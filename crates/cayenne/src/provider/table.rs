@@ -12532,6 +12532,79 @@ impl CayenneTableProvider {
     /// Returns `Ok(true)` if a bake merge was committed, `Ok(false)` for a no-op
     /// (position mode, fewer than `K + 2` protected snapshots, no clean prefix with
     /// a populated manifest, or the CAS lost a race).
+    /// Resurrect-rows-critical clean-prefix gate for the seq-prefix bake. Pruning
+    /// the deletion index at/below `prefix_cutoff` (T) is sound iff EVERY live
+    /// snapshot — the current snapshot ∪ the protected snapshots NOT being baked
+    /// away (`selected_set`) — is clean past T: it holds no row that a `<= T`
+    /// tombstone deletes and that pruning the tombstone would resurrect. A snapshot
+    /// is clean past T iff EITHER:
+    ///   - (delete-watermark) its `protected_snapshots` value is `>= T`. That value
+    ///     IS the snapshot's merge-on-read watermark — the scan applies only
+    ///     deletions with `delete_seq > value`, so deletions `<= value` are already
+    ///     physically applied (survivors only). `value >= T` ⟹ every `<= T` deletion
+    ///     is baked in ⟹ re-pruning it resurrects nothing. This is authoritative (no
+    ///     manifest needed) and covers BOTH a CDC snapshot whose async manifest
+    ///     population is still pending (value = its single allocated commit-sequence,
+    ///     the seq of every row it holds) AND a compaction output whose write-range
+    ///     dips `<= T` but whose deletes are baked to `fence_max_delete_seq >= T`
+    ///     (the threshold exemption); OR
+    ///   - (no `<= T` rows) its manifest proves every file's `min_sequence > T`, so
+    ///     no `<= T` tombstone targets any of its rows.
+    /// The CURRENT snapshot has no `protected_snapshots` value and applies ALL
+    /// tombstones, so it is clean past T only via the second clause (all rows `> T`)
+    /// or when it is genesis (empty manifest — no rows). An empty-manifest PROTECTED
+    /// snapshot whose watermark is `< T` cannot be proven clean and conservatively
+    /// blocks (a later pass retries once it is baked or its watermark advances).
+    /// Snapshots are immutable, and a snapshot a concurrent publish adds carries a
+    /// sequence `> T` (one monotonic counter; T is a past max_sequence), so a clean
+    /// result here holds through the prune under the fence. Returns `(holds,
+    /// violating_value_for_logging)`.
+    async fn bake_clean_prefix_holds(
+        &self,
+        selected_set: &std::collections::HashSet<String>,
+        prefix_cutoff: i64,
+    ) -> (bool, Option<i64>) {
+        let current_snapshot_id = self.get_current_snapshot_id();
+        let protected = self.protected_snapshots.load();
+        let mut live_ids: Vec<String> = protected
+            .keys()
+            .filter(|id| !selected_set.contains(*id))
+            .cloned()
+            .collect();
+        live_ids.push(current_snapshot_id.clone());
+        for id in &live_ids {
+            // Delete-watermark exemption (authoritative, no I/O): a protected
+            // snapshot whose watermark covers T is clean past T regardless of its
+            // write-range. The current snapshot has no entry here.
+            let watermark = protected.get(id).copied();
+            if let Some(w) = watermark {
+                if w >= prefix_cutoff {
+                    continue;
+                }
+            }
+            let files = self
+                .catalog
+                .get_snapshot_files(&self.table_metadata.table_id, id)
+                .await
+                .unwrap_or_default();
+            if files.is_empty() {
+                if id == &current_snapshot_id {
+                    continue; // genesis current snapshot: no rows to resurrect
+                }
+                // Protected snapshot, empty manifest, watermark `< T` (or — never,
+                // for an in-map snapshot — absent): ranges unknown, cannot prove
+                // clean past T, so block this pass.
+                return (false, watermark.or(Some(-1)));
+            }
+            for f in &files {
+                if f.min_sequence <= prefix_cutoff {
+                    return (false, Some(f.min_sequence));
+                }
+            }
+        }
+        (true, None)
+    }
+
     async fn bake_seq_prefix_protected_snapshots(&self) -> Result<bool> {
         // GATE: key-delete tables only. Position deletes are file-scoped (the
         // prune is a no-op for them) and their subset compaction must serialize
@@ -12583,9 +12656,6 @@ impl CayenneTableProvider {
 
         // --- Seq-prefix selection (replaces size-tier selection). ---
         // Candidate prefix = all but the newest K (creation-/sequence-ordered).
-        // A candidate is bake-eligible only with a POPULATED manifest (an empty
-        // manifest has no per-file sequence range, so the seq-prefix split is
-        // undefined — defer it to a later pass once the manifest is rebuilt).
         let split = ordered_ids.len() - BAKE_KEEP_RECENT_SNAPSHOTS;
         let candidate_ids = &ordered_ids[..split];
         let mut selected: Vec<(String, i64)> = Vec::with_capacity(candidate_ids.len());
@@ -12596,10 +12666,24 @@ impl CayenneTableProvider {
                 .get_snapshot_files(&self.table_metadata.table_id, id)
                 .await
                 .unwrap_or_default();
+            let threshold = thresholds.get(id).copied().unwrap_or(0);
             if files.is_empty() {
-                // No manifest yet → cannot place it in the seq-prefix; skip this
-                // pass. (Selecting it without a manifest would force the
-                // conservative `[0, fence]` author range and could understate T.)
+                // Empty manifest ⟹ a CDC-published snapshot whose async manifest
+                // population has not landed yet — both compaction paths author the
+                // manifest BEFORE the protected-set swap, so a protected snapshot is
+                // never empty-while-protected for any other reason. Every row of a
+                // CDC snapshot was committed at its single allocated sequence = its
+                // `protected_snapshots` value (`threshold`), so bake it with
+                // `[threshold, threshold]`: the merge scan reads its files by
+                // directory listing (NOT the manifest), `apply_partial_deletion_filter`
+                // applies deletions `> threshold` (leaving survivors), and T
+                // accumulates exactly `threshold`. Baking it — rather than skipping —
+                // is what lets the prune cover its `<= T` rows; leaving it live with
+                // an empty manifest would force the clean-prefix gate to block.
+                // [resurrect-critical: `threshold` is the true commit-seq of every
+                // row here, so T is never understated.]
+                cutoff = cutoff.max(threshold);
+                selected.push((id.clone(), threshold));
                 continue;
             }
             // T accumulates the highest per-file max_sequence over the selected
@@ -12607,7 +12691,6 @@ impl CayenneTableProvider {
             for f in &files {
                 cutoff = cutoff.max(f.max_sequence);
             }
-            let threshold = thresholds.get(id).copied().unwrap_or(0);
             selected.push((id.clone(), threshold));
         }
 
@@ -12636,6 +12719,29 @@ impl CayenneTableProvider {
             deletion_index_len = deletion_snapshot.delete_len(),
             "Running seq-prefix bake (consolidating the clean older prefix)"
         );
+
+        // PRE-MERGE clean-prefix gate (resurrect-critical perf guard): if the prune
+        // could not run after the merge (some live snapshot is not clean past T),
+        // skip the WHOLE bake NOW — never pay the merge write-amp for a prune that
+        // would then be withheld (the regression this fixes: merge-without-prune).
+        // The post-swap gate re-checks under the fence; a concurrent publish in the
+        // gap can only add a snapshot with sequence > T, which cannot newly violate.
+        let selected_set: std::collections::HashSet<String> =
+            selected.iter().map(|(id, _)| id.clone()).collect();
+        let (pre_holds, pre_violation) = self
+            .bake_clean_prefix_holds(&selected_set, prefix_cutoff)
+            .await;
+        if !pre_holds {
+            tracing::debug!(
+                target: "cayenne::compaction",
+                table = self.table_metadata.table_name.as_str(),
+                prefix_cutoff,
+                violating = pre_violation.unwrap_or(-1),
+                "Skipping seq-prefix bake before merge: a live snapshot is not clean \
+                 past T (prune would be withheld); avoiding merge write-amp"
+            );
+            return Ok(false);
+        }
 
         // --- Phase 2: rewrite outside the lock (identical to the size-tier
         // path): union over selected inputs, each with its own partial deletion
@@ -12782,72 +12888,17 @@ impl CayenneTableProvider {
         // (M present, inputs gone) with a pre-prune deletion index (or vice
         // versa). The clean-prefix assertion is evaluated under this same fence
         // over the now-current live set.
-        // CLEAN-PREFIX DECISION (resurrect-rows-critical) — computed OUTSIDE the
-        // write fence so the per-snapshot manifest reads (metastore I/O) never
-        // stall concurrent scans. The would-be-live set is every currently-live
-        // snapshot except the merged-away inputs (the swap below removes them); the
-        // merged output M is excluded (its `<= T` rows are SURVIVORS the rewrite
-        // kept, so pruned tombstones no longer apply to them). Soundness when the
-        // prune later runs under the fence: snapshots are immutable, so any snapshot
-        // clean here stays clean; and a snapshot a concurrent publish adds in the
-        // gap carries a fresh sequence > T (one monotonic counter; T is a past
-        // max_sequence) so it holds no `<= T` row and cannot violate the invariant.
-        //
-        // Every live snapshot (current ∪ unselected protected) MUST have manifest
-        // min_sequence > T, else it still holds a row at or below T that a `<= T`
-        // tombstone deletes and pruning that tombstone would resurrect it. A
-        // PROTECTED snapshot with an empty manifest has UNKNOWN ranges (Stage-1
-        // population failed/pending) and conservatively blocks the prune; only the
-        // genesis current snapshot (no data) is exempt.
-        let mut clean_prefix_holds = true;
-        let mut violating_min: Option<i64> = None;
-        {
-            let current_snapshot_id = self.get_current_snapshot_id();
-            let selected_set: std::collections::HashSet<String> =
-                selected.iter().map(|(id, _)| id.clone()).collect();
-            let mut live_ids: Vec<String> = self
-                .protected_snapshots
-                .load()
-                .keys()
-                .filter(|id| !selected_set.contains(*id))
-                .cloned()
-                .collect();
-            live_ids.push(current_snapshot_id.clone());
-            for id in &live_ids {
-                if id == &new_snapshot_id {
-                    continue; // M is the bake target, not an unmerged holdout.
-                }
-                let files = self
-                    .catalog
-                    .get_snapshot_files(&self.table_metadata.table_id, id)
-                    .await
-                    .unwrap_or_default();
-                if files.is_empty() {
-                    // A live PROTECTED snapshot always carries data, so an empty
-                    // manifest means its Stage-1 population failed or is pending:
-                    // its per-file ranges are UNKNOWN, so we cannot prove its rows
-                    // are all > T and must NOT prune (a later pass retries once the
-                    // manifest is rebuilt). The genesis current snapshot (no data)
-                    // is the safe no-rows case and is exempt.
-                    if id != &current_snapshot_id {
-                        clean_prefix_holds = false;
-                        violating_min = Some(-1); // sentinel: empty manifest, range unknown
-                        break;
-                    }
-                    continue;
-                }
-                for f in &files {
-                    if f.min_sequence <= prefix_cutoff {
-                        clean_prefix_holds = false;
-                        violating_min = Some(f.min_sequence);
-                        break;
-                    }
-                }
-                if !clean_prefix_holds {
-                    break;
-                }
-            }
-        }
+        // CLEAN-PREFIX GATE (resurrect-rows-critical) — re-evaluated here OUTSIDE
+        // the write fence so the per-snapshot manifest reads (metastore I/O) never
+        // stall concurrent scans, then enforced TOGETHER with the prune under the
+        // single write-fence hold below so no scan observes a torn (swapped-but-not-
+        // pruned, or the reverse) state. The merged output M is not yet in the
+        // protected set at this point (the rcu swap is below), so it is not among
+        // the live ids; its `<= T` rows are SURVIVORS the rewrite kept. See
+        // `bake_clean_prefix_holds` for the watermark-or-min soundness argument.
+        let (clean_prefix_holds, violating_min) = self
+            .bake_clean_prefix_holds(&selected_set, prefix_cutoff)
+            .await;
 
         // Publish the protected-set swap AND (when the clean-prefix invariant holds)
         // the deletion-index prune together under ONE write-fence hold, so a scan
@@ -23924,12 +23975,14 @@ mod tests {
         );
     }
 
-    /// STAGE-2 DELIVERABLE TEST (5). The clean-prefix assertion SKIPS the prune
-    /// (but STILL merges) when a `<= T` snapshot would be left unmerged. We pin
-    /// the OLDER prefix to bake at `T`, but pin one of the KEPT (newest-K)
-    /// snapshots with `min_sequence <= T` — so after the swap a live snapshot
-    /// still reaches at or below `T`. The merge is published (count drops) but the
-    /// `<= T` tombstone is NOT pruned (resurrect-safe).
+    /// STAGE-2 DELIVERABLE TEST (5). The clean-prefix gate SKIPS THE WHOLE BAKE
+    /// (no merge, no prune, no write-amp) when a genuinely-dirty `<= T` snapshot
+    /// would be left unmerged. We pin the OLDER prefix to bake at `T`, but pin one
+    /// of the KEPT (newest-K) snapshots with `min_sequence <= T` AND a delete-
+    /// watermark `< T` — so it is neither write-range-clean nor watermark-exempt, a
+    /// true violation. The PRE-merge gate detects it and returns early: no merge
+    /// write-amp is paid for a prune that would be withheld, and the `<= T`
+    /// tombstone is retained (resurrect-safe).
     #[tokio::test]
     async fn seq_prefix_bake_skips_prune_when_clean_prefix_violated() {
         let ctx = SessionContext::new();
@@ -23937,22 +23990,39 @@ mod tests {
         // pin id-2 at seq 5 (< T=20) to VIOLATE the clean prefix; ids 3,4 are
         // above T (30,40). The violating kept snapshot id-2 makes the post-swap
         // live set contain a min_sequence (5) <= T.
-        let (provider, _tmp, _ids) =
+        let (provider, _tmp, ids) =
             build_seq_prefix_fixture("bake_skips_prune", ctx.runtime_env(), &[10, 20, 5, 30, 40])
                 .await;
+
+        // Pin kept id-2's delete-watermark to 5 (< T=20) so it is genuinely dirty:
+        // neither write-range-clean (min_sequence 5 <= T) nor watermark-exempt
+        // (5 < T). This makes the violation deterministic regardless of the small
+        // real sequence the fixture's inserts happened to allocate.
+        let dirty_kept = ids[2].clone();
+        provider.protected_snapshots.rcu(|cur| {
+            let mut m = (**cur).clone();
+            m.insert(dirty_kept.clone(), 5);
+            Arc::new(m)
+        });
 
         // A tombstone at delete_seq 12 (<= T=20). Were the prune to run it would
         // be dropped, but key 2 (written at 5 <= 12) physically survives in the
         // unmerged kept snapshot id-2 → dropping the tombstone would resurrect it.
         install_int64_deletes(&provider, &[(2, 12)]);
 
+        let before = provider.protected_snapshots.load_full().len();
         let baked = provider
             .bake_seq_prefix_protected_snapshots()
             .await
             .expect("bake should not error");
         assert!(
-            baked,
-            "the merge is still published even when the prune is skipped"
+            !baked,
+            "the bake skips ENTIRELY (no merge, no write-amp) when the prune would be withheld"
+        );
+        assert_eq!(
+            provider.protected_snapshots.load_full().len(),
+            before,
+            "the violated bake must not merge/swap (the older prefix stays live)"
         );
 
         // The tombstone MUST survive (prune skipped) — clean-prefix violated.
@@ -23976,23 +24046,22 @@ mod tests {
         );
     }
 
-    /// STAGE-2 DELIVERABLE TEST (6). The clean-prefix assertion SKIPS the prune
-    /// (but STILL merges) when an OLDER (at-or-below-T) protected snapshot has an
-    /// EMPTY manifest. An empty manifest means its per-file sequence ranges are
-    /// UNKNOWN, so that snapshot is (a) skipped from the bake selection (its split
-    /// is undefined) yet (b) remains a LIVE unselected protected snapshot whose
-    /// rows cannot be proven to be entirely `> T` — so the post-swap prune of
-    /// `<= T` tombstones is conservatively withheld (it could otherwise resurrect
-    /// a still-live row). Distinct from TEST (5): there the kept snapshot had a
-    /// POPULATED manifest with `min_sequence <= T`; here the blocker is the
-    /// empty-manifest (`violating_min = -1`, range-unknown) branch.
+    /// STAGE-2 DELIVERABLE TEST (6) — REGRESSION FIX. An OLDER-prefix candidate
+    /// with an EMPTY manifest (its async population has not landed) is BAKED via its
+    /// protected-set watermark (its single allocated commit-sequence — the seq of
+    /// every row it holds), NOT skipped. The old behavior skipped it, leaving it a
+    /// LIVE empty-manifest blocker so the post-swap prune was withheld forever — the
+    /// bake paid merge write-amp with zero index shrink (the production regression).
+    /// Baking it retires it into the merge (deletions applied → survivors only), so
+    /// the `<= T` prune runs and resurrects nothing.
     ///
-    /// Six protected snapshots pinned at 10,20,30,40,50,60. The older prefix is
-    /// the oldest three (ids 0,1,2). We EMPTY id-2's manifest, so only {0,1} (at
-    /// 10,20 ⇒ T=20) are manifest-populated and bake; id-2 stays live with an
-    /// unknown range and blocks the prune. The newest K=3 ({3,4,5}) stay > T.
+    /// Six protected snapshots; the older prefix is the oldest three (ids 0,1,2).
+    /// We EMPTY id-2's manifest; it is now baked via its watermark alongside {0,1}.
+    /// Key 2 is deleted at delete_seq 12 (above id-2's small watermark, so the merge
+    /// applies it), so id-2's copy is removed and the tombstone is pruned. The newest
+    /// K=3 ({3,4,5}) stay live and `> T`.
     #[tokio::test]
-    async fn seq_prefix_bake_skips_prune_when_older_snapshot_manifest_empty() {
+    async fn seq_prefix_bake_bakes_empty_manifest_candidate_and_prunes() {
         let ctx = SessionContext::new();
         // Pin all six initially; we then empty exactly one older-prefix snapshot.
         let (provider, _tmp, ids) = build_seq_prefix_fixture(
@@ -24060,38 +24129,110 @@ mod tests {
             .bake_seq_prefix_protected_snapshots()
             .await
             .expect("bake should not error");
+        assert!(baked, "the older prefix (incl the empty-manifest id-2) must bake");
+
+        // FIX: an empty-manifest CANDIDATE is now BAKED via its protected-set
+        // watermark (its single commit-sequence), not skipped — so it is retired
+        // into the merge and is no longer a live blocker.
         assert!(
-            baked,
-            "the {{0,1}} prefix still merges even though id-2's manifest is empty"
+            !provider.protected_snapshots.load_full().contains_key(&empty_id),
+            "the empty-manifest older candidate must be baked away (merged into M)"
         );
 
-        // The empty-manifest older snapshot was skipped from the bake, so it
-        // remains a live protected snapshot (not retired into the merge).
-        assert!(
-            provider.protected_snapshots.load_full().contains_key(&empty_id),
-            "the empty-manifest older snapshot must stay live (skipped from the bake)"
-        );
-
-        // The <= T tombstone MUST survive — an empty-manifest live snapshot has an
-        // unknown range and conservatively blocks the prune.
+        // The `<= T` tombstone for key 2 is PRUNED: id-2 was baked with its watermark
+        // as its merge threshold, so the merge applied delete_seq 12 (above that
+        // small watermark) and key 2 is physically removed from M — pruning the
+        // tombstone resurrects nothing.
         let tombstones = int64_tombstones(&provider);
         assert_eq!(
-            tombstones.get(2).map(|t| t.delete_sequence),
-            Some(12),
-            "the <= T tombstone must be RETAINED when an older snapshot's manifest is empty"
-        );
-        assert_eq!(
             tombstones.delete_len(),
-            1,
-            "no tombstone was pruned (range-unknown empty manifest blocks the prune)"
+            0,
+            "the <= T tombstone is pruned once the empty-manifest candidate is baked"
         );
 
-        // Key 2 stays hidden (its retained tombstone still applies to the live,
-        // unmerged id-2 file) — no resurrection.
+        // Key 2 stays deleted (removed by the merge) — no resurrection.
         let pairs = collect_id_value_pairs(&ctx, &provider, "bake_skips_prune_empty").await;
         assert!(
             !pairs.iter().any(|(id, _)| *id == 2),
-            "key 2 stays deleted (tombstone retained) — no resurrection, got {pairs:?}"
+            "key 2 stays deleted (baked out by the merge) — no resurrection, got {pairs:?}"
+        );
+    }
+
+    /// THRESHOLD-EXEMPTION (resurrect-rows-critical). A KEPT live snapshot whose
+    /// manifest write-range dips `<= T` is STILL clean past T when its protected-set
+    /// value (its merge-on-read delete-watermark) is `>= T`: deletions `<= T` are
+    /// already physically applied to it (survivors only), so pruning them resurrects
+    /// nothing and the prune must RUN, not be withheld on the write-range alone.
+    /// This mirrors a compaction output that consolidated old survivors (low
+    /// `min_sequence`) but baked deletes to a high watermark — the case that, left
+    /// unexempted, makes the bake re-merge without ever pruning.
+    ///
+    /// Older prefix {0,1} at 10,20 ⇒ T=20. Kept id-2 is given a manifest
+    /// `min_sequence = 5` (`<= T`, the write-range trap the old gate blocked on) but
+    /// a watermark = 25 (`>= T`), so it is exempt; ids 3,4 stay `> T`. The only
+    /// delete targets key 0 (in the baked prefix), so the prune drops it and key 0
+    /// stays deleted — key 2 (untouched, the watermark's survivor) is irrelevant.
+    #[tokio::test]
+    async fn seq_prefix_bake_prunes_when_kept_snapshot_clean_past_cutoff_by_watermark() {
+        let ctx = SessionContext::new();
+        let (provider, _tmp, ids) = build_seq_prefix_fixture(
+            "bake_watermark_exempt",
+            ctx.runtime_env(),
+            &[10, 20, 30, 40, 50],
+        )
+        .await;
+
+        // Kept id-2: overwrite its manifest write-range to dip `<= T` (min_sequence
+        // 5 — the exact shape the old write-range-only gate blocked on), then set its
+        // delete-watermark (protected-set value) to 25 (`>= T=20`), the production
+        // signal that its `<= T` deletions are already applied (survivors only).
+        let table_id = provider.table_metadata.table_id.clone();
+        let kept_id = ids[2].clone();
+        let files = provider
+            .list_snapshot_files_with_sizes(&kept_id)
+            .await
+            .expect("list kept files");
+        for (file_name, size) in files {
+            provider
+                .catalog
+                .upsert_snapshot_file(&SnapshotFile {
+                    table_id: table_id.clone(),
+                    snapshot_id: kept_id.clone(),
+                    file_path: file_name,
+                    row_count: 1,
+                    file_size_bytes: i64::try_from(size).unwrap_or(0),
+                    min_sequence: 5, // <= T=20: the write-range trap
+                    max_sequence: 5,
+                })
+                .await
+                .expect("pin low write-range");
+        }
+        provider.protected_snapshots.rcu(|cur| {
+            let mut m = (**cur).clone();
+            m.insert(kept_id.clone(), 25); // delete-watermark >= T=20 ⇒ clean past T
+            Arc::new(m)
+        });
+
+        // Delete key 0 (written at 10, in the baked prefix; delete_seq 15 <= T=20).
+        install_int64_deletes(&provider, &[(0, 15)]);
+
+        let baked = provider
+            .bake_seq_prefix_protected_snapshots()
+            .await
+            .expect("bake should not error");
+        assert!(baked, "the {{0,1}} prefix bakes");
+
+        // The watermark exemption let the prune RUN despite id-2's min_sequence <= T.
+        let tombstones = int64_tombstones(&provider);
+        assert_eq!(
+            tombstones.delete_len(),
+            0,
+            "the <= T tombstone is pruned: kept id-2 is clean past T via its watermark"
+        );
+        let pairs = collect_id_value_pairs(&ctx, &provider, "bake_watermark_exempt").await;
+        assert!(
+            !pairs.iter().any(|(id, _)| *id == 0),
+            "key 0 stays deleted after the bake — no resurrection, got {pairs:?}"
         );
     }
 
