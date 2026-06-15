@@ -40,6 +40,10 @@ ignore = [
   "RUSTSEC-2026-0099",
   # Legacy `rustls` 0.21 dependencies pull `rustls-webpki` 0.101.x; newer 0.103.x is updated in Cargo.lock. Owner: AWS/MSSQL integrations.
   "RUSTSEC-2026-0104",
+  # Azure connectors pull `http-types` (unmaintained) through `azure_core`/`azure_storage`; no safe upgrade is available. Owner: data connectors. (Also ignored on trunk.)
+  "RUSTSEC-2026-0174",
+  # Macro dependencies pull `proc-macro-error2` (now unmaintained, like the original `proc-macro-error`/RUSTSEC-2024-0370); no safe upgrade is available. Owner: runtime/data connectors.
+  "RUSTSEC-2026-0173",
 ]
 
 [bans]
