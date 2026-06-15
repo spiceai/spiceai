@@ -14676,15 +14676,16 @@ impl CayenneTableProvider {
         batches: Vec<RecordBatch>,
         target_partitions: usize,
     ) -> Vec<Vec<RecordBatch>> {
+        // Don't fan a trivially small tier across cores — the scheduling +
+        // partial-aggregate merge overhead would dominate the saved scan time.
+        const MIN_ROWS_PER_PARTITION: usize = 8192;
+
         // At least one row-bearing batch is guaranteed by the callers (they
         // early-return on empty), but stay defensive.
         let n = target_partitions.max(1).min(batches.len().max(1));
         if n <= 1 {
             return vec![batches];
         }
-        // Don't fan a trivially small tier across cores — the scheduling +
-        // partial-aggregate merge overhead would dominate the saved scan time.
-        const MIN_ROWS_PER_PARTITION: usize = 8192;
         let total_rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
         let effective_n = n.min((total_rows / MIN_ROWS_PER_PARTITION).max(1));
         if effective_n <= 1 {

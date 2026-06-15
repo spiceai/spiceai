@@ -1336,6 +1336,7 @@ mod tests {
                 temp_directory: None,
                 memory_limit: Some("100MiB".to_string()),
                 target_partitions: None,
+                max_concurrent_queries: None,
             })
         );
 
@@ -1352,6 +1353,7 @@ mod tests {
                 temp_directory: None,
                 memory_limit: Some("200MiB".to_string()),
                 target_partitions: None,
+                max_concurrent_queries: None,
             })
         );
 
@@ -1369,6 +1371,7 @@ mod tests {
                 temp_directory: None,
                 memory_limit: Some("200MiB".to_string()),
                 target_partitions: None,
+                max_concurrent_queries: None,
             })
         );
 
@@ -1393,6 +1396,7 @@ mod tests {
                 temp_directory: Some("/foo".to_string()),
                 memory_limit: None,
                 target_partitions: None,
+                max_concurrent_queries: None,
             })
         );
 
@@ -1409,6 +1413,7 @@ mod tests {
                 temp_directory: Some("/bar".to_string()),
                 memory_limit: None,
                 target_partitions: None,
+                max_concurrent_queries: None,
             })
         );
 
@@ -1426,6 +1431,7 @@ mod tests {
                 temp_directory: Some("/bar".to_string()),
                 memory_limit: None,
                 target_partitions: None,
+                max_concurrent_queries: None,
             })
         );
 
