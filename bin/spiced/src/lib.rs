@@ -821,6 +821,18 @@ pub async fn run(args: Args) -> Result<()> {
              are both required"
         );
     }
+    if matches!(
+        (runtime_auth_configured, client_auth_mode),
+        (false, ClientAuthMode::Request)
+    ) {
+        tracing::warn!(
+            "Insecure configuration: `client_auth: request` is set without `runtime.auth`. \
+             Client certificates are optional in this mode and no other authentication is \
+             configured, so a client that presents no certificate reaches the API \
+             unauthenticated — including write/DDL/DML endpoints. Use `client_auth: required` \
+             to reject certificate-less clients, or configure `runtime.auth`."
+        );
+    }
     let endpoint_auth = endpoint_auth.with_identity_source(identity_source);
 
     let server_thread = tokio::spawn(async move {

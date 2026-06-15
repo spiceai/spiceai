@@ -487,17 +487,15 @@ impl SpidapterHandler {
         // can pass SPIDAPTER_IMAGE_TAG / SPIDAPTER_CHANNEL without modifying the
         // scenario YAML.
         if let Some(ComputeConfig::Scp(ref mut scp)) = scenario.compute {
-            if let Ok(tag) = std::env::var("SPIDAPTER_IMAGE_TAG") {
-                if !tag.is_empty() {
+            if let Ok(tag) = std::env::var("SPIDAPTER_IMAGE_TAG")
+                && !tag.is_empty() {
                     scp.image_tag = Some(tag);
                 }
-            }
-            if let Ok(channel) = std::env::var("SPIDAPTER_CHANNEL") {
-                if !channel.is_empty() {
+            if let Ok(channel) = std::env::var("SPIDAPTER_CHANNEL")
+                && !channel.is_empty() {
                     use spice_cloud_client::types::UpdateChannel;
                     scp.channel = channel.parse::<UpdateChannel>().ok();
                 }
-            }
         }
         Self {
             runs: HashMap::new(),
@@ -1034,7 +1032,7 @@ impl Handler for SpidapterHandler {
             },
             RunState::Scp(_) => state.sql_url().replace("/v1/sql", "/v1/metrics"),
         };
-        let api_key = state.api_key().map(|k| k.to_string());
+        let api_key = state.api_key().map(std::string::ToString::to_string);
 
         // Scrape Prometheus metrics for the CDC replication payload.
         let prom_body = fetch_prometheus_metrics(&prometheus_url, api_key.as_deref())
@@ -1544,7 +1542,7 @@ fn parse_and_rename_spicepod(yaml_str: &str, run_id: &Uuid) -> anyhow::Result<Sp
 ///
 /// `cayenne` is only used when `setup_config.storage` is `DirectIngest`.
 /// `scp` provides the scheduler state location and query memory limit.
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)]
 async fn generate_initial_spicepod(
     run_id: &Uuid,
     setup_config: &SetupConfig,

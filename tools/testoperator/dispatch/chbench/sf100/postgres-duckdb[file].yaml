@@ -8,3 +8,10 @@ tests:
     ready_wait: 600
     query_overrides: duckdb
     rate: 10000
+  bench:
+    spicepod_path: accelerated/postgres-duckdb[file].yaml
+    query_set: chbench
+    query_overrides: duckdb
+    runner_type: spiceai-dev-xlarge-runners
+    scale_factor: 100
+    ready_wait: 600

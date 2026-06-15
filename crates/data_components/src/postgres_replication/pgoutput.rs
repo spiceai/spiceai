@@ -350,7 +350,10 @@ fn decode_truncate(buf: &mut &[u8]) -> Result<DecodedMessage> {
     );
     let nrel = buf.get_u32();
     let _flags = buf.get_u8();
-    let mut relation_ids = Vec::with_capacity(nrel as usize);
+    // Cap the pre-allocation to what the remaining buffer could actually hold
+    // (4 bytes per relation id), so a malicious or corrupt `nrel` cannot trigger
+    // a multi-gigabyte allocation before the per-element bounds check runs.
+    let mut relation_ids = Vec::with_capacity((nrel as usize).min(buf.remaining() / 4));
     for _ in 0..nrel {
         ensure!(
             buf.remaining() >= 4,
@@ -631,6 +634,22 @@ mod tests {
             panic!("expected Truncate")
         };
         assert_eq!(relation_ids, vec![42, 43]);
+    }
+
+    #[test]
+    fn decode_truncate_does_not_overallocate_on_huge_nrel() {
+        // Regression: a malicious or corrupt `nrel` must not drive a multi-GB
+        // `Vec::with_capacity` before the per-element bounds check runs. With the
+        // cap in place this returns an error quickly instead of attempting a
+        // ~16 GiB allocation (which would abort/OOM the process).
+        let mut decoder = Decoder::new();
+        let mut buf = vec![b'T'];
+        buf.extend_from_slice(&u32::MAX.to_be_bytes()); // nrel ≈ 4 billion
+        buf.push(0x00); // flags
+        buf.extend_from_slice(&42u32.to_be_bytes()); // only one relation id actually present
+        decoder
+            .decode(&buf)
+            .expect_err("oversized truncate nrel should error, not over-allocate");
     }
 
     #[test]

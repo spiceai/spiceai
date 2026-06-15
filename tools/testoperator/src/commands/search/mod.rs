@@ -16,7 +16,7 @@ limitations under the License.
 
 mod mteb_quora;
 use super::{duration_millis_between, get_app_and_start_request};
-use crate::{args::SearchTestArgs, health::HealthMonitor, wait_test_and_memory};
+use crate::{args::SearchTestArgs, health::HealthMonitor};
 use std::time::{Duration, Instant};
 use test_framework::{
     TestType, anyhow,
@@ -127,7 +127,15 @@ pub(crate) async fn run(args: &SearchTestArgs) -> anyhow::Result<()> {
     .with_spiced_instance(spiced_instance)
     .start()?;
 
-    let test = wait_test_and_memory!(vector_test, memory_token, memory_readings);
+    let test = match vector_test.wait().await {
+        Ok(test) => test,
+        Err(e) => {
+            if let Some(handle) = memory_readings {
+                let _ = observe_memory(memory_token, handle).await;
+            }
+            return Err(e);
+        }
+    };
     let finished_at = Instant::now();
 
     println!("Search requests completed, calculating results...");
