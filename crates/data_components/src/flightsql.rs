@@ -380,15 +380,13 @@ impl FlightSQLTable {
                 .iter()
                 .filter_map(|ep| ep.ticket.as_ref())
             {
-                if let Ok(stream) = client.do_get(tkt.clone()).await {
-                    if let Ok(batch) = stream.try_collect::<Vec<_>>().await {
-                        // Schema: https://github.com/apache/arrow/blob/44edc27e549d82db930421b0d4c76098941afd71/format/FlightSql.proto#L1182-L1190
-                        if let Some(schema) =
-                            Self::get_table_schema_if_present(batch, table_reference.clone())
-                        {
-                            return Ok(schema);
-                        }
-                    }
+                // Schema: https://github.com/apache/arrow/blob/44edc27e549d82db930421b0d4c76098941afd71/format/FlightSql.proto#L1182-L1190
+                if let Ok(stream) = client.do_get(tkt.clone()).await
+                    && let Ok(batch) = stream.try_collect::<Vec<_>>().await
+                    && let Some(schema) =
+                        Self::get_table_schema_if_present(batch, table_reference.clone())
+                {
+                    return Ok(schema);
                 }
             }
         }
