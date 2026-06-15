@@ -1750,8 +1750,6 @@ mod tests {
             &args,
             &scp,
             None,
-            &Default::default(),
-            None,
         )
         .await
         .expect("spicepod should generate");
@@ -1805,8 +1803,6 @@ mod tests {
             None,
             &args,
             &scp,
-            None,
-            &Default::default(),
             None,
         )
         .await
