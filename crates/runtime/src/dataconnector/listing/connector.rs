@@ -1601,11 +1601,16 @@ async fn get_last_modified(
     }
 
     if found_extensions.is_empty() {
-        return Err(DataConnectorError::InvalidConfigurationNoSource {
+        // No files at all at the path. This is treated as a transient
+        // (retriable) condition rather than a permanent configuration error:
+        // the source data may not have been written yet (e.g. the object store
+        // is still being populated at startup), so the dataset load keeps
+        // retrying until files appear. Restores pre-#10246 eventual-readiness.
+        return Err(DataConnectorError::ObjectStoreNoFilesAvailable {
             dataconnector: dataconnector.clone(),
             connector_component: ConnectorComponent::from(dataset),
             message: format!(
-                "Failed to find any files matching the extension '{extension}'. Spice could not find any files with extensions at the specified path. Check the path and try again."
+                "Spice could not find any files matching the extension '{extension}' at the specified path."
             ),
         });
     }
@@ -2723,6 +2728,50 @@ mod tests {
         .await;
 
         result.expect_err("should error on no matching extension");
+    }
+
+    #[tokio::test]
+    async fn test_get_last_modified_no_files_is_retriable() {
+        // Regression test for the v2.0.0 dataset-init regression: when an
+        // object-store path has no files yet (e.g. the source has not been
+        // written at startup), get_last_modified must return a RETRIABLE error
+        // so the dataset load keeps retrying until the data appears, rather than
+        // permanently failing and never retrying. (Restores pre-#10246
+        // eventual-readiness for object-store sources.)
+        let url = Url::parse("s3://bucket/").expect("to parse url");
+        let table_path = ListingTableUrl::parse(url.clone()).expect("to parse url");
+        let ctx = SessionContext::new();
+        let app = app::AppBuilder::new("test").build();
+        let rt = crate::Runtime::builder().build().await;
+        let dataset = DatasetBuilder::try_new("s3://bucket/".to_string(), "test")
+            .expect("Failed to create builder")
+            .with_app(Arc::new(app))
+            .with_runtime(Arc::new(rt))
+            .build()
+            .expect("Failed to build dataset");
+
+        // Empty store: no files at all at the path.
+        let test_store = Arc::new(TestObjectStore::new(vec![])) as Arc<dyn ObjectStore>;
+
+        let result = get_last_modified(
+            "TestListingConnector".to_string(),
+            &dataset,
+            ".parquet",
+            table_path,
+            &ctx,
+            &test_store,
+        )
+        .await;
+
+        let err = result.expect_err("should error when no files are present at the path");
+        assert!(
+            matches!(err, DataConnectorError::ObjectStoreNoFilesAvailable { .. }),
+            "no-files-at-path should map to ObjectStoreNoFilesAvailable, got: {err:?}"
+        );
+        assert!(
+            err.is_retriable(),
+            "no-files-at-path must be retriable so the dataset load keeps retrying until data appears"
+        );
     }
 
     #[tokio::test]
