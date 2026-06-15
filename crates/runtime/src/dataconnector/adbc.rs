@@ -15,7 +15,7 @@ limitations under the License.
 */
 
 use crate::component::dataset::Dataset;
-use crate::datafusion::udf::deny_spice_functions_for_mysql_table_providers;
+use crate::datafusion::udf::deny_spice_functions_for_table_providers;
 use adbc_core::options::{AdbcVersion, OptionDatabase};
 use adbc_core::{Driver as _, LOAD_FLAG_DEFAULT};
 use adbc_driver_manager::ManagedDriver;
@@ -523,7 +523,7 @@ impl AdbcFactory {
 
         let adbc_factory = AdbcTableFactory::new(Arc::clone(&pool))
             .with_federation_enabled(federation_enabled)
-            .with_function_support(deny_spice_functions_for_mysql_table_providers());
+            .with_function_support(deny_spice_functions_for_table_providers());
 
         Ok(Arc::new(Adbc {
             factory: Some(adbc_factory),

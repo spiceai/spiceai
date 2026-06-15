@@ -822,15 +822,15 @@ pub fn deny_spice_functions_for_duckdb_table_providers() -> TpFunctionSupport {
     )
 }
 
-/// Same deny-list as [`deny_spice_specific_functions`], but expressed in the
-/// `datafusion-table-providers` [`TpFunctionSupport`] type that
-/// `MySQLTableFactory::with_function_support` expects.
+/// Full Spice UDF deny-list expressed as the `datafusion-table-providers`
+/// [`TpFunctionSupport`] type used by `*TableFactory::with_function_support`.
 ///
-/// `MySQL`'s unparser dialect has no Spice-function carve-out (unlike `DuckDB`),
-/// so this is the full default deny-list: every built-in Spice UDF plus any
-/// user-registered function. See issue #10703.
+/// Suitable for any SQL connector whose unparser dialect has no Spice-function
+/// carve-out (unlike DuckDB): every built-in Spice UDF plus any user-registered
+/// function is blocked from being pushed down to the remote source.
+/// See issue #10703.
 #[must_use]
-pub fn deny_spice_functions_for_mysql_table_providers() -> TpFunctionSupport {
+pub fn deny_spice_functions_for_table_providers() -> TpFunctionSupport {
     let mut denied = BUILTIN_DENIED_SPICE_FUNCTION_NAMES.as_slice().to_vec();
     denied.extend(USER_FUNCTION_NAMES.read().iter().cloned());
     TpFunctionSupport::new(Some(TpFunctionRestriction::Deny(denied)), None, None)

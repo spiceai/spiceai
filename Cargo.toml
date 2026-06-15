@@ -170,7 +170,7 @@ datafusion-common-runtime = "53.0.0"
 datafusion-datasource = "53.0.0"
 datafusion-execution = "53.0.0"
 datafusion-expr = "53.0.0"
-datafusion-federation = { git = "https://github.com/spiceai/datafusion-federation.git", rev = "cc539c74781e1d0e01245302002b1fbeddf8e015", features = ["sql"] } # sgrebnov/spiceai-53
+datafusion-federation = { git = "https://github.com/spiceai/datafusion-federation.git", rev = "a38b715b3a640d0b7140df30503ea2065c6d192f", features = ["sql"] } # spiceai-53
 datafusion-functions = "53.0.0"
 datafusion-functions-json = "0.53"
 datafusion-physical-expr = "53.0.0"
@@ -182,7 +182,7 @@ datafusion-proto-common = "53.0.0"
 datafusion-pruning = "53.0.0"
 datafusion-spark = "53.0.0"
 datafusion-substrait = "53.0.0"
-datafusion-table-providers = { git = "https://github.com/datafusion-contrib/datafusion-table-providers.git", rev = "5dcdb7b26def1bb9e26d327fcb674df133011c51" } # sgrebnov/spiceai-53
+datafusion-table-providers = { git = "https://github.com/spiceai/datafusion-table-providers.git", rev = "e8d8b3742b280949efe5238f4d864a9c0fa1a501" } # spiceai-53
 
 delta_kernel = { version = "0.23.0", features = [
     "default-engine-rustls",
@@ -443,7 +443,7 @@ candle-index-select-cu = { git = "https://github.com/spiceai/candle-index-select
 # workspace uses the spiceai fork (DF53-compatible). Redirect crates.io to the fork so the whole
 # graph shares one `SQLExecutor`/federation crate; otherwise `SqlTable: SQLExecutor` (impl'd in
 # table-providers against crates.io federation) fails to satisfy fork-typed bounds in data_components.
-datafusion-federation = { git = "https://github.com/spiceai/datafusion-federation.git", rev = "cc539c74781e1d0e01245302002b1fbeddf8e015" } # sgrebnov/spiceai-53
+datafusion-federation = { git = "https://github.com/spiceai/datafusion-federation.git", rev = "a38b715b3a640d0b7140df30503ea2065c6d192f", features = ["sql"] } # spiceai-53
 
 delta_kernel = { git = "https://github.com/spiceai/delta-kernel-rs.git", rev = "714d64fd5369efc4835109be0fd718db5a3be0aa" } # branch: spiceai-0.23.0
 
