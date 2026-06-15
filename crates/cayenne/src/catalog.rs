@@ -714,6 +714,31 @@ pub trait MetadataCatalog: Send + Sync {
         self.clear_inlined_deletes(table_id).await
     }
 
+    /// Commit on-conflict deletion metadata and clear inline data/delete rows
+    /// for the same table.
+    ///
+    /// Production implementations should override this as a single backend
+    /// transaction. The default keeps trait implementors source-compatible, but
+    /// is not atomic across the metadata commit and inline clear.
+    async fn commit_on_conflict_deletions_and_clear_inlined(
+        &self,
+        delete_files: Vec<DeleteFile>,
+        table_id: &str,
+        insert_pk_bytes_list: Vec<Vec<u8>>,
+        insert_sequence: i64,
+        snapshot_sequence: Option<SnapshotSequenceCommit>,
+    ) -> CatalogResult<()> {
+        self.commit_on_conflict_deletions(
+            delete_files,
+            table_id,
+            insert_pk_bytes_list,
+            insert_sequence,
+            snapshot_sequence,
+        )
+        .await?;
+        self.clear_inlined_data_and_deletes(table_id).await
+    }
+
     /// Add a small batch of delete identifiers inlined in the metastore.
     ///
     /// Returns the `inlined_id` of the written row so the caller can later flip

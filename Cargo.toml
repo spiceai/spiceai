@@ -172,6 +172,7 @@ datafusion-execution = "53.0.0"
 datafusion-expr = "53.0.0"
 datafusion-federation = { git = "https://github.com/spiceai/datafusion-federation.git", rev = "490d3a2f8fb535b1ec76b823abb240e648668a74", features = ["sql"] } # sgrebnov/spiceai-53
 datafusion-functions = "53.0.0"
+datafusion-functions-aggregate = "53.0.0"
 datafusion-functions-json = "0.53"
 datafusion-physical-expr = "53.0.0"
 datafusion-physical-expr-adapter = "53.0.0"

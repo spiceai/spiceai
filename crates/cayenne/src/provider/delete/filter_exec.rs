@@ -19,7 +19,8 @@ limitations under the License.
 //! This module provides execution plans that filter out deleted rows during query execution:
 //!
 //! - **`Int64PkDeletionFilterExec`**: Optimized for tables with single-column Int64 primary keys.
-//!   Probes a [`DeletionIndex`] (bloom filter + `HashMap<i64, i64>`) once per row.
+//!   Probes a [`DeletionIndex`] (bloom filter over a layered base+delta map of fused
+//!   per-key delete/insert sequence numbers) once per row.
 //!
 //! - **`KeyBasedDeletionFilterExec`**: For tables with composite or non-integer primary keys.
 //!   Uses Arrow's `RowConverter` to create deterministic byte keys, then probes a
@@ -187,6 +188,11 @@ pub(crate) fn is_pk_visible_i64(
 ///
 /// `min_delete_seq_to_apply` is the protected-snapshot cutoff. See
 /// [`is_pk_visible_i64`] for the rationale.
+///
+/// The composite hot path now probes via [`KeyDeletionIndex::get_batch`] (one
+/// hash per row), so this per-row helper is retained only as the reference
+/// implementation the `get_batch` equivalence tests check against.
+#[cfg(test)]
 #[inline]
 pub(crate) fn is_pk_visible_row_key(
     key: &[u8],
@@ -515,49 +521,31 @@ impl futures::Stream for KeyBasedDeletionFilterStream {
                         }
                     };
 
-                    // [b3 sub-lever 2] Batch-level bloom sweep. The composite
-                    // index is hash-keyed (no value range), but the bloom is a
-                    // batch-level filter: a tight first pass counts rows whose
-                    // key MIGHT be deleted. If none are even bloom candidates,
-                    // then `get(key) == None` for every row (the bloom has no
-                    // false negatives — module contract), so
-                    // `is_pk_visible_row_key` would return true for all rows.
-                    // Returning the batch unfiltered is what the full per-row
-                    // visibility walk would produce, and skips the map walk +
-                    // mask build + filter kernel entirely on bloom-sparse
-                    // batches. A bloom false positive only forces a row into the
-                    // normal walk below (which then keeps it), so `maybe`
-                    // over-counts at worst — never under-counts. Honors the
-                    // seq-cutoff / insert records trivially (only fires when
-                    // there is nothing to apply in the batch).
-                    let mut maybe = 0usize;
-                    for row in &rows {
-                        if self.tombstones.might_contain(row.as_ref()) {
-                            maybe += 1;
-                        }
-                    }
-                    if maybe == 0 {
-                        self.metrics.baseline.record_output(batch_size);
-                        return std::task::Poll::Ready(Some(Ok(batch)));
-                    }
-
-                    // Build keep mask: bloom-prefiltered probe per row + visibility check.
-                    // Use `BooleanBufferBuilder` so the mask lives as a packed bitmap
-                    // (1 bit per row instead of 1 byte) and skips the `Vec<bool>` →
-                    // `BooleanArray` conversion pass.
-                    let mut keep_mask = BooleanBufferBuilder::new(batch_size);
-                    let mut keep_count: usize = 0;
-                    for row in &rows {
-                        let key: &[u8] = row.as_ref();
-                        let visible = is_pk_visible_row_key(
-                            key,
-                            &self.tombstones,
+                    // Single-hash batched probe. The previous code hashed every
+                    // row's PK key TWICE — once in a standalone bloom
+                    // `might_contain` sweep, then again in the per-row `get` — on
+                    // this hot loop (the dominant query-side CPU cost under
+                    // merge-on-read). `KeyDeletionIndex::get_batch` does what the
+                    // sweep+probe did but hashes each key ONCE: it runs the bloom
+                    // sweep over the precomputed XXH3-128 hashes and walks the
+                    // delta/base tiers only for bloom survivors (probed by hash
+                    // identity). It is proven equivalent to the per-row `get` by
+                    // `get_batch_matches_per_row_get_composite`, and only calls
+                    // back for rows that have a real tombstone — a row with no
+                    // tombstone is visible, exactly as `is_pk_visible_row_key`
+                    // returns `true` on `get() == None`. The bloom-empty /
+                    // all-visible fast path is preserved below via `deleted`.
+                    let mut deleted: Vec<usize> = Vec::new();
+                    self.tombstones.get_batch(rows.iter(), |i, tombstone| {
+                        if !tombstone_visible(
+                            tombstone,
                             self.insert_record_handling,
                             self.min_delete_seq_to_apply,
-                        );
-                        keep_mask.append(visible);
-                        keep_count += usize::from(visible);
-                    }
+                        ) {
+                            deleted.push(i);
+                        }
+                    });
+                    let keep_count = batch_size - deleted.len();
 
                     tracing::trace!(
                         "KeyBasedDeletionFilterStream: keeping {} of {} rows",
@@ -565,16 +553,27 @@ impl futures::Stream for KeyBasedDeletionFilterStream {
                         batch_size
                     );
 
+                    // No deletions applied → every row is visible; return the
+                    // batch as-is. Covers both the old bloom-empty early-out and
+                    // the keep_count == batch_size fast path in one check, and
+                    // avoids building a mask at all.
+                    if deleted.is_empty() {
+                        self.metrics.baseline.record_output(batch_size);
+                        return std::task::Poll::Ready(Some(Ok(batch)));
+                    }
+
                     // If all rows are deleted, skip this batch and continue to next
                     if keep_count == 0 {
                         self.metrics.rows_deleted.add(batch_size);
                         continue;
                     }
 
-                    // If no rows are deleted, return the batch as-is (fast path)
-                    if keep_count == batch_size {
-                        self.metrics.baseline.record_output(batch_size);
-                        return std::task::Poll::Ready(Some(Ok(batch)));
+                    // Build the keep mask as a packed bitmap (1 bit per row): all
+                    // rows kept except the deleted positions reported above.
+                    let mut keep_mask = BooleanBufferBuilder::new(batch_size);
+                    keep_mask.append_n(batch_size, true);
+                    for &i in &deleted {
+                        keep_mask.set_bit(i, false);
                     }
 
                     // Apply mask in one shot via Arrow's filter kernel.
@@ -627,8 +626,9 @@ impl datafusion_execution::RecordBatchStream for KeyBasedDeletionFilterStream {
 /// Execution plan that filters out deleted rows based on Int64 primary key values.
 ///
 /// Optimised for the common case of tables with a single-column Int64 primary key.
-/// Avoids `RowConverter` overhead and probes a [`DeletionIndex`] (bloom filter +
-/// `HashMap<i64, i64>`) directly with native i64 comparisons.
+/// Avoids `RowConverter` overhead and probes a [`DeletionIndex`] (bloom filter over a
+/// layered base+delta map of fused delete/insert sequence numbers) directly with native
+/// i64 comparisons.
 ///
 /// Like [`KeyBasedDeletionFilterExec`], this exec is **filter-pushdown-transparent**
 /// (forwards parent predicates to the child Vortex scan so zone-map pruning runs

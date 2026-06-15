@@ -192,6 +192,7 @@ impl PreparedOverwrite {
         // `inlined_generation`. Bump it here so scans don't return stale
         // pre-overwrite inline batches alongside the new snapshot.
         self.table.invalidate_inlined_cache();
+        self.table.mark_maintained_aggregates_stale();
 
         self.table
             .update_listing_table_for_snapshot(&self.new_snapshot_id)
