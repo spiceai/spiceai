@@ -18,7 +18,7 @@
 set -euo pipefail
 
 CARGO_TOML="${1:-Cargo.toml}"
-REPO_URL="https://github.com/datafusion-contrib/datafusion-table-providers.git"
+REPO_URL="https://github.com/spiceai/datafusion-table-providers.git"
 BRANCH="${BRANCH:-spiceai}"
 
 # Extract the commit hash from the datafusion-table-providers line in [patch.crates-io]
