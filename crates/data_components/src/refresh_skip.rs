@@ -18,6 +18,7 @@ limitations under the License.
 
 use async_trait::async_trait;
 use datafusion::{datasource::TableProvider, error::Result as DataFusionResult};
+use datafusion_federation::FederatedTableProviderAdaptor;
 
 /// A trait for table providers that can determine if a refresh operation should be skipped.
 ///
@@ -68,6 +69,14 @@ impl<T: RefreshSkipTableProvider> AsRefreshSkipProvider for T {
 /// This function uses `Any::downcast_ref` to check if the concrete type implements both
 /// `AsRefreshSkipProvider` and can be used to call the refresh skip logic without requiring
 /// the caller to know the concrete type.
+///
+/// The inner refresh-skip provider can be hidden behind wrappers inserted during dataset
+/// registration — most notably schema-metadata enrichment ([`crate::MetadataEnrichedTableProvider`],
+/// applied by `FederatedTable::new` whenever a dataset declares table- or column-level metadata) and
+/// federation adaptors ([`FederatedTableProviderAdaptor`]). Those wrappers return themselves from
+/// `as_any`, so a single direct downcast would silently miss the inner provider and the refresh would
+/// never be skipped. Unwrap the wrappers we know about and recurse so the skip check still reaches the
+/// inner [`RefreshSkipTableProvider`].
 pub async fn should_skip_refresh_for_table_provider(
     table_provider: &(dyn TableProvider + Send + Sync),
 ) -> DataFusionResult<Option<bool>> {
@@ -83,6 +92,20 @@ pub async fn should_skip_refresh_for_table_provider(
     // if let Some(provider) = any.downcast_ref::<SomeOtherType>() {
     //     return provider.should_skip_refresh().await.map(Some);
     // }
+
+    // Unwrap known wrapper providers so the inner refresh-skip provider is still reached.
+    if let Some(enriched) = any.downcast_ref::<crate::MetadataEnrichedTableProvider>() {
+        return Box::pin(should_skip_refresh_for_table_provider(
+            enriched.get_inner_ref().as_ref(),
+        ))
+        .await;
+    }
+
+    if let Some(adaptor) = any.downcast_ref::<FederatedTableProviderAdaptor>()
+        && let Some(inner) = adaptor.table_provider.as_ref()
+    {
+        return Box::pin(should_skip_refresh_for_table_provider(inner.as_ref())).await;
+    }
 
     Ok(None)
 }
