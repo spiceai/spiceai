@@ -37,8 +37,7 @@ use crate::args::{DeploymentMode, StdioArgs};
 use crate::commands;
 use crate::scenario::{
     AccelerationEngine, CayenneConfig, ComputeConfig, DirectConfig, DynamoDbConfig, MongoEndpoint,
-    PgEndpoint, ScenarioConfig, ScpConfig, SourceConfig, SpiceCompute,
-    load_scenario,
+    PgEndpoint, ScenarioConfig, ScpConfig, SourceConfig, SpiceCompute, load_scenario,
 };
 
 #[path = "sources/mod.rs"]
@@ -420,7 +419,10 @@ fn parse_labeled(body: &str, name: &str) -> std::collections::HashMap<String, f6
 fn build_cdc_replication_metrics(body: &str) -> Option<CdcReplicationMetrics> {
     let recv = parse_labeled(body, "dataset_acceleration_cdc_source_recv_wait_ms_sum");
     let apply = parse_labeled(body, "dataset_acceleration_cdc_apply_burst_duration_ms_sum");
-    let apply_count = parse_labeled(body, "dataset_acceleration_cdc_apply_burst_duration_ms_count");
+    let apply_count = parse_labeled(
+        body,
+        "dataset_acceleration_cdc_apply_burst_duration_ms_count",
+    );
     let linger = parse_labeled(body, "dataset_acceleration_cdc_linger_wait_ms_sum");
     let bytes = parse_labeled(body, "dataset_acceleration_cdc_apply_burst_bytes_sum");
     // Per-burst row counter emitted by spiced. Match the exact name spiced
@@ -1796,20 +1798,19 @@ mod tests {
         let scp = test_scp_config();
         let run_id = Uuid::parse_str("01234567-89ab-cdef-0123-456789abcdef").expect("parse uuid");
 
-        let spicepod =
-            generate_initial_spicepod(
-                &run_id,
-                &setup_config,
-                &datasets,
-                None,
-                &args,
-                &scp,
-                None,
-                &Default::default(),
-                None,
-            )
-            .await
-            .expect("spicepod loads from disk");
+        let spicepod = generate_initial_spicepod(
+            &run_id,
+            &setup_config,
+            &datasets,
+            None,
+            &args,
+            &scp,
+            None,
+            &Default::default(),
+            None,
+        )
+        .await
+        .expect("spicepod loads from disk");
 
         assert_eq!(spicepod.name, "spidapter-01234567");
         let yaml = serialize_spicepod(&spicepod).expect("serialize");

@@ -52,7 +52,10 @@ pub(crate) fn generate_mongodb_spicepod(
             ("mongodb_connection_string".to_string(), conn_str),
             // Increase cursor batch sizes to reduce round-trips on high-volume streams.
             ("change_stream_batch_size".to_string(), "10000".to_string()),
-            ("change_stream_batch_max_size".to_string(), "10000".to_string()),
+            (
+                "change_stream_batch_max_size".to_string(),
+                "10000".to_string(),
+            ),
         ]);
 
         // MongoDB change stream delete events only carry `_id`, so we use `_id` as
