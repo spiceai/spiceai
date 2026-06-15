@@ -76,6 +76,7 @@ struct ScpRunState {
     storage: FederatedStorageConfig,
     ec2_guards: Vec<Ec2Guard>,
     dynamodb_guard: Option<DynamoDbGuard>,
+    mongodb_guard: Option<MongoDbGuard>,
 }
 
 /// State for an active benchmark run provisioned via `setup`.
@@ -123,6 +124,7 @@ struct LocalRunState {
     storage: FederatedStorageConfig,
     ec2_guards: Vec<Ec2Guard>,
     dynamodb_guard: Option<DynamoDbGuard>,
+    mongodb_guard: Option<MongoDbGuard>,
 }
 
 enum LocalProcesses {
@@ -231,6 +233,92 @@ impl Drop for DynamoDbGuard {
             };
             if let Err(e) = rt.block_on(delete_dynamodb_tables(&info)) {
                 eprintln!("[stdio] DynamoDbGuard: failed to delete DynamoDB tables: {e}");
+            }
+        })
+        .join()
+        .ok();
+    }
+}
+
+/// Returns `uri` with its database path component replaced by `database`,
+/// preserving the scheme, authority (userinfo/host), and query string.
+///
+/// MongoDB reads the default database from the URI path, so rewriting it routes
+/// both the spicebench sink and the spiced connector to the same per-run db.
+fn with_mongodb_database(uri: &str, database: &str) -> String {
+    let (base, query) = match uri.split_once('?') {
+        Some((b, q)) => (b, Some(q)),
+        None => (uri, None),
+    };
+    // Authority begins after the "scheme://" prefix; the path is the first '/'
+    // after that. Anything from that '/' onward is the old database name.
+    let scheme_end = base.find("://").map_or(0, |i| i + 3);
+    let authority_and_path = &base[scheme_end..];
+    let new_base = match authority_and_path.find('/') {
+        Some(slash) => format!(
+            "{}{}/{database}",
+            &base[..scheme_end],
+            &authority_and_path[..slash]
+        ),
+        None => format!("{base}/{database}"),
+    };
+    match query {
+        Some(q) => format!("{new_base}?{q}"),
+        None => new_base,
+    }
+}
+
+/// Drops a MongoDB database on an existing (connect-mode) instance.
+async fn drop_mongodb_database(uri: &str, database: &str) -> anyhow::Result<()> {
+    let client = mongodb::Client::with_uri_str(uri)
+        .await
+        .map_err(|e| anyhow::anyhow!("connect to MongoDB for cleanup: {e}"))?;
+    client
+        .database(database)
+        .drop()
+        .await
+        .map_err(|e| anyhow::anyhow!("drop database '{database}': {e}"))?;
+    Ok(())
+}
+
+/// RAII guard that drops a per-run MongoDB database when dropped.
+///
+/// Used in connect mode (e.g. Atlas), where the instance is shared and outlives
+/// the run, so the throwaway database must be cleaned up explicitly. (In provision
+/// mode the whole EC2 instance is terminated, so no per-database cleanup is needed.)
+struct MongoDbGuard {
+    /// `(uri, database)`; `None` once disarmed.
+    target: Option<(String, String)>,
+}
+
+impl MongoDbGuard {
+    fn new(uri: String, database: String) -> Self {
+        Self {
+            target: Some((uri, database)),
+        }
+    }
+
+    fn disarm(&mut self) -> Option<(String, String)> {
+        self.target.take()
+    }
+}
+
+impl Drop for MongoDbGuard {
+    fn drop(&mut self) {
+        let Some((uri, database)) = self.target.take() else {
+            return;
+        };
+        eprintln!("[stdio] MongoDbGuard: dropping database '{database}'");
+        std::thread::spawn(move || {
+            let Ok(rt) = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            else {
+                eprintln!("[stdio] MongoDbGuard: failed to build tokio runtime for cleanup");
+                return;
+            };
+            if let Err(e) = rt.block_on(drop_mongodb_database(&uri, &database)) {
+                eprintln!("[stdio] MongoDbGuard: failed to drop database '{database}': {e}");
             }
         })
         .join()
@@ -562,6 +650,7 @@ impl Handler for SpidapterHandler {
 
         let mut ec2_guards: Vec<Ec2Guard> = Vec::new();
         let mut dynamodb_guard: Option<DynamoDbGuard> = None;
+        let mut mongodb_guard: Option<MongoDbGuard> = None;
 
         let acceleration = self.acceleration();
         let region = self.aws_region();
@@ -725,10 +814,19 @@ impl Handler for SpidapterHandler {
             }
 
             SourceConfig::MongodbStreams(MongoEndpoint::Connect(mongo_conf)) => {
-                FederatedStorageConfig::MongoDB {
-                    uri: mongo_conf.uri.clone(),
-                    acceleration,
-                }
+                // Connect mode targets an existing, shared instance (e.g. Atlas).
+                // Route this run to a fresh per-run database so concurrent runs are
+                // isolated and cleanup is a single drop. The database is created
+                // lazily on first write (by the spicebench sink) and dropped at
+                // teardown via the MongoDbGuard below.
+                let database = format!("spidapter_{short_id}");
+                let uri = with_mongodb_database(&mongo_conf.uri, &database);
+                eprintln!(
+                    "[stdio] MongoDB connect: using per-run database '{database}' \
+                     (created on first write, dropped at teardown)"
+                );
+                mongodb_guard = Some(MongoDbGuard::new(uri.clone(), database));
+                FederatedStorageConfig::MongoDB { uri, acceleration }
             }
         };
 
@@ -990,10 +1088,12 @@ impl Handler for SpidapterHandler {
             RunState::Scp(scp) => {
                 scp.ec2_guards = ec2_guards;
                 scp.dynamodb_guard = dynamodb_guard;
+                scp.mongodb_guard = mongodb_guard;
             }
             RunState::Local(local) => {
                 local.ec2_guards = ec2_guards;
                 local.dynamodb_guard = dynamodb_guard;
+                local.mongodb_guard = mongodb_guard;
             }
         }
 
@@ -1107,14 +1207,16 @@ impl Handler for SpidapterHandler {
             RunState::Local(local) => local.storage.clone(),
         };
 
-        let (ec2_guards, dynamodb_guard) = match &mut state {
+        let (ec2_guards, dynamodb_guard, mongodb_guard) = match &mut state {
             RunState::Scp(scp) => (
                 std::mem::take(&mut scp.ec2_guards),
                 scp.dynamodb_guard.take(),
+                scp.mongodb_guard.take(),
             ),
             RunState::Local(local) => (
                 std::mem::take(&mut local.ec2_guards),
                 local.dynamodb_guard.take(),
+                local.mongodb_guard.take(),
             ),
         };
 
@@ -1133,6 +1235,11 @@ impl Handler for SpidapterHandler {
             if let Some(mut guard) = dynamodb_guard {
                 guard.disarm();
                 eprintln!("[stdio] teardown(preserve): keeping DynamoDB tables alive");
+            }
+            if let Some(mut guard) = mongodb_guard
+                && let Some((_, database)) = guard.disarm()
+            {
+                eprintln!("[stdio] teardown(preserve): keeping MongoDB database '{database}' alive");
             }
             // For SCP: skip app deletion so the deployed spiced stays running.
             eprintln!("[stdio] teardown(preserve): skipping resource deletion");
@@ -1195,6 +1302,18 @@ impl Handler for SpidapterHandler {
                 );
                 if let Err(e) = delete_dynamodb_tables(&info).await {
                     eprintln!("[stdio] teardown: warning: failed to delete DynamoDB tables: {e}");
+                }
+            });
+        }
+        if let Some(mut guard) = mongodb_guard
+            && let Some((uri, database)) = guard.disarm()
+        {
+            cleanup.spawn(async move {
+                eprintln!("[stdio] teardown: dropping MongoDB database '{database}'");
+                if let Err(e) = drop_mongodb_database(&uri, &database).await {
+                    eprintln!(
+                        "[stdio] teardown: warning: failed to drop MongoDB database '{database}': {e}"
+                    );
                 }
             });
         }
@@ -1692,6 +1811,30 @@ mod tests {
 
         let config = SetupConfig::from_metadata(&metadata);
         assert_eq!(config.region.as_deref(), Some("us-west-2"));
+    }
+
+    #[test]
+    fn with_mongodb_database_replaces_path() {
+        // Existing database in the path is replaced.
+        assert_eq!(
+            with_mongodb_database("mongodb+srv://u:p@host/old?tls=true", "spidapter_abc"),
+            "mongodb+srv://u:p@host/spidapter_abc?tls=true"
+        );
+        // No database in the path: one is appended.
+        assert_eq!(
+            with_mongodb_database("mongodb+srv://u:p@host/?retryWrites=true", "db1"),
+            "mongodb+srv://u:p@host/db1?retryWrites=true"
+        );
+        // No path and no query at all.
+        assert_eq!(
+            with_mongodb_database("mongodb://localhost:27017", "db1"),
+            "mongodb://localhost:27017/db1"
+        );
+        // No query string, existing db path.
+        assert_eq!(
+            with_mongodb_database("mongodb://localhost:27017/test", "db1"),
+            "mongodb://localhost:27017/db1"
+        );
     }
 
     #[test]

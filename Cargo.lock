@@ -18458,6 +18458,7 @@ dependencies = [
  "base64 0.22.1",
  "clap",
  "dirs",
+ "mongodb",
  "regex",
  "reqwest 0.12.24",
  "runtime-secrets",

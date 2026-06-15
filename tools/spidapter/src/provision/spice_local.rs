@@ -173,6 +173,7 @@ pub(crate) async fn provision_local_single_node(
         storage: setup_config.storage.clone(),
         ec2_guards: vec![],
         dynamodb_guard: None,
+        mongodb_guard: None,
     })))
 }
 
@@ -403,6 +404,7 @@ pub(crate) async fn provision_local_spiced_cluster(
         storage: setup_config.storage.clone(),
         ec2_guards: vec![],
         dynamodb_guard: None,
+        mongodb_guard: None,
     })))
 }
 
