@@ -16,8 +16,7 @@ description: "Query: tpch_simple_q4"
 |               |         RepartitionExec: partitioning=Hash([L_LINENUMBER@0, L_QUANTITY@1], 32), input_partitions=32                                      |
 |               |           AggregateExec: mode=Partial, gby=[L_LINENUMBER@0 as L_LINENUMBER, L_QUANTITY@1 as L_QUANTITY], aggr=[avg(lineitem.L_TAX)]      |
 |               |             RepartitionExec: partitioning=RoundRobinBatch(32), input_partitions=1                                                        |
-|               |               CooperativeExec                                                                                                            |
-|               |                 BytesProcessedExec                                                                                                       |
-|               |                   OracleExec sql=SELECT "L_LINENUMBER", "L_QUANTITY", "L_TAX" FROM "TPCH_SF1"."LINEITEM"                                 |
+|               |               BytesProcessedExec                                                                                                         |
+|               |                 OracleExec sql=SELECT "L_LINENUMBER", "L_QUANTITY", "L_TAX" FROM "TPCH_SF1"."LINEITEM"                                   |
 |               |                                                                                                                                          |
 +---------------+------------------------------------------------------------------------------------------------------------------------------------------+
