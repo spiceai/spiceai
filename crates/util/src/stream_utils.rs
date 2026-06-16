@@ -154,6 +154,7 @@ pub fn sort_stream(
 /// is byte-identical to what `sort_stream` physically wrote. Re-deriving the
 /// options separately risks a mismatch (advertise ASC while the file is DESC),
 /// which would make sort-elimination / merge-join produce WRONG results.
+#[must_use]
 pub fn parse_sort_entry(entry: &str) -> Option<(&str, arrow::compute::SortOptions)> {
     let tokens: Vec<&str> = entry.split_whitespace().collect();
     let (&column, modifiers) = tokens.split_first()?;
