@@ -1036,9 +1036,7 @@ impl LiveActuators {
                 .compaction_background_interval_ms
                 .load(Ordering::Relaxed),
             compaction_trigger_files: self.compaction_trigger_files.load(Ordering::Relaxed),
-            bake_deletion_index_trigger: self
-                .bake_deletion_index_trigger
-                .load(Ordering::Relaxed),
+            bake_deletion_index_trigger: self.bake_deletion_index_trigger.load(Ordering::Relaxed),
             write_concurrency: self.write_concurrency.load(Ordering::Relaxed),
             mem_tier_max_bytes: self.mem_tier_max_bytes.load(Ordering::Relaxed),
         }

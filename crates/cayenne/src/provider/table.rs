@@ -4445,13 +4445,16 @@ impl CayenneTableProvider {
             return Ok(false);
         }
 
-        // No entries remain: drop the now-empty directory. Treat a concurrent
-        // removal (NotFound) or a late writer racing a file in (NotEmpty) as
-        // "not fully removed" rather than an error — the next sweep retries.
+        // No entries remain: drop the now-empty directory. A concurrent removal
+        // (NotFound) counts as fully removed; a late writer racing a file in
+        // (DirectoryNotEmpty) is "not fully removed" so the next sweep retries.
+        // Every OTHER error (permission denied, read-only FS) is surfaced rather
+        // than silently downgraded to a forever-retry.
         match std::fs::remove_dir(snapshot_dir) {
             Ok(()) => Ok(true),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(true),
-            Err(_) => Ok(false),
+            Err(e) if e.kind() == std::io::ErrorKind::DirectoryNotEmpty => Ok(false),
+            Err(e) => Err(e),
         }
     }
 
@@ -4515,7 +4518,7 @@ impl CayenneTableProvider {
         // observation of `current`/`protected` the `due` filter used) so the
         // spawned task ref-counts against a coherent set.
         let mut live_snapshot_ids: HashSet<String> = protected.keys().cloned().collect();
-        live_snapshot_ids.insert(current.clone());
+        live_snapshot_ids.insert(current);
         let table_path = self.table_metadata.path.clone();
         let table_id = self.table_metadata.table_id.clone();
         let runtime_env = Arc::clone(self.context.runtime_env());
@@ -4890,15 +4893,25 @@ impl CayenneTableProvider {
                     .parts()
                     .next_back()
                     .map(|p| p.as_ref().to_string());
-                let referenced = file_name.as_ref().is_some_and(|name| {
-                    live_referenced.contains(&Self::manifest_file_relative_path(
-                        retiring_snapshot_id,
-                        name,
-                    ))
-                });
+                // Only compactable data files participate in ref-counting; a
+                // non-data sidecar (e.g. a staging WAL artifact) is never a
+                // manifest target, so leave it untouched — mirrors the local
+                // delete_retired_snapshot_dir_refcounted conservative
+                // (never-orphan) behavior instead of deleting unknown objects.
+                let is_data_file = file_name
+                    .as_deref()
+                    .is_some_and(Self::is_compactable_data_file);
+                let referenced = is_data_file
+                    && file_name.as_ref().is_some_and(|name| {
+                        live_referenced.contains(&Self::manifest_file_relative_path(
+                            retiring_snapshot_id,
+                            name,
+                        ))
+                    });
                 async move {
-                    if referenced {
-                        // Referenced in place by a live/protected snapshot — keep.
+                    if !is_data_file || referenced {
+                        // Non-data sidecar (kept, never orphaned) or referenced in
+                        // place by a live/protected snapshot — keep.
                         return Ok(());
                     }
                     store
@@ -11256,13 +11269,16 @@ impl CayenneTableProvider {
         // For the preserve mode, read the snapshot's existing manifest ONCE so a
         // re-list cannot clobber a merged `[min, max]` the compaction that minted
         // this snapshot already authored (the catalog upsert is `INSERT OR
-        // REPLACE`). Empty for `Uniform`, where every range is fixed.
+        // REPLACE`). Empty for `Uniform`, where every range is fixed. A read error
+        // PROPAGATES rather than degrading to an empty map: silently dropping the
+        // existing ranges could clobber a compaction-authored merged `[min, max]`
+        // with the per-file fallback and overstate `min_sequence` (an unsafe
+        // reference-in-place input for the seq-prefix bake).
         let existing: std::collections::HashMap<String, (i64, i64)> = match tag {
             ManifestSequenceTag::PreserveOrUniform { .. } => self
                 .catalog
                 .get_snapshot_files(&table_id, snapshot_id)
-                .await
-                .unwrap_or_default()
+                .await?
                 .into_iter()
                 .map(|f| (f.file_path, (f.min_sequence, f.max_sequence)))
                 .collect(),
@@ -11356,20 +11372,37 @@ impl CayenneTableProvider {
     /// selected inputs).
     ///
     /// Returns `None` when none of the snapshots has any manifest row (nothing to
-    /// fold — the caller falls back to a conservative range). A snapshot whose
-    /// manifest read fails is skipped (best-effort), so a partial outage shrinks
-    /// the folded set rather than poisoning it.
+    /// fold — the caller falls back to a conservative range) OR when any
+    /// snapshot's manifest read fails: failing closed avoids a non-conservative
+    /// (overstated-`min_sequence`) folded range that could drive an unsafe
+    /// reference-in-place decision.
     async fn merged_sequence_range_over_snapshots(
         &self,
         snapshot_ids: &[String],
     ) -> Option<(i64, i64)> {
         let mut range: Option<(i64, i64)> = None;
         for id in snapshot_ids {
-            let files = self
+            let files = match self
                 .catalog
                 .get_snapshot_files(&self.table_metadata.table_id, id)
                 .await
-                .unwrap_or_default();
+            {
+                Ok(files) => files,
+                // Fail CLOSED: skipping a low-`min_sequence` snapshot on a read
+                // error would OVERSTATE the merged min and could make a file look
+                // "clean past T" and be referenced in place — unsafe once `<= T`
+                // tombstones are pruned. Fall back to the conservative range.
+                Err(error) => {
+                    tracing::warn!(
+                        table = self.table_name(),
+                        %error,
+                        snapshot_id = id.as_str(),
+                        "Failed to read a snapshot manifest while folding the merged \
+                         sequence range; falling back to the conservative range"
+                    );
+                    return None;
+                }
+            };
             for file in files {
                 range = Some(match range {
                     None => (file.min_sequence, file.max_sequence),
@@ -12587,13 +12620,14 @@ impl CayenneTableProvider {
     ///     (the threshold exemption); OR
     ///   - (no `<= T` rows) its manifest proves every file's `min_sequence > T`, so
     ///     no `<= T` tombstone targets any of its rows.
+    ///
     /// The CURRENT snapshot has no `protected_snapshots` value and applies ALL
     /// tombstones, so it is clean past T only via the second clause (all rows `> T`)
     /// or when it is genesis (empty manifest — no rows). An empty-manifest PROTECTED
     /// snapshot whose watermark is `< T` cannot be proven clean and conservatively
     /// blocks (a later pass retries once it is baked or its watermark advances).
     /// Snapshots are immutable, and a snapshot a concurrent publish adds carries a
-    /// sequence `> T` (one monotonic counter; T is a past max_sequence), so a clean
+    /// sequence `> T` (one monotonic counter; T is a past `max_sequence`), so a clean
     /// result here holds through the prune under the fence. Returns `(holds,
     /// violating_value_for_logging)`.
     async fn bake_clean_prefix_holds(
@@ -12614,10 +12648,8 @@ impl CayenneTableProvider {
             // snapshot whose watermark covers T is clean past T regardless of its
             // write-range. The current snapshot has no entry here.
             let watermark = protected.get(id).copied();
-            if let Some(w) = watermark {
-                if w >= prefix_cutoff {
-                    continue;
-                }
+            if watermark.is_some_and(|w| w >= prefix_cutoff) {
+                continue;
             }
             let files = self
                 .catalog
@@ -22956,7 +22988,7 @@ mod tests {
     /// file set is resolved from `cayenne_snapshot_file` (the manifest) instead
     /// of by listing the snapshot directory — and the two must be EQUAL.
     ///
-    /// The baseline is DataFusion's own `ListingTable::list_files_for_scan`,
+    /// The baseline is `DataFusion`'s own `ListingTable::list_files_for_scan`,
     /// which always lists the directory regardless of the flag, so it is an
     /// independent directory-built file set. The provider under test has the flag
     /// ON, so its `list_files_for_snapshot_scan` routes through the manifest. The
@@ -23713,7 +23745,7 @@ mod tests {
     /// `delete_seq <= T` is GONE from the index AND the deleted row stays deleted
     /// on scan. Five snapshots (ids 0..5) pinned at seqs 10,20,30,40,50; K = 3 is
     /// kept unbaked, so the older prefix is {0,1} with `T = 20`. Key 0 (written at
-    /// 10) is deleted at delete_seq 15 (<= T) — the bake must physically remove it
+    /// 10) is deleted at `delete_seq` 15 (<= T) — the bake must physically remove it
     /// and drop the tombstone; key 1 (written at 20) is NOT deleted and survives.
     #[tokio::test]
     async fn seq_prefix_bake_drops_baked_tombstone_and_keeps_row_deleted() {
@@ -24116,7 +24148,7 @@ mod tests {
     ///
     /// Six protected snapshots; the older prefix is the oldest three (ids 0,1,2).
     /// We EMPTY id-2's manifest; it is now baked via its watermark alongside {0,1}.
-    /// Key 2 is deleted at delete_seq 12 (above id-2's small watermark, so the merge
+    /// Key 2 is deleted at `delete_seq` 12 (above id-2's small watermark, so the merge
     /// applies it), so id-2's copy is removed and the tombstone is pruned. The newest
     /// K=3 ({3,4,5}) stay live and `> T`.
     #[tokio::test]
@@ -24188,13 +24220,19 @@ mod tests {
             .bake_seq_prefix_protected_snapshots()
             .await
             .expect("bake should not error");
-        assert!(baked, "the older prefix (incl the empty-manifest id-2) must bake");
+        assert!(
+            baked,
+            "the older prefix (incl the empty-manifest id-2) must bake"
+        );
 
         // FIX: an empty-manifest CANDIDATE is now BAKED via its protected-set
         // watermark (its single commit-sequence), not skipped — so it is retired
         // into the merge and is no longer a live blocker.
         assert!(
-            !provider.protected_snapshots.load_full().contains_key(&empty_id),
+            !provider
+                .protected_snapshots
+                .load_full()
+                .contains_key(&empty_id),
             "the empty-manifest older candidate must be baked away (merged into M)"
         );
 

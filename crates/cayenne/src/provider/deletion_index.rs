@@ -525,10 +525,14 @@ where
                 max_sequence_number = Some(outcome.entry.delete_seq);
             }
             // Write to ACTIVE only (merge within active; runs stay un-fused so
-            // they remain independently seq-skippable). Skip stale no-ops.
-            let active_current = active.get(&key).copied();
-            let active_merged = merged_entry(active_current, delete_seq, insert_seq).entry;
-            if active_current != Some(active_merged) {
+            // they remain independently seq-skippable). Skip stale no-ops against
+            // the FUSED pre-state (active + all runs), not just active: an
+            // addition already covered by an older run must not be copied into the
+            // hot `active` tier — it would bloat active and trigger premature
+            // freezes/folds without changing the fused value.
+            if fused != Some(outcome.entry) {
+                let active_current = active.get(&key).copied();
+                let active_merged = merged_entry(active_current, delete_seq, insert_seq).entry;
                 active.insert(key, active_merged);
             }
         }
@@ -1443,6 +1447,8 @@ impl KeyDeletionIndex {
 
 #[cfg(test)]
 mod tests {
+    // Random u64 test keys are intentionally bit-cast to i64 (wrap is fine for keys).
+    #![allow(clippy::cast_possible_wrap)]
     use super::*;
 
     fn byte_key(value: u64) -> Box<[u8]> {
@@ -1656,13 +1662,15 @@ mod tests {
                     .iter()
                     .filter_map(|(k, (d, _))| (*d != SEQUENCE_ABSENT).then_some(*k))
                     .collect();
-                let naive_range = del_keys
-                    .iter()
-                    .min()
-                    .map(|mn| (*mn, *del_keys.iter().max().unwrap()));
+                let naive_range = del_keys.iter().min().map(|mn| {
+                    (
+                        *mn,
+                        *del_keys.iter().max().expect("non-empty: min() was Some"),
+                    )
+                });
                 let idx_range = idx
                     .min_deleted_key
-                    .map(|mn| (mn, idx.max_deleted_key.unwrap()));
+                    .map(|mn| (mn, idx.max_deleted_key.expect("max set when min is Some")));
                 assert_eq!(idx_range, naive_range, "trial {trial}: deleted_key_range");
 
                 // iter_entries: each key exactly once, fully fused.

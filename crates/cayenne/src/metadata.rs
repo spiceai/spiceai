@@ -706,7 +706,7 @@ pub struct VortexConfig {
     /// (bounding write-amp); a smaller value bakes more often (smaller index,
     /// cheaper probe). Key-delete tables only (position-delete tables never bake).
     ///
-    /// Defaults to 50_000 (see
+    /// Defaults to `50_000` (see
     /// [`crate::provider::table::BAKE_DELETION_INDEX_TRIGGER`]).
     #[serde(default = "default_bake_deletion_index_trigger")]
     pub bake_deletion_index_trigger: usize,

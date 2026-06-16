@@ -337,22 +337,38 @@ impl CayenneTableProvider {
         // `PreparedOverwrite::finish` (after the catalog flip commits), mirroring
         // the full-rewrite path's publish-before-clear ordering. Best-effort: a
         // failure leaves the scan on directory listing and never loses rows.
-        let overwrite_sequence = self.reserve_sequences_local(1).await.unwrap_or(0);
-        if let Err(error) = self
-            .author_uniform_snapshot_manifest(
-                &new_snapshot_id,
-                overwrite_sequence,
-                overwrite_sequence,
-            )
-            .await
-        {
-            tracing::warn!(
-                table = self.table_name(),
-                %error,
-                new_snapshot_id = new_snapshot_id.as_str(),
-                "Failed to author overwrite snapshot manifest before commit; \
-                 scan falls back to directory listing"
-            );
+        // On reservation failure do NOT fabricate a sequence: authoring a manifest
+        // with a bogus `[0, 0]` range would make seq-based decisions (the
+        // seq-prefix bake) treat this snapshot as "very old" and risk an unsafe
+        // prune. Skip authoring entirely and leave the scan on directory listing.
+        match self.reserve_sequences_local(1).await {
+            Ok(overwrite_sequence) => {
+                if let Err(error) = self
+                    .author_uniform_snapshot_manifest(
+                        &new_snapshot_id,
+                        overwrite_sequence,
+                        overwrite_sequence,
+                    )
+                    .await
+                {
+                    tracing::warn!(
+                        table = self.table_name(),
+                        %error,
+                        new_snapshot_id = new_snapshot_id.as_str(),
+                        "Failed to author overwrite snapshot manifest before commit; \
+                         scan falls back to directory listing"
+                    );
+                }
+            }
+            Err(error) => {
+                tracing::warn!(
+                    table = self.table_name(),
+                    %error,
+                    new_snapshot_id = new_snapshot_id.as_str(),
+                    "Failed to reserve a sequence for the overwrite snapshot manifest; \
+                     skipping manifest authoring — scan falls back to directory listing"
+                );
+            }
         }
 
         Ok(PreparedOverwrite {
