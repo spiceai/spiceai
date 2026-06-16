@@ -451,7 +451,7 @@ impl CayenneContext {
     /// write path (encode permits, the single-writer metastore, cores) — must
     /// DEFER this round and yield to the foreground writer. Keyed on
     /// `apply_vs_arrival` (per-batch apply latency ÷ offered-load interval;
-    /// `> 1` ⇒ no headroom, the apply is falling behind), gated on fresh ingest
+    /// `>= 1` ⇒ no headroom, the apply is at or past break-even), gated on fresh ingest
     /// since the last check so a table that fell behind and then went idle does
     /// not block its bake forever on a stale EWMA. Returns `false` (allow the
     /// bake) before warmup or when ingest is idle — exactly the windows where
@@ -466,7 +466,7 @@ impl CayenneContext {
         let ingest_fresh = snapshot.samples > last;
         ingest_fresh
             && snapshot.samples >= tuning::WARMUP_BATCHES
-            && snapshot.apply_vs_arrival > tuning::BAKE_BACKPRESSURE_RATIO
+            && snapshot.apply_vs_arrival >= tuning::BAKE_BACKPRESSURE_RATIO
     }
 
     /// Protected snapshot count that should trigger maintenance compaction.
