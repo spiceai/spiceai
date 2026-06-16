@@ -3431,7 +3431,10 @@ impl DataFusion {
                 .fail();
             }
 
-            if let Some(enriched) = table.as_any().downcast_ref::<MetadataEnrichedTableProvider>() {
+            if let Some(enriched) = table
+                .as_any()
+                .downcast_ref::<MetadataEnrichedTableProvider>()
+            {
                 let inner = Arc::clone(enriched.get_inner_ref());
                 table = inner;
                 continue;
@@ -4899,7 +4902,8 @@ mod tests {
         // dataset: non-empty table metadata forces the MetadataEnrichedTableProvider.
         let mut table_metadata = HashMap::new();
         table_metadata.insert("source_owner".to_string(), "analytics".to_string());
-        let wrapped = table_provider_with_spicepod_metadata(Arc::clone(&inner), &table_metadata, &[]);
+        let wrapped =
+            table_provider_with_spicepod_metadata(Arc::clone(&inner), &table_metadata, &[]);
         assert!(
             wrapped
                 .as_any()
