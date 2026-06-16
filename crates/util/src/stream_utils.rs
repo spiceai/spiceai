@@ -144,10 +144,18 @@ pub fn sort_stream(
 /// Parse one sort specification of the form
 /// `column [ASC|DESC] [NULLS FIRST|LAST]` (case-insensitive) into the column
 /// name and its Arrow [`SortOptions`](arrow::compute::SortOptions). When the
-/// NULLS placement is omitted it follows the SQL/Postgres `ORDER BY` default:
+/// NULLS placement is omitted, it follows the SQL/Postgres `ORDER BY` default:
 /// NULLs first for `DESC`, NULLs last for `ASC`. Returns `None` for an entry
 /// that does not match the grammar (the caller decides how to degrade).
-fn parse_sort_entry(entry: &str) -> Option<(&str, arrow::compute::SortOptions)> {
+///
+/// PUBLIC because any code that advertises a scan `output_ordering` derived from
+/// these same sort columns (e.g. Cayenne's sorted-compaction ordering) MUST build
+/// its `SortOptions` from THIS parser, so the advertised direction/nulls placement
+/// is byte-identical to what `sort_stream` physically wrote. Re-deriving the
+/// options separately risks a mismatch (advertise ASC while the file is DESC),
+/// which would make sort-elimination / merge-join produce WRONG results.
+#[must_use]
+pub fn parse_sort_entry(entry: &str) -> Option<(&str, arrow::compute::SortOptions)> {
     let tokens: Vec<&str> = entry.split_whitespace().collect();
     let (&column, modifiers) = tokens.split_first()?;
 

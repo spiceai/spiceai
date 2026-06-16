@@ -731,6 +731,9 @@ pub struct DataFusion {
     pub(crate) accelerator_engine_registry: Arc<AcceleratorEngineRegistry>,
     // Controls the parallelism of accelerated table refreshes
     acceleration_refresh_semaphore: Option<Arc<Semaphore>>,
+    // Bounds concurrently-executing analytical queries (query admission control);
+    // `None` = unbounded. Sized from `runtime.query.max_concurrent_queries`.
+    query_admission_semaphore: Option<Arc<Semaphore>>,
     pub(crate) task_history_enabled: bool,
     // Dedicated runtime for CPU-bound DataFusion queries
     cpu_runtime: OnceLock<ManagedTokioRuntime>,
@@ -893,6 +896,13 @@ impl DataFusion {
 
     pub fn accelerator_engine_registry(&self) -> Arc<AcceleratorEngineRegistry> {
         Arc::clone(&self.accelerator_engine_registry)
+    }
+
+    /// The query-admission semaphore when `runtime.query.max_concurrent_queries`
+    /// is set; `None` means unbounded (no admission gating). Mirrors
+    /// `acceleration_refresh_semaphore` for the read/query side.
+    pub(crate) fn query_admission_semaphore(&self) -> Option<Arc<Semaphore>> {
+        self.query_admission_semaphore.clone()
     }
 
     #[must_use]

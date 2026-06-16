@@ -303,6 +303,7 @@ impl RuntimeBuilder {
 
         let memory_limit = parse_memory_limit(query.memory_limit.clone());
         let target_partitions = query.target_partitions;
+        let max_concurrent_queries = query.max_concurrent_queries;
 
         let metrics = spicepod_rt.metrics.clone();
 
@@ -613,6 +614,7 @@ impl RuntimeBuilder {
         )
         .memory_limit(memory_limit)
         .target_partitions(target_partitions)
+        .max_concurrent_queries(max_concurrent_queries)
         .temp_directory(query.temp_directory)
         .spill_compression(query.spill_compression)
         .with_task_history(task_history)
