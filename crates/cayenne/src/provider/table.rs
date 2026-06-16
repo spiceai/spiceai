@@ -15921,6 +15921,7 @@ impl CayenneTableProvider {
     ///      [`util::stream_utils::parse_sort_entry`].
     ///   3. otherwise `sort_stream` ABANDONS the whole sort and writes the stream
     ///      UNSORTED.
+    ///
     /// We mirror all three: (1)/(2) build the matching `SortExpr`; (3) — and any
     /// entry whose resolved column is absent from `scan_schema` (e.g. projected
     /// out, where a partial order would be unsound) — returns `None`, so the scan
@@ -15988,6 +15989,7 @@ impl CayenneTableProvider {
         .await
     }
 
+    #[expect(clippy::too_many_arguments)]
     async fn create_snapshot_scan_plan_with_config(
         &self,
         state: &dyn Session,

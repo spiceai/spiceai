@@ -2365,6 +2365,119 @@ mod tests {
         );
     }
 
+    /// [query admission] With `max_concurrent_queries = 1`, a second
+    /// query-executing plan must block at permit acquisition while the first
+    /// query's result stream is still alive (the permit rides that stream's
+    /// guard), and must proceed once the first stream is dropped. Guards against
+    /// losing the intended backpressure and against leaking / never releasing a
+    /// permit (a deadlock). The block is real — A holds the only permit — not
+    /// timing-dependent: B can finish early only if admission is broken.
+    #[tokio::test]
+    async fn query_admission_blocks_second_query_until_first_stream_drops() {
+        use std::time::Duration;
+        let df = Arc::new(
+            DataFusionBuilder::new(
+                RuntimeStatus::new(),
+                Arc::new(AcceleratorEngineRegistry::new()),
+                Handle::current(),
+            )
+            .max_concurrent_queries(Some(1))
+            .build(),
+        );
+
+        // Query A acquires the only permit at run() time; the permit rides the
+        // result stream's guard and is held until that stream is dropped.
+        let query_a = QueryBuilder::new("SELECT 42 AS value", Arc::clone(&df))
+            .build()
+            .run()
+            .await
+            .expect("query A should run");
+
+        // B is a DISTINCT query (cache miss → actually reaches the admission gate)
+        // and is spawned so the test task can observe whether run() blocks.
+        let df_b = Arc::clone(&df);
+        let mut b_handle = tokio::spawn(async move {
+            QueryBuilder::new("SELECT 43 AS value", df_b)
+                .build()
+                .run()
+                .await
+                .map(|_q| ())
+        });
+
+        // While A's stream lives, B's run() must NOT return. `biased` polls B's
+        // completion before the timer, so a regression that lets B through is
+        // caught immediately.
+        tokio::select! {
+            biased;
+            r = &mut b_handle => panic!(
+                "query B should block on the admission permit while A holds it, but run() returned: {r:?}"
+            ),
+            () = tokio::time::sleep(Duration::from_millis(750)) => {}
+        }
+
+        // Releasing A's stream frees the permit; B can now finish run().
+        drop(query_a);
+        let b_outcome = tokio::time::timeout(Duration::from_secs(10), b_handle)
+            .await
+            .expect("query B should proceed once the permit is released")
+            .expect("query B task should not panic");
+        b_outcome.expect("query B should run successfully after the permit frees");
+    }
+
+    /// [query admission] A query cancelled WHILE QUEUED for an admission permit
+    /// must return `QueryCancelled` promptly (via the `biased` cancel race),
+    /// instead of blocking until the permit frees and then executing.
+    #[tokio::test]
+    async fn query_admission_cancellation_while_queued_returns_cancelled() {
+        use std::time::Duration;
+        let df = Arc::new(
+            DataFusionBuilder::new(
+                RuntimeStatus::new(),
+                Arc::new(AcceleratorEngineRegistry::new()),
+                Handle::current(),
+            )
+            .max_concurrent_queries(Some(1))
+            .build(),
+        );
+
+        // A holds the only permit (kept alive for the whole test).
+        let _query_a = QueryBuilder::new("SELECT 42 AS value", Arc::clone(&df))
+            .build()
+            .run()
+            .await
+            .expect("query A should run");
+
+        let query_id = uuid::Uuid::new_v4();
+        let cancel_token = CancellationToken::new();
+        let df_b = Arc::clone(&df);
+        let token_b = cancel_token.clone();
+        let b_handle = tokio::spawn(async move {
+            QueryBuilder::new("SELECT 43 AS value", df_b)
+                .query_id(query_id)
+                .cancellation_token(token_b)
+                .build()
+                .run()
+                .await
+                .map(|_q| ())
+        });
+
+        // Let B queue behind A for the permit, then cancel it.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        cancel_token.cancel();
+
+        let b_err = tokio::time::timeout(Duration::from_secs(5), b_handle)
+            .await
+            .expect("cancelled query B should return promptly, not block on the permit")
+            .expect("query B task should not panic")
+            .expect_err("query B should fail with cancellation");
+        match b_err {
+            Error::QueryCancelled {
+                query_id: cancelled,
+            } => assert_eq!(cancelled, query_id.to_string()),
+            other => panic!("expected QueryCancelled, got: {other:?}"),
+        }
+    }
+
     #[tokio::test]
     async fn test_parameter_schema_ordering_basic() {
         use datafusion::execution::context::SessionContext;

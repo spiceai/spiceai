@@ -144,7 +144,7 @@ pub fn sort_stream(
 /// Parse one sort specification of the form
 /// `column [ASC|DESC] [NULLS FIRST|LAST]` (case-insensitive) into the column
 /// name and its Arrow [`SortOptions`](arrow::compute::SortOptions). When the
-/// NULLS placement is omitted it follows the SQL/Postgres `ORDER BY` default:
+/// NULLS placement is omitted, it follows the SQL/Postgres `ORDER BY` default:
 /// NULLs first for `DESC`, NULLs last for `ASC`. Returns `None` for an entry
 /// that does not match the grammar (the caller decides how to degrade).
 ///
