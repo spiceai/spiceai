@@ -567,7 +567,16 @@ where
             let mut map: HashMap<K, TombstoneEntry, S> =
                 HashMap::with_capacity_and_hasher(active.len(), S::default());
             let mut run_max = SEQUENCE_ABSENT;
-            let run_bloom = SplitBlockBloomFilter::new(bloom_capacity_for(active.len()));
+            // Size the per-run bloom by the DELETION-key count, not total entries:
+            // only deletion keys are inserted below, so sizing by `active.len()`
+            // (which includes insert-only entries) over-allocates the bloom on
+            // insert-heavy runs and hurts the cache residency this refactor exists
+            // to protect. Mirrors the global bloom's `bloom_capacity_for(delete…)`.
+            let active_deletes = active
+                .iter()
+                .filter(|(_, e)| e.delete_seq != SEQUENCE_ABSENT)
+                .count();
+            let run_bloom = SplitBlockBloomFilter::new(bloom_capacity_for(active_deletes.max(1)));
             for (key, entry) in active.iter() {
                 if entry.delete_seq != SEQUENCE_ABSENT {
                     if entry.delete_seq > run_max {
@@ -610,9 +619,21 @@ where
             // Build the merged run's bloom in the same passes that build the map:
             // the merged key carries a delete iff either side did, so inserting
             // each side's delete keys yields the union (no extra pass over the map).
-            let bloom = SplitBlockBloomFilter::new(bloom_capacity_for(
-                older.map.len().saturating_add(newer.map.len()),
-            ));
+            // Size the merged bloom by the DELETION-key count (only deletions are
+            // inserted below), not the total entry count — the sum over-counts a
+            // key deleted in both runs but stays far tighter than counting
+            // insert-only entries, keeping the recent-run blooms cache-resident.
+            let merged_deletes = older
+                .map
+                .iter()
+                .filter(|(_, e)| e.delete_seq != SEQUENCE_ABSENT)
+                .count()
+                + newer
+                    .map
+                    .iter()
+                    .filter(|(_, e)| e.delete_seq != SEQUENCE_ABSENT)
+                    .count();
+            let bloom = SplitBlockBloomFilter::new(bloom_capacity_for(merged_deletes.max(1)));
             for (key, entry) in older.map.iter() {
                 map.insert(*key, *entry);
                 if entry.delete_seq != SEQUENCE_ABSENT {
