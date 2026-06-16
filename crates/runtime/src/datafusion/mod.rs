@@ -78,7 +78,10 @@ use cache::TabledCacheProvider;
 use cache::result::embeddings::CachedEmbeddingResult;
 use cache::result::search::CachedSearchResult;
 use cache::{CacheProvider, Caching, QueryResultsCacheProvider, key::RawCacheKey};
-use data_components::{FieldMetadata, metadata_enriched_table_provider, poly::PolyTableProvider};
+use data_components::{
+    FieldMetadata, MetadataEnrichedTableProvider, metadata_enriched_table_provider,
+    poly::PolyTableProvider,
+};
 use datafusion::catalog::CatalogProvider;
 use datafusion::catalog::SchemaProvider;
 use datafusion::common::{Constraint, Constraints, ToDFSchema};
@@ -3406,18 +3409,38 @@ impl DataFusion {
             .await
             .map_err(find_datafusion_root)
             .context(UnableToGetTableSnafu)?;
-        if let Some(adaptor) = table
-            .as_any()
-            .downcast_ref::<FederatedTableProviderAdaptor>()
-        {
-            if let Some(nested_table) = adaptor.table_provider.clone() {
-                table = nested_table;
-            } else {
+        // Peel the wrappers that can sit between the catalog entry and the
+        // underlying `AcceleratedTable` so callers can downcast to it.
+        // PolyTableProvider-backed accelerators are wrapped in a
+        // `FederatedTableProviderAdaptor`, and datasets that declare table- or
+        // column-level metadata are wrapped in a `MetadataEnrichedTableProvider`
+        // by `register_accelerated_table`. The two can nest in either order, so
+        // loop until neither wrapper matches.
+        loop {
+            if let Some(adaptor) = table
+                .as_any()
+                .downcast_ref::<FederatedTableProviderAdaptor>()
+            {
+                if let Some(nested_table) = adaptor.table_provider.clone() {
+                    table = nested_table;
+                    continue;
+                }
                 return UnableToRetrieveTableFromFederationSnafu {
                     table_name: dataset_name.to_string(),
                 }
                 .fail();
             }
+
+            if let Some(enriched) = table
+                .as_any()
+                .downcast_ref::<MetadataEnrichedTableProvider>()
+            {
+                let inner = Arc::clone(enriched.get_inner_ref());
+                table = inner;
+                continue;
+            }
+
+            break;
         }
         Ok(table)
     }
@@ -4294,6 +4317,13 @@ fn partition_expr_from_table_provider(table_provider: &Arc<dyn TableProvider>) -
         return partition_expr_from_table_provider(&accelerated.get_accelerator());
     }
 
+    if let Some(enriched) = table_provider
+        .as_any()
+        .downcast_ref::<MetadataEnrichedTableProvider>()
+    {
+        return partition_expr_from_table_provider(enriched.get_inner_ref());
+    }
+
     if let Some(adaptor) = table_provider
         .as_any()
         .downcast_ref::<FederatedTableProviderAdaptor>()
@@ -4842,6 +4872,58 @@ mod tests {
         assert_eq!(
             df.normalize_table_reference(TableReference::bare("cdc_table")),
             table_reference
+        );
+    }
+
+    #[tokio::test]
+    async fn test_get_accelerated_table_provider_peels_metadata_wrapper() {
+        // Regression test: when a dataset declares table- or column-level
+        // metadata, `register_accelerated_table` registers the AcceleratedTable
+        // behind a `MetadataEnrichedTableProvider`. `get_accelerated_table_provider`
+        // must peel that wrapper so callers (e.g. the
+        // `/v1/datasets/{name}/acceleration/refresh` handler) can downcast to the
+        // inner provider; otherwise refresh wrongly reports "Table is not
+        // accelerated". Here a MemTable stands in for the inner AcceleratedTable —
+        // the fix is the wrapper peeling, which is independent of the inner type.
+        let runtime = RuntimeBuilder::new().build().await;
+        let df = DataFusion::builder(
+            status::RuntimeStatus::new(),
+            runtime.accelerator_engine_registry(),
+            Handle::current(),
+        )
+        .build();
+
+        let inner = Arc::new(
+            MemTable::try_new(streaming_broadcast_test_batch(1).schema(), vec![vec![]])
+                .expect("mem table should be created"),
+        ) as Arc<dyn TableProvider>;
+
+        // Wrap exactly as register_accelerated_table does for a metadata-bearing
+        // dataset: non-empty table metadata forces the MetadataEnrichedTableProvider.
+        let mut table_metadata = HashMap::new();
+        table_metadata.insert("source_owner".to_string(), "analytics".to_string());
+        let wrapped =
+            table_provider_with_spicepod_metadata(Arc::clone(&inner), &table_metadata, &[]);
+        assert!(
+            wrapped
+                .as_any()
+                .downcast_ref::<MetadataEnrichedTableProvider>()
+                .is_some(),
+            "precondition: provider should be wrapped in MetadataEnrichedTableProvider"
+        );
+
+        df.ctx
+            .register_table(TableReference::bare("wrapped_accel"), wrapped)
+            .expect("table should register");
+
+        let resolved = df
+            .get_accelerated_table_provider("wrapped_accel")
+            .await
+            .expect("should resolve the accelerated table provider");
+
+        assert!(
+            resolved.as_any().downcast_ref::<MemTable>().is_some(),
+            "get_accelerated_table_provider must peel MetadataEnrichedTableProvider to reach the inner provider"
         );
     }
 
