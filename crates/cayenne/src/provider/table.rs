@@ -13474,17 +13474,22 @@ impl CayenneTableProvider {
 
                 // [no-tombstone short-circuit] The composite-PK analog of the
                 // Int64 arm's disjoint min/max fast path above. When no row-key
-                // tombstone is live (the file-side index AND the in-RAM tier are
-                // both empty) and the PK columns have no nulls, no scanned row can
-                // be hidden and the batch is valid — pass it through and skip the
-                // O(rows x pk_cols) `RowConverter` encode + `filter_record_batch`
-                // copy entirely. The Int64 arm's disjoint *range* check needs the
-                // encoding for composite keys (the very cost being avoided), so the
-                // empty-set check is the sound, cheap equivalent; gating on
-                // no-nulls preserves the null-PK validation error below. Mem-tier
-                // scans of an INSERT-heavy table take this between updates.
+                // DELETE is live (the file-side index carries no deletions and the
+                // in-RAM tier has no deletion keys) and the PK columns have no
+                // nulls, no scanned row can be hidden and the batch is valid — pass
+                // it through and skip the O(rows x pk_cols) `RowConverter` encode +
+                // `filter_record_batch` copy entirely. We gate on the file index's
+                // `has_deletions()`, NOT `is_empty()`: the `KeyDeletionIndex` also
+                // tracks insert-only (upsert re-insertion) records, which `get_batch`
+                // treats as absent and which never hide a row, so an insert-only
+                // index (deletes == 0) is still a valid skip. The Int64 arm's
+                // disjoint *range* check needs the encoding for composite keys (the
+                // very cost being avoided), so the no-deletions check is the sound,
+                // cheap equivalent; gating on no-nulls preserves the null-PK
+                // validation error below. Mem-tier scans of an INSERT-heavy table
+                // take this between updates.
                 if !pk_has_nulls
-                    && deleted_row_keys.is_empty()
+                    && !deleted_row_keys.has_deletions()
                     && inlined_deletions.row_keys.is_empty()
                 {
                     return Ok(Some(batch));
