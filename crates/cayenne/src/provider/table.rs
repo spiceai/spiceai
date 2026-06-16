@@ -31,7 +31,9 @@ use crate::metadata::{
     CreateTableOptions, InlinedData, InlinedDataStats, InlinedDelete, PkConflictDetection,
     SnapshotFileStatistics, TableMetadata, TableStatistics,
 };
-use crate::provider::scan::{CayenneAccelerationExec, round_robin_repartition_if_needed};
+use crate::provider::scan::{
+    CayenneAccelerationExec, SnapshotScanRef, round_robin_repartition_if_needed,
+};
 use crate::provider::sink::CayenneDataSink;
 use crate::provider::{Error, Result};
 use arrow::array::{
@@ -2238,6 +2240,14 @@ pub struct CayenneTableProvider {
     /// consulted by `sweep_retired_snapshot_dirs` so a long-running query
     /// (executing past the grace period) keeps its input dirs alive.
     snapshot_last_listed: Arc<ParkingMutex<HashMap<String, Instant>>>,
+    /// Per-snapshot IN-FLIGHT-SCAN ref-count: `snapshot_id -> live scan count`.
+    /// A scan increments the ids it reads (under `listing_fence.read()`, via
+    /// [`crate::provider::scan::SnapshotScanRef`]) and decrements when its
+    /// `ExecutionPlan` + output streams drop (execution complete). Snapshot
+    /// GC/cleanup (`cleanup_old_snapshots_*`, `sweep_retired_snapshot_dirs`) skips
+    /// any id with count > 0 — the exact "is a scan still reading this dir?" signal
+    /// that replaces the brittle time-based grace a long query could outlive.
+    snapshot_scan_refs: Arc<ParkingMutex<HashMap<String, usize>>>,
     /// The current episode of protected-snapshot compaction attempts skipped
     /// because a writer held the write lock on a position-delete table.
     /// Position-delete rewrites serialize with writers via `try_lock`, so a
@@ -4083,8 +4093,12 @@ impl CayenneTableProvider {
             // Read the LIVE protected set after the grace period. During the
             // sleep, CDC writers may have created new protected snapshots that
             // must not be deleted.
-            let protected_snapshot_ids: HashSet<String> =
+            let mut protected_snapshot_ids: HashSet<String> =
                 self.protected_snapshots.load().keys().cloned().collect();
+            // Also skip snapshots with in-flight (ref-counted) scans so a
+            // long-running query's Vortex files are not deleted mid-read; a
+            // later compaction's cleanup retries any dir deferred here.
+            protected_snapshot_ids.extend(self.in_flight_scan_snapshot_ids());
             if let Err(err) = self
                 .cleanup_old_snapshots_s3(current_snapshot, &protected_snapshot_ids)
                 .await
@@ -4099,6 +4113,7 @@ impl CayenneTableProvider {
             let table_id = self.table_metadata.table_id.clone();
             let current_snapshot = current_snapshot.to_string();
             let protected_snapshots = Arc::clone(&self.protected_snapshots);
+            let snapshot_scan_refs = Arc::clone(&self.snapshot_scan_refs);
             tokio::spawn(async move {
                 tokio::time::sleep(OLD_SNAPSHOT_CLEANUP_GRACE).await;
                 // Read the LIVE protected set after the grace period. During the
@@ -4107,8 +4122,12 @@ impl CayenneTableProvider {
                 // caused a race: compaction clears `protected_snapshots` at
                 // commit time, new CDC writes re-populate it, then the stale
                 // (empty) captured set causes cleanup to delete them.
-                let protected_snapshot_ids: HashSet<String> =
+                let mut protected_snapshot_ids: HashSet<String> =
                     protected_snapshots.load().keys().cloned().collect();
+                // Also skip snapshots with in-flight (ref-counted) scans so a
+                // long-running query's Vortex files are not deleted mid-read; a
+                // later compaction's cleanup retries any dir deferred here.
+                protected_snapshot_ids.extend(snapshot_scan_refs.lock().keys().cloned());
                 let _ = tokio::task::spawn_blocking(move || {
                     if let Err(e) = Self::cleanup_old_snapshots_blocking(
                         &table_path,
@@ -4173,6 +4192,15 @@ impl CayenneTableProvider {
             .insert(snapshot_id.to_string(), Instant::now());
     }
 
+    /// Snapshot ids that currently have at least one in-flight scan (held via a
+    /// [`crate::provider::scan::SnapshotScanRef`]). The map only ever holds live
+    /// entries — the guard's `Drop` removes an id when its count reaches 0 — so the
+    /// keys ARE the in-flight set. Snapshot GC/cleanup unions these into its skip
+    /// set so a long-running query's Vortex files are not deleted mid-read.
+    fn in_flight_scan_snapshot_ids(&self) -> HashSet<String> {
+        self.snapshot_scan_refs.lock().keys().cloned().collect()
+    }
+
     /// Whether a retired dir's grace has fully elapsed: `grace` past both
     /// retirement and the last scan listing (if any). Pure timing logic,
     /// extracted for unit tests.
@@ -4229,9 +4257,14 @@ impl CayenneTableProvider {
                 ledger.contains_key(id) || protected.contains_key(id) || *id == current
             });
         }
+        // Also defer any dir with an in-flight (ref-counted) scan: deleting it
+        // would unlink Vortex files a long-running query is still reading. It
+        // stays in the retired ledger and is swept on a later pass once the
+        // scan completes (the ledger prune above keeps its entry).
+        let in_flight = self.in_flight_scan_snapshot_ids();
         let due: Vec<String> = due
             .into_iter()
-            .filter(|id| *id != current && !protected.contains_key(id))
+            .filter(|id| *id != current && !protected.contains_key(id) && !in_flight.contains(id))
             .collect();
         if due.is_empty() {
             return;
@@ -5632,6 +5665,7 @@ impl CayenneTableProvider {
             inflight_staging_appends: Arc::new(ParkingMutex::new(HashSet::new())),
             retired_snapshot_dirs: Arc::new(ParkingMutex::new(HashMap::new())),
             snapshot_last_listed: Arc::new(ParkingMutex::new(HashMap::new())),
+            snapshot_scan_refs: Arc::new(ParkingMutex::new(HashMap::new())),
             position_compaction_skip_streak: Arc::new(ParkingMutex::new(
                 PositionCompactionSkipStreak::default(),
             )),
@@ -6350,6 +6384,7 @@ impl CayenneTableProvider {
             inflight_staging_appends: Arc::clone(&self.inflight_staging_appends),
             retired_snapshot_dirs: Arc::clone(&self.retired_snapshot_dirs),
             snapshot_last_listed: Arc::clone(&self.snapshot_last_listed),
+            snapshot_scan_refs: Arc::clone(&self.snapshot_scan_refs),
             position_compaction_skip_streak: Arc::clone(&self.position_compaction_skip_streak),
             new_files_since_last_compaction: Arc::clone(&self.new_files_since_last_compaction),
             // Shared so a writer clone's move records the published files where the
@@ -11613,16 +11648,20 @@ impl CayenneTableProvider {
     fn wrap_scan_plan_with_cayenne_metadata(
         &self,
         plan: Arc<dyn ExecutionPlan>,
+        scan_guard: Arc<SnapshotScanRef>,
     ) -> Arc<dyn ExecutionPlan> {
         if self.maintained_aggregates.is_empty() {
-            Arc::new(CayenneAccelerationExec::new(plan))
+            Arc::new(CayenneAccelerationExec::with_guard(plan, scan_guard))
         } else {
             let epoch = self.maintained_aggregate_epoch.load(Ordering::Acquire);
-            Arc::new(CayenneAccelerationExec::new_with_maintained_aggregates(
-                plan,
-                Arc::clone(&self.maintained_aggregates),
-                epoch,
-            ))
+            Arc::new(
+                CayenneAccelerationExec::with_guard_and_maintained_aggregates(
+                    plan,
+                    scan_guard,
+                    Arc::clone(&self.maintained_aggregates),
+                    epoch,
+                ),
+            )
         }
     }
 
@@ -15796,6 +15835,10 @@ impl CayenneTableProvider {
         }
 
         let projection = ProjectionExec::try_new(projection_expr, input)?;
+        // The outermost `CayenneAccelerationExec` (carrying the scan guard and any
+        // maintained-aggregate state) is applied by the caller via
+        // `wrap_scan_plan_with_cayenne_metadata`, so the strip itself returns the
+        // bare projection.
         Ok(Arc::new(projection))
     }
 
@@ -17274,6 +17317,20 @@ impl TableProvider for CayenneTableProvider {
             && mem_tier_snapshot.is_empty()
             && protected_map.is_empty()
             && inlined_batches.is_empty();
+        // Pin the snapshot dirs this scan reads (the captured current snapshot + all
+        // protected snapshots) against concurrent-compaction GC for the FULL scan
+        // lifetime — plan-build AND execution. Created under the read fence (held
+        // here), so the listing-flip invariant holds: no new scan can reference a
+        // superseded snapshot, its ref-count only falls, and cleanup that sees 0 may
+        // delete it. The guard rides the returned plan + each output stream and drops
+        // (releasing the refs) only when execution completes — fixing the Vortex
+        // file-not-found race where a long query outlived the old time-based grace.
+        let scan_guard = {
+            let mut ids = Vec::with_capacity(protected_map.len() + 1);
+            ids.push(current_snapshot_id.clone());
+            ids.extend(protected_map.keys().cloned());
+            SnapshotScanRef::new(Arc::clone(&self.snapshot_scan_refs), ids)
+        };
         let listing_scan_start = Instant::now();
         let main_plan_result = self
             .create_snapshot_scan_plan_with_config(
@@ -17454,10 +17511,10 @@ impl TableProvider for CayenneTableProvider {
         // but not originally requested by the query.
         if need_projection_strip && let Some(orig_proj) = projection {
             let plan = self.create_projection_strip(plan, orig_proj.len())?;
-            return Ok(self.wrap_scan_plan_with_cayenne_metadata(plan));
+            return Ok(self.wrap_scan_plan_with_cayenne_metadata(plan, scan_guard));
         }
 
-        Ok(self.wrap_scan_plan_with_cayenne_metadata(plan))
+        Ok(self.wrap_scan_plan_with_cayenne_metadata(plan, scan_guard))
     }
 
     // Filter-pushdown exactness contract (read before changing the arms below):
