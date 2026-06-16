@@ -281,13 +281,19 @@ async fn drop_mongodb_database(uri: &str, database: &str) -> anyhow::Result<()> 
     Ok(())
 }
 
-/// RAII guard that drops a per-run `MongoDB` database when dropped.
+/// Holds the per-run `MongoDB` database to drop during explicit teardown.
 ///
 /// Used in connect mode (e.g. Atlas), where the instance is shared and outlives
-/// the run, so the throwaway database must be cleaned up explicitly. (In provision
-/// mode the whole EC2 instance is terminated, so no per-database cleanup is needed.)
+/// the run, so the throwaway database must be cleaned up. (In provision mode the
+/// whole EC2 instance is terminated, so no per-database cleanup is needed.)
+///
+/// IMPORTANT: this is NOT an auto-deleting RAII guard. The database is dropped
+/// *only* by the explicit teardown path when `preserve_resources == false`
+/// (see `teardown`). Dropping this value never deletes anything — see the `Drop`
+/// impl — so `--no-teardown`, errors, panics, and process exit all leave the
+/// database intact (fail-safe against destroying data the caller asked to keep).
 struct MongoDbGuard {
-    /// `(uri, database)`; `None` once disarmed.
+    /// `(uri, database)`; `None` once taken by teardown.
     target: Option<(String, String)>,
 }
 
@@ -305,24 +311,21 @@ impl MongoDbGuard {
 
 impl Drop for MongoDbGuard {
     fn drop(&mut self) {
-        let Some((uri, database)) = self.target.take() else {
-            return;
-        };
-        eprintln!("[stdio] MongoDbGuard: dropping database '{database}'");
-        std::thread::spawn(move || {
-            let Ok(rt) = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-            else {
-                eprintln!("[stdio] MongoDbGuard: failed to build tokio runtime for cleanup");
-                return;
-            };
-            if let Err(e) = rt.block_on(drop_mongodb_database(&uri, &database)) {
-                eprintln!("[stdio] MongoDbGuard: failed to drop database '{database}': {e}");
-            }
-        })
-        .join()
-        .ok();
+        // Fail-safe: NEVER delete the database implicitly on drop. The per-run
+        // database is dropped only by the explicit teardown path when
+        // `preserve_resources == false`. Any other path that drops this value —
+        // `--no-teardown` (preserve), an error/early return, a panic, or process
+        // exit — must leave the database intact so a caller who asked to keep it
+        // (or a crashed run) never loses data they may want to inspect.
+        //
+        // The cost is that an abnormal exit leaks a throwaway `spidapter_<id>`
+        // database on the shared instance; those are safe to GC by name later.
+        if let Some((_, database)) = self.target.take() {
+            eprintln!(
+                "[stdio] MongoDbGuard: dropped without explicit teardown; \
+                 leaving database '{database}' in place (not deleting)"
+            );
+        }
     }
 }
 
