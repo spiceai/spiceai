@@ -118,7 +118,7 @@ pub struct CayenneAccelerationExec {
     /// aggregate (live min/max + integer NDV), aligned to the inner plan's
     /// output schema. Consumed in [`Self::partition_statistics`] to refill
     /// column stats the Cayenne base+delta `UnionExec` drops to
-    /// `Precision::Absent` via DataFusion's generic `col_stats_union`
+    /// `Precision::Absent` via `DataFusion`'s generic `col_stats_union`
     optimizer_column_overlay: Option<Arc<Statistics>>,
 }
 
@@ -1068,7 +1068,7 @@ mod tests {
     /// The base+delta `UnionExec` wipes a join key's min/max + distinct_count to
     /// `Precision::Absent` (an empty delta branch poisons `col_stats_union`).
     /// With an optimizer overlay attached, the wrapper must refill exactly those
-    /// Absent fields while preserving the child's (filter-aware) `num_rows`;
+    /// Absent fields while preserving the child's (filter-aware) `num_rows`.
     #[test]
     fn overlay_refills_union_wiped_join_key_statistics() {
         use datafusion_common::{ColumnStatistics, ScalarValue};
