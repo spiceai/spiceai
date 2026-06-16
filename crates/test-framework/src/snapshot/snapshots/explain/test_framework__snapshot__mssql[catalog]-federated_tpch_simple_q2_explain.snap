@@ -2,26 +2,24 @@
 source: crates/test-framework/src/snapshot/mod.rs
 description: "Query: tpch_simple_q2"
 ---
-+---------------+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
-| plan_type     | plan                                                                                                                                                                           |
-+---------------+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
-| logical_plan  | Projection: mssql.dbo.lineitem.l_linenumber                                                                                                                                    |
-|               |   Inner Join: mssql.dbo.lineitem.l_linenumber = __scalar_sq_1.max(mssql.dbo.lineitem.l_linenumber)                                                                             |
-|               |     TableScan: mssql.dbo.lineitem projection=[l_linenumber]                                                                                                                    |
-|               |     SubqueryAlias: __scalar_sq_1                                                                                                                                               |
-|               |       Aggregate: groupBy=[[]], aggr=[[max(mssql.dbo.lineitem.l_linenumber)]]                                                                                                   |
-|               |         TableScan: mssql.dbo.lineitem projection=[l_linenumber]                                                                                                                |
-| physical_plan | HashJoinExec: mode=CollectLeft, join_type=Inner, accumulator=MinMaxLeftAccumulator, on=[(max(mssql.dbo.lineitem.l_linenumber)@0, l_linenumber@0)], projection=[l_linenumber@1] |
-|               |   AggregateExec: mode=Final, gby=[], aggr=[max(mssql.dbo.lineitem.l_linenumber)]                                                                                               |
-|               |     CoalescePartitionsExec                                                                                                                                                     |
-|               |       AggregateExec: mode=Partial, gby=[], aggr=[max(mssql.dbo.lineitem.l_linenumber)]                                                                                         |
-|               |         RepartitionExec: partitioning=RoundRobinBatch(32), input_partitions=1                                                                                                  |
-|               |           CooperativeExec                                                                                                                                                      |
-|               |             BytesProcessedExec                                                                                                                                                 |
-|               |               SqlServerExec sql=SELECT l_linenumber FROM dbo.lineitem                                                                                                          |
-|               |   RepartitionExec: partitioning=RoundRobinBatch(32), input_partitions=1                                                                                                        |
-|               |     CooperativeExec                                                                                                                                                            |
-|               |       BytesProcessedExec                                                                                                                                                       |
-|               |         SqlServerExec sql=SELECT l_linenumber FROM dbo.lineitem                                                                                                                |
-|               |                                                                                                                                                                                |
-+---------------+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
++---------------+---------------------------------------------------------------------------------------------------------------------------------------------+
+| plan_type     | plan                                                                                                                                        |
++---------------+---------------------------------------------------------------------------------------------------------------------------------------------+
+| logical_plan  | Projection: mssql.dbo.lineitem.l_linenumber                                                                                                 |
+|               |   Inner Join: mssql.dbo.lineitem.l_linenumber = __scalar_sq_1.max(mssql.dbo.lineitem.l_linenumber)                                          |
+|               |     TableScan: mssql.dbo.lineitem projection=[l_linenumber]                                                                                 |
+|               |     SubqueryAlias: __scalar_sq_1                                                                                                            |
+|               |       Aggregate: groupBy=[[]], aggr=[[max(mssql.dbo.lineitem.l_linenumber)]]                                                                |
+|               |         TableScan: mssql.dbo.lineitem projection=[l_linenumber]                                                                             |
+| physical_plan | HashJoinExec: mode=CollectLeft, join_type=Inner, on=[(max(mssql.dbo.lineitem.l_linenumber)@0, l_linenumber@0)], projection=[l_linenumber@1] |
+|               |   AggregateExec: mode=Final, gby=[], aggr=[max(mssql.dbo.lineitem.l_linenumber)]                                                            |
+|               |     CoalescePartitionsExec                                                                                                                  |
+|               |       AggregateExec: mode=Partial, gby=[], aggr=[max(mssql.dbo.lineitem.l_linenumber)]                                                      |
+|               |         RepartitionExec: partitioning=RoundRobinBatch(32), input_partitions=1                                                               |
+|               |           BytesProcessedExec                                                                                                                |
+|               |             SqlServerExec sql=SELECT l_linenumber FROM dbo.lineitem                                                                         |
+|               |   RepartitionExec: partitioning=RoundRobinBatch(32), input_partitions=1                                                                     |
+|               |     BytesProcessedExec                                                                                                                      |
+|               |       SqlServerExec sql=SELECT l_linenumber FROM dbo.lineitem                                                                               |
+|               |                                                                                                                                             |
++---------------+---------------------------------------------------------------------------------------------------------------------------------------------+
