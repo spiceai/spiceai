@@ -21474,7 +21474,7 @@ mod tests {
         df.collect().await.expect("collect succeeded")
     }
 
-    /// [sound output_ordering] `sort_columns_to_file_sort_order` must reproduce
+    /// [sound `output_ordering`] `sort_columns_to_file_sort_order` must reproduce
     /// `sort_stream`'s exact per-entry resolution (Copilot review): the
     /// exact-column-name match comes FIRST (so a column whose literal name contains
     /// whitespace or a direction keyword is matched as a whole, NOT mis-split by the
@@ -21553,11 +21553,11 @@ mod tests {
         assert!(CayenneTableProvider::sort_columns_to_file_sort_order(&[], &schema2).is_none());
     }
 
-    /// [sound output_ordering] A snapshot freshly produced by the sorted compaction
+    /// [sound `output_ordering`] A snapshot freshly produced by the sorted compaction
     /// rewrite, with no unsorted union branches, advertises `output_ordering` by the
     /// sort columns; a subsequent append delta-adds an UNSORTED file in place and
     /// MUST clear the attestation so ordering is no longer advertised. Also locks the
-    /// bare-column SortOptions (ascending, NULLs-last) the writer sorted by.
+    /// bare-column `SortOptions` (ascending, NULLs-last) the writer sorted by.
     #[tokio::test]
     async fn test_sorted_rewrite_advertises_output_ordering_then_append_clears_it() {
         use arrow::array::Int64Array;
@@ -21635,7 +21635,7 @@ mod tests {
         );
     }
 
-    /// [sound output_ordering] The advertised SortOptions (direction + NULLs
+    /// [sound `output_ordering`] The advertised `SortOptions` (direction + NULLs
     /// placement) MUST be byte-identical to what the writer sorted by — both built
     /// from the same `parse_sort_entry`. A `DESC NULLS FIRST` sort column must
     /// advertise descending + NULLs-first; a mismatch = silently wrong results.
