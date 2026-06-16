@@ -698,7 +698,18 @@ impl ExecutionPlan for CayenneAccelerationExec {
 
     fn partition_statistics(&self, partition: Option<usize>) -> Result<Statistics> {
         let child_stats = self.inner.partition_statistics(partition)?;
-        let Some(overlay) = self.optimizer_column_overlay.as_ref() else {
+        // The overlay is a per-table (global) aggregate: its min/max/NDV
+        // describe the whole table, not any single partition. Only the
+        // table-wide aggregate stats (`partition == None`) may be refilled from
+        // it. Per-partition stats (`partition == Some(_)`) must pass through
+        // unchanged — filling them from the global aggregate would violate
+        // `partition_statistics(Some(_))` semantics and mislead partition-level
+        // pruning/optimization.
+        let Some(overlay) = self
+            .optimizer_column_overlay
+            .as_ref()
+            .filter(|_| partition.is_none())
+        else {
             return Ok(child_stats);
         };
         Ok(restore_absent_column_statistics(child_stats, overlay))
@@ -1007,13 +1018,16 @@ mod tests {
         ));
 
         // With an overlay: the Absent join-key fields are refilled, num_rows kept.
-        let restored_exec =
-            CayenneAccelerationExec::new(union).with_optimizer_column_overlay(Some(overlay));
+        let restored_exec = CayenneAccelerationExec::new(Arc::clone(&union))
+            .with_optimizer_column_overlay(Some(overlay));
         let restored = restored_exec
             .partition_statistics(None)
             .expect("statistics should be available");
         let col = &restored.column_statistics[0];
-        assert_eq!(col.min_value, Precision::Inexact(ScalarValue::Int64(Some(1))));
+        assert_eq!(
+            col.min_value,
+            Precision::Inexact(ScalarValue::Int64(Some(1)))
+        );
         assert_eq!(
             col.max_value,
             Precision::Inexact(ScalarValue::Int64(Some(9999)))
@@ -1022,6 +1036,31 @@ mod tests {
         assert_eq!(
             restored.num_rows, poisoned.num_rows,
             "overlay must not override the child's filter-aware num_rows"
+        );
+
+        // The overlay is a per-table (global) aggregate, so it must NOT be
+        // applied to per-partition stats: `partition_statistics(Some(_))` must
+        // return the child's partition stats untouched.
+        let per_partition = restored_exec
+            .partition_statistics(Some(0))
+            .expect("per-partition statistics should be available");
+        let child_partition = union
+            .partition_statistics(Some(0))
+            .expect("child per-partition statistics should be available");
+        assert_eq!(
+            per_partition.column_statistics[0].min_value,
+            child_partition.column_statistics[0].min_value,
+            "overlay must not leak into per-partition min_value"
+        );
+        assert_eq!(
+            per_partition.column_statistics[0].max_value,
+            child_partition.column_statistics[0].max_value,
+            "overlay must not leak into per-partition max_value"
+        );
+        assert_eq!(
+            per_partition.column_statistics[0].distinct_count,
+            child_partition.column_statistics[0].distinct_count,
+            "overlay must not leak into per-partition distinct_count"
         );
     }
 
