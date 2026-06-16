@@ -65,11 +65,20 @@ const EWMA_ALPHA: f64 = 0.3;
 
 /// Number of recorded batches before the controller will act, so a cold table
 /// (or a bootstrap burst) doesn't trigger a spurious early adjustment.
-const WARMUP_BATCHES: u64 = 16;
+pub(crate) const WARMUP_BATCHES: u64 = 16;
 
 /// "Falling behind" hysteresis: act only once apply latency exceeds the offered-
 /// load interval by this factor (not merely equals it), so we don't chase noise.
 const BEHIND_RATIO: f64 = 1.2;
+
+/// `apply_vs_arrival` at or above which the seq-prefix bake DEFERS
+/// (back-pressure). `1.0` is break-even (per-batch apply latency == the
+/// inter-batch arrival interval); above it the apply has no headroom, so a
+/// background bake competing for the write path would push replication lag up.
+/// The bake yields to the apply here. Tunable: lower to protect lag harder
+/// (bake only with more slack), raise to recover bake/QPH at the cost of lag
+/// headroom.
+pub(crate) const BAKE_BACKPRESSURE_RATIO: f64 = 1.0;
 
 /// "Comfortably keeping up" hysteresis: only relax/back off work when apply
 /// latency is well under the offered-load interval.

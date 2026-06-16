@@ -91,6 +91,10 @@ pub struct CayenneContext {
     /// have arrived since the last move (otherwise an idle table would ratchet its
     /// actuators to their extremes). `0` until the first adjustment.
     last_adjust_samples: std::sync::atomic::AtomicU64,
+    /// Recorded-batch count at the last seq-prefix-bake back-pressure check, for
+    /// that gate's own fresh-sample test (independent of the controller's
+    /// `last_adjust_samples`). `0` until the first check.
+    bake_gate_last_samples: std::sync::atomic::AtomicU64,
     /// Wall-clock of the previous recorded CDC write, used to derive the
     /// inter-batch arrival interval (the offered-load signal). `None` until the
     /// first write.
@@ -231,6 +235,7 @@ impl CayenneContext {
             dynamic_tuning: config.dynamic_tuning,
             last_adjust: parking_lot::Mutex::new(None),
             last_adjust_samples: std::sync::atomic::AtomicU64::new(0),
+            bake_gate_last_samples: std::sync::atomic::AtomicU64::new(0),
             last_write: parking_lot::Mutex::new(None),
         })
     }
@@ -438,6 +443,30 @@ impl CayenneContext {
     #[must_use]
     pub(crate) fn bake_deletion_index_trigger(&self) -> usize {
         self.live_actuators.bake_deletion_index_trigger()
+    }
+
+    /// Apply-back-pressure gate for the seq-prefix bake: `true` when the CDC
+    /// apply is at or over capacity, so the background bake — whose merge
+    /// (re-encode survivors + publish) competes with the apply for the shared
+    /// write path (encode permits, the single-writer metastore, cores) — must
+    /// DEFER this round and yield to the foreground writer. Keyed on
+    /// `apply_vs_arrival` (per-batch apply latency ÷ offered-load interval;
+    /// `> 1` ⇒ no headroom, the apply is falling behind), gated on fresh ingest
+    /// since the last check so a table that fell behind and then went idle does
+    /// not block its bake forever on a stale EWMA. Returns `false` (allow the
+    /// bake) before warmup or when ingest is idle — exactly the windows where
+    /// baking is free.
+    #[must_use]
+    pub(crate) fn bake_should_defer_for_apply(&self) -> bool {
+        use std::sync::atomic::Ordering;
+        let snapshot = self.ingest_snapshot();
+        let last = self
+            .bake_gate_last_samples
+            .swap(snapshot.samples, Ordering::Relaxed);
+        let ingest_fresh = snapshot.samples > last;
+        ingest_fresh
+            && snapshot.samples >= tuning::WARMUP_BATCHES
+            && snapshot.apply_vs_arrival > tuning::BAKE_BACKPRESSURE_RATIO
     }
 
     /// Protected snapshot count that should trigger maintenance compaction.
@@ -716,6 +745,52 @@ mod tests {
         assert_eq!(
             context.file_format().options().projection_pushdown,
             ProjectionPushdown::On
+        );
+    }
+
+    #[test]
+    fn bake_back_pressure_gate_defers_only_when_apply_is_behind() {
+        use std::time::Duration;
+        let runtime_env = Arc::new(RuntimeEnv::default());
+        let context = CayenneContext::new(&VortexConfig::default(), runtime_env, "test");
+
+        // Warm up well past WARMUP_BATCHES with the apply far AHEAD of the
+        // offered load (1ms apply per 20ms interval ⇒ apply_vs_arrival ≈ 0.05).
+        for _ in 0..(tuning::WARMUP_BATCHES + 16) {
+            context.ingest_stats.record_write(tuning::WriteSample {
+                rows: 100,
+                bytes: 10_000,
+                apply: Duration::from_millis(1),
+                arrival_gap: Some(Duration::from_millis(20)),
+                delete_rows: 0,
+            });
+        }
+        assert!(
+            !context.bake_should_defer_for_apply(),
+            "healthy apply (headroom) must allow the bake"
+        );
+
+        // Drive the apply well behind (200ms apply per 20ms interval), with
+        // enough samples to dominate the EWMA ⇒ apply_vs_arrival ≫ 1.
+        for _ in 0..(tuning::WARMUP_BATCHES * 3) {
+            context.ingest_stats.record_write(tuning::WriteSample {
+                rows: 100,
+                bytes: 10_000,
+                apply: Duration::from_millis(200),
+                arrival_gap: Some(Duration::from_millis(20)),
+                delete_rows: 0,
+            });
+        }
+        assert!(
+            context.bake_should_defer_for_apply(),
+            "apply at/over capacity must defer the bake"
+        );
+
+        // No fresh ingest since the previous check: a stale "behind" EWMA must
+        // NOT keep deferring forever — an idle table still gets to bake.
+        assert!(
+            !context.bake_should_defer_for_apply(),
+            "stale signal (no fresh ingest) must allow the bake"
         );
     }
 }

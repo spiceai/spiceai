@@ -19559,10 +19559,26 @@ impl super::compaction::CompactionRunner for CayenneTableProvider {
         if deletion_index_len >= self.context.bake_deletion_index_trigger()
             && !self.should_capture_positions()
         {
-            match self.bake_seq_prefix_protected_snapshots().await {
-                Ok(true) => return Ok(true),
-                Ok(false) => { /* nothing baked this pass; fall through to size-tier */ }
-                Err(e) => return Err(e.to_string()),
+            // Apply-back-pressure gate: the bake's merge (re-encode survivors +
+            // publish) competes with the CDC apply for the same write path
+            // (encode permits, the single-writer metastore, cores). When the
+            // apply is at/over capacity, baking steals throughput it cannot
+            // spare and pushes replication lag up (the QPH↔lag tradeoff). So the
+            // background optimizer yields to the foreground writer: defer the
+            // bake until the apply has headroom; the next tick re-evaluates.
+            if self.context.bake_should_defer_for_apply() {
+                tracing::debug!(
+                    target: "cayenne::compaction",
+                    table = self.table_metadata.table_name.as_str(),
+                    deletion_index_len,
+                    "Deferring seq-prefix bake: CDC apply at/over capacity (back-pressure)",
+                );
+            } else {
+                match self.bake_seq_prefix_protected_snapshots().await {
+                    Ok(true) => return Ok(true),
+                    Ok(false) => { /* nothing baked this pass; fall through to size-tier */ }
+                    Err(e) => return Err(e.to_string()),
+                }
             }
         }
 
