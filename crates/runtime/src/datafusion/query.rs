@@ -842,26 +842,39 @@ impl Query {
                 // fully drained, so the permit spans the real execution lifetime
                 // (the lazy Flight drain and the managed-runtime driver included).
                 // No-op when `query_admission_semaphore` is unset (unbounded).
+                //
+                // Only plans that actually EXECUTE a (potentially heavy) query are
+                // gated: ordinary query plans, and `EXECUTE <prepared>` (which runs
+                // the prepared query). The other Statement plans — PREPARE,
+                // DEALLOCATE, SET — only mutate session state, so they must NOT
+                // consume a query permit or block behind the pool under load.
+                let plan_executes_query = match &*plan {
+                    LogicalPlan::Statement(stmt) => {
+                        matches!(stmt, datafusion::logical_expr::Statement::Execute(_))
+                    }
+                    _ => true,
+                };
                 let admission_permit: Option<tokio::sync::OwnedSemaphorePermit> =
-                    if let Some(semaphore) = ctx.df.query_admission_semaphore() {
-                        Self::ensure_not_cancelled(&query_cancel_token, &query_id_str)?;
-                        // Race permit acquisition against cancellation so a query
-                        // cancelled WHILE QUEUED for a permit (client disconnect or
-                        // `/cancel` under load) aborts promptly instead of blocking
-                        // until a permit frees and then still executing. `biased`
-                        // polls cancellation first. A closed semaphore (shutdown
-                        // only) proceeds ungated rather than failing the query.
-                        tokio::select! {
-                            biased;
-                            () = query_cancel_token.cancelled() => {
-                                return Err(Error::QueryCancelled {
-                                    query_id: query_id_str.clone(),
-                                });
+                    match ctx.df.query_admission_semaphore() {
+                        Some(semaphore) if plan_executes_query => {
+                            Self::ensure_not_cancelled(&query_cancel_token, &query_id_str)?;
+                            // Race permit acquisition against cancellation so a query
+                            // cancelled WHILE QUEUED for a permit (client disconnect or
+                            // `/cancel` under load) aborts promptly instead of blocking
+                            // until a permit frees and then still executing. `biased`
+                            // polls cancellation first. A closed semaphore (shutdown
+                            // only) proceeds ungated rather than failing the query.
+                            tokio::select! {
+                                biased;
+                                () = query_cancel_token.cancelled() => {
+                                    return Err(Error::QueryCancelled {
+                                        query_id: query_id_str.clone(),
+                                    });
+                                }
+                                permit = semaphore.acquire_owned() => permit.ok(),
                             }
-                            permit = semaphore.acquire_owned() => permit.ok(),
                         }
-                    } else {
-                        None
+                        _ => None,
                     };
 
                 let (res_stream, physical_plan): (

@@ -15907,16 +15907,26 @@ impl CayenneTableProvider {
     /// provably-sorted snapshot's scan, from the table's configured
     /// `sort_columns`.
     ///
-    /// CORRECTNESS: the `SortOptions` (direction + nulls placement) are derived by
-    /// reusing [`util::stream_utils::parse_sort_entry`] — the EXACT parser the
-    /// sorted-compaction writer (`sort_stream`) uses — so the advertised ordering
-    /// is byte-identical to the physical on-disk order. Re-deriving them separately
-    /// could advertise (say) ASC over a DESC-written file and silently corrupt
-    /// results via sort-elimination / merge-join.
-    ///
-    /// Returns `None` (→ advertise NO ordering) if `sort_columns` is empty, an
-    /// entry doesn't parse, or ANY sort column is absent from `scan_schema` (e.g.
-    /// projected out) — a partial ordering would be unsound.
+    /// CORRECTNESS: this MUST reproduce, entry-for-entry, the EXACT decision
+    /// [`util::stream_utils::sort_stream`] made when it physically wrote the file —
+    /// otherwise the advertised order diverges from disk and sort-elimination /
+    /// merge-join silently corrupt results. `sort_stream` resolves each entry as:
+    ///   1. if the TRIMMED entry is itself a column name → that column, ASC /
+    ///      NULLs-last. This comes FIRST, so a column whose literal name contains
+    ///      whitespace or a direction keyword (e.g. a column actually named
+    ///      `"id DESC"`) is matched as a whole — NOT mis-split by the parser into
+    ///      column `id` + `DESC`, which would advertise a *different* column and
+    ///      direction than was written.
+    ///   2. otherwise parse `column [ASC|DESC] [NULLS FIRST|LAST]` via
+    ///      [`util::stream_utils::parse_sort_entry`].
+    ///   3. otherwise `sort_stream` ABANDONS the whole sort and writes the stream
+    ///      UNSORTED.
+    /// We mirror all three: (1)/(2) build the matching `SortExpr`; (3) — and any
+    /// entry whose resolved column is absent from `scan_schema` (e.g. projected
+    /// out, where a partial order would be unsound) — returns `None`, so the scan
+    /// advertises NO ordering. The column is built UNQUALIFIED (matching
+    /// `sort_stream`'s `Column::new(name, idx)` by-name resolution) so names with
+    /// dots/whitespace resolve to the exact field rather than being re-parsed.
     fn sort_columns_to_file_sort_order(
         sort_columns: &[String],
         scan_schema: &arrow_schema::Schema,
@@ -15926,16 +15936,31 @@ impl CayenneTableProvider {
         }
         let mut exprs = Vec::with_capacity(sort_columns.len());
         for entry in sort_columns {
-            let (column, opts) = util::stream_utils::parse_sort_entry(entry)?;
-            // Every sort column must exist in the scan schema, else the advertised
-            // order would be partial/wrong — bail out of ordering entirely.
-            scan_schema.field_with_name(column).ok()?;
+            let (column, descending, nulls_first) =
+                if scan_schema.field_with_name(entry.trim()).is_ok() {
+                    // (1) exact-column-name fast path — FIRST, exactly as `sort_stream`.
+                    (entry.trim(), false, false)
+                } else if let Some((col, opts)) = util::stream_utils::parse_sort_entry(entry) {
+                    // (2) parsed form. The resolved column must exist in the scan
+                    // schema, else `sort_stream` would have skipped the sort / the
+                    // advertised order would be partial — advertise nothing.
+                    scan_schema.field_with_name(col).ok()?;
+                    (col, opts.descending, opts.nulls_first)
+                } else {
+                    // (3) `sort_stream` abandons the sort for an unparseable entry, so
+                    // the file is UNSORTED — advertise nothing.
+                    return None;
+                };
             exprs.push(datafusion::logical_expr::SortExpr::new(
-                datafusion::logical_expr::col(column),
-                // `create_lex_ordering` maps this back to `SortOptions { descending:
+                // Unqualified so a dotted / whitespaced name resolves to the exact
+                // field (mirrors `sort_stream`'s by-name `Column::new`).
+                datafusion::logical_expr::Expr::Column(datafusion_common::Column::new_unqualified(
+                    column,
+                )),
+                // `create_lex_ordering` maps `asc` back to `SortOptions { descending:
                 // !asc, nulls_first }`, reproducing exactly what the writer wrote.
-                !opts.descending,
-                opts.nulls_first,
+                !descending,
+                nulls_first,
             ));
         }
         Some(vec![exprs])
@@ -21388,6 +21413,85 @@ mod tests {
             .await
             .expect("query created");
         df.collect().await.expect("collect succeeded")
+    }
+
+    /// [sound output_ordering] `sort_columns_to_file_sort_order` must reproduce
+    /// `sort_stream`'s exact per-entry resolution (Copilot review): the
+    /// exact-column-name match comes FIRST (so a column whose literal name contains
+    /// whitespace or a direction keyword is matched as a whole, NOT mis-split by the
+    /// parser), then the `column [ASC|DESC] [NULLS …]` parse, else advertise nothing.
+    /// A divergence here would advertise an order the file was NOT written in.
+    #[test]
+    fn test_sort_columns_to_file_sort_order_mirrors_sort_stream() {
+        use datafusion::logical_expr::Expr;
+        fn col_of(e: &Expr) -> &str {
+            match e {
+                Expr::Column(c) => c.name(),
+                other => panic!("expected a column expr, got {other:?}"),
+            }
+        }
+        let schema = Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            // A column whose LITERAL name contains a space and a direction keyword.
+            Field::new("id DESC", DataType::Int64, true),
+        ]);
+
+        // (1) plain column → exact-match → ASC, NULLs-last.
+        let o = CayenneTableProvider::sort_columns_to_file_sort_order(&["id".to_string()], &schema)
+            .expect("`id` is a column");
+        assert_eq!(o.len(), 1);
+        assert_eq!(o[0].len(), 1);
+        assert!(o[0][0].asc && !o[0][0].nulls_first);
+        assert_eq!(col_of(&o[0][0].expr), "id");
+
+        // (2) exact-match WINS over the parser: a column literally named `id DESC`
+        //     advertises that exact column ASC — NOT column `id` descending (which
+        //     is the silently-wrong order the parser-only path would have produced).
+        let o = CayenneTableProvider::sort_columns_to_file_sort_order(
+            &["id DESC".to_string()],
+            &schema,
+        )
+        .expect("`id DESC` is a column");
+        assert!(o[0][0].asc, "exact-matched column sorts ascending");
+        assert!(!o[0][0].nulls_first, "exact-matched column is NULLs-last");
+        assert_eq!(
+            col_of(&o[0][0].expr),
+            "id DESC",
+            "must advertise the exact column, not the mis-split `id`"
+        );
+
+        // (3) parsed `DESC NULLS FIRST` on a column reachable only via parsing.
+        let schema2 = Schema::new(vec![Field::new("ts", DataType::Int64, true)]);
+        let o = CayenneTableProvider::sort_columns_to_file_sort_order(
+            &["ts DESC NULLS FIRST".to_string()],
+            &schema2,
+        )
+        .expect("`ts` parses and exists");
+        assert!(!o[0][0].asc && o[0][0].nulls_first);
+        assert_eq!(col_of(&o[0][0].expr), "ts");
+
+        // (4) parsed, but the resolved column is absent from the schema → nothing.
+        assert!(
+            CayenneTableProvider::sort_columns_to_file_sort_order(
+                &["missing DESC".to_string()],
+                &schema2,
+            )
+            .is_none(),
+            "a sort column absent from the scan schema must drop ordering"
+        );
+
+        // (5) unparseable entry (`sort_stream` abandons the sort) → advertise nothing.
+        assert!(
+            CayenneTableProvider::sort_columns_to_file_sort_order(
+                &["a b c d".to_string()],
+                &schema2,
+            )
+            .is_none(),
+            "an unparseable entry leaves the file unsorted → advertise nothing"
+        );
+
+        // (6) empty sort_columns → nothing.
+        assert!(CayenneTableProvider::sort_columns_to_file_sort_order(&[], &schema2).is_none());
     }
 
     /// [sound output_ordering] A snapshot freshly produced by the sorted compaction
