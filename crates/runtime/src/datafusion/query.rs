@@ -2393,8 +2393,9 @@ mod tests {
             .await
             .expect("query A should run");
 
-        // B is a DISTINCT query (cache miss → actually reaches the admission gate)
-        // and is spawned so the test task can observe whether run() blocks.
+        // B uses different query text (`SELECT 43`, a cache miss → it actually
+        // reaches the admission gate, not an early cache-hit return) and is spawned
+        // so the test task can observe whether run() blocks.
         let df_b = Arc::clone(&df);
         let mut b_handle = tokio::spawn(async move {
             QueryBuilder::new("SELECT 43 AS value", df_b)
