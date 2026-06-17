@@ -903,11 +903,12 @@ pub struct Query {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub target_partitions: Option<usize>,
 
-    /// Bounds the number of analytical queries that may EXECUTE concurrently.
-    /// Excess queries wait (admission control) rather than oversubscribing the
-    /// shared query runtime + memory pool and starving each other under load
-    /// (e.g. concurrent analytical queries alongside CDC ingestion and
-    /// compaction). The permit is held for the query's full execution +
+    /// Bounds the number of query-executing plans that may run concurrently —
+    /// ordinary queries, DDL/DML, and `EXECUTE`; lightweight session-state
+    /// statements (`PREPARE`/`DEALLOCATE`/`SET`) are not gated. Excess plans wait
+    /// (admission control) rather than oversubscribing the shared query runtime +
+    /// memory pool and starving each other under load (e.g. analytical queries
+    /// alongside CDC ingestion and compaction). The permit is held for the plan's full execution +
     /// result-streaming lifetime; a results-cache hit is never gated. Unset =
     /// unbounded (the prior behavior). A configured value is clamped to a
     /// minimum of `1` in the runtime builder, so `0` means one concurrent query

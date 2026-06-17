@@ -829,13 +829,14 @@ impl Query {
                     t
                 });
 
-                // Statement plans (PREPARE, EXECUTE, DEALLOCATE) need special handling
+                // Statement plans (PREPARE, EXECUTE, DEALLOCATE, SET) need special handling
                 // They modify session state rather than producing query results, so must be
                 // executed through SessionContext::execute_logical_plan() instead of create_physical_plan()
-                // [query admission] Bound concurrently-EXECUTING analytical
-                // queries (`runtime.query.max_concurrent_queries`) so an OLAP
-                // burst can't oversubscribe the shared query runtime + memory
-                // pool and starve queries (the idle-cores-under-load symptom).
+                // [query admission] Bound the number of concurrently-executing
+                // query plans — ordinary queries plus DDL/DML and EXECUTE
+                // (`runtime.query.max_concurrent_queries`) — so an OLAP burst
+                // can't oversubscribe the shared query runtime + memory pool and
+                // starve them (the idle-cores-under-load symptom).
                 // Acquired AFTER the results-cache check above (a cache hit
                 // returned early is never gated) and held — via the cancellation
                 // guard attached to the result stream below — until the stream is
