@@ -591,6 +591,9 @@ pub struct PinnedTuningActuators {
     pub compaction_interval: bool,
     /// `cayenne_compaction_trigger_files` was operator-set.
     pub compaction_trigger: bool,
+    /// `cayenne_bake_deletion_index_trigger` was operator-set (don't adapt the
+    /// seq-prefix bake's deletion-index trigger).
+    pub bake_deletion_index_trigger: bool,
     /// `cayenne_write_concurrency` was operator-set.
     pub write_concurrency: bool,
     /// `cayenne_cdc_mem_tier_max_bytes` was operator-set (don't adapt the
@@ -695,6 +698,18 @@ pub struct VortexConfig {
     /// Defaults to 8.
     #[serde(default = "default_compaction_trigger_files")]
     pub compaction_trigger_files: usize,
+    /// Deletion-index size (count of live PK tombstones) at or above which the
+    /// seq-prefix bake (Stage 2 compaction) is triggered. The bake consolidates
+    /// the settled older prefix of protected snapshots so their tombstones drop
+    /// out of the live merge-on-read deletion index, lowering the per-query probe
+    /// cost — at the cost of write amplification. A larger value bakes less often
+    /// (bounding write-amp); a smaller value bakes more often (smaller index,
+    /// cheaper probe). Key-delete tables only (position-delete tables never bake).
+    ///
+    /// Defaults to `50_000` (see
+    /// [`crate::provider::table::BAKE_DELETION_INDEX_TRIGGER`]).
+    #[serde(default = "default_bake_deletion_index_trigger")]
+    pub bake_deletion_index_trigger: usize,
     /// Number of protected snapshots that can accumulate before snapshot-maintenance
     /// compaction is eligible to run. Kept separate from `compaction_trigger_files`
     /// so small-file compaction tuning does not silently change scan amplification
@@ -848,6 +863,29 @@ pub struct VortexConfig {
     /// closed loop leaves these alone (see [`PinnedTuningActuators`]).
     #[serde(default)]
     pub pinned_tuning_actuators: PinnedTuningActuators,
+    /// Build the scan's file set from the per-snapshot manifest
+    /// (`cayenne_snapshot_file`) instead of by listing the snapshot directory.
+    ///
+    /// EXPERIMENTAL and **off by default**. This path is not yet
+    /// production-hardened: the manifest is maintained as a dual-source supplement
+    /// to directory listing and has not been proven complete on every write/commit
+    /// path, so opting in trades the authoritative listing for a faster-to-resolve
+    /// but less-exercised source. It is **not** required by — and is independent
+    /// of — the seq-prefix deletion-index bake: the bake reads the above-`T`
+    /// protected snapshots via the existing protected-snapshot scan union
+    /// (`protected_snapshots`), never via this manifest.
+    ///
+    /// Defaults to `false` (directory listing) so the manifest stays a
+    /// dual-source supplement until it is proven complete on every path. When
+    /// `true`, a scan resolves its data files from the manifest rows for the
+    /// snapshot it pinned; if the manifest is empty for that snapshot (e.g. a
+    /// snapshot written before population, or a transient post-write rebuild
+    /// failure) the scan transparently falls back to directory listing, so this
+    /// flag never makes a scan miss a live file. The manifest is populated to be
+    /// equal to the directory listing by construction (see
+    /// `upsert_snapshot_manifest_from_listing`).
+    #[serde(default)]
+    pub scan_from_manifest: bool,
     /// Which widening schema differences detected at table open (the requested
     /// schema vs the stored metastore schema) may be committed in place via
     /// `update_table_schema` instead of pinning the stored schema. Set by the
@@ -940,6 +978,10 @@ fn default_upload_concurrency() -> usize {
 
 fn default_compaction_trigger_files() -> usize {
     8
+}
+
+fn default_bake_deletion_index_trigger() -> usize {
+    crate::provider::table::BAKE_DELETION_INDEX_TRIGGER
 }
 
 fn default_compaction_trigger_protected_snapshots() -> usize {
@@ -1139,6 +1181,7 @@ impl Default for VortexConfig {
             upload_concurrency: default_upload_concurrency(),
             write_concurrency: None,
             compaction_trigger_files: default_compaction_trigger_files(),
+            bake_deletion_index_trigger: default_bake_deletion_index_trigger(),
             compaction_trigger_protected_snapshots: default_compaction_trigger_protected_snapshots(
             ),
             compaction_trigger_snapshot_age_ms: default_compaction_trigger_snapshot_age_ms(),
@@ -1161,6 +1204,9 @@ impl Default for VortexConfig {
             cdc_mem_tier_checkpoint_interval_ms: default_cdc_mem_tier_checkpoint_interval_ms(),
             dynamic_tuning: false,
             pinned_tuning_actuators: PinnedTuningActuators::default(),
+            // Directory listing stays the scan's file source by default; the
+            // manifest is a dual-source supplement until proven complete.
+            scan_from_manifest: false,
             schema_evolution: SchemaEvolutionMode::default(),
             goal_replication_lag_secs: None,
             goal_freshness_secs: None,
@@ -1186,6 +1232,30 @@ mod tests {
         assert_eq!(config.upload_concurrency, available_parallelism);
         assert_eq!(config.write_concurrency, None);
         assert_eq!(config.pk_conflict_detection, PkConflictDetection::Auto);
+    }
+
+    /// `scan_from_manifest` must default OFF (directory listing) so the
+    /// per-snapshot manifest stays a dual-source supplement until it is proven
+    /// complete on every path. A regression flipping this default to `true`
+    /// would silently make the manifest the authoritative scan source — guard
+    /// both the struct default and the serde (empty-config) default.
+    #[test]
+    fn test_scan_from_manifest_defaults_off() {
+        assert!(
+            !VortexConfig::default().scan_from_manifest,
+            "scan_from_manifest must default to false (directory listing)"
+        );
+        let from_empty: VortexConfig = serde_json::from_str("{}").expect("valid empty config");
+        assert!(
+            !from_empty.scan_from_manifest,
+            "an empty config must inherit scan_from_manifest = false via serde default"
+        );
+        let opted_in: VortexConfig = serde_json::from_str(r#"{"scan_from_manifest": true}"#)
+            .expect("valid config with scan_from_manifest opt-in");
+        assert!(
+            opted_in.scan_from_manifest,
+            "an explicit scan_from_manifest = true must deserialize as opt-in"
+        );
     }
 
     #[test]
@@ -1375,6 +1445,32 @@ pub struct SnapshotFileStatistics {
     /// Serialized Vortex `FileStatistics` flatbuffer bytes (per-column min, max,
     /// and null count)
     pub statistics_blob: Vec<u8>,
+}
+
+/// One row of the authoritative per-snapshot data-file manifest
+/// (`cayenne_snapshot_file`). Unlike [`SnapshotFileStatistics`] (a best-effort
+/// pruning cache), the manifest is the COMPLETE file set for a snapshot — every
+/// data file the scan must read. A new snapshot references an existing file by
+/// inserting a row pointing at the same `file_path` (no copy), which is what
+/// lets compaction bake only the dead-heavy files and reference the rest in
+/// place. `min_sequence`/`max_sequence` carry the file's commit-seq range so a
+/// seq-prefix bake (`max_sequence <= T`) is well-defined.
+#[derive(Debug, Clone)]
+pub struct SnapshotFile {
+    /// Table this manifest entry belongs to (`UUIDv7`).
+    pub table_id: String,
+    /// Snapshot this file is a member of (`UUIDv7`).
+    pub snapshot_id: String,
+    /// Object-store path of the `.vortex` data file (as returned by listing).
+    pub file_path: String,
+    /// Live row count in the file.
+    pub row_count: i64,
+    /// `ObjectMeta::size` of the file in bytes.
+    pub file_size_bytes: i64,
+    /// Inclusive minimum commit sequence of the rows in this file.
+    pub min_sequence: i64,
+    /// Inclusive maximum commit sequence of the rows in this file.
+    pub max_sequence: i64,
 }
 
 /// Table-level statistics stored as a serialized Vortex [`FileStatistics`] blob.

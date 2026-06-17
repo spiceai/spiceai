@@ -29,7 +29,7 @@ use crate::catalog::{CatalogError, CatalogResult, MetadataCatalog, SnapshotSeque
 use crate::maintained_aggregate::{MaintainedAggregateRegistry, MaintainedAggregateSpec};
 use crate::metadata::{
     CreateTableOptions, InlinedData, InlinedDataStats, InlinedDelete, PkConflictDetection,
-    SnapshotFileStatistics, TableMetadata, TableStatistics,
+    SnapshotFile, SnapshotFileStatistics, TableMetadata, TableStatistics,
 };
 use crate::provider::scan::{
     CayenneAccelerationExec, SnapshotScanRef, round_robin_repartition_if_needed,
@@ -1488,6 +1488,70 @@ struct SnapshotFilesForScan {
     file_groups: Vec<FileGroup>,
     statistics: Statistics,
     grouped_by_partition: bool,
+}
+
+/// Partition of a snapshot's manifest by a seq-prefix cutoff `T`, the planning
+/// core of an incremental seq-prefix compaction.
+///
+/// A file is **bake-eligible** when `min_sequence <= T`: it holds at least one
+/// row committed at or before `T`, so it may carry a deletion with
+/// `delete_seq <= T` that the rewrite physically applies — these files are
+/// consolidated into one new file with their dead rows removed. A file is
+/// **reference-in-place** when `min_sequence > T`: EVERY row it holds was
+/// committed strictly after `T`, hence after every applicable `<= T` tombstone
+/// (which deletes a row that existed at seq `<= T`; a `> T` row was written
+/// after, so under upsert semantics the newer row wins). Such a file can be
+/// referenced unchanged in the new snapshot without rewriting its bytes — the
+/// shrink the manifest model exists to enable.
+///
+/// The predicate is `min_sequence`, NOT `max_sequence`: a merged file that
+/// STRADDLES the cutoff (`min_sequence <= T < max_sequence`) holds rows at or
+/// below `T`, so it MUST be baked. Splitting on `max_sequence` would put a
+/// straddling file in `reference`, and the subsequent
+/// [`CayenneTableProvider::prune_deletion_index_at_or_below`] would then drop a
+/// `<= T` tombstone that still applied to that file's `<= T` rows — resurrecting
+/// the deleted rows. For single-commit files `min == max`, so this is a no-op;
+/// it only matters for merged/straddling files, which is exactly where the bug
+/// would bite.
+#[derive(Debug, Default)]
+struct SeqPrefixPlan {
+    /// Manifest rows whose `min_sequence <= T` — rewritten into one new file.
+    bake: Vec<SnapshotFile>,
+    /// Manifest rows whose `min_sequence > T` — referenced in place unchanged.
+    reference: Vec<SnapshotFile>,
+}
+
+/// How `upsert_snapshot_manifest_from_listing` tags each listed file's
+/// `[min_sequence, max_sequence]` — the TRUE per-file commit-seq range the
+/// seq-prefix bake needs, in place of the prior single per-snapshot watermark
+/// (which degenerated `partition_manifest_by_sequence` to all-bake/all-reference
+/// and delivered zero shrink).
+///
+/// The variant is chosen per snapshot kind by the write path, which knows how
+/// the snapshot's files were produced:
+/// - [`Self::Uniform`] — every file shares one `[min, max]`, overwriting any
+///   prior row. Used by a compaction write-site that AUTHORS the snapshot's
+///   manifest with its merged `[min, max]` over the inputs (full-rewrite,
+///   subset merge).
+/// - [`Self::PreserveOrUniform`] — keep any range already recorded for a file
+///   (so a re-list never clobbers a compaction-authored merged range — the
+///   catalog upsert is `INSERT OR REPLACE`), and tag a brand-new (untagged)
+///   file `[min, max]`. Used by `rebuild_live_snapshot_manifests`:
+///   - the CURRENT snapshot uses `[0, current_seq]` — a brand-new file there
+///     has an unknown true min, so `0` keeps it always bake-eligible (never
+///     wrongly referenced-in-place, never resurrecting a row);
+///   - a PROTECTED snapshot uses `[S, S]` where `S` is its single reserved
+///     sequence (the protected-set value) — every row in a fresh
+///     CDC-staged-append / checkpoint snapshot was committed at `S`, so `[S, S]`
+///     is exact and lets the newest, highest-sequence files be referenced in
+///     place (the shrink the lever exists for). A merged subset-compaction
+///     output is a protected snapshot too, but it AUTHORED its merged range at
+///     commit time, so the preserve arm keeps that range rather than the
+///     (delete-seq) protected-set value.
+#[derive(Debug, Clone, Copy)]
+enum ManifestSequenceTag {
+    Uniform { min: i64, max: i64 },
+    PreserveOrUniform { min: i64, max: i64 },
 }
 
 /// Serialize one or more `RecordBatch`es to Arrow IPC stream bytes.
@@ -3182,6 +3246,19 @@ impl PkDeletionSnapshot {
         }
     }
 
+    /// Count of keys with a live deletion in this snapshot — the per-query
+    /// merge-on-read probe scales with this, so the seq-prefix bake is triggered
+    /// on it (see `BAKE_DELETION_INDEX_TRIGGER`). `0` for `PositionBased` (those
+    /// tombstones are file-scoped, never seq-tagged, and are out of the bake's
+    /// scope).
+    fn delete_len(&self) -> usize {
+        match self {
+            Self::PositionBased => 0,
+            Self::Int64Pk { tombstones } => tombstones.delete_len(),
+            Self::RowConverterBased { tombstones } => tombstones.delete_len(),
+        }
+    }
+
     /// Extend this snapshot by ONE append's tombstone delta — O(delta), the
     /// persistent-index extend. Used by the append path to keep the
     /// merged-scan-deletions memo CURRENT in lockstep (under sustained CDC the
@@ -3322,6 +3399,42 @@ const PROTECTED_TIER_GROWTH: u64 = 8;
 /// bounding the per-pass read/write amplification regardless of how many
 /// same-tier runs have accumulated.
 const PROTECTED_MERGE_MAX_WIDTH: usize = 32;
+
+// ---------------------------------------------------------------------------
+// Seq-prefix BAKE (Stage 2): shrink the merge-on-read deletion index.
+//
+// The bake is a seq-prefix SELECTION VARIANT of the subset compaction: it
+// consolidates the OLD protected snapshots that form a clean
+// `max_sequence <= T` prefix (applying the deletion snapshot, so the merged
+// output holds only survivors), then prunes the in-memory deletion index of
+// every tombstone with `delete_seq <= T`. The per-query merge-on-read probe
+// scales with the live tombstone count, so a small index is the read-side win.
+// Hardcoded for this validation cut; promote to `CayenneContext` config /
+// adaptive wiring in Stage 3 once the lever is proven.
+// ---------------------------------------------------------------------------
+
+/// How many of the MOST-RECENT protected snapshots the bake leaves UNTOUCHED
+/// (`K`). The newest snapshots receive the active delete stream, so baking them
+/// every pass would re-merge hot deltas for no index shrink (write-amp with no
+/// read win). Keeping a small tail unbaked means each bake consolidates only the
+/// settled older prefix; the cutoff `T` is the highest `max_sequence` among the
+/// snapshots OLDER than this tail. With fewer than `K + 1` protected snapshots
+/// there is no settled prefix and the bake is a no-op.
+const BAKE_KEEP_RECENT_SNAPSHOTS: usize = 3;
+
+/// Default deletion-index size (count of live PK tombstones, `delete_len()`) at
+/// or above which a seq-prefix bake is worth triggering. The bake exists to
+/// shrink this index, so it is gated on the very quantity it reduces: below this
+/// floor the per-query probe is already cheap and a bake would only add
+/// write-amp. Chosen well above the steady-state churn of a healthy CDC table so
+/// the bake fires only once tombstones have genuinely accumulated (amortizing
+/// its write cost).
+///
+/// This is the default seed for the `cayenne_bake_deletion_index_trigger` config
+/// param (see [`crate::metadata::default_bake_deletion_index_trigger`]) and the
+/// anchor for the adaptive [`Actuator::BakeDeletionIndexTrigger`] move; the live
+/// value is read per-trigger via `self.context.bake_deletion_index_trigger()`.
+pub(crate) const BAKE_DELETION_INDEX_TRIGGER: usize = 50_000;
 
 /// Classify a protected snapshot's on-disk byte size into an LSM-style size
 /// tier. Tier 0 covers everything up to `base_bytes`; each higher tier covers
@@ -4098,6 +4211,7 @@ impl CayenneTableProvider {
             let table_id = self.table_metadata.table_id.clone();
             let current_snapshot = current_snapshot.to_string();
             let protected_snapshots = Arc::clone(&self.protected_snapshots);
+            let catalog = Arc::clone(&self.catalog);
             let snapshot_scan_refs = Arc::clone(&self.snapshot_scan_refs);
             tokio::spawn(async move {
                 tokio::time::sleep(OLD_SNAPSHOT_CLEANUP_GRACE).await;
@@ -4113,12 +4227,38 @@ impl CayenneTableProvider {
                 // long-running query's Vortex files are not deleted mid-read; a
                 // later compaction's cleanup retries any dir deferred here.
                 protected_snapshot_ids.extend(snapshot_scan_refs.lock().keys().cloned());
+                // Ref-count source: the manifest, read AFTER the grace so it
+                // reflects the same live set the protected read above does. A
+                // live/protected snapshot can reference a data file that lives
+                // in an old snapshot's dir (an in-place compaction reference);
+                // those files must survive even though their dir is "old". The
+                // in-flight scan snapshots added above are part of the live set,
+                // so their referenced files are protected too.
+                let all_rows = match catalog.get_all_snapshot_files(&table_id).await {
+                    Ok(rows) => rows,
+                    Err(error) => {
+                        // Reading the manifest is the safety gate; on failure do
+                        // NOT delete (a referenced file could be orphaned).
+                        tracing::warn!(
+                            "Old-snapshot cleanup skipped for table {table_id}: failed to read \
+                             snapshot manifest ({error})"
+                        );
+                        return;
+                    }
+                };
+                let manifest_populated = !all_rows.is_empty();
+                let mut live_snapshot_ids = protected_snapshot_ids.clone();
+                live_snapshot_ids.insert(current_snapshot.clone());
+                let live_referenced =
+                    Self::live_referenced_relative_paths(&all_rows, &live_snapshot_ids);
                 let _ = tokio::task::spawn_blocking(move || {
                     if let Err(e) = Self::cleanup_old_snapshots_blocking(
                         &table_path,
                         &table_id,
                         &current_snapshot,
                         &protected_snapshot_ids,
+                        manifest_populated,
+                        &live_referenced,
                     ) {
                         tracing::warn!(
                             "Failed to cleanup old snapshots for table {}: {e}",
@@ -4199,6 +4339,125 @@ impl CayenneTableProvider {
             && last_listed.is_none_or(|t| now.duration_since(t) >= grace)
     }
 
+    /// The physical identity of a manifest row's data file, as a path RELATIVE
+    /// to the table root (`table_path/table_id` locally, the table prefix on
+    /// S3): `"{snapshot_id}/{file_path}"`.
+    ///
+    /// This is the same derivation the scan uses to open a file (it resolves
+    /// `file_path` against the snapshot's own directory — see
+    /// `manifest_partitioned_files`) and the same key
+    /// `list_compaction_candidate_files_with_sizes` builds, so a relative path
+    /// computed here protects exactly the bytes a scan would read. Two manifest
+    /// rows that resolve to the same relative path reference the *same physical
+    /// file* even if they carry different `snapshot_id`s — which is precisely
+    /// the cross-snapshot in-place reference that physical-file GC must respect.
+    fn manifest_file_relative_path(snapshot_id: &str, file_path: &str) -> String {
+        format!("{snapshot_id}/{file_path}")
+    }
+
+    /// Build the set of data files (as table-relative paths, see
+    /// [`Self::manifest_file_relative_path`]) referenced by any LIVE snapshot —
+    /// the current snapshot plus every protected snapshot. A physical file is
+    /// safe to delete during GC only when it is NOT in this set.
+    ///
+    /// `all_rows` is every manifest row for the table
+    /// ([`MetadataCatalog::get_all_snapshot_files`]); rows for snapshots outside
+    /// `live_snapshot_ids` (already-retired snapshots) are skipped — their being
+    /// the thing under deletion must not keep their own files alive. Pure;
+    /// extracted for unit tests.
+    fn live_referenced_relative_paths(
+        all_rows: &[SnapshotFile],
+        live_snapshot_ids: &HashSet<String>,
+    ) -> HashSet<String> {
+        all_rows
+            .iter()
+            .filter(|row| live_snapshot_ids.contains(&row.snapshot_id))
+            .map(|row| Self::manifest_file_relative_path(&row.snapshot_id, &row.file_path))
+            .collect()
+    }
+
+    /// Ref-count-aware deletion of a single retired snapshot directory (local
+    /// FS, blocking I/O). Deletes only the data files inside `snapshot_dir`
+    /// whose table-relative path
+    /// (`{retiring_snapshot_id}/{name}` — see
+    /// [`Self::manifest_file_relative_path`]) is NOT in `live_referenced`, then
+    /// removes the directory itself only once it holds no entries. A file kept
+    /// alive by a live/protected snapshot's manifest (an in-place compaction
+    /// reference) is left untouched.
+    ///
+    /// `live_referenced` MUST be the complete live-referenced set (built from
+    /// [`MetadataCatalog::get_all_snapshot_files`] filtered to the live
+    /// snapshots): an incomplete set could orphan a file a scan still needs.
+    /// When the table's manifest is unpopulated the caller takes the legacy
+    /// whole-directory path instead and never reaches here.
+    ///
+    /// Returns `Ok(true)` when the directory was fully removed, `Ok(false)`
+    /// when one or more referenced files (or non-data files) kept it alive, and
+    /// the directory remains. A `NotFound` directory counts as fully removed.
+    fn delete_retired_snapshot_dir_refcounted(
+        snapshot_dir: &std::path::Path,
+        retiring_snapshot_id: &str,
+        live_referenced: &HashSet<String>,
+    ) -> std::io::Result<bool> {
+        let entries = match std::fs::read_dir(snapshot_dir) {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(true),
+            Err(e) => return Err(e),
+        };
+
+        let mut kept_any = false;
+        for entry in entries {
+            let entry = entry?;
+            let path = entry.path();
+            let file_type = entry.file_type()?;
+            // Only data files participate in ref-counting. A nested directory or
+            // a non-data file (e.g. a staging WAL) is never a manifest target,
+            // so leave it in place and let it keep the dir alive — a later
+            // rotation-anchored cleanup or operator reclaims it. This is the
+            // conservative (never-orphan) choice.
+            let is_referenceable = file_type.is_file()
+                && entry
+                    .file_name()
+                    .to_str()
+                    .is_some_and(Self::is_compactable_data_file);
+            if !is_referenceable {
+                kept_any = true;
+                continue;
+            }
+            let Some(name) = entry.file_name().to_str().map(str::to_string) else {
+                kept_any = true;
+                continue;
+            };
+            let relative = Self::manifest_file_relative_path(retiring_snapshot_id, &name);
+            if live_referenced.contains(&relative) {
+                // Referenced in place by a live/protected snapshot — keep.
+                kept_any = true;
+                continue;
+            }
+            match std::fs::remove_file(&path) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e),
+            }
+        }
+
+        if kept_any {
+            return Ok(false);
+        }
+
+        // No entries remain: drop the now-empty directory. A concurrent removal
+        // (NotFound) counts as fully removed; a late writer racing a file in
+        // (DirectoryNotEmpty) is "not fully removed" so the next sweep retries.
+        // Every OTHER error (permission denied, read-only FS) is surfaced rather
+        // than silently downgraded to a forever-retry.
+        match std::fs::remove_dir(snapshot_dir) {
+            Ok(()) => Ok(true),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(true),
+            Err(e) if e.kind() == std::io::ErrorKind::DirectoryNotEmpty => Ok(false),
+            Err(e) => Err(e),
+        }
+    }
+
     /// Physically delete retired snapshot dirs whose grace has fully elapsed,
     /// evicting each deleted dir's (infinite-TTL) `list_files_cache` entry so
     /// a later plan can't resolve files inside it. Spawned detached — never
@@ -4254,28 +4513,70 @@ impl CayenneTableProvider {
         if due.is_empty() {
             return;
         }
+        // The LIVE snapshot set whose manifests pin files alive: the current
+        // snapshot plus every protected snapshot. Built here (under the same
+        // observation of `current`/`protected` the `due` filter used) so the
+        // spawned task ref-counts against a coherent set.
+        let mut live_snapshot_ids: HashSet<String> = protected.keys().cloned().collect();
+        live_snapshot_ids.insert(current);
         let table_path = self.table_metadata.path.clone();
         let table_id = self.table_metadata.table_id.clone();
         let runtime_env = Arc::clone(self.context.runtime_env());
         let ledger = Arc::clone(&self.retired_snapshot_dirs);
         let last_listed = Arc::clone(&self.snapshot_last_listed);
+        let catalog = Arc::clone(&self.catalog);
         tokio::spawn(async move {
+            // Ref-count source: every manifest row for the table, so a file a
+            // retired dir holds but a LIVE snapshot references in place (an
+            // in-place compaction reference) is NOT unlinked. An empty manifest
+            // means no snapshot here is manifest-tracked yet (legacy /
+            // pre-population), so fall back to the original whole-dir delete —
+            // no cross-snapshot reference can exist without manifest rows.
+            let all_rows = match catalog.get_all_snapshot_files(&table_id).await {
+                Ok(rows) => rows,
+                Err(error) => {
+                    // Reading the manifest is the safety check; if it fails we
+                    // must NOT delete (a referenced file could be orphaned).
+                    // Leave the dirs in the ledger and retry next sweep.
+                    tracing::warn!(
+                        target: "cayenne::compaction",
+                        table_id = %table_id,
+                        %error,
+                        "Retired-dir sweep skipped: failed to read snapshot manifest \
+                         (will retry)"
+                    );
+                    return;
+                }
+            };
+            let manifest_populated = !all_rows.is_empty();
+            let live_referenced =
+                Self::live_referenced_relative_paths(&all_rows, &live_snapshot_ids);
             for id in due {
                 let dir = Self::snapshot_dir_path(&table_path, &table_id, &id);
+                let id_for_task = id.clone();
+                let referenced = live_referenced.clone();
                 let removed = tokio::task::spawn_blocking(move || {
-                    match std::fs::remove_dir_all(&dir) {
-                        Ok(()) => Ok(()),
-                        // Already gone (e.g. reaped by a rotation-anchored
-                        // cleanup): success for our purposes.
-                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-                        Err(e) => Err(e),
+                    if manifest_populated {
+                        Self::delete_retired_snapshot_dir_refcounted(
+                            &dir,
+                            &id_for_task,
+                            &referenced,
+                        )
+                    } else {
+                        // Legacy path: no manifest, so no file is referenced
+                        // across snapshots — the whole dir is dead.
+                        match std::fs::remove_dir_all(&dir) {
+                            Ok(()) => Ok(true),
+                            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(true),
+                            Err(e) => Err(e),
+                        }
                     }
                 })
                 .await;
                 match removed {
-                    Ok(Ok(())) => {
-                        // Evict the cached listing AFTER the unlink so the
-                        // next plan lists fresh and sees the dir gone.
+                    Ok(Ok(true)) => {
+                        // Dir fully removed. Evict the cached listing AFTER the
+                        // unlink so the next plan lists fresh and sees it gone.
                         let url = Self::snapshot_dir_url(&table_path, &table_id, &id);
                         Self::invalidate_list_files_cache(&runtime_env, &url);
                         ledger.lock().remove(&id);
@@ -4285,6 +4586,23 @@ impl CayenneTableProvider {
                             table_id = %table_id,
                             snapshot_id = %id,
                             "Deleted retired snapshot dir"
+                        );
+                    }
+                    Ok(Ok(false)) => {
+                        // A file referenced in place by a live/protected
+                        // snapshot (or a non-data sidecar) kept the dir alive.
+                        // KEEP it in the ledger — once the referencing snapshots
+                        // are themselves retired the file becomes orphaned and a
+                        // later sweep reaps the dir. Do NOT evict the listing
+                        // cache: the surviving files must stay resolvable. The
+                        // ledger entry is bounded (one per retired snapshot) and
+                        // re-checking it each grace-gated sweep is cheap.
+                        tracing::debug!(
+                            target: "cayenne::compaction",
+                            table_id = %table_id,
+                            snapshot_id = %id,
+                            "Retired snapshot dir kept: data files still referenced \
+                             in place by a live snapshot (will retry once orphaned)"
                         );
                     }
                     Ok(Err(e)) => {
@@ -4489,6 +4807,22 @@ impl CayenneTableProvider {
                 source: e,
             })?;
 
+        // Ref-count source: a live/protected snapshot can reference a file that
+        // physically lives under an old snapshot's prefix (an in-place
+        // compaction reference). Reading the manifest is the safety gate — on
+        // failure, abort cleanup rather than risk orphaning a referenced file.
+        // Empty manifest = legacy / unpopulated, so prefixes are deleted
+        // wholesale (no cross-snapshot reference can exist without rows).
+        let all_rows = self
+            .catalog
+            .get_all_snapshot_files(&self.table_metadata.table_id)
+            .await
+            .map_err(|source| Error::Catalog { source })?;
+        let manifest_populated = !all_rows.is_empty();
+        let mut live_snapshot_ids = protected_snapshot_ids.clone();
+        live_snapshot_ids.insert(current_snapshot.to_string());
+        let live_referenced = Self::live_referenced_relative_paths(&all_rows, &live_snapshot_ids);
+
         for common_prefix in list_result.common_prefixes {
             if let Some(snapshot_id) = common_prefix.parts().next_back() {
                 let snapshot_id_str = snapshot_id.as_ref();
@@ -4502,9 +4836,95 @@ impl CayenneTableProvider {
                     );
                     continue;
                 }
-                self.delete_prefix_with_object_store(&common_prefix).await?;
+                if manifest_populated {
+                    let snapshot_id_owned = snapshot_id_str.to_string();
+                    self.delete_prefix_refcounted(
+                        &common_prefix,
+                        &snapshot_id_owned,
+                        &live_referenced,
+                    )
+                    .await?;
+                } else {
+                    self.delete_prefix_with_object_store(&common_prefix).await?;
+                }
             }
         }
+
+        Ok(())
+    }
+
+    /// Ref-count-aware deletion of an old snapshot prefix on object storage:
+    /// delete only the objects under `prefix` whose table-relative path
+    /// (`{retiring_snapshot_id}/{file_name}` — see
+    /// [`Self::manifest_file_relative_path`]) is NOT in `live_referenced`. An
+    /// object referenced in place by a live/protected snapshot's manifest is
+    /// left untouched. The S3 mirror of
+    /// [`Self::delete_retired_snapshot_dir_refcounted`]; there is no empty-prefix
+    /// "directory" to remove afterwards on object storage.
+    async fn delete_prefix_refcounted(
+        &self,
+        prefix: &ObjectStorePath,
+        retiring_snapshot_id: &str,
+        live_referenced: &HashSet<String>,
+    ) -> Result<()> {
+        let config = self.require_object_store()?;
+        let objects: Vec<_> = config
+            .store
+            .list(Some(prefix))
+            .try_collect()
+            .await
+            .map_err(|e| Error::ObjectStore {
+                operation: "list objects for snapshot cleanup",
+                table: self.table_metadata.table_name.clone(),
+                source: e,
+            })?;
+
+        let store = Arc::clone(&config.store);
+        let table_name = self.table_metadata.table_name.clone();
+        stream::iter(objects.into_iter().map(Ok::<_, Error>))
+            .try_for_each_concurrent(OBJECT_STORE_MOVE_CONCURRENCY, |meta| {
+                let store = Arc::clone(&store);
+                let table_name = table_name.clone();
+                // The object's bare file name is the last path segment; combined
+                // with the retiring snapshot id it forms the same relative key
+                // the manifest ref-count is built from.
+                let file_name = meta
+                    .location
+                    .parts()
+                    .next_back()
+                    .map(|p| p.as_ref().to_string());
+                // Only compactable data files participate in ref-counting; a
+                // non-data sidecar (e.g. a staging WAL artifact) is never a
+                // manifest target, so leave it untouched — mirrors the local
+                // delete_retired_snapshot_dir_refcounted conservative
+                // (never-orphan) behavior instead of deleting unknown objects.
+                let is_data_file = file_name
+                    .as_deref()
+                    .is_some_and(Self::is_compactable_data_file);
+                let referenced = is_data_file
+                    && file_name.as_ref().is_some_and(|name| {
+                        live_referenced.contains(&Self::manifest_file_relative_path(
+                            retiring_snapshot_id,
+                            name,
+                        ))
+                    });
+                async move {
+                    if !is_data_file || referenced {
+                        // Non-data sidecar (kept, never orphaned) or referenced in
+                        // place by a live/protected snapshot — keep.
+                        return Ok(());
+                    }
+                    store
+                        .delete(&meta.location)
+                        .await
+                        .map_err(|e| Error::ObjectStore {
+                            operation: "delete object from snapshot cleanup",
+                            table: table_name,
+                            source: e,
+                        })
+                }
+            })
+            .await?;
 
         Ok(())
     }
@@ -5229,6 +5649,15 @@ impl CayenneTableProvider {
     /// * `table_path` - Base path for the table
     /// * `table_id` - Table identifier
     /// * `current_snapshot_id` - The current (active) snapshot ID that should be kept
+    /// * `protected_snapshot_ids` - Protected snapshots that must also be kept
+    /// * `manifest_populated` - Whether the table's manifest has any rows. When
+    ///   `false` (legacy / pre-population) the whole old dir is dead and is
+    ///   removed wholesale, preserving the original behavior. When `true` an old
+    ///   dir is reaped FILE-BY-FILE, keeping any file a live/protected
+    ///   snapshot's manifest references in place (a cross-snapshot reference).
+    /// * `live_referenced` - Table-relative paths (see
+    ///   [`Self::manifest_file_relative_path`]) referenced by the live snapshot
+    ///   set; only consulted when `manifest_populated`.
     ///
     /// # Errors
     ///
@@ -5243,6 +5672,8 @@ impl CayenneTableProvider {
         table_id: &str,
         current_snapshot_id: &str,
         protected_snapshot_ids: &HashSet<String>,
+        manifest_populated: bool,
+        live_referenced: &HashSet<String>,
     ) -> CatalogResult<()> {
         let table_dir = std::path::PathBuf::from(table_path).join(table_id);
 
@@ -5326,16 +5757,37 @@ impl CayenneTableProvider {
                 }
             }
 
-            // Delete the old snapshot directory using blocking I/O
+            // Delete the old snapshot directory using blocking I/O. When the
+            // manifest is populated, delete file-by-file so a file referenced
+            // in place by a live/protected snapshot survives; otherwise (legacy
+            // / unpopulated) the whole dir is dead and removed wholesale.
             tracing::info!(
                 "Deleting old snapshot directory for table {}: {}",
                 table_id,
                 snapshot_id
             );
 
-            std::fs::remove_dir_all(&path).map_err(|source| CatalogError::IoError { source })?;
-
-            deleted_count += 1;
+            if manifest_populated {
+                let snapshot_id = snapshot_id.to_string();
+                let fully_removed = Self::delete_retired_snapshot_dir_refcounted(
+                    &path,
+                    &snapshot_id,
+                    live_referenced,
+                )
+                .map_err(|source| CatalogError::IoError { source })?;
+                if fully_removed {
+                    deleted_count += 1;
+                } else {
+                    tracing::info!(
+                        "Kept old snapshot directory for table {table_id}: {snapshot_id} \
+                         (files still referenced in place by a live snapshot)"
+                    );
+                }
+            } else {
+                std::fs::remove_dir_all(&path)
+                    .map_err(|source| CatalogError::IoError { source })?;
+                deleted_count += 1;
+            }
         }
 
         if deleted_count > 0 {
@@ -5694,6 +6146,18 @@ impl CayenneTableProvider {
                 provider.bump_inlined_structural_epoch();
             }
         }
+
+        // Manifest snapshot model (phase 5): if the table was last written before
+        // manifest population existed, its live snapshots have data files but no
+        // `cayenne_snapshot_file` rows. Backfill them from the directory listing
+        // now — synchronously and before the provider is returned — so the live
+        // manifest is complete (not partial) before any scan can run. Recovery
+        // above already moved any interrupted staged append into its snapshot, so
+        // the directory listing this reads is the final, committed file set. No
+        // background task is running yet, so this cannot race a write or
+        // compaction. Best-effort: it leaves the manifest empty on failure and
+        // the scan falls back to directory listing.
+        provider.backfill_snapshot_manifest_if_empty().await;
 
         if let Err(error) = provider
             .rebuild_maintained_aggregates_from_visible_state()
@@ -10119,13 +10583,13 @@ impl CayenneTableProvider {
     /// Returns `Ok(true)` if at least one snapshot rewrite occurred.
     #[doc(hidden)]
     pub async fn maybe_compact_small_files(&self) -> Result<bool> {
-        let Ok(_guard) = self.compaction_lock.try_lock() else {
-            tracing::trace!(
-                table = self.table_metadata.table_name.as_str(),
-                "Skipping compaction trigger: another pass already running",
-            );
-            return Ok(false);
-        };
+        // This explicit trigger is test-only (production background compaction
+        // goes through `CompactionRunner::run_compaction_trigger`). WAIT for the
+        // compaction lock rather than skipping when a spawned post-write
+        // maintenance/compaction holds it, so an explicit pass runs
+        // deterministically instead of racing the background tasks that share
+        // this lock.
+        let _guard = self.compaction_lock.lock().await;
 
         let max_passes = self.context.compaction_max_levels();
         let mut total_passes = 0_usize;
@@ -10386,6 +10850,47 @@ impl CayenneTableProvider {
                 table = self.table_metadata.table_name.as_str(),
                 "Position capture pass failed: {e}"
             );
+        }
+
+        // Manifest snapshot model (phase 1b): rebuild the authoritative data-file
+        // manifest (`cayenne_snapshot_file`) for every LIVE snapshot (the current
+        // snapshot plus each protected snapshot) from a fresh directory listing
+        // whenever this pass observed a write. Append-only inserts accumulate
+        // into the current snapshot dir; CDC upserts publish each batch as a new
+        // protected snapshot whose files live in their own dir, so the complete
+        // live file set spans current ∪ protected. Post-write maintenance is
+        // COALESCED, so listing each snapshot here yields its COMPLETE file set
+        // regardless of how many appends folded into this pass.
+        //
+        // GC: the append path only UPSERTS (no prune). Stale manifest rows are
+        // removed by compaction's single-keep prune (`prune_snapshot_manifest_to`
+        // after `commit_compaction` folds protected snapshots into one current
+        // snapshot) and by overwrite/drop. Between those, the current snapshot id
+        // is stable (it changes only via compaction/overwrite) and protected
+        // snapshots only grow, so every snapshot upserted here is still live — an
+        // upsert-only pass keeps the manifest complete without ever dropping a
+        // live snapshot's rows.
+        //
+        // Serialized against compaction via `compaction_lock`: a concurrent
+        // compaction flips `current_snapshot_id`, repoints the protected set, and
+        // prunes the manifest to its OWN new snapshot under that lock. Rebuilding
+        // here without it could re-add (now-dead) protected-snapshot rows just
+        // after that prune, or race the pointer/protected-set read. Holding the
+        // lock pins the live set for the whole rebuild; if a compaction is
+        // already running (`try_lock` fails) we skip — it populates the manifest
+        // for its new snapshot, and the next maintenance debounce repopulates.
+        // The append path itself never clears tombstones, so deferring the
+        // manifest off the publish fence cannot resurrect or vanish a row.
+        if state.refresh_listing || had_stats || retention_deleted > 0 {
+            if let Ok(_compaction_guard) = self.compaction_lock.try_lock() {
+                self.rebuild_live_snapshot_manifests().await;
+            } else {
+                tracing::trace!(
+                    table = self.table_metadata.table_name.as_str(),
+                    "Skipping post-write manifest rebuild: a compaction holds the lock \
+                     (it will populate the manifest for its new snapshot)"
+                );
+            }
         }
 
         if state.refresh_listing || had_stats || retention_deleted > 0 {
@@ -10710,6 +11215,476 @@ impl CayenneTableProvider {
         name.ends_with(".vortex")
     }
 
+    /// Upsert the authoritative per-snapshot data-file manifest
+    /// (`cayenne_snapshot_file`) for `snapshot_id` from the snapshot directory's
+    /// COMPLETE file listing. Does NOT prune other snapshots — callers pair this
+    /// with [`Self::prune_snapshot_manifest_to`] so a commit that may still fail
+    /// can publish the new set without dropping the live snapshot's rows first.
+    ///
+    /// `file_path` is stored as the snapshot-relative file *name* (what
+    /// [`Self::list_snapshot_files_with_sizes`] returns) — the manifest is scoped
+    /// by `(table_id, snapshot_id)`, so the name uniquely identifies the file
+    /// within the snapshot and the full object-store path is reconstructible as
+    /// `snapshot_dir + "/" + file_path`. Listing the directory (rather than
+    /// threading per-file metadata through every write path) makes the manifest
+    /// equal to the directory listing *by construction* — exactly the invariant
+    /// [`Self::debug_assert_manifest_matches_listing`] checks.
+    ///
+    /// Each file's `[min_sequence, max_sequence]` is resolved per-file from `tag`
+    /// (a [`ManifestSequenceTag`]) — the TRUE commit-seq range the seq-prefix
+    /// bake needs, in place of the prior single per-snapshot watermark (which
+    /// degenerated `partition_manifest_by_sequence` to all-bake/all-reference and
+    /// delivered zero shrink). For a protected snapshot the tag is the single
+    /// reserved sequence (`[S, S]`); for the current snapshot it preserves the
+    /// merged range a compaction/overwrite already recorded (never clobbers it)
+    /// and tags any brand-new file conservatively (`[0, current_seq]`, always
+    /// bake-eligible). Per-file `row_count` is sourced best-effort from the
+    /// persisted per-file stats cache (`cayenne_snapshot_file_statistics`) and
+    /// left `0` when absent — the authoritative live count lives in
+    /// `cayenne_table_statistics`; reading every Vortex footer here would be an
+    /// unbounded write-path I/O regression.
+    ///
+    /// Returns the file listing it wrote (so a caller can feed it straight to the
+    /// debug-assert). Errors propagate to the caller, which decides whether to
+    /// fail the operation; the manifest is not yet the scan's file source
+    /// (directory listing still is), so a transiently incomplete manifest cannot
+    /// make a scan miss a live file or read one outside its snapshot.
+    async fn upsert_snapshot_manifest_from_listing(
+        &self,
+        snapshot_id: &str,
+        tag: ManifestSequenceTag,
+    ) -> CatalogResult<Vec<(String, u64)>> {
+        let files = self
+            .list_snapshot_files_with_sizes(snapshot_id)
+            .await
+            .map_err(|e| CatalogError::InvalidOperation {
+                message: format!(
+                    "Failed to list snapshot '{snapshot_id}' files for manifest population"
+                ),
+                source: Box::new(e),
+            })?;
+
+        let table_id = self.table_metadata.table_id.clone();
+
+        // For the preserve mode, read the snapshot's existing manifest ONCE so a
+        // re-list cannot clobber a merged `[min, max]` the compaction that minted
+        // this snapshot already authored (the catalog upsert is `INSERT OR
+        // REPLACE`). Empty for `Uniform`, where every range is fixed. A read error
+        // PROPAGATES rather than degrading to an empty map: silently dropping the
+        // existing ranges could clobber a compaction-authored merged `[min, max]`
+        // with the per-file fallback and overstate `min_sequence` (an unsafe
+        // reference-in-place input for the seq-prefix bake).
+        let existing: std::collections::HashMap<String, (i64, i64)> = match tag {
+            ManifestSequenceTag::PreserveOrUniform { .. } => self
+                .catalog
+                .get_snapshot_files(&table_id, snapshot_id)
+                .await?
+                .into_iter()
+                .map(|f| (f.file_path, (f.min_sequence, f.max_sequence)))
+                .collect(),
+            ManifestSequenceTag::Uniform { .. } => std::collections::HashMap::new(),
+        };
+
+        for (file_name, size) in &files {
+            // Reuse the per-file footer row count when the scan path already
+            // persisted it for this exact (snapshot, file); the manifest entry is
+            // a hint until the manifest becomes the scan's file source, so a 0
+            // here is correct-but-imprecise, never wrong.
+            let row_count = self
+                .catalog
+                .get_snapshot_file_statistics(&table_id, snapshot_id, file_name)
+                .await
+                .ok()
+                .flatten()
+                .map_or(0, |stats| stats.num_rows);
+
+            let (min_sequence, max_sequence) = match tag {
+                ManifestSequenceTag::Uniform { min, max } => (min, max),
+                // Preserve a compaction-authored merged range; for a brand-new
+                // (untagged) file fall back to `[min, max]` — `[S, S]` for a
+                // protected snapshot (exact), `[0, current_seq]` for the current
+                // snapshot (conservative: `min = 0` keeps it always
+                // bake-eligible, never wrongly referenced, never resurrecting a
+                // deleted row).
+                ManifestSequenceTag::PreserveOrUniform { min, max } => {
+                    existing.get(file_name).copied().unwrap_or((min, max))
+                }
+            };
+
+            self.catalog
+                .upsert_snapshot_file(&SnapshotFile {
+                    table_id: table_id.clone(),
+                    snapshot_id: snapshot_id.to_string(),
+                    file_path: file_name.clone(),
+                    row_count,
+                    file_size_bytes: i64::try_from(*size).unwrap_or(i64::MAX),
+                    min_sequence,
+                    max_sequence,
+                })
+                .await?;
+        }
+
+        Ok(files)
+    }
+
+    /// Snapshot GC of stale manifest rows: drop every manifest row whose
+    /// `snapshot_id` is not `keep_snapshot_id`. Only the live snapshot's file set
+    /// is authoritative (append accumulates into the current snapshot dir;
+    /// compaction mints a fresh snapshot), so after a successful commit every
+    /// other snapshot's manifest rows are dead. Kept separate from the upsert so
+    /// it runs AFTER the commit that makes `keep_snapshot_id` current — a commit
+    /// that fails then leaves the previously-current snapshot's rows intact
+    /// (publish-before-clear).
+    pub(crate) async fn prune_snapshot_manifest_to(
+        &self,
+        keep_snapshot_id: &str,
+    ) -> CatalogResult<()> {
+        self.catalog
+            .clear_snapshot_files_except(&self.table_metadata.table_id, keep_snapshot_id)
+            .await
+    }
+
+    /// Author one snapshot's manifest with a single uniform commit-seq range
+    /// (`[min, max]` on every file). The `pub(crate)` entry the overwrite path
+    /// uses to record its `[S, S]` range without depending on the private
+    /// [`ManifestSequenceTag`]. Returns the listing on success (discarded by
+    /// callers that only need the side effect).
+    pub(crate) async fn author_uniform_snapshot_manifest(
+        &self,
+        snapshot_id: &str,
+        min_sequence: i64,
+        max_sequence: i64,
+    ) -> CatalogResult<Vec<(String, u64)>> {
+        self.upsert_snapshot_manifest_from_listing(
+            snapshot_id,
+            ManifestSequenceTag::Uniform {
+                min: min_sequence,
+                max: max_sequence,
+            },
+        )
+        .await
+    }
+
+    /// Fold the manifest of every snapshot in `snapshot_ids` into one
+    /// `[min over all min_sequence, max over all max_sequence]` — the true
+    /// commit-seq range of a consolidating rewrite that merges those snapshots
+    /// (the full-rewrite folds the whole live set; the subset merge folds its
+    /// selected inputs).
+    ///
+    /// Returns `None` when none of the snapshots has any manifest row (nothing to
+    /// fold — the caller falls back to a conservative range) OR when any
+    /// snapshot's manifest read fails: failing closed avoids a non-conservative
+    /// (overstated-`min_sequence`) folded range that could drive an unsafe
+    /// reference-in-place decision.
+    async fn merged_sequence_range_over_snapshots(
+        &self,
+        snapshot_ids: &[String],
+    ) -> Option<(i64, i64)> {
+        let mut range: Option<(i64, i64)> = None;
+        for id in snapshot_ids {
+            let files = match self
+                .catalog
+                .get_snapshot_files(&self.table_metadata.table_id, id)
+                .await
+            {
+                Ok(files) => files,
+                // Fail CLOSED: skipping a low-`min_sequence` snapshot on a read
+                // error would OVERSTATE the merged min and could make a file look
+                // "clean past T" and be referenced in place — unsafe once `<= T`
+                // tombstones are pruned. Fall back to the conservative range.
+                Err(error) => {
+                    tracing::warn!(
+                        table = self.table_name(),
+                        %error,
+                        snapshot_id = id.as_str(),
+                        "Failed to read a snapshot manifest while folding the merged \
+                         sequence range; falling back to the conservative range"
+                    );
+                    return None;
+                }
+            };
+            for file in files {
+                range = Some(match range {
+                    None => (file.min_sequence, file.max_sequence),
+                    Some((min, max)) => (min.min(file.min_sequence), max.max(file.max_sequence)),
+                });
+            }
+        }
+        range
+    }
+
+    /// The merged commit-seq range over every LIVE snapshot (current +
+    /// protected) — the true range of a full-rewrite, which materializes the
+    /// whole visible stream. See [`Self::merged_sequence_range_over_snapshots`].
+    async fn merged_sequence_range_over_live_snapshots(&self) -> Option<(i64, i64)> {
+        let mut ids: Vec<String> = vec![self.get_current_snapshot_id()];
+        ids.extend(self.protected_snapshots.load().keys().cloned());
+        self.merged_sequence_range_over_snapshots(&ids).await
+    }
+
+    /// Partition `snapshot_id`'s manifest into bake-eligible (`min_sequence <= T`)
+    /// and reference-in-place (`min_sequence > T`) file sets — the planning step
+    /// of an incremental seq-prefix compaction. See [`SeqPrefixPlan`] for the
+    /// soundness argument.
+    ///
+    /// Returns `Ok(None)` when the manifest is empty (not yet populated): without
+    /// an authoritative file set the seq-prefix split is undefined, so the caller
+    /// falls back to the full-snapshot rewrite (which lists the directory).
+    ///
+    /// The split is purely metadata; it reads no data files. `cutoff` is the
+    /// highest delete sequence currently in the deletion index (`T`): every
+    /// applicable tombstone has `delete_seq <= T`. A file holding ANY row at
+    /// `write_seq <= T` has `min_sequence <= T` and so is baked (its dead rows
+    /// physically removed); a referenced file has `min_sequence > T`, so all its
+    /// rows were written after every `<= T` tombstone and none of those
+    /// tombstones apply to it. Pruning the index of `<= T` tombstones after the
+    /// commit therefore cannot resurrect a row in a referenced file. The
+    /// `min_sequence` predicate is load-bearing for merged files that straddle
+    /// the cutoff — see [`SeqPrefixPlan`].
+    async fn partition_manifest_by_sequence(
+        &self,
+        snapshot_id: &str,
+        cutoff: i64,
+    ) -> CatalogResult<Option<SeqPrefixPlan>> {
+        let manifest = self
+            .catalog
+            .get_snapshot_files(&self.table_metadata.table_id, snapshot_id)
+            .await?;
+        if manifest.is_empty() {
+            return Ok(None);
+        }
+
+        let mut plan = SeqPrefixPlan::default();
+        for file in manifest {
+            if file.min_sequence <= cutoff {
+                plan.bake.push(file);
+            } else {
+                plan.reference.push(file);
+            }
+        }
+        Ok(Some(plan))
+    }
+
+    /// Rebuild the manifest for every LIVE snapshot (the current snapshot plus
+    /// each protected snapshot) from fresh directory listings. Used by the
+    /// append path's coalesced post-write maintenance lane.
+    ///
+    /// Per-file sequence ranges are TRUE (no longer a single per-snapshot
+    /// watermark), resolved by snapshot kind. BOTH kinds use
+    /// [`ManifestSequenceTag::PreserveOrUniform`] — preserve any range a
+    /// write-site already authored for a file, and apply the per-kind default
+    /// only to a brand-new (untagged) file:
+    /// - **Protected snapshots** (CDC-staged-append publishes, sync upserts,
+    ///   mem-tier checkpoints) are written by ONE reserved sequence — the
+    ///   in-memory protected-set value, which IS that reservation/threshold
+    ///   sequence. A fresh file therefore defaults to `[S, S]`, which is exactly
+    ///   correct: by the seq-ordering invariant every row in the snapshot was
+    ///   committed at `S`. (A subset-compaction output is a protected snapshot
+    ///   too, but it AUTHORED its merged `[min, max]` at commit time, so the
+    ///   preserve arm keeps that range rather than the delete-seq threshold.)
+    /// - **The current snapshot** is USUALLY a consolidation/overwrite/genesis
+    ///   output whose files carry a MERGED `[min, max]` recorded at that write —
+    ///   but a plain-append table's current snapshot also accretes raw appends,
+    ///   whose true min is unknown here. So a fresh current-snapshot file
+    ///   defaults to `[0, current_seq]` (always bake-eligible — `min = 0` — never
+    ///   wrongly referenced-in-place), while the preserve arm keeps any
+    ///   authored merged range. `current_seq` comes from `cayenne_snapshot_sequence`
+    ///   (0 if absent, e.g. just after an overwrite clears the sequence rows).
+    ///
+    /// **Load-bearing invariant** (the seq-prefix bake depends on it): a file's
+    /// `min_sequence` is a CLEAN WATERMARK — the file holds only rows that are
+    /// free of any deletion with `delete_seq <= min_sequence`. This holds because
+    /// every file-producing path either writes brand-new rows committed at a
+    /// single sequence `S` (so `min_sequence = S` and no `<= S` delete can target
+    /// a row that did not yet exist) or applies the visible deletions at write
+    /// time and records the merged survivor range (so any `<= min_sequence`
+    /// delete is already physically applied). A raw append is conservatively
+    /// tagged `[0, current_seq]`, keeping it bake-eligible rather than asserting a
+    /// clean watermark it cannot prove. This is precisely why
+    /// `partition_manifest_by_sequence` splits on `min_sequence` (not
+    /// `max_sequence`) and why pruning the deletion index at `T` after baking
+    /// every `min_sequence <= T` file resurrects nothing.
+    ///
+    /// Upsert-only — GC of stale rows is the compaction/overwrite/drop paths' job
+    /// (see the call-site comment). Caller MUST hold `compaction_lock` so the
+    /// live set cannot shift mid-rebuild.
+    ///
+    /// Best-effort: a per-snapshot failure is logged and the rest still run; the
+    /// manifest is not yet the scan's file source, so an incomplete manifest
+    /// cannot make a scan miss a live file or read one outside its snapshot.
+    async fn rebuild_live_snapshot_manifests(&self) {
+        // Snapshot the live set as one coherent read (current + protected). The
+        // held `compaction_lock` keeps a compaction from repointing it mid-pass.
+        let current_snapshot = self.get_current_snapshot_id();
+        let current_sequence = self
+            .catalog
+            .get_snapshot_sequence(&self.table_metadata.table_id, &current_snapshot)
+            .await
+            .ok()
+            .flatten()
+            .unwrap_or(0);
+
+        // (snapshot_id, how-to-tag-its-files). Both kinds PRESERVE any
+        // compaction-authored merged range; the per-kind default only applies to
+        // a brand-new (untagged) file. Current: `[0, current_seq]` (conservative,
+        // bake-eligible). Protected: `[S, S]` where `S` is the reservation that
+        // wrote every row in a fresh CDC-staged-append / checkpoint snapshot.
+        let mut live: Vec<(String, ManifestSequenceTag)> = vec![(
+            current_snapshot,
+            ManifestSequenceTag::PreserveOrUniform {
+                min: 0,
+                max: current_sequence,
+            },
+        )];
+        for (snapshot_id, sequence) in self.protected_snapshots.load().iter() {
+            live.push((
+                snapshot_id.clone(),
+                ManifestSequenceTag::PreserveOrUniform {
+                    min: *sequence,
+                    max: *sequence,
+                },
+            ));
+        }
+
+        for (snapshot_id, tag) in &live {
+            match self
+                .upsert_snapshot_manifest_from_listing(snapshot_id, *tag)
+                .await
+            {
+                Ok(files) => {
+                    self.debug_assert_manifest_matches_listing(snapshot_id, &files)
+                        .await;
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        table = self.table_metadata.table_name.as_str(),
+                        %error,
+                        snapshot_id = snapshot_id.as_str(),
+                        "Post-write snapshot manifest rebuild failed for one snapshot; \
+                         scan falls back to directory listing"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Manifest snapshot model (phase 5): backfill `cayenne_snapshot_file` for a
+    /// table opened against snapshots that predate manifest population.
+    ///
+    /// A snapshot written before this code existed (or whose post-write rebuild
+    /// never ran because the table has only been read since) has data files on
+    /// disk but no manifest rows. The scan's dual-source fallback handles an
+    /// *empty* manifest by listing the directory, so such a snapshot is read
+    /// correctly even with `scan_from_manifest` on — but it never benefits from
+    /// the manifest, and a half-written manifest would be *wrong* (the scan only
+    /// falls back when the manifest is empty, never when it is partial). This
+    /// pass closes that gap by making the live manifest either complete or empty,
+    /// never partial, before the provider is handed to a caller.
+    ///
+    /// Idempotent and gated on emptiness: if ANY manifest row already exists for
+    /// the table, the write path is maintaining it, so this is a single cheap
+    /// metastore read and returns. Only a table whose manifest is entirely empty
+    /// pays the directory listing — the same listing a scan would do anyway. Runs
+    /// at open before the background compactor starts, so the live set cannot
+    /// shift under it (no lock contention) and no scan can observe a partial
+    /// manifest. Best-effort: any failure leaves the manifest empty and is logged
+    /// — the dual-source read path then lists the directory, so a backfill error
+    /// can never make a scan miss a live file or read one outside its snapshot.
+    async fn backfill_snapshot_manifest_if_empty(&self) {
+        match self
+            .catalog
+            .get_all_snapshot_files(&self.table_metadata.table_id)
+            .await
+        {
+            Ok(rows) if !rows.is_empty() => {
+                // Manifest already populated (write path or a prior backfill);
+                // leave it to the live write/compaction paths.
+                return;
+            }
+            Ok(_) => {
+                // Empty: fall through to backfill from directory listing.
+            }
+            Err(error) => {
+                // Could not determine emptiness; skip rather than risk writing a
+                // partial manifest atop an unknown state. Directory listing
+                // remains the scan's source.
+                tracing::warn!(
+                    table = self.table_metadata.table_name.as_str(),
+                    %error,
+                    "Snapshot manifest backfill skipped: failed to read existing manifest; \
+                     scan falls back to directory listing"
+                );
+                return;
+            }
+        }
+
+        // Same complete-live-set rebuild the post-write maintenance lane runs
+        // (current ∪ protected, each tagged with its own commit sequence). At
+        // open the background compactor has not started, so `compaction_lock` is
+        // uncontended and the live set is stable for the whole rebuild.
+        tracing::debug!(
+            table = self.table_metadata.table_name.as_str(),
+            "Backfilling empty snapshot manifest from directory listing at open"
+        );
+        self.rebuild_live_snapshot_manifests().await;
+    }
+
+    /// Debug-only invariant check: the manifest file-name set persisted for
+    /// `snapshot_id` must equal the directory listing that produced it. Compiled
+    /// out of release builds. `listed` is the listing the caller just wrote the
+    /// manifest from, so any divergence means the metastore round-trip lost or
+    /// duplicated a row (or a concurrent writer mutated the manifest) — a bug,
+    /// not a data-loss path, since the scan still reads the directory.
+    #[cfg(debug_assertions)]
+    async fn debug_assert_manifest_matches_listing(
+        &self,
+        snapshot_id: &str,
+        listed: &[(String, u64)],
+    ) {
+        let manifest = match self
+            .catalog
+            .get_snapshot_files(&self.table_metadata.table_id, snapshot_id)
+            .await
+        {
+            Ok(rows) => rows,
+            Err(error) => {
+                tracing::warn!(
+                    table = %self.table_metadata.table_name,
+                    %error,
+                    "Manifest consistency check skipped: failed to read back manifest"
+                );
+                return;
+            }
+        };
+
+        let manifest_names: std::collections::BTreeSet<&str> =
+            manifest.iter().map(|f| f.file_path.as_str()).collect();
+        let listed_names: std::collections::BTreeSet<&str> =
+            listed.iter().map(|(name, _)| name.as_str()).collect();
+
+        debug_assert_eq!(
+            manifest_names, listed_names,
+            "cayenne_snapshot_file manifest for table {} snapshot {snapshot_id} \
+             does not match the directory listing (manifest={manifest_names:?}, \
+             listing={listed_names:?})",
+            self.table_metadata.table_name,
+        );
+    }
+
+    #[cfg(not(debug_assertions))]
+    #[inline]
+    #[expect(
+        clippy::unused_async,
+        reason = "release no-op stub mirrors the async debug-build signature so \
+                  call sites `.await` it unconditionally"
+    )]
+    async fn debug_assert_manifest_matches_listing(
+        &self,
+        _snapshot_id: &str,
+        _listed: &[(String, u64)],
+    ) {
+    }
+
     /// Rewrite the current snapshot into a fresh one, consolidating its files.
     ///
     /// When `sort_columns` are configured, compaction sorts the merged stream
@@ -10844,10 +11819,115 @@ impl CayenneTableProvider {
             &self.pk_deletion_strategy,
         )?;
 
+        // Manifest snapshot model (phase 1c): record the new snapshot's COMPLETE
+        // data-file set BEFORE the commit clears this table's tombstones.
+        // `commit_snapshot_rewrite` -> `commit_compaction` drops every delete
+        // file / insert record / snapshot-sequence row in one transaction, so
+        // the manifest must be durable first to honour the publish-before-clear
+        // invariant (a new file set is published before the old deletions are
+        // cleared). The prune (`prune_snapshot_manifest_to`) is deferred to
+        // AFTER the commit succeeds, so a failed commit leaves the still-current
+        // OLD snapshot's manifest rows intact (only harmless orphan rows for the
+        // abandoned new snapshot remain, which the next successful prune
+        // removes). Best-effort: a manifest failure must not resurrect deleted
+        // rows or lose the rewrite, so log and continue — the scan still reads
+        // the directory until the manifest becomes the file source.
+        //
+        // Merged range: this rewrite materializes the FULL visible stream
+        // (`visible_file_stream_for_rewrite` = the whole `scan`, i.e. the current
+        // snapshot UNION every protected snapshot, with all deletions applied),
+        // so the consolidated output's true range is `[min over inputs
+        // min_sequence, max over inputs max_sequence]`. Take it over every LIVE
+        // snapshot's manifest (current + protected) — a strict superset of the
+        // inputs that cannot understate `max` or overstate `min`. When no input
+        // manifest is available (legacy/unpopulated), fall back to the
+        // conservative `[0, current table sequence]`, which keeps the output
+        // always bake-eligible (`min = 0`) — never wrongly referenced-in-place.
+        let (merged_min, merged_max) = self
+            .merged_sequence_range_over_live_snapshots()
+            .await
+            .unwrap_or((0, self.table_metadata.current_sequence_number));
+
+        // Seq-prefix lever signal (phase 3, observability only — does NOT alter
+        // this full-rewrite's behaviour): split the OLD snapshot's manifest at
+        // `T` = the highest applicable delete sequence. `reference` is the count
+        // of files an incremental seq-prefix bake could carry forward unchanged
+        // instead of rewriting — the read-amp + deletion-index shrink the
+        // manifest model exists to capture. Best-effort and skipped when the
+        // index has no deletions (nothing to bake) or the manifest is empty.
+        if let Some(cutoff) = self.deletion_index_max_sequence() {
+            let old_snapshot_id = self.get_current_snapshot_id();
+            match self
+                .partition_manifest_by_sequence(&old_snapshot_id, cutoff)
+                .await
+            {
+                Ok(Some(plan)) => {
+                    tracing::debug!(
+                        target: "cayenne::compaction",
+                        table = self.table_metadata.table_name.as_str(),
+                        cutoff,
+                        bake_files = plan.bake.len(),
+                        reference_files = plan.reference.len(),
+                        "Seq-prefix plan for current snapshot (incremental bake candidate)"
+                    );
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    tracing::debug!(
+                        target: "cayenne::compaction",
+                        table = self.table_metadata.table_name.as_str(),
+                        %error,
+                        "Seq-prefix plan unavailable (manifest read failed)"
+                    );
+                }
+            }
+        }
+
+        let manifest_listed = match self
+            .upsert_snapshot_manifest_from_listing(
+                &new_snapshot_id,
+                ManifestSequenceTag::Uniform {
+                    min: merged_min,
+                    max: merged_max,
+                },
+            )
+            .await
+        {
+            Ok(files) => Some(files),
+            Err(error) => {
+                tracing::warn!(
+                    target: "cayenne::compaction",
+                    table = self.table_metadata.table_name.as_str(),
+                    %error,
+                    new_snapshot_id = new_snapshot_id.as_str(),
+                    "Failed to populate snapshot manifest before compaction commit; \
+                     scan falls back to directory listing"
+                );
+                None
+            }
+        };
+
         if let Err(e) = self.commit_snapshot_rewrite(&new_snapshot_id).await {
             self.cleanup_failed_compaction_snapshot(&new_snapshot_id, is_s3)
                 .await;
             return Err(Error::Catalog { source: e });
+        }
+
+        // Commit succeeded: `new_snapshot_id` is now current, so the old
+        // snapshot's manifest rows are dead. Prune them and assert the live
+        // manifest matches the listing we wrote it from (debug builds only).
+        if let Some(files) = manifest_listed {
+            if let Err(error) = self.prune_snapshot_manifest_to(&new_snapshot_id).await {
+                tracing::warn!(
+                    target: "cayenne::compaction",
+                    table = self.table_metadata.table_name.as_str(),
+                    %error,
+                    new_snapshot_id = new_snapshot_id.as_str(),
+                    "Failed to prune stale snapshot manifest rows after compaction commit"
+                );
+            }
+            self.debug_assert_manifest_matches_listing(&new_snapshot_id, &files)
+                .await;
         }
 
         // Hold the listing fence across the listing-table swap and the
@@ -11317,10 +12397,49 @@ impl CayenneTableProvider {
             }
         }
 
+        let old_ids: Vec<String> = inputs.iter().map(|(id, _)| id.clone()).collect();
+
+        // Manifest snapshot model: AUTHOR the merged output's manifest with its
+        // true merged commit-seq range — `[min, max]` over the SELECTED INPUTS'
+        // manifest files — BEFORE the swap publishes the new snapshot. This is
+        // the data-commit range, NOT the protected-set value the swap stores
+        // (`fence_max_delete_seq`, a DELETE sequence — never a write range). The
+        // later `rebuild_live_snapshot_manifests` re-lists this (now-protected)
+        // snapshot in PreserveOrUniform mode, which keeps the range authored here
+        // rather than clobbering it with `[fence_max_delete_seq, ...]`. When no
+        // input manifest is available, fall back to the conservative
+        // `[0, fence_max_delete_seq]` (always bake-eligible — `min = 0` — so a
+        // missing input manifest can never make the output wrongly referenced and
+        // resurrect a deleted row). Best-effort + upsert-only (matches the
+        // full-rewrite path): a manifest failure leaves the scan on directory
+        // listing, never loses rows.
+        let (merged_min, merged_max) = self
+            .merged_sequence_range_over_snapshots(&old_ids)
+            .await
+            .unwrap_or((0, fence_max_delete_seq));
+        if let Err(error) = self
+            .upsert_snapshot_manifest_from_listing(
+                &new_snapshot_id,
+                ManifestSequenceTag::Uniform {
+                    min: merged_min,
+                    max: merged_max,
+                },
+            )
+            .await
+        {
+            tracing::warn!(
+                target: "cayenne::compaction",
+                table = self.table_metadata.table_name.as_str(),
+                %error,
+                new_snapshot_id = new_snapshot_id.as_str(),
+                "Failed to author merged subset-compaction manifest before swap; \
+                 scan falls back to directory listing"
+            );
+        }
+
         // --- Phase 3: CAS commit. ---
         let phase2_rewrite_ms = phase2_start.elapsed().as_millis();
         let phase3_start = std::time::Instant::now();
-        let old_ids: Vec<String> = inputs.iter().map(|(id, _)| id.clone()).collect();
         let swapped = match self
             .catalog
             .swap_protected_snapshots(
@@ -11432,6 +12551,473 @@ impl CayenneTableProvider {
                 telemetry::KeyValue::new("kind", "subset"),
             ],
         );
+
+        Ok(true)
+    }
+
+    /// Seq-prefix BAKE (Stage 2): consolidate the OLD protected snapshots that
+    /// form a clean `max_sequence <= T` prefix — applying the deletion snapshot so
+    /// the merged output holds only survivors — then PRUNE the in-memory deletion
+    /// index of every tombstone with `delete_seq <= T`, shrinking the per-query
+    /// merge-on-read probe.
+    ///
+    /// This is a SELECTION VARIANT of [`Self::compact_protected_snapshots_subset_inner`]:
+    /// it reuses the identical merge → author-manifest → CAS-swap → retire+sweep
+    /// flow, swapping only (1) the input SELECTOR (seq-prefix instead of size-tier)
+    /// and (2) a post-commit index prune. The merged snapshot is self-contained in
+    /// its own dir; the newer (`min_sequence > T`) protected snapshots are LEFT
+    /// UNTOUCHED — each remains a separate protected snapshot read from its own dir
+    /// with its own threshold by the existing scan union ([`Self::scan_protected_snapshots`]).
+    /// No cross-snapshot file references are created, so no scan/GC/schema change is
+    /// needed; the existing whole-dir retire/sweep reaps the merged inputs.
+    ///
+    /// ## Cutoff `T` and which snapshots are selected
+    ///
+    /// Protected-snapshot ids are `UUIDv7` (lexical == creation order); under CDC
+    /// append, creation order tracks commit sequence. We keep the newest
+    /// [`BAKE_KEEP_RECENT_SNAPSHOTS`] (`K`) snapshots UNBAKED so the active delete
+    /// stream is not re-merged every pass, and consider the older prefix. `T` is
+    /// the highest per-file `max_sequence` over that older prefix's manifests, so
+    /// every selected snapshot trivially has all files `max_sequence <= T`. With
+    /// fewer than `K + 2` protected snapshots there is no merge-worthy settled
+    /// prefix and this is a no-op.
+    ///
+    /// ## Clean-prefix invariant (resurrect-rows-critical)
+    ///
+    /// Pruning `delete_seq <= T` is sound ONLY IF every LIVE snapshot whose files
+    /// reach at or below `T` (`min_sequence <= T`) was merged into the output `M` —
+    /// otherwise a pruned tombstone could still delete a row that physically
+    /// survives in an unmerged snapshot, resurrecting it. After the swap we ASSERT
+    /// that no remaining live snapshot (the current snapshot OR any unselected
+    /// protected snapshot) has `min_sequence <= T`. If the assertion fails (e.g. a
+    /// plain-append current snapshot tagged `[0, current_seq]`), we STILL keep the
+    /// committed merge (publishing a merge is always safe) but SKIP the prune and
+    /// log it. For the CDC-upsert target the data lives in protected snapshots and
+    /// the current snapshot is genesis/compaction-output, so the assertion holds.
+    ///
+    /// Gated to KEY-delete tables ([`Self::should_capture_positions`] false): the
+    /// prune is a no-op for position deletes (file-scoped, not seq-tagged) and
+    /// position-delete subset compaction serializes against writers — out of scope.
+    ///
+    /// Returns `Ok(true)` if a bake merge was committed, `Ok(false)` for a no-op
+    /// (position mode, fewer than `K + 2` protected snapshots, no clean prefix with
+    /// a populated manifest, or the CAS lost a race).
+    /// Resurrect-rows-critical clean-prefix gate for the seq-prefix bake. Pruning
+    /// the deletion index at/below `prefix_cutoff` (T) is sound iff EVERY live
+    /// snapshot — the current snapshot ∪ the protected snapshots NOT being baked
+    /// away (`selected_set`) — is clean past T: it holds no row that a `<= T`
+    /// tombstone deletes and that pruning the tombstone would resurrect. A snapshot
+    /// is clean past T iff EITHER:
+    ///   - (delete-watermark) its `protected_snapshots` value is `>= T`. That value
+    ///     IS the snapshot's merge-on-read watermark — the scan applies only
+    ///     deletions with `delete_seq > value`, so deletions `<= value` are already
+    ///     physically applied (survivors only). `value >= T` ⟹ every `<= T` deletion
+    ///     is baked in ⟹ re-pruning it resurrects nothing. This is authoritative (no
+    ///     manifest needed) and covers BOTH a CDC snapshot whose async manifest
+    ///     population is still pending (value = its single allocated commit-sequence,
+    ///     the seq of every row it holds) AND a compaction output whose write-range
+    ///     dips `<= T` but whose deletes are baked to `fence_max_delete_seq >= T`
+    ///     (the threshold exemption); OR
+    ///   - (no `<= T` rows) its manifest proves every file's `min_sequence > T`, so
+    ///     no `<= T` tombstone targets any of its rows.
+    ///
+    /// The CURRENT snapshot has no `protected_snapshots` value and applies ALL
+    /// tombstones, so it is clean past T only via the second clause (all rows `> T`)
+    /// or when it is genesis (empty manifest — no rows). An empty-manifest PROTECTED
+    /// snapshot whose watermark is `< T` cannot be proven clean and conservatively
+    /// blocks (a later pass retries once it is baked or its watermark advances).
+    /// Snapshots are immutable, and a snapshot a concurrent publish adds carries a
+    /// sequence `> T` (one monotonic counter; T is a past `max_sequence`), so a clean
+    /// result here holds through the prune under the fence. Returns `(holds,
+    /// violating_value_for_logging)`.
+    async fn bake_clean_prefix_holds(
+        &self,
+        selected_set: &std::collections::HashSet<String>,
+        prefix_cutoff: i64,
+    ) -> (bool, Option<i64>) {
+        let current_snapshot_id = self.get_current_snapshot_id();
+        let protected = self.protected_snapshots.load();
+        let mut live_ids: Vec<String> = protected
+            .keys()
+            .filter(|id| !selected_set.contains(*id))
+            .cloned()
+            .collect();
+        live_ids.push(current_snapshot_id.clone());
+        for id in &live_ids {
+            // Delete-watermark exemption (authoritative, no I/O): a protected
+            // snapshot whose watermark covers T is clean past T regardless of its
+            // write-range. The current snapshot has no entry here.
+            let watermark = protected.get(id).copied();
+            if watermark.is_some_and(|w| w >= prefix_cutoff) {
+                continue;
+            }
+            let files = self
+                .catalog
+                .get_snapshot_files(&self.table_metadata.table_id, id)
+                .await
+                .unwrap_or_default();
+            if files.is_empty() {
+                if id == &current_snapshot_id {
+                    continue; // genesis current snapshot: no rows to resurrect
+                }
+                // Protected snapshot, empty manifest, watermark `< T` (or — never,
+                // for an in-map snapshot — absent): ranges unknown, cannot prove
+                // clean past T, so block this pass.
+                return (false, watermark.or(Some(-1)));
+            }
+            for f in &files {
+                if f.min_sequence <= prefix_cutoff {
+                    return (false, Some(f.min_sequence));
+                }
+            }
+        }
+        (true, None)
+    }
+
+    async fn bake_seq_prefix_protected_snapshots(&self) -> Result<bool> {
+        // GATE: key-delete tables only. Position deletes are file-scoped (the
+        // prune is a no-op for them) and their subset compaction must serialize
+        // against writers — neither is the seq-prefix bake's domain.
+        if self.should_capture_positions() || self.pk_deletion_strategy.is_position_based() {
+            tracing::trace!(
+                target: "cayenne::compaction",
+                table = self.table_metadata.table_name.as_str(),
+                "Skipping seq-prefix bake: position-delete table (out of scope)",
+            );
+            return Ok(false);
+        }
+
+        let Ok(_guard) = self.compaction_lock.try_lock() else {
+            tracing::trace!(
+                target: "cayenne::compaction",
+                table = self.table_metadata.table_name.as_str(),
+                "Skipping seq-prefix bake: another compaction pass already running",
+            );
+            return Ok(false);
+        };
+
+        let compaction_start = std::time::Instant::now();
+
+        // --- Phase 1: short fence read — coherent input set. ---
+        // Capture the protected set, each input's deletion threshold, the live
+        // deletion snapshot, and its max delete sequence together under the read
+        // fence (the SAME coherence requirement the size-tier path documents:
+        // a separate max-delete-seq load could observe a newer ArcSwap version
+        // than `deletion_snapshot`, tagging an un-applied deletion as
+        // already-applied and resurrecting the rows it deletes).
+        let (ordered_ids, thresholds, fence_max_delete_seq, deletion_snapshot) = {
+            let _fence = self.listing_fence.read().await;
+            let protected = self.protected_snapshots.load_full();
+            // Need at least K newest-to-keep + 2 to merge an older prefix.
+            if protected.len() < BAKE_KEEP_RECENT_SNAPSHOTS + 2 {
+                return Ok(false);
+            }
+            let mut ids: Vec<String> = protected.keys().cloned().collect();
+            ids.sort();
+            let thresholds: std::collections::HashMap<String, i64> = ids
+                .iter()
+                .map(|id| (id.clone(), protected.get(id).copied().unwrap_or(0)))
+                .collect();
+            let deletion_snapshot = self.pk_deletion_snapshot();
+            let fence_max_delete_seq = deletion_snapshot.max_sequence_number().unwrap_or(0);
+            (ids, thresholds, fence_max_delete_seq, deletion_snapshot)
+        };
+
+        // --- Seq-prefix selection (replaces size-tier selection). ---
+        // Candidate prefix = all but the newest K (creation-/sequence-ordered).
+        let split = ordered_ids.len() - BAKE_KEEP_RECENT_SNAPSHOTS;
+        let candidate_ids = &ordered_ids[..split];
+        let mut selected: Vec<(String, i64)> = Vec::with_capacity(candidate_ids.len());
+        let mut cutoff: i64 = i64::MIN;
+        for id in candidate_ids {
+            let files = self
+                .catalog
+                .get_snapshot_files(&self.table_metadata.table_id, id)
+                .await
+                .unwrap_or_default();
+            let threshold = thresholds.get(id).copied().unwrap_or(0);
+            if files.is_empty() {
+                // Empty manifest ⟹ a CDC-published snapshot whose async manifest
+                // population has not landed yet — both compaction paths author the
+                // manifest BEFORE the protected-set swap, so a protected snapshot is
+                // never empty-while-protected for any other reason. Every row of a
+                // CDC snapshot was committed at its single allocated sequence = its
+                // `protected_snapshots` value (`threshold`), so bake it with
+                // `[threshold, threshold]`: the merge scan reads its files by
+                // directory listing (NOT the manifest), `apply_partial_deletion_filter`
+                // applies deletions `> threshold` (leaving survivors), and T
+                // accumulates exactly `threshold`. Baking it — rather than skipping —
+                // is what lets the prune cover its `<= T` rows; leaving it live with
+                // an empty manifest would force the clean-prefix gate to block.
+                // [resurrect-critical: `threshold` is the true commit-seq of every
+                // row here, so T is never understated.]
+                cutoff = cutoff.max(threshold);
+                selected.push((id.clone(), threshold));
+                continue;
+            }
+            // T accumulates the highest per-file max_sequence over the selected
+            // prefix — every selected file then satisfies `max_sequence <= T`.
+            for f in &files {
+                cutoff = cutoff.max(f.max_sequence);
+            }
+            selected.push((id.clone(), threshold));
+        }
+
+        if selected.len() < 2 {
+            tracing::debug!(
+                target: "cayenne::compaction",
+                table = self.table_metadata.table_name.as_str(),
+                candidates = candidate_ids.len(),
+                keep_recent = BAKE_KEEP_RECENT_SNAPSHOTS,
+                "Skipping seq-prefix bake: fewer than two manifest-populated older snapshots to bake"
+            );
+            return Ok(false);
+        }
+        // `cutoff` is now the seq-prefix cutoff T (the max max_sequence over the
+        // selected older prefix). It was raised above from `i64::MIN` by at least
+        // one selected file, so it is a real sequence.
+        let prefix_cutoff = cutoff;
+
+        tracing::info!(
+            target: "cayenne::compaction",
+            table = self.table_metadata.table_name.as_str(),
+            input_count = selected.len(),
+            keep_recent = BAKE_KEEP_RECENT_SNAPSHOTS,
+            prefix_cutoff,
+            fence_max_delete_seq,
+            deletion_index_len = deletion_snapshot.delete_len(),
+            "Running seq-prefix bake (consolidating the clean older prefix)"
+        );
+
+        // PRE-MERGE clean-prefix gate (resurrect-critical perf guard): if the prune
+        // could not run after the merge (some live snapshot is not clean past T),
+        // skip the WHOLE bake NOW — never pay the merge write-amp for a prune that
+        // would then be withheld (the regression this fixes: merge-without-prune).
+        // The post-swap gate re-checks under the fence; a concurrent publish in the
+        // gap can only add a snapshot with sequence > T, which cannot newly violate.
+        let selected_set: std::collections::HashSet<String> =
+            selected.iter().map(|(id, _)| id.clone()).collect();
+        let (pre_holds, pre_violation) = self
+            .bake_clean_prefix_holds(&selected_set, prefix_cutoff)
+            .await;
+        if !pre_holds {
+            tracing::debug!(
+                target: "cayenne::compaction",
+                table = self.table_metadata.table_name.as_str(),
+                prefix_cutoff,
+                violating = pre_violation.unwrap_or(-1),
+                "Skipping seq-prefix bake before merge: a live snapshot is not clean \
+                 past T (prune would be withheld); avoiding merge write-amp"
+            );
+            return Ok(false);
+        }
+
+        // --- Phase 2: rewrite outside the lock (identical to the size-tier
+        // path): union over selected inputs, each with its own partial deletion
+        // filter, streamed into one fresh snapshot whose dead rows are removed. ---
+        let ctx = self.create_compaction_session_context();
+        let state = ctx.state();
+        let pk_indices = self.pk_column_indices.clone();
+
+        let mut plans: Vec<Arc<dyn ExecutionPlan>> = Vec::with_capacity(selected.len());
+        for (snapshot_id, threshold) in &selected {
+            let plan = self
+                .create_snapshot_scan_plan(&state, snapshot_id, None, &[], None)
+                .await?;
+            let filtered = self.apply_partial_deletion_filter(
+                plan,
+                &pk_indices,
+                *threshold,
+                &deletion_snapshot,
+            )?;
+            plans.push(filtered);
+        }
+        let merged_plan: Arc<dyn ExecutionPlan> = if plans.len() == 1 {
+            plans.remove(0)
+        } else {
+            UnionExec::try_new(plans)?
+        };
+        let stream = datafusion_physical_plan::execute_stream(merged_plan, state.task_ctx())?;
+
+        let new_snapshot_id = uuid::Uuid::now_v7().to_string();
+        let is_s3 = self.table_metadata.path.starts_with("s3://");
+        if !is_s3 {
+            let snapshot_dir = self.snapshot_dir_path_for(&new_snapshot_id);
+            Self::ensure_snapshot_dir_exists(&snapshot_dir).await?;
+        }
+
+        let target_size_bytes = self.context.target_file_size_bytes();
+        // The bake is gated to key mode, so the position single-writer cases do
+        // not apply; size the parallel-encode fan-out from the selected inputs'
+        // on-disk bytes exactly as the size-tier path does. `is_position_based()`
+        // is false here (gated above), so `keeps_positions_serial` is false.
+        let mut total_input_bytes: u64 = 0;
+        for (snapshot_id, _) in &selected {
+            total_input_bytes += match self.list_snapshot_files_with_sizes(snapshot_id).await {
+                Ok(files) => files.iter().map(|(_, sz)| *sz).sum(),
+                Err(_) => 0,
+            };
+        }
+        let (target_partitions, estimated_bytes) = subset_merge_write_shape(
+            /* keeps_positions_serial */ false,
+            state.config().target_partitions(),
+            total_input_bytes,
+        );
+        let write_result = self
+            .write_to_snapshot(
+                stream,
+                target_size_bytes,
+                &new_snapshot_id,
+                target_partitions,
+                estimated_bytes,
+                super::delta_encoding::WriteClass::Maintenance,
+            )
+            .await;
+        let (total_rows, _writer_ops, _stats_acc) = match write_result {
+            Ok(result) => result,
+            Err(e) => {
+                self.cleanup_failed_compaction_snapshot(&new_snapshot_id, is_s3)
+                    .await;
+                return Err(e);
+            }
+        };
+
+        if !is_s3 {
+            let snapshot_dir = self.snapshot_dir_path_for(&new_snapshot_id);
+            if let Err(e) = Self::sync_snapshot_dir(&snapshot_dir).await {
+                self.cleanup_failed_compaction_snapshot(&new_snapshot_id, is_s3)
+                    .await;
+                return Err(Error::Catalog { source: e });
+            }
+        }
+
+        let old_ids: Vec<String> = selected.iter().map(|(id, _)| id.clone()).collect();
+
+        // AUTHOR the merged output's manifest with its true merged commit-seq
+        // range over the selected inputs (NOT the delete-seq threshold the swap
+        // stores). Identical to the size-tier path; the conservative `[0, fence]`
+        // fallback keeps a manifest-read failure always bake-eligible.
+        let (merged_min, merged_max) = self
+            .merged_sequence_range_over_snapshots(&old_ids)
+            .await
+            .unwrap_or((0, fence_max_delete_seq));
+        if let Err(error) = self
+            .upsert_snapshot_manifest_from_listing(
+                &new_snapshot_id,
+                ManifestSequenceTag::Uniform {
+                    min: merged_min,
+                    max: merged_max,
+                },
+            )
+            .await
+        {
+            tracing::warn!(
+                target: "cayenne::compaction",
+                table = self.table_metadata.table_name.as_str(),
+                %error,
+                new_snapshot_id = new_snapshot_id.as_str(),
+                "Failed to author merged seq-prefix-bake manifest before swap; \
+                 scan falls back to directory listing"
+            );
+        }
+
+        // --- Phase 3: CAS commit (atomically deactivate inputs, activate M). ---
+        let swapped = match self
+            .catalog
+            .swap_protected_snapshots(
+                &self.table_metadata.table_id,
+                &old_ids,
+                &new_snapshot_id,
+                fence_max_delete_seq,
+            )
+            .await
+        {
+            Ok(swapped) => swapped,
+            Err(e) => {
+                self.cleanup_failed_compaction_snapshot(&new_snapshot_id, is_s3)
+                    .await;
+                return Err(Error::Catalog { source: e });
+            }
+        };
+        if !swapped {
+            tracing::debug!(
+                target: "cayenne::compaction",
+                table = self.table_metadata.table_name.as_str(),
+                "Seq-prefix bake swap aborted (inputs no longer active); discarding output"
+            );
+            self.cleanup_failed_compaction_snapshot(&new_snapshot_id, is_s3)
+                .await;
+            return Ok(false);
+        }
+
+        // Bring the in-memory protected set into agreement under the scan fence
+        // (readers capture deletion snapshot + protected set together). We hold
+        // the write fence across BOTH the protected-set swap AND the deletion
+        // index prune below, so no scan combines the post-swap protected set
+        // (M present, inputs gone) with a pre-prune deletion index (or vice
+        // versa). The clean-prefix assertion is evaluated under this same fence
+        // over the now-current live set.
+        // CLEAN-PREFIX GATE (resurrect-rows-critical) — re-evaluated here OUTSIDE
+        // the write fence so the per-snapshot manifest reads (metastore I/O) never
+        // stall concurrent scans, then enforced TOGETHER with the prune under the
+        // single write-fence hold below so no scan observes a torn (swapped-but-not-
+        // pruned, or the reverse) state. The merged output M is not yet in the
+        // protected set at this point (the rcu swap is below), so it is not among
+        // the live ids; its `<= T` rows are SURVIVORS the rewrite kept. See
+        // `bake_clean_prefix_holds` for the watermark-or-min soundness argument.
+        let (clean_prefix_holds, violating_min) = self
+            .bake_clean_prefix_holds(&selected_set, prefix_cutoff)
+            .await;
+
+        // Publish the protected-set swap AND (when the clean-prefix invariant holds)
+        // the deletion-index prune together under ONE write-fence hold, so a scan
+        // never observes a torn state (swapped-but-not-pruned, or vice versa). Only
+        // in-memory work runs here — no I/O — so the fence is held briefly.
+        {
+            let _fence = self.listing_fence.write().await;
+            self.protected_snapshots.rcu(|current| {
+                let mut new_map = (**current).clone();
+                for (id, _) in &selected {
+                    new_map.remove(id);
+                }
+                new_map.insert(new_snapshot_id.clone(), fence_max_delete_seq);
+                Arc::new(new_map)
+            });
+            if clean_prefix_holds {
+                self.prune_deletion_index_at_or_below(prefix_cutoff);
+            }
+        }
+
+        if clean_prefix_holds {
+            tracing::info!(
+                target: "cayenne::compaction",
+                table = self.table_metadata.table_name.as_str(),
+                merged_inputs = selected.len(),
+                rows = total_rows,
+                new_snapshot_id = new_snapshot_id.as_str(),
+                prefix_cutoff,
+                duration_ms = compaction_start.elapsed().as_millis(),
+                "Seq-prefix bake completed; pruned deletion index at or below T"
+            );
+        } else {
+            // Publishing the merge is always safe; only the prune was unsafe.
+            tracing::warn!(
+                target: "cayenne::compaction",
+                table = self.table_metadata.table_name.as_str(),
+                merged_inputs = selected.len(),
+                new_snapshot_id = new_snapshot_id.as_str(),
+                prefix_cutoff,
+                violating_min_sequence = violating_min,
+                "Seq-prefix bake merge committed but deletion-index prune SKIPPED: a live \
+                 snapshot still has min_sequence <= T (clean-prefix invariant violated). \
+                 Pruning would risk resurrecting a deleted row; the index is left intact."
+            );
+        }
+
+        // Retire the merged-away inputs (whole-dir, event-anchored) and sweep
+        // aged-out retirements — identical to the size-tier path.
+        self.retire_snapshot_dirs(old_ids.iter().map(String::as_str));
+        self.sweep_retired_snapshot_dirs();
 
         Ok(true)
     }
@@ -11860,6 +13446,18 @@ impl CayenneTableProvider {
         &self.pk_deletion_strategy
     }
 
+    /// Highest **delete** sequence currently in the in-memory deletion index
+    /// (`T`), or `None` when the index records no deletion (position-based
+    /// tables always return `None`). This is the seq-prefix-compaction cutoff:
+    /// every applicable tombstone has `delete_seq <= T`.
+    ///
+    /// Reads one coherent atomic snapshot of the deletion state, so the value is
+    /// consistent with a probe taken from the same load.
+    #[must_use]
+    fn deletion_index_max_sequence(&self) -> Option<i64> {
+        pk_deletion_snapshot_for_strategy(&self.pk_deletion_strategy).max_sequence_number()
+    }
+
     /// Clear all cached deletion vectors and insert records.
     ///
     /// This should be called after compaction operations that have applied all deletions
@@ -11903,6 +13501,71 @@ impl CayenneTableProvider {
 
         tracing::debug!(
             "Cleared all deletion and insert records caches for table {}",
+            self.table_metadata.table_name
+        );
+    }
+
+    /// Seq-prefix clear of the in-memory deletion index: drop every PK tombstone
+    /// whose `delete_seq <= cutoff` (= `T`) while retaining tombstones with
+    /// `delete_seq > cutoff` and all upsert re-insertion records.
+    ///
+    /// This is the deletion-index half of an incremental seq-prefix compaction
+    /// (see [`Self::rewrite_seq_prefix_for_compaction`]). After the rewrite has
+    /// physically applied every deletion at or below `cutoff` into the new
+    /// consolidated file, those tombstones are dead — but tombstones above the
+    /// cutoff still apply to the higher-than-`T` files the new snapshot
+    /// references in place, so unlike [`Self::clear_all_deletion_caches`] this
+    /// does NOT wipe the whole index, the protected-snapshot set, or the PK
+    /// keyset, and it leaves position deletions untouched (they are file-scoped,
+    /// not sequence-tagged, and still apply to whatever files remain).
+    ///
+    /// `DeletionIndex::prune_deletes_at_or_below` rebuilds the membership bloom
+    /// over the survivors, so the dropped tombstones stop costing probe work and
+    /// memory; the memory accounting is refreshed to the shrunken index.
+    ///
+    /// MUST be called only AFTER the new snapshot's file set has been published
+    /// (commit + manifest), to preserve the publish-before-clear invariant.
+    ///
+    /// Exposed as `#[doc(hidden)] pub` so the crate's integration tests can drive
+    /// the seq-prefix prune directly while the subset-scan execution path that
+    /// will call it in production is built out; it is not part of the documented
+    /// public surface.
+    #[doc(hidden)]
+    pub fn prune_deletion_index_at_or_below(&self, cutoff: i64) {
+        match &self.pk_deletion_strategy {
+            PkDeletionStrategyWithCache::Int64Pk {
+                deletion_snapshot, ..
+            } => {
+                let current = deletion_snapshot.load_full();
+                if !current.tombstones.has_deletions() {
+                    return;
+                }
+                let pruned = current.tombstones.prune_deletes_at_or_below(cutoff);
+                deletion_snapshot.store(Arc::new(Int64PkDeletionSnapshot::from_index(pruned)));
+                self.refresh_deletion_memory_accounting();
+            }
+            PkDeletionStrategyWithCache::RowConverterBased {
+                deletion_snapshot, ..
+            } => {
+                let current = deletion_snapshot.load_full();
+                if !current.tombstones.has_deletions() {
+                    return;
+                }
+                let pruned = current.tombstones.prune_deletes_at_or_below(cutoff);
+                deletion_snapshot.store(Arc::new(RowConverterDeletionSnapshot::from_index(pruned)));
+                self.refresh_deletion_memory_accounting();
+            }
+            PkDeletionStrategyWithCache::PositionBased { .. } => {
+                // Position deletions are file-scoped, not sequence-tagged; a
+                // seq-prefix bake of files leaves them to the file-level cleanup
+                // path, so there is nothing to prune by sequence here.
+            }
+        }
+
+        tracing::debug!(
+            cutoff,
+            "Pruned in-memory deletion index of tombstones at or below the \
+             seq-prefix cutoff for table {}",
             self.table_metadata.table_name
         );
     }
@@ -15951,6 +17614,92 @@ impl CayenneTableProvider {
             .await
     }
 
+    /// Resolve a snapshot's data files from the manifest (`cayenne_snapshot_file`)
+    /// instead of by listing the snapshot directory.
+    ///
+    /// Returns `Ok(Some(files))` only when the manifest is non-empty AND the scan
+    /// is unpartitioned. The manifest stores bare file *names* (the same strings a
+    /// directory listing yields); each is joined onto the snapshot directory
+    /// prefix and turned into a [`PartitionedFile`] exactly the way
+    /// [`pruned_partition_list`] does for an unpartitioned table — same
+    /// `ObjectMeta`-to-`PartitionedFile` conversion, same zero-size filter — so
+    /// the manifest-built file list is byte-identical to the directory-built one
+    /// for the same snapshot.
+    ///
+    /// Returns `Ok(None)` (the caller then falls back to directory listing) when:
+    /// - the manifest read fails (transient metastore error),
+    /// - the manifest has no rows for this snapshot (written before population,
+    ///   or a post-write rebuild that has not run / failed), or
+    /// - the table is partitioned (`table_partition_cols` non-empty) — the
+    ///   manifest does not persist partition values, so directory listing (which
+    ///   derives them from the path) stays authoritative there.
+    ///
+    /// This `None`-on-empty fallback is what keeps the flag from ever making a
+    /// scan miss a live file: an incomplete manifest degrades to listing, never
+    /// to a short read.
+    async fn manifest_partitioned_files(
+        &self,
+        request: &SnapshotScanListingRequest<'_>,
+    ) -> Option<Vec<PartitionedFile>> {
+        // The manifest carries no partition values; let directory listing own
+        // partitioned tables (it derives the values from the object path).
+        if !request.options.table_partition_cols.is_empty() {
+            return None;
+        }
+
+        let manifest = match self
+            .catalog
+            .get_snapshot_files(&self.table_metadata.table_id, request.snapshot_id)
+            .await
+        {
+            Ok(rows) => rows,
+            Err(error) => {
+                tracing::debug!(
+                    table = %self.table_metadata.table_name,
+                    snapshot_id = request.snapshot_id,
+                    %error,
+                    "Manifest read failed; scan falls back to directory listing"
+                );
+                return None;
+            }
+        };
+
+        if manifest.is_empty() {
+            // Snapshot predates manifest population, or a post-write rebuild has
+            // not run yet: directory listing is still the authoritative source.
+            return None;
+        }
+
+        // `prefix` is the parsed snapshot-directory path; joining the manifest's
+        // bare file name onto it reproduces the listing's `ObjectMeta.location`
+        // byte-for-byte (the same derivation `stat_moved_files_as_object_metas`
+        // uses for the list-files-cache delta-apply).
+        let prefix = request.table_url.prefix();
+        let files = manifest
+            .into_iter()
+            // Mirror the listing's `size > 0` filter so empty placeholder files
+            // (if any) are excluded identically.
+            .filter(|file| file.file_size_bytes > 0)
+            .map(|file| {
+                let object_meta = ObjectMeta {
+                    location: prefix.clone().join(file.file_path.as_str()),
+                    // `last_modified` is unused by the Vortex scan (it reads
+                    // footer stats by location/size); a fixed epoch keeps the
+                    // value deterministic without an extra stat round-trip.
+                    last_modified: chrono::DateTime::UNIX_EPOCH,
+                    size: u64::try_from(file.file_size_bytes).unwrap_or(0),
+                    e_tag: None,
+                    version: None,
+                };
+                // Same conversion `pruned_partition_list` uses for the
+                // unpartitioned case (`object_meta.into()`).
+                PartitionedFile::from(object_meta)
+            })
+            .collect::<Vec<_>>();
+
+        Some(files)
+    }
+
     async fn list_files_for_snapshot_scan(
         &self,
         request: &SnapshotScanListingRequest<'_>,
@@ -15970,15 +17719,32 @@ impl CayenneTableProvider {
             .config_options()
             .execution
             .meta_fetch_concurrency;
-        let file_list = pruned_partition_list(
-            request.state,
-            store.as_ref(),
-            request.table_url,
-            request.partition_filters,
-            &request.options.file_extension,
-            &request.options.table_partition_cols,
-        )
-        .await?;
+
+        // Manifest-driven file resolution (default OFF). When enabled and the
+        // manifest has rows for this snapshot, the scan's file set comes from
+        // `cayenne_snapshot_file`; otherwise it falls back to directory listing
+        // (dual-source). The two sources are equal by construction — see
+        // `manifest_partitioned_files` and `upsert_snapshot_manifest_from_listing`.
+        let manifest_files = if self.context.scan_from_manifest() {
+            self.manifest_partitioned_files(request).await
+        } else {
+            None
+        };
+        let file_list: futures::stream::BoxStream<'_, DataFusionResult<PartitionedFile>> =
+            match manifest_files {
+                Some(files) => stream::iter(files.into_iter().map(Ok)).boxed(),
+                None => {
+                    pruned_partition_list(
+                        request.state,
+                        store.as_ref(),
+                        request.table_url,
+                        request.partition_filters,
+                        &request.options.file_extension,
+                        &request.options.table_partition_cols,
+                    )
+                    .await?
+                }
+            };
 
         let listing_pruning_predicate = if collect_stats && !request.data_filters.is_empty() {
             super::file_pruning::build_listing_pruning_predicate(
@@ -17775,6 +19541,46 @@ impl super::compaction::CompactionRunner for CayenneTableProvider {
         // `compact_protected_snapshots_subset`, because their tombstones are
         // file-path scoped and would otherwise be lost if they target a file
         // that is swapped away by the merge.
+
+        // Seq-prefix BAKE (Stage 2) — runs FIRST, gated on the deletion-index
+        // size (the very quantity it shrinks). The bake exists to keep the
+        // merge-on-read deletion index small (≈ half the per-query CPU on the
+        // saturated lab), so it fires only once tombstones have genuinely
+        // accumulated past the (config/adaptive) bake trigger. Cheap lock-free
+        // early-out: a single atomic deletion-snapshot load + count, skipping the
+        // compaction lock / fence on the common path where the index is still
+        // small. Key-mode only (the method itself re-gates and re-checks under
+        // the fence). A committed bake also reduces the protected-snapshot count,
+        // so on a bake we return without also running the size-tier subset pass
+        // this tick; the next tick re-evaluates both. The trigger is read live
+        // (`cayenne_bake_deletion_index_trigger`, default
+        // `BAKE_DELETION_INDEX_TRIGGER`; the adaptive controller can move it).
+        let deletion_index_len = self.pk_deletion_snapshot().delete_len();
+        if deletion_index_len >= self.context.bake_deletion_index_trigger()
+            && !self.should_capture_positions()
+        {
+            // Apply-back-pressure gate: the bake's merge (re-encode survivors +
+            // publish) competes with the CDC apply for the same write path
+            // (encode permits, the single-writer metastore, cores). When the
+            // apply is at/over capacity, baking steals throughput it cannot
+            // spare and pushes replication lag up (the QPH↔lag tradeoff). So the
+            // background optimizer yields to the foreground writer: defer the
+            // bake until the apply has headroom; the next tick re-evaluates.
+            if self.context.bake_should_defer_for_apply() {
+                tracing::debug!(
+                    target: "cayenne::compaction",
+                    table = self.table_metadata.table_name.as_str(),
+                    deletion_index_len,
+                    "Deferring seq-prefix bake: CDC apply at/over capacity (back-pressure)",
+                );
+            } else {
+                match self.bake_seq_prefix_protected_snapshots().await {
+                    Ok(true) => return Ok(true),
+                    Ok(false) => { /* nothing baked this pass; fall through to size-tier */ }
+                    Err(e) => return Err(e.to_string()),
+                }
+            }
+        }
 
         // Cheap lock-free early-out first: skip acquiring `compaction_lock` /
         // `listing_fence` and building a session context unless the protected
@@ -21194,6 +23000,1662 @@ mod tests {
         );
     }
 
+    /// Phase 2 manifest snapshot model: with `scan_from_manifest` ON, the scan's
+    /// file set is resolved from `cayenne_snapshot_file` (the manifest) instead
+    /// of by listing the snapshot directory — and the two must be EQUAL.
+    ///
+    /// The baseline is `DataFusion`'s own `ListingTable::list_files_for_scan`,
+    /// which always lists the directory regardless of the flag, so it is an
+    /// independent directory-built file set. The provider under test has the flag
+    /// ON, so its `list_files_for_snapshot_scan` routes through the manifest. The
+    /// manifest is populated deterministically via the production primitive
+    /// (`upsert_snapshot_manifest_from_listing`) before the comparison. Equal
+    /// file-group paths AND per-file row-count statistics prove the manifest-built
+    /// listing equals the directory-built listing.
+    ///
+    /// Also asserts the dual-source fallback: with the manifest cleared, the
+    /// manifest resolver returns `None` and the scan falls back to directory
+    /// listing (so an unpopulated manifest can never make a scan miss a file).
+    #[tokio::test]
+    async fn scan_from_manifest_listing_equals_directory_listing() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("category", DataType::Utf8, false),
+            Field::new("value", DataType::Int64, false),
+        ]));
+        let config = SessionConfig::new()
+            .with_target_partitions(2)
+            .set_usize("datafusion.execution.meta_fetch_concurrency", 1);
+        let ctx = SessionContext::new_with_config(config);
+
+        let vortex_config = VortexConfig {
+            // Route scans through the manifest (the feature under test).
+            scan_from_manifest: true,
+            // Disable the inline memtable so each insert lands as an on-disk
+            // Vortex file in the snapshot dir (the manifest's domain) rather than
+            // being absorbed inline (no file, nothing to list).
+            inline_max_rows: 0,
+            ..VortexConfig::default()
+        };
+        let (provider, _temp_dir) = create_cayenne_table_with_config(
+            "scan_from_manifest_parity",
+            Arc::clone(&schema),
+            vortex_config,
+            vec![],
+            ctx.runtime_env(),
+        )
+        .await;
+
+        // Two batches → a non-trivial multi-file set to resolve.
+        let rows_per_file = INLINE_MAX_ROWS + 16;
+        for batch_idx in 0..2_usize {
+            let start =
+                i64::try_from(batch_idx * rows_per_file).expect("test batch start fits in i64");
+            insert_batch_with_context(
+                &ctx,
+                &provider,
+                make_listing_parity_batch(Arc::clone(&schema), start, rows_per_file),
+            )
+            .await;
+        }
+
+        let snapshot_id = provider.get_current_snapshot_id();
+        let snapshot_dir_url = CayenneTableProvider::snapshot_dir_url(
+            &provider.table_metadata.path,
+            &provider.table_metadata.table_id,
+            &snapshot_id,
+        );
+        let table_url = ListingTableUrl::parse(&snapshot_dir_url).expect("snapshot URL parses");
+        let options = CayenneTableProvider::create_listing_options(
+            provider.context.file_format(),
+            &provider.pk_deletion_strategy,
+            ctx.state().config(),
+        );
+        let scan_schema =
+            CayenneTableProvider::snapshot_scan_schema(&provider.table_metadata.schema, &options);
+        let file_limit = Some(rows_per_file + 1);
+
+        // Populate the manifest deterministically (the production write path does
+        // this on a coalesced post-write maintenance pass; calling the primitive
+        // directly removes the timing dependency). This is the current snapshot,
+        // so use the same `PreserveOrUniform` tag `rebuild_live_snapshot_manifests`
+        // uses for it (`[0, current_seq]`). The sequence tag is irrelevant to this
+        // test — it asserts the resolved file SET, not the per-row sequence range.
+        let sequence = provider
+            .catalog
+            .get_snapshot_sequence(&provider.table_metadata.table_id, &snapshot_id)
+            .await
+            .ok()
+            .flatten()
+            .unwrap_or(0);
+        let listed = provider
+            .upsert_snapshot_manifest_from_listing(
+                &snapshot_id,
+                ManifestSequenceTag::PreserveOrUniform {
+                    min: 0,
+                    max: sequence,
+                },
+            )
+            .await
+            .expect("manifest population should succeed");
+        assert!(
+            !listed.is_empty(),
+            "the write should have produced at least one on-disk file to populate"
+        );
+
+        let request = SnapshotScanListingRequest {
+            state: &ctx.state(),
+            table_url: &table_url,
+            options: &options,
+            partition_filters: &[],
+            data_filters: &[],
+            snapshot_id: &snapshot_id,
+            limit: file_limit,
+            scan_schema: Arc::clone(&scan_schema),
+        };
+
+        // The manifest resolver must now return a non-empty set (flag is ON and
+        // the manifest is populated), proving the manifest branch is taken.
+        let manifest_only = provider
+            .manifest_partitioned_files(&request)
+            .await
+            .expect("manifest resolver returns Some when the manifest is populated");
+        assert_eq!(
+            manifest_only.len(),
+            listed.len(),
+            "manifest resolver must surface exactly the populated file set"
+        );
+
+        // Manifest-routed scan file listing (flag ON → routes through the manifest).
+        let manifest_files = provider
+            .list_files_for_snapshot_scan(&request)
+            .await
+            .expect("manifest-routed scan file listing should succeed");
+
+        // Directory baseline via DataFusion's ListingTable (flag-independent —
+        // it always lists the snapshot directory).
+        let listing_table = CayenneTableProvider::create_listing_table_with_config(
+            &snapshot_dir_url,
+            Arc::clone(&provider.table_metadata.schema),
+            provider.context.file_format(),
+            &provider.pk_deletion_strategy,
+            ctx.state().config(),
+        )
+        .expect("listing table should be created");
+        let listing_files = listing_table
+            .list_files_for_scan(&ctx.state(), &[], file_limit)
+            .await
+            .expect("ListingTable file listing should succeed");
+
+        assert_eq!(
+            file_group_paths(&manifest_files.file_groups),
+            file_group_paths(&listing_files.file_groups),
+            "manifest-built scan file paths must equal the directory-built listing"
+        );
+        assert_eq!(
+            file_group_row_counts(&manifest_files.file_groups),
+            file_group_row_counts(&listing_files.file_groups),
+            "manifest-built scan per-file row counts must equal the directory-built listing"
+        );
+        assert_eq!(
+            manifest_files.grouped_by_partition,
+            listing_files.grouped_by_partition
+        );
+        assert_eq!(manifest_files.statistics, listing_files.statistics);
+
+        // Dual-source fallback: clear the manifest and the resolver must return
+        // `None`, so the scan falls back to directory listing rather than reading
+        // a short (incomplete) file set.
+        provider
+            .catalog
+            .clear_snapshot_files(&provider.table_metadata.table_id)
+            .await
+            .expect("manifest cleared");
+        assert!(
+            provider
+                .manifest_partitioned_files(&request)
+                .await
+                .is_none(),
+            "an empty manifest must fall back to directory listing (Some -> None)"
+        );
+        // The end-to-end listing must still succeed (and match the directory
+        // baseline) via the fallback even with the flag ON.
+        let fallback_files = provider
+            .list_files_for_snapshot_scan(&request)
+            .await
+            .expect("scan file listing should fall back to directory listing");
+        assert_eq!(
+            file_group_paths(&fallback_files.file_groups),
+            file_group_paths(&listing_files.file_groups),
+            "with an empty manifest the flag-ON scan must fall back to the directory listing"
+        );
+    }
+
+    // ----------------------------------------------------------------------
+    // Manifest snapshot model (phase 5): backfill `cayenne_snapshot_file` on
+    // open for snapshots that predate manifest population.
+    // ----------------------------------------------------------------------
+
+    /// Append-mode (no-PK, on-disk) table over a durable `SQLite` metastore that
+    /// the test can REOPEN. Mirrors `create_memory_mode_upsert_table` but for the
+    /// append shape the backfill test needs: every insert lands as an on-disk
+    /// `.vortex` file (`inline_max_rows: 0`) so there is a real directory listing
+    /// to backfill from. Returns the catalog so the test can clear the manifest
+    /// and reopen against the same durable state.
+    async fn create_reopenable_append_table(
+        table_name: &str,
+        schema: SchemaRef,
+        scan_from_manifest: bool,
+        runtime_env: Arc<RuntimeEnv>,
+    ) -> (
+        CayenneTableProvider,
+        Arc<dyn MetadataCatalog>,
+        tempfile::TempDir,
+    ) {
+        let temp_dir = tempfile::tempdir().expect("temp dir created");
+        let metadata_dir = format!(
+            "{}/metadata",
+            temp_dir.path().to_str().expect("should be str")
+        );
+        let data_dir = format!("{}/data", temp_dir.path().to_str().expect("should be str"));
+        std::fs::create_dir_all(&metadata_dir).expect("metadata dir created");
+
+        let connection_string = format!("sqlite://{metadata_dir}/cayenne.db");
+        let catalog = Arc::new(CayenneCatalog::new(connection_string).expect("catalog created"))
+            as Arc<dyn MetadataCatalog>;
+        catalog.init().await.expect("catalog initialized");
+
+        let vortex_config = VortexConfig {
+            scan_from_manifest,
+            // On-disk files only: no inline memtable, so each insert is a Vortex
+            // object in the snapshot dir (the manifest's domain).
+            inline_max_rows: 0,
+            ..VortexConfig::default()
+        };
+        let options = CreateTableOptions {
+            table_name: table_name.to_string(),
+            schema,
+            primary_key: vec![],
+            on_conflict: None,
+            base_path: data_dir,
+            partition_column: None,
+            vortex_config,
+        };
+        let provider = CayenneTableProviderBuilder::new(Arc::clone(&catalog), runtime_env)
+            .create(options)
+            .await
+            .expect("table created");
+        (provider, catalog, temp_dir)
+    }
+
+    /// Phase 5: a table whose live snapshot has on-disk data files but NO
+    /// manifest rows (it predates manifest population) must have its manifest
+    /// backfilled from the directory listing on open — completely, so the
+    /// `scan_from_manifest`-ON scan reads the right files. The backfilled set must
+    /// equal the directory listing, the backfill must be idempotent across a
+    /// second reopen, and the end-to-end scan must return every row.
+    #[tokio::test]
+    async fn backfill_on_open_populates_empty_manifest_from_directory() {
+        let runtime_env = SessionContext::new().runtime_env();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("category", DataType::Utf8, false),
+            Field::new("value", DataType::Int64, false),
+        ]));
+        let (provider, catalog, _temp_dir) = create_reopenable_append_table(
+            "manifest_backfill_on_open",
+            Arc::clone(&schema),
+            true, // scan_from_manifest ON: the scan must read the backfilled set
+            Arc::clone(&runtime_env),
+        )
+        .await;
+
+        // Two batches → a multi-file snapshot to backfill.
+        let rows_per_file = INLINE_MAX_ROWS + 16;
+        let total_rows = 2 * rows_per_file;
+        let ctx = SessionContext::new();
+        for batch_idx in 0..2_usize {
+            let start =
+                i64::try_from(batch_idx * rows_per_file).expect("test batch start fits in i64");
+            insert_batch_with_context(
+                &ctx,
+                &provider,
+                make_listing_parity_batch(Arc::clone(&schema), start, rows_per_file),
+            )
+            .await;
+        }
+
+        // Simulate a snapshot written before manifest population existed: drop
+        // every manifest row the write path may have produced. The directory
+        // listing is untouched (the data files stay on disk).
+        let table_id = provider.table_metadata.table_id.clone();
+        let snapshot_id = provider.get_current_snapshot_id();
+        let expected_files = listing_file_names(&provider, &snapshot_id).await;
+        assert!(
+            expected_files.len() >= 2,
+            "the two on-disk-file inserts must produce a multi-file snapshot to backfill"
+        );
+        provider
+            .catalog
+            .clear_snapshot_files(&table_id)
+            .await
+            .expect("clear manifest to simulate a pre-population snapshot");
+        assert!(
+            manifest_file_names(&provider.catalog, &table_id, &snapshot_id)
+                .await
+                .is_empty(),
+            "the manifest must be empty before reopen (simulated pre-population state)"
+        );
+
+        // Reopen the SAME table from the durable metastore. `new_internal` runs
+        // the phase-5 backfill synchronously before returning the provider.
+        drop(provider);
+        let reopened =
+            CayenneTableProviderBuilder::new(Arc::clone(&catalog), Arc::clone(&runtime_env))
+                .open("manifest_backfill_on_open")
+                .await
+                .expect("reopen table");
+
+        // The backfilled manifest must equal the directory listing exactly — not
+        // a subset (a partial manifest would silently drop files from the scan).
+        let backfilled = manifest_file_names(&reopened.catalog, &table_id, &snapshot_id).await;
+        assert_eq!(
+            backfilled, expected_files,
+            "backfill must reproduce the directory listing exactly (complete, not partial)"
+        );
+
+        // End-to-end: with `scan_from_manifest` ON the scan resolves its files
+        // from the just-backfilled manifest and must return every row.
+        let scanned = scan_sorted_ids(&reopened).await;
+        let expected_ids =
+            (0..i64::try_from(total_rows).expect("row count fits in i64")).collect::<Vec<_>>();
+        assert_eq!(
+            scanned, expected_ids,
+            "the manifest-routed scan over the backfilled manifest must read every row"
+        );
+
+        // Idempotence: a SECOND reopen must see the manifest already populated
+        // (the emptiness gate) and leave it byte-for-byte identical — no duplicate
+        // rows, no churn.
+        drop(reopened);
+        let reopened_again = CayenneTableProviderBuilder::new(Arc::clone(&catalog), runtime_env)
+            .open("manifest_backfill_on_open")
+            .await
+            .expect("reopen table a second time");
+        assert_eq!(
+            manifest_file_names(&reopened_again.catalog, &table_id, &snapshot_id).await,
+            expected_files,
+            "a second open must not re-list or duplicate an already-populated manifest"
+        );
+    }
+
+    /// Phase 5: backfill is gated on the manifest being EMPTY. A table the write
+    /// path has already populated must NOT be re-listed or perturbed on open —
+    /// the live write/compaction paths own it from then on. We prove the gate by
+    /// poisoning the manifest with a sentinel row that the directory listing
+    /// could never produce: if open left it intact, the gate held; if open
+    /// re-listed, the sentinel would be gone.
+    #[tokio::test]
+    async fn backfill_on_open_is_skipped_when_manifest_already_populated() {
+        let runtime_env = SessionContext::new().runtime_env();
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let (provider, catalog, _temp_dir) = create_reopenable_append_table(
+            "manifest_backfill_gate",
+            Arc::clone(&schema),
+            false,
+            Arc::clone(&runtime_env),
+        )
+        .await;
+
+        insert_batch(&provider, int64_id_batch(&[1, 2, 3])).await;
+
+        // A row no directory listing could ever yield (the listing only emits
+        // real `.vortex` file names under the snapshot dir).
+        let table_id = provider.table_metadata.table_id.clone();
+        let snapshot_id = provider.get_current_snapshot_id();
+        let sentinel_path = "sentinel-not-a-real-file.vortex".to_string();
+        provider
+            .catalog
+            .upsert_snapshot_file(&SnapshotFile {
+                table_id: table_id.clone(),
+                snapshot_id: snapshot_id.clone(),
+                file_path: sentinel_path.clone(),
+                row_count: 0,
+                file_size_bytes: 1,
+                min_sequence: 0,
+                max_sequence: 0,
+            })
+            .await
+            .expect("seed a sentinel manifest row");
+
+        // Reopen: the manifest is non-empty, so the emptiness gate must skip the
+        // backfill entirely and leave the sentinel in place.
+        drop(provider);
+        let reopened = CayenneTableProviderBuilder::new(catalog, runtime_env)
+            .open("manifest_backfill_gate")
+            .await
+            .expect("reopen table");
+        assert!(
+            manifest_file_names(&reopened.catalog, &table_id, &snapshot_id)
+                .await
+                .contains(&sentinel_path),
+            "a non-empty manifest must NOT be re-listed on open (the gate must hold)"
+        );
+    }
+
+    // ----------------------------------------------------------------------
+    // Manifest snapshot model (phase 3): incremental seq-prefix compaction
+    // planning + the surgical seq-prefix prune of the deletion index.
+    // ----------------------------------------------------------------------
+
+    /// Build a 1-column Int64-PK provider for deletion-index seq-prefix tests.
+    async fn create_int64_pk_provider(
+        table_name: &str,
+        runtime_env: Arc<RuntimeEnv>,
+    ) -> (CayenneTableProvider, tempfile::TempDir) {
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        create_cayenne_table_with_config(
+            table_name,
+            schema,
+            VortexConfig::default(),
+            vec!["id".to_string()],
+            runtime_env,
+        )
+        .await
+    }
+
+    /// Read the current Int64 deletion index off a provider (test-only access).
+    fn int64_tombstones(provider: &CayenneTableProvider) -> Arc<DeletionIndex> {
+        match provider.pk_deletion_strategy() {
+            PkDeletionStrategyWithCache::Int64Pk {
+                deletion_snapshot, ..
+            } => Arc::clone(&deletion_snapshot.load().tombstones),
+            other => panic!("expected an Int64 PK strategy, got {other:?}"),
+        }
+    }
+
+    /// Install a known deletion index into a provider's Int64 cache.
+    fn store_int64_tombstones(provider: &CayenneTableProvider, index: DeletionIndex) {
+        match provider.pk_deletion_strategy() {
+            PkDeletionStrategyWithCache::Int64Pk {
+                deletion_snapshot, ..
+            } => deletion_snapshot.store(Arc::new(Int64PkDeletionSnapshot::from_index(index))),
+            other => panic!("expected an Int64 PK strategy, got {other:?}"),
+        }
+    }
+
+    /// The surgical seq-prefix prune must drop in-memory tombstones at or below
+    /// `T`, retain those above it (they still apply to the referenced-in-place
+    /// files), and retain upsert re-insertion records — without wiping protected
+    /// snapshots or the keyset the way `clear_all_deletion_caches` does.
+    #[tokio::test]
+    async fn prune_deletion_index_at_or_below_drops_baked_keeps_newer() {
+        let ctx = SessionContext::new();
+        let (provider, _tmp) =
+            create_int64_pk_provider("seq_prefix_prune", ctx.runtime_env()).await;
+
+        // Deletes at seqs 1,2,3,4 and an upsert conflict on key 50 (delete @2,
+        // re-insert @9). Bake everything <= 2 (the seq-prefix cutoff T).
+        let index = DeletionIndex::from_map(HashMap::from([(10, 1), (20, 2), (30, 3), (40, 4)]))
+            .extend_max_conflicts([50_i64], 2, 9);
+        store_int64_tombstones(&provider, index);
+        // T is the max DELETE sequence (4), not the fused insert seq (9): insert
+        // records are not deletions and never raise the seq-prefix cutoff.
+        assert_eq!(
+            provider.deletion_index_max_sequence(),
+            Some(4),
+            "T tracks the max delete sequence, ignoring re-insertion seqs"
+        );
+
+        provider.prune_deletion_index_at_or_below(2);
+
+        let pruned = int64_tombstones(&provider);
+        assert_eq!(
+            pruned.get(10).map(|t| t.delete_sequence),
+            None,
+            "seq 1 baked"
+        );
+        assert_eq!(
+            pruned.get(20).map(|t| t.delete_sequence),
+            None,
+            "seq 2 baked (boundary <=)"
+        );
+        assert_eq!(
+            pruned.get(30).map(|t| t.delete_sequence),
+            Some(3),
+            "seq 3 > T survives"
+        );
+        assert_eq!(
+            pruned.get(40).map(|t| t.delete_sequence),
+            Some(4),
+            "seq 4 > T survives"
+        );
+        // Key 50's delete (2) is baked, but its re-insertion (9 > 2) is retained,
+        // so the row stays visible — the prune must not lose the insert record.
+        assert_eq!(
+            pruned.get(50).map(|t| t.delete_sequence),
+            None,
+            "delete baked"
+        );
+        assert_eq!(pruned.insert_len(), 1, "re-insertion record retained");
+        assert_eq!(pruned.delete_len(), 2, "only the > T deletes remain");
+    }
+
+    /// On a position-based table the seq-prefix prune is a no-op (position
+    /// deletions are file-scoped, not sequence-tagged) and must not panic.
+    #[tokio::test]
+    async fn prune_deletion_index_at_or_below_is_noop_for_position_based() {
+        let ctx = SessionContext::new();
+        // No primary key → position-based strategy.
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let (provider, _tmp) = create_cayenne_table_with_config(
+            "seq_prefix_prune_position",
+            schema,
+            VortexConfig::default(),
+            vec![],
+            ctx.runtime_env(),
+        )
+        .await;
+        assert!(matches!(
+            provider.pk_deletion_strategy(),
+            PkDeletionStrategyWithCache::PositionBased { .. }
+        ));
+        assert_eq!(provider.deletion_index_max_sequence(), None);
+        provider.prune_deletion_index_at_or_below(5); // must not panic
+    }
+
+    /// `partition_manifest_by_sequence` splits the manifest at `T`: single-commit
+    /// files (`min == max`) with sequence `<= T` are bake-eligible, files above
+    /// are referenced in place. An empty (unpopulated) manifest returns `None` so
+    /// the caller falls back to the full-snapshot rewrite. (The straddling
+    /// merged-file case — where the `min_sequence` predicate diverges from
+    /// `max_sequence` — is covered by
+    /// `partition_manifest_by_sequence_bakes_straddling_merged_file`.)
+    #[tokio::test]
+    async fn partition_manifest_by_sequence_splits_at_cutoff() {
+        let ctx = SessionContext::new();
+        let (provider, _tmp) =
+            create_int64_pk_provider("seq_prefix_partition", ctx.runtime_env()).await;
+        let table_id = provider.table_metadata.table_id.clone();
+        let snapshot_id = provider.get_current_snapshot_id();
+
+        // Unpopulated manifest → None (full-rewrite fallback).
+        assert!(
+            provider
+                .partition_manifest_by_sequence(&snapshot_id, 5)
+                .await
+                .expect("manifest read")
+                .is_none(),
+            "an empty manifest must yield None (no seq-prefix split is defined)"
+        );
+
+        // Populate three single-commit files (min == max) straddling T=5.
+        for (name, seq) in [("a.vortex", 3_i64), ("b.vortex", 5), ("c.vortex", 8)] {
+            provider
+                .catalog
+                .upsert_snapshot_file(&SnapshotFile {
+                    table_id: table_id.clone(),
+                    snapshot_id: snapshot_id.clone(),
+                    file_path: name.to_string(),
+                    row_count: 1,
+                    file_size_bytes: 100,
+                    min_sequence: seq,
+                    max_sequence: seq,
+                })
+                .await
+                .expect("upsert manifest row");
+        }
+
+        let plan = provider
+            .partition_manifest_by_sequence(&snapshot_id, 5)
+            .await
+            .expect("manifest read")
+            .expect("populated manifest yields a plan");
+
+        let mut bake: Vec<&str> = plan.bake.iter().map(|f| f.file_path.as_str()).collect();
+        let mut reference: Vec<&str> = plan
+            .reference
+            .iter()
+            .map(|f| f.file_path.as_str())
+            .collect();
+        bake.sort_unstable();
+        reference.sort_unstable();
+        assert_eq!(
+            bake,
+            vec!["a.vortex", "b.vortex"],
+            "min_seq <= T bakes (incl. boundary)"
+        );
+        assert_eq!(
+            reference,
+            vec!["c.vortex"],
+            "min_seq > T referenced in place"
+        );
+    }
+
+    /// STAGE-1 DELIVERABLE TEST (2). The corrected `min_sequence` predicate: a
+    /// merged file that STRADDLES the cutoff (`min_sequence <= T < max_sequence`)
+    /// MUST be BAKED, never referenced in place. It holds rows at or below `T`,
+    /// so referencing it would let the post-commit
+    /// `prune_deletion_index_at_or_below(T)` drop a `<= T` tombstone that still
+    /// applies to those rows — resurrecting deleted rows. The prior
+    /// `max_sequence <= T` predicate put this file in `reference` (the bug).
+    #[tokio::test]
+    async fn partition_manifest_by_sequence_bakes_straddling_merged_file() {
+        let ctx = SessionContext::new();
+        let (provider, _tmp) =
+            create_int64_pk_provider("seq_prefix_straddle", ctx.runtime_env()).await;
+        let table_id = provider.table_metadata.table_id.clone();
+        let snapshot_id = provider.get_current_snapshot_id();
+
+        // T = 5. Three files:
+        //   merged_straddle: [2, 8]  — min <= 5 < max  ⇒ MUST bake
+        //   below:           [1, 4]  — entirely <= 5    ⇒ bake
+        //   above:           [6, 9]  — entirely  > 5    ⇒ reference
+        for (name, min_seq, max_seq) in [
+            ("merged_straddle.vortex", 2_i64, 8_i64),
+            ("below.vortex", 1, 4),
+            ("above.vortex", 6, 9),
+        ] {
+            provider
+                .catalog
+                .upsert_snapshot_file(&SnapshotFile {
+                    table_id: table_id.clone(),
+                    snapshot_id: snapshot_id.clone(),
+                    file_path: name.to_string(),
+                    row_count: 1,
+                    file_size_bytes: 100,
+                    min_sequence: min_seq,
+                    max_sequence: max_seq,
+                })
+                .await
+                .expect("upsert manifest row");
+        }
+
+        let plan = provider
+            .partition_manifest_by_sequence(&snapshot_id, 5)
+            .await
+            .expect("manifest read")
+            .expect("populated manifest yields a plan");
+
+        let mut bake: Vec<&str> = plan.bake.iter().map(|f| f.file_path.as_str()).collect();
+        let reference: Vec<&str> = plan
+            .reference
+            .iter()
+            .map(|f| f.file_path.as_str())
+            .collect();
+        bake.sort_unstable();
+
+        assert_eq!(
+            bake,
+            vec!["below.vortex", "merged_straddle.vortex"],
+            "a file straddling T (min_sequence <= T < max_sequence) MUST bake — \
+             the resurrect-rows-critical fix vs the old max_sequence predicate"
+        );
+        assert_eq!(
+            reference,
+            vec!["above.vortex"],
+            "only a file entirely above T (min_sequence > T) is referenced in place"
+        );
+    }
+
+    // ========================================================================
+    // STAGE 2 — seq-prefix BAKE (resurrect-rows-critical). These five tests
+    // exercise `bake_seq_prefix_protected_snapshots` end-to-end on a key-mode
+    // upsert table: real protected snapshots backed by real Vortex files, with
+    // each snapshot's per-file manifest sequence range PINNED via
+    // `upsert_snapshot_file` so the seq-prefix cutoff `T` is deterministic
+    // (independent of the write path's auto-assigned reservation sequences).
+    // ========================================================================
+
+    /// Build a key-mode (`deletion_mode: Key`) file-backed upsert table holding
+    /// `n` protected snapshots, one row each (id = 0..n), and PIN each protected
+    /// snapshot's manifest file range to `[seq_i, seq_i]` where `seq_i` is the
+    /// i-th value of `seqs` (creation order = ascending protected-snapshot id).
+    /// Returns the provider, the temp dir (kept alive), and the protected
+    /// snapshot ids in creation (sequence) order.
+    ///
+    /// The pin keeps the seq-prefix cutoff deterministic: selection reads these
+    /// manifest `max_sequence` values, not the write path's reserved sequences.
+    async fn build_seq_prefix_fixture(
+        table_name: &str,
+        runtime_env: Arc<RuntimeEnv>,
+        seqs: &[i64],
+    ) -> (CayenneTableProvider, TempDir, Vec<String>) {
+        use arrow::datatypes::{DataType, Field, Schema};
+        let (provider, _catalog, tmp) = create_cdc_upsert_table(table_name, runtime_env).await;
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("value", DataType::Int64, false),
+        ]));
+
+        // Each distinct-key insert publishes its own file-backed protected
+        // snapshot (inline disabled in the fixture).
+        for (i, _) in seqs.iter().enumerate() {
+            let id = i64::try_from(i).expect("row index fits i64");
+            insert_batch(
+                &provider,
+                id_value_batch(Arc::clone(&schema), &[id], &[id * 10]),
+            )
+            .await;
+        }
+
+        // Populate manifests for the live set (under the lock the real
+        // post-write lane holds), then OVERWRITE each protected snapshot's
+        // manifest rows with the pinned [seq, seq] range.
+        {
+            let _guard = provider.compaction_lock.lock().await;
+            provider.rebuild_live_snapshot_manifests().await;
+        }
+
+        let mut ids: Vec<String> = provider
+            .protected_snapshots
+            .load_full()
+            .keys()
+            .cloned()
+            .collect();
+        ids.sort();
+        assert_eq!(
+            ids.len(),
+            seqs.len(),
+            "fixture must produce one protected snapshot per seq ({} expected, got {})",
+            seqs.len(),
+            ids.len()
+        );
+
+        let table_id = provider.table_metadata.table_id.clone();
+        for (id, &seq) in ids.iter().zip(seqs.iter()) {
+            let files = provider
+                .list_snapshot_files_with_sizes(id)
+                .await
+                .expect("list snapshot files");
+            assert!(
+                !files.is_empty(),
+                "protected snapshot {id} must have a data file to pin"
+            );
+            for (file_name, size) in files {
+                provider
+                    .catalog
+                    .upsert_snapshot_file(&SnapshotFile {
+                        table_id: table_id.clone(),
+                        snapshot_id: id.clone(),
+                        file_path: file_name,
+                        row_count: 1,
+                        file_size_bytes: i64::try_from(size).unwrap_or(0),
+                        min_sequence: seq,
+                        max_sequence: seq,
+                    })
+                    .await
+                    .expect("pin manifest sequence");
+            }
+        }
+        (provider, tmp, ids)
+    }
+
+    /// Install a known Int64 deletion index (delete-only entries) onto a provider.
+    fn install_int64_deletes(provider: &CayenneTableProvider, deletes: &[(i64, i64)]) {
+        let index = DeletionIndex::from_map(deletes.iter().copied().collect::<HashMap<i64, i64>>());
+        store_int64_tombstones(provider, index);
+    }
+
+    /// STAGE-2 DELIVERABLE TEST (1). After a bake, a tombstone with
+    /// `delete_seq <= T` is GONE from the index AND the deleted row stays deleted
+    /// on scan. Five snapshots (ids 0..5) pinned at seqs 10,20,30,40,50; K = 3 is
+    /// kept unbaked, so the older prefix is {0,1} with `T = 20`. Key 0 (written at
+    /// 10) is deleted at `delete_seq` 15 (<= T) — the bake must physically remove it
+    /// and drop the tombstone; key 1 (written at 20) is NOT deleted and survives.
+    #[tokio::test]
+    async fn seq_prefix_bake_drops_baked_tombstone_and_keeps_row_deleted() {
+        let ctx = SessionContext::new();
+        let (provider, _tmp, _ids) = build_seq_prefix_fixture(
+            "bake_drops_tombstone",
+            ctx.runtime_env(),
+            &[10, 20, 30, 40, 50],
+        )
+        .await;
+
+        // Delete key 0 at delete_seq 15 (<= T=20, in the older prefix's snapshot).
+        install_int64_deletes(&provider, &[(0, 15)]);
+        assert_eq!(
+            collect_id_value_pairs(&ctx, &provider, "bake_drops_tombstone").await,
+            vec![(1, 10), (2, 20), (3, 30), (4, 40)],
+            "precondition: key 0 hidden by its tombstone before the bake"
+        );
+
+        let baked = provider
+            .bake_seq_prefix_protected_snapshots()
+            .await
+            .expect("bake should not error");
+        assert!(baked, "the older prefix {{0,1}} must bake (>= 2 snapshots)");
+
+        // The tombstone for key 0 (delete_seq 15 <= T=20) is gone from the index.
+        let tombstones = int64_tombstones(&provider);
+        assert_eq!(
+            tombstones.get(0).map(|t| t.delete_sequence),
+            None,
+            "the <= T tombstone must be pruned after the bake"
+        );
+        assert_eq!(
+            tombstones.delete_len(),
+            0,
+            "no live tombstones remain (the only delete was <= T)"
+        );
+
+        // Key 0's row stays physically deleted (the merge applied the delete);
+        // every other row is still present.
+        assert_eq!(
+            collect_id_value_pairs(&ctx, &provider, "bake_drops_tombstone").await,
+            vec![(1, 10), (2, 20), (3, 30), (4, 40)],
+            "key 0 stays deleted after the bake (no resurrection), others preserved"
+        );
+    }
+
+    /// STAGE-2 DELIVERABLE TEST (2). A row written `<= T`, deleted `<= T`, then
+    /// RE-INSERTED at `> T` is PRESENT after the bake — the `> T` version must
+    /// survive (not dropped as part of the bake, not resurrected-as-deleted).
+    ///
+    /// End-to-end through the real upsert path (no synthetic state), so the
+    /// re-insert lands in a genuine newer protected snapshot whose deletion
+    /// threshold the engine itself assigns `>= ` the old row's delete sequence —
+    /// the production mechanism by which the re-inserted copy stays visible while
+    /// the old copy is hidden (protected-snapshot scans IGNORE the re-insert
+    /// marker; visibility comes from the newer snapshot's threshold).
+    ///
+    /// Sequence of events:
+    /// 1. Insert key 100 (value 1) — the OLD copy, in the OLDEST snapshot.
+    /// 2. Insert keys 1,2,3,4 — four more snapshots.
+    /// 3. Re-insert key 100 (value 999) — a real upsert: writes a tombstone for
+    ///    key 100 at some `delete_seq D` and publishes a NEW snapshot (the
+    ///    SURVIVOR) whose threshold the engine assigns `>= D`.
+    ///
+    /// Six protected snapshots; K = 3 kept. The older prefix is the OLDEST three
+    /// (the OLD-100 snapshot + keys 1,2). We pin the older prefix's manifest so
+    /// `T = D` and pin the kept snapshots `> D`, so the SURVIVOR (newest) is
+    /// referenced in place. After the bake: the OLD-100 copy is physically removed
+    /// (the merge applied the `D > old-snapshot-threshold` delete), the `<= T = D`
+    /// tombstone is pruned, and the SURVIVOR (999) still scans — key 100 present
+    /// exactly once at its re-inserted value.
+    #[tokio::test]
+    async fn seq_prefix_bake_keeps_reinserted_row_above_cutoff() {
+        let ctx = SessionContext::new();
+        let (provider, _catalog, _tmp) =
+            create_cdc_upsert_table("bake_keeps_reinsert", ctx.runtime_env()).await;
+        let schema = Arc::clone(&provider.table_metadata.schema);
+        let table_id = provider.table_metadata.table_id.clone();
+
+        // (1) OLD copy of key 100 (value 1) → oldest snapshot.
+        insert_batch(&provider, id_value_batch(Arc::clone(&schema), &[100], &[1])).await;
+        // (2) four more distinct-key snapshots.
+        for id in 1..=4_i64 {
+            insert_batch(
+                &provider,
+                id_value_batch(Arc::clone(&schema), &[id], &[id * 10]),
+            )
+            .await;
+        }
+        // (3) Re-insert key 100 (value 999): a real upsert → tombstone for key 100
+        // + a new SURVIVOR snapshot whose threshold the engine assigns >= delete.
+        insert_batch(
+            &provider,
+            id_value_batch(Arc::clone(&schema), &[100], &[999]),
+        )
+        .await;
+
+        // The engine assigned the tombstone a delete sequence; T must be >= it.
+        let delete_seq = provider
+            .deletion_index_max_sequence()
+            .expect("the re-insert recorded a tombstone with a delete sequence");
+
+        // Precondition: exactly the re-inserted copy (999) of key 100 is visible.
+        assert_eq!(
+            collect_id_value_pairs(&ctx, &provider, "bake_keeps_reinsert")
+                .await
+                .into_iter()
+                .filter(|(id, _)| *id == 100)
+                .collect::<Vec<_>>(),
+            vec![(100, 999)],
+            "precondition: re-insert hides the old copy, only value 999 visible"
+        );
+
+        // Populate manifests, then PIN them: older prefix (oldest 3) at `T = D`,
+        // kept snapshots (newest 3, incl. the SURVIVOR) strictly above `D`, so the
+        // SURVIVOR is referenced in place and the OLD-100 snapshot is baked.
+        {
+            let _guard = provider.compaction_lock.lock().await;
+            provider.rebuild_live_snapshot_manifests().await;
+        }
+        let mut ids: Vec<String> = provider
+            .protected_snapshots
+            .load_full()
+            .keys()
+            .cloned()
+            .collect();
+        ids.sort();
+        assert_eq!(
+            ids.len(),
+            6,
+            "5 distinct inserts + 1 re-insert = 6 snapshots"
+        );
+        // Older prefix = oldest 3 → pin max_sequence = D (so T = D >= delete_seq).
+        // Kept = newest 3 → pin min_sequence = D + 10 (> T).
+        for (i, id) in ids.iter().enumerate() {
+            let seq = if i < 3 { delete_seq } else { delete_seq + 10 };
+            let files = provider
+                .list_snapshot_files_with_sizes(id)
+                .await
+                .expect("list snapshot files");
+            for (file_name, size) in files {
+                provider
+                    .catalog
+                    .upsert_snapshot_file(&SnapshotFile {
+                        table_id: table_id.clone(),
+                        snapshot_id: id.clone(),
+                        file_path: file_name,
+                        row_count: 1,
+                        file_size_bytes: i64::try_from(size).unwrap_or(0),
+                        min_sequence: seq,
+                        max_sequence: seq,
+                    })
+                    .await
+                    .expect("pin manifest sequence");
+            }
+        }
+
+        let baked = provider
+            .bake_seq_prefix_protected_snapshots()
+            .await
+            .expect("bake should not error");
+        assert!(baked, "older prefix must bake");
+
+        // The <= T (= D) delete of key 100 is pruned from the index.
+        let tombstones = int64_tombstones(&provider);
+        assert_eq!(
+            tombstones.get(100).map(|t| t.delete_sequence),
+            None,
+            "the <= T delete of key 100 is pruned after the bake"
+        );
+
+        // Key 100 present exactly once, as its re-inserted (> T) value 999 —
+        // neither dropped (the > T survivor was referenced in place) nor
+        // resurrected-as-deleted (the prune did not change the survivor's
+        // visibility, and the old copy stays physically gone).
+        let key100: Vec<(i64, i64)> =
+            collect_id_value_pairs(&ctx, &provider, "bake_keeps_reinsert")
+                .await
+                .into_iter()
+                .filter(|(id, _)| *id == 100)
+                .collect();
+        assert_eq!(
+            key100,
+            vec![(100, 999)],
+            "key 100 present exactly once as its re-inserted > T value 999, got {key100:?}"
+        );
+    }
+
+    /// STAGE-2 DELIVERABLE TEST (3). A `> T` snapshot's rows remain readable after
+    /// the bake — the scan union still reads the untouched (referenced-in-place)
+    /// snapshots. Five snapshots 0..5 at 10,20,30,40,50; older prefix {0,1}
+    /// (T=20) bakes; snapshots 2,3,4 (seqs 30,40,50 > T) are left untouched and
+    /// their rows (ids 2,3,4) must still scan.
+    #[tokio::test]
+    async fn seq_prefix_bake_leaves_above_cutoff_snapshots_readable() {
+        let ctx = SessionContext::new();
+        let (provider, _tmp, ids) =
+            build_seq_prefix_fixture("bake_keeps_above", ctx.runtime_env(), &[10, 20, 30, 40, 50])
+                .await;
+        let before: std::collections::HashSet<String> = provider
+            .protected_snapshots
+            .load_full()
+            .keys()
+            .cloned()
+            .collect();
+
+        // No deletes at all — pure structural check that the bake merges the
+        // older prefix and the > T snapshots survive untouched.
+        let baked = provider
+            .bake_seq_prefix_protected_snapshots()
+            .await
+            .expect("bake should not error");
+        assert!(baked, "older prefix {{0,1}} bakes");
+
+        // The newest K=3 snapshots (ids[2..5]) are still present (untouched).
+        let after = provider.protected_snapshots.load_full();
+        for kept in &ids[2..] {
+            assert!(
+                after.contains_key(kept),
+                "referenced-in-place snapshot {kept} (min_sequence > T) must be untouched"
+            );
+        }
+        // The two baked inputs are gone, replaced by one merged snapshot.
+        assert!(
+            !after.contains_key(&ids[0]) && !after.contains_key(&ids[1]),
+            "the baked inputs must be retired from the protected set"
+        );
+        assert!(
+            after.len() < before.len(),
+            "the bake reduces the protected-snapshot count: {} -> {}",
+            before.len(),
+            after.len()
+        );
+
+        // Every row still scans (the union reads M ∪ the untouched > T snapshots).
+        assert_eq!(
+            collect_id_value_pairs(&ctx, &provider, "bake_keeps_above").await,
+            vec![(0, 0), (1, 10), (2, 20), (3, 30), (4, 40)],
+            "all rows readable after the bake — untouched > T snapshots included"
+        );
+    }
+
+    /// STAGE-2 DELIVERABLE TEST (4). The bake is a NO-OP on a position-delete
+    /// table: `should_capture_positions()` is true (default `auto` resolves to
+    /// position for a PK table), so the seq-prefix bake returns `Ok(false)`
+    /// without merging — even with enough protected snapshots to otherwise bake.
+    #[tokio::test]
+    async fn seq_prefix_bake_is_noop_on_position_delete_table() {
+        use arrow::datatypes::{DataType, Field, Schema};
+        let ctx = SessionContext::new();
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let metadata_dir = format!("{}/metadata", temp_dir.path().to_str().expect("str path"));
+        let data_dir = format!("{}/data", temp_dir.path().to_str().expect("str path"));
+        std::fs::create_dir_all(&metadata_dir).expect("metadata dir created");
+        let connection_string = format!("sqlite://{metadata_dir}/cayenne.db");
+        let catalog = Arc::new(CayenneCatalog::new(connection_string).expect("catalog created"))
+            as Arc<dyn MetadataCatalog>;
+        catalog.init().await.expect("catalog initialized");
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("value", DataType::Int64, false),
+        ]));
+        let options = CreateTableOptions {
+            table_name: "bake_noop_position".to_string(),
+            schema: Arc::clone(&schema),
+            primary_key: vec!["id".to_string()],
+            on_conflict: Some(OnConflict::Upsert(
+                datafusion_table_providers::util::column_reference::ColumnReference::new(vec![
+                    "id".to_string(),
+                ]),
+            )),
+            base_path: data_dir,
+            partition_column: None,
+            vortex_config: VortexConfig {
+                inline_max_rows: 0,
+                // Default deletion mode left as auto → resolves to POSITION for a
+                // PK table, which the bake gate must skip.
+                compaction_background_interval_ms: 3_600_000,
+                ..VortexConfig::default()
+            },
+        };
+        let provider = CayenneTableProviderBuilder::new(Arc::clone(&catalog), ctx.runtime_env())
+            .create(options)
+            .await
+            .expect("table created");
+        assert!(
+            provider.should_capture_positions(),
+            "fixture must resolve to position mode or this test pins nothing"
+        );
+
+        // Enough distinct-key inserts to clear the K+2 floor if it were key-mode.
+        for id in 0..6_i64 {
+            insert_batch(
+                &provider,
+                id_value_batch(Arc::clone(&schema), &[id], &[id * 10]),
+            )
+            .await;
+        }
+        {
+            let _guard = provider.compaction_lock.lock().await;
+            provider.rebuild_live_snapshot_manifests().await;
+        }
+        let before = provider.protected_snapshots.load_full().len();
+
+        let baked = provider
+            .bake_seq_prefix_protected_snapshots()
+            .await
+            .expect("bake should not error");
+        assert!(
+            !baked,
+            "the seq-prefix bake must be a no-op on a position-delete table"
+        );
+        assert_eq!(
+            provider.protected_snapshots.load_full().len(),
+            before,
+            "a position-mode bake must not touch the protected set"
+        );
+    }
+
+    /// STAGE-2 DELIVERABLE TEST (5). The clean-prefix gate SKIPS THE WHOLE BAKE
+    /// (no merge, no prune, no write-amp) when a genuinely-dirty `<= T` snapshot
+    /// would be left unmerged. We pin the OLDER prefix to bake at `T`, but pin one
+    /// of the KEPT (newest-K) snapshots with `min_sequence <= T` AND a delete-
+    /// watermark `< T` — so it is neither write-range-clean nor watermark-exempt, a
+    /// true violation. The PRE-merge gate detects it and returns early: no merge
+    /// write-amp is paid for a prune that would be withheld, and the `<= T`
+    /// tombstone is retained (resurrect-safe).
+    #[tokio::test]
+    async fn seq_prefix_bake_skips_prune_when_clean_prefix_violated() {
+        let ctx = SessionContext::new();
+        // Older prefix {0,1} pinned at 10,20 ⇒ T=20. Kept snapshots {2,3,4}:
+        // pin id-2 at seq 5 (< T=20) to VIOLATE the clean prefix; ids 3,4 are
+        // above T (30,40). The violating kept snapshot id-2 makes the post-swap
+        // live set contain a min_sequence (5) <= T.
+        let (provider, _tmp, ids) =
+            build_seq_prefix_fixture("bake_skips_prune", ctx.runtime_env(), &[10, 20, 5, 30, 40])
+                .await;
+
+        // Pin kept id-2's delete-watermark to 5 (< T=20) so it is genuinely dirty:
+        // neither write-range-clean (min_sequence 5 <= T) nor watermark-exempt
+        // (5 < T). This makes the violation deterministic regardless of the small
+        // real sequence the fixture's inserts happened to allocate.
+        let dirty_kept = ids[2].clone();
+        provider.protected_snapshots.rcu(|cur| {
+            let mut m = (**cur).clone();
+            m.insert(dirty_kept.clone(), 5);
+            Arc::new(m)
+        });
+
+        // A tombstone at delete_seq 12 (<= T=20). Were the prune to run it would
+        // be dropped, but key 2 (written at 5 <= 12) physically survives in the
+        // unmerged kept snapshot id-2 → dropping the tombstone would resurrect it.
+        install_int64_deletes(&provider, &[(2, 12)]);
+
+        let before = provider.protected_snapshots.load_full().len();
+        let baked = provider
+            .bake_seq_prefix_protected_snapshots()
+            .await
+            .expect("bake should not error");
+        assert!(
+            !baked,
+            "the bake skips ENTIRELY (no merge, no write-amp) when the prune would be withheld"
+        );
+        assert_eq!(
+            provider.protected_snapshots.load_full().len(),
+            before,
+            "the violated bake must not merge/swap (the older prefix stays live)"
+        );
+
+        // The tombstone MUST survive (prune skipped) — clean-prefix violated.
+        let tombstones = int64_tombstones(&provider);
+        assert_eq!(
+            tombstones.get(2).map(|t| t.delete_sequence),
+            Some(12),
+            "the <= T tombstone must be RETAINED when a kept snapshot still has min_sequence <= T"
+        );
+        assert_eq!(
+            tombstones.delete_len(),
+            1,
+            "no tombstone was pruned under the violated clean-prefix invariant"
+        );
+        // Key 2 stays hidden (its surviving tombstone still applies) — no
+        // resurrection despite the kept <= T snapshot.
+        let pairs = collect_id_value_pairs(&ctx, &provider, "bake_skips_prune").await;
+        assert!(
+            !pairs.iter().any(|(id, _)| *id == 2),
+            "key 2 stays deleted (tombstone retained) — no resurrection, got {pairs:?}"
+        );
+    }
+
+    /// STAGE-2 DELIVERABLE TEST (6) — REGRESSION FIX. An OLDER-prefix candidate
+    /// with an EMPTY manifest (its async population has not landed) is BAKED via its
+    /// protected-set watermark (its single allocated commit-sequence — the seq of
+    /// every row it holds), NOT skipped. The old behavior skipped it, leaving it a
+    /// LIVE empty-manifest blocker so the post-swap prune was withheld forever — the
+    /// bake paid merge write-amp with zero index shrink (the production regression).
+    /// Baking it retires it into the merge (deletions applied → survivors only), so
+    /// the `<= T` prune runs and resurrects nothing.
+    ///
+    /// Six protected snapshots; the older prefix is the oldest three (ids 0,1,2).
+    /// We EMPTY id-2's manifest; it is now baked via its watermark alongside {0,1}.
+    /// Key 2 is deleted at `delete_seq` 12 (above id-2's small watermark, so the merge
+    /// applies it), so id-2's copy is removed and the tombstone is pruned. The newest
+    /// K=3 ({3,4,5}) stay live and `> T`.
+    #[tokio::test]
+    async fn seq_prefix_bake_bakes_empty_manifest_candidate_and_prunes() {
+        let ctx = SessionContext::new();
+        // Pin all six initially; we then empty exactly one older-prefix snapshot.
+        let (provider, _tmp, ids) = build_seq_prefix_fixture(
+            "bake_skips_prune_empty",
+            ctx.runtime_env(),
+            &[10, 20, 30, 40, 50, 60],
+        )
+        .await;
+
+        // Empty the manifest of one OLDER-prefix snapshot (the 3rd oldest, id-2):
+        // there is no per-snapshot manifest delete, so clear ALL rows and re-pin
+        // every snapshot EXCEPT id-2 (re-listing each file exactly as the fixture
+        // does). That leaves id-2 with an empty manifest while the others keep
+        // their pinned [seq, seq] ranges.
+        let table_id = provider.table_metadata.table_id.clone();
+        let empty_id = ids[2].clone();
+        provider
+            .catalog
+            .clear_snapshot_files(&table_id)
+            .await
+            .expect("clear all manifests");
+        let seqs = [10_i64, 20, 30, 40, 50, 60];
+        for (id, &seq) in ids.iter().zip(seqs.iter()) {
+            if id == &empty_id {
+                continue; // leave id-2's manifest empty (range unknown)
+            }
+            let files = provider
+                .list_snapshot_files_with_sizes(id)
+                .await
+                .expect("list snapshot files");
+            assert!(!files.is_empty(), "snapshot {id} must have a data file");
+            for (file_name, size) in files {
+                provider
+                    .catalog
+                    .upsert_snapshot_file(&SnapshotFile {
+                        table_id: table_id.clone(),
+                        snapshot_id: id.clone(),
+                        file_path: file_name,
+                        row_count: 1,
+                        file_size_bytes: i64::try_from(size).unwrap_or(0),
+                        min_sequence: seq,
+                        max_sequence: seq,
+                    })
+                    .await
+                    .expect("re-pin manifest sequence");
+            }
+        }
+        // Sanity: id-2's manifest is genuinely empty; a populated peer is not.
+        assert!(
+            provider
+                .catalog
+                .get_snapshot_files(&table_id, &empty_id)
+                .await
+                .expect("get manifest")
+                .is_empty(),
+            "the older snapshot id-2 must have an empty manifest for this test"
+        );
+
+        // Tombstone at delete_seq 12 (<= T=20). Key 2 physically lives in the
+        // empty-manifest snapshot id-2, which is NOT merged (skipped) and stays
+        // live — so dropping this tombstone would resurrect it.
+        install_int64_deletes(&provider, &[(2, 12)]);
+
+        let baked = provider
+            .bake_seq_prefix_protected_snapshots()
+            .await
+            .expect("bake should not error");
+        assert!(
+            baked,
+            "the older prefix (incl the empty-manifest id-2) must bake"
+        );
+
+        // FIX: an empty-manifest CANDIDATE is now BAKED via its protected-set
+        // watermark (its single commit-sequence), not skipped — so it is retired
+        // into the merge and is no longer a live blocker.
+        assert!(
+            !provider
+                .protected_snapshots
+                .load_full()
+                .contains_key(&empty_id),
+            "the empty-manifest older candidate must be baked away (merged into M)"
+        );
+
+        // The `<= T` tombstone for key 2 is PRUNED: id-2 was baked with its watermark
+        // as its merge threshold, so the merge applied delete_seq 12 (above that
+        // small watermark) and key 2 is physically removed from M — pruning the
+        // tombstone resurrects nothing.
+        let tombstones = int64_tombstones(&provider);
+        assert_eq!(
+            tombstones.delete_len(),
+            0,
+            "the <= T tombstone is pruned once the empty-manifest candidate is baked"
+        );
+
+        // Key 2 stays deleted (removed by the merge) — no resurrection.
+        let pairs = collect_id_value_pairs(&ctx, &provider, "bake_skips_prune_empty").await;
+        assert!(
+            !pairs.iter().any(|(id, _)| *id == 2),
+            "key 2 stays deleted (baked out by the merge) — no resurrection, got {pairs:?}"
+        );
+    }
+
+    /// THRESHOLD-EXEMPTION (resurrect-rows-critical). A KEPT live snapshot whose
+    /// manifest write-range dips `<= T` is STILL clean past T when its protected-set
+    /// value (its merge-on-read delete-watermark) is `>= T`: deletions `<= T` are
+    /// already physically applied to it (survivors only), so pruning them resurrects
+    /// nothing and the prune must RUN, not be withheld on the write-range alone.
+    /// This mirrors a compaction output that consolidated old survivors (low
+    /// `min_sequence`) but baked deletes to a high watermark — the case that, left
+    /// unexempted, makes the bake re-merge without ever pruning.
+    ///
+    /// Older prefix {0,1} at 10,20 ⇒ T=20. Kept id-2 is given a manifest
+    /// `min_sequence = 5` (`<= T`, the write-range trap the old gate blocked on) but
+    /// a watermark = 25 (`>= T`), so it is exempt; ids 3,4 stay `> T`. The only
+    /// delete targets key 0 (in the baked prefix), so the prune drops it and key 0
+    /// stays deleted — key 2 (untouched, the watermark's survivor) is irrelevant.
+    #[tokio::test]
+    async fn seq_prefix_bake_prunes_when_kept_snapshot_clean_past_cutoff_by_watermark() {
+        let ctx = SessionContext::new();
+        let (provider, _tmp, ids) = build_seq_prefix_fixture(
+            "bake_watermark_exempt",
+            ctx.runtime_env(),
+            &[10, 20, 30, 40, 50],
+        )
+        .await;
+
+        // Kept id-2: overwrite its manifest write-range to dip `<= T` (min_sequence
+        // 5 — the exact shape the old write-range-only gate blocked on), then set its
+        // delete-watermark (protected-set value) to 25 (`>= T=20`), the production
+        // signal that its `<= T` deletions are already applied (survivors only).
+        let table_id = provider.table_metadata.table_id.clone();
+        let kept_id = ids[2].clone();
+        let files = provider
+            .list_snapshot_files_with_sizes(&kept_id)
+            .await
+            .expect("list kept files");
+        for (file_name, size) in files {
+            provider
+                .catalog
+                .upsert_snapshot_file(&SnapshotFile {
+                    table_id: table_id.clone(),
+                    snapshot_id: kept_id.clone(),
+                    file_path: file_name,
+                    row_count: 1,
+                    file_size_bytes: i64::try_from(size).unwrap_or(0),
+                    min_sequence: 5, // <= T=20: the write-range trap
+                    max_sequence: 5,
+                })
+                .await
+                .expect("pin low write-range");
+        }
+        provider.protected_snapshots.rcu(|cur| {
+            let mut m = (**cur).clone();
+            m.insert(kept_id.clone(), 25); // delete-watermark >= T=20 ⇒ clean past T
+            Arc::new(m)
+        });
+
+        // Delete key 0 (written at 10, in the baked prefix; delete_seq 15 <= T=20).
+        install_int64_deletes(&provider, &[(0, 15)]);
+
+        let baked = provider
+            .bake_seq_prefix_protected_snapshots()
+            .await
+            .expect("bake should not error");
+        assert!(baked, "the {{0,1}} prefix bakes");
+
+        // The watermark exemption let the prune RUN despite id-2's min_sequence <= T.
+        let tombstones = int64_tombstones(&provider);
+        assert_eq!(
+            tombstones.delete_len(),
+            0,
+            "the <= T tombstone is pruned: kept id-2 is clean past T via its watermark"
+        );
+        let pairs = collect_id_value_pairs(&ctx, &provider, "bake_watermark_exempt").await;
+        assert!(
+            !pairs.iter().any(|(id, _)| *id == 0),
+            "key 0 stays deleted after the bake — no resurrection, got {pairs:?}"
+        );
+    }
+
+    /// STAGE-1 DELIVERABLE TEST (1). Two appends published at distinct sequences
+    /// `S1 < S2` (each lands in its own file-backed protected snapshot) must
+    /// yield manifest rows tagged with that snapshot's OWN sequence — snapshot 1
+    /// `[S1, S1]`, snapshot 2 `[S2, S2]` — NOT both stamped the latest watermark.
+    /// This is the central defect Stage 1 fixes: the prior per-snapshot watermark
+    /// tagged every file in the live set with one sequence, degenerating the
+    /// seq-prefix split.
+    #[tokio::test]
+    async fn rebuild_manifest_tags_each_protected_snapshot_with_its_own_sequence() {
+        use arrow::datatypes::{DataType, Field, Schema};
+        use datafusion_table_providers::util::column_reference::ColumnReference;
+
+        let ctx = SessionContext::new();
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let metadata_dir = format!("{}/metadata", temp_dir.path().to_str().expect("str path"));
+        let data_dir = format!("{}/data", temp_dir.path().to_str().expect("str path"));
+        std::fs::create_dir_all(&metadata_dir).expect("metadata dir created");
+        let connection_string = format!("sqlite://{metadata_dir}/cayenne.db");
+        let catalog = Arc::new(CayenneCatalog::new(connection_string).expect("catalog created"))
+            as Arc<dyn MetadataCatalog>;
+        catalog.init().await.expect("catalog initialized");
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("value", DataType::Int64, false),
+        ]));
+        let options = CreateTableOptions {
+            table_name: "manifest_per_snapshot_seq".to_string(),
+            schema: Arc::clone(&schema),
+            primary_key: vec!["id".to_string()],
+            // Upsert table: each insert publishes a new protected snapshot at its
+            // own reserved sequence.
+            on_conflict: Some(OnConflict::Upsert(ColumnReference::new(vec![
+                "id".to_string(),
+            ]))),
+            base_path: data_dir,
+            partition_column: None,
+            vortex_config: VortexConfig {
+                // Inline disabled so each insert lands as an on-disk file in its
+                // protected snapshot dir (the manifest's domain).
+                inline_max_rows: 0,
+                // Pin the background compactor far out so it can't merge the two
+                // protected snapshots out from under the assertion.
+                compaction_background_interval_ms: 3_600_000,
+                ..VortexConfig::default()
+            },
+        };
+        let provider = CayenneTableProviderBuilder::new(Arc::clone(&catalog), ctx.runtime_env())
+            .create(options)
+            .await
+            .expect("table created");
+
+        // Two appends with DISTINCT keys → two live protected snapshots (neither
+        // supersedes the other), each at its own reserved sequence S1 < S2.
+        insert_batch(&provider, id_value_batch(Arc::clone(&schema), &[1], &[10])).await;
+        insert_batch(&provider, id_value_batch(Arc::clone(&schema), &[2], &[20])).await;
+
+        // The protected set maps each snapshot id -> its reserved sequence.
+        let protected = provider.protected_snapshots.load_full();
+        assert_eq!(
+            protected.len(),
+            2,
+            "two distinct-key upserts should leave two live protected snapshots, got {}",
+            protected.len()
+        );
+        let mut seqs: Vec<i64> = protected.values().copied().collect();
+        seqs.sort_unstable();
+        assert!(
+            seqs[0] < seqs[1],
+            "the two appends must have distinct, increasing sequences (S1 < S2): {seqs:?}"
+        );
+
+        // Run the production manifest rebuild (under the compaction lock the real
+        // post-write maintenance lane holds).
+        {
+            let _guard = provider.compaction_lock.lock().await;
+            provider.rebuild_live_snapshot_manifests().await;
+        }
+
+        // Each protected snapshot's manifest rows must carry ITS OWN sequence as
+        // BOTH min and max — never the other snapshot's (the watermark bug).
+        for (snapshot_id, &expected_seq) in protected.iter() {
+            let rows = provider
+                .catalog
+                .get_snapshot_files(&provider.table_metadata.table_id, snapshot_id)
+                .await
+                .expect("manifest rows");
+            assert!(
+                !rows.is_empty(),
+                "protected snapshot {snapshot_id} should have at least one manifest row"
+            );
+            for row in &rows {
+                assert_eq!(
+                    (row.min_sequence, row.max_sequence),
+                    (expected_seq, expected_seq),
+                    "file {} in snapshot {snapshot_id} must be tagged [S, S] = [{expected_seq}, \
+                     {expected_seq}] (its own reservation), not a shared watermark",
+                    row.file_path,
+                );
+            }
+        }
+    }
+
+    /// Phase 4 (physical-file GC ref-counting): the relative-path key combines
+    /// the snapshot id and the file name, so the SAME bare file name under two
+    /// different snapshots maps to two distinct physical files.
+    #[test]
+    fn manifest_file_relative_path_is_snapshot_scoped() {
+        assert_eq!(
+            CayenneTableProvider::manifest_file_relative_path("snapA", "0001.vortex"),
+            "snapA/0001.vortex"
+        );
+        assert_ne!(
+            CayenneTableProvider::manifest_file_relative_path("snapA", "0001.vortex"),
+            CayenneTableProvider::manifest_file_relative_path("snapB", "0001.vortex"),
+            "the same bare name under two snapshots is two different physical files"
+        );
+    }
+
+    /// Phase 4: the live-referenced set is built only from rows whose snapshot is
+    /// in the live set (current + protected); rows belonging to already-retired
+    /// snapshots are excluded so a dying snapshot cannot keep its own files
+    /// alive. A live snapshot that references a file physically located in
+    /// another snapshot's dir (an in-place compaction reference) IS included.
+    #[test]
+    fn live_referenced_relative_paths_filters_to_live_set() {
+        let row = |snap: &str, file: &str| SnapshotFile {
+            table_id: "t".to_string(),
+            snapshot_id: snap.to_string(),
+            file_path: file.to_string(),
+            row_count: 1,
+            file_size_bytes: 100,
+            min_sequence: 1,
+            max_sequence: 1,
+        };
+        let all_rows = vec![
+            // current snapshot owns one file...
+            row("current", "c0.vortex"),
+            // ...and references a file that physically lives in old1's dir.
+            row("current", "old1_baked.vortex"),
+            // protected snapshot owns a file.
+            row("protected", "p0.vortex"),
+            // old1 (already retired) still has a stale manifest row of its own.
+            row("old1", "old1_dead.vortex"),
+        ];
+        let live: HashSet<String> = ["current".to_string(), "protected".to_string()]
+            .into_iter()
+            .collect();
+
+        let referenced = CayenneTableProvider::live_referenced_relative_paths(&all_rows, &live);
+
+        assert!(referenced.contains("current/c0.vortex"));
+        assert!(referenced.contains("protected/p0.vortex"));
+        assert!(
+            referenced.contains("current/old1_baked.vortex"),
+            "an in-place reference is keyed by the REFERENCING snapshot's id"
+        );
+        assert!(
+            !referenced.contains("old1/old1_dead.vortex"),
+            "a retired snapshot's own rows must not keep its files alive"
+        );
+        assert_eq!(referenced.len(), 3);
+    }
+
+    /// Phase 4: `get_all_snapshot_files` returns every manifest row for a table
+    /// across all snapshots (the GC ref-count source), unlike
+    /// `get_snapshot_files` which is scoped to one snapshot.
+    #[tokio::test]
+    async fn get_all_snapshot_files_spans_snapshots() {
+        let ctx = SessionContext::new();
+        let (provider, _tmp) =
+            create_int64_pk_provider("gc_all_manifest_rows", ctx.runtime_env()).await;
+        let table_id = provider.table_metadata.table_id.clone();
+
+        let mk = |snap: &str, file: &str| SnapshotFile {
+            table_id: table_id.clone(),
+            snapshot_id: snap.to_string(),
+            file_path: file.to_string(),
+            row_count: 1,
+            file_size_bytes: 100,
+            min_sequence: 1,
+            max_sequence: 1,
+        };
+        for row in [
+            mk("snapA", "a0.vortex"),
+            mk("snapA", "a1.vortex"),
+            mk("snapB", "b0.vortex"),
+        ] {
+            provider
+                .catalog
+                .upsert_snapshot_file(&row)
+                .await
+                .expect("upsert manifest row");
+        }
+
+        let all = provider
+            .catalog
+            .get_all_snapshot_files(&table_id)
+            .await
+            .expect("get_all_snapshot_files");
+        assert_eq!(all.len(), 3, "all rows across both snapshots are returned");
+
+        // A different table id must see none of these rows.
+        let other = provider
+            .catalog
+            .get_all_snapshot_files("some-other-table")
+            .await
+            .expect("get_all_snapshot_files (other table)");
+        assert!(
+            other.is_empty(),
+            "rows are scoped to the requested table id"
+        );
+    }
+
+    /// Phase 4: ref-counted retired-dir deletion keeps a data file that a live
+    /// snapshot references in place (even when an identically-named file in a
+    /// LIVE dir exists), deletes the genuinely orphaned files, and reports the
+    /// dir as NOT fully removed while a referenced file survives.
+    #[test]
+    fn delete_retired_snapshot_dir_refcounted_keeps_referenced_files() {
+        let tmp = TempDir::new().expect("temp dir");
+        let table_root = tmp.path().join("table-id");
+        let retired_dir = table_root.join("retired-snap");
+        std::fs::create_dir_all(&retired_dir).expect("create retired dir");
+
+        // Two data files in the retired dir, a non-data sidecar, and a hidden file.
+        std::fs::write(retired_dir.join("kept.vortex"), b"x").expect("write kept");
+        std::fs::write(retired_dir.join("orphan.vortex"), b"x").expect("write orphan");
+        std::fs::write(retired_dir.join("notes.txt"), b"x").expect("write sidecar");
+        std::fs::write(retired_dir.join(".hidden"), b"x").expect("write hidden");
+
+        // A LIVE snapshot references `retired-snap/kept.vortex` in place. It does
+        // NOT reference `retired-snap/orphan.vortex`. Note `kept.vortex` as a
+        // bare name is ambiguous; only the snapshot-scoped relative path is.
+        let referenced: HashSet<String> = ["retired-snap/kept.vortex".to_string()]
+            .into_iter()
+            .collect();
+
+        let fully_removed = CayenneTableProvider::delete_retired_snapshot_dir_refcounted(
+            &retired_dir,
+            "retired-snap",
+            &referenced,
+        )
+        .expect("refcounted delete");
+
+        assert!(
+            !fully_removed,
+            "dir is kept while a referenced file (and the non-data sidecar) survive"
+        );
+        assert!(
+            retired_dir.join("kept.vortex").exists(),
+            "a file referenced in place by a live snapshot must survive"
+        );
+        assert!(
+            !retired_dir.join("orphan.vortex").exists(),
+            "an unreferenced data file must be deleted"
+        );
+        assert!(
+            retired_dir.join("notes.txt").exists(),
+            "a non-data sidecar is conservatively kept (never a manifest target)"
+        );
+    }
+
+    /// Phase 4: when NO file in the retired dir is referenced, every data file
+    /// is deleted and the (now-empty) dir is removed, reported as fully removed.
+    #[test]
+    fn delete_retired_snapshot_dir_refcounted_removes_fully_orphaned_dir() {
+        let tmp = TempDir::new().expect("temp dir");
+        let table_root = tmp.path().join("table-id");
+        let retired_dir = table_root.join("dead-snap");
+        std::fs::create_dir_all(&retired_dir).expect("create retired dir");
+        std::fs::write(retired_dir.join("a.vortex"), b"x").expect("write a");
+        std::fs::write(retired_dir.join("b.vortex"), b"x").expect("write b");
+
+        // The live set references a same-named file but under a DIFFERENT
+        // snapshot id, so nothing in `dead-snap` is protected.
+        let referenced: HashSet<String> = ["other-snap/a.vortex".to_string()].into_iter().collect();
+
+        let fully_removed = CayenneTableProvider::delete_retired_snapshot_dir_refcounted(
+            &retired_dir,
+            "dead-snap",
+            &referenced,
+        )
+        .expect("refcounted delete");
+
+        assert!(fully_removed, "a fully-orphaned dir is removed");
+        assert!(
+            !retired_dir.exists(),
+            "the empty dir itself is removed once all data files are gone"
+        );
+    }
+
+    /// Phase 4: a missing (already-reaped) retired dir is reported as fully
+    /// removed rather than erroring — the sweep is idempotent across retries.
+    #[test]
+    fn delete_retired_snapshot_dir_refcounted_missing_dir_is_ok() {
+        let tmp = TempDir::new().expect("temp dir");
+        let missing = tmp.path().join("table-id").join("never-existed");
+        let fully_removed = CayenneTableProvider::delete_retired_snapshot_dir_refcounted(
+            &missing,
+            "never-existed",
+            &HashSet::new(),
+        )
+        .expect("missing dir is not an error");
+        assert!(fully_removed, "a NotFound dir counts as fully removed");
+    }
+
     /// Helper to read all data from a `CayenneTableProvider` as `RecordBatch`es.
     async fn read_all(
         ctx: &SessionContext,
@@ -23553,6 +27015,277 @@ mod tests {
         );
     }
 
+    // ----------------------------------------------------------------------
+    // Manifest snapshot model (phase 1b/1c): `cayenne_snapshot_file` must be
+    // the COMPLETE per-snapshot data-file set, equal to the directory listing.
+    // ----------------------------------------------------------------------
+
+    /// Sorted snapshot-relative file names persisted in the manifest for a
+    /// snapshot.
+    async fn manifest_file_names(
+        catalog: &Arc<dyn MetadataCatalog>,
+        table_id: &str,
+        snapshot_id: &str,
+    ) -> Vec<String> {
+        let mut names: Vec<String> = catalog
+            .get_snapshot_files(table_id, snapshot_id)
+            .await
+            .expect("read snapshot manifest")
+            .into_iter()
+            .map(|f| f.file_path)
+            .collect();
+        names.sort_unstable();
+        names
+    }
+
+    /// Sorted snapshot-relative file names actually present in the snapshot
+    /// directory (the authoritative file set the scan reads today).
+    async fn listing_file_names(provider: &CayenneTableProvider, snapshot_id: &str) -> Vec<String> {
+        let mut names: Vec<String> = provider
+            .list_snapshot_files_with_sizes(snapshot_id)
+            .await
+            .expect("list snapshot files")
+            .into_iter()
+            .map(|(name, _size)| name)
+            .collect();
+        names.sort_unstable();
+        names
+    }
+
+    /// Build an append-only (no PK, no on-conflict) `id`/`value` table whose
+    /// inserts accumulate Vortex files into the CURRENT snapshot directory —
+    /// the shape that exercises the append-path manifest rebuild for the
+    /// current snapshot (CDC-upsert tables instead publish protected snapshots).
+    async fn create_append_only_table(
+        table_name: &str,
+        runtime_env: Arc<RuntimeEnv>,
+    ) -> (CayenneTableProvider, Arc<dyn MetadataCatalog>, TempDir) {
+        use arrow::datatypes::{DataType, Field, Schema};
+
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let metadata_dir = format!("{}/metadata", temp_dir.path().to_str().expect("str path"));
+        let data_dir = format!("{}/data", temp_dir.path().to_str().expect("str path"));
+        std::fs::create_dir_all(&metadata_dir).expect("metadata dir created");
+        let connection_string = format!("sqlite://{metadata_dir}/cayenne.db");
+        let catalog = Arc::new(CayenneCatalog::new(connection_string).expect("catalog created"))
+            as Arc<dyn MetadataCatalog>;
+        catalog.init().await.expect("catalog initialized");
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("value", DataType::Int64, false),
+        ]));
+        let options = CreateTableOptions {
+            table_name: table_name.to_string(),
+            schema,
+            primary_key: vec![],
+            on_conflict: None,
+            base_path: data_dir,
+            partition_column: None,
+            // Disable inlining so each insert materializes a Vortex file in the
+            // current snapshot dir rather than being absorbed into the metastore.
+            vortex_config: VortexConfig {
+                inline_max_rows: 0,
+                inline_max_bytes: 0,
+                inline_max_buffer_bytes: 0,
+                ..VortexConfig::default()
+            },
+        };
+        let provider = CayenneTableProviderBuilder::new(Arc::clone(&catalog), runtime_env)
+            .create(options)
+            .await
+            .expect("table created");
+        (provider, catalog, temp_dir)
+    }
+
+    /// Phase 1b: after appends (which materialize Vortex files in the current
+    /// snapshot dir) plus the coalesced post-write maintenance pass, the
+    /// manifest for the current snapshot must equal the directory listing —
+    /// complete, and with no spurious entries. Sizes recorded must match the
+    /// on-disk sizes.
+    #[tokio::test]
+    async fn manifest_matches_listing_after_append() {
+        let ctx = SessionContext::new();
+        let (provider, catalog, _tmp) =
+            create_append_only_table("manifest_append", ctx.runtime_env()).await;
+        let schema = Arc::clone(&provider.table_metadata.schema);
+        let table_id = provider.table_metadata.table_id.clone();
+
+        // Two appends so the current snapshot accumulates more than one file.
+        insert_batch(
+            &provider,
+            id_value_batch_for_range(Arc::clone(&schema), 0, 64),
+        )
+        .await;
+        insert_batch(
+            &provider,
+            id_value_batch_for_range(Arc::clone(&schema), 64, 64),
+        )
+        .await;
+        // Drain the debounced maintenance lane so the manifest rebuild runs
+        // synchronously (the rebuild is scheduled by the append, not inline).
+        provider
+            .flush_pending_maintenance()
+            .await
+            .expect("drain post-write maintenance");
+
+        let snapshot = provider.get_current_snapshot_id();
+        let listing = provider
+            .list_snapshot_files_with_sizes(&snapshot)
+            .await
+            .expect("listing");
+        assert!(
+            !listing.is_empty(),
+            "fixture must materialize at least one Vortex file in the current snapshot \
+             (inlining disabled, append-only)"
+        );
+
+        assert_eq!(
+            manifest_file_names(&catalog, &table_id, &snapshot).await,
+            listing_file_names(&provider, &snapshot).await,
+            "manifest file set must equal the directory listing for the current snapshot"
+        );
+
+        // Recorded sizes must match the on-disk sizes the listing reports.
+        let manifest: std::collections::HashMap<String, i64> = catalog
+            .get_snapshot_files(&table_id, &snapshot)
+            .await
+            .expect("manifest rows")
+            .into_iter()
+            .map(|f| (f.file_path, f.file_size_bytes))
+            .collect();
+        for (name, size) in &listing {
+            assert_eq!(
+                manifest.get(name).copied(),
+                Some(i64::try_from(*size).expect("size fits i64")),
+                "manifest file_size_bytes must match the on-disk size for {name}"
+            );
+        }
+    }
+
+    /// Phase 1c: after a full-rewrite compaction into a fresh snapshot, the
+    /// manifest must (a) equal the new snapshot's directory listing and (b)
+    /// hold rows for NO other snapshot (the prune GC'd the old one).
+    #[tokio::test]
+    async fn manifest_matches_listing_after_compaction() {
+        let ctx = SessionContext::new();
+        let (provider, catalog, _tmp) =
+            create_cdc_upsert_table("manifest_compaction", ctx.runtime_env()).await;
+        let schema = Arc::clone(&provider.table_metadata.schema);
+        let table_id = provider.table_metadata.table_id.clone();
+
+        insert_batch(
+            &provider,
+            id_value_batch_for_range(Arc::clone(&schema), 0, 64),
+        )
+        .await;
+        provider
+            .flush_pending_maintenance()
+            .await
+            .expect("drain post-write maintenance after seed insert");
+
+        let pre_compaction_snapshot = provider.get_current_snapshot_id();
+        // The upsert seed insert published a protected snapshot holding the
+        // actual data files; capture its id (and assert it has manifest rows)
+        // so we can prove the post-compaction prune dropped it.
+        let protected_before: Vec<String> = provider
+            .protected_snapshots
+            .load()
+            .keys()
+            .cloned()
+            .collect();
+        assert!(
+            !protected_before.is_empty(),
+            "an upsert seed insert must publish at least one protected snapshot"
+        );
+        for protected in &protected_before {
+            assert!(
+                !catalog
+                    .get_snapshot_files(&table_id, protected)
+                    .await
+                    .expect("read protected manifest")
+                    .is_empty(),
+                "the append maintenance pass must populate each protected snapshot's manifest"
+            );
+        }
+
+        provider
+            .rewrite_current_snapshot_for_compaction_tracked()
+            .await
+            .expect("compaction full rewrite into a fresh current snapshot");
+
+        let snapshot = provider.get_current_snapshot_id();
+        assert_ne!(
+            snapshot, pre_compaction_snapshot,
+            "compaction must mint a fresh current snapshot"
+        );
+
+        assert_eq!(
+            manifest_file_names(&catalog, &table_id, &snapshot).await,
+            listing_file_names(&provider, &snapshot).await,
+            "manifest must equal the listing for the post-compaction snapshot"
+        );
+
+        // Every pre-compaction snapshot (the old empty current + the protected
+        // data snapshots) must be GC'd from the manifest by the prune-to-current.
+        for stale in std::iter::once(pre_compaction_snapshot).chain(protected_before) {
+            assert!(
+                catalog
+                    .get_snapshot_files(&table_id, &stale)
+                    .await
+                    .expect("read stale manifest")
+                    .is_empty(),
+                "pre-compaction snapshot {stale} manifest rows must be pruned after commit"
+            );
+        }
+    }
+
+    /// Dropping a table must clear its manifest rows (`clear_snapshot_files`
+    /// path, wired into `drop_table`).
+    #[tokio::test]
+    async fn drop_table_clears_snapshot_manifest() {
+        let ctx = SessionContext::new();
+        let (provider, catalog, _tmp) =
+            create_append_only_table("manifest_drop", ctx.runtime_env()).await;
+        let schema = Arc::clone(&provider.table_metadata.schema);
+        let table_id = provider.table_metadata.table_id.clone();
+        let table_name = provider.table_metadata.table_name.clone();
+
+        insert_batch(
+            &provider,
+            id_value_batch_for_range(Arc::clone(&schema), 0, 32),
+        )
+        .await;
+        provider
+            .flush_pending_maintenance()
+            .await
+            .expect("drain post-write maintenance");
+
+        let snapshot = provider.get_current_snapshot_id();
+        assert!(
+            !catalog
+                .get_snapshot_files(&table_id, &snapshot)
+                .await
+                .expect("manifest populated")
+                .is_empty(),
+            "precondition: manifest must be populated before drop"
+        );
+
+        assert!(
+            catalog.drop_table(&table_name).await.expect("drop table"),
+            "drop_table must report the table existed"
+        );
+
+        assert!(
+            catalog
+                .get_snapshot_files(&table_id, &snapshot)
+                .await
+                .expect("read manifest after drop")
+                .is_empty(),
+            "drop_table must clear the snapshot manifest"
+        );
+    }
+
     /// Regression: every protected snapshot's in-memory deletion threshold must
     /// equal its persisted `cayenne_snapshot_sequence` value. The partial
     /// deletion filter applies deletions with `delete_seq > threshold`, and on
@@ -24374,11 +28107,15 @@ mod tests {
 
         let protected: HashSet<String> = HashSet::new();
 
+        // Legacy / unpopulated-manifest mode: whole-dir delete (the historical
+        // behavior). Ref-counted file-by-file deletion is covered separately.
         CayenneTableProvider::cleanup_old_snapshots_blocking(
             table_path,
             &table_id,
             &current_snapshot,
             &protected,
+            false,
+            &HashSet::new(),
         )
         .expect("cleanup should succeed");
 

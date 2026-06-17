@@ -25,13 +25,13 @@ use vortex::expr::Expression;
 use vortex::expr::and_collect;
 use vortex::expr::cast;
 use vortex::expr::get_item;
-use vortex::expr::is_null;
 use vortex::expr::list_contains;
 use vortex::expr::lit;
 use vortex::expr::not;
 use vortex::expr::pack;
 use vortex::expr::root;
 use vortex::expr::zip_expr;
+use vortex::expr::{is_not_null, is_null};
 use vortex::scalar::Scalar;
 use vortex::scalar_fn::ScalarFnVTableExt;
 use vortex::scalar_fn::fns::binary::Binary;
@@ -251,7 +251,10 @@ impl ExpressionConvertor for DefaultExpressionConvertor {
 
         if let Some(is_not_null_expr) = df.as_any().downcast_ref::<df_expr::IsNotNullExpr>() {
             let arg = self.convert(is_not_null_expr.arg().as_ref())?;
-            return Ok(not(is_null(arg)));
+            // Emit native is_not_null (not `not(is_null(...))`): the negation
+            // has no zone-map falsifier, but is_not_null does — this lights up
+            // the AllNull/AllNonNull pruning rules so IS NOT NULL can skip zones.
+            return Ok(is_not_null(arg));
         }
 
         if let Some(in_list) = df.as_any().downcast_ref::<df_expr::InListExpr>() {
