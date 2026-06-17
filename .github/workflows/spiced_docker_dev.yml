@@ -55,8 +55,7 @@ jobs:
       - name: Set target architectures
         id: set_targets
         run: |
-          # On scheduled runs `inputs.*` are empty; default to a full multi-arch build.
-          target="${{ inputs.target || 'amd64' }}"
+          target="${{ inputs.target }}"
           case "$target" in
             all)
               echo "run_amd64=true" >> $GITHUB_OUTPUT
@@ -128,7 +127,7 @@ jobs:
 
       - name: Set cargo features
         run: |
-          variant="${{ inputs.variant || 'default' }}"
+          variant="${{ inputs.variant }}"
           if [ "$variant" = "models" ]; then
             echo "CARGO_FEATURES=release,models,spicebench" >> $GITHUB_ENV
           else
@@ -196,7 +195,7 @@ jobs:
 
       - name: Set cargo features
         run: |
-          variant="${{ inputs.variant || 'default' }}"
+          variant="${{ inputs.variant }}"
           if [ "$variant" = "models" ]; then
             echo "CARGO_FEATURES=release,models,spicebench" >> $GITHUB_ENV
           else
@@ -269,8 +268,7 @@ jobs:
 
       - name: Import images and create manifest
         env:
-          # On scheduled runs `inputs.tag` is empty; publish the daily build as `latest`.
-          IMAGE_TAG: ${{ inputs.tag || 'latest' }}
+          IMAGE_TAG: ${{ inputs.tag }}
           REL_VERSION: ${{ needs.setup.outputs.rel_version }}
           RUN_AMD64: ${{ needs.setup.outputs.run_amd64 }}
           RUN_ARM64: ${{ needs.setup.outputs.run_arm64 }}
@@ -310,7 +308,7 @@ jobs:
 
       - name: Summary
         env:
-          IMAGE_TAG: ${{ inputs.tag || 'latest' }}
+          IMAGE_TAG: ${{ inputs.tag }}
           REL_VERSION: ${{ needs.setup.outputs.rel_version }}
         run: |
           echo "## 🐳 Dev Docker Image Published" >> $GITHUB_STEP_SUMMARY
