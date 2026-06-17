@@ -20718,6 +20718,9 @@ dependencies = [
 [[package]]
 name = "turso-shared"
 version = "2.1.0-unstable"
+dependencies = [
+ "rand 0.10.1",
+]
 
 [[package]]
 name = "turso_core"
