@@ -273,6 +273,20 @@ pub enum DataConnectorError {
         message: String,
     },
 
+    // Unlike the InvalidConfiguration* variants, this is a transient (retriable)
+    // condition: an object-store source has no data files at the path yet. Object
+    // stores are eventually consistent and data is frequently written after the
+    // runtime starts, so the dataset load must keep retrying until the files
+    // appear rather than failing permanently. See `is_retriable`.
+    #[snafu(display(
+        "No data files are yet available for the {connector_component} ({dataconnector}). {message} The runtime will keep retrying until the source data becomes available."
+    ))]
+    ObjectStoreNoFilesAvailable {
+        dataconnector: String,
+        connector_component: ConnectorComponent,
+        message: String,
+    },
+
     #[snafu(display(
         "Cannot setup the {connector_component} ({dataconnector}). The connector '{dataconnector}' is not a valid connector. For details, visit: https://spiceai.org/docs/components/data-connectors"
     ))]
