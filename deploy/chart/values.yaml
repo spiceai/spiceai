@@ -3,7 +3,7 @@ additionalLabels: {}
 
 image:
   repository: spiceai/spiceai
-  tag: 2.0.0
+  tag: 2.0.1
 replicaCount: 1
 
 service:
