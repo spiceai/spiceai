@@ -198,7 +198,7 @@ dyn-hash = "1.0.0"
 fundu = "2.0.1"
 futures = "0.3.32"
 gethostname = "1.1.0"
-git2 = { version = "0.20", default-features = false, features = [
+git2 = { version = "0.21", default-features = false, features = [
     "https",
     "ssh",
 ] }
