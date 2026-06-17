@@ -26,7 +26,7 @@
 use std::sync::Arc;
 
 use datafusion_common::{Result, tree_node::Transformed};
-use datafusion_expr::LogicalPlan;
+use datafusion_expr::{JoinType, LogicalPlan};
 
 use datafusion::optimizer::{OptimizerConfig, OptimizerRule};
 
@@ -92,11 +92,29 @@ impl OptimizerRule for ReorderJoinRule {
             // (`simplify_expressions: No field named …`) — failing the query.
             // If the output doesn't validate, skip the reorder rather than
             // break the query.
-            Ok(after) if join_keys_resolve(&after) => Ok(Transformed::yes(after)),
+            //
+            // Also reject a reorder that *introduces* a cross/theta join (an
+            // Inner `Join` with empty `on`). The enumerator only sees equi-edges,
+            // so a relation linked to the rest solely by a non-equi predicate
+            // (e.g. chbench q7's `(n1='JAPAN' AND n2='CHINA') OR (…)`) gets
+            // stranded: the rebuild connects it with an empty-`on` Inner join and
+            // the predicate becomes a `NestedLoopJoinExec` filter. If the reorder
+            // happens to place that nested loop over large inputs, the query can
+            // blow up to a near-cartesian and never finish. DataFusion's native
+            // (un-reordered) plan keeps such relations adjacent and applies the
+            // predicate as a residual `Filter` on an equi-join, so falling back
+            // to it is strictly safer here.
+            Ok(after)
+                if join_keys_resolve(&after)
+                    && count_inner_cross_joins(&after)
+                        <= count_inner_cross_joins(&before) =>
+            {
+                Ok(Transformed::yes(after))
+            }
             Ok(_) => {
                 tracing::debug!(
                     target: "reorder_join",
-                    "skipping join reorder: reordered plan has unresolved join keys (plan left unchanged)"
+                    "skipping join reorder: reordered plan has unresolved join keys or an introduced cross/theta join (plan left unchanged)"
                 );
                 Ok(Transformed::no(before))
             }
@@ -134,4 +152,26 @@ fn join_keys_resolve(plan: &LogicalPlan) -> bool {
         }
     }
     plan.inputs().iter().all(|input| join_keys_resolve(input))
+}
+
+/// Counts Inner `Join` nodes with an empty `on` clause (cross/theta joins) in
+/// `plan`. The reorder is rejected when it produces *more* of these than the
+/// input had, i.e. when reordering stranded a relation that was only linked by a
+/// non-equi predicate and had to be reconnected with a cross join (which a
+/// downstream pass turns into a `NestedLoopJoinExec`). See the call site for why
+/// that can make a query never finish.
+fn count_inner_cross_joins(plan: &LogicalPlan) -> usize {
+    let here = match plan {
+        LogicalPlan::Join(join)
+            if join.join_type == JoinType::Inner && join.on.is_empty() =>
+        {
+            1
+        }
+        _ => 0,
+    };
+    here + plan
+        .inputs()
+        .iter()
+        .map(|input| count_inner_cross_joins(input))
+        .sum::<usize>()
 }

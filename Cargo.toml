@@ -385,41 +385,41 @@ lto = "off"
 
 [patch.crates-io]
 # DataFusion 53.1.0 fork: UDTF cache-correctness (#98), BigQuery FLOAT64 unparser, vortex-shuffle
-datafusion = { git = "https://github.com/spiceai/datafusion.git", rev = "c4aac4332f3d9f839a17c6c8fa28ac0257e054ba" }
-datafusion-catalog = { git = "https://github.com/spiceai/datafusion.git", rev = "c4aac4332f3d9f839a17c6c8fa28ac0257e054ba" }
-datafusion-catalog-listing = { git = "https://github.com/spiceai/datafusion.git", rev = "c4aac4332f3d9f839a17c6c8fa28ac0257e054ba" }
-datafusion-common = { git = "https://github.com/spiceai/datafusion.git", rev = "c4aac4332f3d9f839a17c6c8fa28ac0257e054ba" }
-datafusion-common-runtime = { git = "https://github.com/spiceai/datafusion.git", rev = "c4aac4332f3d9f839a17c6c8fa28ac0257e054ba" }
-datafusion-datasource = { git = "https://github.com/spiceai/datafusion.git", rev = "c4aac4332f3d9f839a17c6c8fa28ac0257e054ba" }
-datafusion-datasource-arrow = { git = "https://github.com/spiceai/datafusion.git", rev = "c4aac4332f3d9f839a17c6c8fa28ac0257e054ba" }
-datafusion-datasource-csv = { git = "https://github.com/spiceai/datafusion.git", rev = "c4aac4332f3d9f839a17c6c8fa28ac0257e054ba" }
-datafusion-datasource-json = { git = "https://github.com/spiceai/datafusion.git", rev = "c4aac4332f3d9f839a17c6c8fa28ac0257e054ba" }
-datafusion-datasource-parquet = { git = "https://github.com/spiceai/datafusion.git", rev = "c4aac4332f3d9f839a17c6c8fa28ac0257e054ba" }
-datafusion-doc = { git = "https://github.com/spiceai/datafusion.git", rev = "c4aac4332f3d9f839a17c6c8fa28ac0257e054ba" }
-datafusion-execution = { git = "https://github.com/spiceai/datafusion.git", rev = "c4aac4332f3d9f839a17c6c8fa28ac0257e054ba" }
-datafusion-expr = { git = "https://github.com/spiceai/datafusion.git", rev = "c4aac4332f3d9f839a17c6c8fa28ac0257e054ba" }
-datafusion-expr-common = { git = "https://github.com/spiceai/datafusion.git", rev = "c4aac4332f3d9f839a17c6c8fa28ac0257e054ba" }
-datafusion-functions = { git = "https://github.com/spiceai/datafusion.git", rev = "c4aac4332f3d9f839a17c6c8fa28ac0257e054ba" }
-datafusion-functions-aggregate = { git = "https://github.com/spiceai/datafusion.git", rev = "c4aac4332f3d9f839a17c6c8fa28ac0257e054ba" }
-datafusion-functions-aggregate-common = { git = "https://github.com/spiceai/datafusion.git", rev = "c4aac4332f3d9f839a17c6c8fa28ac0257e054ba" }
-datafusion-functions-nested = { git = "https://github.com/spiceai/datafusion.git", rev = "c4aac4332f3d9f839a17c6c8fa28ac0257e054ba" }
-datafusion-functions-table = { git = "https://github.com/spiceai/datafusion.git", rev = "c4aac4332f3d9f839a17c6c8fa28ac0257e054ba" }
-datafusion-functions-window = { git = "https://github.com/spiceai/datafusion.git", rev = "c4aac4332f3d9f839a17c6c8fa28ac0257e054ba" }
-datafusion-functions-window-common = { git = "https://github.com/spiceai/datafusion.git", rev = "c4aac4332f3d9f839a17c6c8fa28ac0257e054ba" }
-datafusion-macros = { git = "https://github.com/spiceai/datafusion.git", rev = "c4aac4332f3d9f839a17c6c8fa28ac0257e054ba" }
-datafusion-optimizer = { git = "https://github.com/spiceai/datafusion.git", rev = "c4aac4332f3d9f839a17c6c8fa28ac0257e054ba" }
-datafusion-physical-expr = { git = "https://github.com/spiceai/datafusion.git", rev = "c4aac4332f3d9f839a17c6c8fa28ac0257e054ba" }
-datafusion-physical-expr-adapter = { git = "https://github.com/spiceai/datafusion.git", rev = "c4aac4332f3d9f839a17c6c8fa28ac0257e054ba" }
-datafusion-physical-expr-common = { git = "https://github.com/spiceai/datafusion.git", rev = "c4aac4332f3d9f839a17c6c8fa28ac0257e054ba" }
-datafusion-physical-optimizer = { git = "https://github.com/spiceai/datafusion.git", rev = "c4aac4332f3d9f839a17c6c8fa28ac0257e054ba" }
-datafusion-physical-plan = { git = "https://github.com/spiceai/datafusion.git", rev = "c4aac4332f3d9f839a17c6c8fa28ac0257e054ba" }
-datafusion-proto = { git = "https://github.com/spiceai/datafusion.git", rev = "c4aac4332f3d9f839a17c6c8fa28ac0257e054ba" }
-datafusion-proto-common = { git = "https://github.com/spiceai/datafusion.git", rev = "c4aac4332f3d9f839a17c6c8fa28ac0257e054ba" }
-datafusion-pruning = { git = "https://github.com/spiceai/datafusion.git", rev = "c4aac4332f3d9f839a17c6c8fa28ac0257e054ba" }
-datafusion-session = { git = "https://github.com/spiceai/datafusion.git", rev = "c4aac4332f3d9f839a17c6c8fa28ac0257e054ba" }
-datafusion-spark = { git = "https://github.com/spiceai/datafusion.git", rev = "c4aac4332f3d9f839a17c6c8fa28ac0257e054ba" }
-datafusion-sql = { git = "https://github.com/spiceai/datafusion.git", rev = "c4aac4332f3d9f839a17c6c8fa28ac0257e054ba" }
-datafusion-substrait = { git = "https://github.com/spiceai/datafusion.git", rev = "c4aac4332f3d9f839a17c6c8fa28ac0257e054ba" }
+datafusion = { path = "/Users/sg/spice/other/datafusion/datafusion/core" }
+datafusion-catalog = { path = "/Users/sg/spice/other/datafusion/datafusion/catalog" }
+datafusion-catalog-listing = { path = "/Users/sg/spice/other/datafusion/datafusion/catalog-listing" }
+datafusion-common = { path = "/Users/sg/spice/other/datafusion/datafusion/common" }
+datafusion-common-runtime = { path = "/Users/sg/spice/other/datafusion/datafusion/common-runtime" }
+datafusion-datasource = { path = "/Users/sg/spice/other/datafusion/datafusion/datasource" }
+datafusion-datasource-arrow = { path = "/Users/sg/spice/other/datafusion/datafusion/datasource-arrow" }
+datafusion-datasource-csv = { path = "/Users/sg/spice/other/datafusion/datafusion/datasource-csv" }
+datafusion-datasource-json = { path = "/Users/sg/spice/other/datafusion/datafusion/datasource-json" }
+datafusion-datasource-parquet = { path = "/Users/sg/spice/other/datafusion/datafusion/datasource-parquet" }
+datafusion-doc = { path = "/Users/sg/spice/other/datafusion/datafusion/doc" }
+datafusion-execution = { path = "/Users/sg/spice/other/datafusion/datafusion/execution" }
+datafusion-expr = { path = "/Users/sg/spice/other/datafusion/datafusion/expr" }
+datafusion-expr-common = { path = "/Users/sg/spice/other/datafusion/datafusion/expr-common" }
+datafusion-functions = { path = "/Users/sg/spice/other/datafusion/datafusion/functions" }
+datafusion-functions-aggregate = { path = "/Users/sg/spice/other/datafusion/datafusion/functions-aggregate" }
+datafusion-functions-aggregate-common = { path = "/Users/sg/spice/other/datafusion/datafusion/functions-aggregate-common" }
+datafusion-functions-nested = { path = "/Users/sg/spice/other/datafusion/datafusion/functions-nested" }
+datafusion-functions-table = { path = "/Users/sg/spice/other/datafusion/datafusion/functions-table" }
+datafusion-functions-window = { path = "/Users/sg/spice/other/datafusion/datafusion/functions-window" }
+datafusion-functions-window-common = { path = "/Users/sg/spice/other/datafusion/datafusion/functions-window-common" }
+datafusion-macros = { path = "/Users/sg/spice/other/datafusion/datafusion/macros" }
+datafusion-optimizer = { path = "/Users/sg/spice/other/datafusion/datafusion/optimizer" }
+datafusion-physical-expr = { path = "/Users/sg/spice/other/datafusion/datafusion/physical-expr" }
+datafusion-physical-expr-adapter = { path = "/Users/sg/spice/other/datafusion/datafusion/physical-expr-adapter" }
+datafusion-physical-expr-common = { path = "/Users/sg/spice/other/datafusion/datafusion/physical-expr-common" }
+datafusion-physical-optimizer = { path = "/Users/sg/spice/other/datafusion/datafusion/physical-optimizer" }
+datafusion-physical-plan = { path = "/Users/sg/spice/other/datafusion/datafusion/physical-plan" }
+datafusion-proto = { path = "/Users/sg/spice/other/datafusion/datafusion/proto" }
+datafusion-proto-common = { path = "/Users/sg/spice/other/datafusion/datafusion/proto-common" }
+datafusion-pruning = { path = "/Users/sg/spice/other/datafusion/datafusion/pruning" }
+datafusion-session = { path = "/Users/sg/spice/other/datafusion/datafusion/session" }
+datafusion-spark = { path = "/Users/sg/spice/other/datafusion/datafusion/spark" }
+datafusion-sql = { path = "/Users/sg/spice/other/datafusion/datafusion/sql" }
+datafusion-substrait = { path = "/Users/sg/spice/other/datafusion/datafusion/substrait" }
 
 # Local vendored fork of `mysql-common-derive` (path: vendor/mysql-common-derive)
 # that drops the unmaintained `proc-macro-error2` dependency (RUSTSEC-2026-0173).

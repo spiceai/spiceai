@@ -89,7 +89,8 @@ use datafusion::physical_optimizer::PhysicalOptimizerRule;
 use datafusion::physical_optimizer::optimizer::PhysicalOptimizer;
 use datafusion_optimizer_rules::{
     logical_plan::{
-        CacheInvalidationExtensionPlanner, cache_invalidation::CacheInvalidationOptimizerRule,
+        CacheInvalidationExtensionPlanner, ReorderJoinRule,
+        cache_invalidation::CacheInvalidationOptimizerRule,
     },
     physical_plan::{
         EmptyHashJoinExecPhysicalOptimization, HttpParamsPushdown,
@@ -128,6 +129,7 @@ pub static DEFAULT_DATAFUSION_CONFIG: LazyLock<RwLock<SessionConfig>> = LazyLock
         .enable_ident_normalization = false;
 
     df_config.options_mut().optimizer.expand_views_at_output = true;
+    df_config.options_mut().explain.show_statistics = true;
     df_config.options_mut().sql_parser.dialect = datafusion::common::config::Dialect::PostgreSQL;
     df_config
         .options_mut()
@@ -164,6 +166,7 @@ struct CayenneLogicalOptimizerRules {
     cross_join_reassociation: bool,
     inlist_to_range: bool,
     semi_join_pushdown: bool,
+    join_reorder: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -220,6 +223,7 @@ impl CayenneOptimizerRules {
                 cross_join_reassociation: true,
                 inlist_to_range: false,
                 semi_join_pushdown: true,
+                join_reorder: true,
             },
             physical: CayennePhysicalOptimizerRules::auto_enabled(),
         }
@@ -233,6 +237,7 @@ impl CayenneOptimizerRules {
                 cross_join_reassociation: true,
                 inlist_to_range: true,
                 semi_join_pushdown: true,
+                join_reorder: true,
             },
             physical: CayennePhysicalOptimizerRules::all_enabled(),
         }
@@ -246,6 +251,7 @@ impl CayenneOptimizerRules {
                 cross_join_reassociation: false,
                 inlist_to_range: false,
                 semi_join_pushdown: false,
+                join_reorder: false,
             },
             physical: CayennePhysicalOptimizerRules::none(),
         }
@@ -285,6 +291,15 @@ impl CayenneOptimizerRules {
 
     pub fn set_semi_join_pushdown(&mut self, enabled: bool) {
         self.logical.semi_join_pushdown = enabled;
+    }
+
+    #[must_use]
+    pub const fn join_reorder(self) -> bool {
+        self.logical.join_reorder
+    }
+
+    pub fn set_join_reorder(&mut self, enabled: bool) {
+        self.logical.join_reorder = enabled;
     }
 
     #[must_use]
@@ -1021,6 +1036,9 @@ fn with_cayenne_logical_optimizers(
     if cayenne_optimizer_rules.semi_join_pushdown() {
         insert_cayenne_push_down_semi_join(&mut optimizer_rules);
     }
+    if cayenne_optimizer_rules.join_reorder() {
+        insert_cayenne_join_reorder_rule(&mut optimizer_rules);
+    }
     optimizer_rules.extend(trailing_rules);
     state.with_optimizer_rules(optimizer_rules)
 }
@@ -1136,6 +1154,33 @@ fn insert_cayenne_push_down_semi_join(rules: &mut Vec<Arc<dyn OptimizerRule + Se
                 is_cayenne_accelerated_table_provider,
             )),
         );
+    }
+}
+
+#[cfg(not(windows))]
+fn insert_cayenne_join_reorder_rule(rules: &mut Vec<Arc<dyn OptimizerRule + Send + Sync>>) {
+    // Cost-based left-deep join reordering (IK84). Run *after* the inner-join
+    // graph is fully formed — equi-predicates extracted and cross joins
+    // reassociated into a contiguous Inner-join chain — but *before* projection
+    // pushdown (`optimize_projections`) inserts intervening Projections that
+    // fragment the graph into opaque leaves. The rule is best-effort: it reads
+    // table statistics via `TableProvider::statistics()` (which Cayenne
+    // accelerated providers implement) and silently leaves the plan unchanged
+    // when stats are unavailable, so it never fails a query.
+    if !rules.iter().any(|rule| rule.name() == "reorder_join") {
+        let insert_at = rules
+            .iter()
+            .position(|rule| rule.name() == "cayenne_reassociate_cross_join")
+            .map(|position| position + 1)
+            .or_else(|| {
+                rules
+                    .iter()
+                    .position(|rule| rule.name() == "eliminate_cross_join")
+                    .map(|position| position + 1)
+            })
+            .or_else(|| rules.iter().position(|rule| rule.name() == "push_down_filter"))
+            .unwrap_or(rules.len());
+        rules.insert(insert_at, Arc::new(ReorderJoinRule::default()));
     }
 }
 
@@ -1875,6 +1920,8 @@ mod tests {
         inlist_to_range.set_inlist_to_range(true);
         let mut semi_join_pushdown = CayenneOptimizerRules::none();
         semi_join_pushdown.set_semi_join_pushdown(true);
+        let mut join_reorder = CayenneOptimizerRules::none();
+        join_reorder.set_join_reorder(true);
         let mut dynamic_filter_sharing = CayenneOptimizerRules::none();
         dynamic_filter_sharing.set_dynamic_filter_sharing(true);
         let mut maintained_aggregate = CayenneOptimizerRules::none();
@@ -1905,6 +1952,7 @@ mod tests {
                 vec!["cayenne_push_down_semi_join"],
                 vec![],
             ),
+            (join_reorder, vec!["reorder_join"], vec![]),
             (
                 dynamic_filter_sharing,
                 vec![],
