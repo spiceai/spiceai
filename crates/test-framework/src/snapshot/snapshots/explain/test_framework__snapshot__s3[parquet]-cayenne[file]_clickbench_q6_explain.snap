@@ -17,7 +17,7 @@ description: "Query: clickbench_q6"
 |               |           RepartitionExec: partitioning=Hash([alias1@0], 16), input_partitions=16                                      |
 |               |             AggregateExec: mode=Partial, gby=[SearchPhrase@0 as alias1], aggr=[]                                       |
 |               |               SchemaCastScanExec                                                                                       |
-|               |                 CayenneAccelerationExec                                                                                |
+|               |                 CayenneAccelerationExec: snapshots_scanned=1, files_scanned=81                                         |
 |               |                   BytesProcessedExec                                                                                   |
 |               |                     DataSourceExec: file_groups={16 groups: [<redacted>]}, projection=[SearchPhrase], file_type=vortex |
 |               |                                                                                                                        |

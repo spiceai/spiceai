@@ -16,7 +16,7 @@ description: "Query: clickbench_q21"
 |               |       AggregateExec: mode=Partial, gby=[], aggr=[count(Int64(1))]                                                                          |
 |               |         ProjectionExec: expr=[]                                                                                                            |
 |               |           SchemaCastScanExec                                                                                                               |
-|               |             CayenneAccelerationExec                                                                                                        |
+|               |             CayenneAccelerationExec: snapshots_scanned=1, files_scanned=81                                                                 |
 |               |               BytesProcessedExec                                                                                                           |
 |               |                 DataSourceExec: file_groups={16 groups: [<redacted>]}, projection=[URL], file_type=vortex, predicate: URL@13 LIKE %google% |
 |               |                                                                                                                                            |

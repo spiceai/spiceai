@@ -14,19 +14,18 @@ description: "Query: clickbench_q21"
 |               |   AggregateExec: mode=Final, gby=[], aggr=[count(Int64(1))]                                     |
 |               |     CoalescePartitionsExec                                                                      |
 |               |       AggregateExec: mode=Partial, gby=[], aggr=[count(Int64(1))]                               |
-|               |         ProjectionExec: expr=[]                                                                 |
-|               |           FilterExec: URL@0 LIKE %google%                                                       |
-|               |             SchemaCastScanExec                                                                  |
-|               |               PartitionedUnionExec                                                              |
-|               |                 BytesProcessedExec                                                              |
-|               |                   DataSourceExec: partitions=16, partition_sizes=[<redacted>]                   |
-|               |                 BytesProcessedExec                                                              |
-|               |                   DataSourceExec: partitions=16, partition_sizes=[<redacted>]                   |
-|               |                 BytesProcessedExec                                                              |
-|               |                   DataSourceExec: partitions=16, partition_sizes=[<redacted>]                   |
-|               |                 BytesProcessedExec                                                              |
-|               |                   DataSourceExec: partitions=16, partition_sizes=[<redacted>]                   |
-|               |                 BytesProcessedExec                                                              |
-|               |                   DataSourceExec: partitions=16, partition_sizes=[<redacted>]                   |
+|               |         FilterExec: URL@0 LIKE %google%, projection=[]                                          |
+|               |           SchemaCastScanExec                                                                    |
+|               |             PartitionedUnionExec                                                                |
+|               |               BytesProcessedExec                                                                |
+|               |                 DataSourceExec: partitions=16, partition_sizes=[<redacted>]                     |
+|               |               BytesProcessedExec                                                                |
+|               |                 DataSourceExec: partitions=16, partition_sizes=[<redacted>]                     |
+|               |               BytesProcessedExec                                                                |
+|               |                 DataSourceExec: partitions=16, partition_sizes=[<redacted>]                     |
+|               |               BytesProcessedExec                                                                |
+|               |                 DataSourceExec: partitions=16, partition_sizes=[<redacted>]                     |
+|               |               BytesProcessedExec                                                                |
+|               |                 DataSourceExec: partitions=16, partition_sizes=[<redacted>]                     |
 |               |                                                                                                 |
 +---------------+-------------------------------------------------------------------------------------------------+
