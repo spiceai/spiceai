@@ -330,17 +330,15 @@ impl LogicalExtensionCodec for SpiceLogicalCodec {
         node: Arc<dyn TableProvider>,
         buf: &mut Vec<u8>,
     ) -> Result<()> {
-        let any = node.as_any();
-
         // Check for ListUDFTable
-        if any.downcast_ref::<ListUDFTable>().is_some() {
+        if node.downcast_ref::<ListUDFTable>().is_some() {
             let args = UdtfArgs::list_udfs();
             buf.extend_from_slice(&args.encode_to_vec());
             return Ok(());
         }
 
         // Check for SearchQueryProvider (text_search/vector_search via index)
-        if let Some(search_provider) = any.downcast_ref::<SearchQueryProvider>()
+        if let Some(search_provider) = node.downcast_ref::<SearchQueryProvider>()
             && let Some(source) = &search_provider.udtf_source
         {
             let args = match source {
@@ -378,7 +376,7 @@ impl LogicalExtensionCodec for SpiceLogicalCodec {
         }
 
         // Check for VectorSearchUDTFProvider (vector_search without index)
-        if let Some(vector_provider) = any.downcast_ref::<VectorSearchUDTFProvider>() {
+        if let Some(vector_provider) = node.downcast_ref::<VectorSearchUDTFProvider>() {
             let provider_args = vector_provider.args();
             let args = UdtfArgs::vector_search(VectorSearchArgs {
                 table: provider_args.tbl.to_string(),
@@ -395,7 +393,7 @@ impl LogicalExtensionCodec for SpiceLogicalCodec {
         }
 
         // Check for ReciprocalRankFusion (rrf)
-        if let Some(rrf_provider) = any.downcast_ref::<ReciprocalRankFusion>()
+        if let Some(rrf_provider) = node.downcast_ref::<ReciprocalRankFusion>()
             && let Some(source) = &rrf_provider.rrf_source
         {
             let args = UdtfArgs::rrf(source.clone());

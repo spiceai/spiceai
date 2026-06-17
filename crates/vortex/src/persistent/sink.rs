@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
-use std::any::Any;
 use std::sync::Arc;
 
 use arrow_schema::Schema;
@@ -78,15 +77,15 @@ impl ShardSpec {
     /// Build a `BatchPartitioner` that routes each input batch to one of
     /// `num_shards` shards according to this spec. `Single`/`RoundRobin` route
     /// whole batches; `Hash` splits batches row-wise on the key expressions.
-    fn batch_partitioner(&self, num_shards: usize) -> BatchPartitioner {
+    fn batch_partitioner(&self, num_shards: usize) -> DFResult<BatchPartitioner> {
         let timer = Time::default();
         match self {
             ShardSpec::Hash { exprs, .. } => {
                 BatchPartitioner::new_hash_partitioner(exprs.clone(), num_shards, timer)
             }
-            ShardSpec::Single | ShardSpec::RoundRobin(_) => {
-                BatchPartitioner::new_round_robin_partitioner(num_shards, timer, 0, 1)
-            }
+            ShardSpec::Single | ShardSpec::RoundRobin(_) => Ok(
+                BatchPartitioner::new_round_robin_partitioner(num_shards, timer, 0, 1),
+            ),
         }
     }
 }
@@ -211,10 +210,6 @@ impl DisplayAs for VortexSink {
 
 #[async_trait]
 impl DataSink for VortexSink {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn metrics(&self) -> Option<MetricsSet> {
         None
     }
@@ -336,8 +331,9 @@ async fn write_record_batch_stream_to_files(
         )));
     }
 
-    let mut partitioner =
-        (num_shards > 1).then(|| output_options.shard_spec.batch_partitioner(num_shards));
+    let mut partitioner = (num_shards > 1)
+        .then(|| output_options.shard_spec.batch_partitioner(num_shards))
+        .transpose()?;
 
     // A failed send means a shard writer already dropped its receiver — i.e. it
     // exited early with an error (the happy path holds the receiver open until

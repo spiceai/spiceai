@@ -287,7 +287,6 @@ async fn is_distributed_insert_table(session: &SessionState, table_name: &TableR
 
 fn is_dual_write_table_provider(table_provider: &Arc<dyn TableProvider>) -> bool {
     peel_table_provider_wrappers(table_provider)
-        .as_any()
         .downcast_ref::<AcceleratedTable>()
         .is_some_and(AcceleratedTable::is_dual_write)
 }
@@ -306,10 +305,7 @@ fn is_dual_write_table_provider(table_provider: &Arc<dyn TableProvider>) -> bool
 fn peel_table_provider_wrappers(table_provider: &Arc<dyn TableProvider>) -> Arc<dyn TableProvider> {
     let mut current = Arc::clone(table_provider);
     loop {
-        if let Some(adaptor) = current
-            .as_any()
-            .downcast_ref::<FederatedTableProviderAdaptor>()
-        {
+        if let Some(adaptor) = current.downcast_ref::<FederatedTableProviderAdaptor>() {
             let Some(inner) = adaptor.table_provider.clone() else {
                 break;
             };
@@ -317,10 +313,7 @@ fn peel_table_provider_wrappers(table_provider: &Arc<dyn TableProvider>) -> Arc<
             continue;
         }
 
-        if let Some(enriched) = current
-            .as_any()
-            .downcast_ref::<MetadataEnrichedTableProvider>()
-        {
+        if let Some(enriched) = current.downcast_ref::<MetadataEnrichedTableProvider>() {
             current = Arc::clone(enriched.get_inner_ref());
             continue;
         }

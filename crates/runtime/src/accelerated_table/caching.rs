@@ -14,7 +14,6 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::any::Any;
 use std::fmt;
 use std::sync::Arc;
 use std::sync::atomic::AtomicI64;
@@ -1773,10 +1772,6 @@ impl DisplayAs for CachingAccelerationScanExec {
 impl ExecutionPlan for CachingAccelerationScanExec {
     fn name(&self) -> &'static str {
         "CachingAccelerationScanExec"
-    }
-
-    fn as_any(&self) -> &dyn Any {
-        self
     }
 
     fn schema(&self) -> SchemaRef {

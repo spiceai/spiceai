@@ -1566,7 +1566,7 @@ pub async fn initialize_cluster_executor(
                 match executor_request_initial_partitions(
                     cluster_client.clone(),
                     rt.datafusion().cluster_config.node_advertise_url(),
-                    rt.datafusion().ctx.as_ref(),
+                    &rt.datafusion().ctx.task_ctx(),
                 )
                 .await
                 {

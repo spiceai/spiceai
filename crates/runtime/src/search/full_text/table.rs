@@ -93,14 +93,12 @@ pub(crate) fn add_full_text_search_to_table(
     )
     .boxed()?;
 
-    let tbl: IndexedTableProvider = if let Some(idx_tbl) = inner_table_provider
-        .as_any()
-        .downcast_ref::<IndexedTableProvider>()
-    {
-        idx_tbl.clone()
-    } else {
-        IndexedTableProvider::new(inner_table_provider)
-    };
+    let tbl: IndexedTableProvider =
+        if let Some(idx_tbl) = inner_table_provider.downcast_ref::<IndexedTableProvider>() {
+            idx_tbl.clone()
+        } else {
+            IndexedTableProvider::new(inner_table_provider)
+        };
 
     Ok(tbl.add_index(Arc::new(index) as Arc<dyn Index + Send + Sync>))
 }

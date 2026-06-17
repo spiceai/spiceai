@@ -110,7 +110,7 @@ impl PhysicalOptimizerRule for HttpParamsPushdown {
 fn try_rewrite_hash_join(
     plan: Arc<dyn ExecutionPlan>,
 ) -> Result<Transformed<Arc<dyn ExecutionPlan>>, DataFusionError> {
-    let Some(join_exec) = plan.as_any().downcast_ref::<HashJoinExec>() else {
+    let Some(join_exec) = plan.downcast_ref::<HashJoinExec>() else {
         return Ok(Transformed::no(plan));
     };
 
@@ -129,10 +129,10 @@ fn try_rewrite_hash_join(
                 return Ok(Transformed::no(plan));
             }
             let (left_col_expr, right_col_expr) = &on[0];
-            let Some(left_col) = left_col_expr.as_any().downcast_ref::<Column>() else {
+            let Some(left_col) = left_col_expr.downcast_ref::<Column>() else {
                 return Ok(Transformed::no(plan));
             };
-            let Some(right_col) = right_col_expr.as_any().downcast_ref::<Column>() else {
+            let Some(right_col) = right_col_expr.downcast_ref::<Column>() else {
                 return Ok(Transformed::no(plan));
             };
             let name = left_col.name().to_string();
@@ -155,10 +155,10 @@ fn try_rewrite_hash_join(
                 return Ok(Transformed::no(plan));
             }
             let (left_col_expr, right_col_expr) = &on[0];
-            let Some(left_col) = left_col_expr.as_any().downcast_ref::<Column>() else {
+            let Some(left_col) = left_col_expr.downcast_ref::<Column>() else {
                 return Ok(Transformed::no(plan));
             };
-            let Some(right_col) = right_col_expr.as_any().downcast_ref::<Column>() else {
+            let Some(right_col) = right_col_expr.downcast_ref::<Column>() else {
                 return Ok(Transformed::no(plan));
             };
             let name = right_col.name().to_string();
@@ -211,13 +211,13 @@ fn http_join_param_column(join_exec: &HashJoinExec) -> Option<String> {
     let right_has_http = contains_http_exec(join_exec.right());
 
     if left_has_http && !right_has_http {
-        let col = left_col_expr.as_any().downcast_ref::<Column>()?;
+        let col = left_col_expr.downcast_ref::<Column>()?;
         let name = col.name();
         if HTTP_REQUEST_PARAM_COLUMNS.contains(&name) {
             return Some(name.to_string());
         }
     } else if right_has_http && !left_has_http {
-        let col = right_col_expr.as_any().downcast_ref::<Column>()?;
+        let col = right_col_expr.downcast_ref::<Column>()?;
         let name = col.name();
         if HTTP_REQUEST_PARAM_COLUMNS.contains(&name) {
             return Some(name.to_string());
@@ -228,7 +228,7 @@ fn http_join_param_column(join_exec: &HashJoinExec) -> Option<String> {
 
 /// Recursively check whether `plan` or any descendant is an `HttpExec`.
 fn contains_http_exec(plan: &Arc<dyn ExecutionPlan>) -> bool {
-    if plan.as_any().downcast_ref::<HttpExec>().is_some() {
+    if plan.downcast_ref::<HttpExec>().is_some() {
         return true;
     }
     plan.children()
@@ -238,7 +238,7 @@ fn contains_http_exec(plan: &Arc<dyn ExecutionPlan>) -> bool {
 
 /// Find the first `HttpExec` in the plan tree and return a reference to it.
 fn find_http_exec(plan: &Arc<dyn ExecutionPlan>) -> Option<&HttpExec> {
-    if let Some(http_exec) = plan.as_any().downcast_ref::<HttpExec>() {
+    if let Some(http_exec) = plan.downcast_ref::<HttpExec>() {
         return Some(http_exec);
     }
     for child in plan.children() {
@@ -255,7 +255,7 @@ fn find_http_exec(plan: &Arc<dyn ExecutionPlan>) -> Option<&HttpExec> {
 fn mark_http_exec_deferred(plan: Arc<dyn ExecutionPlan>) -> Arc<dyn ExecutionPlan> {
     let fallback = Arc::clone(&plan);
     plan.transform_down(|node| {
-        let Some(http_exec) = node.as_any().downcast_ref::<HttpExec>() else {
+        let Some(http_exec) = node.downcast_ref::<HttpExec>() else {
             return Ok(Transformed::no(node));
         };
         let marked: Arc<dyn ExecutionPlan> = Arc::new(http_exec.clone().with_deferred_partitions());
@@ -351,10 +351,6 @@ impl ExecutionPlan for HttpWithDeferredParamsExec {
         "HttpWithDeferredParamsExec"
     }
 
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
-
     fn schema(&self) -> arrow::datatypes::SchemaRef {
         Arc::clone(self.properties().eq_properties.schema())
     }
@@ -405,8 +401,8 @@ impl ExecutionPlan for HttpWithDeferredParamsExec {
     fn partition_statistics(
         &self,
         _partition: Option<usize>,
-    ) -> Result<Statistics, DataFusionError> {
-        Ok(Statistics::new_unknown(&self.schema()))
+    ) -> Result<Arc<Statistics>, DataFusionError> {
+        Ok(Arc::new(Statistics::new_unknown(&self.schema())))
     }
 
     /// Limit pushdown is not supported — the output stream is assembled
@@ -625,7 +621,7 @@ fn replace_http_exec_with_expanded_params(
 
     Arc::clone(plan)
         .transform_down(move |node| {
-            let Some(http_exec) = node.as_any().downcast_ref::<HttpExec>() else {
+            let Some(http_exec) = node.downcast_ref::<HttpExec>() else {
                 return Ok(Transformed::no(node));
             };
 
@@ -751,7 +747,6 @@ mod tests {
         // The top-level node should be HttpWithDeferredParamsExec
         assert!(
             result
-                .as_any()
                 .downcast_ref::<HttpWithDeferredParamsExec>()
                 .is_some(),
             "expected HttpWithDeferredParamsExec, got {}",
@@ -787,7 +782,6 @@ mod tests {
             .expect("optimize should succeed");
 
         let deferred = result
-            .as_any()
             .downcast_ref::<HttpWithDeferredParamsExec>()
             .expect("expected HttpWithDeferredParamsExec");
         assert_eq!(deferred.col_name, "request_path");
@@ -816,7 +810,7 @@ mod tests {
 
         // Should remain a HashJoinExec (no rewrite)
         assert!(
-            result.as_any().downcast_ref::<HashJoinExec>().is_some(),
+            result.downcast_ref::<HashJoinExec>().is_some(),
             "expected HashJoinExec unchanged, got {}",
             result.name()
         );
@@ -844,7 +838,7 @@ mod tests {
             .expect("optimize should succeed");
 
         assert!(
-            result.as_any().downcast_ref::<HashJoinExec>().is_some(),
+            result.downcast_ref::<HashJoinExec>().is_some(),
             "expected HashJoinExec unchanged when no HttpExec is present"
         );
     }

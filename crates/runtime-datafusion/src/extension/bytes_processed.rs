@@ -90,7 +90,7 @@ impl PhysicalOptimizerRule for BytesProcessedPhysicalOptimizer {
         _config: &ConfigOptions,
     ) -> Result<Arc<dyn ExecutionPlan>, DataFusionError> {
         plan.transform_down(|plan| {
-            if plan.as_any().downcast_ref::<BytesProcessedExec>().is_some() {
+            if plan.downcast_ref::<BytesProcessedExec>().is_some() {
                 return Ok(Transformed::new(plan, false, TreeNodeRecursion::Jump));
             }
 
@@ -221,10 +221,6 @@ impl ExecutionPlan for BytesProcessedExec {
         "BytesProcessedExec"
     }
 
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema(&self) -> SchemaRef {
         Arc::clone(self.properties().eq_properties.schema())
     }
@@ -327,7 +323,7 @@ impl ExecutionPlan for BytesProcessedExec {
         self.input_exec.metrics()
     }
 
-    fn partition_statistics(&self, partition: Option<usize>) -> Result<Statistics> {
+    fn partition_statistics(&self, partition: Option<usize>) -> Result<Arc<Statistics>> {
         self.input_exec.partition_statistics(partition)
     }
 

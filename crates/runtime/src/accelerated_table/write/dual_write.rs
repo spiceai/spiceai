@@ -31,7 +31,6 @@ limitations under the License.
 //! [`WriteMode::DualWrite`]: super::WriteMode::DualWrite
 //! [`WriteMode::WriteThrough`]: super::WriteMode::WriteThrough
 
-use std::any::Any;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -149,10 +148,6 @@ impl DisplayAs for DualWriteDataSink {
 
 #[async_trait]
 impl DataSink for DualWriteDataSink {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn metrics(&self) -> Option<MetricsSet> {
         None
     }
@@ -280,7 +275,6 @@ async fn write_all_with_partitioned_cayenne(
     target_partitions: usize,
 ) -> datafusion::common::Result<u64> {
     let partitioned = accelerator
-        .as_any()
         .downcast_ref::<PartitionTableProvider>()
         .ok_or_else(|| {
             DataFusionError::Execution(
@@ -412,7 +406,7 @@ async fn write_all_with_partitioned_cayenne(
 
 /// Attempts to downcast a partition provider to [`CayenneTableProvider`].
 fn downcast_to_cayenne(provider: &Arc<dyn TableProvider>) -> Option<&CayenneTableProvider> {
-    provider.as_any().downcast_ref::<CayenneTableProvider>()
+    provider.downcast_ref::<CayenneTableProvider>()
 }
 
 fn spawn_federated_insert(
@@ -513,18 +507,13 @@ async fn join_partitioned_staged_tasks(
 pub(crate) fn extract_cayenne_write_target(
     table_provider: &Arc<dyn TableProvider>,
 ) -> Option<CayenneWriteTarget> {
-    if let Some(cayenne) = table_provider
-        .as_any()
-        .downcast_ref::<CayenneTableProvider>()
-    {
+    if let Some(cayenne) = table_provider.downcast_ref::<CayenneTableProvider>() {
         return Some(CayenneWriteTarget::Staged(Box::new(
             cayenne.clone_for_write_operations(),
         )));
     }
 
-    if let Some(partitioned) = table_provider
-        .as_any()
-        .downcast_ref::<PartitionTableProvider>()
+    if let Some(partitioned) = table_provider.downcast_ref::<PartitionTableProvider>()
         && partitioned
             .creator()
             .as_any()
@@ -534,15 +523,12 @@ pub(crate) fn extract_cayenne_write_target(
         return Some(CayenneWriteTarget::Partitioned(Arc::clone(table_provider)));
     }
 
-    if let Some(poly) = table_provider.as_any().downcast_ref::<PolyTableProvider>() {
+    if let Some(poly) = table_provider.downcast_ref::<PolyTableProvider>() {
         let writer = poly.writer();
         return extract_cayenne_write_target(&writer);
     }
 
-    if let Some(upsert_dedup) = table_provider
-        .as_any()
-        .downcast_ref::<UpsertDedupTableProvider>()
-    {
+    if let Some(upsert_dedup) = table_provider.downcast_ref::<UpsertDedupTableProvider>() {
         return extract_cayenne_write_target(upsert_dedup.inner());
     }
 

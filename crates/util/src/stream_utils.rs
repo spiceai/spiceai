@@ -237,10 +237,6 @@ impl ExecutionPlan for StreamingExec {
         "StreamingExec"
     }
 
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema(&self) -> SchemaRef {
         Arc::clone(self.properties().eq_properties.schema())
     }
@@ -327,7 +323,7 @@ impl ExecutionPlan for StreamingExec {
     fn partition_statistics(
         &self,
         partition: Option<usize>,
-    ) -> Result<datafusion::common::Statistics> {
+    ) -> Result<Arc<datafusion::common::Statistics>> {
         if let Some(idx) = partition {
             let partition_count = self.properties.output_partitioning().partition_count();
             if idx >= partition_count {
@@ -336,7 +332,9 @@ impl ExecutionPlan for StreamingExec {
                 )));
             }
         }
-        Ok(datafusion::common::Statistics::new_unknown(&self.schema()))
+        Ok(Arc::new(datafusion::common::Statistics::new_unknown(
+            &self.schema(),
+        )))
     }
 
     fn supports_limit_pushdown(&self) -> bool {

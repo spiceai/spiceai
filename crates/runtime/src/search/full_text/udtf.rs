@@ -48,7 +48,6 @@ use search::{
     index::SearchIndex,
     provider::{SearchQueryProvider, UdtfSource},
 };
-use std::any::Any;
 use std::sync::LazyLock;
 use std::sync::{Arc, Weak};
 
@@ -627,10 +626,6 @@ impl TableFunctionImpl for TextSearchTableFunc {
 }
 
 impl ScalarUDFImpl for TextSearchTableFunc {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn name(&self) -> &str {
         TEXT_SEARCH_UDTF_NAME
     }

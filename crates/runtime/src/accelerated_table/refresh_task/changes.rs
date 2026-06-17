@@ -2191,13 +2191,10 @@ impl RefreshTask {
     fn cayenne_accelerator(&self) -> Option<&CayenneTableProvider> {
         let mut current: &Arc<dyn TableProvider> = &self.accelerator;
         loop {
-            if let Some(cayenne) = current.as_any().downcast_ref::<CayenneTableProvider>() {
+            if let Some(cayenne) = current.downcast_ref::<CayenneTableProvider>() {
                 return Some(cayenne);
             }
-            if let Some(poly) = current
-                .as_any()
-                .downcast_ref::<data_components::poly::PolyTableProvider>()
-            {
+            if let Some(poly) = current.downcast_ref::<data_components::poly::PolyTableProvider>() {
                 current = poly.writer_ref();
                 continue;
             }
@@ -2209,9 +2206,8 @@ impl RefreshTask {
             // table instead stays on the synchronous path (through the wrapper,
             // preserving its semantics) and emits the fallback warning below. Only
             // write-transparent wrappers are peeled here.
-            if let Some(indexed) = current
-                .as_any()
-                .downcast_ref::<runtime_datafusion_index::IndexedTableProvider>()
+            if let Some(indexed) =
+                current.downcast_ref::<runtime_datafusion_index::IndexedTableProvider>()
             {
                 current = indexed.get_underlying_ref();
                 continue;
@@ -2506,7 +2502,7 @@ async fn delete_matching_rows_from_arrow_provider(
     provider: &Arc<dyn TableProvider>,
     rows: &RecordBatch,
 ) -> crate::accelerated_table::Result<Option<u64>> {
-    if let Some(indexed) = provider.as_any().downcast_ref::<IndexedTableProvider>() {
+    if let Some(indexed) = provider.downcast_ref::<IndexedTableProvider>() {
         return Box::pin(delete_matching_rows_from_arrow_provider(
             indexed.get_underlying_ref(),
             rows,
@@ -2514,9 +2510,8 @@ async fn delete_matching_rows_from_arrow_provider(
         .await;
     }
 
-    if let Some(embedding_table) = provider
-        .as_any()
-        .downcast_ref::<crate::embeddings::table::EmbeddingTable>()
+    if let Some(embedding_table) =
+        provider.downcast_ref::<crate::embeddings::table::EmbeddingTable>()
     {
         return Box::pin(delete_matching_rows_from_arrow_provider(
             embedding_table.get_underlying_ref(),
@@ -2525,7 +2520,7 @@ async fn delete_matching_rows_from_arrow_provider(
         .await;
     }
 
-    if let Some(table) = provider.as_any().downcast_ref::<MemTable>() {
+    if let Some(table) = provider.downcast_ref::<MemTable>() {
         return table
             .delete_matching_rows(rows)
             .await
@@ -2534,7 +2529,7 @@ async fn delete_matching_rows_from_arrow_provider(
             .context(crate::accelerated_table::FailedToWriteDataSnafu);
     }
 
-    if let Some(table) = provider.as_any().downcast_ref::<IndexedMemTable>() {
+    if let Some(table) = provider.downcast_ref::<IndexedMemTable>() {
         return table
             .delete_matching_rows(rows)
             .await
@@ -2543,7 +2538,7 @@ async fn delete_matching_rows_from_arrow_provider(
             .context(crate::accelerated_table::FailedToWriteDataSnafu);
     }
 
-    if let Some(partitioned) = provider.as_any().downcast_ref::<PartitionTableProvider>() {
+    if let Some(partitioned) = provider.downcast_ref::<PartitionTableProvider>() {
         let mut deleted = 0_u64;
         let mut matched_arrow_provider = false;
         for partition_provider in partitioned.partition_table_providers().await {
@@ -2567,16 +2562,15 @@ async fn delete_matching_rows_from_arrow_provider(
 async fn perform_change_write_maintenance(
     provider: &Arc<dyn TableProvider>,
 ) -> crate::accelerated_table::Result<()> {
-    if let Some(indexed) = provider.as_any().downcast_ref::<IndexedTableProvider>() {
+    if let Some(indexed) = provider.downcast_ref::<IndexedTableProvider>() {
         return Box::pin(perform_change_write_maintenance(
             indexed.get_underlying_ref(),
         ))
         .await;
     }
 
-    if let Some(embedding_table) = provider
-        .as_any()
-        .downcast_ref::<crate::embeddings::table::EmbeddingTable>()
+    if let Some(embedding_table) =
+        provider.downcast_ref::<crate::embeddings::table::EmbeddingTable>()
     {
         return Box::pin(perform_change_write_maintenance(
             embedding_table.get_underlying_ref(),
@@ -2584,7 +2578,7 @@ async fn perform_change_write_maintenance(
         .await;
     }
 
-    if let Some(partitioned) = provider.as_any().downcast_ref::<PartitionTableProvider>() {
+    if let Some(partitioned) = provider.downcast_ref::<PartitionTableProvider>() {
         for partition_provider in partitioned.partition_table_providers().await {
             Box::pin(perform_change_write_maintenance(&partition_provider)).await?;
         }

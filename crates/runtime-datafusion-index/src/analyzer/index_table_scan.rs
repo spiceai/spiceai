@@ -95,14 +95,13 @@ impl OptimizerRule for IndexTableScanOptimizerRule {
             LogicalPlan::TableScan(table_scan) => {
                 let Some(default_source) = table_scan
                     .source
-                    .as_any()
                     .downcast_ref::<DefaultTableSource>()
                 else {
                     return Ok(Transformed::no(LogicalPlan::TableScan(table_scan)));
                 };
                 let underlying = Arc::clone(&default_source.table_provider);
                 let Some(indexed_table_provider) =
-                    underlying.as_any().downcast_ref::<IndexedTableProvider>()
+                    underlying.downcast_ref::<IndexedTableProvider>()
                 else {
                     return Ok(Transformed::no(LogicalPlan::TableScan(table_scan)));
                 };
@@ -379,10 +378,6 @@ impl ExecutionPlan for IndexerExec {
         "IndexerExec"
     }
 
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema(&self) -> SchemaRef {
         Arc::clone(self.properties().eq_properties.schema())
     }
@@ -563,7 +558,7 @@ impl ExecutionPlan for IndexerExec {
         self.input_exec.metrics()
     }
 
-    fn partition_statistics(&self, partition: Option<usize>) -> Result<Statistics> {
+    fn partition_statistics(&self, partition: Option<usize>) -> Result<Arc<Statistics>> {
         self.input_exec.partition_statistics(partition)
     }
     fn with_fetch(&self, limit: Option<usize>) -> Option<Arc<dyn ExecutionPlan>> {

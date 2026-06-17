@@ -38,9 +38,9 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::Value;
 use snafu::prelude::*;
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
-use std::{any::Any, sync::Arc};
 use tokio::sync::Notify;
 use tokio_stream::StreamExt;
 use tonic::async_trait;
@@ -1396,10 +1396,6 @@ pub mod bench_wrappers {
 
 #[async_trait]
 impl TableProvider for Kafka {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema(&self) -> SchemaRef {
         Arc::clone(&self.schema)
     }

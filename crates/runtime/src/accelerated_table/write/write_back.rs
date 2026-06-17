@@ -33,7 +33,6 @@ limitations under the License.
 //!
 //! [`WriteMode::WriteBack`]: super::WriteMode::WriteBack
 
-use std::any::Any;
 use std::sync::Arc;
 
 use arrow::array::UInt64Array;
@@ -120,10 +119,6 @@ impl DisplayAs for WriteBackDataSink {
 
 #[async_trait]
 impl DataSink for WriteBackDataSink {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn metrics(&self) -> Option<MetricsSet> {
         None
     }

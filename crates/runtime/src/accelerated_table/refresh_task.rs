@@ -145,7 +145,7 @@ fn metadata_enriched_table_provider_preserving_indexes(
         return provider;
     }
 
-    if let Some(indexed) = provider.as_any().downcast_ref::<IndexedTableProvider>() {
+    if let Some(indexed) = provider.downcast_ref::<IndexedTableProvider>() {
         let enriched_underlying = metadata_enriched_table_provider_preserving_indexes(
             indexed.get_underlying(),
             table_metadata,
@@ -158,10 +158,7 @@ fn metadata_enriched_table_provider_preserving_indexes(
         ));
     }
 
-    if let Some(metadata_enriched) = provider
-        .as_any()
-        .downcast_ref::<MetadataEnrichedTableProvider>()
-    {
+    if let Some(metadata_enriched) = provider.downcast_ref::<MetadataEnrichedTableProvider>() {
         return metadata_enriched_table_provider_preserving_indexes(
             Arc::clone(metadata_enriched.get_inner_ref()),
             table_metadata,
@@ -169,10 +166,7 @@ fn metadata_enriched_table_provider_preserving_indexes(
         );
     }
 
-    if let Some(adaptor) = provider
-        .as_any()
-        .downcast_ref::<FederatedTableProviderAdaptor>()
-    {
+    if let Some(adaptor) = provider.downcast_ref::<FederatedTableProviderAdaptor>() {
         let Some(table_provider) = &adaptor.table_provider else {
             return Arc::clone(&provider);
         };
@@ -213,7 +207,7 @@ fn collect_indexes_from_provider(
     let mut current = Some(root);
 
     while let Some(provider) = current.take() {
-        if let Some(indexed) = provider.as_any().downcast_ref::<IndexedTableProvider>() {
+        if let Some(indexed) = provider.downcast_ref::<IndexedTableProvider>() {
             for index in indexed.get_all_indexes() {
                 let ptr = Arc::as_ptr(&index).cast::<()>();
                 if seen.insert(ptr) {
@@ -222,14 +216,11 @@ fn collect_indexes_from_provider(
             }
         }
 
-        current = if let Some(adaptor) = provider
-            .as_any()
-            .downcast_ref::<FederatedTableProviderAdaptor>()
-        {
+        current = if let Some(adaptor) = provider.downcast_ref::<FederatedTableProviderAdaptor>() {
             adaptor.table_provider.as_ref().map(Arc::clone)
-        } else if let Some(embedding_table) = provider.as_any().downcast_ref::<EmbeddingTable>() {
+        } else if let Some(embedding_table) = provider.downcast_ref::<EmbeddingTable>() {
             Some(Arc::clone(embedding_table.get_underlying_ref()))
-        } else if let Some(indexed) = provider.as_any().downcast_ref::<IndexedTableProvider>() {
+        } else if let Some(indexed) = provider.downcast_ref::<IndexedTableProvider>() {
             Some(indexed.get_underlying())
         } else {
             None
@@ -2520,10 +2511,9 @@ fn accelerator_df(
 }
 
 pub fn accelerator_table_provider(accelerator: &Arc<dyn TableProvider>) -> Arc<dyn TableProvider> {
-    match accelerator.as_any().downcast_ref::<PolyTableProvider>() {
+    match accelerator.downcast_ref::<PolyTableProvider>() {
         Some(poly) => match poly
             .get_federated_table_provider()
-            .as_any()
             .downcast_ref::<FederatedTableProviderAdaptor>()
         {
             Some(FederatedTableProviderAdaptor {

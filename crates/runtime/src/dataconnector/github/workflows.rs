@@ -124,10 +124,6 @@ impl WorkflowsTableProvider {
 
 #[async_trait]
 impl TableProvider for WorkflowsTableProvider {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema(&self) -> SchemaRef {
         Arc::clone(&self.schema)
     }
@@ -227,10 +223,6 @@ impl ExecutionPlan for WorkflowsExecutionPlan {
         "GitHubWorkflowsExecutionPlan"
     }
 
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema(&self) -> SchemaRef {
         Arc::clone(&self.schema)
     }
@@ -315,8 +307,8 @@ impl ExecutionPlan for WorkflowsExecutionPlan {
     fn partition_statistics(
         &self,
         _partition: Option<usize>,
-    ) -> datafusion::error::Result<Statistics> {
-        Ok(Statistics::new_unknown(&self.schema()))
+    ) -> datafusion::error::Result<Arc<Statistics>> {
+        Ok(Arc::new(Statistics::new_unknown(&self.schema())))
     }
 
     fn supports_limit_pushdown(&self) -> bool {

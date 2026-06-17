@@ -273,7 +273,7 @@ impl PhysicalOptimizerRule for CayenneAntiJoinSortMergeRewriter {
         config: &ConfigOptions,
     ) -> Result<Arc<dyn ExecutionPlan>, DataFusionError> {
         plan.transform_down(|node| {
-            let Some(hash_join) = node.as_any().downcast_ref::<HashJoinExec>() else {
+            let Some(hash_join) = node.downcast_ref::<HashJoinExec>() else {
                 return Ok(Transformed::no(node));
             };
 
@@ -303,7 +303,7 @@ impl PhysicalOptimizerRule for CayenneDynamicFilterSharing {
         config: &ConfigOptions,
     ) -> Result<Arc<dyn ExecutionPlan>, DataFusionError> {
         plan.transform_down(|node| {
-            let Some(hash_join) = node.as_any().downcast_ref::<HashJoinExec>() else {
+            let Some(hash_join) = node.downcast_ref::<HashJoinExec>() else {
                 return Ok(Transformed::no(node));
             };
 
@@ -343,7 +343,7 @@ impl PhysicalOptimizerRule for CayenneMaintainedAggregateRewriter {
         _config: &ConfigOptions,
     ) -> Result<Arc<dyn ExecutionPlan>, DataFusionError> {
         plan.transform_down(|node| {
-            let Some(aggregate) = node.as_any().downcast_ref::<AggregateExec>() else {
+            let Some(aggregate) = node.downcast_ref::<AggregateExec>() else {
                 return Ok(Transformed::no(node));
             };
             let Some((source, scan_epoch, query_aggregate)) =
@@ -387,16 +387,15 @@ fn maintained_aggregate_source_for_aggregate(
 
 #[expect(deprecated)]
 fn maintained_aggregate_partial_input(plan: &Arc<dyn ExecutionPlan>) -> Option<&AggregateExec> {
-    if let Some(aggregate) = plan.as_any().downcast_ref::<AggregateExec>() {
+    if let Some(aggregate) = plan.downcast_ref::<AggregateExec>() {
         return Some(aggregate);
     }
 
-    let any = plan.as_any();
-    if any.downcast_ref::<RepartitionExec>().is_none()
-        && any
+    if plan.downcast_ref::<RepartitionExec>().is_none()
+        && plan
             .downcast_ref::<datafusion_physical_plan::coalesce_batches::CoalesceBatchesExec>()
             .is_none()
-        && any
+        && plan
             .downcast_ref::<datafusion_physical_plan::coalesce_partitions::CoalescePartitionsExec>()
             .is_none()
     {
@@ -418,17 +417,16 @@ fn is_simple_partial_aggregate(aggregate: &AggregateExec) -> bool {
 fn maintained_aggregate_source(
     plan: &Arc<dyn ExecutionPlan>,
 ) -> Option<(&Arc<MaintainedAggregateRegistry>, u64)> {
-    if let Some(cayenne_scan) = plan.as_any().downcast_ref::<CayenneAccelerationExec>() {
+    if let Some(cayenne_scan) = plan.downcast_ref::<CayenneAccelerationExec>() {
         return cayenne_scan.maintained_aggregates();
     }
 
-    let any = plan.as_any();
-    if any.downcast_ref::<RepartitionExec>().is_none()
-        && any
+    if plan.downcast_ref::<RepartitionExec>().is_none()
+        && plan
             .downcast_ref::<datafusion_physical_plan::coalesce_batches::CoalesceBatchesExec>()
             .is_none()
-        && any.downcast_ref::<SchemaCastScanExec>().is_none()
-        && any
+        && plan.downcast_ref::<SchemaCastScanExec>().is_none()
+        && plan
             .downcast_ref::<datafusion_physical_plan::coalesce_partitions::CoalescePartitionsExec>()
             .is_none()
     {
@@ -960,7 +958,7 @@ fn collect_cayenne_scans(plan: &Arc<dyn ExecutionPlan>) -> Vec<CayenneScanSummar
 }
 
 fn collect_cayenne_scans_inner(plan: &Arc<dyn ExecutionPlan>, scans: &mut Vec<CayenneScanSummary>) {
-    if let Some(cayenne) = plan.as_any().downcast_ref::<CayenneAccelerationExec>()
+    if let Some(cayenne) = plan.downcast_ref::<CayenneAccelerationExec>()
         && let Some(identity) = cayenne.scan_identity()
     {
         let schema_fields = plan_schema_fields(&cayenne.schema());
@@ -980,7 +978,7 @@ fn collect_cayenne_scans_inner(plan: &Arc<dyn ExecutionPlan>, scans: &mut Vec<Ca
 }
 
 fn physical_column_name(expr: &Arc<dyn PhysicalExpr>) -> Option<&str> {
-    expr.as_any().downcast_ref::<Column>().map(Column::name)
+    expr.downcast_ref::<Column>().map(Column::name)
 }
 
 fn scans_by_identity(scans: &[CayenneScanSummary]) -> HashMap<Arc<ScanIdentity>, Vec<usize>> {
@@ -1060,7 +1058,7 @@ fn apply_filter_additions(
         return Ok((plan, false));
     }
 
-    if let Some(cayenne) = plan.as_any().downcast_ref::<CayenneAccelerationExec>() {
+    if let Some(cayenne) = plan.downcast_ref::<CayenneAccelerationExec>() {
         let Some(identity) = cayenne.scan_identity() else {
             return Ok((plan, false));
         };
@@ -1124,11 +1122,11 @@ impl std::fmt::Debug for CayenneJoinRewriter {
 #[expect(deprecated)]
 fn flatten_transparent_nodes(plan: &Arc<dyn ExecutionPlan>) -> &Arc<dyn ExecutionPlan> {
     // ProjectionExec is transparent if it just passes through columns
-    if let Some(projection) = plan.as_any().downcast_ref::<ProjectionExec>() {
+    if let Some(projection) = plan.downcast_ref::<ProjectionExec>() {
         return flatten_transparent_nodes(projection.input());
     }
 
-    if let Some(bytes_processed_exec) = plan.as_any().downcast_ref::<BytesProcessedExec>() {
+    if let Some(bytes_processed_exec) = plan.downcast_ref::<BytesProcessedExec>() {
         let children = bytes_processed_exec.children();
         let Some(input) = children.first() else {
             return plan;
@@ -1137,13 +1135,12 @@ fn flatten_transparent_nodes(plan: &Arc<dyn ExecutionPlan>) -> &Arc<dyn Executio
         return flatten_transparent_nodes(input);
     }
 
-    if let Some(repartitioned) = plan.as_any().downcast_ref::<RepartitionExec>() {
+    if let Some(repartitioned) = plan.downcast_ref::<RepartitionExec>() {
         return flatten_transparent_nodes(repartitioned.input());
     }
 
     if let Some(coalesce) =
-        plan.as_any()
-            .downcast_ref::<datafusion_physical_plan::coalesce_batches::CoalesceBatchesExec>()
+        plan.downcast_ref::<datafusion_physical_plan::coalesce_batches::CoalesceBatchesExec>()
     {
         return flatten_transparent_nodes(coalesce.input());
     }
@@ -1154,7 +1151,7 @@ fn flatten_transparent_nodes(plan: &Arc<dyn ExecutionPlan>) -> &Arc<dyn Executio
     // identifying a Cayenne-backed scan on a join build/probe side they are
     // transparent — see through them so the dynamic-filter join rewrite still
     // fires on tables undergoing CDC deletes.
-    if let Some(int64_delete) = plan.as_any().downcast_ref::<Int64PkDeletionFilterExec>() {
+    if let Some(int64_delete) = plan.downcast_ref::<Int64PkDeletionFilterExec>() {
         let children = int64_delete.children();
         let Some(input) = children.first() else {
             return plan;
@@ -1163,7 +1160,7 @@ fn flatten_transparent_nodes(plan: &Arc<dyn ExecutionPlan>) -> &Arc<dyn Executio
         return flatten_transparent_nodes(input);
     }
 
-    if let Some(key_delete) = plan.as_any().downcast_ref::<KeyBasedDeletionFilterExec>() {
+    if let Some(key_delete) = plan.downcast_ref::<KeyBasedDeletionFilterExec>() {
         let children = key_delete.children();
         let Some(input) = children.first() else {
             return plan;
@@ -1172,7 +1169,7 @@ fn flatten_transparent_nodes(plan: &Arc<dyn ExecutionPlan>) -> &Arc<dyn Executio
         return flatten_transparent_nodes(input);
     }
 
-    if let Some(schema_cast_scan) = plan.as_any().downcast_ref::<SchemaCastScanExec>() {
+    if let Some(schema_cast_scan) = plan.downcast_ref::<SchemaCastScanExec>() {
         let children = schema_cast_scan.children();
         let Some(input) = children.first() else {
             return plan;
@@ -1188,12 +1185,11 @@ fn hash_join_build_side_is_cayenne(join: &HashJoinExec) -> bool {
     let build_side = flatten_transparent_nodes(join.left());
 
     if build_side
-        .as_any()
         .downcast_ref::<CayenneAccelerationExec>()
         .is_some()
     {
         true
-    } else if let Some(nested_join) = build_side.as_any().downcast_ref::<HashJoinExec>() {
+    } else if let Some(nested_join) = build_side.downcast_ref::<HashJoinExec>() {
         // Recursively check the build side of the nested join
         hash_join_build_side_is_cayenne(nested_join)
     } else {
@@ -1218,7 +1214,6 @@ fn is_cayenne_backed_join(hash_join: &HashJoinExec) -> bool {
     let probe_side = flatten_transparent_nodes(hash_join.right());
 
     if probe_side
-        .as_any()
         .downcast_ref::<CayenneAccelerationExec>()
         .is_some()
     {
@@ -1226,7 +1221,7 @@ fn is_cayenne_backed_join(hash_join: &HashJoinExec) -> bool {
     }
 
     // If probe side is another `HashJoinExec`, check the build side of the nested join is Cayenne
-    if let Some(nested_join) = probe_side.as_any().downcast_ref::<HashJoinExec>() {
+    if let Some(nested_join) = probe_side.downcast_ref::<HashJoinExec>() {
         // The nested join's build side must also be Cayenne
         return hash_join_build_side_is_cayenne(nested_join);
     }
@@ -1267,7 +1262,7 @@ impl PhysicalOptimizerRule for CayenneJoinRewriter {
         // Therefore, after we encounter a `HashJoinExec` we need to continue traversing down the build side of any subsequent `HashJoinExec`s to ensure it is a `CayenneAccelerationExec`.
 
         plan.transform_down(|node| {
-            let Some(hash_join) = node.as_any().downcast_ref::<HashJoinExec>() else {
+            let Some(hash_join) = node.downcast_ref::<HashJoinExec>() else {
                 return Ok(Transformed::no(node));
             };
 
@@ -1477,10 +1472,6 @@ mod tests {
             Err(DataFusionError::NotImplemented(
                 "test source cannot open files".to_string(),
             ))
-        }
-
-        fn as_any(&self) -> &dyn Any {
-            self
         }
 
         fn table_schema(&self) -> &TableSchema {

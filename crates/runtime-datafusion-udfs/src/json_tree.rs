@@ -40,7 +40,6 @@ limitations under the License.
 //!   `LATERAL json_tree(s.body)` usage via `UNNEST`. The scalar form takes
 //!   only the JSON argument and always runs with default caps.
 
-use std::any::Any;
 use std::fmt::{Debug, Formatter};
 use std::sync::{Arc, LazyLock};
 
@@ -441,10 +440,6 @@ pub struct JsonTreeTable {
 
 #[async_trait]
 impl TableProvider for JsonTreeTable {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema(&self) -> SchemaRef {
         Arc::clone(&self.schema)
     }
@@ -571,9 +566,6 @@ impl std::hash::Hash for JsonTreeScalar {
 }
 
 impl ScalarUDFImpl for JsonTreeScalar {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
     fn name(&self) -> &str {
         JSON_TREE_UDTF_NAME
     }

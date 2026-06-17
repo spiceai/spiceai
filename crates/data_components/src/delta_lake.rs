@@ -646,10 +646,6 @@ impl std::fmt::Display for RelabelFieldsExpr {
 }
 
 impl PhysicalExpr for RelabelFieldsExpr {
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
-
     fn data_type(&self, _input_schema: &Schema) -> std::result::Result<DataType, DataFusionError> {
         Ok(self.target_type.clone())
     }
@@ -752,10 +748,6 @@ fn map_delta_data_type_to_arrow_data_type(
 
 #[async_trait]
 impl TableProvider for DeltaTable {
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
-
     fn schema(&self) -> SchemaRef {
         Arc::clone(&self.arrow_schema)
     }
@@ -1218,6 +1210,7 @@ async fn get_parquet_access_plan(
 )]
 fn to_delta_kernel_expr(expr: &Expr) -> Option<Expression> {
     match expr {
+        Expr::HigherOrderFunction(_) | Expr::Lambda(_) | Expr::LambdaVariable(_) => None,
         Expr::BinaryExpr(binary) => {
             let left = to_delta_kernel_expr(&binary.left)?;
             let right = to_delta_kernel_expr(&binary.right)?;
@@ -1456,6 +1449,8 @@ fn to_delta_kernel_scalar(scalar: ScalarValue) -> Option<Scalar> {
         | ScalarValue::FixedSizeList(_)
         | ScalarValue::List(_)
         | ScalarValue::LargeList(_)
+        | ScalarValue::ListView(_)
+        | ScalarValue::LargeListView(_)
         | ScalarValue::Struct(_)
         | ScalarValue::Map(_)
         | ScalarValue::Time32Second(_)

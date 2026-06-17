@@ -496,8 +496,7 @@ impl DataAccelerator for SqliteAccelerator {
             .context(UnableToCreateTableSnafu)
             .boxed()?;
 
-        let Some(sqlite_writer) = table_provider.as_any().downcast_ref::<SqliteTableWriter>()
-        else {
+        let Some(sqlite_writer) = table_provider.downcast_ref::<SqliteTableWriter>() else {
             unreachable!("SqliteTableWriter should be returned from SqliteTableProviderFactory")
         };
 

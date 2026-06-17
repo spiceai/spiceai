@@ -396,7 +396,6 @@ impl ColumnBounds for ExactColumnBounds {
             .unwrap_or(arrow::datatypes::DataType::Null);
 
         let col_index = left_expr
-            .as_any()
             .downcast_ref::<datafusion::physical_plan::expressions::Column>()
             .map_or(0, datafusion::physical_expr::expressions::Column::index);
 
@@ -757,7 +756,8 @@ impl BloomFilter {
 }
 
 fn datafusion_hash_join_random_state() -> SeededRandomState {
-    SeededRandomState::with_seeds('J' as u64, 'O' as u64, 'I' as u64, 'N' as u64)
+    // DF54 replaced the old `('J','O','I','N')` 4-seed RandomState with a single-u64 seed.
+    SeededRandomState::with_seed(12210250226015887276)
 }
 
 fn for_each_datafusion_hash(
@@ -898,10 +898,6 @@ impl Display for BloomFilterExpr {
 }
 
 impl PhysicalExpr for BloomFilterExpr {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn data_type(&self, _input_schema: &Schema) -> DataFusionResult<DataType> {
         Ok(DataType::Boolean)
     }
@@ -1185,7 +1181,6 @@ mod tests {
 
     fn assert_literal_true(physical_expr: &Arc<dyn PhysicalExpr>) {
         let literal_expr = physical_expr
-            .as_any()
             .downcast_ref::<Literal>()
             .expect("Should downcast to Literal");
         let expected_value = ScalarValue::Boolean(Some(true));
@@ -1194,7 +1189,6 @@ mod tests {
 
     fn assert_literal_false(physical_expr: &Arc<dyn PhysicalExpr>) {
         let literal_expr = physical_expr
-            .as_any()
             .downcast_ref::<Literal>()
             .expect("Should downcast to Literal");
         let expected_value = ScalarValue::Boolean(Some(false));
@@ -1249,7 +1243,7 @@ mod tests {
             None
         }
 
-        fn row_counts(&self, _column: &Column) -> Option<ArrayRef> {
+        fn row_counts(&self) -> Option<ArrayRef> {
             None
         }
 
@@ -1285,7 +1279,7 @@ mod tests {
             .expect("Should create physical expr");
 
         // Validate the expression is an InListExpr with the expected values
-        let in_list_expr = in_expr.as_any().downcast_ref::<InListExpr>();
+        let in_list_expr = in_expr.downcast_ref::<InListExpr>();
         let in_list_expr = in_list_expr.expect("Should downcast to InListExpr");
         let expected_values: Vec<ScalarValue> =
             (0..10).map(|i| ScalarValue::Int32(Some(i))).collect();
@@ -1293,10 +1287,7 @@ mod tests {
             .list()
             .iter()
             .map(|expr| {
-                let literal = expr
-                    .as_any()
-                    .downcast_ref::<Literal>()
-                    .expect("Should be a literal");
+                let literal = expr.downcast_ref::<Literal>().expect("Should be a literal");
                 literal.value().clone()
             })
             .collect();
@@ -1354,7 +1345,6 @@ mod tests {
             .expect("Should create physical expr");
 
         physical_expr
-            .as_any()
             .downcast_ref::<InListExpr>()
             .expect("Should downcast to InListExpr");
     }
@@ -1803,7 +1793,7 @@ mod tests {
             .expect("Should create physical expr");
 
         // Validate the expression is an InListExpr with the expected unique values
-        let in_list_expr = in_expr.as_any().downcast_ref::<InListExpr>();
+        let in_list_expr = in_expr.downcast_ref::<InListExpr>();
         let in_list_expr = in_list_expr.expect("Should downcast to InListExpr");
         let expected_values: Vec<ScalarValue> = vec![1, 2, 3]
             .into_iter()
@@ -1813,10 +1803,7 @@ mod tests {
             .list()
             .iter()
             .map(|expr| {
-                let literal = expr
-                    .as_any()
-                    .downcast_ref::<Literal>()
-                    .expect("Should be a literal");
+                let literal = expr.downcast_ref::<Literal>().expect("Should be a literal");
                 literal.value().clone()
             })
             .collect();
@@ -1862,7 +1849,7 @@ mod tests {
             .expect("Should create physical expr");
 
         // Validate the expression is an InListExpr with the expected values
-        let in_list_expr = in_expr.as_any().downcast_ref::<InListExpr>();
+        let in_list_expr = in_expr.downcast_ref::<InListExpr>();
         let in_list_expr = in_list_expr.expect("Should downcast to InListExpr");
         let expected_values: Vec<ScalarValue> =
             (1..=6).map(|i| ScalarValue::Int32(Some(i))).collect();
@@ -1870,10 +1857,7 @@ mod tests {
             .list()
             .iter()
             .map(|expr| {
-                let literal = expr
-                    .as_any()
-                    .downcast_ref::<Literal>()
-                    .expect("Should be a literal");
+                let literal = expr.downcast_ref::<Literal>().expect("Should be a literal");
                 literal.value().clone()
             })
             .collect();

@@ -79,7 +79,6 @@ limitations under the License.
 //! depth / row / size limit emits an error-kind metric and yields zero or a
 //! truncated-but-valid batch — never a query-level error.
 
-use std::any::Any;
 use std::collections::HashSet;
 use std::fmt::{Debug, Formatter};
 use std::sync::{Arc, LazyLock};
@@ -1027,9 +1026,6 @@ pub struct FlattenJsonPropertiesTable {
 
 #[async_trait]
 impl TableProvider for FlattenJsonPropertiesTable {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
     fn schema(&self) -> SchemaRef {
         Arc::clone(&self.schema)
     }
@@ -1174,10 +1170,6 @@ impl std::hash::Hash for FlattenJsonPropertiesScalar {
 }
 
 impl ScalarUDFImpl for FlattenJsonPropertiesScalar {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn name(&self) -> &str {
         FLATTEN_JSON_PROPERTIES_UDTF_NAME
     }

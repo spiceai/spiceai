@@ -80,7 +80,7 @@ impl<T: RefreshSkipTableProvider> AsRefreshSkipProvider for T {
 pub async fn should_skip_refresh_for_table_provider(
     table_provider: &(dyn TableProvider + Send + Sync),
 ) -> DataFusionResult<Option<bool>> {
-    let any = table_provider.as_any();
+    let any = table_provider as &dyn std::any::Any;
 
     // Try each known concrete type that implements RefreshSkipTableProvider
     // This is a stopgap until Rust supports trait upcasting (RFC 3324)

@@ -40,7 +40,7 @@ use llms::embeddings::Embed;
 use rayon::prelude::*;
 use snafu::ResultExt;
 use std::collections::HashMap;
-use std::{any::Any, sync::Arc, thread};
+use std::{sync::Arc, thread};
 
 use super::table::{EmbeddingColumnConfig, EmbeddingInputMode};
 use crate::model::EmbeddingModelStore;
@@ -83,10 +83,6 @@ impl DisplayAs for EmbeddingTableExec {
 impl ExecutionPlan for EmbeddingTableExec {
     fn name(&self) -> &'static str {
         "EmbeddingTableExec"
-    }
-
-    fn as_any(&self) -> &dyn Any {
-        self
     }
 
     fn schema(&self) -> SchemaRef {

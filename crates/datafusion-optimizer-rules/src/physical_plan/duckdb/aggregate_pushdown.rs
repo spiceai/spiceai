@@ -64,10 +64,6 @@ impl ExecutionPlan for DuckDBAggregatePushdownMarkerExec {
         Self::name()
     }
 
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema(&self) -> SchemaRef {
         self.input.schema()
     }
@@ -145,7 +141,7 @@ impl ExecutionPlan for DuckDBAggregatePushdownMarkerExec {
         self.input.metrics()
     }
 
-    fn partition_statistics(&self, partition: Option<usize>) -> Result<Statistics> {
+    fn partition_statistics(&self, partition: Option<usize>) -> Result<Arc<Statistics>> {
         self.input.partition_statistics(partition)
     }
 

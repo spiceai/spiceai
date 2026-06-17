@@ -296,10 +296,6 @@ impl Hash for SqlScalarTableArgUdf {
 }
 
 impl ScalarUDFImpl for SqlScalarTableArgUdf {
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
-
     fn name(&self) -> &str {
         &self.name
     }
@@ -361,10 +357,6 @@ impl Hash for SqlScalarUdf {
 }
 
 impl ScalarUDFImpl for SqlScalarUdf {
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
-
     fn name(&self) -> &str {
         &self.name
     }
@@ -497,10 +489,6 @@ struct SqlTableProvider {
 
 #[async_trait::async_trait]
 impl TableProvider for SqlTableProvider {
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
-
     fn schema(&self) -> SchemaRef {
         Arc::clone(&self.schema)
     }

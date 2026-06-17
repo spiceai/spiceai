@@ -15,7 +15,6 @@ limitations under the License.
 */
 
 use std::{
-    any::Any,
     collections::{HashMap, HashSet},
     sync::Arc,
 };
@@ -161,10 +160,6 @@ fn columns_missing_from(expr: &[Expr], schema: &Fields) -> Vec<String> {
 
 #[async_trait]
 impl TableProvider for VectorScanTableProvider {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema(&self) -> SchemaRef {
         let mut fields_map = self
             .table_provider

@@ -75,7 +75,6 @@ limitations under the License.
 //! 6. Release fences (drop guards together).
 //! 7. Run [`PreparedStagedAppend::finish`] on each receipt.
 
-use std::any::Any;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -244,10 +243,6 @@ impl DisplayAs for CayennePartitionedOverwriteSink {
 
 #[async_trait]
 impl DataSink for CayennePartitionedOverwriteSink {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn metrics(&self) -> Option<MetricsSet> {
         None
     }
@@ -581,7 +576,7 @@ fn create_partition_physical_exprs(
 fn downcast_to_cayenne(
     provider: &Arc<dyn datafusion::catalog::TableProvider>,
 ) -> Option<&CayenneTableProvider> {
-    provider.as_any().downcast_ref::<CayenneTableProvider>()
+    provider.downcast_ref::<CayenneTableProvider>()
 }
 
 // ============================================================================
@@ -647,10 +642,6 @@ impl DisplayAs for CayennePartitionedAppendSink {
 
 #[async_trait]
 impl DataSink for CayennePartitionedAppendSink {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn metrics(&self) -> Option<MetricsSet> {
         None
     }

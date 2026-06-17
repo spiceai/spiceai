@@ -162,10 +162,6 @@ fn parse_partition_values(
 #[deny(clippy::missing_trait_methods)]
 #[async_trait]
 impl TableProvider for LocationPruningListingTable {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema(&self) -> Arc<Schema> {
         self.inner.schema()
     }
@@ -256,9 +252,10 @@ impl TableProvider for LocationPruningListingTable {
                 partition_values,
                 range: None,
                 statistics: None,
-                extensions: None,
+                extensions: Default::default(),
                 metadata_size_hint: None,
                 ordering: None,
+                table_reference: None,
             });
         }
 

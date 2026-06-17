@@ -97,7 +97,7 @@ impl SchemaCastScanExec {
             let remapped: Option<Vec<PhysicalSortExpr>> = ordering
                 .iter()
                 .map(|sort_expr| {
-                    let col = sort_expr.expr.as_any().downcast_ref::<Column>()?;
+                    let col = sort_expr.expr.downcast_ref::<Column>()?;
                     let input_idx = col.index();
                     if input_idx >= input_schema.fields().len() {
                         return None;
@@ -169,10 +169,6 @@ impl ExecutionPlan for SchemaCastScanExec {
         Self: Sized,
     {
         "SchemaCastScanExec"
-    }
-
-    fn as_any(&self) -> &dyn Any {
-        self
     }
 
     fn properties(&self) -> &Arc<PlanProperties> {
@@ -260,7 +256,7 @@ impl ExecutionPlan for SchemaCastScanExec {
         self.input.metrics()
     }
 
-    fn partition_statistics(&self, partition: Option<usize>) -> Result<Statistics> {
+    fn partition_statistics(&self, partition: Option<usize>) -> Result<Arc<Statistics>> {
         self.input.partition_statistics(partition)
     }
 
@@ -338,10 +334,6 @@ impl EnsureSchema {
 
 #[async_trait]
 impl TableProvider for EnsureSchema {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema(&self) -> SchemaRef {
         self.input.schema()
     }
@@ -590,7 +582,6 @@ mod tests {
         let sort_expr = &output_ordering[0];
         let col = sort_expr
             .expr
-            .as_any()
             .downcast_ref::<Column>()
             .expect("should be Column expr");
         assert_eq!(
