@@ -22,7 +22,7 @@ limitations under the License.
 
 use super::metadata::{
     CreateTableOptions, DeleteFile, InlinedData, InlinedDataStats, InlinedDelete,
-    PartitionMetadata, SnapshotFile, SnapshotFileStatistics, TableMetadata, TableStatistics,
+    PartitionMetadata, SnapshotFileStatistics, TableMetadata, TableStatistics,
 };
 use arrow_schema::SchemaRef;
 use async_trait::async_trait;
@@ -600,37 +600,6 @@ pub trait MetadataCatalog: Send + Sync {
 
     /// Clear all per-file statistics rows for a table.
     async fn clear_snapshot_file_statistics(&self, table_id: &str) -> CatalogResult<()>;
-
-    /// Upsert one row of the authoritative per-snapshot data-file manifest
-    /// (`cayenne_snapshot_file`) — the complete file set for a snapshot.
-    async fn upsert_snapshot_file(&self, file: &SnapshotFile) -> CatalogResult<()>;
-
-    /// Get the complete manifest file set for a snapshot. In the manifest
-    /// snapshot model this is the scan's authoritative file source (rather than
-    /// directory listing).
-    async fn get_snapshot_files(
-        &self,
-        table_id: &str,
-        snapshot_id: &str,
-    ) -> CatalogResult<Vec<SnapshotFile>>;
-
-    /// Get every manifest row for a table, across all snapshots. Drives
-    /// physical-file GC: a snapshot can reference a data file that physically
-    /// lives in another snapshot's directory (compaction references files in
-    /// place), so a file is only safe to delete when NO live-or-protected
-    /// snapshot's manifest references it. The caller filters these rows down to
-    /// the live set and reconstructs the referenced physical paths.
-    async fn get_all_snapshot_files(&self, table_id: &str) -> CatalogResult<Vec<SnapshotFile>>;
-
-    /// Drop manifest rows for snapshots other than the given one (snapshot GC).
-    async fn clear_snapshot_files_except(
-        &self,
-        table_id: &str,
-        snapshot_id: &str,
-    ) -> CatalogResult<()>;
-
-    /// Clear all manifest rows for a table.
-    async fn clear_snapshot_files(&self, table_id: &str) -> CatalogResult<()>;
 
     /// Upsert the persisted primary-key existence index (a bloom checkpoint),
     /// tagged with the snapshot id it covers. Stored in the metastore so it is

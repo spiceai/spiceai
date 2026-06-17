@@ -433,25 +433,15 @@ async fn compaction_collapses_tiny_protected_snapshots(
         "test setup should create protected snapshots before explicit compaction"
     );
 
-    // The protected-snapshot count trigger (firing even below the byte
-    // threshold) drives a maintenance compaction that collapses the tiny
-    // protected snapshots. That compaction runs on a spawned maintenance task
-    // sharing `compaction_lock`, so the explicit trigger can transiently lose the
-    // try-lock while the background incremental subset merges the protected set
-    // down to a single merged snapshot; re-trigger until it has collapsed
-    // (<= 1 protected snapshot remaining).
-    let mut collapsed = false;
-    for _ in 0..200 {
-        let _ = run_compaction(&table).await;
-        if count_protected_snapshots(&fixture, &table_id).await <= 1 {
-            collapsed = true;
-            break;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-    }
     assert!(
-        collapsed,
-        "protected snapshot count trigger should collapse the tiny protected snapshots"
+        run_compaction(&table).await,
+        "protected snapshot count should trigger maintenance compaction even below the byte threshold"
+    );
+
+    assert_eq!(
+        count_protected_snapshots(&fixture, &table_id).await,
+        0,
+        "compaction should clear protected snapshot metadata"
     );
 
     let total = count_rows(&ctx, "compaction_protected_snapshots").await;
