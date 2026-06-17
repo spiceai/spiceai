@@ -10583,13 +10583,13 @@ impl CayenneTableProvider {
     /// Returns `Ok(true)` if at least one snapshot rewrite occurred.
     #[doc(hidden)]
     pub async fn maybe_compact_small_files(&self) -> Result<bool> {
-        let Ok(_guard) = self.compaction_lock.try_lock() else {
-            tracing::trace!(
-                table = self.table_metadata.table_name.as_str(),
-                "Skipping compaction trigger: another pass already running",
-            );
-            return Ok(false);
-        };
+        // This explicit trigger is test-only (production background compaction
+        // goes through `CompactionRunner::run_compaction_trigger`). WAIT for the
+        // compaction lock rather than skipping when a spawned post-write
+        // maintenance/compaction holds it, so an explicit pass runs
+        // deterministically instead of racing the background tasks that share
+        // this lock.
+        let _guard = self.compaction_lock.lock().await;
 
         let max_passes = self.context.compaction_max_levels();
         let mut total_passes = 0_usize;
