@@ -65,11 +65,20 @@ const EWMA_ALPHA: f64 = 0.3;
 
 /// Number of recorded batches before the controller will act, so a cold table
 /// (or a bootstrap burst) doesn't trigger a spurious early adjustment.
-const WARMUP_BATCHES: u64 = 16;
+pub(crate) const WARMUP_BATCHES: u64 = 16;
 
 /// "Falling behind" hysteresis: act only once apply latency exceeds the offered-
 /// load interval by this factor (not merely equals it), so we don't chase noise.
 const BEHIND_RATIO: f64 = 1.2;
+
+/// `apply_vs_arrival` at or above which the seq-prefix bake DEFERS
+/// (back-pressure). `1.0` is break-even (per-batch apply latency == the
+/// inter-batch arrival interval); above it the apply has no headroom, so a
+/// background bake competing for the write path would push replication lag up.
+/// The bake yields to the apply here. Tunable: lower to protect lag harder
+/// (bake only with more slack), raise to recover bake/QPH at the cost of lag
+/// headroom.
+pub(crate) const BAKE_BACKPRESSURE_RATIO: f64 = 1.0;
 
 /// "Comfortably keeping up" hysteresis: only relax/back off work when apply
 /// latency is well under the offered-load interval.
@@ -976,6 +985,12 @@ pub(crate) struct LiveActuators {
     inline_flush_max_segments: AtomicI64,
     compaction_background_interval_ms: AtomicU64,
     compaction_trigger_files: AtomicUsize,
+    /// Deletion-index size (live PK tombstone count) at or above which the
+    /// seq-prefix bake fires. The merge-on-read read-amp lever: LOWERED when a
+    /// query goal is unmet and the index is large (bake more often → smaller
+    /// index → cheaper probe), RAISED under write pressure (bake less often →
+    /// bound the bake's write amplification).
+    bake_deletion_index_trigger: AtomicUsize,
     /// 0 means "unset" (use the session/default write concurrency).
     write_concurrency: AtomicUsize,
     /// Per-table in-memory CDC durability tier byte cap (`cdc_durability: memory`).
@@ -1008,6 +1023,7 @@ impl LiveActuators {
                 init.compaction_background_interval_ms,
             ),
             compaction_trigger_files: AtomicUsize::new(init.compaction_trigger_files),
+            bake_deletion_index_trigger: AtomicUsize::new(init.bake_deletion_index_trigger),
             write_concurrency: AtomicUsize::new(init.write_concurrency),
             mem_tier_max_bytes: AtomicI64::new(init.mem_tier_max_bytes),
             bytes_per_row: AtomicI64::new(
@@ -1029,6 +1045,7 @@ impl LiveActuators {
                 .compaction_background_interval_ms
                 .load(Ordering::Relaxed),
             compaction_trigger_files: self.compaction_trigger_files.load(Ordering::Relaxed),
+            bake_deletion_index_trigger: self.bake_deletion_index_trigger.load(Ordering::Relaxed),
             write_concurrency: self.write_concurrency.load(Ordering::Relaxed),
             mem_tier_max_bytes: self.mem_tier_max_bytes.load(Ordering::Relaxed),
         }
@@ -1049,6 +1066,9 @@ impl LiveActuators {
     }
     pub fn compaction_trigger_files(&self) -> usize {
         self.compaction_trigger_files.load(Ordering::Relaxed)
+    }
+    pub fn bake_deletion_index_trigger(&self) -> usize {
+        self.bake_deletion_index_trigger.load(Ordering::Relaxed)
     }
     pub fn write_concurrency(&self) -> usize {
         self.write_concurrency.load(Ordering::Relaxed)
@@ -1098,6 +1118,12 @@ impl LiveActuators {
                     Ordering::Relaxed,
                 );
             }
+            Actuator::BakeDeletionIndexTrigger => {
+                self.bake_deletion_index_trigger.store(
+                    usize::try_from(adj.new_value).unwrap_or(usize::MAX),
+                    Ordering::Relaxed,
+                );
+            }
             Actuator::WriteConcurrency => {
                 self.write_concurrency.store(
                     usize::try_from(adj.new_value).unwrap_or(usize::MAX),
@@ -1116,6 +1142,7 @@ pub(crate) struct ActuatorValues {
     pub inline_flush_max_segments: i64,
     pub compaction_background_interval_ms: u64,
     pub compaction_trigger_files: usize,
+    pub bake_deletion_index_trigger: usize,
     pub write_concurrency: usize,
     pub mem_tier_max_bytes: i64,
 }
@@ -1128,6 +1155,7 @@ pub(crate) struct TuningBounds {
     pub inline_flush_max_bytes: (i64, i64),
     pub compaction_background_interval_ms: (u64, u64),
     pub compaction_trigger_files: (usize, usize),
+    pub bake_deletion_index_trigger: (usize, usize),
     pub write_concurrency: (usize, usize),
     pub mem_tier_max_bytes: (i64, i64),
 }
@@ -1143,6 +1171,7 @@ pub(crate) enum Actuator {
     MemTierMaxBytes,
     CompactionIntervalMs,
     CompactionTriggerFiles,
+    BakeDeletionIndexTrigger,
     WriteConcurrency,
 }
 
@@ -1155,6 +1184,7 @@ impl Actuator {
             Self::MemTierMaxBytes => "mem_tier_max_bytes",
             Self::CompactionIntervalMs => "compaction_interval_ms",
             Self::CompactionTriggerFiles => "compaction_trigger_files",
+            Self::BakeDeletionIndexTrigger => "bake_deletion_index_trigger",
             Self::WriteConcurrency => "write_concurrency",
         }
     }
@@ -1682,6 +1712,24 @@ pub(crate) fn decide_with_goals(
                     reason: "high read-amp: lower compaction trigger",
                 });
             }
+            // Lower the seq-prefix bake trigger so the bake fires sooner: a
+            // smaller live deletion index means a cheaper merge-on-read probe —
+            // the read-amp lever for the per-query tombstone scan. Multiplicative
+            // step (the trigger's range spans 1e3..5e6), CPU-gated like the
+            // compaction levers above (the bake runs on the compaction task).
+            if cpu_ok
+                && let Some(v) = clamp_move_usize(
+                    cur.bake_deletion_index_trigger,
+                    shrink_usize(cur.bake_deletion_index_trigger),
+                    b.bake_deletion_index_trigger,
+                )
+            {
+                return Some(Adjustment {
+                    actuator: Actuator::BakeDeletionIndexTrigger,
+                    new_value: u64::try_from(v).unwrap_or(0),
+                    reason: "high read-amp: lower the bake trigger → smaller deletion index → cheaper merge-on-read probe",
+                });
+            }
         }
 
         // An I/O- or publish-bound table that is NOT behind grows the memtable to
@@ -1700,6 +1748,26 @@ pub(crate) fn decide_with_goals(
                 actuator: Actuator::InlineFlushBytes,
                 new_value: u64::try_from(v).unwrap_or(0),
                 reason: "io/publish-bound: enlarge memtable to amortize commits and write fewer, larger files",
+            });
+        }
+
+        // I/O-/publish-bound but read-amp is NOT high (no query payoff from baking
+        // sooner): RAISE the bake trigger so the bake's write-amplification stops
+        // competing for the saturated write path. Withheld when read-amp is high
+        // (the read-amp arm above already lowered it for query health — never fight
+        // that). Multiplicative step over the wide 1e3..5e6 range.
+        if (io_bound || publish_bound)
+            && !read_amp_high
+            && let Some(v) = clamp_move_usize(
+                cur.bake_deletion_index_trigger,
+                grow_usize(cur.bake_deletion_index_trigger),
+                b.bake_deletion_index_trigger,
+            )
+        {
+            return Some(Adjustment {
+                actuator: Actuator::BakeDeletionIndexTrigger,
+                new_value: u64::try_from(v).unwrap_or(0),
+                reason: "io/publish-bound: raise the bake trigger → bake less often → bound bake write-amp",
             });
         }
 
@@ -1924,6 +1992,31 @@ fn decide_goal(
                 reason: "query-latency goal: lower compaction trigger",
             });
         }
+        // Lower the seq-prefix bake trigger so the bake fires sooner — a smaller
+        // live deletion index means a cheaper merge-on-read probe per query.
+        // Gated on read-amp being elevated (the read-side proxy for "the deletion
+        // index is large enough to be hurting probes"): when scans are already
+        // cheap (read-amp low), baking sooner would only add write-amp without a
+        // query payoff, so leave the trigger where it is. No CPU/memory gate is
+        // needed — lowering the trigger spends a future compaction CPU slice the
+        // background compactor already schedules, not a new resource.
+        if s.read_amp > READ_AMP_LOW
+            && let Some(v) = clamp_move_usize(
+                cur.bake_deletion_index_trigger,
+                goal_shrink_usize(
+                    cur.bake_deletion_index_trigger,
+                    b.bake_deletion_index_trigger,
+                    query_v,
+                ),
+                b.bake_deletion_index_trigger,
+            )
+        {
+            return Some(Adjustment {
+                actuator: Actuator::BakeDeletionIndexTrigger,
+                new_value: u64::try_from(v).unwrap_or(0),
+                reason: "query-latency goal: lower the bake trigger → smaller deletion index → cheaper merge-on-read probe",
+            });
+        }
         // Shed a write shard (fewer files) — but not while ingest is also behind,
         // so we don't slow the lag goal to help the query goal.
         if !ingest_violated
@@ -2011,6 +2104,33 @@ fn decide_goal(
                 reason: "replication-lag goal: compact more to keep the snapshot lean",
             });
         }
+    }
+
+    // (3b) Write-pressure backoff for the bake trigger: when the write path is
+    // I/O- or publish-bound (the same `vortex_write` / metastore-publish latency
+    // signals the storage-tier logic reads — the bake's write-amplification adds
+    // directly to that path), RAISE the bake trigger so the bake fires less often
+    // and stops competing for write throughput. Scaled by whichever ingest/lag
+    // violation is active (`ingest_v`), with the goal-mode crawl floor so it still
+    // moves under a bare write-pressure signal. Withheld while a query goal is
+    // violated so it never fights the query-tier LOWER move above (queries win).
+    if (io_bound || publish_bound)
+        && !query_violated
+        && let Some(v) = clamp_move_usize(
+            cur.bake_deletion_index_trigger,
+            goal_grow_usize(
+                cur.bake_deletion_index_trigger,
+                b.bake_deletion_index_trigger,
+                ingest_v,
+            ),
+            b.bake_deletion_index_trigger,
+        )
+    {
+        return Some(Adjustment {
+            actuator: Actuator::BakeDeletionIndexTrigger,
+            new_value: u64::try_from(v).unwrap_or(0),
+            reason: "write pressure (io/publish-bound): raise the bake trigger → bake less often → bound bake write-amp",
+        });
     }
 
     // (4) Healthy-relax: every active goal comfortably met and memory ok → hand
@@ -2256,6 +2376,7 @@ mod tests {
             inline_flush_max_bytes: (2 * 1024 * 1024, 128 * 1024 * 1024),
             compaction_background_interval_ms: (2_000, 60_000),
             compaction_trigger_files: (2, 32),
+            bake_deletion_index_trigger: (1_000, 5_000_000),
             write_concurrency: (1, 16),
             mem_tier_max_bytes: (64 * 1024 * 1024, 2048 * 1024 * 1024),
         }
@@ -2268,6 +2389,7 @@ mod tests {
             inline_flush_max_segments: 64,
             compaction_background_interval_ms: 10_000,
             compaction_trigger_files: 8,
+            bake_deletion_index_trigger: 50_000,
             write_concurrency: 4,
             mem_tier_max_bytes: 256 * 1024 * 1024,
         }
@@ -2840,6 +2962,10 @@ mod tests {
                 Actuator::CompactionTriggerFiles => (
                     b.compaction_trigger_files.0 as u64,
                     b.compaction_trigger_files.1 as u64,
+                ),
+                Actuator::BakeDeletionIndexTrigger => (
+                    b.bake_deletion_index_trigger.0 as u64,
+                    b.bake_deletion_index_trigger.1 as u64,
                 ),
                 Actuator::WriteConcurrency => {
                     (b.write_concurrency.0 as u64, b.write_concurrency.1 as u64)
