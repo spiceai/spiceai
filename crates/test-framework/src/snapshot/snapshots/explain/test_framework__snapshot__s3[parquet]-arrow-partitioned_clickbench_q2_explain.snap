@@ -14,19 +14,18 @@ description: "Query: clickbench_q2"
 |               |   AggregateExec: mode=Final, gby=[], aggr=[count(Int64(1))]                                      |
 |               |     CoalescePartitionsExec                                                                       |
 |               |       AggregateExec: mode=Partial, gby=[], aggr=[count(Int64(1))]                                |
-|               |         ProjectionExec: expr=[]                                                                  |
-|               |           FilterExec: AdvEngineID@0 != 0                                                         |
-|               |             SchemaCastScanExec                                                                   |
-|               |               PartitionedUnionExec                                                               |
-|               |                 BytesProcessedExec                                                               |
-|               |                   DataSourceExec: partitions=16, partition_sizes=[<redacted>]                    |
-|               |                 BytesProcessedExec                                                               |
-|               |                   DataSourceExec: partitions=16, partition_sizes=[<redacted>]                    |
-|               |                 BytesProcessedExec                                                               |
-|               |                   DataSourceExec: partitions=16, partition_sizes=[<redacted>]                    |
-|               |                 BytesProcessedExec                                                               |
-|               |                   DataSourceExec: partitions=16, partition_sizes=[<redacted>]                    |
-|               |                 BytesProcessedExec                                                               |
-|               |                   DataSourceExec: partitions=16, partition_sizes=[<redacted>]                    |
+|               |         FilterExec: AdvEngineID@0 != 0, projection=[]                                            |
+|               |           SchemaCastScanExec                                                                     |
+|               |             PartitionedUnionExec                                                                 |
+|               |               BytesProcessedExec                                                                 |
+|               |                 DataSourceExec: partitions=16, partition_sizes=[<redacted>]                      |
+|               |               BytesProcessedExec                                                                 |
+|               |                 DataSourceExec: partitions=16, partition_sizes=[<redacted>]                      |
+|               |               BytesProcessedExec                                                                 |
+|               |                 DataSourceExec: partitions=16, partition_sizes=[<redacted>]                      |
+|               |               BytesProcessedExec                                                                 |
+|               |                 DataSourceExec: partitions=16, partition_sizes=[<redacted>]                      |
+|               |               BytesProcessedExec                                                                 |
+|               |                 DataSourceExec: partitions=16, partition_sizes=[<redacted>]                      |
 |               |                                                                                                  |
 +---------------+--------------------------------------------------------------------------------------------------+

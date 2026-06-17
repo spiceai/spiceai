@@ -16,7 +16,7 @@ description: "Query: clickbench_q16"
 |               |         RepartitionExec: partitioning=Hash([UserID@0], 16), input_partitions=16                                |
 |               |           AggregateExec: mode=Partial, gby=[UserID@0 as UserID], aggr=[count(Int64(1))]                        |
 |               |             SchemaCastScanExec                                                                                 |
-|               |               CayenneAccelerationExec                                                                          |
+|               |               CayenneAccelerationExec: snapshots_scanned=1, files_scanned=81                                   |
 |               |                 BytesProcessedExec                                                                             |
 |               |                   DataSourceExec: file_groups={16 groups: [<redacted>]}, projection=[UserID], file_type=vortex |
 |               |                                                                                                                |
