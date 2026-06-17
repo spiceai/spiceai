@@ -409,10 +409,6 @@ impl Hash for WasmScalarTableArgUdf {
 }
 
 impl ScalarUDFImpl for WasmScalarTableArgUdf {
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
-
     fn name(&self) -> &str {
         &self.name
     }
@@ -552,10 +548,6 @@ struct WasmTableProvider {
 
 #[async_trait::async_trait]
 impl TableProvider for WasmTableProvider {
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
-
     fn schema(&self) -> SchemaRef {
         Arc::clone(&self.output_schema)
     }

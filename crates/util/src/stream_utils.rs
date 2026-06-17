@@ -230,6 +230,10 @@ impl ExecutionPlan for StreamingExec {
         "StreamingExec"
     }
 
+    fn downcast_delegate(&self) -> Option<&dyn ExecutionPlan> {
+        None
+    }
+
     fn static_name() -> &'static str
     where
         Self: Sized,

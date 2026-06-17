@@ -424,10 +424,6 @@ struct RemoteTableProvider {
 
 #[async_trait::async_trait]
 impl TableProvider for RemoteTableProvider {
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
-
     fn schema(&self) -> SchemaRef {
         Arc::clone(&self.schema)
     }
@@ -670,10 +666,6 @@ impl Hash for RemoteScalarUdf {
 }
 
 impl ScalarUDFImpl for RemoteScalarUdf {
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
-
     fn name(&self) -> &str {
         &self.name
     }
