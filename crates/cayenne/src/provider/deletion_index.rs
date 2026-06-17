@@ -1041,23 +1041,23 @@ impl DeletionIndex {
         if self.core.delete_count == 0 {
             return;
         }
-        let mut candidates: Vec<u32> = Vec::with_capacity(BATCH_SWEEP_CHUNK.min(pks.len()));
+        // Carry each survivor's bloom hash forward to pass 2 so `hash_key_i64`
+        // runs exactly once per key: pass 2 reuses the hash computed during the
+        // sweep rather than recomputing it for every bloom-hit candidate.
+        let mut candidates: Vec<(u32, u64)> = Vec::with_capacity(BATCH_SWEEP_CHUNK.min(pks.len()));
         for (chunk_index, chunk) in pks.chunks(BATCH_SWEEP_CHUNK).enumerate() {
             let chunk_base = chunk_index * BATCH_SWEEP_CHUNK;
             candidates.clear();
             // Pass 1: bloom sweep — no tier walk in the loop body.
             for (i, &pk) in (0_u32..).zip(chunk.iter()) {
-                if self.core.bloom.might_contain(hash_key_i64(pk)) {
-                    candidates.push(i);
+                let hash = hash_key_i64(pk);
+                if self.core.bloom.might_contain(hash) {
+                    candidates.push((i, hash));
                 }
             }
             // Pass 2: tier walk for the bloom survivors only.
-            for &i in &candidates {
-                if let Some(tombstone) = self.core.tombstone_of(
-                    &chunk[i as usize],
-                    hash_key_i64(chunk[i as usize]),
-                    None,
-                ) {
+            for &(i, hash) in &candidates {
+                if let Some(tombstone) = self.core.tombstone_of(&chunk[i as usize], hash, None) {
                     on_hit(chunk_base + i as usize, tombstone);
                 }
             }
