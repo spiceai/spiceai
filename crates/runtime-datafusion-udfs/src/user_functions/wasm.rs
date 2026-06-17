@@ -433,6 +433,8 @@ impl ScalarUDFImpl for WasmScalarTableArgUdf {
         args: Vec<Expr>,
         _info: &SimplifyContext,
     ) -> DataFusionResult<ExprSimplifyResult> {
+        // Migrate to `TableFunctionImpl::call_with_args` (needs a `Session` here).
+        #[expect(deprecated)]
         let provider = self.table_func.call(&args)?;
         let table_source = provider_as_source(provider);
         let table_scan = TableScan::try_new(

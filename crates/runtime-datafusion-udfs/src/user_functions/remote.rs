@@ -583,10 +583,6 @@ impl Hash for RemoteScalarTableArgUdf {
 }
 
 impl ScalarUDFImpl for RemoteScalarTableArgUdf {
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
-
     fn name(&self) -> &str {
         &self.name
     }
@@ -617,6 +613,8 @@ impl ScalarUDFImpl for RemoteScalarTableArgUdf {
         args: Vec<Expr>,
         _info: &SimplifyContext,
     ) -> std::result::Result<ExprSimplifyResult, DataFusionError> {
+        // Migrate to `TableFunctionImpl::call_with_args` (needs a `Session` here).
+        #[expect(deprecated)]
         let provider = self.table_func.call(&args)?;
         let table_source = provider_as_source(provider);
         let table_scan = TableScan::try_new(
