@@ -2449,17 +2449,6 @@ fn concat_change_batches(batches: &[ChangeBatch]) -> crate::accelerated_table::R
     );
 
     let schema = batches[0].record.schema();
-    // Diagnostic: log each batch's full schema so we can see exactly which
-    // envelope's struct/field nullability diverges when concat fails.
-    if tracing::enabled!(tracing::Level::DEBUG) {
-        for (i, b) in batches.iter().enumerate() {
-            tracing::debug!(
-                "concat_change_batches: batch[{i}] rows={} schema={:?}",
-                b.record.num_rows(),
-                b.record.schema(),
-            );
-        }
-    }
     let records: Vec<&RecordBatch> = batches.iter().map(|b| &b.record).collect();
     let combined = arrow::compute::concat_batches(&schema, records)
         .context(crate::accelerated_table::FailedToBuildRecordBatchSnafu)?;
