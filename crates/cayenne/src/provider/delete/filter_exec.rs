@@ -176,7 +176,7 @@ pub(crate) fn is_pk_visible_i64(
     insert_record_handling: InsertRecordHandling,
     min_delete_seq_to_apply: Option<i64>,
 ) -> bool {
-    match tombstones.get_with_min_seq(pk, min_delete_seq_to_apply) {
+    match tombstones.get(pk) {
         None => true,
         Some(tombstone) => {
             tombstone_visible(tombstone, insert_record_handling, min_delete_seq_to_apply)
@@ -200,7 +200,7 @@ pub(crate) fn is_pk_visible_row_key(
     insert_record_handling: InsertRecordHandling,
     min_delete_seq_to_apply: Option<i64>,
 ) -> bool {
-    match tombstones.get_with_min_seq(key, min_delete_seq_to_apply) {
+    match tombstones.get(key) {
         None => true,
         Some(tombstone) => {
             tombstone_visible(tombstone, insert_record_handling, min_delete_seq_to_apply)
