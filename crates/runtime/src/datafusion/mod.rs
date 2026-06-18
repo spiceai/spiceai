@@ -731,8 +731,9 @@ pub struct DataFusion {
     pub(crate) accelerator_engine_registry: Arc<AcceleratorEngineRegistry>,
     // Controls the parallelism of accelerated table refreshes
     acceleration_refresh_semaphore: Option<Arc<Semaphore>>,
-    // Bounds concurrently-executing analytical queries (query admission control);
-    // `None` = unbounded. Sized from `runtime.query.max_concurrent_queries`.
+    // Bounds concurrently-executing query plans — ordinary queries + DDL/DML +
+    // EXECUTE (not lightweight PREPARE/DEALLOCATE/SET) — i.e. query admission
+    // control; `None` = unbounded. Sized from `runtime.query.max_concurrent_queries`.
     query_admission_semaphore: Option<Arc<Semaphore>>,
     pub(crate) task_history_enabled: bool,
     // Dedicated runtime for CPU-bound DataFusion queries

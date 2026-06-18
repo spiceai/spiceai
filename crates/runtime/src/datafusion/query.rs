@@ -2463,8 +2463,18 @@ mod tests {
                 .map(|_q| ())
         });
 
-        // Let B queue behind A for the permit, then cancel it.
-        tokio::time::sleep(Duration::from_millis(300)).await;
+        // Wait until B is registered in the cancel registry, then cancel it.
+        // `run_internal` registers a query in the cancel registry BEFORE acquiring
+        // the admission permit, so B's presence here means it is genuinely queued
+        // for the permit — making the cancellation deterministic instead of racing
+        // a fixed sleep (which is flaky under slow CI). Bounded fallback (~5s).
+        let registry = df.query_cancel_registry();
+        for _ in 0..500 {
+            if registry.list().iter().any(|info| info.query_id == query_id) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
         cancel_token.cancel();
 
         let b_err = tokio::time::timeout(Duration::from_secs(5), b_handle)

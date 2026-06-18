@@ -485,9 +485,11 @@ impl DataFusionBuilder {
         self
     }
 
-    /// Bound concurrently-executing analytical queries (query admission control).
-    /// `None` leaves the gate unbounded (the prior behavior); `Some(n)` installs a
-    /// semaphore of `n` permits (clamped to at least 1).
+    /// Bound the number of concurrently-executing query plans — ordinary queries
+    /// plus DDL/DML and `EXECUTE` (not lightweight `PREPARE`/`DEALLOCATE`/`SET`) —
+    /// i.e. query admission control. `None` leaves the gate unbounded (the prior
+    /// behavior); `Some(n)` installs a semaphore of `n` permits (clamped to at
+    /// least 1).
     #[must_use]
     pub fn max_concurrent_queries(mut self, max_concurrent_queries: Option<usize>) -> Self {
         self.query_admission_semaphore =
