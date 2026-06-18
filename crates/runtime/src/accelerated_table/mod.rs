@@ -16,6 +16,7 @@ limitations under the License.
 
 use crate::config::ClusterRole;
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};

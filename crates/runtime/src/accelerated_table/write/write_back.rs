@@ -469,9 +469,6 @@ mod tests {
         fn name(&self) -> &'static str {
             "ErrorExec"
         }
-        fn as_any(&self) -> &dyn Any {
-            self
-        }
         fn properties(&self) -> &Arc<PlanProperties> {
             &self.properties
         }
@@ -519,9 +516,6 @@ mod tests {
 
     #[async_trait]
     impl TableProvider for MockTableProvider {
-        fn as_any(&self) -> &dyn Any {
-            self
-        }
         fn schema(&self) -> SchemaRef {
             Arc::clone(&self.schema)
         }

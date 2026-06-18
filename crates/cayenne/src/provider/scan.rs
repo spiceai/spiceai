@@ -611,6 +611,10 @@ impl DisplayAs for CayenneAccelerationExec {
 
 #[deny(clippy::missing_trait_methods)]
 impl ExecutionPlan for CayenneAccelerationExec {
+    fn downcast_delegate(&self) -> Option<&dyn ExecutionPlan> {
+        None
+    }
+
     fn with_preserve_order(&self, _preserve_order: bool) -> Option<Arc<dyn ExecutionPlan>> {
         None
     }
@@ -833,7 +837,6 @@ mod tests {
         );
         assert!(
             repartitioned_plan
-                .as_any()
                 .downcast_ref::<RepartitionExec>()
                 .is_some()
         );
@@ -866,10 +869,7 @@ mod tests {
             .expect("inner plan should support projection swapping");
 
         assert!(
-            swapped
-                .as_any()
-                .downcast_ref::<CayenneAccelerationExec>()
-                .is_some(),
+            swapped.downcast_ref::<CayenneAccelerationExec>().is_some(),
             "projection-swapped Cayenne plan should stay wrapped for optimizer identification"
         );
     }

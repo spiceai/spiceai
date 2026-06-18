@@ -367,6 +367,10 @@ impl ExecutionPlan for IndexerExec {
         None
     }
 
+    fn downcast_delegate(&self) -> Option<&dyn ExecutionPlan> {
+        None
+    }
+
     fn name(&self) -> &'static str {
         "IndexerExec"
     }

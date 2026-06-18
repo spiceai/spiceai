@@ -26866,7 +26866,7 @@ mod tests {
         ) -> datafusion_common::Result<Arc<dyn ExecutionPlan>> {
             Ok(Arc::new(StatsOverrideExec::new(
                 Arc::clone(&children[0]),
-                self.stats.clone(),
+                (*self.stats).clone(),
             )))
         }
         fn execute(

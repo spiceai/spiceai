@@ -84,6 +84,7 @@ impl SpiceLogicalCodec {
 
     /// Reconstructs a UDTF-produced `TableProvider` by re-invoking the UDTF with
     /// the serialized arguments.
+    #[expect(deprecated)] // DF54: TableFunctionImpl::call deferred (needs Session); see follow-up
     pub(crate) fn invoke_udtf(
         udtf_args: UdtfArgs,
         runtime: &Arc<Runtime>,
@@ -136,6 +137,7 @@ impl SpiceLogicalCodec {
 
     /// Reconstructs an RRF (Reciprocal Rank Fusion) `TableProvider` by re-invoking
     /// the nested search UDTFs and then the RRF UDTF.
+    #[expect(deprecated)] // DF54: TableFunctionImpl::call deferred (needs Session); see follow-up
     fn invoke_rrf(rrf_args: &RrfArgs, runtime: &Arc<Runtime>) -> Result<Arc<dyn TableProvider>> {
         use datafusion::catalog::TableFunctionImpl;
         use datafusion::logical_expr::expr::FieldMetadata;

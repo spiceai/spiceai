@@ -4927,10 +4927,6 @@ mod tests {
 
     #[async_trait]
     impl TableProvider for CountingInsertProvider {
-        fn as_any(&self) -> &dyn std::any::Any {
-            self
-        }
-
         fn schema(&self) -> arrow::datatypes::SchemaRef {
             self.inner.schema()
         }
@@ -4987,9 +4983,6 @@ mod tests {
         fn name(&self) -> &'static str {
             "CountingExec"
         }
-        fn as_any(&self) -> &dyn Any {
-            self
-        }
         fn properties(&self) -> &Arc<PlanProperties> {
             self.inner.properties()
         }
@@ -5031,9 +5024,6 @@ mod tests {
 
     #[async_trait]
     impl TableProvider for WriteOrderRecordingProvider {
-        fn as_any(&self) -> &dyn std::any::Any {
-            self
-        }
         fn schema(&self) -> arrow::datatypes::SchemaRef {
             self.inner.schema()
         }
@@ -5068,10 +5058,6 @@ mod tests {
 
     #[async_trait]
     impl TableProvider for FailFirstWriteProvider {
-        fn as_any(&self) -> &dyn std::any::Any {
-            self
-        }
-
         fn schema(&self) -> arrow::datatypes::SchemaRef {
             self.inner.schema()
         }
@@ -5681,9 +5667,6 @@ mod tests {
 
     #[async_trait]
     impl TableProvider for SlowProvider {
-        fn as_any(&self) -> &dyn std::any::Any {
-            self
-        }
         fn schema(&self) -> arrow::datatypes::SchemaRef {
             self.inner.schema()
         }

@@ -46,6 +46,7 @@ impl TextSearchCandidate {
 
 #[async_trait]
 impl CandidateGeneration for TextSearchCandidate {
+    #[expect(deprecated)] // DF54: TableFunctionImpl::call deferred (needs Session); see follow-up
     fn search(&self, query: String) -> Result<Arc<dyn TableProvider>, DataFusionError> {
         let udtf_args = TextSearchTableFunc::to_expr(&TextSearchTableFuncArgs {
             tbl: self.tbl.clone(),

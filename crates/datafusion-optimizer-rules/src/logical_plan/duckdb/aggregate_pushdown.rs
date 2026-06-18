@@ -292,6 +292,7 @@ mod tests {
 
             assert!(
                 ext.node
+                    .as_any()
                     .downcast_ref::<DuckDBAggregatePushdownNode>()
                     .is_some(),
                 "Must cast to marker node type"
@@ -440,6 +441,7 @@ mod tests {
 
         let marker = ext
             .node
+            .as_any()
             .downcast_ref::<DuckDBAggregatePushdownNode>()
             .expect("Must be a marker node");
 
@@ -508,6 +510,7 @@ mod tests {
 
         let marker = ext
             .node
+            .as_any()
             .downcast_ref::<DuckDBAggregatePushdownNode>()
             .expect("Must be a marker node");
 

@@ -757,7 +757,7 @@ impl BloomFilter {
 
 fn datafusion_hash_join_random_state() -> SeededRandomState {
     // DF54 replaced the old `('J','O','I','N')` 4-seed RandomState with a single-u64 seed.
-    SeededRandomState::with_seed(12210250226015887276)
+    SeededRandomState::with_seed(12_210_250_226_015_887_276)
 }
 
 fn for_each_datafusion_hash(
