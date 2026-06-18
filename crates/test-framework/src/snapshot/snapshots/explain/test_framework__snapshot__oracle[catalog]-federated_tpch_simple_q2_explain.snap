@@ -2,24 +2,24 @@
 source: crates/test-framework/src/snapshot/mod.rs
 description: "Query: tpch_simple_q2"
 ---
-+---------------+--------------------------------------------------------------------------------------------------------------------------------------------------------+
-| plan_type     | plan                                                                                                                                                   |
-+---------------+--------------------------------------------------------------------------------------------------------------------------------------------------------+
-| logical_plan  | Projection: oracle_tpch.TPCH_SF1.LINEITEM.L_LINENUMBER                                                                                                 |
-|               |   Inner Join: oracle_tpch.TPCH_SF1.LINEITEM.L_LINENUMBER = __scalar_sq_1.max(oracle_tpch.TPCH_SF1.LINEITEM.L_LINENUMBER)                               |
-|               |     TableScan: oracle_tpch.TPCH_SF1.LINEITEM projection=[L_LINENUMBER]                                                                                 |
-|               |     SubqueryAlias: __scalar_sq_1                                                                                                                       |
-|               |       Aggregate: groupBy=[[]], aggr=[[max(oracle_tpch.TPCH_SF1.LINEITEM.L_LINENUMBER)]]                                                                |
-|               |         TableScan: oracle_tpch.TPCH_SF1.LINEITEM projection=[L_LINENUMBER]                                                                             |
-| physical_plan | HashJoinExec: mode=CollectLeft, join_type=Inner, on=[(max(oracle_tpch.TPCH_SF1.LINEITEM.L_LINENUMBER)@0, L_LINENUMBER@0)], projection=[L_LINENUMBER@1] |
-|               |   AggregateExec: mode=Final, gby=[], aggr=[max(oracle_tpch.TPCH_SF1.LINEITEM.L_LINENUMBER)]                                                            |
-|               |     CoalescePartitionsExec                                                                                                                             |
-|               |       AggregateExec: mode=Partial, gby=[], aggr=[max(oracle_tpch.TPCH_SF1.LINEITEM.L_LINENUMBER)]                                                      |
-|               |         RepartitionExec: partitioning=RoundRobinBatch(32), input_partitions=1                                                                          |
-|               |           BytesProcessedExec                                                                                                                           |
-|               |             OracleExec sql=SELECT "L_LINENUMBER" FROM "TPCH_SF1"."LINEITEM"                                                                            |
-|               |   RepartitionExec: partitioning=RoundRobinBatch(32), input_partitions=1                                                                                |
-|               |     BytesProcessedExec                                                                                                                                 |
-|               |       OracleExec sql=SELECT "L_LINENUMBER" FROM "TPCH_SF1"."LINEITEM"                                                                                  |
-|               |                                                                                                                                                        |
-+---------------+--------------------------------------------------------------------------------------------------------------------------------------------------------+
++---------------+---------------------------------------------------------------------------------------------------+
+| plan_type     | plan                                                                                              |
++---------------+---------------------------------------------------------------------------------------------------+
+| logical_plan  | Filter: oracle_tpch.TPCH_SF1.LINEITEM.L_LINENUMBER = (<subquery>)                                 |
+|               |   Subquery:                                                                                       |
+|               |     Aggregate: groupBy=[[]], aggr=[[max(oracle_tpch.TPCH_SF1.LINEITEM.L_LINENUMBER)]]             |
+|               |       TableScan: oracle_tpch.TPCH_SF1.LINEITEM projection=[L_LINENUMBER]                          |
+|               |   TableScan: oracle_tpch.TPCH_SF1.LINEITEM projection=[L_LINENUMBER]                              |
+| physical_plan | ScalarSubqueryExec: subqueries=1                                                                  |
+|               |   FilterExec: L_LINENUMBER@0 = scalar_subquery(<pending>)                                         |
+|               |     RepartitionExec: partitioning=RoundRobinBatch(32), input_partitions=1                         |
+|               |       BytesProcessedExec                                                                          |
+|               |         OracleExec sql=SELECT "L_LINENUMBER" FROM "TPCH_SF1"."LINEITEM"                           |
+|               |   AggregateExec: mode=Final, gby=[], aggr=[max(oracle_tpch.TPCH_SF1.LINEITEM.L_LINENUMBER)]       |
+|               |     CoalescePartitionsExec                                                                        |
+|               |       AggregateExec: mode=Partial, gby=[], aggr=[max(oracle_tpch.TPCH_SF1.LINEITEM.L_LINENUMBER)] |
+|               |         RepartitionExec: partitioning=RoundRobinBatch(32), input_partitions=1                     |
+|               |           BytesProcessedExec                                                                      |
+|               |             OracleExec sql=SELECT "L_LINENUMBER" FROM "TPCH_SF1"."LINEITEM"                       |
+|               |                                                                                                   |
++---------------+---------------------------------------------------------------------------------------------------+
