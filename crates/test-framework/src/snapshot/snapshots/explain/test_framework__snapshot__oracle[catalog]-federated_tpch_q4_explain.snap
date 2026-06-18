@@ -21,7 +21,7 @@ description: "Query: tpch_q4"
 |               |       AggregateExec: mode=FinalPartitioned, gby=[O_ORDERPRIORITY@0 as O_ORDERPRIORITY], aggr=[count(Int64(1))]                                                                        |
 |               |         RepartitionExec: partitioning=Hash([O_ORDERPRIORITY@0], 32), input_partitions=32                                                                                              |
 |               |           AggregateExec: mode=Partial, gby=[O_ORDERPRIORITY@0 as O_ORDERPRIORITY], aggr=[count(Int64(1))]                                                                             |
-|               |             HashJoinExec: mode=Partitioned, join_type=LeftSemi, on=[(O_ORDERKEY@0, L_ORDERKEY@0)], projection=[O_ORDERPRIORITY@1]                                                     |
+|               |             HashJoinExec: mode=Partitioned, join_type=LeftSemi, accumulator=MinMaxLeftAccumulator, on=[(O_ORDERKEY@0, L_ORDERKEY@0)], projection=[O_ORDERPRIORITY@1]                  |
 |               |               RepartitionExec: partitioning=Hash([O_ORDERKEY@0], 32), input_partitions=32                                                                                             |
 |               |                 FilterExec: O_ORDERDATE@1 >= 1993-07-01 AND O_ORDERDATE@1 < 1993-10-01, projection=[O_ORDERKEY@0, O_ORDERPRIORITY@2]                                                  |
 |               |                   RepartitionExec: partitioning=RoundRobinBatch(32), input_partitions=1                                                                                               |
