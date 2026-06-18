@@ -347,6 +347,68 @@ fn bench_extend_max_cumulative_from_empty(c: &mut Criterion) {
     group.finish();
 }
 
+/// Rank-1 protected-scan probe regression (bake #11326).
+///
+/// In CH-bench HTAP the CDC data lives in protected snapshots, scanned with
+/// `min_delete_seq = Some(S)`. The bake guards the global-bloom fast-reject
+/// behind `min_delete_seq.is_none()`, so a protected probe SKIPS the one-shot
+/// global-bloom miss->done and instead walks every frozen run per row — even for
+/// rows with NO applicable tombstone (the common scan case). This A/Bs the two
+/// probe shapes on a multi-run index, probing keys that are never deleted:
+///   - `get` (None)             -> global-bloom fast-reject (one hash + one bloom)
+///   - `get_with_min_seq(Some)`  -> per-run walk (N runs x per-run bloom)
+///
+/// A large `get_with_min_seq_protected_runwalk / get_none_global_bloom_fast_reject`
+/// ratio is the regression. The re-do (apply the global-bloom fast-reject to
+/// `Some(S)` too — a global miss means no tombstone in any run) should collapse it.
+fn bench_protected_probe_multirun(c: &mut Criterion) {
+    let mut group = c.benchmark_group("deletion_index_protected_probe_multirun");
+    group.throughput(Throughput::Elements(ROWS_PER_BATCH as u64));
+
+    // Multi-run index: chain extend_max_deletes in many batches with strictly
+    // increasing delete_seqs, so every frozen run carries a max_delete_seq above
+    // the probe cutoff (S=0) and must be walked. Deletions use EVEN keys.
+    let mut index = DeletionIndex::empty();
+    let mut seq = 1_i64;
+    for batch in 0..96_i64 {
+        let adds: Vec<(i64, i64)> = (0..1_024_i64)
+            .map(|i| {
+                let k = (batch * 1_024 + i) * 2;
+                let s = seq;
+                seq += 1;
+                (k, s)
+            })
+            .collect();
+        index = index.extend_max_deletes(adds);
+    }
+
+    // Odd keys are never deleted but lie inside the deleted-key range: a
+    // global-bloom miss for `None`; a full run-walk for `Some` (the common case).
+    let probe: Vec<i64> = (0..ROWS_PER_BATCH as i64).map(|i| i * 2 + 1).collect();
+
+    group.bench_function("get_none_global_bloom_fast_reject", |b| {
+        b.iter(|| {
+            let mut absent = 0_usize;
+            for &pk in &probe {
+                absent += usize::from(index.get(pk).is_none());
+            }
+            black_box(absent);
+        });
+    });
+
+    group.bench_function("get_with_min_seq_protected_runwalk", |b| {
+        b.iter(|| {
+            let mut absent = 0_usize;
+            for &pk in &probe {
+                absent += usize::from(index.get_with_min_seq(pk, Some(0)).is_none());
+            }
+            black_box(absent);
+        });
+    });
+
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_int64_probe,
@@ -355,5 +417,6 @@ criterion_group!(
     bench_concurrent_load_under_publish,
     bench_extend_max_at_growing_cache_sizes,
     bench_extend_max_cumulative_from_empty,
+    bench_protected_probe_multirun,
 );
 criterion_main!(benches);

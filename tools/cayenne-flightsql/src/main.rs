@@ -185,6 +185,7 @@ async fn main() -> Result<()> {
                 dynamic_tuning: false,
                 compaction_background_interval_ms: None,
                 compaction_trigger_files: None,
+                bake_deletion_index_trigger: None,
             },
             ctx.runtime_env(),
         )
@@ -396,6 +397,7 @@ mod tests {
                     dynamic_tuning: false,
                     compaction_background_interval_ms: None,
                     compaction_trigger_files: None,
+                    bake_deletion_index_trigger: None,
                 },
                 ctx.runtime_env(),
             )

@@ -319,6 +319,9 @@ impl CayenneCatalogConnector {
             dynamic_tuning,
             compaction_background_interval_ms: seed_compaction_background_interval_ms,
             compaction_trigger_files: seed_compaction_trigger_files,
+            // The catalog path keeps the engine default (50_000) as the bake-trigger
+            // anchor; the adaptive controller can still move it within its bounds.
+            bake_deletion_index_trigger: None,
         }
     }
 }
