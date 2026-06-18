@@ -85,6 +85,10 @@ pub struct CayenneCatalogProviderConfig {
     /// Hardware-seeded small-file compaction trigger. Seeds the adaptive
     /// controller's starting point; `None` keeps the engine default.
     pub compaction_trigger_files: Option<usize>,
+    /// Hardware-seeded deletion-index size that triggers the seq-prefix bake.
+    /// Seeds the adaptive controller's starting point; `None` keeps the engine
+    /// default.
+    pub bake_deletion_index_trigger: Option<usize>,
 }
 
 /// Errors that can occur when interacting with a Cayenne catalog.
@@ -316,6 +320,9 @@ impl CayenneCatalogProvider {
         }
         if let Some(v) = provider_config.compaction_trigger_files {
             config.compaction_trigger_files = v;
+        }
+        if let Some(v) = provider_config.bake_deletion_index_trigger {
+            config.bake_deletion_index_trigger = v;
         }
         // Enable the closed loop last so it anchors to the seeded knob values
         // above (the controller bounds derive from `[floor, 4×seed]`).

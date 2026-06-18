@@ -65,11 +65,20 @@ const EWMA_ALPHA: f64 = 0.3;
 
 /// Number of recorded batches before the controller will act, so a cold table
 /// (or a bootstrap burst) doesn't trigger a spurious early adjustment.
-const WARMUP_BATCHES: u64 = 16;
+pub(crate) const WARMUP_BATCHES: u64 = 16;
 
 /// "Falling behind" hysteresis: act only once apply latency exceeds the offered-
 /// load interval by this factor (not merely equals it), so we don't chase noise.
 const BEHIND_RATIO: f64 = 1.2;
+
+/// `apply_vs_arrival` at or above which the seq-prefix bake DEFERS
+/// (back-pressure). `1.0` is break-even (per-batch apply latency == the
+/// inter-batch arrival interval); above it the apply has no headroom, so a
+/// background bake competing for the write path would push replication lag up.
+/// The bake yields to the apply here. Tunable: lower to protect lag harder
+/// (bake only with more slack), raise to recover bake/QPH at the cost of lag
+/// headroom.
+pub(crate) const BAKE_BACKPRESSURE_RATIO: f64 = 1.0;
 
 /// "Comfortably keeping up" hysteresis: only relax/back off work when apply
 /// latency is well under the offered-load interval.
@@ -312,6 +321,19 @@ fn adaptive_inline_flush_bounds_for_budget(
 /// alone and the read accessor keeps treating it as "no cap" (the global mem-tier
 /// budget still bounds aggregate RAM).
 #[must_use]
+/// `[floor, ceiling]` for the adaptively-tuned target Vortex file size, derived
+/// from the configured (storage-tier-aware) size: the controller may grow files
+/// up to 4× the configured size for scan-heavy query goals and shrink to ½ — never
+/// below a 64 MiB floor, never above 2 GiB — always bounded by the static config.
+/// A configured size of `0` (size-rolling disabled) is left for the caller to pin.
+pub(crate) fn adaptive_target_file_size_bounds(initial_bytes: i64) -> (i64, i64) {
+    const FLOOR: i64 = 64 * MIB;
+    const CEIL: i64 = 2048 * MIB;
+    let lo = (initial_bytes / 2).max(FLOOR);
+    let hi = initial_bytes.saturating_mul(4).clamp(lo, CEIL);
+    (lo, hi)
+}
+
 pub(crate) fn adaptive_mem_tier_bounds(initial_bytes: i64) -> (i64, i64) {
     adaptive_mem_tier_bounds_for_budget(initial_bytes, global_memory_budget())
 }
@@ -976,6 +998,12 @@ pub(crate) struct LiveActuators {
     inline_flush_max_segments: AtomicI64,
     compaction_background_interval_ms: AtomicU64,
     compaction_trigger_files: AtomicUsize,
+    /// Deletion-index size (live PK tombstone count) at or above which the
+    /// seq-prefix bake fires. The merge-on-read read-amp lever: LOWERED when a
+    /// query goal is unmet and the index is large (bake more often → smaller
+    /// index → cheaper probe), RAISED under write pressure (bake less often →
+    /// bound the bake's write amplification).
+    bake_deletion_index_trigger: AtomicUsize,
     /// 0 means "unset" (use the session/default write concurrency).
     write_concurrency: AtomicUsize,
     /// Per-table in-memory CDC durability tier byte cap (`cdc_durability: memory`).
@@ -984,6 +1012,11 @@ pub(crate) struct LiveActuators {
     /// means fewer writer-blocking spills, so the controller grows it under
     /// backpressure (when memory allows) and shrinks it under memory pressure.
     mem_tier_max_bytes: AtomicI64,
+    /// Adaptive target Vortex file size (bytes). The query/scan read-amp lever:
+    /// GROWN when a query goal is unmet (bigger files ⇒ fewer files + better
+    /// per-file stats and compression for scans, less fan-out to probe), bounded
+    /// by the static config (storage-tier-aware). `<= 0` keeps size-rolling off.
+    target_vortex_file_size_bytes: AtomicI64,
     /// Observed bytes-per-row, seeded from the initial (schema-aware) config and
     /// then *relearned* from live ingest (EWMA bytes ÷ rows) so the row cap a byte
     /// budget implies tracks the table's real row width — not a stale static
@@ -1008,8 +1041,10 @@ impl LiveActuators {
                 init.compaction_background_interval_ms,
             ),
             compaction_trigger_files: AtomicUsize::new(init.compaction_trigger_files),
+            bake_deletion_index_trigger: AtomicUsize::new(init.bake_deletion_index_trigger),
             write_concurrency: AtomicUsize::new(init.write_concurrency),
             mem_tier_max_bytes: AtomicI64::new(init.mem_tier_max_bytes),
+            target_vortex_file_size_bytes: AtomicI64::new(init.target_vortex_file_size_bytes),
             bytes_per_row: AtomicI64::new(
                 (init.inline_flush_max_bytes / init.inline_flush_max_rows.max(1)).max(1),
             ),
@@ -1029,8 +1064,12 @@ impl LiveActuators {
                 .compaction_background_interval_ms
                 .load(Ordering::Relaxed),
             compaction_trigger_files: self.compaction_trigger_files.load(Ordering::Relaxed),
+            bake_deletion_index_trigger: self.bake_deletion_index_trigger.load(Ordering::Relaxed),
             write_concurrency: self.write_concurrency.load(Ordering::Relaxed),
             mem_tier_max_bytes: self.mem_tier_max_bytes.load(Ordering::Relaxed),
+            target_vortex_file_size_bytes: self
+                .target_vortex_file_size_bytes
+                .load(Ordering::Relaxed),
         }
     }
 
@@ -1050,11 +1089,17 @@ impl LiveActuators {
     pub fn compaction_trigger_files(&self) -> usize {
         self.compaction_trigger_files.load(Ordering::Relaxed)
     }
+    pub fn bake_deletion_index_trigger(&self) -> usize {
+        self.bake_deletion_index_trigger.load(Ordering::Relaxed)
+    }
     pub fn write_concurrency(&self) -> usize {
         self.write_concurrency.load(Ordering::Relaxed)
     }
     pub fn mem_tier_max_bytes(&self) -> i64 {
         self.mem_tier_max_bytes.load(Ordering::Relaxed)
+    }
+    pub fn target_vortex_file_size_bytes(&self) -> i64 {
+        self.target_vortex_file_size_bytes.load(Ordering::Relaxed)
     }
 
     /// Relearn the observed bytes-per-row from live ingest so a later byte-budget
@@ -1088,12 +1133,23 @@ impl LiveActuators {
                 let bytes = i64::try_from(adj.new_value).unwrap_or(i64::MAX);
                 self.mem_tier_max_bytes.store(bytes, Ordering::Relaxed);
             }
+            Actuator::TargetVortexFileSize => {
+                let bytes = i64::try_from(adj.new_value).unwrap_or(i64::MAX);
+                self.target_vortex_file_size_bytes
+                    .store(bytes, Ordering::Relaxed);
+            }
             Actuator::CompactionIntervalMs => {
                 self.compaction_background_interval_ms
                     .store(adj.new_value, Ordering::Relaxed);
             }
             Actuator::CompactionTriggerFiles => {
                 self.compaction_trigger_files.store(
+                    usize::try_from(adj.new_value).unwrap_or(usize::MAX),
+                    Ordering::Relaxed,
+                );
+            }
+            Actuator::BakeDeletionIndexTrigger => {
+                self.bake_deletion_index_trigger.store(
                     usize::try_from(adj.new_value).unwrap_or(usize::MAX),
                     Ordering::Relaxed,
                 );
@@ -1116,8 +1172,10 @@ pub(crate) struct ActuatorValues {
     pub inline_flush_max_segments: i64,
     pub compaction_background_interval_ms: u64,
     pub compaction_trigger_files: usize,
+    pub bake_deletion_index_trigger: usize,
     pub write_concurrency: usize,
     pub mem_tier_max_bytes: i64,
+    pub target_vortex_file_size_bytes: i64,
 }
 
 /// Static `[floor, ceiling]` per dynamically-tuned actuator, derived by the static
@@ -1128,8 +1186,10 @@ pub(crate) struct TuningBounds {
     pub inline_flush_max_bytes: (i64, i64),
     pub compaction_background_interval_ms: (u64, u64),
     pub compaction_trigger_files: (usize, usize),
+    pub bake_deletion_index_trigger: (usize, usize),
     pub write_concurrency: (usize, usize),
     pub mem_tier_max_bytes: (i64, i64),
+    pub target_vortex_file_size_bytes: (i64, i64),
 }
 
 // ---------------------------------------------------------------------------
@@ -1143,7 +1203,9 @@ pub(crate) enum Actuator {
     MemTierMaxBytes,
     CompactionIntervalMs,
     CompactionTriggerFiles,
+    BakeDeletionIndexTrigger,
     WriteConcurrency,
+    TargetVortexFileSize,
 }
 
 impl Actuator {
@@ -1155,7 +1217,9 @@ impl Actuator {
             Self::MemTierMaxBytes => "mem_tier_max_bytes",
             Self::CompactionIntervalMs => "compaction_interval_ms",
             Self::CompactionTriggerFiles => "compaction_trigger_files",
+            Self::BakeDeletionIndexTrigger => "bake_deletion_index_trigger",
             Self::WriteConcurrency => "write_concurrency",
+            Self::TargetVortexFileSize => "target_vortex_file_size_bytes",
         }
     }
 }
@@ -1682,6 +1746,24 @@ pub(crate) fn decide_with_goals(
                     reason: "high read-amp: lower compaction trigger",
                 });
             }
+            // Lower the seq-prefix bake trigger so the bake fires sooner: a
+            // smaller live deletion index means a cheaper merge-on-read probe —
+            // the read-amp lever for the per-query tombstone scan. Multiplicative
+            // step (the trigger's range spans 1e3..5e6), CPU-gated like the
+            // compaction levers above (the bake runs on the compaction task).
+            if cpu_ok
+                && let Some(v) = clamp_move_usize(
+                    cur.bake_deletion_index_trigger,
+                    shrink_usize(cur.bake_deletion_index_trigger),
+                    b.bake_deletion_index_trigger,
+                )
+            {
+                return Some(Adjustment {
+                    actuator: Actuator::BakeDeletionIndexTrigger,
+                    new_value: u64::try_from(v).unwrap_or(0),
+                    reason: "high read-amp: lower the bake trigger → smaller deletion index → cheaper merge-on-read probe",
+                });
+            }
         }
 
         // An I/O- or publish-bound table that is NOT behind grows the memtable to
@@ -1700,6 +1782,26 @@ pub(crate) fn decide_with_goals(
                 actuator: Actuator::InlineFlushBytes,
                 new_value: u64::try_from(v).unwrap_or(0),
                 reason: "io/publish-bound: enlarge memtable to amortize commits and write fewer, larger files",
+            });
+        }
+
+        // I/O-/publish-bound but read-amp is NOT high (no query payoff from baking
+        // sooner): RAISE the bake trigger so the bake's write-amplification stops
+        // competing for the saturated write path. Withheld when read-amp is high
+        // (the read-amp arm above already lowered it for query health — never fight
+        // that). Multiplicative step over the wide 1e3..5e6 range.
+        if (io_bound || publish_bound)
+            && !read_amp_high
+            && let Some(v) = clamp_move_usize(
+                cur.bake_deletion_index_trigger,
+                grow_usize(cur.bake_deletion_index_trigger),
+                b.bake_deletion_index_trigger,
+            )
+        {
+            return Some(Adjustment {
+                actuator: Actuator::BakeDeletionIndexTrigger,
+                new_value: u64::try_from(v).unwrap_or(0),
+                reason: "io/publish-bound: raise the bake trigger → bake less often → bound bake write-amp",
             });
         }
 
@@ -1924,6 +2026,50 @@ fn decide_goal(
                 reason: "query-latency goal: lower compaction trigger",
             });
         }
+        // Grow the target Vortex file size so compaction emits fewer, larger files
+        // — better scan throughput and per-file stats, and less file fan-out to
+        // probe per query. No memory/CPU gate: it changes the size of the files the
+        // background compactor already writes, not the write rate.
+        if let Some(v) = clamp_move_i64(
+            cur.target_vortex_file_size_bytes,
+            goal_grow_i64(
+                cur.target_vortex_file_size_bytes,
+                b.target_vortex_file_size_bytes,
+                query_v,
+            ),
+            b.target_vortex_file_size_bytes,
+        ) {
+            return Some(Adjustment {
+                actuator: Actuator::TargetVortexFileSize,
+                new_value: u64::try_from(v).unwrap_or(0),
+                reason: "query-latency goal: grow target file size → fewer, larger files for scans",
+            });
+        }
+        // Lower the seq-prefix bake trigger so the bake fires sooner — a smaller
+        // live deletion index means a cheaper merge-on-read probe per query.
+        // Gated on read-amp being elevated (the read-side proxy for "the deletion
+        // index is large enough to be hurting probes"): when scans are already
+        // cheap (read-amp low), baking sooner would only add write-amp without a
+        // query payoff, so leave the trigger where it is. No CPU/memory gate is
+        // needed — lowering the trigger spends a future compaction CPU slice the
+        // background compactor already schedules, not a new resource.
+        if s.read_amp > READ_AMP_LOW
+            && let Some(v) = clamp_move_usize(
+                cur.bake_deletion_index_trigger,
+                goal_shrink_usize(
+                    cur.bake_deletion_index_trigger,
+                    b.bake_deletion_index_trigger,
+                    query_v,
+                ),
+                b.bake_deletion_index_trigger,
+            )
+        {
+            return Some(Adjustment {
+                actuator: Actuator::BakeDeletionIndexTrigger,
+                new_value: u64::try_from(v).unwrap_or(0),
+                reason: "query-latency goal: lower the bake trigger → smaller deletion index → cheaper merge-on-read probe",
+            });
+        }
         // Shed a write shard (fewer files) — but not while ingest is also behind,
         // so we don't slow the lag goal to help the query goal.
         if !ingest_violated
@@ -2011,6 +2157,33 @@ fn decide_goal(
                 reason: "replication-lag goal: compact more to keep the snapshot lean",
             });
         }
+    }
+
+    // (3b) Write-pressure backoff for the bake trigger: when the write path is
+    // I/O- or publish-bound (the same `vortex_write` / metastore-publish latency
+    // signals the storage-tier logic reads — the bake's write-amplification adds
+    // directly to that path), RAISE the bake trigger so the bake fires less often
+    // and stops competing for write throughput. Scaled by whichever ingest/lag
+    // violation is active (`ingest_v`), with the goal-mode crawl floor so it still
+    // moves under a bare write-pressure signal. Withheld while a query goal is
+    // violated so it never fights the query-tier LOWER move above (queries win).
+    if (io_bound || publish_bound)
+        && !query_violated
+        && let Some(v) = clamp_move_usize(
+            cur.bake_deletion_index_trigger,
+            goal_grow_usize(
+                cur.bake_deletion_index_trigger,
+                b.bake_deletion_index_trigger,
+                ingest_v,
+            ),
+            b.bake_deletion_index_trigger,
+        )
+    {
+        return Some(Adjustment {
+            actuator: Actuator::BakeDeletionIndexTrigger,
+            new_value: u64::try_from(v).unwrap_or(0),
+            reason: "write pressure (io/publish-bound): raise the bake trigger → bake less often → bound bake write-amp",
+        });
     }
 
     // (4) Healthy-relax: every active goal comfortably met and memory ok → hand
@@ -2256,8 +2429,10 @@ mod tests {
             inline_flush_max_bytes: (2 * 1024 * 1024, 128 * 1024 * 1024),
             compaction_background_interval_ms: (2_000, 60_000),
             compaction_trigger_files: (2, 32),
+            bake_deletion_index_trigger: (1_000, 5_000_000),
             write_concurrency: (1, 16),
             mem_tier_max_bytes: (64 * 1024 * 1024, 2048 * 1024 * 1024),
+            target_vortex_file_size_bytes: (64 * 1024 * 1024, 1024 * 1024 * 1024),
         }
     }
 
@@ -2268,8 +2443,10 @@ mod tests {
             inline_flush_max_segments: 64,
             compaction_background_interval_ms: 10_000,
             compaction_trigger_files: 8,
+            bake_deletion_index_trigger: 50_000,
             write_concurrency: 4,
             mem_tier_max_bytes: 256 * 1024 * 1024,
+            target_vortex_file_size_bytes: 256 * 1024 * 1024,
         }
     }
 
@@ -2841,9 +3018,17 @@ mod tests {
                     b.compaction_trigger_files.0 as u64,
                     b.compaction_trigger_files.1 as u64,
                 ),
+                Actuator::BakeDeletionIndexTrigger => (
+                    b.bake_deletion_index_trigger.0 as u64,
+                    b.bake_deletion_index_trigger.1 as u64,
+                ),
                 Actuator::WriteConcurrency => {
                     (b.write_concurrency.0 as u64, b.write_concurrency.1 as u64)
                 }
+                Actuator::TargetVortexFileSize => (
+                    b.target_vortex_file_size_bytes.0 as u64,
+                    b.target_vortex_file_size_bytes.1 as u64,
+                ),
             };
             assert!(
                 (lo..=hi).contains(&adj.new_value),
@@ -3129,11 +3314,13 @@ mod tests {
             ..snap()
         };
         let goals = Goals::from_targets(None, None, Some(100.0), None, Duration::from_mins(1));
-        // Memtable at ceiling, compaction at its floors → only the shard-shed remains.
+        // Memtable at ceiling, compaction at its floors, target file size at its
+        // ceiling → only the shard-shed remains.
         let cur = ActuatorValues {
             inline_flush_max_bytes: 128 * 1024 * 1024,
             compaction_background_interval_ms: 2_000,
             compaction_trigger_files: 2,
+            target_vortex_file_size_bytes: 1024 * 1024 * 1024,
             write_concurrency: 8,
             ..actuators()
         };
@@ -3142,6 +3329,57 @@ mod tests {
         assert!(
             adj.new_value < 8,
             "latency goal sheds a shard, never grows one"
+        );
+    }
+
+    #[test]
+    fn query_latency_goal_grows_target_file_size_when_compaction_maxed() {
+        // p99 over goal; memtable at ceiling and the compaction levers at their
+        // floors, so the decider falls through to growing the target Vortex file
+        // size — fewer, larger files for scans — before it sheds a write shard.
+        let s = IngestSnapshot {
+            query_latency_p99_ms: Some(500.0),
+            read_amp: 2,
+            ..snap()
+        };
+        let goals = Goals::from_targets(None, None, Some(100.0), None, Duration::from_mins(1));
+        let cur = ActuatorValues {
+            inline_flush_max_bytes: 128 * 1024 * 1024,
+            compaction_background_interval_ms: 2_000,
+            compaction_trigger_files: 2,
+            // 256 MiB, below the test bounds ceiling (1 GiB) → room to grow.
+            target_vortex_file_size_bytes: 256 * 1024 * 1024,
+            ..actuators()
+        };
+        let adj = goal_decide(&s, &cur, &bounds(), &goals).expect("a move");
+        assert_eq!(adj.actuator, Actuator::TargetVortexFileSize);
+        assert!(
+            adj.new_value > 256 * 1024 * 1024,
+            "the query goal grows the target file size, got {}",
+            adj.new_value
+        );
+        assert!(
+            adj.new_value <= bounds().target_vortex_file_size_bytes.1 as u64,
+            "stays within the ceiling"
+        );
+    }
+
+    #[test]
+    fn adaptive_target_file_size_bounds_scale_with_config() {
+        // Default 256 MiB → [½×, 4×].
+        assert_eq!(
+            adaptive_target_file_size_bounds(256 * 1024 * 1024),
+            (128 * 1024 * 1024, 1024 * 1024 * 1024)
+        );
+        // S3-class 512 MiB default → up to the 2 GiB ceiling.
+        assert_eq!(
+            adaptive_target_file_size_bounds(512 * 1024 * 1024),
+            (256 * 1024 * 1024, 2048 * 1024 * 1024)
+        );
+        // Small EBS-class 64 MiB → clamped to the 64 MiB floor.
+        assert_eq!(
+            adaptive_target_file_size_bounds(64 * 1024 * 1024),
+            (64 * 1024 * 1024, 256 * 1024 * 1024)
         );
     }
 
