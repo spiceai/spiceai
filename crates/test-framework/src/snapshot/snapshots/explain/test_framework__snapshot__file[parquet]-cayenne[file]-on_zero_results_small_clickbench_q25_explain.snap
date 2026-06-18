@@ -13,13 +13,12 @@ description: "Query: clickbench_q25"
 | physical_plan | ProjectionExec: expr=[SearchPhrase@0 as SearchPhrase]                                                                |
 |               |   SortPreservingMergeExec: [to_timestamp(EventTime@1) ASC NULLS LAST], fetch=10                                      |
 |               |     SortExec: TopK(fetch=10), expr=[to_timestamp(EventTime@1) ASC NULLS LAST], preserve_partitioning=[true]          |
-|               |       ProjectionExec: expr=[SearchPhrase@1 as SearchPhrase, EventTime@0 as EventTime]                                |
-|               |         FilterExec: SearchPhrase@1 !=                                                                                |
-|               |           RepartitionExec: partitioning=RoundRobinBatch(16), input_partitions=1                                      |
-|               |             SchemaCastScanExec                                                                                       |
-|               |               FallbackOnZeroResultsScanExec                                                                          |
-|               |                 CayenneAccelerationExec: snapshots_scanned=0, files_scanned=0                                        |
-|               |                   BytesProcessedExec                                                                                 |
-|               |                     EmptyExec                                                                                        |
+|               |       FilterExec: SearchPhrase@1 != , projection=[SearchPhrase@1, EventTime@0]                                       |
+|               |         RepartitionExec: partitioning=RoundRobinBatch(16), input_partitions=1                                        |
+|               |           SchemaCastScanExec                                                                                         |
+|               |             FallbackOnZeroResultsScanExec                                                                            |
+|               |               CayenneAccelerationExec: snapshots_scanned=0, files_scanned=0                                          |
+|               |                 BytesProcessedExec                                                                                   |
+|               |                   EmptyExec                                                                                          |
 |               |                                                                                                                      |
 +---------------+----------------------------------------------------------------------------------------------------------------------+
