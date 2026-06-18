@@ -14,113 +14,18 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use datafusion::{
-    common::{
-        Result,
-        tree_node::{TreeNode, TreeNodeRecursion},
-    },
-    logical_expr::{Expr, LogicalPlan},
+// Re-export the canonical types from datafusion-table-providers so that the
+// rest of the codebase has a single definition of FunctionSupport.
+pub use datafusion_table_providers::util::supported_functions::{
+    FunctionRestriction, FunctionSupport, contains_unsupported_functions,
 };
+
+use datafusion::{common::Result, logical_expr::LogicalPlan};
 use datafusion_federation::FederatedPlanNode;
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum FunctionRestriction {
-    Allow(Vec<String>),
-    Deny(Vec<String>),
-}
-
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-#[expect(clippy::struct_field_names)]
-pub struct FunctionSupport {
-    scalar_functions: Option<FunctionRestriction>,
-    aggregate_functions: Option<FunctionRestriction>,
-    window_functions: Option<FunctionRestriction>,
-}
-
-impl FunctionSupport {
-    #[must_use]
-    pub const fn new(
-        scalar_functions: Option<FunctionRestriction>,
-        aggregate_functions: Option<FunctionRestriction>,
-        window_functions: Option<FunctionRestriction>,
-    ) -> Self {
-        Self {
-            scalar_functions,
-            aggregate_functions,
-            window_functions,
-        }
-    }
-
-    #[must_use]
-    pub fn supports(&self, expr: &Expr) -> bool {
-        let mut supported = true;
-        let result = expr.apply(|expr| {
-            if !self.supports_node(expr) {
-                supported = false;
-                return Ok(TreeNodeRecursion::Stop);
-            }
-            Ok(TreeNodeRecursion::Continue)
-        });
-
-        result.is_ok() && supported
-    }
-
-    fn supports_node(&self, expr: &Expr) -> bool {
-        match expr {
-            Expr::ScalarFunction(function) => {
-                supports_name(self.scalar_functions.as_ref(), function.name())
-            }
-            Expr::AggregateFunction(function) => {
-                supports_name(self.aggregate_functions.as_ref(), function.func.name())
-            }
-            Expr::WindowFunction(function) => {
-                supports_name(self.window_functions.as_ref(), function.fun.name())
-            }
-            _ => true,
-        }
-    }
-}
-
-#[must_use]
-fn supports_name(restriction: Option<&FunctionRestriction>, name: &str) -> bool {
-    match restriction {
-        Some(FunctionRestriction::Allow(names)) => {
-            names.iter().any(|n| n.eq_ignore_ascii_case(name))
-        }
-        Some(FunctionRestriction::Deny(names)) => {
-            !names.iter().any(|n| n.eq_ignore_ascii_case(name))
-        }
-        None => true,
-    }
-}
-
-/// Returns `true` if any expression anywhere in `plan` — including child plan
-/// nodes and subquery plans (`IN`/`EXISTS`/scalar subqueries) — references a
-/// function the `function_support` restriction rejects.
-///
-/// The walk must cover the whole plan tree, not just `plan.expressions()` on
-/// the root node: callers pass the root of an entire federated subtree (e.g.
-/// `Projection → Filter → TableScan`), so a denied function in a `WHERE`
-/// predicate or subquery would otherwise escape the check and be unparsed into
-/// the remote engine's SQL.
-pub fn contains_unsupported_functions(
-    plan: &LogicalPlan,
-    function_support: &FunctionSupport,
-) -> Result<bool> {
-    let mut unsupported = false;
-    plan.apply_with_subqueries(|plan| {
-        for expr in plan.expressions() {
-            if !function_support.supports(&expr) {
-                unsupported = true;
-                return Ok(TreeNodeRecursion::Stop);
-            }
-        }
-        Ok(TreeNodeRecursion::Continue)
-    })?;
-
-    Ok(unsupported)
-}
-
+/// If `plan` is a `FederatedPlanNode` whose inner plan contains functions that
+/// are unsupported according to `function_support`, unwrap it back to the inner
+/// plan so it is executed locally rather than being sent to the remote.
 pub fn unfederate_plan_with_unsupported_functions(
     plan: LogicalPlan,
     function_support: &FunctionSupport,
@@ -158,8 +63,11 @@ mod tests {
         ))
     }
 
-    fn udf_expr(name: &str) -> Expr {
-        Expr::ScalarFunction(ScalarFunction::new_udf(stub_udf(name), vec![col("val")]))
+    fn udf_expr(name: &str) -> datafusion::logical_expr::Expr {
+        datafusion::logical_expr::Expr::ScalarFunction(ScalarFunction::new_udf(
+            stub_udf(name),
+            vec![col("val")],
+        ))
     }
 
     fn scan(table: &str) -> LogicalPlanBuilder {
@@ -197,9 +105,6 @@ mod tests {
 
     #[test]
     fn detects_denied_function_below_root_node() {
-        // The denied function sits in a `Filter` BELOW the root `Projection`,
-        // whose own expressions are clean. A root-only check misses it and the
-        // predicate would be unparsed into the remote engine's SQL.
         let plan = scan("t")
             .filter(udf_expr("json_get_str").eq(lit("x")))
             .expect("filter")
@@ -216,9 +121,6 @@ mod tests {
 
     #[test]
     fn detects_denied_function_inside_subquery() {
-        // The denied function lives only inside the `IN (<subquery>)` plan.
-        // `Expr::apply` does not descend into subquery plans, so the walk must
-        // use `apply_with_subqueries` to see it.
         let subquery = scan("u")
             .project(vec![udf_expr("json_get_str")])
             .expect("project")

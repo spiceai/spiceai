@@ -986,11 +986,6 @@ impl CayenneAccelerator {
                 &["cayenne_compaction_trigger_files"],
                 config.compaction_trigger_files,
             );
-            config.bake_deletion_index_trigger = autotune::auto_or_usize(
-                acceleration,
-                &["cayenne_bake_deletion_index_trigger"],
-                config.bake_deletion_index_trigger,
-            );
             config.compaction_trigger_protected_snapshots = autotune::auto_or_usize(
                 acceleration,
                 &["cayenne_compaction_trigger_protected_snapshots"],
@@ -1204,10 +1199,6 @@ impl CayenneAccelerator {
                 compaction_trigger: autotune::is_pinned(
                     acceleration,
                     &["cayenne_compaction_trigger_files"],
-                ),
-                bake_deletion_index_trigger: autotune::is_pinned(
-                    acceleration,
-                    &["cayenne_bake_deletion_index_trigger"],
                 ),
                 write_concurrency: autotune::is_pinned(
                     acceleration,
@@ -1588,8 +1579,8 @@ fn wrap_with_native_vector_indexes(
 const PARAMETERS: &[ParameterSpec] = &concat_arrays::<
     ParameterSpec,
     S3_PARAMS_LEN,
-    45,
-    { S3_PARAMS_LEN + 45 },
+    44,
+    { S3_PARAMS_LEN + 44 },
 >(
     S3_PARAMETERS,
     [
@@ -1639,8 +1630,6 @@ const PARAMETERS: &[ParameterSpec] = &concat_arrays::<
             .description("Writer partition override (parallel encoders) for unsorted Cayenne ingests. 'auto' (or unset) uses a small fixed default of 4, capped at the host core count (= runtime.query.target_partitions) and the process-global encode budget — deliberately not the full core count, because each table is sized independently and the per-table values sum across tables under concurrent CDC. Raise it explicitly for a table that needs more encode parallelism."),
         ParameterSpec::component("compaction_trigger_files")
             .description("Minimum number of small Vortex files in the current snapshot before tiered compaction runs. A 'small' file is one whose size is below cayenne_target_file_size_mb / 4. Default: 4 for refresh_mode: caching, changes, or append with refresh_check_interval <= 5m; 8 otherwise."),
-        ParameterSpec::component("bake_deletion_index_trigger")
-            .description("Deletion-index size (count of live primary-key tombstones) at or above which the seq-prefix bake (key-delete merge-on-read compaction) runs. The bake consolidates the settled older prefix of protected snapshots so their tombstones drop out of the live deletion index, lowering per-query merge-on-read probe cost at the cost of write amplification. A larger value bakes less often (bounds write-amp); a smaller value bakes more often (smaller index, cheaper probe). Key-delete tables only. Default: 50000."),
         ParameterSpec::component("compaction_trigger_protected_snapshots")
             .description("Number of protected snapshots before snapshot-maintenance compaction runs. This is separate from compaction_trigger_files so small-file tuning does not silently change scan amplification behavior. Default: 4 for refresh_mode: caching, changes, or append with refresh_check_interval <= 5m; 8 otherwise."),
         ParameterSpec::component("compaction_trigger_snapshot_age_ms")
