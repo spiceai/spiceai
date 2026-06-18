@@ -589,6 +589,126 @@ pub fn register_cayenne_compaction_metrics(compaction_pool_bytes: u64) {
     cayenne_compaction_memory_pool_bytes().record(compaction_pool_bytes, &[]);
 }
 
+/// Registers per-tokio-runtime observable gauges so `/metrics` shows, per runtime,
+/// whether its worker threads are idle or competing for cores. Pull-based: each
+/// callback reads `tokio::runtime::Handle::metrics()` at Prometheus scrape time, so
+/// there is no periodic sampler task and near-zero cost between scrapes.
+///
+/// `handles` is a list of `(label, handle)` — e.g. `("cpu", …)`, `("refresh", …)`,
+/// `("cdc_apply", …)`, `("compaction", …)`, `("main", …)`; each becomes a
+/// `runtime="<label>"` attribute on every gauge. Like [`register_cayenne_compaction_metrics`],
+/// the binary MUST call this once AFTER `init_metrics` has installed the Prometheus meter.
+///
+/// The task/worker/queue gauges use stable `RuntimeMetrics` APIs and are always emitted.
+/// The per-worker busy/park/steal gauges — the direct "are these threads doing work or
+/// just parked" signal — require the `tokio_unstable` cfg at build time
+/// (`RUSTFLAGS="--cfg tokio_unstable"`); without it only the stable gauges register, so
+/// default and CI builds are unaffected.
+pub fn register_tokio_runtime_metrics(handles: Vec<(&'static str, tokio::runtime::Handle)>) {
+    if handles.is_empty() {
+        return;
+    }
+    let handles: std::sync::Arc<[(&'static str, tokio::runtime::Handle)]> = handles.into();
+    let meter = global::meter("tokio_runtime");
+
+    let h = std::sync::Arc::clone(&handles);
+    let _ = meter
+        .u64_observable_gauge("tokio_runtime_alive_tasks")
+        .with_description("Alive (spawned, not-yet-completed) tasks per tokio runtime.")
+        .with_unit("{task}")
+        .with_callback(move |obs| {
+            for (name, handle) in h.iter() {
+                obs.observe(
+                    handle.metrics().num_alive_tasks() as u64,
+                    &[KeyValue::new("runtime", *name)],
+                );
+            }
+        })
+        .build();
+
+    let h = std::sync::Arc::clone(&handles);
+    let _ = meter
+        .u64_observable_gauge("tokio_runtime_workers")
+        .with_description("Worker threads per tokio runtime.")
+        .with_unit("{thread}")
+        .with_callback(move |obs| {
+            for (name, handle) in h.iter() {
+                obs.observe(
+                    handle.metrics().num_workers() as u64,
+                    &[KeyValue::new("runtime", *name)],
+                );
+            }
+        })
+        .build();
+
+    let h = std::sync::Arc::clone(&handles);
+    let _ = meter
+        .u64_observable_gauge("tokio_runtime_global_queue_depth")
+        .with_description("Tasks waiting in the runtime's global (injection) queue per tokio runtime.")
+        .with_unit("{task}")
+        .with_callback(move |obs| {
+            for (name, handle) in h.iter() {
+                obs.observe(
+                    handle.metrics().global_queue_depth() as u64,
+                    &[KeyValue::new("runtime", *name)],
+                );
+            }
+        })
+        .build();
+
+    // Per-worker busy/park/steal — the direct "idle vs stealing cores" signal — are only
+    // exposed under `--cfg tokio_unstable`. Gated so default/CI builds compile and emit
+    // just the stable gauges above; build with the cfg to surface these in `/metrics`.
+    #[cfg(tokio_unstable)]
+    {
+        let h = std::sync::Arc::clone(&handles);
+        let _ = meter
+            .f64_observable_gauge("tokio_runtime_worker_busy_seconds")
+            .with_description(
+                "Cumulative worker-busy time (summed across workers) per tokio runtime; rate()/workers = busy ratio.",
+            )
+            .with_unit("s")
+            .with_callback(move |obs| {
+                for (name, handle) in h.iter() {
+                    let m = handle.metrics();
+                    let busy: f64 = (0..m.num_workers())
+                        .map(|w| m.worker_total_busy_duration(w).as_secs_f64())
+                        .sum();
+                    obs.observe(busy, &[KeyValue::new("runtime", *name)]);
+                }
+            })
+            .build();
+
+        let h = std::sync::Arc::clone(&handles);
+        let _ = meter
+            .u64_observable_gauge("tokio_runtime_worker_park_count")
+            .with_description("Cumulative worker park count (summed across workers) per tokio runtime.")
+            .with_unit("{park}")
+            .with_callback(move |obs| {
+                for (name, handle) in h.iter() {
+                    let m = handle.metrics();
+                    let parks: u64 = (0..m.num_workers()).map(|w| m.worker_park_count(w)).sum();
+                    obs.observe(parks, &[KeyValue::new("runtime", *name)]);
+                }
+            })
+            .build();
+
+        let h = std::sync::Arc::clone(&handles);
+        let _ = meter
+            .u64_observable_gauge("tokio_runtime_worker_steal_count")
+            .with_description("Cumulative task-steal count (summed across workers) per tokio runtime.")
+            .with_unit("{steal}")
+            .with_callback(move |obs| {
+                for (name, handle) in h.iter() {
+                    let m = handle.metrics();
+                    let steals: u64 = (0..m.num_workers()).map(|w| m.worker_steal_count(w)).sum();
+                    obs.observe(steals, &[KeyValue::new("runtime", *name)]);
+                }
+            })
+            .build();
+    }
+}
+
 static CAYENNE_INLINE_TOMBSTONE_WRITES: OnceLock<Counter<u64>> = OnceLock::new();
 static CAYENNE_INLINE_TOMBSTONE_KEYS: OnceLock<Counter<u64>> = OnceLock::new();
 
