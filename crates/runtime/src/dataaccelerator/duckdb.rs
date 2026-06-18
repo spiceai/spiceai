@@ -1139,7 +1139,7 @@ pub(crate) async fn create_table_provider(
         .context(UnableToCreateTableSnafu)
         .boxed()?;
 
-    let Some(duckdb_writer) = table_provider.as_any().downcast_ref::<DuckDBTableWriter>() else {
+    let Some(duckdb_writer) = table_provider.downcast_ref::<DuckDBTableWriter>() else {
         unreachable!("DuckDBTableWriter should be returned from DuckDBTableProviderFactory")
     };
 
@@ -1379,10 +1379,6 @@ struct DuckDBUniqueIndexGuardTableProvider {
 
 #[async_trait]
 impl TableProvider for DuckDBUniqueIndexGuardTableProvider {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema(&self) -> arrow::datatypes::SchemaRef {
         self.inner.schema()
     }
@@ -1515,10 +1511,6 @@ impl DisplayAs for UniqueIndexValidationExec {
 impl ExecutionPlan for UniqueIndexValidationExec {
     fn name(&self) -> &'static str {
         Self::static_name()
-    }
-
-    fn as_any(&self) -> &dyn Any {
-        self
     }
 
     fn properties(&self) -> &Arc<PlanProperties> {

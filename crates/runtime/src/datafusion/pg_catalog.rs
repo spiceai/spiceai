@@ -15,7 +15,6 @@ limitations under the License.
 */
 
 use std::{
-    any::Any,
     collections::HashMap,
     hash::{Hash, Hasher},
     sync::{
@@ -237,10 +236,6 @@ impl Hash for ObjDescription {
 }
 
 impl ScalarUDFImpl for ObjDescription {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn name(&self) -> &str {
         OBJ_DESCRIPTION_UDF_NAME
     }
@@ -381,10 +376,6 @@ impl Hash for ColDescription {
 }
 
 impl ScalarUDFImpl for ColDescription {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn name(&self) -> &str {
         COL_DESCRIPTION_UDF_NAME
     }

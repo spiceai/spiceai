@@ -50,14 +50,11 @@ pub fn is_cayenne_catalog(provider: &dyn CatalogProvider) -> bool {
 /// Extract the [`CayenneCatalogProvider`] reference, handling both direct and
 /// `ComposedCatalogProvider`-wrapped cases.
 pub fn get_cayenne_provider(provider: &dyn CatalogProvider) -> Option<&CayenneCatalogProvider> {
-    if let Some(cayenne) = provider.as_any().downcast_ref::<CayenneCatalogProvider>() {
+    if let Some(cayenne) = provider.downcast_ref::<CayenneCatalogProvider>() {
         return Some(cayenne);
     }
-    if let Some(composed) = provider.as_any().downcast_ref::<ComposedCatalogProvider>() {
-        return composed
-            .external()
-            .as_any()
-            .downcast_ref::<CayenneCatalogProvider>();
+    if let Some(composed) = provider.downcast_ref::<ComposedCatalogProvider>() {
+        return composed.external().downcast_ref::<CayenneCatalogProvider>();
     }
     None
 }

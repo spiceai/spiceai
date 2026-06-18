@@ -222,7 +222,7 @@ async fn validate_target_metadata(
 
     // Downcast to CayenneSchemaProvider to access the metadata catalog.
     // This works for all Cayenne table shapes (plain and partitioned).
-    let Some(cayenne_schema) = schema.as_any().downcast_ref::<CayenneSchemaProvider>() else {
+    let Some(cayenne_schema) = schema.downcast_ref::<CayenneSchemaProvider>() else {
         // Not a Cayenne schema — skip validation (caller already verified
         // this is a Cayenne catalog table via `is_cayenne_table`).
         return Ok(());

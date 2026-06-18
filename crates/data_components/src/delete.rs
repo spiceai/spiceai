@@ -15,7 +15,7 @@ limitations under the License.
 */
 
 #![allow(clippy::missing_errors_doc)]
-use std::{any::Any, error::Error, sync::Arc};
+use std::{error::Error, sync::Arc};
 
 use ::arrow::{
     array::{ArrayRef, RecordBatch, UInt64Array},
@@ -84,10 +84,6 @@ impl DisplayAs for DeletionExec {
 impl ExecutionPlan for DeletionExec {
     fn name(&self) -> &'static str {
         "DeletionExec"
-    }
-
-    fn as_any(&self) -> &dyn Any {
-        self
     }
 
     fn properties(&self) -> &Arc<datafusion::physical_plan::PlanProperties> {

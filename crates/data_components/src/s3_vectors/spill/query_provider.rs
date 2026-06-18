@@ -13,10 +13,7 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
-use std::{
-    any::Any,
-    sync::{Arc, atomic::AtomicU8},
-};
+use std::sync::{Arc, atomic::AtomicU8};
 
 use crate::s3_vectors::{
     compute_query::ComputeQueryVector, gather_and_limit_providers,
@@ -61,10 +58,6 @@ impl S3VectorsSpillQueryTable {
 
 #[async_trait]
 impl TableProvider for S3VectorsSpillQueryTable {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema(&self) -> SchemaRef {
         self.table.query_provider_schema()
     }

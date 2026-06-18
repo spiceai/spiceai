@@ -25,7 +25,6 @@ use futures::{StreamExt, TryStreamExt};
 use globset::GlobSet;
 use snafu::prelude::*;
 use std::{
-    any::Any,
     collections::HashMap,
     fmt::Write,
     sync::{Arc, RwLock},
@@ -133,12 +132,6 @@ impl UnityCatalogProvider {
 }
 
 impl CatalogProvider for UnityCatalogProvider {
-    /// Returns the catalog provider as [`Any`]
-    /// so that it can be downcast to a specific implementation.
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     /// Retrieves the list of available schema names in this catalog.
     fn schema_names(&self) -> Vec<String> {
         self.schemas.keys().cloned().collect()
@@ -470,12 +463,6 @@ impl UnityCatalogSchemaProvider {
 
 #[async_trait]
 impl SchemaProvider for UnityCatalogSchemaProvider {
-    /// Returns this `SchemaProvider` as [`Any`] so that it can be downcast to a
-    /// specific implementation.
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     /// Retrieves the list of available table names in this schema.
     fn table_names(&self) -> Vec<String> {
         let guard = match self.tables.read() {

@@ -32,14 +32,13 @@ impl AcceleratedTable {
     fn create_federated_table_source(&self) -> Option<Arc<dyn FederatedTableSource>> {
         let accelerated_table_federation_provider = Arc::new(
             self.accelerator
-                .as_any()
                 .downcast_ref::<PolyTableProvider>()?
                 .clone(),
         );
 
-        let remote_table_name = accelerated_table_federation_provider
+        let remote_table_name = (accelerated_table_federation_provider
             .get_table_source()?
-            .as_any()
+            .as_ref() as &dyn std::any::Any)
             .downcast_ref::<SQLTableSource>()
             .map(SQLTableSource::table_reference)?;
 

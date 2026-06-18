@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::{any::Any, collections::HashMap, fmt, sync::Arc};
+use std::{collections::HashMap, fmt, sync::Arc};
 
 use arrow::datatypes::SchemaRef;
 use datafusion::error::{DataFusionError, Result as DataFusionResult};
@@ -298,10 +298,6 @@ impl DisplayAs for StreamingDataUpdateExecutionPlan {
 impl ExecutionPlan for StreamingDataUpdateExecutionPlan {
     fn name(&self) -> &'static str {
         "StreamingDataUpdateExecutionPlan"
-    }
-
-    fn as_any(&self) -> &dyn Any {
-        self
     }
 
     fn schema(&self) -> SchemaRef {

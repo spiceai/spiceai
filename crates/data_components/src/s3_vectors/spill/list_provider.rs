@@ -13,10 +13,7 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
-use std::{
-    any::Any,
-    sync::{Arc, atomic::AtomicU8},
-};
+use std::sync::{Arc, atomic::AtomicU8};
 
 use crate::s3_vectors::{
     gather_and_limit_providers, list_provider::S3VectorsListTable, spill::all_spill_tables,
@@ -53,10 +50,6 @@ impl S3VectorsSpillListTable {
 
 #[async_trait]
 impl TableProvider for S3VectorsSpillListTable {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema(&self) -> SchemaRef {
         Arc::clone(&self.table.schema)
     }
