@@ -401,9 +401,31 @@ impl TursoConnectionPool {
     /// This method is lightweight and can be called frequently. Each connection
     /// shares the underlying database instance, making it efficient for high-frequency
     /// operations.
-    #[expect(clippy::unused_async)]
+    ///
+    /// Per-connection performance PRAGMAs are applied on every connection here.
+    /// Unlike `journal_mode = mvcc` (which persists on the database file and is set
+    /// once at pool creation), `synchronous` and `cache_size` are per-connection and
+    /// do not carry over — without this, every accelerator connection would default
+    /// to `synchronous = FULL` (an extra fsync per commit). These are cheap in-memory
+    /// settings, so they are net-positive even on hot paths.
     pub async fn connect(&self) -> Result<Connection> {
-        self.database.connect().context(TursoDatabaseSnafu)
+        let conn = self.database.connect().context(TursoDatabaseSnafu)?;
+
+        // Wait for locks instead of immediately returning SQLITE_BUSY.
+        conn.busy_timeout(std::time::Duration::from_secs(5))
+            .context(TursoDatabaseSnafu)?;
+
+        // NORMAL synchronous: safe under WAL/MVCC, avoids FULL's extra per-commit fsync.
+        conn.execute("PRAGMA synchronous = NORMAL", ())
+            .await
+            .context(TursoDatabaseSnafu)?;
+
+        // 32MB page cache (negative value = kilobytes), matching the metastore connection.
+        conn.execute("PRAGMA cache_size = -32768", ())
+            .await
+            .context(TursoDatabaseSnafu)?;
+
+        Ok(conn)
     }
 
     /// Returns true if this is an in-memory database
