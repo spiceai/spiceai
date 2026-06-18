@@ -60,7 +60,7 @@ jobs:
   run-htap:
     name: Run CH-BenCHmark
     runs-on: ${{ github.event.inputs.runner_type }}
-    timeout-minutes: 60
+    timeout-minutes: 120
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
 

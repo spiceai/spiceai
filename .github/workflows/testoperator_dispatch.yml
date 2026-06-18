@@ -6,6 +6,8 @@ on:
     - cron: '0 9 * * *'
     # htap-sf100, every 3h (0200, 0500, 0800, 1100, 1400, 1700, 2000, 2300) — HTAP CH-benCHmark SF100
     - cron: '0 2,5,8,11,14,17,20,23 * * *'
+    # htap-sf1000, twice daily (0000, 1200) — HTAP CH-benCHmark SF1000
+    - cron: '0 0,12 * * *'
 
   workflow_dispatch:
     inputs:
@@ -101,6 +103,7 @@ jobs:
           case "${{ github.event.schedule }}" in
             '0 9 * * *')               NAME=daily-main ;;
             '0 2,5,8,11,14,17,20,23 * * *') NAME=htap-sf100 ;;
+            '0 0,12 * * *')            NAME=htap-sf1000 ;;
             *)                         NAME=           ;;   # manual / unrecognized cron — match nothing
           esac
           echo "Resolved schedule name: $NAME"
@@ -245,6 +248,15 @@ jobs:
         if: ${{ matrix.branch == 'trunk' && steps.sched.outputs.name == 'daily-main' }}
         run: |
           testoperator dispatch ./tools/testoperator/dispatch/chbench/sf100 --workflow bench
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SPICED_COMMIT: ${{ steps.setup-spiced.outputs.SPICED_COMMIT }}
+          WORKFLOW_COMMIT: ${{ matrix.branch }}
+
+      - name: Dispatch Testoperator - Scheduled CH-BenCHmark - SF1000
+        if: ${{ matrix.branch == 'trunk' && steps.sched.outputs.name == 'htap-sf1000' }}
+        run: |
+          testoperator dispatch ./tools/testoperator/dispatch/chbench/sf1000 --workflow htap
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           SPICED_COMMIT: ${{ steps.setup-spiced.outputs.SPICED_COMMIT }}
