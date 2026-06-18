@@ -90,22 +90,35 @@ fn fib_backoff_multiplier(attempt: u32) -> u64 {
     prev
 }
 
-/// Apply *equal jitter* to a backoff `delay`: keep half of it as a floor and
-/// randomize the other half, returning a value in `[delay / 2, delay]`.
+/// Apply *equal jitter* to a backoff `delay`: keep roughly half of it as a floor
+/// and randomize the rest, returning a value in `[delay / 2, delay]`.
 ///
 /// Shared by both metastore backends' retry paths — [`retry_backoff_delay`] (the
 /// write-conflict retry common to Turso `BEGIN CONCURRENT` and `SQLite` `SQLITE_BUSY`)
 /// and the `SQLite` connection-setup retry — so concurrent retriers spread across the
-/// backoff window instead of forming a thundering herd on the same boundary. Delays
-/// with no meaningful jitter window (`< 2 ms`) are returned unchanged.
+/// backoff window instead of forming a thundering herd on the same boundary.
+///
+/// Returned unchanged when there is no meaningful jitter window: delays `< 2 ms`
+/// (which would round to zero), and delays whose millisecond count exceeds
+/// [`u64::MAX`] (where clamping would *shrink* the delay below the input).
 #[must_use]
 pub fn apply_equal_jitter(delay: Duration) -> Duration {
-    let total_ms = u64::try_from(delay.as_millis()).unwrap_or(u64::MAX);
+    let Ok(total_ms) = u64::try_from(delay.as_millis()) else {
+        // Delay exceeds u64::MAX ms (~584M years). Clamping to u64::MAX would
+        // return *less* than the input, so leave it unchanged.
+        return delay;
+    };
     let half = total_ms / 2;
     if half == 0 {
         return delay;
     }
-    Duration::from_millis(half + rand::random_range(0..=half))
+    // Randomize within [ceil(delay / 2), delay]: take ceil(delay / 2) as the floor
+    // and jitter the remaining floor(delay / 2) upward. This stays inside the
+    // documented [delay / 2, delay] window for every input and reaches `delay`
+    // exactly — unlike `half + rand(0..=half)`, which truncated the maximum to
+    // `delay - 1` ms for odd-millisecond delays.
+    let floor_ms = total_ms - half; // ceil(delay / 2)
+    Duration::from_millis(floor_ms + rand::random_range(0..=half))
 }
 
 #[must_use]
@@ -172,7 +185,11 @@ mod tests {
         let expected = [1_u64, 1, 2, 3, 5, 8, 13, 21, 34, 55, 89];
         for (attempt, &multiplier) in expected.iter().enumerate() {
             let attempt = u32::try_from(attempt).expect("small index");
-            assert_eq!(fib_backoff_multiplier(attempt), multiplier, "attempt {attempt}");
+            assert_eq!(
+                fib_backoff_multiplier(attempt),
+                multiplier,
+                "attempt {attempt}"
+            );
         }
     }
 
@@ -209,6 +226,35 @@ mod tests {
             apply_equal_jitter(Duration::from_millis(1)),
             Duration::from_millis(1)
         );
+    }
+
+    #[test]
+    fn apply_equal_jitter_reaches_full_delay_for_odd_millis() {
+        // Regression: `half + rand(0..=half)` truncated the maximum to `delay - 1`
+        // for odd-millisecond delays (3ms could only return 1ms or 2ms). The window
+        // must stay within [delay / 2, delay] and be able to reach `delay` exactly.
+        let delay = Duration::from_millis(3);
+        let mut reached_max = false;
+        for _ in 0..512 {
+            let jittered = apply_equal_jitter(delay);
+            assert!(
+                jittered >= delay / 2 && jittered <= delay,
+                "{jittered:?} outside [{:?}, {delay:?}]",
+                delay / 2,
+            );
+            reached_max |= jittered == delay;
+        }
+        assert!(reached_max, "jitter never reached the full delay");
+    }
+
+    #[test]
+    fn apply_equal_jitter_returns_input_on_millis_overflow() {
+        // A delay whose millisecond count exceeds u64::MAX must be returned
+        // unchanged — never clamped down to u64::MAX ms, which would be a *smaller*
+        // duration than the input.
+        // from_secs(u64::MAX).as_millis() = u64::MAX * 1000, which overflows u64.
+        let huge = Duration::from_secs(u64::MAX);
+        assert_eq!(apply_equal_jitter(huge), huge);
     }
 
     #[test]
