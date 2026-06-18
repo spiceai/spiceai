@@ -391,10 +391,6 @@ mod tests {
             self.4
         }
 
-        fn as_any(&self) -> &dyn Any {
-            self
-        }
-
         fn properties(&self) -> &Arc<datafusion::physical_plan::PlanProperties> {
             self.0.properties()
         }
@@ -450,10 +446,6 @@ mod tests {
 
     #[async_trait]
     impl TableProvider for ExplainMemTable {
-        fn as_any(&self) -> &dyn Any {
-            self
-        }
-
         fn schema(&self) -> SchemaRef {
             self.0.schema()
         }

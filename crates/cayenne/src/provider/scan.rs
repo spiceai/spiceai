@@ -837,7 +837,6 @@ mod tests {
         );
         assert!(
             repartitioned_plan
-                .as_any()
                 .downcast_ref::<RepartitionExec>()
                 .is_some()
         );
@@ -870,10 +869,7 @@ mod tests {
             .expect("inner plan should support projection swapping");
 
         assert!(
-            swapped
-                .as_any()
-                .downcast_ref::<CayenneAccelerationExec>()
-                .is_some(),
+            swapped.downcast_ref::<CayenneAccelerationExec>().is_some(),
             "projection-swapped Cayenne plan should stay wrapped for optimizer identification"
         );
     }
