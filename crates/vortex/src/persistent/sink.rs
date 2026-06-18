@@ -259,7 +259,9 @@ impl FileSink for VortexSink {
             match result {
                 Ok(rows) => {
                     row_count = row_count.checked_add(rows?).ok_or_else(|| {
-                        exec_datafusion_err!("Row count overflow aggregating partitioned Vortex writes")
+                        exec_datafusion_err!(
+                            "Row count overflow aggregating partitioned Vortex writes"
+                        )
                     })?;
                 }
                 Err(join_err) => {
@@ -763,9 +765,10 @@ fn batch_uncompressed_bytes(batch: &RecordBatch) -> DFResult<u64> {
     // estimate scales with the rows actually written.
     let mut total: usize = 0;
     for column in batch.columns() {
-        let slice_bytes = column.to_data().get_slice_memory_size().map_err(|e| {
-            exec_datafusion_err!("Failed to measure sink batch slice size: {e}")
-        })?;
+        let slice_bytes = column
+            .to_data()
+            .get_slice_memory_size()
+            .map_err(|e| exec_datafusion_err!("Failed to measure sink batch slice size: {e}"))?;
         total = total.checked_add(slice_bytes).ok_or_else(|| {
             exec_datafusion_err!("RecordBatch slice size overflow while sizing sink output")
         })?;
