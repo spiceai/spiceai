@@ -934,10 +934,7 @@ fn save_api_credentials_and_print_login_result(
     println!("\x1b[32m✓ Successfully logged in to Spice Cloud with API credentials\x1b[0m");
     println!("  Client ID: {client_id}");
     println!();
-    let env_file = auth_env_file_name();
-    println!(
-        "Credentials saved to {env_file}. Re-run 'spice cloud login api' when the token expires."
-    );
+    println!("Credentials saved to env.");
 
     print_post_login_help();
     Ok(())
@@ -1187,14 +1184,6 @@ async fn execute_apps(args: &AppsArgs) -> Result<()> {
     table.print();
 
     Ok(())
-}
-
-fn auth_env_file_name() -> &'static str {
-    if std::path::Path::new(".env.local").exists() {
-        ".env.local"
-    } else {
-        ".env"
-    }
 }
 
 fn is_cloud_unauthorized_error(err: &crate::error::Error) -> bool {
