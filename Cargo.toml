@@ -183,7 +183,7 @@ datafusion-proto-common = "53.0.0"
 datafusion-pruning = "53.0.0"
 datafusion-spark = "53.0.0"
 datafusion-substrait = "53.0.0"
-datafusion-table-providers = { git = "https://github.com/spiceai/datafusion-table-providers.git", rev = "e8d8b3742b280949efe5238f4d864a9c0fa1a501" } # spiceai-53
+datafusion-table-providers = { git = "https://github.com/spiceai/datafusion-table-providers.git", rev = "cbcfdd0c3e33707d57bf7540ac8c0af893900cbe" } # sgrebnov/spiceai-53
 
 delta_kernel = { version = "0.23.0", features = [
     "default-engine-rustls",
