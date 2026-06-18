@@ -217,7 +217,7 @@ impl FileSink for VortexSink {
     }
 
     /// Drains the per-partition `(path, batches)` streams produced by
-    /// DataFusion's Hive-partition demuxer (see [`DataSink::write_all`]), writing
+    /// `DataFusion`'s Hive-partition demuxer (see [`DataSink::write_all`]), writing
     /// one Vortex file per partition value at the demuxer-chosen path
     /// (e.g. `table/c1=hello/<id>.vortex`). Each partition file is written
     /// concurrently — the demuxer interleaves sends across partition channels, so
