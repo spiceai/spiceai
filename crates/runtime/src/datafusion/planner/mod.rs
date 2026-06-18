@@ -46,6 +46,7 @@ mod update;
 
 use std::sync::Arc;
 
+use data_components::MetadataEnrichedTableProvider;
 use datafusion::catalog::TableProvider;
 use datafusion::error::{DataFusionError, Result as DFResult};
 use datafusion::execution::SessionState;
@@ -285,22 +286,117 @@ async fn is_distributed_insert_table(session: &SessionState, table_name: &TableR
 }
 
 fn is_dual_write_table_provider(table_provider: &Arc<dyn TableProvider>) -> bool {
-    if let Some(accelerated) = table_provider.as_any().downcast_ref::<AcceleratedTable>() {
-        return accelerated.is_dual_write();
-    }
+    peel_table_provider_wrappers(table_provider)
+        .downcast_ref::<AcceleratedTable>()
+        .is_some_and(AcceleratedTable::is_dual_write)
+}
 
-    if let Some(adaptor) = table_provider
-        .as_any()
-        .downcast_ref::<FederatedTableProviderAdaptor>()
-        && let Some(inner_provider) = adaptor.table_provider.as_ref()
-        && let Some(accelerated) = inner_provider.as_any().downcast_ref::<AcceleratedTable>()
-    {
-        return accelerated.is_dual_write();
-    }
+/// Peel the wrapper providers that dataset registration can insert between the
+/// catalog entry and the inner `AcceleratedTable`, so callers can downcast to it.
+///
+/// `PolyTableProvider`-backed accelerators are wrapped in a
+/// `FederatedTableProviderAdaptor`, and datasets that declare table- or
+/// column-level metadata are wrapped in a `MetadataEnrichedTableProvider` by
+/// `register_accelerated_table`.
+fn peel_table_provider_wrappers(table_provider: &Arc<dyn TableProvider>) -> Arc<dyn TableProvider> {
+    let mut current = Arc::clone(table_provider);
+    loop {
+        if let Some(adaptor) = current.downcast_ref::<FederatedTableProviderAdaptor>() {
+            let Some(inner) = adaptor.table_provider.clone() else {
+                break;
+            };
+            current = inner;
+            continue;
+        }
 
-    false
+        if let Some(enriched) = current.downcast_ref::<MetadataEnrichedTableProvider>() {
+            current = Arc::clone(enriched.get_inner_ref());
+            continue;
+        }
+
+        break;
+    }
+    current
 }
 
 fn matches_write_op(actual: &WriteOp, expected: &WriteOp) -> bool {
     std::mem::discriminant(actual) == std::mem::discriminant(expected)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    use datafusion::arrow::datatypes::{DataType, Field, Schema};
+    use datafusion::catalog::TableProvider;
+    use datafusion::datasource::MemTable;
+
+    use super::{MetadataEnrichedTableProvider, peel_table_provider_wrappers};
+
+    fn mem_table() -> Arc<dyn TableProvider> {
+        let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, false)]));
+        Arc::new(MemTable::try_new(schema, vec![vec![]]).expect("mem table should be created"))
+    }
+
+    fn enrich(inner: Arc<dyn TableProvider>) -> Arc<dyn TableProvider> {
+        let mut metadata = HashMap::new();
+        metadata.insert("source_owner".to_string(), "analytics".to_string());
+        Arc::new(MetadataEnrichedTableProvider::new(inner, metadata))
+    }
+
+    #[test]
+    fn peel_reaches_inner_through_metadata_wrapper() {
+        // Regression: a dataset that declares table-/column-level metadata is
+        // registered behind a `MetadataEnrichedTableProvider`. `is_dual_write_table_provider`
+        // (via `peel_table_provider_wrappers`) must see through that wrapper to reach the
+        // inner provider; otherwise a dual-write accelerated table with metadata is wrongly
+        // classified as not-dual-write and its INSERTs skip the distributed-insert rewrite.
+        let inner = mem_table();
+        let wrapped = enrich(Arc::clone(&inner));
+        assert!(
+            wrapped
+                .downcast_ref::<MetadataEnrichedTableProvider>()
+                .is_some(),
+            "precondition: provider is wrapped in MetadataEnrichedTableProvider"
+        );
+
+        let peeled = peel_table_provider_wrappers(&wrapped);
+        assert!(
+            peeled.downcast_ref::<MemTable>().is_some(),
+            "peel must reach the inner provider through the metadata wrapper"
+        );
+    }
+
+    #[test]
+    fn peel_reaches_inner_through_nested_metadata_wrappers() {
+        // The wrappers can nest (e.g. metadata-over-federated-over-metadata); the loop
+        // must keep peeling until no known wrapper matches.
+        let inner = mem_table();
+        let wrapped = enrich(enrich(Arc::clone(&inner)));
+
+        let peeled = peel_table_provider_wrappers(&wrapped);
+        assert!(
+            peeled.downcast_ref::<MemTable>().is_some(),
+            "peel must unwrap every nested metadata wrapper"
+        );
+    }
+
+    #[test]
+    fn peel_is_identity_for_unwrapped_provider() {
+        let inner = mem_table();
+        let peeled = peel_table_provider_wrappers(&inner);
+        assert!(
+            peeled.downcast_ref::<MemTable>().is_some(),
+            "an unwrapped provider must be returned unchanged"
+        );
+    }
+
+    #[test]
+    fn non_accelerated_metadata_wrapped_table_is_not_dual_write() {
+        // A wrapped non-accelerated table must not be misclassified as dual-write — the
+        // peel only routes the downcast, it does not invent an AcceleratedTable.
+        let wrapped = enrich(mem_table());
+        assert!(!super::is_dual_write_table_provider(&wrapped));
+    }
 }

@@ -17,7 +17,6 @@
 
 //! Execution plan for reading JSON files
 
-use std::any::Any;
 use std::io::{BufReader, Read, Seek, SeekFrom};
 use std::sync::Arc;
 use std::task::Poll;
@@ -144,10 +143,6 @@ impl FileSource for SpiceJsonSource {
         });
 
         ProjectionOpener::try_new(self.projection.clone(), opener, file_schema)
-    }
-
-    fn as_any(&self) -> &dyn Any {
-        self
     }
 
     fn with_batch_size(&self, batch_size: usize) -> Arc<dyn FileSource> {

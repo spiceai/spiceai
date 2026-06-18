@@ -20,7 +20,7 @@ limitations under the License.
 //! This handles the `UpsertDedup` `on_conflict` behavior by removing duplicate rows
 //! within incoming batches before they are inserted into the accelerator.
 
-use std::{any::Any, sync::Arc};
+use std::sync::Arc;
 
 use arrow::{compute::concat_batches, datatypes::SchemaRef};
 use async_trait::async_trait;
@@ -98,10 +98,6 @@ impl std::fmt::Debug for UpsertDedupTableProvider {
 #[deny(clippy::missing_trait_methods)]
 #[async_trait]
 impl TableProvider for UpsertDedupTableProvider {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema(&self) -> SchemaRef {
         self.inner.schema()
     }
@@ -267,10 +263,6 @@ impl DisplayAs for UpsertDedupExec {
 impl ExecutionPlan for UpsertDedupExec {
     fn name(&self) -> &'static str {
         "UpsertDedupExec"
-    }
-
-    fn as_any(&self) -> &dyn Any {
-        self
     }
 
     fn schema(&self) -> SchemaRef {

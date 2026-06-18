@@ -13,7 +13,7 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
-use std::{any::Any, sync::Arc};
+use std::sync::Arc;
 
 use crate::s3_vectors::{
     gather_and_limit_providers, list_provider::S3VectorsListTable,
@@ -58,10 +58,6 @@ impl S3VectorsPartitionedListTable {
 
 #[async_trait]
 impl TableProvider for S3VectorsPartitionedListTable {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema(&self) -> SchemaRef {
         Arc::clone(&self.table.schema)
     }
@@ -220,13 +216,9 @@ mod tests {
             .expect("scan");
 
         // The plan should be a UnionExec
-        let global_limit_plan = plan
-            .as_any()
-            .downcast_ref::<GlobalLimitExec>()
-            .expect("downcast");
+        let global_limit_plan = plan.downcast_ref::<GlobalLimitExec>().expect("downcast");
         let union_plan = global_limit_plan
             .input()
-            .as_any()
             .downcast_ref::<UnionExec>()
             .expect("downcast");
 

@@ -16,7 +16,6 @@ limitations under the License.
 
 //! Physical execution plans for Iceberg DDL operations.
 
-use std::any::Any;
 use std::collections::HashMap;
 use std::fmt;
 use std::fmt::Write as _;
@@ -233,10 +232,6 @@ impl ExecutionPlan for IcebergCreateSchemaExec {
         "IcebergCreateSchemaExec"
     }
 
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
     }
@@ -410,10 +405,6 @@ impl DisplayAs for IcebergCreateTableExec {
 impl ExecutionPlan for IcebergCreateTableExec {
     fn name(&self) -> &'static str {
         "IcebergCreateTableExec"
-    }
-
-    fn as_any(&self) -> &dyn Any {
-        self
     }
 
     fn properties(&self) -> &Arc<PlanProperties> {
@@ -1126,7 +1117,7 @@ async fn refresh_iceberg_catalog_provider(
         )));
     };
 
-    if let Some(iceberg_provider) = df_catalog.as_any().downcast_ref::<IcebergCatalogProvider>() {
+    if let Some(iceberg_provider) = df_catalog.downcast_ref::<IcebergCatalogProvider>() {
         iceberg_provider.refresh().await.map_err(|e| {
             DataFusionError::Execution(format!(
                 "Failed to refresh Iceberg catalog '{df_catalog_name}': {e}"
@@ -1135,13 +1126,8 @@ async fn refresh_iceberg_catalog_provider(
         return Ok(());
     }
 
-    if let Some(composed) = df_catalog
-        .as_any()
-        .downcast_ref::<ComposedCatalogProvider>()
-        && let Some(iceberg_provider) = composed
-            .external()
-            .as_any()
-            .downcast_ref::<IcebergCatalogProvider>()
+    if let Some(composed) = df_catalog.downcast_ref::<ComposedCatalogProvider>()
+        && let Some(iceberg_provider) = composed.external().downcast_ref::<IcebergCatalogProvider>()
     {
         iceberg_provider.refresh().await.map_err(|e| {
             DataFusionError::Execution(format!(
@@ -1252,10 +1238,6 @@ impl DisplayAs for IcebergDropTableExec {
 impl ExecutionPlan for IcebergDropTableExec {
     fn name(&self) -> &'static str {
         "IcebergDropTableExec"
-    }
-
-    fn as_any(&self) -> &dyn Any {
-        self
     }
 
     fn properties(&self) -> &Arc<PlanProperties> {

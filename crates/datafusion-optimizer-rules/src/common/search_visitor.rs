@@ -6,7 +6,7 @@ use std::sync::Arc;
 #[macro_export]
 macro_rules! concrete {
     ($var:expr, $t:ty) => {
-        $var.as_ref().as_any().downcast_ref::<$t>()
+        $var.as_ref().downcast_ref::<$t>()
     };
 }
 
@@ -83,7 +83,7 @@ impl SearchVisitor<()> {
         node: &Arc<dyn ExecutionPlan>,
     ) -> Option<Arc<dyn ExecutionPlan>> {
         // Arc::downcast requires Send/Sync, but ExecutionPlan implements those
-        if node.as_ref().as_any().is::<C>() {
+        if node.as_ref().is::<C>() {
             Some(Arc::clone(node))
         } else {
             None

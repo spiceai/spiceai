@@ -14,6 +14,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use std::sync::Arc;
+
 use crate::kafka::{
     KafkaOffsetCommitHook, MessageBatchCommitter, inject_ready_signal_on_caught_up,
 };
@@ -35,7 +37,6 @@ use datafusion::{
     logical_expr::Expr,
     physical_plan::{ExecutionPlan, empty::EmptyExec},
 };
-use std::{any::Any, sync::Arc};
 use tokio::time::Duration;
 use tokio_stream::StreamExt;
 
@@ -174,10 +175,6 @@ impl DebeziumKafka {
 
 #[async_trait]
 impl TableProvider for DebeziumKafka {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema(&self) -> SchemaRef {
         Arc::clone(&self.schema)
     }

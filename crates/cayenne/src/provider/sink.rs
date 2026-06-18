@@ -16,7 +16,6 @@ limitations under the License.
 
 //! A [`DataSink`] implementation that writes data to a Cayenne table.
 
-use std::any::Any;
 use std::fmt;
 use std::sync::Arc;
 
@@ -128,10 +127,6 @@ impl DisplayAs for CayenneDataSink {
 
 #[async_trait]
 impl DataSink for CayenneDataSink {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn metrics(&self) -> Option<MetricsSet> {
         None
     }

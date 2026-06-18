@@ -1,0 +1,107 @@
+name: release_from_run
+
+on:
+  workflow_dispatch:
+    inputs:
+      run_id:
+        description: 'Build run ID to download artifacts from (e.g. 26612673506)'
+        required: true
+        type: string
+      target_version:
+        description: 'Release version without leading v (e.g. 2.0.1 or 2.0.1-enterprise)'
+        required: true
+        type: string
+
+permissions:
+  contents: write
+  actions: read
+
+jobs:
+  publish:
+    name: Publish binaries from existing run
+    runs-on: ubuntu-24.04
+    env:
+      ARTIFACT_DIR: ./release
+
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
+
+      - name: Set REL_VERSION to ${{ inputs.target_version }}
+        run: |
+          echo "REL_VERSION=${{ inputs.target_version }}" >> "$GITHUB_ENV"
+
+      # Downloads every artifact present on the run (with actions:read on the
+      # default token) so the recovery publishes whatever was successfully
+      # built, gracefully skipping any that are absent.
+      - name: Download all artifacts from run ${{ inputs.run_id }}
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          path: ${{ env.ARTIFACT_DIR }}/raw
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          run-id: ${{ inputs.run_id }}
+
+      - name: Collect binary archives
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "${ARTIFACT_DIR}"
+
+          # Flatten downloaded artifacts to a single directory of .tar.gz release assets.
+          find "${ARTIFACT_DIR}/raw" -type f -name "*.tar.gz" -print -exec cp -f {} "${ARTIFACT_DIR}/" \;
+
+          # Keep only flattened archives at top-level release dir.
+          rm -rf "${ARTIFACT_DIR}/raw"
+
+          echo "Collected release assets:"
+          ls -l "${ARTIFACT_DIR}"
+
+          if ! find "${ARTIFACT_DIR}" -maxdepth 1 -type f -name "*.tar.gz" | grep -q .; then
+            echo "::error::No .tar.gz release assets were found for run ${{ inputs.run_id }}"
+            exit 1
+          fi
+
+      - name: Publish binaries to GitHub release
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          OWNER_NAME="${GITHUB_REPOSITORY%%/*}"
+          REPO_NAME="${GITHUB_REPOSITORY#*/}"
+          export GITHUB_TOKEN="${{ secrets.GITHUB_TOKEN }}"
+
+          shopt -s nullglob
+          RELEASE_ARTIFACT=("${ARTIFACT_DIR}"/*.tar.gz)
+          shopt -u nullglob
+
+          if [ ${#RELEASE_ARTIFACT[@]} -eq 0 ]; then
+            echo "::error::No release artifacts to publish"
+            exit 1
+          fi
+
+          python ./.github/scripts/github_release.py delete \
+            --owner "$OWNER_NAME" --repo "$REPO_NAME" \
+            --tag "v${REL_VERSION}" \
+            "${RELEASE_ARTIFACT[@]}"
+
+          RELEASE_NOTES_FILE="./docs/release_notes/v${REL_VERSION}.md"
+          if [ -f "$RELEASE_NOTES_FILE" ]; then
+            export RELEASE_BODY="$(cat "$RELEASE_NOTES_FILE")"
+          else
+            export RELEASE_BODY="Release ${REL_VERSION}"
+          fi
+
+          PRE_RELEASE="false"
+          if [[ "$REL_VERSION" == *"-rc."* ]]; then
+            PRE_RELEASE="true"
+          fi
+
+          echo "Uploading $((${#RELEASE_ARTIFACT[@]})) artifacts to v${REL_VERSION}"
+          python ./.github/scripts/github_release.py upload \
+            --owner "$OWNER_NAME" --repo "$REPO_NAME" \
+            --tag "v${REL_VERSION}" \
+            --release-name "v${REL_VERSION}" \
+            --body "${RELEASE_BODY}" \
+            --prerelease "$PRE_RELEASE" \
+            "${RELEASE_ARTIFACT[@]}"

@@ -54,39 +54,34 @@ pub(crate) fn find_concrete_table_provider<T: TableProvider + 'static>(
     // Also avoids having to [`Box::pin`] for recursive `async fn`.
     loop {
         // Attempt to downcast the current table to the desired type.
-        if let Some(found_table) = current_tbl.as_any().downcast_ref::<T>() {
+        if let Some(found_table) = current_tbl.downcast_ref::<T>() {
             return Some(found_table);
         }
 
         // Handle specific table wrapping logic.
-        if let Some(index_table) = current_tbl.as_any().downcast_ref::<IndexedTableProvider>() {
+        if let Some(index_table) = current_tbl.downcast_ref::<IndexedTableProvider>() {
             current_tbl = index_table.get_underlying_ref();
             continue;
         }
 
-        if let Some(adaptor) = current_tbl
-            .as_any()
-            .downcast_ref::<FederatedTableProviderAdaptor>()
+        if let Some(adaptor) = current_tbl.downcast_ref::<FederatedTableProviderAdaptor>()
             && let Some(adapted_tbl) = adaptor.table_provider.as_ref()
         {
             current_tbl = adapted_tbl;
             continue;
         }
 
-        if let Some(metadata_table) = current_tbl
-            .as_any()
-            .downcast_ref::<MetadataEnrichedTableProvider>()
-        {
+        if let Some(metadata_table) = current_tbl.downcast_ref::<MetadataEnrichedTableProvider>() {
             current_tbl = metadata_table.get_inner_ref();
             continue;
         }
 
-        if let Some(embedding_table) = current_tbl.as_any().downcast_ref::<EmbeddingTable>() {
+        if let Some(embedding_table) = current_tbl.downcast_ref::<EmbeddingTable>() {
             current_tbl = embedding_table.get_underlying_ref();
             continue;
         }
 
-        if let Some(accelerated_table) = current_tbl.as_any().downcast_ref::<AcceleratedTable>() {
+        if let Some(accelerated_table) = current_tbl.downcast_ref::<AcceleratedTable>() {
             current_tbl = accelerated_table
                 .get_federated_table_ref()
                 .try_table_provider_sync_ref()?;

@@ -5,6 +5,6 @@ tests:
     scale_factor: 1000
     terminals: 100
     duration: 600
-    ready_wait: 600
+    ready_wait: 900
     query_overrides: duckdb
     rate: 10000

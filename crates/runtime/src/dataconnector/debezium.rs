@@ -536,7 +536,7 @@ impl DataConnector for Debezium {
     ) -> Option<ChangesStream> {
         Some(Box::pin(stream! {
             let table_provider = federated_table.table_provider().await;
-            let Some(debezium_kafka) = table_provider.as_any().downcast_ref::<DebeziumKafka>() else {
+            let Some(debezium_kafka) = table_provider.downcast_ref::<DebeziumKafka>() else {
                 return;
             };
 

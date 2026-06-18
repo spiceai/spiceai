@@ -101,10 +101,6 @@ impl ListUDFTable {
 
 #[async_trait]
 impl TableProvider for ListUDFTable {
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
-
     fn schema(&self) -> SchemaRef {
         Arc::clone(&self.schema)
     }

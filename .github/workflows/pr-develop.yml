@@ -90,7 +90,7 @@ jobs:
       - name: Validate datafusion-table-providers commit
         run: bash .github/scripts/validate_table_providers_commit.sh
         env:
-          BRANCH: sgrebnov/spiceai-53 # temporary
+          BRANCH: sgrebnov/spiceai-54 # temporary
 
       - name: Show sccache stats
         if: runner.os == 'macOS' && steps.setup-spiceio.outputs.endpoint != ''

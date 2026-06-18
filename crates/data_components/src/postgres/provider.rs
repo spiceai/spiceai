@@ -19,7 +19,6 @@ limitations under the License.
 //! Discovers schemas and tables in a `PostgreSQL` database using
 //! `information_schema` queries and provides them as `DataFusion` catalog/schema providers.
 
-use std::any::Any;
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
@@ -341,10 +340,6 @@ impl PostgresCatalogProvider {
 }
 
 impl CatalogProvider for PostgresCatalogProvider {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema_names(&self) -> Vec<String> {
         let guard = match self.schemas.read() {
             Ok(guard) => guard,
@@ -583,10 +578,6 @@ pub fn postgres_metadata_from_rows(
 
 #[async_trait]
 impl SchemaProvider for PostgresSchemaProvider {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn table_names(&self) -> Vec<String> {
         let guard = match self.tables.read() {
             Ok(guard) => guard,
@@ -629,7 +620,6 @@ mod tests {
     use datafusion::prelude::Expr;
     use datafusion::sql::TableReference;
     use globset::{Glob, GlobSetBuilder};
-    use std::any::Any;
     use std::collections::{HashMap, HashSet};
     use std::sync::{Arc, Mutex};
 
@@ -638,10 +628,6 @@ mod tests {
 
     #[async_trait]
     impl TableProvider for MockTableProvider {
-        fn as_any(&self) -> &dyn Any {
-            self
-        }
-
         fn schema(&self) -> arrow::datatypes::SchemaRef {
             Arc::new(arrow::datatypes::Schema::new(vec![
                 arrow::datatypes::Field::new(

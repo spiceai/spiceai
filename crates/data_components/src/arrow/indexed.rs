@@ -26,7 +26,6 @@ limitations under the License.
 //! This module provides a hash index wrapper that accelerates point lookups
 //! on `MemTable` when a primary key is specified.
 
-use std::any::Any;
 use std::collections::HashMap;
 use std::fmt::{self, Debug};
 use std::sync::Arc;
@@ -574,10 +573,6 @@ impl PrimaryKeyValue {
 #[deny(clippy::missing_trait_methods)]
 #[async_trait]
 impl TableProvider for IndexedMemTable {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema(&self) -> SchemaRef {
         self.inner.schema()
     }
@@ -951,10 +946,6 @@ impl DisplayAs for IndexedLookupExec {
 impl ExecutionPlan for IndexedLookupExec {
     fn name(&self) -> &'static str {
         "IndexedLookupExec"
-    }
-
-    fn as_any(&self) -> &dyn Any {
-        self
     }
 
     fn schema(&self) -> SchemaRef {

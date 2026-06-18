@@ -33,7 +33,6 @@ limitations under the License.
 //! * Cosmos DB Rust SDK 0.30 has limited cross-partition capabilities; see
 //!   the module-level documentation.
 
-use std::any::Any;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -300,10 +299,6 @@ async fn fetch_samples(
 
 #[async_trait]
 impl TableProvider for CosmosDBTableProvider {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema(&self) -> SchemaRef {
         Arc::clone(&self.schema)
     }
@@ -396,10 +391,6 @@ impl DisplayAs for CosmosDBExec {
 impl ExecutionPlan for CosmosDBExec {
     fn name(&self) -> &'static str {
         "CosmosDBExec"
-    }
-
-    fn as_any(&self) -> &dyn Any {
-        self
     }
 
     fn schema(&self) -> SchemaRef {

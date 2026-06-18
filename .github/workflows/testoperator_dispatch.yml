@@ -2,16 +2,12 @@ name: testoperator dispatch
 
 on:
   schedule:
-    # daily-main, 0900 UTC / 0200 PDT  — full bench suite + HTAP CH-benCHmark SF1
+    # daily-main, 0900 UTC / 0200 PDT  — full bench suite
     - cron: '0 9 * * *'
-    # htap-sf1, every 3h — extra HTAP CH-benCHmark SF1 runs so SF1 fires every 3
-    # hours (0000, 0300, 0600, 0900 via daily-main, 1200, 1500, 1800, 2100) without
-    # re-running the full daily-main suite eight times a day.
-    - cron: '0 0,3,6,12,15,18,21 * * *'
-    # htap-sf10, every 3h (0100, 0400, 0700, 1000, 1300, 1600, 1900, 2200) — HTAP CH-benCHmark SF10
-    - cron: '0 1,4,7,10,13,16,19,22 * * *'
     # htap-sf100, every 3h (0200, 0500, 0800, 1100, 1400, 1700, 2000, 2300) — HTAP CH-benCHmark SF100
     - cron: '0 2,5,8,11,14,17,20,23 * * *'
+    # htap-sf1000, twice daily (0000, 1200) — HTAP CH-benCHmark SF1000
+    - cron: '0 0,12 * * *'
 
   workflow_dispatch:
     inputs:
@@ -34,7 +30,6 @@ on:
           - 'text-to-sql'
           - 'streaming-bench'
           - 'streaming-correctness'
-          - 'htap'
       update_snapshots:
         description: 'Update snapshots?'
         required: false
@@ -107,9 +102,8 @@ jobs:
         run: |
           case "${{ github.event.schedule }}" in
             '0 9 * * *')               NAME=daily-main ;;
-            '0 0,3,6,12,15,18,21 * * *')   NAME=htap-sf1   ;;
-            '0 1,4,7,10,13,16,19,22 * * *') NAME=htap-sf10  ;;
             '0 2,5,8,11,14,17,20,23 * * *') NAME=htap-sf100 ;;
+            '0 0,12 * * *')            NAME=htap-sf1000 ;;
             *)                         NAME=           ;;   # manual / unrecognized cron — match nothing
           esac
           echo "Resolved schedule name: $NAME"
@@ -240,27 +234,7 @@ jobs:
           SPICED_COMMIT: ${{ steps.setup-spiced.outputs.SPICED_COMMIT }}
           WORKFLOW_COMMIT: ${{ matrix.branch }}
 
-      # HTAP CH-benCHmark — every SF runs 8x/day (every 3 hours). SF1 rides
-      # with daily-main at 0900 plus the htap-sf1 extras at 0000/0300/0600/1200/1500/1800/2100;
-      # SF10 / SF100 each fire on their own every-3h cron.
-      - name: Dispatch Testoperator - Scheduled CH-BenCHmark - SF1
-        if: ${{ matrix.branch == 'trunk' && (steps.sched.outputs.name == 'daily-main' || steps.sched.outputs.name == 'htap-sf1') }}
-        run: |
-          testoperator dispatch ./tools/testoperator/dispatch/chbench/sf1 --workflow htap
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          SPICED_COMMIT: ${{ steps.setup-spiced.outputs.SPICED_COMMIT }}
-          WORKFLOW_COMMIT: ${{ matrix.branch }}
-
-      - name: Dispatch Testoperator - Scheduled CH-BenCHmark - SF10
-        if: ${{ matrix.branch == 'trunk' && steps.sched.outputs.name == 'htap-sf10' }}
-        run: |
-          testoperator dispatch ./tools/testoperator/dispatch/chbench/sf10 --workflow htap
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          SPICED_COMMIT: ${{ steps.setup-spiced.outputs.SPICED_COMMIT }}
-          WORKFLOW_COMMIT: ${{ matrix.branch }}
-
+      # HTAP CH-benCHmark — SF100 fires on its own every-3h cron.
       - name: Dispatch Testoperator - Scheduled CH-BenCHmark - SF100
         if: ${{ matrix.branch == 'trunk' && steps.sched.outputs.name == 'htap-sf100' }}
         run: |
@@ -274,6 +248,15 @@ jobs:
         if: ${{ matrix.branch == 'trunk' && steps.sched.outputs.name == 'daily-main' }}
         run: |
           testoperator dispatch ./tools/testoperator/dispatch/chbench/sf100 --workflow bench
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SPICED_COMMIT: ${{ steps.setup-spiced.outputs.SPICED_COMMIT }}
+          WORKFLOW_COMMIT: ${{ matrix.branch }}
+
+      - name: Dispatch Testoperator - Scheduled CH-BenCHmark - SF1000
+        if: ${{ matrix.branch == 'trunk' && steps.sched.outputs.name == 'htap-sf1000' }}
+        run: |
+          testoperator dispatch ./tools/testoperator/dispatch/chbench/sf1000 --workflow htap
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           SPICED_COMMIT: ${{ steps.setup-spiced.outputs.SPICED_COMMIT }}
@@ -346,15 +329,6 @@ jobs:
         run: |
           shopt -s globstar nullglob
           for file in ./test/spicepods/clickbench/sf1/**/*.yaml; do
-            echo "Validating $file"
-            "$SPICEPOD_VALIDATOR" "$file"
-          done
-
-      - name: Validate spicepods - CH-BenCHmark
-        if: ${{ github.event.inputs.workflow_type == 'htap' }}
-        run: |
-          shopt -s globstar nullglob
-          for file in ./test/spicepods/chbench/**/*.yaml; do
             echo "Validating $file"
             "$SPICEPOD_VALIDATOR" "$file"
           done
@@ -446,12 +420,3 @@ jobs:
           SPICED_COMMIT: ${{ steps.setup-spiced.outputs.SPICED_COMMIT }}
           WORKFLOW_COMMIT: ${{ github.event.ref }}
 
-      - name: Dispatch Testoperator - ${{ github.event.inputs.workflow_type }} - CH-BenCHmark - SF10
-        run: |
-          testoperator dispatch ./tools/testoperator/dispatch/chbench/sf10 \
-            --workflow ${{ github.event.inputs.workflow_type }} \
-            --update-snapshots ${{ github.event.inputs.update_snapshots }}
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          SPICED_COMMIT: ${{ steps.setup-spiced.outputs.SPICED_COMMIT }}
-          WORKFLOW_COMMIT: ${{ github.event.ref }}
