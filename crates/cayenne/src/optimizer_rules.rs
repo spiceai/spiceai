@@ -2510,8 +2510,8 @@ mod tests {
     /// scan's underlying file source — the same min/max bounds +
     /// InList/hash-table membership filter the inner-join path provides.
     ///
-    /// This is new in DataFusion 54: DataFusion 53 pushed join-derived dynamic
-    /// filters through **inner** joins only, whereas DataFusion 54 generalized
+    /// This is new in `DataFusion` 54: `DataFusion` 53 pushed join-derived dynamic
+    /// filters through **inner** joins only, whereas `DataFusion` 54 generalized
     /// `HashJoinExec::allow_join_dynamic_filter_pushdown` to gate on
     /// `join_type.on_lr_is_preserved().probe_preserved`, which is `true` for semi
     /// joins too. Cayenne benefits: a `RightSemi` join's output is the subset of
