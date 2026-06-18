@@ -13,14 +13,13 @@ description: "Query: clickbench_q27"
 | physical_plan | ProjectionExec: expr=[SearchPhrase@0 as SearchPhrase]                                                                                     |
 |               |   SortExec: TopK(fetch=10), expr=[to_timestamp(EventTime@1) ASC NULLS LAST, SearchPhrase@0 ASC NULLS LAST], preserve_partitioning=[false] |
 |               |     CoalescePartitionsExec                                                                                                                |
-|               |       ProjectionExec: expr=[SearchPhrase@1 as SearchPhrase, EventTime@0 as EventTime]                                                     |
-|               |         FilterExec: CAST(SearchPhrase@1 AS Utf8View) !=                                                                                   |
-|               |           RepartitionExec: partitioning=RoundRobinBatch(16), input_partitions=1                                                           |
-|               |             SchemaCastScanExec                                                                                                            |
-|               |               FallbackOnZeroResultsScanExec                                                                                               |
-|               |                 CoalescePartitionsExec                                                                                                    |
-|               |                   RepartitionExec: partitioning=RoundRobinBatch(16), input_partitions=1                                                   |
-|               |                     BytesProcessedExec                                                                                                    |
-|               |                       DuckSqlExec sql= SELECT "EventTime", "SearchPhrase" FROM "hits" WHERE (CAST("SearchPhrase" AS VARCHAR) <> '')       |
+|               |       FilterExec: CAST(SearchPhrase@1 AS Utf8View) != , projection=[SearchPhrase@1, EventTime@0]                                          |
+|               |         RepartitionExec: partitioning=RoundRobinBatch(16), input_partitions=1                                                             |
+|               |           SchemaCastScanExec                                                                                                              |
+|               |             FallbackOnZeroResultsScanExec                                                                                                 |
+|               |               CoalescePartitionsExec                                                                                                      |
+|               |                 RepartitionExec: partitioning=RoundRobinBatch(16), input_partitions=1                                                     |
+|               |                   BytesProcessedExec                                                                                                      |
+|               |                     DuckSqlExec sql= SELECT "EventTime", "SearchPhrase" FROM "hits" WHERE (CAST("SearchPhrase" AS VARCHAR) <> '')         |
 |               |                                                                                                                                           |
 +---------------+-------------------------------------------------------------------------------------------------------------------------------------------+
