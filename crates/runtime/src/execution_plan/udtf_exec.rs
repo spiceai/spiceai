@@ -140,6 +140,10 @@ impl DisplayAs for UdtfExec {
 
 #[deny(clippy::missing_trait_methods)]
 impl ExecutionPlan for UdtfExec {
+    fn downcast_delegate(&self) -> Option<&dyn ExecutionPlan> {
+        None
+    }
+
     fn with_preserve_order(&self, _preserve_order: bool) -> Option<Arc<dyn ExecutionPlan>> {
         None
     }
@@ -321,6 +325,10 @@ impl DisplayAs for PlaceholderExec {
 
 #[deny(clippy::missing_trait_methods)]
 impl ExecutionPlan for PlaceholderExec {
+    fn downcast_delegate(&self) -> Option<&dyn ExecutionPlan> {
+        None
+    }
+
     fn with_preserve_order(&self, _preserve_order: bool) -> Option<Arc<dyn ExecutionPlan>> {
         None
     }

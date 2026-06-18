@@ -908,7 +908,7 @@ impl TableProvider for DeltaTable {
                     selection_vector,
                 )
                 .await?;
-                partitioned_file = partitioned_file.with_extensions(Arc::new(access_plan));
+                partitioned_file = partitioned_file.with_extension(access_plan);
             }
 
             partitioned_files.push(partitioned_file);

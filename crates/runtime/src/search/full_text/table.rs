@@ -125,14 +125,12 @@ pub(crate) async fn add_elasticsearch_fts_to_table(
     let index =
         build_elasticsearch_text_index(Arc::clone(&inner_table_provider), columns, tbl, fts_params)
             .await?;
-    let mut provider: IndexedTableProvider = if let Some(idx_tbl) = inner_table_provider
-        .as_any()
-        .downcast_ref::<IndexedTableProvider>(
-    ) {
-        idx_tbl.clone()
-    } else {
-        IndexedTableProvider::new(Arc::clone(&inner_table_provider))
-    };
+    let mut provider: IndexedTableProvider =
+        if let Some(idx_tbl) = inner_table_provider.downcast_ref::<IndexedTableProvider>() {
+            idx_tbl.clone()
+        } else {
+            IndexedTableProvider::new(Arc::clone(&inner_table_provider))
+        };
     provider = provider.add_index(index as Arc<dyn Index + Send + Sync>);
     Ok(provider)
 }

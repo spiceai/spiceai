@@ -4889,7 +4889,6 @@ mod tests {
             table_provider_with_spicepod_metadata(Arc::clone(&inner), &table_metadata, &[]);
         assert!(
             wrapped
-                .as_any()
                 .downcast_ref::<MetadataEnrichedTableProvider>()
                 .is_some(),
             "precondition: provider should be wrapped in MetadataEnrichedTableProvider"
@@ -4905,7 +4904,7 @@ mod tests {
             .expect("should resolve the accelerated table provider");
 
         assert!(
-            resolved.as_any().downcast_ref::<MemTable>().is_some(),
+            resolved.downcast_ref::<MemTable>().is_some(),
             "get_accelerated_table_provider must peel MetadataEnrichedTableProvider to reach the inner provider"
         );
     }

@@ -393,10 +393,9 @@ async fn wrap_table_as_index_elasticsearch(
         })
         .collect();
 
-    let mut provider = if let Some(indexed) = inner_table_provider
-        .as_any()
-        .downcast_ref::<runtime_datafusion_index::IndexedTableProvider>(
-    ) {
+    let mut provider = if let Some(indexed) =
+        inner_table_provider.downcast_ref::<runtime_datafusion_index::IndexedTableProvider>()
+    {
         indexed.clone()
     } else {
         runtime_datafusion_index::IndexedTableProvider::new(Arc::clone(&inner_table_provider))

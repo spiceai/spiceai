@@ -2168,10 +2168,6 @@ mod tests {
 
     #[async_trait]
     impl TableProvider for FilterTrackingTableProvider {
-        fn as_any(&self) -> &dyn Any {
-            self
-        }
-
         fn schema(&self) -> SchemaRef {
             Arc::clone(&self.schema)
         }
@@ -2251,10 +2247,6 @@ mod tests {
 
     #[async_trait]
     impl TableProvider for MockAcceleratorTableProvider {
-        fn as_any(&self) -> &dyn Any {
-            self
-        }
-
         fn schema(&self) -> SchemaRef {
             Arc::clone(&self.schema)
         }
@@ -2350,10 +2342,6 @@ mod tests {
 
     #[async_trait]
     impl TableProvider for MockHttpTableProvider {
-        fn as_any(&self) -> &dyn Any {
-            self
-        }
-
         fn schema(&self) -> SchemaRef {
             Arc::clone(&self.schema)
         }

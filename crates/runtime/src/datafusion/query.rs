@@ -2717,10 +2717,6 @@ mod tests {
             "TestExecutionPlan"
         }
 
-        fn as_any(&self) -> &dyn Any {
-            self
-        }
-
         fn properties(&self) -> &Arc<PlanProperties> {
             &self.properties
         }

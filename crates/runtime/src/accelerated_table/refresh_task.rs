@@ -2749,14 +2749,12 @@ mod tests {
 
         let wrapped = table_provider_with_existing_metadata(indexed_provider);
         let indexed = wrapped
-            .as_any()
             .downcast_ref::<IndexedTableProvider>()
             .expect("indexed provider should remain the outer provider");
         assert_eq!(indexed.get_all_indexes().len(), 1);
         assert!(
             indexed
                 .get_underlying()
-                .as_any()
                 .downcast_ref::<MetadataEnrichedTableProvider>()
                 .is_some()
         );

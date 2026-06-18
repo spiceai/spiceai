@@ -360,7 +360,6 @@ mod tests {
         let wrapped = enrich(Arc::clone(&inner));
         assert!(
             wrapped
-                .as_any()
                 .downcast_ref::<MetadataEnrichedTableProvider>()
                 .is_some(),
             "precondition: provider is wrapped in MetadataEnrichedTableProvider"
@@ -368,7 +367,7 @@ mod tests {
 
         let peeled = peel_table_provider_wrappers(&wrapped);
         assert!(
-            peeled.as_any().downcast_ref::<MemTable>().is_some(),
+            peeled.downcast_ref::<MemTable>().is_some(),
             "peel must reach the inner provider through the metadata wrapper"
         );
     }
@@ -382,7 +381,7 @@ mod tests {
 
         let peeled = peel_table_provider_wrappers(&wrapped);
         assert!(
-            peeled.as_any().downcast_ref::<MemTable>().is_some(),
+            peeled.downcast_ref::<MemTable>().is_some(),
             "peel must unwrap every nested metadata wrapper"
         );
     }
@@ -392,7 +391,7 @@ mod tests {
         let inner = mem_table();
         let peeled = peel_table_provider_wrappers(&inner);
         assert!(
-            peeled.as_any().downcast_ref::<MemTable>().is_some(),
+            peeled.downcast_ref::<MemTable>().is_some(),
             "an unwrapped provider must be returned unchanged"
         );
     }

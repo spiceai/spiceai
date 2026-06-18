@@ -839,6 +839,7 @@ impl ReciprocalRankFusion {
     // sub-query *before* ranking. This narrows the candidate set so that
     // ranks reflect position within the filtered population — matching user
     // intent for queries like `WHERE review_date > '2015-06-15' AND product_category = 'some category'`.
+    #[expect(deprecated)] // DF54: TableFunctionImpl::call deferred (needs Session); see follow-up
     fn prepare_and_execute_subqueries(
         &self,
         args: &ReciprocalRankFusionArgs,

@@ -154,7 +154,7 @@ impl CayennePropagateFilterAcrossEquiJoinKeys {
     /// Create a new instance of the rule.
     #[must_use]
     pub fn new() -> Self {
-        Self::new_with_table_provider_predicate(|provider| provider.is::<CayenneTableProvider>())
+        Self::new_with_table_provider_predicate(<dyn TableProvider>::is::<CayenneTableProvider>)
     }
 
     /// Create a new instance with a caller-provided table-provider predicate.
@@ -361,7 +361,7 @@ impl CayenneReassociateCrossJoin {
     /// Create a new instance of the rule.
     #[must_use]
     pub fn new() -> Self {
-        Self::new_with_table_provider_predicate(|provider| provider.is::<CayenneTableProvider>())
+        Self::new_with_table_provider_predicate(<dyn TableProvider>::is::<CayenneTableProvider>)
     }
 
     /// Create a new instance with a caller-provided table-provider predicate.
@@ -444,7 +444,7 @@ impl CayenneInListToRangeRewrite {
     /// Create a new instance of the rule.
     #[must_use]
     pub fn new() -> Self {
-        Self::new_with_table_provider_predicate(|provider| provider.is::<CayenneTableProvider>())
+        Self::new_with_table_provider_predicate(<dyn TableProvider>::is::<CayenneTableProvider>)
     }
 
     /// Create a new instance with a caller-provided table-provider predicate.
@@ -573,7 +573,7 @@ impl CayennePushDownSemiJoin {
     /// Create a new instance of the rule.
     #[must_use]
     pub fn new() -> Self {
-        Self::new_with_table_provider_predicate(|provider| provider.is::<CayenneTableProvider>())
+        Self::new_with_table_provider_predicate(<dyn TableProvider>::is::<CayenneTableProvider>)
     }
 
     /// Create a new instance with a caller-provided table-provider predicate.

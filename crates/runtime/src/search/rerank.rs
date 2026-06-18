@@ -459,6 +459,7 @@ impl RerankTableFunc {
 }
 
 impl TableFunctionImpl for RerankTableFunc {
+    #[expect(deprecated)] // DF54: TableFunctionImpl::call deferred (needs Session); see follow-up
     fn call(&self, args: &[Expr]) -> DataFusionResult<Arc<dyn TableProvider>> {
         let parsed = RerankTableFuncArgs::from_udtf_args(args)?;
 
