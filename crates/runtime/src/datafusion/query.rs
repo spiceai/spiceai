@@ -2117,7 +2117,6 @@ mod tests {
     use datafusion_functions_json::JSON_UNION_DATA_TYPE;
     use serde_json::json;
     use spicepod::component::caching::SQLResultsCacheConfig;
-    use std::any::Any;
     use std::fmt::{Debug, Formatter};
     use std::sync::atomic::{AtomicBool, Ordering};
     use tokio_util::sync::CancellationToken;

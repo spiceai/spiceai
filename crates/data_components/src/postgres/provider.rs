@@ -620,7 +620,6 @@ mod tests {
     use datafusion::prelude::Expr;
     use datafusion::sql::TableReference;
     use globset::{Glob, GlobSetBuilder};
-    use std::any::Any;
     use std::collections::{HashMap, HashSet};
     use std::sync::{Arc, Mutex};
 

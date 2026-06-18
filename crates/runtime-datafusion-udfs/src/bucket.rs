@@ -17,12 +17,12 @@ limitations under the License.
 use std::num::TryFromIntError;
 use std::sync::{Arc, LazyLock};
 
+use crate::vendored_hash::{RandomState, create_hashes};
 use arrow::array::{ArrayRef, UInt64Array};
 use arrow::compute::binary;
 use datafusion::arrow::array::{Array, Int32Array};
 use datafusion::arrow::datatypes::DataType;
 use datafusion::common::DataFusionError;
-use datafusion::common::hash_utils::{RandomState, create_hashes};
 use datafusion::logical_expr::{
     ColumnarValue, ScalarFunctionArgs, ScalarUDFImpl, Signature, Volatility,
 };
@@ -237,7 +237,7 @@ fn compute_bucket(
     }
     let array = scalar.to_array()?;
     let mut hashes = vec![0; 1];
-    create_hashes(&[array], &RANDOM_STATE, &mut hashes)?;
+    create_hashes(array.as_ref(), &RANDOM_STATE, &mut hashes)?;
     let bucket = u64::try_from(num_buckets)
         .map(|n| hashes[0] % n)
         .context(BucketLargerThanTypeSnafu)?;
@@ -252,7 +252,7 @@ fn compute_bucket_array(
     let num_buckets = i32::try_from(num_buckets).context(BucketLargerThanTypeSnafu)?;
 
     let mut hashes = vec![0u64; array.len()];
-    create_hashes(&[Arc::clone(array)], &RANDOM_STATE, &mut hashes)?;
+    create_hashes(array.as_ref(), &RANDOM_STATE, &mut hashes)?;
 
     let hash_array = UInt64Array::from(hashes);
 

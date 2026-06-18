@@ -714,7 +714,6 @@ mod tests {
     use datafusion::prelude::SessionContext;
     use datafusion_datasource::memory::MemorySourceConfig;
     use datafusion_datasource::source::DataSourceExec;
-    use std::any::Any;
     use std::sync::Arc;
 
     fn count_exec(n: u64) -> Arc<dyn ExecutionPlan> {

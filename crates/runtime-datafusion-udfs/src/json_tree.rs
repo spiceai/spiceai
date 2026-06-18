@@ -645,6 +645,7 @@ impl ScalarUDFImpl for JsonTreeScalar {
 
 #[cfg(test)]
 mod tests {
+    #![expect(deprecated)] // DF54: test-only TableFunctionImpl::call/create_table_provider; migration deferred (needs Session)
     use super::*;
 
     fn by_fullkey(rows: &[TreeRow]) -> std::collections::HashMap<&str, &TreeRow> {

@@ -1339,7 +1339,6 @@ mod tests {
     use object_store::ObjectMeta;
     use object_store::ObjectStore;
     use object_store::path::Path;
-    use std::any::Any;
     use std::sync::Arc;
 
     fn maintained_aggregate_test_schema() -> Arc<Schema> {

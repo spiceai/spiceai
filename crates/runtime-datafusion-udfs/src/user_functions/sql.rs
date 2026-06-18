@@ -1034,6 +1034,7 @@ fn parse_arrow_type(s: &str) -> Result<DataType> {
 
 #[cfg(test)]
 mod tests {
+    #![expect(deprecated)] // DF54: test-only TableFunctionImpl::call/create_table_provider; migration deferred (needs Session)
     use super::*;
     use arrow::array::{
         Array, ArrayRef, Float64Array, Int32Array, Int64Array, ListArray, StringArray,

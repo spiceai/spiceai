@@ -403,7 +403,6 @@ mod tests {
     use datafusion::prelude::SessionContext;
     use datafusion_datasource::memory::MemorySourceConfig;
     use datafusion_datasource::source::DataSourceExec;
-    use std::any::Any;
     use std::sync::Arc;
 
     use crate::federated_table::FederatedTable;

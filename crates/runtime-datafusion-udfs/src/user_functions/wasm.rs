@@ -1375,6 +1375,7 @@ fn manifest_path(source: &Path) -> PathBuf {
 
 #[cfg(test)]
 mod tests {
+    #![expect(deprecated)] // DF54: test-only TableFunctionImpl::call/create_table_provider; migration deferred (needs Session)
     use super::*;
     use arrow::array::Int64Array;
     use datafusion::common::Spans;

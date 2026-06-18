@@ -2137,7 +2137,6 @@ mod tests {
     use datafusion::physical_plan::ExecutionPlan;
     use datafusion::sql::TableReference;
     use parking_lot::RwLock;
-    use std::any::Any;
     use std::collections::HashMap;
     use std::sync::Arc;
     use std::time::{Duration, SystemTime};

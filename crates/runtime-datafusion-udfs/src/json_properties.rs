@@ -1348,6 +1348,7 @@ impl ScalarUDFImpl for FlattenJsonPropertiesScalar {
 
 #[cfg(test)]
 mod tests {
+    #![expect(deprecated)] // DF54: test-only TableFunctionImpl::call/create_table_provider; migration deferred (needs Session)
     use super::*;
 
     fn by_path(rows: &[PropertyRow]) -> std::collections::HashMap<&str, &PropertyRow> {

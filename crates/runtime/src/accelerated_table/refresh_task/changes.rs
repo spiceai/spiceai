@@ -4334,7 +4334,6 @@ mod tests {
     };
     use datafusion::prelude::Expr;
     use futures::stream::{self as fstream};
-    use std::any::Any;
     use std::pin::Pin;
     use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
     use std::task::{Context, Poll};

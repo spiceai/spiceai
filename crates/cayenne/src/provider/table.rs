@@ -26880,7 +26880,7 @@ mod tests {
             &self,
             _partition: Option<usize>,
         ) -> datafusion_common::Result<Arc<Statistics>> {
-            Ok(self.stats.clone())
+            Ok(Arc::clone(&self.stats))
         }
     }
 

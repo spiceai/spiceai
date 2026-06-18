@@ -270,7 +270,6 @@ impl UserDefinedLogicalNodeCore for DuckDBAggregatePushdownNode {
 
 #[cfg(test)]
 mod tests {
-    use crate::concrete;
     use crate::logical_plan::duckdb::aggregate_pushdown::{
         DuckDBAggregateLogicalPushdown, DuckDBAggregatePushdownNode,
         SPICE_ACCELERATOR_METADATA_KEY, SPICE_OPT_DUCKDB_AGG_PUSHDOWN_KEY,
