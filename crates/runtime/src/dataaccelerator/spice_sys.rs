@@ -412,20 +412,7 @@ async fn acceleration_connection(
             // Derive metadata directory using shared resolution logic
             let metadata_dir = CayenneAccelerator::resolve_metadata_dir(source.acceleration());
 
-            // The dataset checkpoint stores its `spice_checkpoint` table in a SQLite
-            // pool. When the Cayenne metastore backend is Turso it owns `cayenne.db`
-            // as a libSQL/MVCC database; opening that same file as a raw SQLite WAL
-            // pool here would re-stamp it SQLite-WAL and conflict with the metastore.
-            // Keep the checkpoint in a separate SQLite file in that case.
-            let metastore_type = source
-                .acceleration()
-                .and_then(|a| a.params.get("cayenne_metastore"))
-                .map_or("sqlite", String::as_str);
-            let metadata_db_path = if metastore_type == "turso" {
-                format!("{metadata_dir}/cayenne-checkpoint.db")
-            } else {
-                format!("{metadata_dir}/cayenne.db")
-            };
+            let metadata_db_path = format!("{metadata_dir}/cayenne.db");
 
             if open_option == OpenOption::OpenExisting && !Path::new(&metadata_db_path).exists() {
                 return CayenneMetadataMissingSnafu {
@@ -441,6 +428,26 @@ async fn acceleration_connection(
                     .map_err(|e| Error::CayennePool {
                         source: Box::new(e),
                     })?;
+            }
+
+            // When the Cayenne metastore backend is Turso, it owns `cayenne.db` as a
+            // libSQL/MVCC database. Route the checkpoint through a Turso connection
+            // on that same file rather than opening it as a raw SQLite pool, which
+            // would re-stamp it SQLite-WAL and conflict with the metastore.
+            #[cfg(feature = "turso")]
+            {
+                let metastore_type = source
+                    .acceleration()
+                    .and_then(|a| a.params.get("cayenne_metastore"))
+                    .map_or("sqlite", String::as_str);
+                if metastore_type == "turso" {
+                    let pool = super::turso::TursoConnectionPool::new(&metadata_db_path)
+                        .await
+                        .map_err(|e| Error::CayennePool {
+                            source: Box::new(e),
+                        })?;
+                    return Ok(AccelerationConnection::Turso(Arc::new(pool)));
+                }
             }
 
             // Create SQLite connection pool for cayenne metadata using the factory
