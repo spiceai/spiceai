@@ -48,25 +48,46 @@ pub const DEFAULT_CONCURRENT_WRITE_MAX_ATTEMPTS: u32 = 4;
 const _: () = assert!(DEFAULT_CONCURRENT_WRITE_MAX_ATTEMPTS > 0);
 
 /// Base delay in milliseconds used by [`retry_backoff_delay`] for
-/// exponential backoff between concurrent write retries.
+/// Fibonacci backoff between concurrent write retries.
 pub const DEFAULT_CONCURRENT_RETRY_BASE_DELAY_MS: u64 = 10;
 
-/// Exponential backoff delay for retry `attempt` (1-based), with equal jitter
+/// Fibonacci backoff delay for retry `attempt` (1-based), with equal jitter
 /// applied via [`apply_equal_jitter`].
 ///
-/// The exponential base is `DEFAULT_CONCURRENT_RETRY_BASE_DELAY_MS * 2^(attempt - 1)`;
-/// the returned delay is randomized within `[base / 2, base]` so that many writers
-/// contending on the same row — a Turso `BEGIN CONCURRENT` MVCC commit conflict or a
-/// `SQLite` `SQLITE_BUSY` — do not all wake on the same backoff boundary and re-collide
-/// (a retry thundering herd).
+/// The backoff base is `DEFAULT_CONCURRENT_RETRY_BASE_DELAY_MS * fib(attempt)`, where
+/// `fib` walks the Fibonacci sequence `1, 1, 2, 3, 5, 8, …` (see
+/// [`fib_backoff_multiplier`]); the returned delay is then randomized within
+/// `[base / 2, base]` so that many writers contending on the same row — a Turso
+/// `BEGIN CONCURRENT` MVCC commit conflict or a `SQLite` `SQLITE_BUSY` — do not all wake
+/// on the same backoff boundary and re-collide (a retry thundering herd).
+///
+/// Fibonacci grows by the golden ratio (≈1.618×) per attempt rather than doubling, so
+/// retries ramp through more, smaller steps before reaching a long wait. Under moderate
+/// write contention that converges sooner than exponential backoff while still bounding
+/// the worst-case delay.
 #[must_use]
 pub fn retry_backoff_delay(attempt: u32) -> Duration {
-    // Clamp the exponent to avoid shifting by 64+ bits, which would panic.
-    let exponent = attempt.saturating_sub(1).min(63);
-    let backoff_multiplier = 1_u64 << exponent;
-    let base_ms = DEFAULT_CONCURRENT_RETRY_BASE_DELAY_MS.saturating_mul(backoff_multiplier);
+    let base_ms =
+        DEFAULT_CONCURRENT_RETRY_BASE_DELAY_MS.saturating_mul(fib_backoff_multiplier(attempt));
 
     apply_equal_jitter(Duration::from_millis(base_ms))
+}
+
+/// Fibonacci multiplier for retry `attempt`: `1, 1, 2, 3, 5, 8, …` for
+/// `attempt = 0, 1, 2, 3, 4, 5, …` respectively.
+///
+/// Uses saturating arithmetic so a runaway attempt count pins the multiplier at
+/// [`u64::MAX`] instead of overflowing — the final delay still saturates without
+/// panicking, the same safety the previous exponential shift-clamp provided.
+fn fib_backoff_multiplier(attempt: u32) -> u64 {
+    let mut prev: u64 = 1;
+    let mut curr: u64 = 1;
+    for _ in 0..attempt {
+        let next = prev.saturating_add(curr);
+        prev = curr;
+        curr = next;
+    }
+    prev
 }
 
 /// Apply *equal jitter* to a backoff `delay`: keep half of it as a floor and
@@ -111,10 +132,10 @@ mod tests {
 
     #[test]
     fn retry_backoff_delay_stays_within_equal_jitter_window_for_attempts_1_through_5() {
-        for attempt in 1_u32..=5 {
-            let base = Duration::from_millis(
-                DEFAULT_CONCURRENT_RETRY_BASE_DELAY_MS * (1_u64 << attempt.saturating_sub(1)),
-            );
+        // Fibonacci multipliers for attempts 1..=5 are 1, 2, 3, 5, 8.
+        let fib_multipliers = [1_u64, 2, 3, 5, 8];
+        for (attempt, &multiplier) in (1_u32..=5).zip(fib_multipliers.iter()) {
+            let base = Duration::from_millis(DEFAULT_CONCURRENT_RETRY_BASE_DELAY_MS * multiplier);
             // Equal jitter: every sample must land in [base / 2, base].
             for _ in 0..256 {
                 let delay = retry_backoff_delay(attempt);
@@ -138,9 +159,28 @@ mod tests {
 
     #[test]
     fn retry_backoff_delay_does_not_panic_for_large_attempt() {
-        // Shift would overflow for attempt >= 65; verify clamping prevents panic.
+        // Fibonacci overflows u64 well before attempt 200; saturating arithmetic
+        // must pin the delay instead of panicking.
         let delay = retry_backoff_delay(200);
         assert!(delay > Duration::ZERO);
+    }
+
+    #[test]
+    fn fib_backoff_multiplier_follows_fibonacci_sequence() {
+        // attempt = 0, 1, 2, 3, … maps to 1, 1, 2, 3, 5, 8, … (so attempt 0 and 1
+        // both keep the base delay, matching the previous exponential behavior).
+        let expected = [1_u64, 1, 2, 3, 5, 8, 13, 21, 34, 55, 89];
+        for (attempt, &multiplier) in expected.iter().enumerate() {
+            let attempt = u32::try_from(attempt).expect("small index");
+            assert_eq!(fib_backoff_multiplier(attempt), multiplier, "attempt {attempt}");
+        }
+    }
+
+    #[test]
+    fn fib_backoff_multiplier_saturates_without_overflow() {
+        // Fibonacci passes u64::MAX around attempt 93; far beyond that it must pin
+        // at u64::MAX rather than wrapping or panicking.
+        assert_eq!(fib_backoff_multiplier(200), u64::MAX);
     }
 
     #[test]
