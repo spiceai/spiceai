@@ -45,6 +45,11 @@ jobs:
   dispatch-scheduled:
     name: Dispatch tests - Scheduled
     runs-on: spiceai-dev-runners
+    # Serial chbench htap dispatch (--max-concurrent 1) blocks this job for the sum of the batch's
+    # run durations; the SF1000 batch (6 variants x up to the 120-min htap cap) can run several
+    # hours, so raise the cap well above GitHub's 6h default. Shorter crons (daily-main, htap-sf100)
+    # finish early — this is only an upper bound.
+    timeout-minutes: 720
     if: ${{ github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && github.event.inputs.scheduled == 'true') }}
     strategy:
       fail-fast: false
