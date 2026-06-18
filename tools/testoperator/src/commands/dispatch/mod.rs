@@ -35,6 +35,7 @@ pub async fn dispatch(args: DispatchArgs) -> Result<()> {
         spiced_commit,
         update_snapshots,
         max_concurrent,
+        max_concurrent_wait_timeout_mins,
         ..
     } = args;
     if !path.is_dir() && !path.is_file() {
@@ -226,6 +227,7 @@ pub async fn dispatch(args: DispatchArgs) -> Result<()> {
                     &octo_client,
                     Some(payload),
                     max_concurrent,
+                    Duration::from_mins(max_concurrent_wait_timeout_mins),
                 )
                 .await
             }
@@ -266,18 +268,13 @@ async fn dispatch_workflow_with_concurrency(
     octo: &Octocrab,
     input: Option<serde_json::Value>,
     max_concurrent: usize,
+    slot_wait_timeout: Duration,
 ) -> Result<()> {
     println!(
-        "Checking for available slot to run workflow (limit: {max_concurrent} concurrent runs)..."
+        "Checking for available slot to run workflow (limit: {max_concurrent} concurrent runs, waiting up to {} min)...",
+        slot_wait_timeout.as_secs() / 60
     );
-    if let Err(err) = wait_for_slot(
-        &workflow,
-        octo,
-        max_concurrent,
-        Duration::from_mins(30), // 30 mins
-    )
-    .await
-    {
+    if let Err(err) = wait_for_slot(&workflow, octo, max_concurrent, slot_wait_timeout).await {
         eprintln!("Error waiting for slot: {err}");
     }
 
