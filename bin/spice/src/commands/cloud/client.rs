@@ -83,6 +83,27 @@ impl CloudClient {
         })
     }
 
+    /// Return the configured base URL.
+    #[must_use]
+    pub fn base_url(&self) -> &str {
+        self.inner.base_url()
+    }
+
+    /// Make a generic authenticated HTTP request.
+    pub async fn request(
+        &self,
+        method: reqwest::Method,
+        endpoint: &str,
+        headers: &[(String, String)],
+        query: &[(String, String)],
+        body: Option<String>,
+    ) -> Result<reqwest::Response> {
+        self.inner
+            .request(method, endpoint, headers, query, body)
+            .await
+            .map_err(into_cli)
+    }
+
     /// Get the auth URL for the login flow.
     pub fn get_auth_url(&self, auth_code: &str) -> String {
         self.inner.get_auth_url(auth_code)

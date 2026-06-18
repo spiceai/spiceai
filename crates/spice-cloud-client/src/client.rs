@@ -515,6 +515,45 @@ impl CloudClient {
     }
 
     // ========================================================================
+    // Generic API request
+    // ========================================================================
+
+    /// Make a generic HTTP request to the Spice Cloud API.
+    ///
+    /// When a bearer token is configured on this client, it is attached to the
+    /// request. Returns the raw [`reqwest::Response`] so the caller can inspect
+    /// status, headers, and body as needed.
+    pub async fn request(
+        &self,
+        method: reqwest::Method,
+        endpoint: &str,
+        headers: &[(String, String)],
+        query: &[(String, String)],
+        body: Option<String>,
+    ) -> Result<reqwest::Response> {
+        let url = format!("{}/{}", self.base_url, endpoint.trim_start_matches('/'));
+        let mut request = self.client.request(method, &url);
+
+        if let Some(token) = &self.token {
+            request = request.bearer_auth(token);
+        }
+
+        for (key, value) in headers {
+            request = request.header(key, value);
+        }
+
+        if !query.is_empty() {
+            request = request.query(query);
+        }
+
+        if let Some(body) = body {
+            request = request.body(body);
+        }
+
+        request.send().await.context(HttpRequestSnafu)
+    }
+
+    // ========================================================================
     // Metrics
     // ========================================================================
 

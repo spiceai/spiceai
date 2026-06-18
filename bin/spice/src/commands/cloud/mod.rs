@@ -27,6 +27,7 @@ use clap::{Args, Subcommand};
 use dialoguer::{Input, Password, Select, theme::ColorfulTheme};
 use snafu::ResultExt;
 use std::{fmt, io::IsTerminal};
+use tokio::io::AsyncReadExt;
 
 pub use client::{CloudClient, is_device_authorization_denied_error, parse_org_app};
 pub use config::{CloudLink, get_linked_app, load_cloud_link, remove_cloud_link, save_cloud_link};
@@ -127,6 +128,9 @@ pub enum CloudCommands {
 
     /// Show metrics for an app's pods
     Metrics(MetricsArgs),
+
+    /// Make an authenticated HTTP request to the Spice Cloud API
+    Api(ApiArgs),
 }
 
 // ============================================================================
@@ -369,6 +373,40 @@ pub struct MetricsArgs {
     /// Window for counter metrics (e.g. 1m, 5m, 1h). Parsed as a duration.
     #[arg(long, value_parser = parse_window)]
     pub window: Option<String>,
+
+    /// Output format
+    #[arg(long, short = 'o', default_value = "table")]
+    pub output: OutputFormat,
+}
+
+#[derive(Args, Debug)]
+pub struct ApiArgs {
+    /// API endpoint path (e.g. /v1/apps or v1/apps/123)
+    pub endpoint: String,
+
+    /// HTTP method for the request
+    #[arg(short = 'X', long)]
+    pub method: Option<String>,
+
+    /// Add a request header in key:value format
+    #[arg(short = 'H', long = "header")]
+    pub headers: Vec<String>,
+
+    /// Add a parameter in key=value format
+    #[arg(short = 'f', long = "field")]
+    pub fields: Vec<String>,
+
+    /// File to use as the request body (use "-" for stdin)
+    #[arg(long)]
+    pub input: Option<String>,
+
+    /// Include HTTP response status and headers in the output
+    #[arg(short, long)]
+    pub include: bool,
+
+    /// Do not print the response body
+    #[arg(long)]
+    pub silent: bool,
 
     /// Output format
     #[arg(long, short = 'o', default_value = "table")]
@@ -696,6 +734,7 @@ pub async fn execute(_ctx: &RuntimeContext, args: &CloudArgs) -> Result<()> {
         CloudCommands::Inspect(inspect_args) => execute_inspect(inspect_args).await,
         CloudCommands::ApiKeys(api_keys_args) => execute_api_keys(api_keys_args).await,
         CloudCommands::Metrics(metrics_args) => execute_metrics(metrics_args).await,
+        CloudCommands::Api(api_args) => execute_api(api_args).await,
     }
 }
 
@@ -1187,6 +1226,70 @@ async fn execute_apps(args: &AppsArgs) -> Result<()> {
     table.print();
 
     Ok(())
+}
+
+fn parse_api_http_method(method: Option<&str>, has_input: bool) -> Result<reqwest::Method> {
+    if let Some(method) = method {
+        let normalized = method.trim().to_ascii_uppercase();
+        reqwest::Method::from_bytes(normalized.as_bytes()).map_err(|_| {
+            crate::error::Error::InvalidArgument {
+                message: format!("Invalid HTTP method: {method}"),
+            }
+        })
+    } else if has_input {
+        Ok(reqwest::Method::POST)
+    } else {
+        Ok(reqwest::Method::GET)
+    }
+}
+
+fn headers_include(headers: &[(String, String)], name: &str) -> bool {
+    headers
+        .iter()
+        .any(|(key, _)| key.eq_ignore_ascii_case(name))
+}
+
+fn parse_api_fields(fields: &[String]) -> Result<Vec<(String, String)>> {
+    let mut parsed = Vec::with_capacity(fields.len());
+    for field in fields {
+        let Some((key, value)) = field.split_once('=') else {
+            return InvalidArgumentSnafu {
+                message: format!("Invalid field format '{field}': expected key=value"),
+            }
+            .fail();
+        };
+        let key = key.trim();
+        let value = value.trim();
+        if key.is_empty() {
+            return InvalidArgumentSnafu {
+                message: format!("Invalid field format '{field}': field key cannot be empty"),
+            }
+            .fail();
+        }
+        parsed.push((key.to_string(), value.to_string()));
+    }
+    Ok(parsed)
+}
+
+fn parse_api_headers(headers: &[String]) -> Result<Vec<(String, String)>> {
+    let mut parsed = Vec::with_capacity(headers.len());
+    for header in headers {
+        let Some((key, value)) = header.split_once(':') else {
+            return InvalidArgumentSnafu {
+                message: format!("Invalid header format '{header}': expected key:value"),
+            }
+            .fail();
+        };
+        let key = key.trim();
+        if key.is_empty() {
+            return InvalidArgumentSnafu {
+                message: format!("Invalid header format '{header}': header name cannot be empty"),
+            }
+            .fail();
+        }
+        parsed.push((key.to_string(), value.trim().to_string()));
+    }
+    Ok(parsed)
 }
 
 fn is_cloud_unauthorized_error(err: &crate::error::Error) -> bool {
@@ -1787,6 +1890,117 @@ async fn execute_metrics(args: &MetricsArgs) -> Result<()> {
     Ok(())
 }
 
+async fn execute_api(args: &ApiArgs) -> Result<()> {
+    let client = CloudClient::new()?;
+
+    let method = parse_api_http_method(args.method.as_deref(), args.input.is_some())?;
+
+    if method == reqwest::Method::GET && args.input.is_some() {
+        return InvalidArgumentSnafu {
+            message: "GET requests cannot include a request body. Use -f for query parameters or omit --input."
+                .to_string(),
+        }
+        .fail();
+    }
+
+    let mut headers = parse_api_headers(&args.headers)?;
+    let fields = parse_api_fields(&args.fields)?;
+
+    let mut json_body_from_fields = false;
+    let (query, body) = if let Some(input) = &args.input {
+        let body_content = if input == "-" {
+            let mut buf = String::new();
+            tokio::io::stdin()
+                .read_to_string(&mut buf)
+                .await
+                .map_err(|e| crate::error::Error::InvalidArgument {
+                    message: format!("Failed to read request body from stdin: {e}"),
+                })?;
+            buf
+        } else {
+            tokio::fs::read_to_string(input).await.map_err(|e| {
+                crate::error::Error::InvalidArgument {
+                    message: format!("Failed to read request body from '{input}': {e}"),
+                }
+            })?
+        };
+        (fields, Some(body_content))
+    } else if !fields.is_empty() && method == reqwest::Method::GET {
+        (fields, None)
+    } else if !fields.is_empty() {
+        json_body_from_fields = true;
+        let json = fields
+            .into_iter()
+            .map(|(k, v)| (k, serde_json::Value::String(v)))
+            .collect::<serde_json::Map<_, _>>();
+        (
+            Vec::new(),
+            Some(serde_json::to_string(&json).map_err(|e| {
+                crate::error::Error::InvalidResponse {
+                    message: format!("Failed to serialize request body: {e}"),
+                }
+            })?),
+        )
+    } else {
+        (Vec::new(), None)
+    };
+
+    if json_body_from_fields && !headers_include(&headers, "content-type") {
+        headers.push(("Content-Type".to_string(), "application/json".to_string()));
+    }
+
+    let response = client
+        .request(method, &args.endpoint, &headers, &query, body)
+        .await?;
+
+    let status = response.status();
+
+    if args.include {
+        println!(
+            "{} {}",
+            status.as_u16(),
+            status.canonical_reason().unwrap_or("")
+        );
+        for (key, value) in response.headers() {
+            println!("{}: {}", key, value.to_str().unwrap_or(""));
+        }
+        println!();
+    }
+
+    if !args.silent {
+        let body_text = response
+            .text()
+            .await
+            .map_err(|e| crate::error::Error::HttpRequestFailed { source: e })?;
+        if args.output == OutputFormat::Json {
+            if let Ok(json) = serde_json::from_str::<serde_json::Value>(&body_text) {
+                let pretty = serde_json::to_string_pretty(&json).map_err(|e| {
+                    crate::error::Error::InvalidResponse {
+                        message: format!("Failed to format JSON: {e}"),
+                    }
+                })?;
+                println!("{pretty}");
+            } else {
+                println!("{body_text}");
+            }
+        } else {
+            println!("{body_text}");
+        }
+    }
+
+    if !status.is_success() {
+        return Err(crate::error::Error::InvalidResponse {
+            message: format!(
+                "Request failed with status {} {}",
+                status.as_u16(),
+                status.canonical_reason().unwrap_or("")
+            ),
+        });
+    }
+
+    Ok(())
+}
+
 fn metrics_table_headers() -> Vec<&'static str> {
     vec![
         "POD",
@@ -1972,6 +2186,64 @@ mod tests {
         };
 
         assert!(!is_cloud_unauthorized_error(&err));
+    }
+
+    #[test]
+    fn parse_api_http_method_normalizes_lowercase_verbs() {
+        let method = parse_api_http_method(Some("post"), true).expect("post should parse");
+
+        assert_eq!(method, reqwest::Method::POST);
+    }
+
+    #[test]
+    fn parse_api_http_method_defaults_to_get_without_body_input() {
+        let method = parse_api_http_method(None, false).expect("default method should parse");
+
+        assert_eq!(method, reqwest::Method::GET);
+    }
+
+    #[test]
+    fn headers_include_matches_case_insensitively() {
+        let headers = vec![("Content-Type".to_string(), "application/json".to_string())];
+
+        assert!(headers_include(&headers, "content-type"));
+        assert!(!headers_include(&headers, "authorization"));
+    }
+
+    #[test]
+    fn parse_api_fields_trims_whitespace() {
+        let fields = parse_api_fields(&["foo = bar".to_string()]).expect("field should parse");
+
+        assert_eq!(fields, vec![("foo".to_string(), "bar".to_string())]);
+    }
+
+    #[test]
+    fn parse_api_fields_rejects_empty_key() {
+        let err =
+            parse_api_fields(&["=value".to_string()]).expect_err("empty field key should fail");
+
+        assert!(
+            err.to_string().contains("field key cannot be empty"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn parse_api_headers_rejects_empty_name() {
+        let err =
+            parse_api_headers(&[":value".to_string()]).expect_err("empty header name should fail");
+
+        assert!(
+            err.to_string().contains("header name cannot be empty"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn parse_api_http_method_defaults_to_post_only_with_input() {
+        let method = parse_api_http_method(None, true).expect("input should default to POST");
+
+        assert_eq!(method, reqwest::Method::POST);
     }
 
     #[test]

@@ -688,6 +688,7 @@ fn apply_machine_cloud_mode(command: &mut cloud::CloudCommands) {
         cloud::CloudCommands::Inspect(args) => args.output = OutputFormat::Json,
         cloud::CloudCommands::ApiKeys(args) => args.output = OutputFormat::Json,
         cloud::CloudCommands::Metrics(args) => args.output = OutputFormat::Json,
+        cloud::CloudCommands::Api(args) => args.output = OutputFormat::Json,
         cloud::CloudCommands::Secrets(command) => match command {
             cloud::SecretsCommands::List(args) => args.output = OutputFormat::Json,
             cloud::SecretsCommands::Set(args) => args.output = OutputFormat::Json,
@@ -817,6 +818,7 @@ fn is_json_output(cmd: &Commands) -> bool {
             cloud::CloudCommands::Inspect(x) => x.output == OutputFormat::Json,
             cloud::CloudCommands::ApiKeys(x) => x.output == OutputFormat::Json,
             cloud::CloudCommands::Metrics(x) => x.output == OutputFormat::Json,
+            cloud::CloudCommands::Api(x) => x.output == OutputFormat::Json,
             cloud::CloudCommands::Logs(x) => x.output == OutputFormat::Json,
             cloud::CloudCommands::Deploy(x) => x.output == OutputFormat::Json,
 
