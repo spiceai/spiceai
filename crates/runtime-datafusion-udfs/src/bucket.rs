@@ -41,7 +41,7 @@ const _: () = assert!(
 
 /// Static `RandomState` for deterministic hashing.
 static RANDOM_STATE: LazyLock<RandomState> =
-    LazyLock::new(|| RandomState::with_seed(0x0053_0050_0049_4345));
+    LazyLock::new(|| RandomState::with_seeds(0x53, 0x50, 0x49, 0x43_45));
 
 #[derive(Debug, Snafu)]
 pub enum BucketError {
