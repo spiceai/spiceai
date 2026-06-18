@@ -152,24 +152,13 @@ impl CloudClient {
             .fail();
         }
 
-        let context = self.get_auth_context().await?;
+        let context = self.get_auth_context().await.ok();
         let apps = self.list_apps().await?;
+        let context_org = context.as_ref().map(|c| c.org_name.as_str());
 
-        for app in apps {
-            let app_org = if app.org.is_empty() {
-                &context.org_name
-            } else {
-                &app.org
-            };
-            if app.name == name && app_org.eq_ignore_ascii_case(&org) {
-                return self.get_app_by_id(app.id).await;
-            }
-        }
+        let app_id = resolve_app_id(&apps, &org, &name, context_org, org_app)?;
 
-        InvalidResponseSnafu {
-            message: format!("App '{org_app}' not found"),
-        }
-        .fail()
+        self.get_app_by_id(app_id).await
     }
 
     pub async fn get_app_by_id(&self, app_id: i64) -> Result<App> {
@@ -444,6 +433,57 @@ pub fn parse_org_app(org_app: &str) -> (String, String) {
     }
 }
 
+/// Resolve an app ID from a listed set using `org/name`.
+///
+/// When app payloads omit `org`, falls back to `context_org` from the auth
+/// context. If org still cannot be resolved, only a uniquely named app may
+/// match; multiple name collisions without org metadata are rejected.
+fn resolve_app_id(
+    apps: &[spice_cloud_client::types::App],
+    org: &str,
+    name: &str,
+    context_org: Option<&str>,
+    display_name: &str,
+) -> Result<i64> {
+    let mut org_unknown_matches = Vec::new();
+
+    for app in apps {
+        if app.name != name {
+            continue;
+        }
+
+        let app_org = if app.org.is_empty() {
+            context_org.unwrap_or("")
+        } else {
+            app.org.as_str()
+        };
+
+        if !app_org.is_empty() {
+            if app_org.eq_ignore_ascii_case(org) {
+                return Ok(app.id);
+            }
+            continue;
+        }
+
+        org_unknown_matches.push(app.id);
+    }
+
+    match org_unknown_matches.len() {
+        0 => InvalidResponseSnafu {
+            message: format!("App '{display_name}' not found"),
+        }
+        .fail(),
+        1 => Ok(org_unknown_matches[0]),
+        count => InvalidResponseSnafu {
+            message: format!(
+                "Multiple apps named '{name}' found ({count}) and org could not be verified. \
+                 Use a unique app name or authenticate with a user token so org context is available."
+            ),
+        }
+        .fail(),
+    }
+}
+
 use super::bytes::NumBytes;
 
 #[expect(clippy::too_many_arguments)]
@@ -613,6 +653,85 @@ mod tests {
                 "visibility": "private",
                 "cname": "us-east-1-prod-aws-data"
             })
+        );
+    }
+
+    fn test_app(id: i64, name: &str, org: &str) -> App {
+        App {
+            id,
+            name: name.to_string(),
+            org: org.to_string(),
+            description: None,
+            visibility: None,
+            created_at: None,
+            region: None,
+            production_branch: None,
+            config: None,
+        }
+    }
+
+    #[test]
+    fn resolve_app_id_matches_when_app_org_is_present() {
+        let apps = vec![
+            test_app(1, "dashboard", "analytics"),
+            test_app(2, "dashboard", "other"),
+        ];
+
+        let id = resolve_app_id(&apps, "analytics", "dashboard", None, "analytics/dashboard")
+            .expect("should match org from app payload");
+
+        assert_eq!(id, 1);
+    }
+
+    #[test]
+    fn resolve_app_id_uses_context_org_when_app_org_is_missing() {
+        let apps = vec![test_app(7, "dashboard", "")];
+
+        let id = resolve_app_id(
+            &apps,
+            "analytics",
+            "dashboard",
+            Some("analytics"),
+            "analytics/dashboard",
+        )
+        .expect("should match via auth context org");
+
+        assert_eq!(id, 7);
+    }
+
+    #[test]
+    fn resolve_app_id_rejects_org_mismatch_when_app_org_is_known() {
+        let apps = vec![test_app(1, "dashboard", "other")];
+
+        let err = resolve_app_id(&apps, "analytics", "dashboard", None, "analytics/dashboard")
+            .expect_err("org mismatch should not match");
+
+        assert!(
+            err.to_string().contains("not found"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn resolve_app_id_allows_single_name_match_when_org_unknown() {
+        let apps = vec![test_app(9, "dashboard", "")];
+
+        let id = resolve_app_id(&apps, "analytics", "dashboard", None, "analytics/dashboard")
+            .expect("single unnamed-org app should match");
+
+        assert_eq!(id, 9);
+    }
+
+    #[test]
+    fn resolve_app_id_rejects_ambiguous_name_matches_when_org_unknown() {
+        let apps = vec![test_app(1, "dashboard", ""), test_app(2, "dashboard", "")];
+
+        let err = resolve_app_id(&apps, "analytics", "dashboard", None, "analytics/dashboard")
+            .expect_err("ambiguous apps should fail");
+
+        assert!(
+            err.to_string().contains("Multiple apps named 'dashboard'"),
+            "unexpected error: {err}"
         );
     }
 }

@@ -41,7 +41,11 @@ pub struct CloudLink {
 impl CloudLink {
     /// Get the full app name in org/app format.
     pub fn full_name(&self) -> String {
-        format!("{}/{}", self.org, self.app)
+        if self.org.is_empty() {
+            self.app.clone()
+        } else {
+            format!("{}/{}", self.org, self.app)
+        }
     }
 }
 

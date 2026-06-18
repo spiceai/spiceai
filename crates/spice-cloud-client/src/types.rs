@@ -127,7 +127,11 @@ pub struct App {
 impl App {
     #[must_use]
     pub fn full_name(&self) -> String {
-        format!("{}/{}", self.org, self.name)
+        if self.org.is_empty() {
+            self.name.clone()
+        } else {
+            format!("{}/{}", self.org, self.name)
+        }
     }
 }
 
@@ -255,7 +259,7 @@ pub struct Deployment {
     pub commit_message: Option<String>,
     pub error_message: Option<String>,
     pub creation_source: Option<String>,
-    pub created_by: Option<String>,
+    pub created_by: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Deserialize)]
