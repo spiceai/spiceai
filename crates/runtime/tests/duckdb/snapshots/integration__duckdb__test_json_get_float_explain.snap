@@ -2,18 +2,21 @@
 source: crates/runtime/tests/duckdb/mod.rs
 expression: pretty
 ---
-+---------------+----------------------------------------------------------------------------------------------+
-| plan_type     | plan                                                                                         |
-+---------------+----------------------------------------------------------------------------------------------+
-| logical_plan  | Projection: score                                                                            |
-|               |   Sort: json_test.id ASC NULLS LAST                                                          |
-|               |     Projection: json_get_float(json_test.data, Utf8("score")) AS score, json_test.id         |
-|               |       TableScan: json_test projection=[id, data]                                             |
-| physical_plan | ProjectionExec: expr=[score@0 as score]                                                      |
-|               |   ProjectionExec: expr=[json_get_float(data@1, score) as score, id@0 as id]                  |
-|               |     SchemaCastScanExec                                                                       |
-|               |       CooperativeExec                                                                        |
-|               |         BytesProcessedExec                                                                   |
-|               |           DuckSqlExec sql= SELECT "id", "data" FROM "json_test" ORDER BY "id" ASC NULLS LAST |
-|               |                                                                                              |
-+---------------+----------------------------------------------------------------------------------------------+
++---------------+---------------------------------------------------------------------------------------------------------------------------------------------+
+| plan_type     | plan                                                                                                                                        |
++---------------+---------------------------------------------------------------------------------------------------------------------------------------------+
+| logical_plan  | Projection: score                                                                                                                           |
+|               |   Sort: json_test.id ASC NULLS LAST                                                                                                         |
+|               |     Projection: json_get_float(json_test.data, Utf8("score")) AS score, json_test.id                                                        |
+|               |       Federated                                                                                                                             |
+|               |  Projection: json_test.id, json_test.data                                                                                                   |
+|               |   TableScan: json_test projection=[id, data]                                                                                                |
+| physical_plan | ProjectionExec: expr=[score@0 as score]                                                                                                     |
+|               |   SortExec: expr=[id@1 ASC NULLS LAST], preserve_partitioning=[false]                                                                       |
+|               |     ProjectionExec: expr=[json_get_float(data@1, score) as score, id@0 as id]                                                               |
+|               |       SchemaCastScanExec                                                                                                                    |
+|               |         CooperativeExec                                                                                                                     |
+|               |           BytesProcessedExec                                                                                                                |
+|               |             VirtualExecutionPlan name=duckdb compute_context=:memory: base_sql=SELECT "json_test"."id", "json_test"."data" FROM "json_test" |
+|               |                                                                                                                                             |
++---------------+---------------------------------------------------------------------------------------------------------------------------------------------+
