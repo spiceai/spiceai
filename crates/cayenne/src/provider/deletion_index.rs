@@ -1003,9 +1003,14 @@ impl DeletionIndex {
     #[must_use]
     pub fn get_with_min_seq(&self, pk: i64, min_delete_seq: Option<i64>) -> Option<Tombstone> {
         let hash = hash_key_i64(pk);
-        // Global bloom is the fast-reject for main-scan (None) probes only;
-        // protected (Some) probes consult the per-run blooms via tombstone_of.
-        if min_delete_seq.is_none() && !self.core.bloom.might_contain(hash) {
+        // The global bloom covers every run's deletion keys and is a safe
+        // superset (never a false negative), so a miss means the key has no
+        // tombstone at any sequence: `None` for any cutoff, including a protected
+        // `Some(S)` probe. Apply the fast-reject unconditionally so protected
+        // scans don't walk every frozen run per row for keys that were never
+        // deleted (the common scan case). A bloom HIT still falls through to
+        // `tombstone_of`, which applies the `Some(S)` cutoff exactly as before.
+        if !self.core.bloom.might_contain(hash) {
             return None;
         }
         self.core.tombstone_of(&pk, hash, min_delete_seq)
@@ -1342,7 +1347,12 @@ impl KeyDeletionIndex {
     pub fn get_with_min_seq(&self, key: &[u8], min_delete_seq: Option<i64>) -> Option<Tombstone> {
         let key_hash = hash_key_128(key);
         let bloom_hash = bloom_half(key_hash);
-        if min_delete_seq.is_none() && !self.core.bloom.might_contain(bloom_hash) {
+        // Global bloom is a safe superset over every run's deletion keys, so a
+        // miss means no tombstone at any sequence — `None` for any cutoff,
+        // including a protected `Some(S)` probe. Apply the fast-reject
+        // unconditionally so protected scans skip the per-run walk for
+        // never-deleted keys (a HIT still applies the `Some(S)` cutoff below).
+        if !self.core.bloom.might_contain(bloom_hash) {
             return None;
         }
         self.core

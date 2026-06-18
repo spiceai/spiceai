@@ -682,10 +682,15 @@ impl CayenneAccelerator {
             // Storage-aware target Vortex file size on local disk (the `auto`
             // baseline): smaller files reduce write amplification on EBS-class
             // network storage; larger files improve scan throughput on RAM-backed
-            // mounts. Skipped for S3, where the engine default is kept. An
-            // explicit operator value (or `auto`) is then applied on top.
+            // mounts. On S3, where objects are immutable and billed per request
+            // (no fsync), a larger default cuts object count and per-request cost.
+            // An explicit operator value (or `auto`) is then applied on top.
             if !is_s3 && let Some(size_mb) = hw.target_file_size_mb_override() {
                 config.target_vortex_file_size_mb = size_mb;
+            } else if is_s3 {
+                // S3 favors large immutable objects: default to 512 MiB (2× the
+                // local default) when the operator hasn't set a size.
+                config.target_vortex_file_size_mb = config.target_vortex_file_size_mb.max(512);
             }
             config.target_vortex_file_size_mb = autotune::auto_or_usize(
                 acceleration,
@@ -1214,6 +1219,10 @@ impl CayenneAccelerator {
                     &["cayenne_write_concurrency", "write_concurrency"],
                 ),
                 mem_tier: autotune::is_pinned(acceleration, &["cayenne_cdc_mem_tier_max_bytes"]),
+                target_file_size: autotune::is_pinned(
+                    acceleration,
+                    &["cayenne_target_file_size_mb"],
+                ),
             };
 
             // Surface cross-parameter and out-of-range issues that parse cleanly

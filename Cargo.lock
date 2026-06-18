@@ -5889,7 +5889,7 @@ dependencies = [
 [[package]]
 name = "datafusion-federation"
 version = "0.4.2"
-source = "git+https://github.com/spiceai/datafusion-federation.git?rev=490d3a2f8fb535b1ec76b823abb240e648668a74#490d3a2f8fb535b1ec76b823abb240e648668a74"
+source = "git+https://github.com/spiceai/datafusion-federation.git?rev=a38b715b3a640d0b7140df30503ea2065c6d192f#a38b715b3a640d0b7140df30503ea2065c6d192f"
 dependencies = [
  "arrow-json",
  "async-stream",
@@ -6366,7 +6366,7 @@ dependencies = [
 [[package]]
 name = "datafusion-table-providers"
 version = "0.1.0"
-source = "git+https://github.com/datafusion-contrib/datafusion-table-providers.git?rev=9955a7b961602b9ad54a31265245628e71173edd#9955a7b961602b9ad54a31265245628e71173edd"
+source = "git+https://github.com/spiceai/datafusion-table-providers.git?rev=cbcfdd0c3e33707d57bf7540ac8c0af893900cbe#cbcfdd0c3e33707d57bf7540ac8c0af893900cbe"
 dependencies = [
  "adbc_core",
  "adbc_driver_manager",
@@ -8429,9 +8429,9 @@ dependencies = [
 
 [[package]]
 name = "git2"
-version = "0.20.4"
+version = "0.21.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7b88256088d75a56f8ecfa070513a775dd9107f6530ef14919dac831af9cfe2b"
+checksum = "ddddbf932745a6be37109b6112d3ee09696106f848449069d3a57bba937ab82e"
 dependencies = [
  "bitflags 2.12.1",
  "libc",

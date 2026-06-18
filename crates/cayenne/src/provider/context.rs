@@ -138,6 +138,15 @@ impl CayenneContext {
         let wc_init = config
             .write_concurrency
             .unwrap_or(default_write_concurrency);
+        // Target Vortex file size as a byte budget for the adaptive controller,
+        // seeded from the configured (storage-tier-aware) size. `0` keeps
+        // size-rolling disabled.
+        let target_file_size_bytes_init = i64::try_from(
+            config
+                .target_vortex_file_size_mb
+                .saturating_mul(1024 * 1024),
+        )
+        .unwrap_or(i64::MAX);
         let live_actuators = Arc::new(LiveActuators::new(ActuatorValues {
             inline_flush_max_bytes: config.inline_flush_max_bytes,
             inline_flush_max_rows: config.inline_flush_max_rows,
@@ -147,6 +156,7 @@ impl CayenneContext {
             bake_deletion_index_trigger: config.bake_deletion_index_trigger,
             write_concurrency: wc_init,
             mem_tier_max_bytes: config.cdc_mem_tier_max_bytes,
+            target_vortex_file_size_bytes: target_file_size_bytes_init,
         }));
         // Bounds keep the controller within sane, memory-/cpu-safe ranges. The
         // memtable and mem-tier ceilings are derived from the runtime-installed
@@ -200,6 +210,16 @@ impl CayenneContext {
                 (config.cdc_mem_tier_max_bytes, config.cdc_mem_tier_max_bytes)
             } else {
                 mem_tier_bounds
+            },
+            // Pin (collapse the bounds) when the operator set the file size
+            // explicitly — including `0` to disable size-rolling — so the
+            // controller never enables or moves an operator-chosen value.
+            target_vortex_file_size_bytes: if pins.target_file_size
+                || target_file_size_bytes_init <= 0
+            {
+                (target_file_size_bytes_init, target_file_size_bytes_init)
+            } else {
+                tuning::adaptive_target_file_size_bounds(target_file_size_bytes_init)
             },
         };
         // Register (idempotently) this table's query-observations handle in the
@@ -296,7 +316,10 @@ impl CayenneContext {
     /// Get the target file size in bytes for chunking data files.
     #[must_use]
     pub fn target_file_size_bytes(&self) -> usize {
-        self.config.target_vortex_file_size_mb * 1024 * 1024
+        // The live actuator value: seeded from the configured (tier-aware) size
+        // and grown by the adaptive controller for query goals (bounded by the
+        // static config). `<= 0` keeps size-rolling disabled.
+        usize::try_from(self.live_actuators.target_vortex_file_size_bytes().max(0)).unwrap_or(0)
     }
 
     /// Get the sort columns if configured.
