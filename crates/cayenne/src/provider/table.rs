@@ -31363,6 +31363,25 @@ mod tests {
         let total = |parts: &[Vec<RecordBatch>]| -> usize {
             parts.iter().flatten().map(RecordBatch::num_rows).sum()
         };
+        // Sorted multiset of every PK value across all partitions — checks the actual
+        // rows, not just the count (a drop of one batch + duplicate of another with the
+        // same num_rows() would pass a count-only assertion).
+        let collect_pks = |parts: &[Vec<RecordBatch>]| -> Vec<i64> {
+            let mut pks: Vec<i64> = parts
+                .iter()
+                .flatten()
+                .flat_map(|b| {
+                    b.column(0)
+                        .as_any()
+                        .downcast_ref::<arrow::array::Int64Array>()
+                        .expect("pk column is Int64")
+                        .values()
+                        .to_vec()
+                })
+                .collect();
+            pks.sort_unstable();
+            pks
+        };
 
         // 8 equal batches of 4096 rows (32768 total) across 4 partitions: fans
         // out to exactly 4 balanced partitions, every row preserved once.
@@ -31370,6 +31389,11 @@ mod tests {
         let parts = CayenneTableProvider::partition_memory_batches(batches, 4);
         assert_eq!(parts.len(), 4, "32K-row tier fans out to target_partitions");
         assert_eq!(total(&parts), 32768, "rows preserved across partitions");
+        assert_eq!(
+            collect_pks(&parts),
+            (0..32768).collect::<Vec<i64>>(),
+            "every PK value preserved exactly once across partitions (no drop/duplicate)"
+        );
         assert!(
             parts.iter().all(|p| !p.is_empty()),
             "no empty partition when batches >= partitions"
