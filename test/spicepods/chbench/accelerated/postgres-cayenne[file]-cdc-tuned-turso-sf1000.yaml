@@ -1,0 +1,287 @@
+version: v1
+kind: Spicepod
+name: postgres-cayenne[file]-cdc-tuned-turso-sf1000
+
+# Turso-metastore variant of postgres-cayenne[file]-cdc-tuned-sf1000: identical CDC tuning;
+# only the Cayenne metastore backend differs — cayenne_metastore: turso (libsql MVCC /
+# BEGIN CONCURRENT) instead of sqlite. Exercises the Turso metastore at SF-1000 on the
+# scheduled CH-benCHmark so its write-conflict / commit behavior is tracked vs the sqlite twin.
+
+runtime:
+  params:
+    cdc_prefetch_buffer: '16384'
+    cdc_max_coalesced_envelopes: '16384'
+    cdc_max_coalesced_bytes: '134217728' # 128 MB
+    cdc_max_coalesce_age_ms: '250'
+    cdc_commit_timeout_ms: '60000'
+    cayenne_sort_merge_min_rows: '50000000'
+    cayenne_footer_cache_mb: '1024'
+    cayenne_metastore_cache_mb: '1024'
+    cayenne_metastore_mmap_mb: '4096'
+  query:
+    target_partitions: 64
+  caching:
+    sql_results:
+      enabled: false
+  task_history:
+    enabled: false
+
+postgres_connection_params: &postgres_params
+  pg_host: 127.0.0.1
+  pg_port: '5432'
+  pg_db: chbench
+  pg_user: bench
+  pg_pass: bench
+  pg_sslmode: disable
+
+datasets:
+  # ------------------------------------------------------------------
+  # High-volume PK upsert tables.
+  # ------------------------------------------------------------------
+
+  - from: postgres:district
+    name: district
+    params:
+      <<: *postgres_params
+      pg_replication_slot: spice_district
+      pg_replication_initial_snapshot: 'true'
+      pg_replication_bootstrap_batch_size: '1048576'
+    acceleration:
+      enabled: true
+      engine: cayenne
+      mode: file
+      refresh_mode: changes
+      primary_key: (d_w_id, d_id)
+      on_conflict:
+        (d_w_id, d_id): upsert
+      params: &accel_high_volume
+        cayenne_metastore: turso
+        cayenne_file_path: .spice/cayenne/district
+        # Explicit: the engine default flipped to `memory`. This pod IS the
+        # file-durability variant (per-batch durable persist before the slot
+        # ack) — its identity must not depend on the build's default. The
+        # memory-durability twin is postgres-cayenne[file]-cdc-memory.yaml.
+        cayenne_cdc_durability: file
+        # KEY deletes even in file mode: deletion_mode auto resolves to
+        # position, which serializes compaction with writers (try_lock
+        # starvation under continuous CDC — measured unbounded file/read-amp
+        # growth on the delete-receiving table). Key-delete compaction runs
+        # concurrently with writers.
+        cayenne_deletion_mode: key
+        cayenne_write_concurrency: '4'
+        cayenne_segment_cache_mb: '1024'
+        cayenne_compaction_trigger_protected_snapshots: '3'
+        cayenne_pk_keyset_cache_mb: '256'
+        cayenne_compaction_trigger_snapshot_age_ms: '15000'
+        cayenne_compaction_max_files_per_pick: '64'
+        cayenne_compaction_background_interval_ms: '3000'
+        cdc_max_coalesce_age_ms: '3000'
+        cdc_max_coalesced_bytes: '536870912' # 512 MB
+
+  - from: postgres:customer
+    name: customer
+    params:
+      <<: *postgres_params
+      pg_replication_slot: spice_customer
+      pg_replication_initial_snapshot: 'true'
+      pg_replication_bootstrap_batch_size: '1048576'
+    acceleration:
+      enabled: true
+      engine: cayenne
+      mode: file
+      refresh_mode: changes
+      primary_key: (c_w_id, c_d_id, c_id)
+      on_conflict:
+        (c_w_id, c_d_id, c_id): upsert
+      params:
+        <<: *accel_high_volume
+        cayenne_file_path: .spice/cayenne/customer
+        cayenne_target_file_size_mb: '256'
+
+  - from: postgres:new_order
+    name: new_order
+    params:
+      <<: *postgres_params
+      pg_replication_slot: spice_new_order
+      pg_replication_initial_snapshot: 'true'
+      pg_replication_bootstrap_batch_size: '1048576'
+    acceleration:
+      enabled: true
+      engine: cayenne
+      mode: file
+      refresh_mode: changes
+      primary_key: (no_w_id, no_d_id, no_o_id)
+      on_conflict:
+        (no_w_id, no_d_id, no_o_id): upsert
+      params:
+        <<: *accel_high_volume
+        cayenne_file_path: .spice/cayenne/new_order
+
+  - from: postgres:oorder
+    name: oorder
+    params:
+      <<: *postgres_params
+      pg_replication_slot: spice_oorder
+      pg_replication_initial_snapshot: 'true'
+      pg_replication_bootstrap_batch_size: '1048576'
+    acceleration:
+      enabled: true
+      engine: cayenne
+      mode: file
+      refresh_mode: changes
+      primary_key: (o_w_id, o_d_id, o_id)
+      on_conflict:
+        (o_w_id, o_d_id, o_id): upsert
+      params:
+        <<: *accel_high_volume
+        cayenne_file_path: .spice/cayenne/oorder
+
+  - from: postgres:order_line
+    name: order_line
+    params:
+      <<: *postgres_params
+      pg_replication_slot: spice_order_line
+      pg_replication_initial_snapshot: 'true'
+      pg_replication_bootstrap_batch_size: '1048576'
+    acceleration:
+      enabled: true
+      engine: cayenne
+      mode: file
+      refresh_mode: changes
+      primary_key: (ol_w_id, ol_d_id, ol_o_id, ol_number)
+      on_conflict:
+        (ol_w_id, ol_d_id, ol_o_id, ol_number): upsert
+      params:
+        <<: *accel_high_volume
+        cayenne_file_path: .spice/cayenne/order_line
+        cayenne_write_concurrency: '4'
+        cayenne_target_file_size_mb: '256'
+        cayenne_compaction_trigger_files: '8'
+        cayenne_compaction_trigger_snapshot_age_ms: '30000'
+        cayenne_compaction_max_files_per_pick: '128'
+        cayenne_segment_cache_mb: '2048'
+
+  - from: postgres:stock
+    name: stock
+    params:
+      <<: *postgres_params
+      pg_replication_slot: spice_stock
+      pg_replication_initial_snapshot: 'true'
+      pg_replication_bootstrap_batch_size: '1048576'
+    acceleration:
+      enabled: true
+      engine: cayenne
+      mode: file
+      refresh_mode: changes
+      primary_key: (s_w_id, s_i_id)
+      on_conflict:
+        (s_w_id, s_i_id): upsert
+      params:
+        <<: *accel_high_volume
+        cayenne_file_path: .spice/cayenne/stock
+        cayenne_target_file_size_mb: '256'
+
+  # ------------------------------------------------------------------
+  # Low-volume reference tables.
+  # ------------------------------------------------------------------
+
+  - from: postgres:warehouse
+    name: warehouse
+    params:
+      <<: *postgres_params
+      pg_replication_slot: spice_warehouse
+      pg_replication_initial_snapshot: 'true'
+      pg_replication_bootstrap_batch_size: '1048576'
+    acceleration:
+      enabled: true
+      engine: cayenne
+      mode: file
+      refresh_mode: changes
+      primary_key: w_id
+      on_conflict:
+        w_id: upsert
+      params: &accel_medium
+        cayenne_metastore: turso
+        cayenne_file_path: .spice/cayenne/warehouse
+        # See &accel_high_volume: explicit file durability + key deletes.
+        cayenne_cdc_durability: file
+        cayenne_deletion_mode: key
+        cayenne_write_concurrency: '4'
+        cayenne_segment_cache_mb: '64'
+        cayenne_pk_keyset_cache_mb: '256'
+        cdc_max_coalesce_age_ms: '3000'
+        cdc_max_coalesced_bytes: '536870912' # 512 MB
+
+  # ------------------------------------------------------------------
+  # Static reference tables (no OLTP mutations, full refresh).
+  # ------------------------------------------------------------------
+
+  - from: postgres:item
+    name: item
+    params:
+      <<: *postgres_params
+    acceleration:
+      enabled: true
+      engine: cayenne
+      mode: file
+      refresh_mode: full
+      primary_key: i_id
+      on_conflict:
+        i_id: upsert
+      params:
+        <<: *accel_medium
+        cayenne_file_path: .spice/cayenne/item
+
+  - from: postgres:region
+    name: region
+    params:
+      <<: *postgres_params
+    acceleration:
+      enabled: true
+      engine: cayenne
+      mode: file
+      refresh_mode: full
+      primary_key: r_regionkey
+      on_conflict:
+        r_regionkey: upsert
+      params: &accel_small
+        cayenne_metastore: turso
+        cayenne_file_path: .spice/cayenne/region
+        # See &accel_high_volume: explicit file durability + key deletes.
+        cayenne_cdc_durability: file
+        cayenne_deletion_mode: key
+        cayenne_write_concurrency: '2'
+        cayenne_segment_cache_mb: '16'
+        cayenne_pk_keyset_cache_mb: '256'
+
+  - from: postgres:nation
+    name: nation
+    params:
+      <<: *postgres_params
+    acceleration:
+      enabled: true
+      engine: cayenne
+      mode: file
+      refresh_mode: full
+      primary_key: n_nationkey
+      on_conflict:
+        n_nationkey: upsert
+      params:
+        <<: *accel_small
+        cayenne_file_path: .spice/cayenne/nation
+
+  - from: postgres:supplier
+    name: supplier
+    params:
+      <<: *postgres_params
+    acceleration:
+      enabled: true
+      engine: cayenne
+      mode: file
+      refresh_mode: full
+      primary_key: su_suppkey
+      on_conflict:
+        su_suppkey: upsert
+      params:
+        <<: *accel_small
+        cayenne_file_path: .spice/cayenne/supplier

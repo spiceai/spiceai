@@ -56,6 +56,21 @@ on:
         options:
           - 'spiceai-dev-large-runners'
           - 'spiceai-dev-xlarge-runners'
+
+# Serialize ALL SF100 + SF1000 CH-benCHmark runs across every variant (sqlite/turso cdc-tuned,
+# adaptive, cdc-memory, duckdb): they share ONE concurrency group keyed only by scale factor, so
+# only one runs at any time on the shared xlarge runner pool. Overlapping heavy CDC runs would
+# contend for runners and skew each other's freshness/QPH numbers. cancel-in-progress is false so
+# an in-flight benchmark is never killed mid-run. Other scale factors (e.g. manual SF1/SF10 runs)
+# get a unique group (github.run_id) and stay parallel.
+#
+# NOTE: GitHub keeps at most one in-progress + one pending run per group (a newer pending run
+# cancels the older pending one), so when a cron dispatches a batch faster than runs complete,
+# the intermediate dispatches are superseded rather than queued FIFO.
+concurrency:
+  group: ${{ (github.event.inputs.scale_factor == '100' || github.event.inputs.scale_factor == '1000') && 'chbench-htap-sf100-sf1000' || github.run_id }}
+  cancel-in-progress: false
+
 jobs:
   run-htap:
     name: Run CH-BenCHmark
