@@ -540,7 +540,9 @@ fn attach_access_plan_to_file(
     provider: &dyn VortexAccessPlanProvider,
 ) -> PartitionedFile {
     if let Some(access_plan) = provider.access_plan_for_file(&file) {
-        file.with_extensions(access_plan)
+        let mut file = file;
+        file.extensions.insert_arc(access_plan);
+        file
     } else {
         file
     }

@@ -378,6 +378,10 @@ impl ExecutionPlan for IndexerExec {
         "IndexerExec"
     }
 
+    fn downcast_delegate(&self) -> Option<&dyn ExecutionPlan> {
+        None
+    }
+
     fn schema(&self) -> SchemaRef {
         Arc::clone(self.properties().eq_properties.schema())
     }
