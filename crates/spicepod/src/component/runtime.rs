@@ -902,6 +902,14 @@ pub struct Query {
     /// Overrides `DataFusion`'s local query target partition count.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub target_partitions: Option<usize>,
+
+    /// Prefer hash joins over sort-merge joins during physical planning. Maps to
+    /// `datafusion.optimizer.prefer_hash_join`; defaults to `true` (hash joins).
+    /// Set to `false` for very large analytical joins that would otherwise
+    /// exhaust the query memory pool: `HashJoinExec` build sides are not
+    /// spillable, whereas sort-merge joins spill to disk.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prefer_hash_join: Option<bool>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
