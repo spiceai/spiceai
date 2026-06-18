@@ -56,6 +56,17 @@ on:
         options:
           - 'spiceai-dev-large-runners'
           - 'spiceai-dev-xlarge-runners'
+
+# Serialize the Turso-metastore CH-benCHmark runs (CDC-tuned SF100 + SF1000 and adaptive SF1000)
+# so only one of them executes at any time: they share one concurrency group. Overlapping heavy
+# Turso CDC runs would contend for the shared xlarge runner pool and skew each other's
+# freshness/QPH numbers. cancel-in-progress is false so an in-flight benchmark is never killed
+# mid-run — a newer dispatch just queues behind it. Every other htap run (sqlite/adaptive/duckdb)
+# gets a unique group (github.run_id) and is unaffected.
+concurrency:
+  group: ${{ contains(github.event.inputs.spicepod_path, 'turso') && 'chbench-htap-turso' || github.run_id }}
+  cancel-in-progress: false
+
 jobs:
   run-htap:
     name: Run CH-BenCHmark
