@@ -2,18 +2,19 @@
 source: crates/search/src/index/vector_table.rs
 expression: "format!(\"{}\", pretty::pretty_format_batches(&col).map_err(|e| e.to_string())?)"
 ---
-+---------------+------------------------------------------------------------------------------------------------------------+
-| plan_type     | plan                                                                                                       |
-+---------------+------------------------------------------------------------------------------------------------------------+
-| logical_plan  | Sort: my_vectored_table.pk DESC NULLS FIRST, fetch=5                                                       |
-|               |   Projection: my_vectored_table.pk, my_vectored_table.body_embedding                                       |
-|               |     TableScan: my_vectored_table projection=[body_embedding, pk]                                           |
-| physical_plan | SortPreservingMergeExec: [pk@0 DESC], fetch=5                                                              |
-|               |   SortExec: TopK(fetch=5), expr=[pk@0 DESC], preserve_partitioning=[true]                                  |
-|               |     HashJoinExec: mode=Partitioned, join_type=Left, on=[(pk@0, pk@0)], projection=[pk@0, body_embedding@2] |
-|               |       RepartitionExec: partitioning=Hash([pk@0], 3), input_partitions=1                                    |
-|               |         BaseTable: projection=["pk"] filter=[] limit=None                                                  |
-|               |       RepartitionExec: partitioning=Hash([pk@0], 3), input_partitions=1                                    |
-|               |         PretendVectorIndex: projection=["pk", "body_embedding"] filter=[] limit=None                       |
-|               |                                                                                                            |
-+---------------+------------------------------------------------------------------------------------------------------------+
++---------------+-------------------------------------------------------------------------------------------------------------------------------------------------+
+| plan_type     | plan                                                                                                                                            |
++---------------+-------------------------------------------------------------------------------------------------------------------------------------------------+
+| logical_plan  | Sort: my_vectored_table.pk DESC NULLS FIRST, fetch=5                                                                                            |
+|               |   Projection: my_vectored_table.pk, my_vectored_table.body_embedding                                                                            |
+|               |     TableScan: my_vectored_table projection=[body_embedding, pk]                                                                                |
+| physical_plan | SortPreservingMergeExec: [pk@0 DESC], fetch=5                                                                                                   |
+|               |   SortExec: TopK(fetch=5), expr=[pk@0 DESC], preserve_partitioning=[true]                                                                       |
+|               |     ProjectionExec: expr=[pk@1 as pk, body_embedding@0 as body_embedding]                                                                       |
+|               |       HashJoinExec: mode=Partitioned, join_type=Left, accumulator=MinMaxLeftAccumulator, on=[(pk@0, pk@0)], projection=[body_embedding@2, pk@0] |
+|               |         RepartitionExec: partitioning=Hash([pk@0], 3), input_partitions=1                                                                       |
+|               |           BaseTable: projection=["pk"] filter=[] limit=None                                                                                     |
+|               |         RepartitionExec: partitioning=Hash([pk@0], 3), input_partitions=1                                                                       |
+|               |           PretendVectorIndex: projection=["pk", "body_embedding"] filter=[] limit=None                                                          |
+|               |                                                                                                                                                 |
++---------------+-------------------------------------------------------------------------------------------------------------------------------------------------+

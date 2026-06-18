@@ -2504,15 +2504,23 @@ mod tests {
         );
     }
 
-    /// Companion to the inner-join regression: `DataFusion` only pushes
-    /// join-derived dynamic filters through **inner** joins
-    /// (`HashJoinExec::allow_join_dynamic_filter_pushdown`). A semi join must
-    /// therefore *not* plant a dynamic filter into the Cayenne scan — the OOM
-    /// mitigation for semi-join shapes (e.g. CH-benCH Q18) is handled by the
-    /// separate logical `CayennePushDownSemiJoin` rule and by
-    /// `CayenneAntiJoinSortMergeRewriter`, not by this pushdown path.
+    /// Companion to the inner-join regression. For a semi join whose probe
+    /// (right) side is a `CayenneAccelerationExec`, `DataFusion`'s Post-phase
+    /// `FilterPushdown` plants a `DynamicFilterPhysicalExpr` into the Cayenne
+    /// scan's underlying file source — the same min/max bounds +
+    /// InList/hash-table membership filter the inner-join path provides.
+    ///
+    /// This is new in DataFusion 54: DataFusion 53 pushed join-derived dynamic
+    /// filters through **inner** joins only, whereas DataFusion 54 generalized
+    /// `HashJoinExec::allow_join_dynamic_filter_pushdown` to gate on
+    /// `join_type.on_lr_is_preserved().probe_preserved`, which is `true` for semi
+    /// joins too. Cayenne benefits: a `RightSemi` join's output is the subset of
+    /// probe rows with a build-side match, so the build-key filter only prunes
+    /// probe rows that cannot match — a free extra prune that complements (does
+    /// not replace) the `CayennePushDownSemiJoin` and
+    /// `CayenneAntiJoinSortMergeRewriter` semi-join OOM mitigations.
     #[test]
-    fn native_semi_join_does_not_plant_dynamic_filter_into_cayenne_probe_scan() {
+    fn native_semi_join_plants_dynamic_filter_into_cayenne_probe_scan() {
         let schema = order_line_schema();
         let build = file_exec(&schema, "build.vortex", None);
         let probe = cayenne_file_exec(&schema, "probe.vortex", None);
@@ -2527,9 +2535,16 @@ mod tests {
 
         let optimized = push_down_filters(join, &ConfigOptions::default());
 
+        let filters = cayenne_scan_dynamic_filters(&optimized);
         assert!(
-            cayenne_scan_dynamic_filters(&optimized).is_empty(),
-            "DataFusion does not push join dynamic filters through semi joins"
+            !filters.is_empty(),
+            "DataFusion pushes join dynamic filters through semi joins; \
+             got plan: {}",
+            displayable(optimized.as_ref()).indent(true)
+        );
+        assert!(
+            filters.iter().any(|f| f.columns().contains("order_id")),
+            "the planted dynamic filter should reference the equi-join key column"
         );
     }
 }
