@@ -73,10 +73,9 @@ impl<T: RefreshSkipTableProvider> AsRefreshSkipProvider for T {
 /// The inner refresh-skip provider can be hidden behind wrappers inserted during dataset
 /// registration — most notably schema-metadata enrichment ([`crate::MetadataEnrichedTableProvider`],
 /// applied by `FederatedTable::new` whenever a dataset declares table- or column-level metadata) and
-/// federation adaptors ([`FederatedTableProviderAdaptor`]). Those wrappers return themselves from
-/// `as_any`, so a single direct downcast would silently miss the inner provider and the refresh would
-/// never be skipped. Unwrap the wrappers we know about and recurse so the skip check still reaches the
-/// inner [`RefreshSkipTableProvider`].
+/// federation adaptors ([`FederatedTableProviderAdaptor`]). A direct downcast on the outer provider
+/// would silently miss the inner [`RefreshSkipTableProvider`]. Unwrap the wrappers we know about and
+/// recurse so the skip check still reaches the inner provider.
 pub async fn should_skip_refresh_for_table_provider(
     table_provider: &(dyn TableProvider + Send + Sync),
 ) -> DataFusionResult<Option<bool>> {

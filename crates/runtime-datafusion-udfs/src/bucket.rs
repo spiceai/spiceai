@@ -15,7 +15,7 @@ limitations under the License.
 */
 
 use std::num::TryFromIntError;
-use std::sync::{Arc, LazyLock};
+use std::sync::LazyLock;
 
 use crate::vendored_hash::{RandomState, create_hashes};
 use arrow::array::{ArrayRef, UInt64Array};
@@ -281,6 +281,7 @@ mod tests {
     use arrow_schema::Field;
     use datafusion::config::ConfigOptions;
     use insta::assert_snapshot;
+    use std::sync::Arc;
 
     #[test]
     fn test_bucket_scalar() {

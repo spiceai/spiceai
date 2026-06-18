@@ -32,6 +32,8 @@
 //! `bucket()` only ever hashes a single column, so the multi-column
 //! `combine_hashes` path is intentionally omitted.
 
+#![allow(clippy::pedantic)]
+
 pub use ahash::RandomState;
 use arrow::array::types::{IntervalDayTime, IntervalMonthDayNano};
 use arrow::array::*;
