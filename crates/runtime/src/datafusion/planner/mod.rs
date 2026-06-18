@@ -297,11 +297,7 @@ fn is_dual_write_table_provider(table_provider: &Arc<dyn TableProvider>) -> bool
 /// `PolyTableProvider`-backed accelerators are wrapped in a
 /// `FederatedTableProviderAdaptor`, and datasets that declare table- or
 /// column-level metadata are wrapped in a `MetadataEnrichedTableProvider` by
-/// `register_accelerated_table`. Both wrappers return themselves from `as_any`,
-/// and they can nest in either order, so a single direct downcast silently misses
-/// the inner provider — which is how an accelerated table with metadata used to be
-/// misclassified as not-dual-write (the same wrapper-hiding-a-downcast class as
-/// #11339 / #11345). Loop until neither wrapper matches.
+/// `register_accelerated_table`.
 fn peel_table_provider_wrappers(table_provider: &Arc<dyn TableProvider>) -> Arc<dyn TableProvider> {
     let mut current = Arc::clone(table_provider);
     loop {
