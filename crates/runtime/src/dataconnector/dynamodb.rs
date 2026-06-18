@@ -477,7 +477,6 @@ impl DataConnector for DynamoDB {
                 let table_provider = federated_table.table_provider().await;
 
                 let dynamodb_ref = table_provider
-                    .as_any()
                     .downcast_ref::<DynamoDBTableProvider>()?;
 
                 let acceptable_lag = dynamodb_ref.ready_lag;

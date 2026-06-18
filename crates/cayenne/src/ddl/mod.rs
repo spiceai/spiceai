@@ -39,10 +39,7 @@ use crate::catalog_provider::CayenneCatalogProvider;
 /// The runtime extends this check to also cover `ComposedCatalogProvider`.
 #[must_use]
 pub fn is_cayenne_catalog(provider: &dyn CatalogProvider) -> bool {
-    provider
-        .as_any()
-        .downcast_ref::<CayenneCatalogProvider>()
-        .is_some()
+    provider.downcast_ref::<CayenneCatalogProvider>().is_some()
 }
 
 /// Try to extract a [`CayenneCatalogProvider`] reference via direct downcast.
@@ -51,5 +48,5 @@ pub fn is_cayenne_catalog(provider: &dyn CatalogProvider) -> bool {
 /// to also handle `ComposedCatalogProvider`.
 #[must_use]
 pub fn get_cayenne_provider(provider: &dyn CatalogProvider) -> Option<&CayenneCatalogProvider> {
-    provider.as_any().downcast_ref::<CayenneCatalogProvider>()
+    provider.downcast_ref::<CayenneCatalogProvider>()
 }

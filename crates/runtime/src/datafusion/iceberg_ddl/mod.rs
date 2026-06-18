@@ -101,15 +101,12 @@ pub fn composed_catalog_to_iceberg(
     provider: &dyn CatalogProvider,
 ) -> Option<Arc<dyn iceberg::Catalog>> {
     // Try direct downcast
-    if let Some(iceberg) = provider.as_any().downcast_ref::<IcebergCatalogProvider>() {
+    if let Some(iceberg) = provider.downcast_ref::<IcebergCatalogProvider>() {
         return Some(Arc::clone(iceberg.catalog()));
     }
     // Try via ComposedCatalogProvider
-    if let Some(composed) = provider.as_any().downcast_ref::<ComposedCatalogProvider>()
-        && let Some(iceberg) = composed
-            .external()
-            .as_any()
-            .downcast_ref::<IcebergCatalogProvider>()
+    if let Some(composed) = provider.downcast_ref::<ComposedCatalogProvider>()
+        && let Some(iceberg) = composed.external().downcast_ref::<IcebergCatalogProvider>()
     {
         return Some(Arc::clone(iceberg.catalog()));
     }

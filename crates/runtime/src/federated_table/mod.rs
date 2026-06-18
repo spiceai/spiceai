@@ -83,10 +83,6 @@ impl std::fmt::Debug for UnavailableTableProvider {
 
 #[async_trait::async_trait]
 impl TableProvider for UnavailableTableProvider {
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
-
     fn schema(&self) -> SchemaRef {
         Arc::clone(&self.schema)
     }

@@ -169,10 +169,7 @@ impl DataAccelerator for PostgresAccelerator {
                 .context(UnableToCreateTableSnafu)
                 .boxed()?;
 
-        let Some(postgres_writer) = table_provider
-            .as_any()
-            .downcast_ref::<PostgresTableWriter>()
-        else {
+        let Some(postgres_writer) = table_provider.downcast_ref::<PostgresTableWriter>() else {
             unreachable!("PostgresTableWriter should be returned from PostgresTableProviderFactory")
         };
 

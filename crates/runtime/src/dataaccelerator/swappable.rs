@@ -24,7 +24,6 @@ limitations under the License.
 //! snapshots restore the same logical dataset so this invariant holds by
 //! design (and is enforced by snapshot schema validation).
 
-use std::any::Any;
 use std::sync::{Arc, RwLock};
 
 use async_trait::async_trait;
@@ -153,10 +152,6 @@ impl SwappableTableProvider {
 #[deny(clippy::missing_trait_methods)]
 #[async_trait]
 impl TableProvider for SwappableTableProvider {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema(&self) -> SchemaRef {
         Arc::clone(&self.cached_schema)
     }

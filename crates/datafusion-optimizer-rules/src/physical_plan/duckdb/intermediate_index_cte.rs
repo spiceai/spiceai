@@ -247,6 +247,7 @@ impl DuckDBIntermediateIndexMaterializationOptimizer {
             name: Ident::new(CTE_NAME),
             columns: vec![],
             explicit: false,
+            at: None,
         };
 
         let cte_query = Query {

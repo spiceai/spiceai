@@ -57,7 +57,7 @@ impl IcebergDdlHandler {
         catalog_list: &Arc<dyn CatalogProviderList>,
     ) -> Option<Arc<dyn iceberg::Catalog>> {
         let df_catalog = catalog_list.catalog(catalog_name)?;
-        if let Some(p) = df_catalog.as_any().downcast_ref::<IcebergCatalogProvider>() {
+        if let Some(p) = df_catalog.downcast_ref::<IcebergCatalogProvider>() {
             return Some(Arc::clone(p.catalog()));
         }
         composed_catalog_to_iceberg(df_catalog.as_ref())

@@ -16,7 +16,7 @@ limitations under the License.
 
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
-use std::{any::Any, sync::Arc};
+use std::sync::Arc;
 
 use arrow::datatypes::{DataType, Schema, SchemaRef};
 use arrow_schema::Field;
@@ -802,10 +802,6 @@ impl EmbeddingTable {
 #[deny(clippy::missing_trait_methods)]
 #[async_trait]
 impl TableProvider for EmbeddingTable {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn constraints(&self) -> Option<&Constraints> {
         self.base_table.constraints()
     }

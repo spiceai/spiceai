@@ -14,7 +14,6 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::any::Any;
 use std::fmt;
 use std::sync::Arc;
 use std::sync::atomic::AtomicI64;
@@ -1775,10 +1774,6 @@ impl ExecutionPlan for CachingAccelerationScanExec {
         "CachingAccelerationScanExec"
     }
 
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema(&self) -> SchemaRef {
         self.input.schema()
     }
@@ -2142,7 +2137,6 @@ mod tests {
     use datafusion::physical_plan::ExecutionPlan;
     use datafusion::sql::TableReference;
     use parking_lot::RwLock;
-    use std::any::Any;
     use std::collections::HashMap;
     use std::sync::Arc;
     use std::time::{Duration, SystemTime};
@@ -2173,10 +2167,6 @@ mod tests {
 
     #[async_trait]
     impl TableProvider for FilterTrackingTableProvider {
-        fn as_any(&self) -> &dyn Any {
-            self
-        }
-
         fn schema(&self) -> SchemaRef {
             Arc::clone(&self.schema)
         }
@@ -2256,10 +2246,6 @@ mod tests {
 
     #[async_trait]
     impl TableProvider for MockAcceleratorTableProvider {
-        fn as_any(&self) -> &dyn Any {
-            self
-        }
-
         fn schema(&self) -> SchemaRef {
             Arc::clone(&self.schema)
         }
@@ -2355,10 +2341,6 @@ mod tests {
 
     #[async_trait]
     impl TableProvider for MockHttpTableProvider {
-        fn as_any(&self) -> &dyn Any {
-            self
-        }
-
         fn schema(&self) -> SchemaRef {
             Arc::clone(&self.schema)
         }

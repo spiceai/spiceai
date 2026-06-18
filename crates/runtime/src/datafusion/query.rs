@@ -1527,7 +1527,7 @@ fn strip_root_order_preserving_repartition(
         plan.with_new_children(vec![rewritten_child])?
     };
 
-    if let Some(spm) = plan.as_any().downcast_ref::<SortPreservingMergeExec>() {
+    if let Some(spm) = plan.downcast_ref::<SortPreservingMergeExec>() {
         return Ok(Arc::new(
             SortPreservingMergeExec::new(spm.expr().clone(), Arc::clone(spm.input()))
                 .with_fetch(spm.fetch())
@@ -1535,7 +1535,7 @@ fn strip_root_order_preserving_repartition(
         ));
     }
 
-    if let Some(repartition) = plan.as_any().downcast_ref::<RepartitionExec>()
+    if let Some(repartition) = plan.downcast_ref::<RepartitionExec>()
         && repartition.input().output_partitioning().partition_count() == 1
         && repartition.input().output_ordering().is_some()
         && repartition.partitioning().partition_count() > 1
@@ -1785,6 +1785,8 @@ fn scalar_to_json_value(
         ScalarValue::FixedSizeList(array) => single_row_fixed_size_list_to_json(array),
         ScalarValue::List(array) => single_row_list_to_json(array),
         ScalarValue::LargeList(array) => single_row_large_list_to_json(array),
+        ScalarValue::ListView(array) => single_row_nested_array_to_json(array.as_ref(), 0),
+        ScalarValue::LargeListView(array) => single_row_nested_array_to_json(array.as_ref(), 0),
         ScalarValue::Struct(array) => single_row_struct_to_json(array),
         ScalarValue::Map(array) => single_row_map_to_json(array),
         ScalarValue::Union(Some((_, value)), _, _)
@@ -1866,6 +1868,13 @@ fn single_row_nested_array_to_json(
     } else if let Some(list_array) = array.as_any().downcast_ref::<LargeListArray>() {
         list_array.value(index)
     } else if let Some(list_array) = array.as_any().downcast_ref::<FixedSizeListArray>() {
+        list_array.value(index)
+    } else if let Some(list_array) = array.as_any().downcast_ref::<arrow::array::ListViewArray>() {
+        list_array.value(index)
+    } else if let Some(list_array) = array
+        .as_any()
+        .downcast_ref::<arrow::array::LargeListViewArray>()
+    {
         list_array.value(index)
     } else {
         return Err("Expected a list-like Arrow array".into());
@@ -2108,7 +2117,6 @@ mod tests {
     use datafusion_functions_json::JSON_UNION_DATA_TYPE;
     use serde_json::json;
     use spicepod::component::caching::SQLResultsCacheConfig;
-    use std::any::Any;
     use std::fmt::{Debug, Formatter};
     use std::sync::atomic::{AtomicBool, Ordering};
     use tokio_util::sync::CancellationToken;
@@ -2706,10 +2714,6 @@ mod tests {
     impl ExecutionPlan for TestExecutionPlan {
         fn name(&self) -> &'static str {
             "TestExecutionPlan"
-        }
-
-        fn as_any(&self) -> &dyn Any {
-            self
         }
 
         fn properties(&self) -> &Arc<PlanProperties> {

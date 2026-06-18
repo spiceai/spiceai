@@ -15,9 +15,7 @@ limitations under the License.
 */
 
 #![allow(clippy::missing_errors_doc)]
-use std::{
-    any::Any, borrow::Cow, collections::HashMap, error::Error, hash::BuildHasher, sync::Arc,
-};
+use std::{borrow::Cow, collections::HashMap, error::Error, hash::BuildHasher, sync::Arc};
 
 use async_trait::async_trait;
 use datafusion::arrow::datatypes::{Schema, SchemaRef};
@@ -282,10 +280,7 @@ where
         return provider;
     }
 
-    if let Some(adaptor) = provider
-        .as_any()
-        .downcast_ref::<FederatedTableProviderAdaptor>()
-    {
+    if let Some(adaptor) = provider.downcast_ref::<FederatedTableProviderAdaptor>() {
         let Some(table_provider) = &adaptor.table_provider else {
             return Arc::clone(&provider);
         };
@@ -318,10 +313,6 @@ impl std::fmt::Debug for MetadataEnrichedTableProvider {
 
 #[async_trait]
 impl TableProvider for MetadataEnrichedTableProvider {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema(&self) -> SchemaRef {
         Arc::clone(&self.schema)
     }
@@ -515,10 +506,6 @@ mod tests {
     }
 
     impl TableSource for TestFederatedSource {
-        fn as_any(&self) -> &dyn Any {
-            self
-        }
-
         fn schema(&self) -> SchemaRef {
             Arc::clone(&self.schema)
         }
@@ -537,10 +524,6 @@ mod tests {
 
     #[async_trait]
     impl TableProvider for TestTableProvider {
-        fn as_any(&self) -> &dyn Any {
-            self
-        }
-
         fn schema(&self) -> SchemaRef {
             Arc::clone(&self.schema)
         }
@@ -582,7 +565,6 @@ mod tests {
         );
 
         let adaptor = enriched
-            .as_any()
             .downcast_ref::<FederatedTableProviderAdaptor>()
             .expect("metadata enrichment should preserve the federated adaptor");
         let schema = adaptor.schema();

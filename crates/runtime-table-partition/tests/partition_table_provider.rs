@@ -53,10 +53,6 @@ struct PartitionMemTable {
 
 #[async_trait]
 impl TableProvider for PartitionMemTable {
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
-
     fn schema(&self) -> SchemaRef {
         self.mem_table.schema()
     }
@@ -110,10 +106,6 @@ struct PartitionMemTableExec {
 }
 
 impl ExecutionPlan for PartitionMemTableExec {
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
-
     fn schema(&self) -> SchemaRef {
         self.mem_table_exec.schema()
     }
@@ -263,7 +255,7 @@ impl PartitionCreator for TestPartitionCreator {
 /// Get the partition values out of the execution plan
 fn collect_partition_values(plan: &Arc<dyn ExecutionPlan>) -> Vec<ScalarValue> {
     let mut values = Vec::new();
-    if let Some(partition_exec) = plan.as_any().downcast_ref::<PartitionMemTableExec>() {
+    if let Some(partition_exec) = plan.downcast_ref::<PartitionMemTableExec>() {
         // For single-column partitions in tests, just take the first value
         if let Some(first) = partition_exec.partition_values.first() {
             values.push(first.clone());
@@ -1488,10 +1480,6 @@ impl DeletablePartitionMemTable {
 
 #[async_trait]
 impl TableProvider for DeletablePartitionMemTable {
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
-
     fn schema(&self) -> SchemaRef {
         self.mem_table.schema()
     }
@@ -1688,7 +1676,6 @@ async fn test_deletion_table_provider_single_partition() -> Result<(), Box<dyn s
     // Access PartitionTableProvider directly to call delete_from
     let table = ctx.table_provider("test_table").await?;
     let partition_provider = table
-        .as_any()
         .downcast_ref::<PartitionTableProvider>()
         .expect("Expected PartitionTableProvider");
 
@@ -1762,7 +1749,6 @@ async fn test_deletion_table_provider_multiple_partitions() -> Result<(), Box<dy
     // Get the table provider and call delete_from
     let table = ctx.table_provider("test_table").await?;
     let partition_provider = table
-        .as_any()
         .downcast_ref::<PartitionTableProvider>()
         .expect("Expected PartitionTableProvider");
 
@@ -1828,7 +1814,6 @@ async fn test_deletion_table_provider_with_filters() -> Result<(), Box<dyn std::
     // Get the table provider and call delete_from with a filter
     let table = ctx.table_provider("test_table").await?;
     let partition_provider = table
-        .as_any()
         .downcast_ref::<PartitionTableProvider>()
         .expect("Expected PartitionTableProvider");
 
@@ -1885,7 +1870,6 @@ async fn test_deletion_table_provider_empty_partitions() -> Result<(), Box<dyn s
     // Get the table provider and call delete_from
     let table = ctx.table_provider("test_table").await?;
     let partition_provider = table
-        .as_any()
         .downcast_ref::<PartitionTableProvider>()
         .expect("Expected PartitionTableProvider");
 
@@ -2014,7 +1998,6 @@ async fn test_deletion_with_empty_filters_deletes_all() -> Result<(), Box<dyn st
     // Get the table provider and call delete_from with empty filters
     let table = ctx.table_provider("test_table").await?;
     let partition_provider = table
-        .as_any()
         .downcast_ref::<PartitionTableProvider>()
         .expect("Expected PartitionTableProvider");
 
@@ -2093,7 +2076,6 @@ async fn test_deletion_many_partitions() -> Result<(), Box<dyn std::error::Error
     // Get the table provider and call delete_from
     let table = ctx.table_provider("test_table").await?;
     let partition_provider = table
-        .as_any()
         .downcast_ref::<PartitionTableProvider>()
         .expect("Expected PartitionTableProvider");
 
@@ -2162,7 +2144,6 @@ async fn test_deletion_complex_filters() -> Result<(), Box<dyn std::error::Error
     // Get the table provider and call delete_from with complex filters
     let table = ctx.table_provider("test_table").await?;
     let partition_provider = table
-        .as_any()
         .downcast_ref::<PartitionTableProvider>()
         .expect("Expected PartitionTableProvider");
 
@@ -2238,7 +2219,6 @@ async fn test_deletion_with_null_partition_value() -> Result<(), Box<dyn std::er
     // Get the table provider and call delete_from
     let table = ctx.table_provider("test_table").await?;
     let partition_provider = table
-        .as_any()
         .downcast_ref::<PartitionTableProvider>()
         .expect("Expected PartitionTableProvider");
 
@@ -2302,7 +2282,6 @@ async fn test_deletion_repeated_calls() -> Result<(), Box<dyn std::error::Error>
 
     let table = ctx.table_provider("test_table").await?;
     let partition_provider = table
-        .as_any()
         .downcast_ref::<PartitionTableProvider>()
         .expect("Expected PartitionTableProvider");
     let state = ctx.state();
@@ -2373,7 +2352,6 @@ async fn test_update_table_provider_single_partition() -> Result<(), Box<dyn std
     // Access PartitionTableProvider directly to call update
     let table = ctx.table_provider("test_table").await?;
     let partition_provider = table
-        .as_any()
         .downcast_ref::<PartitionTableProvider>()
         .expect("Expected PartitionTableProvider");
 
@@ -2450,7 +2428,6 @@ async fn test_update_table_provider_multiple_partitions() -> Result<(), Box<dyn 
     // Get the table provider and call update
     let table = ctx.table_provider("test_table").await?;
     let partition_provider = table
-        .as_any()
         .downcast_ref::<PartitionTableProvider>()
         .expect("Expected PartitionTableProvider");
 
@@ -2519,7 +2496,6 @@ async fn test_update_table_provider_with_filters() -> Result<(), Box<dyn std::er
     // Get the table provider and call update with filters and assignments
     let table = ctx.table_provider("test_table").await?;
     let partition_provider = table
-        .as_any()
         .downcast_ref::<PartitionTableProvider>()
         .expect("Expected PartitionTableProvider");
 
@@ -2577,7 +2553,6 @@ async fn test_update_table_provider_empty_partitions() -> Result<(), Box<dyn std
 
     let table = ctx.table_provider("test_table").await?;
     let partition_provider = table
-        .as_any()
         .downcast_ref::<PartitionTableProvider>()
         .expect("Expected PartitionTableProvider");
 
@@ -2644,7 +2619,6 @@ async fn test_update_with_multiple_assignments() -> Result<(), Box<dyn std::erro
 
     let table = ctx.table_provider("test_table").await?;
     let partition_provider = table
-        .as_any()
         .downcast_ref::<PartitionTableProvider>()
         .expect("Expected PartitionTableProvider");
 

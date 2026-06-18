@@ -8,7 +8,7 @@ expression: nsql_context_block_with_samples_for_test()
 - Quote column names that contain capitals or special characters with double quotes.
 - For tables with schemas and catalogs, use "catalog"."schema"."table", not "catalog.schema.table".
 - Use table and column descriptions, primary keys, foreign keys, unique constraints, and indexes when choosing joins and filters.
-- Apache DataFusion version: 53.1.0.
+- Apache DataFusion version: 54.0.0.
 - Schema metadata includes table and column comments/descriptions when supplied by the connector or Spicepod.
 
 ## Datasets
@@ -77,15 +77,16 @@ Spice SQL runs on Apache DataFusion with the SQL parser configured for the Postg
 ### Spark compatibility scalar functions
 Spark-compatible scalar functions are available for arrays, maps, structs, dates, strings, hashes, URLs, XML, and other common Spark SQL expressions.
 - `abs`, `add_months`, `array`, `array_contains`, `array_repeat`, `ascii`, `base64`, `bin`
-- `bit_count`, `bit_get`, `bitmap_bit_position`, `bitmap_bucket_number`, `bitmap_count`, `bitwise_not`, `char`, `concat`
-- `crc32`, `csc`, `date_add`, `date_diff`, `date_part`, `date_sub`, `date_trunc`, `elt`
-- `expm1`, `factorial`, `format_string`, `from_utc_timestamp`, `hex`, `hour`, `if`, `ilike`
-- `json_tuple`, `last_day`, `length`, `like`, `luhn_check`, `make_dt_interval`, `make_interval`, `map_from_arrays`
-- `map_from_entries`, `minute`, `mod`, `negative`, `next_day`, `parse_url`, `pmod`, `rint`
-- `sec`, `second`, `sha1`, `sha2`, `shiftleft`, `shiftright`, `shiftrightunsigned`, `shuffle`
-- `size`, `slice`, `space`, `str_to_map`, `substring`, `time_trunc`, `to_utc_timestamp`, `trunc`
-- `try_parse_url`, `try_url_decode`, `unbase64`, `unhex`, `unix_date`, `unix_micros`, `unix_millis`, `unix_seconds`
-- `url_decode`, `url_encode`, `width_bucket`
+- `bit_count`, `bit_get`, `bitmap_bit_position`, `bitmap_bucket_number`, `bitmap_count`, `bitwise_not`, `ceil`, `char`
+- `concat`, `crc32`, `csc`, `date_add`, `date_diff`, `date_part`, `date_sub`, `date_trunc`
+- `elt`, `expm1`, `factorial`, `floor`, `format_string`, `from_utc_timestamp`, `hex`, `hour`
+- `if`, `ilike`, `is_valid_utf8`, `json_tuple`, `last_day`, `length`, `like`, `luhn_check`
+- `make_dt_interval`, `make_interval`, `make_valid_utf8`, `map_from_arrays`, `map_from_entries`, `minute`, `mod`, `negative`
+- `next_day`, `parse_url`, `pmod`, `rint`, `round`, `sec`, `second`, `sha1`
+- `sha2`, `shiftleft`, `shiftright`, `shiftrightunsigned`, `shuffle`, `size`, `slice`, `soundex`
+- `space`, `spark_cast`, `str_to_map`, `substring`, `time_trunc`, `to_utc_timestamp`, `trunc`, `try_parse_url`
+- `try_url_decode`, `unbase64`, `unhex`, `unix_date`, `unix_micros`, `unix_millis`, `unix_seconds`, `url_decode`
+- `url_encode`, `width_bucket`, `xxhash64`
 
 ## Sample Data
 

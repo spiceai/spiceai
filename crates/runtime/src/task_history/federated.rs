@@ -20,7 +20,6 @@ limitations under the License.
 //! schedulers in a cluster, combining results from the local table and all peer
 //! schedulers.
 
-use std::any::Any;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -209,10 +208,6 @@ impl FederatedTaskHistoryTable {
 
 #[async_trait]
 impl TableProvider for FederatedTaskHistoryTable {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema(&self) -> SchemaRef {
         Arc::clone(&self.schema)
     }

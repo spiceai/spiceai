@@ -11,7 +11,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::{any::Any, cmp::min, sync::Arc};
+use std::{cmp::min, sync::Arc};
 
 use crate::{
     SEARCH_SCORE_COLUMN_NAME,
@@ -60,10 +60,6 @@ impl FullTextSearchQuery {
 
 #[async_trait]
 impl TableProvider for FullTextSearchQuery {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema(&self) -> Arc<Schema> {
         append_fields(
             &self.index.schema(),

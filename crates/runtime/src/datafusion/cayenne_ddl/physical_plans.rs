@@ -26,7 +26,6 @@ limitations under the License.
 //! `DistributedCayenneInsertExec`, `DistributedCayenneMergeExec` forward DML SQL
 //! verbatim to all connected executor nodes via `FlightSQL`.
 
-use std::any::Any;
 use std::fmt;
 use std::fmt::Write as _;
 use std::sync::Arc;
@@ -234,9 +233,6 @@ impl DisplayAs for DistributedCayenneCreateTableExec {
 impl ExecutionPlan for DistributedCayenneCreateTableExec {
     fn name(&self) -> &'static str {
         "DistributedCayenneCreateTableExec"
-    }
-    fn as_any(&self) -> &dyn Any {
-        self
     }
     fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
@@ -492,9 +488,6 @@ impl ExecutionPlan for DistributedCayenneDropTableExec {
     fn name(&self) -> &'static str {
         "DistributedCayenneDropTableExec"
     }
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
     fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
     }
@@ -633,9 +626,6 @@ impl ExecutionPlan for DistributedCayenneCreateSchemaExec {
     fn name(&self) -> &'static str {
         "DistributedCayenneCreateSchemaExec"
     }
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
     fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
     }
@@ -752,9 +742,6 @@ impl ExecutionPlan for DistributedCayenneDeleteExec {
     fn name(&self) -> &'static str {
         "DistributedCayenneDeleteExec"
     }
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
     fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
     }
@@ -852,9 +839,6 @@ impl DisplayAs for DistributedCayenneUpdateExec {
 impl ExecutionPlan for DistributedCayenneUpdateExec {
     fn name(&self) -> &'static str {
         "DistributedCayenneUpdateExec"
-    }
-    fn as_any(&self) -> &dyn Any {
-        self
     }
     fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
@@ -965,9 +949,6 @@ impl DisplayAs for DistributedCayenneInsertExec {
 impl ExecutionPlan for DistributedCayenneInsertExec {
     fn name(&self) -> &'static str {
         "DistributedCayenneInsertExec"
-    }
-    fn as_any(&self) -> &dyn Any {
-        self
     }
     fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
@@ -1143,9 +1124,7 @@ impl ExecutionPlan for DistributedCayenneMergeExec {
     fn name(&self) -> &'static str {
         "DistributedCayenneMergeExec"
     }
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
+
     fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
     }

@@ -287,7 +287,6 @@ async fn is_distributed_insert_table(session: &SessionState, table_name: &TableR
 
 fn is_dual_write_table_provider(table_provider: &Arc<dyn TableProvider>) -> bool {
     peel_table_provider_wrappers(table_provider)
-        .as_any()
         .downcast_ref::<AcceleratedTable>()
         .is_some_and(AcceleratedTable::is_dual_write)
 }
@@ -298,18 +297,11 @@ fn is_dual_write_table_provider(table_provider: &Arc<dyn TableProvider>) -> bool
 /// `PolyTableProvider`-backed accelerators are wrapped in a
 /// `FederatedTableProviderAdaptor`, and datasets that declare table- or
 /// column-level metadata are wrapped in a `MetadataEnrichedTableProvider` by
-/// `register_accelerated_table`. Both wrappers return themselves from `as_any`,
-/// and they can nest in either order, so a single direct downcast silently misses
-/// the inner provider — which is how an accelerated table with metadata used to be
-/// misclassified as not-dual-write (the same wrapper-hiding-a-downcast class as
-/// #11339 / #11345). Loop until neither wrapper matches.
+/// `register_accelerated_table`.
 fn peel_table_provider_wrappers(table_provider: &Arc<dyn TableProvider>) -> Arc<dyn TableProvider> {
     let mut current = Arc::clone(table_provider);
     loop {
-        if let Some(adaptor) = current
-            .as_any()
-            .downcast_ref::<FederatedTableProviderAdaptor>()
-        {
+        if let Some(adaptor) = current.downcast_ref::<FederatedTableProviderAdaptor>() {
             let Some(inner) = adaptor.table_provider.clone() else {
                 break;
             };
@@ -317,10 +309,7 @@ fn peel_table_provider_wrappers(table_provider: &Arc<dyn TableProvider>) -> Arc<
             continue;
         }
 
-        if let Some(enriched) = current
-            .as_any()
-            .downcast_ref::<MetadataEnrichedTableProvider>()
-        {
+        if let Some(enriched) = current.downcast_ref::<MetadataEnrichedTableProvider>() {
             current = Arc::clone(enriched.get_inner_ref());
             continue;
         }
@@ -367,7 +356,6 @@ mod tests {
         let wrapped = enrich(Arc::clone(&inner));
         assert!(
             wrapped
-                .as_any()
                 .downcast_ref::<MetadataEnrichedTableProvider>()
                 .is_some(),
             "precondition: provider is wrapped in MetadataEnrichedTableProvider"
@@ -375,7 +363,7 @@ mod tests {
 
         let peeled = peel_table_provider_wrappers(&wrapped);
         assert!(
-            peeled.as_any().downcast_ref::<MemTable>().is_some(),
+            peeled.downcast_ref::<MemTable>().is_some(),
             "peel must reach the inner provider through the metadata wrapper"
         );
     }
@@ -389,7 +377,7 @@ mod tests {
 
         let peeled = peel_table_provider_wrappers(&wrapped);
         assert!(
-            peeled.as_any().downcast_ref::<MemTable>().is_some(),
+            peeled.downcast_ref::<MemTable>().is_some(),
             "peel must unwrap every nested metadata wrapper"
         );
     }
@@ -399,7 +387,7 @@ mod tests {
         let inner = mem_table();
         let peeled = peel_table_provider_wrappers(&inner);
         assert!(
-            peeled.as_any().downcast_ref::<MemTable>().is_some(),
+            peeled.downcast_ref::<MemTable>().is_some(),
             "an unwrapped provider must be returned unchanged"
         );
     }

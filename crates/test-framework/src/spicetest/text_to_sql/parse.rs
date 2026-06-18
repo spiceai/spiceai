@@ -239,7 +239,9 @@ fn extract_projections_from_set_expr(
 
             for item in &select.projection {
                 match item {
-                    SelectItem::UnnamedExpr(e) | SelectItem::ExprWithAlias { expr: e, .. } => {
+                    SelectItem::UnnamedExpr(e)
+                    | SelectItem::ExprWithAlias { expr: e, .. }
+                    | SelectItem::ExprWithAliases { expr: e, .. } => {
                         extract_columns_from_expr(
                             e,
                             projections,

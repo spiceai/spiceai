@@ -323,6 +323,7 @@ fn validate_and_extract_columns(
                 }
             },
             SelectItem::ExprWithAlias { .. }
+            | SelectItem::ExprWithAliases { .. }
             | SelectItem::QualifiedWildcard(..)
             | SelectItem::Wildcard(..) => {
                 return OnlyColumnReferencesSnafu {

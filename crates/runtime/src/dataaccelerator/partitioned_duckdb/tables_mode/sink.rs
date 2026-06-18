@@ -40,7 +40,7 @@ use futures::StreamExt;
 use snafu::prelude::*;
 use std::collections::HashMap;
 use std::time::SystemTime;
-use std::{any::Any, fmt, sync::Arc};
+use std::{fmt, sync::Arc};
 use tokio::sync::mpsc::{self, Receiver, Sender};
 use tokio::task::JoinHandle;
 
@@ -97,10 +97,6 @@ pub struct DuckDBPartitionedDataSink {
 
 #[async_trait]
 impl DataSink for DuckDBPartitionedDataSink {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn metrics(&self) -> Option<MetricsSet> {
         None
     }

@@ -17,7 +17,6 @@
 
 //! [`SpiceJsonFormat`]: Line delimited JSON [`FileFormat`] abstractions
 
-use std::any::Any;
 use std::collections::VecDeque;
 use std::fmt::{self, Debug};
 use std::io::{BufReader, Read};
@@ -219,10 +218,6 @@ impl SpiceJsonFormat {
 
 #[async_trait]
 impl FileFormat for SpiceJsonFormat {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn get_ext(&self) -> String {
         DEFAULT_JSON_EXTENSION[1..].to_string()
     }
@@ -565,10 +560,6 @@ impl DataSource for NonRepartitionedFileScanConfig {
         );
         self.inner.open(partition, context)
     }
-
-    fn as_any(&self) -> &dyn Any {
-        &self.inner
-    }
     fn fmt_as(&self, t: DisplayFormatType, f: &mut fmt::Formatter) -> fmt::Result {
         self.inner.fmt_as(t, f)
     }
@@ -578,7 +569,7 @@ impl DataSource for NonRepartitionedFileScanConfig {
     fn eq_properties(&self) -> EquivalenceProperties {
         self.inner.eq_properties()
     }
-    fn partition_statistics(&self, partition: Option<usize>) -> Result<Statistics> {
+    fn partition_statistics(&self, partition: Option<usize>) -> Result<Arc<Statistics>> {
         self.inner.partition_statistics(partition)
     }
     fn with_fetch(&self, limit: Option<usize>) -> Option<Arc<dyn DataSource>> {
@@ -597,7 +588,6 @@ impl DataSource for NonRepartitionedFileScanConfig {
         match self.inner.try_swapping_with_projection(projection)? {
             Some(new_inner) => {
                 let new_config = new_inner
-                    .as_any()
                     .downcast_ref::<FileScanConfig>()
                     .ok_or_else(|| {
                         DataFusionError::Internal(

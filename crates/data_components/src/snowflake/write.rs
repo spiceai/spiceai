@@ -14,7 +14,6 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::any::Any;
 use std::borrow::Cow;
 use std::error::Error as StdError;
 use std::sync::Arc;
@@ -146,10 +145,7 @@ impl SnowflakeTableProvider {
         // analyzer still recognises this as a federated table (it only downcasts to
         // FederatedTableProviderAdaptor). The source carries the fully-qualified SQL;
         // the fallback provider is our write-capable SnowflakeTableProvider.
-        if let Some(adaptor) = read_provider
-            .as_any()
-            .downcast_ref::<FederatedTableProviderAdaptor>()
-        {
+        if let Some(adaptor) = read_provider.downcast_ref::<FederatedTableProviderAdaptor>() {
             return Arc::new(FederatedTableProviderAdaptor::new_with_provider(
                 Arc::clone(&adaptor.source),
                 write_provider,
@@ -167,14 +163,12 @@ impl FederationProvider for SnowflakeTableProvider {
 
     fn compute_context(&self) -> Option<String> {
         self.read_provider
-            .as_any()
             .downcast_ref::<FederatedTableProviderAdaptor>()
             .and_then(|a| a.source.federation_provider().compute_context())
     }
 
     fn analyzer(&self, plan: &LogicalPlan) -> Option<FederationAnalyzerForLogicalPlan> {
         self.read_provider
-            .as_any()
             .downcast_ref::<FederatedTableProviderAdaptor>()
             .and_then(|a| a.source.federation_provider().analyzer(plan))
     }
@@ -182,10 +176,6 @@ impl FederationProvider for SnowflakeTableProvider {
 
 #[async_trait]
 impl TableProvider for SnowflakeTableProvider {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema(&self) -> SchemaRef {
         Arc::clone(&self.schema)
     }
@@ -348,10 +338,6 @@ impl ExecutionPlan for DmlCountExec {
         "DmlCountExec"
     }
 
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
     }
@@ -425,10 +411,6 @@ impl DisplayAs for UpdateExec {
 impl ExecutionPlan for UpdateExec {
     fn name(&self) -> &'static str {
         "UpdateExec"
-    }
-
-    fn as_any(&self) -> &dyn Any {
-        self
     }
 
     fn properties(&self) -> &Arc<PlanProperties> {
@@ -514,10 +496,6 @@ impl DisplayAs for SnowflakeDataSink {
 
 #[async_trait]
 impl DataSink for SnowflakeDataSink {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn metrics(&self) -> Option<MetricsSet> {
         None
     }

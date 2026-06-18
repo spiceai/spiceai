@@ -73,7 +73,7 @@ use std::collections::HashSet;
 use std::num::NonZeroUsize;
 use std::pin::Pin;
 use std::time::{Duration, SystemTime};
-use std::{any::Any, collections::HashMap, fmt, sync::Arc};
+use std::{collections::HashMap, fmt, sync::Arc};
 
 #[derive(Debug, Clone)]
 pub struct DynamoDBTableProvider {
@@ -577,10 +577,6 @@ impl DynamoDBTableProvider {
 
 #[async_trait]
 impl TableProvider for DynamoDBTableProvider {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema(&self) -> SchemaRef {
         Arc::clone(self.table_schema.schema())
     }
@@ -792,10 +788,6 @@ impl DisplayAs for DynamoDBTableProviderExec {
 impl ExecutionPlan for DynamoDBTableProviderExec {
     fn name(&self) -> &'static str {
         "DynamoDBTableProviderExec"
-    }
-
-    fn as_any(&self) -> &dyn Any {
-        self
     }
 
     fn schema(&self) -> SchemaRef {

@@ -1122,7 +1122,6 @@ mod test {
             .expect("accelerator table should be created");
 
         let indexed = table
-            .as_any()
             .downcast_ref::<IndexedMemTable>()
             .expect("primary key should create an IndexedMemTable");
         assert!(indexed.has_index());
@@ -1240,7 +1239,6 @@ mod test {
             .expect("accelerator table should be created");
 
         let indexed = table
-            .as_any()
             .downcast_ref::<IndexedMemTable>()
             .expect("indexes should create an IndexedMemTable");
         assert!(!indexed.has_index());

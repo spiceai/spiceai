@@ -273,7 +273,7 @@ impl PhysicalOptimizerRule for CayenneAntiJoinSortMergeRewriter {
         config: &ConfigOptions,
     ) -> Result<Arc<dyn ExecutionPlan>, DataFusionError> {
         plan.transform_down(|node| {
-            let Some(hash_join) = node.as_any().downcast_ref::<HashJoinExec>() else {
+            let Some(hash_join) = node.downcast_ref::<HashJoinExec>() else {
                 return Ok(Transformed::no(node));
             };
 
@@ -303,7 +303,7 @@ impl PhysicalOptimizerRule for CayenneDynamicFilterSharing {
         config: &ConfigOptions,
     ) -> Result<Arc<dyn ExecutionPlan>, DataFusionError> {
         plan.transform_down(|node| {
-            let Some(hash_join) = node.as_any().downcast_ref::<HashJoinExec>() else {
+            let Some(hash_join) = node.downcast_ref::<HashJoinExec>() else {
                 return Ok(Transformed::no(node));
             };
 
@@ -343,7 +343,7 @@ impl PhysicalOptimizerRule for CayenneMaintainedAggregateRewriter {
         _config: &ConfigOptions,
     ) -> Result<Arc<dyn ExecutionPlan>, DataFusionError> {
         plan.transform_down(|node| {
-            let Some(aggregate) = node.as_any().downcast_ref::<AggregateExec>() else {
+            let Some(aggregate) = node.downcast_ref::<AggregateExec>() else {
                 return Ok(Transformed::no(node));
             };
             let Some((source, scan_epoch, query_aggregate)) =
@@ -387,16 +387,15 @@ fn maintained_aggregate_source_for_aggregate(
 
 #[expect(deprecated)]
 fn maintained_aggregate_partial_input(plan: &Arc<dyn ExecutionPlan>) -> Option<&AggregateExec> {
-    if let Some(aggregate) = plan.as_any().downcast_ref::<AggregateExec>() {
+    if let Some(aggregate) = plan.downcast_ref::<AggregateExec>() {
         return Some(aggregate);
     }
 
-    let any = plan.as_any();
-    if any.downcast_ref::<RepartitionExec>().is_none()
-        && any
+    if plan.downcast_ref::<RepartitionExec>().is_none()
+        && plan
             .downcast_ref::<datafusion_physical_plan::coalesce_batches::CoalesceBatchesExec>()
             .is_none()
-        && any
+        && plan
             .downcast_ref::<datafusion_physical_plan::coalesce_partitions::CoalescePartitionsExec>()
             .is_none()
     {
@@ -418,17 +417,16 @@ fn is_simple_partial_aggregate(aggregate: &AggregateExec) -> bool {
 fn maintained_aggregate_source(
     plan: &Arc<dyn ExecutionPlan>,
 ) -> Option<(&Arc<MaintainedAggregateRegistry>, u64)> {
-    if let Some(cayenne_scan) = plan.as_any().downcast_ref::<CayenneAccelerationExec>() {
+    if let Some(cayenne_scan) = plan.downcast_ref::<CayenneAccelerationExec>() {
         return cayenne_scan.maintained_aggregates();
     }
 
-    let any = plan.as_any();
-    if any.downcast_ref::<RepartitionExec>().is_none()
-        && any
+    if plan.downcast_ref::<RepartitionExec>().is_none()
+        && plan
             .downcast_ref::<datafusion_physical_plan::coalesce_batches::CoalesceBatchesExec>()
             .is_none()
-        && any.downcast_ref::<SchemaCastScanExec>().is_none()
-        && any
+        && plan.downcast_ref::<SchemaCastScanExec>().is_none()
+        && plan
             .downcast_ref::<datafusion_physical_plan::coalesce_partitions::CoalescePartitionsExec>()
             .is_none()
     {
@@ -960,7 +958,7 @@ fn collect_cayenne_scans(plan: &Arc<dyn ExecutionPlan>) -> Vec<CayenneScanSummar
 }
 
 fn collect_cayenne_scans_inner(plan: &Arc<dyn ExecutionPlan>, scans: &mut Vec<CayenneScanSummary>) {
-    if let Some(cayenne) = plan.as_any().downcast_ref::<CayenneAccelerationExec>()
+    if let Some(cayenne) = plan.downcast_ref::<CayenneAccelerationExec>()
         && let Some(identity) = cayenne.scan_identity()
     {
         let schema_fields = plan_schema_fields(&cayenne.schema());
@@ -980,7 +978,7 @@ fn collect_cayenne_scans_inner(plan: &Arc<dyn ExecutionPlan>, scans: &mut Vec<Ca
 }
 
 fn physical_column_name(expr: &Arc<dyn PhysicalExpr>) -> Option<&str> {
-    expr.as_any().downcast_ref::<Column>().map(Column::name)
+    expr.downcast_ref::<Column>().map(Column::name)
 }
 
 fn scans_by_identity(scans: &[CayenneScanSummary]) -> HashMap<Arc<ScanIdentity>, Vec<usize>> {
@@ -1060,7 +1058,7 @@ fn apply_filter_additions(
         return Ok((plan, false));
     }
 
-    if let Some(cayenne) = plan.as_any().downcast_ref::<CayenneAccelerationExec>() {
+    if let Some(cayenne) = plan.downcast_ref::<CayenneAccelerationExec>() {
         let Some(identity) = cayenne.scan_identity() else {
             return Ok((plan, false));
         };
@@ -1124,11 +1122,11 @@ impl std::fmt::Debug for CayenneJoinRewriter {
 #[expect(deprecated)]
 fn flatten_transparent_nodes(plan: &Arc<dyn ExecutionPlan>) -> &Arc<dyn ExecutionPlan> {
     // ProjectionExec is transparent if it just passes through columns
-    if let Some(projection) = plan.as_any().downcast_ref::<ProjectionExec>() {
+    if let Some(projection) = plan.downcast_ref::<ProjectionExec>() {
         return flatten_transparent_nodes(projection.input());
     }
 
-    if let Some(bytes_processed_exec) = plan.as_any().downcast_ref::<BytesProcessedExec>() {
+    if let Some(bytes_processed_exec) = plan.downcast_ref::<BytesProcessedExec>() {
         let children = bytes_processed_exec.children();
         let Some(input) = children.first() else {
             return plan;
@@ -1137,13 +1135,12 @@ fn flatten_transparent_nodes(plan: &Arc<dyn ExecutionPlan>) -> &Arc<dyn Executio
         return flatten_transparent_nodes(input);
     }
 
-    if let Some(repartitioned) = plan.as_any().downcast_ref::<RepartitionExec>() {
+    if let Some(repartitioned) = plan.downcast_ref::<RepartitionExec>() {
         return flatten_transparent_nodes(repartitioned.input());
     }
 
     if let Some(coalesce) =
-        plan.as_any()
-            .downcast_ref::<datafusion_physical_plan::coalesce_batches::CoalesceBatchesExec>()
+        plan.downcast_ref::<datafusion_physical_plan::coalesce_batches::CoalesceBatchesExec>()
     {
         return flatten_transparent_nodes(coalesce.input());
     }
@@ -1154,7 +1151,7 @@ fn flatten_transparent_nodes(plan: &Arc<dyn ExecutionPlan>) -> &Arc<dyn Executio
     // identifying a Cayenne-backed scan on a join build/probe side they are
     // transparent — see through them so the dynamic-filter join rewrite still
     // fires on tables undergoing CDC deletes.
-    if let Some(int64_delete) = plan.as_any().downcast_ref::<Int64PkDeletionFilterExec>() {
+    if let Some(int64_delete) = plan.downcast_ref::<Int64PkDeletionFilterExec>() {
         let children = int64_delete.children();
         let Some(input) = children.first() else {
             return plan;
@@ -1163,7 +1160,7 @@ fn flatten_transparent_nodes(plan: &Arc<dyn ExecutionPlan>) -> &Arc<dyn Executio
         return flatten_transparent_nodes(input);
     }
 
-    if let Some(key_delete) = plan.as_any().downcast_ref::<KeyBasedDeletionFilterExec>() {
+    if let Some(key_delete) = plan.downcast_ref::<KeyBasedDeletionFilterExec>() {
         let children = key_delete.children();
         let Some(input) = children.first() else {
             return plan;
@@ -1172,7 +1169,7 @@ fn flatten_transparent_nodes(plan: &Arc<dyn ExecutionPlan>) -> &Arc<dyn Executio
         return flatten_transparent_nodes(input);
     }
 
-    if let Some(schema_cast_scan) = plan.as_any().downcast_ref::<SchemaCastScanExec>() {
+    if let Some(schema_cast_scan) = plan.downcast_ref::<SchemaCastScanExec>() {
         let children = schema_cast_scan.children();
         let Some(input) = children.first() else {
             return plan;
@@ -1188,12 +1185,11 @@ fn hash_join_build_side_is_cayenne(join: &HashJoinExec) -> bool {
     let build_side = flatten_transparent_nodes(join.left());
 
     if build_side
-        .as_any()
         .downcast_ref::<CayenneAccelerationExec>()
         .is_some()
     {
         true
-    } else if let Some(nested_join) = build_side.as_any().downcast_ref::<HashJoinExec>() {
+    } else if let Some(nested_join) = build_side.downcast_ref::<HashJoinExec>() {
         // Recursively check the build side of the nested join
         hash_join_build_side_is_cayenne(nested_join)
     } else {
@@ -1218,7 +1214,6 @@ fn is_cayenne_backed_join(hash_join: &HashJoinExec) -> bool {
     let probe_side = flatten_transparent_nodes(hash_join.right());
 
     if probe_side
-        .as_any()
         .downcast_ref::<CayenneAccelerationExec>()
         .is_some()
     {
@@ -1226,7 +1221,7 @@ fn is_cayenne_backed_join(hash_join: &HashJoinExec) -> bool {
     }
 
     // If probe side is another `HashJoinExec`, check the build side of the nested join is Cayenne
-    if let Some(nested_join) = probe_side.as_any().downcast_ref::<HashJoinExec>() {
+    if let Some(nested_join) = probe_side.downcast_ref::<HashJoinExec>() {
         // The nested join's build side must also be Cayenne
         return hash_join_build_side_is_cayenne(nested_join);
     }
@@ -1267,7 +1262,7 @@ impl PhysicalOptimizerRule for CayenneJoinRewriter {
         // Therefore, after we encounter a `HashJoinExec` we need to continue traversing down the build side of any subsequent `HashJoinExec`s to ensure it is a `CayenneAccelerationExec`.
 
         plan.transform_down(|node| {
-            let Some(hash_join) = node.as_any().downcast_ref::<HashJoinExec>() else {
+            let Some(hash_join) = node.downcast_ref::<HashJoinExec>() else {
                 return Ok(Transformed::no(node));
             };
 
@@ -1344,7 +1339,6 @@ mod tests {
     use object_store::ObjectMeta;
     use object_store::ObjectStore;
     use object_store::path::Path;
-    use std::any::Any;
     use std::sync::Arc;
 
     fn maintained_aggregate_test_schema() -> Arc<Schema> {
@@ -1411,7 +1405,6 @@ mod tests {
 
         assert!(
             optimized
-                .as_any()
                 .downcast_ref::<MaintainedAggregateExec>()
                 .is_some()
         );
@@ -1444,7 +1437,7 @@ mod tests {
             .optimize(Arc::clone(&aggregate), &ConfigOptions::default())?;
 
         assert!(
-            optimized.as_any().downcast_ref::<AggregateExec>().is_some(),
+            optimized.downcast_ref::<AggregateExec>().is_some(),
             "stale maintained aggregate state must not rewrite"
         );
         Ok(())
@@ -1477,10 +1470,6 @@ mod tests {
             Err(DataFusionError::NotImplemented(
                 "test source cannot open files".to_string(),
             ))
-        }
-
-        fn as_any(&self) -> &dyn Any {
-            self
         }
 
         fn table_schema(&self) -> &TableSchema {
@@ -1785,12 +1774,10 @@ mod tests {
 
         let optimized = optimize_filter_sharing(join);
         let join = optimized
-            .as_any()
             .downcast_ref::<HashJoinExec>()
             .expect("optimized plan should remain a hash join");
         let right = join
             .right()
-            .as_any()
             .downcast_ref::<CayenneAccelerationExec>()
             .expect("right side should remain Cayenne");
         let filters = right.dynamic_filters();
@@ -1813,12 +1800,10 @@ mod tests {
 
         let optimized = optimize_filter_sharing(join);
         let join = optimized
-            .as_any()
             .downcast_ref::<HashJoinExec>()
             .expect("optimized plan should remain a hash join");
         let right = join
             .right()
-            .as_any()
             .downcast_ref::<CayenneAccelerationExec>()
             .expect("right side should remain Cayenne");
         let filters = right.dynamic_filters();
@@ -1841,12 +1826,10 @@ mod tests {
 
         let optimized = optimize_filter_sharing(join);
         let join = optimized
-            .as_any()
             .downcast_ref::<HashJoinExec>()
             .expect("optimized plan should remain a hash join");
         let right = join
             .right()
-            .as_any()
             .downcast_ref::<CayenneAccelerationExec>()
             .expect("right side should remain Cayenne");
 
@@ -1868,12 +1851,10 @@ mod tests {
 
         let optimized = optimize_filter_sharing(join);
         let join = optimized
-            .as_any()
             .downcast_ref::<HashJoinExec>()
             .expect("optimized plan should remain a hash join");
         let right = join
             .right()
-            .as_any()
             .downcast_ref::<CayenneAccelerationExec>()
             .expect("right side should remain Cayenne");
 
@@ -1895,12 +1876,10 @@ mod tests {
 
         let optimized = optimize_filter_sharing(join);
         let join = optimized
-            .as_any()
             .downcast_ref::<HashJoinExec>()
             .expect("optimized plan should remain a hash join");
         let right = join
             .right()
-            .as_any()
             .downcast_ref::<CayenneAccelerationExec>()
             .expect("right side should remain Cayenne");
 
@@ -1936,7 +1915,6 @@ mod tests {
 
         assert!(!changed);
         let target = optimized
-            .as_any()
             .downcast_ref::<CayenneAccelerationExec>()
             .expect("target should remain Cayenne");
         assert!(target.dynamic_filters().is_empty());
@@ -1966,12 +1944,10 @@ mod tests {
 
         let optimized = optimize_filter_sharing(join);
         let join = optimized
-            .as_any()
             .downcast_ref::<HashJoinExec>()
             .expect("optimized plan should remain a hash join");
         let right = join
             .right()
-            .as_any()
             .downcast_ref::<CayenneAccelerationExec>()
             .expect("right side should remain Cayenne");
 
@@ -1998,12 +1974,10 @@ mod tests {
 
         let optimized = optimize_filter_sharing(join);
         let join = optimized
-            .as_any()
             .downcast_ref::<HashJoinExec>()
             .expect("optimized plan should remain a hash join");
         let right = join
             .right()
-            .as_any()
             .downcast_ref::<CayenneAccelerationExec>()
             .expect("right side should remain Cayenne");
 
@@ -2034,12 +2008,10 @@ mod tests {
 
         let optimized = optimize_filter_sharing(join);
         let join = optimized
-            .as_any()
             .downcast_ref::<HashJoinExec>()
             .expect("optimized plan should remain a hash join");
         let right = join
             .right()
-            .as_any()
             .downcast_ref::<CayenneAccelerationExec>()
             .expect("right side should remain Cayenne");
         let filters = right.dynamic_filters();
@@ -2071,10 +2043,7 @@ mod tests {
 
         let optimized = optimize_anti_join_sort_merge(join);
         assert!(
-            optimized
-                .as_any()
-                .downcast_ref::<SortMergeJoinExec>()
-                .is_some(),
+            optimized.downcast_ref::<SortMergeJoinExec>().is_some(),
             "same-source Cayenne LeftSemi join should use sort-merge join"
         );
     }
@@ -2095,25 +2064,16 @@ mod tests {
 
         let optimized = optimize_anti_join_sort_merge(join);
         let sort_merge = optimized
-            .as_any()
             .downcast_ref::<SortMergeJoinExec>()
             .expect("same-source Cayenne anti join should use sort-merge join");
 
         assert_eq!(JoinType::LeftAnti, sort_merge.join_type());
         assert!(
-            sort_merge
-                .left()
-                .as_any()
-                .downcast_ref::<SortExec>()
-                .is_some(),
+            sort_merge.left().downcast_ref::<SortExec>().is_some(),
             "left anti-join input should be explicitly sorted"
         );
         assert!(
-            sort_merge
-                .right()
-                .as_any()
-                .downcast_ref::<SortExec>()
-                .is_some(),
+            sort_merge.right().downcast_ref::<SortExec>().is_some(),
             "right anti-join input should be explicitly sorted"
         );
     }
@@ -2135,7 +2095,7 @@ mod tests {
         let optimized = optimize_anti_join_sort_merge(join);
 
         assert!(
-            optimized.as_any().downcast_ref::<HashJoinExec>().is_some(),
+            optimized.downcast_ref::<HashJoinExec>().is_some(),
             "inner joins should stay as hash joins unless a more targeted rule proves a win"
         );
     }
@@ -2157,7 +2117,7 @@ mod tests {
         let optimized = optimize_anti_join_sort_merge(join);
 
         assert!(
-            optimized.as_any().downcast_ref::<HashJoinExec>().is_some(),
+            optimized.downcast_ref::<HashJoinExec>().is_some(),
             "outer joins should stay as hash joins unless a more targeted rule proves a win"
         );
     }
@@ -2178,10 +2138,7 @@ mod tests {
         let optimized = optimize_anti_join_sort_merge(join);
 
         assert!(
-            optimized
-                .as_any()
-                .downcast_ref::<SortMergeJoinExec>()
-                .is_some(),
+            optimized.downcast_ref::<SortMergeJoinExec>().is_some(),
             "multi-key same-source Cayenne anti join should use sort-merge join"
         );
     }
@@ -2203,7 +2160,7 @@ mod tests {
         let optimized = optimize_anti_join_sort_merge(join);
 
         assert!(
-            optimized.as_any().downcast_ref::<HashJoinExec>().is_some(),
+            optimized.downcast_ref::<HashJoinExec>().is_some(),
             "anti joins over unrelated sources should stay as hash joins"
         );
     }
@@ -2225,7 +2182,7 @@ mod tests {
         let optimized = optimize_anti_join_sort_merge(join);
 
         assert!(
-            optimized.as_any().downcast_ref::<HashJoinExec>().is_some(),
+            optimized.downcast_ref::<HashJoinExec>().is_some(),
             "inner joins over unrelated sources should stay as hash joins"
         );
     }
@@ -2251,7 +2208,7 @@ mod tests {
         let optimized = optimize_anti_join_sort_merge(join);
 
         assert!(
-            optimized.as_any().downcast_ref::<HashJoinExec>().is_some(),
+            optimized.downcast_ref::<HashJoinExec>().is_some(),
             "same-source anti joins at or below the large-input threshold should stay as hash joins"
         );
     }
@@ -2273,7 +2230,7 @@ mod tests {
         let optimized = optimize_anti_join_sort_merge(join);
 
         assert!(
-            optimized.as_any().downcast_ref::<HashJoinExec>().is_some(),
+            optimized.downcast_ref::<HashJoinExec>().is_some(),
             "null-equal anti joins should stay as hash joins"
         );
     }
@@ -2300,7 +2257,7 @@ mod tests {
         let optimized = optimize_anti_join_sort_merge_with_config(join, &config);
 
         assert!(
-            optimized.as_any().downcast_ref::<HashJoinExec>().is_some(),
+            optimized.downcast_ref::<HashJoinExec>().is_some(),
             "configured min-row threshold should keep smaller build sides as hash joins"
         );
     }
@@ -2333,10 +2290,7 @@ mod tests {
         let optimized = optimize_anti_join_sort_merge_with_config(join, &config);
 
         assert!(
-            optimized
-                .as_any()
-                .downcast_ref::<SortMergeJoinExec>()
-                .is_some(),
+            optimized.downcast_ref::<SortMergeJoinExec>().is_some(),
             "low-row-count + wide-row build exceeding the byte gate should be rewritten to sort-merge"
         );
     }
@@ -2359,7 +2313,7 @@ mod tests {
         let optimized = optimize_anti_join_sort_merge_with_config(join, &config);
 
         assert!(
-            optimized.as_any().downcast_ref::<HashJoinExec>().is_some(),
+            optimized.downcast_ref::<HashJoinExec>().is_some(),
             "estimated build side within the configured memory fraction should stay a hash join"
         );
     }
@@ -2382,10 +2336,7 @@ mod tests {
         let optimized = optimize_anti_join_sort_merge_with_config(join, &config);
 
         assert!(
-            optimized
-                .as_any()
-                .downcast_ref::<SortMergeJoinExec>()
-                .is_some(),
+            optimized.downcast_ref::<SortMergeJoinExec>().is_some(),
             "estimated build side above the configured memory fraction should use sort-merge"
         );
     }
@@ -2411,7 +2362,7 @@ mod tests {
         let optimized = optimize_anti_join_sort_merge(join);
 
         assert!(
-            optimized.as_any().downcast_ref::<HashJoinExec>().is_some(),
+            optimized.downcast_ref::<HashJoinExec>().is_some(),
             "same-source anti joins with inexact preserved-side stats should stay as hash joins"
         );
     }
@@ -2433,7 +2384,7 @@ mod tests {
         let optimized = optimize_anti_join_sort_merge(join);
 
         assert!(
-            optimized.as_any().downcast_ref::<HashJoinExec>().is_some(),
+            optimized.downcast_ref::<HashJoinExec>().is_some(),
             "same-source anti joins with unknown preserved-side stats should stay as hash joins"
         );
     }
@@ -2455,10 +2406,7 @@ mod tests {
         let optimized = optimize_anti_join_sort_merge(join);
 
         assert!(
-            optimized
-                .as_any()
-                .downcast_ref::<SortMergeJoinExec>()
-                .is_some(),
+            optimized.downcast_ref::<SortMergeJoinExec>().is_some(),
             "RightAnti should gate on the left build side, not the right preserved side"
         );
     }
@@ -2480,7 +2428,7 @@ mod tests {
         let optimized = optimize_anti_join_sort_merge(join);
 
         assert!(
-            optimized.as_any().downcast_ref::<HashJoinExec>().is_some(),
+            optimized.downcast_ref::<HashJoinExec>().is_some(),
             "RightAnti should stay hash join when the left build side has unknown stats"
         );
     }
@@ -2490,17 +2438,12 @@ mod tests {
     /// found anywhere in `plan` (depth-first). Returns an empty vec if there is no
     /// Cayenne scan or it carries no dynamic filters.
     fn cayenne_scan_dynamic_filters(plan: &Arc<dyn ExecutionPlan>) -> Vec<ScanDynamicFilter> {
-        if let Some(cayenne) = plan.as_any().downcast_ref::<CayenneAccelerationExec>() {
+        if let Some(cayenne) = plan.downcast_ref::<CayenneAccelerationExec>() {
             return cayenne.dynamic_filters();
         }
         for child in plan.children() {
             let filters = cayenne_scan_dynamic_filters(child);
-            if !filters.is_empty()
-                || child
-                    .as_any()
-                    .downcast_ref::<CayenneAccelerationExec>()
-                    .is_some()
-            {
+            if !filters.is_empty() || child.downcast_ref::<CayenneAccelerationExec>().is_some() {
                 return filters;
             }
         }
@@ -2561,15 +2504,23 @@ mod tests {
         );
     }
 
-    /// Companion to the inner-join regression: `DataFusion` only pushes
-    /// join-derived dynamic filters through **inner** joins
-    /// (`HashJoinExec::allow_join_dynamic_filter_pushdown`). A semi join must
-    /// therefore *not* plant a dynamic filter into the Cayenne scan — the OOM
-    /// mitigation for semi-join shapes (e.g. CH-benCH Q18) is handled by the
-    /// separate logical `CayennePushDownSemiJoin` rule and by
-    /// `CayenneAntiJoinSortMergeRewriter`, not by this pushdown path.
+    /// Companion to the inner-join regression. For a semi join whose probe
+    /// (right) side is a `CayenneAccelerationExec`, `DataFusion`'s Post-phase
+    /// `FilterPushdown` plants a `DynamicFilterPhysicalExpr` into the Cayenne
+    /// scan's underlying file source — the same min/max bounds +
+    /// InList/hash-table membership filter the inner-join path provides.
+    ///
+    /// This is new in `DataFusion` 54: `DataFusion` 53 pushed join-derived dynamic
+    /// filters through **inner** joins only, whereas `DataFusion` 54 generalized
+    /// `HashJoinExec::allow_join_dynamic_filter_pushdown` to gate on
+    /// `join_type.on_lr_is_preserved().probe_preserved`, which is `true` for semi
+    /// joins too. Cayenne benefits: a `RightSemi` join's output is the subset of
+    /// probe rows with a build-side match, so the build-key filter only prunes
+    /// probe rows that cannot match — a free extra prune that complements (does
+    /// not replace) the `CayennePushDownSemiJoin` and
+    /// `CayenneAntiJoinSortMergeRewriter` semi-join OOM mitigations.
     #[test]
-    fn native_semi_join_does_not_plant_dynamic_filter_into_cayenne_probe_scan() {
+    fn native_semi_join_plants_dynamic_filter_into_cayenne_probe_scan() {
         let schema = order_line_schema();
         let build = file_exec(&schema, "build.vortex", None);
         let probe = cayenne_file_exec(&schema, "probe.vortex", None);
@@ -2584,9 +2535,16 @@ mod tests {
 
         let optimized = push_down_filters(join, &ConfigOptions::default());
 
+        let filters = cayenne_scan_dynamic_filters(&optimized);
         assert!(
-            cayenne_scan_dynamic_filters(&optimized).is_empty(),
-            "DataFusion does not push join dynamic filters through semi joins"
+            !filters.is_empty(),
+            "DataFusion pushes join dynamic filters through semi joins; \
+             got plan: {}",
+            displayable(optimized.as_ref()).indent(true)
+        );
+        assert!(
+            filters.iter().any(|f| f.columns().contains("order_id")),
+            "the planted dynamic filter should reference the equi-join key column"
         );
     }
 }

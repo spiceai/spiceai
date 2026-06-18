@@ -13,7 +13,7 @@ expression: response
   ],
   "sql": {
     "engine": "Apache DataFusion",
-    "version": "53.1.0",
+    "version": "54.0.0",
     "dialect": "PostgreSQL",
     "parser": "DataFusion SQL parser configured with PostgreSQL dialect",
     "notes": [
@@ -361,6 +361,7 @@ expression: response
         "bitmap_bucket_number",
         "bitmap_count",
         "bitwise_not",
+        "ceil",
         "char",
         "concat",
         "crc32",
@@ -373,12 +374,14 @@ expression: response
         "elt",
         "expm1",
         "factorial",
+        "floor",
         "format_string",
         "from_utc_timestamp",
         "hex",
         "hour",
         "if",
         "ilike",
+        "is_valid_utf8",
         "json_tuple",
         "last_day",
         "length",
@@ -386,6 +389,7 @@ expression: response
         "luhn_check",
         "make_dt_interval",
         "make_interval",
+        "make_valid_utf8",
         "map_from_arrays",
         "map_from_entries",
         "minute",
@@ -395,6 +399,7 @@ expression: response
         "parse_url",
         "pmod",
         "rint",
+        "round",
         "sec",
         "second",
         "sha1",
@@ -405,7 +410,9 @@ expression: response
         "shuffle",
         "size",
         "slice",
+        "soundex",
         "space",
+        "spark_cast",
         "str_to_map",
         "substring",
         "time_trunc",
@@ -421,7 +428,8 @@ expression: response
         "unix_seconds",
         "url_decode",
         "url_encode",
-        "width_bucket"
+        "width_bucket",
+        "xxhash64"
       ]
     },
     "user_defined": []

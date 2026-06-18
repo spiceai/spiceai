@@ -508,7 +508,6 @@ async fn test_cayenne_primary_key_delete() -> Result<(), anyhow::Error> {
 
             // Get the AcceleratedTable, then its underlying accelerator (which may be wrapped)
             let accelerated_table = table
-                .as_any()
                 .downcast_ref::<AcceleratedTable>()
                 .ok_or_else(|| anyhow::anyhow!("Table is not an AcceleratedTable"))?;
 

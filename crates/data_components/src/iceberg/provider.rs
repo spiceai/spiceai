@@ -16,7 +16,6 @@ limitations under the License.
 
 //! Implementation of the `DataFusion` Catalog/Schema providers for Iceberg.
 
-use std::any::Any;
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
@@ -153,10 +152,6 @@ impl IcebergCatalogProvider {
 }
 
 impl CatalogProvider for IcebergCatalogProvider {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema_names(&self) -> Vec<String> {
         self.schemas
             .read()
@@ -358,10 +353,6 @@ impl IcebergSchemaProvider {
 
 #[async_trait]
 impl SchemaProvider for IcebergSchemaProvider {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn table_names(&self) -> Vec<String> {
         self.tables
             .read()

@@ -28,7 +28,6 @@ limitations under the License.
 //! This uses Iceberg's merge-on-read strategy: the delete files are separate
 //! from data files, and the Iceberg reader filters them out at read time.
 
-use std::any::Any;
 use std::borrow::Cow;
 use std::fmt::{Debug, Formatter};
 use std::sync::Arc;
@@ -146,10 +145,6 @@ impl DisplayAs for IcebergDeleteExec {
 impl ExecutionPlan for IcebergDeleteExec {
     fn name(&self) -> &'static str {
         "IcebergDeleteExec"
-    }
-
-    fn as_any(&self) -> &dyn Any {
-        self
     }
 
     fn properties(&self) -> &Arc<PlanProperties> {
@@ -379,10 +374,6 @@ impl Debug for IcebergDeletionProvider {
 
 #[async_trait]
 impl datafusion::datasource::TableProvider for IcebergDeletionProvider {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema(&self) -> ArrowSchemaRef {
         self.inner.schema()
     }
