@@ -1,8 +1,34 @@
 version: v1
 kind: Spicepod
-name: postgres-cayenne[file]-cdc-tuned-sf1000
+name: postgres-cayenne[file]-cdc-tuned-turso-sf100
 
-
+# Turso-metastore variant of postgres-cayenne[file]-cdc-tuned-sf100: identical CDC tuning;
+# only the Cayenne metastore backend differs — cayenne_metastore: turso (libsql MVCC /
+# BEGIN CONCURRENT) instead of sqlite. Exercises the Turso metastore at SF-100 on the
+# scheduled CH-benCHmark so its write-conflict / commit behavior is tracked vs the sqlite twin.
+#
+# Target: 64 vCPU / 256 GiB RAM, EBS gp3 (m7a.16xlarge-class). Goal: every CDC table under
+# 5s replication lag at SF-100 @ 10K txn/s, with >=5K QPH on the OLAP queries.
+#
+# Tuning (values validated on the 16-core local SF-100 run — all 7 tables <5s, ~97% of 5K
+# QPH — then scaled to 64c/256GB; the write-path values are core/RAM-invariant because the
+# wall is the single-writer-per-table metastore txn, not CPU or batch size):
+#   - cdc_max_coalesce_age_ms 250 + cdc_max_coalesced_bytes 128 MB: keep CDC applies small and
+#     fresh so they stay inline (4000ms/512 MB regressed — see the note on the linger below).
+#   - cdc_prefetch_buffer / cdc_max_coalesced_envelopes 16384: runtime max; deep prefetch keeps
+#     WAL drain ahead of bursty OLTP without enlarging the per-apply batch.
+#   - target_partitions 64: read-path parallelism matched to vCPU count (drives the QPH goal).
+#   - cayenne_pk_keyset_cache_mb 256 pinned on ALL tables: defeats the backwards memory-aware
+#     auto-default (total_mem/32 -> ~8 GiB on a 256 GiB host) and keeps the heavy-update tables
+#     (stock, order_line) on the cheap bloom path (256 = SF-100 sweep optimum).
+#   - per-table cayenne_write_concurrency / segment_cache_mb / compaction_* for the high-volume
+#     upsert tables; reference tables lighter. write_concurrency stays moderate (4/2): lower
+#     fan-out relieves CPU contention for OLAP (validated on the 128-core write-concurrency run).
+#   - metastore/footer caches (1024/1024 MiB, 4096 MiB mmap) are sized to the SF-100 working set,
+#     bounded by catalog/footer size — so 256 GiB adds headroom, not bigger caches.
+#
+# NOTE: validated on 16-core local + the 128-core write-concurrency study; the 64c/256GB
+# end-to-end run is the remaining validation (m7a.16xlarge + gp3).
 runtime:
   params:
     cdc_prefetch_buffer: '16384'
@@ -51,7 +77,7 @@ datasets:
       on_conflict:
         (d_w_id, d_id): upsert
       params: &accel_high_volume
-        cayenne_metastore: sqlite
+        cayenne_metastore: turso
         cayenne_file_path: .spice/cayenne/district
         # Explicit: the engine default flipped to `memory`. This pod IS the
         # file-durability variant (per-batch durable persist before the slot
@@ -67,6 +93,11 @@ datasets:
         cayenne_write_concurrency: '4'
         cayenne_segment_cache_mb: '1024'
         cayenne_compaction_trigger_protected_snapshots: '3'
+        # Pinned to 256 MiB (SF-100 sweep optimum). The keyset pin is scale-dependent: it
+        # must sit just UNDER the heavy-update tables' (stock, order_line) PK keysets so
+        # they stay on the cheap bloom path — at SF-100 that is 256 (1024 would fit them
+        # on the expensive exact path; the SF-1000 venue pins 1024). The memory-aware
+        # auto-default (total_mem/32 -> ~8 GiB on a 256 GiB host) is BACKWARDS — pin it.
         cayenne_pk_keyset_cache_mb: '256'
         cayenne_compaction_trigger_snapshot_age_ms: '15000'
         cayenne_compaction_max_files_per_pick: '64'
@@ -197,13 +228,14 @@ datasets:
       on_conflict:
         w_id: upsert
       params: &accel_medium
-        cayenne_metastore: sqlite
+        cayenne_metastore: turso
         cayenne_file_path: .spice/cayenne/warehouse
         # See &accel_high_volume: explicit file durability + key deletes.
         cayenne_cdc_durability: file
         cayenne_deletion_mode: key
         cayenne_write_concurrency: '4'
         cayenne_segment_cache_mb: '64'
+        # Pin 256 MiB explicitly — SF-100 optimum (don't leave to the backwards memory-aware auto-default).
         cayenne_pk_keyset_cache_mb: '256'
         cdc_max_coalesce_age_ms: '3000'
         cdc_max_coalesced_bytes: '536870912' # 512 MB
@@ -241,13 +273,14 @@ datasets:
       on_conflict:
         r_regionkey: upsert
       params: &accel_small
-        cayenne_metastore: sqlite
+        cayenne_metastore: turso
         cayenne_file_path: .spice/cayenne/region
         # See &accel_high_volume: explicit file durability + key deletes.
         cayenne_cdc_durability: file
         cayenne_deletion_mode: key
         cayenne_write_concurrency: '2'
         cayenne_segment_cache_mb: '16'
+        # Pin 256 MiB explicitly — SF-100 optimum (don't leave to the backwards memory-aware auto-default).
         cayenne_pk_keyset_cache_mb: '256'
 
   - from: postgres:nation

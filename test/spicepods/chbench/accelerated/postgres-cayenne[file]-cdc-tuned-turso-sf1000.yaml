@@ -1,7 +1,11 @@
 version: v1
 kind: Spicepod
-name: postgres-cayenne[file]-cdc-tuned-sf1000
+name: postgres-cayenne[file]-cdc-tuned-turso-sf1000
 
+# Turso-metastore variant of postgres-cayenne[file]-cdc-tuned-sf1000: identical CDC tuning;
+# only the Cayenne metastore backend differs — cayenne_metastore: turso (libsql MVCC /
+# BEGIN CONCURRENT) instead of sqlite. Exercises the Turso metastore at SF-1000 on the
+# scheduled CH-benCHmark so its write-conflict / commit behavior is tracked vs the sqlite twin.
 
 runtime:
   params:
@@ -51,7 +55,7 @@ datasets:
       on_conflict:
         (d_w_id, d_id): upsert
       params: &accel_high_volume
-        cayenne_metastore: sqlite
+        cayenne_metastore: turso
         cayenne_file_path: .spice/cayenne/district
         # Explicit: the engine default flipped to `memory`. This pod IS the
         # file-durability variant (per-batch durable persist before the slot
@@ -197,7 +201,7 @@ datasets:
       on_conflict:
         w_id: upsert
       params: &accel_medium
-        cayenne_metastore: sqlite
+        cayenne_metastore: turso
         cayenne_file_path: .spice/cayenne/warehouse
         # See &accel_high_volume: explicit file durability + key deletes.
         cayenne_cdc_durability: file
@@ -241,7 +245,7 @@ datasets:
       on_conflict:
         r_regionkey: upsert
       params: &accel_small
-        cayenne_metastore: sqlite
+        cayenne_metastore: turso
         cayenne_file_path: .spice/cayenne/region
         # See &accel_high_volume: explicit file durability + key deletes.
         cayenne_cdc_durability: file
