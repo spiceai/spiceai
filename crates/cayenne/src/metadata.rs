@@ -599,6 +599,9 @@ pub struct PinnedTuningActuators {
     /// `cayenne_cdc_mem_tier_max_bytes` was operator-set (don't adapt the
     /// in-memory CDC durability tier byte cap).
     pub mem_tier: bool,
+    /// `cayenne_target_file_size_mb` was operator-set (don't adapt the target
+    /// Vortex file size).
+    pub target_file_size: bool,
 }
 
 /// Storage medium backing a table's data files or metastore, mapped from the
