@@ -131,6 +131,22 @@ pub const EXPECTED_TABLES: &[ExpectedTable] = &[
         ],
     },
     ExpectedTable {
+        // Authoritative per-snapshot data-file manifest (manifest snapshot
+        // model). Captured in metastore snapshots so a snapshot-bootstrapped
+        // node inherits the complete file set. Column order MUST match the DDL
+        // in `sqlite.rs`/`turso.rs` and the export/import column order.
+        name: "cayenne_snapshot_file",
+        columns: &[
+            "table_id",
+            "snapshot_id",
+            "file_path",
+            "row_count",
+            "file_size_bytes",
+            "min_sequence",
+            "max_sequence",
+        ],
+    },
+    ExpectedTable {
         name: "cayenne_pk_index",
         columns: &["table_id", "snapshot_id", "index_blob"],
     },
