@@ -202,7 +202,7 @@ pub struct KafkaConfig {
     pub ssl_ca_location: Option<String>,
     pub ssl_certificate_location: Option<String>,
     pub ssl_key_location: Option<String>,
-    pub ssl_key_password: Option<String>,     
+    pub ssl_key_password: Option<String>,
     pub enable_ssl_certificate_verification: bool,
     pub ssl_endpoint_identification_algorithm: SslIdentification,
     pub consumer_group_id: Option<String>,

@@ -54,6 +54,7 @@ venv
 /test/tpc-bench/oracle/*.bad
 
 .vscode/settings.json
+.idea/
 
 # Nix
 /result

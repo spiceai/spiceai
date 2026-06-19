@@ -120,7 +120,7 @@ impl Kafka {
                 .get("ssl_key_password")
                 .expose()
                 .ok()
-                .map(ToString::to_string)
+                .map(ToString::to_string),
             enable_ssl_certificate_verification: params
                 .get("enable_ssl_certificate_verification")
                 .expose()
