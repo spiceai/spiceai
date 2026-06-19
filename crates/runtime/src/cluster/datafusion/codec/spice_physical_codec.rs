@@ -15,16 +15,20 @@ limitations under the License.
 */
 
 use crate::Runtime;
-use crate::execution_plan::UdtfExec;
+use crate::dataconnector::iceberg_cluster::IcebergClusterTableProvider;
+use crate::datafusion::planner::peel_table_provider_wrappers;
+use crate::execution_plan::{IcebergScanExec, UdtfExec};
 use crate::metrics::telemetry::track_bytes_processed;
 use arrow_schema::Schema;
 use ballista_core::serde::BallistaPhysicalExtensionCodec;
 #[cfg(not(windows))]
 use cayenne::provider::CayenneAccelerationExec;
-use datafusion::common::{DataFusionError, Result, exec_err};
+use datafusion::common::{DataFusionError, Result, TableReference, exec_err};
 use datafusion::execution::{FunctionRegistry, TaskContext};
+use datafusion::logical_expr::Expr;
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion_expr::ScalarUDF;
+use datafusion_proto::bytes::Serializeable;
 use datafusion_proto::generated::datafusion_common;
 #[cfg(not(windows))]
 use datafusion_proto::physical_plan::AsExecutionPlan;
@@ -35,8 +39,8 @@ use prost::Message;
 use runtime_datafusion::execution_plan::schema_cast::SchemaCastScanExec;
 use runtime_datafusion::extension::bytes_processed::BytesProcessedExec;
 use runtime_proto::{
-    BytesProcessedExecNode, CayenneAccelerationExecNode, SchemaCastScanExecNode,
-    SpicePhysicalPlanNode, UdtfExecNode, spice_physical_plan_node,
+    BytesProcessedExecNode, CayenneAccelerationExecNode, IcebergTableScanExecNode,
+    SchemaCastScanExecNode, SpicePhysicalPlanNode, UdtfExecNode, spice_physical_plan_node,
 };
 use std::fmt::Debug;
 use std::sync::Arc;
@@ -140,6 +144,40 @@ impl PhysicalExtensionCodec for SpicePhysicalCodec {
 
                 Ok(Arc::new(UdtfExec::new(args, inner_plan)))
             }
+            Some(spice_physical_plan_node::Node::IcebergTableScan(node)) => {
+                let runtime = self.runtime()?;
+                let table_ref = TableReference::from(node.table_ref.as_str());
+
+                let projection: Option<Vec<usize>> = if node.has_projection {
+                    Some(
+                        node.projection
+                            .iter()
+                            .map(|c| usize::try_from(*c).unwrap_or(usize::MAX))
+                            .collect(),
+                    )
+                } else {
+                    None
+                };
+                let filters = node
+                    .filters
+                    .iter()
+                    .map(|bytes| Expr::from_bytes_with_ctx(bytes, ctx))
+                    .collect::<Result<Vec<Expr>>>()?;
+                let limit = node.limit.map(|l| usize::try_from(l).unwrap_or(usize::MAX));
+
+                // Re-derive the scan by replaying TableProvider::scan on the
+                // already-registered Iceberg provider, reusing its catalog. No
+                // secrets cross the wire and no catalog is rebuilt — the executor
+                // loaded the same app definition, so re-planning with the same
+                // projection/filters reproduces the scheduler's bucketing.
+                replan_registered_iceberg_scan(
+                    &runtime,
+                    &table_ref,
+                    projection.as_ref(),
+                    &filters,
+                    limit,
+                )
+            }
             None => {
                 #[cfg(not(windows))]
                 if let Ok(plan) = Self::try_decode_nested_physical_plan(buf, ctx) {
@@ -182,6 +220,40 @@ impl PhysicalExtensionCodec for SpicePhysicalCodec {
                     schema: schema_buf,
                 })),
             }
+        } else if let Some(scan_exec) = node.downcast_ref::<IcebergScanExec>() {
+            // Serialize the scan recipe (table ref + projection/filters/limit).
+            // The executor replays `TableProvider::scan` with these to re-derive
+            // an equivalent scan — the iceberg `FileScanTask`s themselves are not
+            // serializable (partition / partition_spec fields), so the plan is
+            // rebuilt remotely rather than shipped.
+            let (has_projection, projection) = match scan_exec.projection() {
+                Some(cols) => (
+                    true,
+                    cols.iter()
+                        .map(|c| u32::try_from(*c).unwrap_or(u32::MAX))
+                        .collect(),
+                ),
+                None => (false, Vec::new()),
+            };
+            let filters = scan_exec
+                .filters()
+                .iter()
+                .map(|expr| expr.to_bytes().map(|b| b.to_vec()))
+                .collect::<Result<Vec<Vec<u8>>>>()?;
+
+            SpicePhysicalPlanNode {
+                node: Some(spice_physical_plan_node::Node::IcebergTableScan(
+                    IcebergTableScanExecNode {
+                        table_ref: scan_exec.table_ref().to_string(),
+                        projection,
+                        has_projection,
+                        filters,
+                        limit: scan_exec
+                            .limit()
+                            .map(|l| u64::try_from(l).unwrap_or(u64::MAX)),
+                    },
+                )),
+            }
         } else {
             #[cfg(not(windows))]
             if node.downcast_ref::<CayenneAccelerationExec>().is_some() {
@@ -209,6 +281,61 @@ impl PhysicalExtensionCodec for SpicePhysicalCodec {
     fn try_decode_udf(&self, name: &str, _buf: &[u8]) -> Result<Arc<ScalarUDF>> {
         self.runtime()?.df.ctx.udf(name)
     }
+}
+
+/// Re-derives an Iceberg scan on this executor by replaying
+/// [`TableProvider::scan`] on the already-registered provider for `table_ref`.
+///
+/// The executor loaded the same app definition as the scheduler, so the Iceberg
+/// provider (an [`IcebergClusterTableProvider`], possibly behind registration
+/// wrappers) is already registered. Resolving it and re-calling `scan` with the
+/// same projection/filters/limit rebuilds an equivalent, identically bucketed
+/// scan — reusing the provider's catalog (no secrets cross the wire, no catalog
+/// rebuilt) and producing a fresh [`IcebergScanExec`].
+fn replan_registered_iceberg_scan(
+    runtime: &Arc<Runtime>,
+    table_ref: &TableReference,
+    projection: Option<&Vec<usize>>,
+    filters: &[Expr],
+    limit: Option<usize>,
+) -> Result<Arc<dyn ExecutionPlan>> {
+    // The codec API is synchronous but resolution/scan are async; this path runs
+    // only at plan-decode time on an executor, so blocking is acceptable.
+    let provider = tokio::task::block_in_place(|| {
+        tokio::runtime::Handle::current().block_on(runtime.df.get_table(table_ref))
+    })
+    .ok_or_else(|| {
+        DataFusionError::Execution(format!(
+            "Iceberg table {table_ref} is not registered on this executor; \
+             cannot reconstruct the distributed scan"
+        ))
+    })?;
+
+    // Peel the registration wrappers (FederatedTableProviderAdaptor,
+    // MetadataEnrichedTableProvider) down to the IcebergClusterTableProvider that
+    // dataset registration leaves in the catalog. The Spice `FederatedTable`
+    // holder is already resolved to its inner provider at registration time, so
+    // it is never the registered provider here.
+    let peeled = peel_table_provider_wrappers(&provider);
+    if peeled
+        .downcast_ref::<IcebergClusterTableProvider>()
+        .is_none()
+    {
+        return exec_err!(
+            "registered provider for {table_ref} is not an IcebergClusterTableProvider; \
+             distributed Iceberg scans require the Iceberg data connector"
+        );
+    }
+
+    let session_state = runtime.df.ctx.state();
+    tokio::task::block_in_place(|| {
+        tokio::runtime::Handle::current().block_on(peeled.scan(
+            &session_state,
+            projection,
+            filters,
+            limit,
+        ))
+    })
 }
 
 #[cfg(not(windows))]

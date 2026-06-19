@@ -298,7 +298,9 @@ fn is_dual_write_table_provider(table_provider: &Arc<dyn TableProvider>) -> bool
 /// `FederatedTableProviderAdaptor`, and datasets that declare table- or
 /// column-level metadata are wrapped in a `MetadataEnrichedTableProvider` by
 /// `register_accelerated_table`.
-fn peel_table_provider_wrappers(table_provider: &Arc<dyn TableProvider>) -> Arc<dyn TableProvider> {
+pub(crate) fn peel_table_provider_wrappers(
+    table_provider: &Arc<dyn TableProvider>,
+) -> Arc<dyn TableProvider> {
     let mut current = Arc::clone(table_provider);
     loop {
         if let Some(adaptor) = current.downcast_ref::<FederatedTableProviderAdaptor>() {
