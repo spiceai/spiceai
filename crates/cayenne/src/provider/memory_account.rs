@@ -20,8 +20,9 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use datafusion::execution::memory_pool::{MemoryConsumer, MemoryPool, MemoryReservation};
 use parking_lot::Mutex as ParkingMutex;
 
-/// Per-table accounting of Cayenne's off-pool resident state: the PK keyset and
-/// deletion indexes, against the `DataFusion` [`MemoryPool`] that
+/// Per-table accounting of Cayenne's long-lived resident state (outside query-
+/// operator reservations): the PK keyset and deletion indexes, registered
+/// against the `DataFusion` [`MemoryPool`] that
 /// `runtime.query.memory_limit` controls. Before this reservation, that state
 /// was invisible to the pool, so queries planned against the full budget while
 /// the process drifted toward OOM. With the state registered, the pool reflects

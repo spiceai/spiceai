@@ -346,6 +346,7 @@ pub struct DataFusionBuilder {
     prefer_hash_join: Option<bool>,
     temp_directory: Option<String>,
     accelerated_refresh_semaphore: Option<Arc<Semaphore>>,
+    query_admission_semaphore: Option<Arc<Semaphore>>,
     task_history_enabled: bool,
     caching: Option<Arc<Caching>>,
     spill_compression: Option<SpillCompression>,
@@ -405,6 +406,7 @@ impl DataFusionBuilder {
             prefer_hash_join: None,
             temp_directory: None,
             accelerated_refresh_semaphore: None,
+            query_admission_semaphore: None,
             task_history_enabled: true,
             caching: None,
             spill_compression: None,
@@ -485,6 +487,18 @@ impl DataFusionBuilder {
     ) -> Self {
         self.accelerated_refresh_semaphore =
             Some(Arc::new(Semaphore::new(max_parallel_accelerated_refreshes)));
+        self
+    }
+
+    /// Bound the number of concurrently-executing query plans — ordinary queries
+    /// plus DDL/DML and `EXECUTE` (not lightweight `PREPARE`/`DEALLOCATE`/`SET`) —
+    /// i.e. query admission control. `None` leaves the gate unbounded (the prior
+    /// behavior); `Some(n)` installs a semaphore of `n` permits (clamped to at
+    /// least 1).
+    #[must_use]
+    pub fn max_concurrent_queries(mut self, max_concurrent_queries: Option<usize>) -> Self {
+        self.query_admission_semaphore =
+            max_concurrent_queries.map(|n| Arc::new(Semaphore::new(n.max(1))));
         self
     }
 
@@ -990,6 +1004,7 @@ impl DataFusionBuilder {
             accelerated_tables: TokioRwLock::new(HashSet::new()),
             accelerator_engine_registry: self.accelerator_engine_registry,
             acceleration_refresh_semaphore: self.accelerated_refresh_semaphore,
+            query_admission_semaphore: self.query_admission_semaphore,
             task_history_enabled: self.task_history_enabled,
             temp_directory: self.temp_directory.clone(),
             cpu_runtime: OnceLock::new(),

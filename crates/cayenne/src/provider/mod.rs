@@ -37,8 +37,10 @@ limitations under the License.
 //! - [`table`]: `CayenneTableProvider` implementation — schema, deletion strategy,
 //!   listing-fence, snapshot state, post-write maintenance scheduler, and the
 //!   `DataFusion` `TableProvider` impl.
-//! - [`scan`]: `CayenneAccelerationExec` wrapper and round-robin repartitioning
-//!   used to fan unsorted writes across multiple writer partitions.
+//! - [`scan`]: `CayenneAccelerationExec` wrapper, round-robin repartitioning used to
+//!   fan unsorted writes across multiple writer partitions, dynamic-filter
+//!   gather/dedup, and `SnapshotScanRef` — the in-flight-scan ref-count guard that
+//!   pins a snapshot's Vortex files against GC for the read's lifetime.
 //! - [`vortex_format`]: `DeletionFilteringVortexFormat` wrapping
 //!   `vortex_datafusion::VortexFormat` to attach per-file position-based
 //!   deletion vectors and to gate decimal→float predicate pushdown.
