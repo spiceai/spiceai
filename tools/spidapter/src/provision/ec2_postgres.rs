@@ -227,6 +227,27 @@ echo 'max_replication_slots = 100' >> "$PG_CONF"
 sed -i '/^[[:space:]]*max_wal_senders/d' "$PG_CONF"
 echo 'max_wal_senders = 100' >> "$PG_CONF"
 
+# Memory tuning: use available RAM for caching hot pages.
+# shared_buffers = 25% of RAM; work_mem per-sort/hash op; effective_cache_size
+# as a planner hint. Values are sized for instances with >= 16 GB RAM (e.g. r5.xlarge).
+TOTAL_MEM_KB=$(grep MemTotal /proc/meminfo | awk '{{print $2}}')
+SHARED_BUFFERS_KB=$(( TOTAL_MEM_KB / 4 ))
+SHARED_BUFFERS_MB=$(( SHARED_BUFFERS_KB / 1024 ))
+EFFECTIVE_CACHE_KB=$(( TOTAL_MEM_KB * 3 / 4 ))
+EFFECTIVE_CACHE_MB=$(( EFFECTIVE_CACHE_KB / 1024 ))
+sed -i '/^[[:space:]]*shared_buffers/d' "$PG_CONF"
+echo "shared_buffers = ${{SHARED_BUFFERS_MB}}MB" >> "$PG_CONF"
+sed -i '/^[[:space:]]*work_mem/d' "$PG_CONF"
+echo 'work_mem = 256MB' >> "$PG_CONF"
+sed -i '/^[[:space:]]*effective_cache_size/d' "$PG_CONF"
+echo "effective_cache_size = ${{EFFECTIVE_CACHE_MB}}MB" >> "$PG_CONF"
+
+# Parallel query: allow planner to use multiple cores for large scans/joins.
+sed -i '/^[[:space:]]*max_parallel_workers_per_gather/d' "$PG_CONF"
+echo 'max_parallel_workers_per_gather = 4' >> "$PG_CONF"
+sed -i '/^[[:space:]]*max_parallel_workers/d' "$PG_CONF"
+echo 'max_parallel_workers = 8' >> "$PG_CONF"
+
 # Allow remote connections for all users and replication
 echo "host all             all        0.0.0.0/0 md5" >> "$PG_HBA"
 echo "host replication     all        0.0.0.0/0 md5" >> "$PG_HBA"

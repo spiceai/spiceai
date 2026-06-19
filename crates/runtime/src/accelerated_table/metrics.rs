@@ -171,6 +171,14 @@ pub(crate) static CDC_APPLY_BURST_ENVELOPES: LazyLock<Histogram<u64>> = LazyLock
         .build()
 });
 
+pub(crate) static CDC_APPLY_BURST_ROWS_TOTAL: LazyLock<Counter<u64>> = LazyLock::new(|| {
+    METER
+        .u64_counter("dataset_acceleration_cdc_apply_burst_rows_total")
+        .with_description("Number of rows in one coalesced CDC apply burst.")
+        .with_unit("rows")
+        .build()
+});
+
 pub(crate) static CDC_APPLY_FIXED_COST_MS: LazyLock<Histogram<f64>> = LazyLock::new(|| {
     METER
         .f64_histogram("dataset_acceleration_cdc_apply_fixed_cost_ms")

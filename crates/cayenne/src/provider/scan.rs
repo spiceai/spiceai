@@ -799,7 +799,6 @@ impl ExecutionPlan for CayenneAccelerationExec {
         self.inner.metrics()
     }
 
-
     //fn partition_statistics(&self, partition: Option<usize>) -> Result<Statistics> {
      //   let child_stats = self.inner.partition_statistics(partition)?;
         // The overlay is a per-table (global) aggregate: its min/max/NDV
