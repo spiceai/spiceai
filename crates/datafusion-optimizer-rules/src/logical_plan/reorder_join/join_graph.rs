@@ -1,19 +1,18 @@
-// Licensed to the Apache Software Foundation (ASF) under one
-// or more contributor license agreements.  See the NOTICE file
-// distributed with this work for additional information
-// regarding copyright ownership.  The ASF licenses this file
-// to you under the Apache License, Version 2.0 (the
-// "License"); you may not use this file except in compliance
-// with the License.  You may obtain a copy of the License at
-//
-//   http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing,
-// software distributed under the License is distributed on an
-// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
-// KIND, either express or implied.  See the License for the
-// specific language governing permissions and limitations
-// under the License.
+/*
+Copyright 2026 The Spice.ai OSS Authors
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+     https://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
 
 use std::sync::Arc;
 
@@ -23,8 +22,8 @@ use datafusion_common::{
 use datafusion_expr::{
     Expr, Filter, JoinType, LogicalPlan, Operator,
     utils::{
-        check_all_columns_from_schema, conjunction, disjunction, split_binary,
-        split_conjunction, split_conjunction_owned,
+        check_all_columns_from_schema, conjunction, disjunction, split_binary, split_conjunction,
+        split_conjunction_owned,
     },
 };
 
@@ -36,6 +35,7 @@ pub struct Node {
 }
 
 impl Node {
+    #[must_use]
     pub fn connections(&self) -> &[EdgeId] {
         &self.connections
     }
@@ -51,6 +51,7 @@ impl Node {
             .find(move |x| x.nodes.contains(&node_id))
     }
 
+    #[must_use]
     pub fn neighbours(&self, node_id: NodeId, join_graph: &JoinGraph) -> Vec<NodeId> {
         self.connections
             .iter()
@@ -63,21 +64,18 @@ impl Node {
 
 pub type EdgeId = usize;
 
-/// An edge connecting two nodes in the join graph.
+/// An edge connecting two nodes in the join graph, carrying the equi-join
+/// keys (`on`) between them.
 ///
-/// For symmetric edges (`join_type == JoinType::Inner`), the order of
-/// `nodes` carries no semantic meaning; either side may end up on the
-/// physical left or right after reordering.
+/// For symmetric (`Inner`) edges the order of `nodes` is not meaningful;
+/// either side may end up on the physical left or right after reordering.
 ///
-/// For asymmetric edges (`LeftSemi` / `LeftAnti`, established by
-/// `flatten_joins_recursive`), the order is load-bearing: `nodes[0]` is
-/// always the preserved (LHS) relation that contributes rows to the
-/// output, and `nodes[1]` is always the RHS blob that acts as a filter.
-/// `RightSemi` / `RightAnti` joins are normalized to the `Left` variants
-/// at extraction time so the optimizer interior only ever sees this
-/// orientation. The reconstruction code in
-/// `left_deep_join_plan::into_logical_plan` relies on this invariant to
-/// orient the rebuilt `Join` correctly.
+/// For asymmetric (`LeftSemi` / `LeftAnti`) edges the order is load-bearing:
+/// `nodes[0]` is the preserved (LHS) relation that contributes output rows,
+/// `nodes[1]` is the RHS blob acting as a filter. `RightSemi` / `RightAnti`
+/// joins are normalized to the `Left` variants at extraction time, so the
+/// interior only ever sees this orientation; `into_logical_plan` relies on it
+/// to orient the rebuilt `Join`.
 pub struct Edge {
     pub nodes: [NodeId; 2],
     pub on: Vec<(Expr, Expr)>,
@@ -95,6 +93,13 @@ pub struct JoinGraph {
 }
 
 impl JoinGraph {
+    /// Builds the join graph (plus the wrapper operators stripped from above the
+    /// join subtree) from a logical plan.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the plan contains no join, or if a join predicate
+    /// cannot be mapped onto exactly two relations during flattening.
     pub fn try_from_logical_plan(
         value: LogicalPlan,
     ) -> Result<(JoinGraph, Vec<LogicalPlan>), DataFusionError> {
@@ -104,33 +109,107 @@ impl JoinGraph {
         // Now convert only the join subtree to a query graph
         let mut join_graph = JoinGraph::new();
         flatten_joins_recursive(join_subtree, &mut join_graph)?;
-        // DEBUG (REORDER_DBG): dump the flattened join graph (node count +
-        // each node's head plan + edge degree). The key signal: a fragmented
-        // 2-node graph means the rule ran AFTER projection insertion (set
-        // REORDER_EARLY=1 in the harness to inject it before). See
-        // `reorder_join/PROGRESS.md`.
-        if std::env::var("REORDER_DBG").is_ok() {
-            let nnodes = join_graph.nodes().count();
-            eprintln!(
-                "[graph] nodes={} filters={}",
-                nnodes,
-                join_graph.filters.len()
-            );
-            for (id, n) in join_graph.nodes() {
-                let head = format!("{}", n.plan);
-                let head = head.lines().next().unwrap_or("");
-                eprintln!("[graph]   node {id}: {head} (conns={})", n.connections.len());
-            }
-        }
         join_graph.derive_implied_single_table_filters();
         // Re-anchor degree-1 inner-join pendants onto the smallest relation in
-        // their equi-join equivalence class (e.g. chbench q9's `item`, off the
-        // 30M `order_line` and onto `stock`). Sound by construction: the
-        // original equality is retained as a redundant side-channel filter, so
-        // only the join *order* changes, never the result. Controlled overall
-        // by the `join_reorder` rule gate.
+        // their equi-join equivalence class (e.g. a small dimension joined only
+        // to a large fact). Sound by construction: the original equality is kept
+        // as a redundant side-channel filter, so only the join *order* changes,
+        // never the result.
         join_graph.rewire_pendants_to_selective_equivalent();
+        join_graph.trace_state();
         Ok((join_graph, wrappers))
+    }
+
+    /// Emit the final graph state for troubleshooting: a one-line `debug`
+    /// summary, plus per-node / per-edge / per-residual-filter detail at
+    /// `trace`. A fragmented 2-node graph here means the rule ran after
+    /// projection insertion fragmented the join tree; a connected N-node graph
+    /// is what the enumerator reorders.
+    ///
+    /// Enable with
+    /// `RUST_LOG=datafusion_optimizer_rules::logical_plan::reorder_join=trace`.
+    fn trace_state(&self) {
+        tracing::debug!(
+            nodes = self.nodes.iter().count(),
+            edges = self.edges.iter().count(),
+            filters = self.filters.len(),
+            "join graph built"
+        );
+        // Guard the per-element detail so the `format!`/iteration cost is only
+        // paid when `trace` is actually enabled.
+        if tracing::enabled!(tracing::Level::TRACE) {
+            use std::fmt::Write;
+
+            // One multi-line block rather than an event per element: the whole
+            // graph reads as a single unit when troubleshooting a reorder. Each
+            // edge renders its equi-keys themselves (e.g. `a.x = b.y`), which
+            // also reveal — via the column qualifiers — which relations it links.
+            let mut dump = String::from("join graph:");
+            for (id, node) in self.nodes() {
+                let _ = write!(
+                    dump,
+                    "\n  node[{id}] conns={} {}",
+                    node.connections.len(),
+                    plan_head(&node.plan)
+                );
+            }
+            for (eid, edge) in self.edges.iter() {
+                let keys = edge
+                    .on
+                    .iter()
+                    .map(|(l, r)| format!("{l} = {r}"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let _ = write!(
+                    dump,
+                    "\n  edge[{eid}] {:?} {:?} {keys}",
+                    edge.nodes, edge.join_type
+                );
+            }
+            for (i, f) in self.filters.iter().enumerate() {
+                let _ = write!(dump, "\n  filter[{i}] {f}");
+            }
+            tracing::trace!("{dump}");
+        }
+    }
+
+    /// Emit the cost-model inputs that drive enumeration: per-node estimated
+    /// row count and per-edge selectivity. Complements `trace_state` (which
+    /// dumps the graph *shape*) — together they explain *why* a given root won.
+    /// A node with implausible rows, or an edge with selectivity `1.0` (the
+    /// no-NDV fallback, e.g. a computed `mod`/`ascii` key whose distinct count
+    /// is unknown), is the usual cause of a surprising join order. `<n/a>` means
+    /// statistics were unavailable, so the cost model used its fallback.
+    ///
+    /// Takes the estimator (held by the enumerator, not the graph), so it is
+    /// called from `query_graph_to_optimal_left_deep_join_plan`, not here.
+    pub(crate) fn trace_costs(&self, estimator: &dyn super::cost::JoinCostEstimator) {
+        use std::fmt::Write;
+        if !tracing::enabled!(tracing::Level::TRACE) {
+            return;
+        }
+        let fmt = |v: Option<f64>| match v {
+            Some(n) => format!("{n:.1}"),
+            None => "<n/a>".to_string(),
+        };
+        let mut dump = String::from("join graph costs:");
+        for (id, node) in self.nodes() {
+            let _ = write!(
+                dump,
+                "\n  node[{id}] rows={} {}",
+                fmt(estimator.cardinality(&node.plan, None)),
+                plan_head(&node.plan)
+            );
+        }
+        for (eid, edge) in self.edges.iter() {
+            let (Some(a), Some(b)) = (self.get_node(edge.nodes[0]), self.get_node(edge.nodes[1]))
+            else {
+                continue;
+            };
+            let sel = estimator.selectivity(edge, &a.plan, &b.plan);
+            let _ = write!(dump, "\n  edge[{eid}] {:?} sel={sel:.6}", edge.nodes);
+        }
+        tracing::trace!("{dump}");
     }
 
     pub(crate) fn new() -> Self {
@@ -140,6 +219,7 @@ impl JoinGraph {
             filters: Vec::new(),
         }
     }
+    #[must_use]
     pub fn filters(&self) -> &[Expr] {
         &self.filters
     }
@@ -253,12 +333,11 @@ impl JoinGraph {
     /// exists.
     fn find_edge_between(&self, a: NodeId, b: NodeId) -> Option<EdgeId> {
         let node_a = self.nodes.get(a)?;
-        node_a.connections.iter().copied().find(|&eid| {
-            self.edges
-                .get(eid)
-                .map(|e| e.nodes.contains(&b))
-                .unwrap_or(false)
-        })
+        node_a
+            .connections
+            .iter()
+            .copied()
+            .find(|&eid| self.edges.get(eid).is_some_and(|e| e.nodes.contains(&b)))
     }
 
     /// Appends `pairs` to the given edge's `on` list.
@@ -342,16 +421,6 @@ impl JoinGraph {
     pub(crate) fn derive_implied_single_table_filters(&mut self) {
         use std::collections::HashMap;
 
-        // DEBUG (REORDER_DBG): list the side-channel filters this pass
-        // inspects. Only top-level ORs with >=2 disjuncts can yield an implied
-        // single-table predicate. See `reorder_join/PROGRESS.md`.
-        if std::env::var("REORDER_DBG").is_ok() {
-            eprintln!("[derive] #filters={}", self.filters.len());
-            for (i, f) in self.filters.iter().enumerate() {
-                eprintln!("[derive] filter[{i}] = {f}");
-            }
-        }
-
         // node_id -> predicates to AND onto that node's plan.
         let mut derived: HashMap<NodeId, Vec<Expr>> = HashMap::new();
 
@@ -366,8 +435,7 @@ impl JoinGraph {
 
             for (node_id, node) in self.nodes() {
                 let schema = node.plan.schema();
-                let mut node_disjuncts: Vec<Expr> =
-                    Vec::with_capacity(per_disjunct_conjs.len());
+                let mut node_disjuncts: Vec<Expr> = Vec::with_capacity(per_disjunct_conjs.len());
                 let mut all_disjuncts_contribute = true;
 
                 for conjs in &per_disjunct_conjs {
@@ -376,11 +444,8 @@ impl JoinGraph {
                         .filter(|c| {
                             let cols = c.column_refs();
                             !cols.is_empty()
-                                && check_all_columns_from_schema(
-                                    &cols,
-                                    schema.as_ref(),
-                                )
-                                .unwrap_or(false)
+                                && check_all_columns_from_schema(&cols, schema.as_ref())
+                                    .unwrap_or(false)
                         })
                         .map(|c| (*c).clone())
                         .collect();
@@ -408,9 +473,11 @@ impl JoinGraph {
         for (node_id, preds) in derived {
             if let Some(node) = self.nodes.get_mut(node_id) {
                 for pred in preds {
-                    if std::env::var("REORDER_DBG").is_ok() {
-                        eprintln!("[derive] node {node_id} <- {pred}");
-                    }
+                    tracing::debug!(
+                        node = node_id,
+                        predicate = %pred,
+                        "derived implied single-table filter (shrinks the dimension's estimated cardinality)"
+                    );
                     let input = Arc::clone(&node.plan);
                     if let Ok(filter) = Filter::try_new(pred, input) {
                         node.plan = Arc::new(LogicalPlan::Filter(filter));
@@ -423,18 +490,15 @@ impl JoinGraph {
     /// Re-anchors degree-1 inner-join pendants onto a smaller relation that
     /// shares the pendant's join key via the transitive equivalence class.
     ///
-    /// Prototype, gated on the `REORDER_DERIVE_EDGES` env var.
-    ///
-    /// Motivation (chbench q9): `item` connects only via `ol_i_id = i_id`
-    /// to the 30M fact `order_line`. In a left-deep plan a pendant must
-    /// immediately follow its neighbour, so this forces the fact early.
-    /// Because `ol_i_id = s_i_id` also holds, the equivalence class of the
-    /// key is `{ol_i_id, s_i_id, i_id}`; `stock` (owning `s_i_id`) is far
-    /// smaller than `order_line`. We rewire `item`'s edge to
-    /// `i_id = s_i_id` (anchoring on `stock`) and demote the original
-    /// equality to a hoisted safety filter. Removing a pendant's only edge
-    /// isolates it, then re-attaching it as a leaf of another tree node
-    /// keeps the graph acyclic.
+    /// A left-deep plan must place a pendant immediately after its only
+    /// neighbour, so a small dimension joined solely to a large fact would force
+    /// that fact early. When the key's equivalence class (derived transitively
+    /// from the other equi-edges) also covers a smaller relation, we rewire the
+    /// pendant's edge onto that relation and demote the original equality to a
+    /// hoisted safety filter. The result is unchanged — the new edge plus the
+    /// existing key edges imply the original equality transitively — so only the
+    /// join order changes. Removing a pendant's single edge isolates it before
+    /// re-attaching, keeping the graph acyclic.
     pub(crate) fn rewire_pendants_to_selective_equivalent(&mut self) {
         struct Rewire {
             old_edge: EdgeId,
@@ -461,8 +525,7 @@ impl JoinGraph {
             if edge.join_type != JoinType::Inner || edge.on.len() != 1 {
                 continue;
             }
-            let (Expr::Column(lc), Expr::Column(rc)) = (&edge.on[0].0, &edge.on[0].1)
-            else {
+            let (Expr::Column(lc), Expr::Column(rc)) = (&edge.on[0].0, &edge.on[0].1) else {
                 continue;
             };
             let pendant_schema = node.plan.schema();
@@ -473,16 +536,13 @@ impl JoinGraph {
             } else {
                 continue;
             };
-            let Some(neighbour) =
-                edge.nodes.iter().copied().find(|&n| n != node_id)
-            else {
+            let Some(neighbour) = edge.nodes.iter().copied().find(|&n| n != node_id) else {
                 continue;
             };
             let Some(neighbour_node) = self.get_node(neighbour) else {
                 continue;
             };
-            let Ok(neighbour_card) =
-                super::cost::estimate_cardinality(&neighbour_node.plan, None)
+            let Ok(neighbour_card) = super::cost::estimate_cardinality(&neighbour_node.plan, None)
             else {
                 continue;
             };
@@ -498,9 +558,8 @@ impl JoinGraph {
                 let schema = cand.plan.schema();
                 for cc in &class {
                     if column_in_schema(cc, schema) {
-                        if let Ok(card) =
-                            super::cost::estimate_cardinality(&cand.plan, None)
-                            && best.as_ref().map(|(_, _, b)| card < *b).unwrap_or(true)
+                        if let Ok(card) = super::cost::estimate_cardinality(&cand.plan, None)
+                            && best.as_ref().is_none_or(|(_, _, b)| card < *b)
                         {
                             best = Some((cand_id, cc.clone(), card));
                         }
@@ -530,8 +589,7 @@ impl JoinGraph {
             // Keep the original equality as a redundant safety filter; the
             // new edge plus the existing key edges imply it transitively.
             self.add_filter(
-                Expr::Column(a.col_pendant.clone())
-                    .eq(Expr::Column(a.col_old.clone())),
+                Expr::Column(a.col_pendant.clone()).eq(Expr::Column(a.col_old.clone())),
             );
             self.add_edge(
                 a.pendant,
@@ -542,6 +600,13 @@ impl JoinGraph {
             );
         }
     }
+}
+
+/// The first line of a plan's display (its root operator), for trace labels —
+/// e.g. `TableScan: order_line …` or `Aggregate: …`. Only call under a level
+/// guard: it renders the plan to a string.
+pub(super) fn plan_head(plan: &LogicalPlan) -> String {
+    plan.to_string().lines().next().unwrap_or("").to_string()
 }
 
 /// Returns true if `col` resolves within `schema`.
@@ -586,16 +651,14 @@ fn transitive_class(pairs: &[(Column, Column)], seed: &Column) -> Vec<Column> {
 ///
 /// # Returns
 ///
-/// Returns a tuple of (join_subtree, wrapper_operators) where:
+/// Returns a tuple of (`join_subtree`, `wrapper_operators`) where:
 /// - `join_subtree` is the topmost join and all joins beneath it
 /// - `wrapper_operators` is a vector of non-join operators above the joins, in order from root to join
 ///
 /// # Errors
 ///
 /// Returns an error if the plan doesn't contain any joins.
-pub(crate) fn extract_join_subtree(
-    plan: LogicalPlan,
-) -> Result<(LogicalPlan, Vec<LogicalPlan>)> {
+pub(crate) fn extract_join_subtree(plan: LogicalPlan) -> Result<(LogicalPlan, Vec<LogicalPlan>)> {
     let mut wrappers = Vec::new();
     let mut current = plan;
     let original_display = current.display().to_string();
@@ -614,10 +677,7 @@ pub(crate) fn extract_join_subtree(
             other => {
                 let inputs = other.inputs();
                 if inputs.is_empty() {
-                    return plan_err!(
-                        "Plan does not contain any join nodes: {}",
-                        original_display
-                    );
+                    return plan_err!("Plan does not contain any join nodes: {}", original_display);
                 }
                 if inputs.len() != 1 {
                     return plan_err!(
@@ -653,10 +713,7 @@ pub(crate) fn extract_join_subtree(
 /// # Errors
 ///
 /// Returns an error if reconstructing any wrapper operator fails.
-pub fn reconstruct_plan(
-    join_plan: LogicalPlan,
-    wrappers: Vec<LogicalPlan>,
-) -> Result<LogicalPlan> {
+pub fn reconstruct_plan(join_plan: LogicalPlan, wrappers: Vec<LogicalPlan>) -> Result<LogicalPlan> {
     let mut current = join_plan;
 
     // Apply wrappers in reverse order (from innermost to outermost)
@@ -683,14 +740,8 @@ fn flatten_joins_recursive(plan: LogicalPlan, join_graph: &mut JoinGraph) -> Res
                 }
             }
 
-            flatten_joins_recursive(
-                Arc::unwrap_or_clone(Arc::clone(&join.left)),
-                join_graph,
-            )?;
-            flatten_joins_recursive(
-                Arc::unwrap_or_clone(Arc::clone(&join.right)),
-                join_graph,
-            )?;
+            flatten_joins_recursive(Arc::unwrap_or_clone(Arc::clone(&join.left)), join_graph)?;
+            flatten_joins_recursive(Arc::unwrap_or_clone(Arc::clone(&join.right)), join_graph)?;
 
             // Group each equi-pair by which two nodes it connects. A
             // single `Join.on` can mix pairs that span different node-
@@ -700,9 +751,10 @@ fn flatten_joins_recursive(plan: LogicalPlan, join_graph: &mut JoinGraph) -> Res
             // missing from their endpoints' schemas, and the resulting
             // multi-edge structure forms a cycle that IK84 can't
             // process.
-            use std::collections::HashMap;
-            let mut pairs_by_node_pair: HashMap<(NodeId, NodeId), Vec<(Expr, Expr)>> =
-                HashMap::new();
+            let mut pairs_by_node_pair: std::collections::HashMap<
+                (NodeId, NodeId),
+                Vec<(Expr, Expr)>,
+            > = std::collections::HashMap::new();
             let mut insertion_order: Vec<(NodeId, NodeId)> = Vec::new();
 
             for (left_key, right_key) in &join.on {
@@ -716,11 +768,9 @@ fn flatten_joins_recursive(plan: LogicalPlan, join_graph: &mut JoinGraph) -> Res
                         let has_left =
                             check_all_columns_from_schema(&left_columns, schema.as_ref())
                                 .unwrap_or(false);
-                        let has_right = check_all_columns_from_schema(
-                            &right_columns,
-                            schema.as_ref(),
-                        )
-                        .unwrap_or(false);
+                        let has_right =
+                            check_all_columns_from_schema(&right_columns, schema.as_ref())
+                                .unwrap_or(false);
                         if (has_left && !has_right) || (!has_left && has_right) {
                             Some(node_id)
                         } else {
@@ -739,7 +789,7 @@ fn flatten_joins_recursive(plan: LogicalPlan, join_graph: &mut JoinGraph) -> Res
                 }
 
                 let mut endpoints = [matching_nodes[0], matching_nodes[1]];
-                endpoints.sort();
+                endpoints.sort_unstable();
                 let key = (endpoints[0], endpoints[1]);
                 if !pairs_by_node_pair.contains_key(&key) {
                     insertion_order.push(key);
@@ -751,14 +801,16 @@ fn flatten_joins_recursive(plan: LogicalPlan, join_graph: &mut JoinGraph) -> Res
             }
 
             for (node_a, node_b) in insertion_order {
-                let pairs = pairs_by_node_pair.remove(&(node_a, node_b)).unwrap();
+                // `insertion_order` only holds keys inserted into the map above,
+                // so the entry is always present.
+                let Some(pairs) = pairs_by_node_pair.remove(&(node_a, node_b)) else {
+                    continue;
+                };
 
                 // If a prior recursive call already connected these two
                 // nodes by an edge, merge our pairs into it instead of
                 // adding a parallel edge.
-                if let Some(existing_edge_id) =
-                    join_graph.find_edge_between(node_a, node_b)
-                {
+                if let Some(existing_edge_id) = join_graph.find_edge_between(node_a, node_b) {
                     join_graph.extend_edge_on(existing_edge_id, pairs);
                     continue;
                 }
@@ -774,50 +826,33 @@ fn flatten_joins_recursive(plan: LogicalPlan, join_graph: &mut JoinGraph) -> Res
                     continue;
                 }
 
-                join_graph.add_edge(
-                    node_a,
-                    node_b,
-                    pairs,
-                    join.join_type,
-                    join.null_equality,
-                );
+                join_graph.add_edge(node_a, node_b, pairs, join.join_type, join.null_equality);
             }
 
             Ok(())
         }
-        // Semi/anti joins (Left and Right variants) decompose
-        // asymmetrically: the preserved side participates in reordering
-        // normally, while the filtering side becomes one opaque blob.
-        // The semi/anti edge then connects the LHS node that owns the
-        // join key(s) to the blob. This mirrors DuckDB's relation_manager
-        // logic at relation_manager.cpp:334-346.
+        // Semi/anti joins (Left and Right variants) decompose asymmetrically:
+        // the preserved side participates in reordering normally, while the
+        // filtering side becomes one opaque blob. The semi/anti edge connects
+        // the LHS node that owns the join key(s) to that blob. (Same shape as
+        // DuckDB's relation manager.)
         //
-        // Right{Semi,Anti} are normalized to Left{Semi,Anti} here by
-        // flipping the join's children and on-keys.
-        //
-        // If the LHS key(s) span more than one already-extracted sub-
-        // relation (multi-LHS semi), the resulting join graph would be
-        // cyclic and IK84 cannot handle it. We fall back to opaque in
-        // that case.
+        // Right{Semi,Anti} are normalized to Left{Semi,Anti} by flipping the
+        // join's children and on-keys. If the LHS key(s) span more than one
+        // already-extracted sub-relation, the graph would be cyclic and IK84
+        // cannot handle it, so we fall back to opaque.
         LogicalPlan::Join(join)
             if matches!(
                 join.join_type,
-                JoinType::LeftSemi
-                    | JoinType::LeftAnti
-                    | JoinType::RightSemi
-                    | JoinType::RightAnti
+                JoinType::LeftSemi | JoinType::LeftAnti | JoinType::RightSemi | JoinType::RightAnti
             ) =>
         {
-            // The join-graph `Edge` carries only equi-keys (`on`), not a join
-            // `filter`. A semi/anti join with a correlation filter — e.g. q21's
-            // `NOT EXISTS (… AND l2.ol_delivery_d > l1.ol_delivery_d)` — cannot
-            // be represented as an edge without dropping that filter and
-            // corrupting the plan (the inner predicates collapse into a
-            // side-channel `Filter` over a single relation, referencing columns
-            // that no longer resolve). Treat such a join as opaque (one node,
-            // left un-reordered) so the query stays correct. q21's cost is the
-            // anti-join build side (a cardinality concern), not inner-join
-            // ordering, so we lose little by not reordering through it.
+            // An `Edge` carries only equi-keys (`on`), not a join `filter`. A
+            // semi/anti join with a correlation filter (e.g. a `NOT EXISTS` with
+            // an inequality between the inner and outer rows) cannot be an edge
+            // without dropping that filter and corrupting the plan, so treat it
+            // as opaque (one un-reordered node). Such joins cost their build
+            // side, not inner-join ordering, so little is lost.
             if join.filter.is_some() {
                 join_graph.add_node(Arc::new(LogicalPlan::Join(join)));
                 return Ok(());
@@ -876,12 +911,9 @@ fn flatten_joins_recursive(plan: LogicalPlan, join_graph: &mut JoinGraph) -> Res
                     .nodes()
                     .filter(|(id, _)| *id != blob_id)
                     .filter_map(|(id, node)| {
-                        check_all_columns_from_schema(
-                            &lhs_cols,
-                            node.plan.schema().as_ref(),
-                        )
-                        .unwrap_or(false)
-                        .then_some(id)
+                        check_all_columns_from_schema(&lhs_cols, node.plan.schema().as_ref())
+                            .unwrap_or(false)
+                            .then_some(id)
                     })
                     .collect();
                 if owners.len() != 1 {
@@ -905,19 +937,11 @@ fn flatten_joins_recursive(plan: LogicalPlan, join_graph: &mut JoinGraph) -> Res
                 }
             }
             let lhs_owner = lhs_owner.ok_or_else(|| {
-                plan_datafusion_err!(
-                    "Semi/anti join has no equi-keys; cannot determine LHS owner"
-                )
+                plan_datafusion_err!("Semi/anti join has no equi-keys; cannot determine LHS owner")
             })?;
 
             // Convention: nodes[0] = LHS owner, nodes[1] = blob.
-            join_graph.add_edge(
-                lhs_owner,
-                blob_id,
-                on,
-                semi_join_type,
-                join.null_equality,
-            );
+            join_graph.add_edge(lhs_owner, blob_id, on, semi_join_type, join.null_equality);
             Ok(())
         }
         // Other non-inner joins (Left/Right/Full/Mark) are not freely
@@ -990,4 +1014,3 @@ impl<V> VecMap<V> {
             .filter_map(|(idx, slot)| slot.as_ref().map(|v| (idx, v)))
     }
 }
-

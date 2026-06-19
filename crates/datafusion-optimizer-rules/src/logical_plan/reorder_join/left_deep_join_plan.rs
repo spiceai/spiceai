@@ -1,21 +1,24 @@
-// Licensed to the Apache Software Foundation (ASF) under one
-// or more contributor license agreements.  See the NOTICE file
-// distributed with this work for additional information
-// regarding copyright ownership.  The ASF licenses this file
-// to you under the Apache License, Version 2.0 (the
-// "License"); you may not use this file except in compliance
-// with the License.  You may obtain a copy of the License at
-//
-//   http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing,
-// software distributed under the License is distributed on an
-// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
-// KIND, either express or implied.  See the License for the
-// specific language governing permissions and limitations
-// under the License.
+/*
+Copyright 2026 The Spice.ai OSS Authors
 
-use std::{collections::HashSet, fmt::Debug, sync::Arc};
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+     https://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+use std::{
+    collections::HashSet,
+    fmt::{Debug, Write},
+    sync::Arc,
+};
 
 use datafusion_common::{Result, plan_datafusion_err, plan_err, tree_node::TreeNode};
 use datafusion_expr::{
@@ -24,7 +27,7 @@ use datafusion_expr::{
 
 use super::{
     cost::JoinCostEstimator,
-    join_graph::{JoinGraph, NodeId},
+    join_graph::{JoinGraph, NodeId, plan_head},
 };
 
 /// Generates an optimized left-deep join plan from a logical plan using the Ibaraki-Kameda algorithm.
@@ -73,6 +76,11 @@ use super::{
 /// - Wrapper operators (filters, sorts, etc.) in their original positions
 /// - Joins reordered to minimize estimated execution cost
 /// - Join semantics preserved (same result set as input plan)
+///
+/// # Errors
+///
+/// Returns an error if graph construction, enumeration, or plan reconstruction
+/// fails (e.g. a join predicate that cannot be mapped onto the graph).
 pub fn optimal_left_deep_join_plan(
     plan: LogicalPlan,
     cost_estimator: &dyn JoinCostEstimator,
@@ -99,10 +107,7 @@ pub fn optimal_left_deep_join_plan(
     // (hoisted `Join.filter`, between-join `Filter` nodes, cycle-broken edges,
     // the pendant-rewire safety filter), so the same conjunct can be collected
     // more than once. We also skip any conjunct already carried by a wrapper
-    // `Filter`, since `reconstruct_plan` re-applies the wrappers on top —
-    // applying it from both sides produces a redundant `p AND p` (observed as
-    // `c_state LIKE 'A%' AND c_state LIKE 'A%'` on chbench q3), which bloats the
-    // plan and skews the cost model's selectivity estimate for that relation.
+    // `Filter`, since `reconstruct_plan` re-applies the wrappers on top.
     let mut seen: HashSet<Expr> = wrappers
         .iter()
         .filter_map(|w| match w {
@@ -144,11 +149,26 @@ pub fn optimal_left_deep_join_plan(
 /// 2. **Normalization**: Transform the tree into a chain structure ordered by rank
 /// 3. **Denormalization**: Split merged operations back into individual nodes while maintaining chain structure
 /// 4. **Cost Comparison**: Compare the resulting plan's cost against the current best
+///
+/// # Errors
+///
+/// Returns an error if no valid precedence graph can be built, or if precedence
+/// tree denormalization or reconstruction fails.
 pub fn query_graph_to_optimal_left_deep_join_plan(
     query_graph: &JoinGraph,
     cost_estimator: &dyn JoinCostEstimator,
 ) -> Result<LogicalPlan> {
+    // The cost-model inputs (per-node rows, per-edge selectivity) behind the
+    // per-root costs traced below — a no-op unless trace is enabled.
+    query_graph.trace_costs(cost_estimator);
+
     let mut best_graph: Option<PrecedenceTreeNode> = None;
+
+    // Per-candidate-root IK84 cost + chain head, accumulated into one block so all roots
+    // read together — shows which root the enumerator considered and why one wins.
+    // `None` unless trace is enabled, so it's free when off.
+    let mut root_dump =
+        tracing::enabled!(tracing::Level::TRACE).then(|| String::from("candidate root costs:"));
 
     for (node_id, _) in query_graph.nodes() {
         let mut precedence_graph =
@@ -156,19 +176,14 @@ pub fn query_graph_to_optimal_left_deep_join_plan(
         precedence_graph.normalize();
         precedence_graph.denormalize()?;
 
-        // DEBUG (REORDER_DBG): per-root total IK84 cost + chain head. Lets us
-        // see which candidate root the enumerator picks and why. See
-        // `reorder_join/PROGRESS.md`.
-        if std::env::var("REORDER_DBG").is_ok() {
+        if let Some(dump) = root_dump.as_mut() {
             let head = precedence_graph.query_nodes[0].node_id;
-            let head_name = query_graph
-                .get_node(head)
-                .map(|n| format!("{}", n.plan))
-                .unwrap_or_default();
-            let head_name = head_name.lines().next().unwrap_or("").to_string();
-            eprintln!(
-                "[root] id={node_id} cost={:?} head={head} ({head_name})",
-                precedence_graph.cost()
+            let head_name = query_graph.get_node(head).map(|n| plan_head(&n.plan));
+            let _ = write!(
+                dump,
+                "\n  root[{node_id}] cost={:?} chain_head={head} {}",
+                precedence_graph.cost(),
+                head_name.as_deref().unwrap_or("")
             );
         }
 
@@ -185,9 +200,24 @@ pub fn query_graph_to_optimal_left_deep_join_plan(
         };
     }
 
-    best_graph
-        .ok_or_else(|| plan_datafusion_err!("No valid precedence graph found"))?
-        .into_logical_plan(query_graph)
+    if let Some(dump) = root_dump {
+        tracing::trace!("{dump}");
+    }
+
+    let best = best_graph.ok_or_else(|| plan_datafusion_err!("No valid precedence graph found"))?;
+    // High-signal summary: the winning root + its cost. This is the join the
+    // reorder seeds the left-deep chain from. `debug`, one line per reorder.
+    if tracing::enabled!(tracing::Level::DEBUG) {
+        let head = best.query_nodes[0].node_id;
+        let head_name = query_graph.get_node(head).map(|n| plan_head(&n.plan));
+        tracing::debug!(
+            chain_head = head,
+            cost = ?best.cost(),
+            plan = head_name.as_deref().unwrap_or(""),
+            "selected join order (lowest-cost root)"
+        );
+    }
+    best.into_logical_plan(query_graph)
 }
 
 #[derive(Debug)]
@@ -238,13 +268,7 @@ impl<'graph> PrecedenceTreeNode<'graph> {
     ) -> Result<Self> {
         let mut remaining: HashSet<NodeId> = graph.nodes().map(|(x, _)| x).collect();
         remaining.remove(&root_id);
-        PrecedenceTreeNode::from_query_node(
-            root_id,
-            None,
-            graph,
-            &mut remaining,
-            cost_estimator,
-        )
+        PrecedenceTreeNode::from_query_node(root_id, None, graph, &mut remaining, cost_estimator)
     }
 
     /// Recursively constructs a precedence tree node from a query graph node.
@@ -290,8 +314,7 @@ impl<'graph> PrecedenceTreeNode<'graph> {
                     | JoinType::RightSemi
                     | JoinType::RightAnti => {
                         let blob_plan = &query_graph.get_node(edge.nodes[1])?.plan;
-                        let blob_card =
-                            cost_estimator.cardinality(blob_plan, None).unwrap_or(1.0);
+                        let blob_card = cost_estimator.cardinality(blob_plan, None).unwrap_or(1.0);
                         (sel, blob_card)
                     }
                     _ => {
@@ -310,14 +333,10 @@ impl<'graph> PrecedenceTreeNode<'graph> {
             })
             .collect::<Result<Vec<_>>>()?;
 
-        let (t_value, c_value) = match incoming {
-            Some(tc) => tc,
-            None => {
-                let root_card =
-                    cost_estimator.cardinality(&node.plan, None).unwrap_or(1.0);
-                (root_card, 0.0)
-            }
-        };
+        let (t_value, c_value) = incoming.unwrap_or_else(|| {
+            let root_card = cost_estimator.cardinality(&node.plan, None).unwrap_or(1.0);
+            (root_card, 0.0)
+        });
 
         Ok(PrecedenceTreeNode {
             query_nodes: vec![QueryNode {
@@ -330,7 +349,7 @@ impl<'graph> PrecedenceTreeNode<'graph> {
         })
     }
 
-    /// Rank function according to IbarakiKameda84
+    /// Rank function according to `IbarakiKameda84`
     fn rank(&self) -> f64 {
         let (cardinality, cost) =
             self.query_nodes
@@ -353,7 +372,10 @@ impl<'graph> PrecedenceTreeNode<'graph> {
             0 => (),
             1 => {
                 if self.children[0].rank() < self.rank() {
-                    let mut child = self.children.pop().unwrap();
+                    // `len == 1`, so `pop` is always `Some`.
+                    let Some(mut child) = self.children.pop() else {
+                        return;
+                    };
                     self.query_nodes.append(&mut child.query_nodes);
                     self.children = child.children;
                     self.normalize();
@@ -365,10 +387,13 @@ impl<'graph> PrecedenceTreeNode<'graph> {
                 for child in &mut self.children {
                     child.normalize();
                 }
-                let child = std::mem::take(&mut self.children)
+                // `len >= 2`, so the reduction is always `Some`.
+                let Some(child) = std::mem::take(&mut self.children)
                     .into_iter()
                     .reduce(Self::merge)
-                    .unwrap();
+                else {
+                    return;
+                };
                 self.children = vec![child];
             }
         }
@@ -383,8 +408,8 @@ impl<'graph> PrecedenceTreeNode<'graph> {
         };
         if first.children.is_empty() {
             first.children = vec![second];
-        } else {
-            first.children = vec![first.children.pop().unwrap().merge(second)];
+        } else if let Some(last) = first.children.pop() {
+            first.children = vec![last.merge(second)];
         }
         first
     }
@@ -399,13 +424,20 @@ impl<'graph> PrecedenceTreeNode<'graph> {
 
         while self.query_nodes.len() > 1 {
             if self.children.is_empty() {
-                let highest_rank_idx = self
+                // `query_nodes.len() > 1` (loop guard), so `max_by` is `Some`.
+                let Some(highest_rank_idx) = self
                     .query_nodes
                     .iter()
                     .enumerate()
-                    .max_by(|(_, a), (_, b)| a.rank().partial_cmp(&b.rank()).unwrap())
+                    .max_by(|(_, a), (_, b)| {
+                        a.rank()
+                            .partial_cmp(&b.rank())
+                            .unwrap_or(std::cmp::Ordering::Equal)
+                    })
                     .map(|(idx, _)| idx)
-                    .unwrap();
+                else {
+                    break;
+                };
 
                 let node = self.query_nodes.remove(highest_rank_idx);
 
@@ -416,7 +448,9 @@ impl<'graph> PrecedenceTreeNode<'graph> {
                 });
             } else {
                 let child_id = self.children[0].query_nodes[0].node_id;
-                let child_node = self.query_graph.get_node(child_id).unwrap();
+                let Some(child_node) = self.query_graph.get_node(child_id) else {
+                    break;
+                };
                 let neighbours = child_node.neighbours(child_id, self.query_graph);
 
                 // Prefer a remaining merged node that is a graph-neighbour of
@@ -428,23 +462,33 @@ impl<'graph> PrecedenceTreeNode<'graph> {
                 // node so reconstruction can proceed instead of panicking.
                 // `into_logical_plan` reapplies the missing predicate (cross
                 // join + side-channel filter) for any non-adjacent step.
-                let highest_rank_idx = self
+                // `query_nodes.len() > 1` (loop guard), so the fallback `max_by`
+                // is always `Some`.
+                let Some(highest_rank_idx) = self
                     .query_nodes
                     .iter()
                     .enumerate()
                     .filter(|(_, node)| neighbours.contains(&node.node_id))
-                    .max_by(|(_, a), (_, b)| a.rank().partial_cmp(&b.rank()).unwrap())
+                    .max_by(|(_, a), (_, b)| {
+                        a.rank()
+                            .partial_cmp(&b.rank())
+                            .unwrap_or(std::cmp::Ordering::Equal)
+                    })
                     .map(|(idx, _)| idx)
                     .or_else(|| {
                         self.query_nodes
                             .iter()
                             .enumerate()
                             .max_by(|(_, a), (_, b)| {
-                                a.rank().partial_cmp(&b.rank()).unwrap()
+                                a.rank()
+                                    .partial_cmp(&b.rank())
+                                    .unwrap_or(std::cmp::Ordering::Equal)
                             })
                             .map(|(idx, _)| idx)
                     })
-                    .unwrap();
+                else {
+                    break;
+                };
 
                 let node = self.query_nodes.remove(highest_rank_idx);
 
@@ -457,31 +501,59 @@ impl<'graph> PrecedenceTreeNode<'graph> {
                     },
                 );
                 self.children[0].children = vec![child];
-            };
+            }
         }
         Ok(())
     }
 
-    /// Converts the precedence tree chain into a DataFusion `LogicalPlan`.
-    pub(crate) fn into_logical_plan(
-        self,
-        query_graph: &JoinGraph,
-    ) -> Result<LogicalPlan> {
-        let current_node_id = self.query_nodes[0].node_id;
+    /// Converts the precedence tree chain into a `DataFusion` `LogicalPlan`.
+    pub(crate) fn into_logical_plan(self, query_graph: &JoinGraph) -> Result<LogicalPlan> {
+        // Flatten the precedence chain into an ordered list of node ids.
+        let mut chain: Vec<NodeId> = Vec::new();
+        let mut cursor = &self;
+        loop {
+            chain.push(cursor.query_nodes[0].node_id);
+            match cursor.children.first() {
+                Some(child) => cursor = child,
+                None => break,
+            }
+        }
+
+        let first_node_id = chain[0];
         let mut current_plan = query_graph
-            .get_node(current_node_id)
-            .ok_or_else(|| plan_datafusion_err!("Node {:?} not found", current_node_id))?
+            .get_node(first_node_id)
+            .ok_or_else(|| plan_datafusion_err!("Node {:?} not found", first_node_id))?
             .plan
             .as_ref()
             .clone();
 
-        let mut processed_nodes = vec![current_node_id];
+        let mut processed_nodes = vec![first_node_id];
+        let mut remaining: Vec<NodeId> = chain.split_off(1);
 
-        let mut current_chain = &self;
-
-        while !current_chain.children.is_empty() {
-            let child = &current_chain.children[0];
-            let next_node_id = child.query_nodes[0].node_id;
+        while !remaining.is_empty() {
+            // Consume in a connectivity-respecting order: take the EARLIEST
+            // remaining chain node that has an edge to the already-processed
+            // set. IK84's normalize/denormalize can interleave a path's nodes
+            // non-contiguously (the rank order is scrambled when no-NDV computed
+            // keys inflate costs); walking the chain in strict order would then
+            // bridge a non-adjacent step with a bare cross join and the rule
+            // would bail. Picking the earliest *connected* node is byte-identical
+            // to the chain order when IK84 already produced a contiguous order,
+            // and otherwise repairs connectivity so a connected graph never emits
+            // a cross join. The `unwrap_or(0)` fallback keeps the cross-join path
+            // only for a genuinely disconnected graph (its predicate is reapplied
+            // via the side-channel).
+            let pick = remaining
+                .iter()
+                .position(|&n| {
+                    query_graph.get_node(n).is_some_and(|node| {
+                        processed_nodes
+                            .iter()
+                            .any(|&p| node.connection_with(p, query_graph).is_some())
+                    })
+                })
+                .unwrap_or(0);
+            let next_node_id = remaining.remove(pick);
 
             let next_plan = query_graph
                 .get_node(next_node_id)
@@ -490,19 +562,17 @@ impl<'graph> PrecedenceTreeNode<'graph> {
                 .as_ref()
                 .clone();
 
-            let next_node = query_graph.get_node(next_node_id).ok_or_else(|| {
-                plan_datafusion_err!("Node {:?} not found", next_node_id)
-            })?;
+            let next_node = query_graph
+                .get_node(next_node_id)
+                .ok_or_else(|| plan_datafusion_err!("Node {:?} not found", next_node_id))?;
 
             // Collect ALL edges connecting `next_node` to the already-processed
             // set. A relation can equi-join several processed relations at once
-            // — e.g. q7's `order_line` joins both `stock`
-            // (ol_i_id=s_i_id, ol_supply_w_id=s_w_id) and `oorder`
-            // (ol_w_id=o_w_id, …). Keeping only one edge silently drops the
-            // others' keys, yielding an under-selective join that explodes at
-            // runtime (q7 OOM) or leaves a dangling column reference for a later
-            // rule (q21 "No field named stock.s_w_id"). We merge every connecting
-            // edge's keys into this single join.
+            // (e.g. a fact table joining two dimensions on different keys).
+            // Keeping only one edge silently drops the others' keys, yielding an
+            // under-selective join that explodes at runtime or a dangling column
+            // reference that fails a later rule. We merge every connecting edge's
+            // keys into this single join.
             let connecting: Vec<_> = processed_nodes
                 .iter()
                 .rev()
@@ -515,6 +585,16 @@ impl<'graph> PrecedenceTreeNode<'graph> {
             // reconstruction can finish; the missing equi-predicate is reapplied
             // at the top level via the side-channel `filters`.
             let Some(&primary) = connecting.first() else {
+                // Reached only for a genuinely disconnected graph (greedy
+                // consumption avoids this for connected graphs). This emits an
+                // empty-`on` cross join that the guard in `rule.rs` counts, and
+                // is the usual precursor to a "falling back to native" bail — so
+                // surface it.
+                tracing::debug!(
+                    node = next_node_id,
+                    processed = processed_nodes.len(),
+                    "reconstruction emitted a cross join (node has no edge to the processed set — disconnected graph)"
+                );
                 let join = datafusion_expr::Join::try_new(
                     Arc::new(current_plan),
                     Arc::new(next_plan),
@@ -527,22 +607,20 @@ impl<'graph> PrecedenceTreeNode<'graph> {
                 )?;
                 current_plan = LogicalPlan::Join(join);
                 processed_nodes.push(next_node_id);
-                current_chain = child;
                 continue;
             };
 
             let next_schema = next_plan.schema();
-            let column_in_schema = |col: &datafusion_common::Column,
-                                    schema: &datafusion_common::DFSchema|
-             -> bool {
-                if let Some(relation) = &col.relation {
-                    schema.iter().any(|(qualifier, field)| {
-                        qualifier == Some(relation) && field.name() == col.name()
-                    })
-                } else {
-                    schema.field_with_unqualified_name(&col.name).is_ok()
-                }
-            };
+            let column_in_schema =
+                |col: &datafusion_common::Column, schema: &datafusion_common::DFSchema| -> bool {
+                    if let Some(relation) = &col.relation {
+                        schema.iter().any(|(qualifier, field)| {
+                            qualifier == Some(relation) && field.name() == col.name()
+                        })
+                    } else {
+                        schema.field_with_unqualified_name(&col.name).is_ok()
+                    }
+                };
             let is_semi_anti = |jt: JoinType| {
                 matches!(
                     jt,
@@ -593,9 +671,10 @@ impl<'graph> PrecedenceTreeNode<'graph> {
                     }
                 };
 
-            // Build the join. Schema is auto-derived; non-equi predicates were
-            // already hoisted into the side-channel and are reapplied at the
-            // top level by `optimal_left_deep_join_plan`.
+            // Build the join (schema is auto-derived). All non-equi predicates
+            // were hoisted into the side-channel and are reapplied at the top
+            // level by `optimal_left_deep_join_plan`, so the join carries no
+            // `filter` here.
             let join = datafusion_expr::Join::try_new(
                 Arc::new(current_plan),
                 Arc::new(next_plan),
@@ -609,7 +688,6 @@ impl<'graph> PrecedenceTreeNode<'graph> {
             current_plan = LogicalPlan::Join(join);
 
             processed_nodes.push(next_node_id);
-            current_chain = child;
         }
 
         Ok(current_plan)
@@ -627,12 +705,9 @@ impl<'graph> PrecedenceTreeNode<'graph> {
                 cost + cardinality * self.query_nodes[0].cost,
             )?,
             _ => {
-                return plan_err!(
-                    "Cost calculation requires normalized tree with 0 or 1 children"
-                );
+                return plan_err!("Cost calculation requires normalized tree with 0 or 1 children");
             }
         };
         Ok(cost)
     }
 }
-

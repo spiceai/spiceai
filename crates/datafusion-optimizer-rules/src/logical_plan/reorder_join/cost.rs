@@ -1,28 +1,37 @@
-// Licensed to the Apache Software Foundation (ASF) under one
-// or more contributor license agreements.  See the NOTICE file
-// distributed with this work for additional information
-// regarding copyright ownership.  The ASF licenses this file
-// to you under the Apache License, Version 2.0 (the
-// "License"); you may not use this file except in compliance
-// with the License.  You may obtain a copy of the License at
-//
-//   http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing,
-// software distributed under the License is distributed on an
-// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
-// KIND, either express or implied.  See the License for the
-// specific language governing permissions and limitations
-// under the License.
+/*
+Copyright 2026 The Spice.ai OSS Authors
 
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+     https://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+// The cost model converts row counts / NDVs (`usize`, `i64`, `u64`) into `f64`
+// estimates throughout; these casts are inherent and the lost precision is
+// immaterial to a heuristic estimate. Allow them file-wide rather than
+// annotating every arithmetic site.
+#![allow(
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap
+)]
+
+use datafusion::datasource::DefaultTableSource;
 use datafusion_common::{Column, Result, ScalarValue, plan_err, stats::Precision};
 use datafusion_expr::{Expr, JoinType, LogicalPlan, Operator};
-use datafusion::datasource::DefaultTableSource;
 
 use super::join_graph::Edge;
 
 /// Fraction of preserved-side rows estimated to survive a semi/anti join
-/// when column NDV statistics are unavailable. Mirrors DuckDB's
+/// when column NDV statistics are unavailable. Mirrors `DuckDB`'s
 /// `CardinalityEstimator::DEFAULT_SEMI_ANTI_SELECTIVITY = 1/5`.
 const DEFAULT_SEMI_ANTI_SELECTIVITY: f64 = 0.2;
 
@@ -66,10 +75,9 @@ pub trait JoinCostEstimator: std::fmt::Debug {
     fn selectivity(&self, edge: &Edge, left: &LogicalPlan, right: &LogicalPlan) -> f64 {
         let fallback = match edge.join_type {
             JoinType::Inner => 0.1,
-            JoinType::LeftSemi
-            | JoinType::LeftAnti
-            | JoinType::RightSemi
-            | JoinType::RightAnti => DEFAULT_SEMI_ANTI_SELECTIVITY,
+            JoinType::LeftSemi | JoinType::LeftAnti | JoinType::RightSemi | JoinType::RightAnti => {
+                DEFAULT_SEMI_ANTI_SELECTIVITY
+            }
             _ => 1.0,
         };
         let is_eq_join = matches!(
@@ -80,7 +88,10 @@ pub trait JoinCostEstimator: std::fmt::Debug {
                 | JoinType::RightSemi
                 | JoinType::RightAnti
         );
-        if !is_eq_join || edge.on.is_empty() {
+        // An edge always carries equi-keys — cross products are absorbed as
+        // graph nodes, not edges. Guard defensively, and bail for non-equi
+        // join types.
+        if edge.on.is_empty() || !is_eq_join {
             return fallback;
         }
         // Estimate from the first equi-pair only. Composing 1/max(NDV) across
@@ -118,7 +129,7 @@ pub trait JoinCostEstimator: std::fmt::Debug {
     }
 }
 
-/// Default implementation of JoinCostEstimator
+/// Default implementation of `JoinCostEstimator`
 #[derive(Debug, Clone, Copy)]
 pub struct DefaultCostEstimator;
 
@@ -137,14 +148,13 @@ fn key_side_ndv<E: JoinCostEstimator + ?Sized>(
     right: &LogicalPlan,
 ) -> Option<f64> {
     let cols = expr.column_refs();
-    let rows_bound =
-        if !cols.is_empty() && cols.iter().all(|c| left.schema().has_column(c)) {
-            estimator.cardinality(left, None)
-        } else if !cols.is_empty() && cols.iter().all(|c| right.schema().has_column(c)) {
-            estimator.cardinality(right, None)
-        } else {
-            None
-        };
+    let rows_bound = if !cols.is_empty() && cols.iter().all(|c| left.schema().has_column(c)) {
+        estimator.cardinality(left, None)
+    } else if !cols.is_empty() && cols.iter().all(|c| right.schema().has_column(c)) {
+        estimator.cardinality(right, None)
+    } else {
+        None
+    };
     let lookup = |c: &Column| ndv_for(estimator, c, left, right);
     key_expr_ndv_bound(expr, &lookup, rows_bound)
 }
@@ -223,13 +233,13 @@ fn literal_as_f64(expr: &Expr) -> Option<f64> {
         return None;
     };
     match sv {
-        ScalarValue::Int8(Some(v)) => Some(*v as f64),
-        ScalarValue::Int16(Some(v)) => Some(*v as f64),
-        ScalarValue::Int32(Some(v)) => Some(*v as f64),
+        ScalarValue::Int8(Some(v)) => Some(f64::from(*v)),
+        ScalarValue::Int16(Some(v)) => Some(f64::from(*v)),
+        ScalarValue::Int32(Some(v)) => Some(f64::from(*v)),
         ScalarValue::Int64(Some(v)) => Some(*v as f64),
-        ScalarValue::UInt8(Some(v)) => Some(*v as f64),
-        ScalarValue::UInt16(Some(v)) => Some(*v as f64),
-        ScalarValue::UInt32(Some(v)) => Some(*v as f64),
+        ScalarValue::UInt8(Some(v)) => Some(f64::from(*v)),
+        ScalarValue::UInt16(Some(v)) => Some(f64::from(*v)),
+        ScalarValue::UInt32(Some(v)) => Some(f64::from(*v)),
         ScalarValue::UInt64(Some(v)) => Some(*v as f64),
         _ => None,
     }
@@ -285,7 +295,6 @@ fn like_selectivity(pattern: &str, escape: Option<char>) -> f64 {
     sel.clamp(LIKE_MIN_SELECTIVITY, 1.0)
 }
 
-
 /// `(0, 1]`.
 fn predicate_selectivity(pred: &Expr, input: &LogicalPlan) -> f64 {
     match pred {
@@ -307,17 +316,14 @@ fn predicate_selectivity(pred: &Expr, input: &LogicalPlan) -> f64 {
         }
         Expr::InList(inlist) => {
             let base = match column_ndv_in(&inlist.expr, input) {
-                Some(ndv) if ndv > 0.0 => {
-                    (inlist.list.len() as f64 / ndv).clamp(0.0, 1.0)
-                }
+                Some(ndv) if ndv > 0.0 => (inlist.list.len() as f64 / ndv).clamp(0.0, 1.0),
                 _ => DEFAULT_FILTER_SELECTIVITY,
             };
             if inlist.negated { 1.0 - base } else { base }
         }
         Expr::BinaryExpr(be) => match be.op {
             Operator::And => {
-                predicate_selectivity(&be.left, input)
-                    * predicate_selectivity(&be.right, input)
+                predicate_selectivity(&be.left, input) * predicate_selectivity(&be.right, input)
             }
             Operator::Or => {
                 let l = predicate_selectivity(&be.left, input);
@@ -325,9 +331,7 @@ fn predicate_selectivity(pred: &Expr, input: &LogicalPlan) -> f64 {
                 (l + r - l * r).clamp(0.0, 1.0)
             }
             Operator::Eq => equality_selectivity(&be.left, &be.right, input),
-            Operator::NotEq => {
-                1.0 - equality_selectivity(&be.left, &be.right, input)
-            }
+            Operator::NotEq => 1.0 - equality_selectivity(&be.left, &be.right, input),
             Operator::Lt | Operator::LtEq | Operator::Gt | Operator::GtEq => {
                 DEFAULT_RANGE_SELECTIVITY
             }
@@ -403,12 +407,10 @@ pub(super) fn estimate_cardinality(plan: &LogicalPlan, column: Option<&Column>) 
                 }
                 let input = estimate_cardinality(&agg.input, None)?;
                 // Per-group-key NDV from the child plan, where available.
-                // Mirrors duckdb's `ExtractAggregationStats`
-                // (relation_statistics_helper.cpp:380-415): start with the
+                // Mirrors duckdb's `ExtractAggregationStats`: start with the
                 // product of per-key NDVs, apply a correlation correction,
                 // then use the Occupancy-Problem formula to estimate the
-                // number of group-key tuples actually occupied given
-                // `input` rows.
+                // number of group-key tuples actually occupied given `input` rows.
                 let ndvs: Vec<f64> = agg
                     .group_expr
                     .iter()
@@ -432,27 +434,14 @@ pub(super) fn estimate_cardinality(plan: &LogicalPlan, column: Option<&Column>) 
                 let new_card = if mult == 0.0 { input } else { product * mult };
                 Ok(new_card.min(input).max(1.0))
             }
-            Some(c) => {
-                // Group-by keys are unique in the aggregate's output, so
-                // NDV(group_key) equals the post-aggregate row count.
-                // Match by column name only — a SubqueryAlias wrapping the
-                // aggregate rewrites the relation prefix, so a strict
-                // `relation == relation` comparison would miss legitimate
-                // group keys.
-                let is_group_key = agg.group_expr.iter().any(|e| match e {
-                    Expr::Column(g) => g.name == c.name,
-                    _ => false,
-                });
-                if is_group_key {
-                    estimate_cardinality(plan, None)
-                } else {
-                    // For non-group columns, the post-aggregate NDV is
-                    // bounded by the row count (most one distinct value per
-                    // output row). Return that as a loose upper bound
-                    // instead of erroring, so callers (e.g.
-                    // `selectivity()`) can still compute a fallback.
-                    estimate_cardinality(plan, None)
-                }
+            Some(_) => {
+                // A group-by key is unique in the output, so its NDV equals the
+                // post-aggregate row count; for a non-group column the NDV is
+                // bounded by that same row count (at most one distinct value per
+                // output row). Either way the answer is the output row count — a
+                // loose upper bound that lets callers (e.g. `selectivity()`)
+                // still compute a fallback.
+                estimate_cardinality(plan, None)
             }
         },
         LogicalPlan::TableScan(scan) => {
@@ -463,7 +452,6 @@ pub(super) fn estimate_cardinality(plan: &LogicalPlan, column: Option<&Column>) 
             // `DefaultTableSource` wrapper.
             let stats = scan
                 .source
-                .as_any()
                 .downcast_ref::<DefaultTableSource>()
                 .and_then(|src| src.table_provider.statistics())
                 .ok_or_else(|| {
@@ -473,13 +461,31 @@ pub(super) fn estimate_cardinality(plan: &LogicalPlan, column: Option<&Column>) 
                     ))
                 })?;
             match column {
-                None => match stats.num_rows {
-                    Precision::Exact(n) | Precision::Inexact(n) => Ok(n as f64),
-                    Precision::Absent => plan_err!(
-                        "TableSource for `{}` does not provide a row count",
-                        scan.table_name
-                    ),
-                },
+                None => {
+                    let base = match stats.num_rows {
+                        Precision::Exact(n) | Precision::Inexact(n) => n as f64,
+                        Precision::Absent => {
+                            return plan_err!(
+                                "TableSource for `{}` does not provide a row count",
+                                scan.table_name
+                            );
+                        }
+                    };
+                    // Credit pushed-down scan filters. `push_down_filter` moves
+                    // predicates into `TableScan.filters` before the reorder runs,
+                    // but the provider's row count is *unfiltered* — so without
+                    // this the cost model sees a filtered dimension (e.g. item
+                    // `i_data LIKE '%b'`) as its full 100K, never as the tiny
+                    // relation it is, and IK84 seeds a non-pruning computed-key
+                    // path (chbench q2/q8/q9 `mod`→stock) instead of the selective
+                    // relation. Empty `filters` ⇒ product is 1.0 (no change).
+                    let sel: f64 = scan
+                        .filters
+                        .iter()
+                        .map(|f| predicate_selectivity(f, plan))
+                        .product();
+                    Ok((base * sel).max(1.0))
+                }
                 Some(c) => {
                     // `column_statistics` is indexed by the source schema
                     // (pre-projection), so resolve the column there.
@@ -489,14 +495,13 @@ pub(super) fn estimate_cardinality(plan: &LogicalPlan, column: Option<&Column>) 
                             c.name, scan.table_name
                         ))
                     })?;
-                    let col_stats =
-                        stats.column_statistics.get(idx).ok_or_else(|| {
-                            datafusion_common::DataFusionError::Plan(format!(
-                                "Column statistics missing for index {idx} \
+                    let col_stats = stats.column_statistics.get(idx).ok_or_else(|| {
+                        datafusion_common::DataFusionError::Plan(format!(
+                            "Column statistics missing for index {idx} \
                                  on `{}`",
-                                scan.table_name
-                            ))
-                        })?;
+                            scan.table_name
+                        ))
+                    })?;
                     match col_stats.distinct_count {
                         Precision::Exact(n) | Precision::Inexact(n) => Ok(n as f64),
                         Precision::Absent => plan_err!(
@@ -515,10 +520,7 @@ pub(super) fn estimate_cardinality(plan: &LogicalPlan, column: Option<&Column>) 
         LogicalPlan::Join(j)
             if matches!(
                 j.join_type,
-                JoinType::LeftSemi
-                    | JoinType::LeftAnti
-                    | JoinType::RightSemi
-                    | JoinType::RightAnti
+                JoinType::LeftSemi | JoinType::LeftAnti | JoinType::RightSemi | JoinType::RightAnti
             ) =>
         {
             let preserved = match j.join_type {
@@ -552,9 +554,7 @@ pub(super) fn estimate_cardinality(plan: &LogicalPlan, column: Option<&Column>) 
                 };
                 let rows_bound = |e: &Expr| {
                     let cols = e.column_refs();
-                    if !cols.is_empty()
-                        && cols.iter().all(|c| j.left.schema().has_column(c))
-                    {
+                    if !cols.is_empty() && cols.iter().all(|c| j.left.schema().has_column(c)) {
                         estimate_cardinality(&j.left, None).ok()
                     } else if !cols.is_empty()
                         && cols.iter().all(|c| j.right.schema().has_column(c))
@@ -571,7 +571,7 @@ pub(super) fn estimate_cardinality(plan: &LogicalPlan, column: Option<&Column>) 
                     (Some(x), None) | (None, Some(x)) if x > 0.0 => Some(x),
                     _ => None,
                 };
-                ndv_max.map(|n| 1.0 / n).unwrap_or(0.1)
+                ndv_max.map_or(0.1, |n| 1.0 / n)
             } else {
                 1.0
             };
@@ -596,4 +596,3 @@ pub(super) fn estimate_cardinality(plan: &LogicalPlan, column: Option<&Column>) 
         }
     }
 }
-

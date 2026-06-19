@@ -1,5 +1,5 @@
 /*
-Copyright 2025 The Spice.ai OSS Authors
+Copyright 2026 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -14,21 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-//! Layer 1 — `ReorderJoinRule` logic snapshot tests (rule in isolation).
-//!
-//! Unit tests (run by `cargo nextest run --all --lib`, so they're covered by CI
-//! with no workflow changes). Each chbench query is optimized through a **plain
-//! DataFusion** default optimizer with *only* `ReorderJoinRule` inserted (no
-//! Cayenne rules, no Spice session config), against in-memory `StatTable`
-//! providers carrying realistic SF100 (W=100) statistics. The resulting logical
-//! plan is captured as an insta snapshot.
-//!
-//! This isolates the reorder *algorithm*: a snapshot diff here means the rule's
-//! output changed. The complementary full-pipeline check (Spice + Cayenne) lives
-//! in `crates/test-framework/src/snapshot` (chbench EXPLAIN snapshots).
-//!
-//! Regenerate: `INSTA_UPDATE=always cargo test -p datafusion-optimizer-rules
-//! --lib reorder_join::chbench_tests` (or `cargo insta review`).
+//! `ReorderJoinRule` logic snapshot tests based on the CH-benCHmark queries (SF100).
 
 use std::sync::Arc;
 
@@ -62,9 +48,6 @@ struct StatTable {
 
 #[async_trait]
 impl TableProvider for StatTable {
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
     fn schema(&self) -> SchemaRef {
         Arc::clone(&self.schema)
     }
@@ -123,9 +106,6 @@ impl ModUdf {
 }
 
 impl ScalarUDFImpl for ModUdf {
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
     fn name(&self) -> &'static str {
         "mod"
     }
@@ -246,15 +226,18 @@ const TABLES: &[&str] = &[
 
 /// A plain DataFusion default optimizer with *only* `ReorderJoinRule` inserted,
 /// at the same pipeline position the Spice runtime uses (after the join graph is
-/// formed — `eliminate_cross_join` — and before projection pushdown fragments
-/// it). No Cayenne rules, no Spice session config: this isolates the rule.
+/// formed — `eliminate_cross_join` — and before projection pushdown fragments it).
 fn make_reordered_ctx() -> SessionContext {
     let mut rules = Optimizer::new().rules;
     let insert_at = rules
         .iter()
         .position(|rule| rule.name() == "eliminate_cross_join")
         .map(|position| position + 1)
-        .or_else(|| rules.iter().position(|rule| rule.name() == "push_down_filter"))
+        .or_else(|| {
+            rules
+                .iter()
+                .position(|rule| rule.name() == "push_down_filter")
+        })
         .unwrap_or(rules.len());
     rules.insert(insert_at, Arc::new(ReorderJoinRule::default()));
 
@@ -279,10 +262,7 @@ fn make_reordered_ctx() -> SessionContext {
 }
 
 /// Optimize `sql` through the reorder-enabled optimizer, returning the plan
-/// rendered as a string — or, if planning fails (e.g. a not-yet-fixed
-/// reconstruction bug surfaces in a downstream rule), the error text. Snapshotting
-/// either way keeps the test green while still pinning current behavior, so a
-/// future fix shows up as a snapshot change.
+/// rendered as a string — or, if planning fails, the error text.
 async fn reordered_plan(ctx: &SessionContext, sql: &str) -> String {
     match ctx.sql(sql).await {
         Ok(df) => match df.into_optimized_plan() {
@@ -293,12 +273,6 @@ async fn reordered_plan(ctx: &SessionContext, sql: &str) -> String {
     }
 }
 
-/// Queries are loaded directly from the canonical chbench fixtures in the
-/// `test-framework` crate (single source of truth — no duplicated copies). The
-/// cost model treats `mod(x, k)` (the form these use) identically to `x % k`, so
-/// the rule's output is the same regardless of which spelling a fixture uses;
-/// and IK84 is input-order-independent, so the fixtures' `FROM` ordering doesn't
-/// affect the snapshot either.
 macro_rules! chbench_reorder_snapshot {
     ($name:ident, $file:literal) => {
         #[tokio::test]
@@ -315,6 +289,7 @@ macro_rules! chbench_reorder_snapshot {
     };
 }
 
+// CH-benCHmark queries with join chains.
 chbench_reorder_snapshot!(reorder_q2, "q2.sql");
 chbench_reorder_snapshot!(reorder_q3, "q3.sql");
 chbench_reorder_snapshot!(reorder_q5, "q5.sql");
