@@ -2890,10 +2890,7 @@ mod tests {
         assert_eq!(union.children().len(), 2, "union should keep both joins");
         for child in union.children() {
             assert!(
-                child
-                    .as_any()
-                    .downcast_ref::<SortMergeJoinExec>()
-                    .is_some(),
+                child.as_any().downcast_ref::<SortMergeJoinExec>().is_some(),
                 "each concurrent inner join should be rewritten to sort-merge under fair-share"
             );
         }
