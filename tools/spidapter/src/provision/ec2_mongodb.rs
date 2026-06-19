@@ -209,6 +209,7 @@ processManagement:
   timeZoneInfo: /usr/share/zoneinfo
 replication:
   replSetName: rs0
+  oplogSizeMB: 10240
 MONGODCONF
 
 systemctl enable mongod
@@ -249,6 +250,7 @@ processManagement:
   timeZoneInfo: /usr/share/zoneinfo
 replication:
   replSetName: rs0
+  oplogSizeMB: 10240
 security:
   authorization: enabled
   keyFile: /etc/mongodb-keyfile

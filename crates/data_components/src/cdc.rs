@@ -229,13 +229,27 @@ impl CommitChange for NoOpCommitter {
 /// to carry the ready signal. See the [`ChangesStream`] documentation for the
 /// readiness contract.
 pub fn build_ready_signal_envelope(schema: &SchemaRef) -> Result<ChangeEnvelope, ChangeBatchError> {
+    // Normalize fields to all-nullable so this empty barrier batch's struct type
+    // matches the truncate/snapshot/live change batches it coalesces with. The
+    // dataset schema may declare non-null columns (e.g. a `nullable: false`
+    // primary key in the spicepod), but every other change batch uses the
+    // nullable schema; without this, concat fails ("arrays of different data
+    // types") when the ready signal is coalesced with real data.
+    let nullable_schema = Schema::new(
+        schema
+            .fields()
+            .iter()
+            .map(|f| Arc::new(f.as_ref().clone().with_nullable(true)))
+            .collect::<Vec<_>>(),
+    );
+
     // Build zero-row versions of each dataset column.
-    let empty_data_columns: Vec<ArrayRef> = schema
+    let empty_data_columns: Vec<ArrayRef> = nullable_schema
         .fields()
         .iter()
         .map(|f| arrow::array::new_empty_array(f.data_type()))
         .collect();
-    let data_struct = StructArray::new(schema.fields().clone(), empty_data_columns, None);
+    let data_struct = StructArray::new(nullable_schema.fields().clone(), empty_data_columns, None);
 
     let op_array: ArrayRef = Arc::new(StringArray::from(Vec::<&str>::new()));
     let pk_field = Arc::new(Field::new("item", DataType::Utf8, false));
@@ -246,7 +260,7 @@ pub fn build_ready_signal_envelope(schema: &SchemaRef) -> Result<ChangeEnvelope,
         None,
     );
 
-    let wrapper_schema = Arc::new(changes_schema(schema));
+    let wrapper_schema = Arc::new(changes_schema(&nullable_schema));
     let record = RecordBatch::try_new(
         wrapper_schema,
         vec![op_array, Arc::new(pk_list), Arc::new(data_struct)],

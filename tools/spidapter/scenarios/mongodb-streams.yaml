@@ -10,12 +10,5 @@ compute:
 acceleration: ${SPICE_ACCELERATION:-cayenne}
 source:
   mongodb_streams:
-    provision:
-      ec2:
-        subnet_id: ${EC2_SUBNET_ID}
-        security_group_id: ${EC2_SECURITY_GROUP_ID}
-        ami_id: ${EC2_AMI_ID}
-        instance_type: ${EC2_INSTANCE_TYPE:-m5.large}
-        disk_size_gb: ${EC2_DISK_SIZE_GB:-100}
-        associate_public_ip: true
-        iam_instance_profile: ${EC2_IAM_INSTANCE_PROFILE:-}
+    connect:
+      uri: ${MONGODB_ATLAS_URI}

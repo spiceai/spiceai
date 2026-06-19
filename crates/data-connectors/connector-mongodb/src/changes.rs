@@ -22,7 +22,8 @@ use data_components::{
         build_ready_signal_envelope, wrap_data_as_change_batch,
     },
     mongodb::stream::{
-        change_events_to_change_batch, default_unnest_parameters, truncate_change_batch,
+        change_events_to_change_batch, default_unnest_parameters, nullable_clone,
+        truncate_change_batch,
     },
 };
 use datafusion::{
@@ -177,6 +178,10 @@ pub fn build_changes_stream(
                 .map_err(StreamError::MongoDB)?;
             yield ChangeEnvelope::new(Box::new(NoOpCommitter), truncate, false);
 
+            // Use the same nullable schema that CDC event batches use (via nullable_clone
+            // in change_events_to_change_batch), so snapshot and live-stream batches can
+            // be coalesced without an Arrow schema mismatch on non-null fields like _id.
+            let snapshot_schema = nullable_clone(&schema);
             let mut snapshot_stream = snapshot_stream(table_provider).await?;
             while let Some(batch) = FuturesStreamExt::next(&mut snapshot_stream).await {
                 let batch = batch.map_err(|error| StreamError::Arrow(error.to_string()))?;
@@ -184,7 +189,10 @@ pub fn build_changes_stream(
                     continue;
                 }
 
-                let change_batch = wrap_data_as_change_batch(&schema, &batch)
+                let batch = batch
+                    .with_schema(Arc::clone(&snapshot_schema))
+                    .map_err(|error| StreamError::Arrow(error.to_string()))?;
+                let change_batch = wrap_data_as_change_batch(&snapshot_schema, &batch)
                     .map_err(|error| StreamError::Arrow(error.to_string()))?;
                 yield ChangeEnvelope::new(Box::new(NoOpCommitter), change_batch, false);
             }
