@@ -200,6 +200,7 @@ impl Handler for CayenneFlightsqlHandler {
         Ok(MetricsResponse {
             resource: ResourceMetrics::default(),
             ingestion: IngestionMetrics::default(),
+            cdc_replication: None,
         })
     }
 
