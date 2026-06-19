@@ -156,19 +156,21 @@ pub fn query_graph_to_optimal_left_deep_join_plan(
         precedence_graph.normalize();
         precedence_graph.denormalize()?;
 
-        // DEBUG (REORDER_DBG): per-root total IK84 cost + chain head. Lets us
-        // see which candidate root the enumerator picks and why. See
-        // `reorder_join/PROGRESS.md`.
-        if std::env::var("REORDER_DBG").is_ok() {
+        // Per-candidate-root IK84 cost + chain head — shows which root the
+        // enumerator considered and why one wins. Verbose (one per relation), so
+        // `trace`. Guard the `format!` so it's free when trace is off.
+        if tracing::enabled!(tracing::Level::TRACE) {
             let head = precedence_graph.query_nodes[0].node_id;
             let head_name = query_graph
                 .get_node(head)
                 .map(|n| format!("{}", n.plan))
                 .unwrap_or_default();
-            let head_name = head_name.lines().next().unwrap_or("").to_string();
-            eprintln!(
-                "[root] id={node_id} cost={:?} head={head} ({head_name})",
-                precedence_graph.cost()
+            tracing::trace!(
+                root = node_id,
+                cost = ?precedence_graph.cost(),
+                chain_head = head,
+                plan = head_name.lines().next().unwrap_or(""),
+                "candidate root cost"
             );
         }
 
@@ -185,9 +187,24 @@ pub fn query_graph_to_optimal_left_deep_join_plan(
         };
     }
 
-    best_graph
-        .ok_or_else(|| plan_datafusion_err!("No valid precedence graph found"))?
-        .into_logical_plan(query_graph)
+    let best =
+        best_graph.ok_or_else(|| plan_datafusion_err!("No valid precedence graph found"))?;
+    // High-signal summary: the winning root + its cost. This is the join the
+    // reorder seeds the left-deep chain from. `debug`, one line per reorder.
+    if tracing::enabled!(tracing::Level::DEBUG) {
+        let head = best.query_nodes[0].node_id;
+        let head_name = query_graph
+            .get_node(head)
+            .map(|n| format!("{}", n.plan))
+            .unwrap_or_default();
+        tracing::debug!(
+            chain_head = head,
+            cost = ?best.cost(),
+            plan = head_name.lines().next().unwrap_or(""),
+            "selected join order (lowest-cost root)"
+        );
+    }
+    best.into_logical_plan(query_graph)
 }
 
 #[derive(Debug)]
@@ -467,21 +484,54 @@ impl<'graph> PrecedenceTreeNode<'graph> {
         self,
         query_graph: &JoinGraph,
     ) -> Result<LogicalPlan> {
-        let current_node_id = self.query_nodes[0].node_id;
+        // Flatten the precedence chain into an ordered list of node ids.
+        let mut chain: Vec<NodeId> = Vec::new();
+        let mut cursor = &self;
+        loop {
+            chain.push(cursor.query_nodes[0].node_id);
+            match cursor.children.first() {
+                Some(child) => cursor = child,
+                None => break,
+            }
+        }
+
+        let first_node_id = chain[0];
         let mut current_plan = query_graph
-            .get_node(current_node_id)
-            .ok_or_else(|| plan_datafusion_err!("Node {:?} not found", current_node_id))?
+            .get_node(first_node_id)
+            .ok_or_else(|| plan_datafusion_err!("Node {:?} not found", first_node_id))?
             .plan
             .as_ref()
             .clone();
 
-        let mut processed_nodes = vec![current_node_id];
+        let mut processed_nodes = vec![first_node_id];
+        let mut remaining: Vec<NodeId> = chain.split_off(1);
 
-        let mut current_chain = &self;
-
-        while !current_chain.children.is_empty() {
-            let child = &current_chain.children[0];
-            let next_node_id = child.query_nodes[0].node_id;
+        while !remaining.is_empty() {
+            // Consume in a connectivity-respecting order: take the EARLIEST
+            // remaining chain node that has an edge to the already-processed
+            // set. IK84's normalize/denormalize can interleave a path/tree's
+            // nodes non-contiguously (observed on chbench q7's 7-node path,
+            // where the cost blow-up from no-NDV computed `mod`/`ascii` keys
+            // scrambles the rank order); walking the chain in strict order would
+            // then bridge a non-adjacent step with a bare cross join and the
+            // rule would bail. Picking the earliest *connected* node instead is
+            // byte-identical to the chain order whenever IK84 already produced a
+            // contiguous order (so well-ordered queries don't change) and
+            // otherwise repairs connectivity, so a connected graph never emits a
+            // cross join. The `unwrap_or(0)` fallback keeps the cross-join path
+            // only for a genuinely disconnected graph (its predicate is
+            // reapplied via the side-channel).
+            let pick = remaining
+                .iter()
+                .position(|&n| {
+                    query_graph.get_node(n).is_some_and(|node| {
+                        processed_nodes
+                            .iter()
+                            .any(|&p| node.connection_with(p, query_graph).is_some())
+                    })
+                })
+                .unwrap_or(0);
+            let next_node_id = remaining.remove(pick);
 
             let next_plan = query_graph
                 .get_node(next_node_id)
@@ -515,6 +565,16 @@ impl<'graph> PrecedenceTreeNode<'graph> {
             // reconstruction can finish; the missing equi-predicate is reapplied
             // at the top level via the side-channel `filters`.
             let Some(&primary) = connecting.first() else {
+                // Reached only for a genuinely disconnected graph (greedy
+                // consumption avoids this for connected graphs). This emits an
+                // empty-`on` cross join that the guard in `rule.rs` counts, and
+                // is the usual precursor to a "falling back to native" bail — so
+                // surface it.
+                tracing::debug!(
+                    node = next_node_id,
+                    processed = processed_nodes.len(),
+                    "reconstruction emitted a cross join (node has no edge to the processed set — disconnected graph)"
+                );
                 let join = datafusion_expr::Join::try_new(
                     Arc::new(current_plan),
                     Arc::new(next_plan),
@@ -527,7 +587,6 @@ impl<'graph> PrecedenceTreeNode<'graph> {
                 )?;
                 current_plan = LogicalPlan::Join(join);
                 processed_nodes.push(next_node_id);
-                current_chain = child;
                 continue;
             };
 
@@ -553,7 +612,7 @@ impl<'graph> PrecedenceTreeNode<'graph> {
                 )
             };
 
-            let (on, join_type, null_equality) =
+            let (on, filter, join_type, null_equality) =
                 if connecting.iter().all(|e| !is_semi_anti(e.join_type)) {
                     // All-inner: merge every connecting edge's equi-keys,
                     // orienting each pair so the current-plan column is the LEFT
@@ -574,7 +633,17 @@ impl<'graph> PrecedenceTreeNode<'graph> {
                             }
                         }
                     }
-                    (on, JoinType::Inner, primary.null_equality)
+                    // Thread any soft theta-edge predicates (non-equi links such
+                    // as q7's nation OR) into the join `filter`. When the only
+                    // connecting edge is a theta-edge the join is `on: []` +
+                    // `filter: Some(..)` — a theta join between the two (small)
+                    // relations the enumerator placed adjacently, not a cross
+                    // product over the whole subtree.
+                    let filter = connecting
+                        .iter()
+                        .filter_map(|e| e.filter.clone())
+                        .reduce(Expr::and);
+                    (on, filter, JoinType::Inner, primary.null_equality)
                 } else {
                     // Semi/anti (or a mix): keep the single-primary-edge
                     // behavior, oriented by the `nodes[0] = preserved-LHS`
@@ -587,20 +656,31 @@ impl<'graph> PrecedenceTreeNode<'graph> {
                             .iter()
                             .map(|(left, right)| (right.clone(), left.clone()))
                             .collect();
-                        (swapped_on, primary.join_type.swap(), primary.null_equality)
+                        (
+                            swapped_on,
+                            None,
+                            primary.join_type.swap(),
+                            primary.null_equality,
+                        )
                     } else {
-                        (primary.on.clone(), primary.join_type, primary.null_equality)
+                        (
+                            primary.on.clone(),
+                            None,
+                            primary.join_type,
+                            primary.null_equality,
+                        )
                     }
                 };
 
-            // Build the join. Schema is auto-derived; non-equi predicates were
-            // already hoisted into the side-channel and are reapplied at the
-            // top level by `optimal_left_deep_join_plan`.
+            // Build the join. Schema is auto-derived. `filter` carries any
+            // theta-edge predicate (resolved over both inputs); other non-equi
+            // predicates were hoisted into the side-channel and are reapplied at
+            // the top level by `optimal_left_deep_join_plan`.
             let join = datafusion_expr::Join::try_new(
                 Arc::new(current_plan),
                 Arc::new(next_plan),
                 on,
-                None,
+                filter,
                 join_type,
                 JoinConstraint::On,
                 null_equality,
@@ -609,7 +689,6 @@ impl<'graph> PrecedenceTreeNode<'graph> {
             current_plan = LogicalPlan::Join(join);
 
             processed_nodes.push(next_node_id);
-            current_chain = child;
         }
 
         Ok(current_plan)

@@ -78,9 +78,19 @@ pub type EdgeId = usize;
 /// orientation. The reconstruction code in
 /// `left_deep_join_plan::into_logical_plan` relies on this invariant to
 /// orient the rebuilt `Join` correctly.
+///
+/// A "soft" theta-edge has an empty `on` and a `Some(filter)`: a non-equi
+/// predicate (e.g. q7's `(n1='JAPAN' AND n2='CHINA') OR …`) that links the
+/// two relations but cannot be expressed as equi-keys. It is produced by
+/// `derive_theta_edges` so IK84 keeps the two relations adjacent and the
+/// reconstruction attaches the predicate as a `Join` filter between them
+/// (never a top-level cross join over large subtrees).
 pub struct Edge {
     pub nodes: [NodeId; 2],
     pub on: Vec<(Expr, Expr)>,
+    /// Non-equi predicate carried by a theta-edge (see the type doc). `None`
+    /// for ordinary equi-join edges.
+    pub filter: Option<Expr>,
     pub join_type: JoinType,
     pub null_equality: NullEquality,
 }
@@ -104,25 +114,13 @@ impl JoinGraph {
         // Now convert only the join subtree to a query graph
         let mut join_graph = JoinGraph::new();
         flatten_joins_recursive(join_subtree, &mut join_graph)?;
-        // DEBUG (REORDER_DBG): dump the flattened join graph (node count +
-        // each node's head plan + edge degree). The key signal: a fragmented
-        // 2-node graph means the rule ran AFTER projection insertion (set
-        // REORDER_EARLY=1 in the harness to inject it before). See
-        // `reorder_join/PROGRESS.md`.
-        if std::env::var("REORDER_DBG").is_ok() {
-            let nnodes = join_graph.nodes().count();
-            eprintln!(
-                "[graph] nodes={} filters={}",
-                nnodes,
-                join_graph.filters.len()
-            );
-            for (id, n) in join_graph.nodes() {
-                let head = format!("{}", n.plan);
-                let head = head.lines().next().unwrap_or("");
-                eprintln!("[graph]   node {id}: {head} (conns={})", n.connections.len());
-            }
-        }
         join_graph.derive_implied_single_table_filters();
+        // Promote non-equi predicates that link exactly two relations (e.g. q7's
+        // `(n1='JAPAN' AND n2='CHINA') OR …`) from the side-channel into soft
+        // theta-edges, so IK84 keeps the two relations adjacent and the rebuild
+        // attaches the predicate as a `Join` filter between them instead of
+        // stranding one into a top-level cross join.
+        join_graph.derive_theta_edges();
         // Re-anchor degree-1 inner-join pendants onto the smallest relation in
         // their equi-join equivalence class (e.g. chbench q9's `item`, off the
         // 30M `order_line` and onto `stock`). Sound by construction: the
@@ -130,7 +128,51 @@ impl JoinGraph {
         // only the join *order* changes, never the result. Controlled overall
         // by the `join_reorder` rule gate.
         join_graph.rewire_pendants_to_selective_equivalent();
+        join_graph.trace_state();
         Ok((join_graph, wrappers))
+    }
+
+    /// Emit the final graph state for troubleshooting (replaces the old
+    /// `REORDER_DBG` eprintln dump). A one-line `debug` summary, plus per-node /
+    /// per-edge / per-residual-filter detail at `trace`. A fragmented 2-node
+    /// graph here means the rule ran after projection insertion fragmented the
+    /// join tree; a connected N-node graph is what the enumerator reorders.
+    ///
+    /// Enable with
+    /// `RUST_LOG=datafusion_optimizer_rules::logical_plan::reorder_join=trace`.
+    fn trace_state(&self) {
+        tracing::debug!(
+            nodes = self.nodes.iter().count(),
+            edges = self.edges.iter().count(),
+            filters = self.filters.len(),
+            "join graph built"
+        );
+        // Guard the per-element detail so the `format!`/iteration cost is only
+        // paid when `trace` is actually enabled.
+        if tracing::enabled!(tracing::Level::TRACE) {
+            for (id, node) in self.nodes() {
+                let head = format!("{}", node.plan);
+                tracing::trace!(
+                    node = id,
+                    conns = node.connections.len(),
+                    plan = head.lines().next().unwrap_or(""),
+                    "graph node"
+                );
+            }
+            for (eid, edge) in self.edges.iter() {
+                tracing::trace!(
+                    edge = eid,
+                    nodes = ?edge.nodes,
+                    keys = edge.on.len(),
+                    theta = edge.filter.is_some(),
+                    join_type = ?edge.join_type,
+                    "graph edge"
+                );
+            }
+            for (i, f) in self.filters.iter().enumerate() {
+                tracing::trace!(side_channel_filter = i, expr = %f, "residual filter");
+            }
+        }
     }
 
     pub(crate) fn new() -> Self {
@@ -187,6 +229,7 @@ impl JoinGraph {
             let edge_id = self.edges.insert(Edge {
                 nodes: [from, to],
                 on,
+                filter: None,
                 join_type,
                 null_equality,
             });
@@ -268,6 +311,40 @@ impl JoinGraph {
         }
     }
 
+    /// Adds a "soft" theta-edge: an `Inner` edge with no equi-keys carrying a
+    /// non-equi `filter` between `a` and `b` (see the `Edge` type doc).
+    fn add_theta_edge(&mut self, a: NodeId, b: NodeId, filter: Expr) -> Option<EdgeId> {
+        if self.nodes.contains_key(a) && self.nodes.contains_key(b) {
+            let edge_id = self.edges.insert(Edge {
+                nodes: [a, b],
+                on: Vec::new(),
+                filter: Some(filter),
+                join_type: JoinType::Inner,
+                null_equality: NullEquality::NullEqualsNothing,
+            });
+            if let Some(node) = self.nodes.get_mut(a) {
+                node.connections.push(edge_id);
+            }
+            if let Some(node) = self.nodes.get_mut(b) {
+                node.connections.push(edge_id);
+            }
+            Some(edge_id)
+        } else {
+            None
+        }
+    }
+
+    /// AND-merges `pred` into an existing edge's `filter` (used when a non-equi
+    /// predicate links a pair already connected by an equi-edge).
+    fn set_or_extend_edge_filter(&mut self, edge_id: EdgeId, pred: Expr) {
+        if let Some(edge) = self.edges.get_mut(edge_id) {
+            edge.filter = Some(match edge.filter.take() {
+                Some(existing) => existing.and(pred),
+                None => pred,
+            });
+        }
+    }
+
     /// Returns true if a path already connects `from` to `to`, treating
     /// edges as undirected. Used to detect cycles before adding a new
     /// edge; if a path exists, the new edge would close a cycle.
@@ -342,16 +419,6 @@ impl JoinGraph {
     pub(crate) fn derive_implied_single_table_filters(&mut self) {
         use std::collections::HashMap;
 
-        // DEBUG (REORDER_DBG): list the side-channel filters this pass
-        // inspects. Only top-level ORs with >=2 disjuncts can yield an implied
-        // single-table predicate. See `reorder_join/PROGRESS.md`.
-        if std::env::var("REORDER_DBG").is_ok() {
-            eprintln!("[derive] #filters={}", self.filters.len());
-            for (i, f) in self.filters.iter().enumerate() {
-                eprintln!("[derive] filter[{i}] = {f}");
-            }
-        }
-
         // node_id -> predicates to AND onto that node's plan.
         let mut derived: HashMap<NodeId, Vec<Expr>> = HashMap::new();
 
@@ -408,9 +475,11 @@ impl JoinGraph {
         for (node_id, preds) in derived {
             if let Some(node) = self.nodes.get_mut(node_id) {
                 for pred in preds {
-                    if std::env::var("REORDER_DBG").is_ok() {
-                        eprintln!("[derive] node {node_id} <- {pred}");
-                    }
+                    tracing::debug!(
+                        node = node_id,
+                        predicate = %pred,
+                        "derived implied single-table filter (shrinks the dimension's estimated cardinality)"
+                    );
                     let input = Arc::clone(&node.plan);
                     if let Ok(filter) = Filter::try_new(pred, input) {
                         node.plan = Arc::new(LogicalPlan::Filter(filter));
@@ -418,6 +487,97 @@ impl JoinGraph {
                 }
             }
         }
+    }
+
+    /// Promote side-channel predicates that link *exactly two* relations by a
+    /// non-equi condition into first-class "soft" theta-edges.
+    ///
+    /// `flatten_joins_recursive` can only turn equi-pairs into edges; every
+    /// other cross-relation predicate (e.g. chbench q7's
+    /// `(n1='JAPAN' ∧ n2='CHINA') ∨ (n1='CHINA' ∧ n2='JAPAN')`) is hoisted to
+    /// the side-channel and would otherwise be reapplied as a single top-level
+    /// `Filter` over the *whole* reordered join. With no edge linking them, IK84
+    /// has no signal to keep the two relations adjacent, so the reconstruction
+    /// strands one of them and bridges it with an empty-`on` cross join (which a
+    /// downstream pass turns into a `NestedLoopJoinExec` over large subtrees —
+    /// q7's hang).
+    ///
+    /// For a predicate whose columns resolve in exactly two nodes we either
+    /// attach it to the existing equi-edge between them (so it becomes that
+    /// join's residual `filter`, matching the native plan), or — when no edge
+    /// exists and adding one would not close a cycle — create a theta-edge. The
+    /// predicate is removed from the side-channel so it is applied exactly once.
+    /// Predicates spanning ≠2 relations, or that would close a cycle, stay in
+    /// the side-channel unchanged. Results are identical either way; only join
+    /// order and where the predicate materializes change.
+    ///
+    /// Runs *after* `derive_implied_single_table_filters` (which reads the same
+    /// disjunctions to shrink the per-table cardinalities) and *before*
+    /// `rewire_pendants_to_selective_equivalent`.
+    pub(crate) fn derive_theta_edges(&mut self) {
+        let filters = std::mem::take(&mut self.filters);
+        let mut remaining: Vec<Expr> = Vec::with_capacity(filters.len());
+
+        for filter in filters {
+            let cols = filter.column_refs();
+            if cols.is_empty() {
+                remaining.push(filter);
+                continue;
+            }
+
+            // Nodes whose schema owns at least one of the predicate's columns.
+            let owners: Vec<NodeId> = self
+                .nodes()
+                .filter(|(_, node)| {
+                    let schema = node.plan.schema();
+                    cols.iter().any(|c| schema.has_column(c))
+                })
+                .map(|(id, _)| id)
+                .collect();
+
+            // Must link exactly two relations, and every column must resolve in
+            // one of them (no unowned/ambiguous column).
+            let all_covered = owners.len() == 2
+                && {
+                    let sa = self.get_node(owners[0]).map(|n| n.plan.schema());
+                    let sb = self.get_node(owners[1]).map(|n| n.plan.schema());
+                    match (sa, sb) {
+                        (Some(sa), Some(sb)) => cols
+                            .iter()
+                            .all(|c| sa.has_column(c) || sb.has_column(c)),
+                        _ => false,
+                    }
+                };
+            if !all_covered {
+                remaining.push(filter);
+                continue;
+            }
+
+            let (a, b) = (owners[0], owners[1]);
+            if let Some(edge_id) = self.find_edge_between(a, b) {
+                tracing::debug!(
+                    left = a,
+                    right = b,
+                    predicate = %filter,
+                    "theta predicate merged onto existing edge"
+                );
+                self.set_or_extend_edge_filter(edge_id, filter);
+            } else if !self.path_exists(a, b) {
+                tracing::debug!(
+                    left = a,
+                    right = b,
+                    predicate = %filter,
+                    "theta soft edge added (keeps the two relations adjacent)"
+                );
+                self.add_theta_edge(a, b, filter);
+            } else {
+                // Adding an edge would close a cycle; leave it in the
+                // side-channel for top-level reapplication.
+                remaining.push(filter);
+            }
+        }
+
+        self.filters = remaining;
     }
 
     /// Re-anchors degree-1 inner-join pendants onto a smaller relation that

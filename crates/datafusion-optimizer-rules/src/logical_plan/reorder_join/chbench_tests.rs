@@ -62,9 +62,6 @@ struct StatTable {
 
 #[async_trait]
 impl TableProvider for StatTable {
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
     fn schema(&self) -> SchemaRef {
         Arc::clone(&self.schema)
     }
@@ -123,9 +120,6 @@ impl ModUdf {
 }
 
 impl ScalarUDFImpl for ModUdf {
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
     fn name(&self) -> &'static str {
         "mod"
     }

@@ -799,8 +799,8 @@ impl ExecutionPlan for CayenneAccelerationExec {
         self.inner.metrics()
     }
 
-    //fn partition_statistics(&self, partition: Option<usize>) -> Result<Statistics> {
-     //   let child_stats = self.inner.partition_statistics(partition)?;
+    fn partition_statistics(&self, partition: Option<usize>) -> Result<Arc<Statistics>> {
+        let child_stats = self.inner.partition_statistics(partition)?;
         // The overlay is a per-table (global) aggregate: its min/max/NDV
         // describe the whole table, not any single partition. Only the
         // table-wide aggregate stats (`partition == None`) may be refilled from
@@ -808,18 +808,17 @@ impl ExecutionPlan for CayenneAccelerationExec {
         // unchanged — filling them from the global aggregate would violate
         // `partition_statistics(Some(_))` semantics and mislead partition-level
         // pruning/optimization.
-     //   let Some(overlay) = self
-     //       .optimizer_column_overlay
-     //       .as_ref()
-     //       .filter(|_| partition.is_none())
-    //    else {
-    //        return Ok(child_stats);
-     //   };
-      //  Ok(restore_absent_column_statistics(child_stats, overlay))
-   // }
-
-    fn partition_statistics(&self, partition: Option<usize>) -> Result<Arc<Statistics>> {
-        self.inner.partition_statistics(partition)
+        let Some(overlay) = self
+            .optimizer_column_overlay
+            .as_ref()
+            .filter(|_| partition.is_none())
+        else {
+            return Ok(child_stats);
+        };
+        Ok(Arc::new(restore_absent_column_statistics(
+            Arc::unwrap_or_clone(child_stats),
+            overlay,
+        )))
     }
 
     // Allow optimizer to push limits through to inputs

@@ -80,7 +80,17 @@ pub trait JoinCostEstimator: std::fmt::Debug {
                 | JoinType::RightSemi
                 | JoinType::RightAnti
         );
-        if !is_eq_join || edge.on.is_empty() {
+        // Soft theta-edge: no equi-keys, just a non-equi predicate linking the
+        // two relations (e.g. q7's nation OR). Size it from the predicate
+        // itself, resolving each column against whichever side owns it.
+        if edge.on.is_empty() {
+            if let Some(filter) = &edge.filter {
+                return predicate_selectivity_two_sided(filter, left, right)
+                    .clamp(0.0, 1.0);
+            }
+            return fallback;
+        }
+        if !is_eq_join {
             return fallback;
         }
         // Estimate from the first equi-pair only. Composing 1/max(NDV) across
@@ -351,6 +361,75 @@ fn equality_selectivity(left: &Expr, right: &Expr, input: &LogicalPlan) -> f64 {
     }
 }
 
+/// Selectivity of a theta-edge predicate whose columns may come from *either*
+/// of the two joined relations. Mirrors `predicate_selectivity` but resolves
+/// each `col = literal` against whichever side owns the column. Used to size a
+/// soft theta-edge (e.g. q7's `(n1=… ∧ n2=…) ∨ …`) so IK84 joins the two small
+/// relations early.
+fn predicate_selectivity_two_sided(
+    pred: &Expr,
+    left: &LogicalPlan,
+    right: &LogicalPlan,
+) -> f64 {
+    match pred {
+        Expr::Alias(a) => predicate_selectivity_two_sided(&a.expr, left, right),
+        Expr::Not(inner) => 1.0 - predicate_selectivity_two_sided(inner, left, right),
+        Expr::BinaryExpr(be) => match be.op {
+            Operator::And => {
+                predicate_selectivity_two_sided(&be.left, left, right)
+                    * predicate_selectivity_two_sided(&be.right, left, right)
+            }
+            Operator::Or => {
+                let l = predicate_selectivity_two_sided(&be.left, left, right);
+                let r = predicate_selectivity_two_sided(&be.right, left, right);
+                (l + r - l * r).clamp(0.0, 1.0)
+            }
+            Operator::Eq => {
+                equality_selectivity_two_sided(&be.left, &be.right, left, right)
+            }
+            Operator::NotEq => {
+                1.0 - equality_selectivity_two_sided(&be.left, &be.right, left, right)
+            }
+            Operator::Lt | Operator::LtEq | Operator::Gt | Operator::GtEq => {
+                DEFAULT_RANGE_SELECTIVITY
+            }
+            _ => DEFAULT_FILTER_SELECTIVITY,
+        },
+        _ => DEFAULT_FILTER_SELECTIVITY,
+    }
+}
+
+/// `col = literal` selectivity ≈ `1 / NDV(col)`, resolving `col` against
+/// whichever of `left`/`right` owns it. The two-input analogue of
+/// `equality_selectivity`.
+fn equality_selectivity_two_sided(
+    l: &Expr,
+    r: &Expr,
+    left: &LogicalPlan,
+    right: &LogicalPlan,
+) -> f64 {
+    let col = match (l, r) {
+        (Expr::Column(c), other) if is_literal(other) => Some(c),
+        (other, Expr::Column(c)) if is_literal(other) => Some(c),
+        _ => None,
+    };
+    match col.and_then(|c| ndv_two_sided(c, left, right)) {
+        Some(ndv) if ndv > 0.0 => (1.0 / ndv).clamp(0.0, 1.0),
+        _ => DEFAULT_FILTER_SELECTIVITY,
+    }
+}
+
+/// NDV of `col` on whichever of `left`/`right` owns it.
+fn ndv_two_sided(col: &Column, left: &LogicalPlan, right: &LogicalPlan) -> Option<f64> {
+    if left.schema().has_column(col) {
+        estimate_cardinality(left, Some(col)).ok()
+    } else if right.schema().has_column(col) {
+        estimate_cardinality(right, Some(col)).ok()
+    } else {
+        None
+    }
+}
+
 /// NDV of `expr` on `input` when `expr` is a plain column reference.
 fn column_ndv_in(expr: &Expr, input: &LogicalPlan) -> Option<f64> {
     match expr {
@@ -463,7 +542,6 @@ pub(super) fn estimate_cardinality(plan: &LogicalPlan, column: Option<&Column>) 
             // `DefaultTableSource` wrapper.
             let stats = scan
                 .source
-                .as_any()
                 .downcast_ref::<DefaultTableSource>()
                 .and_then(|src| src.table_provider.statistics())
                 .ok_or_else(|| {
@@ -473,13 +551,31 @@ pub(super) fn estimate_cardinality(plan: &LogicalPlan, column: Option<&Column>) 
                     ))
                 })?;
             match column {
-                None => match stats.num_rows {
-                    Precision::Exact(n) | Precision::Inexact(n) => Ok(n as f64),
-                    Precision::Absent => plan_err!(
-                        "TableSource for `{}` does not provide a row count",
-                        scan.table_name
-                    ),
-                },
+                None => {
+                    let base = match stats.num_rows {
+                        Precision::Exact(n) | Precision::Inexact(n) => n as f64,
+                        Precision::Absent => {
+                            return plan_err!(
+                                "TableSource for `{}` does not provide a row count",
+                                scan.table_name
+                            );
+                        }
+                    };
+                    // Credit pushed-down scan filters. `push_down_filter` moves
+                    // predicates into `TableScan.filters` before the reorder runs,
+                    // but the provider's row count is *unfiltered* — so without
+                    // this the cost model sees a filtered dimension (e.g. item
+                    // `i_data LIKE '%b'`) as its full 100K, never as the tiny
+                    // relation it is, and IK84 seeds a non-pruning computed-key
+                    // path (chbench q2/q8/q9 `mod`→stock) instead of the selective
+                    // relation. Empty `filters` ⇒ product is 1.0 (no change).
+                    let sel: f64 = scan
+                        .filters
+                        .iter()
+                        .map(|f| predicate_selectivity(f, plan))
+                        .product();
+                    Ok((base * sel).max(1.0))
+                }
                 Some(c) => {
                     // `column_statistics` is indexed by the source schema
                     // (pre-projection), so resolve the column there.

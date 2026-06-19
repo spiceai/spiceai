@@ -18,7 +18,7 @@
 //! `OptimizerRule` wrapper for join reordering.
 //!
 //! Append this to an `Optimizer`'s rule list (or to a
-//! `SessionStateBuilder` via `with_optimizer_rule`) so the IK84 reorder
+//! `SessionStateBuilder` via `with_optimizer_rule`) so the reorder
 //! runs *after* `ExtractEquijoinPredicate` has lifted equi-conditions
 //! into the joins' `on` clauses. Running it before that point leaves the
 //! reorder with empty-`on` cross-products and a disconnected join graph.
@@ -71,6 +71,11 @@ impl OptimizerRule for ReorderJoinRule {
         _config: &dyn OptimizerConfig,
     ) -> Result<Transformed<LogicalPlan>> {
         let before = plan.clone();
+        tracing::debug!(
+            joins = count_joins(&before),
+            cross_joins = count_inner_cross_joins(&before),
+            "reorder_join rule invoked"
+        );
         // Join reordering is strictly best-effort: spiceai does NOT guarantee
         // every `TableProvider` exposes statistics (the default `statistics()`
         // returns `None`; only Cayenne/accelerated/dataset providers implement
@@ -83,7 +88,12 @@ impl OptimizerRule for ReorderJoinRule {
             // IK84 is deterministic on a stable graph, so a second pass over an
             // already-optimal plan reproduces the same chain; converge by
             // reporting no change.
-            Ok(after) if after == before => Ok(Transformed::no(after)),
+            Ok(after) if after == before => {
+                tracing::debug!(
+                    "reorder_join: no change (already optimal or no reorderable joins)"
+                );
+                Ok(Transformed::no(after))
+            }
             // Validate the reordered plan before accepting it: every join `on`
             // key must resolve in its own input's schema. A reconstruction bug
             // (e.g. q21's anti-join + mod-key mix, where an inner edge is
@@ -109,18 +119,34 @@ impl OptimizerRule for ReorderJoinRule {
                     && count_inner_cross_joins(&after)
                         <= count_inner_cross_joins(&before) =>
             {
+                tracing::debug!(
+                    cross_joins = count_inner_cross_joins(&after),
+                    "reorder_join applied (join order changed)"
+                );
                 Ok(Transformed::yes(after))
             }
-            Ok(_) => {
-                tracing::debug!(
-                    target: "reorder_join",
-                    "skipping join reorder: reordered plan has unresolved join keys or an introduced cross/theta join (plan left unchanged)"
+            Ok(after) => {
+                // We produced a reordered plan but it failed validation, so we
+                // fall back to the native plan. This is a genuine miss — the rule
+                // *could* reorder this join graph but the reconstruction came out
+                // invalid (e.g. q7's non-equi `n1`/`n2` OR predicate forcing a
+                // cross/theta join, or a dropped equi-edge leaving unresolved
+                // keys) — so warn rather than debug to surface it.
+                let reason = if !join_keys_resolve(&after) {
+                    "reordered plan has unresolved join keys (reconstruction dropped an equi-edge)"
+                } else {
+                    "reorder introduced a cross/theta join (a relation linked only by a non-equi predicate was stranded)"
+                };
+                tracing::warn!(
+                    reason,
+                    cross_joins_before = count_inner_cross_joins(&before),
+                    cross_joins_after = count_inner_cross_joins(&after),
+                    "unable to apply join reorder; falling back to native plan (plan left unchanged)"
                 );
                 Ok(Transformed::no(before))
             }
             Err(e) => {
                 tracing::debug!(
-                    target: "reorder_join",
                     "skipping join reorder (plan left unchanged): {e}"
                 );
                 Ok(Transformed::no(before))
@@ -154,16 +180,35 @@ fn join_keys_resolve(plan: &LogicalPlan) -> bool {
     plan.inputs().iter().all(|input| join_keys_resolve(input))
 }
 
-/// Counts Inner `Join` nodes with an empty `on` clause (cross/theta joins) in
-/// `plan`. The reorder is rejected when it produces *more* of these than the
-/// input had, i.e. when reordering stranded a relation that was only linked by a
-/// non-equi predicate and had to be reconnected with a cross join (which a
-/// downstream pass turns into a `NestedLoopJoinExec`). See the call site for why
-/// that can make a query never finish.
+/// Counts *true* cross products — Inner `Join` nodes with an empty `on` clause
+/// **and** no `filter` — in `plan`. The reorder is rejected when it produces
+/// *more* of these than the input had, i.e. when reordering stranded a relation
+/// that was only linked by a non-equi predicate and had to be reconnected with a
+/// bare cross join (which a downstream pass turns into a `NestedLoopJoinExec`).
+/// See the call site for why that can make a query never finish.
+///
+/// A theta join (empty `on` but `filter = Some(..)`, produced by
+/// `derive_theta_edges`) is deliberately *not* counted: the soft-edge feature
+/// places it between the two small relations the predicate links, so it is a
+/// cheap filtered join, not a cartesian blow-up.
+/// Total number of `Join` nodes anywhere in `plan` (any join type). Used only
+/// for the entry debug trace, to distinguish a no-op invocation on a join-free
+/// plan from a real reorder candidate.
+fn count_joins(plan: &LogicalPlan) -> usize {
+    let here = usize::from(matches!(plan, LogicalPlan::Join(_)));
+    here + plan
+        .inputs()
+        .iter()
+        .map(|input| count_joins(input))
+        .sum::<usize>()
+}
+
 fn count_inner_cross_joins(plan: &LogicalPlan) -> usize {
     let here = match plan {
         LogicalPlan::Join(join)
-            if join.join_type == JoinType::Inner && join.on.is_empty() =>
+            if join.join_type == JoinType::Inner
+                && join.on.is_empty()
+                && join.filter.is_none() =>
         {
             1
         }
