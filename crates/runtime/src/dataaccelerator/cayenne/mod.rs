@@ -644,8 +644,19 @@ impl CayenneAccelerator {
     ) -> cayenne::metadata::VortexConfig {
         let mut config = cayenne::metadata::VortexConfig {
             footer_cache_mb,
+            // Default the query/scan path to Arrow view types (Utf8View/BinaryView)
+            // so DataFusion plans joins/aggregates on view arrays and the
+            // hash-join build-side `concat_batches` cannot hit the i32 2 GiB offset
+            // overflow (CH-benCH q21 @SF1000). The stored schema stays Utf8/Binary.
+            // Operators can opt out with `cayenne_force_view_types: false`.
+            force_view_read_schema: true,
             ..Default::default()
         };
+        if let Some(acceleration) = source.acceleration()
+            && let Some(v) = acceleration.params.get("cayenne_force_view_types")
+        {
+            config.force_view_read_schema = !v.trim().eq_ignore_ascii_case("false");
+        }
 
         // Auto-tune the memory-/cpu-/storage-sensitive Vortex knobs from a
         // single detected host profile so they move together for the host

@@ -507,6 +507,14 @@ impl CayenneContext {
         self.config.scan_from_manifest
     }
 
+    /// Whether the query/scan path advertises and decodes `Utf8`/`Binary`
+    /// columns as Arrow view types (`Utf8View`/`BinaryView`). See
+    /// [`crate::metadata::VortexConfig::force_view_read_schema`].
+    #[must_use]
+    pub(crate) fn force_view_read_schema(&self) -> bool {
+        self.config.force_view_read_schema
+    }
+
     /// Maximum number of consecutive compaction passes per trigger.
     #[must_use]
     pub(crate) fn compaction_max_levels(&self) -> usize {

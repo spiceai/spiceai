@@ -377,6 +377,16 @@ fn widen_type(current: &DataType, incoming: &DataType) -> TypeWidening {
         | (DataType::Binary, DataType::LargeBinary | DataType::BinaryView)
         | (DataType::FixedSizeBinary(_), DataType::Binary)
         | (DataType::Date32, DataType::Date64) => TypeWidening::Widened(incoming.clone()),
+        // A view/large string-or-binary column already holds the full value
+        // domain of a narrower same-family column, so an accelerator advertising
+        // view types (e.g. Cayenne's force-view read schema over `Utf8`/`Binary`
+        // storage) compared against a non-view source is NOT a schema change —
+        // classify it `Equal`. The narrow -> wide direction above stays `Widened`
+        // so a genuine source widening for non-view accelerators still evolves.
+        (DataType::Utf8View, DataType::Utf8 | DataType::LargeUtf8)
+        | (DataType::LargeUtf8, DataType::Utf8 | DataType::Utf8View)
+        | (DataType::BinaryView, DataType::Binary | DataType::LargeBinary)
+        | (DataType::LargeBinary, DataType::Binary | DataType::BinaryView) => TypeWidening::Equal,
         (DataType::Time32(from_unit), DataType::Time32(to_unit) | DataType::Time64(to_unit))
         | (DataType::Time64(from_unit), DataType::Time64(to_unit)) => {
             if time_unit_rank(*to_unit) > time_unit_rank(*from_unit) {
@@ -548,6 +558,30 @@ mod tests {
                 "expected {from} -> {to} to NOT be a widening cast"
             );
         }
+    }
+
+    #[test]
+    fn view_over_nonview_string_binary_is_not_an_evolution() {
+        // A view/large accelerator column compared against a narrower same-family
+        // source column is NOT a schema change (e.g. Cayenne's force-view read
+        // schema over a Utf8/Binary source). classify(current=view, incoming=
+        // nonview) must be Identical — not Widening or Incompatible.
+        let pairs = [
+            (DataType::Utf8View, DataType::Utf8),
+            (DataType::Utf8View, DataType::LargeUtf8),
+            (DataType::LargeUtf8, DataType::Utf8),
+            (DataType::BinaryView, DataType::Binary),
+            (DataType::BinaryView, DataType::LargeBinary),
+            (DataType::LargeBinary, DataType::Binary),
+        ];
+        for (current, incoming) in pairs {
+            let cur = Schema::new(vec![Field::new("c", current.clone(), true)]);
+            let inc = Schema::new(vec![Field::new("c", incoming.clone(), true)]);
+            assert_identical(&classify(&cur, &inc, &NO_CONSTRAINTS));
+        }
+        // The narrow -> wide direction stays a (lossless) widening for non-view
+        // accelerators that genuinely evolve their stored type.
+        assert!(is_widening_cast(&DataType::Utf8, &DataType::Utf8View));
     }
 
     mod widening_matrix {

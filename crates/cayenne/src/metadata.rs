@@ -932,6 +932,18 @@ pub struct VortexConfig {
     /// land). A slow tier biases toward larger inline-flush to amortize commits.
     #[serde(skip)]
     pub metastore_storage_class: StorageClass,
+    /// Force the **read/query** scan to emit Arrow *view* types (`Utf8View`/
+    /// `BinaryView`) for `Utf8`/`Binary` columns, decoupled from the stored
+    /// schema (which keeps the original types for writes/CDC/stats/keyset). Lets
+    /// DataFusion plan joins/aggregates on view arrays, avoiding the i32 2 GiB
+    /// offset overflow in hash-join build-side `concat_batches` (e.g. CH-benCH
+    /// q21 at SF1000, where `su_name` fans out across a ~100M-row join). A runtime
+    /// read behavior that does not affect stored data, so `#[serde(skip)]` — not a
+    /// spicepod knob and not compared by `configuration_matches`. Off by default
+    /// (direct construction / unit tests keep `Utf8`); the runtime factory enables
+    /// it. See `viewify_read_schema`.
+    #[serde(skip)]
+    pub force_view_read_schema: bool,
 }
 
 /// Evolution set permitted when a widening schema difference is detected at
@@ -1218,6 +1230,7 @@ impl Default for VortexConfig {
             goal_convergence_window_secs: None,
             data_storage_class: StorageClass::default(),
             metastore_storage_class: StorageClass::default(),
+            force_view_read_schema: false,
         }
     }
 }

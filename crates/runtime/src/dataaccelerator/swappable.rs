@@ -27,7 +27,7 @@ limitations under the License.
 use std::sync::{Arc, RwLock};
 
 use async_trait::async_trait;
-use datafusion::arrow::datatypes::{Schema, SchemaRef};
+use datafusion::arrow::datatypes::{DataType, Schema, SchemaRef};
 use datafusion::catalog::{Session, TableProvider};
 use datafusion::common::{Constraints, Statistics};
 use datafusion::error::Result as DFResult;
@@ -66,9 +66,32 @@ pub fn schemas_compatible(candidate: &Schema, expected: &Schema) -> bool {
         .zip(expected.fields().iter())
         .all(|(c, e)| {
             c.name() == e.name()
-                && c.data_type() == e.data_type()
+                && data_types_compatible(c.data_type(), e.data_type())
                 && c.is_nullable() == e.is_nullable()
         })
+}
+
+/// `Utf8`, `LargeUtf8`, and `Utf8View` are one logical UTF-8 string type with
+/// different physical layouts; likewise `Binary`/`LargeBinary`/`BinaryView`.
+/// Treat the members of each family as interchangeable so an accelerator that
+/// advertises view types (e.g. Cayenne's force-view read schema, which decouples
+/// the query/scan types from the stored `Utf8`/`Binary` types) is not rejected as
+/// incompatible with a non-view source or snapshot. The values are losslessly
+/// castable in both directions and write paths normalize via `try_cast_to`.
+fn data_types_compatible(a: &DataType, b: &DataType) -> bool {
+    fn is_string(dt: &DataType) -> bool {
+        matches!(
+            dt,
+            DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View
+        )
+    }
+    fn is_binary(dt: &DataType) -> bool {
+        matches!(
+            dt,
+            DataType::Binary | DataType::LargeBinary | DataType::BinaryView
+        )
+    }
+    a == b || (is_string(a) && is_string(b)) || (is_binary(a) && is_binary(b))
 }
 
 /// A [`TableProvider`] that delegates to an inner provider which may be
@@ -351,5 +374,31 @@ mod tests {
             .swap(nullable)
             .expect_err("nullability change must be rejected");
         assert!(matches!(err, SwapError::SchemaMismatch));
+    }
+
+    #[test]
+    fn schemas_compatible_treats_view_and_nonview_string_binary_as_equal() {
+        // String family: Utf8 / LargeUtf8 / Utf8View are interchangeable (an
+        // accelerator advertising view types over a non-view source must not be
+        // rejected). Same for the binary family. Nullability/name still strict.
+        let utf8 = Schema::new(vec![Field::new("s", DataType::Utf8, true)]);
+        let utf8_view = Schema::new(vec![Field::new("s", DataType::Utf8View, true)]);
+        let large_utf8 = Schema::new(vec![Field::new("s", DataType::LargeUtf8, true)]);
+        assert!(schemas_compatible(&utf8, &utf8_view));
+        assert!(schemas_compatible(&utf8_view, &utf8)); // symmetric
+        assert!(schemas_compatible(&large_utf8, &utf8_view));
+
+        let binary = Schema::new(vec![Field::new("b", DataType::Binary, false)]);
+        let binary_view = Schema::new(vec![Field::new("b", DataType::BinaryView, false)]);
+        assert!(schemas_compatible(&binary, &binary_view));
+        assert!(schemas_compatible(&binary_view, &binary));
+
+        // Cross-family and unrelated types stay incompatible.
+        let int = Schema::new(vec![Field::new("s", DataType::Int32, true)]);
+        assert!(!schemas_compatible(&utf8, &int));
+        assert!(!schemas_compatible(&utf8, &binary));
+        // Nullability mismatch is still rejected even within a family.
+        let utf8_view_nonnull = Schema::new(vec![Field::new("s", DataType::Utf8View, false)]);
+        assert!(!schemas_compatible(&utf8, &utf8_view_nonnull));
     }
 }
