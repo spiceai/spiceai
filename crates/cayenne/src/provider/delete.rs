@@ -24,7 +24,7 @@ limitations under the License.
 //!
 //! - **Int64 PK-based (`Int64PkDeletionFilterExec`)**: For tables with a single-column
 //!   Int64 primary key. Bloom-prefilters each row's PK, then probes the cached fused
-//!   `DeletionIndex` (LayeredRuns) — no per-row serialization. The most efficient
+//!   `DeletionIndex` (`LayeredRuns`) — no per-row serialization. The most efficient
 //!   deletion strategy for the common case.
 //!
 //! - **RowConverter-based (`KeyBasedDeletionFilterExec`)**: For tables with composite

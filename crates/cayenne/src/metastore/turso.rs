@@ -16,7 +16,7 @@ limitations under the License.
 
 //! Turso implementation of the metastore backend.
 //!
-//! libSQL/Turso backend (gated on the `turso` feature). Unlike SQLite's single writer,
+//! libSQL/Turso backend (gated on the `turso` feature). Unlike `SQLite`'s single writer,
 //! it uses `BEGIN CONCURRENT` MVCC writers that run in parallel and serialize at commit
 //! time only on actual conflicts, behind a fixed `K = 16` connection pool.
 
