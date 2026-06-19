@@ -39,9 +39,7 @@ use super::acceleration_options::DatasetOptions;
 use crate::accelerated_table::AcceleratedTable;
 use crate::cluster::ExecutorRegistry;
 use crate::datafusion::DataFusion;
-use crate::datafusion::composed_catalog::ComposedCatalogProvider;
 use data_components::RefreshableCatalogProvider;
-use data_components::iceberg::provider::IcebergCatalogProvider;
 use datafusion::catalog::CatalogProviderList;
 
 use crate::component::dataset::acceleration::{Acceleration as RuntimeAcceleration, Mode};
@@ -1117,29 +1115,18 @@ async fn refresh_iceberg_catalog_provider(
         )));
     };
 
-    if let Some(iceberg_provider) = df_catalog.downcast_ref::<IcebergCatalogProvider>() {
-        iceberg_provider.refresh().await.map_err(|e| {
-            DataFusionError::Execution(format!(
-                "Failed to refresh Iceberg catalog '{df_catalog_name}': {e}"
-            ))
-        })?;
-        return Ok(());
-    }
+    let Some(iceberg_provider) = super::iceberg_provider_ref(df_catalog.as_ref()) else {
+        return Err(DataFusionError::Execution(format!(
+            "Catalog '{df_catalog_name}' is not an Iceberg catalog"
+        )));
+    };
 
-    if let Some(composed) = df_catalog.downcast_ref::<ComposedCatalogProvider>()
-        && let Some(iceberg_provider) = composed.external().downcast_ref::<IcebergCatalogProvider>()
-    {
-        iceberg_provider.refresh().await.map_err(|e| {
-            DataFusionError::Execution(format!(
-                "Failed to refresh Iceberg catalog '{df_catalog_name}': {e}"
-            ))
-        })?;
-        return Ok(());
-    }
-
-    Err(DataFusionError::Execution(format!(
-        "Catalog '{df_catalog_name}' is not an Iceberg catalog"
-    )))
+    iceberg_provider.refresh().await.map_err(|e| {
+        DataFusionError::Execution(format!(
+            "Failed to refresh Iceberg catalog '{df_catalog_name}': {e}"
+        ))
+    })?;
+    Ok(())
 }
 
 async fn rollback_created_iceberg_table(

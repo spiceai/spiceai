@@ -30,7 +30,7 @@ use datafusion::physical_plan::ExecutionPlan;
 use datafusion::prelude::SessionContext;
 use datafusion_ddl::{CatalogDdlHandler, CreateSchemaParams, CreateTableParams, DropTableParams};
 
-use crate::catalog_provider::CayenneCatalogProvider;
+use crate::ddl::get_cayenne_provider;
 use crate::ddl::operations;
 use crate::ddl::physical_plans::{
     CayenneCreateSchemaExec, CayenneCreateTableExec, CayenneDropTableExec,
@@ -52,7 +52,7 @@ impl CatalogDdlHandler for CayenneDdlHandler {
     ) -> bool {
         catalog_list
             .catalog(catalog_name)
-            .is_some_and(|c| c.downcast_ref::<CayenneCatalogProvider>().is_some())
+            .is_some_and(|c| get_cayenne_provider(c.as_ref()).is_some())
     }
 
     fn create_table_exec(
