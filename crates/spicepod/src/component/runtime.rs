@@ -902,6 +902,14 @@ pub struct Query {
     /// Overrides `DataFusion`'s local query target partition count.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub target_partitions: Option<usize>,
+
+    /// Prefer hash joins over sort-merge joins during physical planning. Maps to
+    /// `datafusion.optimizer.prefer_hash_join`; defaults to `true` (hash joins).
+    /// Set to `false` for very large analytical joins that would otherwise
+    /// exhaust the query memory pool: `HashJoinExec` build sides are not
+    /// spillable, whereas sort-merge joins spill to disk.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prefer_hash_join: Option<bool>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -1326,6 +1334,7 @@ mod tests {
                 temp_directory: None,
                 memory_limit: Some("100MiB".to_string()),
                 target_partitions: None,
+                prefer_hash_join: None,
             })
         );
 
@@ -1342,6 +1351,7 @@ mod tests {
                 temp_directory: None,
                 memory_limit: Some("200MiB".to_string()),
                 target_partitions: None,
+                prefer_hash_join: None,
             })
         );
 
@@ -1359,6 +1369,7 @@ mod tests {
                 temp_directory: None,
                 memory_limit: Some("200MiB".to_string()),
                 target_partitions: None,
+                prefer_hash_join: None,
             })
         );
 
@@ -1383,6 +1394,7 @@ mod tests {
                 temp_directory: Some("/foo".to_string()),
                 memory_limit: None,
                 target_partitions: None,
+                prefer_hash_join: None,
             })
         );
 
@@ -1399,6 +1411,7 @@ mod tests {
                 temp_directory: Some("/bar".to_string()),
                 memory_limit: None,
                 target_partitions: None,
+                prefer_hash_join: None,
             })
         );
 
@@ -1416,6 +1429,7 @@ mod tests {
                 temp_directory: Some("/bar".to_string()),
                 memory_limit: None,
                 target_partitions: None,
+                prefer_hash_join: None,
             })
         );
 

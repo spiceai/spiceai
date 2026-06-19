@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
-use std::any::Any;
 use std::fmt::Formatter;
 use std::ops::Range;
 use std::sync::Arc;
@@ -248,10 +247,6 @@ impl FileSource for VortexSource {
         };
 
         Ok(Arc::new(opener))
-    }
-
-    fn as_any(&self) -> &dyn Any {
-        self
     }
 
     fn with_batch_size(&self, batch_size: usize) -> Arc<dyn FileSource> {

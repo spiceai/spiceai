@@ -152,7 +152,6 @@ impl TableFunctionImpl for ExecutorTableFunc {
             DataFusionError::Plan(format!("executor_table: schema '{sch_name}' not found"))
         })?;
         let cayenne_schema = schema_provider
-            .as_any()
             .downcast_ref::<CayenneSchemaProvider>()
             .ok_or_else(|| {
                 DataFusionError::Plan(format!(

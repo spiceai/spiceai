@@ -29,7 +29,7 @@ use datafusion::{
     sql::TableReference,
 };
 
-use std::{any::Any, sync::Arc};
+use std::sync::Arc;
 
 use crate::oracle::{
     connection::OracleConnectionPool, convert::map_oracle_type_to_arrow_type,
@@ -203,10 +203,6 @@ impl OracleTableProvider {
 
 #[async_trait]
 impl TableProvider for OracleTableProvider {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema(&self) -> SchemaRef {
         Arc::clone(&self.schema)
     }
@@ -271,7 +267,7 @@ fn is_datetime_related_expr(expr: &Expr) -> bool {
     match expr {
         Expr::Cast(cast) => {
             matches!(
-                cast.data_type,
+                cast.field.data_type(),
                 DataType::Time32(_)
                     | DataType::Time64(_)
                     | DataType::Date32

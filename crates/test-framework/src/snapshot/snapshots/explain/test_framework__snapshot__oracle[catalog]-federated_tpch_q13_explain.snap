@@ -2,39 +2,37 @@
 source: crates/test-framework/src/snapshot/mod.rs
 description: "Query: tpch_q13"
 ---
-+---------------+----------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
-| plan_type     | plan                                                                                                                                                                       |
-+---------------+----------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
-| logical_plan  | Sort: custdist DESC NULLS FIRST, c_orders.c_count DESC NULLS FIRST                                                                                                         |
-|               |   Projection: c_orders.c_count, count(Int64(1)) AS custdist                                                                                                                |
-|               |     Aggregate: groupBy=[[c_orders.c_count]], aggr=[[count(Int64(1))]]                                                                                                      |
-|               |       SubqueryAlias: c_orders                                                                                                                                              |
-|               |         Projection: count(oracle_tpch.TPCH_SF1.ORDERS.O_ORDERKEY) AS c_count                                                                                               |
-|               |           Aggregate: groupBy=[[oracle_tpch.TPCH_SF1.CUSTOMER.C_CUSTKEY]], aggr=[[count(oracle_tpch.TPCH_SF1.ORDERS.O_ORDERKEY)]]                                           |
-|               |             Projection: oracle_tpch.TPCH_SF1.CUSTOMER.C_CUSTKEY, oracle_tpch.TPCH_SF1.ORDERS.O_ORDERKEY                                                                    |
-|               |               Left Join: oracle_tpch.TPCH_SF1.CUSTOMER.C_CUSTKEY = oracle_tpch.TPCH_SF1.ORDERS.O_CUSTKEY                                                                   |
-|               |                 TableScan: oracle_tpch.TPCH_SF1.CUSTOMER projection=[C_CUSTKEY]                                                                                            |
-|               |                 Projection: oracle_tpch.TPCH_SF1.ORDERS.O_ORDERKEY, oracle_tpch.TPCH_SF1.ORDERS.O_CUSTKEY                                                                  |
-|               |                   Filter: oracle_tpch.TPCH_SF1.ORDERS.O_COMMENT NOT LIKE Utf8("%special%requests%")                                                                        |
-|               |                     TableScan: oracle_tpch.TPCH_SF1.ORDERS projection=[O_ORDERKEY, O_CUSTKEY, O_COMMENT]                                                                   |
-| physical_plan | SortPreservingMergeExec: [custdist@1 DESC, c_count@0 DESC]                                                                                                                 |
-|               |   SortExec: expr=[custdist@1 DESC, c_count@0 DESC], preserve_partitioning=[true]                                                                                           |
-|               |     ProjectionExec: expr=[c_count@0 as c_count, count(Int64(1))@1 as custdist]                                                                                             |
-|               |       AggregateExec: mode=FinalPartitioned, gby=[c_count@0 as c_count], aggr=[count(Int64(1))]                                                                             |
-|               |         RepartitionExec: partitioning=Hash([c_count@0], 32), input_partitions=32                                                                                           |
-|               |           AggregateExec: mode=Partial, gby=[c_count@0 as c_count], aggr=[count(Int64(1))]                                                                                  |
-|               |             ProjectionExec: expr=[count(oracle_tpch.TPCH_SF1.ORDERS.O_ORDERKEY)@1 as c_count]                                                                              |
-|               |               AggregateExec: mode=SinglePartitioned, gby=[C_CUSTKEY@0 as C_CUSTKEY], aggr=[count(oracle_tpch.TPCH_SF1.ORDERS.O_ORDERKEY)]                                  |
-|               |                 HashJoinExec: mode=Partitioned, join_type=Left, accumulator=MinMaxLeftAccumulator, on=[(C_CUSTKEY@0, O_CUSTKEY@1)], projection=[C_CUSTKEY@0, O_ORDERKEY@1] |
-|               |                   RepartitionExec: partitioning=Hash([C_CUSTKEY@0], 32), input_partitions=1                                                                                |
-|               |                     CooperativeExec                                                                                                                                        |
-|               |                       BytesProcessedExec                                                                                                                                   |
-|               |                         OracleExec sql=SELECT "C_CUSTKEY" FROM "TPCH_SF1"."CUSTOMER"                                                                                       |
-|               |                   RepartitionExec: partitioning=Hash([O_CUSTKEY@1], 32), input_partitions=32                                                                               |
-|               |                     FilterExec: O_COMMENT@2 NOT LIKE %special%requests%, projection=[O_ORDERKEY@0, O_CUSTKEY@1]                                                            |
-|               |                       RepartitionExec: partitioning=RoundRobinBatch(32), input_partitions=1                                                                                |
-|               |                         CooperativeExec                                                                                                                                    |
-|               |                           BytesProcessedExec                                                                                                                               |
-|               |                             OracleExec sql=SELECT "O_ORDERKEY", "O_CUSTKEY", "O_COMMENT" FROM "TPCH_SF1"."ORDERS"                                                          |
-|               |                                                                                                                                                                            |
-+---------------+----------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
++---------------+-------------------------------------------------------------------------------------------------------------------------------------------+
+| plan_type     | plan                                                                                                                                      |
++---------------+-------------------------------------------------------------------------------------------------------------------------------------------+
+| logical_plan  | Sort: custdist DESC NULLS FIRST, c_orders.c_count DESC NULLS FIRST                                                                        |
+|               |   Projection: c_orders.c_count, count(Int64(1)) AS custdist                                                                               |
+|               |     Aggregate: groupBy=[[c_orders.c_count]], aggr=[[count(Int64(1))]]                                                                     |
+|               |       SubqueryAlias: c_orders                                                                                                             |
+|               |         Projection: count(oracle_tpch.TPCH_SF1.ORDERS.O_ORDERKEY) AS c_count                                                              |
+|               |           Aggregate: groupBy=[[oracle_tpch.TPCH_SF1.CUSTOMER.C_CUSTKEY]], aggr=[[count(oracle_tpch.TPCH_SF1.ORDERS.O_ORDERKEY)]]          |
+|               |             Projection: oracle_tpch.TPCH_SF1.CUSTOMER.C_CUSTKEY, oracle_tpch.TPCH_SF1.ORDERS.O_ORDERKEY                                   |
+|               |               Left Join: oracle_tpch.TPCH_SF1.CUSTOMER.C_CUSTKEY = oracle_tpch.TPCH_SF1.ORDERS.O_CUSTKEY                                  |
+|               |                 TableScan: oracle_tpch.TPCH_SF1.CUSTOMER projection=[C_CUSTKEY]                                                           |
+|               |                 Projection: oracle_tpch.TPCH_SF1.ORDERS.O_ORDERKEY, oracle_tpch.TPCH_SF1.ORDERS.O_CUSTKEY                                 |
+|               |                   Filter: oracle_tpch.TPCH_SF1.ORDERS.O_COMMENT NOT LIKE Utf8("%special%requests%")                                       |
+|               |                     TableScan: oracle_tpch.TPCH_SF1.ORDERS projection=[O_ORDERKEY, O_CUSTKEY, O_COMMENT]                                  |
+| physical_plan | SortPreservingMergeExec: [custdist@1 DESC, c_count@0 DESC]                                                                                |
+|               |   SortExec: expr=[custdist@1 DESC, c_count@0 DESC], preserve_partitioning=[true]                                                          |
+|               |     ProjectionExec: expr=[c_count@0 as c_count, count(Int64(1))@1 as custdist]                                                            |
+|               |       AggregateExec: mode=FinalPartitioned, gby=[c_count@0 as c_count], aggr=[count(Int64(1))]                                            |
+|               |         RepartitionExec: partitioning=Hash([c_count@0], 32), input_partitions=32                                                          |
+|               |           AggregateExec: mode=Partial, gby=[c_count@0 as c_count], aggr=[count(Int64(1))]                                                 |
+|               |             ProjectionExec: expr=[count(oracle_tpch.TPCH_SF1.ORDERS.O_ORDERKEY)@1 as c_count]                                             |
+|               |               AggregateExec: mode=SinglePartitioned, gby=[C_CUSTKEY@0 as C_CUSTKEY], aggr=[count(oracle_tpch.TPCH_SF1.ORDERS.O_ORDERKEY)] |
+|               |                 HashJoinExec: mode=Partitioned, join_type=Left, on=[(C_CUSTKEY@0, O_CUSTKEY@1)], projection=[C_CUSTKEY@0, O_ORDERKEY@1]   |
+|               |                   RepartitionExec: partitioning=Hash([C_CUSTKEY@0], 32), input_partitions=1                                               |
+|               |                     BytesProcessedExec                                                                                                    |
+|               |                       OracleExec sql=SELECT "C_CUSTKEY" FROM "TPCH_SF1"."CUSTOMER"                                                        |
+|               |                   RepartitionExec: partitioning=Hash([O_CUSTKEY@1], 32), input_partitions=32                                              |
+|               |                     FilterExec: O_COMMENT@2 NOT LIKE %special%requests%, projection=[O_ORDERKEY@0, O_CUSTKEY@1]                           |
+|               |                       RepartitionExec: partitioning=RoundRobinBatch(32), input_partitions=1                                               |
+|               |                         BytesProcessedExec                                                                                                |
+|               |                           OracleExec sql=SELECT "O_ORDERKEY", "O_CUSTKEY", "O_COMMENT" FROM "TPCH_SF1"."ORDERS"                           |
+|               |                                                                                                                                           |
++---------------+-------------------------------------------------------------------------------------------------------------------------------------------+

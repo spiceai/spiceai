@@ -761,22 +761,20 @@ impl ClusterService for ClusterServiceImpl {
 
         // Register the allocated partitions in the executor registry so the scheduler knows where they are
         {
-            let registry = self.datafusion.ctx.as_ref();
+            let task_ctx = self.datafusion.ctx.task_ctx();
             let mut partition_map: TablePartitions = table_partitions
                 .iter()
                 .map(|(tbl, sa)| {
                     let exprs = sa
                         .items
                         .iter()
-                        .filter_map(
-                            |bytes| match Expr::from_bytes_with_registry(bytes, registry) {
-                                Ok(expr) => Some(expr),
-                                Err(e) => {
-                                    tracing::error!("Failed to deserialize expr: {e}");
-                                    None
-                                }
-                            },
-                        )
+                        .filter_map(|bytes| match Expr::from_bytes_with_ctx(bytes, &task_ctx) {
+                            Ok(expr) => Some(expr),
+                            Err(e) => {
+                                tracing::error!("Failed to deserialize expr: {e}");
+                                None
+                            }
+                        })
                         .collect();
                     (TableReference::parse_str(tbl), exprs)
                 })
@@ -1171,7 +1169,7 @@ pub(crate) async fn discover_cayenne_tables(datafusion: &DataFusion) -> Vec<Tabl
             };
 
             // Prefer metadata-catalog discovery to avoid relying on in-memory schema cache.
-            if let Some(cayenne_schema) = schema.as_any().downcast_ref::<CayenneSchemaProvider>() {
+            if let Some(cayenne_schema) = schema.downcast_ref::<CayenneSchemaProvider>() {
                 let namespace_prefix = format!("{}/", cayenne_schema.namespace());
                 match cayenne_schema.metadata_catalog().list_table_names().await {
                     Ok(all_table_names) => {

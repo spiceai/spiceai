@@ -41,7 +41,7 @@ use datafusion::execution::object_store::ObjectStoreUrl;
 use datafusion::physical_plan::empty::EmptyExec;
 use datafusion_datasource::file_groups::FileGroup;
 use datafusion_datasource::file_scan_config::FileScanConfigBuilder;
-use datafusion_datasource::{PartitionedFile, TableSchema};
+use datafusion_datasource::{FileExtensions, PartitionedFile, TableSchema};
 use futures::TryStreamExt;
 use object_store::{ObjectMeta, ObjectStore, ObjectStoreExt, path::Path};
 use snafu::prelude::*;
@@ -162,10 +162,6 @@ fn parse_partition_values(
 #[deny(clippy::missing_trait_methods)]
 #[async_trait]
 impl TableProvider for LocationPruningListingTable {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema(&self) -> Arc<Schema> {
         self.inner.schema()
     }
@@ -256,9 +252,10 @@ impl TableProvider for LocationPruningListingTable {
                 partition_values,
                 range: None,
                 statistics: None,
-                extensions: None,
+                extensions: FileExtensions::new(),
                 metadata_size_hint: None,
                 ordering: None,
+                table_reference: None,
             });
         }
 

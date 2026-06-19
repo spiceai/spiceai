@@ -30,7 +30,7 @@ use std::{any::Any, sync::Arc};
 
 use crate::{
     component::dataset::acceleration::Engine,
-    datafusion::udf::deny_spice_specific_functions_table_providers, parameters::ParameterSpec,
+    datafusion::udf::deny_spice_functions_for_table_providers, parameters::ParameterSpec,
     register_data_accelerator,
 };
 
@@ -74,7 +74,7 @@ impl PostgresAccelerator {
             // evaluating locally instead of failing in `Postgres`. Wired before
             // the `DataFusion` 53 upgrade (#11118) dropped it; see issue #10703.
             postgres_factory: PostgresTableProviderFactory::new()
-                .with_function_support(deny_spice_specific_functions_table_providers()),
+                .with_function_support(deny_spice_functions_for_table_providers()),
         }
     }
 }
@@ -169,10 +169,7 @@ impl DataAccelerator for PostgresAccelerator {
                 .context(UnableToCreateTableSnafu)
                 .boxed()?;
 
-        let Some(postgres_writer) = table_provider
-            .as_any()
-            .downcast_ref::<PostgresTableWriter>()
-        else {
+        let Some(postgres_writer) = table_provider.downcast_ref::<PostgresTableWriter>() else {
             unreachable!("PostgresTableWriter should be returned from PostgresTableProviderFactory")
         };
 

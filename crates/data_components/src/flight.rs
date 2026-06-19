@@ -44,7 +44,7 @@ use flight_client::{
 };
 use futures::{Stream, StreamExt};
 use snafu::prelude::*;
-use std::{any::Any, fmt, sync::Arc};
+use std::{fmt, sync::Arc};
 use tonic::metadata::MetadataMap;
 
 use self::write::FlightTableWriter;
@@ -361,10 +361,6 @@ impl FlightTable {
 
 #[async_trait]
 impl TableProvider for FlightTable {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema(&self) -> SchemaRef {
         Arc::clone(&self.schema)
     }
@@ -488,10 +484,6 @@ impl DisplayAs for FlightExec {
 impl ExecutionPlan for FlightExec {
     fn name(&self) -> &'static str {
         "FlightExec"
-    }
-
-    fn as_any(&self) -> &dyn Any {
-        self
     }
 
     fn schema(&self) -> SchemaRef {

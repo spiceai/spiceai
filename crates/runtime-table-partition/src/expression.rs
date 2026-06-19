@@ -78,8 +78,11 @@ pub fn partition_by_expressions(
     // the `SimplifyExpressions` optimizer pass. The partition path builds a physical
     // expression directly from this parsed expression and never runs that pass, so
     // simplify here is reuiqred.
-    let simplifier =
-        ExprSimplifier::new(SimplifyContext::default().with_schema(Arc::new(df_schema.clone())));
+    let simplifier = ExprSimplifier::new(
+        SimplifyContext::builder()
+            .with_schema(Arc::new(df_schema.clone()))
+            .build(),
+    );
 
     let partitioned_by = partitioned_by
         .iter()

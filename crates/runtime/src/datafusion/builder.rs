@@ -100,10 +100,7 @@ use datafusion_optimizer_rules::{
 #[cfg(not(windows))]
 use runtime_datafusion::join_accumulator::clamp_maximum_shared_inlist_memory_bytes;
 use runtime_datafusion::{
-    extension::{
-        ExtensionPlanQueryPlanner, bytes_processed::BytesProcessedPhysicalOptimizer,
-        data_source_tree_display::DataSourceTreeDisplayOptimizer,
-    },
+    extension::{ExtensionPlanQueryPlanner, bytes_processed::BytesProcessedPhysicalOptimizer},
     schema_provider::SpiceSchemaProvider,
     url_table::{DynamicUrlCatalogList, SpiceUrlTableFactory},
 };
@@ -346,6 +343,7 @@ pub struct DataFusionBuilder {
     accelerator_engine_registry: Arc<AcceleratorEngineRegistry>,
     memory_limit: Option<u64>,
     target_partitions: Option<usize>,
+    prefer_hash_join: Option<bool>,
     temp_directory: Option<String>,
     accelerated_refresh_semaphore: Option<Arc<Semaphore>>,
     task_history_enabled: bool,
@@ -404,6 +402,7 @@ impl DataFusionBuilder {
             accelerator_engine_registry,
             memory_limit: None,
             target_partitions: None,
+            prefer_hash_join: None,
             temp_directory: None,
             accelerated_refresh_semaphore: None,
             task_history_enabled: true,
@@ -453,6 +452,12 @@ impl DataFusionBuilder {
     #[must_use]
     pub fn target_partitions(mut self, target_partitions: Option<usize>) -> Self {
         self.target_partitions = target_partitions;
+        self
+    }
+
+    #[must_use]
+    pub fn prefer_hash_join(mut self, prefer_hash_join: Option<bool>) -> Self {
+        self.prefer_hash_join = prefer_hash_join;
         self
     }
 
@@ -663,6 +668,17 @@ impl DataFusionBuilder {
             );
         }
 
+        // `HashJoinExec` build sides are not spillable, so very large joins can
+        // exhaust the query memory pool outright. Setting this to `false` makes
+        // the planner emit spillable sort-merge joins instead. Left unset,
+        // DataFusion's default (prefer hash joins) stands; the Cayenne
+        // `CayenneAntiJoinSortMergeRewriter` still selectively converts oversized
+        // hash joins to sort-merge under the memory gate.
+        if let Some(prefer_hash_join) = self.prefer_hash_join {
+            config.options_mut().optimizer.prefer_hash_join = prefer_hash_join;
+            tracing::info!(prefer_hash_join, "Applied runtime.query.prefer_hash_join");
+        }
+
         // Sizes DataFusion's *native* hash-join InList dynamic-filter budget
         // (`optimizer.hash_join_inlist_pushdown_max_size`) from the runtime
         // memory limit. The native inner-join dynamic-filter pushdown
@@ -777,11 +793,9 @@ impl DataFusionBuilder {
         #[cfg(windows)]
         let _ = exact_join_filter_memory_limit;
 
-        state = state
-            .with_physical_optimizer_rule(Arc::new(BytesProcessedPhysicalOptimizer::new(Arc::new(
-                Box::new(track_bytes_processed),
-            ))))
-            .with_physical_optimizer_rule(Arc::new(DataSourceTreeDisplayOptimizer::new()));
+        state = state.with_physical_optimizer_rule(Arc::new(BytesProcessedPhysicalOptimizer::new(
+            Arc::new(Box::new(track_bytes_processed)),
+        )));
 
         if matches!(
             self.cluster_config.as_ref().and_then(|cfg| cfg.role()),
@@ -980,6 +994,7 @@ impl DataFusionBuilder {
             temp_directory: self.temp_directory.clone(),
             cpu_runtime: OnceLock::new(),
             refresh_runtime: OnceLock::new(),
+            cdc_apply_runtime: OnceLock::new(),
             compaction_runtime: OnceLock::new(),
             compaction_runtime_env,
             compaction_memory_bytes,
@@ -1146,24 +1161,24 @@ fn is_cayenne_accelerated_table_provider(provider: &dyn TableProvider) -> bool {
     }
 
     provider
-        .as_any()
         .downcast_ref::<AcceleratedTable>()
         .is_some_and(|table| is_cayenne_table_provider(table.get_accelerator().as_ref()))
 }
 
 #[cfg(not(windows))]
 fn is_cayenne_table_provider(provider: &dyn TableProvider) -> bool {
-    if provider.as_any().is::<CayenneTableProvider>() || has_cayenne_accelerator_metadata(provider)
+    if provider.downcast_ref::<CayenneTableProvider>().is_some()
+        || has_cayenne_accelerator_metadata(provider)
     {
         return true;
     }
 
-    if let Some(poly) = provider.as_any().downcast_ref::<PolyTableProvider>() {
+    if let Some(poly) = provider.downcast_ref::<PolyTableProvider>() {
         return is_cayenne_table_provider(poly.writer().as_ref())
             || is_cayenne_table_provider(poly.get_federated_table_provider().as_ref());
     }
 
-    if let Some(dedup) = provider.as_any().downcast_ref::<UpsertDedupTableProvider>() {
+    if let Some(dedup) = provider.downcast_ref::<UpsertDedupTableProvider>() {
         return is_cayenne_table_provider(dedup.inner().as_ref());
     }
 
@@ -2550,10 +2565,6 @@ mod tests {
     #[cfg(not(windows))]
     #[async_trait::async_trait]
     impl TableProvider for StatMemTable {
-        fn as_any(&self) -> &dyn std::any::Any {
-            self
-        }
-
         fn schema(&self) -> Arc<Schema> {
             self.inner.schema()
         }

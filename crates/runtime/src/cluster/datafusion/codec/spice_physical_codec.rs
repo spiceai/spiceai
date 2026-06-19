@@ -151,7 +151,7 @@ impl PhysicalExtensionCodec for SpicePhysicalCodec {
     }
 
     fn try_encode(&self, node: Arc<dyn ExecutionPlan>, buf: &mut Vec<u8>) -> Result<()> {
-        let wrapper = if let Some(concrete) = node.as_any().downcast_ref::<SchemaCastScanExec>() {
+        let wrapper = if let Some(concrete) = node.downcast_ref::<SchemaCastScanExec>() {
             let mut schema_buf = vec![];
             let serialized_schema = datafusion_common::Schema::try_from(concrete.schema())?;
             serialized_schema
@@ -163,13 +163,13 @@ impl PhysicalExtensionCodec for SpicePhysicalCodec {
                     SchemaCastScanExecNode { schema: schema_buf },
                 )),
             }
-        } else if node.as_any().downcast_ref::<BytesProcessedExec>().is_some() {
+        } else if node.downcast_ref::<BytesProcessedExec>().is_some() {
             SpicePhysicalPlanNode {
                 node: Some(spice_physical_plan_node::Node::BytesProcessed(
                     BytesProcessedExecNode {},
                 )),
             }
-        } else if let Some(udtf_exec) = node.as_any().downcast_ref::<UdtfExec>() {
+        } else if let Some(udtf_exec) = node.downcast_ref::<UdtfExec>() {
             let mut schema_buf = vec![];
             let serialized_schema = datafusion_common::Schema::try_from(udtf_exec.schema())?;
             serialized_schema
@@ -184,11 +184,7 @@ impl PhysicalExtensionCodec for SpicePhysicalCodec {
             }
         } else {
             #[cfg(not(windows))]
-            if node
-                .as_any()
-                .downcast_ref::<CayenneAccelerationExec>()
-                .is_some()
-            {
+            if node.downcast_ref::<CayenneAccelerationExec>().is_some() {
                 SpicePhysicalPlanNode {
                     node: Some(spice_physical_plan_node::Node::CayenneAcceleration(
                         CayenneAccelerationExecNode {},

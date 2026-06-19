@@ -25,7 +25,6 @@ limitations under the License.
 //! The runtime crate provides broadcast variants of Create/Drop that forward DDL to executor
 //! nodes after calling the same `operations` functions.
 
-use std::any::Any;
 use std::collections::HashSet;
 use std::fmt;
 use std::sync::Arc;
@@ -135,9 +134,6 @@ impl DisplayAs for CayenneCreateTableExec {
 impl ExecutionPlan for CayenneCreateTableExec {
     fn name(&self) -> &'static str {
         "CayenneCreateTableExec"
-    }
-    fn as_any(&self) -> &dyn Any {
-        self
     }
     fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
@@ -263,9 +259,6 @@ impl ExecutionPlan for CayenneDropTableExec {
     fn name(&self) -> &'static str {
         "CayenneDropTableExec"
     }
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
     fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
     }
@@ -378,9 +371,6 @@ impl DisplayAs for CayenneCreateSchemaExec {
 impl ExecutionPlan for CayenneCreateSchemaExec {
     fn name(&self) -> &'static str {
         "CayenneCreateSchemaExec"
-    }
-    fn as_any(&self) -> &dyn Any {
-        self
     }
     fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
@@ -503,10 +493,6 @@ impl DisplayAs for CayenneMergeExec {
 impl ExecutionPlan for CayenneMergeExec {
     fn name(&self) -> &'static str {
         "CayenneMergeExec"
-    }
-
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
     }
 
     fn properties(&self) -> &Arc<PlanProperties> {
@@ -834,7 +820,7 @@ async fn try_key_probe_delete(
     matched_keys: HashSet<Vec<datafusion_common::ScalarValue>>,
 ) -> Result<Option<u64>, DataFusionError> {
     // Case 1: Direct CayenneTableProvider.
-    if let Some(cayenne) = provider.as_any().downcast_ref::<CayenneTableProvider>() {
+    if let Some(cayenne) = provider.downcast_ref::<CayenneTableProvider>() {
         if cayenne.is_position_based() {
             return cayenne
                 .delete_matched_rows_by_key_probe(matched_keys, key_columns)
@@ -847,11 +833,11 @@ async fn try_key_probe_delete(
     // Case 3: PartitionTableProvider wrapping per-partition Cayenne providers.
     // All partitions share the same table metadata and deletion strategy, so
     // checking the first partition is sufficient to decide the fast path.
-    if let Some(partitioned) = provider.as_any().downcast_ref::<PartitionTableProvider>() {
+    if let Some(partitioned) = provider.downcast_ref::<PartitionTableProvider>() {
         let providers = partitioned.partition_table_providers().await;
         if providers
             .first()
-            .and_then(|p| p.as_any().downcast_ref::<CayenneTableProvider>())
+            .and_then(|p| p.downcast_ref::<CayenneTableProvider>())
             .is_none_or(|cayenne| !cayenne.is_position_based())
         {
             return Ok(None);
@@ -859,7 +845,7 @@ async fn try_key_probe_delete(
 
         let mut total = 0u64;
         for pp in &providers {
-            if let Some(cayenne) = pp.as_any().downcast_ref::<CayenneTableProvider>() {
+            if let Some(cayenne) = pp.downcast_ref::<CayenneTableProvider>() {
                 // Each partition's listing table only contains its own files, so
                 // the full matched_keys set is passed to each — hash probes for
                 // keys not in this partition simply find no matches.

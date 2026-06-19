@@ -11,8 +11,7 @@ description: "Query: tpch_simple_q1"
 |               |   CoalescePartitionsExec                                                           |
 |               |     AggregateExec: mode=Partial, gby=[], aggr=[max(mssql.dbo.lineitem.l_orderkey)] |
 |               |       RepartitionExec: partitioning=RoundRobinBatch(32), input_partitions=1        |
-|               |         CooperativeExec                                                            |
-|               |           BytesProcessedExec                                                       |
-|               |             SqlServerExec sql=SELECT l_orderkey FROM dbo.lineitem                  |
+|               |         BytesProcessedExec                                                         |
+|               |           SqlServerExec sql=SELECT l_orderkey FROM dbo.lineitem                    |
 |               |                                                                                    |
 +---------------+------------------------------------------------------------------------------------+
