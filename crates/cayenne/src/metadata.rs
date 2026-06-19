@@ -937,11 +937,14 @@ pub struct VortexConfig {
     /// schema (which keeps the original types for writes/CDC/stats/keyset). Lets
     /// `DataFusion` plan joins/aggregates on view arrays, avoiding the i32 2 GiB
     /// offset overflow in hash-join build-side `concat_batches` (e.g. `CH-benCH`
-    /// q21 at SF1000, where `su_name` fans out across a ~100M-row join). A runtime
-    /// read behavior that does not affect stored data, so `#[serde(skip)]` — not a
-    /// spicepod knob and not compared by `configuration_matches`. Off by default
-    /// (direct construction / unit tests keep `Utf8`); the runtime factory enables
-    /// it. See `viewify_read_schema`.
+    /// q21 at SF1000, where `su_name` fans out across a ~100M-row join).
+    ///
+    /// Runtime-configurable: the accelerator factory sets it (default on; opt out
+    /// with the `cayenne_force_view_types` acceleration param). It is `#[serde(skip)]`
+    /// because it is a read-only scan behavior re-derived on every open, NOT
+    /// serialized into Cayenne metadata — so toggling it never affects stored data
+    /// and it is intentionally excluded from `configuration_matches`. Off by default
+    /// for direct construction (unit tests keep `Utf8`). See `viewify_read_schema`.
     #[serde(skip)]
     pub force_view_read_schema: bool,
 }
