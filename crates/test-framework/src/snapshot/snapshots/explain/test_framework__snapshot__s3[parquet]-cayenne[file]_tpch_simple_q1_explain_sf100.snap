@@ -2,13 +2,13 @@
 source: crates/test-framework/src/snapshot/mod.rs
 description: "Query: tpch_simple_q1"
 ---
-+---------------+--------------------------------------------------------------+
-| plan_type     | plan                                                         |
-+---------------+--------------------------------------------------------------+
-| logical_plan  | Aggregate: groupBy=[[]], aggr=[[max(lineitem.l_orderkey)]]   |
-|               |   TableScan: lineitem projection=[l_orderkey]                |
-| physical_plan | ProjectionExec: expr=[600000000 as max(lineitem.l_orderkey)] |
-|               |   BytesProcessedExec                                         |
-|               |     PlaceholderRowExec                                       |
-|               |                                                              |
-+---------------+--------------------------------------------------------------+
++---------------+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
+| plan_type     | plan                                                                                                                                                                                                                                                         |
++---------------+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
+| logical_plan  | Aggregate: groupBy=[[]], aggr=[[max(lineitem.l_orderkey)]]                                                                                                                                                                                                   |
+|               |   TableScan: lineitem projection=[l_orderkey]                                                                                                                                                                                                                |
+| physical_plan | ProjectionExec: expr=[600000000 as max(lineitem.l_orderkey)], statistics=[Rows=Exact(1), Bytes=Exact(8), [(Col[0]: Min=Exact(Int64(600000000)) Max=Exact(Int64(600000000)) Sum=Exact(Int64(600000000)) Null=Exact(0) Distinct=Exact(1) ScanBytes=Exact(8))]] |
+|               |   BytesProcessedExec, statistics=[Rows=Exact(1), Bytes=Exact(8), [(Col[0]: Null=Exact(1))]]                                                                                                                                                                  |
+|               |     PlaceholderRowExec, statistics=[Rows=Exact(1), Bytes=Exact(8), [(Col[0]: Null=Exact(1))]]                                                                                                                                                                |
+|               |                                                                                                                                                                                                                                                              |
++---------------+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
