@@ -1352,10 +1352,19 @@ impl RefreshTask {
             .iter()
             .map(cdc_item_memory_size)
             .fold(0_usize, usize::saturating_add);
+        // Row-level change count: each Ok envelope's ChangeBatch carries one row
+        // per source change event, so summing num_rows across the burst yields
+        // the true number of records applied.
+        let burst_rows: u64 = burst
+            .iter()
+            .filter_map(|item| item.as_ref().ok())
+            .map(|env| env.change_batch.record.num_rows() as u64)
+            .fold(0_u64, u64::saturating_add);
         let labels = [KeyValue::new("dataset", context.dataset_name.to_string())];
         metrics::CDC_APPLY_BURST_ENVELOPES.record(burst_envelopes, &labels);
         metrics::CDC_APPLY_BURST_BYTES
             .record(u64::try_from(burst_bytes).unwrap_or(u64::MAX), &labels);
+        metrics::CDC_APPLY_BURST_ROWS_TOTAL.add(burst_rows, &labels);
 
         // Walk the burst preserving arrival order, processing contiguous
         // runs of Ok envelopes together and Err items individually so error
