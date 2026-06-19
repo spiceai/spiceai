@@ -56,7 +56,7 @@ pub struct BaseSchema {}
 
 impl BaseSchema {
     pub fn get_schema(provider: &Arc<dyn TableProvider>) -> SchemaRef {
-        if let Some(embedding_table) = provider.as_any().downcast_ref::<EmbeddingTable>() {
+        if let Some(embedding_table) = provider.downcast_ref::<EmbeddingTable>() {
             return embedding_table.get_base_table_schema();
         }
         provider.schema()

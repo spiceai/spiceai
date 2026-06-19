@@ -316,6 +316,7 @@ impl Query {
                                 name: original,
                                 columns: Vec::new(),
                                 explicit: true,
+                                at: None,
                             });
                         }
                     }

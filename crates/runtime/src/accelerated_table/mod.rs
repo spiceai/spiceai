@@ -16,9 +16,10 @@ limitations under the License.
 
 use crate::config::ClusterRole;
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, Ordering};
+use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
-use std::{any::Any, sync::Arc, time::Duration};
 
 use crate::component::dataset::acceleration::{RefreshMode, RefreshOnStartup, ZeroResultsAction};
 use crate::component::dataset::{ReadyState, TimeFormat};
@@ -1341,10 +1342,6 @@ impl Drop for AcceleratedTable {
 
 #[async_trait]
 impl TableProvider for AcceleratedTable {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn constraints(&self) -> Option<&Constraints> {
         self.accelerator.constraints()
     }

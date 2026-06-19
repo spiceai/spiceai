@@ -219,18 +219,7 @@ impl Dialect for SpiceCloudPlatformDialect {
     fn identifier_quote_style(&self, identifier: &str) -> Option<char> {
         PostgreSqlDialect {}.identifier_quote_style(identifier)
     }
-
-    /// Spice Cloud re-plans the SQL we push down with `DataFusion`'s analyzer,
-    /// which rejects a correlated scalar subquery whose parent plan node is a
-    /// `Join` (only `Projection`/`Filter`/`Aggregate` are permitted). The
-    /// unparser only emits subqueries inside `JOIN ... ON` predicates when this
-    /// returns `true`, so returning `false` keeps them in the `WHERE` clause
-    /// where the remote can decorrelate them. See spiceai/spiceai#11141.
-    fn supports_subquery_in_join_predicate(&self) -> bool {
-        false
-    }
 }
-
 #[derive(Default, Copy, Clone)]
 pub struct SpiceAIFactory {}
 
@@ -592,7 +581,6 @@ impl DataConnector for SpiceAI {
         Some(Box::pin(stream! {
             let table_provider = federated_table.table_provider().await;
             let Some(federated_table_provider_adaptor) = table_provider
-            .as_any()
             .downcast_ref::<FederatedTableProviderAdaptor>() else {
                 return;
             };
@@ -600,7 +588,6 @@ impl DataConnector for SpiceAI {
                 return;
             };
             let Some(flight_table) = federated_adaptor
-            .as_any()
             .downcast_ref::<FlightTable>() else {
                 return;
             };

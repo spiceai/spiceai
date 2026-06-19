@@ -46,10 +46,6 @@ impl<T: ScalarUDFImpl + PartialEq + Eq + Hash + 'static> ScalarUDFAlias<T> {
 }
 
 impl<T: ScalarUDFImpl + PartialEq + Eq + Hash + 'static> ScalarUDFImpl for ScalarUDFAlias<T> {
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
-
     fn name(&self) -> &'static str {
         self.alias
     }

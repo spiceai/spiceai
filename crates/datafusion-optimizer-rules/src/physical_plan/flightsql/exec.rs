@@ -17,7 +17,6 @@ limitations under the License.
 //! [`PartialAggregationFlightSqlExec`] — an [`ExecutionPlan`] that pushes a partial
 //! aggregation into a `FlightSQL` query, replacing the original scan + local aggregation.
 
-use std::any::Any;
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::sync::{Arc, LazyLock};
@@ -260,10 +259,6 @@ impl ExecutionPlan for PartialAggregationFlightSqlExec {
         "PartialAggregationFlightSqlExec"
     }
 
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema(&self) -> SchemaRef {
         Arc::clone(&self.output_schema)
     }
@@ -276,10 +271,10 @@ impl ExecutionPlan for PartialAggregationFlightSqlExec {
         vec![]
     }
 
-    fn partition_statistics(&self, partition: Option<usize>) -> Result<Statistics> {
+    fn partition_statistics(&self, partition: Option<usize>) -> Result<Arc<Statistics>> {
         match partition {
-            None | Some(0) => Ok(self.statistics.clone()),
-            Some(_) => Ok(Statistics::new_unknown(&self.output_schema)),
+            None | Some(0) => Ok(Arc::new(self.statistics.clone())),
+            Some(_) => Ok(Arc::new(Statistics::new_unknown(&self.output_schema))),
         }
     }
 
@@ -634,7 +629,7 @@ pub(super) fn physical_expr_to_sql(
         BinaryExpr, CastExpr, Column, Literal, NegativeExpr,
     };
 
-    let any = expr.as_any();
+    let any = expr.as_ref();
 
     if let Some(col) = any.downcast_ref::<Column>() {
         // If there is a substitution for this column index, inline it.

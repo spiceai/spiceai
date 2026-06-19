@@ -659,7 +659,7 @@ pub(crate) fn table_provider_with_spicepod_metadata(
     // If the provider is an IndexedTableProvider, push the metadata enrichment
     // inside it so that the IndexTableScan analyzer can still discover it via
     // downcast_ref::<IndexedTableProvider>().
-    if let Some(indexed) = provider.as_any().downcast_ref::<IndexedTableProvider>() {
+    if let Some(indexed) = provider.downcast_ref::<IndexedTableProvider>() {
         let enriched_underlying = metadata_enriched_table_provider(
             indexed.get_underlying(),
             table_metadata.clone(),
@@ -939,9 +939,7 @@ impl DataFusion {
 
         let schema_provider = Self::resolve_schema_provider(&catalog_provider, table_reference)?;
 
-        let spice_schema_provider = schema_provider
-            .as_any()
-            .downcast_ref::<SpiceSchemaProvider>()?;
+        let spice_schema_provider = schema_provider.downcast_ref::<SpiceSchemaProvider>()?;
 
         spice_schema_provider.table_sync(table_reference.table())
     }
@@ -979,7 +977,7 @@ impl DataFusion {
         access: &AccessMode,
         catalog: Arc<dyn CatalogProvider>,
     ) -> Result<()> {
-        if let Some(deferred_catalog) = catalog.as_any().downcast_ref::<DeferredCatalogProvider>() {
+        if let Some(deferred_catalog) = catalog.downcast_ref::<DeferredCatalogProvider>() {
             self.deferred_catalogs
                 .write()
                 .await
@@ -3114,7 +3112,6 @@ impl DataFusion {
         // downcast borrows `parent_table`, so clone out the inner provider first to release the
         // borrow before falling back to `parent_table` itself.
         let adaptor_inner = parent_table
-            .as_any()
             .downcast_ref::<FederatedTableProviderAdaptor>()
             .map(|adaptor| adaptor.table_provider.clone());
         let parent_table = match adaptor_inner {
@@ -3131,7 +3128,7 @@ impl DataFusion {
             // Arrow accelerator).
             None => parent_table,
         };
-        let Some(parent_table) = parent_table.as_any().downcast_ref::<AcceleratedTable>() else {
+        let Some(parent_table) = parent_table.downcast_ref::<AcceleratedTable>() else {
             tracing::debug!(
                 "Could not synchronize refreshes with parent table {parent_table_reference}. Parent table is not an accelerated table."
             );
@@ -3243,7 +3240,7 @@ impl DataFusion {
         let table = self
             .get_accelerated_table_provider(dataset_name.to_string().as_str())
             .await?;
-        if let Some(accelerated_table) = table.as_any().downcast_ref::<AcceleratedTable>() {
+        if let Some(accelerated_table) = table.downcast_ref::<AcceleratedTable>() {
             let notifier = accelerated_table.refresher().on_complete_notification();
             accelerated_table.trigger_refresh(overrides).await.context(
                 UnableToTriggerRefreshSnafu {
@@ -3377,7 +3374,7 @@ impl DataFusion {
             .fail();
         }
 
-        if let Some(accelerated_table) = table.as_any().downcast_ref::<AcceleratedTable>() {
+        if let Some(accelerated_table) = table.downcast_ref::<AcceleratedTable>() {
             accelerated_table.update_refresh_sql(parsed).await.context(
                 UnableToTriggerRefreshSnafu {
                     dataset_name: dataset_name.to_string(),
@@ -3398,7 +3395,7 @@ impl DataFusion {
             .get_accelerated_table_provider(&dataset_name.to_string())
             .await?;
 
-        if let Some(accelerated_table) = table.as_any().downcast_ref::<AcceleratedTable>() {
+        if let Some(accelerated_table) = table.downcast_ref::<AcceleratedTable>() {
             accelerated_table
                 .update_partition_filters(filters)
                 .await
@@ -3428,10 +3425,7 @@ impl DataFusion {
         // by `register_accelerated_table`. The two can nest in either order, so
         // loop until neither wrapper matches.
         loop {
-            if let Some(adaptor) = table
-                .as_any()
-                .downcast_ref::<FederatedTableProviderAdaptor>()
-            {
+            if let Some(adaptor) = table.downcast_ref::<FederatedTableProviderAdaptor>() {
                 if let Some(nested_table) = adaptor.table_provider.clone() {
                     table = nested_table;
                     continue;
@@ -3442,10 +3436,7 @@ impl DataFusion {
                 .fail();
             }
 
-            if let Some(enriched) = table
-                .as_any()
-                .downcast_ref::<MetadataEnrichedTableProvider>()
-            {
+            if let Some(enriched) = table.downcast_ref::<MetadataEnrichedTableProvider>() {
                 let inner = Arc::clone(enriched.get_inner_ref());
                 table = inner;
                 continue;
@@ -4301,10 +4292,7 @@ async fn resolve_table_partition_expr(
 }
 
 fn partition_expr_from_table_provider(table_provider: &Arc<dyn TableProvider>) -> Option<String> {
-    if let Some(partitioned) = table_provider
-        .as_any()
-        .downcast_ref::<PartitionTableProvider>()
-    {
+    if let Some(partitioned) = table_provider.downcast_ref::<PartitionTableProvider>() {
         let partition_exprs = partitioned
             .partition_by()
             .iter()
@@ -4320,24 +4308,19 @@ fn partition_expr_from_table_provider(table_provider: &Arc<dyn TableProvider>) -
         };
     }
 
-    if let Some(poly) = table_provider.as_any().downcast_ref::<PolyTableProvider>() {
+    if let Some(poly) = table_provider.downcast_ref::<PolyTableProvider>() {
         return partition_expr_from_table_provider(&poly.writer());
     }
 
-    if let Some(accelerated) = table_provider.as_any().downcast_ref::<AcceleratedTable>() {
+    if let Some(accelerated) = table_provider.downcast_ref::<AcceleratedTable>() {
         return partition_expr_from_table_provider(&accelerated.get_accelerator());
     }
 
-    if let Some(enriched) = table_provider
-        .as_any()
-        .downcast_ref::<MetadataEnrichedTableProvider>()
-    {
+    if let Some(enriched) = table_provider.downcast_ref::<MetadataEnrichedTableProvider>() {
         return partition_expr_from_table_provider(enriched.get_inner_ref());
     }
 
-    if let Some(adaptor) = table_provider
-        .as_any()
-        .downcast_ref::<FederatedTableProviderAdaptor>()
+    if let Some(adaptor) = table_provider.downcast_ref::<FederatedTableProviderAdaptor>()
         && let Some(inner_provider) = adaptor.table_provider.as_ref()
     {
         return partition_expr_from_table_provider(inner_provider);
@@ -4917,7 +4900,6 @@ mod tests {
             table_provider_with_spicepod_metadata(Arc::clone(&inner), &table_metadata, &[]);
         assert!(
             wrapped
-                .as_any()
                 .downcast_ref::<MetadataEnrichedTableProvider>()
                 .is_some(),
             "precondition: provider should be wrapped in MetadataEnrichedTableProvider"
@@ -4933,7 +4915,7 @@ mod tests {
             .expect("should resolve the accelerated table provider");
 
         assert!(
-            resolved.as_any().downcast_ref::<MemTable>().is_some(),
+            resolved.downcast_ref::<MemTable>().is_some(),
             "get_accelerated_table_provider must peel MetadataEnrichedTableProvider to reach the inner provider"
         );
     }

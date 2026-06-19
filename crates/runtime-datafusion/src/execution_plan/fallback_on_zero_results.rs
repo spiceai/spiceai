@@ -28,7 +28,6 @@ use datafusion::physical_plan::{
 use datafusion::sql::TableReference;
 use futures::{StreamExt, stream};
 use opentelemetry::KeyValue;
-use std::any::Any;
 use std::fmt;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -104,10 +103,6 @@ impl DisplayAs for FallbackOnZeroResultsScanExec {
 impl ExecutionPlan for FallbackOnZeroResultsScanExec {
     fn name(&self) -> &'static str {
         "FallbackOnZeroResultsScanExec"
-    }
-
-    fn as_any(&self) -> &dyn Any {
-        self
     }
 
     fn schema(&self) -> SchemaRef {

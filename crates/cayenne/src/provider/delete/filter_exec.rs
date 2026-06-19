@@ -75,7 +75,6 @@ use datafusion_physical_plan::filter_pushdown::{FilterDescription, FilterPushdow
 use datafusion_physical_plan::metrics::{
     BaselineMetrics, Count, ExecutionPlanMetricsSet, MetricBuilder, MetricsSet,
 };
-use std::any::Any;
 use std::sync::Arc;
 
 /// Per-partition metrics for a deletion-filter exec.
@@ -344,10 +343,6 @@ impl ExecutionPlan for KeyBasedDeletionFilterExec {
         "KeyBasedDeletionFilterExec"
     }
 
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn metrics(&self) -> Option<MetricsSet> {
         Some(self.metrics.clone_inner())
     }
@@ -367,10 +362,10 @@ impl ExecutionPlan for KeyBasedDeletionFilterExec {
     fn partition_statistics(
         &self,
         partition: Option<usize>,
-    ) -> datafusion_common::Result<datafusion_common::Statistics> {
-        Ok(deletion_filtered_statistics(
-            self.input.partition_statistics(partition)?,
-        ))
+    ) -> datafusion_common::Result<Arc<datafusion_common::Statistics>> {
+        Ok(Arc::new(deletion_filtered_statistics(
+            self.input.partition_statistics(partition)?.as_ref().clone(),
+        )))
     }
 
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
@@ -714,10 +709,6 @@ impl ExecutionPlan for Int64PkDeletionFilterExec {
         "Int64PkDeletionFilterExec"
     }
 
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn metrics(&self) -> Option<MetricsSet> {
         Some(self.metrics.clone_inner())
     }
@@ -737,10 +728,10 @@ impl ExecutionPlan for Int64PkDeletionFilterExec {
     fn partition_statistics(
         &self,
         partition: Option<usize>,
-    ) -> datafusion_common::Result<datafusion_common::Statistics> {
-        Ok(deletion_filtered_statistics(
-            self.input.partition_statistics(partition)?,
-        ))
+    ) -> datafusion_common::Result<Arc<datafusion_common::Statistics>> {
+        Ok(Arc::new(deletion_filtered_statistics(
+            self.input.partition_statistics(partition)?.as_ref().clone(),
+        )))
     }
 
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {

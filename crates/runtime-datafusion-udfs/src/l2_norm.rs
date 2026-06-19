@@ -24,7 +24,6 @@ use arrow_schema::DataType;
 use datafusion::common::{Result as DataFusionResult, exec_err};
 use datafusion::logical_expr::ScalarFunctionArgs;
 use datafusion::logical_expr::{ColumnarValue, ScalarUDFImpl, Signature, Volatility};
-use std::any::Any;
 
 use crate::vector_simd::{compute_fsl_f32_l2_norm, is_fixed_size_list_f32, make_scalar_function};
 
@@ -51,10 +50,6 @@ impl L2Norm {
 }
 
 impl ScalarUDFImpl for L2Norm {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn name(&self) -> &'static str {
         L2_NORM_UDF_NAME
     }

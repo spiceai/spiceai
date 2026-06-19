@@ -134,10 +134,6 @@ impl DataConnector for SinkConnector {
 
 #[async_trait]
 impl TableProvider for SinkConnector {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema(&self) -> SchemaRef {
         Arc::clone(&self.schema)
     }
@@ -184,10 +180,6 @@ struct SinkDataSink {
 
 #[async_trait]
 impl DataSink for SinkDataSink {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn metrics(&self) -> Option<MetricsSet> {
         None
     }

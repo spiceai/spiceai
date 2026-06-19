@@ -100,10 +100,7 @@ use datafusion_optimizer_rules::{
 #[cfg(not(windows))]
 use runtime_datafusion::join_accumulator::clamp_maximum_shared_inlist_memory_bytes;
 use runtime_datafusion::{
-    extension::{
-        ExtensionPlanQueryPlanner, bytes_processed::BytesProcessedPhysicalOptimizer,
-        data_source_tree_display::DataSourceTreeDisplayOptimizer,
-    },
+    extension::{ExtensionPlanQueryPlanner, bytes_processed::BytesProcessedPhysicalOptimizer},
     schema_provider::SpiceSchemaProvider,
     url_table::{DynamicUrlCatalogList, SpiceUrlTableFactory},
 };
@@ -791,11 +788,9 @@ impl DataFusionBuilder {
         #[cfg(windows)]
         let _ = exact_join_filter_memory_limit;
 
-        state = state
-            .with_physical_optimizer_rule(Arc::new(BytesProcessedPhysicalOptimizer::new(Arc::new(
-                Box::new(track_bytes_processed),
-            ))))
-            .with_physical_optimizer_rule(Arc::new(DataSourceTreeDisplayOptimizer::new()));
+        state = state.with_physical_optimizer_rule(Arc::new(BytesProcessedPhysicalOptimizer::new(
+            Arc::new(Box::new(track_bytes_processed)),
+        )));
 
         if matches!(
             self.cluster_config.as_ref().and_then(|cfg| cfg.role()),
@@ -1161,24 +1156,24 @@ fn is_cayenne_accelerated_table_provider(provider: &dyn TableProvider) -> bool {
     }
 
     provider
-        .as_any()
         .downcast_ref::<AcceleratedTable>()
         .is_some_and(|table| is_cayenne_table_provider(table.get_accelerator().as_ref()))
 }
 
 #[cfg(not(windows))]
 fn is_cayenne_table_provider(provider: &dyn TableProvider) -> bool {
-    if provider.as_any().is::<CayenneTableProvider>() || has_cayenne_accelerator_metadata(provider)
+    if provider.downcast_ref::<CayenneTableProvider>().is_some()
+        || has_cayenne_accelerator_metadata(provider)
     {
         return true;
     }
 
-    if let Some(poly) = provider.as_any().downcast_ref::<PolyTableProvider>() {
+    if let Some(poly) = provider.downcast_ref::<PolyTableProvider>() {
         return is_cayenne_table_provider(poly.writer().as_ref())
             || is_cayenne_table_provider(poly.get_federated_table_provider().as_ref());
     }
 
-    if let Some(dedup) = provider.as_any().downcast_ref::<UpsertDedupTableProvider>() {
+    if let Some(dedup) = provider.downcast_ref::<UpsertDedupTableProvider>() {
         return is_cayenne_table_provider(dedup.inner().as_ref());
     }
 
@@ -2565,10 +2560,6 @@ mod tests {
     #[cfg(not(windows))]
     #[async_trait::async_trait]
     impl TableProvider for StatMemTable {
-        fn as_any(&self) -> &dyn std::any::Any {
-            self
-        }
-
         fn schema(&self) -> Arc<Schema> {
             self.inner.schema()
         }

@@ -42,7 +42,7 @@ use futures::Stream;
 use futures::StreamExt;
 use object_store::{GetResult, ObjectMeta, ObjectStore, ObjectStoreExt, path::Path};
 use snafu::ResultExt;
-use std::{any::Any, fmt, sync::Arc};
+use std::{fmt, sync::Arc};
 
 use crate::object::filter::filter_object_meta;
 
@@ -180,10 +180,6 @@ impl ObjectStoreTextTable {
 
 #[async_trait]
 impl TableProvider for ObjectStoreTextTable {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn constraints(&self) -> Option<&Constraints> {
         Some(&self.constraints)
     }
@@ -278,10 +274,6 @@ impl ExecutionPlan for ObjectStoreTextExec {
         "ObjectStoreTextExec"
     }
 
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema(&self) -> SchemaRef {
         Arc::clone(&self.projected_schema)
     }
@@ -304,7 +296,7 @@ impl ExecutionPlan for ObjectStoreTextExec {
     fn partition_statistics(
         &self,
         _partition: Option<usize>,
-    ) -> Result<Statistics, DataFusionError> {
+    ) -> Result<Arc<Statistics>, DataFusionError> {
         let size = usize::try_from(
             self.object_metas
                 .iter()
@@ -314,12 +306,14 @@ impl ExecutionPlan for ObjectStoreTextExec {
         );
 
         // Only one partition.
-        Ok(Statistics::new_unknown(&self.schema())
-            .with_num_rows(Precision::Exact(self.object_metas.len()))
-            .with_total_byte_size(match size {
-                Ok(s) => Precision::Exact(s),
-                Err(_) => Precision::Absent,
-            }))
+        Ok(Arc::new(
+            Statistics::new_unknown(&self.schema())
+                .with_num_rows(Precision::Exact(self.object_metas.len()))
+                .with_total_byte_size(match size {
+                    Ok(s) => Precision::Exact(s),
+                    Err(_) => Precision::Absent,
+                }),
+        ))
     }
 
     fn execute(

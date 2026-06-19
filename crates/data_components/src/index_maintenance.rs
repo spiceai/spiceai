@@ -54,7 +54,7 @@ pub trait IndexMaintenanceProvider: TableProvider {
 pub async fn perform_index_maintenance(
     table_provider: &(dyn TableProvider + Send + Sync),
 ) -> DataFusionResult<bool> {
-    let any = table_provider.as_any();
+    let any = table_provider as &dyn std::any::Any;
 
     // Try each known concrete type that implements IndexMaintenanceProvider
     // This is a stopgap until Rust supports trait upcasting (RFC 3324)

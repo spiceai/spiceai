@@ -353,11 +353,11 @@ fn stable_expr_string(expr: &Expr) -> Result<String, Error> {
         }
         Expr::Cast(cast) => {
             let expr = stable_expr_string(&cast.expr)?;
-            format!("Cast({expr}, {})", cast.data_type)
+            format!("Cast({expr}, {})", cast.field.data_type())
         }
         Expr::TryCast(cast) => {
             let expr = stable_expr_string(&cast.expr)?;
-            format!("TryCast({expr}, {})", cast.data_type)
+            format!("TryCast({expr}, {})", cast.field.data_type())
         }
         Expr::ScalarFunction(ScalarFunction { func, args }) => {
             let args_str = args
@@ -540,10 +540,6 @@ mod tests {
     }
 
     impl ScalarUDFImpl for Bucket {
-        fn as_any(&self) -> &dyn std::any::Any {
-            self
-        }
-
         fn name(&self) -> &'static str {
             "bucket"
         }

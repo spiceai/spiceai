@@ -153,7 +153,7 @@ fn evaluate_expr(
     guarantees: Vec<(Expr, NullableInterval)>,
 ) -> Result<ScalarValue, DataFusionError> {
     let dfschema = schema.clone().to_dfschema_ref()?;
-    let context = SimplifyContext::default().with_schema(dfschema);
+    let context = SimplifyContext::builder().with_schema(dfschema).build();
     let simplifier = ExprSimplifier::new(context).with_guarantees(guarantees.clone());
 
     let simplified_expr = simplifier.simplify(expr.clone())?;

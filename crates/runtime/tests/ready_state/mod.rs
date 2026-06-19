@@ -210,10 +210,6 @@ struct DelayedNativeTableProvider {
 
 #[async_trait]
 impl TableProvider for DelayedNativeTableProvider {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema(&self) -> SchemaRef {
         Arc::clone(&self.schema)
     }
@@ -265,10 +261,6 @@ impl std::fmt::Debug for DelayedExecutionPlan {
 impl ExecutionPlan for DelayedExecutionPlan {
     fn name(&self) -> &'static str {
         "DelayedExecutionPlan"
-    }
-
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
     }
 
     fn properties(&self) -> &Arc<PlanProperties> {
