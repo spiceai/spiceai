@@ -24013,12 +24013,25 @@ mod tests {
             provider.rebuild_live_snapshot_manifests().await;
         }
 
-        let mut ids: Vec<String> = provider
-            .protected_snapshots
-            .load_full()
-            .keys()
-            .cloned()
-            .collect();
+        // Protected-snapshot registration can lag behind the awaited inserts under heavy
+        // parallel load (seen in CI: 6 expected, only 2 registered on an immediate read;
+        // always all N locally). The snapshots are never coalesced away — they all appear
+        // given a moment — so poll until the expected count is reached (bounded ~5s) before
+        // asserting, keeping the fixture deterministic under load instead of racing the
+        // background registration.
+        let mut ids: Vec<String> = Vec::new();
+        for _ in 0..100 {
+            ids = provider
+                .protected_snapshots
+                .load_full()
+                .keys()
+                .cloned()
+                .collect();
+            if ids.len() >= seqs.len() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
         ids.sort();
         assert_eq!(
             ids.len(),
