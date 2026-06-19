@@ -245,6 +245,18 @@ const PARAMETERS: &[ParameterSpec] = &[
         .secret()
         .description("Path to the SSL/TLS CA certificate file for server verification.")
         .help_link(KAFKA_DOCS),
+    ParameterSpec::component("ssl_certificate_location")
+        .secret()
+        .description("Path to the client SSL/TLS certificate file for mTLS authentication.")
+        .help_link(KAFKA_DOCS),
+    ParameterSpec::component("ssl_key_location")
+        .secret()
+        .description("Path to the client SSL/TLS private key file for mTLS authentication.")
+        .help_link(KAFKA_DOCS),
+    ParameterSpec::component("ssl_key_password")
+        .secret()
+        .description("Password for the client SSL/TLS private key, if encrypted.")
+        .help_link(KAFKA_DOCS),
     ParameterSpec::component("enable_ssl_certificate_verification")
         .default("true")
         .description("Enable SSL/TLS certificate verification. Default: 'true'.")
