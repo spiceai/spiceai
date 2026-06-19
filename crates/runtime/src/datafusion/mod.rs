@@ -736,6 +736,11 @@ pub struct DataFusion {
     cpu_runtime: OnceLock<ManagedTokioRuntime>,
     // Dedicated runtime for CPU-bound DataFusion acceleration for dataset acceleration refresh tasks
     refresh_runtime: OnceLock<ManagedTokioRuntime>,
+    // Dedicated, DEFAULT-priority (nice 0) runtime for the CDC changes-apply loop
+    // (refresh_mode: changes). Split from `refresh_runtime` (low-priority, nice 10,
+    // which also runs bulk full/append refresh reads) so the freshness-critical apply
+    // isn't scheduler-deprioritized on an oversubscribed host.
+    cdc_apply_runtime: OnceLock<ManagedTokioRuntime>,
     // Dedicated runtime for background Cayenne compaction (size-tiered protected-snapshot
     // merge + full snapshot rewrite). Isolated from the query and refresh runtimes so the
     // CPU-heavy rewrite can't steal worker threads from queries or CDC ingest.
@@ -1361,6 +1366,28 @@ impl DataFusion {
             .get()
             .map(ManagedTokioRuntime::handle)
             .or_else(|| self.cpu_runtime())
+    }
+
+    /// Set the dedicated, default-priority (nice 0) CDC changes-apply runtime.
+    /// Isolated from the low-priority refresh runtime so the freshness-critical
+    /// CDC apply loop is not scheduler-deprioritized under load.
+    pub fn set_cdc_apply_runtime(&self, handle: ManagedTokioRuntime) {
+        if self.cdc_apply_runtime.set(handle).is_err() {
+            // Failure to set means this was already set - that shouldn't happen.
+            tracing::error!(
+                "Failed to set CDC-apply tokio runtime on the Datafusion struct, this is an unexpected internal error"
+            );
+        }
+    }
+
+    /// Returns the dedicated CDC changes-apply runtime. Falls back to the refresh
+    /// runtime (which itself falls back to the cpu runtime) when unset.
+    #[must_use]
+    pub fn cdc_apply_runtime(&self) -> Option<&tokio::runtime::Handle> {
+        self.cdc_apply_runtime
+            .get()
+            .map(ManagedTokioRuntime::handle)
+            .or_else(|| self.refresh_runtime())
     }
 
     /// Set the dedicated compaction runtime for background Cayenne compaction
@@ -2435,6 +2462,7 @@ impl DataFusion {
             self.io_runtime.clone(),
         );
         accelerated_table_builder.cpu_runtime(self.refresh_runtime().cloned());
+        accelerated_table_builder.cdc_apply_runtime(self.cdc_apply_runtime().cloned());
         accelerated_table_builder.cluster_role(self.cluster_config.effective_role());
         accelerated_table_builder.accelerator_write_mutex(Arc::clone(&accelerator_write_mutex));
         accelerated_table_builder.cdc_param_overrides(

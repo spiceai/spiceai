@@ -370,6 +370,7 @@ pub struct Builder {
     snapshot_refresh_state: Option<snapshots::SnapshotRefreshState>,
     metrics: Option<Metrics>,
     cpu_runtime: Option<Handle>,
+    cdc_apply_runtime: Option<Handle>,
     io_runtime: Handle,
     caching_ttl: Option<Duration>,
     caching_stale_while_revalidate_ttl: Option<Duration>,
@@ -423,6 +424,7 @@ impl Builder {
             snapshot_refresh_state: None,
             metrics: None,
             cpu_runtime: None,
+            cdc_apply_runtime: None,
             io_runtime,
             caching_ttl: None,
             caching_stale_while_revalidate_ttl: None,
@@ -538,6 +540,11 @@ impl Builder {
 
     pub fn cpu_runtime(&mut self, runtime: Option<Handle>) -> &mut Self {
         self.cpu_runtime = runtime;
+        self
+    }
+
+    pub fn cdc_apply_runtime(&mut self, runtime: Option<Handle>) -> &mut Self {
+        self.cdc_apply_runtime = runtime;
         self
     }
 
@@ -854,6 +861,7 @@ impl Builder {
             Arc::clone(&refresh_params),
             Arc::clone(&self.accelerator),
             self.cpu_runtime.clone(),
+            self.cdc_apply_runtime.clone(),
             self.io_runtime.clone(),
             Arc::clone(&self.accelerator_write_mutex),
         );
