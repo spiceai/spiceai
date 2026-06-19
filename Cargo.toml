@@ -210,12 +210,12 @@ hf-hub = { version = "0.4", features = ["tokio"] }
 http = "1.3.1"
 httpdate = "1.0"
 humantime = "2.1.0"
-iceberg = "=0.9.0"
-iceberg-catalog-glue = "=0.9.0"
-iceberg-catalog-rest = "=0.9.0"
-iceberg-datafusion = "=0.9.0"
-iceberg-storage-opendal = { version = "=0.9.0", features = ["opendal-s3", "opendal-gcs", "opendal-fs"] }
-iceberg_test_utils = "=0.9.0"
+iceberg = "=0.9.1"
+iceberg-catalog-glue = "=0.9.1"
+iceberg-catalog-rest = "=0.9.1"
+iceberg-datafusion = "=0.9.1"
+iceberg-storage-opendal = { version = "=0.9.1", features = ["opendal-s3", "opendal-gcs", "opendal-fs"] }
+iceberg_test_utils = "=0.9.1"
 imap = { git = "https://github.com/jonhoo/rust-imap", rev = "6fe22ed11a1ccffe1799a73f48e589366d8d100f" }
 indexmap = "2"
 insta = { version = "1.46.3", features = ["filters"] }
@@ -301,7 +301,7 @@ sqlparser = "0.59.0"
 ssh2 = { version = "0.9.5" }
 suppaftp = { version = "6.3.0", features = ["async"] }
 sysinfo = "0.38.4"
- system-adapter-protocol = { git = "https://github.com/spiceai/spicebench.git", rev = "67ea75341778a1be51b7c182925c177f22b52324", features = ["client", "server"] }
+system-adapter-protocol = { git = "https://github.com/spiceai/spicebench.git", rev = "c9b74ea6773df193bd6a2c891ddcad048f60c8ce", features = ["client", "server"] }
 tantivy = "0.26.0"
 tempfile = "3"
 tiberius = { version = "0.12.3", default-features = false, features = [
@@ -455,12 +455,12 @@ tokio-rusqlite = { git = "https://github.com/spiceai/tokio-rusqlite.git", rev = 
 # Tracking Issue: https://github.com/allan2/dotenvy/issues/113
 dotenvy = { git = "https://github.com/spiceai/dotenvy.git", rev = "e5cef1871b08003198949dfe2da988633eaad78f" }
 
-iceberg = { git = "https://github.com/spiceai/iceberg-rust.git", rev = "e519b22193e44667dde7d461e3cac1798fa0c9e2" }
-iceberg-catalog-glue = { git = "https://github.com/spiceai/iceberg-rust.git", rev = "e519b22193e44667dde7d461e3cac1798fa0c9e2" }
-iceberg-catalog-rest = { git = "https://github.com/spiceai/iceberg-rust.git", rev = "e519b22193e44667dde7d461e3cac1798fa0c9e2" }
-iceberg-datafusion = { git = "https://github.com/spiceai/iceberg-rust.git", rev = "e519b22193e44667dde7d461e3cac1798fa0c9e2" }
-iceberg-storage-opendal = { git = "https://github.com/spiceai/iceberg-rust.git", rev = "e519b22193e44667dde7d461e3cac1798fa0c9e2" }
-iceberg_test_utils = { git = "https://github.com/spiceai/iceberg-rust.git", rev = "e519b22193e44667dde7d461e3cac1798fa0c9e2" }
+iceberg = { git = "https://github.com/spiceai/iceberg-rust.git", rev = "b8fc79d9717d8576a45e2bd49aee52967b763f1d" } # branch: spiceai-0.9.1-df-53
+iceberg-catalog-glue = { git = "https://github.com/spiceai/iceberg-rust.git", rev = "b8fc79d9717d8576a45e2bd49aee52967b763f1d" } # branch: spiceai-0.9.1-df-53
+iceberg-catalog-rest = { git = "https://github.com/spiceai/iceberg-rust.git", rev = "b8fc79d9717d8576a45e2bd49aee52967b763f1d" } # branch: spiceai-0.9.1-df-53
+iceberg-datafusion = { git = "https://github.com/spiceai/iceberg-rust.git", rev = "b8fc79d9717d8576a45e2bd49aee52967b763f1d" } # branch: spiceai-0.9.1-df-53
+iceberg-storage-opendal = { git = "https://github.com/spiceai/iceberg-rust.git", rev = "b8fc79d9717d8576a45e2bd49aee52967b763f1d" } # branch: spiceai-0.9.1-df-53
+iceberg_test_utils = { git = "https://github.com/spiceai/iceberg-rust.git", rev = "b8fc79d9717d8576a45e2bd49aee52967b763f1d" } # branch: spiceai-0.9.1-df-53
 
 # candle-* crates are already redirected to the spiceai/candle fork via the
 # [patch.crates-io] block higher up in this file. Keeping those here would be
