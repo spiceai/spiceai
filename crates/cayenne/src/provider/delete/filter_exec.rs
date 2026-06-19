@@ -19,8 +19,12 @@ limitations under the License.
 //! This module provides execution plans that filter out deleted rows during query execution:
 //!
 //! - **`Int64PkDeletionFilterExec`**: Optimized for tables with single-column Int64 primary keys.
-//!   Probes a [`DeletionIndex`] (bloom filter over a layered base+delta map of fused
+//!   Probes a [`DeletionIndex`] (bloom filter over an ordered set of frozen runs of fused
 //!   per-key delete/insert sequence numbers) once per row.
+//!
+//! Both filter execs **preserve their input's ordering** (`maintains_input_order` /
+//! equivalence-property passthrough), so a sorted scan's `output_ordering` survives the
+//! merge-on-read delete application.
 //!
 //! - **`KeyBasedDeletionFilterExec`**: For tables with composite or non-integer primary keys.
 //!   Uses Arrow's `RowConverter` to create deterministic byte keys, then probes a
@@ -349,6 +353,14 @@ impl ExecutionPlan for KeyBasedDeletionFilterExec {
 
     fn properties(&self) -> &Arc<datafusion_physical_plan::PlanProperties> {
         &self.properties
+    }
+
+    /// Deletion filtering removes rows positionally without reordering, so the
+    /// single input's ordering is preserved end-to-end. Advertising this lets
+    /// `DataFusion` carry a scan's `output_ordering` across the deletion filter
+    /// (required for sound sorted-file `output_ordering`).
+    fn maintains_input_order(&self) -> Vec<bool> {
+        vec![true]
     }
 
     fn partition_statistics(
@@ -707,6 +719,14 @@ impl ExecutionPlan for Int64PkDeletionFilterExec {
 
     fn properties(&self) -> &Arc<datafusion_physical_plan::PlanProperties> {
         &self.properties
+    }
+
+    /// Deletion filtering removes rows positionally without reordering, so the
+    /// single input's ordering is preserved end-to-end. Advertising this lets
+    /// `DataFusion` carry a scan's `output_ordering` across the deletion filter
+    /// (required for sound sorted-file `output_ordering`).
+    fn maintains_input_order(&self) -> Vec<bool> {
+        vec![true]
     }
 
     fn partition_statistics(

@@ -16,9 +16,14 @@ limitations under the License.
 
 //! Logical optimizer rules for Cayenne.
 //!
-//! The flagship rules here are [`CayennePropagateFilterAcrossEquiJoinKeys`]
-//! and [`CayenneReassociateCrossJoin`], the plan-time rewrites that expose
-//! selective key domains and avoid preserving expensive join-order shapes.
+//! This module registers four logical rules: [`CayennePropagateFilterAcrossEquiJoinKeys`]
+//! (predicate transitive closure across equi-join keys), [`CayenneReassociateCrossJoin`]
+//! (avoid preserving an expensive early cross join), [`CayenneInListToRangeRewrite`]
+//! (long consecutive integer `IN` lists → `BETWEEN`), and [`CayennePushDownSemiJoin`]
+//! (push a `LeftSemi`/`RightSemi` join down to prune the base scan before the multi-way
+//! joins build their non-spillable hash tables). The flagship is
+//! [`CayennePropagateFilterAcrossEquiJoinKeys`], which exposes selective key domains and
+//! avoids preserving expensive join-order shapes.
 //!
 //! `DataFusion`'s stock `infer_join_predicates` (in `push_down_filter`) already
 //! propagates predicates that *directly* reference a join-key column:

@@ -16,6 +16,20 @@ limitations under the License.
 //!
 //! This module contains the main `CayenneTableProvider` struct which implements
 //! `DataFusion`'s `TableProvider` trait for Cayenne tables.
+//!
+//! Beyond the scan/insert/delete `TableProvider` surface, this (large) module also
+//! owns the moving parts the rest of the crate coordinates through the provider:
+//!
+//! - the **listing fence** (`RwLock`) read/write barrier and the `ArcSwap` listing /
+//!   snapshot state, plus per-snapshot scan ref-counting (`snapshot_scan_refs`) that pins
+//!   Vortex files against GC for a scan's lifetime;
+//! - the **in-memory CDC mem-tier** (`mem_tier`) with its publish lock, slot advancer,
+//!   and background checkpointer (the `cdc_durability: memory` path);
+//! - **query-path scan optimizations** — sound `output_ordering` on sorted-compaction
+//!   snapshots (attested by `current_sorted_snapshot`), parallel in-RAM scan partitioning
+//!   (`partition_memory_batches`), and the PK no-tombstone scan short-circuits;
+//! - the **seq-prefix bake** planner and the in-process compaction runner;
+//! - maintained-aggregate state (`maintained_aggregates`) and the per-table memory account.
 
 use super::constants::{STAGING_DIR_NAME, STAGING_WAL_FILENAME, STAGING_WAL_TMP_FILENAME};
 use super::delete::{
@@ -2188,6 +2202,17 @@ pub struct CayenneTableProvider {
     /// mode, so file-mode reads/writes are byte-identical. Shared across writer
     /// clones so every clone observes the same tier.
     mem_tier: Arc<ArcSwap<crate::provider::mem_tier::MemTier>>,
+    /// Snapshot-id attestation for sound scan `output_ordering`: `Some(id)` iff
+    /// the current snapshot `id` was produced by the sorted compaction rewrite
+    /// (`rewrite_current_snapshot_for_compaction` while `has_sort_columns()`),
+    /// which writes a single globally-sorted, non-overlapping run. SET under the
+    /// listing fence by that rewrite; CLEARED (`None`) by every other listing
+    /// mutation (snapshot-id change, in-place file add / listing refresh), so a
+    /// scan advertises ordering ONLY when the live file set is provably globally
+    /// sorted (and there are no unsorted in-RAM / protected branches — checked
+    /// separately in `scan`). Shared across writer clones so a compaction clone's
+    /// attestation is observed by scanning clones and invalidated for all on a write.
+    current_sorted_snapshot: Arc<ArcSwap<Option<String>>>,
     /// Serializes mem-tier checkpoints (spills) for this table so a single
     /// checkpoint is in flight at a time. The write path uses
     /// `try_lock()` on this to detect "a checkpoint is already running" and take
@@ -4144,6 +4169,10 @@ impl CayenneTableProvider {
         &self,
         new_snapshot_id: &str,
     ) -> Result<()> {
+        // [sound output_ordering] Rebinding the listing to a snapshot changes the
+        // live file set; invalidate the sorted attestation (the sorted compaction
+        // rewrite swaps the listing directly, not via this path).
+        self.current_sorted_snapshot.store(Arc::new(None));
         let snapshot_dir_url = Self::snapshot_dir_url(
             &self.table_metadata.path,
             &self.table_metadata.table_id,
@@ -6081,6 +6110,10 @@ impl CayenneTableProvider {
             mem_tier: Arc::new(ArcSwap::from_pointee(
                 crate::provider::mem_tier::MemTier::empty(),
             )),
+            // No sorted rewrite has run on this freshly-opened provider, so the
+            // scan does not advertise ordering until the sorted compactor attests
+            // a snapshot.
+            current_sorted_snapshot: Arc::new(ArcSwap::from_pointee(None)),
             mem_checkpoint_lock: Arc::new(tokio::sync::Mutex::new(())),
             mem_tier_publish_lock: Arc::new(tokio::sync::Mutex::new(())),
             slot_advancer: Arc::new(ParkingMutex::new(None)),
@@ -6814,6 +6847,9 @@ impl CayenneTableProvider {
             // Shared so every writer clone appends to / checkpoints the SAME
             // in-memory CDC tier and observes the same slot-advancer handle.
             mem_tier: Arc::clone(&self.mem_tier),
+            // Shared so the sorted-rewrite attestation set by any (compaction)
+            // clone is observed by scanning clones, and cleared for all on a write.
+            current_sorted_snapshot: Arc::clone(&self.current_sorted_snapshot),
             mem_checkpoint_lock: Arc::clone(&self.mem_checkpoint_lock),
             // Shared across clones so EVERY writer serializes on the one publish
             // lock (the seq-ordering invariant requires a single lock per table).
@@ -11940,6 +11976,21 @@ impl CayenneTableProvider {
             self.update_current_snapshot_id(&new_snapshot_id);
             self.clear_all_deletion_caches();
 
+            // [sound output_ordering attestation] When sort columns are
+            // configured this rewrite consolidated the entire snapshot into a
+            // single globally-sorted, non-overlapping run (the stream was sorted
+            // via `sort_stream` above and written by a single writer — see
+            // `snapshot_shard_count`). Attest THIS snapshot id as sorted so a
+            // subsequent `scan` may advertise `output_ordering` by the sort
+            // columns. MUST run AFTER `update_current_snapshot_id` (which clears
+            // the attestation) and under the held listing fence, so a concurrent
+            // scan observes the new listing and the attestation atomically. Any
+            // later listing mutation clears it again (see the clear sites).
+            if self.context.has_sort_columns() {
+                self.current_sorted_snapshot
+                    .store(Arc::new(Some(new_snapshot_id.clone())));
+            }
+
             // Persist accumulated stats from the rewrite — keeps DataFusion's
             // synchronous statistics path consistent with the new snapshot. The
             // rewrite materializes exactly the live rows, so its min/max + NDV +
@@ -13614,6 +13665,11 @@ impl CayenneTableProvider {
     /// in sync with the catalog.
     ///
     pub(crate) fn update_current_snapshot_id(&self, new_snapshot_id: &str) {
+        // [sound output_ordering] Any snapshot-id change invalidates the
+        // sorted-snapshot attestation. The sorted compaction rewrite re-sets it
+        // AFTER calling this; every other id change (overwrite, restore, catalog
+        // refresh) leaves it cleared so the scan never advertises stale ordering.
+        self.current_sorted_snapshot.store(Arc::new(None));
         {
             let mut guard = self.current_snapshot_id.write();
             if guard.as_str() != new_snapshot_id {
@@ -13805,6 +13861,12 @@ impl CayenneTableProvider {
     ///
     /// Returns an error if the listing table cannot be reconstructed.
     pub(crate) async fn refresh_listing_table_under_held_fence(&self) -> Result<()> {
+        // [sound output_ordering] A listing refresh re-lists the current snapshot
+        // because its file set changed (a checkpoint/append wrote files), which
+        // may have added UNSORTED files — invalidate the sorted attestation. The
+        // sorted compaction rewrite swaps the listing directly (not via this
+        // path), so its attestation is unaffected.
+        self.current_sorted_snapshot.store(Arc::new(None));
         // Construct URL to current snapshot using the live snapshot ID
         // (which may differ from table_metadata after compaction)
         let current_snapshot = self.get_current_snapshot_id();
@@ -13873,6 +13935,10 @@ impl CayenneTableProvider {
     /// `listing_fence.read()` across its listing call) and cannot cross a fence
     /// boundary.
     pub(crate) fn publish_current_snapshot_files_changed_under_held_fence(&self) {
+        // [sound output_ordering] This delta-applies newly-added (UNSORTED) files
+        // onto the current snapshot's cached listing in place — invalidate the
+        // sorted attestation so the scan won't advertise stale ordering.
+        self.current_sorted_snapshot.store(Arc::new(None));
         let current_snapshot = self.get_current_snapshot_id();
         let snapshot_dir_url = Self::snapshot_dir_url(
             &self.table_metadata.path,
@@ -15075,20 +15141,45 @@ impl CayenneTableProvider {
             PkDeletionStrategyWithCache::RowConverterBased {
                 deletion_snapshot, ..
             } => {
-                let converter = self.build_pk_converter(&pk_indices)?;
+                let deleted_row_keys = Arc::clone(&deletion_snapshot.load_full().tombstones);
                 let pk_columns: Vec<_> = pk_indices
                     .iter()
                     .map(|idx| Arc::clone(batch.column(*idx)))
                     .collect();
-                let rows = converter.convert_columns(&pk_columns)?;
-                let deleted_row_keys = Arc::clone(&deletion_snapshot.load_full().tombstones);
+                let pk_has_nulls = pk_columns.iter().any(|column| column.null_count() > 0);
 
-                if pk_columns.iter().any(|column| column.null_count() > 0) {
+                // [no-tombstone short-circuit] The composite-PK analog of the
+                // Int64 arm's disjoint min/max fast path above. When no row-key
+                // DELETE is live (the file-side index carries no deletions and the
+                // in-RAM tier has no deletion keys) and the PK columns have no
+                // nulls, no scanned row can be hidden and the batch is valid — pass
+                // it through and skip the O(rows x pk_cols) `RowConverter` encode +
+                // `filter_record_batch` copy entirely. We gate on the file index's
+                // `has_deletions()`, NOT `is_empty()`: the `KeyDeletionIndex` also
+                // tracks insert-only (upsert re-insertion) records, which `get_batch`
+                // treats as absent and which never hide a row, so an insert-only
+                // index (deletes == 0) is still a valid skip. The Int64 arm's
+                // disjoint *range* check needs the encoding for composite keys (the
+                // very cost being avoided), so the no-deletions check is the sound,
+                // cheap equivalent; gating on no-nulls preserves the null-PK
+                // validation error below. Mem-tier scans of an INSERT-heavy table
+                // take this between updates.
+                if !pk_has_nulls
+                    && !deleted_row_keys.has_deletions()
+                    && inlined_deletions.row_keys.is_empty()
+                {
+                    return Ok(Some(batch));
+                }
+
+                if pk_has_nulls {
                     return Err(Error::DataValidation {
                         table: self.table_metadata.table_name.clone(),
                         message: "Primary key values must be non-null".to_string(),
                     });
                 }
+
+                let converter = self.build_pk_converter(&pk_indices)?;
+                let rows = converter.convert_columns(&pk_columns)?;
                 // Same column-sweep shape as the Int64 arm: one batched bloom
                 // sweep over the encoded row keys, then the inline-map pass
                 // only for rows still kept (drop is monotone, so skipping
@@ -16263,6 +16354,7 @@ impl CayenneTableProvider {
         snapshot: &crate::provider::mem_tier::MemTier,
         effective_projection: Option<&Vec<usize>>,
         pruning_predicate: Option<&Arc<dyn PhysicalExpr>>,
+        target_partitions: usize,
     ) -> datafusion_common::Result<Option<Arc<dyn ExecutionPlan>>> {
         if snapshot.is_empty() || snapshot.segments.is_empty() {
             return Ok(None);
@@ -16280,7 +16372,7 @@ impl CayenneTableProvider {
         if visible_batches.is_empty() {
             return Ok(None);
         }
-        self.finish_mem_tier_scan_plan(visible_batches, effective_projection)
+        self.finish_mem_tier_scan_plan(visible_batches, effective_projection, target_partitions)
     }
 
     /// Shared tail of the mem-tier scan plan: apply the effective projection and
@@ -16289,6 +16381,7 @@ impl CayenneTableProvider {
         &self,
         visible_batches: Vec<RecordBatch>,
         effective_projection: Option<&Vec<usize>>,
+        target_partitions: usize,
     ) -> datafusion_common::Result<Option<Arc<dyn ExecutionPlan>>> {
         // Project to the effective projection (reusing the inlined-plan logic).
         let table_schema = self.table_schema();
@@ -16323,13 +16416,66 @@ impl CayenneTableProvider {
             return Ok(None);
         }
 
+        // Fan the in-RAM batches across `target_partitions` so DataFusion
+        // morsel-parallelizes the mem-tier scan instead of pinning it to one
+        // core (the single-partition `MemorySourceConfig` left the box idle on
+        // filtered aggregates over hot CDC tables — the round-robin repartition
+        // in `scan()` is gated off when scan filters are present). Correctness is
+        // unaffected: every batch lands in exactly one partition, so the union of
+        // partitions is the identical row set.
+        let partitions = Self::partition_memory_batches(projected_batches, target_partitions);
         Ok(Some(
             datafusion::datasource::memory::MemorySourceConfig::try_new_exec(
-                &[projected_batches],
+                &partitions,
                 proj_schema,
                 None,
             )?,
         ))
+    }
+
+    /// Distribute record batches across up to `target_partitions` partitions so
+    /// an in-RAM (mem-tier / inline-corpus) `MemorySourceConfig` scan branch runs
+    /// morsel-parallel across cores instead of pinned to a single one.
+    ///
+    /// Greedy least-loaded assignment by row count keeps the partitions balanced
+    /// when batch sizes vary. Tiny inputs stay single-partition (the
+    /// `MIN_ROWS_PER_PARTITION` floor) so the fan-out cost is never paid on a
+    /// trivially small tier. Correctness-preserving: each input batch is placed in
+    /// exactly one output partition, so the multiset of rows is unchanged — an
+    /// aggregate's partial+final and a filter's per-partition pass both compose
+    /// over the partitions identically to the single-partition shape.
+    fn partition_memory_batches(
+        batches: Vec<RecordBatch>,
+        target_partitions: usize,
+    ) -> Vec<Vec<RecordBatch>> {
+        // Don't fan a trivially small tier across cores — the scheduling +
+        // partial-aggregate merge overhead would dominate the saved scan time.
+        const MIN_ROWS_PER_PARTITION: usize = 8192;
+
+        // At least one row-bearing batch is guaranteed by the callers (they
+        // early-return on empty), but stay defensive.
+        let n = target_partitions.max(1).min(batches.len().max(1));
+        if n <= 1 {
+            return vec![batches];
+        }
+        let total_rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
+        let effective_n = n.min((total_rows / MIN_ROWS_PER_PARTITION).max(1));
+        if effective_n <= 1 {
+            return vec![batches];
+        }
+        let mut sizes = vec![0usize; effective_n];
+        let mut partitions: Vec<Vec<RecordBatch>> = (0..effective_n).map(|_| Vec::new()).collect();
+        for batch in batches {
+            // Assign to the currently least-loaded partition (greedy balance).
+            let min_idx = sizes
+                .iter()
+                .enumerate()
+                .min_by_key(|&(_, &rows)| rows)
+                .map_or(0, |(idx, _)| idx);
+            sizes[min_idx] = sizes[min_idx].saturating_add(batch.num_rows());
+            partitions[min_idx].push(batch);
+        }
+        partitions
     }
 
     pub(crate) async fn insert_to_new_snapshot_with_sequence(
@@ -17481,6 +17627,70 @@ impl CayenneTableProvider {
         )
     }
 
+    /// Build the `file_sort_order` (`Vec<Vec<SortExpr>>`) advertised on a
+    /// provably-sorted snapshot's scan, from the table's configured
+    /// `sort_columns`.
+    ///
+    /// CORRECTNESS: this MUST reproduce, entry-for-entry, the EXACT decision
+    /// [`util::stream_utils::sort_stream`] made when it physically wrote the file —
+    /// otherwise the advertised order diverges from disk and sort-elimination /
+    /// merge-join silently corrupt results. `sort_stream` resolves each entry as:
+    ///   1. if the TRIMMED entry is itself a column name → that column, ASC /
+    ///      NULLs-last. This comes FIRST, so a column whose literal name contains
+    ///      whitespace or a direction keyword (e.g. a column actually named
+    ///      `"id DESC"`) is matched as a whole — NOT mis-split by the parser into
+    ///      column `id` + `DESC`, which would advertise a *different* column and
+    ///      direction than was written.
+    ///   2. otherwise parse `column [ASC|DESC] [NULLS FIRST|LAST]` via
+    ///      [`util::stream_utils::parse_sort_entry`].
+    ///   3. otherwise `sort_stream` ABANDONS the whole sort and writes the stream
+    ///      UNSORTED.
+    ///
+    /// We mirror all three: (1)/(2) build the matching `SortExpr`; (3) — and any
+    /// entry whose resolved column is absent from `scan_schema` (e.g. projected
+    /// out, where a partial order would be unsound) — returns `None`, so the scan
+    /// advertises NO ordering. The column is built UNQUALIFIED (matching
+    /// `sort_stream`'s `Column::new(name, idx)` by-name resolution) so names with
+    /// dots/whitespace resolve to the exact field rather than being re-parsed.
+    fn sort_columns_to_file_sort_order(
+        sort_columns: &[String],
+        scan_schema: &arrow_schema::Schema,
+    ) -> Option<Vec<Vec<datafusion::logical_expr::SortExpr>>> {
+        if sort_columns.is_empty() {
+            return None;
+        }
+        let mut exprs = Vec::with_capacity(sort_columns.len());
+        for entry in sort_columns {
+            let (column, descending, nulls_first) =
+                if scan_schema.field_with_name(entry.trim()).is_ok() {
+                    // (1) exact-column-name fast path — FIRST, exactly as `sort_stream`.
+                    (entry.trim(), false, false)
+                } else if let Some((col, opts)) = util::stream_utils::parse_sort_entry(entry) {
+                    // (2) parsed form. The resolved column must exist in the scan
+                    // schema, else `sort_stream` would have skipped the sort / the
+                    // advertised order would be partial — advertise nothing.
+                    scan_schema.field_with_name(col).ok()?;
+                    (col, opts.descending, opts.nulls_first)
+                } else {
+                    // (3) `sort_stream` abandons the sort for an unparseable entry, so
+                    // the file is UNSORTED — advertise nothing.
+                    return None;
+                };
+            exprs.push(datafusion::logical_expr::SortExpr::new(
+                // Unqualified so a dotted / whitespaced name resolves to the exact
+                // field (mirrors `sort_stream`'s by-name `Column::new`).
+                datafusion::logical_expr::Expr::Column(datafusion_common::Column::new_unqualified(
+                    column,
+                )),
+                // `create_lex_ordering` maps `asc` back to `SortOptions { descending:
+                // !asc, nulls_first }`, reproducing exactly what the writer wrote.
+                !descending,
+                nulls_first,
+            ));
+        }
+        Some(vec![exprs])
+    }
+
     async fn create_snapshot_scan_plan(
         &self,
         state: &dyn Session,
@@ -17496,10 +17706,14 @@ impl CayenneTableProvider {
             filters,
             limit,
             state.config(),
+            // This wrapper serves protected-snapshot scans and internal reads,
+            // which are never the provably-sorted main branch — never advertise.
+            false,
         )
         .await
     }
 
+    #[expect(clippy::too_many_arguments)]
     async fn create_snapshot_scan_plan_with_config(
         &self,
         state: &dyn Session,
@@ -17508,6 +17722,11 @@ impl CayenneTableProvider {
         filters: &[Expr],
         limit: Option<usize>,
         scan_config: &SessionConfig,
+        // When true, advertise the sort-column `output_ordering` on the file
+        // branch — ONLY the main `scan()` path sets this, and only after proving
+        // the file set is globally sorted with no unsorted union branches. All
+        // other callers (protected-snapshot scans, internal reads) pass `false`.
+        allow_sorted_ordering: bool,
     ) -> datafusion_common::Result<Arc<dyn ExecutionPlan>> {
         let snapshot_dir_url = Self::snapshot_dir_url(
             &self.table_metadata.path,
@@ -17515,12 +17734,28 @@ impl CayenneTableProvider {
             snapshot_id,
         );
         let table_url = ListingTableUrl::parse(&snapshot_dir_url)?;
-        let options = Self::create_listing_options(
+        let mut options = Self::create_listing_options(
             self.context.file_format(),
             &self.pk_deletion_strategy,
             scan_config,
         );
         let scan_schema = Self::snapshot_scan_schema(&self.table_schema(), &options);
+
+        // [sound output_ordering] The caller (only the main `scan()` path) has
+        // verified this scan is over a provably globally-sorted file set. Advertise
+        // the sort-column ordering via `file_sort_order` so DataFusion drops
+        // redundant sorts and can open merge joins; the existing
+        // `create_lex_ordering` + `split_groups_by_statistics` below consume it,
+        // and a `SortPreservingMerge` handles the multi-file case. The order is
+        // built from the SAME `parse_sort_entry` the writer used, so the advertised
+        // direction/nulls placement is byte-identical to the physical order. If any
+        // sort column is absent from the scan schema, advertise NOTHING.
+        if allow_sorted_ordering
+            && let Some(file_sort_order) =
+                Self::sort_columns_to_file_sort_order(self.context.sort_columns(), &scan_schema)
+        {
+            options = options.with_file_sort_order(file_sort_order);
+        }
 
         let partition_column_names = options
             .table_partition_cols
@@ -17561,6 +17796,17 @@ impl CayenneTableProvider {
             &options.file_sort_order,
             state.execution_props(),
         )?;
+        // [sound output_ordering] Advertise the per-partition ordering ONLY when the
+        // files were actually grouped into non-overlapping sorted runs by statistics.
+        // On ANY fallback — per-file stats absent (e.g. `collect_stat` off for
+        // position deletes with pending deletions), overlapping ranges, or more
+        // groups than `target_partitions` — the default grouping may interleave
+        // ranges within a partition, so advertising a per-partition order would be
+        // UNSOUND (wrong results from sort-elimination / merge-join). `output_ordering`
+        // is non-empty only when the caller proved the set globally sorted
+        // (`allow_sorted_ordering`); for every other scan it is empty and this is a
+        // no-op identical to the prior behavior.
+        let mut ordering_is_sound = false;
         if state
             .config_options()
             .execution
@@ -17575,6 +17821,7 @@ impl CayenneTableProvider {
             ) {
                 Ok(new_groups) if new_groups.len() <= options.target_partitions => {
                     partitioned_file_lists = new_groups;
+                    ordering_is_sound = true;
                 }
                 Ok(_) => {
                     tracing::debug!(
@@ -17590,6 +17837,12 @@ impl CayenneTableProvider {
                 }
             }
         }
+        // Never advertise an ordering the grouping above did not prove sound.
+        let output_ordering = if ordering_is_sound {
+            output_ordering
+        } else {
+            Vec::new()
+        };
 
         let file_source = options.format.file_source(Self::snapshot_file_table_schema(
             &self.table_schema(),
@@ -18037,7 +18290,7 @@ impl CayenneTableProvider {
         let [pk_idx] = pk_indices_in_projection else {
             return None;
         };
-        // DF53 accessor for whole-plan (all-partition) statistics.
+        // DataFusion accessor for whole-plan (all-partition) statistics.
         let stats = plan.partition_statistics(None).ok()?;
         let col = stats.column_statistics.get(*pk_idx)?;
         let (DFPrecision::Exact(lo), DFPrecision::Exact(hi)) = (&col.min_value, &col.max_value)
@@ -18835,6 +19088,21 @@ impl TableProvider for CayenneTableProvider {
         // #10125 §6.4). The plan is built from the live current_snapshot_id so it
         // can apply per-scan DataFusion config (target_partitions, etc.).
         let current_snapshot_id = self.get_current_snapshot_id();
+        // [sound output_ordering] Advertise the sort-column ordering on the main
+        // file branch ONLY when provably sound: the current snapshot was produced
+        // by the sorted compaction rewrite (attestation id matches) AND this scan
+        // has no unsorted branches — no in-RAM mem-tier rows, no inline-corpus
+        // rows, no protected snapshots (each would union an unsorted stream, and a
+        // UnionExec drops ordering anyway). Read under the held `listing_fence`,
+        // consistent with the attestation's fenced writes. The deletion filter and
+        // `CayenneAccelerationExec` preserve ordering; round-robin repartition is
+        // gated off for ordered plans.
+        let allow_sorted_ordering = self.context.has_sort_columns()
+            && self.current_sorted_snapshot.load_full().as_deref()
+                == Some(current_snapshot_id.as_str())
+            && mem_tier_snapshot.is_empty()
+            && protected_map.is_empty()
+            && inlined_batches.is_empty();
         // Pin the snapshot dirs this scan reads (the captured current snapshot + all
         // protected snapshots) against concurrent-compaction GC for the FULL scan
         // lifetime — plan-build AND execution. Created under the read fence (held
@@ -18858,6 +19126,7 @@ impl TableProvider for CayenneTableProvider {
                 scan_filters,
                 limit,
                 scan_listing_config,
+                allow_sorted_ordering,
             )
             .await;
         self.record_listing_scan_duration(listing_scan_start.elapsed());
@@ -18920,9 +19189,21 @@ impl TableProvider for CayenneTableProvider {
             if projected_batches.is_empty() {
                 None
             } else {
+                // Fan the inline corpus across cores (same rationale as the
+                // mem-tier branch): a single-partition MemorySource pins the scan
+                // to one core, and the round-robin repartition in `scan()` is
+                // gated off whenever scan filters are present.
+                let inline_partitions = Self::partition_memory_batches(
+                    projected_batches,
+                    // Scan-resolved partition count, NOT the session's: a PK point
+                    // lookup forces `scan_listing_config` to target_partitions=1
+                    // (the file branch does the same), so the in-RAM branch must
+                    // not re-introduce fan-out for point lookups.
+                    scan_listing_config.target_partitions(),
+                );
                 let inline_exec: Arc<dyn ExecutionPlan> =
                     datafusion::datasource::memory::MemorySourceConfig::try_new_exec(
-                        &[projected_batches],
+                        &inline_partitions,
                         proj_schema,
                         None,
                     )?;
@@ -18945,6 +19226,8 @@ impl TableProvider for CayenneTableProvider {
                 &mem_tier_snapshot,
                 effective_projection.as_ref(),
                 mem_tier_pruning_predicate.as_ref(),
+                // Scan-resolved (1 for PK point lookups) — see the inline branch.
+                scan_listing_config.target_partitions(),
             )?
             .map(|mem_exec| self.wrap_memory_branch_with_scan_filters(mem_exec, filters));
 
@@ -23745,12 +24028,25 @@ mod tests {
             provider.rebuild_live_snapshot_manifests().await;
         }
 
-        let mut ids: Vec<String> = provider
-            .protected_snapshots
-            .load_full()
-            .keys()
-            .cloned()
-            .collect();
+        // Protected-snapshot registration can lag behind the awaited inserts under heavy
+        // parallel load (seen in CI: 6 expected, only 2 registered on an immediate read;
+        // always all N locally). The snapshots are never coalesced away — they all appear
+        // given a moment — so poll until the expected count is reached (bounded ~5s) before
+        // asserting, keeping the fixture deterministic under load instead of racing the
+        // background registration.
+        let mut ids: Vec<String> = Vec::new();
+        for _ in 0..100 {
+            ids = provider
+                .protected_snapshots
+                .load_full()
+                .keys()
+                .cloned()
+                .collect();
+            if ids.len() >= seqs.len() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
         ids.sort();
         assert_eq!(
             ids.len(),
@@ -24773,6 +25069,224 @@ mod tests {
             .await
             .expect("query created");
         df.collect().await.expect("collect succeeded")
+    }
+
+    /// [sound `output_ordering`] `sort_columns_to_file_sort_order` must reproduce
+    /// `sort_stream`'s exact per-entry resolution (Copilot review): the
+    /// exact-column-name match comes FIRST (so a column whose literal name contains
+    /// whitespace or a direction keyword is matched as a whole, NOT mis-split by the
+    /// parser), then the `column [ASC|DESC] [NULLS …]` parse, else advertise nothing.
+    /// A divergence here would advertise an order the file was NOT written in.
+    #[test]
+    fn test_sort_columns_to_file_sort_order_mirrors_sort_stream() {
+        use datafusion::logical_expr::Expr;
+        fn col_of(e: &Expr) -> &str {
+            match e {
+                Expr::Column(c) => c.name(),
+                other => panic!("expected a column expr, got {other:?}"),
+            }
+        }
+        let schema = Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            // A column whose LITERAL name contains a space and a direction keyword.
+            Field::new("id DESC", DataType::Int64, true),
+        ]);
+
+        // (1) plain column → exact-match → ASC, NULLs-last.
+        let o = CayenneTableProvider::sort_columns_to_file_sort_order(&["id".to_string()], &schema)
+            .expect("`id` is a column");
+        assert_eq!(o.len(), 1);
+        assert_eq!(o[0].len(), 1);
+        assert!(o[0][0].asc && !o[0][0].nulls_first);
+        assert_eq!(col_of(&o[0][0].expr), "id");
+
+        // (2) exact-match WINS over the parser: a column literally named `id DESC`
+        //     advertises that exact column ASC — NOT column `id` descending (which
+        //     is the silently-wrong order the parser-only path would have produced).
+        let o = CayenneTableProvider::sort_columns_to_file_sort_order(
+            &["id DESC".to_string()],
+            &schema,
+        )
+        .expect("`id DESC` is a column");
+        assert!(o[0][0].asc, "exact-matched column sorts ascending");
+        assert!(!o[0][0].nulls_first, "exact-matched column is NULLs-last");
+        assert_eq!(
+            col_of(&o[0][0].expr),
+            "id DESC",
+            "must advertise the exact column, not the mis-split `id`"
+        );
+
+        // (3) parsed `DESC NULLS FIRST` on a column reachable only via parsing.
+        let schema2 = Schema::new(vec![Field::new("ts", DataType::Int64, true)]);
+        let o = CayenneTableProvider::sort_columns_to_file_sort_order(
+            &["ts DESC NULLS FIRST".to_string()],
+            &schema2,
+        )
+        .expect("`ts` parses and exists");
+        assert!(!o[0][0].asc && o[0][0].nulls_first);
+        assert_eq!(col_of(&o[0][0].expr), "ts");
+
+        // (4) parsed, but the resolved column is absent from the schema → nothing.
+        assert!(
+            CayenneTableProvider::sort_columns_to_file_sort_order(
+                &["missing DESC".to_string()],
+                &schema2,
+            )
+            .is_none(),
+            "a sort column absent from the scan schema must drop ordering"
+        );
+
+        // (5) unparseable entry (`sort_stream` abandons the sort) → advertise nothing.
+        assert!(
+            CayenneTableProvider::sort_columns_to_file_sort_order(
+                &["a b c d".to_string()],
+                &schema2,
+            )
+            .is_none(),
+            "an unparseable entry leaves the file unsorted → advertise nothing"
+        );
+
+        // (6) empty sort_columns → nothing.
+        assert!(CayenneTableProvider::sort_columns_to_file_sort_order(&[], &schema2).is_none());
+    }
+
+    /// [sound `output_ordering`] A snapshot freshly produced by the sorted compaction
+    /// rewrite, with no unsorted union branches, advertises `output_ordering` by the
+    /// sort columns; a subsequent append delta-adds an UNSORTED file in place and
+    /// MUST clear the attestation so ordering is no longer advertised. Also locks the
+    /// bare-column `SortOptions` (ascending, NULLs-last) the writer sorted by.
+    #[tokio::test]
+    async fn test_sorted_rewrite_advertises_output_ordering_then_append_clears_it() {
+        use arrow::array::Int64Array;
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("value", DataType::Int64, false),
+        ]));
+        // Statistics-based file grouping must be on for the sorted file set to be
+        // grouped into a non-overlapping run (the soundness precondition).
+        let mut config = datafusion::prelude::SessionConfig::new();
+        config
+            .options_mut()
+            .execution
+            .split_file_groups_by_statistics = true;
+        let ctx = SessionContext::new_with_config(config);
+        // `inline_max_rows: 0` forces writes to files (not the inline memtable), so
+        // the rewrite actually sorts them and the inline-branch gate stays clear.
+        let (provider, _tmp) = create_cayenne_table_with_config(
+            "ordering_lifecycle",
+            Arc::clone(&schema),
+            VortexConfig {
+                sort_columns: vec!["id".to_string()],
+                inline_max_rows: 0,
+                ..VortexConfig::default()
+            },
+            vec![],
+            ctx.runtime_env(),
+        )
+        .await;
+
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int64Array::from(vec![5_i64, 1, 4, 2, 3])),
+                Arc::new(Int64Array::from(vec![50_i64, 10, 40, 20, 30])),
+            ],
+        )
+        .expect("batch");
+        insert_batch(&provider, batch).await;
+        provider
+            .rewrite_current_snapshot_for_compaction()
+            .await
+            .expect("sorted rewrite");
+
+        let plan = provider
+            .scan(&ctx.state(), None, &[], None)
+            .await
+            .expect("scan plan");
+        let ordering = plan.properties().output_ordering().expect(
+            "a sorted-rewritten snapshot with no unsorted branches must advertise output_ordering",
+        );
+        let first = ordering.first();
+        // Bare "id" ⇒ ascending, NULLs-last — must match what `sort_stream` wrote.
+        assert!(!first.options.descending, "bare sort column is ascending");
+        assert!(!first.options.nulls_first, "bare sort column is NULLs-last");
+
+        // A subsequent append delta-adds an UNSORTED file into the same snapshot in
+        // place; the attestation must clear so ordering is no longer advertised.
+        let more = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int64Array::from(vec![0_i64, 9])),
+                Arc::new(Int64Array::from(vec![0_i64, 90])),
+            ],
+        )
+        .expect("batch");
+        insert_batch(&provider, more).await;
+        let plan_after = provider
+            .scan(&ctx.state(), None, &[], None)
+            .await
+            .expect("scan plan after append");
+        assert!(
+            plan_after.properties().output_ordering().is_none(),
+            "after an append delta-adds an unsorted file, output_ordering must NOT be advertised"
+        );
+    }
+
+    /// [sound `output_ordering`] The advertised `SortOptions` (direction + NULLs
+    /// placement) MUST be byte-identical to what the writer sorted by — both built
+    /// from the same `parse_sort_entry`. A `DESC NULLS FIRST` sort column must
+    /// advertise descending + NULLs-first; a mismatch = silently wrong results.
+    #[tokio::test]
+    async fn test_output_ordering_sort_options_match_desc_nulls_first() {
+        use arrow::array::Int64Array;
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let mut config = datafusion::prelude::SessionConfig::new();
+        config
+            .options_mut()
+            .execution
+            .split_file_groups_by_statistics = true;
+        let ctx = SessionContext::new_with_config(config);
+        let (provider, _tmp) = create_cayenne_table_with_config(
+            "ordering_desc_nf",
+            Arc::clone(&schema),
+            VortexConfig {
+                sort_columns: vec!["id DESC NULLS FIRST".to_string()],
+                inline_max_rows: 0,
+                ..VortexConfig::default()
+            },
+            vec![],
+            ctx.runtime_env(),
+        )
+        .await;
+
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Int64Array::from(vec![1_i64, 5, 3, 2, 4]))],
+        )
+        .expect("batch");
+        insert_batch(&provider, batch).await;
+        provider
+            .rewrite_current_snapshot_for_compaction()
+            .await
+            .expect("sorted rewrite");
+
+        let plan = provider
+            .scan(&ctx.state(), None, &[], None)
+            .await
+            .expect("scan plan");
+        let ordering = plan
+            .properties()
+            .output_ordering()
+            .expect("descending sorted snapshot must advertise ordering");
+        let first = ordering.first();
+        assert!(
+            first.options.descending,
+            "`id DESC NULLS FIRST` must advertise a descending ordering"
+        );
+        assert!(
+            first.options.nulls_first,
+            "`id DESC NULLS FIRST` must advertise NULLs-first"
+        );
     }
 
     /// Phase 2 (bloom fallback) helper: create an int64-PK upsert table with an
@@ -30852,5 +31366,88 @@ mod tests {
             None,
             "multi-column PK must never be skipped at plan time"
         );
+    }
+
+    /// L4(b): the in-RAM scan branch partitioner must preserve every row exactly
+    /// once (correctness), bound the partition count by `target_partitions` and
+    /// the batch count, and keep a trivially small tier single-partition (the
+    /// fan-out floor). A wrong split here would drop/duplicate scanned rows.
+    #[test]
+    fn partition_memory_batches_preserves_rows_and_bounds_partitions() {
+        let schema = Arc::new(arrow::datatypes::Schema::new(vec![
+            arrow::datatypes::Field::new("pk", arrow::datatypes::DataType::Int64, false),
+        ]));
+        let make = |rows: i64, start: i64| {
+            let vals: Vec<i64> = (start..start + rows).collect();
+            RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![Arc::new(arrow::array::Int64Array::from(vals))],
+            )
+            .expect("batch")
+        };
+        let total = |parts: &[Vec<RecordBatch>]| -> usize {
+            parts.iter().flatten().map(RecordBatch::num_rows).sum()
+        };
+        // Sorted multiset of every PK value across all partitions — checks the actual
+        // rows, not just the count (a drop of one batch + duplicate of another with the
+        // same num_rows() would pass a count-only assertion).
+        let collect_pks = |parts: &[Vec<RecordBatch>]| -> Vec<i64> {
+            let mut pks: Vec<i64> = parts
+                .iter()
+                .flatten()
+                .flat_map(|b| {
+                    b.column(0)
+                        .as_any()
+                        .downcast_ref::<arrow::array::Int64Array>()
+                        .expect("pk column is Int64")
+                        .values()
+                        .to_vec()
+                })
+                .collect();
+            pks.sort_unstable();
+            pks
+        };
+
+        // 8 equal batches of 4096 rows (32768 total) across 4 partitions: fans
+        // out to exactly 4 balanced partitions, every row preserved once.
+        let batches: Vec<RecordBatch> = (0..8).map(|i| make(4096, i * 4096)).collect();
+        let parts = CayenneTableProvider::partition_memory_batches(batches, 4);
+        assert_eq!(parts.len(), 4, "32K-row tier fans out to target_partitions");
+        assert_eq!(total(&parts), 32768, "rows preserved across partitions");
+        assert_eq!(
+            collect_pks(&parts),
+            (0..32768).collect::<Vec<i64>>(),
+            "every PK value preserved exactly once across partitions (no drop/duplicate)"
+        );
+        assert!(
+            parts.iter().all(|p| !p.is_empty()),
+            "no empty partition when batches >= partitions"
+        );
+
+        // Trivially small tier stays single-partition (MIN_ROWS_PER_PARTITION floor).
+        let tiny =
+            CayenneTableProvider::partition_memory_batches(vec![make(10, 0), make(10, 50)], 16);
+        assert_eq!(tiny.len(), 1, "small tier stays single-partition");
+        assert_eq!(total(&tiny), 20);
+
+        // target_partitions == 1 → single partition regardless of size.
+        let one = CayenneTableProvider::partition_memory_batches(vec![make(40000, 0)], 1);
+        assert_eq!(one.len(), 1);
+        assert_eq!(total(&one), 40000);
+
+        // More partitions requested than batches → capped at the batch count.
+        let few = CayenneTableProvider::partition_memory_batches(
+            vec![make(20000, 0), make(20000, 0)],
+            16,
+        );
+        assert!(
+            few.len() <= 2,
+            "partition count never exceeds the batch count"
+        );
+        assert_eq!(total(&few), 40000);
+
+        // Empty input is handled defensively (callers early-return, but stay safe).
+        let empty = CayenneTableProvider::partition_memory_batches(Vec::new(), 8);
+        assert_eq!(total(&empty), 0);
     }
 }

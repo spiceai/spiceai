@@ -23,31 +23,43 @@ limitations under the License.
 //! [`TombstoneEntry`], so the scan hot path answers "is this row deleted, and was
 //! it re-inserted after that?" with a **single** probe.
 //!
-//! # Layered storage: frozen flat base + small delta
+//! # Layered storage: ordered frozen runs + a small active tier
 //!
-//! Entries live in two tiers (the in-memory analogue of an LSM memtable over a
-//! frozen run):
+//! Entries live in `LayeredRuns`: an ordered set of frozen **runs** (oldest
+//! first) over one small mutable **active** tier — the in-memory analogue of an
+//! LSM run cascade over a memtable:
 //!
-//! - **base**: an `Arc<std::collections::HashMap>` (`SwissTable`). Frozen — never
-//!   mutated after construction — so publishing a new index generation shares it
-//!   with an `Arc` clone, and probing it costs 1–2 cache lines regardless of
-//!   size. This tier holds the overwhelming majority of entries at scale.
-//! - **delta**: a small persistent [`im::HashMap`] holding writes since the last
-//!   merge. `O(1)` to snapshot per publish (structural sharing), and because the
-//!   merge policy caps it at `max(`[`DELTA_MERGE_MIN`]`, base/4)` entries it
-//!   stays a shallow, cache-resident HAMT — the pointer-chasing that made a
-//!   *large* HAMT the dominant scan cost (per-row `get` walks of 5+ levels at
-//!   millions of entries) never develops.
+//! - **runs**: a `Vec<Arc<RunData>>`. Each run is a frozen
+//!   `Arc<std::collections::HashMap>` (`SwissTable`) tagged with its maximum
+//!   delete sequence (`max_delete_seq`) plus its own bloom filter. Frozen — never
+//!   mutated after construction — so publishing a new generation shares the runs
+//!   by `Arc` clone, and probing one run costs 1–2 cache lines.
+//! - **active**: a small persistent [`im::HashMap`] holding writes since the last
+//!   freeze. `O(1)` to snapshot per publish (structural sharing).
 //!
-//! A probe checks the bloom filter, then delta, then base — at most one small
-//! in-cache lookup plus one flat-table lookup. A write goes to delta only; when
-//! delta outgrows the threshold it is folded into a fresh base (`O(base+delta)`
-//! copy). The `base/4` ladder keeps total copy work per key logarithmic in the
-//! final index size, and old generations pinned by long scans share the previous
-//! base `Arc`, so a merge costs one transient extra base — not one per
-//! generation.
+//! A write goes to `active`; when `active` crosses
+//! `max(`[`DELTA_MERGE_MIN`]`, base/4)` entries it **freezes** into a new run,
+//! and once the run count exceeds `MAX_FROZEN_RUNS` the adjacent pair with the
+//! smallest combined size **folds** together (size-tiering — the large base run
+//! stays stable while the recent runs a probe touches stay shallow and
+//! cache-resident). The `base/4` freeze ladder keeps total copy work per key
+//! logarithmic in the final index size, and generations pinned by long scans
+//! share the previous runs by `Arc`.
 //!
-//! The bloom filter is keyed on *deletion* membership (a single cache line per
+//! A probe fuses `active` with the *applicable* runs, per-side max:
+//! - **main-scan** (cutoff `None`): every run is fused, behind the global bloom
+//!   fast-reject (the base run's bloom *is* the global one).
+//! - **protected-snapshot** (cutoff `Some(S)`): runs with `max_delete_seq <= S`
+//!   are skipped wholesale (no delete in them can be newer than `S`), and the
+//!   remaining recent runs are gated by their own per-run blooms — so a protected
+//!   probe never touches the large global bloom and its cost tracks the recent
+//!   (small) runs, not the total accumulated tombstone count.
+//!
+//! The seq-prefix bake ([`prune_deletes_at_or_below`](DeletionIndex::prune_deletes_at_or_below))
+//! drops deletes at or below a cutoff sequence once they are baked into the data
+//! files, shrinking the runs.
+//!
+//! The bloom filters are keyed on *deletion* membership (a single cache line per
 //! probe). Entries holding only an insert record (which occur after compaction
 //! purges delete files while insert records remain in the catalog) are not
 //! represented in the bloom and are reported as absent by [`get`] — exactly the
