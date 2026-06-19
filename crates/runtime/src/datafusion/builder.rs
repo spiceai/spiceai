@@ -343,6 +343,7 @@ pub struct DataFusionBuilder {
     accelerator_engine_registry: Arc<AcceleratorEngineRegistry>,
     memory_limit: Option<u64>,
     target_partitions: Option<usize>,
+    prefer_hash_join: Option<bool>,
     temp_directory: Option<String>,
     accelerated_refresh_semaphore: Option<Arc<Semaphore>>,
     task_history_enabled: bool,
@@ -401,6 +402,7 @@ impl DataFusionBuilder {
             accelerator_engine_registry,
             memory_limit: None,
             target_partitions: None,
+            prefer_hash_join: None,
             temp_directory: None,
             accelerated_refresh_semaphore: None,
             task_history_enabled: true,
@@ -450,6 +452,12 @@ impl DataFusionBuilder {
     #[must_use]
     pub fn target_partitions(mut self, target_partitions: Option<usize>) -> Self {
         self.target_partitions = target_partitions;
+        self
+    }
+
+    #[must_use]
+    pub fn prefer_hash_join(mut self, prefer_hash_join: Option<bool>) -> Self {
+        self.prefer_hash_join = prefer_hash_join;
         self
     }
 
@@ -658,6 +666,17 @@ impl DataFusionBuilder {
                 effective = config.options().execution.target_partitions,
                 "runtime.query.target_partitions not set; using DataFusion default"
             );
+        }
+
+        // `HashJoinExec` build sides are not spillable, so very large joins can
+        // exhaust the query memory pool outright. Setting this to `false` makes
+        // the planner emit spillable sort-merge joins instead. Left unset,
+        // DataFusion's default (prefer hash joins) stands; the Cayenne
+        // `CayenneAntiJoinSortMergeRewriter` still selectively converts oversized
+        // hash joins to sort-merge under the memory gate.
+        if let Some(prefer_hash_join) = self.prefer_hash_join {
+            config.options_mut().optimizer.prefer_hash_join = prefer_hash_join;
+            tracing::info!(prefer_hash_join, "Applied runtime.query.prefer_hash_join");
         }
 
         // Sizes DataFusion's *native* hash-join InList dynamic-filter budget
