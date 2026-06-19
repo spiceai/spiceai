@@ -71,13 +71,16 @@ pub fn schemas_compatible(candidate: &Schema, expected: &Schema) -> bool {
         })
 }
 
-/// `Utf8`, `LargeUtf8`, and `Utf8View` are one logical UTF-8 string type with
-/// different physical layouts; likewise `Binary`/`LargeBinary`/`BinaryView`.
-/// Treat the members of each family as interchangeable so an accelerator that
-/// advertises view types (e.g. Cayenne's force-view read schema, which decouples
-/// the query/scan types from the stored `Utf8`/`Binary` types) is not rejected as
-/// incompatible with a non-view source or snapshot. The values are losslessly
-/// castable in both directions and write paths normalize via `try_cast_to`.
+/// A *view* string/binary type is interchangeable with the non-view members of
+/// its family — `Utf8View` with `Utf8`/`LargeUtf8`, and `BinaryView` with
+/// `Binary`/`LargeBinary` — because Cayenne's force-view read schema decouples the
+/// query/scan types from the stored `Utf8`/`Binary` types, and the values are
+/// losslessly castable (write paths normalize via `try_cast_to`).
+///
+/// Deliberately narrow: at least one side must be the view type. Non-view width
+/// changes (e.g. `Utf8` vs `LargeUtf8`) alter the physical offset width, are never
+/// introduced by the force-view path, and stay strict so genuine widenings are
+/// still rejected by snapshot refresh and provider swap.
 fn data_types_compatible(a: &DataType, b: &DataType) -> bool {
     fn is_string(dt: &DataType) -> bool {
         matches!(
@@ -91,7 +94,16 @@ fn data_types_compatible(a: &DataType, b: &DataType) -> bool {
             DataType::Binary | DataType::LargeBinary | DataType::BinaryView
         )
     }
-    a == b || (is_string(a) && is_string(b)) || (is_binary(a) && is_binary(b))
+    if a == b {
+        return true;
+    }
+    let string_view = is_string(a)
+        && is_string(b)
+        && (matches!(a, DataType::Utf8View) || matches!(b, DataType::Utf8View));
+    let binary_view = is_binary(a)
+        && is_binary(b)
+        && (matches!(a, DataType::BinaryView) || matches!(b, DataType::BinaryView));
+    string_view || binary_view
 }
 
 /// A [`TableProvider`] that delegates to an inner provider which may be
@@ -378,9 +390,9 @@ mod tests {
 
     #[test]
     fn schemas_compatible_treats_view_and_nonview_string_binary_as_equal() {
-        // String family: Utf8 / LargeUtf8 / Utf8View are interchangeable (an
-        // accelerator advertising view types over a non-view source must not be
-        // rejected). Same for the binary family. Nullability/name still strict.
+        // A view type is interchangeable with the non-view members of its family
+        // (an accelerator advertising view types over a non-view source must not
+        // be rejected) — but ONLY when one side is the view type.
         let utf8 = Schema::new(vec![Field::new("s", DataType::Utf8, true)]);
         let utf8_view = Schema::new(vec![Field::new("s", DataType::Utf8View, true)]);
         let large_utf8 = Schema::new(vec![Field::new("s", DataType::LargeUtf8, true)]);
@@ -392,6 +404,10 @@ mod tests {
         let binary_view = Schema::new(vec![Field::new("b", DataType::BinaryView, false)]);
         assert!(schemas_compatible(&binary, &binary_view));
         assert!(schemas_compatible(&binary_view, &binary));
+
+        // Non-view width changes stay strict (no view type involved): a genuine
+        // Utf8 -> LargeUtf8 widening must still be rejected.
+        assert!(!schemas_compatible(&utf8, &large_utf8));
 
         // Cross-family and unrelated types stay incompatible.
         let int = Schema::new(vec![Field::new("s", DataType::Int32, true)]);
