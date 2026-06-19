@@ -2207,8 +2207,21 @@ impl DataAccelerator for CayenneAccelerator {
             // the MetadataCatalog API), while the concrete handle is needed by
             // `CayennePartitionedInsertStrategy` to open a shared
             // MetastoreTransaction across all partitions (issue #10125).
+            // Honor the configured `cayenne_metastore` backend (Turso uses the
+            // `libsql://` scheme) rather than hardcoding SQLite. The unpartitioned
+            // path (`get_or_create_catalog`) already selects the scheme from this
+            // param; without the same logic here, partitioned tables silently
+            // ignore `cayenne_metastore: turso` and fall back to SQLite.
+            let metastore_type = source
+                .acceleration()
+                .and_then(|a| a.params.get("cayenne_metastore"))
+                .map_or("sqlite", String::as_str);
+            let catalog_connection_string = match metastore_type {
+                "turso" => format!("libsql://{metadata_dir}/cayenne.db"),
+                _ => format!("sqlite://{metadata_dir}/cayenne.db"),
+            };
             let catalog_concrete: Arc<cayenne::CayenneCatalog> = Arc::new(
-                cayenne::CayenneCatalog::new(format!("sqlite://{metadata_dir}/cayenne.db"))
+                cayenne::CayenneCatalog::new(catalog_connection_string)
                     .boxed()
                     .context(AccelerationInitializationFailedSnafu)?,
             );

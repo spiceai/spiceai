@@ -18,7 +18,7 @@ limitations under the License.
 //!
 //! This trait defines the interface for managing table metadata
 //! and file references. It can be implemented by different RDBMS backends
-//! (`SQLite`, `PostgreSQL`, etc.).
+//! (`SQLite`, Turso, etc.).
 
 use super::metadata::{
     CreateTableOptions, DeleteFile, InlinedData, InlinedDataStats, InlinedDelete,
