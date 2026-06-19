@@ -644,7 +644,9 @@ pub fn register_tokio_runtime_metrics(handles: Vec<(&'static str, tokio::runtime
     let h = std::sync::Arc::clone(&handles);
     let _ = meter
         .u64_observable_gauge("tokio_runtime_global_queue_depth")
-        .with_description("Tasks waiting in the runtime's global (injection) queue per tokio runtime.")
+        .with_description(
+            "Tasks waiting in the runtime's global (injection) queue per tokio runtime.",
+        )
         .with_unit("{task}")
         .with_callback(move |obs| {
             for (name, handle) in h.iter() {
@@ -682,7 +684,9 @@ pub fn register_tokio_runtime_metrics(handles: Vec<(&'static str, tokio::runtime
         let h = std::sync::Arc::clone(&handles);
         let _ = meter
             .u64_observable_gauge("tokio_runtime_worker_park_count")
-            .with_description("Cumulative worker park count (summed across workers) per tokio runtime.")
+            .with_description(
+                "Cumulative worker park count (summed across workers) per tokio runtime.",
+            )
             .with_unit("{park}")
             .with_callback(move |obs| {
                 for (name, handle) in h.iter() {
@@ -696,7 +700,9 @@ pub fn register_tokio_runtime_metrics(handles: Vec<(&'static str, tokio::runtime
         let h = std::sync::Arc::clone(&handles);
         let _ = meter
             .u64_observable_gauge("tokio_runtime_worker_steal_count")
-            .with_description("Cumulative task-steal count (summed across workers) per tokio runtime.")
+            .with_description(
+                "Cumulative task-steal count (summed across workers) per tokio runtime.",
+            )
             .with_unit("{steal}")
             .with_callback(move |obs| {
                 for (name, handle) in h.iter() {
