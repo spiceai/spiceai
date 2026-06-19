@@ -458,6 +458,7 @@ impl MongoResumeTokenCommitter {
 #[async_trait]
 impl CommitChange for MongoResumeTokenCommitter {
     async fn commit(&self) -> Result<(), CommitError> {
+        tracing::info!(dataset_name = %self.mongo_sys.dataset_name, token=%self.resume_token_json, "Committing resume token");
         self.mongo_sys
             .upsert(&MongoCheckpointMetadata {
                 resume_token_json: self.resume_token_json.clone(),
