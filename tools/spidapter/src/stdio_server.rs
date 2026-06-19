@@ -590,9 +590,7 @@ fn build_nondirect_sink(setup_config: &SetupConfig) -> SinkConfig {
         }
         FederatedStorageConfig::MongoDB { uri, .. } => SinkConfig::MongoDb { uri: uri.clone() },
         // Bootstrap is rejected for Direct before this is ever called.
-        FederatedStorageConfig::Direct => SinkConfig::MongoDb {
-            uri: String::new(),
-        },
+        FederatedStorageConfig::Direct => SinkConfig::MongoDb { uri: String::new() },
     }
 }
 
@@ -1456,7 +1454,9 @@ impl Handler for SpidapterHandler {
             {
                 // Drop the seeded per-run database explicitly (Drop is fail-safe).
                 if let Err(e) = drop_mongodb_database(&uri, &database).await {
-                    eprintln!("[stdio] teardown: warning: failed to drop MongoDB database '{database}': {e}");
+                    eprintln!(
+                        "[stdio] teardown: warning: failed to drop MongoDB database '{database}': {e}"
+                    );
                 }
             }
             // Remaining ec2/dynamodb guards (if any, !preserve) clean up on drop here.
