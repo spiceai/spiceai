@@ -200,6 +200,9 @@ pub struct KafkaConfig {
     pub sasl_username: Option<String>,
     pub sasl_password: Option<String>,
     pub ssl_ca_location: Option<String>,
+    pub ssl_certificate_location: Option<String>,
+    pub ssl_key_location: Option<String>,
+    pub ssl_key_password: Option<String>,     
     pub enable_ssl_certificate_verification: bool,
     pub ssl_endpoint_identification_algorithm: SslIdentification,
     pub consumer_group_id: Option<String>,
@@ -218,6 +221,12 @@ impl std::fmt::Debug for KafkaConfig {
                 &self.sasl_password.as_ref().map(|_| "REDACTED"),
             )
             .field("ssl_ca_location", &self.ssl_ca_location)
+            .field("ssl_certificate_location", &self.ssl_certificate_location)
+            .field("ssl_key_location", &self.ssl_key_location)
+            .field(
+                "ssl_key_password",
+                &self.ssl_key_password.as_ref().map(|_| "REDACTED"),
+            )
             .field(
                 "enable_ssl_certificate_verification",
                 &self.enable_ssl_certificate_verification,
@@ -738,6 +747,15 @@ impl KafkaConsumer {
         }
         if let Some(ssl_ca_location) = &kafka_config.ssl_ca_location {
             config.set("ssl.ca.location", ssl_ca_location);
+        }
+        if let Some(ssl_certificate_location) = &kafka_config.ssl_certificate_location {
+            config.set("ssl.certificate.location", ssl_certificate_location);
+        }
+        if let Some(ssl_key_location) = &kafka_config.ssl_key_location {
+            config.set("ssl.key.location", ssl_key_location);
+        }
+        if let Some(ssl_key_password) = &kafka_config.ssl_key_password {
+            config.set("ssl.key.password", ssl_key_password);
         }
         if kafka_config.enable_ssl_certificate_verification {
             config.set("enable.ssl.certificate.verification", "true");
