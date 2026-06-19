@@ -343,8 +343,10 @@ pub struct DataFusionBuilder {
     accelerator_engine_registry: Arc<AcceleratorEngineRegistry>,
     memory_limit: Option<u64>,
     target_partitions: Option<usize>,
+    prefer_hash_join: Option<bool>,
     temp_directory: Option<String>,
     accelerated_refresh_semaphore: Option<Arc<Semaphore>>,
+    query_admission_semaphore: Option<Arc<Semaphore>>,
     task_history_enabled: bool,
     caching: Option<Arc<Caching>>,
     spill_compression: Option<SpillCompression>,
@@ -401,8 +403,10 @@ impl DataFusionBuilder {
             accelerator_engine_registry,
             memory_limit: None,
             target_partitions: None,
+            prefer_hash_join: None,
             temp_directory: None,
             accelerated_refresh_semaphore: None,
+            query_admission_semaphore: None,
             task_history_enabled: true,
             caching: None,
             spill_compression: None,
@@ -454,6 +458,12 @@ impl DataFusionBuilder {
     }
 
     #[must_use]
+    pub fn prefer_hash_join(mut self, prefer_hash_join: Option<bool>) -> Self {
+        self.prefer_hash_join = prefer_hash_join;
+        self
+    }
+
+    #[must_use]
     pub fn spill_compression(mut self, spill_compression: Option<SpiceSpillCompression>) -> Self {
         self.spill_compression = match spill_compression {
             Some(SpiceSpillCompression::Zstd) => Some(SpillCompression::Zstd),
@@ -477,6 +487,18 @@ impl DataFusionBuilder {
     ) -> Self {
         self.accelerated_refresh_semaphore =
             Some(Arc::new(Semaphore::new(max_parallel_accelerated_refreshes)));
+        self
+    }
+
+    /// Bound the number of concurrently-executing query plans — ordinary queries
+    /// plus DDL/DML and `EXECUTE` (not lightweight `PREPARE`/`DEALLOCATE`/`SET`) —
+    /// i.e. query admission control. `None` leaves the gate unbounded (the prior
+    /// behavior); `Some(n)` installs a semaphore of `n` permits (clamped to at
+    /// least 1).
+    #[must_use]
+    pub fn max_concurrent_queries(mut self, max_concurrent_queries: Option<usize>) -> Self {
+        self.query_admission_semaphore =
+            max_concurrent_queries.map(|n| Arc::new(Semaphore::new(n.max(1))));
         self
     }
 
@@ -658,6 +680,17 @@ impl DataFusionBuilder {
                 effective = config.options().execution.target_partitions,
                 "runtime.query.target_partitions not set; using DataFusion default"
             );
+        }
+
+        // `HashJoinExec` build sides are not spillable, so very large joins can
+        // exhaust the query memory pool outright. Setting this to `false` makes
+        // the planner emit spillable sort-merge joins instead. Left unset,
+        // DataFusion's default (prefer hash joins) stands; the Cayenne
+        // `CayenneAntiJoinSortMergeRewriter` still selectively converts oversized
+        // hash joins to sort-merge under the memory gate.
+        if let Some(prefer_hash_join) = self.prefer_hash_join {
+            config.options_mut().optimizer.prefer_hash_join = prefer_hash_join;
+            tracing::info!(prefer_hash_join, "Applied runtime.query.prefer_hash_join");
         }
 
         // Sizes DataFusion's *native* hash-join InList dynamic-filter budget
@@ -971,10 +1004,12 @@ impl DataFusionBuilder {
             accelerated_tables: TokioRwLock::new(HashSet::new()),
             accelerator_engine_registry: self.accelerator_engine_registry,
             acceleration_refresh_semaphore: self.accelerated_refresh_semaphore,
+            query_admission_semaphore: self.query_admission_semaphore,
             task_history_enabled: self.task_history_enabled,
             temp_directory: self.temp_directory.clone(),
             cpu_runtime: OnceLock::new(),
             refresh_runtime: OnceLock::new(),
+            cdc_apply_runtime: OnceLock::new(),
             compaction_runtime: OnceLock::new(),
             compaction_runtime_env,
             compaction_memory_bytes,
