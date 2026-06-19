@@ -17893,10 +17893,9 @@ impl CayenneTableProvider {
             Vec::new()
         };
 
-        let file_source = options.format.file_source(Self::snapshot_file_table_schema(
-            &base_schema,
-            &options,
-        ));
+        let file_source = options
+            .format
+            .file_source(Self::snapshot_file_table_schema(&base_schema, &options));
 
         options
             .format
@@ -18676,11 +18675,11 @@ impl CayenneTableProvider {
 /// Cayenne's stored schema ([`CayenneTableProvider::table_schema`]) — used by
 /// writes, CDC apply, the PK keyset, the deletion index, and footer stats —
 /// keeps the original `Utf8`/`Binary` types. The *query* scan instead advertises
-/// and decodes these columns as view types so DataFusion plans operators on view
-/// arrays. The motivating case is the hash-join build side: DataFusion collects
-/// the whole build side into one `RecordBatch` via `concat_batches`, and a `Utf8`
-/// column there overflows Arrow's i32 offset buffer once the concatenated values
-/// exceed 2 GiB (`Offset overflow`, e.g. CH-benCH q21 at SF1000 where `su_name`
+/// and decodes these columns as view types so `DataFusion` plans operators on
+/// view arrays. The motivating case is the hash-join build side: `DataFusion`
+/// collects the whole build side into one `RecordBatch` via `concat_batches`, and
+/// a `Utf8` column there overflows Arrow's i32 offset buffer once the concatenated
+/// values exceed 2 GiB (`Offset overflow`, e.g. `CH-benCH` q21 at SF1000, `su_name`
 /// fans out across a ~100M-row join). `Utf8View`/`BinaryView` append independent
 /// data buffers instead of re-offsetting one buffer, so they have no 2 GiB
 /// single-array ceiling. Vortex decodes the view type natively when the scan's
@@ -20298,8 +20297,8 @@ mod tests {
     /// provider advertises `Utf8` columns as `Utf8View` AND the scan actually emits
     /// `StringViewArray` — including the in-memory (inline) branch, which is cast to
     /// match the view-typed file scan. (The stored `table_schema` stays `Utf8`.)
-    /// This is the path that lets DataFusion plan the hash join on view arrays and
-    /// avoids the i32 2 GiB offset overflow at scale (CH-benCH q21 @SF1000).
+    /// This is the path that lets `DataFusion` plan the hash join on view arrays
+    /// and avoids the i32 2 GiB offset overflow at scale (`CH-benCH` q21 @SF1000).
     #[tokio::test]
     async fn force_view_read_schema_scan_emits_utf8view() {
         use arrow::array::{Int64Array, StringArray, StringViewArray};

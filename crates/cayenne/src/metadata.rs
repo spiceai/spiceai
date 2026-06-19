@@ -935,8 +935,8 @@ pub struct VortexConfig {
     /// Force the **read/query** scan to emit Arrow *view* types (`Utf8View`/
     /// `BinaryView`) for `Utf8`/`Binary` columns, decoupled from the stored
     /// schema (which keeps the original types for writes/CDC/stats/keyset). Lets
-    /// DataFusion plan joins/aggregates on view arrays, avoiding the i32 2 GiB
-    /// offset overflow in hash-join build-side `concat_batches` (e.g. CH-benCH
+    /// `DataFusion` plan joins/aggregates on view arrays, avoiding the i32 2 GiB
+    /// offset overflow in hash-join build-side `concat_batches` (e.g. `CH-benCH`
     /// q21 at SF1000, where `su_name` fans out across a ~100M-row join). A runtime
     /// read behavior that does not affect stored data, so `#[serde(skip)]` — not a
     /// spicepod knob and not compared by `configuration_matches`. Off by default
