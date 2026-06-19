@@ -821,7 +821,6 @@ impl ExecutionPlan for CayenneAccelerationExec {
             overlay,
         )))
     }
-    }
 
     // Allow optimizer to push limits through to inputs
     fn supports_limit_pushdown(&self) -> bool {
