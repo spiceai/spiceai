@@ -15,9 +15,7 @@ limitations under the License.
 */
 
 #![allow(clippy::missing_errors_doc)]
-use std::{
-    any::Any, borrow::Cow, collections::HashMap, error::Error, hash::BuildHasher, sync::Arc,
-};
+use std::{borrow::Cow, collections::HashMap, error::Error, hash::BuildHasher, sync::Arc};
 
 use async_trait::async_trait;
 use datafusion::arrow::datatypes::{Schema, SchemaRef};
@@ -282,10 +280,7 @@ where
         return provider;
     }
 
-    if let Some(adaptor) = provider
-        .as_any()
-        .downcast_ref::<FederatedTableProviderAdaptor>()
-    {
+    if let Some(adaptor) = provider.downcast_ref::<FederatedTableProviderAdaptor>() {
         let Some(table_provider) = &adaptor.table_provider else {
             return Arc::clone(&provider);
         };
@@ -318,10 +313,6 @@ impl std::fmt::Debug for MetadataEnrichedTableProvider {
 
 #[async_trait]
 impl TableProvider for MetadataEnrichedTableProvider {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema(&self) -> SchemaRef {
         Arc::clone(&self.schema)
     }
@@ -452,6 +443,96 @@ pub trait RefreshableCatalogProvider: CatalogProvider {
     async fn refresh(&self) -> Result<(), Box<dyn Error + Send + Sync>>;
 }
 
+/// A [`CatalogProvider`] that periodically refreshes its contents from a remote
+/// catalog by polling the wrapped [`RefreshableCatalogProvider`].
+///
+/// This is a *transparent* wrapper: every catalog registered through a
+/// `RefreshableCatalogProvider` is wrapped in one of these. Concrete-type
+/// detection (e.g. "is this catalog Cayenne-backed?") must therefore peel the
+/// wrapper via [`RefreshingCatalogProvider::inner_catalog`] before downcasting.
+///
+/// `DataFusion` 54 removed `CatalogProvider::as_any`, which this wrapper used to
+/// delegate to its inner provider so that `downcast_ref::<ConcreteProvider>()`
+/// transparently saw through it. The `Any`-based `downcast_ref` that replaced it
+/// can only ever resolve to the wrapper's own type, so callers must peel
+/// explicitly — see [`RefreshingCatalogProvider::inner_catalog`].
+#[derive(Debug)]
+pub struct RefreshingCatalogProvider {
+    inner: Arc<dyn RefreshableCatalogProvider>,
+    refresh_task: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl RefreshingCatalogProvider {
+    #[must_use]
+    pub fn new(inner: Arc<dyn RefreshableCatalogProvider>) -> Self {
+        Self {
+            inner,
+            refresh_task: None,
+        }
+    }
+
+    /// Returns the wrapped catalog provider.
+    ///
+    /// Catalog-type detection must peel this wrapper via this accessor to reach
+    /// the underlying provider (e.g. a `CayenneCatalogProvider`); see the
+    /// type-level documentation for why.
+    #[must_use]
+    pub fn inner_catalog(&self) -> &dyn CatalogProvider {
+        self.inner.as_ref()
+    }
+
+    /// Spawns the background refresh loop and returns the started provider.
+    #[must_use]
+    pub fn start_refresh(mut self, interval: Option<std::time::Duration>) -> Self {
+        let interval = interval.unwrap_or(std::time::Duration::from_mins(1));
+        let inner = Arc::clone(&self.inner);
+        self.refresh_task = Some(tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(interval).await;
+                if let Err(e) = inner.refresh().await {
+                    tracing::error!("Failed to refresh catalog: {e}");
+                }
+            }
+        }));
+        self
+    }
+}
+
+#[deny(clippy::missing_trait_methods)]
+impl CatalogProvider for RefreshingCatalogProvider {
+    fn schema_names(&self) -> Vec<String> {
+        self.inner.schema_names()
+    }
+
+    fn schema(&self, name: &str) -> Option<Arc<dyn datafusion::catalog::SchemaProvider>> {
+        self.inner.schema(name)
+    }
+
+    fn register_schema(
+        &self,
+        name: &str,
+        schema: Arc<dyn datafusion::catalog::SchemaProvider>,
+    ) -> datafusion::error::Result<Option<Arc<dyn datafusion::catalog::SchemaProvider>>> {
+        self.inner.register_schema(name, schema)
+    }
+
+    fn deregister_schema(
+        &self,
+        name: &str,
+        cascade: bool,
+    ) -> datafusion::error::Result<Option<Arc<dyn datafusion::catalog::SchemaProvider>>> {
+        self.inner.deregister_schema(name, cascade)
+    }
+}
+
+impl Drop for RefreshingCatalogProvider {
+    fn drop(&mut self) {
+        if let Some(task) = self.refresh_task.take() {
+            task.abort();
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -515,10 +596,6 @@ mod tests {
     }
 
     impl TableSource for TestFederatedSource {
-        fn as_any(&self) -> &dyn Any {
-            self
-        }
-
         fn schema(&self) -> SchemaRef {
             Arc::clone(&self.schema)
         }
@@ -537,10 +614,6 @@ mod tests {
 
     #[async_trait]
     impl TableProvider for TestTableProvider {
-        fn as_any(&self) -> &dyn Any {
-            self
-        }
-
         fn schema(&self) -> SchemaRef {
             Arc::clone(&self.schema)
         }
@@ -582,7 +655,6 @@ mod tests {
         );
 
         let adaptor = enriched
-            .as_any()
             .downcast_ref::<FederatedTableProviderAdaptor>()
             .expect("metadata enrichment should preserve the federated adaptor");
         let schema = adaptor.schema();

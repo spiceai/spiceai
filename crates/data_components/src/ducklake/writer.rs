@@ -25,7 +25,6 @@ limitations under the License.
 //! 3. Executes `INSERT INTO <table> SELECT * FROM <temp_view>` in a transaction
 //! 4. Drops the temporary view and commits (or rolls back on error)
 
-use std::any::Any;
 use std::borrow::Cow;
 use std::fmt::{self, Debug};
 use std::sync::Arc;
@@ -42,7 +41,6 @@ use datafusion::datasource::sink::{DataSink, DataSinkExec};
 use datafusion::error::Result as DFResult;
 use datafusion::logical_expr::dml::InsertOp;
 use datafusion::logical_expr::{Expr, LogicalPlan, TableType};
-use datafusion::physical_plan::metrics::MetricsSet;
 use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, SendableRecordBatchStream,
 };
@@ -87,7 +85,6 @@ impl DuckDbFederatedTableWriter {
         write_lock: Arc<Mutex<()>>,
     ) -> Arc<dyn TableProvider> {
         let fed_source = read_provider
-            .as_any()
             .downcast_ref::<FederatedTableProviderAdaptor>()
             .map(|adaptor| Arc::clone(&adaptor.source));
 
@@ -113,10 +110,6 @@ impl DuckDbFederatedTableWriter {
 #[deny(clippy::missing_trait_methods)]
 #[async_trait]
 impl TableProvider for DuckDbFederatedTableWriter {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema(&self) -> SchemaRef {
         self.read_provider.schema()
     }
@@ -244,14 +237,6 @@ impl DisplayAs for DuckDbFederatedDataSink {
 
 #[async_trait]
 impl DataSink for DuckDbFederatedDataSink {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
-    fn metrics(&self) -> Option<MetricsSet> {
-        None
-    }
-
     fn schema(&self) -> &SchemaRef {
         &self.schema
     }

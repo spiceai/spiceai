@@ -17,7 +17,6 @@ limitations under the License.
 //! A wrapper around `ListingTable` for single S3 files that caches `ETag` and Version ID
 //! to avoid unnecessary re-scans when the file hasn't changed.
 
-use std::any::Any;
 use std::borrow::Cow;
 use std::sync::Arc;
 
@@ -202,10 +201,6 @@ impl RefreshSkipTableProvider for S3SingleFileCached {
 #[deny(clippy::missing_trait_methods)]
 #[async_trait]
 impl TableProvider for S3SingleFileCached {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema(&self) -> SchemaRef {
         self.inner.schema()
     }

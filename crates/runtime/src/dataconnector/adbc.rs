@@ -15,6 +15,7 @@ limitations under the License.
 */
 
 use crate::component::dataset::Dataset;
+use crate::datafusion::udf::deny_spice_functions_for_table_providers;
 use adbc_core::options::{AdbcVersion, OptionDatabase};
 use adbc_core::{Driver as _, LOAD_FLAG_DEFAULT};
 use adbc_driver_manager::ManagedDriver;
@@ -385,7 +386,7 @@ impl AdbcFactory {
             connection_namespace.schema.as_deref(),
         );
 
-        is_query_federation_enabled(&params.parameters).map_err(|e| {
+        let federation_enabled = is_query_federation_enabled(&params.parameters).map_err(|e| {
             DataConnectorError::InvalidConfigurationNoSource {
                 dataconnector: "adbc".to_string(),
                 connector_component: params.component.clone(),
@@ -520,7 +521,9 @@ impl AdbcFactory {
                 }
             })?;
 
-        let adbc_factory = AdbcTableFactory::new(Arc::clone(&pool));
+        let adbc_factory = AdbcTableFactory::new(Arc::clone(&pool))
+            .with_federation_enabled(federation_enabled)
+            .with_function_support(deny_spice_functions_for_table_providers());
 
         Ok(Arc::new(Adbc {
             factory: Some(adbc_factory),

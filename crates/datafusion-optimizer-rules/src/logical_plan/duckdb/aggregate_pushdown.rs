@@ -1,4 +1,3 @@
-use crate::concrete;
 use datafusion::common::tree_node::{Transformed, TreeNode, TreeNodeRecursion};
 use datafusion::common::{DFSchemaRef, DataFusionError};
 use datafusion::common::{Result, plan_err};
@@ -193,7 +192,11 @@ impl OptimizerRule for DuckDBAggregateLogicalPushdown {
         // Mark all eligible nodes for DuckDB agg pushdown
         let maybe_marked_agg = plan.transform_down(|p| {
             if let LogicalPlan::Extension(ext) = &p
-                && concrete!(ext.node, DuckDBAggregatePushdownNode).is_some()
+                && ext
+                    .node
+                    .as_any()
+                    .downcast_ref::<DuckDBAggregatePushdownNode>()
+                    .is_some()
             {
                 Ok(Transformed::new(p, false, TreeNodeRecursion::Jump))
             } else {
@@ -267,7 +270,6 @@ impl UserDefinedLogicalNodeCore for DuckDBAggregatePushdownNode {
 
 #[cfg(test)]
 mod tests {
-    use crate::concrete;
     use crate::logical_plan::duckdb::aggregate_pushdown::{
         DuckDBAggregateLogicalPushdown, DuckDBAggregatePushdownNode,
         SPICE_ACCELERATOR_METADATA_KEY, SPICE_OPT_DUCKDB_AGG_PUSHDOWN_KEY,
@@ -288,7 +290,10 @@ mod tests {
             };
 
             assert!(
-                concrete!(ext.node, DuckDBAggregatePushdownNode).is_some(),
+                ext.node
+                    .as_any()
+                    .downcast_ref::<DuckDBAggregatePushdownNode>()
+                    .is_some(),
                 "Must cast to marker node type"
             );
         };
@@ -433,8 +438,11 @@ mod tests {
             panic!("Expected extension node");
         };
 
-        let marker =
-            concrete!(ext.node, DuckDBAggregatePushdownNode).expect("Must be a marker node");
+        let marker = ext
+            .node
+            .as_any()
+            .downcast_ref::<DuckDBAggregatePushdownNode>()
+            .expect("Must be a marker node");
 
         let LogicalPlan::Projection(proj) = &marker.input_plan else {
             panic!(
@@ -499,8 +507,11 @@ mod tests {
             panic!("Expected extension node");
         };
 
-        let marker =
-            concrete!(ext.node, DuckDBAggregatePushdownNode).expect("Must be a marker node");
+        let marker = ext
+            .node
+            .as_any()
+            .downcast_ref::<DuckDBAggregatePushdownNode>()
+            .expect("Must be a marker node");
 
         let mut found_filter = false;
         let _ = marker.input_plan.apply(|p| {

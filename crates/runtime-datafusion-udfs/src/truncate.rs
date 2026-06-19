@@ -110,10 +110,6 @@ impl Truncate {
 }
 
 impl ScalarUDFImpl for Truncate {
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
-
     fn name(&self) -> &'static str {
         TRUNCATE_SCALAR_UDF_NAME
     }

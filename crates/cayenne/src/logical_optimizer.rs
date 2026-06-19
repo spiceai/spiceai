@@ -16,9 +16,14 @@ limitations under the License.
 
 //! Logical optimizer rules for Cayenne.
 //!
-//! The flagship rules here are [`CayennePropagateFilterAcrossEquiJoinKeys`]
-//! and [`CayenneReassociateCrossJoin`], the plan-time rewrites that expose
-//! selective key domains and avoid preserving expensive join-order shapes.
+//! This module registers four logical rules: [`CayennePropagateFilterAcrossEquiJoinKeys`]
+//! (predicate transitive closure across equi-join keys), [`CayenneReassociateCrossJoin`]
+//! (avoid preserving an expensive early cross join), [`CayenneInListToRangeRewrite`]
+//! (long consecutive integer `IN` lists → `BETWEEN`), and [`CayennePushDownSemiJoin`]
+//! (push a `LeftSemi`/`RightSemi` join down to prune the base scan before the multi-way
+//! joins build their non-spillable hash tables). The flagship is
+//! [`CayennePropagateFilterAcrossEquiJoinKeys`], which exposes selective key domains and
+//! avoids preserving expensive join-order shapes.
 //!
 //! `DataFusion`'s stock `infer_join_predicates` (in `push_down_filter`) already
 //! propagates predicates that *directly* reference a join-key column:
@@ -154,9 +159,7 @@ impl CayennePropagateFilterAcrossEquiJoinKeys {
     /// Create a new instance of the rule.
     #[must_use]
     pub fn new() -> Self {
-        Self::new_with_table_provider_predicate(|provider| {
-            provider.as_any().is::<CayenneTableProvider>()
-        })
+        Self::new_with_table_provider_predicate(<dyn TableProvider>::is::<CayenneTableProvider>)
     }
 
     /// Create a new instance with a caller-provided table-provider predicate.
@@ -171,7 +174,6 @@ impl CayennePropagateFilterAcrossEquiJoinKeys {
         let is_cayenne_table_provider: TableProviderPredicate = Arc::new(is_cayenne_table_provider);
         Self::new_with_table_source_predicate(move |source| {
             source
-                .as_any()
                 .downcast_ref::<DefaultTableSource>()
                 .is_some_and(|source| is_cayenne_table_provider(source.table_provider.as_ref()))
         })
@@ -364,9 +366,7 @@ impl CayenneReassociateCrossJoin {
     /// Create a new instance of the rule.
     #[must_use]
     pub fn new() -> Self {
-        Self::new_with_table_provider_predicate(|provider| {
-            provider.as_any().is::<CayenneTableProvider>()
-        })
+        Self::new_with_table_provider_predicate(<dyn TableProvider>::is::<CayenneTableProvider>)
     }
 
     /// Create a new instance with a caller-provided table-provider predicate.
@@ -381,7 +381,6 @@ impl CayenneReassociateCrossJoin {
         let is_cayenne_table_provider: TableProviderPredicate = Arc::new(is_cayenne_table_provider);
         Self::new_with_table_source_predicate(move |source| {
             source
-                .as_any()
                 .downcast_ref::<DefaultTableSource>()
                 .is_some_and(|source| is_cayenne_table_provider(source.table_provider.as_ref()))
         })
@@ -450,9 +449,7 @@ impl CayenneInListToRangeRewrite {
     /// Create a new instance of the rule.
     #[must_use]
     pub fn new() -> Self {
-        Self::new_with_table_provider_predicate(|provider| {
-            provider.as_any().is::<CayenneTableProvider>()
-        })
+        Self::new_with_table_provider_predicate(<dyn TableProvider>::is::<CayenneTableProvider>)
     }
 
     /// Create a new instance with a caller-provided table-provider predicate.
@@ -463,7 +460,6 @@ impl CayenneInListToRangeRewrite {
         let is_cayenne_table_provider: TableProviderPredicate = Arc::new(is_cayenne_table_provider);
         Self::new_with_table_source_predicate(move |source| {
             source
-                .as_any()
                 .downcast_ref::<DefaultTableSource>()
                 .is_some_and(|source| is_cayenne_table_provider(source.table_provider.as_ref()))
         })
@@ -582,9 +578,7 @@ impl CayennePushDownSemiJoin {
     /// Create a new instance of the rule.
     #[must_use]
     pub fn new() -> Self {
-        Self::new_with_table_provider_predicate(|provider| {
-            provider.as_any().is::<CayenneTableProvider>()
-        })
+        Self::new_with_table_provider_predicate(<dyn TableProvider>::is::<CayenneTableProvider>)
     }
 
     /// Create a new instance with a caller-provided table-provider predicate.
@@ -595,7 +589,6 @@ impl CayennePushDownSemiJoin {
         let is_cayenne_table_provider: TableProviderPredicate = Arc::new(is_cayenne_table_provider);
         Self::new_with_table_source_predicate(move |source| {
             source
-                .as_any()
                 .downcast_ref::<DefaultTableSource>()
                 .is_some_and(|source| is_cayenne_table_provider(source.table_provider.as_ref()))
         })
@@ -1300,7 +1293,6 @@ fn table_scan_upper_bound_rows(scan: &datafusion::logical_expr::TableScan) -> Op
     use datafusion::common::stats::Precision;
 
     scan.source
-        .as_any()
         .downcast_ref::<DefaultTableSource>()
         .and_then(|default| default.table_provider.statistics())
         .and_then(|stats| match stats.num_rows {
@@ -1738,10 +1730,6 @@ mod tests {
 
     #[async_trait::async_trait]
     impl TableProvider for StatMemTable {
-        fn as_any(&self) -> &dyn std::any::Any {
-            self
-        }
-
         fn schema(&self) -> Arc<Schema> {
             self.inner.schema()
         }
@@ -1771,10 +1759,6 @@ mod tests {
 
     #[async_trait::async_trait]
     impl TableProvider for NoStatsTable {
-        fn as_any(&self) -> &dyn std::any::Any {
-            self
-        }
-
         fn schema(&self) -> Arc<Schema> {
             self.inner.schema()
         }

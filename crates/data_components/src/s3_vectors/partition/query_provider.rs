@@ -13,7 +13,8 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
-use std::{any::Any, sync::Arc};
+
+use std::sync::Arc;
 
 use crate::s3_vectors::{
     compute_query::ComputeQueryVector, gather_and_limit_providers,
@@ -64,10 +65,6 @@ impl S3VectorsPartitionedQueryTable {
 
 #[async_trait]
 impl TableProvider for S3VectorsPartitionedQueryTable {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema(&self) -> SchemaRef {
         self.table.query_provider_schema()
     }
@@ -265,13 +262,9 @@ mod tests {
             .await
             .expect("scan");
 
-        let limit_plan = plan
-            .as_any()
-            .downcast_ref::<GlobalLimitExec>()
-            .expect("downcast");
+        let limit_plan = plan.downcast_ref::<GlobalLimitExec>().expect("downcast");
         let union_plan = limit_plan
             .input()
-            .as_any()
             .downcast_ref::<UnionExec>()
             .expect("downcast");
 

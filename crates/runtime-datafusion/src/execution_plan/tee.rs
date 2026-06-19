@@ -23,7 +23,6 @@ use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, ExecutionPlanProperties, Partitioning,
     PlanProperties,
 };
-use std::any::Any;
 use std::fmt;
 use std::sync::Arc;
 
@@ -71,10 +70,6 @@ impl DisplayAs for TeeExec {
 impl ExecutionPlan for TeeExec {
     fn name(&self) -> &'static str {
         "TeeExec"
-    }
-
-    fn as_any(&self) -> &dyn Any {
-        self
     }
 
     fn schema(&self) -> SchemaRef {

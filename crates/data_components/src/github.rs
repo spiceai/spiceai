@@ -34,7 +34,7 @@ use datafusion::{
     physical_plan::{ExecutionPlan, stream::RecordBatchStreamAdapter},
     scalar::ScalarValue,
 };
-use std::{any::Any, collections::HashMap, path::Path, sync::Arc, time::Duration};
+use std::{collections::HashMap, path::Path, sync::Arc, time::Duration};
 use token_provider::TokenProvider;
 use util::ExponentialBackoff;
 use util::fibonacci_backoff::{Backoff, FibonacciBackoffBuilder};
@@ -277,10 +277,6 @@ fn requested_ref_from_filters(filters: &[Expr]) -> datafusion::error::Result<Opt
 
 #[async_trait]
 impl TableProvider for GithubFilesTableProvider {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema(&self) -> SchemaRef {
         Arc::clone(&self.schema)
     }

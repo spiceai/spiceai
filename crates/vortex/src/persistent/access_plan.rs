@@ -15,7 +15,7 @@ use vortex::scan::selection::Selection;
 /// This is intended as a low-level interface for users building their own data systems, see the [advanced index] example from the `DataFusion` repo for a similar usage with Parquet.
 ///
 /// [advanced index]: https://github.com/apache/datafusion/blob/47df535d2cd5aac5ad5a92bdc837f38e05ea0f0f/datafusion-examples/examples/data_io/parquet_advanced_index.rs
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct VortexAccessPlan {
     selection: Option<Selection>,
 }

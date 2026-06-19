@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::{any::Any, sync::Arc};
+use std::sync::Arc;
 
 use arrow::array::{RecordBatch, RecordBatchOptions};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
@@ -132,10 +132,6 @@ impl DisplayAs for DuckDBVectorQueryExec {
 impl ExecutionPlan for DuckDBVectorQueryExec {
     fn name(&self) -> &'static str {
         "DuckDBVectorQueryExec"
-    }
-
-    fn as_any(&self) -> &dyn Any {
-        self
     }
 
     fn schema(&self) -> SchemaRef {

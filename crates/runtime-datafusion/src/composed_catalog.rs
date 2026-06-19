@@ -20,7 +20,6 @@ limitations under the License.
 //! When a user-defined catalog overrides the default `spice` catalog,
 //! internal schemas must be preserved alongside the external catalog's schemas.
 
-use std::any::Any;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -75,10 +74,6 @@ impl ComposedCatalogProvider {
 }
 
 impl CatalogProvider for ComposedCatalogProvider {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema_names(&self) -> Vec<String> {
         let mut names: Vec<String> = self.internal_schemas.keys().cloned().collect();
         for name in self.external.schema_names() {

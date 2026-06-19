@@ -30,26 +30,38 @@ pub use handler::CayenneDdlHandler;
 pub use merge_planner::{CayenneDmlHandler, LocalMergePlanInput, build_local_merge_plan_input};
 pub use physical_plans::CayenneMergeExec;
 
+use data_components::RefreshingCatalogProvider;
 use datafusion::catalog::CatalogProvider;
+use runtime_datafusion::composed_catalog::ComposedCatalogProvider;
 
 use crate::catalog_provider::CayenneCatalogProvider;
 
-/// Returns `true` if `provider` is a direct [`CayenneCatalogProvider`].
-///
-/// The runtime extends this check to also cover `ComposedCatalogProvider`.
+/// Returns `true` if `provider` is Cayenne-backed, peeling the transparent
+/// [`RefreshingCatalogProvider`] and [`ComposedCatalogProvider`] wrappers.
 #[must_use]
 pub fn is_cayenne_catalog(provider: &dyn CatalogProvider) -> bool {
-    provider
-        .as_any()
-        .downcast_ref::<CayenneCatalogProvider>()
-        .is_some()
+    get_cayenne_provider(provider).is_some()
 }
 
-/// Try to extract a [`CayenneCatalogProvider`] reference via direct downcast.
+/// Extract the [`CayenneCatalogProvider`] reference, peeling the transparent
+/// [`RefreshingCatalogProvider`] and [`ComposedCatalogProvider`] wrappers in any
+/// nesting order.
 ///
-/// Returns `None` for wrapped providers — use the runtime's `get_cayenne_provider`
-/// to also handle `ComposedCatalogProvider`.
+/// `DataFusion` 54 removed `CatalogProvider::as_any`, which those wrappers used to
+/// delegate to their inner provider so that `downcast_ref::<CayenneCatalogProvider>()`
+/// transparently saw through them. The `Any`-based `downcast_ref` that replaced it
+/// only resolves to the wrapper's own type, so the wrappers must be peeled
+/// explicitly.
 #[must_use]
 pub fn get_cayenne_provider(provider: &dyn CatalogProvider) -> Option<&CayenneCatalogProvider> {
-    provider.as_any().downcast_ref::<CayenneCatalogProvider>()
+    if let Some(cayenne) = provider.downcast_ref::<CayenneCatalogProvider>() {
+        return Some(cayenne);
+    }
+    if let Some(refreshing) = provider.downcast_ref::<RefreshingCatalogProvider>() {
+        return get_cayenne_provider(refreshing.inner_catalog());
+    }
+    if let Some(composed) = provider.downcast_ref::<ComposedCatalogProvider>() {
+        return get_cayenne_provider(composed.external().as_ref());
+    }
+    None
 }

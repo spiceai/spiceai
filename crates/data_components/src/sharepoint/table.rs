@@ -13,7 +13,7 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
-use std::{any::Any, fmt, sync::Arc};
+use std::{fmt, sync::Arc};
 
 use arrow::{array::RecordBatch, datatypes::SchemaRef};
 use async_stream::stream;
@@ -76,10 +76,6 @@ impl SharepointTableProvider {
 
 #[async_trait]
 impl TableProvider for SharepointTableProvider {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema(&self) -> SchemaRef {
         Arc::new(drive_item_table_schema(self.include_file_content))
     }
@@ -205,10 +201,6 @@ impl SharepointListExec {
 impl ExecutionPlan for SharepointListExec {
     fn name(&self) -> &'static str {
         "SharepointListExec"
-    }
-
-    fn as_any(&self) -> &dyn Any {
-        self
     }
 
     fn schema(&self) -> SchemaRef {

@@ -31,7 +31,7 @@ use datafusion::{
     physical_plan::{DisplayAs, DisplayFormatType, metrics::MetricsSet},
 };
 use futures::StreamExt;
-use std::{any::Any, collections::HashMap, fmt, sync::Arc};
+use std::{collections::HashMap, fmt, sync::Arc};
 
 pub struct DynamoDBInsertSink {
     pub db_client: Arc<DbClient>,
@@ -81,10 +81,6 @@ fn record_batch_row_to_dynamodb_item(
 
 #[async_trait]
 impl DataSink for DynamoDBInsertSink {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn metrics(&self) -> Option<MetricsSet> {
         None
     }

@@ -19,7 +19,6 @@ limitations under the License.
 //! Translates scans into Elasticsearch `_search` requests,
 //! converting the JSON hits into Arrow [`RecordBatch`]es.
 
-use std::any::Any;
 use std::sync::Arc;
 
 use chrono::DateTime;
@@ -72,10 +71,6 @@ impl ElasticsearchQueryTable {
 
 #[async_trait]
 impl TableProvider for ElasticsearchQueryTable {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema(&self) -> SchemaRef {
         Arc::clone(&self.schema)
     }
@@ -150,10 +145,6 @@ impl DisplayAs for ElasticsearchQueryExec {
 impl ExecutionPlan for ElasticsearchQueryExec {
     fn name(&self) -> &'static str {
         "ElasticsearchQueryExec"
-    }
-
-    fn as_any(&self) -> &dyn Any {
-        self
     }
 
     fn properties(&self) -> &Arc<PlanProperties> {

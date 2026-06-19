@@ -659,7 +659,7 @@ pub(crate) fn table_provider_with_spicepod_metadata(
     // If the provider is an IndexedTableProvider, push the metadata enrichment
     // inside it so that the IndexTableScan analyzer can still discover it via
     // downcast_ref::<IndexedTableProvider>().
-    if let Some(indexed) = provider.as_any().downcast_ref::<IndexedTableProvider>() {
+    if let Some(indexed) = provider.downcast_ref::<IndexedTableProvider>() {
         let enriched_underlying = metadata_enriched_table_provider(
             indexed.get_underlying(),
             table_metadata.clone(),
@@ -731,11 +731,20 @@ pub struct DataFusion {
     pub(crate) accelerator_engine_registry: Arc<AcceleratorEngineRegistry>,
     // Controls the parallelism of accelerated table refreshes
     acceleration_refresh_semaphore: Option<Arc<Semaphore>>,
+    // Bounds concurrently-executing query plans — ordinary queries + DDL/DML +
+    // EXECUTE (not lightweight PREPARE/DEALLOCATE/SET) — i.e. query admission
+    // control; `None` = unbounded. Sized from `runtime.query.max_concurrent_queries`.
+    query_admission_semaphore: Option<Arc<Semaphore>>,
     pub(crate) task_history_enabled: bool,
     // Dedicated runtime for CPU-bound DataFusion queries
     cpu_runtime: OnceLock<ManagedTokioRuntime>,
     // Dedicated runtime for CPU-bound DataFusion acceleration for dataset acceleration refresh tasks
     refresh_runtime: OnceLock<ManagedTokioRuntime>,
+    // Dedicated, DEFAULT-priority (nice 0) runtime for the CDC changes-apply loop
+    // (refresh_mode: changes). Split from `refresh_runtime` (low-priority, nice 10,
+    // which also runs bulk full/append refresh reads) so the freshness-critical apply
+    // isn't scheduler-deprioritized on an oversubscribed host.
+    cdc_apply_runtime: OnceLock<ManagedTokioRuntime>,
     // Dedicated runtime for background Cayenne compaction (size-tiered protected-snapshot
     // merge + full snapshot rewrite). Isolated from the query and refresh runtimes so the
     // CPU-heavy rewrite can't steal worker threads from queries or CDC ingest.
@@ -895,6 +904,13 @@ impl DataFusion {
         Arc::clone(&self.accelerator_engine_registry)
     }
 
+    /// The query-admission semaphore when `runtime.query.max_concurrent_queries`
+    /// is set; `None` means unbounded (no admission gating). Mirrors
+    /// `acceleration_refresh_semaphore` for the read/query side.
+    pub(crate) fn query_admission_semaphore(&self) -> Option<Arc<Semaphore>> {
+        self.query_admission_semaphore.clone()
+    }
+
     #[must_use]
     pub fn query_cancel_registry(&self) -> Arc<QueryCancelRegistry> {
         Arc::clone(&self.query_cancel_registry)
@@ -928,9 +944,7 @@ impl DataFusion {
 
         let schema_provider = Self::resolve_schema_provider(&catalog_provider, table_reference)?;
 
-        let spice_schema_provider = schema_provider
-            .as_any()
-            .downcast_ref::<SpiceSchemaProvider>()?;
+        let spice_schema_provider = schema_provider.downcast_ref::<SpiceSchemaProvider>()?;
 
         spice_schema_provider.table_sync(table_reference.table())
     }
@@ -968,7 +982,7 @@ impl DataFusion {
         access: &AccessMode,
         catalog: Arc<dyn CatalogProvider>,
     ) -> Result<()> {
-        if let Some(deferred_catalog) = catalog.as_any().downcast_ref::<DeferredCatalogProvider>() {
+        if let Some(deferred_catalog) = catalog.downcast_ref::<DeferredCatalogProvider>() {
             self.deferred_catalogs
                 .write()
                 .await
@@ -1363,6 +1377,28 @@ impl DataFusion {
             .get()
             .map(ManagedTokioRuntime::handle)
             .or_else(|| self.cpu_runtime())
+    }
+
+    /// Set the dedicated, default-priority (nice 0) CDC changes-apply runtime.
+    /// Isolated from the low-priority refresh runtime so the freshness-critical
+    /// CDC apply loop is not scheduler-deprioritized under load.
+    pub fn set_cdc_apply_runtime(&self, handle: ManagedTokioRuntime) {
+        if self.cdc_apply_runtime.set(handle).is_err() {
+            // Failure to set means this was already set - that shouldn't happen.
+            tracing::error!(
+                "Failed to set CDC-apply tokio runtime on the Datafusion struct, this is an unexpected internal error"
+            );
+        }
+    }
+
+    /// Returns the dedicated CDC changes-apply runtime. Falls back to the refresh
+    /// runtime (which itself falls back to the cpu runtime) when unset.
+    #[must_use]
+    pub fn cdc_apply_runtime(&self) -> Option<&tokio::runtime::Handle> {
+        self.cdc_apply_runtime
+            .get()
+            .map(ManagedTokioRuntime::handle)
+            .or_else(|| self.refresh_runtime())
     }
 
     /// Set the dedicated compaction runtime for background Cayenne compaction
@@ -2437,6 +2473,7 @@ impl DataFusion {
             self.io_runtime.clone(),
         );
         accelerated_table_builder.cpu_runtime(self.refresh_runtime().cloned());
+        accelerated_table_builder.cdc_apply_runtime(self.cdc_apply_runtime().cloned());
         accelerated_table_builder.cluster_role(self.cluster_config.effective_role());
         accelerated_table_builder.accelerator_write_mutex(Arc::clone(&accelerator_write_mutex));
         accelerated_table_builder.cdc_param_overrides(
@@ -3103,7 +3140,6 @@ impl DataFusion {
         // downcast borrows `parent_table`, so clone out the inner provider first to release the
         // borrow before falling back to `parent_table` itself.
         let adaptor_inner = parent_table
-            .as_any()
             .downcast_ref::<FederatedTableProviderAdaptor>()
             .map(|adaptor| adaptor.table_provider.clone());
         let parent_table = match adaptor_inner {
@@ -3120,7 +3156,7 @@ impl DataFusion {
             // Arrow accelerator).
             None => parent_table,
         };
-        let Some(parent_table) = parent_table.as_any().downcast_ref::<AcceleratedTable>() else {
+        let Some(parent_table) = parent_table.downcast_ref::<AcceleratedTable>() else {
             tracing::debug!(
                 "Could not synchronize refreshes with parent table {parent_table_reference}. Parent table is not an accelerated table."
             );
@@ -3232,7 +3268,7 @@ impl DataFusion {
         let table = self
             .get_accelerated_table_provider(dataset_name.to_string().as_str())
             .await?;
-        if let Some(accelerated_table) = table.as_any().downcast_ref::<AcceleratedTable>() {
+        if let Some(accelerated_table) = table.downcast_ref::<AcceleratedTable>() {
             let notifier = accelerated_table.refresher().on_complete_notification();
             accelerated_table.trigger_refresh(overrides).await.context(
                 UnableToTriggerRefreshSnafu {
@@ -3366,7 +3402,7 @@ impl DataFusion {
             .fail();
         }
 
-        if let Some(accelerated_table) = table.as_any().downcast_ref::<AcceleratedTable>() {
+        if let Some(accelerated_table) = table.downcast_ref::<AcceleratedTable>() {
             accelerated_table.update_refresh_sql(parsed).await.context(
                 UnableToTriggerRefreshSnafu {
                     dataset_name: dataset_name.to_string(),
@@ -3387,7 +3423,7 @@ impl DataFusion {
             .get_accelerated_table_provider(&dataset_name.to_string())
             .await?;
 
-        if let Some(accelerated_table) = table.as_any().downcast_ref::<AcceleratedTable>() {
+        if let Some(accelerated_table) = table.downcast_ref::<AcceleratedTable>() {
             accelerated_table
                 .update_partition_filters(filters)
                 .await
@@ -3417,10 +3453,7 @@ impl DataFusion {
         // by `register_accelerated_table`. The two can nest in either order, so
         // loop until neither wrapper matches.
         loop {
-            if let Some(adaptor) = table
-                .as_any()
-                .downcast_ref::<FederatedTableProviderAdaptor>()
-            {
+            if let Some(adaptor) = table.downcast_ref::<FederatedTableProviderAdaptor>() {
                 if let Some(nested_table) = adaptor.table_provider.clone() {
                     table = nested_table;
                     continue;
@@ -3431,10 +3464,7 @@ impl DataFusion {
                 .fail();
             }
 
-            if let Some(enriched) = table
-                .as_any()
-                .downcast_ref::<MetadataEnrichedTableProvider>()
-            {
+            if let Some(enriched) = table.downcast_ref::<MetadataEnrichedTableProvider>() {
                 let inner = Arc::clone(enriched.get_inner_ref());
                 table = inner;
                 continue;
@@ -4290,10 +4320,7 @@ async fn resolve_table_partition_expr(
 }
 
 fn partition_expr_from_table_provider(table_provider: &Arc<dyn TableProvider>) -> Option<String> {
-    if let Some(partitioned) = table_provider
-        .as_any()
-        .downcast_ref::<PartitionTableProvider>()
-    {
+    if let Some(partitioned) = table_provider.downcast_ref::<PartitionTableProvider>() {
         let partition_exprs = partitioned
             .partition_by()
             .iter()
@@ -4309,24 +4336,19 @@ fn partition_expr_from_table_provider(table_provider: &Arc<dyn TableProvider>) -
         };
     }
 
-    if let Some(poly) = table_provider.as_any().downcast_ref::<PolyTableProvider>() {
+    if let Some(poly) = table_provider.downcast_ref::<PolyTableProvider>() {
         return partition_expr_from_table_provider(&poly.writer());
     }
 
-    if let Some(accelerated) = table_provider.as_any().downcast_ref::<AcceleratedTable>() {
+    if let Some(accelerated) = table_provider.downcast_ref::<AcceleratedTable>() {
         return partition_expr_from_table_provider(&accelerated.get_accelerator());
     }
 
-    if let Some(enriched) = table_provider
-        .as_any()
-        .downcast_ref::<MetadataEnrichedTableProvider>()
-    {
+    if let Some(enriched) = table_provider.downcast_ref::<MetadataEnrichedTableProvider>() {
         return partition_expr_from_table_provider(enriched.get_inner_ref());
     }
 
-    if let Some(adaptor) = table_provider
-        .as_any()
-        .downcast_ref::<FederatedTableProviderAdaptor>()
+    if let Some(adaptor) = table_provider.downcast_ref::<FederatedTableProviderAdaptor>()
         && let Some(inner_provider) = adaptor.table_provider.as_ref()
     {
         return partition_expr_from_table_provider(inner_provider);
@@ -4906,7 +4928,6 @@ mod tests {
             table_provider_with_spicepod_metadata(Arc::clone(&inner), &table_metadata, &[]);
         assert!(
             wrapped
-                .as_any()
                 .downcast_ref::<MetadataEnrichedTableProvider>()
                 .is_some(),
             "precondition: provider should be wrapped in MetadataEnrichedTableProvider"
@@ -4922,7 +4943,7 @@ mod tests {
             .expect("should resolve the accelerated table provider");
 
         assert!(
-            resolved.as_any().downcast_ref::<MemTable>().is_some(),
+            resolved.downcast_ref::<MemTable>().is_some(),
             "get_accelerated_table_provider must peel MetadataEnrichedTableProvider to reach the inner provider"
         );
     }

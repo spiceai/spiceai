@@ -16,8 +16,10 @@ limitations under the License.
 
 //! `SQLite` implementation of the metastore backend.
 //!
-//! Uses `tokio-rusqlite` for a persistent connection managed by a background thread,
-//! avoiding the overhead of opening a new connection for each operation.
+//! Uses `tokio-rusqlite`. Holds a round-robin pool of persistent connections
+//! (`K = min(available_parallelism, 32)`, floor 2) plus a dedicated checkpoint
+//! connection, each managed by a background thread — avoiding the overhead of opening a
+//! new connection per operation and lifting read-side concurrency for metadata-heavy scans.
 
 use super::{
     ExecuteParams, MetastoreBackend, MetastoreGetValue, MetastoreRow, MetastoreTransaction,
@@ -255,7 +257,11 @@ async fn configure_sqlite_connection(
                 let Some(delay_ms) = retry_delays.next() else {
                     return Err(error);
                 };
-                tokio::time::sleep(std::time::Duration::from_millis(*delay_ms)).await;
+                // Equal jitter (shared with the write-conflict retry) so simultaneous
+                // connection-setup retriers don't all wake on the same boundary.
+                let jittered =
+                    turso_shared::apply_equal_jitter(std::time::Duration::from_millis(*delay_ms));
+                tokio::time::sleep(jittered).await;
             }
             Err(error) => return Err(error),
         }
@@ -624,6 +630,30 @@ impl SqliteMetastore {
         )
     ";
 
+    /// Authoritative per-snapshot data-file manifest (manifest snapshot model,
+    /// phase 1). One row per `(table_id, snapshot_id, file_path)` for EVERY data
+    /// file in the snapshot — unlike `cayenne_snapshot_file_statistics`, which is
+    /// a best-effort pruning cache, this is the complete, authoritative file set
+    /// (the future replacement for directory listing as the scan's file source).
+    /// `min_sequence`/`max_sequence` carry the file's commit-seq range so
+    /// compaction can bake a seq-prefix (`max_sequence <= T`) and reference the
+    /// un-baked files in place. Populated atomically with every append/compaction
+    /// write; rows are scoped to a snapshot so a new snapshot can reference an
+    /// existing file by inserting a row pointing at the same path (no copy).
+    const SNAPSHOT_FILE_TABLE_DDL: &'static str = r"
+        CREATE TABLE IF NOT EXISTS cayenne_snapshot_file (
+            table_id TEXT NOT NULL,
+            snapshot_id TEXT NOT NULL,
+            file_path TEXT NOT NULL,
+            row_count BIGINT NOT NULL DEFAULT 0,
+            file_size_bytes BIGINT NOT NULL DEFAULT 0,
+            min_sequence BIGINT NOT NULL DEFAULT 0,
+            max_sequence BIGINT NOT NULL DEFAULT 0,
+            FOREIGN KEY (table_id) REFERENCES cayenne_table(table_id) ON DELETE CASCADE,
+            PRIMARY KEY (table_id, snapshot_id, file_path)
+        )
+    ";
+
     /// Schema for the `cayenne_pk_index` table.
     ///
     /// One row per table holding the serialized primary-key existence bloom
@@ -813,7 +843,7 @@ impl MetastoreBackend for SqliteMetastore {
             .call(|conn| {
                 // Create tables in a transaction
                 conn.execute_batch(&format!(
-                    "{}; {}; {}; {}; {}; {}; {}; {}; {}; {}; {};",
+                    "{}; {}; {}; {}; {}; {}; {}; {}; {}; {}; {}; {};",
                     Self::TABLE_TABLE_DDL,
                     Self::TABLE_NAME_UNIQUE_INDEX_DDL,
                     Self::DELETE_FILE_TABLE_DDL,
@@ -822,6 +852,7 @@ impl MetastoreBackend for SqliteMetastore {
                     Self::SNAPSHOT_SEQUENCE_TABLE_DDL,
                     Self::TABLE_STATISTICS_DDL,
                     Self::SNAPSHOT_FILE_STATISTICS_TABLE_DDL,
+                    Self::SNAPSHOT_FILE_TABLE_DDL,
                     Self::INLINED_DATA_TABLE_DDL,
                     Self::INLINED_DELETE_TABLE_DDL,
                     Self::PK_INDEX_TABLE_DDL
