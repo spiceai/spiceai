@@ -26,7 +26,6 @@ use datafusion::{
     common::{Result as DataFusionResult, exec_err},
     logical_expr::{ColumnarValue, ScalarUDFImpl, Signature, TypeSignature, Volatility},
 };
-use std::any::Any;
 use std::fmt::{Debug, Write};
 use std::sync::{Arc, LazyLock};
 
@@ -130,10 +129,6 @@ impl DigestMany {
 }
 
 impl ScalarUDFImpl for DigestMany {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn name(&self) -> &'static str {
         DIGEST_UDF_NAME
     }

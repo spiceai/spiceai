@@ -23,7 +23,6 @@ limitations under the License.
 //! In the metadata catalog, table names are stored with a namespace prefix
 //! (`namespace/table_name`) so that namespace membership survives restarts.
 
-use std::any::Any;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -333,10 +332,6 @@ impl CayenneCatalogProvider {
 }
 
 impl CatalogProvider for CayenneCatalogProvider {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema_names(&self) -> Vec<String> {
         self.schemas.read().keys().cloned().collect()
     }
@@ -388,9 +383,8 @@ impl RefreshableCatalogProvider for CayenneCatalogProvider {
             .await?;
 
             if let Some(existing_schema) = existing_schemas.get(ns)
-                && let Some(existing_cayenne_schema) = existing_schema
-                    .as_any()
-                    .downcast_ref::<CayenneSchemaProvider>()
+                && let Some(existing_cayenne_schema) =
+                    existing_schema.downcast_ref::<CayenneSchemaProvider>()
             {
                 existing_cayenne_schema.refresh_from(&refreshed_schema);
                 new_schemas.insert(ns.clone(), Arc::clone(existing_schema));
@@ -404,9 +398,8 @@ impl RefreshableCatalogProvider for CayenneCatalogProvider {
                 continue;
             }
 
-            if let Some(existing_cayenne_schema) = existing_schema
-                .as_any()
-                .downcast_ref::<CayenneSchemaProvider>()
+            if let Some(existing_cayenne_schema) =
+                existing_schema.downcast_ref::<CayenneSchemaProvider>()
             {
                 existing_cayenne_schema.clear_tables();
             }
@@ -594,10 +587,6 @@ impl CayenneSchemaProvider {
 
 #[async_trait]
 impl SchemaProvider for CayenneSchemaProvider {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn table_names(&self) -> Vec<String> {
         self.tables.read().keys().cloned().collect()
     }

@@ -839,6 +839,7 @@ impl ReciprocalRankFusion {
     // sub-query *before* ranking. This narrows the candidate set so that
     // ranks reflect position within the filtered population — matching user
     // intent for queries like `WHERE review_date > '2015-06-15' AND product_category = 'some category'`.
+    #[expect(deprecated)] // DF54: TableFunctionImpl::call deferred (needs Session); see follow-up
     fn prepare_and_execute_subqueries(
         &self,
         args: &ReciprocalRankFusionArgs,
@@ -1105,10 +1106,6 @@ impl ReciprocalRankFusion {
 
 /// This is only implemented as a documentation stub, so that we show up in `SHOW FUNCTIONS`
 impl ScalarUDFImpl for ReciprocalRankFusion {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn name(&self) -> &str {
         RRF_UDF_NAME
     }
@@ -1148,10 +1145,6 @@ impl TableFunctionImpl for ReciprocalRankFusion {
 #[deny(clippy::missing_trait_methods)]
 #[async_trait]
 impl TableProvider for ReciprocalRankFusion {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema(&self) -> SchemaRef {
         match self.schema.as_ref() {
             Some(schema) => Arc::clone(schema),

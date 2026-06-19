@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
-use std::any::Any;
 use std::sync::Arc;
 
 use arrow_schema::Schema;
@@ -11,9 +10,11 @@ use datafusion_common::Result as DFResult;
 use datafusion_common::arrow::array::RecordBatch;
 use datafusion_common::arrow::array::RecordBatchOptions;
 use datafusion_common::exec_datafusion_err;
+use datafusion_common_runtime::{JoinSet, SpawnedTask};
 use datafusion_datasource::ListingTableUrl;
-use datafusion_datasource::file_sink_config::FileSinkConfig;
+use datafusion_datasource::file_sink_config::{FileSink, FileSinkConfig};
 use datafusion_datasource::sink::DataSink;
+use datafusion_datasource::write::demux::DemuxedStreamReceiver;
 use datafusion_datasource::write::get_writer_schema;
 use datafusion_execution::SendableRecordBatchStream;
 use datafusion_execution::TaskContext;
@@ -78,15 +79,15 @@ impl ShardSpec {
     /// Build a `BatchPartitioner` that routes each input batch to one of
     /// `num_shards` shards according to this spec. `Single`/`RoundRobin` route
     /// whole batches; `Hash` splits batches row-wise on the key expressions.
-    fn batch_partitioner(&self, num_shards: usize) -> BatchPartitioner {
+    fn batch_partitioner(&self, num_shards: usize) -> DFResult<BatchPartitioner> {
         let timer = Time::default();
         match self {
             ShardSpec::Hash { exprs, .. } => {
                 BatchPartitioner::new_hash_partitioner(exprs.clone(), num_shards, timer)
             }
-            ShardSpec::Single | ShardSpec::RoundRobin(_) => {
-                BatchPartitioner::new_round_robin_partitioner(num_shards, timer, 0, 1)
-            }
+            ShardSpec::Single | ShardSpec::RoundRobin(_) => Ok(
+                BatchPartitioner::new_round_robin_partitioner(num_shards, timer, 0, 1),
+            ),
         }
     }
 }
@@ -210,11 +211,81 @@ impl DisplayAs for VortexSink {
 }
 
 #[async_trait]
-impl DataSink for VortexSink {
-    fn as_any(&self) -> &dyn Any {
-        self
+impl FileSink for VortexSink {
+    fn config(&self) -> &FileSinkConfig {
+        &self.config
     }
 
+    /// Drains the per-partition `(path, batches)` streams produced by
+    /// `DataFusion`'s Hive-partition demuxer (see [`DataSink::write_all`]), writing
+    /// one Vortex file per partition value at the demuxer-chosen path
+    /// (e.g. `table/c1=hello/<id>.vortex`). Each partition file is written
+    /// concurrently — the demuxer interleaves sends across partition channels, so
+    /// draining them serially would deadlock once a non-active channel fills.
+    async fn spawn_writer_tasks_and_join(
+        &self,
+        _context: &Arc<TaskContext>,
+        demux_task: SpawnedTask<DFResult<()>>,
+        mut file_stream_rx: DemuxedStreamReceiver,
+        object_store: Arc<dyn ObjectStore>,
+    ) -> DFResult<u64> {
+        let dtype = DType::from_arrow(get_writer_schema(&self.config));
+        let mut write_tasks: JoinSet<DFResult<u64>> = JoinSet::new();
+
+        while let Some((path, mut rx)) = file_stream_rx.recv().await {
+            let session = self.session.clone();
+            let object_store = Arc::clone(&object_store);
+            let dtype = dtype.clone();
+            write_tasks.spawn(async move {
+                let mut writer = Some(start_file_writer(&session, object_store, path, dtype));
+                let mut rows: u64 = 0;
+                while let Some(batch) = rx.recv().await {
+                    rows = rows
+                        .checked_add(u64::try_from(batch.num_rows()).unwrap_or(u64::MAX))
+                        .ok_or_else(|| {
+                            exec_datafusion_err!("Row count overflow in partitioned Vortex write")
+                        })?;
+                    send_batch_to_active_writer(&mut writer, batch).await?;
+                }
+                if let Some(writer) = writer.take() {
+                    finish_file_writer(writer).await?;
+                }
+                Ok(rows)
+            });
+        }
+
+        let mut row_count = 0_u64;
+        while let Some(result) = write_tasks.join_next().await {
+            match result {
+                Ok(rows) => {
+                    row_count = row_count.checked_add(rows?).ok_or_else(|| {
+                        exec_datafusion_err!(
+                            "Row count overflow aggregating partitioned Vortex writes"
+                        )
+                    })?;
+                }
+                Err(join_err) => {
+                    if join_err.is_panic() {
+                        std::panic::resume_unwind(join_err.into_panic());
+                    }
+                    return Err(exec_datafusion_err!(
+                        "Vortex partitioned write task failed to join: {join_err}"
+                    ));
+                }
+            }
+        }
+
+        demux_task
+            .join_unwind()
+            .await
+            .map_err(|e| exec_datafusion_err!("Vortex partition demux task failed: {e}"))??;
+
+        Ok(row_count)
+    }
+}
+
+#[async_trait]
+impl DataSink for VortexSink {
     fn metrics(&self) -> Option<MetricsSet> {
         None
     }
@@ -229,6 +300,17 @@ impl DataSink for VortexSink {
         data: SendableRecordBatchStream,
         context: &Arc<TaskContext>,
     ) -> DFResult<u64> {
+        // Hive-partitioned writes must demux rows into `col=value/`
+        // sub-directories. DataFusion 54 performs that demux only inside
+        // `FileSink::write_all` (its `start_demuxer_task` is crate-private), so
+        // route partitioned writes through the `FileSink` path. Non-partitioned
+        // writes keep the sharded single-statement path below, which
+        // parallelizes Vortex encode across shards (the framework demuxer does
+        // not).
+        if !self.config.table_partition_cols.is_empty() {
+            return FileSink::write_all(self, data, context).await;
+        }
+
         let object_store = context
             .runtime_env()
             .object_store(&self.config.object_store_url)?;
@@ -336,8 +418,9 @@ async fn write_record_batch_stream_to_files(
         )));
     }
 
-    let mut partitioner =
-        (num_shards > 1).then(|| output_options.shard_spec.batch_partitioner(num_shards));
+    let mut partitioner = (num_shards > 1)
+        .then(|| output_options.shard_spec.batch_partitioner(num_shards))
+        .transpose()?;
 
     // A failed send means a shard writer already dropped its receiver — i.e. it
     // exited early with an error (the happy path holds the receiver open until
@@ -670,12 +753,28 @@ async fn finish_file_writer(mut writer: ActiveFileWriter) -> DFResult<WriteSumma
 }
 
 fn batch_uncompressed_bytes(batch: &RecordBatch) -> DFResult<u64> {
-    u64::try_from(batch.get_array_memory_size()).map_err(|_| {
-        exec_datafusion_err!(
-            "RecordBatch memory size does not fit in u64: {}",
-            batch.get_array_memory_size()
-        )
-    })
+    // Measure the *logical* bytes of this batch's rows, not the footprint of the
+    // backing buffers. `RecordBatch::get_array_memory_size` counts whole
+    // buffers, so a sliced column — e.g. a hash-partitioned sub-batch that
+    // shares its parent's buffers — reports the entire parent buffer regardless
+    // of how many rows the slice actually covers. That over-counts the size-based
+    // file-roll heuristic and rolls output files far below the target size (it
+    // multiplied the merge's file count under DataFusion 54, where the merge
+    // read hands the writer such sliced sub-batches). `get_slice_memory_size`
+    // counts only the portion of each buffer the slice references, so the
+    // estimate scales with the rows actually written.
+    let mut total: usize = 0;
+    for column in batch.columns() {
+        let slice_bytes = column
+            .to_data()
+            .get_slice_memory_size()
+            .map_err(|e| exec_datafusion_err!("Failed to measure sink batch slice size: {e}"))?;
+        total = total.checked_add(slice_bytes).ok_or_else(|| {
+            exec_datafusion_err!("RecordBatch slice size overflow while sizing sink output")
+        })?;
+    }
+    u64::try_from(total)
+        .map_err(|_| exec_datafusion_err!("RecordBatch slice size does not fit in u64: {total}"))
 }
 
 fn remove_partition_columns(
@@ -905,10 +1004,19 @@ mod tests {
 
     /// Reproduction by <https://github.com/vortex-data/vortex/issues/4315>.
     /// Uses a 1MB target file size to exercise file splitting behavior.
+    ///
+    /// File-count lower bounds track the *logical* (slice-scoped) input size
+    /// against the 1 MiB target — i.e. roughly one file per target's worth of
+    /// data (5 MiB -> 5, 10 MiB -> ~9 after the writer recalibrates its size
+    /// estimate from the first finished file). They are intentionally lower than
+    /// `bytes / target` would naively suggest: `batch_uncompressed_bytes` now
+    /// measures `get_slice_memory_size` rather than the backing buffers'
+    /// `get_array_memory_size`, so sliced scan batches no longer over-count and
+    /// roll files below the target size.
     #[rstest]
     #[case(1_000, 1)]
-    #[case(5_000_000, 6)]
-    #[case(10_000_000, 10)]
+    #[case(5_000_000, 5)]
+    #[case(10_000_000, 9)]
     #[tokio::test]
     async fn test_write_large_batch(
         #[case] entries: usize,

@@ -81,7 +81,7 @@ use datafusion_execution::cache::TableScopedPath;
 use datafusion_execution::cache::cache_manager::{
     CachedFileList, CachedFileMetadata, FileStatisticsCache,
 };
-use datafusion_execution::cache::cache_unit::DefaultFileStatisticsCache;
+use datafusion_execution::cache::file_statistics_cache::DefaultFileStatisticsCache;
 use datafusion_execution::config::SessionConfig;
 use datafusion_expr::dml::InsertOp;
 use datafusion_expr::utils::conjunction;
@@ -103,7 +103,6 @@ use futures::{Stream, StreamExt, TryStreamExt, stream};
 use object_store::{ObjectMeta, ObjectStore, ObjectStoreExt, path::Path as ObjectStorePath};
 use parking_lot::{Mutex as ParkingMutex, RwLock};
 use roaring::RoaringBitmap;
-use std::any::Any;
 use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::pin::Pin;
@@ -17860,10 +17859,10 @@ impl CayenneTableProvider {
         format: &dyn FileFormat,
         part_file: &PartitionedFile,
     ) -> datafusion_common::Result<Arc<Statistics>> {
-        if let Some(cached) = self
-            .scan_file_statistics
-            .get(&part_file.object_meta.location)
-            && cached.is_valid_for(&part_file.object_meta)
+        if let Some(cached) = self.scan_file_statistics.get(&TableScopedPath {
+            table: None,
+            path: part_file.object_meta.location.clone(),
+        }) && cached.is_valid_for(&part_file.object_meta)
         {
             return Ok(cached.statistics);
         }
@@ -17883,7 +17882,10 @@ impl CayenneTableProvider {
             )
         {
             self.scan_file_statistics.put(
-                &part_file.object_meta.location,
+                &TableScopedPath {
+                    table: None,
+                    path: part_file.object_meta.location.clone(),
+                },
                 CachedFileMetadata::new(
                     part_file.object_meta.clone(),
                     Arc::clone(&statistics),
@@ -17930,7 +17932,10 @@ impl CayenneTableProvider {
         }
 
         self.scan_file_statistics.put(
-            &part_file.object_meta.location,
+            &TableScopedPath {
+                table: None,
+                path: part_file.object_meta.location.clone(),
+            },
             CachedFileMetadata::new(part_file.object_meta.clone(), Arc::clone(&statistics), None),
         );
 
@@ -18546,10 +18551,6 @@ fn extract_integer_literal(expr: &Expr) -> Option<i64> {
 
 #[async_trait]
 impl TableProvider for CayenneTableProvider {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema(&self) -> SchemaRef {
         self.table_schema()
     }
@@ -30663,7 +30664,7 @@ mod tests {
     #[derive(Debug)]
     struct StatsOverrideExec {
         inner: Arc<dyn ExecutionPlan>,
-        stats: Statistics,
+        stats: Arc<Statistics>,
         properties: Arc<datafusion_physical_plan::PlanProperties>,
     }
 
@@ -30672,7 +30673,7 @@ mod tests {
             let properties = Arc::clone(inner.properties());
             Self {
                 inner,
-                stats,
+                stats: Arc::new(stats),
                 properties,
             }
         }
@@ -30692,9 +30693,6 @@ mod tests {
         fn name(&self) -> &'static str {
             "StatsOverrideExec"
         }
-        fn as_any(&self) -> &dyn Any {
-            self
-        }
         fn properties(&self) -> &Arc<datafusion_physical_plan::PlanProperties> {
             &self.properties
         }
@@ -30707,7 +30705,7 @@ mod tests {
         ) -> datafusion_common::Result<Arc<dyn ExecutionPlan>> {
             Ok(Arc::new(StatsOverrideExec::new(
                 Arc::clone(&children[0]),
-                self.stats.clone(),
+                (*self.stats).clone(),
             )))
         }
         fn execute(
@@ -30720,8 +30718,8 @@ mod tests {
         fn partition_statistics(
             &self,
             _partition: Option<usize>,
-        ) -> datafusion_common::Result<Statistics> {
-            Ok(self.stats.clone())
+        ) -> datafusion_common::Result<Arc<Statistics>> {
+            Ok(Arc::clone(&self.stats))
         }
     }
 

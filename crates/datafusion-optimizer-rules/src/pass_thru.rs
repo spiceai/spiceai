@@ -23,7 +23,7 @@ use datafusion::{
         SendableRecordBatchStream,
     },
 };
-use std::{any::Any, fmt, sync::Arc};
+use std::{fmt, sync::Arc};
 
 type DisplayFormattingFn =
     dyn Fn(DisplayFormatType, &mut fmt::Formatter) -> fmt::Result + Send + Sync + 'static;
@@ -152,9 +152,7 @@ where
     fn name(&self) -> &'static str {
         self.name
     }
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
+
     fn properties(&self) -> &Arc<PlanProperties> {
         self.input_exec.properties()
     }

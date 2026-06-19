@@ -364,10 +364,9 @@ fn accumulate_file_scan_sources(
     snapshots: &mut usize,
     files: &mut usize,
 ) {
-    if let Some(data_source_exec) = plan.as_any().downcast_ref::<DataSourceExec>() {
+    if let Some(data_source_exec) = plan.downcast_ref::<DataSourceExec>() {
         if let Some(file_scan_config) = data_source_exec
             .data_source()
-            .as_any()
             .downcast_ref::<FileScanConfig>()
         {
             *snapshots += 1;
@@ -410,10 +409,9 @@ fn collect_file_scan_configs<'a>(
     plan: &'a Arc<dyn ExecutionPlan>,
     configs: &mut Vec<&'a FileScanConfig>,
 ) {
-    if let Some(data_source_exec) = plan.as_any().downcast_ref::<DataSourceExec>() {
+    if let Some(data_source_exec) = plan.downcast_ref::<DataSourceExec>() {
         if let Some(file_scan_config) = data_source_exec
             .data_source()
-            .as_any()
             .downcast_ref::<FileScanConfig>()
         {
             configs.push(file_scan_config);
@@ -421,7 +419,7 @@ fn collect_file_scan_configs<'a>(
         return;
     }
 
-    if plan.as_any().downcast_ref::<UnionExec>().is_some() {
+    if plan.downcast_ref::<UnionExec>().is_some() {
         for child in plan.children() {
             collect_file_scan_configs(child, configs);
         }
@@ -450,16 +448,15 @@ fn collect_file_scan_configs<'a>(
 /// it stops a future operator from silently being treated as transparent.
 #[expect(deprecated)]
 fn is_identity_preserving_wrapper(plan: &Arc<dyn ExecutionPlan>) -> bool {
-    let any = plan.as_any();
-    if any.downcast_ref::<ProjectionExec>().is_some()
-        || any.downcast_ref::<RepartitionExec>().is_some()
-        || any
+    if plan.downcast_ref::<ProjectionExec>().is_some()
+        || plan.downcast_ref::<RepartitionExec>().is_some()
+        || plan
             .downcast_ref::<datafusion_physical_plan::coalesce_batches::CoalesceBatchesExec>()
             .is_some()
-        || any
+        || plan
             .downcast_ref::<datafusion_physical_plan::coalesce_partitions::CoalescePartitionsExec>()
             .is_some()
-        || any.downcast_ref::<CayenneAccelerationExec>().is_some()
+        || plan.downcast_ref::<CayenneAccelerationExec>().is_some()
     {
         return true;
     }
@@ -473,7 +470,7 @@ fn is_identity_preserving_wrapper(plan: &Arc<dyn ExecutionPlan>) -> bool {
 }
 
 fn collect_dynamic_filters(expr: &Arc<dyn PhysicalExpr>, filters: &mut Vec<ScanDynamicFilter>) {
-    if let Some(dynamic_filter) = expr.as_any().downcast_ref::<DynamicFilterPhysicalExpr>() {
+    if let Some(dynamic_filter) = expr.downcast_ref::<DynamicFilterPhysicalExpr>() {
         if let Some(columns) = dynamic_filter_column_names(dynamic_filter) {
             filters.push(ScanDynamicFilter {
                 filter: Arc::clone(expr),
@@ -493,7 +490,7 @@ fn dynamic_filter_column_names(
 ) -> Option<BTreeSet<String>> {
     let mut columns = BTreeSet::new();
     for child in dynamic_filter.children() {
-        let column = child.as_any().downcast_ref::<Column>()?;
+        let column = child.downcast_ref::<Column>()?;
         columns.insert(column.name().to_string());
     }
 
@@ -513,10 +510,9 @@ fn push_dynamic_filters_to_data_source(
         return Ok(None);
     }
 
-    if let Some(data_source_exec) = plan.as_any().downcast_ref::<DataSourceExec>()
+    if let Some(data_source_exec) = plan.downcast_ref::<DataSourceExec>()
         && let Some(file_scan_config) = data_source_exec
             .data_source()
-            .as_any()
             .downcast_ref::<FileScanConfig>()
     {
         let filters = filters.iter().map(Arc::clone).collect();
@@ -545,7 +541,7 @@ fn push_dynamic_filters_to_data_source(
         return Ok(None);
     }
 
-    let is_union = plan.as_any().downcast_ref::<UnionExec>().is_some();
+    let is_union = plan.downcast_ref::<UnionExec>().is_some();
     if !is_union && !is_identity_preserving_wrapper(&plan) {
         return Ok(None);
     }
@@ -615,6 +611,10 @@ impl DisplayAs for CayenneAccelerationExec {
 
 #[deny(clippy::missing_trait_methods)]
 impl ExecutionPlan for CayenneAccelerationExec {
+    fn downcast_delegate(&self) -> Option<&dyn ExecutionPlan> {
+        None
+    }
+
     fn with_preserve_order(&self, _preserve_order: bool) -> Option<Arc<dyn ExecutionPlan>> {
         None
     }
@@ -628,10 +628,6 @@ impl ExecutionPlan for CayenneAccelerationExec {
         Self: Sized,
     {
         "CayenneAccelerationExec"
-    }
-
-    fn as_any(&self) -> &dyn Any {
-        self
     }
 
     fn schema(&self) -> SchemaRef {
@@ -739,7 +735,7 @@ impl ExecutionPlan for CayenneAccelerationExec {
         self.inner.metrics()
     }
 
-    fn partition_statistics(&self, partition: Option<usize>) -> Result<Statistics> {
+    fn partition_statistics(&self, partition: Option<usize>) -> Result<Arc<Statistics>> {
         self.inner.partition_statistics(partition)
     }
 
@@ -841,7 +837,6 @@ mod tests {
         );
         assert!(
             repartitioned_plan
-                .as_any()
                 .downcast_ref::<RepartitionExec>()
                 .is_some()
         );
@@ -874,10 +869,7 @@ mod tests {
             .expect("inner plan should support projection swapping");
 
         assert!(
-            swapped
-                .as_any()
-                .downcast_ref::<CayenneAccelerationExec>()
-                .is_some(),
+            swapped.downcast_ref::<CayenneAccelerationExec>().is_some(),
             "projection-swapped Cayenne plan should stay wrapped for optimizer identification"
         );
     }

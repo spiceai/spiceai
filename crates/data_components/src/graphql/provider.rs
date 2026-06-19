@@ -36,7 +36,7 @@ use datafusion::{
 };
 use futures::StreamExt;
 use snafu::ResultExt;
-use std::{any::Any, fmt, sync::Arc};
+use std::{fmt, sync::Arc};
 
 use super::{
     ArrowInternalSnafu, ErrorChecker, GraphQLContext, ResultTransformSnafu, client::GraphQLClient,
@@ -221,10 +221,6 @@ impl GraphQLTableProvider {
 
 #[async_trait]
 impl TableProvider for GraphQLTableProvider {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema(&self) -> SchemaRef {
         Arc::clone(&self.table_schema)
     }
@@ -394,10 +390,6 @@ impl DisplayAs for GraphQLTableProviderExec {
 impl ExecutionPlan for GraphQLTableProviderExec {
     fn name(&self) -> &'static str {
         "GraphQLTableProviderExec"
-    }
-
-    fn as_any(&self) -> &dyn Any {
-        self
     }
 
     fn schema(&self) -> SchemaRef {

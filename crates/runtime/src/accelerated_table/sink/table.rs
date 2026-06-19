@@ -131,11 +131,7 @@ impl TableSink {
     }
 
     async fn providers_for_write_hooks(&self) -> Vec<Arc<dyn TableProvider>> {
-        if let Some(p) = self
-            .table_provider
-            .as_any()
-            .downcast_ref::<PartitionTableProvider>()
-        {
+        if let Some(p) = self.table_provider.downcast_ref::<PartitionTableProvider>() {
             p.partition_table_providers().await
         } else {
             vec![Arc::clone(&self.table_provider)]
@@ -197,7 +193,7 @@ impl TableSink {
         // Elasticsearch indexes maintained externally to the accelerator storage).
         let provider_indexes_before: Vec<Arc<dyn Index + Send + Sync>> = providers_before_write
             .iter()
-            .filter_map(|p| p.as_any().downcast_ref::<IndexedTableProvider>())
+            .filter_map(|p| p.downcast_ref::<IndexedTableProvider>())
             .flat_map(IndexedTableProvider::get_all_indexes)
             .collect();
 
@@ -250,7 +246,7 @@ impl TableSink {
         // no-op after append (index already exists). CDC skips this path entirely.
         let provider_indexes_after: Vec<Arc<dyn Index + Send + Sync>> = providers_after_write
             .iter()
-            .filter_map(|p| p.as_any().downcast_ref::<IndexedTableProvider>())
+            .filter_map(|p| p.downcast_ref::<IndexedTableProvider>())
             .flat_map(IndexedTableProvider::get_all_indexes)
             .collect();
 
@@ -282,7 +278,7 @@ async fn run_on_write_failed(
 ) {
     let provider_indexes: Vec<Arc<dyn Index + Send + Sync>> = providers
         .iter()
-        .filter_map(|p| p.as_any().downcast_ref::<IndexedTableProvider>())
+        .filter_map(|p| p.downcast_ref::<IndexedTableProvider>())
         .flat_map(IndexedTableProvider::get_all_indexes)
         .collect();
 

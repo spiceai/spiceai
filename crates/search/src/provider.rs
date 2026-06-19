@@ -14,11 +14,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::{
-    any::Any,
-    collections::{HashMap, HashSet},
-    sync::Arc,
-};
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 use arrow_schema::{DataType, Field, FieldRef, Schema, SchemaRef};
 use async_trait::async_trait;
@@ -465,10 +462,6 @@ impl SearchQueryProvider {
 
 #[async_trait]
 impl TableProvider for SearchQueryProvider {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn constraints(&self) -> Option<&Constraints> {
         self.constraints.as_ref()
     }

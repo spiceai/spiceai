@@ -19,7 +19,6 @@ limitations under the License.
 //! Connects to a `DuckLake` catalog using a dedicated `DuckDB` instance with the `ducklake` extension
 //! and provides schema/table discovery by querying the attached `DuckLake` database.
 
-use std::any::Any;
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
@@ -221,10 +220,6 @@ impl DuckLakeCatalogProvider {
 }
 
 impl CatalogProvider for DuckLakeCatalogProvider {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema_names(&self) -> Vec<String> {
         let guard = match self.schemas.read() {
             Ok(guard) => guard,
@@ -284,31 +279,30 @@ impl CatalogProvider for DuckLakeCatalogProvider {
             .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?;
 
         // Downcast to our schema type if possible, otherwise create a new one
-        let schema_provider = if let Some(ducklake_schema) =
-            schema.as_any().downcast_ref::<DuckLakeSchemaProvider>()
-        {
-            Arc::new(DuckLakeSchemaProvider::new(
-                Arc::clone(&ducklake_schema.pool),
-                Arc::clone(&ducklake_schema.duckdb_factory),
-                ducklake_schema.catalog_name.clone(),
-                schema_name,
-                ducklake_schema.writable,
-                ducklake_schema.ddl_enabled,
-                ducklake_schema.include.clone(),
-                Arc::clone(&ducklake_schema.write_lock),
-            ))
-        } else {
-            Arc::new(DuckLakeSchemaProvider::new(
-                Arc::clone(&self.pool),
-                Arc::clone(&self.duckdb_factory),
-                self.catalog_name.clone(),
-                schema_name,
-                self.writable,
-                self.ddl_enabled,
-                self.include.clone(),
-                Arc::clone(&self.write_lock),
-            ))
-        };
+        let schema_provider =
+            if let Some(ducklake_schema) = schema.downcast_ref::<DuckLakeSchemaProvider>() {
+                Arc::new(DuckLakeSchemaProvider::new(
+                    Arc::clone(&ducklake_schema.pool),
+                    Arc::clone(&ducklake_schema.duckdb_factory),
+                    ducklake_schema.catalog_name.clone(),
+                    schema_name,
+                    ducklake_schema.writable,
+                    ducklake_schema.ddl_enabled,
+                    ducklake_schema.include.clone(),
+                    Arc::clone(&ducklake_schema.write_lock),
+                ))
+            } else {
+                Arc::new(DuckLakeSchemaProvider::new(
+                    Arc::clone(&self.pool),
+                    Arc::clone(&self.duckdb_factory),
+                    self.catalog_name.clone(),
+                    schema_name,
+                    self.writable,
+                    self.ddl_enabled,
+                    self.include.clone(),
+                    Arc::clone(&self.write_lock),
+                ))
+            };
 
         let mut guard = match self.schemas.write() {
             Ok(guard) => guard,
@@ -588,10 +582,6 @@ impl DuckLakeSchemaProvider {
 
 #[async_trait]
 impl SchemaProvider for DuckLakeSchemaProvider {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn table_names(&self) -> Vec<String> {
         let guard = match self.tables.read() {
             Ok(guard) => guard,

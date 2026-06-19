@@ -207,14 +207,12 @@ async fn wrap_table_as_index_s3(
                 .map(|embed| (c.name.clone(), embed.clone()))
         })
         .collect();
-    let mut provider = if let Some(indexed) = inner_table_provider
-        .as_any()
-        .downcast_ref::<IndexedTableProvider>()
-    {
-        indexed.clone()
-    } else {
-        IndexedTableProvider::new(Arc::clone(&inner_table_provider))
-    };
+    let mut provider =
+        if let Some(indexed) = inner_table_provider.downcast_ref::<IndexedTableProvider>() {
+            indexed.clone()
+        } else {
+            IndexedTableProvider::new(Arc::clone(&inner_table_provider))
+        };
     for (column, config) in embedding_columns {
         let (columns, index_schema) = if config.chunking.as_ref().is_some_and(|cfg| cfg.enabled) {
             updated_chunked_search_index_format(&inner_table_provider, columns, &column)
@@ -395,10 +393,9 @@ async fn wrap_table_as_index_elasticsearch(
         })
         .collect();
 
-    let mut provider = if let Some(indexed) = inner_table_provider
-        .as_any()
-        .downcast_ref::<runtime_datafusion_index::IndexedTableProvider>(
-    ) {
+    let mut provider = if let Some(indexed) =
+        inner_table_provider.downcast_ref::<runtime_datafusion_index::IndexedTableProvider>()
+    {
         indexed.clone()
     } else {
         runtime_datafusion_index::IndexedTableProvider::new(Arc::clone(&inner_table_provider))

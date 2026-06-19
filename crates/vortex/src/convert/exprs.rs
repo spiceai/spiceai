@@ -139,7 +139,6 @@ impl DefaultExpressionConvertor {
             let mut result = self.convert(source_expr.as_ref())?;
             for expr in field_names {
                 let field_name = expr
-                    .as_any()
                     .downcast_ref::<df_expr::Literal>()
                     .ok_or_else(|| exec_datafusion_err!("get_field field name must be a literal"))?
                     .value()
@@ -199,7 +198,7 @@ impl ExpressionConvertor for DefaultExpressionConvertor {
     fn convert(&self, df: &dyn PhysicalExpr) -> DFResult<Expression> {
         // TODO(joe): Don't return an error when we have an unsupported node, bubble up "TRUE" as in keep
         //  for that node, up to any `and` or `or` node.
-        if let Some(binary_expr) = df.as_any().downcast_ref::<df_expr::BinaryExpr>() {
+        if let Some(binary_expr) = df.downcast_ref::<df_expr::BinaryExpr>() {
             let left = self.convert(binary_expr.left().as_ref())?;
             let right = self.convert(binary_expr.right().as_ref())?;
             let operator = try_operator_from_df(*binary_expr.op())?;
@@ -207,11 +206,11 @@ impl ExpressionConvertor for DefaultExpressionConvertor {
             return Ok(Binary.new_expr(operator, [left, right]));
         }
 
-        if let Some(col_expr) = df.as_any().downcast_ref::<df_expr::Column>() {
+        if let Some(col_expr) = df.downcast_ref::<df_expr::Column>() {
             return Ok(get_item(col_expr.name().to_owned(), root()));
         }
 
-        if let Some(like) = df.as_any().downcast_ref::<df_expr::LikeExpr>() {
+        if let Some(like) = df.downcast_ref::<df_expr::LikeExpr>() {
             let child = self.convert(like.expr().as_ref())?;
             let pattern = self.convert(like.pattern().as_ref())?;
             return Ok(Like.new_expr(
@@ -223,33 +222,25 @@ impl ExpressionConvertor for DefaultExpressionConvertor {
             ));
         }
 
-        if let Some(literal) = df.as_any().downcast_ref::<df_expr::Literal>() {
+        if let Some(literal) = df.downcast_ref::<df_expr::Literal>() {
             let value = Scalar::from_df(literal.value()).map_err(|e| {
                 exec_datafusion_err!("Failed to convert literal to a Vortex scalar: {e}")
             })?;
             return Ok(lit(value));
         }
 
-        if let Some(cast_expr) = df.as_any().downcast_ref::<df_expr::CastExpr>() {
+        if let Some(cast_expr) = df.downcast_ref::<df_expr::CastExpr>() {
             let cast_dtype = DType::from_arrow((cast_expr.cast_type(), Nullability::Nullable));
             let child = self.convert(cast_expr.expr().as_ref())?;
             return Ok(cast(child, cast_dtype));
         }
 
-        if let Some(cast_col_expr) = df.as_any().downcast_ref::<df_expr::CastColumnExpr>() {
-            let target = cast_col_expr.target_field();
-
-            let target_dtype = DType::from_arrow((target.data_type(), target.is_nullable().into()));
-            let child = self.convert(cast_col_expr.expr().as_ref())?;
-            return Ok(cast(child, target_dtype));
-        }
-
-        if let Some(is_null_expr) = df.as_any().downcast_ref::<df_expr::IsNullExpr>() {
+        if let Some(is_null_expr) = df.downcast_ref::<df_expr::IsNullExpr>() {
             let arg = self.convert(is_null_expr.arg().as_ref())?;
             return Ok(is_null(arg));
         }
 
-        if let Some(is_not_null_expr) = df.as_any().downcast_ref::<df_expr::IsNotNullExpr>() {
+        if let Some(is_not_null_expr) = df.downcast_ref::<df_expr::IsNotNullExpr>() {
             let arg = self.convert(is_not_null_expr.arg().as_ref())?;
             // Emit native is_not_null (not `not(is_null(...))`): the negation
             // has no zone-map falsifier, but is_not_null does — this lights up
@@ -257,13 +248,13 @@ impl ExpressionConvertor for DefaultExpressionConvertor {
             return Ok(is_not_null(arg));
         }
 
-        if let Some(in_list) = df.as_any().downcast_ref::<df_expr::InListExpr>() {
+        if let Some(in_list) = df.downcast_ref::<df_expr::InListExpr>() {
             let value = self.convert(in_list.expr().as_ref())?;
             let list_elements: Vec<_> = in_list
                 .list()
                 .iter()
                 .map(|e| {
-                    if let Some(lit) = e.as_any().downcast_ref::<df_expr::Literal>() {
+                    if let Some(lit) = e.downcast_ref::<df_expr::Literal>() {
                         Scalar::from_df(lit.value()).map_err(|e| {
                             exec_datafusion_err!(
                                 "Failed to convert IN list literal to a Vortex scalar: {e}"
@@ -289,19 +280,16 @@ impl ExpressionConvertor for DefaultExpressionConvertor {
             return Ok(if in_list.negated() { not(expr) } else { expr });
         }
 
-        if let Some(dynamic_filter) = df
-            .as_any()
-            .downcast_ref::<df_expr::DynamicFilterPhysicalExpr>()
-        {
+        if let Some(dynamic_filter) = df.downcast_ref::<df_expr::DynamicFilterPhysicalExpr>() {
             let current = dynamic_filter.current()?;
             return self.convert(current.as_ref());
         }
 
-        if let Some(scalar_fn) = df.as_any().downcast_ref::<ScalarFunctionExpr>() {
+        if let Some(scalar_fn) = df.downcast_ref::<ScalarFunctionExpr>() {
             return self.try_convert_scalar_function(scalar_fn);
         }
 
-        if let Some(case_expr) = df.as_any().downcast_ref::<df_expr::CaseExpr>() {
+        if let Some(case_expr) = df.downcast_ref::<df_expr::CaseExpr>() {
             return self.try_convert_case_expr(case_expr);
         }
 
@@ -337,7 +325,7 @@ impl ExpressionConvertor for DefaultExpressionConvertor {
                 }
 
                 // We only pull column children of scalar functions that we can't push into the scan.
-                if let Some(scalar_fn_expr) = node.as_any().downcast_ref::<ScalarFunctionExpr>()
+                if let Some(scalar_fn_expr) = node.downcast_ref::<ScalarFunctionExpr>()
                     && !can_scalar_fn_be_pushed_down(scalar_fn_expr, input_schema)
                 {
                     scan_projection.extend(
@@ -352,7 +340,7 @@ impl ExpressionConvertor for DefaultExpressionConvertor {
 
                 // DataFusion assumes different decimal types can be coerced.
                 // Vortex expects a perfect match so we don't push it down.
-                if let Some(binary_expr) = node.as_any().downcast_ref::<df_expr::BinaryExpr>()
+                if let Some(binary_expr) = node.downcast_ref::<df_expr::BinaryExpr>()
                     && binary_expr.op().is_numerical_operators()
                     && (is_decimal(&binary_expr.left().data_type(input_schema)?)
                         && is_decimal(&binary_expr.right().data_type(input_schema)?))
@@ -452,7 +440,7 @@ fn can_be_pushed_down_impl(df_expr: &Arc<dyn PhysicalExpr>, schema: &Schema) -> 
         return false;
     }
 
-    let expr = df_expr.as_any();
+    let expr = df_expr;
     if let Some(binary) = expr.downcast_ref::<df_expr::BinaryExpr>() {
         can_binary_be_pushed_down(binary, schema)
     } else if let Some(col) = expr.downcast_ref::<df_expr::Column>() {
@@ -468,9 +456,6 @@ fn can_be_pushed_down_impl(df_expr: &Arc<dyn PhysicalExpr>, schema: &Schema) -> 
     } else if let Some(cast_expr) = expr.downcast_ref::<df_expr::CastExpr>() {
         // CastExpr child must be an expression type that convert() can handle
         is_convertible_expr(cast_expr.expr())
-    } else if let Some(cast_col_expr) = expr.downcast_ref::<df_expr::CastColumnExpr>() {
-        // CastColumnExpr child must be an expression type that convert() can handle
-        is_convertible_expr(cast_col_expr.expr())
     } else if let Some(is_null) = expr.downcast_ref::<df_expr::IsNullExpr>() {
         can_be_pushed_down_impl(is_null.arg(), schema)
     } else if let Some(is_not_null) = expr.downcast_ref::<df_expr::IsNotNullExpr>() {
@@ -503,7 +488,7 @@ fn can_be_pushed_down_impl(df_expr: &Arc<dyn PhysicalExpr>, schema: &Schema) -> 
 /// This is less restrictive than `can_be_pushed_down` since it only checks
 /// expression types, not data type support.
 fn is_convertible_expr(df_expr: &Arc<dyn PhysicalExpr>) -> bool {
-    let expr = df_expr.as_any();
+    let expr = df_expr;
 
     // Expression types that convert() handles
     expr.downcast_ref::<df_expr::BinaryExpr>().is_some()
@@ -512,9 +497,6 @@ fn is_convertible_expr(df_expr: &Arc<dyn PhysicalExpr>) -> bool {
         || expr.downcast_ref::<df_expr::Literal>().is_some()
         || expr
             .downcast_ref::<df_expr::CastExpr>()
-            .is_some_and(|e| is_convertible_expr(e.expr()))
-        || expr
-            .downcast_ref::<df_expr::CastColumnExpr>()
             .is_some_and(|e| is_convertible_expr(e.expr()))
         || expr.downcast_ref::<df_expr::IsNullExpr>().is_some()
         || expr.downcast_ref::<df_expr::IsNotNullExpr>().is_some()
@@ -532,7 +514,7 @@ fn can_binary_be_pushed_down(binary: &df_expr::BinaryExpr, schema: &Schema) -> b
 }
 
 fn contains_decimal_to_floating_cast(df_expr: &Arc<dyn PhysicalExpr>, schema: &Schema) -> bool {
-    let expr = df_expr.as_any();
+    let expr = df_expr;
 
     if let Some(cast) = expr.downcast_ref::<df_expr::CastExpr>() {
         let casts_to_floating = matches!(cast.cast_type(), DataType::Float32 | DataType::Float64);

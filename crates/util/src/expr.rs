@@ -19,7 +19,6 @@ limitations under the License.
 use std::sync::Arc;
 
 use arrow::datatypes::SchemaRef;
-use chrono::Utc;
 use datafusion::{
     common::DFSchema,
     error::DataFusionError,
@@ -49,9 +48,10 @@ pub fn simplify_expr(expr: Expr, schema: &SchemaRef) -> Result<Expr, DataFusionE
 
     // Set query_execution_start_time so that NOW() and other time-dependent
     // functions can be evaluated during simplification
-    let simplify_context = SimplifyContext::default()
-        .with_query_execution_start_time(Some(Utc::now()))
-        .with_schema(Arc::new(df_schema));
+    let simplify_context = SimplifyContext::builder()
+        .with_current_time()
+        .with_schema(Arc::new(df_schema))
+        .build();
     let simplifier = ExprSimplifier::new(simplify_context);
 
     simplifier.simplify(expr)

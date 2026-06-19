@@ -85,7 +85,7 @@ limitations under the License.
 //! The read path automatically detects the storage format (TEXT vs INTEGER) and converts
 //! to the Arrow schema's expected timestamp type and unit.
 
-use std::{any::Any, fmt, sync::Arc};
+use std::{fmt, sync::Arc};
 
 use arrow::{
     array::{
@@ -1181,10 +1181,6 @@ impl TursoTableProvider {
 
 #[async_trait]
 impl TableProvider for TursoTableProvider {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema(&self) -> SchemaRef {
         Arc::clone(&self.schema)
     }
@@ -1548,10 +1544,6 @@ impl ExecutionPlan for TursoExec {
         "TursoExec"
     }
 
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema(&self) -> SchemaRef {
         Arc::clone(&self.schema)
     }
@@ -1884,10 +1876,6 @@ impl TursoDataSink {
 
 #[async_trait]
 impl DataSink for TursoDataSink {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn metrics(&self) -> Option<datafusion::physical_plan::metrics::MetricsSet> {
         None
     }
