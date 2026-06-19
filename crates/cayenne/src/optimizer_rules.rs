@@ -741,7 +741,7 @@ fn count_hash_joins(plan: &Arc<dyn ExecutionPlan>) -> usize {
 }
 
 fn count_hash_joins_inner(plan: &Arc<dyn ExecutionPlan>, count: &mut usize) {
-    if plan.as_any().downcast_ref::<HashJoinExec>().is_some() {
+    if plan.downcast_ref::<HashJoinExec>().is_some() {
         *count += 1;
     }
     for child in plan.children() {
@@ -2662,10 +2662,7 @@ mod tests {
         let optimized = optimize_anti_join_sort_merge_with_config(join, &config);
 
         assert!(
-            optimized
-                .as_any()
-                .downcast_ref::<SortMergeJoinExec>()
-                .is_some(),
+            optimized.downcast_ref::<SortMergeJoinExec>().is_some(),
             "a large inner hash join over the memory gate should become a sort-merge join"
         );
     }
@@ -2689,10 +2686,7 @@ mod tests {
         let optimized = optimize_anti_join_sort_merge_with_config(join, &config);
 
         assert!(
-            optimized
-                .as_any()
-                .downcast_ref::<SortMergeJoinExec>()
-                .is_some(),
+            optimized.downcast_ref::<SortMergeJoinExec>().is_some(),
             "a large full-outer hash join over the memory gate should become a sort-merge join"
         );
     }
@@ -2722,10 +2716,7 @@ mod tests {
         let optimized = optimize_anti_join_sort_merge_with_config(join, &config);
 
         assert!(
-            optimized
-                .as_any()
-                .downcast_ref::<SortMergeJoinExec>()
-                .is_some(),
+            optimized.downcast_ref::<SortMergeJoinExec>().is_some(),
             "an inexact-but-large inner build side should still be rewritten under the memory gate"
         );
     }
@@ -2750,10 +2741,7 @@ mod tests {
         let optimized = optimize_anti_join_sort_merge_with_config(join, &config);
 
         assert!(
-            optimized
-                .as_any()
-                .downcast_ref::<SortMergeJoinExec>()
-                .is_some(),
+            optimized.downcast_ref::<SortMergeJoinExec>().is_some(),
             "different-source inner joins are eligible under the memory gate"
         );
     }
@@ -2785,7 +2773,7 @@ mod tests {
         let optimized = optimize_anti_join_sort_merge_with_config(join, &config);
 
         assert!(
-            optimized.as_any().downcast_ref::<HashJoinExec>().is_some(),
+            optimized.downcast_ref::<HashJoinExec>().is_some(),
             "non-Cayenne joins are left to the prefer_hash_join knob, not the Cayenne rewriter"
         );
     }
@@ -2809,7 +2797,7 @@ mod tests {
         let optimized = optimize_anti_join_sort_merge_with_config(join, &config);
 
         assert!(
-            optimized.as_any().downcast_ref::<HashJoinExec>().is_some(),
+            optimized.downcast_ref::<HashJoinExec>().is_some(),
             "a lone inner join within the pool fraction should stay a hash join"
         );
     }
@@ -2842,13 +2830,12 @@ mod tests {
         let optimized = optimize_anti_join_sort_merge_with_config(plan, &config);
 
         let union = optimized
-            .as_any()
             .downcast_ref::<UnionExec>()
             .expect("top node should remain a union");
         assert_eq!(union.children().len(), 2, "union should keep both joins");
         for child in union.children() {
             assert!(
-                child.as_any().downcast_ref::<SortMergeJoinExec>().is_some(),
+                child.downcast_ref::<SortMergeJoinExec>().is_some(),
                 "each concurrent inner join should be rewritten to sort-merge under fair-share"
             );
         }
