@@ -106,6 +106,21 @@ impl Kafka {
                 .expose()
                 .ok()
                 .map(ToString::to_string),
+            ssl_certificate_location: params
+                .get("ssl_certificate_location")
+                .expose()
+                .ok()
+                .map(ToString::to_string),
+            ssl_key_location: params
+                .get("ssl_key_location")
+                .expose()
+                .ok()
+                .map(ToString::to_string),
+            ssl_key_password: params
+                .get("ssl_key_password")
+                .expose()
+                .ok()
+                .map(ToString::to_string)
             enable_ssl_certificate_verification: params
                 .get("enable_ssl_certificate_verification")
                 .expose()
