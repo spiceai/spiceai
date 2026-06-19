@@ -16,6 +16,20 @@ limitations under the License.
 //!
 //! This module contains the main `CayenneTableProvider` struct which implements
 //! `DataFusion`'s `TableProvider` trait for Cayenne tables.
+//!
+//! Beyond the scan/insert/delete `TableProvider` surface, this (large) module also
+//! owns the moving parts the rest of the crate coordinates through the provider:
+//!
+//! - the **listing fence** (`RwLock`) read/write barrier and the `ArcSwap` listing /
+//!   snapshot state, plus per-snapshot scan ref-counting (`snapshot_scan_refs`) that pins
+//!   Vortex files against GC for a scan's lifetime;
+//! - the **in-memory CDC mem-tier** (`mem_tier`) with its publish lock, slot advancer,
+//!   and background checkpointer (the `cdc_durability: memory` path);
+//! - **query-path scan optimizations** — sound `output_ordering` on sorted-compaction
+//!   snapshots (attested by `current_sorted_snapshot`), parallel in-RAM scan partitioning
+//!   (`partition_memory_batches`), and the PK no-tombstone scan short-circuits;
+//! - the **seq-prefix bake** planner and the in-process compaction runner;
+//! - maintained-aggregate state (`maintained_aggregates`) and the per-table memory account.
 
 use super::constants::{STAGING_DIR_NAME, STAGING_WAL_FILENAME, STAGING_WAL_TMP_FILENAME};
 use super::delete::{
@@ -18276,7 +18290,7 @@ impl CayenneTableProvider {
         let [pk_idx] = pk_indices_in_projection else {
             return None;
         };
-        // DF53 accessor for whole-plan (all-partition) statistics.
+        // DataFusion accessor for whole-plan (all-partition) statistics.
         let stats = plan.partition_statistics(None).ok()?;
         let col = stats.column_statistics.get(*pk_idx)?;
         let (DFPrecision::Exact(lo), DFPrecision::Exact(hi)) = (&col.min_value, &col.max_value)

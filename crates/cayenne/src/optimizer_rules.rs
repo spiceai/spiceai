@@ -54,11 +54,14 @@ limitations under the License.
 //!    `HashJoinInput[N]` reservation behind.
 //!    [`CayenneAntiJoinSortMergeRewriter`] rewrites only same-source Cayenne
 //!    semi/anti `HashJoinExec` nodes to `SortMergeJoinExec` with explicit
-//!    spillable `SortExec` inputs above a 10M-row exact build-side threshold.
-//!    Ordinary inner/outer joins stay with `HashJoinExec` unless another
-//!    optimizer rule supplies a more targeted win.
+//!    spillable `SortExec` inputs. The gate is primarily the build side
+//!    exhausting a memory-pool fraction (`sort_merge_memory_pool_fraction`,
+//!    default 0.125 of `runtime.query.memory_limit`); when no memory pool is
+//!    wired through config it falls back to a 10M-row exact build-side count
+//!    (`sort_merge_min_rows`). Ordinary inner/outer joins stay with
+//!    `HashJoinExec` unless another optimizer rule supplies a more targeted win.
 //!
-//! The ordinary inner-join probe side is handled by `DataFusion` 53's *native*
+//! The ordinary inner-join probe side is handled by `DataFusion`'s *native*
 //! hash-join dynamic-filter pushdown. For inner joins (the only shape
 //! `DataFusion` pushes join-derived dynamic filters through),
 //! `HashJoinExec::gather_filters_for_pushdown` plants an
@@ -67,7 +70,7 @@ limitations under the License.
 //! execute-time with a combined predicate: min/max **bounds** (for
 //! statistics-based row-group/file/segment skipping) *and* a **membership**
 //! check — an `InList` for small build sides (within
-//! `datafusion.execution.hash_join_inlist_pushdown_max_size`, which the Spice
+//! `datafusion.optimizer.hash_join_inlist_pushdown_max_size`, which the Spice
 //! runtime session builder sizes from `runtime.query.memory_limit` per
 //! partition) or a hash-table lookup for larger ones. This natively supersedes
 //! the previous forked
@@ -144,7 +147,7 @@ use crate::provider::scan::{ScanDynamicFilter, ScanIdentity};
 ///
 /// Opt-in: this rule is only registered when the runtime
 /// `cayenne_optimizer_rules.exact_join_filter` flag is enabled. By default the
-/// ordinary inner-join probe filter is handled by `DataFusion` 53's native
+/// ordinary inner-join probe filter is handled by `DataFusion`'s native
 /// hash-join dynamic-filter pushdown (whose `InList` budget is raised in the
 /// runtime session builder's `configure_hash_join_memory_limits`).
 #[derive(Default)]
@@ -2462,7 +2465,7 @@ mod tests {
             .expect("post-optimization filter pushdown should succeed")
     }
 
-    /// Regression test for the DF53 *native* hash-join dynamic-filter pushdown
+    /// Regression test for `DataFusion`'s *native* hash-join dynamic-filter pushdown
     /// that replaced the forked `ExactLeftAccumulator` accumulator seam.
     ///
     /// For an inner join whose probe (right) side is a `CayenneAccelerationExec`,

@@ -23,8 +23,9 @@ limitations under the License.
 //!   directly to Vortex scan via `Selection::ExcludeRoaring` for efficient row skipping.
 //!
 //! - **Int64 PK-based (`Int64PkDeletionFilterExec`)**: For tables with a single-column
-//!   Int64 primary key. Uses direct `HashSet<i64>` lookup - no serialization overhead.
-//!   This is the most efficient deletion strategy for the common case.
+//!   Int64 primary key. Bloom-prefilters each row's PK, then probes the cached fused
+//!   `DeletionIndex` (LayeredRuns) — no per-row serialization. The most efficient
+//!   deletion strategy for the common case.
 //!
 //! - **RowConverter-based (`KeyBasedDeletionFilterExec`)**: For tables with composite
 //!   or non-integer primary keys. Uses Arrow's `RowConverter` to create deterministic
