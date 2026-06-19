@@ -430,6 +430,26 @@ async fn acceleration_connection(
                     })?;
             }
 
+            // When the Cayenne metastore backend is Turso, it owns `cayenne.db` as a
+            // libSQL/MVCC database. Route the checkpoint through a Turso connection
+            // on that same file rather than opening it as a raw SQLite pool, which
+            // would re-stamp it SQLite-WAL and conflict with the metastore.
+            #[cfg(feature = "turso")]
+            {
+                let metastore_type = source
+                    .acceleration()
+                    .and_then(|a| a.params.get("cayenne_metastore"))
+                    .map_or("sqlite", String::as_str);
+                if metastore_type == "turso" {
+                    let pool = super::turso::TursoConnectionPool::new(&metadata_db_path)
+                        .await
+                        .map_err(|e| Error::CayennePool {
+                            source: Box::new(e),
+                        })?;
+                    return Ok(AccelerationConnection::Turso(Arc::new(pool)));
+                }
+            }
+
             // Create SQLite connection pool for cayenne metadata using the factory
             let sqlite_factory = SqliteTableProviderFactory::new();
             let pool = sqlite_factory
