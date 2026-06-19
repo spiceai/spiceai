@@ -659,6 +659,21 @@ pub async fn run(args: Args) -> Result<()> {
 
             rt.datafusion().set_refresh_runtime(refresh_runtime);
 
+            // Dedicated, DEFAULT-priority (nice 0) runtime for the CDC changes-apply
+            // loop (refresh_mode: changes). Split from the low-priority refresh runtime
+            // above (which also runs bulk full/append refresh reads) so the
+            // freshness-critical apply isn't scheduler-deprioritized on an
+            // oversubscribed host. (Benchmarked nice-0 vs a nice-5 variant at SF50: equal
+            // QPH, but nice-0 drained replication lag harder — cleared the stock backlog —
+            // so it's the better default; the QPH cost vs the shared runtime was noise.)
+            let cdc_apply_runtime = ManagedTokioRuntime::builder()
+                .with_thread_name("cdc-apply-worker")
+                .build()
+                .boxed()
+                .context(UnableToInitializeDatafusionTokioRuntimeSnafu)?;
+
+            rt.datafusion().set_cdc_apply_runtime(cdc_apply_runtime);
+
             // Bring up the dedicated compaction runtime whenever dedicated
             // thread pools are enabled. Cayenne can be activated lazily after
             // startup (for example via Iceberg DDL acceleration defaults), so
@@ -752,6 +767,27 @@ pub async fn run(args: Args) -> Result<()> {
         if let Some(bytes) = rt.datafusion().compaction_memory_pool_bytes() {
             telemetry::register_cayenne_compaction_metrics(bytes);
         }
+
+        // Per-runtime tokio thread/task gauges (alive tasks, workers, global-queue depth;
+        // plus worker busy/park/steal under `--cfg tokio_unstable`) so `/metrics` shows
+        // whether each runtime — notably the dedicated nice-0 `cdc_apply` runtime — is idle
+        // or competing for cores. Pull-based: callbacks read `Handle::metrics()` at scrape time.
+        let df = rt.datafusion();
+        let mut tokio_handles: Vec<(&'static str, Handle)> = Vec::new();
+        if let Some(h) = df.cpu_runtime() {
+            tokio_handles.push(("cpu", h.clone()));
+        }
+        if let Some(h) = df.refresh_runtime() {
+            tokio_handles.push(("refresh", h.clone()));
+        }
+        if let Some(h) = df.cdc_apply_runtime() {
+            tokio_handles.push(("cdc_apply", h.clone()));
+        }
+        if let Some(h) = df.compaction_runtime() {
+            tokio_handles.push(("compaction", h.clone()));
+        }
+        tokio_handles.push(("main", Handle::current()));
+        telemetry::register_tokio_runtime_metrics(tokio_handles);
     }
 
     let (tls_config, client_auth_mode) = tls::load_tls_config(
