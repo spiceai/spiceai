@@ -915,6 +915,14 @@ pub struct Query {
     /// one concurrent query (not unbounded).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_concurrent_queries: Option<usize>,
+
+    /// Prefer hash joins over sort-merge joins during physical planning. Maps to
+    /// `datafusion.optimizer.prefer_hash_join`; defaults to `true` (hash joins).
+    /// Set to `false` for very large analytical joins that would otherwise
+    /// exhaust the query memory pool: `HashJoinExec` build sides are not
+    /// spillable, whereas sort-merge joins spill to disk.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prefer_hash_join: Option<bool>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -1340,6 +1348,7 @@ mod tests {
                 memory_limit: Some("100MiB".to_string()),
                 target_partitions: None,
                 max_concurrent_queries: None,
+                prefer_hash_join: None,
             })
         );
 
@@ -1357,6 +1366,7 @@ mod tests {
                 memory_limit: Some("200MiB".to_string()),
                 target_partitions: None,
                 max_concurrent_queries: None,
+                prefer_hash_join: None,
             })
         );
 
@@ -1375,6 +1385,7 @@ mod tests {
                 memory_limit: Some("200MiB".to_string()),
                 target_partitions: None,
                 max_concurrent_queries: None,
+                prefer_hash_join: None,
             })
         );
 
@@ -1400,6 +1411,7 @@ mod tests {
                 memory_limit: None,
                 target_partitions: None,
                 max_concurrent_queries: None,
+                prefer_hash_join: None,
             })
         );
 
@@ -1417,6 +1429,7 @@ mod tests {
                 memory_limit: None,
                 target_partitions: None,
                 max_concurrent_queries: None,
+                prefer_hash_join: None,
             })
         );
 
@@ -1435,6 +1448,7 @@ mod tests {
                 memory_limit: None,
                 target_partitions: None,
                 max_concurrent_queries: None,
+                prefer_hash_join: None,
             })
         );
 

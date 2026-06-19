@@ -48,18 +48,20 @@ limitations under the License.
 //!    excluded — their semantics require the *absence* of a match, so sharing
 //!    the filter would drop rows the anti-join is supposed to preserve).
 //!
-//! 3. **Same-source large semi/anti sort-merge rewrite.** `DataFusion` does
-//!    not create dynamic filters for anti joins, and semi/anti joins with a
-//!    large same-source LEFT input can leave a large non-spillable
-//!    `HashJoinInput[N]` reservation behind.
-//!    [`CayenneAntiJoinSortMergeRewriter`] rewrites only same-source Cayenne
-//!    semi/anti `HashJoinExec` nodes to `SortMergeJoinExec` with explicit
-//!    spillable `SortExec` inputs. The gate is primarily the build side
-//!    exhausting a memory-pool fraction (`sort_merge_memory_pool_fraction`,
-//!    default 0.125 of `runtime.query.memory_limit`); when no memory pool is
-//!    wired through config it falls back to a 10M-row exact build-side count
-//!    (`sort_merge_min_rows`). Ordinary inner/outer joins stay with
-//!    `HashJoinExec` unless another optimizer rule supplies a more targeted win.
+//! 3. **Oversized hash-join sort-merge rewrite.** Any `HashJoinExec` build side
+//!    that is too big for the pool leaves a large non-spillable
+//!    `HashJoinInput[N]` reservation behind, and dynamic-filter pushdown only
+//!    shrinks the probe side, not that build-side table.
+//!    [`CayenneAntiJoinSortMergeRewriter`] rewrites such joins to
+//!    `SortMergeJoinExec` with explicit spillable `SortExec` inputs. When a
+//!    query memory pool is wired through config (the runtime always does this),
+//!    it covers any join type sort-merge supports — inner, outer, and semi/anti
+//!    — from any source, gated on the estimated build side exceeding its share
+//!    of the pool (the smaller of an absolute fraction and an even split across
+//!    all hash joins in the plan). With no pool configured it falls back to the
+//!    original conservative scope: same-source semi/anti joins above a 10M-row
+//!    exact build-side threshold. Joins carrying an embedded projection are left
+//!    alone and fall back to the `runtime.query.prefer_hash_join` knob.
 //!
 //! The ordinary inner-join probe side is handled by `DataFusion`'s *native*
 //! hash-join dynamic-filter pushdown. For inner joins (the only shape
@@ -200,15 +202,21 @@ impl std::fmt::Debug for CayenneDynamicFilterSharing {
     }
 }
 
-/// Rewrites same-source large Cayenne semi/anti joins from hash join to
-/// sort-merge join when the build side is large enough to risk OOM.
+/// Rewrites large Cayenne hash joins to sort-merge joins when the build side is
+/// large enough to risk exhausting the query memory pool.
 ///
-/// `DataFusion`'s `HashJoinExec` always materializes its left input as the
-/// non-spillable build side regardless of join type. For wide semi/anti-join
-/// decorrelations, that build side can be a large multi-way result. Sort-merge
-/// preserves those semi/anti semantics while keeping the build side spillable;
-/// ordinary inner/outer joins are left alone because their hash join can still
-/// be the faster plan.
+/// `DataFusion`'s `HashJoinExec` always materializes its left input as a
+/// non-spillable build-side hash table, regardless of join type, so a build
+/// side too big for the pool fails the query outright. When a query memory pool
+/// is wired through config (the runtime always does this), any join type that
+/// sort-merge supports — inner, left/right/full outer, and semi/anti — whose
+/// estimated build side would not fit its share of the pool is rewritten to a
+/// `SortMergeJoinExec` with spillable `SortExec` inputs. Smaller joins, and
+/// (when no pool is configured) everything but same-source semi/anti joins, are
+/// left as hash joins because that is usually the faster plan. Joins that carry
+/// an embedded output projection are also left alone — `HashJoinExec` exposes
+/// no accessor to reconstruct the projection onto a sort-merge join — and fall
+/// back to the deterministic `runtime.query.prefer_hash_join` knob.
 #[derive(Default)]
 pub struct CayenneAntiJoinSortMergeRewriter;
 
@@ -275,12 +283,17 @@ impl PhysicalOptimizerRule for CayenneAntiJoinSortMergeRewriter {
         plan: Arc<dyn ExecutionPlan>,
         config: &ConfigOptions,
     ) -> Result<Arc<dyn ExecutionPlan>, DataFusionError> {
+        // The fair-share memory gate divides the pool across every hash join in
+        // the plan, so count them once up front (the original plan's join count
+        // is the concurrency pressure we are budgeting against).
+        let hash_join_count = count_hash_joins(&plan);
         plan.transform_down(|node| {
             let Some(hash_join) = node.downcast_ref::<HashJoinExec>() else {
                 return Ok(Transformed::no(node));
             };
 
-            let Some(sort_merge_join) = try_rewrite_large_same_source_join(hash_join, config)?
+            let Some(sort_merge_join) =
+                try_rewrite_oversized_join(hash_join, config, hash_join_count)?
             else {
                 return Ok(Transformed::no(node));
             };
@@ -549,67 +562,109 @@ fn filter_additions_for_join(
     (left_additions, right_additions)
 }
 
-fn try_rewrite_large_same_source_join(
+fn try_rewrite_oversized_join(
     hash_join: &HashJoinExec,
     config: &ConfigOptions,
+    hash_join_count: usize,
 ) -> Result<Option<Arc<dyn ExecutionPlan>>, DataFusionError> {
-    // Semi/anti joins are the clear-win target: `HashJoinExec` builds the LEFT
-    // input into a non-spillable hash table, while these joins do not have the
-    // same dynamic-filter fallback as ordinary inner joins.
+    // `SortMergeJoinExec` supports these join types with spillable, explicitly
+    // sorted inputs. Inner and outer joins are included here (unlike the legacy
+    // path below) because a large inner/outer build side is just as
+    // non-spillable as a semi/anti one — `HashJoinExec`'s dynamic-filter
+    // pushdown shrinks the *probe* side, not the build-side hash table that
+    // actually exhausts the pool.
     if !matches!(
         hash_join.join_type(),
-        JoinType::LeftAnti | JoinType::RightAnti | JoinType::LeftSemi | JoinType::RightSemi,
+        JoinType::Inner
+            | JoinType::Left
+            | JoinType::Right
+            | JoinType::Full
+            | JoinType::LeftSemi
+            | JoinType::RightSemi
+            | JoinType::LeftAnti
+            | JoinType::RightAnti,
     ) {
         return Ok(None);
     }
 
+    // Sorted-merge inputs rely on the default null-comparison semantics.
     if hash_join.null_equality() != NullEquality::NullEqualsNothing {
         return Ok(None);
     }
 
+    // `SortMergeJoinExec` carries no embedded output projection and
+    // `HashJoinExec` exposes no accessor to read one back, so a projected join
+    // cannot be rewritten without changing the output schema; leave it to the
+    // deterministic `runtime.query.prefer_hash_join` knob.
     if hash_join.contains_projection() || hash_join.on().is_empty() {
         return Ok(None);
     }
 
-    if !has_single_same_source_pair_for_all_join_keys(hash_join) {
-        return Ok(None);
-    }
-
-    let Some(build_row_count) = spillable_rewrite_build_input_exact_rows(hash_join) else {
-        return Ok(None);
-    };
     let optimizer_config = cayenne_optimizer_config(config);
-    let row_count_threshold = optimizer_config.sort_merge_min_rows;
-    let row_gate_passes = build_row_count > row_count_threshold;
     let memory_gate_bytes = sort_merge_memory_gate_bytes(&optimizer_config);
 
-    // When a memory gate is configured, it's the *primary* signal — the row gate
-    // becomes irrelevant unless the byte estimate is unavailable. This lets the
-    // rule catch wide-row builds whose row count is well below the row
-    // threshold but whose materialised hash
-    // table would still exhaust the memory pool. When the gate is *inactive*
-    // (no memory pool wired through config — direct DataFusion users), fall back
-    // to the row-count threshold alone.
-    let estimated_build_bytes = match memory_gate_bytes {
-        Some(_) => build_side_memory_estimate(hash_join.left().as_ref(), build_row_count),
-        None => None,
-    };
-    let should_rewrite = match (memory_gate_bytes, estimated_build_bytes) {
-        // Memory gate active + byte estimate available — byte gate alone decides.
-        (Some(gate_bytes), Some(bytes)) => bytes > gate_bytes,
-        // Memory gate active but no byte estimate, or no gate configured — fall back to row gate.
-        (Some(_), None) | (None, _) => row_gate_passes,
-    };
+    let should_rewrite = if let Some(gate_bytes) = memory_gate_bytes {
+        // General memory-gated path — the live path in production, where the
+        // runtime always wires a pool. Any supported join type, from any source,
+        // is eligible when its estimated build side would not fit its share of
+        // the pool. Build-side row counts may be inexact here: a build side that
+        // is itself a join result rarely carries exact statistics, and an
+        // inexact estimate is enough to choose spilling over an OOM.
+        if !join_touches_cayenne(hash_join) {
+            return Ok(None);
+        }
+        let Some(build_row_count) = build_input_row_estimate(hash_join) else {
+            return Ok(None);
+        };
+        let Some(estimated_build_bytes) =
+            build_side_memory_estimate(hash_join.left().as_ref(), build_row_count)
+        else {
+            return Ok(None);
+        };
 
-    if !should_rewrite {
+        // Per-join budget: the smaller of the absolute pool fraction and an even
+        // share of the pool across every hash join in the plan. A wide query
+        // such as TPC-DS q78 keeps many build sides alive at once, each below
+        // the absolute fraction yet summing past the pool; the fair-share term
+        // catches that, while a lone large join still gets the full fraction.
+        let fair_share = optimizer_config
+            .sort_merge_memory_pool_bytes
+            .map_or(gate_bytes, |pool_bytes| pool_bytes / hash_join_count.max(1));
+        let effective_gate = gate_bytes.min(fair_share);
+        let fire = estimated_build_bytes > effective_gate;
+
         tracing::debug!(
             join_type = ?hash_join.join_type(),
             build_row_count,
-            row_count_threshold,
             estimated_build_bytes,
-            memory_gate_bytes,
-            "Keeping same-source Cayenne HashJoinExec because neither row nor byte gate fires"
+            gate_bytes,
+            fair_share,
+            effective_gate,
+            hash_join_count,
+            fire,
+            "Evaluated Cayenne oversized-join memory gate"
         );
+        fire
+    } else {
+        // Legacy row-count fallback for direct `DataFusion` users with no memory
+        // pool wired through config. Preserve the original conservative scope:
+        // same-source semi/anti joins with an exact, large build side.
+        if !matches!(
+            hash_join.join_type(),
+            JoinType::LeftAnti | JoinType::RightAnti | JoinType::LeftSemi | JoinType::RightSemi,
+        ) {
+            return Ok(None);
+        }
+        if !has_single_same_source_pair_for_all_join_keys(hash_join) {
+            return Ok(None);
+        }
+        let Some(build_row_count) = spillable_rewrite_build_input_exact_rows(hash_join) else {
+            return Ok(None);
+        };
+        build_row_count > optimizer_config.sort_merge_min_rows
+    };
+
+    if !should_rewrite {
         return Ok(None);
     }
 
@@ -650,14 +705,48 @@ fn try_rewrite_large_same_source_join(
 
     tracing::debug!(
         join_type = ?hash_join.join_type(),
-        build_row_count,
-        row_count_threshold,
-        estimated_build_bytes,
-        memory_gate_bytes,
-        "Replacing large same-source Cayenne HashJoinExec with SortMergeJoinExec"
+        "Replaced large Cayenne HashJoinExec with spillable SortMergeJoinExec"
     );
 
     Ok(Some(Arc::new(join)))
+}
+
+/// Build-side (LEFT input) row count for the spillable rewrite, accepting an
+/// inexact estimate. Returns `None` only when statistics are entirely absent.
+/// Deep build sides (a join result feeding another join) rarely have exact
+/// statistics, so requiring `Precision::Exact` would skip exactly the wide
+/// multi-way joins this rewrite targets.
+fn build_input_row_estimate(hash_join: &HashJoinExec) -> Option<usize> {
+    match hash_join.left().partition_statistics(None).ok()?.num_rows {
+        Precision::Exact(row_count) | Precision::Inexact(row_count) => Some(row_count),
+        Precision::Absent => None,
+    }
+}
+
+/// Whether either side of the join reads Cayenne-accelerated data. Keeps the
+/// memory-gated rewrite scoped to Cayenne query plans without the restrictive
+/// same-source join-key pairing required by the legacy semi/anti path.
+fn join_touches_cayenne(hash_join: &HashJoinExec) -> bool {
+    !collect_cayenne_scans(hash_join.left()).is_empty()
+        || !collect_cayenne_scans(hash_join.right()).is_empty()
+}
+
+/// Count the `HashJoinExec` nodes in a plan. Used to size each join's fair
+/// share of the query memory pool: many concurrent build sides, each within the
+/// absolute fraction, can still sum past the pool.
+fn count_hash_joins(plan: &Arc<dyn ExecutionPlan>) -> usize {
+    let mut count = 0;
+    count_hash_joins_inner(plan, &mut count);
+    count
+}
+
+fn count_hash_joins_inner(plan: &Arc<dyn ExecutionPlan>, count: &mut usize) {
+    if plan.downcast_ref::<HashJoinExec>().is_some() {
+        *count += 1;
+    }
+    for child in plan.children() {
+        count_hash_joins_inner(child, count);
+    }
 }
 
 fn cayenne_optimizer_config(config: &ConfigOptions) -> CayenneOptimizerConfig {
@@ -2549,5 +2638,206 @@ mod tests {
             filters.iter().any(|f| f.columns().contains("order_id")),
             "the planted dynamic filter should reference the equi-join key column"
         );
+    }
+
+    /// q78-style: a large *inner* hash join whose non-spillable build side would
+    /// exhaust the pool is rewritten to a spillable sort-merge join. The legacy
+    /// semi/anti gate skipped inner joins entirely.
+    #[test]
+    fn rewrites_large_inner_hash_join_under_memory_gate() {
+        let schema = order_line_schema();
+        let left = large_exact_cayenne_file_exec(&schema, "order_line.vortex");
+        let right = large_exact_cayenne_file_exec(&schema, "store_sales.vortex");
+        let join = Arc::new(hash_join_with_join_type(
+            left,
+            right,
+            "order_id",
+            "order_id",
+            JoinType::Inner,
+            NullEquality::NullEqualsNothing,
+        ));
+        // 64 MiB pool × 0.125 = 8 MiB gate; the ~240 MB build is far above it.
+        let config = config_with_cayenne_optimizer(None, Some(0.125), Some(64 * 1024 * 1024));
+
+        let optimized = optimize_anti_join_sort_merge_with_config(join, &config);
+
+        assert!(
+            optimized.downcast_ref::<SortMergeJoinExec>().is_some(),
+            "a large inner hash join over the memory gate should become a sort-merge join"
+        );
+    }
+
+    /// q97-style: a large *full outer* join is rewritten too.
+    #[test]
+    fn rewrites_large_full_outer_hash_join_under_memory_gate() {
+        let schema = order_line_schema();
+        let left = large_exact_cayenne_file_exec(&schema, "store_sales.vortex");
+        let right = large_exact_cayenne_file_exec(&schema, "catalog_sales.vortex");
+        let join = Arc::new(hash_join_with_join_type(
+            left,
+            right,
+            "order_id",
+            "order_id",
+            JoinType::Full,
+            NullEquality::NullEqualsNothing,
+        ));
+        let config = config_with_cayenne_optimizer(None, Some(0.125), Some(64 * 1024 * 1024));
+
+        let optimized = optimize_anti_join_sort_merge_with_config(join, &config);
+
+        assert!(
+            optimized.downcast_ref::<SortMergeJoinExec>().is_some(),
+            "a large full-outer hash join over the memory gate should become a sort-merge join"
+        );
+    }
+
+    /// The build side of a deep join is rarely `Precision::Exact`; the memory
+    /// gate must still fire on an inexact estimate (the legacy path requires
+    /// exact rows and would skip this — the key q78 enabler).
+    #[test]
+    fn rewrites_inexact_build_inner_hash_join_under_memory_gate() {
+        let schema = order_line_schema();
+        let left = cayenne_file_exec_with_num_rows(
+            &schema,
+            "order_line.vortex",
+            Precision::Inexact(ANTI_JOIN_SORT_MERGE_MIN_EXACT_ROWS + 1),
+        );
+        let right = large_exact_cayenne_file_exec(&schema, "store_sales.vortex");
+        let join = Arc::new(hash_join_with_join_type(
+            left,
+            right,
+            "order_id",
+            "order_id",
+            JoinType::Inner,
+            NullEquality::NullEqualsNothing,
+        ));
+        let config = config_with_cayenne_optimizer(None, Some(0.125), Some(64 * 1024 * 1024));
+
+        let optimized = optimize_anti_join_sort_merge_with_config(join, &config);
+
+        assert!(
+            optimized.downcast_ref::<SortMergeJoinExec>().is_some(),
+            "an inexact-but-large inner build side should still be rewritten under the memory gate"
+        );
+    }
+
+    /// The memory-gated path no longer requires both sides to share a Cayenne
+    /// source; cross-table joins (the common analytical case) are eligible.
+    #[test]
+    fn rewrites_unrelated_inner_hash_join_under_memory_gate() {
+        let schema = order_line_schema();
+        let left = large_exact_cayenne_file_exec(&schema, "order_line.vortex");
+        let right = large_exact_cayenne_file_exec(&schema, "other_order_line.vortex");
+        let join = Arc::new(hash_join_with_join_type(
+            left,
+            right,
+            "order_id",
+            "order_id",
+            JoinType::Inner,
+            NullEquality::NullEqualsNothing,
+        ));
+        let config = config_with_cayenne_optimizer(None, Some(0.125), Some(64 * 1024 * 1024));
+
+        let optimized = optimize_anti_join_sort_merge_with_config(join, &config);
+
+        assert!(
+            optimized.downcast_ref::<SortMergeJoinExec>().is_some(),
+            "different-source inner joins are eligible under the memory gate"
+        );
+    }
+
+    /// Stays scoped to Cayenne plans: a large join with no Cayenne scan on
+    /// either side is left to the `prefer_hash_join` knob, not this rewriter.
+    #[test]
+    fn leaves_non_cayenne_inner_hash_join_under_memory_gate_unchanged() {
+        let schema = order_line_schema();
+        let big = || {
+            file_exec_with_statistics(
+                &schema,
+                "external.parquet",
+                None,
+                Statistics::new_unknown(&schema)
+                    .with_num_rows(Precision::Exact(ANTI_JOIN_SORT_MERGE_MIN_EXACT_ROWS + 1)),
+            )
+        };
+        let join = Arc::new(hash_join_with_join_type(
+            big(),
+            big(),
+            "order_id",
+            "order_id",
+            JoinType::Inner,
+            NullEquality::NullEqualsNothing,
+        ));
+        let config = config_with_cayenne_optimizer(None, Some(0.125), Some(64 * 1024 * 1024));
+
+        let optimized = optimize_anti_join_sort_merge_with_config(join, &config);
+
+        assert!(
+            optimized.downcast_ref::<HashJoinExec>().is_some(),
+            "non-Cayenne joins are left to the prefer_hash_join knob, not the Cayenne rewriter"
+        );
+    }
+
+    /// A single inner join whose build side fits the absolute pool fraction
+    /// stays a hash join...
+    #[test]
+    fn leaves_single_inner_hash_join_within_pool_fraction() {
+        let schema = order_line_schema();
+        let join = Arc::new(hash_join_with_join_type(
+            large_exact_cayenne_file_exec(&schema, "a.vortex"),
+            large_exact_cayenne_file_exec(&schema, "b.vortex"),
+            "order_id",
+            "order_id",
+            JoinType::Inner,
+            NullEquality::NullEqualsNothing,
+        ));
+        // ~240 MB build < 0.9 × 400 MiB ≈ 360 MiB gate, and below the full pool.
+        let config = config_with_cayenne_optimizer(None, Some(0.9), Some(400 * 1024 * 1024));
+
+        let optimized = optimize_anti_join_sort_merge_with_config(join, &config);
+
+        assert!(
+            optimized.downcast_ref::<HashJoinExec>().is_some(),
+            "a lone inner join within the pool fraction should stay a hash join"
+        );
+    }
+
+    /// ...but two such joins, each within the absolute fraction, exceed their
+    /// fair share of the pool and are both rewritten (the q78 sum-of-build-sides
+    /// failure mode that a single-join gate misses).
+    #[test]
+    fn rewrites_concurrent_inner_hash_joins_exceeding_fair_share() {
+        let schema = order_line_schema();
+        let make_join = |a: &str, b: &str| {
+            Arc::new(hash_join_with_join_type(
+                large_exact_cayenne_file_exec(&schema, a),
+                large_exact_cayenne_file_exec(&schema, b),
+                "order_id",
+                "order_id",
+                JoinType::Inner,
+                NullEquality::NullEqualsNothing,
+            )) as Arc<dyn ExecutionPlan>
+        };
+        let plan = UnionExec::try_new(vec![
+            make_join("a.vortex", "b.vortex"),
+            make_join("c.vortex", "d.vortex"),
+        ])
+        .expect("union of two same-schema joins should be valid");
+        // Same 0.9 × 400 MiB config: each ~240 MB build is under the ~360 MiB
+        // absolute gate but over its 200 MiB fair share (pool / 2 joins).
+        let config = config_with_cayenne_optimizer(None, Some(0.9), Some(400 * 1024 * 1024));
+
+        let optimized = optimize_anti_join_sort_merge_with_config(plan, &config);
+
+        let union = optimized
+            .downcast_ref::<UnionExec>()
+            .expect("top node should remain a union");
+        assert_eq!(union.children().len(), 2, "union should keep both joins");
+        for child in union.children() {
+            assert!(
+                child.downcast_ref::<SortMergeJoinExec>().is_some(),
+                "each concurrent inner join should be rewritten to sort-merge under fair-share"
+            );
+        }
     }
 }
