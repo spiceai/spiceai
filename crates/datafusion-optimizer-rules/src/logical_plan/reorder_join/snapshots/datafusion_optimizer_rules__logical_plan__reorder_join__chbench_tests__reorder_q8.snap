@@ -8,9 +8,9 @@ Sort: l_year ASC NULLS LAST
       Projection: order_line.ol_amount, oorder.o_entry_d, n2.n_name
         Inner Join: supplier.su_nationkey = n2.n_nationkey
           Projection: oorder.o_entry_d, order_line.ol_amount, supplier.su_nationkey
-            Inner Join: stock.s_i_id = item.i_id, order_line.ol_i_id = item.i_id
-              Projection: oorder.o_entry_d, order_line.ol_i_id, order_line.ol_amount, stock.s_i_id, supplier.su_nationkey
-                Inner Join: mod(stock.s_w_id * stock.s_i_id, Int64(10000)) = supplier.su_suppkey
+            Inner Join: mod(stock.s_w_id * stock.s_i_id, Int64(10000)) = supplier.su_suppkey
+              Projection: oorder.o_entry_d, order_line.ol_amount, stock.s_w_id, stock.s_i_id
+                Inner Join: stock.s_i_id = item.i_id, order_line.ol_i_id = item.i_id
                   Projection: oorder.o_entry_d, order_line.ol_i_id, order_line.ol_amount, stock.s_w_id, stock.s_i_id
                     Inner Join: order_line.ol_i_id = stock.s_i_id, order_line.ol_supply_w_id = stock.s_w_id
                       Projection: oorder.o_entry_d, order_line.ol_i_id, order_line.ol_supply_w_id, order_line.ol_amount
@@ -32,9 +32,9 @@ Sort: l_year ASC NULLS LAST
                             TableScan: order_line projection=[ol_o_id, ol_w_id, ol_d_id, ol_i_id, ol_supply_w_id, ol_amount]
                       Filter: stock.s_i_id < Int64(1000)
                         TableScan: stock projection=[s_w_id, s_i_id]
-                  TableScan: supplier projection=[su_suppkey, su_nationkey]
-              Projection: item.i_id
-                Filter: item.i_data LIKE Utf8("%b")
-                  TableScan: item projection=[i_id, i_data]
+                  Projection: item.i_id
+                    Filter: item.i_data LIKE Utf8("%b") AND item.i_id < Int64(1000)
+                      TableScan: item projection=[i_id, i_data]
+              TableScan: supplier projection=[su_suppkey, su_nationkey]
           SubqueryAlias: n2
             TableScan: nation projection=[n_nationkey, n_name]

@@ -126,7 +126,6 @@ pub static DEFAULT_DATAFUSION_CONFIG: LazyLock<RwLock<SessionConfig>> = LazyLock
         .enable_ident_normalization = false;
 
     df_config.options_mut().optimizer.expand_views_at_output = true;
-    // df_config.options_mut().explain.show_statistics = true;
     df_config.options_mut().sql_parser.dialect = datafusion::common::config::Dialect::PostgreSQL;
     df_config
         .options_mut()
@@ -1155,33 +1154,23 @@ fn insert_cayenne_push_down_semi_join(rules: &mut Vec<Arc<dyn OptimizerRule + Se
 
 #[cfg(not(windows))]
 fn insert_cayenne_join_reorder_rule(rules: &mut Vec<Arc<dyn OptimizerRule + Send + Sync>>) {
-    // Cost-based left-deep join reordering (IK84). Run *after* the inner-join
-    // graph is fully formed — equi-predicates extracted and cross joins
-    // reassociated into a contiguous Inner-join chain — but *before* projection
-    // pushdown (`optimize_projections`) inserts intervening Projections that
-    // fragment the graph into opaque leaves. The rule is best-effort: it reads
-    // table statistics via `TableProvider::statistics()` (which Cayenne
-    // accelerated providers implement) and silently leaves the plan unchanged
-    // when stats are unavailable, so it never fails a query.
+    // Cost-based left-deep join reordering (IK84). It must run *after* the
+    // inner-join graph is fully formed AND base-table predicates are pushed to
+    // the scans — equi-predicates extracted, cross joins reassociated into a
+    // contiguous Inner-join chain, and `push_down_filter` applied so the cost
+    // model can credit `TableScan.filters` for scan selectivity — but *before*
+    // projection pushdown (`optimize_projections`) inserts intervening
+    // Projections that fragment the graph into opaque leaves.
     if !rules.iter().any(|rule| rule.name() == "reorder_join") {
-        let insert_at = rules
-            .iter()
-            .position(|rule| rule.name() == "cayenne_reassociate_cross_join")
-            .map(|position| position + 1)
-            .or_else(|| {
-                rules
-                    .iter()
-                    .position(|rule| rule.name() == "eliminate_cross_join")
-                    .map(|position| position + 1)
-            })
-            .or_else(|| {
-                // After `push_down_filter`: the cost model credits pushed-down `TableScan.filters` for scan selectivity
-                rules
-                    .iter()
-                    .position(|rule| rule.name() == "push_down_filter")
-                    .map(|position| position + 1)
-            })
-            .unwrap_or(rules.len());
+        let insert_at = [
+            "push_down_filter",
+            "cayenne_reassociate_cross_join",
+            "eliminate_cross_join",
+        ]
+        .iter()
+        .filter_map(|name| rules.iter().position(|rule| rule.name() == *name))
+        .max()
+        .map_or(rules.len(), |position| position + 1);
         rules.insert(insert_at, Arc::new(ReorderJoinRule::default()));
     }
 }
@@ -2220,6 +2209,22 @@ mod tests {
         assert!(
             reassociate_position < push_down_position,
             "Cayenne cross join reassociation must run before push_down_filter consumes the join tree shape"
+        );
+        let reorder_position = rule_names
+            .iter()
+            .position(|name| *name == "reorder_join")
+            .expect("reorder_join rule should be registered (join_reorder is on by default)");
+        let optimize_projections_position = rule_names
+            .iter()
+            .position(|name| *name == "optimize_projections")
+            .expect("DataFusion optimize_projections rule should be registered");
+        assert!(
+            push_down_position < reorder_position,
+            "reorder_join must run AFTER push_down_filter so TableScan.filters are populated for cost-based join reordering"
+        );
+        assert!(
+            reorder_position < optimize_projections_position,
+            "reorder_join must run BEFORE optimize_projections, which inserts Projections between joins that fragment the reorderable join graph into opaque leaves"
         );
         assert_eq!(
             rule_names

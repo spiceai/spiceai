@@ -39,9 +39,9 @@ pub enum ReorderOutcome {
     /// enumeration reproduced the input (already optimal or no reorderable island).
     Completed(Transformed<LogicalPlan>),
     /// The rule could not apply a reorder to this plan — either graph build /
-    /// enumeration errored, or the reconstruction was rejected by a safety check
-    /// (unresolved join keys, or a newly-introduced cross join). The original
-    /// plan is returned
+    /// enumeration errored, or the reconstruction was rejected by the
+    /// `join_keys_resolve` safety check (unresolved join keys). The original
+    /// plan is returned.
     Failed {
         plan: LogicalPlan,
         error: DataFusionError,
@@ -113,42 +113,31 @@ pub fn optimal_left_deep_join_plan(
         }
     };
 
-    // Validate the reconstruction before accepting it:
-    //   1. Every join `on` key must resolve in its own input's schema. A
-    //      reconstruction bug that drops an inner edge can emit a
-    //      structurally-invalid plan that fails a *downstream* rule (e.g. "No
-    //      field named …").
-    //   2. It must introduce no new cross product (Inner `Join` with empty
-    //      `on`). A relation linked to the rest only by a non-equi predicate
-    //      gets stranded and reconnected with a bare cross join, which a
-    //      downstream pass turns into a `NestedLoopJoinExec` that can blow up
-    //      over large inputs. Falling back to the native plan is safer.
-    let cross_joins_before = count_inner_cross_joins(&original);
-    let cross_joins_after = count_inner_cross_joins(&reordered);
-    let rejection = if !join_keys_resolve(&reordered) {
-        Some(plan_datafusion_err!(
-            "reordered plan has unresolved join keys (reconstruction dropped an equi-edge)"
-        ))
-    } else if cross_joins_after > cross_joins_before {
-        Some(plan_datafusion_err!(
-            "reorder introduced a cross join (a relation linked only by a non-equi predicate was \
-             stranded; cross joins {cross_joins_before} -> {cross_joins_after})"
-        ))
-    } else {
-        None
-    };
-    if let Some(error) = rejection {
-        return ReorderOutcome::Failed {
-            plan: original,
-            error,
-        };
-    }
-
     // Deterministic enumeration can reproduce the input order (e.g. an
     // already-optimal plan); report that as a no-op so the optimizer converges.
     if reordered == original {
         return ReorderOutcome::Completed(Transformed::no(original));
     }
+
+    // Validate the reconstruction before accepting it: every join `on` key must
+    // resolve in its own input's schema. A reconstruction bug that drops or
+    // mis-orients an edge can emit a structurally-invalid plan that `rewrite()`
+    // accepts but a *downstream* rule then fails (e.g. "No field named …"); fall
+    // back to native instead.
+    //
+    // (A former "introduced a new cross join" check was removed: a connected
+    // graph plus the greedy connectivity-respecting reconstruction can never emit
+    // a new empty-`on` join, and disconnected graphs are already rejected by
+    // `is_connected()` in `build_reordered_plan` — so it could never fire.)
+    if !join_keys_resolve(&reordered) {
+        return ReorderOutcome::Failed {
+            plan: original,
+            error: plan_datafusion_err!(
+                "reordered plan has unresolved join keys (reconstruction dropped or mis-oriented an equi-edge)"
+            ),
+        };
+    }
+
     ReorderOutcome::Completed(Transformed::yes(reordered))
 }
 
@@ -243,27 +232,6 @@ fn join_keys_resolve(plan: &LogicalPlan) -> bool {
         }
     }
     plan.inputs().iter().all(|input| join_keys_resolve(input))
-}
-
-/// Counts *true* cross products — Inner `Join` nodes with an empty `on` clause
-/// **and** no `filter` — in `plan`. The reorder is rejected when it produces
-/// *more* of these than the input had: a relation the enumerator could only
-/// link by a non-equi predicate gets reconnected with a bare cross join, which
-/// a downstream pass turns into a `NestedLoopJoinExec` that can blow up to a
-/// near-cartesian over large inputs.
-fn count_inner_cross_joins(plan: &LogicalPlan) -> usize {
-    let here = usize::from(matches!(
-        plan,
-        LogicalPlan::Join(join)
-            if join.join_type == JoinType::Inner
-                && join.on.is_empty()
-                && join.filter.is_none()
-    ));
-    here + plan
-        .inputs()
-        .iter()
-        .map(|input| count_inner_cross_joins(input))
-        .sum::<usize>()
 }
 
 /// Generates an optimized linear join plan from a query graph using the Ibaraki-Kameda algorithm.
