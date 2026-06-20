@@ -68,14 +68,17 @@ limitations under the License.
 
 use std::sync::Arc;
 
-use datafusion_common::{Result, tree_node::Transformed};
-use datafusion_expr::{JoinType, LogicalPlan};
+use datafusion_common::{
+    Result,
+    tree_node::{Transformed, TreeNode},
+};
+use datafusion_expr::LogicalPlan;
 
 use datafusion::optimizer::{OptimizerConfig, OptimizerRule};
 
 use super::{
     cost::{DefaultCostEstimator, JoinCostEstimator},
-    left_deep_join_plan::optimal_left_deep_join_plan,
+    left_deep_join_plan::{ReorderOutcome, optimal_left_deep_join_plan},
 };
 
 /// Optimizer-rule wrapper around [`optimal_left_deep_join_plan`].
@@ -113,131 +116,47 @@ impl OptimizerRule for ReorderJoinRule {
         plan: LogicalPlan,
         _config: &dyn OptimizerConfig,
     ) -> Result<Transformed<LogicalPlan>> {
-        let before = plan.clone();
-        tracing::debug!(
-            joins = count_joins(&before),
-            cross_joins = count_inner_cross_joins(&before),
-            "reorder_join rule invoked"
-        );
-        // Join reordering is strictly best-effort: spiceai does NOT guarantee
-        // every `TableProvider` exposes statistics (the default `statistics()`
-        // returns `None`; in such case we trace debug message and pass the original
-        // plan through unchanged (no reorder).
-        match optimal_left_deep_join_plan(plan, self.estimator.as_ref()) {
-            // IK84 is deterministic on a stable graph, so a second pass over an
-            // already-optimal plan reproduces the same chain; converge by
-            // reporting no change.
-            Ok(after) if after == before => {
-                tracing::debug!(
-                    "reorder_join: no change (already optimal or no reorderable joins)"
-                );
-                Ok(Transformed::no(after))
-            }
-            // Accept the reorder only if it passes two checks:
-            //   1. Every join `on` key resolves in its own input's schema. A
-            //      reconstruction bug that drops an inner edge can emit a
-            //      structurally-invalid plan whose `rewrite()` succeeds but then
-            //      fails a *downstream* rule (e.g. "No field named …").
-            //   2. It introduces no new cross product (Inner `Join` with empty
-            //      `on`). The enumerator only sees equi-edges, so a relation
-            //      linked to the rest solely by a non-equi predicate gets
-            //      stranded and reconnected with a bare cross join, which a
-            //      downstream pass turns into a `NestedLoopJoinExec` that can
-            //      blow up over large inputs. The native plan keeps such
-            //      relations adjacent and applies the predicate as a residual
-            //      `Filter` on an equi-join, so falling back to it is safer.
-            // Either failure → skip the reorder rather than break/hang the query.
-            Ok(after)
-                if join_keys_resolve(&after)
-                    && count_inner_cross_joins(&after) <= count_inner_cross_joins(&before) =>
-            {
-                tracing::debug!(
-                    cross_joins = count_inner_cross_joins(&after),
-                    "reorder_join applied (join order changed)"
-                );
-                Ok(Transformed::yes(after))
-            }
-            Ok(after) => {
-                // The rule produced a reordered plan but it failed one of the
-                // checks above, so fall back to the native plan. This is a
-                // genuine miss — the graph was reorderable but the
-                // reconstruction came out invalid — so warn rather than debug.
-                let reason = if join_keys_resolve(&after) {
-                    "reorder introduced a cross join (a relation linked only by a non-equi predicate was stranded)"
-                } else {
-                    "reordered plan has unresolved join keys (reconstruction dropped an equi-edge)"
-                };
-                tracing::warn!(
-                    reason,
-                    cross_joins_before = count_inner_cross_joins(&before),
-                    cross_joins_after = count_inner_cross_joins(&after),
-                    "unable to apply join reorder; falling back to native plan (plan left unchanged)"
-                );
-                Ok(Transformed::no(before))
-            }
-            Err(e) => {
-                tracing::debug!("skipping join reorder (plan left unchanged): {e}");
-                Ok(Transformed::no(before))
-            }
+        let start = std::time::Instant::now();
+
+        // No joins anywhere in the plan: nothing to reorder. Returning the input unchanged.
+        if !plan.exists(|p| Ok(matches!(p, LogicalPlan::Join(_))))? {
+            tracing::debug!(
+                elapsed = ?start.elapsed(),
+                "reorder_join: skipped (no joins in plan)"
+            );
+            return Ok(Transformed::no(plan));
         }
+
+        // Join reordering is strictly best-effort and infallible: spiceai does
+        // not guarantee every `TableProvider` exposes statistics, so a query is
+        // never failed for being un-costable — it simply isn't reordered.
+        Ok(
+            match optimal_left_deep_join_plan(plan, self.estimator.as_ref()) {
+                ReorderOutcome::Completed(transformed) => {
+                    if transformed.transformed {
+                        tracing::debug!(
+                            elapsed = ?start.elapsed(),
+                            "reorder_join applied (join order changed)"
+                        );
+                    } else {
+                        tracing::debug!(
+                            elapsed = ?start.elapsed(),
+                            "reorder_join: no change (already optimal or no reorderable joins)"
+                        );
+                    }
+                    transformed
+                }
+                // Every failure here is a plan the optimizer couldn't process (a
+                // rejected reconstruction or an internal error)
+                ReorderOutcome::Failed { plan, error } => {
+                    tracing::warn!(
+                        error = %error,
+                        elapsed = ?start.elapsed(),
+                        "unable to apply join reorder; plan left unchanged"
+                    );
+                    Transformed::no(plan)
+                }
+            },
+        )
     }
-}
-
-/// Returns `false` if any `Join` in `plan` has an `on` key that does not resolve
-/// in its corresponding input schema — i.e. the reconstruction produced a
-/// structurally-invalid plan. Used as a safety gate so a reorder bug degrades to
-/// "no reorder" instead of a failed query.
-fn join_keys_resolve(plan: &LogicalPlan) -> bool {
-    if let LogicalPlan::Join(join) = plan {
-        let left_schema = join.left.schema();
-        let right_schema = join.right.schema();
-        for (left_key, right_key) in &join.on {
-            if left_key
-                .column_refs()
-                .iter()
-                .any(|col| !left_schema.has_column(col))
-                || right_key
-                    .column_refs()
-                    .iter()
-                    .any(|col| !right_schema.has_column(col))
-            {
-                return false;
-            }
-        }
-    }
-    plan.inputs().iter().all(|input| join_keys_resolve(input))
-}
-
-/// Total number of `Join` nodes anywhere in `plan` (any join type). Used only
-/// for the entry debug trace, to distinguish a no-op invocation on a join-free
-/// plan from a real reorder candidate.
-fn count_joins(plan: &LogicalPlan) -> usize {
-    let here = usize::from(matches!(plan, LogicalPlan::Join(_)));
-    here + plan
-        .inputs()
-        .iter()
-        .map(|input| count_joins(input))
-        .sum::<usize>()
-}
-
-/// Counts *true* cross products — Inner `Join` nodes with an empty `on` clause
-/// **and** no `filter` — in `plan`. The reorder is rejected when it produces
-/// *more* of these than the input had: a relation the enumerator could only
-/// link by a non-equi predicate gets reconnected with a bare cross join, which
-/// a downstream pass turns into a `NestedLoopJoinExec` that can blow up to a
-/// near-cartesian over large inputs. See the call site.
-fn count_inner_cross_joins(plan: &LogicalPlan) -> usize {
-    let here = match plan {
-        LogicalPlan::Join(join)
-            if join.join_type == JoinType::Inner && join.on.is_empty() && join.filter.is_none() =>
-        {
-            1
-        }
-        _ => 0,
-    };
-    here + plan
-        .inputs()
-        .iter()
-        .map(|input| count_inner_cross_joins(input))
-        .sum::<usize>()
 }

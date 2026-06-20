@@ -6,8 +6,7 @@ Sort: revenue DESC NULLS FIRST
   Projection: customer.c_id, customer.c_last, sum(order_line.ol_amount) AS revenue, customer.c_city, customer.c_phone, nation.n_name
     Aggregate: groupBy=[[customer.c_id, customer.c_last, customer.c_city, customer.c_phone, nation.n_name]], aggr=[[sum(order_line.ol_amount)]]
       Projection: nation.n_name, customer.c_id, customer.c_last, customer.c_city, customer.c_phone, order_line.ol_amount
-        Inner Join: order_line.ol_w_id = oorder.o_w_id, order_line.ol_d_id = oorder.o_d_id, order_line.ol_o_id = oorder.o_id Filter: order_line.ol_delivery_d >= oorder.o_entry_d
-          TableScan: order_line projection=[ol_o_id, ol_w_id, ol_d_id, ol_amount, ol_delivery_d]
+        Inner Join: oorder.o_w_id = order_line.ol_w_id, oorder.o_d_id = order_line.ol_d_id, oorder.o_id = order_line.ol_o_id Filter: order_line.ol_delivery_d >= oorder.o_entry_d
           Projection: nation.n_name, customer.c_id, customer.c_last, customer.c_city, customer.c_phone, oorder.o_id, oorder.o_w_id, oorder.o_d_id, oorder.o_entry_d
             Inner Join: customer.c_id = oorder.o_c_id, customer.c_w_id = oorder.o_w_id, customer.c_d_id = oorder.o_d_id
               Projection: nation.n_name, customer.c_id, customer.c_w_id, customer.c_d_id, customer.c_last, customer.c_city, customer.c_phone
@@ -16,3 +15,4 @@ Sort: revenue DESC NULLS FIRST
                   TableScan: customer projection=[c_id, c_w_id, c_d_id, c_state, c_last, c_city, c_phone]
               Filter: oorder.o_entry_d >= TimestampNanosecond(1167696000000000000, None)
                 TableScan: oorder projection=[o_id, o_c_id, o_w_id, o_d_id, o_entry_d]
+          TableScan: order_line projection=[ol_o_id, ol_w_id, ol_d_id, ol_amount, ol_delivery_d]

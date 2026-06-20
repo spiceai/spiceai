@@ -20,7 +20,9 @@ use std::{
     sync::Arc,
 };
 
-use datafusion_common::{Result, plan_datafusion_err, plan_err, tree_node::TreeNode};
+use datafusion_common::{
+    DataFusionError, Result, plan_datafusion_err, plan_err, tree_node::Transformed,
+};
 use datafusion_expr::{
     Expr, Filter, JoinConstraint, JoinType, LogicalPlan, utils::split_conjunction,
 };
@@ -29,6 +31,22 @@ use super::{
     cost::JoinCostEstimator,
     join_graph::{JoinGraph, NodeId, plan_head},
 };
+
+/// Outcome of [`optimal_left_deep_join_plan`]
+pub enum ReorderOutcome {
+    /// The reorder ran to completion. The inner [`Transformed`] says whether the
+    /// plan actually changed: `yes` = a new join order was applied, `no` = the
+    /// enumeration reproduced the input (already optimal or no reorderable island).
+    Completed(Transformed<LogicalPlan>),
+    /// The rule could not apply a reorder to this plan — either graph build /
+    /// enumeration errored, or the reconstruction was rejected by a safety check
+    /// (unresolved join keys, or a newly-introduced cross join). The original
+    /// plan is returned
+    Failed {
+        plan: LogicalPlan,
+        error: DataFusionError,
+    },
+}
 
 /// Generates an optimized left-deep join plan from a logical plan using the Ibaraki-Kameda algorithm.
 ///
@@ -72,28 +90,95 @@ use super::{
 ///
 /// # Returns
 ///
-/// Returns a `LogicalPlan` with optimized join ordering. The plan structure is:
-/// - Wrapper operators (filters, sorts, etc.) in their original positions
-/// - Joins reordered to minimize estimated execution cost
-/// - Join semantics preserved (same result set as input plan)
-///
-/// # Errors
-///
-/// Returns an error if graph construction, enumeration, or plan reconstruction
-/// fails (e.g. a join predicate that cannot be mapped onto the graph).
+/// A [`ReorderOutcome`] reporting whether the plan was reordered, rejected by a
+/// safety check, or hit an internal error — always carrying a usable plan.
 pub fn optimal_left_deep_join_plan(
     plan: LogicalPlan,
     cost_estimator: &dyn JoinCostEstimator,
-) -> Result<LogicalPlan> {
-    // No joins anywhere in the plan: nothing to reorder. Returning the
-    // input unchanged lets callers wire this in unconditionally without
-    // having to pre-check.
-    if !plan.exists(|p| Ok(matches!(p, LogicalPlan::Join(_))))? {
-        return Ok(plan);
+) -> ReorderOutcome {
+    // Original plan fallback, reused for every non-applied outcome (no-op, rejected, error).
+    let original = plan.clone();
+
+    let reordered = match build_reordered_plan(plan, cost_estimator) {
+        Ok(Some(reordered)) => reordered,
+        // Fewer than 3 relations: no join order to choose.
+        Ok(None) => return ReorderOutcome::Completed(Transformed::no(original)),
+        // Best-effort: an internal error (e.g. an unmappable predicate, or stats
+        // the cost model can't size) leaves the plan untouched.
+        Err(error) => {
+            return ReorderOutcome::Failed {
+                plan: original,
+                error,
+            };
+        }
+    };
+
+    // Validate the reconstruction before accepting it:
+    //   1. Every join `on` key must resolve in its own input's schema. A
+    //      reconstruction bug that drops an inner edge can emit a
+    //      structurally-invalid plan that fails a *downstream* rule (e.g. "No
+    //      field named …").
+    //   2. It must introduce no new cross product (Inner `Join` with empty
+    //      `on`). A relation linked to the rest only by a non-equi predicate
+    //      gets stranded and reconnected with a bare cross join, which a
+    //      downstream pass turns into a `NestedLoopJoinExec` that can blow up
+    //      over large inputs. Falling back to the native plan is safer.
+    let cross_joins_before = count_inner_cross_joins(&original);
+    let cross_joins_after = count_inner_cross_joins(&reordered);
+    let rejection = if !join_keys_resolve(&reordered) {
+        Some(plan_datafusion_err!(
+            "reordered plan has unresolved join keys (reconstruction dropped an equi-edge)"
+        ))
+    } else if cross_joins_after > cross_joins_before {
+        Some(plan_datafusion_err!(
+            "reorder introduced a cross join (a relation linked only by a non-equi predicate was \
+             stranded; cross joins {cross_joins_before} -> {cross_joins_after})"
+        ))
+    } else {
+        None
+    };
+    if let Some(error) = rejection {
+        return ReorderOutcome::Failed {
+            plan: original,
+            error,
+        };
     }
 
+    // Deterministic enumeration can reproduce the input order (e.g. an
+    // already-optimal plan); report that as a no-op so the optimizer converges.
+    if reordered == original {
+        return ReorderOutcome::Completed(Transformed::no(original));
+    }
+    ReorderOutcome::Completed(Transformed::yes(reordered))
+}
+
+/// Builds the reordered join plan, or `None` when there is no join order to
+/// choose (fewer than 3 relations). The fallible core behind the infallible
+/// [`optimal_left_deep_join_plan`] wrapper.
+///
+/// The `< 3` early-exit also makes re-entry cheap across the optimizer's
+/// multiple passes: once projection pushdown (which runs after this rule)
+/// inserts `Projection`s between the joins, the flattener absorbs them as opaque
+/// leaves and the graph collapses below this threshold — so a settled plan
+/// no-ops here instead of re-running the cost model.
+fn build_reordered_plan(
+    plan: LogicalPlan,
+    cost_estimator: &dyn JoinCostEstimator,
+) -> Result<Option<LogicalPlan>> {
     // Convert join subtree to query graph
     let (query_graph, wrappers) = JoinGraph::try_from_logical_plan(plan)?;
+
+    if query_graph.node_count() < 3 {
+        return Ok(None);
+    }
+
+    // A disconnected graph means a cross product between components. The
+    // enumerator walks edges, so it can't reach a separate component and would
+    // drop those relations during reconstruction. There's no useful left-deep
+    // order across a cross product, so leave the plan unchanged.
+    if !query_graph.is_connected() {
+        return Ok(None);
+    }
 
     // Optimize the joins
     let mut optimized_joins =
@@ -129,7 +214,56 @@ pub fn optimal_left_deep_join_plan(
     }
 
     // Reconstruct the full plan with wrappers
-    super::join_graph::reconstruct_plan(optimized_joins, wrappers)
+    Ok(Some(super::join_graph::reconstruct_plan(
+        optimized_joins,
+        wrappers,
+    )?))
+}
+
+/// Returns `false` if any `Join` in `plan` has an `on` key that does not resolve
+/// in its corresponding input schema — i.e. the reconstruction produced a
+/// structurally-invalid plan. A safety gate so a reorder bug degrades to "no
+/// reorder" instead of a failed query.
+fn join_keys_resolve(plan: &LogicalPlan) -> bool {
+    if let LogicalPlan::Join(join) = plan {
+        let left_schema = join.left.schema();
+        let right_schema = join.right.schema();
+        for (left_key, right_key) in &join.on {
+            if left_key
+                .column_refs()
+                .iter()
+                .any(|col| !left_schema.has_column(col))
+                || right_key
+                    .column_refs()
+                    .iter()
+                    .any(|col| !right_schema.has_column(col))
+            {
+                return false;
+            }
+        }
+    }
+    plan.inputs().iter().all(|input| join_keys_resolve(input))
+}
+
+/// Counts *true* cross products — Inner `Join` nodes with an empty `on` clause
+/// **and** no `filter` — in `plan`. The reorder is rejected when it produces
+/// *more* of these than the input had: a relation the enumerator could only
+/// link by a non-equi predicate gets reconnected with a bare cross join, which
+/// a downstream pass turns into a `NestedLoopJoinExec` that can blow up to a
+/// near-cartesian over large inputs.
+fn count_inner_cross_joins(plan: &LogicalPlan) -> usize {
+    let here = usize::from(matches!(
+        plan,
+        LogicalPlan::Join(join)
+            if join.join_type == JoinType::Inner
+                && join.on.is_empty()
+                && join.filter.is_none()
+    ));
+    here + plan
+        .inputs()
+        .iter()
+        .map(|input| count_inner_cross_joins(input))
+        .sum::<usize>()
 }
 
 /// Generates an optimized linear join plan from a query graph using the Ibaraki-Kameda algorithm.
@@ -688,6 +822,17 @@ impl<'graph> PrecedenceTreeNode<'graph> {
             current_plan = LogicalPlan::Join(join);
 
             processed_nodes.push(next_node_id);
+        }
+
+        // Defensive: every relation in the graph must be placed. If the chain
+        // didn't cover them all, erroring here makes the rule fall back to the
+        // native plan rather than silently emit a plan missing relations.
+        if processed_nodes.len() != query_graph.node_count() {
+            return plan_err!(
+                "reorder reconstruction placed {} of {} relations (disconnected join graph?)",
+                processed_nodes.len(),
+                query_graph.node_count()
+            );
         }
 
         Ok(current_plan)

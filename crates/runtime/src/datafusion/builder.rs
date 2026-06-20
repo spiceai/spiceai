@@ -126,7 +126,7 @@ pub static DEFAULT_DATAFUSION_CONFIG: LazyLock<RwLock<SessionConfig>> = LazyLock
         .enable_ident_normalization = false;
 
     df_config.options_mut().optimizer.expand_views_at_output = true;
-    //df_config.options_mut().explain.show_statistics = true;
+    // df_config.options_mut().explain.show_statistics = true;
     df_config.options_mut().sql_parser.dialect = datafusion::common::config::Dialect::PostgreSQL;
     df_config
         .options_mut()
@@ -1175,9 +1175,11 @@ fn insert_cayenne_join_reorder_rule(rules: &mut Vec<Arc<dyn OptimizerRule + Send
                     .map(|position| position + 1)
             })
             .or_else(|| {
+                // After `push_down_filter`: the cost model credits pushed-down `TableScan.filters` for scan selectivity
                 rules
                     .iter()
                     .position(|rule| rule.name() == "push_down_filter")
+                    .map(|position| position + 1)
             })
             .unwrap_or(rules.len());
         rules.insert(insert_at, Arc::new(ReorderJoinRule::default()));
@@ -2483,9 +2485,7 @@ mod tests {
             .map(|rule| rule.name().to_string())
             // Cayenne-gated logical rules are `cayenne_*`, plus `reorder_join`
             // (the join-reorder rule, which keeps its DataFusion-style name).
-            .filter(|rule_name| {
-                rule_name.starts_with("cayenne_") || rule_name == "reorder_join"
-            })
+            .filter(|rule_name| rule_name.starts_with("cayenne_") || rule_name == "reorder_join")
             .collect();
         let physical_rule_names = state
             .physical_optimizers()

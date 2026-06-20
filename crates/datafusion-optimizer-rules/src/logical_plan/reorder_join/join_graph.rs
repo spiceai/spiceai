@@ -224,6 +224,43 @@ impl JoinGraph {
         &self.filters
     }
 
+    /// Number of live relations (graph nodes). A value below 3 means there is no
+    /// join order to choose (0/1 relations are trivial; a 2-relation join's only
+    /// freedom is build/probe side, which the physical `JoinSelection` pass owns).
+    pub(crate) fn node_count(&self) -> usize {
+        self.nodes.iter().count()
+    }
+
+    /// True if every relation is reachable from any other via join edges, i.e.
+    /// the graph is a single connected component.
+    ///
+    /// A disconnected graph means the relations are only related by a cross
+    /// product (e.g. `FROM a, b, c` with no equi-predicate between some pair).
+    /// The IK84 enumerator builds its chain by walking edges, so it cannot reach
+    /// a separate component — reconstructing from that chain would silently
+    /// drop the unreachable relations.
+    pub(crate) fn is_connected(&self) -> bool {
+        let total = self.node_count();
+        let Some((start, _)) = self.nodes().next() else {
+            return true; // empty graph is trivially connected
+        };
+        let mut visited = std::collections::HashSet::new();
+        let mut stack = vec![start];
+        while let Some(node_id) = stack.pop() {
+            if !visited.insert(node_id) {
+                continue;
+            }
+            if let Some(node) = self.get_node(node_id) {
+                for neighbour in node.neighbours(node_id, self) {
+                    if !visited.contains(&neighbour) {
+                        stack.push(neighbour);
+                    }
+                }
+            }
+        }
+        visited.len() == total
+    }
+
     pub(crate) fn add_filter(&mut self, expr: Expr) {
         self.filters.push(expr);
     }

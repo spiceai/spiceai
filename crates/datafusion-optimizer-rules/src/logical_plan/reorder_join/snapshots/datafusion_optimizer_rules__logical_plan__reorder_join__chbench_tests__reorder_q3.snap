@@ -6,8 +6,7 @@ Sort: revenue DESC NULLS FIRST, oorder.o_entry_d ASC NULLS LAST
   Projection: order_line.ol_o_id, order_line.ol_w_id, order_line.ol_d_id, sum(order_line.ol_amount) AS revenue, oorder.o_entry_d
     Aggregate: groupBy=[[order_line.ol_o_id, order_line.ol_w_id, order_line.ol_d_id, oorder.o_entry_d]], aggr=[[sum(order_line.ol_amount)]]
       Projection: oorder.o_entry_d, order_line.ol_o_id, order_line.ol_w_id, order_line.ol_d_id, order_line.ol_amount
-        Inner Join: order_line.ol_w_id = oorder.o_w_id, order_line.ol_d_id = oorder.o_d_id, order_line.ol_o_id = oorder.o_id
-          TableScan: order_line projection=[ol_o_id, ol_w_id, ol_d_id, ol_amount]
+        Inner Join: oorder.o_w_id = order_line.ol_w_id, oorder.o_d_id = order_line.ol_d_id, oorder.o_id = order_line.ol_o_id
           Projection: oorder.o_id, oorder.o_w_id, oorder.o_d_id, oorder.o_entry_d
             Inner Join: oorder.o_c_id = customer.c_id, oorder.o_w_id = customer.c_w_id, oorder.o_d_id = customer.c_d_id
               Projection: oorder.o_id, oorder.o_c_id, oorder.o_w_id, oorder.o_d_id, oorder.o_entry_d
@@ -18,3 +17,4 @@ Sort: revenue DESC NULLS FIRST, oorder.o_entry_d ASC NULLS LAST
               Projection: customer.c_id, customer.c_w_id, customer.c_d_id
                 Filter: customer.c_state LIKE Utf8("A%")
                   TableScan: customer projection=[c_id, c_w_id, c_d_id, c_state]
+          TableScan: order_line projection=[ol_o_id, ol_w_id, ol_d_id, ol_amount]

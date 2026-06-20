@@ -284,9 +284,40 @@ macro_rules! chbench_reorder_snapshot {
                 $file
             ));
             let plan = reordered_plan(&ctx, sql).await;
-            insta::assert_snapshot!(plan);
+            insta::assert_snapshot!(stringify!($name), plan);
         }
     };
+}
+
+/// Test: a pure cross join (no equi-predicates) is a disconnected join
+/// graph. The reorder must not drop relations — every base table must survive.
+#[tokio::test]
+async fn reorder_cross_join_preserves_all_relations() {
+    let ctx = make_reordered_ctx();
+    let plan = reordered_plan(&ctx, "SELECT COUNT(*) FROM nation, region, supplier").await;
+    for table in ["nation", "region", "supplier"] {
+        assert!(
+            plan.contains(table),
+            "cross-join reorder dropped `{table}`; plan was:\n{plan}"
+        );
+    }
+}
+/// Test that reorder of a plan with a non-correlated scalar subquery
+/// does not drop table components
+#[tokio::test]
+async fn reorder_q15_scalar_subquery_preserves_relations() {
+    let ctx = make_reordered_ctx();
+    let sql = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../test-framework/src/queries/chbench/q15.sql"
+    ));
+    let plan = reordered_plan(&ctx, sql).await;
+    for table in ["supplier", "order_line", "stock"] {
+        assert!(
+            plan.contains(table),
+            "q15 reorder dropped `{table}`; plan was:\n{plan}"
+        );
+    }
 }
 
 // CH-benCHmark queries with join chains.
