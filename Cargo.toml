@@ -447,7 +447,7 @@ candle-index-select-cu = { git = "https://github.com/spiceai/candle-index-select
 # workspace uses the spiceai fork (DF53-compatible). Redirect crates.io to the fork so the whole
 # graph shares one `SQLExecutor`/federation crate; otherwise `SqlTable: SQLExecutor` (impl'd in
 # table-providers against crates.io federation) fails to satisfy fork-typed bounds in data_components.
-datafusion-federation = { git = "https://github.com/spiceai/datafusion-federation.git", rev = "0cb3781608b89f40c6585618ec3071f83345671a" } # sgrebnov/spiceai-54
+datafusion-federation = { git = "https://github.com/spiceai/datafusion-federation.git", rev = "0cb3781608b89f40c6585618ec3071f83345671a" } # spiceai-54
 
 delta_kernel = { git = "https://github.com/spiceai/delta-kernel-rs.git", rev = "714d64fd5369efc4835109be0fd718db5a3be0aa" } # branch: spiceai-0.23.0
 

@@ -3402,6 +3402,9 @@ struct ProtectedSnapshotScan<'a> {
     pk_indices_in_projection: &'a [usize],
     protected_snapshots: Arc<HashMap<String, i64>>,
     deletion_snapshot: &'a PkDeletionSnapshot,
+    /// View-typed read schema so protected-snapshot scans match the main file
+    /// scan in the union (see `viewify_read_schema`).
+    read_schema: SchemaRef,
 }
 
 struct PreparedProtectedSnapshotUpdate {
@@ -3822,6 +3825,20 @@ impl CayenneTableProvider {
     #[must_use]
     pub fn table_schema(&self) -> SchemaRef {
         self.table_schema.load_full()
+    }
+
+    /// The schema advertised to query planning and produced by `scan()`: the
+    /// stored [`Self::table_schema`] with string/binary columns mapped to Arrow
+    /// view types (see [`viewify_read_schema`]). Decoupled from the stored
+    /// schema, which the write/CDC/stats/keyset paths keep using with the
+    /// original `Utf8`/`Binary` types. Recomputed on demand so it tracks live
+    /// schema evolution; cheap (top-level field remap) and not on a per-row path.
+    pub(crate) fn read_schema(&self) -> SchemaRef {
+        if self.context.force_view_read_schema() {
+            viewify_read_schema(&self.table_schema())
+        } else {
+            self.table_schema()
+        }
     }
 
     /// Live (stream-time) widening schema evolution: atomically widen this
@@ -16384,31 +16401,44 @@ impl CayenneTableProvider {
         target_partitions: usize,
     ) -> datafusion_common::Result<Option<Arc<dyn ExecutionPlan>>> {
         // Project to the effective projection (reusing the inlined-plan logic).
-        let table_schema = self.table_schema();
+        // Build from the (gated) read schema so the RAM-tier branch matches the
+        // main file scan: view types when force_view is on, stored Utf8/Binary
+        // otherwise. Cast each batch to that target (a no-op when force_view off).
+        let read_schema = self.read_schema();
         let proj_schema = if let Some(proj) = effective_projection {
-            let schema_fields = table_schema.fields();
+            let schema_fields = read_schema.fields();
             let fields: Vec<arrow_schema::FieldRef> = proj
                 .iter()
                 .map(|&i| Arc::clone(&schema_fields[i]))
                 .collect();
             Arc::new(arrow_schema::Schema::new(fields))
         } else {
-            table_schema
+            read_schema
         };
 
         let projected_batches: Vec<RecordBatch> = visible_batches
             .into_iter()
             .map(|batch| {
-                if let Some(proj) = effective_projection {
+                let projected = if let Some(proj) = effective_projection {
                     batch.project(proj).map_err(|e| {
                         datafusion_common::DataFusionError::Execution(format!(
                             "Failed to project in-memory CDC tier batch for table {}: {e}",
                             self.table_metadata.table_name
                         ))
-                    })
+                    })?
                 } else {
-                    Ok(batch)
-                }
+                    batch
+                };
+                // No-op cheap reschema when the projection has no string/binary
+                // columns; casts Utf8/Binary -> view otherwise.
+                arrow_tools::record_batch::try_cast_to(projected, Arc::clone(&proj_schema)).map_err(
+                    |e| {
+                        datafusion_common::DataFusionError::Execution(format!(
+                            "Failed to cast in-memory CDC tier batch to view read schema for table {}: {e}",
+                            self.table_metadata.table_name
+                        ))
+                    },
+                )
             })
             .collect::<datafusion_common::Result<Vec<_>>>()?;
 
@@ -17575,12 +17605,18 @@ impl CayenneTableProvider {
 
         for (snapshot_id, max_delete_seq_at_creation) in scan.protected_snapshots.iter() {
             let plan = self
-                .create_snapshot_scan_plan(
+                .create_snapshot_scan_plan_with_config(
                     scan.state,
                     snapshot_id,
                     scan.projection,
                     scan.filters,
                     scan.limit,
+                    scan.state.config(),
+                    // Protected-snapshot scans are union branches, never the
+                    // provably-sorted main branch -> no sorted ordering.
+                    false,
+                    // Match the main file scan's view types so the union branches agree.
+                    Some(Arc::clone(&scan.read_schema)),
                 )
                 .await?;
 
@@ -17706,9 +17742,12 @@ impl CayenneTableProvider {
             filters,
             limit,
             state.config(),
-            // This wrapper serves protected-snapshot scans and internal reads,
-            // which are never the provably-sorted main branch — never advertise.
+            // This wrapper serves protected-snapshot scans and internal reads:
+            // never the provably-sorted main branch (so no sorted ordering), and
+            // they read with the stored Utf8/Binary types (only the query path
+            // requests view types).
             false,
+            None,
         )
         .await
     }
@@ -17727,7 +17766,17 @@ impl CayenneTableProvider {
         // the file set is globally sorted with no unsorted union branches. All
         // other callers (protected-snapshot scans, internal reads) pass `false`.
         allow_sorted_ordering: bool,
+        // Reference schema the Vortex decode targets: `None` -> stored
+        // Utf8/Binary (internal reads); the query path passes the view-typed read
+        // schema so the scan output matches the advertised `TableProvider::schema()`.
+        read_schema_override: Option<SchemaRef>,
     ) -> datafusion_common::Result<Arc<dyn ExecutionPlan>> {
+        // The reference schema the Vortex decode targets. Internal reads
+        // (compaction, keyset, stats) pass `None` -> stored `Utf8`/`Binary`,
+        // keeping re-encoded files unchanged. The query path passes the
+        // view-typed read schema so the scan output matches the advertised
+        // `TableProvider::schema()` and downstream joins plan on view arrays.
+        let base_schema = read_schema_override.unwrap_or_else(|| self.table_schema());
         let snapshot_dir_url = Self::snapshot_dir_url(
             &self.table_metadata.path,
             &self.table_metadata.table_id,
@@ -17739,7 +17788,7 @@ impl CayenneTableProvider {
             &self.pk_deletion_strategy,
             scan_config,
         );
-        let scan_schema = Self::snapshot_scan_schema(&self.table_schema(), &options);
+        let scan_schema = Self::snapshot_scan_schema(&base_schema, &options);
 
         // [sound output_ordering] The caller (only the main `scan()` path) has
         // verified this scan is over a provably globally-sorted file set. Advertise
@@ -17844,10 +17893,9 @@ impl CayenneTableProvider {
             Vec::new()
         };
 
-        let file_source = options.format.file_source(Self::snapshot_file_table_schema(
-            &self.table_schema(),
-            &options,
-        ));
+        let file_source = options
+            .format
+            .file_source(Self::snapshot_file_table_schema(&base_schema, &options));
 
         options
             .format
@@ -18620,6 +18668,66 @@ impl CayenneTableProvider {
     }
 }
 
+/// Map a stored Arrow schema's `Utf8` columns to `Utf8View` for the read/query
+/// path. ONLY `Utf8` is mapped:
+/// - `LargeUtf8`/`LargeBinary` already use i64 offsets (no 2 GiB overflow), so
+///   viewifying them is unnecessary — and a `LargeUtf8` → `Utf8View` write cast is
+///   flagged narrowing/lossy (e.g. a `MySQL` JSON column → `LargeUtf8`).
+/// - `Binary` is left as-is too: Vortex's `BinaryView` decode currently yields
+///   `LargeBinary`, which would diverge from an advertised `BinaryView` and trip
+///   the runtime's query-result `verify_schema` (e.g. a `MySQL` BLOB column).
+///   `Binary` join keys are rare, so the 2 GiB concat risk there is acceptable.
+///
+/// Cayenne's stored schema ([`CayenneTableProvider::table_schema`]) — used by
+/// writes, CDC apply, the PK keyset, the deletion index, and footer stats — keeps
+/// the original `Utf8` type. The *query* scan instead advertises and decodes the
+/// column as `Utf8View` so `DataFusion` plans operators on view arrays. The
+/// motivating case is the hash-join build side: `DataFusion` collects the whole
+/// build side into one `RecordBatch` via `concat_batches`, and a `Utf8` column
+/// there overflows Arrow's i32 offset buffer once the concatenated values exceed
+/// 2 GiB (`Offset overflow`, e.g. `CH-benCH` q21 at SF1000, where `su_name` fans
+/// out across a ~100M-row join). `Utf8View` appends independent data buffers
+/// instead of re-offsetting one buffer, so it has no 2 GiB single-array ceiling.
+/// Vortex decodes `Utf8View` natively when the scan's reference schema requests it
+/// (free on the file path; the small in-memory CDC branches are cast to match —
+/// see `scan()`).
+///
+/// Only top-level fields are mapped. Returns the input schema unchanged (same
+/// `Arc`) when it has no `Utf8` columns, so all-scalar tables pay nothing.
+pub(crate) fn viewify_read_schema(schema: &SchemaRef) -> SchemaRef {
+    fn view_type(dt: &DataType) -> Option<DataType> {
+        match dt {
+            // Only Utf8 (the i32-offset string type) is the q21 overflow case and
+            // the only type Vortex reliably re-decodes as a view. Binary is NOT
+            // mapped (Vortex's BinaryView path yields LargeBinary -> verify_schema
+            // divergence); LargeUtf8/LargeBinary already use i64 offsets.
+            DataType::Utf8 => Some(DataType::Utf8View),
+            _ => None,
+        }
+    }
+
+    if !schema
+        .fields()
+        .iter()
+        .any(|f| view_type(f.data_type()).is_some())
+    {
+        return Arc::clone(schema);
+    }
+
+    let fields: Vec<Field> = schema
+        .fields()
+        .iter()
+        .map(|f| match view_type(f.data_type()) {
+            Some(view) => f.as_ref().clone().with_data_type(view),
+            None => f.as_ref().clone(),
+        })
+        .collect();
+    Arc::new(arrow_schema::Schema::new_with_metadata(
+        fields,
+        schema.metadata().clone(),
+    ))
+}
+
 /// Walks `expr` looking for `Column(name) = Literal` (or the flipped form).
 /// Conjunctions (`AND`) are descended into so `DataFusion`'s split-conjunction
 /// or coalesced `BinaryExpr(And, _, _)` predicates are both matched.
@@ -18805,7 +18913,12 @@ fn extract_integer_literal(expr: &Expr) -> Option<i64> {
 #[async_trait]
 impl TableProvider for CayenneTableProvider {
     fn schema(&self) -> SchemaRef {
-        self.table_schema()
+        // Advertise the view-typed read schema (string/binary -> view) so
+        // DataFusion plans the whole query — joins, aggregates, sorts — on view
+        // arrays, avoiding the i32 2 GiB offset overflow in hash-join build-side
+        // `concat_batches`. The stored schema (table_schema) stays Utf8/Binary
+        // for writes/CDC/stats; scan() decodes the matching view types.
+        self.read_schema()
     }
 
     fn table_type(&self) -> TableType {
@@ -19117,6 +19230,11 @@ impl TableProvider for CayenneTableProvider {
             ids.extend(protected_map.keys().cloned());
             SnapshotScanRef::new(Arc::clone(&self.snapshot_scan_refs), ids)
         };
+        // View-typed schema for the query scan output (string/binary -> view),
+        // matching the advertised `TableProvider::schema()`. Threaded into every
+        // union branch (file scan, protected snapshots, inline + RAM tiers) so
+        // they agree and joins plan on view arrays. See `viewify_read_schema`.
+        let read_schema = self.read_schema();
         let listing_scan_start = Instant::now();
         let main_plan_result = self
             .create_snapshot_scan_plan_with_config(
@@ -19127,6 +19245,7 @@ impl TableProvider for CayenneTableProvider {
                 limit,
                 scan_listing_config,
                 allow_sorted_ordering,
+                Some(Arc::clone(&read_schema)),
             )
             .await;
         self.record_listing_scan_duration(listing_scan_start.elapsed());
@@ -19148,6 +19267,7 @@ impl TableProvider for CayenneTableProvider {
                 pk_indices_in_projection: &pk_indices_in_projection,
                 protected_snapshots: protected_map,
                 deletion_snapshot: &deletion_snapshot,
+                read_schema: Arc::clone(&read_schema),
             })
             .await?;
 
@@ -19157,32 +19277,45 @@ impl TableProvider for CayenneTableProvider {
         let inlined_plan: Option<Arc<dyn ExecutionPlan>> = if inlined_batches.is_empty() {
             None
         } else {
-            // Apply projection to inlined batches if needed
-            let table_schema = self.table_schema();
+            // Build the projected schema from the (gated) read schema so this
+            // branch matches the main file scan exactly: view types when
+            // force_view is on, stored Utf8/Binary otherwise. The inline corpus
+            // holds stored Utf8/Binary, so cast each batch to that target (a no-op
+            // reschema when force_view is off).
+            let read_schema = self.read_schema();
             let proj_schema = if let Some(ref proj) = effective_projection {
-                let schema_fields = table_schema.fields();
+                let schema_fields = read_schema.fields();
                 let fields: Vec<arrow_schema::FieldRef> = proj
                     .iter()
                     .map(|&i| Arc::clone(&schema_fields[i]))
                     .collect();
                 Arc::new(arrow_schema::Schema::new(fields))
             } else {
-                table_schema
+                read_schema
             };
 
             let projected_batches: Vec<RecordBatch> = inlined_batches
                 .into_iter()
                 .map(|batch| {
-                    if let Some(ref proj) = effective_projection {
+                    let projected = if let Some(ref proj) = effective_projection {
                         batch.project(proj).map_err(|e| {
                             datafusion_common::DataFusionError::Execution(format!(
                                 "Failed to project inlined batch for table {}: {e}",
                                 self.table_metadata.table_name
                             ))
-                        })
+                        })?
                     } else {
-                        Ok(batch)
-                    }
+                        batch
+                    };
+                    // No-op cheap reschema when the projection has no
+                    // string/binary columns; casts Utf8/Binary -> view otherwise.
+                    arrow_tools::record_batch::try_cast_to(projected, Arc::clone(&proj_schema))
+                        .map_err(|e| {
+                            datafusion_common::DataFusionError::Execution(format!(
+                                "Failed to cast inlined batch to view read schema for table {}: {e}",
+                                self.table_metadata.table_name
+                            ))
+                        })
                 })
                 .collect::<datafusion_common::Result<Vec<_>>>()?;
 
@@ -20128,6 +20261,150 @@ mod tests {
     use crate::provider::compaction::{CompactionRunner, MemTierCheckpointRunner};
 
     use super::*;
+
+    #[test]
+    fn viewify_read_schema_maps_only_utf8_to_utf8view() {
+        use std::collections::HashMap;
+        let md = HashMap::from([("k".to_string(), "v".to_string())]);
+        let schema = Arc::new(arrow_schema::Schema::new_with_metadata(
+            vec![
+                Field::new("id", DataType::Int64, false),
+                Field::new("s", DataType::Utf8, true),
+                Field::new("ls", DataType::LargeUtf8, false),
+                Field::new("b", DataType::Binary, true),
+                Field::new("lb", DataType::LargeBinary, false),
+                Field::new("f", DataType::Float64, true),
+            ],
+            md.clone(),
+        ));
+        let view = viewify_read_schema(&schema);
+        assert_eq!(view.field(0).data_type(), &DataType::Int64);
+        assert_eq!(view.field(1).data_type(), &DataType::Utf8View);
+        // Only Utf8 is viewified. LargeUtf8/LargeBinary (i64 offsets) and Binary
+        // (Vortex BinaryView decode diverges to LargeBinary) are left unchanged.
+        assert_eq!(view.field(2).data_type(), &DataType::LargeUtf8);
+        assert_eq!(view.field(3).data_type(), &DataType::Binary);
+        assert_eq!(view.field(4).data_type(), &DataType::LargeBinary);
+        assert_eq!(view.field(5).data_type(), &DataType::Float64);
+        // Names, nullability, and schema metadata are preserved.
+        assert_eq!(view.field(1).name(), "s");
+        assert!(view.field(1).is_nullable());
+        assert!(!view.field(2).is_nullable());
+        assert_eq!(view.metadata(), &md);
+
+        // No Utf8 columns (Binary / Large* / scalar) -> same Arc returned (zero
+        // allocation): Binary is not viewified (Vortex BinaryView diverges) and a
+        // MySQL JSON/BLOB column (LargeUtf8/LargeBinary) is not narrowing-cast.
+        let no_view = Arc::new(arrow_schema::Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("ls", DataType::LargeUtf8, false),
+            Field::new("b", DataType::Binary, false),
+        ]));
+        assert!(Arc::ptr_eq(&no_view, &viewify_read_schema(&no_view)));
+    }
+
+    /// End-to-end gate for the `force_view_read_schema` fix: with the flag on, the
+    /// provider advertises `Utf8` columns as `Utf8View` AND the scan actually emits
+    /// `StringViewArray` — including the in-memory (inline) branch, which is cast to
+    /// match the view-typed file scan. (The stored `table_schema` stays `Utf8`.)
+    /// This is the path that lets `DataFusion` plan the hash join on view arrays
+    /// and avoids the i32 2 GiB offset overflow at scale (`CH-benCH` q21 @SF1000).
+    #[tokio::test]
+    async fn force_view_read_schema_scan_emits_utf8view() {
+        use arrow::array::{Int64Array, StringArray, StringViewArray};
+        use arrow::datatypes::{DataType, Field, Schema};
+
+        let ctx = SessionContext::new();
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let metadata_dir = format!("{}/metadata", temp_dir.path().to_str().expect("path"));
+        let data_dir = format!("{}/data", temp_dir.path().to_str().expect("path"));
+        std::fs::create_dir_all(&metadata_dir).expect("metadata dir");
+        let connection_string = format!("sqlite://{metadata_dir}/cayenne.db");
+        let catalog = Arc::new(CayenneCatalog::new(connection_string).expect("catalog"))
+            as Arc<dyn MetadataCatalog>;
+        catalog.init().await.expect("catalog init");
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("name", DataType::Utf8, false),
+        ]));
+        // `force_view_read_schema` is `#[serde(skip)]` (a runtime-derived setting,
+        // like `data_storage_class`), so it is carried by the injected context, not
+        // the persisted metadata. Mirror the runtime factory: build a context from
+        // the force-view config and inject it via `with_context`. This also exercises
+        // that `clone_for_write` (used by `read_all`) preserves the flag.
+        let vortex_config = VortexConfig {
+            force_view_read_schema: true,
+            ..VortexConfig::default()
+        };
+        let context = CayenneContext::new(&vortex_config, ctx.runtime_env(), "view_scan");
+        let options = CreateTableOptions {
+            table_name: "view_scan".to_string(),
+            schema: Arc::clone(&schema),
+            primary_key: vec!["id".to_string()],
+            on_conflict: Some(OnConflict::Upsert(
+                datafusion_table_providers::util::column_reference::ColumnReference::new(vec![
+                    "id".to_string(),
+                ]),
+            )),
+            base_path: data_dir,
+            partition_column: None,
+            vortex_config,
+        };
+        let provider = CayenneTableProviderBuilder::new(Arc::clone(&catalog), ctx.runtime_env())
+            .with_context(context)
+            .create(options)
+            .await
+            .expect("table created");
+
+        // Advertised (query) schema views the Utf8 column; stored schema stays Utf8.
+        assert_eq!(
+            provider
+                .schema()
+                .field_with_name("name")
+                .expect("name field")
+                .data_type(),
+            &DataType::Utf8View,
+        );
+        assert_eq!(
+            provider
+                .table_schema()
+                .field_with_name("name")
+                .expect("name field")
+                .data_type(),
+            &DataType::Utf8,
+        );
+
+        // Small batch -> inline memtable, exercising the inline-branch view cast.
+        insert_batch(
+            &provider,
+            RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![
+                    Arc::new(Int64Array::from(vec![1_i64, 2])),
+                    Arc::new(StringArray::from(vec!["alice", "bob"])),
+                ],
+            )
+            .expect("batch"),
+        )
+        .await;
+        assert!(provider.cached_inlined_row_count() > 0, "rows land inline");
+
+        let batches = read_all(&ctx, &provider, "view_scan").await;
+        let total: usize = batches.iter().map(RecordBatch::num_rows).sum();
+        assert_eq!(total, 2, "both inline rows visible");
+        for b in &batches {
+            let idx = b.schema().index_of("name").expect("name col");
+            assert_eq!(b.schema().field(idx).data_type(), &DataType::Utf8View);
+            assert!(
+                b.column(idx)
+                    .as_any()
+                    .downcast_ref::<StringViewArray>()
+                    .is_some(),
+                "scan must emit StringViewArray under force_view_read_schema"
+            );
+        }
+    }
 
     /// The retired-dir sweep timing contract: a dir is due only once the grace
     /// has elapsed past BOTH its retirement and its last scan listing — a
