@@ -33,38 +33,6 @@ use crate::datafusion::DataFusion;
 // — any write-capable extension must be non-cacheable AND blocked by read-only.
 pub(super) use cache::WRITE_CAPABLE_EXTENSION_NAMES;
 
-/// Config namespaces that `SET`/`RESET` may target.
-///
-/// These cover display (`explain`), plan shape (`optimizer`), and execution
-/// tuning (`execution`) — perf/diagnostic knobs that change neither query
-/// results, security posture, nor write behavior. Everything outside this set
-/// (e.g. `datafusion.catalog.*`, `datafusion.sql_parser.*`) stays rejected so a
-/// session cannot, for example, repoint the default catalog or alter SQL
-/// parsing semantics.
-const SAFE_SET_PREFIXES: &[&str] = &[
-    "datafusion.explain.", // show_statistics, logical_plan_only, etc. — display only
-    "datafusion.optimizer.", // plan shape — perf only
-    "datafusion.execution.", // target_partitions, batch_size — perf only
-];
-
-/// Config keys (or sub-namespaces) that are otherwise prefix-allowed above but
-/// are pinned by the runtime at startup (see `datafusion::builder`) and must
-/// not be overridden per-session.
-const UNSAFE_SET_KEYS: &[&str] = &[
-    // Parquet reader behavior is fixed by the runtime (e.g. `pushdown_filters`);
-    // letting a session flip it can change scan correctness expectations.
-    "datafusion.execution.parquet.",
-];
-
-/// Whether a `SET`/`RESET <variable>` targets a config key that is safe to
-/// expose to SQL clients. Case-insensitive: `DataFusion` lower-cases config keys,
-/// but SQL identifiers may arrive in any case.
-fn is_safe_set_variable(variable: &str) -> bool {
-    let v = variable.to_ascii_lowercase();
-    SAFE_SET_PREFIXES.iter().any(|p| v.starts_with(p))
-        && !UNSAFE_SET_KEYS.iter().any(|p| v.starts_with(p))
-}
-
 /// Validates that a logical plan only performs allowed operations on datasets.
 ///
 /// Reads (SELECT queries) are allowed on all tables.
@@ -72,9 +40,7 @@ fn is_safe_set_variable(variable: &str) -> bool {
 /// and are not allowed on internal Spice tables.
 /// UPDATE operations are only allowed on writable Cayenne catalog tables.
 /// DDL operations are only allowed on catalogs configured with `access: read_write_create`.
-/// DML (other than allowed INSERT/DELETE/UPDATE) and COPY are not permitted.
-/// Statement operations are rejected except PREPARE/EXECUTE/DEALLOCATE and
-/// SET/RESET of an allowlisted, safe config namespace (see [`is_safe_set_variable`]).
+/// DML (other than allowed INSERT/DELETE/UPDATE), COPY, and Statement operations are not permitted.
 ///
 /// # Returns
 /// * `Ok(())` if the plan is valid
@@ -179,16 +145,9 @@ pub fn validate_sql_query_operations(
             plan_err!("COPY operations are not allowed")
         }
         LogicalPlan::Statement(stmt) => {
-            // Allow PREPARE, EXECUTE, and DEALLOCATE statements, plus SET/RESET of
-            // a safe subset of DataFusion config (display/perf knobs only).
+            // Allow PREPARE, EXECUTE, and DEALLOCATE statements using enum pattern matching
             match stmt {
                 Statement::Prepare(_) | Statement::Execute(_) | Statement::Deallocate(_) => {
-                    Ok(TreeNodeRecursion::Continue)
-                }
-                Statement::SetVariable(set) if is_safe_set_variable(&set.variable) => {
-                    Ok(TreeNodeRecursion::Continue)
-                }
-                Statement::ResetVariable(reset) if is_safe_set_variable(&reset.variable) => {
                     Ok(TreeNodeRecursion::Continue)
                 }
                 _ => plan_err!("Statements are not allowed: {}", stmt.name()),
@@ -269,10 +228,6 @@ fn validate_ddl_operation(
 /// three are disallowed on surfaces that must guarantee read-only execution — notably
 /// the built-in `sql` tool and the LLM-generated SQL path in `/v1/nsql`.
 ///
-/// The one exception is `SET` / `RESET` of an allowlisted, safe config namespace
-/// (display/perf only — see [`is_safe_set_variable`]). These mutate session config,
-/// not data, and cannot change query results, security, or write behavior.
-///
 /// Spice's planner can also represent DDL/DML as [`LogicalPlan::Extension`] nodes
 /// (for example, `DdlExtensionNode` from `datafusion-ddl`, `DmlExtensionNode` from
 /// `datafusion-dml`, and the `DistributedCayenne{Insert,Update,Delete,Merge}` /
@@ -298,21 +253,10 @@ pub fn validate_sql_query_read_only(plan: &LogicalPlan) -> Result<(), DataFusion
         LogicalPlan::Copy(_) => {
             plan_err!("COPY operations are not allowed in read-only SQL context.")
         }
-        LogicalPlan::Statement(stmt) => match stmt {
-            // SET/RESET of display/perf config is harmless under read-only auth:
-            // it mutates session config, not data. The allowlist excludes anything
-            // that could change results, security, or write behavior.
-            Statement::SetVariable(set) if is_safe_set_variable(&set.variable) => {
-                Ok(TreeNodeRecursion::Continue)
-            }
-            Statement::ResetVariable(reset) if is_safe_set_variable(&reset.variable) => {
-                Ok(TreeNodeRecursion::Continue)
-            }
-            _ => plan_err!(
-                "Statement '{}' is not allowed in read-only SQL context.",
-                stmt.name()
-            ),
-        },
+        LogicalPlan::Statement(stmt) => plan_err!(
+            "Statement '{}' is not allowed in read-only SQL context.",
+            stmt.name()
+        ),
         LogicalPlan::Extension(ext) => {
             let name = ext.node.name();
             if WRITE_CAPABLE_EXTENSION_NAMES.contains(&name) {
@@ -751,7 +695,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "temporarily disabled"]
     async fn test_validate_statement_operations_blocked() {
         let df = create_test_datafusion();
 
@@ -1305,88 +1248,5 @@ mod tests {
 
         validate_sql_query_read_only(&plan)
             .expect_err("INSERT via Spice planner must be rejected in read-only context");
-    }
-
-    #[test]
-    fn test_is_safe_set_variable_allowlist() {
-        // Allowed: display / optimizer / execution namespaces, any case.
-        assert!(is_safe_set_variable("datafusion.explain.show_statistics"));
-        assert!(is_safe_set_variable(
-            "datafusion.optimizer.enable_round_robin_repartition"
-        ));
-        assert!(is_safe_set_variable(
-            "datafusion.execution.target_partitions"
-        ));
-        assert!(is_safe_set_variable("DATAFUSION.EXECUTION.BATCH_SIZE"));
-
-        // Rejected: pinned parquet sub-namespace, and anything outside the allowlist.
-        assert!(!is_safe_set_variable(
-            "datafusion.execution.parquet.pushdown_filters"
-        ));
-        assert!(!is_safe_set_variable("datafusion.catalog.default_catalog"));
-        assert!(!is_safe_set_variable("datafusion.sql_parser.dialect"));
-        assert!(!is_safe_set_variable("datafusion.runtime.memory_limit"));
-        assert!(!is_safe_set_variable("some_other_var"));
-    }
-
-    #[tokio::test]
-    async fn test_validate_set_safe_variable_allowed() {
-        let df = create_test_datafusion();
-
-        let plan = df
-            .ctx
-            .state()
-            .create_logical_plan("SET datafusion.explain.show_statistics = true")
-            .await
-            .expect("plan should be created");
-
-        validate_sql_query_operations(&plan, &df)
-            .expect("SET of a safe display config must be allowed");
-    }
-
-    #[tokio::test]
-    async fn test_validate_set_unsafe_variable_blocked() {
-        let df = create_test_datafusion();
-
-        let plan = df
-            .ctx
-            .state()
-            .create_logical_plan("SET datafusion.catalog.default_catalog = 'evil'")
-            .await
-            .expect("plan should be created");
-
-        validate_sql_query_operations(&plan, &df)
-            .expect_err("SET of a non-allowlisted config must be rejected");
-    }
-
-    #[tokio::test]
-    async fn test_read_only_validator_allows_safe_set() {
-        let df = create_test_datafusion();
-
-        let plan = df
-            .ctx
-            .state()
-            .create_logical_plan("SET datafusion.execution.target_partitions = 8")
-            .await
-            .expect("plan should be created");
-
-        validate_sql_query_read_only(&plan)
-            .expect("SET of a safe perf config must be allowed under read-only auth");
-    }
-
-    #[tokio::test]
-    async fn test_read_only_validator_rejects_unsafe_set() {
-        let df = create_test_datafusion();
-
-        let plan = df
-            .ctx
-            .state()
-            .create_logical_plan("SET datafusion.execution.parquet.pushdown_filters = false")
-            .await
-            .expect("plan should be created");
-
-        validate_sql_query_read_only(&plan).expect_err(
-            "SET of a pinned parquet config must be rejected even under read-only auth",
-        );
     }
 }
