@@ -234,9 +234,13 @@ fn make_reordered_ctx() -> SessionContext {
         .position(|rule| rule.name() == "eliminate_cross_join")
         .map(|position| position + 1)
         .or_else(|| {
+            // After `push_down_filter`, not before — mirrors the runtime
+            // (`insert_cayenne_join_reorder_rule`) so `TableScan.filters` are
+            // populated for costing.
             rules
                 .iter()
                 .position(|rule| rule.name() == "push_down_filter")
+                .map(|position| position + 1)
         })
         .unwrap_or(rules.len());
     rules.insert(insert_at, Arc::new(ReorderJoinRule::default()));
