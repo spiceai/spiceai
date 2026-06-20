@@ -181,7 +181,6 @@ datasets:
       params:
         <<: *accel_high_volume
         cayenne_file_path: .spice/cayenne/order_line
-        cayenne_write_concurrency: '8'
         cayenne_target_file_size_mb: '512'
         cayenne_compaction_trigger_files: '8'
         cayenne_compaction_trigger_snapshot_age_ms: '30000'
@@ -259,6 +258,8 @@ datasets:
       params:
         <<: *accel_medium
         cayenne_file_path: .spice/cayenne/item
+        # static full-refresh: pin write_concurrency low so the &accel_medium bump (for the warehouse changes table) does not apply here.
+        cayenne_write_concurrency: '2'
 
   - from: postgres:region
     name: region
