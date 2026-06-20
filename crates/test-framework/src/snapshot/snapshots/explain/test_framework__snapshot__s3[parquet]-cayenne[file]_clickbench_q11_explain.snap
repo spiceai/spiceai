@@ -21,7 +21,7 @@ description: "Query: clickbench_q11"
 |               |               RepartitionExec: partitioning=Hash([MobilePhoneModel@0, alias1@1], 16), input_partitions=16                                                                  |
 |               |                 AggregateExec: mode=Partial, gby=[MobilePhoneModel@1 as MobilePhoneModel, UserID@0 as alias1], aggr=[]                                                     |
 |               |                   SchemaCastScanExec                                                                                                                                       |
-|               |                     CayenneAccelerationExec: snapshots_scanned=1, files_scanned=81                                                                                         |
+|               |                     CayenneAccelerationExec: snapshots_scanned=1, files_scanned=83                                                                                         |
 |               |                       BytesProcessedExec                                                                                                                                   |
 |               |                         DataSourceExec: file_groups={16 groups: [<redacted>]}, projection=[UserID, MobilePhoneModel], file_type=vortex, predicate: MobilePhoneModel@34 !=  |
 |               |                                                                                                                                                                            |

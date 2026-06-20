@@ -19,7 +19,7 @@ description: "Query: clickbench_q28"
 |               |           RepartitionExec: partitioning=Hash([CounterID@0], 16), input_partitions=16                                                            |
 |               |             AggregateExec: mode=Partial, gby=[CounterID@0 as CounterID], aggr=[avg(length(hits.URL)), count(Int64(1))]                          |
 |               |               SchemaCastScanExec                                                                                                                |
-|               |                 CayenneAccelerationExec: snapshots_scanned=1, files_scanned=81                                                                  |
+|               |                 CayenneAccelerationExec: snapshots_scanned=1, files_scanned=83                                                                  |
 |               |                   BytesProcessedExec                                                                                                            |
 |               |                     DataSourceExec: file_groups={16 groups: [<redacted>]}, projection=[CounterID, URL], file_type=vortex, predicate: URL@13 !=  |
 |               |                                                                                                                                                 |

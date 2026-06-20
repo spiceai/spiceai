@@ -16,7 +16,7 @@ description: "Query: clickbench_q34"
 |               |         RepartitionExec: partitioning=Hash([URL@0], 16), input_partitions=16                                |
 |               |           AggregateExec: mode=Partial, gby=[URL@0 as URL], aggr=[count(Int64(1))]                           |
 |               |             SchemaCastScanExec                                                                              |
-|               |               CayenneAccelerationExec: snapshots_scanned=1, files_scanned=81                                |
+|               |               CayenneAccelerationExec: snapshots_scanned=1, files_scanned=83                                |
 |               |                 BytesProcessedExec                                                                          |
 |               |                   DataSourceExec: file_groups={16 groups: [<redacted>]}, projection=[URL], file_type=vortex |
 |               |                                                                                                             |

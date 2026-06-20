@@ -11,7 +11,7 @@ description: "Query: clickbench_q26"
 | physical_plan | SortPreservingMergeExec: [SearchPhrase@0 ASC NULLS LAST], fetch=10                                                                                                       |
 |               |   SortExec: TopK(fetch=10), expr=[SearchPhrase@0 ASC NULLS LAST], preserve_partitioning=[true]                                                                           |
 |               |     SchemaCastScanExec                                                                                                                                                   |
-|               |       CayenneAccelerationExec: snapshots_scanned=1, files_scanned=81                                                                                                     |
+|               |       CayenneAccelerationExec: snapshots_scanned=1, files_scanned=83                                                                                                     |
 |               |         BytesProcessedExec                                                                                                                                               |
 |               |           DataSourceExec: file_groups={16 groups: [<redacted>]}, projection=[SearchPhrase], file_type=vortex, predicate: SearchPhrase@39 !=  AND DynamicFilter [ empty ] |
 |               |                                                                                                                                                                          |
