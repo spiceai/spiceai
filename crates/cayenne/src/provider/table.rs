@@ -18668,9 +18668,11 @@ impl CayenneTableProvider {
     }
 }
 
-/// Map a stored Arrow schema's variable-width string/binary columns to their
-/// Arrow *view* equivalents (`Utf8`/`LargeUtf8` → `Utf8View`,
-/// `Binary`/`LargeBinary` → `BinaryView`) for the read/query path.
+/// Map a stored Arrow schema's i32-offset string/binary columns to their Arrow
+/// *view* equivalents (`Utf8` → `Utf8View`, `Binary` → `BinaryView`) for the
+/// read/query path. `LargeUtf8`/`LargeBinary` already use i64 offsets (no 2 GiB
+/// overflow) and are left unchanged — mapping them to a view would be an
+/// unnecessary, runtime-narrowing cast (e.g. a MySQL JSON column → `LargeUtf8`).
 ///
 /// Cayenne's stored schema ([`CayenneTableProvider::table_schema`]) — used by
 /// writes, CDC apply, the PK keyset, the deletion index, and footer stats —
@@ -18694,8 +18696,11 @@ impl CayenneTableProvider {
 pub(crate) fn viewify_read_schema(schema: &SchemaRef) -> SchemaRef {
     fn view_type(dt: &DataType) -> Option<DataType> {
         match dt {
-            DataType::Utf8 | DataType::LargeUtf8 => Some(DataType::Utf8View),
-            DataType::Binary | DataType::LargeBinary => Some(DataType::BinaryView),
+            // Only the i32-offset types overflow the 2 GiB build-side concat;
+            // LargeUtf8/LargeBinary already use i64 offsets, so leave them as-is
+            // (viewifying them would be an unnecessary, runtime-narrowing cast).
+            DataType::Utf8 => Some(DataType::Utf8View),
+            DataType::Binary => Some(DataType::BinaryView),
             _ => None,
         }
     }
@@ -20274,9 +20279,10 @@ mod tests {
         let view = viewify_read_schema(&schema);
         assert_eq!(view.field(0).data_type(), &DataType::Int64);
         assert_eq!(view.field(1).data_type(), &DataType::Utf8View);
-        assert_eq!(view.field(2).data_type(), &DataType::Utf8View);
+        // LargeUtf8/LargeBinary already use i64 offsets -> left unchanged.
+        assert_eq!(view.field(2).data_type(), &DataType::LargeUtf8);
         assert_eq!(view.field(3).data_type(), &DataType::BinaryView);
-        assert_eq!(view.field(4).data_type(), &DataType::BinaryView);
+        assert_eq!(view.field(4).data_type(), &DataType::LargeBinary);
         assert_eq!(view.field(5).data_type(), &DataType::Float64);
         // Names, nullability, and schema metadata are preserved.
         assert_eq!(view.field(1).name(), "s");
@@ -20284,13 +20290,14 @@ mod tests {
         assert!(!view.field(2).is_nullable());
         assert_eq!(view.metadata(), &md);
 
-        // No string/binary columns -> same Arc returned (zero allocation).
-        let scalar = Arc::new(arrow_schema::Schema::new(vec![Field::new(
-            "id",
-            DataType::Int64,
-            false,
-        )]));
-        assert!(Arc::ptr_eq(&scalar, &viewify_read_schema(&scalar)));
+        // No i32-offset string/binary columns (only Large* / scalar) -> same Arc
+        // returned (zero allocation; LargeUtf8 is never viewified, so a MySQL
+        // JSON -> LargeUtf8 column is not narrowing-cast to a view).
+        let no_view = Arc::new(arrow_schema::Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("ls", DataType::LargeUtf8, false),
+        ]));
+        assert!(Arc::ptr_eq(&no_view, &viewify_read_schema(&no_view)));
     }
 
     /// End-to-end gate for the `force_view_read_schema` fix: with the flag on, the
