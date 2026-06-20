@@ -126,7 +126,7 @@ pub static DEFAULT_DATAFUSION_CONFIG: LazyLock<RwLock<SessionConfig>> = LazyLock
         .enable_ident_normalization = false;
 
     df_config.options_mut().optimizer.expand_views_at_output = true;
-    df_config.options_mut().explain.show_statistics = true;
+    //df_config.options_mut().explain.show_statistics = true;
     df_config.options_mut().sql_parser.dialect = datafusion::common::config::Dialect::PostgreSQL;
     df_config
         .options_mut()
@@ -2481,7 +2481,11 @@ mod tests {
             .optimizers()
             .iter()
             .map(|rule| rule.name().to_string())
-            .filter(|rule_name| rule_name.starts_with("cayenne_"))
+            // Cayenne-gated logical rules are `cayenne_*`, plus `reorder_join`
+            // (the join-reorder rule, which keeps its DataFusion-style name).
+            .filter(|rule_name| {
+                rule_name.starts_with("cayenne_") || rule_name == "reorder_join"
+            })
             .collect();
         let physical_rule_names = state
             .physical_optimizers()
