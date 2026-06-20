@@ -306,11 +306,12 @@ message CayenneAccelerationExecNode {}
 // `FileIO`), and its planned `FileScanTask`s carry fields the iceberg crate
 // intentionally refuses to serialize (partition / partition_spec). So instead of
 // shipping the plan, we serialize a minimal recipe — the DataFusion table
-// reference plus the scan's projection, filters, and limit — and on the executor
-// re-derive an equivalent scan by calling the already-registered provider's
-// `scan()`. Reusing the registered provider means no catalog is rebuilt and no
-// secrets cross the wire; re-planning with the same projection/filters yields the
-// same per-partition bucketing the scheduler produced.
+// reference plus the scan's projection, filters, limit, and output partitioning —
+// and on the executor re-derive an equivalent scan by calling the
+// already-registered provider's `scan()` lazily at execution time. Reusing the
+// registered provider means no catalog is rebuilt and no secrets cross the wire;
+// re-planning with the same projection/filters yields the same per-partition
+// bucketing the scheduler produced.
 message IcebergTableScanExecNode {
     // DataFusion table reference (e.g. `dataset`, or `catalog.schema.table`) used
     // to resolve the registered Iceberg provider on the executor.
@@ -324,6 +325,23 @@ message IcebergTableScanExecNode {
     repeated bytes filters = 4;
     // Optional row limit pushed into the scan.
     optional uint64 limit = 5;
+    // Output partitioning, so the deferred node reports the same partition count
+    // the scheduler planned before the (lazy) scan actually runs.
+    IcebergPartitioning partitioning = 6;
+}
+
+// Serializable form of the scan's output `Partitioning`.
+message IcebergPartitioning {
+    // 0 = UnknownPartitioning, 1 = Hash, 2 = RoundRobinBatch.
+    uint32 kind = 1;
+    uint64 partition_count = 2;
+    // Hash partitioning columns (only populated when kind == 1).
+    repeated IcebergHashColumn hash_columns = 3;
+}
+
+message IcebergHashColumn {
+    string name = 1;
+    uint64 index = 2;
 }
 
 // Execution plan node for UDTFs.

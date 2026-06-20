@@ -16,43 +16,51 @@ limitations under the License.
 
 //! A serializable leaf execution plan for distributed Iceberg scans.
 //!
-//! An [`IcebergTableScan`] holds a live, non-serializable `Table`, and its
-//! planned `FileScanTask`s carry fields the iceberg crate intentionally refuses
-//! to serialize. So instead of shipping the plan, this leaf wraps it and carries
-//! the `DataFusion` [`TableReference`] of the registered Iceberg provider plus
-//! the scan's projection, filters, and limit. The physical codec serializes that
-//! recipe; on the executor it resolves the same registered provider and replays
-//! `TableProvider::scan` to re-derive an equivalent, identically-bucketed scan,
-//! reusing the provider's catalog (so no secrets cross the wire).
+//! An `IcebergTableScan` holds a live, non-serializable `Table`, and its planned
+//! `FileScanTask`s carry fields the iceberg crate intentionally refuses to
+//! serialize. So instead of shipping the plan, this leaf carries a *recipe* — the
+//! `DataFusion` [`TableReference`] of the registered Iceberg provider plus the
+//! scan's projection, filters, and limit — which the physical codec serializes.
+//!
+//! It has two modes ([`ScanSource`]):
+//! - **Planned** (scheduler / single-node): wraps the concrete scan the provider
+//!   produced, so physical planning sees real schema and partitioning.
+//! - **Deferred** (remote executor, after decode): holds the registered provider
+//!   resolved synchronously from the recipe; the actual `TableProvider::scan` is
+//!   replayed lazily inside [`execute`](IcebergScanExec::execute) — in proper
+//!   async context — so no catalog I/O happens during synchronous plan
+//!   deserialization and no blocking bridge is needed.
 //!
 //! It is a *leaf* node: [`children`](IcebergScanExec::children) returns an empty
-//! list so the non-serializable inner scan is never handed to Ballista's codec.
-//! All execution is delegated to the inner [`IcebergTableScan`].
+//! list so the non-serializable scan is never handed to Ballista's codec.
 
 use std::any::Any;
 use std::fmt;
 use std::sync::Arc;
 
 use arrow_schema::SchemaRef;
+use datafusion::catalog::TableProvider;
 use datafusion::common::{Result, Statistics, TableReference};
 use datafusion::config::ConfigOptions;
 use datafusion::error::DataFusionError;
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
 use datafusion::logical_expr::Expr;
-use datafusion::physical_expr::OrderingRequirements;
+use datafusion::physical_expr::{EquivalenceProperties, OrderingRequirements, Partitioning};
 use datafusion::physical_plan::execution_plan::{
-    CardinalityEffect, InvariantLevel, check_default_invariants,
+    Boundedness, CardinalityEffect, EmissionType, InvariantLevel, check_default_invariants,
 };
 use datafusion::physical_plan::filter_pushdown::{
     ChildPushdownResult, FilterDescription, FilterPushdownPhase, FilterPushdownPropagation,
 };
 use datafusion::physical_plan::metrics::MetricsSet;
 use datafusion::physical_plan::projection::ProjectionExec;
+use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, Distribution, ExecutionPlan, PhysicalExpr, PlanProperties,
     SortOrderPushdownResult, expressions::PhysicalSortExpr,
 };
-use datafusion::prelude::SessionConfig;
+use datafusion::prelude::{SessionConfig, SessionContext};
+use futures::TryStreamExt;
 use runtime_datafusion::config::cluster_config::SpiceClusterConfig;
 
 /// Returns `true` when `config` belongs to a distributed (Ballista) session.
@@ -70,24 +78,27 @@ pub fn session_is_distributed(config: &SessionConfig) -> bool {
         .is_some()
 }
 
-/// A leaf execution plan that wraps an [`IcebergTableScan`] for distributed
-/// execution.
-///
-/// It carries the [`TableReference`] of the registered Iceberg provider plus the
-/// scan's projection, filters, and limit. The physical codec serializes this
-/// recipe; the executor resolves the registered provider and calls its `scan()`
-/// with the same arguments to re-derive an equivalent (identically bucketed)
-/// scan — sidestepping the iceberg `FileScanTask` fields that are intentionally
-/// non-serializable, while reusing the provider's catalog (no secrets on the
-/// wire). Execution is delegated to `inner`.
+/// How an [`IcebergScanExec`] produces its rows.
+#[derive(Debug)]
+enum ScanSource {
+    /// Planning-time: the concrete scan the provider produced (scheduler side and
+    /// single-node execution). Execution delegates straight to it.
+    Planned(Arc<dyn ExecutionPlan>),
+    /// Decode-time on a remote executor: the registered Iceberg provider, resolved
+    /// synchronously from the recipe. The scan is re-derived lazily at `execute()`
+    /// time so no catalog I/O runs during synchronous plan deserialization.
+    Deferred(Arc<dyn TableProvider>),
+}
+
+/// A leaf execution plan that represents a distributed Iceberg scan. See the
+/// module docs for the planning-vs-deferred modes.
 #[derive(Debug)]
 pub struct IcebergScanExec {
     /// `DataFusion` reference of the registered Iceberg table, used by the codec
     /// to resolve the provider (and reuse its catalog) on the executor.
     table_ref: TableReference,
-    /// The wrapped Iceberg scan (an `IcebergTableScan`). Held privately and never
-    /// exposed as a child, so Ballista never tries to serialize it directly.
-    inner: Arc<dyn ExecutionPlan>,
+    /// Output schema (projected). Cached so `schema()` is sync in both modes.
+    schema: SchemaRef,
     /// Column projection passed to `TableProvider::scan`, replayed on the executor.
     projection: Option<Vec<usize>>,
     /// Pushed-down filters passed to `TableProvider::scan`, replayed on the
@@ -95,11 +106,16 @@ pub struct IcebergScanExec {
     filters: Vec<Expr>,
     /// Row limit passed to `TableProvider::scan`.
     limit: Option<usize>,
+    /// Cached plan properties (schema + partitioning).
+    properties: Arc<PlanProperties>,
+    /// Where rows come from — see [`ScanSource`].
+    source: ScanSource,
 }
 
 impl IcebergScanExec {
-    /// Wraps `inner` (an `IcebergTableScan`) with the table reference and the
-    /// scan arguments needed to reconstruct an equivalent scan remotely.
+    /// Planning-time constructor: wraps the concrete `inner` scan (an
+    /// `IcebergTableScan`) the provider produced, carrying the scan arguments the
+    /// codec needs to serialize a recipe.
     #[must_use]
     pub fn new(
         table_ref: TableReference,
@@ -108,12 +124,48 @@ impl IcebergScanExec {
         filters: Vec<Expr>,
         limit: Option<usize>,
     ) -> Self {
+        let schema = inner.schema();
+        let properties = Arc::clone(inner.properties());
         Self {
             table_ref,
-            inner,
+            schema,
             projection,
             filters,
             limit,
+            properties,
+            source: ScanSource::Planned(inner),
+        }
+    }
+
+    /// Decode-time constructor: builds a deferred scan over the registered
+    /// `provider`. `schema` and `partitioning` are reconstructed from the recipe
+    /// so `properties()` is correct before the (lazy) scan runs. The provider must
+    /// be the concrete Iceberg provider (e.g. `cluster.inner()`), not the cluster
+    /// wrapper, so replaying its `scan()` yields the bare scan without re-wrapping.
+    #[must_use]
+    pub fn new_deferred(
+        table_ref: TableReference,
+        provider: Arc<dyn TableProvider>,
+        projection: Option<Vec<usize>>,
+        filters: Vec<Expr>,
+        limit: Option<usize>,
+        schema: SchemaRef,
+        partitioning: Partitioning,
+    ) -> Self {
+        let properties = Arc::new(PlanProperties::new(
+            EquivalenceProperties::new(Arc::clone(&schema)),
+            partitioning,
+            EmissionType::Incremental,
+            Boundedness::Bounded,
+        ));
+        Self {
+            table_ref,
+            schema,
+            projection,
+            filters,
+            limit,
+            properties,
+            source: ScanSource::Deferred(provider),
         }
     }
 
@@ -121,12 +173,6 @@ impl IcebergScanExec {
     #[must_use]
     pub fn table_ref(&self) -> &TableReference {
         &self.table_ref
-    }
-
-    /// The wrapped Iceberg scan (an `IcebergTableScan`).
-    #[must_use]
-    pub fn inner(&self) -> &Arc<dyn ExecutionPlan> {
-        &self.inner
     }
 
     /// The scan's column projection.
@@ -150,8 +196,20 @@ impl IcebergScanExec {
 
 impl DisplayAs for IcebergScanExec {
     fn fmt_as(&self, t: DisplayFormatType, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "IcebergScanExec table_ref=[{}] ", self.table_ref)?;
-        self.inner.fmt_as(t, f)
+        write!(f, "IcebergScanExec table_ref=[{}]", self.table_ref)?;
+        match &self.source {
+            ScanSource::Planned(inner) => {
+                write!(f, " ")?;
+                inner.fmt_as(t, f)
+            }
+            ScanSource::Deferred(_) => {
+                let projection = self
+                    .projection
+                    .as_ref()
+                    .map_or_else(String::new, |p| format!("{p:?}"));
+                write!(f, " deferred projection:[{projection}]")
+            }
+        }
     }
 }
 
@@ -177,11 +235,11 @@ impl ExecutionPlan for IcebergScanExec {
     }
 
     fn properties(&self) -> &Arc<PlanProperties> {
-        self.inner.properties()
+        &self.properties
     }
 
     fn schema(&self) -> SchemaRef {
-        self.inner.schema()
+        Arc::clone(&self.schema)
     }
 
     fn check_invariants(&self, check: InvariantLevel) -> Result<()> {
@@ -240,15 +298,44 @@ impl ExecutionPlan for IcebergScanExec {
         partition: usize,
         context: Arc<TaskContext>,
     ) -> Result<SendableRecordBatchStream> {
-        self.inner.execute(partition, context)
+        match &self.source {
+            ScanSource::Planned(inner) => inner.execute(partition, context),
+            ScanSource::Deferred(provider) => {
+                let provider = Arc::clone(provider);
+                let projection = self.projection.clone();
+                let filters = self.filters.clone();
+                let limit = self.limit;
+                let schema = self.schema();
+
+                // Re-derive the scan lazily, in async context. A SessionState
+                // carrying the per-job config (notably `target_partitions`) makes
+                // the rebuilt scan bucket the same way the scheduler planned.
+                let fut = async move {
+                    let session =
+                        SessionContext::new_with_config(context.session_config().clone()).state();
+                    let plan = provider
+                        .scan(&session, projection.as_ref(), &filters, limit)
+                        .await?;
+                    plan.execute(partition, context)
+                };
+                let stream = futures::stream::once(fut).try_flatten();
+                Ok(Box::pin(RecordBatchStreamAdapter::new(schema, stream)))
+            }
+        }
     }
 
     fn metrics(&self) -> Option<MetricsSet> {
-        self.inner.metrics()
+        match &self.source {
+            ScanSource::Planned(inner) => inner.metrics(),
+            ScanSource::Deferred(_) => None,
+        }
     }
 
     fn partition_statistics(&self, partition: Option<usize>) -> Result<Arc<Statistics>> {
-        self.inner.partition_statistics(partition)
+        match &self.source {
+            ScanSource::Planned(inner) => inner.partition_statistics(partition),
+            ScanSource::Deferred(_) => Ok(Arc::new(Statistics::new_unknown(&self.schema))),
+        }
     }
 
     fn supports_limit_pushdown(&self) -> bool {

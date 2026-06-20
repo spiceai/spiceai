@@ -26,7 +26,9 @@ use cayenne::provider::CayenneAccelerationExec;
 use datafusion::common::{DataFusionError, Result, TableReference, exec_err};
 use datafusion::execution::{FunctionRegistry, TaskContext};
 use datafusion::logical_expr::Expr;
-use datafusion::physical_plan::ExecutionPlan;
+use datafusion::physical_expr::Partitioning;
+use datafusion::physical_expr::expressions::Column;
+use datafusion::physical_plan::{ExecutionPlan, PhysicalExpr};
 use datafusion_expr::ScalarUDF;
 use datafusion_proto::bytes::Serializeable;
 use datafusion_proto::generated::datafusion_common;
@@ -39,8 +41,9 @@ use prost::Message;
 use runtime_datafusion::execution_plan::schema_cast::SchemaCastScanExec;
 use runtime_datafusion::extension::bytes_processed::BytesProcessedExec;
 use runtime_proto::{
-    BytesProcessedExecNode, CayenneAccelerationExecNode, IcebergTableScanExecNode,
-    SchemaCastScanExecNode, SpicePhysicalPlanNode, UdtfExecNode, spice_physical_plan_node,
+    BytesProcessedExecNode, CayenneAccelerationExecNode, IcebergHashColumn, IcebergPartitioning,
+    IcebergTableScanExecNode, SchemaCastScanExecNode, SpicePhysicalPlanNode, UdtfExecNode,
+    spice_physical_plan_node,
 };
 use std::fmt::Debug;
 use std::sync::Arc;
@@ -185,20 +188,47 @@ impl PhysicalExtensionCodec for SpicePhysicalCodec {
                         })
                     })
                     .transpose()?;
+                let partitioning = decode_partitioning(node.partitioning.as_ref());
 
-                // Re-derive the scan by replaying TableProvider::scan on the
-                // already-registered Iceberg provider, reusing its catalog. No
-                // secrets cross the wire and no catalog is rebuilt — the executor
-                // loaded the same app definition, so re-planning with the same
-                // projection/filters reproduces the scheduler's bucketing.
-                replan_registered_iceberg_scan(
-                    &runtime,
-                    ctx,
-                    &table_ref,
-                    projection.as_ref(),
-                    &filters,
+                // Resolve the registered provider synchronously — no catalog I/O,
+                // no blocking bridge. The executor loaded the same app definition,
+                // so the Iceberg dataset is already registered (in the default
+                // catalog, which is sync-accessible). The actual scan is replayed
+                // lazily at execute() time; see IcebergScanExec::new_deferred.
+                let provider = runtime.df.get_table_sync(&table_ref).ok_or_else(|| {
+                    DataFusionError::Execution(format!(
+                        "Iceberg table {table_ref} is not registered on this executor; \
+                         cannot reconstruct the distributed scan"
+                    ))
+                })?;
+                let peeled = peel_table_provider_wrappers(&provider);
+                let Some(cluster) = peeled.downcast_ref::<IcebergClusterTableProvider>() else {
+                    return exec_err!(
+                        "registered provider for {table_ref} is not an IcebergClusterTableProvider; \
+                         distributed Iceberg scans require the Iceberg data connector"
+                    );
+                };
+                // The concrete Iceberg provider (not the cluster wrapper), so
+                // replaying its scan() yields the bare scan without re-wrapping.
+                let inner_provider = Arc::clone(cluster.inner());
+
+                // Output schema = table schema projected by the recipe, taken
+                // synchronously from the registered provider.
+                let table_schema = inner_provider.schema();
+                let output_schema = match &projection {
+                    Some(p) => Arc::new(table_schema.project(p)?),
+                    None => table_schema,
+                };
+
+                Ok(Arc::new(IcebergScanExec::new_deferred(
+                    table_ref,
+                    inner_provider,
+                    projection,
+                    filters,
                     limit,
-                )
+                    output_schema,
+                    partitioning,
+                )))
             }
             None => {
                 #[cfg(not(windows))]
@@ -282,6 +312,7 @@ impl PhysicalExtensionCodec for SpicePhysicalCodec {
                     })
                 })
                 .transpose()?;
+            let partitioning = encode_partitioning(scan_exec.properties().output_partitioning());
 
             SpicePhysicalPlanNode {
                 node: Some(spice_physical_plan_node::Node::IcebergTableScan(
@@ -291,6 +322,7 @@ impl PhysicalExtensionCodec for SpicePhysicalCodec {
                         has_projection,
                         filters,
                         limit,
+                        partitioning: Some(partitioning),
                     },
                 )),
             }
@@ -323,74 +355,76 @@ impl PhysicalExtensionCodec for SpicePhysicalCodec {
     }
 }
 
-/// Re-derives an Iceberg scan on this executor by replaying
-/// [`TableProvider::scan`] on the already-registered provider for `table_ref`.
+/// Serializes a scan's output [`Partitioning`] into its wire form, so the
+/// deferred node on the executor reports the same partition count the scheduler
+/// planned (before the lazy scan runs).
 ///
-/// The executor loaded the same app definition as the scheduler, so the Iceberg
-/// provider (an [`IcebergClusterTableProvider`], possibly behind registration
-/// wrappers) is already registered. Resolving it and re-calling `scan` with the
-/// same projection/filters/limit rebuilds an equivalent, identically bucketed
-/// scan — reusing the provider's catalog (no secrets cross the wire, no catalog
-/// rebuilt) and producing a fresh [`IcebergScanExec`].
-///
-/// The replan uses the runtime's session state but overrides `target_partitions`
-/// with the value from the per-job [`TaskContext`]. Iceberg's partition (bucket)
-/// count is `target_partitions.min(num_tasks)`, so the replan must use the same
-/// `target_partitions` the scheduler planned with — otherwise the executor could
-/// rebuild a scan with a different partition count than the stage expects.
-fn replan_registered_iceberg_scan(
-    runtime: &Arc<Runtime>,
-    ctx: &TaskContext,
-    table_ref: &TableReference,
-    projection: Option<&Vec<usize>>,
-    filters: &[Expr],
-    limit: Option<usize>,
-) -> Result<Arc<dyn ExecutionPlan>> {
-    // The codec API is synchronous but resolution/scan are async; this path runs
-    // only at plan-decode time on an executor, so blocking is acceptable.
-    let provider = tokio::task::block_in_place(|| {
-        tokio::runtime::Handle::current().block_on(runtime.df.get_table(table_ref))
-    })
-    .ok_or_else(|| {
-        DataFusionError::Execution(format!(
-            "Iceberg table {table_ref} is not registered on this executor; \
-             cannot reconstruct the distributed scan"
-        ))
-    })?;
-
-    // Peel the registration wrappers (FederatedTableProviderAdaptor,
-    // MetadataEnrichedTableProvider) down to the IcebergClusterTableProvider that
-    // dataset registration leaves in the catalog. The Spice `FederatedTable`
-    // holder is already resolved to its inner provider at registration time, so
-    // it is never the registered provider here.
-    let peeled = peel_table_provider_wrappers(&provider);
-    if peeled
-        .downcast_ref::<IcebergClusterTableProvider>()
-        .is_none()
-    {
-        return exec_err!(
-            "registered provider for {table_ref} is not an IcebergClusterTableProvider; \
-             distributed Iceberg scans require the Iceberg data connector"
-        );
+/// Hash partitioning is reproduced only when every expression is a plain
+/// [`Column`]; otherwise the count is preserved as
+/// [`Partitioning::UnknownPartitioning`].
+fn encode_partitioning(partitioning: &Partitioning) -> IcebergPartitioning {
+    let to_u64 = |n: usize| u64::try_from(n).unwrap_or(u64::MAX);
+    match partitioning {
+        Partitioning::UnknownPartitioning(n) => IcebergPartitioning {
+            kind: 0,
+            partition_count: to_u64(*n),
+            hash_columns: Vec::new(),
+        },
+        Partitioning::RoundRobinBatch(n) => IcebergPartitioning {
+            kind: 2,
+            partition_count: to_u64(*n),
+            hash_columns: Vec::new(),
+        },
+        Partitioning::Hash(exprs, n) => {
+            let hash_columns: Vec<IcebergHashColumn> = exprs
+                .iter()
+                .filter_map(|expr| {
+                    expr.downcast_ref::<Column>().map(|c| IcebergHashColumn {
+                        name: c.name().to_string(),
+                        index: to_u64(c.index()),
+                    })
+                })
+                .collect();
+            if hash_columns.len() == exprs.len() {
+                IcebergPartitioning {
+                    kind: 1,
+                    partition_count: to_u64(*n),
+                    hash_columns,
+                }
+            } else {
+                IcebergPartitioning {
+                    kind: 0,
+                    partition_count: to_u64(*n),
+                    hash_columns: Vec::new(),
+                }
+            }
+        }
     }
+}
 
-    // Align target_partitions with the scheduler's per-job config so the rebuilt
-    // scan buckets into the same number of partitions as the planned stage.
-    let mut session_state = runtime.df.ctx.state();
-    session_state
-        .config_mut()
-        .options_mut()
-        .execution
-        .target_partitions = ctx.session_config().options().execution.target_partitions;
-
-    tokio::task::block_in_place(|| {
-        tokio::runtime::Handle::current().block_on(peeled.scan(
-            &session_state,
-            projection,
-            filters,
-            limit,
-        ))
-    })
+/// Reconstructs a [`Partitioning`] from its wire form.
+fn decode_partitioning(partitioning: Option<&IcebergPartitioning>) -> Partitioning {
+    let Some(p) = partitioning else {
+        return Partitioning::UnknownPartitioning(1);
+    };
+    let n = usize::try_from(p.partition_count).unwrap_or(usize::MAX);
+    match p.kind {
+        1 => {
+            let exprs: Vec<Arc<dyn PhysicalExpr>> = p
+                .hash_columns
+                .iter()
+                .map(|c| {
+                    Arc::new(Column::new(
+                        &c.name,
+                        usize::try_from(c.index).unwrap_or(usize::MAX),
+                    )) as Arc<dyn PhysicalExpr>
+                })
+                .collect();
+            Partitioning::Hash(exprs, n)
+        }
+        2 => Partitioning::RoundRobinBatch(n),
+        _ => Partitioning::UnknownPartitioning(n),
+    }
 }
 
 #[cfg(not(windows))]

@@ -35,7 +35,7 @@ use std::sync::Arc;
 
 use arrow_schema::SchemaRef as ArrowSchemaRef;
 use async_trait::async_trait;
-use datafusion::catalog::{Session, TableProvider};
+use datafusion::catalog::{ScanArgs, ScanResult, Session, TableProvider};
 use datafusion::common::{Constraints, Result as DFResult, Statistics};
 use datafusion::datasource::TableType;
 use datafusion::logical_expr::dml::InsertOp;
@@ -79,6 +79,10 @@ impl IcebergClusterTableProvider {
     }
 }
 
+// Deny missing trait methods so that a newly added `TableProvider` method (even
+// one with a default) forces an explicit decision here, rather than silently
+// bypassing this wrapper's distributed-scan handling.
+#[deny(clippy::missing_trait_methods)]
 #[async_trait]
 impl TableProvider for IcebergClusterTableProvider {
     fn schema(&self) -> ArrowSchemaRef {
@@ -146,6 +150,26 @@ impl TableProvider for IcebergClusterTableProvider {
         Ok(plan)
     }
 
+    async fn scan_with_args<'a>(
+        &self,
+        state: &dyn Session,
+        args: ScanArgs<'a>,
+    ) -> DFResult<ScanResult> {
+        // Route through our own `scan` (mirroring the trait's default) so the
+        // distributed `IcebergScanExec` wrapping is applied. Forwarding straight
+        // to `self.inner` would bypass it and make Iceberg scans unserializable.
+        let projection = args.projection().map(<[usize]>::to_vec);
+        let plan = self
+            .scan(
+                state,
+                projection.as_ref(),
+                args.filters().unwrap_or(&[]),
+                args.limit(),
+            )
+            .await?;
+        Ok(plan.into())
+    }
+
     async fn insert_into(
         &self,
         state: &dyn Session,
@@ -161,5 +185,18 @@ impl TableProvider for IcebergClusterTableProvider {
         filters: Vec<Expr>,
     ) -> DFResult<Arc<dyn ExecutionPlan>> {
         self.inner.delete_from(state, filters).await
+    }
+
+    async fn update(
+        &self,
+        state: &dyn Session,
+        assignments: Vec<(String, Expr)>,
+        filters: Vec<Expr>,
+    ) -> DFResult<Arc<dyn ExecutionPlan>> {
+        self.inner.update(state, assignments, filters).await
+    }
+
+    async fn truncate(&self, state: &dyn Session) -> DFResult<Arc<dyn ExecutionPlan>> {
+        self.inner.truncate(state).await
     }
 }
