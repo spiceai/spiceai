@@ -148,12 +148,23 @@ impl PhysicalExtensionCodec for SpicePhysicalCodec {
                 let runtime = self.runtime()?;
                 let table_ref = TableReference::from(node.table_ref.as_str());
 
+                // Surface conversion failures as structured errors rather than
+                // saturating: a corrupt recipe or scheduler/executor version skew
+                // should fail clearly here, not as a later out-of-bounds column or
+                // an effectively unbounded limit.
                 let projection: Option<Vec<usize>> = if node.has_projection {
                     Some(
                         node.projection
                             .iter()
-                            .map(|c| usize::try_from(*c).unwrap_or(usize::MAX))
-                            .collect(),
+                            .map(|c| {
+                                usize::try_from(*c).map_err(|_| {
+                                    DataFusionError::Internal(format!(
+                                        "iceberg scan recipe for {table_ref} has projection index \
+                                         {c} that does not fit in usize"
+                                    ))
+                                })
+                            })
+                            .collect::<Result<Vec<usize>>>()?,
                     )
                 } else {
                     None
@@ -163,7 +174,17 @@ impl PhysicalExtensionCodec for SpicePhysicalCodec {
                     .iter()
                     .map(|bytes| Expr::from_bytes_with_ctx(bytes, ctx))
                     .collect::<Result<Vec<Expr>>>()?;
-                let limit = node.limit.map(|l| usize::try_from(l).unwrap_or(usize::MAX));
+                let limit = node
+                    .limit
+                    .map(|l| {
+                        usize::try_from(l).map_err(|_| {
+                            DataFusionError::Internal(format!(
+                                "iceberg scan recipe for {table_ref} has limit {l} that does not \
+                                 fit in usize"
+                            ))
+                        })
+                    })
+                    .transpose()?;
 
                 // Re-derive the scan by replaying TableProvider::scan on the
                 // already-registered Iceberg provider, reusing its catalog. No
@@ -172,6 +193,7 @@ impl PhysicalExtensionCodec for SpicePhysicalCodec {
                 // projection/filters reproduces the scheduler's bucketing.
                 replan_registered_iceberg_scan(
                     &runtime,
+                    ctx,
                     &table_ref,
                     projection.as_ref(),
                     &filters,
@@ -225,13 +247,22 @@ impl PhysicalExtensionCodec for SpicePhysicalCodec {
             // The executor replays `TableProvider::scan` with these to re-derive
             // an equivalent scan — the iceberg `FileScanTask`s themselves are not
             // serializable (partition / partition_spec fields), so the plan is
-            // rebuilt remotely rather than shipped.
+            // rebuilt remotely rather than shipped. Conversions that don't fit the
+            // wire types fail serialization explicitly rather than silently
+            // saturating into a malformed recipe.
             let (has_projection, projection) = match scan_exec.projection() {
                 Some(cols) => (
                     true,
                     cols.iter()
-                        .map(|c| u32::try_from(*c).unwrap_or(u32::MAX))
-                        .collect(),
+                        .map(|c| {
+                            u32::try_from(*c).map_err(|_| {
+                                DataFusionError::Internal(format!(
+                                    "IcebergScanExec projection index {c} does not fit in u32; \
+                                     cannot serialize the scan for distributed execution"
+                                ))
+                            })
+                        })
+                        .collect::<Result<Vec<u32>>>()?,
                 ),
                 None => (false, Vec::new()),
             };
@@ -240,6 +271,17 @@ impl PhysicalExtensionCodec for SpicePhysicalCodec {
                 .iter()
                 .map(|expr| expr.to_bytes().map(|b| b.to_vec()))
                 .collect::<Result<Vec<Vec<u8>>>>()?;
+            let limit = scan_exec
+                .limit()
+                .map(|l| {
+                    u64::try_from(l).map_err(|_| {
+                        DataFusionError::Internal(format!(
+                            "IcebergScanExec limit {l} does not fit in u64; cannot serialize the \
+                             scan for distributed execution"
+                        ))
+                    })
+                })
+                .transpose()?;
 
             SpicePhysicalPlanNode {
                 node: Some(spice_physical_plan_node::Node::IcebergTableScan(
@@ -248,9 +290,7 @@ impl PhysicalExtensionCodec for SpicePhysicalCodec {
                         projection,
                         has_projection,
                         filters,
-                        limit: scan_exec
-                            .limit()
-                            .map(|l| u64::try_from(l).unwrap_or(u64::MAX)),
+                        limit,
                     },
                 )),
             }
@@ -292,8 +332,15 @@ impl PhysicalExtensionCodec for SpicePhysicalCodec {
 /// same projection/filters/limit rebuilds an equivalent, identically bucketed
 /// scan — reusing the provider's catalog (no secrets cross the wire, no catalog
 /// rebuilt) and producing a fresh [`IcebergScanExec`].
+///
+/// The replan uses the runtime's session state but overrides `target_partitions`
+/// with the value from the per-job [`TaskContext`]. Iceberg's partition (bucket)
+/// count is `target_partitions.min(num_tasks)`, so the replan must use the same
+/// `target_partitions` the scheduler planned with — otherwise the executor could
+/// rebuild a scan with a different partition count than the stage expects.
 fn replan_registered_iceberg_scan(
     runtime: &Arc<Runtime>,
+    ctx: &TaskContext,
     table_ref: &TableReference,
     projection: Option<&Vec<usize>>,
     filters: &[Expr],
@@ -327,7 +374,15 @@ fn replan_registered_iceberg_scan(
         );
     }
 
-    let session_state = runtime.df.ctx.state();
+    // Align target_partitions with the scheduler's per-job config so the rebuilt
+    // scan buckets into the same number of partitions as the planned stage.
+    let mut session_state = runtime.df.ctx.state();
+    session_state
+        .config_mut()
+        .options_mut()
+        .execution
+        .target_partitions = ctx.session_config().options().execution.target_partitions;
+
     tokio::task::block_in_place(|| {
         tokio::runtime::Handle::current().block_on(peeled.scan(
             &session_state,
@@ -420,5 +475,53 @@ mod tests {
             plan.contains("CayenneAccelerationExec"),
             "Cayenne scan marker should survive distributed codec roundtrip: {plan}"
         );
+    }
+
+    #[test]
+    fn iceberg_scan_exec_encodes_recipe() {
+        use datafusion::logical_expr::{col as logical_col, lit};
+        use datafusion::physical_plan::empty::EmptyExec;
+
+        // The encode arm reads only IcebergScanExec's own recipe fields, not the
+        // inner plan's type, so an EmptyExec inner is sufficient to exercise it.
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Int32, false),
+            Field::new("b", DataType::Utf8, true),
+            Field::new("c", DataType::Float64, true),
+        ]));
+        let inner: Arc<dyn ExecutionPlan> = Arc::new(EmptyExec::new(schema));
+        let scan = IcebergScanExec::new(
+            TableReference::bare("trips"),
+            inner,
+            Some(vec![0, 2]),
+            vec![logical_col("a").gt(lit(5_i64))],
+            Some(10),
+        );
+
+        let codec = SpicePhysicalCodec {
+            inner: Arc::new(BallistaPhysicalExtensionCodec::default()),
+            runtime: None,
+        };
+        let mut buf = Vec::new();
+        codec
+            .try_encode(Arc::new(scan), &mut buf)
+            .expect("IcebergScanExec should serialize through the Spice codec");
+
+        let wrapper =
+            SpicePhysicalPlanNode::decode(buf.as_slice()).expect("encoded blob should decode");
+        match wrapper.node {
+            Some(spice_physical_plan_node::Node::IcebergTableScan(node)) => {
+                assert_eq!(node.table_ref, "trips");
+                assert!(node.has_projection);
+                assert_eq!(node.projection, vec![0_u32, 2_u32]);
+                assert_eq!(node.limit, Some(10_u64));
+                assert_eq!(
+                    node.filters.len(),
+                    1,
+                    "the pushed-down filter should be serialized into the recipe"
+                );
+            }
+            other => panic!("expected an IcebergTableScan recipe node, got {other:?}"),
+        }
     }
 }
