@@ -18668,39 +18668,40 @@ impl CayenneTableProvider {
     }
 }
 
-/// Map a stored Arrow schema's i32-offset string/binary columns to their Arrow
-/// *view* equivalents (`Utf8` → `Utf8View`, `Binary` → `BinaryView`) for the
-/// read/query path. `LargeUtf8`/`LargeBinary` already use i64 offsets (no 2 GiB
-/// overflow) and are left unchanged — mapping them to a view would be an
-/// unnecessary, runtime-narrowing cast (e.g. a MySQL JSON column → `LargeUtf8`).
+/// Map a stored Arrow schema's `Utf8` columns to `Utf8View` for the read/query
+/// path. ONLY `Utf8` is mapped:
+/// - `LargeUtf8`/`LargeBinary` already use i64 offsets (no 2 GiB overflow), so
+///   viewifying them is unnecessary — and a `LargeUtf8` → `Utf8View` write cast is
+///   flagged narrowing/lossy (e.g. a `MySQL` JSON column → `LargeUtf8`).
+/// - `Binary` is left as-is too: Vortex's `BinaryView` decode currently yields
+///   `LargeBinary`, which would diverge from an advertised `BinaryView` and trip
+///   the runtime's query-result `verify_schema` (e.g. a `MySQL` BLOB column).
+///   `Binary` join keys are rare, so the 2 GiB concat risk there is acceptable.
 ///
 /// Cayenne's stored schema ([`CayenneTableProvider::table_schema`]) — used by
-/// writes, CDC apply, the PK keyset, the deletion index, and footer stats —
-/// keeps the original `Utf8`/`Binary` types. The *query* scan instead advertises
-/// and decodes these columns as view types so `DataFusion` plans operators on
-/// view arrays. The motivating case is the hash-join build side: `DataFusion`
-/// collects the whole build side into one `RecordBatch` via `concat_batches`, and
-/// a `Utf8` column there overflows Arrow's i32 offset buffer once the concatenated
-/// values exceed 2 GiB (`Offset overflow`, e.g. `CH-benCH` q21 at SF1000, `su_name`
-/// fans out across a ~100M-row join). `Utf8View`/`BinaryView` append independent
-/// data buffers instead of re-offsetting one buffer, so they have no 2 GiB
-/// single-array ceiling. Vortex decodes the view type natively when the scan's
-/// reference schema requests it (free on the file path; the small in-memory CDC
-/// branches are cast to match — see `scan()`).
+/// writes, CDC apply, the PK keyset, the deletion index, and footer stats — keeps
+/// the original `Utf8` type. The *query* scan instead advertises and decodes the
+/// column as `Utf8View` so `DataFusion` plans operators on view arrays. The
+/// motivating case is the hash-join build side: `DataFusion` collects the whole
+/// build side into one `RecordBatch` via `concat_batches`, and a `Utf8` column
+/// there overflows Arrow's i32 offset buffer once the concatenated values exceed
+/// 2 GiB (`Offset overflow`, e.g. `CH-benCH` q21 at SF1000, where `su_name` fans
+/// out across a ~100M-row join). `Utf8View` appends independent data buffers
+/// instead of re-offsetting one buffer, so it has no 2 GiB single-array ceiling.
+/// Vortex decodes `Utf8View` natively when the scan's reference schema requests it
+/// (free on the file path; the small in-memory CDC branches are cast to match —
+/// see `scan()`).
 ///
-/// Only top-level fields are mapped (sufficient for the fact-table columns that
-/// hit the overflow); the result is internally consistent regardless because the
-/// same schema drives both the advertised type and the Vortex decode. Returns the
-/// input schema unchanged (same `Arc`) when it has no string/binary columns, so
-/// all-scalar tables pay nothing.
+/// Only top-level fields are mapped. Returns the input schema unchanged (same
+/// `Arc`) when it has no `Utf8` columns, so all-scalar tables pay nothing.
 pub(crate) fn viewify_read_schema(schema: &SchemaRef) -> SchemaRef {
     fn view_type(dt: &DataType) -> Option<DataType> {
         match dt {
-            // Only the i32-offset types overflow the 2 GiB build-side concat;
-            // LargeUtf8/LargeBinary already use i64 offsets, so leave them as-is
-            // (viewifying them would be an unnecessary, runtime-narrowing cast).
+            // Only Utf8 (the i32-offset string type) is the q21 overflow case and
+            // the only type Vortex reliably re-decodes as a view. Binary is NOT
+            // mapped (Vortex's BinaryView path yields LargeBinary -> verify_schema
+            // divergence); LargeUtf8/LargeBinary already use i64 offsets.
             DataType::Utf8 => Some(DataType::Utf8View),
-            DataType::Binary => Some(DataType::BinaryView),
             _ => None,
         }
     }
@@ -20262,7 +20263,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn viewify_read_schema_maps_string_and_binary_to_view_types() {
+    fn viewify_read_schema_maps_only_utf8_to_utf8view() {
         use std::collections::HashMap;
         let md = HashMap::from([("k".to_string(), "v".to_string())]);
         let schema = Arc::new(arrow_schema::Schema::new_with_metadata(
@@ -20279,9 +20280,10 @@ mod tests {
         let view = viewify_read_schema(&schema);
         assert_eq!(view.field(0).data_type(), &DataType::Int64);
         assert_eq!(view.field(1).data_type(), &DataType::Utf8View);
-        // LargeUtf8/LargeBinary already use i64 offsets -> left unchanged.
+        // Only Utf8 is viewified. LargeUtf8/LargeBinary (i64 offsets) and Binary
+        // (Vortex BinaryView decode diverges to LargeBinary) are left unchanged.
         assert_eq!(view.field(2).data_type(), &DataType::LargeUtf8);
-        assert_eq!(view.field(3).data_type(), &DataType::BinaryView);
+        assert_eq!(view.field(3).data_type(), &DataType::Binary);
         assert_eq!(view.field(4).data_type(), &DataType::LargeBinary);
         assert_eq!(view.field(5).data_type(), &DataType::Float64);
         // Names, nullability, and schema metadata are preserved.
@@ -20290,12 +20292,13 @@ mod tests {
         assert!(!view.field(2).is_nullable());
         assert_eq!(view.metadata(), &md);
 
-        // No i32-offset string/binary columns (only Large* / scalar) -> same Arc
-        // returned (zero allocation; LargeUtf8 is never viewified, so a MySQL
-        // JSON -> LargeUtf8 column is not narrowing-cast to a view).
+        // No Utf8 columns (Binary / Large* / scalar) -> same Arc returned (zero
+        // allocation): Binary is not viewified (Vortex BinaryView diverges) and a
+        // MySQL JSON/BLOB column (LargeUtf8/LargeBinary) is not narrowing-cast.
         let no_view = Arc::new(arrow_schema::Schema::new(vec![
             Field::new("id", DataType::Int64, false),
             Field::new("ls", DataType::LargeUtf8, false),
+            Field::new("b", DataType::Binary, false),
         ]));
         assert!(Arc::ptr_eq(&no_view, &viewify_read_schema(&no_view)));
     }
