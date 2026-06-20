@@ -355,7 +355,8 @@ impl FlightSQLTable {
         mut client: FlightSqlClient,
         table_reference: TableReference,
     ) -> Result<SchemaRef> {
-        let flight_info = client
+        // Preferred path: the Flight SQL `GetTables` metadata RPC (best-effort).
+        if let Ok(flight_info) = client
             .get_tables(CommandGetTables {
                 catalog: table_reference.catalog().map(ToString::to_string),
                 db_schema_filter_pattern: table_reference.schema().map(ToString::to_string),
@@ -373,10 +374,32 @@ impl FlightSQLTable {
                 .collect(),
             })
             .await
+        {
+            for tkt in flight_info
+                .endpoint
+                .iter()
+                .filter_map(|ep| ep.ticket.as_ref())
+            {
+                // Schema: https://github.com/apache/arrow/blob/44edc27e549d82db930421b0d4c76098941afd71/format/FlightSql.proto#L1182-L1190
+                if let Ok(stream) = client.do_get(tkt.clone()).await
+                    && let Ok(batch) = stream.try_collect::<Vec<_>>().await
+                    && let Some(schema) =
+                        Self::get_table_schema_if_present(batch, table_reference.clone())
+                {
+                    return Ok(schema);
+                }
+            }
+        }
+
+        // Fallback for Flight SQL servers that don't implement the `GetTables` metadata RPC
+        // (e.g. StarRocks' experimental Flight SQL, which returns `Unimplemented`): infer the
+        // schema from `SELECT * FROM <table> LIMIT 1`, served by the statement-execution path.
+        let flight_info = client
+            .execute(format!("SELECT * FROM {table_reference} LIMIT 1"), None)
+            .await
             .context(UnableToRetrieveSchemaFlightSnafu {
                 table_name: table_reference.to_string(),
             })?;
-
         for tkt in flight_info
             .endpoint
             .iter()
@@ -389,16 +412,13 @@ impl FlightSQLTable {
                     .context(UnableToRetrieveSchemaFlightSnafu {
                         table_name: table_reference.to_string(),
                     })?;
-            let batch = stream.try_collect::<Vec<_>>().await.context(
+            let batches = stream.try_collect::<Vec<_>>().await.context(
                 UnableToRetrieveSchemaFlightSnafu {
                     table_name: table_reference.to_string(),
                 },
             )?;
-
-            // Schema: https://github.com/apache/arrow/blob/44edc27e549d82db930421b0d4c76098941afd71/format/FlightSql.proto#L1182-L1190
-            if let Some(schema) = Self::get_table_schema_if_present(batch, table_reference.clone())
-            {
-                return Ok(schema);
+            if let Some(batch) = batches.first() {
+                return Ok(batch.schema());
             }
         }
 

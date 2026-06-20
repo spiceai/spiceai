@@ -16,8 +16,10 @@ limitations under the License.
 
 //! `SQLite` implementation of the metastore backend.
 //!
-//! Uses `tokio-rusqlite` for a persistent connection managed by a background thread,
-//! avoiding the overhead of opening a new connection for each operation.
+//! Uses `tokio-rusqlite`. Holds a round-robin pool of persistent connections
+//! (`K = min(available_parallelism, 32)`, floor 2) plus a dedicated checkpoint
+//! connection, each managed by a background thread — avoiding the overhead of opening a
+//! new connection per operation and lifting read-side concurrency for metadata-heavy scans.
 
 use super::{
     ExecuteParams, MetastoreBackend, MetastoreGetValue, MetastoreRow, MetastoreTransaction,

@@ -29,10 +29,11 @@ use crate::{
 };
 use async_trait::async_trait;
 use data_components::RefreshableCatalogProvider;
+pub use data_components::RefreshingCatalogProvider;
 use datafusion::catalog::CatalogProvider;
 use deferred::DeferredCatalogProvider;
 use snafu::prelude::*;
-use tokio::{sync::Mutex, task::JoinHandle};
+use tokio::sync::Mutex;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -78,9 +79,6 @@ pub enum Error {
 
     #[snafu(transparent)]
     IcebergSnafu { source: iceberg::Error },
-
-    #[snafu(display("Failed to start a catalog refresh task. The task is already running."))]
-    RefreshTaskAlreadyStarted {},
 
     #[snafu(display(
         "Failed to read partition metadata for table {schema_name}.{table_name}: {source}"
@@ -390,80 +388,8 @@ pub async fn get_catalog_provider(
             .refreshable_catalog_provider(runtime, catalog)
             .await?,
     )
-    .start_refresh(refresh_interval)?;
+    .start_refresh(refresh_interval);
     Ok(Arc::new(provider))
-}
-
-/// A `CatalogProvider` that periodically refreshes its contents from a remote catalog.
-#[derive(Debug)]
-pub struct RefreshingCatalogProvider {
-    inner: Arc<dyn RefreshableCatalogProvider>,
-    refresh_task: Option<JoinHandle<Result<()>>>,
-}
-
-impl RefreshingCatalogProvider {
-    fn new(inner: Arc<dyn RefreshableCatalogProvider>) -> Self {
-        Self {
-            inner,
-            refresh_task: None,
-        }
-    }
-
-    fn start_refresh(mut self, interval: Option<Duration>) -> Result<Self> {
-        if self.refresh_task.is_some() {
-            return Err(Error::RefreshTaskAlreadyStarted {});
-        }
-
-        let interval = interval.unwrap_or(Duration::from_mins(1));
-        let inner = Arc::clone(&self.inner);
-        self.refresh_task = Some(tokio::spawn(async move {
-            loop {
-                tokio::time::sleep(interval).await;
-                match inner.refresh().await {
-                    Ok(()) => (),
-                    Err(e) => {
-                        tracing::error!("Failed to refresh catalog: {}", e);
-                    }
-                }
-            }
-        }));
-        Ok(self)
-    }
-}
-
-#[deny(clippy::missing_trait_methods)]
-impl CatalogProvider for RefreshingCatalogProvider {
-    fn schema_names(&self) -> Vec<String> {
-        self.inner.schema_names()
-    }
-
-    fn schema(&self, name: &str) -> Option<Arc<dyn datafusion::catalog::SchemaProvider>> {
-        self.inner.schema(name)
-    }
-
-    fn register_schema(
-        &self,
-        name: &str,
-        schema: Arc<dyn datafusion::catalog::SchemaProvider>,
-    ) -> datafusion::error::Result<Option<Arc<dyn datafusion::catalog::SchemaProvider>>> {
-        self.inner.register_schema(name, schema)
-    }
-
-    fn deregister_schema(
-        &self,
-        name: &str,
-        cascade: bool,
-    ) -> datafusion::error::Result<Option<Arc<dyn datafusion::catalog::SchemaProvider>>> {
-        self.inner.deregister_schema(name, cascade)
-    }
-}
-
-impl Drop for RefreshingCatalogProvider {
-    fn drop(&mut self) {
-        if let Some(task) = self.refresh_task.take() {
-            task.abort();
-        }
-    }
 }
 
 #[cfg(test)]
