@@ -68,7 +68,7 @@ datasets:
         # growth on the delete-receiving table). Key-delete compaction runs
         # concurrently with writers.
         cayenne_deletion_mode: key
-        cayenne_write_concurrency: '4'
+        cayenne_write_concurrency: '8'
         cayenne_segment_cache_mb: '1024'
         cayenne_compaction_trigger_protected_snapshots: '3'
         cayenne_pk_keyset_cache_mb: '256'
@@ -96,7 +96,10 @@ datasets:
       params:
         <<: *accel_high_volume
         cayenne_file_path: .spice/cayenne/customer
-        cayenne_target_file_size_mb: '256'
+        # 512 (was 256): fewer/larger files speed scans on the many-core CI runner (SF-1000 has
+        # 10x the data, so this matters more). NOTE: regresses on ~16-core hosts (compaction
+        # contention); many-core value. write_concurrency 8 (anchors) is the paired apply bump.
+        cayenne_target_file_size_mb: '512'
 
   - from: postgres:new_order
     name: new_order
@@ -154,8 +157,8 @@ datasets:
       params:
         <<: *accel_high_volume
         cayenne_file_path: .spice/cayenne/order_line
-        cayenne_write_concurrency: '4'
-        cayenne_target_file_size_mb: '256'
+        cayenne_write_concurrency: '8'
+        cayenne_target_file_size_mb: '512'
         cayenne_compaction_trigger_files: '8'
         cayenne_compaction_trigger_snapshot_age_ms: '30000'
         cayenne_compaction_max_files_per_pick: '128'
@@ -179,7 +182,7 @@ datasets:
       params:
         <<: *accel_high_volume
         cayenne_file_path: .spice/cayenne/stock
-        cayenne_target_file_size_mb: '256'
+        cayenne_target_file_size_mb: '512'
 
   # ------------------------------------------------------------------
   # Low-volume reference tables.
@@ -206,7 +209,7 @@ datasets:
         # See &accel_high_volume: explicit file durability + key deletes.
         cayenne_cdc_durability: file
         cayenne_deletion_mode: key
-        cayenne_write_concurrency: '4'
+        cayenne_write_concurrency: '8'
         cayenne_segment_cache_mb: '64'
         cayenne_pk_keyset_cache_mb: '256'
         cdc_max_coalesce_age_ms: '3000'
