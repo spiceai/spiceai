@@ -175,6 +175,7 @@ pub mod ducklake;
 pub mod gcs;
 pub mod glue;
 pub mod iceberg;
+pub mod iceberg_cluster;
 pub mod parameters;
 pub mod s3;
 pub mod sink;
