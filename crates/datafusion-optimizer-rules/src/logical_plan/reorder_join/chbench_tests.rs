@@ -225,24 +225,22 @@ const TABLES: &[&str] = &[
 ];
 
 /// A plain DataFusion default optimizer with *only* `ReorderJoinRule` inserted,
-/// at the same pipeline position the Spice runtime uses (after the join graph is
-/// formed — `eliminate_cross_join` — and before projection pushdown fragments it).
+/// at the same pipeline position the Spice runtime uses: after the *latest* of
+/// the prerequisite rules — `push_down_filter` (so `TableScan.filters` are
+/// populated for cost-based selectivity), `eliminate_cross_join`, and (in the
+/// runtime) `cayenne_reassociate_cross_join` — and before projection pushdown
+/// fragments the join graph. Mirrors `insert_cayenne_join_reorder_rule`: insert
+/// after the max position, not after the first match, since
+/// `eliminate_cross_join` precedes `push_down_filter` in the default order. The
+/// plain optimizer has no `cayenne_reassociate_cross_join`, so the latest
+/// prerequisite present is `push_down_filter`.
 fn make_reordered_ctx() -> SessionContext {
     let mut rules = Optimizer::new().rules;
-    let insert_at = rules
+    let insert_at = ["push_down_filter", "eliminate_cross_join"]
         .iter()
-        .position(|rule| rule.name() == "eliminate_cross_join")
-        .map(|position| position + 1)
-        .or_else(|| {
-            // After `push_down_filter`, not before — mirrors the runtime
-            // (`insert_cayenne_join_reorder_rule`) so `TableScan.filters` are
-            // populated for costing.
-            rules
-                .iter()
-                .position(|rule| rule.name() == "push_down_filter")
-                .map(|position| position + 1)
-        })
-        .unwrap_or(rules.len());
+        .filter_map(|name| rules.iter().position(|rule| rule.name() == *name))
+        .max()
+        .map_or(rules.len(), |position| position + 1);
     rules.insert(insert_at, Arc::new(ReorderJoinRule::default()));
 
     let state = SessionStateBuilder::new()
