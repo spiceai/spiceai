@@ -16,9 +16,9 @@ limitations under the License.
 
 use crate::Runtime;
 use crate::dataconnector::iceberg_cluster::IcebergClusterTableProvider;
-use crate::datafusion::planner::peel_table_provider_wrappers;
 use crate::execution_plan::{IcebergScanExec, UdtfExec};
 use crate::metrics::telemetry::track_bytes_processed;
+use crate::search::util::find_concrete_table_provider;
 use arrow_schema::Schema;
 use ballista_core::serde::BallistaPhysicalExtensionCodec;
 #[cfg(not(windows))]
@@ -204,8 +204,14 @@ impl PhysicalExtensionCodec for SpicePhysicalCodec {
                          cannot reconstruct the distributed scan"
                     ))
                 })?;
-                let peeled = peel_table_provider_wrappers(&provider);
-                let Some(cluster) = peeled.downcast_ref::<IcebergClusterTableProvider>() else {
+                // Locate the cluster provider through ALL known runtime wrappers
+                // (FederatedTableProviderAdaptor, MetadataEnrichedTableProvider,
+                // EmbeddingTable, IndexedTableProvider, AcceleratedTable, …), not
+                // just the federation/metadata pair — an Iceberg dataset with
+                // embeddings or a search index is wrapped further.
+                let Some(cluster) =
+                    find_concrete_table_provider::<IcebergClusterTableProvider>(&provider)
+                else {
                     return exec_err!(
                         "registered provider for {table_ref} is not an IcebergClusterTableProvider; \
                          distributed Iceberg scans require the Iceberg data connector"
