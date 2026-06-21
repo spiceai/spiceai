@@ -13282,6 +13282,50 @@ impl CayenneTableProvider {
         }
     }
 
+    /// Retract a CDC delete's rows from the maintained aggregates by primary
+    /// key. The per-PK index holds each deleted PK's contribution, so this is
+    /// O(deleted rows) with no CDC before-image. No-op without a PK index (the
+    /// delete path then relies on the legacy `mark_stale` bookkeeping) or for an
+    /// empty batch. On error, fails safe to stale so queries fall back to the
+    /// base table. Runs off the write guard; the burst apply loop serializes
+    /// sub-batches so the maintained-aggregate epoch advances in arrival order.
+    async fn apply_maintained_aggregate_delete(&self, delete_rows: &RecordBatch) {
+        if self.maintained_aggregates.is_empty()
+            || !self.maintained_aggregates.supports_retraction()
+            || delete_rows.num_rows() == 0
+        {
+            return;
+        }
+
+        let epoch = self.next_maintained_aggregate_epoch();
+        let registry = Arc::clone(&self.maintained_aggregates);
+        let deletes = vec![delete_rows.clone()];
+        let apply_result =
+            task::spawn_blocking(move || registry.apply_delta(epoch, &[], &deletes)).await;
+
+        match apply_result {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                self.maintained_aggregates.mark_stale(epoch);
+                tracing::warn!(
+                    table = %self.table_metadata.table_name,
+                    epoch,
+                    error = %error,
+                    "Failed to retract maintained aggregate delete delta; queries will fall back to base table scans"
+                );
+            }
+            Err(error) => {
+                self.maintained_aggregates.mark_stale(epoch);
+                tracing::warn!(
+                    table = %self.table_metadata.table_name,
+                    epoch,
+                    error = %error,
+                    "Maintained aggregate delete delta task failed; queries will fall back to base table scans"
+                );
+            }
+        }
+    }
+
     async fn rebuild_maintained_aggregates_from_visible_state(
         &self,
     ) -> datafusion_common::Result<()> {
@@ -15781,6 +15825,10 @@ impl CayenneTableProvider {
             }
         };
         drop(write_guard);
+        // Maintained aggregates: retract the deleted rows by PK (off the write
+        // guard). With a per-PK index this is incremental; without one it is a
+        // no-op and the registry was already marked stale by the append path.
+        self.apply_maintained_aggregate_delete(delete_rows).await;
         record_cayenne_write_phase(self.table_name(), "cdc_path_inmemory", write_start);
         telemetry::track_cayenne_cdc_absorbed_delete_keys(
             key_count,
