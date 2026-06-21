@@ -1282,7 +1282,9 @@ mod tests {
     use datafusion::physical_expr::aggregate::AggregateExprBuilder;
     use datafusion::physical_expr::expressions::{col, lit};
     use datafusion::physical_plan::aggregates::PhysicalGroupBy;
-    use datafusion_common::cast::{as_float64_array, as_int64_array, as_string_array};
+    use datafusion_common::cast::{
+        as_float64_array, as_int64_array, as_string_array, as_uint64_array,
+    };
     use datafusion_functions_aggregate::average::avg_udaf;
     use datafusion_functions_aggregate::count::count_udaf;
     use datafusion_functions_aggregate::sum::sum_udaf;
@@ -1721,6 +1723,135 @@ mod tests {
             registry.batch_for_aggregate(&aggregate, 1)?.is_none(),
             "over-cap registry must not serve"
         );
+        Ok(())
+    }
+
+    /// Build a (name, i=PK, u, f) batch — exercises every aggregate-input type
+    /// so retraction covers all accumulator inverses. Float values are
+    /// exact-representable in f64 so retraction stays bit-exact.
+    fn typed_batch(rows: &[(&str, i64, u64, f64)]) -> RecordBatch {
+        RecordBatch::try_new(
+            schema(),
+            vec![
+                Arc::new(StringArray::from(
+                    rows.iter().map(|(n, _, _, _)| Some(*n)).collect::<Vec<_>>(),
+                )),
+                Arc::new(Int64Array::from(
+                    rows.iter().map(|(_, i, _, _)| *i).collect::<Vec<_>>(),
+                )),
+                Arc::new(UInt64Array::from(
+                    rows.iter().map(|(_, _, u, _)| *u).collect::<Vec<_>>(),
+                )),
+                Arc::new(Float64Array::from(
+                    rows.iter().map(|(_, _, _, f)| *f).collect::<Vec<_>>(),
+                )),
+            ],
+        )
+        .expect("typed batch should be valid")
+    }
+
+    /// Retraction exercises EVERY accumulator inverse: `COUNT(*)` (CountAll),
+    /// `COUNT(u)` (CountColumn), `SUM(u)` (SumUInt64), `SUM(f)` (SumFloat64),
+    /// `AVG(f)` (AvgFloat64). `SUM(i)` (SumInt64) is covered by
+    /// `apply_delta_retracts_deletes_by_pk`. PK = column `i`.
+    #[test]
+    fn apply_delta_retracts_all_aggregate_types() -> DataFusionResult<()> {
+        let spec = MaintainedAggregateSpec {
+            group_by: vec!["name".to_string()],
+            aggregates: vec![
+                MaintainedAggregateExpr {
+                    function: MaintainedAggregateFunction::Count,
+                    column: None,
+                },
+                MaintainedAggregateExpr {
+                    function: MaintainedAggregateFunction::Count,
+                    column: Some("u".to_string()),
+                },
+                MaintainedAggregateExpr {
+                    function: MaintainedAggregateFunction::Sum,
+                    column: Some("u".to_string()),
+                },
+                MaintainedAggregateExpr {
+                    function: MaintainedAggregateFunction::Sum,
+                    column: Some("f".to_string()),
+                },
+                MaintainedAggregateExpr {
+                    function: MaintainedAggregateFunction::Avg,
+                    column: Some("f".to_string()),
+                },
+            ],
+        };
+        let registry = MaintainedAggregateRegistry::try_new_with_pk(
+            &[spec],
+            &schema(),
+            vec![1],
+            usize::MAX,
+        )?;
+        registry.apply_delta(
+            1,
+            &[typed_batch(&[("a", 1, 10, 2.0), ("a", 2, 20, 4.0), ("b", 3, 5, 8.0)])],
+            &[],
+        )?;
+        // Delete pk i=2 from group a; only the PK column is read for the delete.
+        registry.apply_delta(2, &[], &[typed_batch(&[("", 2, 0, 0.0)])])?;
+
+        let aggregate = aggregate_exec_for(&[
+            ("count(*)", MaintainedAggregateFunction::Count, None),
+            ("count(u)", MaintainedAggregateFunction::Count, Some("u")),
+            ("sum(u)", MaintainedAggregateFunction::Sum, Some("u")),
+            ("sum(f)", MaintainedAggregateFunction::Sum, Some("f")),
+            ("avg(f)", MaintainedAggregateFunction::Avg, Some("f")),
+        ])?;
+        let result = registry
+            .batch_for_aggregate(&aggregate, 2)?
+            .expect("registry should be fresh");
+        assert_eq!(result.num_rows(), 2, "two groups survive");
+
+        let names = as_string_array(result.column(0))?;
+        let count_all = as_int64_array(result.column(1))?;
+        let count_u = as_int64_array(result.column(2))?;
+        let sum_u = as_uint64_array(result.column(3))?;
+        let sum_f = as_float64_array(result.column(4))?;
+        let avg_f = as_float64_array(result.column(5))?;
+        for row in 0..result.num_rows() {
+            match names.value(row) {
+                // group a kept only pk=1 (u=10, f=2.0) after the retraction.
+                "a" => {
+                    assert_eq!(count_all.value(row), 1, "CountAll retracted");
+                    assert_eq!(count_u.value(row), 1, "CountColumn retracted");
+                    assert_eq!(sum_u.value(row), 10, "SumUInt64 retracted");
+                    assert!((sum_f.value(row) - 2.0).abs() < 1e-9, "SumFloat64 retracted");
+                    assert!((avg_f.value(row) - 2.0).abs() < 1e-9, "AvgFloat64 retracted");
+                }
+                // group b untouched (pk=3, u=5, f=8.0).
+                "b" => {
+                    assert_eq!(count_all.value(row), 1);
+                    assert_eq!(sum_u.value(row), 5);
+                    assert!((sum_f.value(row) - 8.0).abs() < 1e-9);
+                    assert!((avg_f.value(row) - 8.0).abs() < 1e-9);
+                }
+                other => panic!("unexpected group {other}"),
+            }
+        }
+        Ok(())
+    }
+
+    /// Retracting a PK that was never inserted is an idempotent no-op (matches
+    /// tombstone semantics — an absent row contributed nothing).
+    #[test]
+    fn retracting_unseen_pk_is_a_noop() -> DataFusionResult<()> {
+        let registry = MaintainedAggregateRegistry::try_new_with_pk(
+            &[sum_i_spec()],
+            &schema(),
+            vec![2],
+            usize::MAX,
+        )?;
+        registry.apply_delta(1, &[group_batch(&[("a", 1, 10), ("b", 2, 20)])], &[])?;
+        // pk=999 was never inserted; the delta must leave every group unchanged.
+        registry.apply_delta(2, &[], &[group_batch(&[("", 999, 0)])])?;
+        let sums = sum_i_by_name(&registry)?;
+        assert_eq!(sums.get("a"), Some(&10));
+        assert_eq!(sums.get("b"), Some(&20));
         Ok(())
     }
 }

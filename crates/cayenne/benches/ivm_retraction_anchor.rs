@@ -470,5 +470,88 @@ fn bench_recompute_vs_maintain(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_real_registry_insert, bench_recompute_vs_maintain);
+fn retract_schema() -> SchemaRef {
+    Arc::new(Schema::new(vec![
+        Field::new("pk", DataType::Int64, false),
+        Field::new("group", DataType::Int64, false),
+        Field::new("value", DataType::Int64, true),
+    ]))
+}
+
+fn retract_spec() -> MaintainedAggregateSpec {
+    MaintainedAggregateSpec {
+        group_by: vec!["group".to_string()],
+        aggregates: vec![MaintainedAggregateExpr {
+            function: MaintainedAggregateFunction::Sum,
+            column: Some("value".to_string()),
+        }],
+    }
+}
+
+fn retract_batch(pk_start: i64, count: usize, groups: usize) -> RecordBatch {
+    let group_count = groups.max(1) as i64;
+    let pk: Vec<i64> = (0..count as i64).map(|i| pk_start + i).collect();
+    let group: Vec<i64> = pk.iter().map(|p| p % group_count).collect();
+    let value: Vec<i64> = (0..count).map(|i| (i as i64 % 2001) - 1000).collect();
+    RecordBatch::try_new(
+        retract_schema(),
+        vec![
+            Arc::new(Int64Array::from(pk)),
+            Arc::new(Int64Array::from(group)),
+            Arc::new(Int64Array::from(value)),
+        ],
+    )
+    .expect("retract batch should be valid")
+}
+
+/// Track the real `MaintainedAggregateRegistry` RETRACTION path:
+/// `apply_delta` with a delete batch + an update (re-upsert) batch on a
+/// populated per-PK index — the O(delta) maintain cost the lever depends on,
+/// measured on the shipped registry (not the model).
+fn bench_real_registry_retract(c: &mut Criterion) {
+    const DELTA: usize = 100;
+    let mut group = c.benchmark_group("ivm_maintained_retract");
+    for &rows in &[16_384usize, 131_072] {
+        let groups = 1_024usize.min(rows);
+        group.throughput(Throughput::Elements(DELTA as u64));
+        group.bench_with_input(
+            BenchmarkId::from_parameter(format!("rows={rows}/groups={groups}/delta={DELTA}")),
+            &rows,
+            |b, &rows| {
+                b.iter_batched(
+                    || {
+                        let registry = MaintainedAggregateRegistry::try_new_with_pk(
+                            &[retract_spec()],
+                            &retract_schema(),
+                            vec![0],
+                            usize::MAX,
+                        )
+                        .expect("registry construction");
+                        registry
+                            .apply_delta(1, &[retract_batch(0, rows, groups)], &[])
+                            .expect("seed insert");
+                        // Half the delta updates existing PKs (re-upsert), half deletes them.
+                        let update = retract_batch(0, DELTA / 2, groups);
+                        let delete = retract_batch((DELTA / 2) as i64, DELTA / 2, groups);
+                        (registry, update, delete)
+                    },
+                    |(registry, update, delete)| {
+                        registry
+                            .apply_delta(2, &[update], &[delete])
+                            .expect("retract delta");
+                    },
+                    criterion::BatchSize::SmallInput,
+                );
+            },
+        );
+    }
+    group.finish();
+}
+
+criterion_group!(
+    benches,
+    bench_real_registry_insert,
+    bench_real_registry_retract,
+    bench_recompute_vs_maintain
+);
 criterion_main!(benches);
