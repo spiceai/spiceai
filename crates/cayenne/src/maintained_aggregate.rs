@@ -73,6 +73,12 @@ pub enum MaintainedAggregateFunction {
 #[derive(Debug)]
 pub struct MaintainedAggregateRegistry {
     state: RwLock<RegistryState>,
+    /// Upper bound on total per-PK index entries across all views. When the
+    /// retraction index would exceed this, the registry fails safe to `Stale`
+    /// and clears its indexes (queries fall back to the base table until the
+    /// next rebuild), keeping memory bounded under `runtime.query.memory_limit`.
+    /// `usize::MAX` for registries built without a PK (no index is maintained).
+    max_index_entries: usize,
 }
 
 #[derive(Debug)]
@@ -92,6 +98,24 @@ enum RegistryStatus {
 struct MaintainedAggregateView {
     spec: ResolvedAggregateSpec,
     groups: HashMap<Vec<ScalarValue>, GroupAccumulator>,
+    /// Primary-key column indices in the input batch. Empty means no per-PK
+    /// index is maintained, so retraction is unavailable and the legacy
+    /// insert-only / mark-stale-on-delete behavior applies.
+    pk_columns: Vec<usize>,
+    /// Per-PK contribution index: `pk -> (group key, captured per-aggregate
+    /// inputs)`. Lets an UPDATE/DELETE retract the exact old contribution in
+    /// O(1) WITHOUT a CDC before-image (the old value is read from the index,
+    /// keyed by the primary key every CDC source delivers). Empty when
+    /// `pk_columns` is empty.
+    pk_index: HashMap<Vec<ScalarValue>, RowEntry>,
+}
+
+/// One row's retraction record: which group it joined and the per-aggregate
+/// input scalars it contributed (so a retraction subtracts exactly).
+#[derive(Debug)]
+struct RowEntry {
+    group_key: Vec<ScalarValue>,
+    inputs: Vec<Option<ScalarValue>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -134,6 +158,10 @@ impl AggregateOutputType {
 
 #[derive(Debug, Clone)]
 struct GroupAccumulator {
+    /// Live row count for this group. A group is dropped when it reaches 0 so
+    /// a fully-retracted group disappears (SQL `GROUP BY` emits no row for an
+    /// empty group).
+    rows: u64,
     aggregates: Vec<AggregateAccumulator>,
 }
 
@@ -282,9 +310,36 @@ impl MaintainedAggregateRegistry {
         specs: &[MaintainedAggregateSpec],
         schema: &SchemaRef,
     ) -> DataFusionResult<Self> {
+        Self::try_new_inner(specs, schema, Vec::new(), usize::MAX)
+    }
+
+    /// As [`Self::try_new`], but maintains a per-PK contribution index keyed on
+    /// `pk_columns` so UPDATE/DELETE can be retracted incrementally (see
+    /// [`Self::apply_delta`]). `max_index_entries` bounds the index across all
+    /// views; exceeding it fails the registry safe to `Stale`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a spec references a missing column or an aggregate
+    /// type Cayenne cannot maintain exactly.
+    pub fn try_new_with_pk(
+        specs: &[MaintainedAggregateSpec],
+        schema: &SchemaRef,
+        pk_columns: Vec<usize>,
+        max_index_entries: usize,
+    ) -> DataFusionResult<Self> {
+        Self::try_new_inner(specs, schema, pk_columns, max_index_entries)
+    }
+
+    fn try_new_inner(
+        specs: &[MaintainedAggregateSpec],
+        schema: &SchemaRef,
+        pk_columns: Vec<usize>,
+        max_index_entries: usize,
+    ) -> DataFusionResult<Self> {
         let views = specs
             .iter()
-            .map(|spec| MaintainedAggregateView::try_new(spec, schema))
+            .map(|spec| MaintainedAggregateView::try_new(spec, schema, pk_columns.clone()))
             .collect::<DataFusionResult<Vec<_>>>()?;
 
         Ok(Self {
@@ -293,6 +348,7 @@ impl MaintainedAggregateRegistry {
                 status: RegistryStatus::Fresh,
                 views,
             }),
+            max_index_entries,
         })
     }
 
@@ -340,6 +396,66 @@ impl MaintainedAggregateRegistry {
             for view in &mut state.views {
                 view.apply_insert_batch(batch)?;
             }
+        }
+
+        Ok(())
+    }
+
+    /// Apply one CDC visibility epoch's delta: `deletes` are retracted by PK,
+    /// then `upserts` are applied (an upsert whose PK is already indexed first
+    /// retracts the old contribution, so UPDATE is handled exactly). Requires a
+    /// PK index ([`Self::try_new_with_pk`]); on a maintained accumulator error
+    /// or a retraction the index can't satisfy, fails safe to `Stale` (queries
+    /// fall back to the base table) rather than serve a wrong answer.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error only on internal misuse; data-dependent failures are
+    /// absorbed into the `Stale` status.
+    pub fn apply_delta(
+        &self,
+        epoch: u64,
+        upserts: &[RecordBatch],
+        deletes: &[RecordBatch],
+    ) -> DataFusionResult<()> {
+        let mut state = self.state.write();
+
+        if epoch != state.epoch.saturating_add(1) {
+            state.epoch = state.epoch.max(epoch);
+            state.status = RegistryStatus::Stale;
+            return Ok(());
+        }
+
+        state.epoch = epoch;
+        if state.status == RegistryStatus::Stale || state.views.is_empty() {
+            return Ok(());
+        }
+
+        let mut failed = false;
+        'views: for view in &mut state.views {
+            for batch in deletes {
+                if view.retract_batch(batch).is_err() {
+                    failed = true;
+                    break 'views;
+                }
+            }
+            for batch in upserts {
+                if view.apply_insert_batch(batch).is_err() {
+                    failed = true;
+                    break 'views;
+                }
+            }
+        }
+
+        let over_cap =
+            state.views.iter().map(MaintainedAggregateView::index_len).sum::<usize>()
+                > self.max_index_entries;
+
+        if failed || over_cap {
+            for view in &mut state.views {
+                view.clear();
+            }
+            state.status = RegistryStatus::Stale;
         }
 
         Ok(())
@@ -422,15 +538,91 @@ impl MaintainedAggregateRegistry {
 }
 
 impl MaintainedAggregateView {
-    fn try_new(spec: &MaintainedAggregateSpec, schema: &SchemaRef) -> DataFusionResult<Self> {
+    fn try_new(
+        spec: &MaintainedAggregateSpec,
+        schema: &SchemaRef,
+        pk_columns: Vec<usize>,
+    ) -> DataFusionResult<Self> {
         Ok(Self {
             spec: ResolvedAggregateSpec::try_new(spec, schema)?,
             groups: HashMap::new(),
+            pk_columns,
+            pk_index: HashMap::new(),
         })
     }
 
     fn clear(&mut self) {
         self.groups.clear();
+        self.pk_index.clear();
+    }
+
+    fn index_len(&self) -> usize {
+        self.pk_index.len()
+    }
+
+    /// Build a key (group key or PK) from the given column indices at `row`.
+    fn scalar_key(
+        batch: &RecordBatch,
+        row: usize,
+        indices: impl Iterator<Item = usize>,
+    ) -> DataFusionResult<Vec<ScalarValue>> {
+        indices
+            .map(|index| ScalarValue::try_from_array(batch.column(index), row))
+            .collect()
+    }
+
+    /// Capture each aggregate's input scalar at `row` for the per-PK index
+    /// (`None` for `COUNT(*)`, which has no input column).
+    fn capture_inputs(
+        &self,
+        batch: &RecordBatch,
+        row: usize,
+    ) -> DataFusionResult<Vec<Option<ScalarValue>>> {
+        self.spec
+            .aggregates
+            .iter()
+            .map(|aggregate| match &aggregate.column {
+                None => Ok(None),
+                Some(column) => Ok(Some(ScalarValue::try_from_array(
+                    batch.column(column.index),
+                    row,
+                )?)),
+            })
+            .collect()
+    }
+
+    /// Subtract a stored row's contribution from its group, dropping the group
+    /// when it becomes empty.
+    fn retract_entry(&mut self, entry: &RowEntry) -> DataFusionResult<()> {
+        if let Some(group) = self.groups.get_mut(&entry.group_key) {
+            if group.retract_row(&entry.inputs)? {
+                self.groups.remove(&entry.group_key);
+            }
+        }
+        Ok(())
+    }
+
+    /// Retract the row currently indexed at `pk`, if any. Idempotent: a PK not
+    /// in the index contributed nothing, so retraction is a no-op.
+    fn retract_pk(&mut self, pk: &[ScalarValue]) -> DataFusionResult<()> {
+        if let Some(entry) = self.pk_index.remove(pk) {
+            self.retract_entry(&entry)?;
+        }
+        Ok(())
+    }
+
+    /// Retract every row in a delete batch by PK. Requires a PK index.
+    fn retract_batch(&mut self, batch: &RecordBatch) -> DataFusionResult<()> {
+        if self.pk_columns.is_empty() {
+            return Err(DataFusionError::Internal(
+                "maintained aggregate retraction requires a configured primary key".to_string(),
+            ));
+        }
+        for row in 0..batch.num_rows() {
+            let pk = Self::scalar_key(batch, row, self.pk_columns.iter().copied())?;
+            self.retract_pk(&pk)?;
+        }
+        Ok(())
     }
 
     fn apply_insert_batch(&mut self, batch: &RecordBatch) -> DataFusionResult<()> {
@@ -438,14 +630,29 @@ impl MaintainedAggregateView {
             return Ok(());
         }
 
+        let indexed = !self.pk_columns.is_empty();
         for row in 0..batch.num_rows() {
-            let mut key = Vec::with_capacity(self.spec.group_by.len());
-            for group_col in &self.spec.group_by {
-                let scalar = ScalarValue::try_from_array(batch.column(group_col.index), row)?;
-                key.push(scalar);
+            let group_key =
+                Self::scalar_key(batch, row, self.spec.group_by.iter().map(|c| c.index))?;
+
+            if indexed {
+                let pk = Self::scalar_key(batch, row, self.pk_columns.iter().copied())?;
+                // An upsert whose PK is already indexed is an UPDATE: retract
+                // the prior contribution before applying the new row.
+                if let Some(old) = self.pk_index.remove(&pk) {
+                    self.retract_entry(&old)?;
+                }
+                let inputs = self.capture_inputs(batch, row)?;
+                self.pk_index.insert(
+                    pk,
+                    RowEntry {
+                        group_key: group_key.clone(),
+                        inputs,
+                    },
+                );
             }
 
-            let group = match self.groups.entry(key) {
+            let group = match self.groups.entry(group_key) {
                 Entry::Occupied(entry) => entry.into_mut(),
                 Entry::Vacant(entry) => entry.insert(GroupAccumulator::try_new(&self.spec)?),
             };
@@ -620,14 +827,26 @@ impl GroupAccumulator {
             .iter()
             .map(AggregateAccumulator::try_new)
             .collect::<DataFusionResult<Vec<_>>>()?;
-        Ok(Self { aggregates })
+        Ok(Self { rows: 0, aggregates })
     }
 
     fn apply_insert_row(&mut self, batch: &RecordBatch, row: usize) -> DataFusionResult<()> {
         for aggregate in &mut self.aggregates {
             aggregate.apply_insert_row(batch, row)?;
         }
+        self.rows = self.rows.saturating_add(1);
         Ok(())
+    }
+
+    /// Subtract a previously-captured row's per-aggregate contributions
+    /// (inverse of [`Self::apply_insert_row`]). Returns whether the group is
+    /// now empty so the caller can drop it.
+    fn retract_row(&mut self, inputs: &[Option<ScalarValue>]) -> DataFusionResult<bool> {
+        for (aggregate, input) in self.aggregates.iter_mut().zip(inputs) {
+            aggregate.retract_row(input.as_ref())?;
+        }
+        self.rows = self.rows.saturating_sub(1);
+        Ok(self.rows == 0)
     }
 
     fn scalar_value(
@@ -753,6 +972,68 @@ impl AggregateAccumulator {
                     };
                     *sum += delta;
                     *count = count.checked_add(1).ok_or_else(count_overflow)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Inverse of [`Self::apply_insert_row`], subtracting a previously-captured
+    /// input scalar. `COUNT`/`SUM(Int64|UInt64)` are exactly invertible;
+    /// `SUM/AVG(Float64)` subtract and rely on a periodic
+    /// [`MaintainedAggregateRegistry::rebuild_from_batches`] to bound float
+    /// drift. A null input contributed nothing, so it retracts nothing.
+    fn retract_row(&mut self, input: Option<&ScalarValue>) -> DataFusionResult<()> {
+        match self {
+            Self::CountAll { value } => {
+                *value = value.checked_sub(1).ok_or_else(retract_underflow)?;
+            }
+            Self::CountColumn { value, .. } => {
+                if input.is_some_and(|scalar| !scalar.is_null()) {
+                    *value = value.checked_sub(1).ok_or_else(retract_underflow)?;
+                }
+            }
+            Self::SumInt64 { value, .. } => {
+                if let Some(scalar) = input {
+                    if !scalar.is_null() {
+                        let ScalarValue::Int64(Some(delta)) = scalar else {
+                            return Err(type_mismatch("Int64", scalar));
+                        };
+                        let current = (*value).ok_or_else(retract_underflow)?;
+                        *value = Some(current.checked_sub(*delta).ok_or_else(sum_overflow)?);
+                    }
+                }
+            }
+            Self::SumUInt64 { value, .. } => {
+                if let Some(scalar) = input {
+                    if !scalar.is_null() {
+                        let ScalarValue::UInt64(Some(delta)) = scalar else {
+                            return Err(type_mismatch("UInt64", scalar));
+                        };
+                        let current = (*value).ok_or_else(retract_underflow)?;
+                        *value = Some(current.checked_sub(*delta).ok_or_else(retract_underflow)?);
+                    }
+                }
+            }
+            Self::SumFloat64 { value, .. } => {
+                if let Some(scalar) = input {
+                    if !scalar.is_null() {
+                        let ScalarValue::Float64(Some(delta)) = scalar else {
+                            return Err(type_mismatch("Float64", scalar));
+                        };
+                        *value = Some(value.unwrap_or(0.0) - delta);
+                    }
+                }
+            }
+            Self::AvgFloat64 { sum, count, .. } => {
+                if let Some(scalar) = input {
+                    if !scalar.is_null() {
+                        let ScalarValue::Float64(Some(delta)) = scalar else {
+                            return Err(type_mismatch("Float64", scalar));
+                        };
+                        *sum -= delta;
+                        *count = count.checked_sub(1).ok_or_else(retract_underflow)?;
+                    }
                 }
             }
         }
@@ -961,6 +1242,13 @@ fn count_overflow() -> DataFusionError {
 fn sum_overflow() -> DataFusionError {
     DataFusionError::Execution(
         "Maintained aggregate SUM overflowed its output type; falling back to base table scan"
+            .to_string(),
+    )
+}
+
+fn retract_underflow() -> DataFusionError {
+    DataFusionError::Execution(
+        "Maintained aggregate retraction underflowed its state; falling back to base table scan"
             .to_string(),
     )
 }
@@ -1287,5 +1575,139 @@ mod tests {
             input,
             schema,
         )
+    }
+
+    // --- retraction (apply_delta + per-PK index) ---
+    //
+    // Column layout for these tests (reusing the module `schema()`):
+    //   name (Utf8)  -> GROUP BY key
+    //   i    (Int64) -> SUM target  (output parses via `as_int64_array`)
+    //   u    (UInt64)-> PRIMARY KEY (pk_columns = [2])
+    // Each test row is `(name, pk, value)`.
+
+    fn group_batch(rows: &[(&str, u64, i64)]) -> RecordBatch {
+        RecordBatch::try_new(
+            schema(),
+            vec![
+                Arc::new(StringArray::from(
+                    rows.iter().map(|(n, _, _)| Some(*n)).collect::<Vec<_>>(),
+                )),
+                Arc::new(Int64Array::from(
+                    rows.iter().map(|(_, _, value)| *value).collect::<Vec<_>>(),
+                )),
+                Arc::new(UInt64Array::from(
+                    rows.iter().map(|(_, pk, _)| *pk).collect::<Vec<_>>(),
+                )),
+                Arc::new(Float64Array::from(
+                    rows.iter().map(|_| None).collect::<Vec<Option<f64>>>(),
+                )),
+            ],
+        )
+        .expect("group batch should be valid")
+    }
+
+    fn sum_i_spec() -> MaintainedAggregateSpec {
+        MaintainedAggregateSpec {
+            group_by: vec!["name".to_string()],
+            aggregates: vec![MaintainedAggregateExpr {
+                function: MaintainedAggregateFunction::Sum,
+                column: Some("i".to_string()),
+            }],
+        }
+    }
+
+    fn sum_i_by_name(
+        registry: &MaintainedAggregateRegistry,
+    ) -> DataFusionResult<BTreeMap<String, i64>> {
+        let aggregate =
+            aggregate_exec_for(&[("sum(i)", MaintainedAggregateFunction::Sum, Some("i"))])?;
+        let epoch = registry.state.read().epoch;
+        let result = registry
+            .batch_for_aggregate(&aggregate, epoch)?
+            .expect("registry should be fresh");
+        let names = as_string_array(result.column(0))?;
+        let sums = as_int64_array(result.column(1))?;
+        let mut out = BTreeMap::new();
+        for row in 0..result.num_rows() {
+            if !sums.is_null(row) {
+                out.insert(names.value(row).to_string(), sums.value(row));
+            }
+        }
+        Ok(out)
+    }
+
+    #[test]
+    fn apply_delta_retracts_deletes_by_pk() -> DataFusionResult<()> {
+        let registry = MaintainedAggregateRegistry::try_new_with_pk(
+            &[sum_i_spec()],
+            &schema(),
+            vec![2],
+            usize::MAX,
+        )?;
+        registry.apply_delta(
+            1,
+            &[group_batch(&[("a", 1, 10), ("a", 2, 20), ("b", 3, 5), ("b", 4, 7)])],
+            &[],
+        )?;
+        // Delete pk=2 (group a) and pk=3 (group b); only the PK column matters.
+        registry.apply_delta(2, &[], &[group_batch(&[("", 2, 0), ("", 3, 0)])])?;
+
+        let sums = sum_i_by_name(&registry)?;
+        assert_eq!(sums.get("a"), Some(&10), "a retains only pk=1 (i=10)");
+        assert_eq!(sums.get("b"), Some(&7), "b retains only pk=4 (i=7)");
+        Ok(())
+    }
+
+    #[test]
+    fn apply_delta_handles_update_as_retract_then_insert() -> DataFusionResult<()> {
+        let registry = MaintainedAggregateRegistry::try_new_with_pk(
+            &[sum_i_spec()],
+            &schema(),
+            vec![2],
+            usize::MAX,
+        )?;
+        registry.apply_delta(1, &[group_batch(&[("a", 1, 10), ("a", 2, 20)])], &[])?;
+        // UPDATE pk=2 in place: i 20 -> 5, so group a = 10 + 5 = 15.
+        registry.apply_delta(2, &[group_batch(&[("a", 2, 5)])], &[])?;
+        assert_eq!(sum_i_by_name(&registry)?.get("a"), Some(&15));
+
+        // UPDATE pk=1 moving group a -> c, i 10 -> 100.
+        registry.apply_delta(3, &[group_batch(&[("c", 1, 100)])], &[])?;
+        let sums = sum_i_by_name(&registry)?;
+        assert_eq!(sums.get("a"), Some(&5), "a keeps only pk=2 (i=5)");
+        assert_eq!(sums.get("c"), Some(&100), "c gains pk=1 (i=100)");
+        Ok(())
+    }
+
+    #[test]
+    fn retracting_last_row_drops_the_group() -> DataFusionResult<()> {
+        let registry = MaintainedAggregateRegistry::try_new_with_pk(
+            &[sum_i_spec()],
+            &schema(),
+            vec![2],
+            usize::MAX,
+        )?;
+        registry.apply_delta(1, &[group_batch(&[("a", 1, 10), ("b", 2, 20)])], &[])?;
+        registry.apply_delta(2, &[], &[group_batch(&[("", 1, 0)])])?;
+        let sums = sum_i_by_name(&registry)?;
+        assert_eq!(sums.get("a"), None, "group a disappears once its last row is retracted");
+        assert_eq!(sums.get("b"), Some(&20));
+        Ok(())
+    }
+
+    #[test]
+    fn exceeding_index_cap_falls_back_to_stale() -> DataFusionResult<()> {
+        // A 1-entry cap: inserting two distinct PKs overflows the index, so the
+        // registry fails safe to Stale and serves nothing (base-table fallback).
+        let registry =
+            MaintainedAggregateRegistry::try_new_with_pk(&[sum_i_spec()], &schema(), vec![2], 1)?;
+        registry.apply_delta(1, &[group_batch(&[("a", 1, 10), ("a", 2, 20)])], &[])?;
+        let aggregate =
+            aggregate_exec_for(&[("sum(i)", MaintainedAggregateFunction::Sum, Some("i"))])?;
+        assert!(
+            registry.batch_for_aggregate(&aggregate, 1)?.is_none(),
+            "over-cap registry must not serve"
+        );
+        Ok(())
     }
 }
