@@ -781,17 +781,14 @@ mod tests {
         let unparser = Unparser::new(&dialect);
 
         // MQL_AT AT TIME ZONE 'UTC' AT TIME ZONE 'America/Los_Angeles'
-        let inner = Expr::Cast(Cast {
-            expr: Box::new(col("MQL_AT")),
-            data_type: DataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into())),
-        });
-        let outer = Expr::Cast(Cast {
-            expr: Box::new(inner),
-            data_type: DataType::Timestamp(
-                TimeUnit::Nanosecond,
-                Some("America/Los_Angeles".into()),
-            ),
-        });
+        let inner = Expr::Cast(Cast::new(
+            Box::new(col("MQL_AT")),
+            DataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into())),
+        ));
+        let outer = Expr::Cast(Cast::new(
+            Box::new(inner),
+            DataType::Timestamp(TimeUnit::Nanosecond, Some("America/Los_Angeles".into())),
+        ));
 
         let sql = unparser
             .expr_to_sql(&outer)

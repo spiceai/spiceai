@@ -660,6 +660,9 @@ pub struct Refresher {
     /// Notification for completion of refresh operation
     on_complete_notification: Option<Arc<Notify>>,
     cpu_runtime: Option<Handle>,
+    /// Dedicated nice-0 runtime for the CDC changes-apply loop; falls back to
+    /// `cpu_runtime` when unset.
+    cdc_apply_runtime: Option<Handle>,
     io_runtime: Handle,
     resource_monitor: Option<crate::resource_monitor::ResourceMonitor>,
     /// Mutex to protect concurrent access to the accelerator during insert/update/delete/cache/snapshot operations
@@ -698,6 +701,7 @@ impl Refresher {
         refresh: Arc<RwLock<Refresh>>,
         accelerator: Arc<dyn TableProvider>,
         cpu_runtime: Option<Handle>,
+        cdc_apply_runtime: Option<Handle>,
         io_runtime: Handle,
         accelerator_write_mutex: Arc<Mutex<()>>,
     ) -> Self {
@@ -722,6 +726,7 @@ impl Refresher {
             snapshot_interval_task: None,
             metrics: None,
             cpu_runtime,
+            cdc_apply_runtime,
             io_runtime,
             resource_monitor: None,
             accelerator_write_mutex,
@@ -1277,7 +1282,14 @@ impl Refresher {
             }
         };
 
-        if let Some(runtime) = self.cpu_runtime.clone() {
+        // Run the CDC changes-apply loop on the dedicated nice-0 apply runtime when
+        // available so it isn't scheduler-deprioritized behind queries/compaction on an
+        // oversubscribed host. Fall back to the cpu/refresh runtime, then ambient.
+        if let Some(runtime) = self
+            .cdc_apply_runtime
+            .clone()
+            .or_else(|| self.cpu_runtime.clone())
+        {
             runtime.spawn(changes_task)
         } else {
             tokio::spawn(changes_task)
@@ -1479,6 +1491,7 @@ mod tests {
             Some("mem_table".to_string()),
             Arc::new(RwLock::new(refresh)),
             Arc::clone(&accelerator),
+            None,
             None,
             Handle::current(),
             Arc::new(Mutex::new(())),
@@ -1693,6 +1706,7 @@ mod tests {
                 Arc::new(RwLock::new(refresh)),
                 Arc::clone(&accelerator),
                 None,
+                None,
                 Handle::current(),
                 Arc::new(Mutex::new(())),
             );
@@ -1850,6 +1864,7 @@ mod tests {
                 Some("mem_table".to_string()),
                 Arc::new(RwLock::new(refresh)),
                 Arc::clone(&accelerator),
+                None,
                 None,
                 Handle::current(),
                 Arc::new(Mutex::new(())),
@@ -2058,6 +2073,7 @@ mod tests {
                 Some("mem_table".to_string()),
                 Arc::new(RwLock::new(refresh)),
                 Arc::clone(&accelerator),
+                None,
                 None,
                 Handle::current(),
                 Arc::new(Mutex::new(())),

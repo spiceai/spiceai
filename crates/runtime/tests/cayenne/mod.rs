@@ -585,7 +585,6 @@ async fn test_cayenne_s3_express_multi_zone_live() -> Result<(), String> {
                 .await
                 .map_err(|e| format!("failed to resolve accelerated provider: {e}"))?;
             if accelerated_provider
-                .as_any()
                 .downcast_ref::<AcceleratedTable>()
                 .is_none()
             {
@@ -932,7 +931,6 @@ async fn test_cayenne_doput_upsert_cycle_stale() -> Result<(), String> {
                 .catalog("stlcyc")
                 .ok_or("catalog 'stlcyc' not found")?;
             let cayenne_provider = catalog_provider
-                .as_any()
                 .downcast_ref::<CayenneCatalogProvider>()
                 .ok_or("failed to downcast to CayenneCatalogProvider")?;
 
@@ -1107,7 +1105,6 @@ impl CayenneTestHarness {
         let df = rt.datafusion();
         let catalog_provider = df.ctx.catalog("cyc").ok_or("catalog 'cyc' not found")?;
         let cayenne_provider = catalog_provider
-            .as_any()
             .downcast_ref::<CayenneCatalogProvider>()
             .ok_or("failed to downcast to CayenneCatalogProvider")?;
 

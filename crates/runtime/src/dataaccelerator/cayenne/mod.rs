@@ -66,6 +66,7 @@ use crate::spice_data_base_path;
 use runtime_acceleration::snapshot::{AccelerationEngine, AccelerationLayout};
 use runtime_datafusion_index::{Index, IndexedTableProvider};
 use search::index::native_vector::NativeVectorIndex;
+use spicepod::acceleration as spicepod_acceleration;
 
 /// Metadata key to identify the accelerator type in the schema metadata.
 const SPICE_ACCELERATOR_METADATA_KEY: &str = "spice.accelerator";
@@ -120,6 +121,58 @@ static UNSUPPORTED_LOCAL_PARTITION_PATTERN: LazyLock<Regex> =
         Ok(compiled) => compiled,
         Err(e) => unreachable!("Unable to compile regexp: {e}"),
     });
+
+fn maintained_aggregate_specs_for_cayenne(
+    acceleration: Option<&Acceleration>,
+) -> Result<Vec<cayenne::maintained_aggregate::MaintainedAggregateSpec>> {
+    let Some(acceleration) = acceleration else {
+        return Ok(Vec::new());
+    };
+
+    let maintained_aggregates = acceleration.maintained_aggregates.enabled_aggregates();
+    if maintained_aggregates.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    if !acceleration.partition_by.is_empty() {
+        return Err(Error::InvalidConfiguration {
+            detail: Arc::from(
+                "Cayenne maintained_aggregates is not yet supported on partitioned tables. Remove maintained_aggregates or remove partition_by from the acceleration configuration.",
+            ),
+        });
+    }
+
+    Ok(maintained_aggregates
+        .iter()
+        .map(
+            |aggregate| cayenne::maintained_aggregate::MaintainedAggregateSpec {
+                group_by: aggregate.group_by.clone(),
+                aggregates: aggregate
+                    .aggregates
+                    .iter()
+                    .map(|expr| {
+                        let function = match expr.function {
+                            spicepod_acceleration::MaintainedAggregateFunction::Count => {
+                                cayenne::maintained_aggregate::MaintainedAggregateFunction::Count
+                            }
+                            spicepod_acceleration::MaintainedAggregateFunction::Sum => {
+                                cayenne::maintained_aggregate::MaintainedAggregateFunction::Sum
+                            }
+                            spicepod_acceleration::MaintainedAggregateFunction::Avg => {
+                                cayenne::maintained_aggregate::MaintainedAggregateFunction::Avg
+                            }
+                        };
+
+                        cayenne::maintained_aggregate::MaintainedAggregateExpr {
+                            function,
+                            column: expr.column.clone(),
+                        }
+                    })
+                    .collect(),
+            },
+        )
+        .collect())
+}
 
 /// Transform schema according to `unsupported_type_action` policy.
 /// Delegates to `cayenne::transform_schema_for_vortex`.
@@ -591,8 +644,19 @@ impl CayenneAccelerator {
     ) -> cayenne::metadata::VortexConfig {
         let mut config = cayenne::metadata::VortexConfig {
             footer_cache_mb,
+            // Default the query/scan path to Arrow view types (Utf8View/BinaryView)
+            // so DataFusion plans joins/aggregates on view arrays and the
+            // hash-join build-side `concat_batches` cannot hit the i32 2 GiB offset
+            // overflow (CH-benCH q21 @SF1000). The stored schema stays Utf8/Binary.
+            // Operators can opt out with `cayenne_force_view_types: false`.
+            force_view_read_schema: true,
             ..Default::default()
         };
+        if let Some(acceleration) = source.acceleration()
+            && let Some(v) = acceleration.params.get("cayenne_force_view_types")
+        {
+            config.force_view_read_schema = !v.trim().eq_ignore_ascii_case("false");
+        }
 
         // Auto-tune the memory-/cpu-/storage-sensitive Vortex knobs from a
         // single detected host profile so they move together for the host
@@ -629,10 +693,15 @@ impl CayenneAccelerator {
             // Storage-aware target Vortex file size on local disk (the `auto`
             // baseline): smaller files reduce write amplification on EBS-class
             // network storage; larger files improve scan throughput on RAM-backed
-            // mounts. Skipped for S3, where the engine default is kept. An
-            // explicit operator value (or `auto`) is then applied on top.
+            // mounts. On S3, where objects are immutable and billed per request
+            // (no fsync), a larger default cuts object count and per-request cost.
+            // An explicit operator value (or `auto`) is then applied on top.
             if !is_s3 && let Some(size_mb) = hw.target_file_size_mb_override() {
                 config.target_vortex_file_size_mb = size_mb;
+            } else if is_s3 {
+                // S3 favors large immutable objects: default to 512 MiB (2× the
+                // local default) when the operator hasn't set a size.
+                config.target_vortex_file_size_mb = config.target_vortex_file_size_mb.max(512);
             }
             config.target_vortex_file_size_mb = autotune::auto_or_usize(
                 acceleration,
@@ -933,6 +1002,11 @@ impl CayenneAccelerator {
                 &["cayenne_compaction_trigger_files"],
                 config.compaction_trigger_files,
             );
+            config.bake_deletion_index_trigger = autotune::auto_or_usize(
+                acceleration,
+                &["cayenne_bake_deletion_index_trigger"],
+                config.bake_deletion_index_trigger,
+            );
             config.compaction_trigger_protected_snapshots = autotune::auto_or_usize(
                 acceleration,
                 &["cayenne_compaction_trigger_protected_snapshots"],
@@ -1147,11 +1221,19 @@ impl CayenneAccelerator {
                     acceleration,
                     &["cayenne_compaction_trigger_files"],
                 ),
+                bake_deletion_index_trigger: autotune::is_pinned(
+                    acceleration,
+                    &["cayenne_bake_deletion_index_trigger"],
+                ),
                 write_concurrency: autotune::is_pinned(
                     acceleration,
                     &["cayenne_write_concurrency", "write_concurrency"],
                 ),
                 mem_tier: autotune::is_pinned(acceleration, &["cayenne_cdc_mem_tier_max_bytes"]),
+                target_file_size: autotune::is_pinned(
+                    acceleration,
+                    &["cayenne_target_file_size_mb"],
+                ),
             };
 
             // Surface cross-parameter and out-of-range issues that parse cleanly
@@ -1340,6 +1422,7 @@ impl CayenneAccelerator {
         // Get metastore type and metadata directory
         let acceleration = source.acceleration();
         let metadata_dir = Self::resolve_metadata_dir(acceleration);
+        let maintained_aggregate_specs = maintained_aggregate_specs_for_cayenne(acceleration)?;
         let metastore_type = acceleration
             .and_then(|a| a.params.get("cayenne_metastore"))
             .map_or("sqlite", String::as_str)
@@ -1406,7 +1489,8 @@ impl CayenneAccelerator {
         // Create CayenneTableProvider with object store for S3 Express One Zone
         let mut builder = CayenneTableProviderBuilder::new(catalog, runtime_env)
             .with_context(context)
-            .with_retention_filters(retention_filters);
+            .with_retention_filters(retention_filters)
+            .with_maintained_aggregates(maintained_aggregate_specs);
         if let Some(retention_builder) = time_retention_filter_builder {
             builder = builder.with_time_retention_filter_builder(retention_builder);
         }
@@ -1524,8 +1608,8 @@ fn wrap_with_native_vector_indexes(
 const PARAMETERS: &[ParameterSpec] = &concat_arrays::<
     ParameterSpec,
     S3_PARAMS_LEN,
-    44,
-    { S3_PARAMS_LEN + 44 },
+    46,
+    { S3_PARAMS_LEN + 46 },
 >(
     S3_PARAMETERS,
     [
@@ -1550,6 +1634,10 @@ const PARAMETERS: &[ParameterSpec] = &concat_arrays::<
         ParameterSpec::component("target_file_size_mb")
             .description("Target size for Vortex data files in MB. 'auto' (default, or when unset) is storage-aware: 256 MB on EBS-class network storage, 64 MB on RAM-backed (tmpfs) mounts, and the 256 MB engine default on local SSD / unknown / S3. Set an explicit MB value to override.")
             .default("auto"),
+        ParameterSpec::component("force_view_types")
+            .description("When 'true' (default), Cayenne advertises and decodes string and binary columns as Arrow view types (Utf8View/BinaryView) on the query/scan path so DataFusion plans joins and aggregates on view arrays, avoiding the i32 2 GiB offset overflow in hash-join build-side batch concatenation at scale. The stored schema keeps Utf8/Binary for writes, CDC, and stats. Set 'false' to opt out.")
+            .one_of(&["true", "false"])
+            .default("true"),
         ParameterSpec::component("sort_columns")
             .description("Comma-separated list of columns to sort data by during inserts (e.g., 'timestamp,user_id')."),
         ParameterSpec::component("shard_key_columns")
@@ -1575,6 +1663,8 @@ const PARAMETERS: &[ParameterSpec] = &concat_arrays::<
             .description("Writer partition override (parallel encoders) for unsorted Cayenne ingests. 'auto' (or unset) uses a small fixed default of 4, capped at the host core count (= runtime.query.target_partitions) and the process-global encode budget — deliberately not the full core count, because each table is sized independently and the per-table values sum across tables under concurrent CDC. Raise it explicitly for a table that needs more encode parallelism."),
         ParameterSpec::component("compaction_trigger_files")
             .description("Minimum number of small Vortex files in the current snapshot before tiered compaction runs. A 'small' file is one whose size is below cayenne_target_file_size_mb / 4. Default: 4 for refresh_mode: caching, changes, or append with refresh_check_interval <= 5m; 8 otherwise."),
+        ParameterSpec::component("bake_deletion_index_trigger")
+            .description("Deletion-index size (count of live primary-key tombstones) at or above which the seq-prefix bake (key-delete merge-on-read compaction) runs. The bake consolidates the settled older prefix of protected snapshots so their tombstones drop out of the live deletion index, lowering per-query merge-on-read probe cost at the cost of write amplification. A larger value bakes less often (bounds write-amp); a smaller value bakes more often (smaller index, cheaper probe). Key-delete tables only. Default: 50000."),
         ParameterSpec::component("compaction_trigger_protected_snapshots")
             .description("Number of protected snapshots before snapshot-maintenance compaction runs. This is separate from compaction_trigger_files so small-file tuning does not silently change scan amplification behavior. Default: 4 for refresh_mode: caching, changes, or append with refresh_check_interval <= 5m; 8 otherwise."),
         ParameterSpec::component("compaction_trigger_snapshot_age_ms")
@@ -2121,8 +2211,21 @@ impl DataAccelerator for CayenneAccelerator {
             // the MetadataCatalog API), while the concrete handle is needed by
             // `CayennePartitionedInsertStrategy` to open a shared
             // MetastoreTransaction across all partitions (issue #10125).
+            // Honor the configured `cayenne_metastore` backend (Turso uses the
+            // `libsql://` scheme) rather than hardcoding SQLite. The unpartitioned
+            // path (`get_or_create_catalog`) already selects the scheme from this
+            // param; without the same logic here, partitioned tables silently
+            // ignore `cayenne_metastore: turso` and fall back to SQLite.
+            let metastore_type = source
+                .acceleration()
+                .and_then(|a| a.params.get("cayenne_metastore"))
+                .map_or("sqlite", String::as_str);
+            let catalog_connection_string = match metastore_type {
+                "turso" => format!("libsql://{metadata_dir}/cayenne.db"),
+                _ => format!("sqlite://{metadata_dir}/cayenne.db"),
+            };
             let catalog_concrete: Arc<cayenne::CayenneCatalog> = Arc::new(
-                cayenne::CayenneCatalog::new(format!("sqlite://{metadata_dir}/cayenne.db"))
+                cayenne::CayenneCatalog::new(catalog_connection_string)
                     .boxed()
                     .context(AccelerationInitializationFailedSnafu)?,
             );
@@ -2855,6 +2958,69 @@ mod tests {
             ),
             true,
         )
+    }
+
+    fn maintained_aggregate_acceleration() -> Acceleration {
+        Acceleration {
+            maintained_aggregates: vec![spicepod_acceleration::MaintainedAggregate {
+                group_by: vec!["customer_id".to_string()],
+                aggregates: vec![spicepod_acceleration::MaintainedAggregateExpr {
+                    function: spicepod_acceleration::MaintainedAggregateFunction::Count,
+                    column: None,
+                }],
+            }]
+            .into(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn maintained_aggregate_specs_convert_for_unpartitioned_cayenne() {
+        let acceleration = maintained_aggregate_acceleration();
+
+        let specs = maintained_aggregate_specs_for_cayenne(Some(&acceleration))
+            .expect("unpartitioned maintained aggregate config should convert");
+
+        assert_eq!(specs.len(), 1);
+        assert_eq!(specs[0].group_by, vec!["customer_id".to_string()]);
+        assert_eq!(specs[0].aggregates.len(), 1);
+        assert_eq!(
+            specs[0].aggregates[0].function,
+            cayenne::maintained_aggregate::MaintainedAggregateFunction::Count
+        );
+        assert_eq!(specs[0].aggregates[0].column, None);
+    }
+
+    #[test]
+    fn maintained_aggregate_specs_empty_when_maintenance_disabled() {
+        let mut acceleration = maintained_aggregate_acceleration();
+        acceleration.maintained_aggregates = spicepod_acceleration::MaintainedAggregates::new(
+            spicepod_acceleration::MaintainAggregates::Disabled,
+            acceleration.maintained_aggregates.as_slice().to_vec(),
+        );
+
+        let specs = maintained_aggregate_specs_for_cayenne(Some(&acceleration))
+            .expect("disabled maintained aggregate config should parse");
+
+        assert!(specs.is_empty());
+    }
+
+    #[test]
+    fn maintained_aggregate_specs_error_for_partitioned_cayenne() {
+        let mut acceleration = maintained_aggregate_acceleration();
+        acceleration.partition_by = vec![spicepod::partitioning::PartitionedBy {
+            name: "region".to_string(),
+            expression: "region".to_string(),
+        }];
+
+        let error = maintained_aggregate_specs_for_cayenne(Some(&acceleration))
+            .expect_err("partitioned maintained aggregate config should be rejected");
+
+        let Error::InvalidConfiguration { detail } = error else {
+            panic!("expected InvalidConfiguration, got {error:?}");
+        };
+        assert!(detail.contains("maintained_aggregates"));
+        assert!(detail.contains("partitioned"));
     }
 
     #[test]

@@ -155,10 +155,6 @@ impl DataConnector for DeferredConnector {
 
 #[async_trait]
 impl TableProvider for DeferredConnector {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema(&self) -> SchemaRef {
         Arc::clone(&self.schema)
     }

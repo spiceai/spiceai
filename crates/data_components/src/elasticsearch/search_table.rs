@@ -17,7 +17,6 @@ limitations under the License.
 //! [`TableProvider`] implementations for Elasticsearch kNN vector search
 //! and full-text search, used by the search index layer.
 
-use std::any::Any;
 use std::sync::Arc;
 
 use arrow::array::{ArrayRef, Float64Array, RecordBatch, StringArray};
@@ -83,10 +82,6 @@ pub struct ElasticsearchKnnTable {
 
 #[async_trait]
 impl TableProvider for ElasticsearchKnnTable {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema(&self) -> SchemaRef {
         Arc::clone(&self.schema)
     }
@@ -161,10 +156,6 @@ impl DisplayAs for ElasticsearchKnnExec {
 impl ExecutionPlan for ElasticsearchKnnExec {
     fn name(&self) -> &'static str {
         "ElasticsearchKnnExec"
-    }
-
-    fn as_any(&self) -> &dyn Any {
-        self
     }
 
     fn properties(&self) -> &Arc<PlanProperties> {
@@ -328,10 +319,6 @@ pub struct ElasticsearchTextSearchTable {
 
 #[async_trait]
 impl TableProvider for ElasticsearchTextSearchTable {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema(&self) -> SchemaRef {
         Arc::clone(&self.schema)
     }
@@ -402,10 +389,6 @@ impl DisplayAs for ElasticsearchTextSearchExec {
 impl ExecutionPlan for ElasticsearchTextSearchExec {
     fn name(&self) -> &'static str {
         "ElasticsearchTextSearchExec"
-    }
-
-    fn as_any(&self) -> &dyn Any {
-        self
     }
 
     fn properties(&self) -> &Arc<PlanProperties> {

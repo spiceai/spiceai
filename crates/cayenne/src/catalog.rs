@@ -18,11 +18,11 @@ limitations under the License.
 //!
 //! This trait defines the interface for managing table metadata
 //! and file references. It can be implemented by different RDBMS backends
-//! (`SQLite`, `PostgreSQL`, etc.).
+//! (`SQLite`, Turso, etc.).
 
 use super::metadata::{
     CreateTableOptions, DeleteFile, InlinedData, InlinedDataStats, InlinedDelete,
-    PartitionMetadata, SnapshotFileStatistics, TableMetadata, TableStatistics,
+    PartitionMetadata, SnapshotFile, SnapshotFileStatistics, TableMetadata, TableStatistics,
 };
 use arrow_schema::SchemaRef;
 use async_trait::async_trait;
@@ -601,6 +601,37 @@ pub trait MetadataCatalog: Send + Sync {
     /// Clear all per-file statistics rows for a table.
     async fn clear_snapshot_file_statistics(&self, table_id: &str) -> CatalogResult<()>;
 
+    /// Upsert one row of the authoritative per-snapshot data-file manifest
+    /// (`cayenne_snapshot_file`) — the complete file set for a snapshot.
+    async fn upsert_snapshot_file(&self, file: &SnapshotFile) -> CatalogResult<()>;
+
+    /// Get the complete manifest file set for a snapshot. In the manifest
+    /// snapshot model this is the scan's authoritative file source (rather than
+    /// directory listing).
+    async fn get_snapshot_files(
+        &self,
+        table_id: &str,
+        snapshot_id: &str,
+    ) -> CatalogResult<Vec<SnapshotFile>>;
+
+    /// Get every manifest row for a table, across all snapshots. Drives
+    /// physical-file GC: a snapshot can reference a data file that physically
+    /// lives in another snapshot's directory (compaction references files in
+    /// place), so a file is only safe to delete when NO live-or-protected
+    /// snapshot's manifest references it. The caller filters these rows down to
+    /// the live set and reconstructs the referenced physical paths.
+    async fn get_all_snapshot_files(&self, table_id: &str) -> CatalogResult<Vec<SnapshotFile>>;
+
+    /// Drop manifest rows for snapshots other than the given one (snapshot GC).
+    async fn clear_snapshot_files_except(
+        &self,
+        table_id: &str,
+        snapshot_id: &str,
+    ) -> CatalogResult<()>;
+
+    /// Clear all manifest rows for a table.
+    async fn clear_snapshot_files(&self, table_id: &str) -> CatalogResult<()>;
+
     /// Upsert the persisted primary-key existence index (a bloom checkpoint),
     /// tagged with the snapshot id it covers. Stored in the metastore so it is
     /// captured by metastore snapshots — letting both a restart and a new node
@@ -681,6 +712,31 @@ pub trait MetadataCatalog: Send + Sync {
     async fn clear_inlined_data_and_deletes(&self, table_id: &str) -> CatalogResult<()> {
         self.clear_inlined_data(table_id).await?;
         self.clear_inlined_deletes(table_id).await
+    }
+
+    /// Commit on-conflict deletion metadata and clear inline data/delete rows
+    /// for the same table.
+    ///
+    /// Production implementations should override this as a single backend
+    /// transaction. The default keeps trait implementors source-compatible, but
+    /// is not atomic across the metadata commit and inline clear.
+    async fn commit_on_conflict_deletions_and_clear_inlined(
+        &self,
+        delete_files: Vec<DeleteFile>,
+        table_id: &str,
+        insert_pk_bytes_list: Vec<Vec<u8>>,
+        insert_sequence: i64,
+        snapshot_sequence: Option<SnapshotSequenceCommit>,
+    ) -> CatalogResult<()> {
+        self.commit_on_conflict_deletions(
+            delete_files,
+            table_id,
+            insert_pk_bytes_list,
+            insert_sequence,
+            snapshot_sequence,
+        )
+        .await?;
+        self.clear_inlined_data_and_deletes(table_id).await
     }
 
     /// Add a small batch of delete identifiers inlined in the metastore.

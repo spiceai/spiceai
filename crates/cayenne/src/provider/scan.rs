@@ -16,22 +16,24 @@ limitations under the License.
 
 use std::{
     any::Any,
-    collections::BTreeSet,
+    collections::{BTreeSet, HashMap},
     sync::{Arc, OnceLock},
 };
 
+use crate::maintained_aggregate::MaintainedAggregateRegistry;
 use arrow_schema::SchemaRef;
 use datafusion::config::ConfigOptions;
 use datafusion::error::Result;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
-use datafusion_common::{DataFusionError, Statistics};
+use datafusion_common::{DataFusionError, Statistics, stats::Precision};
 use datafusion_datasource::file_groups::FileGroup;
 use datafusion_datasource::file_scan_config::FileScanConfig;
 use datafusion_datasource::source::DataSourceExec;
 use datafusion_execution::{SendableRecordBatchStream, TaskContext};
 use datafusion_physical_expr::expressions::{Column, DynamicFilterPhysicalExpr};
 use datafusion_physical_expr::{Distribution, OrderingRequirements, PhysicalExpr};
-use futures::TryStreamExt;
+use futures::{StreamExt, TryStreamExt};
+use parking_lot::Mutex;
 
 use datafusion_physical_expr::Partitioning;
 use datafusion_physical_plan::{
@@ -47,12 +49,77 @@ use datafusion_physical_plan::{
     union::UnionExec,
 };
 
+/// Keeps a scan's snapshot directories alive for the FULL lifetime of the scan —
+/// plan-build AND execution. Increments a per-snapshot in-flight-scan ref-count on
+/// creation and decrements it on `Drop` (when the scan's `ExecutionPlan` and all its
+/// output streams have been dropped). Snapshot GC/cleanup skips any dir with a live
+/// ref, so a long-running query (e.g. a 139s analytical scan) cannot have its Vortex
+/// segment files deleted out from under it by a concurrent compaction. This replaces
+/// the brittle time-based grace, which a query slower than the grace would outlive.
+///
+/// Correctness rests on the listing-flip invariant: a scan captures its snapshot ids
+/// under `listing_fence.read()`, and a compaction's flip takes `listing_fence.write()`,
+/// so after the flip no NEW scan can reference the superseded snapshot — its ref-count
+/// only decreases, and cleanup that observes count 0 can delete it safely.
+#[derive(Debug)]
+pub(crate) struct SnapshotScanRef {
+    refs: Arc<Mutex<HashMap<String, usize>>>,
+    snapshot_ids: Vec<String>,
+}
+
+impl SnapshotScanRef {
+    /// Increment the in-flight-scan ref-count for each snapshot id and return a
+    /// guard that decrements them on drop.
+    pub(crate) fn new(
+        refs: Arc<Mutex<HashMap<String, usize>>>,
+        snapshot_ids: Vec<String>,
+    ) -> Arc<Self> {
+        {
+            let mut map = refs.lock();
+            for id in &snapshot_ids {
+                *map.entry(id.clone()).or_insert(0) += 1;
+            }
+        }
+        Arc::new(Self { refs, snapshot_ids })
+    }
+}
+
+impl Drop for SnapshotScanRef {
+    fn drop(&mut self) {
+        let mut map = self.refs.lock();
+        for id in &self.snapshot_ids {
+            if let Some(count) = map.get_mut(id) {
+                *count = count.saturating_sub(1);
+                if *count == 0 {
+                    map.remove(id);
+                }
+            }
+        }
+    }
+}
+
 /// Wrapper for Cayenne acceleration execution plans.
 /// This is used to identify Cayenne-specific table scans from within the physical plan, once references to the table is lost from the logical plan.
 #[derive(Debug)]
 pub struct CayenneAccelerationExec {
     inner: Arc<dyn ExecutionPlan>,
     scan_identity: OnceLock<Option<Arc<ScanIdentity>>>,
+    /// In-flight-scan ref-count guard for the snapshot dirs this scan reads. Held
+    /// for the plan's lifetime AND injected into each output stream by `execute`,
+    /// so the snapshots stay GC-protected until execution completes. `None` for the
+    /// inner per-snapshot wrappers; set on the outermost wrapper `scan()` returns.
+    /// MUST be carried through every plan-rewriting method (`with_new_children`,
+    /// `with_fetch`, `try_swapping_with_projection`, `reset_state`) or a concurrent
+    /// compaction could GC a snapshot mid-execution.
+    scan_guard: Option<Arc<SnapshotScanRef>>,
+    maintained_aggregates: Option<Arc<MaintainedAggregateRegistry>>,
+    maintained_aggregate_epoch: u64,
+    /// Column-statistics overlay sourced from the table's maintained optimizer
+    /// aggregate (live min/max + integer NDV), aligned to the inner plan's
+    /// output schema. Consumed in [`Self::partition_statistics`] to refill
+    /// column stats the Cayenne base+delta `UnionExec` drops to
+    /// `Precision::Absent` via `DataFusion`'s generic `col_stats_union`
+    optimizer_column_overlay: Option<Arc<Statistics>>,
 }
 
 impl CayenneAccelerationExec {
@@ -62,6 +129,104 @@ impl CayenneAccelerationExec {
         Self {
             inner,
             scan_identity: OnceLock::new(),
+            scan_guard: None,
+            maintained_aggregates: None,
+            maintained_aggregate_epoch: 0,
+            optimizer_column_overlay: None,
+        }
+    }
+
+    /// As [`Self::new`], but carries an in-flight-scan ref-count guard so the
+    /// snapshot dirs this scan reads are not GC'd until execution completes.
+    #[must_use]
+    pub(crate) fn with_guard(inner: Arc<dyn ExecutionPlan>, guard: Arc<SnapshotScanRef>) -> Self {
+        Self {
+            inner,
+            scan_identity: OnceLock::new(),
+            scan_guard: Some(guard),
+            maintained_aggregates: None,
+            maintained_aggregate_epoch: 0,
+            optimizer_column_overlay: None,
+        }
+    }
+
+    /// Creates a new `CayenneAccelerationExec` carrying maintained aggregate
+    /// state captured at the table scan visibility epoch.
+    #[must_use]
+    pub fn new_with_maintained_aggregates(
+        inner: Arc<dyn ExecutionPlan>,
+        maintained_aggregates: Arc<MaintainedAggregateRegistry>,
+        maintained_aggregate_epoch: u64,
+    ) -> Self {
+        Self {
+            inner,
+            scan_identity: OnceLock::new(),
+            scan_guard: None,
+            maintained_aggregates: Some(maintained_aggregates),
+            maintained_aggregate_epoch,
+            optimizer_column_overlay: None,
+        }
+    }
+
+    /// As [`Self::new_with_maintained_aggregates`], but also carries an in-flight-scan
+    /// ref-count guard. Used for the outermost wrapper `scan()` returns when the table
+    /// has maintained aggregates, so the result carries BOTH the GC-protection guard
+    /// and the captured aggregate state.
+    #[must_use]
+    pub(crate) fn with_guard_and_maintained_aggregates(
+        inner: Arc<dyn ExecutionPlan>,
+        guard: Arc<SnapshotScanRef>,
+        maintained_aggregates: Arc<MaintainedAggregateRegistry>,
+        maintained_aggregate_epoch: u64,
+    ) -> Self {
+        Self {
+            inner,
+            scan_identity: OnceLock::new(),
+            scan_guard: Some(guard),
+            maintained_aggregates: Some(maintained_aggregates),
+            maintained_aggregate_epoch,
+            optimizer_column_overlay: None,
+        }
+    }
+
+    /// Attaches a column-statistics overlay sourced from the table's maintained
+    /// optimizer aggregate (live min/max + integer NDV). At
+    /// [`Self::partition_statistics`] this refills only the columns the Cayenne
+    /// base+delta `UnionExec` wiped to `Precision::Absent`, restoring the
+    /// join-key signal `JoinSelection` needs without overriding any surviving
+    /// child statistic. A `None` overlay (cold aggregate) is a no-op.
+    #[must_use]
+    pub(crate) fn with_optimizer_column_overlay(
+        mut self,
+        overlay: Option<Arc<Statistics>>,
+    ) -> Self {
+        self.optimizer_column_overlay = overlay;
+        self
+    }
+
+    /// Returns the maintained aggregate registry and scan epoch captured for
+    /// this table scan, if aggregate maintenance is enabled for the table.
+    #[must_use]
+    pub(crate) fn maintained_aggregates(&self) -> Option<(&Arc<MaintainedAggregateRegistry>, u64)> {
+        self.maintained_aggregates
+            .as_ref()
+            .map(|registry| (registry, self.maintained_aggregate_epoch))
+    }
+
+    /// Rewrap `inner`, preserving this node's carry-through state — the in-flight
+    /// scan guard AND any maintained-aggregate registry — so both survive the
+    /// optimizer transforms applied by the plan-rewriting trait methods
+    /// (`with_new_children`, `with_fetch`, `try_swapping_with_projection`).
+    fn wrap_rewritten_child(&self, inner: Arc<dyn ExecutionPlan>) -> Self {
+        // The output schema is stable across child rewrites (projection/limit
+        // pushdown), so the optimizer column overlay stays aligned and valid.
+        Self {
+            inner,
+            scan_identity: OnceLock::new(),
+            scan_guard: self.scan_guard.clone(),
+            maintained_aggregates: self.maintained_aggregates.clone(),
+            maintained_aggregate_epoch: self.maintained_aggregate_epoch,
+            optimizer_column_overlay: self.optimizer_column_overlay.clone(),
         }
     }
 
@@ -129,8 +294,45 @@ impl CayenneAccelerationExec {
             return Ok(None);
         };
 
-        Ok(Some(Arc::new(Self::new(inner))))
+        Ok(Some(Arc::new(self.wrap_rewritten_child(inner))))
     }
+}
+
+/// Refills only the `Precision::Absent` `distinct_count` (NDV) in `child` from
+/// `overlay`, restoring the join-key NDV that the Cayenne base+delta `UnionExec`
+/// drops (a stat-less/empty delta branch makes `col_stats_union` return `Absent`,
+/// collapsing `estimate_inner_join_cardinality` to `min(L, R)`). Present child
+/// stats — filter-aware `num_rows`/`null_count` and any surviving column stat —
+/// are preserved; a column-count mismatch is a defensive no-op.
+///
+/// `UnionExec` can't fix this itself: an `Absent` branch means *unknown*, not
+/// *empty*, so it must drop the NDV, which isn't additive across branches of
+/// unknown overlap. The repair belongs here because only the Cayenne scan owns
+/// the out-of-band metadata the union can't see — the incrementally-maintained
+/// per-table aggregate (HLL-derived integer NDV over base+delta).
+///
+/// Deliberately does NOT restore min/max. A range predicate against an exact
+/// bound — an append-refresh `ts > watermark` (watermark == the column max) or
+/// a retention `ts < cutoff` — makes `DataFusion`'s interval analysis build an
+/// empty interval `[max+1, max]`; casting it back trips `Interval::try_new`'s
+/// `lower <= upper` assertion (`Err`), failing the query. Build-side selection
+/// reads only `total_byte_size`/`num_rows`, and join-cardinality estimation
+/// prefers NDV when present, so the restored NDV is what carries the estimate —
+/// min/max are not needed here and only re-introduce the assertion hazard.
+fn restore_absent_column_statistics(mut child: Statistics, overlay: &Statistics) -> Statistics {
+    if child.column_statistics.len() != overlay.column_statistics.len() {
+        return child;
+    }
+    for (col, src) in child
+        .column_statistics
+        .iter_mut()
+        .zip(overlay.column_statistics.iter())
+    {
+        if matches!(col.distinct_count, Precision::Absent) {
+            col.distinct_count = src.distinct_count;
+        }
+    }
+    child
 }
 
 fn compute_scan_identity(plan: &Arc<dyn ExecutionPlan>) -> Option<Arc<ScanIdentity>> {
@@ -227,10 +429,9 @@ fn accumulate_file_scan_sources(
     snapshots: &mut usize,
     files: &mut usize,
 ) {
-    if let Some(data_source_exec) = plan.as_any().downcast_ref::<DataSourceExec>() {
+    if let Some(data_source_exec) = plan.downcast_ref::<DataSourceExec>() {
         if let Some(file_scan_config) = data_source_exec
             .data_source()
-            .as_any()
             .downcast_ref::<FileScanConfig>()
         {
             *snapshots += 1;
@@ -273,10 +474,9 @@ fn collect_file_scan_configs<'a>(
     plan: &'a Arc<dyn ExecutionPlan>,
     configs: &mut Vec<&'a FileScanConfig>,
 ) {
-    if let Some(data_source_exec) = plan.as_any().downcast_ref::<DataSourceExec>() {
+    if let Some(data_source_exec) = plan.downcast_ref::<DataSourceExec>() {
         if let Some(file_scan_config) = data_source_exec
             .data_source()
-            .as_any()
             .downcast_ref::<FileScanConfig>()
         {
             configs.push(file_scan_config);
@@ -284,7 +484,7 @@ fn collect_file_scan_configs<'a>(
         return;
     }
 
-    if plan.as_any().downcast_ref::<UnionExec>().is_some() {
+    if plan.downcast_ref::<UnionExec>().is_some() {
         for child in plan.children() {
             collect_file_scan_configs(child, configs);
         }
@@ -313,16 +513,15 @@ fn collect_file_scan_configs<'a>(
 /// it stops a future operator from silently being treated as transparent.
 #[expect(deprecated)]
 fn is_identity_preserving_wrapper(plan: &Arc<dyn ExecutionPlan>) -> bool {
-    let any = plan.as_any();
-    if any.downcast_ref::<ProjectionExec>().is_some()
-        || any.downcast_ref::<RepartitionExec>().is_some()
-        || any
+    if plan.downcast_ref::<ProjectionExec>().is_some()
+        || plan.downcast_ref::<RepartitionExec>().is_some()
+        || plan
             .downcast_ref::<datafusion_physical_plan::coalesce_batches::CoalesceBatchesExec>()
             .is_some()
-        || any
+        || plan
             .downcast_ref::<datafusion_physical_plan::coalesce_partitions::CoalescePartitionsExec>()
             .is_some()
-        || any.downcast_ref::<CayenneAccelerationExec>().is_some()
+        || plan.downcast_ref::<CayenneAccelerationExec>().is_some()
     {
         return true;
     }
@@ -336,7 +535,7 @@ fn is_identity_preserving_wrapper(plan: &Arc<dyn ExecutionPlan>) -> bool {
 }
 
 fn collect_dynamic_filters(expr: &Arc<dyn PhysicalExpr>, filters: &mut Vec<ScanDynamicFilter>) {
-    if let Some(dynamic_filter) = expr.as_any().downcast_ref::<DynamicFilterPhysicalExpr>() {
+    if let Some(dynamic_filter) = expr.downcast_ref::<DynamicFilterPhysicalExpr>() {
         if let Some(columns) = dynamic_filter_column_names(dynamic_filter) {
             filters.push(ScanDynamicFilter {
                 filter: Arc::clone(expr),
@@ -356,7 +555,7 @@ fn dynamic_filter_column_names(
 ) -> Option<BTreeSet<String>> {
     let mut columns = BTreeSet::new();
     for child in dynamic_filter.children() {
-        let column = child.as_any().downcast_ref::<Column>()?;
+        let column = child.downcast_ref::<Column>()?;
         columns.insert(column.name().to_string());
     }
 
@@ -376,10 +575,9 @@ fn push_dynamic_filters_to_data_source(
         return Ok(None);
     }
 
-    if let Some(data_source_exec) = plan.as_any().downcast_ref::<DataSourceExec>()
+    if let Some(data_source_exec) = plan.downcast_ref::<DataSourceExec>()
         && let Some(file_scan_config) = data_source_exec
             .data_source()
-            .as_any()
             .downcast_ref::<FileScanConfig>()
     {
         let filters = filters.iter().map(Arc::clone).collect();
@@ -408,7 +606,7 @@ fn push_dynamic_filters_to_data_source(
         return Ok(None);
     }
 
-    let is_union = plan.as_any().downcast_ref::<UnionExec>().is_some();
+    let is_union = plan.downcast_ref::<UnionExec>().is_some();
     if !is_union && !is_identity_preserving_wrapper(&plan) {
         return Ok(None);
     }
@@ -478,6 +676,10 @@ impl DisplayAs for CayenneAccelerationExec {
 
 #[deny(clippy::missing_trait_methods)]
 impl ExecutionPlan for CayenneAccelerationExec {
+    fn downcast_delegate(&self) -> Option<&dyn ExecutionPlan> {
+        None
+    }
+
     fn with_preserve_order(&self, _preserve_order: bool) -> Option<Arc<dyn ExecutionPlan>> {
         None
     }
@@ -491,10 +693,6 @@ impl ExecutionPlan for CayenneAccelerationExec {
         Self: Sized,
     {
         "CayenneAccelerationExec"
-    }
-
-    fn as_any(&self) -> &dyn Any {
-        self
     }
 
     fn schema(&self) -> SchemaRef {
@@ -545,7 +743,7 @@ impl ExecutionPlan for CayenneAccelerationExec {
         let Some(input) = children.into_iter().next() else {
             unreachable!("should have one input");
         };
-        Ok(Arc::new(CayenneAccelerationExec::new(input)))
+        Ok(Arc::new(self.wrap_rewritten_child(input)))
     }
 
     fn reset_state(self: Arc<Self>) -> Result<Arc<dyn ExecutionPlan>> {
@@ -586,6 +784,15 @@ impl ExecutionPlan for CayenneAccelerationExec {
                 e
             }
         });
+        // Hold the in-flight-scan guard for the stream's lifetime so the snapshot
+        // dirs this scan reads are not GC'd mid-execution. The closure is a no-op
+        // per batch; it drops (releasing the ref-count) when the stream is fully
+        // consumed or dropped. `None` on the inner per-snapshot wrappers.
+        let scan_guard = self.scan_guard.clone();
+        let mapped = mapped.map(move |item| {
+            let _hold = &scan_guard;
+            item
+        });
         Ok(Box::pin(RecordBatchStreamAdapter::new(schema, mapped)))
     }
 
@@ -593,8 +800,26 @@ impl ExecutionPlan for CayenneAccelerationExec {
         self.inner.metrics()
     }
 
-    fn partition_statistics(&self, partition: Option<usize>) -> Result<Statistics> {
-        self.inner.partition_statistics(partition)
+    fn partition_statistics(&self, partition: Option<usize>) -> Result<Arc<Statistics>> {
+        let child_stats = self.inner.partition_statistics(partition)?;
+        // The overlay is a per-table (global) aggregate: its min/max/NDV
+        // describe the whole table, not any single partition. Only the
+        // table-wide aggregate stats (`partition == None`) may be refilled from
+        // it. Per-partition stats (`partition == Some(_)`) must pass through
+        // unchanged — filling them from the global aggregate would violate
+        // `partition_statistics(Some(_))` semantics and mislead partition-level
+        // pruning/optimization.
+        let Some(overlay) = self
+            .optimizer_column_overlay
+            .as_ref()
+            .filter(|_| partition.is_none())
+        else {
+            return Ok(child_stats);
+        };
+        Ok(Arc::new(restore_absent_column_statistics(
+            Arc::unwrap_or_clone(child_stats),
+            overlay,
+        )))
     }
 
     // Allow optimizer to push limits through to inputs
@@ -605,7 +830,7 @@ impl ExecutionPlan for CayenneAccelerationExec {
     fn with_fetch(&self, limit: Option<usize>) -> Option<Arc<dyn ExecutionPlan>> {
         self.inner
             .with_fetch(limit)
-            .map(|plan| Arc::new(CayenneAccelerationExec::new(plan)) as Arc<dyn ExecutionPlan>)
+            .map(|plan| Arc::new(self.wrap_rewritten_child(plan)) as Arc<dyn ExecutionPlan>)
     }
 
     fn fetch(&self) -> Option<usize> {
@@ -623,9 +848,7 @@ impl ExecutionPlan for CayenneAccelerationExec {
         self.inner
             .try_swapping_with_projection(projection)
             .map(|plan| {
-                plan.map(|plan| {
-                    Arc::new(CayenneAccelerationExec::new(plan)) as Arc<dyn ExecutionPlan>
-                })
+                plan.map(|plan| Arc::new(self.wrap_rewritten_child(plan)) as Arc<dyn ExecutionPlan>)
             })
     }
 
@@ -656,8 +879,7 @@ impl ExecutionPlan for CayenneAccelerationExec {
         order: &[PhysicalSortExpr],
     ) -> Result<SortOrderPushdownResult<Arc<dyn ExecutionPlan>>> {
         let result = self.inner.try_pushdown_sort(order)?;
-        Ok(result
-            .map(|plan| Arc::new(CayenneAccelerationExec::new(plan)) as Arc<dyn ExecutionPlan>))
+        Ok(result.map(|plan| Arc::new(self.wrap_rewritten_child(plan)) as Arc<dyn ExecutionPlan>))
     }
 }
 
@@ -698,7 +920,6 @@ mod tests {
         );
         assert!(
             repartitioned_plan
-                .as_any()
                 .downcast_ref::<RepartitionExec>()
                 .is_some()
         );
@@ -731,10 +952,7 @@ mod tests {
             .expect("inner plan should support projection swapping");
 
         assert!(
-            swapped
-                .as_any()
-                .downcast_ref::<CayenneAccelerationExec>()
-                .is_some(),
+            swapped.downcast_ref::<CayenneAccelerationExec>().is_some(),
             "projection-swapped Cayenne plan should stay wrapped for optimizer identification"
         );
     }
@@ -841,5 +1059,151 @@ mod tests {
             paths: Arc::from(vec!["part-000.vortex".to_string()]),
         };
         assert_ne!(bucket_a, bucket_b);
+    }
+
+    /// The base+delta `UnionExec` wipes a join key's `distinct_count` to
+    /// `Precision::Absent` (an empty delta branch poisons `col_stats_union`).
+    /// With an optimizer overlay attached, the wrapper refills the Absent NDV
+    /// while preserving the child's (filter-aware) `num_rows`; min/max are
+    /// intentionally left Absent (they trip `DataFusion`'s empty-interval assertion
+    /// on range filters and aren't needed by build-side selection / cardinality).
+    #[test]
+    fn overlay_refills_union_wiped_join_key_statistics() {
+        use datafusion_common::{ColumnStatistics, ScalarValue};
+        use datafusion_physical_plan::empty::EmptyExec;
+
+        let memory = one_partition_plan();
+        let schema = memory.schema();
+        let empty = Arc::new(EmptyExec::new(Arc::clone(&schema))) as Arc<dyn ExecutionPlan>;
+        let union: Arc<dyn ExecutionPlan> =
+            UnionExec::try_new(vec![memory, empty]).expect("union exec should be created");
+
+        // Sanity: the union poisons min/max + distinct_count to Absent.
+        let poisoned = union
+            .partition_statistics(None)
+            .expect("union statistics should be available");
+        assert!(matches!(
+            poisoned.column_statistics[0].min_value,
+            Precision::Absent
+        ));
+        assert!(matches!(
+            poisoned.column_statistics[0].max_value,
+            Precision::Absent
+        ));
+        assert!(matches!(
+            poisoned.column_statistics[0].distinct_count,
+            Precision::Absent
+        ));
+
+        let overlay = Arc::new(Statistics {
+            num_rows: Precision::Absent,
+            total_byte_size: Precision::Absent,
+            column_statistics: vec![ColumnStatistics {
+                null_count: Precision::Absent,
+                max_value: Precision::Inexact(ScalarValue::Int64(Some(9999))),
+                min_value: Precision::Inexact(ScalarValue::Int64(Some(1))),
+                sum_value: Precision::Absent,
+                distinct_count: Precision::Inexact(42),
+                byte_size: Precision::Absent,
+            }],
+        });
+
+        // Without an overlay: poisoned stats pass through unchanged.
+        let plain = CayenneAccelerationExec::new(Arc::clone(&union));
+        let plain_stats = plain
+            .partition_statistics(None)
+            .expect("statistics should be available");
+        assert!(matches!(
+            plain_stats.column_statistics[0].min_value,
+            Precision::Absent
+        ));
+        assert!(matches!(
+            plain_stats.column_statistics[0].distinct_count,
+            Precision::Absent
+        ));
+
+        // With an overlay: the Absent NDV is refilled, num_rows kept. min/max
+        // are NOT restored (they trip DataFusion's empty-interval assertion on a
+        // `col > max` range filter and aren't needed downstream).
+        let restored_exec = CayenneAccelerationExec::new(Arc::clone(&union))
+            .with_optimizer_column_overlay(Some(overlay));
+        let restored = restored_exec
+            .partition_statistics(None)
+            .expect("statistics should be available");
+        let col = &restored.column_statistics[0];
+        assert!(matches!(col.min_value, Precision::Absent));
+        assert!(matches!(col.max_value, Precision::Absent));
+        assert_eq!(col.distinct_count, Precision::Inexact(42));
+        assert_eq!(
+            restored.num_rows, poisoned.num_rows,
+            "overlay must not override the child's filter-aware num_rows"
+        );
+
+        // The overlay is a per-table (global) aggregate, so it must NOT be
+        // applied to per-partition stats: `partition_statistics(Some(_))` must
+        // return the child's partition stats untouched.
+        let per_partition = restored_exec
+            .partition_statistics(Some(0))
+            .expect("per-partition statistics should be available");
+        let child_partition = union
+            .partition_statistics(Some(0))
+            .expect("child per-partition statistics should be available");
+        assert_eq!(
+            per_partition.column_statistics[0].min_value,
+            child_partition.column_statistics[0].min_value,
+            "overlay must not leak into per-partition min_value"
+        );
+        assert_eq!(
+            per_partition.column_statistics[0].max_value,
+            child_partition.column_statistics[0].max_value,
+            "overlay must not leak into per-partition max_value"
+        );
+        assert_eq!(
+            per_partition.column_statistics[0].distinct_count,
+            child_partition.column_statistics[0].distinct_count,
+            "overlay must not leak into per-partition distinct_count"
+        );
+    }
+
+    /// The restore must never override a statistic the child already provides —
+    /// only `Precision::Absent` fields are filled from the overlay.
+    #[test]
+    fn restore_preserves_present_child_statistics() {
+        use datafusion_common::{ColumnStatistics, ScalarValue};
+
+        let child = Statistics {
+            num_rows: Precision::Exact(100),
+            total_byte_size: Precision::Absent,
+            column_statistics: vec![ColumnStatistics {
+                null_count: Precision::Exact(0),
+                max_value: Precision::Exact(ScalarValue::Int64(Some(7))),
+                min_value: Precision::Absent,
+                sum_value: Precision::Absent,
+                distinct_count: Precision::Absent,
+                byte_size: Precision::Absent,
+            }],
+        };
+        let overlay = Statistics {
+            num_rows: Precision::Absent,
+            total_byte_size: Precision::Absent,
+            column_statistics: vec![ColumnStatistics {
+                null_count: Precision::Absent,
+                max_value: Precision::Inexact(ScalarValue::Int64(Some(999))),
+                min_value: Precision::Inexact(ScalarValue::Int64(Some(-5))),
+                sum_value: Precision::Absent,
+                distinct_count: Precision::Inexact(50),
+                byte_size: Precision::Absent,
+            }],
+        };
+
+        let restored = restore_absent_column_statistics(child, &overlay);
+        let col = &restored.column_statistics[0];
+        // Present max_value must be kept (not overwritten by the overlay).
+        assert_eq!(col.max_value, Precision::Exact(ScalarValue::Int64(Some(7))));
+        // min/max are never restored (only NDV); the Absent min stays Absent.
+        assert!(matches!(col.min_value, Precision::Absent));
+        // Absent distinct_count is filled from the overlay.
+        assert_eq!(col.distinct_count, Precision::Inexact(50));
+        assert_eq!(restored.num_rows, Precision::Exact(100));
     }
 }

@@ -189,13 +189,34 @@ impl SpiceObjectStoreRegistry {
                     // Non-IP custom endpoint — cached result or DNS probe.
                     Self::resolve_s3_url_style(bucket_name, ep)
                 } else {
-                    // No custom endpoint (standard AWS) — vhost.
-                    S3UrlStyle::VirtualHosted
+                    // No custom endpoint (standard AWS).
+                    Self::default_aws_url_style(bucket_name)
                 }
             }
         };
 
         self.build_s3_object_store(bucket_name, &params, url_style)
+    }
+
+    /// Default URL style for standard AWS S3 (no custom endpoint) when the user
+    /// did not set `s3_url_style`.
+    ///
+    /// Virtual-hosted style is AWS's default, but a bucket name containing dots
+    /// cannot use it over HTTPS: the wildcard certificate
+    /// (`*.s3.<region>.amazonaws.com`) only matches a single label, so the
+    /// multi-label virtual-hosted host (`my.dotted.bucket.s3.<region>...`) fails
+    /// TLS validation. AWS recommends path style for dotted bucket names, so fall
+    /// back to it automatically. An explicit `s3_url_style` always takes
+    /// precedence over this default.
+    fn default_aws_url_style(bucket_name: &str) -> S3UrlStyle {
+        if bucket_name.contains('.') {
+            tracing::debug!(
+                "s3_url_style not set and bucket '{bucket_name}' contains dots; using path style to avoid the virtual-hosted TLS certificate mismatch on standard AWS"
+            );
+            S3UrlStyle::Path
+        } else {
+            S3UrlStyle::VirtualHosted
+        }
     }
 
     /// Resolve the S3 URL style for a non-IP custom endpoint, using the cache
@@ -790,6 +811,31 @@ mod tests {
         let params = HashMap::from([("url_style".to_string(), "invalid".to_string())]);
         let _ = SpiceObjectStoreRegistry::parse_s3_url_style(&params)
             .expect_err("invalid url_style should error");
+    }
+
+    #[test]
+    fn test_default_aws_url_style_plain_bucket_is_vhost() {
+        assert_eq!(
+            SpiceObjectStoreRegistry::default_aws_url_style("my-bucket"),
+            S3UrlStyle::VirtualHosted
+        );
+    }
+
+    #[test]
+    fn test_default_aws_url_style_dotted_bucket_falls_back_to_path() {
+        // A dotted bucket name cannot use virtual-hosted style over HTTPS on
+        // standard AWS (wildcard TLS cert matches a single label only), so it
+        // must default to path style.
+        assert_eq!(
+            SpiceObjectStoreRegistry::default_aws_url_style(
+                "com.twilio.dev.us-east-1.amazonaws.com"
+            ),
+            S3UrlStyle::Path
+        );
+        assert_eq!(
+            SpiceObjectStoreRegistry::default_aws_url_style("a.b"),
+            S3UrlStyle::Path
+        );
     }
 
     #[test]

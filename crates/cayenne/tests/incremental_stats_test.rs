@@ -21,7 +21,8 @@ limitations under the License.
 //! End-to-end tests for incrementally-maintained executor statistics: live
 //! `num_rows` nets supersedes under upsert (not the sum of inserts), and
 //! per-integer-column NDV (distinct-count) sketches are populated and reasonably
-//! accurate — both surfaced via `CayenneTableProvider::optimizer_table_statistics()`.
+//! accurate — both surfaced via `CayenneTableProvider::optimizer_table_statistics()`
+//! and `DataFusion`'s `TableProvider::statistics()` optimizer metadata hook.
 
 mod common;
 
@@ -68,6 +69,11 @@ fn distinct_count(stats: &datafusion::common::Statistics, col: usize) -> Option<
         Precision::Exact(n) | Precision::Inexact(n) => Some(n),
         Precision::Absent => None,
     }
+}
+
+fn table_provider_statistics(table: &CayenneTableProvider) -> datafusion::common::Statistics {
+    datafusion::datasource::TableProvider::statistics(table)
+        .expect("table provider statistics present")
 }
 
 fn assert_within(actual: usize, expected: usize, rel: f64, what: &str) {
@@ -130,16 +136,28 @@ async fn test_live_num_rows_and_ndv_under_upsert(
     let stats = table
         .optimizer_table_statistics()
         .expect("stats present after insert");
+    let table_provider_stats = table_provider_statistics(table.as_ref());
     assert_eq!(
         stats.num_rows.get_value().copied(),
         Some(2000),
         "after first insert, live num_rows should be 2000"
+    );
+    assert_eq!(
+        table_provider_stats.num_rows.get_value().copied(),
+        Some(2000),
+        "TableProvider::statistics should expose live num_rows after insert"
     );
     assert_within(
         distinct_count(&stats, 0).expect("id NDV"),
         2000,
         0.10,
         "id NDV after insert",
+    );
+    assert_within(
+        distinct_count(&table_provider_stats, 0).expect("id TableProvider NDV"),
+        2000,
+        0.10,
+        "id NDV from TableProvider::statistics after insert",
     );
     assert_within(
         distinct_count(&stats, 1).expect("val NDV"),
@@ -161,10 +179,16 @@ async fn test_live_num_rows_and_ndv_under_upsert(
     let stats = table
         .optimizer_table_statistics()
         .expect("stats after upsert");
+    let table_provider_stats = table_provider_statistics(table.as_ref());
     assert_eq!(
         stats.num_rows.get_value().copied(),
         Some(2000),
         "live num_rows must net supersedes (stay 2000, not grow to 3000)"
+    );
+    assert_eq!(
+        table_provider_stats.num_rows.get_value().copied(),
+        Some(2000),
+        "TableProvider::statistics live num_rows must net supersedes"
     );
     // No new distinct ids were introduced by the upsert.
     assert_within(
@@ -186,16 +210,28 @@ async fn test_live_num_rows_and_ndv_under_upsert(
     let stats = table
         .optimizer_table_statistics()
         .expect("stats after new insert");
+    let table_provider_stats = table_provider_statistics(table.as_ref());
     assert_eq!(
         stats.num_rows.get_value().copied(),
         Some(3000),
         "live num_rows after inserting 1000 new ids"
+    );
+    assert_eq!(
+        table_provider_stats.num_rows.get_value().copied(),
+        Some(3000),
+        "TableProvider::statistics should expose live num_rows after new insert"
     );
     assert_within(
         distinct_count(&stats, 0).expect("id NDV"),
         3000,
         0.10,
         "id NDV after new insert",
+    );
+    assert_within(
+        distinct_count(&table_provider_stats, 0).expect("id TableProvider NDV"),
+        3000,
+        0.10,
+        "id NDV from TableProvider::statistics after new insert",
     );
 
     Ok(())

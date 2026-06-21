@@ -2229,3 +2229,88 @@ async fn test_distributed_cayenne_late_join_ddl_replay() -> Result<(), anyhow::E
         })
         .await
 }
+
+// =============================================================================
+// Test: partitioned CREATE TABLE using `PARTITION BY (bucket(N, col))` — the
+// spicebench setup form. Regression for the DataFusion 54 upgrade (#11360),
+// which broke this exact statement with
+//   "Unsupported Query. Unsupported logical plan: CreateMemoryTable"
+// while bare `PARTITION BY <col>` (covered by the other tests) kept working.
+// =============================================================================
+#[tokio::test(flavor = "multi_thread")]
+#[cfg(not(target_os = "windows"))]
+#[cfg_attr(
+    not(feature = "spicebench"),
+    ignore = "requires the spicebench feature"
+)]
+async fn test_distributed_cayenne_ddl_bucket_partition() -> Result<(), anyhow::Error> {
+    let _tracing = init_tracing(Some("integration=debug,info"));
+
+    let temp_dir = tempfile::tempdir()?;
+    let data_dir = temp_dir.path().join("data");
+    let metadata_dir = temp_dir.path().join("metadata");
+
+    test_request_context()
+        .scope(async {
+            configure_test_datafusion();
+
+            let catalog = make_cayenne_catalog(
+                "spicebench",
+                &data_dir.to_string_lossy(),
+                &metadata_dir.to_string_lossy(),
+            );
+
+            let harness = ClusterHarness::builder()
+                .scheduler(
+                    AppBuilder::new("distributed_cayenne_bucket_partition")
+                        .with_catalog(catalog.clone())
+                        .build(),
+                )
+                .executor_with_app(
+                    AppBuilder::new("executor_bucket_partition")
+                        .with_catalog(catalog)
+                        .build(),
+                )
+                .start()
+                .await?;
+
+            run_with_harness(harness, |harness| {
+                Box::pin(async move {
+                    harness.wait_for_executors(Duration::from_secs(15)).await?;
+
+                    harness.query("CREATE SCHEMA spicebench.bench").await?;
+
+                    // Exact spicebench setup statement: composite PRIMARY KEY,
+                    // quoted identifiers, and `PARTITION BY (bucket(N, col))`.
+                    harness
+                        .query(
+                            r#"CREATE TABLE IF NOT EXISTS spicebench.bench."customer" (
+                                "c_custkey" BIGINT, "c_name" TEXT, "c_address" TEXT,
+                                "c_nationkey" BIGINT, "c_phone" TEXT,
+                                "c_acctbal" DECIMAL(15, 2), "c_mktsegment" TEXT,
+                                "c_comment" TEXT, "__created_at" TIMESTAMP,
+                                PRIMARY KEY ("c_custkey", "c_nationkey")
+                            ) PARTITION BY (bucket(5, c_nationkey))"#,
+                        )
+                        .await?;
+
+                    let info_batches = harness
+                        .query(
+                            "SELECT table_name FROM information_schema.tables
+                             WHERE table_catalog = 'spicebench' AND table_name = 'customer'",
+                        )
+                        .await?;
+                    assert_eq!(
+                        total_rows(&info_batches),
+                        1,
+                        "customer table should appear in information_schema after \
+                         partitioned CREATE TABLE"
+                    );
+
+                    Ok(())
+                })
+            })
+            .await
+        })
+        .await
+}

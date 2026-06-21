@@ -44,7 +44,7 @@ use test_framework::{
 
 use crate::{
     args::HtapArgs, commands::bench::prepare_chbench_source, health::HealthMonitor,
-    spiced_metrics::MetricsScraper, wait_test_and_memory,
+    spiced_metrics::MetricsScraper,
 };
 
 pub(crate) async fn run(args: &HtapArgs) -> anyhow::Result<()> {
@@ -168,7 +168,15 @@ pub(crate) async fn run(args: &HtapArgs) -> anyhow::Result<()> {
         .with_validate_row_count(false)
         .start()?;
 
-    let test = wait_test_and_memory!(benchmark_test, memory_token, memory_readings);
+    let test = match benchmark_test.wait().await {
+        Ok(test) => test,
+        Err(e) => {
+            if let Some(handle) = memory_readings {
+                let _ = observe_memory(memory_token, handle).await;
+            }
+            return Err(e);
+        }
+    };
 
     // 5. Capture replication metrics while OLTP is still running.
     //    lag_ms = now() − commit_time(last_processed_txn), so it inflates with idle time

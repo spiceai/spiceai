@@ -303,6 +303,7 @@ impl RuntimeBuilder {
 
         let memory_limit = parse_memory_limit(query.memory_limit.clone());
         let target_partitions = query.target_partitions;
+        let max_concurrent_queries = query.max_concurrent_queries;
 
         let metrics = spicepod_rt.metrics.clone();
 
@@ -613,6 +614,8 @@ impl RuntimeBuilder {
         )
         .memory_limit(memory_limit)
         .target_partitions(target_partitions)
+        .max_concurrent_queries(max_concurrent_queries)
+        .prefer_hash_join(query.prefer_hash_join)
         .temp_directory(query.temp_directory)
         .spill_compression(query.spill_compression)
         .with_task_history(task_history)
@@ -1034,8 +1037,17 @@ fn parse_cayenne_optimizer_rules(
             "semi_join_pushdown" | "push_down_semi_join" | "semi_join" => {
                 rules.set_semi_join_pushdown(true);
             }
+            "join_reorder" | "reorder_join" | "join_ordering" => {
+                rules.set_join_reorder(true);
+            }
             "dynamic_filter_sharing" | "dynamic_filters" => {
                 rules.set_dynamic_filter_sharing(true);
+            }
+            "maintained_aggregate"
+            | "maintained_aggregates"
+            | "cdc_aggregate"
+            | "cdc_aggregates" => {
+                rules.set_maintained_aggregate(true);
             }
             "anti_join_sort_merge" | "anti_sort_merge" => {
                 rules.set_anti_join_sort_merge(true);
@@ -1294,12 +1306,14 @@ mod test {
         let mut selected_rules = CayenneOptimizerRules::none();
         selected_rules.set_filter_propagation(true);
         selected_rules.set_cross_join_reassociation(true);
+        selected_rules.set_maintained_aggregate(true);
         selected_rules.set_exact_join_filter(true);
         assert_eq!(
             parse_cayenne_optimizer_rules(
                 &HashMap::from([(
                     CAYENNE_OPTIMIZER_RULES_PARAM.to_string(),
-                    "filter-propagation,cross_join_reassociation,join_rewriter".to_string(),
+                    "filter-propagation,cross_join_reassociation,cdc_aggregates,join_rewriter"
+                        .to_string(),
                 )]),
                 true,
             ),

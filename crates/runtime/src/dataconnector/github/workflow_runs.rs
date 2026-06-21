@@ -301,10 +301,6 @@ impl WorkflowRunsTableProvider {
 
 #[async_trait]
 impl TableProvider for WorkflowRunsTableProvider {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema(&self) -> SchemaRef {
         Arc::clone(&self.schema)
     }
@@ -427,6 +423,10 @@ impl DisplayAs for WorkflowRunsExecutionPlan {
 
 #[deny(clippy::missing_trait_methods)]
 impl ExecutionPlan for WorkflowRunsExecutionPlan {
+    fn downcast_delegate(&self) -> Option<&dyn ExecutionPlan> {
+        None
+    }
+
     fn with_preserve_order(&self, _preserve_order: bool) -> Option<Arc<dyn ExecutionPlan>> {
         None
     }
@@ -440,10 +440,6 @@ impl ExecutionPlan for WorkflowRunsExecutionPlan {
         Self: Sized,
     {
         "GitHubWorkflowRunsExecutionPlan"
-    }
-
-    fn as_any(&self) -> &dyn Any {
-        self
     }
 
     fn schema(&self) -> SchemaRef {
@@ -533,8 +529,8 @@ impl ExecutionPlan for WorkflowRunsExecutionPlan {
     fn partition_statistics(
         &self,
         _partition: Option<usize>,
-    ) -> datafusion::error::Result<Statistics> {
-        Ok(Statistics::new_unknown(&self.schema()))
+    ) -> datafusion::error::Result<Arc<Statistics>> {
+        Ok(Arc::new(Statistics::new_unknown(&self.schema())))
     }
 
     fn supports_limit_pushdown(&self) -> bool {

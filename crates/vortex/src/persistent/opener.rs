@@ -325,9 +325,7 @@ impl FileOpener for VortexOpener {
 
             let mut scan_builder = ScanBuilder::new(session.clone(), layout_reader);
 
-            if let Some(extensions) = file.extensions
-                && let Some(vortex_plan) = extensions.downcast_ref::<VortexAccessPlan>()
-            {
+            if let Some(vortex_plan) = file.extensions.get::<VortexAccessPlan>() {
                 scan_builder = vortex_plan.apply_to_builder(scan_builder);
             }
 
@@ -509,10 +507,7 @@ fn collect_vortex_pushdown_conjunct(
     from_dynamic_filter: bool,
     conjuncts: &mut PushdownConjuncts,
 ) -> DFResult<()> {
-    if let Some(dynamic_filter) = expr
-        .as_any()
-        .downcast_ref::<df_expr::DynamicFilterPhysicalExpr>()
-    {
+    if let Some(dynamic_filter) = expr.downcast_ref::<df_expr::DynamicFilterPhysicalExpr>() {
         let current = match dynamic_filter.current() {
             Ok(current) => current,
             Err(err) => {
@@ -524,6 +519,14 @@ fn collect_vortex_pushdown_conjunct(
         for conjunct in split_conjunction(&current).into_iter().cloned() {
             collect_vortex_pushdown_conjunct(expr_convertor, conjunct, schema, true, conjuncts)?;
         }
+        return Ok(());
+    }
+
+    // Decline the *membership* (`InList`) conjunct of a hash-join dynamic filter.
+    // Vortex evaluates an `InList` with the O(N×M) `list_contains` kernel per row, which
+    // dominates scan time for large build-side lists.
+    if from_dynamic_filter && expr.is::<df_expr::InListExpr>() {
+        conjuncts.skipped_dynamic.push(expr);
         return Ok(());
     }
 
@@ -1214,9 +1217,12 @@ mod tests {
 
         let schema = batch.schema();
         let mut file = PartitionedFile::new(file_path.to_string(), data_size);
-        file.extensions = Some(Arc::new(VortexAccessPlan::default().with_selection(
-            Selection::IncludeByIndex(Buffer::from_iter(vec![1, 3, 5, 7])),
-        )));
+        file.extensions
+            .insert(
+                VortexAccessPlan::default().with_selection(Selection::IncludeByIndex(
+                    Buffer::from_iter(vec![1, 3, 5, 7]),
+                )),
+            );
 
         let opener = make_test_opener(
             object_store.clone(),
@@ -1255,9 +1261,12 @@ mod tests {
 
         let schema = batch.schema();
         let mut file = PartitionedFile::new(file_path.to_string(), data_size);
-        file.extensions = Some(Arc::new(VortexAccessPlan::default().with_selection(
-            Selection::ExcludeByIndex(Buffer::from_iter(vec![0, 2, 4, 6, 8])),
-        )));
+        file.extensions
+            .insert(
+                VortexAccessPlan::default().with_selection(Selection::ExcludeByIndex(
+                    Buffer::from_iter(vec![0, 2, 4, 6, 8]),
+                )),
+            );
 
         let opener = make_test_opener(
             object_store.clone(),
@@ -1299,9 +1308,8 @@ mod tests {
 
         let schema = batch.schema();
         let mut file = PartitionedFile::new(file_path.to_string(), data_size);
-        file.extensions = Some(Arc::new(
-            VortexAccessPlan::default().with_selection(Selection::All),
-        ));
+        file.extensions
+            .insert(VortexAccessPlan::default().with_selection(Selection::All));
 
         let opener = make_test_opener(
             object_store.clone(),
@@ -1468,5 +1476,73 @@ mod tests {
             "Struct(Dictionary) type should be preserved"
         );
         Ok(())
+    }
+
+    /// Builds a hash-join style dynamic filter `(id >= 3 AND id <= 7) AND id IN (3, 7)`
+    /// — the min/max bounds conjuncts AND the `InList` membership.
+    fn bounds_and_inlist_dynamic_filter() -> PhysicalExprRef {
+        let schema = Schema::new(vec![Field::new("id", DataType::Int32, false)]);
+        let column = Arc::new(df_expr::Column::new("id", 0)) as PhysicalExprRef;
+
+        let ge = Arc::new(df_expr::BinaryExpr::new(
+            Arc::clone(&column),
+            Operator::GtEq,
+            Arc::new(df_expr::Literal::new(ScalarValue::Int32(Some(3)))),
+        )) as PhysicalExprRef;
+        let le = Arc::new(df_expr::BinaryExpr::new(
+            Arc::clone(&column),
+            Operator::LtEq,
+            Arc::new(df_expr::Literal::new(ScalarValue::Int32(Some(7)))),
+        )) as PhysicalExprRef;
+        let bounds = Arc::new(df_expr::BinaryExpr::new(ge, Operator::And, le)) as PhysicalExprRef;
+
+        let in_list = Arc::new(
+            df_expr::InListExpr::try_new(
+                Arc::clone(&column),
+                vec![
+                    Arc::new(df_expr::Literal::new(ScalarValue::Int32(Some(3)))) as PhysicalExprRef,
+                    Arc::new(df_expr::Literal::new(ScalarValue::Int32(Some(7)))) as PhysicalExprRef,
+                ],
+                false,
+                &schema,
+            )
+            .expect("IN-list expression should be valid"),
+        ) as PhysicalExprRef;
+
+        let combined =
+            Arc::new(df_expr::BinaryExpr::new(bounds, Operator::And, in_list)) as PhysicalExprRef;
+
+        let dynamic_filter = Arc::new(df_expr::DynamicFilterPhysicalExpr::new(
+            vec![column],
+            Arc::new(df_expr::Literal::new(ScalarValue::Boolean(Some(true)))),
+        ));
+        dynamic_filter
+            .update(combined)
+            .expect("dynamic filter update should succeed");
+        dynamic_filter as PhysicalExprRef
+    }
+
+    #[test]
+    fn dynamic_filter_inlist_membership_is_declined() {
+        let schema = Schema::new(vec![Field::new("id", DataType::Int32, false)]);
+        let convertor = DefaultExpressionConvertor::default();
+        let filter = bounds_and_inlist_dynamic_filter();
+
+        // The cheap min/max bounds conjuncts enter the scan (driving zone pruning) while
+        // the expensive `InList` membership is declined and left to the join hash-probe.
+        let conjuncts = split_vortex_pushdown_conjuncts(&convertor, &filter, &schema)
+            .expect("split should succeed");
+        assert_eq!(
+            conjuncts.pushed.len(),
+            2,
+            "both min/max bounds conjuncts are pushed into the scan"
+        );
+        assert!(conjuncts.unpushed.is_empty());
+        assert_eq!(
+            conjuncts.skipped_dynamic.len(),
+            1,
+            "the InList membership conjunct is declined"
+        );
+        assert!(conjuncts.skipped_dynamic[0].is::<df_expr::InListExpr>());
     }
 }

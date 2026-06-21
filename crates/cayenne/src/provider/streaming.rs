@@ -29,7 +29,6 @@ use datafusion_physical_plan::execution_plan::{Boundedness, EmissionType, Partit
 use futures::StreamExt;
 use futures::stream::unfold;
 use parking_lot::Mutex;
-use std::any::Any;
 use std::sync::Arc;
 
 /// A streaming execution plan that forwards batches without buffering.
@@ -85,10 +84,6 @@ impl DisplayAs for StreamingExec {
 impl ExecutionPlan for StreamingExec {
     fn name(&self) -> &'static str {
         "StreamingExec"
-    }
-
-    fn as_any(&self) -> &dyn Any {
-        self
     }
 
     fn schema(&self) -> SchemaRef {

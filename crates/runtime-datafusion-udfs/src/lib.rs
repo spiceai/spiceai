@@ -32,3 +32,4 @@ pub mod primitive_json_codec;
 pub mod truncate;
 pub mod user_functions;
 pub(crate) mod vector_simd;
+mod vendored_hash;

@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::{any::Any, fmt, sync::Arc};
+use std::{fmt, sync::Arc};
 
 use crate::mssql::{ConnectionPoolSnafu, QuerySnafu, convert::rows_to_arrow};
 use arrow::datatypes::SchemaRef;
@@ -135,7 +135,7 @@ impl SqlServerExecPlan {
                 .sort_exprs
                 .iter()
                 .map(|sort| {
-                    let col = sort.expr.as_any().downcast_ref::<Column>().ok_or_else(|| {
+                    let col = sort.expr.downcast_ref::<Column>().ok_or_else(|| {
                         DataFusionError::Internal(
                             "Sort pushdown contains non-column expressions".to_string(),
                         )
@@ -185,10 +185,6 @@ impl DisplayAs for SqlServerExecPlan {
 impl ExecutionPlan for SqlServerExecPlan {
     fn name(&self) -> &'static str {
         "SqlServerExec"
-    }
-
-    fn as_any(&self) -> &dyn Any {
-        self
     }
 
     fn schema(&self) -> SchemaRef {
@@ -241,7 +237,7 @@ impl ExecutionPlan for SqlServerExecPlan {
         let mut nulls_match_native = true;
         for sort_expr in order {
             // Only support simple column references
-            let Some(col) = sort_expr.expr.as_any().downcast_ref::<Column>() else {
+            let Some(col) = sort_expr.expr.downcast_ref::<Column>() else {
                 return Ok(SortOrderPushdownResult::Unsupported);
             };
 

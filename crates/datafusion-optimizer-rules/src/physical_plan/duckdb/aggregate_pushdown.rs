@@ -49,6 +49,10 @@ impl DuckDBAggregatePushdownMarkerExec {
 
 #[deny(clippy::missing_trait_methods)]
 impl ExecutionPlan for DuckDBAggregatePushdownMarkerExec {
+    fn downcast_delegate(&self) -> Option<&dyn ExecutionPlan> {
+        None
+    }
+
     fn with_preserve_order(&self, _preserve_order: bool) -> Option<Arc<dyn ExecutionPlan>> {
         None
     }
@@ -62,10 +66,6 @@ impl ExecutionPlan for DuckDBAggregatePushdownMarkerExec {
         Self: Sized,
     {
         Self::name()
-    }
-
-    fn as_any(&self) -> &dyn Any {
-        self
     }
 
     fn schema(&self) -> SchemaRef {
@@ -145,7 +145,7 @@ impl ExecutionPlan for DuckDBAggregatePushdownMarkerExec {
         self.input.metrics()
     }
 
-    fn partition_statistics(&self, partition: Option<usize>) -> Result<Statistics> {
+    fn partition_statistics(&self, partition: Option<usize>) -> Result<Arc<Statistics>> {
         self.input.partition_statistics(partition)
     }
 

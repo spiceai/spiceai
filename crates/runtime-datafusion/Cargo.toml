@@ -48,7 +48,3 @@ datafusion-pruning.workspace = true
 insta.workspace = true
 object_store.workspace = true
 tokio.workspace = true
-
-[[bench]]
-harness = false
-name = "data_source_tree_display"

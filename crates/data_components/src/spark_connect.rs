@@ -434,10 +434,6 @@ struct SparkConnectTableProvider {
 
 #[async_trait]
 impl TableProvider for SparkConnectTableProvider {
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
-
     fn schema(&self) -> SchemaRef {
         Arc::clone(&self.schema)
     }
@@ -618,10 +614,6 @@ impl ExecutionPlan for SparkConnectExecutionPlan {
         _children: Vec<Arc<dyn ExecutionPlan>>,
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
         Ok(self)
-    }
-
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
     }
 }
 

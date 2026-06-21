@@ -140,6 +140,10 @@ impl DisplayAs for UdtfExec {
 
 #[deny(clippy::missing_trait_methods)]
 impl ExecutionPlan for UdtfExec {
+    fn downcast_delegate(&self) -> Option<&dyn ExecutionPlan> {
+        None
+    }
+
     fn with_preserve_order(&self, _preserve_order: bool) -> Option<Arc<dyn ExecutionPlan>> {
         None
     }
@@ -153,10 +157,6 @@ impl ExecutionPlan for UdtfExec {
         Self: Sized,
     {
         "UdtfExec"
-    }
-
-    fn as_any(&self) -> &dyn Any {
-        self
     }
 
     fn properties(&self) -> &Arc<PlanProperties> {
@@ -233,7 +233,7 @@ impl ExecutionPlan for UdtfExec {
         self.inner.metrics()
     }
 
-    fn partition_statistics(&self, partition: Option<usize>) -> Result<Statistics> {
+    fn partition_statistics(&self, partition: Option<usize>) -> Result<Arc<Statistics>> {
         self.inner.partition_statistics(partition)
     }
 
@@ -325,6 +325,10 @@ impl DisplayAs for PlaceholderExec {
 
 #[deny(clippy::missing_trait_methods)]
 impl ExecutionPlan for PlaceholderExec {
+    fn downcast_delegate(&self) -> Option<&dyn ExecutionPlan> {
+        None
+    }
+
     fn with_preserve_order(&self, _preserve_order: bool) -> Option<Arc<dyn ExecutionPlan>> {
         None
     }
@@ -338,10 +342,6 @@ impl ExecutionPlan for PlaceholderExec {
         Self: Sized,
     {
         "PlaceholderExec"
-    }
-
-    fn as_any(&self) -> &dyn Any {
-        self
     }
 
     fn properties(&self) -> &Arc<PlanProperties> {
@@ -417,8 +417,8 @@ impl ExecutionPlan for PlaceholderExec {
         None
     }
 
-    fn partition_statistics(&self, _partition: Option<usize>) -> Result<Statistics> {
-        Ok(Statistics::new_unknown(&self.schema))
+    fn partition_statistics(&self, _partition: Option<usize>) -> Result<Arc<Statistics>> {
+        Ok(Arc::new(Statistics::new_unknown(&self.schema)))
     }
 
     fn supports_limit_pushdown(&self) -> bool {

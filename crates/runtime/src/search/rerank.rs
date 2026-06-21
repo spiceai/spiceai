@@ -33,7 +33,6 @@ limitations under the License.
 //! `_score`/`_fused_score` to avoid confusion). Rows are sorted by
 //! `rerank_score DESC` and limited to the requested `limit` (or all rows).
 
-use std::any::Any;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, LazyLock, Weak};
 
@@ -460,6 +459,7 @@ impl RerankTableFunc {
 }
 
 impl TableFunctionImpl for RerankTableFunc {
+    #[expect(deprecated)] // DF54: TableFunctionImpl::call deferred (needs Session); see follow-up
     fn call(&self, args: &[Expr]) -> DataFusionResult<Arc<dyn TableProvider>> {
         let parsed = RerankTableFuncArgs::from_udtf_args(args)?;
 
@@ -497,9 +497,6 @@ impl TableFunctionImpl for RerankTableFunc {
 /// Scalar stub so `rerank(...)` can nest inside other UDTFs (same trick
 /// `vector_search`/`text_search`/`rrf` use for their scalar projection).
 impl ScalarUDFImpl for RerankTableFunc {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
     fn name(&self) -> &str {
         RERANK_UDTF_NAME
     }
@@ -700,10 +697,6 @@ impl RerankUDTFProvider {
 #[deny(clippy::missing_trait_methods)]
 #[async_trait]
 impl TableProvider for RerankUDTFProvider {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema(&self) -> SchemaRef {
         Self::output_schema(&self.input.schema())
     }
@@ -1004,10 +997,6 @@ impl DisplayAs for RerankExec {
 impl ExecutionPlan for RerankExec {
     fn name(&self) -> &'static str {
         "RerankExec"
-    }
-
-    fn as_any(&self) -> &dyn Any {
-        self
     }
 
     fn properties(&self) -> &Arc<PlanProperties> {

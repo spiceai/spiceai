@@ -51,6 +51,7 @@ impl VectorUDTFGeneration {
 
 #[async_trait::async_trait]
 impl CandidateGeneration for VectorUDTFGeneration {
+    #[expect(deprecated)] // DF54: TableFunctionImpl::call deferred (needs Session); see follow-up
     fn search(&self, query: String) -> Result<Arc<dyn TableProvider>, DataFusionError> {
         let udtf_args = VectorSearchTableFunc::to_expr(&VectorSearchTableFuncArgs {
             tbl: self.tbl.clone(),

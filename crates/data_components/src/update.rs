@@ -97,10 +97,6 @@ impl ExecutionPlan for UpdateExec {
         "UpdateExec"
     }
 
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
-
     fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
     }

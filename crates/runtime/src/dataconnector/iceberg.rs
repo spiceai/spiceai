@@ -29,10 +29,8 @@ use iceberg_storage_opendal::OpenDalStorageFactory;
 use secrecy::ExposeSecret;
 use util::concat_arrays;
 
-#[cfg(feature = "iceberg-write")]
-use iceberg::NamespaceIdent;
-
 use super::DataConnectorFactory;
+use super::iceberg_cluster::IcebergClusterTableProvider;
 use crate::{
     catalogconnector::iceberg::{
         ICEBERG_PARAM_LEN, get_rest_catalog, map_param_name_to_iceberg_prop,
@@ -104,15 +102,13 @@ impl DataConnectorFactory for IcebergDataConnectorFactory {
     }
 }
 
-/// Holds the components needed for both read and read-write Iceberg providers.
+/// Holds the components needed for read, read-write, and distributed Iceberg
+/// providers: the base provider plus the catalog and identity used to reload the
+/// table on remote executors during distributed (Ballista) execution.
 struct IcebergTableParts {
     provider: Arc<dyn TableProvider>,
-    #[cfg(feature = "iceberg-write")]
     catalog: Arc<dyn Catalog>,
-    #[cfg(feature = "iceberg-write")]
-    namespace: NamespaceIdent,
-    #[cfg(feature = "iceberg-write")]
-    table_name: String,
+    table_identifier: TableIdent,
 }
 
 #[derive(Clone, Debug)]
@@ -128,16 +124,8 @@ impl IcebergDataConnector {
         })
     }
 
-    async fn create_iceberg_table_provider(
-        &self,
-        dataset: &Dataset,
-    ) -> super::DataConnectorResult<Arc<dyn TableProvider>> {
-        let parts = self.create_iceberg_table_parts(dataset).await?;
-        Ok(parts.provider)
-    }
-
-    /// Creates the Iceberg table provider along with the catalog, namespace, and table name.
-    /// This is used by `read_write_provider` to create a deletion-capable wrapper.
+    /// Creates the Iceberg table provider along with the catalog and table
+    /// identity, used to build read, read-write, and distributed providers.
     async fn create_iceberg_table_parts(
         &self,
         dataset: &Dataset,
@@ -272,12 +260,8 @@ impl IcebergDataConnector {
 
         Ok(IcebergTableParts {
             provider: Arc::new(table_provider),
-            #[cfg(feature = "iceberg-write")]
             catalog: catalog_client,
-            #[cfg(feature = "iceberg-write")]
-            namespace: table_identifier.namespace().clone(),
-            #[cfg(feature = "iceberg-write")]
-            table_name,
+            table_identifier,
         })
     }
 
@@ -298,8 +282,6 @@ impl IcebergDataConnector {
             })?;
 
         // Load the specific table
-        #[cfg(feature = "iceberg-write")]
-        let table_name_str = table_name.clone();
         let table_identifier = TableIdent::new(namespace.name().clone(), table_name);
 
         // Determine storage factory from scheme if not explicitly provided
@@ -353,12 +335,8 @@ impl IcebergDataConnector {
 
         Ok(IcebergTableParts {
             provider: Arc::new(table_provider),
-            #[cfg(feature = "iceberg-write")]
             catalog: catalog_client,
-            #[cfg(feature = "iceberg-write")]
-            namespace: table_identifier.namespace().clone(),
-            #[cfg(feature = "iceberg-write")]
-            table_name: table_name_str,
+            table_identifier,
         })
     }
 }
@@ -373,7 +351,14 @@ impl DataConnector for IcebergDataConnector {
         &self,
         dataset: &Dataset,
     ) -> super::DataConnectorResult<Arc<dyn TableProvider>> {
-        self.create_iceberg_table_provider(dataset).await
+        let parts = self.create_iceberg_table_parts(dataset).await?;
+
+        // Wrap so the scan can be serialized for distributed (Ballista) execution.
+        // In a single-node session this is a transparent pass-through.
+        Ok(Arc::new(IcebergClusterTableProvider::new(
+            dataset.name.clone(),
+            parts.provider,
+        )))
     }
 
     #[cfg(feature = "iceberg-write")]
@@ -390,11 +375,16 @@ impl DataConnector for IcebergDataConnector {
         // Wrap in IcebergDeletionProvider for DELETE FROM support.
         let deletion_provider = data_components::iceberg::delete::IcebergDeletionProvider::new(
             parts.catalog,
-            parts.namespace,
-            parts.table_name,
+            parts.table_identifier.namespace().clone(),
+            parts.table_identifier.name().to_string(),
             parts.provider,
         );
-        Some(Ok(Arc::new(deletion_provider)))
+
+        // Then wrap so the scan can be serialized for distributed execution.
+        Some(Ok(Arc::new(IcebergClusterTableProvider::new(
+            dataset.name.clone(),
+            Arc::new(deletion_provider),
+        ))))
     }
 }
 

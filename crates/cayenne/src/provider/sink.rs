@@ -16,7 +16,6 @@ limitations under the License.
 
 //! A [`DataSink`] implementation that writes data to a Cayenne table.
 
-use std::any::Any;
 use std::fmt;
 use std::sync::Arc;
 
@@ -128,10 +127,6 @@ impl DisplayAs for CayenneDataSink {
 
 #[async_trait]
 impl DataSink for CayenneDataSink {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn metrics(&self) -> Option<MetricsSet> {
         None
     }
@@ -181,8 +176,7 @@ impl CayenneDataSink {
     /// Append data from a record batch stream into the Cayenne table.
     ///
     /// Writes data to the current snapshot (via [`CayenneTableProvider::chunk_and_write_parallel`])
-    /// or a new snapshot (via [`CayenneTableProvider::insert_to_new_snapshot_with_sequence`])
-    /// when deletion isolation is needed.
+    /// or stages a new snapshot when deletion isolation is needed.
     ///
     /// # Write Pipeline
     ///

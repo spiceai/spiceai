@@ -15,7 +15,6 @@ limitations under the License.
 */
 
 use std::{
-    any::Any,
     collections::{HashMap, HashSet},
     sync::Arc,
 };
@@ -161,10 +160,6 @@ fn columns_missing_from(expr: &[Expr], schema: &Fields) -> Vec<String> {
 
 #[async_trait]
 impl TableProvider for VectorScanTableProvider {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema(&self) -> SchemaRef {
         let mut fields_map = self
             .table_provider
@@ -396,10 +391,6 @@ mod tests {
             self.4
         }
 
-        fn as_any(&self) -> &dyn Any {
-            self
-        }
-
         fn properties(&self) -> &Arc<datafusion::physical_plan::PlanProperties> {
             self.0.properties()
         }
@@ -455,10 +446,6 @@ mod tests {
 
     #[async_trait]
     impl TableProvider for ExplainMemTable {
-        fn as_any(&self) -> &dyn Any {
-            self
-        }
-
         fn schema(&self) -> SchemaRef {
             self.0.schema()
         }

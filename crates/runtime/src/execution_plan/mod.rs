@@ -16,6 +16,8 @@ limitations under the License.
 
 //! Custom execution plans for the Spice runtime.
 
+pub mod iceberg_scan_exec;
 pub mod udtf_exec;
 
+pub use iceberg_scan_exec::{IcebergScanExec, session_is_distributed};
 pub use udtf_exec::UdtfExec;

@@ -17,7 +17,7 @@ description: "Query: clickbench_q8"
 |               |         RepartitionExec: partitioning=Hash([AdvEngineID@0], 16), input_partitions=16                                                                |
 |               |           AggregateExec: mode=Partial, gby=[AdvEngineID@0 as AdvEngineID], aggr=[count(Int64(1))]                                                   |
 |               |             SchemaCastScanExec                                                                                                                      |
-|               |               CayenneAccelerationExec                                                                                                               |
+|               |               CayenneAccelerationExec: snapshots_scanned=1, files_scanned=81                                                                        |
 |               |                 BytesProcessedExec                                                                                                                  |
 |               |                   DataSourceExec: file_groups={16 groups: [<redacted>]}, projection=[AdvEngineID], file_type=vortex, predicate: AdvEngineID@40 != 0 |
 |               |                                                                                                                                                     |

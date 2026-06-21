@@ -175,6 +175,7 @@ pub mod ducklake;
 pub mod gcs;
 pub mod glue;
 pub mod iceberg;
+pub mod iceberg_cluster;
 pub mod parameters;
 pub mod s3;
 pub mod sink;
@@ -268,6 +269,20 @@ pub enum DataConnectorError {
         "Cannot setup the {connector_component} ({dataconnector}) with an invalid configuration. {message}"
     ))]
     InvalidConfigurationNoSource {
+        dataconnector: String,
+        connector_component: ConnectorComponent,
+        message: String,
+    },
+
+    // Unlike the InvalidConfiguration* variants, this is a transient (retriable)
+    // condition: an object-store source has no data files at the path yet. Object
+    // stores are eventually consistent and data is frequently written after the
+    // runtime starts, so the dataset load must keep retrying until the files
+    // appear rather than failing permanently. See `is_retriable`.
+    #[snafu(display(
+        "No data files are yet available for the {connector_component} ({dataconnector}). {message} The runtime will keep retrying until the source data becomes available."
+    ))]
+    ObjectStoreNoFilesAvailable {
         dataconnector: String,
         connector_component: ConnectorComponent,
         message: String,

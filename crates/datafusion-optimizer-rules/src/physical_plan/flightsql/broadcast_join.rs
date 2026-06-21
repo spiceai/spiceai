@@ -48,7 +48,6 @@ limitations under the License.
 //! below `broadcast_threshold_rows` — broadcasting a large table would move
 //! `N_executors × dim_size` rows and lose.
 
-use std::any::Any;
 use std::fmt;
 use std::sync::Arc;
 
@@ -109,7 +108,7 @@ pub struct BroadcastJoinFlightSqlExec {
     output_schema: SchemaRef,
     trace_parent: Option<String>,
     properties: Arc<PlanProperties>,
-    statistics: Statistics,
+    statistics: Arc<Statistics>,
 }
 
 impl BroadcastJoinFlightSqlExec {
@@ -134,7 +133,7 @@ impl BroadcastJoinFlightSqlExec {
             output_schema,
             trace_parent,
             properties,
-            statistics,
+            statistics: Arc::new(statistics),
         }
     }
 }
@@ -154,10 +153,6 @@ impl DisplayAs for BroadcastJoinFlightSqlExec {
 impl ExecutionPlan for BroadcastJoinFlightSqlExec {
     fn name(&self) -> &'static str {
         "BroadcastJoinFlightSqlExec"
-    }
-
-    fn as_any(&self) -> &dyn Any {
-        self
     }
 
     fn properties(&self) -> &Arc<PlanProperties> {
@@ -195,8 +190,8 @@ impl ExecutionPlan for BroadcastJoinFlightSqlExec {
         Ok(Box::pin(RecordBatchStreamAdapter::new(target, stream)))
     }
 
-    fn partition_statistics(&self, _partition: Option<usize>) -> Result<Statistics> {
-        Ok(self.statistics.clone())
+    fn partition_statistics(&self, _partition: Option<usize>) -> Result<Arc<Statistics>> {
+        Ok(Arc::clone(&self.statistics))
     }
 }
 
@@ -261,7 +256,7 @@ fn try_rewrite(
     addresses: &[String],
     max_broadcast_rows: usize,
 ) -> Result<Transformed<Arc<dyn ExecutionPlan>>> {
-    let Some(join) = plan.as_any().downcast_ref::<HashJoinExec>() else {
+    let Some(join) = plan.downcast_ref::<HashJoinExec>() else {
         return Ok(Transformed::no(plan));
     };
     // Only inner equi-joins with no residual filter (the common cayenne shape).
@@ -406,7 +401,7 @@ fn safe_output_partitioning(part: &Partitioning, out_schema: &SchemaRef) -> Opti
         Partitioning::Hash(exprs, n) => {
             let mut mapped: Vec<Arc<dyn PhysicalExpr>> = Vec::with_capacity(exprs.len());
             for e in exprs {
-                let Some(col) = e.as_any().downcast_ref::<Column>() else {
+                let Some(col) = e.downcast_ref::<Column>() else {
                     return Some(Partitioning::RoundRobinBatch(*n));
                 };
                 match out_schema.index_of(col.name()) {
@@ -431,8 +426,8 @@ fn resolve_federated_side(plan: &Arc<dyn ExecutionPlan>) -> Option<FederatedSide
     // otherwise `collect_flight_execs` hits the multi-input `UnionExec`
     // mid-walk and bails.
     let mut scan_root = plan;
-    while scan_root.as_any().downcast_ref::<UnionExec>().is_none()
-        && scan_root.as_any().downcast_ref::<FlightSqlExec>().is_none()
+    while scan_root.downcast_ref::<UnionExec>().is_none()
+        && scan_root.downcast_ref::<FlightSqlExec>().is_none()
     {
         if !is_single_input_wrapper(scan_root.as_ref()) {
             return None;
@@ -460,7 +455,7 @@ fn resolve_federated_side(plan: &Arc<dyn ExecutionPlan>) -> Option<FederatedSide
 }
 
 fn collect_flight_execs(plan: &Arc<dyn ExecutionPlan>) -> Option<Vec<&FlightSqlExec>> {
-    if let Some(union) = plan.as_any().downcast_ref::<UnionExec>() {
+    if let Some(union) = plan.downcast_ref::<UnionExec>() {
         let mut out = Vec::with_capacity(union.inputs().len());
         for child in union.inputs() {
             out.push(walk_to_flight_exec(child)?);
@@ -474,7 +469,7 @@ fn collect_flight_execs(plan: &Arc<dyn ExecutionPlan>) -> Option<Vec<&FlightSqlE
 fn walk_to_flight_exec(plan: &Arc<dyn ExecutionPlan>) -> Option<&FlightSqlExec> {
     let mut current = plan;
     loop {
-        if let Some(fe) = current.as_any().downcast_ref::<FlightSqlExec>() {
+        if let Some(fe) = current.downcast_ref::<FlightSqlExec>() {
             return Some(fe);
         }
         let children = current.children();
@@ -505,11 +500,8 @@ fn walk_to_flight_exec(plan: &Arc<dyn ExecutionPlan>) -> Option<&FlightSqlExec> 
     reason = "DF53 deprecates CoalesceBatchesExec (arrow BatchCoalescer); kept for plan-shape recognition"
 )]
 fn is_single_input_wrapper(plan: &dyn ExecutionPlan) -> bool {
-    plan.as_any().downcast_ref::<RepartitionExec>().is_some()
-        || plan
-            .as_any()
-            .downcast_ref::<CoalesceBatchesExec>()
-            .is_some()
+    plan.downcast_ref::<RepartitionExec>().is_some()
+        || plan.downcast_ref::<CoalesceBatchesExec>().is_some()
         || PASS_THROUGH_EXEC_NAMES.contains(&plan.name())
 }
 
@@ -556,8 +548,8 @@ fn build_join_sql(
     let mut same_named_key_pairs: std::collections::HashSet<&str> =
         std::collections::HashSet::new();
     for (l, r) in join.on() {
-        let l_name = l.as_any().downcast_ref::<Column>()?.name();
-        let r_name = r.as_any().downcast_ref::<Column>()?.name();
+        let l_name = l.downcast_ref::<Column>()?.name();
+        let r_name = r.downcast_ref::<Column>()?.name();
         if l_name == r_name {
             same_named_key_pairs.insert(l_name);
         }
@@ -749,8 +741,7 @@ mod tests {
     /// The rewritten SQL when the rewrite fired with a single fact partition
     /// (the root is then the `BroadcastJoinFlightSqlExec` itself).
     fn broadcast_sql(plan: &Arc<dyn ExecutionPlan>) -> Option<String> {
-        plan.as_any()
-            .downcast_ref::<BroadcastJoinFlightSqlExec>()
+        plan.downcast_ref::<BroadcastJoinFlightSqlExec>()
             .map(|b| b.sql.clone())
     }
 

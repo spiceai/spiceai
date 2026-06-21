@@ -38,28 +38,19 @@ use datafusion::catalog::CatalogProvider;
 
 use cayenne::catalog_provider::CayenneCatalogProvider;
 
-use super::composed_catalog::ComposedCatalogProvider;
 use crate::catalogconnector::PartitionAwareCatalog;
 
-/// Returns `true` if `provider` is Cayenne-backed — handles both a direct
-/// [`CayenneCatalogProvider`] and the runtime's [`ComposedCatalogProvider`] wrapper.
+/// Returns `true` if `provider` is Cayenne-backed, peeling the transparent
+/// `RefreshingCatalogProvider` and `ComposedCatalogProvider` wrappers.
 pub fn is_cayenne_catalog(provider: &dyn CatalogProvider) -> bool {
     get_cayenne_provider(provider).is_some()
 }
 
-/// Extract the [`CayenneCatalogProvider`] reference, handling both direct and
-/// `ComposedCatalogProvider`-wrapped cases.
+/// Extract the [`CayenneCatalogProvider`] reference, peeling the transparent
+/// catalog wrappers. Delegates to the wrapper-aware helper in the `cayenne`
+/// crate so the peeling logic lives in one place.
 pub fn get_cayenne_provider(provider: &dyn CatalogProvider) -> Option<&CayenneCatalogProvider> {
-    if let Some(cayenne) = provider.as_any().downcast_ref::<CayenneCatalogProvider>() {
-        return Some(cayenne);
-    }
-    if let Some(composed) = provider.as_any().downcast_ref::<ComposedCatalogProvider>() {
-        return composed
-            .external()
-            .as_any()
-            .downcast_ref::<CayenneCatalogProvider>();
-    }
-    None
+    cayenne::ddl::get_cayenne_provider(provider)
 }
 
 /// Return a [`PartitionAwareCatalog`] reference if the provider is Cayenne-backed.

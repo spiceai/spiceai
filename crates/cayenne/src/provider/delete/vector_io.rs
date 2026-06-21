@@ -453,7 +453,7 @@ pub fn detect_deletion_type_and_read(
         })?;
 
         // Detect type from schema: first column name determines type
-        // "row_id" (Int64) = position-based, "row_key" (Binary) = key-based
+        // "row_id" (UInt64) = position-based, "row_key" (Binary) = key-based
         let schema = reader.schema();
         let first_field = schema.field(0);
         let is_key_based = matches!(first_field.data_type(), DataType::Binary);
