@@ -1,0 +1,30 @@
+---
+source: crates/datafusion-optimizer-rules/src/logical_plan/reorder_join/chbench_tests.rs
+expression: plan
+---
+Sort: revenue DESC NULLS FIRST
+  Projection: nation.n_name, sum(order_line.ol_amount) AS revenue
+    Aggregate: groupBy=[[nation.n_name]], aggr=[[sum(order_line.ol_amount)]]
+      Projection: nation.n_name, order_line.ol_amount
+        Inner Join: oorder.o_c_id = customer.c_id, oorder.o_w_id = customer.c_w_id, oorder.o_d_id = customer.c_d_id, supplier.su_nationkey = CAST(ascii(substr(customer.c_state, Int64(1), Int64(1))) AS Int64) - Int64(65)
+          Projection: nation.n_name, supplier.su_nationkey, order_line.ol_amount, oorder.o_c_id, oorder.o_w_id, oorder.o_d_id
+            Inner Join: order_line.ol_o_id = oorder.o_id, order_line.ol_w_id = oorder.o_w_id, order_line.ol_d_id = oorder.o_d_id
+              Projection: nation.n_name, supplier.su_nationkey, order_line.ol_o_id, order_line.ol_w_id, order_line.ol_d_id, order_line.ol_amount
+                Inner Join: stock.s_w_id = order_line.ol_w_id, stock.s_i_id = order_line.ol_i_id
+                  Projection: nation.n_name, supplier.su_nationkey, stock.s_w_id, stock.s_i_id
+                    Inner Join: supplier.su_suppkey = mod(stock.s_w_id * stock.s_i_id, Int64(10000))
+                      Projection: nation.n_name, supplier.su_suppkey, supplier.su_nationkey
+                        Inner Join: nation.n_nationkey = supplier.su_nationkey
+                          Projection: nation.n_nationkey, nation.n_name
+                            Inner Join: region.r_regionkey = nation.n_regionkey
+                              Projection: region.r_regionkey
+                                Filter: region.r_name = Utf8("EUROPE")
+                                  TableScan: region projection=[r_regionkey, r_name]
+                              TableScan: nation projection=[n_nationkey, n_name, n_regionkey]
+                          TableScan: supplier projection=[su_suppkey, su_nationkey]
+                      TableScan: stock projection=[s_w_id, s_i_id]
+                  TableScan: order_line projection=[ol_o_id, ol_w_id, ol_d_id, ol_i_id, ol_amount]
+              Projection: oorder.o_id, oorder.o_c_id, oorder.o_w_id, oorder.o_d_id
+                Filter: oorder.o_entry_d >= TimestampNanosecond(1167696000000000000, None)
+                  TableScan: oorder projection=[o_id, o_c_id, o_w_id, o_d_id, o_entry_d]
+          TableScan: customer projection=[c_id, c_w_id, c_d_id, c_state]

@@ -1,0 +1,29 @@
+---
+source: crates/datafusion-optimizer-rules/src/logical_plan/reorder_join/chbench_tests.rs
+expression: plan
+---
+Sort: ordercount DESC NULLS FIRST
+  Projection: stock.s_i_id, sum(stock.s_order_cnt) AS ordercount
+    Filter: CAST(sum(stock.s_order_cnt) AS Float64) > (<subquery>)
+      Subquery:
+        Projection: CAST(sum(stock.s_order_cnt) AS Float64) * Float64(0.005)
+          Aggregate: groupBy=[[]], aggr=[[sum(stock.s_order_cnt)]]
+            Projection: stock.s_order_cnt
+              Inner Join: supplier.su_nationkey = nation.n_nationkey
+                Projection: stock.s_order_cnt, supplier.su_nationkey
+                  Inner Join: mod(stock.s_w_id * stock.s_i_id, Int64(10000)) = supplier.su_suppkey
+                    TableScan: stock projection=[s_w_id, s_i_id, s_order_cnt]
+                    TableScan: supplier projection=[su_suppkey, su_nationkey]
+                Projection: nation.n_nationkey
+                  Filter: nation.n_name = Utf8("CHINA")
+                    TableScan: nation projection=[n_nationkey, n_name]
+      Aggregate: groupBy=[[stock.s_i_id]], aggr=[[sum(stock.s_order_cnt)]]
+        Projection: stock.s_i_id, stock.s_order_cnt
+          Inner Join: supplier.su_suppkey = mod(stock.s_w_id * stock.s_i_id, Int64(10000))
+            Projection: supplier.su_suppkey
+              Inner Join: nation.n_nationkey = supplier.su_nationkey
+                Projection: nation.n_nationkey
+                  Filter: nation.n_name = Utf8("CHINA")
+                    TableScan: nation projection=[n_nationkey, n_name]
+                TableScan: supplier projection=[su_suppkey, su_nationkey]
+            TableScan: stock projection=[s_w_id, s_i_id, s_order_cnt]

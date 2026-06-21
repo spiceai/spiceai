@@ -1,0 +1,40 @@
+---
+source: crates/datafusion-optimizer-rules/src/logical_plan/reorder_join/chbench_tests.rs
+expression: plan
+---
+Sort: l_year ASC NULLS LAST
+  Projection: date_part(Utf8("YEAR"),oorder.o_entry_d) AS l_year, sum(CASE WHEN n2.n_name = Utf8("INDIA") THEN order_line.ol_amount ELSE Int64(0) END) / sum(order_line.ol_amount) AS mkt_share
+    Aggregate: groupBy=[[date_part(Utf8("YEAR"), oorder.o_entry_d)]], aggr=[[sum(CASE WHEN n2.n_name = Utf8("INDIA") THEN order_line.ol_amount ELSE Float64(0) END) AS sum(CASE WHEN n2.n_name = Utf8("INDIA") THEN order_line.ol_amount ELSE Int64(0) END), sum(order_line.ol_amount)]]
+      Projection: order_line.ol_amount, oorder.o_entry_d, n2.n_name
+        Inner Join: supplier.su_nationkey = n2.n_nationkey
+          Projection: oorder.o_entry_d, order_line.ol_amount, supplier.su_nationkey
+            Inner Join: mod(stock.s_w_id * stock.s_i_id, Int64(10000)) = supplier.su_suppkey
+              Projection: oorder.o_entry_d, order_line.ol_amount, stock.s_w_id, stock.s_i_id
+                Inner Join: stock.s_i_id = item.i_id, order_line.ol_i_id = item.i_id
+                  Projection: oorder.o_entry_d, order_line.ol_i_id, order_line.ol_amount, stock.s_w_id, stock.s_i_id
+                    Inner Join: order_line.ol_i_id = stock.s_i_id, order_line.ol_supply_w_id = stock.s_w_id
+                      Projection: oorder.o_entry_d, order_line.ol_i_id, order_line.ol_supply_w_id, order_line.ol_amount
+                        Inner Join: oorder.o_w_id = order_line.ol_w_id, oorder.o_d_id = order_line.ol_d_id, oorder.o_id = order_line.ol_o_id
+                          Projection: oorder.o_id, oorder.o_w_id, oorder.o_d_id, oorder.o_entry_d
+                            Inner Join: customer.c_id = oorder.o_c_id, customer.c_w_id = oorder.o_w_id, customer.c_d_id = oorder.o_d_id
+                              Projection: customer.c_id, customer.c_w_id, customer.c_d_id
+                                Inner Join: n1.n_nationkey = CAST(ascii(substr(customer.c_state, Int64(1), Int64(1))) AS Int64) - Int64(65)
+                                  Projection: n1.n_nationkey
+                                    Inner Join: region.r_regionkey = n1.n_regionkey
+                                      Projection: region.r_regionkey
+                                        Filter: region.r_name = Utf8("ASIA")
+                                          TableScan: region projection=[r_regionkey, r_name]
+                                      SubqueryAlias: n1
+                                        TableScan: nation projection=[n_nationkey, n_regionkey]
+                                  TableScan: customer projection=[c_id, c_w_id, c_d_id, c_state]
+                              TableScan: oorder projection=[o_id, o_c_id, o_w_id, o_d_id, o_entry_d]
+                          Filter: order_line.ol_i_id < Int64(1000)
+                            TableScan: order_line projection=[ol_o_id, ol_w_id, ol_d_id, ol_i_id, ol_supply_w_id, ol_amount]
+                      Filter: stock.s_i_id < Int64(1000)
+                        TableScan: stock projection=[s_w_id, s_i_id]
+                  Projection: item.i_id
+                    Filter: item.i_data LIKE Utf8("%b") AND item.i_id < Int64(1000)
+                      TableScan: item projection=[i_id, i_data]
+              TableScan: supplier projection=[su_suppkey, su_nationkey]
+          SubqueryAlias: n2
+            TableScan: nation projection=[n_nationkey, n_name]
