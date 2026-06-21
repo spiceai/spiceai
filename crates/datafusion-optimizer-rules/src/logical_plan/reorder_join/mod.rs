@@ -1,5 +1,5 @@
 /*
-Copyright 2025 The Spice.ai OSS Authors
+Copyright 2026 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -14,10 +14,14 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-pub mod cache_invalidation;
-#[cfg(feature = "duckdb")]
-pub mod duckdb;
-pub mod reorder_join;
+//! Logical optimizer rule that reorders inner-join chains to minimize execution cost.
 
-pub use cache_invalidation::CacheInvalidationExtensionPlanner;
-pub use reorder_join::ReorderJoinRule;
+pub mod cost;
+pub mod join_graph;
+pub mod left_deep_join_plan;
+pub mod rule;
+
+#[cfg(test)]
+mod chbench_tests;
+
+pub use rule::ReorderJoinRule;

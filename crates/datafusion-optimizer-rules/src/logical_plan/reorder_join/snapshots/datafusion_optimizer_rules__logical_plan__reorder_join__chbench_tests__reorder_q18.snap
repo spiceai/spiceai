@@ -1,0 +1,16 @@
+---
+source: crates/datafusion-optimizer-rules/src/logical_plan/reorder_join/chbench_tests.rs
+expression: plan
+---
+Sort: amount_sum DESC NULLS FIRST, oorder.o_entry_d ASC NULLS LAST
+  Projection: customer.c_last, customer.c_id, oorder.o_id, oorder.o_entry_d, oorder.o_ol_cnt, sum(order_line.ol_amount) AS amount_sum
+    Filter: sum(order_line.ol_amount) > Float64(200)
+      Projection: oorder.o_id, customer.c_id, customer.c_last, oorder.o_entry_d, oorder.o_ol_cnt, sum(order_line.ol_amount)
+        Aggregate: groupBy=[[oorder.o_id, oorder.o_w_id, oorder.o_d_id, customer.c_id, customer.c_last, oorder.o_entry_d, oorder.o_ol_cnt]], aggr=[[sum(order_line.ol_amount)]]
+          Projection: customer.c_id, customer.c_last, oorder.o_id, oorder.o_w_id, oorder.o_d_id, oorder.o_entry_d, oorder.o_ol_cnt, order_line.ol_amount
+            Inner Join: oorder.o_w_id = order_line.ol_w_id, oorder.o_d_id = order_line.ol_d_id, oorder.o_id = order_line.ol_o_id
+              Projection: customer.c_id, customer.c_last, oorder.o_id, oorder.o_w_id, oorder.o_d_id, oorder.o_entry_d, oorder.o_ol_cnt
+                Inner Join: customer.c_id = oorder.o_c_id, customer.c_w_id = oorder.o_w_id, customer.c_d_id = oorder.o_d_id
+                  TableScan: customer projection=[c_id, c_w_id, c_d_id, c_last]
+                  TableScan: oorder projection=[o_id, o_c_id, o_w_id, o_d_id, o_entry_d, o_ol_cnt]
+              TableScan: order_line projection=[ol_o_id, ol_w_id, ol_d_id, ol_amount]

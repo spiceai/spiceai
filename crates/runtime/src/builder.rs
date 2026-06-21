@@ -1037,6 +1037,9 @@ fn parse_cayenne_optimizer_rules(
             "semi_join_pushdown" | "push_down_semi_join" | "semi_join" => {
                 rules.set_semi_join_pushdown(true);
             }
+            "join_reorder" | "reorder_join" | "join_ordering" => {
+                rules.set_join_reorder(true);
+            }
             "dynamic_filter_sharing" | "dynamic_filters" => {
                 rules.set_dynamic_filter_sharing(true);
             }
