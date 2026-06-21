@@ -64,6 +64,9 @@ RUN apt-get update \
     && if echo "$CARGO_FEATURES" | grep -q "odbc"; then \
       apt-get install --yes --no-install-recommends unixodbc; \
     fi \
+    && if echo "$CARGO_FEATURES" | grep -q "mssql"; then \
+      apt-get install --yes --no-install-recommends libgssapi-krb5-2; \
+    fi \
     && rm -rf /var/lib/{apt,dpkg,cache,log}
 
 # Layout a tiny filesystem in /spice_sandbox

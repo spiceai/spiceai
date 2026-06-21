@@ -7,7 +7,7 @@ FROM nvidia/cuda:13.3.0-cudnn-devel-ubuntu24.04 AS build
 USER root
 
 RUN apt update \
-    && apt install --yes pkg-config libssl-dev build-essential libsqlite3-dev cmake protobuf-compiler unixodbc-dev curl \
+    && apt install --yes pkg-config libssl-dev build-essential libsqlite3-dev cmake protobuf-compiler unixodbc-dev curl libclang-dev libkrb5-dev \
     && rm -rf /var/lib/{apt,dpkg,cache,log}
 
 RUN curl https://sh.rustup.rs -sSf | bash -s -- -y \
@@ -59,6 +59,12 @@ RUN apt update \
 RUN if echo "$CARGO_FEATURES" | grep -q "odbc"; then \
     apt update \
     && apt install --yes unixodbc --no-install-recommends \
+    && rm -rf /var/lib/{apt,dpkg,cache,log}; \
+    fi
+
+RUN if echo "$CARGO_FEATURES" | grep -q "mssql"; then \
+    apt update \
+    && apt install --yes libgssapi-krb5-2 --no-install-recommends \
     && rm -rf /var/lib/{apt,dpkg,cache,log}; \
     fi
 

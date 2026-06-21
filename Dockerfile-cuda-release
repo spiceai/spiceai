@@ -45,6 +45,12 @@ RUN if echo "$CARGO_FEATURES" | grep -q "odbc"; then \
     && rm -rf /var/lib/{apt,dpkg,cache,log}; \
   fi
 
+RUN if echo "$CARGO_FEATURES" | grep -q "mssql"; then \
+    apt-get update \
+    && apt-get install --yes --no-install-recommends libgssapi-krb5-2 \
+    && rm -rf /var/lib/{apt,dpkg,cache,log}; \
+  fi
+
 COPY --from=binary /root/spiced /usr/local/bin/spiced
 
 ENV CUDA_COMPUTE_CAP=${CUDA_COMPUTE_CAP}

@@ -6,7 +6,7 @@ FROM rust:${RUST_VERSION}-slim-trixie as build
 USER root
 
 RUN apt update \
-    && apt install --yes pkg-config libssl-dev build-essential libsqlite3-dev cmake protobuf-compiler unixodbc-dev libclang-dev \
+    && apt install --yes pkg-config libssl-dev build-essential libsqlite3-dev cmake protobuf-compiler unixodbc-dev libclang-dev libkrb5-dev \
     && rm -rf /var/lib/{apt,dpkg,cache,log}
 
 COPY . /build
@@ -53,6 +53,9 @@ RUN apt update \
     && apt install --yes ca-certificates libssl3 findutils tzdata --no-install-recommends \
     && if echo "$CARGO_FEATURES" | grep -q "odbc"; then \
     apt install --yes unixodbc --no-install-recommends; \
+    fi \
+    && if echo "$CARGO_FEATURES" | grep -q "mssql"; then \
+    apt install --yes libgssapi-krb5-2 --no-install-recommends; \
     fi \
     && rm -rf /var/lib/{apt,dpkg,cache,log}
 
