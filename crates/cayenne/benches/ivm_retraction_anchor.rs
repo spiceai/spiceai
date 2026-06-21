@@ -518,30 +518,38 @@ fn bench_real_registry_retract(c: &mut Criterion) {
             BenchmarkId::from_parameter(format!("rows={rows}/groups={groups}/delta={DELTA}")),
             &rows,
             |b, &rows| {
-                b.iter_batched(
-                    || {
-                        let registry = MaintainedAggregateRegistry::try_new_with_pk(
-                            &[retract_spec()],
-                            &retract_schema(),
-                            vec![0],
-                            usize::MAX,
-                        )
-                        .expect("registry construction");
+                // The registry holds a `RwLock` (can't be cloned), so an
+                // iter_batched setup would re-seed + drop an N-entry registry
+                // INSIDE the measured region and swamp the O(delta) work. Seed
+                // once outside the timer with iter_custom, then time only the
+                // repeated apply_delta calls.
+                b.iter_custom(|iters| {
+                    let registry = MaintainedAggregateRegistry::try_new_with_pk(
+                        &[retract_spec()],
+                        &retract_schema(),
+                        vec![0],
+                        usize::MAX,
+                    )
+                    .expect("registry construction");
+                    registry
+                        .apply_delta(1, &[retract_batch(0, rows, groups)], &[])
+                        .expect("seed insert");
+                    // Each timed delta re-upserts DELTA existing PKs: every row
+                    // retracts its old contribution from the index then applies
+                    // the new one (the O(delta) retraction op), repeatable since
+                    // the PKs stay resident. Seed + final drop are untimed.
+                    let update = retract_batch(0, DELTA, groups);
+                    let mut total = std::time::Duration::ZERO;
+                    for iteration in 0..iters {
+                        let epoch = 2 + iteration; // each apply advances the epoch
+                        let start = std::time::Instant::now();
                         registry
-                            .apply_delta(1, &[retract_batch(0, rows, groups)], &[])
-                            .expect("seed insert");
-                        // Half the delta updates existing PKs (re-upsert), half deletes them.
-                        let update = retract_batch(0, DELTA / 2, groups);
-                        let delete = retract_batch((DELTA / 2) as i64, DELTA / 2, groups);
-                        (registry, update, delete)
-                    },
-                    |(registry, update, delete)| {
-                        registry
-                            .apply_delta(2, &[update], &[delete])
+                            .apply_delta(epoch, std::slice::from_ref(&update), &[])
                             .expect("retract delta");
-                    },
-                    criterion::BatchSize::SmallInput,
-                );
+                        total += start.elapsed();
+                    }
+                    total
+                });
             },
         );
     }
