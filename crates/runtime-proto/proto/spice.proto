@@ -328,6 +328,11 @@ message IcebergTableScanExecNode {
     // Output partitioning, so the deferred node reports the same partition count
     // the scheduler planned before the (lazy) scan actually runs.
     IcebergPartitioning partitioning = 6;
+    // Snapshot pinned at planning time on the scheduler. Every executor task
+    // plans against this snapshot, so all partitions of one query read a single
+    // consistent snapshot even if the table is committed to mid-query. Absent =
+    // read the current snapshot (e.g. table had no snapshot at plan time).
+    optional int64 snapshot_id = 7;
 }
 
 // Serializable form of the scan's output `Partitioning`.

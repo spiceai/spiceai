@@ -23,6 +23,8 @@ use arrow_schema::Schema;
 use ballista_core::serde::BallistaPhysicalExtensionCodec;
 #[cfg(not(windows))]
 use cayenne::provider::CayenneAccelerationExec;
+use data_components::iceberg::delete::IcebergDeletionProvider;
+use datafusion::catalog::TableProvider;
 use datafusion::common::{DataFusionError, Result, TableReference, exec_err};
 use datafusion::execution::{FunctionRegistry, TaskContext};
 use datafusion::logical_expr::Expr;
@@ -37,6 +39,7 @@ use datafusion_proto::physical_plan::AsExecutionPlan;
 use datafusion_proto::physical_plan::PhysicalExtensionCodec;
 #[cfg(not(windows))]
 use datafusion_proto::protobuf::PhysicalPlanNode;
+use iceberg_datafusion::IcebergTableProvider;
 use prost::Message;
 use runtime_datafusion::execution_plan::schema_cast::SchemaCastScanExec;
 use runtime_datafusion::extension::bytes_processed::BytesProcessedExec;
@@ -208,13 +211,23 @@ impl PhysicalExtensionCodec for SpicePhysicalCodec {
                          distributed Iceberg scans require the Iceberg data connector"
                     );
                 };
-                // The concrete Iceberg provider (not the cluster wrapper), so
-                // replaying its scan() yields the bare scan without re-wrapping.
-                let inner_provider = Arc::clone(cluster.inner());
+                // Resolve the concrete IcebergTableProvider (the cluster wrapper's
+                // inner, peeling the deletion wrapper on the read-write path) and
+                // pin it to the snapshot the scheduler chose, so every executor task
+                // of this query reads the same snapshot. Scanning this provider
+                // directly also yields the bare scan without re-wrapping.
+                let Some(iceberg_provider) = concrete_iceberg_provider(cluster.inner()) else {
+                    return exec_err!(
+                        "IcebergClusterTableProvider for {table_ref} does not wrap an \
+                         IcebergTableProvider; cannot reconstruct the distributed scan"
+                    );
+                };
+                let pinned: Arc<dyn TableProvider> =
+                    Arc::new(iceberg_provider.clone().with_snapshot_id(node.snapshot_id));
 
                 // Output schema = table schema projected by the recipe, taken
                 // synchronously from the registered provider.
-                let table_schema = inner_provider.schema();
+                let table_schema = pinned.schema();
                 let output_schema = match &projection {
                     Some(p) => Arc::new(table_schema.project(p)?),
                     None => table_schema,
@@ -222,7 +235,7 @@ impl PhysicalExtensionCodec for SpicePhysicalCodec {
 
                 Ok(Arc::new(IcebergScanExec::new_deferred(
                     table_ref,
-                    inner_provider,
+                    pinned,
                     projection,
                     filters,
                     limit,
@@ -323,6 +336,8 @@ impl PhysicalExtensionCodec for SpicePhysicalCodec {
                         filters,
                         limit,
                         partitioning: Some(partitioning),
+                        // Pin the plan-time snapshot so every executor task reads it.
+                        snapshot_id: scan_exec.snapshot_id(),
                     },
                 )),
             }
@@ -353,6 +368,19 @@ impl PhysicalExtensionCodec for SpicePhysicalCodec {
     fn try_decode_udf(&self, name: &str, _buf: &[u8]) -> Result<Arc<ScalarUDF>> {
         self.runtime()?.df.ctx.udf(name)
     }
+}
+
+/// Returns the concrete [`IcebergTableProvider`] behind a cluster wrapper's inner
+/// provider — directly (read path) or through the [`IcebergDeletionProvider`] the
+/// read-write path inserts. The returned provider is used (cloned + snapshot
+/// pinned) to replay the scan on the executor.
+fn concrete_iceberg_provider(inner: &Arc<dyn TableProvider>) -> Option<&IcebergTableProvider> {
+    if let Some(p) = inner.downcast_ref::<IcebergTableProvider>() {
+        return Some(p);
+    }
+    inner
+        .downcast_ref::<IcebergDeletionProvider>()
+        .and_then(|d| d.inner().downcast_ref::<IcebergTableProvider>())
 }
 
 /// Serializes a scan's output [`Partitioning`] into its wire form, so the

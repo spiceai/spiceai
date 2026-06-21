@@ -61,6 +61,7 @@ use datafusion::physical_plan::{
 };
 use datafusion::prelude::{SessionConfig, SessionContext};
 use futures::TryStreamExt;
+use iceberg_datafusion::physical_plan::IcebergTableScan;
 use runtime_datafusion::config::cluster_config::SpiceClusterConfig;
 use tokio::sync::OnceCell;
 
@@ -201,6 +202,24 @@ impl IcebergScanExec {
     #[must_use]
     pub fn limit(&self) -> Option<usize> {
         self.limit
+    }
+
+    /// The snapshot to pin for this scan, derived from the wrapped scan at plan
+    /// time: the scan's explicit snapshot if any, else the table's current
+    /// snapshot. The codec serializes this so every executor task plans against
+    /// the same snapshot — giving one consistent snapshot across all partitions
+    /// of a distributed query even under concurrent commits. Returns `None` for a
+    /// deferred node (its provider already carries the pin) or if the wrapped plan
+    /// isn't an `IcebergTableScan`.
+    #[must_use]
+    pub fn snapshot_id(&self) -> Option<i64> {
+        match &self.source {
+            ScanSource::Planned(inner) => inner.downcast_ref::<IcebergTableScan>().and_then(|s| {
+                s.snapshot_id()
+                    .or_else(|| s.table().metadata().current_snapshot_id())
+            }),
+            ScanSource::Deferred { .. } => None,
+        }
     }
 }
 
