@@ -1060,7 +1060,7 @@ mod tests {
         assert_ne!(bucket_a, bucket_b);
     }
 
-    /// The base+delta `UnionExec` wipes a join key's min/max + distinct_count to
+    /// The base+delta `UnionExec` wipes a join key's min/max + `distinct_count` to
     /// `Precision::Absent` (an empty delta branch poisons `col_stats_union`).
     /// With an optimizer overlay attached, the wrapper must refill exactly those
     /// Absent fields while preserving the child's (filter-aware) `num_rows`.

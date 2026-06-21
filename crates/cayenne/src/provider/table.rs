@@ -7117,7 +7117,7 @@ impl CayenneTableProvider {
     /// The maintained aggregate stores scalars in the table's *stored* types
     /// (e.g. `Utf8`), but the query-path schema may advertise a different family
     /// (e.g. `Utf8View` via the view read-schema). Feeding a type-mismatched
-    /// bound into interval analysis trips DataFusion's `Interval::try_new`
+    /// bound into interval analysis trips `DataFusion`'s `Interval::try_new`
     /// type-equality assertion, so the pair is dropped on any mismatch. NDV
     /// (`distinct_count`) is a plain count and is always safe to keep.
     fn overlay_column_statistics_for_field(
