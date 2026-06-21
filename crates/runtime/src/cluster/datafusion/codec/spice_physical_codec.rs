@@ -188,7 +188,7 @@ impl PhysicalExtensionCodec for SpicePhysicalCodec {
                         })
                     })
                     .transpose()?;
-                let partitioning = decode_partitioning(node.partitioning.as_ref());
+                let partitioning = decode_partitioning(node.partitioning.as_ref())?;
 
                 // Resolve the registered provider synchronously — no catalog I/O,
                 // no blocking bridge. The executor loaded the same app definition,
@@ -312,7 +312,7 @@ impl PhysicalExtensionCodec for SpicePhysicalCodec {
                     })
                 })
                 .transpose()?;
-            let partitioning = encode_partitioning(scan_exec.properties().output_partitioning());
+            let partitioning = encode_partitioning(scan_exec.properties().output_partitioning())?;
 
             SpicePhysicalPlanNode {
                 node: Some(spice_physical_plan_node::Node::IcebergTableScan(
@@ -362,69 +362,90 @@ impl PhysicalExtensionCodec for SpicePhysicalCodec {
 /// Hash partitioning is reproduced only when every expression is a plain
 /// [`Column`]; otherwise the count is preserved as
 /// [`Partitioning::UnknownPartitioning`].
-fn encode_partitioning(partitioning: &Partitioning) -> IcebergPartitioning {
-    let to_u64 = |n: usize| u64::try_from(n).unwrap_or(u64::MAX);
-    match partitioning {
+fn encode_partitioning(partitioning: &Partitioning) -> Result<IcebergPartitioning> {
+    // Counts/indices fail serialization explicitly rather than saturating into a
+    // malformed recipe (consistent with how projection/limit are encoded).
+    fn to_u64(n: usize) -> Result<u64> {
+        u64::try_from(n).map_err(|_| {
+            DataFusionError::Internal(format!(
+                "IcebergScanExec partitioning value {n} does not fit in u64; cannot serialize \
+                 the scan for distributed execution"
+            ))
+        })
+    }
+    Ok(match partitioning {
         Partitioning::UnknownPartitioning(n) => IcebergPartitioning {
             kind: 0,
-            partition_count: to_u64(*n),
+            partition_count: to_u64(*n)?,
             hash_columns: Vec::new(),
         },
         Partitioning::RoundRobinBatch(n) => IcebergPartitioning {
             kind: 2,
-            partition_count: to_u64(*n),
+            partition_count: to_u64(*n)?,
             hash_columns: Vec::new(),
         },
         Partitioning::Hash(exprs, n) => {
-            let hash_columns: Vec<IcebergHashColumn> = exprs
-                .iter()
-                .filter_map(|expr| {
-                    expr.downcast_ref::<Column>().map(|c| IcebergHashColumn {
+            // Reproduce Hash partitioning only when every expr is a plain Column;
+            // otherwise preserve just the count as UnknownPartitioning.
+            let mut hash_columns = Vec::with_capacity(exprs.len());
+            let mut all_columns = true;
+            for expr in exprs {
+                if let Some(c) = expr.downcast_ref::<Column>() {
+                    hash_columns.push(IcebergHashColumn {
                         name: c.name().to_string(),
-                        index: to_u64(c.index()),
-                    })
-                })
-                .collect();
-            if hash_columns.len() == exprs.len() {
+                        index: to_u64(c.index())?,
+                    });
+                } else {
+                    all_columns = false;
+                    break;
+                }
+            }
+            if all_columns {
                 IcebergPartitioning {
                     kind: 1,
-                    partition_count: to_u64(*n),
+                    partition_count: to_u64(*n)?,
                     hash_columns,
                 }
             } else {
                 IcebergPartitioning {
                     kind: 0,
-                    partition_count: to_u64(*n),
+                    partition_count: to_u64(*n)?,
                     hash_columns: Vec::new(),
                 }
             }
         }
-    }
+    })
 }
 
-/// Reconstructs a [`Partitioning`] from its wire form.
-fn decode_partitioning(partitioning: Option<&IcebergPartitioning>) -> Partitioning {
+/// Reconstructs a [`Partitioning`] from its wire form. Values that don't fit
+/// `usize` (corrupt recipe / platform skew) fail rather than saturating.
+fn decode_partitioning(partitioning: Option<&IcebergPartitioning>) -> Result<Partitioning> {
+    fn to_usize(v: u64) -> Result<usize> {
+        usize::try_from(v).map_err(|_| {
+            DataFusionError::Internal(format!(
+                "iceberg scan recipe partitioning value {v} does not fit in usize"
+            ))
+        })
+    }
     let Some(p) = partitioning else {
-        return Partitioning::UnknownPartitioning(1);
+        return Ok(Partitioning::UnknownPartitioning(1));
     };
-    let n = usize::try_from(p.partition_count).unwrap_or(usize::MAX);
-    match p.kind {
+    let n = to_usize(p.partition_count)?;
+    Ok(match p.kind {
         1 => {
-            let exprs: Vec<Arc<dyn PhysicalExpr>> = p
-                .hash_columns
-                .iter()
-                .map(|c| {
-                    Arc::new(Column::new(
-                        &c.name,
-                        usize::try_from(c.index).unwrap_or(usize::MAX),
-                    )) as Arc<dyn PhysicalExpr>
-                })
-                .collect();
+            let exprs: Vec<Arc<dyn PhysicalExpr>> =
+                p.hash_columns
+                    .iter()
+                    .map(|c| {
+                        Ok::<_, DataFusionError>(Arc::new(Column::new(&c.name, to_usize(c.index)?))
+                            as Arc<dyn PhysicalExpr>)
+                    })
+                    .collect::<Result<Vec<_>>>()?;
             Partitioning::Hash(exprs, n)
         }
         2 => Partitioning::RoundRobinBatch(n),
         _ => Partitioning::UnknownPartitioning(n),
-    }
+    })
 }
 
 #[cfg(not(windows))]

@@ -62,6 +62,7 @@ use datafusion::physical_plan::{
 use datafusion::prelude::{SessionConfig, SessionContext};
 use futures::TryStreamExt;
 use runtime_datafusion::config::cluster_config::SpiceClusterConfig;
+use tokio::sync::OnceCell;
 
 /// Returns `true` when `config` belongs to a distributed (Ballista) session.
 ///
@@ -85,9 +86,15 @@ enum ScanSource {
     /// single-node execution). Execution delegates straight to it.
     Planned(Arc<dyn ExecutionPlan>),
     /// Decode-time on a remote executor: the registered Iceberg provider, resolved
-    /// synchronously from the recipe. The scan is re-derived lazily at `execute()`
-    /// time so no catalog I/O runs during synchronous plan deserialization.
-    Deferred(Arc<dyn TableProvider>),
+    /// synchronously from the recipe. The scan is re-derived lazily on the first
+    /// `execute()` and memoized in `scan`, so it is planned exactly once per
+    /// instance (not once per partition) — avoiding redundant `plan_files()` work
+    /// and keeping every partition of this instance on a single snapshot/fileset.
+    /// No catalog I/O runs during synchronous plan deserialization.
+    Deferred {
+        provider: Arc<dyn TableProvider>,
+        scan: Arc<OnceCell<Arc<dyn ExecutionPlan>>>,
+    },
 }
 
 /// A leaf execution plan that represents a distributed Iceberg scan. See the
@@ -165,7 +172,10 @@ impl IcebergScanExec {
             filters,
             limit,
             properties,
-            source: ScanSource::Deferred(provider),
+            source: ScanSource::Deferred {
+                provider,
+                scan: Arc::new(OnceCell::new()),
+            },
         }
     }
 
@@ -202,11 +212,10 @@ impl DisplayAs for IcebergScanExec {
                 write!(f, " ")?;
                 inner.fmt_as(t, f)
             }
-            ScanSource::Deferred(_) => {
-                let projection = self
-                    .projection
-                    .as_ref()
-                    .map_or_else(String::new, |p| format!("{p:?}"));
+            ScanSource::Deferred { .. } => {
+                let projection = self.projection.as_ref().map_or_else(String::new, |p| {
+                    p.iter().map(usize::to_string).collect::<Vec<_>>().join(",")
+                });
                 write!(f, " deferred projection:[{projection}]")
             }
         }
@@ -300,21 +309,31 @@ impl ExecutionPlan for IcebergScanExec {
     ) -> Result<SendableRecordBatchStream> {
         match &self.source {
             ScanSource::Planned(inner) => inner.execute(partition, context),
-            ScanSource::Deferred(provider) => {
+            ScanSource::Deferred { provider, scan } => {
                 let provider = Arc::clone(provider);
+                let scan = Arc::clone(scan);
                 let projection = self.projection.clone();
                 let filters = self.filters.clone();
                 let limit = self.limit;
                 let schema = self.schema();
 
-                // Re-derive the scan lazily, in async context. A SessionState
-                // carrying the per-job config (notably `target_partitions`) makes
-                // the rebuilt scan bucket the same way the scheduler planned.
+                // Re-derive the scan lazily, in async context, and memoize it: the
+                // first partition to execute plans it (via plan_files); every other
+                // partition of this instance reuses the same plan, so they all read
+                // one consistent snapshot/fileset and re-planning happens once. A
+                // SessionState carrying the per-job config (notably
+                // `target_partitions`) makes the rebuilt scan bucket the way the
+                // scheduler planned.
                 let fut = async move {
-                    let session =
-                        SessionContext::new_with_config(context.session_config().clone()).state();
-                    let plan = provider
-                        .scan(&session, projection.as_ref(), &filters, limit)
+                    let plan = scan
+                        .get_or_try_init(|| async {
+                            let session =
+                                SessionContext::new_with_config(context.session_config().clone())
+                                    .state();
+                            provider
+                                .scan(&session, projection.as_ref(), &filters, limit)
+                                .await
+                        })
                         .await?;
                     plan.execute(partition, context)
                 };
@@ -327,14 +346,14 @@ impl ExecutionPlan for IcebergScanExec {
     fn metrics(&self) -> Option<MetricsSet> {
         match &self.source {
             ScanSource::Planned(inner) => inner.metrics(),
-            ScanSource::Deferred(_) => None,
+            ScanSource::Deferred { .. } => None,
         }
     }
 
     fn partition_statistics(&self, partition: Option<usize>) -> Result<Arc<Statistics>> {
         match &self.source {
             ScanSource::Planned(inner) => inner.partition_statistics(partition),
-            ScanSource::Deferred(_) => Ok(Arc::new(Statistics::new_unknown(&self.schema))),
+            ScanSource::Deferred { .. } => Ok(Arc::new(Statistics::new_unknown(&self.schema))),
         }
     }
 
