@@ -88,7 +88,7 @@ impl TableProvider for StatTable {
 
 /// Minimal `mod(a, b)` scalar UDF so the canonical chbench queries (which use
 /// the `mod(...)` spelling, provided by Spice/Cayenne in production) can be
-/// *planned* in a plain DataFusion context — vanilla DataFusion has no `mod`
+/// *planned* in a plain `DataFusion` context — vanilla `DataFusion` has no `mod`
 /// function. It is never executed: these tests only build/optimize the logical
 /// plan, and the reorder cost model matches the function by name (capping the
 /// key NDV at the modulo literal, mirroring `% k`).
@@ -129,67 +129,76 @@ fn ts() -> DataType {
     DataType::Timestamp(TimeUnit::Nanosecond, None)
 }
 
-/// (schema, per-column NDV, num_rows) for a chbench table at W=100 (SF100).
+fn int64() -> DataType {
+    DataType::Int64
+}
+
+fn float64() -> DataType {
+    DataType::Float64
+}
+
+fn utf8() -> DataType {
+    DataType::Utf8
+}
+
+/// (schema, per-column NDV, `num_rows`) for a chbench table at W=100 (SF100).
 fn chbench_table(name: &str) -> (Schema, Vec<usize>, usize) {
-    let i = DataType::Int64;
-    let f = DataType::Float64;
-    let s = DataType::Utf8;
     let spec: Vec<(&str, DataType, usize)> = match name {
         "customer" => vec![
-            ("c_id", i.clone(), 3_000),
-            ("c_w_id", i.clone(), 100),
-            ("c_d_id", i.clone(), 10),
-            ("c_state", s.clone(), 50),
-            ("c_last", s.clone(), 1_000),
-            ("c_city", s.clone(), 10_000),
-            ("c_phone", s.clone(), 3_000_000),
+            ("c_id", int64(), 3_000),
+            ("c_w_id", int64(), 100),
+            ("c_d_id", int64(), 10),
+            ("c_state", utf8(), 50),
+            ("c_last", utf8(), 1_000),
+            ("c_city", utf8(), 10_000),
+            ("c_phone", utf8(), 3_000_000),
         ],
         "oorder" => vec![
-            ("o_id", i.clone(), 3_000),
-            ("o_c_id", i.clone(), 3_000),
-            ("o_w_id", i.clone(), 100),
-            ("o_d_id", i.clone(), 10),
+            ("o_id", int64(), 3_000),
+            ("o_c_id", int64(), 3_000),
+            ("o_w_id", int64(), 100),
+            ("o_d_id", int64(), 10),
             ("o_entry_d", ts(), 1_000_000),
-            ("o_ol_cnt", i.clone(), 15),
+            ("o_ol_cnt", int64(), 15),
         ],
         "new_order" => vec![
-            ("no_o_id", i.clone(), 900),
-            ("no_w_id", i.clone(), 100),
-            ("no_d_id", i.clone(), 10),
+            ("no_o_id", int64(), 900),
+            ("no_w_id", int64(), 100),
+            ("no_d_id", int64(), 10),
         ],
         "order_line" => vec![
-            ("ol_o_id", i.clone(), 3_000),
-            ("ol_w_id", i.clone(), 100),
-            ("ol_d_id", i.clone(), 10),
-            ("ol_i_id", i.clone(), 100_000),
-            ("ol_supply_w_id", i.clone(), 100),
-            ("ol_amount", f.clone(), 1_000_000),
+            ("ol_o_id", int64(), 3_000),
+            ("ol_w_id", int64(), 100),
+            ("ol_d_id", int64(), 10),
+            ("ol_i_id", int64(), 100_000),
+            ("ol_supply_w_id", int64(), 100),
+            ("ol_amount", float64(), 1_000_000),
             ("ol_delivery_d", ts(), 1_000_000),
         ],
         "stock" => vec![
-            ("s_w_id", i.clone(), 100),
-            ("s_i_id", i.clone(), 100_000),
-            ("s_quantity", i.clone(), 100),
-            ("s_order_cnt", i.clone(), 1_000),
+            ("s_w_id", int64(), 100),
+            ("s_i_id", int64(), 100_000),
+            ("s_quantity", int64(), 100),
+            ("s_order_cnt", int64(), 1_000),
         ],
         "supplier" => vec![
-            ("su_suppkey", i.clone(), 10_000),
-            ("su_nationkey", i.clone(), 62),
-            ("su_name", s.clone(), 10_000),
-            ("su_address", s.clone(), 10_000),
-            ("su_phone", s.clone(), 10_000),
-            ("su_comment", s.clone(), 10_000),
+            ("su_suppkey", int64(), 10_000),
+            ("su_nationkey", int64(), 62),
+            ("su_name", utf8(), 10_000),
+            ("su_address", utf8(), 10_000),
+            ("su_phone", utf8(), 10_000),
+            ("su_comment", utf8(), 10_000),
         ],
         "nation" => vec![
-            ("n_nationkey", i.clone(), 62),
-            ("n_name", s.clone(), 62),
-            ("n_regionkey", i.clone(), 5),
+            ("n_nationkey", int64(), 62),
+            ("n_name", utf8(), 62),
+            ("n_regionkey", int64(), 5),
         ],
-        "region" => vec![("r_regionkey", i.clone(), 5), ("r_name", s.clone(), 5)],
+        "region" => vec![("r_regionkey", int64(), 5), ("r_name", utf8(), 5)],
         "item" => vec![
-            ("i_id", i.clone(), 100_000),
-            ("i_data", s.clone(), 100_000),
-            ("i_name", s.clone(), 100_000),
+            ("i_id", int64(), 100_000),
+            ("i_data", utf8(), 100_000),
+            ("i_name", utf8(), 100_000),
         ],
         other => panic!("unknown chbench table {other}"),
     };
@@ -224,7 +233,7 @@ const TABLES: &[&str] = &[
     "item",
 ];
 
-/// A plain DataFusion default optimizer with *only* `ReorderJoinRule` inserted,
+/// A plain `DataFusion` default optimizer with *only* `ReorderJoinRule` inserted,
 /// at the same pipeline position the Spice runtime uses: after the *latest* of
 /// the prerequisite rules — `push_down_filter` (so `TableScan.filters` are
 /// populated for cost-based selectivity), `eliminate_cross_join`, and (in the
