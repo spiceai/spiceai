@@ -17,7 +17,7 @@ limitations under the License.
 //! Shared timestamp filter conversion logic for building `DataFusion` filter
 //! expressions from timestamp values.
 
-use arrow::datatypes::{DataType, TimeUnit};
+use arrow::datatypes::DataType;
 use datafusion::{
     logical_expr::{Expr, Operator, binary_expr, cast, lit},
     prelude::{and, ident},
@@ -38,13 +38,8 @@ pub enum TimestampFormat {
     UnixTimestamp { scale: u128 },
     /// `Date64`, `Time32`, `Time64`
     Timestamp,
-    /// `Timestamp(unit, tz)` — carries the column's stored time unit (and
-    /// optional timezone) so the filter literal matches the column exactly. A
-    /// fixed nanosecond literal + `CAST(col AS Timestamp(ns))` would otherwise
-    /// force a lossy cross-unit cast that can invert interval bounds during
-    /// statistics analysis (tripping the `lower <= upper` assertion in
-    /// `Interval::try_new`).
-    Timestamptz(TimeUnit, Option<Arc<str>>),
+    /// `Timestamp(unit, tz)` — with optional timezone.
+    Timestamptz(Option<Arc<str>>),
     /// `Date32`.
     Date,
 }
@@ -84,50 +79,17 @@ fn convert_timestamp_expr(
                 None,
             ),
         ),
-        TimestampFormat::Timestamptz(unit, tz) => binary_expr(
-            // No CAST: a literal in the column's own unit compares directly,
-            // which keeps the predicate exact, lets the federated source prune
-            // on it, and avoids the cross-unit cast that inverts interval
-            // bounds in statistics analysis.
-            ident(time_column),
+        TimestampFormat::Timestamptz(tz) => binary_expr(
+            cast(
+                ident(time_column),
+                DataType::Timestamp(arrow::datatypes::TimeUnit::Nanosecond, tz.clone()),
+            ),
             op,
             Expr::Literal(
-                timestamp_scalar_for_unit(timestamp_in_nanos, *unit, tz.as_ref()),
+                ScalarValue::TimestampNanosecond(Some(timestamp_in_nanos as i64), tz.to_owned()),
                 None,
             ),
         ),
-    }
-}
-
-/// Build a `Timestamp` [`ScalarValue`] in `unit` from a nanosecond value, so the
-/// filter literal matches the column's stored unit exactly (no cross-unit cast).
-///
-/// Sub-unit precision is truncated toward the epoch. The refresh watermark is
-/// derived from the column itself, so it already carries the column's precision
-/// and this is exact in practice; even if it weren't, truncating a `>` watermark
-/// (or `<` retention cutoff) toward zero is conservative — it never drops a new
-/// row or over-deletes — and the exact dedup step downstream removes any
-/// boundary duplicate.
-#[expect(clippy::cast_possible_truncation)]
-fn timestamp_scalar_for_unit(
-    timestamp_in_nanos: u128,
-    unit: TimeUnit,
-    tz: Option<&Arc<str>>,
-) -> ScalarValue {
-    let tz = tz.map(Arc::clone);
-    match unit {
-        TimeUnit::Nanosecond => {
-            ScalarValue::TimestampNanosecond(Some(timestamp_in_nanos as i64), tz)
-        }
-        TimeUnit::Microsecond => {
-            ScalarValue::TimestampMicrosecond(Some((timestamp_in_nanos / 1_000) as i64), tz)
-        }
-        TimeUnit::Millisecond => {
-            ScalarValue::TimestampMillisecond(Some((timestamp_in_nanos / 1_000_000) as i64), tz)
-        }
-        TimeUnit::Second => {
-            ScalarValue::TimestampSecond(Some((timestamp_in_nanos / 1_000_000_000) as i64), tz)
-        }
     }
 }
 
@@ -160,7 +122,7 @@ pub fn data_type_to_timestamp_format(
         DataType::Date64 | DataType::Time32(_) | DataType::Time64(_) => {
             Some(TimestampFormat::Timestamp)
         }
-        DataType::Timestamp(unit, tz) => Some(TimestampFormat::Timestamptz(*unit, tz.to_owned())),
+        DataType::Timestamp(_, tz) => Some(TimestampFormat::Timestamptz(tz.to_owned())),
         DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View => Some(TimestampFormat::Iso8601),
         DataType::Date32 => Some(TimestampFormat::Date),
         _ => {
@@ -317,7 +279,7 @@ mod tests {
         let table_source = Arc::new(DefaultTableSource::new(table_provider));
         let converter = TimestampFilterConvert::new(
             "col_Timestamp".to_string(),
-            TimestampFormat::Timestamptz(TimeUnit::Microsecond, None),
+            TimestampFormat::Timestamptz(None),
             None,
             None,
         );
@@ -356,35 +318,11 @@ mod tests {
 
     #[test]
     fn test_timestamp_no_tz() {
-        // Literal is built in the column's own unit (seconds) — no CAST.
         test_convert(
             &DataType::Timestamp(TimeUnit::Second, None),
             None,
             1_620_000_000_000_000_000,
-            "timestamp > TimestampSecond(1620000000, None)",
-        );
-    }
-
-    #[test]
-    fn test_timestamp_microsecond_matches_column_unit() {
-        // Regression for the interval-assertion crash: a µs column must yield a
-        // µs literal (not `CAST(col AS ns) > ns_literal`), so statistics
-        // analysis never performs a lossy cross-unit cast that inverts bounds.
-        test_convert(
-            &DataType::Timestamp(TimeUnit::Microsecond, None),
-            None,
-            1_620_000_000_000_000_000,
-            "timestamp > TimestampMicrosecond(1620000000000000, None)",
-        );
-    }
-
-    #[test]
-    fn test_timestamp_millisecond_matches_column_unit() {
-        test_convert(
-            &DataType::Timestamp(TimeUnit::Millisecond, None),
-            None,
-            1_620_000_000_000_000_000,
-            "timestamp > TimestampMillisecond(1620000000000, None)",
+            "CAST(timestamp AS Timestamp(ns)) > TimestampNanosecond(1620000000000000000, None)",
         );
     }
 
@@ -409,7 +347,7 @@ mod tests {
         let result = converter.convert(1_620_000_000_000_000_000, Operator::Gt);
         assert_eq!(
             result.to_string(),
-            r#"timestamp > TimestampNanosecond(1620000000000000000, Some("UTC"))"#,
+            r#"CAST(timestamp AS Timestamp(ns, "UTC")) > TimestampNanosecond(1620000000000000000, Some("UTC"))"#,
         );
     }
 
@@ -452,7 +390,7 @@ mod tests {
         let result = converter.convert(1_620_000_000_000_000_000, Operator::Gt);
         assert_eq!(
             result.to_string(),
-            "timestamp > UInt64(1620000000000) AND partition_ts > TimestampSecond(1620000000, None)",
+            "timestamp > UInt64(1620000000000) AND CAST(partition_ts AS Timestamp(ns)) > TimestampNanosecond(1620000000000000000, None)",
         );
     }
 

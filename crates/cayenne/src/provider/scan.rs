@@ -298,20 +298,27 @@ impl CayenneAccelerationExec {
     }
 }
 
-/// Refills only `Precision::Absent` column stats in `child` from `overlay`,
-/// restoring the join-key `min/max` + `distinct_count` (NDV) that the Cayenne
-/// base+delta `UnionExec` drops (a stat-less/empty delta branch makes
-/// `col_stats_union` return `Absent`, collapsing `estimate_inner_join_cardinality`
-/// to `min(L, R)`). Present child stats — filter-aware `num_rows`/`null_count`
-/// and any surviving column stat — are preserved; a column-count mismatch is a
-/// defensive no-op.
+/// Refills only the `Precision::Absent` `distinct_count` (NDV) in `child` from
+/// `overlay`, restoring the join-key NDV that the Cayenne base+delta `UnionExec`
+/// drops (a stat-less/empty delta branch makes `col_stats_union` return `Absent`,
+/// collapsing `estimate_inner_join_cardinality` to `min(L, R)`). Present child
+/// stats — filter-aware `num_rows`/`null_count` and any surviving column stat —
+/// are preserved; a column-count mismatch is a defensive no-op.
 ///
 /// `UnionExec` can't fix this itself: an `Absent` branch means *unknown*, not
-/// *empty*, so it must drop min/max, and NDV isn't additive across branches of
+/// *empty*, so it must drop the NDV, which isn't additive across branches of
 /// unknown overlap. The repair belongs here because only the Cayenne scan owns
 /// the out-of-band metadata the union can't see — the incrementally-maintained
-/// per-table aggregate (live min/max + HLL-derived integer NDV over base+delta)
-/// — which it applies as an additive overlay, not a stats replacement.
+/// per-table aggregate (HLL-derived integer NDV over base+delta).
+///
+/// Deliberately does NOT restore min/max. A range predicate against an exact
+/// bound — an append-refresh `ts > watermark` (watermark == the column max) or
+/// a retention `ts < cutoff` — makes `DataFusion`'s interval analysis build an
+/// empty interval `[max+1, max]`; casting it back trips `Interval::try_new`'s
+/// `lower <= upper` assertion (`Err`), failing the query. Build-side selection
+/// reads only `total_byte_size`/`num_rows`, and join-cardinality estimation
+/// prefers NDV when present, so the restored NDV is what carries the estimate —
+/// min/max are not needed here and only re-introduce the assertion hazard.
 fn restore_absent_column_statistics(mut child: Statistics, overlay: &Statistics) -> Statistics {
     if child.column_statistics.len() != overlay.column_statistics.len() {
         return child;
@@ -321,12 +328,6 @@ fn restore_absent_column_statistics(mut child: Statistics, overlay: &Statistics)
         .iter_mut()
         .zip(overlay.column_statistics.iter())
     {
-        if matches!(col.min_value, Precision::Absent) {
-            col.min_value = src.min_value.clone();
-        }
-        if matches!(col.max_value, Precision::Absent) {
-            col.max_value = src.max_value.clone();
-        }
         if matches!(col.distinct_count, Precision::Absent) {
             col.distinct_count = src.distinct_count;
         }
@@ -1060,10 +1061,12 @@ mod tests {
         assert_ne!(bucket_a, bucket_b);
     }
 
-    /// The base+delta `UnionExec` wipes a join key's min/max + `distinct_count` to
+    /// The base+delta `UnionExec` wipes a join key's `distinct_count` to
     /// `Precision::Absent` (an empty delta branch poisons `col_stats_union`).
-    /// With an optimizer overlay attached, the wrapper must refill exactly those
-    /// Absent fields while preserving the child's (filter-aware) `num_rows`.
+    /// With an optimizer overlay attached, the wrapper refills the Absent NDV
+    /// while preserving the child's (filter-aware) `num_rows`; min/max are
+    /// intentionally left Absent (they trip `DataFusion`'s empty-interval assertion
+    /// on range filters and aren't needed by build-side selection / cardinality).
     #[test]
     fn overlay_refills_union_wiped_join_key_statistics() {
         use datafusion_common::{ColumnStatistics, ScalarValue};
@@ -1119,21 +1122,17 @@ mod tests {
             Precision::Absent
         ));
 
-        // With an overlay: the Absent join-key fields are refilled, num_rows kept.
+        // With an overlay: the Absent NDV is refilled, num_rows kept. min/max
+        // are NOT restored (they trip DataFusion's empty-interval assertion on a
+        // `col > max` range filter and aren't needed downstream).
         let restored_exec = CayenneAccelerationExec::new(Arc::clone(&union))
             .with_optimizer_column_overlay(Some(overlay));
         let restored = restored_exec
             .partition_statistics(None)
             .expect("statistics should be available");
         let col = &restored.column_statistics[0];
-        assert_eq!(
-            col.min_value,
-            Precision::Inexact(ScalarValue::Int64(Some(1)))
-        );
-        assert_eq!(
-            col.max_value,
-            Precision::Inexact(ScalarValue::Int64(Some(9999)))
-        );
+        assert!(matches!(col.min_value, Precision::Absent));
+        assert!(matches!(col.max_value, Precision::Absent));
         assert_eq!(col.distinct_count, Precision::Inexact(42));
         assert_eq!(
             restored.num_rows, poisoned.num_rows,
@@ -1201,11 +1200,9 @@ mod tests {
         let col = &restored.column_statistics[0];
         // Present max_value must be kept (not overwritten by the overlay).
         assert_eq!(col.max_value, Precision::Exact(ScalarValue::Int64(Some(7))));
-        // Absent min_value / distinct_count are filled from the overlay.
-        assert_eq!(
-            col.min_value,
-            Precision::Inexact(ScalarValue::Int64(Some(-5)))
-        );
+        // min/max are never restored (only NDV); the Absent min stays Absent.
+        assert!(matches!(col.min_value, Precision::Absent));
+        // Absent distinct_count is filled from the overlay.
         assert_eq!(col.distinct_count, Precision::Inexact(50));
         assert_eq!(restored.num_rows, Precision::Exact(100));
     }
