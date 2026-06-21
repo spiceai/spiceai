@@ -74,7 +74,7 @@ jobs:
       - name: Validate datafusion-table-providers commit
         run: bash .github/scripts/validate_table_providers_commit.sh
         env:
-          BRANCH: sgrebnov/spiceai-54 # temporary
+          BRANCH: spiceai-54
 
   # Run Rust linting
   lint-rust:
