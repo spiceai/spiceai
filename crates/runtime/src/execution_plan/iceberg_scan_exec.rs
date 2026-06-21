@@ -339,16 +339,19 @@ impl ExecutionPlan for IcebergScanExec {
                 // Re-derive the scan lazily, in async context, and memoize it: the
                 // first partition to execute plans it (via plan_files); every other
                 // partition of this instance reuses the same plan, so they all read
-                // one consistent snapshot/fileset and re-planning happens once. A
-                // SessionState carrying the per-job config (notably
-                // `target_partitions`) makes the rebuilt scan bucket the way the
-                // scheduler planned.
+                // one consistent snapshot/fileset and re-planning happens once. The
+                // session carries the per-job config (notably `target_partitions`,
+                // so the rebuilt scan buckets the way the scheduler planned) and the
+                // executing task's own `RuntimeEnv` (object stores, memory pool,
+                // disk manager), so the replay matches the task's environment.
                 let fut = async move {
                     let plan = scan
                         .get_or_try_init(|| async {
-                            let session =
-                                SessionContext::new_with_config(context.session_config().clone())
-                                    .state();
+                            let session = SessionContext::new_with_config_rt(
+                                context.session_config().clone(),
+                                context.runtime_env(),
+                            )
+                            .state();
                             provider
                                 .scan(&session, projection.as_ref(), &filters, limit)
                                 .await
