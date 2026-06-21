@@ -79,6 +79,9 @@ pub struct MaintainedAggregateRegistry {
     /// next rebuild), keeping memory bounded under `runtime.query.memory_limit`.
     /// `usize::MAX` for registries built without a PK (no index is maintained).
     max_index_entries: usize,
+    /// Whether a per-PK index is maintained (a non-empty PK was configured), so
+    /// UPDATE/DELETE can be retracted incrementally rather than marking stale.
+    has_pk_index: bool,
 }
 
 #[derive(Debug)]
@@ -337,6 +340,7 @@ impl MaintainedAggregateRegistry {
         pk_columns: Vec<usize>,
         max_index_entries: usize,
     ) -> DataFusionResult<Self> {
+        let has_pk_index = !pk_columns.is_empty();
         let views = specs
             .iter()
             .map(|spec| MaintainedAggregateView::try_new(spec, schema, pk_columns.clone()))
@@ -349,6 +353,7 @@ impl MaintainedAggregateRegistry {
                 views,
             }),
             max_index_entries,
+            has_pk_index,
         })
     }
 
@@ -356,6 +361,14 @@ impl MaintainedAggregateRegistry {
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.state.read().views.is_empty()
+    }
+
+    /// Whether this registry maintains a per-PK index and can therefore retract
+    /// UPDATE/DELETE incrementally ([`Self::apply_delta`]) rather than falling
+    /// back to a full rebuild via [`Self::mark_stale`].
+    #[must_use]
+    pub fn supports_retraction(&self) -> bool {
+        self.has_pk_index
     }
 
     /// Mark all maintained aggregate views stale at `epoch`.

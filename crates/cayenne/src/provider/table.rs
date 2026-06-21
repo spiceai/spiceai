@@ -5991,10 +5991,18 @@ impl CayenneTableProvider {
             &pk_deletion_strategy,
         )?;
         let table_statistics = Self::load_table_statistics(&catalog, &table_metadata).await;
+        // Bound the per-PK retraction index by entry count; exceeding it fails
+        // the registry safe to a base-table rebuild. TODO: derive from
+        // `runtime.query.memory_limit` once the budget is threaded to the
+        // provider (Pattern 9 — budget-derived caps). An empty `pk_column_indices`
+        // (no primary key) yields no index and the legacy insert-only behavior.
+        const MAINTAINED_AGGREGATE_MAX_INDEX_ENTRIES: usize = 5_000_000;
         let maintained_aggregates = Arc::new(
-            MaintainedAggregateRegistry::try_new(
+            MaintainedAggregateRegistry::try_new_with_pk(
                 &maintained_aggregate_specs,
                 &table_metadata.schema,
+                pk_column_indices.clone(),
+                MAINTAINED_AGGREGATE_MAX_INDEX_ENTRIES,
             )
             .map_err(|source| CatalogError::InvalidOperation {
                 message: format!(
@@ -14454,11 +14462,15 @@ impl CayenneTableProvider {
                     delete_seq,
                 );
             }
-            if removed_rows > 0 || has_file_deletions {
+            if self.maintained_aggregates.supports_retraction()
+                || !(removed_rows > 0 || has_file_deletions)
+            {
+                // The per-PK index retracts superseded rows' old contributions,
+                // so the insert feed maintains UPDATEs incrementally.
+                self.prepare_maintained_aggregate_insert_batches(Arc::new(batches.to_vec()))
+            } else {
                 self.mark_maintained_aggregates_stale();
                 None
-            } else {
-                self.prepare_maintained_aggregate_insert_batches(Arc::new(batches.to_vec()))
             }
         };
 
@@ -15990,18 +16002,23 @@ impl CayenneTableProvider {
                 fence_work_start,
             );
 
-            // Maintained aggregates: a tombstone/supersession can retroactively
-            // hide rows an incremental aggregate already counted, so fall back to a
-            // full rebuild (mark stale); a pure-insert append updates the
-            // aggregates incrementally from the new batches.
-            let maintained_aggregate_insert = if superseded > 0
-                || !tombstones.is_int64_empty()
-                || !tombstones.is_row_keys_empty()
+            // Maintained aggregates: with a per-PK retraction index, an upsert
+            // that supersedes existing rows is maintained incrementally — the
+            // index retracts each superseded PK's old contribution before
+            // applying the new row, so the same insert feed handles UPDATEs.
+            // Without an index, a tombstone/supersession can retroactively hide
+            // rows an incremental aggregate already counted, so fall back to a
+            // full rebuild (mark stale); a pure-insert append still updates
+            // incrementally from the new batches.
+            let maintained_aggregate_insert = if self.maintained_aggregates.supports_retraction()
+                || !(superseded > 0
+                    || !tombstones.is_int64_empty()
+                    || !tombstones.is_row_keys_empty())
             {
+                self.prepare_maintained_aggregate_insert_batches(Arc::clone(&arc_batches))
+            } else {
                 self.mark_maintained_aggregates_stale();
                 None
-            } else {
-                self.prepare_maintained_aggregate_insert_batches(Arc::clone(&arc_batches))
             };
             (epoch, maintained_aggregate_insert)
         };
