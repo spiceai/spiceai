@@ -23417,6 +23417,29 @@ mod tests {
             .collect()
     }
 
+    /// An order-insensitive view of a resolved scan file set: a `path -> row_count`
+    /// map flattened across groups. The manifest resolver returns files sorted by
+    /// `file_path` (the metastore PK index order) while a directory listing returns
+    /// object-store readdir order, so the two agree on the file SET and per-file
+    /// row counts but NOT on the partition-split layout — which carries no
+    /// query-correctness meaning (the scan unions all partitions). Compare this
+    /// map, not the positional `file_group_paths`/`file_group_row_counts`, for
+    /// cross-source parity.
+    fn path_row_counts(file_groups: &[FileGroup]) -> BTreeMap<String, DFPrecision<usize>> {
+        file_groups
+            .iter()
+            .flat_map(FileGroup::iter)
+            .map(|file| {
+                (
+                    file.path().to_string(),
+                    file.statistics
+                        .as_ref()
+                        .map_or(DFPrecision::Absent, |statistics| statistics.num_rows),
+                )
+            })
+            .collect()
+    }
+
     async fn collect_value_id_rows(
         ctx: &SessionContext,
         plan: Arc<dyn ExecutionPlan>,
@@ -23633,6 +23656,18 @@ mod tests {
             .await;
         }
 
+        // Quiesce the debounced post-write maintenance the inserts scheduled. When
+        // it fires (~100 ms later) it rebuilds the manifest from the directory
+        // listing, which would re-populate the manifest AFTER this test clears it
+        // (breaking the empty-manifest fallback assertion below) and reorder its
+        // rows. Draining it now makes the manifest state fully test-controlled.
+        // (Append table — 2 files, no protected snapshots — so no async compaction
+        // is armed; this only stops the manifest-rebuild loop.)
+        provider
+            .flush_pending_maintenance()
+            .await
+            .expect("drain pending post-write maintenance");
+
         let snapshot_id = provider.get_current_snapshot_id();
         let snapshot_dir_url = CayenneTableProvider::snapshot_dir_url(
             &provider.table_metadata.path,
@@ -23721,15 +23756,16 @@ mod tests {
             .await
             .expect("ListingTable file listing should succeed");
 
+        // Order-insensitive: the manifest resolver returns files sorted by
+        // `file_path` (metastore PK-index order) while the directory listing
+        // returns object-store readdir order. They must agree on the file SET and
+        // each file's row count; the partition-split order is not a correctness
+        // property (the scan unions all partitions).
         assert_eq!(
-            file_group_paths(&manifest_files.file_groups),
-            file_group_paths(&listing_files.file_groups),
-            "manifest-built scan file paths must equal the directory-built listing"
-        );
-        assert_eq!(
-            file_group_row_counts(&manifest_files.file_groups),
-            file_group_row_counts(&listing_files.file_groups),
-            "manifest-built scan per-file row counts must equal the directory-built listing"
+            path_row_counts(&manifest_files.file_groups),
+            path_row_counts(&listing_files.file_groups),
+            "manifest-built scan files (paths + per-file row counts) must equal the \
+             directory-built listing"
         );
         assert_eq!(
             manifest_files.grouped_by_partition,
@@ -23759,8 +23795,8 @@ mod tests {
             .await
             .expect("scan file listing should fall back to directory listing");
         assert_eq!(
-            file_group_paths(&fallback_files.file_groups),
-            file_group_paths(&listing_files.file_groups),
+            path_row_counts(&fallback_files.file_groups),
+            path_row_counts(&listing_files.file_groups),
             "with an empty manifest the flag-ON scan must fall back to the directory listing"
         );
     }
@@ -24286,6 +24322,24 @@ mod tests {
             Field::new("value", DataType::Int64, false),
         ]));
 
+        // Hold the compaction lock across the WHOLE fixture (inserts → pin) so the
+        // async write-driven lanes can never corrupt the synthetic state. Each CDC
+        // insert schedules a debounced (~100 ms) post-write maintenance pass; when
+        // it fires it (a) rebuilds every live snapshot's manifest from the
+        // directory listing — overwriting the synthetic `[seq, seq]` ranges pinned
+        // below with the reserved sequences — and (b) when the protected-snapshot
+        // trigger is armed (the low-trigger fixtures), schedules an async size-tier
+        // compaction that MERGES the very snapshots the test sets up. Under
+        // parallel test load that pass fires mid-fixture/mid-test: the merge holds
+        // this lock (so the test's own bake/leveler `try_lock` returns false) or
+        // reduces the protected count — the observed flakiness. Both the rebuild
+        // and the merge `try_lock` this lock, so holding it across the fixture
+        // makes every such pass a no-op skip, and `flush_pending_maintenance` below
+        // drains the loop so it exits rather than firing after we release. (The
+        // write path never takes this lock, so holding it across the inserts is
+        // safe.)
+        let compaction_guard = provider.compaction_lock.lock().await;
+
         // Each distinct-key insert publishes its own file-backed protected
         // snapshot (inline disabled in the fixture).
         for (i, _) in seqs.iter().enumerate() {
@@ -24297,13 +24351,14 @@ mod tests {
             .await;
         }
 
-        // Populate manifests for the live set (under the lock the real
-        // post-write lane holds), then OVERWRITE each protected snapshot's
-        // manifest rows with the pinned [seq, seq] range.
-        {
-            let _guard = provider.compaction_lock.lock().await;
-            provider.rebuild_live_snapshot_manifests().await;
-        }
+        // Drain the debounced maintenance loop the inserts spawned: it skips its
+        // manifest rebuild and any compaction it scheduled (we hold the lock), then
+        // exits — so nothing fires against the pinned manifest after we release the
+        // guard on return.
+        provider
+            .flush_pending_maintenance()
+            .await
+            .expect("drain pending post-write maintenance");
 
         // Protected-snapshot registration can lag behind the awaited inserts under heavy
         // parallel load (seen in CI: 6 expected, only 2 registered on an immediate read;
@@ -24333,6 +24388,10 @@ mod tests {
             ids.len()
         );
 
+        // Populate every live snapshot's manifest (we hold the compaction lock the
+        // real post-write lane takes), then OVERWRITE with the pinned ranges.
+        provider.rebuild_live_snapshot_manifests().await;
+
         let table_id = provider.table_metadata.table_id.clone();
         for (id, &seq) in ids.iter().zip(seqs.iter()) {
             let files = provider
@@ -24359,6 +24418,12 @@ mod tests {
                     .expect("pin manifest sequence");
             }
         }
+
+        // Release the compaction lock now that the manifest is pinned. The async
+        // lanes are drained (the maintenance loop exited; any compaction it
+        // scheduled `try_lock`-skipped while we held the lock), so the pinned state
+        // is stable for the test's own bake/leveler calls.
+        drop(compaction_guard);
         (provider, tmp, ids)
     }
 
