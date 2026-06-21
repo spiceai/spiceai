@@ -362,6 +362,14 @@ impl IcebergDeletionProvider {
             inner,
         }
     }
+
+    /// The wrapped provider (the underlying `IcebergTableProvider`). Exposed so
+    /// wrapper-peeling helpers can see through this layer to the concrete
+    /// Iceberg provider.
+    #[must_use]
+    pub fn inner(&self) -> &Arc<dyn datafusion::datasource::TableProvider> {
+        &self.inner
+    }
 }
 
 impl Debug for IcebergDeletionProvider {
