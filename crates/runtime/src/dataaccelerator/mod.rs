@@ -2366,41 +2366,35 @@ mod accelerator_compat_tests {
 
                 // For Vortex, check if unsupported types are converted to Utf8
                 if matches!(engine, Engine::Cayenne) {
-                    if vortex_unsupported_types.contains(original_type) {
-                        assert_eq!(
-                            table_type,
-                            &DataType::Utf8,
-                            "{:?}: Field {} ({}) with unsupported type {:?} should be converted to Utf8, got {:?}",
-                            engine,
-                            i,
-                            original_field.name(),
-                            original_type,
-                            table_type
-                        );
-                    } else if matches!(original_type, DataType::Map(_, _)) {
-                        // Map types are also converted to Utf8
-                        assert_eq!(
-                            table_type,
-                            &DataType::Utf8,
-                            "{:?}: Field {} ({}) with Map type should be converted to Utf8, got {:?}",
-                            engine,
-                            i,
-                            original_field.name(),
-                            table_type
-                        );
+                    // Cayenne converts these unsupported types and Map to a string
+                    // (Utf8) column. Then, with force_view_read_schema (default on
+                    // in the accelerator factory), it advertises Utf8 columns as
+                    // Utf8View on the read schema. So the expected stored type is
+                    // Utf8 for unsupported/Map and the original type otherwise; any
+                    // stored Utf8 surfaces as Utf8View. (Binary / LargeUtf8 /
+                    // LargeBinary are NOT viewified — see `viewify_read_schema`.)
+                    let expected_stored = if vortex_unsupported_types.contains(original_type)
+                        || matches!(original_type, DataType::Map(_, _))
+                    {
+                        DataType::Utf8
                     } else {
-                        // Other types should match exactly (or be compatible conversions like timestamps)
-                        assert_eq!(
-                            original_type,
-                            table_type,
-                            "{:?}: Field {} ({}) data type mismatch. Expected {:?}, got {:?}",
-                            engine,
-                            i,
-                            original_field.name(),
-                            original_type,
-                            table_type
-                        );
-                    }
+                        original_type.clone()
+                    };
+                    let expected_table = if expected_stored == DataType::Utf8 {
+                        DataType::Utf8View
+                    } else {
+                        expected_stored
+                    };
+                    assert_eq!(
+                        table_type, &expected_table,
+                        "{:?}: Field {} ({}) data type mismatch. original {:?}, expected table {:?}, got {:?}",
+                        engine,
+                        i,
+                        original_field.name(),
+                        original_type,
+                        expected_table,
+                        table_type
+                    );
                 } else if matches!(engine, Engine::DuckDB) {
                     // DuckDB normalises YearMonth/DayTime intervals to MonthDayNano
                     // because its native INTERVAL type maps to the MonthDayNano layout.

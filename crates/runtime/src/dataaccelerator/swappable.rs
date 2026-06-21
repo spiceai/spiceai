@@ -27,7 +27,7 @@ limitations under the License.
 use std::sync::{Arc, RwLock};
 
 use async_trait::async_trait;
-use datafusion::arrow::datatypes::{Schema, SchemaRef};
+use datafusion::arrow::datatypes::{DataType, Schema, SchemaRef};
 use datafusion::catalog::{Session, TableProvider};
 use datafusion::common::{Constraints, Statistics};
 use datafusion::error::Result as DFResult;
@@ -66,9 +66,44 @@ pub fn schemas_compatible(candidate: &Schema, expected: &Schema) -> bool {
         .zip(expected.fields().iter())
         .all(|(c, e)| {
             c.name() == e.name()
-                && c.data_type() == e.data_type()
+                && data_types_compatible(c.data_type(), e.data_type())
                 && c.is_nullable() == e.is_nullable()
         })
+}
+
+/// A *view* string/binary type is interchangeable with the non-view members of
+/// its family — `Utf8View` with `Utf8`/`LargeUtf8`, and `BinaryView` with
+/// `Binary`/`LargeBinary` — because Cayenne's force-view read schema decouples the
+/// query/scan types from the stored `Utf8`/`Binary` types, and the values are
+/// losslessly castable (write paths normalize via `try_cast_to`).
+///
+/// Deliberately narrow: at least one side must be the view type. Non-view width
+/// changes (e.g. `Utf8` vs `LargeUtf8`) alter the physical offset width, are never
+/// introduced by the force-view path, and stay strict so genuine widenings are
+/// still rejected by snapshot refresh and provider swap.
+fn data_types_compatible(a: &DataType, b: &DataType) -> bool {
+    fn is_string(dt: &DataType) -> bool {
+        matches!(
+            dt,
+            DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View
+        )
+    }
+    fn is_binary(dt: &DataType) -> bool {
+        matches!(
+            dt,
+            DataType::Binary | DataType::LargeBinary | DataType::BinaryView
+        )
+    }
+    if a == b {
+        return true;
+    }
+    let string_view = is_string(a)
+        && is_string(b)
+        && (matches!(a, DataType::Utf8View) || matches!(b, DataType::Utf8View));
+    let binary_view = is_binary(a)
+        && is_binary(b)
+        && (matches!(a, DataType::BinaryView) || matches!(b, DataType::BinaryView));
+    string_view || binary_view
 }
 
 /// A [`TableProvider`] that delegates to an inner provider which may be
@@ -351,5 +386,35 @@ mod tests {
             .swap(nullable)
             .expect_err("nullability change must be rejected");
         assert!(matches!(err, SwapError::SchemaMismatch));
+    }
+
+    #[test]
+    fn schemas_compatible_treats_view_and_nonview_string_binary_as_equal() {
+        // A view type is interchangeable with the non-view members of its family
+        // (an accelerator advertising view types over a non-view source must not
+        // be rejected) — but ONLY when one side is the view type.
+        let utf8 = Schema::new(vec![Field::new("s", DataType::Utf8, true)]);
+        let utf8_view = Schema::new(vec![Field::new("s", DataType::Utf8View, true)]);
+        let large_utf8 = Schema::new(vec![Field::new("s", DataType::LargeUtf8, true)]);
+        assert!(schemas_compatible(&utf8, &utf8_view));
+        assert!(schemas_compatible(&utf8_view, &utf8)); // symmetric
+        assert!(schemas_compatible(&large_utf8, &utf8_view));
+
+        let binary = Schema::new(vec![Field::new("b", DataType::Binary, false)]);
+        let binary_view = Schema::new(vec![Field::new("b", DataType::BinaryView, false)]);
+        assert!(schemas_compatible(&binary, &binary_view));
+        assert!(schemas_compatible(&binary_view, &binary));
+
+        // Non-view width changes stay strict (no view type involved): a genuine
+        // Utf8 -> LargeUtf8 widening must still be rejected.
+        assert!(!schemas_compatible(&utf8, &large_utf8));
+
+        // Cross-family and unrelated types stay incompatible.
+        let int = Schema::new(vec![Field::new("s", DataType::Int32, true)]);
+        assert!(!schemas_compatible(&utf8, &int));
+        assert!(!schemas_compatible(&utf8, &binary));
+        // Nullability mismatch is still rejected even within a family.
+        let utf8_view_nonnull = Schema::new(vec![Field::new("s", DataType::Utf8View, false)]);
+        assert!(!schemas_compatible(&utf8, &utf8_view_nonnull));
     }
 }

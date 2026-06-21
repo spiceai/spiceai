@@ -10,9 +10,10 @@ name: postgres-cayenne[file]-cdc-tuned-turso-sf100
 # Target: 64 vCPU / 256 GiB RAM, EBS gp3 (m7a.16xlarge-class). Goal: every CDC table under
 # 5s replication lag at SF-100 @ 10K txn/s, with >=5K QPH on the OLAP queries.
 #
-# Tuning (values validated on the 16-core local SF-100 run — all 7 tables <5s, ~97% of 5K
-# QPH — then scaled to 64c/256GB; the write-path values are core/RAM-invariant because the
-# wall is the single-writer-per-table metastore txn, not CPU or batch size):
+# Tuning (the write-path knobs below are MANY-CORE values, raised for the 64c runner's
+# headroom — they are NOT core-invariant: on a 16-core host the box saturates at 10K and the
+# CDC apply is core-bound, so the larger tables lag. The many-core CI runner clears >=5K QPH
+# and holds 6/7 tables <5s under load; order_line is the remaining apply bottleneck):
 #   - cdc_max_coalesce_age_ms 250 + cdc_max_coalesced_bytes 128 MB: keep CDC applies small and
 #     fresh so they stay inline (4000ms/512 MB regressed — see the note on the linger below).
 #   - cdc_prefetch_buffer / cdc_max_coalesced_envelopes 16384: runtime max; deep prefetch keeps
@@ -22,8 +23,9 @@ name: postgres-cayenne[file]-cdc-tuned-turso-sf100
 #     auto-default (total_mem/32 -> ~8 GiB on a 256 GiB host) and keeps the heavy-update tables
 #     (stock, order_line) on the cheap bloom path (256 = SF-100 sweep optimum).
 #   - per-table cayenne_write_concurrency / segment_cache_mb / compaction_* for the high-volume
-#     upsert tables; reference tables lighter. write_concurrency stays moderate (4/2): lower
-#     fan-out relieves CPU contention for OLAP (validated on the 128-core write-concurrency run).
+#     upsert tables; reference tables lighter. write_concurrency = 8 (was 4) on the changes
+#     tables: the CDC apply is encode-parallelism-bound, so more shards consume the runner's
+#     encode budget; reference tables stay at 2. target_file_size 512 (was 256) on high-volume.
 #   - metastore/footer caches (1024/1024 MiB, 4096 MiB mmap) are sized to the SF-100 working set,
 #     bounded by catalog/footer size — so 256 GiB adds headroom, not bigger caches.
 #
@@ -90,7 +92,7 @@ datasets:
         # growth on the delete-receiving table). Key-delete compaction runs
         # concurrently with writers.
         cayenne_deletion_mode: key
-        cayenne_write_concurrency: '4'
+        cayenne_write_concurrency: '8'
         cayenne_segment_cache_mb: '1024'
         cayenne_compaction_trigger_protected_snapshots: '3'
         # Pinned to 256 MiB (SF-100 sweep optimum). The keyset pin is scale-dependent: it
@@ -123,7 +125,10 @@ datasets:
       params:
         <<: *accel_high_volume
         cayenne_file_path: .spice/cayenne/customer
-        cayenne_target_file_size_mb: '256'
+        # 512 (was 256): fewer/larger files speed scans on the many-core CI runner. NOTE: this
+        # regresses on ~16-core hosts (compaction rewrites contend for scarce cores); it is a
+        # many-core value. write_concurrency 8 (anchors) is the paired apply-side bump — see PR.
+        cayenne_target_file_size_mb: '512'
 
   - from: postgres:new_order
     name: new_order
@@ -181,8 +186,7 @@ datasets:
       params:
         <<: *accel_high_volume
         cayenne_file_path: .spice/cayenne/order_line
-        cayenne_write_concurrency: '4'
-        cayenne_target_file_size_mb: '256'
+        cayenne_target_file_size_mb: '512'
         cayenne_compaction_trigger_files: '8'
         cayenne_compaction_trigger_snapshot_age_ms: '30000'
         cayenne_compaction_max_files_per_pick: '128'
@@ -206,7 +210,7 @@ datasets:
       params:
         <<: *accel_high_volume
         cayenne_file_path: .spice/cayenne/stock
-        cayenne_target_file_size_mb: '256'
+        cayenne_target_file_size_mb: '512'
 
   # ------------------------------------------------------------------
   # Low-volume reference tables.
@@ -233,7 +237,7 @@ datasets:
         # See &accel_high_volume: explicit file durability + key deletes.
         cayenne_cdc_durability: file
         cayenne_deletion_mode: key
-        cayenne_write_concurrency: '4'
+        cayenne_write_concurrency: '8'
         cayenne_segment_cache_mb: '64'
         # Pin 256 MiB explicitly — SF-100 optimum (don't leave to the backwards memory-aware auto-default).
         cayenne_pk_keyset_cache_mb: '256'
@@ -259,6 +263,8 @@ datasets:
       params:
         <<: *accel_medium
         cayenne_file_path: .spice/cayenne/item
+        # static full-refresh: pin write_concurrency low so the &accel_medium bump (for the warehouse changes table) does not apply here.
+        cayenne_write_concurrency: '2'
 
   - from: postgres:region
     name: region
