@@ -17,12 +17,12 @@ async-trait.workspace = true
 cache = { path = "../cache" }
 data_components = { path = "../data_components", features = ["flightsql"] }
 datafusion.workspace = true
+datafusion-common.workspace = true
 datafusion-federation.workspace = true
 datafusion-datasource = { workspace = true }
 datafusion-expr.workspace = true
 datafusion-table-providers.workspace = true
 flight_client = { path = "../flight_client" }
-tokio.workspace = true
 r2d2 = { optional = true, workspace = true }
 duckdb = { optional = true, workspace = true }
 futures.workspace = true
@@ -36,7 +36,7 @@ arrow-flight.workspace = true
 insta.workspace = true
 reqwest.workspace = true
 tonic.workspace = true
-
+tokio.workspace = true
 
 [features]
 duckdb = [
