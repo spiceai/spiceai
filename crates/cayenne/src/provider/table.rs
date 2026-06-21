@@ -7111,6 +7111,40 @@ impl CayenneTableProvider {
         }
     }
 
+    /// Inexact overlay stats for `field`, dropping any min/max bound whose scalar
+    /// type does not match the advertised field type.
+    ///
+    /// The maintained aggregate stores scalars in the table's *stored* types
+    /// (e.g. `Utf8`), but the query-path schema may advertise a different family
+    /// (e.g. `Utf8View` via the view read-schema). Feeding a type-mismatched
+    /// bound into interval analysis trips DataFusion's `Interval::try_new`
+    /// type-equality assertion, so the pair is dropped on any mismatch. NDV
+    /// (`distinct_count`) is a plain count and is always safe to keep.
+    fn overlay_column_statistics_for_field(
+        field: &Field,
+        stats: ColumnStatistics,
+    ) -> ColumnStatistics {
+        let mut stats = Self::column_statistics_to_inexact(stats);
+        let field_type = field.data_type();
+        let min_matches = match &stats.min_value {
+            DFPrecision::Exact(value) | DFPrecision::Inexact(value) => {
+                value.data_type() == *field_type
+            }
+            DFPrecision::Absent => true,
+        };
+        let max_matches = match &stats.max_value {
+            DFPrecision::Exact(value) | DFPrecision::Inexact(value) => {
+                value.data_type() == *field_type
+            }
+            DFPrecision::Absent => true,
+        };
+        if !min_matches || !max_matches {
+            stats.min_value = DFPrecision::Absent;
+            stats.max_value = DFPrecision::Absent;
+        }
+        stats
+    }
+
     /// Builds a column-statistics overlay aligned to `output_schema` from the
     /// incrementally-maintained optimizer aggregate (live min/max + integer NDV
     /// via `distinct_count`). [`CayenneAccelerationExec`] uses this to refill
@@ -7149,7 +7183,7 @@ impl CayenneTableProvider {
                 by_name
                     .get(field.name().as_str())
                     .map_or_else(ColumnStatistics::new_unknown, |stats| {
-                        Self::column_statistics_to_inexact((*stats).clone())
+                        Self::overlay_column_statistics_for_field(field, (*stats).clone())
                     })
             })
             .collect();
@@ -21511,6 +21545,41 @@ mod tests {
         assert_eq!(
             stats.column_statistics[0].null_count,
             column_stats.null_count
+        );
+    }
+
+    #[test]
+    fn overlay_drops_type_mismatched_min_max_keeps_ndv() {
+        use datafusion_common::stats::Precision;
+        let agg = ColumnStatistics {
+            null_count: Precision::Exact(0),
+            min_value: Precision::Exact(ScalarValue::Utf8(Some("a".to_string()))),
+            max_value: Precision::Exact(ScalarValue::Utf8(Some("z".to_string()))),
+            sum_value: Precision::Absent,
+            distinct_count: Precision::Exact(7),
+            byte_size: Precision::Absent,
+        };
+
+        // Aggregate stores Utf8 but the query-path field advertises Utf8View
+        // (the view read-schema): the type-mismatched bounds must be dropped so
+        // they never reach DataFusion interval analysis; NDV stays.
+        let view_field = arrow_schema::Field::new("s", arrow_schema::DataType::Utf8View, true);
+        let dropped =
+            CayenneTableProvider::overlay_column_statistics_for_field(&view_field, agg.clone());
+        assert_eq!(dropped.min_value, Precision::Absent);
+        assert_eq!(dropped.max_value, Precision::Absent);
+        assert_eq!(dropped.distinct_count, Precision::Inexact(7));
+
+        // Matching type keeps the bounds (downgraded to inexact).
+        let utf8_field = arrow_schema::Field::new("s", arrow_schema::DataType::Utf8, true);
+        let kept = CayenneTableProvider::overlay_column_statistics_for_field(&utf8_field, agg);
+        assert_eq!(
+            kept.min_value,
+            Precision::Inexact(ScalarValue::Utf8(Some("a".to_string())))
+        );
+        assert_eq!(
+            kept.max_value,
+            Precision::Inexact(ScalarValue::Utf8(Some("z".to_string())))
         );
     }
 
