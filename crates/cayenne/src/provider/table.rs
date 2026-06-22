@@ -20706,7 +20706,9 @@ mod tests {
     #[test]
     fn protected_snapshot_maintenance_trigger_uses_compaction_count_threshold() {
         let now = UNIX_EPOCH + Duration::from_secs(1_000);
-        let warning_keys = ParkingMutex::new(BoundedFifoSet::with_capacity());
+        let warning_keys = ParkingMutex::new(BoundedFifoSet::with_capacity(
+            PROTECTED_SNAPSHOT_AGE_WARNING_KEY_LIMIT,
+        ));
         let protected_snapshots =
             HashMap::from([("snapshot-1".to_string(), 1), ("snapshot-2".to_string(), 2)]);
 

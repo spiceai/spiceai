@@ -25,8 +25,8 @@ use std::time::{Duration, Instant};
 ///
 /// To avoid log spam, warning escalation is duration-based rather than
 /// attempt-count-based. The first denied attempt starts the episode timer;
-/// once the episode age reaches warn_after, record_denial() returns
-/// Some(denied_attempts) exactly once for that episode so the caller may
+/// once the episode age reaches `warn_after`, `record_denial()` returns
+/// `Some(denied_attempts)` exactly once for that episode so the caller may
 /// emit a WARN-level log. Subsequent denials within the same episode do not
 /// re-trigger escalation.
 ///
@@ -41,15 +41,15 @@ use std::time::{Duration, Instant};
 /// ```ignore
 /// let mut starvation = ResourceStarvationTracker::new(Duration::from_secs(30));
 /// loop {
-///     let now = Instant::now();
 ///     if try_acquire_resource() {
 ///         starvation.reset();
 ///         do_work();
 ///     } else {
-///         if let Some(denials) = starvation.record_denial(now) {
-///         warn!(denials, "resource starvation has persisted for at least 30s");
+///         if let Some(denials) = starvation.record_denial() {
+///             warn!(denials, "resource starvation has persisted for at least 30s");
+///         }
+///         trace!("resource unavailable; skipping work");
 ///     }
-///     trace!("resource unavailable; skipping work");
 /// }
 /// ```
 #[derive(Debug)]
@@ -88,12 +88,11 @@ impl ResourceStarvationTracker {
     }
 
     fn record_denial_at(&mut self, now: Instant) -> Option<usize> {
-        match &mut self.episode {
-            Some(ep) => ep.record_denial(now, self.warn_after),
-            None => {
-                self.episode = Some(ResourceStarvationEpisode::new(now));
-                None
-            }
+        if let Some(ep) = &mut self.episode {
+            ep.record_denial(now, self.warn_after)
+        } else {
+            self.episode = Some(ResourceStarvationEpisode::new(now));
+            None
         }
     }
 
@@ -101,10 +100,6 @@ impl ResourceStarvationTracker {
     /// starvation episode (if any).
     pub fn reset(&mut self) {
         self.episode = None;
-    }
-
-    pub fn episode(&self) -> Option<&ResourceStarvationEpisode> {
-        self.episode.as_ref()
     }
 }
 
@@ -126,14 +121,6 @@ impl ResourceStarvationEpisode {
         } else {
             None
         }
-    }
-
-    fn denied_attempts(&self) -> usize {
-        self.denied_attempts
-    }
-
-    fn age(&self, now: Instant) -> Duration {
-        now.duration_since(self.started_at)
     }
 }
 
