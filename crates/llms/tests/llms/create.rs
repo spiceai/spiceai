@@ -121,6 +121,7 @@ pub(crate) async fn create_hf(model_id: &str) -> Result<Arc<dyn Chat>, ChatError
             .map(SecretString::from)
             .as_ref(),
         None,
+        None,
     )
     .await
 }
