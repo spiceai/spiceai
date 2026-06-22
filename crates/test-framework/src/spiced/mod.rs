@@ -190,12 +190,13 @@ impl SpicedInstance {
     /// - If the spiced instance fails to start
     /// - If the spicepod definition fails to serialize
     pub async fn start(mut start_request: StartRequest) -> Result<Self> {
-        // Check if spiced is already running
+        // Connect to an already-running external spiced if --spiced-path is a URL.
         let spiced_path_str = start_request.spiced_path.to_string_lossy().to_string();
         if spiced_path_str.starts_with("http://") || spiced_path_str.starts_with("https://") {
             return Ok(Self::external(spiced_path_str));
         }
 
+        // Check if spiced is already running.
         let client = reqwest::Client::new();
         let health_url = format!("{HTTP_BASE_URL}{HEALTH_ENDPOINT}");
         let response = client.get(&health_url).send().await;
