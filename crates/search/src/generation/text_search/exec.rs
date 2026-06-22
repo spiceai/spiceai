@@ -10,7 +10,7 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
-use std::{any::Any, fmt::Formatter, sync::Arc};
+use std::{fmt::Formatter, sync::Arc};
 
 use arrow::{datatypes::SchemaRef, error::ArrowError};
 use async_stream::stream;
@@ -87,10 +87,6 @@ impl DisplayAs for FullTextSearchExec {
 impl ExecutionPlan for FullTextSearchExec {
     fn name(&self) -> &'static str {
         "FullTextSearchTableExec"
-    }
-
-    fn as_any(&self) -> &dyn Any {
-        self
     }
 
     fn properties(&self) -> &Arc<PlanProperties> {

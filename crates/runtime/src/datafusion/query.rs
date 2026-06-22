@@ -829,9 +829,55 @@ impl Query {
                     t
                 });
 
-                // Statement plans (PREPARE, EXECUTE, DEALLOCATE) need special handling
+                // Statement plans (PREPARE, EXECUTE, DEALLOCATE, SET) need special handling
                 // They modify session state rather than producing query results, so must be
                 // executed through SessionContext::execute_logical_plan() instead of create_physical_plan()
+                // [query admission] Bound the number of concurrently-executing
+                // query plans — ordinary queries plus DDL/DML and EXECUTE
+                // (`runtime.query.max_concurrent_queries`) — so an OLAP burst
+                // can't oversubscribe the shared query runtime + memory pool and
+                // starve them (the idle-cores-under-load symptom).
+                // Acquired AFTER the results-cache check above (a cache hit
+                // returned early is never gated) and held — via the cancellation
+                // guard attached to the result stream below — until the stream is
+                // fully drained, so the permit spans the real execution lifetime
+                // (the lazy Flight drain and the managed-runtime driver included).
+                // No-op when `query_admission_semaphore` is unset (unbounded).
+                //
+                // Only plans that actually EXECUTE a (potentially heavy) query are
+                // gated: ordinary query plans, and `EXECUTE <prepared>` (which runs
+                // the prepared query). The other Statement plans — PREPARE,
+                // DEALLOCATE, SET — only mutate session state, so they must NOT
+                // consume a query permit or block behind the pool under load.
+                let plan_executes_query = match &*plan {
+                    LogicalPlan::Statement(stmt) => {
+                        matches!(stmt, datafusion::logical_expr::Statement::Execute(_))
+                    }
+                    _ => true,
+                };
+                let admission_permit: Option<tokio::sync::OwnedSemaphorePermit> =
+                    match ctx.df.query_admission_semaphore() {
+                        Some(semaphore) if plan_executes_query => {
+                            Self::ensure_not_cancelled(&query_cancel_token, &query_id_str)?;
+                            // Race permit acquisition against cancellation so a query
+                            // cancelled WHILE QUEUED for a permit (client disconnect or
+                            // `/cancel` under load) aborts promptly instead of blocking
+                            // until a permit frees and then still executing. `biased`
+                            // polls cancellation first. A closed semaphore (shutdown
+                            // only) proceeds ungated rather than failing the query.
+                            tokio::select! {
+                                biased;
+                                () = query_cancel_token.cancelled() => {
+                                    return Err(Error::QueryCancelled {
+                                        query_id: query_id_str.clone(),
+                                    });
+                                }
+                                permit = semaphore.acquire_owned() => permit.ok(),
+                            }
+                        }
+                        _ => None,
+                    };
+
                 let (res_stream, physical_plan): (
                     SendableRecordBatchStream,
                     Arc<dyn ExecutionPlan>,
@@ -1032,7 +1078,13 @@ impl Query {
                     final_stream,
                     query_cancel_token.clone(),
                     query_id_str.clone(),
-                    active_query_guard,
+                    // Bundle the admission permit with the active-query guard so
+                    // BOTH release exactly when the result stream is fully drained
+                    // (completion, error, or cancellation) — the permit thus spans
+                    // the query's true lifetime, not merely until `run` returns
+                    // (Flight drains the stream lazily; the managed runtime drives
+                    // it on a separate task).
+                    (active_query_guard, admission_permit),
                 );
 
                 Ok(QueryResult::new(
@@ -1527,7 +1579,7 @@ fn strip_root_order_preserving_repartition(
         plan.with_new_children(vec![rewritten_child])?
     };
 
-    if let Some(spm) = plan.as_any().downcast_ref::<SortPreservingMergeExec>() {
+    if let Some(spm) = plan.downcast_ref::<SortPreservingMergeExec>() {
         return Ok(Arc::new(
             SortPreservingMergeExec::new(spm.expr().clone(), Arc::clone(spm.input()))
                 .with_fetch(spm.fetch())
@@ -1535,7 +1587,7 @@ fn strip_root_order_preserving_repartition(
         ));
     }
 
-    if let Some(repartition) = plan.as_any().downcast_ref::<RepartitionExec>()
+    if let Some(repartition) = plan.downcast_ref::<RepartitionExec>()
         && repartition.input().output_partitioning().partition_count() == 1
         && repartition.input().output_ordering().is_some()
         && repartition.partitioning().partition_count() > 1
@@ -1785,6 +1837,8 @@ fn scalar_to_json_value(
         ScalarValue::FixedSizeList(array) => single_row_fixed_size_list_to_json(array),
         ScalarValue::List(array) => single_row_list_to_json(array),
         ScalarValue::LargeList(array) => single_row_large_list_to_json(array),
+        ScalarValue::ListView(array) => single_row_nested_array_to_json(array.as_ref(), 0),
+        ScalarValue::LargeListView(array) => single_row_nested_array_to_json(array.as_ref(), 0),
         ScalarValue::Struct(array) => single_row_struct_to_json(array),
         ScalarValue::Map(array) => single_row_map_to_json(array),
         ScalarValue::Union(Some((_, value)), _, _)
@@ -1866,6 +1920,13 @@ fn single_row_nested_array_to_json(
     } else if let Some(list_array) = array.as_any().downcast_ref::<LargeListArray>() {
         list_array.value(index)
     } else if let Some(list_array) = array.as_any().downcast_ref::<FixedSizeListArray>() {
+        list_array.value(index)
+    } else if let Some(list_array) = array.as_any().downcast_ref::<arrow::array::ListViewArray>() {
+        list_array.value(index)
+    } else if let Some(list_array) = array
+        .as_any()
+        .downcast_ref::<arrow::array::LargeListViewArray>()
+    {
         list_array.value(index)
     } else {
         return Err("Expected a list-like Arrow array".into());
@@ -2108,7 +2169,6 @@ mod tests {
     use datafusion_functions_json::JSON_UNION_DATA_TYPE;
     use serde_json::json;
     use spicepod::component::caching::SQLResultsCacheConfig;
-    use std::any::Any;
     use std::fmt::{Debug, Formatter};
     use std::sync::atomic::{AtomicBool, Ordering};
     use tokio_util::sync::CancellationToken;
@@ -2312,6 +2372,130 @@ mod tests {
             registry.list().iter().all(|info| info.query_id != query_id),
             "cached query should be deregistered after the stream terminates"
         );
+    }
+
+    /// [query admission] With `max_concurrent_queries = 1`, a second
+    /// query-executing plan must block at permit acquisition while the first
+    /// query's result stream is still alive (the permit rides that stream's
+    /// guard), and must proceed once the first stream is dropped. Guards against
+    /// losing the intended backpressure and against leaking / never releasing a
+    /// permit (a deadlock). The block is real — A holds the only permit — not
+    /// timing-dependent: B can finish early only if admission is broken.
+    #[tokio::test]
+    async fn query_admission_blocks_second_query_until_first_stream_drops() {
+        use std::time::Duration;
+        let df = Arc::new(
+            DataFusionBuilder::new(
+                RuntimeStatus::new(),
+                Arc::new(AcceleratorEngineRegistry::new()),
+                Handle::current(),
+            )
+            .max_concurrent_queries(Some(1))
+            .build(),
+        );
+
+        // Query A acquires the only permit at run() time; the permit rides the
+        // result stream's guard and is held until that stream is dropped.
+        let query_a = QueryBuilder::new("SELECT 42 AS value", Arc::clone(&df))
+            .build()
+            .run()
+            .await
+            .expect("query A should run");
+
+        // B uses different query text (`SELECT 43`, a cache miss → it actually
+        // reaches the admission gate, not an early cache-hit return) and is spawned
+        // so the test task can observe whether run() blocks.
+        let df_b = Arc::clone(&df);
+        let mut b_handle = tokio::spawn(async move {
+            QueryBuilder::new("SELECT 43 AS value", df_b)
+                .build()
+                .run()
+                .await
+                .map(|_q| ())
+        });
+
+        // While A's stream lives, B's run() must NOT return. `biased` polls B's
+        // completion before the timer, so a regression that lets B through is
+        // caught immediately.
+        tokio::select! {
+            biased;
+            r = &mut b_handle => panic!(
+                "query B should block on the admission permit while A holds it, but run() returned: {r:?}"
+            ),
+            () = tokio::time::sleep(Duration::from_millis(750)) => {}
+        }
+
+        // Releasing A's stream frees the permit; B can now finish run().
+        drop(query_a);
+        let b_outcome = tokio::time::timeout(Duration::from_secs(10), b_handle)
+            .await
+            .expect("query B should proceed once the permit is released")
+            .expect("query B task should not panic");
+        b_outcome.expect("query B should run successfully after the permit frees");
+    }
+
+    /// [query admission] A query cancelled WHILE QUEUED for an admission permit
+    /// must return `QueryCancelled` promptly (via the `biased` cancel race),
+    /// instead of blocking until the permit frees and then executing.
+    #[tokio::test]
+    async fn query_admission_cancellation_while_queued_returns_cancelled() {
+        use std::time::Duration;
+        let df = Arc::new(
+            DataFusionBuilder::new(
+                RuntimeStatus::new(),
+                Arc::new(AcceleratorEngineRegistry::new()),
+                Handle::current(),
+            )
+            .max_concurrent_queries(Some(1))
+            .build(),
+        );
+
+        // A holds the only permit (kept alive for the whole test).
+        let _query_a = QueryBuilder::new("SELECT 42 AS value", Arc::clone(&df))
+            .build()
+            .run()
+            .await
+            .expect("query A should run");
+
+        let query_id = uuid::Uuid::new_v4();
+        let cancel_token = CancellationToken::new();
+        let df_b = Arc::clone(&df);
+        let token_b = cancel_token.clone();
+        let b_handle = tokio::spawn(async move {
+            QueryBuilder::new("SELECT 43 AS value", df_b)
+                .query_id(query_id)
+                .cancellation_token(token_b)
+                .build()
+                .run()
+                .await
+                .map(|_q| ())
+        });
+
+        // Wait until B is registered in the cancel registry, then cancel it.
+        // `run_internal` registers a query in the cancel registry BEFORE acquiring
+        // the admission permit, so B's presence here means it is genuinely queued
+        // for the permit — making the cancellation deterministic instead of racing
+        // a fixed sleep (which is flaky under slow CI). Bounded fallback (~5s).
+        let registry = df.query_cancel_registry();
+        for _ in 0..500 {
+            if registry.list().iter().any(|info| info.query_id == query_id) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        cancel_token.cancel();
+
+        let b_err = tokio::time::timeout(Duration::from_secs(5), b_handle)
+            .await
+            .expect("cancelled query B should return promptly, not block on the permit")
+            .expect("query B task should not panic")
+            .expect_err("query B should fail with cancellation");
+        match b_err {
+            Error::QueryCancelled {
+                query_id: cancelled,
+            } => assert_eq!(cancelled, query_id.to_string()),
+            other => panic!("expected QueryCancelled, got: {other:?}"),
+        }
     }
 
     #[tokio::test]
@@ -2706,10 +2890,6 @@ mod tests {
     impl ExecutionPlan for TestExecutionPlan {
         fn name(&self) -> &'static str {
             "TestExecutionPlan"
-        }
-
-        fn as_any(&self) -> &dyn Any {
-            self
         }
 
         fn properties(&self) -> &Arc<PlanProperties> {

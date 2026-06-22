@@ -29,7 +29,6 @@ use datafusion::{
     common::{Result as DataFusionResult, exec_err},
     logical_expr::{ColumnarValue, ScalarUDFImpl, Signature, TypeSignature, Volatility},
 };
-use std::any::Any;
 use std::collections::HashMap;
 use std::sync::{Arc, LazyLock};
 use tokio::sync::RwLock;
@@ -165,10 +164,6 @@ impl Embed {
 }
 
 impl ScalarUDFImpl for Embed {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn name(&self) -> &'static str {
         EMBED_UDF_NAME
     }

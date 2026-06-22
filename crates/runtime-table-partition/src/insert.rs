@@ -127,10 +127,6 @@ impl DisplayAs for PartitionerExec {
 }
 
 impl ExecutionPlan for PartitionerExec {
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
-
     fn schema(&self) -> SchemaRef {
         Arc::clone(&self.output_schema)
     }
@@ -368,10 +364,6 @@ impl fmt::Debug for PartitionInputExec {
 impl ExecutionPlan for PartitionInputExec {
     fn name(&self) -> &'static str {
         "PartitionInsertExec"
-    }
-
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
     }
 
     fn schema(&self) -> SchemaRef {

@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::{any::Any, sync::Arc};
+use std::sync::Arc;
 
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use async_trait::async_trait;
@@ -73,10 +73,6 @@ macro_rules! parse_addreses_from_envelope {
 
 #[async_trait]
 impl TableProvider for ImapTableProvider {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema(&self) -> SchemaRef {
         let mut fields = vec![
             Field::new("date", DataType::Date64, false),

@@ -91,7 +91,7 @@ impl PhysicalOptimizerRule for FlightSQLPartialAggregatePushdown {
 fn try_rewrite_partial_aggregate(
     plan: Arc<dyn ExecutionPlan>,
 ) -> Result<Transformed<Arc<dyn ExecutionPlan>>> {
-    let Some(agg) = plan.as_any().downcast_ref::<AggregateExec>() else {
+    let Some(agg) = plan.downcast_ref::<AggregateExec>() else {
         return Ok(Transformed::no(plan));
     };
     if *agg.mode() != AggregateMode::Partial {
@@ -175,7 +175,7 @@ fn all_aggregates_pushable(agg: &AggregateExec) -> bool {
 
 /// Skip through a `RepartitionExec(RoundRobinBatch)` if present.
 fn skip_repartition_roundrobin(plan: &Arc<dyn ExecutionPlan>) -> &Arc<dyn ExecutionPlan> {
-    if let Some(repart) = plan.as_any().downcast_ref::<RepartitionExec>()
+    if let Some(repart) = plan.downcast_ref::<RepartitionExec>()
         && matches!(repart.partitioning(), Partitioning::RoundRobinBatch(_))
     {
         return repart.input();
@@ -196,7 +196,7 @@ fn skip_repartition_roundrobin(plan: &Arc<dyn ExecutionPlan>) -> &Arc<dyn Execut
 fn skip_projection(
     plan: &Arc<dyn ExecutionPlan>,
 ) -> (&Arc<dyn ExecutionPlan>, Vec<Arc<dyn PhysicalExpr>>) {
-    if let Some(proj) = plan.as_any().downcast_ref::<ProjectionExec>() {
+    if let Some(proj) = plan.downcast_ref::<ProjectionExec>() {
         let substitutions: Vec<Arc<dyn PhysicalExpr>> =
             proj.expr().iter().map(|pe| Arc::clone(&pe.expr)).collect();
         return (proj.input(), substitutions);
@@ -210,7 +210,7 @@ fn skip_projection(
 /// identified by name (they are defined in upstream crates not available for downcasting).
 /// Returns `None` if any child doesn't terminate at `FlightSqlExec`.
 fn collect_flight_execs(plan: &Arc<dyn ExecutionPlan>) -> Option<Vec<&FlightSqlExec>> {
-    if let Some(union_exec) = plan.as_any().downcast_ref::<UnionExec>() {
+    if let Some(union_exec) = plan.downcast_ref::<UnionExec>() {
         let mut execs = Vec::with_capacity(union_exec.inputs().len());
         for child in union_exec.inputs() {
             execs.push(walk_to_flight_exec(child)?);
@@ -242,7 +242,7 @@ fn collect_flight_execs(plan: &Arc<dyn ExecutionPlan>) -> Option<Vec<&FlightSqlE
 fn walk_to_flight_exec(plan: &Arc<dyn ExecutionPlan>) -> Option<&FlightSqlExec> {
     let mut current: &Arc<dyn ExecutionPlan> = plan;
     loop {
-        if let Some(flight) = current.as_any().downcast_ref::<FlightSqlExec>() {
+        if let Some(flight) = current.downcast_ref::<FlightSqlExec>() {
             return Some(flight);
         }
 
@@ -251,7 +251,7 @@ fn walk_to_flight_exec(plan: &Arc<dyn ExecutionPlan>) -> Option<&FlightSqlExec> 
             return None;
         }
 
-        if current.as_any().downcast_ref::<RepartitionExec>().is_some()
+        if current.downcast_ref::<RepartitionExec>().is_some()
             || PASS_THROUGH_EXEC_NAMES.contains(&current.name())
         {
             current = children[0];
@@ -323,7 +323,6 @@ mod tests {
     use datafusion::sql::TableReference;
     use datafusion_datasource::memory::MemorySourceConfig;
     use flight_client::cookie::CookieStore;
-    use std::any::Any;
     use std::fmt;
     use tonic::transport::Channel;
 
@@ -475,7 +474,6 @@ mod tests {
         data: &mut impl Iterator<Item = Vec<RecordBatch>>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         if plan
-            .as_any()
             .downcast_ref::<PartialAggregationFlightSqlExec>()
             .is_some()
         {
@@ -989,9 +987,6 @@ mod tests {
     impl ExecutionPlan for MockNonFlightExec {
         fn name(&self) -> &'static str {
             "MockNonFlightExec"
-        }
-        fn as_any(&self) -> &dyn Any {
-            self
         }
         fn schema(&self) -> SchemaRef {
             Arc::clone(&self.schema)

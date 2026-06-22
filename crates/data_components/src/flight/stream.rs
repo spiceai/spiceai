@@ -35,7 +35,7 @@ use datafusion::{
 use flight_client::FlightClient;
 use futures::{Stream, StreamExt};
 use snafu::prelude::*;
-use std::{any::Any, fmt, sync::Arc};
+use std::{fmt, sync::Arc};
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -105,10 +105,6 @@ impl FlightTableStreamer {
 
 #[async_trait]
 impl TableProvider for FlightTableStreamer {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema(&self) -> SchemaRef {
         Arc::clone(&self.schema)
     }
@@ -177,10 +173,6 @@ impl DisplayAs for FlightStreamExec {
 impl ExecutionPlan for FlightStreamExec {
     fn name(&self) -> &'static str {
         "FlightStreamExec"
-    }
-
-    fn as_any(&self) -> &dyn Any {
-        self
     }
 
     fn schema(&self) -> SchemaRef {

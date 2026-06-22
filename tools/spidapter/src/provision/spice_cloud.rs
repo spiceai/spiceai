@@ -200,6 +200,7 @@ pub(crate) async fn provision_scp_app(
         storage: FederatedStorageConfig::Direct, // will be replaced by setup() caller
         ec2_guards: vec![],
         dynamodb_guard: None,
+        mongodb_guard: None,
     })))
 }
 

@@ -23,7 +23,6 @@ limitations under the License.
 //! freshness epoch exactly matches the scan snapshot epoch captured by
 //! [`crate::provider::CayenneAccelerationExec`].
 
-use std::any::Any;
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
 use std::sync::Arc;
@@ -218,10 +217,6 @@ impl ExecutionPlan for MaintainedAggregateExec {
         Self: Sized,
     {
         "MaintainedAggregateExec"
-    }
-
-    fn as_any(&self) -> &dyn Any {
-        self
     }
 
     fn properties(&self) -> &Arc<PlanProperties> {
@@ -813,7 +808,7 @@ fn query_spec_for_aggregate(aggregate: &AggregateExec) -> Option<QueryAggregateS
     let input_schema = aggregate.input().schema();
     let mut group_by = Vec::with_capacity(aggregate.group_expr().expr().len());
     for (expr, _) in aggregate.group_expr().expr() {
-        let column = expr.as_any().downcast_ref::<Column>()?;
+        let column = expr.downcast_ref::<Column>()?;
         group_by.push(input_column_name(&input_schema, column)?);
     }
 
@@ -846,7 +841,7 @@ fn query_spec_for_aggregate(aggregate: &AggregateExec) -> Option<QueryAggregateS
                     return None;
                 }
                 let expr = expressions.first()?;
-                let column = expr.as_any().downcast_ref::<Column>()?;
+                let column = expr.downcast_ref::<Column>()?;
                 Some(input_column_name(&input_schema, column)?)
             }
         };
@@ -870,13 +865,13 @@ fn count_column_for_query(
     let Some(expr) = expressions.first() else {
         return Some(CountQueryColumn::AllRows);
     };
-    if let Some(column) = expr.as_any().downcast_ref::<Column>() {
+    if let Some(column) = expr.downcast_ref::<Column>() {
         return Some(CountQueryColumn::Column(input_column_name(
             input_schema,
             column,
         )?));
     }
-    if let Some(literal) = expr.as_any().downcast_ref::<Literal>() {
+    if let Some(literal) = expr.downcast_ref::<Literal>() {
         return (!literal.value().is_null()).then_some(CountQueryColumn::AllRows);
     }
     None

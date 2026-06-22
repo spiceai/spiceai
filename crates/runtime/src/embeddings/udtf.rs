@@ -63,7 +63,6 @@ const EMBED_UDF_NAME: &str = "embed";
 use search::generation::CandidateGeneration;
 use search::generation::util::get_primary_keys;
 use std::{
-    any::Any,
     cmp::min,
     collections::{BTreeMap, HashMap, HashSet},
     sync::{Arc, LazyLock, Weak},
@@ -817,10 +816,6 @@ impl TableFunctionImpl for VectorSearchTableFunc {
 
 /// This is a stub implementation, so that we can nest UDTF function invocations
 impl ScalarUDFImpl for VectorSearchTableFunc {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn name(&self) -> &str {
         VECTOR_SEARCH_UDTF_NAME
     }
@@ -921,10 +916,6 @@ impl VectorSearchUDTFProvider {
 
 #[async_trait::async_trait]
 impl TableProvider for VectorSearchUDTFProvider {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema(&self) -> SchemaRef {
         // When the caller asked `include_score => false`, don't advertise `_score`
         // in the schema. The scan body also omits it from the final projection.

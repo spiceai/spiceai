@@ -49,7 +49,6 @@ use runtime_rate_control::{Permit, RateController};
 use snafu::prelude::*;
 use std::collections::{HashMap, HashSet, VecDeque, hash_map::DefaultHasher};
 use std::{
-    any::Any,
     borrow::ToOwned,
     fmt,
     hash::{Hash, Hasher},
@@ -1424,10 +1423,6 @@ impl HttpTableProvider {
 
 #[async_trait]
 impl TableProvider for HttpTableProvider {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn constraints(&self) -> Option<&Constraints> {
         Some(&self.constraints)
     }
@@ -2085,10 +2080,6 @@ impl DisplayAs for HttpExec {
 impl ExecutionPlan for HttpExec {
     fn name(&self) -> &'static str {
         "HttpExec"
-    }
-
-    fn as_any(&self) -> &dyn Any {
-        self
     }
 
     fn properties(&self) -> &Arc<PlanProperties> {

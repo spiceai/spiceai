@@ -6,6 +6,8 @@ on:
     - cron: '0 9 * * *'
     # htap-sf100, every 3h (0200, 0500, 0800, 1100, 1400, 1700, 2000, 2300) — HTAP CH-benCHmark SF100
     - cron: '0 2,5,8,11,14,17,20,23 * * *'
+    # htap-sf1000, twice daily (0000, 1200) — HTAP CH-benCHmark SF1000
+    - cron: '0 0,12 * * *'
 
   workflow_dispatch:
     inputs:
@@ -43,6 +45,11 @@ jobs:
   dispatch-scheduled:
     name: Dispatch tests - Scheduled
     runs-on: spiceai-dev-runners
+    # Serial chbench htap dispatch (--max-concurrent 1) blocks this job for the sum of the batch's
+    # run durations; the SF1000 batch (6 variants x up to the 120-min htap cap) can run several
+    # hours, so raise the cap well above GitHub's 6h default. Shorter crons (daily-main, htap-sf100)
+    # finish early — this is only an upper bound.
+    timeout-minutes: 720
     if: ${{ github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && github.event.inputs.scheduled == 'true') }}
     strategy:
       fail-fast: false
@@ -101,6 +108,7 @@ jobs:
           case "${{ github.event.schedule }}" in
             '0 9 * * *')               NAME=daily-main ;;
             '0 2,5,8,11,14,17,20,23 * * *') NAME=htap-sf100 ;;
+            '0 0,12 * * *')            NAME=htap-sf1000 ;;
             *)                         NAME=           ;;   # manual / unrecognized cron — match nothing
           esac
           echo "Resolved schedule name: $NAME"
@@ -231,11 +239,14 @@ jobs:
           SPICED_COMMIT: ${{ steps.setup-spiced.outputs.SPICED_COMMIT }}
           WORKFLOW_COMMIT: ${{ matrix.branch }}
 
-      # HTAP CH-benCHmark — SF100 fires on its own every-3h cron.
+      # HTAP CH-benCHmark — SF100 fires on its own every-3h cron. --max-concurrent 1 makes the
+      # dispatcher wait for each run to finish before dispatching the next (true serial, no
+      # supersession); --max-concurrent-wait-timeout-mins 180 covers a full run's wall-clock so
+      # the slot wait doesn't give up early. The htap concurrency group is the backstop.
       - name: Dispatch Testoperator - Scheduled CH-BenCHmark - SF100
         if: ${{ matrix.branch == 'trunk' && steps.sched.outputs.name == 'htap-sf100' }}
         run: |
-          testoperator dispatch ./tools/testoperator/dispatch/chbench/sf100 --workflow htap
+          testoperator dispatch ./tools/testoperator/dispatch/chbench/sf100 --workflow htap --max-concurrent 1 --max-concurrent-wait-timeout-mins 180
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           SPICED_COMMIT: ${{ steps.setup-spiced.outputs.SPICED_COMMIT }}
@@ -245,6 +256,18 @@ jobs:
         if: ${{ matrix.branch == 'trunk' && steps.sched.outputs.name == 'daily-main' }}
         run: |
           testoperator dispatch ./tools/testoperator/dispatch/chbench/sf100 --workflow bench
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SPICED_COMMIT: ${{ steps.setup-spiced.outputs.SPICED_COMMIT }}
+          WORKFLOW_COMMIT: ${{ matrix.branch }}
+
+      # SF1000 fires twice daily. --max-concurrent 1 + the long slot-wait timeout serialize the
+      # whole SF1000 variant batch run-by-run (no supersession), and serialize against any still-
+      # draining SF100 run via the shared htap active-run count.
+      - name: Dispatch Testoperator - Scheduled CH-BenCHmark - SF1000
+        if: ${{ matrix.branch == 'trunk' && steps.sched.outputs.name == 'htap-sf1000' }}
+        run: |
+          testoperator dispatch ./tools/testoperator/dispatch/chbench/sf1000 --workflow htap --max-concurrent 1 --max-concurrent-wait-timeout-mins 180
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           SPICED_COMMIT: ${{ steps.setup-spiced.outputs.SPICED_COMMIT }}

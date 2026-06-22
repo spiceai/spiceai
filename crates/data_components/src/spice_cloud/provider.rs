@@ -16,7 +16,6 @@ limitations under the License.
 
 //! Implementation of the `DataFusion` Catalog/Schema providers for Spice.ai.
 
-use std::any::Any;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -144,10 +143,6 @@ impl SpiceCloudPlatformCatalogProvider {
 }
 
 impl CatalogProvider for SpiceCloudPlatformCatalogProvider {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema_names(&self) -> Vec<String> {
         self.schemas.keys().cloned().collect()
     }
@@ -263,10 +258,6 @@ impl SpiceCloudPlatformSchemaProvider {
 
 #[async_trait]
 impl SchemaProvider for SpiceCloudPlatformSchemaProvider {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn table_names(&self) -> Vec<String> {
         self.tables.keys().cloned().collect()
     }

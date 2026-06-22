@@ -1562,11 +1562,12 @@ pub async fn initialize_cluster_executor(
                 .max_duration(Some(SCHEDULER_BACKOFF_MAX))
                 .max_retries(Some(ALLOCATE_INITIAL_PARTITIONS_MAX_RETRIES))
                 .build();
+            let task_ctx = rt.datafusion().ctx.task_ctx();
             loop {
                 match executor_request_initial_partitions(
                     cluster_client.clone(),
                     rt.datafusion().cluster_config.node_advertise_url(),
-                    rt.datafusion().ctx.as_ref(),
+                    task_ctx.as_ref(),
                 )
                 .await
                 {

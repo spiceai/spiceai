@@ -475,10 +475,6 @@ impl AdbcCatalogProvider {
 }
 
 impl CatalogProvider for AdbcCatalogProvider {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema_names(&self) -> Vec<String> {
         let guard = match self.schemas.read() {
             Ok(guard) => guard,
@@ -521,10 +517,6 @@ impl std::fmt::Debug for AdbcSchemaProvider {
 
 #[async_trait]
 impl SchemaProvider for AdbcSchemaProvider {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn table_names(&self) -> Vec<String> {
         let guard = match self.tables.read() {
             Ok(guard) => guard,

@@ -58,7 +58,7 @@ fn is_accelerated_table_provider(table_provider: &Arc<dyn TableProvider>) -> boo
 
 impl TablePartitionProvider for AcceleratedPartitionProvider {
     fn should_partition(&self, tbl: &TableScan) -> bool {
-        let Some(default) = tbl.source.as_any().downcast_ref::<DefaultTableSource>() else {
+        let Some(default) = tbl.source.downcast_ref::<DefaultTableSource>() else {
             return false;
         };
         is_accelerated_table_provider(&default.table_provider)

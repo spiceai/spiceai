@@ -19,7 +19,7 @@ use std::{collections::HashMap, sync::Arc};
 use app::App;
 
 use datafusion::{
-    execution::FunctionRegistry,
+    execution::TaskContext,
     logical_expr::Expr,
     sql::{ResolvedTableReference, TableReference},
 };
@@ -177,7 +177,7 @@ pub fn accelerated_tables(app: &Arc<App>) -> HashMap<TableReference, Vec<Partiti
 pub async fn executor_request_initial_partitions(
     mut client: ClusterServiceClient<Channel>,
     executor_url: String,
-    registry: &(dyn FunctionRegistry + Send + Sync),
+    task_ctx: &TaskContext,
 ) -> Result<HashMap<ResolvedTableReference, Vec<Expr>>> {
     let response = client
         .allocate_initial_partitions(AllocateInitialPartitionsRequest { executor_url })
@@ -193,7 +193,7 @@ pub async fn executor_request_initial_partitions(
         let mut exprs = Vec::new();
 
         for item in partitions.items {
-            let expr = Expr::from_bytes_with_registry(&item, registry)
+            let expr = Expr::from_bytes_with_ctx(&item, task_ctx)
                 .context(PartitionExpressionDeserializationSnafu)?;
             exprs.push(expr);
         }

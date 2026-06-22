@@ -89,7 +89,8 @@ use datafusion::physical_optimizer::PhysicalOptimizerRule;
 use datafusion::physical_optimizer::optimizer::PhysicalOptimizer;
 use datafusion_optimizer_rules::{
     logical_plan::{
-        CacheInvalidationExtensionPlanner, cache_invalidation::CacheInvalidationOptimizerRule,
+        CacheInvalidationExtensionPlanner, ReorderJoinRule,
+        cache_invalidation::CacheInvalidationOptimizerRule,
     },
     physical_plan::{
         EmptyHashJoinExecPhysicalOptimization, HttpParamsPushdown,
@@ -100,10 +101,7 @@ use datafusion_optimizer_rules::{
 #[cfg(not(windows))]
 use runtime_datafusion::join_accumulator::clamp_maximum_shared_inlist_memory_bytes;
 use runtime_datafusion::{
-    extension::{
-        ExtensionPlanQueryPlanner, bytes_processed::BytesProcessedPhysicalOptimizer,
-        data_source_tree_display::DataSourceTreeDisplayOptimizer,
-    },
+    extension::{ExtensionPlanQueryPlanner, bytes_processed::BytesProcessedPhysicalOptimizer},
     schema_provider::SpiceSchemaProvider,
     url_table::{DynamicUrlCatalogList, SpiceUrlTableFactory},
 };
@@ -164,6 +162,7 @@ struct CayenneLogicalOptimizerRules {
     cross_join_reassociation: bool,
     inlist_to_range: bool,
     semi_join_pushdown: bool,
+    join_reorder: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -220,6 +219,7 @@ impl CayenneOptimizerRules {
                 cross_join_reassociation: true,
                 inlist_to_range: false,
                 semi_join_pushdown: true,
+                join_reorder: true,
             },
             physical: CayennePhysicalOptimizerRules::auto_enabled(),
         }
@@ -233,6 +233,7 @@ impl CayenneOptimizerRules {
                 cross_join_reassociation: true,
                 inlist_to_range: true,
                 semi_join_pushdown: true,
+                join_reorder: true,
             },
             physical: CayennePhysicalOptimizerRules::all_enabled(),
         }
@@ -246,6 +247,7 @@ impl CayenneOptimizerRules {
                 cross_join_reassociation: false,
                 inlist_to_range: false,
                 semi_join_pushdown: false,
+                join_reorder: false,
             },
             physical: CayennePhysicalOptimizerRules::none(),
         }
@@ -285,6 +287,15 @@ impl CayenneOptimizerRules {
 
     pub fn set_semi_join_pushdown(&mut self, enabled: bool) {
         self.logical.semi_join_pushdown = enabled;
+    }
+
+    #[must_use]
+    pub const fn join_reorder(self) -> bool {
+        self.logical.join_reorder
+    }
+
+    pub fn set_join_reorder(&mut self, enabled: bool) {
+        self.logical.join_reorder = enabled;
     }
 
     #[must_use]
@@ -346,8 +357,10 @@ pub struct DataFusionBuilder {
     accelerator_engine_registry: Arc<AcceleratorEngineRegistry>,
     memory_limit: Option<u64>,
     target_partitions: Option<usize>,
+    prefer_hash_join: Option<bool>,
     temp_directory: Option<String>,
     accelerated_refresh_semaphore: Option<Arc<Semaphore>>,
+    query_admission_semaphore: Option<Arc<Semaphore>>,
     task_history_enabled: bool,
     caching: Option<Arc<Caching>>,
     spill_compression: Option<SpillCompression>,
@@ -404,8 +417,10 @@ impl DataFusionBuilder {
             accelerator_engine_registry,
             memory_limit: None,
             target_partitions: None,
+            prefer_hash_join: None,
             temp_directory: None,
             accelerated_refresh_semaphore: None,
+            query_admission_semaphore: None,
             task_history_enabled: true,
             caching: None,
             spill_compression: None,
@@ -457,6 +472,12 @@ impl DataFusionBuilder {
     }
 
     #[must_use]
+    pub fn prefer_hash_join(mut self, prefer_hash_join: Option<bool>) -> Self {
+        self.prefer_hash_join = prefer_hash_join;
+        self
+    }
+
+    #[must_use]
     pub fn spill_compression(mut self, spill_compression: Option<SpiceSpillCompression>) -> Self {
         self.spill_compression = match spill_compression {
             Some(SpiceSpillCompression::Zstd) => Some(SpillCompression::Zstd),
@@ -480,6 +501,18 @@ impl DataFusionBuilder {
     ) -> Self {
         self.accelerated_refresh_semaphore =
             Some(Arc::new(Semaphore::new(max_parallel_accelerated_refreshes)));
+        self
+    }
+
+    /// Bound the number of concurrently-executing query plans — ordinary queries
+    /// plus DDL/DML and `EXECUTE` (not lightweight `PREPARE`/`DEALLOCATE`/`SET`) —
+    /// i.e. query admission control. `None` leaves the gate unbounded (the prior
+    /// behavior); `Some(n)` installs a semaphore of `n` permits (clamped to at
+    /// least 1).
+    #[must_use]
+    pub fn max_concurrent_queries(mut self, max_concurrent_queries: Option<usize>) -> Self {
+        self.query_admission_semaphore =
+            max_concurrent_queries.map(|n| Arc::new(Semaphore::new(n.max(1))));
         self
     }
 
@@ -663,6 +696,17 @@ impl DataFusionBuilder {
             );
         }
 
+        // `HashJoinExec` build sides are not spillable, so very large joins can
+        // exhaust the query memory pool outright. Setting this to `false` makes
+        // the planner emit spillable sort-merge joins instead. Left unset,
+        // DataFusion's default (prefer hash joins) stands; the Cayenne
+        // `CayenneAntiJoinSortMergeRewriter` still selectively converts oversized
+        // hash joins to sort-merge under the memory gate.
+        if let Some(prefer_hash_join) = self.prefer_hash_join {
+            config.options_mut().optimizer.prefer_hash_join = prefer_hash_join;
+            tracing::info!(prefer_hash_join, "Applied runtime.query.prefer_hash_join");
+        }
+
         // Sizes DataFusion's *native* hash-join InList dynamic-filter budget
         // (`optimizer.hash_join_inlist_pushdown_max_size`) from the runtime
         // memory limit. The native inner-join dynamic-filter pushdown
@@ -777,11 +821,9 @@ impl DataFusionBuilder {
         #[cfg(windows)]
         let _ = exact_join_filter_memory_limit;
 
-        state = state
-            .with_physical_optimizer_rule(Arc::new(BytesProcessedPhysicalOptimizer::new(Arc::new(
-                Box::new(track_bytes_processed),
-            ))))
-            .with_physical_optimizer_rule(Arc::new(DataSourceTreeDisplayOptimizer::new()));
+        state = state.with_physical_optimizer_rule(Arc::new(BytesProcessedPhysicalOptimizer::new(
+            Arc::new(Box::new(track_bytes_processed)),
+        )));
 
         if matches!(
             self.cluster_config.as_ref().and_then(|cfg| cfg.role()),
@@ -976,10 +1018,12 @@ impl DataFusionBuilder {
             accelerated_tables: TokioRwLock::new(HashSet::new()),
             accelerator_engine_registry: self.accelerator_engine_registry,
             acceleration_refresh_semaphore: self.accelerated_refresh_semaphore,
+            query_admission_semaphore: self.query_admission_semaphore,
             task_history_enabled: self.task_history_enabled,
             temp_directory: self.temp_directory.clone(),
             cpu_runtime: OnceLock::new(),
             refresh_runtime: OnceLock::new(),
+            cdc_apply_runtime: OnceLock::new(),
             compaction_runtime: OnceLock::new(),
             compaction_runtime_env,
             compaction_memory_bytes,
@@ -1020,6 +1064,9 @@ fn with_cayenne_logical_optimizers(
     }
     if cayenne_optimizer_rules.semi_join_pushdown() {
         insert_cayenne_push_down_semi_join(&mut optimizer_rules);
+    }
+    if cayenne_optimizer_rules.join_reorder() {
+        insert_cayenne_join_reorder_rule(&mut optimizer_rules);
     }
     optimizer_rules.extend(trailing_rules);
     state.with_optimizer_rules(optimizer_rules)
@@ -1140,30 +1187,53 @@ fn insert_cayenne_push_down_semi_join(rules: &mut Vec<Arc<dyn OptimizerRule + Se
 }
 
 #[cfg(not(windows))]
+fn insert_cayenne_join_reorder_rule(rules: &mut Vec<Arc<dyn OptimizerRule + Send + Sync>>) {
+    // Cost-based left-deep join reordering (IK84). It must run *after* the
+    // inner-join graph is fully formed AND base-table predicates are pushed to
+    // the scans — equi-predicates extracted, cross joins reassociated into a
+    // contiguous Inner-join chain, and `push_down_filter` applied so the cost
+    // model can credit `TableScan.filters` for scan selectivity — but *before*
+    // projection pushdown (`optimize_projections`) inserts intervening
+    // Projections that fragment the graph into opaque leaves.
+    if !rules.iter().any(|rule| rule.name() == "reorder_join") {
+        let insert_at = [
+            "push_down_filter",
+            "cayenne_reassociate_cross_join",
+            "eliminate_cross_join",
+        ]
+        .iter()
+        .filter_map(|name| rules.iter().position(|rule| rule.name() == *name))
+        .max()
+        .map_or(rules.len(), |position| position + 1);
+        rules.insert(insert_at, Arc::new(ReorderJoinRule::default()));
+    }
+}
+
+#[cfg(not(windows))]
 fn is_cayenne_accelerated_table_provider(provider: &dyn TableProvider) -> bool {
     if is_cayenne_table_provider(provider) {
         return true;
     }
 
     provider
-        .as_any()
         .downcast_ref::<AcceleratedTable>()
         .is_some_and(|table| is_cayenne_table_provider(table.get_accelerator().as_ref()))
 }
 
 #[cfg(not(windows))]
 fn is_cayenne_table_provider(provider: &dyn TableProvider) -> bool {
-    if provider.as_any().is::<CayenneTableProvider>() || has_cayenne_accelerator_metadata(provider)
+    if provider.downcast_ref::<CayenneTableProvider>().is_some()
+        || has_cayenne_accelerator_metadata(provider)
     {
         return true;
     }
 
-    if let Some(poly) = provider.as_any().downcast_ref::<PolyTableProvider>() {
+    if let Some(poly) = provider.downcast_ref::<PolyTableProvider>() {
         return is_cayenne_table_provider(poly.writer().as_ref())
             || is_cayenne_table_provider(poly.get_federated_table_provider().as_ref());
     }
 
-    if let Some(dedup) = provider.as_any().downcast_ref::<UpsertDedupTableProvider>() {
+    if let Some(dedup) = provider.downcast_ref::<UpsertDedupTableProvider>() {
         return is_cayenne_table_provider(dedup.inner().as_ref());
     }
 
@@ -1875,6 +1945,8 @@ mod tests {
         inlist_to_range.set_inlist_to_range(true);
         let mut semi_join_pushdown = CayenneOptimizerRules::none();
         semi_join_pushdown.set_semi_join_pushdown(true);
+        let mut join_reorder = CayenneOptimizerRules::none();
+        join_reorder.set_join_reorder(true);
         let mut dynamic_filter_sharing = CayenneOptimizerRules::none();
         dynamic_filter_sharing.set_dynamic_filter_sharing(true);
         let mut maintained_aggregate = CayenneOptimizerRules::none();
@@ -1905,6 +1977,7 @@ mod tests {
                 vec!["cayenne_push_down_semi_join"],
                 vec![],
             ),
+            (join_reorder, vec!["reorder_join"], vec![]),
             (
                 dynamic_filter_sharing,
                 vec![],
@@ -2171,6 +2244,22 @@ mod tests {
             reassociate_position < push_down_position,
             "Cayenne cross join reassociation must run before push_down_filter consumes the join tree shape"
         );
+        let reorder_position = rule_names
+            .iter()
+            .position(|name| *name == "reorder_join")
+            .expect("reorder_join rule should be registered (join_reorder is on by default)");
+        let optimize_projections_position = rule_names
+            .iter()
+            .position(|name| *name == "optimize_projections")
+            .expect("DataFusion optimize_projections rule should be registered");
+        assert!(
+            push_down_position < reorder_position,
+            "reorder_join must run AFTER push_down_filter so TableScan.filters are populated for cost-based join reordering"
+        );
+        assert!(
+            reorder_position < optimize_projections_position,
+            "reorder_join must run BEFORE optimize_projections, which inserts Projections between joins that fragment the reorderable join graph into opaque leaves"
+        );
         assert_eq!(
             rule_names
                 .iter()
@@ -2433,7 +2522,9 @@ mod tests {
             .optimizers()
             .iter()
             .map(|rule| rule.name().to_string())
-            .filter(|rule_name| rule_name.starts_with("cayenne_"))
+            // Cayenne-gated logical rules are `cayenne_*`, plus `reorder_join`
+            // (the join-reorder rule, which keeps its DataFusion-style name).
+            .filter(|rule_name| rule_name.starts_with("cayenne_") || rule_name == "reorder_join")
             .collect();
         let physical_rule_names = state
             .physical_optimizers()
@@ -2550,10 +2641,6 @@ mod tests {
     #[cfg(not(windows))]
     #[async_trait::async_trait]
     impl TableProvider for StatMemTable {
-        fn as_any(&self) -> &dyn std::any::Any {
-            self
-        }
-
         fn schema(&self) -> Arc<Schema> {
             self.inner.schema()
         }

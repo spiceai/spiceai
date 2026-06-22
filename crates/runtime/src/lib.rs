@@ -20,6 +20,7 @@ use ::tools::SpiceModelTool;
 use ::tools::rename::with_name;
 use async_stream::stream;
 use datafusion_expr::Expr;
+use datafusion_proto::bytes::Serializeable;
 use init::scheduler::ScheduleRegistry;
 use spicepod::component::runtime::TelemetryConfig;
 use std::collections::HashSet;
@@ -47,7 +48,6 @@ use crate::{auth::EndpointAuth, dataconnector::DataConnector};
 use ::datafusion::error::DataFusionError;
 use ::datafusion::sql::{ResolvedTableReference, TableReference, sqlparser};
 use app::App;
-use datafusion_proto::bytes::Serializeable;
 
 use {crate::Error::FailedToStartClusterExecutor, crate::config::ClusterRole};
 
@@ -807,7 +807,7 @@ impl Runtime {
             if let Some(current_partitions) = prospective.get_mut(&table_ref) {
                 for partition_bytes in partitions {
                     let partition_expr =
-                        Expr::from_bytes_with_registry(partition_bytes, self.df.ctx.as_ref())
+                        Expr::from_bytes_with_ctx(partition_bytes, &self.df.ctx.task_ctx())
                             .map_err(|source| {
                                 Error::UnableToDeserializeClusterPartitionExpression {
                                     table: table_name.clone(),
@@ -824,9 +824,9 @@ impl Runtime {
                 .resolve(SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA);
             let current_partitions = prospective.entry(table_ref.clone()).or_default();
             for partition_bytes in partitions {
-                let partition_expr = ::datafusion_expr::Expr::from_bytes_with_registry(
+                let partition_expr = ::datafusion_expr::Expr::from_bytes_with_ctx(
                     partition_bytes,
-                    self.df.ctx.as_ref(),
+                    &self.df.ctx.task_ctx(),
                 )
                 .map_err(|source| {
                     Error::UnableToDeserializeClusterPartitionExpression {

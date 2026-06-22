@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::{any::Any, fmt, sync::Arc};
+use std::{fmt, sync::Arc};
 
 use arrow::{
     array::{
@@ -187,10 +187,6 @@ impl ObjectStoreMetadataTable {
 
 #[async_trait]
 impl TableProvider for ObjectStoreMetadataTable {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     /// Schema of [`ObjectStoreMetadataTable`] defined in relation to [`object_store::ObjectMeta`].
     /// Must match the order and types of the fields in [`to_record_batch`].
     fn schema(&self) -> SchemaRef {
@@ -266,10 +262,6 @@ impl DisplayAs for ObjectStoreMetadataExec {
 impl ExecutionPlan for ObjectStoreMetadataExec {
     fn name(&self) -> &'static str {
         "ObjectStoreMetadataExec"
-    }
-
-    fn as_any(&self) -> &dyn Any {
-        self
     }
 
     fn schema(&self) -> SchemaRef {

@@ -57,7 +57,6 @@ limitations under the License.
 //! SELECT * FROM 's3://bucket/data/' WHERE year = '2024' AND month = '01'
 //! ```
 
-use std::any::Any;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, ToSocketAddrs};
 use std::sync::{Arc, Weak};
 
@@ -469,10 +468,6 @@ impl DynamicUrlSchemaProvider {
 
 #[async_trait]
 impl SchemaProvider for DynamicUrlSchemaProvider {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn table_names(&self) -> Vec<String> {
         self.inner.table_names()
     }
@@ -527,10 +522,6 @@ impl DynamicUrlCatalogProvider {
 }
 
 impl CatalogProvider for DynamicUrlCatalogProvider {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema_names(&self) -> Vec<String> {
         self.inner.schema_names()
     }
@@ -576,10 +567,6 @@ impl DynamicUrlCatalogList {
 }
 
 impl CatalogProviderList for DynamicUrlCatalogList {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn register_catalog(
         &self,
         name: String,
@@ -695,7 +682,7 @@ mod tests {
 
         // Verify it's a DynamicUrlCatalogProvider by checking it can be downcast
         let retrieved = retrieved.expect("catalog should exist");
-        assert!(retrieved.as_any().is::<DynamicUrlCatalogProvider>());
+        assert!(retrieved.is::<DynamicUrlCatalogProvider>());
     }
 
     #[test]
@@ -721,7 +708,7 @@ mod tests {
         assert!(retrieved.is_some());
 
         let retrieved = retrieved.expect("schema should exist");
-        assert!(retrieved.as_any().is::<DynamicUrlSchemaProvider>());
+        assert!(retrieved.is::<DynamicUrlSchemaProvider>());
     }
 
     #[tokio::test]

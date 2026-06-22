@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::{any::Any, fmt, sync::Arc};
+use std::{fmt, sync::Arc};
 
 use arrow::datatypes::SchemaRef;
 use datafusion::{
@@ -129,7 +129,7 @@ impl OracleExecPlan {
                 .sort_exprs
                 .iter()
                 .map(|sort| {
-                    let col = sort.expr.as_any().downcast_ref::<Column>().ok_or_else(|| {
+                    let col = sort.expr.downcast_ref::<Column>().ok_or_else(|| {
                         DataFusionError::Internal(
                             "Sort pushdown contains non-column expressions".to_string(),
                         )
@@ -196,10 +196,6 @@ impl ExecutionPlan for OracleExecPlan {
         "OracleExec"
     }
 
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema(&self) -> SchemaRef {
         Arc::clone(&self.projected_schema)
     }
@@ -244,7 +240,7 @@ impl ExecutionPlan for OracleExecPlan {
         order: &[PhysicalSortExpr],
     ) -> DataFusionResult<SortOrderPushdownResult<Arc<dyn ExecutionPlan>>> {
         for sort_expr in order {
-            if sort_expr.expr.as_any().downcast_ref::<Column>().is_none() {
+            if sort_expr.expr.downcast_ref::<Column>().is_none() {
                 return Ok(SortOrderPushdownResult::Unsupported);
             }
         }

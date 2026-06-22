@@ -964,20 +964,18 @@ fn try_decompose_struct_in_list(
 ) -> Option<vortex::expr::Expression> {
     use datafusion_common::ScalarValue;
 
-    let in_list = expr.as_any().downcast_ref::<phys_expr::InListExpr>()?;
+    let in_list = expr.downcast_ref::<phys_expr::InListExpr>()?;
 
     // Check that the value expression is struct(col1, col2, ...),
     // possibly wrapped in a CAST (DataFusion may insert type coercion).
     let value_expr: &dyn datafusion_physical_expr::PhysicalExpr = in_list.expr().as_ref();
-    let struct_fn = if let Some(sf) = value_expr
-        .as_any()
-        .downcast_ref::<datafusion_physical_expr::ScalarFunctionExpr>(
-    ) {
+    let struct_fn = if let Some(sf) =
+        value_expr.downcast_ref::<datafusion_physical_expr::ScalarFunctionExpr>()
+    {
         sf
-    } else if let Some(cast_expr) = value_expr.as_any().downcast_ref::<phys_expr::CastExpr>() {
+    } else if let Some(cast_expr) = value_expr.downcast_ref::<phys_expr::CastExpr>() {
         cast_expr
             .expr()
-            .as_any()
             .downcast_ref::<datafusion_physical_expr::ScalarFunctionExpr>()?
     } else {
         return None;
@@ -1008,7 +1006,7 @@ fn try_decompose_struct_in_list(
         .list()
         .iter()
         .filter_map(|elem| {
-            let literal = elem.as_any().downcast_ref::<phys_expr::Literal>()?;
+            let literal = elem.downcast_ref::<phys_expr::Literal>()?;
             let ScalarValue::Struct(struct_arr) = literal.value() else {
                 return None;
             };
@@ -1061,37 +1059,29 @@ fn try_decompose_struct_eq(
 ) -> Option<vortex::expr::Expression> {
     use datafusion_common::ScalarValue;
 
-    let bin_expr = expr
-        .as_any()
-        .downcast_ref::<datafusion_physical_expr::expressions::BinaryExpr>()?;
+    let bin_expr = expr.downcast_ref::<datafusion_physical_expr::expressions::BinaryExpr>()?;
     if *bin_expr.op() != datafusion_expr::Operator::Eq {
         return None;
     }
 
     // LHS must be struct(col1, col2, ...), possibly wrapped in CAST.
     let lhs: &dyn datafusion_physical_expr::PhysicalExpr = bin_expr.left().as_ref();
-    let struct_fn = if let Some(sf) = lhs
-        .as_any()
-        .downcast_ref::<datafusion_physical_expr::ScalarFunctionExpr>()
-    {
-        sf
-    } else if let Some(cast_expr) = lhs.as_any().downcast_ref::<phys_expr::CastExpr>() {
-        cast_expr
-            .expr()
-            .as_any()
-            .downcast_ref::<datafusion_physical_expr::ScalarFunctionExpr>()?
-    } else {
-        return None;
-    };
+    let struct_fn =
+        if let Some(sf) = lhs.downcast_ref::<datafusion_physical_expr::ScalarFunctionExpr>() {
+            sf
+        } else if let Some(cast_expr) = lhs.downcast_ref::<phys_expr::CastExpr>() {
+            cast_expr
+                .expr()
+                .downcast_ref::<datafusion_physical_expr::ScalarFunctionExpr>()?
+        } else {
+            return None;
+        };
     if struct_fn.name() != "struct" {
         return None;
     }
 
     // RHS must be a struct literal.
-    let rhs_literal = bin_expr
-        .right()
-        .as_any()
-        .downcast_ref::<phys_expr::Literal>()?;
+    let rhs_literal = bin_expr.right().downcast_ref::<phys_expr::Literal>()?;
     let ScalarValue::Struct(struct_arr) = rhs_literal.value() else {
         return None;
     };

@@ -19,6 +19,7 @@ async-trait.workspace = true
 datafusion.workspace = true
 datafusion-datasource.workspace = true
 futures.workspace = true
+half = "2"
 blake3 = { workspace = true, optional = true }
 llms = { path = "../llms", default-features = false, optional = true }
 reqwest = { workspace = true, optional = true }
