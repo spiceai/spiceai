@@ -478,7 +478,7 @@ impl Query {
             tracing::debug!("Background revalidation: re-executing query with existing plan");
             let input_tables = cache::get_logical_plan_input_tables(&logical_plan);
             (
-                super::Query::from_logical_plan(df, &logical_plan),
+                super::Query::from_logical_plan(df, logical_plan),
                 input_tables,
             )
         } else {

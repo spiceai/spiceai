@@ -16,7 +16,7 @@ limitations under the License.
 
 use std::sync::Arc;
 
-use crate::embeddings::table::EmbeddingTable;
+use runtime_search::embeddings::table::EmbeddingTable;
 use arrow_schema::SchemaRef;
 use datafusion::{
     datasource::TableProvider, error::Result, execution::context::SessionContext,

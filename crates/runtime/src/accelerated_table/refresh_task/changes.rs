@@ -55,6 +55,7 @@ use futures::{StreamExt, stream};
 use opentelemetry::KeyValue;
 use runtime_datafusion::execution_plan::schema_cast::SchemaCastScanExec;
 use runtime_datafusion_index::IndexedTableProvider;
+use runtime_search::embeddings::table::EmbeddingTable;
 use runtime_table_partition::provider::PartitionTableProvider;
 #[cfg(test)]
 use snafu::OptionExt;
@@ -2519,9 +2520,7 @@ async fn delete_matching_rows_from_arrow_provider(
         .await;
     }
 
-    if let Some(embedding_table) =
-        provider.downcast_ref::<crate::embeddings::table::EmbeddingTable>()
-    {
+    if let Some(embedding_table) = provider.downcast_ref::<EmbeddingTable>() {
         return Box::pin(delete_matching_rows_from_arrow_provider(
             embedding_table.get_underlying_ref(),
             rows,
@@ -2578,9 +2577,7 @@ async fn perform_change_write_maintenance(
         .await;
     }
 
-    if let Some(embedding_table) =
-        provider.downcast_ref::<crate::embeddings::table::EmbeddingTable>()
-    {
+    if let Some(embedding_table) = provider.downcast_ref::<EmbeddingTable>() {
         return Box::pin(perform_change_write_maintenance(
             embedding_table.get_underlying_ref(),
         ))

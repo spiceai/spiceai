@@ -20,7 +20,7 @@ use crate::datafusion::DataFusion;
 use crate::datafusion::request_context_extension::DataFusionContextExtension;
 use crate::model::ModelContextLayer;
 use crate::request::DatabricksAuthExtension;
-use crate::{search::search_engine, status::RuntimeStatus};
+use crate::status::RuntimeStatus;
 
 use crate::Runtime;
 use crate::cluster::ExecutorRegistry;
@@ -33,7 +33,7 @@ use crate::http::v1::{
 use runtime_request_context::{Protocol, RequestContext};
 
 #[cfg(feature = "mcp")]
-use crate::tools::mcp::server::RuntimeServer;
+use runtime_tools::mcp::server::RuntimeServer;
 use app::App;
 use axum::{extract::State, routing::patch};
 use http::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE};
@@ -315,7 +315,11 @@ const HEALTH_REQUEST_BODY_LIMIT: usize = 128 * 1024; // 128 KiB
 pub(crate) fn routes(
     rt: &Arc<Runtime>,
     config: Arc<config::Config>,
-    search: Arc<search_engine::SearchEngine>,
+    search: Arc<
+        runtime_search::search_engine::SearchEngine<
+            crate::search::util::RuntimeTableProviderExplorer,
+        >,
+    >,
     auth_layer: Option<AuthLayer>,
     cors_config: &CorsConfig,
     #[cfg(feature = "mcp")] mcp_config: Option<&McpConfig>,
@@ -458,7 +462,7 @@ pub(crate) fn routes(
         let runtime_arc = Arc::clone(rt);
         let mcp_config = mcp_server_config(mcp_config);
         let mcp_service = StreamableHttpService::new(
-            move || Ok(RuntimeServer::from(&runtime_arc)),
+            move || Ok(RuntimeServer::new(Arc::clone(&runtime_arc.tools))),
             Arc::new(LocalSessionManager::default()),
             mcp_config,
         );
