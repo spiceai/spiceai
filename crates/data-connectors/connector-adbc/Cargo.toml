@@ -30,14 +30,15 @@ data_components = { path = "../../data_components", features = ["adbc"] }
 datafusion.workspace = true
 datafusion-table-providers = { workspace = true, features = ["adbc-federation"] }
 futures.workspace = true
-linkme.workspace = true
 parking_lot.workspace = true
-paste.workspace = true
 runtime = { path = "../../runtime" }
 sha2.workspace = true
 snafu.workspace = true
 tokio.workspace = true
 tracing.workspace = true
+
+[dev-dependencies]
+app = { path = "../../app" }
 
 [features]
 default = []

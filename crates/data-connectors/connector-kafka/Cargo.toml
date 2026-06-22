@@ -15,12 +15,11 @@ dataformat-json = { path = "../../dataformat-json" }
 datafusion.workspace = true
 fundu.workspace = true
 futures.workspace = true
-linkme.workspace = true
 opentelemetry.workspace = true
-paste.workspace = true
 runtime = { path = "../../runtime" }
 secrecy.workspace = true
 serde.workspace = true
+serde_json.workspace = true
 snafu.workspace = true
 tokio.workspace = true
 tonic.workspace = true

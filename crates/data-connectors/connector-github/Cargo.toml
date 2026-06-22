@@ -30,10 +30,9 @@ datafusion.workspace = true
 globset.workspace = true
 governor.workspace = true
 graphql-parser.workspace = true
-linkme.workspace = true
-paste.workspace = true
 reqwest.workspace = true
 runtime = { path = "../../runtime" }
+util = { path = "../../util" }
 runtime-rate-control = { path = "../../runtime-rate-control" }
 secrecy.workspace = true
 snafu.workspace = true
@@ -41,6 +40,9 @@ token_provider = { path = "../../token_provider" }
 tokio.workspace = true
 tracing.workspace = true
 url.workspace = true
+
+[dev-dependencies]
+app = { path = "../../app" }
 
 [features]
 default = []
