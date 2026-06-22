@@ -112,7 +112,9 @@ arrow-json = "58.0.0"
 arrow-odbc = "22" # crates.io 22+ accepts arrow ">=29, <59" so it resolves to the workspace Arrow 58 (the prior git pin v21 was capped at arrow <58, which forced a separate Arrow-57 subtree + an IPC bridge)
 arrow-row = "58.0.0"
 arrow-schema = "58.0.0"
-async-openai = { git = "https://github.com/spiceai/async-openai", rev = "98e0c53be444e2427177cc77554d70813913d775", features = [
+# Pinned to spiceai/async-openai#36 (adds `reasoning_content` to ChatCompletionResponseMessage).
+# Refresh to the merged commit on the `spiceai` branch once that PR lands.
+async-openai = { git = "https://github.com/spiceai/async-openai", rev = "8bf53e63b4704f81b025213dfd9cde4d1ac5c7e0", features = [
     "byot",
     "embedding",
     "chat-completion",

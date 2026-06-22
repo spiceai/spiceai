@@ -22,7 +22,7 @@ runtime:
     enabled: false
 
 postgres_connection_params: &postgres_params
-  pg_host: 127.0.0.1
+  pg_host: ${env:CHBENCH_PG_HOST}
   pg_port: '5432'
   pg_db: chbench
   pg_user: bench
@@ -54,7 +54,7 @@ datasets:
         cayenne_file_path: .spice/cayenne/district
         # Explicit: the engine default flipped to `memory`. This pod IS the
         # file-durability variant (per-batch durable persist before the slot
-        # ack) — its identity must not depend on the build's default. The
+        # ack) — its identity must not depend on the build's default.
         cayenne_cdc_durability: file
         # KEY deletes even in file mode: deletion_mode auto resolves to
         # position, which serializes compaction with writers (try_lock

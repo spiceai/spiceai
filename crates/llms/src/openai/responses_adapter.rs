@@ -548,6 +548,7 @@ fn chat_message_from_response_output(output: Vec<OutputItem>) -> ChatCompletionR
     }
 
     ChatCompletionResponseMessage {
+        reasoning_content: None,
         content: (!text_parts.is_empty()).then(|| text_parts.join("\n")),
         refusal: (!refusal_parts.is_empty()).then(|| refusal_parts.join("\n")),
         tool_calls: (!tool_calls.is_empty()).then_some(tool_calls),
