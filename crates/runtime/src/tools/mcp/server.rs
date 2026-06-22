@@ -118,6 +118,21 @@ impl ServerHandler for RuntimeServer {
                 // model-driven tool calls (see `McpToolWrapper::call`). Without
                 // this, gateway tool calls bypass the task_history span entirely.
                 let input = serde_json::to_string(&arguments).unwrap_or_default();
+
+                // Security: Validate serialized argument size to prevent DoS,
+                // matching the non-proxy path below. `/v1/mcp` is externally
+                // accessible, so reject oversized payloads before logging them
+                // to task history or forwarding them upstream.
+                if input.len() > MAX_ARGS_SIZE {
+                    return Err(McpError::invalid_params(
+                        format!(
+                            "Arguments too large ({} bytes). Maximum: {MAX_ARGS_SIZE} bytes",
+                            input.len()
+                        ),
+                        None,
+                    ));
+                }
+
                 let task_name = format!("tool_use::{tool_name}");
                 let mcp_server = tool_name
                     .split_once('/')
