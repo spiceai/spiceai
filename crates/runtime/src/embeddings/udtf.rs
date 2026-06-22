@@ -1134,7 +1134,6 @@ fn parse_column_limit_score<'a>(
 #[cfg(test)]
 mod tests {
     use super::{VectorSearchTableFunc, VectorSearchTableFuncArgs};
-    use runtime_search::udtf::closest_column;
     use crate::embeddings::udtf::VectorSearchUDTFProvider;
     use crate::model::EmbeddingModelStore;
     use arrow::datatypes::{DataType, Field, Schema};
@@ -1147,6 +1146,7 @@ mod tests {
     use datafusion_expr::TableProviderFilterPushDown;
     use datafusion_expr::expr::ScalarFunction;
     use datafusion_expr::{col, lit};
+    use runtime_search::udtf::closest_column;
     use search::SEARCH_SCORE_COLUMN_NAME;
     use std::collections::BTreeMap;
     use std::collections::HashMap;

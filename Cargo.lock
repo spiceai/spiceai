@@ -16595,7 +16595,6 @@ dependencies = [
  "llms",
  "moka",
  "rayon",
- "runtime-datafusion",
  "runtime-datafusion-index",
  "runtime-datafusion-udfs",
  "runtime-proto",

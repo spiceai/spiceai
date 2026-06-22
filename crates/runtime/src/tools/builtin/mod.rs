@@ -20,6 +20,9 @@ pub mod get_readiness;
 mod tests {
     //! Read/write gating for the built-in [`runtime_tools::builtin::sql::SqlTool`] tool.
     //!
+    //! These tests live in `runtime` (not `runtime-tools`) because they exercise `SqlTool`
+    //! against the full [`DataFusion`] backend.
+    //!
     //! The tool defers its read-only posture to the calling principal's
     //! `read_write` group (the same gate `/v1/sql` and `function_tool`
     //! use). These tests exercise the three cases that matter:
@@ -40,9 +43,9 @@ mod tests {
     use data_components::arrow::write::MemTable;
     use datafusion::sql::TableReference;
     use runtime_auth::{AuthPrincipalRef, AuthRequestContext};
+    use runtime_query_engine::query_engine::QueryEngine;
     use runtime_request_context::{Protocol, RequestContext};
     use runtime_tools::builtin::sql::SqlTool;
-    use runtime_query_engine::query_engine::QueryEngine;
     use spicepod::component::runtime::ApiKey;
     use std::sync::Arc;
     use tokio::runtime::Handle;

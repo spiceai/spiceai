@@ -40,7 +40,6 @@ use datafusion::{
 use datafusion_table_providers::util::column_reference::ColumnReference;
 use futures::{StreamExt, TryStreamExt};
 use itertools::Itertools;
-use runtime_query_engine::allowlist::ResolvedTableAwareAllowlist;
 use runtime_datafusion_index::IndexedTableProvider;
 #[cfg(test)]
 use runtime_datafusion_udfs::{
@@ -52,6 +51,7 @@ use runtime_datafusion_udfs::{
     l2_norm::L2_NORM_UDF_NAME,
     truncate::TRUNCATE_SCALAR_UDF_NAME,
 };
+use runtime_query_engine::allowlist::ResolvedTableAwareAllowlist;
 use runtime_request_context::RequestContext;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -76,10 +76,10 @@ use crate::{
 };
 use runtime_query_engine::query_engine::QueryEngine;
 use runtime_search::{
-    embeddings::table::{EmbeddingInputMode, EmbeddingTable},
+    embeddings::table::EmbeddingTable,
     rerank::RERANK_UDTF_NAME,
     rrf::RRF_UDF_NAME,
-    udtf::{TEXT_SEARCH_UDTF_NAME, VECTOR_SEARCH_UDTF_NAME},
+    udtf::{EmbeddingInputMode, TEXT_SEARCH_UDTF_NAME, VECTOR_SEARCH_UDTF_NAME},
 };
 use runtime_tools::builtin::{
     sample::{
@@ -1214,11 +1214,8 @@ async fn sample_context_blocks(
                     sample_context_method_order(&method),
                 );
                 let content = tool_context_text(
-                    &SampleDataTool::new(
-                        rt.datafusion() as Arc<dyn QueryEngine>,
-                        method.clone(),
-                    )
-                    .with_table_allowlist(allowlist),
+                    &SampleDataTool::new(rt.datafusion() as Arc<dyn QueryEngine>, method.clone())
+                        .with_table_allowlist(allowlist),
                     &params,
                 )
                 .instrument(Span::current())

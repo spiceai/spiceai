@@ -35,6 +35,9 @@ use datafusion::sql::TableReference;
 use crate::query_engine::{Error, QueryEngine, QueryRequest, Result, UpdateType};
 
 /// A [`QueryEngine`] backed directly by a [`SessionContext`].
+///
+/// It is mainly useful for unit tests or basic integration tests that cannot depend on the
+/// `runtime` crate.
 pub struct QuerySession {
     ctx: Arc<SessionContext>,
 }

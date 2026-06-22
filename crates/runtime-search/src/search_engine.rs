@@ -67,7 +67,6 @@ use tracing::{Instrument, Span};
 use crate::request::SearchRequest;
 use crate::types::VectorSearchResult;
 
-
 /// A Component that can perform search operations.
 pub struct SearchEngine<E: TableProviderExplorer> {
     pub df: Arc<dyn QueryEngine>,

@@ -35,6 +35,11 @@ use datafusion::logical_expr::ScalarUDF;
 use datafusion::prelude::SessionContext;
 use datafusion_table_providers::util::supported_functions::{FunctionRestriction, FunctionSupport};
 use parking_lot::RwLock;
+#[cfg(feature = "models")]
+use runtime_datafusion_udfs::{
+    ai::{AI_UDF_NAME, Ai},
+    embed::{self, EMBED_UDF_NAME},
+};
 use runtime_query_engine::query_engine::QueryEngine;
 use runtime_search::full_text_udtf::TextSearchTableFunc;
 use runtime_search::rerank::{RERANK_UDTF_NAME, RerankTableFunc};
@@ -42,11 +47,6 @@ use runtime_search::rrf;
 use runtime_search::rrf::RRF_UDF_NAME;
 use runtime_search::search_engine::parse_explicit_primary_keys;
 use runtime_search::udtf::{TEXT_SEARCH_UDTF_NAME, VECTOR_SEARCH_UDTF_NAME};
-#[cfg(feature = "models")]
-use runtime_datafusion_udfs::{
-    ai::{AI_UDF_NAME, Ai},
-    embed::{self, EMBED_UDF_NAME},
-};
 use runtime_secrets::{ExposeSecret, get_params_with_secrets};
 #[cfg(not(feature = "models"))]
 const EMBED_UDF_NAME: &str = "embed";

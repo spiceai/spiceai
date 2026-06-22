@@ -41,7 +41,7 @@ uuid.workspace = true
 tracing.workspace = true
 tracing-futures.workspace = true
 url.workspace = true
-utoipa = { version = "5", optional = true }
+utoipa = { workspace = true, optional = true }
 util = { path = "../util" }
 
 [features]

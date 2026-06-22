@@ -53,11 +53,11 @@ use crate::schema_evolution::{
     dataset_constraint_columns, engine_supports_in_place_evolution, evolution_allowed,
     reorder_to_checkpoint_order, restrict_schema_to, schema_evolution_labels, widening_plan_kind,
 };
-use runtime_search::udtf::TEXT_SEARCH_UDTF_NAME;
 use crate::secrets::Secrets;
 use crate::tracing_util::view_registered_trace;
 use crate::view::prepare_view;
 use crate::{status, view};
+use runtime_search::udtf::TEXT_SEARCH_UDTF_NAME;
 
 use snafu::ResultExt;
 use {
@@ -115,8 +115,8 @@ use runtime_acceleration::snapshot::AccelerationLayout;
 use runtime_acceleration::snapshot::SnapshotManager;
 use runtime_async::ManagedTokioRuntime;
 use runtime_datafusion::schema_provider::SpiceSchemaProvider;
-use runtime_query_engine::query_engine::Error as QueryEngineError;
 use runtime_datafusion_index::IndexedTableProvider;
+use runtime_query_engine::query_engine::Error as QueryEngineError;
 use runtime_table_partition::provider::PartitionTableProvider;
 use schema::ensure_schema_exists;
 use snafu::prelude::*;
@@ -4199,13 +4199,13 @@ impl runtime_query_engine::query_engine::QueryEngine for DataFusion {
         if let Some(allowlist) = request.table_allowlist {
             qb = qb.allow_tables(allowlist);
         }
-        let QueryResult { data, .. } = qb
-            .build()
-            .run()
-            .await
-            .map_err(|e| QueryEngineError::QueryExecution {
-                source: DataFusionError::External(Box::new(e)),
-            })?;
+        let QueryResult { data, .. } =
+            qb.build()
+                .run()
+                .await
+                .map_err(|e| QueryEngineError::QueryExecution {
+                    source: DataFusionError::External(Box::new(e)),
+                })?;
         Ok(data)
     }
 

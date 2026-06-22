@@ -26,7 +26,6 @@ datafusion-functions-json = { workspace = true }
 futures.workspace = true
 itertools.workspace = true
 llms = { path = "../llms", default-features = false }
-runtime-datafusion = { path = "../runtime-datafusion" }
 runtime-datafusion-index = { path = "../runtime-datafusion-index" }
 runtime-datafusion-udfs = { path = "../runtime-datafusion-udfs" }
 runtime-proto = { path = "../runtime-proto" }
@@ -38,12 +37,12 @@ serde_json.workspace = true
 search = { path = "../search", default-features = false, features = ["text_search"] }
 snafu.workspace = true
 spicepod = { path = "../spicepod" }
-rayon = "1.11.0"
+rayon = { workspace = true }
 moka.workspace = true
 telemetry = { path = "../telemetry" }
 tokio.workspace = true
 tonic.workspace = true
-utoipa = { version = "5", optional = true }
+utoipa = { workspace = true, optional = true }
 util = { path = "../util" }
 tracing.workspace = true
 
