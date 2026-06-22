@@ -1411,7 +1411,6 @@ mod tests {
     use datafusion::common::{JoinType, NullEquality};
     use datafusion::config::ConfigOptions;
     use datafusion::datasource::memory::MemorySourceConfig;
-    use datafusion::execution::TaskContext;
     use datafusion::execution::object_store::ObjectStoreUrl;
     use datafusion::physical_expr::aggregate::AggregateExprBuilder;
     use datafusion::physical_optimizer::PhysicalOptimizerRule;
