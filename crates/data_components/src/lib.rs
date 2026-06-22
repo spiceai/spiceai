@@ -110,6 +110,8 @@ pub const INFERRED_COLUMN_STATS_METADATA_KEY: &str = "spice.inferred_column_stat
 pub type FieldMetadata = HashMap<String, HashMap<String, String>>;
 
 pub mod arrow;
+#[cfg(feature = "adbc")]
+pub mod adbc_helpers;
 #[cfg(feature = "clickhouse")]
 pub mod clickhouse;
 #[cfg(feature = "cosmosdb")]

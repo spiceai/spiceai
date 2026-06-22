@@ -4093,6 +4093,7 @@ dependencies = [
  "parking_lot 0.12.5",
  "paste",
  "runtime",
+ "sha2 0.10.9",
  "snafu",
  "tokio",
  "tracing",
@@ -4330,22 +4331,7 @@ dependencies = [
 name = "connector-glue"
 version = "2.1.0-unstable"
 dependencies = [
- "async-trait",
- "aws-config",
- "aws-credential-types",
- "aws-sdk-glue",
- "aws-sdk-s3",
- "datafusion",
- "iceberg",
- "iceberg-catalog-glue",
- "iceberg-datafusion",
- "iceberg-storage-opendal",
- "linkme",
- "paste",
  "runtime",
- "secrecy",
- "snafu",
- "tokio",
 ]
 
 [[package]]
@@ -4608,7 +4594,14 @@ dependencies = [
 name = "connector-snowflake-native"
 version = "2.1.0-unstable"
 dependencies = [
- "connector-snowflake",
+ "async-trait",
+ "data_components",
+ "datafusion",
+ "datafusion-table-providers",
+ "db_connection_pool",
+ "runtime",
+ "snafu",
+ "snowflake-api",
 ]
 
 [[package]]
@@ -4629,23 +4622,7 @@ dependencies = [
 name = "connector-spiceai"
 version = "2.1.0-unstable"
 dependencies = [
- "arrow-flight",
- "async-stream",
- "async-trait",
- "data_components",
- "datafusion",
- "datafusion-federation",
- "flight_client",
- "futures",
- "linkme",
- "ns_lookup",
- "paste",
  "runtime",
- "secrecy",
- "snafu",
- "spice-cloud-client",
- "tonic",
- "tracing",
 ]
 
 [[package]]
@@ -5616,6 +5593,8 @@ checksum = "a4ae5f15dda3c708c0ade84bfee31ccab44a3da4f88015ed22f63732abe300c8"
 name = "data_components"
 version = "2.1.0-unstable"
 dependencies = [
+ "adbc_core",
+ "adbc_driver_manager",
  "ahash 0.8.12",
  "arrow",
  "arrow-array",
@@ -18496,6 +18475,7 @@ dependencies = [
  "app",
  "clap",
  "connector-abfs",
+ "connector-adbc",
  "connector-clickhouse",
  "connector-cosmosdb",
  "connector-databricks",
@@ -18509,8 +18489,10 @@ dependencies = [
  "connector-gcs",
  "connector-git",
  "connector-github",
+ "connector-glue",
  "connector-graphql",
  "connector-imap",
+ "connector-kafka",
  "connector-mongodb",
  "connector-mssql",
  "connector-mysql",
@@ -20044,11 +20026,16 @@ checksum = "1f3ccbac311fea05f86f61904b462b55fb3df8837a366dfc601a0161d0532f20"
 name = "token_provider"
 version = "2.1.0-unstable"
 dependencies = [
+ "chrono",
+ "jsonwebtoken 10.4.0",
+ "reqwest 0.12.24",
  "secrecy",
+ "serde",
  "sha2 0.10.9",
  "snafu",
  "tokio",
  "tracing",
+ "util",
 ]
 
 [[package]]

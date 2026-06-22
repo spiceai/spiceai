@@ -15,7 +15,7 @@ limitations under the License.
 */
 
 use crate::pull_requests::PullRequestCommentType;
-use runtime::token_providers::github_app_token::GitHubAppTokenProvider;
+use token_provider::github_app_token::GitHubAppTokenProvider;
 use runtime::component::dataset::Dataset;
 use crate::members::MembersTableArgs;
 use arrow::array::{Array, RecordBatch};

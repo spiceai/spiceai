@@ -151,8 +151,8 @@ macro_rules! register_data_connector {
 
 // abfs: moved to crates/data-connectors/connector-abfs
 // #[deprecated] pub mod abfs;
-#[cfg(feature = "adbc")]
-pub mod adbc;
+// adbc: moved to crates/data-connectors/connector-adbc
+// #[cfg(feature = "adbc")] pub mod adbc;
 // cosmosdb: moved to crates/data-connectors/connector-cosmosdb
 // #[cfg(feature = "cosmosdb")] pub mod cosmosdb;
 #[cfg(feature = "debezium")]
@@ -164,6 +164,7 @@ pub mod file;
 // git: moved to crates/data-connectors/connector-git
 // github: moved to crates/data-connectors/connector-github
 pub mod https;
+// kafka connector moved to crates/data-connectors/connector-kafka; module kept for debezium sidecar types
 #[cfg(feature = "kafka")]
 pub mod kafka;
 pub mod localpod;
@@ -173,13 +174,15 @@ pub const ODBC_DATACONNECTOR: &str = "odbc"; // const needs to be accessible whe
 pub mod deferred;
 // ducklake: moved to crates/data-connectors/connector-ducklake
 // gcs: moved to crates/data-connectors/connector-gcs
-// glue: moved to crates/data-connectors/connector-glue
+// glue: registration moved to crates/data-connectors/connector-glue; module kept for catalog connector
+pub mod glue;
 pub mod iceberg;
 pub mod iceberg_cluster;
 pub mod parameters;
 pub mod s3;
 pub mod sink;
-// spiceai: moved to crates/data-connectors/connector-spiceai
+// spiceai: registration moved to crates/data-connectors/connector-spiceai; module kept for catalog connector
+pub mod spiceai;
 
 #[derive(Debug, Snafu)]
 pub enum DataConnectorError {

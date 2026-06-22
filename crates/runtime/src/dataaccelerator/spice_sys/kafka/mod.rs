@@ -37,10 +37,8 @@ use datafusion::arrow::datatypes::{Schema, SchemaRef};
 use super::{
     AccelerationConnection, Error, Result, acceleration_connection, offsets::OffsetSchemaState,
 };
-use crate::{
-    component::dataset::Dataset, dataaccelerator::spice_sys::OpenOption,
-    dataconnector::kafka::KafkaMetadata,
-};
+use crate::{component::dataset::Dataset, dataaccelerator::spice_sys::OpenOption};
+pub(super) use data_components::kafka::KafkaMetadata;
 use data_components::kafka::KafkaOffset;
 
 const KAFKA_TABLE_NAME: &str = "spice_sys_kafka";

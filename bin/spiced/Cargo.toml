@@ -12,6 +12,8 @@ version.workspace = true
 app = { path = "../../crates/app" }
 clap = { workspace = true, features = ["derive"] }
 connector-abfs = { path = "../../crates/data-connectors/connector-abfs" }
+connector-adbc = { path = "../../crates/data-connectors/connector-adbc", optional = true }
+connector-kafka = { path = "../../crates/data-connectors/connector-kafka", optional = true }
 connector-clickhouse = { path = "../../crates/data-connectors/connector-clickhouse", optional = true }
 connector-cosmosdb = { path = "../../crates/data-connectors/connector-cosmosdb", optional = true }
 connector-databricks = { path = "../../crates/data-connectors/connector-databricks", optional = true }
@@ -76,7 +78,7 @@ util = { path = "../../crates/util"}
 
 # Non-default features should be added to `lint-rust` make target.
 [features]
-adbc = ["runtime/adbc"]
+adbc = ["dep:connector-adbc", "runtime/adbc"]
 alloc-jemalloc = ["dep:tikv-jemallocator"]
 alloc-mimalloc = ["dep:mimalloc"]
 alloc-snmalloc = []
@@ -141,7 +143,7 @@ wasm-functions = ["runtime/wasm-functions"]
 wasm-functions-compile = ["runtime/wasm-functions-compile"]
 iceberg-write = ["runtime/iceberg-write"]
 imap = ["connector-imap", "runtime/imap"]
-kafka = ["runtime/kafka"]
+kafka = ["dep:connector-kafka", "runtime/kafka"]
 keyring-secret-store = ["runtime/keyring-secret-store"]
 mcp = ["runtime/mcp"]
 metal = ["runtime/metal"]

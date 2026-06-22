@@ -23,7 +23,6 @@ use data_components::{
 use dataformat_json::{SpiceJsonOptions, unnest_struct_schema};
 use datafusion::catalog::TableProvider;
 use futures::StreamExt;
-use serde::{Deserialize, Serialize};
 use snafu::prelude::*;
 use std::time::Duration;
 use std::{any::Any, pin::Pin, sync::Arc};
@@ -517,14 +516,7 @@ async fn init_kafka_consumer(
     Ok((kafka_consumer, metadata.schema))
 }
 
-#[derive(Serialize, Deserialize)]
-pub(crate) struct KafkaMetadata {
-    pub(crate) consumer_group_id: String,
-    pub(crate) topic: String,
-    pub(crate) schema: SchemaRef,
-    #[serde(default)]
-    pub(crate) offsets: Vec<KafkaOffset>,
-}
+pub(crate) use data_components::kafka::KafkaMetadata;
 
 async fn get_metadata_from_accelerator(
     kafka_sys: &KafkaSys,
@@ -771,5 +763,3 @@ impl MetricsProvider for KafkaMetricsProvider {
         }
     }
 }
-
-register_data_connector!("kafka", KafkaFactory);
