@@ -688,10 +688,16 @@ fn try_rewrite_oversized_join(
         return Ok(None);
     };
 
-    let left: Arc<dyn ExecutionPlan> =
-        Arc::new(SortExec::new(left_ordering, Arc::clone(hash_join.left())));
-    let right: Arc<dyn ExecutionPlan> =
-        Arc::new(SortExec::new(right_ordering, Arc::clone(hash_join.right())));
+    // Preserve the input partitioning. This rule runs AFTER `EnforceDistribution`,
+    // so a `mode=Partitioned` `HashJoinExec` already has both inputs hash-
+    // partitioned on the join keys into N partitions;
+    let left: Arc<dyn ExecutionPlan> = Arc::new(
+        SortExec::new(left_ordering, Arc::clone(hash_join.left())).with_preserve_partitioning(true),
+    );
+    let right: Arc<dyn ExecutionPlan> = Arc::new(
+        SortExec::new(right_ordering, Arc::clone(hash_join.right()))
+            .with_preserve_partitioning(true),
+    );
 
     let join = SortMergeJoinExec::try_new(
         left,
@@ -1405,14 +1411,17 @@ mod tests {
     use datafusion::common::{JoinType, NullEquality};
     use datafusion::config::ConfigOptions;
     use datafusion::datasource::memory::MemorySourceConfig;
+    use datafusion::execution::TaskContext;
     use datafusion::execution::object_store::ObjectStoreUrl;
     use datafusion::physical_expr::aggregate::AggregateExprBuilder;
     use datafusion::physical_optimizer::PhysicalOptimizerRule;
+    use datafusion::physical_plan::Partitioning;
     use datafusion::physical_plan::aggregates::{AggregateExec, AggregateMode, PhysicalGroupBy};
     use datafusion::physical_plan::joins::{HashJoinExec, PartitionMode, SortMergeJoinExec};
+    use datafusion::physical_plan::repartition::RepartitionExec;
     use datafusion::physical_plan::sorts::sort::SortExec;
     use datafusion::physical_plan::union::UnionExec;
-    use datafusion::physical_plan::{ExecutionPlan, displayable};
+    use datafusion::physical_plan::{ExecutionPlan, ExecutionPlanProperties, displayable};
     use datafusion_common::stats::Precision;
     use datafusion_common::{DataFusionError, Result as DFResult, Statistics};
     use datafusion_datasource::file::FileSource;
@@ -2167,6 +2176,100 @@ mod tests {
         assert!(
             sort_merge.right().downcast_ref::<SortExec>().is_some(),
             "right anti-join input should be explicitly sorted"
+        );
+    }
+
+    fn hash_repartition(
+        input: Arc<dyn ExecutionPlan>,
+        column: &str,
+        partitions: usize,
+    ) -> Arc<dyn ExecutionPlan> {
+        let expr = col(column, input.schema().as_ref()).expect("repartition column should exist");
+        Arc::new(
+            RepartitionExec::try_new(input, Partitioning::Hash(vec![expr], partitions))
+                .expect("repartition should be valid"),
+        )
+    }
+
+    /// When the rewriter replaces an inner semi/anti join that sits
+    /// under a `mode=Partitioned` `HashJoinExec`, the replacement must keep the
+    /// same output partition count — otherwise the `SortExec`-coalesced
+    /// `SortMergeJoinExec` (1 partition) feeds a parent that still expects N,
+    /// and the join's runtime sanity check fails at `execute()`.
+    #[test]
+    fn rewrite_under_partitioned_parent_preserves_partition_count() {
+        let schema = order_line_schema();
+        let partitions = 4usize;
+
+        // Inner `EXISTS` (LeftSemi) join over same-source large scans, hash-
+        // partitioned to N — a valid `mode=Partitioned` join emitting N
+        // partitions, mirroring the EnforceDistribution'd TPC-H q21 plan.
+        let semi: Arc<dyn ExecutionPlan> = Arc::new(hash_join_with_join_type(
+            hash_repartition(
+                large_exact_cayenne_file_exec(&schema, "order_line.vortex"),
+                "order_id",
+                partitions,
+            ),
+            hash_repartition(
+                large_exact_cayenne_file_exec(&schema, "order_line.vortex"),
+                "order_id",
+                partitions,
+            ),
+            "order_id",
+            "order_id",
+            JoinType::LeftSemi,
+            NullEquality::NullEqualsNothing,
+        ));
+
+        // Parent `NOT EXISTS` (LeftAnti) join consuming the semi join on its
+        // build side. Its build side is a join (no exact row stats), so the
+        // rewriter leaves it a `HashJoinExec(mode=Partitioned)`.
+        let probe = hash_repartition(
+            large_exact_cayenne_file_exec(&schema, "order_line.vortex"),
+            "order_id",
+            partitions,
+        );
+        let parent: Arc<dyn ExecutionPlan> = Arc::new(hash_join_with_join_type(
+            semi,
+            probe,
+            "order_id",
+            "order_id",
+            JoinType::LeftAnti,
+            NullEquality::NullEqualsNothing,
+        ));
+
+        // Precondition: before the rewrite both parent inputs emit N partitions.
+        let parent_hj = parent
+            .downcast_ref::<HashJoinExec>()
+            .expect("parent should be a hash join");
+        assert_eq!(
+            parent_hj.left().output_partitioning().partition_count(),
+            partitions,
+        );
+        assert_eq!(
+            parent_hj.right().output_partitioning().partition_count(),
+            partitions,
+        );
+
+        let optimized = optimize_anti_join_sort_merge(parent);
+
+        let parent_hj = optimized
+            .downcast_ref::<HashJoinExec>()
+            .expect("parent NOT-EXISTS join must remain a HashJoinExec");
+        assert!(
+            parent_hj
+                .left()
+                .downcast_ref::<SortMergeJoinExec>()
+                .is_some(),
+            "inner EXISTS join should have been rewritten to a SortMergeJoinExec",
+        );
+
+        let left_partitions = parent_hj.left().output_partitioning().partition_count();
+        let right_partitions = parent_hj.right().output_partitioning().partition_count();
+        assert_eq!(
+            left_partitions, right_partitions,
+            "rewrite must preserve the build-side partition count under a mode=Partitioned parent \
+             (got {left_partitions} != {right_partitions})",
         );
     }
 
