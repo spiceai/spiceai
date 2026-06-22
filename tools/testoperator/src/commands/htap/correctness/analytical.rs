@@ -35,6 +35,37 @@ use test_framework::anyhow;
 use test_framework::queries::validation::{QueryValidationResult, validate_with_expected_batches};
 use test_framework::queries::{QueryOverrides, get_chbench_test_queries};
 
+/// Analytical queries that are executed and reported but do **not** gate the
+/// build, because their result is sensitive to floating-point summation order
+/// rather than to engine correctness.
+///
+/// `chbench_q15` selects rows via `total_revenue = (SELECT MAX(total_revenue)
+/// ...)` — a knife-edge equality over `SUM(ol_amount)`, where `ol_amount` is
+/// `DOUBLE PRECISION`. Postgres and Cayenne can accumulate that floating sum in
+/// a different order, so the equality can admit a different number of rows on
+/// each engine even when both sums are numerically correct (the CTE is also
+/// re-evaluated for the subquery, so the two sides need not even agree within a
+/// single engine). This is a property of the query, not a divergence in the
+/// data (<https://github.com/spiceai/spiceai/issues/11212>), so the gate
+/// surfaces any difference but never fails on it.
+const ADVISORY_QUERIES: &[&str] = &["chbench_q15"];
+
+fn is_advisory(name: &str) -> bool {
+    ADVISORY_QUERIES.contains(&name)
+}
+
+/// Whether a result should fail the gate: any non-`Pass` outcome, except a
+/// value/row *divergence* on an advisory query (reported but non-gating —
+/// execution errors on advisory queries still gate). Shared by `emit` and
+/// `failure_message` so the two stay consistent.
+fn is_gating_failure(result: &AnalyticalQueryResult) -> bool {
+    match &result.outcome {
+        Outcome::Pass => false,
+        Outcome::Fail(_) if is_advisory(&result.name) => false,
+        _ => true,
+    }
+}
+
 /// Outcome for a single analytical query.
 #[derive(Debug)]
 pub enum Outcome {
@@ -84,6 +115,7 @@ impl AnalyticalReport {
 
         let mut passed: u64 = 0;
         let mut failed: u64 = 0;
+        let mut advisory: u64 = 0;
         for r in &self.results {
             let delta = r
                 .max_rel_delta
@@ -92,16 +124,30 @@ impl AnalyticalReport {
             if let Some(detail) = r.outcome.detail() {
                 println!("    └─ {detail}");
             }
-            if matches!(r.outcome, Outcome::Pass) {
-                passed += 1;
-            } else {
-                failed += 1;
+            match &r.outcome {
+                Outcome::Pass => passed += 1,
+                // Only a value/row *divergence* on an advisory query is
+                // non-gating; an execution error (PG or Spice) still gates so a
+                // real regression on q15 is not silently hidden.
+                Outcome::Fail(_) if is_advisory(&r.name) => {
+                    advisory += 1;
+                    println!(
+                        "       (advisory — floating-point summation-order artifact, not gated; see https://github.com/spiceai/spiceai/issues/11212)"
+                    );
+                }
+                _ => failed += 1,
             }
         }
 
-        let total = passed + failed;
+        let total = passed + failed + advisory;
         if failed == 0 {
-            println!("  verdict: PASSED — {passed}/{total} queries match");
+            if advisory == 0 {
+                println!("  verdict: PASSED — {passed}/{total} queries match");
+            } else {
+                println!(
+                    "  verdict: PASSED — {passed}/{total} queries match ({advisory} advisory, non-gating)"
+                );
+            }
         } else {
             println!("  verdict: FAILED — {failed}/{total} queries diverged");
         }
@@ -112,7 +158,7 @@ impl AnalyticalReport {
         let problems: Vec<String> = self
             .results
             .iter()
-            .filter(|r| !matches!(r.outcome, Outcome::Pass))
+            .filter(|r| is_gating_failure(r))
             .map(|r| match &r.outcome {
                 Outcome::Pass => unreachable!(),
                 Outcome::Fail(m) => format!("{} mismatch: {m}", r.name),
@@ -139,12 +185,14 @@ pub async fn verify_analytical_results(
     spice: &SpiceClients,
     query_overrides: Option<QueryOverrides>,
 ) -> anyhow::Result<AnalyticalReport> {
-    // All 22 CH-benCH analytical queries are gated, including q15. q15's
+    // All 22 CH-benCH analytical queries are executed and reported. q15 is
+    // advisory (run but non-gating — see `ADVISORY_QUERIES`): its
     // `total_revenue = (SELECT MAX(total_revenue) ...)` is a knife-edge equality
-    // over a floating SUM (https://github.com/spiceai/spiceai/issues/11212): if
-    // the source and Spice compute that SUM in a different order, the predicate
-    // can select a different number of rows. That is a *real* divergence the
-    // gate now reports rather than hiding — watch it on the first live SF-N run.
+    // over a floating SUM of DOUBLE PRECISION `ol_amount`
+    // (https://github.com/spiceai/spiceai/issues/11212). The source and Spice
+    // can accumulate that sum in a different order, so the predicate can admit a
+    // different number of rows even when both sums are numerically correct — a
+    // query artifact, not an engine divergence, so it is surfaced but not gated.
     let queries = get_chbench_test_queries(query_overrides);
     println!(
         "\nRunning analytical-query gate over {} queries",
@@ -364,4 +412,60 @@ fn sort_all_columns(batches: &[RecordBatch]) -> anyhow::Result<Vec<RecordBatch>>
         .collect::<Result<Vec<_>, _>>()?;
 
     Ok(vec![RecordBatch::try_new(schema, new_columns)?])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn result(name: &str, outcome: Outcome) -> AnalyticalQueryResult {
+        AnalyticalQueryResult {
+            name: name.to_string(),
+            outcome,
+            max_rel_delta: None,
+        }
+    }
+
+    #[test]
+    fn only_q15_is_advisory() {
+        assert!(is_advisory("chbench_q15"));
+        assert!(!is_advisory("chbench_q1"));
+        assert!(!is_advisory("chbench_q14"));
+    }
+
+    #[test]
+    fn advisory_divergence_does_not_gate() {
+        // q15's row/value divergence is reported but must not fail the gate.
+        let report = AnalyticalReport {
+            results: vec![result("chbench_q15", Outcome::Fail("NoAnswer".to_string()))],
+        };
+        assert!(report.failure_message().is_none());
+    }
+
+    #[test]
+    fn non_advisory_divergence_gates() {
+        let report = AnalyticalReport {
+            results: vec![result("chbench_q1", Outcome::Fail("drift".to_string()))],
+        };
+        let msg = report
+            .failure_message()
+            .expect("a non-advisory divergence must gate the build");
+        assert!(msg.contains("chbench_q1"));
+    }
+
+    #[test]
+    fn advisory_execution_error_still_gates() {
+        // Only a value/row divergence is non-gating; an execution error on an
+        // advisory query is a real regression and must still fail the gate.
+        let report = AnalyticalReport {
+            results: vec![result(
+                "chbench_q15",
+                Outcome::SpiceError("query failed".to_string()),
+            )],
+        };
+        let msg = report
+            .failure_message()
+            .expect("an execution error on an advisory query must still gate");
+        assert!(msg.contains("chbench_q15"));
+    }
 }
