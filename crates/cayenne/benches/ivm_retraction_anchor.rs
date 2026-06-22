@@ -85,7 +85,7 @@ use cayenne::maintained_aggregate::{
     MaintainedAggregateExpr, MaintainedAggregateFunction, MaintainedAggregateRegistry,
     MaintainedAggregateSpec,
 };
-use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 
 const GROUP_COUNT: usize = 1_000;
 const DELTA_ROWS: usize = 100;
@@ -336,7 +336,12 @@ fn assert_retraction_matches_recompute() {
     for (group, value) in mirror.values() {
         *truth.entry(*group).or_insert(0) += i128::from(*value);
     }
-    let mut groups: Vec<u32> = view.accumulators.keys().chain(truth.keys()).copied().collect();
+    let mut groups: Vec<u32> = view
+        .accumulators
+        .keys()
+        .chain(truth.keys())
+        .copied()
+        .collect();
     groups.sort_unstable();
     groups.dedup();
     for group in groups {
@@ -396,9 +401,11 @@ fn bench_real_registry_insert(c: &mut Criterion) {
                 |b, &rows| {
                     b.iter_batched(
                         || {
-                            let registry =
-                                MaintainedAggregateRegistry::try_new(&[sum_spec()], &registry_schema())
-                                    .expect("registry construction");
+                            let registry = MaintainedAggregateRegistry::try_new(
+                                &[sum_spec()],
+                                &registry_schema(),
+                            )
+                            .expect("registry construction");
                             (registry, registry_batch(rows, groups))
                         },
                         |(registry, batch)| {
@@ -447,22 +454,18 @@ fn bench_recompute_vs_maintain(c: &mut Criterion) {
                 });
             },
         );
-        group.bench_with_input(
-            BenchmarkId::new("maintain_delta", rows),
-            &rows,
-            |b, _| {
-                b.iter_batched(
-                    || maintained.clone(),
-                    |mut view| {
-                        for op in &delta {
-                            view.apply(op);
-                        }
-                        black_box(view.checksum());
-                    },
-                    criterion::BatchSize::SmallInput,
-                );
-            },
-        );
+        group.bench_with_input(BenchmarkId::new("maintain_delta", rows), &rows, |b, _| {
+            b.iter_batched(
+                || maintained.clone(),
+                |mut view| {
+                    for op in &delta {
+                        view.apply(op);
+                    }
+                    black_box(view.checksum());
+                },
+                criterion::BatchSize::SmallInput,
+            );
+        });
         group.bench_with_input(BenchmarkId::new("serve", rows), &rows, |b, _| {
             b.iter(|| black_box(maintained.serve().len()));
         });

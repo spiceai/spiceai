@@ -34,7 +34,8 @@ use datafusion::error::Result as DataFusionResult;
 use datafusion::physical_plan::aggregates::{AggregateExec, AggregateMode};
 use datafusion_common::{DataFusionError, ScalarValue};
 use datafusion_execution::{SendableRecordBatchStream, TaskContext};
-use datafusion_physical_expr::expressions::{Column, Literal};
+use datafusion_physical_expr::PhysicalExpr;
+use datafusion_physical_expr::expressions::{CastExpr, Column, Literal};
 use datafusion_physical_expr::{Distribution, OrderingRequirements};
 use datafusion_physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties};
 use parking_lot::RwLock;
@@ -63,9 +64,12 @@ pub struct MaintainedAggregateExpr {
 pub enum MaintainedAggregateFunction {
     /// SQL `COUNT(*)` or `COUNT(column)`.
     Count,
-    /// SQL `SUM(column)` for `Int64`, `UInt64`, or `Float64` inputs.
+    /// SQL `SUM(column)` over the signed-integer (`Int8`..`Int64`),
+    /// unsigned-integer (`UInt8`..`UInt64`), or floating-point
+    /// (`Float32`/`Float64`) families. Narrower widths widen losslessly to the
+    /// `BIGINT`/`Float64` sum output, matching `DataFusion`'s `SUM` output type.
     Sum,
-    /// SQL `AVG(column)` for `Float64` inputs.
+    /// SQL `AVG(column)` for `Float32`/`Float64` inputs.
     Avg,
 }
 
@@ -313,7 +317,7 @@ impl MaintainedAggregateRegistry {
         specs: &[MaintainedAggregateSpec],
         schema: &SchemaRef,
     ) -> DataFusionResult<Self> {
-        Self::try_new_inner(specs, schema, Vec::new(), usize::MAX)
+        Self::try_new_inner(specs, schema, &[], usize::MAX)
     }
 
     /// As [`Self::try_new`], but maintains a per-PK contribution index keyed on
@@ -328,7 +332,7 @@ impl MaintainedAggregateRegistry {
     pub fn try_new_with_pk(
         specs: &[MaintainedAggregateSpec],
         schema: &SchemaRef,
-        pk_columns: Vec<usize>,
+        pk_columns: &[usize],
         max_index_entries: usize,
     ) -> DataFusionResult<Self> {
         Self::try_new_inner(specs, schema, pk_columns, max_index_entries)
@@ -337,13 +341,13 @@ impl MaintainedAggregateRegistry {
     fn try_new_inner(
         specs: &[MaintainedAggregateSpec],
         schema: &SchemaRef,
-        pk_columns: Vec<usize>,
+        pk_columns: &[usize],
         max_index_entries: usize,
     ) -> DataFusionResult<Self> {
         let has_pk_index = !pk_columns.is_empty();
         let views = specs
             .iter()
-            .map(|spec| MaintainedAggregateView::try_new(spec, schema, pk_columns.clone()))
+            .map(|spec| MaintainedAggregateView::try_new(spec, schema, pk_columns.to_vec()))
             .collect::<DataFusionResult<Vec<_>>>()?;
 
         Ok(Self {
@@ -460,9 +464,12 @@ impl MaintainedAggregateRegistry {
             }
         }
 
-        let over_cap =
-            state.views.iter().map(MaintainedAggregateView::index_len).sum::<usize>()
-                > self.max_index_entries;
+        let over_cap = state
+            .views
+            .iter()
+            .map(MaintainedAggregateView::index_len)
+            .sum::<usize>()
+            > self.max_index_entries;
 
         if failed || over_cap {
             for view in &mut state.views {
@@ -607,10 +614,11 @@ impl MaintainedAggregateView {
     /// Subtract a stored row's contribution from its group, dropping the group
     /// when it becomes empty.
     fn retract_entry(&mut self, entry: &RowEntry) -> DataFusionResult<()> {
-        if let Some(group) = self.groups.get_mut(&entry.group_key) {
-            if group.retract_row(&entry.inputs)? {
-                self.groups.remove(&entry.group_key);
-            }
+        let Some(group) = self.groups.get_mut(&entry.group_key) else {
+            return Ok(());
+        };
+        if group.retract_row(&entry.inputs)? {
+            self.groups.remove(&entry.group_key);
         }
         Ok(())
     }
@@ -804,14 +812,24 @@ impl ResolvedAggregateExpr {
 
         let output_type = match (expr.function, column.as_ref().map(|c| &c.data_type)) {
             (MaintainedAggregateFunction::Count, _) => AggregateOutputType::Count,
-            (MaintainedAggregateFunction::Sum, Some(DataType::Int64)) => AggregateOutputType::Int64,
-            (MaintainedAggregateFunction::Sum, Some(DataType::UInt64)) => {
+            // SQL `SUM(int)` widens to `BIGINT` (DataFusion's `Int64`/`UInt64`
+            // sum output), so the whole signed/unsigned integer family is summed
+            // exactly via lossless i64/u64 widening — Postgres `INTEGER` (arrow
+            // `Int32`) is the common CDC case, not `BIGINT` (`Int64`).
+            (MaintainedAggregateFunction::Sum, Some(data_type)) if is_signed_integer(data_type) => {
+                AggregateOutputType::Int64
+            }
+            (MaintainedAggregateFunction::Sum, Some(data_type))
+                if is_unsigned_integer(data_type) =>
+            {
                 AggregateOutputType::UInt64
             }
+            // `SUM`/`AVG` over floating-point widen to `Float64` (DataFusion's
+            // float sum/avg output type); `Float32` widens losslessly.
             (
                 MaintainedAggregateFunction::Sum | MaintainedAggregateFunction::Avg,
-                Some(DataType::Float64),
-            ) => AggregateOutputType::Float64,
+                Some(data_type),
+            ) if is_floating_point(data_type) => AggregateOutputType::Float64,
             (MaintainedAggregateFunction::Sum | MaintainedAggregateFunction::Avg, None) => {
                 return Err(DataFusionError::Plan(format!(
                     "{:?} maintained aggregate requires a column",
@@ -840,7 +858,10 @@ impl GroupAccumulator {
             .iter()
             .map(AggregateAccumulator::try_new)
             .collect::<DataFusionResult<Vec<_>>>()?;
-        Ok(Self { rows: 0, aggregates })
+        Ok(Self {
+            rows: 0,
+            aggregates,
+        })
     }
 
     fn apply_insert_row(&mut self, batch: &RecordBatch, row: usize) -> DataFusionResult<()> {
@@ -937,9 +958,7 @@ impl AggregateAccumulator {
             } => {
                 if !batch.column(*column_index).is_null(row) {
                     let scalar = ScalarValue::try_from_array(batch.column(*column_index), row)?;
-                    let ScalarValue::Int64(Some(delta)) = scalar else {
-                        return Err(type_mismatch("Int64", &scalar));
-                    };
+                    let delta = scalar_as_i64(&scalar)?;
                     *value = Some(match *value {
                         Some(current) => current.checked_add(delta).ok_or_else(sum_overflow)?,
                         None => delta,
@@ -952,9 +971,7 @@ impl AggregateAccumulator {
             } => {
                 if !batch.column(*column_index).is_null(row) {
                     let scalar = ScalarValue::try_from_array(batch.column(*column_index), row)?;
-                    let ScalarValue::UInt64(Some(delta)) = scalar else {
-                        return Err(type_mismatch("UInt64", &scalar));
-                    };
+                    let delta = scalar_as_u64(&scalar)?;
                     *value = Some(match *value {
                         Some(current) => current.checked_add(delta).ok_or_else(sum_overflow)?,
                         None => delta,
@@ -967,9 +984,7 @@ impl AggregateAccumulator {
             } => {
                 if !batch.column(*column_index).is_null(row) {
                     let scalar = ScalarValue::try_from_array(batch.column(*column_index), row)?;
-                    let ScalarValue::Float64(Some(delta)) = scalar else {
-                        return Err(type_mismatch("Float64", &scalar));
-                    };
+                    let delta = scalar_as_f64(&scalar)?;
                     *value = Some(value.unwrap_or(0.0) + delta);
                 }
             }
@@ -980,9 +995,7 @@ impl AggregateAccumulator {
             } => {
                 if !batch.column(*column_index).is_null(row) {
                     let scalar = ScalarValue::try_from_array(batch.column(*column_index), row)?;
-                    let ScalarValue::Float64(Some(delta)) = scalar else {
-                        return Err(type_mismatch("Float64", &scalar));
-                    };
+                    let delta = scalar_as_f64(&scalar)?;
                     *sum += delta;
                     *count = count.checked_add(1).ok_or_else(count_overflow)?;
                 }
@@ -1007,46 +1020,38 @@ impl AggregateAccumulator {
                 }
             }
             Self::SumInt64 { value, .. } => {
-                if let Some(scalar) = input {
-                    if !scalar.is_null() {
-                        let ScalarValue::Int64(Some(delta)) = scalar else {
-                            return Err(type_mismatch("Int64", scalar));
-                        };
-                        let current = (*value).ok_or_else(retract_underflow)?;
-                        *value = Some(current.checked_sub(*delta).ok_or_else(sum_overflow)?);
-                    }
+                if let Some(scalar) = input
+                    && !scalar.is_null()
+                {
+                    let delta = scalar_as_i64(scalar)?;
+                    let current = (*value).ok_or_else(retract_underflow)?;
+                    *value = Some(current.checked_sub(delta).ok_or_else(sum_overflow)?);
                 }
             }
             Self::SumUInt64 { value, .. } => {
-                if let Some(scalar) = input {
-                    if !scalar.is_null() {
-                        let ScalarValue::UInt64(Some(delta)) = scalar else {
-                            return Err(type_mismatch("UInt64", scalar));
-                        };
-                        let current = (*value).ok_or_else(retract_underflow)?;
-                        *value = Some(current.checked_sub(*delta).ok_or_else(retract_underflow)?);
-                    }
+                if let Some(scalar) = input
+                    && !scalar.is_null()
+                {
+                    let delta = scalar_as_u64(scalar)?;
+                    let current = (*value).ok_or_else(retract_underflow)?;
+                    *value = Some(current.checked_sub(delta).ok_or_else(retract_underflow)?);
                 }
             }
             Self::SumFloat64 { value, .. } => {
-                if let Some(scalar) = input {
-                    if !scalar.is_null() {
-                        let ScalarValue::Float64(Some(delta)) = scalar else {
-                            return Err(type_mismatch("Float64", scalar));
-                        };
-                        *value = Some(value.unwrap_or(0.0) - delta);
-                    }
+                if let Some(scalar) = input
+                    && !scalar.is_null()
+                {
+                    let delta = scalar_as_f64(scalar)?;
+                    *value = Some(value.unwrap_or(0.0) - delta);
                 }
             }
             Self::AvgFloat64 { sum, count, .. } => {
-                if let Some(scalar) = input {
-                    if !scalar.is_null() {
-                        let ScalarValue::Float64(Some(delta)) = scalar else {
-                            return Err(type_mismatch("Float64", scalar));
-                        };
-                        *sum -= delta;
-                        *count = count.checked_sub(1).ok_or_else(retract_underflow)?;
-                    }
+                if let Some(scalar) = input
+                    && !scalar.is_null()
+                {
+                    let delta = scalar_as_f64(scalar)?;
+                    *sum -= delta;
+                    *count = count.checked_sub(1).ok_or_else(retract_underflow)?;
                 }
             }
         }
@@ -1088,6 +1093,20 @@ pub(crate) fn aggregate_shape_is_maintainable(aggregate: &AggregateExec) -> bool
         && aggregate.filter_expr().iter().all(Option::is_none)
         && !aggregate.group_expr().has_grouping_set()
         && aggregate.group_expr().groups().len() == 1
+}
+
+/// The `Column` an aggregate input expression ultimately references, seeing
+/// through the numeric-widening `CAST` that `DataFusion`'s type coercion inserts
+/// for an aggregate over a narrow column (`SUM(Int32)` is planned as
+/// `SUM(CAST(col AS Int64))`). The maintained view widens the same way and
+/// `output_schema_matches` still guards the result type, so recovering the
+/// column name through the coercion cast is sound.
+fn aggregate_input_column(expr: &Arc<dyn PhysicalExpr>) -> Option<&Column> {
+    if let Some(column) = expr.downcast_ref::<Column>() {
+        return Some(column);
+    }
+    expr.downcast_ref::<CastExpr>()
+        .and_then(|cast| cast.expr().downcast_ref::<Column>())
 }
 
 fn query_spec_for_aggregate(aggregate: &AggregateExec) -> Option<QueryAggregateSpec> {
@@ -1135,7 +1154,7 @@ fn query_spec_for_aggregate(aggregate: &AggregateExec) -> Option<QueryAggregateS
                     return None;
                 }
                 let expr = expressions.first()?;
-                let column = expr.downcast_ref::<Column>()?;
+                let column = aggregate_input_column(expr)?;
                 Some(input_column_name(&input_schema, column)?)
             }
         };
@@ -1228,6 +1247,60 @@ fn is_supported_group_key_type(data_type: &DataType) -> bool {
     )
 }
 
+fn is_signed_integer(data_type: &DataType) -> bool {
+    matches!(
+        data_type,
+        DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64
+    )
+}
+
+fn is_unsigned_integer(data_type: &DataType) -> bool {
+    matches!(
+        data_type,
+        DataType::UInt8 | DataType::UInt16 | DataType::UInt32 | DataType::UInt64
+    )
+}
+
+fn is_floating_point(data_type: &DataType) -> bool {
+    matches!(data_type, DataType::Float32 | DataType::Float64)
+}
+
+/// Coerce a non-null signed-integer input scalar to `i64`, widening the
+/// `Int8`/`Int16`/`Int32`/`Int64` family losslessly. SQL `SUM(int)` widens to
+/// `BIGINT` (`DataFusion`'s `Int64` sum output), so a narrower CDC column
+/// (Postgres `INTEGER` → arrow `Int32`) is summed exactly without overflow.
+fn scalar_as_i64(scalar: &ScalarValue) -> DataFusionResult<i64> {
+    match scalar {
+        ScalarValue::Int64(Some(v)) => Ok(*v),
+        ScalarValue::Int32(Some(v)) => Ok(i64::from(*v)),
+        ScalarValue::Int16(Some(v)) => Ok(i64::from(*v)),
+        ScalarValue::Int8(Some(v)) => Ok(i64::from(*v)),
+        _ => Err(type_mismatch("a signed integer", scalar)),
+    }
+}
+
+/// Coerce a non-null unsigned-integer input scalar to `u64`, widening the
+/// `UInt8`/`UInt16`/`UInt32`/`UInt64` family losslessly.
+fn scalar_as_u64(scalar: &ScalarValue) -> DataFusionResult<u64> {
+    match scalar {
+        ScalarValue::UInt64(Some(v)) => Ok(*v),
+        ScalarValue::UInt32(Some(v)) => Ok(u64::from(*v)),
+        ScalarValue::UInt16(Some(v)) => Ok(u64::from(*v)),
+        ScalarValue::UInt8(Some(v)) => Ok(u64::from(*v)),
+        _ => Err(type_mismatch("an unsigned integer", scalar)),
+    }
+}
+
+/// Coerce a non-null floating-point input scalar to `f64`, widening `Float32`
+/// to `Float64` losslessly (`DataFusion`'s float sum/avg output type).
+fn scalar_as_f64(scalar: &ScalarValue) -> DataFusionResult<f64> {
+    match scalar {
+        ScalarValue::Float64(Some(v)) => Ok(*v),
+        ScalarValue::Float32(Some(v)) => Ok(f64::from(*v)),
+        _ => Err(type_mismatch("a floating-point", scalar)),
+    }
+}
+
 fn scalar_for_field(
     field: &FieldRef,
     scalar: Option<ScalarValue>,
@@ -1277,10 +1350,10 @@ mod tests {
     use super::*;
     use std::collections::BTreeMap;
 
-    use arrow::array::{Float64Array, Int64Array, StringArray, UInt64Array};
+    use arrow::array::{Float64Array, Int32Array, Int64Array, StringArray, UInt64Array};
     use arrow_schema::{Field, Schema};
     use datafusion::physical_expr::aggregate::AggregateExprBuilder;
-    use datafusion::physical_expr::expressions::{col, lit};
+    use datafusion::physical_expr::expressions::{cast, col, lit};
     use datafusion::physical_plan::aggregates::PhysicalGroupBy;
     use datafusion_common::cast::{
         as_float64_array, as_int64_array, as_string_array, as_uint64_array,
@@ -1409,6 +1482,45 @@ mod tests {
             aggregate_exec_for(&[("count(*)", MaintainedAggregateFunction::Count, None)])?;
         assert!(registry.batch_for_aggregate(&aggregate, 2)?.is_none());
         assert!(registry.batch_for_aggregate(&aggregate, 1)?.is_none());
+        Ok(())
+    }
+
+    /// The off-write-path background applier drains deltas in strict epoch order
+    /// (channel FIFO). The registry enforces that contract as its safety net: an
+    /// in-order epoch chain stays fresh and serves, but a skipped/out-of-order
+    /// epoch (as a reordered or dropped delta would produce) fails safe to stale
+    /// — queries fall back to the base table rather than serve a partial result.
+    #[test]
+    fn out_of_order_apply_epoch_falls_back_to_stale() -> DataFusionResult<()> {
+        let spec = MaintainedAggregateSpec {
+            group_by: vec!["name".to_string()],
+            aggregates: vec![MaintainedAggregateExpr {
+                function: MaintainedAggregateFunction::Count,
+                column: None,
+            }],
+        };
+        let registry = MaintainedAggregateRegistry::try_new(&[spec], &schema())?;
+        let aggregate =
+            aggregate_exec_for(&[("count(*)", MaintainedAggregateFunction::Count, None)])?;
+
+        // In-order epoch 1 applies and serves.
+        registry.apply_insert_batches(1, &[batch()])?;
+        assert!(
+            registry.batch_for_aggregate(&aggregate, 1)?.is_some(),
+            "in-order epoch 1 serves"
+        );
+
+        // Skipping epoch 2 and applying epoch 3 is a gap; the registry fails safe
+        // to stale and serves nothing at any epoch.
+        registry.apply_insert_batches(3, &[batch()])?;
+        assert!(
+            registry.batch_for_aggregate(&aggregate, 3)?.is_none(),
+            "gapped epoch 3 must not serve"
+        );
+        assert!(
+            registry.batch_for_aggregate(&aggregate, 1)?.is_none(),
+            "registry is stale after the gap"
+        );
         Ok(())
     }
 
@@ -1656,12 +1768,17 @@ mod tests {
         let registry = MaintainedAggregateRegistry::try_new_with_pk(
             &[sum_i_spec()],
             &schema(),
-            vec![2],
+            &[2],
             usize::MAX,
         )?;
         registry.apply_delta(
             1,
-            &[group_batch(&[("a", 1, 10), ("a", 2, 20), ("b", 3, 5), ("b", 4, 7)])],
+            &[group_batch(&[
+                ("a", 1, 10),
+                ("a", 2, 20),
+                ("b", 3, 5),
+                ("b", 4, 7),
+            ])],
             &[],
         )?;
         // Delete pk=2 (group a) and pk=3 (group b); only the PK column matters.
@@ -1678,7 +1795,7 @@ mod tests {
         let registry = MaintainedAggregateRegistry::try_new_with_pk(
             &[sum_i_spec()],
             &schema(),
-            vec![2],
+            &[2],
             usize::MAX,
         )?;
         registry.apply_delta(1, &[group_batch(&[("a", 1, 10), ("a", 2, 20)])], &[])?;
@@ -1699,13 +1816,17 @@ mod tests {
         let registry = MaintainedAggregateRegistry::try_new_with_pk(
             &[sum_i_spec()],
             &schema(),
-            vec![2],
+            &[2],
             usize::MAX,
         )?;
         registry.apply_delta(1, &[group_batch(&[("a", 1, 10), ("b", 2, 20)])], &[])?;
         registry.apply_delta(2, &[], &[group_batch(&[("", 1, 0)])])?;
         let sums = sum_i_by_name(&registry)?;
-        assert_eq!(sums.get("a"), None, "group a disappears once its last row is retracted");
+        assert_eq!(
+            sums.get("a"),
+            None,
+            "group a disappears once its last row is retracted"
+        );
         assert_eq!(sums.get("b"), Some(&20));
         Ok(())
     }
@@ -1715,7 +1836,7 @@ mod tests {
         // A 1-entry cap: inserting two distinct PKs overflows the index, so the
         // registry fails safe to Stale and serves nothing (base-table fallback).
         let registry =
-            MaintainedAggregateRegistry::try_new_with_pk(&[sum_i_spec()], &schema(), vec![2], 1)?;
+            MaintainedAggregateRegistry::try_new_with_pk(&[sum_i_spec()], &schema(), &[2], 1)?;
         registry.apply_delta(1, &[group_batch(&[("a", 1, 10), ("a", 2, 20)])], &[])?;
         let aggregate =
             aggregate_exec_for(&[("sum(i)", MaintainedAggregateFunction::Sum, Some("i"))])?;
@@ -1750,9 +1871,9 @@ mod tests {
         .expect("typed batch should be valid")
     }
 
-    /// Retraction exercises EVERY accumulator inverse: `COUNT(*)` (CountAll),
-    /// `COUNT(u)` (CountColumn), `SUM(u)` (SumUInt64), `SUM(f)` (SumFloat64),
-    /// `AVG(f)` (AvgFloat64). `SUM(i)` (SumInt64) is covered by
+    /// Retraction exercises EVERY accumulator inverse: `COUNT(*)` (`CountAll`),
+    /// `COUNT(u)` (`CountColumn`), `SUM(u)` (`SumUInt64`), `SUM(f)` (`SumFloat64`),
+    /// `AVG(f)` (`AvgFloat64`). `SUM(i)` (`SumInt64`) is covered by
     /// `apply_delta_retracts_deletes_by_pk`. PK = column `i`.
     #[test]
     fn apply_delta_retracts_all_aggregate_types() -> DataFusionResult<()> {
@@ -1781,15 +1902,15 @@ mod tests {
                 },
             ],
         };
-        let registry = MaintainedAggregateRegistry::try_new_with_pk(
-            &[spec],
-            &schema(),
-            vec![1],
-            usize::MAX,
-        )?;
+        let registry =
+            MaintainedAggregateRegistry::try_new_with_pk(&[spec], &schema(), &[1], usize::MAX)?;
         registry.apply_delta(
             1,
-            &[typed_batch(&[("a", 1, 10, 2.0), ("a", 2, 20, 4.0), ("b", 3, 5, 8.0)])],
+            &[typed_batch(&[
+                ("a", 1, 10, 2.0),
+                ("a", 2, 20, 4.0),
+                ("b", 3, 5, 8.0),
+            ])],
             &[],
         )?;
         // Delete pk i=2 from group a; only the PK column is read for the delete.
@@ -1820,8 +1941,14 @@ mod tests {
                     assert_eq!(count_all.value(row), 1, "CountAll retracted");
                     assert_eq!(count_u.value(row), 1, "CountColumn retracted");
                     assert_eq!(sum_u.value(row), 10, "SumUInt64 retracted");
-                    assert!((sum_f.value(row) - 2.0).abs() < 1e-9, "SumFloat64 retracted");
-                    assert!((avg_f.value(row) - 2.0).abs() < 1e-9, "AvgFloat64 retracted");
+                    assert!(
+                        (sum_f.value(row) - 2.0).abs() < 1e-9,
+                        "SumFloat64 retracted"
+                    );
+                    assert!(
+                        (avg_f.value(row) - 2.0).abs() < 1e-9,
+                        "AvgFloat64 retracted"
+                    );
                 }
                 // group b untouched (pk=3, u=5, f=8.0).
                 "b" => {
@@ -1836,6 +1963,109 @@ mod tests {
         Ok(())
     }
 
+    /// Postgres `INTEGER` → arrow `Int32`, the common CDC case (not `BIGINT` →
+    /// `Int64`). `SUM` over a narrow signed-integer column must (a) be accepted
+    /// at registry construction and (b) widen to `Int64` on both the insert and
+    /// the retraction path. Regression guard for the `CH-benCH` `district`
+    /// `SUM(d_next_o_id)` config, where `d_next_o_id` is `Int32` — this combo
+    /// previously failed planning with "Sum maintained aggregate does not
+    /// support column type Int32".
+    #[test]
+    fn sum_over_int32_widens_on_insert_and_retract() -> DataFusionResult<()> {
+        let i32_schema = Arc::new(Schema::new(vec![
+            Field::new("name", DataType::Utf8, true),
+            Field::new("v", DataType::Int32, true),
+            Field::new("pk", DataType::Int64, true),
+        ]));
+        let i32_batch = |rows: &[(&str, i32, i64)]| {
+            RecordBatch::try_new(
+                Arc::clone(&i32_schema),
+                vec![
+                    Arc::new(StringArray::from(
+                        rows.iter().map(|(n, _, _)| Some(*n)).collect::<Vec<_>>(),
+                    )),
+                    Arc::new(Int32Array::from(
+                        rows.iter().map(|(_, v, _)| *v).collect::<Vec<_>>(),
+                    )),
+                    Arc::new(Int64Array::from(
+                        rows.iter().map(|(_, _, pk)| *pk).collect::<Vec<_>>(),
+                    )),
+                ],
+            )
+            .expect("int32 batch should be valid")
+        };
+
+        let spec = MaintainedAggregateSpec {
+            group_by: vec!["name".to_string()],
+            aggregates: vec![MaintainedAggregateExpr {
+                function: MaintainedAggregateFunction::Sum,
+                column: Some("v".to_string()),
+            }],
+        };
+        // PK = column index 2 (`pk`). Construction must succeed for Int32 SUM.
+        let registry =
+            MaintainedAggregateRegistry::try_new_with_pk(&[spec], &i32_schema, &[2], usize::MAX)?;
+
+        registry.apply_delta(
+            1,
+            &[i32_batch(&[("a", 10, 1), ("a", 20, 2), ("b", 5, 3)])],
+            &[],
+        )?;
+        // UPDATE pk=2 in place (retract-old-then-apply-new): v 20 -> 7, so a = 17.
+        registry.apply_delta(2, &[i32_batch(&[("a", 7, 2)])], &[])?;
+        // DELETE pk=3: retracts the whole of group b.
+        registry.apply_delta(3, &[], &[i32_batch(&[("", 0, 3)])])?;
+
+        // Serve via a real AggregateExec. DataFusion's type coercion plans
+        // `SUM(Int32)` as `SUM(CAST(v AS Int64))`, so the aggregate input is a
+        // cast over the column — the serve path must see through it.
+        let input = MemorySourceConfig::try_new_exec(
+            &[vec![i32_batch(&[])]],
+            Arc::clone(&i32_schema),
+            None,
+        )?;
+        let sum_arg = cast(
+            col("v", i32_schema.as_ref())?,
+            i32_schema.as_ref(),
+            DataType::Int64,
+        )?;
+        let sum_v = AggregateExprBuilder::new(sum_udaf(), vec![sum_arg])
+            .schema(Arc::clone(&i32_schema))
+            .alias("sum(v)")
+            .build()
+            .map(Arc::new)?;
+        let aggregate = AggregateExec::try_new(
+            AggregateMode::Single,
+            PhysicalGroupBy::new_single(vec![(
+                col("name", i32_schema.as_ref())?,
+                "name".to_string(),
+            )]),
+            vec![sum_v],
+            vec![None],
+            input,
+            Arc::clone(&i32_schema),
+        )?;
+        let result = registry
+            .batch_for_aggregate(&aggregate, 3)?
+            .expect("registry should be fresh");
+        // Output widened to Int64 (matches DataFusion's `sum(Int32)` = `Int64`).
+        let names = as_string_array(result.column(0))?;
+        let sums = as_int64_array(result.column(1))?;
+        let mut by_name = BTreeMap::new();
+        for row in 0..result.num_rows() {
+            if !sums.is_null(row) {
+                by_name.insert(names.value(row).to_string(), sums.value(row));
+            }
+        }
+        assert_eq!(
+            by_name.get("a"),
+            Some(&17),
+            "group a = 10 + updated 7 (Int32 widened)"
+        );
+        assert_eq!(by_name.get("b"), None, "group b fully retracted by delete");
+        Ok(())
+    }
+
     /// Retracting a PK that was never inserted is an idempotent no-op (matches
     /// tombstone semantics — an absent row contributed nothing).
     #[test]
@@ -1843,7 +2073,7 @@ mod tests {
         let registry = MaintainedAggregateRegistry::try_new_with_pk(
             &[sum_i_spec()],
             &schema(),
-            vec![2],
+            &[2],
             usize::MAX,
         )?;
         registry.apply_delta(1, &[group_batch(&[("a", 1, 10), ("b", 2, 20)])], &[])?;
