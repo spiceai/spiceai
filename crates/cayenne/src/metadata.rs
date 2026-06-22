@@ -932,6 +932,21 @@ pub struct VortexConfig {
     /// land). A slow tier biases toward larger inline-flush to amortize commits.
     #[serde(skip)]
     pub metastore_storage_class: StorageClass,
+    /// Force the **read/query** scan to emit Arrow *view* types (`Utf8View`/
+    /// `BinaryView`) for `Utf8`/`Binary` columns, decoupled from the stored
+    /// schema (which keeps the original types for writes/CDC/stats/keyset). Lets
+    /// `DataFusion` plan joins/aggregates on view arrays, avoiding the i32 2 GiB
+    /// offset overflow in hash-join build-side `concat_batches` (e.g. `CH-benCH`
+    /// q21 at SF1000, where `su_name` fans out across a ~100M-row join).
+    ///
+    /// Runtime-configurable: the accelerator factory sets it (default on; opt out
+    /// with the `cayenne_force_view_types` acceleration param). It is `#[serde(skip)]`
+    /// because it is a read-only scan behavior re-derived on every open, NOT
+    /// serialized into Cayenne metadata — so toggling it never affects stored data
+    /// and it is intentionally excluded from `configuration_matches`. Off by default
+    /// for direct construction (unit tests keep `Utf8`). See `viewify_read_schema`.
+    #[serde(skip)]
+    pub force_view_read_schema: bool,
 }
 
 /// Evolution set permitted when a widening schema difference is detected at
@@ -1218,6 +1233,7 @@ impl Default for VortexConfig {
             goal_convergence_window_secs: None,
             data_storage_class: StorageClass::default(),
             metastore_storage_class: StorageClass::default(),
+            force_view_read_schema: false,
         }
     }
 }

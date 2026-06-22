@@ -15,28 +15,38 @@ limitations under the License.
 */
 
 use crate::Runtime;
-use crate::execution_plan::UdtfExec;
+use crate::dataconnector::iceberg_cluster::IcebergClusterTableProvider;
+use crate::execution_plan::{IcebergScanExec, UdtfExec};
 use crate::metrics::telemetry::track_bytes_processed;
+use crate::search::util::find_concrete_table_provider;
 use arrow_schema::Schema;
 use ballista_core::serde::BallistaPhysicalExtensionCodec;
 #[cfg(not(windows))]
 use cayenne::provider::CayenneAccelerationExec;
-use datafusion::common::{DataFusionError, Result, exec_err};
+use data_components::iceberg::delete::IcebergDeletionProvider;
+use datafusion::catalog::TableProvider;
+use datafusion::common::{DataFusionError, Result, TableReference, exec_err};
 use datafusion::execution::{FunctionRegistry, TaskContext};
-use datafusion::physical_plan::ExecutionPlan;
+use datafusion::logical_expr::Expr;
+use datafusion::physical_expr::Partitioning;
+use datafusion::physical_expr::expressions::Column;
+use datafusion::physical_plan::{ExecutionPlan, PhysicalExpr};
 use datafusion_expr::ScalarUDF;
+use datafusion_proto::bytes::Serializeable;
 use datafusion_proto::generated::datafusion_common;
 #[cfg(not(windows))]
 use datafusion_proto::physical_plan::AsExecutionPlan;
 use datafusion_proto::physical_plan::PhysicalExtensionCodec;
 #[cfg(not(windows))]
 use datafusion_proto::protobuf::PhysicalPlanNode;
+use iceberg_datafusion::IcebergTableProvider;
 use prost::Message;
 use runtime_datafusion::execution_plan::schema_cast::SchemaCastScanExec;
 use runtime_datafusion::extension::bytes_processed::BytesProcessedExec;
 use runtime_proto::{
-    BytesProcessedExecNode, CayenneAccelerationExecNode, SchemaCastScanExecNode,
-    SpicePhysicalPlanNode, UdtfExecNode, spice_physical_plan_node,
+    BytesProcessedExecNode, CayenneAccelerationExecNode, IcebergHashColumn, IcebergPartitioning,
+    IcebergTableScanExecNode, SchemaCastScanExecNode, SpicePhysicalPlanNode, UdtfExecNode,
+    spice_physical_plan_node,
 };
 use std::fmt::Debug;
 use std::sync::Arc;
@@ -140,6 +150,105 @@ impl PhysicalExtensionCodec for SpicePhysicalCodec {
 
                 Ok(Arc::new(UdtfExec::new(args, inner_plan)))
             }
+            Some(spice_physical_plan_node::Node::IcebergTableScan(node)) => {
+                let runtime = self.runtime()?;
+                let table_ref = TableReference::from(node.table_ref.as_str());
+
+                // Surface conversion failures as structured errors rather than
+                // saturating: a corrupt recipe or scheduler/executor version skew
+                // should fail clearly here, not as a later out-of-bounds column or
+                // an effectively unbounded limit.
+                let projection: Option<Vec<usize>> = if node.has_projection {
+                    Some(
+                        node.projection
+                            .iter()
+                            .map(|c| {
+                                usize::try_from(*c).map_err(|_| {
+                                    DataFusionError::Internal(format!(
+                                        "iceberg scan recipe for {table_ref} has projection index \
+                                         {c} that does not fit in usize"
+                                    ))
+                                })
+                            })
+                            .collect::<Result<Vec<usize>>>()?,
+                    )
+                } else {
+                    None
+                };
+                let filters = node
+                    .filters
+                    .iter()
+                    .map(|bytes| Expr::from_bytes_with_ctx(bytes, ctx))
+                    .collect::<Result<Vec<Expr>>>()?;
+                let limit = node
+                    .limit
+                    .map(|l| {
+                        usize::try_from(l).map_err(|_| {
+                            DataFusionError::Internal(format!(
+                                "iceberg scan recipe for {table_ref} has limit {l} that does not \
+                                 fit in usize"
+                            ))
+                        })
+                    })
+                    .transpose()?;
+                let partitioning = decode_partitioning(node.partitioning.as_ref())?;
+
+                // Resolve the registered provider synchronously — no catalog I/O,
+                // no blocking bridge. The executor loaded the same app definition,
+                // so the Iceberg dataset is already registered (in the default
+                // catalog, which is sync-accessible). The actual scan is replayed
+                // lazily at execute() time; see IcebergScanExec::new_deferred.
+                let provider = runtime.df.get_table_sync(&table_ref).ok_or_else(|| {
+                    DataFusionError::Execution(format!(
+                        "Iceberg table {table_ref} is not registered on this executor; \
+                         cannot reconstruct the distributed scan"
+                    ))
+                })?;
+                // Locate the cluster provider through ALL known runtime wrappers
+                // (FederatedTableProviderAdaptor, MetadataEnrichedTableProvider,
+                // EmbeddingTable, IndexedTableProvider, AcceleratedTable, …), not
+                // just the federation/metadata pair — an Iceberg dataset with
+                // embeddings or a search index is wrapped further.
+                let Some(cluster) =
+                    find_concrete_table_provider::<IcebergClusterTableProvider>(&provider)
+                else {
+                    return exec_err!(
+                        "registered provider for {table_ref} is not an IcebergClusterTableProvider; \
+                         distributed Iceberg scans require the Iceberg data connector"
+                    );
+                };
+                // Resolve the concrete IcebergTableProvider (the cluster wrapper's
+                // inner, peeling the deletion wrapper on the read-write path) and
+                // pin it to the snapshot the scheduler chose, so every executor task
+                // of this query reads the same snapshot. Scanning this provider
+                // directly also yields the bare scan without re-wrapping.
+                let Some(iceberg_provider) = concrete_iceberg_provider(cluster.inner()) else {
+                    return exec_err!(
+                        "IcebergClusterTableProvider for {table_ref} does not wrap an \
+                         IcebergTableProvider; cannot reconstruct the distributed scan"
+                    );
+                };
+                let pinned: Arc<dyn TableProvider> =
+                    Arc::new(iceberg_provider.clone().with_snapshot_id(node.snapshot_id));
+
+                // Output schema = table schema projected by the recipe, taken
+                // synchronously from the registered provider.
+                let table_schema = pinned.schema();
+                let output_schema = match &projection {
+                    Some(p) => Arc::new(table_schema.project(p)?),
+                    None => table_schema,
+                };
+
+                Ok(Arc::new(IcebergScanExec::new_deferred(
+                    table_ref,
+                    pinned,
+                    projection,
+                    filters,
+                    limit,
+                    output_schema,
+                    partitioning,
+                )))
+            }
             None => {
                 #[cfg(not(windows))]
                 if let Ok(plan) = Self::try_decode_nested_physical_plan(buf, ctx) {
@@ -182,6 +291,62 @@ impl PhysicalExtensionCodec for SpicePhysicalCodec {
                     schema: schema_buf,
                 })),
             }
+        } else if let Some(scan_exec) = node.downcast_ref::<IcebergScanExec>() {
+            // Serialize the scan recipe (table ref + projection/filters/limit).
+            // The executor replays `TableProvider::scan` with these to re-derive
+            // an equivalent scan — the iceberg `FileScanTask`s themselves are not
+            // serializable (partition / partition_spec fields), so the plan is
+            // rebuilt remotely rather than shipped. Conversions that don't fit the
+            // wire types fail serialization explicitly rather than silently
+            // saturating into a malformed recipe.
+            let (has_projection, projection) = match scan_exec.projection() {
+                Some(cols) => (
+                    true,
+                    cols.iter()
+                        .map(|c| {
+                            u32::try_from(*c).map_err(|_| {
+                                DataFusionError::Internal(format!(
+                                    "IcebergScanExec projection index {c} does not fit in u32; \
+                                     cannot serialize the scan for distributed execution"
+                                ))
+                            })
+                        })
+                        .collect::<Result<Vec<u32>>>()?,
+                ),
+                None => (false, Vec::new()),
+            };
+            let filters = scan_exec
+                .filters()
+                .iter()
+                .map(|expr| expr.to_bytes().map(|b| b.to_vec()))
+                .collect::<Result<Vec<Vec<u8>>>>()?;
+            let limit = scan_exec
+                .limit()
+                .map(|l| {
+                    u64::try_from(l).map_err(|_| {
+                        DataFusionError::Internal(format!(
+                            "IcebergScanExec limit {l} does not fit in u64; cannot serialize the \
+                             scan for distributed execution"
+                        ))
+                    })
+                })
+                .transpose()?;
+            let partitioning = encode_partitioning(scan_exec.properties().output_partitioning())?;
+
+            SpicePhysicalPlanNode {
+                node: Some(spice_physical_plan_node::Node::IcebergTableScan(
+                    IcebergTableScanExecNode {
+                        table_ref: scan_exec.table_ref().to_string(),
+                        projection,
+                        has_projection,
+                        filters,
+                        limit,
+                        partitioning: Some(partitioning),
+                        // Pin the plan-time snapshot so every executor task reads it.
+                        snapshot_id: scan_exec.snapshot_id(),
+                    },
+                )),
+            }
         } else {
             #[cfg(not(windows))]
             if node.downcast_ref::<CayenneAccelerationExec>().is_some() {
@@ -209,6 +374,112 @@ impl PhysicalExtensionCodec for SpicePhysicalCodec {
     fn try_decode_udf(&self, name: &str, _buf: &[u8]) -> Result<Arc<ScalarUDF>> {
         self.runtime()?.df.ctx.udf(name)
     }
+}
+
+/// Returns the concrete [`IcebergTableProvider`] behind a cluster wrapper's inner
+/// provider — directly (read path) or through the [`IcebergDeletionProvider`] the
+/// read-write path inserts. The returned provider is used (cloned + snapshot
+/// pinned) to replay the scan on the executor.
+fn concrete_iceberg_provider(inner: &Arc<dyn TableProvider>) -> Option<&IcebergTableProvider> {
+    if let Some(p) = inner.downcast_ref::<IcebergTableProvider>() {
+        return Some(p);
+    }
+    inner
+        .downcast_ref::<IcebergDeletionProvider>()
+        .and_then(|d| d.inner().downcast_ref::<IcebergTableProvider>())
+}
+
+/// Serializes a scan's output [`Partitioning`] into its wire form, so the
+/// deferred node on the executor reports the same partition count the scheduler
+/// planned (before the lazy scan runs).
+///
+/// Hash partitioning is reproduced only when every expression is a plain
+/// [`Column`]; otherwise the count is preserved as
+/// [`Partitioning::UnknownPartitioning`].
+fn encode_partitioning(partitioning: &Partitioning) -> Result<IcebergPartitioning> {
+    // Counts/indices fail serialization explicitly rather than saturating into a
+    // malformed recipe (consistent with how projection/limit are encoded).
+    fn to_u64(n: usize) -> Result<u64> {
+        u64::try_from(n).map_err(|_| {
+            DataFusionError::Internal(format!(
+                "IcebergScanExec partitioning value {n} does not fit in u64; cannot serialize \
+                 the scan for distributed execution"
+            ))
+        })
+    }
+    Ok(match partitioning {
+        Partitioning::UnknownPartitioning(n) => IcebergPartitioning {
+            kind: 0,
+            partition_count: to_u64(*n)?,
+            hash_columns: Vec::new(),
+        },
+        Partitioning::RoundRobinBatch(n) => IcebergPartitioning {
+            kind: 2,
+            partition_count: to_u64(*n)?,
+            hash_columns: Vec::new(),
+        },
+        Partitioning::Hash(exprs, n) => {
+            // Reproduce Hash partitioning only when every expr is a plain Column;
+            // otherwise preserve just the count as UnknownPartitioning.
+            let mut hash_columns = Vec::with_capacity(exprs.len());
+            let mut all_columns = true;
+            for expr in exprs {
+                if let Some(c) = expr.downcast_ref::<Column>() {
+                    hash_columns.push(IcebergHashColumn {
+                        name: c.name().to_string(),
+                        index: to_u64(c.index())?,
+                    });
+                } else {
+                    all_columns = false;
+                    break;
+                }
+            }
+            if all_columns {
+                IcebergPartitioning {
+                    kind: 1,
+                    partition_count: to_u64(*n)?,
+                    hash_columns,
+                }
+            } else {
+                IcebergPartitioning {
+                    kind: 0,
+                    partition_count: to_u64(*n)?,
+                    hash_columns: Vec::new(),
+                }
+            }
+        }
+    })
+}
+
+/// Reconstructs a [`Partitioning`] from its wire form. Values that don't fit
+/// `usize` (corrupt recipe / platform skew) fail rather than saturating.
+fn decode_partitioning(partitioning: Option<&IcebergPartitioning>) -> Result<Partitioning> {
+    fn to_usize(v: u64) -> Result<usize> {
+        usize::try_from(v).map_err(|_| {
+            DataFusionError::Internal(format!(
+                "iceberg scan recipe partitioning value {v} does not fit in usize"
+            ))
+        })
+    }
+    let Some(p) = partitioning else {
+        return Ok(Partitioning::UnknownPartitioning(1));
+    };
+    let n = to_usize(p.partition_count)?;
+    Ok(match p.kind {
+        1 => {
+            let exprs: Vec<Arc<dyn PhysicalExpr>> =
+                p.hash_columns
+                    .iter()
+                    .map(|c| {
+                        Ok::<_, DataFusionError>(Arc::new(Column::new(&c.name, to_usize(c.index)?))
+                            as Arc<dyn PhysicalExpr>)
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+            Partitioning::Hash(exprs, n)
+        }
+        2 => Partitioning::RoundRobinBatch(n),
+        _ => Partitioning::UnknownPartitioning(n),
+    })
 }
 
 #[cfg(not(windows))]
@@ -293,5 +564,53 @@ mod tests {
             plan.contains("CayenneAccelerationExec"),
             "Cayenne scan marker should survive distributed codec roundtrip: {plan}"
         );
+    }
+
+    #[test]
+    fn iceberg_scan_exec_encodes_recipe() {
+        use datafusion::logical_expr::{col as logical_col, lit};
+        use datafusion::physical_plan::empty::EmptyExec;
+
+        // The encode arm reads only IcebergScanExec's own recipe fields, not the
+        // inner plan's type, so an EmptyExec inner is sufficient to exercise it.
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Int32, false),
+            Field::new("b", DataType::Utf8, true),
+            Field::new("c", DataType::Float64, true),
+        ]));
+        let inner: Arc<dyn ExecutionPlan> = Arc::new(EmptyExec::new(schema));
+        let scan = IcebergScanExec::new(
+            TableReference::bare("trips"),
+            inner,
+            Some(vec![0, 2]),
+            vec![logical_col("a").gt(lit(5_i64))],
+            Some(10),
+        );
+
+        let codec = SpicePhysicalCodec {
+            inner: Arc::new(BallistaPhysicalExtensionCodec::default()),
+            runtime: None,
+        };
+        let mut buf = Vec::new();
+        codec
+            .try_encode(Arc::new(scan), &mut buf)
+            .expect("IcebergScanExec should serialize through the Spice codec");
+
+        let wrapper =
+            SpicePhysicalPlanNode::decode(buf.as_slice()).expect("encoded blob should decode");
+        match wrapper.node {
+            Some(spice_physical_plan_node::Node::IcebergTableScan(node)) => {
+                assert_eq!(node.table_ref, "trips");
+                assert!(node.has_projection);
+                assert_eq!(node.projection, vec![0_u32, 2_u32]);
+                assert_eq!(node.limit, Some(10_u64));
+                assert_eq!(
+                    node.filters.len(),
+                    1,
+                    "the pushed-down filter should be serialized into the recipe"
+                );
+            }
+            other => panic!("expected an IcebergTableScan recipe node, got {other:?}"),
+        }
     }
 }

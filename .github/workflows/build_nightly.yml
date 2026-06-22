@@ -79,7 +79,11 @@ jobs:
           commit_hash=$(git rev-parse --short HEAD)
           date="$(date +%Y%m%d)"
           version="${date}-${commit_hash}"
-          nightly_label="nightly.${date}.${commit_hash}"
+          # `g`-prefix the commit hash (git-describe convention) so it is always a
+          # valid SemVer pre-release identifier in the Cargo.toml version below.
+          # An all-numeric short SHA with a leading zero (e.g. 0882134) is an
+          # invalid numeric SemVer identifier and fails `cargo build`.
+          nightly_label="nightly.${date}.g${commit_hash}"
           echo "rel_version=${version}" >> $GITHUB_OUTPUT
           echo "nightly_label=${nightly_label}" >> $GITHUB_OUTPUT
           echo "Preparing to publish nightly build with version: \"${version}\""
