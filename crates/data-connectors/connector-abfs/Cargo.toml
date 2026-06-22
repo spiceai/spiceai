@@ -1,0 +1,16 @@
+[package]
+name = "connector-abfs"
+edition.workspace = true
+version.workspace = true
+rust-version.workspace = true
+license-file.workspace = true
+description = "Azure Blob Filesystem (ABFS) data connector for Spice.ai runtime"
+
+[dependencies]
+linkme.workspace = true
+object_store = { workspace = true }
+paste.workspace = true
+runtime = { path = "../../runtime" }
+snafu.workspace = true
+tokio.workspace = true
+url.workspace = true

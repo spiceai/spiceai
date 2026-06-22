@@ -1,0 +1,27 @@
+[package]
+name = "connector-kafka"
+edition.workspace = true
+version.workspace = true
+rust-version.workspace = true
+license-file.workspace = true
+description = "Apache Kafka data connector for Spice.ai runtime"
+
+[dependencies]
+arrow-schema.workspace = true
+async-stream.workspace = true
+async-trait.workspace = true
+data_components = { path = "../../data_components", features = ["kafka"] }
+dataformat-json = { path = "../../dataformat-json" }
+datafusion.workspace = true
+fundu.workspace = true
+futures.workspace = true
+linkme.workspace = true
+opentelemetry.workspace = true
+paste.workspace = true
+runtime = { path = "../../runtime" }
+secrecy.workspace = true
+serde.workspace = true
+snafu.workspace = true
+tokio.workspace = true
+tonic.workspace = true
+tracing.workspace = true
