@@ -4062,6 +4062,41 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "510ca239cf13b7f8d16a2b48f263de7b4f8c566f0af58d901031473c76afb1e3"
 
 [[package]]
+name = "connector-abfs"
+version = "2.1.0-unstable"
+dependencies = [
+ "linkme",
+ "object_store",
+ "paste",
+ "runtime",
+ "snafu",
+ "tokio",
+ "url",
+]
+
+[[package]]
+name = "connector-adbc"
+version = "2.1.0-unstable"
+dependencies = [
+ "adbc_core",
+ "adbc_driver_manager",
+ "arrow",
+ "async-trait",
+ "blake3",
+ "data_components",
+ "datafusion",
+ "datafusion-table-providers",
+ "futures",
+ "linkme",
+ "parking_lot 0.12.5",
+ "paste",
+ "runtime",
+ "snafu",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "connector-clickhouse"
 version = "2.1.0-unstable"
 dependencies = [
@@ -4078,6 +4113,22 @@ dependencies = [
  "secrecy",
  "snafu",
  "url",
+]
+
+[[package]]
+name = "connector-cosmosdb"
+version = "2.1.0-unstable"
+dependencies = [
+ "async-trait",
+ "data_components",
+ "datafusion",
+ "datafusion-table-providers",
+ "linkme",
+ "opentelemetry",
+ "paste",
+ "runtime",
+ "snafu",
+ "tokio",
 ]
 
 [[package]]
@@ -4157,6 +4208,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "connector-ducklake"
+version = "2.1.0-unstable"
+dependencies = [
+ "async-trait",
+ "data_components",
+ "datafusion",
+ "datafusion-table-providers",
+ "duckdb",
+ "linkme",
+ "paste",
+ "runtime",
+ "snafu",
+ "tokio",
+]
+
+[[package]]
 name = "connector-elasticsearch"
 version = "2.1.0-unstable"
 dependencies = [
@@ -4201,6 +4268,85 @@ dependencies = [
 ]
 
 [[package]]
+name = "connector-gcs"
+version = "2.1.0-unstable"
+dependencies = [
+ "linkme",
+ "object_store",
+ "paste",
+ "runtime",
+ "snafu",
+ "tokio",
+ "url",
+]
+
+[[package]]
+name = "connector-git"
+version = "2.1.0-unstable"
+dependencies = [
+ "async-trait",
+ "data_components",
+ "datafusion",
+ "globset",
+ "linkme",
+ "opentelemetry",
+ "paste",
+ "reqwest 0.12.24",
+ "runtime",
+ "secrecy",
+ "snafu",
+ "tokio",
+]
+
+[[package]]
+name = "connector-github"
+version = "2.1.0-unstable"
+dependencies = [
+ "arrow",
+ "arrow-schema",
+ "async-trait",
+ "chrono",
+ "data_components",
+ "datafusion",
+ "globset",
+ "governor",
+ "graphql-parser",
+ "linkme",
+ "paste",
+ "reqwest 0.12.24",
+ "runtime",
+ "runtime-rate-control",
+ "secrecy",
+ "snafu",
+ "token_provider",
+ "tokio",
+ "tracing",
+ "url",
+]
+
+[[package]]
+name = "connector-glue"
+version = "2.1.0-unstable"
+dependencies = [
+ "async-trait",
+ "aws-config",
+ "aws-credential-types",
+ "aws-sdk-glue",
+ "aws-sdk-s3",
+ "datafusion",
+ "iceberg",
+ "iceberg-catalog-glue",
+ "iceberg-datafusion",
+ "iceberg-storage-opendal",
+ "linkme",
+ "paste",
+ "runtime",
+ "secrecy",
+ "snafu",
+ "tokio",
+]
+
+[[package]]
 name = "connector-graphql"
 version = "2.1.0-unstable"
 dependencies = [
@@ -4232,6 +4378,30 @@ dependencies = [
  "runtime",
  "secrecy",
  "snafu",
+]
+
+[[package]]
+name = "connector-kafka"
+version = "2.1.0-unstable"
+dependencies = [
+ "arrow-schema",
+ "async-stream",
+ "async-trait",
+ "data_components",
+ "dataformat-json",
+ "datafusion",
+ "fundu",
+ "futures",
+ "linkme",
+ "opentelemetry",
+ "paste",
+ "runtime",
+ "secrecy",
+ "serde",
+ "snafu",
+ "tokio",
+ "tonic",
+ "tracing",
 ]
 
 [[package]]
@@ -4433,6 +4603,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "connector-snowflake-native"
+version = "2.1.0-unstable"
+dependencies = [
+ "connector-snowflake",
+]
+
+[[package]]
 name = "connector-spark"
 version = "2.1.0-unstable"
 dependencies = [
@@ -4444,6 +4621,29 @@ dependencies = [
  "runtime",
  "runtime-parameters",
  "snafu",
+]
+
+[[package]]
+name = "connector-spiceai"
+version = "2.1.0-unstable"
+dependencies = [
+ "arrow-flight",
+ "async-stream",
+ "async-trait",
+ "data_components",
+ "datafusion",
+ "datafusion-federation",
+ "flight_client",
+ "futures",
+ "linkme",
+ "ns_lookup",
+ "paste",
+ "runtime",
+ "secrecy",
+ "snafu",
+ "spice-cloud-client",
+ "tonic",
+ "tracing",
 ]
 
 [[package]]
@@ -18310,14 +18510,20 @@ version = "2.1.0-unstable"
 dependencies = [
  "app",
  "clap",
+ "connector-abfs",
  "connector-clickhouse",
+ "connector-cosmosdb",
  "connector-databricks",
  "connector-delta-lake",
  "connector-dremio",
  "connector-duckdb",
+ "connector-ducklake",
  "connector-elasticsearch",
  "connector-flightsql",
  "connector-ftp",
+ "connector-gcs",
+ "connector-git",
+ "connector-github",
  "connector-graphql",
  "connector-imap",
  "connector-mongodb",
@@ -18333,6 +18539,7 @@ dependencies = [
  "connector-smb",
  "connector-snowflake",
  "connector-spark",
+ "connector-spiceai",
  "event_stream",
  "futures",
  "mimalloc",

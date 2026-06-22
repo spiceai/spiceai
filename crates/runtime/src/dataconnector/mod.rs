@@ -57,7 +57,7 @@ use tracing::Level;
 use std::future::Future;
 use std::time::Duration;
 
-pub(crate) mod client_identity;
+pub mod client_identity;
 pub mod http_rate_control;
 pub mod listing;
 
@@ -149,19 +149,20 @@ macro_rules! register_data_connector {
     };
 }
 
-pub mod abfs;
+// abfs: moved to crates/data-connectors/connector-abfs
+// #[deprecated] pub mod abfs;
 #[cfg(feature = "adbc")]
 pub mod adbc;
-#[cfg(feature = "cosmosdb")]
-pub mod cosmosdb;
+// cosmosdb: moved to crates/data-connectors/connector-cosmosdb
+// #[cfg(feature = "cosmosdb")] pub mod cosmosdb;
 #[cfg(feature = "debezium")]
 pub mod debezium;
 #[cfg(feature = "dynamodb")]
 pub mod dynamodb;
 pub mod file;
 
-pub mod git;
-pub mod github;
+// git: moved to crates/data-connectors/connector-git
+// github: moved to crates/data-connectors/connector-github
 pub mod https;
 #[cfg(feature = "kafka")]
 pub mod kafka;
@@ -170,15 +171,14 @@ pub mod memory;
 
 pub const ODBC_DATACONNECTOR: &str = "odbc"; // const needs to be accessible when ODBC isn't built
 pub mod deferred;
-#[cfg(feature = "duckdb")]
-pub mod ducklake;
-pub mod gcs;
-pub mod glue;
+// ducklake: moved to crates/data-connectors/connector-ducklake
+// gcs: moved to crates/data-connectors/connector-gcs
+// glue: moved to crates/data-connectors/connector-glue
 pub mod iceberg;
 pub mod parameters;
 pub mod s3;
 pub mod sink;
-pub mod spiceai;
+// spiceai: moved to crates/data-connectors/connector-spiceai
 
 #[derive(Debug, Snafu)]
 pub enum DataConnectorError {
