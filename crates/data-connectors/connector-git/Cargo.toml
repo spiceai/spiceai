@@ -11,11 +11,10 @@ async-trait.workspace = true
 data_components = { path = "../../data_components" }
 datafusion.workspace = true
 globset.workspace = true
-linkme.workspace = true
 opentelemetry.workspace = true
-paste.workspace = true
 reqwest.workspace = true
 runtime = { path = "../../runtime" }
 secrecy.workspace = true
 snafu.workspace = true
 tokio.workspace = true
+tracing.workspace = true

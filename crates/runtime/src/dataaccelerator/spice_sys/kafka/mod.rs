@@ -68,7 +68,7 @@ impl KafkaSys {
         })
     }
 
-    pub(crate) async fn get(&self) -> Result<Option<KafkaMetadata>> {
+    pub async fn get(&self) -> Result<Option<KafkaMetadata>> {
         match &self.acceleration_connection {
             #[cfg(feature = "duckdb")]
             AccelerationConnection::DuckDB(pool) => self.get_duckdb(pool),
@@ -90,7 +90,7 @@ impl KafkaSys {
         }
     }
 
-    pub(crate) async fn upsert(&self, metadata: &KafkaMetadata) -> Result<()> {
+    pub async fn upsert(&self, metadata: &KafkaMetadata) -> Result<()> {
         match &self.acceleration_connection {
             #[cfg(feature = "duckdb")]
             AccelerationConnection::DuckDB(pool) => self.upsert_duckdb(pool, metadata),
@@ -112,7 +112,7 @@ impl KafkaSys {
         }
     }
 
-    pub(crate) async fn upsert_offsets(&self, offsets: &[KafkaOffset]) -> Result<()> {
+    pub async fn upsert_offsets(&self, offsets: &[KafkaOffset]) -> Result<()> {
         match &self.acceleration_connection {
             #[cfg(feature = "duckdb")]
             AccelerationConnection::DuckDB(pool) => self.upsert_offsets_duckdb(pool, offsets),

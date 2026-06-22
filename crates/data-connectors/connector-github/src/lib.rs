@@ -935,8 +935,6 @@ impl DataConnectorFactory for GithubFactory {
     }
 }
 
-register_data_connector!("github", GithubFactory);
-
 fn resolve_runtime_github_concurrent_connections_limit(
     app: Option<&app::App>,
     connector_component: &ConnectorComponent,

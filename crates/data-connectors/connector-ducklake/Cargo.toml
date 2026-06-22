@@ -12,11 +12,10 @@ data_components = { path = "../../data_components", features = ["duckdb"] }
 datafusion.workspace = true
 datafusion-table-providers = { workspace = true }
 duckdb = { workspace = true, features = ["bundled", "r2d2", "extensions-full"] }
-linkme.workspace = true
-paste.workspace = true
 runtime = { path = "../../runtime" }
 snafu.workspace = true
 tokio.workspace = true
+tracing.workspace = true
 
 [features]
 default = []
