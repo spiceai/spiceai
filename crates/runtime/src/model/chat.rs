@@ -324,8 +324,85 @@ async fn huggingface(
     }
 
     let chat_template_literal = params.get("chat_template").expose().ok();
+    let distributed = parse_distributed_config(params)?;
 
-    llms::chat::create_hf_model(&id, model_type, gguf_path, hf_token, chat_template_literal).await
+    llms::chat::create_hf_model(
+        &id,
+        model_type,
+        gguf_path,
+        hf_token,
+        chat_template_literal,
+        distributed,
+    )
+    .await
+}
+
+/// Parse the optional multi-node distributed-inference params (`distributed_backend`,
+/// `node_rank`, `nodes`) for a Huggingface model into a [`llms::chat::DistributedConfig`].
+/// Returns `Ok(None)` when distributed mode is not requested.
+#[cfg(feature = "models")]
+fn parse_distributed_config(
+    params: &Parameters,
+) -> Result<Option<llms::chat::DistributedConfig>, LlmError> {
+    let backend = match params
+        .get("distributed_backend")
+        .expose()
+        .ok()
+        .map(str::trim)
+    {
+        None | Some("") | Some("none") => return Ok(None),
+        Some("ring") => llms::chat::DistributedBackend::Ring,
+        Some(other) => {
+            return Err(LlmError::InvalidParamValueError {
+                param: "distributed_backend".to_string(),
+                message: format!("Must be 'ring' or 'none', got '{other}'"),
+            });
+        }
+    };
+
+    let node_rank = match params.get("node_rank").expose().ok().map(str::trim) {
+        None | Some("") => 0,
+        Some(raw) => raw
+            .parse::<usize>()
+            .map_err(|_| LlmError::InvalidParamValueError {
+                param: "node_rank".to_string(),
+                message: format!("Must be a non-negative integer, got '{raw}'"),
+            })?,
+    };
+
+    let nodes: Vec<String> = params
+        .get("nodes")
+        .expose()
+        .ok()
+        .map(|raw| {
+            raw.split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(ToString::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+    if nodes.is_empty() {
+        return Err(LlmError::InvalidParamValueError {
+            param: "nodes".to_string(),
+            message:
+                "`distributed_backend: ring` requires `nodes`: a comma-separated, rank-ordered list of node addresses (e.g. `10.0.0.1,10.0.0.2`)."
+                    .to_string(),
+        });
+    }
+
+    let config = llms::chat::DistributedConfig {
+        backend,
+        node_rank,
+        nodes,
+    };
+    config
+        .validate()
+        .map_err(|message| LlmError::InvalidParamValueError {
+            param: "nodes".to_string(),
+            message,
+        })?;
+    Ok(Some(config))
 }
 
 async fn databricks(

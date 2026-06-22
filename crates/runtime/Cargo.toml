@@ -317,6 +317,7 @@ kafka = ["data_components/kafka"]
 keyring-secret-store = ["runtime-secrets/keyring-secret-store"]
 mcp = ["dep:rmcp", "tools/mcp"]
 metal = ["llms/metal"]
+ring = ["llms/ring"]
 models = [
     "bedrock",
     "model_components/full",

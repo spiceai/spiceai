@@ -715,6 +715,62 @@ pub trait Chat: Sync + Send {
     }
 }
 
+/// Backend used for multi-node distributed (tensor-parallel) inference of a
+/// local model. Currently only mistral.rs's pure-TCP `ring` all-reduce.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DistributedBackend {
+    /// mistral.rs ring all-reduce over plain TCP. No system dependency; the
+    /// all-reduce is correct at world_size = 2 (the two-node case).
+    Ring,
+}
+
+/// Topology for running one local model across multiple nodes (tensor-parallel).
+///
+/// The same `nodes` list is given to every node; only `node_rank` differs.
+/// Spice derives the per-node transport wiring (ports, ring neighbour, master
+/// address) from this. Rank 0 is the head and serves the API; the other ranks
+/// run as compute replicas.
+#[derive(Debug, Clone)]
+pub struct DistributedConfig {
+    pub backend: DistributedBackend,
+    /// This node's rank in `[0, world_size)`. Rank 0 is the head/server.
+    pub node_rank: usize,
+    /// Ordered node addresses (host or IP); index == rank, length == world size.
+    pub nodes: Vec<String>,
+}
+
+impl DistributedConfig {
+    /// Number of nodes participating (the tensor-parallel world size).
+    #[must_use]
+    pub fn world_size(&self) -> usize {
+        self.nodes.len()
+    }
+
+    /// Validate the topology, returning a human-readable message on failure.
+    /// mistral.rs additionally requires the world size to divide the model's
+    /// attention/kv head counts; that is enforced when the model loads.
+    pub fn validate(&self) -> std::result::Result<(), String> {
+        let world_size = self.world_size();
+        if world_size < 2 {
+            return Err(format!(
+                "distributed inference needs at least 2 nodes; `nodes` lists {world_size}"
+            ));
+        }
+        if !world_size.is_power_of_two() {
+            return Err(format!(
+                "world size (number of `nodes`) must be a power of 2; got {world_size}"
+            ));
+        }
+        if self.node_rank >= world_size {
+            return Err(format!(
+                "`node_rank` {} is out of range for world size {world_size} (valid: 0..{world_size})",
+                self.node_rank
+            ));
+        }
+        Ok(())
+    }
+}
+
 /// Create a model to run locally, via files from Huggingface.
 ///
 /// `model_id` uniquely refers to a Huggingface model.
@@ -722,6 +778,7 @@ pub trait Chat: Sync + Send {
 ///    be inferred from the `.model_type` key in a HF's `config.json`, or from the GGUF metadata.
 /// `from_gguf` is a path to a GGUF file within the huggingface model repo. If provided, the model will be loaded from this GGUF. This is useful for loading quantized models.
 /// `hf_token_literal` is a literal string of the Huggingface API token. If not provided, the token will be read from the HF token cache (i.e. `~/.cache/huggingface/token` or set via `HF_TOKEN_PATH`).
+/// `distributed` optionally runs the model tensor-parallel across multiple nodes.
 #[cfg(feature = "local_llm")]
 pub async fn create_hf_model(
     model_id: &str,
@@ -729,6 +786,7 @@ pub async fn create_hf_model(
     from_gguf: Option<PathBuf>,
     hf_token_literal: Option<&SecretString>,
     chat_template_literal: Option<&str>,
+    distributed: Option<DistributedConfig>,
 ) -> Result<Arc<dyn Chat>> {
     mistral::MistralLlama::from_hf(
         model_id,
@@ -736,6 +794,7 @@ pub async fn create_hf_model(
         hf_token_literal,
         from_gguf,
         chat_template_literal,
+        distributed,
     )
     .await
     .map(|x| Arc::new(x) as Arc<dyn Chat>)
