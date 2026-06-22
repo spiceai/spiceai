@@ -115,7 +115,10 @@ jobs:
       - name: Build Testoperator
         uses: ./.github/actions/build-testoperator
 
+      # On spiceai-dev-xlarge-runners a dedicated in-cluster PostgreSQL pod is used,
+      # so skip the local docker Postgres there.
       - name: Setup CH-benCH PostgreSQL
+        if: github.event.inputs.runner_type != 'spiceai-dev-xlarge-runners'
         uses: ./.github/actions/setup-chbench-postgres
 
       - name: Start resource monitor
@@ -138,8 +141,24 @@ jobs:
 
       - name: Run CH-benCHmark - ${{ github.event.inputs.spicepod_path }}
         run: |
-          testoperator run htap \
-            -s /usr/local/bin/spiced \
+          # On the xlarge runner, pin spiced and testoperator to disjoint CPU sets
+          # so they don't contend for cores during the benchmark:
+          #   spiced       -> cores 0-63  (64)
+          #   testoperator -> cores 64-79 (16)
+          SPICED_BIN=/usr/local/bin/spiced
+          TESTOP_PREFIX=""
+          if [ "${{ github.event.inputs.runner_type }}" = "spiceai-dev-xlarge-runners" ] && command -v taskset >/dev/null 2>&1; then
+            cat > /tmp/spiced-pinned.sh <<'EOF'
+          #!/usr/bin/env bash
+          exec taskset -c 0-63 /usr/local/bin/spiced "$@"
+          EOF
+            chmod +x /tmp/spiced-pinned.sh
+            SPICED_BIN=/tmp/spiced-pinned.sh
+            TESTOP_PREFIX="taskset -c 64-79"
+            echo "CPU pinning: spiced -> 0-63, testoperator -> 64-79"
+          fi
+          $TESTOP_PREFIX testoperator run htap \
+            -s "${SPICED_BIN}" \
             -p '${{ steps.set_spicepod_path.outputs.SPICEPOD_PATH }}' \
             --query-set chbench \
             --scale-factor ${{ github.event.inputs.scale_factor }} \
@@ -154,7 +173,8 @@ jobs:
         env:
           SPICEAI_BENCHMARK_METRICS_KEY: ${{ secrets.SPICEAI_BENCHMARK_METRICS_KEY }}
           SPICED_COMMIT: ${{ steps.setup-spiced.outputs.SPICED_COMMIT }}
-          CHBENCH_PG_HOST: 127.0.0.1
+          # Dedicated in-cluster PG pod on xlarge; per-run docker container (loopback) elsewhere.
+          CHBENCH_PG_HOST: ${{ github.event.inputs.runner_type == 'spiceai-dev-xlarge-runners' && 'chbench-postgres.dataplatform.svc.cluster.local' || '127.0.0.1' }}
 
       - name: Stop resource monitor
         if: always()
@@ -170,3 +190,49 @@ jobs:
           name: resource-monitor
           path: /tmp/resource-monitor.tsv
           retention-days: 7
+
+      # The dedicated PG pod is long-lived and shared across runs, so a crashed
+      # or cancelled run can leave inactive replication slots (which retain WAL
+      # and eventually fill the disk) and orphaned publications. Drop any left
+      # behind. testoperator already drops its tables/publication at the start of
+      # the next run, but inactive slots are not covered by that.
+      - name: Clean up PG replication slots
+        if: always() && github.event.inputs.runner_type == 'spiceai-dev-xlarge-runners'
+        env:
+          CHBENCH_PG_HOST: chbench-postgres.dataplatform.svc.cluster.local
+          CHBENCH_PG_PORT: '5432'
+          CHBENCH_PG_USER: bench
+          CHBENCH_PG_PASS: bench
+          CHBENCH_PG_DB: chbench
+        run: |
+          cat > /tmp/chbench-slot-cleanup.sql <<'SQL'
+          DO $$
+          DECLARE r RECORD;
+          BEGIN
+            FOR r IN
+              SELECT slot_name FROM pg_replication_slots
+              WHERE slot_name LIKE 'spice_%' AND NOT active
+            LOOP
+              RAISE NOTICE 'dropping replication slot %', r.slot_name;
+              PERFORM pg_drop_replication_slot(r.slot_name);
+            END LOOP;
+            FOR r IN
+              SELECT pubname FROM pg_publication WHERE pubname LIKE 'spice_%'
+            LOOP
+              RAISE NOTICE 'dropping publication %', r.pubname;
+              EXECUTE format('DROP PUBLICATION IF EXISTS %I', r.pubname);
+            END LOOP;
+          END $$;
+          SQL
+          if ! command -v psql >/dev/null 2>&1; then
+            echo "psql not found; installing postgresql-client..."
+            sudo apt-get update -qq && sudo apt-get install -y -qq postgresql-client || true
+          fi
+          if command -v psql >/dev/null 2>&1; then
+            PGPASSWORD="${CHBENCH_PG_PASS}" psql \
+              -h "${CHBENCH_PG_HOST}" -p "${CHBENCH_PG_PORT}" \
+              -U "${CHBENCH_PG_USER}" -d "${CHBENCH_PG_DB}" \
+              -v ON_ERROR_STOP=0 -f /tmp/chbench-slot-cleanup.sql || true
+          else
+            echo "No psql client available; skipping replication slot cleanup."
+          fi
