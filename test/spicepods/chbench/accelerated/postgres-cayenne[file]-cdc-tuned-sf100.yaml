@@ -13,7 +13,7 @@ name: postgres-cayenne[file]-cdc-tuned-sf100
 #     fresh so they stay inline (4000ms/512 MB regressed — see the note on the linger below).
 #   - cdc_prefetch_buffer / cdc_max_coalesced_envelopes 16384: runtime max; deep prefetch keeps
 #     WAL drain ahead of bursty OLTP without enlarging the per-apply batch.
-#   - target_partitions 64: read-path parallelism matched to vCPU count (drives the QPH goal).
+#   - target_partitions 48: read-path parallelism tuned for the QPH goal on the 64c runner.
 #   - cayenne_pk_keyset_cache_mb 256 pinned on ALL tables: defeats the backwards memory-aware
 #     auto-default (total_mem/32 -> ~8 GiB on a 256 GiB host) and keeps the heavy-update tables
 #     (stock, order_line) on the cheap bloom path (256 = SF-100 sweep optimum).
@@ -79,7 +79,8 @@ datasets:
         # Explicit: the engine default flipped to `memory`. This pod IS the
         # file-durability variant (per-batch durable persist before the slot
         # ack) — its identity must not depend on the build's default. The
-        # memory-durability twin is postgres-cayenne[file]-cdc-memory.yaml.
+        # memory-durability variant was retired with the obsolete CDC memory
+        # configs.
         cayenne_cdc_durability: file
         # KEY deletes even in file mode: deletion_mode auto resolves to
         # position, which serializes compaction with writers (try_lock
