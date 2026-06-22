@@ -123,6 +123,18 @@ impl CloudClient {
         self.inner.get_auth_context().await.map_err(into_cli)
     }
 
+    /// Returns user auth context when the token supports it.
+    ///
+    /// Service-account tokens cannot access the auth-context endpoint; those
+    /// `Unauthorized` failures are treated as absent user context.
+    pub async fn optional_user_auth_context(&self) -> Result<Option<AuthContext>> {
+        match self.get_auth_context().await {
+            Ok(ctx) => Ok(Some(ctx)),
+            Err(err) if is_unauthorized_auth_context_error(&err) => Ok(None),
+            Err(err) => Err(err),
+        }
+    }
+
     // ========================================================================
     // Apps
     // ========================================================================
@@ -152,7 +164,7 @@ impl CloudClient {
             .fail();
         }
 
-        let context = self.get_auth_context().await.ok();
+        let context = self.optional_user_auth_context().await?;
         let apps = self.list_apps().await?;
         let context_org = context.as_ref().map(|c| c.org_name.as_str());
 
@@ -561,6 +573,14 @@ fn build_executor(
         resources: build_resources(cpu, memory),
         storage_size_gb: None,
     })
+}
+
+fn is_unauthorized_auth_context_error(err: &crate::error::Error) -> bool {
+    matches!(
+        err,
+        crate::error::Error::InvalidArgument { message }
+            if message.starts_with("Unauthorized:")
+    )
 }
 
 /// Convert a [`spice_cloud_client::error::Error`] into the CLI error type.

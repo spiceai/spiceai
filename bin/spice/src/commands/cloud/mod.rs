@@ -1046,7 +1046,10 @@ fn execute_logout() -> Result<()> {
     let lines: Vec<&str> = content
         .lines()
         .filter(|line| {
-            !line.starts_with("SPICE_SPICEAI_TOKEN=") && !line.starts_with("SPICE_SPICEAI_API_KEY=")
+            !line.starts_with("SPICE_SPICEAI_TOKEN=")
+                && !line.starts_with("SPICE_SPICEAI_API_KEY=")
+                && !line.starts_with("SPICE_CLOUD_CLIENT_ID=")
+                && !line.starts_with("SPICE_CLOUD_CLIENT_SECRET=")
         })
         .collect();
 
@@ -1149,7 +1152,7 @@ fn execute_unlink() -> Result<()> {
 
 async fn execute_apps(args: &AppsArgs) -> Result<()> {
     let client = CloudClient::new()?;
-    let context = client.get_auth_context().await.ok();
+    let context = client.optional_user_auth_context().await?;
     let apps = client.list_apps().await?;
 
     if apps.is_empty() {
