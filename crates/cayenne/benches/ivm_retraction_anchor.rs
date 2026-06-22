@@ -41,10 +41,11 @@
 //!   proposed per-key-index retraction. Recompute is O(N); maintain is O(delta),
 //!   serve is O(groups) — so the ratio widens with table size.
 //!
-//! The retraction logic here (`MaintainedView`) is the reference for the
-//! follow-up `maintained_aggregate.rs` change; this bench's `assert`-guarded
-//! correctness check (sums identical to a full recompute over
-//! inserts+updates+deletes) is run before any timing.
+//! The retraction logic modeled here (`MaintainedView`) mirrors the per-key
+//! contribution index now implemented in `maintained_aggregate.rs` (which is
+//! authoritative); this bench's `assert`-guarded correctness check (sums
+//! identical to a full recompute over inserts+updates+deletes) runs before any
+//! timing.
 //!
 //! ## Measured (Apple Silicon, 12 perf cores; full sweep + the real DuckDB
 //! comparison live in the PR description). Per-query answer cost:
@@ -89,6 +90,8 @@ use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_m
 
 const GROUP_COUNT: usize = 1_000;
 const DELTA_ROWS: usize = 100;
+/// Upper bound for the parallel-recompute lane; the lane caps the actual thread
+/// count at the host's available parallelism so it never oversubscribes.
 const THREAD_COUNT: usize = 12;
 const SEED: u64 = 0x5125_2026_0621_0001;
 
@@ -187,7 +190,10 @@ fn generate_ops(op_count: usize, base_rows: usize, group_count: usize, rng: &mut
 /// contribution index that enables retraction with no before-image.
 #[derive(Clone)]
 struct MaintainedView {
-    accumulators: HashMap<u32, i128>,
+    /// `group -> (running SUM, live row count)`. The row count lets a group be
+    /// dropped only when it is truly empty (matches SQL `GROUP BY`), not when its
+    /// SUM happens to be 0 — mirroring `GroupAccumulator.rows` in the real registry.
+    accumulators: HashMap<u32, (i128, u64)>,
     contribution_index: HashMap<u64, (u32, i64)>,
 }
 
@@ -201,22 +207,30 @@ impl MaintainedView {
 
     fn apply_upsert(&mut self, pk: u64, group: u32, value: i64) {
         if let Some((old_group, old_value)) = self.contribution_index.insert(pk, (group, value)) {
-            let slot = self
-                .accumulators
-                .get_mut(&old_group)
-                .expect("a group in the index must have an accumulator");
-            *slot -= i128::from(old_value);
+            self.retract_contribution(old_group, old_value);
         }
-        *self.accumulators.entry(group).or_insert(0) += i128::from(value);
+        let slot = self.accumulators.entry(group).or_insert((0, 0));
+        slot.0 += i128::from(value);
+        slot.1 += 1;
     }
 
     fn apply_delete(&mut self, pk: u64) {
         if let Some((old_group, old_value)) = self.contribution_index.remove(&pk) {
-            let slot = self
-                .accumulators
-                .get_mut(&old_group)
-                .expect("a group in the index must have an accumulator");
-            *slot -= i128::from(old_value);
+            self.retract_contribution(old_group, old_value);
+        }
+    }
+
+    /// Subtract one row's contribution from `group`, dropping the group once its
+    /// last live row is retracted.
+    fn retract_contribution(&mut self, group: u32, value: i64) {
+        let slot = self
+            .accumulators
+            .get_mut(&group)
+            .expect("a group in the index must have an accumulator");
+        slot.0 -= i128::from(value);
+        slot.1 -= 1;
+        if slot.1 == 0 {
+            self.accumulators.remove(&group);
         }
     }
 
@@ -227,20 +241,21 @@ impl MaintainedView {
         }
     }
 
-    /// O(G) "serve the maintained result": snapshot non-zero groups.
+    /// O(G) "serve the maintained result": snapshot every live group. Empty
+    /// groups are already absent (dropped on last-row retraction), so a group
+    /// with rows whose SUM is exactly 0 is still returned — matching `GROUP BY`.
     fn serve(&self) -> Vec<(u32, i128)> {
         let mut out: Vec<(u32, i128)> = self
             .accumulators
             .iter()
-            .filter(|(_, sum)| **sum != 0)
-            .map(|(group, sum)| (*group, *sum))
+            .map(|(group, (sum, _))| (*group, *sum))
             .collect();
         out.sort_by_key(|(group, _)| *group);
         out
     }
 
     fn checksum(&self) -> i128 {
-        self.accumulators.values().copied().sum()
+        self.accumulators.values().map(|(sum, _)| *sum).sum()
     }
 }
 
@@ -323,14 +338,19 @@ fn assert_retraction_matches_recompute() {
                 mirror.insert(pk, (group, value));
             }
             Op::Delete { pk } => {
-                saw_delete = true;
+                // Only count a delete that actually removed a live row, so the
+                // gate proves the retraction path ran (a no-op delete of an
+                // absent PK would otherwise satisfy it trivially).
+                saw_delete |= mirror.remove(&pk).is_some();
                 view.apply_delete(pk);
-                mirror.remove(&pk);
             }
         }
     }
     assert!(saw_update, "delta must exercise the UPDATE retraction path");
-    assert!(saw_delete, "delta must exercise the DELETE retraction path");
+    assert!(
+        saw_delete,
+        "delta must exercise the DELETE retraction path (a real row removal)"
+    );
 
     let mut truth: HashMap<u32, i128> = HashMap::new();
     for (group, value) in mirror.values() {
@@ -345,7 +365,7 @@ fn assert_retraction_matches_recompute() {
     groups.sort_unstable();
     groups.dedup();
     for group in groups {
-        let lhs = view.accumulators.get(&group).copied().unwrap_or(0);
+        let lhs = view.accumulators.get(&group).map_or(0, |(sum, _)| *sum);
         let rhs = truth.get(&group).copied().unwrap_or(0);
         assert_eq!(
             lhs, rhs,
@@ -433,7 +453,14 @@ fn bench_recompute_vs_maintain(c: &mut Criterion) {
         let base = build_base(rows, GROUP_COUNT, &mut rng);
         let maintained = build_maintained(&base);
         let delta = generate_ops(DELTA_ROWS, rows, GROUP_COUNT, &mut rng);
-        group.throughput(Throughput::Elements(rows as u64));
+        // No group-level throughput: the lanes measure different units
+        // (recompute is O(rows), maintain_delta is O(DELTA_ROWS), serve is
+        // O(groups)), so a single Elements(rows) figure would misreport three.
+        // Cap parallelism by the host (THREAD_COUNT is only an upper bound) so
+        // the lane adapts instead of oversubscribing smaller machines.
+        let thread_count = std::thread::available_parallelism()
+            .map_or(THREAD_COUNT, std::num::NonZeroUsize::get)
+            .min(THREAD_COUNT);
 
         group.bench_with_input(
             BenchmarkId::new("recompute_1thread", rows),
@@ -441,12 +468,12 @@ fn bench_recompute_vs_maintain(c: &mut Criterion) {
             |b, _| b.iter(|| black_box(recompute(&base).values().copied().sum::<i128>())),
         );
         group.bench_with_input(
-            BenchmarkId::new("recompute_12thread", rows),
+            BenchmarkId::new(format!("recompute_{thread_count}thread"), rows),
             &rows,
             |b, _| {
                 b.iter(|| {
                     black_box(
-                        recompute_parallel(&base, THREAD_COUNT)
+                        recompute_parallel(&base, thread_count)
                             .values()
                             .copied()
                             .sum::<i128>(),
@@ -530,7 +557,7 @@ fn bench_real_registry_retract(c: &mut Criterion) {
                     let registry = MaintainedAggregateRegistry::try_new_with_pk(
                         &[retract_spec()],
                         &retract_schema(),
-                        vec![0],
+                        &[0],
                         usize::MAX,
                     )
                     .expect("registry construction");

@@ -2439,7 +2439,10 @@ enum MaintainedAggregateApply {
     },
     Delete {
         epoch: u64,
-        rows: RecordBatch,
+        /// PK columns of the deleted rows, projected by name into `pk_columns`
+        /// order (table-schema types) — the layout `apply_pk_deletes` expects, so
+        /// retraction is independent of the CDC delete batch's source schema.
+        pk_batch: RecordBatch,
     },
 }
 
@@ -13277,10 +13280,9 @@ impl CayenneTableProvider {
                     MaintainedAggregateApply::Insert { epoch, batches } => {
                         (epoch, registry.apply_insert_batches(epoch, &batches))
                     }
-                    MaintainedAggregateApply::Delete { epoch, rows } => (
-                        epoch,
-                        registry.apply_delta(epoch, &[], std::slice::from_ref(&rows)),
-                    ),
+                    MaintainedAggregateApply::Delete { epoch, pk_batch } => {
+                        (epoch, registry.apply_pk_deletes(epoch, &pk_batch))
+                    }
                 };
                 if let Err(error) = result {
                     registry.mark_stale(epoch);
@@ -13354,11 +13356,15 @@ impl CayenneTableProvider {
     /// key. The per-PK index holds each deleted PK's contribution, so retraction
     /// is O(deleted rows) with no CDC before-image. No-op without a PK index (the
     /// delete path then relies on the legacy `mark_stale` bookkeeping) or for an
-    /// empty batch. Enqueues onto the ordered background applier rather than
-    /// applying inline, so retraction never blocks replication convergence; the
-    /// applier retracts in epoch order and fails safe to stale on error. The
-    /// epoch is assigned here, on the serialized write path, so the applier sees
-    /// deltas in arrival order.
+    /// empty batch. CDC delete batches carry the SOURCE-schema column layout, so
+    /// the PK columns are projected by name into the registry's `pk_columns`
+    /// order before enqueuing (see [`Self::project_delete_pk_batch`]) — otherwise
+    /// the registry's index-position retraction would read the wrong columns.
+    /// Enqueues onto the ordered background applier rather than applying inline,
+    /// so retraction never blocks replication convergence; the applier retracts
+    /// in epoch order and fails safe to stale on error. The epoch is assigned
+    /// here, on the serialized write path, so the applier sees deltas in arrival
+    /// order.
     async fn apply_maintained_aggregate_delete(&self, delete_rows: &RecordBatch) {
         if self.maintained_aggregates.is_empty()
             || !self.maintained_aggregates.supports_retraction()
@@ -13369,13 +13375,67 @@ impl CayenneTableProvider {
         let Some(tx) = &self.maintained_aggregate_tx else {
             return;
         };
+        let pk_batch = match self.project_delete_pk_batch(delete_rows) {
+            Ok(Some(pk_batch)) => pk_batch,
+            // The PK can't be resolved from this delete batch (missing/null PK
+            // column); fall back to stale rather than retract the wrong keys.
+            Ok(None) => {
+                self.mark_maintained_aggregates_stale();
+                return;
+            }
+            Err(error) => {
+                self.mark_maintained_aggregates_stale();
+                tracing::warn!(
+                    table = %self.table_metadata.table_name,
+                    error = %error,
+                    "Failed to project maintained-aggregate delete PK columns; queries will fall back to base table scans"
+                );
+                return;
+            }
+        };
         let epoch = self.next_maintained_aggregate_epoch();
         let _ = tx
-            .send(MaintainedAggregateApply::Delete {
-                epoch,
-                rows: delete_rows.clone(),
-            })
+            .send(MaintainedAggregateApply::Delete { epoch, pk_batch })
             .await;
+    }
+
+    /// Project a CDC delete batch (source-schema column layout) onto the table's
+    /// primary-key columns, resolved BY NAME, in `pk_column_indices` order and
+    /// cast to the table column types — the layout
+    /// [`MaintainedAggregateRegistry::apply_pk_deletes`] expects, so retraction
+    /// does not depend on the delete batch's source-schema column order. Returns
+    /// `None` when a PK column is missing or null (the row can't be keyed). This
+    /// mirrors the by-name PK resolution in [`Self::cdc_delete_intents_from_batch`].
+    fn project_delete_pk_batch(
+        &self,
+        delete_rows: &RecordBatch,
+    ) -> datafusion_common::Result<Option<RecordBatch>> {
+        if delete_rows.num_rows() == 0 || self.pk_column_indices.is_empty() {
+            return Ok(None);
+        }
+        let pk_schema = Arc::new(
+            self.table_metadata
+                .schema
+                .project(&self.pk_column_indices)?,
+        );
+        let batch_schema = delete_rows.schema();
+        let mut columns: Vec<ArrayRef> = Vec::with_capacity(self.pk_column_indices.len());
+        for field in pk_schema.fields() {
+            let Ok(batch_idx) = batch_schema.index_of(field.name()) else {
+                return Ok(None);
+            };
+            let column = delete_rows.column(batch_idx);
+            let column = if column.data_type() == field.data_type() {
+                Arc::clone(column)
+            } else {
+                arrow::compute::cast(column, field.data_type())?
+            };
+            if column.null_count() > 0 {
+                return Ok(None);
+            }
+            columns.push(column);
+        }
+        Ok(Some(RecordBatch::try_new(pk_schema, columns)?))
     }
 
     async fn rebuild_maintained_aggregates_from_visible_state(

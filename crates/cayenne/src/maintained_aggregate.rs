@@ -383,11 +383,15 @@ impl MaintainedAggregateRegistry {
     }
 
     /// Apply positive row deltas if the state is fresh, otherwise keep it stale.
+    /// Bounds memory: if the per-PK index would exceed its cap the indexes are
+    /// cleared and the registry fails safe to stale.
     ///
     /// # Errors
     ///
-    /// Returns an error if a maintained accumulator overflows or Arrow scalar
-    /// extraction fails. The caller should then mark the registry stale.
+    /// Returns an error (after clearing the indexes and marking the registry
+    /// stale) when a maintained accumulator overflows, Arrow scalar extraction
+    /// fails, or the per-PK index exceeds its entry cap. Queries then fall back
+    /// to base-table scans until the next rebuild.
     pub fn apply_insert_batches(
         &self,
         epoch: u64,
@@ -409,13 +413,17 @@ impl MaintainedAggregateRegistry {
             return Ok(());
         }
 
-        for batch in batches {
+        let mut failure: Option<DataFusionError> = None;
+        'outer: for batch in batches {
             for view in &mut state.views {
-                view.apply_insert_batch(batch)?;
+                if let Err(error) = view.apply_insert_batch(batch) {
+                    failure = Some(error);
+                    break 'outer;
+                }
             }
         }
 
-        Ok(())
+        finalize_maintenance_pass(&mut state, self.max_index_entries, failure)
     }
 
     /// Apply one CDC visibility epoch's delta: `deletes` are retracted by PK,
@@ -427,8 +435,10 @@ impl MaintainedAggregateRegistry {
     ///
     /// # Errors
     ///
-    /// Returns an error only on internal misuse; data-dependent failures are
-    /// absorbed into the `Stale` status.
+    /// Returns an error (after clearing the indexes and marking the registry
+    /// stale) when a retraction or insert fails or the per-PK index exceeds its
+    /// cap, so the caller can log a concrete reason. An out-of-order epoch is
+    /// not an error: it silently marks stale and returns `Ok`.
     pub fn apply_delta(
         &self,
         epoch: u64,
@@ -448,37 +458,60 @@ impl MaintainedAggregateRegistry {
             return Ok(());
         }
 
-        let mut failed = false;
+        let mut failure: Option<DataFusionError> = None;
         'views: for view in &mut state.views {
             for batch in deletes {
-                if view.retract_batch(batch).is_err() {
-                    failed = true;
+                if let Err(error) = view.retract_batch(batch) {
+                    failure = Some(error);
                     break 'views;
                 }
             }
             for batch in upserts {
-                if view.apply_insert_batch(batch).is_err() {
-                    failed = true;
+                if let Err(error) = view.apply_insert_batch(batch) {
+                    failure = Some(error);
                     break 'views;
                 }
             }
         }
 
-        let over_cap = state
-            .views
-            .iter()
-            .map(MaintainedAggregateView::index_len)
-            .sum::<usize>()
-            > self.max_index_entries;
+        finalize_maintenance_pass(&mut state, self.max_index_entries, failure)
+    }
 
-        if failed || over_cap {
-            for view in &mut state.views {
-                view.clear();
-            }
+    /// Retract delete rows whose primary-key columns are supplied directly as
+    /// the columns of `pk_batch`, in `pk_columns` order (positions `0..n`). The
+    /// caller resolves the PK columns BY NAME from the CDC delete batch, so this
+    /// is independent of that batch's source-schema column layout — unlike
+    /// [`Self::apply_delta`], whose `deletes` are read at the table-schema
+    /// `pk_columns` indices. Requires a PK index ([`Self::try_new_with_pk`]).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error (after clearing the indexes and marking the registry
+    /// stale) when retraction fails. An out-of-order epoch silently marks stale
+    /// and returns `Ok`.
+    pub fn apply_pk_deletes(&self, epoch: u64, pk_batch: &RecordBatch) -> DataFusionResult<()> {
+        let mut state = self.state.write();
+
+        if epoch != state.epoch.saturating_add(1) {
+            state.epoch = state.epoch.max(epoch);
             state.status = RegistryStatus::Stale;
+            return Ok(());
         }
 
-        Ok(())
+        state.epoch = epoch;
+        if state.status == RegistryStatus::Stale || state.views.is_empty() {
+            return Ok(());
+        }
+
+        let mut failure: Option<DataFusionError> = None;
+        for view in &mut state.views {
+            if let Err(error) = view.retract_pk_batch(pk_batch) {
+                failure = Some(error);
+                break;
+            }
+        }
+
+        finalize_maintenance_pass(&mut state, self.max_index_entries, failure)
     }
 
     /// Rebuild every view from a complete table snapshot.
@@ -632,7 +665,9 @@ impl MaintainedAggregateView {
         Ok(())
     }
 
-    /// Retract every row in a delete batch by PK. Requires a PK index.
+    /// Retract every row in a delete batch by PK, reading the PK at the
+    /// table-schema `pk_columns` indices. Requires the batch to carry the
+    /// table-schema column layout. Requires a PK index.
     fn retract_batch(&mut self, batch: &RecordBatch) -> DataFusionResult<()> {
         if self.pk_columns.is_empty() {
             return Err(DataFusionError::Internal(
@@ -641,6 +676,25 @@ impl MaintainedAggregateView {
         }
         for row in 0..batch.num_rows() {
             let pk = Self::scalar_key(batch, row, self.pk_columns.iter().copied())?;
+            self.retract_pk(&pk)?;
+        }
+        Ok(())
+    }
+
+    /// Retract every row of `pk_batch`, whose columns ARE this view's primary-key
+    /// columns in `pk_columns` order (positions `0..num_columns`). Mirrors the
+    /// keys built by [`Self::apply_insert_batch`] (PK scalars in `pk_columns`
+    /// order), so the caller must project the CDC delete batch to exactly those
+    /// columns, by name, in that order — independent of its source-schema layout.
+    /// Requires a PK index.
+    fn retract_pk_batch(&mut self, pk_batch: &RecordBatch) -> DataFusionResult<()> {
+        if self.pk_columns.is_empty() {
+            return Err(DataFusionError::Internal(
+                "maintained aggregate retraction requires a configured primary key".to_string(),
+            ));
+        }
+        for row in 0..pk_batch.num_rows() {
+            let pk = Self::scalar_key(pk_batch, row, 0..pk_batch.num_columns())?;
             self.retract_pk(&pk)?;
         }
         Ok(())
@@ -868,7 +922,10 @@ impl GroupAccumulator {
         for aggregate in &mut self.aggregates {
             aggregate.apply_insert_row(batch, row)?;
         }
-        self.rows = self.rows.saturating_add(1);
+        // `checked_add` (not saturating): a silently-clamped counter would break
+        // the "drop the group when its last row is retracted" invariant, so an
+        // overflow must fail the registry safe to stale instead.
+        self.rows = self.rows.checked_add(1).ok_or_else(count_overflow)?;
         Ok(())
     }
 
@@ -879,7 +936,11 @@ impl GroupAccumulator {
         for (aggregate, input) in self.aggregates.iter_mut().zip(inputs) {
             aggregate.retract_row(input.as_ref())?;
         }
-        self.rows = self.rows.saturating_sub(1);
+        // `checked_sub` (not saturating): if retractions ever outnumber inserts
+        // for a group (index/state inconsistency), surface it as an error so the
+        // caller fails safe to stale rather than silently clamping at 0 and
+        // mis-dropping the group.
+        self.rows = self.rows.checked_sub(1).ok_or_else(retract_underflow)?;
         Ok(self.rows == 0)
     }
 
@@ -1317,6 +1378,39 @@ fn scalar_for_field(
         scalar.data_type(),
         field.data_type()
     )))
+}
+
+/// Finalize a maintenance pass: if `failure` is set, or the per-PK index now
+/// exceeds `max_index_entries`, clear every index, mark the registry stale, and
+/// return the reason (so the write-path applier can log it); otherwise the
+/// registry stays fresh. Centralizes the fail-safe across the insert, delta, and
+/// PK-delete paths so memory is bounded on every path (not only `apply_delta`).
+fn finalize_maintenance_pass(
+    state: &mut RegistryState,
+    max_index_entries: usize,
+    failure: Option<DataFusionError>,
+) -> DataFusionResult<()> {
+    let over_cap = state
+        .views
+        .iter()
+        .map(MaintainedAggregateView::index_len)
+        .sum::<usize>()
+        > max_index_entries;
+    if failure.is_some() || over_cap {
+        for view in &mut state.views {
+            view.clear();
+        }
+        state.status = RegistryStatus::Stale;
+        return Err(failure.unwrap_or_else(index_cap_exceeded));
+    }
+    Ok(())
+}
+
+fn index_cap_exceeded() -> DataFusionError {
+    DataFusionError::Execution(
+        "Maintained aggregate per-PK index exceeded its entry cap; falling back to base table scan"
+            .to_string(),
+    )
 }
 
 fn count_overflow() -> DataFusionError {
@@ -1790,6 +1884,49 @@ mod tests {
         Ok(())
     }
 
+    /// `apply_pk_deletes` retracts using a batch whose columns ARE the primary
+    /// key in `pk_columns` order (positions `0..n`) — NOT the table-schema
+    /// layout. This is the path the provider uses after projecting a CDC delete
+    /// batch by name, so retraction matches the right keys regardless of the
+    /// delete batch's source-schema column order. PK = column index 2 (`u`).
+    #[test]
+    fn apply_pk_deletes_retracts_by_projected_pk() -> DataFusionResult<()> {
+        let registry = MaintainedAggregateRegistry::try_new_with_pk(
+            &[sum_i_spec()],
+            &schema(),
+            &[2],
+            usize::MAX,
+        )?;
+        registry.apply_insert_batches(
+            1,
+            &[group_batch(&[("a", 1, 10), ("a", 2, 20), ("b", 3, 5)])],
+        )?;
+
+        // A PK-only batch: one `u` (UInt64) column at position 0 — the table
+        // layout has the PK at column 2, so a positional read of the full table
+        // batch would pick the wrong column. apply_pk_deletes reads positions
+        // `0..n`, matching the index keys built from the table PK column.
+        let pk_only = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new("u", DataType::UInt64, true)])),
+            vec![Arc::new(UInt64Array::from(vec![2_u64, 3_u64]))],
+        )
+        .expect("pk batch should be valid");
+        registry.apply_pk_deletes(2, &pk_only)?;
+
+        let sums = sum_i_by_name(&registry)?;
+        assert_eq!(
+            sums.get("a"),
+            Some(&10),
+            "a keeps only pk=1 (i=10) after pk=2 retracted"
+        );
+        assert_eq!(
+            sums.get("b"),
+            None,
+            "b fully retracted (pk=3 was its only row)"
+        );
+        Ok(())
+    }
+
     #[test]
     fn apply_delta_handles_update_as_retract_then_insert() -> DataFusionResult<()> {
         let registry = MaintainedAggregateRegistry::try_new_with_pk(
@@ -1837,7 +1974,10 @@ mod tests {
         // registry fails safe to Stale and serves nothing (base-table fallback).
         let registry =
             MaintainedAggregateRegistry::try_new_with_pk(&[sum_i_spec()], &schema(), &[2], 1)?;
-        registry.apply_delta(1, &[group_batch(&[("a", 1, 10), ("a", 2, 20)])], &[])?;
+        // Exceeding the cap surfaces a concrete error (not a silent Ok) so the
+        // write-path applier can log the reason.
+        let result = registry.apply_delta(1, &[group_batch(&[("a", 1, 10), ("a", 2, 20)])], &[]);
+        assert!(result.is_err(), "over-cap apply must return an error");
         let aggregate =
             aggregate_exec_for(&[("sum(i)", MaintainedAggregateFunction::Sum, Some("i"))])?;
         assert!(
