@@ -58,7 +58,7 @@ on:
           - 'spiceai-dev-xlarge-runners'
 
 # Serialize ALL SF100 + SF1000 CH-benCHmark runs across every variant (sqlite/turso cdc-tuned,
-# adaptive, cdc-memory, duckdb): they share ONE concurrency group keyed only by scale factor, so
+# adaptive, duckdb): they share ONE concurrency group keyed only by scale factor, so
 # only one runs at any time on the shared xlarge runner pool. Overlapping heavy CDC runs would
 # contend for runners and skew each other's freshness/QPH numbers. cancel-in-progress is false so
 # an in-flight benchmark is never killed mid-run. Other scale factors (e.g. manual SF1/SF10 runs)
