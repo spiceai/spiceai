@@ -126,7 +126,11 @@ pub async fn register_external_connectors() {
     )
     .await;
 
-    // kafka is still registered via runtime's distributed_slice
+    #[cfg(feature = "adbc")]
+    register_connector_factory(connector_adbc::CONNECTOR_NAME, connector_adbc::factory()).await;
+
+    #[cfg(feature = "kafka")]
+    register_connector_factory(connector_kafka::CONNECTOR_NAME, connector_kafka::factory()).await;
 
     #[cfg(feature = "databricks")]
     register_connector_factory(

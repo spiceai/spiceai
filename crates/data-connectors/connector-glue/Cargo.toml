@@ -7,19 +7,4 @@ license-file.workspace = true
 description = "AWS Glue data connector for Spice.ai runtime"
 
 [dependencies]
-async-trait.workspace = true
-aws-config.workspace = true
-aws-credential-types.workspace = true
-aws-sdk-glue.workspace = true
-aws-sdk-s3.workspace = true
-datafusion.workspace = true
-iceberg.workspace = true
-iceberg-catalog-glue.workspace = true
-iceberg-datafusion.workspace = true
-iceberg-storage-opendal.workspace = true
-linkme.workspace = true
-paste.workspace = true
 runtime = { path = "../../runtime" }
-secrecy.workspace = true
-snafu.workspace = true
-tokio.workspace = true

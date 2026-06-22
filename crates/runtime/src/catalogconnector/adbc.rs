@@ -20,7 +20,7 @@ limitations under the License.
 //! and provides schema/table discovery using the ADBC metadata API.
 
 use super::{CatalogConnector, ConnectorComponent, ParameterSpec};
-use crate::dataconnector::adbc::{
+use data_components::adbc_helpers::{
     build_db_options, dialect_for_driver, enrich_with_bigquery_metadata,
 };
 use crate::{Runtime, component::catalog::Catalog, dataconnector::parameters::ConnectorParams};

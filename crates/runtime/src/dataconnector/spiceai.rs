@@ -617,14 +617,6 @@ impl DataConnector for SpiceAI {
     }
 }
 
-register_data_connector!("spice.ai", SpiceAIFactory);
-register_data_connector!(
-    register_legacy_spiceai_connector,
-    LEGACY_SPICEAI_CONNECTOR_REGISTRATION,
-    "spiceai",
-    SpiceAIFactory
-);
-
 #[derive(Debug, PartialEq, Eq)]
 pub enum SpiceAIDatasetPath {
     OrgAppPath {
