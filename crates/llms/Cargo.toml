@@ -82,10 +82,15 @@ cuda = [
     "tei_backend/cuda",
     "tei_candle/cuda",
     "mistralrs-core/cuda",
-    "mistralrs-core/flash-attn",
     "mistralrs/cuda",
-    "mistralrs/flash-attn",
     "cudarc/cuda-version-from-build-system",
+]
+# Flash-Attention is opt-in (compose with `cuda`). It MUST stay off for
+# MLA-attention models (GLM-4.5/5.x, DeepSeek-V3/R1) whose kernels abort it;
+# enable only for standard-attention models that benefit.
+flash-attn = [
+    "mistralrs-core/flash-attn",
+    "mistralrs/flash-attn",
 ]
 local_embed = [
     "dep:tei_backend",

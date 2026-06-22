@@ -686,6 +686,7 @@ pub trait Chat: Sync + Send {
         })? {
             Some(resp) => vec![ChatChoice {
                 message: ChatCompletionResponseMessage {
+                    reasoning_content: None,
                     content: Some(resp),
                     tool_calls: None,
                     role: Role::System,
