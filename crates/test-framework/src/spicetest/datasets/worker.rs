@@ -565,8 +565,15 @@ impl SpiceTestQueryWorker {
         results_snapshot: bool,
         validate: bool,
     ) -> Result<()> {
+        // Only retain result batches when something actually consumes them:
+        // validation (executor must support it) or a results snapshot. The
+        // throughput path needs neither, so the executor streams-and-discards
+        // instead of materializing the full result set in memory.
+        let collect_batches =
+            results_snapshot || (validate && self.executor.supports_validation());
+
         // Execute query using the configured executor
-        let result = self.executor.execute(query).await?;
+        let result = self.executor.execute(query, collect_batches).await?;
 
         // Handle validation if supported and requested
         if validate
