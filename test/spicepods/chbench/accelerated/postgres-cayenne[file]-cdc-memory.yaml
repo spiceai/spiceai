@@ -29,7 +29,7 @@ name: postgres-cayenne[file]-cdc-memory
 # comparison isolates the effect of in-memory CDC durability, not caching/history overhead.
 
 postgres_connection_params: &postgres_params
-  pg_host: 127.0.0.1
+  pg_host: ${env:CHBENCH_PG_HOST}
   pg_port: 5432
   pg_db: chbench
   pg_user: bench
