@@ -897,8 +897,15 @@ fn build_chunk_response(
         .map(arrow::array::RecordBatch::num_rows)
         .sum();
 
-    // Calculate row offset based on chunk index using the configured chunk size
-    let row_offset = chunk_index.saturating_mul(DEFAULT_CHUNK_SIZE);
+    // Use the chunk's recorded cumulative starting offset. Chunks are not fixed-size
+    // (they hold whole batches and flush once the row threshold is reached), so the
+    // offset cannot be derived from `chunk_index * DEFAULT_CHUNK_SIZE`. Fall back to that
+    // estimate only for results persisted before per-chunk offsets were recorded.
+    let row_offset = job_result
+        .chunk_row_offsets
+        .get(chunk_index)
+        .copied()
+        .unwrap_or_else(|| chunk_index.saturating_mul(DEFAULT_CHUNK_SIZE));
 
     // Determine next chunk info
     let (next_chunk_index, next_chunk_url) =
@@ -1147,5 +1154,68 @@ mod tests {
         assert_eq!(preview.chars().count(), 100);
         assert!(preview.ends_with("..."));
         assert!(long_sql.starts_with(preview.trim_end_matches("...")));
+    }
+
+    fn job_result_with_offsets(
+        total_chunk_count: usize,
+        chunk_row_offsets: Vec<usize>,
+    ) -> crate::jobs::JobResult {
+        crate::jobs::JobResult {
+            manifest: crate::jobs::JobResultManifest {
+                format: "ARROW_IPC".to_string(),
+                schema: crate::jobs::JobSchema {
+                    column_count: 1,
+                    columns: vec![],
+                },
+                total_row_count: chunk_row_offsets.iter().sum(),
+                total_chunk_count,
+                total_byte_count: 0,
+            },
+            chunk_indices: (0..total_chunk_count).collect(),
+            chunk_row_offsets,
+        }
+    }
+
+    fn batch_with_rows(num_rows: usize) -> arrow::array::RecordBatch {
+        use arrow::array::Int32Array;
+        use arrow::datatypes::{DataType, Field, Schema};
+
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+        let values: Vec<i32> = (0..num_rows as i32).collect();
+        arrow::array::RecordBatch::try_new(schema, vec![Arc::new(Int32Array::from(values))])
+            .expect("to create batch")
+    }
+
+    #[test]
+    fn build_chunk_response_uses_recorded_offset() {
+        // Regression test for #11271: chunks are not fixed-size, so the reported
+        // row_offset must come from the recorded cumulative offsets, not from
+        // chunk_index * DEFAULT_CHUNK_SIZE.
+        let job_result = job_result_with_offsets(3, vec![0, 12000, 24000]);
+        let batches = vec![batch_with_rows(3000)];
+
+        let response = build_chunk_response("q1", 1, &batches, &job_result)
+            .expect("chunk response should build");
+
+        assert_eq!(response.chunk_index, 1);
+        assert_eq!(response.row_offset, 12000);
+        assert_eq!(response.row_count, 3000);
+        assert_eq!(response.next_chunk_index, Some(2));
+    }
+
+    #[test]
+    fn build_chunk_response_falls_back_to_estimate_when_offset_absent() {
+        use crate::jobs::DEFAULT_CHUNK_SIZE;
+
+        // Results persisted before per-chunk offsets existed deserialize with an empty
+        // chunk_row_offsets; the handler must fall back to the legacy estimate rather
+        // than panic.
+        let job_result = job_result_with_offsets(3, vec![]);
+        let batches = vec![batch_with_rows(10)];
+
+        let response = build_chunk_response("q1", 2, &batches, &job_result)
+            .expect("chunk response should build");
+
+        assert_eq!(response.row_offset, 2 * DEFAULT_CHUNK_SIZE);
     }
 }

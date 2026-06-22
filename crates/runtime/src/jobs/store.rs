@@ -253,11 +253,15 @@ impl JobStore {
         let mut total_rows = 0usize;
         let mut total_bytes = 0usize;
         let mut chunk_indices = Vec::new();
+        // Cumulative starting row offset of each flushed chunk (rows in all prior chunks).
+        let mut chunk_row_offsets = Vec::new();
 
         // Buffer for accumulating batches until we reach chunk_size
         let mut current_chunk_batches: Vec<RecordBatch> = Vec::new();
         let mut current_chunk_rows = 0usize;
         let mut chunk_index = 0usize;
+        // Rows already committed to prior chunks; the starting offset of the next chunk.
+        let mut committed_rows = 0usize;
 
         while let Some(batch_result) = stream.next().await {
             let batch = batch_result.map_err(|e| super::error::Error::StreamRead {
@@ -302,6 +306,14 @@ impl JobStore {
                 }
 
                 chunk_indices.push(chunk_index);
+                chunk_row_offsets.push(committed_rows);
+                committed_rows = committed_rows.checked_add(current_chunk_rows).ok_or_else(
+                    || super::error::Error::IntegerOverflow {
+                        field: "chunk_row_offset".to_string(),
+                        left_value: committed_rows,
+                        right_value: current_chunk_rows,
+                    },
+                )?;
                 chunk_index = chunk_index.checked_add(1).ok_or_else(|| {
                     super::error::Error::IntegerOverflow {
                         field: "chunk_index".to_string(),
@@ -334,6 +346,7 @@ impl JobStore {
             }
 
             chunk_indices.push(chunk_index);
+            chunk_row_offsets.push(committed_rows);
         }
 
         Ok(Self::build_job_result(
@@ -342,6 +355,7 @@ impl JobStore {
             total_bytes,
             chunk_indices.len(),
             chunk_indices,
+            chunk_row_offsets,
         ))
     }
 
@@ -352,6 +366,7 @@ impl JobStore {
         total_bytes: usize,
         total_chunks: usize,
         chunk_indices: Vec<usize>,
+        chunk_row_offsets: Vec<usize>,
     ) -> JobResult {
         // Build schema info - use Display instead of Debug for stable type names
         let columns: Vec<ColumnSchema> = schema
@@ -390,6 +405,7 @@ impl JobStore {
                 total_byte_count: total_bytes,
             },
             chunk_indices,
+            chunk_row_offsets,
         }
     }
 
@@ -794,6 +810,7 @@ mod tests {
                 total_byte_count: 0,
             },
             chunk_indices: vec![],
+            chunk_row_offsets: vec![],
         };
 
         let completed = job_store
@@ -877,6 +894,7 @@ mod tests {
             assert_eq!(result.manifest.total_row_count, 0);
             assert_eq!(result.manifest.total_chunk_count, 0);
             assert!(result.chunk_indices.is_empty());
+            assert!(result.chunk_row_offsets.is_empty());
 
             // Schema should be preserved even with empty stream
             assert_eq!(result.manifest.schema.column_count, 2);
@@ -912,6 +930,7 @@ mod tests {
             assert_eq!(result.manifest.total_row_count, 3);
             assert_eq!(result.manifest.total_chunk_count, 1);
             assert_eq!(result.chunk_indices, vec![0]);
+            assert_eq!(result.chunk_row_offsets, vec![0]);
 
             // Verify chunk can be read back
             let chunks = job_store
@@ -957,6 +976,7 @@ mod tests {
             // All batches fit in one chunk since chunk_size is 100
             assert_eq!(result.manifest.total_chunk_count, 1);
             assert_eq!(result.chunk_indices, vec![0]);
+            assert_eq!(result.chunk_row_offsets, vec![0]);
         }
 
         #[tokio::test]
@@ -1004,6 +1024,8 @@ mod tests {
             // - chunk 2: batch3 (1 row) -> flushed at end
             assert_eq!(result.manifest.total_chunk_count, 3);
             assert_eq!(result.chunk_indices, vec![0, 1, 2]);
+            // Each batch is exactly chunk_size rows, so offsets are 0, 2, 4.
+            assert_eq!(result.chunk_row_offsets, vec![0, 2, 4]);
 
             // Verify all chunks can be read
             for i in 0..3 {
@@ -1013,6 +1035,50 @@ mod tests {
                     .expect("to read chunk");
                 assert!(!chunks.is_empty());
             }
+        }
+
+        #[tokio::test]
+        async fn test_chunk_row_offsets_with_oversized_batches() {
+            // Regression test for #11271: chunks are flushed once the row threshold is
+            // reached but contain whole batches, so a chunk routinely holds MORE than
+            // chunk_size rows. The recorded offset must be the cumulative row count of
+            // prior chunks, not `chunk_index * chunk_size`.
+            let store = Arc::new(InMemory::new());
+            // chunk_size=2 but each batch is 3 rows, so every chunk overshoots.
+            let job_store = JobStore::new(store, "test", "node-1").with_chunk_size(2);
+
+            let state = job_store
+                .create_job(make_request("SELECT * FROM test"), false)
+                .await
+                .expect("to create job");
+
+            let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+
+            let make_batch = |vals: Vec<i32>| {
+                RecordBatch::try_new(Arc::clone(&schema), vec![Arc::new(Int32Array::from(vals))])
+                    .expect("to create batch")
+            };
+
+            // Three 3-row batches: each one alone trips the threshold and flushes.
+            let batches = vec![
+                make_batch(vec![1, 2, 3]),
+                make_batch(vec![4, 5, 6]),
+                make_batch(vec![7, 8, 9]),
+            ];
+
+            let stream = create_test_stream(Arc::clone(&schema), batches);
+
+            let result = job_store
+                .write_result_chunks_from_stream(&state.job_id, stream)
+                .await
+                .expect("to write stream");
+
+            assert_eq!(result.manifest.total_row_count, 9);
+            assert_eq!(result.manifest.total_chunk_count, 3);
+            assert_eq!(result.chunk_indices, vec![0, 1, 2]);
+            // True cumulative offsets are 0, 3, 6 — NOT the 0, 2, 4 that the old
+            // `chunk_index * chunk_size` formula would have produced.
+            assert_eq!(result.chunk_row_offsets, vec![0, 3, 6]);
         }
 
         #[tokio::test]
