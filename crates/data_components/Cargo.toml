@@ -161,6 +161,10 @@ imap = ["dep:charset", "dep:imap", "dep:mailparse"]
 kafka = ["dep:rdkafka"]
 mongodb = ["dep:mongodb", "datafusion-table-providers/mongodb"]
 mssql = ["dep:tiberius", "dep:tokio-util", "dep:bb8"]
+# Kerberos integrated auth (GSSAPI) for MSSQL on Unix.
+# Opt-in: only links libgssapi_krb5 when explicitly enabled. Windows integrated auth uses SSPI and needs no extra feature.
+# Weak dep so this is a no-op unless `mssql` is also on.
+mssql-kerberos-unix = ["tiberius?/integrated-auth-gssapi"]
 mysql = [
     "dep:mysql_async",
     "datafusion-table-providers/mysql",

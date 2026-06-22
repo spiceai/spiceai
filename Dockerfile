@@ -54,7 +54,7 @@ RUN apt update \
     && if echo "$CARGO_FEATURES" | grep -q "odbc"; then \
     apt install --yes unixodbc --no-install-recommends; \
     fi \
-    && if echo "$CARGO_FEATURES" | grep -q "mssql"; then \
+    && if echo "$CARGO_FEATURES" | grep -q "mssql-kerberos-unix"; then \
     apt install --yes libgssapi-krb5-2 --no-install-recommends; \
     fi \
     && rm -rf /var/lib/{apt,dpkg,cache,log}

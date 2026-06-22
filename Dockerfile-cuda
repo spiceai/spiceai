@@ -62,7 +62,7 @@ RUN if echo "$CARGO_FEATURES" | grep -q "odbc"; then \
     && rm -rf /var/lib/{apt,dpkg,cache,log}; \
     fi
 
-RUN if echo "$CARGO_FEATURES" | grep -q "mssql"; then \
+RUN if echo "$CARGO_FEATURES" | grep -q "mssql-kerberos-unix"; then \
     apt update \
     && apt install --yes libgssapi-krb5-2 --no-install-recommends \
     && rm -rf /var/lib/{apt,dpkg,cache,log}; \
