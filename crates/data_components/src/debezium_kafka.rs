@@ -14,6 +14,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use std::sync::Arc;
+
 use crate::kafka::{
     KafkaOffsetCommitHook, MessageBatchCommitter, inject_ready_signal_on_caught_up,
 };
@@ -35,7 +37,6 @@ use datafusion::{
     logical_expr::Expr,
     physical_plan::{ExecutionPlan, empty::EmptyExec},
 };
-use std::{any::Any, sync::Arc};
 use tokio::time::Duration;
 use tokio_stream::StreamExt;
 
@@ -138,8 +139,25 @@ impl DebeziumKafka {
                     .map(super::kafka::KafkaMessage::value)
                     .collect();
 
+                // Newest upstream commit timestamp in the batch, for the
+                // replication-lag signal: prefer the source DB commit time
+                // (`source.ts_ms`), falling back to the connector envelope time
+                // (`payload.ts_ms`) when the source time is absent (0).
+                let source_commit_ts_ms = changes
+                    .iter()
+                    .map(|change| {
+                        let source_ts = change.payload.source.ts_ms;
+                        if source_ts != 0 {
+                            source_ts
+                        } else {
+                            change.payload.ts_ms
+                        }
+                    })
+                    .max();
+
                 let rb = changes::vector_to_change_batch(&schema, &pk, &changes)
-                    .map_err(|e| cdc::StreamError::SerdeJsonError(e.to_string()))?;
+                    .map_err(|e| cdc::StreamError::SerdeJsonError(e.to_string()))?
+                    .with_source_commit_ts_ms(source_commit_ts_ms);
 
                 let committer = MessageBatchCommitter::from_messages(consumer, &messages)
                     .with_offset_commit_hook(offset_commit_hook.clone());
@@ -157,10 +175,6 @@ impl DebeziumKafka {
 
 #[async_trait]
 impl TableProvider for DebeziumKafka {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema(&self) -> SchemaRef {
         Arc::clone(&self.schema)
     }

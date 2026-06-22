@@ -19,7 +19,6 @@ limitations under the License.
 //! Connects to a `DuckLake` catalog using a dedicated `DuckDB` instance with the `ducklake` extension
 //! and provides schema/table discovery by querying the attached `DuckLake` database.
 
-use std::any::Any;
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
@@ -40,7 +39,9 @@ use crate::RefreshableCatalogProvider;
 #[derive(Debug, Snafu)]
 pub enum Error {
     #[snafu(display("Failed to execute DuckDB query: {source}"))]
-    QueryFailed { source: duckdb::Error },
+    QueryFailed {
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
 
     #[snafu(display("Failed to get DuckDB connection: {source}"))]
     ConnectionFailed {
@@ -166,14 +167,19 @@ impl DuckLakeCatalogProvider {
                    WHERE catalog_name = ?
                    ORDER BY schema_name";
 
-            let mut stmt = duckdb_wrapper.conn.prepare(sql).context(QueryFailedSnafu)?;
+            let mut stmt = duckdb_wrapper
+                .conn
+                .prepare(sql)
+                .boxed()
+                .context(QueryFailedSnafu)?;
             let rows = stmt
                 .query_map([&catalog_name], |row| row.get::<_, String>(0))
+                .boxed()
                 .context(QueryFailedSnafu)?;
 
             let mut names = Vec::new();
             for row_result in rows {
-                let name: String = row_result.context(QueryFailedSnafu)?;
+                let name: String = row_result.boxed().context(QueryFailedSnafu)?;
                 if name != "information_schema" && name != "pg_catalog" {
                     names.push(name);
                 }
@@ -214,10 +220,6 @@ impl DuckLakeCatalogProvider {
 }
 
 impl CatalogProvider for DuckLakeCatalogProvider {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema_names(&self) -> Vec<String> {
         let guard = match self.schemas.read() {
             Ok(guard) => guard,
@@ -277,31 +279,30 @@ impl CatalogProvider for DuckLakeCatalogProvider {
             .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?;
 
         // Downcast to our schema type if possible, otherwise create a new one
-        let schema_provider = if let Some(ducklake_schema) =
-            schema.as_any().downcast_ref::<DuckLakeSchemaProvider>()
-        {
-            Arc::new(DuckLakeSchemaProvider::new(
-                Arc::clone(&ducklake_schema.pool),
-                Arc::clone(&ducklake_schema.duckdb_factory),
-                ducklake_schema.catalog_name.clone(),
-                schema_name,
-                ducklake_schema.writable,
-                ducklake_schema.ddl_enabled,
-                ducklake_schema.include.clone(),
-                Arc::clone(&ducklake_schema.write_lock),
-            ))
-        } else {
-            Arc::new(DuckLakeSchemaProvider::new(
-                Arc::clone(&self.pool),
-                Arc::clone(&self.duckdb_factory),
-                self.catalog_name.clone(),
-                schema_name,
-                self.writable,
-                self.ddl_enabled,
-                self.include.clone(),
-                Arc::clone(&self.write_lock),
-            ))
-        };
+        let schema_provider =
+            if let Some(ducklake_schema) = schema.downcast_ref::<DuckLakeSchemaProvider>() {
+                Arc::new(DuckLakeSchemaProvider::new(
+                    Arc::clone(&ducklake_schema.pool),
+                    Arc::clone(&ducklake_schema.duckdb_factory),
+                    ducklake_schema.catalog_name.clone(),
+                    schema_name,
+                    ducklake_schema.writable,
+                    ducklake_schema.ddl_enabled,
+                    ducklake_schema.include.clone(),
+                    Arc::clone(&ducklake_schema.write_lock),
+                ))
+            } else {
+                Arc::new(DuckLakeSchemaProvider::new(
+                    Arc::clone(&self.pool),
+                    Arc::clone(&self.duckdb_factory),
+                    self.catalog_name.clone(),
+                    schema_name,
+                    self.writable,
+                    self.ddl_enabled,
+                    self.include.clone(),
+                    Arc::clone(&self.write_lock),
+                ))
+            };
 
         let mut guard = match self.schemas.write() {
             Ok(guard) => guard,
@@ -498,14 +499,19 @@ impl DuckLakeSchemaProvider {
                      AND table_schema = ?
                    ORDER BY table_name";
 
-            let mut stmt = duckdb_wrapper.conn.prepare(sql).context(QueryFailedSnafu)?;
+            let mut stmt = duckdb_wrapper
+                .conn
+                .prepare(sql)
+                .boxed()
+                .context(QueryFailedSnafu)?;
             let rows = stmt
                 .query_map([&catalog_name, &schema_name], |row| row.get::<_, String>(0))
+                .boxed()
                 .context(QueryFailedSnafu)?;
 
             let mut names = Vec::new();
             for row_result in rows {
-                let name = row_result.context(QueryFailedSnafu)?;
+                let name = row_result.boxed().context(QueryFailedSnafu)?;
                 names.push(name);
             }
             Ok(names)
@@ -576,10 +582,6 @@ impl DuckLakeSchemaProvider {
 
 #[async_trait]
 impl SchemaProvider for DuckLakeSchemaProvider {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn table_names(&self) -> Vec<String> {
         let guard = match self.tables.read() {
             Ok(guard) => guard,

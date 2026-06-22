@@ -47,6 +47,13 @@ pub struct DispatchArgs {
     #[arg(long)]
     pub(crate) max_concurrent: Option<usize>,
 
+    /// When `--max-concurrent` is set, how many minutes to wait for a free slot
+    /// before dispatching anyway. Raise this above a single run's wall-clock for
+    /// long workloads (e.g. SF-1000 HTAP) so the slot wait actually serializes them
+    /// instead of giving up early. Ignored unless `--max-concurrent` is set.
+    #[arg(long, default_value = "30")]
+    pub(crate) max_concurrent_wait_timeout_mins: u64,
+
     /// Dry run mode - print the workflow dispatch request without sending it
     #[arg(long, default_value = "false")]
     pub(crate) dry_run: bool,
@@ -304,6 +311,8 @@ pub enum RunnerType {
     Dev,
     #[serde(rename = "spiceai-dev-large-runners")]
     DevLarge,
+    #[serde(rename = "spiceai-dev-xlarge-runners")]
+    DevXLarge,
 }
 
 /// Payload sent to the GitHub Actions workflow request. Should match inputs in `.github/workflows/testoperator_run_texttosql.yml`.
@@ -692,5 +701,30 @@ tests:
             serialized.get("terminals").is_none(),
             "terminals should be omitted when None"
         );
+    }
+
+    #[test]
+    fn test_xlarge_runner_type_round_trip() {
+        let yaml = "
+tests:
+  htap:
+    spicepod_path: accelerated/postgres-cayenne[file].yaml
+    runner_type: spiceai-dev-xlarge-runners
+    scale_factor: 10
+    duration: 600
+    ready_wait: 300
+";
+
+        let test_file: DispatchTestFile = yaml::from_str(yaml).expect("Failed to deserialize");
+
+        assert!(matches!(
+            test_file.tests.htap[0].runner_type,
+            RunnerType::DevXLarge
+        ));
+
+        // Verify it serializes back to the expected workflow input value
+        let serialized =
+            serde_json::to_value(&test_file.tests.htap[0]).expect("Failed to serialize");
+        assert_eq!(serialized["runner_type"], "spiceai-dev-xlarge-runners");
     }
 }

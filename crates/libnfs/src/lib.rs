@@ -216,7 +216,10 @@ pub struct DirEntry {
 ///
 /// This type uses `Rc` for reference counting and is **not** thread-safe.
 /// See [`Nfs`] documentation for details on thread safety constraints.
-#[derive(Clone)]
+///
+/// Note: deliberately **not** `Clone`. This type owns a unique `nfsdir` handle
+/// that `Drop` frees via `nfs_closedir`; deriving `Clone` would duplicate the
+/// raw pointer and free the same handle twice (double-free / use-after-free).
 pub struct NfsDirectory {
     nfs: Rc<NfsPtr>,
     handle: *mut sys::nfsdir,
@@ -238,7 +241,10 @@ impl Drop for NfsDirectory {
 ///
 /// This type uses `Rc` for reference counting and is **not** thread-safe.
 /// See [`Nfs`] documentation for details on thread safety constraints.
-#[derive(Clone)]
+///
+/// Note: deliberately **not** `Clone`. This type owns a unique `nfsfh` handle
+/// that `Drop` frees via `nfs_close`; deriving `Clone` would duplicate the raw
+/// pointer and free the same handle twice (double-free / use-after-free).
 pub struct NfsFile {
     nfs: Rc<NfsPtr>,
     handle: *mut sys::nfsfh,
@@ -983,3 +989,16 @@ impl Iterator for NfsDirectory {
 // context is only accessed through the safe wrapper methods.
 // The context itself is not thread-safe, so we don't implement Send/Sync.
 // Usage should be confined to a single thread.
+
+#[cfg(test)]
+mod tests {
+    use super::{NfsDirectory, NfsFile};
+    use static_assertions::assert_not_impl_any;
+
+    // Regression guard: `NfsFile` and `NfsDirectory` each own a unique libnfs C
+    // handle that `Drop` frees (`nfs_close` / `nfs_closedir`). They must never be
+    // `Clone` or `Copy` — duplicating the raw handle would free it twice
+    // (double-free / use-after-free). Re-deriving `Clone` will fail this build.
+    assert_not_impl_any!(NfsFile: Clone, Copy);
+    assert_not_impl_any!(NfsDirectory: Clone, Copy);
+}

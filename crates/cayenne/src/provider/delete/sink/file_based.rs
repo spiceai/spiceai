@@ -45,7 +45,7 @@ use datafusion::execution::runtime_env::RuntimeEnv;
 use datafusion_catalog::TableProvider;
 use datafusion_common::ScalarValue;
 use datafusion_expr::Expr;
-use object_store::{ObjectMeta, ObjectStore};
+use object_store::{ObjectMeta, ObjectStore, ObjectStoreExt};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::Mutex as TokioMutex;

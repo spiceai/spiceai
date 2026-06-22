@@ -19,7 +19,6 @@ limitations under the License.
 //! Discovers schemas and tables in a `MySQL` server using
 //! `information_schema` queries and provides them as `DataFusion` catalog/schema providers.
 
-use std::any::Any;
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
@@ -150,10 +149,6 @@ impl MySQLCatalogProvider {
 }
 
 impl CatalogProvider for MySQLCatalogProvider {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema_names(&self) -> Vec<String> {
         let guard = match self.schemas.read() {
             Ok(guard) => guard,
@@ -414,10 +409,6 @@ pub fn mysql_metadata_from_rows(
 
 #[async_trait]
 impl SchemaProvider for MySQLSchemaProvider {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn table_names(&self) -> Vec<String> {
         let guard = match self.tables.read() {
             Ok(guard) => guard,

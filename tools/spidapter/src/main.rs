@@ -20,6 +20,7 @@ mod args;
 mod cayenne_server;
 mod commands;
 mod local_spiced_server;
+mod scenario;
 mod stdio_server;
 
 use args::{Commands, StdioArgs};

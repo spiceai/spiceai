@@ -125,13 +125,13 @@ mod nsql {
 
                 tokio::select! {
                     // increased timeout to download and load huggingface model
-                    () = tokio::time::sleep(std::time::Duration::from_secs(300)) => {
+                    () = tokio::time::sleep(std::time::Duration::from_mins(5)) => {
                         return Err(anyhow::anyhow!("Timed out waiting for components to load"));
                     }
                     () = Arc::clone(&rt).load_components() => {}
                 }
 
-                runtime_ready_check_with_timeout(&rt, std::time::Duration::from_secs(120)).await;
+                runtime_ready_check_with_timeout(&rt, std::time::Duration::from_mins(2)).await;
 
                 let test_cases = [
                     TestCase {
@@ -324,7 +324,7 @@ async fn hf_embeddings_beta_requirements() -> Result<(), anyhow::Error> {
         .scope(async {
             run_beta_functionality_criteria_test(
                 get_huggingface_embeddings("sentence-transformers/all-MiniLM-L6-v2", "hf_minilm"),
-                Duration::from_secs(2 * 60),
+                Duration::from_mins(2),
             )
             .await
         })
@@ -456,13 +456,13 @@ async fn huggingface_test_chat_completion() -> Result<(), anyhow::Error> {
 
         tokio::select! {
             // increased timeout to download and load huggingface model
-            () = tokio::time::sleep(std::time::Duration::from_secs(300)) => {
+            () = tokio::time::sleep(std::time::Duration::from_mins(5)) => {
                 return Err(anyhow::anyhow!("Timed out waiting for components to load"));
             }
             () = Arc::clone(&rt).load_components() => {}
         }
 
-        runtime_ready_check_with_timeout(&rt, std::time::Duration::from_secs(120)).await;
+        runtime_ready_check_with_timeout(&rt, std::time::Duration::from_mins(2)).await;
 
         let response = send_chat_completions_request(
             http_base_url.as_str(),
@@ -528,13 +528,13 @@ async fn huggingface_test_gemma_chat_completion() -> Result<(), anyhow::Error> {
 
             tokio::select! {
                 // increased timeout to download and load huggingface model
-                () = tokio::time::sleep(std::time::Duration::from_secs(300)) => {
+                () = tokio::time::sleep(std::time::Duration::from_mins(5)) => {
                     return Err(anyhow::anyhow!("Timed out waiting for components to load"));
                 }
                 () = Arc::clone(&rt).load_components() => {}
             }
 
-            runtime_ready_check_with_timeout(&rt, std::time::Duration::from_secs(120)).await;
+            runtime_ready_check_with_timeout(&rt, std::time::Duration::from_mins(2)).await;
 
             let response = send_chat_completions_request(
                 http_base_url.as_str(),
@@ -598,13 +598,13 @@ async fn huggingface_test_gemma4_chat_completion() -> Result<(), anyhow::Error> 
 
             tokio::select! {
                 // increased timeout to download and load huggingface model
-                () = tokio::time::sleep(std::time::Duration::from_secs(300)) => {
+                () = tokio::time::sleep(std::time::Duration::from_mins(5)) => {
                     return Err(anyhow::anyhow!("Timed out waiting for components to load"));
                 }
                 () = Arc::clone(&rt).load_components() => {}
             }
 
-            runtime_ready_check_with_timeout(&rt, std::time::Duration::from_secs(120)).await;
+            runtime_ready_check_with_timeout(&rt, std::time::Duration::from_mins(2)).await;
 
             let response = send_chat_completions_request(
                 http_base_url.as_str(),

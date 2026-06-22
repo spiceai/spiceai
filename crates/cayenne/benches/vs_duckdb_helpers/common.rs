@@ -240,6 +240,37 @@ async fn setup_cayenne_with(
     on_conflict: Option<OnConflict>,
     table_schema: Arc<Schema>,
 ) -> CayenneFixture {
+    setup_cayenne_custom(
+        table_name,
+        metastore,
+        primary_key,
+        on_conflict,
+        table_schema,
+        cayenne::metadata::VortexConfig::default(),
+        Arc::new(RuntimeEnv::default()),
+    )
+    .await
+}
+
+/// Fully-parameterized Cayenne fixture: callers control the `VortexConfig`
+/// (e.g. compaction triggers, inline-memtable size) and the `RuntimeEnv`
+/// (e.g. a budgeted memory pool). The simpler `setup_cayenne*` wrappers all
+/// route through this with defaults.
+///
+/// Pass the SAME `RuntimeEnv` to [`warm_session_with_runtime`] when queries
+/// must run under the same memory budget as the table's write path — that
+/// mirrors spiced, which shares one `RuntimeEnv` across the accelerator and
+/// the query sessions.
+#[allow(clippy::too_many_arguments)]
+pub async fn setup_cayenne_custom(
+    table_name: &str,
+    metastore: Metastore,
+    primary_key: Vec<String>,
+    on_conflict: Option<OnConflict>,
+    table_schema: Arc<Schema>,
+    vortex_config: cayenne::metadata::VortexConfig,
+    runtime_env: Arc<RuntimeEnv>,
+) -> CayenneFixture {
     let temp_dir = tempfile::tempdir().expect("temp dir");
     let data_path = temp_dir.path().join("data");
     tokio::fs::create_dir_all(&data_path)
@@ -260,9 +291,9 @@ async fn setup_cayenne_with(
                 on_conflict,
                 base_path: data_path.to_string_lossy().to_string(),
                 partition_column: None,
-                vortex_config: cayenne::metadata::VortexConfig::default(),
+                vortex_config,
             },
-            Arc::new(RuntimeEnv::default()),
+            runtime_env,
         )
         .await
         .expect("cayenne create_table"),
@@ -273,6 +304,24 @@ async fn setup_cayenne_with(
         table,
         catalog: Arc::clone(&catalog) as Arc<dyn MetadataCatalog>,
     }
+}
+
+/// Like [`warm_session_for`] but builds the session on a caller-provided
+/// [`RuntimeEnv`] — required when the query must execute under a budgeted
+/// memory pool. A plain `SessionContext::new()` would silently run queries
+/// against an UNLIMITED default pool, making any memory-budget comparison
+/// measure nothing (the fixture's budget would gate only the write path).
+pub fn warm_session_with_runtime(
+    table: &Arc<CayenneTableProvider>,
+    runtime_env: Arc<RuntimeEnv>,
+) -> datafusion::prelude::SessionContext {
+    use datafusion::datasource::TableProvider;
+    use datafusion::prelude::{SessionConfig, SessionContext};
+
+    let ctx = SessionContext::new_with_config_rt(SessionConfig::new(), runtime_env);
+    ctx.register_table("t", Arc::clone(table) as Arc<dyn TableProvider>)
+        .expect("register table");
+    ctx
 }
 
 /// A clean DuckDB file-mode database with the same schema.

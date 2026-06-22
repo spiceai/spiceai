@@ -38,9 +38,11 @@ use datafusion::{
     error::Result,
     logical_expr::Expr,
     physical_plan::ExecutionPlan,
-    sql::TableReference,
+    sql::{
+        TableReference,
+        unparser::{Unparser, dialect::CustomDialectBuilder},
+    },
 };
-use datafusion_table_providers::sql::sql_provider_datafusion::expr::{self, Engine};
 use futures::Stream;
 use runtime_rate_control::RateController;
 use spark_connect_rs::errors::SparkError;
@@ -432,10 +434,6 @@ struct SparkConnectTableProvider {
 
 #[async_trait]
 impl TableProvider for SparkConnectTableProvider {
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
-
     fn schema(&self) -> SchemaRef {
         Arc::clone(&self.schema)
     }
@@ -450,7 +448,7 @@ impl TableProvider for SparkConnectTableProvider {
     ) -> DataFusionResult<Vec<TableProviderFilterPushDown>> {
         let mut filter_push_down = vec![];
         for filter in filters {
-            match expr::to_sql(filter) {
+            match expr_to_sql(filter) {
                 Ok(_) => filter_push_down.push(TableProviderFilterPushDown::Exact),
                 Err(_) => filter_push_down.push(TableProviderFilterPushDown::Unsupported),
             }
@@ -484,7 +482,7 @@ struct SparkConnectExecutionPlan {
     projected_schema: SchemaRef,
     filters: Vec<String>,
     limit: Option<i32>,
-    properties: PlanProperties,
+    properties: Arc<PlanProperties>,
 }
 
 impl SparkConnectExecutionPlan {
@@ -519,18 +517,30 @@ impl SparkConnectExecutionPlan {
             projected_schema: Arc::clone(&projected_schema),
             filters: filters
                 .iter()
-                .map(|f| expr::to_sql_with_engine(f, Some(Engine::Spark)))
+                .map(expr_to_sql)
                 .collect::<Result<Vec<_>, _>>()
                 .map_err(|e| DataFusionError::Execution(e.to_string()))?,
             limit,
-            properties: PlanProperties::new(
+            properties: Arc::new(PlanProperties::new(
                 EquivalenceProperties::new(projected_schema),
                 Partitioning::UnknownPartitioning(1),
                 EmissionType::Incremental,
                 Boundedness::Bounded,
-            ),
+            )),
         })
     }
+}
+
+fn expr_to_sql(expr: &Expr) -> DataFusionResult<String> {
+    // Spark Connect parses pushed-down filters as Spark SQL (see `DataFrame::filter` below), which
+    // quotes identifiers with backticks. `DefaultDialect` would emit double-quoted identifiers,
+    // which Spark interprets as string literals, breaking case-sensitive or keyword column refs.
+    let dialect = CustomDialectBuilder::new()
+        .with_identifier_quote_style('`')
+        .build();
+    Unparser::new(&dialect)
+        .expr_to_sql(expr)
+        .map(|expr| expr.to_string())
 }
 
 impl DisplayAs for SparkConnectExecutionPlan {
@@ -560,7 +570,7 @@ impl ExecutionPlan for SparkConnectExecutionPlan {
         "SparkConnectExecutionPlan"
     }
 
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
     }
 
@@ -604,10 +614,6 @@ impl ExecutionPlan for SparkConnectExecutionPlan {
         _children: Vec<Arc<dyn ExecutionPlan>>,
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
         Ok(self)
-    }
-
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
     }
 }
 

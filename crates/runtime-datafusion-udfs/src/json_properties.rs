@@ -79,7 +79,6 @@ limitations under the License.
 //! depth / row / size limit emits an error-kind metric and yields zero or a
 //! truncated-but-valid batch — never a query-level error.
 
-use std::any::Any;
 use std::collections::HashSet;
 use std::fmt::{Debug, Formatter};
 use std::sync::{Arc, LazyLock};
@@ -97,7 +96,7 @@ use datafusion::catalog::{Session, TableFunctionImpl, TableProvider};
 use datafusion::common::Result as DataFusionResult;
 use datafusion::datasource::TableType;
 use datafusion::error::DataFusionError;
-use datafusion::logical_expr::simplify::{ExprSimplifyResult, SimplifyInfo};
+use datafusion::logical_expr::simplify::{ExprSimplifyResult, SimplifyContext};
 use datafusion::logical_expr::{
     ColumnarValue, ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl, Signature, Volatility,
 };
@@ -1027,9 +1026,6 @@ pub struct FlattenJsonPropertiesTable {
 
 #[async_trait]
 impl TableProvider for FlattenJsonPropertiesTable {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
     fn schema(&self) -> SchemaRef {
         Arc::clone(&self.schema)
     }
@@ -1174,10 +1170,6 @@ impl std::hash::Hash for FlattenJsonPropertiesScalar {
 }
 
 impl ScalarUDFImpl for FlattenJsonPropertiesScalar {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn name(&self) -> &str {
         FLATTEN_JSON_PROPERTIES_UDTF_NAME
     }
@@ -1214,7 +1206,7 @@ impl ScalarUDFImpl for FlattenJsonPropertiesScalar {
     fn simplify(
         &self,
         args: Vec<Expr>,
-        _info: &dyn SimplifyInfo,
+        _info: &SimplifyContext,
     ) -> DataFusionResult<ExprSimplifyResult> {
         // No named args to rewrite; nothing to simplify.
         if args.len() <= 1 {
@@ -1356,6 +1348,7 @@ impl ScalarUDFImpl for FlattenJsonPropertiesScalar {
 
 #[cfg(test)]
 mod tests {
+    #![expect(deprecated)] // DF54: test-only TableFunctionImpl::call/create_table_provider; migration deferred (needs Session)
     use super::*;
 
     fn by_path(rows: &[PropertyRow]) -> std::collections::HashMap<&str, &PropertyRow> {

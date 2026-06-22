@@ -60,7 +60,7 @@ pub struct UdtfExec {
     /// The inner execution plan from the UDTF's `TableProvider`.
     inner: Arc<dyn ExecutionPlan>,
     /// Cached plan properties.
-    properties: PlanProperties,
+    properties: Arc<PlanProperties>,
 }
 
 impl UdtfExec {
@@ -71,12 +71,12 @@ impl UdtfExec {
         let eq_properties = EquivalenceProperties::new(schema);
         let emission_type = inner.pipeline_behavior();
         let boundedness = inner.boundedness();
-        let properties = PlanProperties::new(
+        let properties = Arc::new(PlanProperties::new(
             eq_properties,
             inner.output_partitioning().clone(),
             emission_type,
             boundedness,
-        );
+        ));
 
         Self {
             args,
@@ -95,12 +95,12 @@ impl UdtfExec {
     #[must_use]
     pub fn placeholder(args: UdtfArgs, schema: SchemaRef) -> Self {
         let eq_properties = EquivalenceProperties::new(Arc::clone(&schema));
-        let properties = PlanProperties::new(
+        let properties = Arc::new(PlanProperties::new(
             eq_properties,
             Partitioning::UnknownPartitioning(1),
             datafusion::physical_plan::execution_plan::EmissionType::Final,
             datafusion::physical_plan::execution_plan::Boundedness::Bounded,
-        );
+        ));
 
         // Create a placeholder inner plan - this will be replaced when the
         // plan is actually executed after reconstruction
@@ -140,6 +140,14 @@ impl DisplayAs for UdtfExec {
 
 #[deny(clippy::missing_trait_methods)]
 impl ExecutionPlan for UdtfExec {
+    fn downcast_delegate(&self) -> Option<&dyn ExecutionPlan> {
+        None
+    }
+
+    fn with_preserve_order(&self, _preserve_order: bool) -> Option<Arc<dyn ExecutionPlan>> {
+        None
+    }
+
     fn name(&self) -> &'static str {
         "UdtfExec"
     }
@@ -151,11 +159,7 @@ impl ExecutionPlan for UdtfExec {
         "UdtfExec"
     }
 
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
     }
 
@@ -229,12 +233,7 @@ impl ExecutionPlan for UdtfExec {
         self.inner.metrics()
     }
 
-    fn statistics(&self) -> Result<Statistics> {
-        #[expect(deprecated)]
-        self.inner.statistics()
-    }
-
-    fn partition_statistics(&self, partition: Option<usize>) -> Result<Statistics> {
+    fn partition_statistics(&self, partition: Option<usize>) -> Result<Arc<Statistics>> {
         self.inner.partition_statistics(partition)
     }
 
@@ -302,18 +301,18 @@ impl ExecutionPlan for UdtfExec {
 #[derive(Debug)]
 struct PlaceholderExec {
     schema: SchemaRef,
-    properties: PlanProperties,
+    properties: Arc<PlanProperties>,
 }
 
 impl PlaceholderExec {
     fn new(schema: SchemaRef) -> Self {
         let eq_properties = EquivalenceProperties::new(Arc::clone(&schema));
-        let properties = PlanProperties::new(
+        let properties = Arc::new(PlanProperties::new(
             eq_properties,
             Partitioning::UnknownPartitioning(1),
             datafusion::physical_plan::execution_plan::EmissionType::Final,
             datafusion::physical_plan::execution_plan::Boundedness::Bounded,
-        );
+        ));
         Self { schema, properties }
     }
 }
@@ -326,6 +325,14 @@ impl DisplayAs for PlaceholderExec {
 
 #[deny(clippy::missing_trait_methods)]
 impl ExecutionPlan for PlaceholderExec {
+    fn downcast_delegate(&self) -> Option<&dyn ExecutionPlan> {
+        None
+    }
+
+    fn with_preserve_order(&self, _preserve_order: bool) -> Option<Arc<dyn ExecutionPlan>> {
+        None
+    }
+
     fn name(&self) -> &'static str {
         "PlaceholderExec"
     }
@@ -337,11 +344,7 @@ impl ExecutionPlan for PlaceholderExec {
         "PlaceholderExec"
     }
 
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
     }
 
@@ -414,12 +417,8 @@ impl ExecutionPlan for PlaceholderExec {
         None
     }
 
-    fn statistics(&self) -> Result<Statistics> {
-        Ok(Statistics::new_unknown(&self.schema))
-    }
-
-    fn partition_statistics(&self, _partition: Option<usize>) -> Result<Statistics> {
-        Ok(Statistics::new_unknown(&self.schema))
+    fn partition_statistics(&self, _partition: Option<usize>) -> Result<Arc<Statistics>> {
+        Ok(Arc::new(Statistics::new_unknown(&self.schema)))
     }
 
     fn supports_limit_pushdown(&self) -> bool {

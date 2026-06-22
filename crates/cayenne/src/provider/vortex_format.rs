@@ -81,12 +81,45 @@ impl VortexAccessPlanProvider for PositionDeletionAccessPlanProvider {
 
         Statistics {
             num_rows: adjust_num_rows_for_deletions(statistics.num_rows, &deletion_vector),
-            total_byte_size: statistics.total_byte_size,
-            column_statistics: vec![
-                ColumnStatistics::new_unknown();
-                statistics.column_statistics.len()
-            ],
+            // Position deletes only ever remove rows, so the footer byte size is
+            // now an over-estimate. Keep it as an (inexact) upper bound instead of
+            // dropping it, so size-based heuristics still have a signal.
+            total_byte_size: statistics.total_byte_size.to_inexact(),
+            column_statistics: statistics
+                .column_statistics
+                .into_iter()
+                .map(adjust_column_stats_for_deletions)
+                .collect(),
         }
+    }
+}
+
+/// Soundly downgrade a column's footer statistics for a file with position
+/// deletes attached.
+///
+/// Position deletes only ever *remove* rows, so the surviving rows are a subset
+/// of the rows the footer described. That makes the footer min/max a valid
+/// *superset* bound of the survivors (the true min can only rise, the true max
+/// can only fall), which is exactly what min/max pruning needs — but the precise
+/// boundary value may belong to a deleted row, so the precision must drop from
+/// `Exact` to `Inexact`. Counts (`null_count`, `distinct_count`) can only shrink
+/// after deletes, so the footer value is an upper-bound estimate and is likewise
+/// kept as `Inexact`. The aggregate `sum_value` cannot be bounded after removing
+/// rows of unknown sign, so it is dropped to `Absent` rather than handing an
+/// aggregate a value that no longer matches the live data.
+fn adjust_column_stats_for_deletions(stats: ColumnStatistics) -> ColumnStatistics {
+    ColumnStatistics {
+        // Upper-bound estimate after deletes.
+        null_count: stats.null_count.to_inexact(),
+        // Still-valid superset bounds; precision drops because the boundary row
+        // may have been deleted.
+        max_value: stats.max_value.to_inexact(),
+        min_value: stats.min_value.to_inexact(),
+        // Unsound to keep after removing rows of unknown sign.
+        sum_value: Precision::Absent,
+        // Upper-bound estimate after deletes.
+        distinct_count: stats.distinct_count.to_inexact(),
+        byte_size: stats.byte_size.to_inexact(),
     }
 }
 
@@ -122,5 +155,49 @@ mod tests {
             adjust_num_rows_for_deletions(Precision::Inexact(10), &deletion_vector),
             Precision::Inexact(7)
         );
+    }
+
+    #[test]
+    fn column_stats_are_downgraded_soundly_for_deletions() {
+        use datafusion_common::ScalarValue;
+
+        let exact = ColumnStatistics {
+            null_count: Precision::Exact(2),
+            max_value: Precision::Exact(ScalarValue::Int64(Some(100))),
+            min_value: Precision::Exact(ScalarValue::Int64(Some(1))),
+            sum_value: Precision::Exact(ScalarValue::Int64(Some(5050))),
+            distinct_count: Precision::Exact(100),
+            byte_size: Precision::Exact(800),
+        };
+
+        let adjusted = adjust_column_stats_for_deletions(exact);
+
+        // min/max stay valid superset bounds but are no longer exact (the row
+        // holding the boundary value may have been deleted).
+        assert_eq!(
+            adjusted.min_value,
+            Precision::Inexact(ScalarValue::Int64(Some(1)))
+        );
+        assert_eq!(
+            adjusted.max_value,
+            Precision::Inexact(ScalarValue::Int64(Some(100)))
+        );
+        // Counts can only shrink after deletes — keep as inexact upper bounds.
+        assert_eq!(adjusted.null_count, Precision::Inexact(2));
+        assert_eq!(adjusted.distinct_count, Precision::Inexact(100));
+        assert_eq!(adjusted.byte_size, Precision::Inexact(800));
+        // Sum cannot be bounded after removing rows of unknown sign.
+        assert_eq!(adjusted.sum_value, Precision::Absent);
+    }
+
+    #[test]
+    fn absent_column_stats_stay_absent_after_adjustment() {
+        let adjusted = adjust_column_stats_for_deletions(ColumnStatistics::new_unknown());
+
+        assert_eq!(adjusted.min_value, Precision::Absent);
+        assert_eq!(adjusted.max_value, Precision::Absent);
+        assert_eq!(adjusted.null_count, Precision::Absent);
+        assert_eq!(adjusted.distinct_count, Precision::Absent);
+        assert_eq!(adjusted.sum_value, Precision::Absent);
     }
 }

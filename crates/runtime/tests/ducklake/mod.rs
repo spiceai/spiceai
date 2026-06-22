@@ -131,7 +131,7 @@ async fn ducklake_catalog_include_filter() -> Result<(), anyhow::Error> {
             let cloned_rt = Arc::clone(&rt);
 
             tokio::select! {
-                () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+                () = tokio::time::sleep(std::time::Duration::from_mins(1)) => {
                     panic!("Timeout waiting for components to load");
                 }
                 () = cloned_rt.load_components() => {}
@@ -225,7 +225,7 @@ async fn ducklake_catalog_no_filter() -> Result<(), anyhow::Error> {
             let cloned_rt = Arc::clone(&rt);
 
             tokio::select! {
-                () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+                () = tokio::time::sleep(std::time::Duration::from_mins(1)) => {
                     panic!("Timeout waiting for components to load");
                 }
                 () = cloned_rt.load_components() => {}
@@ -332,7 +332,7 @@ async fn ducklake_catalog_include_glob_pattern() -> Result<(), anyhow::Error> {
             let cloned_rt = Arc::clone(&rt);
 
             tokio::select! {
-                () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+                () = tokio::time::sleep(std::time::Duration::from_mins(1)) => {
                     panic!("Timeout waiting for components to load");
                 }
                 () = cloned_rt.load_components() => {}
@@ -410,7 +410,7 @@ async fn ducklake_standalone_dataset() -> Result<(), anyhow::Error> {
             let cloned_rt = Arc::clone(&rt);
 
             tokio::select! {
-                () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+                () = tokio::time::sleep(std::time::Duration::from_mins(1)) => {
                     panic!("Timeout waiting for components to load");
                 }
                 () = cloned_rt.load_components() => {}
@@ -482,7 +482,7 @@ async fn ducklake_standalone_read_write_insert() -> Result<(), anyhow::Error> {
             let cloned_rt = Arc::clone(&rt);
 
             tokio::select! {
-                () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+                () = tokio::time::sleep(std::time::Duration::from_mins(1)) => {
                     panic!("Timeout waiting for components to load");
                 }
                 () = cloned_rt.load_components() => {}
@@ -578,7 +578,7 @@ async fn ducklake_catalog_read_write_insert() -> Result<(), anyhow::Error> {
             let cloned_rt = Arc::clone(&rt);
 
             tokio::select! {
-                () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+                () = tokio::time::sleep(std::time::Duration::from_mins(1)) => {
                     panic!("Timeout waiting for components to load");
                 }
                 () = cloned_rt.load_components() => {}

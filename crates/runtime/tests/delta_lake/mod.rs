@@ -87,7 +87,7 @@ async fn run_delta_lake_test(
 
     // Set a timeout for the test
     tokio::select! {
-        () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+        () = tokio::time::sleep(std::time::Duration::from_mins(1)) => {
             return Err("Timed out waiting for datasets to load".to_string());
         }
         () = cloned_rt.load_components() => {}
@@ -359,7 +359,7 @@ async fn query_delta_lake_with_timestamp_pruning() -> Result<(), String> {
             let cloned_rt = Arc::new(rt.clone());
 
             tokio::select! {
-                () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+                () = tokio::time::sleep(std::time::Duration::from_mins(1)) => {
                     return Err("Timed out waiting for datasets to load".to_string());
                 }
                 () = cloned_rt.load_components() => {}
@@ -447,7 +447,7 @@ async fn query_delta_lake_column_mapping_mode_name() -> Result<(), String> {
             let cloned_rt = Arc::new(rt.clone());
 
             tokio::select! {
-                () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+                () = tokio::time::sleep(std::time::Duration::from_mins(1)) => {
                     return Err("Timed out waiting for datasets to load".to_string());
                 }
                 () = cloned_rt.load_components() => {}
@@ -577,7 +577,7 @@ async fn query_delta_lake_column_mapping_mode_id() -> Result<(), String> {
             let cloned_rt = Arc::new(rt.clone());
 
             tokio::select! {
-                () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+                () = tokio::time::sleep(std::time::Duration::from_mins(1)) => {
                     return Err("Timed out waiting for datasets to load".to_string());
                 }
                 () = cloned_rt.load_components() => {}
@@ -679,7 +679,7 @@ async fn query_delta_lake_column_mapping_with_partitions() -> Result<(), String>
             let cloned_rt = Arc::new(rt.clone());
 
             tokio::select! {
-                () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+                () = tokio::time::sleep(std::time::Duration::from_mins(1)) => {
                     return Err("Timed out waiting for datasets to load".to_string());
                 }
                 () = cloned_rt.load_components() => {}

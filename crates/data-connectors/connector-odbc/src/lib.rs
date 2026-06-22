@@ -29,6 +29,7 @@ use runtime::dataconnector::{
     ConnectorComponent, ConnectorParams, DataConnector, DataConnectorFactory, DataConnectorResult,
     NewDataConnectorResult,
 };
+use runtime::datafusion::udf::deny_spice_specific_functions;
 use runtime::parameters::{ParameterSpec, Parameters};
 use snafu::prelude::*;
 use std::any::Any;
@@ -190,10 +191,8 @@ fn driver_is_file(driver: &str) -> bool {
     driver
         .split('=')
         .next_back()
-        // if the file doesn't yet exist, the connector will fail registration
-        // when the connector re-tries, if the file exists it will fail again
-        .filter(|s| std::fs::metadata(s).is_ok())
-        .is_some()
+        .as_ref()
+        .is_some_and(|s| std::fs::metadata(s).is_ok())
 }
 
 fn parameter_is_integer(parameters: &Parameters, param: &str) -> Result<()> {
@@ -267,7 +266,11 @@ impl DataConnectorFactory for ODBCFactory {
                     .context(UnableToCreateODBCConnectionPoolSnafu)?,
             );
 
-            let odbc_factory = ODBCTableFactory::new(pool, dialect);
+            // Install the Spice function deny-list so Spice-only UDFs
+            // (json_get_str, etc.) are evaluated locally instead of pushed into
+            // the SQL sent through ODBC, which would reject them (#10703).
+            let odbc_factory = ODBCTableFactory::new(pool, dialect)
+                .with_function_support(deny_spice_specific_functions().as_ref().clone());
 
             Ok(Arc::new(ODBC { odbc_factory }) as Arc<dyn DataConnector>)
         })

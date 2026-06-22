@@ -23,7 +23,6 @@ limitations under the License.
 //! In the metadata catalog, table names are stored with a namespace prefix
 //! (`namespace/table_name`) so that namespace membership survives restarts.
 
-use std::any::Any;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -75,6 +74,21 @@ pub struct CayenneCatalogProviderConfig {
     pub inline_flush_max_bytes: Option<i64>,
     /// Primary-key conflict detection behavior for inserts.
     pub pk_conflict_detection: Option<PkConflictDetection>,
+    /// Enable the closed-loop adaptive tuner (`cayenne_tuning: adaptive`). When
+    /// `true`, the per-table controller in `provider::context` adapts the
+    /// inline-flush caps, compaction cadence/trigger, and write concurrency over
+    /// time, anchored to the seeded knob values below.
+    pub dynamic_tuning: bool,
+    /// Hardware-seeded background compaction interval (ms). Seeds the adaptive
+    /// controller's starting point; `None` keeps the engine default.
+    pub compaction_background_interval_ms: Option<u64>,
+    /// Hardware-seeded small-file compaction trigger. Seeds the adaptive
+    /// controller's starting point; `None` keeps the engine default.
+    pub compaction_trigger_files: Option<usize>,
+    /// Hardware-seeded deletion-index size that triggers the seq-prefix bake.
+    /// Seeds the adaptive controller's starting point; `None` keeps the engine
+    /// default.
+    pub bake_deletion_index_trigger: Option<usize>,
 }
 
 /// Errors that can occur when interacting with a Cayenne catalog.
@@ -301,15 +315,23 @@ impl CayenneCatalogProvider {
         if let Some(v) = provider_config.pk_conflict_detection {
             config.pk_conflict_detection = v;
         }
+        if let Some(v) = provider_config.compaction_background_interval_ms {
+            config.compaction_background_interval_ms = v;
+        }
+        if let Some(v) = provider_config.compaction_trigger_files {
+            config.compaction_trigger_files = v;
+        }
+        if let Some(v) = provider_config.bake_deletion_index_trigger {
+            config.bake_deletion_index_trigger = v;
+        }
+        // Enable the closed loop last so it anchors to the seeded knob values
+        // above (the controller bounds derive from `[floor, 4×seed]`).
+        config.dynamic_tuning = provider_config.dynamic_tuning;
         config
     }
 }
 
 impl CatalogProvider for CayenneCatalogProvider {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema_names(&self) -> Vec<String> {
         self.schemas.read().keys().cloned().collect()
     }
@@ -361,9 +383,8 @@ impl RefreshableCatalogProvider for CayenneCatalogProvider {
             .await?;
 
             if let Some(existing_schema) = existing_schemas.get(ns)
-                && let Some(existing_cayenne_schema) = existing_schema
-                    .as_any()
-                    .downcast_ref::<CayenneSchemaProvider>()
+                && let Some(existing_cayenne_schema) =
+                    existing_schema.downcast_ref::<CayenneSchemaProvider>()
             {
                 existing_cayenne_schema.refresh_from(&refreshed_schema);
                 new_schemas.insert(ns.clone(), Arc::clone(existing_schema));
@@ -377,9 +398,8 @@ impl RefreshableCatalogProvider for CayenneCatalogProvider {
                 continue;
             }
 
-            if let Some(existing_cayenne_schema) = existing_schema
-                .as_any()
-                .downcast_ref::<CayenneSchemaProvider>()
+            if let Some(existing_cayenne_schema) =
+                existing_schema.downcast_ref::<CayenneSchemaProvider>()
             {
                 existing_cayenne_schema.clear_tables();
             }
@@ -484,6 +504,15 @@ impl CayenneSchemaProvider {
         self.tables.read().clone()
     }
 
+    /// Synchronous lookup of a cached table provider by name. Unlike the async
+    /// [`SchemaProvider::table`], this reads the in-memory table cache directly,
+    /// so callers that need a table's schema from a sync context (e.g. the
+    /// `executor_table` UDTF's `TableFunctionImpl::call`) can avoid blocking.
+    #[must_use]
+    pub fn table_sync(&self, name: &str) -> Option<Arc<dyn TableProvider>> {
+        self.tables.read().get(name).cloned()
+    }
+
     fn replace_tables(&self, tables: HashMap<String, Arc<dyn TableProvider>>) {
         *self.tables.write() = tables;
     }
@@ -558,10 +587,6 @@ impl CayenneSchemaProvider {
 
 #[async_trait]
 impl SchemaProvider for CayenneSchemaProvider {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn table_names(&self) -> Vec<String> {
         self.tables.read().keys().cloned().collect()
     }

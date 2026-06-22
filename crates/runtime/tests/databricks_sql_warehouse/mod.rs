@@ -88,7 +88,7 @@ async fn databricks_sql_warehouse_managed_table_test() -> Result<(), anyhow::Err
             let cloned_rt = Arc::new(rt.clone());
 
             tokio::select! {
-                () = tokio::time::sleep(std::time::Duration::from_secs(120)) => {
+                () = tokio::time::sleep(std::time::Duration::from_mins(2)) => {
                     return Err(anyhow::anyhow!("Timed out waiting for datasets to load"));
                 }
                 () = cloned_rt.load_components() => {}
@@ -150,7 +150,7 @@ async fn databricks_sql_warehouse_schema_inference_test() -> Result<(), anyhow::
             let cloned_rt = Arc::new(rt.clone());
 
             tokio::select! {
-                () = tokio::time::sleep(std::time::Duration::from_secs(120)) => {
+                () = tokio::time::sleep(std::time::Duration::from_mins(2)) => {
                     return Err(anyhow::anyhow!("Timed out waiting for datasets to load"));
                 }
                 () = cloned_rt.load_components() => {}
@@ -212,7 +212,7 @@ async fn databricks_sql_warehouse_dataset_registration_test() -> Result<(), anyh
             let cloned_rt = Arc::new(rt.clone());
 
             tokio::select! {
-                () = tokio::time::sleep(std::time::Duration::from_secs(120)) => {
+                () = tokio::time::sleep(std::time::Duration::from_mins(2)) => {
                     return Err(anyhow::anyhow!("Timed out waiting for datasets to load"));
                 }
                 () = cloned_rt.load_components() => {}
@@ -277,7 +277,7 @@ async fn databricks_sql_warehouse_external_table_test() -> Result<(), anyhow::Er
             let cloned_rt = Arc::new(rt.clone());
 
             tokio::select! {
-                () = tokio::time::sleep(std::time::Duration::from_secs(120)) => {
+                () = tokio::time::sleep(std::time::Duration::from_mins(2)) => {
                     return Err(anyhow::anyhow!("Timed out waiting for datasets to load"));
                 }
                 () = cloned_rt.load_components() => {}
@@ -340,7 +340,7 @@ async fn databricks_sql_warehouse_foreign_table_test() -> Result<(), anyhow::Err
             let cloned_rt = Arc::new(rt.clone());
 
             tokio::select! {
-                () = tokio::time::sleep(std::time::Duration::from_secs(120)) => {
+                () = tokio::time::sleep(std::time::Duration::from_mins(2)) => {
                     return Err(anyhow::anyhow!("Timed out waiting for datasets to load"));
                 }
                 () = cloned_rt.load_components() => {}
@@ -402,7 +402,7 @@ async fn databricks_sql_warehouse_materialized_view_test() -> Result<(), anyhow:
             let cloned_rt = Arc::new(rt.clone());
 
             tokio::select! {
-                () = tokio::time::sleep(std::time::Duration::from_secs(120)) => {
+                () = tokio::time::sleep(std::time::Duration::from_mins(2)) => {
                     return Err(anyhow::anyhow!("Timed out waiting for datasets to load"));
                 }
                 () = cloned_rt.load_components() => {}

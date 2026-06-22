@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::{any::Any, collections::HashMap, fmt, sync::Arc};
+use std::{collections::HashMap, fmt, sync::Arc};
 
 use arrow::datatypes::SchemaRef;
 use datafusion::error::{DataFusionError, Result as DataFusionResult};
@@ -213,7 +213,7 @@ impl TryFrom<DataUpdate> for StreamingDataUpdate {
 pub struct StreamingDataUpdateExecutionPlan {
     record_batch_stream: Arc<Mutex<Option<SendableRecordBatchStream>>>,
     schema: SchemaRef,
-    properties: PlanProperties,
+    properties: Arc<PlanProperties>,
 }
 
 impl StreamingDataUpdateExecutionPlan {
@@ -235,12 +235,12 @@ impl StreamingDataUpdateExecutionPlan {
         Self {
             record_batch_stream: Arc::new(Mutex::new(record_batch_stream)),
             schema: Arc::clone(&schema),
-            properties: PlanProperties::new(
+            properties: Arc::new(PlanProperties::new(
                 EquivalenceProperties::new(schema),
                 Partitioning::UnknownPartitioning(1),
                 EmissionType::Incremental,
                 Boundedness::Bounded,
-            ),
+            )),
         }
     }
 
@@ -300,15 +300,11 @@ impl ExecutionPlan for StreamingDataUpdateExecutionPlan {
         "StreamingDataUpdateExecutionPlan"
     }
 
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema(&self) -> SchemaRef {
         Arc::clone(&self.schema)
     }
 
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
     }
 

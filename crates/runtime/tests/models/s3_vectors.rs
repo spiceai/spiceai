@@ -951,7 +951,7 @@ pub(crate) mod search {
         let rt = Arc::new(Runtime::builder().with_app(app).build().await);
 
         tokio::select! {
-            () = tokio::time::sleep(std::time::Duration::from_secs(120)) => {
+            () = tokio::time::sleep(std::time::Duration::from_mins(2)) => {
                 return Err(anyhow::anyhow!("Timed out waiting for components to load"));
             }
             () = Arc::clone(&rt).load_components() => {}

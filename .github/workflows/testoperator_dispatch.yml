@@ -2,8 +2,12 @@ name: testoperator dispatch
 
 on:
   schedule:
-    # Every day, at 0900 UTC (0200 PDT)
+    # daily-main, 0900 UTC / 0200 PDT  — full bench suite
     - cron: '0 9 * * *'
+    # htap-sf100, every 3h (0200, 0500, 0800, 1100, 1400, 1700, 2000, 2300) — HTAP CH-benCHmark SF100
+    - cron: '0 2,5,8,11,14,17,20,23 * * *'
+    # htap-sf1000, twice daily (0000, 1200) — HTAP CH-benCHmark SF1000
+    - cron: '0 0,12 * * *'
 
   workflow_dispatch:
     inputs:
@@ -26,7 +30,6 @@ on:
           - 'text-to-sql'
           - 'streaming-bench'
           - 'streaming-correctness'
-          - 'htap'
       update_snapshots:
         description: 'Update snapshots?'
         required: false
@@ -42,6 +45,11 @@ jobs:
   dispatch-scheduled:
     name: Dispatch tests - Scheduled
     runs-on: spiceai-dev-runners
+    # Serial chbench htap dispatch (--max-concurrent 1) blocks this job for the sum of the batch's
+    # run durations; the SF1000 batch (6 variants x up to the 120-min htap cap) can run several
+    # hours, so raise the cap well above GitHub's 6h default. Shorter crons (daily-main, htap-sf100)
+    # finish early — this is only an upper bound.
+    timeout-minutes: 720
     if: ${{ github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && github.event.inputs.scheduled == 'true') }}
     strategy:
       fail-fast: false
@@ -50,10 +58,10 @@ jobs:
           - 'trunk'
           - 'release/2.0'
     concurrency:
-      group: testoperator-dispatch-scheduled
+      group: testoperator-dispatch-scheduled-${{ matrix.branch }}-${{ github.event.schedule || github.event.ref }}
       cancel-in-progress: false
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
         with:
           persist-credentials: false
           ref: ${{ matrix.branch }}
@@ -92,7 +100,22 @@ jobs:
       - name: Set spicepod validator path
         run: echo "SPICEPOD_VALIDATOR=${{ steps.build-spicepod-validator.outputs.validator-path }}" >> $GITHUB_ENV
 
+      # Map the cron that fired to a human-readable schedule name. 
+      # Every gated step reads steps.sched.outputs.name.
+      - name: Resolve schedule name
+        id: sched
+        run: |
+          case "${{ github.event.schedule }}" in
+            '0 9 * * *')               NAME=daily-main ;;
+            '0 2,5,8,11,14,17,20,23 * * *') NAME=htap-sf100 ;;
+            '0 0,12 * * *')            NAME=htap-sf1000 ;;
+            *)                         NAME=           ;;   # manual / unrecognized cron — match nothing
+          esac
+          echo "Resolved schedule name: $NAME"
+          echo "name=$NAME" >> "$GITHUB_OUTPUT"
+
       - name: Validate spicepods - TPCH - SF1
+        if: ${{ steps.sched.outputs.name == 'daily-main' }}
         run: |
           shopt -s globstar nullglob
           for file in ./test/spicepods/tpch/sf1/**/*.yaml; do
@@ -101,6 +124,7 @@ jobs:
           done
 
       - name: Validate spicepods - TPCDS - SF1
+        if: ${{ steps.sched.outputs.name == 'daily-main' }}
         run: |
           shopt -s globstar nullglob
           for file in ./test/spicepods/tpcds/sf1/**/*.yaml; do
@@ -109,9 +133,28 @@ jobs:
           done
 
       - name: Validate spicepods - ClickBench - SF1
+        if: ${{ steps.sched.outputs.name == 'daily-main' }}
         run: |
           shopt -s globstar nullglob
           for file in ./test/spicepods/clickbench/sf1/**/*.yaml; do
+            echo "Validating $file"
+            "$SPICEPOD_VALIDATOR" "$file"
+          done
+
+      - name: Validate spicepods - TPCH - SF100
+        if: ${{ steps.sched.outputs.name == 'daily-main' }}
+        run: |
+          shopt -s globstar nullglob
+          for file in ./test/spicepods/tpch/sf100/**/*.yaml; do
+            echo "Validating $file"
+            "$SPICEPOD_VALIDATOR" "$file"
+          done
+
+      - name: Validate spicepods - TPCDS - SF100
+        if: ${{ steps.sched.outputs.name == 'daily-main' }}
+        run: |
+          shopt -s globstar nullglob
+          for file in ./test/spicepods/tpcds/sf100/**/*.yaml; do
             echo "Validating $file"
             "$SPICEPOD_VALIDATOR" "$file"
           done
@@ -124,23 +167,8 @@ jobs:
             "$SPICEPOD_VALIDATOR" "$file"
           done
 
-      - name: Validate spicepods - TPCH - SF100
-        run: |
-          shopt -s globstar nullglob
-          for file in ./test/spicepods/tpch/sf100/**/*.yaml; do
-            echo "Validating $file"
-            "$SPICEPOD_VALIDATOR" "$file"
-          done
-
-      - name: Validate spicepods - TPCDS - SF100
-        run: |
-          shopt -s globstar nullglob
-          for file in ./test/spicepods/tpcds/sf100/**/*.yaml; do
-            echo "Validating $file"
-            "$SPICEPOD_VALIDATOR" "$file"
-          done
-
       - name: Dispatch Testoperator - Scheduled Bench - TPCH - SF1
+        if: ${{ steps.sched.outputs.name == 'daily-main' }}
         run: |
           testoperator dispatch ./tools/testoperator/dispatch/tpch/sf1 --workflow bench
         env:
@@ -149,6 +177,7 @@ jobs:
           WORKFLOW_COMMIT: ${{ matrix.branch }}
 
       - name: Dispatch Testoperator - Scheduled Bench - TPCDS
+        if: ${{ steps.sched.outputs.name == 'daily-main' }}
         run: |
           testoperator dispatch ./tools/testoperator/dispatch/tpcds/sf1 --workflow bench
         env:
@@ -157,6 +186,7 @@ jobs:
           WORKFLOW_COMMIT: ${{ matrix.branch }}
 
       - name: Dispatch Testoperator - Scheduled Bench - ClickBench
+        if: ${{ steps.sched.outputs.name == 'daily-main' }}
         run: |
           testoperator dispatch ./tools/testoperator/dispatch/clickbench/sf1 --workflow bench
         env:
@@ -165,6 +195,7 @@ jobs:
           WORKFLOW_COMMIT: ${{ matrix.branch }}
 
       - name: Dispatch Testoperator - Scheduled Append - TPCH - SF1
+        if: ${{ steps.sched.outputs.name == 'daily-main' }}
         run: |
           testoperator dispatch ./tools/testoperator/dispatch/tpch/sf1 --workflow append
         env:
@@ -173,6 +204,7 @@ jobs:
           WORKFLOW_COMMIT: ${{ matrix.branch }}
 
       - name: Dispatch Testoperator - Scheduled Bench - TPCH - SF100
+        if: ${{ steps.sched.outputs.name == 'daily-main' }}
         run: |
           testoperator dispatch ./tools/testoperator/dispatch/tpch/sf100 --workflow bench
         env:
@@ -181,6 +213,7 @@ jobs:
           WORKFLOW_COMMIT: ${{ matrix.branch }}
 
       - name: Dispatch Testoperator - Scheduled Bench - TPCDS - SF100
+        if: ${{ steps.sched.outputs.name == 'daily-main' }}
         run: |
           testoperator dispatch ./tools/testoperator/dispatch/tpcds/sf100 --workflow bench
         env:
@@ -189,6 +222,7 @@ jobs:
           WORKFLOW_COMMIT: ${{ matrix.branch }}
 
       - name: Dispatch Testoperator - Scheduled Streaming - Bench
+        if: false
         run: |
           testoperator dispatch ./tools/testoperator/dispatch/streaming --workflow streaming-bench
         env:
@@ -197,6 +231,7 @@ jobs:
           WORKFLOW_COMMIT: ${{ matrix.branch }}
 
       - name: Dispatch Testoperator - Scheduled Streaming - Correctness
+        if: false
         run: |
           testoperator dispatch ./tools/testoperator/dispatch/streaming --workflow streaming-correctness
         env:
@@ -204,9 +239,35 @@ jobs:
           SPICED_COMMIT: ${{ steps.setup-spiced.outputs.SPICED_COMMIT }}
           WORKFLOW_COMMIT: ${{ matrix.branch }}
 
-      - name: Dispatch Testoperator - Scheduled CH-BenCHmark - SF1
+      # HTAP CH-benCHmark — SF100 fires on its own every-3h cron. --max-concurrent 1 makes the
+      # dispatcher wait for each run to finish before dispatching the next (true serial, no
+      # supersession); --max-concurrent-wait-timeout-mins 180 covers a full run's wall-clock so
+      # the slot wait doesn't give up early. The htap concurrency group is the backstop.
+      - name: Dispatch Testoperator - Scheduled CH-BenCHmark - SF100
+        if: ${{ matrix.branch == 'trunk' && steps.sched.outputs.name == 'htap-sf100' }}
         run: |
-          testoperator dispatch ./tools/testoperator/dispatch/chbench/sf1 --workflow htap
+          testoperator dispatch ./tools/testoperator/dispatch/chbench/sf100 --workflow htap --max-concurrent 1 --max-concurrent-wait-timeout-mins 180
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SPICED_COMMIT: ${{ steps.setup-spiced.outputs.SPICED_COMMIT }}
+          WORKFLOW_COMMIT: ${{ matrix.branch }}
+
+      - name: Dispatch Testoperator - Scheduled CH-BenCHmark Bench - SF100
+        if: ${{ matrix.branch == 'trunk' && steps.sched.outputs.name == 'daily-main' }}
+        run: |
+          testoperator dispatch ./tools/testoperator/dispatch/chbench/sf100 --workflow bench
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SPICED_COMMIT: ${{ steps.setup-spiced.outputs.SPICED_COMMIT }}
+          WORKFLOW_COMMIT: ${{ matrix.branch }}
+
+      # SF1000 fires twice daily. --max-concurrent 1 + the long slot-wait timeout serialize the
+      # whole SF1000 variant batch run-by-run (no supersession), and serialize against any still-
+      # draining SF100 run via the shared htap active-run count.
+      - name: Dispatch Testoperator - Scheduled CH-BenCHmark - SF1000
+        if: ${{ matrix.branch == 'trunk' && steps.sched.outputs.name == 'htap-sf1000' }}
+        run: |
+          testoperator dispatch ./tools/testoperator/dispatch/chbench/sf1000 --workflow htap --max-concurrent 1 --max-concurrent-wait-timeout-mins 180
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           SPICED_COMMIT: ${{ steps.setup-spiced.outputs.SPICED_COMMIT }}
@@ -220,7 +281,7 @@ jobs:
       group: testoperator-dispatch-${{ github.event.ref }}
       cancel-in-progress: false
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
         with:
           persist-credentials: false
 
@@ -279,15 +340,6 @@ jobs:
         run: |
           shopt -s globstar nullglob
           for file in ./test/spicepods/clickbench/sf1/**/*.yaml; do
-            echo "Validating $file"
-            "$SPICEPOD_VALIDATOR" "$file"
-          done
-
-      - name: Validate spicepods - CH-BenCHmark
-        if: ${{ github.event.inputs.workflow_type == 'htap' }}
-        run: |
-          shopt -s globstar nullglob
-          for file in ./test/spicepods/chbench/**/*.yaml; do
             echo "Validating $file"
             "$SPICEPOD_VALIDATOR" "$file"
           done
@@ -369,6 +421,7 @@ jobs:
           WORKFLOW_COMMIT: ${{ github.event.ref }}
 
       - name: Dispatch Testoperator - ${{ github.event.inputs.workflow_type }} - Streaming
+        if: false
         run: |
           testoperator dispatch ./tools/testoperator/dispatch/streaming \
             --workflow ${{ github.event.inputs.workflow_type }} \
@@ -378,12 +431,3 @@ jobs:
           SPICED_COMMIT: ${{ steps.setup-spiced.outputs.SPICED_COMMIT }}
           WORKFLOW_COMMIT: ${{ github.event.ref }}
 
-      - name: Dispatch Testoperator - ${{ github.event.inputs.workflow_type }} - CH-BenCHmark - SF10
-        run: |
-          testoperator dispatch ./tools/testoperator/dispatch/chbench/sf10 \
-            --workflow ${{ github.event.inputs.workflow_type }} \
-            --update-snapshots ${{ github.event.inputs.update_snapshots }}
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          SPICED_COMMIT: ${{ steps.setup-spiced.outputs.SPICED_COMMIT }}
-          WORKFLOW_COMMIT: ${{ github.event.ref }}

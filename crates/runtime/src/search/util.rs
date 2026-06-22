@@ -20,6 +20,7 @@ use std::{collections::HashMap, sync::Arc};
 
 use app::App;
 use data_components::MetadataEnrichedTableProvider;
+use data_components::iceberg::delete::IcebergDeletionProvider;
 use datafusion::common::Column;
 use datafusion::error::DataFusionError;
 use datafusion::{datasource::TableProvider, sql::TableReference};
@@ -34,6 +35,7 @@ use snafu::ResultExt;
 use tokio::sync::RwLock;
 
 use crate::accelerated_table::AcceleratedTable;
+use crate::dataconnector::iceberg_cluster::IcebergClusterTableProvider;
 use crate::datafusion::{DataFusion, SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA};
 
 use crate::embeddings::table::EmbeddingTable;
@@ -54,39 +56,47 @@ pub(crate) fn find_concrete_table_provider<T: TableProvider + 'static>(
     // Also avoids having to [`Box::pin`] for recursive `async fn`.
     loop {
         // Attempt to downcast the current table to the desired type.
-        if let Some(found_table) = current_tbl.as_any().downcast_ref::<T>() {
+        if let Some(found_table) = current_tbl.downcast_ref::<T>() {
             return Some(found_table);
         }
 
         // Handle specific table wrapping logic.
-        if let Some(index_table) = current_tbl.as_any().downcast_ref::<IndexedTableProvider>() {
+        if let Some(index_table) = current_tbl.downcast_ref::<IndexedTableProvider>() {
             current_tbl = index_table.get_underlying_ref();
             continue;
         }
 
-        if let Some(adaptor) = current_tbl
-            .as_any()
-            .downcast_ref::<FederatedTableProviderAdaptor>()
+        if let Some(adaptor) = current_tbl.downcast_ref::<FederatedTableProviderAdaptor>()
             && let Some(adapted_tbl) = adaptor.table_provider.as_ref()
         {
             current_tbl = adapted_tbl;
             continue;
         }
 
-        if let Some(metadata_table) = current_tbl
-            .as_any()
-            .downcast_ref::<MetadataEnrichedTableProvider>()
-        {
+        if let Some(metadata_table) = current_tbl.downcast_ref::<MetadataEnrichedTableProvider>() {
             current_tbl = metadata_table.get_inner_ref();
             continue;
         }
 
-        if let Some(embedding_table) = current_tbl.as_any().downcast_ref::<EmbeddingTable>() {
+        // The Iceberg data connector wraps its providers so distributed (Ballista)
+        // scans can be serialized; peel both layers so callers (e.g. the health
+        // monitor's Iceberg skip) still see the underlying `IcebergTableProvider`.
+        if let Some(cluster_table) = current_tbl.downcast_ref::<IcebergClusterTableProvider>() {
+            current_tbl = cluster_table.inner();
+            continue;
+        }
+
+        if let Some(deletion_table) = current_tbl.downcast_ref::<IcebergDeletionProvider>() {
+            current_tbl = deletion_table.inner();
+            continue;
+        }
+
+        if let Some(embedding_table) = current_tbl.downcast_ref::<EmbeddingTable>() {
             current_tbl = embedding_table.get_underlying_ref();
             continue;
         }
 
-        if let Some(accelerated_table) = current_tbl.as_any().downcast_ref::<AcceleratedTable>() {
+        if let Some(accelerated_table) = current_tbl.downcast_ref::<AcceleratedTable>() {
             current_tbl = accelerated_table
                 .get_federated_table_ref()
                 .try_table_provider_sync_ref()?;
@@ -421,5 +431,28 @@ mod tests {
         assert!(find_concrete_table_provider::<IndexedTableProvider>(&wrapped_table).is_some());
 
         assert!(find_concrete_table_provider::<EmbeddingTable>(&wrapped_table).is_none());
+    }
+
+    #[test]
+    fn test_find_concrete_table_provider_peels_iceberg_cluster_wrapper() {
+        use datafusion::sql::TableReference;
+
+        let base: Arc<dyn TableProvider> = Arc::new(
+            MemTable::try_new(Arc::new(Schema::empty()), vec![]).expect("failed to make table"),
+        );
+
+        let wrapped: Arc<dyn TableProvider> = Arc::new(IcebergClusterTableProvider::new(
+            TableReference::bare("trips"),
+            Arc::clone(&base),
+        ));
+
+        // The Iceberg cluster wrapper must be peeled so concrete-provider lookups
+        // (e.g. the health monitor's Iceberg skip, #6994) still reach the inner
+        // provider. Using MemTable as the inner exercises the peel arm without a
+        // live Iceberg catalog.
+        assert!(
+            find_concrete_table_provider::<MemTable>(&wrapped).is_some(),
+            "find_concrete_table_provider must peel IcebergClusterTableProvider"
+        );
     }
 }

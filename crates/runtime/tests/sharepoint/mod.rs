@@ -52,7 +52,7 @@ use app::AppBuilder;
 use arrow::array::{Int64Array, RecordBatch, UInt64Array};
 use data_components::sharepoint::auth::{DEFAULT_SCOPE, SharepointAuth};
 use futures::StreamExt;
-use object_store::ObjectStore;
+use object_store::ObjectStoreExt;
 use runtime::Runtime;
 use secrecy::SecretString;
 use spicepod::{component::dataset::Dataset, param::Params};
@@ -122,8 +122,7 @@ fn unique_filename(ext: &str) -> String {
     // other's drive items.
     let ts = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis())
-        .unwrap_or(0);
+        .map_or(0, |d| d.as_millis());
     let nonce = uuid::Uuid::new_v4().simple();
     format!("spice-test-{ts}-{nonce}.{ext}")
 }
@@ -224,7 +223,7 @@ async fn sharepoint_csv_round_trip() -> Result<(), anyhow::Error> {
             let rt = Runtime::builder().with_app(app).build().await;
             let cloned = Arc::new(rt.clone());
             tokio::select! {
-                () = tokio::time::sleep(Duration::from_secs(60)) => {
+                () = tokio::time::sleep(Duration::from_mins(1)) => {
                     return Err(anyhow::anyhow!("timed out loading SharePoint dataset"));
                 }
                 () = cloned.load_components() => {}
@@ -305,7 +304,7 @@ async fn sharepoint_parquet_copy_to() -> Result<(), anyhow::Error> {
             let rt = Runtime::builder().with_app(app).build().await;
             let cloned = Arc::new(rt.clone());
             tokio::select! {
-                () = tokio::time::sleep(Duration::from_secs(60)) => {
+                () = tokio::time::sleep(Duration::from_mins(1)) => {
                     return Err(anyhow::anyhow!("timed out loading dataset"));
                 }
                 () = cloned.load_components() => {}
@@ -399,7 +398,7 @@ async fn sharepoint_legacy_metadata_listing() -> Result<(), anyhow::Error> {
             let rt = Runtime::builder().with_app(app).build().await;
             let cloned = Arc::new(rt.clone());
             tokio::select! {
-                () = tokio::time::sleep(Duration::from_secs(60)) => {
+                () = tokio::time::sleep(Duration::from_mins(1)) => {
                     return Err(anyhow::anyhow!("timed out loading legacy dataset"));
                 }
                 () = cloned.load_components() => {}

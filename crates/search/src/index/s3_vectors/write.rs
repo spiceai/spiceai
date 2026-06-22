@@ -236,7 +236,7 @@ async fn process_single_batch(
     let (schema, arr, _) = updated_record.into_parts();
     let (arrs, fields): (Vec<_>, Vec<_>) = arr
         .into_iter()
-        .zip(schema.fields().into_iter())
+        .zip(schema.fields())
         .sorted_by_key(|(_, f)| f.name())
         .unzip();
 
@@ -415,7 +415,7 @@ async fn embed_column(
     let mut column = vec![];
 
     for (i, o) in data.enumerate() {
-        if o.is_none() || o.is_some_and(str::is_empty) {
+        if o.is_none_or(str::is_empty) {
             nulls.push(i);
         } else if let Some(s) = o {
             column.push(s.to_string());

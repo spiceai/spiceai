@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::{any::Any, sync::Arc};
+use std::sync::Arc;
 
 use arrow_schema::SchemaRef;
 use async_trait::async_trait;
@@ -50,10 +50,6 @@ pub(super) struct DuckDBVectorQueryTable {
 
 #[async_trait]
 impl TableProvider for DuckDBVectorQueryTable {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema(&self) -> SchemaRef {
         Arc::clone(&self.schema)
     }
@@ -93,12 +89,12 @@ impl TableProvider for DuckDBVectorQueryTable {
                 .collect(),
         };
 
-        let properties = PlanProperties::new(
+        let properties = Arc::new(PlanProperties::new(
             EquivalenceProperties::new(Arc::clone(&projected_schema)),
             Partitioning::UnknownPartitioning(1),
             EmissionType::Incremental,
             Boundedness::Bounded,
-        );
+        ));
 
         Ok(Arc::new(DuckDBVectorQueryExec {
             projected_schema,

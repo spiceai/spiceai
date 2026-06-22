@@ -36,7 +36,7 @@ use async_openai::types::embeddings::EmbeddingInput;
 use datafusion::common::exec_err;
 use datafusion::datasource::ViewTable;
 use datafusion::logical_expr::expr::FieldMetadata;
-use datafusion::logical_expr::{ColumnarValue, Signature, Volatility};
+use datafusion::logical_expr::{ColumnarValue, DocSection, Documentation, Signature, Volatility};
 use datafusion::{
     catalog::{Session, TableFunctionImpl, TableProvider},
     common::Column,
@@ -63,7 +63,6 @@ const EMBED_UDF_NAME: &str = "embed";
 use search::generation::CandidateGeneration;
 use search::generation::util::get_primary_keys;
 use std::{
-    any::Any,
     cmp::min,
     collections::{BTreeMap, HashMap, HashSet},
     sync::{Arc, LazyLock, Weak},
@@ -136,6 +135,43 @@ pub static VECTOR_SEARCH_SIGNATURE: LazyLock<Signature> = LazyLock::new(|| {
         Ok(sig) => sig,
         Err(_) => Signature::variadic_any(Volatility::Stable),
     }
+});
+
+static VECTOR_SEARCH_DOCUMENTATION: LazyLock<Documentation> = LazyLock::new(|| Documentation {
+    doc_section: DocSection::default(),
+    description: "Runs vector search over a configured embedding/vector index.".to_string(),
+    syntax_example: "vector_search(tbl, 'query text'[, column])".to_string(),
+    sql_example: None,
+    arguments: Some(vec![
+        (
+            "tbl".to_string(),
+            "Dataset or table reference with an embedding/vector index.".to_string(),
+        ),
+        ("query".to_string(), "Search query text.".to_string()),
+        (
+            "column".to_string(),
+            "Optional indexed column to search when the dataset has multiple vector indexes."
+                .to_string(),
+        ),
+        (
+            "limit".to_string(),
+            "Optional maximum number of search results.".to_string(),
+        ),
+        (
+            "include_score".to_string(),
+            "Whether to include the search score column; defaults to true.".to_string(),
+        ),
+        (
+            "rank_weight".to_string(),
+            "Optional per-query weighting factor when nested inside rrf().".to_string(),
+        ),
+        (
+            "distance_metric".to_string(),
+            "Optional vector distance metric such as cosine or l2.".to_string(),
+        ),
+    ]),
+    alternative_syntax: None,
+    related_udfs: Some(vec!["rrf".to_string(), "rerank".to_string()]),
 });
 
 #[derive(Debug, PartialEq, Clone, Copy)]
@@ -780,16 +816,16 @@ impl TableFunctionImpl for VectorSearchTableFunc {
 
 /// This is a stub implementation, so that we can nest UDTF function invocations
 impl ScalarUDFImpl for VectorSearchTableFunc {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn name(&self) -> &str {
         VECTOR_SEARCH_UDTF_NAME
     }
 
     fn signature(&self) -> &Signature {
         &VECTOR_SEARCH_SIGNATURE
+    }
+
+    fn documentation(&self) -> Option<&Documentation> {
+        Some(&*VECTOR_SEARCH_DOCUMENTATION)
     }
 
     fn return_type(&self, _arg_types: &[DataType]) -> DataFusionResult<DataType> {
@@ -880,10 +916,6 @@ impl VectorSearchUDTFProvider {
 
 #[async_trait::async_trait]
 impl TableProvider for VectorSearchUDTFProvider {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema(&self) -> SchemaRef {
         // When the caller asked `include_score => false`, don't advertise `_score`
         // in the schema. The scan body also omits it from the final projection.
@@ -983,7 +1015,7 @@ impl TableProvider for VectorSearchUDTFProvider {
                     return None;
                 }
                 // Check it is in projection
-                if projection.is_none() || projection.is_some_and(|proj| proj.contains(&i)) {
+                if projection.is_none_or(|proj| proj.contains(&i)) {
                     Some(ident(f.name()))
                 } else {
                     None
@@ -1074,7 +1106,7 @@ impl TableProvider for VectorSearchUDTFProvider {
         // Only project `_score` into the output when the caller asked for it
         // AND either asked for all columns or explicitly projected that index.
         if let Some(idx) = search_field_index
-            && (projection.is_none() || projection.is_some_and(|proj| proj.contains(&idx)))
+            && projection.is_none_or(|proj| proj.contains(&idx))
         {
             final_expr.push(score_expr.clone().alias(SEARCH_SCORE_COLUMN_NAME));
         }

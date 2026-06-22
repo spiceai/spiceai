@@ -14,11 +14,14 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::{any::Any, fmt, sync::Arc};
+use std::{fmt, sync::Arc};
 
 use arrow::{
-    array::{ArrayRef, RecordBatch, StringArray, TimestampMillisecondArray, UInt64Array},
-    datatypes::{DataType, Field, Schema, SchemaRef},
+    array::{
+        ArrayRef, RecordBatch, StringArray, TimestampMicrosecondArray, TimestampMillisecondArray,
+        UInt64Array,
+    },
+    datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit},
     error::ArrowError,
 };
 use async_stream::stream;
@@ -44,6 +47,58 @@ use object_store::{ObjectMeta, ObjectStore, path::Path};
 
 use super::ObjectStoreContext;
 use url::Url;
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum MetadataColumn {
+    Location(Option<Arc<str>>),
+    LastModified,
+    Size,
+}
+
+impl MetadataColumn {
+    #[must_use]
+    pub fn name(&self) -> &str {
+        match self {
+            MetadataColumn::Location(_) => "_location",
+            MetadataColumn::LastModified => "_last_modified",
+            MetadataColumn::Size => "_size",
+        }
+    }
+
+    #[must_use]
+    pub fn arrow_type(&self) -> DataType {
+        match self {
+            MetadataColumn::Location(_) => DataType::Utf8,
+            MetadataColumn::LastModified => {
+                DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into()))
+            }
+            MetadataColumn::Size => DataType::UInt64,
+        }
+    }
+
+    #[must_use]
+    pub fn field(&self) -> Field {
+        Field::new(self.name(), self.arrow_type(), true)
+    }
+
+    #[must_use]
+    pub fn value_to_array(&self, meta: &ObjectMeta) -> ArrayRef {
+        match self {
+            MetadataColumn::Location(prefix) => {
+                let prefix = prefix.as_deref().unwrap_or_default();
+                Arc::new(StringArray::from(vec![format!(
+                    "{prefix}{}",
+                    meta.location
+                )]))
+            }
+            MetadataColumn::LastModified => Arc::new(
+                TimestampMicrosecondArray::from(vec![meta.last_modified.timestamp_micros()])
+                    .with_timezone("UTC"),
+            ),
+            MetadataColumn::Size => Arc::new(UInt64Array::from(vec![meta.size])),
+        }
+    }
+}
 
 #[derive(Debug)]
 pub struct ObjectStoreMetadataTable {
@@ -132,10 +187,6 @@ impl ObjectStoreMetadataTable {
 
 #[async_trait]
 impl TableProvider for ObjectStoreMetadataTable {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     /// Schema of [`ObjectStoreMetadataTable`] defined in relation to [`object_store::ObjectMeta`].
     /// Must match the order and types of the fields in [`to_record_batch`].
     fn schema(&self) -> SchemaRef {
@@ -186,7 +237,7 @@ pub struct ObjectStoreMetadataExec {
     projected_schema: SchemaRef,
     _filters: Vec<Expr>,
     limit: Option<usize>,
-    properties: PlanProperties,
+    properties: Arc<PlanProperties>,
 
     ctx: ObjectStoreContext,
 }
@@ -213,15 +264,11 @@ impl ExecutionPlan for ObjectStoreMetadataExec {
         "ObjectStoreMetadataExec"
     }
 
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema(&self) -> SchemaRef {
         Arc::clone(&self.projected_schema)
     }
 
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
     }
 
@@ -259,12 +306,12 @@ impl ObjectStoreMetadataExec {
             projected_schema: Arc::clone(&projected_schema),
             _filters: filters.to_vec(),
             limit,
-            properties: PlanProperties::new(
+            properties: Arc::new(PlanProperties::new(
                 EquivalenceProperties::new(projected_schema),
                 Partitioning::UnknownPartitioning(1),
                 EmissionType::Incremental,
                 Boundedness::Bounded,
-            ),
+            )),
             ctx,
         }
     }

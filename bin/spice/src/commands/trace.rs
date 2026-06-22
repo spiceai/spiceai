@@ -292,7 +292,7 @@ fn build_tree_node(
             .collect();
 
         // Sort children by start time
-        children.sort_by(|a, b| a.task_history.start_time.cmp(&b.task_history.start_time));
+        children.sort_by_key(|a| a.task_history.start_time);
 
         node.children = children;
     }

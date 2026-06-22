@@ -39,6 +39,7 @@ use bytes::Bytes;
 use chrono::Utc;
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use datafusion::arrow::datatypes::{DataType, Field, Schema};
+use object_store::ObjectStoreExt;
 use object_store::{ClientOptions, ObjectStore, aws::AmazonS3Builder, path::Path as ObjectPath};
 use runtime_acceleration::snapshot::AccelerationEngine;
 use std::{hint::black_box, path::PathBuf, sync::Arc};

@@ -761,22 +761,20 @@ impl ClusterService for ClusterServiceImpl {
 
         // Register the allocated partitions in the executor registry so the scheduler knows where they are
         {
-            let registry = self.datafusion.ctx.as_ref();
+            let task_ctx = self.datafusion.ctx.task_ctx();
             let mut partition_map: TablePartitions = table_partitions
                 .iter()
                 .map(|(tbl, sa)| {
                     let exprs = sa
                         .items
                         .iter()
-                        .filter_map(
-                            |bytes| match Expr::from_bytes_with_registry(bytes, registry) {
-                                Ok(expr) => Some(expr),
-                                Err(e) => {
-                                    tracing::error!("Failed to deserialize expr: {e}");
-                                    None
-                                }
-                            },
-                        )
+                        .filter_map(|bytes| match Expr::from_bytes_with_ctx(bytes, &task_ctx) {
+                            Ok(expr) => Some(expr),
+                            Err(e) => {
+                                tracing::error!("Failed to deserialize expr: {e}");
+                                None
+                            }
+                        })
                         .collect();
                     (TableReference::parse_str(tbl), exprs)
                 })
@@ -1171,7 +1169,7 @@ pub(crate) async fn discover_cayenne_tables(datafusion: &DataFusion) -> Vec<Tabl
             };
 
             // Prefer metadata-catalog discovery to avoid relying on in-memory schema cache.
-            if let Some(cayenne_schema) = schema.as_any().downcast_ref::<CayenneSchemaProvider>() {
+            if let Some(cayenne_schema) = schema.downcast_ref::<CayenneSchemaProvider>() {
                 let namespace_prefix = format!("{}/", cayenne_schema.namespace());
                 match cayenne_schema.metadata_catalog().list_table_names().await {
                     Ok(all_table_names) => {
@@ -1216,6 +1214,13 @@ pub(crate) async fn discover_cayenne_tables(datafusion: &DataFusion) -> Vec<Tabl
 /// Encodes a slice of `RecordBatch` into Arrow IPC streaming format.
 ///
 /// Returns an empty vec if no batches are provided.
+///
+/// A single [`StreamWriter`] is constructed once and reused across every batch
+/// in the stream (the dictionary-tracking and, where enabled, compression
+/// context live on the writer). This is the cheap hot path Arrow 58.1/58.2
+/// optimized for; constructing a writer (or compression codec) per batch would
+/// re-emit the schema/dictionaries and rebuild the codec each time. Do not
+/// move the writer construction inside the loop.
 fn encode_batches_to_ipc(batches: &[RecordBatch]) -> Result<Vec<u8>, arrow::error::ArrowError> {
     if batches.is_empty() {
         return Ok(Vec::new());
@@ -1514,5 +1519,43 @@ mod tests {
             result.contains("local_task_history"),
             "Expected local_task_history in: {result}"
         );
+    }
+
+    #[test]
+    fn test_encode_batches_to_ipc_empty_is_empty() {
+        let encoded = encode_batches_to_ipc(&[]).expect("encoding empty slice should succeed");
+        assert!(encoded.is_empty());
+    }
+
+    /// Round-trips multiple batches through a single IPC stream. This both
+    /// exercises the multi-batch path and guards the writer-reuse invariant:
+    /// one `StreamWriter` must emit a single, well-formed stream that a single
+    /// `StreamReader` decodes back into every original batch in order.
+    #[test]
+    fn test_encode_batches_to_ipc_reuses_writer_across_batches() {
+        use arrow::array::Int64Array;
+        use arrow_ipc::reader::StreamReader;
+
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let batch = |vals: Vec<i64>| {
+            RecordBatch::try_new(Arc::clone(&schema), vec![Arc::new(Int64Array::from(vals))])
+                .expect("batch should be valid")
+        };
+        let batches = vec![batch(vec![1, 2, 3]), batch(vec![4, 5]), batch(vec![6])];
+
+        let encoded = encode_batches_to_ipc(&batches).expect("encoding should succeed");
+
+        let reader = StreamReader::try_new(std::io::Cursor::new(encoded), None)
+            .expect("stream reader should parse the single reused-writer stream");
+        let decoded: Vec<RecordBatch> = reader
+            .collect::<Result<Vec<_>, _>>()
+            .expect("all batches should decode");
+
+        assert_eq!(decoded.len(), batches.len());
+        let total_rows: usize = decoded.iter().map(RecordBatch::num_rows).sum();
+        assert_eq!(total_rows, 6);
+        for (got, want) in decoded.iter().zip(batches.iter()) {
+            assert_eq!(got, want);
+        }
     }
 }

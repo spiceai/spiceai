@@ -115,7 +115,7 @@ impl AccelerationLayout {
     pub fn total_size(&self) -> u64 {
         match self {
             Self::None => 0,
-            Self::File { path } => std::fs::metadata(path).map(|m| m.len()).unwrap_or(0),
+            Self::File { path } => std::fs::metadata(path).map_or(0, |m| m.len()),
             Self::Directories { dirs } => dirs
                 .iter()
                 .map(|(dir, _)| Self::calculate_directory_size(dir))
@@ -130,7 +130,7 @@ impl AccelerationLayout {
             for entry in entries.flatten() {
                 let p = entry.path();
                 if p.is_file() {
-                    total += std::fs::metadata(&p).map(|m| m.len()).unwrap_or(0);
+                    total += std::fs::metadata(&p).map_or(0, |m| m.len());
                 } else if p.is_dir() {
                     total += Self::calculate_directory_size(&p);
                 }

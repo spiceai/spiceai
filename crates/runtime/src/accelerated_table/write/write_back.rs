@@ -33,7 +33,6 @@ limitations under the License.
 //!
 //! [`WriteMode::WriteBack`]: super::WriteMode::WriteBack
 
-use std::any::Any;
 use std::sync::Arc;
 
 use arrow::array::UInt64Array;
@@ -120,10 +119,6 @@ impl DisplayAs for WriteBackDataSink {
 
 #[async_trait]
 impl DataSink for WriteBackDataSink {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn metrics(&self) -> Option<MetricsSet> {
         None
     }
@@ -408,7 +403,6 @@ mod tests {
     use datafusion::prelude::SessionContext;
     use datafusion_datasource::memory::MemorySourceConfig;
     use datafusion_datasource::source::DataSourceExec;
-    use std::any::Any;
     use std::sync::Arc;
 
     use crate::federated_table::FederatedTable;
@@ -430,7 +424,7 @@ mod tests {
     }
 
     struct ErrorExec {
-        properties: PlanProperties,
+        properties: Arc<PlanProperties>,
         message: String,
     }
 
@@ -441,12 +435,12 @@ mod tests {
                 DataType::UInt64,
                 false,
             )]));
-            let properties = PlanProperties::new(
+            let properties = Arc::new(PlanProperties::new(
                 EquivalenceProperties::new(Arc::clone(&schema)),
                 Partitioning::UnknownPartitioning(1),
                 EmissionType::Incremental,
                 Boundedness::Bounded,
-            );
+            ));
             Arc::new(Self {
                 properties,
                 message: message.into(),
@@ -474,10 +468,7 @@ mod tests {
         fn name(&self) -> &'static str {
             "ErrorExec"
         }
-        fn as_any(&self) -> &dyn Any {
-            self
-        }
-        fn properties(&self) -> &PlanProperties {
+        fn properties(&self) -> &Arc<PlanProperties> {
             &self.properties
         }
         fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
@@ -524,9 +515,6 @@ mod tests {
 
     #[async_trait]
     impl TableProvider for MockTableProvider {
-        fn as_any(&self) -> &dyn Any {
-            self
-        }
         fn schema(&self) -> SchemaRef {
             Arc::clone(&self.schema)
         }

@@ -14,7 +14,6 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::any::Any;
 use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
@@ -56,10 +55,6 @@ impl PanickingOnceTableProvider {
 
 #[async_trait]
 impl TableProvider for PanickingOnceTableProvider {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema(&self) -> SchemaRef {
         self.inner.schema()
     }

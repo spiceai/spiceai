@@ -33,7 +33,6 @@ limitations under the License.
 //! * Cosmos DB Rust SDK 0.30 has limited cross-partition capabilities; see
 //!   the module-level documentation.
 
-use std::any::Any;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -300,10 +299,6 @@ async fn fetch_samples(
 
 #[async_trait]
 impl TableProvider for CosmosDBTableProvider {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema(&self) -> SchemaRef {
         Arc::clone(&self.schema)
     }
@@ -343,7 +338,7 @@ struct CosmosDBExec {
     /// Schema presented to `DataFusion` after projection.
     projected_schema: SchemaRef,
     projection: Option<Vec<usize>>,
-    properties: PlanProperties,
+    properties: Arc<PlanProperties>,
 }
 
 impl CosmosDBExec {
@@ -355,12 +350,12 @@ impl CosmosDBExec {
         projected_schema: SchemaRef,
         projection: Option<Vec<usize>>,
     ) -> Self {
-        let properties = PlanProperties::new(
+        let properties = Arc::new(PlanProperties::new(
             EquivalenceProperties::new(Arc::clone(&projected_schema)),
             Partitioning::UnknownPartitioning(1),
             EmissionType::Incremental,
             Boundedness::Bounded,
-        );
+        ));
         Self {
             container_client,
             endpoint,
@@ -398,15 +393,11 @@ impl ExecutionPlan for CosmosDBExec {
         "CosmosDBExec"
     }
 
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema(&self) -> SchemaRef {
         Arc::clone(&self.projected_schema)
     }
 
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
     }
 

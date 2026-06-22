@@ -17,7 +17,6 @@ limitations under the License.
 //! [`PartialAggregationFlightSqlExec`] — an [`ExecutionPlan`] that pushes a partial
 //! aggregation into a `FlightSQL` query, replacing the original scan + local aggregation.
 
-use std::any::Any;
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::sync::{Arc, LazyLock};
@@ -155,7 +154,7 @@ pub struct PartialAggregationFlightSqlExec {
     /// Cookie store for authentication propagation.
     cookie_store: Arc<CookieStore>,
     /// Cached plan properties.
-    properties: PlanProperties,
+    properties: Arc<PlanProperties>,
     /// Optional W3C `traceparent` value inherited from the source
     /// `FlightSqlExec`. Forwarded as a gRPC metadata header on each
     /// outgoing call so executor-side spans chain back to the originating
@@ -176,12 +175,12 @@ impl PartialAggregationFlightSqlExec {
         output_schema: SchemaRef,
         column_substitutions: Vec<Arc<dyn PhysicalExpr>>,
     ) -> Self {
-        let properties = PlanProperties::new(
+        let properties = Arc::new(PlanProperties::new(
             EquivalenceProperties::new(Arc::clone(&output_schema)),
             Partitioning::UnknownPartitioning(1),
             EmissionType::Incremental,
             Boundedness::Bounded,
-        );
+        ));
         let statistics = Self::derive_statistics(source, &output_schema);
         Self {
             table_reference: source.table_reference().clone(),
@@ -260,15 +259,11 @@ impl ExecutionPlan for PartialAggregationFlightSqlExec {
         "PartialAggregationFlightSqlExec"
     }
 
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema(&self) -> SchemaRef {
         Arc::clone(&self.output_schema)
     }
 
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
     }
 
@@ -276,14 +271,10 @@ impl ExecutionPlan for PartialAggregationFlightSqlExec {
         vec![]
     }
 
-    fn statistics(&self) -> Result<Statistics> {
-        Ok(self.statistics.clone())
-    }
-
-    fn partition_statistics(&self, partition: Option<usize>) -> Result<Statistics> {
+    fn partition_statistics(&self, partition: Option<usize>) -> Result<Arc<Statistics>> {
         match partition {
-            None | Some(0) => Ok(self.statistics.clone()),
-            Some(_) => Ok(Statistics::new_unknown(&self.output_schema)),
+            None | Some(0) => Ok(Arc::new(self.statistics.clone())),
+            Some(_) => Ok(Arc::new(Statistics::new_unknown(&self.output_schema))),
         }
     }
 
@@ -609,11 +600,11 @@ fn find_top_level_as(s: &str) -> Option<usize> {
                 }
                 depth -= 1;
             }
-            b' ' if depth == 0 => {
+            b' ' if depth == 0
                 // Check for " AS "
-                if i + 4 <= len && bytes[i..i + 4].eq_ignore_ascii_case(b" AS ") {
-                    return Some(i);
-                }
+                && i + 4 <= len && bytes[i..i + 4].eq_ignore_ascii_case(b" AS ") =>
+            {
+                return Some(i);
             }
             _ => {}
         }
@@ -638,7 +629,7 @@ pub(super) fn physical_expr_to_sql(
         BinaryExpr, CastExpr, Column, Literal, NegativeExpr,
     };
 
-    let any = expr.as_any();
+    let any = expr.as_ref();
 
     if let Some(col) = any.downcast_ref::<Column>() {
         // If there is a substitution for this column index, inline it.

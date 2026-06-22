@@ -164,7 +164,7 @@ async fn no_accel_no_schema_table_not_found_then_created_with_rows() -> anyhow::
             });
 
             tokio::select! {
-                () = tokio::time::sleep(Duration::from_secs(60)) => {
+                () = tokio::time::sleep(Duration::from_mins(1)) => {
                     return Err(anyhow::Error::msg("Timed out waiting for datasets to load"));
                 }
                 () = cloned_rt.load_components() => {}
@@ -231,7 +231,7 @@ async fn no_accel_no_schema_empty_table_then_rows_added() -> anyhow::Result<()> 
             });
 
             tokio::select! {
-                () = tokio::time::sleep(Duration::from_secs(60)) => {
+                () = tokio::time::sleep(Duration::from_mins(1)) => {
                     return Err(anyhow::Error::msg("Timed out waiting for datasets to load"));
                 }
                 () = cloned_rt.load_components() => {}
@@ -308,7 +308,7 @@ async fn no_accel_declared_schema_table_not_found_then_created_empty() -> anyhow
             });
 
             tokio::select! {
-                () = tokio::time::sleep(Duration::from_secs(60)) => {
+                () = tokio::time::sleep(Duration::from_mins(1)) => {
                     return Err(anyhow::Error::msg("Timed out waiting for datasets to load"));
                 }
                 () = cloned_rt.load_components() => {}
@@ -378,7 +378,7 @@ async fn no_accel_declared_schema_table_not_found_then_created_with_rows() -> an
             });
 
             tokio::select! {
-                () = tokio::time::sleep(Duration::from_secs(60)) => {
+                () = tokio::time::sleep(Duration::from_mins(1)) => {
                     return Err(anyhow::Error::msg("Timed out waiting for datasets to load"));
                 }
                 () = cloned_rt.load_components() => {}
@@ -448,7 +448,7 @@ async fn no_accel_declared_schema_empty_table_registers_immediately() -> anyhow:
             let cloned_rt = Arc::new(rt.clone());
 
             tokio::select! {
-                () = tokio::time::sleep(Duration::from_secs(60)) => {
+                () = tokio::time::sleep(Duration::from_mins(1)) => {
                     return Err(anyhow::Error::msg("Timed out waiting for datasets to load"));
                 }
                 () = cloned_rt.load_components() => {}
@@ -530,7 +530,7 @@ async fn streams_no_schema_table_not_found_then_created() -> anyhow::Result<()> 
             });
 
             tokio::select! {
-                () = tokio::time::sleep(Duration::from_secs(60)) => {
+                () = tokio::time::sleep(Duration::from_mins(1)) => {
                     return Err(anyhow::Error::msg("Timed out waiting for datasets to load"));
                 }
                 () = cloned_rt.load_components() => {}
@@ -601,7 +601,7 @@ async fn streams_no_schema_streams_not_enabled_then_enabled() -> anyhow::Result<
             });
 
             tokio::select! {
-                () = tokio::time::sleep(Duration::from_secs(60)) => {
+                () = tokio::time::sleep(Duration::from_mins(1)) => {
                     return Err(anyhow::Error::msg("Timed out waiting for datasets to load"));
                 }
                 () = cloned_rt.load_components() => {}
@@ -668,7 +668,7 @@ async fn streams_no_schema_empty_table_then_rows_added() -> anyhow::Result<()> {
             });
 
             tokio::select! {
-                () = tokio::time::sleep(Duration::from_secs(60)) => {
+                () = tokio::time::sleep(Duration::from_mins(1)) => {
                     return Err(anyhow::Error::msg("Timed out waiting for datasets to load"));
                 }
                 () = cloned_rt.load_components() => {}
@@ -739,7 +739,7 @@ async fn streams_declared_schema_table_not_found_then_created() -> anyhow::Resul
             });
 
             tokio::select! {
-                () = tokio::time::sleep(Duration::from_secs(60)) => {
+                () = tokio::time::sleep(Duration::from_mins(1)) => {
                     return Err(anyhow::Error::msg("Timed out waiting for datasets to load"));
                 }
                 () = cloned_rt.load_components() => {}
@@ -819,7 +819,7 @@ async fn streams_declared_schema_streams_not_enabled_then_enabled() -> anyhow::R
             });
 
             tokio::select! {
-                () = tokio::time::sleep(Duration::from_secs(60)) => {
+                () = tokio::time::sleep(Duration::from_mins(1)) => {
                     return Err(anyhow::Error::msg("Timed out waiting for datasets to load"));
                 }
                 () = cloned_rt.load_components() => {}
@@ -890,7 +890,7 @@ async fn streams_declared_schema_empty_table_registers_immediately() -> anyhow::
             let cloned_rt = Arc::new(rt.clone());
 
             tokio::select! {
-                () = tokio::time::sleep(Duration::from_secs(60)) => {
+                () = tokio::time::sleep(Duration::from_mins(1)) => {
                     return Err(anyhow::Error::msg("Timed out waiting for datasets to load"));
                 }
                 () = cloned_rt.load_components() => {}

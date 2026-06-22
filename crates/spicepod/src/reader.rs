@@ -23,7 +23,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 #[cfg(feature = "object-store")]
-use object_store::{DynObjectStore, ObjectStore};
+use object_store::{DynObjectStore, ObjectStoreExt};
 use snafu::prelude::*;
 
 #[derive(Debug, Snafu)]

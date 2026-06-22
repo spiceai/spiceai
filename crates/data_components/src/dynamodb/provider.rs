@@ -32,6 +32,7 @@ use crate::dynamodb::schema::infer_arrow_schema_from_rows;
 use crate::dynamodb::stream::{StreamError, process_batch, record_batch_to_change_batch};
 use crate::dynamodb::table_schema::DynamoDBTableSchema;
 use crate::dynamodb::unnest::unnest_dynamodb_rows;
+use crate::schema_discovery::merge_inferred_and_declared_schemas;
 use arrow::datatypes::SchemaRef;
 use async_trait::async_trait;
 use aws_config::SdkConfig;
@@ -63,7 +64,6 @@ use datafusion::{
     },
     prelude::Expr,
 };
-use datafusion_table_providers::util::schema::merge_inferred_and_declared_schemas;
 use dynamodb_streams::{Checkpoint, Client as StreamsClient, Metrics, MetricsCollector};
 use futures::Stream;
 use futures::pin_mut;
@@ -73,7 +73,7 @@ use std::collections::HashSet;
 use std::num::NonZeroUsize;
 use std::pin::Pin;
 use std::time::{Duration, SystemTime};
-use std::{any::Any, collections::HashMap, fmt, sync::Arc};
+use std::{collections::HashMap, fmt, sync::Arc};
 
 #[derive(Debug, Clone)]
 pub struct DynamoDBTableProvider {
@@ -577,10 +577,6 @@ impl DynamoDBTableProvider {
 
 #[async_trait]
 impl TableProvider for DynamoDBTableProvider {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema(&self) -> SchemaRef {
         Arc::clone(self.table_schema.schema())
     }
@@ -741,7 +737,7 @@ pub struct DynamoDBTableProviderExec {
     projected_schema: SchemaRef,
     unnest_depth: Option<usize>,
     time_format: Arc<String>,
-    properties: PlanProperties,
+    properties: Arc<PlanProperties>,
     json_nesting: Option<JsonNesting>,
 }
 
@@ -763,12 +759,12 @@ impl DynamoDBTableProviderExec {
             unnest_depth,
             time_format,
             json_nesting,
-            properties: PlanProperties::new(
+            properties: Arc::new(PlanProperties::new(
                 EquivalenceProperties::new(projected_schema),
                 Partitioning::UnknownPartitioning(partitions),
                 EmissionType::Incremental,
                 Boundedness::Bounded,
-            ),
+            )),
         }
     }
 }
@@ -794,15 +790,11 @@ impl ExecutionPlan for DynamoDBTableProviderExec {
         "DynamoDBTableProviderExec"
     }
 
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema(&self) -> SchemaRef {
         Arc::clone(&self.projected_schema)
     }
 
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
     }
 

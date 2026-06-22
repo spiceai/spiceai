@@ -28,17 +28,31 @@ use std::sync::Arc;
 #[derive(Clone)]
 pub struct FlightSessionExtension {
     session_ctx: Arc<SessionContext>,
+    /// Stable id of the principal that owns this session (the principal that
+    /// created it at handshake), or `None` if the session has no owner
+    /// (e.g. created without authentication). Used to bind the session to its
+    /// owner so a different authenticated principal cannot execute against it.
+    owner_stable_id: Option<String>,
 }
 
 impl FlightSessionExtension {
     #[must_use]
-    pub fn new(session_ctx: Arc<SessionContext>) -> Self {
-        Self { session_ctx }
+    pub fn new(session_ctx: Arc<SessionContext>, owner_stable_id: Option<String>) -> Self {
+        Self {
+            session_ctx,
+            owner_stable_id,
+        }
     }
 
     #[must_use]
     pub fn session_context(&self) -> &Arc<SessionContext> {
         &self.session_ctx
+    }
+
+    /// The stable id of the principal that owns this session, if any.
+    #[must_use]
+    pub fn owner_stable_id(&self) -> Option<&str> {
+        self.owner_stable_id.as_deref()
     }
 }
 

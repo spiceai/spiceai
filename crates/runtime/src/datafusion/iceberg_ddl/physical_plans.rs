@@ -16,7 +16,6 @@ limitations under the License.
 
 //! Physical execution plans for Iceberg DDL operations.
 
-use std::any::Any;
 use std::collections::HashMap;
 use std::fmt;
 use std::fmt::Write as _;
@@ -40,9 +39,7 @@ use super::acceleration_options::DatasetOptions;
 use crate::accelerated_table::AcceleratedTable;
 use crate::cluster::ExecutorRegistry;
 use crate::datafusion::DataFusion;
-use crate::datafusion::composed_catalog::ComposedCatalogProvider;
 use data_components::RefreshableCatalogProvider;
-use data_components::iceberg::provider::IcebergCatalogProvider;
 use datafusion::catalog::CatalogProviderList;
 
 use crate::component::dataset::acceleration::{Acceleration as RuntimeAcceleration, Mode};
@@ -55,6 +52,27 @@ fn ddl_result_schema() -> SchemaRef {
         DataType::Utf8,
         false,
     )]))
+}
+
+async fn create_iceberg_table_provider(
+    catalog: Arc<dyn Catalog>,
+    namespace: &NamespaceIdent,
+    table_name: &str,
+    table_state: &str,
+) -> DFResult<Arc<dyn datafusion::datasource::TableProvider>> {
+    let provider = IcebergTableProvider::try_new(
+        Arc::clone(&catalog),
+        namespace.clone(),
+        table_name.to_string(),
+    )
+    .await
+    .map_err(|e| {
+        DataFusionError::Execution(format!(
+            "Failed to create table provider for {table_state} Iceberg table '{table_name}': {e}"
+        ))
+    })?;
+
+    Ok(Arc::new(provider))
 }
 
 #[derive(Debug)]
@@ -140,7 +158,7 @@ pub struct IcebergCreateTableExec {
     dataset_options: DatasetOptions,
     datafusion: Weak<DataFusion>,
     partition_expr_sql: Option<String>,
-    properties: PlanProperties,
+    properties: Arc<PlanProperties>,
 }
 
 /// Physical plan for creating an Iceberg schema.
@@ -152,7 +170,7 @@ pub struct IcebergCreateSchemaExec {
     df_schema_name: String,
     catalog_list: Arc<dyn CatalogProviderList>,
     datafusion: Weak<DataFusion>,
-    properties: PlanProperties,
+    properties: Arc<PlanProperties>,
 }
 
 impl fmt::Debug for IcebergCreateSchemaExec {
@@ -178,12 +196,12 @@ impl IcebergCreateSchemaExec {
         datafusion: Weak<DataFusion>,
     ) -> Self {
         let schema = ddl_result_schema();
-        let properties = PlanProperties::new(
+        let properties = Arc::new(PlanProperties::new(
             EquivalenceProperties::new(Arc::clone(&schema)),
             Partitioning::UnknownPartitioning(1),
             EmissionType::Final,
             Boundedness::Bounded,
-        );
+        ));
         Self {
             catalog,
             namespace,
@@ -212,11 +230,7 @@ impl ExecutionPlan for IcebergCreateSchemaExec {
         "IcebergCreateSchemaExec"
     }
 
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
     }
 
@@ -351,12 +365,12 @@ impl IcebergCreateTableExec {
         datafusion: Weak<DataFusion>,
     ) -> Self {
         let schema = ddl_result_schema();
-        let properties = PlanProperties::new(
+        let properties = Arc::new(PlanProperties::new(
             EquivalenceProperties::new(Arc::clone(&schema)),
             Partitioning::UnknownPartitioning(1),
             EmissionType::Final,
             Boundedness::Bounded,
-        );
+        ));
         Self {
             catalog,
             namespace,
@@ -391,11 +405,7 @@ impl ExecutionPlan for IcebergCreateTableExec {
         "IcebergCreateTableExec"
     }
 
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
     }
 
@@ -479,19 +489,13 @@ impl ExecutionPlan for IcebergCreateTableExec {
 
             if exists {
                 if if_not_exists {
-                    let provider: Arc<dyn datafusion::datasource::TableProvider> = Arc::new(
-                        IcebergTableProvider::try_new(
-                            Arc::clone(&catalog),
-                            namespace.clone(),
-                            table_name.clone(),
-                        )
-                        .await
-                        .map_err(|e| {
-                            DataFusionError::Execution(format!(
-                                "Failed to create table provider for existing Iceberg table: {e}"
-                            ))
-                        })?,
-                    );
+                    let provider = create_iceberg_table_provider(
+                        Arc::clone(&catalog),
+                        &namespace,
+                        &table_name,
+                        "existing",
+                    )
+                    .await?;
 
                     let Some(df_catalog) = catalog_list.catalog(&df_catalog_name) else {
                         return Err(DataFusionError::Execution(format!(
@@ -600,19 +604,9 @@ impl ExecutionPlan for IcebergCreateTableExec {
                 })?;
 
             // Create an IcebergTableProvider for the new table
-            let provider: Arc<dyn datafusion::datasource::TableProvider> = Arc::new(
-                IcebergTableProvider::try_new(
-                    Arc::clone(&catalog),
-                    namespace.clone(),
-                    table_name.clone(),
-                )
-                .await
-                .map_err(|e| {
-                    DataFusionError::Execution(format!(
-                        "Failed to create table provider for new Iceberg table: {e}"
-                    ))
-                })?,
-            );
+            let provider =
+                create_iceberg_table_provider(Arc::clone(&catalog), &namespace, &table_name, "new")
+                    .await?;
             // Register in the DataFusion catalog's schema provider
             let Some(df_catalog) = catalog_list.catalog(&df_catalog_name) else {
                 return Err(DataFusionError::Execution(format!(
@@ -1121,34 +1115,18 @@ async fn refresh_iceberg_catalog_provider(
         )));
     };
 
-    if let Some(iceberg_provider) = df_catalog.as_any().downcast_ref::<IcebergCatalogProvider>() {
-        iceberg_provider.refresh().await.map_err(|e| {
-            DataFusionError::Execution(format!(
-                "Failed to refresh Iceberg catalog '{df_catalog_name}': {e}"
-            ))
-        })?;
-        return Ok(());
-    }
+    let Some(iceberg_provider) = super::iceberg_provider_ref(df_catalog.as_ref()) else {
+        return Err(DataFusionError::Execution(format!(
+            "Catalog '{df_catalog_name}' is not an Iceberg catalog"
+        )));
+    };
 
-    if let Some(composed) = df_catalog
-        .as_any()
-        .downcast_ref::<ComposedCatalogProvider>()
-        && let Some(iceberg_provider) = composed
-            .external()
-            .as_any()
-            .downcast_ref::<IcebergCatalogProvider>()
-    {
-        iceberg_provider.refresh().await.map_err(|e| {
-            DataFusionError::Execution(format!(
-                "Failed to refresh Iceberg catalog '{df_catalog_name}': {e}"
-            ))
-        })?;
-        return Ok(());
-    }
-
-    Err(DataFusionError::Execution(format!(
-        "Catalog '{df_catalog_name}' is not an Iceberg catalog"
-    )))
+    iceberg_provider.refresh().await.map_err(|e| {
+        DataFusionError::Execution(format!(
+            "Failed to refresh Iceberg catalog '{df_catalog_name}': {e}"
+        ))
+    })?;
+    Ok(())
 }
 
 async fn rollback_created_iceberg_table(
@@ -1185,7 +1163,7 @@ pub struct IcebergDropTableExec {
     df_schema_name: String,
     catalog_list: Arc<dyn CatalogProviderList>,
     _datafusion: Weak<DataFusion>,
-    properties: PlanProperties,
+    properties: Arc<PlanProperties>,
 }
 
 impl fmt::Debug for IcebergDropTableExec {
@@ -1214,12 +1192,12 @@ impl IcebergDropTableExec {
         datafusion: Weak<DataFusion>,
     ) -> Self {
         let schema = ddl_result_schema();
-        let properties = PlanProperties::new(
+        let properties = Arc::new(PlanProperties::new(
             EquivalenceProperties::new(Arc::clone(&schema)),
             Partitioning::UnknownPartitioning(1),
             EmissionType::Final,
             Boundedness::Bounded,
-        );
+        ));
         Self {
             catalog,
             namespace,
@@ -1249,11 +1227,7 @@ impl ExecutionPlan for IcebergDropTableExec {
         "IcebergDropTableExec"
     }
 
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
     }
 

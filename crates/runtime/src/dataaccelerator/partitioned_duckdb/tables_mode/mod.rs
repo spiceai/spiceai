@@ -274,7 +274,6 @@ impl DuckDBPartitionCreator {
             .map_err(|e| format!("Failed to create table provider: {e}"))?;
 
         let poly_table = table_provider
-            .as_any()
             .downcast_ref::<PolyTableProvider>()
             .ok_or("Expected PolyTableProvider but got different table provider type")?;
 
@@ -478,13 +477,11 @@ async fn get_pool(
 fn extract_duckdb_writer(
     writer: &Arc<dyn TableProvider>,
 ) -> std::result::Result<&DuckDBTableWriter, Box<dyn std::error::Error + Send + Sync>> {
-    if let Some(w) = writer.as_any().downcast_ref::<DuckDBTableWriter>() {
+    if let Some(w) = writer.downcast_ref::<DuckDBTableWriter>() {
         Ok(w)
-    } else if let Some(upsert_provider) = writer.as_any().downcast_ref::<UpsertDedupTableProvider>()
-    {
+    } else if let Some(upsert_provider) = writer.downcast_ref::<UpsertDedupTableProvider>() {
         upsert_provider
             .inner()
-            .as_any()
             .downcast_ref::<DuckDBTableWriter>()
             .ok_or_else(|| "UpsertDedupTableProvider inner is not DuckDBTableWriter".into())
     } else {

@@ -98,6 +98,7 @@ use tower_http::limit::RequestBodyLimitLayer;
         v1::responses::post,
         v1::models::get,
         v1::workers::get,
+        v1::nsql::get_context,
         v1::nsql::post,
         v1::inference::get,
         v1::inference::post,
@@ -402,6 +403,7 @@ pub(crate) fn routes(
             .route("/v1/models", get(v1::models::get))
             .route("/v1/models/{name}/predict", get(v1::inference::get))
             .route("/v1/predict", post(v1::inference::post))
+            .route("/v1/nsql/context", get(v1::nsql::get_context))
             .route("/v1/nsql", post(v1::nsql::post).layer(ModelContextLayer))
             .route(
                 "/v1/chat/completions",
@@ -593,7 +595,7 @@ async fn track_metrics(
         KeyValue::new("status", status),
     ];
 
-    labels.extend(request_dimensions.into_iter());
+    labels.extend(request_dimensions);
 
     metrics::REQUESTS_TOTAL.add(1, &labels);
     metrics::REQUESTS.add(1, &labels);

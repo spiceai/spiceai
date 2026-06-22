@@ -23,13 +23,13 @@ description: "Query: tpch_q4"
 |               |       AggregateExec: mode=FinalPartitioned, gby=[o_orderpriority@0 as o_orderpriority], aggr=[count(Int64(1))]                                                                                 |
 |               |         RepartitionExec: partitioning=Hash([o_orderpriority@0], 32), input_partitions=32                                                                                                       |
 |               |           AggregateExec: mode=Partial, gby=[o_orderpriority@0 as o_orderpriority], aggr=[count(Int64(1))]                                                                                      |
-|               |             HashJoinExec: mode=Partitioned, join_type=LeftSemi, accumulator=MinMaxLeftAccumulator, on=[(o_orderkey@0, l_orderkey@0)], projection=[o_orderpriority@1]                           |
+|               |             HashJoinExec: mode=Partitioned, join_type=LeftSemi, on=[(o_orderkey@0, l_orderkey@0)], projection=[o_orderpriority@1]                                                              |
 |               |               RepartitionExec: partitioning=Hash([o_orderkey@0], 32), input_partitions=32                                                                                                      |
 |               |                 FilterExec: o_orderdate@1 >= 1993-07-01 AND o_orderdate@1 < 1993-10-01, projection=[o_orderkey@0, o_orderpriority@2]                                                           |
 |               |                   RepartitionExec: partitioning=RoundRobinBatch(32), input_partitions=1                                                                                                        |
 |               |                     SchemaCastScanExec                                                                                                                                                         |
 |               |                       FallbackOnZeroResultsScanExec                                                                                                                                            |
-|               |                         CayenneAccelerationExec                                                                                                                                                |
+|               |                         CayenneAccelerationExec: snapshots_scanned=0, files_scanned=0                                                                                                          |
 |               |                           BytesProcessedExec                                                                                                                                                   |
 |               |                             EmptyExec                                                                                                                                                          |
 |               |               RepartitionExec: partitioning=Hash([l_orderkey@0], 32), input_partitions=32                                                                                                      |
@@ -37,7 +37,7 @@ description: "Query: tpch_q4"
 |               |                   RepartitionExec: partitioning=RoundRobinBatch(32), input_partitions=1                                                                                                        |
 |               |                     SchemaCastScanExec                                                                                                                                                         |
 |               |                       FallbackOnZeroResultsScanExec                                                                                                                                            |
-|               |                         CayenneAccelerationExec                                                                                                                                                |
+|               |                         CayenneAccelerationExec: snapshots_scanned=0, files_scanned=0                                                                                                          |
 |               |                           BytesProcessedExec                                                                                                                                                   |
 |               |                             EmptyExec                                                                                                                                                          |
 |               |                                                                                                                                                                                                |

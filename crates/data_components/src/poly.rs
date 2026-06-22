@@ -30,7 +30,7 @@ use datafusion_federation::{
     FederationProvider,
 };
 use std::collections::HashMap;
-use std::{any::Any, borrow::Cow, sync::Arc};
+use std::{borrow::Cow, sync::Arc};
 
 #[derive(Debug, Clone)]
 pub struct PolyTableProvider {
@@ -62,17 +62,13 @@ impl PolyTableProvider {
 
     fn get_federation_provider(&self) -> Option<Arc<dyn FederationProvider>> {
         self.fed
-            .as_any()
             .downcast_ref::<FederatedTableProviderAdaptor>()
             .map(|x| x.source.federation_provider())
     }
 
     #[must_use]
     pub fn get_table_source(&self) -> Option<Arc<dyn FederatedTableSource>> {
-        let adaptor = self
-            .fed
-            .as_any()
-            .downcast_ref::<FederatedTableProviderAdaptor>();
+        let adaptor = self.fed.downcast_ref::<FederatedTableProviderAdaptor>();
 
         adaptor.map(|f| Arc::clone(&f.source))
     }
@@ -115,9 +111,6 @@ impl FederationProvider for PolyTableProvider {
 
 #[async_trait]
 impl TableProvider for PolyTableProvider {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
     fn schema(&self) -> SchemaRef {
         let schema = self.write.schema().as_ref().clone();
         let mut metadata = schema.metadata().clone();

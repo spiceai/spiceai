@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::{any::Any, sync::Arc};
+use std::sync::Arc;
 
 use arrow::array::{RecordBatch, RecordBatchOptions};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
@@ -48,7 +48,7 @@ pub(super) struct DuckDBVectorQueryExec {
     pub(super) dims: i32,
     pub(super) hnsw: DuckDBHnswOptions,
     pub(super) context: DuckDBVectorQueryContext,
-    pub(super) properties: PlanProperties,
+    pub(super) properties: Arc<PlanProperties>,
 }
 
 impl DuckDBVectorQueryExec {
@@ -134,15 +134,11 @@ impl ExecutionPlan for DuckDBVectorQueryExec {
         "DuckDBVectorQueryExec"
     }
 
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema(&self) -> SchemaRef {
         Arc::clone(&self.projected_schema)
     }
 
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
     }
 

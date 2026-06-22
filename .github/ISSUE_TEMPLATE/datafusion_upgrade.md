@@ -42,12 +42,34 @@ graph TD
     L[spark-connect-rs] -.-> E
 ```
 
+## Current Upgrade PRs
+
+Keep this table updated as the canonical status tracker for the upgrade — one row per fork plus the main Spice PR. Re-query mergeability with `gh pr view <n> --repo <repo> --json state,isDraft,mergeable,mergeStateStatus` (`DIRTY` = conflicts, `BLOCKED` = mergeable but gated by checks/draft, `CLEAN` = ready).
+
+Main Spice PR: _spiceai/spiceai#NNNN_
+
+| Dependency                 | PR  | Base ← Head                                       | Status |
+| -------------------------- | --- | ------------------------------------------------- | ------ |
+| DataFusion                 |     | `spiceai-X` ← `spiceai-X-patches`                 |        |
+| DataFusion Ballista        |     | `spiceai-X` ← `spiceai-X-patches`                 |        |
+| DataFusion Federation      |     | `spiceai-X` ← `spiceai-X-patches`                 |        |
+| DataFusion Table Providers |     | `spiceai-X` ← `spiceai-X-patches`                 |        |
+| Iceberg Rust               |     | `spiceai-<iceberg>` ← `spiceai-<iceberg>-patches` |        |
+| Arrow RS                   |     | `spiceai-<arrow>` ← `spiceai-<arrow>-patches`     |        |
+| DuckDB RS                  |     | `spiceai-<arrow>` ← `spiceai-<arrow>-patches`     |        |
+| Delta Kernel RS            |     | `spiceai-<delta>` ← `spiceai-<delta>-patches`     |        |
+| Snowflake RS               |     | `spiceai-<arrow>` ← `spiceai-<arrow>-patches`     |        |
+| Spark Connect RS           |     | `spiceai-<arrow>` ← `spiceai-<arrow>-patches`     |        |
+| Spice Rust SDK             |     | `spiceai-<arrow>` ← `spiceai-<arrow>-patches`     |        |
+
 ## Fork Branch Naming Convention
 
 For all forked dependencies, we use a two-branch strategy:
 
 1. **Feature branch** (`spiceai-<version>`): Created directly from the upstream tag (e.g., `51.0.0`). This branch tracks the exact upstream release with no modifications.
 2. **Patch branch** (`spiceai-<version>-patches`): Created from the feature branch. All Spice-specific patches are cherry-picked and applied here.
+
+> **Before forking, check whether a fork is still needed.** If the new upstream release already contains our patches (merged upstream) or the crates.io release works without Spice modifications, depend on the upstream crates.io release directly and skip the `spiceai-<version>` fork for that crate — prefer upstream-direct to reduce fork-maintenance burden. (In the v53 cycle several DataFusion-stack crates — `datafusion`, `datafusion-federation`, `datafusion-table-providers` — were taken from crates.io directly rather than via a `[patch.crates-io]` fork.) If you go upstream-direct, make sure no stale fork `[patch.crates-io]` entry for that crate is left behind.
 
 **CRITICAL: All patches must be cherry-picked individually to the `-patches` branch**, resolving any merge conflicts in the cherry-pick commit itself. This ensures:
 
@@ -85,7 +107,7 @@ This allows:
 
 ## Pre-upgrade Tasks
 
-- [ ] Read the DataFusion [changelog](https://github.com/apache/datafusion/tree/branch-49/dev/changelog) of the new version to identify breaking changes and new features.
+- [ ] Read the DataFusion [changelog](https://github.com/apache/datafusion/tree/main/dev/changelog) of the new version (open the target version's `branch-X` to see its changelog) to identify breaking changes and new features.
 - [ ] Read the DataFusion [blog](https://datafusion.apache.org/blog/) for the latest release.
 - [ ] Read the DataFusion [upgrade guides](https://datafusion.apache.org/library-user-guide/upgrading.html).
 - [ ] Identify which Arrow version the new DataFusion requires (check DataFusion's `Cargo.toml`).
@@ -157,6 +179,8 @@ The following forked dependencies use DataFusion and/or Arrow and need to be upg
 
 If DataFusion upgraded Arrow, the following crates should be upgraded:
 
+> Note: an Arrow-only fork (e.g. `duckdb-rs`) may temporarily lag one Arrow major behind the main stack during a transition. This is acceptable **only** if that crate's Arrow types stay isolated behind a conversion boundary and never cross into the new-Arrow stack — confirm the isolation rather than forcing a same-day bump. Watch for the inverse trap too: a `[patch.crates-io] arrow = ...` rev that still resolves to the *old* Arrow major is inert for the new stack (crates.io wins) and only patches the lagging fork — bump the fork branch to the new major and re-point, or drop the patch.
+
 - [ ] **[arrow-rs](https://github.com/spiceai/arrow-rs)**: Core Arrow implementation.
   - Create `spiceai-<arrow-major>` branch from upstream tag (e.g., `spiceai-57` from `57.1.0`).
   - Cherry-pick any Spice-specific patches from previous branch.
@@ -212,11 +236,28 @@ These forks may not require changes for every DataFusion upgrade but should be v
     - New required trait methods
     - Changed method signatures
     - Removed deprecated methods
+- [ ] Verify no duplicate major versions linger in `Cargo.lock`: `cargo tree -d -i datafusion` and `cargo tree -d -i arrow`. A transitive consumer can pin the previous major and silently pull a second DataFusion/Arrow tree (e.g. `geodatafusion` held DataFusion on the old major during the v53 cycle). Bump/pin or drop the offending crate until a single major remains.
 - [ ] Run all tests using `make build-cli nextest` to verify that all functionality is working as expected and snapshots have not changed.
 - [ ] Create a pull request with the changes.
 - [ ] Ensure all CI checks pass.
 - [ ] Build the branch version and test with test operator, updating snapshots if needed.
 - [ ] Merge PR. 🎉
+
+## Post-Merge Verification
+
+After each fork's version-branch PR merges, double-check that no Spice patch was lost in the port:
+
+- [ ] Diff the newly merged version branch against the previous one (e.g. `spiceai-53` vs `spiceai-52.5`, `spiceai-58` vs `spiceai-57`). Enumerate the old line's Spice patches and verify each is accounted for in the merged branch — **PRESENT** (commit or equivalent), **UPSTREAMED** (cite the upstream code), or **consciously dropped** (document the rationale):
+
+  ```bash
+  # enumerate the previous line's Spice patches
+  git log --oneline <upstream-base>..spiceai-<prev>-patches
+  # verify each patch in the new branch by key symbol
+  git log -S<key-symbol> spiceai-<new>   # and/or grep the code
+  ```
+
+- [ ] Re-pin the Spice root `Cargo.toml` to the **final merged commit** on the canonical `spiceai-*` branch (never a personal or pre-merge branch).
+- [ ] Update the upgrade PR description's dependency table with the merged commit SHAs.
 
 ## Forked Dependency Test Coverage
 
@@ -329,7 +370,28 @@ When upgrading, ensure all these tests pass. If adding a new patch to a fork, ad
 
 ## Common API Changes Reference
 
-This section documents breaking API changes encountered during upgrades. Update this list as new patterns emerge.
+This section documents breaking API changes encountered during upgrades. Update this list as new patterns emerge. List newest version first.
+
+### DataFusion v53 Breaking Changes
+
+1. **`ExecutionPlan::statistics` removed**
+   - Replaced by `partition_statistics(&self, partition: Option<usize>)`.
+   - Fix: delete the `statistics` impl and provide `partition_statistics`. For a single-partition plan, return the whole-plan stats for `None | Some(0)` and `Statistics::new_unknown(&schema)` otherwise.
+
+   ```rust
+   // Before (DF52)
+   fn statistics(&self) -> Result<Statistics> {
+       Ok(self.statistics.clone())
+   }
+
+   // After (DF53)
+   fn partition_statistics(&self, partition: Option<usize>) -> Result<Statistics> {
+       match partition {
+           None | Some(0) => Ok(self.statistics.clone()),
+           Some(_) => Ok(Statistics::new_unknown(&self.projected_schema)),
+       }
+   }
+   ```
 
 ### DataFusion v51 Breaking Changes
 

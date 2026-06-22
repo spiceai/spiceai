@@ -11,7 +11,10 @@ RUN apt-get update \
     && rm -rf /var/lib/{apt,dpkg,cache,log}
 
 COPY --chmod=0755 ${SPIDAPTER_BIN} /usr/local/bin/spidapter
+COPY scenarios /app/scenarios
 
 WORKDIR /app
+
+ENV SPIDAPTER_SCENARIO_BASE_PATH=/app/scenarios
 
 ENTRYPOINT ["/usr/local/bin/spidapter"]

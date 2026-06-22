@@ -14,10 +14,10 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::{borrow::Cow, fmt::Debug, sync::Arc};
+use std::{borrow::Cow, fmt::Debug, sync::Arc, time::Duration};
 
 use axum::Router;
-use hyper_util::rt::{TokioExecutor, TokioIo};
+use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
 use hyper_util::server::conn::auto::{Builder, Connection};
 use hyper_util::service::TowerToHyperService;
 use runtime_auth::{HttpAuth, IdentitySource, layer::http::AuthLayer};
@@ -258,6 +258,11 @@ fn process_tcp_stream(stream: TcpStream, routes: Router, on_shutdown: Receiver<(
     });
 }
 
+/// Maximum time a client may take to send the full request-header block on an
+/// HTTP/1 connection. Bounds Slowloris-style header-dribble attacks that would
+/// otherwise hold connections (and their spawned tasks/FDs) open indefinitely.
+const HTTP_HEADER_READ_TIMEOUT: Duration = Duration::from_secs(30);
+
 fn serve_connection<S>(
     stream: S,
     service: Router,
@@ -266,7 +271,15 @@ where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
     let hyper_service = TowerToHyperService::new(service);
-    Builder::new(TokioExecutor::new())
+    let mut builder = Builder::new(TokioExecutor::new());
+    // Apply an HTTP/1 header-read timeout (auto HTTP/1+2 serving is preserved).
+    // HTTP/2 has its own framing/flow-control limits, so this targets the
+    // plaintext/HTTP-1 Slowloris vector.
+    builder
+        .http1()
+        .timer(TokioTimer::new())
+        .header_read_timeout(HTTP_HEADER_READ_TIMEOUT);
+    builder
         .serve_connection(TokioIo::new(stream), hyper_service)
         .into_owned()
 }

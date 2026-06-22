@@ -26,7 +26,6 @@ limitations under the License.
 //! This module provides a hash index wrapper that accelerates point lookups
 //! on `MemTable` when a primary key is specified.
 
-use std::any::Any;
 use std::collections::HashMap;
 use std::fmt::{self, Debug};
 use std::sync::Arc;
@@ -574,10 +573,6 @@ impl PrimaryKeyValue {
 #[deny(clippy::missing_trait_methods)]
 #[async_trait]
 impl TableProvider for IndexedMemTable {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema(&self) -> SchemaRef {
         self.inner.schema()
     }
@@ -865,7 +860,7 @@ pub struct IndexedLookupExec {
     schema: SchemaRef,
     /// The result stream (single batch for point lookup).
     result: std::sync::Mutex<Option<SendableRecordBatchStream>>,
-    properties: datafusion::physical_plan::PlanProperties,
+    properties: Arc<datafusion::physical_plan::PlanProperties>,
     /// Primary key columns used for the indexed lookup.
     pk_columns: Vec<String>,
     /// Whether the lookup found a result.
@@ -887,12 +882,12 @@ impl IndexedLookupExec {
         use datafusion::physical_plan::Partitioning;
         use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
 
-        let properties = datafusion::physical_plan::PlanProperties::new(
+        let properties = Arc::new(datafusion::physical_plan::PlanProperties::new(
             EquivalenceProperties::new(Arc::clone(&schema)),
             Partitioning::UnknownPartitioning(1),
             EmissionType::Incremental,
             Boundedness::Bounded,
-        );
+        ));
 
         // For indexed point lookups, output_rows is 0 or 1
         let output_rows = usize::from(found_result);
@@ -953,15 +948,11 @@ impl ExecutionPlan for IndexedLookupExec {
         "IndexedLookupExec"
     }
 
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema(&self) -> SchemaRef {
         Arc::clone(&self.schema)
     }
 
-    fn properties(&self) -> &datafusion::physical_plan::PlanProperties {
+    fn properties(&self) -> &Arc<datafusion::physical_plan::PlanProperties> {
         &self.properties
     }
 

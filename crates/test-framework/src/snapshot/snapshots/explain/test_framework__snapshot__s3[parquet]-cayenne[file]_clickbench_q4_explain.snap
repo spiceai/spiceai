@@ -11,7 +11,7 @@ description: "Query: clickbench_q4"
 |               |   CoalescePartitionsExec                                                                                 |
 |               |     AggregateExec: mode=Partial, gby=[], aggr=[avg(hits.UserID)]                                         |
 |               |       SchemaCastScanExec                                                                                 |
-|               |         CayenneAccelerationExec                                                                          |
+|               |         CayenneAccelerationExec: snapshots_scanned=1, files_scanned=81                                   |
 |               |           BytesProcessedExec                                                                             |
 |               |             DataSourceExec: file_groups={16 groups: [<redacted>]}, projection=[UserID], file_type=vortex |
 |               |                                                                                                          |

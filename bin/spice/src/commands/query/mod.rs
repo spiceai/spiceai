@@ -836,12 +836,16 @@ async fn display_results(
     }
 
     // Fetch results as Arrow RecordBatches
-    let batches = job
+    let spice_batches = job
         .results()
         .await
         .map_err(|e| crate::error::Error::InvalidResponse {
             message: format!("getting results: {e}"),
         })?;
+
+    // The Spice SDK is now built against the workspace Arrow version, so its
+    // `RecordBatch`es are already workspace-native and need no conversion.
+    let batches = spice_batches;
 
     let total_rows: usize = batches
         .iter()

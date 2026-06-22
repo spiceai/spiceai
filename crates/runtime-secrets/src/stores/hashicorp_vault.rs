@@ -160,7 +160,7 @@ pub const PARAMETERS: &[ParameterSpec] = &[
 
 /// Default cache TTL applied when Vault does not return a `lease_duration`
 /// for the data secret (typical for KV which has no lease itself).
-const DEFAULT_DATA_TTL: Duration = Duration::from_secs(60);
+const DEFAULT_DATA_TTL: Duration = Duration::from_mins(1);
 /// Negative-cache TTL for confirmed-missing paths (404).
 const NEGATIVE_CACHE_TTL: Duration = Duration::from_secs(10);
 /// Default request timeout when none is configured.

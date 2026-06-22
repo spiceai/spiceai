@@ -463,7 +463,7 @@ async fn test_caching_mode_multi_filter_ideal() -> Result<(), anyhow::Error> {
 
             eprintln!("TEST: Loading components (DuckDB initialization)...");
             tokio::select! {
-                () = tokio::time::sleep(std::time::Duration::from_secs(120)) => {
+                () = tokio::time::sleep(std::time::Duration::from_mins(2)) => {
                     eprintln!("TEST: TIMEOUT waiting for datasets to load");
                     return Err(anyhow::Error::msg("Timed out waiting for datasets to load"));
                 }
@@ -679,7 +679,7 @@ async fn test_caching_mode_multi_filter_cayenne() -> Result<(), anyhow::Error> {
             let status = Arc::new(Runtime::builder().with_app(app).build().await);
 
             tokio::select! {
-                () = tokio::time::sleep(std::time::Duration::from_secs(120)) => {
+                () = tokio::time::sleep(std::time::Duration::from_mins(2)) => {
                     return Err(anyhow::Error::msg("Timed out waiting for datasets to load"));
                 }
                 () = Arc::clone(&status).load_components() => {}
@@ -1641,7 +1641,7 @@ async fn test_caching_mode_background_refresh_on_stale() -> Result<(), anyhow::E
 
             // Wait for background refresh to complete
             eprintln!("TEST: Waiting for background refresh to update cache...");
-            tokio::time::sleep(tokio::time::Duration::from_millis(2000)).await;
+            tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
 
             // STEP 4: Verify cache was refreshed in background by querying again
             eprintln!("TEST: Step 4 - Verify cache has fresh data after background refresh");

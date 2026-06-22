@@ -37,8 +37,8 @@ use crate::{
     docker::{ContainerRunnerBuilder, RunningContainer, wait_for_tcp_port},
 };
 
-const AZURITE_CONTAINER_START_TIMEOUT: Duration = Duration::from_secs(180);
-const AZURITE_HOST_PORT_READY_TIMEOUT: Duration = Duration::from_secs(60);
+const AZURITE_CONTAINER_START_TIMEOUT: Duration = Duration::from_mins(3);
+const AZURITE_HOST_PORT_READY_TIMEOUT: Duration = Duration::from_mins(1);
 
 #[instrument]
 pub async fn start_azurite_docker_container() -> Result<RunningContainer<'static>, anyhow::Error> {
@@ -151,7 +151,7 @@ async fn run_queries() -> Result<(), anyhow::Error> {
 
     // Set a timeout for the test
     tokio::select! {
-        () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+        () = tokio::time::sleep(std::time::Duration::from_mins(1)) => {
             return Err(anyhow!("Timed out waiting for datasets to load".to_string()));
         }
         () = cloned_rt.load_components() => {}
@@ -280,7 +280,7 @@ async fn run_parquet_query_with_meta() -> Result<(), anyhow::Error> {
     let cloned_rt = Arc::new(rt.clone());
 
     tokio::select! {
-        () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+        () = tokio::time::sleep(std::time::Duration::from_mins(1)) => {
             return Err(anyhow!("Timed out waiting for datasets to load"));
         }
         () = cloned_rt.load_components() => {}

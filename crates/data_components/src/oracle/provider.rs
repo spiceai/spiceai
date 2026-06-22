@@ -20,7 +20,6 @@ limitations under the License.
 //! `ALL_USERS` and `ALL_TABLES`/`ALL_VIEWS` queries, and provides them
 //! as `DataFusion` catalog/schema providers.
 
-use std::any::Any;
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
@@ -165,10 +164,6 @@ impl OracleCatalogProvider {
 }
 
 impl CatalogProvider for OracleCatalogProvider {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema_names(&self) -> Vec<String> {
         let guard = match self.schemas.read() {
             Ok(guard) => guard,
@@ -299,10 +294,6 @@ impl OracleSchemaProvider {
 
 #[async_trait]
 impl SchemaProvider for OracleSchemaProvider {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn table_names(&self) -> Vec<String> {
         let guard = match self.tables.read() {
             Ok(guard) => guard,

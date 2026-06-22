@@ -26,6 +26,35 @@ use async_trait::async_trait;
 use futures::stream::BoxStream;
 use snafu::prelude::*;
 
+/// Process-wide CDC shutdown signal, as a monotonically increasing *epoch*.
+///
+/// Raised by the runtime at the *start* of graceful shutdown — before the
+/// (potentially long) connection-drain phase — so CDC sources can release
+/// their upstream resources immediately: a Postgres replication connection
+/// holds a single-consumer slot, and releasing it at SIGTERM (instead of at
+/// process exit) lets a replacement instance attach during a rolling deploy
+/// rather than retrying against "replication slot is active".
+///
+/// An epoch (rather than a one-way flag) keeps multi-`Runtime` processes
+/// working: test suites construct and shut down several `Runtime` instances
+/// in one process, and streams started *after* a shutdown capture the new
+/// epoch and are unaffected. A stream stops when the epoch advances past the
+/// value it captured at start.
+static CDC_SHUTDOWN_EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Signal every currently-running CDC source in the process to stop and
+/// release its upstream resources. Sources started afterwards are unaffected.
+pub fn begin_shutdown() {
+    CDC_SHUTDOWN_EPOCH.fetch_add(1, std::sync::atomic::Ordering::Release);
+}
+
+/// The current shutdown epoch. Long-running CDC sources capture this at
+/// stream start and stop once it changes.
+#[must_use]
+pub fn shutdown_epoch() -> u64 {
+    CDC_SHUTDOWN_EPOCH.load(std::sync::atomic::Ordering::Acquire)
+}
+
 /// A stream of [`ChangeEnvelope`] items produced by a CDC connector.
 ///
 /// # Readiness contract
@@ -108,6 +137,18 @@ impl std::fmt::Display for StreamError {
 #[async_trait]
 pub trait CommitChange {
     async fn commit(&self) -> Result<(), CommitError>;
+
+    /// Whether deferring this commit is crash-safe: the source can re-stream from
+    /// its last durable checkpoint after a crash, so the source offset is advanced
+    /// only after downstream durability. Defaults to `false` (conservative — never
+    /// defer); overridden `true` only by committers backed by a replayable source
+    /// checkpoint (e.g. a Postgres replication slot). Consumers that defer the
+    /// commit behind a later durability fence (in-memory CDC tier) MUST gate that
+    /// deferral on this returning `true`, or a crash could lose data that the
+    /// source can no longer re-stream.
+    fn supports_deferral(&self) -> bool {
+        false
+    }
 }
 
 pub struct ChangeEnvelope {
@@ -188,13 +229,27 @@ impl CommitChange for NoOpCommitter {
 /// to carry the ready signal. See the [`ChangesStream`] documentation for the
 /// readiness contract.
 pub fn build_ready_signal_envelope(schema: &SchemaRef) -> Result<ChangeEnvelope, ChangeBatchError> {
+    // Normalize fields to all-nullable so this empty barrier batch's struct type
+    // matches the truncate/snapshot/live change batches it coalesces with. The
+    // dataset schema may declare non-null columns (e.g. a `nullable: false`
+    // primary key in the spicepod), but every other change batch uses the
+    // nullable schema; without this, concat fails ("arrays of different data
+    // types") when the ready signal is coalesced with real data.
+    let nullable_schema = Schema::new(
+        schema
+            .fields()
+            .iter()
+            .map(|f| Arc::new(f.as_ref().clone().with_nullable(true)))
+            .collect::<Vec<_>>(),
+    );
+
     // Build zero-row versions of each dataset column.
-    let empty_data_columns: Vec<ArrayRef> = schema
+    let empty_data_columns: Vec<ArrayRef> = nullable_schema
         .fields()
         .iter()
         .map(|f| arrow::array::new_empty_array(f.data_type()))
         .collect();
-    let data_struct = StructArray::new(schema.fields().clone(), empty_data_columns, None);
+    let data_struct = StructArray::new(nullable_schema.fields().clone(), empty_data_columns, None);
 
     let op_array: ArrayRef = Arc::new(StringArray::from(Vec::<&str>::new()));
     let pk_field = Arc::new(Field::new("item", DataType::Utf8, false));
@@ -205,7 +260,7 @@ pub fn build_ready_signal_envelope(schema: &SchemaRef) -> Result<ChangeEnvelope,
         None,
     );
 
-    let wrapper_schema = Arc::new(changes_schema(schema));
+    let wrapper_schema = Arc::new(changes_schema(&nullable_schema));
     let record = RecordBatch::try_new(
         wrapper_schema,
         vec![op_array, Arc::new(pk_list), Arc::new(data_struct)],
@@ -244,6 +299,13 @@ pub struct ChangeBatch {
     op_idx: usize,
     primary_keys_idx: usize,
     data_idx: usize,
+    /// Newest upstream COMMIT timestamp in this batch (milliseconds since the Unix
+    /// epoch — a wall clock, NOT a monotonic `Instant`), when the source provides
+    /// one; `None` otherwise. Lets a downstream consumer compute true end-to-end
+    /// replication lag as `now_ms - source_commit_ts_ms`. Populated by CDC
+    /// connectors that carry a source timestamp (Debezium, Postgres logical
+    /// replication, `MongoDB` change streams); left `None` by sources that don't.
+    source_commit_ts_ms: Option<i64>,
 }
 
 pub enum ChangeOperation {
@@ -301,7 +363,25 @@ impl ChangeBatch {
             op_idx,
             primary_keys_idx,
             data_idx,
+            source_commit_ts_ms: None,
         })
+    }
+
+    /// Attach the newest upstream commit timestamp (ms since the Unix epoch) for
+    /// this batch. Connectors that carry a source timestamp set it here; the value
+    /// rides the batch into the accelerator write path, where it feeds the
+    /// replication-lag signal. `None` leaves the batch without lag information.
+    #[must_use]
+    pub fn with_source_commit_ts_ms(mut self, source_commit_ts_ms: Option<i64>) -> Self {
+        self.source_commit_ts_ms = source_commit_ts_ms;
+        self
+    }
+
+    /// The newest upstream commit timestamp (ms since the Unix epoch) in this
+    /// batch, or `None` when the source does not provide one.
+    #[must_use]
+    pub fn source_commit_ts_ms(&self) -> Option<i64> {
+        self.source_commit_ts_ms
     }
 
     #[must_use]
@@ -485,6 +565,15 @@ mod tests {
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow_array::{Int32Array, StringArray};
     use std::sync::Arc;
+
+    #[test]
+    fn noop_committer_does_not_support_deferral() {
+        // The conservative default: a committer with no replayable source offset
+        // (`NoOpCommitter` carries synthetic ready-signal envelopes) must NOT be
+        // deferred — deferring it advances nothing and there is nothing to
+        // re-stream, so an in-memory durability tier must never arm on it.
+        assert!(!NoOpCommitter.supports_deferral());
+    }
 
     #[test]
     fn test_wrap_batch_as_change_batch() {

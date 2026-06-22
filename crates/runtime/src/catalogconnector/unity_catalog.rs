@@ -27,7 +27,10 @@ use data_components::RefreshableCatalogProvider;
 use data_components::delta_lake::DeltaTableFactory;
 use data_components::unity_catalog::UCTable;
 use data_components::unity_catalog::UnityCatalog as UnityCatalogClient;
-use data_components::unity_catalog::provider::UnityCatalogProvider;
+use data_components::unity_catalog::credential_vending::VendedDeltaTableFactory;
+use data_components::unity_catalog::provider::{
+    ReadTableProviderFactory, UCTableProviderFactory, UnityCatalogProvider,
+};
 use datafusion::sql::TableReference;
 use runtime_secrets::get_params_with_secrets;
 use secrecy::SecretString;
@@ -54,6 +57,9 @@ impl UnityCatalog {
 pub const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::component("token").secret().description(
         "The personal access token used to authenticate against the Unity Catalog API.",
+    ),
+    ParameterSpec::component("credential_vending").description(
+        "When set to 'enabled', short-lived storage credentials for each table are fetched from the Unity Catalog credential vending API instead of using static storage credentials. Defaults to 'disabled'.",
     ),
     // S3 storage options
     ParameterSpec::component("aws_region")
@@ -166,16 +172,40 @@ impl CatalogConnector for UnityCatalog {
             connector_component: ConnectorComponent::from(catalog),
         })?;
 
-        let delta_table_creator = Arc::new(DeltaTableFactory::new(
-            params.to_secret_map(),
-            runtime.tokio_io_runtime(),
-        )) as Arc<dyn Read>;
+        let credential_vending = match params.get("credential_vending").expose().ok() {
+            Some("enabled") => true,
+            None | Some("disabled") => false,
+            Some(other) => {
+                return Err(super::Error::InvalidConfigurationNoSource {
+                    connector: "unity_catalog".into(),
+                    message: format!(
+                        "Invalid value '{other}' for 'unity_catalog_credential_vending'. Valid values: 'enabled', 'disabled'."
+                    ),
+                    connector_component: ConnectorComponent::from(catalog),
+                });
+            }
+        };
+
+        let table_creator: Arc<dyn UCTableProviderFactory> = if credential_vending {
+            Arc::new(VendedDeltaTableFactory::new(
+                Arc::clone(&client),
+                params.to_secret_map(),
+                runtime.tokio_io_runtime(),
+            ))
+        } else {
+            Arc::new(ReadTableProviderFactory::new(
+                Arc::new(DeltaTableFactory::new(
+                    params.to_secret_map(),
+                    runtime.tokio_io_runtime(),
+                )) as Arc<dyn Read>,
+                table_reference_creator,
+            ))
+        };
 
         let catalog_provider = match UnityCatalogProvider::try_new(
             client,
             catalog_id,
-            delta_table_creator,
-            table_reference_creator,
+            table_creator,
             catalog.include.clone(),
         )
         .await
@@ -217,6 +247,7 @@ mod tests {
             data_source_format: "DELTA".to_string(),
             columns: vec![],
             storage_location: storage_location.map(ToString::to_string),
+            table_id: None,
         }
     }
 

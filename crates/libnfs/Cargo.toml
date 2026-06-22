@@ -4,7 +4,7 @@
 name = "libnfs"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.94.1"
+rust-version = "1.95.0"
 description = "Safe Rust bindings to libnfs C library for NFS client operations"
 license = "Apache-2.0"
 
@@ -14,3 +14,6 @@ snafu = "0.8.6"
 
 [build-dependencies]
 bindgen = "0.71.1"
+
+[dev-dependencies]
+static_assertions = "1"

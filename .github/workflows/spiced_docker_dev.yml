@@ -1,4 +1,5 @@
 name: spiced_docker_dev
+run-name: 'spiced_docker_dev: ${{ inputs.tag }} (branch ${{ github.ref_name }} @ ${{ github.sha }})'
 
 on:
   workflow_dispatch:
@@ -34,7 +35,7 @@ jobs:
       run_amd64: ${{ steps.set_targets.outputs.run_amd64 }}
       run_arm64: ${{ steps.set_targets.outputs.run_arm64 }}
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
 
       - name: Set version
         id: set_version
@@ -45,7 +46,11 @@ jobs:
           safe_branch=$(echo "$branch_name" | sed 's/[^a-zA-Z0-9]/-/g' | head -c 20)
           date="$(date +%Y%m%d)"
           version="${date}-${safe_branch}-${commit_hash}"
-          dev_label="dev.${date}.${commit_hash}"
+          # `g`-prefix the commit hash (git-describe convention) so it is always a
+          # valid SemVer pre-release identifier in the Cargo.toml version below.
+          # An all-numeric short SHA with a leading zero (e.g. 0882134) is an
+          # invalid numeric SemVer identifier and fails `cargo build`.
+          dev_label="dev.${date}.g${commit_hash}"
           echo "rel_version=${version}" >> $GITHUB_OUTPUT
           echo "dev_label=${dev_label}" >> $GITHUB_OUTPUT
           echo "Building dev image with version: \"${version}\""
@@ -77,7 +82,7 @@ jobs:
       RUST_PROFILE: release
 
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
 
       - name: Add dev postfix to version in Cargo.toml
         env:
@@ -164,7 +169,7 @@ jobs:
       RUST_PROFILE: release
 
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
 
       - name: Add dev postfix to version in Cargo.toml
         env:

@@ -291,10 +291,6 @@ impl PartitionTableProvider {
 #[deny(clippy::missing_trait_methods)]
 #[async_trait]
 impl TableProvider for PartitionTableProvider {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema(&self) -> SchemaRef {
         Arc::clone(&self.schema)
     }
@@ -723,6 +719,14 @@ impl PartitionedUnionExec {
 
 #[deny(clippy::missing_trait_methods)]
 impl ExecutionPlan for PartitionedUnionExec {
+    fn downcast_delegate(&self) -> Option<&dyn ExecutionPlan> {
+        None
+    }
+
+    fn with_preserve_order(&self, _preserve_order: bool) -> Option<Arc<dyn ExecutionPlan>> {
+        None
+    }
+
     fn name(&self) -> &'static str {
         "PartitionedUnionExec"
     }
@@ -734,11 +738,7 @@ impl ExecutionPlan for PartitionedUnionExec {
         "PartitionedUnionExec"
     }
 
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         self.inner_union.properties()
     }
 
@@ -808,15 +808,10 @@ impl ExecutionPlan for PartitionedUnionExec {
         self.inner_union.metrics()
     }
 
-    fn statistics(&self) -> Result<Statistics, DataFusionError> {
-        #[expect(deprecated)]
-        self.inner_union.statistics()
-    }
-
     fn partition_statistics(
         &self,
         partition: Option<usize>,
-    ) -> Result<Statistics, DataFusionError> {
+    ) -> Result<Arc<Statistics>, DataFusionError> {
         self.inner_union.partition_statistics(partition)
     }
 
@@ -996,7 +991,7 @@ mod tests {
 
         // With 2 partitions and no filters, should produce a UnionExec
         assert!(
-            plan.as_any().is::<PartitionedUnionExec>(),
+            plan.is::<PartitionedUnionExec>(),
             "Expected PartitionedUnionExec for multiple partitions"
         );
     }
@@ -1053,7 +1048,7 @@ mod tests {
 
         // After pruning to single partition, should not be UnionExec
         assert!(
-            !plan.as_any().is::<UnionExec>(),
+            !plan.is::<UnionExec>(),
             "Expected single partition plan (not UnionExec) after pruning"
         );
     }
@@ -1097,7 +1092,7 @@ mod tests {
 
         // With a limit, should wrap in GlobalLimitExec
         assert!(
-            plan.as_any().is::<GlobalLimitExec>(),
+            plan.is::<GlobalLimitExec>(),
             "Expected GlobalLimitExec when limit is provided"
         );
     }
@@ -1131,7 +1126,7 @@ mod tests {
 
         // No partitions should return EmptyExec
         assert!(
-            plan.as_any().is::<EmptyExec>(),
+            plan.is::<EmptyExec>(),
             "Expected EmptyExec when no partitions exist"
         );
     }
@@ -1188,7 +1183,7 @@ mod tests {
 
         // All partitions pruned should return EmptyExec
         assert!(
-            plan.as_any().is::<EmptyExec>(),
+            plan.is::<EmptyExec>(),
             "Expected EmptyExec when all partitions are pruned"
         );
     }
@@ -1269,7 +1264,7 @@ mod tests {
 
         // Should prune to single partition
         assert!(
-            !plan.as_any().is::<UnionExec>(),
+            !plan.is::<UnionExec>(),
             "Expected single partition plan after pruning with bucket expression"
         );
     }
@@ -1365,7 +1360,7 @@ mod tests {
         // 1. Only one partition is scanned (pruning worked)
         // 2. The plan is not a UnionExec (single partition)
         assert!(
-            !plan.as_any().is::<UnionExec>(),
+            !plan.is::<UnionExec>(),
             "Expected single partition plan after pruning with base column filter"
         );
 
@@ -1394,9 +1389,6 @@ mod tests {
 
     #[async_trait]
     impl TableProvider for FilterTrackingProvider {
-        fn as_any(&self) -> &dyn std::any::Any {
-            self
-        }
         fn schema(&self) -> SchemaRef {
             self.inner.schema()
         }

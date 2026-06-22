@@ -30,11 +30,13 @@ limitations under the License.
 //!
 //! - **Int64 PK-based**: For tables with a single-column Int64 primary key.
 //!   Optimized path that extracts PK values directly without `RowConverter` overhead.
-//!   Uses `HashMap<i64, i64>` for PK -> `delete_sequence` mapping.
+//!   The deleted PKs (at the write's `delete_sequence`) are folded into the published
+//!   [`super::super::deletion_index::DeletionIndex`] via `extend_max_deletes`.
 //!
 //! - **Key-based**: For tables with composite or non-integer primary keys.
-//!   Uses Arrow's `RowConverter` to create deterministic byte keys for lookup.
-//!   Uses `HashMap<Box<[u8]>, i64>` for key -> `delete_sequence` mapping.
+//!   Uses Arrow's `RowConverter` to create deterministic byte keys, which are folded
+//!   into the published [`super::super::deletion_index::KeyDeletionIndex`] via
+//!   `extend_max_deletes`.
 //!
 //! # Workflow
 //!
@@ -117,6 +119,11 @@ pub struct CayenneDeletionSink {
     /// `None` when the caller already holds the write lock (e.g. retention filters applied
     /// during `write_all_append`).
     write_lock: Option<Arc<TokioMutex<()>>>,
+    /// Shared in-memory sequence allocator (lever B2) of the owning
+    /// `CayenneTableProvider`. The DML `DELETE` sink routes its sequence
+    /// allocations through the SAME allocator as every other writer of this
+    /// table, so memory and the DB `current_sequence_number` never diverge.
+    seq_allocator: Arc<TokioMutex<super::super::table::SeqAllocator>>,
 }
 
 impl CayenneDeletionSink {
@@ -135,6 +142,7 @@ impl CayenneDeletionSink {
         protected_snapshot_tables: Vec<Arc<ListingTable>>,
         runtime_env: Arc<RuntimeEnv>,
         write_lock: Option<Arc<TokioMutex<()>>>,
+        seq_allocator: Arc<TokioMutex<super::super::table::SeqAllocator>>,
     ) -> Self {
         Self {
             table_metadata,
@@ -149,6 +157,7 @@ impl CayenneDeletionSink {
             protected_snapshot_tables,
             runtime_env,
             write_lock,
+            seq_allocator,
         }
     }
 
@@ -593,10 +602,14 @@ impl CayenneDeletionSink {
         let sequence = if let Some(sequence) = delete_sequence {
             *sequence
         } else {
-            let sequence = self
-                .catalog
-                .increment_sequence_number(&self.table_metadata.table_id)
-                .await?;
+            let sequence = super::super::table::reserve_sequences_in(
+                &self.seq_allocator,
+                &self.catalog,
+                &self.table_metadata.table_id,
+                &self.table_metadata.table_name,
+                1,
+            )
+            .await?;
             *delete_sequence = Some(sequence);
             sequence
         };
@@ -617,10 +630,14 @@ impl CayenneDeletionSink {
         let sequence = if let Some(sequence) = delete_sequence {
             *sequence
         } else {
-            let sequence = self
-                .catalog
-                .increment_sequence_number(&self.table_metadata.table_id)
-                .await?;
+            let sequence = super::super::table::reserve_sequences_in(
+                &self.seq_allocator,
+                &self.catalog,
+                &self.table_metadata.table_id,
+                &self.table_metadata.table_name,
+                1,
+            )
+            .await?;
             *delete_sequence = Some(sequence);
             sequence
         };
@@ -694,7 +711,7 @@ impl CayenneDeletionSink {
         let current = deletion_snapshot.load_full();
         let new_deletion_count = row_keys
             .iter()
-            .filter(|key| current.deleted_row_keys.get(key.as_ref()).is_none())
+            .filter(|key| current.tombstones.get(key.as_ref()).is_none())
             .count();
 
         // Create a temporary metadata with the delete sequence number
@@ -726,15 +743,10 @@ impl CayenneDeletionSink {
         // Build a fresh snapshot with the new deletions and publish via ArcSwap.
         // Writes are serialised by the per-table write lock so the load+rebuild+store
         // sequence is race-free.
-        let updated = current.deleted_row_keys.extend_max(
-            written_row_keys
-                .iter()
-                .map(|key| (key.clone(), delete_sequence)),
-        );
-        deletion_snapshot.store(Arc::new(RowConverterDeletionSnapshot::from_arcs(
-            Arc::new(updated),
-            Arc::clone(&current.insert_records),
-        )));
+        let updated = current
+            .tombstones
+            .extend_max_deletes(written_row_keys.iter().map(|key| (key, delete_sequence)));
+        deletion_snapshot.store(Arc::new(RowConverterDeletionSnapshot::from_index(updated)));
         self.refresh_deletion_memory_accounting();
 
         let deleted_count =
@@ -816,7 +828,7 @@ impl CayenneDeletionSink {
         let current = deletion_snapshot.load_full();
         let new_deletion_count = pk_values
             .iter()
-            .filter(|pk| current.deleted_pk.get(**pk).is_none())
+            .filter(|pk| current.tombstones.get(**pk).is_none())
             .count();
 
         // For Int64 PK deletions, we store them as key-based deletions
@@ -846,12 +858,9 @@ impl CayenneDeletionSink {
         // Writes are serialised by the per-table write lock so the load+rebuild+store
         // sequence is race-free.
         let updated = current
-            .deleted_pk
-            .extend_max(pk_values.iter().map(|&pk| (pk, delete_sequence)));
-        deletion_snapshot.store(Arc::new(Int64PkDeletionSnapshot::from_arcs(
-            Arc::new(updated),
-            Arc::clone(&current.insert_records),
-        )));
+            .tombstones
+            .extend_max_deletes(pk_values.iter().map(|&pk| (pk, delete_sequence)));
+        deletion_snapshot.store(Arc::new(Int64PkDeletionSnapshot::from_index(updated)));
         self.refresh_deletion_memory_accounting();
 
         let deleted_count =

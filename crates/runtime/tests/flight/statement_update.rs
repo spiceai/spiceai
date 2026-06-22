@@ -118,7 +118,7 @@ async fn start_cayenne_flight_app(
 
     let cloned_rt = Arc::clone(&rt);
     tokio::select! {
-        () = tokio::time::sleep(Duration::from_secs(60)) => {
+        () = tokio::time::sleep(Duration::from_mins(1)) => {
             return Err(anyhow::anyhow!("Timed out waiting for components to load"));
         }
         () = cloned_rt.load_components() => {}

@@ -45,7 +45,7 @@ pub async fn track_flight_request(method: &str, command: Option<&str>) -> TimeMe
         dimensions.push(KeyValue::new("command", method.to_string()));
     }
 
-    dimensions.extend(request_context.to_dimensions().into_iter());
+    dimensions.extend(request_context.to_dimensions());
 
     FLIGHT_REQUESTS.add(1, dimensions.as_slice());
     TimeMeasurement::new(&FLIGHT_REQUEST_DURATION_MS, dimensions.as_slice())

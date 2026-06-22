@@ -68,7 +68,6 @@ limitations under the License.
 //! resulting `LargeList` offsets would overflow `i64`; callers in those
 //! paths should reduce `max_rows` or split the input.
 
-use std::any::Any;
 use std::fmt::{Debug, Formatter};
 use std::sync::{Arc, LazyLock};
 
@@ -645,9 +644,6 @@ pub struct FlattenJsonTable {
 
 #[async_trait]
 impl TableProvider for FlattenJsonTable {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
     fn schema(&self) -> SchemaRef {
         Arc::clone(&self.schema)
     }
@@ -751,10 +747,6 @@ impl std::hash::Hash for FlattenJsonScalar {
 }
 
 impl ScalarUDFImpl for FlattenJsonScalar {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn name(&self) -> &str {
         FLATTEN_JSON_UDTF_NAME
     }

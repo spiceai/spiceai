@@ -17,7 +17,6 @@ limitations under the License.
 //! A wrapper around `ListingTable` for single S3 files that caches `ETag` and Version ID
 //! to avoid unnecessary re-scans when the file hasn't changed.
 
-use std::any::Any;
 use std::borrow::Cow;
 use std::sync::Arc;
 
@@ -30,8 +29,8 @@ use datafusion::error::Result as DataFusionResult;
 use datafusion::logical_expr::dml::InsertOp;
 use datafusion::logical_expr::{Expr, TableProviderFilterPushDown};
 use datafusion::physical_plan::ExecutionPlan;
-use object_store::ObjectStore;
 use object_store::path::Path as ObjectStorePath;
+use object_store::{ObjectStore, ObjectStoreExt};
 use tokio::sync::RwLock;
 
 use crate::refresh_skip::RefreshSkipTableProvider;
@@ -202,10 +201,6 @@ impl RefreshSkipTableProvider for S3SingleFileCached {
 #[deny(clippy::missing_trait_methods)]
 #[async_trait]
 impl TableProvider for S3SingleFileCached {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema(&self) -> SchemaRef {
         self.inner.schema()
     }
@@ -358,6 +353,13 @@ mod tests {
         }
     }
 
+    fn not_implemented(operation: &str) -> object_store::Error {
+        object_store::Error::NotImplemented {
+            operation: operation.to_string(),
+            implementer: "HeadOnlyObjectStore".to_string(),
+        }
+    }
+
     impl std::fmt::Display for HeadOnlyObjectStore {
         fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
             write!(f, "HeadOnlyObjectStore")
@@ -373,32 +375,12 @@ mod tests {
             stream::empty().boxed()
         }
 
-        async fn head(&self, _location: &Path) -> object_store::Result<object_store::ObjectMeta> {
-            let mut guard = self.responses.lock().await;
-            guard.pop_front().ok_or(object_store::Error::NotImplemented)
-        }
-
-        async fn put(
-            &self,
-            _location: &Path,
-            _payload: object_store::PutPayload,
-        ) -> object_store::Result<object_store::PutResult> {
-            unimplemented!()
-        }
-
         async fn put_opts(
             &self,
             _location: &Path,
             _payload: object_store::PutPayload,
             _opts: object_store::PutOptions,
         ) -> object_store::Result<object_store::PutResult> {
-            unimplemented!()
-        }
-
-        async fn put_multipart(
-            &self,
-            _location: &Path,
-        ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
             unimplemented!()
         }
 
@@ -410,26 +392,30 @@ mod tests {
             unimplemented!()
         }
 
-        async fn get(&self, _location: &Path) -> object_store::Result<object_store::GetResult> {
-            unimplemented!()
-        }
-
         async fn get_opts(
             &self,
             _location: &Path,
-            _options: object_store::GetOptions,
+            options: object_store::GetOptions,
         ) -> object_store::Result<object_store::GetResult> {
-            unimplemented!()
+            if !options.head {
+                return Err(not_implemented("get_opts without head option"));
+            }
+            let mut guard = self.responses.lock().await;
+            let meta = guard
+                .pop_front()
+                .ok_or_else(|| not_implemented("get_opts"))?;
+            Ok(object_store::GetResult {
+                payload: object_store::GetResultPayload::Stream(Box::pin(futures::stream::empty())),
+                attributes: object_store::Attributes::default(),
+                range: 0..0,
+                meta,
+            })
         }
 
-        async fn delete(&self, _location: &Path) -> object_store::Result<()> {
-            unimplemented!()
-        }
-
-        fn delete_stream<'a>(
-            &'a self,
-            _locations: BoxStream<'a, object_store::Result<Path>>,
-        ) -> BoxStream<'a, object_store::Result<Path>> {
+        fn delete_stream(
+            &self,
+            _locations: BoxStream<'static, object_store::Result<Path>>,
+        ) -> BoxStream<'static, object_store::Result<Path>> {
             unimplemented!()
         }
 
@@ -440,11 +426,12 @@ mod tests {
             unimplemented!()
         }
 
-        async fn copy(&self, _from: &Path, _to: &Path) -> object_store::Result<()> {
-            unimplemented!()
-        }
-
-        async fn copy_if_not_exists(&self, _from: &Path, _to: &Path) -> object_store::Result<()> {
+        async fn copy_opts(
+            &self,
+            _from: &Path,
+            _to: &Path,
+            _options: object_store::CopyOptions,
+        ) -> object_store::Result<()> {
             unimplemented!()
         }
     }
@@ -504,6 +491,38 @@ mod tests {
                 .should_skip_refresh()
                 .await
                 .expect("second attempt")
+        );
+    }
+
+    /// Regression test for the lost S3 `ETag`/Version refresh-skip check.
+    ///
+    /// `FederatedTable::new` wraps the connector's provider in a
+    /// [`crate::MetadataEnrichedTableProvider`] whenever the dataset declares table- or
+    /// column-level metadata. That wrapper returns itself from `as_any`, so the previous
+    /// single-level downcast in `should_skip_refresh_for_table_provider` missed the inner
+    /// `S3SingleFileCached`, returned `Ok(None)`, and forced a full S3 fetch on every refresh.
+    /// The skip check must now see through the wrapper.
+    #[tokio::test]
+    async fn test_should_skip_refresh_through_metadata_enriched_wrapper() {
+        let meta = make_meta("file", 128, 10, Some("etag"), Some("v1"));
+        let store = Arc::new(HeadOnlyObjectStore::new(vec![meta.clone()])) as Arc<dyn ObjectStore>;
+        let cached_table = build_cached_table(store, Some(meta));
+
+        let mut extra_metadata = std::collections::HashMap::new();
+        extra_metadata.insert("schema.key".to_string(), "value".to_string());
+        let wrapped: Arc<dyn TableProvider> = Arc::new(crate::MetadataEnrichedTableProvider::new(
+            Arc::new(cached_table) as Arc<dyn TableProvider>,
+            extra_metadata,
+        ));
+
+        let result = crate::refresh_skip::should_skip_refresh_for_table_provider(wrapped.as_ref())
+            .await
+            .expect("skip check should not error");
+
+        assert_eq!(
+            result,
+            Some(true),
+            "refresh-skip must be reached through the metadata-enriched wrapper"
         );
     }
 }

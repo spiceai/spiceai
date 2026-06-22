@@ -441,7 +441,7 @@ impl S3VectorsTable {
 
         let vectors: Vec<PutInputVector> = data
             .into_iter()
-            .zip(key.into_iter())
+            .zip(key)
             .enumerate()
             .filter_map(|(i, (data, key))| {
                 let key = key?;

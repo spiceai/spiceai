@@ -120,7 +120,7 @@ impl SpillIndex {
         }
 
         // Sort by sequence number for consistent ordering
-        spill_indexes.sort_by(|a, b| a.sequence.cmp(&b.sequence));
+        spill_indexes.sort_by_key(|a| a.sequence);
 
         spill_indexes.into_iter().map(|i| i.format_name()).collect()
     }

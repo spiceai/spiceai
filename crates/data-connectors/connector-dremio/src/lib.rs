@@ -32,6 +32,7 @@ use runtime::dataconnector::{
     ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory,
     DataConnectorResult, NewDataConnectorResult,
 };
+use runtime::datafusion::udf::deny_spice_specific_functions;
 use runtime::parameters::ParameterSpec;
 use snafu::prelude::*;
 use std::any::Any;
@@ -169,7 +170,8 @@ impl DataConnectorFactory for DremioFactory {
                 .await
                 .context(UnableToCreateFlightClientSnafu)?;
             let flight_factory =
-                FlightFactory::new("dremio", flight_client, Arc::new(DremioDialect {}));
+                FlightFactory::new("dremio", flight_client, Arc::new(DremioDialect {}))
+                    .with_function_support(deny_spice_specific_functions().as_ref().clone());
             Ok(Arc::new(Dremio { flight_factory }) as Arc<dyn DataConnector>)
         })
     }

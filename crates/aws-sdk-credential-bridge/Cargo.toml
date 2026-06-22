@@ -22,6 +22,7 @@ iceberg.workspace = true
 iceberg-storage-opendal.workspace = true
 object_store.workspace = true
 reqwest.workspace = true
+reqsign-core.workspace = true
 secrecy.workspace = true
 snafu.workspace = true
 tokio.workspace = true

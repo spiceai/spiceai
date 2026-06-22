@@ -2452,3 +2452,84 @@ async fn cayenne_catalog_rejected_without_distributed_mode() -> Result<(), Strin
         })
         .await
 }
+
+// =============================================================================
+// Test: partitioned CREATE TABLE using `PARTITION BY (bucket(N, col))` (the
+// spicebench form) — regression for the DataFusion 54 upgrade (#11360) where
+// this exact statement failed with
+//   "Unsupported Query. Unsupported logical plan: CreateMemoryTable"
+// =============================================================================
+#[tokio::test]
+#[cfg_attr(
+    not(feature = "spicebench"),
+    ignore = "requires the spicebench feature"
+)]
+async fn cayenne_catalog_ddl_create_table_bucket_partition() -> Result<(), String> {
+    let _tracing = init_tracing(Some("integration=debug,info"));
+    register_test_connectors().await;
+
+    let temp_dir = tempfile::tempdir().map_err(|e| e.to_string())?;
+    let data_dir = temp_dir.path().join("data");
+    let metadata_dir = temp_dir.path().join("metadata");
+
+    test_request_context()
+        .scope(async {
+            let catalog = make_cayenne_catalog(
+                "spicebench",
+                &data_dir.to_string_lossy(),
+                &metadata_dir.to_string_lossy(),
+            );
+
+            let app = AppBuilder::new("cayenne_ddl_bucket_partition")
+                .with_catalog(catalog)
+                .build();
+
+            configure_test_datafusion();
+            let rt = Runtime::builder()
+                .with_app(app)
+                .with_resolved_cluster_config(test_cluster_config())
+                .with_runtime_config(Config::default().with_caching_disabled())
+                .build()
+                .await;
+            let cloned_rt = Arc::new(rt.clone());
+
+            tokio::select! {
+                () = tokio::time::sleep(Duration::from_secs(30)) => {
+                    return Err("Timeout waiting for components to load".to_string());
+                }
+                () = cloned_rt.load_components() => {}
+            }
+            runtime_ready_check_with_timeout(&rt, Duration::from_secs(30)).await;
+
+            exec(&rt, "CREATE SCHEMA spicebench.bench").await?;
+
+            // Exact spicebench setup statement: composite PRIMARY KEY,
+            // quoted identifiers, and `PARTITION BY (bucket(N, col))`.
+            exec(
+                &rt,
+                r#"CREATE TABLE IF NOT EXISTS spicebench.bench."customer" (
+                    "c_custkey" BIGINT, "c_name" TEXT, "c_address" TEXT, "c_nationkey" BIGINT,
+                    "c_phone" TEXT, "c_acctbal" DECIMAL(15, 2), "c_mktsegment" TEXT,
+                    "c_comment" TEXT, "__created_at" TIMESTAMP,
+                    PRIMARY KEY ("c_custkey", "c_nationkey")
+                ) PARTITION BY (bucket(5, c_nationkey))"#,
+            )
+            .await?;
+
+            // The table must appear in information_schema (i.e. it was actually
+            // created as a partitioned cayenne table, not silently dropped).
+            let batches = run_query(
+                &rt,
+                "SELECT table_name FROM information_schema.tables
+                 WHERE table_catalog = 'spicebench' AND table_name = 'customer'",
+            )
+            .await?;
+            assert!(
+                !batches.is_empty() && batches[0].num_rows() == 1,
+                "Expected customer table in information_schema, got {batches:?}"
+            );
+
+            Ok(())
+        })
+        .await
+}

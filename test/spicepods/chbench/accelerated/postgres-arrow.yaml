@@ -3,12 +3,19 @@ kind: Spicepod
 name: postgres-arrow
 
 postgres_connection_params: &postgres_params
-  pg_host: 127.0.0.1
+  pg_host: ${env:CHBENCH_PG_HOST}
   pg_port: 5432
   pg_db: chbench
   pg_user: bench
   pg_pass: bench
   pg_sslmode: disable
+
+runtime:
+  caching:
+    sql_results:
+      enabled: false
+  task_history:
+    enabled: false
 
 datasets:
   # ---- TPC-C core tables (mutated by OLTP workload) ----

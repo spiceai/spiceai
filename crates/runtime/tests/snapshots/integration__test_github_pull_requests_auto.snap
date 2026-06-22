@@ -9,8 +9,9 @@ description: "Query: SELECT additions, review_comments, discussion FROM spiceai_
 |               |   Limit: skip=0, fetch=10                                                                                           |
 |               |     TableScan: spiceai_pulls_auto projection=[additions, discussion, review_comments], fetch=10                     |
 | physical_plan | ProjectionExec: expr=[additions@0 as additions, review_comments@21 as review_comments, discussion@20 as discussion] |
-|               |   CooperativeExec                                                                                                   |
-|               |     BytesProcessedExec                                                                                              |
-|               |       GraphQLTableProviderExec limit=[10]                                                                           |
+|               |   GlobalLimitExec: skip=0, fetch=10                                                                                 |
+|               |     CooperativeExec                                                                                                 |
+|               |       BytesProcessedExec                                                                                            |
+|               |         GraphQLTableProviderExec limit=[10]                                                                         |
 |               |                                                                                                                     |
 +---------------+---------------------------------------------------------------------------------------------------------------------+

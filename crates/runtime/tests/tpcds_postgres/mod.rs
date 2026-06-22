@@ -144,14 +144,14 @@ async fn init_shared_env() -> Result<SharedTestEnv, anyhow::Error> {
 
     // Wait for datasets to load with a longer timeout since we're loading many tables
     tokio::select! {
-        () = tokio::time::sleep(std::time::Duration::from_secs(600)) => {
+        () = tokio::time::sleep(std::time::Duration::from_mins(10)) => {
             return Err(anyhow::Error::msg("Timed out waiting for datasets to load"));
         }
         () = Arc::clone(&rt).load_components() => {}
     }
 
     // Wait for runtime to be ready with extended timeout for acceleration
-    runtime_ready_check_with_timeout(&rt, std::time::Duration::from_secs(300)).await;
+    runtime_ready_check_with_timeout(&rt, std::time::Duration::from_mins(5)).await;
 
     tracing::info!("TPC-DS shared test environment initialized successfully");
 

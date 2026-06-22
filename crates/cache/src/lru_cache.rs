@@ -614,7 +614,7 @@ mod tests {
     ) {
         let cache: LruCache<CachedQueryResult, _, _> = LruCache::new(
             10,
-            Duration::from_secs(60),
+            Duration::from_mins(1),
             hasher,
             CachingPolicy::Lru,
             CacheEngine::Moka,
@@ -650,7 +650,7 @@ mod tests {
     ) {
         let cache: LruCache<CachedQueryResult, _, _> = LruCache::new(
             10,
-            Duration::from_secs(60),
+            Duration::from_mins(1),
             hasher,
             CachingPolicy::Lru,
             CacheEngine::Moka,
@@ -678,7 +678,7 @@ mod tests {
     ) {
         let cache: LruCache<CachedQueryResult, _, _> = LruCache::new(
             10,
-            Duration::from_secs(60),
+            Duration::from_mins(1),
             hasher,
             CachingPolicy::Lru,
             CacheEngine::Moka,
@@ -726,7 +726,7 @@ mod tests {
     ) {
         let cache: LruCache<CachedSearchResult, _, _> = LruCache::new(
             10,
-            Duration::from_secs(60),
+            Duration::from_mins(1),
             hasher,
             CachingPolicy::Lru,
             CacheEngine::Moka,
@@ -848,7 +848,7 @@ mod tests {
         let hasher = RandomState::default();
         let cache: LruCache<CachedQueryResult, _, _> = LruCache::new(
             10,
-            Duration::from_secs(60),
+            Duration::from_mins(1),
             hasher,
             caching_policy,
             CacheEngine::Moka,
@@ -877,7 +877,7 @@ mod tests {
         let hasher = RandomState::default();
         let cache: LruCache<CachedQueryResult, _, _> = LruCache::new(
             1024 * 1024, // 1 MB
-            Duration::from_secs(60),
+            Duration::from_mins(1),
             hasher,
             CachingPolicy::Lru,
             CacheEngine::Pingora,
@@ -909,7 +909,7 @@ mod tests {
         let hasher = RandomState::default();
         let cache: LruCache<CachedQueryResult, _, _> = LruCache::new(
             1024 * 1024, // 1 MB
-            Duration::from_secs(60),
+            Duration::from_mins(1),
             hasher,
             CachingPolicy::Lru,
             CacheEngine::Pingora,
@@ -932,7 +932,7 @@ mod tests {
         let hasher = RandomState::default();
         let cache: LruCache<CachedQueryResult, _, _> = LruCache::new(
             1024 * 1024, // 1 MB
-            Duration::from_secs(60),
+            Duration::from_mins(1),
             hasher,
             CachingPolicy::Lru,
             CacheEngine::Pingora,
@@ -970,7 +970,7 @@ mod tests {
         let hasher = RandomState::default();
         let cache: LruCache<CachedQueryResult, _, _> = LruCache::new(
             1024 * 1024, // 1 MB
-            Duration::from_secs(60),
+            Duration::from_mins(1),
             hasher,
             CachingPolicy::Lru,
             CacheEngine::Pingora,
@@ -1016,7 +1016,7 @@ mod tests {
         let hasher = RandomState::default();
         let cache: LruCache<CachedQueryResult, _, _> = LruCache::new(
             1024 * 1024, // 1 MB
-            Duration::from_secs(60),
+            Duration::from_mins(1),
             hasher,
             CachingPolicy::Lru,
             CacheEngine::Pingora,
@@ -1125,7 +1125,7 @@ mod tests {
         let hasher = RandomState::default();
         let cache: LruCache<CachedQueryResult, _, _> = LruCache::new(
             1024 * 1024, // 1 MB
-            Duration::from_secs(60),
+            Duration::from_mins(1),
             hasher,
             CachingPolicy::Lru,
             CacheEngine::Pingora,
@@ -1170,7 +1170,7 @@ mod tests {
         let hasher = RandomState::default();
         let cache: LruCache<CachedSearchResult, _, _> = LruCache::new(
             1024 * 1024, // 1 MB
-            Duration::from_secs(60),
+            Duration::from_mins(1),
             hasher,
             CachingPolicy::Lru,
             CacheEngine::Pingora,

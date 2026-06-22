@@ -29,7 +29,10 @@ use data_components::databricks::DatabricksSparkConnect;
 use data_components::databricks::sql_warehouse::DatabricksMetrics;
 use data_components::databricks::{DatabricksDelta, DatabricksSqlWarehouse, sql_warehouse};
 use data_components::delta_lake::DeltaTableFactory;
-use data_components::unity_catalog::provider::UnityCatalogProvider;
+use data_components::unity_catalog::credential_vending::VendedDeltaTableFactory;
+use data_components::unity_catalog::provider::{
+    ReadTableProviderFactory, UCTableProviderFactory, UnityCatalogProvider,
+};
 use data_components::unity_catalog::{
     CatalogId, Endpoint, UCTable, UnityCatalog as UnityCatalogClient,
 };
@@ -141,6 +144,9 @@ pub const PARAMETERS: &[ParameterSpec] = &[
         .secret()
         .description("The SQL Warehouse ID to use when 'mode' is set to 'sql_warehouse'.")
         .examples(&["862f1d7571f6f3c4"])
+        .help_link(DATABRICKS_DOCS),
+    ParameterSpec::component("credential_vending")
+        .description("When set to 'enabled' (requires 'mode' to be 'delta_lake'), short-lived storage credentials for each table are fetched from the Unity Catalog credential vending API instead of using static storage credentials. Defaults to 'disabled'.")
         .help_link(DATABRICKS_DOCS),
 
     // Connection / resilience tuning (sql_warehouse mode)
@@ -282,6 +288,27 @@ impl Databricks {
             .expose()
             .ok_or_else(|p| MissingParameterSnafu { parameter: p.0 }.build())?;
 
+        let credential_vending = match params.get("credential_vending").expose().ok() {
+            Some("enabled") => true,
+            None | Some("disabled") => false,
+            Some(other) => {
+                return InvalidConfigurationSnafu {
+                    message: format!(
+                        "invalid value '{other}' for 'databricks_credential_vending'; valid values: 'enabled', 'disabled'"
+                    ),
+                }
+                .fail();
+            }
+        };
+        if credential_vending && mode != "delta_lake" {
+            return InvalidConfigurationSnafu {
+                message:
+                    "'databricks_credential_vending' is only supported when 'mode' is 'delta_lake'"
+                        .to_string(),
+            }
+            .fail();
+        }
+
         let auth_credentials = Self::build_auth_credentials(&params)?;
         let initialization = match auth_credentials {
             AuthCredentials::U2M(_) => ComponentInitialization::OnTrigger,
@@ -392,12 +419,21 @@ impl Databricks {
                     }
                 };
 
-                let read_provider = DatabricksDelta::new(
+                let mut read_provider = DatabricksDelta::new(
                     Endpoint(endpoint.to_string()),
                     storage_options,
                     token_provider,
                     io_runtime,
                 );
+                if credential_vending {
+                    if let Some(uc) = &uc_client {
+                        read_provider = read_provider.with_credential_vending(Arc::clone(uc));
+                    } else {
+                        tracing::warn!(
+                            "Unity Catalog credential vending is enabled, but the Unity Catalog client could not be initialized; falling back to configured storage credentials"
+                        );
+                    }
+                }
                 let delta_provider = Arc::new(read_provider);
 
                 Ok(Self {
@@ -1046,6 +1082,16 @@ impl DataConnector for Databricks {
             return Ok(());
         };
 
+        // Executors build their own object stores from the static storage
+        // params encoded below; vended Unity Catalog credentials live only in
+        // the head node's table provider and do not propagate.
+        if delta.credential_vending_enabled() {
+            tracing::warn!(
+                dataset = %dataset.name,
+                "Unity Catalog credential vending is not supported for distributed query execution; executors will use the configured static storage credentials"
+            );
+        }
+
         // Resolve the underlying storage location via Unity Catalog. This is
         // the bare URL (e.g. `s3://databricks-workspace-stack-bfa88-bucket/...`)
         // that DataFusion will look up in `runtime_env().object_store(url)`
@@ -1383,6 +1429,8 @@ pub const CATALOG_PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::component("token")
         .secret()
         .description("The personal access token used to authenticate against the DataBricks API."),
+    ParameterSpec::component("credential_vending")
+        .description("When set to 'enabled' (requires 'mode' to be 'delta_lake'), short-lived storage credentials for each table are fetched from the Unity Catalog credential vending API instead of using static storage credentials. Defaults to 'disabled'."),
     ParameterSpec::runtime("mode")
         .description("The execution mode for querying against Databricks.")
         .default("spark_connect"),
@@ -1581,14 +1629,44 @@ impl CatalogConnector for DatabricksCatalog {
         let client = Arc::new(unity_catalog);
 
         let mode = self.params.get("mode").expose().ok();
-        let (table_creator, table_reference_creator) = if mode == Some("delta_lake") {
-            (
-                Arc::new(DeltaTableFactory::new(
+        let credential_vending = match params.get("credential_vending").expose().ok() {
+            Some("enabled") => true,
+            None | Some("disabled") => false,
+            Some(other) => {
+                return Err(CatalogError::InvalidConfigurationNoSource {
+                    connector: "databricks".into(),
+                    message: format!(
+                        "Invalid value '{other}' for 'databricks_credential_vending'. Valid values: 'enabled', 'disabled'."
+                    ),
+                    connector_component: ConnectorComponent::from(catalog),
+                });
+            }
+        };
+        if credential_vending && mode != Some("delta_lake") {
+            return Err(CatalogError::InvalidConfigurationNoSource {
+                connector: "databricks".into(),
+                message:
+                    "'databricks_credential_vending' is only supported when 'mode' is 'delta_lake'."
+                        .into(),
+                connector_component: ConnectorComponent::from(catalog),
+            });
+        }
+        let table_creator: Arc<dyn UCTableProviderFactory> = if mode == Some("delta_lake") {
+            if credential_vending {
+                Arc::new(VendedDeltaTableFactory::new(
+                    Arc::clone(&client),
                     params.to_secret_map(),
                     runtime.tokio_io_runtime(),
-                )) as Arc<dyn Read>,
-                table_reference_creator_delta_lake as fn(&UCTable) -> Option<TableReference>,
-            )
+                ))
+            } else {
+                Arc::new(ReadTableProviderFactory::new(
+                    Arc::new(DeltaTableFactory::new(
+                        params.to_secret_map(),
+                        runtime.tokio_io_runtime(),
+                    )) as Arc<dyn Read>,
+                    table_reference_creator_delta_lake,
+                ))
+            }
         } else {
             let shared_semaphore = if mode == Some("sql_warehouse") {
                 match (
@@ -1635,17 +1713,16 @@ impl CatalogConnector for DatabricksCatalog {
                 connector_component: ConnectorComponent::from(catalog),
             })?;
 
-            (
+            Arc::new(ReadTableProviderFactory::new(
                 dataset_databricks.read_provider(),
-                table_reference_creator_spark as fn(&UCTable) -> Option<TableReference>,
-            )
+                table_reference_creator_spark,
+            ))
         };
 
         let catalog_provider = UnityCatalogProvider::try_new(
             client,
             CatalogId(catalog_id),
             table_creator,
-            table_reference_creator,
             catalog.include.clone(),
         )
         .await

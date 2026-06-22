@@ -240,6 +240,12 @@ impl MySQLCatalog {
         }
 
         if ssl_mode == "preferred" {
+            tracing::warn!(
+                "MySQL catalog connector: sslmode=preferred negotiates TLS but does NOT verify \
+                 the server certificate or hostname, leaving the metadata connection vulnerable \
+                 to man-in-the-middle attacks. Use sslmode=required with sslrootcert for a \
+                 verified connection."
+            );
             opts = opts
                 .with_danger_accept_invalid_certs(true)
                 .with_danger_skip_domain_validation(true);

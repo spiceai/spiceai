@@ -148,7 +148,7 @@ async fn test_distributed_acceleration_with_bucket_partitioning() -> Result<(), 
             harness.wait_for_executors(Duration::from_secs(15)).await?;
 
             // Wait for executors to load and accelerate their assigned partitions.
-            wait_for_row_count(&harness, "test_data", 10, Duration::from_secs(60)).await?;
+            wait_for_row_count(&harness, "test_data", 10, Duration::from_mins(1)).await?;
 
             // --- Test 1: SELECT all rows ---
             let select_all_sql = "SELECT id, name, age, city, score FROM test_data ORDER BY id";
@@ -179,6 +179,204 @@ async fn test_distributed_acceleration_with_bucket_partitioning() -> Result<(), 
             insta::assert_snapshot!("bucket_partitioning_agg", agg_fmt);
 
             harness.shutdown().await;
+            Ok(())
+        })
+        .await
+}
+
+/// Regression: same as `test_distributed_acceleration_with_bucket_partitioning`, but the
+/// source is a FEDERATED connector (`DuckDB`, a `PolyTableProvider`) instead of a local CSV
+/// file — the cloud shape (federated source + cayenne partitioned acceleration). The
+/// federation wrapper must not hide the inner `AcceleratedTable` from `should_partition`;
+/// the query must still distribute (`FlightSqlExec`).
+#[tokio::test(flavor = "multi_thread")]
+#[cfg(not(target_os = "windows"))]
+async fn cluster_distributes_accelerated_table_with_federated_source() -> Result<(), anyhow::Error>
+{
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(EnvFilter::new("runtime=info,warn"))
+        .with_ansi(true)
+        .try_init();
+
+    // Build a local DuckDB database file to act as the federated source.
+    let duck_tempdir = tempfile::tempdir().expect("duckdb tempdir");
+    let db_path = duck_tempdir.path().join("source.duckdb");
+    {
+        let conn = duckdb::Connection::open(&db_path).expect("open duckdb");
+        conn.execute_batch(
+            "CREATE TABLE test_data (id BIGINT, name VARCHAR, age BIGINT, city VARCHAR, score BIGINT);
+             INSERT INTO test_data VALUES
+             (1,'John Doe',28,'New York',85),(2,'Jane Smith',34,'Los Angeles',92),
+             (3,'Mike Johnson',45,'Chicago',78),(4,'Emily Brown',31,'Houston',89),
+             (5,'David Lee',39,'Phoenix',76),(6,'Sarah Wilson',26,'Philadelphia',94),
+             (7,'Tom Anderson',52,'San Antonio',81),(8,'Lisa Taylor',29,'San Diego',88),
+             (9,'Chris Martin',37,'Dallas',79),(10,'Anna Garcia',41,'San Jose',90);",
+        )
+        .expect("populate duckdb");
+    }
+
+    let cayenne_tempdir = tempfile::tempdir().expect("cayenne tempdir");
+    let state_tempdir = tempfile::tempdir().expect("state tempdir");
+
+    test_request_context()
+        .scope(async {
+            configure_test_datafusion();
+            crate::utils::register_test_connectors().await;
+
+            // Cayenne file-mode acceleration with bucket(3, id), but federated DuckDB source.
+            let mut dataset = make_accelerated_dataset(
+                "duckdb:test_data",
+                "test_data",
+                3,
+                "id",
+                cayenne_tempdir.path(),
+            );
+            dataset.params = Some(spicepod::param::Params::from_string_map(
+                std::collections::HashMap::from([(
+                    "duckdb_open".to_string(),
+                    db_path.display().to_string(),
+                )]),
+            ));
+
+            // Local-filesystem cluster state (avoids the S3 partition store the other
+            // cluster tests use, so this runs hermetically without AWS creds).
+            let scheduler_cfg = SchedulerConfig {
+                state_location: format!("file://{}", state_tempdir.path().display()),
+                params: None,
+                partition_assignment_interval: "1s".to_string(),
+                max_partition_assignments_per_interval:
+                    spicepod::component::runtime::default_max_partition_assignments_per_interval(),
+                max_partitions_per_executor: 10,
+                partition_discovery_timeout:
+                    spicepod::component::runtime::default_partition_discovery_timeout(),
+            };
+
+            let app = AppBuilder::new("repro_federated_source")
+                .with_dataset(dataset)
+                .with_runtime(SpicepodRuntime {
+                    scheduler: Some(scheduler_cfg),
+                    ..SpicepodRuntime::default()
+                })
+                .build();
+
+            let harness = ClusterHarness::builder()
+                .scheduler(app)
+                .executors(1)
+                .start()
+                .await?;
+
+            sleep(Duration::from_secs(2)).await;
+            harness.wait_for_executors(Duration::from_secs(15)).await?;
+            wait_for_row_count(&harness, "test_data", 10, Duration::from_mins(1)).await?;
+            // Give the executor time to finish loading + acking its assigned partitions.
+            sleep(Duration::from_secs(8)).await;
+
+            let select_all_sql = "SELECT id, name, age, city, score FROM test_data ORDER BY id";
+            let plan = harness.explain(select_all_sql).await?;
+            let plan_fmt = arrow::util::pretty::pretty_format_batches(&plan)
+                .expect("format explain")
+                .to_string();
+
+            let distributes = plan_fmt.contains("FlightSqlExec");
+            harness.shutdown().await;
+
+            assert!(
+                distributes,
+                "federated-source accelerated table must distribute to executors \
+                 (expected FlightSqlExec), but the coordinator federated to the source:\n{plan_fmt}"
+            );
+            Ok(())
+        })
+        .await
+}
+
+/// Regression: a clustered cayenne-accelerated dataset that carries column metadata
+/// (descriptions) — like the cloud `amazon_reviews_accelerated` — must still distribute to
+/// executors. Column/table metadata makes `register_table` wrap the `AcceleratedTable` in a
+/// `MetadataEnrichedTableProvider`; the coordinator's `should_partition` must see through that
+/// wrapper (via `find_concrete_table_provider`), otherwise it silently federates the read to
+/// the source instead of distributing. This is identical to `bucket_partitioning_plan` EXCEPT
+/// the dataset has a column description.
+#[tokio::test(flavor = "multi_thread")]
+#[cfg(not(target_os = "windows"))]
+async fn cluster_distributes_accelerated_table_with_column_metadata() -> Result<(), anyhow::Error> {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(EnvFilter::new("runtime=info,warn"))
+        .with_ansi(true)
+        .try_init();
+
+    let csv_tempdir = tempfile::tempdir().expect("csv tempdir");
+    let csv_path = csv_tempdir.path().join("test_data.csv");
+    tokio::fs::write(&csv_path, TEST_DATA_CSV)
+        .await
+        .expect("write test data");
+    let cayenne_tempdir = tempfile::tempdir().expect("cayenne tempdir");
+    let state_tempdir = tempfile::tempdir().expect("state tempdir");
+
+    test_request_context()
+        .scope(async {
+            configure_test_datafusion();
+            crate::utils::register_test_connectors().await;
+
+            let mut dataset = make_accelerated_dataset(
+                format!("file://{}", csv_path.display()),
+                "test_data",
+                3,
+                "id",
+                cayenne_tempdir.path(),
+            );
+            // THE ONLY DIFFERENCE vs the passing bucket_partitioning test: column descriptions.
+            let mut id_col = spicepod::semantic::Column::new("id");
+            id_col.description = Some("the row identifier".to_string());
+            dataset.columns = vec![id_col];
+
+            let scheduler_cfg = SchedulerConfig {
+                state_location: format!("file://{}", state_tempdir.path().display()),
+                params: None,
+                partition_assignment_interval: "1s".to_string(),
+                max_partition_assignments_per_interval:
+                    spicepod::component::runtime::default_max_partition_assignments_per_interval(),
+                max_partitions_per_executor: 10,
+                partition_discovery_timeout:
+                    spicepod::component::runtime::default_partition_discovery_timeout(),
+            };
+
+            let app = AppBuilder::new("repro_column_metadata")
+                .with_dataset(dataset)
+                .with_runtime(SpicepodRuntime {
+                    scheduler: Some(scheduler_cfg),
+                    ..SpicepodRuntime::default()
+                })
+                .build();
+
+            let harness = ClusterHarness::builder()
+                .scheduler(app)
+                .executors(1)
+                .start()
+                .await?;
+
+            sleep(Duration::from_secs(2)).await;
+            harness.wait_for_executors(Duration::from_secs(15)).await?;
+            wait_for_row_count(&harness, "test_data", 10, Duration::from_mins(1)).await?;
+            sleep(Duration::from_secs(5)).await;
+
+            let select_all_sql = "SELECT id, name, age, city, score FROM test_data ORDER BY id";
+            let plan = harness.explain(select_all_sql).await?;
+            let plan_fmt = arrow::util::pretty::pretty_format_batches(&plan)
+                .expect("format explain")
+                .to_string();
+            let rows = harness.query(select_all_sql).await?;
+            let row_count: usize = rows.iter().map(arrow::array::RecordBatch::num_rows).sum();
+
+            let distributes = plan_fmt.contains("FlightSqlExec");
+            harness.shutdown().await;
+
+            assert_eq!(row_count, 10, "query should return all 10 rows");
+            assert!(
+                distributes,
+                "accelerated table with column metadata must distribute to executors \
+                 (expected FlightSqlExec), but the coordinator federated to the source:\n{plan_fmt}"
+            );
             Ok(())
         })
         .await
@@ -240,7 +438,7 @@ async fn test_distributed_acceleration_multi_executor() -> Result<(), anyhow::Er
 
             sleep(Duration::from_secs(2)).await; // Ensure we get an initial partition assignment.
             harness.wait_for_executors(Duration::from_secs(15)).await?;
-            wait_for_row_count(&harness, "test_data", 10, Duration::from_secs(60)).await?;
+            wait_for_row_count(&harness, "test_data", 10, Duration::from_mins(1)).await?;
 
             // --- SELECT all rows ---
             let select_all_sql = "SELECT id, name, age, city, score FROM test_data ORDER BY id";
@@ -337,7 +535,7 @@ async fn test_distributed_acceleration_predicate_pushdown() -> Result<(), anyhow
 
             tokio::time::sleep(Duration::from_secs(2)).await;
             harness.wait_for_executors(Duration::from_secs(15)).await?;
-            wait_for_row_count(&harness, "test_data", 10, Duration::from_secs(60)).await?;
+            wait_for_row_count(&harness, "test_data", 10, Duration::from_mins(1)).await?;
 
             // The user predicate `score > 85` must be visible inside the FlightSqlExec
             // sql string — confirming it was pushed to the executor, not applied above.
@@ -410,7 +608,7 @@ async fn test_distributed_acceleration_order_by_limit_pushdown() -> Result<(), a
 
             sleep(Duration::from_secs(2)).await;
             harness.wait_for_executors(Duration::from_secs(15)).await?;
-            wait_for_row_count(&harness, "test_data", 10, Duration::from_secs(60)).await?;
+            wait_for_row_count(&harness, "test_data", 10, Duration::from_mins(1)).await?;
 
             // --- ORDER BY score DESC LIMIT 3 ---
             // Expected top-3 scores from TEST_DATA_CSV: Sarah Wilson=94, Jane Smith=92, Anna Garcia=90
@@ -509,7 +707,7 @@ async fn test_distributed_acceleration_executor_shutdown_and_rebalance() -> Resu
 
             tokio::time::sleep(Duration::from_secs(2)).await;
             harness.wait_for_executors(Duration::from_secs(15)).await?;
-            wait_for_row_count(&harness, "test_data", 10, Duration::from_secs(60)).await?;
+            wait_for_row_count(&harness, "test_data", 10, Duration::from_mins(1)).await?;
 
             // Baseline: both executors up, all 10 rows visible.
             let select_all = "SELECT id FROM test_data ORDER BY id";
@@ -531,7 +729,7 @@ async fn test_distributed_acceleration_executor_shutdown_and_rebalance() -> Resu
                 .await?;
 
             // Wait for the partition manager to reassign and executor[1] to refresh.
-            wait_for_row_count(&harness, "test_data", 10, Duration::from_secs(60)).await?;
+            wait_for_row_count(&harness, "test_data", 10, Duration::from_mins(1)).await?;
 
             // After rebalance executor[1] should hold all 4 buckets and return all rows.
             let rows = harness.query(select_all).await?;
@@ -628,8 +826,8 @@ async fn test_distributed_acceleration_join_two_partitioned_tables() -> Result<(
 
             harness.wait_for_executors(Duration::from_secs(15)).await?;
             // Wait for both tables to be fully accelerated.
-            wait_for_row_count(&harness, "test_data", 10, Duration::from_secs(60)).await?;
-            wait_for_row_count(&harness, "categories", 10, Duration::from_secs(60)).await?;
+            wait_for_row_count(&harness, "test_data", 10, Duration::from_mins(1)).await?;
+            wait_for_row_count(&harness, "categories", 10, Duration::from_mins(1)).await?;
 
             // Wait for partition metadata to be fully assigned across both
             // executors before querying. Without this, the scheduler may
@@ -738,7 +936,7 @@ async fn test_distributed_refresh_forwarding() -> Result<(), anyhow::Error> {
             tokio::time::sleep(Duration::from_secs(2)).await;
 
             harness.wait_for_executors(Duration::from_secs(15)).await?;
-            wait_for_row_count(&harness, "test_data", 10, Duration::from_secs(60)).await?;
+            wait_for_row_count(&harness, "test_data", 10, Duration::from_mins(1)).await?;
 
             // Trigger refresh from the scheduler. Previously this would fail with
             // "the refresh worker is no longer running. channel closed" because the
@@ -829,7 +1027,7 @@ async fn test_on_demand_refresh_discovers_new_partitions() -> Result<(), anyhow:
                 .await?;
 
             harness.wait_for_executors(Duration::from_secs(15)).await?;
-            wait_for_row_count(&harness, "test_data", 10, Duration::from_secs(60)).await?;
+            wait_for_row_count(&harness, "test_data", 10, Duration::from_mins(1)).await?;
 
             // Wait for partition management cycle to discover and assign all partitions.
             // The cycle runs every 1s (configured in make_named_scheduler_config).
@@ -910,7 +1108,7 @@ async fn test_on_demand_refresh_discovers_new_partitions() -> Result<(), anyhow:
             // Wait for the executor to pick up the new partition and load the data.
             // The executor needs to receive the UpdatePartitions message, update its
             // partition filter, and then the next refresh will include Seattle.
-            wait_for_row_count(&harness, "test_data", 11, Duration::from_secs(60)).await?;
+            wait_for_row_count(&harness, "test_data", 11, Duration::from_mins(1)).await?;
 
             harness.shutdown().await;
             Ok(())

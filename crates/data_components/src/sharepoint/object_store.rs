@@ -51,9 +51,9 @@ use graph_rs_sdk::{
     http::{AsyncIterator, ResponseExt},
 };
 use object_store::{
-    Attributes, GetOptions, GetRange, GetResult, GetResultPayload, ListResult, MultipartUpload,
-    ObjectMeta, ObjectStore, PutMode, PutMultipartOptions, PutOptions, PutPayload, PutResult,
-    Result as ObjectStoreResult, UploadPart, path::Path,
+    Attributes, CopyOptions, GetOptions, GetRange, GetResult, GetResultPayload, ListResult,
+    MultipartUpload, ObjectMeta, ObjectStore, PutMode, PutMultipartOptions, PutOptions, PutPayload,
+    PutResult, Result as ObjectStoreResult, UploadPart, path::Path,
 };
 use serde::Deserialize;
 use tokio::sync::Mutex;
@@ -381,6 +381,16 @@ impl ObjectStore for SharepointObjectStore {
         };
         options.check_preconditions(&object_meta)?;
 
+        if options.head {
+            let stream = futures::stream::empty();
+            return Ok(GetResult {
+                payload: GetResultPayload::Stream(Box::pin(stream)),
+                attributes: Attributes::default(),
+                range: 0..0,
+                meta: object_meta,
+            });
+        }
+
         // Slice in-memory after fetch (see note in `get_content`).
         // `get_content` returns the authoritative total size from the
         // fetched response body, so `range` / `meta.size` always agree
@@ -410,24 +420,26 @@ impl ObjectStore for SharepointObjectStore {
         })
     }
 
-    async fn head(&self, location: &Path) -> ObjectStoreResult<ObjectMeta> {
-        let (drive, in_drive) = self.resolve(location)?;
-        let meta = with_original_location(
-            head_drive_item(&self.client, &drive, &in_drive).await,
-            location,
-        )?;
-        Ok(ObjectMeta {
-            location: location.clone(),
-            last_modified: meta.last_modified,
-            size: meta.size,
-            e_tag: meta.e_tag,
-            version: meta.version,
-        })
-    }
-
-    async fn delete(&self, location: &Path) -> ObjectStoreResult<()> {
-        let (drive, in_drive) = self.resolve(location)?;
-        with_original_location(delete_item(&self.client, &drive, &in_drive).await, location)
+    fn delete_stream(
+        &self,
+        locations: BoxStream<'static, ObjectStoreResult<Path>>,
+    ) -> BoxStream<'static, ObjectStoreResult<Path>> {
+        let client = Arc::clone(&self.client);
+        let kind = self.kind;
+        locations
+            .then(move |res| {
+                let client = Arc::clone(&client);
+                async move {
+                    let location = res?;
+                    let (drive, in_drive) = resolve_static(kind, &location)?;
+                    with_original_location(
+                        delete_item(&client, &drive, &in_drive).await,
+                        &location,
+                    )?;
+                    Ok(location)
+                }
+            })
+            .boxed()
     }
 
     /// Lists objects recursively below `prefix`, matching the `ObjectStore`
@@ -516,12 +528,16 @@ impl ObjectStore for SharepointObjectStore {
         })
     }
 
-    async fn copy(&self, _from: &Path, _to: &Path) -> ObjectStoreResult<()> {
-        Err(object_store::Error::NotImplemented)
-    }
-
-    async fn copy_if_not_exists(&self, _from: &Path, _to: &Path) -> ObjectStoreResult<()> {
-        Err(object_store::Error::NotImplemented)
+    async fn copy_opts(
+        &self,
+        _from: &Path,
+        _to: &Path,
+        _options: CopyOptions,
+    ) -> ObjectStoreResult<()> {
+        Err(object_store::Error::NotImplemented {
+            operation: "copy_opts".to_string(),
+            implementer: "SharePointObjectStore".to_string(),
+        })
     }
 }
 

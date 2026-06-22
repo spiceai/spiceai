@@ -200,7 +200,7 @@ async fn test_datasets_api_returns_correct_status() -> Result<(), anyhow::Error>
 
             // Wait for components to load
             tokio::select! {
-                () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+                () = tokio::time::sleep(std::time::Duration::from_mins(1)) => {
                     return Err(anyhow::anyhow!("Timed out waiting for datasets to load"));
                 }
                 () = Arc::clone(&rt).load_components() => {}
@@ -344,7 +344,7 @@ async fn test_datasets_api_permission_edge_cases_update_statuses() -> Result<(),
             // Permission-denied datasets are permanent errors so
             // load_components completes without retrying.
             tokio::select! {
-                () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+                () = tokio::time::sleep(std::time::Duration::from_mins(1)) => {
                     return Err(anyhow::anyhow!("Timed out waiting for components to load"));
                 }
                 () = Arc::clone(&rt).load_components() => {}
@@ -437,7 +437,7 @@ async fn test_datasets_api_without_status_param() -> Result<(), anyhow::Error> {
             });
 
             tokio::select! {
-                () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+                () = tokio::time::sleep(std::time::Duration::from_mins(1)) => {
                     return Err(anyhow::anyhow!("Timed out waiting for datasets to load"));
                 }
                 () = Arc::clone(&rt).load_components() => {}

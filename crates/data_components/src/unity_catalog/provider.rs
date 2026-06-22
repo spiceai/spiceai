@@ -25,7 +25,6 @@ use futures::{StreamExt, TryStreamExt};
 use globset::GlobSet;
 use snafu::prelude::*;
 use std::{
-    any::Any,
     collections::HashMap,
     fmt::Write,
     sync::{Arc, RwLock},
@@ -34,6 +33,61 @@ use std::{
 use crate::{Read, RefreshableCatalogProvider};
 
 use super::{CatalogId, Result, UCSchema, UCTable, UnityCatalog};
+
+/// Creates `DataFusion` table providers for Unity Catalog tables.
+///
+/// Unlike [`Read`], implementations receive the full [`UCTable`] so they can
+/// use table metadata beyond the storage location — e.g. the `table_id`
+/// needed for credential vending.
+#[async_trait]
+pub trait UCTableProviderFactory: Send + Sync {
+    /// The reference used to construct and identify the table.
+    ///
+    /// Returns `None` when the table cannot be materialized (e.g. it has no
+    /// storage location); such tables are skipped.
+    fn table_reference(&self, table: &UCTable) -> Option<TableReference>;
+
+    async fn table_provider(
+        &self,
+        table: &UCTable,
+        table_reference: TableReference,
+    ) -> Result<Arc<dyn TableProvider>, Box<dyn std::error::Error + Send + Sync>>;
+}
+
+/// Adapts an `(Arc<dyn Read>, table_reference_creator)` pair to
+/// [`UCTableProviderFactory`] for table creators that only need the table
+/// reference.
+pub struct ReadTableProviderFactory {
+    read: Arc<dyn Read>,
+    table_reference_creator: fn(&UCTable) -> Option<TableReference>,
+}
+
+impl ReadTableProviderFactory {
+    pub fn new(
+        read: Arc<dyn Read>,
+        table_reference_creator: fn(&UCTable) -> Option<TableReference>,
+    ) -> Self {
+        Self {
+            read,
+            table_reference_creator,
+        }
+    }
+}
+
+#[async_trait]
+impl UCTableProviderFactory for ReadTableProviderFactory {
+    fn table_reference(&self, table: &UCTable) -> Option<TableReference> {
+        (self.table_reference_creator)(table)
+    }
+
+    async fn table_provider(
+        &self,
+        _table: &UCTable,
+        table_reference: TableReference,
+    ) -> Result<Arc<dyn TableProvider>, Box<dyn std::error::Error + Send + Sync>> {
+        self.read.table_provider(table_reference).await
+    }
+}
 
 #[derive(Debug)]
 pub struct UnityCatalogProvider {
@@ -44,8 +98,7 @@ impl UnityCatalogProvider {
     pub async fn try_new(
         client: Arc<UnityCatalog>,
         catalog_id: CatalogId,
-        table_creator: Arc<dyn Read>,
-        table_reference_creator: fn(&UCTable) -> Option<TableReference>,
+        table_creator: Arc<dyn UCTableProviderFactory>,
         include: Option<GlobSet>,
     ) -> Result<Self> {
         let schemas =
@@ -67,7 +120,6 @@ impl UnityCatalogProvider {
                 Arc::clone(&client),
                 &schema,
                 Arc::clone(&table_creator),
-                table_reference_creator,
                 include.clone(),
             )
             .await?;
@@ -80,12 +132,6 @@ impl UnityCatalogProvider {
 }
 
 impl CatalogProvider for UnityCatalogProvider {
-    /// Returns the catalog provider as [`Any`]
-    /// so that it can be downcast to a specific implementation.
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     /// Retrieves the list of available schema names in this catalog.
     fn schema_names(&self) -> Vec<String> {
         self.schemas.keys().cloned().collect()
@@ -122,9 +168,8 @@ pub struct UnityCatalogSchemaProvider {
     tables: RwLock<HashMap<String, Arc<dyn TableProvider>>>,
     client: Arc<UnityCatalog>,
     schema: UCSchema,
-    table_reference_creator: fn(&UCTable) -> Option<TableReference>,
     include: Option<Arc<GlobSet>>,
-    table_creator: Arc<dyn Read>,
+    table_creator: Arc<dyn UCTableProviderFactory>,
 }
 
 impl std::fmt::Debug for UnityCatalogSchemaProvider {
@@ -145,8 +190,7 @@ impl UnityCatalogSchemaProvider {
     pub async fn try_new(
         client: Arc<UnityCatalog>,
         schema: &UCSchema,
-        table_creator: Arc<dyn Read>,
-        table_reference_creator: fn(&UCTable) -> Option<TableReference>,
+        table_creator: Arc<dyn UCTableProviderFactory>,
         include: Option<Arc<GlobSet>>,
     ) -> Result<Self> {
         let tables = client
@@ -169,7 +213,7 @@ impl UnityCatalogSchemaProvider {
                 continue;
             }
 
-            let Some(table_reference) = table_reference_creator(&table) else {
+            let Some(table_reference) = table_creator.table_reference(&table) else {
                 continue;
             };
 
@@ -238,7 +282,10 @@ impl UnityCatalogSchemaProvider {
         // Third pass: create table providers for permitted tables.
         let mut tables_map = HashMap::new();
         for (table, table_reference) in permission_results.into_iter().flatten() {
-            let table_provider = match table_creator.table_provider(table_reference.clone()).await {
+            let table_provider = match table_creator
+                .table_provider(&table, table_reference.clone())
+                .await
+            {
                 Ok(provider) => provider,
                 Err(source) => {
                     tracing::warn!("Couldn't get table provider for {table_reference}: {source}");
@@ -252,7 +299,6 @@ impl UnityCatalogSchemaProvider {
             tables: RwLock::new(tables_map),
             client,
             schema: schema.clone(),
-            table_reference_creator,
             include,
             table_creator,
         })
@@ -290,7 +336,6 @@ impl UnityCatalogSchemaProvider {
                 &self.schema,
                 &table,
                 Arc::clone(&self.table_creator),
-                self.table_reference_creator,
                 self.include.clone(),
                 Arc::clone(&self.client),
             )
@@ -343,8 +388,7 @@ impl UnityCatalogSchemaProvider {
     async fn provider_for_uc_table(
         schema: &UCSchema,
         table: &UCTable,
-        table_creator: Arc<dyn Read>,
-        table_reference_creator: fn(&UCTable) -> Option<TableReference>,
+        table_creator: Arc<dyn UCTableProviderFactory>,
         include: Option<Arc<GlobSet>>,
         client: Arc<UnityCatalog>,
     ) -> Option<Arc<dyn TableProvider>> {
@@ -358,7 +402,7 @@ impl UnityCatalogSchemaProvider {
         }
 
         let table_name = table.name.clone();
-        let table_reference = table_reference_creator(table)?;
+        let table_reference = table_creator.table_reference(table)?;
 
         let schema_with_table = format!("{}.{}", schema.name, table_name);
         tracing::debug!("Checking if table {} should be included", schema_with_table);
@@ -403,7 +447,10 @@ impl UnityCatalogSchemaProvider {
             );
         }
 
-        let table_provider = match table_creator.table_provider(table_reference.clone()).await {
+        let table_provider = match table_creator
+            .table_provider(table, table_reference.clone())
+            .await
+        {
             Ok(provider) => provider,
             Err(source) => {
                 tracing::warn!("Couldn't get table provider for {table_reference}: {source}");
@@ -416,12 +463,6 @@ impl UnityCatalogSchemaProvider {
 
 #[async_trait]
 impl SchemaProvider for UnityCatalogSchemaProvider {
-    /// Returns this `SchemaProvider` as [`Any`] so that it can be downcast to a
-    /// specific implementation.
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     /// Retrieves the list of available table names in this schema.
     fn table_names(&self) -> Vec<String> {
         let guard = match self.tables.read() {

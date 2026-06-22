@@ -30,7 +30,6 @@ use datafusion::scalar::ScalarValue;
 use datafusion_table_providers::util::column_reference::ColumnReference;
 use datafusion_table_providers::util::on_conflict::OnConflict;
 use futures::stream;
-use std::any::Any;
 use std::collections::{HashMap, HashSet};
 use std::fmt::{self, Debug};
 
@@ -262,10 +261,6 @@ impl MemTable {
 
 #[async_trait]
 impl TableProvider for MemTable {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema(&self) -> SchemaRef {
         Arc::clone(&self.schema)
     }
@@ -1167,10 +1162,6 @@ fn primary_key_identifier(
 
 #[async_trait]
 impl DataSink for MemSink {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn metrics(&self) -> Option<MetricsSet> {
         None
     }
@@ -1243,7 +1234,7 @@ impl DataSink for MemSink {
         let mut writable_targets: Vec<_> =
             futures::future::join_all(self.batches.iter().map(|target| target.write())).await;
 
-        for (target, mut batches) in writable_targets.iter_mut().zip(new_batches.into_iter()) {
+        for (target, mut batches) in writable_targets.iter_mut().zip(new_batches) {
             // Depending on [`InsertOp`], we may need to mutate the existing `target` before adding new data.
             match self.overwrite {
                 // Ensure no primary key conflicts between new data that is being appended, and existing data (since we are not replacing).

@@ -31,8 +31,9 @@ use pgwire_replication::{Lsn, ReplicationClient, ReplicationConfig, ReplicationE
 use super::{
     ReplicationMetricsCollector, Result, SchemaMismatchSnafu,
     changes::{TransactionBuffer, build_change_batch, envelope_with_lsn},
-    config::{ReplicationParams, SslMode},
+    config::{ReplicationParams, SchemaEvolutionPolicy, SslMode},
     pgoutput::{DecodedMessage, Decoder},
+    schema_evolution::RelationSchemaTracker,
 };
 use crate::cdc::{ChangeEnvelope, ChangesStream, StreamError};
 
@@ -43,7 +44,15 @@ pub struct WalStreamInput {
     pub start_lsn: u64,
     pub schema: SchemaRef,
     pub primary_keys: Vec<String>,
+    /// `GENERATED` columns of the source table — absent from pgoutput
+    /// `Relation` messages by Postgres design; tolerated during schema
+    /// validation and applied as NULL.
+    pub generated_columns: Vec<String>,
     pub dataset_name: String,
+    /// Dataset `on_schema_change` policy. With anything other than `Block`,
+    /// pgoutput `Relation` messages are reconciled against the working schema
+    /// (widening adopted, breaking changes surfaced as actionable errors).
+    pub schema_evolution_policy: SchemaEvolutionPolicy,
     /// When `true`, the first envelope emitted will signal the dataset as
     /// ready — used when we skip bootstrap (existing slot resume path).
     pub is_dataset_ready_on_first_event: bool,
@@ -63,7 +72,12 @@ pub async fn start_wal_stream(input: WalStreamInput) -> Result<ChangesStream> {
     // by the reconnect loop. If it succeeds we hand the client to the stream;
     // if it fails with a transient error we still proceed into the resilient
     // loop so the dataset comes up once Postgres is reachable.
-    let config = build_replication_config(&input);
+    let config = build_replication_config(
+        &input.params,
+        &input.slot_name,
+        &input.publication_name,
+        input.start_lsn,
+    );
     let initial = ReplicationClient::connect(config.clone()).await;
     match initial {
         Ok(client) => Ok(Box::pin(wal_stream(Some(client), config, input))),
@@ -79,12 +93,17 @@ pub async fn start_wal_stream(input: WalStreamInput) -> Result<ChangesStream> {
     }
 }
 
-fn build_replication_config(input: &WalStreamInput) -> ReplicationConfig {
+pub(crate) fn build_replication_config(
+    params: &ReplicationParams,
+    slot_name: &str,
+    publication_name: &str,
+    start_lsn: u64,
+) -> ReplicationConfig {
     // Map our `SslMode` to pgwire-replication's `TlsConfig`. The crate uses
     // rustls and its own SslMode enum (Disabled / Require / VerifyCa /
     // VerifyFull), so we pick the matching constructor and pass the optional
     // CA path.
-    let tls = match input.params.sslmode {
+    let tls = match params.sslmode {
         // Prefer maps to plaintext for WAL streaming. Rationale:
         // pgwire-replication does not expose a safe "try TLS then fall back
         // to plaintext" path, so the only two honest mappings are Disabled
@@ -98,21 +117,21 @@ fn build_replication_config(input: &WalStreamInput) -> ReplicationConfig {
         // VerifyCa, or VerifyFull explicitly.
         SslMode::Disable | SslMode::Prefer => TlsConfig::disabled(),
         SslMode::Require => TlsConfig::require(),
-        SslMode::VerifyCa => TlsConfig::verify_ca(input.params.sslrootcert.clone()),
-        SslMode::VerifyFull => TlsConfig::verify_full(input.params.sslrootcert.clone()),
+        SslMode::VerifyCa => TlsConfig::verify_ca(params.sslrootcert.clone()),
+        SslMode::VerifyFull => TlsConfig::verify_full(params.sslrootcert.clone()),
     };
     ReplicationConfig {
-        host: input.params.host.clone(),
-        port: input.params.port,
-        user: input.params.user.clone(),
-        password: input.params.password.expose_secret().to_string(),
-        database: input.params.database.clone(),
+        host: params.host.clone(),
+        port: params.port,
+        user: params.user.clone(),
+        password: params.password.expose_secret().to_string(),
+        database: params.database.clone(),
         tls,
-        slot: input.slot_name.clone(),
-        publication: input.publication_name.clone(),
-        start_lsn: Lsn(input.start_lsn),
+        slot: slot_name.to_string(),
+        publication: publication_name.to_string(),
+        start_lsn: Lsn(start_lsn),
         stop_at_lsn: None,
-        status_interval: input.params.status_interval,
+        status_interval: params.status_interval,
         idle_wakeup_interval: Duration::from_secs(1),
         buffer_events: 1024,
     }
@@ -126,12 +145,35 @@ fn wal_stream(
     let schema = input.schema;
     let dataset_name = input.dataset_name;
     let primary_keys = input.primary_keys;
+    let generated_columns = input.generated_columns;
     let confirmed_flush = Arc::clone(&input.confirmed_flush);
     let mark_ready_on_first = input.is_dataset_ready_on_first_event;
+    let policy = input.schema_evolution_policy;
     let metrics = input.metrics;
 
     try_stream! {
+        // Capture the CDC shutdown epoch at stream start: this stream stops
+        // when the epoch advances (this Runtime began shutting down), while
+        // streams started by a later Runtime in the same process capture the
+        // newer epoch and are unaffected.
+        let shutdown_epoch = crate::cdc::shutdown_epoch();
         let mut first_emitted = !mark_ready_on_first;
+        // The working schema starts at the dataset schema and (policy
+        // permitting) widens when the source relation gains columns or widens
+        // types. It persists across reconnects — the OID baseline in the
+        // tracker does too — so pre-evolution WAL replayed after a reconnect
+        // still null-fills against the widened shape.
+        let mut working_schema = Arc::clone(&schema);
+        let mut relation_tracker = RelationSchemaTracker::new(
+            Arc::clone(&schema),
+            policy,
+            dataset_name.clone(),
+            primary_keys.clone(),
+        );
+        // Block-path observability: relation column names seen so far, used to
+        // warn (once per change) when the source gains columns that are being
+        // silently dropped because no evolution policy is set.
+        let mut known_relation_columns: Option<std::collections::HashSet<String>> = None;
         // If the caller passed `None`, the upfront connect failed transiently
         // (see `start_wal_stream`) — count it as a prior failure so the next
         // successful connect emits an INFO "resumed" line.
@@ -152,6 +194,13 @@ fn wal_stream(
         // reaches a natural end (rare — Postgres replication slots are
         // indefinite). Transient errors drop the current client and restart.
         'reconnect: loop {
+            if crate::cdc::shutdown_epoch() != shutdown_epoch {
+                tracing::info!(
+                    dataset = %dataset_name,
+                    "runtime shutdown; releasing replication connection and slot"
+                );
+                break 'reconnect;
+            }
             // Ensure we have an open client. Reconnect with backoff on
             // transient failures.
             let mut client = match client_slot.take() {
@@ -199,6 +248,18 @@ fn wal_stream(
             let mut txn: Option<TransactionBuffer> = None;
 
         'recv: loop {
+            if crate::cdc::shutdown_epoch() != shutdown_epoch {
+                // Release the walsender (and the slot it holds) now rather
+                // than at process exit — the shutdown drain phase can keep
+                // the process alive for tens of seconds. Checked per event,
+                // so the bound is one keepalive interval on a quiet source.
+                drop(client);
+                tracing::info!(
+                    dataset = %dataset_name,
+                    "runtime shutdown; released replication connection and slot"
+                );
+                break 'reconnect;
+            }
             let event = match client.recv().await {
                 Ok(Some(e)) => e,
                 Ok(None) => break 'reconnect, // server closed cleanly
@@ -242,15 +303,57 @@ fn wal_stream(
 
                     match msg {
                         DecodedMessage::Relation(rel) => {
-                            if let Err(e) = validate_relation_against_schema(
-                                &schema,
-                                &rel,
-                                &primary_keys,
-                            ) {
-                                metrics.inc_schema_mismatch_error();
-                                Err(StreamError::External(format!(
-                                    "schema mismatch for {dataset_name}: {e}"
-                                )))?;
+                            if policy == SchemaEvolutionPolicy::Block {
+                                if let Err(e) = validate_relation_against_schema(
+                                    &schema,
+                                    &rel,
+                                    &primary_keys,
+                                    &generated_columns,
+                                ) {
+                                    metrics.inc_schema_mismatch_error();
+                                    Err(StreamError::External(format!(
+                                        "schema mismatch for {dataset_name}: {e}"
+                                    )))?;
+                                }
+                                // Observability-only (behavior is unchanged under
+                                // `block`): a mid-stream column add is silently
+                                // dropped — say so loudly once per change.
+                                warn_on_new_relation_columns(
+                                    &rel,
+                                    &mut known_relation_columns,
+                                    &dataset_name,
+                                    &metrics,
+                                );
+                            } else {
+                                if let Err(e) =
+                                    validate_relation_primary_keys(&rel, &primary_keys)
+                                {
+                                    metrics.inc_schema_mismatch_error();
+                                    Err(StreamError::External(format!(
+                                        "schema mismatch for {dataset_name}: {e}"
+                                    )))?;
+                                }
+                                match relation_tracker.observe_relation(&rel) {
+                                    Ok(observation) => {
+                                        if observation.schema_changed {
+                                            working_schema =
+                                                Arc::clone(relation_tracker.working_schema());
+                                            metrics.inc_schema_evolution();
+                                            tracing::info!(
+                                                dataset = %dataset_name,
+                                                "adopted source schema change: {}",
+                                                observation.summary
+                                            );
+                                        }
+                                    }
+                                    Err(e) => {
+                                        metrics.inc_schema_evolution_rejected();
+                                        metrics.inc_schema_mismatch_error();
+                                        Err(StreamError::External(format!(
+                                            "schema change for {dataset_name} cannot be applied: {e}"
+                                        )))?;
+                                    }
+                                }
                             }
                             decoder.apply_declared_primary_keys(rel.relation_id, &primary_keys);
                         }
@@ -260,8 +363,11 @@ fn wal_stream(
                                 .push_insert(rel, tuple);
                             metrics.inc_insert();
                         }
-                        DecodedMessage::Update { relation_id, new, .. } => {
+                        DecodedMessage::Update { relation_id, old, new } => {
                             let rel = resolve_relation(&decoder, relation_id)?;
+                            // Fill unchanged-TOAST markers from the old tuple
+                            // (REPLICA IDENTITY FULL) before buffering.
+                            let new = super::changes::merge_unchanged_toast(new, old.as_ref());
                             txn.get_or_insert_with(|| TransactionBuffer::new(0))
                                 .push_update(rel, new);
                             metrics.inc_update();
@@ -352,10 +458,19 @@ fn wal_stream(
                             unreachable!();
                         }
 
-                        let batch = build_change_batch(&schema, rel, &buffer.changes)
+                        // Carry the transaction's commit time (one commit ts per
+                        // transaction) as Unix-epoch ms so the accelerator can
+                        // compute true source-to-queryable replication lag.
+                        let commit_ts_ms = pg_epoch_to_system_time(commit_time_micros)
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .ok()
+                            .and_then(|d| i64::try_from(d.as_millis()).ok());
+
+                        let batch = build_change_batch(&working_schema, rel, &buffer.changes)
                             .map_err(|e| StreamError::External(format!(
                                 "change batch build failed for {dataset_name}: {e}"
-                            )))?;
+                            )))?
+                            .with_source_commit_ts_ms(commit_ts_ms);
 
                         let is_ready = !first_emitted;
                         first_emitted = true;
@@ -418,7 +533,7 @@ fn wal_stream(
 
 /// Convert a Postgres-epoch microsecond timestamp (from pgoutput Commit) into a
 /// `SystemTime`. Postgres' epoch is 2000-01-01T00:00:00 UTC, not the Unix epoch.
-fn pg_epoch_to_system_time(pg_micros: i64) -> std::time::SystemTime {
+pub(crate) fn pg_epoch_to_system_time(pg_micros: i64) -> std::time::SystemTime {
     // 30 years = 946_684_800 seconds between 1970-01-01 and 2000-01-01.
     const PG_EPOCH_UNIX_SECS: i64 = 946_684_800;
     let total_micros = pg_micros + PG_EPOCH_UNIX_SECS * 1_000_000;
@@ -464,7 +579,7 @@ fn reconnect_logs_at_warn(attempt: u32) -> bool {
 /// Emit a per-attempt log for a transient connect/recv failure. The first
 /// attempt of an outage cycle is WARN (so an outage is loud and greppable);
 /// subsequent attempts are DEBUG to avoid flooding logs during long outages.
-fn log_transient_reconnect(attempt: u32, dataset: &str, error: &str, retry_in_ms: u128) {
+pub(crate) fn log_transient_reconnect(attempt: u32, dataset: &str, error: &str, retry_in_ms: u128) {
     if reconnect_logs_at_warn(attempt) {
         tracing::warn!(
             dataset = %dataset,
@@ -510,13 +625,21 @@ fn advance(flush: &AtomicU64, to: u64) {
     }
 }
 
-fn validate_relation_against_schema(
+pub(crate) fn validate_relation_against_schema(
     dataset_schema: &SchemaRef,
     rel: &super::pgoutput::Relation,
     declared_pks: &[String],
+    generated_columns: &[String],
 ) -> Result<()> {
     for field in dataset_schema.fields() {
         if !rel.columns.iter().any(|c| c.name == *field.name()) {
+            // GENERATED columns are absent from pgoutput Relation messages by
+            // Postgres design — they're catalog-confirmed at setup, so their
+            // absence here is expected (applied as NULL downstream). Any
+            // OTHER missing column means the source schema really changed.
+            if generated_columns.iter().any(|g| g == field.name()) {
+                continue;
+            }
             return SchemaMismatchSnafu {
                 message: format!(
                     "column `{}` from dataset schema is missing in source relation {}.{}",
@@ -528,6 +651,16 @@ fn validate_relation_against_schema(
             .fail();
         }
     }
+    validate_relation_primary_keys(rel, declared_pks)
+}
+
+/// Validate that every dataset-declared primary key exists on the relation and
+/// is part of the source replica identity. Runs for every policy — UPDATE and
+/// DELETE events cannot be routed without the key columns.
+fn validate_relation_primary_keys(
+    rel: &super::pgoutput::Relation,
+    declared_pks: &[String],
+) -> Result<()> {
     for pk in declared_pks {
         let Some(col) = rel.columns.iter().find(|c| c.name == *pk) else {
             return SchemaMismatchSnafu {
@@ -549,6 +682,39 @@ fn validate_relation_against_schema(
         }
     }
     Ok(())
+}
+
+/// Under `on_schema_change: block`, a mid-stream column add is silently
+/// ignored (the legacy behavior). Surface that narrowing loudly: warn once per
+/// relation change naming the dropped columns, counted as a rejected schema
+/// evolution. The first relation of a connection only seeds the baseline —
+/// columns intentionally excluded from the dataset schema must not warn.
+fn warn_on_new_relation_columns(
+    rel: &super::pgoutput::Relation,
+    known_relation_columns: &mut Option<std::collections::HashSet<String>>,
+    dataset_name: &str,
+    metrics: &ReplicationMetricsCollector,
+) {
+    let current: std::collections::HashSet<String> =
+        rel.columns.iter().map(|c| c.name.clone()).collect();
+    if let Some(known) = known_relation_columns.as_ref() {
+        let added: Vec<&str> = current
+            .iter()
+            .filter(|name| !known.contains(*name))
+            .map(String::as_str)
+            .collect();
+        if !added.is_empty() {
+            metrics.inc_schema_evolution_rejected();
+            tracing::warn!(
+                dataset = %dataset_name,
+                columns = ?added,
+                "source relation {}.{} gained columns whose values are being silently dropped. Set `on_schema_change: append_new_columns` (or `sync_all_columns`) on the dataset to adopt new columns",
+                rel.namespace,
+                rel.name
+            );
+        }
+    }
+    *known_relation_columns = Some(current);
 }
 
 #[cfg(test)]
@@ -583,6 +749,47 @@ mod tests {
 
         assert_eq!(applied, 100);
         assert_eq!(confirmed.load(Ordering::Relaxed), 100);
+    }
+
+    #[test]
+    fn validation_tolerates_generated_columns_but_not_dropped_ones() {
+        use crate::postgres_replication::pgoutput::{Column, Relation};
+        let schema: SchemaRef = std::sync::Arc::new(arrow::datatypes::Schema::new(vec![
+            arrow::datatypes::Field::new("id", arrow::datatypes::DataType::Int32, false),
+            arrow::datatypes::Field::new("name", arrow::datatypes::DataType::Utf8, true),
+            arrow::datatypes::Field::new("name_lower", arrow::datatypes::DataType::Utf8, true),
+        ]));
+        // pgoutput omits GENERATED columns: the relation carries only id+name.
+        let rel = Relation {
+            relation_id: 7,
+            namespace: "public".into(),
+            name: "apps".into(),
+            replica_identity: b'd',
+            columns: vec![
+                Column {
+                    is_key: true,
+                    name: "id".into(),
+                    type_oid: 23,
+                    type_modifier: -1,
+                },
+                Column {
+                    is_key: false,
+                    name: "name".into(),
+                    type_oid: 25,
+                    type_modifier: -1,
+                },
+            ],
+        };
+        let pks = vec!["id".to_string()];
+
+        // Catalog-confirmed generated column → tolerated.
+        validate_relation_against_schema(&schema, &rel, &pks, &["name_lower".to_string()])
+            .expect("generated column absence must validate");
+
+        // Same absence WITHOUT catalog confirmation = a real schema change.
+        let err = validate_relation_against_schema(&schema, &rel, &pks, &[])
+            .expect_err("non-generated missing column must fail validation");
+        assert!(err.to_string().contains("name_lower"), "got: {err}");
     }
 
     #[test]

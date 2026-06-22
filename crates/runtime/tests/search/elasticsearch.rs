@@ -52,7 +52,7 @@ pub(super) async fn start_elasticsearch_docker_container(
             start_interval: None,
         })
         .build()?
-        .run(Some(std::time::Duration::from_secs(120)))
+        .run(Some(std::time::Duration::from_mins(2)))
         .await?;
 
     Ok(running_container)

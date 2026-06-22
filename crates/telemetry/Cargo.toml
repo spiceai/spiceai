@@ -8,6 +8,12 @@ repository.workspace = true
 rust-version.workspace = true
 version.workspace = true
 
+[lints.rust]
+# `tokio_unstable` is enabled via `RUSTFLAGS="--cfg tokio_unstable"` to expose the
+# per-worker tokio RuntimeMetrics (busy/park/steal). Declare it so the otherwise-unknown
+# cfg name doesn't trip the `unexpected_cfgs` lint on builds without the flag.
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(tokio_unstable)'] }
+
 [dependencies]
 arrow.workspace = true
 async-trait.workspace = true

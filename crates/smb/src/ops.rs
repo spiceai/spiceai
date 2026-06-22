@@ -702,7 +702,7 @@ impl ShareSession {
         if result.is_ok() && offset != src_size {
             result = Err(io::Error::new(
                 io::ErrorKind::UnexpectedEof,
-                format!("copy_object: copied {offset} of {src_size} bytes from {src_key}",),
+                format!("copy_object: copied {offset} of {src_size} bytes from {src_key}"),
             ));
         }
 

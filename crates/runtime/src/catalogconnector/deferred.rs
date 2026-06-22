@@ -15,7 +15,7 @@ limitations under the License.
 */
 
 use datafusion::catalog::{CatalogProvider, SchemaProvider};
-use std::{any::Any, fmt::Debug, sync::Arc};
+use std::{fmt::Debug, sync::Arc};
 
 use crate::{Runtime, component::catalog::Catalog};
 
@@ -59,10 +59,6 @@ impl DeferredCatalogProvider {
 }
 
 impl CatalogProvider for DeferredCatalogProvider {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema_names(&self) -> Vec<String> {
         Vec::new()
     }

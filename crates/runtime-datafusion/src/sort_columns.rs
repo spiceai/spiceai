@@ -33,17 +33,23 @@ impl std::fmt::Display for SortDirection {
     }
 }
 
-/// A parsed sort column specification with column name and direction.
+/// A parsed sort column specification with column name, direction, and an
+/// optional explicit NULLs placement (`None` = the engine default).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SortColumn {
     pub column: String,
     pub direction: SortDirection,
+    pub nulls_first: Option<bool>,
 }
 
 impl SortColumn {
     #[must_use]
     pub fn new(column: String, direction: SortDirection) -> Self {
-        Self { column, direction }
+        Self {
+            column,
+            direction,
+            nulls_first: None,
+        }
     }
 
     #[must_use]
@@ -55,6 +61,12 @@ impl SortColumn {
     pub fn desc(column: impl Into<String>) -> Self {
         Self::new(column.into(), SortDirection::Desc)
     }
+
+    #[must_use]
+    pub fn with_nulls_first(mut self, nulls_first: bool) -> Self {
+        self.nulls_first = Some(nulls_first);
+        self
+    }
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -62,7 +74,7 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 #[derive(Debug, Snafu)]
 pub enum Error {
     #[snafu(display(
-        "Invalid sort column specification '{specification}', expected 'column [ASC|DESC]'"
+        "Invalid sort column specification '{specification}', expected 'column [ASC|DESC] [NULLS FIRST|LAST]'"
     ))]
     InvalidSpecification { specification: String },
 
@@ -83,12 +95,15 @@ pub enum Error {
 /// Parses and validates the `on_refresh_sort_columns` parameter against the schema.
 ///
 /// # Format
-/// `column1 ASC, column2 DESC` or `column1, column2` (defaults to ASC)
+/// `column [ASC|DESC] [NULLS FIRST|LAST]` per entry, comma-separated — e.g.
+/// `created_at DESC NULLS FIRST, id` (direction defaults to ASC; NULLs placement
+/// defaults to the engine default when omitted).
 ///
 /// # Errors
 /// Returns an error if:
 /// - The input contains invalid sort column specifications
 /// - A specified sort direction is not 'ASC' or 'DESC'
+/// - A specified NULLs placement is not 'NULLS FIRST' or 'NULLS LAST'
 /// - A specified column does not exist in the schema
 /// - No valid columns are found in the input
 pub fn parse_sort_columns(sort_columns_str: &str, schema: &Schema) -> Result<Vec<SortColumn>> {
@@ -101,21 +116,47 @@ pub fn parse_sort_columns(sort_columns_str: &str, schema: &Schema) -> Result<Vec
         }
 
         let parts: Vec<&str> = trimmed.split_whitespace().collect();
-        let sort_column = match parts.as_slice() {
-            [column] => SortColumn::asc(*column),
-            [column, dir] => {
-                let direction = match dir.to_uppercase().as_str() {
-                    "ASC" => SortDirection::Asc,
-                    "DESC" => SortDirection::Desc,
-                    _ => {
-                        return InvalidDirectionSnafu {
-                            column: (*column).to_string(),
-                            direction: (*dir).to_string(),
-                        }
-                        .fail();
+        let Some((&column, modifiers)) = parts.split_first() else {
+            return InvalidSpecificationSnafu {
+                specification: trimmed.to_string(),
+            }
+            .fail();
+        };
+
+        // Optional direction token.
+        let mut direction = SortDirection::Asc;
+        let mut rest = modifiers;
+        if let Some((&dir, after_dir)) = rest.split_first()
+            && !dir.eq_ignore_ascii_case("NULLS")
+        {
+            direction = match dir.to_uppercase().as_str() {
+                "ASC" => SortDirection::Asc,
+                "DESC" => SortDirection::Desc,
+                _ => {
+                    return InvalidDirectionSnafu {
+                        column: column.to_string(),
+                        direction: dir.to_string(),
                     }
-                };
-                SortColumn::new((*column).to_string(), direction)
+                    .fail();
+                }
+            };
+            rest = after_dir;
+        }
+
+        // Optional `NULLS FIRST|LAST` suffix.
+        let nulls_first = match rest {
+            [] => None,
+            [nulls, placement] if nulls.eq_ignore_ascii_case("NULLS") => {
+                if placement.eq_ignore_ascii_case("FIRST") {
+                    Some(true)
+                } else if placement.eq_ignore_ascii_case("LAST") {
+                    Some(false)
+                } else {
+                    return InvalidSpecificationSnafu {
+                        specification: trimmed.to_string(),
+                    }
+                    .fail();
+                }
             }
             _ => {
                 return InvalidSpecificationSnafu {
@@ -124,6 +165,9 @@ pub fn parse_sort_columns(sort_columns_str: &str, schema: &Schema) -> Result<Vec
                 .fail();
             }
         };
+
+        let mut sort_column = SortColumn::new(column.to_string(), direction);
+        sort_column.nulls_first = nulls_first;
 
         // Validate that the column exists in the schema
         if schema.field_with_name(&sort_column.column).is_err() {
@@ -260,6 +304,36 @@ mod tests {
     fn test_error_too_many_parts() {
         let schema = test_schema();
         parse_sort_columns("id ASC extra", &schema).expect_err("should fail on too many parts");
+    }
+
+    #[test]
+    fn test_parse_nulls_placement() {
+        let schema = test_schema();
+        let result =
+            parse_sort_columns("timestamp DESC NULLS LAST, id NULLS FIRST, value", &schema)
+                .expect("should parse");
+        assert_eq!(result.len(), 3);
+        assert_eq!(result[0].direction, SortDirection::Desc);
+        assert_eq!(result[0].nulls_first, Some(false));
+        assert_eq!(result[1].direction, SortDirection::Asc);
+        assert_eq!(result[1].nulls_first, Some(true));
+        assert_eq!(result[2].nulls_first, None);
+    }
+
+    #[test]
+    fn test_parse_nulls_placement_case_insensitive() {
+        let schema = test_schema();
+        let result = parse_sort_columns("timestamp desc nulls first", &schema).expect("parse");
+        assert_eq!(result[0].nulls_first, Some(true));
+    }
+
+    #[test]
+    fn test_error_invalid_nulls_placement() {
+        let schema = test_schema();
+        parse_sort_columns("id NULLS SOMETIMES", &schema)
+            .expect_err("should fail on invalid NULLS placement");
+        parse_sort_columns("id DESC NULLS", &schema)
+            .expect_err("should fail on dangling NULLS keyword");
     }
 
     #[test]

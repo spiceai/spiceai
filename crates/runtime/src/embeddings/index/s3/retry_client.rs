@@ -92,7 +92,7 @@ impl<T: S3Vectors + Send + Sync + ?Sized> S3VectorsRetryMiddlewareBuilder<T> {
             inner,
             retry_strategy: FibonacciBackoffBuilder::new().max_retries(Some(10)).build(),
             max_parallelism: 10,
-            operation_timeout: Duration::from_secs(300),
+            operation_timeout: Duration::from_mins(5),
         }
     }
 

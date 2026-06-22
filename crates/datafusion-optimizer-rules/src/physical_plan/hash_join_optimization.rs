@@ -43,7 +43,7 @@ impl PhysicalOptimizerRule for EmptyHashJoinExecPhysicalOptimization {
         _config: &ConfigOptions,
     ) -> Result<Arc<dyn ExecutionPlan>, DataFusionError> {
         plan.transform_down(|plan| {
-            let Some(join_exec) = plan.as_any().downcast_ref::<HashJoinExec>() else {
+            let Some(join_exec) = plan.downcast_ref::<HashJoinExec>() else {
                 return Ok(Transformed::no(plan));
             };
 
@@ -162,6 +162,7 @@ mod tests {
                 None,
                 PartitionMode::Partitioned,
                 NullEquality::NullEqualsNothing,
+                false,
             )
             .expect("valid HashJoinExec"),
         );
@@ -178,7 +179,6 @@ mod tests {
             .expect("optimize succeeds");
 
         let empty = optimized
-            .as_any()
             .downcast_ref::<EmptyExec>()
             .expect("join replaced with EmptyExec");
         assert_eq!(
@@ -217,6 +217,7 @@ mod tests {
                 None,
                 PartitionMode::CollectLeft,
                 NullEquality::NullEqualsNothing,
+                false,
             )
             .expect("valid HashJoinExec"),
         );
@@ -227,7 +228,7 @@ mod tests {
             .expect("optimize succeeds");
 
         assert!(
-            optimized.as_any().is::<HashJoinExec>(),
+            optimized.is::<HashJoinExec>(),
             "rule must leave non-empty joins as `HashJoinExec`"
         );
     }

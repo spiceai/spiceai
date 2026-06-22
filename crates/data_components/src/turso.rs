@@ -85,7 +85,7 @@ limitations under the License.
 //! The read path automatically detects the storage format (TEXT vs INTEGER) and converts
 //! to the Arrow schema's expected timestamp type and unit.
 
-use std::{any::Any, fmt, sync::Arc};
+use std::{fmt, sync::Arc};
 
 use arrow::{
     array::{
@@ -113,7 +113,7 @@ use datafusion::{
     },
     error::{DataFusionError, Result as DataFusionResult},
     execution::{SendableRecordBatchStream, TaskContext},
-    logical_expr::{Expr, LogicalPlan, TableProviderFilterPushDown, TableType, dml::InsertOp},
+    logical_expr::{Expr, TableProviderFilterPushDown, TableType, dml::InsertOp},
     physical_expr::EquivalenceProperties,
     physical_plan::{
         DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PlanProperties,
@@ -135,16 +135,16 @@ use datafusion::{
 use datafusion_federation::{
     FederatedTableProviderAdaptor, FederatedTableSource,
     sql::{
-        RemoteTableRef, SQLExecutor, SQLFederationProvider, SQLTableSource,
-        ast_analyzer::{AstAnalyzer, AstAnalyzerRule},
+        AstAnalyzer, AstAnalyzerRule, LogicalOptimizer, RemoteTableRef, SQLExecutor,
+        SQLFederationProvider, SQLTableSource,
     },
 };
 use datafusion_table_providers::sqlite::sqlite_interval::SQLiteIntervalVisitor;
-use datafusion_table_providers::util::supported_functions::{
-    FunctionSupport, contains_unsupported_functions,
-};
+
+use crate::function_support::{FunctionSupport, unfederate_plan_with_unsupported_functions};
 use futures::stream::{self, StreamExt, TryStreamExt};
 use snafu::prelude::*;
+use tokio::sync::{OwnedRwLockReadGuard, OwnedRwLockWriteGuard, RwLock};
 use turso::{Builder, Connection, Database, Value as TursoValue};
 use turso_shared::{BEGIN_CONCURRENT_SQL, COMMIT_SQL, JOURNAL_MODE_SQL_LITERAL};
 
@@ -354,6 +354,7 @@ pub struct TursoConnectionPool {
     database: Arc<Database>,
     db_path: String,
     timestamp_format: TimestampFormat,
+    schema_lock: Arc<RwLock<()>>,
 }
 
 impl TursoConnectionPool {
@@ -391,6 +392,7 @@ impl TursoConnectionPool {
             database: Arc::new(database),
             db_path: path.to_string(),
             timestamp_format,
+            schema_lock: Arc::new(RwLock::new(())),
         })
     }
 
@@ -399,9 +401,31 @@ impl TursoConnectionPool {
     /// This method is lightweight and can be called frequently. Each connection
     /// shares the underlying database instance, making it efficient for high-frequency
     /// operations.
-    #[expect(clippy::unused_async)]
+    ///
+    /// Per-connection performance PRAGMAs are applied on every connection here.
+    /// Unlike `journal_mode = mvcc` (which persists on the database file and is set
+    /// once at pool creation), `synchronous` and `cache_size` are per-connection and
+    /// do not carry over — without this, every accelerator connection would default
+    /// to `synchronous = FULL` (an extra fsync per commit). These are cheap in-memory
+    /// settings, so they are net-positive even on hot paths.
     pub async fn connect(&self) -> Result<Connection> {
-        self.database.connect().context(TursoDatabaseSnafu)
+        let conn = self.database.connect().context(TursoDatabaseSnafu)?;
+
+        // Wait for locks instead of immediately returning SQLITE_BUSY.
+        conn.busy_timeout(std::time::Duration::from_secs(5))
+            .context(TursoDatabaseSnafu)?;
+
+        // NORMAL synchronous: safe under WAL/MVCC, avoids FULL's extra per-commit fsync.
+        conn.execute("PRAGMA synchronous = NORMAL", ())
+            .await
+            .context(TursoDatabaseSnafu)?;
+
+        // 32MB page cache (negative value = kilobytes), matching the metastore connection.
+        conn.execute("PRAGMA cache_size = -32768", ())
+            .await
+            .context(TursoDatabaseSnafu)?;
+
+        Ok(conn)
     }
 
     /// Returns true if this is an in-memory database
@@ -420,6 +444,22 @@ impl TursoConnectionPool {
     #[must_use]
     pub fn timestamp_format(&self) -> TimestampFormat {
         self.timestamp_format
+    }
+
+    /// Holds schema changes out while a Turso write transaction is open.
+    ///
+    /// Turso returns "Database schema conflict" if a `BEGIN CONCURRENT` write
+    /// transaction commits after another connection changes the schema. DML uses
+    /// a shared guard so concurrent writers can still proceed; DDL uses the
+    /// exclusive guard below.
+    pub async fn acquire_schema_read_lock(&self) -> OwnedRwLockReadGuard<()> {
+        Arc::clone(&self.schema_lock).read_owned().await
+    }
+
+    /// Acquires exclusive access for schema-changing statements such as
+    /// `CREATE TABLE`, `CREATE INDEX`, `ALTER TABLE`, and `DROP TABLE`.
+    pub async fn acquire_schema_write_lock(&self) -> OwnedRwLockWriteGuard<()> {
+        Arc::clone(&self.schema_lock).write_owned().await
     }
 }
 
@@ -1141,10 +1181,6 @@ impl TursoTableProvider {
 
 #[async_trait]
 impl TableProvider for TursoTableProvider {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema(&self) -> SchemaRef {
         Arc::clone(&self.schema)
     }
@@ -1286,11 +1322,11 @@ impl SQLExecutor for TursoTableProvider {
         Some(AstAnalyzer::new(vec![Self::turso_ast_analyzer()]))
     }
 
-    fn can_execute_plan(&self, plan: &LogicalPlan) -> bool {
-        // Default to not federate if [`Self::function_support`] provided, otherwise true.
-        self.function_support.as_ref().is_none_or(|func_supp| {
-            !contains_unsupported_functions(plan, func_supp).unwrap_or(false)
-        })
+    fn logical_optimizer(&self) -> Option<LogicalOptimizer> {
+        let function_support = self.function_support.clone()?;
+        Some(Box::new(move |plan| {
+            unfederate_plan_with_unsupported_functions(plan, &function_support)
+        }))
     }
 
     fn execute(
@@ -1414,7 +1450,7 @@ pub struct TursoExec {
     pool: Arc<TursoConnectionPool>,
     filters: Vec<Expr>,
     limit: Option<usize>,
-    properties: PlanProperties,
+    properties: Arc<PlanProperties>,
 }
 
 impl TursoExec {
@@ -1434,12 +1470,12 @@ impl TursoExec {
         filters: &[Expr],
         limit: Option<usize>,
     ) -> Self {
-        let properties = PlanProperties::new(
+        let properties = Arc::new(PlanProperties::new(
             EquivalenceProperties::new(Arc::clone(&schema)),
             Partitioning::UnknownPartitioning(1),
             EmissionType::Incremental,
             Boundedness::Bounded,
-        );
+        ));
 
         Self {
             schema,
@@ -1508,15 +1544,11 @@ impl ExecutionPlan for TursoExec {
         "TursoExec"
     }
 
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema(&self) -> SchemaRef {
         Arc::clone(&self.schema)
     }
 
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
     }
 
@@ -1633,6 +1665,7 @@ impl DeletionSink for TursoDeletionSink {
             where_clause
         );
 
+        let _schema_guard = self.pool.acquire_schema_read_lock().await;
         let conn = self.pool.connect().await?;
         let rows_affected = conn
             .execute(&delete_sql, ())
@@ -1715,6 +1748,7 @@ impl TursoDataSink {
             .connect()
             .await
             .map_err(|e| DataFusionError::External(Box::new(e)))?;
+        let _schema_guard = self.pool.acquire_schema_read_lock().await;
 
         let delete_sql = format!("DELETE FROM {}", quote_identifier(&self.table_name));
         let insert_sql = self.insert_sql();
@@ -1771,6 +1805,7 @@ impl TursoDataSink {
             .connect()
             .await
             .map_err(|e| DataFusionError::External(Box::new(e)))?;
+        let _schema_guard = self.pool.acquire_schema_read_lock().await;
         let insert_sql = self.insert_sql();
 
         let write_result = async {
@@ -1841,10 +1876,6 @@ impl TursoDataSink {
 
 #[async_trait]
 impl DataSink for TursoDataSink {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn metrics(&self) -> Option<datafusion::physical_plan::metrics::MetricsSet> {
         None
     }
@@ -2460,6 +2491,101 @@ mod tests {
             query_rows(&pool, table_name).await,
             Vec::<(i64, String)>::new(),
             "the first batch must roll back when a later batch in the same stream fails"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_turso_schema_changes_wait_for_open_sink_write_transaction() {
+        let table_name = "schema_gate_data";
+        let (pool, sink) = create_turso_sink(table_name).await;
+        let schema = Arc::clone(sink.schema());
+        let first_batch = batch(Arc::clone(&schema), vec![1], vec!["one"]);
+
+        let (stream_waiting_tx, stream_waiting_rx) = tokio::sync::oneshot::channel();
+        let (finish_stream_tx, finish_stream_rx) = tokio::sync::oneshot::channel();
+        let delayed_stream = futures::stream::unfold(
+            (
+                0_u8,
+                Some(first_batch),
+                Some(stream_waiting_tx),
+                Some(finish_stream_rx),
+            ),
+            |(state, batch, stream_waiting_tx, finish_stream_rx)| async move {
+                match state {
+                    0 => Some((
+                        Ok::<_, DataFusionError>(batch.expect("first batch should be available")),
+                        (1, None, stream_waiting_tx, finish_stream_rx),
+                    )),
+                    1 => {
+                        if let Some(stream_waiting_tx) = stream_waiting_tx {
+                            let _ = stream_waiting_tx.send(());
+                        }
+                        if let Some(finish_stream_rx) = finish_stream_rx {
+                            let _ = finish_stream_rx.await;
+                        }
+                        None
+                    }
+                    _ => None,
+                }
+            },
+        );
+        let data: SendableRecordBatchStream = Box::pin(RecordBatchStreamAdapter::new(
+            Arc::clone(&schema),
+            delayed_stream,
+        ));
+
+        let sink_task = tokio::spawn(async move {
+            sink.write_all(data, &Arc::new(TaskContext::default()))
+                .await
+        });
+        stream_waiting_rx
+            .await
+            .expect("sink stream should wait before commit");
+
+        let ddl_pool = Arc::clone(&pool);
+        let (ddl_started_tx, ddl_started_rx) = tokio::sync::oneshot::channel();
+        let mut ddl_task = tokio::spawn(async move {
+            ddl_started_tx
+                .send(())
+                .expect("DDL start notification should be delivered");
+            let _schema_guard = ddl_pool.acquire_schema_write_lock().await;
+            let conn = ddl_pool
+                .connect()
+                .await
+                .expect("schema change connection should be created");
+            conn.execute(
+                "CREATE TABLE schema_gate_other (id INTEGER PRIMARY KEY)",
+                (),
+            )
+            .await
+        });
+
+        ddl_started_rx
+            .await
+            .expect("DDL task should start before waiting for the schema lock");
+        let ddl_wait =
+            tokio::time::timeout(std::time::Duration::from_millis(50), &mut ddl_task).await;
+        assert!(
+            ddl_wait.is_err(),
+            "schema changes should wait until the sink write transaction commits"
+        );
+
+        finish_stream_tx
+            .send(())
+            .expect("stream finish signal should be delivered");
+        let written = sink_task
+            .await
+            .expect("sink task should not panic")
+            .expect("sink write should succeed");
+        assert_eq!(written, 1);
+
+        ddl_task
+            .await
+            .expect("DDL task should not panic")
+            .expect("schema change should succeed after the sink commits");
+        assert_eq!(
+            query_rows(&pool, table_name).await,
+            vec![(1, "one".to_string())]
         );
     }
 

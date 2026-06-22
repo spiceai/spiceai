@@ -217,14 +217,12 @@ pub(crate) async fn wrap_accelerator_with_duckdb_vector_indexes(
     // in the TableDefinition configuration.
     table_definition.add_ignored_index_prefix("__spice_vss_");
 
-    let mut provider = if let Some(indexed) = accelerator_provider
-        .as_any()
-        .downcast_ref::<IndexedTableProvider>()
-    {
-        indexed.clone()
-    } else {
-        IndexedTableProvider::new(Arc::clone(&accelerator_provider))
-    };
+    let mut provider =
+        if let Some(indexed) = accelerator_provider.downcast_ref::<IndexedTableProvider>() {
+            indexed.clone()
+        } else {
+            IndexedTableProvider::new(Arc::clone(&accelerator_provider))
+        };
 
     for (column, config) in embedding_columns {
         let vector_index = try_from_table(
@@ -298,17 +296,16 @@ fn normalized_duckdb_vector_param_name(key: &str) -> Option<&'static str> {
 fn duckdb_writer_context(
     provider: &Arc<dyn TableProvider>,
 ) -> Option<(Arc<DuckDbConnectionPool>, Arc<TableDefinition>)> {
-    if let Some(indexed) = provider.as_any().downcast_ref::<IndexedTableProvider>() {
+    if let Some(indexed) = provider.downcast_ref::<IndexedTableProvider>() {
         return duckdb_writer_context(&indexed.underlying);
     }
 
-    if let Some(poly) = provider.as_any().downcast_ref::<PolyTableProvider>() {
+    if let Some(poly) = provider.downcast_ref::<PolyTableProvider>() {
         let writer = poly.writer();
         return duckdb_writer_context(&writer);
     }
 
     provider
-        .as_any()
         .downcast_ref::<DuckDBTableWriter>()
         .map(|writer| (writer.pool(), writer.table_definition()))
 }

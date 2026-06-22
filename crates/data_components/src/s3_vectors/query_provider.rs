@@ -13,7 +13,7 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
-use std::{any::Any, sync::Arc};
+use std::sync::Arc;
 
 use crate::s3_vectors::{
     S3_VECTOR_EMBEDDING_NAME, S3_VECTOR_PRIMARY_KEY_NAME,
@@ -81,10 +81,6 @@ impl S3VectorsQueryTable {
 
 #[async_trait]
 impl TableProvider for S3VectorsQueryTable {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema(&self) -> SchemaRef {
         self.table.query_provider_schema()
     }
@@ -147,7 +143,7 @@ impl std::fmt::Debug for S3VectorsQueryExec {
 pub(super) struct S3VectorsQueryExec {
     idx: S3VectorIdentifier,
     client: Arc<dyn S3Vectors + Send + Sync>,
-    plan_properties: PlanProperties,
+    plan_properties: Arc<PlanProperties>,
     query: Vec<f32>,
     limit: i32,
     filters: Vec<Expr>,
@@ -178,12 +174,12 @@ impl S3VectorsQueryExec {
         Self {
             idx: Arc::unwrap_or_clone(Arc::clone(&table.idx)),
             client: Arc::clone(&table.client),
-            plan_properties: PlanProperties::new(
+            plan_properties: Arc::new(PlanProperties::new(
                 EquivalenceProperties::new(projected_schema),
                 Partitioning::UnknownPartitioning(1),
                 EmissionType::Incremental,
                 Boundedness::Bounded,
-            ),
+            )),
             query,
             limit: i32::try_from(limit).unwrap_or(i32::MAX),
             filters,
@@ -196,11 +192,7 @@ impl ExecutionPlan for S3VectorsQueryExec {
         "S3VectorsQueryExec"
     }
 
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.plan_properties
     }
 
@@ -635,13 +627,9 @@ mod tests {
             .expect("scan");
 
         // The plan should be a GlobalLimitExec -> UnionExec
-        let limit_plan = plan
-            .as_any()
-            .downcast_ref::<GlobalLimitExec>()
-            .expect("downcast");
+        let limit_plan = plan.downcast_ref::<GlobalLimitExec>().expect("downcast");
         let union_plan = limit_plan
             .input()
-            .as_any()
             .downcast_ref::<UnionExec>()
             .expect("downcast");
 
@@ -737,13 +725,9 @@ mod tests {
             .expect("scan");
 
         // The plan should be a GlobalLimitExec -> UnionExec
-        let limit_plan = plan
-            .as_any()
-            .downcast_ref::<GlobalLimitExec>()
-            .expect("downcast");
+        let limit_plan = plan.downcast_ref::<GlobalLimitExec>().expect("downcast");
         let union_plan = limit_plan
             .input()
-            .as_any()
             .downcast_ref::<UnionExec>()
             .expect("downcast");
 
@@ -816,7 +800,7 @@ mod tests {
             .expect("scan");
 
         // The plan should be S3VectorsQueryExec directly
-        assert!(plan.as_any().downcast_ref::<S3VectorsQueryExec>().is_some());
+        assert!(plan.downcast_ref::<S3VectorsQueryExec>().is_some());
 
         Ok(())
     }
@@ -897,7 +881,6 @@ mod tests {
 
         // The plan should be S3VectorsQueryExec with clamped limit
         let exec = plan
-            .as_any()
             .downcast_ref::<S3VectorsQueryExec>()
             .expect("should be S3VectorsQueryExec");
 
@@ -968,7 +951,6 @@ mod tests {
 
         // The plan should be S3VectorsQueryExec with the original limit
         let exec = plan
-            .as_any()
             .downcast_ref::<S3VectorsQueryExec>()
             .expect("should be S3VectorsQueryExec");
 
@@ -1039,7 +1021,6 @@ mod tests {
 
         // The plan should be S3VectorsQueryExec with the default limit
         let exec = plan
-            .as_any()
             .downcast_ref::<S3VectorsQueryExec>()
             .expect("should be S3VectorsQueryExec");
 

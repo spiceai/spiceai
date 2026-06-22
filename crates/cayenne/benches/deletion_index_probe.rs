@@ -70,7 +70,6 @@ fn bench_int64_probe(c: &mut Criterion) {
 
     let pk_array = build_int64_pk_column(ROWS_PER_BATCH);
     let pk_slice = pk_array.values();
-    let empty_inserts = DeletionIndex::empty();
 
     for ratio in DELETION_RATIOS {
         let index = build_int64_index(ROWS_PER_BATCH, ratio);
@@ -84,9 +83,9 @@ fn bench_int64_probe(c: &mut Criterion) {
                     for &pk in pk_slice.iter() {
                         let visible = match index.get(pk) {
                             None => true,
-                            Some(del_seq) => empty_inserts
-                                .get(pk)
-                                .is_some_and(|ins_seq| ins_seq > del_seq),
+                            Some(t) => t
+                                .insert_sequence
+                                .is_some_and(|ins_seq| ins_seq > t.delete_sequence),
                         };
                         keep += usize::from(visible);
                     }
@@ -124,7 +123,6 @@ fn bench_row_keys_probe(c: &mut Criterion) {
     group.throughput(Throughput::Elements(ROWS_PER_BATCH as u64));
 
     let row_keys = build_row_keys(ROWS_PER_BATCH);
-    let empty_inserts = KeyDeletionIndex::empty();
 
     for ratio in DELETION_RATIOS {
         let index = build_key_index(ROWS_PER_BATCH, ratio);
@@ -137,13 +135,85 @@ fn bench_row_keys_probe(c: &mut Criterion) {
                     for key in &row_keys {
                         let visible = match index.get(key.as_ref()) {
                             None => true,
-                            Some(del_seq) => empty_inserts
-                                .get(key.as_ref())
-                                .is_some_and(|ins_seq| ins_seq > del_seq),
+                            Some(t) => t
+                                .insert_sequence
+                                .is_some_and(|ins_seq| ins_seq > t.delete_sequence),
                         };
                         keep += usize::from(visible);
                     }
                     black_box(keep);
+                });
+            },
+        );
+    }
+    group.finish();
+}
+
+/// Old vs new composite deletion-filter probe shape.
+///
+/// `KeyBasedDeletionFilterExec` used to hash every row's PK key TWICE — a
+/// standalone bloom `might_contain` sweep, then a per-row `get` — before
+/// building the keep mask. Switching the exec to [`KeyDeletionIndex::get_batch`]
+/// hashes each key once (bloom sweep over the precomputed hashes, tier walk for
+/// survivors only). These two lanes isolate that change on the composite hot
+/// loop across deletion ratios.
+fn bench_row_keys_filter_modes(c: &mut Criterion) {
+    let mut group = c.benchmark_group("deletion_index_row_keys_filter_modes");
+    group.throughput(Throughput::Elements(ROWS_PER_BATCH as u64));
+
+    let row_keys = build_row_keys(ROWS_PER_BATCH);
+
+    for ratio in DELETION_RATIOS {
+        let index = build_key_index(ROWS_PER_BATCH, ratio);
+
+        // OLD: bloom `might_contain` sweep (one hash/row) + per-row `get`
+        // (a second hash/row).
+        group.bench_with_input(
+            BenchmarkId::new("sweep_plus_get", format!("ratio={ratio}")),
+            &ratio,
+            |b, _| {
+                b.iter(|| {
+                    let mut maybe = 0_usize;
+                    for key in &row_keys {
+                        if index.might_contain(key.as_ref()) {
+                            maybe += 1;
+                        }
+                    }
+                    let mut keep = 0_usize;
+                    if maybe == 0 {
+                        keep = row_keys.len();
+                    } else {
+                        for key in &row_keys {
+                            let visible = match index.get(key.as_ref()) {
+                                None => true,
+                                Some(t) => t
+                                    .insert_sequence
+                                    .is_some_and(|ins_seq| ins_seq > t.delete_sequence),
+                            };
+                            keep += usize::from(visible);
+                        }
+                    }
+                    black_box((maybe, keep));
+                });
+            },
+        );
+
+        // NEW: `get_batch` — one hash/row, bloom-gated tier walk for survivors.
+        group.bench_with_input(
+            BenchmarkId::new("get_batch", format!("ratio={ratio}")),
+            &ratio,
+            |b, _| {
+                b.iter(|| {
+                    let mut deleted = 0_usize;
+                    index.get_batch(row_keys.iter().map(AsRef::as_ref), |_, t| {
+                        let visible = t
+                            .insert_sequence
+                            .is_some_and(|ins_seq| ins_seq > t.delete_sequence);
+                        if !visible {
+                            deleted += 1;
+                        }
+                    });
+                    black_box(deleted);
                 });
             },
         );
@@ -236,7 +306,7 @@ fn bench_extend_max_at_growing_cache_sizes(c: &mut Criterion) {
                 // every iteration takes the Vacant branch. (If we extended
                 // with an existing key, the Occupied branch would short-
                 // circuit and obscure the new-key bloom-insert work.)
-                let next = base.extend_max([((n as i64) + 1, 2)]);
+                let next = base.extend_max_deletes([((n as i64) + 1, 2)]);
                 black_box(next);
             });
         });
@@ -267,7 +337,7 @@ fn bench_extend_max_cumulative_from_empty(c: &mut Criterion) {
                 // stays roughly flat.
                 let mut idx = DeletionIndex::empty();
                 for i in 0..total as i64 {
-                    idx = idx.extend_max([(i, 1)]);
+                    idx = idx.extend_max_deletes([(i, 1)]);
                 }
                 black_box(idx);
             });
@@ -277,12 +347,76 @@ fn bench_extend_max_cumulative_from_empty(c: &mut Criterion) {
     group.finish();
 }
 
+/// Rank-1 protected-scan probe regression (bake #11326).
+///
+/// In CH-bench HTAP the CDC data lives in protected snapshots, scanned with
+/// `min_delete_seq = Some(S)`. The bake guards the global-bloom fast-reject
+/// behind `min_delete_seq.is_none()`, so a protected probe SKIPS the one-shot
+/// global-bloom miss->done and instead walks every frozen run per row — even for
+/// rows with NO applicable tombstone (the common scan case). This A/Bs the two
+/// probe shapes on a multi-run index, probing keys that are never deleted:
+///   - `get` (None)             -> global-bloom fast-reject (one hash + one bloom)
+///   - `get_with_min_seq(Some)`  -> per-run walk (N runs x per-run bloom)
+///
+/// A large `get_with_min_seq_protected_runwalk / get_none_global_bloom_fast_reject`
+/// ratio is the regression. The re-do (apply the global-bloom fast-reject to
+/// `Some(S)` too — a global miss means no tombstone in any run) should collapse it.
+fn bench_protected_probe_multirun(c: &mut Criterion) {
+    let mut group = c.benchmark_group("deletion_index_protected_probe_multirun");
+    group.throughput(Throughput::Elements(ROWS_PER_BATCH as u64));
+
+    // Multi-run index: chain extend_max_deletes in many batches with strictly
+    // increasing delete_seqs, so every frozen run carries a max_delete_seq above
+    // the probe cutoff (S=0) and must be walked. Deletions use EVEN keys.
+    let mut index = DeletionIndex::empty();
+    let mut seq = 1_i64;
+    for batch in 0..96_i64 {
+        let adds: Vec<(i64, i64)> = (0..1_024_i64)
+            .map(|i| {
+                let k = (batch * 1_024 + i) * 2;
+                let s = seq;
+                seq += 1;
+                (k, s)
+            })
+            .collect();
+        index = index.extend_max_deletes(adds);
+    }
+
+    // Odd keys are never deleted but lie inside the deleted-key range: a
+    // global-bloom miss for `None`; a full run-walk for `Some` (the common case).
+    let probe: Vec<i64> = (0..ROWS_PER_BATCH as i64).map(|i| i * 2 + 1).collect();
+
+    group.bench_function("get_none_global_bloom_fast_reject", |b| {
+        b.iter(|| {
+            let mut absent = 0_usize;
+            for &pk in &probe {
+                absent += usize::from(index.get(pk).is_none());
+            }
+            black_box(absent);
+        });
+    });
+
+    group.bench_function("get_with_min_seq_protected_runwalk", |b| {
+        b.iter(|| {
+            let mut absent = 0_usize;
+            for &pk in &probe {
+                absent += usize::from(index.get_with_min_seq(pk, Some(0)).is_none());
+            }
+            black_box(absent);
+        });
+    });
+
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_int64_probe,
     bench_row_keys_probe,
+    bench_row_keys_filter_modes,
     bench_concurrent_load_under_publish,
     bench_extend_max_at_growing_cache_sizes,
     bench_extend_max_cumulative_from_empty,
+    bench_protected_probe_multirun,
 );
 criterion_main!(benches);

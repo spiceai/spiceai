@@ -4,12 +4,12 @@ expression: sanitized_plan
 ---
 SchemaCastScanExec
   PartitionedUnionExec
-    CayenneAccelerationExec
+    CayenneAccelerationExec: snapshots_scanned=1, files_scanned=1
       BytesProcessedExec
         DataSourceExec: file_groups={1 group: [[<TEMP_PATH>/.vortex]]}, projection=[id, name, age, city, score], file_type=vortex
-    CayenneAccelerationExec
+    CayenneAccelerationExec: snapshots_scanned=1, files_scanned=1
       BytesProcessedExec
         DataSourceExec: file_groups={1 group: [[<TEMP_PATH>/.vortex]]}, projection=[id, name, age, city, score], file_type=vortex
-    CayenneAccelerationExec
+    CayenneAccelerationExec: snapshots_scanned=1, files_scanned=1
       BytesProcessedExec
         DataSourceExec: file_groups={1 group: [[<TEMP_PATH>/.vortex]]}, projection=[id, name, age, city, score], file_type=vortex

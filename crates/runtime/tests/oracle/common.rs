@@ -85,7 +85,7 @@ pub async fn start_oracle_docker_container(
         })
         .build()?
         // Average time to start container is 60s, we set longer timeout to ensure enough time for the container to start
-        .run(Some(Duration::from_secs(120)))
+        .run(Some(Duration::from_mins(2)))
         .await?;
 
     Ok(running_container)

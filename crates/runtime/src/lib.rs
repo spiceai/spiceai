@@ -20,6 +20,7 @@ use ::tools::SpiceModelTool;
 use ::tools::rename::with_name;
 use async_stream::stream;
 use datafusion_expr::Expr;
+use datafusion_proto::bytes::Serializeable;
 use init::scheduler::ScheduleRegistry;
 use spicepod::component::runtime::TelemetryConfig;
 use std::collections::HashSet;
@@ -47,7 +48,6 @@ use crate::{auth::EndpointAuth, dataconnector::DataConnector};
 use ::datafusion::error::DataFusionError;
 use ::datafusion::sql::{ResolvedTableReference, TableReference, sqlparser};
 use app::App;
-use datafusion_proto::bytes::Serializeable;
 
 use {crate::Error::FailedToStartClusterExecutor, crate::config::ClusterRole};
 
@@ -98,6 +98,7 @@ pub mod datasets_health_monitor;
 pub mod dataupdate;
 pub mod embeddings;
 pub mod execution_plan;
+pub mod executor_table;
 pub mod extension;
 pub mod federated_table;
 pub mod flight;
@@ -125,6 +126,7 @@ pub use runtime_parameters as parameters;
 pub mod podswatcher;
 pub mod request;
 mod scheduling;
+pub(crate) mod schema_evolution;
 pub mod search;
 pub mod secrets {
     pub use runtime_secrets::*;
@@ -508,7 +510,7 @@ const COMPONENTS_INITIAL_LOAD: &str = "components_initial_load";
 const CACHE_MAINTENANCE: &str = "cache_maintenance";
 
 /// How often [`Runtime::run_cache_maintenance`] drives moka housekeeping.
-const CACHE_MAINTENANCE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+const CACHE_MAINTENANCE_INTERVAL: std::time::Duration = std::time::Duration::from_mins(1);
 
 // Allow 30 seconds for tasks for graceful shutdown
 const RUNTIME_DEFAULT_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(30);
@@ -828,7 +830,7 @@ impl Runtime {
             if let Some(current_partitions) = prospective.get_mut(&table_ref) {
                 for partition_bytes in partitions {
                     let partition_expr =
-                        Expr::from_bytes_with_registry(partition_bytes, self.df.ctx.as_ref())
+                        Expr::from_bytes_with_ctx(partition_bytes, &self.df.ctx.task_ctx())
                             .map_err(|source| {
                                 Error::UnableToDeserializeClusterPartitionExpression {
                                     table: table_name.clone(),
@@ -845,9 +847,9 @@ impl Runtime {
                 .resolve(SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA);
             let current_partitions = prospective.entry(table_ref.clone()).or_default();
             for partition_bytes in partitions {
-                let partition_expr = ::datafusion_expr::Expr::from_bytes_with_registry(
+                let partition_expr = ::datafusion_expr::Expr::from_bytes_with_ctx(
                     partition_bytes,
-                    self.df.ctx.as_ref(),
+                    &self.df.ctx.task_ctx(),
                 )
                 .map_err(|source| {
                     Error::UnableToDeserializeClusterPartitionExpression {
@@ -1709,6 +1711,14 @@ impl Runtime {
         }
 
         self.status.mark_shutdown();
+
+        // Tell CDC sources to release their upstream resources NOW, before
+        // the connection-drain phase below: a Postgres replication connection
+        // holds a single-consumer slot, and releasing it at shutdown start
+        // (instead of at process exit) lets a replacement instance attach
+        // during a rolling deploy instead of retrying against "slot is
+        // active".
+        data_components::cdc::begin_shutdown();
 
         let shutdown_timeout: Duration = self.read_app().await.and_then(|app| {
             app.runtime.shutdown_timeout().unwrap_or_else(|err| {

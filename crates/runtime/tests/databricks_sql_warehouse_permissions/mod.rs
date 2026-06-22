@@ -44,7 +44,7 @@ use crate::{
 };
 
 /// 15 minutes — enough for a cold warehouse to wake up + run queries.
-const LOAD_TIMEOUT: Duration = Duration::from_secs(900);
+const LOAD_TIMEOUT: Duration = Duration::from_mins(15);
 
 fn env(name: &str) -> String {
     std::env::var(name).unwrap_or_else(|_| panic!("{name} is not set"))
