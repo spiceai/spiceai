@@ -25,7 +25,7 @@ runtime:
     cayenne_metastore_cache_mb: '1024'
     cayenne_metastore_mmap_mb: '4096'
   query:
-    target_partitions: 64
+    target_partitions: 48
   caching:
     sql_results:
       enabled: false
