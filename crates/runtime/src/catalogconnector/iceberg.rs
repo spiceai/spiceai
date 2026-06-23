@@ -30,9 +30,32 @@ use data_components::{
             hadoop::{HadoopCatalogBuilder, MetadataMode},
             rest::RestCatalog,
         },
-        provider::IcebergCatalogProvider,
+        provider::{CatalogTableWrapper, IcebergCatalogProvider},
     },
 };
+use datafusion::catalog::TableProvider;
+use datafusion::sql::TableReference;
+
+use crate::dataconnector::iceberg_cluster::IcebergClusterTableProvider;
+
+/// Builds the hook that makes catalog-sourced Iceberg scans serializable for
+/// distributed (Ballista) execution.
+///
+/// Each loaded table provider is wrapped in an [`IcebergClusterTableProvider`]
+/// keyed by its fully-qualified `catalog.schema.table` reference — mirroring the
+/// single-dataset Iceberg data connector, which wraps every dataset the same
+/// way. All three parts are qualified because a remote executor resolves the
+/// recipe's reference through `get_table_sync`, which needs the catalog and
+/// schema to locate this provider. In a single-node session the wrapper is a
+/// transparent pass-through, so non-distributed catalogs are unaffected.
+fn cluster_table_wrapper(catalog_name: &str) -> CatalogTableWrapper {
+    let catalog_name = catalog_name.to_string();
+    Arc::new(move |schema: &str, table: &str, provider| {
+        let table_ref =
+            TableReference::full(catalog_name.clone(), schema.to_string(), table.to_string());
+        Arc::new(IcebergClusterTableProvider::new(table_ref, provider)) as Arc<dyn TableProvider>
+    })
+}
 use iceberg::{CatalogBuilder, Namespace, NamespaceIdent, io::StorageFactory};
 use iceberg_catalog_rest::{
     REST_CATALOG_PROP_URI, RestCatalog as IcebergRestCatalog, RestCatalogBuilder,
@@ -115,6 +138,7 @@ impl IcebergCatalog {
         s3_credential_loader: Option<CustomAwsCredentialLoader>,
         catalog: &Catalog,
         catalog_id: &str,
+        table_wrapper: Option<CatalogTableWrapper>,
     ) -> super::Result<Arc<dyn RefreshableCatalogProvider>> {
         let operator = build_opendal_operator(catalog_id, &props).map_err(|e| {
             super::Error::InvalidConfiguration {
@@ -163,6 +187,7 @@ impl IcebergCatalog {
             Arc::new(hadoop_catalog),
             None,
             catalog.include.as_ref(),
+            table_wrapper,
         )
         .await
         .map_err(|e| super::Error::UnableToGetCatalogProvider {
@@ -321,6 +346,10 @@ impl CatalogConnector for IcebergCatalog {
             );
         };
 
+        // Wrap every catalog table so its scans serialize for distributed
+        // execution, mirroring the single-dataset Iceberg connector.
+        let table_wrapper = Some(cluster_table_wrapper(&catalog.name));
+
         let mut props = HashMap::new();
         for (key, value) in &self.params {
             if let Some(prop_vec) = map_param_name_to_iceberg_prop(key.as_str()) {
@@ -385,6 +414,7 @@ impl CatalogConnector for IcebergCatalog {
                 s3_credential_loader,
                 catalog,
                 &catalog_id,
+                table_wrapper,
             )
             .await;
         }
@@ -418,6 +448,7 @@ impl CatalogConnector for IcebergCatalog {
             Arc::new(catalog_client),
             namespace.map(|n| n.name().clone()),
             catalog.include.as_ref(),
+            table_wrapper,
         )
         .await
         .map_err(|e| super::Error::UnableToGetCatalogProvider {
