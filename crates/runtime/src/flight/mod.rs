@@ -16,6 +16,7 @@ limitations under the License.
 
 use crate::auth::EndpointAuth;
 use crate::datafusion::DataFusion;
+use crate::datafusion::app_context_extension::AppContextExtension;
 use crate::datafusion::error::{SpiceExternalError, find_datafusion_root};
 use crate::datafusion::query::{self, QueryBuilder};
 use crate::datafusion::sql_validator::validate_sql_query_read_only;
@@ -23,7 +24,7 @@ use crate::dataupdate::DataUpdateBroadcaster;
 use crate::opentelemetry::create_metrics_service;
 use crate::tls::TlsConfig;
 use crate::{Runtime, metrics as runtime_metrics};
-use app::App;
+use app::{App, spicepod::component::runtime::FlightIpcCompression};
 use arrow::array::RecordBatch;
 use arrow::datatypes::Schema;
 use arrow::ipc::writer::{CompressionContext, DictionaryTracker, IpcDataGenerator};
@@ -35,7 +36,7 @@ use arrow_flight::{
     FlightData, FlightDescriptor, FlightInfo, HandshakeRequest, HandshakeResponse, SchemaAsIpc,
     Ticket, flight_service_server::FlightServiceServer,
 };
-use arrow_ipc::writer::IpcWriteOptions;
+use arrow_ipc::{CompressionType, writer::IpcWriteOptions};
 use async_stream::try_stream;
 use bytes::Bytes;
 use cache::result::{CacheStatus, query::QueryResult};
@@ -272,14 +273,49 @@ impl Service {
             .run()
             .await
             .map_err(handle_query_error)?;
-        Ok(Self::query_result_to_flight_stream(query_result))
+        let context = RequestContext::current(AsyncMarker::new().await);
+        let ipc_write_options = Self::ipc_write_options_for_context(&context)?;
+        Ok(Self::query_result_to_flight_stream(
+            query_result,
+            ipc_write_options,
+        ))
+    }
+
+    pub(crate) fn ipc_write_options_for_context(
+        context: &RequestContext,
+    ) -> Result<IpcWriteOptions, Status> {
+        let ipc_compression = context
+            .extension::<AppContextExtension>()
+            .and_then(|app_ext| app_ext.app())
+            .and_then(|app| {
+                app.runtime
+                    .flight
+                    .as_ref()
+                    .map(|flight| flight.ipc_compression)
+            })
+            .unwrap_or_default();
+
+        Self::ipc_write_options(ipc_compression)
+    }
+
+    fn ipc_write_options(ipc_compression: FlightIpcCompression) -> Result<IpcWriteOptions, Status> {
+        let compression = match ipc_compression {
+            FlightIpcCompression::None => None,
+            FlightIpcCompression::Lz4Frame => Some(CompressionType::LZ4_FRAME),
+            FlightIpcCompression::Zstd => Some(CompressionType::ZSTD),
+        };
+
+        IpcWriteOptions::default()
+            .try_with_compression(compression)
+            .map_err(to_tonic_err)
     }
 
     fn query_result_to_flight_stream(
         query_result: QueryResult,
+        ipc_write_options: IpcWriteOptions,
     ) -> (BoxStream<'static, Result<FlightData, Status>>, CacheStatus) {
-        // Reuse the same options for all messages
-        let options = datafusion::arrow::ipc::writer::IpcWriteOptions::default();
+        // Reuse the same options for all messages.
+        let options = ipc_write_options;
         let raw_schema = query_result.data.schema();
 
         // Expand Utf8View → LargeUtf8 and BinaryView → LargeBinary so the

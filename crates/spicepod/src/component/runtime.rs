@@ -29,6 +29,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 const TASK_HISTORY_RETENTION_MINIMUM: u64 = 60; // 1 minute
+pub const DEFAULT_FLIGHT_ADAPTIVE_BATCH_SIZE_MAX: usize = 131_072;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 #[cfg_attr(feature = "schemars", derive(JsonSchema))]
@@ -485,6 +486,16 @@ pub struct McpConfig {
 pub struct Flight {
     pub max_message_size: Option<String>,
 
+    /// Controls how DataFusion execution batch size is selected for Flight `DoGet` result streams.
+    /// Defaults to adaptive sizing capped at 131072 rows per batch.
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub batch_size: FlightBatchSize,
+
+    /// Arrow IPC compression to use for Flight `DoGet` result batches.
+    /// Defaults to `none` for broad client compatibility.
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub ipc_compression: FlightIpcCompression,
+
     /// Whether to enable rate limiting on Flight `DoPut` (write) requests.
     /// Defaults to `true`. Set to `false` to disable write rate limiting for bulk ingest workloads.
     #[serde(default = "default_true")]
@@ -495,9 +506,40 @@ impl Default for Flight {
     fn default() -> Self {
         Self {
             max_message_size: None,
+            batch_size: FlightBatchSize::default(),
+            ipc_compression: FlightIpcCompression::default(),
             do_put_rate_limit_enabled: true,
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "schemars", derive(JsonSchema))]
+#[serde(deny_unknown_fields)]
+#[serde(rename_all = "snake_case", tag = "mode")]
+pub enum FlightBatchSize {
+    /// Use the session's configured DataFusion execution batch size.
+    Default,
+    /// Increase the batch size for large estimated Flight result sets, capped by `max`.
+    Adaptive { max: usize },
+}
+
+impl Default for FlightBatchSize {
+    fn default() -> Self {
+        Self::Adaptive {
+            max: DEFAULT_FLIGHT_ADAPTIVE_BATCH_SIZE_MAX,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "schemars", derive(JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum FlightIpcCompression {
+    #[default]
+    None,
+    Lz4Frame,
+    Zstd,
 }
 
 impl Flight {
