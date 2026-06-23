@@ -35,7 +35,7 @@ pub(crate) const HF_PARAMETERS: [ParameterSpec; HF_PARAM_LEN] = [
         .description("Customizes the transformation of OpenAI chat messages into a character stream for the model."),
     ParameterSpec::component("token").description("The Huggingface access token."),
     ParameterSpec::runtime("distributed_backend")
-        .description("Run the model tensor-parallel across multiple nodes. Set to 'ring' to pool the model over the `nodes` list; omit or 'none' for single-node."),
+        .description("Run the model tensor-parallel across multiple nodes. Set to 'ring' to pool the model over the `nodes` list (the 'ring' backend currently supports exactly 2 nodes); omit or 'none' for single-node."),
     ParameterSpec::runtime("node_rank")
         .description("This node's 0-indexed rank in the distributed `nodes` list. Rank 0 is the head and serves the API; other ranks are compute replicas."),
     ParameterSpec::runtime("nodes")

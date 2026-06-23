@@ -70,9 +70,9 @@ const LOCAL_LLM_MAX_SEQS: NonZeroUsize = NonZeroUsize::MIN.saturating_add(4);
 pub struct MistralLlama {
     pipeline: Arc<MistralRs>,
     counter: AtomicUsize,
-    /// Keeps the per-node `RING_CONFIG` temp file alive for the model's lifetime
-    /// when running distributed (ring) inference. `None` for single-node models.
-    #[allow(dead_code)]
+    /// RAII drop guard that keeps the per-node `RING_CONFIG` temp file alive for
+    /// the model's lifetime (its `Drop` deletes the file on model teardown).
+    /// `None` for single-node models. Never read directly.
     ring_config: Option<tempfile::TempPath>,
 }
 
@@ -112,6 +112,20 @@ struct RingConfigFile {
 /// builder API for rank/world size), so this MUST run before `load_model_from_hf`.
 /// Returns the temp-file guard, which must outlive the model.
 fn configure_ring_distributed(cfg: &DistributedConfig) -> Result<tempfile::TempPath> {
+    /// Map a ring rank to its TCP port (`RING_PORT_BASE + rank`), erroring rather
+    /// than silently truncating if it cannot fit in a `u16`.
+    fn ring_port(rank: usize) -> Result<u16> {
+        u16::try_from(rank)
+            .ok()
+            .and_then(|r| RING_PORT_BASE.checked_add(r))
+            .ok_or_else(|| ChatError::InvalidParamValueError {
+                param: "node_rank".to_string(),
+                message: format!(
+                    "rank {rank} cannot be mapped to a TCP port (base {RING_PORT_BASE} + rank overflows u16)"
+                ),
+            })
+    }
+
     match cfg.backend {
         DistributedBackend::Ring => {}
     }
@@ -142,8 +156,8 @@ fn configure_ring_distributed(cfg: &DistributedConfig) -> Result<tempfile::TempP
             Some(cfg.nodes[0].trim().to_string())
         },
         master_port: RING_MASTER_PORT,
-        port: RING_PORT_BASE + u16::try_from(rank).unwrap_or(0),
-        right_port: RING_PORT_BASE + u16::try_from(right).unwrap_or(0),
+        port: ring_port(rank)?,
+        right_port: ring_port(right)?,
         right_ip: Some(cfg.nodes[right].trim().to_string()),
         rank,
         world_size,
@@ -573,7 +587,14 @@ impl MistralLlama {
         // pipeline. The returned guard keeps the temp file alive for the model.
         let ring_config = match distributed {
             Some(cfg) => Some(configure_ring_distributed(&cfg)?),
-            None => None,
+            None => {
+                // Defensive: clear any `RING_CONFIG` left set by a prior distributed
+                // load in this process, so this single-node load can't accidentally
+                // run distributed.
+                // SAFETY: touched only during model init, before mistral.rs reads it.
+                unsafe { std::env::remove_var("RING_CONFIG") };
+                None
+            }
         };
 
         let pipeline = loader?

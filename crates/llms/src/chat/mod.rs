@@ -767,6 +767,11 @@ impl DistributedConfig {
                 self.node_rank
             ));
         }
+        if self.backend == DistributedBackend::Ring && world_size != 2 {
+            return Err(format!(
+                "the `ring` backend currently supports exactly 2 nodes (world_size = 2); got {world_size}. Use 2 nodes (or the future `nccl` backend for larger worlds)."
+            ));
+        }
         Ok(())
     }
 }
@@ -912,5 +917,40 @@ mod tests {
     fn extensionless_path_is_ignored() {
         let path = PathBuf::from("/m/no_extension_here");
         reject_unsafe_weight_formats(&[path], false).expect("no extension → no rejection");
+    }
+
+    fn ring_cfg(node_rank: usize, n: usize) -> DistributedConfig {
+        DistributedConfig {
+            backend: DistributedBackend::Ring,
+            node_rank,
+            nodes: (0..n).map(|i| format!("10.0.0.{i}")).collect(),
+        }
+    }
+
+    #[test]
+    fn validate_accepts_two_node_ring() {
+        ring_cfg(0, 2).validate().expect("2-node ring rank 0 is valid");
+        ring_cfg(1, 2).validate().expect("2-node ring rank 1 is valid");
+    }
+
+    #[test]
+    fn validate_rejects_fewer_than_two_nodes() {
+        assert!(ring_cfg(0, 1).validate().is_err());
+    }
+
+    #[test]
+    fn validate_rejects_non_power_of_two_world_size() {
+        assert!(ring_cfg(0, 3).validate().is_err());
+    }
+
+    #[test]
+    fn validate_rejects_rank_out_of_range() {
+        assert!(ring_cfg(2, 2).validate().is_err());
+    }
+
+    #[test]
+    fn validate_rejects_ring_world_size_other_than_two() {
+        // 4 is a power of two and the rank is in range, but `ring` only supports 2.
+        assert!(ring_cfg(0, 4).validate().is_err());
     }
 }
