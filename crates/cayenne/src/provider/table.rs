@@ -2427,6 +2427,12 @@ struct PendingMaintainedAggregateInsert {
     batches: Arc<Vec<RecordBatch>>,
 }
 
+struct PendingMaintainedAggregateDelete {
+    epoch: u64,
+    /// PK columns of the deleted rows, projected by name into `pk_columns` order.
+    pk_batch: RecordBatch,
+}
+
 /// One ordered unit of maintained-aggregate maintenance. The CDC write path
 /// enqueues these and the single per-table background applier drains them in
 /// strict visibility-epoch order (channel FIFO), so registry maintenance never
@@ -13352,50 +13358,27 @@ impl CayenneTableProvider {
             .await;
     }
 
-    /// Retract a CDC delete's rows from the maintained aggregates by primary
-    /// key. The per-PK index holds each deleted PK's contribution, so retraction
-    /// is O(deleted rows) with no CDC before-image. No-op without a PK index (the
-    /// delete path then relies on the legacy `mark_stale` bookkeeping) or for an
-    /// empty batch. CDC delete batches carry the SOURCE-schema column layout, so
-    /// the PK columns are projected by name into the registry's `pk_columns`
-    /// order before enqueuing (see [`Self::project_delete_pk_batch`]) — otherwise
-    /// the registry's index-position retraction would read the wrong columns.
-    /// Enqueues onto the ordered background applier rather than applying inline,
-    /// so retraction never blocks replication convergence; the applier retracts
-    /// in epoch order and fails safe to stale on error. The epoch is assigned
-    /// here, on the serialized write path, so the applier sees deltas in arrival
-    /// order.
-    async fn apply_maintained_aggregate_delete(&self, delete_rows: &RecordBatch) {
-        if self.maintained_aggregates.is_empty()
-            || !self.maintained_aggregates.supports_retraction()
-            || delete_rows.num_rows() == 0
-        {
+    /// Enqueue a maintained-aggregate DELETE retraction (prepared under
+    /// `mem_tier_publish_lock` by [`Self::append_to_mem_tier_inner`], so its
+    /// epoch was advanced atomically with the tombstone publish) onto the ordered
+    /// background applier. Enqueuing off the publish lock keeps retraction off the
+    /// CDC critical path; the applier retracts in epoch order and fails safe to
+    /// stale on error.
+    async fn apply_maintained_aggregate_delete_pending(
+        &self,
+        pending: Option<PendingMaintainedAggregateDelete>,
+    ) {
+        let Some(pending) = pending else {
             return;
-        }
+        };
         let Some(tx) = &self.maintained_aggregate_tx else {
             return;
         };
-        let pk_batch = match self.project_delete_pk_batch(delete_rows) {
-            Ok(Some(pk_batch)) => pk_batch,
-            // The PK can't be resolved from this delete batch (missing/null PK
-            // column); fall back to stale rather than retract the wrong keys.
-            Ok(None) => {
-                self.mark_maintained_aggregates_stale();
-                return;
-            }
-            Err(error) => {
-                self.mark_maintained_aggregates_stale();
-                tracing::warn!(
-                    table = %self.table_metadata.table_name,
-                    error = %error,
-                    "Failed to project maintained-aggregate delete PK columns; queries will fall back to base table scans"
-                );
-                return;
-            }
-        };
-        let epoch = self.next_maintained_aggregate_epoch();
         let _ = tx
-            .send(MaintainedAggregateApply::Delete { epoch, pk_batch })
+            .send(MaintainedAggregateApply::Delete {
+                epoch: pending.epoch,
+                pk_batch: pending.pk_batch,
+            })
             .await;
     }
 
@@ -15926,8 +15909,11 @@ impl CayenneTableProvider {
         // inline rows from scans. The hidden rows are subtracted by the
         // merge-on-read filter, not by count bookkeeping; the absorbed key
         // count is observable via the telemetry counter below.
+        // Retraction is handled INSIDE the append under `mem_tier_publish_lock`
+        // (the maintained-aggregate epoch is advanced atomically with the
+        // tombstone visibility), so pass the source-schema delete batch through.
         let epoch = match self
-            .append_to_mem_tier(Vec::new(), &deletions, incoming_bytes, 0)
+            .append_to_mem_tier_inner(Vec::new(), &deletions, incoming_bytes, 0, Some(delete_rows))
             .await
         {
             Ok(epoch) => epoch,
@@ -15937,10 +15923,6 @@ impl CayenneTableProvider {
             }
         };
         drop(write_guard);
-        // Maintained aggregates: retract the deleted rows by PK (off the write
-        // guard). With a per-PK index this is incremental; without one it is a
-        // no-op and the registry was already marked stale by the append path.
-        self.apply_maintained_aggregate_delete(delete_rows).await;
         record_cayenne_write_phase(self.table_name(), "cdc_path_inmemory", write_start);
         telemetry::track_cayenne_cdc_absorbed_delete_keys(
             key_count,
@@ -16020,6 +16002,26 @@ impl CayenneTableProvider {
         incoming_bytes: u64,
         superseded: u64,
     ) -> Result<u64> {
+        self.append_to_mem_tier_inner(batches, deletions, incoming_bytes, superseded, None)
+            .await
+    }
+
+    /// As [`Self::append_to_mem_tier`], plus maintained-aggregate DELETE
+    /// retraction. When `maintained_aggregate_delete_rows` is the source-schema
+    /// CDC delete batch, the retraction epoch is advanced and the retraction is
+    /// enqueued UNDER the same `mem_tier_publish_lock` that publishes the
+    /// tombstones — so a scan that observes the delete also observes the advanced
+    /// epoch, and the exact-epoch serve gate falls back to a base-table scan
+    /// (never serving a maintained aggregate that still counts the deleted rows)
+    /// until the background applier catches up.
+    async fn append_to_mem_tier_inner(
+        &self,
+        batches: Vec<RecordBatch>,
+        deletions: &OnConflictDeletions,
+        incoming_bytes: u64,
+        superseded: u64,
+        maintained_aggregate_delete_rows: Option<&RecordBatch>,
+    ) -> Result<u64> {
         let incoming_rows: u64 = batches
             .iter()
             .map(|b| b.num_rows() as u64)
@@ -16038,7 +16040,7 @@ impl CayenneTableProvider {
         // to sit while the lock was held.
         let mut tombstones = self.prepare_segment_tombstones(deletions);
 
-        let (epoch, maintained_aggregate_insert) = {
+        let (epoch, maintained_aggregate_insert, maintained_aggregate_delete) = {
             // Publish the RAM swap under the dedicated `mem_tier_publish_lock`,
             // DECOUPLED from the listing fence. The mem-tier is an `ArcSwap`, so a
             // concurrent scan still captures either the pre- or post-swap tier
@@ -16180,7 +16182,34 @@ impl CayenneTableProvider {
                 self.mark_maintained_aggregates_stale();
                 None
             };
-            (epoch, maintained_aggregate_insert)
+            // Maintained-aggregate DELETE retraction, UNDER this publish lock so
+            // the epoch advances atomically with the tombstone visibility: a scan
+            // that observes the delete also observes the advanced epoch, and the
+            // exact-epoch serve gate falls back to a base scan until the applier
+            // catches up (never serving an aggregate that still counts the rows).
+            let retraction_rows = maintained_aggregate_delete_rows
+                .filter(|_| self.maintained_aggregates.supports_retraction());
+            let maintained_aggregate_delete = match retraction_rows
+                .map(|delete_rows| self.project_delete_pk_batch(delete_rows))
+            {
+                Some(Ok(Some(pk_batch))) => Some(PendingMaintainedAggregateDelete {
+                    epoch: self.next_maintained_aggregate_epoch(),
+                    pk_batch,
+                }),
+                // A delete batch whose PK cannot be resolved cannot be retracted,
+                // so fail safe to stale (also under this lock). `None` = no delete
+                // rows / no retraction support.
+                Some(Ok(None) | Err(_)) => {
+                    self.mark_maintained_aggregates_stale();
+                    None
+                }
+                None => None,
+            };
+            (
+                epoch,
+                maintained_aggregate_insert,
+                maintained_aggregate_delete,
+            )
         };
 
         // Net the live row count by the superseded rows, exactly like the durable
@@ -16190,6 +16219,8 @@ impl CayenneTableProvider {
         self.inlined_row_count.fetch_add(net, Ordering::Relaxed);
 
         self.apply_maintained_aggregate_insert_batches(maintained_aggregate_insert)
+            .await;
+        self.apply_maintained_aggregate_delete_pending(maintained_aggregate_delete)
             .await;
 
         Ok(epoch)
