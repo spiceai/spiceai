@@ -70,24 +70,10 @@ use crate::provider::scan::{
 };
 use crate::provider::sink::CayenneDataSink;
 use crate::provider::{Error, Result};
-use arrow::array::{
-    Array, ArrayRef, BinaryArray, BinaryViewArray, BooleanArray, Date32Array, Date64Array,
-    Decimal128Array, FixedSizeBinaryArray, Float32Array, Float64Array, Int8Array, Int16Array,
-    Int32Array, Int64Array, LargeBinaryArray, LargeStringArray, StringArray, StringViewArray,
-    Time32MillisecondArray, Time32SecondArray, Time64MicrosecondArray, Time64NanosecondArray,
-    TimestampMicrosecondArray, TimestampMillisecondArray, TimestampNanosecondArray,
-    TimestampSecondArray, UInt8Array, UInt16Array, UInt32Array, UInt64Array,
-};
-use arrow::compute::kernels::aggregate;
-use arrow::datatypes::{
-    Date32Type, Date64Type, Decimal128Type, Int8Type, Int16Type, Int32Type, Int64Type,
-    Time32MillisecondType, Time32SecondType, Time64MicrosecondType, Time64NanosecondType,
-    TimestampMicrosecondType, TimestampMillisecondType, TimestampNanosecondType,
-    TimestampSecondType, UInt8Type, UInt16Type, UInt32Type, UInt64Type,
-};
+use arrow::array::{Array, ArrayRef, BinaryArray, Int64Array};
 use arrow::record_batch::RecordBatch;
 use arrow_row::{OwnedRow, RowConverter, SortField};
-use arrow_schema::{DataType, Field, SchemaBuilder, SchemaRef, TimeUnit};
+use arrow_schema::{DataType, Field, SchemaBuilder, SchemaRef};
 use arrow_tools::schema_evolution::{EvolutionContext, SchemaEvolution, WideningPlan, classify};
 use async_trait::async_trait;
 use data_components::delete::{DeletionExec, DeletionSink};
@@ -124,6 +110,7 @@ use datafusion_physical_expr::execution_props::ExecutionProps;
 use datafusion_physical_expr::expressions::Column;
 use datafusion_physical_expr::{PhysicalExpr, create_lex_ordering, create_physical_expr};
 use datafusion_physical_plan::ExecutionPlan;
+use datafusion_physical_plan::SendableRecordBatchStream;
 use datafusion_physical_plan::coalesce_partitions::CoalescePartitionsExec;
 use datafusion_physical_plan::collect;
 use datafusion_physical_plan::empty::EmptyExec;
@@ -131,21 +118,17 @@ use datafusion_physical_plan::filter::FilterExec;
 use datafusion_physical_plan::limit::{GlobalLimitExec, LocalLimitExec};
 use datafusion_physical_plan::projection::ProjectionExec;
 use datafusion_physical_plan::union::UnionExec;
-use datafusion_physical_plan::{RecordBatchStream, SendableRecordBatchStream};
 use datafusion_table_providers::util::on_conflict::OnConflict;
 use futures::{Stream, StreamExt, TryStreamExt, stream};
 use object_store::{ObjectMeta, ObjectStore, ObjectStoreExt, path::Path as ObjectStorePath};
 use parking_lot::{Mutex as ParkingMutex, RwLock};
 use roaring::RoaringBitmap;
 use std::borrow::Cow;
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
-use std::pin::Pin;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering};
-use std::task::{Context, Poll};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime};
 use tokio::task;
-use vortex::dtype::arrow::FromArrowType;
 use vortex_datafusion::VortexFormat;
 use vortex_datafusion::WriteShardConfig;
 
@@ -10280,7 +10263,7 @@ impl CayenneTableProvider {
                     0
                 }
             };
-            sized_candidates.push((snapshot_id.to_string(), *threshold, bytes));
+            sized_candidates.push((snapshot_id.clone(), *threshold, bytes));
         }
         let sizing_ms = sizing_start.elapsed().as_millis();
 
@@ -10819,7 +10802,7 @@ impl CayenneTableProvider {
                 // [resurrect-critical: `threshold` is the true commit-seq of every
                 // row here, so T is never understated.]
                 cutoff = cutoff.max(threshold);
-                selected.push((id.to_string(), threshold));
+                selected.push((id.clone(), threshold));
                 continue;
             }
             // T accumulates the highest per-file max_sequence over the selected
@@ -10827,7 +10810,7 @@ impl CayenneTableProvider {
             for f in &files {
                 cutoff = cutoff.max(f.max_sequence);
             }
-            selected.push((id.to_string(), threshold));
+            selected.push((id.clone(), threshold));
         }
 
         if selected.len() < 2 {

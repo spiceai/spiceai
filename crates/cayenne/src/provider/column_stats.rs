@@ -20,7 +20,7 @@ limitations under the License.
 //! how a stats persist adjusts the table's live `num_rows`.
 
 use arrow::array::{
-    Array, BinaryArray, BinaryViewArray, BooleanArray, Date32Array, Date64Array, Decimal128Array,
+    BinaryArray, BinaryViewArray, BooleanArray, Date32Array, Date64Array, Decimal128Array,
     FixedSizeBinaryArray, Float32Array, Float64Array, Int8Array, Int16Array, Int32Array,
     Int64Array, LargeBinaryArray, LargeStringArray, StringArray, StringViewArray,
     Time32MillisecondArray, Time32SecondArray, Time64MicrosecondArray, Time64NanosecondArray,

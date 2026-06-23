@@ -21,130 +21,35 @@ limitations under the License.
 //! ([`TombstoneDelta`], [`PendingTombstoneDeltas`]), and the protected-snapshot
 //! scan/update plumbing. The provider drives these from its insert/delete path.
 
-use super::column_stats::{ColumnStatsAccumulator, RowCountUpdate};
-use super::constants::{STAGING_DIR_NAME, STAGING_WAL_FILENAME, STAGING_WAL_TMP_FILENAME};
-use super::delete::{
-    CayenneDeletionSink, DeletionIdentifier, DeletionVectorWriteResult, DeletionVectorWriteSpec,
-    DeletionVectorWriter, FileBasedDeletionSink, InsertRecordHandling, Int64PkDeletionFilterExec,
-    KeyBasedDeletionFilterExec,
-};
-use super::inlined_cache::{InlinedCache, InlinedDurableCommit, InlinedViewEntry};
-use super::maintenance::{
-    BoundedWarningKeys, PostWriteMaintenance, PostWriteMaintenanceState, RetentionFailureAction,
-    SnapshotMaintenanceTrigger, duration_millis_saturating, protected_snapshot_maintenance_trigger,
-};
-use super::manifest::{ManifestSequenceTag, SeqPrefixPlan};
-use super::mutation_writer::AppendMutationWriter;
-use super::pk_index::{
-    CachedPkIndex, CachedPkKeyset, PK_INDEX_PERSIST_MAX_BYTES, PkBloom, PkExistenceRef,
-    RowLocation, approx_captured_file_bytes, approx_pk_keyset_entry_bytes,
-    deserialize_pk_bloom_sidecar, serialize_pk_bloom_sidecar,
-};
-use super::streaming::StreamingExec;
-use crate::catalog::{CatalogError, CatalogResult, MetadataCatalog, SnapshotSequenceCommit};
-use crate::maintained_aggregate::{MaintainedAggregateRegistry, MaintainedAggregateSpec};
-use crate::metadata::{
-    CreateTableOptions, InlinedData, InlinedDataStats, InlinedDelete, PkConflictDetection,
-    SnapshotFile, SnapshotFileStatistics, TableMetadata, TableStatistics,
-};
-use crate::provider::scan::{
-    CayenneAccelerationExec, SnapshotScanRef, round_robin_repartition_if_needed,
-};
-use crate::provider::sink::CayenneDataSink;
-use crate::provider::{Error, Result};
-use arrow::array::{
-    Array, ArrayRef, BinaryArray, BinaryViewArray, BooleanArray, Date32Array, Date64Array,
-    Decimal128Array, FixedSizeBinaryArray, Float32Array, Float64Array, Int8Array, Int16Array,
-    Int32Array, Int64Array, LargeBinaryArray, LargeStringArray, StringArray, StringViewArray,
-    Time32MillisecondArray, Time32SecondArray, Time64MicrosecondArray, Time64NanosecondArray,
-    TimestampMicrosecondArray, TimestampMillisecondArray, TimestampNanosecondArray,
-    TimestampSecondArray, UInt8Array, UInt16Array, UInt32Array, UInt64Array,
-};
-use arrow::compute::kernels::aggregate;
-use arrow::datatypes::{
-    Date32Type, Date64Type, Decimal128Type, Int8Type, Int16Type, Int32Type, Int64Type,
-    Time32MillisecondType, Time32SecondType, Time64MicrosecondType, Time64NanosecondType,
-    TimestampMicrosecondType, TimestampMillisecondType, TimestampNanosecondType,
-    TimestampSecondType, UInt8Type, UInt16Type, UInt32Type, UInt64Type,
-};
+use super::delete::CayenneDeletionSink;
+use super::pk_index::{CachedPkIndex, PkExistenceRef};
+use crate::metadata::InlinedData;
+
 use arrow::record_batch::RecordBatch;
-use arrow_row::{OwnedRow, RowConverter, SortField};
-use arrow_schema::{DataType, Field, SchemaBuilder, SchemaRef, TimeUnit};
-use arrow_tools::schema_evolution::{EvolutionContext, SchemaEvolution, WideningPlan, classify};
+use arrow_row::{OwnedRow, RowConverter};
+use arrow_schema::SchemaRef;
 use async_trait::async_trait;
-use data_components::delete::{DeletionExec, DeletionSink};
-use datafusion::datasource::file_format::FileFormat;
-use datafusion::datasource::listing::{
-    ListingOptions, ListingTable, ListingTableConfig, ListingTableUrl,
-    helpers::{expr_applicable_for_cols, pruned_partition_list},
-};
-use datafusion::datasource::sink::DataSinkExec;
-use datafusion::execution::context::SessionContext;
-use datafusion::execution::runtime_env::RuntimeEnv;
-use datafusion::optimizer::analyzer::type_coercion::TypeCoercionRewriter;
-use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+use data_components::delete::DeletionSink;
 use datafusion_catalog::{Session, TableProvider};
-use datafusion_common::stats::Precision as DFPrecision;
-use datafusion_common::tree_node::TreeNode;
-use datafusion_common::{
-    ColumnStatistics, Constraints, DFSchema, Result as DataFusionResult, ScalarValue, Statistics,
-    project_schema,
-};
-use datafusion_datasource::file_groups::FileGroup;
-use datafusion_datasource::file_scan_config::{FileScanConfig, FileScanConfigBuilder};
-use datafusion_datasource::{PartitionedFile, TableSchema, compute_all_files_statistics};
-use datafusion_execution::cache::TableScopedPath;
-use datafusion_execution::cache::cache_manager::{
-    CachedFileList, CachedFileMetadata, FileStatisticsCache,
-};
-use datafusion_execution::cache::file_statistics_cache::DefaultFileStatisticsCache;
-use datafusion_execution::config::SessionConfig;
-use datafusion_expr::dml::InsertOp;
-use datafusion_expr::utils::conjunction;
-use datafusion_expr::{Expr, LogicalPlan, Operator, TableProviderFilterPushDown, TableType};
-use datafusion_physical_expr::execution_props::ExecutionProps;
-use datafusion_physical_expr::expressions::Column;
-use datafusion_physical_expr::{PhysicalExpr, create_lex_ordering, create_physical_expr};
-use datafusion_physical_plan::ExecutionPlan;
-use datafusion_physical_plan::coalesce_partitions::CoalescePartitionsExec;
-use datafusion_physical_plan::collect;
-use datafusion_physical_plan::empty::EmptyExec;
-use datafusion_physical_plan::filter::FilterExec;
-use datafusion_physical_plan::limit::{GlobalLimitExec, LocalLimitExec};
-use datafusion_physical_plan::projection::ProjectionExec;
-use datafusion_physical_plan::union::UnionExec;
+use datafusion_expr::Expr;
 use datafusion_physical_plan::{RecordBatchStream, SendableRecordBatchStream};
 use datafusion_table_providers::util::on_conflict::OnConflict;
-use futures::{Stream, StreamExt, TryStreamExt, stream};
-use object_store::{ObjectMeta, ObjectStore, ObjectStoreExt, path::Path as ObjectStorePath};
-use parking_lot::{Mutex as ParkingMutex, RwLock};
-use roaring::RoaringBitmap;
-use std::borrow::Cow;
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use futures::{Stream, StreamExt};
+use parking_lot::Mutex as ParkingMutex;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering};
 use std::task::{Context, Poll};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use tokio::task;
-use vortex::dtype::arrow::FromArrowType;
-use vortex_datafusion::VortexFormat;
-use vortex_datafusion::WriteShardConfig;
+use std::time::Instant;
 
-use super::context::CayenneContext;
 use super::deletion_index::{DeletionIndex, KeyDeletionIndex};
 use super::deletion_strategy::{
-    Int64PkDeletionSnapshot, PkDeletionStrategy, PkDeletionStrategyWithCache, PositionBitmap,
-    PositionDeletionVector, RowConverterDeletionSnapshot,
+    Int64PkDeletionSnapshot, PkDeletionStrategyWithCache, RowConverterDeletionSnapshot,
 };
-use super::memory_account::CayenneMemoryAccount;
-use super::staging_wal::PreparedStagedAppend;
 use super::table::{
     CayenneTableProvider, InlinedDeletionMaps, OnConflictExt, UpsertOptions,
     record_cayenne_write_phase,
 };
-use super::vortex_format::PositionDeletionAccessPlanProvider;
-use arc_swap::ArcSwap;
 
 pub(crate) struct PreparedOnConflictDeletionPublish {
     pub(crate) target_snapshot_id: String,
