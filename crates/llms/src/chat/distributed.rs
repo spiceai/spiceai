@@ -98,7 +98,9 @@ impl DistributedConfig {
         if self.backend == DistributedBackend::Ring && world_size != 2 {
             return Err((
                 "nodes",
-                format!("the `ring` backend currently supports exactly 2 nodes (world_size = 2); got {world_size}. Use 2 nodes (or the future `nccl` backend for larger worlds)."),
+                format!(
+                    "the `ring` backend currently supports exactly 2 nodes (world_size = 2); got {world_size}. Use 2 nodes (or the future `nccl` backend for larger worlds)."
+                ),
             ));
         }
         Ok(())
