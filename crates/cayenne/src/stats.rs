@@ -163,6 +163,23 @@ pub(crate) fn column_stats_to_stats_set(cs: &ColumnStatistics) -> StatsSet {
         stats.set(Stat::Max, precision);
     }
 
+    // Persist the column sum so whole-table `SUM`/`AVG` can be answered from
+    // metadata. The value is already widened to the sum dtype by
+    // `compute_column_sum` (signed -> Int64, unsigned -> UInt64, float ->
+    // Float64), matching `Sum::return_dtype` so it round-trips through
+    // `stats_set_to_column_stats`. Cross-batch/cross-file combination is handled
+    // additively by Vortex's `StatsSet::merge_unordered` (`merge_sum`).
+    if let Some(sv) = cs.sum_value.get_value()
+        && let Some(vortex_sv) = df_scalar_to_vortex(sv)
+    {
+        let precision = if cs.sum_value.is_exact().is_some() {
+            VortexPrecision::Exact(vortex_sv)
+        } else {
+            VortexPrecision::Inexact(vortex_sv)
+        };
+        stats.set(Stat::Sum, precision);
+    }
+
     if let Some(count) = cs.null_count.get_value() {
         // `usize -> u64` is lossless on all currently supported targets
         // (cayenne requires \u2265 64-bit pointers per project policy), but use
@@ -207,11 +224,22 @@ pub(crate) fn stats_set_to_column_stats(stats: &StatsSet, dtype: &DType) -> Colu
             .and_then(|count| usize::try_from(count).ok()),
     );
 
+    // `Stat::Sum` is stored in the sum's widened dtype (signed -> I64,
+    // unsigned -> U64, float -> F64; see `Sum::return_dtype`), and
+    // `vortex_stat_to_df` reconstructs that via `Stat::Sum.dtype(dtype)`. This
+    // lets the metadata-only `SUM`/`AVG` fold (`crate::stats_aggregate`) answer
+    // whole-table sums without a scan.
+    let sum_value = vortex_precision_to_df(
+        stats
+            .get(Stat::Sum)
+            .and_then(|v| vortex_stat_to_df(&v, Stat::Sum, dtype)),
+    );
+
     ColumnStatistics {
         null_count,
         max_value,
         min_value,
-        sum_value: Precision::Absent,
+        sum_value,
         distinct_count: Precision::Absent,
         byte_size: Precision::Absent,
     }
@@ -468,6 +496,69 @@ mod tests {
         assert_eq!(
             col.max_value,
             DfPrecision::Exact(ScalarValue::Int64(Some(30)))
+        );
+    }
+
+    #[test]
+    fn sum_roundtrips_through_file_statistics() {
+        let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, true)]));
+        let cs = ColumnStatistics {
+            null_count: DfPrecision::Exact(0),
+            min_value: DfPrecision::Exact(ScalarValue::Int64(Some(1))),
+            max_value: DfPrecision::Exact(ScalarValue::Int64(Some(3))),
+            sum_value: DfPrecision::Exact(ScalarValue::Int64(Some(6))),
+            distinct_count: DfPrecision::Absent,
+            byte_size: DfPrecision::Absent,
+        };
+        let set = column_stats_to_stats_set(&cs);
+        assert!(
+            matches!(set.get(Stat::Sum), VortexPrecision::Exact(_)),
+            "sum present in StatsSet"
+        );
+
+        let file_stats = build_file_statistics(vec![set], &schema);
+        let bytes = serialize_file_statistics(&file_stats).expect("serialize ok");
+        let rt = deserialize_file_statistics(&bytes, &schema).expect("deserialize ok");
+
+        let df = file_statistics_to_df(&rt, 3);
+        assert_eq!(
+            df.column_statistics[0].sum_value,
+            DfPrecision::Exact(ScalarValue::Int64(Some(6))),
+            "exact sum must survive the metastore blob roundtrip"
+        );
+    }
+
+    #[test]
+    fn serialized_statistics_merge_adds_sum_across_writes() {
+        let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, true)]));
+        let mk_sum = |sum: i64| ColumnStatistics {
+            null_count: DfPrecision::Exact(0),
+            min_value: DfPrecision::Absent,
+            max_value: DfPrecision::Absent,
+            sum_value: DfPrecision::Exact(ScalarValue::Int64(Some(sum))),
+            distinct_count: DfPrecision::Absent,
+            byte_size: DfPrecision::Absent,
+        };
+        let first_set = column_stats_to_stats_set(&mk_sum(60));
+        let second_set = column_stats_to_stats_set(&mk_sum(30));
+        let first_blob =
+            serialize_file_statistics(&build_file_statistics(vec![first_set], &schema))
+                .expect("serialize ok");
+        let dtypes = vec![DType::from_arrow((
+            schema.field(0).data_type(),
+            Nullability::Nullable,
+        ))];
+
+        let merged_blob = merge_serialized_stats(&first_blob, &[second_set], &dtypes, &schema)
+            .expect("statistics should merge");
+        let merged =
+            deserialize_file_statistics(&merged_blob, &schema).expect("deserialize ok");
+
+        let df = file_statistics_to_df(&merged, 9);
+        assert_eq!(
+            df.column_statistics[0].sum_value,
+            DfPrecision::Exact(ScalarValue::Int64(Some(90))),
+            "sums must add additively across writes/files (Vortex merge_sum)"
         );
     }
 }

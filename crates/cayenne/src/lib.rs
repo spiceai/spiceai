@@ -74,6 +74,7 @@ pub(crate) mod partition_creator;
 pub mod provider;
 pub(crate) mod schema;
 pub mod stats;
+pub mod stats_aggregate;
 
 pub use catalog::MetadataCatalog;
 pub use catalog::{CatalogError, CatalogResult};
