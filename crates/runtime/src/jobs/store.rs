@@ -307,13 +307,14 @@ impl JobStore {
 
                 chunk_indices.push(chunk_index);
                 chunk_row_offsets.push(committed_rows);
-                committed_rows = committed_rows.checked_add(current_chunk_rows).ok_or_else(
-                    || super::error::Error::IntegerOverflow {
-                        field: "chunk_row_offset".to_string(),
-                        left_value: committed_rows,
-                        right_value: current_chunk_rows,
-                    },
-                )?;
+                committed_rows =
+                    committed_rows
+                        .checked_add(current_chunk_rows)
+                        .ok_or_else(|| super::error::Error::IntegerOverflow {
+                            field: "chunk_row_offset".to_string(),
+                            left_value: committed_rows,
+                            right_value: current_chunk_rows,
+                        })?;
                 chunk_index = chunk_index.checked_add(1).ok_or_else(|| {
                     super::error::Error::IntegerOverflow {
                         field: "chunk_index".to_string(),
