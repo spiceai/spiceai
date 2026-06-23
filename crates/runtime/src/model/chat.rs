@@ -398,8 +398,8 @@ fn parse_distributed_config(
     };
     config
         .validate()
-        .map_err(|message| LlmError::InvalidParamValueError {
-            param: "nodes".to_string(),
+        .map_err(|(param, message)| LlmError::InvalidParamValueError {
+            param: param.to_string(),
             message,
         })?;
     Ok(Some(config))

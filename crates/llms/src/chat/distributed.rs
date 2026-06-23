@@ -67,30 +67,38 @@ impl DistributedConfig {
         self.nodes.len()
     }
 
-    /// Validate the topology, returning a human-readable message on failure.
+    /// Validate the topology. On failure, returns the offending param name
+    /// (`"nodes"` or `"node_rank"`) alongside a human-readable message, so the
+    /// caller can attribute the error to the field the user actually set wrong.
     /// mistral.rs additionally requires the world size to divide the model's
     /// attention/kv head counts; that is enforced when the model loads.
-    pub fn validate(&self) -> std::result::Result<(), String> {
+    pub fn validate(&self) -> std::result::Result<(), (&'static str, String)> {
         let world_size = self.world_size();
         if world_size < 2 {
-            return Err(format!(
-                "distributed inference needs at least 2 nodes; `nodes` lists {world_size}"
+            return Err((
+                "nodes",
+                format!("distributed inference needs at least 2 nodes; `nodes` lists {world_size}"),
             ));
         }
         if !world_size.is_power_of_two() {
-            return Err(format!(
-                "world size (number of `nodes`) must be a power of 2; got {world_size}"
+            return Err((
+                "nodes",
+                format!("world size (number of `nodes`) must be a power of 2; got {world_size}"),
             ));
         }
         if self.node_rank >= world_size {
-            return Err(format!(
-                "`node_rank` {} is out of range for world size {world_size} (valid: 0..{world_size})",
-                self.node_rank
+            return Err((
+                "node_rank",
+                format!(
+                    "`node_rank` {} is out of range for world size {world_size} (valid: 0..{world_size})",
+                    self.node_rank
+                ),
             ));
         }
         if self.backend == DistributedBackend::Ring && world_size != 2 {
-            return Err(format!(
-                "the `ring` backend currently supports exactly 2 nodes (world_size = 2); got {world_size}. Use 2 nodes (or the future `nccl` backend for larger worlds)."
+            return Err((
+                "nodes",
+                format!("the `ring` backend currently supports exactly 2 nodes (world_size = 2); got {world_size}. Use 2 nodes (or the future `nccl` backend for larger worlds)."),
             ));
         }
         Ok(())
@@ -115,9 +123,9 @@ pub(crate) fn configure_ring_distributed(
         });
     }
 
-    if let Err(message) = cfg.validate() {
+    if let Err((param, message)) = cfg.validate() {
         return Err(ChatError::InvalidParamValueError {
-            param: "nodes".to_string(),
+            param: param.to_string(),
             message,
         });
     }
@@ -228,7 +236,11 @@ mod tests {
 
     #[test]
     fn validate_rejects_rank_out_of_range() {
-        assert!(ring_cfg(2, 2).validate().is_err());
+        let err = ring_cfg(2, 2)
+            .validate()
+            .expect_err("rank 2 is out of range for world size 2");
+        // The error must be attributed to `node_rank`, not `nodes`.
+        assert_eq!(err.0, "node_rank");
     }
 
     #[test]

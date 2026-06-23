@@ -53,7 +53,9 @@ use async_openai::{
 pub mod mistral;
 pub mod nsql;
 #[cfg(feature = "local_llm")]
-use crate::chat::distributed::{DistributedConfig, configure_ring_distributed};
+use crate::chat::distributed::configure_ring_distributed;
+#[cfg(feature = "local_llm")]
+pub use crate::chat::distributed::{DistributedBackend, DistributedConfig};
 use crate::streaming_utils::generate_stream_id;
 #[cfg(feature = "local_llm")]
 use indexmap::IndexMap;
