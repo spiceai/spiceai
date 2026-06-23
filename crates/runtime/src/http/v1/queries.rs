@@ -1181,7 +1181,8 @@ mod tests {
         use arrow::datatypes::{DataType, Field, Schema};
 
         let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
-        let values: Vec<i32> = (0..num_rows as i32).collect();
+        let row_count = i32::try_from(num_rows).expect("row count should fit in i32");
+        let values: Vec<i32> = (0..row_count).collect();
         arrow::array::RecordBatch::try_new(schema, vec![Arc::new(Int32Array::from(values))])
             .expect("to create batch")
     }
