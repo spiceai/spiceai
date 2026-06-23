@@ -20,7 +20,7 @@ pub(super) mod postgres_wal;
 
 /// Acceleration `params` to attach for a CDC dataset, given its engine.
 ///
-/// For the `cayenne` engine we disable the Utf8View query/scan read schema
+/// For the `cayenne` engine we disable the `Utf8View` query/scan read schema
 /// (introduced by spiceai #11379). That change makes cayenne emit `Utf8View`
 /// for string columns on the scan path while `RowConverter`s in the query and
 /// deletion paths are still built on the stored `Utf8` schema, producing
