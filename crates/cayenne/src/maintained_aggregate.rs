@@ -322,7 +322,7 @@ impl MaintainedAggregateRegistry {
 
     /// As [`Self::try_new`], but maintains a per-PK contribution index keyed on
     /// `pk_columns` so UPDATE/DELETE can be retracted incrementally (see
-    /// [`Self::apply_delta`]). `max_index_entries` bounds the index across all
+    /// [`Self::apply_pk_deletes`]). `max_index_entries` bounds the index across all
     /// views; exceeding it fails the registry safe to `Stale`.
     ///
     /// # Errors
@@ -368,8 +368,9 @@ impl MaintainedAggregateRegistry {
     }
 
     /// Whether this registry maintains a per-PK index and can therefore retract
-    /// UPDATE/DELETE incrementally ([`Self::apply_delta`]) rather than falling
-    /// back to a full rebuild via [`Self::mark_stale`].
+    /// UPDATE/DELETE incrementally ([`Self::apply_pk_deletes`] for deletes, the
+    /// retract-old-then-insert path in [`Self::apply_insert_batches`] for
+    /// updates) rather than falling back to a full rebuild via [`Self::mark_stale`].
     #[must_use]
     pub fn supports_retraction(&self) -> bool {
         self.has_pk_index
@@ -823,11 +824,13 @@ impl ResolvedAggregateExpr {
             // sum output), so the whole signed/unsigned integer family is summed
             // exactly via lossless i64/u64 widening — Postgres `INTEGER` (arrow
             // `Int32`) is the common CDC case, not `BIGINT` (`Int64`).
-            (MaintainedAggregateFunction::Sum, Some(data_type)) if is_signed_integer(data_type) => {
+            (MaintainedAggregateFunction::Sum, Some(data_type))
+                if data_type.is_signed_integer() =>
+            {
                 AggregateOutputType::Int64
             }
             (MaintainedAggregateFunction::Sum, Some(data_type))
-                if is_unsigned_integer(data_type) =>
+                if data_type.is_unsigned_integer() =>
             {
                 AggregateOutputType::UInt64
             }
@@ -836,7 +839,7 @@ impl ResolvedAggregateExpr {
             (
                 MaintainedAggregateFunction::Sum | MaintainedAggregateFunction::Avg,
                 Some(data_type),
-            ) if is_floating_point(data_type) => AggregateOutputType::Float64,
+            ) if is_maintainable_float(data_type) => AggregateOutputType::Float64,
             (MaintainedAggregateFunction::Sum | MaintainedAggregateFunction::Avg, None) => {
                 return Err(DataFusionError::Plan(format!(
                     "{:?} maintained aggregate requires a column",
@@ -1261,21 +1264,12 @@ fn is_supported_group_key_type(data_type: &DataType) -> bool {
     )
 }
 
-fn is_signed_integer(data_type: &DataType) -> bool {
-    matches!(
-        data_type,
-        DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64
-    )
-}
-
-fn is_unsigned_integer(data_type: &DataType) -> bool {
-    matches!(
-        data_type,
-        DataType::UInt8 | DataType::UInt16 | DataType::UInt32 | DataType::UInt64
-    )
-}
-
-fn is_floating_point(data_type: &DataType) -> bool {
+/// Floating-point types a maintained `SUM`/`AVG` can fold exactly into an
+/// `f64` accumulator. Deliberately NARROWER than arrow's `DataType::is_floating`
+/// (which also matches `Float16`): the accumulator path has no `Float16`
+/// support, so this must not admit it. (Signed/unsigned-integer acceptance uses
+/// arrow's `DataType::is_signed_integer`/`is_unsigned_integer` directly.)
+fn is_maintainable_float(data_type: &DataType) -> bool {
     matches!(data_type, DataType::Float32 | DataType::Float64)
 }
 
@@ -1336,8 +1330,8 @@ fn scalar_for_field(
 /// Finalize a maintenance pass: if `failure` is set, or the per-PK index now
 /// exceeds `max_index_entries`, clear every index, mark the registry stale, and
 /// return the reason (so the write-path applier can log it); otherwise the
-/// registry stays fresh. Centralizes the fail-safe across the insert, delta, and
-/// PK-delete paths so memory is bounded on every path (not only `apply_delta`).
+/// registry stays fresh. Centralizes the fail-safe across the insert, PK-delete,
+/// and rebuild paths so memory is bounded on every mutating path.
 fn finalize_maintenance_pass(
     state: &mut RegistryState,
     max_index_entries: usize,
@@ -1751,7 +1745,7 @@ mod tests {
         )
     }
 
-    // --- retraction (apply_delta + per-PK index) ---
+    // --- retraction (apply_pk_deletes + per-PK index) ---
     //
     // Column layout for these tests (reusing the module `schema()`):
     //   name (Utf8)  -> GROUP BY key
