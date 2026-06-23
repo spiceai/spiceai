@@ -26,7 +26,7 @@ use crate::tls::TlsConfig;
 use crate::{Runtime, metrics as runtime_metrics};
 use app::{App, spicepod::component::runtime::FlightIpcCompression};
 use arrow::array::RecordBatch;
-use arrow::datatypes::Schema;
+use arrow::datatypes::{DataType, Schema};
 use arrow::ipc::writer::{CompressionContext, DictionaryTracker, IpcDataGenerator};
 use arrow_flight::encode::FlightDataEncoderBuilder;
 use arrow_flight::error::FlightError;
@@ -318,10 +318,18 @@ impl Service {
         let options = ipc_write_options;
         let raw_schema = query_result.data.schema();
 
+        let needs_view_cast = raw_schema
+            .fields()
+            .iter()
+            .any(|field| matches!(field.data_type(), DataType::Utf8View | DataType::BinaryView));
         // Expand Utf8View → LargeUtf8 and BinaryView → LargeBinary so the
         // schema header matches what we advertise in GetFlightInfo and what
         // clients (e.g. ADBC) expect after seeing that advertisement.
-        let schema = Arc::new(arrow_tools::schema::expand_views_schema(&raw_schema));
+        let schema = if needs_view_cast {
+            Arc::new(arrow_tools::schema::expand_views_schema(&raw_schema))
+        } else {
+            raw_schema
+        };
 
         // Pre-compute schema flight data once
         let mut dict_tracker = DictionaryTracker::new(true); // Set to true to handle dictionaries
@@ -355,8 +363,12 @@ impl Service {
                 match batch_result {
                     Ok(batch) => {
                         // Cast view columns to match the expanded schema we advertised.
-                        let batch = arrow_tools::schema::cast_view_columns(batch, &schema)
-                            .map_err(|e| Status::internal(e.to_string()))?;
+                        let batch = if needs_view_cast {
+                            arrow_tools::schema::cast_view_columns(batch, &schema)
+                                .map_err(|e| Status::internal(e.to_string()))?
+                        } else {
+                            batch
+                        };
                         let (dicts, batch_data) = encoder
                             .encode(&batch, &mut dict_tracker, &options, &mut compression_context)
                             .map_err(|e| Status::internal(e.to_string()))?;
@@ -675,7 +687,7 @@ pub async fn start(
             flight_message_size.unwrap_or(flight_client::MAX_ENCODING_MESSAGE_SIZE),
         );
 
-    let server = Server::builder();
+    let server = configure_flight_server_transport(Server::builder());
     let session_aware_auth = session_auth::with_session_awareness(
         endpoint_auth.flight_basic_auth,
         session_store.clone(),
@@ -773,6 +785,12 @@ pub async fn start(
     tracing::debug!("Spice Runtime Flight stopped");
 
     Ok(())
+}
+
+pub(crate) fn configure_flight_server_transport(server: Server) -> Server {
+    server
+        .initial_stream_window_size(flight_client::HTTP2_INITIAL_STREAM_WINDOW_SIZE)
+        .initial_connection_window_size(flight_client::HTTP2_INITIAL_CONNECTION_WINDOW_SIZE)
 }
 
 pub struct RateLimits {
