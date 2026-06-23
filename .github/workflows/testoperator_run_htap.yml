@@ -58,7 +58,7 @@ on:
           - 'spiceai-dev-xlarge-runners'
 
 # Serialize ALL SF100 + SF1000 CH-benCHmark runs across every variant (sqlite/turso cdc-tuned,
-# adaptive, cdc-memory, duckdb): they share ONE concurrency group keyed only by scale factor, so
+# adaptive, duckdb): they share ONE concurrency group keyed only by scale factor, so
 # only one runs at any time on the shared xlarge runner pool. Overlapping heavy CDC runs would
 # contend for runners and skew each other's freshness/QPH numbers. cancel-in-progress is false so
 # an in-flight benchmark is never killed mid-run. Other scale factors (e.g. manual SF1/SF10 runs)
@@ -115,31 +115,33 @@ jobs:
       - name: Build Testoperator
         uses: ./.github/actions/build-testoperator
 
+      # On spiceai-dev-xlarge-runners a dedicated in-cluster PostgreSQL pod is used,
+      # so skip the local docker Postgres there.
       - name: Setup CH-benCH PostgreSQL
+        if: github.event.inputs.runner_type != 'spiceai-dev-xlarge-runners'
         uses: ./.github/actions/setup-chbench-postgres
-
-      - name: Start resource monitor
-        run: |
-          echo -e "timestamp\tpg_cpu_pct\tpg_mem\tpg_block_io\tspiced_cpu_pct\tspiced_rss_kb\ttestop_cpu_pct\ttestop_rss_kb" > /tmp/resource-monitor.tsv
-          (while true; do
-            ts=$(date -u +%H:%M:%S)
-            pg=$(docker stats chbench-pg --no-stream --format "{{.CPUPerc}}\t{{.MemUsage}}\t{{.BlockIO}}" 2>/dev/null || echo "0%\t0\t0")
-            spiced_line=$(ps -eo pcpu,rss,comm | grep '[s]piced' | head -1 || true)
-            testop_line=$(ps -eo pcpu,rss,comm | grep '[t]estoperator' | head -1 || true)
-            spiced_cpu=$(echo "$spiced_line" | awk '{print $1+0}')
-            spiced_rss=$(echo "$spiced_line" | awk '{print $2+0}')
-            testop_cpu=$(echo "$testop_line" | awk '{print $1+0}')
-            testop_rss=$(echo "$testop_line" | awk '{print $2+0}')
-            echo -e "${ts}\t${pg}\t${spiced_cpu}\t${spiced_rss}\t${testop_cpu}\t${testop_rss}" >> /tmp/resource-monitor.tsv
-            sleep 10
-          done) &
-          echo $! > /tmp/monitor-pid.txt
-          echo "Resource monitor started (PID: $(cat /tmp/monitor-pid.txt))"
 
       - name: Run CH-benCHmark - ${{ github.event.inputs.spicepod_path }}
         run: |
-          testoperator run htap \
-            -s /usr/local/bin/spiced \
+          # On the xlarge runner (64-core EPYC, 2 threads/core, SMT siblings are
+          # cpu N and cpu 64+N), pin spiced and testoperator to whole physical
+          # cores so they don't contend — not even via hyperthread siblings:
+          #   spiced       -> cores 0-31  (logical CPUs 0-31,64-95   = 64 threads)
+          #   testoperator -> cores 32-39 (logical CPUs 32-39,96-103 = 16 threads)
+          SPICED_BIN=/usr/local/bin/spiced
+          TESTOP_PREFIX=""
+          if [ "${{ github.event.inputs.runner_type }}" = "spiceai-dev-xlarge-runners" ] && command -v taskset >/dev/null 2>&1; then
+            cat > /tmp/spiced-pinned.sh <<'EOF'
+          #!/usr/bin/env bash
+          exec taskset -c 0-31,64-95 /usr/local/bin/spiced "$@"
+          EOF
+            chmod +x /tmp/spiced-pinned.sh
+            SPICED_BIN=/tmp/spiced-pinned.sh
+            TESTOP_PREFIX="taskset -c 32-39,96-103"
+            echo "CPU pinning: spiced -> 64 logical CPUs, testoperator -> 16 logical CPUs"
+          fi
+          $TESTOP_PREFIX testoperator run htap \
+            -s "${SPICED_BIN}" \
             -p '${{ steps.set_spicepod_path.outputs.SPICEPOD_PATH }}' \
             --query-set chbench \
             --scale-factor ${{ github.event.inputs.scale_factor }} \
@@ -154,19 +156,51 @@ jobs:
         env:
           SPICEAI_BENCHMARK_METRICS_KEY: ${{ secrets.SPICEAI_BENCHMARK_METRICS_KEY }}
           SPICED_COMMIT: ${{ steps.setup-spiced.outputs.SPICED_COMMIT }}
-          CHBENCH_PG_HOST: 127.0.0.1
+          # Dedicated in-cluster PG pod on xlarge; per-run docker container (loopback) elsewhere.
+          CHBENCH_PG_HOST: ${{ github.event.inputs.runner_type == 'spiceai-dev-xlarge-runners' && 'chbench-postgres.dataplatform.svc.cluster.local' || '127.0.0.1' }}
 
-      - name: Stop resource monitor
-        if: always()
+      # The dedicated PG pod is long-lived and shared across runs, so a crashed
+      # or cancelled run can leave inactive replication slots (which retain WAL
+      # and eventually fill the disk) and orphaned publications. Drop any left
+      # behind. testoperator already drops its tables/publication at the start of
+      # the next run, but inactive slots are not covered by that.
+      - name: Clean up PG replication slots
+        if: always() && github.event.inputs.runner_type == 'spiceai-dev-xlarge-runners'
+        env:
+          CHBENCH_PG_HOST: chbench-postgres.dataplatform.svc.cluster.local
+          CHBENCH_PG_PORT: '5432'
+          CHBENCH_PG_USER: bench
+          CHBENCH_PG_PASS: bench
+          CHBENCH_PG_DB: chbench
         run: |
-          if [ -f /tmp/monitor-pid.txt ]; then
-            kill "$(cat /tmp/monitor-pid.txt)" 2>/dev/null || true
+          cat > /tmp/chbench-slot-cleanup.sql <<'SQL'
+          DO $$
+          DECLARE r RECORD;
+          BEGIN
+            FOR r IN
+              SELECT slot_name FROM pg_replication_slots
+              WHERE slot_name LIKE 'spice_%' AND NOT active
+            LOOP
+              RAISE NOTICE 'dropping replication slot %', r.slot_name;
+              PERFORM pg_drop_replication_slot(r.slot_name);
+            END LOOP;
+            FOR r IN
+              SELECT pubname FROM pg_publication WHERE pubname LIKE 'spice_%'
+            LOOP
+              RAISE NOTICE 'dropping publication %', r.pubname;
+              EXECUTE format('DROP PUBLICATION IF EXISTS %I', r.pubname);
+            END LOOP;
+          END $$;
+          SQL
+          if ! command -v psql >/dev/null 2>&1; then
+            echo "psql not found; installing postgresql-client..."
+            sudo apt-get update -qq && sudo apt-get install -y -qq postgresql-client || true
           fi
-
-      - name: Upload resource monitor
-        if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
-        with:
-          name: resource-monitor
-          path: /tmp/resource-monitor.tsv
-          retention-days: 7
+          if command -v psql >/dev/null 2>&1; then
+            PGPASSWORD="${CHBENCH_PG_PASS}" psql \
+              -h "${CHBENCH_PG_HOST}" -p "${CHBENCH_PG_PORT}" \
+              -U "${CHBENCH_PG_USER}" -d "${CHBENCH_PG_DB}" \
+              -v ON_ERROR_STOP=0 -f /tmp/chbench-slot-cleanup.sql || true
+          else
+            echo "No psql client available; skipping replication slot cleanup."
+          fi

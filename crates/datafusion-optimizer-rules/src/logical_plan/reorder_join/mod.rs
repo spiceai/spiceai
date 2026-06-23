@@ -14,10 +14,14 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-//! Custom execution plans for the Spice runtime.
+//! Logical optimizer rule that reorders inner-join chains to minimize execution cost.
 
-pub mod iceberg_scan_exec;
-pub mod udtf_exec;
+pub mod cost;
+pub mod join_graph;
+pub mod left_deep_join_plan;
+pub mod rule;
 
-pub use iceberg_scan_exec::{IcebergScanExec, session_is_distributed};
-pub use udtf_exec::UdtfExec;
+#[cfg(test)]
+mod chbench_tests;
+
+pub use rule::ReorderJoinRule;
