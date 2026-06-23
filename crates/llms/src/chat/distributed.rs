@@ -41,7 +41,7 @@ struct RingConfigFile {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DistributedBackend {
     /// mistral.rs ring all-reduce over plain TCP. No system dependency; the
-    /// all-reduce is correct at world_size = 2 (the two-node case).
+    /// all-reduce is correct at `world_size` = 2 (the two-node case).
     Ring,
 }
 

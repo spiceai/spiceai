@@ -741,16 +741,15 @@ pub async fn create_hf_model(
     // Configure multi-node distributed (ring) inference before loading: the
     // loader reads `RING_CONFIG` from the environment while building the
     // pipeline. The returned guard keeps the temp file alive for the model.
-    let ring_config = match distributed {
-        Some(cfg) => Some(configure_ring_distributed(&cfg)?),
-        None => {
-            // Defensive: clear any `RING_CONFIG` left set by a prior distributed
-            // load in this process, so this single-node load can't accidentally
-            // run distributed.
-            // SAFETY: touched only during model init, before mistral.rs reads it.
-            unsafe { std::env::remove_var("RING_CONFIG") };
-            None
-        }
+    let ring_config = if let Some(cfg) = distributed {
+        Some(configure_ring_distributed(&cfg)?)
+    } else {
+        // Defensive: clear any `RING_CONFIG` left set by a prior distributed
+        // load in this process, so this single-node load can't accidentally
+        // run distributed.
+        // SAFETY: touched only during model init, before mistral.rs reads it.
+        unsafe { std::env::remove_var("RING_CONFIG") };
+        None
     };
     mistral::MistralLlama::from_hf(
         model_id,
@@ -777,16 +776,15 @@ pub async fn create_local_model(
     // Configure multi-node distributed (ring) inference before loading: the
     // loader reads `RING_CONFIG` from the environment while building the
     // pipeline. The returned guard keeps the temp file alive for the model.
-    let ring_config = match distributed {
-        Some(cfg) => Some(configure_ring_distributed(&cfg)?),
-        None => {
-            // Defensive: clear any `RING_CONFIG` left set by a prior distributed
-            // load in this process, so this single-node load can't accidentally
-            // run distributed.
-            // SAFETY: touched only during model init, before mistral.rs reads it.
-            unsafe { std::env::remove_var("RING_CONFIG") };
-            None
-        }
+    let ring_config = if let Some(cfg) = distributed {
+        Some(configure_ring_distributed(&cfg)?)
+    } else {
+        // Defensive: clear any `RING_CONFIG` left set by a prior distributed
+        // load in this process, so this single-node load can't accidentally
+        // run distributed.
+        // SAFETY: touched only during model init, before mistral.rs reads it.
+        unsafe { std::env::remove_var("RING_CONFIG") };
+        None
     };
     mistral::MistralLlama::from(
         model_weights

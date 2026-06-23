@@ -14,7 +14,7 @@ limitations under the License.
 #![allow(clippy::borrowed_box)]
 #![allow(clippy::needless_pass_by_value)]
 
-use crate::chat::{FailedToLoadModelSnafu, message_to_mistral};
+use crate::chat::message_to_mistral;
 use crate::streaming_utils::create_stream_response_with_timestamp;
 
 use super::{Chat, Error as ChatError, FailedToRunModelSnafu, Result, nsql::SqlGeneration};
@@ -70,6 +70,7 @@ pub struct MistralLlama {
     /// RAII drop guard that keeps the per-node `RING_CONFIG` temp file alive for
     /// the model's lifetime (its `Drop` deletes the file on model teardown).
     /// `None` for single-node models. Never read directly.
+    #[expect(dead_code)]
     ring_config: Option<tempfile::TempPath>,
 }
 
@@ -452,8 +453,7 @@ impl MistralLlama {
                     (
                         builder
                             .build(normal_loader_type)
-                            .map_err(|e| e.into_boxed_dyn_error())
-                            .context(FailedToLoadModelSnafu),
+                            .map_err(|e| ChatError::FailedToLoadModel { source: e.into() }),
                         AutoDeviceMapParams::default_text(),
                     )
                 }
