@@ -2868,7 +2868,7 @@ impl ShardedPkIndex {
         // The position-delete capture set is table-global; every shard needs the
         // complete skip set so its read-back doesn't re-capture a covered file.
         for shard in &mut shards {
-            shard.captured_files = keyset.captured_files.clone();
+            shard.captured_files.clone_from(&keyset.captured_files);
         }
         Self::Exact(shards.into_boxed_slice())
     }
@@ -7837,13 +7837,11 @@ impl CayenneTableProvider {
             .map(|&idx| Arc::clone(batch.column(idx)))
             .collect();
         let rows = converter.convert_columns(&pk_columns)?;
-        // Per-shard order-preserving selection masks. `row_idx` indexes the
-        // computed-shard mask (`masks[shard][row_idx]`), not the iterated rows, so
-        // a range loop is the natural form here.
+        // Per-shard order-preserving selection masks: scatter each row's index
+        // into its computed shard's mask (`masks[shard][row_idx]`).
         let mut masks: Vec<Vec<bool>> = vec![vec![false; batch.num_rows()]; n];
-        #[allow(clippy::needless_range_loop)]
-        for row_idx in 0..batch.num_rows() {
-            let shard = shard_of_pk(rows.row(row_idx).as_ref(), n);
+        for (row_idx, row) in rows.iter().enumerate() {
+            let shard = shard_of_pk(row.as_ref(), n);
             masks[shard][row_idx] = true;
         }
         let mut shards = Vec::with_capacity(n);
@@ -8863,7 +8861,6 @@ impl CayenneTableProvider {
     /// path — the `Exact` path's O(1) hashmap probe already returns "keep, no
     /// delete" for an absent key, so a split buys nothing there.
     fn bloom_split_shard_batch(
-        &self,
         batch: &RecordBatch,
         bloom: &PkBloom,
         pk_indices: &[usize],
@@ -9019,7 +9016,7 @@ impl CayenneTableProvider {
                 // an absent key, so it runs the whole sub-batch through validation.
                 let hit_batch = match index.existence_ref(s) {
                     PkExistenceRef::Bloom(bloom) => {
-                        let (miss, hit, miss_keys) = self.bloom_split_shard_batch(
+                        let (miss, hit, miss_keys) = Self::bloom_split_shard_batch(
                             &batch,
                             bloom,
                             pk_indices,
@@ -16537,12 +16534,12 @@ impl CayenneTableProvider {
     /// `shard_of_pk(OwnedRow bytes)` (§3.5), preserving row order within each
     /// shard. Used by [`Self::append_delete_intents_sharded`] so a delete key's
     /// tombstone lands in the SAME shard that owns its rows (the upsert routing
-    /// and per-shard keyset use the identical OwnedRow hash). Returns exactly `n`
+    /// and per-shard keyset use the identical `OwnedRow` hash). Returns exactly `n`
     /// batches (some may be empty) carrying the delete batch's own schema.
     ///
     /// The PK columns are looked up BY NAME in the delete batch and cast to the
     /// table-schema PK types (mirroring [`Self::cdc_delete_intents_from_batch`]),
-    /// then converted with the table-schema-built `RowConverter` so the OwnedRow
+    /// then converted with the table-schema-built `RowConverter` so the `OwnedRow`
     /// bytes match every other routing site exactly. Returns `None` when a PK
     /// column is missing or null (the caller falls back to the durable path).
     fn split_delete_batch_by_pk_shard(
@@ -16577,9 +16574,8 @@ impl CayenneTableProvider {
         let converter = self.build_pk_converter(&self.pk_column_indices)?;
         let rows = converter.convert_columns(&pk_columns)?;
         let mut masks: Vec<Vec<bool>> = vec![vec![false; batch.num_rows()]; n];
-        #[allow(clippy::needless_range_loop)]
-        for row_idx in 0..batch.num_rows() {
-            let shard = shard_of_pk(rows.row(row_idx).as_ref(), n);
+        for (row_idx, row) in rows.iter().enumerate() {
+            let shard = shard_of_pk(row.as_ref(), n);
             masks[shard][row_idx] = true;
         }
         let mut shards = Vec::with_capacity(n);
@@ -16591,7 +16587,7 @@ impl CayenneTableProvider {
     }
 
     /// Absorb a CDC Delete-event batch into the SHARDED (N>1) in-memory tier:
-    /// route each delete key to the shard that owns it (`shard_of_pk` on OwnedRow
+    /// route each delete key to the shard that owns it (`shard_of_pk` on `OwnedRow`
     /// bytes) and append a tombstone-only segment to that shard, so the per-shard
     /// merge-on-read filter (§2.3e) actually sees the tombstone. Without this a
     /// delete-receiving table split-brains — its rows live in shards 0..N while a
@@ -17251,14 +17247,11 @@ impl CayenneTableProvider {
             // partial-prefix checkpoint exists" (the whole-tier triggers + the sole
             // all-shards capture body below enforce it); a partial checkpoint would
             // make MAX a data-loss hole and require reverting to a MIN watermark.
-            let durable_epoch = {
-                let maxes: Vec<u64> = shard_snapshots
-                    .iter()
-                    .zip(flushed_counts.iter())
-                    .filter_map(|(s, &c)| s.max_source_position_in_prefix(c))
-                    .collect();
-                maxes.into_iter().max()
-            };
+            let durable_epoch = shard_snapshots
+                .iter()
+                .zip(flushed_counts.iter())
+                .filter_map(|(s, &c)| s.max_source_position_in_prefix(c))
+                .max();
             // The metadata/encode path reads ONE tier's tombstones/epoch. At N==1
             // that is shard 0's snapshot unchanged (byte-identical); at N>1 it is
             // the cross-shard UNION view (disjoint keys ⇒ exact union).
@@ -24463,17 +24456,17 @@ mod tests {
             state ^= state >> 27;
             state.wrapping_mul(0x2545_F491_4F6C_DD1D)
         };
-        let key_space: i64 = 64; // many repeated keys ⇒ heavy LWW overwrite
+        let key_space: u64 = 64; // many repeated keys ⇒ heavy LWW overwrite
         let mut applies = Vec::new();
         for _ in 0..40 {
             let burst_len = (next() % 12) as usize + 1;
             let mut burst = Vec::with_capacity(burst_len);
             for _ in 0..burst_len {
-                let pk = (next() % key_space as u64) as i64;
+                let pk = i64::try_from(next() % key_space).expect("test pk < key_space fits i64");
                 // The value carries the global write ordinal so the LWW winner
                 // is identifiable: a later apply for the same pk has a higher
                 // value, and the visible value must be the max over its applies.
-                let value = (next() % 1_000_000) as i64;
+                let value = i64::try_from(next() % 1_000_000).expect("test value fits i64");
                 burst.push((pk, value));
             }
             applies.push(burst);
@@ -24534,7 +24527,7 @@ mod tests {
                 let s = shard_of_pk(row.row(0).as_ref(), n);
                 let prev = owner.insert(id, s);
                 assert!(
-                    prev.map(|p| p == s).unwrap_or(true),
+                    prev.is_none_or(|p| p == s),
                     "pk {id} routed to two shards ({prev:?} vs {s})"
                 );
             }
@@ -24574,7 +24567,7 @@ mod tests {
     /// applied identically at EVERY routing site. This test fails if any site
     /// were to re-hash the big-endian-i64 encoding instead: it asserts the
     /// OwnedRow-derived shard is the shard the data actually lands in (the live
-    /// tier's segments for that key), and that the OwnedRow hash and the BE-i64
+    /// tier's segments for that key), and that the `OwnedRow` hash and the BE-i64
     /// hash genuinely DISAGREE for some keys (so a BE-based site would be caught).
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn sharded_cdc_shard_key_is_owned_row_not_be_i64() {
@@ -25133,7 +25126,7 @@ mod tests {
             "whole_tier_under",
             Arc::clone(&runtime_env),
             n,
-            i64::try_from(total + 4096).unwrap(),
+            i64::try_from(total + 4096).expect("test cap fits i64"),
         )
         .await;
         let under_schema = Arc::clone(&under.table_metadata.schema);
@@ -25150,7 +25143,7 @@ mod tests {
             "whole_tier_over",
             Arc::clone(&runtime_env),
             n,
-            i64::try_from(total).unwrap(),
+            i64::try_from(total).expect("test cap fits i64"),
         )
         .await;
         let over_schema = Arc::clone(&over.table_metadata.schema);
