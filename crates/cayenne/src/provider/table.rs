@@ -6328,7 +6328,9 @@ impl CayenneTableProvider {
                 batches: Arc::new(Vec::new()),
                 view: Arc::new(Vec::new()),
             }))),
-            mem_tier: Arc::new(crate::provider::mem_tier::ShardedMemTier::empty(mem_tier_shards)),
+            mem_tier: Arc::new(crate::provider::mem_tier::ShardedMemTier::empty(
+                mem_tier_shards,
+            )),
             // No sorted rewrite has run on this freshly-opened provider, so the
             // scan does not advertise ordering until the sorted compactor attests
             // a snapshot.
@@ -8882,8 +8884,7 @@ impl CayenneTableProvider {
         let mut miss_mask = Vec::with_capacity(batch.num_rows());
         let mut miss_keys: HashSet<OwnedRow> = HashSet::new();
         for row_idx in 0..batch.num_rows() {
-            let null_pk =
-                any_pk_nullable && pk_columns.iter().any(|col| col.is_null(row_idx));
+            let null_pk = any_pk_nullable && pk_columns.iter().any(|col| col.is_null(row_idx));
             let key = rows.row(row_idx).owned();
             let is_miss = !null_pk
                 && !bloom.maybe_contains(key.as_ref())
@@ -8959,8 +8960,8 @@ impl CayenneTableProvider {
                 if sub.num_rows() == 0 {
                     continue;
                 }
-                per_shard_bytes[s] = per_shard_bytes[s]
-                    .saturating_add(sub.get_array_memory_size() as u64);
+                per_shard_bytes[s] =
+                    per_shard_bytes[s].saturating_add(sub.get_array_memory_size() as u64);
                 per_shard_batches[s].push(sub);
             }
         }
@@ -8969,8 +8970,7 @@ impl CayenneTableProvider {
         // to shard 0). At N=1 `per_shard_bytes[0]` is the whole apply.
         let assigned: u64 = per_shard_bytes.iter().fold(0, |a, b| a.saturating_add(*b));
         if assigned < total_incoming_bytes && !per_shard_bytes.is_empty() {
-            per_shard_bytes[0] =
-                per_shard_bytes[0].saturating_add(total_incoming_bytes - assigned);
+            per_shard_bytes[0] = per_shard_bytes[0].saturating_add(total_incoming_bytes - assigned);
         }
 
         // 2. Validate each shard synchronously against ITS existence view, then
@@ -8987,8 +8987,11 @@ impl CayenneTableProvider {
         //    HIT-path row in the same shard sees them, and they are inserted into
         //    the shard's bloom UNDER `locks[s]` in `append_to_shard` (below) so the
         //    durable existence index reflects them atomically with the segment swap.
-        let mut per_shard_validated: Vec<(Vec<RecordBatch>, OnConflictDeletions, HashSet<OwnedRow>)> =
-            Vec::with_capacity(n);
+        let mut per_shard_validated: Vec<(
+            Vec<RecordBatch>,
+            OnConflictDeletions,
+            HashSet<OwnedRow>,
+        )> = Vec::with_capacity(n);
         for (s, shard_batches) in per_shard_batches.into_iter().enumerate() {
             let mut incoming_keys: HashSet<OwnedRow> = HashSet::new();
             let mut delete_specs: HashMap<Arc<str>, Vec<u64>> = HashMap::new();
@@ -9126,8 +9129,7 @@ impl CayenneTableProvider {
                 if !has_rows && !has_deletions {
                     return None;
                 }
-                let superseded =
-                    u64::try_from(deletions.total_superseded()).unwrap_or(u64::MAX);
+                let superseded = u64::try_from(deletions.total_superseded()).unwrap_or(u64::MAX);
                 Some(self.append_to_shard(
                     s,
                     filtered_batches.clone(),
@@ -9149,10 +9151,18 @@ impl CayenneTableProvider {
         let mut combined = OnConflictDeletions::default();
         for (_, deletions, _) in &mut per_shard_validated {
             for (file_path, rows) in std::mem::take(&mut deletions.delete_specs) {
-                combined.delete_specs.entry(file_path).or_default().extend(rows);
+                combined
+                    .delete_specs
+                    .entry(file_path)
+                    .or_default()
+                    .extend(rows);
             }
-            combined.deleted_pk_i64.append(&mut deletions.deleted_pk_i64);
-            combined.deleted_row_keys.append(&mut deletions.deleted_row_keys);
+            combined
+                .deleted_pk_i64
+                .append(&mut deletions.deleted_pk_i64);
+            combined
+                .deleted_row_keys
+                .append(&mut deletions.deleted_row_keys);
             combined
                 .deleted_inlined_pk_i64
                 .append(&mut deletions.deleted_inlined_pk_i64);
@@ -16116,8 +16126,7 @@ impl CayenneTableProvider {
         // Per-shard version VECTOR collapsed to one key (changes when any shard
         // moves). Hash the CAPTURED snapshots (not the live `ArcSwap`s) so the
         // memo key matches the tombstones it was built from.
-        let tier_version =
-            crate::provider::mem_tier::ShardedMemTier::version_hash_of(shards);
+        let tier_version = crate::provider::mem_tier::ShardedMemTier::version_hash_of(shards);
         let structural_epoch = self.inlined_structural_epoch.load(Ordering::Relaxed);
         if let Some(memo) = self.merged_scan_deletions.load_full()
             && memo.file_index_ptr == file_index_ptr
@@ -16648,24 +16657,23 @@ impl CayenneTableProvider {
             .mem_tier_apply_epoch
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let no_keys: HashSet<OwnedRow> = HashSet::new();
-        let append_futures =
-            per_shard
-                .iter()
-                .enumerate()
-                .filter_map(|(s, (deletions, bytes))| {
-                    if deletions.total_superseded() == 0 {
-                        return None;
-                    }
-                    Some(self.append_to_shard(
-                        s,
-                        Vec::new(),
-                        deletions,
-                        *bytes,
-                        0,
-                        Some(apply_epoch),
-                        &no_keys,
-                    ))
-                });
+        let append_futures = per_shard
+            .iter()
+            .enumerate()
+            .filter_map(|(s, (deletions, bytes))| {
+                if deletions.total_superseded() == 0 {
+                    return None;
+                }
+                Some(self.append_to_shard(
+                    s,
+                    Vec::new(),
+                    deletions,
+                    *bytes,
+                    0,
+                    Some(apply_epoch),
+                    &no_keys,
+                ))
+            });
         futures::future::try_join_all(append_futures).await?;
         Ok(apply_epoch)
     }
@@ -16873,8 +16881,16 @@ impl CayenneTableProvider {
         // cache (it is `None` off the sharded path) — byte-identical to the
         // pre-Phase-6 behavior.
         let no_keys: HashSet<OwnedRow> = HashSet::new();
-        self.append_to_shard(0, batches, deletions, incoming_bytes, superseded, None, &no_keys)
-            .await
+        self.append_to_shard(
+            0,
+            batches,
+            deletions,
+            incoming_bytes,
+            superseded,
+            None,
+            &no_keys,
+        )
+        .await
     }
 
     /// Append a CDC batch to ONE PK-shard's sub-tier. Takes `locks[shard_id]`,
@@ -17147,10 +17163,7 @@ impl CayenneTableProvider {
         self.checkpoint_mem_tier_inner(false).await
     }
 
-    async fn checkpoint_mem_tier_inner(
-        &self,
-        acquire_write_lock_for_capture: bool,
-    ) -> Result<u64> {
+    async fn checkpoint_mem_tier_inner(&self, acquire_write_lock_for_capture: bool) -> Result<u64> {
         // Capture the corpus to flush AND reserve this checkpoint's
         // snapshot_sequence ATOMICALLY under ALL shard `mem_tier_publish_locks`
         // (index order, deadlock-free), so the capture+reservation is mutually
@@ -17188,8 +17201,12 @@ impl CayenneTableProvider {
             for lock in self.mem_tier_publish_locks.iter() {
                 guards.push(lock.lock().await);
             }
-            let shard_snapshots: Vec<Arc<crate::provider::mem_tier::MemTier>> =
-                self.mem_tier.shards().iter().map(ArcSwap::load_full).collect();
+            let shard_snapshots: Vec<Arc<crate::provider::mem_tier::MemTier>> = self
+                .mem_tier
+                .shards()
+                .iter()
+                .map(ArcSwap::load_full)
+                .collect();
             let flushed_counts: Vec<usize> =
                 shard_snapshots.iter().map(|s| s.segments.len()).collect();
             let any_nonempty = shard_snapshots.iter().any(|s| !s.is_empty());
@@ -17248,10 +17265,12 @@ impl CayenneTableProvider {
             let snapshot = if n == 1 {
                 Arc::clone(&shard_snapshots[0])
             } else {
-                Arc::new(crate::provider::mem_tier::ShardedMemTier::union_snapshot_view(
-                    &shard_snapshots,
-                    durable_epoch.unwrap_or(0),
-                ))
+                Arc::new(
+                    crate::provider::mem_tier::ShardedMemTier::union_snapshot_view(
+                        &shard_snapshots,
+                        durable_epoch.unwrap_or(0),
+                    ),
+                )
             };
             drop(guards);
             (
@@ -17433,11 +17452,8 @@ impl CayenneTableProvider {
             // all-shards clear keeps the invariant ("every clear arm holds the
             // publish lock") unconditional. Lock order: fence (outer) → publish
             // (inner), same as phase 2.
-            self.clear_flushed_mem_tier_state_all_shards(
-                &flushed_counts,
-                !inlined_view.is_empty(),
-            )
-            .await?;
+            self.clear_flushed_mem_tier_state_all_shards(&flushed_counts, !inlined_view.is_empty())
+                .await?;
             self.refresh_listing_table_under_held_fence().await?;
             stats
         } else {
@@ -17644,8 +17660,9 @@ impl CayenneTableProvider {
                 guards.push(lock.lock().await);
             }
             for (shard_id, &flushed_count) in flushed_counts.iter().enumerate() {
-                released_total = released_total
-                    .saturating_add(self.clear_mem_tier_flushed_prefix_for_shard(shard_id, flushed_count));
+                released_total = released_total.saturating_add(
+                    self.clear_mem_tier_flushed_prefix_for_shard(shard_id, flushed_count),
+                );
             }
             drop(guards);
         }
@@ -23673,7 +23690,10 @@ mod tests {
             "the periodic tick advanced the deferred slot ack to the flushed epoch"
         );
         // Rows are durable: a fresh tier (empty) still scans them back.
-        assert!(provider.mem_tier.tier().load().is_empty(), "tier flushed empty");
+        assert!(
+            provider.mem_tier.tier().load().is_empty(),
+            "tier flushed empty"
+        );
         assert_eq!(
             scan_sorted_ids(&provider).await,
             vec![1, 2, 3, 4, 5],
@@ -24081,7 +24101,10 @@ mod tests {
             1,
             "the spill advanced the deferred slot ack"
         );
-        assert!(provider.mem_tier.tier().load().is_empty(), "tier spilled empty");
+        assert!(
+            provider.mem_tier.tier().load().is_empty(),
+            "tier spilled empty"
+        );
     }
 
     /// A2-T2 — the AGE cap never blocks the writer; it belongs to the tick.
@@ -24365,7 +24388,11 @@ mod tests {
             }
         }
         assert_eq!(total, batch.num_rows(), "rows lost or added across shards");
-        assert_eq!(seen.len(), batch.num_rows(), "every id present exactly once");
+        assert_eq!(
+            seen.len(),
+            batch.num_rows(),
+            "every id present exactly once"
+        );
     }
 
     // ======================================================================
@@ -25028,9 +25055,7 @@ mod tests {
         for b in &bursts {
             apply_upsert_burst(&ctx, &provider, Arc::clone(&schema), b).await;
         }
-        let pre_rows: u64 = (0..n)
-            .map(|s| provider.mem_tier.shard(s).load().rows)
-            .sum();
+        let pre_rows: u64 = (0..n).map(|s| provider.mem_tier.shard(s).load().rows).sum();
         assert!(pre_rows > 0, "rows resident in the tier before checkpoint");
 
         // Force the durable encode to fail deterministically: replace the table's
@@ -25055,9 +25080,7 @@ mod tests {
             "a failed checkpoint must NOT advance the slot (partial-swap guard)"
         );
         // The tier was not cleared — the rows are still resident for a replay.
-        let post_rows: u64 = (0..n)
-            .map(|s| provider.mem_tier.shard(s).load().rows)
-            .sum();
+        let post_rows: u64 = (0..n).map(|s| provider.mem_tier.shard(s).load().rows).sum();
         assert_eq!(
             post_rows, pre_rows,
             "a failed checkpoint must leave the tier intact (no flushed-prefix clear)"
