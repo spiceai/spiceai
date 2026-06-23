@@ -42,6 +42,7 @@ pub struct View {
     pub ready_state: ReadyState,
     pub runtime: Arc<Runtime>,
     pub vectors: Option<VectorStore>,
+    pub params: HashMap<String, String>,
     pub app: Arc<App>,
 }
 
@@ -53,6 +54,7 @@ impl PartialEq for View {
             && self.columns == other.columns
             && self.acceleration == other.acceleration
             && self.vectors == other.vectors
+            && self.params == other.params
             && self.ready_state == other.ready_state
     }
 }
@@ -67,6 +69,7 @@ impl std::fmt::Debug for View {
             .field("acceleration", &self.acceleration)
             .field("ready_state", &self.ready_state)
             .field("vectors", &self.vectors)
+            .field("params", &self.params)
             .finish_non_exhaustive()
     }
 }
@@ -165,6 +168,7 @@ pub struct ViewBuilder {
     pub acceleration: Option<acceleration::Acceleration>,
     pub ready_state: ReadyState,
     pub vectors: Option<VectorStore>,
+    pub params: HashMap<String, String>,
 }
 
 impl TryFrom<spicepod_view::View> for ViewBuilder {
@@ -219,6 +223,11 @@ impl TryFrom<spicepod_view::View> for ViewBuilder {
             acceleration,
             ready_state: ReadyState::from(view.ready_state),
             vectors: view.vectors,
+            params: view
+                .params
+                .as_ref()
+                .map(spicepod::param::Params::as_string_map)
+                .unwrap_or_default(),
         })
     }
 }
@@ -278,6 +287,7 @@ impl ViewBuilder {
             acceleration: None,
             ready_state: ReadyState::default(),
             vectors: None,
+            params: HashMap::default(),
         }
     }
 
@@ -291,6 +301,7 @@ impl ViewBuilder {
             acceleration: self.acceleration,
             ready_state: self.ready_state,
             vectors: self.vectors,
+            params: self.params,
             runtime,
             app,
         }
