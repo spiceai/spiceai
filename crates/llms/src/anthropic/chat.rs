@@ -179,6 +179,7 @@ fn create_completion_message(
         .collect::<Result<Vec<_>, Box<dyn std::error::Error + Send + Sync>>>()?;
 
     Ok(ChatCompletionResponseMessage {
+        reasoning_content: None,
         tool_calls: Some(tool_calls),
         refusal: None,
         annotations: None,

@@ -164,11 +164,12 @@ pub(crate) fn column_stats_to_stats_set(cs: &ColumnStatistics) -> StatsSet {
     }
 
     // Persist the column sum so whole-table `SUM`/`AVG` can be answered from
-    // metadata. The value is already widened to the sum dtype by
-    // `compute_column_sum` (signed -> Int64, unsigned -> UInt64, float ->
-    // Float64), matching `Sum::return_dtype` so it round-trips through
-    // `stats_set_to_column_stats`. Cross-batch/cross-file combination is handled
-    // additively by Vortex's `StatsSet::merge_unordered` (`merge_sum`).
+    // metadata. The value is already widened to the sum dtype upstream by
+    // `infer_stats` in the Vortex persistent format (via `Stat::Sum.dtype`:
+    // signed -> Int64, unsigned -> UInt64, float -> Float64), matching
+    // `Sum::return_dtype` so it round-trips through `stats_set_to_column_stats`.
+    // Cross-batch/cross-file combination is handled additively by Vortex's
+    // `StatsSet::merge_unordered` (`merge_sum`).
     if let Some(sv) = cs.sum_value.get_value()
         && let Some(vortex_sv) = df_scalar_to_vortex(sv)
     {
@@ -551,8 +552,7 @@ mod tests {
 
         let merged_blob = merge_serialized_stats(&first_blob, &[second_set], &dtypes, &schema)
             .expect("statistics should merge");
-        let merged =
-            deserialize_file_statistics(&merged_blob, &schema).expect("deserialize ok");
+        let merged = deserialize_file_statistics(&merged_blob, &schema).expect("deserialize ok");
 
         let df = file_statistics_to_df(&merged, 9);
         assert_eq!(

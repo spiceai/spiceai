@@ -38,12 +38,16 @@ limitations under the License.
 //! `None`, leaving the original scan+aggregate in place.
 
 use arrow::array::RecordBatch;
+use arrow_schema::Schema;
 use arrow_schema::{DataType, FieldRef};
 use datafusion::error::Result as DataFusionResult;
+// `ExecutionPlan` is used as a trait (for `AggregateExec::schema`/`input`), not a
+// path, so it reads as unused to a shallow linter — it is required to compile.
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::physical_plan::aggregates::{AggregateExec, AggregateMode};
-use datafusion_common::{ColumnStatistics, DataFusionError, ScalarValue, Statistics, stats::Precision};
-use arrow_schema::Schema;
+use datafusion_common::{
+    ColumnStatistics, DataFusionError, ScalarValue, Statistics, stats::Precision,
+};
 use datafusion_physical_expr::PhysicalExpr;
 use datafusion_physical_expr::expressions::{CastExpr, Column, Literal};
 use std::sync::Arc;
@@ -134,11 +138,9 @@ impl StatsAggKind {
     const fn column_index(self) -> Option<usize> {
         match self {
             Self::CountStar => None,
-            Self::CountColumn(i)
-            | Self::Sum(i)
-            | Self::Avg(i)
-            | Self::Min(i)
-            | Self::Max(i) => Some(i),
+            Self::CountColumn(i) | Self::Sum(i) | Self::Avg(i) | Self::Min(i) | Self::Max(i) => {
+                Some(i)
+            }
         }
     }
 }
@@ -199,7 +201,9 @@ fn single_column_index(
 /// (e.g. `Float64 -> Int32`, anything non-numeric) are rejected so we never fold
 /// a stat that does not match the query's casted values.
 fn is_numeric_widening_cast(source: &DataType, target: &DataType) -> bool {
-    use DataType::{Float16, Float32, Float64, Int8, Int16, Int32, Int64, UInt8, UInt16, UInt32, UInt64};
+    use DataType::{
+        Float16, Float32, Float64, Int8, Int16, Int32, Int64, UInt8, UInt16, UInt32, UInt64,
+    };
     matches!(
         (source, target),
         (Int8 | Int16 | Int32 | Int64, Int64 | Float64)
@@ -260,9 +264,7 @@ fn scalar_for_kind(
     stats: &Statistics,
     field: &FieldRef,
 ) -> DataFusionResult<Option<ScalarValue>> {
-    let column = |index: usize| -> Option<&ColumnStatistics> {
-        stats.column_statistics.get(index)
-    };
+    let column = |index: usize| -> Option<&ColumnStatistics> { stats.column_statistics.get(index) };
 
     let scalar = match kind {
         StatsAggKind::CountStar => {
@@ -336,9 +338,44 @@ fn cast_scalar(scalar: ScalarValue, field: &FieldRef) -> DataFusionResult<Scalar
 
 /// Convert a numeric scalar to `f64` for AVG. Returns `None` for non-numeric or
 /// null inputs (callers handle the null/empty case separately).
+///
+/// Declines exact integer sums whose magnitude exceeds 2^53: those cannot be
+/// represented exactly in f64, so dividing them would make the AVG fold
+/// silently inexact. This mirrors the denominator guard in `usize_to_exact_f64`
+/// and keeps the fold sound, falling back to a real scan instead.
 fn scalar_to_f64(scalar: &ScalarValue) -> Option<f64> {
+    const MAX_EXACT_F64_INTEGER: u128 = 1_u128 << f64::MANTISSA_DIGITS;
+    if let Some(magnitude) = integer_scalar_magnitude(scalar)
+        && magnitude > MAX_EXACT_F64_INTEGER
+    {
+        return None;
+    }
     match scalar.cast_to(&DataType::Float64) {
         Ok(ScalarValue::Float64(Some(value))) => Some(value),
+        _ => None,
+    }
+}
+
+/// Magnitude of an exact integer scalar, or `None` for non-integer (float /
+/// decimal) scalars, which carry their own inherent precision and are not
+/// subject to the exact-integer-range check. SUM widens integer columns to
+/// `Int64`/`UInt64`, but the smaller variants are handled too for safety.
+fn integer_scalar_magnitude(scalar: &ScalarValue) -> Option<u128> {
+    let signed = match scalar {
+        ScalarValue::Int8(Some(v)) => Some(i64::from(*v)),
+        ScalarValue::Int16(Some(v)) => Some(i64::from(*v)),
+        ScalarValue::Int32(Some(v)) => Some(i64::from(*v)),
+        ScalarValue::Int64(Some(v)) => Some(*v),
+        _ => None,
+    };
+    if let Some(v) = signed {
+        return Some(i128::from(v).unsigned_abs());
+    }
+    match scalar {
+        ScalarValue::UInt8(Some(v)) => Some(u128::from(*v)),
+        ScalarValue::UInt16(Some(v)) => Some(u128::from(*v)),
+        ScalarValue::UInt32(Some(v)) => Some(u128::from(*v)),
+        ScalarValue::UInt64(Some(v)) => Some(u128::from(*v)),
         _ => None,
     }
 }
@@ -374,7 +411,11 @@ mod tests {
     use datafusion_physical_expr::expressions::{cast, col, lit};
 
     fn value_schema() -> Arc<Schema> {
-        Arc::new(Schema::new(vec![Field::new("value", DataType::Int64, true)]))
+        Arc::new(Schema::new(vec![Field::new(
+            "value",
+            DataType::Int64,
+            true,
+        )]))
     }
 
     /// One-column value stats: `value` column with the given sum / null_count /
@@ -430,7 +471,11 @@ mod tests {
         )
     }
 
-    fn agg(udaf: datafusion_expr::AggregateUDF, arg: Arc<dyn PhysicalExpr>, alias: &str) -> Arc<AggregateFunctionExpr> {
+    fn agg(
+        udaf: datafusion_expr::AggregateUDF,
+        arg: Arc<dyn PhysicalExpr>,
+        alias: &str,
+    ) -> Arc<AggregateFunctionExpr> {
         Arc::new(
             AggregateExprBuilder::new(Arc::new(udaf), vec![arg])
                 .schema(value_schema())
@@ -453,7 +498,11 @@ mod tests {
 
     #[test]
     fn folds_sum_from_exact_stats() {
-        let exec = single_aggregate(vec![agg(sum_udaf().as_ref().clone(), value_col(), "sum(value)")]);
+        let exec = single_aggregate(vec![agg(
+            sum_udaf().as_ref().clone(),
+            value_col(),
+            "sum(value)",
+        )]);
         assert_eq!(
             folded_scalar(&exec, &exact_stats()),
             Some(ScalarValue::Int64(Some(6)))
@@ -462,7 +511,11 @@ mod tests {
 
     #[test]
     fn folds_count_star() {
-        let exec = single_aggregate(vec![agg(count_udaf().as_ref().clone(), lit(1_i64), "count(*)")]);
+        let exec = single_aggregate(vec![agg(
+            count_udaf().as_ref().clone(),
+            lit(1_i64),
+            "count(*)",
+        )]);
         assert_eq!(
             folded_scalar(&exec, &exact_stats()),
             Some(ScalarValue::Int64(Some(3)))
@@ -478,16 +531,37 @@ mod tests {
             Precision::Exact(ScalarValue::Int64(Some(1))),
             Precision::Exact(ScalarValue::Int64(Some(3))),
         );
-        let exec = single_aggregate(vec![agg(count_udaf().as_ref().clone(), value_col(), "count(value)")]);
-        assert_eq!(folded_scalar(&exec, &stats), Some(ScalarValue::Int64(Some(3))));
+        let exec = single_aggregate(vec![agg(
+            count_udaf().as_ref().clone(),
+            value_col(),
+            "count(value)",
+        )]);
+        assert_eq!(
+            folded_scalar(&exec, &stats),
+            Some(ScalarValue::Int64(Some(3)))
+        );
     }
 
     #[test]
     fn folds_min_and_max() {
-        let min_exec = single_aggregate(vec![agg(min_udaf().as_ref().clone(), value_col(), "min(value)")]);
-        let max_exec = single_aggregate(vec![agg(max_udaf().as_ref().clone(), value_col(), "max(value)")]);
-        assert_eq!(folded_scalar(&min_exec, &exact_stats()), Some(ScalarValue::Int64(Some(1))));
-        assert_eq!(folded_scalar(&max_exec, &exact_stats()), Some(ScalarValue::Int64(Some(3))));
+        let min_exec = single_aggregate(vec![agg(
+            min_udaf().as_ref().clone(),
+            value_col(),
+            "min(value)",
+        )]);
+        let max_exec = single_aggregate(vec![agg(
+            max_udaf().as_ref().clone(),
+            value_col(),
+            "max(value)",
+        )]);
+        assert_eq!(
+            folded_scalar(&min_exec, &exact_stats()),
+            Some(ScalarValue::Int64(Some(1)))
+        );
+        assert_eq!(
+            folded_scalar(&max_exec, &exact_stats()),
+            Some(ScalarValue::Int64(Some(3)))
+        );
     }
 
     #[test]
@@ -495,7 +569,11 @@ mod tests {
         // DataFusion coerces AVG(Int64) to avg(CAST(value AS Float64)); the fold
         // must see through that cast and compute 6/3 = 2.0.
         let cast_arg = cast(value_col(), &value_schema(), DataType::Float64).expect("cast");
-        let exec = single_aggregate(vec![agg(avg_udaf().as_ref().clone(), cast_arg, "avg(value)")]);
+        let exec = single_aggregate(vec![agg(
+            avg_udaf().as_ref().clone(),
+            cast_arg,
+            "avg(value)",
+        )]);
         assert_eq!(
             folded_scalar(&exec, &exact_stats()),
             Some(ScalarValue::Float64(Some(2.0)))
@@ -513,8 +591,41 @@ mod tests {
             Precision::Absent,
         );
         let cast_arg = cast(value_col(), &value_schema(), DataType::Float64).expect("cast");
-        let exec = single_aggregate(vec![agg(avg_udaf().as_ref().clone(), cast_arg, "avg(value)")]);
-        assert_eq!(folded_scalar(&exec, &stats), Some(ScalarValue::Float64(None)));
+        let exec = single_aggregate(vec![agg(
+            avg_udaf().as_ref().clone(),
+            cast_arg,
+            "avg(value)",
+        )]);
+        assert_eq!(
+            folded_scalar(&exec, &stats),
+            Some(ScalarValue::Float64(None))
+        );
+    }
+
+    #[test]
+    fn does_not_fold_avg_with_oversized_integer_sum() {
+        // An exact integer SUM beyond 2^53 cannot be represented exactly in f64,
+        // so the AVG fold would be silently inexact -> decline and let it scan.
+        let oversized = (1_i64 << f64::MANTISSA_DIGITS) + 1;
+        let stats = stats(
+            Precision::Exact(3),
+            Precision::Exact(ScalarValue::Int64(Some(oversized))),
+            Precision::Exact(0),
+            Precision::Absent,
+            Precision::Absent,
+        );
+        let cast_arg = cast(value_col(), &value_schema(), DataType::Float64).expect("cast");
+        let exec = single_aggregate(vec![agg(
+            avg_udaf().as_ref().clone(),
+            cast_arg,
+            "avg(value)",
+        )]);
+        assert!(
+            stats_aggregate_batch(&exec, &exec, &stats)
+                .expect("no error")
+                .is_none(),
+            "oversized integer sum must not fold AVG"
+        );
     }
 
     #[test]
@@ -526,9 +637,15 @@ mod tests {
             Precision::Exact(ScalarValue::Int64(Some(1))),
             Precision::Exact(ScalarValue::Int64(Some(3))),
         );
-        let exec = single_aggregate(vec![agg(sum_udaf().as_ref().clone(), value_col(), "sum(value)")]);
+        let exec = single_aggregate(vec![agg(
+            sum_udaf().as_ref().clone(),
+            value_col(),
+            "sum(value)",
+        )]);
         assert!(
-            stats_aggregate_batch(&exec, &exec, &stats).expect("no error").is_none(),
+            stats_aggregate_batch(&exec, &exec, &stats)
+                .expect("no error")
+                .is_none(),
             "inexact sum must not fold"
         );
     }
@@ -542,9 +659,15 @@ mod tests {
             Precision::Exact(ScalarValue::Int64(Some(1))),
             Precision::Exact(ScalarValue::Int64(Some(3))),
         );
-        let exec = single_aggregate(vec![agg(count_udaf().as_ref().clone(), lit(1_i64), "count(*)")]);
+        let exec = single_aggregate(vec![agg(
+            count_udaf().as_ref().clone(),
+            lit(1_i64),
+            "count(*)",
+        )]);
         assert!(
-            stats_aggregate_batch(&exec, &exec, &stats).expect("no error").is_none(),
+            stats_aggregate_batch(&exec, &exec, &stats)
+                .expect("no error")
+                .is_none(),
             "inexact num_rows must not fold COUNT(*)"
         );
     }
@@ -559,9 +682,15 @@ mod tests {
             Precision::Exact(ScalarValue::Int64(Some(1))),
             Precision::Exact(ScalarValue::Int64(Some(3))),
         );
-        let exec = single_aggregate(vec![agg(sum_udaf().as_ref().clone(), value_col(), "sum(value)")]);
+        let exec = single_aggregate(vec![agg(
+            sum_udaf().as_ref().clone(),
+            value_col(),
+            "sum(value)",
+        )]);
         assert!(
-            stats_aggregate_batch(&exec, &exec, &stats).expect("no error").is_none(),
+            stats_aggregate_batch(&exec, &exec, &stats)
+                .expect("no error")
+                .is_none(),
             "absent sum must not fold"
         );
     }

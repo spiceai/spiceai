@@ -524,8 +524,11 @@ impl PhysicalOptimizerRule for CayenneStatsAggregateRewriter {
             // aggregate's column indices reference. Soundness guard #2 lives in
             // `stats_aggregate_batch`: every value consumed must be `Exact`.
             let input_stats = query_aggregate.input().partition_statistics(None)?;
-            let Some(batch) =
-                crate::stats_aggregate::stats_aggregate_batch(query_aggregate, aggregate, &input_stats)?
+            let Some(batch) = crate::stats_aggregate::stats_aggregate_batch(
+                query_aggregate,
+                aggregate,
+                &input_stats,
+            )?
             else {
                 return Ok(Transformed::no(node));
             };
@@ -1531,8 +1534,6 @@ mod tests {
         CayenneDynamicFilterSharing, CayenneMaintainedAggregateRewriter, CayenneOptimizerConfig,
         CayenneStatsAggregateRewriter, FilterAddition, apply_filter_additions, plan_schema_fields,
     };
-    use datafusion_common::{ColumnStatistics, ScalarValue};
-    use datafusion_functions_aggregate::sum::sum_udaf;
     use crate::maintained_aggregate::{
         MaintainedAggregateExec, MaintainedAggregateExpr, MaintainedAggregateFunction,
         MaintainedAggregateRegistry, MaintainedAggregateSpec,
@@ -1556,6 +1557,7 @@ mod tests {
     use datafusion::physical_plan::union::UnionExec;
     use datafusion::physical_plan::{ExecutionPlan, ExecutionPlanProperties, displayable};
     use datafusion_common::stats::Precision;
+    use datafusion_common::{ColumnStatistics, ScalarValue};
     use datafusion_common::{DataFusionError, Result as DFResult, Statistics};
     use datafusion_datasource::file::FileSource;
     use datafusion_datasource::file_groups::FileGroup;
@@ -1564,6 +1566,7 @@ mod tests {
     use datafusion_datasource::source::DataSourceExec;
     use datafusion_datasource::{PartitionedFile, TableSchema};
     use datafusion_functions_aggregate::count::count_udaf;
+    use datafusion_functions_aggregate::sum::sum_udaf;
     use datafusion_physical_expr::expressions::{DynamicFilterPhysicalExpr, col, lit};
     use datafusion_physical_expr::projection::ProjectionExprs;
     use datafusion_physical_expr::{PhysicalExpr, conjunction};
@@ -1728,7 +1731,9 @@ mod tests {
             CayenneStatsAggregateRewriter::new().optimize(aggregate, &ConfigOptions::default())?;
 
         assert!(
-            optimized.downcast_ref::<MaintainedAggregateExec>().is_some(),
+            optimized
+                .downcast_ref::<MaintainedAggregateExec>()
+                .is_some(),
             "exact whole-file sum over an unfiltered Cayenne scan must fold"
         );
         Ok(())
