@@ -351,7 +351,7 @@ fn parse_distributed_config(
         .map(|s| s.trim().to_ascii_lowercase())
         .as_deref()
     {
-        None | Some("") | Some("none") => {
+        None | Some("" | "none") => {
             // Distributed is off: reject orphan topology params so forgetting (or
             // mistyping) `distributed_backend` doesn't silently run single-node
             // while `nodes`/`node_rank` look configured.
