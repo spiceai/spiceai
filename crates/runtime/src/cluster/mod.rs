@@ -1949,8 +1949,10 @@ async fn create_scheduler_server(
         on_work_available: Some(on_work_available),
         on_cancel_tasks: Some(on_cancel_tasks),
 
-        // Faster failure detection: 30s timeout with 10s heartbeat interval
-        executor_timeout_seconds: 30,
+        // DIAGNOSTIC: raised 30 -> 300 to test whether the false-"executor lost"
+        // resets (and resulting stage-reset livelock) are caused by the aggressive
+        // 30s timeout firing on busy-but-alive executors. NOT a fix to ship.
+        executor_timeout_seconds: 300,
 
         // The Spice executor uses pull-based polling (execution_loop::poll_loop),
         // so the scheduler must use PullStaged to register executors via PollWork RPCs.
