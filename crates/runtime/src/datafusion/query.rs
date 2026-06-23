@@ -1156,6 +1156,7 @@ impl Query {
                     if let Some(batch_size) =
                         Self::adaptive_flight_batch_size(&session, &request_context, &physical_plan)
                     {
+                        Self::ensure_not_cancelled(&query_cancel_token, &query_id_str)?;
                         let adaptive_session = Self::session_with_batch_size(&session, batch_size);
                         physical_plan = match adaptive_session.create_physical_plan(&plan).await {
                             Ok(stream) => stream,
