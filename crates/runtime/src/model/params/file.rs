@@ -39,7 +39,7 @@ pub(crate) const FILE_PARAMETERS: [ParameterSpec; FILE_PARAM_LEN] = [
         Set to 'true' only when the model weights come from a fully trusted source.",
     ).one_of(&["true", "false"]),
     ParameterSpec::runtime("distributed_backend")
-        .description("Run the model tensor-parallel across multiple nodes. Set to 'ring' to pool the model over the `nodes` list (the 'ring' backend currently supports exactly 2 nodes); omit or 'none' for single-node.")
+        .description("Run the model tensor-parallel across multiple nodes (a Spice enterprise feature; standard builds are single-node only). Set to 'ring' to pool the model over the `nodes` list (the 'ring' backend currently supports exactly 2 nodes); omit or 'none' for single-node.")
         .default("none")
         .one_of(&["none", "ring"]),
     ParameterSpec::runtime("node_rank")

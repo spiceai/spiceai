@@ -119,9 +119,9 @@ pub(crate) fn configure_ring_distributed(
         DistributedBackend::Ring => {}
     }
 
-    if !cfg!(feature = "ring") {
+    if !cfg!(feature = "distributed") {
         return Err(ChatError::FailedToLoadModel {
-            source: "`distributed_backend: ring` was requested, but spiced was not built with the `ring` feature. Rebuild with `--features ring` (compose with `cuda`).".into(),
+            source: "`distributed_backend: ring` was requested, but this build does not include multi-node distributed inference — a Spice enterprise feature (build with the `distributed` Cargo feature to enable it).".into(),
         });
     }
 

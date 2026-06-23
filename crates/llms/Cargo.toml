@@ -96,7 +96,11 @@ flash-attn = [
 # ring all-reduce. No system dependency (unlike `nccl`); the ring all-reduce is
 # correct at world_size = 2 — the two-node case. Composes with `cuda`. Activated
 # at runtime when a model sets `params.distributed_backend: ring` + a `nodes` list.
-ring = [
+#
+# OFF BY DEFAULT: multi-node distributed inference is a Spice enterprise feature
+# and is intentionally not enabled in standard (OSS) builds. The `distributed`
+# name is backend-agnostic (currently the `ring` backend; `nccl` may follow).
+distributed = [
     "mistralrs-core/ring",
     "mistralrs/ring",
 ]
