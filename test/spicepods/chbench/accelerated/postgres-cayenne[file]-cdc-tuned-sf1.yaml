@@ -10,7 +10,7 @@ name: postgres-cayenne[file]-cdc-tuned-sf1
 #   - cdc_prefetch_buffer / cdc_max_coalesced_envelopes 16384 (runtime max after Lever D
 #     raised CDC_PREFETCH_BUFFER_MAX / CDC_MAX_COALESCED_ENVELOPES_MAX 4096->16384):
 #     larger CDC bursts cut metastore round-trips and keep WAL drain ahead of bursty OLTP.
-#   - target_partitions 64: read-path parallelism matched to vCPU count.
+#   - target_partitions 48: read-path parallelism tuned for the current runner sweep.
 #   - per-table cayenne_write_concurrency / segment_cache_mb / compaction_* for the high-volume
 #     upsert tables; reference tables use lighter settings.
 runtime:
@@ -25,7 +25,7 @@ runtime:
     cayenne_metastore_cache_mb: '1024'
     cayenne_metastore_mmap_mb: '4096'
   query:
-    target_partitions: 64
+    target_partitions: 48
   caching:
     sql_results:
       enabled: false
@@ -33,7 +33,7 @@ runtime:
     enabled: false
 
 postgres_connection_params: &postgres_params
-  pg_host: 127.0.0.1
+  pg_host: ${env:CHBENCH_PG_HOST}
   pg_port: '5432'
   pg_db: chbench
   pg_user: bench

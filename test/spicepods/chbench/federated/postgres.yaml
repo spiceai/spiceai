@@ -6,7 +6,7 @@ datasets:
   - from: postgres:warehouse
     name: warehouse
     params: &postgres_params
-      pg_host: 127.0.0.1
+      pg_host: ${env:CHBENCH_PG_HOST}
       pg_port: 5432
       pg_db: chbench
       pg_user: bench
