@@ -348,7 +348,8 @@ fn parse_distributed_config(
         .get("distributed_backend")
         .expose()
         .ok()
-        .map(str::trim)
+        .map(|s| s.trim().to_ascii_lowercase())
+        .as_deref()
     {
         None | Some("") | Some("none") => return Ok(None),
         Some("ring") => llms::chat::DistributedBackend::Ring,
