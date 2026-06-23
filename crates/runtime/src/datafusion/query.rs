@@ -35,7 +35,7 @@ use cache::PlanOrCached;
 use datafusion::{
     common::ParamValues,
     error::{DataFusionError, Result as DataFusionResult},
-    execution::{SendableRecordBatchStream, TaskContext},
+    execution::{SendableRecordBatchStream, TaskContext, memory_pool::MemoryLimit},
     logical_expr::LogicalPlan,
     physical_plan::{
         ExecutionPlan, ExecutionPlanProperties, execute_stream, repartition::RepartitionExec,
@@ -106,6 +106,7 @@ const FLIGHT_ADAPTIVE_BATCH_SIZE_LARGE_ROWS: usize = 10_000_000;
 const FLIGHT_ADAPTIVE_BATCH_SIZE_SMALL_BYTES: usize = 16 * 1024 * 1024;
 const FLIGHT_ADAPTIVE_BATCH_SIZE_MEDIUM_BYTES: usize = 128 * 1024 * 1024;
 const FLIGHT_ADAPTIVE_BATCH_SIZE_LARGE_BYTES: usize = 512 * 1024 * 1024;
+const FLIGHT_ADAPTIVE_BATCH_SIZE_MEMORY_BUDGET_DENOMINATOR: usize = 8;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -266,6 +267,83 @@ impl Query {
         builder_from_existing(session).with_config(config).build()
     }
 
+    fn adaptive_flight_batch_size_memory_limit(session: &SessionState) -> Option<usize> {
+        match session.runtime_env().memory_pool.memory_limit() {
+            MemoryLimit::Finite(limit) => Some(limit),
+            MemoryLimit::Infinite | MemoryLimit::Unknown => None,
+        }
+    }
+
+    fn estimated_flight_row_size_bytes(
+        schema: &Schema,
+        estimated_rows: Option<usize>,
+        estimated_bytes: Option<usize>,
+    ) -> Option<usize> {
+        if let (Some(rows), Some(bytes)) = (estimated_rows, estimated_bytes)
+            && rows > 0
+        {
+            return Some(bytes.div_ceil(rows).max(1));
+        }
+
+        schema.fields().iter().try_fold(0_usize, |size, field| {
+            field
+                .data_type()
+                .primitive_width()
+                .and_then(|width| size.checked_add(width))
+        })
+    }
+
+    fn limit_adaptive_flight_batch_size_for_memory(
+        session: &SessionState,
+        current: usize,
+        selected: usize,
+        physical_plan: &Arc<dyn ExecutionPlan>,
+        estimated_rows: Option<usize>,
+        estimated_bytes: Option<usize>,
+    ) -> Option<usize> {
+        let Some(memory_limit) = Self::adaptive_flight_batch_size_memory_limit(session) else {
+            return Some(selected);
+        };
+        let batch_memory_budget =
+            memory_limit / FLIGHT_ADAPTIVE_BATCH_SIZE_MEMORY_BUDGET_DENOMINATOR;
+
+        let Some(row_size) = Self::estimated_flight_row_size_bytes(
+            physical_plan.schema().as_ref(),
+            estimated_rows,
+            estimated_bytes,
+        ) else {
+            tracing::debug!(
+                memory_limit_bytes = memory_limit,
+                batch_memory_budget_bytes = batch_memory_budget,
+                estimated_rows,
+                estimated_bytes,
+                "Skipping adaptive Flight batch size because result row size is unknown under a finite query memory limit"
+            );
+            return None;
+        };
+
+        if row_size == 0 {
+            return Some(selected);
+        }
+
+        let memory_limited_batch_size = batch_memory_budget / row_size;
+        let selected = selected.min(memory_limited_batch_size);
+
+        if selected <= current {
+            tracing::debug!(
+                current_batch_size = current,
+                memory_limited_batch_size,
+                row_size_bytes = row_size,
+                memory_limit_bytes = memory_limit,
+                batch_memory_budget_bytes = batch_memory_budget,
+                "Skipping adaptive Flight batch size because query memory limit does not allow a larger result batch"
+            );
+            return None;
+        }
+
+        Some(selected)
+    }
+
     fn adaptive_flight_batch_size(
         session: &SessionState,
         request_context: &RequestContext,
@@ -319,6 +397,15 @@ impl Query {
         if selected <= current {
             return None;
         }
+
+        let selected = Self::limit_adaptive_flight_batch_size_for_memory(
+            session,
+            current,
+            selected,
+            physical_plan,
+            estimated_rows,
+            estimated_bytes,
+        )?;
 
         tracing::debug!(
             current_batch_size = current,
@@ -2272,6 +2359,7 @@ mod tests {
         datatypes::{DataType, Field, Schema, UnionMode},
     };
     use datafusion::common::{Statistics, stats::Precision};
+    use datafusion::execution::runtime_env::RuntimeEnvBuilder;
     use datafusion::logical_expr::Extension;
     use datafusion::physical_expr::{EquivalenceProperties, Partitioning};
     use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
@@ -2980,11 +3068,19 @@ mod tests {
 
     impl TestExecutionPlan {
         fn new(metrics: Option<MetricsSet>, children: Vec<Arc<dyn ExecutionPlan>>) -> Self {
+            Self::new_with_schema(metrics, children, Arc::new(Schema::empty()))
+        }
+
+        fn new_with_schema(
+            metrics: Option<MetricsSet>,
+            children: Vec<Arc<dyn ExecutionPlan>>,
+            schema: Arc<Schema>,
+        ) -> Self {
             Self {
                 metrics,
                 children,
                 properties: Arc::new(PlanProperties::new(
-                    EquivalenceProperties::new(Arc::new(Schema::empty())),
+                    EquivalenceProperties::new(schema),
                     Partitioning::UnknownPartitioning(1),
                     EmissionType::Final,
                     Boundedness::Bounded,
@@ -2997,6 +3093,13 @@ mod tests {
             Self {
                 statistics: Some(statistics),
                 ..Self::new(None, vec![])
+            }
+        }
+
+        fn with_statistics_and_schema(statistics: Statistics, schema: Arc<Schema>) -> Self {
+            Self {
+                statistics: Some(statistics),
+                ..Self::new_with_schema(None, vec![], schema)
             }
         }
     }
@@ -3040,11 +3143,10 @@ mod tests {
         fn partition_statistics(
             &self,
             _partition: Option<usize>,
-        ) -> datafusion::common::Result<Statistics> {
-            Ok(self
-                .statistics
-                .clone()
-                .unwrap_or_else(|| Statistics::new_unknown(self.schema().as_ref())))
+        ) -> datafusion::common::Result<Arc<Statistics>> {
+            Ok(Arc::new(self.statistics.clone().unwrap_or_else(|| {
+                Statistics::new_unknown(self.schema().as_ref())
+            })))
         }
 
         fn execute(
@@ -3071,6 +3173,18 @@ mod tests {
             .build()
     }
 
+    fn session_with_finite_memory_limit(batch_size: usize, memory_limit: usize) -> SessionState {
+        let runtime_env = RuntimeEnvBuilder::default()
+            .with_memory_limit(memory_limit, 1.0)
+            .build_arc()
+            .expect("runtime env should build");
+        SessionContext::new_with_config_rt(
+            SessionConfig::new().with_batch_size(batch_size),
+            runtime_env,
+        )
+        .state()
+    }
+
     #[test]
     fn adaptive_flight_batch_size_uses_max_for_large_estimates() {
         let session =
@@ -3087,6 +3201,45 @@ mod tests {
         assert_eq!(
             Query::adaptive_flight_batch_size(&session, &request_context, &plan),
             Some(131_072)
+        );
+    }
+
+    #[test]
+    fn adaptive_flight_batch_size_honors_query_memory_limit() {
+        let session = session_with_finite_memory_limit(8192, 128 * 1024 * 1024);
+        let request_context = request_context_with_flight_batch_size(
+            Protocol::FlightSQL,
+            FlightBatchSize::Adaptive { max: 131_072 },
+        );
+        let statistics = Statistics::new_unknown(&Schema::empty())
+            .with_num_rows(Precision::Exact(100_000_000))
+            .with_total_byte_size(Precision::Exact(100_000_000 * 1024));
+        let plan =
+            Arc::new(TestExecutionPlan::with_statistics(statistics)) as Arc<dyn ExecutionPlan>;
+
+        assert_eq!(
+            Query::adaptive_flight_batch_size(&session, &request_context, &plan),
+            Some(16_384)
+        );
+    }
+
+    #[test]
+    fn adaptive_flight_batch_size_skips_unknown_row_size_with_finite_memory_limit() {
+        let session = session_with_finite_memory_limit(8192, 128 * 1024 * 1024);
+        let request_context = request_context_with_flight_batch_size(
+            Protocol::FlightSQL,
+            FlightBatchSize::Adaptive { max: 131_072 },
+        );
+        let schema = Arc::new(Schema::new(vec![Field::new("value", DataType::Utf8, true)]));
+        let statistics =
+            Statistics::new_unknown(schema.as_ref()).with_num_rows(Precision::Exact(100_000_000));
+        let plan = Arc::new(TestExecutionPlan::with_statistics_and_schema(
+            statistics, schema,
+        )) as Arc<dyn ExecutionPlan>;
+
+        assert_eq!(
+            Query::adaptive_flight_batch_size(&session, &request_context, &plan),
+            None
         );
     }
 
