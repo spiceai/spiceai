@@ -4067,12 +4067,11 @@ checksum = "510ca239cf13b7f8d16a2b48f263de7b4f8c566f0af58d901031473c76afb1e3"
 name = "connector-abfs"
 version = "2.1.0-unstable"
 dependencies = [
- "linkme",
  "object_store",
- "paste",
  "runtime",
  "snafu",
  "tokio",
+ "tracing",
  "url",
 ]
 
@@ -4082,6 +4081,7 @@ version = "2.1.0-unstable"
 dependencies = [
  "adbc_core",
  "adbc_driver_manager",
+ "app",
  "arrow",
  "async-trait",
  "blake3",
@@ -4089,9 +4089,7 @@ dependencies = [
  "datafusion",
  "datafusion-table-providers",
  "futures",
- "linkme",
  "parking_lot 0.12.5",
- "paste",
  "runtime",
  "sha2 0.10.9",
  "snafu",
@@ -4126,12 +4124,11 @@ dependencies = [
  "data_components",
  "datafusion",
  "datafusion-table-providers",
- "linkme",
  "opentelemetry",
- "paste",
  "runtime",
  "snafu",
  "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -4219,11 +4216,10 @@ dependencies = [
  "datafusion",
  "datafusion-table-providers",
  "duckdb",
- "linkme",
- "paste",
  "runtime",
  "snafu",
  "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -4274,9 +4270,7 @@ dependencies = [
 name = "connector-gcs"
 version = "2.1.0-unstable"
 dependencies = [
- "linkme",
  "object_store",
- "paste",
  "runtime",
  "snafu",
  "tokio",
@@ -4291,20 +4285,20 @@ dependencies = [
  "data_components",
  "datafusion",
  "globset",
- "linkme",
  "opentelemetry",
- "paste",
  "reqwest 0.12.24",
  "runtime",
  "secrecy",
  "snafu",
  "tokio",
+ "tracing",
 ]
 
 [[package]]
 name = "connector-github"
 version = "2.1.0-unstable"
 dependencies = [
+ "app",
  "arrow",
  "arrow-schema",
  "async-trait",
@@ -4314,8 +4308,6 @@ dependencies = [
  "globset",
  "governor",
  "graphql-parser",
- "linkme",
- "paste",
  "reqwest 0.12.24",
  "runtime",
  "runtime-rate-control",
@@ -4325,6 +4317,7 @@ dependencies = [
  "tokio",
  "tracing",
  "url",
+ "util",
 ]
 
 [[package]]
@@ -4380,12 +4373,11 @@ dependencies = [
  "datafusion",
  "fundu",
  "futures",
- "linkme",
  "opentelemetry",
- "paste",
  "runtime",
  "secrecy",
  "serde",
+ "serde_json",
  "snafu",
  "tokio",
  "tonic",
