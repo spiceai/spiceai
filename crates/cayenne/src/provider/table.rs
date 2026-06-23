@@ -10401,7 +10401,7 @@ impl CayenneTableProvider {
         }
         let Some((snapshot_id, threshold)) = protected_snapshot else {
             let _view_guard = self.scan_state_lock.write().await;
-            self.mark_maintained_aggregates_stale();
+            self.mark_maintained_aggregates_stale_on_checkpoint();
             self.publish_on_conflict_update(update);
             return;
         };
@@ -10414,7 +10414,7 @@ impl CayenneTableProvider {
             let _view_guard = self.scan_state_lock.write().await;
             if self.try_commit_prepared_protected_snapshot(prepared) {
                 let update = update.take().unwrap_or_else(OnConflictUpdate::none);
-                self.mark_maintained_aggregates_stale();
+                self.mark_maintained_aggregates_stale_on_checkpoint();
                 self.publish_on_conflict_update(update);
                 return;
             }
@@ -13324,6 +13324,21 @@ impl CayenneTableProvider {
         );
     }
 
+    /// Stale-marking for a mem-tier checkpoint publish. A checkpoint relocates
+    /// already-counted rows (RAM tier → durable file) and publishes tombstones
+    /// the registry already retracted on the write path, so it is
+    /// aggregate-NEUTRAL for a registry that maintains a per-PK retraction index:
+    /// staling there would discard a still-correct index that nothing rebuilds
+    /// (rebuild runs only at `open`), making incremental retraction a
+    /// steady-state no-op after the first delete-bearing checkpoint. An
+    /// insert-only registry (no index) keeps the conservative stale — it cannot
+    /// absorb deletes incrementally.
+    fn mark_maintained_aggregates_stale_on_checkpoint(&self) {
+        if !self.maintained_aggregates.supports_retraction() {
+            self.mark_maintained_aggregates_stale();
+        }
+    }
+
     fn prepare_maintained_aggregate_insert_batches(
         &self,
         batches: Arc<Vec<RecordBatch>>,
@@ -13389,25 +13404,30 @@ impl CayenneTableProvider {
     /// does not depend on the delete batch's source-schema column order. Returns
     /// `None` when a PK column is missing or null (the row can't be keyed). This
     /// mirrors the by-name PK resolution in [`Self::cdc_delete_intents_from_batch`].
-    fn project_delete_pk_batch(
+    /// Resolve this table's primary-key columns out of `batch` BY NAME (CDC
+    /// batches carry the source-schema column order, not the table's), in
+    /// `pk_column_indices` order, each cast to the table column type. Returns
+    /// `None` when any PK column is absent or contains a null (the rows can't be
+    /// keyed). Shared by the delete-tombstone path
+    /// ([`Self::cdc_delete_intents_from_batch`]) and the maintained-aggregate
+    /// retraction projection ([`Self::project_delete_pk_batch`]) so the three
+    /// coupled invariants — by-name resolution, cast-on-type-mismatch, null-bail —
+    /// stay in lockstep.
+    fn resolve_pk_columns_by_name(
         &self,
-        delete_rows: &RecordBatch,
-    ) -> datafusion_common::Result<Option<RecordBatch>> {
-        if delete_rows.num_rows() == 0 || self.pk_column_indices.is_empty() {
+        batch: &RecordBatch,
+    ) -> std::result::Result<Option<Vec<ArrayRef>>, arrow::error::ArrowError> {
+        if batch.num_rows() == 0 || self.pk_column_indices.is_empty() {
             return Ok(None);
         }
-        let pk_schema = Arc::new(
-            self.table_metadata
-                .schema
-                .project(&self.pk_column_indices)?,
-        );
-        let batch_schema = delete_rows.schema();
+        let batch_schema = batch.schema();
         let mut columns: Vec<ArrayRef> = Vec::with_capacity(self.pk_column_indices.len());
-        for field in pk_schema.fields() {
+        for &table_idx in &self.pk_column_indices {
+            let field = self.table_metadata.schema.field(table_idx);
             let Ok(batch_idx) = batch_schema.index_of(field.name()) else {
                 return Ok(None);
             };
-            let column = delete_rows.column(batch_idx);
+            let column = batch.column(batch_idx);
             let column = if column.data_type() == field.data_type() {
                 Arc::clone(column)
             } else {
@@ -13418,6 +13438,26 @@ impl CayenneTableProvider {
             }
             columns.push(column);
         }
+        Ok(Some(columns))
+    }
+
+    /// Project a CDC delete batch onto a `RecordBatch` of the table's primary-key
+    /// columns (resolved by name via [`Self::resolve_pk_columns_by_name`],
+    /// table-schema types) — the layout
+    /// [`MaintainedAggregateRegistry::apply_pk_deletes`] expects. `None` when the
+    /// rows can't be keyed.
+    fn project_delete_pk_batch(
+        &self,
+        delete_rows: &RecordBatch,
+    ) -> datafusion_common::Result<Option<RecordBatch>> {
+        let Some(columns) = self.resolve_pk_columns_by_name(delete_rows)? else {
+            return Ok(None);
+        };
+        let pk_schema = Arc::new(
+            self.table_metadata
+                .schema
+                .project(&self.pk_column_indices)?,
+        );
         Ok(Some(RecordBatch::try_new(pk_schema, columns)?))
     }
 
@@ -15780,28 +15820,9 @@ impl CayenneTableProvider {
         &self,
         batch: &RecordBatch,
     ) -> Result<Option<(OnConflictDeletions, u64, u64)>> {
-        if batch.num_rows() == 0 || self.pk_column_indices.is_empty() {
+        let Some(pk_columns) = self.resolve_pk_columns_by_name(batch)? else {
             return Ok(None);
-        }
-
-        let batch_schema = batch.schema();
-        let mut pk_columns: Vec<ArrayRef> = Vec::with_capacity(self.pk_column_indices.len());
-        for &table_idx in &self.pk_column_indices {
-            let field = self.table_metadata.schema.field(table_idx);
-            let Ok(batch_idx) = batch_schema.index_of(field.name()) else {
-                return Ok(None);
-            };
-            let column = batch.column(batch_idx);
-            let column = if column.data_type() == field.data_type() {
-                Arc::clone(column)
-            } else {
-                arrow::compute::cast(column, field.data_type())?
-            };
-            if column.null_count() > 0 {
-                return Ok(None);
-            }
-            pk_columns.push(column);
-        }
+        };
 
         let mut deletions = OnConflictDeletions::default();
         let (key_count, byte_estimate) = match &self.pk_deletion_strategy {
