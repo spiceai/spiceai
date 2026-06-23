@@ -55,7 +55,7 @@ use datafusion::optimizer::{Optimizer, OptimizerRule};
 use datafusion::{
     catalog::{CatalogProvider, MemoryCatalogProvider},
     execution::{
-        DiskManager, SessionStateBuilder,
+        DiskManager, FunctionRegistry, SessionStateBuilder,
         disk_manager::DiskManagerMode,
         memory_pool::{GreedyMemoryPool, TrackConsumersPool},
         object_store::ObjectStoreRegistry,
@@ -856,8 +856,30 @@ impl DataFusionBuilder {
             panic!("Unable to register JSON functions: {e}");
         }
 
-        if let Err(e) = datafusion_spark::register_all(&mut state) {
-            panic!("Unable to register Spark functions: {e}");
+        // Register Spark-compatible functions, but skip Spark's `trunc`. DataFusion
+        // 54's Spark crate ships a date-truncation `trunc` UDF whose signature
+        // requires a Date/String argument; `register_all` would overwrite the
+        // built-in numeric `trunc(value, scale)`, breaking `trunc(<float>, <int>)`
+        // planning. We keep the built-in numeric `trunc`, so register every Spark
+        // scalar function except `trunc`, then the aggregate and window functions
+        // (mirrors `datafusion_spark::register_all`).
+        for udf in datafusion_spark::all_default_scalar_functions() {
+            if udf.name() == "trunc" {
+                continue;
+            }
+            if let Err(e) = state.register_udf(udf) {
+                panic!("Unable to register Spark scalar function: {e}");
+            }
+        }
+        for udaf in datafusion_spark::all_default_aggregate_functions() {
+            if let Err(e) = state.register_udaf(udaf) {
+                panic!("Unable to register Spark aggregate function: {e}");
+            }
+        }
+        for udwf in datafusion_spark::all_default_window_functions() {
+            if let Err(e) = state.register_udwf(udwf) {
+                panic!("Unable to register Spark window function: {e}");
+            }
         }
 
         let catalog = MemoryCatalogProvider::new();
