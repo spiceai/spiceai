@@ -38,6 +38,14 @@ pub struct QueryParams {
     pub format: Format,
 }
 
+/// Marker extension indicating whether the metrics endpoint terminates TLS.
+///
+/// When spiced is configured with TLS the metrics server is served over HTTPS,
+/// so the status probe must use the `https` scheme (and tolerate a loopback
+/// certificate mismatch) rather than hardcoding `http`.
+#[derive(Debug, Clone, Copy)]
+pub struct MetricsTlsEnabled(pub bool);
+
 #[derive(Debug, Serialize, Deserialize)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub struct ConnectionDetails {
@@ -98,6 +106,7 @@ pub struct ConnectionDetails {
 pub(crate) async fn get(
     Extension(cfg): Extension<Arc<config::Config>>,
     Extension(with_metrics): Extension<Option<SocketAddr>>,
+    Extension(metrics_tls): Extension<MetricsTlsEnabled>,
     Query(params): Query<QueryParams>,
 ) -> Response {
     let cfg = cfg.as_ref();
@@ -119,13 +128,15 @@ pub(crate) async fn get(
             name: "metrics",
             endpoint: with_metrics.map_or("N/A".to_string(), |addr| addr.to_string()),
             status: match with_metrics {
-                Some(metrics_url) => match get_metrics_status(&metrics_url.to_string()).await {
-                    Ok(status) => status,
-                    Err(e) => {
-                        tracing::error!("Error getting metrics status from {metrics_url}: {e}");
-                        ComponentStatus::error_with_message(e.to_string())
+                Some(metrics_url) => {
+                    match get_metrics_status(&metrics_url.to_string(), metrics_tls.0).await {
+                        Ok(status) => status,
+                        Err(e) => {
+                            tracing::error!("Error getting metrics status from {metrics_url}: {e}");
+                            ComponentStatus::error_with_message(e.to_string())
+                        }
                     }
-                },
+                }
                 None => ComponentStatus::Disabled,
             },
         },
@@ -180,9 +191,11 @@ async fn get_flight_status(flight_addr: &str) -> ComponentStatus {
 
 async fn get_metrics_status(
     metrics_addr: &str,
+    tls_enabled: bool,
 ) -> Result<ComponentStatus, Box<dyn std::error::Error>> {
     use std::sync::LazyLock;
 
+    // Plain HTTP client for non-TLS metrics endpoints.
     static METRICS_CLIENT: LazyLock<Result<reqwest::Client, reqwest::Error>> =
         LazyLock::new(|| {
             reqwest::Client::builder()
@@ -191,14 +204,32 @@ async fn get_metrics_status(
                 .build()
         });
 
-    let client = METRICS_CLIENT.as_ref().map_err(|e| {
+    // HTTPS client for TLS-terminating metrics endpoints. This probe is an
+    // in-process loopback request, so the certificate's SAN almost certainly
+    // won't match 127.0.0.1/0.0.0.0 — accept invalid certs for the health check.
+    static METRICS_TLS_CLIENT: LazyLock<Result<reqwest::Client, reqwest::Error>> =
+        LazyLock::new(|| {
+            reqwest::Client::builder()
+                .connect_timeout(Duration::from_secs(2))
+                .timeout(Duration::from_secs(5))
+                .danger_accept_invalid_certs(true)
+                .build()
+        });
+
+    let client = if tls_enabled {
+        &METRICS_TLS_CLIENT
+    } else {
+        &METRICS_CLIENT
+    };
+    let client = client.as_ref().map_err(|e| {
         Box::new(std::io::Error::other(format!(
             "Failed to build metrics HTTP client: {e}"
         ))) as Box<dyn std::error::Error>
     })?;
 
+    let scheme = if tls_enabled { "https" } else { "http" };
     let resp = client
-        .get(format!("http://{metrics_addr}/health"))
+        .get(format!("{scheme}://{metrics_addr}/health"))
         .send()
         .await?;
     if resp.status().is_success() && resp.text().await? == "OK" {
