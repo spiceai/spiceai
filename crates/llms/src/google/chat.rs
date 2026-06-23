@@ -316,6 +316,7 @@ fn convert_google_response_to_openai(
             ChatChoice {
                 index: idx as u32,
                 message: ChatCompletionResponseMessage {
+                    reasoning_content: None,
                     role: Role::Assistant,
                     content,
                     tool_calls: tool_calls_opt,

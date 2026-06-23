@@ -39,6 +39,7 @@ use super::delete::{
 };
 use super::mutation_writer::AppendMutationWriter;
 use super::streaming::StreamingExec;
+use crate::bounded_fifo::BoundedFifoSet;
 use crate::catalog::{CatalogError, CatalogResult, MetadataCatalog, SnapshotSequenceCommit};
 use crate::maintained_aggregate::{MaintainedAggregateRegistry, MaintainedAggregateSpec};
 use crate::metadata::{
@@ -50,6 +51,7 @@ use crate::provider::scan::{
 };
 use crate::provider::sink::CayenneDataSink;
 use crate::provider::{Error, Result};
+use crate::resource_starvation::ResourceStarvationTracker;
 use arrow::array::{
     Array, ArrayRef, BinaryArray, BinaryViewArray, BooleanArray, Date32Array, Date64Array,
     Decimal128Array, FixedSizeBinaryArray, Float32Array, Float64Array, Int8Array, Int16Array,
@@ -170,45 +172,9 @@ const PROTECTED_SNAPSHOT_AGE_WARNING_KEY_LIMIT: usize = 1024;
 /// default 10s) — a fixed count of 30 would have meant anywhere from one
 /// minute to thirty minutes of silent starvation depending on the live
 /// interval. See `compact_protected_snapshots_subset_inner` and
-/// [`PositionCompactionSkipStreak`].
+/// [`ResourceStarvationTracker`].
 const POSITION_COMPACTION_SKIP_WARN_AFTER: Duration = Duration::from_secs(30);
 
-/// One starvation episode of writer-active position-compaction skips:
-/// consecutive skip count plus when the episode began, so the WARN escalation
-/// is wall-clock-based and independent of the (dynamically tuned) compactor
-/// cadence. Cold-path state — touched at most once per background wake —
-/// behind a short-held mutex.
-#[derive(Debug, Default)]
-struct PositionCompactionSkipStreak {
-    /// Consecutive skips in the current episode (`0` = no live episode).
-    skips: usize,
-    /// When the current episode's first skip happened.
-    since: Option<Instant>,
-    /// Whether this episode already escalated to WARN (one-shot per episode).
-    warned: bool,
-}
-
-impl PositionCompactionSkipStreak {
-    /// Record one skipped compaction attempt at `now`. Returns
-    /// `Some(consecutive_skips)` exactly once per episode — when the episode's
-    /// wall-clock age first reaches `warn_after` — so the caller emits the WARN
-    /// then and only then.
-    fn record_skip(&mut self, now: Instant, warn_after: Duration) -> Option<usize> {
-        self.skips = self.skips.saturating_add(1);
-        let since = *self.since.get_or_insert(now);
-        if !self.warned && now.duration_since(since) >= warn_after {
-            self.warned = true;
-            return Some(self.skips);
-        }
-        None
-    }
-
-    /// A compaction attempt acquired the writer lock — the episode (if any) is
-    /// over; the next skip starts a fresh one (and may WARN again).
-    fn reset(&mut self) {
-        *self = Self::default();
-    }
-}
 const MIN_CONSECUTIVE_INLIST_REWRITE_VALUES: usize = 4;
 /// Upper bound on PK `IN` list cardinality that qualifies for `target_partitions = 1`.
 const MAX_PK_SELECTIVE_INLIST_VALUES: usize = 32;
@@ -216,29 +182,6 @@ const MAX_PK_SELECTIVE_INLIST_VALUES: usize = 32;
 const MAX_PK_SELECTIVE_RANGE_SPAN: i64 = 32;
 /// Maximum tombstone keys pushed into the Vortex scan predicate as `NOT IN`.
 const MAX_VORTEX_KEY_DELETE_PUSHDOWN: usize = 256;
-
-#[derive(Debug, Default)]
-struct BoundedWarningKeys {
-    seen: HashSet<String>,
-    insertion_order: VecDeque<String>,
-}
-
-impl BoundedWarningKeys {
-    fn insert_new(&mut self, key: String, limit: usize) -> bool {
-        if self.seen.contains(&key) {
-            return false;
-        }
-
-        if self.seen.len() >= limit
-            && let Some(oldest_key) = self.insertion_order.pop_front()
-        {
-            self.seen.remove(&oldest_key);
-        }
-
-        self.insertion_order.push_back(key.clone());
-        self.seen.insert(key)
-    }
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SnapshotMaintenanceTrigger {
@@ -254,18 +197,17 @@ enum SnapshotMaintenanceTrigger {
 }
 
 fn should_warn_protected_snapshot_age(
-    warning_keys: &ParkingMutex<BoundedWarningKeys>,
+    warning_keys: &ParkingMutex<BoundedFifoSet>,
     snapshot_id: &str,
     warning_kind: &'static str,
 ) -> bool {
-    let key = format!("{warning_kind}:{snapshot_id}");
     warning_keys
         .lock()
-        .insert_new(key, PROTECTED_SNAPSHOT_AGE_WARNING_KEY_LIMIT)
+        .insert_new(format!("{warning_kind}:{snapshot_id}"))
 }
 
 fn protected_snapshot_age(
-    warning_keys: &ParkingMutex<BoundedWarningKeys>,
+    warning_keys: &ParkingMutex<BoundedFifoSet>,
     snapshot_id: &str,
     now: SystemTime,
 ) -> Option<Duration> {
@@ -315,7 +257,7 @@ fn protected_snapshot_age(
 }
 
 fn oldest_protected_snapshot_age(
-    warning_keys: &ParkingMutex<BoundedWarningKeys>,
+    warning_keys: &ParkingMutex<BoundedFifoSet>,
     protected_snapshots: &HashMap<String, i64>,
     now: SystemTime,
 ) -> Option<Duration> {
@@ -330,7 +272,7 @@ fn duration_millis_saturating(duration: Duration) -> u64 {
 }
 
 fn protected_snapshot_maintenance_trigger(
-    warning_keys: &ParkingMutex<BoundedWarningKeys>,
+    warning_keys: &ParkingMutex<BoundedFifoSet>,
     protected_snapshots: &HashMap<String, i64>,
     trigger_count: usize,
     trigger_age: Option<Duration>,
@@ -2014,7 +1956,7 @@ pub struct CayenneTableProvider {
     protected_snapshots: Arc<ArcSwap<HashMap<String, i64>>>,
     /// Table-scoped warning dedupe for protected snapshot ids that cannot
     /// provide a `UUIDv7` timestamp for age-triggered maintenance.
-    protected_snapshot_age_warning_keys: Arc<ParkingMutex<BoundedWarningKeys>>,
+    protected_snapshot_age_warning_keys: Arc<ParkingMutex<BoundedFifoSet>>,
     /// Cached visible primary-key set for auto conflict detection.
     ///
     /// The first auto-mode insert still scans existing data to build the set;
@@ -2360,7 +2302,7 @@ pub struct CayenneTableProvider {
     /// an episode sustained past `POSITION_COMPACTION_SKIP_WARN_AFTER` of
     /// wall-clock time escalates the (otherwise TRACE-level) skip to a
     /// one-shot WARN.
-    position_compaction_skip_streak: Arc<ParkingMutex<PositionCompactionSkipStreak>>,
+    position_compaction_skip_streak: Arc<ParkingMutex<ResourceStarvationTracker>>,
     /// Serializes concurrent compaction passes on this table so a write-driven
     /// inline trigger and the background scheduler can't both rewrite the
     /// current snapshot at the same time. Held across the *entire* trigger
@@ -2836,6 +2778,14 @@ fn deserialize_pk_blooms_sidecar(bytes: &[u8]) -> Option<(Vec<PkBloom>, String)>
     ))
     .ok()?;
     let mut rest = bytes.get(count_end..)?;
+    // Reject an impossible bloom count before allocating: each bloom is
+    // self-describing and consumes >= 32 bytes (24-byte header + >= one 8-byte
+    // word), so a `count` larger than the remaining bytes can encode means a
+    // corrupt/truncated sidecar — return None (clean rebuild) rather than risk a
+    // huge `with_capacity` allocation. Same guard idiom as `deserialize_from_prefix`.
+    if count > rest.len() / 32 {
+        return None;
+    }
     let mut blooms = Vec::with_capacity(count);
     for _ in 0..count {
         let (bloom, consumed) = PkBloom::deserialize_from_prefix(rest)?;
@@ -2904,15 +2854,16 @@ impl ShardedPkIndex {
     /// blooms during `load_existing_keyset` / `try_load_persisted_pk_index`.
     fn from_exact(keyset: CachedPkKeyset, n: usize) -> Self {
         let n = n.max(1);
-        let total_keys = keyset.keys.len().max(1);
-        let per_key_bytes = keyset.approx_bytes / total_keys;
         let mut shards: Vec<CachedPkKeyset> =
             (0..n).map(|_| CachedPkKeyset::with_capacity(0)).collect();
         for (key, loc) in keyset.keys {
             let s = shard_of_pk(key.row().as_ref(), n);
-            let shard = &mut shards[s];
-            shard.approx_bytes = shard.approx_bytes.saturating_add(per_key_bytes);
-            shard.keys.insert(key, loc);
+            // Route through CachedPkKeyset::insert — the single source of truth for
+            // approx_bytes (per-key approx_pk_keyset_entry_bytes) — so each shard's
+            // byte tally is exact for variable-length/composite PKs, not an even
+            // split of the source total. The per-shard sums then add back up to the
+            // unsharded keyset's bytes with no integer-division undercount.
+            shards[s].insert(key, loc);
         }
         // The position-delete capture set is table-global; every shard needs the
         // complete skip set so its read-back doesn't re-capture a covered file.
@@ -3633,6 +3584,9 @@ struct ProtectedSnapshotScan<'a> {
     pk_indices_in_projection: &'a [usize],
     protected_snapshots: Arc<HashMap<String, i64>>,
     deletion_snapshot: &'a PkDeletionSnapshot,
+    /// View-typed read schema so protected-snapshot scans match the main file
+    /// scan in the union (see `viewify_read_schema`).
+    read_schema: SchemaRef,
 }
 
 struct PreparedProtectedSnapshotUpdate {
@@ -4068,6 +4022,20 @@ impl CayenneTableProvider {
     #[must_use]
     pub fn table_schema(&self) -> SchemaRef {
         self.table_schema.load_full()
+    }
+
+    /// The schema advertised to query planning and produced by `scan()`: the
+    /// stored [`Self::table_schema`] with string/binary columns mapped to Arrow
+    /// view types (see [`viewify_read_schema`]). Decoupled from the stored
+    /// schema, which the write/CDC/stats/keyset paths keep using with the
+    /// original `Utf8`/`Binary` types. Recomputed on demand so it tracks live
+    /// schema evolution; cheap (top-level field remap) and not on a per-row path.
+    pub(crate) fn read_schema(&self) -> SchemaRef {
+        if self.context.force_view_read_schema() {
+            viewify_read_schema(&self.table_schema())
+        } else {
+            self.table_schema()
+        }
     }
 
     /// Live (stream-time) widening schema evolution: atomically widen this
@@ -6328,7 +6296,7 @@ impl CayenneTableProvider {
             )),
             protected_snapshots: Arc::new(ArcSwap::from_pointee(protected_snapshots)),
             protected_snapshot_age_warning_keys: Arc::new(ParkingMutex::new(
-                BoundedWarningKeys::default(),
+                BoundedFifoSet::with_capacity(PROTECTED_SNAPSHOT_AGE_WARNING_KEY_LIMIT),
             )),
             pk_keyset_cache: Arc::new(ParkingMutex::new(None)),
             sharded_pk_keyset_cache: Arc::new(ParkingMutex::new(None)),
@@ -6387,7 +6355,7 @@ impl CayenneTableProvider {
             snapshot_last_listed: Arc::new(ParkingMutex::new(HashMap::new())),
             snapshot_scan_refs: Arc::new(ParkingMutex::new(HashMap::new())),
             position_compaction_skip_streak: Arc::new(ParkingMutex::new(
-                PositionCompactionSkipStreak::default(),
+                ResourceStarvationTracker::new(POSITION_COMPACTION_SKIP_WARN_AFTER),
             )),
             new_files_since_last_compaction: Arc::new(AtomicUsize::new(0)),
             last_moved_snapshot_files: Arc::new(ParkingMutex::new(None)),
@@ -7357,6 +7325,56 @@ impl CayenneTableProvider {
             distinct_count: stats.distinct_count.to_inexact(),
             byte_size: stats.byte_size.to_inexact(),
         }
+    }
+
+    /// Builds a column-statistics overlay aligned to `output_schema` from the
+    /// incrementally-maintained optimizer aggregate (live min/max + integer NDV
+    /// via `distinct_count`). [`CayenneAccelerationExec`] uses this to refill
+    /// the join-key stats that the base+delta `UnionExec` wipes to
+    /// `Precision::Absent`, restoring `JoinSelection`'s ability to size joins.
+    ///
+    /// Only `column_statistics` are populated (downgraded to inexact via
+    /// [`Self::column_statistics_to_inexact`]); `num_rows`/`total_byte_size`
+    /// are left `Absent` so the physical scan's own filter-aware `num_rows`
+    /// always wins. Columns not present in the aggregate map to
+    /// `ColumnStatistics::new_unknown()`.
+    ///
+    /// Returns `None` when the aggregate is cold or its column count does not
+    /// match the table schema, leaving the scan to report child stats unchanged.
+    fn optimizer_stats_overlay_for_schema(
+        &self,
+        output_schema: &SchemaRef,
+    ) -> Option<Arc<Statistics>> {
+        let table_stats = self.optimizer_table_statistics()?;
+        let table_schema = self.table_schema();
+        if table_stats.column_statistics.len() != table_schema.fields().len() {
+            return None;
+        }
+
+        let by_name: HashMap<&str, &ColumnStatistics> = table_schema
+            .fields()
+            .iter()
+            .map(|f| f.name().as_str())
+            .zip(table_stats.column_statistics.iter())
+            .collect();
+
+        let column_statistics = output_schema
+            .fields()
+            .iter()
+            .map(|field| {
+                by_name
+                    .get(field.name().as_str())
+                    .map_or_else(ColumnStatistics::new_unknown, |stats| {
+                        Self::column_statistics_to_inexact((*stats).clone())
+                    })
+            })
+            .collect();
+
+        Some(Arc::new(Statistics {
+            num_rows: DFPrecision::Absent,
+            total_byte_size: DFPrecision::Absent,
+            column_statistics,
+        }))
     }
 
     fn clear_cached_table_statistics_unlocked(&self) {
@@ -12993,11 +13011,10 @@ impl CayenneTableProvider {
                 // WARN, once per starvation episode, on a WALL-CLOCK bound
                 // (the skip cadence follows the dynamically tuned compactor
                 // interval, so a count alone is meaningless).
-                let warn_skips = self
-                    .position_compaction_skip_streak
-                    .lock()
-                    .record_skip(Instant::now(), POSITION_COMPACTION_SKIP_WARN_AFTER);
-                if let Some(consecutive_skips) = warn_skips {
+
+                if let Some(consecutive_skips) =
+                    self.position_compaction_skip_streak.lock().record_denial()
+                {
                     tracing::warn!(
                         target: "cayenne::compaction",
                         table = self.table_metadata.table_name.as_str(),
@@ -14085,8 +14102,12 @@ impl CayenneTableProvider {
         plan: Arc<dyn ExecutionPlan>,
         scan_guard: Arc<SnapshotScanRef>,
     ) -> Arc<dyn ExecutionPlan> {
+        let overlay = self.optimizer_stats_overlay_for_schema(&plan.schema());
         if self.maintained_aggregates.is_empty() {
-            Arc::new(CayenneAccelerationExec::with_guard(plan, scan_guard))
+            Arc::new(
+                CayenneAccelerationExec::with_guard(plan, scan_guard)
+                    .with_optimizer_column_overlay(overlay),
+            )
         } else {
             let epoch = self.maintained_aggregate_epoch.load(Ordering::Acquire);
             Arc::new(
@@ -14095,7 +14116,8 @@ impl CayenneTableProvider {
                     scan_guard,
                     Arc::clone(&self.maintained_aggregates),
                     epoch,
-                ),
+                )
+                .with_optimizer_column_overlay(overlay),
             )
         }
     }
@@ -17712,31 +17734,44 @@ impl CayenneTableProvider {
         target_partitions: usize,
     ) -> datafusion_common::Result<Option<Arc<dyn ExecutionPlan>>> {
         // Project to the effective projection (reusing the inlined-plan logic).
-        let table_schema = self.table_schema();
+        // Build from the (gated) read schema so the RAM-tier branch matches the
+        // main file scan: view types when force_view is on, stored Utf8/Binary
+        // otherwise. Cast each batch to that target (a no-op when force_view off).
+        let read_schema = self.read_schema();
         let proj_schema = if let Some(proj) = effective_projection {
-            let schema_fields = table_schema.fields();
+            let schema_fields = read_schema.fields();
             let fields: Vec<arrow_schema::FieldRef> = proj
                 .iter()
                 .map(|&i| Arc::clone(&schema_fields[i]))
                 .collect();
             Arc::new(arrow_schema::Schema::new(fields))
         } else {
-            table_schema
+            read_schema
         };
 
         let projected_batches: Vec<RecordBatch> = visible_batches
             .into_iter()
             .map(|batch| {
-                if let Some(proj) = effective_projection {
+                let projected = if let Some(proj) = effective_projection {
                     batch.project(proj).map_err(|e| {
                         datafusion_common::DataFusionError::Execution(format!(
                             "Failed to project in-memory CDC tier batch for table {}: {e}",
                             self.table_metadata.table_name
                         ))
-                    })
+                    })?
                 } else {
-                    Ok(batch)
-                }
+                    batch
+                };
+                // No-op cheap reschema when the projection has no string/binary
+                // columns; casts Utf8/Binary -> view otherwise.
+                arrow_tools::record_batch::try_cast_to(projected, Arc::clone(&proj_schema)).map_err(
+                    |e| {
+                        datafusion_common::DataFusionError::Execution(format!(
+                            "Failed to cast in-memory CDC tier batch to view read schema for table {}: {e}",
+                            self.table_metadata.table_name
+                        ))
+                    },
+                )
             })
             .collect::<datafusion_common::Result<Vec<_>>>()?;
 
@@ -18903,12 +18938,21 @@ impl CayenneTableProvider {
 
         for (snapshot_id, max_delete_seq_at_creation) in scan.protected_snapshots.iter() {
             let plan = self
-                .create_snapshot_scan_plan(
+                .create_snapshot_scan_plan_with_config(
                     scan.state,
                     snapshot_id,
                     scan.projection,
                     scan.filters,
                     scan.limit,
+                    scan.state.config(),
+                    // Protected-snapshot scans are union branches, never the
+                    // provably-sorted main branch -> no sorted ordering.
+                    false,
+                    // Match the main file scan's view types so the union branches agree.
+                    Some(Arc::clone(&scan.read_schema)),
+                    // Protected-snapshot scans are internal union branches, not the
+                    // user point-lookup path — keep default repartition.
+                    false,
                 )
                 .await?;
 
@@ -19034,9 +19078,13 @@ impl CayenneTableProvider {
             filters,
             limit,
             state.config(),
-            // This wrapper serves protected-snapshot scans and internal reads,
-            // which are never the provably-sorted main branch — never advertise.
+            // This wrapper serves protected-snapshot scans and internal reads:
+            // never the provably-sorted main branch (so no sorted ordering), and
+            // they read with the stored Utf8/Binary types (only the query path
+            // requests view types).
             false,
+            // Internal reads read the stored types (None -> Utf8/Binary).
+            None,
             // Internal reads are not user point-lookups — keep default repartition.
             false,
         )
@@ -19057,6 +19105,10 @@ impl CayenneTableProvider {
         // the file set is globally sorted with no unsorted union branches. All
         // other callers (protected-snapshot scans, internal reads) pass `false`.
         allow_sorted_ordering: bool,
+        // Reference schema the Vortex decode targets: `None` -> stored
+        // Utf8/Binary (internal reads); the query path passes the view-typed read
+        // schema so the scan output matches the advertised `TableProvider::schema()`.
+        read_schema_override: Option<SchemaRef>,
         // When true, this scan is highly selective (PK point lookup / small IN /
         // tight BETWEEN). Report `supports_repartitioning() == false` on the
         // Vortex source so DataFusion's `repartition_file_scans` rule does NOT
@@ -19066,6 +19118,12 @@ impl CayenneTableProvider {
         // optimizer re-splits using the OUTER session's `target_partitions`.
         disable_repartition: bool,
     ) -> datafusion_common::Result<Arc<dyn ExecutionPlan>> {
+        // The reference schema the Vortex decode targets. Internal reads
+        // (compaction, keyset, stats) pass `None` -> stored `Utf8`/`Binary`,
+        // keeping re-encoded files unchanged. The query path passes the
+        // view-typed read schema so the scan output matches the advertised
+        // `TableProvider::schema()` and downstream joins plan on view arrays.
+        let base_schema = read_schema_override.unwrap_or_else(|| self.table_schema());
         let snapshot_dir_url = Self::snapshot_dir_url(
             &self.table_metadata.path,
             &self.table_metadata.table_id,
@@ -19077,7 +19135,7 @@ impl CayenneTableProvider {
             &self.pk_deletion_strategy,
             scan_config,
         );
-        let scan_schema = Self::snapshot_scan_schema(&self.table_schema(), &options);
+        let scan_schema = Self::snapshot_scan_schema(&base_schema, &options);
 
         // [sound output_ordering] The caller (only the main `scan()` path) has
         // verified this scan is over a provably globally-sorted file set. Advertise
@@ -19182,10 +19240,9 @@ impl CayenneTableProvider {
             Vec::new()
         };
 
-        let mut file_source = options.format.file_source(Self::snapshot_file_table_schema(
-            &self.table_schema(),
-            &options,
-        ));
+        let mut file_source = options
+            .format
+            .file_source(Self::snapshot_file_table_schema(&base_schema, &options));
 
         // Selective scans opt the Vortex source out of `repartition_file_scans`
         // so the matching file group is not byte-range-split into N partitions
@@ -19973,6 +20030,66 @@ impl CayenneTableProvider {
     }
 }
 
+/// Map a stored Arrow schema's `Utf8` columns to `Utf8View` for the read/query
+/// path. ONLY `Utf8` is mapped:
+/// - `LargeUtf8`/`LargeBinary` already use i64 offsets (no 2 GiB overflow), so
+///   viewifying them is unnecessary — and a `LargeUtf8` → `Utf8View` write cast is
+///   flagged narrowing/lossy (e.g. a `MySQL` JSON column → `LargeUtf8`).
+/// - `Binary` is left as-is too: Vortex's `BinaryView` decode currently yields
+///   `LargeBinary`, which would diverge from an advertised `BinaryView` and trip
+///   the runtime's query-result `verify_schema` (e.g. a `MySQL` BLOB column).
+///   `Binary` join keys are rare, so the 2 GiB concat risk there is acceptable.
+///
+/// Cayenne's stored schema ([`CayenneTableProvider::table_schema`]) — used by
+/// writes, CDC apply, the PK keyset, the deletion index, and footer stats — keeps
+/// the original `Utf8` type. The *query* scan instead advertises and decodes the
+/// column as `Utf8View` so `DataFusion` plans operators on view arrays. The
+/// motivating case is the hash-join build side: `DataFusion` collects the whole
+/// build side into one `RecordBatch` via `concat_batches`, and a `Utf8` column
+/// there overflows Arrow's i32 offset buffer once the concatenated values exceed
+/// 2 GiB (`Offset overflow`, e.g. `CH-benCH` q21 at SF1000, where `su_name` fans
+/// out across a ~100M-row join). `Utf8View` appends independent data buffers
+/// instead of re-offsetting one buffer, so it has no 2 GiB single-array ceiling.
+/// Vortex decodes `Utf8View` natively when the scan's reference schema requests it
+/// (free on the file path; the small in-memory CDC branches are cast to match —
+/// see `scan()`).
+///
+/// Only top-level fields are mapped. Returns the input schema unchanged (same
+/// `Arc`) when it has no `Utf8` columns, so all-scalar tables pay nothing.
+pub(crate) fn viewify_read_schema(schema: &SchemaRef) -> SchemaRef {
+    fn view_type(dt: &DataType) -> Option<DataType> {
+        match dt {
+            // Only Utf8 (the i32-offset string type) is the q21 overflow case and
+            // the only type Vortex reliably re-decodes as a view. Binary is NOT
+            // mapped (Vortex's BinaryView path yields LargeBinary -> verify_schema
+            // divergence); LargeUtf8/LargeBinary already use i64 offsets.
+            DataType::Utf8 => Some(DataType::Utf8View),
+            _ => None,
+        }
+    }
+
+    if !schema
+        .fields()
+        .iter()
+        .any(|f| view_type(f.data_type()).is_some())
+    {
+        return Arc::clone(schema);
+    }
+
+    let fields: Vec<Field> = schema
+        .fields()
+        .iter()
+        .map(|f| match view_type(f.data_type()) {
+            Some(view) => f.as_ref().clone().with_data_type(view),
+            None => f.as_ref().clone(),
+        })
+        .collect();
+    Arc::new(arrow_schema::Schema::new_with_metadata(
+        fields,
+        schema.metadata().clone(),
+    ))
+}
+
 /// Walks `expr` looking for `Column(name) = Literal` (or the flipped form).
 /// Conjunctions (`AND`) are descended into so `DataFusion`'s split-conjunction
 /// or coalesced `BinaryExpr(And, _, _)` predicates are both matched.
@@ -20158,7 +20275,12 @@ fn extract_integer_literal(expr: &Expr) -> Option<i64> {
 #[async_trait]
 impl TableProvider for CayenneTableProvider {
     fn schema(&self) -> SchemaRef {
-        self.table_schema()
+        // Advertise the view-typed read schema (string/binary -> view) so
+        // DataFusion plans the whole query — joins, aggregates, sorts — on view
+        // arrays, avoiding the i32 2 GiB offset overflow in hash-join build-side
+        // `concat_batches`. The stored schema (table_schema) stays Utf8/Binary
+        // for writes/CDC/stats; scan() decodes the matching view types.
+        self.read_schema()
     }
 
     fn table_type(&self) -> TableType {
@@ -20498,6 +20620,11 @@ impl TableProvider for CayenneTableProvider {
             ids.extend(protected_map.keys().cloned());
             SnapshotScanRef::new(Arc::clone(&self.snapshot_scan_refs), ids)
         };
+        // View-typed schema for the query scan output (string/binary -> view),
+        // matching the advertised `TableProvider::schema()`. Threaded into every
+        // union branch (file scan, protected snapshots, inline + RAM tiers) so
+        // they agree and joins plan on view arrays. See `viewify_read_schema`.
+        let read_schema = self.read_schema();
         let listing_scan_start = Instant::now();
         let main_plan_result = self
             .create_snapshot_scan_plan_with_config(
@@ -20508,6 +20635,7 @@ impl TableProvider for CayenneTableProvider {
                 limit,
                 scan_listing_config,
                 allow_sorted_ordering,
+                Some(Arc::clone(&read_schema)),
                 is_pk_selective_scan,
             )
             .await;
@@ -20530,6 +20658,7 @@ impl TableProvider for CayenneTableProvider {
                 pk_indices_in_projection: &pk_indices_in_projection,
                 protected_snapshots: protected_map,
                 deletion_snapshot: &deletion_snapshot,
+                read_schema: Arc::clone(&read_schema),
             })
             .await?;
 
@@ -20539,32 +20668,45 @@ impl TableProvider for CayenneTableProvider {
         let inlined_plan: Option<Arc<dyn ExecutionPlan>> = if inlined_batches.is_empty() {
             None
         } else {
-            // Apply projection to inlined batches if needed
-            let table_schema = self.table_schema();
+            // Build the projected schema from the (gated) read schema so this
+            // branch matches the main file scan exactly: view types when
+            // force_view is on, stored Utf8/Binary otherwise. The inline corpus
+            // holds stored Utf8/Binary, so cast each batch to that target (a no-op
+            // reschema when force_view is off).
+            let read_schema = self.read_schema();
             let proj_schema = if let Some(ref proj) = effective_projection {
-                let schema_fields = table_schema.fields();
+                let schema_fields = read_schema.fields();
                 let fields: Vec<arrow_schema::FieldRef> = proj
                     .iter()
                     .map(|&i| Arc::clone(&schema_fields[i]))
                     .collect();
                 Arc::new(arrow_schema::Schema::new(fields))
             } else {
-                table_schema
+                read_schema
             };
 
             let projected_batches: Vec<RecordBatch> = inlined_batches
                 .into_iter()
                 .map(|batch| {
-                    if let Some(ref proj) = effective_projection {
+                    let projected = if let Some(ref proj) = effective_projection {
                         batch.project(proj).map_err(|e| {
                             datafusion_common::DataFusionError::Execution(format!(
                                 "Failed to project inlined batch for table {}: {e}",
                                 self.table_metadata.table_name
                             ))
-                        })
+                        })?
                     } else {
-                        Ok(batch)
-                    }
+                        batch
+                    };
+                    // No-op cheap reschema when the projection has no
+                    // string/binary columns; casts Utf8/Binary -> view otherwise.
+                    arrow_tools::record_batch::try_cast_to(projected, Arc::clone(&proj_schema))
+                        .map_err(|e| {
+                            datafusion_common::DataFusionError::Execution(format!(
+                                "Failed to cast inlined batch to view read schema for table {}: {e}",
+                                self.table_metadata.table_name
+                            ))
+                        })
                 })
                 .collect::<datafusion_common::Result<Vec<_>>>()?;
 
@@ -21514,6 +21656,150 @@ mod tests {
 
     use super::*;
 
+    #[test]
+    fn viewify_read_schema_maps_only_utf8_to_utf8view() {
+        use std::collections::HashMap;
+        let md = HashMap::from([("k".to_string(), "v".to_string())]);
+        let schema = Arc::new(arrow_schema::Schema::new_with_metadata(
+            vec![
+                Field::new("id", DataType::Int64, false),
+                Field::new("s", DataType::Utf8, true),
+                Field::new("ls", DataType::LargeUtf8, false),
+                Field::new("b", DataType::Binary, true),
+                Field::new("lb", DataType::LargeBinary, false),
+                Field::new("f", DataType::Float64, true),
+            ],
+            md.clone(),
+        ));
+        let view = viewify_read_schema(&schema);
+        assert_eq!(view.field(0).data_type(), &DataType::Int64);
+        assert_eq!(view.field(1).data_type(), &DataType::Utf8View);
+        // Only Utf8 is viewified. LargeUtf8/LargeBinary (i64 offsets) and Binary
+        // (Vortex BinaryView decode diverges to LargeBinary) are left unchanged.
+        assert_eq!(view.field(2).data_type(), &DataType::LargeUtf8);
+        assert_eq!(view.field(3).data_type(), &DataType::Binary);
+        assert_eq!(view.field(4).data_type(), &DataType::LargeBinary);
+        assert_eq!(view.field(5).data_type(), &DataType::Float64);
+        // Names, nullability, and schema metadata are preserved.
+        assert_eq!(view.field(1).name(), "s");
+        assert!(view.field(1).is_nullable());
+        assert!(!view.field(2).is_nullable());
+        assert_eq!(view.metadata(), &md);
+
+        // No Utf8 columns (Binary / Large* / scalar) -> same Arc returned (zero
+        // allocation): Binary is not viewified (Vortex BinaryView diverges) and a
+        // MySQL JSON/BLOB column (LargeUtf8/LargeBinary) is not narrowing-cast.
+        let no_view = Arc::new(arrow_schema::Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("ls", DataType::LargeUtf8, false),
+            Field::new("b", DataType::Binary, false),
+        ]));
+        assert!(Arc::ptr_eq(&no_view, &viewify_read_schema(&no_view)));
+    }
+
+    /// End-to-end gate for the `force_view_read_schema` fix: with the flag on, the
+    /// provider advertises `Utf8` columns as `Utf8View` AND the scan actually emits
+    /// `StringViewArray` — including the in-memory (inline) branch, which is cast to
+    /// match the view-typed file scan. (The stored `table_schema` stays `Utf8`.)
+    /// This is the path that lets `DataFusion` plan the hash join on view arrays
+    /// and avoids the i32 2 GiB offset overflow at scale (`CH-benCH` q21 @SF1000).
+    #[tokio::test]
+    async fn force_view_read_schema_scan_emits_utf8view() {
+        use arrow::array::{Int64Array, StringArray, StringViewArray};
+        use arrow::datatypes::{DataType, Field, Schema};
+
+        let ctx = SessionContext::new();
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let metadata_dir = format!("{}/metadata", temp_dir.path().to_str().expect("path"));
+        let data_dir = format!("{}/data", temp_dir.path().to_str().expect("path"));
+        std::fs::create_dir_all(&metadata_dir).expect("metadata dir");
+        let connection_string = format!("sqlite://{metadata_dir}/cayenne.db");
+        let catalog = Arc::new(CayenneCatalog::new(connection_string).expect("catalog"))
+            as Arc<dyn MetadataCatalog>;
+        catalog.init().await.expect("catalog init");
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("name", DataType::Utf8, false),
+        ]));
+        // `force_view_read_schema` is `#[serde(skip)]` (a runtime-derived setting,
+        // like `data_storage_class`), so it is carried by the injected context, not
+        // the persisted metadata. Mirror the runtime factory: build a context from
+        // the force-view config and inject it via `with_context`. This also exercises
+        // that `clone_for_write` (used by `read_all`) preserves the flag.
+        let vortex_config = VortexConfig {
+            force_view_read_schema: true,
+            ..VortexConfig::default()
+        };
+        let context = CayenneContext::new(&vortex_config, ctx.runtime_env(), "view_scan");
+        let options = CreateTableOptions {
+            table_name: "view_scan".to_string(),
+            schema: Arc::clone(&schema),
+            primary_key: vec!["id".to_string()],
+            on_conflict: Some(OnConflict::Upsert(
+                datafusion_table_providers::util::column_reference::ColumnReference::new(vec![
+                    "id".to_string(),
+                ]),
+            )),
+            base_path: data_dir,
+            partition_column: None,
+            vortex_config,
+        };
+        let provider = CayenneTableProviderBuilder::new(Arc::clone(&catalog), ctx.runtime_env())
+            .with_context(context)
+            .create(options)
+            .await
+            .expect("table created");
+
+        // Advertised (query) schema views the Utf8 column; stored schema stays Utf8.
+        assert_eq!(
+            provider
+                .schema()
+                .field_with_name("name")
+                .expect("name field")
+                .data_type(),
+            &DataType::Utf8View,
+        );
+        assert_eq!(
+            provider
+                .table_schema()
+                .field_with_name("name")
+                .expect("name field")
+                .data_type(),
+            &DataType::Utf8,
+        );
+
+        // Small batch -> inline memtable, exercising the inline-branch view cast.
+        insert_batch(
+            &provider,
+            RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![
+                    Arc::new(Int64Array::from(vec![1_i64, 2])),
+                    Arc::new(StringArray::from(vec!["alice", "bob"])),
+                ],
+            )
+            .expect("batch"),
+        )
+        .await;
+        assert!(provider.cached_inlined_row_count() > 0, "rows land inline");
+
+        let batches = read_all(&ctx, &provider, "view_scan").await;
+        let total: usize = batches.iter().map(RecordBatch::num_rows).sum();
+        assert_eq!(total, 2, "both inline rows visible");
+        for b in &batches {
+            let idx = b.schema().index_of("name").expect("name col");
+            assert_eq!(b.schema().field(idx).data_type(), &DataType::Utf8View);
+            assert!(
+                b.column(idx)
+                    .as_any()
+                    .downcast_ref::<StringViewArray>()
+                    .is_some(),
+                "scan must emit StringViewArray under force_view_read_schema"
+            );
+        }
+    }
+
     /// The retired-dir sweep timing contract: a dir is due only once the grace
     /// has elapsed past BOTH its retirement and its last scan listing — a
     /// long-running query that listed the dir keeps it alive a full grace past
@@ -21551,59 +21837,6 @@ mod tests {
             listed + grace,
             grace
         ));
-    }
-
-    /// The position-compaction starvation WARN is WALL-CLOCK-based and
-    /// one-shot per episode: it fires on the first skip at/after `warn_after`
-    /// of continuous starvation — regardless of how many skips accrued (the
-    /// skip cadence follows the dynamically tuned compactor interval) — stays
-    /// silent for the rest of that episode, and re-arms after a successful
-    /// lock acquisition resets the episode.
-    #[test]
-    fn position_skip_streak_warns_on_wall_clock_once_per_episode() {
-        let warn_after = std::time::Duration::from_secs(30);
-        let t0 = std::time::Instant::now();
-        let sec = std::time::Duration::from_secs;
-
-        // Slow cadence (60s interval): the SECOND skip is already past the
-        // bound — warn at 2 skips, not at some fixed count.
-        let mut streak = PositionCompactionSkipStreak::default();
-        assert_eq!(streak.record_skip(t0, warn_after), None, "episode start");
-        assert_eq!(
-            streak.record_skip(t0 + sec(60), warn_after),
-            Some(2),
-            "60s of starvation crosses the 30s bound"
-        );
-        assert_eq!(
-            streak.record_skip(t0 + sec(120), warn_after),
-            None,
-            "one-shot: no second WARN within the episode"
-        );
-
-        // Fast cadence (2s interval): many skips stay silent until the bound.
-        let mut streak = PositionCompactionSkipStreak::default();
-        for i in 0..15 {
-            assert_eq!(
-                streak.record_skip(t0 + sec(2 * i), warn_after),
-                None,
-                "{}s elapsed is under the 30s bound",
-                2 * i
-            );
-        }
-        assert_eq!(
-            streak.record_skip(t0 + sec(30), warn_after),
-            Some(16),
-            "fires exactly when 30s of wall-clock starvation is reached"
-        );
-
-        // A successful acquisition ends the episode; the next one re-arms.
-        streak.reset();
-        assert_eq!(streak.record_skip(t0 + sec(100), warn_after), None);
-        assert_eq!(
-            streak.record_skip(t0 + sec(140), warn_after),
-            Some(2),
-            "a fresh episode warns again after reset"
-        );
     }
 
     use datafusion::arrow::array::RecordBatch;
@@ -21871,7 +22104,9 @@ mod tests {
     #[test]
     fn protected_snapshot_maintenance_trigger_uses_compaction_count_threshold() {
         let now = UNIX_EPOCH + Duration::from_secs(1_000);
-        let warning_keys = ParkingMutex::new(BoundedWarningKeys::default());
+        let warning_keys = ParkingMutex::new(BoundedFifoSet::with_capacity(
+            PROTECTED_SNAPSHOT_AGE_WARNING_KEY_LIMIT,
+        ));
         let protected_snapshots =
             HashMap::from([("snapshot-1".to_string(), 1), ("snapshot-2".to_string(), 2)]);
 
@@ -21893,7 +22128,9 @@ mod tests {
     #[test]
     fn protected_snapshot_maintenance_trigger_uses_oldest_snapshot_age() {
         let now = UNIX_EPOCH + Duration::from_secs(1_000);
-        let warning_keys = ParkingMutex::new(BoundedWarningKeys::default());
+        let warning_keys = ParkingMutex::new(BoundedFifoSet::with_capacity(
+            PROTECTED_SNAPSHOT_AGE_WARNING_KEY_LIMIT,
+        ));
         let protected_snapshots = HashMap::from([
             (protected_snapshot_id_at_unix_time(900), 1),
             (protected_snapshot_id_at_unix_time(990), 2),
@@ -21918,7 +22155,9 @@ mod tests {
     #[test]
     fn protected_snapshot_maintenance_trigger_ignores_invalid_uuid_for_age() {
         let now = UNIX_EPOCH + Duration::from_secs(1_000);
-        let warning_keys = ParkingMutex::new(BoundedWarningKeys::default());
+        let warning_keys = ParkingMutex::new(BoundedFifoSet::with_capacity(
+            PROTECTED_SNAPSHOT_AGE_WARNING_KEY_LIMIT,
+        ));
         let protected_snapshots = HashMap::from([("not-a-uuid".to_string(), 1)]);
 
         assert_eq!(
@@ -21936,7 +22175,9 @@ mod tests {
     #[test]
     fn protected_snapshot_maintenance_trigger_ignores_future_uuid_for_age() {
         let now = UNIX_EPOCH + Duration::from_secs(1_000);
-        let warning_keys = ParkingMutex::new(BoundedWarningKeys::default());
+        let warning_keys = ParkingMutex::new(BoundedFifoSet::with_capacity(
+            PROTECTED_SNAPSHOT_AGE_WARNING_KEY_LIMIT,
+        ));
         let protected_snapshots = HashMap::from([(protected_snapshot_id_at_unix_time(1_100), 1)]);
 
         assert_eq!(
@@ -25442,6 +25683,29 @@ mod tests {
             .collect()
     }
 
+    /// An order-insensitive view of a resolved scan file set: a `path -> row_count`
+    /// map flattened across groups. The manifest resolver returns files sorted by
+    /// `file_path` (the metastore PK index order) while a directory listing returns
+    /// object-store readdir order, so the two agree on the file SET and per-file
+    /// row counts but NOT on the partition-split layout — which carries no
+    /// query-correctness meaning (the scan unions all partitions). Compare this
+    /// map, not the positional `file_group_paths`/`file_group_row_counts`, for
+    /// cross-source parity.
+    fn path_row_counts(file_groups: &[FileGroup]) -> BTreeMap<String, DFPrecision<usize>> {
+        file_groups
+            .iter()
+            .flat_map(FileGroup::iter)
+            .map(|file| {
+                (
+                    file.path().to_string(),
+                    file.statistics
+                        .as_ref()
+                        .map_or(DFPrecision::Absent, |statistics| statistics.num_rows),
+                )
+            })
+            .collect()
+    }
+
     async fn collect_value_id_rows(
         ctx: &SessionContext,
         plan: Arc<dyn ExecutionPlan>,
@@ -25897,6 +26161,18 @@ mod tests {
             .await;
         }
 
+        // Quiesce the debounced post-write maintenance the inserts scheduled. When
+        // it fires (~100 ms later) it rebuilds the manifest from the directory
+        // listing, which would re-populate the manifest AFTER this test clears it
+        // (breaking the empty-manifest fallback assertion below) and reorder its
+        // rows. Draining it now makes the manifest state fully test-controlled.
+        // (Append table — 2 files, no protected snapshots — so no async compaction
+        // is armed; this only stops the manifest-rebuild loop.)
+        provider
+            .flush_pending_maintenance()
+            .await
+            .expect("drain pending post-write maintenance");
+
         let snapshot_id = provider.get_current_snapshot_id();
         let snapshot_dir_url = CayenneTableProvider::snapshot_dir_url(
             &provider.table_metadata.path,
@@ -25985,15 +26261,16 @@ mod tests {
             .await
             .expect("ListingTable file listing should succeed");
 
+        // Order-insensitive: the manifest resolver returns files sorted by
+        // `file_path` (metastore PK-index order) while the directory listing
+        // returns object-store readdir order. They must agree on the file SET and
+        // each file's row count; the partition-split order is not a correctness
+        // property (the scan unions all partitions).
         assert_eq!(
-            file_group_paths(&manifest_files.file_groups),
-            file_group_paths(&listing_files.file_groups),
-            "manifest-built scan file paths must equal the directory-built listing"
-        );
-        assert_eq!(
-            file_group_row_counts(&manifest_files.file_groups),
-            file_group_row_counts(&listing_files.file_groups),
-            "manifest-built scan per-file row counts must equal the directory-built listing"
+            path_row_counts(&manifest_files.file_groups),
+            path_row_counts(&listing_files.file_groups),
+            "manifest-built scan files (paths + per-file row counts) must equal the \
+             directory-built listing"
         );
         assert_eq!(
             manifest_files.grouped_by_partition,
@@ -26023,8 +26300,8 @@ mod tests {
             .await
             .expect("scan file listing should fall back to directory listing");
         assert_eq!(
-            file_group_paths(&fallback_files.file_groups),
-            file_group_paths(&listing_files.file_groups),
+            path_row_counts(&fallback_files.file_groups),
+            path_row_counts(&listing_files.file_groups),
             "with an empty manifest the flag-ON scan must fall back to the directory listing"
         );
     }
@@ -26550,6 +26827,24 @@ mod tests {
             Field::new("value", DataType::Int64, false),
         ]));
 
+        // Hold the compaction lock across the WHOLE fixture (inserts → pin) so the
+        // async write-driven lanes can never corrupt the synthetic state. Each CDC
+        // insert schedules a debounced (~100 ms) post-write maintenance pass; when
+        // it fires it (a) rebuilds every live snapshot's manifest from the
+        // directory listing — overwriting the synthetic `[seq, seq]` ranges pinned
+        // below with the reserved sequences — and (b) when the protected-snapshot
+        // trigger is armed (the low-trigger fixtures), schedules an async size-tier
+        // compaction that MERGES the very snapshots the test sets up. Under
+        // parallel test load that pass fires mid-fixture/mid-test: the merge holds
+        // this lock (so the test's own bake/leveler `try_lock` returns false) or
+        // reduces the protected count — the observed flakiness. Both the rebuild
+        // and the merge `try_lock` this lock, so holding it across the fixture
+        // makes every such pass a no-op skip, and `flush_pending_maintenance` below
+        // drains the loop so it exits rather than firing after we release. (The
+        // write path never takes this lock, so holding it across the inserts is
+        // safe.)
+        let compaction_guard = provider.compaction_lock.lock().await;
+
         // Each distinct-key insert publishes its own file-backed protected
         // snapshot (inline disabled in the fixture).
         for (i, _) in seqs.iter().enumerate() {
@@ -26561,13 +26856,14 @@ mod tests {
             .await;
         }
 
-        // Populate manifests for the live set (under the lock the real
-        // post-write lane holds), then OVERWRITE each protected snapshot's
-        // manifest rows with the pinned [seq, seq] range.
-        {
-            let _guard = provider.compaction_lock.lock().await;
-            provider.rebuild_live_snapshot_manifests().await;
-        }
+        // Drain the debounced maintenance loop the inserts spawned: it skips its
+        // manifest rebuild and any compaction it scheduled (we hold the lock), then
+        // exits — so nothing fires against the pinned manifest after we release the
+        // guard on return.
+        provider
+            .flush_pending_maintenance()
+            .await
+            .expect("drain pending post-write maintenance");
 
         // Protected-snapshot registration can lag behind the awaited inserts under heavy
         // parallel load (seen in CI: 6 expected, only 2 registered on an immediate read;
@@ -26597,6 +26893,10 @@ mod tests {
             ids.len()
         );
 
+        // Populate every live snapshot's manifest (we hold the compaction lock the
+        // real post-write lane takes), then OVERWRITE with the pinned ranges.
+        provider.rebuild_live_snapshot_manifests().await;
+
         let table_id = provider.table_metadata.table_id.clone();
         for (id, &seq) in ids.iter().zip(seqs.iter()) {
             let files = provider
@@ -26623,6 +26923,12 @@ mod tests {
                     .expect("pin manifest sequence");
             }
         }
+
+        // Release the compaction lock now that the manifest is pinned. The async
+        // lanes are drained (the maintenance loop exited; any compaction it
+        // scheduled `try_lock`-skipped while we held the lock), so the pinned state
+        // is stable for the test's own bake/leveler calls.
+        drop(compaction_guard);
         (provider, tmp, ids)
     }
 

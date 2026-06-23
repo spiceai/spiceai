@@ -4193,6 +4193,13 @@
               }
             ]
           },
+          "reasoning_content": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Reasoning / chain-of-thought content (e.g. extracted from a `<think>` block),\nkept separate from the user-facing `content`. Populated by reasoning models\nsuch as GLM, DeepSeek-R1, and QwQ."
+          },
           "refusal": {
             "type": [
               "string",

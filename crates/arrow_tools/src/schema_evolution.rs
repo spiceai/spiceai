@@ -377,6 +377,14 @@ fn widen_type(current: &DataType, incoming: &DataType) -> TypeWidening {
         | (DataType::Binary, DataType::LargeBinary | DataType::BinaryView)
         | (DataType::FixedSizeBinary(_), DataType::Binary)
         | (DataType::Date32, DataType::Date64) => TypeWidening::Widened(incoming.clone()),
+        // A *view* accelerator column (Cayenne's force-view read schema over
+        // `Utf8`/`Binary` storage) already holds the full value domain of the
+        // non-view source column it is compared against, so it is NOT a schema
+        // change — classify it `Equal`. Deliberately narrow to a view current:
+        // the non-view narrow -> wide direction above stays `Widened` so genuine
+        // source widenings for non-view accelerators still evolve.
+        (DataType::Utf8View, DataType::Utf8 | DataType::LargeUtf8)
+        | (DataType::BinaryView, DataType::Binary | DataType::LargeBinary) => TypeWidening::Equal,
         (DataType::Time32(from_unit), DataType::Time32(to_unit) | DataType::Time64(to_unit))
         | (DataType::Time64(from_unit), DataType::Time64(to_unit)) => {
             if time_unit_rank(*to_unit) > time_unit_rank(*from_unit) {
@@ -548,6 +556,36 @@ mod tests {
                 "expected {from} -> {to} to NOT be a widening cast"
             );
         }
+    }
+
+    #[test]
+    fn view_over_nonview_string_binary_is_not_an_evolution() {
+        // A *view* accelerator column compared against a non-view same-family
+        // source column is NOT a schema change (e.g. Cayenne's force-view read
+        // schema over a Utf8/Binary source). classify(current=view, incoming=
+        // nonview) must be Identical — not Widening or Incompatible.
+        let pairs = [
+            (DataType::Utf8View, DataType::Utf8),
+            (DataType::Utf8View, DataType::LargeUtf8),
+            (DataType::BinaryView, DataType::Binary),
+            (DataType::BinaryView, DataType::LargeBinary),
+        ];
+        for (current, incoming) in pairs {
+            let cur = Schema::new(vec![Field::new("c", current.clone(), true)]);
+            let inc = Schema::new(vec![Field::new("c", incoming.clone(), true)]);
+            assert_identical(&classify(&cur, &inc, &NO_CONSTRAINTS));
+        }
+        // The narrow -> wide direction stays a (lossless) widening for non-view
+        // accelerators that genuinely evolve their stored type.
+        assert!(is_widening_cast(&DataType::Utf8, &DataType::Utf8View));
+        // A non-view width change (no view type involved) is NOT absorbed — it
+        // stays a genuine schema difference, so the relaxation is view-scoped.
+        let large = Schema::new(vec![Field::new("c", DataType::LargeUtf8, true)]);
+        let small = Schema::new(vec![Field::new("c", DataType::Utf8, true)]);
+        assert!(!matches!(
+            classify(&large, &small, &NO_CONSTRAINTS),
+            SchemaEvolution::Identical
+        ));
     }
 
     mod widening_matrix {
