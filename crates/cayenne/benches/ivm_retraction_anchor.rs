@@ -534,10 +534,11 @@ fn retract_batch(pk_start: i64, count: usize, groups: usize) -> RecordBatch {
     .expect("retract batch should be valid")
 }
 
-/// Track the real `MaintainedAggregateRegistry` RETRACTION path:
-/// `apply_delta` with a delete batch + an update (re-upsert) batch on a
-/// populated per-PK index — the O(delta) maintain cost the lever depends on,
-/// measured on the shipped registry (not the model).
+/// Track the real `MaintainedAggregateRegistry` RETRACTION path: a re-upsert of
+/// existing PKs via `apply_insert_batches` on a populated per-PK index — each
+/// row retracts its old contribution from the index then applies the new one
+/// (the O(delta) maintain cost the lever depends on), measured on the shipped
+/// registry (not the model).
 fn bench_real_registry_retract(c: &mut Criterion) {
     const DELTA: usize = 100;
     let mut group = c.benchmark_group("ivm_maintained_retract");
@@ -552,7 +553,7 @@ fn bench_real_registry_retract(c: &mut Criterion) {
                 // iter_batched setup would re-seed + drop an N-entry registry
                 // INSIDE the measured region and swamp the O(delta) work. Seed
                 // once outside the timer with iter_custom, then time only the
-                // repeated apply_delta calls.
+                // repeated apply_insert_batches calls.
                 b.iter_custom(|iters| {
                     let registry = MaintainedAggregateRegistry::try_new_with_pk(
                         &[retract_spec()],
@@ -562,7 +563,7 @@ fn bench_real_registry_retract(c: &mut Criterion) {
                     )
                     .expect("registry construction");
                     registry
-                        .apply_delta(1, &[retract_batch(0, rows, groups)], &[])
+                        .apply_insert_batches(1, &[retract_batch(0, rows, groups)])
                         .expect("seed insert");
                     // Each timed delta re-upserts DELTA existing PKs: every row
                     // retracts its old contribution from the index then applies
@@ -574,7 +575,7 @@ fn bench_real_registry_retract(c: &mut Criterion) {
                         let epoch = 2 + iteration; // each apply advances the epoch
                         let start = std::time::Instant::now();
                         registry
-                            .apply_delta(epoch, std::slice::from_ref(&update), &[])
+                            .apply_insert_batches(epoch, std::slice::from_ref(&update))
                             .expect("retract delta");
                         total += start.elapsed();
                     }

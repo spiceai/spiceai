@@ -426,63 +426,11 @@ impl MaintainedAggregateRegistry {
         finalize_maintenance_pass(&mut state, self.max_index_entries, failure)
     }
 
-    /// Apply one CDC visibility epoch's delta: `deletes` are retracted by PK,
-    /// then `upserts` are applied (an upsert whose PK is already indexed first
-    /// retracts the old contribution, so UPDATE is handled exactly). Requires a
-    /// PK index ([`Self::try_new_with_pk`]); on a maintained accumulator error
-    /// or a retraction the index can't satisfy, fails safe to `Stale` (queries
-    /// fall back to the base table) rather than serve a wrong answer.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error (after clearing the indexes and marking the registry
-    /// stale) when a retraction or insert fails or the per-PK index exceeds its
-    /// cap, so the caller can log a concrete reason. An out-of-order epoch is
-    /// not an error: it silently marks stale and returns `Ok`.
-    pub fn apply_delta(
-        &self,
-        epoch: u64,
-        upserts: &[RecordBatch],
-        deletes: &[RecordBatch],
-    ) -> DataFusionResult<()> {
-        let mut state = self.state.write();
-
-        if epoch != state.epoch.saturating_add(1) {
-            state.epoch = state.epoch.max(epoch);
-            state.status = RegistryStatus::Stale;
-            return Ok(());
-        }
-
-        state.epoch = epoch;
-        if state.status == RegistryStatus::Stale || state.views.is_empty() {
-            return Ok(());
-        }
-
-        let mut failure: Option<DataFusionError> = None;
-        'views: for view in &mut state.views {
-            for batch in deletes {
-                if let Err(error) = view.retract_batch(batch) {
-                    failure = Some(error);
-                    break 'views;
-                }
-            }
-            for batch in upserts {
-                if let Err(error) = view.apply_insert_batch(batch) {
-                    failure = Some(error);
-                    break 'views;
-                }
-            }
-        }
-
-        finalize_maintenance_pass(&mut state, self.max_index_entries, failure)
-    }
-
     /// Retract delete rows whose primary-key columns are supplied directly as
     /// the columns of `pk_batch`, in `pk_columns` order (positions `0..n`). The
     /// caller resolves the PK columns BY NAME from the CDC delete batch, so this
-    /// is independent of that batch's source-schema column layout — unlike
-    /// [`Self::apply_delta`], whose `deletes` are read at the table-schema
-    /// `pk_columns` indices. Requires a PK index ([`Self::try_new_with_pk`]).
+    /// is independent of that batch's source-schema column layout. Requires a PK
+    /// index ([`Self::try_new_with_pk`]).
     ///
     /// # Errors
     ///
@@ -514,12 +462,16 @@ impl MaintainedAggregateRegistry {
         finalize_maintenance_pass(&mut state, self.max_index_entries, failure)
     }
 
-    /// Rebuild every view from a complete table snapshot.
+    /// Rebuild every view from a complete table snapshot. Bounds memory: the
+    /// per-PK index is checked against its cap after each batch, so rebuilding a
+    /// table larger than `max_index_entries` fails safe to stale (clearing the
+    /// indexes) instead of growing the index unbounded.
     ///
     /// # Errors
     ///
-    /// Returns an error if a maintained accumulator overflows or Arrow scalar
-    /// extraction fails.
+    /// Returns an error (after clearing the indexes and marking the registry
+    /// stale) if a maintained accumulator overflows, Arrow scalar extraction
+    /// fails, or the per-PK index exceeds its entry cap.
     pub fn rebuild_from_batches(
         &self,
         epoch: u64,
@@ -527,16 +479,33 @@ impl MaintainedAggregateRegistry {
     ) -> DataFusionResult<()> {
         let mut state = self.state.write();
         state.epoch = epoch;
+        state.status = RegistryStatus::Fresh;
         for view in &mut state.views {
             view.clear();
         }
-        for batch in batches {
+        let mut failure: Option<DataFusionError> = None;
+        'outer: for batch in batches {
             for view in &mut state.views {
-                view.apply_insert_batch(batch)?;
+                if let Err(error) = view.apply_insert_batch(batch) {
+                    failure = Some(error);
+                    break 'outer;
+                }
+            }
+            // Bail incrementally so a table larger than the cap fails safe to
+            // stale before the per-PK index grows unbounded (rather than only
+            // after the full rebuild, which could OOM first).
+            if state
+                .views
+                .iter()
+                .map(MaintainedAggregateView::index_len)
+                .sum::<usize>()
+                > self.max_index_entries
+            {
+                failure = Some(index_cap_exceeded());
+                break 'outer;
             }
         }
-        state.status = RegistryStatus::Fresh;
-        Ok(())
+        finalize_maintenance_pass(&mut state, self.max_index_entries, failure)
     }
 
     /// Materialize a maintained aggregate batch matching `aggregate`, if fresh.
@@ -661,22 +630,6 @@ impl MaintainedAggregateView {
     fn retract_pk(&mut self, pk: &[ScalarValue]) -> DataFusionResult<()> {
         if let Some(entry) = self.pk_index.remove(pk) {
             self.retract_entry(&entry)?;
-        }
-        Ok(())
-    }
-
-    /// Retract every row in a delete batch by PK, reading the PK at the
-    /// table-schema `pk_columns` indices. Requires the batch to carry the
-    /// table-schema column layout. Requires a PK index.
-    fn retract_batch(&mut self, batch: &RecordBatch) -> DataFusionResult<()> {
-        if self.pk_columns.is_empty() {
-            return Err(DataFusionError::Internal(
-                "maintained aggregate retraction requires a configured primary key".to_string(),
-            ));
-        }
-        for row in 0..batch.num_rows() {
-            let pk = Self::scalar_key(batch, row, self.pk_columns.iter().copied())?;
-            self.retract_pk(&pk)?;
         }
         Ok(())
     }
@@ -1858,14 +1811,14 @@ mod tests {
     }
 
     #[test]
-    fn apply_delta_retracts_deletes_by_pk() -> DataFusionResult<()> {
+    fn retracts_a_subset_of_a_group_by_pk() -> DataFusionResult<()> {
         let registry = MaintainedAggregateRegistry::try_new_with_pk(
             &[sum_i_spec()],
             &schema(),
             &[2],
             usize::MAX,
         )?;
-        registry.apply_delta(
+        registry.apply_insert_batches(
             1,
             &[group_batch(&[
                 ("a", 1, 10),
@@ -1873,10 +1826,9 @@ mod tests {
                 ("b", 3, 5),
                 ("b", 4, 7),
             ])],
-            &[],
         )?;
-        // Delete pk=2 (group a) and pk=3 (group b); only the PK column matters.
-        registry.apply_delta(2, &[], &[group_batch(&[("", 2, 0), ("", 3, 0)])])?;
+        // Delete pk=2 (group a) and pk=3 (group b) via a PK-projected batch.
+        registry.apply_pk_deletes(2, &group_batch(&[("", 2, 0), ("", 3, 0)]).project(&[2])?)?;
 
         let sums = sum_i_by_name(&registry)?;
         assert_eq!(sums.get("a"), Some(&10), "a retains only pk=1 (i=10)");
@@ -1928,20 +1880,20 @@ mod tests {
     }
 
     #[test]
-    fn apply_delta_handles_update_as_retract_then_insert() -> DataFusionResult<()> {
+    fn handles_update_as_retract_then_insert() -> DataFusionResult<()> {
         let registry = MaintainedAggregateRegistry::try_new_with_pk(
             &[sum_i_spec()],
             &schema(),
             &[2],
             usize::MAX,
         )?;
-        registry.apply_delta(1, &[group_batch(&[("a", 1, 10), ("a", 2, 20)])], &[])?;
+        registry.apply_insert_batches(1, &[group_batch(&[("a", 1, 10), ("a", 2, 20)])])?;
         // UPDATE pk=2 in place: i 20 -> 5, so group a = 10 + 5 = 15.
-        registry.apply_delta(2, &[group_batch(&[("a", 2, 5)])], &[])?;
+        registry.apply_insert_batches(2, &[group_batch(&[("a", 2, 5)])])?;
         assert_eq!(sum_i_by_name(&registry)?.get("a"), Some(&15));
 
         // UPDATE pk=1 moving group a -> c, i 10 -> 100.
-        registry.apply_delta(3, &[group_batch(&[("c", 1, 100)])], &[])?;
+        registry.apply_insert_batches(3, &[group_batch(&[("c", 1, 100)])])?;
         let sums = sum_i_by_name(&registry)?;
         assert_eq!(sums.get("a"), Some(&5), "a keeps only pk=2 (i=5)");
         assert_eq!(sums.get("c"), Some(&100), "c gains pk=1 (i=100)");
@@ -1956,8 +1908,8 @@ mod tests {
             &[2],
             usize::MAX,
         )?;
-        registry.apply_delta(1, &[group_batch(&[("a", 1, 10), ("b", 2, 20)])], &[])?;
-        registry.apply_delta(2, &[], &[group_batch(&[("", 1, 0)])])?;
+        registry.apply_insert_batches(1, &[group_batch(&[("a", 1, 10), ("b", 2, 20)])])?;
+        registry.apply_pk_deletes(2, &group_batch(&[("", 1, 0)]).project(&[2])?)?;
         let sums = sum_i_by_name(&registry)?;
         assert_eq!(
             sums.get("a"),
@@ -1976,7 +1928,8 @@ mod tests {
             MaintainedAggregateRegistry::try_new_with_pk(&[sum_i_spec()], &schema(), &[2], 1)?;
         // Exceeding the cap surfaces a concrete error (not a silent Ok) so the
         // write-path applier can log the reason.
-        let result = registry.apply_delta(1, &[group_batch(&[("a", 1, 10), ("a", 2, 20)])], &[]);
+        let result =
+            registry.apply_insert_batches(1, &[group_batch(&[("a", 1, 10), ("a", 2, 20)])]);
         assert!(result.is_err(), "over-cap apply must return an error");
         let aggregate =
             aggregate_exec_for(&[("sum(i)", MaintainedAggregateFunction::Sum, Some("i"))])?;
@@ -2014,9 +1967,9 @@ mod tests {
     /// Retraction exercises EVERY accumulator inverse: `COUNT(*)` (`CountAll`),
     /// `COUNT(u)` (`CountColumn`), `SUM(u)` (`SumUInt64`), `SUM(f)` (`SumFloat64`),
     /// `AVG(f)` (`AvgFloat64`). `SUM(i)` (`SumInt64`) is covered by
-    /// `apply_delta_retracts_deletes_by_pk`. PK = column `i`.
+    /// `retracts_a_subset_of_a_group_by_pk`. PK = column `i`.
     #[test]
-    fn apply_delta_retracts_all_aggregate_types() -> DataFusionResult<()> {
+    fn retracts_all_aggregate_types() -> DataFusionResult<()> {
         let spec = MaintainedAggregateSpec {
             group_by: vec!["name".to_string()],
             aggregates: vec![
@@ -2044,17 +1997,16 @@ mod tests {
         };
         let registry =
             MaintainedAggregateRegistry::try_new_with_pk(&[spec], &schema(), &[1], usize::MAX)?;
-        registry.apply_delta(
+        registry.apply_insert_batches(
             1,
             &[typed_batch(&[
                 ("a", 1, 10, 2.0),
                 ("a", 2, 20, 4.0),
                 ("b", 3, 5, 8.0),
             ])],
-            &[],
         )?;
-        // Delete pk i=2 from group a; only the PK column is read for the delete.
-        registry.apply_delta(2, &[], &[typed_batch(&[("", 2, 0, 0.0)])])?;
+        // Delete pk i=2 from group a via a PK-projected batch (PK = column 1).
+        registry.apply_pk_deletes(2, &typed_batch(&[("", 2, 0, 0.0)]).project(&[1])?)?;
 
         let aggregate = aggregate_exec_for(&[
             ("count(*)", MaintainedAggregateFunction::Count, None),
@@ -2146,15 +2098,12 @@ mod tests {
         let registry =
             MaintainedAggregateRegistry::try_new_with_pk(&[spec], &i32_schema, &[2], usize::MAX)?;
 
-        registry.apply_delta(
-            1,
-            &[i32_batch(&[("a", 10, 1), ("a", 20, 2), ("b", 5, 3)])],
-            &[],
-        )?;
+        registry
+            .apply_insert_batches(1, &[i32_batch(&[("a", 10, 1), ("a", 20, 2), ("b", 5, 3)])])?;
         // UPDATE pk=2 in place (retract-old-then-apply-new): v 20 -> 7, so a = 17.
-        registry.apply_delta(2, &[i32_batch(&[("a", 7, 2)])], &[])?;
-        // DELETE pk=3: retracts the whole of group b.
-        registry.apply_delta(3, &[], &[i32_batch(&[("", 0, 3)])])?;
+        registry.apply_insert_batches(2, &[i32_batch(&[("a", 7, 2)])])?;
+        // DELETE pk=3 via a PK-projected batch (PK = column 2): retracts group b.
+        registry.apply_pk_deletes(3, &i32_batch(&[("", 0, 3)]).project(&[2])?)?;
 
         // Serve via a real AggregateExec. DataFusion's type coercion plans
         // `SUM(Int32)` as `SUM(CAST(v AS Int64))`, so the aggregate input is a
@@ -2216,9 +2165,9 @@ mod tests {
             &[2],
             usize::MAX,
         )?;
-        registry.apply_delta(1, &[group_batch(&[("a", 1, 10), ("b", 2, 20)])], &[])?;
-        // pk=999 was never inserted; the delta must leave every group unchanged.
-        registry.apply_delta(2, &[], &[group_batch(&[("", 999, 0)])])?;
+        registry.apply_insert_batches(1, &[group_batch(&[("a", 1, 10), ("b", 2, 20)])])?;
+        // pk=999 was never inserted; the retraction must leave every group unchanged.
+        registry.apply_pk_deletes(2, &group_batch(&[("", 999, 0)]).project(&[2])?)?;
         let sums = sum_i_by_name(&registry)?;
         assert_eq!(sums.get("a"), Some(&10));
         assert_eq!(sums.get("b"), Some(&20));
