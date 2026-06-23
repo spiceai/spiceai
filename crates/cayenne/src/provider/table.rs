@@ -13355,22 +13355,13 @@ impl CayenneTableProvider {
         &self,
         pending: Option<PendingMaintainedAggregateInsert>,
     ) {
-        let Some(pending) = pending else {
-            return;
-        };
-        let Some(tx) = &self.maintained_aggregate_tx else {
-            return;
-        };
-        // Enqueue onto the ordered background applier and continue; this never
-        // blocks the CDC write path except for backpressure under sustained
-        // overload (the bounded queue is drained off the critical path). An
-        // `Err` means the applier has shut down, so there is nothing to maintain.
-        let _ = tx
-            .send(MaintainedAggregateApply::Insert {
+        if let Some(pending) = pending {
+            self.enqueue_maintained_aggregate(MaintainedAggregateApply::Insert {
                 epoch: pending.epoch,
                 batches: pending.batches,
             })
             .await;
+        }
     }
 
     /// Enqueue a maintained-aggregate DELETE retraction (prepared under
@@ -13383,18 +13374,33 @@ impl CayenneTableProvider {
         &self,
         pending: Option<PendingMaintainedAggregateDelete>,
     ) {
-        let Some(pending) = pending else {
-            return;
-        };
-        let Some(tx) = &self.maintained_aggregate_tx else {
-            return;
-        };
-        let _ = tx
-            .send(MaintainedAggregateApply::Delete {
+        if let Some(pending) = pending {
+            self.enqueue_maintained_aggregate(MaintainedAggregateApply::Delete {
                 epoch: pending.epoch,
                 pk_batch: pending.pk_batch,
             })
             .await;
+        }
+    }
+
+    /// Enqueue one maintenance message onto the ordered background applier, off
+    /// the CDC critical path (the write path continues; backpressure only under
+    /// sustained overload, since the bounded queue is drained on the applier
+    /// thread). A send failure means the applier has shut down — its thread
+    /// exited or panicked, dropping the receiver — so maintenance can no longer
+    /// advance: mark the registry stale (queries fall back to base-table scans)
+    /// and log it, rather than silently degrading with no breadcrumb.
+    async fn enqueue_maintained_aggregate(&self, msg: MaintainedAggregateApply) {
+        let Some(tx) = &self.maintained_aggregate_tx else {
+            return;
+        };
+        if tx.send(msg).await.is_err() {
+            tracing::warn!(
+                table = %self.table_metadata.table_name,
+                "Maintained-aggregate applier is unavailable; marking stale — queries fall back to base table scans"
+            );
+            self.mark_maintained_aggregates_stale();
+        }
     }
 
     /// Project a CDC delete batch (source-schema column layout) onto the table's
