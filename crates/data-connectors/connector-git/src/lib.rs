@@ -389,16 +389,14 @@ const PARAMETERS: &[ParameterSpec] = &[
         .default("5000"),
     ParameterSpec::runtime("max_file_bytes")
         .description("Maximum size (bytes) for an individual file when fetching content."),
-    ParameterSpec::component("username")
-        .description("Username for HTTP(S) basic authentication."),
+    ParameterSpec::component("username").description("Username for HTTP(S) basic authentication."),
     ParameterSpec::component("password")
         .description("Password or personal access token for HTTP(S) basic authentication.")
         .secret(),
     ParameterSpec::component("token")
         .description("Personal access token used for HTTP(S) authentication.")
         .secret(),
-    ParameterSpec::component("ssh_key")
-        .description("Absolute path to an SSH private key."),
+    ParameterSpec::component("ssh_key").description("Absolute path to an SSH private key."),
     ParameterSpec::component("ssh_passphrase")
         .description("Passphrase for the SSH private key.")
         .secret(),
@@ -471,12 +469,12 @@ struct GitMetrics {
     inflight_operations: Arc<AtomicU64>,
 }
 
-const GIT_METRICS: &[MetricSpec] = &[MetricSpec::new(
-    "inflight_operations",
-    MetricType::ObservableGaugeU64,
-)
-.description("Current number of Git network operations holding a concurrency permit")
-.auto_register()];
+const GIT_METRICS: &[MetricSpec] =
+    &[
+        MetricSpec::new("inflight_operations", MetricType::ObservableGaugeU64)
+            .description("Current number of Git network operations holding a concurrency permit")
+            .auto_register(),
+    ];
 
 #[derive(Debug, Clone)]
 struct GitMetricsProvider {

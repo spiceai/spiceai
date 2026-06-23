@@ -554,11 +554,11 @@ fn gql_schema(comments_type: &PullRequestCommentType) -> SchemaRef {
 #[cfg(test)]
 mod tests {
     use super::{PullRequestCommentType, PullRequestTableArgs};
+    use crate::GitHubQueryMode;
+    use app::AppBuilder;
     use runtime::builder::RuntimeBuilder;
     use runtime::component::dataset::builder::DatasetBuilder;
     use runtime::dataconnector::ConnectorComponent;
-    use crate::GitHubQueryMode;
-    use app::AppBuilder;
     use std::sync::{Arc, OnceLock};
 
     /// Building a `ConnectorComponent` requires a full runtime + app

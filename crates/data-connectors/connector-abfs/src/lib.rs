@@ -16,17 +16,18 @@ limitations under the License.
 
 use runtime::Runtime;
 use runtime::component::dataset::Dataset;
-use runtime::dataconnector::listing::{self, ListingTableConnector, LISTING_TABLE_PARAMETERS, ObjectVersionType, build_fragments};
-use runtime::dataconnector::{
-    ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory,
-    DataConnectorResult, ParameterSpec, Parameters,
+use runtime::dataconnector::listing::{
+    self, LISTING_TABLE_PARAMETERS, ListingTableConnector, ObjectVersionType, build_fragments,
 };
 use runtime::dataconnector::parameters::{
     Validator,
     azure::{
-        AzureAccountValidator, AzureAuthValidator, AzureEndpointValidator,
-        AzureSasTokenNormalizer,
+        AzureAccountValidator, AzureAuthValidator, AzureEndpointValidator, AzureSasTokenNormalizer,
     },
+};
+use runtime::dataconnector::{
+    ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory,
+    DataConnectorResult, ParameterSpec, Parameters,
 };
 use snafu::prelude::*;
 use std::any::Any;
@@ -41,7 +42,14 @@ use url::Url;
 static PREFIX: &str = "abfs";
 
 static VALIDATORS: LazyLock<
-    Vec<Box<dyn Validator<Error = runtime::dataconnector::parameters::azure::Error> + Send + Sync + 'static>>,
+    Vec<
+        Box<
+            dyn Validator<Error = runtime::dataconnector::parameters::azure::Error>
+                + Send
+                + Sync
+                + 'static,
+        >,
+    >,
 > = LazyLock::new(|| {
     vec![
         Box::new(AzureSasTokenNormalizer),

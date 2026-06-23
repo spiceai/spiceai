@@ -14,10 +14,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use crate::pull_requests::PullRequestCommentType;
-use token_provider::github_app_token::GitHubAppTokenProvider;
-use runtime::component::dataset::Dataset;
 use crate::members::MembersTableArgs;
+use crate::pull_requests::PullRequestCommentType;
 use arrow::array::{Array, RecordBatch};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use async_trait::async_trait;
@@ -51,6 +49,7 @@ use issues::IssuesTableArgs;
 use projects::ProjectsTableArgs;
 use pull_requests::PullRequestTableArgs;
 use rate_limit::GitHubRateLimiter;
+use runtime::component::dataset::Dataset;
 use runtime_rate_control::{JitterConfig, RateController, RateControllerBuilder};
 use secrecy::ExposeSecret;
 use snafu::ResultExt;
@@ -59,6 +58,7 @@ use std::collections::HashMap;
 use std::num::NonZeroU32;
 use std::sync::LazyLock;
 use std::{any::Any, future::Future, pin::Pin, str::FromStr, sync::Arc, time::Duration};
+use token_provider::github_app_token::GitHubAppTokenProvider;
 use token_provider::{StaticTokenProvider, TokenProvider};
 use tokio::sync::{Mutex, RwLock, Semaphore};
 use url::Url;
@@ -572,12 +572,12 @@ impl Github {
         requested_ref: Option<&str>,
         dataset: &Dataset,
     ) -> DataConnectorResult<Arc<dyn TableProvider>> {
-        let client = self
-            .create_rest_client()
-            .context(runtime::dataconnector::UnableToGetReadProviderSnafu {
+        let client = self.create_rest_client().context(
+            runtime::dataconnector::UnableToGetReadProviderSnafu {
                 dataconnector: "github".to_string(),
                 connector_component: ConnectorComponent::from(dataset),
-            })?;
+            },
+        )?;
 
         let include = match self.params.get("include").expose().ok() {
             Some(pattern) => Some(parse_globs(&ConnectorComponent::from(dataset), pattern)?),
@@ -645,12 +645,12 @@ impl Github {
         let client = delegate_provider.client();
         let delegate = Arc::new(delegate_provider) as Arc<dyn TableProvider>;
 
-        let rest_client =
-            self.create_rest_client()
-                .context(runtime::dataconnector::UnableToGetReadProviderSnafu {
-                    dataconnector: "github".to_string(),
-                    connector_component: ConnectorComponent::from(dataset),
-                })?;
+        let rest_client = self.create_rest_client().context(
+            runtime::dataconnector::UnableToGetReadProviderSnafu {
+                dataconnector: "github".to_string(),
+                connector_component: ConnectorComponent::from(dataset),
+            },
+        )?;
 
         Ok(Arc::new(CommitsTableProvider::new(
             delegate,
@@ -1399,21 +1399,23 @@ pub fn parse_globs(
     for pattern in patterns {
         let trimmed_pattern = pattern.trim();
         if !trimmed_pattern.is_empty() {
-            builder.add(
-                Glob::new(trimmed_pattern).context(runtime::dataconnector::InvalidGlobPatternSnafu {
+            builder.add(Glob::new(trimmed_pattern).context(
+                runtime::dataconnector::InvalidGlobPatternSnafu {
                     pattern,
                     dataconnector: "github".to_string(),
                     connector_component: component.clone(),
-                })?,
-            );
+                },
+            )?);
         }
     }
 
-    let glob_set = builder.build().context(runtime::dataconnector::InvalidGlobPatternSnafu {
-        pattern: input,
-        dataconnector: "github".to_string(),
-        connector_component: component.clone(),
-    })?;
+    let glob_set = builder
+        .build()
+        .context(runtime::dataconnector::InvalidGlobPatternSnafu {
+            pattern: input,
+            dataconnector: "github".to_string(),
+            connector_component: component.clone(),
+        })?;
     Ok(Arc::new(glob_set))
 }
 
@@ -1883,8 +1885,13 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::{  // remaining super:: in test is correct
-        Github, GithubFactory, PARAMETERS, parse_github_path, sanitize_github_validation_body,
+    use super::{
+        // remaining super:: in test is correct
+        Github,
+        GithubFactory,
+        PARAMETERS,
+        parse_github_path,
+        sanitize_github_validation_body,
     };
     use runtime::Runtime;
     use runtime::component::dataset::builder::DatasetBuilder;
@@ -1958,7 +1965,9 @@ mod tests {
         }
     }
 
-    fn github_available_permits(connector: &Arc<dyn runtime::dataconnector::DataConnector>) -> usize {
+    fn github_available_permits(
+        connector: &Arc<dyn runtime::dataconnector::DataConnector>,
+    ) -> usize {
         connector
             .as_any()
             .downcast_ref::<Github>()

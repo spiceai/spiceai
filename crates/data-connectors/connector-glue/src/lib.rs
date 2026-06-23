@@ -19,9 +19,7 @@ limitations under the License.
 //! Re-exports the connector from `runtime` and provides factory functions
 //! for registration in the connector registry.
 
-pub use runtime::dataconnector::glue::{
-    GlueDataConnector, GlueDataConnectorFactory, InputFormat,
-};
+pub use runtime::dataconnector::glue::{GlueDataConnector, GlueDataConnectorFactory, InputFormat};
 
 use runtime::dataconnector::DataConnectorFactory;
 use std::sync::Arc;

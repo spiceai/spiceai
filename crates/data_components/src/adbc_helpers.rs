@@ -20,13 +20,13 @@ limitations under the License.
 //! and the ADBC catalog connector, avoiding circular dependencies between the
 //! runtime and connector crates.
 
-use arrow::array::{Array, ArrayRef, LargeStringArray, StringArray};
 use adbc_core::options::OptionDatabase;
+use arrow::array::{Array, ArrayRef, LargeStringArray, StringArray};
 use datafusion::datasource::TableProvider;
 use datafusion::sql::TableReference;
 use datafusion::sql::unparser::dialect::{BigQueryDialect, Dialect};
-use datafusion_table_providers::sql::db_connection_pool::adbcpool::ADBCPool;
 use datafusion_table_providers::sql::db_connection_pool::DbConnectionPool;
+use datafusion_table_providers::sql::db_connection_pool::adbcpool::ADBCPool;
 use datafusion_table_providers::sql::db_connection_pool::dbconnection::query_arrow;
 use futures::TryStreamExt;
 use std::collections::HashMap;
@@ -152,13 +152,22 @@ async fn bigquery_schema_metadata(
         };
         let metadata = field_metadata.entry(column_name.clone()).or_default();
         if let Some(source_type) = source_type {
-            metadata.insert(crate::SOURCE_TYPE_METADATA_KEY.to_string(), source_type.clone());
+            metadata.insert(
+                crate::SOURCE_TYPE_METADATA_KEY.to_string(),
+                source_type.clone(),
+            );
         }
         if partition.as_deref() == Some("true") {
-            metadata.insert(crate::PARTITION_METADATA_KEY.to_string(), "true".to_string());
+            metadata.insert(
+                crate::PARTITION_METADATA_KEY.to_string(),
+                "true".to_string(),
+            );
         }
         if let Some(clustering) = clustering {
-            metadata.insert(crate::CLUSTERING_METADATA_KEY.to_string(), clustering.clone());
+            metadata.insert(
+                crate::CLUSTERING_METADATA_KEY.to_string(),
+                clustering.clone(),
+            );
         }
     }
 

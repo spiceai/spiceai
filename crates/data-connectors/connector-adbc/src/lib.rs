@@ -14,7 +14,6 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use runtime::component::dataset::Dataset;
 use adbc_core::options::{AdbcVersion, OptionDatabase};
 use adbc_core::{Driver as _, LOAD_FLAG_DEFAULT};
 use adbc_driver_manager::ManagedDriver;
@@ -31,6 +30,7 @@ use datafusion_table_providers::sql::db_connection_pool::adbcpool::{
 };
 use datafusion_table_providers::sql::db_connection_pool::dbconnection::query_arrow;
 use futures::TryStreamExt;
+use runtime::component::dataset::Dataset;
 #[cfg(test)]
 use sha2::{Digest, Sha256};
 use snafu::prelude::*;
@@ -1157,7 +1157,6 @@ fn classify_adbc_error(
     }
 }
 
-
 #[async_trait]
 impl DataConnector for Adbc {
     fn as_any(&self) -> &dyn Any {
@@ -1486,8 +1485,8 @@ mod tests {
     }
 
     async fn test_dataset(from: &str, name: &str) -> Dataset {
-        use runtime::component::dataset::builder::DatasetBuilder;
         use app::AppBuilder;
+        use runtime::component::dataset::builder::DatasetBuilder;
 
         let app = AppBuilder::new("test_app").build();
         let rt = runtime::Runtime::builder().build().await;

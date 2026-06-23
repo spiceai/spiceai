@@ -109,9 +109,9 @@ pub const INFERRED_COLUMN_STATS_METADATA_KEY: &str = "spice.inferred_column_stat
 /// Metadata to merge into fields, keyed by field name.
 pub type FieldMetadata = HashMap<String, HashMap<String, String>>;
 
-pub mod arrow;
 #[cfg(feature = "adbc")]
 pub mod adbc_helpers;
+pub mod arrow;
 #[cfg(feature = "clickhouse")]
 pub mod clickhouse;
 #[cfg(feature = "cosmosdb")]

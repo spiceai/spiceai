@@ -26,11 +26,11 @@ use datafusion::datasource::TableProvider;
 use datafusion_table_providers::sql::db_connection_pool::DbConnectionPool;
 use db_connection_pool::snowflakepool::SnowflakeConnectionPool;
 use runtime::component::dataset::Dataset;
-use runtime::datafusion::udf::deny_spice_specific_functions;
 use runtime::dataconnector::{
     ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory,
     DataConnectorResult, NewDataConnectorResult, ParameterSpec,
 };
+use runtime::datafusion::udf::deny_spice_specific_functions;
 use snafu::prelude::*;
 use snowflake_api::SnowflakeApi;
 use std::any::Any;

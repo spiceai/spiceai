@@ -16,12 +16,14 @@ limitations under the License.
 
 use runtime::Runtime;
 use runtime::component::dataset::Dataset;
-use runtime::dataconnector::listing::{ListingTableConnector, LISTING_TABLE_PARAMETERS, ObjectVersionType, build_fragments};
+use runtime::dataconnector::listing::{
+    LISTING_TABLE_PARAMETERS, ListingTableConnector, ObjectVersionType, build_fragments,
+};
+use runtime::dataconnector::parameters::{Validator, gcs::GcsAuthValidator};
 use runtime::dataconnector::{
     ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory,
     DataConnectorResult, ParameterSpec, Parameters,
 };
-use runtime::dataconnector::parameters::{Validator, gcs::GcsAuthValidator};
 use snafu::prelude::*;
 use std::any::Any;
 use std::clone::Clone;
@@ -35,7 +37,14 @@ use url::Url;
 static PREFIX: &str = "gcs";
 
 static VALIDATORS: LazyLock<
-    Vec<Box<dyn Validator<Error = runtime::dataconnector::parameters::gcs::Error> + Send + Sync + 'static>>,
+    Vec<
+        Box<
+            dyn Validator<Error = runtime::dataconnector::parameters::gcs::Error>
+                + Send
+                + Sync
+                + 'static,
+        >,
+    >,
 > = LazyLock::new(|| vec![Box::new(GcsAuthValidator)]);
 
 #[derive(Debug, Snafu)]

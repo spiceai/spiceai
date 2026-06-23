@@ -14,7 +14,6 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use runtime::component::dataset::Dataset;
 use async_trait::async_trait;
 use data_components::github::{Error as GithubError, GithubRestClient};
 use datafusion::{
@@ -42,6 +41,7 @@ use datafusion::{
     scalar::ScalarValue,
 };
 use futures::{TryFutureExt, TryStreamExt};
+use runtime::component::dataset::Dataset;
 use std::{any::Any, collections::HashMap, sync::Arc};
 
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};

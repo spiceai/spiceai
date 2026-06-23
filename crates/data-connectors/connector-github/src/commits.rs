@@ -14,9 +14,9 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use async_trait::async_trait;
 use runtime::dataconnector::ConnectorComponent;
 use runtime::datafusion::error::find_datafusion_root;
-use async_trait::async_trait;
 
 use super::{
     GitHubTableArgs, GitHubTableGraphQLParams, commits_inject_parameters, expr_to_match,
@@ -900,9 +900,9 @@ fn gql_schema() -> SchemaRef {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use app::AppBuilder;
     use runtime::builder::RuntimeBuilder;
     use runtime::component::dataset::builder::DatasetBuilder;
-    use app::AppBuilder;
     use serde_json::json;
 
     fn create_mock_component(name: &str) -> ConnectorComponent {

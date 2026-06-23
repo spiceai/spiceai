@@ -30,11 +30,11 @@ use datafusion_table_providers::sql::db_connection_pool::dbconnection::duckdbcon
 use datafusion_table_providers::sql::db_connection_pool::duckdbpool::DuckDbConnectionPool;
 use duckdb::AccessMode;
 use runtime::component::dataset::Dataset;
-use runtime::datafusion::dialect::new_duckdb_dialect;
 use runtime::dataconnector::{
     AnyErrorResult, ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError,
     DataConnectorFactory, ParameterSpec,
 };
+use runtime::datafusion::dialect::new_duckdb_dialect;
 use snafu::prelude::*;
 use std::any::Any;
 use std::future::Future;

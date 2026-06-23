@@ -238,9 +238,9 @@ fn gql_schema() -> SchemaRef {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use app::AppBuilder;
     use runtime::builder::RuntimeBuilder;
     use runtime::component::dataset::builder::DatasetBuilder;
-    use app::AppBuilder;
 
     fn create_mock_component(name: &str) -> ConnectorComponent {
         let app = AppBuilder::new("test").build();
