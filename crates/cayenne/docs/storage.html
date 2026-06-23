@@ -1,0 +1,640 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Cayenne · Metadata &amp; Data Storage</title>
+<meta name="description" content="What Cayenne persists and where — the 11-table metastore schema, the on-disk Vortex/Arrow data layout, and storage conventions." />
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+<link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,400;9..144,500;9..144,600&family=Hanken+Grotesk:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet" />
+<style>
+:root{
+  --paper:#f7f3ec; --paper-2:#fffdf9; --ink:#1b1714; --ink-2:#5f5750; --ink-3:#938a7e;
+  --ember:#cb461d; --ember-soft:#f6e7dc; --amber-2:#a6691f; --cool:#2c7a6e; --cool-soft:#e1efea;
+  --line:#e7ddcf; --line-2:#d8ccba; --sidebar:280px;
+  --ff:"Hanken Grotesk",system-ui,sans-serif; --fd:"Fraunces",Georgia,serif; --fm:"JetBrains Mono",ui-monospace,monospace;
+}
+*{box-sizing:border-box;margin:0;padding:0}
+html{scroll-behavior:smooth}
+body{background:var(--paper);color:var(--ink);font-family:var(--ff);line-height:1.7;-webkit-font-smoothing:antialiased;font-size:16px}
+::selection{background:var(--ember);color:var(--paper)}
+body::before{content:"";position:fixed;inset:0;z-index:-1;pointer-events:none;opacity:.5;
+  background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='160' height='160'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='2'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)' opacity='0.04'/%3E%3C/svg%3E");}
+
+.shell{display:grid;grid-template-columns:var(--sidebar) minmax(0,1fr)}
+aside.side{position:sticky;top:0;height:100vh;overflow-y:auto;border-right:1px solid var(--line);padding:32px 22px 48px;background:rgba(247,243,236,.6);backdrop-filter:blur(4px)}
+.brand{display:flex;align-items:center;gap:11px;margin-bottom:6px}
+.brand .mark{width:26px;height:26px;border-radius:7px;flex:0 0 auto;background:linear-gradient(150deg,var(--ember),var(--amber-2));position:relative}
+.brand .mark::after{content:"";position:absolute;inset:7px 7px auto auto;width:6px;height:6px;border-radius:2px;background:var(--paper)}
+.brand .t b{font-family:var(--fd);font-weight:600;font-size:1.06rem;display:block;line-height:1.1}
+.brand .t span{font-family:var(--fm);font-size:.6rem;letter-spacing:.18em;text-transform:uppercase;color:var(--ink-3)}
+.side .tagline{font-size:.8rem;color:var(--ink-3);margin:6px 2px 10px;line-height:1.5}
+.side .kick{font-family:var(--fm);font-size:.6rem;letter-spacing:.2em;text-transform:uppercase;color:var(--amber-2);margin:22px 0 7px;padding-left:2px}
+.side nav a{display:block;text-decoration:none;color:var(--ink-2);font-size:.84rem;padding:5px 11px;border-radius:7px;border-left:2px solid transparent;transition:.2s;line-height:1.3}
+.side nav a:hover{color:var(--ink);background:rgba(203,70,29,.05)}
+.side nav a.active{color:var(--ember);background:var(--ember-soft);border-left-color:var(--ember);font-weight:500}
+.side nav a code{font-family:var(--fm);font-size:.92em;background:none;border:none;padding:0;color:inherit}
+.side .foot{margin-top:26px;padding-top:16px;border-top:1px solid var(--line);font-family:var(--fm);font-size:.65rem;color:var(--ink-3);line-height:1.9}
+.side .foot a{color:var(--cool);text-decoration:none}
+
+main{min-width:0}
+.topbar{position:sticky;top:0;z-index:20;display:flex;align-items:center;justify-content:space-between;padding:15px 44px;border-bottom:1px solid var(--line);background:rgba(247,243,236,.82);backdrop-filter:blur(8px);font-family:var(--fm);font-size:.73rem;letter-spacing:.04em;color:var(--ink-3)}
+.topbar .crumb b{color:var(--ink)}
+.topbar .pill{color:var(--cool);border:1px solid var(--line-2);padding:3px 10px;border-radius:100px}
+.doc{max-width:920px;margin:0 auto;padding:0 44px 130px}
+article{padding-top:54px}
+
+.masthead{margin-bottom:44px;padding-bottom:36px;border-bottom:1px solid var(--line)}
+.masthead .ey{font-family:var(--fm);font-size:.71rem;letter-spacing:.16em;text-transform:uppercase;color:var(--ember);display:inline-flex;align-items:center;gap:.7em}
+.masthead .ey::before{content:"";width:22px;height:1px;background:var(--ember)}
+.masthead h1{font-family:var(--fd);font-weight:500;font-size:clamp(2.2rem,5vw,3.4rem);line-height:1.04;letter-spacing:-.018em;margin:16px 0 0}
+.masthead .sub{font-size:1.12rem;color:var(--ink-2);font-weight:300;margin-top:18px;max-width:60ch}
+.masthead .sub b{color:var(--ink);font-weight:600}
+
+article section{scroll-margin-top:84px;margin-bottom:52px}
+.snum{font-family:var(--fm);font-size:.7rem;letter-spacing:.14em;text-transform:uppercase;color:var(--ink-3)}
+article h2{font-family:var(--fd);font-weight:500;font-size:1.7rem;line-height:1.12;margin:8px 0 14px}
+article h3.grp{font-family:var(--fm);font-size:.7rem;letter-spacing:.13em;text-transform:uppercase;color:var(--amber-2);margin:30px 0 4px;font-weight:600}
+article p{color:var(--ink-2);margin-bottom:14px}
+article p strong{color:var(--ink);font-weight:600}
+article a.lnk{color:var(--ember);text-decoration:none;border-bottom:1px solid var(--ember-soft)}
+code{font-family:var(--fm);font-size:.85em;background:rgba(27,23,20,.05);color:var(--amber-2);padding:2px 6px;border-radius:5px;border:1px solid var(--line)}
+
+/* table cards */
+.tcard{border:1px solid var(--line-2);border-radius:13px;overflow:hidden;margin:18px 0;background:var(--paper-2);box-shadow:0 1px 0 #fff inset,0 16px 36px -34px rgba(60,40,20,.5)}
+.tcard .th{display:flex;align-items:baseline;gap:12px;padding:14px 18px;border-bottom:1px solid var(--line);background:linear-gradient(180deg,#f4eee4,#efe7d9);flex-wrap:wrap}
+.tcard .th .nm{font-family:var(--fm);font-size:.95rem;font-weight:600;color:var(--ember)}
+.tcard .th .desc{font-size:.86rem;color:var(--ink-2);font-weight:300}
+.tcard .th .badge{font-family:var(--fm);font-size:.6rem;letter-spacing:.08em;text-transform:uppercase;padding:2px 8px;border-radius:100px;border:1px solid var(--line-2);color:var(--ink-3);margin-left:auto}
+table.cols{width:100%;border-collapse:collapse;font-size:.85rem}
+table.cols th{font-family:var(--fm);font-size:.6rem;letter-spacing:.12em;text-transform:uppercase;color:var(--ink-3);text-align:left;padding:10px 18px;border-bottom:1px solid var(--line);font-weight:500}
+table.cols td{padding:9px 18px;border-bottom:1px solid var(--line);vertical-align:top;color:var(--ink-2)}
+table.cols tr:last-child td{border-bottom:none}
+table.cols tr:hover td{background:rgba(203,70,29,.03)}
+table.cols td.c{font-family:var(--fm);font-size:.82rem;color:var(--ink);white-space:nowrap}
+table.cols td.ty{font-family:var(--fm);font-size:.76rem;color:var(--ink-3);white-space:nowrap}
+table.cols td.c .pk{display:inline-block;font-size:.58rem;font-family:var(--fm);letter-spacing:.06em;color:var(--ember);border:1px solid var(--ember);border-radius:4px;padding:0 4px;margin-left:6px;vertical-align:middle}
+table.cols td.c .fk{color:var(--cool);border-color:var(--cool)}
+table.cols td.n code{white-space:nowrap}
+
+/* ascii block */
+.ascii{margin:22px 0;border:1px solid var(--line-2);border-radius:12px;overflow:hidden;background:var(--paper-2)}
+.ascii .bar{display:flex;align-items:center;gap:8px;padding:9px 15px;border-bottom:1px solid var(--line);background:linear-gradient(180deg,#f4eee4,#efe7d9)}
+.ascii .bar .lights{display:flex;gap:6px}.ascii .bar .lights i{width:9px;height:9px;border-radius:50%}
+.ascii .bar .lights i:nth-child(1){background:var(--ember)}.ascii .bar .lights i:nth-child(2){background:#c98a2b}.ascii .bar .lights i:nth-child(3){background:var(--cool)}
+.ascii .bar .label{font-family:var(--fm);font-size:.66rem;letter-spacing:.12em;text-transform:uppercase;color:var(--ink-3)}
+.ascii pre{margin:0;padding:18px 20px;overflow-x:auto;font-family:var(--fm);font-size:12px;line-height:1.5;color:#36291d;white-space:pre}
+.ascii pre b{color:var(--ember);font-weight:600}.ascii pre i{color:var(--ink-3);font-style:normal}
+
+/* stores overview table */
+.tbl-wrap{overflow-x:auto;margin:14px 0}
+table.kv{width:100%;border-collapse:collapse;font-size:.88rem}
+table.kv th{font-family:var(--fm);font-size:.62rem;letter-spacing:.12em;text-transform:uppercase;color:var(--ink-3);text-align:left;padding:0 14px 11px;border-bottom:1px solid var(--line-2);font-weight:500}
+table.kv td{padding:12px 14px;border-bottom:1px solid var(--line);vertical-align:top;color:var(--ink-2)}
+table.kv td.k{font-family:var(--fm);font-size:.8rem;color:var(--ember);white-space:nowrap}
+
+.note{border:1px solid var(--line-2);border-left:3px solid var(--cool);background:var(--paper-2);border-radius:0 10px 10px 0;padding:18px 22px;margin:22px 0}
+.note .lbl{font-family:var(--fm);font-size:.64rem;letter-spacing:.14em;text-transform:uppercase;color:var(--cool);margin-bottom:7px}
+.note p{margin:0;color:var(--ink-2)}.note p strong{color:var(--ink)}
+
+@media(max-width:860px){.shell{grid-template-columns:1fr}aside.side{position:static;height:auto;border-right:none;border-bottom:1px solid var(--line)}.doc{padding:0 22px 90px}.topbar{padding:13px 22px}}
+</style>
+</head>
+<body>
+<div class="shell">
+  <aside class="side">
+    <div class="brand"><div class="mark"></div><div class="t"><b>Cayenne</b><span>Storage</span></div></div>
+    <p class="tagline">What Cayenne persists, and where — the 11-table metastore schema and the on-disk data layout.</p>
+
+    <div class="kick">Overview</div>
+    <nav id="nav">
+      <a href="#stores">Two stores + L0</a>
+    </nav>
+    <div class="kick">Metastore · definition</div>
+    <nav>
+      <a href="#cayenne_table"><code>cayenne_table</code></a>
+      <a href="#cayenne_snapshot_sequence"><code>cayenne_snapshot_sequence</code></a>
+    </nav>
+    <div class="kick">Metastore · files &amp; stats</div>
+    <nav>
+      <a href="#cayenne_snapshot_file"><code>cayenne_snapshot_file</code></a>
+      <a href="#cayenne_snapshot_file_statistics"><code>…snapshot_file_statistics</code></a>
+      <a href="#cayenne_table_statistics"><code>cayenne_table_statistics</code></a>
+    </nav>
+    <div class="kick">Metastore · deletes &amp; pk</div>
+    <nav>
+      <a href="#cayenne_delete_file"><code>cayenne_delete_file</code></a>
+      <a href="#cayenne_insert_record"><code>cayenne_insert_record</code></a>
+      <a href="#cayenne_pk_index"><code>cayenne_pk_index</code></a>
+    </nav>
+    <div class="kick">Metastore · partitions &amp; L0</div>
+    <nav>
+      <a href="#cayenne_partition"><code>cayenne_partition</code></a>
+      <a href="#cayenne_inlined_data"><code>cayenne_inlined_data</code></a>
+      <a href="#cayenne_inlined_delete"><code>cayenne_inlined_delete</code></a>
+    </nav>
+    <div class="kick">Data lake &amp; conventions</div>
+    <nav>
+      <a href="#layout">On-disk layout</a>
+      <a href="#memory">In-memory state</a>
+      <a href="#conventions">Conventions</a>
+    </nav>
+    <div class="foot">SOURCE<br>metastore/sqlite.rs · EXPECTED_TABLES<br><br><a href="index.html">← architecture tour</a><br><a href="../README.md">README</a></div>
+  </aside>
+
+  <main>
+    <div class="topbar"><div class="crumb">cayenne / docs / <b>storage</b></div><div class="pill">11 tables · 2 stores</div></div>
+    <div class="doc">
+      <article>
+        <div class="masthead">
+          <span class="ey">Metadata &amp; data reference</span>
+          <h1>What Cayenne stores, and where</h1>
+          <p class="sub">Cayenne splits storage across a transactional <b>metastore</b> (SQLite / Turso),
+            an immutable <b>Vortex data lake</b>, and an <b>LSM level-0 tier</b>. This is the authoritative
+            map of every persisted table, file, and convention.</p>
+        </div>
+
+        <!-- STORES -->
+        <section id="stores">
+          <div class="snum">§ 01 — Overview</div>
+          <h2>Two stores plus a level-0 tier</h2>
+          <div class="tbl-wrap"><table class="kv">
+            <thead><tr><th>Store</th><th>Holds</th><th>Durability</th></tr></thead>
+            <tbody>
+              <tr><td class="k">Metastore<br><span style="color:var(--ink-3)">SQLite / Turso</span></td><td>All metadata — table rows, snapshot pointer, file manifests, delete-file refs, statistics, sequence numbers, the inline memtable.</td><td>Transactional <code>BEGIN…COMMIT</code></td></tr>
+              <tr><td class="k">Data lake<br><span style="color:var(--ink-3)">FS / S3 Express</span></td><td>Immutable <strong>Vortex</strong> data files + Arrow-IPC deletion files, grouped under per-snapshot directories.</td><td>Atomic rename + snapshot-pointer flip</td></tr>
+              <tr><td class="k">LSM level-0</td><td>Small writes as Arrow-IPC blobs in the metastore (<code>cayenne_inlined_*</code>) and, under the CDC profile, an in-RAM mem-tier.</td><td>Metastore tier durable; RAM tier re-streamed exactly-once on crash</td></tr>
+            </tbody>
+          </table></div>
+          <div class="note">
+            <div class="lbl">Source of truth</div>
+            <p>The DDL in <code>crates/cayenne/src/metastore/sqlite.rs</code> (mirrored in <code>turso.rs</code>)
+              and the column lists in <code>metastore::EXPECTED_TABLES</code>. <code>validate_existing_schema</code>
+              checks column <strong>names and ordering</strong> at startup — types aren't compared, since
+              SQLite/libSQL type affinity makes exact matching unreliable. The 11 tables below are the full set.</p>
+          </div>
+        </section>
+
+        <!-- ============ TABLE CARDS ============ -->
+        <section>
+          <div class="snum">§ 02 — Metastore schema</div>
+          <h2>The 11 metastore tables</h2>
+          <p><code>table_id</code> is a UUIDv7 string and the spine of every dependent table via
+            <code>FOREIGN KEY … ON DELETE CASCADE</code>. Grouped by role.</p>
+
+          <h3 class="grp">Table definition &amp; sequencing</h3>
+
+          <div class="tcard" id="cayenne_table">
+            <div class="th"><span class="nm">cayenne_table</span><span class="desc">one row per table — the authoritative state pointer</span></div>
+            <table class="cols"><thead><tr><th>Column</th><th>Type</th><th>Notes</th></tr></thead><tbody>
+              <tr><td class="c">table_id<span class="pk">PK</span></td><td class="ty">TEXT</td><td class="n">UUIDv7 — stable across dumps &amp; snapshots</td></tr>
+              <tr><td class="c">table_name</td><td class="ty">TEXT</td><td class="n">unique index <code>idx_cayenne_table_name_unique</code></td></tr>
+              <tr><td class="c">path</td><td class="ty">TEXT</td><td class="n">data root (local or <code>s3://…--x-s3/…</code>)</td></tr>
+              <tr><td class="c">path_is_relative</td><td class="ty">BOOLEAN</td><td class="n">re-anchored on snapshot import</td></tr>
+              <tr><td class="c">schema_json</td><td class="ty">TEXT</td><td class="n">Arrow schema</td></tr>
+              <tr><td class="c">primary_key_json</td><td class="ty">TEXT</td><td class="n">PK column list (null → no PK)</td></tr>
+              <tr><td class="c">on_conflict_json</td><td class="ty">TEXT</td><td class="n">upsert / on-conflict policy</td></tr>
+              <tr><td class="c">current_snapshot_id</td><td class="ty">TEXT</td><td class="n"><strong>the visibility pointer</strong> — flipped atomically per write/compaction</td></tr>
+              <tr><td class="c">partition_column</td><td class="ty">TEXT</td><td class="n">composite-partition spec (nullable)</td></tr>
+              <tr><td class="c">vortex_config_json</td><td class="ty">TEXT</td><td class="n">per-dataset <code>VortexConfig</code></td></tr>
+              <tr><td class="c">current_sequence_number</td><td class="ty">BIGINT</td><td class="n">high-water sequence allocator</td></tr>
+            </tbody></table>
+          </div>
+
+          <div class="tcard" id="cayenne_snapshot_sequence">
+            <div class="th"><span class="nm">cayenne_snapshot_sequence</span><span class="desc">Iceberg-style visibility ordering</span></div>
+            <table class="cols"><thead><tr><th>Column</th><th>Type</th><th>Notes</th></tr></thead><tbody>
+              <tr><td class="c">table_id<span class="pk fk">PK·FK</span></td><td class="ty">TEXT</td><td class="n">FK → cayenne_table</td></tr>
+              <tr><td class="c">snapshot_id<span class="pk">PK</span></td><td class="ty">TEXT</td><td class="n"></td></tr>
+              <tr><td class="c">sequence_number</td><td class="ty">BIGINT</td><td class="n">a delete applies only to snapshots with <code>seq ≤</code> the delete's</td></tr>
+            </tbody></table>
+          </div>
+
+          <h3 class="grp">Data-file manifest &amp; statistics</h3>
+
+          <div class="tcard" id="cayenne_snapshot_file">
+            <div class="th"><span class="nm">cayenne_snapshot_file</span><span class="desc">authoritative per-snapshot file manifest</span><span class="badge">manifest model</span></div>
+            <table class="cols"><thead><tr><th>Column</th><th>Type</th><th>Notes</th></tr></thead><tbody>
+              <tr><td class="c">table_id<span class="pk fk">PK·FK</span></td><td class="ty">TEXT</td><td class="n"></td></tr>
+              <tr><td class="c">snapshot_id<span class="pk">PK</span></td><td class="ty">TEXT</td><td class="n">a new snapshot references an existing file by inserting a row — no copy</td></tr>
+              <tr><td class="c">file_path<span class="pk">PK</span></td><td class="ty">TEXT</td><td class="n"></td></tr>
+              <tr><td class="c">row_count</td><td class="ty">BIGINT</td><td class="n"></td></tr>
+              <tr><td class="c">file_size_bytes</td><td class="ty">BIGINT</td><td class="n"></td></tr>
+              <tr><td class="c">min_sequence</td><td class="ty">BIGINT</td><td class="n">commit-seq range — drives the seq-prefix bake (<code>max_sequence ≤ T</code>)</td></tr>
+              <tr><td class="c">max_sequence</td><td class="ty">BIGINT</td><td class="n"></td></tr>
+            </tbody></table>
+          </div>
+
+          <div class="tcard" id="cayenne_snapshot_file_statistics">
+            <div class="th"><span class="nm">cayenne_snapshot_file_statistics</span><span class="desc">per-file footer stats — pruning cache</span><span class="badge">best-effort</span></div>
+            <table class="cols"><thead><tr><th>Column</th><th>Type</th><th>Notes</th></tr></thead><tbody>
+              <tr><td class="c">table_id<span class="pk fk">PK·FK</span></td><td class="ty">TEXT</td><td class="n"></td></tr>
+              <tr><td class="c">snapshot_id<span class="pk">PK</span></td><td class="ty">TEXT</td><td class="n"></td></tr>
+              <tr><td class="c">file_path<span class="pk">PK</span></td><td class="ty">TEXT</td><td class="n">skip re-reading every object on each scan</td></tr>
+              <tr><td class="c">file_size_bytes</td><td class="ty">BIGINT</td><td class="n"></td></tr>
+              <tr><td class="c">num_rows</td><td class="ty">BIGINT</td><td class="n"></td></tr>
+              <tr><td class="c">statistics_blob</td><td class="ty">BLOB</td><td class="n">Vortex <code>FileStatistics</code> flatbuffer (min/max/null count)</td></tr>
+            </tbody></table>
+          </div>
+
+          <div class="tcard" id="cayenne_table_statistics">
+            <div class="th"><span class="nm">cayenne_table_statistics</span><span class="desc">per-table aggregate, upserted per write</span></div>
+            <table class="cols"><thead><tr><th>Column</th><th>Type</th><th>Notes</th></tr></thead><tbody>
+              <tr><td class="c">table_id<span class="pk fk">PK·FK</span></td><td class="ty">TEXT</td><td class="n"></td></tr>
+              <tr><td class="c">statistics_blob</td><td class="ty">BLOB</td><td class="n">Vortex <code>FileStatistics</code> flatbuffer (min/max/null count)</td></tr>
+              <tr><td class="c">num_rows</td><td class="ty">BIGINT</td><td class="n">live row count</td></tr>
+              <tr><td class="c">ndv_sketches</td><td class="ty">BLOB</td><td class="n">per-int-column HyperLogLog NDV sketches (mergeable register-wise max)</td></tr>
+            </tbody></table>
+          </div>
+
+          <h3 class="grp">Deletes &amp; upsert tracking</h3>
+
+          <div class="tcard" id="cayenne_delete_file">
+            <div class="th"><span class="nm">cayenne_delete_file</span><span class="desc">deletion-vector references — deletes never rewrite data</span></div>
+            <table class="cols"><thead><tr><th>Column</th><th>Type</th><th>Notes</th></tr></thead><tbody>
+              <tr><td class="c">delete_file_id<span class="pk">PK</span></td><td class="ty">TEXT</td><td class="n">UUIDv7</td></tr>
+              <tr><td class="c">table_id<span class="pk fk">FK</span></td><td class="ty">TEXT</td><td class="n"></td></tr>
+              <tr><td class="c">path</td><td class="ty">TEXT</td><td class="n">unique <code>(table_id, path)</code></td></tr>
+              <tr><td class="c">path_is_relative</td><td class="ty">BOOLEAN</td><td class="n"></td></tr>
+              <tr><td class="c">format</td><td class="ty">TEXT</td><td class="n">always <code>'arrow_ipc'</code></td></tr>
+              <tr><td class="c">delete_count</td><td class="ty">BIGINT</td><td class="n"></td></tr>
+              <tr><td class="c">file_size_bytes</td><td class="ty">BIGINT</td><td class="n"></td></tr>
+              <tr><td class="c">source_data_file_path</td><td class="ty">TEXT</td><td class="n">non-NULL <strong>only</strong> for position-based deletes</td></tr>
+              <tr><td class="c">sequence_number</td><td class="ty">BIGINT</td><td class="n">delete sequence</td></tr>
+              <tr><td class="c">reinsert_sequence</td><td class="ty">BIGINT</td><td class="n">per-commit reinsert seq for metadata-only publish (added last)</td></tr>
+            </tbody></table>
+          </div>
+
+          <div class="tcard" id="cayenne_insert_record">
+            <div class="th"><span class="nm">cayenne_insert_record</span><span class="desc">upsert re-insertion tracking — hot, high-volume</span><span class="badge">WITHOUT ROWID</span></div>
+            <table class="cols"><thead><tr><th>Column</th><th>Type</th><th>Notes</th></tr></thead><tbody>
+              <tr><td class="c">table_id<span class="pk">PK</span></td><td class="ty">BLOB</td><td class="n">16 raw UUID bytes (not 36-char text) — cuts WAL volume (<code>table_id_to_key_bytes</code>)</td></tr>
+              <tr><td class="c">pk_bytes<span class="pk">PK</span></td><td class="ty">BLOB</td><td class="n">PK row key (Arrow <code>RowConverter</code> bytes)</td></tr>
+              <tr><td class="c">sequence_number</td><td class="ty">BIGINT</td><td class="n">re-insertion sequence</td></tr>
+            </tbody></table>
+          </div>
+
+          <div class="tcard" id="cayenne_pk_index">
+            <div class="th"><span class="nm">cayenne_pk_index</span><span class="desc">persisted PK existence checkpoint</span></div>
+            <table class="cols"><thead><tr><th>Column</th><th>Type</th><th>Notes</th></tr></thead><tbody>
+              <tr><td class="c">table_id<span class="pk fk">PK·FK</span></td><td class="ty">TEXT</td><td class="n"></td></tr>
+              <tr><td class="c">snapshot_id</td><td class="ty">TEXT</td><td class="n">snapshot the checkpoint covers</td></tr>
+              <tr><td class="c">index_blob</td><td class="ty">BLOB</td><td class="n">serialized PK bloom checkpoint — restart skips full keyset rebuild</td></tr>
+            </tbody></table>
+          </div>
+
+          <h3 class="grp">Partitions &amp; LSM level-0</h3>
+
+          <div class="tcard" id="cayenne_partition">
+            <div class="th"><span class="nm">cayenne_partition</span><span class="desc">composite partition metadata</span></div>
+            <table class="cols"><thead><tr><th>Column</th><th>Type</th><th>Notes</th></tr></thead><tbody>
+              <tr><td class="c">partition_id<span class="pk">PK</span></td><td class="ty">TEXT</td><td class="n"></td></tr>
+              <tr><td class="c">table_id<span class="pk fk">FK</span></td><td class="ty">TEXT</td><td class="n"></td></tr>
+              <tr><td class="c">partition_columns_json</td><td class="ty">TEXT</td><td class="n">ordered column names</td></tr>
+              <tr><td class="c">partition_values_json</td><td class="ty">TEXT</td><td class="n">ordered values</td></tr>
+              <tr><td class="c">partition_key</td><td class="ty">TEXT</td><td class="n">slash-separated key (Hive dirs); <code>UNIQUE(table_id, partition_key)</code></td></tr>
+              <tr><td class="c">path</td><td class="ty">TEXT</td><td class="n"></td></tr>
+              <tr><td class="c">path_is_relative</td><td class="ty">BOOLEAN</td><td class="n"></td></tr>
+              <tr><td class="c">record_count</td><td class="ty">BIGINT</td><td class="n"></td></tr>
+              <tr><td class="c">file_size_bytes</td><td class="ty">BIGINT</td><td class="n"></td></tr>
+            </tbody></table>
+          </div>
+
+          <div class="tcard" id="cayenne_inlined_data">
+            <div class="th"><span class="nm">cayenne_inlined_data</span><span class="desc">inline memtable — small writes as IPC blobs</span><span class="badge">L0</span></div>
+            <table class="cols"><thead><tr><th>Column</th><th>Type</th><th>Notes</th></tr></thead><tbody>
+              <tr><td class="c">inlined_id<span class="pk">PK</span></td><td class="ty">TEXT</td><td class="n"></td></tr>
+              <tr><td class="c">table_id<span class="pk fk">FK</span></td><td class="ty">TEXT</td><td class="n"></td></tr>
+              <tr><td class="c">partition_key</td><td class="ty">TEXT</td><td class="n">routes inline data per partition (nullable)</td></tr>
+              <tr><td class="c">data_ipc</td><td class="ty">BLOB</td><td class="n">Arrow IPC stream</td></tr>
+              <tr><td class="c">record_count</td><td class="ty">BIGINT</td><td class="n"></td></tr>
+              <tr><td class="c">sequence_number</td><td class="ty">BIGINT</td><td class="n">index <code>(table_id, sequence_number)</code></td></tr>
+              <tr><td class="c">created_at</td><td class="ty">TEXT</td><td class="n">default <code>strftime(…'now')</code></td></tr>
+            </tbody></table>
+          </div>
+
+          <div class="tcard" id="cayenne_inlined_delete">
+            <div class="th"><span class="nm">cayenne_inlined_delete</span><span class="desc">inline tombstones not yet checkpointed</span><span class="badge">L0</span></div>
+            <table class="cols"><thead><tr><th>Column</th><th>Type</th><th>Notes</th></tr></thead><tbody>
+              <tr><td class="c">inlined_id<span class="pk">PK</span></td><td class="ty">TEXT</td><td class="n"></td></tr>
+              <tr><td class="c">table_id<span class="pk fk">FK</span></td><td class="ty">TEXT</td><td class="n"></td></tr>
+              <tr><td class="c">delete_ipc</td><td class="ty">BLOB</td><td class="n">Arrow IPC stream of PK row keys / row IDs</td></tr>
+              <tr><td class="c">delete_count</td><td class="ty">BIGINT</td><td class="n"></td></tr>
+              <tr><td class="c">sequence_number</td><td class="ty">BIGINT</td><td class="n">index <code>(table_id, sequence_number)</code></td></tr>
+              <tr><td class="c">created_at</td><td class="ty">TEXT</td><td class="n">default timestamp</td></tr>
+              <tr><td class="c">published</td><td class="ty">INTEGER</td><td class="n"><code>NOT NULL DEFAULT 0</code>. Per-tombstone durable activation — read filter applies it only when <code>1</code>; the owning snapshot's finalize flips it. Must stay last.</td></tr>
+            </tbody></table>
+          </div>
+        </section>
+
+        <!-- LAYOUT -->
+        <section id="layout">
+          <div class="snum">§ 03 — Data lake</div>
+          <h2>On-disk data layout</h2>
+          <p>Vortex data files and Arrow-IPC deletion files live under the data root, grouped by
+            <code>table_id</code> then snapshot directory:</p>
+
+          <figure class="ascii">
+            <div class="bar"><span class="lights"><i></i><i></i><i></i></span><span class="label">data-root directory tree</span></div>
+<pre>
+&lt;data_root&gt;/
+└─ &lt;table_id&gt;/
+   ├─ &lt;current_snapshot_id&gt;/          <b>◀ the one authoritative, VISIBLE base state</b>
+   │   ├─ part-001.vortex            <i>immutable columnar data file</i>
+   │   ├─ part-002.vortex
+   │   └─ deletions/
+   │       └─ &lt;delete_file_id&gt;.arrow <i>Arrow-IPC deletion vector</i>
+   ├─ &lt;staging_snapshot_id&gt;/          <i>◀ Stage-A buffer — durable, NOT yet visible</i>
+   │   ├─ _wal.json                  <i>staging WAL (tmp+fsync+rename)</i>
+   │   └─ part-*.vortex              <i>(no deletions/ until published)</i>
+   └─ &lt;protected_snapshot_id&gt;/        <b>◀ published &amp; VISIBLE, scanned with a PARTIAL filter</b>
+       └─ part-001.vortex            <i>DATA FILES ONLY — the replacement rows.</i>
+                                     <i>deletion vectors live under current's deletions/;</i>
+                                     <i>upsert tombstones are inline (cayenne_inlined_delete)</i>
+
+<i>partitioned tables: _partitioned_wal/&lt;commit_id&gt;.json anchors the
+cross-partition atomic commit on local FS.</i>
+</pre>
+          </figure>
+
+          <h3 class="grp">The three snapshot kinds</h3>
+          <p>A <code>&lt;snapshot_id&gt;</code> directory is a UUIDv7-named set of immutable Vortex files (and their
+            deletion vectors). Three kinds coexist under one table, and they differ entirely in
+            <strong>visibility</strong> and <strong>which deletions apply at scan time</strong> — not in their
+            on-disk shape:</p>
+          <div class="tbl-wrap"><table class="kv">
+            <thead><tr><th>Kind</th><th>Visible to reads?</th><th>Deletion filter at scan</th><th>Lifetime · created by</th></tr></thead>
+            <tbody>
+              <tr><td class="k">Current</td><td>yes — the base; <code>cayenne_table.current_snapshot_id</code></td><td><strong>full</strong> — every deletion applies</td><td>exactly one at a time; replaced by an atomic pointer flip. Genesis + compaction output</td></tr>
+              <tr><td class="k">Staging</td><td><strong>no</strong> — pre-visibility</td><td>n/a</td><td>transient; written in <strong>Stage A</strong> of every burst under <code>_wal.json</code>. <strong>Stage B</strong> moves/publishes it; the WAL self-heals on crash</td></tr>
+              <tr><td class="k">Protected</td><td>yes — <strong>unioned</strong> with current</td><td><strong>partial</strong> — only <code>delete_seq &gt; threshold</code></td><td>retained; they accumulate and are folded by maintenance compaction. Created by an on-conflict upsert / pending-PK-delete publish (key-delete path)</td></tr>
+            </tbody>
+          </table></div>
+          <p>The <strong>why</strong> for protected snapshots: a publish stages freshly-inserted rows at sequence
+            numbers <em>above</em> the deletions already baked into the current snapshot. Those older deletions
+            provably cannot apply to the new rows, so the writer skips re-resolving the entire deletion set against
+            them — it publishes the new data as a protected snapshot with a <strong>threshold = the snapshot's own
+            allocated sequence</strong> (persisted in <a class="lnk" href="#cayenne_snapshot_sequence"><code>cayenne_snapshot_sequence</code></a>,
+            cached as <code>protected_snapshots: snapshot_id → threshold</code>). At scan time the read applies the
+            full deletion filter to current and a partial one (<code>delete_seq &gt; threshold</code>) to each protected
+            snapshot, then unions them. They are never silently cleared — each holds valid data under its own filter;
+            <code>compact_protected_snapshots_subset</code> (count/age-triggered) folds the older prefix into one
+            self-contained merged snapshot, keeping the newest <code>K</code> unbaked and seq-prefix-baking
+            <code>delete_seq ≤ T</code>.</p>
+
+          <h3 class="grp">Layout by workload shape</h3>
+          <p>The same primitives produce visibly different trees depending on whether the workload deletes.
+            Three representative shapes:</p>
+
+          <figure class="ascii">
+            <div class="bar"><span class="lights"><i></i><i></i><i></i></span><span class="label">1 · append-only (plain INSERT / batch load)</span></div>
+<pre>
+&lt;table_id&gt;/
+└─ &lt;current_snapshot_id&gt;/           <b>◀ one snapshot, GROWS IN PLACE</b>
+   ├─ part-0001.vortex             <i>each append moves its staged files in here —</i>
+   ├─ part-0002.vortex             <i>current_snapshot_id does NOT change</i>
+   ├─ part-0003.vortex
+   └─ (no deletions/)              <i>nothing is ever deleted</i>
+
+       │  compaction (small-file tier → target size)
+       ▼
+&lt;table_id&gt;/
+└─ &lt;NEW current_snapshot_id&gt;/       <b>◀ pointer FLIPS to a fresh UUIDv7</b>
+   └─ part-0001.vortex             <i>consolidated; prior dir retired + swept</i>
+</pre>
+          </figure>
+
+          <figure class="ascii">
+            <div class="bar"><span class="lights"><i></i><i></i><i></i></span><span class="label">2 · CDC append (cdc_durability: memory, no PK conflicts)</span></div>
+<pre>
+ RAM   <i>[ mem-tier: newest bursts — NOT on disk yet ]</i>
+ meta  <i>[ cayenne_inlined_data: tiny batches as Arrow-IPC blobs ]</i>
+
+&lt;table_id&gt;/
+├─ &lt;current_snapshot_id&gt;/           <i>durable data</i>
+│  ├─ part-0001.vortex             <b>◀ written by a periodic CHECKPOINT</b>
+│  └─ part-0002.vortex             <i>(flushes the RAM tier to one Vortex file)</i>
+└─ &lt;staging_id&gt;/                    <b>◀ exists only mid-burst (Stage A)</b>
+   ├─ _wal.json                    <i>durable file list (tmp+fsync+rename)</i>
+   └─ part-*.vortex                <i>source LSN acked once this is durable</i>
+
+ <i>(still no deletions/, no protected snapshots — pure append)</i>
+</pre>
+          </figure>
+
+          <figure class="ascii">
+            <div class="bar"><span class="lights"><i></i><i></i><i></i></span><span class="label">3 · updates / deletes (upserts + deletes, key-delete path)</span></div>
+<pre>
+ meta  <i>[ cayenne_snapshot_sequence: {A → seqA, B → seqB} ]  ◀ thresholds</i>
+       <i>[ cayenne_inlined_delete:    unflushed tombstones    ]</i>
+
+&lt;table_id&gt;/
+├─ &lt;current_snapshot_id&gt;/           <b>◀ base (genesis / compaction output)</b>
+│  ├─ part-0001.vortex             <i>scanned with the FULL deletion filter</i>
+│  └─ deletions/&lt;del&gt;.arrow        <i>key-based: row_key, deleted_at</i>
+├─ &lt;protected_snapshot_A&gt;/          <b>◀ upsert publish #1  (filter: delete_seq &gt; seqA)</b>
+│  └─ part-*.vortex                <i>replacement rows ONLY (seq &gt; seqA); their tombstones</i>
+│                                  <i>are inline + under current's deletions/, NOT here</i>
+├─ &lt;protected_snapshot_B&gt;/          <b>◀ upsert publish #2  (filter: delete_seq &gt; seqB)</b>
+│  └─ part-*.vortex
+└─ &lt;staging_id&gt;/  <i>(mid-burst)</i>      <i>_wal.json + part-*.vortex</i>
+
+ scan = current(FULL)  ∪  A(partial)  ∪  B(partial)  ∪  mem-tier / inline
+
+       │  maintenance compaction (count/age trigger): fold older prefix,
+       │  keep newest K unbaked, seq-prefix-bake delete_seq ≤ T
+       ▼
+&lt;table_id&gt;/
+├─ &lt;current_snapshot_id&gt;/           <i>(unchanged)</i>
+├─ &lt;merged_snapshot_id&gt;/            <b>◀ A+B folded into ONE self-contained dir</b>
+│  └─ part-*.vortex                <i>seq-prefix baked: tombstones ≤ T applied into the data</i>
+└─ &lt;protected_snapshot_C&gt;/          <b>◀ newest K kept (active delete stream)</b>
+</pre>
+          </figure>
+
+          <h3 class="grp">Vortex data files</h3>
+          <p>Immutable once written. Target size <code>cayenne_target_file_size_mb</code> (default 256 MB);
+            <code>btrblocks</code> (default) or <code>zstd</code> compression; optional sort columns. A
+            "file" (<code>DataFile</code>) is a Vortex <code>ListingTable</code> rooted at a unique directory,
+            not necessarily one object. Footer stats are cached in <code>cayenne_snapshot_file_statistics</code>.</p>
+
+          <h3 class="grp">Deletion files — the schema is the discriminator</h3>
+          <div class="tbl-wrap"><table class="kv">
+            <thead><tr><th>Mode</th><th>Arrow schema</th><th>When</th></tr></thead>
+            <tbody>
+              <tr><td class="k">Position-based</td><td><code>row_id: UInt64</code>, <code>deleted_at: Int64</code> (µs)</td><td>PK-less tables (always), or any table in <code>deletion_mode: position</code></td></tr>
+              <tr><td class="k">Key-based</td><td><code>row_key: Binary</code>, <code>deleted_at: Int64</code> (µs)</td><td>PK tables in <code>deletion_mode: key</code> (<code>auto</code> ⇒ key for <code>changes</code>-mode PK tables)</td></tr>
+            </tbody>
+          </table></div>
+
+          <h3 class="grp">Crash-safety &amp; portability files</h3>
+          <p><strong>Staging WAL (<code>_wal.json</code>)</strong> — makes a staged file list crash-safe via
+            tmp + fsync + rename; unreconciled markers self-heal on the next open.
+            <strong>Partitioned WAL</strong> — anchors a cross-partition atomic commit.
+            <strong>Snapshot slice (<code>metadata/&lt;dataset&gt;.slice.json</code>)</strong> — a versioned
+            (<code>format_version: 1</code>) per-dataset metastore export, path-re-anchored on import for
+            portability across nodes. The raw <code>cayenne.db</code>/<code>-wal</code>/<code>-shm</code> are
+            <strong>excluded</strong> from the snapshot tar.</p>
+        </section>
+
+        <!-- MEMORY -->
+        <section id="memory">
+          <div class="snum">§ 04 — In-memory</div>
+          <h2>In-memory state — an ontology</h2>
+          <p><code>CayenneTableProvider</code> carries ~57 fields of in-memory state (<code>provider/table.rs:1894</code>).
+            They are <em>not</em> all data and <em>not</em> all ephemeral. The organizing question is
+            <strong>durability class</strong> — what happens on a crash.</p>
+
+          <div class="tbl-wrap"><table class="kv">
+            <thead><tr><th>Class</th><th>Meaning</th><th>On crash</th></tr></thead>
+            <tbody>
+              <tr><td class="k" style="color:var(--cool)">Derived cache</td><td>fast-read projection of a durable source, rebuilt on open</td><td><strong>no loss</strong> — reloaded from metastore / files</td></tr>
+              <tr><td class="k" style="color:var(--ember)">Ephemeral</td><td>RAM-only payload, no durable copy</td><td>discarded, then <strong>re-streamed exactly-once</strong> from the source slot</td></tr>
+              <tr><td class="k" style="color:var(--ink-3)">Coordination</td><td>locks, fences, atomics, flags — no payload</td><td>reconstructed empty</td></tr>
+              <tr><td class="k" style="color:var(--ink-3)">Accounting</td><td>memory-pool reservations</td><td>irrelevant</td></tr>
+            </tbody>
+          </table></div>
+
+          <div class="note" style="border-left-color:var(--ember)">
+            <div class="lbl" style="color:var(--ember)">Are protected snapshots in memory?</div>
+            <p>Only as a <strong>derived cache</strong>. <code>protected_snapshots: Arc&lt;ArcSwap&lt;HashMap&lt;String,i64&gt;&gt;&gt;</code>
+              (<code>table.rs:2012</code>) maps <code>snapshot_id → minimum_sequence</code> for wait-free read routing — but it is
+              <strong>not the source of truth</strong>. <code>load_protected_snapshots</code> (<code>table.rs:17511</code>)
+              rebuilds it from the durable <a class="lnk" href="#cayenne_snapshot_sequence"><code>cayenne_snapshot_sequence</code></a>
+              table on every open and restart, and writes go to <em>both</em> <code>set_snapshot_sequence</code> (persist) and
+              <code>protected_snapshots.rcu(…)</code> (refresh). The snapshot <strong>data</strong> lives in on-disk per-snapshot
+              directories. Protected snapshots are durable; the <code>ArcSwap</code> is just the index in front of them — and the
+              same is true of nearly every "cache" below.</p>
+          </div>
+
+          <h3 class="grp">Concurrency vocabulary</h3>
+          <p><code>ArcSwap&lt;T&gt;</code> — wait-free RCU (readers <code>load()</code> an immutable <code>Arc</code>, never block;
+            writers swap a new <code>T</code> in). &nbsp;<code>im::HashMap</code> — persistent HAMT, O(1) clone on append.
+            &nbsp;<code>tokio::{Mutex,RwLock}</code> — async (held across I/O). &nbsp;<code>parking_lot::Mutex</code> — short
+            sync sections. &nbsp;<code>Atomic*</code>/<code>OnceLock</code> — counters/flags / one-time task init.</p>
+
+          <h3 class="grp">A · Visibility &amp; listing — <span style="color:var(--cool)">derived cache</span> (← cayenne_snapshot_file, current_snapshot_id, on-disk dirs)</h3>
+          <div class="tcard"><table class="cols"><thead><tr><th>Field</th><th>Type</th><th>Role</th></tr></thead><tbody>
+            <tr><td class="c">listing_table</td><td class="ty">Arc&lt;ArcSwap&lt;ListingTable&gt;&gt;</td><td class="n">the Vortex listing table reads scan; swapped on publish</td></tr>
+            <tr><td class="c">current_snapshot_id</td><td class="ty">Arc&lt;RwLock&lt;String&gt;&gt;</td><td class="n">the snapshot a scan resolves; compaction advances it</td></tr>
+            <tr><td class="c">current_sorted_snapshot</td><td class="ty">Arc&lt;ArcSwap&lt;Option&lt;String&gt;&gt;&gt;</td><td class="n">attestation gating sound <code>output_ordering</code></td></tr>
+            <tr><td class="c">scan_file_statistics</td><td class="ty">Arc&lt;dyn FileStatisticsCache&gt;</td><td class="n">per-file footer stats for the scan planner</td></tr>
+            <tr><td class="c">listing_fence</td><td class="ty">Arc&lt;RwLock&lt;()&gt;&gt;</td><td class="n">read/write barrier — scans read, publish writes</td></tr>
+            <tr><td class="c">scan_state_lock · visibility_lock</td><td class="ty">RwLock&lt;()&gt; · Mutex&lt;()&gt;</td><td class="n">make deletion + protected + inline visibility flip atomically</td></tr>
+          </tbody></table></div>
+
+          <h3 class="grp">B · Protected-snapshot routing — <span style="color:var(--cool)">derived cache</span> (← cayenne_snapshot_sequence)</h3>
+          <p><code>protected_snapshots: Arc&lt;ArcSwap&lt;HashMap&lt;String,i64&gt;&gt;&gt;</code> — <code>snapshot_id → min_sequence</code>.
+            A read of a protected snapshot skips deletion runs whose <code>max_delete_seq ≤ min_sequence</code>. (See the callout above.)</p>
+
+          <h3 class="grp">C · Deletion view — <span style="color:var(--cool)">derived cache</span> (← cayenne_delete_file + cayenne_insert_record + inline)</h3>
+          <p>One <code>ArcSwap</code> per table publishes a frozen, fused index, so concurrent scans always see consistent
+            delete/re-insert pairs. The type hierarchy:</p>
+          <figure class="ascii"><div class="bar"><span class="lights"><i></i><i></i><i></i></span><span class="label">deletion-index types</span></div>
+<pre>
+PkDeletionStrategyWithCache                          <i>(enum — one variant per PK shape)</i>
+├─ PositionBased     { cached_deleted_row_ids: Arc&lt;ArcSwap&lt;PositionBitmap&gt;&gt; }  <i>no PK; RoaringBitmap/file</i>
+├─ Int64Pk           { deletion_snapshot: Arc&lt;ArcSwap&lt;Int64PkDeletionSnapshot&gt;&gt;, position_deletions… }
+└─ RowConverterBased { deletion_snapshot: Arc&lt;ArcSwap&lt;RowConverterDeletionSnapshot&gt;&gt;, position_deletions… }
+
+Int64PkDeletionSnapshot      { tombstones: Arc&lt;DeletionIndex&gt; }      <b>DeletionIndex.core    = LayeredRuns&lt;i64&gt;</b>
+RowConverterDeletionSnapshot { tombstones: Arc&lt;KeyDeletionIndex&gt; }   <b>KeyDeletionIndex.core = LayeredRuns&lt;u128&gt;</b>
+                                                                  <i>u128 = XXH3-128 of RowConverter bytes;</i>
+                                                                  <i>bytes not retained → 32 B/entry, any PK width</i>
+
+LayeredRuns&lt;K,S&gt; {
+  runs:   Vec&lt;Arc&lt;RunData&gt;&gt;          <i>frozen runs, oldest first (Arc-shared on publish)</i>
+  active: persistent HashMap&lt;K, TombstoneEntry&gt;   <i>small mutable delta tier</i>
+  bloom:  Arc&lt;SplitBlockBloomFilter&gt; <i>global deletion bloom, extended in place, 2× headroom</i>
+  max_sequence_number, min/max_deleted_key, entry/delete/insert_count
+}
+RunData      { map: Arc&lt;HashMap&lt;K,TombstoneEntry&gt;&gt;, max_delete_seq: i64, bloom }   <i>immutable once frozen</i>
+<b>TombstoneEntry { delete_seq: i64, insert_seq: i64 }</b>   <i>fused — one probe: "deleted? re-inserted after?"</i>
+                                                       <i>(visible iff insert_seq &gt; delete_seq)</i>
+
+freeze at max(DELTA_MERGE_MIN, base/4).min(FREEZE_CAP); fold past MAX_FROZEN_RUNS
+prod: DELTA_MERGE_MIN=16384  FREEZE_CAP=262144  MAX_FROZEN_RUNS=8  MIN_BLOOM_CAPACITY=64
+shared_empty(): one process-wide LazyLock&lt;Arc&gt; reused by all delete-free tables
+</pre></figure>
+
+          <h3 class="grp">D · Inline / level-0 cache — <span style="color:var(--cool)">derived cache</span> (← cayenne_inlined_data / _delete)</h3>
+          <div class="tcard"><table class="cols"><thead><tr><th>Field</th><th>Type</th><th>Role</th></tr></thead><tbody>
+            <tr><td class="c">inlined_cache</td><td class="ty">Arc&lt;ArcSwap&lt;InlinedCache&gt;&gt;</td><td class="n">decoded inline batches — a hit skips IPC decode + 2 metastore round-trips</td></tr>
+            <tr><td class="c">inlined_generation · inlined_structural_epoch</td><td class="ty">Arc&lt;AtomicU64&gt;</td><td class="n">cache validity + the epoch that licenses the append-only delta path</td></tr>
+            <tr><td class="c">inlined_row_count · durable_inlined_row_count</td><td class="ty">Arc&lt;AtomicI64&gt;</td><td class="n">live vs durable corpus size — checkpoint + zero-corpus fast paths</td></tr>
+            <tr><td class="c">published_inlined_seq</td><td class="ty">Arc&lt;AtomicI64&gt;</td><td class="n">in-memory visibility watermark</td></tr>
+            <tr><td class="c">pending_tombstone_deltas · inlined_locally_published · pending_durable_tombstone_flips</td><td class="ty">ParkingMutex&lt;…&gt;</td><td class="n">the publish/defer machinery behind the per-tombstone <code>published</code> flag</td></tr>
+          </tbody></table></div>
+          <p style="font-family:var(--fm);font-size:.78rem;color:var(--ink-3)"><code>InlinedCache = { generation, structural_epoch, materialized_through_sequence, tombstone_delta_seq, batches: Arc&lt;Vec&lt;RecordBatch&gt;&gt;, view: Arc&lt;Vec&lt;InlinedViewEntry&gt;&gt; }</code></p>
+
+          <h3 class="grp">E · CDC mem-tier — <span style="color:var(--ember)">ephemeral</span> (RAM-only; re-streamed exactly-once)</h3>
+          <p>The <strong>only data-bearing state with no durable copy</strong>. <code>mem_tier: Arc&lt;ArcSwap&lt;MemTier&gt;&gt;</code>
+            (<code>provider/mem_tier.rs</code>), empty in <code>file</code> mode. On crash it's discarded; the source slot holds the
+            last-checkpointed LSN, the source re-streams past it, and the PK-idempotent apply reconciles exactly-once. The
+            <code>SlotAdvancer</code> advances the slot <strong>only after</strong> a checkpoint is durable.</p>
+          <figure class="ascii"><div class="bar"><span class="lights"><i></i><i></i><i></i></span><span class="label">mem-tier types</span></div>
+<pre>
+MemTier {
+  segments:   Arc&lt;Vec&lt;MemSegment&gt;&gt;     <i>append-log, one segment per CDC apply</i>
+  tombstones: InMemTombstones          <i>accumulated max-delete-seq per key (im::HashMap, O(1) clone)</i>
+  bytes, rows, superseded: u64          epoch, version: u64          oldest_append: Option&lt;Instant&gt;
+}
+MemSegment       { batches: Arc&lt;Vec&lt;RecordBatch&gt;&gt;, data_sequence: i64, statistics, tombstones: SegmentTombstones, … }
+InMemTombstones  { int64_pk: im::HashMap&lt;i64,i64&gt;, row_keys: im::HashMap&lt;Box&lt;[u8]&gt;,i64&gt; }   <i>key → max delete seq</i>
+SegmentTombstones{ deleted-key SETS (built off-lock) + one reserved delete_sequence (stamped under lock) }
+
+bounded by: per-table byte cap · age cap · periodic tick · global MemTierBudget { total: u64, used: Arc&lt;AtomicU64&gt; }
+locks: mem_checkpoint_lock (serialize spills) · mem_tier_publish_lock (append/seq, decoupled from listing_fence)
+</pre></figure>
+
+          <h3 class="grp">F · PK keyset — <span style="color:var(--cool)">derived cache</span> (← re-scan / cayenne_pk_index)</h3>
+          <p><code>pk_keyset_cache: Arc&lt;ParkingMutex&lt;Option&lt;CachedPkIndex&gt;&gt;&gt;</code> — the visible PK set for auto
+            on-conflict detection, byte-budgeted at <code>DEFAULT_PK_KEYSET_CACHE_MAX_BYTES</code> (256 MiB default;
+            <code>cayenne_pk_keyset_cache_mb</code> overrides):</p>
+          <figure class="ascii"><div class="bar"><span class="lights"><i></i><i></i><i></i></span><span class="label">pk keyset</span></div>
+<pre>
+CachedPkIndex
+├─ Exact( CachedPkKeyset { keys: HashMap&lt;OwnedRow, RowLocation&gt;, approx_bytes, captured_files } )
+└─ Bloom( PkBloom        { bits: Vec&lt;u64&gt;, bit_mask: u64, inserted_keys } )   <i>fallback when exact &gt; budget</i>
+</pre></figure>
+
+          <h3 class="grp">G–K · The rest</h3>
+          <div class="tcard"><table class="cols"><thead><tr><th>Cluster</th><th>State</th><th>Class</th></tr></thead><tbody>
+            <tr><td class="c">G · Statistics</td><td class="n"><code>table_statistics: Arc&lt;RwLock&lt;CachedTableStatistics&gt;&gt;</code> + persistence lock</td><td class="ty" style="color:var(--cool)">cache ← cayenne_table_statistics</td></tr>
+            <tr><td class="c">H · Sequence alloc</td><td class="n"><code>seq_allocator: Arc&lt;Mutex&lt;SeqAllocator&gt;&gt;</code> — batched refill from the high-water column</td><td class="ty" style="color:var(--cool)">cache ← cayenne_table</td></tr>
+            <tr><td class="c">I · Maintained agg / schema</td><td class="n"><code>maintained_aggregates</code> + epoch; <code>table_schema: Arc&lt;ArcSwap&lt;Schema&gt;&gt;</code>; pk converter/indices</td><td class="ty" style="color:var(--cool)">cache / derived</td></tr>
+            <tr><td class="c">J · Coordination / GC</td><td class="n">locks, staging trackers, compaction flags, background tasks (<code>OnceLock</code>), in-flight-scan GC guards (<code>snapshot_scan_refs</code>, <code>retired_snapshot_dirs</code>)</td><td class="ty" style="color:var(--ink-3)">coordination</td></tr>
+            <tr><td class="c">K · Memory accounting</td><td class="n"><code>CayenneMemoryAccount { reservation, keyset_bytes, deletion_bytes }</code> — reports resident bytes to the query <code>MemoryPool</code></td><td class="ty" style="color:var(--ink-3)">accounting</td></tr>
+          </tbody></table></div>
+        </section>
+
+        <!-- CONVENTIONS -->
+        <section id="conventions">
+          <div class="snum">§ 05 — Conventions</div>
+          <h2>Identifiers, sequences &amp; validation</h2>
+          <ul style="list-style:none;padding:0">
+            <li style="padding:8px 0 8px 20px;position:relative;color:var(--ink-2)"><span style="position:absolute;left:2px;top:15px;width:6px;height:6px;background:var(--ember);transform:rotate(45deg)"></span><strong>Identifiers</strong> — UUIDv7 text everywhere except <code>cayenne_insert_record.table_id</code>, stored as the 16 raw UUID bytes (a pure re-encoding to shrink the hot upsert table's clustered key).</li>
+            <li style="padding:8px 0 8px 20px;position:relative;color:var(--ink-2)"><span style="position:absolute;left:2px;top:15px;width:6px;height:6px;background:var(--ember);transform:rotate(45deg)"></span><strong>Sequence numbers</strong> — monotonic, reserved from the metastore (<code>reserve_sequence_numbers</code> batches reservations). Every insert/delete/re-insertion carries one; the scan resolves "deleted, and re-inserted after that?" from them.</li>
+            <li style="padding:8px 0 8px 20px;position:relative;color:var(--ink-2)"><span style="position:absolute;left:2px;top:15px;width:6px;height:6px;background:var(--cool);transform:rotate(45deg)"></span><strong>Visibility</strong> — the authoritative state is <code>cayenne_table.current_snapshot_id</code>; visible by an atomic pointer flip under the listing fence, never in-place mutation.</li>
+            <li style="padding:8px 0 8px 20px;position:relative;color:var(--ink-2)"><span style="position:absolute;left:2px;top:15px;width:6px;height:6px;background:var(--cool);transform:rotate(45deg)"></span><strong>Schema validation</strong> — <code>validate_existing_schema</code> compares column names + ordering only; a mismatch returns <code>CatalogError::SchemaMismatch</code> with a "clear your acceleration data" message.</li>
+            <li style="padding:8px 0 8px 20px;position:relative;color:var(--ink-2)"><span style="position:absolute;left:2px;top:15px;width:6px;height:6px;background:var(--cool);transform:rotate(45deg)"></span><strong>Backends</strong> — SQLite uses <code>BEGIN IMMEDIATE</code>; Turso uses <code>BEGIN CONCURRENT</code> (MVCC). DDL is identical except <code>WITHOUT ROWID</code> (SQLite-only).</li>
+          </ul>
+          <p style="margin-top:20px;font-family:var(--fm);font-size:.78rem;color:var(--ink-3)">The DDL source
+            (<code>metastore/sqlite.rs</code>) is authoritative; treat this as a quick reference. See the
+            <a class="lnk" href="../README.md">README</a> for how these structures are used, and the
+            <a class="lnk" href="index.html">architecture tour</a> for the mechanisms.</p>
+        </section>
+      </article>
+    </div>
+  </main>
+</div>
+
+<script>
+const links=[...document.querySelectorAll('.side nav a')];
+const tgts=links.map(a=>document.querySelector(a.getAttribute('href'))).filter(Boolean);
+const io=new IntersectionObserver(es=>es.forEach(e=>{if(e.isIntersecting){const id='#'+e.target.id;links.forEach(a=>a.classList.toggle('active',a.getAttribute('href')===id));}}),{rootMargin:'-15% 0px -75% 0px',threshold:0});
+tgts.forEach(t=>io.observe(t));
+</script>
+</body>
+</html>

@@ -1,0 +1,499 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Cayenne · How one table serves writes and reads at once</title>
+<meta name="description" content="An interactive tour of Cayenne — the design tension it resolves, and the mechanisms (staged CDC apply, merge-on-read, fused deletion index, wait-free publish) that resolve it." />
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+<link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,ital,wght@9..144,0,400;9..144,0,500;9..144,0,600;9..144,1,400&family=Hanken+Grotesk:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet" />
+<style>
+:root{
+  --paper:#f7f3ec; --paper-2:#fffdf9; --ink:#1b1714; --ink-2:#5f5750; --ink-3:#938a7e;
+  --ember:#cb461d; --ember-soft:#f6e7dc; --amber:#c98a2b; --amber-2:#a6691f;
+  --cool:#2c7a6e; --cool-soft:#e1efea;
+  --line:#e7ddcf; --line-2:#d8ccba;
+  --ff:"Hanken Grotesk",system-ui,sans-serif; --fd:"Fraunces",Georgia,serif; --fm:"JetBrains Mono",ui-monospace,monospace;
+}
+*{box-sizing:border-box;margin:0;padding:0}
+html{scroll-behavior:smooth}
+body{background:var(--paper);color:var(--ink);font-family:var(--ff);line-height:1.7;-webkit-font-smoothing:antialiased;font-size:16px;overflow-x:hidden}
+::selection{background:var(--ember);color:var(--paper)}
+body::before{content:"";position:fixed;inset:0;z-index:-1;pointer-events:none;opacity:.5;
+  background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='160' height='160'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='2'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)' opacity='0.04'/%3E%3C/svg%3E");}
+
+/* top bar + progress */
+.scrollbar{position:fixed;top:0;left:0;height:2px;width:0;z-index:60;background:linear-gradient(90deg,var(--ember),var(--amber),var(--cool))}
+.topnav{position:fixed;top:0;left:0;right:0;z-index:50;display:flex;align-items:center;justify-content:space-between;
+  padding:14px 30px;background:rgba(247,243,236,.78);backdrop-filter:blur(10px);border-bottom:1px solid var(--line)}
+.topnav .brand{display:flex;align-items:center;gap:10px;text-decoration:none;color:var(--ink)}
+.topnav .mark{width:24px;height:24px;border-radius:6px;background:linear-gradient(150deg,var(--ember),var(--amber-2));position:relative}
+.topnav .mark::after{content:"";position:absolute;inset:6px 6px auto auto;width:6px;height:6px;border-radius:2px;background:var(--paper)}
+.topnav .brand b{font-family:var(--fd);font-weight:600;font-size:1.05rem}
+.topnav nav{display:flex;gap:26px}
+.topnav nav a{text-decoration:none;color:var(--ink-3);font-size:.82rem;font-weight:500;transition:.2s;position:relative}
+.topnav nav a:hover,.topnav nav a.active{color:var(--ember)}
+.topnav nav a.active::after{content:"";position:absolute;left:0;right:0;bottom:-6px;height:2px;background:var(--ember);border-radius:2px}
+@media(max-width:820px){.topnav nav{display:none}}
+
+.wrap{max-width:1000px;margin:0 auto;padding:0 30px}
+section{padding:92px 0;position:relative}
+.eyl{font-family:var(--fm);font-size:.72rem;letter-spacing:.18em;text-transform:uppercase;color:var(--ember);display:inline-flex;align-items:center;gap:.7em}
+.eyl::before{content:"";width:24px;height:1px;background:var(--ember)}
+h2.big{font-family:var(--fd);font-weight:500;font-size:clamp(1.9rem,4.4vw,3rem);line-height:1.08;letter-spacing:-.015em;margin:16px 0 0;max-width:20ch}
+h2.big em{font-style:italic;color:var(--ember)}
+.lede{font-size:1.1rem;color:var(--ink-2);font-weight:300;margin-top:18px;max-width:60ch}
+.lede b{color:var(--ink);font-weight:600}
+
+.reveal{opacity:0;transform:translateY(26px);transition:opacity .8s ease,transform .9s cubic-bezier(.2,.7,.2,1)}
+.reveal.in{opacity:1;transform:none}
+
+/* ============ HERO ============ */
+.hero{min-height:100vh;display:flex;flex-direction:column;justify-content:center;padding-top:80px}
+.hero h1{font-family:var(--fd);font-weight:300;font-size:clamp(2.6rem,7vw,5.4rem);line-height:.98;letter-spacing:-.02em;margin:26px 0 0;max-width:17ch}
+.hero h1 b{font-weight:600}
+.hero h1 .e{color:var(--ember);font-style:italic;font-weight:400}
+.hero h1 .c{color:var(--cool);font-style:italic;font-weight:400}
+.hero .lede{margin-top:28px;font-size:clamp(1.05rem,1.7vw,1.3rem)}
+.hero .cue{margin-top:46px;font-family:var(--fm);font-size:.74rem;letter-spacing:.14em;text-transform:uppercase;color:var(--ink-3);display:flex;align-items:center;gap:12px}
+.hero .cue .d{width:7px;height:7px;border-radius:50%;background:var(--ember);animation:pulse 2.2s infinite}
+@keyframes pulse{0%,100%{opacity:.3;transform:scale(.8)}50%{opacity:1;transform:scale(1.3)}}
+
+/* living two-stream animation */
+.stream{margin-top:50px;height:160px;position:relative;border:1px solid var(--line);border-radius:16px;
+  background:linear-gradient(180deg,var(--paper-2),#fbf6ef);overflow:hidden;display:flex;align-items:center;justify-content:center}
+.stream .lane{position:absolute;left:0;right:0;height:2px;background:repeating-linear-gradient(90deg,var(--line-2) 0 6px,transparent 6px 12px)}
+.stream .lane.w{top:42%}.stream .lane.r{top:58%}
+.stream .core{position:relative;z-index:3;background:var(--paper-2);border:1.5px solid var(--ember);color:var(--ink);
+  font-family:var(--fm);font-size:.78rem;letter-spacing:.06em;padding:14px 22px;border-radius:12px;text-align:center;box-shadow:0 0 0 8px rgba(203,70,29,.05)}
+.stream .core b{color:var(--ember)}
+.stream .core small{display:block;color:var(--ink-3);font-size:.66rem;margin-top:3px;letter-spacing:.04em}
+.stream .fence{position:absolute;top:18%;bottom:18%;left:50%;width:2px;background:linear-gradient(var(--ember),var(--cool));opacity:.35;animation:fencepulse 2.6s ease-in-out infinite}
+@keyframes fencepulse{0%,100%{opacity:.2}50%{opacity:.55}}
+.stream .tag{position:absolute;font-family:var(--fm);font-size:.64rem;letter-spacing:.14em;text-transform:uppercase;color:var(--ink-3)}
+.stream .tag.w{left:18px;top:calc(42% - 22px)}.stream .tag.r{right:18px;top:calc(58% + 10px);color:var(--cool)}
+.dot{position:absolute;width:9px;height:9px;border-radius:50%;margin-top:-4px}
+.dot.w{background:var(--ember);top:42%;animation:flowR 3.4s linear infinite}
+.dot.r{background:var(--cool);top:58%;animation:flowOut 3.4s linear infinite}
+@keyframes flowR{0%{left:-2%;opacity:0}8%{opacity:1}44%{left:46%;opacity:1}50%{left:48%;opacity:0}100%{left:48%;opacity:0}}
+@keyframes flowOut{0%{left:52%;opacity:0}50%{left:54%;opacity:0}56%{left:54%;opacity:1}92%{left:102%;opacity:1}100%{left:102%;opacity:0}}
+
+/* ============ TENSION (interactive triangle) ============ */
+.tension{display:grid;grid-template-columns:1.1fr 1fr;gap:48px;align-items:center;margin-top:44px}
+@media(max-width:820px){.tension{grid-template-columns:1fr}}
+.tri{position:relative;aspect-ratio:1/.92}
+.tri svg{width:100%;height:100%;overflow:visible}
+.tri .vtx{cursor:pointer}
+.tri .vtx circle{transition:.3s}
+.tri .vtx text{font-family:var(--fm);font-size:11px;font-weight:600;fill:var(--ink);transition:.3s}
+.tri .vtx.active circle{r:13;filter:drop-shadow(0 0 10px var(--ember))}
+.tri .vtx.active text{fill:var(--ember)}
+.tpanel{border:1px solid var(--line-2);border-radius:14px;background:var(--paper-2);padding:28px;min-height:230px}
+.tpanel .k{font-family:var(--fm);font-size:.7rem;letter-spacing:.14em;text-transform:uppercase;color:var(--ember);transition:.25s}
+.tpanel h3{font-family:var(--fd);font-weight:500;font-size:1.5rem;margin:8px 0 12px}
+.tpanel p{color:var(--ink-2);font-weight:300}
+.tpanel .mech{margin-top:16px;font-family:var(--fm);font-size:.8rem;color:var(--cool);border-top:1px solid var(--line);padding-top:14px}
+.tpanel .mech b{color:var(--ink)}
+.hint{font-family:var(--fm);font-size:.7rem;color:var(--ink-3);margin-top:14px;letter-spacing:.04em}
+
+/* ============ STEPPER (life of a write) ============ */
+.panel{border:1px solid var(--line-2);border-radius:16px;background:var(--paper-2);
+  box-shadow:0 1px 0 #fff inset,0 22px 48px -38px rgba(60,40,20,.55);margin-top:40px;overflow:hidden}
+.panel .head{display:flex;align-items:center;justify-content:space-between;gap:14px;padding:14px 20px;border-bottom:1px solid var(--line);
+  background:linear-gradient(180deg,#f4eee4,#efe7d9);flex-wrap:wrap}
+.panel .head .label{font-family:var(--fm);font-size:.68rem;letter-spacing:.13em;text-transform:uppercase;color:var(--ink-3)}
+.toggle{display:inline-flex;border:1px solid var(--line-2);border-radius:100px;overflow:hidden;background:var(--paper)}
+.toggle button{border:none;background:transparent;font-family:var(--fm);font-size:.72rem;padding:6px 14px;cursor:pointer;color:var(--ink-3);transition:.2s;letter-spacing:.04em}
+.toggle button.on{background:var(--ember);color:var(--paper)}
+.toggle.cool button.on{background:var(--cool)}
+
+.track{display:flex;align-items:stretch;gap:0;padding:34px 24px 12px;position:relative}
+.stage{flex:1;text-align:center;position:relative;padding:0 6px}
+.stage .node{width:46px;height:46px;border-radius:12px;margin:0 auto;display:flex;align-items:center;justify-content:center;
+  border:1.5px solid var(--line-2);background:var(--paper);font-family:var(--fm);font-weight:600;color:var(--ink-3);transition:.35s;position:relative;z-index:2}
+.stage .nm{font-family:var(--fm);font-size:.66rem;letter-spacing:.04em;color:var(--ink-3);margin-top:10px;line-height:1.3;transition:.3s}
+.stage:not(:last-child)::after{content:"";position:absolute;top:23px;left:60%;right:-40%;height:2px;background:var(--line-2);z-index:1}
+.stage.done .node{border-color:var(--cool);color:var(--cool)}
+.stage.active .node{border-color:var(--ember);color:var(--ember);background:var(--ember-soft);transform:scale(1.12);box-shadow:0 0 0 6px rgba(203,70,29,.08)}
+.stage.active .nm{color:var(--ember)}
+.stage .ackbadge{position:absolute;top:-22px;left:50%;transform:translateX(-50%);font-family:var(--fm);font-size:.58rem;
+  letter-spacing:.08em;color:var(--cool);white-space:nowrap;opacity:0;transition:.3s}
+.stage.ack .ackbadge{opacity:1}
+
+.detail{padding:6px 24px 22px;display:grid;grid-template-columns:auto 1fr;gap:18px;align-items:start}
+.detail .num{font-family:var(--fd);font-size:2.6rem;color:var(--ember);line-height:1}
+.detail .txt h4{font-size:1.05rem;font-weight:600;margin-bottom:5px}
+.detail .txt p{color:var(--ink-2);font-weight:300;font-size:.96rem;margin:0}
+.detail .txt .meta{font-family:var(--fm);font-size:.74rem;color:var(--cool);margin-top:8px}
+.controls{display:flex;align-items:center;gap:10px;padding:0 24px 22px}
+.controls button{font-family:var(--fm);font-size:.78rem;border:1px solid var(--line-2);background:var(--paper);color:var(--ink);
+  padding:8px 16px;border-radius:9px;cursor:pointer;transition:.2s}
+.controls button:hover{border-color:var(--ember);color:var(--ember)}
+.controls button.play{background:var(--ember);color:var(--paper);border-color:var(--ember)}
+.controls .prog{flex:1;height:3px;background:var(--line);border-radius:2px;overflow:hidden}
+.controls .prog i{display:block;height:100%;background:var(--ember);width:0;transition:width .4s}
+
+/* ============ READ animation ============ */
+.readbox{margin-top:40px}
+.tiers{display:grid;grid-template-columns:repeat(3,1fr);gap:14px;margin-bottom:6px}
+.tier{border:1px solid var(--line-2);border-radius:12px;padding:14px;background:var(--paper-2)}
+.tier .tt{font-family:var(--fm);font-size:.66rem;letter-spacing:.1em;text-transform:uppercase;color:var(--ink-3);margin-bottom:10px}
+.rows{display:flex;flex-direction:column;gap:5px}
+.row{height:13px;border-radius:4px;background:var(--cool-soft);border:1px solid var(--cool);transition:transform .6s ease,opacity .5s ease,background .3s}
+.row.del{background:var(--ember-soft);border-color:var(--ember)}
+.readbox.scanning .row{transform:translateY(8px);opacity:.85}
+.readbox.scanning .row.del{opacity:.12;transform:translateY(8px) scaleX(.4)}
+.readout{display:flex;align-items:center;gap:14px;margin-top:16px;font-family:var(--fm);font-size:.8rem;color:var(--ink-2);flex-wrap:wrap}
+.readout .pill{padding:5px 12px;border-radius:100px;border:1px solid var(--line-2);background:var(--paper)}
+.readout .pill b{color:var(--ember)}
+
+/* ============ SEQUENCE scrubber ============ */
+.seqbox{margin-top:40px}
+.runs{display:flex;gap:12px;flex-wrap:wrap;margin:8px 0 22px}
+.run{flex:1;min-width:120px;border:1.5px solid var(--cool);border-radius:12px;padding:16px;background:var(--cool-soft);transition:.35s;position:relative}
+.run.active-tier{border-color:var(--ember);background:var(--ember-soft)}
+.run.skipped{border-color:var(--line-2);background:var(--paper);opacity:.45}
+.run .rl{font-family:var(--fm);font-size:.64rem;letter-spacing:.08em;text-transform:uppercase;color:var(--ink-3)}
+.run .rs{font-family:var(--fd);font-size:1.5rem;margin-top:4px;color:var(--ink)}
+.run .rb{font-family:var(--fm);font-size:.64rem;color:var(--cool);margin-top:8px}
+.run.skipped .rb{color:var(--ink-3)}
+.run .skiptag{position:absolute;top:8px;right:10px;font-family:var(--fm);font-size:.58rem;letter-spacing:.06em;color:var(--ink-3);opacity:0;transition:.3s}
+.run.skipped .skiptag{opacity:1}
+.slider-wrap{display:flex;align-items:center;gap:16px;margin:6px 0 18px}
+.slider-wrap label{font-family:var(--fm);font-size:.78rem;color:var(--ink-2);white-space:nowrap}
+input[type=range]{flex:1;accent-color:var(--ember);height:4px}
+.seqread{font-family:var(--fm);font-size:.84rem;color:var(--ink);background:var(--paper-2);border:1px solid var(--line-2);border-radius:10px;padding:14px 18px}
+.seqread b{color:var(--ember)}.seqread u{color:var(--cool);text-decoration:none}
+
+/* ============ principles cards ============ */
+.cards3{display:grid;grid-template-columns:repeat(3,1fr);gap:18px;margin-top:40px}
+@media(max-width:760px){.cards3{grid-template-columns:1fr}.detail{grid-template-columns:1fr}.tiers{grid-template-columns:1fr}}
+.pcard{border:1px solid var(--line);border-radius:14px;padding:24px;background:var(--paper-2);transition:.3s}
+.pcard:hover{transform:translateY(-4px);border-color:var(--line-2)}
+.pcard .ic{font-family:var(--fm);font-size:.72rem;color:var(--cool);letter-spacing:.04em}
+.pcard h4{font-family:var(--fd);font-weight:500;font-size:1.25rem;margin:8px 0 8px}
+.pcard p{color:var(--ink-2);font-weight:300;font-size:.92rem}
+
+footer{border-top:1px solid var(--line);padding:70px 0 90px;margin-top:40px}
+footer .g{display:flex;justify-content:space-between;align-items:flex-end;flex-wrap:wrap;gap:24px}
+footer h3{font-family:var(--fd);font-weight:300;font-size:clamp(1.5rem,3vw,2.2rem);max-width:20ch;line-height:1.1}
+footer h3 em{font-style:italic;color:var(--ember)}
+footer .ref{font-family:var(--fm);font-size:.76rem;color:var(--ink-3);text-align:right;line-height:1.9}
+footer .ref a{color:var(--cool);text-decoration:none}
+@media (prefers-reduced-motion:reduce){.dot,.stream .fence,.hero .cue .d{animation:none!important}.reveal{opacity:1;transform:none}}
+</style>
+</head>
+<body>
+<div class="scrollbar" id="bar"></div>
+<div class="topnav">
+  <a class="brand" href="#top"><span class="mark"></span><b>Cayenne</b></a>
+  <nav id="topnav">
+    <a href="#tension">The tension</a>
+    <a href="#write">A write</a>
+    <a href="#read">A read</a>
+    <a href="#sequence">Sequence</a>
+    <a href="#fence">No contention</a>
+  </nav>
+</div>
+
+<!-- ===== HERO ===== -->
+<section class="hero" id="top">
+  <div class="wrap">
+    <span class="eyl reveal">Cayenne · an interactive tour</span>
+    <h1 class="reveal">One table.<br><b>Writes</b> <span class="e">and</span> <b>reads</b> <span class="c">that never collide.</span></h1>
+    <p class="lede reveal">Cayenne is a lakehouse format over the Vortex columnar format. It sustains
+      high-rate CDC ingestion <b>and</b> low-latency analytical scans on the same table — because the two
+      paths are engineered never to contend. This is the tour of <b>how</b>. For the full reference, see the
+      <a href="../README.md" style="color:var(--ember)">README</a>.</p>
+    <div class="stream reveal" aria-hidden="true">
+      <div class="lane w"></div><div class="lane r"></div>
+      <div class="fence"></div>
+      <span class="tag w">CDC writes →</span><span class="tag r">← scans</span>
+      <div class="core"><b>one table</b><small>snapshot pointer · ArcSwap</small></div>
+      <div class="dot w" style="animation-delay:0s"></div><div class="dot w" style="animation-delay:.9s"></div>
+      <div class="dot w" style="animation-delay:1.8s"></div><div class="dot w" style="animation-delay:2.6s"></div>
+      <div class="dot r" style="animation-delay:.3s"></div><div class="dot r" style="animation-delay:1.2s"></div>
+      <div class="dot r" style="animation-delay:2.1s"></div><div class="dot r" style="animation-delay:3s"></div>
+    </div>
+    <div class="cue reveal"><span class="d"></span> Scroll — the mechanisms are interactive</div>
+  </div>
+</section>
+
+<!-- ===== TENSION ===== -->
+<section id="tension">
+  <div class="wrap">
+    <span class="eyl reveal">The problem worth solving</span>
+    <h2 class="big reveal">Three goals most engines force you to <em>trade</em>.</h2>
+    <p class="lede reveal">Write throughput, read latency, data freshness — pick two. Cayenne refuses the
+      trade. Click a corner to see the mechanism that protects it.</p>
+
+    <div class="tension reveal">
+      <div class="tri">
+        <svg viewBox="0 0 320 300">
+          <polygon id="tri-fill" points="160,30 300,260 20,260" fill="rgba(203,70,29,.05)" stroke="var(--line-2)" stroke-width="1.5"/>
+          <g class="vtx active" data-k="write">
+            <circle cx="160" cy="30" r="9" fill="var(--ember)"/>
+            <text x="160" y="16" text-anchor="middle">write throughput</text>
+          </g>
+          <g class="vtx" data-k="read">
+            <circle cx="300" cy="260" r="9" fill="var(--cool)"/>
+            <text x="300" y="282" text-anchor="middle">read latency</text>
+          </g>
+          <g class="vtx" data-k="fresh">
+            <circle cx="20" cy="260" r="9" fill="var(--amber)"/>
+            <text x="20" y="282" text-anchor="middle">freshness</text>
+          </g>
+        </svg>
+      </div>
+      <div class="tpanel" id="tpanel">
+        <div class="k" id="tk">Write throughput</div>
+        <h3 id="th">Small writes don't make small files</h3>
+        <p id="tp">High-rate CDC bursts would normally produce a tiny data file each, crushing both the
+          writer and every future scan. Cayenne absorbs them into an LSM level-0 tier instead — a
+          metastore-resident memtable, or pure RAM under the CDC profile.</p>
+        <div class="mech" id="tm"><b>Mechanism:</b> inline memtable &amp; in-RAM mem-tier, flushed to Vortex on threshold.</div>
+        <div class="hint">▲ click another corner</div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ===== LIFE OF A WRITE ===== -->
+<section id="write">
+  <div class="wrap">
+    <span class="eyl reveal">Mechanism · the write path</span>
+    <h2 class="big reveal">Watch a CDC burst become <em>durable</em>, then <em>visible</em>.</h2>
+    <p class="lede reveal">A burst splits its work in two: the parts that must be durable run on the write
+      path; the part that makes data visible runs off it. Step through it — and flip the durability mode to
+      see where the source-slot ack moves.</p>
+
+    <div class="panel reveal">
+      <div class="head">
+        <span class="label">write_cdc_append_stream — staged apply</span>
+        <div class="toggle cool" id="durtoggle">
+          <button data-mode="memory" class="on">cdc_durability: memory</button>
+          <button data-mode="file">file</button>
+        </div>
+      </div>
+      <div class="track" id="track">
+        <div class="stage"><div class="node">1</div><div class="nm">coalesce<br>burst</div></div>
+        <div class="stage"><div class="node">2</div><div class="nm">conflict<br>prep</div></div>
+        <div class="stage"><div class="node">3</div><div class="nm">tier<br>select</div></div>
+        <div class="stage"><div class="ackbadge">▲ LSN ack</div><div class="node">A</div><div class="nm">Stage A<br>durable</div></div>
+        <div class="stage"><div class="node">B</div><div class="nm">Stage B<br>visible</div></div>
+      </div>
+      <div class="detail">
+        <div class="num" id="d-num">1</div>
+        <div class="txt"><h4 id="d-h">Coalesce the burst</h4><p id="d-p"></p><div class="meta" id="d-m"></div></div>
+      </div>
+      <div class="controls">
+        <button id="prev">◀ Prev</button>
+        <button id="play" class="play">▶ Play</button>
+        <button id="next">Next ▶</button>
+        <div class="prog"><i id="prog"></i></div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ===== LIFE OF A READ ===== -->
+<section id="read">
+  <div class="wrap">
+    <span class="eyl reveal">Mechanism · the read path</span>
+    <h2 class="big reveal">A scan <em>unions</em> three tiers, then filters by merge-on-read.</h2>
+    <p class="lede reveal">Reads resolve the snapshot once under the listing fence, union the Vortex files
+      with the live memtable and RAM tier, and apply deletions on the way out — deleted rows never decode.
+      Run it, and toggle whether the table has a primary key.</p>
+
+    <div class="panel reveal">
+      <div class="head">
+        <span class="label">scan — union + merge-on-read deletions</span>
+        <div class="toggle" id="pktoggle">
+          <button data-pk="yes" class="on">primary key</button>
+          <button data-pk="no">no PK</button>
+        </div>
+      </div>
+      <div style="padding:24px">
+        <div class="readbox" id="readbox">
+          <div class="tiers">
+            <div class="tier"><div class="tt">Vortex files</div><div class="rows">
+              <div class="row"></div><div class="row del"></div><div class="row"></div><div class="row"></div></div></div>
+            <div class="tier"><div class="tt">inline memtable</div><div class="rows">
+              <div class="row"></div><div class="row"></div><div class="row del"></div></div></div>
+            <div class="tier"><div class="tt">RAM mem-tier</div><div class="rows">
+              <div class="row"></div><div class="row"></div></div></div>
+          </div>
+          <div class="readout">
+            <span class="pill">filter: <b id="ro-mode">bloom-prefilter → fused DeletionIndex probe</b></span>
+            <span class="pill" id="ro-result">9 rows scanned · 2 masked → <b>7 returned</b></span>
+          </div>
+        </div>
+        <div class="controls" style="padding:18px 0 0">
+          <button id="runscan" class="play">▶ Run a scan</button>
+          <span class="hint" id="scanhint">deleted rows fade out before they ever decode</span>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ===== SEQUENCE ===== -->
+<section id="sequence">
+  <div class="wrap">
+    <span class="eyl reveal">Mechanism · sequence numbers</span>
+    <h2 class="big reveal">The deletion index is a stack of runs. A <em>cutoff</em> skips the old ones.</h2>
+    <p class="lede reveal">Every mutation carries a sequence number. Deletions pile into sequence-tagged
+      runs (oldest → newest). A <b>protected-snapshot probe</b> with cutoff <code style="font-family:var(--fm)">S</code>
+      skips any run whose deletes can't be newer than <code style="font-family:var(--fm)">S</code> — so probe
+      cost tracks recent writes, not total tombstones. Drag <code style="font-family:var(--fm)">S</code>.</p>
+
+    <div class="seqbox reveal panel" style="padding:26px 24px">
+      <div class="runs" id="runs">
+        <div class="run" data-seq="3"><span class="skiptag">skipped</span><div class="rl">run₀ · oldest</div><div class="rs">≤ 3</div><div class="rb">max_delete_seq 3</div></div>
+        <div class="run" data-seq="7"><span class="skiptag">skipped</span><div class="rl">run₁</div><div class="rs">≤ 7</div><div class="rb">max_delete_seq 7</div></div>
+        <div class="run" data-seq="12"><span class="skiptag">skipped</span><div class="rl">run₂</div><div class="rs">≤ 12</div><div class="rb">max_delete_seq 12</div></div>
+        <div class="run active-tier" data-seq="999"><div class="rl">active · newest</div><div class="rs">live</div><div class="rb">mutable tier</div></div>
+      </div>
+      <div class="slider-wrap">
+        <label>protected cutoff S = <b id="sval" style="color:var(--ember)">0</b></label>
+        <input type="range" id="slider" min="0" max="14" value="0" />
+      </div>
+      <div class="seqread" id="seqread"></div>
+    </div>
+  </div>
+</section>
+
+<!-- ===== NO CONTENTION ===== -->
+<section id="fence">
+  <div class="wrap">
+    <span class="eyl reveal">Why it holds together</span>
+    <h2 class="big reveal">The two paths share state, but never <em>block</em> on it.</h2>
+    <p class="lede reveal">Everything above works because of three rules the whole engine obeys. They're why
+      a writer and a reader never wait on the same byte.</p>
+    <div class="cards3 reveal">
+      <div class="pcard"><div class="ic">rule 01</div><h4>Publish wait-free</h4><p>State readers touch — the listing table, protected snapshots, the tier handles — is swapped behind <code>ArcSwap</code>. A reader never locks; a writer never waits for a reader to finish.</p></div>
+      <div class="pcard"><div class="ic">rule 02</div><h4>Work off the fence</h4><p>The expensive parts of a write — encode, metastore I/O, checkpoint — run <em>outside</em> the listing fence. Only the instant of becoming visible happens under it.</p></div>
+      <div class="pcard"><div class="ic">rule 03</div><h4>Visibility is one flip</h4><p>Files are immutable; a write or compaction becomes visible by atomically flipping the current-snapshot pointer. There is no in-place mutation for a reader to catch mid-change.</p></div>
+    </div>
+  </div>
+</section>
+
+<footer>
+  <div class="wrap">
+    <div class="g">
+      <h3>This was the <em>why</em>. The README is the <em>what</em>.</h3>
+      <div class="ref">
+        FULL REFERENCE · <a href="../README.md">crates/cayenne/README.md</a><br>
+        components · configuration · schema · DuckLake · status<br>
+        CODE · crates/cayenne/src/
+      </div>
+    </div>
+  </div>
+</footer>
+
+<script>
+/* progress + topnav active */
+const bar=document.getElementById('bar');
+addEventListener('scroll',()=>{const h=document.documentElement;bar.style.width=(h.scrollTop/(h.scrollHeight-h.clientHeight)*100)+'%';},{passive:true});
+const navLinks=[...document.querySelectorAll('#topnav a')];
+const secs=['tension','write','read','sequence','fence'].map(id=>document.getElementById(id));
+const navIo=new IntersectionObserver(es=>es.forEach(e=>{if(e.isIntersecting){const id=e.target.id;navLinks.forEach(a=>a.classList.toggle('active',a.getAttribute('href')==='#'+id));}}),{rootMargin:'-30% 0px -60% 0px'});
+secs.forEach(s=>s&&navIo.observe(s));
+
+/* reveal */
+const rio=new IntersectionObserver(es=>es.forEach(e=>{if(e.isIntersecting){e.target.classList.add('in');rio.unobserve(e.target);}}),{threshold:.14});
+document.querySelectorAll('.reveal').forEach(el=>rio.observe(el));
+
+/* ---- tension triangle ---- */
+const TDATA={
+  write:{k:'Write throughput',h:"Small writes don't make small files",
+    p:'High-rate CDC bursts would normally produce a tiny data file each, crushing both the writer and every future scan. Cayenne absorbs them into an LSM level-0 tier instead — a metastore-resident memtable, or pure RAM under the CDC profile.',
+    m:'<b>Mechanism:</b> inline memtable & in-RAM mem-tier, flushed to Vortex on threshold.'},
+  read:{k:'Read latency',h:'Read amplification stays bounded',
+    p:'Left alone, accumulating files and tombstones make every scan slower over time. Tiered compaction folds the smallest file tier into target-sized files, and a fused, bloom-prefiltered deletion index keeps the per-row "is it deleted?" probe cheap.',
+    m:'<b>Mechanism:</b> incremental tiered compaction + fused LayeredRuns deletion index.'},
+  fresh:{k:'Freshness',h:'New data is visible in seconds',
+    p:'A burst is durable after Stage A — fast enough to ack the source LSN immediately — and becomes visible after a backgrounded Stage B, a single snapshot-pointer flip. Under memory durability, fresh rows are even queryable straight from the RAM tier.',
+    m:'<b>Mechanism:</b> staged Stage A/Stage B apply + wait-free snapshot flip.'}
+};
+const vtxs=[...document.querySelectorAll('.tri .vtx')];
+const tk=document.getElementById('tk'),th=document.getElementById('th'),tp=document.getElementById('tp'),tm=document.getElementById('tm');
+vtxs.forEach(v=>v.addEventListener('click',()=>{
+  vtxs.forEach(x=>x.classList.remove('active'));v.classList.add('active');
+  const d=TDATA[v.dataset.k];tk.textContent=d.k;th.textContent=d.h;tp.textContent=d.p;tm.innerHTML=d.m;
+}));
+
+/* ---- write stepper ---- */
+const STEPS={
+  memory:[
+    {h:'Coalesce the burst',p:'The CDC apply loop batches source change envelopes into one burst on its own default-priority runtime, so background compaction can never starve it.',m:'runtime: accelerated_table/refresh_task/changes.rs'},
+    {h:'Conflict preparation',p:'Under the write lock, build (or reuse from the byte-budgeted keyset cache) the set of existing primary keys and resolve which incoming rows are re-insertions that must tombstone an older copy.',m:'pk_conflict_detection: auto'},
+    {h:'Tier selection',p:'Small batches are appended to the in-RAM mem-tier — an O(1) Arc swap, no data file. Larger batches are encoded straight to Vortex files.',m:'cdc_durability: memory → RAM tier'},
+    {h:'Stage A — durable',p:'Under memory durability the batch is in RAM; the source-slot ack is DEFERRED until a periodic, off-fence checkpoint flushes the tier to a durable Vortex file. The crash window is bounded; replay is exactly-once.',m:'▲ slot ack deferred to checkpoint'},
+    {h:'Stage B — visible',p:'A backgrounded finalize task makes the data visible — for the mem-tier, reads already union it live under the listing fence; a checkpoint later flips the snapshot pointer. Burst order is preserved by a FIFO.',m:'visible via ArcSwap union — zero copy'}
+  ],
+  file:[
+    {h:'Coalesce the burst',p:'The CDC apply loop batches source change envelopes into one burst on its own default-priority runtime, so background compaction can never starve it.',m:'runtime: accelerated_table/refresh_task/changes.rs'},
+    {h:'Conflict preparation',p:'Under the write lock, build (or reuse from the byte-budgeted keyset cache) the set of existing primary keys and resolve which incoming rows are re-insertions that must tombstone an older copy.',m:'pk_conflict_detection: auto'},
+    {h:'Tier selection',p:'Small batches absorb into the metastore-resident inline memtable as Arrow IPC blobs; larger batches are encoded to Vortex files. Either way the write is made durable before the ack.',m:'cdc_durability: file → durable per batch'},
+    {h:'Stage A — durable',p:'Vortex files are written into a staging directory and the file list is made crash-safe by the staging WAL (tmp + fsync + rename of _wal.json). The source LSN can be acked the moment Stage A is durable.',m:'▲ LSN ack here — PG recycles WAL'},
+    {h:'Stage B — visible',p:'A backgrounded finalize task moves the staged files into the current snapshot, publishes any on-conflict deletion vectors, flips the snapshot pointer, and invalidates the list-files cache. A FIFO preserves burst order.',m:'visible via snapshot-pointer flip'}
+  ]
+};
+let mode='memory',step=0,timer=null;
+const stages=[...document.querySelectorAll('#track .stage')];
+const dNum=document.getElementById('d-num'),dH=document.getElementById('d-h'),dP=document.getElementById('d-p'),dM=document.getElementById('d-m'),prog=document.getElementById('prog');
+function renderStep(){
+  const data=STEPS[mode][step];
+  stages.forEach((s,i)=>{s.classList.toggle('active',i===step);s.classList.toggle('done',i<step);
+    s.classList.toggle('ack',i===3 && step>=3);});
+  dNum.textContent=step<3?step+1:(step===3?'A':'B');
+  dH.textContent=data.h;dP.textContent=data.p;dM.textContent=data.m;
+  prog.style.width=((step+1)/5*100)+'%';
+}
+document.getElementById('next').onclick=()=>{stopPlay();step=(step+1)%5;renderStep();};
+document.getElementById('prev').onclick=()=>{stopPlay();step=(step+4)%5;renderStep();};
+const playBtn=document.getElementById('play');
+function stopPlay(){if(timer){clearInterval(timer);timer=null;playBtn.textContent='▶ Play';}}
+playBtn.onclick=()=>{
+  if(timer){stopPlay();return;}
+  playBtn.textContent='⏸ Pause';
+  timer=setInterval(()=>{step=(step+1)%5;renderStep();},1500);
+};
+document.querySelectorAll('#durtoggle button').forEach(b=>b.onclick=()=>{
+  document.querySelectorAll('#durtoggle button').forEach(x=>x.classList.remove('on'));b.classList.add('on');
+  mode=b.dataset.mode;renderStep();
+});
+renderStep();
+
+/* ---- read scan ---- */
+const readbox=document.getElementById('readbox'),roMode=document.getElementById('ro-mode'),roResult=document.getElementById('ro-result');
+let hasPK=true;
+document.querySelectorAll('#pktoggle button').forEach(b=>b.onclick=()=>{
+  document.querySelectorAll('#pktoggle button').forEach(x=>x.classList.remove('on'));b.classList.add('on');
+  hasPK=b.dataset.pk==='yes';
+  roMode.textContent=hasPK?'bloom-prefilter → fused DeletionIndex probe':'per-file RoaringBitmap (ExcludeRoaring, in Vortex)';
+});
+document.getElementById('runscan').onclick=()=>{
+  readbox.classList.remove('scanning');void readbox.offsetWidth;readbox.classList.add('scanning');
+  roResult.innerHTML='scanning…';
+  setTimeout(()=>{roResult.innerHTML='9 rows scanned · 2 masked → <b>7 returned</b>';},700);
+};
+
+/* ---- sequence scrubber ---- */
+const slider=document.getElementById('slider'),sval=document.getElementById('sval'),seqread=document.getElementById('seqread');
+const runEls=[...document.querySelectorAll('#runs .run')].filter(r=>r.dataset.seq!=='999');
+function renderSeq(){
+  const S=+slider.value;sval.textContent=S;
+  let skipped=0;
+  runEls.forEach(r=>{const sk=(+r.dataset.seq)<=S;r.classList.toggle('skipped',sk);if(sk)skipped++;});
+  const consulted=runEls.length-skipped;
+  seqread.innerHTML=`A protected-snapshot probe with cutoff <b>S = ${S}</b> skips <b>${skipped}</b> run(s) whose `+
+    `deletes can't be newer than S — it consults <u>${consulted} of ${runEls.length}</u> frozen runs plus the active tier, `+
+    `via their small per-run blooms (never the large global bloom). Probe cost tracks recent writes.`;
+}
+slider.addEventListener('input',renderSeq);renderSeq();
+</script>
+</body>
+</html>

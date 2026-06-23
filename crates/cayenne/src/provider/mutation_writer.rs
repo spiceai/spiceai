@@ -78,13 +78,12 @@ use parking_lot::Mutex as ParkingMutex;
 use tokio::sync::OwnedMutexGuard;
 
 use super::Result;
+use super::column_stats::ColumnStatsAccumulator;
 use super::context::CayenneContext;
 use super::mem_tier_budget;
+use super::on_conflict::PostValidationState;
 use super::staging_wal::{CayenneStagedAppend, PreparedStagedAppend, StagingWalTargetKind};
-use super::table::{
-    CayenneCdcWrite, CayenneTableProvider, ColumnStatsAccumulator, PostValidationState,
-    record_cayenne_write_phase,
-};
+use super::table::{CayenneCdcWrite, CayenneTableProvider, record_cayenne_write_phase};
 
 /// Record METRIC 4 (`cayenne_cdc_burst_rows` / `cayenne_cdc_burst_bytes`) for one
 /// prepared CDC batch at the staged/inlined write entry, labeled by table. The

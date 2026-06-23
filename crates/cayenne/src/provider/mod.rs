@@ -71,6 +71,7 @@ limitations under the License.
 //! - [`constants`]: Staging-dir name, WAL filename, and other shared constants.
 //! - [`partitioned_wal`]: Cross-partition WAL for the partitioned-table
 //!   coordinator (feature-gated).
+pub(crate) mod column_stats;
 pub(crate) mod compaction;
 pub(crate) mod constants;
 pub(crate) mod context;
@@ -80,12 +81,17 @@ pub(crate) mod deletion_strategy;
 pub(crate) mod delta_encoding;
 pub(crate) mod file_pruning;
 pub(crate) mod fsync_tier;
+pub(crate) mod inlined_cache;
+pub(crate) mod maintenance;
+pub(crate) mod manifest;
 pub(crate) mod mem_tier;
 pub(crate) mod mem_tier_budget;
 pub(crate) mod memory_account;
 pub(crate) mod mutation_writer;
+pub(crate) mod on_conflict;
 pub(crate) mod overwrite;
 pub mod partitioned_wal;
+pub(crate) mod pk_index;
 pub(crate) mod retention;
 pub(crate) mod scan;
 pub(crate) mod sink;

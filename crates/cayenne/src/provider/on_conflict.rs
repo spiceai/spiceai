@@ -1,0 +1,1014 @@
+/*
+Copyright 2025-2026 The Spice.ai OSS Authors
+Licensed under the Apache License, Version 2.0 (the "License");
+You may obtain a copy of the License at
+
+     https://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+//! On-conflict (upsert / do-nothing) write-path machinery.
+//!
+//! Holds the per-batch primary-key validation pipeline
+//! ([`OnConflictValidationStream`], [`OnConflictContext`]), the prepared
+//! deletion/update publishes ([`OnConflictDeletions`], [`OnConflictUpdate`],
+//! [`PreparedOnConflictDeletionPublish`]), the inline-cache tombstone deltas
+//! ([`TombstoneDelta`], [`PendingTombstoneDeltas`]), and the protected-snapshot
+//! scan/update plumbing. The provider drives these from its insert/delete path.
+
+use super::column_stats::{ColumnStatsAccumulator, RowCountUpdate};
+use super::constants::{STAGING_DIR_NAME, STAGING_WAL_FILENAME, STAGING_WAL_TMP_FILENAME};
+use super::delete::{
+    CayenneDeletionSink, DeletionIdentifier, DeletionVectorWriteResult, DeletionVectorWriteSpec,
+    DeletionVectorWriter, FileBasedDeletionSink, InsertRecordHandling, Int64PkDeletionFilterExec,
+    KeyBasedDeletionFilterExec,
+};
+use super::inlined_cache::{InlinedCache, InlinedDurableCommit, InlinedViewEntry};
+use super::maintenance::{
+    BoundedWarningKeys, PostWriteMaintenance, PostWriteMaintenanceState, RetentionFailureAction,
+    SnapshotMaintenanceTrigger, duration_millis_saturating, protected_snapshot_maintenance_trigger,
+};
+use super::manifest::{ManifestSequenceTag, SeqPrefixPlan};
+use super::mutation_writer::AppendMutationWriter;
+use super::pk_index::{
+    CachedPkIndex, CachedPkKeyset, PK_INDEX_PERSIST_MAX_BYTES, PkBloom, PkExistenceRef,
+    RowLocation, approx_captured_file_bytes, approx_pk_keyset_entry_bytes,
+    deserialize_pk_bloom_sidecar, serialize_pk_bloom_sidecar,
+};
+use super::streaming::StreamingExec;
+use crate::catalog::{CatalogError, CatalogResult, MetadataCatalog, SnapshotSequenceCommit};
+use crate::maintained_aggregate::{MaintainedAggregateRegistry, MaintainedAggregateSpec};
+use crate::metadata::{
+    CreateTableOptions, InlinedData, InlinedDataStats, InlinedDelete, PkConflictDetection,
+    SnapshotFile, SnapshotFileStatistics, TableMetadata, TableStatistics,
+};
+use crate::provider::scan::{
+    CayenneAccelerationExec, SnapshotScanRef, round_robin_repartition_if_needed,
+};
+use crate::provider::sink::CayenneDataSink;
+use crate::provider::{Error, Result};
+use arrow::array::{
+    Array, ArrayRef, BinaryArray, BinaryViewArray, BooleanArray, Date32Array, Date64Array,
+    Decimal128Array, FixedSizeBinaryArray, Float32Array, Float64Array, Int8Array, Int16Array,
+    Int32Array, Int64Array, LargeBinaryArray, LargeStringArray, StringArray, StringViewArray,
+    Time32MillisecondArray, Time32SecondArray, Time64MicrosecondArray, Time64NanosecondArray,
+    TimestampMicrosecondArray, TimestampMillisecondArray, TimestampNanosecondArray,
+    TimestampSecondArray, UInt8Array, UInt16Array, UInt32Array, UInt64Array,
+};
+use arrow::compute::kernels::aggregate;
+use arrow::datatypes::{
+    Date32Type, Date64Type, Decimal128Type, Int8Type, Int16Type, Int32Type, Int64Type,
+    Time32MillisecondType, Time32SecondType, Time64MicrosecondType, Time64NanosecondType,
+    TimestampMicrosecondType, TimestampMillisecondType, TimestampNanosecondType,
+    TimestampSecondType, UInt8Type, UInt16Type, UInt32Type, UInt64Type,
+};
+use arrow::record_batch::RecordBatch;
+use arrow_row::{OwnedRow, RowConverter, SortField};
+use arrow_schema::{DataType, Field, SchemaBuilder, SchemaRef, TimeUnit};
+use arrow_tools::schema_evolution::{EvolutionContext, SchemaEvolution, WideningPlan, classify};
+use async_trait::async_trait;
+use data_components::delete::{DeletionExec, DeletionSink};
+use datafusion::datasource::file_format::FileFormat;
+use datafusion::datasource::listing::{
+    ListingOptions, ListingTable, ListingTableConfig, ListingTableUrl,
+    helpers::{expr_applicable_for_cols, pruned_partition_list},
+};
+use datafusion::datasource::sink::DataSinkExec;
+use datafusion::execution::context::SessionContext;
+use datafusion::execution::runtime_env::RuntimeEnv;
+use datafusion::optimizer::analyzer::type_coercion::TypeCoercionRewriter;
+use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+use datafusion_catalog::{Session, TableProvider};
+use datafusion_common::stats::Precision as DFPrecision;
+use datafusion_common::tree_node::TreeNode;
+use datafusion_common::{
+    ColumnStatistics, Constraints, DFSchema, Result as DataFusionResult, ScalarValue, Statistics,
+    project_schema,
+};
+use datafusion_datasource::file_groups::FileGroup;
+use datafusion_datasource::file_scan_config::{FileScanConfig, FileScanConfigBuilder};
+use datafusion_datasource::{PartitionedFile, TableSchema, compute_all_files_statistics};
+use datafusion_execution::cache::TableScopedPath;
+use datafusion_execution::cache::cache_manager::{
+    CachedFileList, CachedFileMetadata, FileStatisticsCache,
+};
+use datafusion_execution::cache::file_statistics_cache::DefaultFileStatisticsCache;
+use datafusion_execution::config::SessionConfig;
+use datafusion_expr::dml::InsertOp;
+use datafusion_expr::utils::conjunction;
+use datafusion_expr::{Expr, LogicalPlan, Operator, TableProviderFilterPushDown, TableType};
+use datafusion_physical_expr::execution_props::ExecutionProps;
+use datafusion_physical_expr::expressions::Column;
+use datafusion_physical_expr::{PhysicalExpr, create_lex_ordering, create_physical_expr};
+use datafusion_physical_plan::ExecutionPlan;
+use datafusion_physical_plan::coalesce_partitions::CoalescePartitionsExec;
+use datafusion_physical_plan::collect;
+use datafusion_physical_plan::empty::EmptyExec;
+use datafusion_physical_plan::filter::FilterExec;
+use datafusion_physical_plan::limit::{GlobalLimitExec, LocalLimitExec};
+use datafusion_physical_plan::projection::ProjectionExec;
+use datafusion_physical_plan::union::UnionExec;
+use datafusion_physical_plan::{RecordBatchStream, SendableRecordBatchStream};
+use datafusion_table_providers::util::on_conflict::OnConflict;
+use futures::{Stream, StreamExt, TryStreamExt, stream};
+use object_store::{ObjectMeta, ObjectStore, ObjectStoreExt, path::Path as ObjectStorePath};
+use parking_lot::{Mutex as ParkingMutex, RwLock};
+use roaring::RoaringBitmap;
+use std::borrow::Cow;
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::pin::Pin;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering};
+use std::task::{Context, Poll};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use tokio::task;
+use vortex::dtype::arrow::FromArrowType;
+use vortex_datafusion::VortexFormat;
+use vortex_datafusion::WriteShardConfig;
+
+use super::context::CayenneContext;
+use super::deletion_index::{DeletionIndex, KeyDeletionIndex};
+use super::deletion_strategy::{
+    Int64PkDeletionSnapshot, PkDeletionStrategy, PkDeletionStrategyWithCache, PositionBitmap,
+    PositionDeletionVector, RowConverterDeletionSnapshot,
+};
+use super::memory_account::CayenneMemoryAccount;
+use super::staging_wal::PreparedStagedAppend;
+use super::table::{
+    CayenneTableProvider, InlinedDeletionMaps, OnConflictExt, UpsertOptions,
+    record_cayenne_write_phase,
+};
+use super::vortex_format::PositionDeletionAccessPlanProvider;
+use arc_swap::ArcSwap;
+
+pub(crate) struct PreparedOnConflictDeletionPublish {
+    pub(crate) target_snapshot_id: String,
+    pub(crate) snapshot_sequence: i64,
+    pub(crate) delete_sequence: Option<i64>,
+    pub(crate) insert_sequence: Option<i64>,
+    pub(crate) deleted_pk_i64: Vec<i64>,
+    pub(crate) deleted_row_keys: Vec<Box<[u8]>>,
+    /// PKs whose prior copy was INLINE (the ones the inline tombstone hides),
+    /// kept separate from the file-deletion `deleted_pk_i64`/`deleted_row_keys`
+    /// above (cycle-5 TASK 1). At finalize these — at `delete_sequence` — are the
+    /// removal applied to the inline-cache base via `pending_tombstone_deltas`, so
+    /// they MUST be the inline keys (the tombstone's keys), NOT the file keys: a
+    /// file-conflict deletion never matches a cached inline row, so using the file
+    /// keys would fail to hide the old inline copy (a transient duplicate). Empty
+    /// when the batch replaced no inline rows (then `inlined_delete_id` is `None`
+    /// and no removal is enqueued). One of the two is always empty per PK strategy.
+    pub(crate) deleted_inlined_pk_i64: Vec<i64>,
+    pub(crate) deleted_inlined_row_keys: Vec<Box<[u8]>>,
+    pub(crate) position_deletions: HashMap<String, Vec<u32>>,
+    /// `inlined_id` of the inline tombstone this staged upsert wrote with
+    /// `published = false` (Option D), or `None` when the batch replaced no
+    /// inlined rows. At finalize (`publish_prepared_on_conflict_deletions`, under
+    /// the listing fence, after the replacement files are moved into the snapshot)
+    /// the tombstone is activated IN MEMORY (recorded in
+    /// `inlined_locally_published` so the read filter applies it immediately) and
+    /// its durable `published = 1` flip is DEFERRED into
+    /// `pending_durable_tombstone_flips` — the cycle-4 b1★ Stage-B-writer-free
+    /// path. `pending_inline_tombstones` is decremented there. Carrying the exact
+    /// id (rather than re-deriving from keys) makes both the in-memory activation
+    /// and the later durable flip target precisely THIS tombstone — never a
+    /// later-staged tombstone for the same PK.
+    pub(crate) inlined_delete_id: Option<String>,
+    /// Count of existing rows superseded by this upsert, captured from
+    /// [`OnConflictDeletions::total_superseded`] at validation time. This is the
+    /// authoritative live-row-delta input: it must NOT be recomputed from the
+    /// fields above, because `deleted_pk_i64` and `deleted_row_keys` carry the
+    /// SAME `Int64Pk` deletions in two encodings (i64 + committed byte keys), so
+    /// summing their lengths double-counts, and neither captures `position_deletions`.
+    pub(crate) superseded: usize,
+}
+
+/// One published inline tombstone's removal effect, recorded so the inline-cache
+/// delta path can apply it to the structurally-shared base entries WITHOUT a
+/// structural epoch bump + full corpus re-read (cycle-5 TASK 1).
+///
+/// A published tombstone only ever REMOVES rows from the cached view — it hides
+/// the prior inline copy of an upserted PK whose entry `sequence_number <=
+/// delete_sequence`. Removal can never invalidate a *retained* entry (the same
+/// soundness as pruning-under-deletes), so re-filtering the base entries against
+/// just these keys is sound. The keys are exactly the ones in hand at publish
+/// (`PreparedOnConflictDeletionPublish::deleted_pk_i64` / `deleted_row_keys`), so
+/// no metastore read is needed to build the removal.
+pub(crate) struct TombstoneDelta {
+    /// Monotonic queue sequence (`tombstone_delta_seq` at publish). Globally
+    /// unique and never reset, so an `InlinedCache` records the highest delta it
+    /// has applied (`tombstone_delta_seq`) and the delta path applies exactly the
+    /// deltas with `seq > base.tombstone_delta_seq`.
+    pub(crate) seq: u64,
+    /// The tombstone's `delete_sequence`. An entry's row is removed iff its PK is
+    /// in this delta AND the entry `sequence_number <= delete_sequence` (mirrors
+    /// `filter_inlined_batch_for_deletions`: keep iff `data_sequence > delete_sequence`).
+    pub(crate) delete_sequence: i64,
+    /// Deleted Int64 PKs (for `Int64Pk` tables). Empty for composite-key tables.
+    pub(crate) int64_pk: Vec<i64>,
+    /// Deleted encoded row-keys (for `RowConverterBased` tables). Empty for
+    /// `Int64Pk` tables.
+    pub(crate) row_keys: Vec<Box<[u8]>>,
+}
+
+impl TombstoneDelta {
+    /// Approximate heap footprint, used to bound the pending-delta queue.
+    fn approx_keys(&self) -> usize {
+        self.int64_pk.len() + self.row_keys.len()
+    }
+}
+
+/// Cap on the pending tombstone-delta queue (cycle-5 TASK 1). When EITHER the
+/// number of queued deltas OR the total queued keys exceeds these, the next
+/// inline-cache miss falls back to a FULL rebuild (which reads the whole corpus
+/// plus the full deletion maps, so it captures every tombstone) and resets the
+/// queue baseline. This bounds both the queue's memory and the per-miss
+/// re-filter work between checkpoints, while keeping the delta path on the
+/// common per-batch single-tombstone case. A checkpoint clears the queue
+/// entirely, so in steady state it stays far below these caps.
+const MAX_PENDING_TOMBSTONE_DELTAS: usize = 256;
+const MAX_PENDING_TOMBSTONE_DELTA_KEYS: usize = 1_000_000;
+
+/// Queue of published-but-not-yet-baked tombstone removals plus the live
+/// monotonic sequence counter (cycle-5 TASK 1). Guarded by a single
+/// `ParkingMutex` shared across writer clones; mutated only under that lock so
+/// the `seq` and the `deltas` stay consistent.
+#[derive(Default)]
+pub(crate) struct PendingTombstoneDeltas {
+    /// Monotonic sequence; the value of the most recently enqueued delta. A new
+    /// delta is assigned `seq + 1`. Never reset (so seqs are globally unique even
+    /// across a queue drain).
+    pub(crate) seq: u64,
+    /// Deltas pending application to the inline-cache base, ordered by `seq`
+    /// ascending. Drained from the front once a stored cache has baked them in.
+    deltas: VecDeque<TombstoneDelta>,
+    /// Running sum of `deltas[..].approx_keys()` for the O(1) cap check.
+    total_keys: usize,
+}
+
+impl PendingTombstoneDeltas {
+    /// Enqueue a published tombstone's removal and return its assigned sequence.
+    pub(crate) fn push(
+        &mut self,
+        delete_sequence: i64,
+        int64_pk: Vec<i64>,
+        row_keys: Vec<Box<[u8]>>,
+    ) -> u64 {
+        self.seq += 1;
+        let delta = TombstoneDelta {
+            seq: self.seq,
+            delete_sequence,
+            int64_pk,
+            row_keys,
+        };
+        self.total_keys += delta.approx_keys();
+        self.deltas.push_back(delta);
+        self.seq
+    }
+
+    /// `true` when the queue has outgrown either cap and the next miss should
+    /// full-rebuild instead of delta-extend.
+    pub(crate) fn over_cap(&self) -> bool {
+        self.deltas.len() > MAX_PENDING_TOMBSTONE_DELTAS
+            || self.total_keys > MAX_PENDING_TOMBSTONE_DELTA_KEYS
+    }
+
+    /// Drop deltas with `seq <= applied_through` from the front — they are
+    /// provably baked into a cache stored with `tombstone_delta_seq >=
+    /// applied_through`, which is the base every future miss extends. Safe under
+    /// concurrent populates because the queue is monotonic and a stale store only
+    /// triggers a (correct) miss-and-recompute, and any delta above
+    /// `applied_through` is retained.
+    pub(crate) fn drain_through(&mut self, applied_through: u64) {
+        while let Some(front) = self.deltas.front() {
+            if front.seq <= applied_through {
+                self.total_keys = self.total_keys.saturating_sub(front.approx_keys());
+                self.deltas.pop_front();
+            } else {
+                break;
+            }
+        }
+    }
+
+    /// Snapshot the deltas with `seq > base_seq` into a single
+    /// [`InlinedDeletionMaps`] (the merged removal to apply to the base entries),
+    /// returning `(removal_map, max_seq_in_queue)`. The max seq is the queue's
+    /// current `seq` (even when no new delta exists), so a cache built from this
+    /// records that it is current through the whole queue.
+    pub(crate) fn removal_above(&self, base_seq: u64) -> (InlinedDeletionMaps, u64) {
+        let mut maps = InlinedDeletionMaps::default();
+        // Deltas are stored seq-ascending (monotonic `push_back`), so the ones
+        // with `seq > base_seq` are a suffix at the back — iterate from the back
+        // and stop at the first `seq <= base_seq` so this is O(new deltas).
+        for delta in self.deltas.iter().rev() {
+            if delta.seq <= base_seq {
+                break;
+            }
+            for &pk in &delta.int64_pk {
+                maps.int64_pk
+                    .entry(pk)
+                    .and_modify(|seq| *seq = (*seq).max(delta.delete_sequence))
+                    .or_insert(delta.delete_sequence);
+            }
+            for key in &delta.row_keys {
+                maps.row_keys
+                    .entry(key.clone())
+                    .and_modify(|seq| *seq = (*seq).max(delta.delete_sequence))
+                    .or_insert(delta.delete_sequence);
+            }
+        }
+        (maps, self.seq)
+    }
+}
+
+#[derive(Default)]
+pub(crate) struct ExtractedPrimaryKeys {
+    pub(crate) int64_pk: Vec<i64>,
+    pub(crate) row_keys: Vec<Box<[u8]>>,
+}
+
+#[derive(Default)]
+pub(crate) struct InlinedDataRewrite {
+    pub(crate) updated_data: Vec<InlinedData>,
+    pub(crate) deleted_inlined_ids: Vec<String>,
+    pub(crate) removed_rows: usize,
+}
+
+impl InlinedDataRewrite {
+    #[must_use]
+    pub(crate) fn is_empty(&self) -> bool {
+        self.updated_data.is_empty() && self.deleted_inlined_ids.is_empty()
+    }
+}
+
+pub(crate) struct InlineAwareDeletionSink {
+    pub(crate) table: CayenneTableProvider,
+    pub(crate) file_sink: CayenneDeletionSink,
+    pub(crate) filters: Vec<Expr>,
+}
+
+pub(crate) struct PkKeysetInvalidatingDeletionSink {
+    pub(crate) table: CayenneTableProvider,
+    pub(crate) inner: Arc<dyn DeletionSink>,
+}
+
+#[async_trait]
+impl DeletionSink for PkKeysetInvalidatingDeletionSink {
+    async fn delete_from(
+        &self,
+    ) -> std::result::Result<u64, Box<dyn std::error::Error + Send + Sync>> {
+        self.table.mark_maintained_aggregates_stale();
+        let deleted = self.inner.delete_from().await?;
+        if deleted > 0 {
+            // Keyset clear-on-delete avoidance (cycle-4 incremental lever).
+            //
+            // This is a FILTER-based DELETE (`DELETE … WHERE <predicate>`), so
+            // the deleted PK set is NOT enumerable at this call site — only the
+            // count is. We therefore cannot surgically `remove` keys from the
+            // Exact keyset here. But for an `Upsert` table we do not need to:
+            // leaving a deleted key STALE-PRESENT in the existence index only
+            // ever produces a redundant key-based delete tombstone on a later
+            // re-insert of that PK, which masks no prior version (none exists)
+            // and is harmless — exactly the false-positive invariant documented
+            // on `PkBloom` (table.rs ~1896-1902) and exercised on the upsert
+            // existence path in `apply_on_conflict_to_batch` (both the Exact arm
+            // at ~6106 and the Bloom arm at ~6159 keep the row and emit at most a
+            // no-op delete). So for upsert tables we SKIP the clear entirely and
+            // keep the stale-superset index — eliminating the O(live-rows)
+            // `load_existing_keyset` cold rebuild the next CDC insert batch would
+            // otherwise pay (measured 277 ms × 244 = 68 s/600 s on `new_order`).
+            //
+            // `DoNothing` tables need an EXACT answer (a stale-present entry would
+            // wrongly DROP a genuinely new row at `apply_on_conflict_to_batch`
+            // ~6105), and their keys are not enumerable on this filter path, so
+            // they keep the conservative full clear and rebuild next batch.
+            // `upsert_bloom_eligible()` is precisely "is this an `Upsert` table".
+            if !self.table.upsert_bloom_eligible() {
+                self.table.clear_cached_pk_keyset();
+            }
+            // Drop the per-file stats `CayenneTableProvider::collect_scan_file_statistics`
+            // caches. Without this, a follow-up `COUNT(*)` (or any other stats-driven
+            // query) is served the row count we computed *before* this delete added
+            // its rows to the position-based deletion vector, so the count is stale —
+            // see `tests/position_based_deletion_test.rs::test_position_based_sequential_deletes`.
+            // (Independent of the keyset: always invalidate so counts stay fresh.)
+            self.table.invalidate_scan_file_statistics();
+        }
+        Ok(deleted)
+    }
+}
+
+#[async_trait]
+impl DeletionSink for InlineAwareDeletionSink {
+    async fn delete_from(
+        &self,
+    ) -> std::result::Result<u64, Box<dyn std::error::Error + Send + Sync>> {
+        let _write_guard = self.table.write_lock.lock().await;
+        self.table.mark_maintained_aggregates_stale();
+
+        let inlined_deleted = self
+            .table
+            .delete_inlined_rows_matching_filters(&self.filters)
+            .await?;
+        let file_deleted = self.file_sink.delete_from().await?;
+
+        let deleted = inlined_deleted.checked_add(file_deleted).ok_or_else(|| {
+            Box::new(datafusion_common::DataFusionError::Execution(
+                "Deleted row count overflowed u64".to_string(),
+            )) as Box<dyn std::error::Error + Send + Sync>
+        })?;
+
+        if deleted > 0 {
+            // Keyset clear-on-delete avoidance (cycle-4 incremental lever) — see
+            // the detailed rationale on `PkKeysetInvalidatingDeletionSink::delete_from`.
+            // This is a FILTER-based DELETE, so the deleted PK set is not in hand
+            // here. For an `Upsert` table a stale-present existence entry only
+            // yields a harmless redundant delete on a later re-insert (the
+            // `PkBloom` false-positive invariant, table.rs ~1896-1902), so we SKIP
+            // the clear and avoid the O(live-rows) `load_existing_keyset` rebuild
+            // the next insert batch would pay. `DoNothing` tables need exactness
+            // (a stale entry would wrongly drop a new row) and keep the full clear.
+            if !self.table.upsert_bloom_eligible() {
+                self.table.clear_cached_pk_keyset();
+            }
+            if file_deleted > 0 && self.table.pk_deletion_strategy.is_position_based() {
+                self.table.clear_scan_file_statistics_cache();
+            }
+        }
+
+        Ok(deleted)
+    }
+}
+
+pub(crate) struct BatchValidationResult {
+    pub(crate) filtered_batch: Option<RecordBatch>,
+    /// Per-file position deletes for located conflict rows: file path -> deleted
+    /// file-local row positions. Empty unless `deletion_mode: position`.
+    pub(crate) delete_specs: Vec<(Arc<str>, Vec<u64>)>,
+    pub(crate) kept_keys: HashSet<OwnedRow>,
+    /// File-backed Int64 PK values being deleted (for `Int64Pk` strategy).
+    pub(crate) deleted_pk_i64: Vec<i64>,
+    /// File-backed row key bytes being deleted (for `RowConverterBased` strategy).
+    pub(crate) deleted_row_keys: Vec<Box<[u8]>>,
+    /// Inlined Int64 PK values being deleted.
+    pub(crate) deleted_inlined_pk_i64: Vec<i64>,
+    /// Inlined row key bytes being deleted.
+    pub(crate) deleted_inlined_row_keys: Vec<Box<[u8]>>,
+}
+
+pub(crate) struct PreparedInsertStream {
+    pub(crate) stream: SendableRecordBatchStream,
+    post_validation: Arc<ParkingMutex<Option<PostValidationState>>>,
+    may_have_on_conflict_deletions: bool,
+}
+
+impl PreparedInsertStream {
+    pub(crate) fn immediate(stream: SendableRecordBatchStream) -> Self {
+        Self {
+            stream,
+            post_validation: Arc::new(ParkingMutex::new(Some(PostValidationState::default()))),
+            may_have_on_conflict_deletions: false,
+        }
+    }
+
+    pub(crate) fn deferred(
+        stream: SendableRecordBatchStream,
+        post_validation: Arc<ParkingMutex<Option<PostValidationState>>>,
+        may_have_on_conflict_deletions: bool,
+    ) -> Self {
+        Self {
+            stream,
+            post_validation,
+            may_have_on_conflict_deletions,
+        }
+    }
+
+    pub(crate) fn post_validation(&self) -> Arc<ParkingMutex<Option<PostValidationState>>> {
+        Arc::clone(&self.post_validation)
+    }
+
+    #[must_use]
+    pub(crate) const fn may_have_on_conflict_deletions(&self) -> bool {
+        self.may_have_on_conflict_deletions
+    }
+}
+
+#[derive(Default)]
+pub(crate) struct OnConflictDeletions {
+    /// Per-file position deletes: file path -> deleted file-local row positions.
+    /// Routed to the position-vector write path; empty unless `deletion_mode: position`.
+    pub(crate) delete_specs: HashMap<Arc<str>, Vec<u64>>,
+    /// Deleted file-backed Int64 PK values (for `Int64Pk` strategy).
+    pub(crate) deleted_pk_i64: Vec<i64>,
+    /// Deleted file-backed row keys (for `RowConverterBased` strategy).
+    pub(crate) deleted_row_keys: Vec<Box<[u8]>>,
+    /// Deleted inlined Int64 PK values.
+    pub(crate) deleted_inlined_pk_i64: Vec<i64>,
+    /// Deleted inlined row keys.
+    pub(crate) deleted_inlined_row_keys: Vec<Box<[u8]>>,
+}
+
+impl OnConflictDeletions {
+    /// Total number of existing rows superseded (deleted) by this upsert across
+    /// all strategies, each superseded row counted exactly ONCE. Used to net the
+    /// live row count: an upsert that replaces N existing rows adds
+    /// `inserted - N` live rows, not `inserted`.
+    ///
+    /// Counting a row once requires accounting for the deliberate dual encoding
+    /// of `FilePositioned` conflicts under the `Int64Pk`/`RowConverterBased`
+    /// strategies: `apply_on_conflict_to_batch` pushes BOTH a per-file position
+    /// delete (`delete_specs`, masked inside the Vortex scan) AND a key-based
+    /// twin (`deleted_pk_i64`/`deleted_row_keys`) covering the paths position
+    /// vectors never reach (e.g. the in-memory CDC tier's merge-on-read
+    /// tombstones, built from the key lists only — see `build_mem_tombstones`).
+    /// Summing all five collections would count those rows twice. The key-based
+    /// total already counts every dual-encoded row once, so position deletes
+    /// contribute only the EXCESS beyond the key-based total — exactly the
+    /// conflicts with no key twin (the `PositionBased` strategy, whose key
+    /// lists stay empty).
+    pub(crate) fn total_superseded(&self) -> usize {
+        let position_deletes = self.delete_specs.values().map(Vec::len).sum::<usize>();
+        let file_key_deletes = self.deleted_pk_i64.len() + self.deleted_row_keys.len();
+        file_key_deletes
+            + position_deletes.saturating_sub(file_key_deletes)
+            + self.deleted_inlined_pk_i64.len()
+            + self.deleted_inlined_row_keys.len()
+    }
+}
+
+/// `apply_on_conflict_deletions` performs all durable deletion-vector and
+/// inlined-data rewrite I/O but returns the computed in-memory visibility
+/// updates instead of storing them, so the stores can be committed
+/// synchronously — together with the protected snapshot publish — under a
+/// single `scan_state_lock.write()`. This keeps the scan-excluding guard held
+/// for microseconds rather than across durable writes.
+pub(crate) struct OnConflictUpdate {
+    pub(crate) deletion_update: OnConflictDeletionUpdate,
+    /// Set when `apply_on_conflict_deletions` durably wrote an inline tombstone
+    /// (via `add_inlined_delete`) to hide the prior inline copy of an upserted
+    /// PK. Publishing must then bump `inlined_generation` (under
+    /// `scan_state_lock`) so the next scan rebuilds the inline view and observes
+    /// the tombstone atomically with the deletion-cache + protected-snapshot
+    /// flips. A tombstone only adds a hide-marker — it appends no inline DATA
+    /// rows and changes no row count — so unlike the previous inline-rewrite
+    /// path there is no visibility watermark to advance.
+    pub(crate) inlined_tombstone_written: bool,
+}
+
+impl OnConflictUpdate {
+    pub(crate) fn none() -> Self {
+        Self {
+            deletion_update: OnConflictDeletionUpdate::None,
+            inlined_tombstone_written: false,
+        }
+    }
+
+    pub(crate) fn from_deletion_update(deletion_update: OnConflictDeletionUpdate) -> Self {
+        Self {
+            deletion_update,
+            inlined_tombstone_written: false,
+        }
+    }
+
+    pub(crate) fn with_inlined_tombstone_written(mut self, written: bool) -> Self {
+        self.inlined_tombstone_written = written;
+        self
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        matches!(self.deletion_update, OnConflictDeletionUpdate::None)
+            && !self.inlined_tombstone_written
+    }
+}
+
+pub(crate) enum OnConflictDeletionUpdate {
+    /// No key-based deletion-cache change (pure position deletes or no deletes).
+    None,
+    /// New `Int64Pk` deletion snapshot to publish.
+    Int64Pk(Arc<Int64PkDeletionSnapshot>),
+    /// New `RowConverterBased` deletion snapshot to publish.
+    RowConverter(Arc<RowConverterDeletionSnapshot>),
+}
+
+#[derive(Clone)]
+pub(crate) enum PkDeletionSnapshot {
+    PositionBased,
+    Int64Pk { tombstones: Arc<DeletionIndex> },
+    RowConverterBased { tombstones: Arc<KeyDeletionIndex> },
+}
+
+/// One memoized merged (file ∪ mem-tier) deletion snapshot for the scan path.
+/// See the `merged_scan_deletions` field docs for the key's torn-state proof.
+pub(crate) struct MergedScanDeletions {
+    /// `Arc::as_ptr` identity of the FILE-side index the merge was built from.
+    pub(crate) file_index_ptr: usize,
+    /// [`crate::provider::mem_tier::MemTier::version`] of the tier merged in.
+    pub(crate) tier_version: u64,
+    /// Structural epoch observed when the memo was built.
+    pub(crate) structural_epoch: u64,
+    pub(crate) merged: PkDeletionSnapshot,
+}
+
+/// PK membership of a mem-tier checkpoint's flushed corpus (the visible inline +
+/// tier rows being encoded into the new snapshot), keyed by deletion strategy.
+/// Splits the tier's tombstones at durable-commit time: a tombstoned key WITH a
+/// corpus row was re-inserted after its delete and must carry the reinsert
+/// marker so the flushed row stays visible; a tombstoned key WITHOUT one is a
+/// pure delete and must be committed delete-only (a phantom reinsert marker
+/// would resurrect older durable copies on the main scan path). See
+/// `commit_mem_tier_checkpoint_metadata`.
+pub(crate) enum CheckpointCorpusKeys {
+    Int64(HashSet<i64>),
+    RowKeys(HashSet<Box<[u8]>>),
+    None,
+}
+
+impl CheckpointCorpusKeys {
+    pub(crate) fn contains_i64(&self, pk: i64) -> bool {
+        matches!(self, Self::Int64(keys) if keys.contains(&pk))
+    }
+
+    pub(crate) fn contains_row_key(&self, key: &[u8]) -> bool {
+        matches!(self, Self::RowKeys(keys) if keys.contains(key))
+    }
+}
+
+impl PkDeletionSnapshot {
+    /// Identity of the inner index allocation, for the merged-scan memo key.
+    /// `None` for `PositionBased` (no index; the merge is a no-op there anyway).
+    pub(crate) fn index_ptr(&self) -> Option<usize> {
+        match self {
+            Self::PositionBased => None,
+            Self::Int64Pk { tombstones } => Some(Arc::as_ptr(tombstones) as usize),
+            Self::RowConverterBased { tombstones } => Some(Arc::as_ptr(tombstones) as usize),
+        }
+    }
+
+    pub(crate) fn has_deletions(&self) -> bool {
+        match self {
+            Self::PositionBased => false,
+            Self::Int64Pk { tombstones } => tombstones.has_deletions(),
+            Self::RowConverterBased { tombstones } => tombstones.has_deletions(),
+        }
+    }
+
+    /// Count of keys with a live deletion in this snapshot — the per-query
+    /// merge-on-read probe scales with this, so the seq-prefix bake is triggered
+    /// on it (see `BAKE_DELETION_INDEX_TRIGGER`). `0` for `PositionBased` (those
+    /// tombstones are file-scoped, never seq-tagged, and are out of the bake's
+    /// scope).
+    pub(crate) fn delete_len(&self) -> usize {
+        match self {
+            Self::PositionBased => 0,
+            Self::Int64Pk { tombstones } => tombstones.delete_len(),
+            Self::RowConverterBased { tombstones } => tombstones.delete_len(),
+        }
+    }
+
+    /// Extend this snapshot by ONE append's tombstone delta — O(delta), the
+    /// persistent-index extend. Used by the append path to keep the
+    /// merged-scan-deletions memo CURRENT in lockstep (under sustained CDC the
+    /// version-keyed memo can otherwise never hit: every append bumps the tier
+    /// version, and the O(tier) rebuild per scan was the churn-coupled collapse
+    /// the `mem_tier_join_shapes` live lanes measure at 175-247x).
+    pub(crate) fn extended_by_delta(
+        &self,
+        delta: &crate::provider::mem_tier::SegmentTombstones,
+    ) -> Self {
+        // Every key in `delta` shares one reserved delete sequence (one CDC
+        // apply), so the memo extend applies that single scalar to all of them —
+        // identical to extending by a per-key map whose values are all that seq.
+        let seq = delta.delete_sequence();
+        match self {
+            Self::PositionBased => Self::PositionBased,
+            Self::Int64Pk { tombstones } => {
+                if delta.is_int64_empty() {
+                    return self.clone();
+                }
+                let updated = tombstones.extend_max_deletes(delta.int64_keys().map(|pk| (pk, seq)));
+                Self::Int64Pk {
+                    tombstones: Arc::new(updated),
+                }
+            }
+            Self::RowConverterBased { tombstones } => {
+                if delta.is_row_keys_empty() {
+                    return self.clone();
+                }
+                let updated = tombstones.extend_max_deletes(delta.row_keys().map(|key| (key, seq)));
+                Self::RowConverterBased {
+                    tombstones: Arc::new(updated),
+                }
+            }
+        }
+    }
+
+    pub(crate) fn with_mem_tier_tombstones(
+        &self,
+        mem_tier: &crate::provider::mem_tier::MemTier,
+    ) -> Self {
+        match self {
+            Self::PositionBased => Self::PositionBased,
+            Self::Int64Pk { tombstones } => {
+                if mem_tier.tombstones.int64_pk.is_empty() {
+                    return self.clone();
+                }
+
+                let updated = tombstones.extend_max_deletes(
+                    mem_tier
+                        .tombstones
+                        .int64_pk
+                        .iter()
+                        .map(|(&pk, &delete_sequence)| (pk, delete_sequence)),
+                );
+                Self::Int64Pk {
+                    tombstones: Arc::new(updated),
+                }
+            }
+            Self::RowConverterBased { tombstones } => {
+                if mem_tier.tombstones.row_keys.is_empty() {
+                    return self.clone();
+                }
+
+                let updated = tombstones.extend_max_deletes(
+                    mem_tier
+                        .tombstones
+                        .row_keys
+                        .iter()
+                        .map(|(key, &delete_sequence)| (key.as_ref(), delete_sequence)),
+                );
+                Self::RowConverterBased {
+                    tombstones: Arc::new(updated),
+                }
+            }
+        }
+    }
+
+    /// The highest delete sequence reflected in THIS coherent snapshot.
+    ///
+    /// Because every deletion update builds an extended index followed by a single
+    /// atomic `deletion_snapshot.store(...)`, a snapshot obtained from one load
+    /// reflects all deletions up to this value. Deriving the compaction fence
+    /// from the same snapshot (rather than a second, independent
+    /// `get_max_delete_sequence()` load) is required for correctness — see
+    /// `compact_protected_snapshots_subset`.
+    pub(crate) fn max_sequence_number(&self) -> Option<i64> {
+        match self {
+            Self::PositionBased => None,
+            Self::Int64Pk { tombstones } => tombstones.max_sequence_number(),
+            Self::RowConverterBased { tombstones } => tombstones.max_sequence_number(),
+        }
+    }
+}
+
+pub(crate) fn pk_deletion_snapshot_for_strategy(
+    strategy: &PkDeletionStrategyWithCache,
+) -> PkDeletionSnapshot {
+    match strategy {
+        PkDeletionStrategyWithCache::PositionBased { .. } => PkDeletionSnapshot::PositionBased,
+        PkDeletionStrategyWithCache::Int64Pk {
+            deletion_snapshot, ..
+        } => {
+            let snapshot = deletion_snapshot.load_full();
+            PkDeletionSnapshot::Int64Pk {
+                tombstones: Arc::clone(&snapshot.tombstones),
+            }
+        }
+        PkDeletionStrategyWithCache::RowConverterBased {
+            deletion_snapshot, ..
+        } => {
+            let snapshot = deletion_snapshot.load_full();
+            PkDeletionSnapshot::RowConverterBased {
+                tombstones: Arc::clone(&snapshot.tombstones),
+            }
+        }
+    }
+}
+
+pub(crate) struct ProtectedSnapshotScan<'a> {
+    pub(crate) state: &'a dyn Session,
+    pub(crate) projection: Option<&'a Vec<usize>>,
+    pub(crate) filters: &'a [Expr],
+    pub(crate) limit: Option<usize>,
+    pub(crate) pk_indices_in_projection: &'a [usize],
+    pub(crate) protected_snapshots: Arc<HashMap<String, i64>>,
+    pub(crate) deletion_snapshot: &'a PkDeletionSnapshot,
+    /// View-typed read schema so protected-snapshot scans match the main file
+    /// scan in the union (see `viewify_read_schema`).
+    pub(crate) read_schema: SchemaRef,
+}
+
+pub(crate) struct PreparedProtectedSnapshotUpdate {
+    pub(crate) expected: Arc<HashMap<String, i64>>,
+    pub(crate) updated: Arc<HashMap<String, i64>>,
+}
+
+#[derive(Default)]
+pub(crate) struct PostValidationState {
+    pub(crate) on_conflict_deletions: OnConflictDeletions,
+    pub(crate) validated_keys: HashSet<OwnedRow>,
+}
+
+pub(crate) struct OnConflictContext<'a> {
+    pub(crate) pk_indices: &'a [usize],
+    pub(crate) converter: &'a RowConverter,
+    pub(crate) on_conflict: &'a OnConflict,
+    pub(crate) upsert_options: &'a UpsertOptions,
+    pub(crate) existing: PkExistenceRef<'a>,
+    pub(crate) incoming_keys: &'a HashSet<OwnedRow>,
+}
+
+pub(crate) struct OnConflictValidationStream {
+    pub(crate) table: CayenneTableProvider,
+    pub(crate) inner: SendableRecordBatchStream,
+    schema: SchemaRef,
+    pub(crate) pk_indices: Vec<usize>,
+    pub(crate) converter: RowConverter,
+    pub(crate) on_conflict: OnConflict,
+    pub(crate) upsert_options: UpsertOptions,
+    existing_keys: Option<CachedPkIndex>,
+    pub(crate) incoming_keys: HashSet<OwnedRow>,
+    pub(crate) kept_keys: HashSet<OwnedRow>,
+    pub(crate) delete_specs: HashMap<Arc<str>, Vec<u64>>,
+    pub(crate) deleted_pk_i64: Vec<i64>,
+    pub(crate) deleted_row_keys: Vec<Box<[u8]>>,
+    pub(crate) deleted_inlined_pk_i64: Vec<i64>,
+    pub(crate) deleted_inlined_row_keys: Vec<Box<[u8]>>,
+    post_validation: Arc<ParkingMutex<Option<PostValidationState>>>,
+    finalized: bool,
+}
+
+impl OnConflictValidationStream {
+    pub(crate) fn new(
+        table: CayenneTableProvider,
+        inner: SendableRecordBatchStream,
+        pk_indices: Vec<usize>,
+        converter: RowConverter,
+        existing_keys: CachedPkIndex,
+        on_conflict: OnConflict,
+        post_validation: Arc<ParkingMutex<Option<PostValidationState>>>,
+    ) -> Self {
+        let schema = inner.schema();
+        let upsert_options = on_conflict.get_upsert_options();
+        Self {
+            table,
+            inner,
+            schema,
+            pk_indices,
+            converter,
+            on_conflict,
+            upsert_options,
+            existing_keys: Some(existing_keys),
+            incoming_keys: HashSet::with_capacity(1024),
+            kept_keys: HashSet::with_capacity(1024),
+            delete_specs: HashMap::new(),
+            deleted_pk_i64: Vec::new(),
+            deleted_row_keys: Vec::new(),
+            deleted_inlined_pk_i64: Vec::new(),
+            deleted_inlined_row_keys: Vec::new(),
+            post_validation,
+            finalized: false,
+        }
+    }
+
+    fn process_batch(
+        &mut self,
+        batch: RecordBatch,
+    ) -> datafusion_common::Result<Option<RecordBatch>> {
+        if batch.num_rows() == 0 {
+            return Ok(None);
+        }
+
+        let existing_index = self.existing_keys.as_ref().ok_or_else(|| {
+            datafusion_common::DataFusionError::Internal(format!(
+                "On-conflict validation for table {} was polled after finalization",
+                self.table.table_name()
+            ))
+        })?;
+        let existing = match existing_index {
+            CachedPkIndex::Exact(keyset) => PkExistenceRef::Exact(&keyset.keys),
+            CachedPkIndex::Bloom(bloom) => PkExistenceRef::Bloom(bloom),
+        };
+
+        let mut ctx = OnConflictContext {
+            pk_indices: &self.pk_indices,
+            converter: &self.converter,
+            on_conflict: &self.on_conflict,
+            upsert_options: &self.upsert_options,
+            existing,
+            incoming_keys: &self.incoming_keys,
+        };
+
+        let validation_start = Instant::now();
+        let validation_result = self.table.apply_on_conflict_to_batch(batch, &mut ctx);
+        record_cayenne_write_phase(
+            self.table.table_name(),
+            "apply_on_conflict_validation",
+            validation_start,
+        );
+
+        let BatchValidationResult {
+            filtered_batch,
+            delete_specs: batch_delete_specs,
+            kept_keys,
+            deleted_pk_i64,
+            deleted_row_keys,
+            deleted_inlined_pk_i64,
+            deleted_inlined_row_keys,
+        } = validation_result.map_err(datafusion_common::DataFusionError::from)?;
+
+        for (file_path, rows) in batch_delete_specs {
+            self.delete_specs.entry(file_path).or_default().extend(rows);
+        }
+
+        self.deleted_pk_i64.extend(deleted_pk_i64);
+        self.deleted_row_keys.extend(deleted_row_keys);
+        self.deleted_inlined_pk_i64.extend(deleted_inlined_pk_i64);
+        self.deleted_inlined_row_keys
+            .extend(deleted_inlined_row_keys);
+
+        self.incoming_keys.extend(kept_keys.iter().cloned());
+        self.kept_keys.extend(kept_keys);
+
+        Ok(filtered_batch)
+    }
+
+    fn store_existing_keyset(&mut self) {
+        if let Some(existing_keys) = self.existing_keys.take() {
+            self.table.store_cached_pk_index(existing_keys);
+        }
+    }
+
+    fn finish_success(&mut self) {
+        if self.finalized {
+            return;
+        }
+
+        self.store_existing_keyset();
+        let post_validation = PostValidationState {
+            on_conflict_deletions: OnConflictDeletions {
+                delete_specs: std::mem::take(&mut self.delete_specs),
+                deleted_pk_i64: std::mem::take(&mut self.deleted_pk_i64),
+                deleted_row_keys: std::mem::take(&mut self.deleted_row_keys),
+                deleted_inlined_pk_i64: std::mem::take(&mut self.deleted_inlined_pk_i64),
+                deleted_inlined_row_keys: std::mem::take(&mut self.deleted_inlined_row_keys),
+            },
+            validated_keys: std::mem::take(&mut self.kept_keys),
+        };
+        *self.post_validation.lock() = Some(post_validation);
+        self.finalized = true;
+    }
+
+    fn finish_after_error(&mut self) {
+        if self.finalized {
+            return;
+        }
+
+        self.store_existing_keyset();
+        self.finalized = true;
+    }
+}
+
+impl Unpin for OnConflictValidationStream {}
+
+impl futures::Stream for OnConflictValidationStream {
+    type Item = datafusion_common::Result<RecordBatch>;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let this = self.get_mut();
+        if this.finalized {
+            return Poll::Ready(None);
+        }
+
+        loop {
+            match this.inner.as_mut().poll_next(cx) {
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(None) => {
+                    this.finish_success();
+                    return Poll::Ready(None);
+                }
+                Poll::Ready(Some(Err(err))) => {
+                    this.finish_after_error();
+                    return Poll::Ready(Some(Err(err)));
+                }
+                Poll::Ready(Some(Ok(batch))) => match this.process_batch(batch) {
+                    Ok(Some(filtered_batch)) => return Poll::Ready(Some(Ok(filtered_batch))),
+                    Ok(None) => {}
+                    Err(err) => {
+                        this.finish_after_error();
+                        return Poll::Ready(Some(Err(err)));
+                    }
+                },
+            }
+        }
+    }
+}
+
+impl RecordBatchStream for OnConflictValidationStream {
+    fn schema(&self) -> SchemaRef {
+        Arc::clone(&self.schema)
+    }
+}
