@@ -653,6 +653,7 @@ async fn file(
     let tokenizer_config_path = component.find_any_file_path(ModelFileType::TokenizerConfig);
     let config_path = component.find_any_file_path(ModelFileType::Config);
     let generation_config = component.find_any_file_path(ModelFileType::GenerationConfig);
+    let distributed = parse_distributed_config(params)?;
 
     let chat_template_literal = params.get("chat_template").expose().ok();
 
@@ -663,6 +664,7 @@ async fn file(
         tokenizer_config_path.as_deref(),
         generation_config.as_deref(),
         chat_template_literal,
+        distributed,
     )
     .await
 }

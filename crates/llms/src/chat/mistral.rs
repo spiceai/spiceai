@@ -14,13 +14,10 @@ limitations under the License.
 #![allow(clippy::borrowed_box)]
 #![allow(clippy::needless_pass_by_value)]
 
-use crate::chat::message_to_mistral;
+use crate::chat::{FailedToLoadModelSnafu, message_to_mistral};
 use crate::streaming_utils::create_stream_response_with_timestamp;
 
-use super::{
-    Chat, DistributedBackend, DistributedConfig, Error as ChatError, FailedToRunModelSnafu, Result,
-    nsql::SqlGeneration,
-};
+use super::{Chat, Error as ChatError, FailedToRunModelSnafu, Result, nsql::SqlGeneration};
 use async_openai::{
     error::{ApiError, OpenAIError},
     types::chat::{
@@ -85,119 +82,6 @@ fn to_openai_response(
         .map_err(|e| OpenAIError::InvalidArgument(format!("Failed to deserialize response: {e}")))
 }
 
-/// Base TCP port for the ring transport. Rank `r` binds `RING_PORT_BASE + r` to
-/// accept its left neighbour; its right neighbour is rank `(r + 1) % world_size`.
-const RING_PORT_BASE: u16 = 12345;
-/// Port for the ring's request-replication channel (rank 0 listens; others dial).
-const RING_MASTER_PORT: u16 = 12344;
-
-/// mistral.rs `RingConfig` as serialized to the `RING_CONFIG` JSON file. The
-/// field names/shape must match `mistralrs_quant::distributed::RingConfig`.
-#[derive(serde::Serialize)]
-struct RingConfigFile {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    master_ip: Option<String>,
-    master_port: u16,
-    port: u16,
-    right_port: u16,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    right_ip: Option<String>,
-    rank: usize,
-    world_size: usize,
-}
-
-/// Translate a [`DistributedConfig`] into a per-node mistral.rs ring topology,
-/// write it to a temp `RING_CONFIG` file, and point the `RING_CONFIG` env var at
-/// it. mistral.rs reads that env var while building the pipeline (there is no
-/// builder API for rank/world size), so this MUST run before `load_model_from_hf`.
-/// Returns the temp-file guard, which must outlive the model.
-fn configure_ring_distributed(cfg: &DistributedConfig) -> Result<tempfile::TempPath> {
-    /// Map a ring rank to its TCP port (`RING_PORT_BASE + rank`), erroring rather
-    /// than silently truncating if it cannot fit in a `u16`.
-    fn ring_port(rank: usize) -> Result<u16> {
-        u16::try_from(rank)
-            .ok()
-            .and_then(|r| RING_PORT_BASE.checked_add(r))
-            .ok_or_else(|| ChatError::InvalidParamValueError {
-                param: "node_rank".to_string(),
-                message: format!(
-                    "rank {rank} cannot be mapped to a TCP port (base {RING_PORT_BASE} + rank overflows u16)"
-                ),
-            })
-    }
-
-    match cfg.backend {
-        DistributedBackend::Ring => {}
-    }
-
-    if !cfg!(feature = "ring") {
-        return Err(ChatError::FailedToLoadModel {
-            source: "`distributed_backend: ring` was requested, but spiced was not built with the `ring` feature. Rebuild with `--features ring` (compose with `cuda`).".into(),
-        });
-    }
-
-    if let Err(message) = cfg.validate() {
-        return Err(ChatError::InvalidParamValueError {
-            param: "nodes".to_string(),
-            message,
-        });
-    }
-
-    let world_size = cfg.world_size();
-    let rank = cfg.node_rank;
-    let right = (rank + 1) % world_size;
-
-    let ring = RingConfigFile {
-        // Rank 0 listens for the replication channel on all interfaces (the
-        // mistral.rs default of 0.0.0.0); other ranks must dial the head.
-        master_ip: if rank == 0 {
-            None
-        } else {
-            Some(cfg.nodes[0].trim().to_string())
-        },
-        master_port: RING_MASTER_PORT,
-        port: ring_port(rank)?,
-        right_port: ring_port(right)?,
-        right_ip: Some(cfg.nodes[right].trim().to_string()),
-        rank,
-        world_size,
-    };
-
-    let json = serde_json::to_string_pretty(&ring)
-        .map_err(|e| ChatError::FailedToLoadModel { source: Box::new(e) })?;
-
-    let mut file = tempfile::Builder::new()
-        .prefix("spice-ring-")
-        .suffix(".json")
-        .tempfile()
-        .map_err(|e| ChatError::FailedToLoadModel { source: Box::new(e) })?;
-    std::io::Write::write_all(&mut file, json.as_bytes())
-        .map_err(|e| ChatError::FailedToLoadModel { source: Box::new(e) })?;
-    let path = file.into_temp_path();
-
-    // SAFETY: set once during model initialization, before mistral.rs reads
-    // `RING_CONFIG` while constructing the pipeline. Loading is not concurrent
-    // with other environment access here, so no other thread races this write.
-    unsafe {
-        std::env::set_var("RING_CONFIG", path.as_os_str());
-    }
-
-    tracing::info!(
-        rank,
-        world_size,
-        right = %cfg.nodes[right],
-        "Configured distributed ring inference"
-    );
-    if rank != 0 {
-        tracing::warn!(
-            "This node is rank {rank} (not the head): it runs as a tensor-parallel compute replica, blocking inside model load instead of serving its own API. Send inference requests to rank 0 ({}).",
-            cfg.nodes[0]
-        );
-    }
-
-    Ok(path)
-}
-
 impl MistralLlama {
     pub async fn from(
         model_weights: &[PathBuf],
@@ -206,6 +90,7 @@ impl MistralLlama {
         tokenizer_config: Option<&Path>,
         generation_config: Option<&Path>,
         chat_template_literal: Option<&str>,
+        ring_config_path: Option<tempfile::TempPath>,
     ) -> Result<Self> {
         for weight in model_weights {
             if !weight.exists() {
@@ -283,7 +168,7 @@ impl MistralLlama {
             )?,
         };
 
-        Ok(Self::from_pipeline(pipeline, paged_attn_requested).await)
+        Ok(Self::from_pipeline(pipeline, paged_attn_requested, ring_config_path).await)
     }
 
     /// Create paths object, [`ModelPaths`], to create new [`MistralLlama`].
@@ -502,7 +387,7 @@ impl MistralLlama {
         hf_token_literal: Option<&SecretString>,
         gguf_filename: Option<PathBuf>,
         chat_template_literal: Option<&str>,
-        distributed: Option<DistributedConfig>,
+        ring_config_path: Option<tempfile::TempPath>,
     ) -> Result<Self> {
         let model_parts: Vec<&str> = model_id.split(':').collect();
         let chat_template = chat_template_literal.map(ToString::to_string);
@@ -567,7 +452,8 @@ impl MistralLlama {
                     (
                         builder
                             .build(normal_loader_type)
-                            .map_err(|e| ChatError::FailedToLoadModel { source: e.into() }),
+                            .map_err(|e| e.into_boxed_dyn_error())
+                            .context(FailedToLoadModelSnafu),
                         AutoDeviceMapParams::default_text(),
                     )
                 }
@@ -582,21 +468,6 @@ impl MistralLlama {
         let paged_attn_config = Self::paged_attention_config(&device);
         let paged_attn_requested = paged_attn_config.is_some();
 
-        // Configure multi-node distributed (ring) inference before loading: the
-        // loader reads `RING_CONFIG` from the environment while building the
-        // pipeline. The returned guard keeps the temp file alive for the model.
-        let ring_config = match distributed {
-            Some(cfg) => Some(configure_ring_distributed(&cfg)?),
-            None => {
-                // Defensive: clear any `RING_CONFIG` left set by a prior distributed
-                // load in this process, so this single-node load can't accidentally
-                // run distributed.
-                // SAFETY: touched only during model init, before mistral.rs reads it.
-                unsafe { std::env::remove_var("RING_CONFIG") };
-                None
-            }
-        };
-
         let pipeline = loader?
             .load_model_from_hf(
                 model_parts.get(1).map(|&x| x.to_string()),
@@ -610,14 +481,13 @@ impl MistralLlama {
             )
             .map_err(|e| ChatError::FailedToLoadModel { source: e.into() })?;
 
-        let mut llama = Self::from_pipeline(pipeline, paged_attn_requested).await;
-        llama.ring_config = ring_config;
-        Ok(llama)
+        Ok(Self::from_pipeline(pipeline, paged_attn_requested, ring_config_path).await)
     }
 
     async fn from_pipeline(
         pipeline: Arc<tokio::sync::Mutex<dyn Pipeline + Sync + Send>>,
         paged_attn_requested: bool,
+        ring_config: Option<tempfile::TempPath>,
     ) -> Self {
         let scheduler_config = Self::scheduler_config(&pipeline, paged_attn_requested).await;
         Self {
@@ -625,7 +495,7 @@ impl MistralLlama {
                 .build()
                 .await,
             counter: AtomicUsize::new(0),
-            ring_config: None,
+            ring_config,
         }
     }
 

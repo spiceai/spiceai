@@ -52,11 +52,15 @@ use async_openai::{
 #[cfg(feature = "local_llm")]
 pub mod mistral;
 pub mod nsql;
+#[cfg(feature = "local_llm")]
+use crate::chat::distributed::{DistributedConfig, configure_ring_distributed};
 use crate::streaming_utils::generate_stream_id;
 #[cfg(feature = "local_llm")]
 use indexmap::IndexMap;
 #[cfg(feature = "local_llm")]
 use mistralrs::MessageContent;
+
+pub mod distributed;
 
 static WEIGHTS_EXTENSIONS: [&str; 7] = [
     ".safetensors",
@@ -715,67 +719,6 @@ pub trait Chat: Sync + Send {
     }
 }
 
-/// Backend used for multi-node distributed (tensor-parallel) inference of a
-/// local model. Currently only mistral.rs's pure-TCP `ring` all-reduce.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DistributedBackend {
-    /// mistral.rs ring all-reduce over plain TCP. No system dependency; the
-    /// all-reduce is correct at world_size = 2 (the two-node case).
-    Ring,
-}
-
-/// Topology for running one local model across multiple nodes (tensor-parallel).
-///
-/// The same `nodes` list is given to every node; only `node_rank` differs.
-/// Spice derives the per-node transport wiring (ports, ring neighbour, master
-/// address) from this. Rank 0 is the head and serves the API; the other ranks
-/// run as compute replicas.
-#[derive(Debug, Clone)]
-pub struct DistributedConfig {
-    pub backend: DistributedBackend,
-    /// This node's rank in `[0, world_size)`. Rank 0 is the head/server.
-    pub node_rank: usize,
-    /// Ordered node addresses (host or IP); index == rank, length == world size.
-    pub nodes: Vec<String>,
-}
-
-impl DistributedConfig {
-    /// Number of nodes participating (the tensor-parallel world size).
-    #[must_use]
-    pub fn world_size(&self) -> usize {
-        self.nodes.len()
-    }
-
-    /// Validate the topology, returning a human-readable message on failure.
-    /// mistral.rs additionally requires the world size to divide the model's
-    /// attention/kv head counts; that is enforced when the model loads.
-    pub fn validate(&self) -> std::result::Result<(), String> {
-        let world_size = self.world_size();
-        if world_size < 2 {
-            return Err(format!(
-                "distributed inference needs at least 2 nodes; `nodes` lists {world_size}"
-            ));
-        }
-        if !world_size.is_power_of_two() {
-            return Err(format!(
-                "world size (number of `nodes`) must be a power of 2; got {world_size}"
-            ));
-        }
-        if self.node_rank >= world_size {
-            return Err(format!(
-                "`node_rank` {} is out of range for world size {world_size} (valid: 0..{world_size})",
-                self.node_rank
-            ));
-        }
-        if self.backend == DistributedBackend::Ring && world_size != 2 {
-            return Err(format!(
-                "the `ring` backend currently supports exactly 2 nodes (world_size = 2); got {world_size}. Use 2 nodes (or the future `nccl` backend for larger worlds)."
-            ));
-        }
-        Ok(())
-    }
-}
-
 /// Create a model to run locally, via files from Huggingface.
 ///
 /// `model_id` uniquely refers to a Huggingface model.
@@ -793,13 +736,27 @@ pub async fn create_hf_model(
     chat_template_literal: Option<&str>,
     distributed: Option<DistributedConfig>,
 ) -> Result<Arc<dyn Chat>> {
+    // Configure multi-node distributed (ring) inference before loading: the
+    // loader reads `RING_CONFIG` from the environment while building the
+    // pipeline. The returned guard keeps the temp file alive for the model.
+    let ring_config = match distributed {
+        Some(cfg) => Some(configure_ring_distributed(&cfg)?),
+        None => {
+            // Defensive: clear any `RING_CONFIG` left set by a prior distributed
+            // load in this process, so this single-node load can't accidentally
+            // run distributed.
+            // SAFETY: touched only during model init, before mistral.rs reads it.
+            unsafe { std::env::remove_var("RING_CONFIG") };
+            None
+        }
+    };
     mistral::MistralLlama::from_hf(
         model_id,
         model_type,
         hf_token_literal,
         from_gguf,
         chat_template_literal,
-        distributed,
+        ring_config,
     )
     .await
     .map(|x| Arc::new(x) as Arc<dyn Chat>)
@@ -813,7 +770,22 @@ pub async fn create_local_model(
     tokenizer_config: Option<&str>,
     generation_config: Option<&str>,
     chat_template_literal: Option<&str>,
+    distributed: Option<DistributedConfig>,
 ) -> Result<Arc<dyn Chat>> {
+    // Configure multi-node distributed (ring) inference before loading: the
+    // loader reads `RING_CONFIG` from the environment while building the
+    // pipeline. The returned guard keeps the temp file alive for the model.
+    let ring_config = match distributed {
+        Some(cfg) => Some(configure_ring_distributed(&cfg)?),
+        None => {
+            // Defensive: clear any `RING_CONFIG` left set by a prior distributed
+            // load in this process, so this single-node load can't accidentally
+            // run distributed.
+            // SAFETY: touched only during model init, before mistral.rs reads it.
+            unsafe { std::env::remove_var("RING_CONFIG") };
+            None
+        }
+    };
     mistral::MistralLlama::from(
         model_weights
             .iter()
@@ -827,6 +799,7 @@ pub async fn create_local_model(
         tokenizer_config.map(Path::new),
         generation_config.map(Path::new),
         chat_template_literal,
+        ring_config,
     )
     .await
     .map(|x| Arc::new(x) as Arc<dyn Chat>)
@@ -917,40 +890,5 @@ mod tests {
     fn extensionless_path_is_ignored() {
         let path = PathBuf::from("/m/no_extension_here");
         reject_unsafe_weight_formats(&[path], false).expect("no extension → no rejection");
-    }
-
-    fn ring_cfg(node_rank: usize, n: usize) -> DistributedConfig {
-        DistributedConfig {
-            backend: DistributedBackend::Ring,
-            node_rank,
-            nodes: (0..n).map(|i| format!("10.0.0.{i}")).collect(),
-        }
-    }
-
-    #[test]
-    fn validate_accepts_two_node_ring() {
-        ring_cfg(0, 2).validate().expect("2-node ring rank 0 is valid");
-        ring_cfg(1, 2).validate().expect("2-node ring rank 1 is valid");
-    }
-
-    #[test]
-    fn validate_rejects_fewer_than_two_nodes() {
-        assert!(ring_cfg(0, 1).validate().is_err());
-    }
-
-    #[test]
-    fn validate_rejects_non_power_of_two_world_size() {
-        assert!(ring_cfg(0, 3).validate().is_err());
-    }
-
-    #[test]
-    fn validate_rejects_rank_out_of_range() {
-        assert!(ring_cfg(2, 2).validate().is_err());
-    }
-
-    #[test]
-    fn validate_rejects_ring_world_size_other_than_two() {
-        // 4 is a power of two and the rank is in range, but `ring` only supports 2.
-        assert!(ring_cfg(0, 4).validate().is_err());
     }
 }
