@@ -486,7 +486,7 @@ pub struct McpConfig {
 pub struct Flight {
     pub max_message_size: Option<String>,
 
-    /// Controls how DataFusion execution batch size is selected for Flight `DoGet` result streams.
+    /// Controls how `DataFusion` execution batch size is selected for Flight `DoGet` result streams.
     /// Defaults to adaptive sizing capped at 131072 rows per batch.
     #[serde(default, skip_serializing_if = "is_default")]
     pub batch_size: FlightBatchSize,
@@ -518,7 +518,7 @@ impl Default for Flight {
 #[serde(deny_unknown_fields)]
 #[serde(rename_all = "snake_case", tag = "mode")]
 pub enum FlightBatchSize {
-    /// Use the session's configured DataFusion execution batch size.
+    /// Use the session's configured `DataFusion` execution batch size.
     Default,
     /// Increase the batch size for large estimated Flight result sets, capped by `max`.
     Adaptive { max: usize },
