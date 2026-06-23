@@ -190,9 +190,18 @@ fn construct_logical_plan(
             .iter()
             .map(|pk| SortExpr::new(col(pk.clone()), true, true)),
     );
-    scan.project(columns)?
-        .sort_with_limit(sort_exprs, limit)?
-        .build()
+    // Use a plain sort followed by a limit rather than `sort_with_limit`. A
+    // fetch-bearing sort lowers to a TopK `SortExec` plus a
+    // `SortPreservingMergeExec`; under DataFusion 54 that merge can end up
+    // requiring an ordering its (unordered) child does not provide, failing
+    // physical planning ("does not satisfy order requirements ... Child-0 order:
+    // []"). Splitting the sort and the limit keeps ordering enforcement correct
+    // (this matches the aggregation path in `reciprocal_rank`).
+    let mut plan = scan.project(columns)?.sort(sort_exprs)?;
+    if let Some(limit) = limit {
+        plan = plan.limit(0, Some(limit))?;
+    }
+    plan.build()
 }
 
 /// Convert each keyword into an `ILIKE %keyword%` [`Expr`].
