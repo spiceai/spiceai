@@ -280,10 +280,15 @@ impl IcebergSchemaProvider {
     /// distributed-plan deserialization, where no async context is available.
     #[must_use]
     pub fn table_sync(&self, name: &str) -> Option<Arc<dyn TableProvider>> {
+        // Recover a poisoned lock (as `refresh` does) rather than returning
+        // `None`: an unrelated panic must not make a table appear to vanish,
+        // which would surface as a confusing "table not registered" error during
+        // distributed scan reconstruction on an executor.
         self.tables
             .read()
-            .ok()
-            .and_then(|tables| tables.get(name).cloned())
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(name)
+            .cloned()
     }
 
     /// Returns a reference to the underlying Iceberg catalog client.
