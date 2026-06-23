@@ -2625,7 +2625,6 @@ fn pk_bloom_hash(bytes: &[u8], seed: u64) -> u64 {
 
 /// Routing seed for PK-shard assignment — distinct from the bloom's hashing seeds
 /// so shard placement is independent of bloom bit positions.
-#[allow(dead_code)] // Phase 3: consumed by sharded write/validate routing
 const PK_SHARD_SEED: u64 = 0x243f_6a88_85a3_08d3;
 
 /// Map a primary key to one of `n` shards by hashing its `RowConverter`-encoded
@@ -2637,7 +2636,6 @@ const PK_SHARD_SEED: u64 = 0x243f_6a88_85a3_08d3;
 /// hash this same byte string, or the same logical key routes to two shards,
 /// splitting its version history and breaking last-writer-wins. `n <= 1` is the
 /// unsharded fast path and always returns shard 0.
-#[allow(dead_code)] // Phase 3: consumed by sharded write/validate routing
 #[inline]
 fn shard_of_pk(owned_row_bytes: &[u8], n: usize) -> usize {
     if n <= 1 {
@@ -2963,6 +2961,12 @@ impl ShardedPkIndex {
     /// validation against this shard observes the prior MISS-path appends (the
     /// §3.4 / Review-4 HOLE-3 intra-apply-dup window is closed jointly by this
     /// insert and the per-apply `incoming_keys` set).
+    ///
+    /// NOTE: unlike `record_pk_keys_with_location`, this intentionally does NOT do
+    /// per-insert over-budget exact→bloom conversion. The sharded path recomputes
+    /// the keyset byte tally ONCE after all per-shard appends (recompute-once), so a
+    /// shard never converts exact→bloom mid-life — a deliberate divergence, not an
+    /// oversight.
     fn record_keys_in_shard(
         &mut self,
         shard: usize,
@@ -7556,7 +7560,6 @@ impl CayenneTableProvider {
         self.table_memory.set_keyset_bytes(bytes);
     }
 
-
     pub(crate) fn record_file_pk_keys(&self, keys: &HashSet<OwnedRow>) {
         self.record_pk_keys_with_location(keys, &RowLocation::FileUnlocated);
     }
@@ -7799,7 +7802,6 @@ impl CayenneTableProvider {
     /// so it is safe to run before (or concurrently with) the serial
     /// validate->append. The routing is keyed on the `OwnedRow` bytes so it agrees
     /// with the per-shard bloom/keyset and tombstone routing (see [`shard_of_pk`]).
-    #[allow(dead_code)] // Phase 3: consumed by the sharded append path
     fn split_batch_by_pk_shard(
         &self,
         batch: &RecordBatch,
@@ -9089,8 +9091,11 @@ impl CayenneTableProvider {
         // shard segment of this apply. Applies are serialized by `write_lock` (the
         // caller holds it), so a plain `fetch_add` is strictly monotone across
         // applies — the runtime's slot deferral keys on this commensurable quantity,
-        // and the all-shards-atomic checkpoint reconciles durable coverage by MIN
-        // over it. (Per-shard `MemTier::epoch` values are incommensurable: two
+        // and the all-shards-atomic checkpoint reconciles durable coverage by MAX
+        // over it — every applied epoch <= the captured max is durable under the
+        // all-shards-atomic full-prefix flush, so a MIN would only UNDER-ack (pin
+        // the slot at a cold shard, stalling the WAL). (Per-shard `MemTier::epoch`
+        // values are incommensurable: two
         // distinct bursts can collide on the same per-shard integer, so a `min`/`max`
         // over them is NOT a source watermark — the data-loss hole this fixes.)
         let apply_epoch = self
@@ -9154,9 +9159,9 @@ impl CayenneTableProvider {
         Ok(ShardedApplyResult {
             // The shared per-apply slot-ack epoch (§3.4 Fix 1), NOT a max over the
             // per-shard `MemTier::epoch`s. The runtime defers this apply's source
-            // commit on this value; the checkpoint reports it durable (MIN over
-            // shard coverage) once every shard that received this apply's rows is
-            // flushed.
+            // commit on this value; the checkpoint reports it durable (the MAX
+            // captured epoch — safe under the all-shards-atomic full-prefix flush)
+            // once every shard that received this apply's rows is flushed.
             epoch: apply_epoch,
             superseded: u64::try_from(combined.total_superseded()).unwrap_or(u64::MAX),
             on_conflict_deletions: combined,

@@ -1851,8 +1851,9 @@ impl RefreshTask {
         // shards (NOT a per-shard max, which would be incommensurable across
         // bursts). A given table's shard count is fixed for its lifetime, so this
         // axis is consistent within one table's FIFO commit queue. The cayenne
-        // checkpoint reports the MIN over fully-durable shard coverage on the SAME
-        // axis (the lockstep fire side), so this `max`-then-`on_checkpoint_durable`
+        // checkpoint reports the MAX captured epoch on the SAME axis (safe because
+        // the capture is all-shards-atomic over each shard's full prefix; a MIN
+        // would under-ack and stall the slot), so this `max`-then-`on_checkpoint_durable`
         // (`<=` FIFO drain) is correct unchanged for both N==1 and N>1.
         let mut max_in_memory_epoch: Option<u64> = None;
         for (op_type, row_indices) in sub_batches {

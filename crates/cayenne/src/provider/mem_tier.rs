@@ -546,16 +546,13 @@ impl MemTier {
 /// A fixed fan-out of independent [`MemTier`] shards, each its own `ArcSwap` so
 /// a single shard's append/checkpoint swap is O(1) and lock-free for readers.
 ///
-/// Phase 2 of the in-memory CDC intra-apply parallelism rollout: this is the
-/// **A/B-neutral skeleton**. Every provider is constructed with [`Self::empty`]`(1)`
-/// — a single shard — so behavior is byte-for-byte identical to the prior single
-/// `ArcSwap<MemTier>` field. Existing call sites reach the one shard through
-/// [`Self::tier`], which `debug_assert!`s the N==1 invariant so no multi-shard
-/// path can slip through before Phase 3 wires the real sharded
-/// append/validation/checkpoint. The fan-out becomes `> 1` only in Phase 3+, at
-/// which point the [`Self::tier`] sites migrate to explicit per-shard routing.
+/// The fan-out N is set per table by `cdc_mem_tier_shards` (default 1) and is
+/// fixed for the table's lifetime. At N=1 it is byte-for-byte identical to the
+/// prior single `ArcSwap<MemTier>` field — the sharded append/validation/read/
+/// checkpoint paths all collapse to the single-shard case. At N>1 one CDC apply
+/// is fanned across the shards, which validate + append concurrently.
 ///
-/// Shard assignment (Phase 3) is by the PK `OwnedRow` bytes (see
+/// Shard assignment is by the PK `OwnedRow` bytes (see
 /// `table::shard_of_pk`), NOT the derived big-endian-i64 encoding — sharding a
 /// derived artifact would split a key's history across shards and break
 /// last-writer-wins. The byte/age caps and checkpoints are **whole-tier**
@@ -569,12 +566,6 @@ pub(crate) struct ShardedMemTier {
     shards: Box<[ArcSwap<MemTier>]>,
 }
 
-// The per-shard / whole-tier API is consumed by the sharded append/validation
-// (Phase 3) and the sharded read path (Phase 4). `tier()` remains the N==1
-// compatibility shim for the not-yet-sharded checkpoint capture (Phase 5). The
-// `allow(dead_code)` is retained as a harmless guard while the last shim sites
-// are migrated.
-#[allow(dead_code)]
 impl ShardedMemTier {
     /// `n` empty shards (`n` is clamped to `>= 1`). Phase 2 always passes `1`;
     /// the multi-shard path is exercised only once Phase 3 sizes the fan-out.
@@ -593,11 +584,11 @@ impl ShardedMemTier {
         self.shards.len()
     }
 
-    /// The single backing tier — **VALID ONLY at N==1**. This is the Phase-2
-    /// compatibility accessor: every legacy `self.mem_tier.{load,store,load_full}`
-    /// site reaches the one shard through here. The `debug_assert!` pins that no
-    /// N>1 path reaches a site still assuming a single tier; Phase 3 replaces
-    /// these call sites with explicit per-shard routing and removes this shim.
+    /// Test-only convenience accessor for the single backing tier at N==1.
+    /// Production code uses `shard(i)` / `shards()` directly; this exists so unit
+    /// tests can assert on the lone shard. The `debug_assert!` pins the N==1
+    /// assumption (a test that builds N>1 and calls this is the bug).
+    #[cfg(test)]
     #[must_use]
     #[inline]
     pub(crate) fn tier(&self) -> &ArcSwap<MemTier> {
@@ -735,28 +726,7 @@ impl ShardedMemTier {
         }
     }
 
-    /// A cheap order-insensitive combination of every shard's content `version`
-    /// — the per-shard version VECTOR collapsed to one `u64` for the
-    /// `merged_scan_deletions` memo key. It changes when ANY shard's version
-    /// moves (an append/clear on that shard), so the memo invalidates on any
-    /// shard mutation, exactly as the single-tier `version` did at N==1. At
-    /// N==1 this returns shard 0's `version` unchanged (the multiplier and the
-    /// XOR fold are identities over a single element), so the memo key is
-    /// byte-identical to the pre-shard scheme.
-    #[must_use]
-    pub(crate) fn version_hash(&self) -> u64 {
-        // N==1 fast path: return shard 0's raw `version` UNCHANGED so the memo
-        // key — and the append-path `memo.tier_version == cur.version`
-        // lockstep-extend comparison, which compares against the raw single-tier
-        // `version` — are byte-identical to the pre-shard scheme.
-        if self.shards.len() == 1 {
-            return self.shards[0].load().version;
-        }
-        let snapshots: Vec<Arc<MemTier>> = self.shards.iter().map(ArcSwap::load_full).collect();
-        Self::version_hash_of(&snapshots)
-    }
-
-    /// `version_hash` over a set of CAPTURED shard snapshots (the scan path,
+    /// A cheap order-insensitive combination of a set of CAPTURED shard snapshots'
     /// which already pinned `Vec<Arc<MemTier>>`). Identical semantics: N==1
     /// returns shard 0's raw `version` (byte-identical memo key); N>1 hashes the
     /// version vector.
