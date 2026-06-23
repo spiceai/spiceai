@@ -39,6 +39,7 @@ use super::delete::{
 };
 use super::mutation_writer::AppendMutationWriter;
 use super::streaming::StreamingExec;
+use crate::bounded_fifo::BoundedFifoSet;
 use crate::catalog::{CatalogError, CatalogResult, MetadataCatalog, SnapshotSequenceCommit};
 use crate::maintained_aggregate::{MaintainedAggregateRegistry, MaintainedAggregateSpec};
 use crate::metadata::{
@@ -50,6 +51,7 @@ use crate::provider::scan::{
 };
 use crate::provider::sink::CayenneDataSink;
 use crate::provider::{Error, Result};
+use crate::resource_starvation::ResourceStarvationTracker;
 use arrow::array::{
     Array, ArrayRef, BinaryArray, BinaryViewArray, BooleanArray, Date32Array, Date64Array,
     Decimal128Array, FixedSizeBinaryArray, Float32Array, Float64Array, Int8Array, Int16Array,
@@ -181,45 +183,9 @@ const MAINTAINED_AGGREGATE_APPLY_QUEUE_DEPTH: usize = 1024;
 /// default 10s) — a fixed count of 30 would have meant anywhere from one
 /// minute to thirty minutes of silent starvation depending on the live
 /// interval. See `compact_protected_snapshots_subset_inner` and
-/// [`PositionCompactionSkipStreak`].
+/// [`ResourceStarvationTracker`].
 const POSITION_COMPACTION_SKIP_WARN_AFTER: Duration = Duration::from_secs(30);
 
-/// One starvation episode of writer-active position-compaction skips:
-/// consecutive skip count plus when the episode began, so the WARN escalation
-/// is wall-clock-based and independent of the (dynamically tuned) compactor
-/// cadence. Cold-path state — touched at most once per background wake —
-/// behind a short-held mutex.
-#[derive(Debug, Default)]
-struct PositionCompactionSkipStreak {
-    /// Consecutive skips in the current episode (`0` = no live episode).
-    skips: usize,
-    /// When the current episode's first skip happened.
-    since: Option<Instant>,
-    /// Whether this episode already escalated to WARN (one-shot per episode).
-    warned: bool,
-}
-
-impl PositionCompactionSkipStreak {
-    /// Record one skipped compaction attempt at `now`. Returns
-    /// `Some(consecutive_skips)` exactly once per episode — when the episode's
-    /// wall-clock age first reaches `warn_after` — so the caller emits the WARN
-    /// then and only then.
-    fn record_skip(&mut self, now: Instant, warn_after: Duration) -> Option<usize> {
-        self.skips = self.skips.saturating_add(1);
-        let since = *self.since.get_or_insert(now);
-        if !self.warned && now.duration_since(since) >= warn_after {
-            self.warned = true;
-            return Some(self.skips);
-        }
-        None
-    }
-
-    /// A compaction attempt acquired the writer lock — the episode (if any) is
-    /// over; the next skip starts a fresh one (and may WARN again).
-    fn reset(&mut self) {
-        *self = Self::default();
-    }
-}
 const MIN_CONSECUTIVE_INLIST_REWRITE_VALUES: usize = 4;
 /// Upper bound on PK `IN` list cardinality that qualifies for `target_partitions = 1`.
 const MAX_PK_SELECTIVE_INLIST_VALUES: usize = 32;
@@ -227,29 +193,6 @@ const MAX_PK_SELECTIVE_INLIST_VALUES: usize = 32;
 const MAX_PK_SELECTIVE_RANGE_SPAN: i64 = 32;
 /// Maximum tombstone keys pushed into the Vortex scan predicate as `NOT IN`.
 const MAX_VORTEX_KEY_DELETE_PUSHDOWN: usize = 256;
-
-#[derive(Debug, Default)]
-struct BoundedWarningKeys {
-    seen: HashSet<String>,
-    insertion_order: VecDeque<String>,
-}
-
-impl BoundedWarningKeys {
-    fn insert_new(&mut self, key: String, limit: usize) -> bool {
-        if self.seen.contains(&key) {
-            return false;
-        }
-
-        if self.seen.len() >= limit
-            && let Some(oldest_key) = self.insertion_order.pop_front()
-        {
-            self.seen.remove(&oldest_key);
-        }
-
-        self.insertion_order.push_back(key.clone());
-        self.seen.insert(key)
-    }
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SnapshotMaintenanceTrigger {
@@ -265,18 +208,17 @@ enum SnapshotMaintenanceTrigger {
 }
 
 fn should_warn_protected_snapshot_age(
-    warning_keys: &ParkingMutex<BoundedWarningKeys>,
+    warning_keys: &ParkingMutex<BoundedFifoSet>,
     snapshot_id: &str,
     warning_kind: &'static str,
 ) -> bool {
-    let key = format!("{warning_kind}:{snapshot_id}");
     warning_keys
         .lock()
-        .insert_new(key, PROTECTED_SNAPSHOT_AGE_WARNING_KEY_LIMIT)
+        .insert_new(format!("{warning_kind}:{snapshot_id}"))
 }
 
 fn protected_snapshot_age(
-    warning_keys: &ParkingMutex<BoundedWarningKeys>,
+    warning_keys: &ParkingMutex<BoundedFifoSet>,
     snapshot_id: &str,
     now: SystemTime,
 ) -> Option<Duration> {
@@ -326,7 +268,7 @@ fn protected_snapshot_age(
 }
 
 fn oldest_protected_snapshot_age(
-    warning_keys: &ParkingMutex<BoundedWarningKeys>,
+    warning_keys: &ParkingMutex<BoundedFifoSet>,
     protected_snapshots: &HashMap<String, i64>,
     now: SystemTime,
 ) -> Option<Duration> {
@@ -341,7 +283,7 @@ fn duration_millis_saturating(duration: Duration) -> u64 {
 }
 
 fn protected_snapshot_maintenance_trigger(
-    warning_keys: &ParkingMutex<BoundedWarningKeys>,
+    warning_keys: &ParkingMutex<BoundedFifoSet>,
     protected_snapshots: &HashMap<String, i64>,
     trigger_count: usize,
     trigger_age: Option<Duration>,
@@ -2025,7 +1967,7 @@ pub struct CayenneTableProvider {
     protected_snapshots: Arc<ArcSwap<HashMap<String, i64>>>,
     /// Table-scoped warning dedupe for protected snapshot ids that cannot
     /// provide a `UUIDv7` timestamp for age-triggered maintenance.
-    protected_snapshot_age_warning_keys: Arc<ParkingMutex<BoundedWarningKeys>>,
+    protected_snapshot_age_warning_keys: Arc<ParkingMutex<BoundedFifoSet>>,
     /// Cached visible primary-key set for auto conflict detection.
     ///
     /// The first auto-mode insert still scans existing data to build the set;
@@ -2345,7 +2287,7 @@ pub struct CayenneTableProvider {
     /// an episode sustained past `POSITION_COMPACTION_SKIP_WARN_AFTER` of
     /// wall-clock time escalates the (otherwise TRACE-level) skip to a
     /// one-shot WARN.
-    position_compaction_skip_streak: Arc<ParkingMutex<PositionCompactionSkipStreak>>,
+    position_compaction_skip_streak: Arc<ParkingMutex<ResourceStarvationTracker>>,
     /// Serializes concurrent compaction passes on this table so a write-driven
     /// inline trigger and the background scheduler can't both rewrite the
     /// current snapshot at the same time. Held across the *entire* trigger
@@ -6152,7 +6094,7 @@ impl CayenneTableProvider {
             )),
             protected_snapshots: Arc::new(ArcSwap::from_pointee(protected_snapshots)),
             protected_snapshot_age_warning_keys: Arc::new(ParkingMutex::new(
-                BoundedWarningKeys::default(),
+                BoundedFifoSet::with_capacity(PROTECTED_SNAPSHOT_AGE_WARNING_KEY_LIMIT),
             )),
             pk_keyset_cache: Arc::new(ParkingMutex::new(None)),
             table_memory,
@@ -6208,7 +6150,7 @@ impl CayenneTableProvider {
             snapshot_last_listed: Arc::new(ParkingMutex::new(HashMap::new())),
             snapshot_scan_refs: Arc::new(ParkingMutex::new(HashMap::new())),
             position_compaction_skip_streak: Arc::new(ParkingMutex::new(
-                PositionCompactionSkipStreak::default(),
+                ResourceStarvationTracker::new(POSITION_COMPACTION_SKIP_WARN_AFTER),
             )),
             new_files_since_last_compaction: Arc::new(AtomicUsize::new(0)),
             last_moved_snapshot_files: Arc::new(ParkingMutex::new(None)),
@@ -12287,11 +12229,10 @@ impl CayenneTableProvider {
                 // WARN, once per starvation episode, on a WALL-CLOCK bound
                 // (the skip cadence follows the dynamically tuned compactor
                 // interval, so a count alone is meaningless).
-                let warn_skips = self
-                    .position_compaction_skip_streak
-                    .lock()
-                    .record_skip(Instant::now(), POSITION_COMPACTION_SKIP_WARN_AFTER);
-                if let Some(consecutive_skips) = warn_skips {
+
+                if let Some(consecutive_skips) =
+                    self.position_compaction_skip_streak.lock().record_denial()
+                {
                     tracing::warn!(
                         target: "cayenne::compaction",
                         table = self.table_metadata.table_name.as_str(),
@@ -20735,59 +20676,6 @@ mod tests {
         ));
     }
 
-    /// The position-compaction starvation WARN is WALL-CLOCK-based and
-    /// one-shot per episode: it fires on the first skip at/after `warn_after`
-    /// of continuous starvation — regardless of how many skips accrued (the
-    /// skip cadence follows the dynamically tuned compactor interval) — stays
-    /// silent for the rest of that episode, and re-arms after a successful
-    /// lock acquisition resets the episode.
-    #[test]
-    fn position_skip_streak_warns_on_wall_clock_once_per_episode() {
-        let warn_after = std::time::Duration::from_secs(30);
-        let t0 = std::time::Instant::now();
-        let sec = std::time::Duration::from_secs;
-
-        // Slow cadence (60s interval): the SECOND skip is already past the
-        // bound — warn at 2 skips, not at some fixed count.
-        let mut streak = PositionCompactionSkipStreak::default();
-        assert_eq!(streak.record_skip(t0, warn_after), None, "episode start");
-        assert_eq!(
-            streak.record_skip(t0 + sec(60), warn_after),
-            Some(2),
-            "60s of starvation crosses the 30s bound"
-        );
-        assert_eq!(
-            streak.record_skip(t0 + sec(120), warn_after),
-            None,
-            "one-shot: no second WARN within the episode"
-        );
-
-        // Fast cadence (2s interval): many skips stay silent until the bound.
-        let mut streak = PositionCompactionSkipStreak::default();
-        for i in 0..15 {
-            assert_eq!(
-                streak.record_skip(t0 + sec(2 * i), warn_after),
-                None,
-                "{}s elapsed is under the 30s bound",
-                2 * i
-            );
-        }
-        assert_eq!(
-            streak.record_skip(t0 + sec(30), warn_after),
-            Some(16),
-            "fires exactly when 30s of wall-clock starvation is reached"
-        );
-
-        // A successful acquisition ends the episode; the next one re-arms.
-        streak.reset();
-        assert_eq!(streak.record_skip(t0 + sec(100), warn_after), None);
-        assert_eq!(
-            streak.record_skip(t0 + sec(140), warn_after),
-            Some(2),
-            "a fresh episode warns again after reset"
-        );
-    }
-
     use datafusion::arrow::array::RecordBatch;
     use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
     use datafusion::catalog::TableProviderFactory;
@@ -21053,7 +20941,9 @@ mod tests {
     #[test]
     fn protected_snapshot_maintenance_trigger_uses_compaction_count_threshold() {
         let now = UNIX_EPOCH + Duration::from_secs(1_000);
-        let warning_keys = ParkingMutex::new(BoundedWarningKeys::default());
+        let warning_keys = ParkingMutex::new(BoundedFifoSet::with_capacity(
+            PROTECTED_SNAPSHOT_AGE_WARNING_KEY_LIMIT,
+        ));
         let protected_snapshots =
             HashMap::from([("snapshot-1".to_string(), 1), ("snapshot-2".to_string(), 2)]);
 
@@ -21075,7 +20965,9 @@ mod tests {
     #[test]
     fn protected_snapshot_maintenance_trigger_uses_oldest_snapshot_age() {
         let now = UNIX_EPOCH + Duration::from_secs(1_000);
-        let warning_keys = ParkingMutex::new(BoundedWarningKeys::default());
+        let warning_keys = ParkingMutex::new(BoundedFifoSet::with_capacity(
+            PROTECTED_SNAPSHOT_AGE_WARNING_KEY_LIMIT,
+        ));
         let protected_snapshots = HashMap::from([
             (protected_snapshot_id_at_unix_time(900), 1),
             (protected_snapshot_id_at_unix_time(990), 2),
@@ -21100,7 +20992,9 @@ mod tests {
     #[test]
     fn protected_snapshot_maintenance_trigger_ignores_invalid_uuid_for_age() {
         let now = UNIX_EPOCH + Duration::from_secs(1_000);
-        let warning_keys = ParkingMutex::new(BoundedWarningKeys::default());
+        let warning_keys = ParkingMutex::new(BoundedFifoSet::with_capacity(
+            PROTECTED_SNAPSHOT_AGE_WARNING_KEY_LIMIT,
+        ));
         let protected_snapshots = HashMap::from([("not-a-uuid".to_string(), 1)]);
 
         assert_eq!(
@@ -21118,7 +21012,9 @@ mod tests {
     #[test]
     fn protected_snapshot_maintenance_trigger_ignores_future_uuid_for_age() {
         let now = UNIX_EPOCH + Duration::from_secs(1_000);
-        let warning_keys = ParkingMutex::new(BoundedWarningKeys::default());
+        let warning_keys = ParkingMutex::new(BoundedFifoSet::with_capacity(
+            PROTECTED_SNAPSHOT_AGE_WARNING_KEY_LIMIT,
+        ));
         let protected_snapshots = HashMap::from([(protected_snapshot_id_at_unix_time(1_100), 1)]);
 
         assert_eq!(

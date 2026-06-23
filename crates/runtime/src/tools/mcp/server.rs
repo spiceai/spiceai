@@ -27,6 +27,7 @@ use rmcp::{
 };
 use serde_json::{Map, Value, json};
 use std::{borrow::Cow, future::Future, ops::Deref, sync::Arc};
+use tracing_futures::Instrument;
 use util::security::{MAX_SAFE_JSON_DEPTH, get_json_depth};
 
 #[derive(Clone)]
@@ -112,10 +113,49 @@ impl ServerHandler for RuntimeServer {
                     }
                 }
 
-                return mcp_proxy
+                // Record the proxied call in task history so tool calls made
+                // through the `/v1/mcp` gateway are audited identically to
+                // model-driven tool calls (see `McpToolWrapper::call`). Without
+                // this, gateway tool calls bypass the task_history span entirely.
+                let input = serde_json::to_string(&arguments).unwrap_or_default();
+
+                // Security: Validate serialized argument size to prevent DoS,
+                // matching the non-proxy path below. `/v1/mcp` is externally
+                // accessible, so reject oversized payloads before logging them
+                // to task history or forwarding them upstream.
+                if input.len() > MAX_ARGS_SIZE {
+                    return Err(McpError::invalid_params(
+                        format!(
+                            "Arguments too large ({} bytes). Maximum: {MAX_ARGS_SIZE} bytes",
+                            input.len()
+                        ),
+                        None,
+                    ));
+                }
+
+                let task_name = format!("tool_use::{tool_name}");
+                let mcp_server = tool_name
+                    .split_once('/')
+                    .map_or_else(|| tool_name.to_string(), |(server, _)| server.to_string());
+                let span = tracing::span!(target: "task_history", tracing::Level::INFO, "tool_use::mcp", tool = %tool_name, input = %input);
+                tracing::info!(target: "task_history", parent: &span, task_override = %task_name, mcp_server = %mcp_server, "labels");
+
+                return match mcp_proxy
                     .call_tool(arguments)
+                    .instrument(span.clone())
                     .await
-                    .map_err(|e| McpError::internal_error(e.to_string(), None));
+                {
+                    Ok(result) => {
+                        if let Ok(captured_output) = serde_json::to_string(&result.content) {
+                            tracing::info!(target: "task_history", parent: &span, captured_output = %captured_output);
+                        }
+                        Ok(result)
+                    }
+                    Err(e) => {
+                        tracing::error!(target: "task_history", parent: &span, "{e}");
+                        Err(McpError::internal_error(e.to_string(), None))
+                    }
+                };
             }
 
             let args = serde_json::to_string(&arguments)
