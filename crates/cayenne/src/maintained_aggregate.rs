@@ -400,17 +400,10 @@ impl MaintainedAggregateRegistry {
     ) -> DataFusionResult<()> {
         let mut state = self.state.write();
 
-        // Async write-path maintenance must apply deltas in visibility-epoch
-        // order. If a delayed task observes a skipped or already-advanced epoch,
-        // fail safe and force queries back to the base table.
-        if epoch != state.epoch.saturating_add(1) {
-            state.epoch = state.epoch.max(epoch);
-            state.status = RegistryStatus::Stale;
-            return Ok(());
-        }
-
-        state.epoch = epoch;
-        if state.status == RegistryStatus::Stale || state.views.is_empty() {
+        // Async write-path maintenance must apply deltas in strict
+        // visibility-epoch order; an out-of-order/skipped epoch or an
+        // already-stale registry short-circuits (see `begin_maintenance_pass`).
+        if !begin_maintenance_pass(&mut state, epoch) {
             return Ok(());
         }
 
@@ -441,14 +434,7 @@ impl MaintainedAggregateRegistry {
     pub fn apply_pk_deletes(&self, epoch: u64, pk_batch: &RecordBatch) -> DataFusionResult<()> {
         let mut state = self.state.write();
 
-        if epoch != state.epoch.saturating_add(1) {
-            state.epoch = state.epoch.max(epoch);
-            state.status = RegistryStatus::Stale;
-            return Ok(());
-        }
-
-        state.epoch = epoch;
-        if state.status == RegistryStatus::Stale || state.views.is_empty() {
+        if !begin_maintenance_pass(&mut state, epoch) {
             return Ok(());
         }
 
@@ -606,10 +592,13 @@ impl MaintainedAggregateView {
             .iter()
             .map(|aggregate| match &aggregate.column {
                 None => Ok(None),
-                Some(column) => Ok(Some(ScalarValue::try_from_array(
-                    batch.column(column.index),
-                    row,
-                )?)),
+                Some(column) => {
+                    let scalar = ScalarValue::try_from_array(batch.column(column.index), row)?;
+                    // A NULL aggregate input contributes nothing; store `None`
+                    // rather than a typed-NULL scalar (smaller, and retraction
+                    // treats both identically as "contributed nothing").
+                    Ok((!scalar.is_null()).then_some(scalar))
+                }
             })
             .collect()
     }
@@ -1325,6 +1314,25 @@ fn scalar_for_field(
         scalar.data_type(),
         field.data_type()
     )))
+}
+
+/// Enforce the strict per-epoch ordering at the start of a mutating pass.
+/// Returns `true` to proceed, `false` (after updating `state`) to short-circuit:
+/// an out-of-order/skipped epoch clears the indexes and marks the registry stale
+/// — freeing the now-unservable index for the rest of the table lifetime, since
+/// it will not serve again until a rebuild — and an already-stale or empty
+/// registry simply returns. Shared by `apply_insert_batches`/`apply_pk_deletes`.
+fn begin_maintenance_pass(state: &mut RegistryState, epoch: u64) -> bool {
+    if epoch != state.epoch.saturating_add(1) {
+        state.epoch = state.epoch.max(epoch);
+        state.status = RegistryStatus::Stale;
+        for view in &mut state.views {
+            view.clear();
+        }
+        return false;
+    }
+    state.epoch = epoch;
+    !(state.status == RegistryStatus::Stale || state.views.is_empty())
 }
 
 /// Finalize a maintenance pass: if `failure` is set, or the per-PK index now

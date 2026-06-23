@@ -13335,9 +13335,17 @@ impl CayenneTableProvider {
         let Some(tx) = &self.maintained_aggregate_tx else {
             return;
         };
-        if tx.send(msg).await.is_err() {
+        if let Err(send_err) = tx.send(msg).await {
+            // The applier returns the unsent message; log its epoch + kind so a
+            // fall-back-to-base-scan is diagnosable (which delta, at which epoch).
+            let (epoch, kind) = match send_err.0 {
+                MaintainedAggregateApply::Insert { epoch, .. } => (epoch, "insert"),
+                MaintainedAggregateApply::Delete { epoch, .. } => (epoch, "delete"),
+            };
             tracing::warn!(
                 table = %self.table_metadata.table_name,
+                epoch,
+                kind,
                 "Maintained-aggregate applier is unavailable; marking stale — queries fall back to base table scans"
             );
             self.mark_maintained_aggregates_stale();
