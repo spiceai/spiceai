@@ -23,13 +23,13 @@ use std::{
 };
 
 use chrono::{DateTime, Utc};
+use crate::{Result, TokenProvider};
 use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
 use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
 use snafu::prelude::*;
 use std::hash::Hash;
 use std::hash::Hasher;
-use crate::{Result, TokenProvider};
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tokio::time::sleep;

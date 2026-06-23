@@ -23,8 +23,8 @@ use crate::component::metrics::MetricsProvider;
 use crate::component::metrics::MetricsProviderComponent;
 use crate::datafusion::error::find_datafusion_root;
 use crate::federated_table::FederatedTable;
-use crate::parameters::ParameterSpec;
-use crate::parameters::Parameters;
+pub use crate::parameters::ParameterSpec;
+pub use crate::parameters::Parameters;
 use arrow_schema::SchemaRef;
 use arrow_tools::schema::schema_meta_get_computed_columns;
 use async_trait::async_trait;
@@ -185,6 +185,7 @@ pub mod sink;
 pub mod spiceai;
 
 #[derive(Debug, Snafu)]
+#[snafu(visibility(pub))]
 pub enum DataConnectorError {
     #[snafu(display("Cannot connect to the {connector_component} ({dataconnector}). {source}"))]
     UnableToConnectInternal {
