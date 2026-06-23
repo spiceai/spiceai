@@ -229,7 +229,25 @@ fn spawn_control_stream(
                                 })),
                             };
 
-                            if heartbeat_tx.send(msg).await.is_err() {
+                            // DIAG: measure how long the heartbeat send blocks on the
+                            // bounded(32) outbound channel + channel free-slot count.
+                            // If send_ms grows large and cap_before==0, the channel is
+                            // full (downstream gRPC stream backpressured) -> heartbeat
+                            // starvation -> scheduler expires this alive executor.
+                            let __hb_start = std::time::Instant::now();
+                            let __hb_cap_before = heartbeat_tx.capacity();
+                            let __hb_res = heartbeat_tx.send(msg).await;
+                            let __hb_ms = __hb_start.elapsed().as_millis() as u64;
+                            tracing::warn!(
+                                target: "diag_hb",
+                                executor_id = %heartbeat_executor_id,
+                                send_ms = __hb_ms,
+                                cap_before = __hb_cap_before,
+                                cap_after = heartbeat_tx.capacity(),
+                                max_cap = heartbeat_tx.max_capacity(),
+                                "DIAG heartbeat send"
+                            );
+                            if __hb_res.is_err() {
                                 break;
                             }
                         }
