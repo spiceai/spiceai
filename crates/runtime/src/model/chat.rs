@@ -351,7 +351,20 @@ fn parse_distributed_config(
         .map(|s| s.trim().to_ascii_lowercase())
         .as_deref()
     {
-        None | Some("") | Some("none") => return Ok(None),
+        None | Some("") | Some("none") => {
+            // Distributed is off: reject orphan topology params so forgetting (or
+            // mistyping) `distributed_backend` doesn't silently run single-node
+            // while `nodes`/`node_rank` look configured.
+            if params.get("nodes").expose().ok().is_some()
+                || params.get("node_rank").expose().ok().is_some()
+            {
+                return Err(LlmError::InvalidParamValueError {
+                    param: "distributed_backend".to_string(),
+                    message: "`nodes`/`node_rank` are set but `distributed_backend` is not `ring`; set `distributed_backend: ring` to enable multi-node inference, or remove `nodes`/`node_rank`.".to_string(),
+                });
+            }
+            return Ok(None);
+        }
         Some("ring") => llms::chat::DistributedBackend::Ring,
         Some(other) => {
             return Err(LlmError::InvalidParamValueError {
@@ -850,5 +863,120 @@ mod test {
                 .iter()
                 .any(|(k, v)| k == "max_completion_tokens" && v == &Value::Number(1.into()))
         );
+    }
+
+    #[cfg(feature = "models")]
+    fn distributed_params(pairs: &[(&str, &str)]) -> Parameters {
+        Parameters::new(
+            pairs
+                .iter()
+                .map(|&(k, v)| (k.to_string(), SecretString::from(v.to_string())))
+                .collect(),
+            "huggingface",
+            crate::model::params::huggingface::PARAMETERS,
+        )
+    }
+
+    #[cfg(feature = "models")]
+    #[test]
+    fn distributed_absent_is_single_node() {
+        let params = distributed_params(&[]);
+        assert!(
+            parse_distributed_config(&params)
+                .expect("no distributed params is valid")
+                .is_none()
+        );
+    }
+
+    #[cfg(feature = "models")]
+    #[test]
+    fn distributed_none_is_single_node() {
+        let params = distributed_params(&[("distributed_backend", "none")]);
+        assert!(
+            parse_distributed_config(&params)
+                .expect("`none` backend is valid")
+                .is_none()
+        );
+    }
+
+    #[cfg(feature = "models")]
+    #[test]
+    fn distributed_ring_parses_topology() {
+        let params = distributed_params(&[
+            ("distributed_backend", "ring"),
+            ("nodes", "10.0.0.1, 10.0.0.2"),
+            ("node_rank", "1"),
+        ]);
+        let cfg = parse_distributed_config(&params)
+            .expect("valid ring config")
+            .expect("ring config is Some");
+        assert_eq!(cfg.backend, llms::chat::DistributedBackend::Ring);
+        assert_eq!(cfg.node_rank, 1);
+        assert_eq!(
+            cfg.nodes,
+            vec!["10.0.0.1".to_string(), "10.0.0.2".to_string()]
+        );
+    }
+
+    #[cfg(feature = "models")]
+    #[test]
+    fn distributed_backend_is_case_insensitive() {
+        let params = distributed_params(&[
+            ("distributed_backend", "Ring"),
+            ("nodes", "10.0.0.1,10.0.0.2"),
+        ]);
+        let cfg = parse_distributed_config(&params)
+            .expect("mixed-case backend is valid")
+            .expect("ring config is Some");
+        assert_eq!(cfg.backend, llms::chat::DistributedBackend::Ring);
+    }
+
+    #[cfg(feature = "models")]
+    #[test]
+    fn distributed_rejects_unknown_backend() {
+        let params = distributed_params(&[("distributed_backend", "nccl")]);
+        let err = parse_distributed_config(&params).expect_err("unknown backend is invalid");
+        assert!(matches!(
+            err,
+            LlmError::InvalidParamValueError { ref param, .. } if param == "distributed_backend"
+        ));
+    }
+
+    #[cfg(feature = "models")]
+    #[test]
+    fn distributed_ring_requires_nodes() {
+        let params = distributed_params(&[("distributed_backend", "ring")]);
+        let err = parse_distributed_config(&params).expect_err("ring without nodes is invalid");
+        assert!(matches!(
+            err,
+            LlmError::InvalidParamValueError { ref param, .. } if param == "nodes"
+        ));
+    }
+
+    #[cfg(feature = "models")]
+    #[test]
+    fn distributed_rejects_rank_out_of_range() {
+        let params = distributed_params(&[
+            ("distributed_backend", "ring"),
+            ("nodes", "10.0.0.1,10.0.0.2"),
+            ("node_rank", "2"),
+        ]);
+        let err = parse_distributed_config(&params).expect_err("rank >= world size is invalid");
+        assert!(matches!(
+            err,
+            LlmError::InvalidParamValueError { ref param, .. } if param == "node_rank"
+        ));
+    }
+
+    #[cfg(feature = "models")]
+    #[test]
+    fn distributed_rejects_orphan_nodes_without_backend() {
+        let params = distributed_params(&[("nodes", "10.0.0.1,10.0.0.2")]);
+        let err =
+            parse_distributed_config(&params).expect_err("nodes without ring backend is invalid");
+        assert!(matches!(
+            err,
+            LlmError::InvalidParamValueError { ref param, .. } if param == "distributed_backend"
+        ));
     }
 }
