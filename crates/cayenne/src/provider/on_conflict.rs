@@ -278,7 +278,7 @@ impl DeletionSink for PkKeysetInvalidatingDeletionSink {
             // ever produces a redundant key-based delete tombstone on a later
             // re-insert of that PK, which masks no prior version (none exists)
             // and is harmless — exactly the false-positive invariant documented
-            // on `PkBloom` (table.rs ~1896-1902) and exercised on the upsert
+            // on `PkBloom` (see `provider::pk_index::PkBloom`) and exercised on the upsert
             // existence path in `apply_on_conflict_to_batch` (both the Exact arm
             // at ~6106 and the Bloom arm at ~6159 keep the row and emit at most a
             // no-op delete). So for upsert tables we SKIP the clear entirely and
@@ -332,7 +332,7 @@ impl DeletionSink for InlineAwareDeletionSink {
             // This is a FILTER-based DELETE, so the deleted PK set is not in hand
             // here. For an `Upsert` table a stale-present existence entry only
             // yields a harmless redundant delete on a later re-insert (the
-            // `PkBloom` false-positive invariant, table.rs ~1896-1902), so we SKIP
+            // `PkBloom` false-positive invariant, see `provider::pk_index::PkBloom`), so we SKIP
             // the clear and avoid the O(live-rows) `load_existing_keyset` rebuild
             // the next insert batch would pay. `DoNothing` tables need exactness
             // (a stale entry would wrongly drop a new row) and keep the full clear.

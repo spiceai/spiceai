@@ -297,7 +297,7 @@ The same primitives produce visibly different trees depending on whether the wor
 
 ## 3. In-memory state — an ontology
 
-`CayenneTableProvider` carries ~57 fields of in-memory state (defined at `provider/table.rs:1894`). They are *not* all "data" and they are *not* all ephemeral. The organizing question is **durability class** — what happens to each on a crash:
+`CayenneTableProvider` carries ~57 fields of in-memory state (the `CayenneTableProvider` struct in `crates/cayenne/src/provider/table.rs`). They are *not* all "data" and they are *not* all ephemeral. The organizing question is **durability class** — what happens to each on a crash:
 
 | Class | Meaning | On crash | Examples |
 |-------|---------|----------|----------|
@@ -306,7 +306,7 @@ The same primitives produce visibly different trees depending on whether the wor
 | **Coordination** | locks, fences, atomics, scheduling flags — no payload | irrelevant (reconstructed empty) | `listing_fence`, `write_lock`, generation counters, staging trackers, GC maps |
 | **Accounting** | memory-pool reservations | irrelevant | `CayenneMemoryAccount`, the global `MemTierBudget` |
 
-> **Are protected snapshots in memory?** Only as a **derived cache**. The `protected_snapshots: Arc<ArcSwap<HashMap<String, i64>>>` field (`table.rs:2012`) maps `snapshot_id → minimum_sequence` for wait-free read-path routing, but it is **not the source of truth**: `load_protected_snapshots` (`table.rs:17511`) rebuilds it from the durable [`cayenne_snapshot_sequence`](#cayenne_snapshot_sequence) table on every open and restart, and writes go to *both* `set_snapshot_sequence` (persist) and `protected_snapshots.rcu(…)` (refresh cache). The protected-snapshot **data** lives in on-disk per-snapshot directories. So protected snapshots are durable; the `ArcSwap` is just the index in front of them.
+> **Are protected snapshots in memory?** Only as a **derived cache**. The `protected_snapshots: Arc<ArcSwap<HashMap<String, i64>>>` field (the `protected_snapshots` field of `CayenneTableProvider` in `crates/cayenne/src/provider/table.rs`) maps `snapshot_id → minimum_sequence` for wait-free read-path routing, but it is **not the source of truth**: the `load_protected_snapshots` method (in `crates/cayenne/src/provider/table.rs`) rebuilds it from the durable [`cayenne_snapshot_sequence`](#cayenne_snapshot_sequence) table on every open and restart, and writes go to *both* `set_snapshot_sequence` (persist) and `protected_snapshots.rcu(…)` (refresh cache). The protected-snapshot **data** lives in on-disk per-snapshot directories. So protected snapshots are durable; the `ArcSwap` is just the index in front of them.
 
 The same caveat applies to almost every "cache" below — the durable backing is named in each cluster.
 
