@@ -142,9 +142,9 @@ aws-smithy-runtime = "1.11.1"
 aws-smithy-runtime-api = "1.11.6"
 aws-smithy-types = "1.4.5"
 axum = { version = "0.8", features = ["macros"] }
-ballista-core = { git = "https://github.com/spiceai/datafusion-ballista.git", rev = "29f95792bf5658b98586ef26a1129aea02ac8140" } # spiceai-54
-ballista-executor = { git = "https://github.com/spiceai/datafusion-ballista.git", rev = "29f95792bf5658b98586ef26a1129aea02ac8140" }
-ballista-scheduler = { git = "https://github.com/spiceai/datafusion-ballista.git", rev = "29f95792bf5658b98586ef26a1129aea02ac8140" }
+ballista-core = { git = "https://github.com/spiceai/datafusion-ballista.git", rev = "a55b851ad88007523390ebb4d22caf6971dacad6" } # phillip/distributed-job-state
+ballista-executor = { git = "https://github.com/spiceai/datafusion-ballista.git", rev = "a55b851ad88007523390ebb4d22caf6971dacad6" }
+ballista-scheduler = { git = "https://github.com/spiceai/datafusion-ballista.git", rev = "a55b851ad88007523390ebb4d22caf6971dacad6" }
 base64 = "0.22.1"
 bb8 = "0.9"
 bb8-postgres = "0.9"
@@ -384,6 +384,11 @@ debug = "line-tables-only"
 incremental = true
 inherits = "dev"
 lto = "off"
+
+[patch."https://github.com/spiceai/datafusion-ballista.git"]
+ballista-core = { path = "/Users/phillip/code/apache/datafusion-ballista/ballista/core" }
+ballista-executor = { path = "/Users/phillip/code/apache/datafusion-ballista/ballista/executor" }
+ballista-scheduler = { path = "/Users/phillip/code/apache/datafusion-ballista/ballista/scheduler" }
 
 [patch.crates-io]
 datafusion = { git = "https://github.com/spiceai/datafusion.git", rev = "33c9881a8ed6b4c6a2691c61d490aafc3cf0bfe9" }

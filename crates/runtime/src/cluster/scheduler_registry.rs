@@ -44,6 +44,7 @@ use crate::metrics::cluster as cluster_metrics;
 
 const DEFAULT_TTL_MS: u64 = 30_000;
 const DISCOVERY_INTERVAL: Duration = Duration::from_secs(5);
+const JOB_RECOVERY_INTERVAL: Duration = Duration::from_secs(10);
 const HEARTBEAT_DIVISOR: u64 = 3;
 
 #[derive(Debug, Snafu)]
@@ -126,13 +127,23 @@ pub async fn start_scheduler_registry(
     let job_store = crate::jobs::JobStore::new(
         Arc::clone(&store),
         base_prefix.clone(),
-        scheduler_id.clone(),
+        instance_id.to_string(),
     );
-    let job_executor = crate::jobs::JobExecutor::new(Arc::new(job_store), rt.datafusion());
-    rt.set_job_executor(Arc::new(job_executor)).await;
+    let job_executor = Arc::new(crate::jobs::JobExecutor::new(
+        Arc::new(job_store),
+        rt.datafusion(),
+    ));
+    rt.set_job_executor(Arc::clone(&job_executor)).await;
     tracing::info!(
         "Initialized async SQL jobs API with state location: {}",
         config.state_location
+    );
+
+    spawn_job_recovery_loop(
+        Arc::clone(&job_executor),
+        Arc::clone(&peers),
+        instance_id,
+        cancel.clone(),
     );
 
     let reaper = Reaper::new(Arc::clone(&cluster), Arc::clone(&heartbeats));
@@ -148,6 +159,70 @@ pub async fn start_scheduler_registry(
     };
 
     runner.run(cancel).await
+}
+
+/// Periodically re-drives running jobs whose owning scheduler is no longer
+/// among the live peers.
+fn spawn_job_recovery_loop(
+    job_executor: Arc<crate::jobs::JobExecutor>,
+    peers: Arc<RwLock<SchedulerPeers>>,
+    instance_id: Uuid,
+    cancel: CancellationToken,
+) {
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(JOB_RECOVERY_INTERVAL);
+        loop {
+            tokio::select! {
+                () = cancel.cancelled() => break,
+                _ = tick.tick() => {
+                    recover_orphaned_jobs(&job_executor, &peers, instance_id).await;
+                }
+            }
+        }
+    });
+}
+
+/// Resumes any running job whose recorded scheduler instance is not currently
+/// live. Each driving scheduler records its own `instance_id` on the job, and
+/// this scheduler's id is always treated as live so it never reclaims its own
+/// in-flight jobs.
+async fn recover_orphaned_jobs(
+    job_executor: &crate::jobs::JobExecutor,
+    peers: &RwLock<SchedulerPeers>,
+    instance_id: Uuid,
+) {
+    let live: HashSet<String> = {
+        let guard = peers.read().await;
+        let mut live: HashSet<String> = guard.values().map(|e| e.instance_id.to_string()).collect();
+        live.insert(instance_id.to_string());
+        live
+    };
+
+    let jobs = match job_executor
+        .list_jobs(Some(crate::jobs::JobStatus::Running))
+        .await
+    {
+        Ok(jobs) => jobs,
+        Err(err) => {
+            tracing::warn!("Failed to list jobs during recovery sweep: {err}");
+            return;
+        }
+    };
+
+    for job in jobs {
+        let driven = job
+            .scheduler_node
+            .as_ref()
+            .is_some_and(|node| live.contains(node));
+        if !driven {
+            tracing::info!(
+                job_id = %job.job_id,
+                scheduler_node = ?job.scheduler_node,
+                "Recovering job orphaned by a lost scheduler"
+            );
+            job_executor.resume(&job.job_id).await;
+        }
+    }
 }
 
 impl SchedulerRegistryRunner {

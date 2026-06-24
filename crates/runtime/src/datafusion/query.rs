@@ -340,7 +340,7 @@ impl Query {
         }
 
         let result = self
-            .submit_distributed_internal(job_id, request_context, span.clone())
+            .submit_distributed_internal(job_id, request_context, span.clone(), false)
             .await;
         if let Err(e) = &result {
             tracing::error!(target: "task_history", parent: &span, "{e}");
@@ -348,12 +348,47 @@ impl Query {
         result
     }
 
-    /// Internal implementation for submitting a distributed query.
+    /// Resumes a distributed query whose owning scheduler was lost, driving the
+    /// recovered execution graph to completion on this scheduler and returning a
+    /// handle to its results. `job_id` must match the original submission.
+    pub async fn resume_distributed(self, job_id: &str) -> Result<QueryHandle> {
+        let request_context = RequestContext::current(AsyncMarker::new().await);
+
+        let span = tracing::span!(
+            target: "task_history",
+            tracing::Level::INFO,
+            "sql_query",
+            input = %self.sql,
+            runtime_query = false,
+            distributed = true,
+            job_id = %job_id,
+            ballista_job_id = tracing::field::Empty,
+            stage_count = tracing::field::Empty,
+            executor_count = tracing::field::Empty,
+            total_tasks = tracing::field::Empty,
+            total_executor_ms = tracing::field::Empty,
+        );
+
+        if let Some(traceparent) = request_context.trace_parent() {
+            crate::http::traceparent::override_task_history_with_trace_parent(&span, traceparent);
+        }
+
+        let result = self
+            .submit_distributed_internal(job_id, request_context, span.clone(), true)
+            .await;
+        if let Err(e) = &result {
+            tracing::error!(target: "task_history", parent: &span, "{e}");
+        }
+        result
+    }
+
+    /// Internal implementation for submitting (or resuming) a distributed query.
     async fn submit_distributed_internal(
         self,
         job_id: &str,
         request_context: Arc<RequestContext>,
         span: Span,
+        resume: bool,
     ) -> Result<QueryHandle> {
         // Get the scheduler server
         let scheduler = Self::get_scheduler_server(&self.df)?;
@@ -527,13 +562,25 @@ impl Query {
             t
         });
 
-        // Submit the job to the Ballista scheduler
-        let ballista_job_id = scheduler
-            .submit_job(job_id, session_ctx, &plan, None)
-            .await
-            .map_err(|e| Error::JobSubmissionFailed {
-                message: e.to_string(),
-            })?;
+        // Submit the job to the Ballista scheduler, or resume driving an
+        // existing one whose owning scheduler was lost. The job id is used as
+        // the Ballista job id so it can be addressed across schedulers.
+        let ballista_job_id = if resume {
+            scheduler
+                .recover_job(job_id)
+                .await
+                .map_err(|e| Error::JobSubmissionFailed {
+                    message: e.to_string(),
+                })?;
+            job_id.to_string()
+        } else {
+            scheduler
+                .submit_job_with_id(job_id, job_id, session_ctx, &plan, None)
+                .await
+                .map_err(|e| Error::JobSubmissionFailed {
+                    message: e.to_string(),
+                })?
+        };
 
         tracing::debug!(
             job_id,
