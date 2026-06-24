@@ -18,41 +18,19 @@ limitations under the License.
 //! Holds the coalescing [`PostWriteMaintenance`] debounce state plus the
 //! count/age-based [`SnapshotMaintenanceTrigger`] evaluation over the protected
 //! snapshot set (with bounded, de-duplicated warning emission via
-//! [`BoundedWarningKeys`]). The provider drives these from its write path.
+//! [`BoundedFifoSet`]). The provider drives these from its write path.
 
 use super::column_stats::ColumnStatsAccumulator;
+use crate::bounded_fifo::BoundedFifoSet;
 use parking_lot::Mutex as ParkingMutex;
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// Cap on the number of distinct protected-snapshot warning keys retained, to
 /// bound the dedup set used by age-based maintenance warnings.
-const PROTECTED_SNAPSHOT_AGE_WARNING_KEY_LIMIT: usize = 1024;
-
-#[derive(Debug, Default)]
-pub(crate) struct BoundedWarningKeys {
-    seen: HashSet<String>,
-    insertion_order: VecDeque<String>,
-}
-
-impl BoundedWarningKeys {
-    fn insert_new(&mut self, key: String, limit: usize) -> bool {
-        if self.seen.contains(&key) {
-            return false;
-        }
-
-        if self.seen.len() >= limit
-            && let Some(oldest_key) = self.insertion_order.pop_front()
-        {
-            self.seen.remove(&oldest_key);
-        }
-
-        self.insertion_order.push_back(key.clone());
-        self.seen.insert(key)
-    }
-}
+pub(crate) const PROTECTED_SNAPSHOT_AGE_WARNING_KEY_LIMIT: usize = 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SnapshotMaintenanceTrigger {
@@ -68,18 +46,17 @@ pub(crate) enum SnapshotMaintenanceTrigger {
 }
 
 fn should_warn_protected_snapshot_age(
-    warning_keys: &ParkingMutex<BoundedWarningKeys>,
+    warning_keys: &ParkingMutex<BoundedFifoSet>,
     snapshot_id: &str,
     warning_kind: &'static str,
 ) -> bool {
-    let key = format!("{warning_kind}:{snapshot_id}");
     warning_keys
         .lock()
-        .insert_new(key, PROTECTED_SNAPSHOT_AGE_WARNING_KEY_LIMIT)
+        .insert_new(format!("{warning_kind}:{snapshot_id}"))
 }
 
 fn protected_snapshot_age(
-    warning_keys: &ParkingMutex<BoundedWarningKeys>,
+    warning_keys: &ParkingMutex<BoundedFifoSet>,
     snapshot_id: &str,
     now: SystemTime,
 ) -> Option<Duration> {
@@ -129,7 +106,7 @@ fn protected_snapshot_age(
 }
 
 fn oldest_protected_snapshot_age(
-    warning_keys: &ParkingMutex<BoundedWarningKeys>,
+    warning_keys: &ParkingMutex<BoundedFifoSet>,
     protected_snapshots: &HashMap<String, i64>,
     now: SystemTime,
 ) -> Option<Duration> {
@@ -144,7 +121,7 @@ pub(crate) fn duration_millis_saturating(duration: Duration) -> u64 {
 }
 
 pub(crate) fn protected_snapshot_maintenance_trigger(
-    warning_keys: &ParkingMutex<BoundedWarningKeys>,
+    warning_keys: &ParkingMutex<BoundedFifoSet>,
     protected_snapshots: &HashMap<String, i64>,
     trigger_count: usize,
     trigger_age: Option<Duration>,

@@ -152,6 +152,7 @@ where
         vsearch,
         auth_layer,
         &cors_config,
+        tls_config.is_some(),
         #[cfg(feature = "mcp")]
         mcp_config.as_ref(),
     );
