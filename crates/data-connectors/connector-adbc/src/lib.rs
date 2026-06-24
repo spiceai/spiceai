@@ -1579,8 +1579,6 @@ mod tests {
         let dataset_b = test_dataset("adbc:bigquery/my_project.dataset.table_b", "table_b").await;
 
         let make_params = |dataset: &Dataset| {
-            use runtime_parameters::Parameters;
-
             let parameters = Parameters::new(
                 vec![
                     ("driver".to_string(), SecretString::from("bigquery")),
@@ -1619,8 +1617,6 @@ mod tests {
         let dataset = test_dataset("adbc:bigquery/my_project.dataset.table_a", "table_a").await;
 
         let make_params = |uri: &str| {
-            use runtime_parameters::Parameters;
-
             let parameters = Parameters::new(
                 vec![
                     ("driver".to_string(), SecretString::from("bigquery")),

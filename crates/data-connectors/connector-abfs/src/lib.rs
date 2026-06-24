@@ -17,7 +17,7 @@ limitations under the License.
 use runtime::Runtime;
 use runtime::component::dataset::Dataset;
 use runtime::dataconnector::listing::{
-    self, LISTING_TABLE_PARAMETERS, ListingTableConnector, ObjectVersionType, build_fragments,
+    LISTING_TABLE_PARAMETERS, ListingTableConnector, ObjectVersionType, build_fragments,
 };
 use runtime::dataconnector::parameters::{
     Validator,
