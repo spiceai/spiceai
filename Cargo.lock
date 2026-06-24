@@ -2394,7 +2394,7 @@ dependencies = [
 [[package]]
 name = "ballista-core"
 version = "52.0.0"
-source = "git+https://github.com/spiceai/datafusion-ballista.git?rev=e1774c0c08587fb149f2b4ff2cc6e238f138f3b8#e1774c0c08587fb149f2b4ff2cc6e238f138f3b8"
+source = "git+https://github.com/spiceai/datafusion-ballista.git?rev=fc500ce94d6cd5b1bc8da744b2ca1e8c7bddeca4#fc500ce94d6cd5b1bc8da744b2ca1e8c7bddeca4"
 dependencies = [
  "arrow-flight",
  "async-trait",
@@ -2431,7 +2431,7 @@ dependencies = [
 [[package]]
 name = "ballista-executor"
 version = "52.0.0"
-source = "git+https://github.com/spiceai/datafusion-ballista.git?rev=e1774c0c08587fb149f2b4ff2cc6e238f138f3b8#e1774c0c08587fb149f2b4ff2cc6e238f138f3b8"
+source = "git+https://github.com/spiceai/datafusion-ballista.git?rev=fc500ce94d6cd5b1bc8da744b2ca1e8c7bddeca4#fc500ce94d6cd5b1bc8da744b2ca1e8c7bddeca4"
 dependencies = [
  "arrow",
  "arrow-flight",
@@ -2462,7 +2462,7 @@ dependencies = [
 [[package]]
 name = "ballista-scheduler"
 version = "52.0.0"
-source = "git+https://github.com/spiceai/datafusion-ballista.git?rev=e1774c0c08587fb149f2b4ff2cc6e238f138f3b8#e1774c0c08587fb149f2b4ff2cc6e238f138f3b8"
+source = "git+https://github.com/spiceai/datafusion-ballista.git?rev=fc500ce94d6cd5b1bc8da744b2ca1e8c7bddeca4#fc500ce94d6cd5b1bc8da744b2ca1e8c7bddeca4"
 dependencies = [
  "arrow-flight",
  "async-trait",
