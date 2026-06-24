@@ -155,9 +155,9 @@ impl KafkaOffset {
     }
 }
 
-/// Metadata stored in the spice_sys sidecar for a Kafka-backed accelerated dataset.
+/// Metadata stored in the `spice_sys` sidecar for a Kafka-backed accelerated dataset.
 ///
-/// This type is shared between the Kafka data connector and the spice_sys persistence
+/// This type is shared between the Kafka data connector and the `spice_sys` persistence
 /// layer so that neither needs to depend on the other.
 #[derive(Serialize, Deserialize)]
 pub struct KafkaMetadata {

@@ -34,7 +34,7 @@ use bootstrap::{
 
 use crate::configure_test_datafusion;
 use crate::utils::runtime_ready_check;
-use crate::{init_tracing, utils::test_request_context};
+use crate::{init_tracing, utils::{register_test_connectors, test_request_context}};
 
 const KAFKA_PORT: u16 = 19093;
 const KAFKA_MESSAGE_PROCESSING_TIMEOUT: Duration = Duration::from_secs(30);
@@ -93,6 +93,7 @@ async fn kafka_sasl_connect_test() -> anyhow::Result<()> {
                 .build();
 
             configure_test_datafusion();
+            register_test_connectors().await;
             let rt = Runtime::builder().with_app(app).build().await;
 
             let cloned_rt = Arc::new(rt.clone());

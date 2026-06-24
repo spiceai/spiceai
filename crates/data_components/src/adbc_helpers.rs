@@ -75,6 +75,7 @@ pub fn build_db_options(
 }
 
 /// Returns the SQL dialect for a given ADBC driver name, if a non-default one is needed.
+#[must_use]
 pub fn dialect_for_driver(driver_name: &str) -> Option<Arc<dyn Dialect + Send + Sync>> {
     match driver_name {
         "bigquery" => Some(Arc::new(BigQueryDialect::new())),

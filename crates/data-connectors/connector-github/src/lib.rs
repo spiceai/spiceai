@@ -2192,5 +2192,5 @@ pub const CONNECTOR_NAME: &str = "github";
 /// Returns a new instance of the GitHub connector factory.
 #[must_use]
 pub fn factory() -> std::sync::Arc<dyn DataConnectorFactory> {
-    GitHubFactory::new_arc()
+    GithubFactory::new_arc()
 }

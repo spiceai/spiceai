@@ -301,10 +301,6 @@ impl WorkflowRunsTableProvider {
 
 #[async_trait]
 impl TableProvider for WorkflowRunsTableProvider {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema(&self) -> SchemaRef {
         Arc::clone(&self.schema)
     }
@@ -440,10 +436,6 @@ impl ExecutionPlan for WorkflowRunsExecutionPlan {
         Self: Sized,
     {
         "GitHubWorkflowRunsExecutionPlan"
-    }
-
-    fn as_any(&self) -> &dyn Any {
-        self
     }
 
     fn schema(&self) -> SchemaRef {

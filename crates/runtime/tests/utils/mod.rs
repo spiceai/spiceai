@@ -732,5 +732,43 @@ async fn do_register_test_connectors() {
     .await;
     register_connector_factory(connector_spark::CONNECTOR_NAME, connector_spark::factory()).await;
 
+    // Connectors extracted into dedicated crates (registered the same way as in `bin/spiced`).
+    register_connector_factory(connector_abfs::CONNECTOR_NAME, connector_abfs::factory()).await;
+    // Also register the "abfss" prefix (secure variant uses the same factory)
+    register_connector_factory("abfss", connector_abfs::factory()).await;
+    register_connector_factory(connector_adbc::CONNECTOR_NAME, connector_adbc::factory()).await;
+    register_connector_factory(
+        connector_cosmosdb::CONNECTOR_NAME,
+        connector_cosmosdb::factory(),
+    )
+    .await;
+    register_connector_factory(
+        connector_ducklake::CONNECTOR_NAME,
+        connector_ducklake::factory(),
+    )
+    .await;
+    register_connector_factory(connector_gcs::CONNECTOR_NAME, connector_gcs::factory()).await;
+    // Also register the "gs" prefix alias for GCS
+    register_connector_factory("gs", connector_gcs::factory()).await;
+    register_connector_factory(connector_git::CONNECTOR_NAME, connector_git::factory()).await;
+    register_connector_factory(
+        connector_github::CONNECTOR_NAME,
+        connector_github::factory(),
+    )
+    .await;
+    register_connector_factory(connector_glue::CONNECTOR_NAME, connector_glue::factory()).await;
+    register_connector_factory(connector_kafka::CONNECTOR_NAME, connector_kafka::factory()).await;
+    register_connector_factory(
+        connector_spiceai::CONNECTOR_NAME,
+        connector_spiceai::factory(),
+    )
+    .await;
+    // Also register the legacy "spiceai" prefix
+    register_connector_factory(
+        connector_spiceai::LEGACY_CONNECTOR_NAME,
+        connector_spiceai::legacy_factory(),
+    )
+    .await;
+
     tracing::debug!("Completed connector registration for tests");
 }

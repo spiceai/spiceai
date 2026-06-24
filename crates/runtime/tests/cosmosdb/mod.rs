@@ -44,7 +44,7 @@ use app::AppBuilder;
 use runtime::Runtime;
 use spicepod::{component::dataset::Dataset, param::Params};
 
-use crate::{configure_test_datafusion, init_tracing, utils::test_request_context};
+use crate::{configure_test_datafusion, init_tracing, utils::{register_test_connectors, test_request_context}};
 
 const DEFAULT_DATABASE: &str = "spice-integration";
 const DEFAULT_CONTAINER: &str = "documents";
@@ -114,6 +114,7 @@ async fn cosmosdb_connector_factory_is_registered() -> Result<(), anyhow::Error>
             // fails to link or the factory panics during registration, this
             // test surfaces it without needing live credentials.
             configure_test_datafusion();
+            register_test_connectors().await;
             let _rt = Runtime::builder()
                 .with_app(AppBuilder::new("cosmosdb_smoke").build())
                 .build()
@@ -145,6 +146,7 @@ async fn cosmosdb_live_select_returns_rows() -> Result<(), anyhow::Error> {
                 .build();
 
             configure_test_datafusion();
+            register_test_connectors().await;
             let rt = Runtime::builder().with_app(app).build().await;
             let cloned_rt = Arc::new(rt.clone());
 
@@ -190,6 +192,7 @@ async fn cosmosdb_live_repeated_queries_share_budget() -> Result<(), anyhow::Err
                 .build();
 
             configure_test_datafusion();
+            register_test_connectors().await;
             let rt = Runtime::builder().with_app(app).build().await;
             let cloned_rt = Arc::new(rt.clone());
 
