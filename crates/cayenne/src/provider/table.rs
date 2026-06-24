@@ -70,7 +70,9 @@ use crate::provider::scan::{
 };
 use crate::provider::sink::CayenneDataSink;
 use crate::provider::{Error, Result};
-use arrow::array::{Array, ArrayRef, BinaryArray, Int64Array};
+use arrow::array::{
+    Array, ArrayRef, BinaryArray, Float64Array, Int64Array, StringArray, StringViewArray,
+};
 use arrow::record_batch::RecordBatch;
 use arrow_row::{OwnedRow, RowConverter, SortField};
 use arrow_schema::{DataType, Field, SchemaBuilder, SchemaRef};
@@ -127,7 +129,7 @@ use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering};
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::task;
 use vortex_datafusion::VortexFormat;
 use vortex_datafusion::WriteShardConfig;

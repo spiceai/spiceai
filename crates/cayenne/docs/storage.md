@@ -50,7 +50,7 @@ Drives Iceberg-style visibility ordering and protected-snapshot filtering: a del
 
 #### `cayenne_snapshot_file` — authoritative per-snapshot file manifest
 
-The **complete** data-file set for a snapshot (manifest snapshot model). One row per file; a new snapshot can reference an existing file by inserting a row pointing at the same path (no copy). `min_sequence`/`max_sequence` let compaction bake a seq-prefix (`max_sequence ≤ T`).
+The **complete** data-file set for a snapshot (manifest snapshot model). One row per file; a new snapshot can reference an existing file by inserting a row pointing at the same path (no copy). `min_sequence`/`max_sequence` let compaction bake a seq-prefix: a file is bake-eligible when `min_sequence ≤ T` (a file straddling the cutoff, `min_sequence ≤ T < max_sequence`, still holds rows ≤ T and must be baked).
 
 | Column | Type | Notes |
 |--------|------|-------|
