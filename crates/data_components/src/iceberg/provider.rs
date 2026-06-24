@@ -33,12 +33,21 @@ use crate::iceberg::catalog::Error;
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
+/// A hook that wraps each Iceberg table provider as it is loaded from the
+/// catalog, given its `(schema_name, table_name)`. The runtime injects this so
+/// catalog-sourced Iceberg scans can be serialized for distributed (Ballista)
+/// execution — `data_components` cannot name the runtime's
+/// `IcebergClusterTableProvider` directly, so the runtime supplies a closure
+/// that applies it. When `None`, table providers are returned unwrapped (the
+/// single-node behavior).
+pub type CatalogTableWrapper =
+    Arc<dyn Fn(&str, &str, Arc<dyn TableProvider>) -> Arc<dyn TableProvider> + Send + Sync>;
+
 /// Provides an interface to manage and access multiple schemas
 /// within an Iceberg [`Catalog`].
 ///
 /// Acts as a centralized catalog provider that aggregates
 /// multiple [`SchemaProvider`], each associated with distinct namespaces.
-#[derive(Debug)]
 pub struct IcebergCatalogProvider {
     /// The underlying Iceberg catalog client.
     catalog: Arc<dyn Catalog>,
@@ -46,10 +55,22 @@ pub struct IcebergCatalogProvider {
     root_namespace: Option<NamespaceIdent>,
     /// Optional glob patterns for filtering tables.
     include: Option<GlobSet>,
+    /// Optional hook to wrap each loaded table provider (see
+    /// [`CatalogTableWrapper`]). Reapplied on every refresh.
+    table_wrapper: Option<CatalogTableWrapper>,
     /// A `RwLock`-protected `HashMap` where keys are namespace names
     /// and values are dynamic references to objects implementing the
     /// [`SchemaProvider`] trait.
     schemas: RwLock<HashMap<String, Arc<dyn SchemaProvider>>>,
+}
+
+impl std::fmt::Debug for IcebergCatalogProvider {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("IcebergCatalogProvider")
+            .field("root_namespace", &self.root_namespace)
+            .field("has_table_wrapper", &self.table_wrapper.is_some())
+            .finish_non_exhaustive()
+    }
 }
 
 impl IcebergCatalogProvider {
@@ -69,14 +90,21 @@ impl IcebergCatalogProvider {
         client: Arc<dyn Catalog>,
         root_namespace: Option<NamespaceIdent>,
         includes: Option<&GlobSet>,
+        table_wrapper: Option<CatalogTableWrapper>,
     ) -> Result<Self> {
-        let schemas =
-            Self::load_schemas(Arc::clone(&client), root_namespace.as_ref(), includes).await?;
+        let schemas = Self::load_schemas(
+            Arc::clone(&client),
+            root_namespace.as_ref(),
+            includes,
+            table_wrapper.as_ref(),
+        )
+        .await?;
 
         Ok(IcebergCatalogProvider {
             catalog: client,
             root_namespace,
             include: includes.cloned(),
+            table_wrapper,
             schemas: RwLock::new(schemas),
         })
     }
@@ -98,6 +126,7 @@ impl IcebergCatalogProvider {
         client: Arc<dyn Catalog>,
         root_namespace: Option<&NamespaceIdent>,
         includes: Option<&GlobSet>,
+        table_wrapper: Option<&CatalogTableWrapper>,
     ) -> Result<HashMap<String, Arc<dyn SchemaProvider>>> {
         // Create the semaphore first, so we can use it in the closures below
         let load_semaphore = Arc::new(Semaphore::new(10));
@@ -134,6 +163,7 @@ impl IcebergCatalogProvider {
                 NamespaceIdent::new(name.clone()),
                 semaphore_clone,
                 includes,
+                table_wrapper.cloned(),
             )
         }))
         .await?;
@@ -174,6 +204,7 @@ impl RefreshableCatalogProvider for IcebergCatalogProvider {
             Arc::clone(&self.catalog),
             self.root_namespace.as_ref(),
             self.include.as_ref(),
+            self.table_wrapper.as_ref(),
         )
         .await?;
 
@@ -223,15 +254,41 @@ impl IcebergSchemaProvider {
         namespace: NamespaceIdent,
         load_semaphore: Arc<Semaphore>,
         include: Option<&GlobSet>,
+        table_wrapper: Option<CatalogTableWrapper>,
     ) -> Result<Self> {
-        let tables =
-            Self::load_tables(Arc::clone(&client), &namespace, load_semaphore, include).await?;
+        let tables = Self::load_tables(
+            Arc::clone(&client),
+            &namespace,
+            load_semaphore,
+            include,
+            table_wrapper.as_ref(),
+        )
+        .await?;
 
         Ok(IcebergSchemaProvider {
             catalog: client,
             namespace,
             tables: RwLock::new(tables),
         })
+    }
+
+    /// Synchronously look up a cached table provider by name.
+    ///
+    /// Tables are loaded eagerly at construction (and on catalog refresh), so
+    /// this is a lock-and-clone with no catalog I/O. The runtime relies on this
+    /// to resolve catalog-sourced Iceberg providers on remote executors during
+    /// distributed-plan deserialization, where no async context is available.
+    #[must_use]
+    pub fn table_sync(&self, name: &str) -> Option<Arc<dyn TableProvider>> {
+        // Recover a poisoned lock (as `refresh` does) rather than returning
+        // `None`: an unrelated panic must not make a table appear to vanish,
+        // which would surface as a confusing "table not registered" error during
+        // distributed scan reconstruction on an executor.
+        self.tables
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(name)
+            .cloned()
     }
 
     /// Returns a reference to the underlying Iceberg catalog client.
@@ -252,6 +309,7 @@ impl IcebergSchemaProvider {
         namespace: &NamespaceIdent,
         load_semaphore: Arc<Semaphore>,
         include: Option<&GlobSet>,
+        table_wrapper: Option<&CatalogTableWrapper>,
     ) -> Result<HashMap<String, Arc<dyn TableProvider>>> {
         let table_names: Vec<_> = client
             .list_tables(namespace)
@@ -276,11 +334,17 @@ impl IcebergSchemaProvider {
                 let client_clone = Arc::clone(&client);
                 let name_clone = Arc::new(name.clone());
                 let semaphore_clone = Arc::clone(&load_semaphore);
+                let wrapper_clone = table_wrapper.cloned();
                 async move {
                     // Map the inner Result to include the table name
-                    Self::load_table(client_clone, Arc::clone(&name_clone), semaphore_clone)
-                        .await
-                        .map(|opt_provider| (name_clone, opt_provider))
+                    Self::load_table(
+                        client_clone,
+                        Arc::clone(&name_clone),
+                        semaphore_clone,
+                        wrapper_clone,
+                    )
+                    .await
+                    .map(|opt_provider| (name_clone, opt_provider))
                 }
             })
             .collect();
@@ -303,6 +367,7 @@ impl IcebergSchemaProvider {
         catalog: Arc<dyn Catalog>,
         table_name: Arc<TableIdent>,
         semaphore: Arc<Semaphore>,
+        table_wrapper: Option<CatalogTableWrapper>,
     ) -> Result<Option<Arc<dyn TableProvider>>> {
         // Acquire a permit from the semaphore to limit concurrent table loads
         let _permit = semaphore
@@ -329,6 +394,20 @@ impl IcebergSchemaProvider {
                         Arc::new(provider),
                     );
                     let adapted: Arc<dyn TableProvider> = Arc::new(deletion_provider);
+
+                    // Wrap so catalog-sourced Iceberg scans can cross Ballista
+                    // node boundaries. The schema name is the (single-level)
+                    // namespace under which this table is registered, so the
+                    // recipe's `catalog.schema.table` reference resolves back to
+                    // this provider on a remote executor. In a single-node
+                    // session the wrapper is a transparent pass-through.
+                    let adapted = match &table_wrapper {
+                        Some(wrap) => {
+                            let schema_name = table_name.namespace().as_ref().join(".");
+                            wrap(&schema_name, table_name.name(), adapted)
+                        }
+                        None => adapted,
+                    };
                     Ok(Some(adapted))
                 }
                 Err(e) => Err(handle_iceberg_error(e)),
