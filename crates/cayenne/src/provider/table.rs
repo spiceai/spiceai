@@ -3814,8 +3814,10 @@ pub(crate) struct PostValidationState {
 /// Aggregate result of one sharded in-memory CDC apply
 /// ([`CayenneTableProvider::validate_and_append_sharded`]).
 pub(crate) struct ShardedApplyResult {
-    /// The MAX mem-tier epoch across the shards appended this apply (used for the
-    /// slot-deferral receipt; the Phase 5 checkpoint reconciles coverage).
+    /// The single shared per-apply epoch (§3.4 Fix 1), stamped IDENTICALLY on
+    /// every shard's segment this apply — NOT a max across shards. Used for the
+    /// slot-deferral receipt; the all-shards-atomic Phase 5 checkpoint reconciles
+    /// durable coverage on this one axis.
     pub(crate) epoch: u64,
     /// Existing rows superseded across all shards (each counted once), for the
     /// live-row-count net.
@@ -16960,7 +16962,13 @@ impl CayenneTableProvider {
         let n = self.mem_tier_shard_count();
         let epoch = if n <= 1 {
             match self
-                .append_to_mem_tier_inner(Vec::new(), &deletions, incoming_bytes, 0, Some(delete_rows))
+                .append_to_mem_tier_inner(
+                    Vec::new(),
+                    &deletions,
+                    incoming_bytes,
+                    0,
+                    Some(delete_rows),
+                )
                 .await
             {
                 Ok(epoch) => epoch,
