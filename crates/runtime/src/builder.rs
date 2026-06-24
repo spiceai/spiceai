@@ -1058,6 +1058,9 @@ fn parse_cayenne_optimizer_rules(
             "exact_join_filter" | "join_rewriter" | "exact_accumulator" => {
                 rules.set_exact_join_filter(true);
             }
+            "stats_aggregate" | "metadata_aggregate" | "aggregate_pushdown" => {
+                rules.set_stats_aggregate(true);
+            }
             _ => {
                 // Don't discard the rest of an explicit list because of one bad
                 // token; collect the unknown ones, keep the recognized rules,
@@ -1333,6 +1336,23 @@ mod test {
                 false,
             ),
             semi_join_only
+        );
+
+        // `stats_aggregate` is on under both `auto` and `all`, and is also
+        // selectable by token (including its aliases) without enabling anything else.
+        assert!(CayenneOptimizerRules::auto_enabled().stats_aggregate());
+        assert!(CayenneOptimizerRules::all_enabled().stats_aggregate());
+        let mut stats_aggregate_only = CayenneOptimizerRules::none();
+        stats_aggregate_only.set_stats_aggregate(true);
+        assert_eq!(
+            parse_cayenne_optimizer_rules(
+                &HashMap::from([(
+                    CAYENNE_OPTIMIZER_RULES_PARAM.to_string(),
+                    "metadata_aggregate".to_string(),
+                )]),
+                false,
+            ),
+            stats_aggregate_only
         );
 
         assert_eq!(
