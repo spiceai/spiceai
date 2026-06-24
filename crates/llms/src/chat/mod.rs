@@ -62,6 +62,10 @@ use indexmap::IndexMap;
 #[cfg(feature = "local_llm")]
 use mistralrs::MessageContent;
 
+// Distributed inference only matters for local mistral.rs models, so the module
+// (and its `configure_ring_distributed` helper) is gated on `local_llm` to avoid
+// dead-code in `--no-default-features` / feature-matrix builds.
+#[cfg(feature = "local_llm")]
 pub mod distributed;
 
 static WEIGHTS_EXTENSIONS: [&str; 7] = [

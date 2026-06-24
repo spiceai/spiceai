@@ -101,6 +101,7 @@ flash-attn = [
 # and is intentionally not enabled in standard (OSS) builds. The `distributed`
 # name is backend-agnostic (currently the `ring` backend; `nccl` may follow).
 distributed = [
+    "local_llm",
     "mistralrs-core/ring",
     "mistralrs/ring",
 ]
