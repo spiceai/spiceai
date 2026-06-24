@@ -51,9 +51,12 @@ limitations under the License.
 //! When unset (the default — file mode, unit tests, embedders that don't wire it
 //! up) [`try_reserve_bytes`] always succeeds, so memory mode (if explicitly
 //! opted into without the budget installed) is gated only by the per-table cap.
-//! The runtime binary installs the budget once at startup, sized from total
-//! system/container memory (`resource_monitor::get_total_memory() / 4`). This
-//! budget is independent of `DataFusion`'s query memory pool.
+//! The runtime binary installs the budget once at startup, sized to COORDINATE
+//! with `DataFusion`'s query + compaction memory pools: the host RAM left after
+//! the query pool, the compaction pool, and a headroom reserve, so the on-pool
+//! query memory and this off-pool tier together never exceed host RAM. It is then
+//! resized dynamically (see [`update_global_mem_tier_total`]) as the query pool
+//! fills and drains, staying within that coordinated envelope.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock};
@@ -180,10 +183,11 @@ impl MemTierBudget {
     }
 }
 
-/// Process-wide in-memory CDC tier budget, injected once at startup by the
-/// binary (sized to a fraction of TOTAL system/container memory —
-/// `resource_monitor::get_total_memory() / 8` — and deliberately INDEPENDENT of
-/// the `DataFusion` query memory pool, since the RAM tier lives off-pool).
+/// Process-wide in-memory CDC tier budget, injected once at startup by the binary
+/// (sized to COORDINATE with the query + compaction memory pools — the host RAM
+/// left after them and a headroom reserve — so the off-pool tier and the on-pool
+/// query memory together never exceed host RAM; the tier still lives off-pool and
+/// is resized dynamically as the pools fill and drain).
 /// Replaceable so a test binary that builds and drops multiple runtimes does not
 /// retain a stale budget (mirrors [`super::write_budget`]).
 static GLOBAL_MEM_TIER_BUDGET: LazyLock<RwLock<Option<MemTierBudget>>> =
