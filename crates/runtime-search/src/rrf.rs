@@ -1321,9 +1321,8 @@ impl TableProvider for ReciprocalRankFusion {
 mod tests {
     use crate::rrf::ReciprocalRankFusionArgs;
     use datafusion::arrow::datatypes::DataType;
-    use datafusion::catalog::TableProvider;
+
     use datafusion::logical_expr::Expr;
-    use datafusion::logical_expr::col;
     use datafusion::logical_expr::expr::FieldMetadata;
     use datafusion::logical_expr::{ColumnarValue, Volatility, create_udf};
     use datafusion::scalar::ScalarValue;
@@ -1341,22 +1340,6 @@ mod tests {
             )]));
             Expr::Literal(scalar_value, Some(spice_metadata))
         }};
-    }
-
-    fn stub_scalar_function(name: &str) -> Expr {
-        let stub_udf = create_udf(
-            name,
-            vec![DataType::Utf8; 0],
-            DataType::Utf8,
-            Volatility::Stable,
-            Arc::new(|_| {
-                Ok(ColumnarValue::Scalar(ScalarValue::Utf8(Some(
-                    "stub".to_string(),
-                ))))
-            }),
-        );
-
-        Expr::ScalarFunction(ScalarFunction::new_udf(Arc::new(stub_udf), vec![]))
     }
 
     fn col_expr(name: &str) -> Expr {
@@ -1411,14 +1394,14 @@ mod tests {
         ))
     }
 
+    #[expect(clippy::float_cmp)]
     #[test]
     fn test_parse_argument_exprs() {
         // Empty call
         let result = ReciprocalRankFusionArgs::from_udtf_exprs(&[]);
-        assert!(result.is_err(), "Expected error for empty args");
-        let err_msg = result.unwrap_err().to_string();
+
         assert!(
-            err_msg.contains("at least 2"),
+            result.is_err_and(|e| e.contains("at least 2")),
             "Expected 'at least 2' in error message, got: {err_msg}"
         );
 
@@ -1440,12 +1423,8 @@ mod tests {
             vector_search_expr("foo", "query2"),
             spice_named_lit!("k", 42.0f64),
         ]);
-        assert!(
-            result.is_ok(),
-            "Expected success for two queries with named args"
-        );
 
-        let parsed = result.unwrap();
+        let parsed = result.expect("Expected success for two queries with named args");
         assert_eq!(parsed.k, 42.0);
         assert_eq!(parsed.search_udtf_exprs.len(), 2);
     }
@@ -1457,8 +1436,7 @@ mod tests {
             text_search_expr("foo", "query2"),
             spice_named_lit!("join_key", "id"),
         ]);
-        assert!(result.is_ok(), "Expected success");
-        let parsed = result.unwrap();
+        let parsed = result.expect("Expected success");
         assert!(parsed.join_key.is_some());
     }
 
@@ -1469,8 +1447,8 @@ mod tests {
             text_search_expr("foo", "query2"),
             spice_named_lit!("time_column", "created_at"),
         ]);
-        assert!(result.is_ok(), "Expected success");
-        let parsed = result.unwrap();
+
+        let parsed = result.expect("Expected success");
         assert!(parsed.time_column.is_some());
     }
 
@@ -1481,8 +1459,7 @@ mod tests {
             text_search_expr("foo", "query2"),
             named_arg("limit", ScalarValue::UInt64(Some(10))),
         ]);
-        assert!(result.is_ok(), "Expected success");
-        let parsed = result.unwrap();
+        let parsed = result.expect("Expected success");
         assert_eq!(parsed.limit, Some(10));
     }
 
@@ -1513,8 +1490,7 @@ mod tests {
             vs_with_weight,
             vector_search_expr("foo", "query2"),
         ]);
-        assert!(result.is_ok(), "Expected success");
-        let parsed = result.unwrap();
+        let parsed = result.expect("Expected success");
         assert_eq!(
             parsed.rrf_subquery_arguments[0].rank_weight,
             Some(2.5),
