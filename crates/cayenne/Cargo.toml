@@ -115,6 +115,10 @@ name = "metastore_operations"
 
 [[bench]]
 harness = false
+name = "ivm_retraction_anchor"
+
+[[bench]]
+harness = false
 name = "folded_txn_decomposition"
 
 [[bench]]

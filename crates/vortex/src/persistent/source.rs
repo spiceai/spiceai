@@ -76,6 +76,12 @@ pub struct VortexSource {
     target_partitions: Option<usize>,
     /// Whether to enable expression pushdown into the underlying Vortex scan.
     options: VortexTableOptions,
+    /// When `false`, [`FileSource::supports_repartitioning`] returns `false`, so
+    /// `DataFusion`'s `repartition_file_scans` rule will not byte-range-split this
+    /// source's file group. Highly selective scans (PK point lookups) set this:
+    /// the fan-out only multiplies per-split Vortex footer-opens the lookup never
+    /// needs. Default `true`, preserving full-scan read parallelism.
+    allow_repartitioning: bool,
 }
 
 impl VortexSource {
@@ -106,6 +112,7 @@ impl VortexSource {
             segment_cache: None,
             target_partitions: None,
             options: VortexTableOptions::default(),
+            allow_repartitioning: true,
         }
     }
 
@@ -177,6 +184,18 @@ impl VortexSource {
     #[must_use]
     pub fn with_options(mut self, opts: VortexTableOptions) -> Self {
         self.options = opts;
+        self
+    }
+
+    /// Control whether `DataFusion` may byte-range-split this source's file group
+    /// (see [`FileSource::supports_repartitioning`]). Set `false` for highly
+    /// selective scans (e.g. PK point lookups), where splitting one file into N
+    /// partitions only multiplies the per-split Vortex footer-open cost without
+    /// reducing work — exactly one split contains the matching row. Default
+    /// `true`, so full scans keep their intra-file read parallelism.
+    #[must_use]
+    pub fn with_repartitioning(mut self, allow: bool) -> Self {
+        self.allow_repartitioning = allow;
         self
     }
 }
@@ -285,7 +304,7 @@ impl FileSource for VortexSource {
     }
 
     fn supports_repartitioning(&self) -> bool {
-        true
+        self.allow_repartitioning
     }
 
     fn repartitioned(

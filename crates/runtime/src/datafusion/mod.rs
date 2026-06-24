@@ -114,7 +114,6 @@ use runtime_acceleration::snapshot::AccelerationLayout;
 ))]
 use runtime_acceleration::snapshot::SnapshotManager;
 use runtime_async::ManagedTokioRuntime;
-use runtime_datafusion::schema_provider::SpiceSchemaProvider;
 use runtime_datafusion_index::IndexedTableProvider;
 use runtime_query_engine::query_engine::Error as QueryEngineError;
 use runtime_table_partition::provider::PartitionTableProvider;
@@ -157,6 +156,7 @@ pub mod secrets_context_extension;
 pub mod table;
 pub use runtime_datafusion::sort_columns;
 pub(crate) mod sql_validator;
+pub(crate) mod sync_table;
 pub mod tool_udf;
 pub mod udf;
 pub mod udtf;
@@ -944,9 +944,11 @@ impl DataFusion {
 
         let schema_provider = Self::resolve_schema_provider(&catalog_provider, table_reference)?;
 
-        let spice_schema_provider = schema_provider.downcast_ref::<SpiceSchemaProvider>()?;
-
-        spice_schema_provider.table_sync(table_reference.table())
+        // Centralized synchronous resolution: handles every schema-provider type
+        // that caches its tables (`SpiceSchemaProvider`, the Iceberg catalog's
+        // `IcebergSchemaProvider`, …). See `sync_table` for how to extend it to
+        // another catalog.
+        sync_table::resolve_table_sync(schema_provider.as_ref(), table_reference.table())
     }
 
     /// Register a table with its [`SchemaProvider`] if it exists and marks it as writable.

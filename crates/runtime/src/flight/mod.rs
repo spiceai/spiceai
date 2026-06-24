@@ -16,6 +16,7 @@ limitations under the License.
 
 use crate::auth::EndpointAuth;
 use crate::datafusion::DataFusion;
+use crate::datafusion::app_context_extension::AppContextExtension;
 use crate::datafusion::error::{SpiceExternalError, find_datafusion_root};
 use crate::datafusion::query::{self, QueryBuilder};
 use crate::datafusion::sql_validator::validate_sql_query_read_only;
@@ -23,9 +24,9 @@ use crate::dataupdate::DataUpdateBroadcaster;
 use crate::opentelemetry::create_metrics_service;
 use crate::tls::TlsConfig;
 use crate::{Runtime, metrics as runtime_metrics};
-use app::App;
+use app::{App, spicepod::component::runtime::FlightIpcCompression};
 use arrow::array::RecordBatch;
-use arrow::datatypes::Schema;
+use arrow::datatypes::{DataType, Schema};
 use arrow::ipc::writer::{CompressionContext, DictionaryTracker, IpcDataGenerator};
 use arrow_flight::encode::FlightDataEncoderBuilder;
 use arrow_flight::error::FlightError;
@@ -35,7 +36,7 @@ use arrow_flight::{
     FlightData, FlightDescriptor, FlightInfo, HandshakeRequest, HandshakeResponse, SchemaAsIpc,
     Ticket, flight_service_server::FlightServiceServer,
 };
-use arrow_ipc::writer::IpcWriteOptions;
+use arrow_ipc::{CompressionType, writer::IpcWriteOptions};
 use async_stream::try_stream;
 use bytes::Bytes;
 use cache::result::{CacheStatus, query::QueryResult};
@@ -272,20 +273,63 @@ impl Service {
             .run()
             .await
             .map_err(handle_query_error)?;
-        Ok(Self::query_result_to_flight_stream(query_result))
+        let context = RequestContext::current(AsyncMarker::new().await);
+        let ipc_write_options = Self::ipc_write_options_for_context(&context)?;
+        Ok(Self::query_result_to_flight_stream(
+            query_result,
+            ipc_write_options,
+        ))
+    }
+
+    pub(crate) fn ipc_write_options_for_context(
+        context: &RequestContext,
+    ) -> Result<IpcWriteOptions, Status> {
+        let ipc_compression = context
+            .extension::<AppContextExtension>()
+            .and_then(|app_ext| app_ext.app())
+            .and_then(|app| {
+                app.runtime
+                    .flight
+                    .as_ref()
+                    .map(|flight| flight.ipc_compression)
+            })
+            .unwrap_or_default();
+
+        Self::ipc_write_options(ipc_compression)
+    }
+
+    fn ipc_write_options(ipc_compression: FlightIpcCompression) -> Result<IpcWriteOptions, Status> {
+        let compression = match ipc_compression {
+            FlightIpcCompression::None => None,
+            FlightIpcCompression::Lz4Frame => Some(CompressionType::LZ4_FRAME),
+            FlightIpcCompression::Zstd => Some(CompressionType::ZSTD),
+        };
+
+        IpcWriteOptions::default()
+            .try_with_compression(compression)
+            .map_err(to_tonic_err)
     }
 
     fn query_result_to_flight_stream(
         query_result: QueryResult,
+        ipc_write_options: IpcWriteOptions,
     ) -> (BoxStream<'static, Result<FlightData, Status>>, CacheStatus) {
-        // Reuse the same options for all messages
-        let options = datafusion::arrow::ipc::writer::IpcWriteOptions::default();
+        // Reuse the same options for all messages.
+        let options = ipc_write_options;
         let raw_schema = query_result.data.schema();
 
+        let needs_view_cast = raw_schema
+            .fields()
+            .iter()
+            .any(|field| matches!(field.data_type(), DataType::Utf8View | DataType::BinaryView));
         // Expand Utf8View → LargeUtf8 and BinaryView → LargeBinary so the
         // schema header matches what we advertise in GetFlightInfo and what
         // clients (e.g. ADBC) expect after seeing that advertisement.
-        let schema = Arc::new(arrow_tools::schema::expand_views_schema(&raw_schema));
+        let schema = if needs_view_cast {
+            Arc::new(arrow_tools::schema::expand_views_schema(&raw_schema))
+        } else {
+            raw_schema
+        };
 
         // Pre-compute schema flight data once
         let mut dict_tracker = DictionaryTracker::new(true); // Set to true to handle dictionaries
@@ -319,8 +363,12 @@ impl Service {
                 match batch_result {
                     Ok(batch) => {
                         // Cast view columns to match the expanded schema we advertised.
-                        let batch = arrow_tools::schema::cast_view_columns(batch, &schema)
-                            .map_err(|e| Status::internal(e.to_string()))?;
+                        let batch = if needs_view_cast {
+                            arrow_tools::schema::cast_view_columns(batch, &schema)
+                                .map_err(|e| Status::internal(e.to_string()))?
+                        } else {
+                            batch
+                        };
                         let (dicts, batch_data) = encoder
                             .encode(&batch, &mut dict_tracker, &options, &mut compression_context)
                             .map_err(|e| Status::internal(e.to_string()))?;
@@ -639,7 +687,7 @@ pub async fn start(
             flight_message_size.unwrap_or(flight_client::MAX_ENCODING_MESSAGE_SIZE),
         );
 
-    let server = Server::builder();
+    let server = configure_flight_server_transport(Server::builder());
     let session_aware_auth = session_auth::with_session_awareness(
         endpoint_auth.flight_basic_auth,
         session_store.clone(),
@@ -737,6 +785,12 @@ pub async fn start(
     tracing::debug!("Spice Runtime Flight stopped");
 
     Ok(())
+}
+
+pub(crate) fn configure_flight_server_transport(server: Server) -> Server {
+    server
+        .initial_stream_window_size(flight_client::HTTP2_INITIAL_STREAM_WINDOW_SIZE)
+        .initial_connection_window_size(flight_client::HTTP2_INITIAL_CONNECTION_WINDOW_SIZE)
 }
 
 pub struct RateLimits {

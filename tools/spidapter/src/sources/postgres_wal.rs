@@ -162,6 +162,7 @@ pub(crate) fn generate_postgres_wal_spicepod(
             refresh_mode: Some(RefreshMode::Changes),
             primary_key,
             on_conflict,
+            params: super::cayenne_acceleration_params(acceleration_engine),
             ..Acceleration::default()
         });
 

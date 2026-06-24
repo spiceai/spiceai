@@ -526,12 +526,8 @@ pub struct Runtime {
     app: Arc<RwLock<Option<Arc<App>>>>,
     df: Arc<DataFusion>,
     models: Arc<RwLock<HashMap<String, Model>>>,
-    completion_llms: Arc<RwLock<LLMChatCompletionsModelStore>>,
-    /// Per-model rate controllers for AI UDF concurrency control.
-    model_rate_controllers: Arc<RwLock<HashMap<String, Arc<runtime_rate_control::RateController>>>>,
+    llm_runtime_stores: Arc<model::LlmRuntimeStores>,
     http_rate_control_registry: Arc<dataconnector::http_rate_control::HttpRateControlRegistry>,
-    // LLMs that support the OpenAI Responses API
-    responses_llms: Arc<RwLock<LLMResponsesModelStore>>,
     embeds: Arc<RwLock<EmbeddingModelStore>>,
     /// Registered reranker models (native cross-encoders, reranker-API
     /// providers). Consumed by the `rerank()` UDTF; may be empty when only
@@ -636,7 +632,7 @@ impl Runtime {
 
     #[must_use]
     pub fn completion_llms(&self) -> Arc<RwLock<LLMChatCompletionsModelStore>> {
-        Arc::clone(&self.completion_llms)
+        self.llm_runtime_stores.completion_llms()
     }
 
     #[must_use]
@@ -644,11 +640,38 @@ impl Runtime {
         Arc::clone(&self.rerankers)
     }
 
+    pub async fn responses_api_support_for_model(
+        &self,
+        model_name: &str,
+    ) -> Option<crate::model::ResponsesApiSupport> {
+        self.llm_runtime_stores
+            .responses_api_support()
+            .read()
+            .await
+            .get(model_name)
+            .cloned()
+    }
+
+    pub async fn responses_supported_model_names(&self) -> HashSet<String> {
+        self.llm_runtime_stores
+            .responses_api_support()
+            .read()
+            .await
+            .iter()
+            .filter_map(|(name, support)| support.supports_responses_api().then_some(name.clone()))
+            .collect()
+    }
+
     #[must_use]
     pub fn model_rate_controllers(
         &self,
     ) -> Arc<RwLock<HashMap<String, Arc<runtime_rate_control::RateController>>>> {
-        Arc::clone(&self.model_rate_controllers)
+        self.llm_runtime_stores.rate_controllers()
+    }
+
+    #[must_use]
+    pub fn responses_llms(&self) -> Arc<RwLock<LLMResponsesModelStore>> {
+        self.llm_runtime_stores.responses_llms()
     }
 
     #[must_use]

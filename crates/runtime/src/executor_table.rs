@@ -50,7 +50,10 @@ use datafusion::common::{DataFusionError, Result as DataFusionResult};
 use datafusion::logical_expr::Expr;
 use datafusion::scalar::ScalarValue;
 use datafusion::sql::TableReference;
-use flight_client::cookie::{CookieService, CookieStore};
+use flight_client::{
+    configure_endpoint_for_high_throughput,
+    cookie::{CookieService, CookieStore},
+};
 use tonic::transport::{ClientTlsConfig, Endpoint};
 
 use cayenne::catalog_provider::CayenneSchemaProvider;
@@ -103,8 +106,10 @@ fn build_peer_client(
     } else {
         format!("http://{endpoint}")
     };
-    let mut channel = Endpoint::from_shared(address)
-        .map_err(|e| DataFusionError::Execution(format!("executor_table: bad endpoint: {e}")))?;
+    let mut channel =
+        configure_endpoint_for_high_throughput(Endpoint::from_shared(address).map_err(|e| {
+            DataFusionError::Execution(format!("executor_table: bad endpoint: {e}"))
+        })?);
     if let Some(tls_config) = client_tls_config {
         channel = channel
             .tls_config(tls_config)
