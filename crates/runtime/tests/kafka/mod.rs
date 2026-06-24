@@ -34,7 +34,10 @@ use bootstrap::{
 
 use crate::configure_test_datafusion;
 use crate::utils::runtime_ready_check;
-use crate::{init_tracing, utils::{register_test_connectors, test_request_context}};
+use crate::{
+    init_tracing,
+    utils::{register_test_connectors, test_request_context},
+};
 
 const KAFKA_PORT: u16 = 19093;
 const KAFKA_MESSAGE_PROCESSING_TIMEOUT: Duration = Duration::from_secs(30);
