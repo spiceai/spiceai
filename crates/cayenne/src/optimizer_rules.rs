@@ -200,7 +200,7 @@ impl std::fmt::Debug for CayenneMaintainedAggregateRewriter {
 /// one-row result computed from the scan's Vortex file statistics, avoiding the
 /// scan entirely.
 ///
-/// This complements DataFusion's built-in `AggregateStatistics` rule, which only
+/// This complements `DataFusion`'s built-in `AggregateStatistics` rule, which only
 /// covers `COUNT`/`MIN`/`MAX` (the aggregate UDFs that implement
 /// `value_from_stats`). This rule additionally folds `SUM` and `AVG` — and, so
 /// that mixed queries like `SELECT COUNT(*), SUM(v) FROM t` fold as a whole,

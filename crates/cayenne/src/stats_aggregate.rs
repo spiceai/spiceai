@@ -16,7 +16,7 @@ limitations under the License.
 
 //! Whole-table aggregate folding from Vortex file statistics.
 //!
-//! DataFusion's built-in `AggregateStatistics` physical rule already answers
+//! `DataFusion`'s built-in `AggregateStatistics` physical rule already answers
 //! `COUNT(*)`, `COUNT(col)`, `MIN`, and `MAX` from exact statistics (via each
 //! aggregate UDF's `value_from_stats`). The built-in `sum`/`avg` UDFs do **not**
 //! implement that hook, so `SUM`/`AVG` always fall through to a full scan even
@@ -27,7 +27,7 @@ limitations under the License.
 //! from the scan's [`Statistics`], covering the full metadata-answerable set:
 //! `COUNT(*)`, `COUNT(col)`, `SUM`, `AVG`, `MIN`, `MAX`. Covering the whole set
 //! (not just `SUM`/`AVG`) matters for mixed queries such as
-//! `SELECT COUNT(*), SUM(v), MIN(v) FROM t`: DataFusion's rule declines the
+//! `SELECT COUNT(*), SUM(v), MIN(v) FROM t`: `DataFusion`'s rule declines the
 //! whole aggregate as soon as one expression (`SUM`) is unsupported, so the
 //! entire node is left for this rule to fold.
 //!
@@ -110,8 +110,8 @@ fn parse_stats_aggregates(aggregate: &AggregateExec) -> Option<Vec<StatsAggKind>
 
         let kind = match name.as_str() {
             "count" => match count_target(&expressions)? {
-                Some(index) => StatsAggKind::CountColumn(index),
-                None => StatsAggKind::CountStar,
+                CountTarget::Column(index) => StatsAggKind::CountColumn(index),
+                CountTarget::AllRows => StatsAggKind::CountStar,
             },
             "sum" => StatsAggKind::Sum(single_column_index(&expressions, &input_schema)?),
             "avg" => StatsAggKind::Avg(single_column_index(&expressions, &input_schema)?),
@@ -145,19 +145,28 @@ impl StatsAggKind {
     }
 }
 
-/// `COUNT` argument analysis: `Ok(None)` for `COUNT(*)`/`COUNT(<non-null lit>)`,
-/// `Ok(Some(index))` for `COUNT(col)`. Returns `None` (decline) for anything
-/// else (multiple args, expressions, null literal).
-fn count_target(expressions: &[Arc<dyn PhysicalExpr>]) -> Option<Option<usize>> {
+/// What a `COUNT` aggregate counts, once its argument has been analyzed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CountTarget {
+    /// `COUNT(*)` / `COUNT(<non-null lit>)` — the table cardinality.
+    AllRows,
+    /// `COUNT(col)` — the non-null count of the column at this input index.
+    Column(usize),
+}
+
+/// `COUNT` argument analysis: `AllRows` for `COUNT(*)`/`COUNT(<non-null lit>)`,
+/// `Column(index)` for `COUNT(col)`. Returns `None` (decline) for anything else
+/// (multiple args, expressions, null literal).
+fn count_target(expressions: &[Arc<dyn PhysicalExpr>]) -> Option<CountTarget> {
     match expressions {
-        [] => Some(None),
+        [] => Some(CountTarget::AllRows),
         [expr] => {
             if let Some(column) = expr.downcast_ref::<Column>() {
-                Some(Some(column.index()))
+                Some(CountTarget::Column(column.index()))
             } else if let Some(literal) = expr.downcast_ref::<Literal>() {
                 // COUNT(1) counts all rows; COUNT(NULL) counts none and must not
                 // be folded as COUNT(*).
-                (!literal.value().is_null()).then_some(None)
+                (!literal.value().is_null()).then_some(CountTarget::AllRows)
             } else {
                 None
             }
@@ -169,10 +178,10 @@ fn count_target(expressions: &[Arc<dyn PhysicalExpr>]) -> Option<Option<usize>> 
 /// Extract the single input-column index for `SUM`/`AVG`/`MIN`/`MAX`, seeing
 /// through a value-preserving numeric *widening* cast.
 ///
-/// DataFusion coerces an integer argument before aggregating — e.g. `AVG(i64)`
+/// `DataFusion` coerces an integer argument before aggregating — e.g. `AVG(i64)`
 /// becomes `avg(CAST(col AS Float64))` — so the physical input is a `CastExpr`
 /// over a `Column`, not a bare `Column`. We read the aggregate from the
-/// *original* column's footer stats (sum/min/max/null_count), so unwrapping is
+/// *original* column's footer stats (`sum`/`min`/`max`/`null_count`), so unwrapping is
 /// sound exactly when the cast is a numeric widening: it preserves the column
 /// sum (hence `AVG`), and being monotonic it preserves `MIN`/`MAX`. We then cast
 /// the folded scalar to the aggregate's output type, matching the query.
@@ -196,7 +205,7 @@ fn single_column_index(
 
 /// Whether casting `source` to `target` is a value-preserving numeric widening:
 /// integers widen to their family's 64-bit type or to `Float64`, floats widen to
-/// `Float64`. These are the implicit coercions DataFusion inserts for `SUM`/`AVG`
+/// `Float64`. These are the implicit coercions `DataFusion` inserts for `SUM`/`AVG`
 /// and they preserve sum (and order, for `MIN`/`MAX`). Narrowing or lossy casts
 /// (e.g. `Float64 -> Int32`, anything non-numeric) are rejected so we never fold
 /// a stat that does not match the query's casted values.
