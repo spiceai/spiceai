@@ -42,6 +42,7 @@ limitations under the License.
 use std::sync::Arc;
 use std::time::Instant;
 
+use arc_swap::ArcSwap;
 use arrow::record_batch::RecordBatch;
 use arrow_schema::Schema;
 use async_trait::async_trait;
@@ -117,9 +118,12 @@ impl InMemTombstones {
     ///
     /// The live fold path uses [`Self::merge_segment`] (a segment's key set at one
     /// uniform sequence); this per-key-map variant is retained as the reference
-    /// the equivalence test checks `merge_segment` against.
-    #[cfg(test)]
-    fn merge_from(&mut self, other: &InMemTombstones) {
+    /// the equivalence test checks `merge_segment` against. It is ALSO the
+    /// cross-shard union step (`ShardedMemTier::union_tombstones`): each shard
+    /// owns a disjoint key set, so the per-key `max` here only ever takes the
+    /// single present value (no real cross-shard collision can occur), yielding
+    /// the exact whole-tier tombstone map the single-tier path produced.
+    pub(crate) fn merge_from(&mut self, other: &InMemTombstones) {
         for (&pk, &seq) in &other.int64_pk {
             let next = self.int64_pk.get(&pk).map_or(seq, |&cur| cur.max(seq));
             self.int64_pk.insert(pk, next);
@@ -150,7 +154,7 @@ impl InMemTombstones {
         }
     }
 
-    fn is_empty(&self) -> bool {
+    pub(crate) fn is_empty(&self) -> bool {
         self.int64_pk.is_empty() && self.row_keys.is_empty()
     }
 }
@@ -293,6 +297,14 @@ pub(crate) struct MemSegment {
     pub(crate) rows: u64,
     /// Rows this segment's upsert superseded (carried, not recomputed).
     pub(crate) superseded: u64,
+    /// The SHARED, per-APPLY slot-ack epoch this segment belongs to — the single
+    /// epoch axis across all N shards (§3.4 Fix 1). One CDC apply fans into N
+    /// shard appends; every one of them stamps the SAME `source_position`, so the
+    /// checkpoint can reconcile durable coverage across shards on one commensurable
+    /// quantity (the runtime's slot deferral keys on it). `None` at N==1 (the
+    /// single-shard path keeps using `MemTier::epoch` as the slot-ack currency, so
+    /// behavior is byte-identical) and for the position-based / non-sharded append.
+    pub(crate) source_position: Option<u64>,
 }
 
 /// The in-memory CDC tier for one table. Immutable once constructed: every
@@ -365,6 +377,10 @@ impl MemTier {
     /// deltas for this batch. `tombstones` is this apply's [`SegmentTombstones`]
     /// (key set built off the publish lock, sequence already stamped); it is moved
     /// into the new segment after its keys are folded into the tier aggregate.
+    /// Test-only convenience: append a segment with no shared per-apply
+    /// `source_position` (the production path uses
+    /// [`Self::append_segment_with_source_position`] directly).
+    #[cfg(test)]
     #[must_use]
     pub(crate) fn append_segment(
         &self,
@@ -374,6 +390,34 @@ impl MemTier {
         incoming_bytes: u64,
         incoming_rows: u64,
         superseded: u64,
+    ) -> Self {
+        self.append_segment_with_source_position(
+            batches,
+            data_sequence,
+            tombstones,
+            incoming_bytes,
+            incoming_rows,
+            superseded,
+            None,
+        )
+    }
+
+    /// `append_segment`, additionally stamping the shared per-apply slot-ack epoch
+    /// (`source_position`) on the new segment (§3.4 Fix 1). At N==1 callers pass
+    /// `None` (the single-shard path keeps `MemTier::epoch` as the slot-ack axis,
+    /// byte-identical). At N>1 every shard append of one apply passes the SAME
+    /// value so the checkpoint reconciles cross-shard durable coverage on one axis.
+    #[must_use]
+    #[expect(clippy::too_many_arguments)]
+    pub(crate) fn append_segment_with_source_position(
+        &self,
+        batches: Arc<Vec<RecordBatch>>,
+        data_sequence: i64,
+        tombstones: SegmentTombstones,
+        incoming_bytes: u64,
+        incoming_rows: u64,
+        superseded: u64,
+        source_position: Option<u64>,
     ) -> Self {
         let statistics = batches.first().map_or_else(
             || Arc::new(Statistics::new_unknown(&Schema::empty())),
@@ -405,6 +449,7 @@ impl MemTier {
             bytes: incoming_bytes,
             rows: incoming_rows,
             superseded,
+            source_position,
         });
 
         Self {
@@ -417,14 +462,6 @@ impl MemTier {
             oldest_append: self.oldest_append.or_else(|| Some(Instant::now())),
             version: self.version + 1,
         }
-    }
-
-    /// Wall-clock age of the oldest un-checkpointed segment, or zero when empty.
-    #[must_use]
-    pub(crate) fn age_ms(&self) -> u64 {
-        self.oldest_append.map_or(0, |t| {
-            u64::try_from(t.elapsed().as_millis()).unwrap_or(u64::MAX)
-        })
     }
 
     /// The tier that REMAINS after a checkpoint durably flushed the first
@@ -476,6 +513,246 @@ impl MemTier {
             oldest_append: Some(Instant::now()),
             version: self.version + 1,
         }
+    }
+
+    /// The maximum shared per-apply slot-ack epoch (`source_position`) over the
+    /// first `flushed_segment_count` segments — the prefix a checkpoint is about
+    /// to make durable. Returns `None` when no segment in the prefix carries a
+    /// `source_position` (N==1, or an empty/position-based prefix), so the
+    /// checkpoint falls back to the single-shard `epoch` axis. Used by the
+    /// all-shards-atomic checkpoint to compute the cross-shard durable watermark
+    /// as the **MAX** over shards of this value (§3.4 Fix 1) — NOT the min. MAX is
+    /// safe *because* every checkpoint is all-shards-atomic over each shard's FULL
+    /// segment prefix (§3.4 Fix 2/3): there is no partial-coverage state, so every
+    /// epoch `<=` the cross-shard max is durable in some shard's prefix. A MIN
+    /// would UNDER-ack — an apply stamps its epoch only on the shards it touched,
+    /// so a cold shard pins the min low and the source slot never advances (WAL
+    /// never drains). LOAD-BEARING: MAX correctness depends on no single-shard /
+    /// partial-prefix checkpoint ever existing; a min would be required the moment
+    /// that invariant is broken.
+    #[must_use]
+    pub(crate) fn max_source_position_in_prefix(
+        &self,
+        flushed_segment_count: usize,
+    ) -> Option<u64> {
+        let end = flushed_segment_count.min(self.segments.len());
+        self.segments[..end]
+            .iter()
+            .filter_map(|s| s.source_position)
+            .max()
+    }
+}
+
+/// A fixed fan-out of independent [`MemTier`] shards, each its own `ArcSwap` so
+/// a single shard's append/checkpoint swap is O(1) and lock-free for readers.
+///
+/// The fan-out N is set per table by `cdc_mem_tier_shards` (default 1) and is
+/// fixed for the table's lifetime. At N=1 it is byte-for-byte identical to the
+/// prior single `ArcSwap<MemTier>` field — the sharded append/validation/read/
+/// checkpoint paths all collapse to the single-shard case. At N>1 one CDC apply
+/// is fanned across the shards, which validate + append concurrently.
+///
+/// Shard assignment is by the PK `OwnedRow` bytes (see
+/// `table::shard_of_pk`), NOT the derived big-endian-i64 encoding — sharding a
+/// derived artifact would split a key's history across shards and break
+/// last-writer-wins. The byte/age caps and checkpoints are **whole-tier**
+/// (summed/earliest across shards), never per-shard, so a single hot shard
+/// cannot pin the source watermark and starve WAL drain (parallelism-plan
+/// correctness fix #2).
+#[derive(Debug)]
+pub(crate) struct ShardedMemTier {
+    /// One independent `ArcSwap<MemTier>` per shard. `Box<[_]>` (not `Vec`) pins
+    /// the fan-out immutable after construction — a live provider never resizes.
+    shards: Box<[ArcSwap<MemTier>]>,
+}
+
+impl ShardedMemTier {
+    /// `n` empty shards (`n` is clamped to `>= 1`). Phase 2 always passes `1`;
+    /// the multi-shard path is exercised only once Phase 3 sizes the fan-out.
+    #[must_use]
+    pub(crate) fn empty(n: usize) -> Self {
+        let shards: Box<[ArcSwap<MemTier>]> = (0..n.max(1))
+            .map(|_| ArcSwap::from_pointee(MemTier::empty()))
+            .collect();
+        Self { shards }
+    }
+
+    /// The number of shards (always `>= 1`).
+    #[must_use]
+    #[inline]
+    pub(crate) fn shard_count(&self) -> usize {
+        self.shards.len()
+    }
+
+    /// Test-only convenience accessor for the single backing tier at N==1.
+    /// Production code uses `shard(i)` / `shards()` directly; this exists so unit
+    /// tests can assert on the lone shard. The `debug_assert!` pins the N==1
+    /// assumption (a test that builds N>1 and calls this is the bug).
+    #[cfg(test)]
+    #[must_use]
+    #[inline]
+    pub(crate) fn tier(&self) -> &ArcSwap<MemTier> {
+        debug_assert_eq!(
+            self.shards.len(),
+            1,
+            "ShardedMemTier::tier() is the N==1 compatibility shim; this site must \
+             be migrated to per-shard routing before the fan-out exceeds 1 (Phase 3)"
+        );
+        &self.shards[0]
+    }
+
+    /// The `i`-th shard's `ArcSwap` (Phase 3 per-shard append/validation/checkpoint).
+    #[must_use]
+    #[inline]
+    pub(crate) fn shard(&self, i: usize) -> &ArcSwap<MemTier> {
+        &self.shards[i]
+    }
+
+    /// All shards, for cross-shard reads/aggregation (Phase 3+).
+    #[must_use]
+    #[inline]
+    pub(crate) fn shards(&self) -> &[ArcSwap<MemTier>] {
+        &self.shards
+    }
+
+    /// True only when **every** shard is empty.
+    #[must_use]
+    pub(crate) fn is_empty(&self) -> bool {
+        self.shards.iter().all(|s| s.load().is_empty())
+    }
+
+    /// Sum of retained bytes across all shards — the whole-tier byte trigger.
+    #[must_use]
+    pub(crate) fn total_bytes(&self) -> u64 {
+        self.shards
+            .iter()
+            .map(|s| s.load().bytes)
+            .fold(0u64, u64::saturating_add)
+    }
+
+    /// Sum of retained rows across all shards.
+    #[must_use]
+    pub(crate) fn total_rows(&self) -> u64 {
+        self.shards
+            .iter()
+            .map(|s| s.load().rows)
+            .fold(0u64, u64::saturating_add)
+    }
+
+    /// The oldest un-checkpointed append across all shards — the age cap is
+    /// whole-tier (the crash-replay window is bounded by the EARLIEST shard).
+    #[must_use]
+    pub(crate) fn oldest_append(&self) -> Option<Instant> {
+        self.shards
+            .iter()
+            .filter_map(|s| s.load().oldest_append)
+            .min()
+    }
+
+    /// True if ANY shard carries tombstones. Used by the read path to decide
+    /// whether the merge-on-read deletion view is the identity (skip the union).
+    /// At N==1 this is exactly `mem_tier_has_tombstones(shard 0)`.
+    #[must_use]
+    pub(crate) fn any_tombstones(&self) -> bool {
+        self.shards.iter().any(|s| {
+            let t = s.load();
+            !t.tombstones.int64_pk.is_empty() || !t.tombstones.row_keys.is_empty()
+        })
+    }
+
+    /// The whole-tier tombstone view over a set of CAPTURED shard snapshots —
+    /// the union of every shard's `InMemTombstones`. Because each shard owns a
+    /// disjoint key set (a key always hashes to one shard), the union is a plain
+    /// concatenation: no cross-shard key ever collides, so the per-key `max` in
+    /// [`InMemTombstones::merge_from`] only ever sees a single value.
+    ///
+    /// Hot-path identity preserved: with exactly ONE non-empty shard the result
+    /// is that shard's `tombstones.clone()` (the O(1) HAMT-root clone the
+    /// single-tier `mem_tier_deletion_maps` returned) — at N==1 this is
+    /// byte-identical to the pre-shard path with zero extra allocation.
+    #[must_use]
+    pub(crate) fn union_tombstones(shards: &[Arc<MemTier>]) -> InMemTombstones {
+        // Find the non-empty shards; reuse the first as the base (O(1) clone),
+        // then fold the rest in. With 0 or 1 non-empty shard this is `default()`
+        // or a single O(1) clone — no per-key rebuild.
+        let mut nonempty = shards.iter().filter(|s| !s.tombstones.is_empty());
+        let Some(base) = nonempty.next() else {
+            return InMemTombstones::default();
+        };
+        let mut merged = base.tombstones.clone();
+        for shard in nonempty {
+            merged.merge_from(&shard.tombstones);
+        }
+        merged
+    }
+
+    /// Build a synthetic single-tier VIEW over a set of CAPTURED shard snapshots
+    /// for the all-shards-atomic checkpoint's metadata/encode path (§3.4 Fix 2/3).
+    /// The `tombstones` are the cross-shard UNION (disjoint keys ⇒ a plain
+    /// concatenation, no per-key collision); `bytes`/`rows`/`superseded` are summed;
+    /// `epoch` is the supplied cross-shard durable watermark; `version` is the
+    /// `version_hash`. `segments` is EMPTY — the per-shard flushed prefixes and the
+    /// per-shard `retain_after` clears operate on the real shard tiers, not this
+    /// view; the view exists only so the checkpoint's metadata commit
+    /// (`commit_mem_tier_checkpoint_metadata`, which reads `tombstones`) and the
+    /// `mem_tier_has_tombstones` / inline-removal-map paths see the whole-tier
+    /// tombstone union. At N==1 callers pass shard 0's snapshot directly instead
+    /// (this view is only built at N>1), so the single-shard checkpoint is
+    /// byte-identical.
+    #[must_use]
+    pub(crate) fn union_snapshot_view(shards: &[Arc<MemTier>], durable_epoch: u64) -> MemTier {
+        let tombstones = Self::union_tombstones(shards);
+        let mut bytes = 0u64;
+        let mut rows = 0u64;
+        let mut superseded = 0u64;
+        let mut oldest_append: Option<Instant> = None;
+        for s in shards {
+            bytes = bytes.saturating_add(s.bytes);
+            rows = rows.saturating_add(s.rows);
+            superseded = superseded.saturating_add(s.superseded);
+            if let Some(t) = s.oldest_append {
+                oldest_append = Some(oldest_append.map_or(t, |cur: Instant| cur.min(t)));
+            }
+        }
+        MemTier {
+            segments: Arc::new(Vec::new()),
+            tombstones,
+            bytes,
+            rows,
+            superseded,
+            epoch: durable_epoch,
+            oldest_append,
+            version: Self::version_hash_of(shards),
+        }
+    }
+
+    /// A cheap order-insensitive combination of a set of CAPTURED shard snapshots'
+    /// which already pinned `Vec<Arc<MemTier>>`). Identical semantics: N==1
+    /// returns shard 0's raw `version` (byte-identical memo key); N>1 hashes the
+    /// version vector.
+    #[must_use]
+    pub(crate) fn version_hash_of(shards: &[Arc<MemTier>]) -> u64 {
+        if shards.len() == 1 {
+            return shards[0].version;
+        }
+        // A position-sensitive hash of the per-shard version VECTOR. It changes
+        // when ANY shard's version moves (an append/clear on that shard), so the
+        // memo invalidates on any shard mutation — exactly the single-tier
+        // `version`'s role, generalized to the vector.
+        let mut acc: u64 = 0;
+        for (i, s) in shards.iter().enumerate() {
+            let v = s.version;
+            // Splitmix-style avalanche of (version, shard index) so distinct
+            // vectors don't collide on a plain XOR (e.g. [v,v] vs [0,0]).
+            let mut x = v
+                .wrapping_mul(0x9E37_79B9_7F4A_7C15)
+                .wrapping_add(i as u64 + 1);
+            x = (x ^ (x >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            x = (x ^ (x >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            x ^= x >> 31;
+            acc ^= x;
+        }
+        acc
     }
 }
 
