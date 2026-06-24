@@ -78,6 +78,7 @@ pub fn fold_completion_stream(
                 finish_reason: None,
                 logprobs: None,
                 message: ChatCompletionResponseMessage {
+                    reasoning_content: None,
                     content: None,
                     refusal: None,
                     tool_calls: None,

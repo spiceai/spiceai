@@ -31,7 +31,7 @@ name: postgres-cayenne[file]-adaptive-turso
 # comparison isolates the effect of adaptive tuning, not caching/history overhead.
 
 postgres_connection_params: &postgres_params
-  pg_host: 127.0.0.1
+  pg_host: ${env:CHBENCH_PG_HOST}
   pg_port: 5432
   pg_db: chbench
   pg_user: bench
@@ -39,6 +39,8 @@ postgres_connection_params: &postgres_params
   pg_sslmode: disable
 
 runtime:
+  flight:
+    ipc_compression: lz4_frame
   caching:
     sql_results:
       enabled: false
