@@ -27,6 +27,8 @@ name: postgres-cayenne[file]-cdc-tuned-sf100
 # NOTE: validated on 16-core local + the 128-core write-concurrency study; the 64c/256GB
 # end-to-end run is the remaining validation (m7a.16xlarge + gp3).
 runtime:
+  flight:
+    ipc_compression: lz4_frame
   params:
     cdc_prefetch_buffer: '16384'
     cdc_max_coalesced_envelopes: '16384'
