@@ -344,8 +344,15 @@ mod tests {
 
         // Shrink below `used`: the 600 stays reserved, but no new reservation fits.
         b.set_total(500);
-        assert_eq!(b.used.load(Ordering::Acquire), 600, "live reservation preserved");
-        assert!(!b.try_reserve(1), "nothing fits while used (600) exceeds total (500)");
+        assert_eq!(
+            b.used.load(Ordering::Acquire),
+            600,
+            "live reservation preserved"
+        );
+        assert!(
+            !b.try_reserve(1),
+            "nothing fits while used (600) exceeds total (500)"
+        );
 
         // A release that brings used under the new total admits reserves again.
         b.release(200);

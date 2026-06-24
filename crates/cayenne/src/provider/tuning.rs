@@ -1695,7 +1695,11 @@ pub(crate) fn decide_with_goals(
                       bounds: (i64, i64),
                       actuator: Actuator,
                       reasons: (&'static str, &'static str)| {
-            let target = if mem_critical { bounds.0 } else { shrink_i64(cur_v) };
+            let target = if mem_critical {
+                bounds.0
+            } else {
+                shrink_i64(cur_v)
+            };
             clamp_move_i64(cur_v, target, bounds).map(|v| Adjustment {
                 actuator,
                 new_value: u64::try_from(v).unwrap_or(0),

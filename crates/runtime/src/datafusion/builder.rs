@@ -647,7 +647,8 @@ impl DataFusionBuilder {
             .compaction_memory_fraction
             .and_then(validate_compaction_memory_fraction);
         let cayenne_active = compaction_memory_fraction.is_some();
-        let effective_memory_limit = effective_query_memory_limit(self.memory_limit, cayenne_active);
+        let effective_memory_limit =
+            effective_query_memory_limit(self.memory_limit, cayenne_active);
         let compaction_memory_bytes = compaction_memory_fraction.map(|fraction| {
             #[expect(
                 clippy::cast_precision_loss,
@@ -1672,8 +1673,14 @@ mod tests {
     /// whether Cayenne is active — the coordinated default only applies when unset.
     #[test]
     fn effective_query_memory_limit_honors_explicit_value() {
-        assert_eq!(effective_query_memory_limit(Some(123 << 30), true), 123 << 30);
-        assert_eq!(effective_query_memory_limit(Some(123 << 30), false), 123 << 30);
+        assert_eq!(
+            effective_query_memory_limit(Some(123 << 30), true),
+            123 << 30
+        );
+        assert_eq!(
+            effective_query_memory_limit(Some(123 << 30), false),
+            123 << 30
+        );
         assert_eq!(effective_query_memory_limit(Some(7), true), 7);
     }
 
@@ -1732,11 +1739,17 @@ mod tests {
 
             // Tiny pools → tier grows to the ceiling (uses spare RAM), never above.
             let big = coordinated_mem_tier_budget(total, total / 100, 0);
-            assert_eq!(big, ceiling, "small pools should grow the tier to the ceiling");
+            assert_eq!(
+                big, ceiling,
+                "small pools should grow the tier to the ceiling"
+            );
 
             // A greedy pool that consumes all of host → tier floored, never 0.
             let small = coordinated_mem_tier_budget(total, total, 0);
-            assert_eq!(small, floor, "a greedy pool floors the tier (still a nonzero cap)");
+            assert_eq!(
+                small, floor,
+                "a greedy pool floors the tier (still a nonzero cap)"
+            );
             assert!(small > 0, "the global aggregate cap must never be disabled");
         }
     }
