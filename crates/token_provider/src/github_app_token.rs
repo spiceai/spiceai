@@ -1,5 +1,5 @@
 /*
-Copyright 2024-2025 The Spice.ai OSS Authors
+Copyright 2024-2026 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -64,12 +64,12 @@ pub enum GitHubAppError {
     InvalidSystemTime { source: std::num::TryFromIntError },
 
     #[snafu(display(
-        "Failed to generate JWT Verify the GitHub Connector configuration and try again. For details, visit: https://spiceai.org/docs/components/data-connectors/github#common-configuration"
+        "Failed to generate JWT. Verify the GitHub Connector configuration and try again. For details, visit: https://spiceai.org/docs/components/data-connectors/github#common-configuration"
     ))]
     UnableToGenerateJWT { source: jsonwebtoken::errors::Error },
 
     #[snafu(display(
-        "Failed to get GitHub installation access token Verify the GitHub Connector configuration and try again. For details, visit: https://spiceai.org/docs/components/data-connectors/github#common-configuration"
+        "Failed to get GitHub installation access token. Verify the GitHub Connector configuration and try again. For details, visit: https://spiceai.org/docs/components/data-connectors/github#common-configuration"
     ))]
     UnableToGetGitHubInstallationAccessToken { source: reqwest::Error },
 
@@ -78,7 +78,7 @@ pub enum GitHubAppError {
     ))]
     UnableToGetGitHubInstallationAccessTokenBody { source: reqwest::Error },
 
-    #[snafu(display("Unable to parse GitHub token expiration page"))]
+    #[snafu(display("Unable to parse GitHub token expiration timestamp"))]
     UnableToParseTokenExpiration {},
 }
 
@@ -234,9 +234,12 @@ impl GitHubToken {
     #[expect(clippy::cast_sign_loss)]
     #[must_use]
     pub fn next_wait(&self) -> Duration {
-        Duration::from_secs(
-            ((self.expires_at - Utc::now()).num_seconds() as u64) - TOKEN_REFRESH_BUFFER_SECS,
-        )
+        // Clamp seconds-until-expiry to a non-negative value before casting to u64;
+        // an already-expired (or near-expired) token yields a negative value that would
+        // otherwise wrap to a huge sleep. Subtract the refresh buffer with saturating
+        // subtraction so it floors at 0 rather than underflowing.
+        let seconds_until_expiry = (self.expires_at - Utc::now()).num_seconds().max(0) as u64;
+        Duration::from_secs(seconds_until_expiry.saturating_sub(TOKEN_REFRESH_BUFFER_SECS))
     }
 }
 
