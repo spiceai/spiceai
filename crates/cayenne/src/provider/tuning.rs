@@ -121,6 +121,16 @@ const MEM_PRESSURE_HIGH: f64 = 0.85;
 /// [`MEM_PRESSURE_HIGH`] avoids grow/shrink flapping near the limit.
 const MEM_PRESSURE_OK: f64 = 0.75;
 
+/// Memory-usage fraction at which pressure is CRITICAL: close enough to the host
+/// ceiling that one ×2/3 shrink step per dwell is too slow. At or above this the
+/// controller (a) collapses the live memory caps — inline memtable then mem-tier —
+/// straight to their floors in a single move, and (b) the impure mem-tier
+/// checkpoint tick bypasses its churn gate to force an immediate drain, actually
+/// releasing resident RAM (a cap shrink alone does not evict already-resident
+/// bytes). A last-resort safety valve ABOVE [`MEM_PRESSURE_HIGH`], atop the
+/// structural query-pool/tier partition that already prevents overcommit.
+pub(crate) const MEM_PRESSURE_CRITICAL: f64 = 0.90;
+
 /// CPU busy-fraction (of available cores, cgroup-aware) below which the controller
 /// re-enables CPU-stealing moves — adding write-encode shards and shrinking the
 /// compaction interval both compete with query threads, so they are withheld until
@@ -800,6 +810,15 @@ impl IngestStats {
         if let Some(milli) = pressure_to_milli(fraction) {
             self.mem_pressure_milli.store(milli, Ordering::Relaxed);
         }
+    }
+
+    /// Current memory pressure (`used / budget`), or `None` when unsampled
+    /// (non-Linux, no budget installed). A single relaxed atomic load — the cheap
+    /// path for hot loops that need only this one signal, not a full
+    /// [`IngestSnapshot`].
+    #[must_use]
+    pub fn mem_pressure(&self) -> Option<f64> {
+        milli_to_pressure(self.mem_pressure_milli.load(Ordering::Relaxed))
     }
 
     /// Fold in an upstream commit timestamp (ms since the Unix epoch) for a freshly
@@ -1625,6 +1644,11 @@ pub(crate) fn decide_with_goals(
 
     let mem_high = s.mem_pressure.is_some_and(|p| p > MEM_PRESSURE_HIGH);
     let mem_ok = s.mem_pressure.is_none_or(|p| p < MEM_PRESSURE_OK);
+    // CRITICAL pressure: approaching the host ceiling. The shrink below collapses
+    // the live caps straight to their floors (not one ×2/3 step) so they stop
+    // admitting growth at once; the impure checkpoint tick pairs this with a
+    // forced mem-tier drain to release resident RAM.
+    let mem_critical = s.mem_pressure.is_some_and(|p| p >= MEM_PRESSURE_CRITICAL);
     // Fresh-sample gate: the rate/latency EWMAs only advance on a CDC write, so a
     // table that fell behind and then went idle keeps a stale `apply_vs_arrival`
     // above 1 indefinitely. Without this gate the controller would re-fire the
@@ -1664,27 +1688,41 @@ pub(crate) fn decide_with_goals(
     // already-tight box; query read-amp is instead relieved by compaction (which
     // costs CPU, not memory).
     if mem_high {
-        if let Some(v) = clamp_move_i64(
+        // Under CRITICAL pressure jump straight to the floor in one move; otherwise
+        // take a single ×2/3 step and re-evaluate next dwell. Same shape for the
+        // inline memtable and the mem-tier cap (`reasons` = (critical, normal)).
+        let shrink = |cur_v: i64,
+                      bounds: (i64, i64),
+                      actuator: Actuator,
+                      reasons: (&'static str, &'static str)| {
+            let target = if mem_critical { bounds.0 } else { shrink_i64(cur_v) };
+            clamp_move_i64(cur_v, target, bounds).map(|v| Adjustment {
+                actuator,
+                new_value: u64::try_from(v).unwrap_or(0),
+                reason: if mem_critical { reasons.0 } else { reasons.1 },
+            })
+        };
+        if let Some(adj) = shrink(
             cur.inline_flush_max_bytes,
-            shrink_i64(cur.inline_flush_max_bytes),
             b.inline_flush_max_bytes,
+            Actuator::InlineFlushBytes,
+            (
+                "critical memory pressure: collapse memtable to floor",
+                "memory pressure: shrink memtable to stay within the cgroup budget",
+            ),
         ) {
-            return Some(Adjustment {
-                actuator: Actuator::InlineFlushBytes,
-                new_value: u64::try_from(v).unwrap_or(0),
-                reason: "memory pressure: shrink memtable to stay within the cgroup budget",
-            });
+            return Some(adj);
         }
-        if let Some(v) = clamp_move_i64(
+        if let Some(adj) = shrink(
             cur.mem_tier_max_bytes,
-            shrink_i64(cur.mem_tier_max_bytes),
             b.mem_tier_max_bytes,
+            Actuator::MemTierMaxBytes,
+            (
+                "critical memory pressure: collapse the in-memory CDC tier cap to floor",
+                "memory pressure: shrink the in-memory CDC tier cap to free RAM",
+            ),
         ) {
-            return Some(Adjustment {
-                actuator: Actuator::MemTierMaxBytes,
-                new_value: u64::try_from(v).unwrap_or(0),
-                reason: "memory pressure: shrink the in-memory CDC tier cap to free RAM",
-            });
+            return Some(adj);
         }
     }
 
