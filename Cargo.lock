@@ -6369,7 +6369,7 @@ dependencies = [
 [[package]]
 name = "datafusion-table-providers"
 version = "0.1.0"
-source = "git+https://github.com/spiceai/datafusion-table-providers.git?rev=d878f0de2464#d878f0de2464cd5dcc4168abf38f2b426604b6d0"
+source = "git+https://github.com/spiceai/datafusion-table-providers.git?rev=5789a8391a71553d4d38e2d2399c1099fbf12265#5789a8391a71553d4d38e2d2399c1099fbf12265"
 dependencies = [
  "adbc_core",
  "adbc_driver_manager",
@@ -6396,6 +6396,7 @@ dependencies = [
  "geo-types",
  "hickory-resolver",
  "itertools 0.14.0",
+ "logos",
  "mongodb",
  "mysql_async",
  "native-tls",
