@@ -645,6 +645,7 @@ mod tests {
                 choices: vec![ChatChoice {
                     index: 0,
                     message: ChatCompletionResponseMessage {
+                        reasoning_content: None,
                         content: Some(response_text),
                         role: Role::Assistant,
                         #[expect(deprecated)]
@@ -948,6 +949,7 @@ mod tests {
                 choices: vec![ChatChoice {
                     index: 0,
                     message: ChatCompletionResponseMessage {
+                        reasoning_content: None,
                         content: None, // This represents a null/empty response
                         role: Role::Assistant,
                         #[expect(deprecated)]

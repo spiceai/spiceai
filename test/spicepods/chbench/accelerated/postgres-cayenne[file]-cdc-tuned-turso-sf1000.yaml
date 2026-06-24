@@ -8,6 +8,8 @@ name: postgres-cayenne[file]-cdc-tuned-turso-sf1000
 # scheduled CH-benCHmark so its write-conflict / commit behavior is tracked vs the sqlite twin.
 
 runtime:
+  flight:
+    ipc_compression: lz4_frame
   params:
     cdc_prefetch_buffer: '16384'
     cdc_max_coalesced_envelopes: '16384'
@@ -19,7 +21,7 @@ runtime:
     cayenne_metastore_cache_mb: '1024'
     cayenne_metastore_mmap_mb: '4096'
   query:
-    target_partitions: 64
+    target_partitions: 48
   caching:
     sql_results:
       enabled: false
@@ -27,7 +29,7 @@ runtime:
     enabled: false
 
 postgres_connection_params: &postgres_params
-  pg_host: 127.0.0.1
+  pg_host: ${env:CHBENCH_PG_HOST}
   pg_port: '5432'
   pg_db: chbench
   pg_user: bench
@@ -59,8 +61,7 @@ datasets:
         cayenne_file_path: .spice/cayenne/district
         # Explicit: the engine default flipped to `memory`. This pod IS the
         # file-durability variant (per-batch durable persist before the slot
-        # ack) — its identity must not depend on the build's default. The
-        # memory-durability twin is postgres-cayenne[file]-cdc-memory.yaml.
+        # ack) — its identity must not depend on the build's default.
         cayenne_cdc_durability: file
         # KEY deletes even in file mode: deletion_mode auto resolves to
         # position, which serializes compaction with writers (try_lock

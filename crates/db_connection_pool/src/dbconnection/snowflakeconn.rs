@@ -21,7 +21,7 @@ use std::time::Instant;
 
 use arrow::array::{
     Array, ArrayRef, AsArray, Decimal128Array, Int32Array, Int64Array, PrimitiveArray, RecordBatch,
-    StringArray, StructArray, TimestampNanosecondArray,
+    StringArray, StructArray, Time64NanosecondArray, TimestampNanosecondArray,
 };
 use arrow::datatypes::{
     ArrowPrimitiveType, DataType, Field, Int8Type, Int16Type, Int32Type, Int64Type, Schema,
@@ -336,23 +336,58 @@ pub fn snowflake_schema_cast(record_batch: &RecordBatch) -> Result<RecordBatch, 
         let column = record_batch.column(idx);
         let field_metadata = field.metadata();
         if let Some(sf_logical_type) = field_metadata.get("logicalType") {
+            // Snowflake encodes sub-second precision for temporal types via a
+            // per-column `scale` (fractional-second digits, 0..=9). The
+            // timestamp/time arms below use it to pick the correct
+            // seconds->nanoseconds multiplier. Absent or unparseable metadata
+            // falls back to scale 0 (whole-second precision), which preserves
+            // the pre-scale behavior for inputs that genuinely were in seconds.
+            let temporal_scale = field_metadata
+                .get("scale")
+                .and_then(|s| s.parse::<i8>().ok())
+                .unwrap_or(0);
             match sf_logical_type.to_lowercase().as_str() {
                 "timestamp_ntz" | "timestamp_ltz" => {
-                    fields.push(Arc::new(Field::new(
-                        field.name(),
-                        DataType::Timestamp(TimeUnit::Nanosecond, None),
-                        field.is_nullable(),
-                    )));
-                    columns.push(cast_sf_timestamp_to_arrow_timestamp(column, false)?);
+                    // Preserve Snowflake field metadata (logicalType, scale,
+                    // precision) by cloning the field rather than rebuilding it
+                    // with `Field::new`, which would drop it.
+                    fields.push(Arc::new(
+                        field
+                            .as_ref()
+                            .clone()
+                            .with_data_type(DataType::Timestamp(TimeUnit::Nanosecond, None)),
+                    ));
+                    columns.push(cast_sf_timestamp_to_arrow_timestamp(
+                        column,
+                        false,
+                        temporal_scale,
+                    )?);
                     continue;
                 }
                 "timestamp_tz" => {
-                    fields.push(Arc::new(Field::new(
-                        field.name(),
+                    fields.push(Arc::new(field.as_ref().clone().with_data_type(
                         DataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into())),
-                        field.is_nullable(),
                     )));
-                    columns.push(cast_sf_timestamp_to_arrow_timestamp(column, true)?);
+                    columns.push(cast_sf_timestamp_to_arrow_timestamp(
+                        column,
+                        true,
+                        temporal_scale,
+                    )?);
+                    continue;
+                }
+                "time" => {
+                    // TIME is declared `Time64(Nanosecond)` by the type parser
+                    // but arrives as a raw scaled Int64 (units of 10^-scale
+                    // seconds since midnight). Without this arm it fell through
+                    // the catch-all below and shipped unconverted under a schema
+                    // that claimed nanoseconds.
+                    fields.push(Arc::new(
+                        field
+                            .as_ref()
+                            .clone()
+                            .with_data_type(DataType::Time64(TimeUnit::Nanosecond)),
+                    ));
+                    columns.push(cast_sf_time_to_arrow_time64(column, temporal_scale)?);
                     continue;
                 }
                 "fixed"
@@ -366,11 +401,12 @@ pub fn snowflake_schema_cast(record_batch: &RecordBatch) -> Result<RecordBatch, 
                         && let (Ok(precision), Ok(scale)) =
                             (precision_str.parse::<u8>(), scale_str.parse::<i8>())
                     {
-                        fields.push(Arc::new(Field::new(
-                            field.name(),
-                            DataType::Decimal128(precision, scale),
-                            field.is_nullable(),
-                        )));
+                        fields.push(Arc::new(
+                            field
+                                .as_ref()
+                                .clone()
+                                .with_data_type(DataType::Decimal128(precision, scale)),
+                        ));
 
                         columns.push(cast_sf_fixed_point_number_to_decimal(
                             column, precision, scale,
@@ -389,7 +425,18 @@ pub fn snowflake_schema_cast(record_batch: &RecordBatch) -> Result<RecordBatch, 
     RecordBatch::try_new(schema, columns).context(FailedToCreateRecordBatchSnafu)
 }
 
-fn cast_sf_timestamp_to_arrow_timestamp(column: &ArrayRef, is_tz: bool) -> Result<ArrayRef, Error> {
+/// Casts a Snowflake `TIMESTAMP_*` column to an Arrow nanosecond timestamp.
+///
+/// `scale` is the column's fractional-second precision (0..=9). It is only
+/// consulted for the primitive `Int64` wire encoding (scale <= 7), where the
+/// value is in units of `10^-scale` seconds. The `struct{epoch, fraction}`
+/// encoding (scale 8-9) already carries whole seconds plus a nanosecond
+/// fraction, so it is scale-independent and ignores the parameter.
+fn cast_sf_timestamp_to_arrow_timestamp(
+    column: &ArrayRef,
+    is_tz: bool,
+    scale: i8,
+) -> Result<ArrayRef, Error> {
     // Try to downcast to StructArray first
     if let Some(struct_array) = column.as_any().downcast_ref::<StructArray>() {
         let expected_fields = if is_tz { 3 } else { 2 };
@@ -438,7 +485,15 @@ fn cast_sf_timestamp_to_arrow_timestamp(column: &ArrayRef, is_tz: bool) -> Resul
 
         Ok(Arc::new(builder.finish()) as ArrayRef)
     } else if let Some(epoch_array) = column.as_any().downcast_ref::<Int64Array>() {
-        // Handle case where Snowflake returns a primitive Int64Array (seconds precision)
+        // Snowflake sends TIMESTAMP_* with scale <= 7 as a primitive Int64 whose
+        // value is in units of 10^-scale seconds, NOT always whole seconds. The
+        // previous code unconditionally multiplied by 1e9, so a TIMESTAMP_NTZ(3)
+        // value in milliseconds (~1.7e12) overflowed i64 in `checked_mul` and
+        // every row silently became NULL. Use the scale-derived multiplier.
+        let multiplier =
+            scale_to_nanos_multiplier(scale).context(UnableToCastSnowflakeTimestampSnafu {
+                reason: format!("unsupported timestamp scale {scale} (expected 0..=9)"),
+            })?;
         let mut builder = TimestampNanosecondArray::builder(epoch_array.len());
         if is_tz {
             builder = builder.with_timezone(Arc::clone(&UTC_TIMEZONE));
@@ -448,7 +503,9 @@ fn cast_sf_timestamp_to_arrow_timestamp(column: &ArrayRef, is_tz: bool) -> Resul
             if epoch_array.is_null(idx) {
                 builder.append_null();
             } else {
-                match epoch_array.value(idx).checked_mul(NANOSECONDS) {
+                // NULL on overflow for instants outside the representable
+                // nanosecond range (~1677-2262), matching the struct path above.
+                match epoch_array.value(idx).checked_mul(multiplier) {
                     Some(ts) => builder.append_value(ts),
                     None => builder.append_null(),
                 }
@@ -462,6 +519,48 @@ fn cast_sf_timestamp_to_arrow_timestamp(column: &ArrayRef, is_tz: bool) -> Resul
         }
         .fail()
     }
+}
+
+/// Returns the multiplier that converts a Snowflake temporal value expressed in
+/// units of `10^-scale` seconds into nanoseconds, i.e. `10^(9 - scale)`.
+///
+/// Snowflake `TIMESTAMP_*` / `TIME` columns carry a `scale` (0..=9) giving the
+/// number of fractional-second digits, so a stored value `v` represents
+/// `v * 10^-scale` seconds = `v * 10^(9 - scale)` nanoseconds. Returns `None`
+/// for a scale outside the Snowflake-supported `0..=9` range so callers can
+/// fail loudly instead of silently producing wrong instants.
+fn scale_to_nanos_multiplier(scale: i8) -> Option<i64> {
+    let exponent = 9i8.checked_sub(scale).filter(|e| (0..=9).contains(e))?;
+    // `exponent` is in 0..=9, so the conversion and `pow` cannot overflow i64.
+    Some(10i64.pow(u32::from(u8::try_from(exponent).ok()?)))
+}
+
+/// Casts a Snowflake `TIME` column (raw scaled `Int64`, units of `10^-scale`
+/// seconds since midnight) to an Arrow `Time64(Nanosecond)` array.
+fn cast_sf_time_to_arrow_time64(column: &ArrayRef, scale: i8) -> Result<ArrayRef, Error> {
+    let value_array = column.as_any().downcast_ref::<Int64Array>().context(
+        UnableToCastSnowflakeTimestampSnafu {
+            reason: "TIME column is not an Int64Array",
+        },
+    )?;
+    let multiplier =
+        scale_to_nanos_multiplier(scale).context(UnableToCastSnowflakeTimestampSnafu {
+            reason: format!("unsupported TIME scale {scale} (expected 0..=9)"),
+        })?;
+
+    let mut builder = Time64NanosecondArray::builder(value_array.len());
+    for idx in 0..value_array.len() {
+        if value_array.is_null(idx) {
+            builder.append_null();
+        } else {
+            match value_array.value(idx).checked_mul(multiplier) {
+                Some(nanos) => builder.append_value(nanos),
+                None => builder.append_null(),
+            }
+        }
+    }
+
+    Ok(Arc::new(builder.finish()) as ArrayRef)
 }
 
 fn cast_sf_fixed_point_number_to_decimal(
@@ -722,7 +821,7 @@ mod tests {
         builder.append_values(&[1_696_164_330, 1_714_647_301], &[true, true]);
         let timestamp_ntz_array = Arc::new(builder.finish()) as Arc<dyn Array>;
 
-        let result = cast_sf_timestamp_to_arrow_timestamp(&timestamp_ntz_array, false)
+        let result = cast_sf_timestamp_to_arrow_timestamp(&timestamp_ntz_array, false, 0)
             .expect("Should cast Snowflake timestamp to Arrow timestamp");
         let result = result
             .as_any()
@@ -744,7 +843,7 @@ mod tests {
         builder.append_values(&[1_696_164_330, 1_714_647_301], &[true, true]);
         let timestamp_tz_array = Arc::new(builder.finish()) as Arc<dyn Array>;
 
-        let result = cast_sf_timestamp_to_arrow_timestamp(&timestamp_tz_array, true)
+        let result = cast_sf_timestamp_to_arrow_timestamp(&timestamp_tz_array, true, 0)
             .expect("Should cast Snowflake timestamp to Arrow timestamp");
         let result = result
             .as_any()
@@ -766,7 +865,8 @@ mod tests {
             vec![Some(1_696_164_330), None, Some(1_714_647_301)],
             vec![Some(0), None, Some(739_000_000)],
         );
-        let result = cast_sf_timestamp_to_arrow_timestamp(&timestamp_ntz_array, false)
+        // struct{epoch, fraction} encoding (scale 8-9); the scale arg is ignored.
+        let result = cast_sf_timestamp_to_arrow_timestamp(&timestamp_ntz_array, false, 9)
             .expect("Should cast Snowflake timestamp to Arrow timestamp");
         let result = result
             .as_any()
@@ -791,7 +891,8 @@ mod tests {
             vec![Some(0), None, Some(739_000_000)],
             vec![Some(1440), None, Some(1500)],
         );
-        let result = cast_sf_timestamp_to_arrow_timestamp(&timestamp_tz_array, true)
+        // struct{epoch, fraction, tz} encoding (scale 8-9); the scale arg is ignored.
+        let result = cast_sf_timestamp_to_arrow_timestamp(&timestamp_tz_array, true, 9)
             .expect("Should cast Snowflake timestamp to Arrow timestamp");
         let result = result
             .as_any()
@@ -825,6 +926,7 @@ mod tests {
         let result = cast_sf_timestamp_to_arrow_timestamp(
             &(Arc::new(timestamp_ntz_no_fraction) as ArrayRef),
             false,
+            0,
         );
 
         result.expect_err("Should fail for missing fraction field");
@@ -1616,7 +1718,7 @@ mod tests {
             vec![Some(0), Some(0)],
         );
 
-        let result = cast_sf_timestamp_to_arrow_timestamp(&timestamp_array, false)
+        let result = cast_sf_timestamp_to_arrow_timestamp(&timestamp_array, false, 0)
             .expect("Should not error on overflow");
         let result = result
             .as_any()
@@ -1633,7 +1735,7 @@ mod tests {
         builder.append_values(&[i64::MAX / NANOSECONDS + 1, 1_696_164_330], &[true, true]);
         let epoch_array = Arc::new(builder.finish()) as Arc<dyn Array>;
 
-        let result = cast_sf_timestamp_to_arrow_timestamp(&epoch_array, false)
+        let result = cast_sf_timestamp_to_arrow_timestamp(&epoch_array, false, 0)
             .expect("Should not error on overflow");
         let result = result
             .as_any()
@@ -1642,5 +1744,138 @@ mod tests {
 
         assert!(result.is_null(0), "Overflowing epoch should produce null");
         assert_eq!(result.value(1), 1_696_164_330_000_000_000);
+    }
+
+    #[test]
+    fn test_scale_to_nanos_multiplier() {
+        // 10^(9 - scale) for the supported range; None outside 0..=9.
+        assert_eq!(scale_to_nanos_multiplier(0), Some(1_000_000_000));
+        assert_eq!(scale_to_nanos_multiplier(3), Some(1_000_000));
+        assert_eq!(scale_to_nanos_multiplier(6), Some(1_000));
+        assert_eq!(scale_to_nanos_multiplier(9), Some(1));
+        assert_eq!(scale_to_nanos_multiplier(-1), None);
+        assert_eq!(scale_to_nanos_multiplier(10), None);
+    }
+
+    #[test]
+    fn test_cast_sf_timestamp_ntz_millisecond_scale_not_nulled() {
+        // Regression for #11268: a TIMESTAMP_NTZ(3) column arrives as a
+        // primitive Int64 in MILLISECONDS. The old code always multiplied by
+        // 1e9, overflowing i64 (1.7e12 * 1e9 > i64::MAX) so `checked_mul`
+        // returned None and every row silently became NULL. With scale 3 the
+        // multiplier is 1e6 and the value converts correctly.
+        let mut builder = Int64Builder::new();
+        // 2023-10-01T12:45:30.123Z expressed in milliseconds.
+        builder.append_values(&[1_696_164_330_123], &[true]);
+        let array = Arc::new(builder.finish()) as ArrayRef;
+
+        let result = cast_sf_timestamp_to_arrow_timestamp(&array, false, 3)
+            .expect("scale-3 timestamp should cast");
+        let result = result
+            .as_any()
+            .downcast_ref::<TimestampNanosecondArray>()
+            .expect("Should downcast to TimestampNanosecondArray");
+
+        assert!(!result.is_null(0), "scale-3 value must not be nulled");
+        assert_eq!(result.value(0), 1_696_164_330_123_000_000);
+    }
+
+    #[test]
+    fn test_cast_sf_timestamp_microsecond_scale() {
+        let mut builder = Int64Builder::new();
+        // 2023-10-01T12:45:30.123456Z expressed in microseconds.
+        builder.append_values(&[1_696_164_330_123_456], &[true]);
+        let array = Arc::new(builder.finish()) as ArrayRef;
+
+        let result = cast_sf_timestamp_to_arrow_timestamp(&array, false, 6)
+            .expect("scale-6 timestamp should cast");
+        let result = result
+            .as_any()
+            .downcast_ref::<TimestampNanosecondArray>()
+            .expect("Should downcast to TimestampNanosecondArray");
+
+        assert_eq!(result.value(0), 1_696_164_330_123_456_000);
+    }
+
+    #[test]
+    fn test_cast_sf_time_to_arrow_time64_scale_3() {
+        let mut builder = Int64Builder::new();
+        // 12:30:45.123 at scale 3 -> 45_045_123 milliseconds since midnight.
+        builder.append_value(45_045_123);
+        builder.append_null();
+        let array = Arc::new(builder.finish()) as ArrayRef;
+
+        let result = cast_sf_time_to_arrow_time64(&array, 3).expect("TIME should cast");
+        let result = result
+            .as_any()
+            .downcast_ref::<Time64NanosecondArray>()
+            .expect("Should downcast to Time64NanosecondArray");
+
+        // 45045.123 seconds since midnight, in nanoseconds.
+        assert_eq!(result.value(0), 45_045_123_000_000);
+        assert!(result.is_null(1));
+    }
+
+    #[test]
+    fn test_snowflake_schema_cast_timestamp_ntz_scale_preserves_value_and_metadata() {
+        // End-to-end through the dispatcher: a TIMESTAMP_NTZ(3) field carrying
+        // millisecond data must produce a non-NULL nanosecond timestamp AND
+        // retain the Snowflake field metadata (logicalType/scale) rather than
+        // dropping it via a bare `Field::new` rebuild.
+        let metadata = std::collections::HashMap::from([
+            ("logicalType".to_string(), "timestamp_ntz".to_string()),
+            ("scale".to_string(), "3".to_string()),
+            ("precision".to_string(), "0".to_string()),
+        ]);
+        let field = Field::new("ts", DataType::Int64, true).with_metadata(metadata);
+        let schema = Arc::new(Schema::new(vec![field]));
+        let column = Arc::new(Int64Array::from(vec![Some(1_696_164_330_123i64)])) as ArrayRef;
+        let batch = RecordBatch::try_new(schema, vec![column]).expect("valid batch");
+
+        let result = snowflake_schema_cast(&batch).expect("schema cast should succeed");
+        let out_field = result.schema().field(0).clone();
+        assert_eq!(
+            out_field.data_type(),
+            &DataType::Timestamp(TimeUnit::Nanosecond, None)
+        );
+        assert_eq!(
+            out_field.metadata().get("logicalType").map(String::as_str),
+            Some("timestamp_ntz"),
+            "Snowflake field metadata must survive the cast"
+        );
+        let ts = result
+            .column(0)
+            .as_any()
+            .downcast_ref::<TimestampNanosecondArray>()
+            .expect("Should downcast to TimestampNanosecondArray");
+        assert!(!ts.is_null(0), "scale-3 timestamp must not be nulled");
+        assert_eq!(ts.value(0), 1_696_164_330_123_000_000);
+    }
+
+    #[test]
+    fn test_snowflake_schema_cast_time_column() {
+        // TIME columns previously fell through the catch-all and shipped the
+        // raw scaled Int64 under a Time64(Nanosecond) schema. The dispatcher
+        // must now cast them.
+        let metadata = std::collections::HashMap::from([
+            ("logicalType".to_string(), "time".to_string()),
+            ("scale".to_string(), "3".to_string()),
+        ]);
+        let field = Field::new("t", DataType::Int64, true).with_metadata(metadata);
+        let schema = Arc::new(Schema::new(vec![field]));
+        let column = Arc::new(Int64Array::from(vec![Some(45_045_123i64)])) as ArrayRef;
+        let batch = RecordBatch::try_new(schema, vec![column]).expect("valid batch");
+
+        let result = snowflake_schema_cast(&batch).expect("schema cast should succeed");
+        assert_eq!(
+            result.schema().field(0).data_type(),
+            &DataType::Time64(TimeUnit::Nanosecond)
+        );
+        let t = result
+            .column(0)
+            .as_any()
+            .downcast_ref::<Time64NanosecondArray>()
+            .expect("Should downcast to Time64NanosecondArray");
+        assert_eq!(t.value(0), 45_045_123_000_000);
     }
 }
