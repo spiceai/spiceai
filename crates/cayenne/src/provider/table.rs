@@ -2218,12 +2218,6 @@ pub struct CayenneTableProvider {
     /// (the single shard keeps `MemTier::epoch` as the slot-ack currency, so the
     /// N=1 path is byte-identical). Shared across writer clones.
     mem_tier_apply_epoch: Arc<std::sync::atomic::AtomicU64>,
-    /// The highest epoch the most recent mem-tier checkpoint reported durable (the
-    /// last value handed to `fire_slot_advancer`). Observability ONLY — it feeds the
-    /// `cayenne_mem_tier_durable_epoch` gauge so the gap against `mem_tier_apply_epoch`
-    /// exposes a stuck slot-ack watermark (the N>1 WAL-drain stall) directly. Not read
-    /// by any control path. Shared across writer clones.
-    last_durable_epoch: Arc<std::sync::atomic::AtomicU64>,
     /// Cross-layer handle the runtime installs in memory mode so
     /// `checkpoint_mem_tier` can advance the source slot AFTER the durable fence
     /// (the slot-deferral correctness seam). `None` in file mode (and for
@@ -6408,7 +6402,6 @@ impl CayenneTableProvider {
                 .collect::<Vec<_>>()
                 .into(),
             mem_tier_apply_epoch: Arc::new(std::sync::atomic::AtomicU64::new(0)),
-            last_durable_epoch: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             slot_advancer: Arc::new(ParkingMutex::new(None)),
             mem_tier_max_age_ms,
             // Local providers can use `ensure_no_incomplete_write`'s
@@ -7158,7 +7151,6 @@ impl CayenneTableProvider {
             // lock (the seq-ordering invariant requires a single lock per table).
             mem_tier_publish_locks: Arc::clone(&self.mem_tier_publish_locks),
             mem_tier_apply_epoch: Arc::clone(&self.mem_tier_apply_epoch),
-            last_durable_epoch: Arc::clone(&self.last_durable_epoch),
             slot_advancer: Arc::clone(&self.slot_advancer),
             mem_tier_max_age_ms: self.mem_tier_max_age_ms,
             staging_wal_present: Arc::clone(&self.staging_wal_present),
@@ -16812,9 +16804,28 @@ impl CayenneTableProvider {
                     .mem_tier_apply_epoch
                     .fetch_add(1, std::sync::atomic::Ordering::SeqCst));
             };
-            return self
-                .append_to_mem_tier(Vec::new(), &deletions, total_incoming_bytes, 0)
-                .await;
+            // Stamp the shared per-apply slot-ack epoch even on this shard-0 fallback:
+            // a `source_position = None` append on a sharded tier (N>1) would make the
+            // checkpoint's MAX(source_position) watermark skip it → the deferred source
+            // slot stalls (the mixed-axis N>1 bug). Route through `append_to_shard` with
+            // the epoch so this stays on the single `apply_epoch` axis like every other
+            // N>1 apply, and return that epoch as the deferral receipt.
+            let apply_epoch = self
+                .mem_tier_apply_epoch
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let no_keys: HashSet<OwnedRow> = HashSet::new();
+            self.append_to_shard(
+                0,
+                Vec::new(),
+                &deletions,
+                total_incoming_bytes,
+                0,
+                Some(apply_epoch),
+                &no_keys,
+                None,
+            )
+            .await?;
+            return Ok(apply_epoch);
         };
 
         // Build each shard's tombstone-only `OnConflictDeletions` from its
@@ -17160,6 +17171,19 @@ impl CayenneTableProvider {
         // sharded path (a known limit of the opt-in N>1 path).
         maintained_aggregate_delete_rows: Option<&RecordBatch>,
     ) -> Result<u64> {
+        // INVARIANT: at N>1 every mem-tier append MUST carry a `source_position` (the
+        // per-apply `apply_epoch` slot-ack axis). A `None`-stamped append on a sharded
+        // tier is invisible to the checkpoint's MAX(source_position) watermark, which
+        // stalls the deferred source slot (the N>1 WAL-drain bug). `None` is valid ONLY
+        // at N==1, where the single shard keeps `MemTier::epoch` as the slot-ack
+        // currency. This guards against a future serial-at-N>1 caller silently
+        // re-opening that hole.
+        debug_assert!(
+            source_position.is_some() || self.mem_tier.shard_count() == 1,
+            "append_to_shard at N>1 (shard_count={}) requires source_position (apply_epoch); \
+             a None-stamped append stalls the source slot",
+            self.mem_tier.shard_count()
+        );
         let incoming_rows: u64 = batches
             .iter()
             .map(|b| b.num_rows() as u64)
@@ -17561,10 +17585,13 @@ impl CayenneTableProvider {
                 seq,
             )
         };
-        // The all-shards-atomic capture window — at N>1 this is the ONLY span that
-        // holds `write_lock`, so its duration is the per-checkpoint apply-stall. A
-        // spike here (vs the off-fence `mem_tier_checkpoint` total below) means the
-        // capture, not the encode, is contending the write path.
+        // The all-shards-atomic capture window: the per-shard snapshot load +
+        // sequence reservation under the publish locks. At N>1 `write_lock` is held
+        // from before this span through the WHOLE checkpoint (capture + encode +
+        // commit — see the LOAD-BEARING note above; the encode is NOT off-write_lock
+        // here), so this metric isolates the CAPTURE portion of that hold. The encode
+        // portion is `mem_tier_checkpoint` (total) minus this; comparing the two
+        // localizes a per-checkpoint apply-stall to the capture vs the encode.
         record_cayenne_write_phase(
             &self.table_metadata.table_name,
             "mem_tier_checkpoint_capture",
@@ -17985,12 +18012,10 @@ impl CayenneTableProvider {
     /// up (memory mode). A no-op in file mode / when the runtime did not install
     /// a handle.
     async fn fire_slot_advancer(&self, durable_epoch: u64) {
-        // Observability: record the durable watermark and the live apply-epoch
+        // Observability: emit the durable watermark alongside the live apply-epoch
         // counter so `cayenne_mem_tier_{durable,apply}_epoch` expose the slot-ack
         // gap. A gap that GROWS while checkpoints keep firing is a stuck watermark
         // (the N>1 WAL-drain stall) — vs the trigger never firing (the tick counter).
-        self.last_durable_epoch
-            .store(durable_epoch, std::sync::atomic::Ordering::Relaxed);
         telemetry::track_cayenne_mem_tier_epoch(
             self.mem_tier_apply_epoch
                 .load(std::sync::atomic::Ordering::Relaxed),
@@ -25591,24 +25616,33 @@ mod tests {
         let n = 4_usize;
         let ctx = SessionContext::new();
         let runtime_env = ctx.runtime_env();
-        let (provider, _catalog, _tmp) = create_sharded_cdc_upsert_table(
-            "shard_with_pending_del",
-            Arc::clone(&runtime_env),
-            n,
-        )
-        .await;
+        let (provider, _catalog, _tmp) =
+            create_sharded_cdc_upsert_table("shard_with_pending_del", Arc::clone(&runtime_env), n)
+                .await;
         let schema = Arc::clone(&provider.table_metadata.schema);
 
         // Make the DURABLE deletion index hold a tombstone: seed keys + checkpoint
         // (durable), then delete one + checkpoint. The tombstone hides a now-durable
         // row, so it must persist durably ⇒ `has_pending_deletions()` is true after.
-        apply_upsert_burst(&ctx, &provider, Arc::clone(&schema), &[(1, 10), (2, 20), (3, 30)]).await;
-        provider.checkpoint_mem_tier().await.expect("seed checkpoint");
+        apply_upsert_burst(
+            &ctx,
+            &provider,
+            Arc::clone(&schema),
+            &[(1, 10), (2, 20), (3, 30)],
+        )
+        .await;
+        provider
+            .checkpoint_mem_tier()
+            .await
+            .expect("seed checkpoint");
         provider
             .write_cdc_delete_keys_in_memory(&int64_id_batch(&[2]))
             .await
             .expect("delete absorb");
-        provider.checkpoint_mem_tier().await.expect("delete checkpoint");
+        provider
+            .checkpoint_mem_tier()
+            .await
+            .expect("delete checkpoint");
         assert!(
             provider.has_pending_deletions(),
             "precondition: the durable deletion index must hold a tombstone so the \
