@@ -27,7 +27,7 @@ pub const PARAMETERS: &[ParameterSpec] =
         { FILE_PARAM_LEN + PARAM_WITH_DEPRE_LEN },
     >(FILE_PARAMETERS, COMMON_MODEL_PARAMETERS_WITH_DEPRECATED);
 
-const FILE_PARAM_LEN: usize = 2;
+const FILE_PARAM_LEN: usize = 5;
 
 pub(crate) const FILE_PARAMETERS: [ParameterSpec; FILE_PARAM_LEN] = [
     ParameterSpec::runtime("chat_template").description(
@@ -38,4 +38,12 @@ pub(crate) const FILE_PARAMETERS: [ParameterSpec; FILE_PARAM_LEN] = [
         These formats execute arbitrary code on load and are disabled by default. \
         Set to 'true' only when the model weights come from a fully trusted source.",
     ).one_of(&["true", "false"]),
+    ParameterSpec::runtime("distributed_backend")
+        .description("Run the model tensor-parallel across multiple nodes (a Spice enterprise feature; standard builds are single-node only). Set to 'ring' to pool the model over the `nodes` list (the 'ring' backend currently supports exactly 2 nodes); omit or 'none' for single-node.")
+        .default("none")
+        .one_of(&["none", "ring"]),
+    ParameterSpec::runtime("node_rank")
+        .description("This node's 0-indexed rank in the distributed `nodes` list. Rank 0 is the head and serves the API; other ranks are compute replicas."),
+    ParameterSpec::runtime("nodes")
+        .description("Comma-separated, rank-ordered node addresses for distributed inference (e.g. '10.0.0.1,10.0.0.2'). Identical on every node; only `node_rank` differs. The node count (world size) must be a power of two; the 'ring' backend requires exactly 2."),
 ];
