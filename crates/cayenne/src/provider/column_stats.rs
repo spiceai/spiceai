@@ -74,8 +74,9 @@ pub(crate) enum RowCountUpdate {
 /// Accumulates per-column statistics across multiple `RecordBatch`es during a write.
 ///
 /// Builds Vortex [`StatsSet`] objects per column (min, max, null count) and tracks
-/// the total row count. After the write completes, call [`to_file_statistics_blob`] to
-/// produce a serialized Vortex `FileStatistics` blob for metastore persistence.
+/// the total row count. After the write completes, call
+/// [`to_file_statistics_blob_with_row_count`] to produce a serialized Vortex
+/// `FileStatistics` blob for metastore persistence.
 ///
 /// Thread-safe: guarded by `Mutex` when shared across stream tasks.
 ///

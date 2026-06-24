@@ -73,9 +73,7 @@ use crate::provider::scan::{
 use crate::provider::sink::CayenneDataSink;
 use crate::provider::{Error, Result};
 use crate::resource_starvation::ResourceStarvationTracker;
-use arrow::array::{
-    Array, ArrayRef, BinaryArray, Float64Array, Int64Array, StringArray, StringViewArray,
-};
+use arrow::array::{Array, ArrayRef, BinaryArray, Int64Array};
 use arrow::record_batch::RecordBatch;
 use arrow_row::{OwnedRow, RowConverter, SortField};
 use arrow_schema::{DataType, Field, SchemaBuilder, SchemaRef};
@@ -19635,6 +19633,7 @@ mod tests {
 
     #[test]
     fn compute_column_stats_skips_float_nan_values() {
+        use arrow::array::Float64Array;
         let array = Float64Array::from(vec![Some(f64::NAN), Some(5.0), None, Some(-2.0)]);
 
         let stats = ColumnStatsAccumulator::compute_column_stats(&array);
@@ -19655,6 +19654,7 @@ mod tests {
 
     #[test]
     fn compute_column_stats_uses_typed_min_max_for_utf8_view() {
+        use arrow::array::StringViewArray;
         let array = StringViewArray::from(vec![Some("beta"), Some("alpha"), None]);
 
         let stats = ColumnStatsAccumulator::compute_column_stats(&array);
@@ -21521,6 +21521,7 @@ mod tests {
     }
 
     fn make_listing_parity_batch(schema: SchemaRef, start: i64, row_count: usize) -> RecordBatch {
+        use arrow::array::StringArray;
         let row_count = i64::try_from(row_count).expect("test row count fits in i64");
         let ids = (start..start + row_count).collect::<Vec<_>>();
         let categories = ids
@@ -28000,7 +28001,7 @@ mod tests {
         ids: &[i64],
         values: &[i64],
     ) -> RecordBatch {
-        use arrow::array::Int64Array;
+        use arrow::array::{Int64Array, StringArray};
         RecordBatch::try_new(
             schema,
             vec![
@@ -28046,7 +28047,7 @@ mod tests {
         provider: &CayenneTableProvider,
         table_name: &str,
     ) -> Vec<(String, i64, i64)> {
-        use arrow::array::Int64Array;
+        use arrow::array::{Int64Array, StringArray};
         let batches = read_all(ctx, provider, table_name).await;
         let mut rows = Vec::new();
         for batch in &batches {
