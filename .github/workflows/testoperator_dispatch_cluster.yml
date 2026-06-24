@@ -9,11 +9,10 @@ name: testoperator cluster bench dispatch
 # Spice Cloud resource usage bounded.
 
 on:
-  schedule:
-    # Daily at 1000 UTC (0300 PDT) — runs after the single-node dispatch so
-    # the trunk image is built with the same commit.
-    - cron: '0 10 * * *'
-
+  # No automatic schedule for now — the distributed cluster benchmark is run
+  # manually via workflow_dispatch until the outstanding cluster issues are
+  # resolved (executor ephemeral-storage eviction, see #11433, plus the
+  # related ballista fixes). Re-add a `schedule:` cron once it runs clean.
   workflow_dispatch:
     inputs:
       spiced_ref:
