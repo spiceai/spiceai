@@ -16,7 +16,7 @@ on:
   workflow_dispatch:
     inputs:
       spiced_ref:
-        description: 'Git ref to build the spiced image from. Defaults to trunk for scheduled runs.'
+        description: 'Git ref to build the spiced image from (defaults to trunk).'
         required: false
         type: string
         default: 'trunk'
@@ -173,10 +173,15 @@ jobs:
             dispatch_files+=("$f")
           done < <(find "$dir" -type f -name '*.yaml' | sort)
 
-          # Install yq for YAML parsing if not already on PATH.
+          # Install yq for YAML parsing if not already on PATH. This runs on a
+          # privileged runner, so the release binary is pinned by version AND
+          # verified against a known sha256 before install (no unverified
+          # binaries). Bump the version and the hash together if updating.
           if ! command -v yq >/dev/null 2>&1; then
+            yq_sha256="a2c097180dd884a8d50c956ee16a9cec070f30a7947cf4ebf87d5f36213e9ed7"
             curl -fsSL -o /tmp/yq \
               https://github.com/mikefarah/yq/releases/download/v4.44.3/yq_linux_amd64
+            echo "${yq_sha256}  /tmp/yq" | sha256sum -c -
             sudo install -m 0755 /tmp/yq /usr/local/bin/yq
           fi
 
@@ -345,7 +350,9 @@ jobs:
             validate_results="$(field '.tests.bench.validate_results' 'false')"
             ready_wait="$(field '.tests.bench.ready_wait' '600')"
             # Cluster-bench-specific fields (optional in the yaml; sensible defaults).
-            query_transport="$(field '.tests.bench.query_transport' 'flightsql')"
+            # Default to the Ballista distributed-query path (v1-queries), matching
+            # this workflow's intent and the run_cluster_bench runner's default.
+            query_transport="$(field '.tests.bench.query_transport' 'v1-queries')"
             executor_replicas="$(field '.tests.bench.executor_replicas' '3')"
             channel="$(field '.tests.bench.channel' 'nightly')"
             shuffle_location="$(field '.tests.bench.shuffle_location' '')"
