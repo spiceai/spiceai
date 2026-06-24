@@ -15,7 +15,7 @@ limitations under the License.
 */
 
 //! Apache Kafka data connector for Spice.ai runtime.
-
+#![allow(clippy::missing_errors_doc)]
 use std::{any::Any, future::Future, pin::Pin, sync::Arc, time::Duration};
 
 use arrow_schema::SchemaRef;

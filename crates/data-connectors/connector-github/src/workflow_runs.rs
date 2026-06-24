@@ -438,6 +438,10 @@ impl ExecutionPlan for WorkflowRunsExecutionPlan {
         "GitHubWorkflowRunsExecutionPlan"
     }
 
+    fn downcast_delegate(&self) -> Option<&dyn ExecutionPlan> {
+        None
+    }
+
     fn schema(&self) -> SchemaRef {
         Arc::clone(&self.schema)
     }

@@ -9,6 +9,7 @@ description = "Azure Blob Filesystem (ABFS) data connector for Spice.ai runtime"
 [dependencies]
 object_store = { workspace = true }
 runtime = { path = "../../runtime" }
+secrecy.workspace = true
 snafu.workspace = true
 tokio.workspace = true
 tracing.workspace = true
