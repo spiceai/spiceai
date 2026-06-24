@@ -46,7 +46,6 @@ use datafusion_catalog::TableProvider;
 use datafusion_common::ScalarValue;
 use datafusion_expr::Expr;
 use object_store::{ObjectMeta, ObjectStore, ObjectStoreExt};
-use parking_lot::RwLock;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::Mutex as TokioMutex;
@@ -104,12 +103,12 @@ pub struct FileBasedDeletionSink {
     protected_snapshots: Arc<ArcSwap<HashMap<String, i64>>>,
     /// Table ID for catalog operations.
     table_id: String,
-    /// Live current-snapshot ID (shared with `CayenneTableProvider`). Read under
-    /// the write lock during orphaned-DV cleanup so the current snapshot's
-    /// manifest can be folded into the surviving-sequence floor; sharing the
-    /// `Arc` (rather than capturing a `String`) reads the value compaction may
-    /// have flipped, never a stale one.
-    current_snapshot_id: Arc<RwLock<String>>,
+    /// A write-clone of the owning provider (shares all of its `Arc`-backed
+    /// state). Used during orphaned-DV cleanup to read the live current-snapshot
+    /// ID (folded into the surviving-sequence floor) and to prune the in-memory
+    /// PK deletion index of the tombstones whose delete files were removed, so
+    /// the memory is reclaimed immediately rather than only on the next reload.
+    provider: CayenneTableProvider,
     /// Table base path for constructing snapshot directory paths.
     table_path: String,
     /// Shared runtime environment for cache invalidation after file deletion.
@@ -138,7 +137,8 @@ impl FileBasedDeletionSink {
     /// * `catalog` - Metadata catalog for clearing snapshot sequence records.
     /// * `protected_snapshots` - In-memory protected snapshots map.
     /// * `table_id` - Table ID for catalog operations.
-    /// * `current_snapshot_id` - Live current-snapshot ID, shared with the provider.
+    /// * `provider` - A write-clone of the owning provider (shared `Arc` state),
+    ///   used for orphaned-DV cleanup (current-snapshot lookup + deletion-index prune).
     /// * `table_path` - Table base path for snapshot directory construction.
     /// * `runtime_env` - Shared runtime environment for cache invalidation.
     #[expect(clippy::too_many_arguments)]
@@ -150,7 +150,7 @@ impl FileBasedDeletionSink {
         catalog: Arc<dyn MetadataCatalog>,
         protected_snapshots: Arc<ArcSwap<HashMap<String, i64>>>,
         table_id: String,
-        current_snapshot_id: Arc<RwLock<String>>,
+        provider: CayenneTableProvider,
         table_path: String,
         runtime_env: Arc<RuntimeEnv>,
         write_lock: Arc<TokioMutex<()>>,
@@ -164,7 +164,7 @@ impl FileBasedDeletionSink {
             catalog,
             protected_snapshots,
             table_id,
-            current_snapshot_id,
+            provider,
             table_path,
             runtime_env,
             write_lock,
@@ -542,9 +542,21 @@ impl FileBasedDeletionSink {
     /// prune could resurrect a live current-snapshot row. We fold the current
     /// snapshot's manifest into the floor here. (`CayenneTableProvider` solves the
     /// identical problem for the seq-prefix bake in `bake_clean_prefix_holds`;
-    /// rather than reach into the provider from the sink we reproduce its current
-    /// snapshot clause — empty manifest is genesis-clean, otherwise the floor is
-    /// capped at the smallest file `min_sequence`.)
+    /// rather than call that — its `selected_set` semantics differ — we reproduce
+    /// its current-snapshot clause inline: empty manifest is genesis-clean,
+    /// otherwise the floor is capped at the smallest file `min_sequence`.)
+    ///
+    /// # In-memory deletion index
+    ///
+    /// Removing the catalog rows + `.arrow` files reclaims only restart cost; the
+    /// orphaned tombstones also sit in the in-memory PK deletion index for the
+    /// life of the process. After the rows are removed we therefore prune the
+    /// index of every tombstone at or below the same floor via
+    /// [`CayenneTableProvider::prune_deletion_index_at_or_below`] (which the
+    /// seq-prefix bake also uses), reclaiming the memory immediately. This is
+    /// sound for the same reason the row removal is: the floor proves no surviving
+    /// snapshot is shadowed, so those tombstones (and their paired re-insert
+    /// records, removed with the same DV rows) affect no live row.
     async fn cleanup_orphaned_deletion_vectors(&self) {
         // Floor = minimum threshold over all surviving protected snapshots. For
         // PK/upsert tables every PROTECTED data-bearing snapshot is tracked here.
@@ -563,7 +575,7 @@ impl FileBasedDeletionSink {
         // safe against pruning D only when its smallest row sequence is `>= D`. An
         // empty manifest is genesis (no rows to resurrect). If the manifest cannot
         // be read we cannot prove safety, so skip the sweep this pass.
-        let current_snapshot_id = self.current_snapshot_id.read().clone();
+        let current_snapshot_id = self.provider.get_current_snapshot_id();
         let current_floor = match self
             .catalog
             .get_snapshot_files(&self.table_id, &current_snapshot_id)
@@ -643,6 +655,11 @@ impl FileBasedDeletionSink {
                 ),
             }
         }
+
+        // Reclaim the memory now: drop the just-removed tombstones from the
+        // in-memory PK deletion index (no-op for position-based tables). Safe at
+        // `floor` for the same reason the catalog removal is — see the doc above.
+        self.provider.prune_deletion_index_at_or_below(floor);
 
         tracing::debug!(
             table = %self.table_name,
