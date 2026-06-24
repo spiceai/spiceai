@@ -23,7 +23,10 @@ use futures::StreamExt;
 use runtime::Runtime;
 use spicepod::{component::dataset::Dataset, param::Params};
 
-use crate::{configure_test_datafusion, init_tracing, utils::{register_test_connectors, test_request_context}};
+use crate::{
+    configure_test_datafusion, init_tracing,
+    utils::{register_test_connectors, test_request_context},
+};
 
 pub fn get_glue_dataset(s3_uri: &str, name: &str) -> Dataset {
     let mut dataset = Dataset::new(s3_uri, name);

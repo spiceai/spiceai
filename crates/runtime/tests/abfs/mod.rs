@@ -19,7 +19,10 @@ limitations under the License.
 //! These tests verify the Azure Blob Storage integration, including patches from
 //! the `spiceai/arrow-rs` fork that optimize Parquet reading on Azure.
 
-use crate::{RecordBatch, init_tracing, utils::{register_test_connectors, test_request_context}};
+use crate::{
+    RecordBatch, init_tracing,
+    utils::{register_test_connectors, test_request_context},
+};
 
 use anyhow::anyhow;
 use app::AppBuilder;

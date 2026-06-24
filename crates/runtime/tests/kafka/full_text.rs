@@ -25,7 +25,10 @@ use super::bootstrap::{make_kafka_dataset, send_messages_to_kafka, start_kafka_d
 use super::{run_and_snapshot_query, wait_for_query_rows};
 use crate::configure_test_datafusion;
 use crate::utils::runtime_ready_check;
-use crate::{init_tracing, utils::{register_test_connectors, test_request_context}};
+use crate::{
+    init_tracing,
+    utils::{register_test_connectors, test_request_context},
+};
 
 const KAFKA_PORT: u16 = 19094;
 

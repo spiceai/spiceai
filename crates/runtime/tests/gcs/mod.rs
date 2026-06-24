@@ -35,7 +35,10 @@ use futures::TryStreamExt;
 use runtime::Runtime;
 use spicepod::{component::dataset::Dataset, param::Params as DatasetParams};
 
-use crate::{configure_test_datafusion, init_tracing, utils::{register_test_connectors, test_request_context}};
+use crate::{
+    configure_test_datafusion, init_tracing,
+    utils::{register_test_connectors, test_request_context},
+};
 
 /// Creates a GCS dataset configuration for public bucket access (no auth required).
 pub fn get_public_gcs_dataset(gcs_uri: &str, name: &str) -> Dataset {

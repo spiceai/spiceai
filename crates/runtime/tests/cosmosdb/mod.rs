@@ -44,7 +44,10 @@ use app::AppBuilder;
 use runtime::Runtime;
 use spicepod::{component::dataset::Dataset, param::Params};
 
-use crate::{configure_test_datafusion, init_tracing, utils::{register_test_connectors, test_request_context}};
+use crate::{
+    configure_test_datafusion, init_tracing,
+    utils::{register_test_connectors, test_request_context},
+};
 
 const DEFAULT_DATABASE: &str = "spice-integration";
 const DEFAULT_CONTAINER: &str = "documents";
