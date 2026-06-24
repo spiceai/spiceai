@@ -882,8 +882,8 @@ async fn count_key_based_delete_files(fixture: &TestFixture, table: &CayenneTabl
         .count()
 }
 
-/// Count `.arrow` deletion-vector files physically present under the table dir.
-fn count_arrow_files(table_id_dir: &std::path::Path) -> usize {
+/// Count `.arrow` deletion-vector files physically present anywhere under `root`.
+fn count_arrow_files(root: &std::path::Path) -> usize {
     fn walk(dir: &std::path::Path, count: &mut usize) {
         let Ok(entries) = std::fs::read_dir(dir) else {
             return;
@@ -898,24 +898,27 @@ fn count_arrow_files(table_id_dir: &std::path::Path) -> usize {
         }
     }
     let mut count = 0;
-    walk(table_id_dir, &mut count);
+    walk(root, &mut count);
     count
 }
 
 /// Test: a key-based deletion vector orphaned by retention is cleaned up.
 ///
-/// Setup (PK table with upsert, 3-second retention):
+/// Setup (PK table with upsert, 60-second retention):
 /// - insert id=1 @ now-100s: old copy lands in protected snapshot M
 /// - upsert id=1 @ now: fresh copy lands in protected snapshot N, plus a
 ///   key-based DV superseding the old copy
 ///
-/// Retention (`event_time < now-3s`) deletes M's expired file, fully emptying M.
-/// The DV (which only ever shadowed M's now-deleted row) is orphaned: it lives
-/// in the base snapshot's `deletions/` dir, so retention's snapshot cleanup
-/// never removes it. This test asserts the orphan is cleaned from both the
-/// catalog and disk, while the surviving row is unaffected. Issue #9388.
+/// Retention (`event_time < now-60s`) deletes M's expired file, fully emptying
+/// M. The DV (which only ever shadowed M's now-deleted row) is orphaned: it
+/// lives in the base snapshot's `deletions/` dir, so retention's snapshot
+/// cleanup never removes it. This test asserts the orphan is cleaned from both
+/// the catalog and disk, while the surviving row is unaffected. Issue #9388.
+///
+/// The window is 60s (not a few seconds) so the background-checkpoint polls
+/// below cannot let the `now` row age past the cutoff before the delete runs.
 async fn test_orphaned_key_dv_cleaned_after_retention_impl(fixture: TestFixture) -> TestResult {
-    let retention_seconds = 3;
+    let retention_seconds = 60;
     let table_name = "orphan_dv_cleanup";
     let ctx = SessionContext::new();
     let table = create_pk_retention_table(
@@ -981,13 +984,16 @@ async fn test_orphaned_key_dv_cleaned_after_retention_impl(fixture: TestFixture)
 /// sequence) must be retained even though an unrelated snapshot was emptied by
 /// retention. This guards the sequence-floor rule against over-pruning.
 ///
-/// Setup (PK table with upsert, 3-second retention):
+/// Setup (PK table with upsert, 60-second retention):
 /// - insert id=1 @ now-100s: old copy in M (expired → emptied by retention)
 /// - insert id=2 @ now: fresh copy in A (survives)
 /// - upsert id=2 @ now: fresh copy in B (survives), plus a DV shadowing A's
 ///   copy of id=2 — still needed after retention
+///
+/// 60s window so the checkpoint polls can't let the `now` id=2 rows age past
+/// the cutoff (which would delete the data the test expects to survive).
 async fn test_needed_key_dv_retained_after_retention_impl(fixture: TestFixture) -> TestResult {
-    let retention_seconds = 3;
+    let retention_seconds = 60;
     let table_name = "needed_dv_retained";
     let ctx = SessionContext::new();
     let table = create_pk_retention_table(
@@ -1047,7 +1053,7 @@ async fn test_needed_key_dv_retained_after_retention_impl(fixture: TestFixture) 
 async fn test_all_snapshots_emptied_cleans_all_orphaned_dvs_impl(
     fixture: TestFixture,
 ) -> TestResult {
-    let retention_seconds = 3;
+    let retention_seconds = 60;
     let table_name = "all_emptied_dv_cleanup";
     let ctx = SessionContext::new();
     let table = create_pk_retention_table(
@@ -1064,10 +1070,11 @@ async fn test_all_snapshots_emptied_cleans_all_orphaned_dvs_impl(
     let now_us = chrono::Utc::now().timestamp_micros();
 
     // Two expired copies of id=1: the upsert creates a key DV, and BOTH copies'
-    // snapshots are old enough to be emptied by retention.
-    insert_row(&table, 1, now_us - 100_000_000).await?;
+    // snapshots are old enough (well past the 60s window) to be emptied by
+    // retention.
+    insert_row(&table, 1, now_us - 200_000_000).await?;
     common::poll_inlined_data_count_zero(&fixture.catalog, &table_id).await?;
-    insert_row(&table, 1, now_us - 50_000_000).await?;
+    insert_row(&table, 1, now_us - 100_000_000).await?;
     common::poll_inlined_data_count_zero(&fixture.catalog, &table_id).await?;
 
     assert_eq!(
