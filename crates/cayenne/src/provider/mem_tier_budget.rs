@@ -225,8 +225,8 @@ pub fn set_global_mem_tier_bytes(bytes: u64) {
 /// is the dynamic re-partition entry point: the runtime samples query-pool usage
 /// and resizes the tier within `[floor, static ceiling]` so the tier yields RAM to
 /// the query pool as it fills and reclaims it as the pool drains. A `bytes` of 0 is
-/// ignored (the floor keeps a global cap installed; use
-/// [`set_global_mem_tier_bytes`]`(0)` to actually uninstall).
+/// ignored (the floor keeps a global cap installed; call
+/// `set_global_mem_tier_bytes(0)` to actually uninstall).
 pub fn update_global_mem_tier_total(bytes: u64) {
     if bytes == 0 {
         return;

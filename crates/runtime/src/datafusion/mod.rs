@@ -1485,16 +1485,29 @@ impl DataFusion {
         // budget below (`get_total_memory` rebuilds a sysinfo System each call).
         let total_memory = crate::resource_monitor::get_total_memory();
         let mem_tier_budget_bytes = self.mem_tier_budget_bytes.unwrap_or_else(|| {
-            // Reached only if the compaction runtime is set (Cayenne active) but
-            // the builder did not precompute a budget (e.g. an invalid compaction
-            // fraction left `cayenne_active` false). Coordinate from the stored
-            // query pool size so we still never overcommit and never install 0
-            // (which would disable the global cap entirely).
-            builder::coordinated_mem_tier_budget(
+            // Reached only if the compaction runtime is set (Cayenne active) but the
+            // builder did not precompute a budget — e.g. an invalid compaction
+            // fraction, or Cayenne activated lazily after the query pool was already
+            // sized at the non-Cayenne default. Coordinate from the stored query
+            // pool size; this always installs a NONZERO global cap (never 0, which
+            // would disable the cap). It does NOT by itself guarantee
+            // pool + compaction + tier + headroom <= host when the query pool was
+            // not reduced for Cayenne — the tier is then floored and memory mode
+            // leans on the per-table caps + spill/durable backstops (warned below).
+            let budget = builder::coordinated_mem_tier_budget(
                 total_memory,
                 self.query_memory_pool_bytes,
                 self.compaction_memory_bytes.unwrap_or(0),
-            )
+            );
+            if budget <= total_memory / builder::MEM_TIER_FLOOR_FRACTION {
+                tracing::warn!(
+                    query_memory_pool_bytes = self.query_memory_pool_bytes,
+                    total_memory,
+                    mem_tier_budget_bytes = budget,
+                    "Cayenne in-memory CDC tier budget floored: the query pool was not coordinated for an off-pool tier (lazy activation or an oversized runtime.query.memory_limit), so the tier relies on per-table caps + spill rather than a host-fraction reserve. Consider lowering runtime.query.memory_limit."
+                );
+            }
+            budget
         });
         cayenne::set_global_mem_tier_bytes(mem_tier_budget_bytes);
         tracing::info!(

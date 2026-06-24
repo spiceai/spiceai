@@ -1393,7 +1393,7 @@ const MEM_TIER_HEADROOM_FRACTION: u64 = 8;
 /// pins an explicit, greedy `runtime.query.memory_limit` that leaves no
 /// coordinated room; memory mode then leans on the per-table caps + spill/durable
 /// backstops, and the caller warns.
-const MEM_TIER_FLOOR_FRACTION: u64 = 32;
+pub(crate) const MEM_TIER_FLOOR_FRACTION: u64 = 32;
 
 /// Coordinated aggregate byte budget for the off-pool Cayenne in-memory CDC tier.
 ///
@@ -1401,10 +1401,20 @@ const MEM_TIER_FLOOR_FRACTION: u64 = 32;
 /// derived from total RAM IN ISOLATION (`builder.rs` query pool, compaction carve,
 /// and `mod.rs` `get_total_memory()/4`) and sum to >100% of host. Sizing the tier
 /// as the host RAM left AFTER the query pool, the compaction pool, and a headroom
-/// reserve is the missing cross-subsystem coordination: it guarantees
-/// `query_pool + compaction + tier + headroom ≤ host`. Clamped to `[host/32,
-/// host/8]` so a global cap is always present and the tier never exceeds 1/8 of
-/// host even when the pools are small.
+/// reserve is the missing cross-subsystem coordination. For the coordinated
+/// default inputs — a query pool sized to leave room (see
+/// [`effective_query_memory_limit`]) — it yields
+/// `query_pool + compaction + tier + headroom ≤ host`. The result is clamped to
+/// `[host/32, host/8]`: the `host/8` ceiling keeps the tier ≤ 1/8 of host when the
+/// pools are small, and the `host/32` floor guarantees a nonzero global aggregate
+/// cap is ALWAYS installed (a 0 budget would disable the cap — the original
+/// no-global-cap OOM).
+///
+/// PRECONDITION: the `≤ host` guarantee holds only while the inputs leave at least
+/// `floor + headroom` of room. An oversized explicit `runtime.query.memory_limit`
+/// makes the `host/32` floor win over the strict budget; the caller
+/// ([`DataFusionBuilder::build`]) detects that and warns, and memory mode then
+/// leans on the per-table caps + spill/durable backstops.
 pub(crate) fn coordinated_mem_tier_budget(
     total_memory: u64,
     query_pool_bytes: u64,
