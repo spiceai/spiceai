@@ -523,7 +523,9 @@ impl PhysicalOptimizerRule for CayenneStatsAggregateRewriter {
             // Statistics of the aggregate's input are aligned to the schema the
             // aggregate's column indices reference. Soundness guard #2 lives in
             // `stats_aggregate_batch`: every value consumed must be `Exact`.
-            let input_stats = query_aggregate.input().partition_statistics(None)?;
+            let Ok(input_stats) = query_aggregate.input().partition_statistics(None) else {
+                return Ok(Transformed::no(node));
+            };
             let Some(batch) = crate::stats_aggregate::stats_aggregate_batch(
                 query_aggregate,
                 aggregate,
