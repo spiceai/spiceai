@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use super::super::offsets::{self, sort_offsets};
+use super::super::offsets::{self, sort_offsets, OffsetSchemaState};
 use super::{
     DEBEZIUM_KAFKA_OFFSETS_TABLE_NAME, DEBEZIUM_KAFKA_TABLE_NAME, DebeziumKafkaMetadata,
     DebeziumKafkaSys, Error, Result,
@@ -26,8 +26,9 @@ use std::sync::Arc;
 
 impl DebeziumKafkaSys {
     pub(super) fn upsert_duckdb(
-        &self,
         pool: &Arc<DuckDbConnectionPool>,
+        dataset_name: &str,
+        schema_ensured: &OffsetSchemaState,
         metadata: &DebeziumKafkaMetadata,
     ) -> Result<()> {
         let mut db_conn = Arc::clone(pool).connect_sync().map_err(Error::external)?;
@@ -36,7 +37,7 @@ impl DebeziumKafkaSys {
             .get_underlying_conn_mut();
 
         ensure_debezium_kafka_tables(duckdb_conn)?;
-        self.schema_ensured.mark_ensured();
+        schema_ensured.mark_ensured();
 
         let primary_keys =
             serde_json::to_string(&metadata.primary_keys).map_err(Error::external)?;
@@ -57,7 +58,7 @@ impl DebeziumKafkaSys {
         tx.execute(
             &upsert,
             duckdb::params![
-                self.dataset_name,
+                dataset_name,
                 metadata.consumer_group_id,
                 metadata.topic,
                 primary_keys,
@@ -65,31 +66,32 @@ impl DebeziumKafkaSys {
             ],
         )
         .map_err(Error::external)?;
-        upsert_offsets_tx(&tx, &self.dataset_name, &metadata.offsets)?;
+        upsert_offsets_tx(&tx, dataset_name, &metadata.offsets)?;
         tx.commit().map_err(Error::external)?;
 
         Ok(())
     }
 
     pub(super) fn get_duckdb(
-        &self,
         pool: &Arc<DuckDbConnectionPool>,
+        dataset_name: &str,
+        schema_ensured: &OffsetSchemaState,
     ) -> Result<Option<DebeziumKafkaMetadata>> {
         let mut db_conn = Arc::clone(pool).connect_sync().map_err(Error::external)?;
         let duckdb_conn = datafusion_table_providers::duckdb::DuckDB::duckdb_conn(&mut db_conn)
             .map_err(Error::external)?
             .get_underlying_conn_mut();
 
-        if self.schema_needs_ensure() {
+        if schema_ensured.needs_ensure() {
             ensure_debezium_kafka_tables(duckdb_conn)?;
-            self.mark_schema_ensured();
+            schema_ensured.mark_ensured();
         }
 
         let query = format!(
             "SELECT consumer_group_id, topic, primary_keys, schema_fields FROM {DEBEZIUM_KAFKA_TABLE_NAME} WHERE dataset_name = ?"
         );
         let mut stmt = duckdb_conn.prepare(&query).map_err(Error::external)?;
-        let mut rows = stmt.query([&self.dataset_name]).map_err(Error::external)?;
+        let mut rows = stmt.query([dataset_name]).map_err(Error::external)?;
 
         let Some(row) = rows.next().map_err(Error::external)? else {
             return Ok(None);
@@ -102,7 +104,7 @@ impl DebeziumKafkaSys {
         drop(rows);
         drop(stmt);
 
-        let offsets = load_offsets(duckdb_conn, &self.dataset_name)?;
+        let offsets = load_offsets(duckdb_conn, dataset_name)?;
 
         let primary_keys: Vec<String> =
             serde_json::from_str(&primary_keys_json).map_err(Error::external)?;
@@ -119,8 +121,9 @@ impl DebeziumKafkaSys {
     }
 
     pub(super) fn upsert_offsets_duckdb(
-        &self,
         pool: &Arc<DuckDbConnectionPool>,
+        dataset_name: &str,
+        schema_ensured: &OffsetSchemaState,
         offsets: &[KafkaOffset],
     ) -> Result<()> {
         let mut db_conn = Arc::clone(pool).connect_sync().map_err(Error::external)?;
@@ -128,18 +131,18 @@ impl DebeziumKafkaSys {
             .map_err(Error::external)?
             .get_underlying_conn_mut();
 
-        if self.schema_needs_ensure() {
+        if schema_ensured.needs_ensure() {
             ensure_debezium_kafka_tables(duckdb_conn)?;
-            self.mark_schema_ensured();
+            schema_ensured.mark_ensured();
         }
 
         // Diagnostic-only: surface a warn log when an offset regresses.
-        if let Ok(prior) = load_offsets(duckdb_conn, &self.dataset_name) {
-            let _ = offsets::merge_offsets(&self.dataset_name, prior, offsets);
+        if let Ok(prior) = load_offsets(duckdb_conn, dataset_name) {
+            let _ = offsets::merge_offsets(dataset_name, prior, offsets);
         }
 
         let tx = duckdb_conn.transaction().map_err(Error::external)?;
-        upsert_offsets_tx(&tx, &self.dataset_name, offsets)?;
+        upsert_offsets_tx(&tx, dataset_name, offsets)?;
         tx.commit().map_err(Error::external)?;
         Ok(())
     }

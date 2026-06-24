@@ -517,7 +517,7 @@ async fn init_kafka_consumer(
     Ok((kafka_consumer, metadata.schema))
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub(crate) struct KafkaMetadata {
     pub(crate) consumer_group_id: String,
     pub(crate) topic: String,

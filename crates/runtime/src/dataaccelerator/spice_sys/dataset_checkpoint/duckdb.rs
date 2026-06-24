@@ -44,7 +44,10 @@ impl DatasetCheckpoint {
         Ok(())
     }
 
-    pub(super) fn exists_duckdb(&self, pool: &Arc<DuckDbConnectionPool>) -> Result<bool> {
+    pub(super) fn exists_duckdb(
+        dataset_name: &str,
+        pool: &Arc<DuckDbConnectionPool>,
+    ) -> Result<bool> {
         let mut db_conn = Arc::clone(pool).connect_sync().map_err(Error::external)?;
         let duckdb_conn = datafusion_table_providers::duckdb::DuckDB::duckdb_conn(&mut db_conn)
             .map_err(Error::external)?
@@ -52,13 +55,13 @@ impl DatasetCheckpoint {
 
         let query = format!("SELECT 1 FROM {CHECKPOINT_TABLE_NAME} WHERE dataset_name = ? LIMIT 1");
         let mut stmt = duckdb_conn.prepare(&query).map_err(Error::external)?;
-        let mut rows = stmt.query([&self.dataset_name]).map_err(Error::external)?;
+        let mut rows = stmt.query([dataset_name]).map_err(Error::external)?;
 
         Ok(rows.next().map_err(Error::external)?.is_some())
     }
 
     pub(super) fn last_checkpoint_time_duckdb(
-        &self,
+        dataset_name: &str,
         pool: &Arc<DuckDbConnectionPool>,
     ) -> Result<Option<SystemTime>> {
         let mut db_conn = Arc::clone(pool).connect_sync().map_err(Error::external)?;
@@ -70,7 +73,7 @@ impl DatasetCheckpoint {
             "SELECT epoch_us(timezone('UTC', updated_at::TIMESTAMPTZ)) FROM {CHECKPOINT_TABLE_NAME} WHERE dataset_name = ? LIMIT 1"
         );
         let mut stmt = duckdb_conn.prepare(&query).map_err(Error::external)?;
-        let mut rows = stmt.query([&self.dataset_name]).map_err(Error::external)?;
+        let mut rows = stmt.query([dataset_name]).map_err(Error::external)?;
 
         let checkpoint_time_micros: Option<i64> = rows
             .next()
@@ -89,8 +92,9 @@ impl DatasetCheckpoint {
     }
 
     pub(super) fn checkpoint_duckdb(
-        &self,
         pool: &Arc<DuckDbConnectionPool>,
+        dataset_name: &str,
+        create_snapshot: bool,
         schema: &SchemaRef,
         refresh_sql: Option<&str>,
     ) -> Result<()> {
@@ -109,11 +113,11 @@ impl DatasetCheckpoint {
         duckdb_conn
             .execute(
                 &upsert,
-                duckdb::params![&self.dataset_name, &schema_json, refresh_sql],
+                duckdb::params![dataset_name, &schema_json, refresh_sql],
             )
             .map_err(Error::external)?;
 
-        if self.snapshot_behavior.create_enabled() {
+        if create_snapshot {
             // Force a DuckDB checkpoint so the WAL and database pages are flushed to disk before the snapshot is taken.
             duckdb_conn
                 .execute("CHECKPOINT", [])
@@ -141,7 +145,7 @@ impl DatasetCheckpoint {
     }
 
     pub(super) fn get_schema_duckdb(
-        &self,
+        dataset_name: &str,
         pool: &Arc<DuckDbConnectionPool>,
     ) -> Result<Option<SchemaRef>> {
         let mut db_conn = Arc::clone(pool).connect_sync().map_err(Error::external)?;
@@ -153,7 +157,7 @@ impl DatasetCheckpoint {
             "SELECT schema_json FROM {CHECKPOINT_TABLE_NAME} WHERE dataset_name = ? LIMIT 1"
         );
         let mut stmt = duckdb_conn.prepare(&query).map_err(Error::external)?;
-        let mut rows = stmt.query([&self.dataset_name]).map_err(Error::external)?;
+        let mut rows = stmt.query([dataset_name]).map_err(Error::external)?;
 
         if let Some(row) = rows.next().map_err(Error::external)? {
             let schema_json: Option<String> = row.get(0).map_err(Error::external)?;
@@ -167,7 +171,7 @@ impl DatasetCheckpoint {
     }
 
     pub(super) fn get_refresh_sql_duckdb(
-        &self,
+        dataset_name: &str,
         pool: &Arc<DuckDbConnectionPool>,
     ) -> Result<Option<String>> {
         let mut db_conn = Arc::clone(pool).connect_sync().map_err(Error::external)?;
@@ -179,7 +183,7 @@ impl DatasetCheckpoint {
             "SELECT refresh_sql FROM {CHECKPOINT_TABLE_NAME} WHERE dataset_name = ? LIMIT 1"
         );
         let mut stmt = duckdb_conn.prepare(&query).map_err(Error::external)?;
-        let mut rows = stmt.query([&self.dataset_name]).map_err(Error::external)?;
+        let mut rows = stmt.query([dataset_name]).map_err(Error::external)?;
 
         if let Some(row) = rows.next().map_err(Error::external)? {
             let refresh_sql: Option<String> = row.get(0).map_err(Error::external)?;
@@ -189,7 +193,10 @@ impl DatasetCheckpoint {
         }
     }
 
-    pub(super) fn delete_duckdb(&self, pool: &Arc<DuckDbConnectionPool>) -> Result<()> {
+    pub(super) fn delete_duckdb(
+        dataset_name: &str,
+        pool: &Arc<DuckDbConnectionPool>,
+    ) -> Result<()> {
         let mut db_conn = Arc::clone(pool).connect_sync().map_err(Error::external)?;
         let duckdb_conn = datafusion_table_providers::duckdb::DuckDB::duckdb_conn(&mut db_conn)
             .map_err(Error::external)?
@@ -197,7 +204,7 @@ impl DatasetCheckpoint {
 
         let delete = format!("DELETE FROM {CHECKPOINT_TABLE_NAME} WHERE dataset_name = ?");
         duckdb_conn
-            .execute(&delete, [&self.dataset_name])
+            .execute(&delete, [dataset_name])
             .map_err(Error::external)?;
 
         Ok(())

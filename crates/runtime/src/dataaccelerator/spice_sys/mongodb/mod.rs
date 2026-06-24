@@ -33,6 +33,9 @@ limitations under the License.
 //! );
 //! ```
 
+#[cfg(feature = "duckdb")]
+use std::sync::Arc;
+
 use datafusion::arrow::datatypes::{Schema, SchemaRef};
 use serde::{Deserialize, Serialize};
 
@@ -102,7 +105,16 @@ impl MongoSys {
     pub async fn get(&self) -> Option<MongoCheckpointMetadata> {
         match &self.acceleration_connection {
             #[cfg(feature = "duckdb")]
-            AccelerationConnection::DuckDB(pool) => self.get_duckdb(pool),
+            AccelerationConnection::DuckDB(pool) => {
+                // DuckDB is synchronous; offload to the blocking pool so the
+                // async runtime thread isn't stalled.
+                let pool = Arc::clone(pool);
+                let dataset_name = self.dataset_name.clone();
+                tokio::task::spawn_blocking(move || Self::get_duckdb(&pool, &dataset_name))
+                    .await
+                    .ok()
+                    .flatten()
+            }
             #[cfg(feature = "postgres-accel")]
             AccelerationConnection::Postgres(pool) => self.get_postgres(pool).await,
             #[cfg(feature = "sqlite")]
@@ -136,7 +148,16 @@ impl MongoSys {
     ) -> Result<()> {
         match &self.acceleration_connection {
             #[cfg(feature = "duckdb")]
-            AccelerationConnection::DuckDB(pool) => self.upsert_duckdb(pool, metadata),
+            AccelerationConnection::DuckDB(pool) => {
+                let pool = Arc::clone(pool);
+                let dataset_name = self.dataset_name.clone();
+                let metadata = metadata.clone();
+                tokio::task::spawn_blocking(move || {
+                    Self::upsert_duckdb(&pool, &dataset_name, &metadata)
+                })
+                .await
+                .map_err(Error::external)?
+            }
             #[cfg(feature = "postgres-accel")]
             AccelerationConnection::Postgres(pool) => self.upsert_postgres(pool, metadata).await,
             #[cfg(feature = "sqlite")]
@@ -158,7 +179,13 @@ impl MongoSys {
     pub async fn delete(&self) -> Result<()> {
         match &self.acceleration_connection {
             #[cfg(feature = "duckdb")]
-            AccelerationConnection::DuckDB(pool) => self.delete_duckdb(pool),
+            AccelerationConnection::DuckDB(pool) => {
+                let pool = Arc::clone(pool);
+                let dataset_name = self.dataset_name.clone();
+                tokio::task::spawn_blocking(move || Self::delete_duckdb(&pool, &dataset_name))
+                    .await
+                    .map_err(Error::external)?
+            }
             #[cfg(feature = "postgres-accel")]
             AccelerationConnection::Postgres(pool) => self.delete_postgres(pool).await,
             #[cfg(feature = "sqlite")]

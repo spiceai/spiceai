@@ -32,6 +32,8 @@ limitations under the License.
 //!     PRIMARY KEY (`dataset_name`, `topic`, `partition_id`),
 //! );
 
+use std::sync::Arc;
+
 use datafusion::arrow::datatypes::{Schema, SchemaRef};
 
 use super::{
@@ -58,7 +60,9 @@ mod turso;
 pub struct KafkaSys {
     dataset_name: String,
     acceleration_connection: AccelerationConnection,
-    schema_ensured: OffsetSchemaState,
+    // `Arc` so the "ensure DDL once" flag can be shared into the blocking task
+    // that runs the synchronous DuckDB work via `spawn_blocking`.
+    schema_ensured: Arc<OffsetSchemaState>,
 }
 
 impl KafkaSys {
@@ -66,14 +70,25 @@ impl KafkaSys {
         Ok(Self {
             dataset_name: dataset.name.to_string(),
             acceleration_connection: acceleration_connection(dataset, open_option).await?,
-            schema_ensured: OffsetSchemaState::default(),
+            schema_ensured: Arc::new(OffsetSchemaState::default()),
         })
     }
 
     pub(crate) async fn get(&self) -> Result<Option<KafkaMetadata>> {
         match &self.acceleration_connection {
             #[cfg(feature = "duckdb")]
-            AccelerationConnection::DuckDB(pool) => self.get_duckdb(pool),
+            AccelerationConnection::DuckDB(pool) => {
+                // DuckDB is synchronous; offload to the blocking pool so the
+                // async runtime thread isn't stalled.
+                let pool = Arc::clone(pool);
+                let dataset_name = self.dataset_name.clone();
+                let schema_ensured = Arc::clone(&self.schema_ensured);
+                tokio::task::spawn_blocking(move || {
+                    Self::get_duckdb(&pool, &dataset_name, &schema_ensured)
+                })
+                .await
+                .map_err(Error::external)?
+            }
             #[cfg(feature = "postgres-accel")]
             AccelerationConnection::Postgres(pool) => self.get_postgres(pool).await,
             #[cfg(feature = "sqlite")]
@@ -95,7 +110,17 @@ impl KafkaSys {
     pub(crate) async fn upsert(&self, metadata: &KafkaMetadata) -> Result<()> {
         match &self.acceleration_connection {
             #[cfg(feature = "duckdb")]
-            AccelerationConnection::DuckDB(pool) => self.upsert_duckdb(pool, metadata),
+            AccelerationConnection::DuckDB(pool) => {
+                let pool = Arc::clone(pool);
+                let dataset_name = self.dataset_name.clone();
+                let schema_ensured = Arc::clone(&self.schema_ensured);
+                let metadata = metadata.clone();
+                tokio::task::spawn_blocking(move || {
+                    Self::upsert_duckdb(&pool, &dataset_name, &schema_ensured, &metadata)
+                })
+                .await
+                .map_err(Error::external)?
+            }
             #[cfg(feature = "postgres-accel")]
             AccelerationConnection::Postgres(pool) => self.upsert_postgres(pool, metadata).await,
             #[cfg(feature = "sqlite")]
@@ -117,7 +142,17 @@ impl KafkaSys {
     pub(crate) async fn upsert_offsets(&self, offsets: &[KafkaOffset]) -> Result<()> {
         match &self.acceleration_connection {
             #[cfg(feature = "duckdb")]
-            AccelerationConnection::DuckDB(pool) => self.upsert_offsets_duckdb(pool, offsets),
+            AccelerationConnection::DuckDB(pool) => {
+                let pool = Arc::clone(pool);
+                let dataset_name = self.dataset_name.clone();
+                let schema_ensured = Arc::clone(&self.schema_ensured);
+                let offsets = offsets.to_vec();
+                tokio::task::spawn_blocking(move || {
+                    Self::upsert_offsets_duckdb(&pool, &dataset_name, &schema_ensured, &offsets)
+                })
+                .await
+                .map_err(Error::external)?
+            }
             #[cfg(feature = "postgres-accel")]
             AccelerationConnection::Postgres(pool) => {
                 self.upsert_offsets_postgres(pool, offsets).await

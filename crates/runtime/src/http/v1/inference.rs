@@ -137,7 +137,7 @@ pub enum PredictStatus {
 pub(crate) async fn get(
     Extension(app): Extension<Arc<RwLock<Option<Arc<App>>>>>,
     Path(model_name): Path<String>,
-    Extension(models): Extension<Arc<RwLock<HashMap<String, Model>>>>,
+    Extension(models): Extension<Arc<RwLock<HashMap<String, Arc<Model>>>>>,
 ) -> Response {
     let context = RequestContext::current(AsyncMarker::new().await);
     let df = get_current_datafusion(&context);
@@ -206,7 +206,7 @@ pub(crate) async fn get(
 ))]
 pub(crate) async fn post(
     Extension(app): Extension<Arc<RwLock<Option<Arc<App>>>>>,
-    Extension(models): Extension<Arc<RwLock<HashMap<String, Model>>>>,
+    Extension(models): Extension<Arc<RwLock<HashMap<String, Arc<Model>>>>>,
     Json(payload): Json<BatchPredictRequest>,
 ) -> Response {
     let context = RequestContext::current(AsyncMarker::new().await);
@@ -243,7 +243,7 @@ pub(crate) async fn post(
 async fn run_inference(
     app: Arc<RwLock<Option<Arc<App>>>>,
     df: Arc<DataFusion>,
-    models: Arc<RwLock<HashMap<String, Model>>>,
+    models: Arc<RwLock<HashMap<String, Arc<Model>>>>,
     model_name: String,
 ) -> PredictResponse {
     let start_time = Instant::now();
@@ -273,17 +273,23 @@ async fn run_inference(
         };
     };
 
-    let loaded_models = models.read().await;
-    let Some(runnable) = loaded_models.get(&model.name) else {
-        tracing::debug!("Model {model_name} not found");
-        return PredictResponse {
-            status: PredictStatus::BadRequest,
-            error_message: Some(format!("Model {model_name} not found")),
-            model_name,
-            model_version: Some(modelsource::version(&model.from)),
-            prediction: None,
-            duration_ms: start_time.elapsed().as_millis(),
+    // Clone the model handle out of the lock and release the read guard before
+    // running inference, so the (blocking, `spawn_blocking`-offloaded) prediction
+    // doesn't hold the models lock for its whole duration.
+    let runnable = {
+        let loaded_models = models.read().await;
+        let Some(runnable) = loaded_models.get(&model.name) else {
+            tracing::debug!("Model {model_name} not found");
+            return PredictResponse {
+                status: PredictStatus::BadRequest,
+                error_message: Some(format!("Model {model_name} not found")),
+                model_name,
+                model_version: Some(modelsource::version(&model.from)),
+                prediction: None,
+                duration_ms: start_time.elapsed().as_millis(),
+            };
         };
+        Arc::clone(runnable)
     };
 
     match run(runnable, Arc::clone(&df)).await {
