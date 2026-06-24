@@ -17,6 +17,8 @@ limitations under the License.
 mod cancel_tasks;
 mod distributed_acceleration;
 mod distributed_cayenne_catalog;
+#[cfg(not(target_os = "windows"))]
+mod distributed_iceberg;
 mod distributed_task_history;
 pub mod harness;
 mod in_memory_shuffle;

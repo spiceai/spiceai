@@ -126,17 +126,20 @@ async-trait = "0.1.89"
 aws-config = "1.8.17"
 aws-credential-types = "1.2.13"
 aws-runtime = "1.7.1"
-aws-sdk-bedrockruntime = "1.132.0"
-aws-sdk-cognitoidentity = "1.101.0"
-aws-sdk-cognitoidentityprovider = "1.118.0"
-aws-sdk-dynamodb = "1.115.0"
-aws-sdk-ec2 = "1.113.0"
-aws-sdk-dynamodbstreams = "1.101.0"
-aws-sdk-glue = "1.149.0"
-aws-sdk-s3 = "1.134.0"
-aws-sdk-s3vectors = "1.26.0"
-aws-sdk-secretsmanager = "1.106.0"
-aws-sdk-sts = "1.105.0"
+# aws-sdk-* default features include both `rustls` (legacy aws-smithy-runtime/tls-rustls
+# connector → rustls 0.21) and `default-https-client` (modern rustls-aws-lc → rustls 0.23).
+# Drop `rustls` (keep `default-https-client`) so only the modern rustls 0.23 connector is built.
+aws-sdk-bedrockruntime = { version = "1.132.0", default-features = false, features = ["default-https-client", "rt-tokio"] }
+aws-sdk-cognitoidentity = { version = "1.101.0", default-features = false, features = ["default-https-client", "rt-tokio"] }
+aws-sdk-cognitoidentityprovider = { version = "1.118.0", default-features = false, features = ["default-https-client", "rt-tokio"] }
+aws-sdk-dynamodb = { version = "1.115.0", default-features = false, features = ["default-https-client", "rt-tokio"] }
+aws-sdk-ec2 = { version = "1.113.0", default-features = false, features = ["default-https-client", "rt-tokio"] }
+aws-sdk-dynamodbstreams = { version = "1.101.0", default-features = false, features = ["default-https-client", "rt-tokio"] }
+aws-sdk-glue = { version = "1.149.0", default-features = false, features = ["default-https-client", "rt-tokio"] }
+aws-sdk-s3 = { version = "1.134.0", default-features = false, features = ["sigv4a", "http-1x", "default-https-client", "rt-tokio"] }
+aws-sdk-s3vectors = { version = "1.26.0", default-features = false, features = ["default-https-client", "rt-tokio"] }
+aws-sdk-secretsmanager = { version = "1.106.0", default-features = false, features = ["default-https-client", "rt-tokio"] }
+aws-sdk-sts = { version = "1.105.0", default-features = false, features = ["sigv4a", "default-https-client", "rt-tokio"] }
 aws-smithy-async = "1.2.14"
 aws-smithy-runtime = "1.11.1"
 aws-smithy-runtime-api = "1.11.6"
@@ -303,14 +306,14 @@ sqlparser = "0.59.0"
 ssh2 = { version = "0.9.5" }
 suppaftp = { version = "6.3.0", features = ["async"] }
 sysinfo = "0.38.4"
-system-adapter-protocol = { git = "https://github.com/spiceai/spicebench.git", rev = "6c00cb7e811a51d8b22191bac798f49b76e779ad", features = ["client", "server"] }
+system-adapter-protocol = { git = "https://github.com/spiceai/spicebench.git", rev = "4624f1ec96c519d0bde4fee8c4e75b0498a2181d", features = ["client", "server"] }
 tantivy = "0.26.0"
 tempfile = "3"
-tiberius = { version = "0.12.3", default-features = false, features = [
+tiberius = { git = "https://github.com/spiceai/tiberius", rev = "9ae93c65222b51b0579945ffce5cba053cb23cca", default-features = false, features = [
     "tds73",
     "rustls",
     "chrono",
-] }
+] } # spiceai branch
 tokenizers = "0.21.2"
 tokio = { version = "1", features = [
     "io-std",

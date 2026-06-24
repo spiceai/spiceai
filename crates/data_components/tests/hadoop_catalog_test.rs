@@ -521,7 +521,7 @@ mod tests {
             let catalog = Arc::new(catalog) as Arc<dyn Catalog>;
 
             let provider =
-                IcebergCatalogProvider::try_new(Arc::clone(&catalog), None, Some(&glob_set))
+                IcebergCatalogProvider::try_new(Arc::clone(&catalog), None, Some(&glob_set), None)
                     .await
                     .expect("Should create provider");
 
@@ -568,7 +568,7 @@ mod tests {
             );
 
             // recreate provider with no includes
-            let provider = IcebergCatalogProvider::try_new(catalog, None, None)
+            let provider = IcebergCatalogProvider::try_new(catalog, None, None, None)
                 .await
                 .expect("Should create provider without includes");
 

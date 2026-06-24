@@ -42,7 +42,7 @@ use snafu::prelude::*;
 use std::error::Error as StdError;
 use tonic::IntoRequest;
 use tonic::IntoStreamingRequest;
-use tonic::transport::Channel;
+use tonic::transport::{Channel, Endpoint};
 
 pub mod arrow_flight_factory;
 pub mod cookie;
@@ -50,6 +50,16 @@ pub mod tls;
 
 pub const MAX_ENCODING_MESSAGE_SIZE: usize = 100 * 1024 * 1024;
 pub const MAX_DECODING_MESSAGE_SIZE: usize = 100 * 1024 * 1024;
+pub const HTTP2_INITIAL_STREAM_WINDOW_SIZE: u32 = 16 * 1024 * 1024;
+pub const HTTP2_INITIAL_CONNECTION_WINDOW_SIZE: u32 = 64 * 1024 * 1024;
+
+/// Applies shared HTTP/2 flow-control settings for high-throughput Flight streams.
+#[must_use]
+pub fn configure_endpoint_for_high_throughput(endpoint: Endpoint) -> Endpoint {
+    endpoint
+        .initial_stream_window_size(HTTP2_INITIAL_STREAM_WINDOW_SIZE)
+        .initial_connection_window_size(HTTP2_INITIAL_CONNECTION_WINDOW_SIZE)
+}
 
 #[derive(Debug)]
 pub struct TonicStatusError(Box<tonic::Status>);
