@@ -870,7 +870,10 @@ fn dummy_cache_value() -> CachedFileList {
 /// `source_data_file_path`; position-based DVs always have one. Note the
 /// catalog does not persist `deletion_type`, so it cannot be used to classify a
 /// DV — `source_data_file_path.is_none()` is the reliable discriminator.
-async fn count_key_based_delete_files(fixture: &TestFixture, table: &CayenneTableProvider) -> usize {
+async fn count_key_based_delete_files(
+    fixture: &TestFixture,
+    table: &CayenneTableProvider,
+) -> usize {
     let table_id = table.metadata().table_id.clone();
     let dfs = fixture
         .catalog
@@ -1028,7 +1031,10 @@ async fn test_needed_key_dv_retained_after_retention_impl(fixture: TestFixture) 
 
     // Retention empties M (id=1 expired); A and B are fresh and survive.
     let deleted = execute_delete(&table, retention_delete_filter(retention_seconds)).await?;
-    assert_eq!(deleted, 1, "Retention should delete only the expired id=1 row");
+    assert_eq!(
+        deleted, 1,
+        "Retention should delete only the expired id=1 row"
+    );
 
     // id=1 is gone; id=2 survives exactly once (the upserted copy).
     assert_table_contents(&ctx, &table, table_name, &[2], "after retention").await?;
