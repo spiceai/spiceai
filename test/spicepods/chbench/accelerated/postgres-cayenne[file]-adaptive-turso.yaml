@@ -39,6 +39,8 @@ postgres_connection_params: &postgres_params
   pg_sslmode: disable
 
 runtime:
+  flight:
+    ipc_compression: lz4_frame
   caching:
     sql_results:
       enabled: false
