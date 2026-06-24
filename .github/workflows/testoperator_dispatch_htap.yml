@@ -1,6 +1,14 @@
 name: testoperator dispatch htap
 
 on:
+  schedule:
+    # htap-sf100, every 3h (0200, 0500, 0800, 1100, 1400, 1700, 2000, 2300) — HTAP CH-benCHmark SF100 (spiceai-dev-xlarge-runners)
+    - cron: '0 2,5,8,11,14,17,20,23 * * *'
+    # htap-sf1000, twice daily (0000, 1200) — HTAP CH-benCHmark SF1000 (spiceai-dev-xlarge-runners)
+    - cron: '0 0,12 * * *'
+    # htap-sf1, twice daily (0600, 1800) — HTAP CH-benCHmark SF1 (spiceai-dev-large-runners)
+    - cron: '0 6,18 * * *'
+
   workflow_dispatch:
     inputs:
       spiced_commit:
@@ -19,10 +27,15 @@ on:
 
 jobs:
   dispatch-htap:
-    name: Dispatch HTAP - ${{ github.event.inputs.scale_factor }}
+    name: Dispatch HTAP - ${{ github.event.inputs.scale_factor || github.event.schedule }}
     runs-on: spiceai-dev-runners
+    # On schedule the dispatcher serializes the batch (--max-concurrent 1) and blocks for the sum of
+    # its run durations; an SF1000 batch can run several hours, so raise the cap above GitHub's 6h.
+    timeout-minutes: 720
+    # Per-cron group on schedule (so the SF1/SF100/SF1000 dispatchers don't block each other),
+    # per-ref on manual dispatch.
     concurrency:
-      group: testoperator-dispatch-htap-${{ github.event.ref }}
+      group: testoperator-dispatch-htap-${{ github.event.schedule || github.event.ref }}
       cancel-in-progress: false
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
@@ -41,7 +54,8 @@ jobs:
         id: setup-spiced
         with:
           spiced_commit: ${{ github.event.inputs.spiced_commit }}
-          ref: ${{ github.event.ref }}
+          # github.event.ref is empty on schedule (cron only runs on the default branch).
+          ref: ${{ github.event.ref || 'refs/heads/trunk' }}
 
       - name: Display spiced commit
         run: echo "SPICED_COMMIT=${{ steps.setup-spiced.outputs.SPICED_COMMIT }}"
@@ -72,11 +86,35 @@ jobs:
             "$SPICEPOD_VALIDATOR" "$file"
           done
 
-      - name: Dispatch Testoperator - HTAP - CH-BenCHmark - ${{ github.event.inputs.scale_factor }}
+      # On manual dispatch the scale factor comes from the input. On schedule, derive it from the
+      # cron that fired. Scheduled batches also serialize (--max-concurrent 1) so each run finishes
+      # before the next is dispatched; --max-concurrent-wait-timeout-mins covers a full run's
+      # wall-clock so the slot wait doesn't give up early. Manual dispatch keeps the original
+      # fire-and-forget behaviour (no serialization flags).
+      - name: Resolve scale factor
+        id: resolve
         run: |
-          testoperator dispatch ./tools/testoperator/dispatch/chbench/${{ github.event.inputs.scale_factor }} \
-            --workflow htap
+          SF="${{ github.event.inputs.scale_factor }}"
+          FLAGS=""
+          if [ -z "$SF" ]; then
+            case "${{ github.event.schedule }}" in
+              '0 2,5,8,11,14,17,20,23 * * *') SF=sf100 ;;
+              '0 0,12 * * *')                 SF=sf1000 ;;
+              '0 6,18 * * *')                 SF=sf1 ;;
+              *)                              SF= ;;   # unrecognized cron — dispatch nothing
+            esac
+            FLAGS="--max-concurrent 1 --max-concurrent-wait-timeout-mins 180"
+          fi
+          echo "Resolved scale factor: '$SF' (flags: '$FLAGS')"
+          echo "scale_factor=$SF" >> "$GITHUB_OUTPUT"
+          echo "flags=$FLAGS" >> "$GITHUB_OUTPUT"
+
+      - name: Dispatch Testoperator - HTAP - CH-BenCHmark - ${{ steps.resolve.outputs.scale_factor }}
+        if: ${{ steps.resolve.outputs.scale_factor != '' }}
+        run: |
+          testoperator dispatch ./tools/testoperator/dispatch/chbench/${{ steps.resolve.outputs.scale_factor }} \
+            --workflow htap ${{ steps.resolve.outputs.flags }}
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           SPICED_COMMIT: ${{ steps.setup-spiced.outputs.SPICED_COMMIT }}
-          WORKFLOW_COMMIT: ${{ github.event.ref }}
+          WORKFLOW_COMMIT: ${{ github.event.ref || 'trunk' }}
