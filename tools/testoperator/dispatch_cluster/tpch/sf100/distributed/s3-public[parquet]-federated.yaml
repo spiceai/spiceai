@@ -1,0 +1,15 @@
+tests:
+  bench:
+    spicepod_path: federated/s3-public[parquet].yaml
+    query_set: tpch
+    scale_factor: 100
+    query_transport: v1-queries
+    # SF100 has enough work to amortize Ballista scheduling/shuffle overhead.
+    # Use PVC-backed local disk for Ballista shuffle and query temp files.
+    shuffle_location: /data/ballista-shuffle/{github_run_id}/{github_run_attempt}
+    query_temp_directory: /data
+    app_storage_size_gb: 100
+    executor_storage_size_gb: 500
+    ephemeral_storage_limit: 1Gi
+    runner_type: spiceai-dev-runners
+    validate_results: false
