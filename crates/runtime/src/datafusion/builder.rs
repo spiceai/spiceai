@@ -859,7 +859,7 @@ impl DataFusionBuilder {
         // Register Spark-compatible functions, but skip Spark's `trunc` (scalar) and
         // `avg` (aggregate): `register_all` would register them *over* the built-ins
         // of the same name. Spark `trunc` is date-truncation and shadows numeric
-        // `trunc(<float>, <int>)` (see spiceai#11415). Spark `avg` uses a different
+        // `trunc(<float>, <int>)` (see spiceai/spiceai#11415). Spark `avg` uses a different
         // partial-aggregate state layout (`[sum, count:Int64]`) than the built-in
         // (`[count:UInt64, sum]`); harmless single-node, but it corrupts DISTRIBUTED
         // plans — the scheduler bakes the shuffle/stage schema from Spark `avg`'s
@@ -871,21 +871,24 @@ impl DataFusionBuilder {
             if udf.name() == "trunc" {
                 continue;
             }
+            let name = udf.name().to_string();
             if let Err(e) = state.register_udf(udf) {
-                panic!("Unable to register Spark scalar function: {e}");
+                panic!("Unable to register Spark scalar function `{name}`: {e}");
             }
         }
         for udaf in datafusion_spark::all_default_aggregate_functions() {
             if udaf.name() == "avg" {
                 continue;
             }
+            let name = udaf.name().to_string();
             if let Err(e) = state.register_udaf(udaf) {
-                panic!("Unable to register Spark aggregate function: {e}");
+                panic!("Unable to register Spark aggregate function `{name}`: {e}");
             }
         }
         for udwf in datafusion_spark::all_default_window_functions() {
+            let name = udwf.name().to_string();
             if let Err(e) = state.register_udwf(udwf) {
-                panic!("Unable to register Spark window function: {e}");
+                panic!("Unable to register Spark window function `{name}`: {e}");
             }
         }
 
