@@ -20,8 +20,8 @@ use std::sync::Arc;
 
 impl DynamoDBSys {
     pub(super) fn upsert_duckdb(
+        &self,
         pool: &Arc<DuckDbConnectionPool>,
-        dataset_name: &str,
         metadata: &DynamoDBCheckpointMetadata,
     ) -> Result<()> {
         let mut db_conn = Arc::clone(pool).connect_sync().map_err(Error::external)?;
@@ -50,15 +50,15 @@ impl DynamoDBSys {
         );
 
         duckdb_conn
-            .execute(&upsert, [dataset_name, metadata.checkpoint_data.as_str()])
+            .execute(&upsert, [&self.dataset_name, &metadata.checkpoint_data])
             .map_err(Error::external)?;
 
         Ok(())
     }
 
     pub(super) fn get_duckdb(
+        &self,
         pool: &Arc<DuckDbConnectionPool>,
-        dataset_name: &str,
     ) -> Option<DynamoDBCheckpointMetadata> {
         use std::time::{Duration, UNIX_EPOCH};
 
@@ -71,7 +71,7 @@ impl DynamoDBSys {
             "SELECT checkpoint_data, epoch(updated_at) FROM {DYNAMODB_STREAMS_TABLE_NAME} WHERE dataset_name = ?"
         );
         let mut stmt = duckdb_conn.prepare(&query).ok()?;
-        let mut rows = stmt.query([dataset_name]).ok()?;
+        let mut rows = stmt.query([&self.dataset_name]).ok()?;
 
         if let Some(row) = rows.next().ok()? {
             let checkpoint_data: String = row.get(0).ok()?;

@@ -559,7 +559,7 @@ impl DataConnector for Debezium {
     }
 }
 
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Serialize, Deserialize)]
 pub(crate) struct DebeziumKafkaMetadata {
     pub(crate) consumer_group_id: String,
     pub(crate) topic: String,

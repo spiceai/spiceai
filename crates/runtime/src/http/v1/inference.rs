@@ -33,6 +33,10 @@ use std::time::Instant;
 use std::{collections::HashMap, sync::Arc};
 use tokio::sync::RwLock;
 
+// Shared map of loaded ML models keyed by model name. `Arc<Model>` so a handle
+// can be cloned out of the lock and moved into `spawn_blocking` for inference.
+type ModelStore = Arc<RwLock<HashMap<String, Arc<Model>>>>;
+
 #[derive(Default, Serialize, Deserialize)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub struct BatchPredictRequest {
@@ -137,7 +141,7 @@ pub enum PredictStatus {
 pub(crate) async fn get(
     Extension(app): Extension<Arc<RwLock<Option<Arc<App>>>>>,
     Path(model_name): Path<String>,
-    Extension(models): Extension<Arc<RwLock<HashMap<String, Arc<Model>>>>>,
+    Extension(models): Extension<ModelStore>,
 ) -> Response {
     let context = RequestContext::current(AsyncMarker::new().await);
     let df = get_current_datafusion(&context);
@@ -206,7 +210,7 @@ pub(crate) async fn get(
 ))]
 pub(crate) async fn post(
     Extension(app): Extension<Arc<RwLock<Option<Arc<App>>>>>,
-    Extension(models): Extension<Arc<RwLock<HashMap<String, Arc<Model>>>>>,
+    Extension(models): Extension<ModelStore>,
     Json(payload): Json<BatchPredictRequest>,
 ) -> Response {
     let context = RequestContext::current(AsyncMarker::new().await);
@@ -243,34 +247,40 @@ pub(crate) async fn post(
 async fn run_inference(
     app: Arc<RwLock<Option<Arc<App>>>>,
     df: Arc<DataFusion>,
-    models: Arc<RwLock<HashMap<String, Arc<Model>>>>,
+    models: ModelStore,
     model_name: String,
 ) -> PredictResponse {
     let start_time = Instant::now();
 
-    let app_lock = app.read().await;
-    let Some(readable_app) = &*app_lock else {
-        return PredictResponse {
-            status: PredictStatus::BadRequest,
-            error_message: Some("App not found".to_string()),
-            model_name,
-            model_version: None,
-            prediction: None,
-            duration_ms: start_time.elapsed().as_millis(),
+    // Resolve the model's version and release the app read-lock before any heavy
+    // await below, so inference doesn't hold the app lock for its whole duration
+    // (which would contend with reload/update writers).
+    let model_version = {
+        let app_lock = app.read().await;
+        let Some(readable_app) = &*app_lock else {
+            return PredictResponse {
+                status: PredictStatus::BadRequest,
+                error_message: Some("App not found".to_string()),
+                model_name,
+                model_version: None,
+                prediction: None,
+                duration_ms: start_time.elapsed().as_millis(),
+            };
         };
-    };
 
-    let model = readable_app.models.iter().find(|m| m.name == model_name);
-    let Some(model) = model else {
-        tracing::debug!("Model {model_name} not found");
-        return PredictResponse {
-            status: PredictStatus::BadRequest,
-            error_message: Some(format!("Model {model_name} not found")),
-            model_name,
-            model_version: None,
-            prediction: None,
-            duration_ms: start_time.elapsed().as_millis(),
+        let Some(model) = readable_app.models.iter().find(|m| m.name == model_name) else {
+            tracing::debug!("Model {model_name} not found");
+            return PredictResponse {
+                status: PredictStatus::BadRequest,
+                error_message: Some(format!("Model {model_name} not found")),
+                model_name,
+                model_version: None,
+                prediction: None,
+                duration_ms: start_time.elapsed().as_millis(),
+            };
         };
+
+        modelsource::version(&model.from)
     };
 
     // Clone the model handle out of the lock and release the read guard before
@@ -278,13 +288,13 @@ async fn run_inference(
     // doesn't hold the models lock for its whole duration.
     let runnable = {
         let loaded_models = models.read().await;
-        let Some(runnable) = loaded_models.get(&model.name) else {
+        let Some(runnable) = loaded_models.get(&model_name) else {
             tracing::debug!("Model {model_name} not found");
             return PredictResponse {
                 status: PredictStatus::BadRequest,
                 error_message: Some(format!("Model {model_name} not found")),
                 model_name,
-                model_version: Some(modelsource::version(&model.from)),
+                model_version: Some(model_version),
                 prediction: None,
                 duration_ms: start_time.elapsed().as_millis(),
             };
@@ -300,7 +310,7 @@ async fn run_inference(
                         status: PredictStatus::Success,
                         error_message: None,
                         model_name,
-                        model_version: Some(modelsource::version(&model.from)),
+                        model_version: Some(model_version.clone()),
                         prediction: Some(array.values().to_vec()),
                         duration_ms: start_time.elapsed().as_millis(),
                     };
@@ -317,7 +327,7 @@ async fn run_inference(
                         "Unable to cast inference result to Float32Array".to_string(),
                     ),
                     model_name,
-                    model_version: Some(modelsource::version(&model.from)),
+                    model_version: Some(model_version.clone()),
                     prediction: None,
                     duration_ms: start_time.elapsed().as_millis(),
                 };
@@ -327,7 +337,7 @@ async fn run_inference(
                 status: PredictStatus::InternalError,
                 error_message: Some("Unable to find column 'y' in inference result".to_string()),
                 model_name,
-                model_version: Some(modelsource::version(&model.from)),
+                model_version: Some(model_version.clone()),
                 prediction: None,
                 duration_ms: start_time.elapsed().as_millis(),
             }
@@ -338,7 +348,7 @@ async fn run_inference(
                 status: PredictStatus::InternalError,
                 error_message: Some(e.to_string()),
                 model_name,
-                model_version: Some(modelsource::version(&model.from)),
+                model_version: Some(model_version.clone()),
                 prediction: None,
                 duration_ms: start_time.elapsed().as_millis(),
             }

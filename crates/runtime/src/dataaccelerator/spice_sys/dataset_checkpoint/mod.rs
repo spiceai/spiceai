@@ -153,14 +153,7 @@ impl DatasetCheckpoint {
         ))]
         match connection {
             #[cfg(feature = "duckdb")]
-            AccelerationConnection::DuckDB(pool) => {
-                // DuckDB is a synchronous embedded engine; run its blocking work
-                // on the blocking pool so the async runtime thread isn't stalled.
-                let pool = Arc::clone(pool);
-                tokio::task::spawn_blocking(move || Self::init_duckdb(&pool))
-                    .await
-                    .map_err(Error::external)??;
-            }
+            AccelerationConnection::DuckDB(pool) => Self::init_duckdb(pool)?,
             #[cfg(feature = "postgres-accel")]
             AccelerationConnection::Postgres(pool) => Self::init_postgres(pool).await?,
             #[cfg(feature = "sqlite")]
@@ -180,12 +173,7 @@ impl DatasetCheckpoint {
         ))]
         match connection {
             #[cfg(feature = "duckdb")]
-            AccelerationConnection::DuckDB(pool) => {
-                let pool = Arc::clone(pool);
-                tokio::task::spawn_blocking(move || Self::migrate_duckdb(&pool))
-                    .await
-                    .map_err(Error::external)??;
-            }
+            AccelerationConnection::DuckDB(pool) => Self::migrate_duckdb(pool)?,
             #[cfg(feature = "postgres-accel")]
             AccelerationConnection::Postgres(pool) => Self::migrate_postgres(pool).await?,
             #[cfg(feature = "sqlite")]
@@ -240,15 +228,7 @@ impl DatasetCheckpoint {
     pub async fn exists(&self) -> bool {
         match &self.acceleration_connection {
             #[cfg(feature = "duckdb")]
-            AccelerationConnection::DuckDB(pool) => {
-                let pool = Arc::clone(pool);
-                let dataset_name = self.dataset_name.clone();
-                tokio::task::spawn_blocking(move || Self::exists_duckdb(&dataset_name, &pool))
-                    .await
-                    .ok()
-                    .and_then(Result::ok)
-                    .unwrap_or(false)
-            }
+            AccelerationConnection::DuckDB(pool) => self.exists_duckdb(pool).ok().unwrap_or(false),
             #[cfg(feature = "postgres-accel")]
             AccelerationConnection::Postgres(pool) => {
                 self.exists_postgres(pool).await.ok().unwrap_or(false)
@@ -278,15 +258,7 @@ impl DatasetCheckpoint {
     pub async fn last_checkpoint_time(&self) -> Result<Option<SystemTime>> {
         match &self.acceleration_connection {
             #[cfg(feature = "duckdb")]
-            AccelerationConnection::DuckDB(pool) => {
-                let pool = Arc::clone(pool);
-                let dataset_name = self.dataset_name.clone();
-                tokio::task::spawn_blocking(move || {
-                    Self::last_checkpoint_time_duckdb(&dataset_name, &pool)
-                })
-                .await
-                .map_err(Error::external)?
-            }
+            AccelerationConnection::DuckDB(pool) => self.last_checkpoint_time_duckdb(pool),
             #[cfg(feature = "postgres-accel")]
             AccelerationConnection::Postgres(pool) => {
                 self.last_checkpoint_time_postgres(pool).await
@@ -320,22 +292,7 @@ impl DatasetCheckpoint {
         match &self.acceleration_connection {
             #[cfg(feature = "duckdb")]
             AccelerationConnection::DuckDB(pool) => {
-                let pool = Arc::clone(pool);
-                let dataset_name = self.dataset_name.clone();
-                let create_snapshot = self.snapshot_behavior.create_enabled();
-                let schema = Arc::clone(schema);
-                let refresh_sql = refresh_sql.map(ToString::to_string);
-                tokio::task::spawn_blocking(move || {
-                    Self::checkpoint_duckdb(
-                        &pool,
-                        &dataset_name,
-                        create_snapshot,
-                        &schema,
-                        refresh_sql.as_deref(),
-                    )
-                })
-                .await
-                .map_err(Error::external)?
+                self.checkpoint_duckdb(pool, schema, refresh_sql)
             }
             #[cfg(feature = "postgres-accel")]
             AccelerationConnection::Postgres(pool) => {
@@ -366,13 +323,7 @@ impl DatasetCheckpoint {
     pub async fn get_schema(&self) -> Result<Option<SchemaRef>> {
         match &self.acceleration_connection {
             #[cfg(feature = "duckdb")]
-            AccelerationConnection::DuckDB(pool) => {
-                let pool = Arc::clone(pool);
-                let dataset_name = self.dataset_name.clone();
-                tokio::task::spawn_blocking(move || Self::get_schema_duckdb(&dataset_name, &pool))
-                    .await
-                    .map_err(Error::external)?
-            }
+            AccelerationConnection::DuckDB(pool) => self.get_schema_duckdb(pool),
             #[cfg(feature = "postgres-accel")]
             AccelerationConnection::Postgres(pool) => self.get_schema_postgres(pool).await,
             #[cfg(feature = "sqlite")]
@@ -394,15 +345,7 @@ impl DatasetCheckpoint {
     pub async fn get_refresh_sql(&self) -> Result<Option<String>> {
         match &self.acceleration_connection {
             #[cfg(feature = "duckdb")]
-            AccelerationConnection::DuckDB(pool) => {
-                let pool = Arc::clone(pool);
-                let dataset_name = self.dataset_name.clone();
-                tokio::task::spawn_blocking(move || {
-                    Self::get_refresh_sql_duckdb(&dataset_name, &pool)
-                })
-                .await
-                .map_err(Error::external)?
-            }
+            AccelerationConnection::DuckDB(pool) => self.get_refresh_sql_duckdb(pool),
             #[cfg(feature = "postgres-accel")]
             AccelerationConnection::Postgres(pool) => self.get_refresh_sql_postgres(pool).await,
             #[cfg(feature = "sqlite")]
@@ -425,13 +368,7 @@ impl DatasetCheckpoint {
     pub async fn delete(&self) -> Result<()> {
         match &self.acceleration_connection {
             #[cfg(feature = "duckdb")]
-            AccelerationConnection::DuckDB(pool) => {
-                let pool = Arc::clone(pool);
-                let dataset_name = self.dataset_name.clone();
-                tokio::task::spawn_blocking(move || Self::delete_duckdb(&dataset_name, &pool))
-                    .await
-                    .map_err(Error::external)?
-            }
+            AccelerationConnection::DuckDB(pool) => self.delete_duckdb(pool),
             #[cfg(feature = "postgres-accel")]
             AccelerationConnection::Postgres(pool) => self.delete_postgres(pool).await,
             #[cfg(feature = "sqlite")]

@@ -14,9 +14,6 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-#[cfg(feature = "duckdb")]
-use std::sync::Arc;
-
 use super::{AccelerationConnection, Error, Result, acceleration_connection};
 use crate::{component::dataset::Dataset, dataaccelerator::spice_sys::OpenOption};
 use serde::{Deserialize, Serialize};
@@ -56,16 +53,7 @@ impl DynamoDBSys {
     pub async fn get(&self) -> Option<DynamoDBCheckpointMetadata> {
         match &self.acceleration_connection {
             #[cfg(feature = "duckdb")]
-            AccelerationConnection::DuckDB(pool) => {
-                // DuckDB is synchronous; offload to the blocking pool so the
-                // async runtime thread isn't stalled.
-                let pool = Arc::clone(pool);
-                let dataset_name = self.dataset_name.clone();
-                tokio::task::spawn_blocking(move || Self::get_duckdb(&pool, &dataset_name))
-                    .await
-                    .ok()
-                    .flatten()
-            }
+            AccelerationConnection::DuckDB(pool) => self.get_duckdb(pool),
             #[cfg(feature = "postgres-accel")]
             AccelerationConnection::Postgres(pool) => self.get_postgres(pool).await,
             #[cfg(feature = "sqlite")]
@@ -87,16 +75,7 @@ impl DynamoDBSys {
     pub async fn upsert(&self, metadata: &DynamoDBCheckpointMetadata) -> Result<()> {
         match &self.acceleration_connection {
             #[cfg(feature = "duckdb")]
-            AccelerationConnection::DuckDB(pool) => {
-                let pool = Arc::clone(pool);
-                let dataset_name = self.dataset_name.clone();
-                let metadata = metadata.clone();
-                tokio::task::spawn_blocking(move || {
-                    Self::upsert_duckdb(&pool, &dataset_name, &metadata)
-                })
-                .await
-                .map_err(Error::external)?
-            }
+            AccelerationConnection::DuckDB(pool) => self.upsert_duckdb(pool, metadata),
             #[cfg(feature = "postgres-accel")]
             AccelerationConnection::Postgres(pool) => self.upsert_postgres(pool, metadata).await,
             #[cfg(feature = "sqlite")]

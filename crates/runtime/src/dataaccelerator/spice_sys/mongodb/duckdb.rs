@@ -22,8 +22,8 @@ use super::{Error, MONGODB_TABLE_NAME, MongoCheckpointMetadata, MongoSys, Result
 
 impl MongoSys {
     pub(super) fn upsert_duckdb(
+        &self,
         pool: &Arc<DuckDbConnectionPool>,
-        dataset_name: &str,
         metadata: &MongoCheckpointMetadata,
     ) -> Result<()> {
         let mut db_conn = Arc::clone(pool).connect_sync().map_err(Error::external)?;
@@ -60,7 +60,7 @@ impl MongoSys {
             .execute(
                 &upsert,
                 duckdb::params![
-                    dataset_name,
+                    self.dataset_name,
                     metadata.resume_token_json,
                     metadata.cluster_time_ts,
                     metadata.schema_json,
@@ -72,8 +72,8 @@ impl MongoSys {
     }
 
     pub(super) fn get_duckdb(
+        &self,
         pool: &Arc<DuckDbConnectionPool>,
-        dataset_name: &str,
     ) -> Option<MongoCheckpointMetadata> {
         use std::time::{Duration, UNIX_EPOCH};
 
@@ -86,7 +86,7 @@ impl MongoSys {
             "SELECT resume_token_json, cluster_time_ts, schema_json, CAST(epoch(updated_at) AS DOUBLE) FROM {MONGODB_TABLE_NAME} WHERE dataset_name = ?"
         );
         let mut stmt = duckdb_conn.prepare(&query).ok()?;
-        let mut rows = stmt.query([dataset_name]).ok()?;
+        let mut rows = stmt.query([&self.dataset_name]).ok()?;
 
         if let Some(row) = rows.next().ok()? {
             let resume_token_json: String = row.get(0).ok()?;
@@ -107,10 +107,7 @@ impl MongoSys {
         }
     }
 
-    pub(super) fn delete_duckdb(
-        pool: &Arc<DuckDbConnectionPool>,
-        dataset_name: &str,
-    ) -> Result<()> {
+    pub(super) fn delete_duckdb(&self, pool: &Arc<DuckDbConnectionPool>) -> Result<()> {
         let mut db_conn = Arc::clone(pool).connect_sync().map_err(Error::external)?;
         let duckdb_conn = datafusion_table_providers::duckdb::DuckDB::duckdb_conn(&mut db_conn)
             .map_err(Error::external)?
@@ -118,7 +115,7 @@ impl MongoSys {
 
         let delete = format!("DELETE FROM {MONGODB_TABLE_NAME} WHERE dataset_name = ?");
         duckdb_conn
-            .execute(&delete, [dataset_name])
+            .execute(&delete, [&self.dataset_name])
             .map_err(Error::external)?;
 
         Ok(())

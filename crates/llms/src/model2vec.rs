@@ -182,7 +182,7 @@ impl Debug for Model2Vec {
     }
 }
 
-/// Run the Model2Vec forward pass. Synchronous and CPU-bound — callers on the
+/// Run the `Model2Vec` forward pass. Synchronous and CPU-bound — callers on the
 /// async runtime must invoke this via `spawn_blocking`.
 fn encode_with_static_model(
     model: &StaticModel,
@@ -246,7 +246,13 @@ impl Embed for Model2Vec {
         // `cache_key` borrows `input`, so hand the blocking task an owned clone.
         let owned_input = input.clone();
         let vectors = tokio::task::spawn_blocking(move || {
-            encode_with_static_model(&model, owned_input, &model_name, max_token_length, batch_size)
+            encode_with_static_model(
+                &model,
+                owned_input,
+                &model_name,
+                max_token_length,
+                batch_size,
+            )
         })
         .await
         .map_err(|e| super::embeddings::Error::FailedToCreateEmbedding {
