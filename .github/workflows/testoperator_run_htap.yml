@@ -35,6 +35,11 @@ on:
         required: false
         type: string
         default: '4'
+      eager_aggregation:
+        description: 'Enable cost-based eager aggregation (SPICED_EAGER_AGGREGATION)'
+        required: false
+        type: boolean
+        default: false
       query_overrides:
         description: 'Query overrides'
         required: false
@@ -156,6 +161,9 @@ jobs:
         env:
           SPICEAI_BENCHMARK_METRICS_KEY: ${{ secrets.SPICEAI_BENCHMARK_METRICS_KEY }}
           SPICED_COMMIT: ${{ steps.setup-spiced.outputs.SPICED_COMMIT }}
+          # Experiment toggle: inherited by testoperator -> spiced (spawned without
+          # env_clear). On => the cost-based eager-aggregation optimizer; empty => off.
+          SPICED_EAGER_AGGREGATION: ${{ github.event.inputs.eager_aggregation == 'true' && '1' || '' }}
           # Dedicated in-cluster PG pod on xlarge; per-run docker container (loopback) elsewhere.
           CHBENCH_PG_HOST: ${{ github.event.inputs.runner_type == 'spiceai-dev-xlarge-runners' && 'chbench-postgres.dataplatform.svc.cluster.local' || '127.0.0.1' }}
 
