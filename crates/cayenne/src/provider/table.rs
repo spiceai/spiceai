@@ -163,6 +163,19 @@ const SCHEMA_EVOLUTION_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
 /// parallelism. See `snapshot_write_concurrency`.
 pub(crate) const DEFAULT_WRITE_CONCURRENCY: usize = 4;
 const TABLE_STATISTICS_FULL_COLUMN_SYNC_LIMIT: usize = 256;
+/// Upper bound on total per-PK maintained-aggregate retraction index entries;
+/// exceeding it fails the registry safe to a base-table rebuild so memory stays
+/// bounded. TODO: derive from `runtime.query.memory_limit` once the budget is
+/// threaded to the provider (Pattern 9 — budget-derived caps).
+const MAINTAINED_AGGREGATE_MAX_INDEX_ENTRIES: usize = 5_000_000;
+/// Bounded depth of the per-table maintained-aggregate apply queue. The CDC
+/// write path enqueues maintenance here and continues, so registry maintenance
+/// runs off the replication critical path while the background applier drains it
+/// in strict epoch order. Large enough to absorb CDC bursts without backpressure
+/// in steady state, small enough to bound memory. On sustained overload the
+/// write path waits (backpressure) rather than dropping a delta — a dropped
+/// delta would gap the strict apply order and force the registry stale.
+const MAINTAINED_AGGREGATE_APPLY_QUEUE_DEPTH: usize = 1024;
 /// Wall-clock duration of CONTINUOUS writer-active compaction skips on a
 /// position-delete table after which the TRACE-level skip escalates to a
 /// one-shot WARN per starvation episode. Deliberately time-based, not a skip
@@ -1349,6 +1362,12 @@ pub struct CayenneTableProvider {
     /// Visibility epoch for the maintained aggregate registry. Advanced under
     /// the same write barriers that publish scan-visible table changes.
     maintained_aggregate_epoch: Arc<AtomicU64>,
+    /// Sender to the single per-table background applier that maintains the
+    /// maintained-aggregate registry off the CDC write path (so maintenance
+    /// never blocks replication convergence). `None` when no maintained
+    /// aggregates are configured. Cloned (never re-spawned) onto provider
+    /// clones so every clone feeds the one ordered applier.
+    maintained_aggregate_tx: Option<tokio::sync::mpsc::Sender<MaintainedAggregateApply>>,
     /// Per-table background compaction task, populated by
     /// [`Self::spawn_background_compaction`]. Held by `Arc<OnceLock<…>>` so it
     /// survives [`Self::clone_for_write`] and shares its drop signal across
@@ -1398,6 +1417,31 @@ pub struct CayenneTableProviderBuilder {
 struct PendingMaintainedAggregateInsert {
     epoch: u64,
     batches: Arc<Vec<RecordBatch>>,
+}
+
+struct PendingMaintainedAggregateDelete {
+    epoch: u64,
+    /// PK columns of the deleted rows, projected by name into `pk_columns` order.
+    pk_batch: RecordBatch,
+}
+
+/// One ordered unit of maintained-aggregate maintenance. The CDC write path
+/// enqueues these and the single per-table background applier drains them in
+/// strict visibility-epoch order (channel FIFO), so registry maintenance never
+/// blocks replication convergence. Out-of-order or skipped epochs fail the
+/// registry safe to stale (queries then fall back to base-table scans).
+enum MaintainedAggregateApply {
+    Insert {
+        epoch: u64,
+        batches: Arc<Vec<RecordBatch>>,
+    },
+    Delete {
+        epoch: u64,
+        /// PK columns of the deleted rows, projected by name into `pk_columns`
+        /// order (table-schema types) — the layout `apply_pk_deletes` expects, so
+        /// retraction is independent of the CDC delete batch's source schema.
+        pk_batch: RecordBatch,
+    },
 }
 
 struct CayenneTableProviderOpenOptions {
@@ -3893,10 +3937,15 @@ impl CayenneTableProvider {
             &pk_deletion_strategy,
         )?;
         let table_statistics = Self::load_table_statistics(&catalog, &table_metadata).await;
+        // An empty `pk_column_indices` (no primary key) yields no index and the
+        // legacy insert-only behavior; otherwise the per-PK index is bounded by
+        // `MAINTAINED_AGGREGATE_MAX_INDEX_ENTRIES` (fail-safe to a base rebuild).
         let maintained_aggregates = Arc::new(
-            MaintainedAggregateRegistry::try_new(
+            MaintainedAggregateRegistry::try_new_with_pk(
                 &maintained_aggregate_specs,
                 &table_metadata.schema,
+                &pk_column_indices,
+                MAINTAINED_AGGREGATE_MAX_INDEX_ENTRIES,
             )
             .map_err(|source| CatalogError::InvalidOperation {
                 message: format!(
@@ -3905,6 +3954,16 @@ impl CayenneTableProvider {
                 source: Box::new(source),
             })?,
         );
+        // Maintain the registry off the CDC write path: the write path enqueues
+        // deltas onto this sender and continues while a single per-table
+        // background applier drains them in strict epoch order. `None` when no
+        // maintained aggregates are configured.
+        let maintained_aggregate_tx = (!maintained_aggregates.is_empty()).then(|| {
+            Self::spawn_maintained_aggregate_applier(
+                Arc::clone(&maintained_aggregates),
+                table_name.to_string(),
+            )
+        });
 
         // Load protected snapshots from catalog.
         // Protected snapshots are those with sequence > max_delete_sequence.
@@ -4060,6 +4119,7 @@ impl CayenneTableProvider {
             post_write_maintenance: Arc::new(PostWriteMaintenance::default()),
             maintained_aggregates,
             maintained_aggregate_epoch: Arc::new(AtomicU64::new(0)),
+            maintained_aggregate_tx,
             background_compactor: Arc::new(std::sync::OnceLock::new()),
             background_mem_tier_checkpointer: Arc::new(std::sync::OnceLock::new()),
         };
@@ -4793,6 +4853,9 @@ impl CayenneTableProvider {
             post_write_maintenance: Arc::clone(&self.post_write_maintenance),
             maintained_aggregates: Arc::clone(&self.maintained_aggregates),
             maintained_aggregate_epoch: Arc::clone(&self.maintained_aggregate_epoch),
+            // Clone the sender (never re-spawn): all provider clones feed the one
+            // ordered background applier spawned by the original constructor.
+            maintained_aggregate_tx: self.maintained_aggregate_tx.clone(),
             background_compactor: Arc::clone(&self.background_compactor),
             // Shared so the single periodic checkpoint task (spawned on the
             // original `Arc`) survives writer clones and its drop signal is shared.
@@ -8240,7 +8303,7 @@ impl CayenneTableProvider {
         }
         let Some((snapshot_id, threshold)) = protected_snapshot else {
             let _view_guard = self.scan_state_lock.write().await;
-            self.mark_maintained_aggregates_stale();
+            self.mark_maintained_aggregates_stale_on_checkpoint();
             self.publish_on_conflict_update(update);
             return;
         };
@@ -8253,7 +8316,7 @@ impl CayenneTableProvider {
             let _view_guard = self.scan_state_lock.write().await;
             if self.try_commit_prepared_protected_snapshot(prepared) {
                 let update = update.take().unwrap_or_else(OnConflictUpdate::none);
-                self.mark_maintained_aggregates_stale();
+                self.mark_maintained_aggregates_stale_on_checkpoint();
                 self.publish_on_conflict_update(update);
                 return;
             }
@@ -11104,6 +11167,44 @@ impl CayenneTableProvider {
         )
     }
 
+    /// Spawn the single ordered background applier for `registry`, returning the
+    /// sender the CDC write path enqueues maintenance onto. The applier drains
+    /// the bounded queue in strict epoch order (channel FIFO) on a dedicated
+    /// thread, so registry maintenance neither blocks replication convergence
+    /// nor contends for the tokio blocking pool with compaction/encode. On a
+    /// maintained-accumulator error it fails the registry safe to stale. The
+    /// thread exits once the provider and all its clones drop the sender.
+    fn spawn_maintained_aggregate_applier(
+        registry: Arc<MaintainedAggregateRegistry>,
+        table_name: String,
+    ) -> tokio::sync::mpsc::Sender<MaintainedAggregateApply> {
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<MaintainedAggregateApply>(
+            MAINTAINED_AGGREGATE_APPLY_QUEUE_DEPTH,
+        );
+        std::thread::spawn(move || {
+            while let Some(msg) = rx.blocking_recv() {
+                let (epoch, result) = match msg {
+                    MaintainedAggregateApply::Insert { epoch, batches } => {
+                        (epoch, registry.apply_insert_batches(epoch, &batches))
+                    }
+                    MaintainedAggregateApply::Delete { epoch, pk_batch } => {
+                        (epoch, registry.apply_pk_deletes(epoch, &pk_batch))
+                    }
+                };
+                if let Err(error) = result {
+                    registry.mark_stale(epoch);
+                    tracing::warn!(
+                        table = %table_name,
+                        epoch,
+                        error = %error,
+                        "Failed to apply maintained aggregate delta off the write path; queries will fall back to base table scans"
+                    );
+                }
+            }
+        });
+        tx
+    }
+
     fn next_maintained_aggregate_epoch(&self) -> u64 {
         self.maintained_aggregate_epoch
             .fetch_add(1, Ordering::AcqRel)
@@ -11124,6 +11225,21 @@ impl CayenneTableProvider {
         );
     }
 
+    /// Stale-marking for a mem-tier checkpoint publish. A checkpoint relocates
+    /// already-counted rows (RAM tier → durable file) and publishes tombstones
+    /// the registry already retracted on the write path, so it is
+    /// aggregate-NEUTRAL for a registry that maintains a per-PK retraction index:
+    /// staling there would discard a still-correct index that nothing rebuilds
+    /// (rebuild runs only at `open`), making incremental retraction a
+    /// steady-state no-op after the first delete-bearing checkpoint. An
+    /// insert-only registry (no index) keeps the conservative stale — it cannot
+    /// absorb deletes incrementally.
+    fn mark_maintained_aggregates_stale_on_checkpoint(&self) {
+        if !self.maintained_aggregates.supports_retraction() {
+            self.mark_maintained_aggregates_stale();
+        }
+    }
+
     fn prepare_maintained_aggregate_insert_batches(
         &self,
         batches: Arc<Vec<RecordBatch>>,
@@ -11140,39 +11256,124 @@ impl CayenneTableProvider {
         &self,
         pending: Option<PendingMaintainedAggregateInsert>,
     ) {
-        let Some(pending) = pending else {
+        if let Some(pending) = pending {
+            self.enqueue_maintained_aggregate(MaintainedAggregateApply::Insert {
+                epoch: pending.epoch,
+                batches: pending.batches,
+            })
+            .await;
+        }
+    }
+
+    /// Enqueue a maintained-aggregate DELETE retraction (prepared under
+    /// `mem_tier_publish_lock` by [`Self::append_to_mem_tier_inner`], so its
+    /// epoch was advanced atomically with the tombstone publish) onto the ordered
+    /// background applier. Enqueuing off the publish lock keeps retraction off the
+    /// CDC critical path; the applier retracts in epoch order and fails safe to
+    /// stale on error.
+    async fn apply_maintained_aggregate_delete_pending(
+        &self,
+        pending: Option<PendingMaintainedAggregateDelete>,
+    ) {
+        if let Some(pending) = pending {
+            self.enqueue_maintained_aggregate(MaintainedAggregateApply::Delete {
+                epoch: pending.epoch,
+                pk_batch: pending.pk_batch,
+            })
+            .await;
+        }
+    }
+
+    /// Enqueue one maintenance message onto the ordered background applier, off
+    /// the CDC critical path (the write path continues; backpressure only under
+    /// sustained overload, since the bounded queue is drained on the applier
+    /// thread). A send failure means the applier has shut down — its thread
+    /// exited or panicked, dropping the receiver — so maintenance can no longer
+    /// advance: mark the registry stale (queries fall back to base-table scans)
+    /// and log it, rather than silently degrading with no breadcrumb.
+    async fn enqueue_maintained_aggregate(&self, msg: MaintainedAggregateApply) {
+        let Some(tx) = &self.maintained_aggregate_tx else {
             return;
         };
-
-        let epoch = pending.epoch;
-        let registry = Arc::clone(&self.maintained_aggregates);
-        let apply_registry = Arc::clone(&registry);
-        let apply_result = task::spawn_blocking(move || {
-            apply_registry.apply_insert_batches(epoch, &pending.batches)
-        })
-        .await;
-
-        match apply_result {
-            Ok(Ok(())) => {}
-            Ok(Err(error)) => {
-                registry.mark_stale(epoch);
-                tracing::warn!(
-                    table = %self.table_metadata.table_name,
-                    epoch,
-                    error = %error,
-                    "Failed to apply maintained aggregate insert delta; queries will fall back to base table scans"
-                );
-            }
-            Err(error) => {
-                registry.mark_stale(epoch);
-                tracing::warn!(
-                    table = %self.table_metadata.table_name,
-                    epoch,
-                    error = %error,
-                    "Maintained aggregate insert delta task failed; queries will fall back to base table scans"
-                );
-            }
+        if let Err(send_err) = tx.send(msg).await {
+            // The applier returns the unsent message; log its epoch + kind so a
+            // fall-back-to-base-scan is diagnosable (which delta, at which epoch).
+            let (epoch, kind) = match send_err.0 {
+                MaintainedAggregateApply::Insert { epoch, .. } => (epoch, "insert"),
+                MaintainedAggregateApply::Delete { epoch, .. } => (epoch, "delete"),
+            };
+            tracing::warn!(
+                table = %self.table_metadata.table_name,
+                epoch,
+                kind,
+                "Maintained-aggregate applier is unavailable; marking stale — queries fall back to base table scans"
+            );
+            self.mark_maintained_aggregates_stale();
         }
+    }
+
+    /// Project a CDC delete batch (source-schema column layout) onto the table's
+    /// primary-key columns, resolved BY NAME, in `pk_column_indices` order and
+    /// cast to the table column types — the layout
+    /// [`MaintainedAggregateRegistry::apply_pk_deletes`] expects, so retraction
+    /// does not depend on the delete batch's source-schema column order. Returns
+    /// `None` when a PK column is missing or null (the row can't be keyed). This
+    /// mirrors the by-name PK resolution in [`Self::cdc_delete_intents_from_batch`].
+    /// Resolve this table's primary-key columns out of `batch` BY NAME (CDC
+    /// batches carry the source-schema column order, not the table's), in
+    /// `pk_column_indices` order, each cast to the table column type. Returns
+    /// `None` when any PK column is absent or contains a null (the rows can't be
+    /// keyed). Shared by the delete-tombstone path
+    /// ([`Self::cdc_delete_intents_from_batch`]) and the maintained-aggregate
+    /// retraction projection ([`Self::project_delete_pk_batch`]) so the three
+    /// coupled invariants — by-name resolution, cast-on-type-mismatch, null-bail —
+    /// stay in lockstep.
+    fn resolve_pk_columns_by_name(
+        &self,
+        batch: &RecordBatch,
+    ) -> std::result::Result<Option<Vec<ArrayRef>>, arrow::error::ArrowError> {
+        if batch.num_rows() == 0 || self.pk_column_indices.is_empty() {
+            return Ok(None);
+        }
+        let batch_schema = batch.schema();
+        let mut columns: Vec<ArrayRef> = Vec::with_capacity(self.pk_column_indices.len());
+        for &table_idx in &self.pk_column_indices {
+            let field = self.table_metadata.schema.field(table_idx);
+            let Ok(batch_idx) = batch_schema.index_of(field.name()) else {
+                return Ok(None);
+            };
+            let column = batch.column(batch_idx);
+            let column = if column.data_type() == field.data_type() {
+                Arc::clone(column)
+            } else {
+                arrow::compute::cast(column, field.data_type())?
+            };
+            if column.null_count() > 0 {
+                return Ok(None);
+            }
+            columns.push(column);
+        }
+        Ok(Some(columns))
+    }
+
+    /// Project a CDC delete batch onto a `RecordBatch` of the table's primary-key
+    /// columns (resolved by name via [`Self::resolve_pk_columns_by_name`],
+    /// table-schema types) — the layout
+    /// [`MaintainedAggregateRegistry::apply_pk_deletes`] expects. `None` when the
+    /// rows can't be keyed.
+    fn project_delete_pk_batch(
+        &self,
+        delete_rows: &RecordBatch,
+    ) -> datafusion_common::Result<Option<RecordBatch>> {
+        let Some(columns) = self.resolve_pk_columns_by_name(delete_rows)? else {
+            return Ok(None);
+        };
+        let pk_schema = Arc::new(
+            self.table_metadata
+                .schema
+                .project(&self.pk_column_indices)?,
+        );
+        Ok(Some(RecordBatch::try_new(pk_schema, columns)?))
     }
 
     async fn rebuild_maintained_aggregates_from_visible_state(
@@ -12355,11 +12556,15 @@ impl CayenneTableProvider {
                     delete_seq,
                 );
             }
-            if removed_rows > 0 || has_file_deletions {
+            if self.maintained_aggregates.supports_retraction()
+                || !(removed_rows > 0 || has_file_deletions)
+            {
+                // The per-PK index retracts superseded rows' old contributions,
+                // so the insert feed maintains UPDATEs incrementally.
+                self.prepare_maintained_aggregate_insert_batches(Arc::new(batches.to_vec()))
+            } else {
                 self.mark_maintained_aggregates_stale();
                 None
-            } else {
-                self.prepare_maintained_aggregate_insert_batches(Arc::new(batches.to_vec()))
             }
         };
 
@@ -13530,28 +13735,9 @@ impl CayenneTableProvider {
         &self,
         batch: &RecordBatch,
     ) -> Result<Option<(OnConflictDeletions, u64, u64)>> {
-        if batch.num_rows() == 0 || self.pk_column_indices.is_empty() {
+        let Some(pk_columns) = self.resolve_pk_columns_by_name(batch)? else {
             return Ok(None);
-        }
-
-        let batch_schema = batch.schema();
-        let mut pk_columns: Vec<ArrayRef> = Vec::with_capacity(self.pk_column_indices.len());
-        for &table_idx in &self.pk_column_indices {
-            let field = self.table_metadata.schema.field(table_idx);
-            let Ok(batch_idx) = batch_schema.index_of(field.name()) else {
-                return Ok(None);
-            };
-            let column = batch.column(batch_idx);
-            let column = if column.data_type() == field.data_type() {
-                Arc::clone(column)
-            } else {
-                arrow::compute::cast(column, field.data_type())?
-            };
-            if column.null_count() > 0 {
-                return Ok(None);
-            }
-            pk_columns.push(column);
-        }
+        };
 
         let mut deletions = OnConflictDeletions::default();
         let (key_count, byte_estimate) = match &self.pk_deletion_strategy {
@@ -13659,8 +13845,11 @@ impl CayenneTableProvider {
         // inline rows from scans. The hidden rows are subtracted by the
         // merge-on-read filter, not by count bookkeeping; the absorbed key
         // count is observable via the telemetry counter below.
+        // Retraction is handled INSIDE the append under `mem_tier_publish_lock`
+        // (the maintained-aggregate epoch is advanced atomically with the
+        // tombstone visibility), so pass the source-schema delete batch through.
         let epoch = match self
-            .append_to_mem_tier(Vec::new(), &deletions, incoming_bytes, 0)
+            .append_to_mem_tier_inner(Vec::new(), &deletions, incoming_bytes, 0, Some(delete_rows))
             .await
         {
             Ok(epoch) => epoch,
@@ -13749,6 +13938,26 @@ impl CayenneTableProvider {
         incoming_bytes: u64,
         superseded: u64,
     ) -> Result<u64> {
+        self.append_to_mem_tier_inner(batches, deletions, incoming_bytes, superseded, None)
+            .await
+    }
+
+    /// As [`Self::append_to_mem_tier`], plus maintained-aggregate DELETE
+    /// retraction. When `maintained_aggregate_delete_rows` is the source-schema
+    /// CDC delete batch, the retraction epoch is advanced and the retraction is
+    /// enqueued UNDER the same `mem_tier_publish_lock` that publishes the
+    /// tombstones — so a scan that observes the delete also observes the advanced
+    /// epoch, and the exact-epoch serve gate falls back to a base-table scan
+    /// (never serving a maintained aggregate that still counts the deleted rows)
+    /// until the background applier catches up.
+    async fn append_to_mem_tier_inner(
+        &self,
+        batches: Vec<RecordBatch>,
+        deletions: &OnConflictDeletions,
+        incoming_bytes: u64,
+        superseded: u64,
+        maintained_aggregate_delete_rows: Option<&RecordBatch>,
+    ) -> Result<u64> {
         let incoming_rows: u64 = batches
             .iter()
             .map(|b| b.num_rows() as u64)
@@ -13767,7 +13976,7 @@ impl CayenneTableProvider {
         // to sit while the lock was held.
         let mut tombstones = self.prepare_segment_tombstones(deletions);
 
-        let (epoch, maintained_aggregate_insert) = {
+        let (epoch, maintained_aggregate_insert, maintained_aggregate_delete) = {
             // Publish the RAM swap under the dedicated `mem_tier_publish_lock`,
             // DECOUPLED from the listing fence. The mem-tier is an `ArcSwap`, so a
             // concurrent scan still captures either the pre- or post-swap tier
@@ -13891,20 +14100,52 @@ impl CayenneTableProvider {
                 fence_work_start,
             );
 
-            // Maintained aggregates: a tombstone/supersession can retroactively
-            // hide rows an incremental aggregate already counted, so fall back to a
-            // full rebuild (mark stale); a pure-insert append updates the
-            // aggregates incrementally from the new batches.
-            let maintained_aggregate_insert = if superseded > 0
-                || !tombstones.is_int64_empty()
-                || !tombstones.is_row_keys_empty()
+            // Maintained aggregates: with a per-PK retraction index, an upsert
+            // that supersedes existing rows is maintained incrementally — the
+            // index retracts each superseded PK's old contribution before
+            // applying the new row, so the same insert feed handles UPDATEs.
+            // Without an index, a tombstone/supersession can retroactively hide
+            // rows an incremental aggregate already counted, so fall back to a
+            // full rebuild (mark stale); a pure-insert append still updates
+            // incrementally from the new batches.
+            let maintained_aggregate_insert = if self.maintained_aggregates.supports_retraction()
+                || !(superseded > 0
+                    || !tombstones.is_int64_empty()
+                    || !tombstones.is_row_keys_empty())
             {
+                self.prepare_maintained_aggregate_insert_batches(Arc::clone(&arc_batches))
+            } else {
                 self.mark_maintained_aggregates_stale();
                 None
-            } else {
-                self.prepare_maintained_aggregate_insert_batches(Arc::clone(&arc_batches))
             };
-            (epoch, maintained_aggregate_insert)
+            // Maintained-aggregate DELETE retraction, UNDER this publish lock so
+            // the epoch advances atomically with the tombstone visibility: a scan
+            // that observes the delete also observes the advanced epoch, and the
+            // exact-epoch serve gate falls back to a base scan until the applier
+            // catches up (never serving an aggregate that still counts the rows).
+            let retraction_rows = maintained_aggregate_delete_rows
+                .filter(|_| self.maintained_aggregates.supports_retraction());
+            let maintained_aggregate_delete = match retraction_rows
+                .map(|delete_rows| self.project_delete_pk_batch(delete_rows))
+            {
+                Some(Ok(Some(pk_batch))) => Some(PendingMaintainedAggregateDelete {
+                    epoch: self.next_maintained_aggregate_epoch(),
+                    pk_batch,
+                }),
+                // A delete batch whose PK cannot be resolved cannot be retracted,
+                // so fail safe to stale (also under this lock). `None` = no delete
+                // rows / no retraction support.
+                Some(Ok(None) | Err(_)) => {
+                    self.mark_maintained_aggregates_stale();
+                    None
+                }
+                None => None,
+            };
+            (
+                epoch,
+                maintained_aggregate_insert,
+                maintained_aggregate_delete,
+            )
         };
 
         // Net the live row count by the superseded rows, exactly like the durable
@@ -13914,6 +14155,8 @@ impl CayenneTableProvider {
         self.inlined_row_count.fetch_add(net, Ordering::Relaxed);
 
         self.apply_maintained_aggregate_insert_batches(maintained_aggregate_insert)
+            .await;
+        self.apply_maintained_aggregate_delete_pending(maintained_aggregate_delete)
             .await;
 
         Ok(epoch)

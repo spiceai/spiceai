@@ -405,6 +405,7 @@ pub(crate) fn generate_dynamodb_spicepod(
             engine: Some(acceleration_engine.to_string()),
             mode: Mode::File,
             refresh_mode: Some(RefreshMode::Changes),
+            params: super::cayenne_acceleration_params(acceleration_engine),
             ..Acceleration::default()
         });
 
