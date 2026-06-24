@@ -35,7 +35,7 @@ use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 
 use cayenne::metadata::{CreateTableOptions, VortexConfig};
-use cayenne::{CayenneTableProvider, MetadataCatalog};
+use cayenne::{CayenneTableProvider, CayenneTableProviderBuilder, MetadataCatalog};
 
 use datafusion::prelude::SessionContext;
 use datafusion_table_providers::util::{
@@ -646,6 +646,224 @@ async fn compaction_handles_concurrent_compaction_triggers(
     // Data must be intact.
     let total = count_rows(&ctx, "compaction_concurrent").await;
     assert_eq!(total, batch_rows * 8);
+
+    Ok(())
+}
+
+// --- Production current-snapshot small-file compaction (#11392) ----------------
+//
+// #11130 removed the general compactor from `run_compaction_trigger`, which
+// early-outs when a table has no protected snapshots. Append-only tables never
+// create protected snapshots, so they stopped being compacted. These tests
+// drive the restored production path (`compact_current_snapshot_small_files`,
+// the method `run_compaction_trigger` now calls regardless of the protected set)
+// directly and assert it consolidates small files on a table with ZERO protected
+// snapshots, and that a concurrent append can never lose rows.
+
+test_with_backends!(production_trigger_compacts_append_only_table);
+async fn production_trigger_compacts_append_only_table(
+    fixture: common::TestFixture,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let schema = pk_schema();
+    // pk = None → append-only: every insert lands as a new Vortex file in the
+    // current snapshot dir and NO protected snapshot is ever created.
+    let (table, ctx, table_id) = build_table(
+        &fixture,
+        "prod_append_only",
+        Arc::clone(&schema),
+        None,
+        aggressive_compaction_config(),
+    )
+    .await;
+
+    let batch_rows: i64 = 1500;
+    let batches = 12_i64;
+    for batch_idx in 0..batches {
+        let start = batch_idx * batch_rows;
+        common::insert_batch(&table, make_batch(&schema, start, batch_rows)).await?;
+    }
+
+    // No protected snapshots exist — this is exactly the case #11130's
+    // early-out starved.
+    assert_eq!(
+        count_protected_snapshots(&fixture, &table_id).await,
+        0,
+        "append-only table must have no protected snapshots"
+    );
+
+    // Drive the PRODUCTION current-snapshot path directly (not the test-only
+    // maybe_compact_small_files loop). Retry a bounded number of times: a
+    // spawned post-write compaction may transiently hold the compaction lock.
+    let mut committed = false;
+    for _ in 0..50 {
+        if table.compact_current_snapshot_small_files().await? {
+            committed = true;
+        }
+        let snapshot_id = fixture
+            .catalog
+            .get_table("prod_append_only")
+            .await?
+            .current_snapshot_id;
+        if count_vortex_files(&fixture.data_path, &table_id, &snapshot_id).await <= 2 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert!(
+        committed,
+        "current-snapshot compaction must fire on an append-only table with no protected snapshots"
+    );
+
+    // A fresh snapshot dir was minted and the file count is bounded.
+    let snapshot_id = fixture
+        .catalog
+        .get_table("prod_append_only")
+        .await?
+        .current_snapshot_id;
+    let file_count = count_vortex_files(&fixture.data_path, &table_id, &snapshot_id).await;
+    assert!(
+        file_count <= 2,
+        "expected the current snapshot to be consolidated, found {file_count} files"
+    );
+
+    // Rows preserved end-to-end.
+    assert_eq!(
+        count_rows(&ctx, "prod_append_only").await,
+        batch_rows * batches
+    );
+
+    Ok(())
+}
+
+test_with_backends!(concurrent_append_during_compaction_loses_no_rows);
+async fn concurrent_append_during_compaction_loses_no_rows(
+    fixture: common::TestFixture,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let schema = pk_schema();
+    let (table, ctx, _table_id) = build_table(
+        &fixture,
+        "concurrent_append_compaction",
+        Arc::clone(&schema),
+        None,
+        aggressive_compaction_config(),
+    )
+    .await;
+
+    let batch_rows: i64 = 1500;
+    // Seed enough small files to make the compaction picker fire.
+    let seeded = 8_i64;
+    for batch_idx in 0..seeded {
+        let start = batch_idx * batch_rows;
+        common::insert_batch(&table, make_batch(&schema, start, batch_rows)).await?;
+    }
+
+    // Race a compaction against a burst of appends. Whether the guard commits or
+    // aborts (because an append landed mid-rewrite), the invariant is the same:
+    // NO appended row is dropped — an abort leaves the old snapshot current and
+    // intact, a commit carries every pre-scan file forward.
+    let extra = 6_i64;
+    let compaction_table = Arc::clone(&table);
+    let compaction = tokio::spawn(async move {
+        // A few passes so at least one overlaps the appends below.
+        for _ in 0..extra {
+            let _ = compaction_table
+                .compact_current_snapshot_small_files()
+                .await;
+            tokio::task::yield_now().await;
+        }
+    });
+
+    for batch_idx in seeded..(seeded + extra) {
+        let start = batch_idx * batch_rows;
+        common::insert_batch(&table, make_batch(&schema, start, batch_rows)).await?;
+    }
+
+    compaction.await.expect("compaction task did not panic");
+
+    // Every appended row must still be visible.
+    assert_eq!(
+        count_rows(&ctx, "concurrent_append_compaction").await,
+        batch_rows * (seeded + extra),
+        "a concurrent append during compaction must never lose rows"
+    );
+
+    Ok(())
+}
+
+test_with_backends!(compaction_survives_provider_reopen);
+async fn compaction_survives_provider_reopen(
+    fixture: common::TestFixture,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let schema = pk_schema();
+    let (table, _ctx, table_id) = build_table(
+        &fixture,
+        "compaction_reopen",
+        Arc::clone(&schema),
+        None,
+        aggressive_compaction_config(),
+    )
+    .await;
+
+    let batch_rows: i64 = 1500;
+    let batches = 10_i64;
+    for batch_idx in 0..batches {
+        let start = batch_idx * batch_rows;
+        common::insert_batch(&table, make_batch(&schema, start, batch_rows)).await?;
+    }
+
+    // Consolidate via the production path.
+    let mut committed = false;
+    for _ in 0..50 {
+        if table.compact_current_snapshot_small_files().await? {
+            committed = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert!(committed, "compaction must commit before the reopen");
+
+    let committed_snapshot_id = fixture
+        .catalog
+        .get_table("compaction_reopen")
+        .await?
+        .current_snapshot_id;
+
+    // Drop the live provider and reopen from the persisted catalog — a fresh
+    // provider with empty in-memory state must read the committed consolidated
+    // snapshot, with every row intact.
+    drop(table);
+    let reopen_ctx = SessionContext::new();
+    let reopened = Arc::new(
+        CayenneTableProviderBuilder::new(fixture.catalog.clone(), reopen_ctx.runtime_env())
+            .open("compaction_reopen")
+            .await?,
+    );
+    reopen_ctx.register_table(
+        "compaction_reopen",
+        Arc::clone(&reopened) as Arc<dyn datafusion::datasource::TableProvider>,
+    )?;
+
+    assert_eq!(
+        fixture
+            .catalog
+            .get_table("compaction_reopen")
+            .await?
+            .current_snapshot_id,
+        committed_snapshot_id,
+        "the reopened table must point at the consolidated snapshot"
+    );
+    assert_eq!(
+        count_rows(&reopen_ctx, "compaction_reopen").await,
+        batch_rows * batches,
+        "all rows must survive the compaction + reopen"
+    );
+    // Sanity: the committed snapshot dir physically exists and is consolidated.
+    let file_count =
+        count_vortex_files(&fixture.data_path, &table_id, &committed_snapshot_id).await;
+    assert!(
+        (1..=2).contains(&file_count),
+        "consolidated snapshot should hold 1-2 files, found {file_count}"
+    );
 
     Ok(())
 }
