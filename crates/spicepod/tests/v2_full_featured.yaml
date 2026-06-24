@@ -17,6 +17,10 @@ runtime:
   ready_state: on_registration
   flight:
     max_message_size: 32MiB
+    batch_size:
+      mode: adaptive
+      max: 131072
+    ipc_compression: lz4_frame
     do_put_rate_limit_enabled: false
   query:
     memory_limit: 1GiB

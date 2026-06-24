@@ -605,6 +605,7 @@ mod tests {
 /// - v1 uses top-level `runtime.memory_limit`/`runtime.temp_directory`,
 ///   v2 uses `runtime.query.memory_limit`/`runtime.query.temp_directory`
 /// - v2 adds `runtime.ready_state`, `runtime.flight.do_put_rate_limit_enabled`,
+///   `runtime.flight.ipc_compression`, `runtime.flight.batch_size`,
 ///   `runtime.scheduler` partition assignment fields
 /// - v2 adds `read_write_create` access mode
 /// - v2 adds `stale_while_revalidate_ttl` and `encoding` to `SQLResultsCacheConfig`
@@ -614,7 +615,7 @@ mod version_tests {
     use crate::component::{
         access::AccessMode,
         caching::{CacheEngine, CacheKeyType, CachingPolicy, Encoding, HashingAlgorithm},
-        runtime::RuntimeReadyState,
+        runtime::{FlightBatchSize, FlightIpcCompression, RuntimeReadyState},
     };
 
     // ========================================================================
@@ -998,6 +999,11 @@ mod version_tests {
             .as_ref()
             .expect("flight should be present");
         assert_eq!(flight.max_message_size, Some("32MiB".to_string()));
+        assert_eq!(
+            flight.batch_size,
+            FlightBatchSize::Adaptive { max: 131_072 }
+        );
+        assert_eq!(flight.ipc_compression, FlightIpcCompression::Lz4Frame);
         assert!(!flight.do_put_rate_limit_enabled);
 
         // Caching with v2 fields
@@ -1125,7 +1131,43 @@ mod version_tests {
             max_message_size: 4MiB
         ";
         let flight: component::runtime::Flight = yaml::from_str(yaml).expect("Should parse Flight");
+        assert_eq!(
+            flight.batch_size,
+            FlightBatchSize::Adaptive { max: 131_072 }
+        );
+        assert_eq!(flight.ipc_compression, FlightIpcCompression::None);
         assert!(flight.do_put_rate_limit_enabled);
+    }
+
+    /// `batch_size` parses adaptive Flight result batch sizing.
+    #[test]
+    fn test_flight_batch_size_adaptive() {
+        let yaml = r"
+            batch_size:
+              mode: adaptive
+              max: 131072
+        ";
+        let flight: component::runtime::Flight = yaml::from_str(yaml).expect("Should parse Flight");
+        assert_eq!(
+            flight.batch_size,
+            FlightBatchSize::Adaptive { max: 131_072 }
+        );
+    }
+
+    /// `ipc_compression` parses supported Arrow IPC compression codecs.
+    #[test]
+    fn test_flight_ipc_compression() {
+        let yaml = r"
+            ipc_compression: lz4_frame
+        ";
+        let flight: component::runtime::Flight = yaml::from_str(yaml).expect("Should parse Flight");
+        assert_eq!(flight.ipc_compression, FlightIpcCompression::Lz4Frame);
+
+        let yaml = r"
+            ipc_compression: zstd
+        ";
+        let flight: component::runtime::Flight = yaml::from_str(yaml).expect("Should parse Flight");
+        assert_eq!(flight.ipc_compression, FlightIpcCompression::Zstd);
     }
 
     /// `do_put_rate_limit_enabled` can be explicitly disabled.

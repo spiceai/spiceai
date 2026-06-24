@@ -19,7 +19,10 @@ use crate::auth::EndpointAuth;
 use crate::cluster::ExecutorRegistry;
 use crate::cluster::{ClusterServiceImpl, SchedulerPeers};
 use crate::flight::middleware::{RequestContextLayer, WriteRateLimitLayer};
-use crate::flight::{Error, Service as SpiceFlightService, is_address_in_use_error, session_auth};
+use crate::flight::{
+    Error, Service as SpiceFlightService, configure_flight_server_transport,
+    is_address_in_use_error, session_auth,
+};
 use crate::tls::flight_incoming::tls_incoming;
 use crate::{Runtime, metrics as runtime_metrics};
 use ballista_core::serde::protobuf::scheduler_grpc_server::SchedulerGrpcServer;
@@ -200,7 +203,7 @@ pub async fn start_executor_flight_server(
         });
     }
 
-    let server = Server::builder();
+    let server = configure_flight_server_transport(Server::builder());
 
     if cluster_server_config.is_some() {
         tracing::info!("Cluster mTLS enabled for executor flight server");
