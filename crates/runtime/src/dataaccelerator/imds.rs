@@ -27,8 +27,8 @@ limitations under the License.
 //!   once CPU credits deplete; the controller withholds CPU-stealing moves sooner
 //!   on a burstable instance (the CPU sampler alone is credit-blind).
 //!
-//! The transport is the AWS SDK's IMDSv2 client ([`Client`],
-//! already a runtime dependency), so token handling, IMDSv1 fallback, the
+//! The transport is the AWS SDK's `IMDSv2` client ([`Client`],
+//! already a runtime dependency), so token handling, `IMDSv1` fallback, the
 //! `AWS_EC2_METADATA_DISABLED` env var, and IPv6 endpoints come for free. It is
 //! non-blocking and fail-open: a tight connect/read timeout plus a single attempt
 //! means that off-AWS (no route to the link-local address) detection fails in
@@ -62,7 +62,7 @@ pub(crate) struct InstanceProfile {
 
 static INSTANCE_PROFILE: OnceCell<Option<InstanceProfile>> = OnceCell::const_new();
 
-/// Detect the EC2 instance profile via IMDSv2, memoized for the process. Returns
+/// Detect the EC2 instance profile via `IMDSv2`, memoized for the process. Returns
 /// `None` when disabled, off-AWS, or the metadata service is unreachable within
 /// [`IMDS_TIMEOUT`].
 pub(crate) async fn detect_instance_profile() -> Option<InstanceProfile> {
@@ -85,7 +85,7 @@ pub(crate) async fn detect_instance_profile() -> Option<InstanceProfile> {
         .clone()
 }
 
-/// Fetch the instance type string via the SDK's IMDSv2 client. Any error (no
+/// Fetch the instance type string via the SDK's `IMDSv2` client. Any error (no
 /// route, non-2xx, timeout) yields `None`.
 async fn fetch_instance_type() -> Option<String> {
     let client = Client::builder()

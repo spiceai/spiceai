@@ -384,11 +384,12 @@ fn probe_storage_perf_blocking(path: &std::path::Path) -> StoragePerf {
     use std::io::Write;
     use std::sync::atomic::{AtomicU64, Ordering};
 
+    // Process-unique sequence for the temp-file name (declared before statements).
+    static PROBE_SEQ: AtomicU64 = AtomicU64::new(0);
+
     let Some(dir) = probe_dir(path) else {
         return StoragePerf::default();
     };
-
-    static PROBE_SEQ: AtomicU64 = AtomicU64::new(0);
     let seq = PROBE_SEQ.fetch_add(1, Ordering::Relaxed);
     let probe_path = dir.join(format!(
         ".spice_storage_probe_{}_{seq}.tmp",
@@ -396,10 +397,12 @@ fn probe_storage_perf_blocking(path: &std::path::Path) -> StoragePerf {
     ));
 
     let perf = (|| -> Option<StoragePerf> {
+        // `create_new` (O_EXCL): never truncate/clobber a pre-existing or
+        // attacker-planted file at the (pid+seq) probe path — if it somehow exists,
+        // the probe just fails open.
         let mut file = std::fs::OpenOptions::new()
-            .create(true)
+            .create_new(true)
             .write(true)
-            .truncate(true)
             .open(&probe_path)
             .ok()?;
         // A non-zero pattern so a filesystem can't satisfy the write as a sparse

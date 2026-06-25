@@ -329,7 +329,8 @@ fn to_cayenne_storage_class(
     }
 }
 
-/// Warn (once per volume) when the filesystem backing `path` is low on free space.
+/// Warn (once per canonicalized path) when the filesystem backing `path` is low on
+/// free space.
 /// Under memory pressure the in-memory CDC tier spills to this volume; if it fills,
 /// ingestion fails — so surface it at startup rather than discovering it on a crash.
 async fn warn_if_low_disk(label: &str, path: &str) {
@@ -349,9 +350,10 @@ fn warn_if_low_disk_blocking(label: &str, path: &str) {
     static CHECKED: LazyLock<Mutex<std::collections::HashSet<std::path::PathBuf>>> =
         LazyLock::new(|| Mutex::new(std::collections::HashSet::new()));
 
-    // Check each distinct volume once per process, BEFORE probing free space
-    // (`disk_space_bytes` re-enumerates every mount). Key on the canonicalized path
-    // so equivalent paths (trailing slash, symlinks) collapse to one check.
+    // Check each distinct canonicalized path once per process, BEFORE probing free
+    // space (`disk_space_bytes` re-enumerates every mount). Canonicalizing collapses
+    // equivalent paths (trailing slash, symlinks); distinct dirs on the same mount
+    // each warn once — keyed by path, not mount point.
     let key = std::path::Path::new(path)
         .canonicalize()
         .unwrap_or_else(|_| std::path::PathBuf::from(path));
@@ -781,7 +783,7 @@ impl CayenneAccelerator {
             cayenne::set_cpu_burstable(hw.burstable);
 
             // Low-disk startup warning: a full data/spill volume turns a
-            // memory-pressure spill into a crash. Best-effort, once per volume.
+            // memory-pressure spill into a crash. Best-effort, once per path.
             if let Some(dir) = data_dir.as_deref() {
                 warn_if_low_disk("data", fs_probe_path(dir)).await;
             }

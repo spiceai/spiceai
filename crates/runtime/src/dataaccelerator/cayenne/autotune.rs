@@ -239,7 +239,7 @@ impl HardwareProfile {
     /// Only constrains confirmed network/EBS-class media: a single EBS volume is a
     /// shared, bandwidth-bounded pipe, so many parallel uploads to it don't add
     /// throughput — they just fan out small files (the regression that made a
-    /// lag-violated EBS table keep ADDING write shards). Local NVMe / instance
+    /// lag-violated EBS table keep ADDING write shards). Local `NVMe` / instance
     /// store parallelize well and are left uncapped. The ceiling is the
     /// authoritative IMDS baseline when known, else the calibration probe's
     /// measured single-stream throughput; divided by a per-stream estimate and

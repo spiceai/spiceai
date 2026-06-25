@@ -181,7 +181,7 @@ const IO_CLIFF_FLOOR_MS: f64 = 10.0;
 /// throughput at/below [`TIER_SCALE_SLOW_MBPS`] gets the full slow-tier scale
 /// ([`SLOW_TIER_BOUND_SCALE`]); at/above [`TIER_SCALE_FAST_MBPS`] gets none (1.0);
 /// linearly interpolated between. ~125 MiB/s ≈ a gp3 baseline volume; ~1 GiB/s ≈
-/// fast local NVMe or a high-provisioned io2 — which should not get the same
+/// fast local `NVMe` or a high-provisioned io2 — which should not get the same
 /// commit-amortization pressure as slow gp3 even though both classify as `Ebs`.
 const TIER_SCALE_SLOW_MBPS: f64 = 125.0;
 const TIER_SCALE_FAST_MBPS: f64 = 1024.0;
@@ -2679,7 +2679,7 @@ fn is_cliff(fast_ms: Option<f64>, slow_ms: Option<f64>) -> bool {
 /// Continuous slow-tier bias factor in `[SLOW_TIER_BOUND_SCALE, 1.0]`. When the
 /// calibration probe measured the volume's write throughput, the factor scales
 /// linearly with it — `≤ TIER_SCALE_SLOW_MBPS` (a gp3-baseline volume) gets the
-/// full slow-tier bias, `≥ TIER_SCALE_FAST_MBPS` (fast NVMe / high io2) gets none,
+/// full slow-tier bias, `≥ TIER_SCALE_FAST_MBPS` (fast `NVMe` / high io2) gets none,
 /// interpolated between — so a fast io2 volume is no longer penalized like slow
 /// gp3 just because both classify as `Ebs`. Without a measurement (remote path,
 /// probe failure, or a never-spilling memory-tier table), it falls back to the
