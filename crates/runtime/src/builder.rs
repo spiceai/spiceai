@@ -486,6 +486,11 @@ impl RuntimeBuilder {
         // executors, where secrets resolve via scheduler RPC and the
         // scheduler has already validated them. Never changes component
         // loading; never logs secret values.
+        //
+        // Wrapped in `in_tracing_context_async` for the same reason as
+        // `load_secrets`: this runs before `spiced::init_tracing` installs the
+        // global subscriber, so without a temporary subscriber the summary
+        // would be dropped on the floor.
         let is_cluster_executor = matches!(
             self.resolved_cluster_config
                 .as_ref()
@@ -493,7 +498,8 @@ impl RuntimeBuilder {
             Some(ClusterRole::Executor)
         );
         if !is_cluster_executor && let Some(app) = self.app.as_ref() {
-            crate::secrets_preflight::run(app, &*secrets.read().await).await;
+            let secrets_guard = secrets.read().await;
+            in_tracing_context_async(crate::secrets_preflight::run(app, &secrets_guard)).await;
         }
 
         // Create the shared app reference early so DataFusion, Runtime, and PartitionService share it.
