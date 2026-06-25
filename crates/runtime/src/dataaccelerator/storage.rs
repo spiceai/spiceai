@@ -357,6 +357,20 @@ static PROBE_CACHE: std::sync::LazyLock<
     std::sync::Mutex<std::collections::HashMap<std::path::PathBuf, StoragePerf>>,
 > = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
 
+/// The directory the calibration probe writes to for `path`: `path` itself when it
+/// is a directory, else its parent directory; `None` when neither is a directory.
+/// Shared by [`probe_storage_perf_async`] (which canonicalizes it for the
+/// per-volume cache key) and [`probe_storage_perf_blocking`], so the memo key
+/// matches the directory actually probed — two files on one volume dedupe to a
+/// single probe.
+fn probe_dir(path: &Path) -> Option<std::path::PathBuf> {
+    if path.is_dir() {
+        Some(path.to_path_buf())
+    } else {
+        path.parent().filter(|p| p.is_dir()).map(Path::to_path_buf)
+    }
+}
+
 /// Blocking calibration: write `PROBE_FILE_BYTES` to a temp file under `dir`,
 /// fsync, and measure sequential write throughput. Best-effort: any I/O error
 /// short-circuits to `StoragePerf::default()` and the temp file is always removed.
@@ -365,13 +379,8 @@ fn probe_storage_perf_blocking(path: &std::path::Path) -> StoragePerf {
     use std::io::Write;
     use std::sync::atomic::{AtomicU64, Ordering};
 
-    let dir = if path.is_dir() {
-        path.to_path_buf()
-    } else {
-        match path.parent().filter(|p| p.is_dir()) {
-            Some(parent) => parent.to_path_buf(),
-            None => return StoragePerf::default(),
-        }
+    let Some(dir) = probe_dir(path) else {
+        return StoragePerf::default();
     };
 
     static PROBE_SEQ: AtomicU64 = AtomicU64::new(0);
@@ -436,7 +445,12 @@ pub(crate) async fn probe_storage_perf_async(path: &str) -> StoragePerf {
     if path.is_empty() {
         return StoragePerf::default();
     }
-    let dir = std::path::PathBuf::from(path);
+    // Resolve to the directory actually probed (the parent when handed a file path)
+    // and canonicalize THAT, so the per-volume memo key matches the probed
+    // directory — different files on the same volume dedupe to a single probe.
+    let Some(dir) = probe_dir(Path::new(path)) else {
+        return StoragePerf::default();
+    };
     let key = dir.canonicalize().unwrap_or(dir);
     if let Some(cached) = PROBE_CACHE
         .lock()

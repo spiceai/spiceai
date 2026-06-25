@@ -27,7 +27,7 @@ limitations under the License.
 //!   once CPU credits deplete; the controller withholds CPU-stealing moves sooner
 //!   on a burstable instance (the CPU sampler alone is credit-blind).
 //!
-//! The transport is the AWS SDK's IMDSv2 client ([`aws_config::imds::Client`],
+//! The transport is the AWS SDK's IMDSv2 client ([`Client`],
 //! already a runtime dependency), so token handling, IMDSv1 fallback, the
 //! `AWS_EC2_METADATA_DISABLED` env var, and IPv6 endpoints come for free. It is
 //! non-blocking and fail-open: a tight connect/read timeout plus a single attempt
