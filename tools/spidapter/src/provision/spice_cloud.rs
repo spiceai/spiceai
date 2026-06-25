@@ -99,6 +99,8 @@ pub(crate) async fn provision_scp_app(
         commands::ensure_spice_cloud_app(&cloud, &app_name, &app_create_config, deployment_mode)
             .await?;
 
+    let app_guard = commands::ScpAppGuard::new(cloud.clone(), app_id);
+
     // Fetch API key from the dedicated api-keys endpoint
     let api_keys = cloud
         .get_api_keys(app_id)
@@ -201,6 +203,7 @@ pub(crate) async fn provision_scp_app(
         ec2_guards: vec![],
         dynamodb_guard: None,
         mongodb_guard: None,
+        app_guard: Some(app_guard),
     })))
 }
 
