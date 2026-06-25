@@ -305,7 +305,7 @@ pub struct MaintainedAggregate {
     /// filtered analytical query (the common dashboard shape) be answered from
     /// the incrementally-maintained view instead of a full re-scan.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub filter: Option<String>,
+    pub filter_sql: Option<String>,
 }
 
 /// One aggregate expression inside a maintained aggregate view.
@@ -781,7 +781,7 @@ mod tests {
         let yaml = r"
                 maintained_aggregates:
                   - group_by: [ol_number]
-                    filter: ol_delivery_d > '2007-01-02'
+                    filter_sql: ol_delivery_d > '2007-01-02'
                     aggregates:
                       - function: sum
                         column: ol_amount
@@ -790,12 +790,12 @@ mod tests {
             yaml::from_str(yaml).expect("Failed to parse Acceleration");
         let maintained = &acceleration.maintained_aggregates.as_slice()[0];
         assert_eq!(
-            maintained.filter.as_deref(),
+            maintained.filter_sql.as_deref(),
             Some("ol_delivery_d > '2007-01-02'"),
             "the filter predicate must round-trip from YAML"
         );
 
-        // Absent filter must default to None (backward compatible).
+        // Absent filter_sql must default to None (backward compatible).
         let no_filter: Acceleration = yaml::from_str(
             "
                 maintained_aggregates:
@@ -805,7 +805,10 @@ mod tests {
             ",
         )
         .expect("Failed to parse Acceleration");
-        assert_eq!(no_filter.maintained_aggregates.as_slice()[0].filter, None);
+        assert_eq!(
+            no_filter.maintained_aggregates.as_slice()[0].filter_sql,
+            None
+        );
     }
 
     #[test]

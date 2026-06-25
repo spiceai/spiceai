@@ -385,3 +385,28 @@ fn filtered_view_does_not_serve_unfiltered_query_and_vice_versa() {
         "unfiltered view must sum every row (both pk0 and pk1)"
     );
 }
+
+#[test]
+fn non_boolean_filter_is_rejected_at_construction() {
+    let schema = table_schema();
+    // `delivery` alone is an Int64 column, not a Boolean `WHERE` predicate — the
+    // registry must reject it at construction rather than failing later during
+    // maintenance with an internal error.
+    let non_boolean = col("delivery", &schema).expect("col delivery");
+    let spec = MaintainedAggregateSpec {
+        filter: Some(non_boolean),
+        ..filtered_spec()
+    };
+
+    let error = MaintainedAggregateRegistry::try_new_with_pk(
+        std::slice::from_ref(&spec),
+        &schema,
+        &[0],
+        usize::MAX,
+    )
+    .expect_err("a non-Boolean filter must be rejected at construction");
+    assert!(
+        error.to_string().contains("Boolean"),
+        "error must say the filter must be a Boolean predicate: {error}"
+    );
+}

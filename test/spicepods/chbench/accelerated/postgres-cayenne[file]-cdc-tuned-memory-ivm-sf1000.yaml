@@ -185,7 +185,7 @@ datasets:
         # q1: SUM/AVG of qty & amount + COUNT, grouped by ol_number, over
         # delivered order lines.
         - group_by: [ol_number]
-          filter: "ol_delivery_d > '2007-01-02 00:00:00.000000'"
+          filter_sql: "ol_delivery_d > '2007-01-02 00:00:00.000000'"
           aggregates:
             - function: sum
               column: ol_quantity
@@ -198,7 +198,7 @@ datasets:
             - function: count
         # q6: global revenue SUM over a delivery-date window + quantity range.
         - group_by: []
-          filter: "ol_delivery_d >= '1997-01-01 00:00:00' AND ol_delivery_d < '2030-01-01 00:00:00' AND ol_quantity BETWEEN 1 AND 100000"
+          filter_sql: "ol_delivery_d >= '1997-01-01 00:00:00' AND ol_delivery_d < '2030-01-01 00:00:00' AND ol_quantity BETWEEN 1 AND 100000"
           aggregates:
             - function: sum
               column: ol_amount

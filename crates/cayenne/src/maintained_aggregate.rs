@@ -619,6 +619,19 @@ impl MaintainedAggregateView {
         schema: &SchemaRef,
         pk_columns: Vec<usize>,
     ) -> DataFusionResult<Self> {
+        // A filter is a `WHERE` condition, so it must evaluate to Boolean.
+        // Validate at construction so a non-Boolean predicate fails fast here with
+        // a clear error, rather than later in `evaluate_filter_mask` with an
+        // internal error. This guards every caller — config, tests, benches, and
+        // any future programmatic construction.
+        if let Some(filter) = &spec.filter {
+            let data_type = filter.data_type(schema)?;
+            if data_type != DataType::Boolean {
+                return Err(DataFusionError::Plan(format!(
+                    "maintained aggregate filter must be a Boolean predicate, but it evaluates to {data_type}"
+                )));
+            }
+        }
         Ok(Self {
             spec: ResolvedAggregateSpec::try_new(spec, schema)?,
             filter: spec.filter.clone(),

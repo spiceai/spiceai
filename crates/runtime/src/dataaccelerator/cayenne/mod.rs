@@ -151,7 +151,7 @@ fn maintained_aggregate_specs_for_cayenne(
             // predicate so the view maintains only the matching rows and the
             // optimizer can serve a query carrying the identical predicate.
             let filter = aggregate
-                .filter
+                .filter_sql
                 .as_deref()
                 .map(|sql| parse_maintained_aggregate_filter(sql, schema))
                 .transpose()?;
@@ -220,7 +220,7 @@ fn parse_maintained_aggregate_filter(
                 "Cayenne maintained_aggregates filter '{sql}' is not a valid SQL predicate over the table columns: {source}"
             )),
         })?;
-    datafusion::physical_expr::create_physical_expr(
+    let physical = datafusion::physical_expr::create_physical_expr(
         &logical,
         &df_schema,
         &datafusion_expr::execution_props::ExecutionProps::new(),
@@ -229,7 +229,25 @@ fn parse_maintained_aggregate_filter(
         detail: Arc::from(format!(
             "Cayenne maintained_aggregates filter '{sql}' could not be planned: {source}"
         )),
-    })
+    })?;
+    // A filter is a `WHERE` condition, so it must evaluate to Boolean. Reject a
+    // non-Boolean predicate (e.g. `filter: 1`) at config time with a clear error,
+    // rather than letting it fail later during maintenance.
+    let data_type = physical
+        .data_type(schema)
+        .map_err(|source| Error::InvalidConfiguration {
+            detail: Arc::from(format!(
+                "Cayenne maintained_aggregates filter '{sql}' could not be type-checked: {source}"
+            )),
+        })?;
+    if data_type != DataType::Boolean {
+        return Err(Error::InvalidConfiguration {
+            detail: Arc::from(format!(
+                "Cayenne maintained_aggregates filter '{sql}' must be a Boolean predicate (a WHERE condition), but it evaluates to {data_type}"
+            )),
+        });
+    }
+    Ok(physical)
 }
 
 /// Transform schema according to `unsupported_type_action` policy.
@@ -3040,7 +3058,7 @@ mod tests {
                     function: spicepod_acceleration::MaintainedAggregateFunction::Count,
                     column: None,
                 }],
-                filter: None,
+                filter_sql: None,
             }]
             .into(),
             ..Default::default()
@@ -3117,7 +3135,7 @@ mod tests {
             .maintained_aggregates
             .as_slice()
             .to_vec();
-        views[0].filter = Some(filter.to_string());
+        views[0].filter_sql = Some(filter.to_string());
         Acceleration {
             maintained_aggregates: views.into(),
             ..Default::default()
@@ -3157,6 +3175,26 @@ mod tests {
         assert!(
             detail.contains("filter"),
             "the error must identify the maintained-aggregate filter: {detail}"
+        );
+    }
+
+    #[test]
+    fn maintained_aggregate_specs_reject_non_boolean_filter() {
+        // `amount` alone is an Int64 column, not a `WHERE` predicate.
+        let acceleration = maintained_aggregate_acceleration_with_filter("amount");
+
+        let error = maintained_aggregate_specs_for_cayenne(
+            Some(&acceleration),
+            &maintained_aggregate_test_schema(),
+        )
+        .expect_err("a non-Boolean filter must be rejected at config time");
+
+        let Error::InvalidConfiguration { detail } = error else {
+            panic!("expected InvalidConfiguration, got {error:?}");
+        };
+        assert!(
+            detail.contains("Boolean"),
+            "the error must say the filter must be a Boolean predicate: {detail}"
         );
     }
 
