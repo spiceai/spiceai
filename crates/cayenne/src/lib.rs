@@ -64,6 +64,7 @@ pub mod ddl;
 pub mod hll;
 #[cfg(feature = "partition-table-provider")]
 pub use ddl::CayenneDdlHandler;
+pub(crate) mod bounded_fifo;
 pub mod logical_optimizer;
 pub mod maintained_aggregate;
 pub mod metadata;
@@ -72,9 +73,9 @@ pub mod optimizer_rules;
 #[cfg(feature = "partition-table-provider")]
 pub(crate) mod partition_creator;
 pub mod provider;
+pub(crate) mod resource_starvation;
 pub(crate) mod schema;
 pub mod stats;
-
 pub use catalog::MetadataCatalog;
 pub use catalog::{CatalogError, CatalogResult};
 pub use catalog_provider::{
@@ -91,8 +92,9 @@ pub use provider::{
     CayenneCdcWrite, CayenneContext, CayenneStagedAppend, CayenneTableProvider,
     CayenneTableProviderBuilder, PARTITIONED_WAL_DIR, PartitionedWal, PartitionedWalEntry,
     PreparedOverwrite, PreparedStagedAppend, QueryObservations, SlotAdvancer,
-    TimeRetentionFilterBuilder, deregister_query_observations, record_query_latency,
-    register_query_observations, set_compaction_runtime_env, set_compaction_runtime_handle,
-    set_global_encode_concurrency, set_global_mem_tier_bytes, set_global_memory_budget,
+    TimeRetentionFilterBuilder, deregister_query_observations, global_mem_tier_total,
+    record_query_latency, register_query_observations, set_compaction_runtime_env,
+    set_compaction_runtime_handle, set_global_encode_concurrency, set_global_mem_tier_bytes,
+    set_global_memory_budget, update_global_mem_tier_total,
 };
 pub use schema::transform_schema_for_vortex;

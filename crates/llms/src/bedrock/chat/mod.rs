@@ -590,6 +590,7 @@ impl BedrockConverse {
                 Ok::<_, OpenAIError>(ChatChoice {
                     index: 0,
                     message: ChatCompletionResponseMessage {
+                        reasoning_content: None,
                         content: Some(content.into_iter().flatten().join("\n")),
                         refusal: Some(refusals.into_iter().flatten().join("\n")),
                         tool_calls: if tool_calls_enum.is_empty() {

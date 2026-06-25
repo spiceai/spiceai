@@ -138,6 +138,21 @@ impl Debezium {
                 .expose()
                 .ok()
                 .map(ToString::to_string),
+            ssl_certificate_location: params
+                .get("kafka_ssl_certificate_location")
+                .expose()
+                .ok()
+                .map(ToString::to_string),
+            ssl_key_location: params
+                .get("kafka_ssl_key_location")
+                .expose()
+                .ok()
+                .map(ToString::to_string),
+            ssl_key_password: params
+                .get("kafka_ssl_key_password")
+                .expose()
+                .ok()
+                .map(ToString::to_string),
             enable_ssl_certificate_verification: params
                 .get("kafka_enable_ssl_certificate_verification")
                 .expose()
@@ -240,6 +255,15 @@ const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::runtime("kafka_ssl_ca_location")
         .secret()
         .description("Path to the SSL/TLS CA certificate file for server verification."),
+    ParameterSpec::runtime("kafka_ssl_certificate_location")
+        .secret()
+        .description("Path to the client SSL/TLS certificate file for mTLS authentication."),
+    ParameterSpec::runtime("kafka_ssl_key_location")
+        .secret()
+        .description("Path to the client SSL/TLS private key file for mTLS authentication."),
+    ParameterSpec::runtime("kafka_ssl_key_password")
+        .secret()
+        .description("Password for the client SSL/TLS private key, if encrypted."),
     ParameterSpec::runtime("kafka_enable_ssl_certificate_verification")
         .default("true")
         .description("Enable SSL/TLS certificate verification. Default: 'true'."),

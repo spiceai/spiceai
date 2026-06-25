@@ -288,8 +288,9 @@ pub async fn new_tls_flight_channel_with_options(
 ) -> Result<Channel> {
     if let Some(tls_info) = extract_tls_endpoint_info(endpoint_str) {
         // Use the normalized URL (https://) for tonic compatibility
-        let mut endpoint =
-            Endpoint::from_str(&tls_info.normalized_url).context(UnableToConnectToEndpointSnafu)?;
+        let mut endpoint = crate::configure_endpoint_for_high_throughput(
+            Endpoint::from_str(&tls_info.normalized_url).context(UnableToConnectToEndpointSnafu)?,
+        );
 
         let cert = if let Some(ca_path) = opts.ca_certificate_path.as_deref() {
             load_ca_certificate_from_file(ca_path).await?
@@ -316,11 +317,12 @@ pub async fn new_tls_flight_channel_with_options(
             .context(UnableToConnectToEndpointSnafu)
     } else {
         // Non-TLS endpoint, connect without TLS config
-        Endpoint::from_str(endpoint_str)
-            .context(UnableToConnectToEndpointSnafu)?
-            .connect()
-            .await
-            .context(UnableToConnectToEndpointSnafu)
+        crate::configure_endpoint_for_high_throughput(
+            Endpoint::from_str(endpoint_str).context(UnableToConnectToEndpointSnafu)?,
+        )
+        .connect()
+        .await
+        .context(UnableToConnectToEndpointSnafu)
     }
 }
 

@@ -1843,6 +1843,18 @@ impl RefreshTask {
         // sub-batches (`cdc_durability: memory`). The slot deferral keys on the
         // max: draining committers up to the highest epoch covers every earlier
         // one (epochs are monotone). `None` if no sub-batch took the RAM path.
+        //
+        // SINGLE EPOCH AXIS (sharded mem tier, cayenne §3.4 Fix 1): the epoch
+        // cayenne returns is ONE monotone per-apply quantity regardless of the
+        // mem-tier shard count — at N==1 it is the single `MemTier::epoch`, and at
+        // N>1 it is a shared per-apply slot-ack epoch stamped identically across all
+        // shards (NOT a per-shard max, which would be incommensurable across
+        // bursts). A given table's shard count is fixed for its lifetime, so this
+        // axis is consistent within one table's FIFO commit queue. The cayenne
+        // checkpoint reports the MAX captured epoch on the SAME axis (safe because
+        // the capture is all-shards-atomic over each shard's full prefix; a MIN
+        // would under-ack and stall the slot), so this `max`-then-`on_checkpoint_durable`
+        // (`<=` FIFO drain) is correct unchanged for both N==1 and N>1.
         let mut max_in_memory_epoch: Option<u64> = None;
         for (op_type, row_indices) in sub_batches {
             if let Some(finalize) = pending_finalize.take()
