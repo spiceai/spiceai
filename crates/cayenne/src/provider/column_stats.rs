@@ -245,6 +245,13 @@ impl ColumnStatsAccumulator {
             null_count,
             min_value: batch_min.map_or(Precision::Absent, Precision::Exact),
             max_value: batch_max.map_or(Precision::Absent, Precision::Exact),
+            // The metadata-only `SUM`/`AVG` fold sources its column sum from the
+            // per-file Vortex footer (`Stat::Sum`, surfaced by
+            // `VortexFormat::infer_stats` and persisted into the per-file
+            // `snapshot_file_statistics` blob), NOT from this table-level
+            // accumulator. Computing a sum here would only add a per-write pass
+            // for the table-level `TableStatistics` (used for join sizing), which
+            // does not consume `sum_value` — so we leave it absent.
             sum_value: Precision::Absent,
             distinct_count: Precision::Absent,
             byte_size: Precision::Absent,
