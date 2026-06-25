@@ -115,8 +115,10 @@ pub(crate) async fn run(app: &App, secrets: &Secrets) {
     tracing::warn!("{report}");
 }
 
-/// Human-readable explanation of a non-`Found` status. Carries only store/key
-/// names and store error text — never secret values.
+/// Human-readable explanation of a [`RefStatus`]. Carries only store/key
+/// names and store error text — never secret values. Callers only pass the
+/// non-`Found` statuses (the unresolved references); the `Found` arm is
+/// handled for exhaustiveness.
 fn describe(status: &RefStatus) -> String {
     match status {
         RefStatus::Found { .. } => "resolved".to_string(),
