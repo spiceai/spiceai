@@ -170,7 +170,14 @@ fn spawn_job_recovery_loop(
     cancel: CancellationToken,
 ) {
     tokio::spawn(async move {
-        let mut tick = tokio::time::interval(JOB_RECOVERY_INTERVAL);
+        // `interval()` fires immediately on the first tick; start one interval out
+        // so the initial peer discovery has populated `peers` before the first
+        // sweep. Otherwise live schedulers look orphaned and their in-flight jobs
+        // would be wrongly recovered at startup.
+        let mut tick = tokio::time::interval_at(
+            tokio::time::Instant::now() + JOB_RECOVERY_INTERVAL,
+            JOB_RECOVERY_INTERVAL,
+        );
         loop {
             tokio::select! {
                 () = cancel.cancelled() => break,
