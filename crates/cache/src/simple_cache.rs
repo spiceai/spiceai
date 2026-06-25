@@ -169,7 +169,9 @@ impl<
         };
         let table_name = Arc::clone(table_name);
         self.cache
-            .invalidate_entries_if(move |_key, value| value.as_table_refs().contains(&table_ref))
+            .invalidate_entries_if(move |_key, value| {
+                crate::resolved_table_match(value.as_table_refs().as_ref(), &table_ref)
+            })
             .context(FailedToInvalidateCacheSnafu { table_name })?;
 
         Ok(())

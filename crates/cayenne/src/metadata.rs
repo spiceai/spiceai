@@ -960,12 +960,8 @@ pub struct VortexConfig {
     /// offset overflow in hash-join build-side `concat_batches` (e.g. `CH-benCH`
     /// q21 at SF1000, where `su_name` fans out across a ~100M-row join).
     ///
-    /// Runtime-configurable: the accelerator factory sets it (default on; opt out
-    /// with the `cayenne_force_view_types` acceleration param). It is `#[serde(skip)]`
-    /// because it is a read-only scan behavior re-derived on every open, NOT
-    /// serialized into Cayenne metadata — so toggling it never affects stored data
-    /// and it is intentionally excluded from `configuration_matches`. Off by default
-    /// for direct construction (unit tests keep `Utf8`). See `viewify_read_schema`.
+    /// Runtime-configurable: the accelerator factory sets it (default off; opt in
+    /// with `cayenne_force_view_types: true`).
     #[serde(skip)]
     pub force_view_read_schema: bool,
 }
