@@ -1476,56 +1476,36 @@ impl DataFusion {
         // query/compaction budgets to >100% of host — the SF1000 process OOM (RSS
         // 242 GiB on a 256 GiB box). `mem_tier_budget_bytes` is instead the host
         // RAM left after the query pool, the compaction pool, and a headroom
-        // reserve, guaranteeing query_pool + compaction + tier + headroom ≤ host.
-        // The per-table caps and the spill/durable fallbacks stay the OOM
-        // backstops; the dynamic re-partition sampler may later resize this budget
-        // within the same envelope as the query pool fills and drains.
-        // Total host/cgroup memory is constant for the process; read it once and
-        // reuse it for the tier budget, the log, the sampler, and the pressure
-        // budget below (`get_total_memory` rebuilds a sysinfo System each call).
+        // reserve, so the off-pool tier and the on-pool query/compaction budgets
+        // are coordinated against host RAM (see `coordinated_mem_tier_budget` for
+        // the exact bound and its precondition). The per-table caps and the
+        // spill/durable fallbacks stay the OOM backstops; the dynamic re-partition
+        // sampler may later resize this budget within the same envelope.
+        //
+        // Installed only when Cayenne acceleration is active (`mem_tier_budget_bytes`
+        // is `Some`, computed in the builder). It is `None` for non-Cayenne
+        // deployments that still get a dedicated compaction runtime — dedicated
+        // thread pools are the default, so `set_compaction_runtime` runs even with
+        // no Cayenne dataset — and those have no in-memory CDC tier to bound, so we
+        // install nothing and emit no tuning warning. `get_total_memory` rebuilds a
+        // sysinfo System each call, so read it once.
         let total_memory = crate::resource_monitor::get_total_memory();
-        let mem_tier_budget_bytes = self.mem_tier_budget_bytes.unwrap_or_else(|| {
-            // Reached only if the compaction runtime is set (Cayenne active) but the
-            // builder did not precompute a budget — e.g. an invalid compaction
-            // fraction, or Cayenne activated lazily after the query pool was already
-            // sized at the non-Cayenne default. Coordinate from the stored query
-            // pool size; this always installs a NONZERO global cap (never 0, which
-            // would disable the cap). It does NOT by itself guarantee
-            // pool + compaction + tier + headroom <= host when the query pool was
-            // not reduced for Cayenne — the tier is then floored and memory mode
-            // leans on the per-table caps + spill/durable backstops (warned below).
-            let budget = builder::coordinated_mem_tier_budget(
+        if let Some(mem_tier_budget_bytes) = self.mem_tier_budget_bytes {
+            cayenne::set_global_mem_tier_bytes(mem_tier_budget_bytes);
+            tracing::info!(
+                mem_tier_budget_bytes,
+                query_memory_pool_bytes = self.query_memory_pool_bytes,
+                compaction_memory_bytes = self.compaction_memory_bytes.unwrap_or(0),
                 total_memory,
-                self.query_memory_pool_bytes,
-                self.compaction_memory_bytes.unwrap_or(0),
+                "Cayenne global in-memory CDC tier byte budget active (coordinated with the query + compaction pools so their sum stays within host RAM)"
             );
-            if budget <= total_memory / builder::MEM_TIER_FLOOR_FRACTION {
-                tracing::warn!(
-                    query_memory_pool_bytes = self.query_memory_pool_bytes,
-                    total_memory,
-                    mem_tier_budget_bytes = budget,
-                    "Cayenne in-memory CDC ingestion has limited memory on this host (the query memory pool leaves little room for it), so ingestion will spill to disk more often. Consider lowering runtime.query.memory_limit to give in-memory CDC more room."
-                );
-            }
-            budget
-        });
-        cayenne::set_global_mem_tier_bytes(mem_tier_budget_bytes);
-        tracing::info!(
-            mem_tier_budget_bytes,
-            query_memory_pool_bytes = self.query_memory_pool_bytes,
-            compaction_memory_bytes = self.compaction_memory_bytes.unwrap_or(0),
-            total_memory,
-            "Cayenne global in-memory CDC tier byte budget active (coordinated with the query + compaction pools so their sum never exceeds host RAM)"
-        );
 
-        // Spawn the dynamic re-partition sampler: it watches LIVE query +
-        // compaction pool usage and resizes the mem-tier budget within
-        // [floor, mem_tier_budget_bytes] so the off-pool CDC tier yields RAM to the
-        // query pool as it fills (a heavy OLAP burst) and reclaims it as the pool
-        // drains — never above the coordinated static ceiling, so it cannot
-        // reintroduce overcommit. The critical-pressure reactive spill drains the
-        // tier when the budget is lowered below resident.
-        {
+            // Dynamic re-partition sampler: watches LIVE query + compaction pool
+            // usage and resizes the mem-tier budget within [floor, mem_tier_budget_bytes]
+            // so the off-pool CDC tier yields RAM to the query pool as it fills and
+            // reclaims it as the pool drains — never above the coordinated static
+            // ceiling, so it cannot reintroduce overcommit. The critical-pressure
+            // reactive spill drains the tier when the budget is lowered below resident.
             let rt = self.ctx.runtime_env();
             let query_pool = Arc::downgrade(&rt.memory_pool);
             let compaction_pool = self
