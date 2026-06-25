@@ -45,7 +45,8 @@ use datafusion::execution::SendableRecordBatchStream;
 use tokio::sync::OwnedMutexGuard;
 
 use super::Result;
-use super::table::{CayenneTableProvider, ColumnStatsAccumulator};
+use super::column_stats::ColumnStatsAccumulator;
+use super::table::CayenneTableProvider;
 use crate::CayenneCatalog;
 use crate::catalog::CatalogResult;
 use crate::metastore::MetastoreTransaction;
