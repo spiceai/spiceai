@@ -147,7 +147,10 @@ pub const SPICE_DEFAULT_SCHEMA: &str = "public";
 /// until TTL expiry. Resolving both sides first makes the comparison robust to
 /// qualification differences.
 #[must_use]
-pub fn resolved_table_match(stored: &HashSet<TableReference>, target: &TableReference) -> bool {
+pub fn resolved_table_match<S: std::hash::BuildHasher>(
+    stored: &HashSet<TableReference, S>,
+    target: &TableReference,
+) -> bool {
     let resolved_target = target
         .clone()
         .resolve(SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA);
