@@ -427,7 +427,7 @@ mod tests {
         )]))
     }
 
-    /// One-column value stats: `value` column with the given sum / null_count /
+    /// One-column value stats: `value` column with the given sum / `null_count` /
     /// min / max, over `num_rows` total rows.
     fn stats(
         num_rows: Precision<usize>,
