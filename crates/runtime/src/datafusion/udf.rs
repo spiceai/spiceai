@@ -828,13 +828,19 @@ pub fn deny_spice_functions_for_table_providers() -> FunctionSupport {
 /// the deny-list against that name. Collecting only canonical names would let
 /// every alias federate and be unparsed straight into the remote engine — which
 /// is exactly how `array_contains` was reaching Redshift.
-fn datafusion_nested_function_names() -> Vec<String> {
-    datafusion::functions_nested::all_default_nested_functions()
-        .iter()
-        .flat_map(|udf| {
-            std::iter::once(udf.name().to_string()).chain(udf.aliases().iter().cloned())
-        })
-        .collect()
+fn datafusion_nested_function_names() -> &'static [String] {
+    // The default nested-function set is fixed for the lifetime of the process,
+    // so compute the name+alias list once instead of re-allocating it on every
+    // Postgres table-provider construction.
+    static NAMES: LazyLock<Vec<String>> = LazyLock::new(|| {
+        datafusion::functions_nested::all_default_nested_functions()
+            .iter()
+            .flat_map(|udf| {
+                std::iter::once(udf.name().to_string()).chain(udf.aliases().iter().cloned())
+            })
+            .collect()
+    });
+    NAMES.as_slice()
 }
 
 /// `DataFusion` array functions that `PostgreSQL` implements under the SAME name,
@@ -885,7 +891,7 @@ fn denied_function_names_for_postgres() -> Vec<String> {
     let builtins = BUILTIN_DENIED_SPICE_FUNCTION_NAMES.clone();
     let user = USER_FUNCTION_NAMES.read().clone();
     let denied_array = deny_list_excluding_native(
-        &datafusion_nested_function_names(),
+        datafusion_nested_function_names(),
         POSTGRES_PUSHABLE_ARRAY_FUNCTIONS,
     );
     let mut denied = Vec::with_capacity(builtins.len() + user.len() + denied_array.len());
@@ -1197,14 +1203,7 @@ mod tests {
             );
         }
         // The exact PostgreSQL function names keep pushing down.
-        for name in [
-            "array_append",
-            "array_prepend",
-            "array_position",
-            "array_to_string",
-            "cardinality",
-            "string_to_array",
-        ] {
+        for &name in POSTGRES_PUSHABLE_ARRAY_FUNCTIONS {
             assert!(
                 support.supports(&make_named_expr(name)),
                 "{name} matches PostgreSQL exactly and should still federate"
@@ -1246,7 +1245,10 @@ mod tests {
         // Guard against typos / drift: every name we allow to push down must
         // actually be a DataFusion nested function, otherwise the carve-out is a
         // no-op that silently denies it.
-        let known: HashSet<String> = datafusion_nested_function_names().into_iter().collect();
+        let known: HashSet<&str> = datafusion_nested_function_names()
+            .iter()
+            .map(String::as_str)
+            .collect();
         for name in POSTGRES_PUSHABLE_ARRAY_FUNCTIONS {
             assert!(
                 known.contains(*name),
