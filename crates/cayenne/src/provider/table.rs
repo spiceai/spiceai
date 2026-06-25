@@ -19715,11 +19715,29 @@ impl super::compaction::MemTierCheckpointRunner for CayenneTableProvider {
             // deferred slot ack and crash-replay window bounded; freshness is
             // unaffected — RAM rows are query-visible immediately on append).
             // The write-path cap spill and explicit checkpoints bypass this.
+            // Under CRITICAL memory pressure, bypass the churn gate and force an
+            // immediate drain: shrinking the mem-tier cap (what the controller
+            // does) does NOT evict already-resident bytes, so this tick is what
+            // actually releases the off-pool tier back to the host. `mem_pressure`
+            // is refreshed ~every 1s by the controller's `on_background_tick`
+            // (`observe_environment`); `None` (non-Linux / no budget) leaves the
+            // churn gate fully intact.
+            let mem_critical = self
+                .context
+                .mem_pressure()
+                .is_some_and(|p| p >= super::tuning::MEM_PRESSURE_CRITICAL);
+            if mem_critical {
+                tracing::debug!(
+                    target: "cayenne::mem_tier",
+                    table = %self.table_metadata.table_name,
+                    "Critical memory pressure: forcing a mem-tier checkpoint (bypassing the churn gate) to release resident RAM"
+                );
+            }
             let min_flush = self
                 .table_metadata
                 .vortex_config
                 .cdc_mem_tier_min_flush_bytes;
-            if min_flush > 0 {
+            if min_flush > 0 && !mem_critical {
                 let size_ready =
                     i64::try_from(self.mem_tier.total_bytes()).unwrap_or(i64::MAX) >= min_flush;
                 if !size_ready && !self.mem_tier_age_cap_reached_whole_tier() {
