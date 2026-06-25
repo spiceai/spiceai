@@ -36,7 +36,7 @@ use cache::Caching;
 #[cfg(not(windows))]
 use cayenne::optimizer_rules::{
     CayenneAntiJoinSortMergeRewriter, CayenneDynamicFilterSharing, CayenneJoinRewriter,
-    CayenneMaintainedAggregateRewriter, CayenneOptimizerConfig,
+    CayenneMaintainedAggregateRewriter, CayenneOptimizerConfig, CayenneStatsAggregateRewriter,
 };
 #[cfg(not(windows))]
 use cayenne::{
@@ -175,12 +175,14 @@ impl CayennePhysicalOptimizerRules {
     const MAINTAINED_AGGREGATE: u8 = 1 << 1;
     const ANTI_JOIN_SORT_MERGE: u8 = 1 << 2;
     const EXACT_JOIN_FILTER: u8 = 1 << 3;
+    const STATS_AGGREGATE: u8 = 1 << 4;
 
     const fn auto_enabled() -> Self {
         Self {
             enabled_rules: Self::DYNAMIC_FILTER_SHARING
                 | Self::MAINTAINED_AGGREGATE
-                | Self::ANTI_JOIN_SORT_MERGE,
+                | Self::ANTI_JOIN_SORT_MERGE
+                | Self::STATS_AGGREGATE,
         }
     }
 
@@ -189,7 +191,8 @@ impl CayennePhysicalOptimizerRules {
             enabled_rules: Self::DYNAMIC_FILTER_SHARING
                 | Self::MAINTAINED_AGGREGATE
                 | Self::ANTI_JOIN_SORT_MERGE
-                | Self::EXACT_JOIN_FILTER,
+                | Self::EXACT_JOIN_FILTER
+                | Self::STATS_AGGREGATE,
         }
     }
 
@@ -320,6 +323,17 @@ impl CayenneOptimizerRules {
     pub fn set_maintained_aggregate(&mut self, enabled: bool) {
         self.physical
             .set(CayennePhysicalOptimizerRules::MAINTAINED_AGGREGATE, enabled);
+    }
+
+    #[must_use]
+    pub const fn stats_aggregate(self) -> bool {
+        self.physical
+            .is_enabled(CayennePhysicalOptimizerRules::STATS_AGGREGATE)
+    }
+
+    pub fn set_stats_aggregate(&mut self, enabled: bool) {
+        self.physical
+            .set(CayennePhysicalOptimizerRules::STATS_AGGREGATE, enabled);
     }
 
     #[must_use]
@@ -841,6 +855,10 @@ impl DataFusionBuilder {
                 state = state.with_physical_optimizer_rule(Arc::new(
                     CayenneMaintainedAggregateRewriter::new(),
                 ));
+            }
+            if self.cayenne_optimizer_rules.stats_aggregate() {
+                state = state
+                    .with_physical_optimizer_rule(Arc::new(CayenneStatsAggregateRewriter::new()));
             }
             if self.cayenne_optimizer_rules.anti_join_sort_merge() {
                 state = state.with_physical_optimizer_rule(Arc::new(
@@ -2118,9 +2136,10 @@ mod tests {
             vec![
                 "CayenneDynamicFilterSharing",
                 "CayenneMaintainedAggregateRewriter",
+                "CayenneStatsAggregateRewriter",
                 "CayenneAntiJoinSortMergeRewriter",
             ],
-            "Default Cayenne physical optimizer selection should preserve prior safe defaults without re-enabling the exact join filter"
+            "Default Cayenne physical optimizer selection should preserve prior safe defaults (now including the metadata-only stats aggregate fold) without re-enabling the exact join filter"
         );
     }
 
@@ -2221,6 +2240,8 @@ mod tests {
         dynamic_filter_sharing.set_dynamic_filter_sharing(true);
         let mut maintained_aggregate = CayenneOptimizerRules::none();
         maintained_aggregate.set_maintained_aggregate(true);
+        let mut stats_aggregate = CayenneOptimizerRules::none();
+        stats_aggregate.set_stats_aggregate(true);
         let mut anti_join_sort_merge = CayenneOptimizerRules::none();
         anti_join_sort_merge.set_anti_join_sort_merge(true);
         let mut exact_join_filter = CayenneOptimizerRules::none();
@@ -2257,6 +2278,11 @@ mod tests {
                 maintained_aggregate,
                 vec![],
                 vec!["CayenneMaintainedAggregateRewriter"],
+            ),
+            (
+                stats_aggregate,
+                vec![],
+                vec!["CayenneStatsAggregateRewriter"],
             ),
             (
                 anti_join_sort_merge,
