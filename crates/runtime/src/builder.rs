@@ -480,6 +480,22 @@ impl RuntimeBuilder {
         let resource_monitor = crate::resource_monitor::ResourceMonitor::new();
         let secrets = Arc::new(RwLock::new(Self::load_secrets(self.app.as_ref()).await));
 
+        // Diagnostics-only: resolve every `${ store:key }` reference in the
+        // app up front so secret problems surface as one consolidated report
+        // instead of scattered per-component errors. Skipped on cluster
+        // executors, where secrets resolve via scheduler RPC and the
+        // scheduler has already validated them. Never changes component
+        // loading; never logs secret values.
+        let is_cluster_executor = matches!(
+            self.resolved_cluster_config
+                .as_ref()
+                .and_then(ResolvedClusterConfig::effective_role),
+            Some(ClusterRole::Executor)
+        );
+        if !is_cluster_executor && let Some(app) = self.app.as_ref() {
+            crate::secrets_preflight::run(app, &*secrets.read().await).await;
+        }
+
         // Create the shared app reference early so DataFusion, Runtime, and PartitionService share it.
         let shared_app: Arc<RwLock<Option<Arc<App>>>> = Arc::new(RwLock::new(self.app));
 

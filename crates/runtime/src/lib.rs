@@ -131,6 +131,7 @@ pub mod search;
 pub mod secrets {
     pub use runtime_secrets::*;
 }
+mod secrets_preflight;
 pub mod cluster;
 pub mod spice_metrics;
 pub mod status;
