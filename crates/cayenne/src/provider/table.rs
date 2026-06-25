@@ -31,13 +31,35 @@ limitations under the License.
 //! - the **seq-prefix bake** planner and the in-process compaction runner;
 //! - maintained-aggregate state (`maintained_aggregates`) and the per-table memory account.
 
+use super::column_stats::{ColumnStatsAccumulator, RowCountUpdate};
 use super::constants::{STAGING_DIR_NAME, STAGING_WAL_FILENAME, STAGING_WAL_TMP_FILENAME};
 use super::delete::{
     CayenneDeletionSink, DeletionIdentifier, DeletionVectorWriteResult, DeletionVectorWriteSpec,
     DeletionVectorWriter, FileBasedDeletionSink, InsertRecordHandling, Int64PkDeletionFilterExec,
     KeyBasedDeletionFilterExec,
 };
+use super::inlined_cache::{InlinedCache, InlinedDurableCommit, InlinedViewEntry};
+use super::maintenance::{
+    PROTECTED_SNAPSHOT_AGE_WARNING_KEY_LIMIT, PostWriteMaintenance, PostWriteMaintenanceState,
+    RetentionFailureAction, SnapshotMaintenanceTrigger, duration_millis_saturating,
+    protected_snapshot_maintenance_trigger,
+};
+use super::manifest::{ManifestSequenceTag, SeqPrefixPlan};
 use super::mutation_writer::AppendMutationWriter;
+use super::on_conflict::{
+    BatchValidationResult, CheckpointCorpusKeys, ExtractedPrimaryKeys, InlineAwareDeletionSink,
+    InlinedDataRewrite, MergedScanDeletions, OnConflictContext, OnConflictDeletionUpdate,
+    OnConflictDeletions, OnConflictUpdate, OnConflictValidationStream, PendingTombstoneDeltas,
+    PkDeletionSnapshot, PkKeysetInvalidatingDeletionSink, PreparedInsertStream,
+    PreparedOnConflictDeletionPublish, PreparedProtectedSnapshotUpdate,
+    PreparedShardedInsertStream, ProtectedSnapshotScan, ShardedApplyResult,
+    pk_deletion_snapshot_for_strategy,
+};
+use super::pk_index::{
+    CachedPkIndex, CachedPkKeyset, PK_INDEX_PERSIST_MAX_BYTES, PkBloom, PkExistenceRef,
+    RowLocation, ShardedPkIndex, approx_captured_file_bytes, approx_pk_keyset_entry_bytes,
+    deserialize_pk_bloom_sidecar, serialize_pk_bloom_sidecar, shard_of_pk,
+};
 use super::streaming::StreamingExec;
 use crate::bounded_fifo::BoundedFifoSet;
 use crate::catalog::{CatalogError, CatalogResult, MetadataCatalog, SnapshotSequenceCommit};
@@ -52,24 +74,10 @@ use crate::provider::scan::{
 use crate::provider::sink::CayenneDataSink;
 use crate::provider::{Error, Result};
 use crate::resource_starvation::ResourceStarvationTracker;
-use arrow::array::{
-    Array, ArrayRef, BinaryArray, BinaryViewArray, BooleanArray, Date32Array, Date64Array,
-    Decimal128Array, FixedSizeBinaryArray, Float32Array, Float64Array, Int8Array, Int16Array,
-    Int32Array, Int64Array, LargeBinaryArray, LargeStringArray, StringArray, StringViewArray,
-    Time32MillisecondArray, Time32SecondArray, Time64MicrosecondArray, Time64NanosecondArray,
-    TimestampMicrosecondArray, TimestampMillisecondArray, TimestampNanosecondArray,
-    TimestampSecondArray, UInt8Array, UInt16Array, UInt32Array, UInt64Array,
-};
-use arrow::compute::kernels::aggregate;
-use arrow::datatypes::{
-    Date32Type, Date64Type, Decimal128Type, Int8Type, Int16Type, Int32Type, Int64Type,
-    Time32MillisecondType, Time32SecondType, Time64MicrosecondType, Time64NanosecondType,
-    TimestampMicrosecondType, TimestampMillisecondType, TimestampNanosecondType,
-    TimestampSecondType, UInt8Type, UInt16Type, UInt32Type, UInt64Type,
-};
+use arrow::array::{Array, ArrayRef, BinaryArray, BooleanArray, Int64Array};
 use arrow::record_batch::RecordBatch;
 use arrow_row::{OwnedRow, RowConverter, SortField};
-use arrow_schema::{DataType, Field, SchemaBuilder, SchemaRef, TimeUnit};
+use arrow_schema::{DataType, Field, SchemaBuilder, SchemaRef};
 use arrow_tools::schema_evolution::{EvolutionContext, SchemaEvolution, WideningPlan, classify};
 use async_trait::async_trait;
 use data_components::delete::{DeletionExec, DeletionSink};
@@ -107,6 +115,7 @@ use datafusion_physical_expr::execution_props::ExecutionProps;
 use datafusion_physical_expr::expressions::Column;
 use datafusion_physical_expr::{PhysicalExpr, create_lex_ordering, create_physical_expr};
 use datafusion_physical_plan::ExecutionPlan;
+use datafusion_physical_plan::SendableRecordBatchStream;
 use datafusion_physical_plan::coalesce_partitions::CoalescePartitionsExec;
 use datafusion_physical_plan::collect;
 use datafusion_physical_plan::empty::EmptyExec;
@@ -114,21 +123,17 @@ use datafusion_physical_plan::filter::FilterExec;
 use datafusion_physical_plan::limit::{GlobalLimitExec, LocalLimitExec};
 use datafusion_physical_plan::projection::ProjectionExec;
 use datafusion_physical_plan::union::UnionExec;
-use datafusion_physical_plan::{RecordBatchStream, SendableRecordBatchStream};
 use datafusion_table_providers::util::on_conflict::OnConflict;
 use futures::{Stream, StreamExt, TryStreamExt, stream};
 use object_store::{ObjectMeta, ObjectStore, ObjectStoreExt, path::Path as ObjectStorePath};
 use parking_lot::{Mutex as ParkingMutex, RwLock};
 use roaring::RoaringBitmap;
 use std::borrow::Cow;
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
-use std::pin::Pin;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering};
-use std::task::{Context, Poll};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime};
 use tokio::task;
-use vortex::dtype::arrow::FromArrowType;
 use vortex_datafusion::VortexFormat;
 use vortex_datafusion::VortexSource;
 use vortex_datafusion::WriteShardConfig;
@@ -158,12 +163,7 @@ const SCHEMA_EVOLUTION_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
 /// `cayenne_write_concurrency` explicitly when a table needs more encode
 /// parallelism. See `snapshot_write_concurrency`.
 pub(crate) const DEFAULT_WRITE_CONCURRENCY: usize = 4;
-// Approximate per-entry `HashMap` control/allocation overhead used for the
-// cache budget. The exact value is allocator-dependent, so keep this estimate
-// centralized with `approx_pk_keyset_entry_bytes`.
-const PK_KEYSET_CACHE_HASHMAP_ENTRY_OVERHEAD_BYTES: usize = 16;
 const TABLE_STATISTICS_FULL_COLUMN_SYNC_LIMIT: usize = 256;
-const PROTECTED_SNAPSHOT_AGE_WARNING_KEY_LIMIT: usize = 1024;
 /// Upper bound on total per-PK maintained-aggregate retraction index entries;
 /// exceeding it fails the registry safe to a base-table rebuild so memory stays
 /// bounded. TODO: derive from `runtime.query.memory_limit` once the budget is
@@ -196,274 +196,6 @@ const MAX_PK_SELECTIVE_RANGE_SPAN: i64 = 32;
 /// Maximum tombstone keys pushed into the Vortex scan predicate as `NOT IN`.
 const MAX_VORTEX_KEY_DELETE_PUSHDOWN: usize = 256;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SnapshotMaintenanceTrigger {
-    ProtectedSnapshotCount {
-        protected_snapshot_count: usize,
-        trigger_count: usize,
-    },
-    ProtectedSnapshotAge {
-        protected_snapshot_count: usize,
-        oldest_snapshot_age: Duration,
-        trigger_age: Duration,
-    },
-}
-
-fn should_warn_protected_snapshot_age(
-    warning_keys: &ParkingMutex<BoundedFifoSet>,
-    snapshot_id: &str,
-    warning_kind: &'static str,
-) -> bool {
-    warning_keys
-        .lock()
-        .insert_new(format!("{warning_kind}:{snapshot_id}"))
-}
-
-fn protected_snapshot_age(
-    warning_keys: &ParkingMutex<BoundedFifoSet>,
-    snapshot_id: &str,
-    now: SystemTime,
-) -> Option<Duration> {
-    // Protected snapshot ids are generated as UUIDv7 values by
-    // `commit_on_conflict_publish`; imported or future ids that
-    // do not preserve that invariant are ignored for age-triggered maintenance
-    // and still participate in count-triggered maintenance.
-    let Ok(snapshot_uuid) = uuid::Uuid::parse_str(snapshot_id) else {
-        if should_warn_protected_snapshot_age(warning_keys, snapshot_id, "invalid_uuid") {
-            tracing::warn!(
-                snapshot_id,
-                "Cayenne protected snapshot id is not a valid UUID; ignoring it for age-based maintenance"
-            );
-        }
-        return None;
-    };
-    let Some(timestamp) = snapshot_uuid.get_timestamp() else {
-        if should_warn_protected_snapshot_age(warning_keys, snapshot_id, "missing_uuid_timestamp") {
-            tracing::warn!(
-                snapshot_id,
-                "Cayenne protected snapshot id does not contain a UUID timestamp; ignoring it for age-based maintenance"
-            );
-        }
-        return None;
-    };
-    let (seconds, nanos) = timestamp.to_unix();
-    let Some(snapshot_time) = UNIX_EPOCH.checked_add(Duration::new(seconds, nanos)) else {
-        if should_warn_protected_snapshot_age(warning_keys, snapshot_id, "timestamp_overflow") {
-            tracing::warn!(
-                snapshot_id,
-                "Cayenne protected snapshot timestamp overflowed SystemTime; ignoring it for age-based maintenance"
-            );
-        }
-        return None;
-    };
-    if let Ok(age) = now.duration_since(snapshot_time) {
-        Some(age)
-    } else {
-        if should_warn_protected_snapshot_age(warning_keys, snapshot_id, "future_timestamp") {
-            tracing::warn!(
-                snapshot_id,
-                "Cayenne protected snapshot timestamp is in the future; ignoring it for age-based maintenance"
-            );
-        }
-        None
-    }
-}
-
-fn oldest_protected_snapshot_age(
-    warning_keys: &ParkingMutex<BoundedFifoSet>,
-    protected_snapshots: &HashMap<String, i64>,
-    now: SystemTime,
-) -> Option<Duration> {
-    protected_snapshots
-        .keys()
-        .filter_map(|snapshot_id| protected_snapshot_age(warning_keys, snapshot_id, now))
-        .max()
-}
-
-fn duration_millis_saturating(duration: Duration) -> u64 {
-    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
-}
-
-fn protected_snapshot_maintenance_trigger(
-    warning_keys: &ParkingMutex<BoundedFifoSet>,
-    protected_snapshots: &HashMap<String, i64>,
-    trigger_count: usize,
-    trigger_age: Option<Duration>,
-    now: SystemTime,
-) -> Option<SnapshotMaintenanceTrigger> {
-    let protected_snapshot_count = protected_snapshots.len();
-    let trigger_count = trigger_count.max(1);
-    if protected_snapshot_count >= trigger_count {
-        return Some(SnapshotMaintenanceTrigger::ProtectedSnapshotCount {
-            protected_snapshot_count,
-            trigger_count,
-        });
-    }
-
-    // Age parsing only runs below the count trigger; above it, the cheaper
-    // count trigger short-circuits before scanning snapshot ids.
-    let trigger_age = trigger_age?;
-    let oldest_snapshot_age =
-        oldest_protected_snapshot_age(warning_keys, protected_snapshots, now)?;
-    if oldest_snapshot_age >= trigger_age {
-        Some(SnapshotMaintenanceTrigger::ProtectedSnapshotAge {
-            protected_snapshot_count,
-            oldest_snapshot_age,
-            trigger_age,
-        })
-    } else {
-        None
-    }
-}
-
-fn approx_pk_keyset_entry_bytes(key: &OwnedRow) -> usize {
-    key.as_ref().len()
-        + std::mem::size_of::<RowLocation>()
-        + PK_KEYSET_CACHE_HASHMAP_ENTRY_OVERHEAD_BYTES
-}
-
-/// Approximate resident bytes a captured-file path adds to the keyset's
-/// `captured_files` set: the heap string (counted once per file — the `Arc<str>`
-/// is shared with the keyset's `FilePositioned` values) plus the fat pointer and
-/// `HashSet` slot overhead.
-fn approx_captured_file_bytes(path: &str) -> usize {
-    path.len() + std::mem::size_of::<Arc<str>>() + PK_KEYSET_CACHE_HASHMAP_ENTRY_OVERHEAD_BYTES
-}
-
-#[derive(Default)]
-struct PostWriteMaintenanceState {
-    stats: Option<Arc<ColumnStatsAccumulator>>,
-    refresh_listing: bool,
-    /// Set when the writer wants retention filters applied. Coalesces — multiple
-    /// writes scheduling retention collapse to one scan per debounce window.
-    retention_requested: bool,
-    /// Net change to the live row count across the coalesced writes
-    /// (`inserted - superseded - deleted`). Accumulated alongside `stats` and
-    /// applied as a [`RowCountUpdate::Delta`] when the stats are persisted.
-    live_rows_delta: i64,
-}
-
-impl PostWriteMaintenanceState {
-    fn is_empty(&self) -> bool {
-        self.stats.is_none()
-            && !self.refresh_listing
-            && !self.retention_requested
-            && self.live_rows_delta == 0
-    }
-}
-
-enum RetentionFailureAction {
-    Requeue,
-    ReturnError,
-}
-
-#[derive(Default)]
-struct PostWriteMaintenance {
-    state: ParkingMutex<PostWriteMaintenanceState>,
-    scheduled: AtomicBool,
-}
-
-/// Per-entry decoded view of one metastore inline-data row.
-///
-/// Pairs the original [`InlinedData`] envelope (needed to build rewrites
-/// without a second metastore round-trip) with the pre-decoded,
-/// deletion-filtered `RecordBatch`es for that entry.
-///
-/// `Clone` is cheap: the envelope is small metadata and each `RecordBatch`
-/// shares its Arrow buffers via `Arc`. The append-only inline-cache delta path
-/// clones the base view's entries (structural sharing of the buffers) before
-/// appending the newly decoded entries.
-#[derive(Clone)]
-struct InlinedViewEntry {
-    /// Original metastore envelope; provides `inlined_id`, `sequence_number`,
-    /// and other fields required to reconstruct a rewrite.
-    envelope: InlinedData,
-    /// Batches already decoded from IPC and filtered through the deletion map.
-    /// Empty when all rows in this entry were removed by the deletion filter.
-    batches: Vec<RecordBatch>,
-    /// Conservative min/max over the decoded IPC batches (pre-tombstone filter).
-    statistics: Arc<Statistics>,
-}
-
-/// Cached result of [`CayenneTableProvider::read_inlined_batches`] and
-/// [`CayenneTableProvider::cached_inlined_view`].
-///
-/// The cache is keyed by an `inlined_generation` counter that is incremented
-/// (with `Release` ordering) by every `commit_inlined_data_mutation` and
-/// `clear_inlined_metadata_after_checkpoint` call. A cache entry is valid only
-/// when its stored `generation` equals the live counter — guaranteeing that any
-/// write or checkpoint immediately invalidates the cache without a lock.
-///
-/// # Incremental maintenance contract
-///
-/// On a miss, the cache is **not** always rebuilt from the whole corpus. The
-/// `structural_epoch` records the value of `inlined_structural_epoch` this view
-/// was built at. That epoch is bumped ONLY by mutations that can retroactively
-/// change an already-materialized entry — an inline rewrite/removal
-/// (`removed_rows > 0`), a newly published tombstone, a checkpoint clear, an
-/// overwrite, or open-time recovery. A pure append (new rows at a sequence above
-/// every existing entry, with no rewrite and no new tombstone) bumps only the
-/// generation. So when a miss observes the SAME structural epoch as the cached
-/// view, the only changes since were appends, and
-/// `CayenneTableProvider::populate_inlined_cache` takes the cheap delta path:
-/// it fetches just the entries with `sequence_number >
-/// materialized_through_sequence`, decodes+filters those, and merges them onto
-/// the structurally-shared existing `view` — never re-reading or re-decoding the
-/// corpus. Any other miss
-/// (structural-epoch mismatch, sentinel/first touch) falls back to a full
-/// rebuild. See [`CayenneTableProvider::populate_inlined_cache`].
-struct InlinedCache {
-    /// Generation at the time this entry was built.
-    generation: u64,
-    /// `inlined_structural_epoch` at the time this entry was built. A miss whose
-    /// live structural epoch still matches this value proves every change since
-    /// was append-only and the entry can be extended with the delta instead of
-    /// rebuilt. See the type-level "Incremental maintenance contract".
-    structural_epoch: u64,
-    /// The visibility watermark (`published_inlined_seq`) at the time this view
-    /// was built: the view materialized exactly the entries with
-    /// `sequence_number <= materialized_through_sequence`. The append-only delta
-    /// path queries `sequence_number > materialized_through_sequence` to fetch
-    /// precisely the entries that have become eligible since — both rows appended
-    /// above the old watermark AND rows that were durably committed but held back
-    /// by the old watermark and are now published. This boundary (not the corpus
-    /// max) is what makes the delta both gap-free (a watermark advance re-fetches
-    /// the now-visible held-back rows) and duplicate-free (already-materialized
-    /// rows have `seq <= this` and are excluded). `i64::MIN` for the empty
-    /// sentinel so the first real read fetches everything.
-    materialized_through_sequence: i64,
-    /// Highest `PendingTombstoneDeltas::seq` whose removal this view has applied
-    /// (cycle-5 TASK 1). A published tombstone now enqueues a removal delta and
-    /// bumps ONLY the generation (not the structural epoch), so the delta path
-    /// applies exactly the deltas with `seq > this` to the structurally-shared
-    /// base entries — re-filtering them against just the newly-deleted keys
-    /// instead of full-rebuilding from the corpus. A full rebuild stamps this
-    /// with the queue's current seq (it captured every tombstone via
-    /// `load_inlined_deletion_maps`). `0` for the empty sentinel.
-    tombstone_delta_seq: u64,
-    /// Flattened `RecordBatch`es across all entries. Each batch shares Arrow
-    /// buffer ownership via `Arc`, so cloning the `Vec` is cheap.
-    batches: Arc<Vec<RecordBatch>>,
-    /// Per-entry view used by the upsert-rewrite path to avoid a second
-    /// metastore round-trip and re-decode.
-    view: Arc<Vec<InlinedViewEntry>>,
-}
-
-/// Outcome of a durable inlined-data commit that has not yet been published to the in-memory caches.
-///
-/// Returned by [`CayenneTableProvider::commit_inlined_data_durable`] and
-/// consumed by [`CayenneTableProvider::publish_inlined_mutation`] under
-/// `scan_state_lock.write()`.
-struct InlinedDurableCommit {
-    /// Number of rows removed by the rewrite (superseded inlined copies).
-    removed_rows: i64,
-    /// Sequence assigned to newly appended inlined rows, or `None` when the
-    /// commit only rewrote/removed existing entries. When `Some`, publishing
-    /// advances `published_inlined_seq` to this value to make the appended rows
-    /// visible.
-    published_seq: Option<i64>,
-}
-
 /// Result of a Cayenne CDC append write.
 ///
 /// A write can be fully complete when this value is returned, or it can have a
@@ -488,47 +220,6 @@ pub struct CayenneCdcWrite {
     /// seam). `None` for every durable-path write (file mode, fallback, the
     /// non-pipelined path), which keep the normal per-batch committer.
     in_memory_epoch: Option<u64>,
-}
-
-pub(crate) struct PreparedOnConflictDeletionPublish {
-    target_snapshot_id: String,
-    snapshot_sequence: i64,
-    delete_sequence: Option<i64>,
-    insert_sequence: Option<i64>,
-    deleted_pk_i64: Vec<i64>,
-    deleted_row_keys: Vec<Box<[u8]>>,
-    /// PKs whose prior copy was INLINE (the ones the inline tombstone hides),
-    /// kept separate from the file-deletion `deleted_pk_i64`/`deleted_row_keys`
-    /// above (cycle-5 TASK 1). At finalize these — at `delete_sequence` — are the
-    /// removal applied to the inline-cache base via `pending_tombstone_deltas`, so
-    /// they MUST be the inline keys (the tombstone's keys), NOT the file keys: a
-    /// file-conflict deletion never matches a cached inline row, so using the file
-    /// keys would fail to hide the old inline copy (a transient duplicate). Empty
-    /// when the batch replaced no inline rows (then `inlined_delete_id` is `None`
-    /// and no removal is enqueued). One of the two is always empty per PK strategy.
-    deleted_inlined_pk_i64: Vec<i64>,
-    deleted_inlined_row_keys: Vec<Box<[u8]>>,
-    position_deletions: HashMap<String, Vec<u32>>,
-    /// `inlined_id` of the inline tombstone this staged upsert wrote with
-    /// `published = false` (Option D), or `None` when the batch replaced no
-    /// inlined rows. At finalize (`publish_prepared_on_conflict_deletions`, under
-    /// the listing fence, after the replacement files are moved into the snapshot)
-    /// the tombstone is activated IN MEMORY (recorded in
-    /// `inlined_locally_published` so the read filter applies it immediately) and
-    /// its durable `published = 1` flip is DEFERRED into
-    /// `pending_durable_tombstone_flips` — the cycle-4 b1★ Stage-B-writer-free
-    /// path. `pending_inline_tombstones` is decremented there. Carrying the exact
-    /// id (rather than re-deriving from keys) makes both the in-memory activation
-    /// and the later durable flip target precisely THIS tombstone — never a
-    /// later-staged tombstone for the same PK.
-    inlined_delete_id: Option<String>,
-    /// Count of existing rows superseded by this upsert, captured from
-    /// [`OnConflictDeletions::total_superseded`] at validation time. This is the
-    /// authoritative live-row-delta input: it must NOT be recomputed from the
-    /// fields above, because `deleted_pk_i64` and `deleted_row_keys` carry the
-    /// SAME `Int64Pk` deletions in two encodings (i64 + committed byte keys), so
-    /// summing their lengths double-counts, and neither captures `position_deletions`.
-    superseded: usize,
 }
 
 impl CayenneCdcWrite {
@@ -780,591 +471,6 @@ impl CayenneCdcWrite {
     }
 }
 
-/// Joint accumulator state held under a single mutex so `update()` and
-/// `merge_from()` only pay one acquire per batch. `seeded[i]` is `true`
-/// once column i has been assigned its first batch — the first batch is
-/// assigned directly (not merged) because `StatsSet::default()` is
-/// `merge_unordered`'s identity-less "unknown" and merging into it drops
-/// the new stats.
-#[derive(Debug, Default)]
-struct ColumnStatsState {
-    columns: Vec<vortex::array::stats::StatsSet>,
-    seeded: Vec<bool>,
-    /// Per-column NDV (distinct-count) `HyperLogLog` sketch, `Some` only for
-    /// integer columns (join-key candidates). Parallel to `columns` for O(1)
-    /// access on the write hot path. See [`crate::hll`].
-    ndv: Vec<Option<crate::hll::HyperLogLog>>,
-}
-
-/// How a stats persist updates the live `num_rows` count, keeping it tracking
-/// `SELECT COUNT(*)` rather than the sum of every insert ever made.
-#[derive(Debug, Clone, Copy)]
-pub(crate) enum RowCountUpdate {
-    /// Add a signed net delta for this commit (`inserted - superseded - deleted`).
-    /// Used by the normal write/CDC-upsert path.
-    Delta(i64),
-    /// Replace with an authoritative live count. Used by compaction and overwrite
-    /// rewrites, which materialize exactly the live rows and so bound any drift
-    /// the incremental deltas might accumulate.
-    Set(i64),
-    /// Leave the count unchanged — rows moved, not added (e.g. the inline-data
-    /// checkpoint flush, whose rows were already counted on insert).
-    Unchanged,
-}
-
-/// Accumulates per-column statistics across multiple `RecordBatch`es during a write.
-///
-/// Builds Vortex [`StatsSet`] objects per column (min, max, null count) and tracks
-/// the total row count. After the write completes, call [`to_file_statistics_blob`] to
-/// produce a serialized Vortex `FileStatistics` blob for metastore persistence.
-///
-/// Thread-safe: guarded by `Mutex` when shared across stream tasks.
-///
-/// [`StatsSet`]: vortex::array::stats::StatsSet
-#[derive(Debug)]
-pub(crate) struct ColumnStatsAccumulator {
-    state: std::sync::Mutex<ColumnStatsState>,
-    /// Column dtypes (Vortex types, derived from Arrow schema)
-    dtypes: Vec<vortex::dtype::DType>,
-    /// Total accumulated row count across all batches
-    row_count: std::sync::atomic::AtomicI64,
-    /// Arrow schema for serialization
-    schema: arrow_schema::Schema,
-}
-
-impl ColumnStatsAccumulator {
-    /// Create a new accumulator for the given schema.
-    pub(crate) fn new(schema: &arrow_schema::Schema) -> Self {
-        let num_cols = schema.fields().len();
-        let dtypes: Vec<vortex::dtype::DType> = schema
-            .fields()
-            .iter()
-            .map(|f| {
-                vortex::dtype::DType::from_arrow((
-                    f.data_type(),
-                    if f.is_nullable() {
-                        vortex::dtype::Nullability::Nullable
-                    } else {
-                        vortex::dtype::Nullability::NonNullable
-                    },
-                ))
-            })
-            .collect();
-        // NDV sketches only for integer columns (join-key candidates); other
-        // columns get `None` so the write path skips them.
-        let ndv: Vec<Option<crate::hll::HyperLogLog>> = schema
-            .fields()
-            .iter()
-            .map(|f| Self::supports_ndv(f.data_type()).then(crate::hll::HyperLogLog::new))
-            .collect();
-        Self {
-            state: std::sync::Mutex::new(ColumnStatsState {
-                columns: vec![vortex::array::stats::StatsSet::default(); num_cols],
-                seeded: vec![false; num_cols],
-                ndv,
-            }),
-            dtypes,
-            row_count: std::sync::atomic::AtomicI64::new(0),
-            schema: schema.clone(),
-        }
-    }
-
-    /// Whether to maintain an NDV sketch for `dt`. Restricted to integer types:
-    /// these are the join-key candidates (e.g. `*_custkey`, `*_orderkey`) whose
-    /// distinct count can diverge sharply from their min/max range under sparse
-    /// CDC keys. Mirrors the consumer-side `supports_ndv` in the cluster reporter.
-    fn supports_ndv(dt: &DataType) -> bool {
-        matches!(
-            dt,
-            DataType::Int8
-                | DataType::Int16
-                | DataType::Int32
-                | DataType::Int64
-                | DataType::UInt8
-                | DataType::UInt16
-                | DataType::UInt32
-                | DataType::UInt64
-        )
-    }
-
-    /// Fold every non-null value of an integer Arrow column into `hll`. Iterates
-    /// the typed array directly (no `ScalarValue` boxing) to keep the write hot
-    /// path cheap, sign-extending to `i128` so all widths share one hash path.
-    fn add_int_column_to_hll(col: &dyn arrow::array::Array, hll: &mut crate::hll::HyperLogLog) {
-        macro_rules! fold {
-            ($array_ty:ty) => {{
-                if let Some(a) = col.as_any().downcast_ref::<$array_ty>() {
-                    for v in a.iter().flatten() {
-                        hll.add_i128(i128::from(v));
-                    }
-                    return;
-                }
-            }};
-        }
-        fold!(Int8Array);
-        fold!(Int16Array);
-        fold!(Int32Array);
-        fold!(Int64Array);
-        fold!(UInt8Array);
-        fold!(UInt16Array);
-        fold!(UInt32Array);
-        fold!(UInt64Array);
-    }
-
-    /// Update accumulated stats from a `RecordBatch`.
-    pub(crate) fn update(&self, batch: &RecordBatch) {
-        let Ok(mut state) = self.state.lock() else {
-            tracing::warn!("ColumnStatsAccumulator: mutex poisoned in update(), skipping");
-            return;
-        };
-
-        let num_rows = batch.num_rows();
-        // Use saturating addition at i64::MAX so overflow on extremely long-lived
-        // accumulators surfaces as a clamped row count rather than wrapping to
-        // a negative value that would get persisted as a bogus `num_rows`.
-        let delta = i64::try_from(num_rows).unwrap_or(i64::MAX);
-        let _ = self.row_count.fetch_update(
-            std::sync::atomic::Ordering::Relaxed,
-            std::sync::atomic::Ordering::Relaxed,
-            |current| Some(current.saturating_add(delta)),
-        );
-
-        for (i, col) in batch.columns().iter().enumerate() {
-            if i >= state.columns.len() || i >= self.dtypes.len() || i >= state.seeded.len() {
-                continue;
-            }
-
-            // Build a StatsSet for this batch's column
-            let batch_stats =
-                crate::stats::column_stats_to_stats_set(&Self::compute_column_stats(col));
-
-            // For the first batch, seed directly. `StatsSet::default()` is
-            // treated by Vortex as "unknown" — and `merge_unordered(unknown,
-            // known) == unknown`, which would otherwise silently drop the
-            // first batch's stats. On subsequent batches, merge using the
-            // commutative unordered merge so statistics stay correct
-            // regardless of the order batches arrive in.
-            if state.seeded[i] {
-                let existing = std::mem::take(&mut state.columns[i]);
-                state.columns[i] = existing.merge_unordered(&batch_stats, &self.dtypes[i]);
-            } else {
-                state.columns[i] = batch_stats;
-                state.seeded[i] = true;
-            }
-
-            // Maintain the per-column NDV sketch for integer columns.
-            if let Some(Some(hll)) = state.ndv.get_mut(i) {
-                Self::add_int_column_to_hll(col.as_ref(), hll);
-            }
-        }
-    }
-
-    /// Compute `DataFusion` `ColumnStatistics` from a single Arrow column.
-    pub(crate) fn compute_column_stats(
-        col: &dyn arrow::array::Array,
-    ) -> datafusion_common::ColumnStatistics {
-        use datafusion_common::stats::Precision;
-
-        let null_count = Precision::Exact(col.null_count());
-
-        if col.is_empty() || col.null_count() == col.len() {
-            return datafusion_common::ColumnStatistics {
-                null_count,
-                min_value: Precision::Absent,
-                max_value: Precision::Absent,
-                sum_value: Precision::Absent,
-                distinct_count: Precision::Absent,
-                byte_size: Precision::Absent,
-            };
-        }
-
-        let (batch_min, batch_max) =
-            Self::fast_column_min_max(col).unwrap_or_else(|| Self::scalar_column_min_max(col));
-
-        datafusion_common::ColumnStatistics {
-            null_count,
-            min_value: batch_min.map_or(Precision::Absent, Precision::Exact),
-            max_value: batch_max.map_or(Precision::Absent, Precision::Exact),
-            // The metadata-only `SUM`/`AVG` fold sources its column sum from the
-            // per-file Vortex footer (`Stat::Sum`, surfaced by
-            // `VortexFormat::infer_stats` and persisted into the per-file
-            // `snapshot_file_statistics` blob), NOT from this table-level
-            // accumulator. Computing a sum here would only add a per-write pass
-            // for the table-level `TableStatistics` (used for join sizing), which
-            // does not consume `sum_value` — so we leave it absent.
-            sum_value: Precision::Absent,
-            distinct_count: Precision::Absent,
-            byte_size: Precision::Absent,
-        }
-    }
-
-    fn scalar_column_min_max(
-        col: &dyn arrow::array::Array,
-    ) -> (Option<ScalarValue>, Option<ScalarValue>) {
-        // O(n) linear scan to find min/max using `ScalarValue` comparison.
-        // NaN values are skipped entirely so stats remain deterministic.
-        let mut batch_min: Option<datafusion_common::ScalarValue> = None;
-        let mut batch_max: Option<datafusion_common::ScalarValue> = None;
-
-        for row_idx in 0..col.len() {
-            if col.is_null(row_idx) {
-                continue;
-            }
-            let Ok(value) = datafusion_common::ScalarValue::try_from_array(col, row_idx) else {
-                continue;
-            };
-
-            // Skip NaN: partial_cmp(NaN, x) always returns None
-            if value.partial_cmp(&value) != Some(std::cmp::Ordering::Equal) {
-                continue;
-            }
-
-            batch_min = Some(match batch_min {
-                None => value.clone(),
-                Some(existing) => {
-                    if value.partial_cmp(&existing) == Some(std::cmp::Ordering::Less) {
-                        value.clone()
-                    } else {
-                        existing
-                    }
-                }
-            });
-            batch_max = Some(match batch_max {
-                None => value,
-                Some(existing) => {
-                    if value.partial_cmp(&existing) == Some(std::cmp::Ordering::Greater) {
-                        value
-                    } else {
-                        existing
-                    }
-                }
-            });
-        }
-
-        (batch_min, batch_max)
-    }
-
-    fn fast_column_min_max(
-        col: &dyn arrow::array::Array,
-    ) -> Option<(Option<ScalarValue>, Option<ScalarValue>)> {
-        macro_rules! primitive_min_max {
-            ($array_ty:ty, $arrow_ty:ty, |$value:ident| $scalar:expr) => {{
-                let array = col.as_any().downcast_ref::<$array_ty>()?;
-                let min_value = aggregate::min::<$arrow_ty>(array).map(|$value| $scalar);
-                let max_value = aggregate::max::<$arrow_ty>(array).map(|$value| $scalar);
-                Some((min_value, max_value))
-            }};
-        }
-
-        macro_rules! byte_min_max {
-            ($array_ty:ty, $min_fn:ident, $max_fn:ident, |$value:ident| $scalar:expr) => {{
-                let array = col.as_any().downcast_ref::<$array_ty>()?;
-                let min_value = aggregate::$min_fn(array).map(|$value| $scalar);
-                let max_value = aggregate::$max_fn(array).map(|$value| $scalar);
-                Some((min_value, max_value))
-            }};
-        }
-
-        match col.data_type() {
-            DataType::Boolean => {
-                let array = col.as_any().downcast_ref::<BooleanArray>()?;
-                Some((
-                    aggregate::min_boolean(array).map(|value| ScalarValue::Boolean(Some(value))),
-                    aggregate::max_boolean(array).map(|value| ScalarValue::Boolean(Some(value))),
-                ))
-            }
-            DataType::Int8 => primitive_min_max!(Int8Array, Int8Type, |value| {
-                ScalarValue::Int8(Some(value))
-            }),
-            DataType::Int16 => primitive_min_max!(Int16Array, Int16Type, |value| {
-                ScalarValue::Int16(Some(value))
-            }),
-            DataType::Int32 => primitive_min_max!(Int32Array, Int32Type, |value| {
-                ScalarValue::Int32(Some(value))
-            }),
-            DataType::Int64 => primitive_min_max!(Int64Array, Int64Type, |value| {
-                ScalarValue::Int64(Some(value))
-            }),
-            DataType::UInt8 => primitive_min_max!(UInt8Array, UInt8Type, |value| {
-                ScalarValue::UInt8(Some(value))
-            }),
-            DataType::UInt16 => primitive_min_max!(UInt16Array, UInt16Type, |value| {
-                ScalarValue::UInt16(Some(value))
-            }),
-            DataType::UInt32 => primitive_min_max!(UInt32Array, UInt32Type, |value| {
-                ScalarValue::UInt32(Some(value))
-            }),
-            DataType::UInt64 => primitive_min_max!(UInt64Array, UInt64Type, |value| {
-                ScalarValue::UInt64(Some(value))
-            }),
-            DataType::Float32 => {
-                let array = col.as_any().downcast_ref::<Float32Array>()?;
-                let (min_value, max_value) = Self::float32_min_max(array);
-                Some((
-                    min_value.map(|value| ScalarValue::Float32(Some(value))),
-                    max_value.map(|value| ScalarValue::Float32(Some(value))),
-                ))
-            }
-            DataType::Float64 => {
-                let array = col.as_any().downcast_ref::<Float64Array>()?;
-                let (min_value, max_value) = Self::float64_min_max(array);
-                Some((
-                    min_value.map(|value| ScalarValue::Float64(Some(value))),
-                    max_value.map(|value| ScalarValue::Float64(Some(value))),
-                ))
-            }
-            DataType::Decimal128(precision, scale) => {
-                primitive_min_max!(Decimal128Array, Decimal128Type, |value| {
-                    ScalarValue::Decimal128(Some(value), *precision, *scale)
-                })
-            }
-            DataType::Utf8 => byte_min_max!(StringArray, min_string, max_string, |value| {
-                ScalarValue::Utf8(Some(value.to_string()))
-            }),
-            DataType::LargeUtf8 => {
-                byte_min_max!(LargeStringArray, min_string, max_string, |value| {
-                    ScalarValue::LargeUtf8(Some(value.to_string()))
-                })
-            }
-            DataType::Utf8View => {
-                byte_min_max!(StringViewArray, min_string_view, max_string_view, |value| {
-                    ScalarValue::Utf8View(Some(value.to_string()))
-                })
-            }
-            DataType::Binary => byte_min_max!(BinaryArray, min_binary, max_binary, |value| {
-                ScalarValue::Binary(Some(value.to_vec()))
-            }),
-            DataType::LargeBinary => {
-                byte_min_max!(LargeBinaryArray, min_binary, max_binary, |value| {
-                    ScalarValue::LargeBinary(Some(value.to_vec()))
-                })
-            }
-            DataType::BinaryView => {
-                byte_min_max!(BinaryViewArray, min_binary_view, max_binary_view, |value| {
-                    ScalarValue::BinaryView(Some(value.to_vec()))
-                })
-            }
-            DataType::FixedSizeBinary(size) => byte_min_max!(
-                FixedSizeBinaryArray,
-                min_fixed_size_binary,
-                max_fixed_size_binary,
-                |value| { ScalarValue::FixedSizeBinary(*size, Some(value.to_vec())) }
-            ),
-            DataType::Date32 => primitive_min_max!(Date32Array, Date32Type, |value| {
-                ScalarValue::Date32(Some(value))
-            }),
-            DataType::Date64 => primitive_min_max!(Date64Array, Date64Type, |value| {
-                ScalarValue::Date64(Some(value))
-            }),
-            DataType::Time32(TimeUnit::Second) => {
-                primitive_min_max!(Time32SecondArray, Time32SecondType, |value| {
-                    ScalarValue::Time32Second(Some(value))
-                })
-            }
-            DataType::Time32(TimeUnit::Millisecond) => {
-                primitive_min_max!(Time32MillisecondArray, Time32MillisecondType, |value| {
-                    ScalarValue::Time32Millisecond(Some(value))
-                })
-            }
-            DataType::Time64(TimeUnit::Microsecond) => {
-                primitive_min_max!(Time64MicrosecondArray, Time64MicrosecondType, |value| {
-                    ScalarValue::Time64Microsecond(Some(value))
-                })
-            }
-            DataType::Time64(TimeUnit::Nanosecond) => {
-                primitive_min_max!(Time64NanosecondArray, Time64NanosecondType, |value| {
-                    ScalarValue::Time64Nanosecond(Some(value))
-                })
-            }
-            DataType::Timestamp(TimeUnit::Second, tz) => {
-                primitive_min_max!(TimestampSecondArray, TimestampSecondType, |value| {
-                    ScalarValue::TimestampSecond(Some(value), tz.clone())
-                })
-            }
-            DataType::Timestamp(TimeUnit::Millisecond, tz) => primitive_min_max!(
-                TimestampMillisecondArray,
-                TimestampMillisecondType,
-                |value| { ScalarValue::TimestampMillisecond(Some(value), tz.clone()) }
-            ),
-            DataType::Timestamp(TimeUnit::Microsecond, tz) => primitive_min_max!(
-                TimestampMicrosecondArray,
-                TimestampMicrosecondType,
-                |value| { ScalarValue::TimestampMicrosecond(Some(value), tz.clone()) }
-            ),
-            DataType::Timestamp(TimeUnit::Nanosecond, tz) => {
-                primitive_min_max!(TimestampNanosecondArray, TimestampNanosecondType, |value| {
-                    ScalarValue::TimestampNanosecond(Some(value), tz.clone())
-                })
-            }
-            _ => None,
-        }
-    }
-
-    fn float32_min_max(array: &Float32Array) -> (Option<f32>, Option<f32>) {
-        let mut min_value: Option<f32> = None;
-        let mut max_value: Option<f32> = None;
-
-        for value in array.iter().flatten() {
-            if value.is_nan() {
-                continue;
-            }
-            min_value = Some(match min_value {
-                Some(current) if current <= value => current,
-                _ => value,
-            });
-            max_value = Some(match max_value {
-                Some(current) if current >= value => current,
-                _ => value,
-            });
-        }
-
-        (min_value, max_value)
-    }
-
-    fn float64_min_max(array: &Float64Array) -> (Option<f64>, Option<f64>) {
-        let mut min_value: Option<f64> = None;
-        let mut max_value: Option<f64> = None;
-
-        for value in array.iter().flatten() {
-            if value.is_nan() {
-                continue;
-            }
-            min_value = Some(match min_value {
-                Some(current) if current <= value => current,
-                _ => value,
-            });
-            max_value = Some(match max_value {
-                Some(current) if current >= value => current,
-                _ => value,
-            });
-        }
-
-        (min_value, max_value)
-    }
-
-    /// Get the total accumulated row count.
-    pub(crate) fn row_count(&self) -> i64 {
-        self.row_count.load(std::sync::atomic::Ordering::Relaxed)
-    }
-
-    pub(crate) fn merge_from(&self, other: &Self) {
-        let other_row_count = other.row_count();
-        if other_row_count == 0 {
-            return;
-        }
-
-        let (other_columns, other_seeded, other_ndv) = {
-            let Ok(other_state) = other.state.lock() else {
-                tracing::warn!("ColumnStatsAccumulator: mutex poisoned in merge_from(), skipping");
-                return;
-            };
-            (
-                other_state.columns.clone(),
-                other_state.seeded.clone(),
-                other_state.ndv.clone(),
-            )
-        };
-
-        let Ok(mut state) = self.state.lock() else {
-            tracing::warn!("ColumnStatsAccumulator: mutex poisoned in merge_from(), skipping");
-            return;
-        };
-
-        let _ = self.row_count.fetch_update(
-            std::sync::atomic::Ordering::Relaxed,
-            std::sync::atomic::Ordering::Relaxed,
-            |current| Some(current.saturating_add(other_row_count)),
-        );
-
-        for (idx, other_stats) in other_columns.into_iter().enumerate() {
-            if idx >= state.columns.len()
-                || idx >= state.seeded.len()
-                || idx >= self.dtypes.len()
-                || !other_seeded.get(idx).copied().unwrap_or(false)
-            {
-                continue;
-            }
-
-            if state.seeded[idx] {
-                let existing = std::mem::take(&mut state.columns[idx]);
-                state.columns[idx] = existing.merge_unordered(&other_stats, &self.dtypes[idx]);
-            } else {
-                state.columns[idx] = other_stats;
-                state.seeded[idx] = true;
-            }
-        }
-
-        // Merge per-column NDV sketches (register-wise max).
-        for (idx, other_hll) in other_ndv.into_iter().enumerate() {
-            let (Some(other_hll), Some(slot)) = (other_hll, state.ndv.get_mut(idx)) else {
-                continue;
-            };
-            match slot {
-                Some(hll) => hll.merge(&other_hll),
-                None => *slot = Some(other_hll),
-            }
-        }
-    }
-
-    /// Snapshot the accumulated per-column NDV sketches as an [`NdvSketches`]
-    /// container (column index -> sketch), for serialization/merge on persist.
-    fn to_ndv_sketches(&self) -> crate::hll::NdvSketches {
-        let mut sketches = crate::hll::NdvSketches::new();
-        let Ok(state) = self.state.lock() else {
-            tracing::warn!(
-                "ColumnStatsAccumulator: mutex poisoned in to_ndv_sketches(), returning empty"
-            );
-            return sketches;
-        };
-        for (idx, slot) in state.ndv.iter().enumerate() {
-            if let Some(hll) = slot
-                && let Ok(col_idx) = u32::try_from(idx)
-            {
-                *sketches.entry(col_idx) = hll.clone();
-            }
-        }
-        sketches
-    }
-
-    pub(crate) fn to_file_statistics_blob_with_row_count(&self) -> Option<(Vec<u8>, i64)> {
-        let row_count = self.row_count();
-        if row_count == 0 {
-            return None;
-        }
-        let Ok(state) = self.state.lock() else {
-            tracing::warn!(
-                "ColumnStatsAccumulator: mutex poisoned in to_file_statistics_blob(), returning None"
-            );
-            return None;
-        };
-
-        let file_stats = crate::stats::build_file_statistics(state.columns.clone(), &self.schema);
-        match crate::stats::serialize_file_statistics(&file_stats) {
-            Ok(bytes) => Some((bytes, row_count)),
-            Err(e) => {
-                tracing::warn!("Failed to serialize file statistics: {e}");
-                None
-            }
-        }
-    }
-
-    fn merged_file_statistics_blob(&self, existing_blob: &[u8]) -> Option<Vec<u8>> {
-        let Ok(state) = self.state.lock() else {
-            tracing::warn!(
-                "ColumnStatsAccumulator: mutex poisoned in merged_file_statistics_blob(), returning None"
-            );
-            return None;
-        };
-
-        crate::stats::merge_serialized_stats(
-            existing_blob,
-            &state.columns,
-            &self.dtypes,
-            &self.schema,
-        )
-    }
-}
-
 // Inlining caps are intentionally conservative: inlined data is reread on every
 // scan, lives as BLOBs in the metastore, and gets no zone-map pruning. Raising
 // these limits trades a slightly cheaper write path for read amplification on
@@ -1465,70 +571,6 @@ struct SnapshotFilesForScan {
     file_groups: Vec<FileGroup>,
     statistics: Statistics,
     grouped_by_partition: bool,
-}
-
-/// Partition of a snapshot's manifest by a seq-prefix cutoff `T`, the planning
-/// core of an incremental seq-prefix compaction.
-///
-/// A file is **bake-eligible** when `min_sequence <= T`: it holds at least one
-/// row committed at or before `T`, so it may carry a deletion with
-/// `delete_seq <= T` that the rewrite physically applies — these files are
-/// consolidated into one new file with their dead rows removed. A file is
-/// **reference-in-place** when `min_sequence > T`: EVERY row it holds was
-/// committed strictly after `T`, hence after every applicable `<= T` tombstone
-/// (which deletes a row that existed at seq `<= T`; a `> T` row was written
-/// after, so under upsert semantics the newer row wins). Such a file can be
-/// referenced unchanged in the new snapshot without rewriting its bytes — the
-/// shrink the manifest model exists to enable.
-///
-/// The predicate is `min_sequence`, NOT `max_sequence`: a merged file that
-/// STRADDLES the cutoff (`min_sequence <= T < max_sequence`) holds rows at or
-/// below `T`, so it MUST be baked. Splitting on `max_sequence` would put a
-/// straddling file in `reference`, and the subsequent
-/// [`CayenneTableProvider::prune_deletion_index_at_or_below`] would then drop a
-/// `<= T` tombstone that still applied to that file's `<= T` rows — resurrecting
-/// the deleted rows. For single-commit files `min == max`, so this is a no-op;
-/// it only matters for merged/straddling files, which is exactly where the bug
-/// would bite.
-#[derive(Debug, Default)]
-struct SeqPrefixPlan {
-    /// Manifest rows whose `min_sequence <= T` — rewritten into one new file.
-    bake: Vec<SnapshotFile>,
-    /// Manifest rows whose `min_sequence > T` — referenced in place unchanged.
-    reference: Vec<SnapshotFile>,
-}
-
-/// How `upsert_snapshot_manifest_from_listing` tags each listed file's
-/// `[min_sequence, max_sequence]` — the TRUE per-file commit-seq range the
-/// seq-prefix bake needs, in place of the prior single per-snapshot watermark
-/// (which degenerated `partition_manifest_by_sequence` to all-bake/all-reference
-/// and delivered zero shrink).
-///
-/// The variant is chosen per snapshot kind by the write path, which knows how
-/// the snapshot's files were produced:
-/// - [`Self::Uniform`] — every file shares one `[min, max]`, overwriting any
-///   prior row. Used by a compaction write-site that AUTHORS the snapshot's
-///   manifest with its merged `[min, max]` over the inputs (full-rewrite,
-///   subset merge).
-/// - [`Self::PreserveOrUniform`] — keep any range already recorded for a file
-///   (so a re-list never clobbers a compaction-authored merged range — the
-///   catalog upsert is `INSERT OR REPLACE`), and tag a brand-new (untagged)
-///   file `[min, max]`. Used by `rebuild_live_snapshot_manifests`:
-///   - the CURRENT snapshot uses `[0, current_seq]` — a brand-new file there
-///     has an unknown true min, so `0` keeps it always bake-eligible (never
-///     wrongly referenced-in-place, never resurrecting a row);
-///   - a PROTECTED snapshot uses `[S, S]` where `S` is its single reserved
-///     sequence (the protected-set value) — every row in a fresh
-///     CDC-staged-append / checkpoint snapshot was committed at `S`, so `[S, S]`
-///     is exact and lets the newest, highest-sequence files be referenced in
-///     place (the shrink the lever exists for). A merged subset-compaction
-///     output is a protected snapshot too, but it AUTHORED its merged range at
-///     commit time, so the preserve arm keeps that range rather than the
-///     (delete-seq) protected-set value.
-#[derive(Debug, Clone, Copy)]
-enum ManifestSequenceTag {
-    Uniform { min: i64, max: i64 },
-    PreserveOrUniform { min: i64, max: i64 },
 }
 
 /// Serialize one or more `RecordBatch`es to Arrow IPC stream bytes.
@@ -1712,7 +754,7 @@ fn serialize_delete_keys_to_ipc(
 ///
 /// The upstream `OnConflict` enum only contains `ColumnReference`, but our on-conflict
 /// logic requires `UpsertOptions`. This trait provides a compatibility shim.
-trait OnConflictExt {
+pub(crate) trait OnConflictExt {
     /// Returns `UpsertOptions` for this `OnConflict` variant.
     /// Currently returns default options; future versions may store options in `OnConflict`.
     fn get_upsert_options(&self) -> UpsertOptions;
@@ -1725,7 +767,7 @@ impl OnConflictExt for OnConflict {
 }
 
 #[derive(Debug, Clone, Copy, Default)]
-struct UpsertOptions {
+pub(crate) struct UpsertOptions {
     remove_duplicates: bool,
     last_write_wins: bool,
 }
@@ -1920,7 +962,7 @@ pub struct CayenneTableProvider {
     context: Arc<CayenneContext>,
     /// Strategy for primary key-based deletion filtering.
     /// Contains the deletion caches specific to each strategy variant.
-    pk_deletion_strategy: PkDeletionStrategyWithCache,
+    pub(crate) pk_deletion_strategy: PkDeletionStrategyWithCache,
     /// `RowConverter` for converting primary key columns to byte representation.
     /// Only set for tables with composite or non-integer primary keys.
     pk_row_converter: Option<Arc<RowConverter>>,
@@ -1934,7 +976,7 @@ pub struct CayenneTableProvider {
     /// - Statistics are consistent and up-to-date
     ///
     /// Uses `tokio::sync::Mutex` because the lock is held across `.await` points during insert operations.
-    write_lock: Arc<tokio::sync::Mutex<()>>,
+    pub(crate) write_lock: Arc<tokio::sync::Mutex<()>>,
     /// Serializes staged append visibility flips after Stage A has durably
     /// written its isolated staging WAL. CDC pipelining releases `write_lock`
     /// after Stage A, then Stage B takes this lock for move + listing cache
@@ -2542,1107 +1584,29 @@ impl CayenneTableProviderBuilder {
     }
 }
 
-/// Where a primary key's current row version lives. The upsert path uses this to
-/// decide how to tombstone the prior version: a `FilePositioned` entry can be
-/// tombstoned by a per-file position deletion vector (pushed into the Vortex
-/// scan, page-skippable); everything else falls back to a key-based deletion
-/// vector applied above the scan. A single table can hold a mix.
-#[derive(Debug, Clone)]
-enum RowLocation {
-    /// Row lives in the inline memtable; tombstoned by an inlined-data rewrite.
-    Inlined,
-    /// Row lives in a Vortex file but its file-local position is unknown — a
-    /// cold-rebuilt keyset entry, or any entry under `deletion_mode: key`.
-    /// Tombstoned by a key-based deletion vector.
-    FileUnlocated,
-    /// Row lives at a known `(file path, file-local position)`, captured by the
-    /// `row_idx()` read-back under `deletion_mode: position`. Tombstoned by a
-    /// per-file position deletion vector (`Selection::ExcludeRoaring`). The
-    /// `file_path` `Arc` is shared across all rows in the same file, so the
-    /// per-entry cost is one pointer + the `u64` position.
-    FilePositioned { file_path: Arc<str>, position: u64 },
-}
-
-pub(crate) struct CachedPkKeyset {
-    keys: HashMap<OwnedRow, RowLocation>,
-    approx_bytes: usize,
-    /// Data files whose rows have already had their `(key -> file-local
-    /// position)` captured by the `deletion_mode: position` read-back, so the
-    /// capture pass can skip them. Reset whenever the keyset is rebuilt (e.g.
-    /// after compaction), which is exactly when the file set changes.
-    captured_files: HashSet<Arc<str>>,
-}
-
-impl CachedPkKeyset {
-    fn with_capacity(capacity: usize) -> Self {
-        Self {
-            keys: HashMap::with_capacity(capacity),
-            approx_bytes: 0,
-            captured_files: HashSet::new(),
-        }
-    }
-
-    fn len(&self) -> usize {
-        self.keys.len()
-    }
-
-    fn insert(&mut self, key: OwnedRow, location: RowLocation) {
-        let entry_bytes = approx_pk_keyset_entry_bytes(&key);
-        match self.keys.entry(key) {
-            std::collections::hash_map::Entry::Occupied(mut entry) => {
-                entry.insert(location);
-            }
-            std::collections::hash_map::Entry::Vacant(entry) => {
-                self.approx_bytes = self.approx_bytes.saturating_add(entry_bytes);
-                entry.insert(location);
-            }
-        }
-    }
-}
-
-/// Number of hash probes for [`PkBloom`]. Seven keeps the false-positive rate
-/// near 1% at the ~10 bits/key fill level; the bloom is sized to the whole byte
-/// budget, so at realistic fills the rate is far lower.
-const PK_BLOOM_NUM_HASHES: u32 = 7;
-
-/// Seeded FNV-1a-64. Dependency-free and adequate for a Bloom filter; two
-/// independent seeds feed the Kirsch–Mitzenmacher double-hashing scheme below.
-fn pk_bloom_hash(bytes: &[u8], seed: u64) -> u64 {
-    let mut hash = 0xcbf2_9ce4_8422_2325_u64 ^ seed;
-    for &byte in bytes {
-        hash ^= u64::from(byte);
-        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
-    }
-    hash
-}
-
-/// Routing seed for PK-shard assignment — distinct from the bloom's hashing seeds
-/// so shard placement is independent of bloom bit positions.
-const PK_SHARD_SEED: u64 = 0x243f_6a88_85a3_08d3;
-
-/// Map a primary key to one of `n` shards by hashing its `RowConverter`-encoded
-/// `OwnedRow` bytes.
-///
-/// THE shard key is defined as the `OwnedRow` byte representation — NEVER the
-/// big-endian i64 encoding the tombstone delete-lists use. Every routing site
-/// (write/validate routing, per-shard keyset/bloom, derived tombstone lists) must
-/// hash this same byte string, or the same logical key routes to two shards,
-/// splitting its version history and breaking last-writer-wins. `n <= 1` is the
-/// unsharded fast path and always returns shard 0.
-#[inline]
-fn shard_of_pk(owned_row_bytes: &[u8], n: usize) -> usize {
-    if n <= 1 {
-        return 0;
-    }
-    let bucket = pk_bloom_hash(owned_row_bytes, PK_SHARD_SEED) % n as u64;
-    usize::try_from(bucket).unwrap_or(0)
-}
-
-/// Bounded Bloom filter of live primary keys.
-///
-/// Used as the existence index for **`OnConflict::Upsert`** tables whose exact
-/// keyset would exceed the configured byte budget (`pk_keyset_cache_max_bytes`).
-/// Sized to the budget, it stays resident and is maintained incrementally,
-/// avoiding the O(total-rows) full keyset rebuild on every CDC batch.
-///
-/// Correctness invariants:
-/// - **No false negatives** as long as every inserted key is added and keys are
-///   never removed — so a real upsert conflict is never missed.
-/// - A **false positive** yields a redundant key-based delete tombstone, which
-///   masks no older version (none exists) and is harmless under upsert.
-/// - Only valid for upsert. `DoNothing` needs an exact answer (a false positive
-///   would wrongly drop a genuinely new row), so those tables keep the exact path.
-pub(crate) struct PkBloom {
-    bits: Vec<u64>,
-    /// `num_bits - 1`; `num_bits` is a power of two so indexing masks instead of mods.
-    bit_mask: u64,
-    /// Keys inserted (observability + false-positive-rate estimation).
-    inserted_keys: usize,
-}
-
-impl PkBloom {
-    /// Allocate a bloom whose bit array fits within `budget_bytes`, using the
-    /// largest power-of-two bit count that does not exceed the budget.
-    fn with_byte_budget(budget_bytes: usize) -> Self {
-        Self::with_num_bits_pow2(budget_bytes.saturating_mul(8))
-    }
-
-    /// Right-size a bloom for `expected_keys` (~10 bits/key, ~1% FPR), never
-    /// exceeding `max_bytes`. Used when persisting a compaction checkpoint so the
-    /// sidecar stays small rather than the full byte budget.
-    fn with_expected_keys(expected_keys: usize, max_bytes: usize) -> Self {
-        let want_bits = expected_keys.saturating_mul(10);
-        let cap_bits = max_bytes.saturating_mul(8).max(64);
-        Self::with_num_bits_pow2(want_bits.min(cap_bits))
-    }
-
-    /// Allocate with the largest power-of-two bit count `<= target_bits` (min 64).
-    fn with_num_bits_pow2(target_bits: usize) -> Self {
-        let num_bits: usize = 1usize << target_bits.max(64).ilog2();
-        let words = (num_bits / 64).max(1);
-        Self {
-            bits: vec![0u64; words],
-            bit_mask: u64::try_from(num_bits.saturating_sub(1)).unwrap_or(u64::MAX),
-            inserted_keys: 0,
-        }
-    }
-
-    /// Serialize as `bit_mask(8) | inserted_keys(8) | num_words(8) | words(8·W)`,
-    /// little-endian.
-    fn serialize_into(&self, out: &mut Vec<u8>) {
-        out.extend_from_slice(&self.bit_mask.to_le_bytes());
-        out.extend_from_slice(
-            &u64::try_from(self.inserted_keys)
-                .unwrap_or(u64::MAX)
-                .to_le_bytes(),
-        );
-        out.extend_from_slice(&u64::try_from(self.bits.len()).unwrap_or(0).to_le_bytes());
-        for word in &self.bits {
-            out.extend_from_slice(&word.to_le_bytes());
-        }
-    }
-
-    /// Deserialize ONE bloom from the front of `bytes`, returning it and the
-    /// number of bytes it consumed — so several blooms can be read back-to-back
-    /// from a sharded sidecar (the bloom is self-describing via its `num_words`).
-    fn deserialize_from_prefix(bytes: &[u8]) -> Option<(Self, usize)> {
-        let bit_mask = u64::from_le_bytes(bytes.get(0..8)?.try_into().ok()?);
-        let inserted_keys = u64::from_le_bytes(bytes.get(8..16)?.try_into().ok()?);
-        let num_words =
-            usize::try_from(u64::from_le_bytes(bytes.get(16..24)?.try_into().ok()?)).ok()?;
-        // Reject impossible word counts before allocating.
-        if num_words == 0 || num_words > bytes.len().saturating_sub(24) / 8 {
-            return None;
-        }
-        // `num_bits` must be a power of two and consistent with `bit_mask`.
-        let num_bits = u64::try_from(num_words).ok()?.checked_mul(64)?;
-        if num_bits != bit_mask.checked_add(1)? || !num_bits.is_power_of_two() {
-            return None;
-        }
-        let mut bits = Vec::with_capacity(num_words);
-        let mut offset = 24usize;
-        for _ in 0..num_words {
-            let end = offset.checked_add(8)?;
-            bits.push(u64::from_le_bytes(bytes.get(offset..end)?.try_into().ok()?));
-            offset = end;
-        }
-        Some((
-            Self {
-                bits,
-                bit_mask,
-                inserted_keys: usize::try_from(inserted_keys).unwrap_or(0),
-            },
-            offset,
-        ))
-    }
-
-    fn probe_bits(key: &[u8]) -> impl Iterator<Item = u64> {
-        let h1 = pk_bloom_hash(key, 0x517c_c1b7_2722_0a95);
-        // Force odd so successive probes stride across the whole bit space.
-        let h2 = pk_bloom_hash(key, 0x9e37_79b9_7f4a_7c15) | 1;
-        (0..PK_BLOOM_NUM_HASHES).map(move |i| h1.wrapping_add(u64::from(i).wrapping_mul(h2)))
-    }
-
-    fn insert(&mut self, key: &[u8]) {
-        for hash in Self::probe_bits(key) {
-            let bit = hash & self.bit_mask;
-            let word = usize::try_from(bit >> 6).unwrap_or(0);
-            self.bits[word] |= 1u64 << (bit & 63);
-        }
-        self.inserted_keys = self.inserted_keys.saturating_add(1);
-    }
-
-    fn maybe_contains(&self, key: &[u8]) -> bool {
-        for hash in Self::probe_bits(key) {
-            let bit = hash & self.bit_mask;
-            let word = usize::try_from(bit >> 6).unwrap_or(0);
-            if self.bits[word] & (1u64 << (bit & 63)) == 0 {
-                return false;
-            }
-        }
-        true
-    }
-}
-
-/// Magic ("CPKB") + version for the persisted PK-index bloom sidecar. Bumping
-/// the version invalidates older sidecars (they deserialize to `None` → safe
-/// full-scan fallback).
-const PK_INDEX_SIDECAR_MAGIC: u32 = 0x4350_4b42;
-/// Bumped to 2 for the sharded PK-index rollout: the sidecar now carries a bloom
-/// COUNT prefix and N serialized blooms (one per mem-tier shard) instead of a
-/// single bloom. A version-1 (single-bloom) sidecar deserializes to `None` →
-/// safe full keyset rebuild (the designed stale-format fallback), so an upgrade
-/// across the bump simply rebuilds the index once.
-const PK_INDEX_SIDECAR_VERSION: u32 = 2;
-/// Upper bound on the persisted PK-index blob. Extreme-cardinality tables skip
-/// persistence (and fall back to a runtime rebuild) to bound the metastore and
-/// snapshot footprint. The bloom is right-sized (~10 bits/key), so this caps the
-/// covered live-key count at roughly 200M.
-const PK_INDEX_PERSIST_MAX_BYTES: usize = 256 * 1024 * 1024;
-
-/// Serialize a sharded checkpoint:
-/// `magic | version | snapshot_id_len | snapshot_id | bloom_count | bloom* `.
-/// `blooms` carries one entry per mem-tier shard (one element at the default N=1).
-fn serialize_pk_blooms_sidecar(blooms: &[PkBloom], snapshot_id: &str) -> Vec<u8> {
-    let mut out = Vec::new();
-    out.extend_from_slice(&PK_INDEX_SIDECAR_MAGIC.to_le_bytes());
-    out.extend_from_slice(&PK_INDEX_SIDECAR_VERSION.to_le_bytes());
-    let snapshot_bytes = snapshot_id.as_bytes();
-    out.extend_from_slice(
-        &u64::try_from(snapshot_bytes.len())
-            .unwrap_or(0)
-            .to_le_bytes(),
-    );
-    out.extend_from_slice(snapshot_bytes);
-    out.extend_from_slice(&u64::try_from(blooms.len()).unwrap_or(0).to_le_bytes());
-    for bloom in blooms {
-        bloom.serialize_into(&mut out);
-    }
-    out
-}
-
-/// Single-bloom convenience over [`serialize_pk_blooms_sidecar`] (the persist path
-/// produces one combined-snapshot bloom; the sharded blooms are rebuilt at load).
-fn serialize_pk_bloom_sidecar(bloom: &PkBloom, snapshot_id: &str) -> Vec<u8> {
-    serialize_pk_blooms_sidecar(std::slice::from_ref(bloom), snapshot_id)
-}
-
-/// Inverse of [`serialize_pk_blooms_sidecar`]; returns `None` on any
-/// magic/version/length/count mismatch so a corrupt or stale-format sidecar
-/// (including every version-1 single-bloom sidecar) falls back to the full keyset
-/// rebuild.
-fn deserialize_pk_blooms_sidecar(bytes: &[u8]) -> Option<(Vec<PkBloom>, String)> {
-    let magic = u32::from_le_bytes(bytes.get(0..4)?.try_into().ok()?);
-    let version = u32::from_le_bytes(bytes.get(4..8)?.try_into().ok()?);
-    if magic != PK_INDEX_SIDECAR_MAGIC || version != PK_INDEX_SIDECAR_VERSION {
-        return None;
-    }
-    let snapshot_len =
-        usize::try_from(u64::from_le_bytes(bytes.get(8..16)?.try_into().ok()?)).ok()?;
-    let snapshot_end = 16usize.checked_add(snapshot_len)?;
-    let snapshot_id = std::str::from_utf8(bytes.get(16..snapshot_end)?)
-        .ok()?
-        .to_string();
-    let count_end = snapshot_end.checked_add(8)?;
-    let count = usize::try_from(u64::from_le_bytes(
-        bytes.get(snapshot_end..count_end)?.try_into().ok()?,
-    ))
-    .ok()?;
-    let mut rest = bytes.get(count_end..)?;
-    // Reject an impossible bloom count before allocating: each bloom is
-    // self-describing and consumes >= 32 bytes (24-byte header + >= one 8-byte
-    // word), so a `count` larger than the remaining bytes can encode means a
-    // corrupt/truncated sidecar — return None (clean rebuild) rather than risk a
-    // huge `with_capacity` allocation. Same guard idiom as `deserialize_from_prefix`.
-    if count > rest.len() / 32 {
-        return None;
-    }
-    let mut blooms = Vec::with_capacity(count);
-    for _ in 0..count {
-        let (bloom, consumed) = PkBloom::deserialize_from_prefix(rest)?;
-        blooms.push(bloom);
-        rest = rest.get(consumed..)?;
-    }
-    Some((blooms, snapshot_id))
-}
-
-/// Single-bloom convenience over [`deserialize_pk_blooms_sidecar`]: returns the
-/// first bloom (the n==1 reload path). A multi-bloom sidecar with count != 1 is
-/// rejected so the n==1 reader never silently uses a sharded sidecar.
-fn deserialize_pk_bloom_sidecar(bytes: &[u8]) -> Option<(PkBloom, String)> {
-    let (mut blooms, snapshot_id) = deserialize_pk_blooms_sidecar(bytes)?;
-    if blooms.len() != 1 {
-        return None;
-    }
-    Some((blooms.remove(0), snapshot_id))
-}
-
-/// Cached primary-key existence index for upsert/insert conflict detection.
-///
-/// Tables keep an [`Exact`](Self::Exact) keyset while it fits the byte budget;
-/// upsert tables that exceed it fall back to a bounded [`Bloom`](Self::Bloom)
-/// (see [`PkBloom`]) instead of dropping the cache and rebuilding from a
-/// full-table scan every batch.
-enum CachedPkIndex {
-    Exact(CachedPkKeyset),
-    Bloom(PkBloom),
-}
-
-impl CachedPkIndex {
-    fn len(&self) -> usize {
-        match self {
-            Self::Exact(keyset) => keyset.len(),
-            Self::Bloom(bloom) => bloom.inserted_keys,
-        }
-    }
-
-    /// Approximate resident bytes for memory accounting: the exact keyset's
-    /// running byte tally, or the bloom's fixed bit-array size.
-    fn approx_bytes(&self) -> usize {
-        match self {
-            Self::Exact(keyset) => keyset.approx_bytes,
-            Self::Bloom(bloom) => bloom.bits.len().saturating_mul(8),
-        }
-    }
-}
-
-/// The per-shard PK existence index — the sharded analog of [`CachedPkIndex`]
-/// (§2.3c). A key is owned by `shard_of_pk(OwnedRow bytes)` (§3.5), the SAME
-/// routing the tier append + reads use, so a key's existence entry co-locates
-/// with its segments and a shard validates only against its own keys. Either
-/// all-exact (one keyset per shard) or all-bloom (one bloom per shard), matching
-/// the source index's path.
-pub(crate) enum ShardedPkIndex {
-    Exact(Box<[CachedPkKeyset]>),
-    Bloom(Box<[PkBloom]>),
-}
-
-impl ShardedPkIndex {
-    /// Partition an exact keyset into `n` per-shard keysets by `shard_of_pk` on
-    /// each key's `OwnedRow` bytes (§3.5). Bloom-path indices are built sharded at
-    /// load time instead — a combined bloom can't be partitioned (its keys are
-    /// unrecoverable), so per-shard blooms are constructed by routing keys to N
-    /// blooms during `load_existing_keyset` / `try_load_persisted_pk_index`.
-    fn from_exact(keyset: CachedPkKeyset, n: usize) -> Self {
-        let n = n.max(1);
-        let mut shards: Vec<CachedPkKeyset> =
-            (0..n).map(|_| CachedPkKeyset::with_capacity(0)).collect();
-        for (key, loc) in keyset.keys {
-            let s = shard_of_pk(key.row().as_ref(), n);
-            // Route through CachedPkKeyset::insert — the single source of truth for
-            // approx_bytes (per-key approx_pk_keyset_entry_bytes) — so each shard's
-            // byte tally is exact for variable-length/composite PKs, not an even
-            // split of the source total. The per-shard sums then add back up to the
-            // unsharded keyset's bytes with no integer-division undercount.
-            shards[s].insert(key, loc);
-        }
-        // The position-delete capture set is table-global; every shard needs the
-        // complete skip set so its read-back doesn't re-capture a covered file.
-        for shard in &mut shards {
-            shard.captured_files.clone_from(&keyset.captured_files);
-        }
-        Self::Exact(shards.into_boxed_slice())
-    }
-
-    fn shard_count(&self) -> usize {
-        match self {
-            Self::Exact(s) => s.len(),
-            Self::Bloom(s) => s.len(),
-        }
-    }
-
-    /// Borrowed existence view for shard `i`, handed to that shard's validation.
-    fn existence_ref(&self, i: usize) -> PkExistenceRef<'_> {
-        match self {
-            Self::Exact(keysets) => PkExistenceRef::Exact(&keysets[i].keys),
-            Self::Bloom(blooms) => PkExistenceRef::Bloom(&blooms[i]),
-        }
-    }
-
-    /// Approximate resident bytes across all shards, for memory accounting.
-    fn approx_bytes(&self) -> usize {
-        match self {
-            Self::Exact(keysets) => keysets
-                .iter()
-                .map(|k| k.approx_bytes)
-                .fold(0, usize::saturating_add),
-            Self::Bloom(blooms) => blooms
-                .iter()
-                .map(|b| b.bits.len().saturating_mul(8))
-                .fold(0, usize::saturating_add),
-        }
-    }
-
-    /// Record `keys` into ONE shard's existence view (Phase 6 — the bloom-split
-    /// insert performed UNDER `mem_tier_publish_locks[shard]`). Every key in
-    /// `keys` MUST belong to `shard` (it is the validated/kept key set of that
-    /// shard's own sub-batch, already routed by `shard_of_pk`); inserting them
-    /// here keyed on the SAME `shard` index keeps a key's existence entry
-    /// co-located with its segments. Inserting under the shard lock makes the
-    /// bloom INSERT atomic with the segment swap, so a later same-apply HIT-path
-    /// validation against this shard observes the prior MISS-path appends (the
-    /// §3.4 / Review-4 HOLE-3 intra-apply-dup window is closed jointly by this
-    /// insert and the per-apply `incoming_keys` set).
-    ///
-    /// NOTE: unlike `record_pk_keys_with_location`, this intentionally does NOT do
-    /// per-insert over-budget exact→bloom conversion. The sharded path recomputes
-    /// the keyset byte tally ONCE after all per-shard appends (recompute-once), so a
-    /// shard never converts exact→bloom mid-life — a deliberate divergence, not an
-    /// oversight.
-    fn record_keys_in_shard(
-        &mut self,
-        shard: usize,
-        keys: &HashSet<OwnedRow>,
-        location: &RowLocation,
-    ) {
-        match self {
-            Self::Exact(keysets) => {
-                if let Some(keyset) = keysets.get_mut(shard) {
-                    for key in keys {
-                        keyset.insert(key.clone(), location.clone());
-                    }
-                }
-            }
-            Self::Bloom(blooms) => {
-                if let Some(bloom) = blooms.get_mut(shard) {
-                    for key in keys {
-                        bloom.insert(key.as_ref());
-                    }
-                }
-            }
-        }
-    }
-}
-
-/// Borrowed view of a [`CachedPkIndex`] handed to per-batch validation.
-enum PkExistenceRef<'a> {
-    Exact(&'a HashMap<OwnedRow, RowLocation>),
-    Bloom(&'a PkBloom),
-}
-
 /// Key -> max delete sequence maps the read path probes to hide superseded
 /// rows. An alias of the tier's own [`InMemTombstones`] (same persistent maps,
 /// same hasher), so building this view from the in-memory CDC tier is an O(1)
 /// HAMT-root clone per scan, NOT an O(tier-tombstones) rebuild — the per-scan
 /// rebuild was the dominant query tax under memory mode once the resident tier
 /// grew (q20's correlated rescans paid it per outer group).
-type InlinedDeletionMaps = crate::provider::mem_tier::InMemTombstones;
+pub(crate) type InlinedDeletionMaps = crate::provider::mem_tier::InMemTombstones;
 
-/// One published inline tombstone's removal effect, recorded so the inline-cache
-/// delta path can apply it to the structurally-shared base entries WITHOUT a
-/// structural epoch bump + full corpus re-read (cycle-5 TASK 1).
-///
-/// A published tombstone only ever REMOVES rows from the cached view — it hides
-/// the prior inline copy of an upserted PK whose entry `sequence_number <=
-/// delete_sequence`. Removal can never invalidate a *retained* entry (the same
-/// soundness as pruning-under-deletes), so re-filtering the base entries against
-/// just these keys is sound. The keys are exactly the ones in hand at publish
-/// (`PreparedOnConflictDeletionPublish::deleted_pk_i64` / `deleted_row_keys`), so
-/// no metastore read is needed to build the removal.
-struct TombstoneDelta {
-    /// Monotonic queue sequence (`tombstone_delta_seq` at publish). Globally
-    /// unique and never reset, so an `InlinedCache` records the highest delta it
-    /// has applied (`tombstone_delta_seq`) and the delta path applies exactly the
-    /// deltas with `seq > base.tombstone_delta_seq`.
-    seq: u64,
-    /// The tombstone's `delete_sequence`. An entry's row is removed iff its PK is
-    /// in this delta AND the entry `sequence_number <= delete_sequence` (mirrors
-    /// `filter_inlined_batch_for_deletions`: keep iff `data_sequence > delete_sequence`).
-    delete_sequence: i64,
-    /// Deleted Int64 PKs (for `Int64Pk` tables). Empty for composite-key tables.
-    int64_pk: Vec<i64>,
-    /// Deleted encoded row-keys (for `RowConverterBased` tables). Empty for
-    /// `Int64Pk` tables.
-    row_keys: Vec<Box<[u8]>>,
-}
-
-impl TombstoneDelta {
-    /// Approximate heap footprint, used to bound the pending-delta queue.
-    fn approx_keys(&self) -> usize {
-        self.int64_pk.len() + self.row_keys.len()
-    }
-}
-
-/// Cap on the pending tombstone-delta queue (cycle-5 TASK 1). When EITHER the
-/// number of queued deltas OR the total queued keys exceeds these, the next
-/// inline-cache miss falls back to a FULL rebuild (which reads the whole corpus
-/// plus the full deletion maps, so it captures every tombstone) and resets the
-/// queue baseline. This bounds both the queue's memory and the per-miss
-/// re-filter work between checkpoints, while keeping the delta path on the
-/// common per-batch single-tombstone case. A checkpoint clears the queue
-/// entirely, so in steady state it stays far below these caps.
-const MAX_PENDING_TOMBSTONE_DELTAS: usize = 256;
-const MAX_PENDING_TOMBSTONE_DELTA_KEYS: usize = 1_000_000;
-
-/// Queue of published-but-not-yet-baked tombstone removals plus the live
-/// monotonic sequence counter (cycle-5 TASK 1). Guarded by a single
-/// `ParkingMutex` shared across writer clones; mutated only under that lock so
-/// the `seq` and the `deltas` stay consistent.
-#[derive(Default)]
-struct PendingTombstoneDeltas {
-    /// Monotonic sequence; the value of the most recently enqueued delta. A new
-    /// delta is assigned `seq + 1`. Never reset (so seqs are globally unique even
-    /// across a queue drain).
-    seq: u64,
-    /// Deltas pending application to the inline-cache base, ordered by `seq`
-    /// ascending. Drained from the front once a stored cache has baked them in.
-    deltas: VecDeque<TombstoneDelta>,
-    /// Running sum of `deltas[..].approx_keys()` for the O(1) cap check.
-    total_keys: usize,
-}
-
-impl PendingTombstoneDeltas {
-    /// Enqueue a published tombstone's removal and return its assigned sequence.
-    fn push(&mut self, delete_sequence: i64, int64_pk: Vec<i64>, row_keys: Vec<Box<[u8]>>) -> u64 {
-        self.seq += 1;
-        let delta = TombstoneDelta {
-            seq: self.seq,
-            delete_sequence,
-            int64_pk,
-            row_keys,
-        };
-        self.total_keys += delta.approx_keys();
-        self.deltas.push_back(delta);
-        self.seq
-    }
-
-    /// `true` when the queue has outgrown either cap and the next miss should
-    /// full-rebuild instead of delta-extend.
-    fn over_cap(&self) -> bool {
-        self.deltas.len() > MAX_PENDING_TOMBSTONE_DELTAS
-            || self.total_keys > MAX_PENDING_TOMBSTONE_DELTA_KEYS
-    }
-
-    /// Drop deltas with `seq <= applied_through` from the front — they are
-    /// provably baked into a cache stored with `tombstone_delta_seq >=
-    /// applied_through`, which is the base every future miss extends. Safe under
-    /// concurrent populates because the queue is monotonic and a stale store only
-    /// triggers a (correct) miss-and-recompute, and any delta above
-    /// `applied_through` is retained.
-    fn drain_through(&mut self, applied_through: u64) {
-        while let Some(front) = self.deltas.front() {
-            if front.seq <= applied_through {
-                self.total_keys = self.total_keys.saturating_sub(front.approx_keys());
-                self.deltas.pop_front();
-            } else {
-                break;
-            }
-        }
-    }
-
-    /// Snapshot the deltas with `seq > base_seq` into a single
-    /// [`InlinedDeletionMaps`] (the merged removal to apply to the base entries),
-    /// returning `(removal_map, max_seq_in_queue)`. The max seq is the queue's
-    /// current `seq` (even when no new delta exists), so a cache built from this
-    /// records that it is current through the whole queue.
-    fn removal_above(&self, base_seq: u64) -> (InlinedDeletionMaps, u64) {
-        let mut maps = InlinedDeletionMaps::default();
-        // Deltas are stored seq-ascending (monotonic `push_back`), so the ones
-        // with `seq > base_seq` are a suffix at the back — iterate from the back
-        // and stop at the first `seq <= base_seq` so this is O(new deltas).
-        for delta in self.deltas.iter().rev() {
-            if delta.seq <= base_seq {
-                break;
-            }
-            for &pk in &delta.int64_pk {
-                maps.int64_pk
-                    .entry(pk)
-                    .and_modify(|seq| *seq = (*seq).max(delta.delete_sequence))
-                    .or_insert(delta.delete_sequence);
-            }
-            for key in &delta.row_keys {
-                maps.row_keys
-                    .entry(key.clone())
-                    .and_modify(|seq| *seq = (*seq).max(delta.delete_sequence))
-                    .or_insert(delta.delete_sequence);
-            }
-        }
-        (maps, self.seq)
-    }
-}
-
-#[derive(Default)]
-struct ExtractedPrimaryKeys {
-    int64_pk: Vec<i64>,
-    row_keys: Vec<Box<[u8]>>,
-}
-
-#[derive(Default)]
-struct InlinedDataRewrite {
-    updated_data: Vec<InlinedData>,
-    deleted_inlined_ids: Vec<String>,
-    removed_rows: usize,
-}
-
-impl InlinedDataRewrite {
-    #[must_use]
-    fn is_empty(&self) -> bool {
-        self.updated_data.is_empty() && self.deleted_inlined_ids.is_empty()
-    }
-}
-
-struct InlineAwareDeletionSink {
-    table: CayenneTableProvider,
-    file_sink: CayenneDeletionSink,
-    filters: Vec<Expr>,
-}
-
-struct PkKeysetInvalidatingDeletionSink {
-    table: CayenneTableProvider,
-    inner: Arc<dyn DeletionSink>,
-}
-
-#[async_trait]
-impl DeletionSink for PkKeysetInvalidatingDeletionSink {
-    async fn delete_from(
-        &self,
-    ) -> std::result::Result<u64, Box<dyn std::error::Error + Send + Sync>> {
-        self.table.mark_maintained_aggregates_stale();
-        let deleted = self.inner.delete_from().await?;
-        if deleted > 0 {
-            // Keyset clear-on-delete avoidance (cycle-4 incremental lever).
-            //
-            // This is a FILTER-based DELETE (`DELETE … WHERE <predicate>`), so
-            // the deleted PK set is NOT enumerable at this call site — only the
-            // count is. We therefore cannot surgically `remove` keys from the
-            // Exact keyset here. But for an `Upsert` table we do not need to:
-            // leaving a deleted key STALE-PRESENT in the existence index only
-            // ever produces a redundant key-based delete tombstone on a later
-            // re-insert of that PK, which masks no prior version (none exists)
-            // and is harmless — exactly the false-positive invariant documented
-            // on `PkBloom` (table.rs ~1896-1902) and exercised on the upsert
-            // existence path in `apply_on_conflict_to_batch` (both the Exact arm
-            // at ~6106 and the Bloom arm at ~6159 keep the row and emit at most a
-            // no-op delete). So for upsert tables we SKIP the clear entirely and
-            // keep the stale-superset index — eliminating the O(live-rows)
-            // `load_existing_keyset` cold rebuild the next CDC insert batch would
-            // otherwise pay (measured 277 ms × 244 = 68 s/600 s on `new_order`).
-            //
-            // `DoNothing` tables need an EXACT answer (a stale-present entry would
-            // wrongly DROP a genuinely new row at `apply_on_conflict_to_batch`
-            // ~6105), and their keys are not enumerable on this filter path, so
-            // they keep the conservative full clear and rebuild next batch.
-            // `upsert_bloom_eligible()` is precisely "is this an `Upsert` table".
-            if !self.table.upsert_bloom_eligible() {
-                self.table.clear_cached_pk_keyset();
-            }
-            // Drop the per-file stats `CayenneTableProvider::collect_scan_file_statistics`
-            // caches. Without this, a follow-up `COUNT(*)` (or any other stats-driven
-            // query) is served the row count we computed *before* this delete added
-            // its rows to the position-based deletion vector, so the count is stale —
-            // see `tests/position_based_deletion_test.rs::test_position_based_sequential_deletes`.
-            // (Independent of the keyset: always invalidate so counts stay fresh.)
-            self.table.invalidate_scan_file_statistics();
-        }
-        Ok(deleted)
-    }
-}
-
-#[async_trait]
-impl DeletionSink for InlineAwareDeletionSink {
-    async fn delete_from(
-        &self,
-    ) -> std::result::Result<u64, Box<dyn std::error::Error + Send + Sync>> {
-        let _write_guard = self.table.write_lock.lock().await;
-        self.table.mark_maintained_aggregates_stale();
-
-        let inlined_deleted = self
-            .table
-            .delete_inlined_rows_matching_filters(&self.filters)
-            .await?;
-        let file_deleted = self.file_sink.delete_from().await?;
-
-        let deleted = inlined_deleted.checked_add(file_deleted).ok_or_else(|| {
-            Box::new(datafusion_common::DataFusionError::Execution(
-                "Deleted row count overflowed u64".to_string(),
-            )) as Box<dyn std::error::Error + Send + Sync>
-        })?;
-
-        if deleted > 0 {
-            // Keyset clear-on-delete avoidance (cycle-4 incremental lever) — see
-            // the detailed rationale on `PkKeysetInvalidatingDeletionSink::delete_from`.
-            // This is a FILTER-based DELETE, so the deleted PK set is not in hand
-            // here. For an `Upsert` table a stale-present existence entry only
-            // yields a harmless redundant delete on a later re-insert (the
-            // `PkBloom` false-positive invariant, table.rs ~1896-1902), so we SKIP
-            // the clear and avoid the O(live-rows) `load_existing_keyset` rebuild
-            // the next insert batch would pay. `DoNothing` tables need exactness
-            // (a stale entry would wrongly drop a new row) and keep the full clear.
-            if !self.table.upsert_bloom_eligible() {
-                self.table.clear_cached_pk_keyset();
-            }
-            if file_deleted > 0 && self.table.pk_deletion_strategy.is_position_based() {
-                self.table.clear_scan_file_statistics_cache();
-            }
-        }
-
-        Ok(deleted)
-    }
-}
-
-struct BatchValidationResult {
-    filtered_batch: Option<RecordBatch>,
-    /// Per-file position deletes for located conflict rows: file path -> deleted
-    /// file-local row positions. Empty unless `deletion_mode: position`.
-    delete_specs: Vec<(Arc<str>, Vec<u64>)>,
-    kept_keys: HashSet<OwnedRow>,
-    /// File-backed Int64 PK values being deleted (for `Int64Pk` strategy).
-    deleted_pk_i64: Vec<i64>,
-    /// File-backed row key bytes being deleted (for `RowConverterBased` strategy).
-    deleted_row_keys: Vec<Box<[u8]>>,
-    /// Inlined Int64 PK values being deleted.
-    deleted_inlined_pk_i64: Vec<i64>,
-    /// Inlined row key bytes being deleted.
-    deleted_inlined_row_keys: Vec<Box<[u8]>>,
-}
-
-pub(crate) struct PreparedInsertStream {
-    pub(crate) stream: SendableRecordBatchStream,
-    post_validation: Arc<ParkingMutex<Option<PostValidationState>>>,
-    may_have_on_conflict_deletions: bool,
-}
-
-impl PreparedInsertStream {
-    fn immediate(stream: SendableRecordBatchStream) -> Self {
-        Self {
-            stream,
-            post_validation: Arc::new(ParkingMutex::new(Some(PostValidationState::default()))),
-            may_have_on_conflict_deletions: false,
-        }
-    }
-
-    fn deferred(
-        stream: SendableRecordBatchStream,
-        post_validation: Arc<ParkingMutex<Option<PostValidationState>>>,
-        may_have_on_conflict_deletions: bool,
-    ) -> Self {
-        Self {
-            stream,
-            post_validation,
-            may_have_on_conflict_deletions,
-        }
-    }
-
-    pub(crate) fn post_validation(&self) -> Arc<ParkingMutex<Option<PostValidationState>>> {
-        Arc::clone(&self.post_validation)
-    }
-
-    #[must_use]
-    pub(crate) const fn may_have_on_conflict_deletions(&self) -> bool {
-        self.may_have_on_conflict_deletions
-    }
-}
-
-/// Prepared sharded insert (the N>1 in-memory CDC path, §2.3c/§5 Phase 3).
-///
-/// Unlike [`PreparedInsertStream`], the stream is the RAW decoded upstream — NOT
-/// wrapped in an [`OnConflictValidationStream`] — because the sharded path runs
-/// the on-conflict validation PER SHARD after splitting each batch by
-/// [`shard_of_pk`]. The pre-apply existence snapshot is carried as a
-/// [`ShardedPkIndex`] (one existence view per shard), so a shard validates only
-/// against its own keys (a key's whole history is confined to one shard, §3.1).
-///
-/// The single-shard (`n == 1`) path never uses this — it takes the existing
-/// [`Self::prepare_stream_for_insert`] flow unchanged, keeping N=1 byte-identical.
-pub(crate) struct PreparedShardedInsertStream {
-    /// Raw decoded upstream stream (no validation wrapper).
-    pub(crate) stream: SendableRecordBatchStream,
-    /// PK column indices (in the stream's schema) for the shard split + validate.
-    pub(crate) pk_indices: Vec<usize>,
-    /// The PK existence converter, reused across the apply's batches.
-    pub(crate) converter: RowConverter,
-    /// Pre-apply per-shard existence snapshot. `None` when conflict detection is
-    /// off (`pk_conflict_detection: none`) or the source trusts uniqueness — the
-    /// drain then appends every row with no validation, mirroring the immediate
-    /// path.
-    pub(crate) sharded_index: Option<ShardedPkIndex>,
-    /// The resolved on-conflict behavior for this table.
-    pub(crate) on_conflict: OnConflict,
-}
-
-#[derive(Default)]
-pub(crate) struct OnConflictDeletions {
-    /// Per-file position deletes: file path -> deleted file-local row positions.
-    /// Routed to the position-vector write path; empty unless `deletion_mode: position`.
-    pub(crate) delete_specs: HashMap<Arc<str>, Vec<u64>>,
-    /// Deleted file-backed Int64 PK values (for `Int64Pk` strategy).
-    pub(crate) deleted_pk_i64: Vec<i64>,
-    /// Deleted file-backed row keys (for `RowConverterBased` strategy).
-    pub(crate) deleted_row_keys: Vec<Box<[u8]>>,
-    /// Deleted inlined Int64 PK values.
-    pub(crate) deleted_inlined_pk_i64: Vec<i64>,
-    /// Deleted inlined row keys.
-    pub(crate) deleted_inlined_row_keys: Vec<Box<[u8]>>,
-}
-
-impl OnConflictDeletions {
-    /// Total number of existing rows superseded (deleted) by this upsert across
-    /// all strategies, each superseded row counted exactly ONCE. Used to net the
-    /// live row count: an upsert that replaces N existing rows adds
-    /// `inserted - N` live rows, not `inserted`.
-    ///
-    /// Counting a row once requires accounting for the deliberate dual encoding
-    /// of `FilePositioned` conflicts under the `Int64Pk`/`RowConverterBased`
-    /// strategies: `apply_on_conflict_to_batch` pushes BOTH a per-file position
-    /// delete (`delete_specs`, masked inside the Vortex scan) AND a key-based
-    /// twin (`deleted_pk_i64`/`deleted_row_keys`) covering the paths position
-    /// vectors never reach (e.g. the in-memory CDC tier's merge-on-read
-    /// tombstones, built from the key lists only — see `build_mem_tombstones`).
-    /// Summing all five collections would count those rows twice. The key-based
-    /// total already counts every dual-encoded row once, so position deletes
-    /// contribute only the EXCESS beyond the key-based total — exactly the
-    /// conflicts with no key twin (the `PositionBased` strategy, whose key
-    /// lists stay empty).
-    pub(crate) fn total_superseded(&self) -> usize {
-        let position_deletes = self.delete_specs.values().map(Vec::len).sum::<usize>();
-        let file_key_deletes = self.deleted_pk_i64.len() + self.deleted_row_keys.len();
-        file_key_deletes
-            + position_deletes.saturating_sub(file_key_deletes)
-            + self.deleted_inlined_pk_i64.len()
-            + self.deleted_inlined_row_keys.len()
-    }
-}
-
-/// `apply_on_conflict_deletions` performs all durable deletion-vector and
-/// inlined-data rewrite I/O but returns the computed in-memory visibility
-/// updates instead of storing them, so the stores can be committed
-/// synchronously — together with the protected snapshot publish — under a
-/// single `scan_state_lock.write()`. This keeps the scan-excluding guard held
-/// for microseconds rather than across durable writes.
-pub(crate) struct OnConflictUpdate {
-    deletion_update: OnConflictDeletionUpdate,
-    /// Set when `apply_on_conflict_deletions` durably wrote an inline tombstone
-    /// (via `add_inlined_delete`) to hide the prior inline copy of an upserted
-    /// PK. Publishing must then bump `inlined_generation` (under
-    /// `scan_state_lock`) so the next scan rebuilds the inline view and observes
-    /// the tombstone atomically with the deletion-cache + protected-snapshot
-    /// flips. A tombstone only adds a hide-marker — it appends no inline DATA
-    /// rows and changes no row count — so unlike the previous inline-rewrite
-    /// path there is no visibility watermark to advance.
-    inlined_tombstone_written: bool,
-}
-
-impl OnConflictUpdate {
-    fn none() -> Self {
-        Self {
-            deletion_update: OnConflictDeletionUpdate::None,
-            inlined_tombstone_written: false,
-        }
-    }
-
-    fn from_deletion_update(deletion_update: OnConflictDeletionUpdate) -> Self {
-        Self {
-            deletion_update,
-            inlined_tombstone_written: false,
-        }
-    }
-
-    fn with_inlined_tombstone_written(mut self, written: bool) -> Self {
-        self.inlined_tombstone_written = written;
-        self
-    }
-
-    fn is_empty(&self) -> bool {
-        matches!(self.deletion_update, OnConflictDeletionUpdate::None)
-            && !self.inlined_tombstone_written
-    }
-}
-
-enum OnConflictDeletionUpdate {
-    /// No key-based deletion-cache change (pure position deletes or no deletes).
-    None,
-    /// New `Int64Pk` deletion snapshot to publish.
-    Int64Pk(Arc<Int64PkDeletionSnapshot>),
-    /// New `RowConverterBased` deletion snapshot to publish.
-    RowConverter(Arc<RowConverterDeletionSnapshot>),
-}
-
-#[derive(Clone)]
-enum PkDeletionSnapshot {
-    PositionBased,
-    Int64Pk { tombstones: Arc<DeletionIndex> },
-    RowConverterBased { tombstones: Arc<KeyDeletionIndex> },
-}
-
-/// One memoized merged (file ∪ mem-tier) deletion snapshot for the scan path.
-/// See the `merged_scan_deletions` field docs for the key's torn-state proof.
-struct MergedScanDeletions {
-    /// `Arc::as_ptr` identity of the FILE-side index the merge was built from.
-    file_index_ptr: usize,
-    /// [`crate::provider::mem_tier::MemTier::version`] of the tier merged in.
-    tier_version: u64,
-    /// Structural epoch observed when the memo was built.
-    structural_epoch: u64,
-    merged: PkDeletionSnapshot,
-}
-
-/// PK membership of a mem-tier checkpoint's flushed corpus (the visible inline +
-/// tier rows being encoded into the new snapshot), keyed by deletion strategy.
-/// Splits the tier's tombstones at durable-commit time: a tombstoned key WITH a
-/// corpus row was re-inserted after its delete and must carry the reinsert
-/// marker so the flushed row stays visible; a tombstoned key WITHOUT one is a
-/// pure delete and must be committed delete-only (a phantom reinsert marker
-/// would resurrect older durable copies on the main scan path). See
-/// `commit_mem_tier_checkpoint_metadata`.
-enum CheckpointCorpusKeys {
-    Int64(HashSet<i64>),
-    RowKeys(HashSet<Box<[u8]>>),
-    None,
-}
-
-impl CheckpointCorpusKeys {
-    fn contains_i64(&self, pk: i64) -> bool {
-        matches!(self, Self::Int64(keys) if keys.contains(&pk))
-    }
-
-    fn contains_row_key(&self, key: &[u8]) -> bool {
-        matches!(self, Self::RowKeys(keys) if keys.contains(key))
-    }
-}
-
-impl PkDeletionSnapshot {
-    /// Identity of the inner index allocation, for the merged-scan memo key.
-    /// `None` for `PositionBased` (no index; the merge is a no-op there anyway).
-    fn index_ptr(&self) -> Option<usize> {
-        match self {
-            Self::PositionBased => None,
-            Self::Int64Pk { tombstones } => Some(Arc::as_ptr(tombstones) as usize),
-            Self::RowConverterBased { tombstones } => Some(Arc::as_ptr(tombstones) as usize),
-        }
-    }
-
-    fn has_deletions(&self) -> bool {
-        match self {
-            Self::PositionBased => false,
-            Self::Int64Pk { tombstones } => tombstones.has_deletions(),
-            Self::RowConverterBased { tombstones } => tombstones.has_deletions(),
-        }
-    }
-
-    /// Count of keys with a live deletion in this snapshot — the per-query
-    /// merge-on-read probe scales with this, so the seq-prefix bake is triggered
-    /// on it (see `BAKE_DELETION_INDEX_TRIGGER`). `0` for `PositionBased` (those
-    /// tombstones are file-scoped, never seq-tagged, and are out of the bake's
-    /// scope).
-    fn delete_len(&self) -> usize {
-        match self {
-            Self::PositionBased => 0,
-            Self::Int64Pk { tombstones } => tombstones.delete_len(),
-            Self::RowConverterBased { tombstones } => tombstones.delete_len(),
-        }
-    }
-
-    /// Extend this snapshot by ONE append's tombstone delta — O(delta), the
-    /// persistent-index extend. Used by the append path to keep the
-    /// merged-scan-deletions memo CURRENT in lockstep (under sustained CDC the
-    /// version-keyed memo can otherwise never hit: every append bumps the tier
-    /// version, and the O(tier) rebuild per scan was the churn-coupled collapse
-    /// the `mem_tier_join_shapes` live lanes measure at 175-247x).
-    fn extended_by_delta(&self, delta: &crate::provider::mem_tier::SegmentTombstones) -> Self {
-        // Every key in `delta` shares one reserved delete sequence (one CDC
-        // apply), so the memo extend applies that single scalar to all of them —
-        // identical to extending by a per-key map whose values are all that seq.
-        let seq = delta.delete_sequence();
-        match self {
-            Self::PositionBased => Self::PositionBased,
-            Self::Int64Pk { tombstones } => {
-                if delta.is_int64_empty() {
-                    return self.clone();
-                }
-                let updated = tombstones.extend_max_deletes(delta.int64_keys().map(|pk| (pk, seq)));
-                Self::Int64Pk {
-                    tombstones: Arc::new(updated),
-                }
-            }
-            Self::RowConverterBased { tombstones } => {
-                if delta.is_row_keys_empty() {
-                    return self.clone();
-                }
-                let updated = tombstones.extend_max_deletes(delta.row_keys().map(|key| (key, seq)));
-                Self::RowConverterBased {
-                    tombstones: Arc::new(updated),
-                }
-            }
-        }
-    }
-
-    /// Merge a mem-tier tombstone map into this file-side snapshot — the scan
-    /// path passes the cross-shard UNION (`ShardedMemTier::union_tombstones`). At
-    /// N==1 the union is shard 0's tombstone map.
-    fn with_mem_tier_tombstones_map(
-        &self,
-        tombstones: &crate::provider::mem_tier::InMemTombstones,
-    ) -> Self {
-        match self {
-            Self::PositionBased => Self::PositionBased,
-            Self::Int64Pk { tombstones: file } => {
-                if tombstones.int64_pk.is_empty() {
-                    return self.clone();
-                }
-
-                let updated = file.extend_max_deletes(
-                    tombstones
-                        .int64_pk
-                        .iter()
-                        .map(|(&pk, &delete_sequence)| (pk, delete_sequence)),
-                );
-                Self::Int64Pk {
-                    tombstones: Arc::new(updated),
-                }
-            }
-            Self::RowConverterBased { tombstones: file } => {
-                if tombstones.row_keys.is_empty() {
-                    return self.clone();
-                }
-
-                let updated = file.extend_max_deletes(
-                    tombstones
-                        .row_keys
-                        .iter()
-                        .map(|(key, &delete_sequence)| (key.as_ref(), delete_sequence)),
-                );
-                Self::RowConverterBased {
-                    tombstones: Arc::new(updated),
-                }
-            }
-        }
-    }
-
-    /// The highest delete sequence reflected in THIS coherent snapshot.
-    ///
-    /// Because every deletion update builds an extended index followed by a single
-    /// atomic `deletion_snapshot.store(...)`, a snapshot obtained from one load
-    /// reflects all deletions up to this value. Deriving the compaction fence
-    /// from the same snapshot (rather than a second, independent
-    /// `get_max_delete_sequence()` load) is required for correctness — see
-    /// `compact_protected_snapshots_subset`.
-    fn max_sequence_number(&self) -> Option<i64> {
-        match self {
-            Self::PositionBased => None,
-            Self::Int64Pk { tombstones } => tombstones.max_sequence_number(),
-            Self::RowConverterBased { tombstones } => tombstones.max_sequence_number(),
-        }
-    }
-}
-
-fn pk_deletion_snapshot_for_strategy(strategy: &PkDeletionStrategyWithCache) -> PkDeletionSnapshot {
-    match strategy {
-        PkDeletionStrategyWithCache::PositionBased { .. } => PkDeletionSnapshot::PositionBased,
-        PkDeletionStrategyWithCache::Int64Pk {
-            deletion_snapshot, ..
-        } => {
-            let snapshot = deletion_snapshot.load_full();
-            PkDeletionSnapshot::Int64Pk {
-                tombstones: Arc::clone(&snapshot.tombstones),
-            }
-        }
-        PkDeletionStrategyWithCache::RowConverterBased {
-            deletion_snapshot, ..
-        } => {
-            let snapshot = deletion_snapshot.load_full();
-            PkDeletionSnapshot::RowConverterBased {
-                tombstones: Arc::clone(&snapshot.tombstones),
-            }
-        }
-    }
-}
-
-struct ProtectedSnapshotScan<'a> {
-    state: &'a dyn Session,
-    projection: Option<&'a Vec<usize>>,
-    filters: &'a [Expr],
-    limit: Option<usize>,
-    pk_indices_in_projection: &'a [usize],
-    protected_snapshots: Arc<HashMap<String, i64>>,
-    deletion_snapshot: &'a PkDeletionSnapshot,
-    /// View-typed read schema so protected-snapshot scans match the main file
-    /// scan in the union (see `viewify_read_schema`).
-    read_schema: SchemaRef,
-}
-
-struct PreparedProtectedSnapshotUpdate {
-    expected: Arc<HashMap<String, i64>>,
-    updated: Arc<HashMap<String, i64>>,
+pub(crate) fn record_cayenne_write_phase(table_name: &str, phase: &'static str, start: Instant) {
+    let elapsed = start.elapsed();
+    tracing::debug!(
+        table = table_name,
+        phase,
+        duration_ms = elapsed.as_millis(),
+        "Cayenne write phase completed"
+    );
+    telemetry::track_cayenne_write_phase_duration(
+        elapsed,
+        &[
+            telemetry::KeyValue::new("table", table_name.to_string()),
+            telemetry::KeyValue::new("phase", phase),
+        ],
+    );
 }
 
 /// Tier-0 size ceiling for protected-snapshot leveling, in bytes (8 MiB).
@@ -3809,247 +1773,6 @@ const fn subset_merge_write_shape(
             session_target_partitions
         };
         (cap, Some(total_input_bytes))
-    }
-}
-
-#[derive(Default)]
-pub(crate) struct PostValidationState {
-    pub(crate) on_conflict_deletions: OnConflictDeletions,
-    pub(crate) validated_keys: HashSet<OwnedRow>,
-}
-
-/// Aggregate result of one sharded in-memory CDC apply
-/// ([`CayenneTableProvider::validate_and_append_sharded`]).
-pub(crate) struct ShardedApplyResult {
-    /// The single shared per-apply epoch (§3.4 Fix 1), stamped IDENTICALLY on
-    /// every shard's segment this apply — NOT a max across shards. Used for the
-    /// slot-deferral receipt; the all-shards-atomic Phase 5 checkpoint reconciles
-    /// durable coverage on this one axis.
-    pub(crate) epoch: u64,
-    /// Existing rows superseded across all shards (each counted once), for the
-    /// live-row-count net.
-    pub(crate) superseded: u64,
-    /// Union of every shard's on-conflict deletions (keys disjoint across shards).
-    pub(crate) on_conflict_deletions: OnConflictDeletions,
-    /// Union of every shard's validated (kept) keys.
-    pub(crate) validated_keys: HashSet<OwnedRow>,
-}
-
-struct OnConflictContext<'a> {
-    pk_indices: &'a [usize],
-    converter: &'a RowConverter,
-    on_conflict: &'a OnConflict,
-    upsert_options: &'a UpsertOptions,
-    existing: PkExistenceRef<'a>,
-    incoming_keys: &'a HashSet<OwnedRow>,
-}
-
-struct OnConflictValidationStream {
-    table: CayenneTableProvider,
-    inner: SendableRecordBatchStream,
-    schema: SchemaRef,
-    pk_indices: Vec<usize>,
-    converter: RowConverter,
-    on_conflict: OnConflict,
-    upsert_options: UpsertOptions,
-    existing_keys: Option<CachedPkIndex>,
-    incoming_keys: HashSet<OwnedRow>,
-    kept_keys: HashSet<OwnedRow>,
-    delete_specs: HashMap<Arc<str>, Vec<u64>>,
-    deleted_pk_i64: Vec<i64>,
-    deleted_row_keys: Vec<Box<[u8]>>,
-    deleted_inlined_pk_i64: Vec<i64>,
-    deleted_inlined_row_keys: Vec<Box<[u8]>>,
-    post_validation: Arc<ParkingMutex<Option<PostValidationState>>>,
-    finalized: bool,
-}
-
-impl OnConflictValidationStream {
-    fn new(
-        table: CayenneTableProvider,
-        inner: SendableRecordBatchStream,
-        pk_indices: Vec<usize>,
-        converter: RowConverter,
-        existing_keys: CachedPkIndex,
-        on_conflict: OnConflict,
-        post_validation: Arc<ParkingMutex<Option<PostValidationState>>>,
-    ) -> Self {
-        let schema = inner.schema();
-        let upsert_options = on_conflict.get_upsert_options();
-        Self {
-            table,
-            inner,
-            schema,
-            pk_indices,
-            converter,
-            on_conflict,
-            upsert_options,
-            existing_keys: Some(existing_keys),
-            incoming_keys: HashSet::with_capacity(1024),
-            kept_keys: HashSet::with_capacity(1024),
-            delete_specs: HashMap::new(),
-            deleted_pk_i64: Vec::new(),
-            deleted_row_keys: Vec::new(),
-            deleted_inlined_pk_i64: Vec::new(),
-            deleted_inlined_row_keys: Vec::new(),
-            post_validation,
-            finalized: false,
-        }
-    }
-
-    fn process_batch(
-        &mut self,
-        batch: RecordBatch,
-    ) -> datafusion_common::Result<Option<RecordBatch>> {
-        if batch.num_rows() == 0 {
-            return Ok(None);
-        }
-
-        let existing_index = self.existing_keys.as_ref().ok_or_else(|| {
-            datafusion_common::DataFusionError::Internal(format!(
-                "On-conflict validation for table {} was polled after finalization",
-                self.table.table_name()
-            ))
-        })?;
-        let existing = match existing_index {
-            CachedPkIndex::Exact(keyset) => PkExistenceRef::Exact(&keyset.keys),
-            CachedPkIndex::Bloom(bloom) => PkExistenceRef::Bloom(bloom),
-        };
-
-        let mut ctx = OnConflictContext {
-            pk_indices: &self.pk_indices,
-            converter: &self.converter,
-            on_conflict: &self.on_conflict,
-            upsert_options: &self.upsert_options,
-            existing,
-            incoming_keys: &self.incoming_keys,
-        };
-
-        let validation_start = Instant::now();
-        let validation_result = self.table.apply_on_conflict_to_batch(batch, &mut ctx);
-        record_cayenne_write_phase(
-            self.table.table_name(),
-            "apply_on_conflict_validation",
-            validation_start,
-        );
-
-        let BatchValidationResult {
-            filtered_batch,
-            delete_specs: batch_delete_specs,
-            kept_keys,
-            deleted_pk_i64,
-            deleted_row_keys,
-            deleted_inlined_pk_i64,
-            deleted_inlined_row_keys,
-        } = validation_result.map_err(datafusion_common::DataFusionError::from)?;
-
-        for (file_path, rows) in batch_delete_specs {
-            self.delete_specs.entry(file_path).or_default().extend(rows);
-        }
-
-        self.deleted_pk_i64.extend(deleted_pk_i64);
-        self.deleted_row_keys.extend(deleted_row_keys);
-        self.deleted_inlined_pk_i64.extend(deleted_inlined_pk_i64);
-        self.deleted_inlined_row_keys
-            .extend(deleted_inlined_row_keys);
-
-        self.incoming_keys.extend(kept_keys.iter().cloned());
-        self.kept_keys.extend(kept_keys);
-
-        Ok(filtered_batch)
-    }
-
-    fn store_existing_keyset(&mut self) {
-        if let Some(existing_keys) = self.existing_keys.take() {
-            self.table.store_cached_pk_index(existing_keys);
-        }
-    }
-
-    fn finish_success(&mut self) {
-        if self.finalized {
-            return;
-        }
-
-        self.store_existing_keyset();
-        let post_validation = PostValidationState {
-            on_conflict_deletions: OnConflictDeletions {
-                delete_specs: std::mem::take(&mut self.delete_specs),
-                deleted_pk_i64: std::mem::take(&mut self.deleted_pk_i64),
-                deleted_row_keys: std::mem::take(&mut self.deleted_row_keys),
-                deleted_inlined_pk_i64: std::mem::take(&mut self.deleted_inlined_pk_i64),
-                deleted_inlined_row_keys: std::mem::take(&mut self.deleted_inlined_row_keys),
-            },
-            validated_keys: std::mem::take(&mut self.kept_keys),
-        };
-        *self.post_validation.lock() = Some(post_validation);
-        self.finalized = true;
-    }
-
-    fn finish_after_error(&mut self) {
-        if self.finalized {
-            return;
-        }
-
-        self.store_existing_keyset();
-        self.finalized = true;
-    }
-}
-
-pub(crate) fn record_cayenne_write_phase(table_name: &str, phase: &'static str, start: Instant) {
-    let elapsed = start.elapsed();
-    tracing::debug!(
-        table = table_name,
-        phase,
-        duration_ms = elapsed.as_millis(),
-        "Cayenne write phase completed"
-    );
-    telemetry::track_cayenne_write_phase_duration(
-        elapsed,
-        &[
-            telemetry::KeyValue::new("table", table_name.to_string()),
-            telemetry::KeyValue::new("phase", phase),
-        ],
-    );
-}
-
-impl Unpin for OnConflictValidationStream {}
-
-impl futures::Stream for OnConflictValidationStream {
-    type Item = datafusion_common::Result<RecordBatch>;
-
-    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        let this = self.get_mut();
-        if this.finalized {
-            return Poll::Ready(None);
-        }
-
-        loop {
-            match this.inner.as_mut().poll_next(cx) {
-                Poll::Pending => return Poll::Pending,
-                Poll::Ready(None) => {
-                    this.finish_success();
-                    return Poll::Ready(None);
-                }
-                Poll::Ready(Some(Err(err))) => {
-                    this.finish_after_error();
-                    return Poll::Ready(Some(Err(err)));
-                }
-                Poll::Ready(Some(Ok(batch))) => match this.process_batch(batch) {
-                    Ok(Some(filtered_batch)) => return Poll::Ready(Some(Ok(filtered_batch))),
-                    Ok(None) => {}
-                    Err(err) => {
-                        this.finish_after_error();
-                        return Poll::Ready(Some(Err(err)));
-                    }
-                },
-            }
-        }
-    }
-}
-
-impl RecordBatchStream for OnConflictValidationStream {
-    fn schema(&self) -> SchemaRef {
-        Arc::clone(&self.schema)
     }
 }
 
@@ -7458,7 +5181,7 @@ impl CayenneTableProvider {
         cache.raw = None;
     }
 
-    fn clear_scan_file_statistics_cache(&self) {
+    pub(crate) fn clear_scan_file_statistics_cache(&self) {
         self.scan_file_statistics.clear();
     }
 
@@ -7470,7 +5193,7 @@ impl CayenneTableProvider {
     /// its exact keyset exceeds the budget. Only safe for `Upsert`: a bloom false
     /// positive yields a harmless redundant delete under upsert, but would wrongly
     /// drop a genuinely new row under `DoNothing` semantics.
-    fn upsert_bloom_eligible(&self) -> bool {
+    pub(crate) fn upsert_bloom_eligible(&self) -> bool {
         matches!(self.table_metadata.on_conflict, Some(OnConflict::Upsert(_)))
     }
 
@@ -7483,7 +5206,7 @@ impl CayenneTableProvider {
         bloom
     }
 
-    fn store_cached_pk_index(&self, index: CachedPkIndex) {
+    pub(crate) fn store_cached_pk_index(&self, index: CachedPkIndex) {
         let max_bytes = self.context.pk_keyset_cache_max_bytes();
         let to_store = match index {
             CachedPkIndex::Exact(keyset) if keyset.approx_bytes > max_bytes => {
@@ -8688,7 +6411,7 @@ impl CayenneTableProvider {
         Ok(ShardedPkIndex::from_exact(keyset, n))
     }
 
-    fn apply_on_conflict_to_batch(
+    pub(crate) fn apply_on_conflict_to_batch(
         &self,
         batch: RecordBatch,
         ctx: &mut OnConflictContext<'_>,
@@ -13189,7 +10912,7 @@ impl CayenneTableProvider {
                     tracing::warn!(
                         target: "cayenne::compaction",
                         table = self.table_metadata.table_name.as_str(),
-                        snapshot_id = snapshot_id.as_str(),
+                        snapshot_id = snapshot_id,
                         "Failed to size protected-snapshot merge input for tiering: {e}"
                     );
                     // Treat as tier 0 (unknown/small) so it stays a merge
@@ -16811,9 +14534,28 @@ impl CayenneTableProvider {
                     .mem_tier_apply_epoch
                     .fetch_add(1, std::sync::atomic::Ordering::SeqCst));
             };
-            return self
-                .append_to_mem_tier(Vec::new(), &deletions, total_incoming_bytes, 0)
-                .await;
+            // Stamp the shared per-apply slot-ack epoch even on this shard-0 fallback:
+            // a `source_position = None` append on a sharded tier (N>1) would make the
+            // checkpoint's MAX(source_position) watermark skip it → the deferred source
+            // slot stalls (the mixed-axis N>1 bug). Route through `append_to_shard` with
+            // the epoch so this stays on the single `apply_epoch` axis like every other
+            // N>1 apply, and return that epoch as the deferral receipt.
+            let apply_epoch = self
+                .mem_tier_apply_epoch
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let no_keys: HashSet<OwnedRow> = HashSet::new();
+            self.append_to_shard(
+                0,
+                Vec::new(),
+                &deletions,
+                total_incoming_bytes,
+                0,
+                Some(apply_epoch),
+                &no_keys,
+                None,
+            )
+            .await?;
+            return Ok(apply_epoch);
         };
 
         // Build each shard's tombstone-only `OnConflictDeletions` from its
@@ -17159,6 +14901,19 @@ impl CayenneTableProvider {
         // sharded path (a known limit of the opt-in N>1 path).
         maintained_aggregate_delete_rows: Option<&RecordBatch>,
     ) -> Result<u64> {
+        // INVARIANT: at N>1 every mem-tier append MUST carry a `source_position` (the
+        // per-apply `apply_epoch` slot-ack axis). A `None`-stamped append on a sharded
+        // tier is invisible to the checkpoint's MAX(source_position) watermark, which
+        // stalls the deferred source slot (the N>1 WAL-drain bug). `None` is valid ONLY
+        // at N==1, where the single shard keeps `MemTier::epoch` as the slot-ack
+        // currency. This guards against a future serial-at-N>1 caller silently
+        // re-opening that hole.
+        debug_assert!(
+            source_position.is_some() || self.mem_tier.shard_count() == 1,
+            "append_to_shard at N>1 (shard_count={}) requires source_position (apply_epoch); \
+             a None-stamped append stalls the source slot",
+            self.mem_tier.shard_count()
+        );
         let incoming_rows: u64 = batches
             .iter()
             .map(|b| b.num_rows() as u64)
@@ -17435,6 +15190,7 @@ impl CayenneTableProvider {
     }
 
     async fn checkpoint_mem_tier_inner(&self, acquire_write_lock_for_capture: bool) -> Result<u64> {
+        let checkpoint_start = Instant::now();
         // Capture the corpus to flush AND reserve this checkpoint's
         // snapshot_sequence ATOMICALLY under ALL shard `mem_tier_publish_locks`
         // (index order, deadlock-free), so the capture+reservation is mutually
@@ -17461,6 +15217,16 @@ impl CayenneTableProvider {
         // apply and shard B WITHOUT it — a torn cut whose acked source position
         // covers rows never captured.
         let n = self.mem_tier.shard_count();
+        let capture_start = Instant::now();
+        // LOAD-BEARING: at N>1 `write_lock` is held across the WHOLE checkpoint
+        // (capture + off-fence encode + commit + clear), NOT just the capture.
+        // Scoping it to the capture alone (releasing before the encode) DEADLOCKED
+        // under sustained N>1 load — a concurrent apply racing the checkpoint's clear
+        // hung spiced after ~57 checkpoints in the SF-100 N=4 run (20-min log silence,
+        // health endpoint dead). So this serialization is required for deadlock-safety.
+        // It does NOT cause the WAL-drain stall: with this hold in place, checkpoints
+        // still fire ~57× yet the source slot does not advance — the real stall is
+        // downstream in the slot-ack watermark (under investigation), not here.
         let _capture_write_guard = if acquire_write_lock_for_capture && n > 1 {
             Some(self.write_lock.lock().await)
         } else {
@@ -17549,6 +15315,18 @@ impl CayenneTableProvider {
                 seq,
             )
         };
+        // The all-shards-atomic capture window: the per-shard snapshot load +
+        // sequence reservation under the publish locks. At N>1 `write_lock` is held
+        // from before this span through the WHOLE checkpoint (capture + encode +
+        // commit — see the LOAD-BEARING note above; the encode is NOT off-write_lock
+        // here), so this metric isolates the CAPTURE portion of that hold. The encode
+        // portion is `mem_tier_checkpoint` (total) minus this; comparing the two
+        // localizes a per-checkpoint apply-stall to the capture vs the encode.
+        record_cayenne_write_phase(
+            &self.table_metadata.table_name,
+            "mem_tier_checkpoint_capture",
+            capture_start,
+        );
         // Emptiness must be judged on the REAL captured shard snapshots, not the
         // synthetic union view: `union_snapshot_view` carries the cross-shard
         // tombstone union + the summed byte/row counts but ALWAYS has empty
@@ -17655,6 +15433,11 @@ impl CayenneTableProvider {
                 )
                 .await?;
             }
+            record_cayenne_write_phase(
+                &self.table_metadata.table_name,
+                "mem_tier_checkpoint",
+                checkpoint_start,
+            );
             self.fire_slot_advancer(flushed_epoch).await;
             return Ok(0);
         }
@@ -17849,6 +15632,11 @@ impl CayenneTableProvider {
         self.persist_table_stats(&stats, RowCountUpdate::Unchanged)
             .await;
 
+        record_cayenne_write_phase(
+            &self.table_metadata.table_name,
+            "mem_tier_checkpoint",
+            checkpoint_start,
+        );
         // ONLY NOW — after the Vortex file + metastore pointer are durable — tell
         // the runtime it may advance the source slot to cover this epoch.
         self.fire_slot_advancer(flushed_epoch).await;
@@ -17954,6 +15742,19 @@ impl CayenneTableProvider {
     /// up (memory mode). A no-op in file mode / when the runtime did not install
     /// a handle.
     async fn fire_slot_advancer(&self, durable_epoch: u64) {
+        // Observability: emit the durable watermark alongside the live apply-epoch
+        // counter so `cayenne_mem_tier_{durable,apply}_epoch` expose the slot-ack
+        // gap. A gap that GROWS while checkpoints keep firing is a stuck watermark
+        // (the N>1 WAL-drain stall) — vs the trigger never firing (the tick counter).
+        telemetry::track_cayenne_mem_tier_epoch(
+            self.mem_tier_apply_epoch
+                .load(std::sync::atomic::Ordering::Relaxed),
+            durable_epoch,
+            &[telemetry::KeyValue::new(
+                "table",
+                self.table_metadata.table_name.clone(),
+            )],
+        );
         let advancer = self.slot_advancer.lock().clone();
         if let Some(advancer) = advancer {
             advancer.on_checkpoint_durable(durable_epoch).await;
@@ -18541,7 +16342,7 @@ impl CayenneTableProvider {
         Ok(())
     }
 
-    async fn delete_inlined_rows_matching_filters(
+    pub(crate) async fn delete_inlined_rows_matching_filters(
         &self,
         filters: &[Expr],
     ) -> datafusion_common::Result<u64> {
@@ -21396,6 +19197,7 @@ impl CayenneTableProvider {
             Arc::clone(&self.catalog),
             Arc::clone(&self.protected_snapshots),
             self.table_metadata.table_id.clone(),
+            self.clone_for_write(),
             self.table_metadata.path.clone(),
             Arc::clone(self.context.runtime_env()),
             Arc::clone(&self.write_lock),
@@ -21870,9 +19672,25 @@ impl CayenneTableProvider {
 #[async_trait::async_trait]
 impl super::compaction::MemTierCheckpointRunner for CayenneTableProvider {
     async fn run_mem_tier_checkpoint_tick(&self) {
+        // Background tick OUTCOME telemetry (`cayenne_mem_tier_checkpoint_tick_total`):
+        // attributes a stalled deferred slot ack to the trigger path vs the checkpoint
+        // body. A flat-zero `fired` under a growing WAL backlog is the smoking gun the
+        // N>1 sharded tier diagnosis lacked (no checkpoint-fire metric existed).
+        let tick_table = self.table_metadata.table_name.clone();
+        let emit_tick = |outcome: &'static str| {
+            telemetry::track_cayenne_mem_tier_checkpoint_tick(&[
+                telemetry::KeyValue::new("table", tick_table.clone()),
+                telemetry::KeyValue::new("outcome", outcome),
+            ]);
+        };
         // Only memory-mode tables that the runtime has armed have a deferred
         // slot ack to advance; everything else has nothing to flush here.
-        if !self.is_cdc_memory_mode() || !self.has_slot_advancer() {
+        if !self.is_cdc_memory_mode() {
+            emit_tick("not_memory_mode");
+            return;
+        }
+        if !self.has_slot_advancer() {
+            emit_tick("no_advancer");
             return;
         }
         // Cheap lock-free early-out: skip taking the checkpoint lock on an idle
@@ -21884,6 +19702,7 @@ impl super::compaction::MemTierCheckpointRunner for CayenneTableProvider {
             // checkpoint is always all-shards-atomic (§3.4 Fix 2), so the trigger
             // is the aggregate. At N==1 these are exactly shard 0's bytes/age.
             if self.mem_tier.is_empty() {
+                emit_tick("skipped_empty");
                 return;
             }
             // Churn gate: each durable checkpoint costs a new snapshot dir,
@@ -21896,14 +19715,33 @@ impl super::compaction::MemTierCheckpointRunner for CayenneTableProvider {
             // deferred slot ack and crash-replay window bounded; freshness is
             // unaffected — RAM rows are query-visible immediately on append).
             // The write-path cap spill and explicit checkpoints bypass this.
+            // Under CRITICAL memory pressure, bypass the churn gate and force an
+            // immediate drain: shrinking the mem-tier cap (what the controller
+            // does) does NOT evict already-resident bytes, so this tick is what
+            // actually releases the off-pool tier back to the host. `mem_pressure`
+            // is refreshed ~every 1s by the controller's `on_background_tick`
+            // (`observe_environment`); `None` (non-Linux / no budget) leaves the
+            // churn gate fully intact.
+            let mem_critical = self
+                .context
+                .mem_pressure()
+                .is_some_and(|p| p >= super::tuning::MEM_PRESSURE_CRITICAL);
+            if mem_critical {
+                tracing::debug!(
+                    target: "cayenne::mem_tier",
+                    table = %self.table_metadata.table_name,
+                    "Critical memory pressure: forcing a mem-tier checkpoint (bypassing the churn gate) to release resident RAM"
+                );
+            }
             let min_flush = self
                 .table_metadata
                 .vortex_config
                 .cdc_mem_tier_min_flush_bytes;
-            if min_flush > 0 {
+            if min_flush > 0 && !mem_critical {
                 let size_ready =
                     i64::try_from(self.mem_tier.total_bytes()).unwrap_or(i64::MAX) >= min_flush;
                 if !size_ready && !self.mem_tier_age_cap_reached_whole_tier() {
+                    emit_tick("skipped_gate");
                     return;
                 }
             }
@@ -21920,11 +19758,14 @@ impl super::compaction::MemTierCheckpointRunner for CayenneTableProvider {
             // deferred committers stay queued and the next tick retries; surface
             // it as a warning rather than flipping refresh status from a
             // background task.
+            emit_tick("failed");
             tracing::warn!(
                 target: "cayenne::mem_tier",
                 table = %self.table_metadata.table_name,
                 "Periodic mem-tier checkpoint failed (deferred slot ack not advanced; will retry next tick): {e}"
             );
+        } else {
+            emit_tick("fired");
         }
     }
 
@@ -21938,6 +19779,7 @@ mod tests {
     use crate::CayenneCatalog;
     use crate::metadata::VortexConfig;
     use crate::provider::compaction::{CompactionRunner, MemTierCheckpointRunner};
+    use std::time::UNIX_EPOCH;
 
     use super::*;
 
@@ -23115,6 +20957,7 @@ mod tests {
 
     #[test]
     fn compute_column_stats_skips_float_nan_values() {
+        use arrow::array::Float64Array;
         let array = Float64Array::from(vec![Some(f64::NAN), Some(5.0), None, Some(-2.0)]);
 
         let stats = ColumnStatsAccumulator::compute_column_stats(&array);
@@ -23135,6 +20978,7 @@ mod tests {
 
     #[test]
     fn compute_column_stats_uses_typed_min_max_for_utf8_view() {
+        use arrow::array::StringViewArray;
         let array = StringViewArray::from(vec![Some("beta"), Some("alpha"), None]);
 
         let stats = ColumnStatsAccumulator::compute_column_stats(&array);
@@ -25443,6 +23287,145 @@ mod tests {
         );
     }
 
+    /// REGRESSION (SF-100 N=4 WAL-drain stall). The PRIMARY production drain at
+    /// N>1 is the periodic BACKGROUND tick (`run_mem_tier_checkpoint_tick`), NOT a
+    /// direct `checkpoint_mem_tier()` call (the byte-cap spill is documented as a
+    /// rare backstop). Every existing checkpoint test calls `checkpoint_mem_tier()`
+    /// directly, so the TRIGGER path was never covered at N>1. In the SF-100 N=4
+    /// run the tick fired 0 checkpoints: the tier never drained, the source slot
+    /// was never acked, and the WAL backlog grew unbounded (38 GB) even though the
+    /// data stayed correct + query-visible. The tick MUST fire the all-shards
+    /// checkpoint and advance the slot to the latest apply epoch at N>1, exactly as
+    /// it does at N=1.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn sharded_cdc_background_tick_drains_and_advances_slot_at_n_gt_1() {
+        let n = 4_usize;
+        let ctx = SessionContext::new();
+        let runtime_env = ctx.runtime_env();
+        // min_flush_bytes = 0 (helper default) ⇒ the tick's churn gate is always
+        // "ready", so this isolates the tick's drain behavior, not a size threshold.
+        let (provider, _catalog, _tmp) =
+            create_sharded_cdc_upsert_table("bg_tick_n4", Arc::clone(&runtime_env), n).await;
+        let schema = Arc::clone(&provider.table_metadata.schema);
+
+        let durable = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        provider.install_slot_advancer(std::sync::Arc::new(EpochRecorder(std::sync::Arc::clone(
+            &durable,
+        ))));
+
+        let bursts: Vec<Vec<(i64, i64)>> = vec![
+            vec![(1, 10), (2, 20), (3, 30)],
+            vec![(10, 100), (11, 110)],
+            vec![(30, 300), (31, 310), (32, 320)],
+        ];
+        let mut max_epoch = 0_u64;
+        for b in &bursts {
+            if let Some(e) = apply_upsert_burst(&ctx, &provider, Arc::clone(&schema), b).await {
+                max_epoch = max_epoch.max(e);
+            }
+        }
+        assert!(
+            !provider.mem_tier.is_empty(),
+            "rows resident in the tier before the background tick"
+        );
+        assert_eq!(
+            durable.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "no checkpoint has fired yet, so the slot has not advanced"
+        );
+
+        // Drive the PRODUCTION drain trigger — the periodic background tick — NOT a
+        // direct `checkpoint_mem_tier()` call.
+        provider.run_mem_tier_checkpoint_tick().await;
+
+        assert_eq!(
+            durable.load(std::sync::atomic::Ordering::SeqCst),
+            max_epoch,
+            "the background tick must advance the slot to the latest apply epoch at N>1 \
+             (SF-100 N=4 stall: the tick never drained, so the slot froze and WAL grew to 38 GB)"
+        );
+        for s in 0..n {
+            assert!(
+                provider.mem_tier.shard(s).load().is_empty(),
+                "shard {s} drained by the background tick at N>1"
+            );
+        }
+    }
+
+    /// REGRESSION (SF-100 N=4 WAL-drain stall, ROOT CAUSE). The `!pending_pk_deletions`
+    /// gate in `write_cdc_pipelined` diverted an upsert apply onto the SERIAL shard-0
+    /// path (which stamps `source_position = None`) whenever the table's durable
+    /// deletion index held ANY tombstone — which is ~always for a real CDC table (every
+    /// supersession and every delete leaves one). At SF-100 N=4 that diverted ~98% of
+    /// applies off the sharded path, so the checkpoint's `durable_epoch = MAX(source_position)`
+    /// never reflected them and the source slot froze (WAL → 38 GB). An upsert at N>1
+    /// MUST take the SHARDED path — stamping the per-apply `apply_epoch` axis — even when
+    /// durable deletions are pending. We detect the path via `mem_tier_apply_epoch`: the
+    /// sharded path allocates a fresh per-apply epoch (bumps it); the serial shard-0 path
+    /// does not. Pre-fix this asserts-false (serial path, no bump); post-fix it passes.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn sharded_cdc_upsert_shards_despite_pending_durable_deletions() {
+        let n = 4_usize;
+        let ctx = SessionContext::new();
+        let runtime_env = ctx.runtime_env();
+        let (provider, _catalog, _tmp) =
+            create_sharded_cdc_upsert_table("shard_with_pending_del", Arc::clone(&runtime_env), n)
+                .await;
+        let schema = Arc::clone(&provider.table_metadata.schema);
+
+        // Make the DURABLE deletion index hold a tombstone: seed keys + checkpoint
+        // (durable), then delete one + checkpoint. The tombstone hides a now-durable
+        // row, so it must persist durably ⇒ `has_pending_deletions()` is true after.
+        apply_upsert_burst(
+            &ctx,
+            &provider,
+            Arc::clone(&schema),
+            &[(1, 10), (2, 20), (3, 30)],
+        )
+        .await;
+        provider
+            .checkpoint_mem_tier()
+            .await
+            .expect("seed checkpoint");
+        provider
+            .write_cdc_delete_keys_in_memory(&int64_id_batch(&[2]))
+            .await
+            .expect("delete absorb");
+        provider
+            .checkpoint_mem_tier()
+            .await
+            .expect("delete checkpoint");
+        assert!(
+            provider.has_pending_deletions(),
+            "precondition: the durable deletion index must hold a tombstone so the \
+             pre-fix `!pending_pk_deletions` gate would divert the next upsert to serial"
+        );
+
+        // A fresh upsert WITH pending durable deletions present. The sharded path bumps
+        // `mem_tier_apply_epoch`; the serial shard-0 path (pre-fix) does not.
+        let epoch_before = provider
+            .mem_tier_apply_epoch
+            .load(std::sync::atomic::Ordering::SeqCst);
+        apply_upsert_burst(&ctx, &provider, Arc::clone(&schema), &[(4, 40)]).await;
+        let epoch_after = provider
+            .mem_tier_apply_epoch
+            .load(std::sync::atomic::Ordering::SeqCst);
+        assert!(
+            epoch_after > epoch_before,
+            "an upsert at N>1 must take the SHARDED path (stamping the apply_epoch axis) \
+             even with pending durable deletions — otherwise its source_position is None \
+             and the checkpoint watermark never covers it (the WAL-drain stall). \
+             apply_epoch before={epoch_before} after={epoch_after}"
+        );
+
+        // And merge-on-read stays correct: key 2 deleted, 1/3 retained, 4 inserted.
+        assert_eq!(
+            collect_id_value_pairs(&ctx, &provider, "shard_with_pending_del").await,
+            vec![(1, 10), (3, 30), (4, 40)],
+            "sharded upsert with pending deletions preserves the correct merge-on-read result"
+        );
+    }
+
     /// §6.1 MEMO EQUIVALENCE under sharding. A single-shard append bumps only
     /// that shard's tier version, and the merged file+RAM deletion view a scan
     /// builds must equal a full rebuild (the per-shard version-vector memo key
@@ -25924,6 +23907,7 @@ mod tests {
     }
 
     fn make_listing_parity_batch(schema: SchemaRef, start: i64, row_count: usize) -> RecordBatch {
+        use arrow::array::StringArray;
         let row_count = i64::try_from(row_count).expect("test row count fits in i64");
         let ids = (start..start + row_count).collect::<Vec<_>>();
         let categories = ids
@@ -32642,7 +30626,7 @@ mod tests {
         ids: &[i64],
         values: &[i64],
     ) -> RecordBatch {
-        use arrow::array::Int64Array;
+        use arrow::array::{Int64Array, StringArray};
         RecordBatch::try_new(
             schema,
             vec![
@@ -32688,7 +30672,7 @@ mod tests {
         provider: &CayenneTableProvider,
         table_name: &str,
     ) -> Vec<(String, i64, i64)> {
-        use arrow::array::Int64Array;
+        use arrow::array::{Int64Array, StringArray};
         let batches = read_all(ctx, provider, table_name).await;
         let mut rows = Vec::new();
         for batch in &batches {

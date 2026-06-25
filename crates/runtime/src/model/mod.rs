@@ -95,7 +95,7 @@ use crate::DataFusion;
 
 pub static ENABLE_MODEL_SUPPORT_MESSAGE: &str = "To enable model support, either: \n  1) `spice install ai` \n  2) Build spiced binary with flag `--features models`.";
 
-pub async fn run(m: &Model, df: Arc<DataFusion>) -> Result<RecordBatch, ModelError> {
+pub async fn run(m: Arc<Model>, df: Arc<DataFusion>) -> Result<RecordBatch, ModelError> {
     let dataset = TableReference::parse_str(&m.model.datasets[0]);
     let dataset_name = dataset
         .clone()
@@ -126,5 +126,13 @@ pub async fn run(m: &Model, df: Arc<DataFusion>) -> Result<RecordBatch, ModelErr
             source: Box::new(e),
         })?;
 
-    m.run(batches)
+    // ONNX/tract inference is CPU-bound and synchronous; run it on the blocking
+    // pool so it doesn't stall the async runtime thread (which also serves
+    // `/health`). `spawn_blocking` (vs `block_in_place`) is safe regardless of
+    // the runtime flavor driving this call.
+    tokio::task::spawn_blocking(move || m.run(batches))
+        .await
+        .map_err(|e| ModelError::UnableToRunModel {
+            source: Box::new(e),
+        })?
 }
