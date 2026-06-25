@@ -353,7 +353,8 @@ fn warn_if_low_disk(label: &str, path: &str) {
     let Some((available, total)) = crate::dataaccelerator::storage::disk_space_bytes(path) else {
         return;
     };
-    if total == 0 || (available >= total / LOW_DISK_FRACTION_DENOM && available >= LOW_DISK_FLOOR_BYTES)
+    if total == 0
+        || (available >= total / LOW_DISK_FRACTION_DENOM && available >= LOW_DISK_FLOOR_BYTES)
     {
         return;
     }

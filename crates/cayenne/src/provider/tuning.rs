@@ -932,7 +932,12 @@ impl IngestStats {
         let prior = inner.publish_samples;
         let ms = duration_ms(d);
         ewma(&mut inner.publish_latency_ms, ms, prior);
-        ewma_with(&mut inner.publish_latency_fast_ms, ms, prior, EWMA_ALPHA_FAST);
+        ewma_with(
+            &mut inner.publish_latency_fast_ms,
+            ms,
+            prior,
+            EWMA_ALPHA_FAST,
+        );
         inner.publish_samples = prior.saturating_add(1);
     }
 
@@ -2251,7 +2256,11 @@ fn decide_goal(
         && latency_bound(
             s.publish_latency_ms,
             s.arrival_gap_ms,
-            tier_bound_fraction(PUBLISH_BOUND_FRACTION, s.metastore_storage, s.metastore_write_mbps),
+            tier_bound_fraction(
+                PUBLISH_BOUND_FRACTION,
+                s.metastore_storage,
+                s.metastore_write_mbps,
+            ),
         );
     let mutation_heavy = s.delete_fraction > MUTATION_HEAVY_FRACTION;
 
@@ -2719,7 +2728,11 @@ pub(crate) fn binding_constraint(s: &IngestSnapshot) -> &'static str {
         || latency_bound(
             s.publish_latency_ms,
             s.arrival_gap_ms,
-            tier_bound_fraction(PUBLISH_BOUND_FRACTION, s.metastore_storage, s.metastore_write_mbps),
+            tier_bound_fraction(
+                PUBLISH_BOUND_FRACTION,
+                s.metastore_storage,
+                s.metastore_write_mbps,
+            ),
         )
     {
         if s.data_tier_is_slow() || s.metastore_tier_is_slow() {
@@ -4109,11 +4122,17 @@ mod tests {
         let mid = tier_scale(StorageClass::Ebs, Some(512.0));
         assert!(mid > SLOW_TIER_BOUND_SCALE && mid < 1.0);
         // No measurement → class fallback (Unknown is slow, LocalSsd is fast).
-        assert!(close(tier_scale(StorageClass::Unknown, None), SLOW_TIER_BOUND_SCALE));
+        assert!(close(
+            tier_scale(StorageClass::Unknown, None),
+            SLOW_TIER_BOUND_SCALE
+        ));
         assert!(close(tier_scale(StorageClass::LocalSsd, None), 1.0));
         // A non-finite/zero measurement is ignored (falls back to class).
         assert!(close(tier_scale(StorageClass::LocalSsd, Some(0.0)), 1.0));
-        assert!(close(tier_scale(StorageClass::Ebs, Some(f64::NAN)), SLOW_TIER_BOUND_SCALE));
+        assert!(close(
+            tier_scale(StorageClass::Ebs, Some(f64::NAN)),
+            SLOW_TIER_BOUND_SCALE
+        ));
     }
 
     #[test]

@@ -1481,8 +1481,7 @@ pub(crate) fn coordinated_mem_tier_budget(
         .saturating_sub(query_pool_bytes)
         .saturating_sub(compaction_pool_bytes)
         .saturating_sub(2 * headroom);
-    let ceiling =
-        base_ceiling.max(float_room.min(total_memory / MEM_TIER_FLOAT_CEILING_FRACTION));
+    let ceiling = base_ceiling.max(float_room.min(total_memory / MEM_TIER_FLOAT_CEILING_FRACTION));
     remainder.clamp(floor, ceiling)
 }
 

@@ -68,7 +68,11 @@ const MIB: u64 = 1024 * 1024;
     reason = "guarded: only finite, positive, small (≤ a few thousand) values reach the cast"
 )]
 fn f64_to_usize_floor(v: f64) -> usize {
-    if v.is_finite() && v > 0.0 { v as usize } else { 0 }
+    if v.is_finite() && v > 0.0 {
+        v as usize
+    } else {
+        0
+    }
 }
 
 /// Inline-memtable flush floor in bytes (2 MiB). A host at or under the scaling
