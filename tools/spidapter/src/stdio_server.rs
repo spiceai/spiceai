@@ -77,6 +77,10 @@ struct ScpRunState {
     ec2_guards: Vec<Ec2Guard>,
     dynamodb_guard: Option<DynamoDbGuard>,
     mongodb_guard: Option<MongoDbGuard>,
+    /// Deletes the Spice Cloud app if the run is dropped without an explicit
+    /// teardown (panic, interrupt, dropped handler). `take`n/`disarm`ed by the
+    /// teardown path so it never double-deletes. See [`ScpAppGuard`].
+    app_guard: Option<ScpAppGuard>,
 }
 
 /// State for an active benchmark run provisioned via `setup`.
@@ -233,6 +237,62 @@ impl Drop for DynamoDbGuard {
             };
             if let Err(e) = rt.block_on(delete_dynamodb_tables(&info)) {
                 eprintln!("[stdio] DynamoDbGuard: failed to delete DynamoDB tables: {e}");
+            }
+        })
+        .join()
+        .ok();
+    }
+}
+
+/// RAII guard that deletes a Spice Cloud app when dropped.
+///
+/// Unlike the source-side guards, the SCP app has no other Drop-based cleanup:
+/// previously it was deleted *only* by the explicit `teardown` path, so a failure
+/// partway through `provision_scp_app` (after the app was created but before it was
+/// handed to a tracked `ScpRunState`), a panic, or an interrupt would orphan the
+/// app on Spice Cloud. This guard closes those windows: it is armed at app creation
+/// and only `disarm`ed once the run is either explicitly torn down or intentionally
+/// preserved (`--no-teardown`). Drop alone cannot cover SIGKILL/`panic=abort` — a
+/// server-side reaper is still needed for those.
+struct ScpAppGuard {
+    /// `(cloud, app_id)` while armed; `None` once disarmed.
+    app: Option<(CloudClient, i64)>,
+}
+
+impl ScpAppGuard {
+    fn new(cloud: CloudClient, app_id: i64) -> Self {
+        Self {
+            app: Some((cloud, app_id)),
+        }
+    }
+
+    /// Disarm so the app is NOT deleted on drop (it was deleted explicitly, or is
+    /// being intentionally preserved). Returns the guarded app id, if still armed.
+    fn disarm(&mut self) -> Option<i64> {
+        self.app.take().map(|(_, app_id)| app_id)
+    }
+}
+
+impl Drop for ScpAppGuard {
+    fn drop(&mut self) {
+        let Some((cloud, app_id)) = self.app.take() else {
+            return;
+        };
+        eprintln!(
+            "[stdio] ScpAppGuard: deleting orphaned app {app_id} at {}",
+            cloud.base_url()
+        );
+        std::thread::spawn(move || {
+            let Ok(rt) = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            else {
+                eprintln!("[stdio] ScpAppGuard: failed to build tokio runtime for cleanup");
+                return;
+            };
+            match rt.block_on(commands::delete_app(&cloud, app_id)) {
+                Ok(()) => eprintln!("[stdio] ScpAppGuard: deleted app {app_id}"),
+                Err(e) => eprintln!("[stdio] ScpAppGuard: failed to delete app {app_id}: {e}"),
             }
         })
         .join()
@@ -1510,21 +1570,33 @@ impl Handler for SpidapterHandler {
                     "[stdio] teardown(preserve): keeping MongoDB database '{database}' alive"
                 );
             }
-            // For SCP: skip app deletion so the deployed spiced stays running.
+            // For SCP: disarm the app guard and skip app deletion so the deployed
+            // spiced stays running (dropping `state` below must not delete it).
+            if let RunState::Scp(scp) = &mut state
+                && let Some(guard) = &mut scp.app_guard
+            {
+                guard.disarm();
+            }
             eprintln!("[stdio] teardown(preserve): skipping resource deletion");
             return Ok(TeardownResponse { ok: true });
         }
 
         match state {
-            RunState::Scp(scp) => {
+            RunState::Scp(mut scp) => {
                 eprintln!(
                     "[stdio] teardown: deleting app {} at {}",
                     scp.app_id,
                     scp.cloud.base_url()
                 );
+                // On `?` failure here, `scp` (and its still-armed `app_guard`) is
+                // dropped, so the guard retries the delete on drop. On success we
+                // disarm it below so it does not delete the app a second time.
                 commands::delete_app(&scp.cloud, scp.app_id)
                     .await
                     .map_err(|e| format!("Failed to delete app {}: {e}", scp.app_id))?;
+                if let Some(mut guard) = scp.app_guard.take() {
+                    guard.disarm();
+                }
                 eprintln!("[stdio] teardown: app {} deleted", scp.app_id);
             }
             RunState::Local(mut local_state) => {
@@ -1689,15 +1761,22 @@ pub async fn run_stdio_server(args: &StdioArgs) -> anyhow::Result<()> {
 
     let handler = SpidapterHandler::new(args, scenario);
     let mut server = Server::new(handler);
-    tokio::select! {
+    let result = tokio::select! {
         r = server.run_stdio() => {
             r.map_err(|e| anyhow::anyhow!("Stdio server error: {e}"))
         }
         _ = tokio::signal::ctrl_c() => {
-            eprintln!("[stdio] Received interrupt, cleaning up resources...");
+            eprintln!("[stdio] Received interrupt, cleaning up active runs...");
             Ok(())
         }
-    }
+    };
+    // Drop the server (and the handler it owns) here so every active run's state is
+    // torn down before we return. For SCP runs the embedded `ScpAppGuard` deletes
+    // the Spice Cloud app on drop, so an interrupt no longer orphans apps. (The
+    // previous code logged "cleaning up" but dropped the server implicitly without
+    // any SCP cleanup, since `ScpRunState` had no Drop.)
+    drop(server);
+    result
 }
 
 async fn post_setup_sink_action(
