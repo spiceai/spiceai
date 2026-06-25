@@ -43,7 +43,7 @@ use runtime::dataconnector::{
     ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory,
     DataConnectorResult, NewDataConnectorResult,
 };
-use runtime::datafusion::udf::deny_spice_specific_functions;
+use runtime::datafusion::udf::deny_spice_functions_for_postgres_table_providers;
 use runtime::parameters::ParameterSpec;
 use secrecy::SecretBox;
 use snafu::prelude::*;
@@ -919,7 +919,7 @@ async fn federated_postgres_table_provider(
         sql_table,
         schema,
         table_reference,
-        Some(deny_spice_specific_functions().as_ref().clone()),
+        Some(deny_spice_functions_for_postgres_table_providers()),
     )))
 }
 
