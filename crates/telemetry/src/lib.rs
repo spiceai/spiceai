@@ -501,6 +501,66 @@ pub fn track_cayenne_cdc_absorbed_delete_keys(keys: u64, dimensions: &[KeyValue]
         .add(keys, dimensions);
 }
 
+static CAYENNE_MEM_TIER_CHECKPOINT_TICK: OnceLock<Counter<u64>> = OnceLock::new();
+
+/// Counts background mem-tier checkpoint TICK outcomes (`cdc_durability: memory`),
+/// so a stalled deferred source-slot ack is attributable to the trigger vs the
+/// checkpoint body. Outcomes (carried as the `outcome` dimension): `fired` (the
+/// tick ran a checkpoint), `skipped_empty` (whole tier empty), `skipped_gate`
+/// (size/age churn gate held it off), `no_advancer` / `not_memory_mode` (early
+/// return before the gate), `failed` (the checkpoint errored). A flat-zero `fired`
+/// under a growing WAL backlog localizes a slot-ack stall to the trigger path —
+/// the exact signal missing when the sharded (N>1) tier stopped draining.
+/// `dimensions` carries `table` + `outcome`.
+pub fn track_cayenne_mem_tier_checkpoint_tick(dimensions: &[KeyValue]) {
+    CAYENNE_MEM_TIER_CHECKPOINT_TICK
+        .get_or_init(|| {
+            cayenne_operational_meter()
+                .u64_counter("cayenne_mem_tier_checkpoint_tick_total")
+                .with_description(
+                    "Background mem-tier checkpoint tick outcomes (fired / skipped_empty / skipped_gate / no_advancer / not_memory_mode / failed), labeled by table and outcome.",
+                )
+                .with_unit("ticks")
+                .build()
+        })
+        .add(1, dimensions);
+}
+
+static CAYENNE_MEM_TIER_APPLY_EPOCH: OnceLock<Gauge<u64>> = OnceLock::new();
+static CAYENNE_MEM_TIER_DURABLE_EPOCH: OnceLock<Gauge<u64>> = OnceLock::new();
+
+/// The per-apply slot-ack epoch axis (`cdc_durability: memory`): `apply_epoch` is the
+/// latest allocated per-apply epoch counter; `durable_epoch` is the highest epoch the
+/// most recent mem-tier checkpoint reported durable (what `fire_slot_advancer` handed
+/// the runtime to advance the source slot). The GAP (`apply_epoch − durable_epoch`) is
+/// the un-acked source-slot backlog measured in apply epochs: a small/steady gap means
+/// the slot keeps pace; a gap that GROWS while checkpoints keep firing means the
+/// watermark is stuck — the exact signature of the N>1 WAL-drain stall, and the signal
+/// that pins it to the watermark computation vs the trigger. `dimensions` carries
+/// `table`. Emitted on each `fire_slot_advancer` (i.e. each completed checkpoint).
+pub fn track_cayenne_mem_tier_epoch(apply_epoch: u64, durable_epoch: u64, dimensions: &[KeyValue]) {
+    CAYENNE_MEM_TIER_APPLY_EPOCH
+        .get_or_init(|| {
+            cayenne_operational_meter()
+                .u64_gauge("cayenne_mem_tier_apply_epoch")
+                .with_description(
+                    "Latest allocated per-apply slot-ack epoch counter (cdc_durability: memory).",
+                )
+                .build()
+        })
+        .record(apply_epoch, dimensions);
+    CAYENNE_MEM_TIER_DURABLE_EPOCH
+        .get_or_init(|| {
+            cayenne_operational_meter()
+                .u64_gauge("cayenne_mem_tier_durable_epoch")
+                .with_description(
+                    "Highest per-apply epoch the last mem-tier checkpoint reported durable (handed to fire_slot_advancer to advance the source slot).",
+                )
+                .build()
+        })
+        .record(durable_epoch, dimensions);
+}
+
 static CAYENNE_COMPACTION_DURATION_MS: OnceLock<Histogram<f64>> = OnceLock::new();
 
 /// Build-once accessor for the compaction-duration histogram. The first call
