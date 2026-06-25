@@ -146,6 +146,7 @@ fn maintained_aggregate_specs_for_cayenne(
         .iter()
         .map(
             |aggregate| cayenne::maintained_aggregate::MaintainedAggregateSpec {
+                filter: None,
                 group_by: aggregate.group_by.clone(),
                 aggregates: aggregate
                     .aggregates

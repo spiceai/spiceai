@@ -27,10 +27,11 @@ use std::collections::HashMap;
 use std::collections::hash_map::Entry;
 use std::sync::Arc;
 
-use arrow::array::{Array, ArrayRef, RecordBatch, new_empty_array};
+use arrow::array::{Array, ArrayRef, BooleanArray, RecordBatch, new_empty_array};
 use arrow_schema::{DataType, FieldRef, SchemaRef};
 use datafusion::datasource::memory::MemorySourceConfig;
 use datafusion::error::Result as DataFusionResult;
+use datafusion::logical_expr::ColumnarValue;
 use datafusion::physical_plan::aggregates::{AggregateExec, AggregateMode};
 use datafusion_common::{DataFusionError, ScalarValue};
 use datafusion_execution::{SendableRecordBatchStream, TaskContext};
@@ -47,6 +48,17 @@ pub struct MaintainedAggregateSpec {
     pub group_by: Vec<String>,
     /// Aggregate expressions maintained for each group.
     pub aggregates: Vec<MaintainedAggregateExpr>,
+    /// Optional row predicate (a physical expression over the table/input
+    /// schema) that selects which rows contribute to the view — the maintained
+    /// equivalent of a query `WHERE`. `None` maintains the aggregate over every
+    /// row (the original behavior). When set, maintenance applies only rows the
+    /// predicate selects, and the optimizer serves a query from this view only
+    /// when the query's filter matches this predicate exactly (see
+    /// [`MaintainedAggregateView::matches_query`]). This is what lets the
+    /// flagship serve filtered analytical queries (e.g. CH-benCH q1/q6) that
+    /// every general-purpose engine must re-scan O(rows) for, while Cayenne
+    /// maintains the filtered relation from the CDC delta and serves O(groups).
+    pub filter: Option<Arc<dyn PhysicalExpr>>,
 }
 
 /// One aggregate expression inside a maintained aggregate view.
@@ -104,6 +116,11 @@ enum RegistryStatus {
 #[derive(Debug)]
 struct MaintainedAggregateView {
     spec: ResolvedAggregateSpec,
+    /// Optional row predicate over the input schema. When set, only rows the
+    /// predicate selects are folded into `groups`/`pk_index`; a non-matching row
+    /// is treated exactly as an absent row (not indexed, not accumulated), so all
+    /// retraction logic is reused unchanged. See [`MaintainedAggregateSpec::filter`].
+    filter: Option<Arc<dyn PhysicalExpr>>,
     groups: HashMap<Vec<ScalarValue>, GroupAccumulator>,
     /// Primary-key column indices in the input batch. Empty means no per-PK
     /// index is maintained, so retraction is unavailable and the legacy
@@ -204,6 +221,12 @@ enum AggregateAccumulator {
 struct QueryAggregateSpec {
     group_by: Vec<String>,
     aggregates: Vec<QueryAggregateExpr>,
+    /// The query's row predicate (captured from a `FilterExec` between the
+    /// aggregate and the Cayenne scan), or `None` for an unfiltered query. A
+    /// view serves the query only when this matches the view's own filter
+    /// exactly — a filtered view must never answer an unfiltered query, and vice
+    /// versa, or the result would be wrong.
+    filter: Option<Arc<dyn PhysicalExpr>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -508,7 +531,7 @@ impl MaintainedAggregateRegistry {
         aggregate: &AggregateExec,
         scan_epoch: u64,
     ) -> DataFusionResult<Option<RecordBatch>> {
-        self.batch_for_aggregate_with_output(aggregate, aggregate, scan_epoch)
+        self.batch_for_aggregate_with_output(aggregate, aggregate, scan_epoch, None)
     }
 
     /// Materialize a maintained aggregate batch by matching `query_aggregate`
@@ -526,19 +549,63 @@ impl MaintainedAggregateRegistry {
         query_aggregate: &AggregateExec,
         output_aggregate: &AggregateExec,
         scan_epoch: u64,
+        filter: Option<Arc<dyn PhysicalExpr>>,
     ) -> DataFusionResult<Option<RecordBatch>> {
-        let Some(query) = query_spec_for_aggregate(query_aggregate) else {
+        let Some(mut query) = query_spec_for_aggregate(query_aggregate) else {
             return Ok(None);
         };
+        query.filter = filter;
+        self.serve(&query, scan_epoch, output_aggregate.schema())
+    }
 
+    /// Serve a maintained view directly from a declared [`MaintainedAggregateSpec`]
+    /// (group-by + aggregates + optional filter) into `output_schema`, without an
+    /// `AggregateExec`. Exercises the exact fresh/epoch gate, view match (incl.
+    /// filter equality), and O(groups) materialize the optimizer rewrite uses —
+    /// the entry point for benches/tests that measure the maintained serve cost.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a matching maintained view cannot be materialized.
+    pub fn batch_for_spec(
+        &self,
+        spec: &MaintainedAggregateSpec,
+        scan_epoch: u64,
+        output_schema: SchemaRef,
+    ) -> DataFusionResult<Option<RecordBatch>> {
+        let query = QueryAggregateSpec {
+            group_by: spec.group_by.clone(),
+            aggregates: spec
+                .aggregates
+                .iter()
+                .map(|aggregate| QueryAggregateExpr {
+                    function: aggregate.function,
+                    column: aggregate.column.clone(),
+                })
+                .collect(),
+            filter: spec.filter.clone(),
+        };
+        self.serve(&query, scan_epoch, output_schema)
+    }
+
+    /// Shared serve path: only answer from a maintained view when the registry is
+    /// fresh at the scan epoch and a view matches the query shape exactly.
+    fn serve(
+        &self,
+        query: &QueryAggregateSpec,
+        scan_epoch: u64,
+        output_schema: SchemaRef,
+    ) -> DataFusionResult<Option<RecordBatch>> {
         let state = self.state.read();
         if state.status != RegistryStatus::Fresh || state.epoch != scan_epoch {
             return Ok(None);
         }
 
         for view in &state.views {
-            if view.matches_query(&query) {
-                return view.materialize(output_aggregate.schema());
+            if view.matches_query(query) {
+                // Moved on the diverging return path — at most one view matches,
+                // so no clone of the schema is needed.
+                return view.materialize(output_schema);
             }
         }
 
@@ -554,10 +621,49 @@ impl MaintainedAggregateView {
     ) -> DataFusionResult<Self> {
         Ok(Self {
             spec: ResolvedAggregateSpec::try_new(spec, schema)?,
+            filter: spec.filter.clone(),
             groups: HashMap::new(),
             pk_columns,
             pk_index: HashMap::new(),
         })
+    }
+
+    /// Evaluate the view's row predicate over `batch`, returning a per-row
+    /// boolean mask. `None` (no filter configured) means every row contributes.
+    /// SQL `WHERE` semantics: a row contributes only when the predicate is
+    /// exactly `TRUE` (a `NULL`/`FALSE` result excludes it).
+    fn evaluate_filter_mask(&self, batch: &RecordBatch) -> DataFusionResult<Option<BooleanArray>> {
+        let Some(filter) = &self.filter else {
+            return Ok(None);
+        };
+        let array = match filter.evaluate(batch)? {
+            ColumnarValue::Array(array) => array,
+            scalar @ ColumnarValue::Scalar(_) => scalar.into_array(batch.num_rows())?,
+        };
+        let mask = array
+            .as_any()
+            .downcast_ref::<BooleanArray>()
+            .ok_or_else(|| {
+                DataFusionError::Internal(format!(
+                    "maintained aggregate filter must evaluate to Boolean, got {}",
+                    array.data_type()
+                ))
+            })?;
+        Ok(Some(mask.clone()))
+    }
+
+    /// Fold one row into its group, creating the group accumulator on first use.
+    fn insert_into_group(
+        &mut self,
+        group_key: Vec<ScalarValue>,
+        batch: &RecordBatch,
+        row: usize,
+    ) -> DataFusionResult<()> {
+        let group = match self.groups.entry(group_key) {
+            Entry::Occupied(entry) => entry.into_mut(),
+            Entry::Vacant(entry) => entry.insert(GroupAccumulator::try_new(&self.spec)?),
+        };
+        group.apply_insert_row(batch, row)
     }
 
     fn clear(&mut self) {
@@ -648,18 +754,31 @@ impl MaintainedAggregateView {
             return Ok(());
         }
 
+        // `None` mask => every row contributes (unfiltered view, original path).
+        let mask = self.evaluate_filter_mask(batch)?;
         let indexed = !self.pk_columns.is_empty();
         for row in 0..batch.num_rows() {
-            let group_key =
-                Self::scalar_key(batch, row, self.spec.group_by.iter().map(|c| c.index))?;
+            let matches = mask
+                .as_ref()
+                .is_none_or(|mask| mask.is_valid(row) && mask.value(row));
 
             if indexed {
                 let pk = Self::scalar_key(batch, row, self.pk_columns.iter().copied())?;
-                // An upsert whose PK is already indexed is an UPDATE: retract
-                // the prior contribution before applying the new row.
+                // An upsert whose PK is already indexed is an UPDATE: retract the
+                // prior contribution first. This runs even when the new row no
+                // longer matches the filter, so a row updated OUT of the predicate
+                // correctly drops its old contribution.
                 if let Some(old) = self.pk_index.remove(&pk) {
                     self.retract_entry(&old)?;
                 }
+                // A non-matching row contributes nothing and is left unindexed —
+                // identical to an absent row, so a later DELETE/UPDATE retraction
+                // is a correct no-op or correct re-add.
+                if !matches {
+                    continue;
+                }
+                let group_key =
+                    Self::scalar_key(batch, row, self.spec.group_by.iter().map(|c| c.index))?;
                 let inputs = self.capture_inputs(batch, row)?;
                 self.pk_index.insert(
                     pk,
@@ -668,24 +787,35 @@ impl MaintainedAggregateView {
                         inputs,
                     },
                 );
+                self.insert_into_group(group_key, batch, row)?;
+            } else {
+                // No PK index: insert-only semantics. Skip non-matching rows.
+                if !matches {
+                    continue;
+                }
+                let group_key =
+                    Self::scalar_key(batch, row, self.spec.group_by.iter().map(|c| c.index))?;
+                self.insert_into_group(group_key, batch, row)?;
             }
-
-            let group = match self.groups.entry(group_key) {
-                Entry::Occupied(entry) => entry.into_mut(),
-                Entry::Vacant(entry) => entry.insert(GroupAccumulator::try_new(&self.spec)?),
-            };
-            group.apply_insert_row(batch, row)?;
         }
 
         Ok(())
     }
 
     fn matches_query(&self, query: &QueryAggregateSpec) -> bool {
-        self.spec
-            .group_by
-            .iter()
-            .map(|c| c.name.as_str())
-            .eq(query.group_by.iter().map(String::as_str))
+        // Filter must match EXACTLY: an unfiltered view (filter `None`) answers
+        // only unfiltered queries; a filtered view answers only a query carrying
+        // the identical predicate. `Arc<dyn PhysicalExpr>` compares structurally
+        // (DataFusion's `DynEq`), so two equivalent predicates over the same
+        // schema match. A mismatch (or an unrecognized predicate) falls back to
+        // the base-table scan — correct, just not accelerated.
+        self.filter == query.filter
+            && self
+                .spec
+                .group_by
+                .iter()
+                .map(|c| c.name.as_str())
+                .eq(query.group_by.iter().map(String::as_str))
             && self.spec.aggregates.len() == query.aggregates.len()
             && self
                 .spec
@@ -1171,6 +1301,10 @@ fn query_spec_for_aggregate(aggregate: &AggregateExec) -> Option<QueryAggregateS
     Some(QueryAggregateSpec {
         group_by,
         aggregates,
+        // The aggregate node carries no filter; the optimizer captures any
+        // `FilterExec` predicate during plan descent and sets it via
+        // `batch_for_aggregate_with_output`.
+        filter: None,
     })
 }
 
@@ -1446,6 +1580,7 @@ mod tests {
     #[test]
     fn applies_null_aware_count_sum_and_avg() -> DataFusionResult<()> {
         let spec = MaintainedAggregateSpec {
+            filter: None,
             group_by: vec!["name".to_string()],
             aggregates: vec![
                 MaintainedAggregateExpr {
@@ -1517,6 +1652,7 @@ mod tests {
     #[test]
     fn stale_epoch_does_not_serve() -> DataFusionResult<()> {
         let spec = MaintainedAggregateSpec {
+            filter: None,
             group_by: vec!["name".to_string()],
             aggregates: vec![MaintainedAggregateExpr {
                 function: MaintainedAggregateFunction::Count,
@@ -1542,6 +1678,7 @@ mod tests {
     #[test]
     fn out_of_order_apply_epoch_falls_back_to_stale() -> DataFusionResult<()> {
         let spec = MaintainedAggregateSpec {
+            filter: None,
             group_by: vec!["name".to_string()],
             aggregates: vec![MaintainedAggregateExpr {
                 function: MaintainedAggregateFunction::Count,
@@ -1576,6 +1713,7 @@ mod tests {
     #[test]
     fn count_null_literal_is_not_rewritten_as_count_all() -> DataFusionResult<()> {
         let spec = MaintainedAggregateSpec {
+            filter: None,
             group_by: vec!["name".to_string()],
             aggregates: vec![MaintainedAggregateExpr {
                 function: MaintainedAggregateFunction::Count,
@@ -1609,6 +1747,7 @@ mod tests {
     #[test]
     fn global_empty_aggregate_returns_sql_row() -> DataFusionResult<()> {
         let spec = MaintainedAggregateSpec {
+            filter: None,
             group_by: vec![],
             aggregates: vec![
                 MaintainedAggregateExpr {
@@ -1642,6 +1781,7 @@ mod tests {
     #[test]
     fn sum_overflow_returns_error() -> DataFusionResult<()> {
         let spec = MaintainedAggregateSpec {
+            filter: None,
             group_by: vec![],
             aggregates: vec![MaintainedAggregateExpr {
                 function: MaintainedAggregateFunction::Sum,
@@ -1672,6 +1812,7 @@ mod tests {
             true,
         )]));
         let spec = MaintainedAggregateSpec {
+            filter: None,
             group_by: vec!["group_key".to_string()],
             aggregates: vec![MaintainedAggregateExpr {
                 function: MaintainedAggregateFunction::Count,
@@ -1784,6 +1925,7 @@ mod tests {
 
     fn sum_i_spec() -> MaintainedAggregateSpec {
         MaintainedAggregateSpec {
+            filter: None,
             group_by: vec!["name".to_string()],
             aggregates: vec![MaintainedAggregateExpr {
                 function: MaintainedAggregateFunction::Sum,
@@ -1973,6 +2115,7 @@ mod tests {
     #[test]
     fn retracts_all_aggregate_types() -> DataFusionResult<()> {
         let spec = MaintainedAggregateSpec {
+            filter: None,
             group_by: vec!["name".to_string()],
             aggregates: vec![
                 MaintainedAggregateExpr {
@@ -2090,6 +2233,7 @@ mod tests {
         };
 
         let spec = MaintainedAggregateSpec {
+            filter: None,
             group_by: vec!["name".to_string()],
             aggregates: vec![MaintainedAggregateExpr {
                 function: MaintainedAggregateFunction::Sum,
