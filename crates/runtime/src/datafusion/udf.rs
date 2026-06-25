@@ -833,7 +833,9 @@ fn json_functions() -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
-    use datafusion::arrow::datatypes::DataType;
+    use datafusion::arrow::array::AsArray;
+    use datafusion::arrow::datatypes::{DataType, Float64Type};
+    use datafusion::execution::SessionStateBuilder;
     use datafusion::logical_expr::expr::ScalarFunction;
     use datafusion::logical_expr::{ColumnarValue, Volatility as DataFusionVolatility, create_udf};
     use datafusion::prelude::{Expr, lit};
@@ -842,6 +844,7 @@ mod tests {
         json_as_text_udf, json_contains_udf, json_get_bool_udf, json_get_float_udf,
         json_get_int_udf, json_get_json_udf, json_get_str_udf, json_get_udf, json_length_udf,
     };
+    use runtime_datafusion_udfs::inner_product::DOT_PRODUCT_UDF_ALIAS;
 
     use super::*;
 
@@ -1175,5 +1178,81 @@ mod tests {
             BTreeSet::from([COSINE_DISTANCE_UDF_NAME, INNER_PRODUCT_UDF_NAME, "rand"]),
             "unexpected change to the set of Spice functions pushable to DuckDB"
         );
+    }
+
+    /// Build a `SessionContext` the way `builder.rs` does: `DataFusion` defaults
+    /// first (which, with `nested_expressions`, register `DataFusion` 54's
+    /// `cosine_distance` / `inner_product` / `dot_product`), then Spice's core
+    /// scalar UDFs, which override them by name.
+    fn ctx_like_runtime() -> SessionContext {
+        let state = SessionStateBuilder::new().with_default_features().build();
+        let ctx = SessionContext::new_with_state(state);
+        register_core_scalar_udfs(&ctx);
+        ctx
+    }
+
+    async fn eval_f64(ctx: &SessionContext, sql: &str) -> datafusion::common::Result<f64> {
+        let batches = ctx.sql(sql).await?.collect().await?;
+        Ok(batches[0].column(0).as_primitive::<Float64Type>().value(0))
+    }
+
+    /// Locks in that Spice's `cosine_distance` — not `DataFusion` 54's same-named
+    /// built-in — is the impl bound after registration, and that it keeps the
+    /// `(1 - similarity) / 2` remap to `[0, 1]`. `DataFusion`'s built-in returns
+    /// `1 - similarity` over `[0, 2]`; if it ever shadowed Spice's UDF the
+    /// orthogonal case below would be `1.0` instead of `0.5`, silently changing
+    /// every `vector_search` relevance score (`score = 1 - cosine_distance`).
+    #[tokio::test]
+    async fn cosine_distance_keeps_spice_zero_to_one_semantics() {
+        let ctx = ctx_like_runtime();
+
+        let identical = eval_f64(&ctx, "SELECT cosine_distance([1.0, 0.0], [1.0, 0.0])")
+            .await
+            .expect("cosine_distance over List literals should evaluate");
+        assert!(
+            (identical - 0.0).abs() < 1e-9,
+            "identical vectors must be 0.0, got {identical}"
+        );
+
+        let orthogonal = eval_f64(&ctx, "SELECT cosine_distance([1.0, 0.0], [0.0, 1.0])")
+            .await
+            .expect("cosine_distance over List literals should evaluate");
+        assert!(
+            (orthogonal - 0.5).abs() < 1e-9,
+            "orthogonal vectors must be 0.5 (Spice's [0,1] remap); 1.0 would mean \
+             DataFusion 54's built-in shadowed Spice's cosine_distance, got {orthogonal}"
+        );
+
+        let opposite = eval_f64(&ctx, "SELECT cosine_distance([1.0, 0.0], [-1.0, 0.0])")
+            .await
+            .expect("cosine_distance over List literals should evaluate");
+        assert!(
+            (opposite - 1.0).abs() < 1e-9,
+            "opposite vectors must be 1.0 (top of Spice's [0,1] range), got {opposite}"
+        );
+    }
+
+    /// Locks in that both `inner_product` and its `dot_product` alias resolve to
+    /// Spice's SIMD UDF rather than `DataFusion` 54's built-in. Spice's impl
+    /// accepts only `FixedSizeList<Float32, N>`; `DataFusion`'s accepts
+    /// `List`/`LargeList` of any numeric and would return `11.0` for the call
+    /// below. A `FixedSizeList` coercion error is therefore the discriminator
+    /// that Spice's impl — including for the `dot_product` alias key — is bound.
+    #[tokio::test]
+    async fn inner_product_and_dot_product_bind_to_spice_impl() {
+        let ctx = ctx_like_runtime();
+
+        for name in [INNER_PRODUCT_UDF_NAME, DOT_PRODUCT_UDF_ALIAS] {
+            let err = eval_f64(&ctx, &format!("SELECT {name}([1.0, 2.0], [3.0, 4.0])"))
+                .await
+                .expect_err(&format!(
+                    "{name} over List<Float64> must error — Spice's FixedSizeList<Float32>-only \
+                     impl should be bound, not DataFusion 54's List-accepting built-in"
+                ));
+            assert!(
+                err.to_string().contains("FixedSizeList"),
+                "{name}: expected a FixedSizeList coercion error from Spice's impl, got: {err}"
+            );
+        }
     }
 }
