@@ -487,16 +487,35 @@ fn make_stream(
     limit: usize,
 ) -> impl Stream<Item = std::result::Result<RecordBatch, DataFusionError>> {
     stream! {
+        // Share the searcher into the blocking task that runs the synchronous
+        // tantivy search (mmap/disk reads + scoring + stored-field decode) off
+        // the async runtime thread (which also serves `/health`, `/v1/search`).
+        let fts = std::sync::Arc::new(fts);
         let mut remaining_limit = limit;
         let mut offset = 0;
         while remaining_limit > 0 {
             let page_size = min(remaining_limit, DEFAULT_BATCH_SIZE);
-            let hits = match fts
-                .search_query_literal(query.as_str(), page_size, offset)
-                .map_err(|e| DataFusionError::Internal(e.to_string())) {
-                    Ok(h) => h,
-                    Err(e) => {yield Err(e); return}
-                };
+            let hits = {
+                let fts = std::sync::Arc::clone(&fts);
+                let query = query.clone();
+                match tokio::task::spawn_blocking(move || {
+                    fts.search_query_literal(query.as_str(), page_size, offset)
+                })
+                .await
+                {
+                    Ok(Ok(h)) => h,
+                    Ok(Err(e)) => {
+                        yield Err(DataFusionError::Internal(e.to_string()));
+                        return;
+                    }
+                    Err(e) => {
+                        yield Err(DataFusionError::Internal(format!(
+                            "full text search task failed: {e}"
+                        )));
+                        return;
+                    }
+                }
+            };
 
             // Decrement by *actual* hits returned (not the requested page size) so
             // we stop once the index is exhausted instead of issuing further empty

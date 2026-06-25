@@ -525,7 +525,9 @@ pub struct LogErrors(pub bool);
 pub struct Runtime {
     app: Arc<RwLock<Option<Arc<App>>>>,
     df: Arc<DataFusion>,
-    models: Arc<RwLock<HashMap<String, Model>>>,
+    // `Arc<Model>` (not `Model`) so a handle can be cloned out of the lock and
+    // moved into `spawn_blocking` to run synchronous inference off the runtime.
+    models: Arc<RwLock<HashMap<String, Arc<Model>>>>,
     llm_runtime_stores: Arc<model::LlmRuntimeStores>,
     http_rate_control_registry: Arc<dataconnector::http_rate_control::HttpRateControlRegistry>,
     embeds: Arc<RwLock<EmbeddingModelStore>>,
