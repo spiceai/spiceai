@@ -314,15 +314,29 @@ impl<'a> AppendMutationWriter<'a> {
             && self.table.has_pending_deletions();
 
         // N>1 in-memory CDC: validate + append per PK-hash shard within one apply
-        // (§5 Phase 3). Engaged ONLY when the table is on the in-memory merge-on-read
-        // shape with deferral armed, has no pending PK deletions (those force the
-        // durable path), AND is configured for >1 shard. Every other case — and
+        // (§5 Phase 3). Engaged for EVERY in-memory upsert apply on a non-partitioned,
+        // deferral-armed, >1-shard table.
+        //
+        // CRITICAL — this path must NOT be gated on `!pending_pk_deletions`. A real CDC
+        // table almost always carries a tombstone in its durable deletion index (every
+        // upsert supersedes, every delete tombstones), so gating on it diverted ~98% of
+        // applies to the SERIAL shard-0 path — which stamps `source_position = None`, so
+        // the checkpoint's `durable_epoch = MAX(source_position)` never covered them and
+        // the source slot froze (the SF-100 N=4 WAL→38 GB stall; ~2239 serial vs ~82
+        // sharded applies on order_line). Sharding a pending-deletion upsert is SOUND: the
+        // per-shard validation handles on-conflict supersession (it builds per-shard
+        // `OnConflictDeletions`), and a new row is immune to any pre-existing tombstone
+        // because its `data_sequence` is reserved strictly above every prior
+        // `delete_sequence` — the same seq-ordering the serial staged path relies on — so a
+        // stale-PRESENT existence-index hit costs at most a harmless redundant tombstone
+        // under upsert semantics. CDC DELETE bursts take the separately-sharded
+        // `append_delete_intents_sharded`, so EVERY apply at N>1 stays on the one
+        // `apply_epoch` slot-ack axis the checkpoint reconciles. Every other case — and
         // ALWAYS at N=1 — falls through to the byte-identical serial path below.
         let mem_tier_shards = self.table.mem_tier_shard_count();
         if mem_tier_shards > 1
             && self.table.is_cdc_memory_mode()
             && self.table.has_slot_advancer()
-            && !pending_pk_deletions
             && self.table.metadata().partition_column.is_none()
         {
             if let Some(prepared) = self
