@@ -20,8 +20,9 @@ use arrow::datatypes::DataType;
 use async_trait::async_trait;
 use spice_cloud_client::CloudClient;
 use spicepod::component::runtime::{
-    Scheduler, default_max_partition_assignments_per_interval, default_max_partitions_per_executor,
-    default_partition_assignment_interval, default_partition_discovery_timeout,
+    Query, Scheduler, default_max_partition_assignments_per_interval,
+    default_max_partitions_per_executor, default_partition_assignment_interval,
+    default_partition_discovery_timeout,
 };
 use spicepod::param::{ParamValue, Params};
 use spicepod::spec::SpicepodDefinition;
@@ -2038,6 +2039,33 @@ async fn generate_initial_spicepod(
                     .insert("s3_region".to_string(), ParamValue::String(region))
             });
             spicepod.runtime.scheduler = Some(sched);
+        }
+    }
+
+    // Route Ballista shuffle output and query spill/temp files onto the
+    // executor's data PVC. The cluster-bench workflow exports these env vars
+    // (with `{github_run_id}`/`{github_run_attempt}` placeholders already
+    // substituted); they are inherited down through testoperator into this
+    // process. Without them the executor's work_dir falls back to
+    // `env::temp_dir()` (`/tmp`), which in the cloud is a small EmptyDir whose
+    // `sizeLimit` a SF10+ shuffle blows past — getting the executor pod evicted
+    // mid-query and livelocking the run. Mirrors the SCHEDULER_STATE_LOCATION
+    // env handling above.
+    if let Ok(shuffle_location) = std::env::var("SPIDAPTER_SHUFFLE_LOCATION") {
+        let shuffle_location = shuffle_location.trim();
+        if !shuffle_location.is_empty() {
+            spicepod.runtime.params.insert(
+                "shuffle_location".to_string(),
+                shuffle_location.to_string(),
+            );
+        }
+    }
+    if let Ok(temp_directory) = std::env::var("SPIDAPTER_QUERY_TEMP_DIRECTORY") {
+        let temp_directory = temp_directory.trim();
+        if !temp_directory.is_empty() {
+            let mut query = spicepod.runtime.query.clone().unwrap_or_else(Query::default);
+            query.temp_directory = Some(temp_directory.to_string());
+            spicepod.runtime.query = Some(query);
         }
     }
 
