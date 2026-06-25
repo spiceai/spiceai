@@ -52,6 +52,7 @@ use cayenne::{CayenneCatalog, CayenneTableProvider, MetadataCatalog};
 use datafusion::datasource::TableProvider;
 use datafusion::execution::context::SessionContext;
 use tempfile::TempDir;
+use tokio::sync::Barrier;
 
 type TestResult<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
@@ -129,9 +130,16 @@ async fn overwrite_finish_never_exposes_a_torn_snapshot_to_a_concurrent_scan() -
         .collect()
         .await?;
 
+    // Start both loops together so they genuinely overlap — the torn-publish window
+    // is narrow, and a shared barrier maximizes interleaving (cf.
+    // shared_metastore_concurrency_test.rs).
+    let start = Arc::new(Barrier::new(2));
+
     // Writer: repeatedly OVERWRITE with the same KEY_COUNT keys (count-invariant).
     let writer_ctx = ctx.clone();
+    let writer_start = Arc::clone(&start);
     let writer = tokio::spawn(async move {
+        writer_start.wait().await;
         for iteration in 0..ITERATIONS {
             let salt = i64::try_from(iteration % 7).expect("salt fits i64");
             writer_ctx
@@ -149,7 +157,9 @@ async fn overwrite_finish_never_exposes_a_torn_snapshot_to_a_concurrent_scan() -
 
     // Reader: scan concurrently; a torn publish shows a count != KEY_COUNT.
     let reader_ctx = ctx.clone();
+    let reader_start = Arc::clone(&start);
     let reader = tokio::spawn(async move {
+        reader_start.wait().await;
         let mut torn_observations = 0_usize;
         for _ in 0..ITERATIONS {
             if scan_count(&reader_ctx).await != KEY_COUNT {
