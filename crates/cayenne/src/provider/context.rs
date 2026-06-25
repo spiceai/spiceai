@@ -99,8 +99,11 @@ pub struct CayenneContext {
     /// controller had no move left (every relevant lever clamped). At
     /// [`tuning::GOAL_INFEASIBLE_STUCK_TICKS`] the SLO is declared infeasible on the
     /// current hardware — surfaced via [`Self::goal_slo_infeasible`] (telemetry) and
-    /// a one-time operator warning. Reset to 0 whenever a move is made or the goal
-    /// is met. `0` when not goal-driven.
+    /// one operator warning per infeasible *episode* (fired on the crossing tick).
+    /// Deliberately NOT a permanent latch: reset to 0 whenever the controller makes a
+    /// move again or the goal is met, so the signal self-clears if the SLO becomes
+    /// reachable (and re-warns only if a fresh episode crosses the threshold again).
+    /// `0` when not goal-driven.
     goal_stuck_ticks: std::sync::atomic::AtomicU64,
     /// Wall-clock of the previous recorded CDC write, used to derive the
     /// inter-batch arrival interval (the offered-load signal). `None` until the
@@ -750,7 +753,8 @@ impl CayenneContext {
     /// [`Self::goal_stuck_ticks`]). A made move or a met goal resets the counter; an
     /// eligible tick (past warmup + dwell) that is still violated with no move
     /// increments it. On crossing [`tuning::GOAL_INFEASIBLE_STUCK_TICKS`] it warns
-    /// once, naming the binding constraint; the latched gauge is read separately.
+    /// once for that episode, naming the binding constraint; the gauge
+    /// ([`Self::goal_slo_infeasible`]) reflects current state and is read separately.
     fn track_goal_feasibility(
         &self,
         snapshot: &tuning::IngestSnapshot,

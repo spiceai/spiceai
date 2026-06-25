@@ -450,13 +450,19 @@ pub(crate) async fn probe_storage_perf_async(path: &str) -> StoragePerf {
     if path.is_empty() {
         return StoragePerf::default();
     }
-    // Resolve to the directory actually probed (the parent when handed a file path)
-    // and canonicalize THAT, so the per-volume memo key matches the probed
-    // directory — different files on the same volume dedupe to a single probe.
-    let Some(dir) = probe_dir(Path::new(path)) else {
+    // Resolve + canonicalize the probed directory (the parent when handed a file
+    // path) OFF the runtime — `is_dir`/`canonicalize` are blocking syscalls. The
+    // result is the per-volume memo key, so different files on one volume dedupe to
+    // a single probe.
+    let path_owned = path.to_string();
+    let Some(key) = tokio::task::spawn_blocking(move || {
+        probe_dir(Path::new(&path_owned)).map(|dir| dir.canonicalize().unwrap_or(dir))
+    })
+    .await
+    .ok()
+    .flatten() else {
         return StoragePerf::default();
     };
-    let key = dir.canonicalize().unwrap_or(dir);
     // Per-key shared cell: concurrent registrations on the same volume COALESCE on a
     // single probe via `get_or_init` instead of each firing an 8 MiB write + fsync.
     let cell = {

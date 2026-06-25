@@ -155,20 +155,27 @@ pub fn set_global_encode_concurrency(permits: usize) {
 /// nothing. A no-op when no budget is installed yet or the cap does not bind.
 pub fn cap_global_encode_concurrency(max_permits: usize) {
     let max_permits = max_permits.max(1);
-    {
-        let guard = GLOBAL_ENCODE_BUDGET.read();
-        match guard.as_ref() {
-            Some(budget) if budget.total > max_permits => {}
-            // No budget installed yet, or the cap is already ≥ the current total.
-            _ => return,
+    // Check-and-replace under a SINGLE write lock so concurrent registrations
+    // proposing different caps can't race (a looser cap landing last must not raise
+    // the budget back up): re-read the current total under the lock and replace only
+    // while it still exceeds `max_permits`. "Tightest wins, never raises" holds.
+    let mut guard = GLOBAL_ENCODE_BUDGET.write();
+    match guard.as_ref() {
+        Some(budget) if budget.total > max_permits => {
+            tracing::info!(
+                target: "cayenne::write_budget",
+                max_permits,
+                "Capping global encode-concurrency budget to the instance EBS write-bandwidth ceiling"
+            );
+            *guard = Some(EncodeBudget {
+                semaphore: Arc::new(Semaphore::new(max_permits)),
+                maintenance_gate: Arc::new(Semaphore::new(maintenance_gate_cap(max_permits))),
+                total: max_permits,
+            });
         }
+        // No budget installed yet, or the cap is already ≥ the current total.
+        _ => {}
     }
-    tracing::info!(
-        target: "cayenne::write_budget",
-        max_permits,
-        "Capping global encode-concurrency budget to the instance EBS write-bandwidth ceiling"
-    );
-    set_global_encode_concurrency(max_permits);
 }
 
 /// Acquire up to `shards` encode permits from the global budget, atomically.

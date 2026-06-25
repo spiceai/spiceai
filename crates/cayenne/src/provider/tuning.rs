@@ -282,9 +282,10 @@ const GOAL_MIN_STEP_FRACTION: f64 = 0.25;
 /// already clamped at its bound — before the SLO is declared infeasible on the
 /// current hardware. At [`STEPS_PER_WINDOW`] ticks per convergence window this is
 /// ~2 windows of being maxed out, long enough to rule out transient convergence.
-/// Surfaced as a telemetry gauge + a one-time operator warning naming the binding
-/// constraint (e.g. EBS-bandwidth-bound) so silent underperformance becomes
-/// actionable (provision more IOPS/throughput, or relax the SLO).
+/// Surfaced as a telemetry gauge + one operator warning per infeasible episode,
+/// naming the binding constraint (e.g. EBS-bandwidth-bound) so silent
+/// underperformance becomes actionable (provision more IOPS/throughput, or relax
+/// the SLO). The signal self-clears if the controller resumes progress.
 pub(crate) const GOAL_INFEASIBLE_STUCK_TICKS: u64 = 2 * STEPS_PER_WINDOW as u64;
 
 // ---------------------------------------------------------------------------

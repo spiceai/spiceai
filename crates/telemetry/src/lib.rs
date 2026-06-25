@@ -1027,7 +1027,8 @@ pub struct CayenneAutotuneState {
     pub metastore_storage_write_mbps: f64,
     /// `1` when the goal-driven controller has declared the SLO infeasible on this
     /// hardware (every relevant actuator clamped and the goal still violated); `0`
-    /// otherwise. A latched, actionable signal that the configured SLO cannot be met.
+    /// otherwise. Reflects current state — self-clears if the SLO becomes reachable
+    /// again — so an operator can alert on a sustained `1`.
     pub goal_slo_infeasible: u64,
 }
 
