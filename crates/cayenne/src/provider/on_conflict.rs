@@ -42,9 +42,7 @@ use std::task::{Context, Poll};
 use std::time::Instant;
 
 use super::deletion_index::{DeletionIndex, KeyDeletionIndex};
-use super::deletion_strategy::{
-    Int64PkDeletionSnapshot, PkDeletionStrategyWithCache, RowConverterDeletionSnapshot,
-};
+use super::deletion_strategy::PkDeletionStrategyWithCache;
 use super::table::{
     CayenneTableProvider, InlinedDeletionMaps, OnConflictExt, UpsertOptions,
     record_cayenne_write_phase,
@@ -516,13 +514,39 @@ impl OnConflictUpdate {
     }
 }
 
+/// A replayable deletion-index delta, folded into the LIVE index under `rcu`
+/// at publish time.
+///
+/// Carrying the operations — rather than a snapshot prebuilt from a `load` at
+/// prepare time — is what makes the on-conflict publish lost-update-safe:
+/// `commit_on_conflict_deletion_update` re-applies the delta against whatever
+/// index is live when it commits, so a concurrent compaction prune or
+/// delete-sink add (which serialize on a DIFFERENT lock than the on-conflict
+/// finalize) can never be clobbered by storing a snapshot built off a stale
+/// load. The `extend_max_*` folds are per-key max, so replaying the delta over
+/// concurrent changes is order-independent.
+pub(crate) struct Int64DeletionDelta {
+    /// `(delete_sequence, pks)` groups folded via `extend_max_deletes`.
+    pub(crate) pure: Vec<(i64, Vec<i64>)>,
+    /// `(delete_sequence, pks, insert_sequence)` groups folded via `extend_max_conflicts`.
+    pub(crate) reinsert: Vec<(i64, Vec<i64>, i64)>,
+}
+
+/// Key-based counterpart to [`Int64DeletionDelta`].
+pub(crate) struct RowKeyDeletionDelta {
+    /// `(delete_sequence, keys)` groups folded via `extend_max_deletes`.
+    pub(crate) pure: Vec<(i64, Vec<Box<[u8]>>)>,
+    /// `(delete_sequence, keys, insert_sequence)` groups folded via `extend_max_conflicts`.
+    pub(crate) reinsert: Vec<(i64, Vec<Box<[u8]>>, i64)>,
+}
+
 pub(crate) enum OnConflictDeletionUpdate {
     /// No key-based deletion-cache change (pure position deletes or no deletes).
     None,
-    /// New `Int64Pk` deletion snapshot to publish.
-    Int64Pk(Arc<Int64PkDeletionSnapshot>),
-    /// New `RowConverterBased` deletion snapshot to publish.
-    RowConverter(Arc<RowConverterDeletionSnapshot>),
+    /// `Int64Pk` deletion delta to fold into the live index.
+    Int64Pk(Int64DeletionDelta),
+    /// `RowConverterBased` deletion delta to fold into the live index.
+    RowConverter(RowKeyDeletionDelta),
 }
 
 #[derive(Clone)]
