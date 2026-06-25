@@ -16153,10 +16153,13 @@ dependencies = [
  "runtime-object-store",
  "runtime-parameters",
  "runtime-proto",
+ "runtime-query-engine",
  "runtime-rate-control",
  "runtime-request-context",
+ "runtime-search",
  "runtime-secrets",
  "runtime-table-partition",
+ "runtime-tools",
  "rusqlite",
  "rustls",
  "rustls-pemfile 2.2.0",
@@ -16357,7 +16360,6 @@ dependencies = [
  "datafusion-pruning",
  "datafusion-table-providers",
  "futures",
- "globset",
  "insta",
  "itertools 0.14.0",
  "object_store",
@@ -16365,6 +16367,7 @@ dependencies = [
  "parking_lot 0.12.5",
  "runtime-datafusion-index",
  "runtime-datafusion-udfs",
+ "runtime-query-engine",
  "runtime-request-context",
  "search",
  "serde_json",
@@ -16499,6 +16502,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "runtime-query-engine"
+version = "2.1.0-unstable"
+dependencies = [
+ "arrow",
+ "arrow-schema",
+ "async-trait",
+ "datafusion",
+ "globset",
+ "snafu",
+]
+
+[[package]]
 name = "runtime-rate-control"
 version = "2.1.0-unstable"
 dependencies = [
@@ -16534,6 +16549,49 @@ dependencies = [
  "tokio-util",
  "tracing",
  "winver",
+]
+
+[[package]]
+name = "runtime-search"
+version = "2.1.0-unstable"
+dependencies = [
+ "app",
+ "arrow",
+ "arrow-schema",
+ "arrow_tools",
+ "async-openai",
+ "async-stream",
+ "async-trait",
+ "cache",
+ "chunking",
+ "data_components",
+ "datafusion",
+ "datafusion-expr",
+ "datafusion-federation",
+ "datafusion-functions-json",
+ "futures",
+ "insta",
+ "itertools 0.14.0",
+ "llms",
+ "moka",
+ "rayon",
+ "runtime-datafusion-index",
+ "runtime-datafusion-udfs",
+ "runtime-proto",
+ "runtime-query-engine",
+ "runtime-request-context",
+ "schemars 1.2.1",
+ "search",
+ "serde",
+ "serde_json",
+ "snafu",
+ "spicepod",
+ "telemetry",
+ "tokio",
+ "tonic",
+ "tracing",
+ "util",
+ "utoipa",
 ]
 
 [[package]]
@@ -16591,6 +16649,46 @@ dependencies = [
  "tokio-stream",
  "tracing",
  "util",
+]
+
+[[package]]
+name = "runtime-tools"
+version = "2.1.0-unstable"
+dependencies = [
+ "app",
+ "arrow",
+ "arrow-json",
+ "arrow-schema",
+ "arrow_tools",
+ "async-openai",
+ "async-trait",
+ "cache",
+ "chrono",
+ "datafusion",
+ "fundu",
+ "futures",
+ "globset",
+ "http 1.4.1",
+ "itertools 0.14.0",
+ "rmcp",
+ "runtime-auth",
+ "runtime-query-engine",
+ "runtime-request-context",
+ "runtime-search",
+ "schemars 1.2.1",
+ "secrecy",
+ "serde",
+ "serde_json",
+ "snafu",
+ "spicepod",
+ "tokio",
+ "tools",
+ "tracing",
+ "tracing-futures",
+ "url",
+ "util",
+ "utoipa",
+ "uuid 1.23.2",
 ]
 
 [[package]]
@@ -17279,6 +17377,7 @@ dependencies = [
  "itertools 0.14.0",
  "llms",
  "runtime-datafusion-index",
+ "runtime-query-engine",
  "runtime-table-partition",
  "serde",
  "serde_json",
@@ -18271,6 +18370,7 @@ dependencies = [
  "runtime-async",
  "runtime-auth",
  "runtime-datafusion",
+ "runtime-query-engine",
  "rustls",
  "snafu",
  "snmalloc-rs",

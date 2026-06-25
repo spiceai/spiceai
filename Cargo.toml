@@ -39,6 +39,9 @@ members = [
     "crates/runtime-cluster",
     "crates/datafusion-flightsql",
     "crates/runtime-datafusion",
+    "crates/runtime-query-engine",
+    "crates/runtime-search",
+    "crates/runtime-tools",
     "crates/runtime-datafusion-index",
     "crates/runtime-datafusion-udfs",
     "crates/runtime-proto",
@@ -289,6 +292,7 @@ regex = "1.12.3"
 reqwest = { version = "=0.12.24", features = ["json", "rustls-tls", "gzip", "brotli", "zstd", "deflate"] }
 reqsign-core = "3.0.0"
 rmcp = { version = "1.5.0", default-features = false }
+rayon = "1.11.0"
 roaring = "0.11"
 rusqlite = { version = "0.40", features = ["bundled-decimal", "chrono"] }
 rustls = "0.23"
@@ -349,6 +353,7 @@ turso-shared = { path = "crates/turso-shared" }
 twox-hash = "2.1.2"
 url = { version = "2.5", features = ["serde"] }
 util = { path = "crates/util", default-features = false }
+utoipa = { version = "5" }
 uuid = "1"
 wasmtime = { version = "44.0.1", default-features = false, features = ["cranelift", "runtime", "std"] }
 wat = "1.248.0"

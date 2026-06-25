@@ -36,11 +36,9 @@ use tracing_futures::Instrument;
 
 use crate::{
     Runtime,
-    tools::{
-        options::SpiceToolsOptions,
-        utils::{get_tools, parameters},
-    },
+    tools::utils::{get_tools, parameters},
 };
+use runtime_tools::options::SpiceToolsOptions;
 
 const TOOL_SEARCH_NAME: &str = "tool_search";
 const TOOL_INVOKE_NAME: &str = "tool_invoke";
