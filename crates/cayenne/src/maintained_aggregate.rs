@@ -564,9 +564,19 @@ impl MaintainedAggregateRegistry {
     /// filter equality), and O(groups) materialize the optimizer rewrite uses —
     /// the entry point for benches/tests that measure the maintained serve cost.
     ///
+    /// # Returns
+    ///
+    /// `Ok(Some(batch))` when the registry is fresh at `scan_epoch`, a view
+    /// matches `spec` exactly, and it materializes into `output_schema`.
+    /// `Ok(None)` is the fallback signal (the caller should run normal
+    /// execution) when the registry is stale at `scan_epoch`, no view matches
+    /// `spec`, or the matched view does not fit `output_schema`.
+    ///
     /// # Errors
     ///
-    /// Returns an error if a matching maintained view cannot be materialized.
+    /// Returns an error only when a matched view fails to build its result
+    /// arrays (e.g. a group-key or scalar-value conversion error) — not for the
+    /// stale / no-match / schema-mismatch fallbacks above, which are `Ok(None)`.
     pub fn batch_for_spec(
         &self,
         spec: &MaintainedAggregateSpec,
