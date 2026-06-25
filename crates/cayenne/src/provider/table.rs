@@ -10491,44 +10491,56 @@ impl CayenneTableProvider {
         // `compact_protected_snapshots_subset`). `try_lock` + defer so a busy
         // writer postpones compaction rather than blocking ingestion.
         let (_position_write_guard, _position_visibility_guard) = if uses_position_deletes {
-            let Ok(write_guard) = self.write_lock_arc().try_lock_owned() else {
-                tracing::trace!(
-                    target: "cayenne::compaction",
-                    table = self.table_metadata.table_name.as_str(),
-                    "Deferring full compaction: a writer is active on this position-delete \
-                     table (file-scoped tombstones cannot be sequence-fenced, so the rewrite \
-                     must exclude concurrent writers)",
-                );
-                return Ok(());
-            };
+            // Blocking acquire (not try_lock): the full-snapshot rewrite must
+            // always make progress — a try_lock+defer would starve it on a busy
+            // table (the documented "files accumulate unboundedly" failure mode)
+            // and would no-op a direct/explicit compaction call. We wait for the
+            // current writer instead, then exclude writers for the rest of the
+            // rewrite. Deadlock-safe: the full rewrite is only ever invoked
+            // holding `compaction_lock` (never `write_lock`), so this can't
+            // re-enter the lock.
+            let write_guard = self.write_lock_arc().lock_owned().await;
             let visibility_guard = self.visibility_lock_arc().lock_owned().await;
             (Some(write_guard), Some(visibility_guard))
         } else {
             (None, None)
         };
 
-        // Key-delete tables: capture a COHERENT sequence cutoff + the set of
-        // protected snapshots being folded in, under a brief `write_lock`. Under
-        // `write_lock` no writer is mid-publish, so every mutation with
-        // `seq <= cutoff` is already visible to the rewrite scan below; anything
-        // that arrives afterward gets `seq > cutoff` and is carried forward (NOT
-        // cleared) at the end. The lock is released immediately — the long
-        // encode runs fully concurrent with writers, preserving CDC throughput.
-        let fence: Option<(i64, std::collections::HashSet<String>)> = if uses_position_deletes {
-            None
-        } else {
-            let _capture_guard = self.write_lock_arc().lock_owned().await;
-            let cutoff = self.sequence_high_water().await;
-            let folded: std::collections::HashSet<String> =
-                self.protected_snapshots.load_full().keys().cloned().collect();
-            Some((cutoff, folded))
-        };
-
         // Use the dedicated compaction memory environment (carved budget) when
         // injected, so this rewrite accounts its memory against the isolated
         // compaction pool rather than competing with queries for the query pool.
         let ctx = self.create_compaction_session_context();
-        let mut stream = self.visible_file_stream_for_rewrite(&ctx).await?;
+
+        // Build the visible stream and, for key-delete tables, capture a COHERENT
+        // `(cutoff, folded protected snapshots)` fence under a brief `write_lock`
+        // held ACROSS stream construction. Holding it across the build (not just a
+        // point read) is required so the captured `folded` set EXACTLY matches
+        // what the stream folds in: `visible_file_stream_for_rewrite` may run an
+        // inline-data checkpoint that itself creates a protected snapshot, and no
+        // concurrent writer may slip a protected snapshot in between the capture
+        // and the scan. Under `write_lock` no writer is mid-publish, so every
+        // mutation with `seq <= cutoff` is already visible to the scan; anything
+        // that arrives afterward gets `seq > cutoff` and is carried forward (NOT
+        // cleared) at the end. The lock is released as soon as the stream object
+        // exists (it has already pinned its inputs), so the slow encode below
+        // runs fully concurrent with writers, preserving CDC throughput.
+        //
+        // Position-delete tables already hold `write_lock` for the whole rewrite
+        // (above) and clear everything at the end, so they need no fence.
+        let (mut stream, fence): (
+            SendableRecordBatchStream,
+            Option<(i64, std::collections::HashSet<String>)>,
+        ) = if uses_position_deletes {
+            let stream = self.visible_file_stream_for_rewrite(&ctx).await?;
+            (stream, None)
+        } else {
+            let _capture_guard = self.write_lock_arc().lock_owned().await;
+            let stream = self.visible_file_stream_for_rewrite(&ctx).await?;
+            let cutoff = self.sequence_high_water().await;
+            let folded: std::collections::HashSet<String> =
+                self.protected_snapshots.load_full().keys().cloned().collect();
+            (stream, Some((cutoff, folded)))
+        };
 
         if self.context.has_sort_columns() {
             tracing::info!(
