@@ -16,7 +16,7 @@ limitations under the License.
 
 use crate::{
     configure_test_datafusion, init_tracing,
-    utils::{runtime_ready_check, test_request_context},
+    utils::{register_test_connectors, runtime_ready_check, test_request_context},
 };
 use anyhow::Context;
 use app::AppBuilder;
@@ -105,6 +105,10 @@ async fn glue_insert_into_existing_table() -> Result<(), anyhow::Error> {
             let app = AppBuilder::new("glue-write").with_dataset(dataset).with_catalog(catalog).build();
 
             configure_test_datafusion();
+
+            // The `glue` connector is registered explicitly (its `linkme` auto-registration
+            // moved to the extracted `connector-glue` crate), so register it before building.
+            register_test_connectors().await;
 
             let rt = Runtime::builder().with_app(app).build().await;
             let cloned_rt = Arc::new(rt.clone());
