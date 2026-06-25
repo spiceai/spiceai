@@ -367,7 +367,7 @@ vortex-session = { git = "https://github.com/spiceai/vortex.git", rev = "729249d
 vortex-utils = { git = "https://github.com/spiceai/vortex.git", rev = "729249dd35e9af37ffbcd606ea51ebb60f9ac71b" } # spiceai-54
 
 x509-certificate = "0.25.0"
-spiceai = { git = "https://github.com/spiceai/spice-rs.git", rev = "1b0852221fdee5814ecf92f8203b18b980d4c291" } # phillip/client-lazy-flight
+spiceai = { git = "https://github.com/spiceai/spice-rs.git", rev = "93b75c3c7d1a812b23d00b45adf537d7a2415496" } # spiceai/spice-rs#77
 
 [profile.release-lto]
 inherits = "release"
