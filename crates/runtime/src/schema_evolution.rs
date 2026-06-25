@@ -81,18 +81,16 @@ pub fn engine_supports_in_place_evolution(engine: Engine) -> bool {
     )
 }
 
-/// Engines whose [`crate::dataaccelerator::DataAccelerator::drop_table`] actually
-/// drops the stored table, so the accelerated table can be dropped and recreated with
-/// a new schema (the `on_schema_change: drop_and_recreate` path). This is the same set
-/// as [`engine_supports_in_place_evolution`]: Arrow is memory-only (a full refresh
-/// already rebuilds it from the source), and Postgres / partitioned engines have a
-/// no-op `drop_table`, so a recreate could not safely replace the table.
+/// Engines whose [`crate::dataaccelerator::DataAccelerator::drop_table`] actually drops the
+/// stored table, so the accelerated table can be dropped and recreated with a new schema (the
+/// `on_schema_change: drop_and_recreate` path). Today this is exactly the in-place-evolution
+/// set: the four engines with a real `drop_table` (DuckDB/SQLite/Turso/Cayenne) are the same
+/// four with `evolve_table_schema`; Arrow is memory-only (a full refresh rebuilds it) and
+/// Postgres / partitioned engines have a no-op `drop_table`. Delegate to keep the two in sync;
+/// if a future engine gains one capability but not the other, split this back into its own match.
 #[must_use]
 pub fn engine_supports_recreate(engine: Engine) -> bool {
-    matches!(
-        engine,
-        Engine::DuckDB | Engine::Sqlite | Engine::Turso | Engine::Cayenne
-    )
+    engine_supports_in_place_evolution(engine)
 }
 
 /// Whether a schema change that cannot be applied in place should DROP and RECREATE the
