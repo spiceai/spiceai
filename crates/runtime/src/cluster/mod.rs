@@ -1923,28 +1923,43 @@ async fn create_scheduler_server(
             .with_ballista_shuffle_memory_mode(shuffle_memory_mode)
     });
 
-    // Back job state with shared object storage when a scheduler state location
-    // is configured, so in-flight jobs survive scheduler loss and any scheduler
-    // can resume them; otherwise keep job state in memory.
-    // The spicepod is loaded asynchronously after the runtime is built, so wait
-    // briefly for it before choosing the job state backend.
-    let scheduler_cfg = 'wait: {
-        for _ in 0..300 {
+    // Back job state with shared object storage when a scheduler state location is
+    // configured, so in-flight jobs survive scheduler loss and any scheduler can
+    // resume them; otherwise keep job state in memory.
+    //
+    // The spicepod loads asynchronously after the runtime is built. Wait for it with
+    // a fibonacci backoff and keep retrying until it loads (warning periodically)
+    // rather than giving up — when a state location is configured we must honor it,
+    // not silently degrade to in-memory.
+    let scheduler_cfg = {
+        let mut backoff = util::fibonacci_backoff::FibonacciBackoffBuilder::new()
+            .max_retries(None)
+            .build();
+        let started = std::time::Instant::now();
+        let mut last_warn = std::time::Instant::now();
+        loop {
             if let Some(app) = rt.read_app().await {
-                break 'wait app.runtime.scheduler.clone();
+                break app.runtime.scheduler.clone();
             }
-            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            if last_warn.elapsed() >= std::time::Duration::from_secs(30) {
+                tracing::warn!(
+                    "still waiting for the spicepod to load before configuring the \
+                     scheduler's job state ({}s elapsed)",
+                    started.elapsed().as_secs()
+                );
+                last_warn = std::time::Instant::now();
+            }
+            let delay = backoff
+                .next_duration()
+                .unwrap_or_else(|| std::time::Duration::from_secs(30))
+                .min(std::time::Duration::from_secs(30));
+            tokio::time::sleep(delay).await;
         }
-        tracing::warn!(
-            "spicepod not available after 30s; distributed scheduler falling back to \
-             in-memory job state (cross-scheduler job failover disabled)"
-        );
-        None
     };
     let job_state: Arc<dyn JobState> = if let Some(scheduler_cfg) = scheduler_cfg {
         tracing::info!(
             state_location = %scheduler_cfg.state_location,
-            "Distributed scheduler using shared object-store job state"
+            "Scheduler using shared object-store job state"
         );
         let (store, base_prefix) = scheduler_registry::build_object_store(
             rt.as_ref(),

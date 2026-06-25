@@ -81,6 +81,7 @@ struct SchedulerRegistryRunner {
     instance_id: Uuid,
     entry: SchedulerEntry,
     peers: Arc<RwLock<SchedulerPeers>>,
+    job_executor: Arc<crate::jobs::JobExecutor>,
 }
 
 pub async fn start_scheduler_registry(
@@ -139,15 +140,11 @@ pub async fn start_scheduler_registry(
         config.state_location
     );
 
-    spawn_job_recovery_loop(
-        Arc::clone(&job_executor),
-        Arc::clone(&peers),
-        instance_id,
-        cancel.clone(),
-    );
-
     let reaper = Reaper::new(Arc::clone(&cluster), Arc::clone(&heartbeats));
 
+    // The job-recovery sweep runs as another arm of the runner's select loop (see
+    // `run`), so it shares this already-tracked registry task's lifecycle and
+    // graceful shutdown rather than a separate untracked tokio::spawn.
     let runner = SchedulerRegistryRunner {
         cluster,
         heartbeats,
@@ -156,37 +153,10 @@ pub async fn start_scheduler_registry(
         instance_id,
         entry,
         peers,
+        job_executor,
     };
 
     runner.run(cancel).await
-}
-
-/// Periodically re-drives running jobs whose owning scheduler is no longer
-/// among the live peers.
-fn spawn_job_recovery_loop(
-    job_executor: Arc<crate::jobs::JobExecutor>,
-    peers: Arc<RwLock<SchedulerPeers>>,
-    instance_id: Uuid,
-    cancel: CancellationToken,
-) {
-    tokio::spawn(async move {
-        // `interval()` fires immediately on the first tick; start one interval out
-        // so the initial peer discovery has populated `peers` before the first
-        // sweep. Otherwise live schedulers look orphaned and their in-flight jobs
-        // would be wrongly recovered at startup.
-        let mut tick = tokio::time::interval_at(
-            tokio::time::Instant::now() + JOB_RECOVERY_INTERVAL,
-            JOB_RECOVERY_INTERVAL,
-        );
-        loop {
-            tokio::select! {
-                () = cancel.cancelled() => break,
-                _ = tick.tick() => {
-                    recover_orphaned_jobs(&job_executor, &peers, instance_id).await;
-                }
-            }
-        }
-    });
 }
 
 /// Resumes any running job whose recorded scheduler instance is not currently
@@ -244,6 +214,13 @@ impl SchedulerRegistryRunner {
         let mut heartbeat_tick = tokio::time::interval(heartbeat_interval);
         let mut discovery_tick = tokio::time::interval(DISCOVERY_INTERVAL);
         let mut reaper_tick = tokio::time::interval(reaper_jittered);
+        // `interval_at` starts the first recovery sweep one interval out, so the
+        // initial discovery below has populated `peers` before we judge any job
+        // orphaned — otherwise live schedulers look lost at startup.
+        let mut recovery_tick = tokio::time::interval_at(
+            tokio::time::Instant::now() + JOB_RECOVERY_INTERVAL,
+            JOB_RECOVERY_INTERVAL,
+        );
 
         // Run an initial discovery so peers are populated promptly.
         if let Err(err) = self.refresh_peers().await {
@@ -283,6 +260,9 @@ impl SchedulerRegistryRunner {
                             "Skipping reaper tick because current time is unavailable: {err}"
                         ),
                     }
+                }
+                _ = recovery_tick.tick() => {
+                    recover_orphaned_jobs(&self.job_executor, &self.peers, self.instance_id).await;
                 }
             }
         }

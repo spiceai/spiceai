@@ -241,6 +241,14 @@ macro_rules! handle_error {
     }};
 }
 
+/// How a distributed query is started: planned and submitted fresh, or recovered
+/// and resumed from an existing job whose owning scheduler was lost.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DistributedSubmitMode {
+    New,
+    Resume,
+}
+
 impl Query {
     fn ensure_not_cancelled(
         token: &tokio_util::sync::CancellationToken,
@@ -515,7 +523,12 @@ impl Query {
         }
 
         let result = self
-            .submit_distributed_internal(job_id, request_context, span.clone(), false)
+            .submit_distributed_internal(
+                job_id,
+                request_context,
+                span.clone(),
+                DistributedSubmitMode::New,
+            )
             .await;
         if let Err(e) = &result {
             tracing::error!(target: "task_history", parent: &span, "{e}");
@@ -549,7 +562,12 @@ impl Query {
         }
 
         let result = self
-            .submit_distributed_internal(job_id, request_context, span.clone(), true)
+            .submit_distributed_internal(
+                job_id,
+                request_context,
+                span.clone(),
+                DistributedSubmitMode::Resume,
+            )
             .await;
         if let Err(e) = &result {
             tracing::error!(target: "task_history", parent: &span, "{e}");
@@ -563,7 +581,7 @@ impl Query {
         job_id: &str,
         request_context: Arc<RequestContext>,
         span: Span,
-        resume: bool,
+        mode: DistributedSubmitMode,
     ) -> Result<QueryHandle> {
         // Get the scheduler server
         let scheduler = Self::get_scheduler_server(&self.df)?;
@@ -740,7 +758,7 @@ impl Query {
         // Submit the job to the Ballista scheduler, or resume driving an
         // existing one whose owning scheduler was lost. The job id is used as
         // the Ballista job id so it can be addressed across schedulers.
-        let ballista_job_id = if resume {
+        let ballista_job_id = if mode == DistributedSubmitMode::Resume {
             scheduler
                 .recover_job(job_id)
                 .await
