@@ -34,6 +34,7 @@ const DEFAULT_BASE_URL: &str = "https://api.spice.ai";
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// HTTP client for the Spice Cloud API.
+#[derive(Clone)]
 pub struct CloudClient {
     base_url: String,
     client: Client,

@@ -6363,7 +6363,7 @@ dependencies = [
 [[package]]
 name = "datafusion-table-providers"
 version = "0.1.0"
-source = "git+https://github.com/spiceai/datafusion-table-providers.git?rev=3d8eca098dc5aefe361625b834ad834d2b846137#3d8eca098dc5aefe361625b834ad834d2b846137"
+source = "git+https://github.com/spiceai/datafusion-table-providers.git?rev=6b64a83d3bbd243003750c8b2e59eac50e094d65#6b64a83d3bbd243003750c8b2e59eac50e094d65"
 dependencies = [
  "adbc_core",
  "adbc_driver_manager",
@@ -6390,6 +6390,7 @@ dependencies = [
  "geo-types",
  "hickory-resolver",
  "itertools 0.14.0",
+ "logos",
  "mongodb",
  "mysql_async",
  "native-tls",
@@ -18198,7 +18199,7 @@ dependencies = [
 [[package]]
 name = "spiceai"
 version = "3.2.0"
-source = "git+https://github.com/spiceai/spice-rs.git?rev=7bc9e455d47aa8899acc5c6c91f7448bea5637b2#7bc9e455d47aa8899acc5c6c91f7448bea5637b2"
+source = "git+https://github.com/spiceai/spice-rs.git?rev=93b75c3c7d1a812b23d00b45adf537d7a2415496#93b75c3c7d1a812b23d00b45adf537d7a2415496"
 dependencies = [
  "arrow",
  "arrow-flight",
