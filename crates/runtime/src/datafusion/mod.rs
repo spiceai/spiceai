@@ -3210,7 +3210,9 @@ impl DataFusion {
                 1,
                 &schema_evolution_labels(&dataset_name, "recreate", "recreate"),
             );
-            emit_schema_evolution_event(&dataset_name, "recreated", &diff, false);
+            // Use the same `recreate` action label as the SCHEMA_EVOLUTION_APPLIED metric
+            // above so metrics and task_history rows correlate by action for this outcome.
+            emit_schema_evolution_event(&dataset_name, "recreate", &diff, false);
         }
 
         Ok(None)

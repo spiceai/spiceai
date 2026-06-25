@@ -645,7 +645,9 @@ async fn run_drop_recreate_csv_phases(
             rt.shutdown().await;
             drop(rt);
 
-            // Phase 2: additive column (widening) — applied IN PLACE, not recreated.
+            // Phase 2: additive column (widening) — the new column is adopted and existing
+            // rows are preserved. This asserts the observable outcome only; the in-place-ALTER
+            // vs drop+recreate distinction is covered by the classifier/policy unit tests.
             std::fs::write(csv_path, CSV_ADD_COLUMN).expect("write csv");
             let rt = Arc::new(
                 init_drop_recreate_csv_runtime(csv_path, engine, accel_params.clone()).await?,
