@@ -21467,6 +21467,7 @@ impl CayenneTableProvider {
             Arc::clone(&self.catalog),
             Arc::clone(&self.protected_snapshots),
             self.table_metadata.table_id.clone(),
+            self.clone_for_write(),
             self.table_metadata.path.clone(),
             Arc::clone(self.context.runtime_env()),
             Arc::clone(&self.write_lock),
