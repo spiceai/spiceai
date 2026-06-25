@@ -138,6 +138,13 @@ pub fn build_changes_stream(
         runtime::component::dataset::OnSchemaChange::SyncAllColumns => {
             SchemaEvolutionPolicy::SyncAllColumns
         }
+        // A CDC stream cannot drop-and-recreate without losing un-replayable history, so
+        // `drop_and_recreate` adopts widening changes like `sync_all_columns` and rejects
+        // incompatible changes mid-stream. The accelerated table is recreated only on a
+        // `refresh_mode: full` registration, not from the replication stream.
+        runtime::component::dataset::OnSchemaChange::DropAndRecreate => {
+            SchemaEvolutionPolicy::SyncAllColumns
+        }
     };
 
     Box::pin(try_stream! {

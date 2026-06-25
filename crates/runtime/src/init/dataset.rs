@@ -679,12 +679,18 @@ impl Runtime {
             return Err(err);
         }
 
-        // In file_update mode, schema mismatches are handled by create_accelerated_table
-        // which detects changes and recreates the acceleration with the new schema.
-        let allow_schema_mismatch = ds
-            .acceleration
-            .as_ref()
-            .is_some_and(|a| a.mode == Mode::FileUpdate);
+        // Bypass the deferred-mismatch gate when the dataset recreates on a schema change
+        // (`file_update` mode, or `on_schema_change: drop_and_recreate` + `refresh_mode:
+        // full`): let create_accelerated_table drop + recreate the table with the new schema
+        // instead of deferring. Uses the shared predicate so this gate and the recreate
+        // decision in create_accelerated_table cannot disagree.
+        let allow_schema_mismatch = ds.acceleration.as_ref().is_some_and(|a| {
+            crate::schema_evolution::recreates_on_schema_mismatch(
+                a,
+                ds.on_schema_change,
+                data_connector.resolve_refresh_mode(a.refresh_mode),
+            )
+        });
 
         // Test dataset connectivity by attempting to get a read provider.
         // Acquire the load semaphore (if provided) to limit concurrent source queries.
@@ -1002,10 +1008,16 @@ impl Runtime {
             }
             .build()
         })?;
-        let allow_schema_mismatch = ds
-            .acceleration
-            .as_ref()
-            .is_some_and(|a| a.mode == Mode::FileUpdate);
+        // Same recreate-bypass as the initial-load gate. Previously this honored only
+        // `file_update`, so a reloaded `on_schema_change: drop_and_recreate` dataset would not
+        // recreate on an incompatible source change; the shared helper fixes that.
+        let allow_schema_mismatch = ds.acceleration.as_ref().is_some_and(|a| {
+            crate::schema_evolution::recreates_on_schema_mismatch(
+                a,
+                ds.on_schema_change,
+                connector.resolve_refresh_mode(a.refresh_mode),
+            )
+        });
         let federated_table = FederatedTable::new(
             Arc::clone(&ds),
             read_table,
