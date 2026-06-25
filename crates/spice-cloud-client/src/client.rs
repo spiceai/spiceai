@@ -34,10 +34,6 @@ const DEFAULT_BASE_URL: &str = "https://api.spice.ai";
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// HTTP client for the Spice Cloud API.
-///
-/// `Clone` is cheap: `reqwest::Client` clones share one connection pool, and the
-/// base URL/token are small. Cloning lets RAII guards (e.g. `ScpAppGuard`) hold
-/// their own handle for best-effort cleanup on drop.
 #[derive(Clone)]
 pub struct CloudClient {
     base_url: String,

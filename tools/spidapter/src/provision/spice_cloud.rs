@@ -21,8 +21,8 @@ use system_adapter_protocol::DatasetConfig;
 use uuid::Uuid;
 
 use super::super::{
-    FederatedStorageConfig, RunState, ScpAppGuard, ScpRunState, SetupConfig,
-    generate_initial_spicepod, serialize_spicepod,
+    FederatedStorageConfig, RunState, ScpRunState, SetupConfig, generate_initial_spicepod,
+    serialize_spicepod,
 };
 use crate::args::{DeploymentMode, StdioArgs};
 use crate::commands;
@@ -99,11 +99,7 @@ pub(crate) async fn provision_scp_app(
         commands::ensure_spice_cloud_app(&cloud, &app_name, &app_create_config, deployment_mode)
             .await?;
 
-    // Arm a guard immediately: if any step below fails (`?`), the app has already
-    // been created on Spice Cloud, so the guard deletes it on drop instead of
-    // orphaning it. On success it moves into `ScpRunState` (still armed) and is
-    // disarmed by the explicit teardown path. See `ScpAppGuard`.
-    let app_guard = ScpAppGuard::new(cloud.clone(), app_id);
+    let app_guard = commands::ScpAppGuard::new(cloud.clone(), app_id);
 
     // Fetch API key from the dedicated api-keys endpoint
     let api_keys = cloud
