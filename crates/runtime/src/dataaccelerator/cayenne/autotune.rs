@@ -272,7 +272,8 @@ impl HardwareProfile {
             .write_mbps
             .unwrap_or(PER_STREAM_FALLBACK_MBPS)
             .clamp(64.0, 512.0);
-        let streams = f64_to_usize_floor((ceiling_mbps / per_stream).round());
+        // Floor (not round): a cap must never round UP past the bandwidth ceiling.
+        let streams = f64_to_usize_floor(ceiling_mbps / per_stream);
         Some(streams.max(MIN_STREAMS))
     }
 

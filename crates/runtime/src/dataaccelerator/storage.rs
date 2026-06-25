@@ -354,7 +354,12 @@ const PROBE_CHUNK_BYTES: usize = 256 * 1024;
 /// canonicalized directory; a poisoned lock recovers in-place (the probe is
 /// best-effort, never load-bearing).
 static PROBE_CACHE: std::sync::LazyLock<
-    std::sync::Mutex<std::collections::HashMap<std::path::PathBuf, StoragePerf>>,
+    std::sync::Mutex<
+        std::collections::HashMap<
+            std::path::PathBuf,
+            std::sync::Arc<tokio::sync::OnceCell<StoragePerf>>,
+        >,
+    >,
 > = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
 
 /// The directory the calibration probe writes to for `path`: `path` itself when it
@@ -452,23 +457,24 @@ pub(crate) async fn probe_storage_perf_async(path: &str) -> StoragePerf {
         return StoragePerf::default();
     };
     let key = dir.canonicalize().unwrap_or(dir);
-    if let Some(cached) = PROBE_CACHE
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .get(&key)
-        .copied()
-    {
-        return cached;
-    }
-    let probe_key = key.clone();
-    let perf = tokio::task::spawn_blocking(move || probe_storage_perf_blocking(&probe_key))
+    // Per-key shared cell: concurrent registrations on the same volume COALESCE on a
+    // single probe via `get_or_init` instead of each firing an 8 MiB write + fsync.
+    let cell = {
+        let mut cache = PROBE_CACHE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        std::sync::Arc::clone(cache.entry(key.clone()).or_default())
+    };
+    *cell
+        .get_or_init(|| {
+            let probe_target = key.clone();
+            async move {
+                tokio::task::spawn_blocking(move || probe_storage_perf_blocking(&probe_target))
+                    .await
+                    .unwrap_or_default()
+            }
+        })
         .await
-        .unwrap_or_default();
-    PROBE_CACHE
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .insert(key, perf);
-    perf
 }
 
 #[cfg(test)]

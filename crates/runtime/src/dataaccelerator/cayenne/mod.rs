@@ -332,21 +332,33 @@ fn to_cayenne_storage_class(
 /// Warn (once per volume) when the filesystem backing `path` is low on free space.
 /// Under memory pressure the in-memory CDC tier spills to this volume; if it fills,
 /// ingestion fails — so surface it at startup rather than discovering it on a crash.
-fn warn_if_low_disk(label: &str, path: &str) {
+async fn warn_if_low_disk(label: &str, path: &str) {
+    // `disk_space_bytes` canonicalizes + enumerates every mount (blocking OS I/O);
+    // run it off the Tokio runtime so it can't stall a worker during concurrent
+    // table registration.
+    let label = label.to_string();
+    let path = path.to_string();
+    let _ = tokio::task::spawn_blocking(move || warn_if_low_disk_blocking(&label, &path)).await;
+}
+
+fn warn_if_low_disk_blocking(label: &str, path: &str) {
     use std::sync::{LazyLock, Mutex};
     /// Below this fraction free OR this many absolute bytes free ⇒ warn.
     const LOW_DISK_FRACTION_DENOM: u64 = 10; // < 10% free
     const LOW_DISK_FLOOR_BYTES: u64 = 2 * 1024 * 1024 * 1024; // < 2 GiB free
-    static CHECKED: LazyLock<Mutex<std::collections::HashSet<String>>> =
+    static CHECKED: LazyLock<Mutex<std::collections::HashSet<std::path::PathBuf>>> =
         LazyLock::new(|| Mutex::new(std::collections::HashSet::new()));
 
-    // Check each distinct volume path once per process, BEFORE probing free space:
-    // `disk_space_bytes` enumerates every mount, so without this guard every table
-    // registration re-enumerates the same volumes.
+    // Check each distinct volume once per process, BEFORE probing free space
+    // (`disk_space_bytes` re-enumerates every mount). Key on the canonicalized path
+    // so equivalent paths (trailing slash, symlinks) collapse to one check.
+    let key = std::path::Path::new(path)
+        .canonicalize()
+        .unwrap_or_else(|_| std::path::PathBuf::from(path));
     if !CHECKED
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .insert(path.to_string())
+        .insert(key)
     {
         return;
     }
@@ -771,9 +783,9 @@ impl CayenneAccelerator {
             // Low-disk startup warning: a full data/spill volume turns a
             // memory-pressure spill into a crash. Best-effort, once per volume.
             if let Some(dir) = data_dir.as_deref() {
-                warn_if_low_disk("data", fs_probe_path(dir));
+                warn_if_low_disk("data", fs_probe_path(dir)).await;
             }
-            warn_if_low_disk("metastore", fs_probe_path(&metadata_dir));
+            warn_if_low_disk("metastore", fs_probe_path(&metadata_dir)).await;
 
             // Storage-aware target Vortex file size on local disk (the `auto`
             // baseline): smaller files reduce write amplification on EBS-class
