@@ -145,6 +145,32 @@ pub fn set_global_encode_concurrency(permits: usize) {
     *guard = Some(budget);
 }
 
+/// Lower the process-global encode budget to at most `max_permits`, never raising
+/// it. The integration point for the instance EBS-bandwidth cap: a single EBS
+/// volume is a shared, bandwidth-bounded pipe, so the aggregate parallel
+/// encode/upload streams must be bounded below the core-derived budget or they
+/// just fan out small files without adding throughput. Idempotent and safe across
+/// multiple table registrations — each EBS-class table proposes its
+/// bandwidth-derived cap and the tightest wins; a local-SSD table proposes
+/// nothing. A no-op when no budget is installed yet or the cap does not bind.
+pub fn cap_global_encode_concurrency(max_permits: usize) {
+    let max_permits = max_permits.max(1);
+    {
+        let guard = GLOBAL_ENCODE_BUDGET.read();
+        match guard.as_ref() {
+            Some(budget) if budget.total > max_permits => {}
+            // No budget installed yet, or the cap is already ≥ the current total.
+            _ => return,
+        }
+    }
+    tracing::info!(
+        target: "cayenne::write_budget",
+        max_permits,
+        "Capping global encode-concurrency budget to the instance EBS write-bandwidth ceiling"
+    );
+    set_global_encode_concurrency(max_permits);
+}
+
 /// Acquire up to `shards` encode permits from the global budget, atomically.
 ///
 /// Returns the held permits (which release on drop, so callers scope them to
