@@ -828,7 +828,7 @@ pub fn deny_spice_functions_for_table_providers() -> FunctionSupport {
 /// the deny-list against that name. Collecting only canonical names would let
 /// every alias federate and be unparsed straight into the remote engine — which
 /// is exactly how `array_contains` was reaching Redshift.
-fn datafusion_array_function_names() -> Vec<String> {
+fn datafusion_nested_function_names() -> Vec<String> {
     datafusion::functions_nested::all_default_nested_functions()
         .iter()
         .flat_map(|udf| {
@@ -885,7 +885,7 @@ fn denied_function_names_for_postgres() -> Vec<String> {
     let builtins = BUILTIN_DENIED_SPICE_FUNCTION_NAMES.clone();
     let user = USER_FUNCTION_NAMES.read().clone();
     let denied_array = deny_list_excluding_native(
-        &datafusion_array_function_names(),
+        &datafusion_nested_function_names(),
         POSTGRES_PUSHABLE_ARRAY_FUNCTIONS,
     );
     let mut denied = Vec::with_capacity(builtins.len() + user.len() + denied_array.len());
@@ -1244,13 +1244,13 @@ mod tests {
     #[test]
     fn postgres_pushable_array_functions_are_real_datafusion_functions() {
         // Guard against typos / drift: every name we allow to push down must
-        // actually be a DataFusion array function, otherwise the carve-out is a
+        // actually be a DataFusion nested function, otherwise the carve-out is a
         // no-op that silently denies it.
-        let known: HashSet<String> = datafusion_array_function_names().into_iter().collect();
+        let known: HashSet<String> = datafusion_nested_function_names().into_iter().collect();
         for name in POSTGRES_PUSHABLE_ARRAY_FUNCTIONS {
             assert!(
                 known.contains(*name),
-                "{name} is in the Postgres pushable list but is not a DataFusion array function"
+                "{name} is in the Postgres pushable list but is not a DataFusion nested function"
             );
         }
     }
