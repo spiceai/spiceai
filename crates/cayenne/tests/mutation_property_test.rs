@@ -443,8 +443,9 @@ async fn run_concurrent_mutations_seed(
 
     let population: i64 = 1000;
     for start in (0..population).step_by(20) {
-        let rows: Vec<(i64, i64)> =
-            (start..(start + 20).min(population)).map(|k| (k, k * 10)).collect();
+        let rows: Vec<(i64, i64)> = (start..(start + 20).min(population))
+            .map(|k| (k, k * 10))
+            .collect();
         common::insert_batch(table.as_ref(), rows_to_batch(&rows)).await?;
     }
     let mut model: Model = (0..population).map(|k| (k, k * 10)).collect();
@@ -483,11 +484,17 @@ async fn run_concurrent_mutations_seed(
 
     let live = read_rows(&ctx, &table_name).await?;
     assert_eq!(
-        live, model,
+        live,
+        model,
         "CONVERGENCE FAILURE (mode={mode:?} seed={seed}) after concurrent mutations + compaction\n\
          missing_from_live={:?}\nextra_in_live={:?}",
-        model.iter().filter(|(k, _)| !live.contains_key(k)).collect::<Vec<_>>(),
-        live.iter().filter(|(k, _)| !model.contains_key(k)).collect::<Vec<_>>(),
+        model
+            .iter()
+            .filter(|(k, _)| !live.contains_key(k))
+            .collect::<Vec<_>>(),
+        live.iter()
+            .filter(|(k, _)| !model.contains_key(k))
+            .collect::<Vec<_>>(),
     );
     Ok(())
 }
@@ -568,10 +575,7 @@ async fn run_concurrent_reads_seed(fixture: &TestFixture, mode: Mode, seed: u64)
 
     // Background reader: assert the cardinality/key-set invariant on every read.
     let read_ctx = SessionContext::new();
-    read_ctx.register_table(
-        &table_name,
-        Arc::clone(&table) as Arc<dyn TableProvider>,
-    )?;
+    read_ctx.register_table(&table_name, Arc::clone(&table) as Arc<dyn TableProvider>)?;
     let read_stop = Arc::clone(&stop);
     let read_name = table_name.clone();
     let reader = tokio::spawn(async move {
@@ -583,7 +587,10 @@ async fn run_concurrent_reads_seed(fixture: &TestFixture, mode: Mode, seed: u64)
                         violation = Some(format!(
                             "torn read: saw {} rows (expected {n}); missing={:?}",
                             live.len(),
-                            (0..n).filter(|k| !live.contains_key(k)).take(8).collect::<Vec<_>>(),
+                            (0..n)
+                                .filter(|k| !live.contains_key(k))
+                                .take(8)
+                                .collect::<Vec<_>>(),
                         ));
                         break;
                     }
@@ -600,8 +607,10 @@ async fn run_concurrent_reads_seed(fixture: &TestFixture, mode: Mode, seed: u64)
 
     // Foreground: repeatedly overwrite the SAME key set with fresh values.
     for _ in 0..150 {
-        let rows: Vec<(i64, i64)> =
-            keyset.iter().map(|&k| (k, rng.below(1_000_000) as i64)).collect();
+        let rows: Vec<(i64, i64)> = keyset
+            .iter()
+            .map(|&k| (k, rng.below(1_000_000) as i64))
+            .collect();
         overwrite(&table, &rows).await?;
         tokio::time::sleep(std::time::Duration::from_millis(1)).await;
     }
@@ -617,7 +626,11 @@ async fn run_concurrent_reads_seed(fixture: &TestFixture, mode: Mode, seed: u64)
 
     // And it still converges to the last overwrite.
     let live = read_rows(&ctx, &table_name).await?;
-    assert_eq!(live.len() as i64, n, "final row count must be N (mode={mode:?})");
+    assert_eq!(
+        live.len() as i64,
+        n,
+        "final row count must be N (mode={mode:?})"
+    );
     Ok(())
 }
 

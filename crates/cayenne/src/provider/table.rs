@@ -10537,8 +10537,12 @@ impl CayenneTableProvider {
             let _capture_guard = self.write_lock_arc().lock_owned().await;
             let stream = self.visible_file_stream_for_rewrite(&ctx).await?;
             let cutoff = self.sequence_high_water().await;
-            let folded: std::collections::HashSet<String> =
-                self.protected_snapshots.load_full().keys().cloned().collect();
+            let folded: std::collections::HashSet<String> = self
+                .protected_snapshots
+                .load_full()
+                .keys()
+                .cloned()
+                .collect();
             (stream, Some((cutoff, folded)))
         };
 
@@ -10708,7 +10712,10 @@ impl CayenneTableProvider {
             }
         };
 
-        if let Err(e) = self.commit_snapshot_rewrite(&new_snapshot_id, fence.as_ref()).await {
+        if let Err(e) = self
+            .commit_snapshot_rewrite(&new_snapshot_id, fence.as_ref())
+            .await
+        {
             self.cleanup_failed_compaction_snapshot(&new_snapshot_id, is_s3)
                 .await;
             return Err(Error::Catalog { source: e });

@@ -141,7 +141,9 @@ async fn insert_block(table: &Arc<CayenneTableProvider>, ids: Vec<i64>) -> TestR
 
 async fn delete_key(table: &Arc<CayenneTableProvider>, key: i64) -> TestResult<()> {
     let ctx = SessionContext::new();
-    let plan = table.delete_from(&ctx.state(), vec![col("id").eq(lit(key))]).await?;
+    let plan = table
+        .delete_from(&ctx.state(), vec![col("id").eq(lit(key))])
+        .await?;
     datafusion_physical_plan::collect(plan, ctx.task_ctx()).await?;
     Ok(())
 }
@@ -249,9 +251,12 @@ async fn delete_during_full_rewrite_is_not_lost_impl(fixture: TestFixture) -> Te
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn delete_during_full_rewrite_is_not_lost_sqlite() -> TestResult<()> {
-    common::run_with_backend(BackendType::Sqlite, delete_during_full_rewrite_is_not_lost_impl)
-        .await
-        .map_err(|e| -> Box<dyn std::error::Error> { e })
+    common::run_with_backend(
+        BackendType::Sqlite,
+        delete_during_full_rewrite_is_not_lost_impl,
+    )
+    .await
+    .map_err(|e| -> Box<dyn std::error::Error> { e })
 }
 
 // ===========================================================================
