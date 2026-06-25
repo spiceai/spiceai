@@ -1684,20 +1684,15 @@ mod tests {
         assert_eq!(effective_query_memory_limit(Some(7), true), 7);
     }
 
-    /// The host partition constants are coordinated: the Cayenne query-pool default
-    /// is below the non-Cayenne default, and 75% query+compaction + 1/8 tier ceiling
-    /// + 1/8 headroom == 100% of host. Locks the design so a future edit that would
-    /// overcommit (e.g. raising the query %) trips here.
-    #[test]
-    fn host_partition_constants_are_coordinated() {
-        assert!(
-            CAYENNE_QUERY_MEMORY_PERCENT < DEFAULT_QUERY_MEMORY_PERCENT,
-            "Cayenne must reserve more host RAM than the non-Cayenne default"
-        );
-        assert_eq!(CAYENNE_QUERY_MEMORY_PERCENT, 75);
-        assert_eq!(MEM_TIER_CEILING_FRACTION, 8); // 1/8 = 12.5%
-        assert_eq!(MEM_TIER_HEADROOM_FRACTION, 8); // 1/8 = 12.5%
-    }
+    // Compile-time invariants on the host-partition constants: the Cayenne
+    // query-pool default must be below the non-Cayenne default, and the partition
+    // (75% query+compaction, one-eighth tier ceiling, one-eighth headroom) sums to
+    // 100% of host. `const` assertions (compile-time) rather than a runtime test
+    // asserting constant values (which clippy flags as assertions_on_constants).
+    const _: () = assert!(CAYENNE_QUERY_MEMORY_PERCENT < DEFAULT_QUERY_MEMORY_PERCENT);
+    const _: () = assert!(CAYENNE_QUERY_MEMORY_PERCENT == 75);
+    const _: () = assert!(MEM_TIER_CEILING_FRACTION == 8); // one-eighth = 12.5%
+    const _: () = assert!(MEM_TIER_HEADROOM_FRACTION == 8); // one-eighth = 12.5%
 
     /// THE invariant: for the coordinated default partition (Cayenne active, no
     /// explicit limit), `query_pool + compaction + mem_tier + headroom` never
