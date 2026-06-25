@@ -124,6 +124,41 @@ impl AsTableRefs for LogicalPlan {
     }
 }
 
+/// Default catalog and schema used to resolve table references before comparing
+/// them during cache invalidation.
+///
+/// These mirror `runtime_datafusion::SPICE_DEFAULT_CATALOG` /
+/// `SPICE_DEFAULT_SCHEMA`. They are duplicated here because the `cache` crate
+/// cannot depend on `runtime-datafusion` without forming a dependency cycle
+/// (`runtime-datafusion -> search -> datafusion-optimizer-rules -> cache`).
+pub const SPICE_DEFAULT_CATALOG: &str = "spice";
+pub const SPICE_DEFAULT_SCHEMA: &str = "public";
+
+/// Returns `true` if `target` refers to the same physical table as any reference
+/// in `stored`, after resolving both sides to fully-qualified
+/// (`catalog.schema.table`) form.
+///
+/// Cache entries record table references exactly as written in the originating
+/// SQL (e.g. bare `customer` or fully-qualified `spice.public.customer`), while
+/// invalidators — accelerated-refresh completion, `INSERT INTO`, and other DML —
+/// may pass a differently-qualified reference for the same table. Plain
+/// `TableReference` equality therefore misses entries that name the same table
+/// with a different qualification, leaving stale rows served as fresh cache hits
+/// until TTL expiry. Resolving both sides first makes the comparison robust to
+/// qualification differences.
+#[must_use]
+pub fn resolved_table_match(stored: &HashSet<TableReference>, target: &TableReference) -> bool {
+    let resolved_target = target
+        .clone()
+        .resolve(SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA);
+    stored.iter().any(|stored_ref| {
+        stored_ref
+            .clone()
+            .resolve(SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA)
+            == resolved_target
+    })
+}
+
 #[async_trait]
 pub trait CacheProvider<V: Clone + Send + Sync + 'static>:
     HashProvider + std::fmt::Debug + std::fmt::Display
