@@ -700,7 +700,7 @@ impl DataFusionBuilder {
                     query_memory_pool_bytes,
                     total_memory,
                     mem_tier_budget_bytes = budget,
-                    "Explicit runtime.query.memory_limit leaves little room for the Cayenne in-memory CDC tier (cdc_durability: memory); the tier budget is floored, so writes will spill / fall back to the durable path more often. Consider lowering runtime.query.memory_limit."
+                    "Cayenne in-memory CDC ingestion has limited memory on this host because runtime.query.memory_limit reserves most of it for queries, so ingestion will spill to disk more often. Consider lowering runtime.query.memory_limit to give in-memory CDC more room."
                 );
             }
             budget
@@ -714,8 +714,8 @@ impl DataFusionBuilder {
         // (ResourceExhausted) instead of spilling — the SF1000 Q10/Q18 symptom.
         // Guide operators to point spill at a roomy volume.
         if cayenne_active && self.temp_directory.is_none() {
-            tracing::warn!(
-                "Cayenne acceleration is active but runtime.query.temp_directory is unset: large analytical queries spill to the OS temp directory, which on hosts with a separate data volume may lack space and fail with ResourceExhausted instead of spilling. Set runtime.query.temp_directory to a path on a volume with ample free space (e.g. the Cayenne data volume)."
+            tracing::info!(
+                "Cayenne acceleration is active but runtime.query.temp_directory is unset: large analytical queries spill to the OS temp directory. If your data is on a separate volume (e.g. EBS) and the root volume is small, set runtime.query.temp_directory to a path with ample free space so large queries can spill instead of failing."
             );
         }
 

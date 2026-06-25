@@ -1504,7 +1504,7 @@ impl DataFusion {
                     query_memory_pool_bytes = self.query_memory_pool_bytes,
                     total_memory,
                     mem_tier_budget_bytes = budget,
-                    "Cayenne in-memory CDC tier budget floored: the query pool was not coordinated for an off-pool tier (lazy activation or an oversized runtime.query.memory_limit), so the tier relies on per-table caps + spill rather than a host-fraction reserve. Consider lowering runtime.query.memory_limit."
+                    "Cayenne in-memory CDC ingestion has limited memory on this host (the query memory pool leaves little room for it), so ingestion will spill to disk more often. Consider lowering runtime.query.memory_limit to give in-memory CDC more room."
                 );
             }
             budget
