@@ -108,6 +108,9 @@ pub enum Error {
         partition: i32,
         offset: i64,
     },
+
+    #[snafu(display("Kafka blocking task failed to complete: {source}"))]
+    TaskJoin { source: tokio::task::JoinError },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -919,34 +922,46 @@ impl KafkaConsumer {
         let temp_group_id = format!("spice-schema-peek-{}", uuid::Uuid::new_v4());
         let mut peek_config = kafka_config.clone();
         peek_config.metrics_store = None; // Avoid skewing real consumer metrics
-        let temp_consumer = Self::create(temp_group_id, &peek_config, None)?;
+        // `fetch_metadata`/`fetch_watermarks` are synchronous librdkafka calls
+        // that block the calling thread for up to `remaining` (the schema-peek
+        // budget, up to ~30s). Run them on the blocking pool so this
+        // registration-time path doesn't stall the async runtime thread.
+        let temp_consumer = Arc::new(Self::create(temp_group_id, &peek_config, None)?);
 
         let remaining = deadline.saturating_duration_since(Instant::now());
-        let metadata = temp_consumer
-            .consumer
-            .fetch_metadata(Some(topic), remaining)
-            .context(UnableToRestartTopicSnafu {
-                message: "Failed to fetch topic metadata".to_string(),
-            })?;
+        let partition_ids: Vec<i32> = {
+            let temp_consumer = Arc::clone(&temp_consumer);
+            let topic = topic.to_string();
+            tokio::task::spawn_blocking(move || -> Result<Vec<i32>> {
+                let metadata = temp_consumer
+                    .consumer
+                    .fetch_metadata(Some(&topic), remaining)
+                    .context(UnableToRestartTopicSnafu {
+                        message: "Failed to fetch topic metadata".to_string(),
+                    })?;
 
-        let topic_metadata = metadata
-            .topics()
-            .iter()
-            .find(|t| t.name() == topic)
-            .context(MetadataTopicNotFoundSnafu {
-                topic: topic.to_string(),
-            })?;
+                let topic_metadata = metadata
+                    .topics()
+                    .iter()
+                    .find(|t| t.name() == topic)
+                    .context(MetadataTopicNotFoundSnafu {
+                        topic: topic.clone(),
+                    })?;
+
+                // `MetadataPartition` is not `Send` (it holds `*mut i32`), so
+                // extract the ids inside the blocking task and return the owned
+                // `Vec<i32>`.
+                Ok(topic_metadata
+                    .partitions()
+                    .iter()
+                    .map(MetadataPartition::id)
+                    .collect())
+            })
+            .await
+            .context(TaskJoinSnafu)??
+        };
 
         let mut best_message: Option<(Option<K>, V, i64)> = None;
-
-        // Collect partition IDs up-front so the `MetadataPartition` iterator
-        // (which is not `Send` because it contains `*mut i32`) is dropped before
-        // any await points inside the loop body.
-        let partition_ids: Vec<i32> = topic_metadata
-            .partitions()
-            .iter()
-            .map(MetadataPartition::id)
-            .collect();
 
         for partition_id in partition_ids {
             if Instant::now() >= deadline {
@@ -955,12 +970,22 @@ impl KafkaConsumer {
             }
 
             let remaining = deadline.saturating_duration_since(Instant::now());
-            let (low, high) = temp_consumer
-                .consumer
-                .fetch_watermarks(topic, partition_id, remaining)
-                .context(UnableToRestartTopicSnafu {
-                    message: format!("Failed to fetch watermarks for partition {partition_id}"),
-                })?;
+            let (low, high) = {
+                let temp_consumer = Arc::clone(&temp_consumer);
+                let topic = topic.to_string();
+                tokio::task::spawn_blocking(move || {
+                    temp_consumer
+                        .consumer
+                        .fetch_watermarks(&topic, partition_id, remaining)
+                        .context(UnableToRestartTopicSnafu {
+                            message: format!(
+                                "Failed to fetch watermarks for partition {partition_id}"
+                            ),
+                        })
+                })
+                .await
+                .context(TaskJoinSnafu)??
+            };
 
             if high <= low {
                 continue;
