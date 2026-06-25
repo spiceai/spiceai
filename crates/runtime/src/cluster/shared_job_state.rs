@@ -332,19 +332,28 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> JobState for Shar
         meta.session_id = session_id;
         // Compare-and-set the ownership metadata before persisting the graph, so a
         // scheduler racing a takeover cannot clobber the shared graph blob.
-        if let object_store_occ::UpdateResult::Conflict { current } = self
+        match self
             .meta
             .update(job_id, &meta)
             .await
             .map_err(|e| BallistaError::Internal(format!("failed to persist job meta: {e}")))?
         {
-            tracing::warn!(
-                "job {job_id} ownership changed under us (epoch {} -> {}); yielding",
-                epoch,
-                current.epoch
-            );
-            self.local_jobs.remove(job_id);
-            return Ok(());
+            object_store_occ::UpdateResult::Ok => {}
+            object_store_occ::UpdateResult::Conflict { current } => {
+                tracing::warn!(
+                    "job {job_id} ownership changed under us (epoch {} -> {}); yielding",
+                    epoch,
+                    current.epoch
+                );
+                self.local_jobs.remove(job_id);
+                return Ok(());
+            }
+            object_store_occ::UpdateResult::NotFound => {
+                self.local_jobs.remove(job_id);
+                return Err(BallistaError::Internal(format!(
+                    "job {job_id} metadata no longer exists; cannot persist state"
+                )));
+            }
         }
         self.put_graph(job_id, graph).await?;
 
@@ -388,12 +397,15 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> JobState for Shar
         claimed.owner_instance_id = Some(self.owner_instance_id);
         claimed.epoch = meta.epoch + 1;
         claimed.updated_at = now_ms();
-        if let object_store_occ::UpdateResult::Conflict { .. } = self
-            .meta
-            .update(job_id, &claimed)
-            .await
-            .map_err(|e| BallistaError::Internal(format!("failed to acquire job: {e}")))?
-        {
+        // Another scheduler won the claim (Conflict), or the job's metadata was
+        // removed under us (NotFound) — either way we don't own it.
+        if !matches!(
+            self.meta
+                .update(job_id, &claimed)
+                .await
+                .map_err(|e| BallistaError::Internal(format!("failed to acquire job: {e}")))?,
+            object_store_occ::UpdateResult::Ok
+        ) {
             return Ok(None);
         }
 
