@@ -478,7 +478,32 @@ impl RuntimeBuilder {
 
         // Create resource monitor early so it can be passed to DataFusion
         let resource_monitor = crate::resource_monitor::ResourceMonitor::new();
-        let secrets = Arc::new(RwLock::new(Self::load_secrets(self.app.as_ref()).await));
+        let loaded_secrets = Self::load_secrets(self.app.as_ref()).await;
+
+        // Diagnostics-only: resolve every `${ store:key }` reference in the
+        // app up front so secret problems surface as one consolidated report
+        // instead of scattered per-component errors. Skipped on cluster
+        // executors, where secrets resolve via scheduler RPC and the
+        // scheduler has already validated them. Never changes component
+        // loading; never logs secret values.
+        //
+        // Runs on the owned `Secrets` before it is wrapped in the shared
+        // `RwLock` below, so no lock guard is held across the lookups' awaits.
+        // Wrapped in `in_tracing_context_async` for the same reason as
+        // `load_secrets`: this runs before `spiced::init_tracing` installs the
+        // global subscriber, so without a temporary subscriber the summary
+        // would be dropped on the floor.
+        let is_cluster_executor = matches!(
+            self.resolved_cluster_config
+                .as_ref()
+                .and_then(ResolvedClusterConfig::effective_role),
+            Some(ClusterRole::Executor)
+        );
+        if !is_cluster_executor && let Some(app) = self.app.as_ref() {
+            in_tracing_context_async(crate::secrets_preflight::run(app, &loaded_secrets)).await;
+        }
+
+        let secrets = Arc::new(RwLock::new(loaded_secrets));
 
         // Create the shared app reference early so DataFusion, Runtime, and PartitionService share it.
         let shared_app: Arc<RwLock<Option<Arc<App>>>> = Arc::new(RwLock::new(self.app));
