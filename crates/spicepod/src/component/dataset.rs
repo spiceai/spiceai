@@ -105,7 +105,7 @@ pub enum OnSchemaChange {
     AppendNewColumns,
     /// Keep the registered dataset schema synchronized with the projected source schema.
     SyncAllColumns,
-    /// Recreate the accelerated table with the new schema when a source schema change cannot be applied in place. Widening changes are still applied in place; otherwise the table is dropped and recreated. Recreation is destructive and only occurs with refresh_mode full.
+    /// Recreate the accelerated table with the new schema when a source schema change cannot be applied in place. Widening changes are still applied in place; otherwise the table is dropped and recreated. Recreation is destructive and only occurs with `refresh_mode: full`.
     DropAndRecreate,
 }
 
