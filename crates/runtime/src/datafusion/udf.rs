@@ -819,7 +819,7 @@ pub fn deny_spice_functions_for_table_providers() -> FunctionSupport {
     deny_spice_specific_functions().as_ref().clone()
 }
 
-/// DataFusion's built-in nested (array/list/map) scalar functions, by canonical
+/// `DataFusion`'s built-in nested (array/list/map) scalar functions, by canonical
 /// name AND every alias.
 ///
 /// Aliases are essential here: when a function is invoked by an alias, the
@@ -837,33 +837,33 @@ fn datafusion_nested_function_names() -> Vec<String> {
         .collect()
 }
 
-/// DataFusion array functions that PostgreSQL implements under the SAME name,
+/// `DataFusion` array functions that `PostgreSQL` implements under the SAME name,
 /// with a matching argument signature AND matching semantics, so they can keep
-/// being federated (pushed down) to a PostgreSQL-wire backend rather than being
+/// being federated (pushed down) to a `PostgreSQL`-wire backend rather than being
 /// denied. Anything not on this list is denied for Postgres (see
 /// [`denied_function_names_for_postgres`]).
 ///
-/// Cross-checked against the DataFusion array functions and PostgreSQL's array functions:
+/// Cross-checked against the `DataFusion` array functions and `PostgreSQL`'s array functions:
 /// - <https://datafusion.apache.org/user-guide/sql/scalar_functions.html#array-functions>
 /// - <https://www.postgresql.org/docs/current/functions-array.html>
 ///
-/// Everything else in DataFusion's array family is denied because PostgreSQL
+/// Everything else in `DataFusion`'s array family is denied because `PostgreSQL`
 /// either:
-/// - lacks the function entirely — `array_has`/`array_contains` (PostgreSQL uses
+/// - lacks the function entirely — `array_has`/`array_contains` (`PostgreSQL` uses
 ///   the `@>`/`= ANY` operators), `make_array` (`ARRAY[...]` syntax), `flatten`,
 ///   `range`/`generate_series` (set-returning, not an array), the set ops
 ///   (`array_distinct`/`array_union`/`array_intersect`/`array_except`),
 ///   element/slice accessors (`array_element`/`array_slice`/`array_pop_*`),
 ///   `array_distance`, `array_max`/`array_min`, `map_*`, ...;
-/// - spells it differently — DataFusion's canonical `array_concat` vs
-///   PostgreSQL's `array_cat`. These could be a candidate for function rewrite later.
+/// - spells it differently — `DataFusion`'s canonical `array_concat` vs
+///   `PostgreSQL`'s `array_cat`. These could be a candidate for function rewrite later.
 /// - uses an incompatible signature — `array_length(array)` is valid in
-///   DataFusion (dimension optional) but PostgreSQL requires the dimension;
-///   `array_dims` returns a list in DataFusion but `text` in PostgreSQL. Could also be a candidate for function rewrite later.
+///   `DataFusion` (dimension optional) but `PostgreSQL` requires the dimension;
+///   `array_dims` returns a list in `DataFusion` but `text` in `PostgreSQL`. Could also be a candidate for function rewrite later.
 /// - diverges in semantics — `array_remove`/`array_replace` affect only the
-///   first match in DataFusion but every match in PostgreSQL;
+///   first match in `DataFusion` but every match in `PostgreSQL`;
 /// - is too new / unavailable on Redshift — `array_reverse`, `array_sort`
-///   (PostgreSQL 16/17+).
+///   (`PostgreSQL` 16/17+).
 const POSTGRES_PUSHABLE_ARRAY_FUNCTIONS: &[&str] = &[
     "array_append",    // (array, element) — identical to PostgreSQL
     "array_prepend",   // (element, array) — identical to PostgreSQL
@@ -875,8 +875,8 @@ const POSTGRES_PUSHABLE_ARRAY_FUNCTIONS: &[&str] = &[
     "string_to_array", // (string, delimiter[, null_string]) -> text[]
 ];
 
-/// The Spice UDF deny-list extended with the DataFusion array functions that
-/// PostgreSQL can't run, for PostgreSQL and PostgreSQL-wire backends (e.g.
+/// The Spice UDF deny-list extended with the `DataFusion` array functions that
+/// `PostgreSQL` can't run, for `PostgreSQL` and PostgreSQL-wire backends (e.g.
 /// Redshift). The PostgreSQL-compatible array functions
 /// ([`POSTGRES_PUSHABLE_ARRAY_FUNCTIONS`]) are kept OUT of the deny-list so they
 /// continue to push down. Shared source of truth for both the connector and
@@ -896,11 +896,11 @@ fn denied_function_names_for_postgres() -> Vec<String> {
 }
 
 /// Postgres-flavored deny-list as a value (not `Arc`): the full Spice UDF
-/// deny-list extended with the DataFusion array functions PostgreSQL (and
+/// deny-list extended with the `DataFusion` array functions `PostgreSQL` (and
 /// PostgreSQL-wire backends like Redshift) can't execute, while still allowing
-/// the array functions that match PostgreSQL exactly to push down. Used both
+/// the array functions that match `PostgreSQL` exactly to push down. Used both
 /// with `PostgresTableProviderFactory::with_function_support` (accelerator) and
-/// the PostgreSQL data connector's federation deny-list. See issue #10703.
+/// the `PostgreSQL` data connector's federation deny-list. See issue #10703.
 #[must_use]
 pub fn deny_spice_functions_for_postgres_table_providers() -> FunctionSupport {
     FunctionSupport::new(
