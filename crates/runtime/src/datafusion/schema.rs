@@ -16,13 +16,13 @@ limitations under the License.
 
 use std::sync::Arc;
 
-use crate::embeddings::table::EmbeddingTable;
 use arrow_schema::SchemaRef;
 use datafusion::{
     datasource::TableProvider, error::Result, execution::context::SessionContext,
     sql::TableReference,
 };
 use runtime_datafusion::schema_provider::SpiceSchemaProvider;
+use runtime_search::embeddings::table::EmbeddingTable;
 use snafu::prelude::*;
 
 pub(crate) fn ensure_schema_exists(
