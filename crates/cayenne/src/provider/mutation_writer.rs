@@ -81,7 +81,7 @@ use super::Result;
 use super::column_stats::ColumnStatsAccumulator;
 use super::context::CayenneContext;
 use super::mem_tier_budget;
-use super::on_conflict::PostValidationState;
+use super::on_conflict::{PostValidationState, PreparedShardedInsertStream};
 use super::staging_wal::{CayenneStagedAppend, PreparedStagedAppend, StagingWalTargetKind};
 use super::table::{CayenneCdcWrite, CayenneTableProvider, record_cayenne_write_phase};
 
@@ -247,6 +247,20 @@ enum MemWriteOutcome {
     },
 }
 
+/// Outcome of the N>1 sharded in-memory CDC write attempt (§5 Phase 3).
+enum MemShardedOutcome {
+    /// Appended to the per-shard RAM tiers; carries the slot-deferral receipt.
+    Done(Box<CayenneCdcWrite>),
+    /// Sustained overload — take the durable path. The buffered RAW batches +
+    /// schema are handed back; the caller re-streams them through the standard
+    /// serial prepare so the durable path re-validates them.
+    FallBackToDurable {
+        batches: Vec<RecordBatch>,
+        schema: SchemaRef,
+        write_guard: OwnedMutexGuard<()>,
+    },
+}
+
 struct PreparedStagedAppendTarget {
     staging_snapshot_id: String,
     target_snapshot_id: String,
@@ -297,6 +311,78 @@ impl<'a> AppendMutationWriter<'a> {
 
         let pending_pk_deletions = !self.table.pk_deletion_strategy().is_position_based()
             && self.table.has_pending_deletions();
+
+        // N>1 in-memory CDC: validate + append per PK-hash shard within one apply
+        // (§5 Phase 3). Engaged ONLY when the table is on the in-memory merge-on-read
+        // shape with deferral armed, has no pending PK deletions (those force the
+        // durable path), AND is configured for >1 shard. Every other case — and
+        // ALWAYS at N=1 — falls through to the byte-identical serial path below.
+        let mem_tier_shards = self.table.mem_tier_shard_count();
+        if mem_tier_shards > 1
+            && self.table.is_cdc_memory_mode()
+            && self.table.has_slot_advancer()
+            && !pending_pk_deletions
+            && self.table.metadata().partition_column.is_none()
+        {
+            if let Some(prepared) = self
+                .table
+                .prepare_stream_for_insert_sharded(data, mem_tier_shards)
+                .await?
+            {
+                match self
+                    .write_cdc_in_memory_sharded(prepared, write_guard, write_start)
+                    .await?
+                {
+                    MemShardedOutcome::Done(cdc_write) => return Ok(*cdc_write),
+                    MemShardedOutcome::FallBackToDurable {
+                        batches,
+                        schema,
+                        write_guard,
+                    } => {
+                        // Sustained overload: the sharded path bailed BEFORE any
+                        // validation/append (no tier mutation occurred, the spill
+                        // already drained + acked prior mem batches). Re-stream the
+                        // buffered RAW batches through the standard serial
+                        // `prepare_stream_for_insert` so the durable path re-runs
+                        // on-conflict validation against the single index — keeping
+                        // conflict semantics intact without a second sharded apply.
+                        let _write_guard = write_guard;
+                        let raw = MemorySourceConfig::try_new_exec(&[batches], schema, None)
+                            .and_then(|exec| execute_stream(exec, Arc::clone(self.task_context)))?;
+                        let prepared = self.table.prepare_stream_for_insert(raw).await?;
+                        let post_validation = prepared.post_validation();
+                        let may_have_on_conflict_deletions =
+                            prepared.may_have_on_conflict_deletions();
+                        let rows = self
+                            .write_prepared_stream(
+                                prepared.stream,
+                                post_validation,
+                                pending_pk_deletions,
+                                may_have_on_conflict_deletions,
+                            )
+                            .await?;
+                        record_cayenne_write_phase(
+                            self.table.table_name(),
+                            "cdc_path_inmemory_sharded_fallback",
+                            write_start,
+                        );
+                        return Ok(CayenneCdcWrite::completed(
+                            self.table.clone_for_write_operations(),
+                            rows,
+                        ));
+                    }
+                }
+            }
+            // `prepare_stream_for_insert_sharded` returned None (no PK): fall through
+            // is impossible — `data` was consumed. PK-less tables never reach
+            // `is_cdc_memory_mode` (it requires a key-based merge-on-read shape), so
+            // this branch is unreachable in practice. Guard defensively.
+            return Err(super::Error::Internal {
+                table: self.table.table_name().to_string(),
+                message: "sharded in-memory CDC path engaged on a table without a primary key"
+                    .to_string(),
+            });
+        }
 
         let prepared = self.table.prepare_stream_for_insert(data).await?;
         let post_validation = prepared.post_validation();
@@ -710,6 +796,134 @@ impl<'a> AppendMutationWriter<'a> {
                 self.table.clone_for_write_operations(),
                 incoming_rows,
                 epoch,
+            ),
+        )))
+    }
+
+    /// Sharded (N>1) in-memory CDC write path (§5 Phase 3, step b). Drains the
+    /// RAW decoded stream, applies the whole-apply OOM-safety caps/budget exactly
+    /// as [`Self::write_cdc_in_memory`], then DECOUPLES decode from validation:
+    /// each batch is split by PK shard and the per-batch on-conflict validation
+    /// runs PER SHARD ([`CayenneTableProvider::validate_and_append_sharded`]),
+    /// with the N shard appends joined concurrently. The combined post-validation
+    /// state is published for the durable fallback.
+    ///
+    /// Engaged only at N>1; the N=1 write path never reaches here, so today's
+    /// behavior is byte-identical.
+    async fn write_cdc_in_memory_sharded(
+        &self,
+        prepared: PreparedShardedInsertStream,
+        write_guard: OwnedMutexGuard<()>,
+        write_start: Instant,
+    ) -> Result<MemShardedOutcome> {
+        let PreparedShardedInsertStream {
+            mut stream,
+            pk_indices,
+            converter,
+            sharded_index,
+            on_conflict,
+        } = prepared;
+
+        // Drain the RAW stream into RAM (no validation wrapper — validation is
+        // deferred to the per-shard step below).
+        let schema = stream.schema();
+        let mut batches: Vec<RecordBatch> = Vec::new();
+        let mut incoming_bytes: u64 = 0;
+        let mut incoming_rows: u64 = 0;
+        let drain_start = Instant::now();
+        while let Some(batch) = StreamExt::next(&mut stream).await {
+            let batch = batch?;
+            incoming_bytes = incoming_bytes.saturating_add(batch.get_array_memory_size() as u64);
+            incoming_rows = incoming_rows.saturating_add(batch.num_rows() as u64);
+            batches.push(batch);
+        }
+        drop(stream);
+        record_cayenne_write_phase(
+            self.table.table_name(),
+            "inmemory_stream_drain",
+            drain_start,
+        );
+
+        // Whole-apply (whole-tier) OOM-safety: per-table byte cap spill + global
+        // budget reservation, identical to the serial path. The byte trigger is
+        // whole-tier (sum across shards), never budget/N-per-shard (§3.4 Fix 2).
+        if self.table.mem_tier_per_table_cap_breached(incoming_bytes) {
+            let spill_start = Instant::now();
+            let spill_result = self
+                .table
+                .spill_mem_tier_if_cap_breached(incoming_bytes)
+                .await;
+            record_cayenne_write_phase(self.table.table_name(), "inmemory_spill", spill_start);
+            spill_result?;
+        }
+
+        if !mem_tier_budget::try_reserve_bytes(incoming_bytes) {
+            let wait_start = Instant::now();
+            let admitted = self.table.wait_for_budget_or_spill(incoming_bytes).await;
+            record_cayenne_write_phase(self.table.table_name(), "inmemory_budget_wait", wait_start);
+            if !admitted? {
+                // Sustained overload: hand the buffered raw batches to the durable
+                // path. Populate the combined post-validation state by running the
+                // sharded validate+append? No — on fallback we must NOT append to
+                // the tier. Instead run validation only to produce the combined
+                // on-conflict deletions for the durable path. The simplest correct
+                // route: re-run validation through the standard serial prepare on
+                // the durable side (it rebuilds the single index). We therefore
+                // hand back the raw batches with an EMPTY post-validation; the
+                // durable `write_prepared_stream` re-validates via its own
+                // `prepare_stream_for_insert`. To keep that contract, the fallback
+                // re-streams the raw batches into a FRESH `prepare_stream_for_insert`
+                // at the caller.
+                return Ok(MemShardedOutcome::FallBackToDurable {
+                    batches,
+                    schema,
+                    write_guard,
+                });
+            }
+        }
+
+        // Validate + append per shard. On error, release the byte reservation so
+        // the global budget doesn't leak (matching the serial path).
+        let apply = match self
+            .table
+            .validate_and_append_sharded(
+                batches,
+                sharded_index,
+                &pk_indices,
+                &converter,
+                &on_conflict,
+                incoming_bytes,
+            )
+            .await
+        {
+            Ok(apply) => apply,
+            Err(e) => {
+                mem_tier_budget::release_bytes(incoming_bytes);
+                return Err(e);
+            }
+        };
+
+        drop(write_guard);
+        tracing::debug!(
+            table = self.table.table_name(),
+            shards = self.table.mem_tier_shard_count(),
+            incoming_rows,
+            superseded = apply.superseded,
+            validated_keys = apply.validated_keys.len(),
+            file_key_deletes = apply.on_conflict_deletions.deleted_pk_i64.len()
+                + apply.on_conflict_deletions.deleted_row_keys.len(),
+            "Sharded in-memory CDC apply completed"
+        );
+        record_cayenne_write_phase(
+            self.table.table_name(),
+            "cdc_path_inmemory_sharded",
+            write_start,
+        );
+        Ok(MemShardedOutcome::Done(Box::new(
+            CayenneCdcWrite::in_memory_staged(
+                self.table.clone_for_write_operations(),
+                incoming_rows,
+                apply.epoch,
             ),
         )))
     }

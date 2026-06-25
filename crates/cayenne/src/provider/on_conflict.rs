@@ -22,7 +22,7 @@ limitations under the License.
 //! scan/update plumbing. The provider drives these from its insert/delete path.
 
 use super::delete::CayenneDeletionSink;
-use super::pk_index::{CachedPkIndex, PkExistenceRef};
+use super::pk_index::{CachedPkIndex, PkExistenceRef, ShardedPkIndex};
 use crate::metadata::InlinedData;
 
 use arrow::record_batch::RecordBatch;
@@ -401,6 +401,33 @@ impl PreparedInsertStream {
     }
 }
 
+/// Prepared sharded insert (the N>1 in-memory CDC path, §2.3c/§5 Phase 3).
+///
+/// Unlike [`PreparedInsertStream`], the stream is the RAW decoded upstream — NOT
+/// wrapped in an [`OnConflictValidationStream`] — because the sharded path runs
+/// the on-conflict validation PER SHARD after splitting each batch by
+/// `shard_of_pk`. The pre-apply existence snapshot is carried as a
+/// [`ShardedPkIndex`] (one existence view per shard), so a shard validates only
+/// against its own keys (a key's whole history is confined to one shard, §3.1).
+///
+/// The single-shard (`n == 1`) path never uses this — it takes the existing
+/// `prepare_stream_for_insert` flow unchanged, keeping N=1 byte-identical.
+pub(crate) struct PreparedShardedInsertStream {
+    /// Raw decoded upstream stream (no validation wrapper).
+    pub(crate) stream: SendableRecordBatchStream,
+    /// PK column indices (in the stream's schema) for the shard split + validate.
+    pub(crate) pk_indices: Vec<usize>,
+    /// The PK existence converter, reused across the apply's batches.
+    pub(crate) converter: RowConverter,
+    /// Pre-apply per-shard existence snapshot. `None` when conflict detection is
+    /// off (`pk_conflict_detection: none`) or the source trusts uniqueness — the
+    /// drain then appends every row with no validation, mirroring the immediate
+    /// path.
+    pub(crate) sharded_index: Option<ShardedPkIndex>,
+    /// The resolved on-conflict behavior for this table.
+    pub(crate) on_conflict: OnConflict,
+}
+
 #[derive(Default)]
 pub(crate) struct OnConflictDeletions {
     /// Per-file position deletes: file path -> deleted file-local row positions.
@@ -610,20 +637,22 @@ impl PkDeletionSnapshot {
         }
     }
 
-    pub(crate) fn with_mem_tier_tombstones(
+    /// Merge a mem-tier tombstone map into this file-side snapshot — the scan
+    /// path passes the cross-shard UNION (`ShardedMemTier::union_tombstones`). At
+    /// N==1 the union is shard 0's tombstone map.
+    pub(crate) fn with_mem_tier_tombstones_map(
         &self,
-        mem_tier: &crate::provider::mem_tier::MemTier,
+        tombstones: &crate::provider::mem_tier::InMemTombstones,
     ) -> Self {
         match self {
             Self::PositionBased => Self::PositionBased,
-            Self::Int64Pk { tombstones } => {
-                if mem_tier.tombstones.int64_pk.is_empty() {
+            Self::Int64Pk { tombstones: file } => {
+                if tombstones.int64_pk.is_empty() {
                     return self.clone();
                 }
 
-                let updated = tombstones.extend_max_deletes(
-                    mem_tier
-                        .tombstones
+                let updated = file.extend_max_deletes(
+                    tombstones
                         .int64_pk
                         .iter()
                         .map(|(&pk, &delete_sequence)| (pk, delete_sequence)),
@@ -632,14 +661,13 @@ impl PkDeletionSnapshot {
                     tombstones: Arc::new(updated),
                 }
             }
-            Self::RowConverterBased { tombstones } => {
-                if mem_tier.tombstones.row_keys.is_empty() {
+            Self::RowConverterBased { tombstones: file } => {
+                if tombstones.row_keys.is_empty() {
                     return self.clone();
                 }
 
-                let updated = tombstones.extend_max_deletes(
-                    mem_tier
-                        .tombstones
+                let updated = file.extend_max_deletes(
+                    tombstones
                         .row_keys
                         .iter()
                         .map(|(key, &delete_sequence)| (key.as_ref(), delete_sequence)),
@@ -713,6 +741,23 @@ pub(crate) struct PreparedProtectedSnapshotUpdate {
 #[derive(Default)]
 pub(crate) struct PostValidationState {
     pub(crate) on_conflict_deletions: OnConflictDeletions,
+    pub(crate) validated_keys: HashSet<OwnedRow>,
+}
+
+/// Aggregate result of one sharded in-memory CDC apply
+/// ([`CayenneTableProvider::validate_and_append_sharded`]).
+pub(crate) struct ShardedApplyResult {
+    /// The single shared per-apply epoch (§3.4 Fix 1), stamped IDENTICALLY on
+    /// every shard's segment this apply — NOT a max across shards. Used for the
+    /// slot-deferral receipt; the all-shards-atomic Phase 5 checkpoint reconciles
+    /// durable coverage on this one axis.
+    pub(crate) epoch: u64,
+    /// Existing rows superseded across all shards (each counted once), for the
+    /// live-row-count net.
+    pub(crate) superseded: u64,
+    /// Union of every shard's on-conflict deletions (keys disjoint across shards).
+    pub(crate) on_conflict_deletions: OnConflictDeletions,
+    /// Union of every shard's validated (kept) keys.
     pub(crate) validated_keys: HashSet<OwnedRow>,
 }
 

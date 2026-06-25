@@ -101,6 +101,28 @@ impl CachedPkKeyset {
     }
 }
 
+/// Routing seed for PK-shard assignment — distinct from the bloom's hashing seeds
+/// so shard placement is independent of bloom bit positions.
+const PK_SHARD_SEED: u64 = 0x243f_6a88_85a3_08d3;
+
+/// Map a primary key to one of `n` shards by hashing its `RowConverter`-encoded
+/// `OwnedRow` bytes.
+///
+/// THE shard key is defined as the `OwnedRow` byte representation — NEVER the
+/// big-endian i64 encoding the tombstone delete-lists use. Every routing site
+/// (write/validate routing, per-shard keyset/bloom, derived tombstone lists) must
+/// hash this same byte string, or the same logical key routes to two shards,
+/// splitting its version history and breaking last-writer-wins. `n <= 1` is the
+/// unsharded fast path and always returns shard 0.
+#[inline]
+pub(crate) fn shard_of_pk(owned_row_bytes: &[u8], n: usize) -> usize {
+    if n <= 1 {
+        return 0;
+    }
+    let bucket = pk_bloom_hash(owned_row_bytes, PK_SHARD_SEED) % n as u64;
+    usize::try_from(bucket).unwrap_or(0)
+}
+
 /// Number of hash probes for [`PkBloom`]. Seven keeps the false-positive rate
 /// near 1% at the ~10 bits/key fill level; the bloom is sized to the whole byte
 /// budget, so at realistic fills the rate is far lower.
@@ -181,9 +203,10 @@ impl PkBloom {
         }
     }
 
-    /// Inverse of [`serialize_into`]. Returns `None` on any length/format mismatch
-    /// so a corrupt sidecar safely falls back to a full keyset rebuild.
-    pub(crate) fn deserialize_from(bytes: &[u8]) -> Option<Self> {
+    /// Deserialize ONE bloom from the front of `bytes`, returning it and the
+    /// number of bytes it consumed — so several blooms can be read back-to-back
+    /// from a sharded sidecar (the bloom is self-describing via its `num_words`).
+    fn deserialize_from_prefix(bytes: &[u8]) -> Option<(Self, usize)> {
         let bit_mask = u64::from_le_bytes(bytes.get(0..8)?.try_into().ok()?);
         let inserted_keys = u64::from_le_bytes(bytes.get(8..16)?.try_into().ok()?);
         let num_words =
@@ -204,11 +227,14 @@ impl PkBloom {
             bits.push(u64::from_le_bytes(bytes.get(offset..end)?.try_into().ok()?));
             offset = end;
         }
-        Some(Self {
-            bits,
-            bit_mask,
-            inserted_keys: usize::try_from(inserted_keys).unwrap_or(0),
-        })
+        Some((
+            Self {
+                bits,
+                bit_mask,
+                inserted_keys: usize::try_from(inserted_keys).unwrap_or(0),
+            },
+            offset,
+        ))
     }
 
     pub(crate) fn probe_bits(key: &[u8]) -> impl Iterator<Item = u64> {
@@ -243,15 +269,22 @@ impl PkBloom {
 /// the version invalidates older sidecars (they deserialize to `None` → safe
 /// full-scan fallback).
 const PK_INDEX_SIDECAR_MAGIC: u32 = 0x4350_4b42;
-const PK_INDEX_SIDECAR_VERSION: u32 = 1;
+/// Bumped to 2 for the sharded PK-index rollout: the sidecar now carries a bloom
+/// COUNT prefix and N serialized blooms (one per mem-tier shard) instead of a
+/// single bloom. A version-1 (single-bloom) sidecar deserializes to `None` →
+/// safe full keyset rebuild (the designed stale-format fallback), so an upgrade
+/// across the bump simply rebuilds the index once.
+const PK_INDEX_SIDECAR_VERSION: u32 = 2;
 /// Upper bound on the persisted PK-index blob. Extreme-cardinality tables skip
 /// persistence (and fall back to a runtime rebuild) to bound the metastore and
 /// snapshot footprint. The bloom is right-sized (~10 bits/key), so this caps the
 /// covered live-key count at roughly 200M.
 pub(crate) const PK_INDEX_PERSIST_MAX_BYTES: usize = 256 * 1024 * 1024;
 
-/// Serialize a checkpoint: `magic | version | snapshot_id_len | snapshot_id | bloom`.
-pub(crate) fn serialize_pk_bloom_sidecar(bloom: &PkBloom, snapshot_id: &str) -> Vec<u8> {
+/// Serialize a sharded checkpoint:
+/// `magic | version | snapshot_id_len | snapshot_id | bloom_count | bloom* `.
+/// `blooms` carries one entry per mem-tier shard (one element at the default N=1).
+fn serialize_pk_blooms_sidecar(blooms: &[PkBloom], snapshot_id: &str) -> Vec<u8> {
     let mut out = Vec::new();
     out.extend_from_slice(&PK_INDEX_SIDECAR_MAGIC.to_le_bytes());
     out.extend_from_slice(&PK_INDEX_SIDECAR_VERSION.to_le_bytes());
@@ -262,14 +295,24 @@ pub(crate) fn serialize_pk_bloom_sidecar(bloom: &PkBloom, snapshot_id: &str) -> 
             .to_le_bytes(),
     );
     out.extend_from_slice(snapshot_bytes);
-    bloom.serialize_into(&mut out);
+    out.extend_from_slice(&u64::try_from(blooms.len()).unwrap_or(0).to_le_bytes());
+    for bloom in blooms {
+        bloom.serialize_into(&mut out);
+    }
     out
 }
 
-/// Inverse of [`serialize_pk_bloom_sidecar`]; returns `None` on any
-/// magic/version/length mismatch so a corrupt or stale-format sidecar falls back
-/// to the full keyset rebuild.
-pub(crate) fn deserialize_pk_bloom_sidecar(bytes: &[u8]) -> Option<(PkBloom, String)> {
+/// Single-bloom convenience over [`serialize_pk_blooms_sidecar`] (the persist path
+/// produces one combined-snapshot bloom; the sharded blooms are rebuilt at load).
+pub(crate) fn serialize_pk_bloom_sidecar(bloom: &PkBloom, snapshot_id: &str) -> Vec<u8> {
+    serialize_pk_blooms_sidecar(std::slice::from_ref(bloom), snapshot_id)
+}
+
+/// Inverse of [`serialize_pk_blooms_sidecar`]; returns `None` on any
+/// magic/version/length/count mismatch so a corrupt or stale-format sidecar
+/// (including every version-1 single-bloom sidecar) falls back to the full keyset
+/// rebuild.
+fn deserialize_pk_blooms_sidecar(bytes: &[u8]) -> Option<(Vec<PkBloom>, String)> {
     let magic = u32::from_le_bytes(bytes.get(0..4)?.try_into().ok()?);
     let version = u32::from_le_bytes(bytes.get(4..8)?.try_into().ok()?);
     if magic != PK_INDEX_SIDECAR_MAGIC || version != PK_INDEX_SIDECAR_VERSION {
@@ -281,8 +324,38 @@ pub(crate) fn deserialize_pk_bloom_sidecar(bytes: &[u8]) -> Option<(PkBloom, Str
     let snapshot_id = std::str::from_utf8(bytes.get(16..snapshot_end)?)
         .ok()?
         .to_string();
-    let bloom = PkBloom::deserialize_from(bytes.get(snapshot_end..)?)?;
-    Some((bloom, snapshot_id))
+    let count_end = snapshot_end.checked_add(8)?;
+    let count = usize::try_from(u64::from_le_bytes(
+        bytes.get(snapshot_end..count_end)?.try_into().ok()?,
+    ))
+    .ok()?;
+    let mut rest = bytes.get(count_end..)?;
+    // Reject an impossible bloom count before allocating: each bloom is
+    // self-describing and consumes >= 32 bytes (24-byte header + >= one 8-byte
+    // word), so a `count` larger than the remaining bytes can encode means a
+    // corrupt/truncated sidecar — return None (clean rebuild) rather than risk a
+    // huge `with_capacity` allocation. Same guard idiom as `deserialize_from_prefix`.
+    if count > rest.len() / 32 {
+        return None;
+    }
+    let mut blooms = Vec::with_capacity(count);
+    for _ in 0..count {
+        let (bloom, consumed) = PkBloom::deserialize_from_prefix(rest)?;
+        blooms.push(bloom);
+        rest = rest.get(consumed..)?;
+    }
+    Some((blooms, snapshot_id))
+}
+
+/// Single-bloom convenience over [`deserialize_pk_blooms_sidecar`]: returns the
+/// first bloom (the n==1 reload path). A multi-bloom sidecar with count != 1 is
+/// rejected so the n==1 reader never silently uses a sharded sidecar.
+pub(crate) fn deserialize_pk_bloom_sidecar(bytes: &[u8]) -> Option<(PkBloom, String)> {
+    let (mut blooms, snapshot_id) = deserialize_pk_blooms_sidecar(bytes)?;
+    if blooms.len() != 1 {
+        return None;
+    }
+    Some((blooms.remove(0), snapshot_id))
 }
 
 /// Cached primary-key existence index for upsert/insert conflict detection.
@@ -310,6 +383,114 @@ impl CachedPkIndex {
         match self {
             Self::Exact(keyset) => keyset.approx_bytes,
             Self::Bloom(bloom) => bloom.bits.len().saturating_mul(8),
+        }
+    }
+}
+
+/// The per-shard PK existence index — the sharded analog of [`CachedPkIndex`]
+/// (§2.3c). A key is owned by `shard_of_pk(OwnedRow bytes)` (§3.5), the SAME
+/// routing the tier append + reads use, so a key's existence entry co-locates
+/// with its segments and a shard validates only against its own keys. Either
+/// all-exact (one keyset per shard) or all-bloom (one bloom per shard), matching
+/// the source index's path.
+pub(crate) enum ShardedPkIndex {
+    Exact(Box<[CachedPkKeyset]>),
+    Bloom(Box<[PkBloom]>),
+}
+
+impl ShardedPkIndex {
+    /// Partition an exact keyset into `n` per-shard keysets by `shard_of_pk` on
+    /// each key's `OwnedRow` bytes (§3.5). Bloom-path indices are built sharded at
+    /// load time instead — a combined bloom can't be partitioned (its keys are
+    /// unrecoverable), so per-shard blooms are constructed by routing keys to N
+    /// blooms during `load_existing_keyset` / `try_load_persisted_pk_index`.
+    pub(crate) fn from_exact(keyset: CachedPkKeyset, n: usize) -> Self {
+        let n = n.max(1);
+        let mut shards: Vec<CachedPkKeyset> =
+            (0..n).map(|_| CachedPkKeyset::with_capacity(0)).collect();
+        for (key, loc) in keyset.keys {
+            let s = shard_of_pk(key.row().as_ref(), n);
+            // Route through CachedPkKeyset::insert — the single source of truth for
+            // approx_bytes (per-key approx_pk_keyset_entry_bytes) — so each shard's
+            // byte tally is exact for variable-length/composite PKs, not an even
+            // split of the source total. The per-shard sums then add back up to the
+            // unsharded keyset's bytes with no integer-division undercount.
+            shards[s].insert(key, loc);
+        }
+        // The position-delete capture set is table-global; every shard needs the
+        // complete skip set so its read-back doesn't re-capture a covered file.
+        for shard in &mut shards {
+            shard.captured_files.clone_from(&keyset.captured_files);
+        }
+        Self::Exact(shards.into_boxed_slice())
+    }
+
+    pub(crate) fn shard_count(&self) -> usize {
+        match self {
+            Self::Exact(s) => s.len(),
+            Self::Bloom(s) => s.len(),
+        }
+    }
+
+    /// Borrowed existence view for shard `i`, handed to that shard's validation.
+    pub(crate) fn existence_ref(&self, i: usize) -> PkExistenceRef<'_> {
+        match self {
+            Self::Exact(keysets) => PkExistenceRef::Exact(&keysets[i].keys),
+            Self::Bloom(blooms) => PkExistenceRef::Bloom(&blooms[i]),
+        }
+    }
+
+    /// Approximate resident bytes across all shards, for memory accounting.
+    pub(crate) fn approx_bytes(&self) -> usize {
+        match self {
+            Self::Exact(keysets) => keysets
+                .iter()
+                .map(|k| k.approx_bytes)
+                .fold(0, usize::saturating_add),
+            Self::Bloom(blooms) => blooms
+                .iter()
+                .map(|b| b.bits.len().saturating_mul(8))
+                .fold(0, usize::saturating_add),
+        }
+    }
+
+    /// Record `keys` into ONE shard's existence view (Phase 6 — the bloom-split
+    /// insert performed UNDER `mem_tier_publish_locks[shard]`). Every key in
+    /// `keys` MUST belong to `shard` (it is the validated/kept key set of that
+    /// shard's own sub-batch, already routed by `shard_of_pk`); inserting them
+    /// here keyed on the SAME `shard` index keeps a key's existence entry
+    /// co-located with its segments. Inserting under the shard lock makes the
+    /// bloom INSERT atomic with the segment swap, so a later same-apply HIT-path
+    /// validation against this shard observes the prior MISS-path appends (the
+    /// §3.4 / Review-4 HOLE-3 intra-apply-dup window is closed jointly by this
+    /// insert and the per-apply `incoming_keys` set).
+    ///
+    /// NOTE: unlike `record_pk_keys_with_location`, this intentionally does NOT do
+    /// per-insert over-budget exact→bloom conversion. The sharded path recomputes
+    /// the keyset byte tally ONCE after all per-shard appends (recompute-once), so a
+    /// shard never converts exact→bloom mid-life — a deliberate divergence, not an
+    /// oversight.
+    pub(crate) fn record_keys_in_shard(
+        &mut self,
+        shard: usize,
+        keys: &HashSet<OwnedRow>,
+        location: &RowLocation,
+    ) {
+        match self {
+            Self::Exact(keysets) => {
+                if let Some(keyset) = keysets.get_mut(shard) {
+                    for key in keys {
+                        keyset.insert(key.clone(), location.clone());
+                    }
+                }
+            }
+            Self::Bloom(blooms) => {
+                if let Some(bloom) = blooms.get_mut(shard) {
+                    for key in keys {
+                        bloom.insert(key.as_ref());
+                    }
+                }
+            }
         }
     }
 }
