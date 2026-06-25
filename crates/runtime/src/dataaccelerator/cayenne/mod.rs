@@ -124,6 +124,7 @@ static UNSUPPORTED_LOCAL_PARTITION_PATTERN: LazyLock<Regex> =
 
 fn maintained_aggregate_specs_for_cayenne(
     acceleration: Option<&Acceleration>,
+    schema: &Schema,
 ) -> Result<Vec<cayenne::maintained_aggregate::MaintainedAggregateSpec>> {
     let Some(acceleration) = acceleration else {
         return Ok(Vec::new());
@@ -142,37 +143,88 @@ fn maintained_aggregate_specs_for_cayenne(
         });
     }
 
-    Ok(maintained_aggregates
+    maintained_aggregates
         .iter()
-        .map(
-            |aggregate| cayenne::maintained_aggregate::MaintainedAggregateSpec {
-                filter: None,
-                group_by: aggregate.group_by.clone(),
-                aggregates: aggregate
-                    .aggregates
-                    .iter()
-                    .map(|expr| {
-                        let function = match expr.function {
-                            spicepod_acceleration::MaintainedAggregateFunction::Count => {
-                                cayenne::maintained_aggregate::MaintainedAggregateFunction::Count
-                            }
-                            spicepod_acceleration::MaintainedAggregateFunction::Sum => {
-                                cayenne::maintained_aggregate::MaintainedAggregateFunction::Sum
-                            }
-                            spicepod_acceleration::MaintainedAggregateFunction::Avg => {
-                                cayenne::maintained_aggregate::MaintainedAggregateFunction::Avg
-                            }
-                        };
+        .map(|aggregate| {
+            // An optional `filter` is the maintained equivalent of a query
+            // `WHERE`: it is parsed against the table schema into a physical
+            // predicate so the view maintains only the matching rows and the
+            // optimizer can serve a query carrying the identical predicate.
+            let filter = aggregate
+                .filter
+                .as_deref()
+                .map(|sql| parse_maintained_aggregate_filter(sql, schema))
+                .transpose()?;
 
-                        cayenne::maintained_aggregate::MaintainedAggregateExpr {
-                            function,
-                            column: expr.column.clone(),
+            let aggregates = aggregate
+                .aggregates
+                .iter()
+                .map(|expr| {
+                    let function = match expr.function {
+                        spicepod_acceleration::MaintainedAggregateFunction::Count => {
+                            cayenne::maintained_aggregate::MaintainedAggregateFunction::Count
                         }
-                    })
-                    .collect(),
-            },
-        )
-        .collect())
+                        spicepod_acceleration::MaintainedAggregateFunction::Sum => {
+                            cayenne::maintained_aggregate::MaintainedAggregateFunction::Sum
+                        }
+                        spicepod_acceleration::MaintainedAggregateFunction::Avg => {
+                            cayenne::maintained_aggregate::MaintainedAggregateFunction::Avg
+                        }
+                    };
+
+                    cayenne::maintained_aggregate::MaintainedAggregateExpr {
+                        function,
+                        column: expr.column.clone(),
+                    }
+                })
+                .collect();
+
+            Ok(cayenne::maintained_aggregate::MaintainedAggregateSpec {
+                filter,
+                group_by: aggregate.group_by.clone(),
+                aggregates,
+            })
+        })
+        .collect()
+}
+
+/// Parse a maintained-aggregate `filter` SQL predicate into a physical
+/// expression over the table `schema`. The resulting expression references the
+/// table columns by their schema position, matching both the CDC batches the
+/// view is maintained from and the `FilterExec` predicate a filtered query
+/// carries — so the maintained view serves the query when the predicates match.
+fn parse_maintained_aggregate_filter(
+    sql: &str,
+    schema: &Schema,
+) -> Result<Arc<dyn datafusion::physical_expr::PhysicalExpr>> {
+    use datafusion::common::ToDFSchema;
+
+    let df_schema = schema
+        .clone()
+        .to_dfschema()
+        .map_err(|source| Error::InvalidConfiguration {
+            detail: Arc::from(format!(
+                "Cayenne maintained_aggregates filter '{sql}' could not bind to the table schema: {source}"
+            )),
+        })?;
+    let context = datafusion::prelude::SessionContext::new();
+    let logical = context
+        .parse_sql_expr(sql, &df_schema)
+        .map_err(|source| Error::InvalidConfiguration {
+            detail: Arc::from(format!(
+                "Cayenne maintained_aggregates filter '{sql}' is not a valid SQL predicate over the table columns: {source}"
+            )),
+        })?;
+    datafusion::physical_expr::create_physical_expr(
+        &logical,
+        &df_schema,
+        &datafusion_expr::execution_props::ExecutionProps::new(),
+    )
+    .map_err(|source| Error::InvalidConfiguration {
+        detail: Arc::from(format!(
+            "Cayenne maintained_aggregates filter '{sql}' could not be planned: {source}"
+        )),
+    })
 }
 
 /// Transform schema according to `unsupported_type_action` policy.
@@ -1434,7 +1486,8 @@ impl CayenneAccelerator {
         // Get metastore type and metadata directory
         let acceleration = source.acceleration();
         let metadata_dir = Self::resolve_metadata_dir(acceleration);
-        let maintained_aggregate_specs = maintained_aggregate_specs_for_cayenne(acceleration)?;
+        let maintained_aggregate_specs =
+            maintained_aggregate_specs_for_cayenne(acceleration, &schema)?;
         let metastore_type = acceleration
             .and_then(|a| a.params.get("cayenne_metastore"))
             .map_or("sqlite", String::as_str)
@@ -2982,18 +3035,29 @@ mod tests {
                     function: spicepod_acceleration::MaintainedAggregateFunction::Count,
                     column: None,
                 }],
+                filter: None,
             }]
             .into(),
             ..Default::default()
         }
     }
 
+    fn maintained_aggregate_test_schema() -> Schema {
+        Schema::new(vec![
+            arrow_schema::Field::new("customer_id", DataType::Int64, false),
+            arrow_schema::Field::new("amount", DataType::Int64, true),
+        ])
+    }
+
     #[test]
     fn maintained_aggregate_specs_convert_for_unpartitioned_cayenne() {
         let acceleration = maintained_aggregate_acceleration();
 
-        let specs = maintained_aggregate_specs_for_cayenne(Some(&acceleration))
-            .expect("unpartitioned maintained aggregate config should convert");
+        let specs = maintained_aggregate_specs_for_cayenne(
+            Some(&acceleration),
+            &maintained_aggregate_test_schema(),
+        )
+        .expect("unpartitioned maintained aggregate config should convert");
 
         assert_eq!(specs.len(), 1);
         assert_eq!(specs[0].group_by, vec!["customer_id".to_string()]);
@@ -3013,8 +3077,11 @@ mod tests {
             acceleration.maintained_aggregates.as_slice().to_vec(),
         );
 
-        let specs = maintained_aggregate_specs_for_cayenne(Some(&acceleration))
-            .expect("disabled maintained aggregate config should parse");
+        let specs = maintained_aggregate_specs_for_cayenne(
+            Some(&acceleration),
+            &maintained_aggregate_test_schema(),
+        )
+        .expect("disabled maintained aggregate config should parse");
 
         assert!(specs.is_empty());
     }
@@ -3027,14 +3094,65 @@ mod tests {
             expression: "region".to_string(),
         }];
 
-        let error = maintained_aggregate_specs_for_cayenne(Some(&acceleration))
-            .expect_err("partitioned maintained aggregate config should be rejected");
+        let error = maintained_aggregate_specs_for_cayenne(
+            Some(&acceleration),
+            &maintained_aggregate_test_schema(),
+        )
+        .expect_err("partitioned maintained aggregate config should be rejected");
 
         let Error::InvalidConfiguration { detail } = error else {
             panic!("expected InvalidConfiguration, got {error:?}");
         };
         assert!(detail.contains("maintained_aggregates"));
         assert!(detail.contains("partitioned"));
+    }
+
+    fn maintained_aggregate_acceleration_with_filter(filter: &str) -> Acceleration {
+        let mut views = maintained_aggregate_acceleration()
+            .maintained_aggregates
+            .as_slice()
+            .to_vec();
+        views[0].filter = Some(filter.to_string());
+        Acceleration {
+            maintained_aggregates: views.into(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn maintained_aggregate_specs_parse_config_filter() {
+        let acceleration = maintained_aggregate_acceleration_with_filter("amount > 100");
+
+        let specs = maintained_aggregate_specs_for_cayenne(
+            Some(&acceleration),
+            &maintained_aggregate_test_schema(),
+        )
+        .expect("a valid maintained aggregate filter should convert");
+
+        assert_eq!(specs.len(), 1);
+        assert!(
+            specs[0].filter.is_some(),
+            "the config filter must be parsed onto the maintained aggregate spec"
+        );
+    }
+
+    #[test]
+    fn maintained_aggregate_specs_reject_unknown_filter_column() {
+        let acceleration = maintained_aggregate_acceleration_with_filter("nonexistent_column > 1");
+
+        let error = maintained_aggregate_specs_for_cayenne(
+            Some(&acceleration),
+            &maintained_aggregate_test_schema(),
+        )
+        .expect_err("a filter referencing an unknown column must be rejected");
+
+        let Error::InvalidConfiguration { detail } = error else {
+            panic!("expected InvalidConfiguration, got {error:?}");
+        };
+        assert!(
+            detail.contains("filter"),
+            "the error must identify the maintained-aggregate filter: {detail}"
+        );
     }
 
     #[test]

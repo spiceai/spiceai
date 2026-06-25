@@ -296,6 +296,16 @@ pub struct MaintainedAggregate {
     /// Aggregate expressions maintained for each group, in query output order.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub aggregates: Vec<MaintainedAggregateExpr>,
+
+    /// Optional SQL row predicate (a `WHERE` expression over the dataset's
+    /// columns, e.g. `ol_delivery_d > '2007-01-02'`) selecting which rows
+    /// contribute to the view. When set, an accelerator that supports it
+    /// maintains the aggregate over only the matching rows and serves a query
+    /// carrying the identical predicate from that maintained state — letting a
+    /// filtered analytical query (the common dashboard shape) be answered from
+    /// the incrementally-maintained view instead of a full re-scan.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub filter: Option<String>,
 }
 
 /// One aggregate expression inside a maintained aggregate view.
@@ -764,6 +774,38 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn test_deserialize_maintained_aggregate_filter() {
+        let yaml = r"
+                maintained_aggregates:
+                  - group_by: [ol_number]
+                    filter: ol_delivery_d > '2007-01-02'
+                    aggregates:
+                      - function: sum
+                        column: ol_amount
+            ";
+        let acceleration: Acceleration =
+            yaml::from_str(yaml).expect("Failed to parse Acceleration");
+        let maintained = &acceleration.maintained_aggregates.as_slice()[0];
+        assert_eq!(
+            maintained.filter.as_deref(),
+            Some("ol_delivery_d > '2007-01-02'"),
+            "the filter predicate must round-trip from YAML"
+        );
+
+        // Absent filter must default to None (backward compatible).
+        let no_filter: Acceleration = yaml::from_str(
+            "
+                maintained_aggregates:
+                  - group_by: [customer_id]
+                    aggregates:
+                      - function: count
+            ",
+        )
+        .expect("Failed to parse Acceleration");
+        assert_eq!(no_filter.maintained_aggregates.as_slice()[0].filter, None);
     }
 
     #[test]
