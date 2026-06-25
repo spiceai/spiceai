@@ -121,6 +121,7 @@ pub(crate) async fn create_hf(model_id: &str) -> Result<Arc<dyn Chat>, ChatError
             .map(SecretString::from)
             .as_ref(),
         None,
+        None,
     )
     .await
 }
@@ -145,6 +146,7 @@ pub(crate) async fn create_local(model_id: &str) -> Result<Arc<dyn Chat>, anyhow
         temp_dir.join("config.json").to_str(),
         temp_dir.join("tokenizer.json").to_str(),
         temp_dir.join("tokenizer_config.json").to_str(),
+        None,
         None,
         None,
     )

@@ -55,7 +55,7 @@ use datafusion::optimizer::{Optimizer, OptimizerRule};
 use datafusion::{
     catalog::{CatalogProvider, MemoryCatalogProvider},
     execution::{
-        DiskManager, SessionStateBuilder,
+        DiskManager, FunctionRegistry, SessionStateBuilder,
         disk_manager::DiskManagerMode,
         memory_pool::{GreedyMemoryPool, TrackConsumersPool},
         object_store::ObjectStoreRegistry,
@@ -89,7 +89,8 @@ use datafusion::physical_optimizer::PhysicalOptimizerRule;
 use datafusion::physical_optimizer::optimizer::PhysicalOptimizer;
 use datafusion_optimizer_rules::{
     logical_plan::{
-        CacheInvalidationExtensionPlanner, cache_invalidation::CacheInvalidationOptimizerRule,
+        CacheInvalidationExtensionPlanner, ReorderJoinRule,
+        cache_invalidation::CacheInvalidationOptimizerRule,
     },
     physical_plan::{
         EmptyHashJoinExecPhysicalOptimization, HttpParamsPushdown,
@@ -161,6 +162,7 @@ struct CayenneLogicalOptimizerRules {
     cross_join_reassociation: bool,
     inlist_to_range: bool,
     semi_join_pushdown: bool,
+    join_reorder: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -217,6 +219,7 @@ impl CayenneOptimizerRules {
                 cross_join_reassociation: true,
                 inlist_to_range: false,
                 semi_join_pushdown: true,
+                join_reorder: true,
             },
             physical: CayennePhysicalOptimizerRules::auto_enabled(),
         }
@@ -230,6 +233,7 @@ impl CayenneOptimizerRules {
                 cross_join_reassociation: true,
                 inlist_to_range: true,
                 semi_join_pushdown: true,
+                join_reorder: true,
             },
             physical: CayennePhysicalOptimizerRules::all_enabled(),
         }
@@ -243,6 +247,7 @@ impl CayenneOptimizerRules {
                 cross_join_reassociation: false,
                 inlist_to_range: false,
                 semi_join_pushdown: false,
+                join_reorder: false,
             },
             physical: CayennePhysicalOptimizerRules::none(),
         }
@@ -282,6 +287,15 @@ impl CayenneOptimizerRules {
 
     pub fn set_semi_join_pushdown(&mut self, enabled: bool) {
         self.logical.semi_join_pushdown = enabled;
+    }
+
+    #[must_use]
+    pub const fn join_reorder(self) -> bool {
+        self.logical.join_reorder
+    }
+
+    pub fn set_join_reorder(&mut self, enabled: bool) {
+        self.logical.join_reorder = enabled;
     }
 
     #[must_use]
@@ -842,8 +856,40 @@ impl DataFusionBuilder {
             panic!("Unable to register JSON functions: {e}");
         }
 
-        if let Err(e) = datafusion_spark::register_all(&mut state) {
-            panic!("Unable to register Spark functions: {e}");
+        // Register Spark-compatible functions, but skip Spark's `trunc` (scalar) and
+        // `avg` (aggregate): `register_all` would register them *over* the built-ins
+        // of the same name. Spark `trunc` is date-truncation and shadows numeric
+        // `trunc(<float>, <int>)` (see spiceai/spiceai#11415). Spark `avg` uses a different
+        // partial-aggregate state layout (`[sum, count:Int64]`) than the built-in
+        // (`[count:UInt64, sum]`); harmless single-node, but it corrupts DISTRIBUTED
+        // plans — the scheduler bakes the shuffle/stage schema from Spark `avg`'s
+        // `state_fields` while executors run the built-in `avg`, so the coalescing
+        // shuffle reader downcasts the wrong primitive type and panics ("primitive
+        // array"). Keep the built-ins; register every other Spark function (mirrors
+        // `datafusion_spark::register_all`).
+        for udf in datafusion_spark::all_default_scalar_functions() {
+            if udf.name() == "trunc" {
+                continue;
+            }
+            let name = udf.name().to_string();
+            if let Err(e) = state.register_udf(udf) {
+                panic!("Unable to register Spark scalar function `{name}`: {e}");
+            }
+        }
+        for udaf in datafusion_spark::all_default_aggregate_functions() {
+            if udaf.name() == "avg" {
+                continue;
+            }
+            let name = udaf.name().to_string();
+            if let Err(e) = state.register_udaf(udaf) {
+                panic!("Unable to register Spark aggregate function `{name}`: {e}");
+            }
+        }
+        for udwf in datafusion_spark::all_default_window_functions() {
+            let name = udwf.name().to_string();
+            if let Err(e) = state.register_udwf(udwf) {
+                panic!("Unable to register Spark window function `{name}`: {e}");
+            }
         }
 
         let catalog = MemoryCatalogProvider::new();
@@ -1051,6 +1097,9 @@ fn with_cayenne_logical_optimizers(
     if cayenne_optimizer_rules.semi_join_pushdown() {
         insert_cayenne_push_down_semi_join(&mut optimizer_rules);
     }
+    if cayenne_optimizer_rules.join_reorder() {
+        insert_cayenne_join_reorder_rule(&mut optimizer_rules);
+    }
     optimizer_rules.extend(trailing_rules);
     state.with_optimizer_rules(optimizer_rules)
 }
@@ -1166,6 +1215,29 @@ fn insert_cayenne_push_down_semi_join(rules: &mut Vec<Arc<dyn OptimizerRule + Se
                 is_cayenne_accelerated_table_provider,
             )),
         );
+    }
+}
+
+#[cfg(not(windows))]
+fn insert_cayenne_join_reorder_rule(rules: &mut Vec<Arc<dyn OptimizerRule + Send + Sync>>) {
+    // Cost-based left-deep join reordering (IK84). It must run *after* the
+    // inner-join graph is fully formed AND base-table predicates are pushed to
+    // the scans — equi-predicates extracted, cross joins reassociated into a
+    // contiguous Inner-join chain, and `push_down_filter` applied so the cost
+    // model can credit `TableScan.filters` for scan selectivity — but *before*
+    // projection pushdown (`optimize_projections`) inserts intervening
+    // Projections that fragment the graph into opaque leaves.
+    if !rules.iter().any(|rule| rule.name() == "reorder_join") {
+        let insert_at = [
+            "push_down_filter",
+            "cayenne_reassociate_cross_join",
+            "eliminate_cross_join",
+        ]
+        .iter()
+        .filter_map(|name| rules.iter().position(|rule| rule.name() == *name))
+        .max()
+        .map_or(rules.len(), |position| position + 1);
+        rules.insert(insert_at, Arc::new(ReorderJoinRule::default()));
     }
 }
 
@@ -1905,6 +1977,8 @@ mod tests {
         inlist_to_range.set_inlist_to_range(true);
         let mut semi_join_pushdown = CayenneOptimizerRules::none();
         semi_join_pushdown.set_semi_join_pushdown(true);
+        let mut join_reorder = CayenneOptimizerRules::none();
+        join_reorder.set_join_reorder(true);
         let mut dynamic_filter_sharing = CayenneOptimizerRules::none();
         dynamic_filter_sharing.set_dynamic_filter_sharing(true);
         let mut maintained_aggregate = CayenneOptimizerRules::none();
@@ -1935,6 +2009,7 @@ mod tests {
                 vec!["cayenne_push_down_semi_join"],
                 vec![],
             ),
+            (join_reorder, vec!["reorder_join"], vec![]),
             (
                 dynamic_filter_sharing,
                 vec![],
@@ -2201,6 +2276,22 @@ mod tests {
             reassociate_position < push_down_position,
             "Cayenne cross join reassociation must run before push_down_filter consumes the join tree shape"
         );
+        let reorder_position = rule_names
+            .iter()
+            .position(|name| *name == "reorder_join")
+            .expect("reorder_join rule should be registered (join_reorder is on by default)");
+        let optimize_projections_position = rule_names
+            .iter()
+            .position(|name| *name == "optimize_projections")
+            .expect("DataFusion optimize_projections rule should be registered");
+        assert!(
+            push_down_position < reorder_position,
+            "reorder_join must run AFTER push_down_filter so TableScan.filters are populated for cost-based join reordering"
+        );
+        assert!(
+            reorder_position < optimize_projections_position,
+            "reorder_join must run BEFORE optimize_projections, which inserts Projections between joins that fragment the reorderable join graph into opaque leaves"
+        );
         assert_eq!(
             rule_names
                 .iter()
@@ -2463,7 +2554,9 @@ mod tests {
             .optimizers()
             .iter()
             .map(|rule| rule.name().to_string())
-            .filter(|rule_name| rule_name.starts_with("cayenne_"))
+            // Cayenne-gated logical rules are `cayenne_*`, plus `reorder_join`
+            // (the join-reorder rule, which keeps its DataFusion-style name).
+            .filter(|rule_name| rule_name.starts_with("cayenne_") || rule_name == "reorder_join")
             .collect();
         let physical_rule_names = state
             .physical_optimizers()

@@ -64,6 +64,7 @@ pub mod ddl;
 pub mod hll;
 #[cfg(feature = "partition-table-provider")]
 pub use ddl::CayenneDdlHandler;
+pub(crate) mod bounded_fifo;
 pub mod logical_optimizer;
 pub mod maintained_aggregate;
 pub mod metadata;
@@ -72,9 +73,9 @@ pub mod optimizer_rules;
 #[cfg(feature = "partition-table-provider")]
 pub(crate) mod partition_creator;
 pub mod provider;
+pub(crate) mod resource_starvation;
 pub(crate) mod schema;
 pub mod stats;
-
 pub use catalog::MetadataCatalog;
 pub use catalog::{CatalogError, CatalogResult};
 pub use catalog_provider::{

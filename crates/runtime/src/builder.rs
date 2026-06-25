@@ -673,10 +673,8 @@ impl RuntimeBuilder {
             app: shared_app,
             df,
             models: Arc::new(RwLock::new(HashMap::new())),
-            completion_llms: Arc::new(RwLock::new(HashMap::new())),
-            model_rate_controllers: Arc::new(RwLock::new(HashMap::new())),
+            llm_runtime_stores: Arc::new(crate::model::LlmRuntimeStores::default()),
             http_rate_control_registry,
-            responses_llms: Arc::new(RwLock::new(HashMap::new())),
             workers: Arc::new(RwLock::new(HashMap::new())),
             embeds: Arc::new(RwLock::new(HashMap::new())),
             rerankers: Arc::new(RwLock::new(HashMap::new())),
@@ -1036,6 +1034,9 @@ fn parse_cayenne_optimizer_rules(
             }
             "semi_join_pushdown" | "push_down_semi_join" | "semi_join" => {
                 rules.set_semi_join_pushdown(true);
+            }
+            "join_reorder" | "reorder_join" | "join_ordering" => {
+                rules.set_join_reorder(true);
             }
             "dynamic_filter_sharing" | "dynamic_filters" => {
                 rules.set_dynamic_filter_sharing(true);
