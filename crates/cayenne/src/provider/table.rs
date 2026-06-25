@@ -10488,8 +10488,8 @@ impl CayenneTableProvider {
         // named data file), not sequence-tagged, so they cannot be carried
         // forward by sequence once compaction rewrites the file away. The only
         // safe option is to exclude writers for the whole rewrite (mirrors
-        // `compact_protected_snapshots_subset`). `try_lock` + defer so a busy
-        // writer postpones compaction rather than blocking ingestion.
+        // `compact_protected_snapshots_subset`), via a BLOCKING `write_lock`
+        // acquire so the full-snapshot rewrite always makes progress (see below).
         let (_position_write_guard, _position_visibility_guard) = if uses_position_deletes {
             // Blocking acquire (not try_lock): the full-snapshot rewrite must
             // always make progress — a try_lock+defer would starve it on a busy
@@ -10512,18 +10512,27 @@ impl CayenneTableProvider {
         let ctx = self.create_compaction_session_context();
 
         // Build the visible stream and, for key-delete tables, capture a COHERENT
-        // `(cutoff, folded protected snapshots)` fence under a brief `write_lock`
-        // held ACROSS stream construction. Holding it across the build (not just a
-        // point read) is required so the captured `folded` set EXACTLY matches
-        // what the stream folds in: `visible_file_stream_for_rewrite` may run an
-        // inline-data checkpoint that itself creates a protected snapshot, and no
-        // concurrent writer may slip a protected snapshot in between the capture
-        // and the scan. Under `write_lock` no writer is mid-publish, so every
-        // mutation with `seq <= cutoff` is already visible to the scan; anything
-        // that arrives afterward gets `seq > cutoff` and is carried forward (NOT
-        // cleared) at the end. The lock is released as soon as the stream object
-        // exists (it has already pinned its inputs), so the slow encode below
-        // runs fully concurrent with writers, preserving CDC throughput.
+        // `(cutoff, folded protected snapshots)` fence under a brief `write_lock`.
+        // Under `write_lock` no writer is mid-publish, so every mutation with
+        // `seq <= cutoff` is already visible to the scan; anything that arrives
+        // afterward gets `seq > cutoff` and is carried forward (NOT cleared) at
+        // the end. The lock is released as soon as the stream object exists (it
+        // has already pinned its inputs), so the slow encode below runs fully
+        // concurrent with writers, preserving CDC throughput.
+        //
+        // `folded` MUST be exactly the protected snapshots the scan folded in:
+        // clearing one the scan did NOT fold loses its rows; failing to clear one
+        // it DID fold duplicates them. `write_lock` alone does not give that — a
+        // pipelined CDC finalize publishes a protected snapshot under
+        // `listing_fence.write()` WITHOUT `write_lock`, so it can interleave
+        // between the scan's plan capture and our read. We hold `compaction_lock`
+        // (clears are serialized), so the protected set can only GROW during this
+        // pass; bracket the scan with two reads and ABORT the pass if it changed
+        // (best-effort — the next trigger retries), which is the only safe option
+        // short of plumbing the folded set out of the scan. The inline checkpoint
+        // is run explicitly FIRST so the protected snapshot it may create is in
+        // both reads (otherwise `visible_file_stream_for_rewrite` would create it
+        // between the two reads and spuriously abort every pass with inline data).
         //
         // Position-delete tables already hold `write_lock` for the whole rewrite
         // (above) and clear everything at the end, so they need no fence.
@@ -10535,15 +10544,28 @@ impl CayenneTableProvider {
             (stream, None)
         } else {
             let _capture_guard = self.write_lock_arc().lock_owned().await;
+            if self.cached_inlined_row_count() > 0 {
+                self.checkpoint_inlined_data().await?;
+            }
+            let folded_before: std::collections::HashSet<String> =
+                self.protected_snapshots.load_full().keys().cloned().collect();
             let stream = self.visible_file_stream_for_rewrite(&ctx).await?;
             let cutoff = self.sequence_high_water().await;
-            let folded: std::collections::HashSet<String> = self
-                .protected_snapshots
-                .load_full()
-                .keys()
-                .cloned()
-                .collect();
-            (stream, Some((cutoff, folded)))
+            let folded_after: std::collections::HashSet<String> =
+                self.protected_snapshots.load_full().keys().cloned().collect();
+            if folded_before != folded_after {
+                // A concurrent finalize published a protected snapshot during the
+                // scan; we can no longer tell which snapshots the scan folded.
+                // Abort before any new snapshot dir is created; retry next trigger.
+                tracing::debug!(
+                    target: "cayenne::compaction",
+                    table = self.table_metadata.table_name.as_str(),
+                    "Aborting full rewrite: protected-snapshot set changed during scan \
+                     (concurrent finalize); will retry on the next trigger",
+                );
+                return Ok(());
+            }
+            (stream, Some((cutoff, folded_before)))
         };
 
         if self.context.has_sort_columns() {

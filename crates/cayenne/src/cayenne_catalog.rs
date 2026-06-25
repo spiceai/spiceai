@@ -454,6 +454,14 @@ impl CayenneCatalog {
     /// cutoff` and only the protected snapshots named in
     /// `protected_snapshot_ids_to_clear`, then advances the snapshot pointer.
     /// Same statement order as the wholesale version for crash-safety parity.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CatalogError::InvalidOperationNoSource`] if `table_id`,
+    /// `new_snapshot_id`, or any id in `protected_snapshot_ids_to_clear` is not a
+    /// valid UUID (they are interpolated into the batch SQL).
+    /// Returns [`CatalogError::FailedToSetCurrentSnapshot`] if the `execute_batch`
+    /// call against the borrowed transaction fails.
     pub async fn commit_compaction_fenced_in_txn(
         &self,
         txn: &mut dyn MetastoreTransaction,
