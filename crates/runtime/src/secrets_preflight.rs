@@ -1,5 +1,5 @@
 /*
-Copyright 2024-2025 The Spice.ai OSS Authors
+Copyright 2024-2026 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -142,33 +142,33 @@ fn collect_references(app: &App) -> Vec<LocatedRef> {
 
     for dataset in &app.datasets {
         if let Some(params) = &dataset.params {
-            scan_map("dataset", &dataset.name, params.as_string_map(), &mut refs);
+            scan_map("dataset", &dataset.name, &params.as_string_map(), &mut refs);
         }
     }
     for catalog in &app.catalogs {
         if let Some(params) = &catalog.params {
-            scan_map("catalog", &catalog.name, params.as_string_map(), &mut refs);
+            scan_map("catalog", &catalog.name, &params.as_string_map(), &mut refs);
         }
     }
     for view in &app.views {
         if let Some(params) = &view.params {
-            scan_map("view", &view.name, params.as_string_map(), &mut refs);
+            scan_map("view", &view.name, &params.as_string_map(), &mut refs);
         }
     }
     for model in &app.models {
-        scan_map("model", &model.name, value_map(&model.params), &mut refs);
+        scan_map("model", &model.name, &value_map(&model.params), &mut refs);
     }
     for embedding in &app.embeddings {
         scan_map(
             "embedding",
             &embedding.name,
-            value_map(&embedding.params),
+            &value_map(&embedding.params),
             &mut refs,
         );
     }
     for tool in &app.tools {
-        scan_map("tool", &tool.name, tool.params.clone(), &mut refs);
-        scan_map("tool", &tool.name, tool.env.clone(), &mut refs);
+        scan_map("tool", &tool.name, &tool.params, &mut refs);
+        scan_map("tool", &tool.name, &tool.env, &mut refs);
     }
 
     refs
@@ -192,14 +192,16 @@ fn value_map(params: &HashMap<String, serde_json::Value>) -> HashMap<String, Str
 }
 
 /// Scans one component's `param -> value` map and appends every reference found.
+/// Borrows the map so call sites (notably `tool.params` / `tool.env`) don't
+/// clone during startup.
 fn scan_map(
     kind: &'static str,
     component: &str,
-    params: HashMap<String, String>,
+    params: &HashMap<String, String>,
     refs: &mut Vec<LocatedRef>,
 ) {
     for (param, value) in params {
-        for reference in iter_secret_references(&value) {
+        for reference in iter_secret_references(value) {
             refs.push(LocatedRef {
                 kind,
                 component: component.to_string(),
