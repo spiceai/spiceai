@@ -83,10 +83,22 @@ impl JobMetadata {
     }
 
     fn is_terminal(&self) -> bool {
-        matches!(
-            self.job_status().ok().and_then(|s| s.status),
-            Some(Status::Successful(_) | Status::Failed(_))
-        )
+        match self.job_status() {
+            Ok(status) => matches!(
+                status.status,
+                Some(Status::Successful(_) | Status::Failed(_))
+            ),
+            // A corrupt/undecodable status must not be treated as resumable: report
+            // it as terminal so schedulers refuse to take over and drive a job whose
+            // recovery state we cannot trust.
+            Err(e) => {
+                tracing::warn!(
+                    "job {} has an undecodable persisted status ({e}); treating as terminal to prevent takeover",
+                    self.job_id
+                );
+                true
+            }
+        }
     }
 }
 
@@ -237,8 +249,10 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> JobState for Shar
         };
 
         let status = graph.status().clone();
-        self.put_graph(&job_id, graph).await?;
 
+        // Claim ownership via OCC *before* writing the graph blob. Writing the
+        // graph first would overwrite an existing owner's graph for the same
+        // job_id on a metadata conflict, corrupting their recovery state.
         let mut meta = Self::metadata(&job_id, &status, Some(self.owner_instance_id), 0, queued_at);
         meta.session_id = graph.session_id().to_string();
         if let object_store_occ::WriteResult::Conflict { .. } = self
@@ -250,6 +264,17 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> JobState for Shar
             return Err(BallistaError::Internal(format!(
                 "failed to submit job {job_id}, meta already owned"
             )));
+        }
+        // With the claim in place, persist the graph. If that fails, best-effort
+        // roll back the metadata so other schedulers never observe meta pointing
+        // at a missing graph.
+        if let Err(e) = self.put_graph(&job_id, graph).await {
+            if let Err(cleanup) = self.meta.delete(&job_id).await {
+                tracing::warn!(
+                    "failed to roll back job meta for {job_id} after graph write failed: {cleanup}"
+                );
+            }
+            return Err(e);
         }
 
         self.local_jobs
@@ -431,13 +456,16 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> JobState for Shar
     async fn remove_job(&self, job_id: &str) -> Result<()> {
         self.local_jobs.remove(job_id);
         self.queued_jobs.remove(job_id);
+        // Delete metadata first: if it fails we keep the graph so meta still
+        // points at a valid blob. A subsequent graph-delete failure is then only
+        // a storage leak rather than dangling metadata pointing at nothing.
+        if let Err(e) = self.meta.delete(job_id).await {
+            tracing::warn!("failed to delete job meta for {job_id}: {e}");
+        }
         if let Err(e) = self.store.delete(&self.graph_path(job_id)).await
             && !matches!(e, object_store::Error::NotFound { .. })
         {
             tracing::warn!("failed to delete job graph for {job_id}: {e}");
-        }
-        if let Err(e) = self.meta.delete(job_id).await {
-            tracing::warn!("failed to delete job meta for {job_id}: {e}");
         }
         Ok(())
     }

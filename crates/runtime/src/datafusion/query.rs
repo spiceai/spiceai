@@ -616,43 +616,70 @@ impl Query {
                 pre_parsed_plan,
                 ..
             } => {
-                // Use the existing get_plan_or_cached which handles all cache
-                // control, stale-while-revalidate, and query tracking. The
-                // cache itself is namespaced per principal and refuses to
-                // store write-capable plans, so a read-only caller cannot
-                // observe a cached entry produced by a write-capable plan.
-                match Query::get_plan_or_cached(
-                    &self.df,
-                    &session,
-                    Arc::clone(&request_context),
-                    sql,
-                    parameters.clone(),
-                    tracker,
-                    pre_parsed_plan.clone(),
-                )
-                .await?
-                {
-                    cache::PlanOrCached::Cached(cached_result) => {
-                        tracing::debug!(job_id, "Returning cached result for distributed query");
-                        // Return a QueryHandle with cached results
-                        let schema = cached_result.data.schema();
-                        return Ok(QueryHandle::new_with_cached_result(
-                            job_id.to_string(),
-                            schema,
-                            Arc::clone(&self.df),
-                            None, // Cache key already used for lookup
-                            cached_result.data,
-                            Arc::clone(&request_context),
-                        ));
-                    }
-                    cache::PlanOrCached::Plan(plan, tracker, cache_manager) => {
-                        // Plan needs execution - cache_manager contains the raw cache key for storing results
-                        let cache_key = if cache_manager.should_cache_results() {
-                            Some(cache_manager.raw_cache_key)
-                        } else {
-                            None
-                        };
-                        (*plan, tracker, cache_key)
+                if mode == DistributedSubmitMode::Resume {
+                    // Recovery drives the already-persisted execution graph: it must
+                    // never short-circuit on a cached result (that would skip
+                    // recover_job and leave the running job orphaned) nor write a
+                    // fresh cache entry. Plan without consulting the result cache.
+                    let plan = if let Some(plan) = pre_parsed_plan.clone() {
+                        *plan
+                    } else {
+                        let cache_namespace = request_context.cache_namespace();
+                        let (ns_tag, ns_id) = cache_namespace.hash_inputs();
+                        let sql_raw_cache_key = CacheKey::Query(sql, parameters.as_ref())
+                            .as_raw_key_in_namespace(Self::plan_hasher(&self.df), ns_tag, ns_id);
+                        Query::get_plan(
+                            &self.df,
+                            &session,
+                            sql,
+                            &sql_raw_cache_key,
+                            parameters.clone(),
+                        )
+                        .await?
+                    };
+                    (plan, tracker, None)
+                } else {
+                    // Use the existing get_plan_or_cached which handles all cache
+                    // control, stale-while-revalidate, and query tracking. The
+                    // cache itself is namespaced per principal and refuses to
+                    // store write-capable plans, so a read-only caller cannot
+                    // observe a cached entry produced by a write-capable plan.
+                    match Query::get_plan_or_cached(
+                        &self.df,
+                        &session,
+                        Arc::clone(&request_context),
+                        sql,
+                        parameters.clone(),
+                        tracker,
+                        pre_parsed_plan.clone(),
+                    )
+                    .await?
+                    {
+                        cache::PlanOrCached::Cached(cached_result) => {
+                            tracing::debug!(
+                                job_id,
+                                "Returning cached result for distributed query"
+                            );
+                            // Return a QueryHandle with cached results
+                            let schema = cached_result.data.schema();
+                            return Ok(QueryHandle::new_with_cached_result(
+                                job_id.to_string(),
+                                schema,
+                                Arc::clone(&self.df),
+                                None, // Cache key already used for lookup
+                                cached_result.data,
+                                Arc::clone(&request_context),
+                            ));
+                        }
+                        cache::PlanOrCached::Plan(plan, tracker, cache_manager) => {
+                            // Plan needs execution - cache_manager contains the raw cache key for storing results
+                            let cache_key = if cache_manager.should_cache_results() {
+                                Some(cache_manager.raw_cache_key)
+                            } else {
+                                None
+                            };
+                            (*plan, tracker, cache_key)
+                        }
                     }
                 }
             }
@@ -668,8 +695,11 @@ impl Query {
                     ns_id,
                 );
 
-                // Check for cached results using the standard cache lookup
-                if let Some(cache_provider) = self.df.results_cache_provider()
+                // Check for cached results using the standard cache lookup.
+                // Resume drives the persisted graph, so skip the short-circuit
+                // entirely (returning a cached result would orphan the job).
+                if mode != DistributedSubmitMode::Resume
+                    && let Some(cache_provider) = self.df.results_cache_provider()
                     && let Ok(Some(cached_result)) =
                         cache_provider.get_raw_key(&plan_cache_key).await
                 {
@@ -698,7 +728,9 @@ impl Query {
                     }
                 }
 
-                (logical_plan.as_ref().clone(), tracker, Some(plan_cache_key))
+                // Don't cache results for a recovered job.
+                let cache_key = (mode != DistributedSubmitMode::Resume).then_some(plan_cache_key);
+                (logical_plan.as_ref().clone(), tracker, cache_key)
             }
         };
 

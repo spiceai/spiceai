@@ -1937,6 +1937,11 @@ async fn create_scheduler_server(
             .build();
         let started = std::time::Instant::now();
         let mut last_warn = std::time::Instant::now();
+        // Keep retrying until the spicepod loads (a configured state location must
+        // be honored, never silently degraded), but stay responsive to shutdown so
+        // a process told to stop while the app is still loading can't deadlock here.
+        let shutdown = crate::shutdown_signal();
+        tokio::pin!(shutdown);
         loop {
             if let Some(app) = rt.read_app().await {
                 break app.runtime.scheduler.clone();
@@ -1953,7 +1958,14 @@ async fn create_scheduler_server(
                 .next_duration()
                 .unwrap_or_else(|| std::time::Duration::from_secs(30))
                 .min(std::time::Duration::from_secs(30));
-            tokio::time::sleep(delay).await;
+            tokio::select! {
+                () = tokio::time::sleep(delay) => {}
+                () = &mut shutdown => {
+                    return Err(crate::Error::FailedToStartClusterScheduler {
+                        source: "shutdown requested while waiting for the spicepod to load".into(),
+                    });
+                }
+            }
         }
     };
     let job_state: Arc<dyn JobState> = if let Some(scheduler_cfg) = scheduler_cfg {
