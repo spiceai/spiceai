@@ -448,6 +448,77 @@ impl CayenneCatalog {
             })
     }
 
+    /// Sequence-fenced counterpart of [`Self::commit_compaction_in_txn`].
+    ///
+    /// Clears only delete files / insert records with `sequence_number <=
+    /// cutoff` and only the protected snapshots named in
+    /// `protected_snapshot_ids_to_clear`, then advances the snapshot pointer.
+    /// Same statement order as the wholesale version for crash-safety parity.
+    pub async fn commit_compaction_fenced_in_txn(
+        &self,
+        txn: &mut dyn MetastoreTransaction,
+        table_id: &str,
+        new_snapshot_id: &str,
+        cutoff: i64,
+        protected_snapshot_ids_to_clear: &[String],
+    ) -> CatalogResult<()> {
+        // Validate all interpolated UUIDs (table id, new snapshot id, and every
+        // protected snapshot id) to prevent SQL injection. `cutoff` is an i64 and
+        // is interpolated as a bare integer literal (no injection surface).
+        for (name, value) in [("table_id", table_id), ("new_snapshot_id", new_snapshot_id)] {
+            if uuid::Uuid::parse_str(value).is_err() {
+                return Err(CatalogError::InvalidOperationNoSource {
+                    message: format!("{name} is not a valid UUID: {value}"),
+                });
+            }
+        }
+        for id in protected_snapshot_ids_to_clear {
+            if uuid::Uuid::parse_str(id).is_err() {
+                return Err(CatalogError::InvalidOperationNoSource {
+                    message: format!("protected snapshot id is not a valid UUID: {id}"),
+                });
+            }
+        }
+
+        let table_id_literal = sql_text_literal(table_id);
+        let insert_record_table_id_literal = insert_record_table_id_blob_literal(table_id);
+        let new_snapshot_id_literal = sql_text_literal(new_snapshot_id);
+
+        // Clear only the protected snapshots that were folded into this rewrite.
+        // An empty set means none existed at fence-capture time, so emit no
+        // snapshot-sequence DELETE (an `IN ()` clause is invalid SQL, and there
+        // is nothing to clear).
+        let snapshot_sequence_delete = if protected_snapshot_ids_to_clear.is_empty() {
+            String::new()
+        } else {
+            let id_list = protected_snapshot_ids_to_clear
+                .iter()
+                .map(|id| sql_text_literal(id))
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!(
+                "DELETE FROM cayenne_snapshot_sequence \
+                 WHERE table_id = {table_id_literal} AND snapshot_id IN ({id_list}); "
+            )
+        };
+
+        let batch_sql = format!(
+            "DELETE FROM cayenne_delete_file \
+               WHERE table_id = {table_id_literal} AND sequence_number <= {cutoff}; \
+             DELETE FROM cayenne_insert_record \
+               WHERE table_id = {insert_record_table_id_literal} AND sequence_number <= {cutoff}; \
+             {snapshot_sequence_delete}\
+             UPDATE cayenne_table SET current_snapshot_id = {new_snapshot_id_literal} \
+               WHERE table_id = {table_id_literal};"
+        );
+
+        txn.execute_batch(&batch_sql)
+            .await
+            .map_err(|e| CatalogError::FailedToSetCurrentSnapshot {
+                source: Box::new(e),
+            })
+    }
+
     /// CAS-validate and swap a subset of protected-snapshot sequence rows
     /// inside the caller's `MetastoreTransaction`, without opening a new one.
     ///
@@ -2102,6 +2173,68 @@ impl MetadataCatalog for CayenneCatalog {
         Err(CatalogError::InvalidOperationNoSource {
             message: format!(
                 "commit_compaction exhausted {max_attempts} attempts without success or a terminal error"
+            ),
+        })
+    }
+
+    async fn commit_compaction_fenced(
+        &self,
+        table_id: &str,
+        new_snapshot_id: &str,
+        cutoff: i64,
+        protected_snapshot_ids_to_clear: &[String],
+    ) -> CatalogResult<()> {
+        // Same transaction/retry envelope as `commit_compaction`; only the
+        // in-txn mutation differs (sequence/id-bounded instead of wholesale).
+        let max_attempts = DEFAULT_CONCURRENT_WRITE_MAX_ATTEMPTS;
+        if max_attempts == 0 {
+            return Err(CatalogError::InvalidOperationNoSource {
+                message: "commit_compaction_fenced requires at least one attempt".to_string(),
+            });
+        }
+
+        for attempt in 1..=max_attempts {
+            let mut tx = self.begin_transaction().await.map_err(|e| {
+                CatalogError::FailedToSetCurrentSnapshot {
+                    source: Box::new(e),
+                }
+            })?;
+
+            match self
+                .commit_compaction_fenced_in_txn(
+                    &mut *tx,
+                    table_id,
+                    new_snapshot_id,
+                    cutoff,
+                    protected_snapshot_ids_to_clear,
+                )
+                .await
+            {
+                Ok(()) => match tx.commit().await {
+                    Ok(()) => return Ok(()),
+                    Err(e) if attempt < max_attempts && is_retryable_write_conflict(&e) => {
+                        let delay = retry_backoff_delay(attempt);
+                        tracing::debug!(
+                            attempt,
+                            max_attempts,
+                            ?delay,
+                            "Retrying fenced compaction transaction after commit conflict"
+                        );
+                        tokio::time::sleep(delay).await;
+                    }
+                    Err(e) => {
+                        return Err(CatalogError::FailedToSetCurrentSnapshot {
+                            source: Box::new(e),
+                        });
+                    }
+                },
+                Err(e) => return Err(e),
+            }
+        }
+
+        Err(CatalogError::InvalidOperationNoSource {
+            message: format!(
+                "commit_compaction_fenced exhausted {max_attempts} attempts without success or a terminal error"
             ),
         })
     }
