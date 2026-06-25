@@ -18,6 +18,28 @@ pub(super) mod mongodb;
 pub(super) mod postgres_debezium;
 pub(super) mod postgres_wal;
 
+/// Acceleration `params` to attach for a CDC dataset, given its engine.
+///
+/// For the `cayenne` engine we disable the `Utf8View` query/scan read schema
+/// (introduced by spiceai #11379). That change makes cayenne emit `Utf8View`
+/// for string columns on the scan path while `RowConverter`s in the query and
+/// deletion paths are still built on the stored `Utf8` schema, producing
+/// `RowConverter column schema mismatch, expected Utf8 got Utf8View` failures
+/// on join/sort/group-by queries and on the row-converter-based delete filter.
+/// Returns `None` for non-cayenne engines (the param is cayenne-specific).
+pub(super) fn cayenne_acceleration_params(
+    acceleration_engine: &str,
+) -> Option<spicepod::param::Params> {
+    acceleration_engine
+        .eq_ignore_ascii_case("cayenne")
+        .then(|| {
+            spicepod::param::Params::from_string_map(std::collections::HashMap::from([(
+                "cayenne_force_view_types".to_string(),
+                "false".to_string(),
+            )]))
+        })
+}
+
 /// Format a list of column names as a `ColumnReference` string accepted by spicepod:
 /// - single column → `"col"`
 /// - composite key → `"(col1, col2)"`
