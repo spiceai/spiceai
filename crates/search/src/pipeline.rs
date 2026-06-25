@@ -108,18 +108,10 @@ impl<A: CandidateAggregation> SearchPipeline<A> {
         keywords: Vec<String>,
         limit: usize,
     ) -> std::result::Result<Option<AggregationResult>, Error> {
-        // NB: `_score` is intentionally projected *last* (appended after the
-        // value column below), not here. The candidate provider (`g.search`)
-        // emits `_score` as its last column; keeping it last in this projection
-        // means the projection does not move the sort-key column `_score` to a
-        // different index. A projection that reorders `_score` triggers a
-        // DataFusion EnforceSorting bug where the candidate `SortExec` is pushed
-        // below the reordering projection without its column index being remapped
-        // ("does not satisfy order requirements ... Child-0 order: []").
-        // See spiceai/spiceai#11426.
         let columns: Vec<_> = [
             primary_keys.iter().map(|c| col(c.clone())).collect(),
             addition_projection,
+            vec![ident(SEARCH_SCORE_COLUMN_NAME)],
         ]
         .concat()
         .into_iter()
@@ -139,10 +131,6 @@ impl<A: CandidateAggregation> SearchPipeline<A> {
 
                 let mut columns = columns.clone();
                 columns.push(ident(g.value_projection_name()).alias(SEARCH_VALUE_COLUMN_NAME));
-                // `_score` last — keeps its index aligned with the candidate
-                // provider output so the projection does not reorder the sort
-                // key. See the note where `columns` is built above (#11426).
-                columns.push(ident(SEARCH_SCORE_COLUMN_NAME));
 
                 let lp = construct_logical_plan(
                     g.search(query.clone())
