@@ -762,23 +762,31 @@ impl MaintainedAggregateView {
                 .as_ref()
                 .is_none_or(|mask| mask.is_valid(row) && mask.value(row));
 
-            if indexed {
+            // Indexed views: an upsert whose PK is already indexed is an UPDATE,
+            // so retract the prior contribution first. This runs even when the new
+            // row no longer matches the filter, so a row updated OUT of the
+            // predicate correctly drops its old contribution. `None` for
+            // insert-only (no PK) views, which never retract.
+            let pk = if indexed {
                 let pk = Self::scalar_key(batch, row, self.pk_columns.iter().copied())?;
-                // An upsert whose PK is already indexed is an UPDATE: retract the
-                // prior contribution first. This runs even when the new row no
-                // longer matches the filter, so a row updated OUT of the predicate
-                // correctly drops its old contribution.
                 if let Some(old) = self.pk_index.remove(&pk) {
                     self.retract_entry(&old)?;
                 }
-                // A non-matching row contributes nothing and is left unindexed —
-                // identical to an absent row, so a later DELETE/UPDATE retraction
-                // is a correct no-op or correct re-add.
-                if !matches {
-                    continue;
-                }
-                let group_key =
-                    Self::scalar_key(batch, row, self.spec.group_by.iter().map(|c| c.index))?;
+                Some(pk)
+            } else {
+                None
+            };
+
+            // A non-matching row contributes nothing and is left unindexed —
+            // identical to an absent row, so a later DELETE/UPDATE retraction is a
+            // correct no-op or re-add (its prior contribution was retracted above).
+            if !matches {
+                continue;
+            }
+
+            let group_key =
+                Self::scalar_key(batch, row, self.spec.group_by.iter().map(|c| c.index))?;
+            if let Some(pk) = pk {
                 let inputs = self.capture_inputs(batch, row)?;
                 self.pk_index.insert(
                     pk,
@@ -787,16 +795,8 @@ impl MaintainedAggregateView {
                         inputs,
                     },
                 );
-                self.insert_into_group(group_key, batch, row)?;
-            } else {
-                // No PK index: insert-only semantics. Skip non-matching rows.
-                if !matches {
-                    continue;
-                }
-                let group_key =
-                    Self::scalar_key(batch, row, self.spec.group_by.iter().map(|c| c.index))?;
-                self.insert_into_group(group_key, batch, row)?;
             }
+            self.insert_into_group(group_key, batch, row)?;
         }
 
         Ok(())
@@ -809,6 +809,18 @@ impl MaintainedAggregateView {
         // (DataFusion's `DynEq`), so two equivalent predicates over the same
         // schema match. A mismatch (or an unrecognized predicate) falls back to
         // the base-table scan — correct, just not accelerated.
+        //
+        // BOUNDARY (known limitation): the comparison is index- and type-sensitive
+        // (`Column{index}`, typed `Literal`). The view's filter is parsed against
+        // the table schema (config time) while the query's filter is the
+        // `FilterExec` predicate captured from the physical plan. If a projection
+        // or type-coercion sits between the scan and the filter (e.g. a
+        // `SchemaCastScanExec` reordering columns or advertising `Utf8View` over a
+        // stored `Utf8`), the predicates differ structurally and this returns
+        // `false`, so the view SILENTLY does not serve and the query re-scans. A
+        // future slice can normalize both predicates to a schema-independent
+        // (column-name + canonical-literal) form before comparison; until then,
+        // declare the filter so it matches the query's scan-output predicate.
         self.filter == query.filter
             && self
                 .spec

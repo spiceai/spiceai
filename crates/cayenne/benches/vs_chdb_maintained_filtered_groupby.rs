@@ -27,8 +27,10 @@
 //!   WHERE delivery > 1000 GROUP BY grp` against a chDB MergeTree table.
 //! - `cayenne_serve` — the same answer from the real `MaintainedAggregateRegistry`.
 //!
-//! The two engines are cross-checked (group count + total SUM + total COUNT over
-//! the filtered set must agree) before any timing.
+//! The Cayenne-side fixture is shared with the DuckDB sibling via
+//! `maintained_filtered_helpers/common.rs`. The two engines are cross-checked
+//! (group count + total SUM + total COUNT over the filtered set must agree) before
+//! any timing.
 
 #![allow(clippy::expect_used)]
 #![allow(clippy::cast_possible_wrap)]
@@ -37,140 +39,16 @@
 
 #[path = "vs_chdb_helpers/chdb_common.rs"]
 mod chdb_common;
+#[path = "maintained_filtered_helpers/common.rs"]
+mod common;
 
-use std::collections::BTreeMap;
 use std::hint::black_box;
-use std::sync::Arc;
 
-use arrow::array::{Array, Int64Array, RecordBatch};
-use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
-use cayenne::maintained_aggregate::{
-    MaintainedAggregateExpr, MaintainedAggregateFunction, MaintainedAggregateRegistry,
-    MaintainedAggregateSpec,
-};
+use arrow::array::RecordBatch;
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
-use datafusion::logical_expr::Operator;
-use datafusion_physical_expr::PhysicalExpr;
-use datafusion_physical_expr::expressions::{binary, col, lit};
 
 use chdb_common::setup_chdb_with_schema;
-
-const ROW_COUNTS: &[usize] = &[100_000, 1_000_000];
-const GROUP_COUNT: i64 = 16;
-const DELIVERY_MODULUS: i64 = 10_000;
-const DELIVERY_THRESHOLD: i64 = 1_000;
-const LOAD_BATCH_ROWS: usize = 65_536;
-
-fn table_schema() -> SchemaRef {
-    Arc::new(Schema::new(vec![
-        Field::new("pk", DataType::Int64, false),
-        Field::new("grp", DataType::Int64, false),
-        Field::new("delivery", DataType::Int64, false),
-        Field::new("value", DataType::Int64, false),
-    ]))
-}
-
-fn output_schema() -> SchemaRef {
-    Arc::new(Schema::new(vec![
-        Field::new("grp", DataType::Int64, false),
-        Field::new("value_sum", DataType::Int64, false),
-        Field::new("row_count", DataType::Int64, false),
-    ]))
-}
-
-fn delivery_filter() -> Arc<dyn PhysicalExpr> {
-    let schema = table_schema();
-    binary(
-        col("delivery", &schema).expect("col delivery"),
-        Operator::Gt,
-        lit(DELIVERY_THRESHOLD),
-        &schema,
-    )
-    .expect("delivery > threshold predicate")
-}
-
-fn filtered_spec() -> MaintainedAggregateSpec {
-    MaintainedAggregateSpec {
-        group_by: vec!["grp".to_string()],
-        aggregates: vec![
-            MaintainedAggregateExpr {
-                function: MaintainedAggregateFunction::Sum,
-                column: Some("value".to_string()),
-            },
-            MaintainedAggregateExpr {
-                function: MaintainedAggregateFunction::Count,
-                column: None,
-            },
-        ],
-        filter: Some(delivery_filter()),
-    }
-}
-
-fn row_batch(start: i64, count: usize) -> RecordBatch {
-    let pk: Vec<i64> = (0..count as i64).map(|j| start + j).collect();
-    let grp: Vec<i64> = pk.iter().map(|&i| i % GROUP_COUNT).collect();
-    let delivery: Vec<i64> = pk.iter().map(|&i| i % DELIVERY_MODULUS).collect();
-    let value: Vec<i64> = pk.iter().map(|&i| (i % 2_001) - 1_000).collect();
-    RecordBatch::try_new(
-        table_schema(),
-        vec![
-            Arc::new(Int64Array::from(pk)),
-            Arc::new(Int64Array::from(grp)),
-            Arc::new(Int64Array::from(delivery)),
-            Arc::new(Int64Array::from(value)),
-        ],
-    )
-    .expect("row batch")
-}
-
-fn load_registry(rows: usize) -> MaintainedAggregateRegistry {
-    let schema = table_schema();
-    let registry = MaintainedAggregateRegistry::try_new_with_pk(
-        std::slice::from_ref(&filtered_spec()),
-        &schema,
-        &[0],
-        usize::MAX,
-    )
-    .expect("filtered registry");
-    let mut batches = Vec::with_capacity(rows.div_ceil(LOAD_BATCH_ROWS));
-    let mut start = 0_i64;
-    while (start as usize) < rows {
-        let count = LOAD_BATCH_ROWS.min(rows - start as usize);
-        batches.push(row_batch(start, count));
-        start += count as i64;
-    }
-    registry
-        .apply_insert_batches(1, &batches)
-        .expect("load registry");
-    registry
-}
-
-fn cayenne_result(registry: &MaintainedAggregateRegistry, epoch: u64) -> BTreeMap<i64, (i64, i64)> {
-    let batch = registry
-        .batch_for_spec(&filtered_spec(), epoch, output_schema())
-        .expect("serve must not error")
-        .expect("filtered view must serve at the scan epoch");
-    let grp = batch
-        .column(0)
-        .as_any()
-        .downcast_ref::<Int64Array>()
-        .expect("grp Int64");
-    let sum = batch
-        .column(1)
-        .as_any()
-        .downcast_ref::<Int64Array>()
-        .expect("sum Int64");
-    let count = batch
-        .column(2)
-        .as_any()
-        .downcast_ref::<Int64Array>()
-        .expect("count Int64");
-    let mut out = BTreeMap::new();
-    for row in 0..batch.num_rows() {
-        out.insert(grp.value(row), (sum.value(row), count.value(row)));
-    }
-    out
-}
+use common::{ROW_COUNTS, cayenne_result, load_registry, row_batch};
 
 fn write_parquet(batch: &RecordBatch, path: &std::path::Path) {
     use datafusion::parquet::arrow::ArrowWriter;

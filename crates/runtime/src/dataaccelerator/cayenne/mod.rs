@@ -190,9 +190,14 @@ fn maintained_aggregate_specs_for_cayenne(
 
 /// Parse a maintained-aggregate `filter` SQL predicate into a physical
 /// expression over the table `schema`. The resulting expression references the
-/// table columns by their schema position, matching both the CDC batches the
-/// view is maintained from and the `FilterExec` predicate a filtered query
-/// carries — so the maintained view serves the query when the predicates match.
+/// table columns by their schema position, so it lines up with the CDC batches
+/// the view is maintained from. For serving, the view answers a query only when
+/// this predicate is structurally equal to the query's `FilterExec` predicate
+/// (see `MaintainedAggregateView::matches_query`): that holds when the query
+/// filters the scan output directly, but a projection or type-coercion between
+/// the scan and the filter changes the predicate's column indices/literal types
+/// and the view silently falls back to a re-scan. Declare the filter to match
+/// the predicate the query carries over the scan output.
 fn parse_maintained_aggregate_filter(
     sql: &str,
     schema: &Schema,
