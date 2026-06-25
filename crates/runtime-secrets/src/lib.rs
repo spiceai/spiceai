@@ -126,6 +126,29 @@ impl SecretStore for FailedSecretStore {
     }
 }
 
+/// Resolution status of a single `${ store:key }` reference, as reported by
+/// [`Secrets::check_reference`].
+///
+/// Carries store names, key names, and error text only — never secret values
+/// — so it is safe to log or serialize.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RefStatus {
+    /// The reference resolves. `store` is the configured store that answered
+    /// (for `${ secrets:KEY }`, the first store in precedence order holding
+    /// the key).
+    Found { store: String },
+    /// No healthy store holds the key. `searched` lists the stores consulted.
+    NotFound { searched: Vec<String> },
+    /// The lookup could not be answered: the named store — or, for the
+    /// `secrets:` sentinel, every consulted store — failed. `error` is the
+    /// store's failure text (the captured init root cause for stores that
+    /// failed to load).
+    StoreError { store: String, error: String },
+    /// The reference names a store that isn't configured. `configured` lists
+    /// the stores that are.
+    UnknownStore { configured: Vec<String> },
+}
+
 pub struct Secrets {
     // Use an IndexMap to maintain the order of the secret stores.
     // This order is the reverse of the order in which the secret stores are defined in the SpicePod.
@@ -329,6 +352,63 @@ impl Secrets {
         }
     }
 
+    /// Reports whether a `${ store_name:key }` reference would resolve,
+    /// without exposing the value.
+    ///
+    /// Mirrors the lookup semantics of [`Self::inject_secrets`] /
+    /// [`Self::get_secret`]: the `secrets:` sentinel walks all stores in
+    /// precedence order (skipping unhealthy stores), while any other name
+    /// targets that configured store directly. Any value fetched to answer
+    /// the question is dropped (and zeroized) before returning.
+    ///
+    /// Intended for preflight/status surfaces (e.g. validating every
+    /// reference in a spicepod before components load) where the caller
+    /// needs an explanation, not the secret.
+    pub async fn check_reference(&self, store_name: &str, key: &str) -> RefStatus {
+        let store_names = || self.stores.keys().cloned().collect::<Vec<_>>();
+
+        if store_name == SECRETS {
+            let mut last_error: Option<(String, String)> = None;
+            let mut any_healthy = false;
+            for (name, store) in &self.stores {
+                match store.get_secret(key).await {
+                    Ok(Some(_value)) => {
+                        return RefStatus::Found {
+                            store: name.clone(),
+                        };
+                    }
+                    Ok(None) => any_healthy = true,
+                    Err(e) => last_error = Some((name.clone(), e.to_string())),
+                }
+            }
+            return match last_error {
+                Some((store, error)) if !any_healthy => RefStatus::StoreError { store, error },
+                _ => RefStatus::NotFound {
+                    searched: store_names(),
+                },
+            };
+        }
+
+        let Some(store) = self.stores.get(store_name) else {
+            return RefStatus::UnknownStore {
+                configured: store_names(),
+            };
+        };
+
+        match store.get_secret(key).await {
+            Ok(Some(_value)) => RefStatus::Found {
+                store: store_name.to_string(),
+            },
+            Ok(None) => RefStatus::NotFound {
+                searched: vec![store_name.to_string()],
+            },
+            Err(e) => RefStatus::StoreError {
+                store: store_name.to_string(),
+                error: e.to_string(),
+            },
+        }
+    }
+
     /// Internal helper for [`Self::inject_secrets`]. Returns the value
     /// wrapped in a [`SecretString`] (never a plain `String`) so the caller
     /// can splice the bytes without an intermediate non-zeroizing allocation.
@@ -405,11 +485,49 @@ impl Default for Secrets {
     }
 }
 
+/// A single `${ store:key }` reference found in a string.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SecretReference {
+    /// The store segment: `env`, the `secrets` sentinel, or a user-defined
+    /// store name.
+    pub store: String,
+    /// The secret key segment.
+    pub key: String,
+}
+
+/// Iterates over every `${ store:key }` reference in a string (e.g. spicepod
+/// YAML content), in document order, including duplicates.
+///
+/// Unlike [`extract_secret_references`], no occurrences are lost: the same
+/// key referenced through two stores (`${ env:K }` and `${ secrets:K }`)
+/// yields two entries.
+///
+/// # Example
+/// ```
+/// use runtime_secrets::iter_secret_references;
+///
+/// let yaml = "user: ${ env:DB_CRED }\npassword: ${ secrets:DB_CRED }";
+/// let refs: Vec<_> = iter_secret_references(yaml).collect();
+/// assert_eq!(refs.len(), 2);
+/// assert_eq!((refs[0].store.as_str(), refs[0].key.as_str()), ("env", "DB_CRED"));
+/// assert_eq!((refs[1].store.as_str(), refs[1].key.as_str()), ("secrets", "DB_CRED"));
+/// ```
+pub fn iter_secret_references(content: &str) -> impl Iterator<Item = SecretReference> + '_ {
+    SecretReplacementMatcher::new(content).map(|m| SecretReference {
+        store: m.store_name,
+        key: m.key,
+    })
+}
+
 /// Extract all secret references from a string (e.g., spicepod YAML content).
 ///
 /// Returns a map where keys are secret keys and values are the store names they reference.
 /// For example, `${ env:MY_VAR }` returns `("MY_VAR", "env")` and
 /// `${ secrets:API_KEY }` returns `("API_KEY", "secrets")`.
+///
+/// Note: the map is keyed by secret key, so when the same key is referenced
+/// through multiple stores only the last occurrence's store survives. Use
+/// [`iter_secret_references`] when every occurrence matters.
 ///
 /// # Example
 /// ```
@@ -427,16 +545,9 @@ impl Default for Secrets {
 /// ```
 #[must_use]
 pub fn extract_secret_references(content: &str) -> std::collections::HashMap<String, String> {
-    let mut references = std::collections::HashMap::new();
-
-    for secret_replacement in SecretReplacementMatcher::new(content) {
-        references.insert(
-            secret_replacement.key.clone(),
-            secret_replacement.store_name.clone(),
-        );
-    }
-
-    references
+    iter_secret_references(content)
+        .map(|r| (r.key, r.store))
+        .collect()
 }
 
 /// Typed hand-off between configuration validation
@@ -1082,6 +1193,142 @@ mod tests {
         assert_eq!("healthy_value", secret.expose_secret());
 
         unsafe { std::env::remove_var(&var) };
+    }
+
+    #[test]
+    fn test_iter_secret_references_keeps_duplicates_in_document_order() {
+        let yaml = r"
+params:
+  user: ${ env:DB_CRED }
+  password: ${ secrets:DB_CRED }
+  again: ${ env:DB_CRED }
+";
+        let refs: Vec<super::SecretReference> = super::iter_secret_references(yaml).collect();
+        assert_eq!(
+            vec![
+                super::SecretReference {
+                    store: "env".to_string(),
+                    key: "DB_CRED".to_string()
+                },
+                super::SecretReference {
+                    store: "secrets".to_string(),
+                    key: "DB_CRED".to_string()
+                },
+                super::SecretReference {
+                    store: "env".to_string(),
+                    key: "DB_CRED".to_string()
+                },
+            ],
+            refs
+        );
+    }
+
+    #[tokio::test]
+    async fn test_check_reference_sentinel_names_answering_store() {
+        let secrets = secrets_with_stores(vec![
+            ("vault", std::sync::Arc::new(ErroringStore("vault is down"))),
+            (
+                "env",
+                std::sync::Arc::new(MapStore::new(&[("API_KEY", "s3cret")])),
+            ),
+        ]);
+
+        let status = secrets.check_reference(super::SECRETS, "API_KEY").await;
+        assert_eq!(
+            super::RefStatus::Found {
+                store: "env".to_string()
+            },
+            status
+        );
+    }
+
+    #[tokio::test]
+    async fn test_check_reference_sentinel_not_found_lists_searched_stores() {
+        let secrets = secrets_with_stores(vec![
+            ("vault", std::sync::Arc::new(ErroringStore("vault is down"))),
+            ("env", std::sync::Arc::new(MapStore::new(&[]))),
+        ]);
+
+        let status = secrets.check_reference(super::SECRETS, "MISSING").await;
+        assert_eq!(
+            super::RefStatus::NotFound {
+                searched: vec!["vault".to_string(), "env".to_string()]
+            },
+            status
+        );
+    }
+
+    #[tokio::test]
+    async fn test_check_reference_sentinel_all_failed_reports_store_error() {
+        let secrets = secrets_with_stores(vec![
+            ("vault", std::sync::Arc::new(ErroringStore("first error"))),
+            ("aws", std::sync::Arc::new(ErroringStore("second error"))),
+        ]);
+
+        let status = secrets.check_reference(super::SECRETS, "ANY").await;
+        assert_eq!(
+            super::RefStatus::StoreError {
+                store: "aws".to_string(),
+                error: "second error".to_string()
+            },
+            status
+        );
+    }
+
+    #[tokio::test]
+    async fn test_check_reference_named_store_statuses() {
+        let secrets = secrets_with_stores(vec![
+            ("vault", std::sync::Arc::new(ErroringStore("vault is down"))),
+            (
+                "env",
+                std::sync::Arc::new(MapStore::new(&[("API_KEY", "s3cret")])),
+            ),
+        ]);
+
+        assert_eq!(
+            super::RefStatus::Found {
+                store: "env".to_string()
+            },
+            secrets.check_reference("env", "API_KEY").await
+        );
+        assert_eq!(
+            super::RefStatus::NotFound {
+                searched: vec!["env".to_string()]
+            },
+            secrets.check_reference("env", "MISSING").await
+        );
+        assert_eq!(
+            super::RefStatus::StoreError {
+                store: "vault".to_string(),
+                error: "vault is down".to_string()
+            },
+            secrets.check_reference("vault", "API_KEY").await
+        );
+        assert_eq!(
+            super::RefStatus::UnknownStore {
+                configured: vec!["vault".to_string(), "env".to_string()]
+            },
+            secrets.check_reference("nope", "API_KEY").await
+        );
+    }
+
+    #[tokio::test]
+    async fn test_check_reference_surfaces_init_root_cause_for_failed_store() {
+        // Composes with the failed-store placeholders (#11181): checking a
+        // reference against a store that failed to initialize reports the
+        // captured init error, not "unknown store".
+        let mut secrets = super::Secrets::new();
+        secrets
+            .load_from(&[failing_spicepod_secret("rpc")])
+            .await
+            .expect("load_from should not abort on a store init failure");
+
+        let status = secrets.check_reference("rpc", "ANY_KEY").await;
+        let super::RefStatus::StoreError { store, error } = status else {
+            panic!("expected StoreError, got {status:?}");
+        };
+        assert_eq!("rpc", store);
+        assert!(error.contains("failed to initialize"), "got {error}");
     }
 
     #[test]
