@@ -91,7 +91,7 @@ async fn setup() -> TestResult<(SessionContext, TempDir, TempDir)> {
     Ok((ctx, data_dir, metadata_dir))
 }
 
-/// `KEY_COUNT` rows, ids 0..KEY_COUNT, values salted so each overwrite is distinct
+/// `KEY_COUNT` rows, ids `0..KEY_COUNT`, values salted so each overwrite is distinct
 /// content but the same cardinality.
 fn values_clause(salt: i64) -> String {
     (0..KEY_COUNT)
