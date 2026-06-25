@@ -25,7 +25,6 @@ limitations under the License.
 //! The runtime crate provides broadcast variants of Create/Drop that forward DDL to executor
 //! nodes after calling the same `operations` functions.
 
-use std::any::Any;
 use std::collections::HashSet;
 use std::fmt;
 use std::sync::Arc;
@@ -63,13 +62,13 @@ fn ddl_result_schema() -> SchemaRef {
     )]))
 }
 
-fn ddl_plan_properties(schema: SchemaRef) -> PlanProperties {
-    PlanProperties::new(
+fn ddl_plan_properties(schema: SchemaRef) -> Arc<PlanProperties> {
+    Arc::new(PlanProperties::new(
         EquivalenceProperties::new(schema),
         Partitioning::UnknownPartitioning(1),
         EmissionType::Final,
         Boundedness::Bounded,
-    )
+    ))
 }
 
 fn merge_count_schema() -> SchemaRef {
@@ -91,7 +90,7 @@ pub struct CayenneCreateTableExec {
     params: CreateTableParams,
     catalog_list: Arc<dyn CatalogProviderList>,
     runtime_env: Arc<datafusion::execution::runtime_env::RuntimeEnv>,
-    properties: PlanProperties,
+    properties: Arc<PlanProperties>,
 }
 
 impl fmt::Debug for CayenneCreateTableExec {
@@ -136,10 +135,7 @@ impl ExecutionPlan for CayenneCreateTableExec {
     fn name(&self) -> &'static str {
         "CayenneCreateTableExec"
     }
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
     }
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
@@ -215,7 +211,7 @@ pub struct CayenneDropTableExec {
     df_catalog_name: String,
     df_schema_name: String,
     catalog_list: Arc<dyn CatalogProviderList>,
-    properties: PlanProperties,
+    properties: Arc<PlanProperties>,
 }
 
 impl fmt::Debug for CayenneDropTableExec {
@@ -263,10 +259,7 @@ impl ExecutionPlan for CayenneDropTableExec {
     fn name(&self) -> &'static str {
         "CayenneDropTableExec"
     }
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
     }
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
@@ -333,7 +326,7 @@ pub struct CayenneCreateSchemaExec {
     if_not_exists: bool,
     df_catalog_name: String,
     catalog_list: Arc<dyn CatalogProviderList>,
-    properties: PlanProperties,
+    properties: Arc<PlanProperties>,
 }
 
 impl fmt::Debug for CayenneCreateSchemaExec {
@@ -379,10 +372,7 @@ impl ExecutionPlan for CayenneCreateSchemaExec {
     fn name(&self) -> &'static str {
         "CayenneCreateSchemaExec"
     }
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
     }
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
@@ -457,7 +447,7 @@ pub struct CayenneMergeExec {
     /// Target-side ON key column names, used to build deletion filters.
     target_key_columns: Vec<String>,
     /// Output properties.
-    properties: PlanProperties,
+    properties: Arc<PlanProperties>,
 }
 
 impl CayenneMergeExec {
@@ -470,12 +460,12 @@ impl CayenneMergeExec {
         target_key_columns: Vec<String>,
     ) -> Self {
         let schema = merge_count_schema();
-        let properties = PlanProperties::new(
+        let properties = Arc::new(PlanProperties::new(
             EquivalenceProperties::new(Arc::clone(&schema)),
             Partitioning::UnknownPartitioning(1),
             EmissionType::Incremental,
             Boundedness::Bounded,
-        );
+        ));
         Self {
             join_plan,
             target_provider,
@@ -505,11 +495,7 @@ impl ExecutionPlan for CayenneMergeExec {
         "CayenneMergeExec"
     }
 
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
-
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
     }
 
@@ -834,7 +820,7 @@ async fn try_key_probe_delete(
     matched_keys: HashSet<Vec<datafusion_common::ScalarValue>>,
 ) -> Result<Option<u64>, DataFusionError> {
     // Case 1: Direct CayenneTableProvider.
-    if let Some(cayenne) = provider.as_any().downcast_ref::<CayenneTableProvider>() {
+    if let Some(cayenne) = provider.downcast_ref::<CayenneTableProvider>() {
         if cayenne.is_position_based() {
             return cayenne
                 .delete_matched_rows_by_key_probe(matched_keys, key_columns)
@@ -847,11 +833,11 @@ async fn try_key_probe_delete(
     // Case 3: PartitionTableProvider wrapping per-partition Cayenne providers.
     // All partitions share the same table metadata and deletion strategy, so
     // checking the first partition is sufficient to decide the fast path.
-    if let Some(partitioned) = provider.as_any().downcast_ref::<PartitionTableProvider>() {
+    if let Some(partitioned) = provider.downcast_ref::<PartitionTableProvider>() {
         let providers = partitioned.partition_table_providers().await;
         if providers
             .first()
-            .and_then(|p| p.as_any().downcast_ref::<CayenneTableProvider>())
+            .and_then(|p| p.downcast_ref::<CayenneTableProvider>())
             .is_none_or(|cayenne| !cayenne.is_position_based())
         {
             return Ok(None);
@@ -859,7 +845,7 @@ async fn try_key_probe_delete(
 
         let mut total = 0u64;
         for pp in &providers {
-            if let Some(cayenne) = pp.as_any().downcast_ref::<CayenneTableProvider>() {
+            if let Some(cayenne) = pp.downcast_ref::<CayenneTableProvider>() {
                 // Each partition's listing table only contains its own files, so
                 // the full matched_keys set is passed to each — hash probes for
                 // keys not in this partition simply find no matches.

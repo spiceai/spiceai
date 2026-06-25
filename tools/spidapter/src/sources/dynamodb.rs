@@ -306,7 +306,7 @@ pub(crate) async fn wait_for_table_active(
     client: &aws_sdk_dynamodb::Client,
     table_name: &str,
 ) -> anyhow::Result<()> {
-    let timeout = Duration::from_secs(120);
+    let timeout = Duration::from_mins(2);
     let started = tokio::time::Instant::now();
 
     loop {
@@ -405,6 +405,7 @@ pub(crate) fn generate_dynamodb_spicepod(
             engine: Some(acceleration_engine.to_string()),
             mode: Mode::File,
             refresh_mode: Some(RefreshMode::Changes),
+            params: super::cayenne_acceleration_params(acceleration_engine),
             ..Acceleration::default()
         });
 

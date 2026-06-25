@@ -25,7 +25,7 @@ limitations under the License.
 
 use std::sync::{
     Arc, RwLock,
-    atomic::{AtomicU64, Ordering},
+    atomic::{AtomicBool, AtomicU64, Ordering},
 };
 use std::time::SystemTime;
 
@@ -44,11 +44,20 @@ pub struct MetricsCollector {
 
     // Bootstrap progress.
     bootstrap_rows_total: AtomicU64,
-    bootstrap_complete: AtomicU64, // 0 = running/not-started, 1 = done
+    bootstrap_rows_expected: AtomicU64, // valid only when `bootstrap_rows_expected_known`
+    bootstrap_rows_expected_known: AtomicBool, // false = no estimate yet (distinct from `0`)
+    bootstrap_complete: AtomicU64,      // 0 = running/not-started, 1 = done
 
     // LSN position.
     confirmed_flush_lsn: AtomicU64, // last LSN we acknowledged to the server
     server_wal_end_lsn: AtomicU64,  // latest WAL end reported by the server (keepalive)
+
+    // Schema evolution (stream-time, from pgoutput Relation messages).
+    /// Widening schema changes adopted into the working schema.
+    schema_evolutions_total: AtomicU64,
+    /// Schema changes detected but NOT adopted: incompatible/non-widening
+    /// changes (terminal error) or changes ignored under `block`.
+    schema_evolution_rejections_total: AtomicU64,
 
     // Errors.
     wal_decode_errors_total: AtomicU64,
@@ -93,6 +102,43 @@ impl MetricsCollector {
         self.bootstrap_complete.store(1, Ordering::Relaxed);
     }
 
+    /// Set the estimated total rows to bootstrap (from extended schema inference).
+    /// Marks the estimate as known, so a count of `0` is a valid value (a known-empty
+    /// source table) rather than being conflated with "no estimate available".
+    pub fn set_bootstrap_rows_expected(&self, n: u64) {
+        self.bootstrap_rows_expected.store(n, Ordering::Relaxed);
+        // Release pairs with the Acquire load in `bootstrap_rows_expected()`: once a
+        // reader (the metrics callback, a different thread) observes the flag as `true`,
+        // the value store above is guaranteed visible — never a stale default `0`.
+        self.bootstrap_rows_expected_known
+            .store(true, Ordering::Release);
+    }
+    /// The estimated bootstrap row total, or `None` when no estimate is available
+    /// (extended schema inference is off or surfaced no row count). `Some(0)` is a
+    /// known-empty source table — deliberately distinct from `None`.
+    #[must_use]
+    pub fn bootstrap_rows_expected(&self) -> Option<u64> {
+        // Acquire pairs with the Release store in `set_bootstrap_rows_expected()` so the
+        // value load below never observes a stale default once the flag reads `true`.
+        if self.bootstrap_rows_expected_known.load(Ordering::Acquire) {
+            Some(self.bootstrap_rows_expected.load(Ordering::Relaxed))
+        } else {
+            None
+        }
+    }
+    /// Bootstrap progress as a percent (0–100), or `None` when the expected total is
+    /// unknown. A known-empty source table (`Some(0)`) reports `Some(100)` — the
+    /// snapshot is trivially complete. Clamped to 100 since the estimate is approximate.
+    #[must_use]
+    pub fn bootstrap_progress_percent(&self) -> Option<u64> {
+        let expected = self.bootstrap_rows_expected()?;
+        if expected == 0 {
+            return Some(100);
+        }
+        let total = self.bootstrap_rows_total.load(Ordering::Relaxed);
+        Some((total.saturating_mul(100) / expected).min(100))
+    }
+
     pub fn set_confirmed_flush_lsn(&self, lsn: u64) {
         // Monotonic CAS — never regress.
         let mut current = self.confirmed_flush_lsn.load(Ordering::Relaxed);
@@ -128,6 +174,14 @@ impl MetricsCollector {
         if let Ok(mut guard) = self.last_commit_seen_at.write() {
             *guard = Some(at);
         }
+    }
+
+    pub fn inc_schema_evolution(&self) {
+        self.schema_evolutions_total.fetch_add(1, Ordering::Relaxed);
+    }
+    pub fn inc_schema_evolution_rejected(&self) {
+        self.schema_evolution_rejections_total
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     pub fn inc_decode_error(&self) {
@@ -192,6 +246,15 @@ impl Metrics {
     pub fn bootstrap_complete(&self) -> u64 {
         self.collector.bootstrap_complete.load(Ordering::Relaxed)
     }
+    #[must_use]
+    pub fn bootstrap_rows_expected(&self) -> Option<u64> {
+        self.collector.bootstrap_rows_expected()
+    }
+    /// Bootstrap progress percent (0–100), or `None` when the expected total is unknown.
+    #[must_use]
+    pub fn bootstrap_progress_percent(&self) -> Option<u64> {
+        self.collector.bootstrap_progress_percent()
+    }
 
     #[must_use]
     pub fn confirmed_flush_lsn(&self) -> u64 {
@@ -227,6 +290,19 @@ impl Metrics {
             .duration_since(watermark)
             .ok()
             .and_then(|d| u64::try_from(d.as_millis()).ok())
+    }
+
+    #[must_use]
+    pub fn schema_evolutions_total(&self) -> u64 {
+        self.collector
+            .schema_evolutions_total
+            .load(Ordering::Relaxed)
+    }
+    #[must_use]
+    pub fn schema_evolution_rejections_total(&self) -> u64 {
+        self.collector
+            .schema_evolution_rejections_total
+            .load(Ordering::Relaxed)
     }
 
     #[must_use]
@@ -277,6 +353,36 @@ mod tests {
     }
 
     #[test]
+    fn bootstrap_progress_tracks_expected() {
+        let c = MetricsCollector::new();
+        let m = Metrics::new(Arc::clone(&c));
+        // Unknown until an expected total is set: both the estimate and the progress
+        // percent read as `None` (never a misleading `0`).
+        assert_eq!(m.bootstrap_rows_expected(), None);
+        assert_eq!(m.bootstrap_progress_percent(), None);
+
+        c.set_bootstrap_rows_expected(200);
+        c.add_bootstrap_rows(50);
+        assert_eq!(m.bootstrap_rows_expected(), Some(200));
+        assert_eq!(m.bootstrap_progress_percent(), Some(25));
+
+        // The estimate can be exceeded; progress clamps at 100.
+        c.add_bootstrap_rows(1000);
+        assert_eq!(m.bootstrap_progress_percent(), Some(100));
+    }
+
+    #[test]
+    fn bootstrap_empty_table_is_distinct_from_unknown() {
+        // A known-empty source table (expected `0`) is a complete bootstrap, not
+        // "unknown" — `0` must not be conflated with an absent estimate.
+        let c = MetricsCollector::new();
+        let m = Metrics::new(Arc::clone(&c));
+        c.set_bootstrap_rows_expected(0);
+        assert_eq!(m.bootstrap_rows_expected(), Some(0));
+        assert_eq!(m.bootstrap_progress_percent(), Some(100));
+    }
+
+    #[test]
     fn confirmed_flush_lsn_never_regresses() {
         let c = MetricsCollector::new();
         c.set_confirmed_flush_lsn(100);
@@ -320,6 +426,17 @@ mod tests {
         let lag = m.replication_lag_ms().expect("lag set");
         // Should be at least ~150ms; allow slack.
         assert!(lag >= 140, "expected ≥140ms lag, got {lag}");
+    }
+
+    #[test]
+    fn schema_evolution_counters_increment() {
+        let c = MetricsCollector::new();
+        c.inc_schema_evolution();
+        c.inc_schema_evolution();
+        c.inc_schema_evolution_rejected();
+        let m = Metrics::new(c);
+        assert_eq!(m.schema_evolutions_total(), 2);
+        assert_eq!(m.schema_evolution_rejections_total(), 1);
     }
 
     #[test]

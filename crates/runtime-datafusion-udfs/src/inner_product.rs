@@ -26,7 +26,6 @@ use arrow_schema::DataType;
 use datafusion::common::Result as DataFusionResult;
 use datafusion::logical_expr::ScalarFunctionArgs;
 use datafusion::logical_expr::{ColumnarValue, ScalarUDFImpl, Signature, Volatility};
-use std::any::Any;
 
 use crate::vector_simd::{
     Kernel, coerce_fsl_f32_binary_args, compute_fsl_f32, fsl_f32_binary_return_type,
@@ -56,10 +55,6 @@ impl InnerProduct {
 }
 
 impl ScalarUDFImpl for InnerProduct {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn name(&self) -> &'static str {
         INNER_PRODUCT_UDF_NAME
     }

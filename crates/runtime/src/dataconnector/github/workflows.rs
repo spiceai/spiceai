@@ -124,10 +124,6 @@ impl WorkflowsTableProvider {
 
 #[async_trait]
 impl TableProvider for WorkflowsTableProvider {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema(&self) -> SchemaRef {
         Arc::clone(&self.schema)
     }
@@ -160,12 +156,12 @@ impl TableProvider for WorkflowsTableProvider {
             limit,
             schema: self.schema(),
             client: Arc::clone(&self.client),
-            properties: PlanProperties::new(
+            properties: Arc::new(PlanProperties::new(
                 EquivalenceProperties::new(Arc::clone(&self.schema)),
                 Partitioning::UnknownPartitioning(1),
                 EmissionType::Final,
                 Boundedness::Bounded,
-            ),
+            )),
         });
 
         if let Some(projection) = projection {
@@ -193,7 +189,7 @@ struct WorkflowsExecutionPlan {
     limit: Option<usize>,
     schema: SchemaRef,
     client: Arc<GithubRestClient>,
-    properties: PlanProperties,
+    properties: Arc<PlanProperties>,
 }
 
 impl DisplayAs for WorkflowsExecutionPlan {
@@ -212,6 +208,14 @@ impl DisplayAs for WorkflowsExecutionPlan {
 
 #[deny(clippy::missing_trait_methods)]
 impl ExecutionPlan for WorkflowsExecutionPlan {
+    fn downcast_delegate(&self) -> Option<&dyn ExecutionPlan> {
+        None
+    }
+
+    fn with_preserve_order(&self, _preserve_order: bool) -> Option<Arc<dyn ExecutionPlan>> {
+        None
+    }
+
     fn name(&self) -> &'static str {
         "GitHubWorkflowsExecutionPlan"
     }
@@ -223,15 +227,11 @@ impl ExecutionPlan for WorkflowsExecutionPlan {
         "GitHubWorkflowsExecutionPlan"
     }
 
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema(&self) -> SchemaRef {
         Arc::clone(&self.schema)
     }
 
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
     }
 
@@ -308,15 +308,11 @@ impl ExecutionPlan for WorkflowsExecutionPlan {
         None
     }
 
-    fn statistics(&self) -> datafusion::error::Result<Statistics> {
-        Ok(Statistics::new_unknown(&self.schema()))
-    }
-
     fn partition_statistics(
         &self,
         _partition: Option<usize>,
-    ) -> datafusion::error::Result<Statistics> {
-        Ok(Statistics::new_unknown(&self.schema()))
+    ) -> datafusion::error::Result<Arc<Statistics>> {
+        Ok(Arc::new(Statistics::new_unknown(&self.schema())))
     }
 
     fn supports_limit_pushdown(&self) -> bool {

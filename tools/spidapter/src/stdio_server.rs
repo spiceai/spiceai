@@ -26,8 +26,8 @@ use spicepod::component::runtime::{
 use spicepod::param::{ParamValue, Params};
 use spicepod::spec::SpicepodDefinition;
 use system_adapter_protocol::{
-    AdbcDriver, DatasetConfig, Handler, IngestionMetrics, MetricsResponse, ResourceMetrics, Server,
-    SetupResponse, SinkConfig, TeardownResponse,
+    AdbcDriver, CdcReplicationMetrics, CdcTableMetrics, DatasetConfig, Handler, IngestionMetrics,
+    MetricsResponse, ResourceMetrics, Server, SetupResponse, SinkConfig, TeardownResponse,
 };
 use tokio::process::Child;
 use tokio::time::sleep;
@@ -76,6 +76,7 @@ struct ScpRunState {
     storage: FederatedStorageConfig,
     ec2_guards: Vec<Ec2Guard>,
     dynamodb_guard: Option<DynamoDbGuard>,
+    mongodb_guard: Option<MongoDbGuard>,
 }
 
 /// State for an active benchmark run provisioned via `setup`.
@@ -123,6 +124,7 @@ struct LocalRunState {
     storage: FederatedStorageConfig,
     ec2_guards: Vec<Ec2Guard>,
     dynamodb_guard: Option<DynamoDbGuard>,
+    mongodb_guard: Option<MongoDbGuard>,
 }
 
 enum LocalProcesses {
@@ -235,6 +237,95 @@ impl Drop for DynamoDbGuard {
         })
         .join()
         .ok();
+    }
+}
+
+/// Returns `uri` with its database path component replaced by `database`,
+/// preserving the scheme, authority (userinfo/host), and query string.
+///
+/// `MongoDB` reads the default database from the URI path, so rewriting it routes
+/// both the spicebench sink and the spiced connector to the same per-run db.
+fn with_mongodb_database(uri: &str, database: &str) -> String {
+    let (base, query) = match uri.split_once('?') {
+        Some((b, q)) => (b, Some(q)),
+        None => (uri, None),
+    };
+    // Authority begins after the "scheme://" prefix; the path is the first '/'
+    // after that. Anything from that '/' onward is the old database name.
+    let scheme_end = base.find("://").map_or(0, |i| i + 3);
+    let authority_and_path = &base[scheme_end..];
+    let new_base = match authority_and_path.find('/') {
+        Some(slash) => format!(
+            "{}{}/{database}",
+            &base[..scheme_end],
+            &authority_and_path[..slash]
+        ),
+        None => format!("{base}/{database}"),
+    };
+    match query {
+        Some(q) => format!("{new_base}?{q}"),
+        None => new_base,
+    }
+}
+
+/// Drops a `MongoDB` database on an existing (connect-mode) instance.
+async fn drop_mongodb_database(uri: &str, database: &str) -> anyhow::Result<()> {
+    let client = mongodb::Client::with_uri_str(uri)
+        .await
+        .map_err(|e| anyhow::anyhow!("connect to MongoDB for cleanup: {e}"))?;
+    client
+        .database(database)
+        .drop()
+        .await
+        .map_err(|e| anyhow::anyhow!("drop database '{database}': {e}"))?;
+    Ok(())
+}
+
+/// Holds the per-run `MongoDB` database to drop during explicit teardown.
+///
+/// Used in connect mode (e.g. Atlas), where the instance is shared and outlives
+/// the run, so the throwaway database must be cleaned up. (In provision mode the
+/// whole EC2 instance is terminated, so no per-database cleanup is needed.)
+///
+/// IMPORTANT: this is NOT an auto-deleting RAII guard. The database is dropped
+/// *only* by the explicit teardown path when `preserve_resources == false`
+/// (see `teardown`). Dropping this value never deletes anything — see the `Drop`
+/// impl — so `--no-teardown`, errors, panics, and process exit all leave the
+/// database intact (fail-safe against destroying data the caller asked to keep).
+struct MongoDbGuard {
+    /// `(uri, database)`; `None` once taken by teardown.
+    target: Option<(String, String)>,
+}
+
+impl MongoDbGuard {
+    fn new(uri: String, database: String) -> Self {
+        Self {
+            target: Some((uri, database)),
+        }
+    }
+
+    fn disarm(&mut self) -> Option<(String, String)> {
+        self.target.take()
+    }
+}
+
+impl Drop for MongoDbGuard {
+    fn drop(&mut self) {
+        // Fail-safe: NEVER delete the database implicitly on drop. The per-run
+        // database is dropped only by the explicit teardown path when
+        // `preserve_resources == false`. Any other path that drops this value —
+        // `--no-teardown` (preserve), an error/early return, a panic, or process
+        // exit — must leave the database intact so a caller who asked to keep it
+        // (or a crashed run) never loses data they may want to inspect.
+        //
+        // The cost is that an abnormal exit leaks a throwaway `spidapter_<id>`
+        // database on the shared instance; those are safe to GC by name later.
+        if let Some((_, database)) = self.target.take() {
+            eprintln!(
+                "[stdio] MongoDbGuard: dropped without explicit teardown; \
+                 leaving database '{database}' in place (not deleting)"
+            );
+        }
     }
 }
 
@@ -372,12 +463,157 @@ fn sum_opt_f64_as_u64(
     any.then_some(sum.round() as u64)
 }
 
+/// Fetch raw Prometheus metrics text from a spiced instance.
+async fn fetch_prometheus_metrics(url: &str, api_key: Option<&str>) -> Result<String, String> {
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .map_err(|e| format!("HTTP client error: {e}"))?;
+    let mut req = client.get(url);
+    if let Some(key) = api_key {
+        req = req.bearer_auth(key);
+    }
+    let resp = req.send().await.map_err(|e| format!("GET {url}: {e}"))?;
+    resp.text().await.map_err(|e| format!("read body: {e}"))
+}
+
+/// Parse a labeled Prometheus metric line `<name>{...dataset="X"...} <value>`,
+/// summing values per `dataset` label. `name` must include any suffix
+/// (`_sum`, `_count`, `_total`, …).
+fn parse_labeled(body: &str, name: &str) -> std::collections::HashMap<String, f64> {
+    let mut out = std::collections::HashMap::new();
+    let prefix = format!("{name}{{");
+    for line in body.lines() {
+        if !line.starts_with(&prefix) {
+            continue;
+        }
+        let dataset = line
+            .split("dataset=\"")
+            .nth(1)
+            .and_then(|s| s.split('"').next())
+            .unwrap_or("unknown")
+            .to_string();
+        let value: f64 = line
+            .split_whitespace()
+            .last()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0.0);
+        *out.entry(dataset).or_insert(0.0) += value;
+    }
+    out
+}
+
+/// Build the vendor-neutral `CdcReplicationMetrics` from spiced's Prometheus
+/// text, mapping spiced's MongoDB/cayenne metric names onto the generic
+/// per-table contract. Returns `None` when no CDC metrics are present (e.g. a
+/// non-CDC run), so the field stays absent rather than empty.
+#[expect(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+fn build_cdc_replication_metrics(body: &str) -> Option<CdcReplicationMetrics> {
+    let recv = parse_labeled(body, "dataset_acceleration_cdc_source_recv_wait_ms_sum");
+    let apply = parse_labeled(body, "dataset_acceleration_cdc_apply_burst_duration_ms_sum");
+    let apply_count = parse_labeled(
+        body,
+        "dataset_acceleration_cdc_apply_burst_duration_ms_count",
+    );
+    let linger = parse_labeled(body, "dataset_acceleration_cdc_linger_wait_ms_sum");
+    let bytes = parse_labeled(body, "dataset_acceleration_cdc_apply_burst_bytes_sum");
+    // Per-burst row counter emitted by spiced. Match the exact name spiced
+    // exposes (`..._cdc_apply_burst_rows_total`); fall back to legacy/suffixed
+    // variants in case the metric name or OTel→Prometheus suffixing differs.
+    let mut rows = parse_labeled(body, "dataset_acceleration_cdc_apply_burst_rows_total");
+    for alt in [
+        "dataset_acceleration_cdc_apply_burst_rows_total_total",
+        "dataset_acceleration_cdc_apply_rows_total",
+        "dataset_acceleration_cdc_apply_rows_total_total",
+    ] {
+        if rows.is_empty() {
+            rows = parse_labeled(body, alt);
+        }
+    }
+
+    let mut tables: Vec<String> = recv
+        .keys()
+        .chain(apply.keys())
+        .chain(rows.keys())
+        .chain(bytes.keys())
+        .cloned()
+        .collect::<std::collections::HashSet<_>>()
+        .into_iter()
+        .collect();
+    tables.sort();
+    if tables.is_empty() {
+        return None;
+    }
+
+    let per_table = tables
+        .into_iter()
+        .map(|t| CdcTableMetrics {
+            source_wait_ms: recv.get(&t).copied(),
+            apply_ms: apply.get(&t).copied(),
+            apply_count: apply_count.get(&t).map(|v| v.round() as u64),
+            linger_ms: linger.get(&t).copied(),
+            rows_applied: rows.get(&t).map(|v| v.round() as u64),
+            bytes_applied: bytes.get(&t).map(|v| v.round() as u64),
+            table: t,
+        })
+        .collect();
+
+    Some(CdcReplicationMetrics { per_table })
+}
+
 /// System adapter handler that provisions Spice Cloud apps.
+/// Builds the write-side [`SinkConfig`] for a non-direct source. Mirrors the
+/// inline sink construction in the non-direct `setup` branch; used by the
+/// bootstrap path (which returns the sink before the SUT is started).
+fn build_nondirect_sink(setup_config: &SetupConfig) -> SinkConfig {
+    match &setup_config.storage {
+        FederatedStorageConfig::Postgres { pg, .. }
+        | FederatedStorageConfig::PostgresDebezium { pg, .. } => {
+            let mut write_db_kwargs = pg.adbc_kwargs();
+            write_db_kwargs.insert(
+                "spicebench.write_schema".to_string(),
+                serde_json::Value::String(pg.schema.clone()),
+            );
+            SinkConfig::Adbc {
+                driver: AdbcDriver::Postgresql,
+                db_kwargs: write_db_kwargs,
+            }
+        }
+        FederatedStorageConfig::DynamoDB { .. } => {
+            let region = resolve_aws_region(setup_config);
+            SinkConfig::DynamoDb {
+                region,
+                access_key_id: std::env::var("AWS_ACCESS_KEY_ID").ok(),
+                secret_access_key: std::env::var("AWS_SECRET_ACCESS_KEY").ok(),
+                session_token: std::env::var("AWS_SESSION_TOKEN").ok(),
+            }
+        }
+        FederatedStorageConfig::MongoDB { uri, .. } => SinkConfig::MongoDb { uri: uri.clone() },
+        // Bootstrap is rejected for Direct before this is ever called.
+        FederatedStorageConfig::Direct => SinkConfig::MongoDb { uri: String::new() },
+    }
+}
+
+/// Context captured by `setup` and consumed by `activate_run` to provision the
+/// SUT. For non-bootstrap runs this is created and consumed within a single
+/// `setup` call; for bootstrap runs it is stashed across the `setup`→`activate`
+/// boundary so spicebench can seed the source in between.
+struct PendingActivation {
+    setup_config: SetupConfig,
+    datasets: HashMap<String, DatasetConfig>,
+    sink: SinkConfig,
+    ec2_guards: Vec<Ec2Guard>,
+    dynamodb_guard: Option<DynamoDbGuard>,
+    mongodb_guard: Option<MongoDbGuard>,
+}
+
 struct SpidapterHandler {
     /// Active runs keyed by run ID.
     runs: HashMap<Uuid, RunState>,
     /// Datasets from setup, keyed by run ID → dataset name → config.
     run_datasets: HashMap<Uuid, HashMap<String, DatasetConfig>>,
+    /// Non-direct runs awaiting `activate` (source provisioned, SUT not yet started).
+    pending: HashMap<Uuid, PendingActivation>,
     /// Full CLI args (includes all flags and env-var-backed configuration).
     args: StdioArgs,
     /// Loaded scenario configuration (source type, compute, channel, acceleration).
@@ -385,10 +621,27 @@ struct SpidapterHandler {
 }
 
 impl SpidapterHandler {
-    fn new(args: &StdioArgs, scenario: ScenarioConfig) -> Self {
+    fn new(args: &StdioArgs, mut scenario: ScenarioConfig) -> Self {
+        // Apply env var overrides for SCP image tag and channel so the workflow
+        // can pass SPIDAPTER_IMAGE_TAG / SPIDAPTER_CHANNEL without modifying the
+        // scenario YAML.
+        if let Some(ComputeConfig::Scp(ref mut scp)) = scenario.compute {
+            if let Ok(tag) = std::env::var("SPIDAPTER_IMAGE_TAG")
+                && !tag.is_empty()
+            {
+                scp.image_tag = Some(tag);
+            }
+            if let Ok(channel) = std::env::var("SPIDAPTER_CHANNEL")
+                && !channel.is_empty()
+            {
+                use spice_cloud_client::types::UpdateChannel;
+                scp.channel = channel.parse::<UpdateChannel>().ok();
+            }
+        }
         Self {
             runs: HashMap::new(),
             run_datasets: HashMap::new(),
+            pending: HashMap::new(),
             args: args.clone(),
             scenario,
         }
@@ -432,6 +685,154 @@ impl SpidapterHandler {
             Some(ComputeConfig::Local) | None => SpiceCompute::Local,
         }
     }
+
+    /// Provision the SUT for a non-direct run and finalize run state. Used both
+    /// inline by non-bootstrap `setup` (via the regular path) and by `activate`
+    /// for bootstrap runs (after spicebench has seeded the source).
+    async fn activate_run(&mut self, run_id: Uuid) -> Result<SetupResponse, String> {
+        let PendingActivation {
+            setup_config,
+            datasets,
+            sink,
+            ec2_guards,
+            dynamodb_guard,
+            mongodb_guard,
+        } = self
+            .pending
+            .remove(&run_id)
+            .ok_or_else(|| format!("activate: no pending setup for run_id={run_id}"))?;
+
+        // Non-direct sources have no cayenne config.
+        let cayenne_cfg: Option<&CayenneConfig> = match &self.scenario.source {
+            SourceConfig::Direct(DirectConfig { cayenne }) => cayenne.as_ref(),
+            _ => None,
+        };
+
+        let deployment_mode = setup_config.storage.deployment_mode();
+        let provision_result = match self.compute() {
+            SpiceCompute::Scp => {
+                let scp = self.scp_config().ok_or_else(|| {
+                    "SCP compute requires a scenario with `compute: scp:`".to_string()
+                })?;
+                provision_scp_app(
+                    run_id,
+                    &self.args,
+                    scp,
+                    &setup_config,
+                    &datasets,
+                    &deployment_mode,
+                    false,
+                    cayenne_cfg,
+                )
+                .await
+            }
+            SpiceCompute::Local => match deployment_mode {
+                DeploymentMode::SingleNode => {
+                    provision_local_single_node(
+                        run_id,
+                        Duration::from_secs(self.args.ready_wait),
+                        &setup_config,
+                        &datasets,
+                        &self.args,
+                        self.scp_config(),
+                        cayenne_cfg,
+                    )
+                    .await
+                }
+                DeploymentMode::Cluster => {
+                    provision_local_spiced_cluster(
+                        run_id,
+                        Duration::from_secs(self.args.ready_wait),
+                        &setup_config,
+                        &datasets,
+                        &self.args,
+                        self.scp_config(),
+                    )
+                    .await
+                }
+            },
+        };
+
+        let mut state = match provision_result {
+            Ok(mut s) => {
+                match &mut s {
+                    RunState::Scp(scp) => scp.storage = setup_config.storage.clone(),
+                    RunState::Local(local) => local.storage = setup_config.storage.clone(),
+                }
+                s
+            }
+            Err(e) => return Err(format!("activate: provisioning failed: {e}")),
+        };
+
+        // Move the source guards into the now-provisioned run state.
+        match &mut state {
+            RunState::Scp(scp) => {
+                scp.ec2_guards = ec2_guards;
+                scp.dynamodb_guard = dynamodb_guard;
+                scp.mongodb_guard = mongodb_guard;
+            }
+            RunState::Local(local) => {
+                local.ec2_guards = ec2_guards;
+                local.dynamodb_guard = dynamodb_guard;
+                local.mongodb_guard = mongodb_guard;
+            }
+        }
+
+        Ok(self.finalize_setup(run_id, state, sink, datasets, &setup_config.storage))
+    }
+
+    /// Build the read-side config + catalog namespace from a provisioned run
+    /// state, register the run, and assemble the `SetupResponse`.
+    fn finalize_setup(
+        &mut self,
+        run_id: Uuid,
+        state: RunState,
+        sink: SinkConfig,
+        datasets: HashMap<String, DatasetConfig>,
+        storage: &FederatedStorageConfig,
+    ) -> SetupResponse {
+        let mut read_db_kwargs = HashMap::from([
+            (
+                "uri".to_string(),
+                serde_json::Value::String(state.flight_url().to_string()),
+            ),
+            (
+                "username".to_string(),
+                serde_json::Value::String(String::new()),
+            ),
+            (
+                "password".to_string(),
+                serde_json::Value::String(state.password().to_string()),
+            ),
+        ]);
+        if let RunState::Local(local_state) = &state
+            && let Some(ak) = &local_state.flight_api_key
+        {
+            read_db_kwargs.insert(
+                "adbc.flight.sql.rpc.call_header.authorization".to_string(),
+                serde_json::Value::String(format!("Bearer {ak}")),
+            );
+        }
+
+        let catalog_namespace = match storage {
+            FederatedStorageConfig::Direct => Some("spicebench.bench".to_string()),
+            FederatedStorageConfig::DynamoDB { prefix, .. } if !prefix.is_empty() => {
+                Some(prefix.clone())
+            }
+            _ => None,
+        };
+
+        self.runs.insert(run_id, state);
+        self.run_datasets.insert(run_id, datasets);
+
+        SetupResponse {
+            sink,
+            read_driver: AdbcDriver::Flightsql,
+            read_db_kwargs,
+            catalog_namespace,
+            endpoints: HashMap::new(),
+        }
+    }
 }
 
 #[async_trait]
@@ -449,6 +850,7 @@ impl Handler for SpidapterHandler {
 
         let mut ec2_guards: Vec<Ec2Guard> = Vec::new();
         let mut dynamodb_guard: Option<DynamoDbGuard> = None;
+        let mut mongodb_guard: Option<MongoDbGuard> = None;
 
         let acceleration = self.acceleration();
         let region = self.aws_region();
@@ -612,10 +1014,19 @@ impl Handler for SpidapterHandler {
             }
 
             SourceConfig::MongodbStreams(MongoEndpoint::Connect(mongo_conf)) => {
-                FederatedStorageConfig::MongoDB {
-                    uri: mongo_conf.uri.clone(),
-                    acceleration,
-                }
+                // Connect mode targets an existing, shared instance (e.g. Atlas).
+                // Route this run to a fresh per-run database so concurrent runs are
+                // isolated and cleanup is a single drop. The database is created
+                // lazily on first write (by the spicebench sink) and dropped at
+                // teardown via the MongoDbGuard below.
+                let database = format!("spidapter_{short_id}");
+                let uri = with_mongodb_database(&mongo_conf.uri, &database);
+                eprintln!(
+                    "[stdio] MongoDB connect: using per-run database '{database}' \
+                     (created on first write, dropped at teardown)"
+                );
+                mongodb_guard = Some(MongoDbGuard::new(uri.clone(), database));
+                FederatedStorageConfig::MongoDB { uri, acceleration }
             }
         };
 
@@ -663,6 +1074,41 @@ impl Handler for SpidapterHandler {
             )
             .await
             .map_err(|e| format!("Failed to register Debezium PostgreSQL connector: {e}"))?;
+        }
+
+        // Bootstrap mode: the source is now provisioned. Return its sink WITHOUT
+        // starting the SUT so spicebench can seed the source first; the SUT is
+        // started later by `activate`. Only non-direct sources support this.
+        let is_bootstrap = metadata
+            .get(system_adapter_protocol::BOOTSTRAP_METADATA_KEY)
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
+        if is_bootstrap {
+            if matches!(setup_config.storage, FederatedStorageConfig::Direct) {
+                return Err("bootstrap mode is not supported for direct-ingest sources".to_string());
+            }
+            let sink = build_nondirect_sink(&setup_config);
+            eprintln!(
+                "[stdio] setup(bootstrap): source provisioned; deferring SUT start until activate"
+            );
+            self.pending.insert(
+                run_id,
+                PendingActivation {
+                    setup_config,
+                    datasets,
+                    sink: sink.clone(),
+                    ec2_guards,
+                    dynamodb_guard,
+                    mongodb_guard,
+                },
+            );
+            return Ok(SetupResponse {
+                sink,
+                read_driver: AdbcDriver::Flightsql,
+                read_db_kwargs: HashMap::new(),
+                catalog_namespace: None,
+                endpoints: HashMap::new(),
+            });
         }
 
         // For Cayenne (DirectIngest): provision spiced first (Flight URL needed to build SinkConfig).
@@ -877,10 +1323,12 @@ impl Handler for SpidapterHandler {
             RunState::Scp(scp) => {
                 scp.ec2_guards = ec2_guards;
                 scp.dynamodb_guard = dynamodb_guard;
+                scp.mongodb_guard = mongodb_guard;
             }
             RunState::Local(local) => {
                 local.ec2_guards = ec2_guards;
                 local.dynamodb_guard = dynamodb_guard;
+                local.mongodb_guard = mongodb_guard;
             }
         }
 
@@ -905,6 +1353,29 @@ impl Handler for SpidapterHandler {
             .runs
             .get(&run_id)
             .ok_or_else(|| format!("No active run found for {run_id}"))?;
+
+        // Derive the Prometheus metrics URL.
+        // - SCP: the gateway serves Prometheus at `/v1/metrics` (same host as
+        //   `/v1/sql`), so swap only the trailing path segment and keep `/v1`.
+        // - Local: spiced serves Prometheus on a dedicated `--metrics` port
+        //   (SPIDAPTER_METRICS_PORT) at `/metrics`, distinct from the HTTP/SQL
+        //   port — the path swap alone would hit the SQL port and return nothing.
+        let prometheus_url = match state {
+            RunState::Local(_) => match std::env::var("SPIDAPTER_METRICS_PORT") {
+                Ok(port) if !port.trim().is_empty() => {
+                    format!("http://127.0.0.1:{}/metrics", port.trim())
+                }
+                _ => state.sql_url().replace("/v1/sql", "/metrics"),
+            },
+            RunState::Scp(_) => state.sql_url().replace("/v1/sql", "/v1/metrics"),
+        };
+        let api_key = state.api_key().map(std::string::ToString::to_string);
+
+        // Scrape Prometheus metrics for the CDC replication payload.
+        let prom_body = fetch_prometheus_metrics(&prometheus_url, api_key.as_deref())
+            .await
+            .ok();
+        let cdc_replication = prom_body.as_deref().and_then(build_cdc_replication_metrics);
 
         match state {
             RunState::Scp(scp) => {
@@ -942,13 +1413,20 @@ impl Handler for SpidapterHandler {
                 Ok(MetricsResponse {
                     resource,
                     ingestion,
+                    cdc_replication,
                 })
             }
             RunState::Local(_) => Ok(MetricsResponse {
                 resource: ResourceMetrics::default(),
                 ingestion: IngestionMetrics::default(),
+                cdc_replication,
             }),
         }
+    }
+
+    async fn activate(&mut self, run_id: Uuid) -> Result<SetupResponse, String> {
+        eprintln!("[stdio] activate: run_id={run_id} (starting SUT after source seed)");
+        self.activate_run(run_id).await
     }
 
     async fn teardown(
@@ -957,6 +1435,33 @@ impl Handler for SpidapterHandler {
         preserve_resources: bool,
     ) -> Result<TeardownResponse, String> {
         eprintln!("[stdio] teardown: run_id={run_id} preserve_resources={preserve_resources}");
+
+        // Bootstrap run torn down before `activate`: state lives in `pending`.
+        if let Some(mut pending) = self.pending.remove(&run_id) {
+            eprintln!("[stdio] teardown: run_id={run_id} torn down before activation");
+            if preserve_resources {
+                for mut g in pending.ec2_guards.drain(..) {
+                    g.disarm();
+                }
+                if let Some(mut g) = pending.dynamodb_guard.take() {
+                    g.disarm();
+                }
+                if let Some(mut g) = pending.mongodb_guard.take() {
+                    g.disarm();
+                }
+            } else if let Some(mut g) = pending.mongodb_guard.take()
+                && let Some((uri, database)) = g.disarm()
+            {
+                // Drop the seeded per-run database explicitly (Drop is fail-safe).
+                if let Err(e) = drop_mongodb_database(&uri, &database).await {
+                    eprintln!(
+                        "[stdio] teardown: warning: failed to drop MongoDB database '{database}': {e}"
+                    );
+                }
+            }
+            // Remaining ec2/dynamodb guards (if any, !preserve) clean up on drop here.
+            return Ok(TeardownResponse { ok: true });
+        }
 
         let Some(mut state) = self.runs.remove(&run_id) else {
             eprintln!("[stdio] teardown: run_id={run_id} not found (already torn down?)");
@@ -969,14 +1474,16 @@ impl Handler for SpidapterHandler {
             RunState::Local(local) => local.storage.clone(),
         };
 
-        let (ec2_guards, dynamodb_guard) = match &mut state {
+        let (ec2_guards, dynamodb_guard, mongodb_guard) = match &mut state {
             RunState::Scp(scp) => (
                 std::mem::take(&mut scp.ec2_guards),
                 scp.dynamodb_guard.take(),
+                scp.mongodb_guard.take(),
             ),
             RunState::Local(local) => (
                 std::mem::take(&mut local.ec2_guards),
                 local.dynamodb_guard.take(),
+                local.mongodb_guard.take(),
             ),
         };
 
@@ -995,6 +1502,13 @@ impl Handler for SpidapterHandler {
             if let Some(mut guard) = dynamodb_guard {
                 guard.disarm();
                 eprintln!("[stdio] teardown(preserve): keeping DynamoDB tables alive");
+            }
+            if let Some(mut guard) = mongodb_guard
+                && let Some((_, database)) = guard.disarm()
+            {
+                eprintln!(
+                    "[stdio] teardown(preserve): keeping MongoDB database '{database}' alive"
+                );
             }
             // For SCP: skip app deletion so the deployed spiced stays running.
             eprintln!("[stdio] teardown(preserve): skipping resource deletion");
@@ -1057,6 +1571,18 @@ impl Handler for SpidapterHandler {
                 );
                 if let Err(e) = delete_dynamodb_tables(&info).await {
                     eprintln!("[stdio] teardown: warning: failed to delete DynamoDB tables: {e}");
+                }
+            });
+        }
+        if let Some(mut guard) = mongodb_guard
+            && let Some((uri, database)) = guard.disarm()
+        {
+            cleanup.spawn(async move {
+                eprintln!("[stdio] teardown: dropping MongoDB database '{database}'");
+                if let Err(e) = drop_mongodb_database(&uri, &database).await {
+                    eprintln!(
+                        "[stdio] teardown: warning: failed to drop MongoDB database '{database}': {e}"
+                    );
                 }
             });
         }
@@ -1202,7 +1728,7 @@ async fn execute_sql_statement(
     statement: &str,
 ) -> anyhow::Result<()> {
     let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(60))
+        .timeout(Duration::from_mins(1))
         .build()?;
 
     let mut attempts = 0;
@@ -1415,7 +1941,19 @@ async fn generate_initial_spicepod(
     scp: &ScpConfig,
     cayenne: Option<&CayenneConfig>,
 ) -> anyhow::Result<SpicepodDefinition> {
-    let scheduler_state_location = scp.scheduler_state_location.as_deref();
+    // Local-bench fallback: when no scenario `compute.scp` block provides a
+    // scheduler state location, honor the SCHEDULER_STATE_LOCATION env var
+    // (passed by `spicebench run` via --system-adapter-env). spiced refuses to
+    // start in scheduler mode without `runtime.scheduler.state_location`, and
+    // the local backend otherwise leaves it unset.
+    let scheduler_state_location_env = std::env::var("SCHEDULER_STATE_LOCATION")
+        .ok()
+        .filter(|s| !s.trim().is_empty());
+    let scheduler_state_location = scp
+        .scheduler_state_location
+        .as_deref()
+        .filter(|s| !s.trim().is_empty())
+        .or(scheduler_state_location_env.as_deref());
 
     let mut spicepod = if let Some(path) = setup_config.spicepod_path.as_deref() {
         load_spicepod_from_path(path, run_id).await?
@@ -1541,6 +2079,30 @@ mod tests {
 
         let config = SetupConfig::from_metadata(&metadata);
         assert_eq!(config.region.as_deref(), Some("us-west-2"));
+    }
+
+    #[test]
+    fn with_mongodb_database_replaces_path() {
+        // Existing database in the path is replaced.
+        assert_eq!(
+            with_mongodb_database("mongodb+srv://u:p@host/old?tls=true", "spidapter_abc"),
+            "mongodb+srv://u:p@host/spidapter_abc?tls=true"
+        );
+        // No database in the path: one is appended.
+        assert_eq!(
+            with_mongodb_database("mongodb+srv://u:p@host/?retryWrites=true", "db1"),
+            "mongodb+srv://u:p@host/db1?retryWrites=true"
+        );
+        // No path and no query at all.
+        assert_eq!(
+            with_mongodb_database("mongodb://localhost:27017", "db1"),
+            "mongodb://localhost:27017/db1"
+        );
+        // No query string, existing db path.
+        assert_eq!(
+            with_mongodb_database("mongodb://localhost:27017/test", "db1"),
+            "mongodb://localhost:27017/db1"
+        );
     }
 
     #[test]

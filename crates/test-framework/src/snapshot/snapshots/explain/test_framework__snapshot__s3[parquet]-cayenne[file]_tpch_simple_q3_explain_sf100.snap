@@ -14,7 +14,7 @@ description: "Query: tpch_simple_q3"
 |               |     SortExec: TopK(fetch=10), expr=[l_linenumber@2 DESC], preserve_partitioning=[true]                                                                                     |
 |               |       ProjectionExec: expr=[l_comment@2 as l_comment, l_partkey@0 as l_partkey, l_linenumber@1 as l_linenumber]                                                            |
 |               |         SchemaCastScanExec                                                                                                                                                 |
-|               |           CayenneAccelerationExec                                                                                                                                          |
+|               |           CayenneAccelerationExec: snapshots_scanned=1, files_scanned=91                                                                                                   |
 |               |             BytesProcessedExec                                                                                                                                             |
 |               |               DataSourceExec: file_groups={16 groups: [<redacted>]}, projection=[l_partkey, l_linenumber, l_comment], file_type=vortex, predicate: DynamicFilter [ empty ] |
 |               |                                                                                                                                                                            |

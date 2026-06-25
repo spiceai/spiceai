@@ -60,7 +60,7 @@ runs:
 
     - name: Install CUDA Toolkit (Linux)
       if: ${{ inputs.target_os != 'windows'}}
-      uses: Jimver/cuda-toolkit@8022558310ea543e35132143092835585f60e628 # v0.2.21
+      uses: Jimver/cuda-toolkit@3d45d157f327c09c04b50ee6ccdea2d9d017ec76 # v0.2.35
       id: cuda-toolkit-linux
       with:
         cuda: ${{ inputs.cuda-version }}
@@ -71,7 +71,7 @@ runs:
 
     - name: Install CUDA Toolkit (Windows)
       if: ${{ inputs.target_os == 'windows'}}
-      uses: Jimver/cuda-toolkit@8022558310ea543e35132143092835585f60e628 # v0.2.21
+      uses: Jimver/cuda-toolkit@3d45d157f327c09c04b50ee6ccdea2d9d017ec76 # v0.2.35
       id: cuda-toolkit-windows
       with:
         cuda: ${{ inputs.cuda-version }}
@@ -94,14 +94,14 @@ runs:
 
     - name: Upload artifact
       if: inputs.target_os != 'windows'
-      uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7
+      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
       with:
         name: spiced_cuda_${{ inputs.cuda-compute-capability }}_${{ inputs.artifact-tag }}
         path: spiced_cuda_${{ inputs.cuda-compute-capability }}_${{ inputs.artifact-tag }}.tar.gz
 
     - name: Upload artifact
       if: inputs.target_os == 'windows'
-      uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7
+      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
       with:
         name: spiced.exe_cuda_${{ inputs.cuda-compute-capability }}_${{ inputs.artifact-tag }}
         path: spiced.exe_cuda_${{ inputs.cuda-compute-capability }}_${{ inputs.artifact-tag }}.tar.gz

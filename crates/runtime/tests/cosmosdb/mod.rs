@@ -149,7 +149,7 @@ async fn cosmosdb_live_select_returns_rows() -> Result<(), anyhow::Error> {
             let cloned_rt = Arc::new(rt.clone());
 
             tokio::select! {
-                () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+                () = tokio::time::sleep(std::time::Duration::from_mins(1)) => {
                     return Err(anyhow::anyhow!("Timed out waiting for Cosmos DB dataset to load"));
                 }
                 () = cloned_rt.load_components() => {}
@@ -194,7 +194,7 @@ async fn cosmosdb_live_repeated_queries_share_budget() -> Result<(), anyhow::Err
             let cloned_rt = Arc::new(rt.clone());
 
             tokio::select! {
-                () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+                () = tokio::time::sleep(std::time::Duration::from_mins(1)) => {
                     return Err(anyhow::anyhow!("Timed out waiting for Cosmos DB dataset to load"));
                 }
                 () = cloned_rt.load_components() => {}

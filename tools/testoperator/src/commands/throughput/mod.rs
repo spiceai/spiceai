@@ -97,7 +97,6 @@ async fn run_inner(
     // bench/mod.rs for context.
     let memory_readings = spiced_instance
         .process()
-        .ok()
         .map(|process| process.watch_memory(&memory_token));
 
     // throughput test

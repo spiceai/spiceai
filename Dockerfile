@@ -1,5 +1,5 @@
 #syntax=docker/dockerfile:1.2
-ARG RUST_VERSION=1.94.1
+ARG RUST_VERSION=1.95.0
 FROM rust:${RUST_VERSION}-slim-trixie as build
 
 # cache mounts below may already exist and owned by root

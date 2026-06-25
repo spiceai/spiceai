@@ -36,7 +36,6 @@ use datafusion::common::tree_node::{Transformed, TreeNode};
 use datafusion::config::ConfigOptions;
 use datafusion::physical_optimizer::PhysicalOptimizerRule;
 use datafusion::physical_plan::aggregates::{AggregateExec, AggregateMode};
-use datafusion::physical_plan::filter::FilterExec;
 use datafusion::physical_plan::projection::ProjectionExec;
 use datafusion::physical_plan::repartition::RepartitionExec;
 use datafusion::physical_plan::union::UnionExec;
@@ -92,7 +91,7 @@ impl PhysicalOptimizerRule for FlightSQLPartialAggregatePushdown {
 fn try_rewrite_partial_aggregate(
     plan: Arc<dyn ExecutionPlan>,
 ) -> Result<Transformed<Arc<dyn ExecutionPlan>>> {
-    let Some(agg) = plan.as_any().downcast_ref::<AggregateExec>() else {
+    let Some(agg) = plan.downcast_ref::<AggregateExec>() else {
         return Ok(Transformed::no(plan));
     };
     if *agg.mode() != AggregateMode::Partial {
@@ -109,6 +108,16 @@ fn try_rewrite_partial_aggregate(
     // synthetic columns like `__common_expr_1` can be inlined back to their
     // original expressions during SQL generation.
     let (scan_child, column_substitutions) = skip_projection(child);
+
+    // A RoundRobin RepartitionExec can also sit BELOW the CSE projection
+    // (Aggregate → Projection → Repartition → Union → …Flight). This is the
+    // common shape for aggregates over computed arguments — e.g.
+    // `sum(l_extendedprice * (1 - l_discount))` (TPC-H Q1) — where CSE pulls the
+    // computed expression into a projection that lands above the repartition.
+    // Skip it here too so `collect_flight_execs` sees the `UnionExec` directly
+    // instead of bailing on a multi-input node mid-walk. The repartition
+    // preserves the scan schema, so the projection substitutions stay valid.
+    let scan_child = skip_repartition_roundrobin(scan_child);
 
     let flight_execs = collect_flight_execs(scan_child);
     let Some(flight_execs) = flight_execs else {
@@ -166,7 +175,7 @@ fn all_aggregates_pushable(agg: &AggregateExec) -> bool {
 
 /// Skip through a `RepartitionExec(RoundRobinBatch)` if present.
 fn skip_repartition_roundrobin(plan: &Arc<dyn ExecutionPlan>) -> &Arc<dyn ExecutionPlan> {
-    if let Some(repart) = plan.as_any().downcast_ref::<RepartitionExec>()
+    if let Some(repart) = plan.downcast_ref::<RepartitionExec>()
         && matches!(repart.partitioning(), Partitioning::RoundRobinBatch(_))
     {
         return repart.input();
@@ -187,7 +196,7 @@ fn skip_repartition_roundrobin(plan: &Arc<dyn ExecutionPlan>) -> &Arc<dyn Execut
 fn skip_projection(
     plan: &Arc<dyn ExecutionPlan>,
 ) -> (&Arc<dyn ExecutionPlan>, Vec<Arc<dyn PhysicalExpr>>) {
-    if let Some(proj) = plan.as_any().downcast_ref::<ProjectionExec>() {
+    if let Some(proj) = plan.downcast_ref::<ProjectionExec>() {
         let substitutions: Vec<Arc<dyn PhysicalExpr>> =
             proj.expr().iter().map(|pe| Arc::clone(&pe.expr)).collect();
         return (proj.input(), substitutions);
@@ -201,7 +210,7 @@ fn skip_projection(
 /// identified by name (they are defined in upstream crates not available for downcasting).
 /// Returns `None` if any child doesn't terminate at `FlightSqlExec`.
 fn collect_flight_execs(plan: &Arc<dyn ExecutionPlan>) -> Option<Vec<&FlightSqlExec>> {
-    if let Some(union_exec) = plan.as_any().downcast_ref::<UnionExec>() {
+    if let Some(union_exec) = plan.downcast_ref::<UnionExec>() {
         let mut execs = Vec::with_capacity(union_exec.inputs().len());
         for child in union_exec.inputs() {
             execs.push(walk_to_flight_exec(child)?);
@@ -215,19 +224,25 @@ fn collect_flight_execs(plan: &Arc<dyn ExecutionPlan>) -> Option<Vec<&FlightSqlE
 /// Walk through single-input pass-through nodes to find a `FlightSqlExec`.
 ///
 /// Recognised pass-through nodes (single input, no semantic change for pushdown):
-/// - `FilterExec` — the underlying `FlightSqlExec` already carries the filter in
-///   its SQL; the `FilterExec` is a redundant safety layer added by `DataFusion`.
 /// - `RepartitionExec` — only shuffles partitions, no data change.
 /// - Name-identified nodes in [`PASS_THROUGH_EXEC_NAMES`] (`CooperativeExec`,
 ///   `BytesProcessedExec`) — defined in upstream crates, not available for
 ///   downcasting.
+///
+/// `FilterExec` is deliberately NOT pass-through. `FlightSQLTable` reports
+/// filter pushdown as `Exact` (predicate absorbed into the scan SQL, no
+/// `FilterExec` planned) or `Unsupported` (predicate stays in the plan as a
+/// `FilterExec` and is NOT in the scan SQL) — it never reports `Inexact`. A
+/// `FilterExec` here therefore always carries a predicate the pushed-down
+/// aggregation SQL would lose, and the rewrite would silently aggregate over
+/// unfiltered rows. Bail and keep the local partial aggregate instead.
 ///
 /// Returns `None` if the chain contains a multi-input node or an unrecognised
 /// node, or terminates at a non-`FlightSqlExec`.
 fn walk_to_flight_exec(plan: &Arc<dyn ExecutionPlan>) -> Option<&FlightSqlExec> {
     let mut current: &Arc<dyn ExecutionPlan> = plan;
     loop {
-        if let Some(flight) = current.as_any().downcast_ref::<FlightSqlExec>() {
+        if let Some(flight) = current.downcast_ref::<FlightSqlExec>() {
             return Some(flight);
         }
 
@@ -236,8 +251,7 @@ fn walk_to_flight_exec(plan: &Arc<dyn ExecutionPlan>) -> Option<&FlightSqlExec> 
             return None;
         }
 
-        if current.as_any().downcast_ref::<FilterExec>().is_some()
-            || current.as_any().downcast_ref::<RepartitionExec>().is_some()
+        if current.downcast_ref::<RepartitionExec>().is_some()
             || PASS_THROUGH_EXEC_NAMES.contains(&current.name())
         {
             current = children[0];
@@ -309,7 +323,6 @@ mod tests {
     use datafusion::sql::TableReference;
     use datafusion_datasource::memory::MemorySourceConfig;
     use flight_client::cookie::CookieStore;
-    use std::any::Any;
     use std::fmt;
     use tonic::transport::Channel;
 
@@ -461,7 +474,6 @@ mod tests {
         data: &mut impl Iterator<Item = Vec<RecordBatch>>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         if plan
-            .as_any()
             .downcast_ref::<PartialAggregationFlightSqlExec>()
             .is_some()
         {
@@ -751,6 +763,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_no_pushdown_through_residual_filter_exec() -> Result<()> {
+        use datafusion::physical_expr::expressions::IsNotNullExpr;
+        use datafusion::physical_plan::filter::FilterExec;
+
+        let schema = lineitem_schema();
+        let flight = make_flight_exec(&schema, "foo.foo.lineitem", &[]);
+        // A FilterExec above the scan means DataFusion kept a predicate the
+        // scan's SQL does NOT apply (FlightSQLTable pushdown is
+        // Exact-or-Unsupported, never Inexact). Pushing the aggregate past it
+        // would aggregate unfiltered rows, so the rule must leave the plan
+        // alone.
+        let predicate: Arc<dyn PhysicalExpr> =
+            Arc::new(IsNotNullExpr::new(Arc::new(Column::new("l_returnflag", 3))));
+        let filtered: Arc<dyn ExecutionPlan> = Arc::new(FilterExec::try_new(predicate, flight)?);
+
+        let sum_expr =
+            AggregateExprBuilder::new(sum_udaf(), vec![Arc::new(Column::new("l_quantity", 0))])
+                .schema(Arc::clone(&schema))
+                .alias("sum(l_quantity)")
+                .build()?;
+
+        let plan = full_aggregate(filtered, &[(3, "l_returnflag")], vec![Arc::new(sum_expr)])?;
+
+        let optimized = optimize(Arc::clone(&plan))?;
+        assert_eq!(
+            plan_display(&optimized),
+            plan_display(&plan),
+            "partial aggregate must NOT be pushed past a residual FilterExec"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn test_pushdown_preserves_filters_in_where() -> Result<()> {
         use datafusion::logical_expr::{col, lit};
 
@@ -778,8 +824,8 @@ mod tests {
         AggregateExec: mode=Final, gby=[l_returnflag@0 as l_returnflag], aggr=[sum(l_quantity)]
           CoalescePartitionsExec
             UnionExec
-              PartialAggregationFlightSqlExec sql=SELECT "l_returnflag", SUM("l_quantity") AS "__agg_0" FROM foo.foo.lineitem WHERE ("l_shipdate" > 100) GROUP BY "l_returnflag"
-              PartialAggregationFlightSqlExec sql=SELECT "l_returnflag", SUM("l_quantity") AS "__agg_0" FROM foo.foo.lineitem WHERE ("l_shipdate" > 100) GROUP BY "l_returnflag"
+              PartialAggregationFlightSqlExec sql=SELECT "l_returnflag", SUM("l_quantity") AS "__agg_0" FROM foo.foo.lineitem WHERE (l_shipdate > 100) GROUP BY "l_returnflag"
+              PartialAggregationFlightSqlExec sql=SELECT "l_returnflag", SUM("l_quantity") AS "__agg_0" FROM foo.foo.lineitem WHERE (l_shipdate > 100) GROUP BY "l_returnflag"
         "#);
 
         Ok(())
@@ -914,17 +960,17 @@ mod tests {
     #[derive(Debug)]
     struct MockNonFlightExec {
         schema: SchemaRef,
-        properties: PlanProperties,
+        properties: Arc<PlanProperties>,
     }
 
     impl MockNonFlightExec {
         fn new(schema: SchemaRef) -> Self {
-            let props = PlanProperties::new(
+            let props = Arc::new(PlanProperties::new(
                 EquivalenceProperties::new(Arc::clone(&schema)),
                 Partitioning::UnknownPartitioning(1),
                 EmissionType::Incremental,
                 Boundedness::Bounded,
-            );
+            ));
             Self {
                 schema,
                 properties: props,
@@ -942,13 +988,10 @@ mod tests {
         fn name(&self) -> &'static str {
             "MockNonFlightExec"
         }
-        fn as_any(&self) -> &dyn Any {
-            self
-        }
         fn schema(&self) -> SchemaRef {
             Arc::clone(&self.schema)
         }
-        fn properties(&self) -> &PlanProperties {
+        fn properties(&self) -> &Arc<PlanProperties> {
             &self.properties
         }
         fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
@@ -1042,6 +1085,40 @@ mod tests {
             make_flight_exec(&schema, "foo.foo.lineitem", &[]),
             Arc::new(MockNonFlightExec::new(Arc::clone(&schema))),
         ]);
+        assert_no_pushdown(partial_aggregate(
+            input,
+            &[(3, "l_returnflag")],
+            vec![Arc::new(
+                AggregateExprBuilder::new(sum_udaf(), vec![Arc::new(Column::new("l_quantity", 0))])
+                    .schema(Arc::clone(&schema))
+                    .alias("sum")
+                    .build()?,
+            )],
+        )?);
+        Ok(())
+    }
+
+    /// A `FilterExec` above a federated scan holds a predicate that is NOT in
+    /// the scan's SQL (`FlightSQLTable` pushdown is `Exact` or `Unsupported`,
+    /// never `Inexact`). Pushing the partial aggregate through it would
+    /// silently aggregate over unfiltered rows, so the rule must bail.
+    #[tokio::test]
+    async fn test_no_pushdown_filter_exec_above_scan() -> Result<()> {
+        use datafusion::logical_expr::Operator;
+        use datafusion::physical_expr::expressions::BinaryExpr;
+        use datafusion::physical_plan::filter::FilterExec;
+
+        let schema = lineitem_schema();
+        let predicate: Arc<dyn PhysicalExpr> = Arc::new(BinaryExpr::new(
+            Arc::new(Column::new("l_returnflag", 3)),
+            Operator::Eq,
+            Arc::new(Literal::new(ScalarValue::Utf8View(Some("A".to_string())))),
+        ));
+        let filtered_scan = Arc::new(FilterExec::try_new(
+            predicate,
+            make_flight_exec(&schema, "foo.foo.lineitem", &[]),
+        )?) as Arc<dyn ExecutionPlan>;
+        let input = make_union(vec![filtered_scan]);
         assert_no_pushdown(partial_aggregate(
             input,
             &[(3, "l_returnflag")],

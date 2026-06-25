@@ -573,7 +573,7 @@ impl Query {
         let locks = REVALIDATION_LOCKS.get_or_init(|| {
             moka::future::Cache::builder()
                 .max_capacity(10_000) // Track up to 10k concurrent revalidations
-                .time_to_live(std::time::Duration::from_secs(300)) // Auto-cleanup after 5min
+                .time_to_live(std::time::Duration::from_mins(5)) // Auto-cleanup after 5min
                 .build()
         });
 
@@ -770,7 +770,7 @@ mod tests {
 
         let plan_cache_provider = Arc::new(SimpleCache::new(
             512,
-            Duration::from_secs(3600),
+            Duration::from_hours(1),
             std::hash::BuildHasherDefault::<twox_hash::XxHash3_64>::default(),
         ));
         let runtime = RuntimeBuilder::new().build().await;

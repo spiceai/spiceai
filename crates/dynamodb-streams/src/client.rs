@@ -121,7 +121,7 @@ impl Client {
         let retry_strategy = RetryBackoffBuilder::new()
             .method(BackoffMethod::Fibonacci)
             .max_retries(None)
-            .max_duration(Some(Duration::from_secs(60)))
+            .max_duration(Some(Duration::from_mins(1)))
             .build();
 
         let producer = DynamodbStreamProducer {

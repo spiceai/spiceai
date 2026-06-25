@@ -359,7 +359,7 @@ async fn test_cayenne_core_arrow_data_types() -> Result<(), anyhow::Error> {
             let rt = Arc::new(Runtime::builder().with_app(app).build().await);
 
             tokio::select! {
-                () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+                () = tokio::time::sleep(std::time::Duration::from_mins(1)) => {
                     return Err(anyhow::Error::msg("Timeout waiting for components to load"));
                 }
                 () = Arc::clone(&rt).load_components() => {}
@@ -484,7 +484,7 @@ async fn test_cayenne_primary_key_delete() -> Result<(), anyhow::Error> {
             let rt = Arc::new(Runtime::builder().with_app(app).build().await);
 
             tokio::select! {
-                () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+                () = tokio::time::sleep(std::time::Duration::from_mins(1)) => {
                     return Err(anyhow::Error::msg("Timeout waiting for components to load"));
                 }
                 () = Arc::clone(&rt).load_components() => {}
@@ -508,7 +508,6 @@ async fn test_cayenne_primary_key_delete() -> Result<(), anyhow::Error> {
 
             // Get the AcceleratedTable, then its underlying accelerator (which may be wrapped)
             let accelerated_table = table
-                .as_any()
                 .downcast_ref::<AcceleratedTable>()
                 .ok_or_else(|| anyhow::anyhow!("Table is not an AcceleratedTable"))?;
 
@@ -625,7 +624,7 @@ async fn test_cayenne_partitioned_primary_key() -> Result<(), anyhow::Error> {
             let rt = Arc::new(Runtime::builder().with_app(app).build().await);
 
             tokio::select! {
-                () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+                () = tokio::time::sleep(std::time::Duration::from_mins(1)) => {
                     return Err(anyhow::Error::msg("Timeout waiting for components to load"));
                 }
                 () = Arc::clone(&rt).load_components() => {}
@@ -1107,7 +1106,7 @@ async fn test_cayenne_on_conflict_runtime_integration() -> Result<(), anyhow::Er
             let rt = Arc::new(Runtime::builder().with_app(app).build().await);
 
             tokio::select! {
-                () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+                () = tokio::time::sleep(std::time::Duration::from_mins(1)) => {
                     return Err(anyhow::Error::msg("Timeout waiting for components to load"));
                 }
                 () = Arc::clone(&rt).load_components() => {}
@@ -1924,7 +1923,7 @@ async fn test_cayenne_partitioned_deletion() -> Result<(), anyhow::Error> {
             let rt = Arc::new(Runtime::builder().with_app(app).build().await);
 
             tokio::select! {
-                () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+                () = tokio::time::sleep(std::time::Duration::from_mins(1)) => {
                     return Err(anyhow::Error::msg("Timeout waiting for components to load"));
                 }
                 () = Arc::clone(&rt).load_components() => {}

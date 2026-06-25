@@ -17,5 +17,7 @@ limitations under the License.
 pub mod cache_invalidation;
 #[cfg(feature = "duckdb")]
 pub mod duckdb;
+pub mod reorder_join;
 
 pub use cache_invalidation::CacheInvalidationExtensionPlanner;
+pub use reorder_join::ReorderJoinRule;

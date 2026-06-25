@@ -56,7 +56,7 @@ fn commented_dataset(port: u16) -> Dataset {
 /// don't pile up; the loop retries until success or the overall deadline is hit.
 async fn wait_for_ddl_ready(port: u16) -> Result<(), anyhow::Error> {
     tracing::debug!("wait_for_ddl_ready: probing InnoDB DDL readiness on port {port}");
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(180);
+    let deadline = tokio::time::Instant::now() + Duration::from_mins(3);
     let mut attempt = 0u32;
     loop {
         attempt += 1;
@@ -131,7 +131,7 @@ async fn start_runtime(dataset: Dataset) -> Result<Arc<runtime::Runtime>, anyhow
     let rt = Arc::new(runtime::Runtime::builder().with_app(app).build().await);
 
     tokio::select! {
-        () = tokio::time::sleep(Duration::from_secs(120)) => {
+        () = tokio::time::sleep(Duration::from_mins(2)) => {
             return Err(anyhow::anyhow!("Timed out waiting for dataset to load"));
         }
         () = Arc::clone(&rt).load_components() => {}

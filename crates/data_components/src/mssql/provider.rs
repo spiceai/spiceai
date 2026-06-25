@@ -19,10 +19,6 @@ limitations under the License.
 //! Discovers schemas and tables in a SQL Server database using
 //! `INFORMATION_SCHEMA` queries and provides them as `DataFusion` catalog/schema providers.
 
-use std::any::Any;
-use std::collections::HashMap;
-use std::sync::{Arc, RwLock};
-
 use async_trait::async_trait;
 use datafusion::catalog::{CatalogProvider, SchemaProvider};
 use datafusion::datasource::TableProvider;
@@ -31,6 +27,8 @@ use datafusion::sql::TableReference;
 use futures::StreamExt;
 use globset::GlobSet;
 use snafu::prelude::*;
+use std::collections::HashMap;
+use std::sync::{Arc, RwLock};
 
 use super::SqlServerTableProvider;
 use super::connection_manager::SqlServerConnectionPool;
@@ -137,10 +135,6 @@ impl MssqlCatalogProvider {
 }
 
 impl CatalogProvider for MssqlCatalogProvider {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema_names(&self) -> Vec<String> {
         let guard = match self.schemas.read() {
             Ok(guard) => guard,
@@ -273,10 +267,6 @@ impl MssqlSchemaProvider {
 
 #[async_trait]
 impl SchemaProvider for MssqlSchemaProvider {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn table_names(&self) -> Vec<String> {
         let guard = match self.tables.read() {
             Ok(guard) => guard,

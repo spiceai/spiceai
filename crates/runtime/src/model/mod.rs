@@ -18,14 +18,16 @@ use arrow::record_batch::RecordBatch;
 use datafusion::prelude::col;
 use datafusion::sql::TableReference;
 use model_components::model::{Error as ModelError, Model};
-use std::io;
 use std::result::Result;
 use std::sync::Arc;
+use std::{collections::HashMap, io};
+use tokio::sync::RwLock;
 
 mod chat;
 mod embed;
 mod metrics;
 mod model_context;
+pub(crate) mod nsql;
 pub mod params;
 pub(crate) mod provider_models;
 pub(crate) mod rate_limit;
@@ -42,9 +44,52 @@ pub use model_context::{
     ModelContextExtension, ModelContextLayer, add_tools_used, track_ai_inferences_with_spice_count,
 };
 pub use rerank::{RerankerModelStore, try_to_rerank_model};
-pub use responses::{LLMResponsesModelStore, try_to_responses_model};
+pub use responses::{LLMResponsesModelStore, ResponsesApiSupport, try_to_responses_model};
 pub use tool_use::ToolUsingChat;
 pub use tool_use_responses::ToolUsingResponses;
+
+#[derive(Clone)]
+pub struct LlmRuntimeStores {
+    completion_llms: Arc<RwLock<LLMChatCompletionsModelStore>>,
+    responses_llms: Arc<RwLock<LLMResponsesModelStore>>,
+    rate_controllers: Arc<RwLock<HashMap<String, Arc<runtime_rate_control::RateController>>>>,
+    responses_api_support: Arc<RwLock<HashMap<String, ResponsesApiSupport>>>,
+}
+
+impl Default for LlmRuntimeStores {
+    fn default() -> Self {
+        Self {
+            completion_llms: Arc::new(RwLock::new(HashMap::new())),
+            responses_llms: Arc::new(RwLock::new(HashMap::new())),
+            rate_controllers: Arc::new(RwLock::new(HashMap::new())),
+            responses_api_support: Arc::new(RwLock::new(HashMap::new())),
+        }
+    }
+}
+
+impl LlmRuntimeStores {
+    #[must_use]
+    pub fn completion_llms(&self) -> Arc<RwLock<LLMChatCompletionsModelStore>> {
+        Arc::clone(&self.completion_llms)
+    }
+
+    #[must_use]
+    pub fn responses_llms(&self) -> Arc<RwLock<LLMResponsesModelStore>> {
+        Arc::clone(&self.responses_llms)
+    }
+
+    #[must_use]
+    pub fn rate_controllers(
+        &self,
+    ) -> Arc<RwLock<HashMap<String, Arc<runtime_rate_control::RateController>>>> {
+        Arc::clone(&self.rate_controllers)
+    }
+
+    #[must_use]
+    pub fn responses_api_support(&self) -> Arc<RwLock<HashMap<String, ResponsesApiSupport>>> {
+        Arc::clone(&self.responses_api_support)
+    }
+}
 
 use crate::DataFusion;
 

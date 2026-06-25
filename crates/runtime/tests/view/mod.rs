@@ -82,7 +82,7 @@ async fn accelerated_view_duckdb() -> Result<(), anyhow::Error> {
             let cloned_rt = Arc::clone(&rt);
 
             tokio::select! {
-                () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+                () = tokio::time::sleep(std::time::Duration::from_mins(1)) => {
                     return Err(anyhow::anyhow!("Timed out waiting for datasets to load"));
                 }
                 () = cloned_rt.load_components() => {}
@@ -226,7 +226,7 @@ async fn test_view_dependency_ordering() -> Result<(), anyhow::Error> {
             let cloned_rt = Arc::clone(&rt);
 
             tokio::select! {
-                () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+                () = tokio::time::sleep(std::time::Duration::from_mins(1)) => {
                     return Err(anyhow::anyhow!("Timed out waiting for views to load"));
                 }
                 () = cloned_rt.load_components() => {}
@@ -332,7 +332,7 @@ async fn test_view_depending_on_dataset() -> Result<(), anyhow::Error> {
             let cloned_rt = Arc::clone(&rt);
 
             tokio::select! {
-                () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+                () = tokio::time::sleep(std::time::Duration::from_mins(1)) => {
                     return Err(anyhow::anyhow!("Timed out waiting for views to load"));
                 }
                 () = cloned_rt.load_components() => {}
@@ -432,7 +432,7 @@ async fn test_multiple_views_same_dataset() -> Result<(), anyhow::Error> {
             let cloned_rt = Arc::clone(&rt);
 
             tokio::select! {
-                () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+                () = tokio::time::sleep(std::time::Duration::from_mins(1)) => {
                     return Err(anyhow::anyhow!("Timed out waiting for views to load"));
                 }
                 () = cloned_rt.load_components() => {}
@@ -782,7 +782,7 @@ async fn test_accelerated_view_on_zero_results_use_source() -> Result<(), anyhow
             let cloned_rt = Arc::clone(&rt);
 
             tokio::select! {
-                () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+                () = tokio::time::sleep(std::time::Duration::from_mins(1)) => {
                     return Err(anyhow::anyhow!("Timed out waiting for components to load"));
                 }
                 () = cloned_rt.load_components() => {}

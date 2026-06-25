@@ -52,11 +52,21 @@ use async_openai::{
 #[cfg(feature = "local_llm")]
 pub mod mistral;
 pub mod nsql;
+#[cfg(feature = "local_llm")]
+use crate::chat::distributed::configure_ring_distributed;
+#[cfg(feature = "local_llm")]
+pub use crate::chat::distributed::{DistributedBackend, DistributedConfig};
 use crate::streaming_utils::generate_stream_id;
 #[cfg(feature = "local_llm")]
 use indexmap::IndexMap;
 #[cfg(feature = "local_llm")]
 use mistralrs::MessageContent;
+
+// Distributed inference only matters for local mistral.rs models, so the module
+// (and its `configure_ring_distributed` helper) is gated on `local_llm` to avoid
+// dead-code in `--no-default-features` / feature-matrix builds.
+#[cfg(feature = "local_llm")]
+pub mod distributed;
 
 static WEIGHTS_EXTENSIONS: [&str; 7] = [
     ".safetensors",
@@ -686,6 +696,7 @@ pub trait Chat: Sync + Send {
         })? {
             Some(resp) => vec![ChatChoice {
                 message: ChatCompletionResponseMessage {
+                    reasoning_content: None,
                     content: Some(resp),
                     tool_calls: None,
                     role: Role::System,
@@ -721,6 +732,7 @@ pub trait Chat: Sync + Send {
 ///    be inferred from the `.model_type` key in a HF's `config.json`, or from the GGUF metadata.
 /// `from_gguf` is a path to a GGUF file within the huggingface model repo. If provided, the model will be loaded from this GGUF. This is useful for loading quantized models.
 /// `hf_token_literal` is a literal string of the Huggingface API token. If not provided, the token will be read from the HF token cache (i.e. `~/.cache/huggingface/token` or set via `HF_TOKEN_PATH`).
+/// `distributed` optionally runs the model tensor-parallel across multiple nodes.
 #[cfg(feature = "local_llm")]
 pub async fn create_hf_model(
     model_id: &str,
@@ -728,13 +740,28 @@ pub async fn create_hf_model(
     from_gguf: Option<PathBuf>,
     hf_token_literal: Option<&SecretString>,
     chat_template_literal: Option<&str>,
+    distributed: Option<DistributedConfig>,
 ) -> Result<Arc<dyn Chat>> {
+    // Configure multi-node distributed (ring) inference before loading: the
+    // loader reads `RING_CONFIG` from the environment while building the
+    // pipeline. The returned guard keeps the temp file alive for the model.
+    let ring_config = if let Some(cfg) = distributed {
+        Some(configure_ring_distributed(&cfg)?)
+    } else {
+        // Defensive: clear any `RING_CONFIG` left set by a prior distributed
+        // load in this process, so this single-node load can't accidentally
+        // run distributed.
+        // SAFETY: touched only during model init, before mistral.rs reads it.
+        unsafe { std::env::remove_var("RING_CONFIG") };
+        None
+    };
     mistral::MistralLlama::from_hf(
         model_id,
         model_type,
         hf_token_literal,
         from_gguf,
         chat_template_literal,
+        ring_config,
     )
     .await
     .map(|x| Arc::new(x) as Arc<dyn Chat>)
@@ -748,7 +775,21 @@ pub async fn create_local_model(
     tokenizer_config: Option<&str>,
     generation_config: Option<&str>,
     chat_template_literal: Option<&str>,
+    distributed: Option<DistributedConfig>,
 ) -> Result<Arc<dyn Chat>> {
+    // Configure multi-node distributed (ring) inference before loading: the
+    // loader reads `RING_CONFIG` from the environment while building the
+    // pipeline. The returned guard keeps the temp file alive for the model.
+    let ring_config = if let Some(cfg) = distributed {
+        Some(configure_ring_distributed(&cfg)?)
+    } else {
+        // Defensive: clear any `RING_CONFIG` left set by a prior distributed
+        // load in this process, so this single-node load can't accidentally
+        // run distributed.
+        // SAFETY: touched only during model init, before mistral.rs reads it.
+        unsafe { std::env::remove_var("RING_CONFIG") };
+        None
+    };
     mistral::MistralLlama::from(
         model_weights
             .iter()
@@ -762,6 +803,7 @@ pub async fn create_local_model(
         tokenizer_config.map(Path::new),
         generation_config.map(Path::new),
         chat_template_literal,
+        ring_config,
     )
     .await
     .map(|x| Arc::new(x) as Arc<dyn Chat>)

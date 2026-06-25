@@ -14,7 +14,7 @@ limitations under the License.
 //! Supports loading and saving snapshots of accelerated database files to and from object storage.
 
 use arrow_schema::{Schema, SchemaRef};
-use arrow_tools::schema::schema_difference;
+use arrow_tools::schema_evolution::{EvolutionContext, SchemaEvolution, WideningPlan, classify};
 use aws_sdk_credential_bridge::object_store_builder::{
     S3ObjectStoreBuilder, S3ObjectStoreBuilderError,
 };
@@ -22,8 +22,10 @@ use bytes::BytesMut;
 use chrono::{DateTime, Utc};
 use futures::StreamExt;
 use object_store::{
-    GetResult, ObjectStore, PutMode, PutPayload, UpdateVersion, path::Path as ObjectPath,
+    GetResult, ObjectStore, ObjectStoreExt, PutMode, PutPayload, UpdateVersion,
+    path::Path as ObjectPath,
 };
+use opentelemetry::KeyValue;
 use runtime_parameters::{ParameterSpec, Parameters};
 use runtime_secrets::{Secrets, get_params_with_secrets};
 use serde::{Deserialize, Serialize};
@@ -111,6 +113,44 @@ const SNAPSHOT_METADATA_FORMAT_VERSION: u32 = 1;
 const METADATA_FILE_NAME: &str = "metadata.json";
 const SNAPSHOT_CHECKSUM_ALGORITHM: &str = "SHA256";
 const NETWORK_RETRY_MAX: usize = 3;
+
+// Shared with the other schema-evolution emit sites. `runtime-acceleration` cannot
+// import the `runtime` crate's counters (it is a dependency of `runtime`), so the
+// instruments are defined locally but kept identical — same meter (`schema_evolution`),
+// name, and description — so telemetry backends that deduplicate by metric name see a
+// single consistent instrument.
+static SCHEMA_EVOLUTION_APPLIED: LazyLock<opentelemetry::metrics::Counter<u64>> =
+    LazyLock::new(|| {
+        opentelemetry::global::meter("schema_evolution")
+            .u64_counter("schema_evolution_applied")
+            .with_description(
+                "Schema evolutions applied to the accelerator or cached source schema.",
+            )
+            .build()
+    });
+
+static SCHEMA_EVOLUTION_DETECTED: LazyLock<opentelemetry::metrics::Counter<u64>> = LazyLock::new(
+    || {
+        opentelemetry::global::meter("schema_evolution")
+            .u64_counter("schema_evolution_detected")
+            .with_description(
+                "Schema changes detected between an incoming source schema and the stored/accelerator schema.",
+            )
+            .build()
+    },
+);
+
+/// The metric `kind` label for a widening plan, per the
+/// `schema_evolution_*{kind=...}` counter convention.
+fn widening_plan_kind(plan: &WideningPlan) -> &'static str {
+    if !plan.widened_columns.is_empty() {
+        "widened_types"
+    } else if !plan.relaxed_nullability.is_empty() {
+        "nullability"
+    } else {
+        "added_columns"
+    }
+}
 
 /// Returns `true` if the given object store error is likely transient and worth retrying.
 fn is_retriable_object_store_error(err: &object_store::Error) -> bool {
@@ -466,7 +506,7 @@ pub enum SnapshotUploadError {
     #[snafu(display("Snapshot metadata schema for dataset {dataset} is missing"))]
     UploadMetadataSchemaMissing { dataset: String },
     #[snafu(display(
-        "Schema mismatch for dataset {dataset}: existing snapshots are incompatible with the current schema. Snapshots don't support schema evolution. Delete the existing snapshots and restart the Spice runtime to rebuild them with the updated schema. {details}"
+        "Schema mismatch for dataset {dataset}: existing snapshots are incompatible with the current schema, and the change is not a lossless widening that snapshot schema versioning can record. Delete the existing snapshots and restart the Spice runtime to rebuild them with the updated schema. {details}"
     ))]
     UploadSchemaMismatch { dataset: String, details: String },
     #[snafu(display("Failed to copy local file from {source_path:?} to {dest_path:?}"))]
@@ -517,10 +557,11 @@ impl<'a> SnapshotPathLayout<'a> {
         let month_partition = format!("month={}", instant.format("%Y-%m"));
         let day_partition = format!("day={}", instant.format("%Y-%m-%d"));
         let dataset_partition = self.dataset_partition_raw();
-        base.child(month_partition)
-            .child(day_partition)
-            .child(dataset_partition)
-            .child(self.snapshot_filename(instant))
+        base.clone()
+            .join(month_partition)
+            .join(day_partition)
+            .join(dataset_partition)
+            .join(self.snapshot_filename(instant))
     }
 }
 
@@ -630,7 +671,7 @@ impl Not for &ForceCreate {
 
 impl SnapshotManager {
     fn metadata_path(&self) -> ObjectPath {
-        self.snapshots_location.child(METADATA_FILE_NAME)
+        self.snapshots_location.clone().join(METADATA_FILE_NAME)
     }
 
     fn metadata_path_display(&self) -> String {
@@ -1641,7 +1682,7 @@ impl SnapshotManager {
             .filter(|entry| Some(entry.snapshot_id) != dataset_metadata.current_snapshot_id)
             .cloned()
             .collect();
-        remaining.sort_by(|a, b| b.snapshot_id.cmp(&a.snapshot_id));
+        remaining.sort_by_key(|b| std::cmp::Reverse(b.snapshot_id));
         ordered_snapshots.extend(remaining);
 
         let current_engine = self.engine.to_string();
@@ -1847,9 +1888,50 @@ impl SnapshotManager {
             .map_err(|source| SnapshotDownloadError::CheckpointerSchema { source })?;
         let final_schema = if let Some(schema) = local_schema {
             if schema.as_ref() != metadata_schema.as_ref() {
-                return Err(SnapshotDownloadError::SchemaMismatch {
-                    dataset: self.dataset_name.clone(),
-                });
+                let ctx = EvolutionContext {
+                    constraint_columns: &[],
+                };
+                match classify(&schema, &metadata_schema, &ctx) {
+                    SchemaEvolution::Identical => {
+                        tracing::debug!(
+                            dataset = %self.dataset_name,
+                            snapshot = %entry.snapshot,
+                            "restored snapshot checkpoint schema differs from the metadata-recorded schema in field order, metadata, or nullability only; keeping the restored schema"
+                        );
+                    }
+                    // The restored file predates a widening schema evolution that a
+                    // later snapshot recorded; the acceleration is evolved back to
+                    // the current schema by startup re-classification when the
+                    // dataset registers.
+                    SchemaEvolution::Widening(plan) => {
+                        tracing::warn!(
+                            dataset = %self.dataset_name,
+                            snapshot = %entry.snapshot,
+                            snapshot_id = entry.snapshot_id,
+                            "restored a snapshot that predates a widening schema change ({}); the acceleration is re-evolved to the current schema when the dataset registers",
+                            plan.describe()
+                        );
+                        SCHEMA_EVOLUTION_DETECTED.add(
+                            1,
+                            &[
+                                KeyValue::new("dataset", self.dataset_name.clone()),
+                                KeyValue::new("kind", widening_plan_kind(&plan)),
+                                KeyValue::new("action", "snapshot_restore_pre_evolution"),
+                            ],
+                        );
+                    }
+                    SchemaEvolution::Incompatible { reason } => {
+                        tracing::warn!(
+                            dataset = %self.dataset_name,
+                            snapshot = %entry.snapshot,
+                            snapshot_id = entry.snapshot_id,
+                            "restored snapshot checkpoint schema is incompatible with the metadata-recorded schema: {reason}"
+                        );
+                        return Err(SnapshotDownloadError::SchemaMismatch {
+                            dataset: self.dataset_name.clone(),
+                        });
+                    }
+                }
             }
             schema
         } else {
@@ -2342,11 +2424,53 @@ impl SnapshotManager {
                     )?;
 
                 if metadata_schema.fields() != schema.fields() {
-                    let details = schema_difference(&metadata_schema, schema).unwrap_or_default();
-                    return Err(SnapshotUploadError::UploadSchemaMismatch {
-                        dataset: dataset_name.clone(),
-                        details,
-                    });
+                    let ctx = EvolutionContext {
+                        constraint_columns: &[],
+                    };
+                    match classify(&metadata_schema, schema, &ctx) {
+                        // Field order / metadata / nullability-tightening only - the
+                        // recorded schema remains canonical.
+                        SchemaEvolution::Identical => {}
+                        SchemaEvolution::Widening(plan) => {
+                            let next_schema_id = dataset_entry
+                                .schemas
+                                .iter()
+                                .map(|s| s.schema_id)
+                                .max()
+                                .map_or(0, |max_id| max_id + 1);
+                            let schema_metadata =
+                                SchemaMetadata::from_schema(next_schema_id, schema).map_err(
+                                    |source| SnapshotUploadError::UploadSchemaSerialize {
+                                        dataset: dataset_name.clone(),
+                                        source,
+                                    },
+                                )?;
+                            dataset_entry.schemas.push(schema_metadata);
+                            dataset_entry.current_schema_id = next_schema_id;
+                            tracing::info!(
+                                dataset = %dataset_name,
+                                schema_id = next_schema_id,
+                                "snapshot upload: dataset schema widened since the last snapshot ({}); appended a new schema version to the snapshot metadata",
+                                plan.describe()
+                            );
+                            // Emitted before the conditional metadata put; a
+                            // precondition-failure retry of this loop may re-emit.
+                            SCHEMA_EVOLUTION_APPLIED.add(
+                                1,
+                                &[
+                                    KeyValue::new("dataset", dataset_name.clone()),
+                                    KeyValue::new("kind", widening_plan_kind(&plan)),
+                                    KeyValue::new("action", "snapshot_schema_version_appended"),
+                                ],
+                            );
+                        }
+                        SchemaEvolution::Incompatible { reason } => {
+                            return Err(SnapshotUploadError::UploadSchemaMismatch {
+                                dataset: dataset_name.clone(),
+                                details: reason,
+                            });
+                        }
+                    }
                 }
             }
 
@@ -3221,7 +3345,7 @@ mod tests {
             )]),
         };
 
-        let metadata_path = base.child(METADATA_FILE_NAME);
+        let metadata_path = base.join(METADATA_FILE_NAME);
         write_metadata(&store, &metadata_path, &metadata).await;
 
         let temp_dir = TempDir::new().expect("create temp dir");
@@ -3288,7 +3412,7 @@ mod tests {
                 dataset_metadata(&schema, vec![entry], Some(7)),
             )]),
         };
-        let metadata_path = base.child(METADATA_FILE_NAME);
+        let metadata_path = base.join(METADATA_FILE_NAME);
         write_metadata(&store, &metadata_path, &metadata).await;
 
         let temp_dir = TempDir::new().expect("create temp dir");
@@ -3423,7 +3547,7 @@ mod tests {
             )]),
         };
 
-        let metadata_path = base.child(METADATA_FILE_NAME);
+        let metadata_path = base.join(METADATA_FILE_NAME);
         write_metadata(&store, &metadata_path, &metadata).await;
 
         let temp_dir = TempDir::new().expect("create temp dir");
@@ -3489,7 +3613,7 @@ mod tests {
             .expect("read stored snapshot");
         assert_eq!(stored_bytes.as_ref(), contents.as_slice());
 
-        let metadata_path = Path::from(SNAPSHOT_BASE_PATH).child(METADATA_FILE_NAME);
+        let metadata_path = Path::from(SNAPSHOT_BASE_PATH).join(METADATA_FILE_NAME);
         let metadata_bytes = store
             .get(&metadata_path)
             .await
@@ -3523,6 +3647,157 @@ mod tests {
             .to_schema_ref()
             .expect("deserialize schema");
         assert_eq!(metadata_schema.as_ref(), schema.as_ref());
+    }
+
+    #[cfg(feature = "duckdb")]
+    async fn read_dataset_metadata(store: &InMemory) -> DatasetMetadata {
+        let metadata_path = Path::from(SNAPSHOT_BASE_PATH).join(METADATA_FILE_NAME);
+        let metadata_bytes = store
+            .get(&metadata_path)
+            .await
+            .expect("metadata stored")
+            .bytes()
+            .await
+            .expect("read metadata");
+        let metadata: SnapshotMetadata =
+            serde_json::from_slice(&metadata_bytes).expect("parse metadata");
+        metadata
+            .datasets
+            .get(DATASET_NAME)
+            .expect("dataset metadata present")
+            .clone()
+    }
+
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn create_snapshot_appends_schema_version_on_widening() {
+        let store = Arc::new(InMemory::new());
+        let contents = b"snapshot-bytes".to_vec();
+        let mut temp_file = NamedTempFile::new().expect("create temp file");
+        temp_file.write_all(&contents).expect("write temp snapshot");
+        temp_file.flush().expect("flush temp snapshot");
+        let temp_path = temp_file.into_temp_path();
+        let local_path = temp_path.to_path_buf();
+
+        let schema = sample_schema();
+        let manager = build_manager(
+            Arc::clone(&store),
+            local_path.clone(),
+            BootstrapOnFailureBehavior::Fallback,
+            &schema,
+            false,
+        );
+
+        let mutex = Arc::new(Mutex::new(()));
+        manager
+            .create_snapshot(
+                &schema,
+                Arc::clone(&mutex).lock_owned().await,
+                None,
+                None,
+                ForceCreate(true),
+            )
+            .await
+            .expect("create snapshot")
+            .expect("snapshot should be created");
+
+        // The dataset schema widened: a new nullable column was appended.
+        let widened_schema: SchemaRef = Arc::new(Schema::new(vec![
+            Field::new("value", DataType::Int64, false),
+            Field::new("extra", DataType::Utf8, true),
+        ]));
+        manager
+            .create_snapshot(
+                &widened_schema,
+                Arc::clone(&mutex).lock_owned().await,
+                None,
+                None,
+                ForceCreate(true),
+            )
+            .await
+            .expect("create widened snapshot")
+            .expect("widened snapshot should be created");
+
+        let dataset = read_dataset_metadata(&store).await;
+        assert_eq!(dataset.schemas.len(), 2, "a schema version was appended");
+        assert_eq!(dataset.current_schema_id, 1);
+        assert_eq!(dataset.snapshots.len(), 2);
+        let current_schema = dataset
+            .current_schema()
+            .expect("current schema")
+            .to_schema_ref()
+            .expect("deserialize schema");
+        assert_eq!(current_schema.as_ref(), widened_schema.as_ref());
+        // The original schema version is preserved for older snapshots.
+        let original = dataset
+            .schemas
+            .iter()
+            .find(|s| s.schema_id == 0)
+            .expect("original schema version retained")
+            .to_schema_ref()
+            .expect("deserialize original schema");
+        assert_eq!(original.as_ref(), schema.as_ref());
+    }
+
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn create_snapshot_rejects_non_widening_schema_change() {
+        let store = Arc::new(InMemory::new());
+        let contents = b"snapshot-bytes".to_vec();
+        let mut temp_file = NamedTempFile::new().expect("create temp file");
+        temp_file.write_all(&contents).expect("write temp snapshot");
+        temp_file.flush().expect("flush temp snapshot");
+        let temp_path = temp_file.into_temp_path();
+        let local_path = temp_path.to_path_buf();
+
+        let schema = sample_schema();
+        let manager = build_manager(
+            Arc::clone(&store),
+            local_path.clone(),
+            BootstrapOnFailureBehavior::Fallback,
+            &schema,
+            false,
+        );
+
+        let mutex = Arc::new(Mutex::new(()));
+        manager
+            .create_snapshot(
+                &schema,
+                Arc::clone(&mutex).lock_owned().await,
+                None,
+                None,
+                ForceCreate(true),
+            )
+            .await
+            .expect("create snapshot")
+            .expect("snapshot should be created");
+
+        // `value` changed type non-losslessly: Int64 -> Utf8.
+        let incompatible_schema: SchemaRef = Arc::new(Schema::new(vec![Field::new(
+            "value",
+            DataType::Utf8,
+            false,
+        )]));
+        let result = manager
+            .create_snapshot(
+                &incompatible_schema,
+                Arc::clone(&mutex).lock_owned().await,
+                None,
+                None,
+                ForceCreate(true),
+            )
+            .await;
+        assert!(
+            matches!(
+                result,
+                Err(SnapshotUploadError::UploadSchemaMismatch { .. })
+            ),
+            "expected UploadSchemaMismatch, got: {result:?}"
+        );
+
+        let dataset = read_dataset_metadata(&store).await;
+        assert_eq!(dataset.schemas.len(), 1, "no schema version was appended");
+        assert_eq!(dataset.current_schema_id, 0);
     }
 
     #[tokio::test]
@@ -3563,7 +3838,7 @@ mod tests {
             .expect("snapshot should be created");
 
         // Read and verify metadata
-        let metadata_path = Path::from(SNAPSHOT_BASE_PATH).child(METADATA_FILE_NAME);
+        let metadata_path = Path::from(SNAPSHOT_BASE_PATH).join(METADATA_FILE_NAME);
         let metadata_bytes = store
             .get(&metadata_path)
             .await
@@ -3617,7 +3892,7 @@ mod tests {
             .expect("snapshot should be created");
 
         // Read and verify metadata
-        let metadata_path = Path::from(SNAPSHOT_BASE_PATH).child(METADATA_FILE_NAME);
+        let metadata_path = Path::from(SNAPSHOT_BASE_PATH).join(METADATA_FILE_NAME);
         let metadata_bytes = store
             .get(&metadata_path)
             .await
@@ -3915,6 +4190,90 @@ mod tests {
         ));
     }
 
+    /// A restored snapshot whose checkpoint schema predates a widening schema
+    /// change (the metadata-recorded current schema is wider) is accepted:
+    /// startup re-classification evolves the restored acceleration afterwards.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn download_snapshot_entry_accepts_pre_evolution_snapshot() {
+        let store = Arc::new(InMemory::new());
+        let base = Path::from(SNAPSHOT_BASE_PATH);
+        let layout = SnapshotPathLayout::new(DATASET_NAME, &AccelerationEngine::DuckDB);
+        let instant = Utc
+            .with_ymd_and_hms(2025, 6, 1, 12, 0, 0)
+            .single()
+            .expect("valid time");
+        let location = layout.build_location(&base, instant);
+
+        let contents = Bytes::from_static(b"pre-evolution-bytes");
+        store
+            .put(&location, contents.clone().into())
+            .await
+            .expect("write snapshot");
+
+        // The restored file's checkpoint carries the pre-evolution schema; the
+        // metadata current schema has since widened with an added nullable column.
+        let restored_schema = sample_schema();
+        let widened_schema: SchemaRef = Arc::new(Schema::new(vec![
+            Field::new("value", DataType::Int64, false),
+            Field::new("extra", DataType::Utf8, true),
+        ]));
+        let checksum = compute_sha256_hex(contents.as_ref());
+        let entry = SnapshotEntry {
+            snapshot_id: 3,
+            timestamp_ms: instant.timestamp_millis(),
+            snapshot: snapshot_uri(&location),
+            snapshot_checksum: checksum,
+            snapshot_checksum_algorithm: SNAPSHOT_CHECKSUM_ALGORITHM.to_string(),
+            snapshot_size: contents.len() as u64,
+            snapshot_engine: None,
+            snapshot_row_count: None,
+            snapshot_last_updated_at_ms: None,
+        };
+        let metadata = DatasetMetadata {
+            name: DATASET_NAME.to_string(),
+            engine: None,
+            schemas: vec![
+                SchemaMetadata::from_schema(0, &restored_schema).expect("serialize schema"),
+                SchemaMetadata::from_schema(1, &widened_schema).expect("serialize schema"),
+            ],
+            current_schema_id: 1,
+            snapshots: vec![entry.clone()],
+            current_snapshot_id: Some(3),
+            ..Default::default()
+        };
+
+        let temp_dir = TempDir::new().expect("create temp dir");
+        let local_path = temp_dir.path().join("snapshot.db");
+
+        let manager = build_manager(
+            Arc::clone(&store),
+            local_path.clone(),
+            BootstrapOnFailureBehavior::Warn,
+            &restored_schema,
+            false,
+        );
+        let factory = Arc::clone(
+            manager
+                .checkpointer_factory
+                .as_ref()
+                .expect("factory present"),
+        );
+
+        let info = manager
+            .download_snapshot_entry(&entry, &metadata, factory)
+            .await
+            .expect("pre-evolution snapshot should be accepted");
+
+        assert_eq!(info.snapshot_id, 3);
+        assert_eq!(
+            info.schema.as_ref(),
+            restored_schema.as_ref(),
+            "the restored (pre-evolution) schema is the source of truth for the local file"
+        );
+        assert!(local_path.exists(), "snapshot file restored locally");
+    }
+
     #[cfg(feature = "duckdb")]
     #[tokio::test]
     async fn download_snapshot_entry_rejects_engine_mismatch() {
@@ -4063,7 +4422,7 @@ mod tests {
             )]),
         };
 
-        let metadata_path = base.child(METADATA_FILE_NAME);
+        let metadata_path = base.join(METADATA_FILE_NAME);
         write_metadata(&store, &metadata_path, &metadata).await;
 
         let temp_dir = TempDir::new().expect("create temp dir");
@@ -4136,7 +4495,7 @@ mod tests {
             )]),
         };
 
-        let metadata_path = base.child(METADATA_FILE_NAME);
+        let metadata_path = base.join(METADATA_FILE_NAME);
         write_metadata(&store, &metadata_path, &metadata).await;
 
         let temp_dir = TempDir::new().expect("create temp dir");
@@ -4242,7 +4601,7 @@ mod tests {
             )]),
         };
 
-        let metadata_path = base.child(METADATA_FILE_NAME);
+        let metadata_path = base.join(METADATA_FILE_NAME);
         write_metadata(&store, &metadata_path, &metadata).await;
 
         let temp_dir = TempDir::new().expect("create temp dir");
@@ -4387,7 +4746,7 @@ mod tests {
         );
 
         // Verify metadata was updated correctly
-        let metadata_path = Path::from(SNAPSHOT_BASE_PATH).child(METADATA_FILE_NAME);
+        let metadata_path = Path::from(SNAPSHOT_BASE_PATH).join(METADATA_FILE_NAME);
         let metadata_bytes = store
             .get(&metadata_path)
             .await
@@ -4493,7 +4852,7 @@ mod tests {
             .expect("read stored snapshot");
 
         // Verify metadata was created
-        let metadata_path = Path::from(SNAPSHOT_BASE_PATH).child(METADATA_FILE_NAME);
+        let metadata_path = Path::from(SNAPSHOT_BASE_PATH).join(METADATA_FILE_NAME);
         let metadata_bytes = store
             .get(&metadata_path)
             .await
@@ -4557,7 +4916,7 @@ mod tests {
             )]),
         };
 
-        let metadata_path = base.child(METADATA_FILE_NAME);
+        let metadata_path = base.join(METADATA_FILE_NAME);
         write_metadata(&store, &metadata_path, &metadata).await;
 
         let temp_dir = TempDir::new().expect("create temp dir");
@@ -5002,7 +5361,7 @@ mod tests {
         let local_path = temp_path.to_path_buf();
 
         // Create metadata with a different dataset (not our test dataset)
-        let metadata_path = Path::from(SNAPSHOT_BASE_PATH).child(METADATA_FILE_NAME);
+        let metadata_path = Path::from(SNAPSHOT_BASE_PATH).join(METADATA_FILE_NAME);
         let mut metadata = SnapshotMetadata::empty(SNAPSHOT_URI_PREFIX.to_string(), 0);
         metadata.datasets.insert(
             "other_dataset".to_string(),
@@ -5045,7 +5404,7 @@ mod tests {
 
         // Create metadata that claims snapshots exist, but don't actually create the files
         let schema = sample_schema();
-        let metadata_path = Path::from(SNAPSHOT_BASE_PATH).child(METADATA_FILE_NAME);
+        let metadata_path = Path::from(SNAPSHOT_BASE_PATH).join(METADATA_FILE_NAME);
         let mut metadata = SnapshotMetadata::empty(SNAPSHOT_URI_PREFIX.to_string(), 0);
         let schema_metadata =
             SchemaMetadata::from_schema(0, &schema).expect("schema serialization");
@@ -5138,7 +5497,7 @@ mod tests {
     async fn get_snapshot_summary_returns_snapshots_from_metadata() {
         let store = Arc::new(InMemory::new());
         let base = Path::from(SNAPSHOT_BASE_PATH);
-        let metadata_path = base.child(METADATA_FILE_NAME);
+        let metadata_path = base.join(METADATA_FILE_NAME);
 
         let snapshot_entry = SnapshotEntry {
             snapshot_id: 100,
@@ -5206,7 +5565,7 @@ mod tests {
     async fn get_snapshot_summary_returns_missing_snapshot_with_empty_status() {
         let store = Arc::new(InMemory::new());
         let base = Path::from(SNAPSHOT_BASE_PATH);
-        let metadata_path = base.child(METADATA_FILE_NAME);
+        let metadata_path = base.join(METADATA_FILE_NAME);
 
         let existing_entry = SnapshotEntry {
             snapshot_id: 1,
@@ -5292,7 +5651,7 @@ mod tests {
     async fn get_snapshot_summary_returns_unverified_when_size_mismatches() {
         let store = Arc::new(InMemory::new());
         let base = Path::from(SNAPSHOT_BASE_PATH);
-        let metadata_path = base.child(METADATA_FILE_NAME);
+        let metadata_path = base.join(METADATA_FILE_NAME);
 
         let entry = SnapshotEntry {
             snapshot_id: 1,
@@ -5355,7 +5714,7 @@ mod tests {
     async fn get_snapshot_summary_respects_limit() {
         let store = Arc::new(InMemory::new());
         let base = Path::from(SNAPSHOT_BASE_PATH);
-        let metadata_path = base.child(METADATA_FILE_NAME);
+        let metadata_path = base.join(METADATA_FILE_NAME);
 
         let mut snapshots = Vec::new();
         for i in 0..5u64 {
@@ -5419,7 +5778,7 @@ mod tests {
     async fn get_snapshot_returns_snapshot_when_exists() {
         let store = Arc::new(InMemory::new());
         let base = Path::from(SNAPSHOT_BASE_PATH);
-        let metadata_path = base.child(METADATA_FILE_NAME);
+        let metadata_path = base.join(METADATA_FILE_NAME);
 
         let snapshot_entry = SnapshotEntry {
             snapshot_id: 200,
@@ -5472,7 +5831,7 @@ mod tests {
     async fn get_snapshot_returns_error_when_snapshot_not_found() {
         let store = Arc::new(InMemory::new());
         let base = Path::from(SNAPSHOT_BASE_PATH);
-        let metadata_path = base.child(METADATA_FILE_NAME);
+        let metadata_path = base.join(METADATA_FILE_NAME);
 
         let mut datasets = HashMap::new();
         datasets.insert(
@@ -5521,7 +5880,7 @@ mod tests {
     async fn set_current_snapshot_updates_metadata() {
         let store = Arc::new(InMemory::new());
         let base = Path::from(SNAPSHOT_BASE_PATH);
-        let metadata_path = base.child(METADATA_FILE_NAME);
+        let metadata_path = base.join(METADATA_FILE_NAME);
 
         let snapshot_entry1 = SnapshotEntry {
             snapshot_id: 100,
@@ -5622,7 +5981,7 @@ mod tests {
     async fn set_current_snapshot_returns_error_when_snapshot_not_found() {
         let store = Arc::new(InMemory::new());
         let base = Path::from(SNAPSHOT_BASE_PATH);
-        let metadata_path = base.child(METADATA_FILE_NAME);
+        let metadata_path = base.join(METADATA_FILE_NAME);
 
         let snapshot_entry = SnapshotEntry {
             snapshot_id: 100,
@@ -5685,7 +6044,7 @@ mod tests {
     async fn get_snapshot_summary_returns_error_on_unsupported_version() {
         let store = Arc::new(InMemory::new());
         let base = Path::from(SNAPSHOT_BASE_PATH);
-        let metadata_path = base.child(METADATA_FILE_NAME);
+        let metadata_path = base.join(METADATA_FILE_NAME);
 
         // Create metadata with unsupported version
         let metadata_json = serde_json::json!({
@@ -5712,7 +6071,7 @@ mod tests {
     async fn get_snapshot_summary_returns_empty_when_dataset_not_in_metadata() {
         let store = Arc::new(InMemory::new());
         let base = Path::from(SNAPSHOT_BASE_PATH);
-        let metadata_path = base.child(METADATA_FILE_NAME);
+        let metadata_path = base.join(METADATA_FILE_NAME);
 
         // Create metadata without our dataset
         let metadata = SnapshotMetadata {
@@ -5776,7 +6135,7 @@ mod tests {
     async fn has_existing_snapshots_returns_false_when_metadata_has_no_snapshots() {
         let store = Arc::new(InMemory::new());
         let base = Path::from(SNAPSHOT_BASE_PATH);
-        let metadata_path = base.child(METADATA_FILE_NAME);
+        let metadata_path = base.join(METADATA_FILE_NAME);
 
         // Create metadata with dataset but no snapshots
         let mut metadata = SnapshotMetadata::empty(SNAPSHOT_URI_PREFIX.to_string(), 0);
@@ -5803,7 +6162,7 @@ mod tests {
     async fn has_existing_snapshots_returns_false_when_metadata_has_snapshots_but_files_missing() {
         let store = Arc::new(InMemory::new());
         let base = Path::from(SNAPSHOT_BASE_PATH);
-        let metadata_path = base.child(METADATA_FILE_NAME);
+        let metadata_path = base.join(METADATA_FILE_NAME);
 
         // Create metadata claiming snapshots exist
         let mut metadata = SnapshotMetadata::empty(SNAPSHOT_URI_PREFIX.to_string(), 0);
@@ -5843,14 +6202,14 @@ mod tests {
     async fn has_existing_snapshots_returns_true_when_metadata_and_files_exist() {
         let store = Arc::new(InMemory::new());
         let base = Path::from(SNAPSHOT_BASE_PATH);
-        let metadata_path = base.child(METADATA_FILE_NAME);
+        let metadata_path = base.clone().join(METADATA_FILE_NAME);
 
         // Create the actual snapshot file
         let snapshot_path = base
-            .child("month=2025-01")
-            .child("day=2025-01-01")
-            .child("dataset=foo")
-            .child("foo.db");
+            .join("month=2025-01")
+            .join("day=2025-01-01")
+            .join("dataset=foo")
+            .join("foo.db");
         store
             .put(&snapshot_path, Bytes::from_static(b"snapshot data").into())
             .await
@@ -5899,14 +6258,14 @@ mod tests {
     async fn has_existing_snapshots_does_not_match_dataset_name_prefix() {
         let store = Arc::new(InMemory::new());
         let base = Path::from(SNAPSHOT_BASE_PATH);
-        let metadata_path = base.child(METADATA_FILE_NAME);
+        let metadata_path = base.clone().join(METADATA_FILE_NAME);
 
         // Create a snapshot file for "foobar" dataset (NOT "foo")
         let snapshot_path = base
-            .child("month=2025-01")
-            .child("day=2025-01-01")
-            .child("dataset=foobar") // Note: "foobar", not "foo"
-            .child("foobar.db");
+            .join("month=2025-01")
+            .join("day=2025-01-01")
+            .join("dataset=foobar") // Note: "foobar", not "foo"
+            .join("foobar.db");
         store
             .put(&snapshot_path, Bytes::from_static(b"snapshot data").into())
             .await
@@ -5989,14 +6348,14 @@ mod tests {
     async fn has_existing_snapshots_does_not_match_dataset_name_suffix() {
         let store = Arc::new(InMemory::new());
         let base = Path::from(SNAPSHOT_BASE_PATH);
-        let metadata_path = base.child(METADATA_FILE_NAME);
+        let metadata_path = base.clone().join(METADATA_FILE_NAME);
 
         // Create a snapshot file for "foobar" dataset
         let snapshot_path = base
-            .child("month=2025-01")
-            .child("day=2025-01-01")
-            .child("dataset=foobar")
-            .child("foobar.db");
+            .join("month=2025-01")
+            .join("day=2025-01-01")
+            .join("dataset=foobar")
+            .join("foobar.db");
         store
             .put(&snapshot_path, Bytes::from_static(b"snapshot data").into())
             .await
@@ -6084,7 +6443,7 @@ mod tests {
     async fn metadata_updates_in_place_with_new_fields() {
         let store = Arc::new(InMemory::new());
         let base = Path::from(SNAPSHOT_BASE_PATH);
-        let metadata_path = base.child(METADATA_FILE_NAME);
+        let metadata_path = base.join(METADATA_FILE_NAME);
 
         // Create old-format metadata without engine fields
         // Note: datasets are flattened at the top level

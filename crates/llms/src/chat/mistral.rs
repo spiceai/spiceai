@@ -67,6 +67,11 @@ const LOCAL_LLM_MAX_SEQS: NonZeroUsize = NonZeroUsize::MIN.saturating_add(4);
 pub struct MistralLlama {
     pipeline: Arc<MistralRs>,
     counter: AtomicUsize,
+    /// RAII drop guard that keeps the per-node `RING_CONFIG` temp file alive for
+    /// the model's lifetime (its `Drop` deletes the file on model teardown).
+    /// `None` for single-node models. Never read directly.
+    #[expect(dead_code)]
+    ring_config: Option<tempfile::TempPath>,
 }
 
 fn to_openai_response(
@@ -86,6 +91,7 @@ impl MistralLlama {
         tokenizer_config: Option<&Path>,
         generation_config: Option<&Path>,
         chat_template_literal: Option<&str>,
+        ring_config_path: Option<tempfile::TempPath>,
     ) -> Result<Self> {
         for weight in model_weights {
             if !weight.exists() {
@@ -163,7 +169,7 @@ impl MistralLlama {
             )?,
         };
 
-        Ok(Self::from_pipeline(pipeline, paged_attn_requested).await)
+        Ok(Self::from_pipeline(pipeline, paged_attn_requested, ring_config_path).await)
     }
 
     /// Create paths object, [`ModelPaths`], to create new [`MistralLlama`].
@@ -382,6 +388,7 @@ impl MistralLlama {
         hf_token_literal: Option<&SecretString>,
         gguf_filename: Option<PathBuf>,
         chat_template_literal: Option<&str>,
+        ring_config_path: Option<tempfile::TempPath>,
     ) -> Result<Self> {
         let model_parts: Vec<&str> = model_id.split(':').collect();
         let chat_template = chat_template_literal.map(ToString::to_string);
@@ -460,6 +467,7 @@ impl MistralLlama {
 
         let paged_attn_config = Self::paged_attention_config(&device);
         let paged_attn_requested = paged_attn_config.is_some();
+
         let pipeline = loader?
             .load_model_from_hf(
                 model_parts.get(1).map(|&x| x.to_string()),
@@ -473,12 +481,13 @@ impl MistralLlama {
             )
             .map_err(|e| ChatError::FailedToLoadModel { source: e.into() })?;
 
-        Ok(Self::from_pipeline(pipeline, paged_attn_requested).await)
+        Ok(Self::from_pipeline(pipeline, paged_attn_requested, ring_config_path).await)
     }
 
     async fn from_pipeline(
         pipeline: Arc<tokio::sync::Mutex<dyn Pipeline + Sync + Send>>,
         paged_attn_requested: bool,
+        ring_config: Option<tempfile::TempPath>,
     ) -> Self {
         let scheduler_config = Self::scheduler_config(&pipeline, paged_attn_requested).await;
         Self {
@@ -486,6 +495,7 @@ impl MistralLlama {
                 .build()
                 .await,
             counter: AtomicUsize::new(0),
+            ring_config,
         }
     }
 

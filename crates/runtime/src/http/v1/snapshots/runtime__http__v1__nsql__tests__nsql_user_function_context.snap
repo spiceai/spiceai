@@ -1,0 +1,8 @@
+---
+source: crates/runtime/src/http/v1/nsql.rs
+expression: output
+---
+
+### User-defined functions
+- `Haversine_Km`: scalar function from `sql` with `stable` volatility. Syntax: `Haversine_Km(x int64) -> int64`. Haversine_Km description
+- `Rows_Fn`: table function from `sql` with `stable` volatility. Syntax: `Rows_Fn(x int64) -> TABLE(value int64)`. Rows_Fn description

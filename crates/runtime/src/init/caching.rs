@@ -69,7 +69,7 @@ impl Runtime {
             Ok(hash_builder) => {
                 let plans_cache_provider = Arc::new(SimpleCache::new(
                     DEFAULT_CACHED_PLANS_MAX_CAPACITY,
-                    Duration::from_secs(3600),
+                    Duration::from_hours(1),
                     hash_builder,
                 ))
                 .as_tabled_provider();

@@ -350,6 +350,8 @@ pub struct Acceleration {
 
     pub on_conflict: HashMap<ColumnReference, OnConflictBehavior>,
 
+    pub maintained_aggregates: spicepod_acceleration::MaintainedAggregates,
+
     pub write_mode: spicepod_acceleration::WriteMode,
 
     pub storage_profile: StorageProfile,
@@ -556,6 +558,7 @@ impl TryFrom<spicepod_acceleration::Acceleration> for Acceleration {
             indexes,
             primary_key,
             on_conflict,
+            maintained_aggregates: acceleration.maintained_aggregates,
             write_mode: acceleration.write_mode,
             storage_profile: StorageProfile::from(acceleration.storage_profile),
             partition_by: acceleration.partition_by,
@@ -600,6 +603,7 @@ impl Default for Acceleration {
             indexes: HashMap::default(),
             primary_key: None,
             on_conflict: HashMap::default(),
+            maintained_aggregates: spicepod_acceleration::MaintainedAggregates::default(),
             write_mode: spicepod_acceleration::WriteMode::default(),
             storage_profile: StorageProfile::default(),
             disable_federation: false,
@@ -800,5 +804,27 @@ mod tests {
 
         let parsed = Acceleration::try_from(acceleration).expect("acceleration should parse");
         assert_eq!(parsed.storage_profile, StorageProfile::Ebs);
+    }
+
+    #[test]
+    fn test_maintained_aggregates_are_preserved_from_spicepod_acceleration() {
+        let maintained = spicepod_acceleration::MaintainedAggregate {
+            group_by: vec!["customer_id".to_string()],
+            aggregates: vec![spicepod_acceleration::MaintainedAggregateExpr {
+                function: spicepod_acceleration::MaintainedAggregateFunction::Count,
+                column: None,
+            }],
+        };
+        let acceleration = spicepod_acceleration::Acceleration {
+            maintained_aggregates: spicepod_acceleration::MaintainedAggregates::new(
+                spicepod_acceleration::MaintainAggregates::Disabled,
+                vec![maintained.clone()],
+            ),
+            ..Default::default()
+        };
+
+        let parsed = Acceleration::try_from(acceleration).expect("acceleration should parse");
+        assert_eq!(parsed.maintained_aggregates.as_slice(), &[maintained]);
+        assert!(!parsed.maintained_aggregates.is_enabled());
     }
 }

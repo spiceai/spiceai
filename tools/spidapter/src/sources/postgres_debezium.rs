@@ -218,7 +218,7 @@ async fn wait_for_connector_running(
     connector_name: &str,
 ) -> anyhow::Result<()> {
     let status_url = format!("{connect_url}/connectors/{connector_name}/status");
-    let timeout = Duration::from_secs(120);
+    let timeout = Duration::from_mins(2);
     let started = tokio::time::Instant::now();
 
     eprintln!(
@@ -364,6 +364,7 @@ pub(crate) fn generate_postgres_debezium_spicepod(
             refresh_mode: Some(RefreshMode::Changes),
             primary_key,
             on_conflict,
+            params: super::cayenne_acceleration_params(acceleration_engine),
             ..Acceleration::default()
         });
 

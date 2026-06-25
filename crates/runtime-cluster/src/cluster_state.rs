@@ -32,7 +32,9 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use object_store::path::Path;
-use object_store::{Error as ObjectStoreError, ObjectStore, PutMode, PutOptions, UpdateVersion};
+use object_store::{
+    Error as ObjectStoreError, ObjectStore, ObjectStoreExt, PutMode, PutOptions, UpdateVersion,
+};
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use snafu::{ResultExt, Snafu};

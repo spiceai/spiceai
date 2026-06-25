@@ -265,7 +265,7 @@ async fn all_available_tools(
 
     let default_catalog_names = default_catalog_names();
     let mut tool_entries = all_tools.iter().collect::<Vec<_>>();
-    tool_entries.sort_by(|(left_name, _), (right_name, _)| left_name.cmp(right_name));
+    tool_entries.sort_by_key(|(left_name, _)| *left_name);
 
     for (tool_name, tooling) in tool_entries {
         if BuiltinToolCatalog::is_builtin_tool(tool_name) {

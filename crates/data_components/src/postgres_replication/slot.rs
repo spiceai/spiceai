@@ -36,6 +36,12 @@ pub struct SlotInfo {
     pub consistent_lsn: u64,
     pub snapshot_name: Option<String>,
     pub created_fresh: bool,
+    /// `GENERATED` columns of the source table. Postgres does not publish
+    /// generated columns over logical replication (they are absent from
+    /// pgoutput `Relation` messages), so the WAL path must tolerate their
+    /// absence — the initial snapshot still captures their values, but
+    /// replicated changes apply them as NULL.
+    pub generated_columns: Vec<String>,
 }
 
 pub type SlotSetupOutcome = SlotInfo;
@@ -71,34 +77,68 @@ pub async fn setup_slot_and_publication(
     .await
 }
 
+/// Setup outcome for one member table of a *shared* replication slot.
+#[derive(Clone, Debug)]
+pub struct SharedMemberSetup {
+    pub slot: SlotInfo,
+    /// Whether this call newly added the member's table to the shared
+    /// publication (or created the publication with it). When `true`, the
+    /// member's table has no WAL history on this slot before now and needs an
+    /// initial snapshot.
+    pub table_added: bool,
+    /// `GENERATED` columns of this member's table — see
+    /// [`SlotInfo::generated_columns`].
+    pub generated_columns: Vec<String>,
+}
+
+/// Idempotent setup for one member of a shared slot: validates the table's
+/// replica identity, adds it to the shared publication, and creates the slot
+/// if this is the first member to arrive.
+///
+/// Unlike [`setup_slot_and_publication`], an existing slot is never treated as
+/// owned by the member — `created_fresh` describes the slot itself, and the
+/// caller combines it with `table_added` to decide whether this member needs
+/// a snapshot.
+pub async fn setup_shared_member(
+    params: &ReplicationParams,
+    schema_name: &str,
+    table_name: &str,
+) -> Result<SharedMemberSetup> {
+    super::resilience::retry_async(
+        "postgres_replication::setup_shared_member",
+        super::resilience::DEFAULT_SETUP_MAX_ELAPSED,
+        is_transient_setup_error,
+        || async {
+            let (client, conn_task) = connect_setup(params).await?;
+            let outcome = async {
+                validate_replica_identity(&client, schema_name, table_name).await?;
+                let generated_columns =
+                    fetch_generated_columns(&client, schema_name, table_name).await?;
+                let table_added =
+                    ensure_publication(&client, &params.publication_name, schema_name, table_name)
+                        .await?;
+                let slot = ensure_slot(&client, params).await?;
+                Ok(SharedMemberSetup {
+                    slot,
+                    table_added,
+                    generated_columns,
+                })
+            }
+            .await;
+            drop(client);
+            let _ = conn_task.await;
+            outcome
+        },
+    )
+    .await
+}
+
 async fn setup_once(
     params: &ReplicationParams,
     schema_name: &str,
     table_name: &str,
 ) -> Result<SlotInfo> {
-    let cfg = params.setup_pg_config();
-    let tls = params
-        .native_tls_connector()
-        .await
-        .context(TlsConfigSnafu)?;
-
-    let (client, conn_task) = if let Some(connector) = tls {
-        let (client, connection) = cfg.connect(connector).await.context(SetupConnectSnafu)?;
-        let task = tokio::spawn(async move {
-            if let Err(e) = connection.await {
-                tracing::warn!("postgres setup connection terminated: {e}");
-            }
-        });
-        (client, task)
-    } else {
-        let (client, connection) = cfg.connect(NoTls).await.context(SetupConnectSnafu)?;
-        let task = tokio::spawn(async move {
-            if let Err(e) = connection.await {
-                tracing::warn!("postgres setup connection terminated: {e}");
-            }
-        });
-        (client, task)
-    };
+    let (client, conn_task) = connect_setup(params).await?;
 
     let outcome = do_setup(&client, params, schema_name, table_name).await;
 
@@ -106,6 +146,36 @@ async fn setup_once(
     let _ = conn_task.await;
 
     outcome
+}
+
+/// Open a regular (non-replication) connection for setup queries, spawning the
+/// connection driver task.
+async fn connect_setup(
+    params: &ReplicationParams,
+) -> Result<(tokio_postgres::Client, tokio::task::JoinHandle<()>)> {
+    let cfg = params.setup_pg_config();
+    let tls = params
+        .native_tls_connector()
+        .await
+        .context(TlsConfigSnafu)?;
+
+    if let Some(connector) = tls {
+        let (client, connection) = cfg.connect(connector).await.context(SetupConnectSnafu)?;
+        let task = tokio::spawn(async move {
+            if let Err(e) = connection.await {
+                tracing::warn!("postgres setup connection terminated: {e}");
+            }
+        });
+        Ok((client, task))
+    } else {
+        let (client, connection) = cfg.connect(NoTls).await.context(SetupConnectSnafu)?;
+        let task = tokio::spawn(async move {
+            if let Err(e) = connection.await {
+                tracing::warn!("postgres setup connection terminated: {e}");
+            }
+        });
+        Ok((client, task))
+    }
 }
 
 fn is_transient_setup_error(e: &super::Error) -> bool {
@@ -126,8 +196,43 @@ async fn do_setup(
     table_name: &str,
 ) -> Result<SlotInfo> {
     validate_replica_identity(client, schema_name, table_name).await?;
+    let generated_columns = fetch_generated_columns(client, schema_name, table_name).await?;
     ensure_publication(client, &params.publication_name, schema_name, table_name).await?;
+    let mut slot = ensure_slot(client, params).await?;
+    slot.generated_columns = generated_columns;
+    Ok(slot)
+}
 
+/// List the table's `GENERATED` columns (`pg_attribute.attgenerated`).
+/// Postgres omits these from pgoutput `Relation` messages, so the WAL path
+/// needs to know which dataset columns to expect to be absent.
+async fn fetch_generated_columns(
+    client: &tokio_postgres::Client,
+    schema_name: &str,
+    table_name: &str,
+) -> Result<Vec<String>> {
+    let rows = client
+        .query(
+            "SELECT a.attname \
+             FROM pg_attribute a \
+             JOIN pg_class c ON c.oid = a.attrelid \
+             JOIN pg_namespace n ON n.oid = c.relnamespace \
+             WHERE n.nspname = $1 AND c.relname = $2 \
+               AND a.attnum > 0 AND NOT a.attisdropped \
+               AND a.attgenerated::text <> ''",
+            &[&schema_name, &table_name],
+        )
+        .await
+        .context(SetupExecSnafu)?;
+    Ok(rows.iter().map(|r| r.get::<_, String>(0)).collect())
+}
+
+/// Look up the named slot, creating it if absent. See [`setup_slot_and_publication`]
+/// for the semantics of the returned `consistent_lsn` / `created_fresh`.
+async fn ensure_slot(
+    client: &tokio_postgres::Client,
+    params: &ReplicationParams,
+) -> Result<SlotInfo> {
     // Distinguish three catalog states for the named slot:
     //   * None            — no slot exists; we create one and need a bootstrap.
     //   * Some(0)         — slot exists but confirmed_flush_lsn is NULL. This
@@ -151,6 +256,7 @@ async fn do_setup(
                 publication_name: params.publication_name.clone(),
                 consistent_lsn: confirmed_flush_lsn,
                 snapshot_name: None,
+                generated_columns: Vec::new(),
                 created_fresh: false,
             });
         }
@@ -167,6 +273,7 @@ async fn do_setup(
                 publication_name: params.publication_name.clone(),
                 consistent_lsn: 0,
                 snapshot_name: None,
+                generated_columns: Vec::new(),
                 created_fresh: true,
             });
         }
@@ -174,7 +281,34 @@ async fn do_setup(
     }
 
     let (consistent_lsn, snapshot_name) =
-        create_logical_slot(client, &params.slot_name, params.temporary_slot).await?;
+        match create_logical_slot(client, &params.slot_name, params.temporary_slot).await {
+            Ok(created) => created,
+            // Lost a creation race: another consumer (a second replica, or a
+            // concurrent stream on an older build) created the slot between
+            // our catalog read and the CREATE. The slot exists now — treat it
+            // exactly like the existing-slot paths above instead of failing
+            // the dataset with "replication slot already exists".
+            Err(e) if is_duplicate_slot_error(&e) => {
+                tracing::info!(
+                    slot = %params.slot_name,
+                    "Lost replication-slot creation race; resuming from the winner's slot"
+                );
+                let confirmed = read_slot_confirmed_flush(client, &params.slot_name)
+                    .await?
+                    .unwrap_or(0);
+                return Ok(SlotInfo {
+                    slot_name: params.slot_name.clone(),
+                    publication_name: params.publication_name.clone(),
+                    consistent_lsn: confirmed,
+                    snapshot_name: None,
+                    // A raced slot with no durable checkpoint yet still needs
+                    // a bootstrap (same reasoning as the Some(0) path above).
+                    generated_columns: Vec::new(),
+                    created_fresh: confirmed == 0,
+                });
+            }
+            Err(e) => return Err(e),
+        };
 
     tracing::info!(
         slot = %params.slot_name,
@@ -189,8 +323,19 @@ async fn do_setup(
         publication_name: params.publication_name.clone(),
         consistent_lsn,
         snapshot_name: Some(snapshot_name),
+        generated_columns: Vec::new(),
         created_fresh: true,
     })
+}
+
+/// SQLSTATE 42710 (`duplicate_object`) from `pg_create_logical_replication_slot`
+/// — someone else created the slot first.
+fn is_duplicate_slot_error(e: &super::Error) -> bool {
+    matches!(
+        e,
+        super::Error::SetupExec { source }
+            if source.as_db_error().is_some_and(|db| db.code().code() == "42710")
+    )
 }
 
 async fn validate_replica_identity(
@@ -236,12 +381,19 @@ async fn validate_replica_identity(
     }
 }
 
+/// Create the publication / add the table to it as needed.
+///
+/// Returns `true` when the table was *not* already a member of the publication
+/// before this call (i.e. we created the publication with it, or `ALTER
+/// PUBLICATION ... ADD TABLE`d it). Shared-slot members use this to decide
+/// whether they need an initial snapshot: a table newly added to the
+/// publication has no WAL history on the slot.
 async fn ensure_publication(
     client: &tokio_postgres::Client,
     publication_name: &str,
     schema_name: &str,
     table_name: &str,
-) -> Result<()> {
+) -> Result<bool> {
     let exists: bool = client
         .query_one(
             "SELECT EXISTS(SELECT 1 FROM pg_publication WHERE pubname = $1)",
@@ -269,9 +421,12 @@ async fn ensure_publication(
                 schema = quote_ident(schema_name),
                 table = quote_ident(table_name),
             );
+            // A lost 42710 race still means the table is newly in the
+            // publication relative to this slot's history — report `true`
+            // either way so the caller's snapshot decision stays safe.
             ignore_duplicate_object(client.simple_query(&stmt).await)?;
         }
-        return Ok(());
+        return Ok(!has_table);
     }
 
     let stmt = format!(
@@ -281,11 +436,58 @@ async fn ensure_publication(
         table = quote_ident(table_name),
     );
     // In multi-replica deployments two replicas can both observe `exists =
-    // false` and race into `CREATE PUBLICATION` / `ALTER PUBLICATION`. The
-    // loser gets SQLSTATE 42710 (`duplicate_object`); treat that as success
-    // since the desired state is already achieved.
-    ignore_duplicate_object(client.simple_query(&stmt).await)?;
-    Ok(())
+    // false` and race into `CREATE PUBLICATION`. The loser gets SQLSTATE
+    // 42710 (`duplicate_object`) — but on a *shared* publication the winner
+    // may have created it for a different table, so losing the race does NOT
+    // imply our table is a member. Enforce membership explicitly with a
+    // follow-up ADD TABLE (itself 42710-tolerant for the same-table race).
+    if ignore_duplicate_object(client.simple_query(&stmt).await)?.is_none() {
+        let add = format!(
+            "ALTER PUBLICATION {pub} ADD TABLE {schema}.{table}",
+            pub = quote_ident(publication_name),
+            schema = quote_ident(schema_name),
+            table = quote_ident(table_name),
+        );
+        ignore_duplicate_object(client.simple_query(&add).await)?;
+    }
+    Ok(true)
+}
+
+/// Best-effort removal of a table from a (shared) publication. Used when a
+/// member detaches while its initial snapshot is still running: tearing the
+/// table out of the publication forces any future rejoin — in-process or after
+/// a restart — back through the ADD TABLE + fresh-snapshot path, instead of
+/// resuming over an accelerator that is missing base rows.
+///
+/// "Already absent" outcomes (publication or membership gone) are success.
+pub async fn remove_table_from_publication(
+    params: &ReplicationParams,
+    schema_name: &str,
+    table_name: &str,
+) -> Result<()> {
+    let (client, conn_task) = connect_setup(params).await?;
+    let stmt = format!(
+        "ALTER PUBLICATION {pub} DROP TABLE {schema}.{table}",
+        pub = quote_ident(&params.publication_name),
+        schema = quote_ident(schema_name),
+        table = quote_ident(table_name),
+    );
+    let outcome = match client.simple_query(&stmt).await {
+        Ok(_) => Ok(()),
+        // 42704 undefined_object: table is not a member; 42P01 undefined_table:
+        // the publication (or table) no longer exists. Both mean the desired
+        // state — "table not published" — already holds.
+        Err(e)
+            if e.as_db_error()
+                .is_some_and(|db| matches!(db.code().code(), "42704" | "42P01")) =>
+        {
+            Ok(())
+        }
+        Err(e) => Err(e).context(SetupExecSnafu),
+    };
+    drop(client);
+    let _ = conn_task.await;
+    outcome
 }
 
 /// Treats a `duplicate_object` SQLSTATE (42710) as success — some replica beat

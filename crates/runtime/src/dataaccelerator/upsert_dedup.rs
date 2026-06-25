@@ -20,7 +20,7 @@ limitations under the License.
 //! This handles the `UpsertDedup` `on_conflict` behavior by removing duplicate rows
 //! within incoming batches before they are inserted into the accelerator.
 
-use std::{any::Any, sync::Arc};
+use std::sync::Arc;
 
 use arrow::{compute::concat_batches, datatypes::SchemaRef};
 use async_trait::async_trait;
@@ -36,8 +36,9 @@ use datafusion::{
         stream::RecordBatchStreamAdapter,
     },
 };
-use datafusion_table_providers::util::constraints::UpsertOptions;
 use futures::StreamExt;
+
+use super::UpsertOptions;
 
 /// A wrapper `TableProvider` that applies batch deduplication based on `UpsertOptions`
 /// before passing data to the underlying provider.
@@ -97,10 +98,6 @@ impl std::fmt::Debug for UpsertDedupTableProvider {
 #[deny(clippy::missing_trait_methods)]
 #[async_trait]
 impl TableProvider for UpsertDedupTableProvider {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema(&self) -> SchemaRef {
         self.inner.schema()
     }
@@ -228,7 +225,7 @@ struct UpsertDedupExec {
     input: Arc<dyn ExecutionPlan>,
     constraints: Constraints,
     upsert_options: UpsertOptions,
-    properties: PlanProperties,
+    properties: Arc<PlanProperties>,
 }
 
 impl UpsertDedupExec {
@@ -237,7 +234,7 @@ impl UpsertDedupExec {
         constraints: Constraints,
         upsert_options: UpsertOptions,
     ) -> Self {
-        let properties = input.properties().clone();
+        let properties = Arc::clone(input.properties());
         Self {
             input,
             constraints,
@@ -268,15 +265,11 @@ impl ExecutionPlan for UpsertDedupExec {
         "UpsertDedupExec"
     }
 
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema(&self) -> SchemaRef {
         self.input.schema()
     }
 
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
     }
 
@@ -311,8 +304,6 @@ impl ExecutionPlan for UpsertDedupExec {
         let upsert_options = self.upsert_options.clone();
 
         // Create a stream that validates constraints and applies deduplication to each batch.
-        // The validate_batch_with_constraints function handles both constraint validation and
-        // deduplication based on UpsertOptions (remove_duplicates, last_write_wins).
         let stream_schema = Arc::clone(&schema);
         let validated_stream = input_stream.then(move |batch_result| {
             let constraints = constraints.clone();
@@ -321,19 +312,19 @@ impl ExecutionPlan for UpsertDedupExec {
             async move {
                 let batch = batch_result?;
 
-                // Apply constraint validation
+                let tp_upsert_options =
+                    datafusion_table_providers::util::constraints::UpsertOptions::default()
+                        .with_remove_duplicates(upsert_options.remove_duplicates)
+                        .with_last_write_wins(upsert_options.last_write_wins);
                 let validated_batches =
                     datafusion_table_providers::util::constraints::validate_batch_with_constraints(
                         vec![batch],
                         &constraints,
-                        &upsert_options,
+                        &tp_upsert_options,
                     )
                     .await
                     .map_err(|e| DataFusionError::External(Box::new(e)))?;
 
-                // Concatenate all returned batches into a single batch.
-                // The validate_batch_with_constraints function may return multiple batches
-                // after deduplication (e.g., from df.collect()), so we need to merge them.
                 if validated_batches.is_empty() {
                     return Err(DataFusionError::Internal(
                         "Expected validated batch".to_string(),

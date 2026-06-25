@@ -21,6 +21,7 @@ use ::cache::{
     key::CacheKey,
     result::{CacheStatus, query::QueryResult},
 };
+use app::spicepod::component::runtime::FlightBatchSize;
 use arrow::{
     array::{
         Array, FixedSizeListArray, LargeListArray, MapArray, RecordBatch, StructArray, UnionArray,
@@ -34,7 +35,7 @@ use cache::PlanOrCached;
 use datafusion::{
     common::ParamValues,
     error::{DataFusionError, Result as DataFusionResult},
-    execution::{SendableRecordBatchStream, TaskContext},
+    execution::{SendableRecordBatchStream, TaskContext, memory_pool::MemoryLimit},
     logical_expr::LogicalPlan,
     physical_plan::{
         ExecutionPlan, ExecutionPlanProperties, execute_stream, repartition::RepartitionExec,
@@ -78,6 +79,7 @@ use futures::StreamExt;
 
 use super::{
     SPICE_RUNTIME_SCHEMA,
+    app_context_extension::AppContextExtension,
     error::{find_datafusion_root, format_datafusion_error},
 };
 
@@ -89,12 +91,22 @@ use crate::datafusion::{
 };
 use managed_runtime::ManagedRuntimeError;
 use opentelemetry::KeyValue;
+use runtime_auth::AuthRequestContext;
 use runtime_datafusion::allowlist::ResolvedTableAwareAllowlist;
 use runtime_datafusion::config::request_context_config::SpiceRequestContextConfig;
-use runtime_request_context::{AsyncMarker, RequestContext};
+use runtime_request_context::{AsyncMarker, Protocol, RequestContext};
 use tokio::runtime::Handle;
+use util::session_state::builder_from_existing;
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
+
+const FLIGHT_ADAPTIVE_BATCH_SIZE_SMALL_ROWS: usize = 100_000;
+const FLIGHT_ADAPTIVE_BATCH_SIZE_MEDIUM_ROWS: usize = 1_000_000;
+const FLIGHT_ADAPTIVE_BATCH_SIZE_LARGE_ROWS: usize = 10_000_000;
+const FLIGHT_ADAPTIVE_BATCH_SIZE_SMALL_BYTES: usize = 16 * 1024 * 1024;
+const FLIGHT_ADAPTIVE_BATCH_SIZE_MEDIUM_BYTES: usize = 128 * 1024 * 1024;
+const FLIGHT_ADAPTIVE_BATCH_SIZE_LARGE_BYTES: usize = 512 * 1024 * 1024;
+const FLIGHT_ADAPTIVE_BATCH_SIZE_MEMORY_BUDGET_DENOMINATOR: usize = 8;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -242,6 +254,170 @@ impl Query {
         Ok(())
     }
 
+    fn flight_batch_size_config(request_context: &RequestContext) -> FlightBatchSize {
+        request_context
+            .extension::<AppContextExtension>()
+            .and_then(|app_ext| app_ext.app())
+            .and_then(|app| app.runtime.flight.as_ref().map(|flight| flight.batch_size))
+            .unwrap_or_default()
+    }
+
+    fn session_with_batch_size(session: &SessionState, batch_size: usize) -> SessionState {
+        let config = session.config().clone().with_batch_size(batch_size);
+        builder_from_existing(session).with_config(config).build()
+    }
+
+    fn adaptive_flight_batch_size_memory_limit(session: &SessionState) -> Option<usize> {
+        match session.runtime_env().memory_pool.memory_limit() {
+            MemoryLimit::Finite(limit) => Some(limit),
+            MemoryLimit::Infinite | MemoryLimit::Unknown => None,
+        }
+    }
+
+    fn estimated_flight_row_size_bytes(
+        schema: &Schema,
+        estimated_rows: Option<usize>,
+        estimated_bytes: Option<usize>,
+    ) -> Option<usize> {
+        if let (Some(rows), Some(bytes)) = (estimated_rows, estimated_bytes)
+            && rows > 0
+        {
+            return Some(bytes.div_ceil(rows).max(1));
+        }
+
+        schema.fields().iter().try_fold(0_usize, |size, field| {
+            field
+                .data_type()
+                .primitive_width()
+                .and_then(|width| size.checked_add(width))
+        })
+    }
+
+    fn limit_adaptive_flight_batch_size_for_memory(
+        session: &SessionState,
+        current: usize,
+        selected: usize,
+        physical_plan: &Arc<dyn ExecutionPlan>,
+        estimated_rows: Option<usize>,
+        estimated_bytes: Option<usize>,
+    ) -> Option<usize> {
+        let Some(memory_limit) = Self::adaptive_flight_batch_size_memory_limit(session) else {
+            return Some(selected);
+        };
+        let batch_memory_budget =
+            memory_limit / FLIGHT_ADAPTIVE_BATCH_SIZE_MEMORY_BUDGET_DENOMINATOR;
+
+        let Some(row_size) = Self::estimated_flight_row_size_bytes(
+            physical_plan.schema().as_ref(),
+            estimated_rows,
+            estimated_bytes,
+        ) else {
+            tracing::debug!(
+                memory_limit_bytes = memory_limit,
+                batch_memory_budget_bytes = batch_memory_budget,
+                estimated_rows,
+                estimated_bytes,
+                "Skipping adaptive Flight batch size because result row size is unknown under a finite query memory limit"
+            );
+            return None;
+        };
+
+        if row_size == 0 {
+            return Some(selected);
+        }
+
+        let memory_limited_batch_size = batch_memory_budget / row_size;
+        let selected = selected.min(memory_limited_batch_size);
+
+        if selected <= current {
+            tracing::debug!(
+                current_batch_size = current,
+                memory_limited_batch_size,
+                row_size_bytes = row_size,
+                memory_limit_bytes = memory_limit,
+                batch_memory_budget_bytes = batch_memory_budget,
+                "Skipping adaptive Flight batch size because query memory limit does not allow a larger result batch"
+            );
+            return None;
+        }
+
+        Some(selected)
+    }
+
+    fn adaptive_flight_batch_size(
+        session: &SessionState,
+        request_context: &RequestContext,
+        physical_plan: &Arc<dyn ExecutionPlan>,
+    ) -> Option<usize> {
+        if !matches!(
+            request_context.protocol(),
+            Protocol::Flight | Protocol::FlightSQL
+        ) {
+            return None;
+        }
+
+        let FlightBatchSize::Adaptive { max } = Self::flight_batch_size_config(request_context)
+        else {
+            return None;
+        };
+
+        let current = session.config().batch_size();
+        if max <= current {
+            return None;
+        }
+
+        let statistics = match physical_plan.partition_statistics(None) {
+            Ok(statistics) => statistics,
+            Err(error) => {
+                tracing::debug!(%error, "Unable to estimate Flight result size for adaptive batch size");
+                return None;
+            }
+        };
+
+        let estimated_rows = statistics.num_rows.get_value().copied();
+        let estimated_bytes = statistics.total_byte_size.get_value().copied();
+
+        let selected = if estimated_rows
+            .is_some_and(|rows| rows >= FLIGHT_ADAPTIVE_BATCH_SIZE_LARGE_ROWS)
+            || estimated_bytes.is_some_and(|bytes| bytes >= FLIGHT_ADAPTIVE_BATCH_SIZE_LARGE_BYTES)
+        {
+            max
+        } else if estimated_rows.is_some_and(|rows| rows >= FLIGHT_ADAPTIVE_BATCH_SIZE_MEDIUM_ROWS)
+            || estimated_bytes.is_some_and(|bytes| bytes >= FLIGHT_ADAPTIVE_BATCH_SIZE_MEDIUM_BYTES)
+        {
+            current.saturating_mul(8).min(max)
+        } else if estimated_rows.is_some_and(|rows| rows >= FLIGHT_ADAPTIVE_BATCH_SIZE_SMALL_ROWS)
+            || estimated_bytes.is_some_and(|bytes| bytes >= FLIGHT_ADAPTIVE_BATCH_SIZE_SMALL_BYTES)
+        {
+            current.saturating_mul(4).min(max)
+        } else {
+            return None;
+        };
+
+        if selected <= current {
+            return None;
+        }
+
+        let selected = Self::limit_adaptive_flight_batch_size_for_memory(
+            session,
+            current,
+            selected,
+            physical_plan,
+            estimated_rows,
+            estimated_bytes,
+        )?;
+
+        tracing::debug!(
+            current_batch_size = current,
+            adaptive_batch_size = selected,
+            estimated_rows,
+            estimated_bytes,
+            "Using adaptive Flight batch size"
+        );
+
+        Some(selected)
+    }
+
     /// Returns the session state for local query execution.
     ///
     /// For Flight SQL sessions, returns the session-specific context to preserve
@@ -251,8 +427,17 @@ impl Query {
         if let Some(flight_session) =
             request_context.extension::<super::flight_session_extension::FlightSessionExtension>()
         {
-            // Use session-specific context to preserve prepared statements
-            return flight_session.session_context().state();
+            // Only honor the session if it belongs to the current principal. The
+            // session is selected from a client-controlled `x-session-id` header
+            // before authentication runs; binding it to the authenticated
+            // principal here prevents one principal from executing against
+            // another's session (and its prepared statements) if a session id is
+            // leaked.
+            let current = request_context.auth_principal().and_then(|p| p.stable_id());
+            if principal_owns_session(flight_session.owner_stable_id(), current.as_deref()) {
+                // Use session-specific context to preserve prepared statements
+                return flight_session.session_context().state();
+            }
         }
 
         // Always use local execution for synchronous APIs (/v1/sql, FlightSQL)
@@ -316,8 +501,8 @@ impl Query {
             runtime_query = false,
             distributed = true,
             job_id = %job_id,
-            // Distributed-job summary labels — recorded at completion by
-            // `crate::datafusion::query::stage_history::record_stage_history`.
+            // Distributed-job summary labels. Ballista 53 no longer exposes the
+            // scheduler execution graph needed to populate these fields.
             ballista_job_id = tracing::field::Empty,
             stage_count = tracing::field::Empty,
             executor_count = tracing::field::Empty,
@@ -419,9 +604,16 @@ impl Query {
                 }
             }
             QueryMethod::Plan(logical_plan) => {
-                // For direct plan submission, compute cache key and check cache
-                let plan_cache_key =
-                    CacheKey::LogicalPlan(logical_plan).as_raw_key(Self::plan_hasher(&self.df));
+                // For direct plan submission, compute cache key and check cache.
+                // Namespace the key per principal so a plan-submitted result is
+                // never served across principals (mirrors the text-query path).
+                let cache_namespace = request_context.cache_namespace();
+                let (ns_tag, ns_id) = cache_namespace.hash_inputs();
+                let plan_cache_key = CacheKey::LogicalPlan(logical_plan).as_raw_key_in_namespace(
+                    Self::plan_hasher(&self.df),
+                    ns_tag,
+                    ns_id,
+                );
 
                 // Check for cached results using the standard cache lookup
                 if let Some(cache_provider) = self.df.results_cache_provider()
@@ -724,10 +916,17 @@ impl Query {
                         }
                     }
                     QueryMethod::Plan(logical_plan) => {
+                        // Namespace the results-cache key per principal so a
+                        // plan-submitted result is never reused across principals.
+                        let cache_namespace = request_context.cache_namespace();
+                        let (ns_tag, ns_id) = cache_namespace.hash_inputs();
                         let cache_manager = RequestCacheManager::new(
                             CacheStatus::CacheMiss,
-                            CacheKey::LogicalPlan(logical_plan)
-                                .as_raw_key(Query::plan_hasher(&ctx.df)),
+                            CacheKey::LogicalPlan(logical_plan).as_raw_key_in_namespace(
+                                Query::plan_hasher(&ctx.df),
+                                ns_tag,
+                                ns_id,
+                            ),
                         );
                         (logical_plan.clone(), None, cache_manager)
                     }
@@ -805,9 +1004,55 @@ impl Query {
                     t
                 });
 
-                // Statement plans (PREPARE, EXECUTE, DEALLOCATE) need special handling
+                // Statement plans (PREPARE, EXECUTE, DEALLOCATE, SET) need special handling
                 // They modify session state rather than producing query results, so must be
                 // executed through SessionContext::execute_logical_plan() instead of create_physical_plan()
+                // [query admission] Bound the number of concurrently-executing
+                // query plans — ordinary queries plus DDL/DML and EXECUTE
+                // (`runtime.query.max_concurrent_queries`) — so an OLAP burst
+                // can't oversubscribe the shared query runtime + memory pool and
+                // starve them (the idle-cores-under-load symptom).
+                // Acquired AFTER the results-cache check above (a cache hit
+                // returned early is never gated) and held — via the cancellation
+                // guard attached to the result stream below — until the stream is
+                // fully drained, so the permit spans the real execution lifetime
+                // (the lazy Flight drain and the managed-runtime driver included).
+                // No-op when `query_admission_semaphore` is unset (unbounded).
+                //
+                // Only plans that actually EXECUTE a (potentially heavy) query are
+                // gated: ordinary query plans, and `EXECUTE <prepared>` (which runs
+                // the prepared query). The other Statement plans — PREPARE,
+                // DEALLOCATE, SET — only mutate session state, so they must NOT
+                // consume a query permit or block behind the pool under load.
+                let plan_executes_query = match &*plan {
+                    LogicalPlan::Statement(stmt) => {
+                        matches!(stmt, datafusion::logical_expr::Statement::Execute(_))
+                    }
+                    _ => true,
+                };
+                let admission_permit: Option<tokio::sync::OwnedSemaphorePermit> =
+                    match ctx.df.query_admission_semaphore() {
+                        Some(semaphore) if plan_executes_query => {
+                            Self::ensure_not_cancelled(&query_cancel_token, &query_id_str)?;
+                            // Race permit acquisition against cancellation so a query
+                            // cancelled WHILE QUEUED for a permit (client disconnect or
+                            // `/cancel` under load) aborts promptly instead of blocking
+                            // until a permit frees and then still executing. `biased`
+                            // polls cancellation first. A closed semaphore (shutdown
+                            // only) proceeds ungated rather than failing the query.
+                            tokio::select! {
+                                biased;
+                                () = query_cancel_token.cancelled() => {
+                                    return Err(Error::QueryCancelled {
+                                        query_id: query_id_str.clone(),
+                                    });
+                                }
+                                permit = semaphore.acquire_owned() => permit.ok(),
+                            }
+                        }
+                        _ => None,
+                    };
+
                 let (res_stream, physical_plan): (
                     SendableRecordBatchStream,
                     Arc<dyn ExecutionPlan>,
@@ -892,7 +1137,7 @@ impl Query {
                 } else {
                     // For regular plans, use the standard physical plan execution
                     Self::ensure_not_cancelled(&query_cancel_token, &query_id_str)?;
-                    let physical_plan = match session.create_physical_plan(&plan).await {
+                    let mut physical_plan = match session.create_physical_plan(&plan).await {
                         Ok(stream) => stream,
                         Err(e) => {
                             let e = find_datafusion_root(e);
@@ -907,8 +1152,31 @@ impl Query {
                         }
                     };
 
+                    let mut execution_session = session.clone();
+                    if let Some(batch_size) =
+                        Self::adaptive_flight_batch_size(&session, &request_context, &physical_plan)
+                    {
+                        Self::ensure_not_cancelled(&query_cancel_token, &query_id_str)?;
+                        let adaptive_session = Self::session_with_batch_size(&session, batch_size);
+                        physical_plan = match adaptive_session.create_physical_plan(&plan).await {
+                            Ok(stream) => stream,
+                            Err(e) => {
+                                let e = find_datafusion_root(e);
+                                let error_code = ErrorCode::from(&e);
+                                handle_error!(
+                                    tracker,
+                                    &request_context,
+                                    error_code,
+                                    e,
+                                    UnableToExecuteQuery
+                                )
+                            }
+                        };
+                        execution_session = adaptive_session;
+                    }
+
                     Self::ensure_not_cancelled(&query_cancel_token, &query_id_str)?;
-                    let task_ctx = Arc::new(TaskContext::from(&session));
+                    let task_ctx = Arc::new(TaskContext::from(&execution_session));
 
                     let stream = match execute_stream_preserving_output_order(
                         Arc::clone(&physical_plan),
@@ -1008,7 +1276,13 @@ impl Query {
                     final_stream,
                     query_cancel_token.clone(),
                     query_id_str.clone(),
-                    active_query_guard,
+                    // Bundle the admission permit with the active-query guard so
+                    // BOTH release exactly when the result stream is fully drained
+                    // (completion, error, or cancellation) — the permit thus spans
+                    // the query's true lifetime, not merely until `run` returns
+                    // (Flight drains the stream lazily; the managed runtime drives
+                    // it on a separate task).
+                    (active_query_guard, admission_permit),
                 );
 
                 Ok(QueryResult::new(
@@ -1503,7 +1777,7 @@ fn strip_root_order_preserving_repartition(
         plan.with_new_children(vec![rewritten_child])?
     };
 
-    if let Some(spm) = plan.as_any().downcast_ref::<SortPreservingMergeExec>() {
+    if let Some(spm) = plan.downcast_ref::<SortPreservingMergeExec>() {
         return Ok(Arc::new(
             SortPreservingMergeExec::new(spm.expr().clone(), Arc::clone(spm.input()))
                 .with_fetch(spm.fetch())
@@ -1511,7 +1785,7 @@ fn strip_root_order_preserving_repartition(
         ));
     }
 
-    if let Some(repartition) = plan.as_any().downcast_ref::<RepartitionExec>()
+    if let Some(repartition) = plan.downcast_ref::<RepartitionExec>()
         && repartition.input().output_partitioning().partition_count() == 1
         && repartition.input().output_ordering().is_some()
         && repartition.partitioning().partition_count() > 1
@@ -1737,7 +2011,7 @@ fn scalar_to_json_value(
     value: &ScalarValue,
 ) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
     match value {
-        ScalarValue::Boolean(value) => Ok(value.map(Value::Bool).unwrap_or(Value::Null)),
+        ScalarValue::Boolean(value) => Ok(value.map_or(Value::Null, Value::Bool)),
         ScalarValue::Float16(Some(value)) => number_to_json(f64::from(f32::from(*value))),
         ScalarValue::Float32(Some(value)) => number_to_json(f64::from(*value)),
         ScalarValue::Float64(Some(value)) => number_to_json(*value),
@@ -1761,10 +2035,13 @@ fn scalar_to_json_value(
         ScalarValue::FixedSizeList(array) => single_row_fixed_size_list_to_json(array),
         ScalarValue::List(array) => single_row_list_to_json(array),
         ScalarValue::LargeList(array) => single_row_large_list_to_json(array),
+        ScalarValue::ListView(array) => single_row_nested_array_to_json(array.as_ref(), 0),
+        ScalarValue::LargeListView(array) => single_row_nested_array_to_json(array.as_ref(), 0),
         ScalarValue::Struct(array) => single_row_struct_to_json(array),
         ScalarValue::Map(array) => single_row_map_to_json(array),
-        ScalarValue::Union(Some((_type_id, value)), _, _) => scalar_to_json_value(value),
-        ScalarValue::Dictionary(_, value) => scalar_to_json_value(value),
+        ScalarValue::Union(Some((_, value)), _, _)
+        | ScalarValue::Dictionary(_, value)
+        | ScalarValue::RunEndEncoded(_, _, value) => scalar_to_json_value(value),
         ScalarValue::Null
         | ScalarValue::Float16(None)
         | ScalarValue::Float32(None)
@@ -1841,6 +2118,13 @@ fn single_row_nested_array_to_json(
     } else if let Some(list_array) = array.as_any().downcast_ref::<LargeListArray>() {
         list_array.value(index)
     } else if let Some(list_array) = array.as_any().downcast_ref::<FixedSizeListArray>() {
+        list_array.value(index)
+    } else if let Some(list_array) = array.as_any().downcast_ref::<arrow::array::ListViewArray>() {
+        list_array.value(index)
+    } else if let Some(list_array) = array
+        .as_any()
+        .downcast_ref::<arrow::array::LargeListViewArray>()
+    {
         list_array.value(index)
     } else {
         return Err("Expected a list-like Arrow array".into());
@@ -2024,6 +2308,46 @@ fn is_dml_extension(plan: &LogicalPlan) -> bool {
     )
 }
 
+/// Returns whether a Flight SQL session may be used by the current principal.
+///
+/// An unowned session (`owner` is `None`) is always permitted, preserving
+/// behavior for unauthenticated setups. An owned session is permitted only when
+/// the current principal's stable id matches the owner's — this is the check
+/// that stops a leaked session id from being usable by a different principal.
+fn principal_owns_session(owner: Option<&str>, current_principal: Option<&str>) -> bool {
+    match owner {
+        None => true,
+        Some(owner) => current_principal == Some(owner),
+    }
+}
+
+#[cfg(test)]
+mod session_ownership_tests {
+    use super::principal_owns_session;
+
+    #[test]
+    fn unowned_session_is_always_allowed() {
+        assert!(principal_owns_session(None, None));
+        assert!(principal_owns_session(None, Some("apikey:abc")));
+    }
+
+    #[test]
+    fn owned_session_requires_matching_principal() {
+        // Same principal: allowed.
+        assert!(principal_owns_session(
+            Some("apikey:abc"),
+            Some("apikey:abc")
+        ));
+        // Different principal: rejected (cross-principal session access).
+        assert!(!principal_owns_session(
+            Some("apikey:abc"),
+            Some("apikey:xyz")
+        ));
+        // Unauthenticated caller cannot use an owned session.
+        assert!(!principal_owns_session(Some("apikey:abc"), None));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use ::cache::{Caching, QueryResultsCacheProvider, result::CacheStatus};
@@ -2035,22 +2359,29 @@ mod tests {
         buffer::Buffer,
         datatypes::{DataType, Field, Schema, UnionMode},
     };
+    use datafusion::common::{Statistics, stats::Precision};
+    use datafusion::execution::runtime_env::RuntimeEnvBuilder;
     use datafusion::logical_expr::Extension;
     use datafusion::physical_expr::{EquivalenceProperties, Partitioning};
     use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
     use datafusion::physical_plan::metrics::{ExecutionPlanMetricsSet, MetricBuilder, MetricsSet};
     use datafusion::physical_plan::{DisplayAs, DisplayFormatType, PlanProperties};
+    use datafusion::prelude::{SessionConfig, SessionContext};
     use datafusion_functions_json::JSON_UNION_DATA_TYPE;
+    use runtime_request_context::{Protocol, RequestContext};
     use serde_json::json;
     use spicepod::component::caching::SQLResultsCacheConfig;
-    use std::any::Any;
+    use spicepod::component::runtime::{Flight, FlightBatchSize};
     use std::fmt::{Debug, Formatter};
     use std::sync::atomic::{AtomicBool, Ordering};
     use tokio_util::sync::CancellationToken;
 
     use crate::{
         dataaccelerator::AcceleratorEngineRegistry,
-        datafusion::{builder::DataFusionBuilder, param_utils::convert_json_to_param_values},
+        datafusion::{
+            app_context_extension::AppContextExtension, builder::DataFusionBuilder,
+            param_utils::convert_json_to_param_values,
+        },
         status::RuntimeStatus,
     };
 
@@ -2247,6 +2578,130 @@ mod tests {
             registry.list().iter().all(|info| info.query_id != query_id),
             "cached query should be deregistered after the stream terminates"
         );
+    }
+
+    /// [query admission] With `max_concurrent_queries = 1`, a second
+    /// query-executing plan must block at permit acquisition while the first
+    /// query's result stream is still alive (the permit rides that stream's
+    /// guard), and must proceed once the first stream is dropped. Guards against
+    /// losing the intended backpressure and against leaking / never releasing a
+    /// permit (a deadlock). The block is real — A holds the only permit — not
+    /// timing-dependent: B can finish early only if admission is broken.
+    #[tokio::test]
+    async fn query_admission_blocks_second_query_until_first_stream_drops() {
+        use std::time::Duration;
+        let df = Arc::new(
+            DataFusionBuilder::new(
+                RuntimeStatus::new(),
+                Arc::new(AcceleratorEngineRegistry::new()),
+                Handle::current(),
+            )
+            .max_concurrent_queries(Some(1))
+            .build(),
+        );
+
+        // Query A acquires the only permit at run() time; the permit rides the
+        // result stream's guard and is held until that stream is dropped.
+        let query_a = QueryBuilder::new("SELECT 42 AS value", Arc::clone(&df))
+            .build()
+            .run()
+            .await
+            .expect("query A should run");
+
+        // B uses different query text (`SELECT 43`, a cache miss → it actually
+        // reaches the admission gate, not an early cache-hit return) and is spawned
+        // so the test task can observe whether run() blocks.
+        let df_b = Arc::clone(&df);
+        let mut b_handle = tokio::spawn(async move {
+            QueryBuilder::new("SELECT 43 AS value", df_b)
+                .build()
+                .run()
+                .await
+                .map(|_q| ())
+        });
+
+        // While A's stream lives, B's run() must NOT return. `biased` polls B's
+        // completion before the timer, so a regression that lets B through is
+        // caught immediately.
+        tokio::select! {
+            biased;
+            r = &mut b_handle => panic!(
+                "query B should block on the admission permit while A holds it, but run() returned: {r:?}"
+            ),
+            () = tokio::time::sleep(Duration::from_millis(750)) => {}
+        }
+
+        // Releasing A's stream frees the permit; B can now finish run().
+        drop(query_a);
+        let b_outcome = tokio::time::timeout(Duration::from_secs(10), b_handle)
+            .await
+            .expect("query B should proceed once the permit is released")
+            .expect("query B task should not panic");
+        b_outcome.expect("query B should run successfully after the permit frees");
+    }
+
+    /// [query admission] A query cancelled WHILE QUEUED for an admission permit
+    /// must return `QueryCancelled` promptly (via the `biased` cancel race),
+    /// instead of blocking until the permit frees and then executing.
+    #[tokio::test]
+    async fn query_admission_cancellation_while_queued_returns_cancelled() {
+        use std::time::Duration;
+        let df = Arc::new(
+            DataFusionBuilder::new(
+                RuntimeStatus::new(),
+                Arc::new(AcceleratorEngineRegistry::new()),
+                Handle::current(),
+            )
+            .max_concurrent_queries(Some(1))
+            .build(),
+        );
+
+        // A holds the only permit (kept alive for the whole test).
+        let _query_a = QueryBuilder::new("SELECT 42 AS value", Arc::clone(&df))
+            .build()
+            .run()
+            .await
+            .expect("query A should run");
+
+        let query_id = uuid::Uuid::new_v4();
+        let cancel_token = CancellationToken::new();
+        let df_b = Arc::clone(&df);
+        let token_b = cancel_token.clone();
+        let b_handle = tokio::spawn(async move {
+            QueryBuilder::new("SELECT 43 AS value", df_b)
+                .query_id(query_id)
+                .cancellation_token(token_b)
+                .build()
+                .run()
+                .await
+                .map(|_q| ())
+        });
+
+        // Wait until B is registered in the cancel registry, then cancel it.
+        // `run_internal` registers a query in the cancel registry BEFORE acquiring
+        // the admission permit, so B's presence here means it is genuinely queued
+        // for the permit — making the cancellation deterministic instead of racing
+        // a fixed sleep (which is flaky under slow CI). Bounded fallback (~5s).
+        let registry = df.query_cancel_registry();
+        for _ in 0..500 {
+            if registry.list().iter().any(|info| info.query_id == query_id) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        cancel_token.cancel();
+
+        let b_err = tokio::time::timeout(Duration::from_secs(5), b_handle)
+            .await
+            .expect("cancelled query B should return promptly, not block on the permit")
+            .expect("query B task should not panic")
+            .expect_err("query B should fail with cancellation");
+        match b_err {
+            Error::QueryCancelled {
+                query_id: cancelled,
+            } => assert_eq!(cancelled, query_id.to_string()),
+            other => panic!("expected QueryCancelled, got: {other:?}"),
+        }
     }
 
     #[tokio::test]
@@ -2608,20 +3063,44 @@ mod tests {
     struct TestExecutionPlan {
         metrics: Option<MetricsSet>,
         children: Vec<Arc<dyn ExecutionPlan>>,
-        properties: PlanProperties,
+        properties: Arc<PlanProperties>,
+        statistics: Option<Statistics>,
     }
 
     impl TestExecutionPlan {
         fn new(metrics: Option<MetricsSet>, children: Vec<Arc<dyn ExecutionPlan>>) -> Self {
+            Self::new_with_schema(metrics, children, Arc::new(Schema::empty()))
+        }
+
+        fn new_with_schema(
+            metrics: Option<MetricsSet>,
+            children: Vec<Arc<dyn ExecutionPlan>>,
+            schema: Arc<Schema>,
+        ) -> Self {
             Self {
                 metrics,
                 children,
-                properties: PlanProperties::new(
-                    EquivalenceProperties::new(Arc::new(Schema::empty())),
+                properties: Arc::new(PlanProperties::new(
+                    EquivalenceProperties::new(schema),
                     Partitioning::UnknownPartitioning(1),
                     EmissionType::Final,
                     Boundedness::Bounded,
-                ),
+                )),
+                statistics: None,
+            }
+        }
+
+        fn with_statistics(statistics: Statistics) -> Self {
+            Self {
+                statistics: Some(statistics),
+                ..Self::new(None, vec![])
+            }
+        }
+
+        fn with_statistics_and_schema(statistics: Statistics, schema: Arc<Schema>) -> Self {
+            Self {
+                statistics: Some(statistics),
+                ..Self::new_with_schema(None, vec![], schema)
             }
         }
     }
@@ -2643,11 +3122,7 @@ mod tests {
             "TestExecutionPlan"
         }
 
-        fn as_any(&self) -> &dyn Any {
-            self
-        }
-
-        fn properties(&self) -> &PlanProperties {
+        fn properties(&self) -> &Arc<PlanProperties> {
             &self.properties
         }
 
@@ -2666,6 +3141,15 @@ mod tests {
             self.metrics.clone()
         }
 
+        fn partition_statistics(
+            &self,
+            _partition: Option<usize>,
+        ) -> datafusion::common::Result<Arc<Statistics>> {
+            Ok(Arc::new(self.statistics.clone().unwrap_or_else(|| {
+                Statistics::new_unknown(self.schema().as_ref())
+            })))
+        }
+
         fn execute(
             &self,
             _partition: usize,
@@ -2673,6 +3157,110 @@ mod tests {
         ) -> datafusion::common::Result<SendableRecordBatchStream> {
             unimplemented!("Not used in tests")
         }
+    }
+
+    fn request_context_with_flight_batch_size(
+        protocol: Protocol,
+        batch_size: FlightBatchSize,
+    ) -> RequestContext {
+        let mut app = app::App::default();
+        app.runtime.flight = Some(Flight {
+            batch_size,
+            ..Flight::default()
+        });
+
+        RequestContext::builder(protocol)
+            .with_extension(AppContextExtension::new(Some(Arc::new(app))))
+            .build()
+    }
+
+    fn session_with_finite_memory_limit(batch_size: usize, memory_limit: usize) -> SessionState {
+        let runtime_env = RuntimeEnvBuilder::default()
+            .with_memory_limit(memory_limit, 1.0)
+            .build_arc()
+            .expect("runtime env should build");
+        SessionContext::new_with_config_rt(
+            SessionConfig::new().with_batch_size(batch_size),
+            runtime_env,
+        )
+        .state()
+    }
+
+    #[test]
+    fn adaptive_flight_batch_size_uses_max_for_large_estimates() {
+        let session =
+            SessionContext::new_with_config(SessionConfig::new().with_batch_size(8192)).state();
+        let request_context = request_context_with_flight_batch_size(
+            Protocol::FlightSQL,
+            FlightBatchSize::Adaptive { max: 131_072 },
+        );
+        let statistics =
+            Statistics::new_unknown(&Schema::empty()).with_num_rows(Precision::Exact(100_000_000));
+        let plan =
+            Arc::new(TestExecutionPlan::with_statistics(statistics)) as Arc<dyn ExecutionPlan>;
+
+        assert_eq!(
+            Query::adaptive_flight_batch_size(&session, &request_context, &plan),
+            Some(131_072)
+        );
+    }
+
+    #[test]
+    fn adaptive_flight_batch_size_honors_query_memory_limit() {
+        let session = session_with_finite_memory_limit(8192, 128 * 1024 * 1024);
+        let request_context = request_context_with_flight_batch_size(
+            Protocol::FlightSQL,
+            FlightBatchSize::Adaptive { max: 131_072 },
+        );
+        let statistics = Statistics::new_unknown(&Schema::empty())
+            .with_num_rows(Precision::Exact(100_000_000))
+            .with_total_byte_size(Precision::Exact(100_000_000 * 1024));
+        let plan =
+            Arc::new(TestExecutionPlan::with_statistics(statistics)) as Arc<dyn ExecutionPlan>;
+
+        assert_eq!(
+            Query::adaptive_flight_batch_size(&session, &request_context, &plan),
+            Some(16_384)
+        );
+    }
+
+    #[test]
+    fn adaptive_flight_batch_size_skips_unknown_row_size_with_finite_memory_limit() {
+        let session = session_with_finite_memory_limit(8192, 128 * 1024 * 1024);
+        let request_context = request_context_with_flight_batch_size(
+            Protocol::FlightSQL,
+            FlightBatchSize::Adaptive { max: 131_072 },
+        );
+        let schema = Arc::new(Schema::new(vec![Field::new("value", DataType::Utf8, true)]));
+        let statistics =
+            Statistics::new_unknown(schema.as_ref()).with_num_rows(Precision::Exact(100_000_000));
+        let plan = Arc::new(TestExecutionPlan::with_statistics_and_schema(
+            statistics, schema,
+        )) as Arc<dyn ExecutionPlan>;
+
+        assert_eq!(
+            Query::adaptive_flight_batch_size(&session, &request_context, &plan),
+            None
+        );
+    }
+
+    #[test]
+    fn adaptive_flight_batch_size_skips_non_flight_protocols() {
+        let session =
+            SessionContext::new_with_config(SessionConfig::new().with_batch_size(8192)).state();
+        let request_context = request_context_with_flight_batch_size(
+            Protocol::Http,
+            FlightBatchSize::Adaptive { max: 131_072 },
+        );
+        let statistics =
+            Statistics::new_unknown(&Schema::empty()).with_num_rows(Precision::Exact(100_000_000));
+        let plan =
+            Arc::new(TestExecutionPlan::with_statistics(statistics)) as Arc<dyn ExecutionPlan>;
+
+        assert_eq!(
+            Query::adaptive_flight_batch_size(&session, &request_context, &plan),
+            None
+        );
     }
 
     #[tokio::test]

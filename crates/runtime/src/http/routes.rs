@@ -98,6 +98,7 @@ use tower_http::limit::RequestBodyLimitLayer;
         v1::responses::post,
         v1::models::get,
         v1::workers::get,
+        v1::nsql::get_context,
         v1::nsql::post,
         v1::inference::get,
         v1::inference::post,
@@ -317,6 +318,7 @@ pub(crate) fn routes(
     search: Arc<search_engine::SearchEngine>,
     auth_layer: Option<AuthLayer>,
     cors_config: &CorsConfig,
+    metrics_tls: bool,
     #[cfg(feature = "mcp")] mcp_config: Option<&McpConfig>,
 ) -> Router {
     let mut authenticated_router = Router::new()
@@ -402,6 +404,7 @@ pub(crate) fn routes(
             .route("/v1/models", get(v1::models::get))
             .route("/v1/models/{name}/predict", get(v1::inference::get))
             .route("/v1/predict", post(v1::inference::post))
+            .route("/v1/nsql/context", get(v1::nsql::get_context))
             .route("/v1/nsql", post(v1::nsql::post).layer(ModelContextLayer))
             .route(
                 "/v1/chat/completions",
@@ -415,12 +418,12 @@ pub(crate) fn routes(
             .route("/v1/search", post(v1::search::post))
             .merge(tools_router)
             .route("/v1/workers", get(v1::workers::get))
-            .layer(Extension(Arc::clone(&rt.completion_llms)))
+            .layer(Extension(rt.completion_llms()))
             .layer(Extension(Arc::clone(&rt.models)))
             .layer(Extension(search))
             .layer(Extension(Arc::clone(&rt.embeds)))
             .layer(Extension(Arc::clone(&rt.workers)))
-            .layer(Extension(Arc::clone(&rt.responses_llms)));
+            .layer(Extension(rt.responses_llms()));
     }
 
     // Add async queries API routes - registered unconditionally for discoverability and consistency.
@@ -479,6 +482,7 @@ pub(crate) fn routes(
     authenticated_router = authenticated_router
         .layer(Extension(Arc::clone(rt)))
         .layer(Extension(rt.metrics_endpoint))
+        .layer(Extension(v1::status::MetricsTlsEnabled(metrics_tls)))
         .layer(Extension(config));
 
     // Apply request body size limit to prevent DoS attacks via unbounded request payloads
@@ -593,7 +597,7 @@ async fn track_metrics(
         KeyValue::new("status", status),
     ];
 
-    labels.extend(request_dimensions.into_iter());
+    labels.extend(request_dimensions);
 
     metrics::REQUESTS_TOTAL.add(1, &labels);
     metrics::REQUESTS.add(1, &labels);

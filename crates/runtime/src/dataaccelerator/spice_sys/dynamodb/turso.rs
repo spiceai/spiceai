@@ -30,18 +30,22 @@ impl DynamoDBSys {
 
         let conn = pool.connect().await.map_err(Error::external)?;
 
-        let create_table = format!(
-            "CREATE TABLE IF NOT EXISTS {DYNAMODB_STREAMS_TABLE_NAME} (
-                dataset_name TEXT PRIMARY KEY,
-                checkpoint_data TEXT,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )"
-        );
-        conn.execute(&create_table, ())
-            .await
-            .map_err(Error::external)?;
+        {
+            let _schema_guard = pool.acquire_schema_write_lock().await;
+            let create_table = format!(
+                "CREATE TABLE IF NOT EXISTS {DYNAMODB_STREAMS_TABLE_NAME} (
+                    dataset_name TEXT PRIMARY KEY,
+                    checkpoint_data TEXT,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )"
+            );
+            conn.execute(&create_table, ())
+                .await
+                .map_err(Error::external)?;
+        }
 
+        let _schema_guard = pool.acquire_schema_read_lock().await;
         let upsert = format!(
             "INSERT INTO {DYNAMODB_STREAMS_TABLE_NAME}
              (dataset_name, checkpoint_data, updated_at)

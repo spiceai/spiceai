@@ -284,6 +284,176 @@ pub enum SnapshotsCompaction {
     Enabled,
 }
 
+/// A Cayenne-maintained aggregate view declaration.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "schemars", derive(JsonSchema))]
+#[serde(deny_unknown_fields)]
+pub struct MaintainedAggregate {
+    /// Columns used as the `GROUP BY` key, in query output order.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub group_by: Vec<String>,
+
+    /// Aggregate expressions maintained for each group, in query output order.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub aggregates: Vec<MaintainedAggregateExpr>,
+}
+
+/// One aggregate expression inside a maintained aggregate view.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "schemars", derive(JsonSchema))]
+#[serde(deny_unknown_fields)]
+pub struct MaintainedAggregateExpr {
+    pub function: MaintainedAggregateFunction,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub column: Option<String>,
+}
+
+/// Aggregate functions supported by Cayenne maintained aggregate views.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "schemars", derive(JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum MaintainedAggregateFunction {
+    Count,
+    Sum,
+    Avg,
+}
+
+/// Controls whether configured maintained aggregates are materialized and
+/// updated incrementally by accelerators that support them.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "schemars", derive(JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum MaintainAggregates {
+    #[default]
+    Disabled,
+    Enabled,
+}
+
+impl MaintainAggregates {
+    #[must_use]
+    pub const fn is_enabled(self) -> bool {
+        matches!(self, Self::Enabled)
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "schemars", derive(JsonSchema))]
+#[serde(deny_unknown_fields)]
+pub struct MaintainedAggregatesConfig {
+    #[serde(default, alias = "enabled")]
+    pub mode: MaintainAggregates,
+
+    #[serde(
+        default,
+        alias = "aggregates",
+        alias = "specs",
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub views: Vec<MaintainedAggregate>,
+}
+
+impl Default for MaintainedAggregatesConfig {
+    fn default() -> Self {
+        Self {
+            mode: MaintainAggregates::Disabled,
+            views: Vec::new(),
+        }
+    }
+}
+
+/// Maintained aggregate configuration.
+///
+/// Accepts the original list form:
+/// `maintained_aggregates: [{ group_by: ..., aggregates: ... }]`, or a policy
+/// form with `mode` and `views` when the configured specs should be kept but
+/// not maintained.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "schemars", derive(JsonSchema))]
+#[serde(untagged)]
+pub enum MaintainedAggregates {
+    List(Vec<MaintainedAggregate>),
+    Config(MaintainedAggregatesConfig),
+    Mode(MaintainAggregates),
+}
+
+impl Default for MaintainedAggregates {
+    fn default() -> Self {
+        Self::Mode(MaintainAggregates::Disabled)
+    }
+}
+
+impl From<Vec<MaintainedAggregate>> for MaintainedAggregates {
+    fn from(aggregates: Vec<MaintainedAggregate>) -> Self {
+        Self::List(aggregates)
+    }
+}
+
+impl<'a> IntoIterator for &'a MaintainedAggregates {
+    type Item = &'a MaintainedAggregate;
+    type IntoIter = std::slice::Iter<'a, MaintainedAggregate>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.as_slice().iter()
+    }
+}
+
+impl MaintainedAggregates {
+    #[must_use]
+    pub fn new(mode: MaintainAggregates, views: Vec<MaintainedAggregate>) -> Self {
+        Self::Config(MaintainedAggregatesConfig { mode, views })
+    }
+
+    #[must_use]
+    pub fn is_enabled(&self) -> bool {
+        match self {
+            Self::List(aggregates) => !aggregates.is_empty(),
+            Self::Config(config) => config.mode.is_enabled(),
+            Self::Mode(mode) => mode.is_enabled(),
+        }
+    }
+
+    #[must_use]
+    pub fn enabled_aggregates(&self) -> &[MaintainedAggregate] {
+        if self.is_enabled() {
+            self.as_slice()
+        } else {
+            &[]
+        }
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.as_slice().is_empty()
+    }
+
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.as_slice().len()
+    }
+
+    pub fn iter(&self) -> std::slice::Iter<'_, MaintainedAggregate> {
+        self.as_slice().iter()
+    }
+
+    #[must_use]
+    pub fn is_default(&self) -> bool {
+        match self {
+            Self::List(aggregates) => aggregates.is_empty(),
+            Self::Config(config) => !config.mode.is_enabled() && config.views.is_empty(),
+            Self::Mode(mode) => !mode.is_enabled(),
+        }
+    }
+
+    #[must_use]
+    pub fn as_slice(&self) -> &[MaintainedAggregate] {
+        match self {
+            Self::List(aggregates) => aggregates,
+            Self::Config(config) => &config.views,
+            Self::Mode(_) => &[],
+        }
+    }
+}
+
 #[expect(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[cfg_attr(feature = "schemars", derive(JsonSchema))]
@@ -361,6 +531,9 @@ pub struct Acceleration {
 
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub on_conflict: HashMap<String, OnConflictBehavior>,
+
+    #[serde(default, skip_serializing_if = "is_default_maintained_aggregates")]
+    pub maintained_aggregates: MaintainedAggregates,
 
     /// Controls write behavior for read-write accelerated datasets.
     /// Only applies when `access: read_write` and the dataset is accelerated.
@@ -444,6 +617,10 @@ fn is_default_storage_profile(storage_profile: &StorageProfile) -> bool {
     *storage_profile == StorageProfile::Auto
 }
 
+fn is_default_maintained_aggregates(maintained_aggregates: &MaintainedAggregates) -> bool {
+    maintained_aggregates.is_default()
+}
+
 const fn default_true() -> bool {
     true
 }
@@ -476,6 +653,7 @@ impl Default for Acceleration {
             indexes: HashMap::default(),
             primary_key: None,
             on_conflict: HashMap::default(),
+            maintained_aggregates: MaintainedAggregates::default(),
             write_mode: WriteMode::default(),
             storage_profile: StorageProfile::default(),
             metrics: None,
@@ -549,6 +727,126 @@ mod tests {
             acceleration.on_conflict.get("foo"),
             Some(&OnConflictBehavior::Drop)
         );
+    }
+
+    #[test]
+    fn test_deserialize_maintained_aggregates() {
+        let yaml = r"
+                maintained_aggregates:
+                  - group_by: [customer_id]
+                    aggregates:
+                      - function: count
+                      - function: sum
+                        column: amount
+                      - function: avg
+                        column: latency_ms
+            ";
+        let acceleration: Acceleration =
+            yaml::from_str(yaml).expect("Failed to parse Acceleration");
+        assert!(acceleration.maintained_aggregates.is_enabled());
+        assert_eq!(acceleration.maintained_aggregates.len(), 1);
+        let maintained = &acceleration.maintained_aggregates.as_slice()[0];
+        assert_eq!(maintained.group_by, vec!["customer_id"]);
+        assert_eq!(
+            maintained.aggregates,
+            vec![
+                MaintainedAggregateExpr {
+                    function: MaintainedAggregateFunction::Count,
+                    column: None,
+                },
+                MaintainedAggregateExpr {
+                    function: MaintainedAggregateFunction::Sum,
+                    column: Some("amount".to_string()),
+                },
+                MaintainedAggregateExpr {
+                    function: MaintainedAggregateFunction::Avg,
+                    column: Some("latency_ms".to_string()),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn test_maintained_aggregates_disabled_by_default() {
+        let acceleration: Acceleration =
+            yaml::from_str("{}").expect("Failed to parse Acceleration");
+
+        assert!(!acceleration.maintained_aggregates.is_enabled());
+        assert!(
+            acceleration
+                .maintained_aggregates
+                .enabled_aggregates()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn test_deserialize_maintained_aggregates_config_defaults_disabled() {
+        let yaml = concat!(
+            "maintained_aggregates:\n",
+            "  views:\n",
+            "    - group_by: [customer_id]\n",
+            "      aggregates:\n",
+            "        - function: count\n",
+        );
+        let acceleration: Acceleration =
+            yaml::from_str(yaml).expect("Failed to parse Acceleration");
+
+        assert!(!acceleration.maintained_aggregates.is_enabled());
+        assert_eq!(acceleration.maintained_aggregates.len(), 1);
+        assert!(
+            acceleration
+                .maintained_aggregates
+                .enabled_aggregates()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn test_deserialize_maintained_aggregates_enabled_config() {
+        let yaml = concat!(
+            "maintained_aggregates:\n",
+            "  mode: enabled\n",
+            "  views:\n",
+            "    - group_by: [customer_id]\n",
+            "      aggregates:\n",
+            "        - function: count\n",
+        );
+        let acceleration: Acceleration =
+            yaml::from_str(yaml).expect("Failed to parse Acceleration");
+
+        assert!(acceleration.maintained_aggregates.is_enabled());
+        assert_eq!(
+            acceleration
+                .maintained_aggregates
+                .enabled_aggregates()
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn test_deserialize_maintained_aggregates_disabled_config() {
+        let yaml = concat!(
+            "maintained_aggregates:\n",
+            "  mode: disabled\n",
+            "  views:\n",
+            "    - group_by: [customer_id]\n",
+            "      aggregates:\n",
+            "        - function: count\n",
+        );
+        let acceleration: Acceleration =
+            yaml::from_str(yaml).expect("Failed to parse Acceleration");
+        assert!(!acceleration.maintained_aggregates.is_enabled());
+        assert_eq!(acceleration.maintained_aggregates.len(), 1);
+    }
+
+    #[test]
+    fn test_deserialize_maintained_aggregates_disabled_scalar() {
+        let acceleration: Acceleration = yaml::from_str("maintained_aggregates: disabled")
+            .expect("Failed to parse Acceleration");
+        assert!(!acceleration.maintained_aggregates.is_enabled());
+        assert!(acceleration.maintained_aggregates.is_empty());
     }
 
     #[test]

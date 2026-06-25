@@ -324,7 +324,7 @@ async fn test_inlined_upsert_survives_restart_impl(fixture: TestFixture) -> Test
     )?;
     insert_batch(&table, upsert).await?;
 
-    let connection_string = format!("sqlite://{}", fixture.db_path().to_string_lossy());
+    let connection_string = fixture.connection_string();
 
     // ---- Restart ----
     drop(table);
@@ -621,7 +621,7 @@ async fn test_double_inline_upsert_same_pk_impl(fixture: TestFixture) -> TestRes
     assert_eq!(v, vec![2222], "second upsert value should win");
 
     // ---- Restart ----
-    let connection_string = format!("sqlite://{}", fixture.db_path().to_string_lossy());
+    let connection_string = fixture.connection_string();
     drop(table);
     drop(ctx);
 

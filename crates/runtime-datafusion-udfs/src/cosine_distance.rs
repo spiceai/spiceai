@@ -30,7 +30,6 @@ use datafusion::{
     common::{DataFusionError, Result as DataFusionResult, exec_err},
     logical_expr::{ColumnarValue, ScalarUDFImpl, Signature, Volatility},
 };
-use std::any::Any;
 use std::sync::Arc;
 
 use crate::vector_simd::make_scalar_function;
@@ -67,10 +66,6 @@ impl CosineDistance {
 }
 
 impl ScalarUDFImpl for CosineDistance {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn name(&self) -> &'static str {
         COSINE_DISTANCE_UDF_NAME
     }

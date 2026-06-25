@@ -388,7 +388,7 @@ impl Github {
         let client = reqwest::Client::builder()
             .user_agent(util::spiceai_user_agent())
             .connect_timeout(Duration::from_secs(10))
-            .timeout(Duration::from_secs(120))
+            .timeout(Duration::from_mins(2))
             .gzip(true)
             .brotli(true)
             .zstd(true)
@@ -1838,11 +1838,7 @@ where
 
     let mut target_field = None;
     // loop over inner selection sets to find the target field if it's deep in a nest
-    loop {
-        let Some(selection) = all_selections.pop() else {
-            break;
-        };
-
+    while let Some(selection) = all_selections.pop() {
         match selection {
             graphql_parser::query::Selection::InlineFragment(InlineFragment {
                 selection_set,

@@ -31,7 +31,7 @@ use std::collections::HashMap;
 use std::fmt;
 use std::sync::Arc;
 use vortex_datafusion::VortexAccessPlan;
-use vortex_scan::Selection;
+use vortex_scan::selection::Selection;
 
 /// Position-based deletion state for a single data file.
 ///

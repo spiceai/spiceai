@@ -165,7 +165,7 @@ pub(crate) async fn provision_scp_app(
 
     // Always wait for spiced to accept SQL queries before returning.
     let poll_client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(600))
+        .timeout(Duration::from_mins(10))
         .build()?;
     commands::wait_for_deployment_ready(
         &poll_client,
@@ -200,6 +200,7 @@ pub(crate) async fn provision_scp_app(
         storage: FederatedStorageConfig::Direct, // will be replaced by setup() caller
         ec2_guards: vec![],
         dynamodb_guard: None,
+        mongodb_guard: None,
     })))
 }
 

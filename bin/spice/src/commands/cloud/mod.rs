@@ -28,7 +28,7 @@ use dialoguer::{Input, Password, Select, theme::ColorfulTheme};
 use snafu::ResultExt;
 use std::{fmt, io::IsTerminal};
 
-pub use client::{CloudClient, is_device_authorization_denied_error};
+pub use client::{CloudClient, is_device_authorization_denied_error, parse_org_app};
 pub use config::{CloudLink, get_linked_app, load_cloud_link, remove_cloud_link, save_cloud_link};
 use spice_cloud_client::{
     endpoints::{data_region_name, normalize_data_region},
@@ -795,7 +795,10 @@ async fn execute_login_api(args: &ApiLoginArgs) -> Result<()> {
         .exchange_client_credentials(&client_id, &client_secret)
         .await?;
 
-    save_token_and_print_login_result(&token).await
+    // Save the token and client credentials to the env file. Service-account
+    // tokens do not have a user context, so skip the auth-context check used
+    // for subscription/PAT logins.
+    save_api_credentials_and_print_login_result(&client_id, &client_secret, &token)
 }
 
 fn resolve_string_or_prompt(
@@ -914,6 +917,29 @@ async fn save_token_and_print_login_result(token: &str) -> Result<()> {
     Ok(())
 }
 
+fn save_api_credentials_and_print_login_result(
+    client_id: &str,
+    client_secret: &str,
+    token: &str,
+) -> Result<()> {
+    use crate::commands::login::merge_auth_config;
+
+    merge_auth_config("SPICEAI", &[("TOKEN", token)])?;
+    merge_auth_config(
+        "CLOUD",
+        &[("CLIENT_ID", client_id), ("CLIENT_SECRET", client_secret)],
+    )?;
+
+    println!();
+    println!("\x1b[32m✓ Successfully logged in to Spice Cloud with API credentials\x1b[0m");
+    println!("  Client ID: {client_id}");
+    println!();
+    println!("Credentials saved to env.");
+
+    print_post_login_help();
+    Ok(())
+}
+
 async fn execute_login_device_flow(open_browser: bool) -> Result<()> {
     use rand::RngExt;
 
@@ -954,7 +980,7 @@ async fn execute_login_device_flow(open_browser: bool) -> Result<()> {
     println!("Waiting for authentication...");
 
     // Poll for auth status
-    let timeout = std::time::Duration::from_secs(300); // 5 minutes
+    let timeout = std::time::Duration::from_mins(5); // 5 minutes
     let start = std::time::Instant::now();
 
     loop {
@@ -1020,7 +1046,10 @@ fn execute_logout() -> Result<()> {
     let lines: Vec<&str> = content
         .lines()
         .filter(|line| {
-            !line.starts_with("SPICE_SPICEAI_TOKEN=") && !line.starts_with("SPICE_SPICEAI_API_KEY=")
+            !line.starts_with("SPICE_SPICEAI_TOKEN=")
+                && !line.starts_with("SPICE_SPICEAI_API_KEY=")
+                && !line.starts_with("SPICE_CLOUD_CLIENT_ID=")
+                && !line.starts_with("SPICE_CLOUD_CLIENT_SECRET=")
         })
         .collect();
 
@@ -1045,7 +1074,26 @@ fn execute_logout() -> Result<()> {
 
 async fn execute_whoami(args: &WhoamiArgs) -> Result<()> {
     let client = CloudClient::new()?;
-    let context = client.get_auth_context().await?;
+
+    let context = match client.get_auth_context().await {
+        Ok(ctx) => ctx,
+        Err(err) if is_cloud_unauthorized_error(&err) => {
+            // The auth-context endpoint requires a user token (subscription
+            // or PAT). Service-account tokens (OAuth client credentials) are
+            // valid for API calls but do not have a user identity.
+            if client.list_apps().await.is_ok() {
+                return Err(crate::error::Error::InvalidArgument {
+                    message: "User identity is not available for this authentication method. \
+                        'spice cloud whoami' requires a user token (subscription or PAT login). \
+                        Use 'spice cloud login subscription' or 'spice cloud login pat' to obtain a user token. \
+                        The current token is a valid service-account token and can be used for API calls."
+                        .to_string(),
+                });
+            }
+            return Err(err);
+        }
+        Err(err) => return Err(err),
+    };
 
     if args.output == OutputFormat::Json {
         return write_json(&context);
@@ -1066,17 +1114,27 @@ async fn execute_link(args: &LinkArgs) -> Result<()> {
     // Verify the app exists
     let app = client.get_app(&args.app).await?;
 
+    // The API does not return `org` on app payloads, so derive it from the
+    // user-supplied argument (which must be in org/app format) and fall back
+    // to the API response only when it is present.
+    let (parsed_org, _) = parse_org_app(&args.app);
+    let org = if app.org.is_empty() {
+        parsed_org
+    } else {
+        app.org
+    };
+
     // Save the link
     let link = CloudLink {
-        org: app.org.clone(),
-        app: app.name.clone(),
+        org,
+        app: app.name,
         app_id: Some(app.id),
         region: app.region,
         linked_at: Some(chrono::Utc::now().to_rfc3339()),
     };
     save_cloud_link(&link)?;
 
-    println!("\x1b[32m✓ Linked to app {}/{}\x1b[0m", link.org, link.app);
+    println!("\x1b[32m✓ Linked to app {}\x1b[0m", link.full_name());
     println!();
     println!("You can now use commands without specifying --app:");
     println!("  spice cloud deploy");
@@ -1094,7 +1152,7 @@ fn execute_unlink() -> Result<()> {
 
 async fn execute_apps(args: &AppsArgs) -> Result<()> {
     let client = CloudClient::new()?;
-    let context = client.get_auth_context().await?;
+    let context = client.optional_user_auth_context().await?;
     let apps = client.list_apps().await?;
 
     if apps.is_empty() {
@@ -1114,7 +1172,8 @@ async fn execute_apps(args: &AppsArgs) -> Result<()> {
         "CREATED",
     ]);
     for app in &apps {
-        let display_name = display_app_name(app, &context.org_name);
+        let context_org = context.as_ref().map_or("", |c| c.org_name.as_str());
+        let display_name = display_app_name(app, context_org);
         table.add_row(vec![
             display_name,
             app.description.clone().unwrap_or_default(),
@@ -1128,6 +1187,14 @@ async fn execute_apps(args: &AppsArgs) -> Result<()> {
     table.print();
 
     Ok(())
+}
+
+fn is_cloud_unauthorized_error(err: &crate::error::Error) -> bool {
+    matches!(
+        err,
+        crate::error::Error::InvalidArgument { message }
+            if message.starts_with("Unauthorized:")
+    )
 }
 
 /// Format an app's display name as `org/name`, falling back to the auth
@@ -1887,6 +1954,24 @@ mod tests {
                 .contains("Choose a login type explicitly when running non-interactively"),
             "unexpected error: {err}"
         );
+    }
+
+    #[test]
+    fn is_cloud_unauthorized_error_matches_invalid_argument_prefix() {
+        let err = crate::error::Error::InvalidArgument {
+            message: "Unauthorized: token expired".to_string(),
+        };
+
+        assert!(is_cloud_unauthorized_error(&err));
+    }
+
+    #[test]
+    fn is_cloud_unauthorized_error_rejects_unrelated_errors() {
+        let err = crate::error::Error::InvalidArgument {
+            message: "Forbidden: missing scope".to_string(),
+        };
+
+        assert!(!is_cloud_unauthorized_error(&err));
     }
 
     #[test]

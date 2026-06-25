@@ -30,9 +30,32 @@ use data_components::{
             hadoop::{HadoopCatalogBuilder, MetadataMode},
             rest::RestCatalog,
         },
-        provider::IcebergCatalogProvider,
+        provider::{CatalogTableWrapper, IcebergCatalogProvider},
     },
 };
+use datafusion::catalog::TableProvider;
+use datafusion::sql::TableReference;
+
+use crate::dataconnector::iceberg_cluster::IcebergClusterTableProvider;
+
+/// Builds the hook that makes catalog-sourced Iceberg scans serializable for
+/// distributed (Ballista) execution.
+///
+/// Each loaded table provider is wrapped in an [`IcebergClusterTableProvider`]
+/// keyed by its fully-qualified `catalog.schema.table` reference — mirroring the
+/// single-dataset Iceberg data connector, which wraps every dataset the same
+/// way. All three parts are qualified because a remote executor resolves the
+/// recipe's reference through `get_table_sync`, which needs the catalog and
+/// schema to locate this provider. In a single-node session the wrapper is a
+/// transparent pass-through, so non-distributed catalogs are unaffected.
+fn cluster_table_wrapper(catalog_name: &str) -> CatalogTableWrapper {
+    let catalog_name = catalog_name.to_string();
+    Arc::new(move |schema: &str, table: &str, provider| {
+        let table_ref =
+            TableReference::full(catalog_name.clone(), schema.to_string(), table.to_string());
+        Arc::new(IcebergClusterTableProvider::new(table_ref, provider)) as Arc<dyn TableProvider>
+    })
+}
 use iceberg::{CatalogBuilder, Namespace, NamespaceIdent, io::StorageFactory};
 use iceberg_catalog_rest::{
     REST_CATALOG_PROP_URI, RestCatalog as IcebergRestCatalog, RestCatalogBuilder,
@@ -115,6 +138,7 @@ impl IcebergCatalog {
         s3_credential_loader: Option<CustomAwsCredentialLoader>,
         catalog: &Catalog,
         catalog_id: &str,
+        table_wrapper: Option<CatalogTableWrapper>,
     ) -> super::Result<Arc<dyn RefreshableCatalogProvider>> {
         let operator = build_opendal_operator(catalog_id, &props).map_err(|e| {
             super::Error::InvalidConfiguration {
@@ -132,18 +156,12 @@ impl IcebergCatalog {
             .with_operator(operator)
             .with_properties(props);
 
-        // Use a builder closure for the storage factory so that scheme inference
-        // (e.g. inferring `s3a://` from table metadata when the warehouse root is
-        // configured as `s3://`) can rebuild the factory with the new scheme. The
-        // S3 `OpenDalStorageFactory` validates that paths match the configured
-        // scheme, so the factory must be reconstructed when the scheme changes.
         if catalog_id.starts_with("gs://") || catalog_id.starts_with("gcs://") {
             catalog_builder =
                 catalog_builder.with_storage_factory(Arc::new(OpenDalStorageFactory::Gcs));
         } else if catalog_id.starts_with("s3://") || catalog_id.starts_with("s3a://") {
-            catalog_builder = catalog_builder.with_storage_factory_builder(move |scheme| {
+            catalog_builder = catalog_builder.with_storage_factory_builder(move |_scheme| {
                 Arc::new(OpenDalStorageFactory::S3 {
-                    configured_scheme: scheme.to_string(),
                     customized_credential_load: s3_credential_loader.clone(),
                 })
             });
@@ -169,6 +187,7 @@ impl IcebergCatalog {
             Arc::new(hadoop_catalog),
             None,
             catalog.include.as_ref(),
+            table_wrapper,
         )
         .await
         .map_err(|e| super::Error::UnableToGetCatalogProvider {
@@ -181,7 +200,7 @@ impl IcebergCatalog {
     }
 }
 
-pub const ICEBERG_PARAM_LEN: usize = 23;
+pub const ICEBERG_PARAM_LEN: usize = 24;
 pub const PARAMETERS: [ParameterSpec; ICEBERG_PARAM_LEN] = [
     ParameterSpec::component("token")
         .secret()
@@ -243,6 +262,9 @@ pub const PARAMETERS: [ParameterSpec; ICEBERG_PARAM_LEN] = [
         .secret(),
     ParameterSpec::component("s3_connect_timeout")
         .description("Configure socket connection timeout, in seconds (default: 60)."),
+    ParameterSpec::component("s3_path_style_access")
+        .description("Controls S3 addressing style. Defaults to 'true' (path-style: endpoint/bucket), which is required for object stores such as MinIO. Set to 'false' to use virtual-hosted-style (bucket.endpoint).")
+        .default("true"),
 
     // GCS storage options
     ParameterSpec::component("gcs_project_id")
@@ -258,16 +280,6 @@ pub const PARAMETERS: [ParameterSpec; ICEBERG_PARAM_LEN] = [
     ParameterSpec::component("gcs_no_auth")
         .description("Set to 'true' to allow anonymous access to GCS (for public buckets)."),
 ];
-
-/// Returns the S3 scheme (`"s3a"` or `"s3"`) from a URL that is known to start with
-/// an S3-family scheme. Any non-`s3a://` prefix is treated as plain `"s3"`.
-pub(crate) fn s3_scheme_from_url(url: &str) -> String {
-    if url.starts_with("s3a://") {
-        "s3a".to_string()
-    } else {
-        "s3".to_string()
-    }
-}
 
 /// Maps a Spice parameter name to an Iceberg property name.
 pub(crate) fn map_param_name_to_iceberg_prop(param_name: &str) -> Option<Vec<String>> {
@@ -290,6 +302,7 @@ pub(crate) fn map_param_name_to_iceberg_prop(param_name: &str) -> Option<Vec<Str
             "rest.session-token".to_string(),
         ]),
         "s3_region" => Some(vec!["s3.region".to_string()]),
+        "s3_path_style_access" => Some(vec!["s3.path-style-access".to_string()]),
         "s3_role_session_name" => Some(vec![
             "client.assume-role.session-name".to_string(),
             "rest.client.assume-role.session-name".to_string(),
@@ -332,6 +345,10 @@ impl CatalogConnector for IcebergCatalog {
                 },
             );
         };
+
+        // Wrap every catalog table so its scans serialize for distributed
+        // execution, mirroring the single-dataset Iceberg connector.
+        let table_wrapper = Some(cluster_table_wrapper(&catalog.name));
 
         let mut props = HashMap::new();
         for (key, value) in &self.params {
@@ -397,24 +414,14 @@ impl CatalogConnector for IcebergCatalog {
                 s3_credential_loader,
                 catalog,
                 &catalog_id,
+                table_wrapper,
             )
             .await;
         }
 
-        // For the REST catalog path, materialize the storage factory now so it can
-        // be passed to `get_rest_catalog`. The configured scheme is derived from the
-        // catalog's `warehouse` property (if present) since `catalog_id` is an HTTP
-        // URL for REST catalogs and would otherwise always resolve to plain `s3`.
-        // Falling back to `catalog_id` preserves prior behavior for callers that
-        // do not set a `warehouse` property.
-        let configured_s3_scheme = props.get("warehouse").map_or_else(
-            || s3_scheme_from_url(&catalog_id),
-            |w| s3_scheme_from_url(w),
-        );
         let storage_factory: Option<Arc<dyn StorageFactory>> =
             s3_credential_loader.map(|custom_loader| {
                 Arc::new(OpenDalStorageFactory::S3 {
-                    configured_scheme: configured_s3_scheme,
                     customized_credential_load: Some(custom_loader),
                 }) as Arc<dyn StorageFactory>
             });
@@ -441,6 +448,7 @@ impl CatalogConnector for IcebergCatalog {
             Arc::new(catalog_client),
             namespace.map(|n| n.name().clone()),
             catalog.include.as_ref(),
+            table_wrapper,
         )
         .await
         .map_err(|e| super::Error::UnableToGetCatalogProvider {
@@ -675,7 +683,6 @@ fn default_storage_factory_from_props(props: &HashMap<String, String>) -> Arc<dy
         Arc::new(OpenDalStorageFactory::Gcs)
     } else {
         Arc::new(OpenDalStorageFactory::S3 {
-            configured_scheme: "s3".to_string(),
             customized_credential_load: None,
         })
     }

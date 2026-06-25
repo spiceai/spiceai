@@ -523,6 +523,19 @@ impl ExecutorRegistry {
         connections.keys().cloned().collect()
     }
 
+    /// Best-effort SYNCHRONOUS snapshot of ready executor IDs (`host:port`, no
+    /// scheme — the same form `executor_table` expects after prepending a
+    /// scheme). Returns empty if the lock is momentarily contended. Used by the
+    /// broadcast-join physical optimizer rule, which runs in a sync planning
+    /// context and cannot await.
+    #[must_use]
+    pub fn ready_executor_ids_sync(&self) -> Vec<String> {
+        match self.flight_sql_clients.try_read() {
+            Ok(clients) => clients.keys().cloned().collect(),
+            Err(_) => Vec::new(),
+        }
+    }
+
     /// Sends a control message to a specific executor and waits for an Ack
     /// correlated by `request_id`.
     ///

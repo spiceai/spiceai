@@ -388,7 +388,7 @@ impl DataConnector for Kafka {
     fn append_stream(&self, federated_table: Arc<FederatedTable>) -> Option<ChangesStream> {
         Some(Box::pin(stream! {
             let table_provider = federated_table.table_provider().await;
-            let Some(kafka) = table_provider.as_any().downcast_ref::<data_components::kafka::Kafka>() else {
+            let Some(kafka) = table_provider.downcast_ref::<data_components::kafka::Kafka>() else {
                 return;
             };
 

@@ -222,7 +222,7 @@ async fn collect_served_at(rt: &Runtime, ctx: &Arc<RequestContext>) -> usize {
     // in `accelerated_table::caching`). Wait long enough that the write
     // is guaranteed to have landed in the accelerator before the next
     // scan looks for the row.
-    tokio::time::sleep(std::time::Duration::from_millis(1_000)).await;
+    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
     value
 }
 
@@ -295,7 +295,7 @@ async fn caching_accelerator_isolates_per_principal_e2e() -> Result<(), anyhow::
             let rt = Runtime::builder().with_app(app).build().await;
             let load_rt = Arc::new(rt.clone());
             tokio::select! {
-                () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+                () = tokio::time::sleep(std::time::Duration::from_mins(1)) => {
                     return Err(anyhow::Error::msg(
                         "Timed out waiting for caching dataset to load",
                     ));
@@ -441,7 +441,7 @@ async fn caching_accelerator_hides_namespace_column_from_user_schema() -> Result
             let rt = Runtime::builder().with_app(app).build().await;
             let load_rt = Arc::new(rt.clone());
             tokio::select! {
-                () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+                () = tokio::time::sleep(std::time::Duration::from_mins(1)) => {
                     return Err(anyhow::Error::msg(
                         "Timed out waiting for caching dataset to load",
                     ));

@@ -10,6 +10,7 @@ version.workspace = true
 
 [dependencies]
 secrecy.workspace = true
+sha2.workspace = true
 snafu.workspace = true
 tokio.workspace = true
 tracing.workspace = true

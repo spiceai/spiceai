@@ -71,7 +71,18 @@ where
     let driver_span = span.clone();
 
     let driver_task = async move {
-        match future.instrument(driver_span.clone()).await {
+        // Scope the planning/execution future under the originating request
+        // context so task-local reads (`RequestContext::current()`) resolve to
+        // the request's context on this managed runtime task. The streaming
+        // loop below is already scoped; without scoping the future too, code
+        // that reads the task-local context during query planning/execution
+        // (identity UDFs like `current_user_id()`/`current_org_id()`, task
+        // history attribution, per-principal cache namespacing) falls back to
+        // the empty/anonymous context.
+        match Arc::clone(&driver_request_context)
+            .scope(future.instrument(driver_span.clone()))
+            .await
+        {
             Ok((metadata, mut stream)) => {
                 let schema = stream.schema();
 

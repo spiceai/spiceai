@@ -32,7 +32,7 @@ use std::time::Duration;
 
 use futures::StreamExt;
 use object_store::path::Path;
-use object_store::{Error as ObjectStoreError, ObjectStore, PutMode, PutOptions};
+use object_store::{Error as ObjectStoreError, ObjectStore, ObjectStoreExt, PutMode, PutOptions};
 use serde::{Deserialize, Serialize};
 use snafu::{ResultExt, Snafu};
 use util::fibonacci_backoff::FibonacciBackoffBuilder;

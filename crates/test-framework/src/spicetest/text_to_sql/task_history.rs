@@ -20,7 +20,6 @@ use tokio::time::sleep;
 
 use anyhow::Result;
 use arrow::array::{Array, Int64Array, RecordBatch, StringArray};
-use futures::TryStreamExt;
 use opentelemetry::trace::TraceId;
 
 /// Metrics from `runtime.task_history` for a `nsql` operation.
@@ -299,38 +298,44 @@ async fn retry_query_until_llm_found(
         let query = query.clone();
         let data = Arc::clone(&data);
         async move {
-            match spice_client.sql(&query).await {
-                Ok(stream) => {
-                    let Some(rbs) = stream.try_collect::<Vec<RecordBatch>>().await.ok() else {
-                        sleep(Duration::from_secs(1)).await;
-                        return false;
-                    };
-
-                    let Some(rb) = rbs.first() else {
-                        sleep(Duration::from_secs(1)).await;
-                        return false;
-                    };
-
-                    if rb.num_rows() == 0 {
-                        sleep(Duration::from_secs(1)).await;
-                        return false;
-                    }
-
-                    // Check if llm_count > 0
-                    let llm_count = rb
-                        .column_by_name("llm_count")
-                        .and_then(|c| c.as_any().downcast_ref::<Int64Array>())
-                        .map_or(0, |a| a.value(0));
-
-                    if llm_count > 0 {
-                        *data.lock().await = Some(rbs);
-                        true
-                    } else {
-                        sleep(Duration::from_secs(1)).await;
-                        false
-                    }
+            // Back off on transient query errors so we don't hot-loop at the
+            // `wait_until_true` poll interval (matches the empty-result backoff below).
+            let Ok(rbs) = async {
+                let mut stream = spice_client.sql(&query).await?;
+                let mut batches = Vec::new();
+                while let Some(batch) = futures::StreamExt::next(&mut stream).await {
+                    batches.push(batch?);
                 }
-                Err(_) => false,
+                anyhow::Ok(batches)
+            }
+            .await
+            else {
+                sleep(Duration::from_secs(1)).await;
+                return false;
+            };
+
+            let Some(rb) = rbs.first() else {
+                sleep(Duration::from_secs(1)).await;
+                return false;
+            };
+
+            if rb.num_rows() == 0 {
+                sleep(Duration::from_secs(1)).await;
+                return false;
+            }
+
+            // Check if llm_count > 0
+            let llm_count = rb
+                .column_by_name("llm_count")
+                .and_then(|c| c.as_any().downcast_ref::<Int64Array>())
+                .map_or(0, |a| a.value(0));
+
+            if llm_count > 0 {
+                *data.lock().await = Some(rbs);
+                true
+            } else {
+                sleep(Duration::from_secs(1)).await;
+                false
             }
         }
     })
@@ -352,21 +357,28 @@ async fn retry_query_expecting_results(
         let query = query.clone();
         let data = Arc::clone(&data);
         async move {
-            match spice_client.sql(&query).await {
-                Ok(stream) => {
-                    let Some(rbs) = stream.try_collect::<Vec<RecordBatch>>().await.ok() else {
-                        sleep(Duration::from_secs(1)).await;
-                        return false;
-                    };
-                    if rbs.first().is_none_or(|rb| rb.num_rows() == 0) {
-                        sleep(Duration::from_secs(1)).await;
-                        false
-                    } else {
-                        *data.lock().await = Some(rbs);
-                        true
-                    }
+            // Back off on transient query errors so we don't hot-loop at the
+            // `wait_until_true` poll interval (matches the empty-result backoff below).
+            let Ok(rbs) = async {
+                let mut stream = spice_client.sql(&query).await?;
+                let mut batches = Vec::new();
+                while let Some(batch) = futures::StreamExt::next(&mut stream).await {
+                    batches.push(batch?);
                 }
-                Err(_) => false,
+                anyhow::Ok(batches)
+            }
+            .await
+            else {
+                sleep(Duration::from_secs(1)).await;
+                return false;
+            };
+
+            if rbs.first().is_none_or(|rb| rb.num_rows() == 0) {
+                sleep(Duration::from_secs(1)).await;
+                false
+            } else {
+                *data.lock().await = Some(rbs);
+                true
             }
         }
     })

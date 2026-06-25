@@ -42,7 +42,10 @@ use ansi_colors::Color;
 use arrow::array::RecordBatch;
 use clap::Parser;
 use config::get_user_agent;
-use flight_client::{MAX_DECODING_MESSAGE_SIZE, MAX_ENCODING_MESSAGE_SIZE, TonicStatusError};
+use flight_client::{
+    MAX_DECODING_MESSAGE_SIZE, MAX_ENCODING_MESSAGE_SIZE, TonicStatusError,
+    configure_endpoint_for_high_throughput,
+};
 use futures::{StreamExt, TryStreamExt};
 use prost::Message;
 use reqwest::Client;
@@ -854,7 +857,8 @@ async fn connect_channel(
     user_agent: &str,
     tls_config: Option<ClientTlsConfig>,
 ) -> Result<Channel, Box<dyn std::error::Error>> {
-    let mut endpoint = Channel::from_shared(endpoint)?.user_agent(user_agent.to_string())?;
+    let mut endpoint = configure_endpoint_for_high_throughput(Channel::from_shared(endpoint)?)
+        .user_agent(user_agent.to_string())?;
     if let Some(tls_config) = tls_config {
         endpoint = endpoint.tls_config(tls_config)?;
     }

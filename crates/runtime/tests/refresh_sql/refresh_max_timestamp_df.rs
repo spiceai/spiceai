@@ -57,7 +57,7 @@ async fn test_refresh_max_timestamp_df() -> anyhow::Result<()> {
             let cloned_rt = Arc::new(rt.clone());
 
             tokio::select! {
-                () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+                () = tokio::time::sleep(std::time::Duration::from_mins(1)) => {
                     return Err(anyhow::anyhow!("Timed out waiting for datasets to load"));
                 }
                 () = cloned_rt.load_components() => {}
@@ -99,7 +99,6 @@ async fn test_refresh_max_timestamp_df() -> anyhow::Result<()> {
                 .expect("Failed to create external table");
 
             accelerated_table
-                .as_any()
                 .downcast_ref::<PolyTableProvider>()
                 .expect("Expected PolyTableProvider");
 
@@ -155,7 +154,7 @@ async fn test_accelerator_table_provider() -> anyhow::Result<()> {
             let cloned_rt = Arc::new(rt.clone());
 
             tokio::select! {
-                () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+                () = tokio::time::sleep(std::time::Duration::from_mins(1)) => {
                     return Err(anyhow::anyhow!("Timed out waiting for datasets to load"));
                 }
                 () = cloned_rt.load_components() => {}
@@ -197,14 +196,12 @@ async fn test_accelerator_table_provider() -> anyhow::Result<()> {
                 .expect("Failed to create external table");
 
             accelerated_table
-                .as_any()
                 .downcast_ref::<PolyTableProvider>()
                 .expect("Expected PolyTableProvider");
 
             let table_provider = accelerator_table_provider(&accelerated_table);
 
             let federated_table_adaptor = table_provider
-                .as_any()
                 .downcast_ref::<FederatedTableProviderAdaptor>()
                 .expect("Expected FederatedTableProviderAdaptor");
 
@@ -212,7 +209,6 @@ async fn test_accelerator_table_provider() -> anyhow::Result<()> {
                 .table_provider
                 .as_ref()
                 .expect("Expected table provider")
-                .as_any()
                 .downcast_ref::<EnsureSchema>()
                 .expect("Expected EnsureSchema");
 

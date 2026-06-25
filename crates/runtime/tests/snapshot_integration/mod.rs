@@ -39,7 +39,7 @@ use datafusion::sql::TableReference;
 use duckdb::Connection;
 use futures::{StreamExt, future::try_join_all};
 use object_store::{
-    ClientOptions, ObjectMeta, ObjectStore,
+    ClientOptions, ObjectMeta, ObjectStore, ObjectStoreExt,
     aws::AmazonS3Builder,
     path::{Path as ObjectPath, PathPart},
 };
@@ -101,7 +101,7 @@ impl SnapshotS3Context {
     }
 
     async fn metadata_json(&self) -> Result<Value> {
-        let metadata_path = self.base_path.child(PathPart::from("metadata.json"));
+        let metadata_path = self.base_path.clone().join(PathPart::from("metadata.json"));
         let data = self
             .store
             .get(&metadata_path)
@@ -176,7 +176,7 @@ impl SnapshotS3Context {
     }
 
     async fn write_metadata(&self, metadata: &Value) -> Result<()> {
-        let metadata_path = self.base_path.child(PathPart::from("metadata.json"));
+        let metadata_path = self.base_path.clone().join(PathPart::from("metadata.json"));
         let bytes =
             serde_json::to_vec_pretty(metadata).context("Serializing snapshot metadata to JSON")?;
         self.store
@@ -411,7 +411,7 @@ async fn build_snapshot_store() -> Result<Arc<dyn ObjectStore>> {
 }
 
 async fn load_runtime(rt: Arc<Runtime>) -> Result<()> {
-    timeout(Duration::from_secs(180), Arc::clone(&rt).load_components())
+    timeout(Duration::from_mins(3), Arc::clone(&rt).load_components())
         .await
         .map_err(|_| anyhow!("Timed out waiting for runtime components to load"))?;
     runtime_ready_check(rt.as_ref()).await;
@@ -479,7 +479,7 @@ async fn prepare_duckdb_fixture(test_name: &str) -> Result<SnapshotFixture> {
     runtime.shutdown().await;
 
     let snapshot_objects = context
-        .wait_for_snapshot_objects(TAXI_TRIPS_DATASET_NAME, 1, Duration::from_secs(60))
+        .wait_for_snapshot_objects(TAXI_TRIPS_DATASET_NAME, 1, Duration::from_mins(1))
         .await?;
     let metadata = build_metadata_document(
         &context,
@@ -567,7 +567,7 @@ async fn prepare_sqlite_fixture(test_name: &str) -> Result<SnapshotFixture> {
     runtime.shutdown().await;
 
     let snapshot_objects = context
-        .wait_for_snapshot_objects(TAXI_TRIPS_DATASET_NAME, 1, Duration::from_secs(60))
+        .wait_for_snapshot_objects(TAXI_TRIPS_DATASET_NAME, 1, Duration::from_mins(1))
         .await?;
     let metadata = build_metadata_document(
         &context,
@@ -1024,7 +1024,7 @@ async fn snapshot_int_test6_concurrent_snapshot_writes_retry() -> Result<()> {
                 .wait_for_snapshot_objects(
                     TAXI_TRIPS_DATASET_NAME,
                     expected_minimum,
-                    Duration::from_secs(60),
+                    Duration::from_mins(1),
                 )
                 .await?;
             assert!(
@@ -1127,7 +1127,7 @@ async fn snapshot_int_test7_respects_current_snapshot_metadata_selection() -> Re
                 .wait_for_snapshot_objects(
                     TAXI_TRIPS_DATASET_NAME,
                     fixture.initial_snapshot_count + 1,
-                    Duration::from_secs(60),
+                    Duration::from_mins(1),
                 )
                 .await?;
             let updated_metadata = build_metadata_document(
@@ -1522,7 +1522,7 @@ async fn snapshot_int_test9_onchange_policy_skips_when_no_changes() -> Result<()
                 .wait_for_snapshot_objects(
                     TAXI_TRIPS_DATASET_NAME,
                     fixture.initial_snapshot_count + 1,
-                    Duration::from_secs(60),
+                    Duration::from_mins(1),
                 )
                 .await?;
 
@@ -1592,7 +1592,7 @@ async fn snapshot_int_test9_onchange_policy_skips_when_no_changes() -> Result<()
                 .wait_for_snapshot_objects(
                     TAXI_TRIPS_DATASET_NAME,
                     snapshot_count_after_first + 1,
-                    Duration::from_secs(60),
+                    Duration::from_mins(1),
                 )
                 .await?;
 
@@ -1680,7 +1680,7 @@ async fn snapshot_int_test10_onchange_policy_skips_interval_based_snapshots() ->
 
             // Wait for snapshot to appear
             let snapshots_after = context
-                .wait_for_snapshot_objects(TAXI_TRIPS_DATASET_NAME, 1, Duration::from_secs(60))
+                .wait_for_snapshot_objects(TAXI_TRIPS_DATASET_NAME, 1, Duration::from_mins(1))
                 .await?;
 
             assert_eq!(
@@ -1768,7 +1768,7 @@ async fn snapshot_int_test11_interval_based_snapshots() -> Result<()> {
 
             // Wait for snapshot to appear
             let snapshots_after = context
-                .wait_for_snapshot_objects(TAXI_TRIPS_DATASET_NAME, 1, Duration::from_secs(60))
+                .wait_for_snapshot_objects(TAXI_TRIPS_DATASET_NAME, 1, Duration::from_mins(1))
                 .await?;
 
             assert_eq!(
@@ -1889,7 +1889,7 @@ async fn snapshot_int_test12_onchange_policy_skips_refresh_based_snapshots() -> 
 
             // Wait for snapshot to appear
             let snapshots_after = context
-                .wait_for_snapshot_objects(TAXI_TRIPS_DATASET_NAME, 1, Duration::from_secs(60))
+                .wait_for_snapshot_objects(TAXI_TRIPS_DATASET_NAME, 1, Duration::from_mins(1))
                 .await?;
 
             assert_eq!(
@@ -2003,7 +2003,7 @@ async fn snapshot_int_test13_refresh_based_snapshots() -> Result<()> {
 
             // Wait for snapshot to appear
             let snapshots_after = context
-                .wait_for_snapshot_objects(TAXI_TRIPS_DATASET_NAME, 1, Duration::from_secs(60))
+                .wait_for_snapshot_objects(TAXI_TRIPS_DATASET_NAME, 1, Duration::from_mins(1))
                 .await?;
 
             assert_eq!(

@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::{any::Any, borrow::Cow, sync::Arc};
+use std::{borrow::Cow, sync::Arc};
 
 use async_trait::async_trait;
 use datafusion::{
@@ -98,10 +98,6 @@ impl IndexedTableProvider {
 #[deny(clippy::missing_trait_methods)]
 #[async_trait]
 impl TableProvider for IndexedTableProvider {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema(&self) -> SchemaRef {
         self.underlying.schema()
     }

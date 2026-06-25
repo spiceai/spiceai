@@ -320,7 +320,7 @@ fn into_ordered_fallbacks(cfg: &[worker::RouterConfig]) -> Vec<(String, u32)> {
         })
         .collect::<Vec<_>>();
 
-    fallbacks.sort_by(|(_, a), (_, b)| a.cmp(b));
+    fallbacks.sort_by_key(|(_, a)| *a);
     fallbacks
 }
 

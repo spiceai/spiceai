@@ -30,7 +30,7 @@ pub fn do_put_idle_timeout() -> std::time::Duration {
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
         .map_or(
-            std::time::Duration::from_secs(120),
+            std::time::Duration::from_mins(2),
             std::time::Duration::from_secs,
         )
 }

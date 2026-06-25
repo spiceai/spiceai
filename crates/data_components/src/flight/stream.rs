@@ -35,7 +35,7 @@ use datafusion::{
 use flight_client::FlightClient;
 use futures::{Stream, StreamExt};
 use snafu::prelude::*;
-use std::{any::Any, fmt, sync::Arc};
+use std::{fmt, sync::Arc};
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -105,10 +105,6 @@ impl FlightTableStreamer {
 
 #[async_trait]
 impl TableProvider for FlightTableStreamer {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema(&self) -> SchemaRef {
         Arc::clone(&self.schema)
     }
@@ -141,7 +137,7 @@ struct FlightStreamExec {
     table_reference: TableReference,
     client: FlightClient,
     schema: SchemaRef,
-    properties: PlanProperties,
+    properties: Arc<PlanProperties>,
 }
 
 impl FlightStreamExec {
@@ -150,14 +146,14 @@ impl FlightStreamExec {
             table_reference: table_reference.clone(),
             client,
             schema: Arc::clone(schema),
-            properties: PlanProperties::new(
+            properties: Arc::new(PlanProperties::new(
                 EquivalenceProperties::new(Arc::clone(schema)),
                 Partitioning::UnknownPartitioning(1),
                 EmissionType::Incremental,
                 Boundedness::Unbounded {
                     requires_infinite_memory: false,
                 },
-            ),
+            )),
         }
     }
 }
@@ -179,15 +175,11 @@ impl ExecutionPlan for FlightStreamExec {
         "FlightStreamExec"
     }
 
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema(&self) -> SchemaRef {
         Arc::clone(&self.schema)
     }
 
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
     }
 

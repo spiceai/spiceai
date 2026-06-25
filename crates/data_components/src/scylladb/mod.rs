@@ -29,7 +29,7 @@ limitations under the License.
 mod cql_dialect;
 pub mod table_schema;
 
-use std::{any::Any, fmt, sync::Arc};
+use std::{fmt, sync::Arc};
 
 use async_trait::async_trait;
 use datafusion::{
@@ -101,10 +101,6 @@ impl fmt::Display for ScyllaDbTable {
 
 #[async_trait]
 impl TableProvider for ScyllaDbTable {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema(&self) -> datafusion::arrow::datatypes::SchemaRef {
         self.base_table.schema()
     }

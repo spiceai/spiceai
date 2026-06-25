@@ -512,7 +512,7 @@ async fn route_batch_and_assign_unseen(
 
     // Update in-memory filters and forward rows for each partition.
     for ((scalar_values, _partition_value, sub_batch), executor_id) in
-        entries.into_iter().zip(executor_ids.into_iter())
+        entries.into_iter().zip(executor_ids)
     {
         tracing::debug!(
             table = %path,

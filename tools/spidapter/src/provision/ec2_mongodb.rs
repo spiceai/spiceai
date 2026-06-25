@@ -209,6 +209,7 @@ processManagement:
   timeZoneInfo: /usr/share/zoneinfo
 replication:
   replSetName: rs0
+  oplogSizeMB: 10240
 MONGODCONF
 
 systemctl enable mongod
@@ -249,6 +250,7 @@ processManagement:
   timeZoneInfo: /usr/share/zoneinfo
 replication:
   replSetName: rs0
+  oplogSizeMB: 10240
 security:
   authorization: enabled
   keyFile: /etc/mongodb-keyfile
@@ -262,7 +264,7 @@ until mongosh "mongodb://$MONGO_USER:$MONGO_PASSWORD@localhost:27017/$MONGO_DB?a
 }
 
 async fn wait_for_mongodb(host: &str, port: u16) -> anyhow::Result<()> {
-    let timeout = Duration::from_secs(600);
+    let timeout = Duration::from_mins(10);
     let started = tokio::time::Instant::now();
 
     loop {
@@ -285,7 +287,7 @@ async fn wait_for_mongodb(host: &str, port: u16) -> anyhow::Result<()> {
 }
 
 async fn wait_for_instance_running(ec2: &Ec2Client, instance_id: &str) -> anyhow::Result<()> {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(300);
+    let deadline = tokio::time::Instant::now() + Duration::from_mins(5);
     loop {
         if tokio::time::Instant::now() > deadline {
             anyhow::bail!(

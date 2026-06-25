@@ -32,7 +32,7 @@ pub const KAFKA_SASL_PASSWORD: &str = "kafka123";
 pub const KAFKA_SASL_MECHANISM: &str = "SCRAM-SHA-256";
 
 const REDPANDA_IMAGE: &str = "docker.redpanda.com/redpandadata/redpanda:v26.1.6";
-const KAFKA_CONTAINER_START_TIMEOUT: Duration = Duration::from_secs(180);
+const KAFKA_CONTAINER_START_TIMEOUT: Duration = Duration::from_mins(3);
 
 #[instrument]
 pub async fn start_kafka_docker_container(
@@ -247,6 +247,184 @@ where
         }
     }
     Ok(())
+}
+
+/// Send a tombstone (null payload) message to a Kafka topic.
+pub async fn send_tombstone_to_kafka(
+    producer: &FutureProducer,
+    topic: &str,
+    partition: i32,
+    key: &str,
+) -> Result<(), anyhow::Error> {
+    const MAX_RETRIES: u32 = 5;
+    const DELAY_S: u64 = 2;
+    const QUEUE_TIMEOUT: Duration = Duration::from_secs(10);
+
+    let key_owned = key.to_string();
+    let mut last_error = None;
+    for attempt in 0..=MAX_RETRIES {
+        let record: FutureRecord<'_, String, ()> =
+            FutureRecord::to(topic).partition(partition).key(&key_owned);
+        match producer.send(record, QUEUE_TIMEOUT).await {
+            Ok(_) => {
+                if attempt > 0 {
+                    tracing::debug!("Tombstone sent successfully after {attempt} retries");
+                }
+                last_error = None;
+                break;
+            }
+            Err((e, _)) if attempt < MAX_RETRIES => {
+                tracing::debug!(
+                    "Kafka tombstone send failed (attempt {}/{}): {e}. Retrying in {DELAY_S} seconds",
+                    attempt + 1,
+                    MAX_RETRIES + 1,
+                );
+                last_error = Some(e);
+                tokio::time::sleep(Duration::from_secs(DELAY_S)).await;
+            }
+            Err((e, _)) => {
+                last_error = Some(e);
+            }
+        }
+    }
+
+    if let Some(e) = last_error {
+        return Err(anyhow::Error::msg(format!(
+            "Kafka tombstone delivery failed after {} attempts: {e}",
+            MAX_RETRIES + 1,
+        )));
+    }
+    Ok(())
+}
+
+/// Send a single JSON message to a specific Kafka partition with a custom timestamp.
+pub async fn send_message_to_kafka_partition(
+    producer: &FutureProducer,
+    topic: &str,
+    partition: i32,
+    timestamp: i64,
+    message: &serde_json::Value,
+) -> Result<(), anyhow::Error> {
+    const MAX_RETRIES: u32 = 5;
+    const DELAY_S: u64 = 2;
+    const QUEUE_TIMEOUT: Duration = Duration::from_secs(10);
+
+    let message_str = serde_json::to_string(message)?;
+    let mut last_error = None;
+
+    for attempt in 0..=MAX_RETRIES {
+        let record: FutureRecord<'_, String, String> = FutureRecord::to(topic)
+            .partition(partition)
+            .payload(&message_str)
+            .timestamp(timestamp);
+
+        match producer.send(record, QUEUE_TIMEOUT).await {
+            Ok(_) => {
+                if attempt > 0 {
+                    tracing::debug!("Message sent successfully after {attempt} retries");
+                }
+                last_error = None;
+                break;
+            }
+            Err((e, _)) if attempt < MAX_RETRIES => {
+                tracing::debug!(
+                    "Kafka send failed (attempt {}/{}): {e}. Retrying in {DELAY_S} seconds",
+                    attempt + 1,
+                    MAX_RETRIES + 1,
+                );
+                last_error = Some(e);
+                tokio::time::sleep(Duration::from_secs(DELAY_S)).await;
+            }
+            Err((e, _)) => {
+                last_error = Some(e);
+            }
+        }
+    }
+
+    if let Some(e) = last_error {
+        return Err(anyhow::Error::msg(format!(
+            "Kafka message delivery failed after {} attempts: {e}",
+            MAX_RETRIES + 1,
+        )));
+    }
+    Ok(())
+}
+
+/// Create a Kafka topic with a specific number of partitions.
+pub async fn create_kafka_topic_with_partitions(
+    running_container: &crate::docker::RunningContainer<'static>,
+    port: u16,
+    topic: &str,
+    partitions: i32,
+) -> Result<(), anyhow::Error> {
+    let output = running_container
+        .exec_cmd(&format!(
+            "rpk topic create {topic} \
+            --partitions {partitions} \
+            --brokers localhost:{port} \
+            --user {KAFKA_SASL_USERNAME} \
+            --password {KAFKA_SASL_PASSWORD} \
+            --sasl-mechanism {KAFKA_SASL_MECHANISM}"
+        ))
+        .await?;
+    tracing::debug!("Created topic '{topic}' with {partitions} partitions: {output}");
+
+    let producer = create_kafka_producer(
+        &format!("localhost:{port}"),
+        Some(KAFKA_SASL_USERNAME),
+        Some(KAFKA_SASL_PASSWORD),
+    )?;
+    wait_for_topic_partitions(&producer, topic, partitions).await?;
+
+    Ok(())
+}
+
+/// Wait until topic metadata reports the expected partition count.
+async fn wait_for_topic_partitions(
+    producer: &FutureProducer,
+    topic: &str,
+    expected_partitions: i32,
+) -> Result<(), anyhow::Error> {
+    const MAX_RETRIES: u32 = 10;
+    const RETRY_DELAY: Duration = Duration::from_millis(250);
+    const METADATA_TIMEOUT: Duration = Duration::from_secs(5);
+
+    for attempt in 1..=MAX_RETRIES {
+        match producer
+            .client()
+            .fetch_metadata(Some(topic), METADATA_TIMEOUT)
+        {
+            Ok(metadata) => {
+                let partition_count = metadata
+                    .topics()
+                    .iter()
+                    .find(|t| t.name() == topic)
+                    .map_or(0, |t| t.partitions().len());
+
+                if i32::try_from(partition_count).unwrap_or(0) == expected_partitions {
+                    tracing::debug!("Topic '{topic}' ready with {expected_partitions} partitions");
+                    return Ok(());
+                }
+
+                tracing::debug!(
+                    "Topic '{topic}' has {partition_count} partitions, expected {expected_partitions} (attempt {attempt}/{MAX_RETRIES})"
+                );
+            }
+            Err(e) => {
+                tracing::debug!(
+                    "Failed to fetch metadata for topic '{topic}' (attempt {attempt}/{MAX_RETRIES}): {e}"
+                );
+            }
+        }
+
+        if attempt < MAX_RETRIES {
+            tokio::time::sleep(RETRY_DELAY).await;
+        }
+    }
+
+    Err(anyhow::anyhow!(
+        "Topic '{topic}' did not become ready with {expected_partitions} partitions after {MAX_RETRIES} attempts"
+    ))
 }
 
 pub fn make_kafka_dataset(

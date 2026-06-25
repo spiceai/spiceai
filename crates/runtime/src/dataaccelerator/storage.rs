@@ -294,7 +294,7 @@ fn classify_block_devices(devices: &[BlockDevice]) -> ResolvedAccelerationStorag
         // vendor "Msft" and model "Virtual Disk". Treat them like EBS for
         // pool sizing because they share the same network-attached latency
         // characteristics.
-        if description.contains("msft virtual disk")
+        if (description.contains("msft") && description.contains("virtual disk"))
             || description.contains("microsoft virtual disk")
             || description.contains("azure managed disk")
         {

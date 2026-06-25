@@ -166,26 +166,25 @@ mod tests {
     use datafusion::physical_plan::{
         DisplayAs, DisplayFormatType, Distribution, ExecutionPlanProperties, PlanProperties,
     };
-    use std::any::Any;
     use std::fmt;
 
     /// A mock execution plan that pretends to be `UdtfExec` for testing purposes.
     #[derive(Debug)]
     struct MockUdtfExec {
         inner: Arc<dyn ExecutionPlan>,
-        properties: PlanProperties,
+        properties: Arc<PlanProperties>,
     }
 
     impl MockUdtfExec {
         fn new(inner: Arc<dyn ExecutionPlan>) -> Self {
             let schema = inner.schema();
             let eq_properties = EquivalenceProperties::new(schema);
-            let properties = PlanProperties::new(
+            let properties = Arc::new(PlanProperties::new(
                 eq_properties,
                 inner.output_partitioning().clone(),
                 inner.pipeline_behavior(),
                 inner.boundedness(),
-            );
+            ));
             Self { inner, properties }
         }
     }
@@ -208,11 +207,7 @@ mod tests {
             "UdtfExec"
         }
 
-        fn as_any(&self) -> &dyn Any {
-            self
-        }
-
-        fn properties(&self) -> &PlanProperties {
+        fn properties(&self) -> &Arc<PlanProperties> {
             &self.properties
         }
 
@@ -235,12 +230,7 @@ mod tests {
             self.inner.execute(partition, context)
         }
 
-        fn statistics(&self) -> Result<Statistics> {
-            #[expect(deprecated)]
-            self.inner.statistics()
-        }
-
-        fn partition_statistics(&self, partition: Option<usize>) -> Result<Statistics> {
+        fn partition_statistics(&self, partition: Option<usize>) -> Result<Arc<Statistics>> {
             self.inner.partition_statistics(partition)
         }
 

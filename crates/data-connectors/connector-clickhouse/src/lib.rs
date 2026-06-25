@@ -36,6 +36,7 @@ use runtime::dataconnector::{
     ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory,
     DataConnectorResult, NewDataConnectorResult,
 };
+use runtime::datafusion::udf::deny_spice_specific_functions;
 use runtime::parameters::{ParamLookup, ParameterSpec, Parameters};
 use secrecy::ExposeSecret;
 use snafu::prelude::*;
@@ -180,7 +181,11 @@ impl DataConnectorFactory for ClickhouseFactory {
                         config.db,
                         config.compute_context,
                     );
-                    let clickhouse_factory = ClickhouseTableFactory::new(Arc::new(pool));
+                    // Install the Spice function deny-list so Spice-only UDFs
+                    // (json_get_str, etc.) are evaluated locally instead of pushed
+                    // into ClickHouse SQL, which would reject them (#10703).
+                    let clickhouse_factory = ClickhouseTableFactory::new(Arc::new(pool))
+                        .with_function_support(deny_spice_specific_functions().as_ref().clone());
                     Ok(Arc::new(Clickhouse { clickhouse_factory }) as Arc<dyn DataConnector>)
                 }
 

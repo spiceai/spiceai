@@ -60,7 +60,7 @@ limitations under the License.
 //!
 //! #[async_trait]
 //! impl QueryExecutor for PostgresExecutor {
-//!     async fn execute(&self, query: &Query) -> Result<ExecutionResult> {
+//!     async fn execute(&self, query: &Query, collect_batches: bool) -> Result<ExecutionResult> {
 //!         let start = std::time::Instant::now();
 //!         let rows = self.client.query(&query.sql, &[]).await?;
 //!
@@ -107,8 +107,14 @@ pub struct ExecutionResult {
 /// Trait for executing queries against different backends
 #[async_trait]
 pub trait QueryExecutor: Send + Sync {
-    /// Execute a query and return the result
-    async fn execute(&self, query: &Query) -> Result<ExecutionResult>;
+    /// Execute a query and return the result.
+    ///
+    /// When `collect_batches` is `false`, executors that stream results (e.g.
+    /// Flight) MUST count rows without retaining the `RecordBatch`es — they
+    /// return `batches: None`. Throughput runs pass `false` so a worker does not
+    /// materialize a large result set in memory just to drop it; pass `true`
+    /// only when the batches are actually consumed (validation or snapshots).
+    async fn execute(&self, query: &Query, collect_batches: bool) -> Result<ExecutionResult>;
 
     /// Name of this executor for logging/metrics
     fn name(&self) -> &'static str;
@@ -161,7 +167,7 @@ impl Clone for FlightExecutor {
 
 #[async_trait]
 impl QueryExecutor for FlightExecutor {
-    async fn execute(&self, query: &Query) -> Result<ExecutionResult> {
+    async fn execute(&self, query: &Query, collect_batches: bool) -> Result<ExecutionResult> {
         let start = std::time::Instant::now();
 
         let mut result_stream = self
@@ -169,19 +175,24 @@ impl QueryExecutor for FlightExecutor {
             .sql_with_params(&query.sql, query.get_parameters_batch().transpose()?)
             .await?;
 
-        let mut batches = Vec::new();
+        // When the caller does not need the batches (the throughput path: no
+        // validation, no snapshot), stream-and-discard — count rows and drop
+        // each batch — so a worker never materializes a full result set in
+        // memory just to drop it. Only retain batches when asked.
+        let mut batches = collect_batches.then(Vec::new);
         let mut row_count = 0;
 
         while let Some(batch) = result_stream.try_next().await? {
-            let batch_rows = batch.num_rows();
-            row_count += batch_rows;
-            batches.push(batch);
+            row_count += batch.num_rows();
+            if let Some(batches) = &mut batches {
+                batches.push(batch);
+            }
         }
 
         Ok(ExecutionResult {
             duration: start.elapsed(),
             row_count,
-            batches: Some(batches),
+            batches,
         })
     }
 
@@ -230,7 +241,9 @@ impl Clone for HttpExecutor {
 
 #[async_trait]
 impl QueryExecutor for HttpExecutor {
-    async fn execute(&self, query: &Query) -> Result<ExecutionResult> {
+    // The HTTP `/v1/sql` endpoint returns only a `row_count`, never the rows, so
+    // `collect_batches` is irrelevant here — `batches` is always `None`.
+    async fn execute(&self, query: &Query, _collect_batches: bool) -> Result<ExecutionResult> {
         let start = std::time::Instant::now();
         let sql_text = query.to_sql_with_inlined_params();
         let sql_url = format!("{}/v1/sql", self.base_url);
@@ -286,9 +299,9 @@ impl QueryExecutor for HttpExecutor {
 // ============================================================================
 
 /// Maximum interval between status polls for distributed queries (caps exponential backoff)
-const MAX_POLL_INTERVAL: Duration = Duration::from_millis(5000);
+const MAX_POLL_INTERVAL: Duration = Duration::from_secs(5);
 /// Maximum time to wait for a distributed query to complete (1 hour)
-const POLL_TIMEOUT: Duration = Duration::from_secs(3600);
+const POLL_TIMEOUT: Duration = Duration::from_hours(1);
 
 /// Distributed query executor - executes queries via async /v1/queries endpoint
 pub struct DistributedExecutor {
@@ -314,7 +327,9 @@ impl Clone for DistributedExecutor {
 
 #[async_trait]
 impl QueryExecutor for DistributedExecutor {
-    async fn execute(&self, query: &Query) -> Result<ExecutionResult> {
+    // The async `/v1/queries` endpoint reports a `row_count` in its status, not
+    // the rows, so `collect_batches` is irrelevant here — `batches` is `None`.
+    async fn execute(&self, query: &Query, _collect_batches: bool) -> Result<ExecutionResult> {
         let start = std::time::Instant::now();
         let sql_text = query.to_sql_with_inlined_params();
         let queries_url = format!("{}/v1/queries", self.base_url);

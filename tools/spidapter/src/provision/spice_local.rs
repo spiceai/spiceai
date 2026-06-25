@@ -62,7 +62,7 @@ pub(crate) fn build_local_extra_envs(_setup_config: &SetupConfig) -> HashMap<Str
     let mut map = HashMap::new();
     map.insert(
         "SPICED_LOG".to_string(),
-        "info,cayenne=off,runtime::accelerated_table::refresh_task::changes=trace,data_components=trace".to_string(),
+        "info,cayenne=debug,runtime::accelerated_table::refresh_task::changes=trace,data_components=trace".to_string(),
     );
     map
 }
@@ -173,6 +173,7 @@ pub(crate) async fn provision_local_single_node(
         storage: setup_config.storage.clone(),
         ec2_guards: vec![],
         dynamodb_guard: None,
+        mongodb_guard: None,
     })))
 }
 
@@ -403,6 +404,7 @@ pub(crate) async fn provision_local_spiced_cluster(
         storage: setup_config.storage.clone(),
         ec2_guards: vec![],
         dynamodb_guard: None,
+        mongodb_guard: None,
     })))
 }
 
@@ -411,6 +413,21 @@ pub(crate) async fn teardown_local_run(local_state: &mut LocalRunState) -> anyho
         "[stdio] teardown: stopping local process(es) (sql endpoint: {})",
         local_state.sql_url
     );
+    // Diagnostic hold: keep the loaded cluster alive for SPIDAPTER_HOLD_SECS so
+    // an operator can run EXPLAIN ANALYZE / inspect state before teardown
+    // SIGKILLs it. No-op when unset or zero.
+    if let Ok(raw) = std::env::var("SPIDAPTER_HOLD_SECS")
+        && let Ok(secs) = raw.trim().parse::<u64>()
+        && secs > 0
+    {
+        eprintln!(
+            "[stdio] teardown: HOLDING cluster {secs}s before teardown. sql_endpoint={} api_key={}",
+            local_state.sql_url,
+            local_state.flight_api_key.as_deref().unwrap_or("<none>")
+        );
+        tokio::time::sleep(std::time::Duration::from_secs(secs)).await;
+        eprintln!("[stdio] teardown: hold elapsed, proceeding with teardown");
+    }
     match &mut local_state.processes {
         LocalProcesses::SingleNode { child } => {
             stop_child_process(child, "spiced").await?;
@@ -485,13 +502,20 @@ fn num_executors() -> anyhow::Result<usize> {
 }
 
 fn standalone_spiced_args(bind_host: &str, ports: LocalPorts, spicepod_path: &Path) -> Vec<String> {
-    vec![
+    let mut args = vec![
         "--http".to_string(),
         format!("{bind_host}:{}", ports.http),
         "--flight".to_string(),
         format!("{bind_host}:{}", ports.flight),
-        spicepod_path.display().to_string(),
-    ]
+    ];
+
+    if let Ok(metrics_port) = std::env::var("SPIDAPTER_METRICS_PORT") {
+        args.push("--metrics".to_string());
+        args.push(format!("{bind_host}:{metrics_port}"));
+    }
+
+    args.push(spicepod_path.display().to_string());
+    args
 }
 
 fn scheduler_spiced_args(

@@ -71,19 +71,14 @@ impl AvoidDerivedVectorColumnOnIndexRule {
             return None;
         };
 
-        let default_table_source = table_scan
-            .source
-            .as_any()
-            .downcast_ref::<DefaultTableSource>()?;
+        let default_table_source = table_scan.source.downcast_ref::<DefaultTableSource>()?;
 
         let indexed_table_provider = default_table_source
             .table_provider
-            .as_any()
             .downcast_ref::<IndexedTableProvider>()?;
 
         let _vector_scan_table = indexed_table_provider
             .get_underlying()
-            .as_any()
             .downcast_ref::<VectorScanTableProvider>()?;
 
         Some((indexed_table_provider, table_scan))

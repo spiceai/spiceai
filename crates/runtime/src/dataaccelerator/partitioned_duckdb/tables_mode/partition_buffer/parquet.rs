@@ -344,9 +344,9 @@ impl PartitionSink {
             // Use SNAPPY compression for good balance of speed and size
             .set_compression(Compression::SNAPPY)
             // Use default row group size (1024 * 1024)
-            .set_max_row_group_size(
-                datafusion::parquet::file::properties::DEFAULT_MAX_ROW_GROUP_SIZE,
-            )
+            .set_max_row_group_row_count(Some(
+                datafusion::parquet::file::properties::DEFAULT_MAX_ROW_GROUP_ROW_COUNT,
+            ))
             // Use default write batch size (1024)
             .set_write_batch_size(datafusion::parquet::file::properties::DEFAULT_WRITE_BATCH_SIZE)
             .build();

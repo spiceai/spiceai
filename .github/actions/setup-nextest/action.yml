@@ -38,7 +38,7 @@ runs:
     - name: Cache Nextest binary (Linux)
       if: runner.os == 'Linux'
       id: cache-nextest-linux
-      uses: actions/cache@9255dc7a253b0ccc959486e2bca901246202afeb # v5.0.1
+      uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
       with:
         path: ~/.cargo/bin/cargo-nextest
         key: nextest-linux-x86_64-0.9.89
@@ -53,7 +53,7 @@ runs:
     - name: Cache Nextest binary (macOS)
       if: runner.os == 'macOS'
       id: cache-nextest-macos
-      uses: actions/cache@9255dc7a253b0ccc959486e2bca901246202afeb # v5.0.1
+      uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
       with:
         path: ~/.cargo/bin/cargo-nextest
         key: nextest-macos-${{ runner.arch }}-0.9.89
@@ -68,7 +68,7 @@ runs:
     - name: Cache Nextest binary (Windows)
       if: runner.os == 'Windows'
       id: cache-nextest-windows
-      uses: actions/cache@9255dc7a253b0ccc959486e2bca901246202afeb # v5.0.1
+      uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
       with:
         path: ~/.cargo/bin/cargo-nextest.exe
         key: nextest-windows-x86_64-0.9.89

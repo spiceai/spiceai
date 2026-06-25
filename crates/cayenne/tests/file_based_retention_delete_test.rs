@@ -42,7 +42,7 @@ use datafusion::datasource::TableProvider;
 use datafusion::execution::runtime_env::RuntimeEnv;
 use datafusion::prelude::*;
 use datafusion_common::ScalarValue;
-use datafusion_execution::cache::TableScopedPath;
+use datafusion_execution::cache::{TableScopedPath, cache_manager::CachedFileList};
 use datafusion_table_providers::util::{
     column_reference::ColumnReference, on_conflict::OnConflict,
 };
@@ -59,8 +59,8 @@ test_with_backends!(test_file_based_retention_mixed_file_not_deleted_impl);
 // PK-based file retention tests
 test_with_backends!(test_pk_file_based_retention_main_table_only_impl);
 
-// Cache invalidation tests
-test_with_backends!(test_cache_invalidated_after_append_impl);
+// List-files cache maintenance tests
+test_with_backends!(test_cache_delta_applied_after_append_impl);
 test_with_backends!(test_file_based_retention_targeted_cache_invalidation_impl);
 
 /// Test: File-based retention physically deletes files that are fully expired.
@@ -264,18 +264,21 @@ async fn test_file_based_retention_mixed_file_not_deleted_impl(fixture: TestFixt
     Ok(())
 }
 
-/// `refresh_listing_table` invalidates the cache for its snapshot URL
-/// but preserves unrelated cache entries.
+/// The append publish path makes newly committed files visible to the next scan
+/// via a **targeted, incremental** update of the list-files cache: it
+/// delta-applies the new file's metadata onto the cached snapshot-directory
+/// listing rather than evicting it, and leaves unrelated cache entries untouched.
 ///
 /// Steps:
 /// 1. Create a table, insert a row, then query to populate the list-files cache.
-/// 2. Capture the table's specific cache key and verify it exists.
+/// 2. Capture the table's specific cache key and verify it lists exactly 1 file.
 /// 3. Add a cache entry for a separate, unrelated table path.
-/// 4. Insert another row → triggers `refresh_listing_table` → invalidates table's cache entry.
-/// 5. Assert: the table's cache key is gone (targeted invalidation).
-/// 6. Assert: the unrelated table's cache entry is still present.
-/// 7. Query still returns correct data (fresh listing from disk).
-async fn test_cache_invalidated_after_append_impl(fixture: TestFixture) -> TestResult {
+/// 4. Insert another row → the append publish delta-applies the new file onto
+///    the table's cached listing (incremental update, not eviction).
+/// 5. Assert: the table's cache entry survives and now lists 2 files.
+/// 6. Assert: the unrelated table's cache entry is still present (targeted).
+/// 7. Query still returns correct data (the freshly added file is visible).
+async fn test_cache_delta_applied_after_append_impl(fixture: TestFixture) -> TestResult {
     let retention_seconds = 60;
     let table_name = "cache_inv_append";
     let ctx = SessionContext::new();
@@ -311,9 +314,13 @@ async fn test_cache_invalidated_after_append_impl(fixture: TestFixture) -> TestR
         .next()
         .expect("cache should have one entry")
         .clone();
-    assert!(
-        cache.contains_key(&table_cache_key),
-        "Table's cache entry should exist after query"
+    let cached_files_before = cache
+        .get(&table_cache_key)
+        .expect("table's cache entry should exist after query");
+    assert_eq!(
+        cached_files_before.len(),
+        1,
+        "Cache should list exactly the 1 file written by the first insert"
     );
 
     // 4. Add a cache entry for a separate, unrelated table path
@@ -332,23 +339,33 @@ async fn test_cache_invalidated_after_append_impl(fixture: TestFixture) -> TestR
         "Unrelated table entry should be in cache"
     );
 
-    // 5. Insert another row → triggers refresh_listing_table → invalidates this table's cache
+    // 5. Insert another row → the append publish delta-applies the new file's
+    //    metadata onto the table's cached listing (incremental update).
     insert_row(&table, 2, now_us - 1_000_000).await?;
 
-    // 6. Verify the table's specific cache entry was invalidated
-    assert!(
-        !cache.contains_key(&table_cache_key),
-        "Table's cache entry must be invalidated after refresh_listing_table"
+    // 6. The table's cache entry survives and now lists both files — the new file
+    //    was delta-applied onto the existing listing, not evicted.
+    let cached_files_after = cache
+        .get(&table_cache_key)
+        .expect("table's cache entry must survive an append (delta-applied, not evicted)");
+    assert_eq!(
+        cached_files_after.len(),
+        2,
+        "Append must delta-apply the new file onto the cached listing (2 files now visible)"
     );
 
-    // 7. Verify unrelated entry is still there (targeted invalidation, not cache.clear())
+    // 7. Unrelated entry is untouched (targeted update, not a blanket cache.clear())
     assert!(
         cache.contains_key(&other_table_key),
-        "Unrelated table entry must survive targeted invalidation"
+        "Unrelated table entry must survive the targeted cache update"
+    );
+    assert_eq!(
+        cache.len(),
+        2,
+        "Both the table's (updated) entry and the unrelated entry must remain"
     );
 
-    // 8. Query returns correct data — proves the stale cache entry was evicted and
-    //    fresh listing picked up the new file.
+    // 8. Query returns correct data — proves the delta-applied file is visible.
     assert_table_contents(&ctx, &table, table_name, &[1, 2], "After second insert").await?;
 
     Ok(())
@@ -834,8 +851,8 @@ fn table_id_dir(
 }
 
 /// Creates a dummy non-empty cache value. The cache rejects empty vecs internally.
-fn dummy_cache_value() -> std::sync::Arc<Vec<ObjectMeta>> {
-    std::sync::Arc::new(vec![ObjectMeta {
+fn dummy_cache_value() -> CachedFileList {
+    CachedFileList::new(vec![ObjectMeta {
         location: object_store::path::Path::from("dummy/file.parquet"),
         last_modified: chrono::Utc::now(),
         size: 42,

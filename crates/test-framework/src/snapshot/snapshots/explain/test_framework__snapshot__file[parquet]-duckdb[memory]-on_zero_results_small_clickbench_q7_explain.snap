@@ -17,8 +17,7 @@ description: "Query: clickbench_q7"
 |               |             FallbackOnZeroResultsScanExec                                                                                                                                  |
 |               |               CoalescePartitionsExec                                                                                                                                       |
 |               |                 RepartitionExec: partitioning=RoundRobinBatch(16), input_partitions=1                                                                                      |
-|               |                   CooperativeExec                                                                                                                                          |
-|               |                     BytesProcessedExec                                                                                                                                     |
-|               |                       DuckSqlExec sql= SELECT "EventDate" FROM "hits"                                                                                                      |
+|               |                   BytesProcessedExec                                                                                                                                       |
+|               |                     DuckSqlExec sql= SELECT "EventDate" FROM "hits"                                                                                                        |
 |               |                                                                                                                                                                            |
 +---------------+----------------------------------------------------------------------------------------------------------------------------------------------------------------------------+

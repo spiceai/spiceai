@@ -160,6 +160,7 @@ async fn test_snapshot_interval_serializes_with_accelerator_writes() -> anyhow::
         Arc::new(RwLock::new(refresh)),
         accelerator,
         None,
+        None,
         runtime.tokio_io_runtime(),
         Arc::clone(&accelerator_write_mutex),
     );

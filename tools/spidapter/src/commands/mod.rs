@@ -83,7 +83,7 @@ pub(crate) fn build_cloud_client(
     let token = spice_cloud_token(api_key_override)?;
     Ok(CloudClient::new(&base_url)?
         .with_token(token)
-        .with_timeout(Duration::from_secs(600))?)
+        .with_timeout(Duration::from_mins(10))?)
 }
 
 /// Default resource allocation shared by scheduler and executor when no overrides are provided.

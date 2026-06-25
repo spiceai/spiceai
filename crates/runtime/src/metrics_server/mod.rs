@@ -624,7 +624,7 @@ fn histogram_to_summary(
 ) -> MetricFamily {
     let mut summary = MetricFamily::new();
     summary.set_name(format!("{histogram_name}_summary"));
-    summary.set_help(format!("Summary derived from histogram {histogram_name}",));
+    summary.set_help(format!("Summary derived from histogram {histogram_name}"));
     summary.set_field_type(MetricType::SUMMARY);
 
     let mut summary_metric = Metric::new();

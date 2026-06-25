@@ -29,6 +29,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 const TASK_HISTORY_RETENTION_MINIMUM: u64 = 60; // 1 minute
+pub const DEFAULT_FLIGHT_ADAPTIVE_BATCH_SIZE_MAX: usize = 131_072;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 #[cfg_attr(feature = "schemars", derive(JsonSchema))]
@@ -485,6 +486,16 @@ pub struct McpConfig {
 pub struct Flight {
     pub max_message_size: Option<String>,
 
+    /// Controls how `DataFusion` execution batch size is selected for Flight `DoGet` result streams.
+    /// Defaults to adaptive sizing capped at 131072 rows per batch.
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub batch_size: FlightBatchSize,
+
+    /// Arrow IPC compression to use for Flight `DoGet` result batches.
+    /// Defaults to `none` for broad client compatibility.
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub ipc_compression: FlightIpcCompression,
+
     /// Whether to enable rate limiting on Flight `DoPut` (write) requests.
     /// Defaults to `true`. Set to `false` to disable write rate limiting for bulk ingest workloads.
     #[serde(default = "default_true")]
@@ -495,9 +506,40 @@ impl Default for Flight {
     fn default() -> Self {
         Self {
             max_message_size: None,
+            batch_size: FlightBatchSize::default(),
+            ipc_compression: FlightIpcCompression::default(),
             do_put_rate_limit_enabled: true,
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "schemars", derive(JsonSchema))]
+#[serde(deny_unknown_fields)]
+#[serde(rename_all = "snake_case", tag = "mode")]
+pub enum FlightBatchSize {
+    /// Use the session's configured `DataFusion` execution batch size.
+    Default,
+    /// Increase the batch size for large estimated Flight result sets, capped by `max`.
+    Adaptive { max: usize },
+}
+
+impl Default for FlightBatchSize {
+    fn default() -> Self {
+        Self::Adaptive {
+            max: DEFAULT_FLIGHT_ADAPTIVE_BATCH_SIZE_MAX,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "schemars", derive(JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum FlightIpcCompression {
+    #[default]
+    None,
+    Lz4Frame,
+    Zstd,
 }
 
 impl Flight {
@@ -902,6 +944,27 @@ pub struct Query {
     /// Overrides `DataFusion`'s local query target partition count.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub target_partitions: Option<usize>,
+
+    /// Bounds the number of query-executing plans that may run concurrently —
+    /// ordinary queries, DDL/DML, and `EXECUTE`; lightweight session-state
+    /// statements (`PREPARE`/`DEALLOCATE`/`SET`) are not gated. Excess plans wait
+    /// (admission control) rather than oversubscribing the shared query runtime
+    /// and memory pool and starving each other under load (e.g. analytical
+    /// queries alongside CDC ingestion and compaction). The permit is held for
+    /// the plan's full execution and result-streaming lifetime; a results-cache
+    /// hit is never gated. Unset = unbounded (the prior behavior). A configured
+    /// value is clamped to a minimum of `1` in the runtime builder, so `0` means
+    /// one concurrent query (not unbounded).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_concurrent_queries: Option<usize>,
+
+    /// Prefer hash joins over sort-merge joins during physical planning. Maps to
+    /// `datafusion.optimizer.prefer_hash_join`; defaults to `true` (hash joins).
+    /// Set to `false` for very large analytical joins that would otherwise
+    /// exhaust the query memory pool: `HashJoinExec` build sides are not
+    /// spillable, whereas sort-merge joins spill to disk.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prefer_hash_join: Option<bool>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -1326,6 +1389,8 @@ mod tests {
                 temp_directory: None,
                 memory_limit: Some("100MiB".to_string()),
                 target_partitions: None,
+                max_concurrent_queries: None,
+                prefer_hash_join: None,
             })
         );
 
@@ -1342,6 +1407,8 @@ mod tests {
                 temp_directory: None,
                 memory_limit: Some("200MiB".to_string()),
                 target_partitions: None,
+                max_concurrent_queries: None,
+                prefer_hash_join: None,
             })
         );
 
@@ -1359,6 +1426,8 @@ mod tests {
                 temp_directory: None,
                 memory_limit: Some("200MiB".to_string()),
                 target_partitions: None,
+                max_concurrent_queries: None,
+                prefer_hash_join: None,
             })
         );
 
@@ -1383,6 +1452,8 @@ mod tests {
                 temp_directory: Some("/foo".to_string()),
                 memory_limit: None,
                 target_partitions: None,
+                max_concurrent_queries: None,
+                prefer_hash_join: None,
             })
         );
 
@@ -1399,6 +1470,8 @@ mod tests {
                 temp_directory: Some("/bar".to_string()),
                 memory_limit: None,
                 target_partitions: None,
+                max_concurrent_queries: None,
+                prefer_hash_join: None,
             })
         );
 
@@ -1416,6 +1489,8 @@ mod tests {
                 temp_directory: Some("/bar".to_string()),
                 memory_limit: None,
                 target_partitions: None,
+                max_concurrent_queries: None,
+                prefer_hash_join: None,
             })
         );
 
@@ -1424,6 +1499,34 @@ mod tests {
         ";
         let runtime: Runtime = yaml::from_str(yaml).expect("Failed to parse Runtime");
         assert_eq!(runtime.query, None);
+    }
+
+    #[test]
+    fn test_max_concurrent_queries_parse() {
+        // Set: nested under runtime.query parses into the new field.
+        let yaml = r"
+            query:
+                max_concurrent_queries: 4
+        ";
+        let runtime: Runtime = yaml::from_str(yaml).expect("Failed to parse Runtime");
+        assert_eq!(
+            runtime.query.and_then(|q| q.max_concurrent_queries),
+            Some(4)
+        );
+
+        // Absent → None (unbounded), guarding against a serde rename/regression.
+        let yaml = r"
+            query:
+                target_partitions: 8
+        ";
+        let runtime: Runtime = yaml::from_str(yaml).expect("Failed to parse Runtime");
+        assert_eq!(
+            runtime
+                .query
+                .as_ref()
+                .and_then(|q| q.max_concurrent_queries),
+            None
+        );
     }
 
     #[test]
@@ -1939,7 +2042,7 @@ datasets:
         let duration = config_minutes
             .push_interval_duration()
             .expect("should parse duration");
-        assert_eq!(duration, std::time::Duration::from_secs(300));
+        assert_eq!(duration, std::time::Duration::from_mins(5));
 
         let config_hours = OtelExporterConfig {
             enabled: true,
@@ -1952,7 +2055,7 @@ datasets:
         let duration = config_hours
             .push_interval_duration()
             .expect("should parse duration");
-        assert_eq!(duration, std::time::Duration::from_secs(3600));
+        assert_eq!(duration, std::time::Duration::from_hours(1));
 
         // Sub-second intervals should also work
         let config_ms = OtelExporterConfig {

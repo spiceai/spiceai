@@ -90,7 +90,7 @@ impl PhysicalOptimizerRule for BytesProcessedPhysicalOptimizer {
         _config: &ConfigOptions,
     ) -> Result<Arc<dyn ExecutionPlan>, DataFusionError> {
         plan.transform_down(|plan| {
-            if plan.as_any().downcast_ref::<BytesProcessedExec>().is_some() {
+            if plan.downcast_ref::<BytesProcessedExec>().is_some() {
                 return Ok(Transformed::new(plan, false, TreeNodeRecursion::Jump));
             }
 
@@ -206,6 +206,14 @@ impl DisplayAs for BytesProcessedExec {
 // for example, the recently added `gather_filters_for_pushdown` defaults to `all_unsupported` but we likely want `from_children`
 #[deny(clippy::missing_trait_methods)]
 impl ExecutionPlan for BytesProcessedExec {
+    fn downcast_delegate(&self) -> Option<&dyn ExecutionPlan> {
+        None
+    }
+
+    fn with_preserve_order(&self, _preserve_order: bool) -> Option<Arc<dyn ExecutionPlan>> {
+        None
+    }
+
     fn name(&self) -> &'static str {
         "BytesProcessedExec"
     }
@@ -217,15 +225,11 @@ impl ExecutionPlan for BytesProcessedExec {
         "BytesProcessedExec"
     }
 
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema(&self) -> SchemaRef {
         Arc::clone(self.properties().eq_properties.schema())
     }
 
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         self.input_exec.properties()
     }
 
@@ -323,12 +327,7 @@ impl ExecutionPlan for BytesProcessedExec {
         self.input_exec.metrics()
     }
 
-    fn statistics(&self) -> Result<Statistics> {
-        #[expect(deprecated)]
-        self.input_exec.statistics()
-    }
-
-    fn partition_statistics(&self, partition: Option<usize>) -> Result<Statistics> {
+    fn partition_statistics(&self, partition: Option<usize>) -> Result<Arc<Statistics>> {
         self.input_exec.partition_statistics(partition)
     }
 

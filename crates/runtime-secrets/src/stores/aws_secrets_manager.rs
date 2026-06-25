@@ -169,7 +169,7 @@ const SPICE_KEY_PREFIX: &str = "spice_";
 /// Chosen to balance responsiveness to secret rotation against API call volume.
 /// Secret rotation in AWS is typically on the order of hours/days, so a minute
 /// of staleness is acceptable for most workloads.
-const DEFAULT_CACHE_TTL: Duration = Duration::from_secs(60);
+const DEFAULT_CACHE_TTL: Duration = Duration::from_mins(1);
 
 /// Negative-cache TTL for confirmed-missing secrets.
 ///
@@ -847,7 +847,7 @@ mod tests {
         *store.cache.write().await = Some(CachedPayload {
             data: Arc::new(data),
             fetched_at: Instant::now(),
-            ttl: Duration::from_secs(60),
+            ttl: Duration::from_mins(1),
         });
 
         let v = store
@@ -908,9 +908,9 @@ mod tests {
         *store.cache.write().await = Some(CachedPayload {
             data: Arc::new(data),
             fetched_at: Instant::now()
-                .checked_sub(Duration::from_secs(3600))
+                .checked_sub(Duration::from_hours(1))
                 .expect("system time has enough headroom"),
-            ttl: Duration::from_secs(60),
+            ttl: Duration::from_mins(1),
         });
 
         assert!(store.try_cached().await.is_none());

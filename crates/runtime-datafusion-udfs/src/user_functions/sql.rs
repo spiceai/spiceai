@@ -48,7 +48,7 @@ use datafusion::execution::SessionState;
 use datafusion::logical_expr::{
     ColumnarValue, LogicalPlan, ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl, Signature, Subquery,
     TableScan, Volatility as DfVolatility,
-    simplify::{ExprSimplifyResult, SimplifyInfo},
+    simplify::{ExprSimplifyResult, SimplifyContext},
 };
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::physical_plan::{PhysicalExpr, expressions::CastExpr};
@@ -296,10 +296,6 @@ impl Hash for SqlScalarTableArgUdf {
 }
 
 impl ScalarUDFImpl for SqlScalarTableArgUdf {
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
-
     fn name(&self) -> &str {
         &self.name
     }
@@ -325,8 +321,10 @@ impl ScalarUDFImpl for SqlScalarTableArgUdf {
     fn simplify(
         &self,
         args: Vec<Expr>,
-        _info: &dyn SimplifyInfo,
+        _info: &SimplifyContext,
     ) -> Result<ExprSimplifyResult, DataFusionError> {
+        // Migrate to `TableFunctionImpl::call_with_args` (needs a `Session` here).
+        #[expect(deprecated)]
         let provider = self.table_func.call(&args)?;
         let table_source = provider_as_source(provider);
         let table_scan = TableScan::try_new(
@@ -361,10 +359,6 @@ impl Hash for SqlScalarUdf {
 }
 
 impl ScalarUDFImpl for SqlScalarUdf {
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
-
     fn name(&self) -> &str {
         &self.name
     }
@@ -497,10 +491,6 @@ struct SqlTableProvider {
 
 #[async_trait::async_trait]
 impl TableProvider for SqlTableProvider {
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
-
     fn schema(&self) -> SchemaRef {
         Arc::clone(&self.schema)
     }
@@ -1044,6 +1034,7 @@ fn parse_arrow_type(s: &str) -> Result<DataType> {
 
 #[cfg(test)]
 mod tests {
+    #![expect(deprecated)] // DF54: test-only TableFunctionImpl::call/create_table_provider; migration deferred (needs Session)
     use super::*;
     use arrow::array::{
         Array, ArrayRef, Float64Array, Int32Array, Int64Array, ListArray, StringArray,

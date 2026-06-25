@@ -51,6 +51,7 @@ mod partition_by_cayenne;
 #[cfg(feature = "postgres-accel")]
 mod query_push_down;
 mod refresh;
+mod retention_arrow;
 #[cfg(feature = "duckdb")]
 mod single_instance_duckdb;
 #[cfg(feature = "snapshots")]
@@ -59,7 +60,7 @@ mod snapshot_lock_contention;
 mod snapshot_mutex;
 
 pub(crate) fn get_params(mode: &Mode, file: Option<String>, engine: &str) -> Option<Params> {
-    let param_name = format!("{engine}_file",);
+    let param_name = format!("{engine}_file");
     if mode == &Mode::File {
         return Some(Params::from_string_map(
             vec![(param_name, file.unwrap_or_default())]

@@ -113,8 +113,8 @@ pub async fn get_dataset_elements(
     let mut tables = get_table_elements(Arc::clone(&rt), opt_include).await;
     let views = get_view_elements(Arc::clone(&rt), opt_include).await;
     let catalogs = get_catalog_elements(Arc::clone(&rt), opt_include).await;
-    tables.extend(views.into_iter());
-    tables.extend(catalogs.into_iter());
+    tables.extend(views);
+    tables.extend(catalogs);
 
     tables
 }

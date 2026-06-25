@@ -122,7 +122,7 @@ fn bench_simple_cache_concurrent_get(c: &mut Criterion) {
                             SimpleCache<String, HashBuilder, Box<dyn Hasher + Send + Sync>>,
                         > = Arc::new(SimpleCache::new(
                             CACHE_WEIGHT,
-                            Duration::from_secs(60),
+                            Duration::from_mins(1),
                             hash_builder.clone(),
                         ));
                         let mut rng = StdRng::seed_from_u64(42);
@@ -188,9 +188,7 @@ fn bench_simple_cache_concurrent_put(c: &mut Criterion) {
                             HashBuilder,
                             Box<dyn Hasher + Send + Sync>,
                         >::new(
-                            CACHE_WEIGHT,
-                            Duration::from_secs(60),
-                            hash_builder.clone(),
+                            CACHE_WEIGHT, Duration::from_mins(1), hash_builder.clone()
                         ))
                     },
                     |cache| {
@@ -246,7 +244,7 @@ fn bench_simple_cache_concurrent_mixed(c: &mut Criterion) {
                             SimpleCache<String, HashBuilder, Box<dyn Hasher + Send + Sync>>,
                         > = Arc::new(SimpleCache::new(
                             CACHE_WEIGHT,
-                            Duration::from_secs(60),
+                            Duration::from_mins(1),
                             hash_builder.clone(),
                         ));
                         let mut rng = StdRng::seed_from_u64(42);
@@ -324,7 +322,7 @@ fn bench_lru_cache_concurrent_get(c: &mut Criterion) {
                                     >,
                                 > = Arc::new(LruCache::new(
                                     CACHE_WEIGHT,
-                                    Duration::from_secs(60),
+                                    Duration::from_mins(1),
                                     hash_builder.clone(),
                                     policy,
                                     CacheEngine::Moka,
@@ -399,7 +397,7 @@ fn bench_lru_cache_concurrent_put(c: &mut Criterion) {
                                     Box<dyn Hasher + Send + Sync>,
                                 >::new(
                                     CACHE_WEIGHT,
-                                    Duration::from_secs(60),
+                                    Duration::from_mins(1),
                                     hash_builder.clone(),
                                     policy,
                                     CacheEngine::Moka,
@@ -468,7 +466,7 @@ fn bench_lru_cache_concurrent_mixed(c: &mut Criterion) {
                                     >,
                                 > = Arc::new(LruCache::new(
                                     CACHE_WEIGHT,
-                                    Duration::from_secs(60),
+                                    Duration::from_mins(1),
                                     hash_builder.clone(),
                                     policy,
                                     CacheEngine::Moka,
