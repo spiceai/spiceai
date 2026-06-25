@@ -466,16 +466,17 @@ mod tests {
             build_version: "test".to_string(),
             labels: HashMap::new(),
         };
-        let job_store =
-            crate::jobs::JobStore::new(Arc::clone(&store), "", instance_id.to_string());
+        let job_store = crate::jobs::JobStore::new(Arc::clone(&store), "", instance_id.to_string());
         let df = DataFusionBuilder::new(
             status::RuntimeStatus::new(),
             Arc::new(AcceleratorEngineRegistry::default()),
             Handle::current(),
         )
         .build();
-        let job_executor =
-            Arc::new(crate::jobs::JobExecutor::new(Arc::new(job_store), Arc::new(df)));
+        let job_executor = Arc::new(crate::jobs::JobExecutor::new(
+            Arc::new(job_store),
+            Arc::new(df),
+        ));
         let runner = SchedulerRegistryRunner {
             cluster: Arc::clone(&cluster),
             heartbeats: Arc::clone(&heartbeats),
