@@ -1212,7 +1212,12 @@ mod tests {
         }
         // ...but their DataFusion-only aliases (which PostgreSQL doesn't define)
         // stay denied so they aren't unparsed into invalid remote SQL.
-        for name in ["list_append", "array_push_back", "array_join", "list_position"] {
+        for name in [
+            "list_append",
+            "array_push_back",
+            "array_join",
+            "list_position",
+        ] {
             assert!(
                 !support.supports(&make_named_expr(name)),
                 "{name} is a DataFusion-only alias with no PostgreSQL equivalent and must be denied"
