@@ -791,11 +791,27 @@ impl FileFormat for VortexFormat {
 
                 let null_count = stats_set.get_as::<usize>(Stat::NullCount, &PType::U64.into());
 
+                // Surface the column sum from the Vortex footer (`Stat::Sum`) so
+                // whole-table `SUM`/`AVG` can be answered from metadata without a
+                // scan. We deliberately keep the sum in its *own* widened dtype
+                // (`Stat::Sum.dtype`) rather than casting down to the column's
+                // arrow type: the sum of e.g. an `Int32` column is an `Int64` in
+                // DataFusion, and narrowing here would lose width or overflow.
+                let sum = match Stat::Sum.dtype(stats_dtype) {
+                    Some(sum_dtype) => scalar_stat_to_df(
+                        Stat::Sum,
+                        stats_set.get(Stat::Sum),
+                        stats_dtype,
+                        &sum_dtype,
+                    ),
+                    None => stats::Precision::Absent,
+                };
+
                 column_statistics.push(ColumnStatistics {
                     null_count: null_count.to_df(),
                     min_value: min.to_df(),
                     max_value: max.to_df(),
-                    sum_value: Precision::Absent,
+                    sum_value: sum.to_df(),
                     distinct_count: distinct_count_from_is_constant(stats_set.get_as::<bool>(
                         Stat::IsConstant,
                         &DType::Bool(Nullability::NonNullable),

@@ -196,6 +196,39 @@ impl std::fmt::Debug for CayenneMaintainedAggregateRewriter {
     }
 }
 
+/// Folds whole-table aggregates over an *unfiltered* Cayenne scan into a literal
+/// one-row result computed from the scan's Vortex file statistics, avoiding the
+/// scan entirely.
+///
+/// This complements `DataFusion`'s built-in `AggregateStatistics` rule, which only
+/// covers `COUNT`/`MIN`/`MAX` (the aggregate UDFs that implement
+/// `value_from_stats`). This rule additionally folds `SUM` and `AVG` — and, so
+/// that mixed queries like `SELECT COUNT(*), SUM(v) FROM t` fold as a whole,
+/// also handles `COUNT`/`MIN`/`MAX` when they appear alongside `SUM`/`AVG`.
+///
+/// Unlike [`CayenneMaintainedAggregateRewriter`], no registry or freshness epoch
+/// is involved: the answer comes from the file footer surfaced through
+/// [`crate::provider::CayenneAccelerationExec`]'s statistics. Soundness rests on
+/// two guards in [`Self::optimize`]: the scan must carry no pushed-down filter,
+/// and every statistic consumed must be `Precision::Exact` (see
+/// [`crate::stats_aggregate`]).
+#[derive(Default)]
+pub struct CayenneStatsAggregateRewriter;
+
+impl CayenneStatsAggregateRewriter {
+    /// Create a new `CayenneStatsAggregateRewriter` optimizer rule.
+    #[must_use]
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+impl std::fmt::Debug for CayenneStatsAggregateRewriter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CayenneStatsAggregateRewriter").finish()
+    }
+}
+
 impl std::fmt::Debug for CayenneDynamicFilterSharing {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("CayenneDynamicFilterSharing").finish()
@@ -495,6 +528,110 @@ fn maintained_aggregate_source(
         return None;
     }
     maintained_aggregate_source(children[0])
+}
+
+impl PhysicalOptimizerRule for CayenneStatsAggregateRewriter {
+    fn name(&self) -> &'static str {
+        "CayenneStatsAggregateRewriter"
+    }
+
+    fn schema_check(&self) -> bool {
+        false
+    }
+
+    fn optimize(
+        &self,
+        plan: Arc<dyn ExecutionPlan>,
+        _config: &ConfigOptions,
+    ) -> Result<Arc<dyn ExecutionPlan>, DataFusionError> {
+        plan.transform_down(|node| {
+            let Some(aggregate) = node.downcast_ref::<AggregateExec>() else {
+                return Ok(Transformed::no(node));
+            };
+            let Some((query_aggregate, scan)) = stats_aggregate_source_for_aggregate(aggregate)
+            else {
+                return Ok(Transformed::no(node));
+            };
+
+            // Soundness guard #1: whole-file statistics describe the unfiltered
+            // file. A scan carrying a pushed-down predicate (or dynamic join
+            // filter) returns a row subset whose aggregate the footer cannot
+            // answer, so decline and leave the real scan+aggregate in place.
+            if scan.has_pushed_filter() {
+                return Ok(Transformed::no(node));
+            }
+
+            // Statistics of the aggregate's input are aligned to the schema the
+            // aggregate's column indices reference. Soundness guard #2 lives in
+            // `stats_aggregate_batch`: every value consumed must be `Exact`.
+            let Ok(input_stats) = query_aggregate.input().partition_statistics(None) else {
+                return Ok(Transformed::no(node));
+            };
+            let Some(batch) = crate::stats_aggregate::stats_aggregate_batch(
+                query_aggregate,
+                aggregate,
+                &input_stats,
+            )?
+            else {
+                return Ok(Transformed::no(node));
+            };
+
+            Ok(Transformed::yes(
+                Arc::new(MaintainedAggregateExec::try_new(batch)?) as Arc<dyn ExecutionPlan>,
+            ))
+        })
+        .data()
+    }
+}
+
+/// Locate the aggregate that defines the stats-foldable shape and the Cayenne
+/// scan beneath it, mirroring the partial/final handling of
+/// [`maintained_aggregate_source_for_aggregate`]. Returns the *query* aggregate
+/// (the `Partial` under a `Final`, or the `Single` node) paired with the scan.
+fn stats_aggregate_source_for_aggregate(
+    aggregate: &AggregateExec,
+) -> Option<(&AggregateExec, &CayenneAccelerationExec)> {
+    match aggregate.mode() {
+        AggregateMode::Single | AggregateMode::SinglePartitioned => {
+            cayenne_scan_input(aggregate.input()).map(|scan| (aggregate, scan))
+        }
+        AggregateMode::Final | AggregateMode::FinalPartitioned => {
+            let partial = maintained_aggregate_partial_input(aggregate.input())?;
+            if !matches!(partial.mode(), AggregateMode::Partial) {
+                return None;
+            }
+            cayenne_scan_input(partial.input()).map(|scan| (partial, scan))
+        }
+        AggregateMode::Partial | AggregateMode::PartialReduce => None,
+    }
+}
+
+/// Descend through statistics-preserving passthrough nodes to the
+/// [`CayenneAccelerationExec`] beneath an aggregate's input, mirroring the
+/// allowlist in [`maintained_aggregate_source`].
+#[expect(deprecated)]
+fn cayenne_scan_input(plan: &Arc<dyn ExecutionPlan>) -> Option<&CayenneAccelerationExec> {
+    if let Some(cayenne_scan) = plan.downcast_ref::<CayenneAccelerationExec>() {
+        return Some(cayenne_scan);
+    }
+
+    if plan.downcast_ref::<RepartitionExec>().is_none()
+        && plan
+            .downcast_ref::<datafusion_physical_plan::coalesce_batches::CoalesceBatchesExec>()
+            .is_none()
+        && plan.downcast_ref::<SchemaCastScanExec>().is_none()
+        && plan
+            .downcast_ref::<datafusion_physical_plan::coalesce_partitions::CoalescePartitionsExec>()
+            .is_none()
+    {
+        return None;
+    }
+
+    let children = plan.children();
+    if children.len() != 1 {
+        return None;
+    }
+    cayenne_scan_input(children[0])
 }
 
 #[derive(Clone)]
@@ -1438,7 +1575,7 @@ mod tests {
     use super::{
         ANTI_JOIN_SORT_MERGE_MIN_EXACT_ROWS, CayenneAntiJoinSortMergeRewriter,
         CayenneDynamicFilterSharing, CayenneMaintainedAggregateRewriter, CayenneOptimizerConfig,
-        FilterAddition, apply_filter_additions, plan_schema_fields,
+        CayenneStatsAggregateRewriter, FilterAddition, apply_filter_additions, plan_schema_fields,
     };
     use crate::maintained_aggregate::{
         MaintainedAggregateExec, MaintainedAggregateExpr, MaintainedAggregateFunction,
@@ -1463,6 +1600,7 @@ mod tests {
     use datafusion::physical_plan::union::UnionExec;
     use datafusion::physical_plan::{ExecutionPlan, ExecutionPlanProperties, displayable};
     use datafusion_common::stats::Precision;
+    use datafusion_common::{ColumnStatistics, ScalarValue};
     use datafusion_common::{DataFusionError, Result as DFResult, Statistics};
     use datafusion_datasource::file::FileSource;
     use datafusion_datasource::file_groups::FileGroup;
@@ -1471,6 +1609,7 @@ mod tests {
     use datafusion_datasource::source::DataSourceExec;
     use datafusion_datasource::{PartitionedFile, TableSchema};
     use datafusion_functions_aggregate::count::count_udaf;
+    use datafusion_functions_aggregate::sum::sum_udaf;
     use datafusion_physical_expr::expressions::{DynamicFilterPhysicalExpr, col, lit};
     use datafusion_physical_expr::projection::ProjectionExprs;
     use datafusion_physical_expr::{PhysicalExpr, conjunction};
@@ -1596,6 +1735,44 @@ mod tests {
         )
     }
 
+    /// Whole-table `SUM(value)` over a `[name, value]` scan, `Single` mode.
+    fn sum_value_aggregate(
+        input: Arc<dyn ExecutionPlan>,
+        schema: Arc<Schema>,
+    ) -> DFResult<Arc<dyn ExecutionPlan>> {
+        let expr = AggregateExprBuilder::new(sum_udaf(), vec![col("value", schema.as_ref())?])
+            .schema(Arc::clone(&schema))
+            .alias("sum(value)".to_string())
+            .build()?;
+        Ok(Arc::new(AggregateExec::try_new(
+            AggregateMode::Single,
+            PhysicalGroupBy::new_single(vec![]),
+            vec![Arc::new(expr)],
+            vec![None],
+            input,
+            schema,
+        )?))
+    }
+
+    /// Statistics for the `[name, value]` schema with the given `value`-column sum.
+    fn value_sum_statistics(sum: Precision<ScalarValue>) -> Statistics {
+        Statistics {
+            num_rows: Precision::Exact(3),
+            total_byte_size: Precision::Absent,
+            column_statistics: vec![
+                ColumnStatistics::new_unknown(), // name
+                ColumnStatistics {
+                    null_count: Precision::Exact(0),
+                    min_value: Precision::Absent,
+                    max_value: Precision::Absent,
+                    sum_value: sum,
+                    distinct_count: Precision::Absent,
+                    byte_size: Precision::Absent,
+                },
+            ],
+        }
+    }
+
     // A FILTERED maintained view must serve a query that carries the SAME
     // predicate as a `FilterExec` between the aggregate and the scan — the q1/q6
     // shape every CH-benCH query has and the shipped rewrite missed. The rewrite
@@ -1674,6 +1851,79 @@ mod tests {
         assert!(
             optimized.downcast_ref::<AggregateExec>().is_some(),
             "a filtered view must not answer an unfiltered query"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn stats_aggregate_rewriter_folds_sum_over_cayenne_scan() -> DFResult<()> {
+        let schema = maintained_aggregate_test_schema();
+        let stats = value_sum_statistics(Precision::Exact(ScalarValue::Int64(Some(6))));
+        let scan = Arc::new(CayenneAccelerationExec::new(file_exec_with_statistics(
+            &schema, "f.vortex", None, stats,
+        )));
+        let aggregate = sum_value_aggregate(scan, schema)?;
+
+        let optimized =
+            CayenneStatsAggregateRewriter::new().optimize(aggregate, &ConfigOptions::default())?;
+
+        assert!(
+            optimized
+                .downcast_ref::<MaintainedAggregateExec>()
+                .is_some(),
+            "exact whole-file sum over an unfiltered Cayenne scan must fold"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn stats_aggregate_rewriter_does_not_fold_with_pushed_filter() -> DFResult<()> {
+        let schema = maintained_aggregate_test_schema();
+        let stats = value_sum_statistics(Precision::Exact(ScalarValue::Int64(Some(6))));
+        // A pushed-down predicate means the scan returns a row subset; the
+        // whole-file sum cannot answer it.
+        let filter = col("value", schema.as_ref())?;
+        let scan = Arc::new(CayenneAccelerationExec::new(file_exec_with_statistics(
+            &schema,
+            "f.vortex",
+            Some(filter),
+            stats,
+        )));
+        let aggregate = sum_value_aggregate(scan, schema)?;
+
+        let optimized = CayenneStatsAggregateRewriter::new()
+            .optimize(Arc::clone(&aggregate), &ConfigOptions::default())?;
+
+        assert!(
+            optimized.downcast_ref::<AggregateExec>().is_some(),
+            "a filtered scan must not fold from whole-file stats"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn stats_aggregate_rewriter_does_not_fold_over_base_delta_union() -> DFResult<()> {
+        let schema = maintained_aggregate_test_schema();
+        // Base file has an exact sum, but the inlined (delta) branch has no
+        // stats: the union's combined sum is Absent, so the fold must decline —
+        // the per-table/per-scan soundness invariant for uncompacted deltas.
+        let base = file_exec_with_statistics(
+            &schema,
+            "base.vortex",
+            None,
+            value_sum_statistics(Precision::Exact(ScalarValue::Int64(Some(6)))),
+        );
+        let delta = MemorySourceConfig::try_new_exec(&[vec![]], Arc::clone(&schema), None)?;
+        let union = UnionExec::try_new(vec![base, delta])?;
+        let scan = Arc::new(CayenneAccelerationExec::new(union));
+        let aggregate = sum_value_aggregate(scan, schema)?;
+
+        let optimized = CayenneStatsAggregateRewriter::new()
+            .optimize(Arc::clone(&aggregate), &ConfigOptions::default())?;
+
+        assert!(
+            optimized.downcast_ref::<AggregateExec>().is_some(),
+            "a base+delta union with an unknown-stat delta must not fold"
         );
         Ok(())
     }
