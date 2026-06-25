@@ -1401,7 +1401,9 @@ mod tests {
         let result = ReciprocalRankFusionArgs::from_udtf_exprs(&[]);
 
         assert!(
-            result.is_err_and(|e| e.to_string().contains("at least 2")),
+            result
+                .as_ref()
+                .is_err_and(|e| e.to_string().contains("at least 2")),
             "Expected 'at least 2' in error message, got: {result:?}"
         );
 
