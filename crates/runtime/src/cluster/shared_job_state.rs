@@ -310,7 +310,10 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> JobState for Shar
         if let Some(m) = &current
             && m.owner_instance_id != Some(self.owner_instance_id)
         {
-            tracing::warn!("job {job_id} owned by another scheduler (epoch {}); yielding", m.epoch);
+            tracing::warn!(
+                "job {job_id} owned by another scheduler (epoch {}); yielding",
+                m.epoch
+            );
             self.local_jobs.remove(job_id);
             return Ok(());
         }
@@ -455,9 +458,7 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> JobState for Shar
         let mut meta = Self::metadata(job_id, &status, Some(self.owner_instance_id), 0, queued_at);
         meta.session_id = String::new();
         if let Err(e) = self.meta.insert_or_update(job_id, &meta).await {
-            tracing::warn!(
-                "failed to persist failed status for unscheduled job {job_id}: {e}"
-            );
+            tracing::warn!("failed to persist failed status for unscheduled job {job_id}: {e}");
         }
         Ok(())
     }
