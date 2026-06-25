@@ -27,6 +27,7 @@ limitations under the License.
 //! store/key names and error text only).
 
 use std::collections::HashMap;
+use std::fmt::Write as _;
 
 use app::App;
 use runtime_secrets::{RefStatus, Secrets, iter_secret_references};
@@ -78,13 +79,12 @@ pub(crate) async fn run(app: &App, secrets: &Secrets) {
     let mut problems: Vec<(&LocatedRef, RefStatus)> = Vec::new();
     for located in &refs {
         let cache_key = (located.store.clone(), located.key.clone());
-        let status = match cache.get(&cache_key) {
-            Some(status) => status.clone(),
-            None => {
-                let status = secrets.check_reference(&located.store, &located.key).await;
-                cache.insert(cache_key, status.clone());
-                status
-            }
+        let status = if let Some(status) = cache.get(&cache_key) {
+            status.clone()
+        } else {
+            let status = secrets.check_reference(&located.store, &located.key).await;
+            cache.insert(cache_key, status.clone());
+            status
         };
         if !matches!(status, RefStatus::Found { .. }) {
             problems.push((located, status));
@@ -92,27 +92,26 @@ pub(crate) async fn run(app: &App, secrets: &Secrets) {
     }
 
     if problems.is_empty() {
-        tracing::info!(
-            "Secret preflight: {} secret reference(s) resolved.",
-            refs.len()
-        );
+        tracing::info!("Secrets: all {} secret reference(s) resolved.", refs.len());
         return;
     }
 
     let mut report = format!(
-        "Secret preflight: {} of {} secret reference(s) have problems:",
+        "Secrets: {} of {} secret reference(s) could not be resolved:",
         problems.len(),
         refs.len()
     );
     for (located, status) in &problems {
-        report.push_str(&format!(
+        // Infallible: writing to a String never errors.
+        let _ = write!(
+            report,
             "\n  ✗ {}  {} — {}",
             located.reference(),
             located.provenance(),
             describe(status)
-        ));
+        );
     }
-    report.push_str(&format!("\nDocs: {DOCS_URL}"));
+    let _ = write!(report, "\nDocs: {DOCS_URL}");
     tracing::warn!("{report}");
 }
 
@@ -305,7 +304,10 @@ mod tests {
 
         let model_ref = find(&refs, "openai_api_key").expect("model ref");
         assert_eq!(model_ref.kind, "model");
-        assert_eq!((model_ref.store.as_str(), model_ref.key.as_str()), ("secrets", "OPENAI_KEY"));
+        assert_eq!(
+            (model_ref.store.as_str(), model_ref.key.as_str()),
+            ("secrets", "OPENAI_KEY")
+        );
 
         let embed_ref = find(&refs, "hf_token").expect("embedding ref");
         assert_eq!(embed_ref.kind, "embedding");
@@ -316,7 +318,10 @@ mod tests {
 
         let tool_env = find(&refs, "TOKEN").expect("tool env ref");
         assert_eq!(tool_env.kind, "tool");
-        assert_eq!((tool_env.store.as_str(), tool_env.key.as_str()), ("env", "TOOL_ENV"));
+        assert_eq!(
+            (tool_env.store.as_str(), tool_env.key.as_str()),
+            ("env", "TOOL_ENV")
+        );
     }
 
     #[test]
