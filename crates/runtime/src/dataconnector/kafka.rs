@@ -106,6 +106,21 @@ impl Kafka {
                 .expose()
                 .ok()
                 .map(ToString::to_string),
+            ssl_certificate_location: params
+                .get("ssl_certificate_location")
+                .expose()
+                .ok()
+                .map(ToString::to_string),
+            ssl_key_location: params
+                .get("ssl_key_location")
+                .expose()
+                .ok()
+                .map(ToString::to_string),
+            ssl_key_password: params
+                .get("ssl_key_password")
+                .expose()
+                .ok()
+                .map(ToString::to_string),
             enable_ssl_certificate_verification: params
                 .get("enable_ssl_certificate_verification")
                 .expose()
@@ -229,6 +244,18 @@ const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::component("ssl_ca_location")
         .secret()
         .description("Path to the SSL/TLS CA certificate file for server verification.")
+        .help_link(KAFKA_DOCS),
+    ParameterSpec::component("ssl_certificate_location")
+        .secret()
+        .description("Path to the client SSL/TLS certificate file for mTLS authentication.")
+        .help_link(KAFKA_DOCS),
+    ParameterSpec::component("ssl_key_location")
+        .secret()
+        .description("Path to the client SSL/TLS private key file for mTLS authentication.")
+        .help_link(KAFKA_DOCS),
+    ParameterSpec::component("ssl_key_password")
+        .secret()
+        .description("Password for the client SSL/TLS private key, if encrypted.")
         .help_link(KAFKA_DOCS),
     ParameterSpec::component("enable_ssl_certificate_verification")
         .default("true")
