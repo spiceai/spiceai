@@ -2054,16 +2054,20 @@ async fn generate_initial_spicepod(
     if let Ok(shuffle_location) = std::env::var("SPIDAPTER_SHUFFLE_LOCATION") {
         let shuffle_location = shuffle_location.trim();
         if !shuffle_location.is_empty() {
-            spicepod.runtime.params.insert(
-                "shuffle_location".to_string(),
-                shuffle_location.to_string(),
-            );
+            spicepod
+                .runtime
+                .params
+                .insert("shuffle_location".to_string(), shuffle_location.to_string());
         }
     }
     if let Ok(temp_directory) = std::env::var("SPIDAPTER_QUERY_TEMP_DIRECTORY") {
         let temp_directory = temp_directory.trim();
         if !temp_directory.is_empty() {
-            let mut query = spicepod.runtime.query.clone().unwrap_or_else(Query::default);
+            let mut query = spicepod
+                .runtime
+                .query
+                .clone()
+                .unwrap_or_else(Query::default);
             query.temp_directory = Some(temp_directory.to_string());
             spicepod.runtime.query = Some(query);
         }
