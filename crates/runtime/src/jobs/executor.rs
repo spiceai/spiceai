@@ -230,8 +230,13 @@ impl JobExecutor {
         cancel: CancellationToken,
         resume: bool,
     ) -> Result<()> {
-        // Get job and mark as running
-        let state = job_store.set_job_running(job_id).await?;
+        // Get job and mark as running. During recovery another scheduler may have
+        // already claimed this job; treat that race as a no-op.
+        let state = match job_store.set_job_running(job_id).await {
+            Ok(state) => state,
+            Err(super::error::Error::ConcurrentModification { .. }) if resume => return Ok(()),
+            Err(e) => return Err(e),
+        };
 
         // Check for early cancellation
         if cancel.is_cancelled() {

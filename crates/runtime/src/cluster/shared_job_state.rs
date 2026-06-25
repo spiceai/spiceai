@@ -299,13 +299,21 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> JobState for Shar
 
     async fn save_job(&self, job_id: &str, graph: &ExecutionGraphBox) -> Result<()> {
         let status = graph.status().clone();
-        self.put_graph(job_id, graph).await?;
 
         let current = self
             .meta
             .get(job_id)
             .await
             .map_err(|e| BallistaError::Internal(format!("failed to read job meta: {e}")))?;
+        // A scheduler that has lost ownership must not touch shared state. Drop
+        // the local entry so reads fall through to the new owner's status.
+        if let Some(m) = &current
+            && m.owner_instance_id != Some(self.owner_instance_id)
+        {
+            tracing::warn!("job {job_id} owned by another scheduler (epoch {}); yielding", m.epoch);
+            self.local_jobs.remove(job_id);
+            return Ok(());
+        }
         let (epoch, queued_at, session_id) = current
             .as_ref()
             .map(|m| (m.epoch, m.queued_at, m.session_id.clone()))
@@ -319,20 +327,23 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> JobState for Shar
             queued_at,
         );
         meta.session_id = session_id;
+        // Compare-and-set the ownership metadata before persisting the graph, so a
+        // scheduler racing a takeover cannot clobber the shared graph blob.
         if let object_store_occ::UpdateResult::Conflict { current } = self
             .meta
             .update(job_id, &meta)
             .await
             .map_err(|e| BallistaError::Internal(format!("failed to persist job meta: {e}")))?
         {
-            // Another scheduler has taken ownership; stop asserting our view.
             tracing::warn!(
                 "job {job_id} ownership changed under us (epoch {} -> {}); yielding",
                 epoch,
                 current.epoch
             );
+            self.local_jobs.remove(job_id);
             return Ok(());
         }
+        self.put_graph(job_id, graph).await?;
 
         let terminal = matches!(
             status.status,
@@ -405,7 +416,11 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> JobState for Shar
     async fn remove_job(&self, job_id: &str) -> Result<()> {
         self.local_jobs.remove(job_id);
         self.queued_jobs.remove(job_id);
-        let _ = self.store.delete(&self.graph_path(job_id)).await;
+        if let Err(e) = self.store.delete(&self.graph_path(job_id)).await
+            && !matches!(e, object_store::Error::NotFound { .. })
+        {
+            tracing::warn!("failed to delete job graph for {job_id}: {e}");
+        }
         if let Err(e) = self.meta.delete(job_id).await {
             tracing::warn!("failed to delete job meta for {job_id}: {e}");
         }
@@ -439,7 +454,11 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> JobState for Shar
         };
         let mut meta = Self::metadata(job_id, &status, Some(self.owner_instance_id), 0, queued_at);
         meta.session_id = String::new();
-        let _ = self.meta.insert_or_update(job_id, &meta).await;
+        if let Err(e) = self.meta.insert_or_update(job_id, &meta).await {
+            tracing::warn!(
+                "failed to persist failed status for unscheduled job {job_id}: {e}"
+            );
+        }
         Ok(())
     }
 

@@ -1935,6 +1935,10 @@ async fn create_scheduler_server(
             }
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         }
+        tracing::warn!(
+            "spicepod not available after 30s; distributed scheduler falling back to \
+             in-memory job state (cross-scheduler job failover disabled)"
+        );
         None
     };
     let job_state: Arc<dyn JobState> = if let Some(scheduler_cfg) = scheduler_cfg {
