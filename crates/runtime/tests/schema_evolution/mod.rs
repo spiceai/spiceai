@@ -611,11 +611,7 @@ async fn assert_csv_query(
         "`{sql}` returned {rows} rows, expected {expected_rows}"
     );
     let schema = batches.first().expect("at least one record batch").schema();
-    let actual_cols: Vec<&str> = schema
-        .fields()
-        .iter()
-        .map(|f| f.name().as_str())
-        .collect();
+    let actual_cols: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
     for col in expected_cols {
         assert!(
             actual_cols.contains(col),
@@ -642,31 +638,35 @@ async fn run_drop_recreate_csv_phases(
         .scope(async {
             // Phase 1: initial load (4 columns).
             std::fs::write(csv_path, CSV_INITIAL).expect("write csv");
-            let rt =
-                Arc::new(init_drop_recreate_csv_runtime(csv_path, engine, accel_params.clone()).await?);
+            let rt = Arc::new(
+                init_drop_recreate_csv_runtime(csv_path, engine, accel_params.clone()).await?,
+            );
             assert_csv_query(&rt, sql, 2, &["id", "name", "age", "city"]).await;
             rt.shutdown().await;
             drop(rt);
 
             // Phase 2: additive column (widening) — applied IN PLACE, not recreated.
             std::fs::write(csv_path, CSV_ADD_COLUMN).expect("write csv");
-            let rt =
-                Arc::new(init_drop_recreate_csv_runtime(csv_path, engine, accel_params.clone()).await?);
+            let rt = Arc::new(
+                init_drop_recreate_csv_runtime(csv_path, engine, accel_params.clone()).await?,
+            );
             assert_csv_query(&rt, sql, 2, &["id", "name", "age", "city", "lname"]).await;
             rt.shutdown().await;
             drop(rt);
 
             // Phase 3: dropped column (incompatible) — drops + recreates with the new schema.
             std::fs::write(csv_path, CSV_DROP_COLUMN).expect("write csv");
-            let rt =
-                Arc::new(init_drop_recreate_csv_runtime(csv_path, engine, accel_params.clone()).await?);
+            let rt = Arc::new(
+                init_drop_recreate_csv_runtime(csv_path, engine, accel_params.clone()).await?,
+            );
             assert_csv_query(&rt, sql, 2, &["id", "name", "city"]).await;
             rt.shutdown().await;
             drop(rt);
 
             // Phase 4: no-change restart — stable, data preserved (no recreate).
-            let rt =
-                Arc::new(init_drop_recreate_csv_runtime(csv_path, engine, accel_params.clone()).await?);
+            let rt = Arc::new(
+                init_drop_recreate_csv_runtime(csv_path, engine, accel_params.clone()).await?,
+            );
             assert_csv_query(&rt, sql, 2, &["id", "name", "city"]).await;
             rt.shutdown().await;
             drop(rt);

@@ -3055,7 +3055,12 @@ impl DataFusion {
                                     "Applied widening schema evolution to the '{engine}' acceleration: {change}",
                                     engine = acceleration_settings.engine,
                                 );
-                                emit_schema_evolution_event(&dataset_name, "applied", &change, false);
+                                emit_schema_evolution_event(
+                                    &dataset_name,
+                                    "applied",
+                                    &change,
+                                    false,
+                                );
                                 // The table schema changed; cached plans are obsolete.
                                 self.clear_cached_plans().await;
                                 return Ok(Some(Arc::clone(&plan.evolved_schema)));
@@ -3196,6 +3201,10 @@ impl DataFusion {
 
             // Clear the checkpoint so the refresh treats this as a fresh table
             let _ = cp.delete().await;
+
+            // The table is recreated with a new schema; cached logical plans reference the
+            // old schema and must be dropped (mirrors the in-place evolution path above).
+            self.clear_cached_plans().await;
 
             SCHEMA_EVOLUTION_APPLIED.add(
                 1,

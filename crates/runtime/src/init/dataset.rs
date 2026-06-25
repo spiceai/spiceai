@@ -678,11 +678,12 @@ impl Runtime {
             return Err(err);
         }
 
-        // Bypass the deferred-mismatch gate when the dataset recreates on a schema change
-        // (`file_update` mode, or `on_schema_change: drop_and_recreate` + `refresh_mode:
-        // full`): let create_accelerated_table drop + recreate the table with the new schema
-        // instead of deferring. Uses the shared predicate so this gate and the recreate
-        // decision in create_accelerated_table cannot disagree.
+        // Bypass the deferred-mismatch gate when the dataset recreates on a schema change, so
+        // create_accelerated_table drops + recreates the table with the new schema instead of
+        // deferring. `recreates_on_schema_mismatch` is the single source of truth for the exact
+        // conditions (`file_update` with refreshes enabled, or `on_schema_change:
+        // drop_and_recreate` + `refresh_mode: full` on a recreate-capable engine); sharing it
+        // keeps this gate and the recreate decision in create_accelerated_table aligned.
         let allow_schema_mismatch = ds.acceleration.as_ref().is_some_and(|a| {
             crate::schema_evolution::recreates_on_schema_mismatch(
                 a,

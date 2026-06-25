@@ -96,9 +96,9 @@ pub fn engine_supports_recreate(engine: Engine) -> bool {
 }
 
 /// Whether a schema change that cannot be applied in place should DROP and RECREATE the
-/// accelerated table (rather than defer/reject). True for `mode: file_update`, and for
-/// `on_schema_change: drop_and_recreate` under `refresh_mode: full` on a recreate-capable
-/// engine ([`engine_supports_recreate`]).
+/// accelerated table (rather than defer/reject). True for `mode: file_update` when refreshes
+/// are enabled (`refresh_mode != disabled`), and for `on_schema_change: drop_and_recreate`
+/// under `refresh_mode: full` on a recreate-capable engine ([`engine_supports_recreate`]).
 ///
 /// This is the single source of truth for the recreate decision: registration
 /// (`handle_schema_difference`) gates the actual drop+recreate on it, and the initial-load
@@ -298,9 +298,18 @@ mod tests {
         assert!(evolution_allowed(OnSchemaChange::SyncAllColumns, &widening));
         assert!(evolution_allowed(OnSchemaChange::SyncAllColumns, &relaxing));
         // `drop_and_recreate` evolves the full widening set in place like `sync_all_columns`.
-        assert!(evolution_allowed(OnSchemaChange::DropAndRecreate, &additive));
-        assert!(evolution_allowed(OnSchemaChange::DropAndRecreate, &widening));
-        assert!(evolution_allowed(OnSchemaChange::DropAndRecreate, &relaxing));
+        assert!(evolution_allowed(
+            OnSchemaChange::DropAndRecreate,
+            &additive
+        ));
+        assert!(evolution_allowed(
+            OnSchemaChange::DropAndRecreate,
+            &widening
+        ));
+        assert!(evolution_allowed(
+            OnSchemaChange::DropAndRecreate,
+            &relaxing
+        ));
         assert!(!evolution_allowed(OnSchemaChange::Block, &additive));
         assert!(!evolution_allowed(OnSchemaChange::Fail, &additive));
     }
@@ -349,7 +358,9 @@ mod tests {
         assert!(!engine_supports_recreate(Engine::Arrow));
         assert!(!engine_supports_recreate(Engine::PartitionedArrow));
         assert!(!engine_supports_recreate(Engine::PartitionedDuckDB));
-        assert!(!engine_supports_recreate(Engine::TableModePartitionedDuckDB));
+        assert!(!engine_supports_recreate(
+            Engine::TableModePartitionedDuckDB
+        ));
         assert!(!engine_supports_recreate(Engine::PostgreSQL));
     }
 

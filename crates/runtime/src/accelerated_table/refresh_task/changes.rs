@@ -5372,7 +5372,10 @@ mod tests {
         assert!(evolution_allowed(OnSchemaChange::SyncAllColumns, &additive));
         assert!(evolution_allowed(OnSchemaChange::SyncAllColumns, &typed));
         // `drop_and_recreate` evolves the full widening set in place like `sync_all_columns`.
-        assert!(evolution_allowed(OnSchemaChange::DropAndRecreate, &additive));
+        assert!(evolution_allowed(
+            OnSchemaChange::DropAndRecreate,
+            &additive
+        ));
         assert!(evolution_allowed(OnSchemaChange::DropAndRecreate, &typed));
         assert!(!evolution_allowed(OnSchemaChange::Block, &additive));
         assert!(!evolution_allowed(OnSchemaChange::Fail, &additive));
