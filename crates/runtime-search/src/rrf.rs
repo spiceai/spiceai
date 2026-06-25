@@ -1402,7 +1402,7 @@ mod tests {
 
         assert!(
             result.is_err_and(|e| e.to_string().contains("at least 2")),
-            "Expected 'at least 2' in error message, got: {e:?}"
+            "Expected 'at least 2' in error message, got: {result:?}"
         );
 
         // Single search query - should fail
