@@ -23,8 +23,8 @@ use serde_json::Value;
 
 use super::{Nameable, WithDependsOn, dataset::ReadyState, is_default};
 use crate::{
-    acceleration::Acceleration, metadata::metadata_value_to_string, semantic::Column,
-    vector::VectorStore,
+    acceleration::Acceleration, metadata::metadata_value_to_string, param::Params,
+    semantic::Column, vector::VectorStore,
 };
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[cfg_attr(feature = "schemars", derive(JsonSchema))]
@@ -58,6 +58,9 @@ pub struct View {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub vectors: Option<VectorStore>,
 
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub params: Option<Params>,
+
     #[serde(skip_serializing_if = "Vec::is_empty")]
     #[serde(rename = "dependsOn", default)]
     pub depends_on: Vec<String>,
@@ -83,6 +86,7 @@ impl View {
             ready_state: ReadyState::default(),
             depends_on: Vec::default(),
             vectors: None,
+            params: None,
         }
     }
 
@@ -137,7 +141,42 @@ impl WithDependsOn<View> for View {
             acceleration: self.acceleration.clone(),
             ready_state: self.ready_state,
             vectors: self.vectors.clone(),
+            params: self.params.clone(),
             depends_on: depends_on.to_vec(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn deserializes_params_with_file_format() {
+        let yaml = r"
+name: my_view
+sql: SELECT body FROM docs
+params:
+  file_format: md
+";
+        let view: View = yaml::from_str(yaml).expect("view should deserialize");
+        let params = view.params.expect("params should be present");
+        assert_eq!(
+            params
+                .as_string_map()
+                .get("file_format")
+                .map(String::as_str),
+            Some("md")
+        );
+    }
+
+    #[test]
+    fn params_defaults_to_none_when_absent() {
+        let yaml = r"
+name: my_view
+sql: SELECT body FROM docs
+";
+        let view: View = yaml::from_str(yaml).expect("view should deserialize");
+        assert!(view.params.is_none());
     }
 }

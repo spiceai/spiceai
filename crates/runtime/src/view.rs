@@ -112,6 +112,7 @@ pub(crate) async fn prepare_view(
 
     // Add any embedding columns (and vector engine, if applicable)
     if view.has_embeddings() {
+        let file_format = view.params.get("file_format").map(String::as_str);
         if let Some(ref vectors) = view.vectors
             && vectors.enabled
         {
@@ -121,7 +122,7 @@ pub(crate) async fn prepare_view(
                 &view.runtime.secrets(),
                 &view.name,
                 &view.columns,
-                None,
+                file_format,
                 tbl_provider,
                 vectors,
             )
@@ -144,7 +145,7 @@ pub(crate) async fn prepare_view(
                     })
                     .collect(),
                 &view.runtime.embeds(),
-                None, // TODO handle file formats: `view.params.get("file_format").map(String::as_str)`.
+                file_format,
             )
             .await
             .boxed()

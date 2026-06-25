@@ -51,9 +51,12 @@ limitations under the License.
 //! When unset (the default — file mode, unit tests, embedders that don't wire it
 //! up) [`try_reserve_bytes`] always succeeds, so memory mode (if explicitly
 //! opted into without the budget installed) is gated only by the per-table cap.
-//! The runtime binary installs the budget once at startup, sized from total
-//! system/container memory (`resource_monitor::get_total_memory() / 4`). This
-//! budget is independent of `DataFusion`'s query memory pool.
+//! The runtime binary installs the budget once at startup, sized to COORDINATE
+//! with `DataFusion`'s query + compaction memory pools: the host RAM left after
+//! the query pool, the compaction pool, and a headroom reserve, so the on-pool
+//! query memory and this off-pool tier together never exceed host RAM. It is then
+//! resized dynamically (see [`update_global_mem_tier_total`]) as the query pool
+//! fills and drains, staying within that coordinated envelope.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock};
@@ -73,11 +76,15 @@ use tokio::sync::Notify;
 pub(crate) const BUDGET_WAIT: Duration = Duration::from_millis(1500);
 
 /// A counting byte-budget. Reservations are tracked with a single atomic so the
-/// reserve path is lock-free; the budget value itself is read once on install.
+/// reserve path is lock-free. `total` is ALSO atomic so the dynamic re-partition
+/// sampler can resize the budget in place — preserving `used` — as the query pool
+/// fills and drains (resetting to a fresh budget would lose every in-flight
+/// reservation).
 #[derive(Clone)]
 struct MemTierBudget {
-    /// Total bytes the in-memory CDC tier may hold across ALL tables.
-    total: u64,
+    /// Total bytes the in-memory CDC tier may hold across ALL tables. Atomic so it
+    /// can be resized live; every reserve re-reads it.
+    total: Arc<AtomicU64>,
     /// Currently-reserved bytes (sum of live reservations across tables).
     used: Arc<AtomicU64>,
 }
@@ -90,18 +97,20 @@ impl MemTierBudget {
     /// A request larger than the entire budget can never fit, so it always
     /// fails (the caller spills/falls back rather than blocking forever).
     fn try_reserve(&self, bytes: u64) -> bool {
-        if bytes > self.total {
-            return false;
-        }
         // CAS loop: only commit the reservation if it still fits against the
-        // latest `used`. This keeps the aggregate hard-capped under concurrent
-        // appends from independent tables without a lock.
+        // latest `used` AND the latest `total` (re-read each attempt so a concurrent
+        // dynamic resize is honored). This keeps the aggregate hard-capped under
+        // concurrent appends from independent tables without a lock.
         let mut current = self.used.load(Ordering::Acquire);
         loop {
+            let total = self.total.load(Ordering::Acquire);
+            if bytes > total {
+                return false;
+            }
             let Some(next) = current.checked_add(bytes) else {
                 return false;
             };
-            if next > self.total {
+            if next > total {
                 return false;
             }
             match self.used.compare_exchange_weak(
@@ -114,6 +123,13 @@ impl MemTierBudget {
                 Err(observed) => current = observed,
             }
         }
+    }
+
+    /// Resize the aggregate budget in place, preserving `used`. Lowering it below
+    /// `used` admits no new reservations until releases drain `used` under the new
+    /// total (the write path then spills); raising it makes room immediately.
+    fn set_total(&self, bytes: u64) {
+        self.total.store(bytes, Ordering::Release);
     }
 
     /// Release a previously-reserved `bytes`. Saturating so a double-release or
@@ -145,7 +161,7 @@ impl MemTierBudget {
         // A request larger than the entire budget can never fit no matter how
         // many releases land; fail fast to the caller's spill/fallback instead
         // of parking for the full bound (mirrors `try_reserve`).
-        if bytes > self.total {
+        if bytes > self.total.load(Ordering::Acquire) {
             return false;
         }
         // ONE absolute deadline across all retries — not a per-iteration
@@ -167,10 +183,11 @@ impl MemTierBudget {
     }
 }
 
-/// Process-wide in-memory CDC tier budget, injected once at startup by the
-/// binary (sized to a fraction of TOTAL system/container memory —
-/// `resource_monitor::get_total_memory() / 8` — and deliberately INDEPENDENT of
-/// the `DataFusion` query memory pool, since the RAM tier lives off-pool).
+/// Process-wide in-memory CDC tier budget, injected once at startup by the binary
+/// (sized to COORDINATE with the query + compaction memory pools — the host RAM
+/// left after them and a headroom reserve — so the off-pool tier and the on-pool
+/// query memory together never exceed host RAM; the tier still lives off-pool and
+/// is resized dynamically as the pools fill and drain).
 /// Replaceable so a test binary that builds and drops multiple runtimes does not
 /// retain a stale budget (mirrors [`super::write_budget`]).
 static GLOBAL_MEM_TIER_BUDGET: LazyLock<RwLock<Option<MemTierBudget>>> =
@@ -201,9 +218,52 @@ pub fn set_global_mem_tier_bytes(bytes: u64) {
         );
     }
     *guard = Some(MemTierBudget {
-        total: bytes,
+        total: Arc::new(AtomicU64::new(bytes)),
         used: Arc::new(AtomicU64::new(0)),
     });
+}
+
+/// Dynamically resize the installed global budget IN PLACE, preserving live
+/// reservations (`used`). No-op when no budget is installed (the install path is
+/// [`set_global_mem_tier_bytes`], which resets `used` for a fresh runtime). This
+/// is the dynamic re-partition entry point: the runtime samples query-pool usage
+/// and resizes the tier within `[floor, static ceiling]` so the tier yields RAM to
+/// the query pool as it fills and reclaims it as the pool drains. A `bytes` of 0 is
+/// ignored (the floor keeps a global cap installed; call
+/// `set_global_mem_tier_bytes(0)` to actually uninstall).
+pub fn update_global_mem_tier_total(bytes: u64) {
+    if bytes == 0 {
+        return;
+    }
+    let guard = GLOBAL_MEM_TIER_BUDGET.read();
+    let Some(budget) = guard.as_ref() else {
+        return;
+    };
+    let current = budget.total.load(Ordering::Acquire);
+    if bytes == current {
+        // Unchanged (the steady-state case for the 2 s sampler): skip the store so
+        // `total`'s cache line stays read-shared with the hot reserve path's CAS
+        // loop instead of being needlessly invalidated every tick.
+        return;
+    }
+    budget.set_total(bytes);
+    drop(guard);
+    // A raise may make room for writers parked in `reserve_bytes_or_wait`; wake
+    // them so they retry against the larger budget (a lower total needs no wake —
+    // releases drive the drain).
+    if bytes > current {
+        BUDGET_RELEASED.notify_waiters();
+    }
+}
+
+/// Current installed global tier budget (`total`) in bytes, or `None` when unset.
+/// For telemetry and the dynamic sampler's clamp.
+#[must_use]
+pub fn global_mem_tier_total() -> Option<u64> {
+    GLOBAL_MEM_TIER_BUDGET
+        .read()
+        .as_ref()
+        .map(|b| b.total.load(Ordering::Acquire))
 }
 
 /// Attempt to reserve `bytes` from the global in-memory tier budget.
@@ -271,9 +331,44 @@ mod tests {
 
     fn budget(total: u64) -> MemTierBudget {
         MemTierBudget {
-            total,
+            total: Arc::new(AtomicU64::new(total)),
             used: Arc::new(AtomicU64::new(0)),
         }
+    }
+
+    /// Dynamic resize preserves live reservations: lowering `total` below `used`
+    /// refuses new reserves (the write path then spills) without dropping the
+    /// in-flight `used`, and raising it admits new reserves again. This is the
+    /// invariant the dynamic re-partition sampler relies on.
+    #[test]
+    fn set_total_resizes_in_place_preserving_used() {
+        let b = budget(1000);
+        assert!(b.try_reserve(600));
+        assert_eq!(b.used.load(Ordering::Acquire), 600);
+
+        // Shrink below `used`: the 600 stays reserved, but no new reservation fits.
+        b.set_total(500);
+        assert_eq!(
+            b.used.load(Ordering::Acquire),
+            600,
+            "live reservation preserved"
+        );
+        assert!(
+            !b.try_reserve(1),
+            "nothing fits while used (600) exceeds total (500)"
+        );
+
+        // A release that brings used under the new total admits reserves again.
+        b.release(200);
+        assert_eq!(b.used.load(Ordering::Acquire), 400);
+        assert!(b.try_reserve(100));
+        assert_eq!(b.used.load(Ordering::Acquire), 500);
+        assert!(!b.try_reserve(1), "now full at the lowered total");
+
+        // Raising the total makes immediate room.
+        b.set_total(2000);
+        assert!(b.try_reserve(1000));
+        assert_eq!(b.used.load(Ordering::Acquire), 1500);
     }
 
     /// A reservation that fits is granted and consumes exactly its bytes.

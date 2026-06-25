@@ -1836,6 +1836,20 @@
                 }
               }
             }
+          },
+          "503": {
+            "description": "The specified model is unavailable via the Responses API",
+            "content": {
+              "application/json": {
+                "schema": {},
+                "example": {
+                  "message": "model 'my_model' is unavailable via /v1/responses",
+                  "type": "service_unavailable_error",
+                  "param": "model",
+                  "code": "service_unavailable"
+                }
+              }
+            }
           }
         }
       }

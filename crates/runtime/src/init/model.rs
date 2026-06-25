@@ -159,7 +159,7 @@ impl Runtime {
             Some(ModelType::Ml) => match Model::load(m.clone(), params.clone()).await {
                 Ok(in_m) => {
                     let mut model_map = self.models.write().await;
-                    model_map.insert(m.name.clone(), in_m);
+                    model_map.insert(m.name.clone(), Arc::new(in_m));
                     Ok(())
                 }
                 Err(e) => Err(Error::FailedToLoadRunnableModel {

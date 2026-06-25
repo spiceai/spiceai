@@ -188,7 +188,7 @@ datafusion-proto-common = "54.0.0"
 datafusion-pruning = "54.0.0"
 datafusion-spark = "54.0.0"
 datafusion-substrait = "54.0.0"
-datafusion-table-providers = { git = "https://github.com/spiceai/datafusion-table-providers.git", rev = "3d8eca098dc5aefe361625b834ad834d2b846137" } # spiceai-54
+datafusion-table-providers = { git = "https://github.com/spiceai/datafusion-table-providers.git", rev = "6b64a83d3bbd243003750c8b2e59eac50e094d65" } # spiceai-54
 
 delta_kernel = { version = "0.23.0", features = [
     "default-engine-rustls",
@@ -367,7 +367,7 @@ vortex-session = { git = "https://github.com/spiceai/vortex.git", rev = "729249d
 vortex-utils = { git = "https://github.com/spiceai/vortex.git", rev = "729249dd35e9af37ffbcd606ea51ebb60f9ac71b" } # spiceai-54
 
 x509-certificate = "0.25.0"
-spiceai = { git = "https://github.com/spiceai/spice-rs.git", rev = "7bc9e455d47aa8899acc5c6c91f7448bea5637b2" } # branch: spiceai-58
+spiceai = { git = "https://github.com/spiceai/spice-rs.git", rev = "93b75c3c7d1a812b23d00b45adf537d7a2415496" } # spiceai/spice-rs#77
 
 [profile.release-lto]
 inherits = "release"

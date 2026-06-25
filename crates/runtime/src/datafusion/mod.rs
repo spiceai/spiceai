@@ -756,6 +756,17 @@ pub struct DataFusion {
     // Size in bytes of the carved compaction memory pool, retained for the
     // startup confirmation log + the `cayenne_compaction_memory_pool_bytes` gauge.
     compaction_memory_bytes: Option<u64>,
+    // Query memory pool size in bytes (the `GreedyMemoryPool` limit after the
+    // compaction carve), retained so the off-pool Cayenne in-memory CDC tier
+    // budget can be coordinated against it and so the dynamic re-partition sampler
+    // knows the pool's ceiling.
+    query_memory_pool_bytes: u64,
+    // Coordinated aggregate byte budget for the off-pool Cayenne in-memory CDC
+    // tier, sized in the builder so query_pool + compaction + tier + headroom ≤
+    // host (the cross-subsystem coordination that prevents the SF1000 process
+    // OOM). `Some` only when Cayenne acceleration is active; installed in
+    // `set_compaction_runtime`.
+    mem_tier_budget_bytes: Option<u64>,
     pub(crate) io_runtime: Handle,
     metrics: Option<Metrics>,
     resource_monitor: Option<crate::resource_monitor::ResourceMonitor>,
@@ -1424,7 +1435,7 @@ impl DataFusion {
         // environment into the Cayenne accelerator crate, so background and
         // post-write compaction run isolated from queries and CDC on both CPU
         // (this runtime's threads) and memory (the carved pool).
-        cayenne::set_compaction_runtime_handle(tokio_handle);
+        cayenne::set_compaction_runtime_handle(tokio_handle.clone());
         // Install the process-global encode-concurrency budget: cap the aggregate
         // number of concurrent Vortex encode shards across ALL Cayenne tables.
         // Per-table `cayenne_write_concurrency` is sized in isolation — its unset
@@ -1454,30 +1465,67 @@ impl DataFusion {
         // tables. Per-table `cayenne_cdc_mem_tier_max_bytes` is sized in
         // isolation; without this global cap a fleet of memory-mode tables would
         // sum their per-table caps and blow the box (the no-global-cap lesson,
-        // applied to memory). Sized to one quarter of total system/container
-        // memory, independent of DataFusion's query memory pool; an
-        // over-budget append spills to durable Vortex (and, under sustained
-        // overload, falls back to the durable path) rather than
-        // growing the tier, so memory mode can never OOM. File-mode tables never
-        // touch this budget. A quarter (was an eighth): under sustained
-        // high-rate CDC the budget gate fires while resident tiers are far
-        // below it (reservations are held until the flushed epoch's checkpoint
-        // releases them, so encode lag inflates the in-flight aggregate), and a
-        // budget-gated append stalls the apply path — pay RAM for freshness.
-        // The per-table caps and the spill/durable fallbacks stay the
-        // OOM backstops.
-        let mem_tier_budget_bytes = crate::resource_monitor::get_total_memory() / 4;
-        cayenne::set_global_mem_tier_bytes(mem_tier_budget_bytes);
-        tracing::info!(
-            mem_tier_budget_bytes,
-            "Cayenne global in-memory CDC tier byte budget active (caps aggregate RAM for cdc_durability: memory across all tables)"
-        );
+        // applied to memory). An over-budget append spills to durable Vortex (and,
+        // under sustained overload, falls back to the durable path) rather than
+        // growing the tier. File-mode tables never touch this budget.
+        //
+        // CRITICAL: this budget is now COORDINATED with the query + compaction
+        // memory pools (sized in `DataFusionBuilder::build`). The tier lives
+        // off-pool, so sizing it from total RAM in isolation (the old
+        // `get_total_memory() / 4`) summed with the off-pool tier and the in-pool
+        // query/compaction budgets to >100% of host — the SF1000 process OOM (RSS
+        // 242 GiB on a 256 GiB box). `mem_tier_budget_bytes` is instead the host
+        // RAM left after the query pool, the compaction pool, and a headroom
+        // reserve, so the off-pool tier and the on-pool query/compaction budgets
+        // are coordinated against host RAM (see `coordinated_mem_tier_budget` for
+        // the exact bound and its precondition). The per-table caps and the
+        // spill/durable fallbacks stay the OOM backstops; the dynamic re-partition
+        // sampler may later resize this budget within the same envelope.
+        //
+        // Installed only when Cayenne acceleration is active (`mem_tier_budget_bytes`
+        // is `Some`, computed in the builder). It is `None` for non-Cayenne
+        // deployments that still get a dedicated compaction runtime — dedicated
+        // thread pools are the default, so `set_compaction_runtime` runs even with
+        // no Cayenne dataset — and those have no in-memory CDC tier to bound, so we
+        // install nothing and emit no tuning warning. `get_total_memory` rebuilds a
+        // sysinfo System each call, so read it once.
+        let total_memory = crate::resource_monitor::get_total_memory();
+        if let Some(mem_tier_budget_bytes) = self.mem_tier_budget_bytes {
+            cayenne::set_global_mem_tier_bytes(mem_tier_budget_bytes);
+            tracing::info!(
+                mem_tier_budget_bytes,
+                query_memory_pool_bytes = self.query_memory_pool_bytes,
+                compaction_memory_bytes = self.compaction_memory_bytes.unwrap_or(0),
+                total_memory,
+                "Cayenne global in-memory CDC tier byte budget active (coordinated with the query + compaction pools so their sum stays within host RAM)"
+            );
+
+            // Dynamic re-partition sampler: watches LIVE query + compaction pool
+            // usage and resizes the mem-tier budget within [floor, mem_tier_budget_bytes]
+            // so the off-pool CDC tier yields RAM to the query pool as it fills and
+            // reclaims it as the pool drains — never above the coordinated static
+            // ceiling, so it cannot reintroduce overcommit. The critical-pressure
+            // reactive spill drains the tier when the budget is lowered below resident.
+            let rt = self.ctx.runtime_env();
+            let query_pool = Arc::downgrade(&rt.memory_pool);
+            let compaction_pool = self
+                .compaction_runtime_env
+                .as_ref()
+                .map(|env| Arc::downgrade(&env.memory_pool));
+            Self::spawn_mem_tier_repartition_sampler(
+                &tokio_handle,
+                query_pool,
+                compaction_pool,
+                mem_tier_budget_bytes,
+                total_memory,
+            );
+        }
 
         // Install the cgroup-aware memory budget the dynamic auto-tuner uses to
         // compute memory pressure (so the control loop closes on memory, not just
         // ingest/query behavior). Mirrors the encode budget: injected here so the
         // cayenne crate needs no runtime-specific resource detection of its own.
-        let memory_budget = crate::resource_monitor::get_total_memory();
+        let memory_budget = total_memory;
         cayenne::set_global_memory_budget(memory_budget);
         tracing::info!(
             memory_budget,
@@ -1497,6 +1545,54 @@ impl DataFusion {
                 "Dedicated Cayenne compaction runtime active (carved memory pool + low-priority worker threads)"
             );
         }
+    }
+
+    /// Periodically resize the global Cayenne in-memory CDC tier budget from live
+    /// query + compaction memory-pool usage, so the off-pool tier and the query
+    /// pool dynamically share host RAM within the coordinated envelope.
+    ///
+    /// The budget moves in `[floor, static_ceiling_bytes]` where `static_ceiling`
+    /// is the Tier-1 coordinated cap (which already guarantees `query_pool +
+    /// compaction + tier + headroom ≤ host`): as the query pool fills, the tier
+    /// shrinks toward the floor (yielding RAM and, paired with the reactive spill,
+    /// draining resident bytes); as the pool drains, the tier reclaims up to the
+    /// ceiling. It NEVER exceeds the ceiling, so it cannot reintroduce the
+    /// overcommit the static partition prevents. The task stops when the query pool
+    /// is dropped (runtime teardown).
+    fn spawn_mem_tier_repartition_sampler(
+        handle: &tokio::runtime::Handle,
+        query_pool: std::sync::Weak<dyn datafusion::execution::memory_pool::MemoryPool>,
+        compaction_pool: Option<
+            std::sync::Weak<dyn datafusion::execution::memory_pool::MemoryPool>,
+        >,
+        static_ceiling_bytes: u64,
+        total_memory: u64,
+    ) {
+        // Short enough to react to a query-pool spike ahead of the slower per-table
+        // controller tick, long enough that the sampling overhead is negligible.
+        const SAMPLE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
+        handle.spawn(async move {
+            let mut ticker = tokio::time::interval(SAMPLE_INTERVAL);
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                ticker.tick().await;
+                let Some(pool) = query_pool.upgrade() else {
+                    break; // query ctx dropped (runtime teardown) — stop sampling
+                };
+                let pool_used = u64::try_from(pool.reserved()).unwrap_or(u64::MAX);
+                let compaction_used = compaction_pool
+                    .as_ref()
+                    .and_then(std::sync::Weak::upgrade)
+                    .map_or(0, |p| u64::try_from(p.reserved()).unwrap_or(u64::MAX));
+                // Same coordinated partition as the static install (one tested
+                // definition of the no-overcommit invariant), but from LIVE pool
+                // usage, and never above the static ceiling so it can't overcommit.
+                let dynamic =
+                    builder::coordinated_mem_tier_budget(total_memory, pool_used, compaction_used)
+                        .min(static_ceiling_bytes);
+                cayenne::update_global_mem_tier_total(dynamic);
+            }
+        });
     }
 
     /// Returns the dedicated compaction runtime, if one has been set.
