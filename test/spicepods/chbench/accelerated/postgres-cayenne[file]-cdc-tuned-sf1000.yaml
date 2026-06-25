@@ -3,6 +3,8 @@ kind: Spicepod
 name: postgres-cayenne[file]-cdc-tuned-sf1000
 
 runtime:
+  flight:
+    ipc_compression: lz4_frame
   params:
     cdc_prefetch_buffer: '16384'
     cdc_max_coalesced_envelopes: '16384'

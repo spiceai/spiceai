@@ -31,7 +31,7 @@ use runtime_api_types::v1::ModelMetadata;
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 
-use crate::{Runtime, model::LLMResponsesModelStore};
+use crate::Runtime;
 
 use super::Format;
 
@@ -164,7 +164,6 @@ text-embedding-ada-002,model,openai-internal,\"text-dataset-1,text-dataset-2\",e
 pub(crate) async fn get(
     Extension(app): Extension<Arc<RwLock<Option<Arc<App>>>>>,
     Extension(rt): Extension<Arc<Runtime>>,
-    Extension(responses_models): Extension<Arc<RwLock<LLMResponsesModelStore>>>,
     Query(params): Query<ModelsQueryParams>,
 ) -> Response {
     let statuses = if params.status {
@@ -181,8 +180,7 @@ pub(crate) async fn get(
     };
 
     let responses_models = if metadata_keys.contains(&MetadataKeys::SupportsResponsesAPI) {
-        let guard = responses_models.read().await;
-        guard.keys().cloned().collect::<HashSet<String>>()
+        rt.responses_supported_model_names().await
     } else {
         HashSet::default()
     };
