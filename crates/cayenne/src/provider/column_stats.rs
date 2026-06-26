@@ -268,7 +268,7 @@ impl ColumnStatsAccumulator {
             }
 
             // Maintain the per-column NDV sketch for NDV-tracked columns
-            // (integers, strings, dates).
+            // (integers, strings, temporal).
             if let Some(Some(hll)) = state.ndv.get_mut(i) {
                 Self::add_column_to_hll(col.as_ref(), hll);
             }
