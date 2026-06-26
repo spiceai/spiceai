@@ -764,6 +764,47 @@ impl DataFusionBuilder {
             tracing::info!(prefer_hash_join, "Applied runtime.query.prefer_hash_join");
         }
 
+        // EXPERIMENTAL (benchmark toggle): cost-based eager-aggregation optimizer
+        // from the datafusion fork — a physical rule that pushes a partial
+        // aggregation below a join when a statistics-based cost model predicts a
+        // win. Gated in datafusion by `optimizer.enable_eager_aggregation`
+        // (default false). spiced has no pod knob for it yet, so toggle via env to
+        // A/B a single binary: SPICED_EAGER_AGGREGATION=1 turns it on. The cost
+        // gate's thresholds can be swept (no rebuild) via
+        // SPICED_EAGER_AGGREGATION_MIN_REDUCTION_FACTOR (default 4) and
+        // SPICED_EAGER_AGGREGATION_MAX_PUSHED_GROUPS (default 0 = uncapped).
+        if std::env::var("SPICED_EAGER_AGGREGATION")
+            .is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        {
+            config.options_mut().optimizer.enable_eager_aggregation = true;
+            tracing::info!(
+                "SPICED_EAGER_AGGREGATION=1 — cost-based eager aggregation optimizer ENABLED"
+            );
+
+            if let Some(factor) =
+                std::env::var("SPICED_EAGER_AGGREGATION_MIN_REDUCTION_FACTOR")
+                    .ok()
+                    .and_then(|v| v.parse::<usize>().ok())
+            {
+                config
+                    .options_mut()
+                    .optimizer
+                    .eager_aggregation_min_reduction_factor = factor;
+                tracing::info!(factor, "eager aggregation: min reduction factor override");
+            }
+            if let Some(cap) =
+                std::env::var("SPICED_EAGER_AGGREGATION_MAX_PUSHED_GROUPS")
+                    .ok()
+                    .and_then(|v| v.parse::<usize>().ok())
+            {
+                config
+                    .options_mut()
+                    .optimizer
+                    .eager_aggregation_max_pushed_groups = cap;
+                tracing::info!(cap, "eager aggregation: max pushed groups override");
+            }
+        }
+
         // Sizes DataFusion's *native* hash-join InList dynamic-filter budget
         // (`optimizer.hash_join_inlist_pushdown_max_size`) from the runtime
         // memory limit. The native inner-join dynamic-filter pushdown
