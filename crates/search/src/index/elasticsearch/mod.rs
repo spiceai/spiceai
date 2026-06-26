@@ -50,6 +50,11 @@ use data_components::elasticsearch::search_table::{
     ElasticsearchKnnTable, ElasticsearchTextSearchTable, QueryEmbedder,
 };
 
+/// Default kNN candidate-pool size used when a `LIMIT` cannot be pushed down to the
+/// Elasticsearch index scan. Matches the DuckDB vector backend's default
+/// (`DEFAULT_DUCKDB_VECTOR_SEARCH_LIMIT`).
+const DEFAULT_ELASTICSEARCH_VECTOR_SEARCH_LIMIT: usize = 1000;
+
 /// Adapter that implements [`QueryEmbedder`] using an [`Embed`] model.
 #[derive(Debug)]
 struct EmbedQueryAdapter(Arc<dyn Embed>);
@@ -303,7 +308,7 @@ impl SearchIndex for ElasticsearchIndex {
             index: self.es_index.clone(),
             vector_field: self.vector_field.clone(),
             query_vector: vec![],
-            k: 10,
+            k: DEFAULT_ELASTICSEARCH_VECTOR_SEARCH_LIMIT,
             schema: Arc::clone(&schema),
             source_schema: Arc::clone(&self.source_schema),
             query_text: Some(query.to_string()),
