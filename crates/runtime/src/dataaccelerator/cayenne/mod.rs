@@ -934,7 +934,8 @@ impl CayenneAccelerator {
                         crate::component::dataset::OnSchemaChange::AppendNewColumns => {
                             cayenne::metadata::SchemaEvolutionMode::AddColumnsOnly
                         }
-                        crate::component::dataset::OnSchemaChange::SyncAllColumns => {
+                        crate::component::dataset::OnSchemaChange::SyncAllColumns
+                        | crate::component::dataset::OnSchemaChange::DropAndRecreate => {
                             cayenne::metadata::SchemaEvolutionMode::Widen
                         }
                         crate::component::dataset::OnSchemaChange::Block
