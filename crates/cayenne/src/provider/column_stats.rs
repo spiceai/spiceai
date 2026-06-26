@@ -49,8 +49,9 @@ use vortex::dtype::arrow::FromArrowType;
 struct ColumnStatsState {
     columns: Vec<vortex::array::stats::StatsSet>,
     seeded: Vec<bool>,
-    /// Per-column NDV (distinct-count) `HyperLogLog` sketch, `Some` only for
-    /// integer columns (join-key candidates). Parallel to `columns` for O(1)
+    /// Per-column NDV (distinct-count) `HyperLogLog` sketch, `Some` for the
+    /// NDV-tracked columns (integers, strings, dates — see
+    /// [`ColumnStatsAccumulator::supports_ndv`]). Parallel to `columns` for O(1)
     /// access on the write hot path. See [`crate::hll`].
     ndv: Vec<Option<crate::hll::HyperLogLog>>,
 }
@@ -110,8 +111,8 @@ impl ColumnStatsAccumulator {
                 ))
             })
             .collect();
-        // NDV sketches only for integer columns (join-key candidates); other
-        // columns get `None` so the write path skips them.
+        // NDV sketches only for NDV-tracked columns (integers, strings, dates);
+        // other columns get `None` so the write path skips them.
         let ndv: Vec<Option<crate::hll::HyperLogLog>> = schema
             .fields()
             .iter()
@@ -129,10 +130,17 @@ impl ColumnStatsAccumulator {
         }
     }
 
-    /// Whether to maintain an NDV sketch for `dt`. Restricted to integer types:
-    /// these are the join-key candidates (e.g. `*_custkey`, `*_orderkey`) whose
-    /// distinct count can diverge sharply from their min/max range under sparse
-    /// CDC keys. Mirrors the consumer-side `supports_ndv` in the cluster reporter.
+    /// Whether to maintain an NDV sketch for `dt`. Covers the types whose
+    /// distinct count is useful for join/group-by sizing and can diverge sharply
+    /// from a min/max range:
+    /// - integers — join-key candidates (e.g. `*_custkey`, `*_orderkey`) under
+    ///   sparse CDC keys;
+    /// - strings — group-by / join keys (e.g. `n_name`, `c_state`) where min/max
+    ///   carries no cardinality signal;
+    /// - dates — low-cardinality temporal group keys (e.g. `o_entry_d`).
+    ///
+    /// The sketch hashes all of these uniformly (`add_hash`), yielding `Inexact`
+    /// NDV — exactly what the optimizer's cardinality gate accepts.
     fn supports_ndv(dt: &DataType) -> bool {
         matches!(
             dt,
@@ -144,14 +152,24 @@ impl ColumnStatsAccumulator {
                 | DataType::UInt16
                 | DataType::UInt32
                 | DataType::UInt64
+                | DataType::Utf8
+                | DataType::LargeUtf8
+                | DataType::Utf8View
+                | DataType::Date32
+                | DataType::Date64
         )
     }
 
-    /// Fold every non-null value of an integer Arrow column into `hll`. Iterates
-    /// the typed array directly (no `ScalarValue` boxing) to keep the write hot
-    /// path cheap, sign-extending to `i128` so all widths share one hash path.
-    fn add_int_column_to_hll(col: &dyn arrow::array::Array, hll: &mut crate::hll::HyperLogLog) {
-        macro_rules! fold {
+    /// Fold every non-null value of an NDV-tracked Arrow column into `hll`.
+    /// Iterates the typed array directly (no `ScalarValue` boxing) to keep the
+    /// write hot path cheap. Integer and date values sign-extend to `i128` so all
+    /// widths share one hash path; strings hash their raw UTF-8 bytes. Types not
+    /// listed here (i.e. those for which [`supports_ndv`] returns `false`) are
+    /// silently ignored.
+    ///
+    /// [`supports_ndv`]: Self::supports_ndv
+    fn add_column_to_hll(col: &dyn arrow::array::Array, hll: &mut crate::hll::HyperLogLog) {
+        macro_rules! fold_int {
             ($array_ty:ty) => {{
                 if let Some(a) = col.as_any().downcast_ref::<$array_ty>() {
                     for v in a.iter().flatten() {
@@ -161,14 +179,31 @@ impl ColumnStatsAccumulator {
                 }
             }};
         }
-        fold!(Int8Array);
-        fold!(Int16Array);
-        fold!(Int32Array);
-        fold!(Int64Array);
-        fold!(UInt8Array);
-        fold!(UInt16Array);
-        fold!(UInt32Array);
-        fold!(UInt64Array);
+        macro_rules! fold_bytes {
+            ($array_ty:ty) => {{
+                if let Some(a) = col.as_any().downcast_ref::<$array_ty>() {
+                    for v in a.iter().flatten() {
+                        hll.add_bytes(v.as_bytes());
+                    }
+                    return;
+                }
+            }};
+        }
+        fold_int!(Int8Array);
+        fold_int!(Int16Array);
+        fold_int!(Int32Array);
+        fold_int!(Int64Array);
+        fold_int!(UInt8Array);
+        fold_int!(UInt16Array);
+        fold_int!(UInt32Array);
+        fold_int!(UInt64Array);
+        // Dates are integer-backed (Date32 = days, Date64 = ms since epoch);
+        // hash them through the same i128 path as integers.
+        fold_int!(Date32Array);
+        fold_int!(Date64Array);
+        fold_bytes!(StringArray);
+        fold_bytes!(LargeStringArray);
+        fold_bytes!(StringViewArray);
     }
 
     /// Update accumulated stats from a `RecordBatch`.
@@ -212,9 +247,10 @@ impl ColumnStatsAccumulator {
                 state.seeded[i] = true;
             }
 
-            // Maintain the per-column NDV sketch for integer columns.
+            // Maintain the per-column NDV sketch for NDV-tracked columns
+            // (integers, strings, dates).
             if let Some(Some(hll)) = state.ndv.get_mut(i) {
-                Self::add_int_column_to_hll(col.as_ref(), hll);
+                Self::add_column_to_hll(col.as_ref(), hll);
             }
         }
     }
@@ -622,5 +658,67 @@ impl ColumnStatsAccumulator {
             &self.dtypes,
             &self.schema,
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use arrow::array::{Date32Array, Float64Array, Int64Array, StringArray};
+    use arrow::record_batch::RecordBatch;
+    use arrow_schema::{DataType, Field};
+
+    use super::*;
+
+    #[test]
+    fn ndv_sketches_cover_integer_string_and_date_columns() {
+        // Schema mixes NDV-tracked types (int, string, date) with an excluded
+        // type (float) to confirm the gate and the per-column fold.
+        let schema = arrow_schema::Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("name", DataType::Utf8, true),
+            Field::new("d", DataType::Date32, true),
+            Field::new("amount", DataType::Float64, true),
+        ]);
+        let acc = ColumnStatsAccumulator::new(&schema);
+
+        // 100 distinct ids, 4 distinct names (each repeated 25x), 10 distinct
+        // dates, and floats (which must not get a sketch).
+        let ids: Int64Array = (0..100i64).map(Some).collect();
+        let names: StringArray = (0..100)
+            .map(|i| Some(format!("name-{}", i % 4)))
+            .collect();
+        let dates: Date32Array = (0..100).map(|i| Some(i % 10)).collect();
+        let amounts: Float64Array = (0..100).map(|i| Some(f64::from(i))).collect();
+
+        let batch = RecordBatch::try_new(
+            Arc::new(schema),
+            vec![
+                Arc::new(ids),
+                Arc::new(names),
+                Arc::new(dates),
+                Arc::new(amounts),
+            ],
+        )
+        .expect("batch");
+        acc.update(&batch);
+
+        let sketches = acc.to_ndv_sketches();
+        // id: ~100 distinct.
+        let id_ndv = sketches.estimate(0).expect("id sketch present");
+        assert!((90..=110).contains(&id_ndv), "id NDV {id_ndv} not ~100");
+        // name: 4 distinct, despite 100 rows.
+        let name_ndv = sketches.estimate(1).expect("name sketch present");
+        assert!((3..=5).contains(&name_ndv), "name NDV {name_ndv} not ~4");
+        // date: 10 distinct.
+        let date_ndv = sketches.estimate(2).expect("date sketch present");
+        assert!((9..=11).contains(&date_ndv), "date NDV {date_ndv} not ~10");
+        // float (amount): excluded — no sketch.
+        assert_eq!(
+            sketches.estimate(3),
+            None,
+            "float column must not get an NDV sketch"
+        );
     }
 }

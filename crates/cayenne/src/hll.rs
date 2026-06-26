@@ -105,6 +105,14 @@ impl HyperLogLog {
         self.add_hash(hash);
     }
 
+    /// Add a raw byte value (e.g. a UTF-8 string or binary key). Uses the same
+    /// stable, explicit byte hashing as [`add_i128`](Self::add_i128) so the
+    /// mapping is consistent across runs and builds for the persisted sketch.
+    pub fn add_bytes(&mut self, value: &[u8]) {
+        let hash = hash_index::hash_key_bytes(&[value]);
+        self.add_hash(hash);
+    }
+
     /// Merge another sketch into this one (register-wise max). No-op on a
     /// precision mismatch (treated as incompatible rather than panicking).
     pub fn merge(&mut self, other: &Self) {
@@ -180,7 +188,7 @@ impl Default for HyperLogLog {
 }
 
 /// Per-column NDV sketches, keyed by column index in the table schema. Only
-/// integer columns (join-key candidates) get a sketch.
+/// NDV-tracked columns (integers, strings, dates) get a sketch.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct NdvSketches {
     columns: BTreeMap<u32, HyperLogLog>,
@@ -360,6 +368,23 @@ mod tests {
         assert!(
             est <= 3,
             "duplicate-only sketch estimated {est}, expected ~1"
+        );
+    }
+
+    #[test]
+    fn add_bytes_counts_distinct_strings() {
+        let mut hll = HyperLogLog::new();
+        for v in 0..10_000u64 {
+            // Distinct strings; repeat each a few times to confirm dedup.
+            let s = format!("name-{v}");
+            for _ in 0..3 {
+                hll.add_bytes(s.as_bytes());
+            }
+        }
+        let est = hll.estimate();
+        assert!(
+            within_error(est, 10_000, 0.05),
+            "string est={est} outside 5% of 10,000"
         );
     }
 
