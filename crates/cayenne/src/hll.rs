@@ -16,14 +16,16 @@ limitations under the License.
 
 //! A small, mergeable [`HyperLogLog`] cardinality sketch maintained incrementally
 //! on the Cayenne write path, plus a [`NdvSketches`] container that holds one
-//! sketch per (integer) column and (de)serializes them for the metastore.
+//! sketch per NDV-tracked column (integer, string, or date) and (de)serializes
+//! them for the metastore.
 //!
 //! Why a purpose-built sketch: `DataFusion`'s `approx_distinct` `HyperLogLog` is
 //! private to its aggregate executor and not importable, and no other HLL crate
 //! is in the dependency graph. The estimate only needs to be accurate enough to
-//! *size distributed joins* on sparse integer keys (e.g. CDC `o_custkey` spanning
-//! ~1e9 with ~1M distinct), so a standard register-array HLL at precision
-//! [`PRECISION`] (≈1.6% standard error) is more than sufficient.
+//! *size distributed joins and group-bys* on keys whose distinct count diverges
+//! sharply from their min/max range (e.g. CDC `o_custkey` spanning ~1e9 with ~1M
+//! distinct, or string group keys like `n_name`), so a standard register-array
+//! HLL at precision [`PRECISION`] (≈1.6% standard error) is more than sufficient.
 //!
 //! Mergeability is the reason this is incremental rather than recomputed: HLL is
 //! a register-wise max, so a write's sketch folds into the metastore aggregate
@@ -188,7 +190,7 @@ impl Default for HyperLogLog {
 }
 
 /// Per-column NDV sketches, keyed by column index in the table schema. Only
-/// NDV-tracked columns (integers, strings, dates) get a sketch.
+/// NDV-tracked columns (integers, strings, temporal) get a sketch.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct NdvSketches {
     columns: BTreeMap<u32, HyperLogLog>,

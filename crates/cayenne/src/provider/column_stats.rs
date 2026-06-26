@@ -50,7 +50,7 @@ struct ColumnStatsState {
     columns: Vec<vortex::array::stats::StatsSet>,
     seeded: Vec<bool>,
     /// Per-column NDV (distinct-count) `HyperLogLog` sketch, `Some` for the
-    /// NDV-tracked columns (integers, strings, dates — see
+    /// NDV-tracked columns (integers, strings, temporal — see
     /// [`ColumnStatsAccumulator::supports_ndv`]). Parallel to `columns` for O(1)
     /// access on the write hot path. See [`crate::hll`].
     ndv: Vec<Option<crate::hll::HyperLogLog>>,
@@ -111,7 +111,7 @@ impl ColumnStatsAccumulator {
                 ))
             })
             .collect();
-        // NDV sketches only for NDV-tracked columns (integers, strings, dates);
+        // NDV sketches only for NDV-tracked columns (integers, strings, temporal);
         // other columns get `None` so the write path skips them.
         let ndv: Vec<Option<crate::hll::HyperLogLog>> = schema
             .fields()
@@ -137,7 +137,14 @@ impl ColumnStatsAccumulator {
     ///   sparse CDC keys;
     /// - strings — group-by / join keys (e.g. `n_name`, `c_state`) where min/max
     ///   carries no cardinality signal;
-    /// - dates — low-cardinality temporal group keys (e.g. `o_entry_d`).
+    /// - temporal (dates, times, timestamps) — low-cardinality group keys (e.g.
+    ///   `o_entry_d`, `ol_delivery_d`) whose distinct count is far smaller than
+    ///   their min/max range.
+    ///
+    /// Deliberately excluded: floats, decimals, and booleans — these are
+    /// measures, not keys, so an NDV signal would not feed join/group-by sizing.
+    /// The set mirrors the integer/string/temporal arms folded in
+    /// [`add_column_to_hll`](Self::add_column_to_hll); keep the two in sync.
     ///
     /// The sketch hashes all of these uniformly (`add_hash`), yielding `Inexact`
     /// NDV — exactly what the optimizer's cardinality gate accepts.
@@ -157,6 +164,9 @@ impl ColumnStatsAccumulator {
                 | DataType::Utf8View
                 | DataType::Date32
                 | DataType::Date64
+                | DataType::Time32(_)
+                | DataType::Time64(_)
+                | DataType::Timestamp(_, _)
         )
     }
 
@@ -197,10 +207,20 @@ impl ColumnStatsAccumulator {
         fold_int!(UInt16Array);
         fold_int!(UInt32Array);
         fold_int!(UInt64Array);
-        // Dates are integer-backed (Date32 = days, Date64 = ms since epoch);
-        // hash them through the same i128 path as integers.
+        // Temporal types are integer-backed (Date32 = days; Date64/Timestamp =
+        // ms/us/ns since epoch; Time32/Time64 = since midnight) — hash them
+        // through the same i128 path as integers. The array type is independent
+        // of any timezone, so a single downcast per unit covers tz-aware columns.
         fold_int!(Date32Array);
         fold_int!(Date64Array);
+        fold_int!(TimestampSecondArray);
+        fold_int!(TimestampMillisecondArray);
+        fold_int!(TimestampMicrosecondArray);
+        fold_int!(TimestampNanosecondArray);
+        fold_int!(Time32SecondArray);
+        fold_int!(Time32MillisecondArray);
+        fold_int!(Time64MicrosecondArray);
+        fold_int!(Time64NanosecondArray);
         fold_bytes!(StringArray);
         fold_bytes!(LargeStringArray);
         fold_bytes!(StringViewArray);
@@ -665,31 +685,40 @@ impl ColumnStatsAccumulator {
 mod tests {
     use std::sync::Arc;
 
-    use arrow::array::{Date32Array, Float64Array, Int64Array, StringArray};
+    use arrow::array::{
+        Date32Array, Float64Array, Int64Array, StringArray, TimestampMicrosecondArray,
+    };
     use arrow::record_batch::RecordBatch;
-    use arrow_schema::{DataType, Field};
+    use arrow_schema::{DataType, Field, TimeUnit};
 
     use super::*;
 
     #[test]
-    fn ndv_sketches_cover_integer_string_and_date_columns() {
-        // Schema mixes NDV-tracked types (int, string, date) with an excluded
-        // type (float) to confirm the gate and the per-column fold.
+    fn ndv_sketches_cover_integer_string_and_temporal_columns() {
+        // Schema mixes NDV-tracked types (int, string, date, timestamp) with an
+        // excluded type (float) to confirm the gate and the per-column fold.
+        // Timestamp is the column class behind TPC `o_entry_d` / `ol_delivery_d`.
         let schema = arrow_schema::Schema::new(vec![
             Field::new("id", DataType::Int64, false),
             Field::new("name", DataType::Utf8, true),
             Field::new("d", DataType::Date32, true),
+            Field::new(
+                "ts",
+                DataType::Timestamp(TimeUnit::Microsecond, None),
+                true,
+            ),
             Field::new("amount", DataType::Float64, true),
         ]);
         let acc = ColumnStatsAccumulator::new(&schema);
 
         // 100 distinct ids, 4 distinct names (each repeated 25x), 10 distinct
-        // dates, and floats (which must not get a sketch).
+        // dates, 7 distinct timestamps, and floats (which must not get a sketch).
         let ids: Int64Array = (0..100i64).map(Some).collect();
         let names: StringArray = (0..100)
             .map(|i| Some(format!("name-{}", i % 4)))
             .collect();
         let dates: Date32Array = (0..100).map(|i| Some(i % 10)).collect();
+        let timestamps: TimestampMicrosecondArray = (0..100).map(|i| Some(i % 7)).collect();
         let amounts: Float64Array = (0..100).map(|i| Some(f64::from(i))).collect();
 
         let batch = RecordBatch::try_new(
@@ -698,6 +727,7 @@ mod tests {
                 Arc::new(ids),
                 Arc::new(names),
                 Arc::new(dates),
+                Arc::new(timestamps),
                 Arc::new(amounts),
             ],
         )
@@ -714,9 +744,12 @@ mod tests {
         // date: 10 distinct.
         let date_ndv = sketches.estimate(2).expect("date sketch present");
         assert!((9..=11).contains(&date_ndv), "date NDV {date_ndv} not ~10");
+        // timestamp: 7 distinct.
+        let ts_ndv = sketches.estimate(3).expect("timestamp sketch present");
+        assert!((6..=8).contains(&ts_ndv), "timestamp NDV {ts_ndv} not ~7");
         // float (amount): excluded — no sketch.
         assert_eq!(
-            sketches.estimate(3),
+            sketches.estimate(4),
             None,
             "float column must not get an NDV sketch"
         );
