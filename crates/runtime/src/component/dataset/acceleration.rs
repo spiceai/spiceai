@@ -814,6 +814,7 @@ mod tests {
                 function: spicepod_acceleration::MaintainedAggregateFunction::Count,
                 column: None,
             }],
+            filter_sql: None,
         };
         let acceleration = spicepod_acceleration::Acceleration {
             maintained_aggregates: spicepod_acceleration::MaintainedAggregates::new(
