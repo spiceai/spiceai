@@ -58,9 +58,10 @@ deregistration — requires an abrupt process kill. Both in-process tests theref
 drive recovery via graceful shutdown and assert the same recovery + completion
 contract; the SIGKILL-named test documents the TTL-expiry path it does not cover.
 
-The real SIGKILL path is exercised manually by the failover demo
-(`~/code/spicepod_test/.../failover_demo.py`), which kills actual `spiced`
-processes and observes TTL-based recovery.
+The real SIGKILL path is exercised manually by a standalone failover demo (a
+terminal TUI that runs a local cluster, kills a scheduler with SIGKILL/SIGTERM,
+and shows the job being recovered by the other scheduler) — it kills actual
+`spiced` processes and observes TTL-based recovery.
 
 ## Follow-up: subprocess harness for true SIGKILL
 

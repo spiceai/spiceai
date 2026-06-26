@@ -291,7 +291,8 @@ where
     }
 }
 
-/// Drives the full failover scenario and returns the recovered job's row count.
+/// Drives the full failover scenario and asserts the recovered job completes on
+/// the second scheduler with the correct row count.
 ///
 /// `recovery_timeout` differs by variant because graceful deregistration (the
 /// only in-process stop) makes recovery fast; the larger SIGKILL budget leaves
