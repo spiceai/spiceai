@@ -4206,7 +4206,8 @@ mod tests {
         // Pressure between the slow and default HIGH thresholds: the slow tier
         // shrinks the memtable; the fast tier neither grows nor shrinks from memory.
         let pressure = MEM_PRESSURE_HIGH - SLOW_TIER_MEM_DRAIN_OFFSET / 2.0;
-        let cur_inline = u64::try_from(actuators().inline_flush_max_bytes).unwrap();
+        let cur_inline =
+            u64::try_from(actuators().inline_flush_max_bytes).expect("non-negative inline cap");
 
         let slow = IngestSnapshot {
             mem_pressure: Some(pressure),

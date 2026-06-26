@@ -1817,7 +1817,7 @@ mod tests {
             // ...and even at the raised ceiling the no-overcommit invariant holds.
             let headroom = total / MEM_TIER_HEADROOM_FRACTION;
             assert!(
-                (total / 100) + 0 + big + headroom <= total,
+                (total / 100) + big + headroom <= total,
                 "the float must not overcommit host RAM"
             );
 
