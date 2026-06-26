@@ -40,6 +40,11 @@ on:
         required: false
         type: boolean
         default: false
+      capture_explain:
+        description: 'After the run, capture per-query EXPLAIN / EXPLAIN ANALYZE / eager-aggregation decline map as an artifact'
+        required: false
+        type: boolean
+        default: true
       query_overrides:
         description: 'Query overrides'
         required: false
@@ -189,6 +194,31 @@ jobs:
           SPICED_EAGER_AGGREGATION: ${{ github.event.inputs.eager_aggregation == 'true' && '1' || '' }}
           # Dedicated in-cluster PG pod on xlarge; per-run docker container (loopback) elsewhere.
           CHBENCH_PG_HOST: ${{ github.event.inputs.runner_type == 'spiceai-dev-xlarge-runners' && 'chbench-postgres.dataplatform.svc.cluster.local' || '127.0.0.1' }}
+
+      # Diagnostics: re-launch spiced standalone against the data the run left on
+      # disk (no re-seed) and capture per-query EXPLAIN / EXPLAIN ANALYZE and the
+      # eager-aggregation decline map. Best-effort — never fails the job.
+      - name: Capture EXPLAIN / decline map
+        if: always() && github.event.inputs.capture_explain == 'true'
+        continue-on-error: true
+        env:
+          SPICED_BIN: /usr/local/bin/spiced
+          SPICEPOD_PATH: ${{ steps.set_spicepod_path.outputs.SPICEPOD_PATH }}
+          QUERY_DIR: crates/test-framework/src/queries/chbench
+          OUT_DIR: ${{ runner.temp }}/explain-capture
+          # Mirror the run's eager-aggregation state so captured plans match.
+          SPICED_EAGER_AGGREGATION: ${{ github.event.inputs.eager_aggregation == 'true' && '1' || '' }}
+          CHBENCH_PG_HOST: ${{ github.event.inputs.runner_type == 'spiceai-dev-xlarge-runners' && 'chbench-postgres.dataplatform.svc.cluster.local' || '127.0.0.1' }}
+        run: ./.github/scripts/chbench_explain_capture.sh
+
+      - name: Upload EXPLAIN / decline-map artifact
+        if: always() && github.event.inputs.capture_explain == 'true'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: chbench-explain-${{ github.event.inputs.scale_factor }}-eager-${{ github.event.inputs.eager_aggregation }}-${{ github.run_id }}
+          path: ${{ runner.temp }}/explain-capture
+          if-no-files-found: warn
+          retention-days: 30
 
       # The dedicated PG pod is long-lived and shared across runs, so a crashed
       # or cancelled run can leave inactive replication slots (which retain WAL
