@@ -320,6 +320,25 @@ where
         Ok(keys)
     }
 
+    /// Delete the object for a given key. Treats a missing object as success.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the object store delete operation fails.
+    pub async fn delete(&self, key: &str) -> Result<()> {
+        match self.store.delete(&self.path(key)).await {
+            Ok(()) | Err(ObjectStoreError::NotFound { .. }) => {
+                self.remove_from_cache(key);
+                Ok(())
+            }
+            Err(source) => Err(Error::ObjectStore {
+                key: key.to_string(),
+                operation: "delete",
+                source,
+            }),
+        }
+    }
+
     /// Refresh local cache from object store. Retrieves all keys.
     ///
     /// # Errors
@@ -408,6 +427,26 @@ mod tests {
             .await
             .expect("second insert failed");
         assert_eq!(result, InsertResult::AlreadyExists);
+    }
+
+    #[tokio::test]
+    async fn test_delete() {
+        let store = Arc::new(InMemory::new());
+        let state: ObjectState<TestData> = ObjectState::new(store).with_prefix("test/");
+
+        let data = TestData {
+            name: "test".to_string(),
+            value: 42,
+        };
+        state.insert("key1", &data).await.expect("insert failed");
+        assert_eq!(state.get("key1").await.expect("get failed"), Some(data));
+
+        state.delete("key1").await.expect("delete failed");
+        assert_eq!(state.get("key1").await.expect("get failed"), None);
+        assert!(state.list_keys().await.expect("list failed").is_empty());
+
+        // Deleting a missing key is a no-op.
+        state.delete("key1").await.expect("delete missing failed");
     }
 
     #[tokio::test]
