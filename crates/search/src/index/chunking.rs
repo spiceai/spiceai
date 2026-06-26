@@ -885,13 +885,13 @@ mod tests {
             trim_whitespace: false,
             file_format: None,
         };
-        let chunker =
+        let text_chunker =
             RecursiveSplittingChunker::with_character_sizer(&cfg).expect("create chunker");
 
         // Multi-byte characters so byte and character offsets diverge — the heart
         // of the bug. The first chunk also exercises the 0-based→1-based fix.
         let text = "café über señor data points";
-        let chunked: Vec<((usize, usize), String)> = chunker
+        let chunked: Vec<((usize, usize), String)> = text_chunker
             .chunk_with_char_offsets(text)
             .map(|(off, c)| (off, c.to_string()))
             .collect();

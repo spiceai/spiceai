@@ -59,8 +59,8 @@ pub trait Chunker: Sync + Send {
     /// Like [`Chunker::chunk_with_offsets`] but returns **character** offsets
     /// (0-based start inclusive, end exclusive) rather than byte offsets.
     ///
-    /// The search read path recovers the matched snippet with DataFusion
-    /// `substring`, which is 1-based and character-counted (PostgreSQL
+    /// The search read path recovers the matched snippet with `DataFusion`
+    /// `substring`, which is 1-based and character-counted (`PostgreSQL`
     /// semantics). Persisting character offsets — rather than the byte offsets
     /// `chunk_with_offsets` yields — lets the reader extract the exact chunk for
     /// non-ASCII text, where a byte index and a character index diverge. See
@@ -428,7 +428,7 @@ mod tests {
 
     /// Recover a chunk from `text` using 0-based, end-exclusive character
     /// offsets — mirrors how the search read path applies the stored offsets via
-    /// DataFusion `substring`.
+    /// `DataFusion` `substring`.
     fn chars_in_range(text: &str, start: usize, end: usize) -> String {
         text.chars().skip(start).take(end - start).collect()
     }
