@@ -1057,8 +1057,8 @@ static CAYENNE_AT_GOAL_QPH: OnceLock<Gauge<f64>> = OnceLock::new();
 static CAYENNE_AT_CPU_PRESSURE: OnceLock<Gauge<f64>> = OnceLock::new();
 static CAYENNE_AT_IO_LATENCY_MS: OnceLock<Gauge<f64>> = OnceLock::new();
 static CAYENNE_AT_PUBLISH_LATENCY_MS: OnceLock<Gauge<f64>> = OnceLock::new();
-static CAYENNE_AT_DATA_STORAGE_WRITE_MBPS: OnceLock<Gauge<f64>> = OnceLock::new();
-static CAYENNE_AT_METASTORE_STORAGE_WRITE_MBPS: OnceLock<Gauge<f64>> = OnceLock::new();
+static CAYENNE_AT_DATA_STORAGE_WRITE_MIBPS: OnceLock<Gauge<f64>> = OnceLock::new();
+static CAYENNE_AT_METASTORE_STORAGE_WRITE_MIBPS: OnceLock<Gauge<f64>> = OnceLock::new();
 static CAYENNE_AT_GOAL_SLO_INFEASIBLE: OnceLock<Gauge<u64>> = OnceLock::new();
 static CAYENNE_AT_DATA_STORAGE_CLASS: OnceLock<Gauge<u64>> = OnceLock::new();
 static CAYENNE_AT_METASTORE_STORAGE_CLASS: OnceLock<Gauge<u64>> = OnceLock::new();
@@ -1358,10 +1358,10 @@ pub fn track_cayenne_autotune_state(state: &CayenneAutotuneState, dimensions: &[
         })
         .record(state.metastore_storage_class, dimensions);
     if state.data_storage_write_mbps >= 0.0 {
-        CAYENNE_AT_DATA_STORAGE_WRITE_MBPS
+        CAYENNE_AT_DATA_STORAGE_WRITE_MIBPS
             .get_or_init(|| {
                 cayenne_operational_meter()
-                    .f64_gauge("cayenne_data_storage_write_mbps")
+                    .f64_gauge("cayenne_data_storage_write_mibps")
                     .with_description(
                         "Calibration-probe measured data-volume write throughput; drives the continuous slow-tier bias.",
                     )
@@ -1371,10 +1371,10 @@ pub fn track_cayenne_autotune_state(state: &CayenneAutotuneState, dimensions: &[
             .record(state.data_storage_write_mbps, dimensions);
     }
     if state.metastore_storage_write_mbps >= 0.0 {
-        CAYENNE_AT_METASTORE_STORAGE_WRITE_MBPS
+        CAYENNE_AT_METASTORE_STORAGE_WRITE_MIBPS
             .get_or_init(|| {
                 cayenne_operational_meter()
-                    .f64_gauge("cayenne_metastore_storage_write_mbps")
+                    .f64_gauge("cayenne_metastore_storage_write_mibps")
                     .with_description(
                         "Calibration-probe measured metastore-volume write throughput; drives the continuous publish bias.",
                     )
