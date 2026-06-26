@@ -702,11 +702,7 @@ mod tests {
             Field::new("id", DataType::Int64, false),
             Field::new("name", DataType::Utf8, true),
             Field::new("d", DataType::Date32, true),
-            Field::new(
-                "ts",
-                DataType::Timestamp(TimeUnit::Microsecond, None),
-                true,
-            ),
+            Field::new("ts", DataType::Timestamp(TimeUnit::Microsecond, None), true),
             Field::new("amount", DataType::Float64, true),
         ]);
         let acc = ColumnStatsAccumulator::new(&schema);
@@ -714,9 +710,7 @@ mod tests {
         // 100 distinct ids, 4 distinct names (each repeated 25x), 10 distinct
         // dates, 7 distinct timestamps, and floats (which must not get a sketch).
         let ids: Int64Array = (0..100i64).map(Some).collect();
-        let names: StringArray = (0..100)
-            .map(|i| Some(format!("name-{}", i % 4)))
-            .collect();
+        let names: StringArray = (0..100).map(|i| Some(format!("name-{}", i % 4))).collect();
         let dates: Date32Array = (0..100).map(|i| Some(i % 10)).collect();
         let timestamps: TimestampMicrosecondArray = (0..100).map(|i| Some(i % 7)).collect();
         let amounts: Float64Array = (0..100).map(|i| Some(f64::from(i))).collect();
