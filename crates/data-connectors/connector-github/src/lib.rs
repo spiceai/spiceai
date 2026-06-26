@@ -1884,6 +1884,15 @@ where
     Ok(())
 }
 
+/// The name used to identify this connector in configuration.
+pub const CONNECTOR_NAME: &str = "github";
+
+/// Returns a new instance of the GitHub connector factory.
+#[must_use]
+pub fn factory() -> std::sync::Arc<dyn DataConnectorFactory> {
+    GithubFactory::new_arc()
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -2185,13 +2194,4 @@ mod tests {
             "expected shared auth concurrency conflict, got: {message}"
         );
     }
-}
-
-/// The name used to identify this connector in configuration.
-pub const CONNECTOR_NAME: &str = "github";
-
-/// Returns a new instance of the GitHub connector factory.
-#[must_use]
-pub fn factory() -> std::sync::Arc<dyn DataConnectorFactory> {
-    GithubFactory::new_arc()
 }
