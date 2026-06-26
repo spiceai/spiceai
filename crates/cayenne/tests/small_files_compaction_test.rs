@@ -768,7 +768,8 @@ async fn concurrent_append_during_compaction_loses_no_rows(
         for _ in 0..extra {
             let _ = compaction_table
                 .compact_current_snapshot_small_files()
-                .await;
+                .await
+                .expect("compaction pass should not error");
             tokio::task::yield_now().await;
         }
     });

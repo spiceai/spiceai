@@ -2211,14 +2211,6 @@ pub struct CayenneTableProvider {
     /// expensive full snapshot listing + picker decision on every write.
     /// Reset to 0 after a compaction rewrite. Conservative: can only cause
     /// extra listings, never missed compactions.
-    ///
-    /// This is a TRIGGER signal only — it is intentionally over-counted (e.g.
-    /// off-fence mem-tier checkpoints feed it via `record_current_snapshot_files_added`
-    /// so protected-snapshot fan-out also triggers consolidation). It MUST NOT
-    /// be used as the concurrent-append fence for a snapshot rewrite: the
-    /// rewrite's own `write_to_snapshot` and background checkpoints bump it
-    /// without changing the *current dir*, which would make the fence abort
-    /// every pass. Use [`Self::current_dir_generation`] for that.
     new_files_since_last_compaction: Arc<AtomicUsize>,
     /// Monotonic *version stamp* for the current snapshot directory's file set
     /// (NOT a file count). Bumped by one on every current-dir publish in
@@ -10779,7 +10771,7 @@ impl CayenneTableProvider {
                     Some(self.visibility_lock_arc().lock_owned().await),
                 ),
                 Err(_) => {
-                    tracing::error!(
+                    tracing::trace!(
                         target: "cayenne::compaction",
                         table = self.table_metadata.table_name.as_str(),
                         "Skipping current-snapshot small-file compaction: writer active on position-delete table",
@@ -10792,7 +10784,7 @@ impl CayenneTableProvider {
         };
 
         let Ok(_guard) = self.compaction_lock.try_lock() else {
-            tracing::error!(
+            tracing::trace!(
                 target: "cayenne::compaction",
                 table = self.table_metadata.table_name.as_str(),
                 "Skipping current-snapshot small-file compaction: another pass already running",
@@ -12199,10 +12191,12 @@ impl CayenneTableProvider {
                     "Aborting current-snapshot compaction: a concurrent append \
                      landed during the re-encode; discarding output and retrying"
                 );
+                drop(_fence);
                 self.cleanup_failed_compaction_snapshot(&new_snapshot_id, is_s3)
                     .await;
                 return Ok(false);
             } else if let Err(e) = self.commit_snapshot_rewrite(&new_snapshot_id).await {
+                drop(_fence);
                 self.cleanup_failed_compaction_snapshot(&new_snapshot_id, is_s3)
                     .await;
                 return Err(Error::Catalog { source: e });
