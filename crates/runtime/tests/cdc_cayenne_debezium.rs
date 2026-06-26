@@ -1,5 +1,5 @@
 /*
-Copyright 2024-2025 The Spice.ai OSS Authors
+Copyright 2026 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -149,7 +149,11 @@ fn make_envelope(
             commits: Arc::clone(commits),
         }),
         batch,
-        false,
+        // Mark every envelope dataset-ready, matching the real Debezium
+        // connector, which emits `is_dataset_ready = true`
+        // (crates/data_components/src/debezium_kafka.rs) so the runtime
+        // transitions the dataset out of `AccelerationNotReady`.
+        true,
     )
 }
 
@@ -192,7 +196,7 @@ async fn setup_keyed_cayenne(
             schema,
             primary_key: vec!["id".to_string()],
             on_conflict: Some(OnConflict::Upsert(ColumnReference::new(vec![
-                "id".to_string()
+                "id".to_string(),
             ]))),
             base_path: data_path.to_string_lossy().to_string(),
             partition_column: None,
@@ -236,9 +240,15 @@ async fn apply_stream(
     let commits = Arc::new(TokioMutex::new(Vec::new()));
     let stream = stream_of(ops, &commits);
     let refresh = Arc::new(RwLock::new(Refresh::default()));
-    task.start_changes_stream(refresh, stream, None, None, Arc::new(AtomicBool::new(false)))
-        .await
-        .expect("start_changes_stream");
+    task.start_changes_stream(
+        refresh,
+        stream,
+        None,
+        None,
+        Arc::new(AtomicBool::new(false)),
+    )
+    .await
+    .expect("start_changes_stream");
     commits.lock().await.clone()
 }
 
@@ -367,7 +377,11 @@ async fn debezium_redelivered_events_are_idempotent() {
     ];
 
     apply_stream(&table, "dbz_idem", &ops).await;
-    assert_eq!(scan_rows(&table).await.len(), 3, "three rows after first apply");
+    assert_eq!(
+        scan_rows(&table).await.len(),
+        3,
+        "three rows after first apply"
+    );
 
     // Redeliver the identical events.
     apply_stream(&table, "dbz_idem", &ops).await;
