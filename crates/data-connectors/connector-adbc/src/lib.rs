@@ -1258,6 +1258,15 @@ fn is_query_federation_enabled(params: &Parameters) -> Result<bool> {
     }
 }
 
+/// The name used to identify this connector in configuration.
+pub const CONNECTOR_NAME: &str = "adbc";
+
+/// Returns a new instance of the ADBC connector factory.
+#[must_use]
+pub fn factory() -> std::sync::Arc<dyn DataConnectorFactory> {
+    AdbcFactory::new_arc()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1939,13 +1948,4 @@ mod tests {
         let ctx_b = build_join_context("bigquery:///project-b?DatasetId=ds1", None, None, None);
         assert_ne!(ctx_a, ctx_b, "different URIs must produce different hashes");
     }
-}
-
-/// The name used to identify this connector in configuration.
-pub const CONNECTOR_NAME: &str = "adbc";
-
-/// Returns a new instance of the ADBC connector factory.
-#[must_use]
-pub fn factory() -> std::sync::Arc<dyn DataConnectorFactory> {
-    AdbcFactory::new_arc()
 }
