@@ -488,9 +488,7 @@ impl OnConflictDeletions {
         let inline_key_deletes = (self.deleted_inlined_pk_i64.len()
             + self.deleted_inlined_row_keys.len())
         .saturating_sub(reinserts);
-        file_key_deletes
-            + position_deletes.saturating_sub(file_key_deletes)
-            + inline_key_deletes
+        file_key_deletes + position_deletes.saturating_sub(file_key_deletes) + inline_key_deletes
     }
 }
 
