@@ -96,7 +96,9 @@ pub struct CayenneContext {
     /// `last_adjust_samples`). `0` until the first check.
     bake_gate_last_samples: std::sync::atomic::AtomicU64,
     /// Consecutive eligible control ticks on which a goal stayed violated while the
-    /// controller had no move left (every relevant lever clamped). At
+    /// controller had no move left — no eligible adjustment, whether because every
+    /// relevant lever is clamped at its bound OR the helpful lever is blocked by a
+    /// resource gate (e.g. memory/CPU pressure). At
     /// [`tuning::GOAL_INFEASIBLE_STUCK_TICKS`] the SLO is declared infeasible on the
     /// current hardware — surfaced via [`Self::goal_slo_infeasible`] (telemetry) and
     /// one operator warning per infeasible *episode* (fired on the crossing tick).
@@ -790,7 +792,8 @@ impl CayenneContext {
     }
 
     /// Whether the goal-driven controller has declared the configured SLO infeasible
-    /// on this hardware (every relevant lever clamped and the goal still violated for
+    /// on this hardware (no eligible adjustment available — actuator bounds or resource
+    /// gating — and the goal still violated for
     /// ~[`tuning::GOAL_INFEASIBLE_STUCK_TICKS`] eligible ticks). Surfaced as a
     /// telemetry gauge so silent underperformance becomes visible.
     #[must_use]

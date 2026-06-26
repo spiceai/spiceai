@@ -1026,9 +1026,9 @@ pub struct CayenneAutotuneState {
     /// ⇒ unprobed.
     pub metastore_storage_write_mbps: f64,
     /// `1` when the goal-driven controller has declared the SLO infeasible on this
-    /// hardware (every relevant actuator clamped and the goal still violated); `0`
-    /// otherwise. Reflects current state — self-clears if the SLO becomes reachable
-    /// again — so an operator can alert on a sustained `1`.
+    /// hardware (no further adjustment possible — actuator bounds or resource gating —
+    /// and the goal still violated); `0` otherwise. Reflects current state — self-clears
+    /// if the SLO becomes reachable again — so an operator can alert on a sustained `1`.
     pub goal_slo_infeasible: u64,
 }
 
@@ -1388,7 +1388,7 @@ pub fn track_cayenne_autotune_state(state: &CayenneAutotuneState, dimensions: &[
             cayenne_operational_meter()
                 .u64_gauge("cayenne_goal_slo_infeasible")
                 .with_description(
-                    "1 when the goal-driven tuner has declared the SLO infeasible on this hardware (every relevant actuator clamped, goal still violated); 0 otherwise.",
+                    "1 when the goal-driven tuner has declared the SLO infeasible on this hardware (no further adjustment possible due to bounds or gating, goal still violated); 0 otherwise.",
                 )
                 .build()
         })
