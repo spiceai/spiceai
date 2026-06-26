@@ -50,10 +50,9 @@ use super::on_conflict::{
     BatchValidationResult, CheckpointCorpusKeys, ExtractedPrimaryKeys, InlineAwareDeletionSink,
     InlinedDataRewrite, Int64DeletionDelta, MergedScanDeletions, OnConflictContext,
     OnConflictDeletionUpdate, OnConflictDeletions, OnConflictUpdate, OnConflictValidationStream,
-    PendingTombstoneDeltas, RowKeyDeletionDelta,
-    PkDeletionSnapshot, PkKeysetInvalidatingDeletionSink, PreparedInsertStream,
-    PreparedOnConflictDeletionPublish, PreparedProtectedSnapshotUpdate,
-    PreparedShardedInsertStream, ProtectedSnapshotScan, ShardedApplyResult,
+    PendingTombstoneDeltas, PkDeletionSnapshot, PkKeysetInvalidatingDeletionSink,
+    PreparedInsertStream, PreparedOnConflictDeletionPublish, PreparedProtectedSnapshotUpdate,
+    PreparedShardedInsertStream, ProtectedSnapshotScan, RowKeyDeletionDelta, ShardedApplyResult,
     pk_deletion_snapshot_for_strategy,
 };
 use super::pk_index::{
@@ -8857,11 +8856,12 @@ impl CayenneTableProvider {
                             delta.pure.iter().flat_map(|(delete_seq, pks)| {
                                 pks.iter().map(move |&pk| (pk, *delete_seq))
                             }),
-                            delta.reinsert.iter().flat_map(
-                                |(delete_seq, pks, insert_seq)| {
+                            delta
+                                .reinsert
+                                .iter()
+                                .flat_map(|(delete_seq, pks, insert_seq)| {
                                     pks.iter().map(move |&pk| (pk, *delete_seq, *insert_seq))
-                                },
-                            ),
+                                }),
                         );
                         Arc::new(Int64PkDeletionSnapshot::from_index(updated))
                     });
@@ -8880,12 +8880,12 @@ impl CayenneTableProvider {
                             delta.pure.iter().flat_map(|(delete_seq, keys)| {
                                 keys.iter().map(move |k| (&**k, *delete_seq))
                             }),
-                            delta.reinsert.iter().flat_map(
-                                |(delete_seq, keys, insert_seq)| {
-                                    keys.iter()
-                                        .map(move |k| (&**k, *delete_seq, *insert_seq))
-                                },
-                            ),
+                            delta
+                                .reinsert
+                                .iter()
+                                .flat_map(|(delete_seq, keys, insert_seq)| {
+                                    keys.iter().map(move |k| (&**k, *delete_seq, *insert_seq))
+                                }),
                         );
                         Arc::new(RowConverterDeletionSnapshot::from_index(updated))
                     });
