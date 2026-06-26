@@ -6785,6 +6785,115 @@ impl CayenneTableProvider {
     /// `epochs` are returned per shard; the caller uses the MAX (every shard's
     /// segment shares the apply's source coverage; the checkpoint watermark math
     /// is Phase 5).
+    /// Validate ONE shard's sub-batches against its existence view, returning the
+    /// rows to append plus the tombstones and kept keys for that shard. Pure,
+    /// synchronous CPU work over per-shard state that is independent of every
+    /// other shard (a key has exactly one owner — §3.2), so
+    /// [`Self::validate_and_append_sharded`] runs the N shards CONCURRENTLY on
+    /// scoped threads. No `.await` and no shared mutable state — that
+    /// independence is what makes the fan-out sound.
+    fn validate_one_shard(
+        &self,
+        s: usize,
+        shard_batches: Vec<RecordBatch>,
+        sharded_index: Option<&ShardedPkIndex>,
+        pk_indices: &[usize],
+        converter: &RowConverter,
+        on_conflict: &OnConflict,
+    ) -> Result<(Vec<RecordBatch>, OnConflictDeletions, HashSet<OwnedRow>)> {
+        let upsert_options = on_conflict.get_upsert_options();
+        let mut incoming_keys: HashSet<OwnedRow> = HashSet::new();
+        let mut delete_specs: HashMap<Arc<str>, Vec<u64>> = HashMap::new();
+        let mut deleted_pk_i64: Vec<i64> = Vec::new();
+        let mut deleted_row_keys: Vec<Box<[u8]>> = Vec::new();
+        let mut deleted_inlined_pk_i64: Vec<i64> = Vec::new();
+        let mut deleted_inlined_row_keys: Vec<Box<[u8]>> = Vec::new();
+        let mut kept_keys: HashSet<OwnedRow> = HashSet::new();
+        let mut filtered_batches: Vec<RecordBatch> = Vec::new();
+
+        for batch in shard_batches {
+            if batch.num_rows() == 0 {
+                continue;
+            }
+            let Some(index) = sharded_index else {
+                // No validation (pk_conflict_detection: none / no PK): keep all.
+                filtered_batches.push(batch);
+                continue;
+            };
+
+            // Bloom-split fast path: partition the sub-batch into definitely-new
+            // MISS rows (appended directly, no validation) and HIT rows (the
+            // existing validate path). Only the `Bloom` existence view supports
+            // the MISS test; the `Exact` view's O(1) probe already short-circuits
+            // an absent key, so it runs the whole sub-batch through validation.
+            let hit_batch = match index.existence_ref(s) {
+                PkExistenceRef::Bloom(bloom) => {
+                    let (miss, hit, miss_keys) = Self::bloom_split_shard_batch(
+                        &batch,
+                        bloom,
+                        pk_indices,
+                        converter,
+                        &incoming_keys,
+                    )?;
+                    // MISS rows are kept verbatim (new keys are never dropped),
+                    // recorded so a later same-shard HIT row observes them.
+                    if let Some(miss) = miss
+                        && miss.num_rows() > 0
+                    {
+                        incoming_keys.extend(miss_keys.iter().cloned());
+                        kept_keys.extend(miss_keys);
+                        filtered_batches.push(miss);
+                    }
+                    hit
+                }
+                PkExistenceRef::Exact(_) => Some(batch),
+            };
+
+            let Some(hit_batch) = hit_batch else {
+                continue;
+            };
+            if hit_batch.num_rows() == 0 {
+                continue;
+            }
+
+            let mut ctx = OnConflictContext {
+                pk_indices,
+                converter,
+                on_conflict,
+                upsert_options: &upsert_options,
+                existing: index.existence_ref(s),
+                incoming_keys: &incoming_keys,
+            };
+            let result = self.apply_on_conflict_to_batch(hit_batch, &mut ctx)?;
+            for (file_path, rows) in result.delete_specs {
+                delete_specs.entry(file_path).or_default().extend(rows);
+            }
+            deleted_pk_i64.extend(result.deleted_pk_i64);
+            deleted_row_keys.extend(result.deleted_row_keys);
+            deleted_inlined_pk_i64.extend(result.deleted_inlined_pk_i64);
+            deleted_inlined_row_keys.extend(result.deleted_inlined_row_keys);
+            incoming_keys.extend(result.kept_keys.iter().cloned());
+            kept_keys.extend(result.kept_keys);
+            if let Some(fb) = result.filtered_batch
+                && fb.num_rows() > 0
+            {
+                filtered_batches.push(fb);
+            }
+        }
+
+        Ok((
+            filtered_batches,
+            OnConflictDeletions {
+                delete_specs,
+                deleted_pk_i64,
+                deleted_row_keys,
+                deleted_inlined_pk_i64,
+                deleted_inlined_row_keys,
+            },
+            kept_keys,
+        ))
+    }
+
     pub(crate) async fn validate_and_append_sharded(
         &self,
         batches: Vec<RecordBatch>,
@@ -6795,7 +6904,6 @@ impl CayenneTableProvider {
         total_incoming_bytes: u64,
     ) -> Result<ShardedApplyResult> {
         let n = self.mem_tier.shard_count().max(1);
-        let upsert_options = on_conflict.get_upsert_options();
 
         // 1. Split every raw batch into N per-shard sub-batches (order-preserving
         //    Arrow filter on the OwnedRow shard hash).
@@ -6822,10 +6930,11 @@ impl CayenneTableProvider {
             per_shard_bytes[0] = per_shard_bytes[0].saturating_add(total_incoming_bytes - assigned);
         }
 
-        // 2. Validate each shard synchronously against ITS existence view, then
-        //    build that shard's `OnConflictDeletions`. `incoming_keys` is per
-        //    shard (a key has one owner, so the global cross-batch dup check is
-        //    exactly the per-shard one — §3.2).
+        // 2. Validate each shard CONCURRENTLY against ITS existence view, building
+        //    that shard's `OnConflictDeletions`. The shards are independent — a key
+        //    has exactly one owner (§3.2), so each uses its own existence view,
+        //    `incoming_keys`, and tombstone accumulators with no cross-shard state
+        //    (see `validate_one_shard`).
         //
         //    BLOOM-SPLIT (§5 Phase 6): when a shard's existence view is a `Bloom`,
         //    each sub-batch is first partitioned by `bloom.maybe_contains` (gated
@@ -6836,103 +6945,63 @@ impl CayenneTableProvider {
         //    HIT-path row in the same shard sees them, and they are inserted into
         //    the shard's bloom UNDER `locks[s]` in `append_to_shard` (below) so the
         //    durable existence index reflects them atomically with the segment swap.
+        //
+        //    Scoped OS threads fan the N shards out: validation is the dominant
+        //    per-apply CPU cost on insert-heavy tables, and the shards are
+        //    embarrassingly parallel. `std::thread::scope` lets the borrowed
+        //    `&self`/index/converter cross the thread boundary without
+        //    `'static`/`Arc` gymnastics and joins every thread before returning, so
+        //    `sharded_index` is free to move again at step 3. This blocks the
+        //    caller for `max(shard)` validation CPU instead of the prior
+        //    `sum(shard)`; the per-apply thread spawn (~tens of µs) is negligible
+        //    against the multi-hundred-ms fat applies where N>1 is configured.
         let mut per_shard_validated: Vec<(
             Vec<RecordBatch>,
             OnConflictDeletions,
             HashSet<OwnedRow>,
-        )> = Vec::with_capacity(n);
-        for (s, shard_batches) in per_shard_batches.into_iter().enumerate() {
-            let mut incoming_keys: HashSet<OwnedRow> = HashSet::new();
-            let mut delete_specs: HashMap<Arc<str>, Vec<u64>> = HashMap::new();
-            let mut deleted_pk_i64: Vec<i64> = Vec::new();
-            let mut deleted_row_keys: Vec<Box<[u8]>> = Vec::new();
-            let mut deleted_inlined_pk_i64: Vec<i64> = Vec::new();
-            let mut deleted_inlined_row_keys: Vec<Box<[u8]>> = Vec::new();
-            let mut kept_keys: HashSet<OwnedRow> = HashSet::new();
-            let mut filtered_batches: Vec<RecordBatch> = Vec::new();
-
-            for batch in shard_batches {
-                if batch.num_rows() == 0 {
-                    continue;
-                }
-                let Some(index) = sharded_index.as_ref() else {
-                    // No validation (pk_conflict_detection: none / no PK): keep all.
-                    filtered_batches.push(batch);
-                    continue;
-                };
-
-                // Bloom-split fast path: partition the sub-batch into definitely-new
-                // MISS rows (appended directly, no validation) and HIT rows (the
-                // existing validate path). Only the `Bloom` existence view supports
-                // the MISS test; the `Exact` view's O(1) probe already short-circuits
-                // an absent key, so it runs the whole sub-batch through validation.
-                let hit_batch = match index.existence_ref(s) {
-                    PkExistenceRef::Bloom(bloom) => {
-                        let (miss, hit, miss_keys) = Self::bloom_split_shard_batch(
-                            &batch,
-                            bloom,
-                            pk_indices,
-                            converter,
-                            &incoming_keys,
-                        )?;
-                        // MISS rows are kept verbatim (new keys are never dropped),
-                        // recorded so a later same-shard HIT row observes them.
-                        if let Some(miss) = miss
-                            && miss.num_rows() > 0
-                        {
-                            incoming_keys.extend(miss_keys.iter().cloned());
-                            kept_keys.extend(miss_keys);
-                            filtered_batches.push(miss);
+        )> = {
+            let index_ref = sharded_index.as_ref();
+            std::thread::scope(|scope| {
+                // Spawn a validation thread per NON-EMPTY shard; a shard with no
+                // rows routed to it this apply needs no validation, so it yields
+                // the empty result inline and skips the spawn/join — mirroring the
+                // `has_rows` skip in the append step below. One entry per shard in
+                // order, so the index alignment steps 3/4 rely on is preserved.
+                let handles: Vec<Option<_>> = per_shard_batches
+                    .into_iter()
+                    .enumerate()
+                    .map(|(s, shard_batches)| {
+                        if shard_batches.is_empty() {
+                            None
+                        } else {
+                            Some(scope.spawn(move || {
+                                self.validate_one_shard(
+                                    s,
+                                    shard_batches,
+                                    index_ref,
+                                    pk_indices,
+                                    converter,
+                                    on_conflict,
+                                )
+                            }))
                         }
-                        hit
-                    }
-                    PkExistenceRef::Exact(_) => Some(batch),
-                };
-
-                let Some(hit_batch) = hit_batch else {
-                    continue;
-                };
-                if hit_batch.num_rows() == 0 {
-                    continue;
-                }
-
-                let mut ctx = OnConflictContext {
-                    pk_indices,
-                    converter,
-                    on_conflict,
-                    upsert_options: &upsert_options,
-                    existing: index.existence_ref(s),
-                    incoming_keys: &incoming_keys,
-                };
-                let result = self.apply_on_conflict_to_batch(hit_batch, &mut ctx)?;
-                for (file_path, rows) in result.delete_specs {
-                    delete_specs.entry(file_path).or_default().extend(rows);
-                }
-                deleted_pk_i64.extend(result.deleted_pk_i64);
-                deleted_row_keys.extend(result.deleted_row_keys);
-                deleted_inlined_pk_i64.extend(result.deleted_inlined_pk_i64);
-                deleted_inlined_row_keys.extend(result.deleted_inlined_row_keys);
-                incoming_keys.extend(result.kept_keys.iter().cloned());
-                kept_keys.extend(result.kept_keys);
-                if let Some(fb) = result.filtered_batch
-                    && fb.num_rows() > 0
-                {
-                    filtered_batches.push(fb);
-                }
-            }
-
-            per_shard_validated.push((
-                filtered_batches,
-                OnConflictDeletions {
-                    delete_specs,
-                    deleted_pk_i64,
-                    deleted_row_keys,
-                    deleted_inlined_pk_i64,
-                    deleted_inlined_row_keys,
-                },
-                kept_keys,
-            ));
-        }
+                    })
+                    .collect();
+                handles
+                    .into_iter()
+                    .map(|handle| match handle {
+                        // Empty shard: no validation ran; yield the empty result.
+                        None => Ok((Vec::new(), OnConflictDeletions::default(), HashSet::new())),
+                        Some(h) => match h.join() {
+                            Ok(result) => result,
+                            // A panic in shard validation is a bug; re-raise it
+                            // faithfully rather than masking it as a normal error.
+                            Err(payload) => std::panic::resume_unwind(payload),
+                        },
+                    })
+                    .collect::<Result<Vec<_>>>()
+            })?
+        };
 
         // 3. Restore the per-shard existence index to the cache BEFORE the appends
         //    so each shard's `append_to_shard` can record its kept keys into that
