@@ -258,8 +258,13 @@ impl HardwareProfile {
         // sane range. A coarse divisor for a cap that only ever *lowers* concurrency.
         const PER_STREAM_FALLBACK_MBPS: f64 = 90.0;
         const MIN_STREAMS: usize = 4;
+        // The IMDS baseline is a fail-safe ONLY for unclassified storage: a
+        // confirmed local NVMe/instance-store (or tmpfs) parallelizes well and is
+        // never capped, even on an EBS-optimized instance (i*/d* families) whose
+        // baseline is known but whose data lives on the local volume.
         let is_ebs = matches!(self.data_storage, ResolvedAccelerationStorage::Ebs)
-            || self.ebs_baseline_mbps.is_some();
+            || (matches!(self.data_storage, ResolvedAccelerationStorage::Unknown)
+                && self.ebs_baseline_mbps.is_some());
         if !is_ebs {
             return None;
         }
@@ -861,6 +866,23 @@ mod tests {
         let mut hw = profile(16, 64 * GIB, ResolvedAccelerationStorage::Unknown);
         hw.ebs_baseline_mbps = Some(625.0);
         assert_eq!(hw.ebs_upload_concurrency_cap(), Some(6));
+
+        // Regression: a CONFIRMED local NVMe/instance-store volume stays UNCAPPED
+        // even on an EBS-optimized instance whose IMDS baseline is known — the
+        // baseline fail-safe only binds unclassified (Unknown) media, never a fast
+        // local disk. Tmpfs (RAM-backed) likewise ignores the baseline.
+        for fast in [
+            ResolvedAccelerationStorage::LocalSsd,
+            ResolvedAccelerationStorage::Tmpfs,
+        ] {
+            let mut hw = profile(16, 64 * GIB, fast);
+            hw.ebs_baseline_mbps = Some(625.0);
+            assert_eq!(
+                hw.ebs_upload_concurrency_cap(),
+                None,
+                "{fast:?} parallelizes well → never capped by an IMDS baseline"
+            );
+        }
     }
 
     // ---- inline_flush_caps (relocated from mod.rs) ------------------------

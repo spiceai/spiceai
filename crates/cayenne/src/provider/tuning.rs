@@ -2711,7 +2711,17 @@ fn tier_bound_fraction(base: f64, storage: StorageClass, measured_mbps: Option<f
 /// memory (the hard #1), then CPU, then the write path / storage, else the static
 /// actuator bounds themselves.
 pub(crate) fn binding_constraint(s: &IngestSnapshot) -> &'static str {
-    if s.mem_pressure.is_some_and(|p| p > MEM_PRESSURE_OK) {
+    // Mirror the controller's EFFECTIVE memory gate: a confirmed slow tier blocks
+    // buffer growth `SLOW_TIER_MEM_DRAIN_OFFSET` earlier (the earlier-drain gate in
+    // `decide`), so memory is the binding constraint at that same shifted threshold —
+    // otherwise a slow-tier goal stuck behind the shifted gate is misclassified as
+    // non-memory-bound.
+    let mem_gate = if s.confirmed_slow_tier() {
+        MEM_PRESSURE_OK - SLOW_TIER_MEM_DRAIN_OFFSET
+    } else {
+        MEM_PRESSURE_OK
+    };
+    if s.mem_pressure.is_some_and(|p| p > mem_gate) {
         "memory-bound (at/over the RAM budget — the controller can't grow buffers to meet the SLO; add memory or lower runtime.query.memory_limit)"
     } else if !s.cpu_ok() {
         if s.cpu_burstable {
@@ -4290,6 +4300,27 @@ mod tests {
             ..snap()
         };
         assert!(binding_constraint(&s).contains("memory"));
+        // Slow-tier earlier-drain gate: a confirmed slow tier (EBS) is memory-bound
+        // at `MEM_PRESSURE_OK - SLOW_TIER_MEM_DRAIN_OFFSET` (0.68) — the same gate the
+        // controller blocks buffer growth at — whereas the Unknown default keeps the
+        // standard 0.75 gate and shrugs the identical pressure off.
+        let slow = IngestSnapshot {
+            mem_pressure: Some(0.70),
+            data_storage: StorageClass::Ebs,
+            ..snap()
+        };
+        assert!(
+            binding_constraint(&slow).contains("memory"),
+            "confirmed slow tier binds on memory at the shifted gate"
+        );
+        let unknown = IngestSnapshot {
+            mem_pressure: Some(0.70),
+            ..snap()
+        };
+        assert!(
+            !binding_constraint(&unknown).contains("memory"),
+            "the Unknown default keeps the standard 0.75 memory gate"
+        );
         // CPU next.
         let s = IngestSnapshot {
             cpu_pressure: Some(0.9),

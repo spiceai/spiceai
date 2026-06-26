@@ -1491,10 +1491,13 @@ pub(crate) fn coordinated_mem_tier_budget(
     // `runtime.query.memory_limit`), let the tier reclaim part of the freed RAM
     // above the base host/8 cap — up to `host / MEM_TIER_FLOAT_CEILING_FRACTION` —
     // but only the room left beyond a DOUBLED headroom reserve, so the off-pool
-    // caches/memtables the single headroom covers keep their slack. `remainder`
-    // (computed with the single headroom) is still the clamped value, and the
-    // result never exceeds it, so `query_pool + compaction + tier + headroom <=
-    // host` (the #11449 no-overcommit invariant) holds exactly for ANY ceiling.
+    // caches/memtables the single headroom covers keep their slack. Raising only the
+    // ceiling never lifts the result above `remainder` (the ceiling caps from above,
+    // and `remainder` is computed with the single headroom), so the floating ceiling
+    // preserves the #11449 no-overcommit invariant `query_pool + compaction + tier +
+    // headroom <= host` for ANY ceiling — subject to the same `remainder >= floor`
+    // PRECONDITION above: when the floor wins (`remainder < floor`) the clamp returns
+    // `floor > remainder` and the caller warns instead.
     let float_room = total_memory
         .saturating_sub(query_pool_bytes)
         .saturating_sub(compaction_pool_bytes)
