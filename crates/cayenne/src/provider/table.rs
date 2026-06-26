@@ -10547,12 +10547,20 @@ impl CayenneTableProvider {
             if self.cached_inlined_row_count() > 0 {
                 self.checkpoint_inlined_data().await?;
             }
-            let folded_before: std::collections::HashSet<String> =
-                self.protected_snapshots.load_full().keys().cloned().collect();
+            let folded_before: std::collections::HashSet<String> = self
+                .protected_snapshots
+                .load_full()
+                .keys()
+                .cloned()
+                .collect();
             let stream = self.visible_file_stream_for_rewrite(&ctx).await?;
             let cutoff = self.sequence_high_water().await;
-            let folded_after: std::collections::HashSet<String> =
-                self.protected_snapshots.load_full().keys().cloned().collect();
+            let folded_after: std::collections::HashSet<String> = self
+                .protected_snapshots
+                .load_full()
+                .keys()
+                .cloned()
+                .collect();
             if folded_before != folded_after {
                 // A concurrent finalize published a protected snapshot during the
                 // scan; we can no longer tell which snapshots the scan folded.
