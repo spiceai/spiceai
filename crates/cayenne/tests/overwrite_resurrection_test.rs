@@ -39,7 +39,7 @@ use std::sync::Arc;
 use arrow::array::{Int64Array, RecordBatch};
 use arrow::datatypes::{DataType, Field, Schema};
 use cayenne::metadata::{CreateTableOptions, DeletionMode, VortexConfig};
-use cayenne::{CayenneTableProvider, MetadataCatalog};
+use cayenne::{CayenneTableProvider, CayenneTableProviderBuilder, MetadataCatalog};
 use common::TestFixture;
 use datafusion::datasource::TableProvider;
 use datafusion::datasource::memory::MemorySourceConfig;
@@ -88,6 +88,14 @@ async fn create_table(
     name: &str,
     mode: Mode,
 ) -> TestResult<(Arc<CayenneTableProvider>, SessionContext)> {
+    create_table_with(fixture, name, config(mode)).await
+}
+
+async fn create_table_with(
+    fixture: &TestFixture,
+    name: &str,
+    vortex_config: VortexConfig,
+) -> TestResult<(Arc<CayenneTableProvider>, SessionContext)> {
     let opts = CreateTableOptions {
         table_name: name.to_string(),
         schema: schema(),
@@ -97,13 +105,31 @@ async fn create_table(
         ]))),
         base_path: fixture.data_path.to_string_lossy().to_string(),
         partition_column: None,
-        vortex_config: config(mode),
+        vortex_config,
     };
     let catalog: Arc<dyn MetadataCatalog> =
         Arc::clone(&fixture.catalog) as Arc<dyn MetadataCatalog>;
     let ctx = SessionContext::new();
     let table =
         Arc::new(CayenneTableProvider::create_table(catalog, opts, ctx.runtime_env()).await?);
+    ctx.register_table(name, Arc::clone(&table) as Arc<dyn TableProvider>)?;
+    Ok((table, ctx))
+}
+
+/// Reopen an existing table from the catalog, rebuilding all in-memory state
+/// (including the PK existence index) from durable metadata.
+async fn reopen_table(
+    fixture: &TestFixture,
+    name: &str,
+) -> TestResult<(Arc<CayenneTableProvider>, SessionContext)> {
+    let catalog: Arc<dyn MetadataCatalog> =
+        Arc::clone(&fixture.catalog) as Arc<dyn MetadataCatalog>;
+    let ctx = SessionContext::new();
+    let table = Arc::new(
+        CayenneTableProviderBuilder::new(catalog, ctx.runtime_env())
+            .open(name)
+            .await?,
+    );
     ctx.register_table(name, Arc::clone(&table) as Arc<dyn TableProvider>)?;
     Ok((table, ctx))
 }
@@ -236,3 +262,79 @@ async fn overwrite_resurrection_position_impl(fixture: TestFixture) -> TestResul
 
 test_with_backends!(overwrite_resurrection_key_impl);
 test_with_backends!(overwrite_resurrection_position_impl);
+
+// ===========================================================================
+// Bloom existence-fallback variant
+// ===========================================================================
+//
+// An over-budget upsert table falls back from the exact PK keyset to a bounded
+// bloom existence filter (`PkExistenceRef::Bloom`). The reinsert-over-tombstone
+// probe has to run on the bloom MISS path too: a key absent from the bloom but
+// still carrying a pending DELETE tombstone otherwise takes the plain-insert
+// path, records no `insert_seq`, and stays hidden — the same resurrection bug,
+// on the bloom fallback. The per-mode tests above never reach this; their tiny
+// keyset stays exact, so this gap was invisible until now.
+//
+// Forcing the bloom path deterministically:
+//   * `pk_keyset_cache_mb: 0` converts any non-empty keyset to a bloom (a 64-bit
+//     floor — low false-positive rate for the handful of keys here).
+//   * A delete cannot be removed from a bloom in place, so we REOPEN the table:
+//     the existence index is rebuilt from the post-delete live keyset (just the
+//     sentinel key), which therefore excludes the victims while their tombstones
+//     stay durable. A warm-up upsert of the sentinel materializes that bloom, so
+//     the victim re-upserts below are checked against it (a MISS), not a freshly
+//     built exact keyset.
+// Several victims are re-upserted: the early ones are true bloom misses (the
+// fix's target); a late false-positive hit is still resolved correctly, so the
+// assertion holds either way, while a regression loses the true misses.
+
+fn bloom_config() -> VortexConfig {
+    VortexConfig {
+        deletion_mode: DeletionMode::Key,
+        pk_keyset_cache_mb: Some(0),
+        inline_max_rows: 0,
+        ..VortexConfig::default()
+    }
+}
+
+async fn reupsert_over_tombstone_survives_bloom_fallback_impl(
+    fixture: TestFixture,
+) -> TestResult<()> {
+    let name = "bloom_resurrect";
+    let sentinel = 0;
+    let victims: Vec<i64> = (1..=16).collect();
+
+    {
+        let (table, _ctx) = create_table_with(&fixture, name, bloom_config()).await?;
+        // Sentinel stays live so the keyset is never empty (an empty keyset is
+        // kept exact, not converted to a bloom).
+        upsert(&table, sentinel, 1).await?;
+        for &k in &victims {
+            upsert(&table, k, k * 10).await?;
+        }
+        for &k in &victims {
+            delete_key(&table, k).await?;
+        }
+    }
+
+    // Reopen: existence index is rebuilt from the live keyset ({sentinel}); the
+    // victims' tombstones survive in the durable deletion index.
+    let (table2, ctx2) = reopen_table(&fixture, name).await?;
+    // Materialize the bloom from the rebuilt {sentinel} keyset.
+    upsert(&table2, sentinel, 2).await?;
+    // Each victim re-upsert is a bloom MISS with a pending tombstone.
+    for &k in &victims {
+        upsert(&table2, k, k * 100).await?;
+    }
+
+    for &k in &victims {
+        assert_eq!(
+            read_value(&ctx2, name, k).await?,
+            Some(k * 100),
+            "key {k} lost after reinsert-over-tombstone on the bloom existence-fallback path"
+        );
+    }
+    Ok(())
+}
+
+test_with_backends!(reupsert_over_tombstone_survives_bloom_fallback_impl);
