@@ -6468,6 +6468,26 @@ impl CayenneTableProvider {
         let mut deleted_inlined_pk_i64: Vec<i64> = Vec::new();
         let mut deleted_inlined_row_keys: Vec<Box<[u8]>> = Vec::new();
 
+        // Re-insert-over-tombstone probe (upsert correctness): a key may be ABSENT
+        // from the visible existence index yet still carry a pending DELETE
+        // tombstone — e.g. after `INSERT OVERWRITE` clears the PK keyset and a
+        // later `DELETE` leaves a tombstone. A plain insert for such a key would
+        // stay hidden forever (a row is visible iff `insert_seq > delete_seq`, and
+        // a plain insert records no `insert_seq`). When this table has pending
+        // deletions, snapshot the deletion index once so the per-row `else` branch
+        // below can detect those keys and route them through the on-conflict
+        // re-insert path (which records an `insert_seq` that supersedes the
+        // tombstone). Gated on `Upsert` + `has_pending_deletions()` so there is no
+        // cost on the common no-pending-deletes path.
+        let reinsert_over_tombstone: Option<PkDeletionSnapshot> =
+            if matches!(ctx.on_conflict, OnConflict::Upsert(_)) && self.has_pending_deletions() {
+                Some(pk_deletion_snapshot_for_strategy(
+                    &self.pk_deletion_strategy,
+                ))
+            } else {
+                None
+            };
+
         // Hoist the PK-null check out of the per-row loop: an Arrow column with no
         // null buffer reports `null_count() == 0` in O(1), so when no PK column is
         // nullable we skip the per-row `is_null` scan across all PK columns
@@ -6552,6 +6572,33 @@ impl CayenneTableProvider {
                                 true
                             }
                         }
+                    } else if let Some(snapshot) = &reinsert_over_tombstone {
+                        // Key is not in the visible existence index, but carries a
+                        // pending DELETE tombstone — record it on the on-conflict
+                        // re-insert path so the new row gets an `insert_seq` that
+                        // supersedes the tombstone (no row location ⇒ no position
+                        // delete; the prior row is already gone). Without this the
+                        // re-inserted row stays permanently hidden.
+                        match snapshot {
+                            PkDeletionSnapshot::Int64Pk { tombstones } => {
+                                if let Some(arr) = int64_pk_array {
+                                    let value = arr.value(row_idx);
+                                    if tombstones.get(value).is_some() {
+                                        deleted_pk_i64.push(value);
+                                        deleted_inlined_pk_i64.push(value);
+                                    }
+                                }
+                            }
+                            PkDeletionSnapshot::RowConverterBased { tombstones } => {
+                                if tombstones.get(key.as_ref()).is_some() {
+                                    let row_key = key.as_ref().to_vec().into_boxed_slice();
+                                    deleted_row_keys.push(row_key.clone());
+                                    deleted_inlined_row_keys.push(row_key);
+                                }
+                            }
+                            PkDeletionSnapshot::PositionBased => {}
+                        }
+                        true
                     } else {
                         true
                     }
