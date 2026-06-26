@@ -10512,13 +10512,24 @@ impl CayenneTableProvider {
         let ctx = self.create_compaction_session_context();
 
         // Build the visible stream and, for key-delete tables, capture a COHERENT
-        // `(cutoff, folded protected snapshots)` fence under a brief `write_lock`.
-        // Under `write_lock` no writer is mid-publish, so every mutation with
+        // `(cutoff, folded protected snapshots)` fence under `write_lock`. Under
+        // `write_lock` no writer is mid-publish, so every mutation with
         // `seq <= cutoff` is already visible to the scan; anything that arrives
         // afterward gets `seq > cutoff` and is carried forward (NOT cleared) at
-        // the end. The lock is released as soon as the stream object exists (it
-        // has already pinned its inputs), so the slow encode below runs fully
-        // concurrent with writers, preserving CDC throughput.
+        // the end.
+        //
+        // The lock is dropped once the stream object exists (its inputs are
+        // pinned), so the dominant cost — reading every input file and
+        // re-encoding the consolidated output below — runs concurrent with
+        // writers. The lock is NOT I/O-free, though: when an inline memtable is
+        // present it spans `checkpoint_inlined_data` (writes a Vortex file +
+        // listing-fence swap, bounded by the memtable size; skipped entirely
+        // when there is no inline data), so a writer can block for that flush.
+        // The checkpoint MUST stay inside the lock — it has to land in
+        // `folded_before`, and running it lock-free would let a racing inline
+        // write trigger a re-checkpoint during the scan and spuriously abort the
+        // pass (the documented files-accumulate failure mode); see the
+        // folded-set bracket below.
         //
         // `folded` MUST be exactly the protected snapshots the scan folded in:
         // clearing one the scan did NOT fold loses its rows; failing to clear one
