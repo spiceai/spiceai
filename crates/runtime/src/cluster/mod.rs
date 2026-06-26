@@ -34,6 +34,7 @@ use ::datafusion::sql::ResolvedTableReference;
 use app::App;
 use ballista_core::config::ShuffleFormat as BallistaShuffleFormat;
 use ballista_core::extension::SessionConfigExt;
+use ballista_core::extension::SessionConfigHelperExt;
 use ballista_core::registry::BallistaFunctionRegistry;
 use ballista_core::serde::BallistaCodec;
 use ballista_core::serde::protobuf::executor_resource::Resource;
@@ -1875,7 +1876,53 @@ async fn create_scheduler_server(
                 .with_option_extension(SpiceClusterConfig::default())
                 .with_option_extension(incoming_request_context)
                 .with_ballista_shuffle_format(ballista_shuffle_format)
-                .with_ballista_shuffle_memory_mode(shuffle_memory_mode);
+                .with_ballista_shuffle_memory_mode(shuffle_memory_mode)
+                // Enforce the DataFusion settings distributed (Ballista) execution
+                // requires for correctness — the same set the executor applies via
+                // `new_with_ballista`. The session builder otherwise rebuilds from
+                // `current_context.copied_config()` (the local single-node config),
+                // and this config is serialized into the task props sent to
+                // executors, so it governs both the distributed plan and its
+                // execution. Among other things this disables CollectLeft broadcast
+                // joins (whose left child must be a single partition — invalid once
+                // the input is a multi-partition shuffle) and round-robin
+                // repartition.
+                .ballista_restricted_configuration();
+
+            // The following optimizations all rely on shared mutable state within a
+            // single process and are incorrect (or fatal) once a plan is split into
+            // stages that run in separate executor processes. They are not disabled
+            // by `ballista_restricted_configuration`, so disable them explicitly on
+            // the session/planning config (which is serialized into executor task
+            // props):
+            {
+                let opts = cfg.options_mut();
+
+                // File-scan work-stealing shares one queue of unopened files across
+                // all of a scan's partition streams. In-process that means each file
+                // is read once; under Ballista every executor process rebuilds the
+                // full queue and reads the whole input — N-fold scan amplification
+                // and N-fold inflated aggregate results.
+                opts.execution.enable_file_scan_work_stealing = false;
+
+                // The hash-join dynamic filter builds a min/max filter from the
+                // build side at runtime and pushes it into the probe-side scan via
+                // shared plan state; across a stage boundary it can never be
+                // populated, and its serialized form carries probe-side column
+                // indices that don't resolve against the receiving stage's schema.
+                // (TopK/aggregate dynamic filters are left enabled — they merely
+                // stay empty across stages rather than erroring.)
+                opts.optimizer.enable_join_dynamic_filter_pushdown = false;
+
+                // Uncorrelated scalar subqueries are otherwise executed by a
+                // `ScalarSubqueryExec` that evaluates them eagerly on one node into a
+                // shared results container; a shuffle boundary between the exec and
+                // its dependent `ScalarSubqueryExpr`s leaves a child stage unable to
+                // decode the expr. Disabling this rewrites them to left joins via
+                // `ScalarSubqueryToJoin` (DataFusion's documented escape hatch for
+                // distributed execution frameworks), which distribute correctly.
+                opts.optimizer.enable_physical_uncorrelated_scalar_subquery = false;
+            }
 
             // Apply object store shuffle configuration if specified
             if let Some(ref storage_type) = shuffle_storage_type {
