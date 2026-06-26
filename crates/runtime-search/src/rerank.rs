@@ -1767,6 +1767,11 @@ mod tests {
         // hits the unhandled fallback and returns a plan error.
         let mut config = datafusion::prelude::SessionConfig::new();
         config.options_mut().sql_parser.dialect = datafusion::common::config::Dialect::PostgreSQL;
+        // Pin target_partitions so EXPLAIN plan snapshots are deterministic across
+        // CI runners: otherwise a post-filter `RepartitionExec: RoundRobinBatch(N)`
+        // reports N = the host CPU count (e.g. 10 on a dev box vs 12 on a runner),
+        // which is incidental to what these rerank tests assert.
+        config.options_mut().execution.target_partitions = 1;
         let ctx = Arc::new(SessionContext::new_with_config(config));
         ctx.state().config_mut().set_extension(Arc::new(
             RequestContext::builder(Protocol::Internal).build(),
