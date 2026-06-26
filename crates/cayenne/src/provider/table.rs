@@ -6467,6 +6467,10 @@ impl CayenneTableProvider {
         let mut deleted_row_keys: Vec<Box<[u8]>> = Vec::new();
         let mut deleted_inlined_pk_i64: Vec<i64> = Vec::new();
         let mut deleted_inlined_row_keys: Vec<Box<[u8]>> = Vec::new();
+        // Reinsert-over-tombstone resurrections recorded below — counted once per
+        // key so `total_superseded` can exclude them from the live-row delta (a
+        // resurrection adds a live row, it does not supersede one).
+        let mut reinserted_over_tombstone: usize = 0;
 
         // Re-insert-over-tombstone probe (upsert correctness): a key may be ABSENT
         // from the visible existence index yet still carry a pending DELETE
@@ -6579,6 +6583,10 @@ impl CayenneTableProvider {
                         // supersedes the tombstone (no row location ⇒ no position
                         // delete; the prior row is already gone). Without this the
                         // re-inserted row stays permanently hidden.
+                        // Pushed to BOTH a file and an inline list (so the prior
+                        // version is masked wherever it lives, mirroring the bloom
+                        // path), but the key supersedes no live row — count it once
+                        // here so `total_superseded` can net it back out.
                         match snapshot {
                             PkDeletionSnapshot::Int64Pk { tombstones } => {
                                 if let Some(arr) = int64_pk_array {
@@ -6586,6 +6594,7 @@ impl CayenneTableProvider {
                                     if tombstones.get(value).is_some() {
                                         deleted_pk_i64.push(value);
                                         deleted_inlined_pk_i64.push(value);
+                                        reinserted_over_tombstone += 1;
                                     }
                                 }
                             }
@@ -6594,6 +6603,7 @@ impl CayenneTableProvider {
                                     let row_key = key.as_ref().to_vec().into_boxed_slice();
                                     deleted_row_keys.push(row_key.clone());
                                     deleted_inlined_row_keys.push(row_key);
+                                    reinserted_over_tombstone += 1;
                                 }
                             }
                             PkDeletionSnapshot::PositionBased => {}
@@ -6690,6 +6700,7 @@ impl CayenneTableProvider {
             deleted_row_keys,
             deleted_inlined_pk_i64,
             deleted_inlined_row_keys,
+            reinserted_over_tombstone,
         })
     }
 
@@ -6854,6 +6865,7 @@ impl CayenneTableProvider {
             let mut deleted_row_keys: Vec<Box<[u8]>> = Vec::new();
             let mut deleted_inlined_pk_i64: Vec<i64> = Vec::new();
             let mut deleted_inlined_row_keys: Vec<Box<[u8]>> = Vec::new();
+            let mut reinserted_over_tombstone: usize = 0;
             let mut kept_keys: HashSet<OwnedRow> = HashSet::new();
             let mut filtered_batches: Vec<RecordBatch> = Vec::new();
 
@@ -6918,6 +6930,7 @@ impl CayenneTableProvider {
                 deleted_row_keys.extend(result.deleted_row_keys);
                 deleted_inlined_pk_i64.extend(result.deleted_inlined_pk_i64);
                 deleted_inlined_row_keys.extend(result.deleted_inlined_row_keys);
+                reinserted_over_tombstone += result.reinserted_over_tombstone;
                 incoming_keys.extend(result.kept_keys.iter().cloned());
                 kept_keys.extend(result.kept_keys);
                 if let Some(fb) = result.filtered_batch
@@ -6935,6 +6948,7 @@ impl CayenneTableProvider {
                     deleted_row_keys,
                     deleted_inlined_pk_i64,
                     deleted_inlined_row_keys,
+                    reinserted_over_tombstone,
                 },
                 kept_keys,
             ));
@@ -7904,6 +7918,8 @@ impl CayenneTableProvider {
             deleted_row_keys,
             deleted_inlined_pk_i64,
             deleted_inlined_row_keys,
+            // Already folded into `superseded` above; not needed past this point.
+            reinserted_over_tombstone: _,
         } = on_conflict_deletions;
 
         // Inline-bearing batches now STAGE inert (Option D): the tombstone is
@@ -8500,6 +8516,9 @@ impl CayenneTableProvider {
             deleted_row_keys,
             deleted_inlined_pk_i64,
             deleted_inlined_row_keys,
+            // Live-row-delta accounting only (see `total_superseded`); the actual
+            // delete/reinsert I/O below works off the key lists.
+            reinserted_over_tombstone: _,
         } = on_conflict_deletions;
 
         let has_file_key_deletions = !deleted_pk_i64.is_empty() || !deleted_row_keys.is_empty();

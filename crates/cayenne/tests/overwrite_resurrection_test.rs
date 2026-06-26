@@ -40,7 +40,7 @@ use arrow::array::{Int64Array, RecordBatch};
 use arrow::datatypes::{DataType, Field, Schema};
 use cayenne::metadata::{CreateTableOptions, DeletionMode, VortexConfig};
 use cayenne::{CayenneTableProvider, MetadataCatalog};
-use common::{BackendType, TestFixture};
+use common::TestFixture;
 use datafusion::datasource::TableProvider;
 use datafusion::datasource::memory::MemorySourceConfig;
 use datafusion::execution::context::SessionContext;
