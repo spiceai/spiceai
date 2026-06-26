@@ -69,9 +69,10 @@ fn alloc_port() -> u16 {
 }
 
 fn build_names_csv() -> String {
+    use std::fmt::Write as _;
     let mut csv = String::from("id,name\n");
     for i in 1..=NAMES_ROWS {
-        csv.push_str(&format!("{i},name-{i}\n"));
+        writeln!(csv, "{i},name-{i}").expect("write csv row to String");
     }
     csv
 }
@@ -272,7 +273,6 @@ where
     F: Fn(&JobState) -> bool,
 {
     let start = Instant::now();
-    let mut last: Option<JobStatus> = None;
     loop {
         let state = je
             .get_status(job_id)
@@ -281,10 +281,10 @@ where
         if pred(&state) {
             return Ok(state);
         }
-        last = Some(state.status);
         if start.elapsed() > timeout {
             return Err(anyhow::Error::msg(format!(
-                "timed out waiting for job {job_id} to reach `{label}` within {timeout:?}; last status = {last:?}"
+                "timed out waiting for job {job_id} to reach `{label}` within {timeout:?}; last status = {:?}",
+                state.status
             )));
         }
         sleep(Duration::from_millis(150)).await;
@@ -426,6 +426,6 @@ async fn recovers_job_after_scheduler_loss_sigterm() -> Result<(), anyhow::Error
 async fn recovers_job_after_scheduler_loss_sigkill() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,info"));
     test_request_context()
-        .scope(async { run_failover(Duration::from_secs(60)).await })
+        .scope(async { run_failover(Duration::from_mins(1)).await })
         .await
 }
