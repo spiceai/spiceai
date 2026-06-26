@@ -10395,7 +10395,9 @@ impl CayenneTableProvider {
     /// concurrent append may legitimately add its own files (and manifest rows)
     /// to it before this check runs; those extra manifest entries are expected
     /// and must not trip the assert. A LISTED file MISSING from the manifest is
-    /// the real bug (a dropped/duplicated round-trip row) and still fails.
+    /// the real bug (a dropped round-trip row) and still fails. (A duplicated
+    /// manifest row is not detectable here — both sides are name sets — and is
+    /// not the failure mode this guards against.)
     #[cfg(debug_assertions)]
     async fn debug_assert_manifest_matches_listing(
         &self,
@@ -10423,15 +10425,18 @@ impl CayenneTableProvider {
         let listed_names: std::collections::BTreeSet<&str> =
             listed.iter().map(|(name, _)| name.as_str()).collect();
 
-        let missing_from_manifest: Vec<&str> =
-            listed_names.difference(&manifest_names).copied().collect();
+        // Cheap check first (no allocation); only materialize the diff for the
+        // panic message on failure.
         debug_assert!(
-            missing_from_manifest.is_empty(),
+            listed_names.is_subset(&manifest_names),
             "cayenne_snapshot_file manifest for table {} snapshot {snapshot_id} is missing \
-             files the rewrite authored (round-trip dropped rows): \
-             missing={missing_from_manifest:?} (manifest={manifest_names:?}, \
-             listed={listed_names:?})",
+             files the caller just listed (round-trip dropped rows): missing={:?} \
+             (manifest={manifest_names:?}, listed={listed_names:?})",
             self.table_metadata.table_name,
+            listed_names
+                .difference(&manifest_names)
+                .copied()
+                .collect::<Vec<&str>>(),
         );
     }
 
