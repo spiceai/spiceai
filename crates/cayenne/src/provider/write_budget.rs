@@ -38,6 +38,7 @@ limitations under the License.
 //! When unset (unit tests, embedders that don't wire it up) acquisition is a
 //! no-op and writes proceed ungated, preserving the prior per-table behavior.
 
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock};
 
 use parking_lot::RwLock;
@@ -109,7 +110,26 @@ struct EncodeBudget {
     /// then main) and `Delta` never touches the gate, so no hold-and-wait
     /// cycle exists across classes.
     maintenance_gate: Arc<Semaphore>,
-    total: usize,
+    /// The current budget ceiling, shared (an `Arc<AtomicUsize>` rather than a
+    /// plain `usize`) so [`cap_global_encode_concurrency`] can lower it IN
+    /// PLACE on the live `semaphore`/`maintenance_gate` — every clone an
+    /// in-flight acquirer holds observes the new ceiling. Per-acquire clamps
+    /// (`acquire_from`) read this, not a stale snapshot, so a request can never
+    /// ask for more permits than the (possibly just-shrunk) budget can ever
+    /// hold — closing the "pending `acquire_many` clamped to the old cap stalls
+    /// forever" hazard.
+    total: Arc<AtomicUsize>,
+    /// Permits a cap-shrink still owes on `semaphore`: tokio's `forget_permits`
+    /// can only remove *available* permits, so when held permits exceed the new
+    /// cap the residual is recorded here and forgotten as those permits return
+    /// (drained best-effort in `acquire_from`). This converges the live budget
+    /// down to the cap WITHOUT ever re-adding capacity — the prior swap-in of a
+    /// fresh full-size semaphore left old held permits running alongside a new
+    /// full budget, transiently over-subscribing the shared EBS pipe by
+    /// `old_held + new_cap`.
+    pending_forget: Arc<AtomicUsize>,
+    /// As [`Self::pending_forget`], for the `maintenance_gate` semaphore.
+    pending_gate_forget: Arc<AtomicUsize>,
 }
 
 /// Permits held for one write's encode, released together on drop.
@@ -132,7 +152,9 @@ pub fn set_global_encode_concurrency(permits: usize) {
     let budget = EncodeBudget {
         semaphore: Arc::new(Semaphore::new(permits)),
         maintenance_gate: Arc::new(Semaphore::new(maintenance_gate_cap(permits))),
-        total: permits,
+        total: Arc::new(AtomicUsize::new(permits)),
+        pending_forget: Arc::new(AtomicUsize::new(0)),
+        pending_gate_forget: Arc::new(AtomicUsize::new(0)),
     };
     let mut guard = GLOBAL_ENCODE_BUDGET.write();
     if guard.is_some() {
@@ -145,6 +167,70 @@ pub fn set_global_encode_concurrency(permits: usize) {
     *guard = Some(budget);
 }
 
+/// Forget up to `delta` permits on `sem` now, recording any that could not be
+/// forgotten (because they are currently held) as owed in `owed` — to be
+/// forgotten as those permits return (see [`drain_owed`]). Never adds capacity.
+fn forget_or_owe(sem: &Semaphore, owed: &AtomicUsize, delta: usize) {
+    if delta == 0 {
+        return;
+    }
+    let forgot = sem.forget_permits(delta);
+    if forgot < delta {
+        owed.fetch_add(delta - forgot, Ordering::AcqRel);
+    }
+}
+
+/// Forget any still-owed permits that have become available since the last
+/// cap-shrink (a held permit released back to `sem`). Best-effort and cheap: a
+/// single `forget_permits` of whatever is owed, capped by what is available
+/// now; the remainder drains on a later call. Called on the acquire path so the
+/// live budget converges to its cap as in-flight encodes finish, without ever
+/// having re-added capacity.
+fn drain_owed(sem: &Semaphore, owed: &AtomicUsize) {
+    let pending = owed.load(Ordering::Acquire);
+    if pending == 0 {
+        return;
+    }
+    let forgot = sem.forget_permits(pending);
+    if forgot > 0 {
+        owed.fetch_sub(forgot, Ordering::AcqRel);
+    }
+}
+
+impl EncodeBudget {
+    /// Lower this budget's ceiling to `max_permits` IN PLACE (never raises).
+    /// Returns the previous total when the cap bound (shrank), or `None` when it
+    /// was already at or below `max_permits`. The caller serializes (the global
+    /// write lock); `max_permits` is clamped to ≥ 1.
+    ///
+    /// This is the SINGLE source of the cap-shrink arithmetic —
+    /// [`cap_global_encode_concurrency`] and the unit test both drive it, so the
+    /// test can never validate a drifted copy of the shrink logic.
+    ///
+    /// Shrinks via `forget_permits` on the live semaphores rather than swapping
+    /// in fresh ones. A swap left every permit already held against the old
+    /// semaphore running ALONGSIDE a brand-new full-size budget, so aggregate
+    /// concurrency could transiently reach `old_held + max_permits` —
+    /// over-subscribing the very EBS pipe the cap protects. Forgetting in place
+    /// never adds capacity: it removes available permits immediately and records
+    /// the residual still held as owed (`pending_forget`/`pending_gate_forget`),
+    /// forgotten as those permits return ([`drain_owed`] on the acquire path), so
+    /// the budget converges DOWN to the cap and never temporarily up.
+    fn shrink_to(&self, max_permits: usize) -> Option<usize> {
+        let max_permits = max_permits.max(1);
+        let current = self.total.load(Ordering::Acquire);
+        if current <= max_permits {
+            return None; // Already at or below the cap — never raises.
+        }
+        forget_or_owe(&self.semaphore, &self.pending_forget, current - max_permits);
+        let gate_delta =
+            maintenance_gate_cap(current).saturating_sub(maintenance_gate_cap(max_permits));
+        forget_or_owe(&self.maintenance_gate, &self.pending_gate_forget, gate_delta);
+        self.total.store(max_permits, Ordering::Release);
+        Some(current)
+    }
+}
+
 /// Lower the process-global encode budget to at most `max_permits`, never raising
 /// it. The integration point for the instance EBS-bandwidth cap: a single EBS
 /// volume is a shared, bandwidth-bounded pipe, so the aggregate parallel
@@ -154,27 +240,23 @@ pub fn set_global_encode_concurrency(permits: usize) {
 /// bandwidth-derived cap and the tightest wins; a local-SSD table proposes
 /// nothing. A no-op when no budget is installed yet or the cap does not bind.
 pub fn cap_global_encode_concurrency(max_permits: usize) {
-    let max_permits = max_permits.max(1);
-    // Check-and-replace under a SINGLE write lock so concurrent registrations
-    // proposing different caps can't race (a looser cap landing last must not raise
-    // the budget back up): re-read the current total under the lock and replace only
-    // while it still exceeds `max_permits`. "Tightest wins, never raises" holds.
-    let mut guard = GLOBAL_ENCODE_BUDGET.write();
-    match guard.as_ref() {
-        Some(budget) if budget.total > max_permits => {
-            tracing::info!(
-                target: "cayenne::write_budget",
-                max_permits,
-                "Capping global encode-concurrency budget to the instance EBS write-bandwidth ceiling"
-            );
-            *guard = Some(EncodeBudget {
-                semaphore: Arc::new(Semaphore::new(max_permits)),
-                maintenance_gate: Arc::new(Semaphore::new(maintenance_gate_cap(max_permits))),
-                total: max_permits,
-            });
-        }
-        // No budget installed yet, or the cap is already ≥ the current total.
-        _ => {}
+    // The write lock serializes concurrent registrations proposing different
+    // caps: `shrink_to` re-reads the current total and shrinks only while it still
+    // exceeds `max_permits`, so a looser cap landing last cannot raise the budget
+    // back up ("tightest wins, never raises"). The semaphores are mutated in place
+    // (the shared `Arc`s every in-flight acquirer holds), so the lock guards the
+    // total/forget bookkeeping, not an `Option` swap.
+    let guard = GLOBAL_ENCODE_BUDGET.write();
+    let Some(budget) = guard.as_ref() else {
+        return; // No budget installed yet.
+    };
+    if let Some(previous) = budget.shrink_to(max_permits) {
+        tracing::info!(
+            target: "cayenne::write_budget",
+            max_permits,
+            previous,
+            "Capping global encode-concurrency budget to the instance EBS write-bandwidth ceiling"
+        );
     }
 }
 
@@ -208,13 +290,22 @@ async fn acquire_from(
     shards: usize,
     class: WriteClass,
 ) -> Option<EncodePermits> {
+    // Forget any permits a prior cap-shrink still owes that have since returned,
+    // converging the live budget down to its cap before we read it. Cheap no-op
+    // in the common case (nothing owed).
+    drain_owed(&budget.semaphore, &budget.pending_forget);
+    drain_owed(&budget.maintenance_gate, &budget.pending_gate_forget);
+    // Read the LIVE ceiling (not a stale snapshot) so a request is always
+    // satisfiable under the current — possibly just-shrunk — budget and can
+    // never block forever waiting for more permits than it can ever hold.
+    let total = budget.total.load(Ordering::Acquire);
     let gate = match class {
         WriteClass::Delta => None,
         WriteClass::Maintenance => {
             // Gate first (uniform order; see `maintenance_gate` docs). The gate
             // is sized below `total`, so the subsequent main acquisition of the
             // same count can always be satisfied once delta holders release.
-            let gate_cap = maintenance_gate_cap(budget.total);
+            let gate_cap = maintenance_gate_cap(total);
             let permits = u32::try_from(shards.clamp(1, gate_cap)).unwrap_or(u32::MAX);
             Some(
                 Arc::clone(&budget.maintenance_gate)
@@ -226,7 +317,7 @@ async fn acquire_from(
     };
     let main_count = gate
         .as_ref()
-        .map_or_else(|| shards.clamp(1, budget.total), |g| g.num_permits().max(1));
+        .map_or_else(|| shards.clamp(1, total), |g| g.num_permits().max(1));
     let main_count = u32::try_from(main_count).unwrap_or(u32::MAX);
     let main = Arc::clone(&budget.semaphore)
         .acquire_many_owned(main_count)
@@ -248,8 +339,77 @@ mod tests {
         EncodeBudget {
             semaphore: Arc::new(Semaphore::new(total)),
             maintenance_gate: Arc::new(Semaphore::new(maintenance_gate_cap(total))),
-            total,
+            total: Arc::new(AtomicUsize::new(total)),
+            pending_forget: Arc::new(AtomicUsize::new(0)),
+            pending_gate_forget: Arc::new(AtomicUsize::new(0)),
         }
+    }
+
+    /// REGRESSION (the resize-without-coordination bug): capping the budget while
+    /// permits are held must NOT add capacity. The prior implementation swapped in
+    /// a fresh `Semaphore::new(max_permits)`, so the already-held permits kept
+    /// running alongside a brand-new full budget — a further acquire succeeded
+    /// immediately, pushing aggregate concurrency to `old_held + new_cap` and
+    /// over-subscribing the shared EBS pipe the cap exists to protect.
+    ///
+    /// With the in-place forget, capping below the held count leaves zero
+    /// available, so a further acquire BLOCKS (no new capacity) — and once the
+    /// over-cap held permits drain, the budget converges to the new cap rather
+    /// than reverting to the old total.
+    #[tokio::test]
+    async fn cap_under_held_permits_never_oversubscribes() {
+        let b = budget(4);
+        // Hold the entire budget (4 permits), modelling 4 in-flight encodes.
+        let held = acquire_from(&b, 4, WriteClass::Delta)
+            .await
+            .expect("initial acquire of the full budget succeeds");
+        assert_eq!(b.semaphore.available_permits(), 0, "all 4 permits held");
+
+        // A registration tightens the EBS cap to 2 while those 4 are in flight.
+        b.shrink_to(2);
+
+        // BUG would allow this: a fresh 2-permit semaphore grants immediately,
+        // so 4 (old) + up-to-2 (new) = up to 6 concurrent encodes. FIX: the live
+        // semaphore has 0 available, so the new acquire must block.
+        let pending = acquire_from(&b, 1, WriteClass::Delta);
+        tokio::pin!(pending);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), &mut pending)
+                .await
+                .is_err(),
+            "capping below the held count must NOT grant new permits \
+             (the swap re-added capacity, over-subscribing to old_held + new_cap)"
+        );
+
+        // Release the 4 over-cap in-flight permits; the budget must converge DOWN
+        // to the new cap of 2, not revert to the old total of 4.
+        drop(held);
+        // The blocked acquire now proceeds (a returned permit satisfies it).
+        let resumed = tokio::time::timeout(Duration::from_millis(500), &mut pending)
+            .await
+            .expect("the waiter proceeds once an in-flight encode releases")
+            .expect("acquire yields permits after release");
+        // One more acquire drives the owed-forget drain to completion, then with
+        // 1 of the 2 capped permits held by `resumed`, exactly 1 remains.
+        let _second = acquire_from(&b, 1, WriteClass::Delta)
+            .await
+            .expect("a second acquire fits within the capped budget of 2");
+        assert_eq!(
+            b.semaphore.available_permits(),
+            0,
+            "budget converged to the cap of 2 (both held), not the old total of 4"
+        );
+        // And a THIRD acquire must block: the cap of 2 is now fully held, proving
+        // the old total of 4 was not silently restored when the held permits returned.
+        let third = acquire_from(&b, 1, WriteClass::Delta);
+        tokio::pin!(third);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), &mut third)
+                .await
+                .is_err(),
+            "the capped budget of 2 must stay enforced after the held permits drained"
+        );
+        drop(resumed);
     }
 
     /// The reserve scales with the total (~25%) within `[2, 6]`, and the gate
