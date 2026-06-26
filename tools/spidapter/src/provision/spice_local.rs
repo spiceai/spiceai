@@ -58,12 +58,18 @@ struct LocalPkiPaths {
     executor_pki: Vec<(PathBuf, PathBuf)>,
 }
 
-pub(crate) fn build_local_extra_envs(_setup_config: &SetupConfig) -> HashMap<String, String> {
+pub(crate) fn build_local_extra_envs(setup_config: &SetupConfig) -> HashMap<String, String> {
     let mut map = HashMap::new();
     map.insert(
         "SPICED_LOG".to_string(),
-        "info,cayenne=debug,runtime::accelerated_table::refresh_task::changes=trace,data_components=trace".to_string(),
+        "info,cayenne=info,runtime::accelerated_table::refresh_task::changes=info,data_components=info".to_string(),
     );
+    if let FederatedStorageConfig::MongoDB { uri, .. } = &setup_config.storage {
+        map.insert(
+            super::super::sources::mongodb::MONGO_CONNECTION_STRING_SECRET.to_string(),
+            uri.clone(),
+        );
+    }
     map
 }
 
@@ -94,7 +100,6 @@ pub(crate) async fn provision_local_single_node(
             args,
             scp,
             cayenne,
-            false, // local spiced: no secret store; inline connection strings
         )
         .await?;
         write_local_spicepod(&spicepod, &working_dir).await
@@ -215,7 +220,6 @@ pub(crate) async fn provision_local_spiced_cluster(
             args,
             scp,
             None,
-            false, // local spiced: no secret store; inline connection strings
         )
         .await?;
         let spicepod_path = write_local_spicepod(&spicepod, &working_dir).await?;

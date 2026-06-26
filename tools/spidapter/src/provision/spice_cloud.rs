@@ -114,17 +114,9 @@ pub(crate) async fn provision_scp_app(
     eprintln!("[stdio] App ID: {app_id}");
     eprintln!("[stdio] Deployment mode: {deployment_mode:?}");
 
-    let spicepod = generate_initial_spicepod(
-        &run_id,
-        setup_config,
-        datasets,
-        None,
-        args,
-        scp,
-        cayenne,
-        true,
-    )
-    .await?;
+    let spicepod =
+        generate_initial_spicepod(&run_id, setup_config, datasets, None, args, scp, cayenne)
+            .await?;
     let spicepod_yaml = serialize_spicepod(&spicepod)?;
     eprintln!(
         "[stdio] Generated spicepod for app '{app_name}' ({} bytes):\n{spicepod_yaml}",
