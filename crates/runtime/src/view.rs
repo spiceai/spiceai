@@ -14,8 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 use crate::{
-    component::view::View,
-    embeddings::{index::table::wrap_table_as_index, table::EmbeddingTable},
+    component::view::View, embeddings::index::table::wrap_table_as_index,
     search::full_text::table::add_full_text_search_to_table,
 };
 use ::datafusion::sql::{TableReference, parser, sqlparser::ast};
@@ -25,6 +24,7 @@ use datafusion::{
     error::{DataFusionError, Result},
     prelude::SessionContext,
 };
+use runtime_search::embeddings::table::EmbeddingTable;
 use snafu::ResultExt;
 use spicepod::component::embeddings::ColumnEmbeddingConfig;
 use std::{collections::HashSet, sync::Arc};
