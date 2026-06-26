@@ -25,11 +25,17 @@ use uuid::Uuid;
 
 use super::mongodb_arrow_type_to_spicepod_str;
 
+/// Secret name under which the MongoDB connection string is stored on a Spice
+/// Cloud app and referenced from the spicepod as
+/// `${secrets:MONGO_CONNECTION_STRING}`.
+pub(crate) const MONGO_CONNECTION_STRING_SECRET: &str = "MONGO_CONNECTION_STRING";
+
 pub(crate) fn generate_mongodb_spicepod(
     run_id: &Uuid,
     uri: &str,
     datasets: &HashMap<String, DatasetConfig>,
     acceleration_engine: &str,
+    use_connection_secret: bool,
 ) -> SpicepodDefinition {
     let run_id_str = run_id.to_string();
     let short_id = run_id_str.split('-').next().unwrap_or_default();
@@ -44,10 +50,17 @@ pub(crate) fn generate_mongodb_spicepod(
     };
 
     for (dataset_name, dataset_config) in datasets {
-        // Use the connection URI verbatim — the caller is responsible for any
-        // TLS settings. (EC2-provisioned mongo encodes tls=false in its URI;
-        // connect-mode URIs like Atlas carry their own tls/ssl settings.)
-        let conn_str = uri.to_string();
+        // On Spice Cloud the connection string is stored as a secret and the
+        // spicepod references it as `${secrets:MONGO_CONNECTION_STRING}` (the
+        // caller sets that secret to the real URI). Locally there is no secret
+        // store wired up, so inline the URI verbatim — the caller is responsible
+        // for any TLS settings (EC2-provisioned mongo encodes tls=false in its
+        // URI; connect-mode URIs like Atlas carry their own tls/ssl settings).
+        let conn_str = if use_connection_secret {
+            format!("${{secrets:{MONGO_CONNECTION_STRING_SECRET}}}")
+        } else {
+            uri.to_string()
+        };
         let param_map = HashMap::from([
             ("mongodb_connection_string".to_string(), conn_str),
             // Increase cursor batch sizes to reduce round-trips on high-volume streams.

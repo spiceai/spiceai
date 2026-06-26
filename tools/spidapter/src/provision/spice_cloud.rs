@@ -114,9 +114,17 @@ pub(crate) async fn provision_scp_app(
     eprintln!("[stdio] App ID: {app_id}");
     eprintln!("[stdio] Deployment mode: {deployment_mode:?}");
 
-    let spicepod =
-        generate_initial_spicepod(&run_id, setup_config, datasets, None, args, scp, cayenne)
-            .await?;
+    let spicepod = generate_initial_spicepod(
+        &run_id,
+        setup_config,
+        datasets,
+        None,
+        args,
+        scp,
+        cayenne,
+        true,
+    )
+    .await?;
     let spicepod_yaml = serialize_spicepod(&spicepod)?;
     eprintln!(
         "[stdio] Generated spicepod for app '{app_name}' ({} bytes):\n{spicepod_yaml}",
@@ -131,6 +139,24 @@ pub(crate) async fn provision_scp_app(
     eprintln!("[stdio] Setting secrets from spicepod...");
     commands::secrets::set_spicepod_secrets(&cloud, app_id, &spicepod_yaml).await?;
     eprintln!("[stdio] Spicepod secrets set");
+
+    // The MongoDB connection string carries credentials, so the spicepod
+    // references it as `${secrets:MONGO_CONNECTION_STRING}` (see
+    // `generate_mongodb_spicepod`). Set that secret to the real URI here: it is
+    // dynamic (per-run database / EC2-provisioned), so the env-only
+    // `set_spicepod_secrets` above cannot resolve it. Runs after that call so
+    // this value wins.
+    if let FederatedStorageConfig::MongoDB { uri, .. } = &setup_config.storage {
+        eprintln!("[stdio] Setting MONGO_CONNECTION_STRING secret...");
+        commands::secrets::set_secret(
+            &cloud,
+            app_id,
+            super::super::sources::mongodb::MONGO_CONNECTION_STRING_SECRET,
+            uri,
+        )
+        .await?;
+        eprintln!("[stdio] MONGO_CONNECTION_STRING secret set");
+    }
 
     eprintln!("[stdio] Setting RUNNER secret...");
     match commands::secrets::set_secret(&cloud, app_id, "RUNNER", "spidapter").await {

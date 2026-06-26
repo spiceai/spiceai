@@ -94,6 +94,7 @@ pub(crate) async fn provision_local_single_node(
             args,
             scp,
             cayenne,
+            false, // local spiced: no secret store; inline connection strings
         )
         .await?;
         write_local_spicepod(&spicepod, &working_dir).await
@@ -214,6 +215,7 @@ pub(crate) async fn provision_local_spiced_cluster(
             args,
             scp,
             None,
+            false, // local spiced: no secret store; inline connection strings
         )
         .await?;
         let spicepod_path = write_local_spicepod(&spicepod, &working_dir).await?;

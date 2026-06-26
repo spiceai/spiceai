@@ -1963,6 +1963,10 @@ async fn generate_initial_spicepod(
     _args: &StdioArgs,
     scp: &ScpConfig,
     cayenne: Option<&CayenneConfig>,
+    // When true (Spice Cloud deployments), source connection strings that
+    // carry credentials are emitted as `${secrets:...}` references rather than
+    // inlined, and the caller sets the corresponding secret on the app.
+    use_connection_secrets: bool,
 ) -> anyhow::Result<SpicepodDefinition> {
     // Local-bench fallback: when no scenario `compute.scp` block provides a
     // scheduler state location, honor the SCHEDULER_STATE_LOCATION env var
@@ -2024,6 +2028,7 @@ async fn generate_initial_spicepod(
                 uri,
                 datasets,
                 acceleration_engine_str(*acceleration),
+                use_connection_secrets,
             ),
         }
     };
@@ -2184,6 +2189,7 @@ mod tests {
             &args,
             &scp,
             None,
+            false,
         )
         .await
         .expect("spicepod should generate");
@@ -2230,10 +2236,18 @@ mod tests {
         let scp = test_scp_config();
         let run_id = Uuid::parse_str("01234567-89ab-cdef-0123-456789abcdef").expect("parse uuid");
 
-        let spicepod =
-            generate_initial_spicepod(&run_id, &setup_config, &datasets, None, &args, &scp, None)
-                .await
-                .expect("spicepod loads from disk");
+        let spicepod = generate_initial_spicepod(
+            &run_id,
+            &setup_config,
+            &datasets,
+            None,
+            &args,
+            &scp,
+            None,
+            false,
+        )
+        .await
+        .expect("spicepod loads from disk");
 
         assert_eq!(spicepod.name, "spidapter-01234567");
         let yaml = serialize_spicepod(&spicepod).expect("serialize");
