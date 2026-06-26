@@ -105,6 +105,8 @@ pub enum OnSchemaChange {
     AppendNewColumns,
     /// Keep the registered dataset schema synchronized with the projected source schema.
     SyncAllColumns,
+    /// Recreate the accelerated table with the new schema when a source schema change cannot be applied in place. Widening changes are still applied in place; otherwise the table is dropped and recreated. Recreation is destructive and only occurs with `refresh_mode: full`.
+    DropAndRecreate,
 }
 
 impl std::fmt::Display for OnSchemaChange {
@@ -114,6 +116,7 @@ impl std::fmt::Display for OnSchemaChange {
             OnSchemaChange::Fail => write!(f, "fail"),
             OnSchemaChange::AppendNewColumns => write!(f, "append_new_columns"),
             OnSchemaChange::SyncAllColumns => write!(f, "sync_all_columns"),
+            OnSchemaChange::DropAndRecreate => write!(f, "drop_and_recreate"),
         }
     }
 }
@@ -717,6 +720,7 @@ mod tests {
             ("fail", OnSchemaChange::Fail),
             ("append_new_columns", OnSchemaChange::AppendNewColumns),
             ("sync_all_columns", OnSchemaChange::SyncAllColumns),
+            ("drop_and_recreate", OnSchemaChange::DropAndRecreate),
         ] {
             let yaml = format!(
                 r"

@@ -1238,14 +1238,21 @@ pub async fn initialize_cluster_executor(
                 .unwrap_or_else(|| env::temp_dir().to_string_lossy().to_string())
         }
         Some(loc) => {
-            // Local disk mode with explicit path
-            // Validate the path exists or can be created
+            // Local disk mode with explicit path. Ensure it exists: the executor
+            // mounts its data volume (e.g. `/data`) but a configured shuffle
+            // subdirectory (e.g. `/data/ballista-shuffle/<run>`) will not exist
+            // yet, and Ballista uses the work_dir as-is without creating it — so
+            // shuffle writes would fail. Create it (idempotent) rather than only
+            // warning.
             let path = std::path::Path::new(loc);
             if !path.exists() {
-                tracing::warn!(
-                    "shuffle_location '{}' does not exist. Ensure the directory exists and is writable by the executor process.",
-                    loc
-                );
+                match std::fs::create_dir_all(path) {
+                    Ok(()) => tracing::info!("Created shuffle_location directory '{}'", loc),
+                    Err(e) => tracing::warn!(
+                        "shuffle_location '{}' does not exist and could not be created: {e}. Ensure it is writable by the executor process.",
+                        loc
+                    ),
+                }
             }
             loc.to_string()
         }

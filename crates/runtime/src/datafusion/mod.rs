@@ -50,7 +50,8 @@ use crate::dataupdate::{
 use crate::federated_table::FederatedTable;
 use crate::schema_evolution::{
     SCHEMA_EVOLUTION_APPLIED, SCHEMA_EVOLUTION_DETECTED, SCHEMA_EVOLUTION_FAILED,
-    dataset_constraint_columns, engine_supports_in_place_evolution, evolution_allowed,
+    dataset_constraint_columns, emit_schema_evolution_event, engine_supports_in_place_evolution,
+    evolution_allowed, policy_recreates_on_incompatible, recreates_on_schema_mismatch,
     reorder_to_checkpoint_order, restrict_schema_to, schema_evolution_labels, widening_plan_kind,
 };
 use crate::secrets::Secrets;
@@ -2901,6 +2902,15 @@ impl DataFusion {
         let is_file_update =
             acceleration_settings.mode == Mode::FileUpdate && refresh_mode != RefreshMode::Disabled;
 
+        // Whether a change the in-place policy can't evolve should drop + recreate the table
+        // (`file_update` mode, or `on_schema_change: drop_and_recreate` under `refresh_mode:
+        // full` on a recreate-capable engine; a full refresh re-fetches every row, so dropping
+        // loses no un-recoverable data). This is the same helper the initial-load and reload
+        // schema-mismatch gates consult, so "bypass the deferred-mismatch gate" and "recreate
+        // here" cannot disagree.
+        let allow_recreate =
+            recreates_on_schema_mismatch(acceleration_settings, policy, refresh_mode);
+
         // `block` consults no classifier and reads the checkpoint only on the
         // file_update path — today's code paths verbatim.
         if policy == OnSchemaChange::Block && !is_file_update {
@@ -3046,6 +3056,12 @@ impl DataFusion {
                                     "Applied widening schema evolution to the '{engine}' acceleration: {change}",
                                     engine = acceleration_settings.engine,
                                 );
+                                emit_schema_evolution_event(
+                                    &dataset_name,
+                                    "applied",
+                                    &change,
+                                    false,
+                                );
                                 // The table schema changed; cached plans are obsolete.
                                 self.clear_cached_plans().await;
                                 return Ok(Some(Arc::clone(&plan.evolved_schema)));
@@ -3058,13 +3074,13 @@ impl DataFusion {
                                 tracing::warn!(
                                     dataset = %dataset.name,
                                     "Failed to apply widening schema evolution ({change}): {e}{fallback}",
-                                    fallback = if is_file_update {
-                                        ". The acceleration is recreated (file_update mode)"
+                                    fallback = if allow_recreate {
+                                        ". The acceleration is dropped and recreated with the new schema"
                                     } else {
                                         ". The new schema is not applied; a restart retries the evolution"
                                     },
                                 );
-                                if !is_file_update {
+                                if !allow_recreate {
                                     // Evolution failed and we will not drop-recreate: pin
                                     // back to the un-evolved engine-table schema so the
                                     // registered provider matches it. Use `comparison_schema`,
@@ -3094,40 +3110,63 @@ impl DataFusion {
                             1,
                             &schema_evolution_labels(&dataset_name, "incompatible", "fail_policy"),
                         );
+                        emit_schema_evolution_event(&dataset_name, "fail_policy", &reason, true);
                         return SchemaChangeFailPolicySnafu {
                             dataset_name,
                             change: reason,
                         }
                         .fail();
                     }
-                    SCHEMA_EVOLUTION_FAILED.add(
-                        1,
-                        &schema_evolution_labels(&dataset_name, "incompatible", "incompatible"),
-                    );
-                    tracing::warn!(
-                        dataset = %dataset.name,
-                        "Schema change detected that cannot be evolved under `on_schema_change: {policy}`: {reason}{fallback}",
-                        fallback = if is_file_update {
-                            ". The acceleration is recreated (file_update mode)"
-                        } else {
-                            ". The new schema is not applied; revert the source schema change to recover"
-                        },
-                    );
+                    if allow_recreate {
+                        // `drop_and_recreate` (full mode) or `file_update`: the change
+                        // cannot be applied in place, so fall through to the snapshot +
+                        // drop + recreate path below, which logs and emits the APPLIED
+                        // (action=recreate) metric + event once the table is dropped.
+                        tracing::warn!(
+                            dataset = %dataset.name,
+                            "Schema change detected that cannot be applied in place ({reason}); the acceleration is dropped and recreated with the new schema (on_schema_change: {policy})",
+                        );
+                    } else {
+                        SCHEMA_EVOLUTION_FAILED.add(
+                            1,
+                            &schema_evolution_labels(&dataset_name, "incompatible", "incompatible"),
+                        );
+                        // `drop_and_recreate` reaching here means the recreate gate failed
+                        // (not `refresh_mode: full`, or an engine without `drop_table`); point
+                        // the user at the requirement rather than only "revert".
+                        tracing::warn!(
+                            dataset = %dataset.name,
+                            "Schema change detected that cannot be evolved under `on_schema_change: {policy}`: {reason}.{fallback}",
+                            fallback = if policy_recreates_on_incompatible(policy) {
+                                " `drop_and_recreate` recreates the table only with `refresh_mode: full` on a supported engine (DuckDB, SQLite, Turso, Cayenne); the new schema is not applied. Use `refresh_mode: full`, or revert the source schema change, to recover"
+                            } else {
+                                " The new schema is not applied; revert the source schema change to recover"
+                            },
+                        );
+                        emit_schema_evolution_event(&dataset_name, "incompatible", &reason, true);
+                    }
                 }
             }
         }
 
-        // file_update mode contract: anything the policy did not evolve falls back to
-        // snapshot + drop-recreate (today's behavior verbatim under `block`).
-        if is_file_update
+        // Recreate path: `file_update` mode, or `on_schema_change: drop_and_recreate`
+        // under `refresh_mode: full` (`allow_recreate`). Anything the in-place policy did
+        // not evolve falls back to snapshot + drop + recreate with the new schema (under
+        // `block`, this is `file_update`'s today's-behavior-verbatim contract).
+        if allow_recreate
             && let Some(diff) = arrow_tools::schema::schema_difference(
                 &comparison_schema,
                 &normalized_refresh_schema,
             )
         {
+            let dataset_name = dataset.name.to_string();
+            let trigger = if is_file_update {
+                "file_update mode"
+            } else {
+                "on_schema_change: drop_and_recreate"
+            };
             tracing::warn!(
-                "Dataset {} schema change detected in file_update mode. {diff}. Acceleration file is replaced.",
-                dataset.name
+                "Dataset {dataset_name} schema change detected ({trigger}). {diff}. The acceleration is dropped and recreated with the new schema.",
             );
 
             // Snapshot before recreating (best-effort)
@@ -3137,7 +3176,7 @@ impl DataFusion {
             {
                 dataaccelerator::snapshots::snapshot_before_recreate(
                     acceleration_settings,
-                    &dataset.name.to_string(),
+                    &dataset_name,
                     layout,
                     accel_engine,
                     Arc::clone(&existing_schema),
@@ -3153,16 +3192,28 @@ impl DataFusion {
                 .get_accelerator_engine(acceleration_settings.engine)
                 .await
                 .ok_or_else(|| Error::ExpectedAccelerationSettings {
-                    name: dataset.name.to_string(),
+                    name: dataset_name.clone(),
                 })?;
             accelerator
-                .drop_table(&dataset.name.to_string(), dataset)
+                .drop_table(&dataset_name, dataset)
                 .await
                 .map_err(|e| dataaccelerator::Error::AccelerationCreationFailed { source: e })
                 .context(UnableToCreateDataAcceleratorSnafu)?;
 
             // Clear the checkpoint so the refresh treats this as a fresh table
             let _ = cp.delete().await;
+
+            // The table is recreated with a new schema; cached logical plans reference the
+            // old schema and must be dropped (mirrors the in-place evolution path above).
+            self.clear_cached_plans().await;
+
+            SCHEMA_EVOLUTION_APPLIED.add(
+                1,
+                &schema_evolution_labels(&dataset_name, "recreate", "recreate"),
+            );
+            // Use the same `recreate` action label as the SCHEMA_EVOLUTION_APPLIED metric
+            // above so metrics and task_history rows correlate by action for this outcome.
+            emit_schema_evolution_event(&dataset_name, "recreate", &diff, false);
         }
 
         Ok(None)
