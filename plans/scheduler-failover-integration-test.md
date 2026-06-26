@@ -57,11 +57,8 @@ happens via heartbeat-TTL expiry (`DEFAULT_TTL_MS = 30s`) rather than immediate
 deregistration — requires an abrupt process kill. Both in-process tests therefore
 drive recovery via graceful shutdown and assert the same recovery + completion
 contract; the SIGKILL-named test documents the TTL-expiry path it does not cover.
-
-The real SIGKILL path is exercised manually by a standalone failover demo (a
-terminal TUI that runs a local cluster, kills a scheduler with SIGKILL/SIGTERM,
-and shows the job being recovered by the other scheduler) — it kills actual
-`spiced` processes and observes TTL-based recovery.
+The true SIGKILL path (heartbeat going stale without deregistration, recovery via
+TTL expiry) would require a subprocess harness — see the follow-up below.
 
 ## Follow-up: subprocess harness for true SIGKILL
 

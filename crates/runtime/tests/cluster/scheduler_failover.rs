@@ -25,9 +25,9 @@
 //!
 //! A true SIGKILL — the heartbeat going stale *without* deregistration, so
 //! recovery happens via heartbeat-TTL expiry rather than immediate
-//! deregistration — requires an abrupt process kill. That path is exercised by
-//! the failover demo and would need a subprocess harness here. Both tests below
-//! therefore drive recovery via graceful shutdown and assert the same recovery +
+//! deregistration — requires an abrupt process kill, which would need a
+//! subprocess harness and is not covered here. Both tests below therefore
+//! drive recovery via graceful shutdown and assert the same recovery +
 //! completion contract; [`recovers_job_after_scheduler_loss_sigkill`] documents
 //! the TTL-expiry path it does not cover in-process.
 
@@ -419,9 +419,8 @@ async fn recovers_job_after_scheduler_loss_sigterm() -> Result<(), anyhow::Error
 /// gracefully, so this drives recovery via the same deregister path as the
 /// SIGTERM case and asserts the same recovery + completion contract. A true
 /// SIGKILL — heartbeat going stale without deregistration, recovery via TTL
-/// expiry — is exercised by the failover demo and would require a subprocess
-/// harness here. The larger timeout reflects the TTL-expiry budget that path
-/// would need.
+/// expiry — would require a subprocess harness and is not covered here. The
+/// larger timeout reflects the TTL-expiry budget that path would need.
 #[tokio::test(flavor = "multi_thread")]
 #[cfg(not(target_os = "windows"))]
 async fn recovers_job_after_scheduler_loss_sigkill() -> Result<(), anyhow::Error> {
