@@ -162,7 +162,7 @@ async fn wrap_table_as_index_duckdb(
         })
         .collect::<Vec<_>>();
 
-    let provider = crate::embeddings::table::EmbeddingTable::from_spicepod_columns(
+    let provider = runtime_search::embeddings::table::EmbeddingTable::from_spicepod_columns(
         inner_table_provider,
         embeddings,
         embedding_models,

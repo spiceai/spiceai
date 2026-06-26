@@ -46,8 +46,10 @@ use datafusion::{
 use ballista_core::serde::protobuf::{ExecutorStoppedParams, scheduler_grpc_server::SchedulerGrpc};
 
 use datafusion_proto::bytes::Serializeable;
-use flight_client::cookie::{CookieService, CookieStore};
-use flight_client::{MAX_DECODING_MESSAGE_SIZE, MAX_ENCODING_MESSAGE_SIZE};
+use flight_client::{
+    MAX_DECODING_MESSAGE_SIZE, MAX_ENCODING_MESSAGE_SIZE, configure_endpoint_for_high_throughput,
+    cookie::{CookieService, CookieStore},
+};
 use futures::{Stream, StreamExt, TryStreamExt};
 use parking_lot::RwLock;
 use runtime_proto::{
@@ -827,7 +829,8 @@ fn create_executor_flight_client(
         format!("http://{endpoint}")
     };
 
-    let mut flight_channel = Endpoint::from_shared(executor_address)?;
+    let mut flight_channel =
+        configure_endpoint_for_high_throughput(Endpoint::from_shared(executor_address)?);
     if let Some(tls_config) = client_tls_config {
         flight_channel = flight_channel.tls_config(tls_config)?;
     }

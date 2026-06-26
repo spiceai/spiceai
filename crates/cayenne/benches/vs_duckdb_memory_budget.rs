@@ -146,7 +146,17 @@ impl HighWaterPool {
     }
 }
 
+impl std::fmt::Display for HighWaterPool {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "HighWaterPool({})", self.inner)
+    }
+}
+
 impl MemoryPool for HighWaterPool {
+    fn name(&self) -> &str {
+        "HighWaterPool"
+    }
+
     fn register(&self, consumer: &datafusion::execution::memory_pool::MemoryConsumer) {
         self.inner.register(consumer);
     }

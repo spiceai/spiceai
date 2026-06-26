@@ -1466,9 +1466,9 @@ dependencies = [
 
 [[package]]
 name = "aws-sdk-bedrockruntime"
-version = "1.134.0"
+version = "1.135.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "09525553211416fd3c18ead2dd6a29908dcdeb1a032809a23417e7ab848dc23e"
+checksum = "e74b780f2f36912bae71b4f4f8ed9a0a88832b4681a1add3caf5ca25dbc8ab2d"
 dependencies = [
  "arc-swap",
  "aws-credential-types",
@@ -1519,9 +1519,9 @@ dependencies = [
 
 [[package]]
 name = "aws-sdk-cognitoidentityprovider"
-version = "1.121.0"
+version = "1.122.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "dd15437cc96e27f0b5371fcc52a047a114e777efd1a9e73579efa198237e2de4"
+checksum = "99e39cb12d93f1c19f2dac01828e560cfe2730fb3b999574888d20279cb79ec1"
 dependencies = [
  "arc-swap",
  "aws-credential-types",
@@ -1623,9 +1623,9 @@ dependencies = [
 
 [[package]]
 name = "aws-sdk-ec2"
-version = "1.232.0"
+version = "1.232.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3ed1c72b10833ce8a789a21c1b95df11387932d7e9ee9a2931635bdb6770a0ad"
+checksum = "5932a9378455fe2a3c7cfe1706457d520e6da26e0f9ea2496291b313e9658f20"
 dependencies = [
  "arc-swap",
  "aws-credential-types",
@@ -1649,9 +1649,9 @@ dependencies = [
 
 [[package]]
 name = "aws-sdk-glue"
-version = "1.150.0"
+version = "1.152.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c718ce2c35c2552e3b39baa30796a6cb295c1f12e9d91a4cddbf6b8f34438379"
+checksum = "267d3459c708985a1c1472bb2eb8def3b8673abbcdb3e8057d73e40fa5a7f5b4"
 dependencies = [
  "arc-swap",
  "aws-credential-types",
@@ -1674,9 +1674,9 @@ dependencies = [
 
 [[package]]
 name = "aws-sdk-s3"
-version = "1.136.0"
+version = "1.137.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fbd03e531a7d981fba45114c5813a7565dd470a1bd3ef1188ca98c98ebdfc668"
+checksum = "c2dd7213994e2ff9382ff100403b78c30d1b74cdfcd8fa9d0d1dc3a94a5c4874"
 dependencies = [
  "arc-swap",
  "aws-credential-types",
@@ -1710,9 +1710,9 @@ dependencies = [
 
 [[package]]
 name = "aws-sdk-s3vectors"
-version = "1.28.0"
+version = "1.29.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "064a533ab62804953483c0682239cd0a82652ddbde7c941d2ba6939e34a27c11"
+checksum = "1d3cfdd5c047226d52209c642c5a220e6efd21cafb8e795c23c87f83e7e9f790"
 dependencies = [
  "arc-swap",
  "aws-credential-types",
@@ -1935,23 +1935,17 @@ dependencies = [
  "aws-smithy-async",
  "aws-smithy-runtime-api",
  "aws-smithy-types",
- "h2 0.3.27",
  "h2 0.4.14",
- "http 0.2.12",
  "http 1.4.1",
- "http-body 0.4.6",
- "hyper 0.14.32",
  "hyper 1.10.1",
- "hyper-rustls 0.24.2",
- "hyper-rustls 0.27.9",
+ "hyper-rustls",
  "hyper-util",
  "pin-project-lite",
- "rustls 0.21.12",
- "rustls 0.23.40",
- "rustls-native-certs 0.8.4",
+ "rustls",
+ "rustls-native-certs",
  "rustls-pki-types",
  "tokio",
- "tokio-rustls 0.26.4",
+ "tokio-rustls",
  "tower 0.5.3",
  "tracing",
 ]
@@ -2394,7 +2388,7 @@ dependencies = [
 [[package]]
 name = "ballista-core"
 version = "52.0.0"
-source = "git+https://github.com/spiceai/datafusion-ballista.git?rev=29f95792bf5658b98586ef26a1129aea02ac8140#29f95792bf5658b98586ef26a1129aea02ac8140"
+source = "git+https://github.com/spiceai/datafusion-ballista.git?rev=fc500ce94d6cd5b1bc8da744b2ca1e8c7bddeca4#fc500ce94d6cd5b1bc8da744b2ca1e8c7bddeca4"
 dependencies = [
  "arrow-flight",
  "async-trait",
@@ -2431,7 +2425,7 @@ dependencies = [
 [[package]]
 name = "ballista-executor"
 version = "52.0.0"
-source = "git+https://github.com/spiceai/datafusion-ballista.git?rev=29f95792bf5658b98586ef26a1129aea02ac8140#29f95792bf5658b98586ef26a1129aea02ac8140"
+source = "git+https://github.com/spiceai/datafusion-ballista.git?rev=fc500ce94d6cd5b1bc8da744b2ca1e8c7bddeca4#fc500ce94d6cd5b1bc8da744b2ca1e8c7bddeca4"
 dependencies = [
  "arrow",
  "arrow-flight",
@@ -2462,7 +2456,7 @@ dependencies = [
 [[package]]
 name = "ballista-scheduler"
 version = "52.0.0"
-source = "git+https://github.com/spiceai/datafusion-ballista.git?rev=29f95792bf5658b98586ef26a1129aea02ac8140#29f95792bf5658b98586ef26a1129aea02ac8140"
+source = "git+https://github.com/spiceai/datafusion-ballista.git?rev=fc500ce94d6cd5b1bc8da744b2ca1e8c7bddeca4#fc500ce94d6cd5b1bc8da744b2ca1e8c7bddeca4"
 dependencies = [
  "arrow-flight",
  "async-trait",
@@ -5725,7 +5719,7 @@ dependencies = [
 [[package]]
 name = "datafusion"
 version = "54.0.0"
-source = "git+https://github.com/spiceai/datafusion.git?rev=994caa9af02bbda418eb5f8797b249beda7fed56#994caa9af02bbda418eb5f8797b249beda7fed56"
+source = "git+https://github.com/spiceai/datafusion.git?rev=ec52d75bb6c796a047f052a5e00a227145b872f1#ec52d75bb6c796a047f052a5e00a227145b872f1"
 dependencies = [
  "arrow",
  "arrow-schema",
@@ -5777,7 +5771,7 @@ dependencies = [
 [[package]]
 name = "datafusion-catalog"
 version = "54.0.0"
-source = "git+https://github.com/spiceai/datafusion.git?rev=994caa9af02bbda418eb5f8797b249beda7fed56#994caa9af02bbda418eb5f8797b249beda7fed56"
+source = "git+https://github.com/spiceai/datafusion.git?rev=ec52d75bb6c796a047f052a5e00a227145b872f1#ec52d75bb6c796a047f052a5e00a227145b872f1"
 dependencies = [
  "arrow",
  "async-trait",
@@ -5801,7 +5795,7 @@ dependencies = [
 [[package]]
 name = "datafusion-catalog-listing"
 version = "54.0.0"
-source = "git+https://github.com/spiceai/datafusion.git?rev=994caa9af02bbda418eb5f8797b249beda7fed56#994caa9af02bbda418eb5f8797b249beda7fed56"
+source = "git+https://github.com/spiceai/datafusion.git?rev=ec52d75bb6c796a047f052a5e00a227145b872f1#ec52d75bb6c796a047f052a5e00a227145b872f1"
 dependencies = [
  "arrow",
  "async-trait",
@@ -5825,7 +5819,7 @@ dependencies = [
 [[package]]
 name = "datafusion-common"
 version = "54.0.0"
-source = "git+https://github.com/spiceai/datafusion.git?rev=994caa9af02bbda418eb5f8797b249beda7fed56#994caa9af02bbda418eb5f8797b249beda7fed56"
+source = "git+https://github.com/spiceai/datafusion.git?rev=ec52d75bb6c796a047f052a5e00a227145b872f1#ec52d75bb6c796a047f052a5e00a227145b872f1"
 dependencies = [
  "arrow",
  "arrow-ipc",
@@ -5850,7 +5844,7 @@ dependencies = [
 [[package]]
 name = "datafusion-common-runtime"
 version = "54.0.0"
-source = "git+https://github.com/spiceai/datafusion.git?rev=994caa9af02bbda418eb5f8797b249beda7fed56#994caa9af02bbda418eb5f8797b249beda7fed56"
+source = "git+https://github.com/spiceai/datafusion.git?rev=ec52d75bb6c796a047f052a5e00a227145b872f1#ec52d75bb6c796a047f052a5e00a227145b872f1"
 dependencies = [
  "futures",
  "log",
@@ -5860,7 +5854,7 @@ dependencies = [
 [[package]]
 name = "datafusion-datasource"
 version = "54.0.0"
-source = "git+https://github.com/spiceai/datafusion.git?rev=994caa9af02bbda418eb5f8797b249beda7fed56#994caa9af02bbda418eb5f8797b249beda7fed56"
+source = "git+https://github.com/spiceai/datafusion.git?rev=ec52d75bb6c796a047f052a5e00a227145b872f1#ec52d75bb6c796a047f052a5e00a227145b872f1"
 dependencies = [
  "arrow",
  "async-compression",
@@ -5897,7 +5891,7 @@ dependencies = [
 [[package]]
 name = "datafusion-datasource-arrow"
 version = "54.0.0"
-source = "git+https://github.com/spiceai/datafusion.git?rev=994caa9af02bbda418eb5f8797b249beda7fed56#994caa9af02bbda418eb5f8797b249beda7fed56"
+source = "git+https://github.com/spiceai/datafusion.git?rev=ec52d75bb6c796a047f052a5e00a227145b872f1#ec52d75bb6c796a047f052a5e00a227145b872f1"
 dependencies = [
  "arrow",
  "arrow-ipc",
@@ -5920,7 +5914,7 @@ dependencies = [
 [[package]]
 name = "datafusion-datasource-csv"
 version = "54.0.0"
-source = "git+https://github.com/spiceai/datafusion.git?rev=994caa9af02bbda418eb5f8797b249beda7fed56#994caa9af02bbda418eb5f8797b249beda7fed56"
+source = "git+https://github.com/spiceai/datafusion.git?rev=ec52d75bb6c796a047f052a5e00a227145b872f1#ec52d75bb6c796a047f052a5e00a227145b872f1"
 dependencies = [
  "arrow",
  "async-trait",
@@ -5942,7 +5936,7 @@ dependencies = [
 [[package]]
 name = "datafusion-datasource-json"
 version = "54.0.0"
-source = "git+https://github.com/spiceai/datafusion.git?rev=994caa9af02bbda418eb5f8797b249beda7fed56#994caa9af02bbda418eb5f8797b249beda7fed56"
+source = "git+https://github.com/spiceai/datafusion.git?rev=ec52d75bb6c796a047f052a5e00a227145b872f1#ec52d75bb6c796a047f052a5e00a227145b872f1"
 dependencies = [
  "arrow",
  "async-trait",
@@ -5964,7 +5958,7 @@ dependencies = [
 [[package]]
 name = "datafusion-datasource-parquet"
 version = "54.0.0"
-source = "git+https://github.com/spiceai/datafusion.git?rev=994caa9af02bbda418eb5f8797b249beda7fed56#994caa9af02bbda418eb5f8797b249beda7fed56"
+source = "git+https://github.com/spiceai/datafusion.git?rev=ec52d75bb6c796a047f052a5e00a227145b872f1#ec52d75bb6c796a047f052a5e00a227145b872f1"
 dependencies = [
  "arrow",
  "async-trait",
@@ -6013,12 +6007,12 @@ dependencies = [
 [[package]]
 name = "datafusion-doc"
 version = "54.0.0"
-source = "git+https://github.com/spiceai/datafusion.git?rev=994caa9af02bbda418eb5f8797b249beda7fed56#994caa9af02bbda418eb5f8797b249beda7fed56"
+source = "git+https://github.com/spiceai/datafusion.git?rev=ec52d75bb6c796a047f052a5e00a227145b872f1#ec52d75bb6c796a047f052a5e00a227145b872f1"
 
 [[package]]
 name = "datafusion-execution"
 version = "54.0.0"
-source = "git+https://github.com/spiceai/datafusion.git?rev=994caa9af02bbda418eb5f8797b249beda7fed56#994caa9af02bbda418eb5f8797b249beda7fed56"
+source = "git+https://github.com/spiceai/datafusion.git?rev=ec52d75bb6c796a047f052a5e00a227145b872f1#ec52d75bb6c796a047f052a5e00a227145b872f1"
 dependencies = [
  "arrow",
  "arrow-buffer",
@@ -6039,7 +6033,7 @@ dependencies = [
 [[package]]
 name = "datafusion-expr"
 version = "54.0.0"
-source = "git+https://github.com/spiceai/datafusion.git?rev=994caa9af02bbda418eb5f8797b249beda7fed56#994caa9af02bbda418eb5f8797b249beda7fed56"
+source = "git+https://github.com/spiceai/datafusion.git?rev=ec52d75bb6c796a047f052a5e00a227145b872f1#ec52d75bb6c796a047f052a5e00a227145b872f1"
 dependencies = [
  "arrow",
  "arrow-schema",
@@ -6061,7 +6055,7 @@ dependencies = [
 [[package]]
 name = "datafusion-expr-common"
 version = "54.0.0"
-source = "git+https://github.com/spiceai/datafusion.git?rev=994caa9af02bbda418eb5f8797b249beda7fed56#994caa9af02bbda418eb5f8797b249beda7fed56"
+source = "git+https://github.com/spiceai/datafusion.git?rev=ec52d75bb6c796a047f052a5e00a227145b872f1#ec52d75bb6c796a047f052a5e00a227145b872f1"
 dependencies = [
  "arrow",
  "datafusion-common",
@@ -6113,7 +6107,7 @@ dependencies = [
 [[package]]
 name = "datafusion-functions"
 version = "54.0.0"
-source = "git+https://github.com/spiceai/datafusion.git?rev=994caa9af02bbda418eb5f8797b249beda7fed56#994caa9af02bbda418eb5f8797b249beda7fed56"
+source = "git+https://github.com/spiceai/datafusion.git?rev=ec52d75bb6c796a047f052a5e00a227145b872f1#ec52d75bb6c796a047f052a5e00a227145b872f1"
 dependencies = [
  "arrow",
  "arrow-buffer",
@@ -6144,7 +6138,7 @@ dependencies = [
 [[package]]
 name = "datafusion-functions-aggregate"
 version = "54.0.0"
-source = "git+https://github.com/spiceai/datafusion.git?rev=994caa9af02bbda418eb5f8797b249beda7fed56#994caa9af02bbda418eb5f8797b249beda7fed56"
+source = "git+https://github.com/spiceai/datafusion.git?rev=ec52d75bb6c796a047f052a5e00a227145b872f1#ec52d75bb6c796a047f052a5e00a227145b872f1"
 dependencies = [
  "arrow",
  "datafusion-common",
@@ -6164,7 +6158,7 @@ dependencies = [
 [[package]]
 name = "datafusion-functions-aggregate-common"
 version = "54.0.0"
-source = "git+https://github.com/spiceai/datafusion.git?rev=994caa9af02bbda418eb5f8797b249beda7fed56#994caa9af02bbda418eb5f8797b249beda7fed56"
+source = "git+https://github.com/spiceai/datafusion.git?rev=ec52d75bb6c796a047f052a5e00a227145b872f1#ec52d75bb6c796a047f052a5e00a227145b872f1"
 dependencies = [
  "arrow",
  "datafusion-common",
@@ -6188,7 +6182,7 @@ dependencies = [
 [[package]]
 name = "datafusion-functions-nested"
 version = "54.0.0"
-source = "git+https://github.com/spiceai/datafusion.git?rev=994caa9af02bbda418eb5f8797b249beda7fed56#994caa9af02bbda418eb5f8797b249beda7fed56"
+source = "git+https://github.com/spiceai/datafusion.git?rev=ec52d75bb6c796a047f052a5e00a227145b872f1#ec52d75bb6c796a047f052a5e00a227145b872f1"
 dependencies = [
  "arrow",
  "arrow-ord",
@@ -6212,7 +6206,7 @@ dependencies = [
 [[package]]
 name = "datafusion-functions-table"
 version = "54.0.0"
-source = "git+https://github.com/spiceai/datafusion.git?rev=994caa9af02bbda418eb5f8797b249beda7fed56#994caa9af02bbda418eb5f8797b249beda7fed56"
+source = "git+https://github.com/spiceai/datafusion.git?rev=ec52d75bb6c796a047f052a5e00a227145b872f1#ec52d75bb6c796a047f052a5e00a227145b872f1"
 dependencies = [
  "arrow",
  "async-trait",
@@ -6227,7 +6221,7 @@ dependencies = [
 [[package]]
 name = "datafusion-functions-window"
 version = "54.0.0"
-source = "git+https://github.com/spiceai/datafusion.git?rev=994caa9af02bbda418eb5f8797b249beda7fed56#994caa9af02bbda418eb5f8797b249beda7fed56"
+source = "git+https://github.com/spiceai/datafusion.git?rev=ec52d75bb6c796a047f052a5e00a227145b872f1#ec52d75bb6c796a047f052a5e00a227145b872f1"
 dependencies = [
  "arrow",
  "datafusion-common",
@@ -6243,7 +6237,7 @@ dependencies = [
 [[package]]
 name = "datafusion-functions-window-common"
 version = "54.0.0"
-source = "git+https://github.com/spiceai/datafusion.git?rev=994caa9af02bbda418eb5f8797b249beda7fed56#994caa9af02bbda418eb5f8797b249beda7fed56"
+source = "git+https://github.com/spiceai/datafusion.git?rev=ec52d75bb6c796a047f052a5e00a227145b872f1#ec52d75bb6c796a047f052a5e00a227145b872f1"
 dependencies = [
  "datafusion-common",
  "datafusion-physical-expr-common",
@@ -6252,7 +6246,7 @@ dependencies = [
 [[package]]
 name = "datafusion-macros"
 version = "54.0.0"
-source = "git+https://github.com/spiceai/datafusion.git?rev=994caa9af02bbda418eb5f8797b249beda7fed56#994caa9af02bbda418eb5f8797b249beda7fed56"
+source = "git+https://github.com/spiceai/datafusion.git?rev=ec52d75bb6c796a047f052a5e00a227145b872f1#ec52d75bb6c796a047f052a5e00a227145b872f1"
 dependencies = [
  "datafusion-doc",
  "quote",
@@ -6262,7 +6256,7 @@ dependencies = [
 [[package]]
 name = "datafusion-optimizer"
 version = "54.0.0"
-source = "git+https://github.com/spiceai/datafusion.git?rev=994caa9af02bbda418eb5f8797b249beda7fed56#994caa9af02bbda418eb5f8797b249beda7fed56"
+source = "git+https://github.com/spiceai/datafusion.git?rev=ec52d75bb6c796a047f052a5e00a227145b872f1#ec52d75bb6c796a047f052a5e00a227145b872f1"
 dependencies = [
  "arrow",
  "chrono",
@@ -6313,7 +6307,7 @@ dependencies = [
 [[package]]
 name = "datafusion-physical-expr"
 version = "54.0.0"
-source = "git+https://github.com/spiceai/datafusion.git?rev=994caa9af02bbda418eb5f8797b249beda7fed56#994caa9af02bbda418eb5f8797b249beda7fed56"
+source = "git+https://github.com/spiceai/datafusion.git?rev=ec52d75bb6c796a047f052a5e00a227145b872f1#ec52d75bb6c796a047f052a5e00a227145b872f1"
 dependencies = [
  "arrow",
  "datafusion-common",
@@ -6334,7 +6328,7 @@ dependencies = [
 [[package]]
 name = "datafusion-physical-expr-adapter"
 version = "54.0.0"
-source = "git+https://github.com/spiceai/datafusion.git?rev=994caa9af02bbda418eb5f8797b249beda7fed56#994caa9af02bbda418eb5f8797b249beda7fed56"
+source = "git+https://github.com/spiceai/datafusion.git?rev=ec52d75bb6c796a047f052a5e00a227145b872f1#ec52d75bb6c796a047f052a5e00a227145b872f1"
 dependencies = [
  "arrow",
  "datafusion-common",
@@ -6348,7 +6342,7 @@ dependencies = [
 [[package]]
 name = "datafusion-physical-expr-common"
 version = "54.0.0"
-source = "git+https://github.com/spiceai/datafusion.git?rev=994caa9af02bbda418eb5f8797b249beda7fed56#994caa9af02bbda418eb5f8797b249beda7fed56"
+source = "git+https://github.com/spiceai/datafusion.git?rev=ec52d75bb6c796a047f052a5e00a227145b872f1#ec52d75bb6c796a047f052a5e00a227145b872f1"
 dependencies = [
  "arrow",
  "chrono",
@@ -6364,7 +6358,7 @@ dependencies = [
 [[package]]
 name = "datafusion-physical-optimizer"
 version = "54.0.0"
-source = "git+https://github.com/spiceai/datafusion.git?rev=994caa9af02bbda418eb5f8797b249beda7fed56#994caa9af02bbda418eb5f8797b249beda7fed56"
+source = "git+https://github.com/spiceai/datafusion.git?rev=ec52d75bb6c796a047f052a5e00a227145b872f1#ec52d75bb6c796a047f052a5e00a227145b872f1"
 dependencies = [
  "arrow",
  "datafusion-common",
@@ -6382,7 +6376,7 @@ dependencies = [
 [[package]]
 name = "datafusion-physical-plan"
 version = "54.0.0"
-source = "git+https://github.com/spiceai/datafusion.git?rev=994caa9af02bbda418eb5f8797b249beda7fed56#994caa9af02bbda418eb5f8797b249beda7fed56"
+source = "git+https://github.com/spiceai/datafusion.git?rev=ec52d75bb6c796a047f052a5e00a227145b872f1#ec52d75bb6c796a047f052a5e00a227145b872f1"
 dependencies = [
  "arrow",
  "arrow-data",
@@ -6414,7 +6408,7 @@ dependencies = [
 [[package]]
 name = "datafusion-proto"
 version = "54.0.0"
-source = "git+https://github.com/spiceai/datafusion.git?rev=994caa9af02bbda418eb5f8797b249beda7fed56#994caa9af02bbda418eb5f8797b249beda7fed56"
+source = "git+https://github.com/spiceai/datafusion.git?rev=ec52d75bb6c796a047f052a5e00a227145b872f1#ec52d75bb6c796a047f052a5e00a227145b872f1"
 dependencies = [
  "arrow",
  "chrono",
@@ -6443,7 +6437,7 @@ dependencies = [
 [[package]]
 name = "datafusion-proto-common"
 version = "54.0.0"
-source = "git+https://github.com/spiceai/datafusion.git?rev=994caa9af02bbda418eb5f8797b249beda7fed56#994caa9af02bbda418eb5f8797b249beda7fed56"
+source = "git+https://github.com/spiceai/datafusion.git?rev=ec52d75bb6c796a047f052a5e00a227145b872f1#ec52d75bb6c796a047f052a5e00a227145b872f1"
 dependencies = [
  "arrow",
  "datafusion-common",
@@ -6455,7 +6449,7 @@ dependencies = [
 [[package]]
 name = "datafusion-pruning"
 version = "54.0.0"
-source = "git+https://github.com/spiceai/datafusion.git?rev=994caa9af02bbda418eb5f8797b249beda7fed56#994caa9af02bbda418eb5f8797b249beda7fed56"
+source = "git+https://github.com/spiceai/datafusion.git?rev=ec52d75bb6c796a047f052a5e00a227145b872f1#ec52d75bb6c796a047f052a5e00a227145b872f1"
 dependencies = [
  "arrow",
  "datafusion-common",
@@ -6470,7 +6464,7 @@ dependencies = [
 [[package]]
 name = "datafusion-session"
 version = "54.0.0"
-source = "git+https://github.com/spiceai/datafusion.git?rev=994caa9af02bbda418eb5f8797b249beda7fed56#994caa9af02bbda418eb5f8797b249beda7fed56"
+source = "git+https://github.com/spiceai/datafusion.git?rev=ec52d75bb6c796a047f052a5e00a227145b872f1#ec52d75bb6c796a047f052a5e00a227145b872f1"
 dependencies = [
  "async-trait",
  "datafusion-common",
@@ -6483,7 +6477,7 @@ dependencies = [
 [[package]]
 name = "datafusion-spark"
 version = "54.0.0"
-source = "git+https://github.com/spiceai/datafusion.git?rev=994caa9af02bbda418eb5f8797b249beda7fed56#994caa9af02bbda418eb5f8797b249beda7fed56"
+source = "git+https://github.com/spiceai/datafusion.git?rev=ec52d75bb6c796a047f052a5e00a227145b872f1#ec52d75bb6c796a047f052a5e00a227145b872f1"
 dependencies = [
  "arrow",
  "bigdecimal",
@@ -6511,7 +6505,7 @@ dependencies = [
 [[package]]
 name = "datafusion-sql"
 version = "54.0.0"
-source = "git+https://github.com/spiceai/datafusion.git?rev=994caa9af02bbda418eb5f8797b249beda7fed56#994caa9af02bbda418eb5f8797b249beda7fed56"
+source = "git+https://github.com/spiceai/datafusion.git?rev=ec52d75bb6c796a047f052a5e00a227145b872f1#ec52d75bb6c796a047f052a5e00a227145b872f1"
 dependencies = [
  "arrow",
  "bigdecimal",
@@ -6529,7 +6523,7 @@ dependencies = [
 [[package]]
 name = "datafusion-substrait"
 version = "54.0.0"
-source = "git+https://github.com/spiceai/datafusion.git?rev=994caa9af02bbda418eb5f8797b249beda7fed56#994caa9af02bbda418eb5f8797b249beda7fed56"
+source = "git+https://github.com/spiceai/datafusion.git?rev=ec52d75bb6c796a047f052a5e00a227145b872f1#ec52d75bb6c796a047f052a5e00a227145b872f1"
 dependencies = [
  "async-recursion",
  "async-trait",
@@ -6548,7 +6542,7 @@ dependencies = [
 [[package]]
 name = "datafusion-table-providers"
 version = "0.1.0"
-source = "git+https://github.com/spiceai/datafusion-table-providers.git?rev=3d8eca098dc5aefe361625b834ad834d2b846137#3d8eca098dc5aefe361625b834ad834d2b846137"
+source = "git+https://github.com/spiceai/datafusion-table-providers.git?rev=6b64a83d3bbd243003750c8b2e59eac50e094d65#6b64a83d3bbd243003750c8b2e59eac50e094d65"
 dependencies = [
  "adbc_core",
  "adbc_driver_manager",
@@ -6575,6 +6569,7 @@ dependencies = [
  "geo-types",
  "hickory-resolver",
  "itertools 0.14.0",
+ "logos",
  "mongodb",
  "mysql_async",
  "native-tls",
@@ -7862,7 +7857,7 @@ dependencies = [
  "futures",
  "http 1.4.1",
  "parking_lot 0.12.5",
- "rustls-native-certs 0.8.4",
+ "rustls-native-certs",
  "secrecy",
  "snafu",
  "tokio",
@@ -9498,21 +9493,6 @@ dependencies = [
 
 [[package]]
 name = "hyper-rustls"
-version = "0.24.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ec3efd23720e2049821a693cbc7e65ea87c72f1c58ff2f9522ff332b1491e590"
-dependencies = [
- "futures-util",
- "http 0.2.12",
- "hyper 0.14.32",
- "log",
- "rustls 0.21.12",
- "tokio",
- "tokio-rustls 0.24.1",
-]
-
-[[package]]
-name = "hyper-rustls"
 version = "0.27.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "33ca68d021ef39cf6463ab54c1d0f5daf03377b70561305bb89a8f83aab66e0f"
@@ -9521,10 +9501,10 @@ dependencies = [
  "hyper 1.10.1",
  "hyper-util",
  "log",
- "rustls 0.23.40",
- "rustls-native-certs 0.8.4",
+ "rustls",
+ "rustls-native-certs",
  "tokio",
- "tokio-rustls 0.26.4",
+ "tokio-rustls",
  "tower-service",
  "webpki-roots 1.0.7",
 ]
@@ -9588,7 +9568,7 @@ dependencies = [
  "libc",
  "percent-encoding",
  "pin-project-lite",
- "socket2 0.6.4",
+ "socket2 0.5.10",
  "system-configuration 0.7.0",
  "tokio",
  "tower-service",
@@ -11965,7 +11945,7 @@ dependencies = [
  "percent-encoding",
  "rand 0.9.4",
  "rustc_version_runtime",
- "rustls 0.23.40",
+ "rustls",
  "serde",
  "serde_bytes",
  "serde_with",
@@ -11978,7 +11958,7 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tokio-openssl",
- "tokio-rustls 0.26.4",
+ "tokio-rustls",
  "tokio-util",
  "typed-builder 0.22.0",
  "uuid 1.23.2",
@@ -12973,7 +12953,7 @@ dependencies = [
  "http-body 1.0.1",
  "http-body-util",
  "hyper 1.10.1",
- "hyper-rustls 0.27.9",
+ "hyper-rustls",
  "hyper-timeout",
  "hyper-util",
  "jsonwebtoken 10.4.0",
@@ -14009,11 +13989,11 @@ dependencies = [
  "bytes",
  "hmac 0.12.1",
  "rand 0.9.4",
- "rustls 0.23.40",
+ "rustls",
  "sha2 0.10.9",
  "thiserror 1.0.69",
  "tokio",
- "tokio-rustls 0.26.4",
+ "tokio-rustls",
  "tokio-util",
  "tracing",
  "webpki-roots 0.26.11",
@@ -14167,8 +14147,8 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3aa964c4e12e6328388b7059c93aac37b052be7962bbb70dd239b515532be4bf"
 dependencies = [
  "arrayvec",
- "hashbrown 0.17.1",
- "parking_lot 0.12.5",
+ "hashbrown 0.5.0",
+ "parking_lot 0.11.2",
  "rand 0.8.6",
 ]
 
@@ -14639,7 +14619,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "343d3bd7056eda839b03204e68deff7d1b13aba7af2b2fd16890697274262ee7"
 dependencies = [
  "heck 0.5.0",
- "itertools 0.14.0",
+ "itertools 0.12.1",
  "log",
  "multimap",
  "petgraph",
@@ -14673,7 +14653,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "27c6023962132f4b30eb4c172c91ce92d933da334c59c23cddee82358ddafb0b"
 dependencies = [
  "anyhow",
- "itertools 0.14.0",
+ "itertools 0.12.1",
  "proc-macro2",
  "quote",
  "syn 2.0.117",
@@ -15000,8 +14980,8 @@ dependencies = [
  "quinn-proto",
  "quinn-udp",
  "rustc-hash 2.1.2",
- "rustls 0.23.40",
- "socket2 0.6.4",
+ "rustls",
+ "socket2 0.5.10",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
@@ -15021,7 +15001,7 @@ dependencies = [
  "rand 0.9.4",
  "ring",
  "rustc-hash 2.1.2",
- "rustls 0.23.40",
+ "rustls",
  "rustls-pki-types",
  "slab",
  "thiserror 2.0.18",
@@ -15039,7 +15019,7 @@ dependencies = [
  "cfg_aliases",
  "libc",
  "once_cell",
- "socket2 0.6.4",
+ "socket2 0.5.10",
  "tracing",
  "windows-sys 0.60.2",
 ]
@@ -15840,7 +15820,7 @@ dependencies = [
  "http-body 1.0.1",
  "http-body-util",
  "hyper 1.10.1",
- "hyper-rustls 0.27.9",
+ "hyper-rustls",
  "hyper-tls 0.6.0",
  "hyper-util",
  "js-sys",
@@ -15851,8 +15831,8 @@ dependencies = [
  "percent-encoding",
  "pin-project-lite",
  "quinn",
- "rustls 0.23.40",
- "rustls-native-certs 0.8.4",
+ "rustls",
+ "rustls-native-certs",
  "rustls-pki-types",
  "serde",
  "serde_json",
@@ -15860,7 +15840,7 @@ dependencies = [
  "sync_wrapper 1.0.2",
  "tokio",
  "tokio-native-tls",
- "tokio-rustls 0.26.4",
+ "tokio-rustls",
  "tokio-util",
  "tower 0.5.3",
  "tower-http",
@@ -15890,7 +15870,7 @@ dependencies = [
  "http-body 1.0.1",
  "http-body-util",
  "hyper 1.10.1",
- "hyper-rustls 0.27.9",
+ "hyper-rustls",
  "hyper-util",
  "js-sys",
  "log",
@@ -15898,14 +15878,14 @@ dependencies = [
  "percent-encoding",
  "pin-project-lite",
  "quinn",
- "rustls 0.23.40",
+ "rustls",
  "rustls-pki-types",
  "rustls-platform-verifier",
  "serde",
  "serde_json",
  "sync_wrapper 1.0.2",
  "tokio",
- "tokio-rustls 0.26.4",
+ "tokio-rustls",
  "tokio-util",
  "tower 0.5.3",
  "tower-http",
@@ -16362,12 +16342,15 @@ dependencies = [
  "runtime-object-store",
  "runtime-parameters",
  "runtime-proto",
+ "runtime-query-engine",
  "runtime-rate-control",
  "runtime-request-context",
+ "runtime-search",
  "runtime-secrets",
  "runtime-table-partition",
+ "runtime-tools",
  "rusqlite",
- "rustls 0.23.40",
+ "rustls",
  "rustls-pemfile 2.2.0",
  "s3_vectors",
  "scheduler",
@@ -16396,7 +16379,7 @@ dependencies = [
  "tokio",
  "tokio-postgres",
  "tokio-rusqlite",
- "tokio-rustls 0.26.4",
+ "tokio-rustls",
  "tokio-stream",
  "tokio-util",
  "tonic",
@@ -16566,7 +16549,6 @@ dependencies = [
  "datafusion-pruning",
  "datafusion-table-providers",
  "futures",
- "globset",
  "insta",
  "itertools 0.14.0",
  "object_store",
@@ -16574,6 +16556,7 @@ dependencies = [
  "parking_lot 0.12.5",
  "runtime-datafusion-index",
  "runtime-datafusion-udfs",
+ "runtime-query-engine",
  "runtime-request-context",
  "search",
  "serde_json",
@@ -16708,6 +16691,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "runtime-query-engine"
+version = "2.1.0-unstable"
+dependencies = [
+ "arrow",
+ "arrow-schema",
+ "async-trait",
+ "datafusion",
+ "globset",
+ "snafu",
+]
+
+[[package]]
 name = "runtime-rate-control"
 version = "2.1.0-unstable"
 dependencies = [
@@ -16743,6 +16738,49 @@ dependencies = [
  "tokio-util",
  "tracing",
  "winver",
+]
+
+[[package]]
+name = "runtime-search"
+version = "2.1.0-unstable"
+dependencies = [
+ "app",
+ "arrow",
+ "arrow-schema",
+ "arrow_tools",
+ "async-openai",
+ "async-stream",
+ "async-trait",
+ "cache",
+ "chunking",
+ "data_components",
+ "datafusion",
+ "datafusion-expr",
+ "datafusion-federation",
+ "datafusion-functions-json",
+ "futures",
+ "insta",
+ "itertools 0.14.0",
+ "llms",
+ "moka",
+ "rayon",
+ "runtime-datafusion-index",
+ "runtime-datafusion-udfs",
+ "runtime-proto",
+ "runtime-query-engine",
+ "runtime-request-context",
+ "schemars 1.2.1",
+ "search",
+ "serde",
+ "serde_json",
+ "snafu",
+ "spicepod",
+ "telemetry",
+ "tokio",
+ "tonic",
+ "tracing",
+ "util",
+ "utoipa",
 ]
 
 [[package]]
@@ -16800,6 +16838,46 @@ dependencies = [
  "tokio-stream",
  "tracing",
  "util",
+]
+
+[[package]]
+name = "runtime-tools"
+version = "2.1.0-unstable"
+dependencies = [
+ "app",
+ "arrow",
+ "arrow-json",
+ "arrow-schema",
+ "arrow_tools",
+ "async-openai",
+ "async-trait",
+ "cache",
+ "chrono",
+ "datafusion",
+ "fundu",
+ "futures",
+ "globset",
+ "http 1.4.1",
+ "itertools 0.14.0",
+ "rmcp",
+ "runtime-auth",
+ "runtime-query-engine",
+ "runtime-request-context",
+ "runtime-search",
+ "schemars 1.2.1",
+ "secrecy",
+ "serde",
+ "serde_json",
+ "snafu",
+ "spicepod",
+ "tokio",
+ "tools",
+ "tracing",
+ "tracing-futures",
+ "url",
+ "util",
+ "utoipa",
+ "uuid 1.23.2",
 ]
 
 [[package]]
@@ -16987,18 +17065,6 @@ dependencies = [
 
 [[package]]
 name = "rustls"
-version = "0.21.12"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3f56a14d1f48b391359b22f731fd4bd7e43c97f3c50eee276f3aa09c94784d3e"
-dependencies = [
- "log",
- "ring",
- "rustls-webpki 0.101.7",
- "sct",
-]
-
-[[package]]
-name = "rustls"
 version = "0.23.40"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ef86cd5876211988985292b91c96a8f2d298df24e75989a43a3c73f2d4d8168b"
@@ -17008,21 +17074,9 @@ dependencies = [
  "once_cell",
  "ring",
  "rustls-pki-types",
- "rustls-webpki 0.103.13",
+ "rustls-webpki",
  "subtle",
  "zeroize",
-]
-
-[[package]]
-name = "rustls-native-certs"
-version = "0.6.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a9aace74cb666635c918e9c12bc0d348266037aa8eb599b5cba565709a8dff00"
-dependencies = [
- "openssl-probe 0.1.6",
- "rustls-pemfile 1.0.4",
- "schannel",
- "security-framework 2.11.1",
 ]
 
 [[package]]
@@ -17076,10 +17130,10 @@ dependencies = [
  "jni",
  "log",
  "once_cell",
- "rustls 0.23.40",
- "rustls-native-certs 0.8.4",
+ "rustls",
+ "rustls-native-certs",
  "rustls-platform-verifier-android",
- "rustls-webpki 0.103.13",
+ "rustls-webpki",
  "security-framework 3.7.0",
  "security-framework-sys",
  "webpki-root-certs",
@@ -17091,16 +17145,6 @@ name = "rustls-platform-verifier-android"
 version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f87165f0995f63a9fbeea62b64d10b4d9d8e78ec6d7d51fb2125fda7bb36788f"
-
-[[package]]
-name = "rustls-webpki"
-version = "0.101.7"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8b6275d1ee7a1cd780b64aca7726599a1dbc893b1e64144529e55c3c2f745765"
-dependencies = [
- "ring",
- "untrusted 0.9.0",
-]
 
 [[package]]
 name = "rustls-webpki"
@@ -17412,16 +17456,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "sct"
-version = "0.7.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "da046153aa2352493d6cb7da4b6e5c0c057d8a1d0a9aa8560baffdd945acd414"
-dependencies = [
- "ring",
- "untrusted 0.9.0",
-]
-
-[[package]]
 name = "scylla"
 version = "1.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -17532,6 +17566,7 @@ dependencies = [
  "itertools 0.14.0",
  "llms",
  "runtime-datafusion-index",
+ "runtime-query-engine",
  "runtime-table-partition",
  "serde",
  "serde_json",
@@ -17676,7 +17711,7 @@ checksum = "4db5a4a562bcc0017c34cd0efbabf447be783f00576a2a516947f884e6a7ed57"
 dependencies = [
  "ahash 0.8.12",
  "annotate-snippets",
- "base64 0.22.1",
+ "base64 0.21.7",
  "encoding_rs_io",
  "nohash-hasher",
  "num-traits",
@@ -18452,7 +18487,7 @@ dependencies = [
 [[package]]
 name = "spiceai"
 version = "3.2.0"
-source = "git+https://github.com/spiceai/spice-rs.git?rev=7bc9e455d47aa8899acc5c6c91f7448bea5637b2#7bc9e455d47aa8899acc5c6c91f7448bea5637b2"
+source = "git+https://github.com/spiceai/spice-rs.git?rev=93b75c3c7d1a812b23d00b45adf537d7a2415496#93b75c3c7d1a812b23d00b45adf537d7a2415496"
 dependencies = [
  "arrow",
  "arrow-flight",
@@ -18467,8 +18502,8 @@ dependencies = [
  "prost-types",
  "rand 0.9.4",
  "reqwest 0.12.24",
- "rustls 0.23.40",
- "rustls-native-certs 0.8.4",
+ "rustls",
+ "rustls-native-certs",
  "rustls-pemfile 1.0.4",
  "serde",
  "serde_json",
@@ -18534,7 +18569,8 @@ dependencies = [
  "runtime-async",
  "runtime-auth",
  "runtime-datafusion",
- "rustls 0.23.40",
+ "runtime-query-engine",
+ "rustls",
  "snafu",
  "snmalloc-rs",
  "spice-cloud",
@@ -18644,7 +18680,7 @@ dependencies = [
  "regex",
  "reqwest 0.12.24",
  "runtime-secrets",
- "rustls 0.23.40",
+ "rustls",
  "serde",
  "serde_json",
  "spice-cloud-client",
@@ -19240,7 +19276,7 @@ dependencies = [
 [[package]]
 name = "system-adapter-protocol"
 version = "0.1.0"
-source = "git+https://github.com/spiceai/spicebench.git?rev=6c00cb7e811a51d8b22191bac798f49b76e779ad#6c00cb7e811a51d8b22191bac798f49b76e779ad"
+source = "git+https://github.com/spiceai/spicebench.git?rev=4624f1ec96c519d0bde4fee8c4e75b0498a2181d#4624f1ec96c519d0bde4fee8c4e75b0498a2181d"
 dependencies = [
  "arrow-schema",
  "async-trait",
@@ -19619,7 +19655,7 @@ dependencies = [
  "regex",
  "reqwest 0.12.24",
  "rstest 0.26.1",
- "rustls 0.23.40",
+ "rustls",
  "secrecy",
  "serde",
  "serde_json",
@@ -19783,7 +19819,7 @@ dependencies = [
  "once_cell",
  "pulldown-cmark 0.12.2",
  "regex",
- "rustls 0.23.40",
+ "rustls",
  "strum 0.26.3",
  "thiserror 2.0.18",
  "tiktoken-rs 0.6.0",
@@ -19854,8 +19890,7 @@ dependencies = [
 [[package]]
 name = "tiberius"
 version = "0.12.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a1446cb4198848d1562301a3340424b4f425ef79f35ef9ee034769a9dd92c10d"
+source = "git+https://github.com/spiceai/tiberius?rev=9ae93c65222b51b0579945ffce5cba053cb23cca#9ae93c65222b51b0579945ffce5cba053cb23cca"
 dependencies = [
  "async-trait",
  "asynchronous-codec",
@@ -19870,10 +19905,9 @@ dependencies = [
  "once_cell",
  "pin-project-lite",
  "pretty-hex",
- "rustls-native-certs 0.6.3",
- "rustls-pemfile 1.0.4",
+ "rustls-native-certs",
  "thiserror 1.0.69",
- "tokio-rustls 0.24.1",
+ "tokio-rustls",
  "tokio-util",
  "tracing",
  "uuid 1.23.2",
@@ -20216,21 +20250,11 @@ dependencies = [
 
 [[package]]
 name = "tokio-rustls"
-version = "0.24.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c28327cf380ac148141087fbfb9de9d7bd4e84ab5d2c28fbc911d753de8a7081"
-dependencies = [
- "rustls 0.21.12",
- "tokio",
-]
-
-[[package]]
-name = "tokio-rustls"
 version = "0.26.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1729aa945f29d91ba541258c8df89027d5792d85a8841fb65e8bf0f4ede4ef61"
 dependencies = [
- "rustls 0.23.40",
+ "rustls",
  "tokio",
 ]
 
@@ -20405,11 +20429,11 @@ dependencies = [
  "hyper-util",
  "percent-encoding",
  "pin-project",
- "rustls-native-certs 0.8.4",
+ "rustls-native-certs",
  "socket2 0.6.4",
  "sync_wrapper 1.0.2",
  "tokio",
- "tokio-rustls 0.26.4",
+ "tokio-rustls",
  "tokio-stream",
  "tower 0.5.3",
  "tower-layer",
@@ -20694,9 +20718,9 @@ dependencies = [
 
 [[package]]
 name = "tract-core"
-version = "0.22.1"
+version = "0.22.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b65d67f5190132365dda73fe215bfc5e01b031e8cbfbea9d486bb5b0dbba3545"
+checksum = "3f0674154b96abb73f8bdade9e6b6e22fa65f4e13da8d84c0659bd7d3c4739b9"
 dependencies = [
  "anyhow",
  "anymap3",
@@ -20720,9 +20744,9 @@ dependencies = [
 
 [[package]]
 name = "tract-data"
-version = "0.22.1"
+version = "0.22.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "73cd7fda1e5e8b854ea3abdd09126a87fc4af81e6d1e29ec1710a8a4abf4f13a"
+checksum = "5a0972068b06792ef536df873857854c41109aefa3ad90432e09b0b6549e7523"
 dependencies = [
  "anyhow",
  "downcast-rs 1.2.1",
@@ -20746,9 +20770,9 @@ dependencies = [
 
 [[package]]
 name = "tract-hir"
-version = "0.22.1"
+version = "0.22.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "554df991b647dba8af0547ee5838b6912ed20b424f2adda0ea0b7faf8db1b151"
+checksum = "fe50ad4a84553a75c2eeba7b705ff32f862d7e4bdb5892397b4560ec59d1627d"
 dependencies = [
  "derive-new 0.5.9",
  "log",
@@ -20757,9 +20781,9 @@ dependencies = [
 
 [[package]]
 name = "tract-linalg"
-version = "0.22.1"
+version = "0.22.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e72097a89cc4e7c5f1bc4f854b9294dd30fa6f6d8f7f409c556953b49078c94f"
+checksum = "a7b582f6ef2dcf32a78f043bbbb93ebc54af247c95cd5d18d5f8b36af47a273e"
 dependencies = [
  "byteorder",
  "cc",
@@ -20785,9 +20809,9 @@ dependencies = [
 
 [[package]]
 name = "tract-nnef"
-version = "0.22.1"
+version = "0.22.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "45b3755dd0948111b407085d11033ba218cb85b85ce8d795cec2b8353db552ea"
+checksum = "d4c317f94210bdfc0b81913965c7d7439d401527cc8d9bbc85fffbb59b09af5c"
 dependencies = [
  "byteorder",
  "flate2",
@@ -20805,9 +20829,9 @@ dependencies = [
 
 [[package]]
 name = "tract-onnx"
-version = "0.22.1"
+version = "0.22.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ac23ad1d2d5da3256ae1a78757b1072a8a3fac2a4b28d27cfb561c5942ec2701"
+checksum = "30cf71aa3c8a2ca05258ee0750e428cf2d0e8a38781ccd2ab9a0900551684c2b"
 dependencies = [
  "bytes",
  "derive-new 0.5.9",
@@ -20823,9 +20847,9 @@ dependencies = [
 
 [[package]]
 name = "tract-onnx-opl"
-version = "0.22.1"
+version = "0.22.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "87561bf0b84f74a124afc0f1997682728da6cd821083511e0357432954fd24f6"
+checksum = "a34a0c0d726b7adc04e3ae956fa1e091ac6a33d4b9bc52ef678108c5445efb7d"
 dependencies = [
  "getrandom 0.2.17",
  "log",
@@ -21459,7 +21483,7 @@ dependencies = [
  "log",
  "native-tls",
  "once_cell",
- "rustls 0.23.40",
+ "rustls",
  "rustls-pki-types",
  "serde",
  "serde_json",

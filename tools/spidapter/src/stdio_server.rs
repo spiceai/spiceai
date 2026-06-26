@@ -77,6 +77,10 @@ struct ScpRunState {
     ec2_guards: Vec<Ec2Guard>,
     dynamodb_guard: Option<DynamoDbGuard>,
     mongodb_guard: Option<MongoDbGuard>,
+    /// Deletes the Spice Cloud app if the run is dropped without an explicit
+    /// teardown (panic, interrupt, dropped handler). `take`n/`disarm`ed by the
+    /// teardown path so it never double-deletes. See [`commands::ScpAppGuard`].
+    app_guard: Option<commands::ScpAppGuard>,
 }
 
 /// State for an active benchmark run provisioned via `setup`.
@@ -562,11 +566,58 @@ fn build_cdc_replication_metrics(body: &str) -> Option<CdcReplicationMetrics> {
 }
 
 /// System adapter handler that provisions Spice Cloud apps.
+/// Builds the write-side [`SinkConfig`] for a non-direct source. Mirrors the
+/// inline sink construction in the non-direct `setup` branch; used by the
+/// bootstrap path (which returns the sink before the SUT is started).
+fn build_nondirect_sink(setup_config: &SetupConfig) -> SinkConfig {
+    match &setup_config.storage {
+        FederatedStorageConfig::Postgres { pg, .. }
+        | FederatedStorageConfig::PostgresDebezium { pg, .. } => {
+            let mut write_db_kwargs = pg.adbc_kwargs();
+            write_db_kwargs.insert(
+                "spicebench.write_schema".to_string(),
+                serde_json::Value::String(pg.schema.clone()),
+            );
+            SinkConfig::Adbc {
+                driver: AdbcDriver::Postgresql,
+                db_kwargs: write_db_kwargs,
+            }
+        }
+        FederatedStorageConfig::DynamoDB { .. } => {
+            let region = resolve_aws_region(setup_config);
+            SinkConfig::DynamoDb {
+                region,
+                access_key_id: std::env::var("AWS_ACCESS_KEY_ID").ok(),
+                secret_access_key: std::env::var("AWS_SECRET_ACCESS_KEY").ok(),
+                session_token: std::env::var("AWS_SESSION_TOKEN").ok(),
+            }
+        }
+        FederatedStorageConfig::MongoDB { uri, .. } => SinkConfig::MongoDb { uri: uri.clone() },
+        // Bootstrap is rejected for Direct before this is ever called.
+        FederatedStorageConfig::Direct => SinkConfig::MongoDb { uri: String::new() },
+    }
+}
+
+/// Context captured by `setup` and consumed by `activate_run` to provision the
+/// SUT. For non-bootstrap runs this is created and consumed within a single
+/// `setup` call; for bootstrap runs it is stashed across the `setup`→`activate`
+/// boundary so spicebench can seed the source in between.
+struct PendingActivation {
+    setup_config: SetupConfig,
+    datasets: HashMap<String, DatasetConfig>,
+    sink: SinkConfig,
+    ec2_guards: Vec<Ec2Guard>,
+    dynamodb_guard: Option<DynamoDbGuard>,
+    mongodb_guard: Option<MongoDbGuard>,
+}
+
 struct SpidapterHandler {
     /// Active runs keyed by run ID.
     runs: HashMap<Uuid, RunState>,
     /// Datasets from setup, keyed by run ID → dataset name → config.
     run_datasets: HashMap<Uuid, HashMap<String, DatasetConfig>>,
+    /// Non-direct runs awaiting `activate` (source provisioned, SUT not yet started).
+    pending: HashMap<Uuid, PendingActivation>,
     /// Full CLI args (includes all flags and env-var-backed configuration).
     args: StdioArgs,
     /// Loaded scenario configuration (source type, compute, channel, acceleration).
@@ -594,6 +645,7 @@ impl SpidapterHandler {
         Self {
             runs: HashMap::new(),
             run_datasets: HashMap::new(),
+            pending: HashMap::new(),
             args: args.clone(),
             scenario,
         }
@@ -635,6 +687,154 @@ impl SpidapterHandler {
         match &self.scenario.compute {
             Some(ComputeConfig::Scp(_)) => SpiceCompute::Scp,
             Some(ComputeConfig::Local) | None => SpiceCompute::Local,
+        }
+    }
+
+    /// Provision the SUT for a non-direct run and finalize run state. Used both
+    /// inline by non-bootstrap `setup` (via the regular path) and by `activate`
+    /// for bootstrap runs (after spicebench has seeded the source).
+    async fn activate_run(&mut self, run_id: Uuid) -> Result<SetupResponse, String> {
+        let PendingActivation {
+            setup_config,
+            datasets,
+            sink,
+            ec2_guards,
+            dynamodb_guard,
+            mongodb_guard,
+        } = self
+            .pending
+            .remove(&run_id)
+            .ok_or_else(|| format!("activate: no pending setup for run_id={run_id}"))?;
+
+        // Non-direct sources have no cayenne config.
+        let cayenne_cfg: Option<&CayenneConfig> = match &self.scenario.source {
+            SourceConfig::Direct(DirectConfig { cayenne }) => cayenne.as_ref(),
+            _ => None,
+        };
+
+        let deployment_mode = setup_config.storage.deployment_mode();
+        let provision_result = match self.compute() {
+            SpiceCompute::Scp => {
+                let scp = self.scp_config().ok_or_else(|| {
+                    "SCP compute requires a scenario with `compute: scp:`".to_string()
+                })?;
+                provision_scp_app(
+                    run_id,
+                    &self.args,
+                    scp,
+                    &setup_config,
+                    &datasets,
+                    &deployment_mode,
+                    false,
+                    cayenne_cfg,
+                )
+                .await
+            }
+            SpiceCompute::Local => match deployment_mode {
+                DeploymentMode::SingleNode => {
+                    provision_local_single_node(
+                        run_id,
+                        Duration::from_secs(self.args.ready_wait),
+                        &setup_config,
+                        &datasets,
+                        &self.args,
+                        self.scp_config(),
+                        cayenne_cfg,
+                    )
+                    .await
+                }
+                DeploymentMode::Cluster => {
+                    provision_local_spiced_cluster(
+                        run_id,
+                        Duration::from_secs(self.args.ready_wait),
+                        &setup_config,
+                        &datasets,
+                        &self.args,
+                        self.scp_config(),
+                    )
+                    .await
+                }
+            },
+        };
+
+        let mut state = match provision_result {
+            Ok(mut s) => {
+                match &mut s {
+                    RunState::Scp(scp) => scp.storage = setup_config.storage.clone(),
+                    RunState::Local(local) => local.storage = setup_config.storage.clone(),
+                }
+                s
+            }
+            Err(e) => return Err(format!("activate: provisioning failed: {e}")),
+        };
+
+        // Move the source guards into the now-provisioned run state.
+        match &mut state {
+            RunState::Scp(scp) => {
+                scp.ec2_guards = ec2_guards;
+                scp.dynamodb_guard = dynamodb_guard;
+                scp.mongodb_guard = mongodb_guard;
+            }
+            RunState::Local(local) => {
+                local.ec2_guards = ec2_guards;
+                local.dynamodb_guard = dynamodb_guard;
+                local.mongodb_guard = mongodb_guard;
+            }
+        }
+
+        Ok(self.finalize_setup(run_id, state, sink, datasets, &setup_config.storage))
+    }
+
+    /// Build the read-side config + catalog namespace from a provisioned run
+    /// state, register the run, and assemble the `SetupResponse`.
+    fn finalize_setup(
+        &mut self,
+        run_id: Uuid,
+        state: RunState,
+        sink: SinkConfig,
+        datasets: HashMap<String, DatasetConfig>,
+        storage: &FederatedStorageConfig,
+    ) -> SetupResponse {
+        let mut read_db_kwargs = HashMap::from([
+            (
+                "uri".to_string(),
+                serde_json::Value::String(state.flight_url().to_string()),
+            ),
+            (
+                "username".to_string(),
+                serde_json::Value::String(String::new()),
+            ),
+            (
+                "password".to_string(),
+                serde_json::Value::String(state.password().to_string()),
+            ),
+        ]);
+        if let RunState::Local(local_state) = &state
+            && let Some(ak) = &local_state.flight_api_key
+        {
+            read_db_kwargs.insert(
+                "adbc.flight.sql.rpc.call_header.authorization".to_string(),
+                serde_json::Value::String(format!("Bearer {ak}")),
+            );
+        }
+
+        let catalog_namespace = match storage {
+            FederatedStorageConfig::Direct => Some("spicebench.bench".to_string()),
+            FederatedStorageConfig::DynamoDB { prefix, .. } if !prefix.is_empty() => {
+                Some(prefix.clone())
+            }
+            _ => None,
+        };
+
+        self.runs.insert(run_id, state);
+        self.run_datasets.insert(run_id, datasets);
+
+        SetupResponse {
+            sink,
+            read_driver: AdbcDriver::Flightsql,
+            read_db_kwargs,
+            catalog_namespace,
+            endpoints: HashMap::new(),
         }
     }
 }
@@ -878,6 +1078,41 @@ impl Handler for SpidapterHandler {
             )
             .await
             .map_err(|e| format!("Failed to register Debezium PostgreSQL connector: {e}"))?;
+        }
+
+        // Bootstrap mode: the source is now provisioned. Return its sink WITHOUT
+        // starting the SUT so spicebench can seed the source first; the SUT is
+        // started later by `activate`. Only non-direct sources support this.
+        let is_bootstrap = metadata
+            .get(system_adapter_protocol::BOOTSTRAP_METADATA_KEY)
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
+        if is_bootstrap {
+            if matches!(setup_config.storage, FederatedStorageConfig::Direct) {
+                return Err("bootstrap mode is not supported for direct-ingest sources".to_string());
+            }
+            let sink = build_nondirect_sink(&setup_config);
+            eprintln!(
+                "[stdio] setup(bootstrap): source provisioned; deferring SUT start until activate"
+            );
+            self.pending.insert(
+                run_id,
+                PendingActivation {
+                    setup_config,
+                    datasets,
+                    sink: sink.clone(),
+                    ec2_guards,
+                    dynamodb_guard,
+                    mongodb_guard,
+                },
+            );
+            return Ok(SetupResponse {
+                sink,
+                read_driver: AdbcDriver::Flightsql,
+                read_db_kwargs: HashMap::new(),
+                catalog_namespace: None,
+                endpoints: HashMap::new(),
+            });
         }
 
         // For Cayenne (DirectIngest): provision spiced first (Flight URL needed to build SinkConfig).
@@ -1193,12 +1428,44 @@ impl Handler for SpidapterHandler {
         }
     }
 
+    async fn activate(&mut self, run_id: Uuid) -> Result<SetupResponse, String> {
+        eprintln!("[stdio] activate: run_id={run_id} (starting SUT after source seed)");
+        self.activate_run(run_id).await
+    }
+
     async fn teardown(
         &mut self,
         run_id: Uuid,
         preserve_resources: bool,
     ) -> Result<TeardownResponse, String> {
         eprintln!("[stdio] teardown: run_id={run_id} preserve_resources={preserve_resources}");
+
+        // Bootstrap run torn down before `activate`: state lives in `pending`.
+        if let Some(mut pending) = self.pending.remove(&run_id) {
+            eprintln!("[stdio] teardown: run_id={run_id} torn down before activation");
+            if preserve_resources {
+                for mut g in pending.ec2_guards.drain(..) {
+                    g.disarm();
+                }
+                if let Some(mut g) = pending.dynamodb_guard.take() {
+                    g.disarm();
+                }
+                if let Some(mut g) = pending.mongodb_guard.take() {
+                    g.disarm();
+                }
+            } else if let Some(mut g) = pending.mongodb_guard.take()
+                && let Some((uri, database)) = g.disarm()
+            {
+                // Drop the seeded per-run database explicitly (Drop is fail-safe).
+                if let Err(e) = drop_mongodb_database(&uri, &database).await {
+                    eprintln!(
+                        "[stdio] teardown: warning: failed to drop MongoDB database '{database}': {e}"
+                    );
+                }
+            }
+            // Remaining ec2/dynamodb guards (if any, !preserve) clean up on drop here.
+            return Ok(TeardownResponse { ok: true });
+        }
 
         let Some(mut state) = self.runs.remove(&run_id) else {
             eprintln!("[stdio] teardown: run_id={run_id} not found (already torn down?)");
@@ -1247,21 +1514,33 @@ impl Handler for SpidapterHandler {
                     "[stdio] teardown(preserve): keeping MongoDB database '{database}' alive"
                 );
             }
-            // For SCP: skip app deletion so the deployed spiced stays running.
+            // For SCP: disarm the app guard and skip app deletion so the deployed
+            // spiced stays running (dropping `state` below must not delete it).
+            if let RunState::Scp(scp) = &mut state
+                && let Some(guard) = &mut scp.app_guard
+            {
+                guard.disarm();
+            }
             eprintln!("[stdio] teardown(preserve): skipping resource deletion");
             return Ok(TeardownResponse { ok: true });
         }
 
         match state {
-            RunState::Scp(scp) => {
+            RunState::Scp(mut scp) => {
                 eprintln!(
                     "[stdio] teardown: deleting app {} at {}",
                     scp.app_id,
                     scp.cloud.base_url()
                 );
+                // On `?` failure here, `scp` (and its still-armed `app_guard`) is
+                // dropped, so the guard retries the delete on drop. On success we
+                // disarm it below so it does not delete the app a second time.
                 commands::delete_app(&scp.cloud, scp.app_id)
                     .await
                     .map_err(|e| format!("Failed to delete app {}: {e}", scp.app_id))?;
+                if let Some(mut guard) = scp.app_guard.take() {
+                    guard.disarm();
+                }
                 eprintln!("[stdio] teardown: app {} deleted", scp.app_id);
             }
             RunState::Local(mut local_state) => {
@@ -1426,15 +1705,22 @@ pub async fn run_stdio_server(args: &StdioArgs) -> anyhow::Result<()> {
 
     let handler = SpidapterHandler::new(args, scenario);
     let mut server = Server::new(handler);
-    tokio::select! {
+    let result = tokio::select! {
         r = server.run_stdio() => {
             r.map_err(|e| anyhow::anyhow!("Stdio server error: {e}"))
         }
         _ = tokio::signal::ctrl_c() => {
-            eprintln!("[stdio] Received interrupt, cleaning up resources...");
+            eprintln!("[stdio] Received interrupt, cleaning up active runs...");
             Ok(())
         }
-    }
+    };
+    // Drop the server (and the handler it owns) here so every active run's state is
+    // torn down before we return. For SCP runs the embedded `ScpAppGuard` deletes
+    // the Spice Cloud app on drop, so an interrupt no longer orphans apps. (The
+    // previous code logged "cleaning up" but dropped the server implicitly without
+    // any SCP cleanup, since `ScpRunState` had no Drop.)
+    drop(server);
+    result
 }
 
 async fn post_setup_sink_action(

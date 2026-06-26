@@ -36,6 +36,19 @@ impl OracleConnectionPool {
             .map_err(|err| super::Error::ConnectionPoolError { source: err.into() })?;
         Ok(conn)
     }
+
+    /// Like [`get`](Self::get) but returns a `'static` connection (tied to an
+    /// internal `Arc`-clone of the pool) so it can be moved into
+    /// `tokio::task::spawn_blocking` to run synchronous OCI calls off the async
+    /// runtime thread.
+    pub async fn get_owned(
+        &self,
+    ) -> super::Result<bb8::PooledConnection<'static, OracleConnectionManager>> {
+        self.pool
+            .get_owned()
+            .await
+            .map_err(|err| super::Error::ConnectionPoolError { source: err.into() })
+    }
 }
 
 #[derive(Debug)]
@@ -50,10 +63,21 @@ impl CustomizeConnection<Arc<Connection>, bb8_oracle::Error> for SetTimezoneCust
         conn: &'a mut Arc<Connection>,
     ) -> std::pin::Pin<Box<dyn Future<Output = Result<(), bb8_oracle::Error>> + Send + 'a>> {
         let sql = format!("ALTER SESSION SET TIME_ZONE = '{}'", self.timezone);
+        // `rust-oracle`'s `execute` is a synchronous OCI call that blocks the
+        // calling thread; run it on the blocking pool (with an owned `Arc`-clone
+        // of the connection) so every pool acquire doesn't stall the async
+        // runtime thread.
+        let conn = Arc::clone(conn);
         Box::pin(async move {
-            conn.execute(&sql, &[])
-                .map(|_| ())
-                .map_err(bb8_oracle::Error::Database)
+            tokio::task::spawn_blocking(move || {
+                conn.execute(&sql, &[])
+                    .map(|_| ())
+                    .map_err(bb8_oracle::Error::Database)
+            })
+            .await
+            // A join failure (task panic/cancel) maps to the pool's dedicated
+            // `Panic` variant.
+            .map_err(bb8_oracle::Error::Panic)?
         })
     }
 }
