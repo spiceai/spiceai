@@ -754,36 +754,54 @@ pub(crate) struct WriteSample {
     pub delete_rows: u64,
 }
 
-#[derive(Debug, Default, Clone, Copy)]
+#[derive(Debug, Clone, Copy)]
 struct EwmaInner {
-    rows_per_sec: f64,
-    bytes_per_sec: f64,
-    apply_ms: f64,
-    arrival_gap_ms: f64,
+    rows_per_sec: Ewma,
+    bytes_per_sec: Ewma,
+    apply_ms: Ewma,
+    arrival_gap_ms: Ewma,
     /// EWMA of `arrival_gap_ms²`, paired with `arrival_gap_ms` to derive the
     /// arrival-interval variance (and thus the burstiness CV) without storing a
     /// history: `Var = E[x²] − E[x]²`.
-    arrival_gap_ms_sq: f64,
+    arrival_gap_ms_sq: Ewma,
     /// EWMA of the per-batch mutation fraction (`superseded delete_rows / rows`),
     /// in `[0, 1]` — the mutation-heavy gate signal (updates + deletes).
-    delete_fraction: f64,
+    delete_fraction: Ewma,
+    /// Count of recorded batches, for the controller's warmup/fresh-sample gates
+    /// (NOT the EWMA seeding — each [`Ewma`] self-seeds on its first sample).
     samples: u64,
     /// EWMA per-batch object-store/disk write latency (the `vortex_write` phase),
-    /// ms; paired with `io_samples` for cold-start priming. `0` / no samples ⇒
-    /// the table has not spilled to Vortex (pure-inline) → I/O signal unavailable.
-    io_latency_ms: f64,
-    io_samples: u64,
+    /// ms. Unseeded (`value() == None`) ⇒ the table has not spilled to Vortex
+    /// (pure-inline) → I/O signal unavailable.
+    io_latency_ms: Ewma,
     /// FAST EWMA (alpha [`EWMA_ALPHA_FAST`]) of the same `vortex_write` latency,
     /// for the cliff detector: a sudden step (burst-credit depletion) shows up
     /// here several dwells before the slow `io_latency_ms` catches up.
-    io_latency_fast_ms: f64,
+    io_latency_fast_ms: Ewma,
     /// EWMA per-batch metastore publish latency (the `publish` phase — the
-    /// single-writer commit), ms; paired with `publish_samples`.
-    publish_latency_ms: f64,
-    publish_samples: u64,
+    /// single-writer commit), ms.
+    publish_latency_ms: Ewma,
     /// FAST EWMA of the `publish` latency, paired with `publish_latency_ms` for the
     /// publish-side cliff detector.
-    publish_latency_fast_ms: f64,
+    publish_latency_fast_ms: Ewma,
+}
+
+impl Default for EwmaInner {
+    fn default() -> Self {
+        Self {
+            rows_per_sec: Ewma::new(),
+            bytes_per_sec: Ewma::new(),
+            apply_ms: Ewma::new(),
+            arrival_gap_ms: Ewma::new(),
+            arrival_gap_ms_sq: Ewma::new(),
+            delete_fraction: Ewma::new(),
+            samples: 0,
+            io_latency_ms: Ewma::new(),
+            io_latency_fast_ms: Ewma::with_alpha(EWMA_ALPHA_FAST),
+            publish_latency_ms: Ewma::new(),
+            publish_latency_fast_ms: Ewma::with_alpha(EWMA_ALPHA_FAST),
+        }
+    }
 }
 
 /// Per-table rolling accounting of both the **input** (ingest rate) and the
@@ -861,18 +879,15 @@ impl IngestStats {
         };
 
         let mut inner = self.inner.lock();
-        let prior = inner.samples;
-        ewma(&mut inner.rows_per_sec, inst_rows_per_sec, prior);
-        ewma(&mut inner.bytes_per_sec, inst_bytes_per_sec, prior);
-        ewma(&mut inner.apply_ms, apply_ms, prior);
-        ewma(&mut inner.arrival_gap_ms, arrival_gap_ms, prior);
-        ewma(
-            &mut inner.arrival_gap_ms_sq,
-            arrival_gap_ms * arrival_gap_ms,
-            prior,
-        );
-        ewma(&mut inner.delete_fraction, inst_delete_fraction, prior);
-        inner.samples = prior.saturating_add(1);
+        inner.rows_per_sec.update(inst_rows_per_sec);
+        inner.bytes_per_sec.update(inst_bytes_per_sec);
+        inner.apply_ms.update(apply_ms);
+        inner.arrival_gap_ms.update(arrival_gap_ms);
+        inner
+            .arrival_gap_ms_sq
+            .update(arrival_gap_ms * arrival_gap_ms);
+        inner.delete_fraction.update(inst_delete_fraction);
+        inner.samples = inner.samples.saturating_add(1);
     }
 
     /// Update the observed read amplification (small-file count). Called by the
@@ -919,27 +934,18 @@ impl IngestStats {
     /// so a pure-inline table leaves `io_latency_ms` unavailable.
     pub fn record_io_latency(&self, d: Duration) {
         let mut inner = self.inner.lock();
-        let prior = inner.io_samples;
         let ms = duration_ms(d);
-        ewma(&mut inner.io_latency_ms, ms, prior);
-        ewma_with(&mut inner.io_latency_fast_ms, ms, prior, EWMA_ALPHA_FAST);
-        inner.io_samples = prior.saturating_add(1);
+        inner.io_latency_ms.update(ms);
+        inner.io_latency_fast_ms.update(ms);
     }
 
     /// Fold one CDC batch's metastore publish latency (the `publish` phase — the
     /// single-writer commit) into the rolling EWMA.
     pub fn record_publish_latency(&self, d: Duration) {
         let mut inner = self.inner.lock();
-        let prior = inner.publish_samples;
         let ms = duration_ms(d);
-        ewma(&mut inner.publish_latency_ms, ms, prior);
-        ewma_with(
-            &mut inner.publish_latency_fast_ms,
-            ms,
-            prior,
-            EWMA_ALPHA_FAST,
-        );
-        inner.publish_samples = prior.saturating_add(1);
+        inner.publish_latency_ms.update(ms);
+        inner.publish_latency_fast_ms.update(ms);
     }
 
     /// Replication lag in seconds relative to `now_ms` (age of the newest applied
@@ -971,11 +977,18 @@ impl IngestStats {
     #[must_use]
     pub fn snapshot(&self) -> IngestSnapshot {
         let inner = *self.inner.lock();
+        // Resolve each EWMA to its current value; an unseeded average reads as the
+        // cold-start `0.0` the prior bare-f64 slots defaulted to.
+        let rows_per_sec = inner.rows_per_sec.value().unwrap_or(0.0);
+        let bytes_per_sec = inner.bytes_per_sec.value().unwrap_or(0.0);
+        let apply_ms = inner.apply_ms.value().unwrap_or(0.0);
+        let arrival_gap_ms = inner.arrival_gap_ms.value().unwrap_or(0.0);
+        let delete_fraction = inner.delete_fraction.value().unwrap_or(0.0);
         // Key response signal: apply latency relative to the offered-load
         // interval. > 1 means we absorb a batch slower than batches arrive — the
         // table is falling behind regardless of the absolute rate.
-        let apply_vs_arrival = if inner.arrival_gap_ms > 0.0 {
-            inner.apply_ms / inner.arrival_gap_ms
+        let apply_vs_arrival = if arrival_gap_ms > 0.0 {
+            apply_ms / arrival_gap_ms
         } else {
             0.0
         };
@@ -984,28 +997,28 @@ impl IngestStats {
         // σ/μ = sqrt(E[x²] − E[x]²) / E[x]. CV ≈ 0 is a metronome-steady stream;
         // CV > 1 means the gap's spread exceeds its mean (spiky). `0` until the
         // mean is positive (cold start) so it can't fire a spurious "bursty".
-        let arrival_cv = if inner.arrival_gap_ms > 0.0 {
-            let variance =
-                (inner.arrival_gap_ms_sq - inner.arrival_gap_ms * inner.arrival_gap_ms).max(0.0);
-            variance.sqrt() / inner.arrival_gap_ms
+        let arrival_cv = if arrival_gap_ms > 0.0 {
+            let arrival_gap_ms_sq = inner.arrival_gap_ms_sq.value().unwrap_or(0.0);
+            let variance = (arrival_gap_ms_sq - arrival_gap_ms * arrival_gap_ms).max(0.0);
+            variance.sqrt() / arrival_gap_ms
         } else {
             0.0
         };
         IngestSnapshot {
-            rows_per_sec: inner.rows_per_sec,
+            rows_per_sec,
             // Real bytes/sec once the first write has been recorded; -1.0 before
             // then (cold start) so the gauge is suppressed rather than emitting 0.
             bytes_per_sec: if self.total_bytes.load(Ordering::Relaxed) > 0 {
-                inner.bytes_per_sec
+                bytes_per_sec
             } else {
                 -1.0
             },
-            apply_ms: inner.apply_ms,
-            arrival_gap_ms: inner.arrival_gap_ms,
+            apply_ms,
+            arrival_gap_ms,
             apply_vs_arrival,
             read_amp: self.read_amp.load(Ordering::Relaxed),
             mem_pressure,
-            delete_fraction: inner.delete_fraction,
+            delete_fraction,
             arrival_cv,
             samples: inner.samples,
             // The now-relative CDC signals, the query-side metrics, and the
@@ -1020,11 +1033,10 @@ impl IngestStats {
             qph: None,
             cpu_pressure: cpu_pressure(),
             cpu_burstable: cpu_burstable(),
-            io_latency_ms: (inner.io_samples > 0).then_some(inner.io_latency_ms),
-            publish_latency_ms: (inner.publish_samples > 0).then_some(inner.publish_latency_ms),
-            io_latency_fast_ms: (inner.io_samples > 0).then_some(inner.io_latency_fast_ms),
-            publish_latency_fast_ms: (inner.publish_samples > 0)
-                .then_some(inner.publish_latency_fast_ms),
+            io_latency_ms: inner.io_latency_ms.value(),
+            publish_latency_ms: inner.publish_latency_ms.value(),
+            io_latency_fast_ms: inner.io_latency_fast_ms.value(),
+            publish_latency_fast_ms: inner.publish_latency_fast_ms.value(),
             data_storage: StorageClass::default(),
             metastore_storage: StorageClass::default(),
             // Filled by `CayenneContext::ingest_snapshot` from the per-table config
@@ -2542,17 +2554,46 @@ fn duration_ms(d: Duration) -> f64 {
     d.as_secs_f64() * 1000.0
 }
 
-fn ewma(slot: &mut f64, sample: f64, prior_samples: u64) {
-    ewma_with(slot, sample, prior_samples, EWMA_ALPHA);
+/// An exponentially-weighted moving average with first-sample seeding.
+///
+/// The first [`update`](Self::update) seeds the average to the sample exactly (no
+/// bias toward an initial zero); each later sample blends in at `alpha`
+/// (`next = alpha·sample + (1−alpha)·prev`). Encapsulating the smoothing — rather
+/// than scattering `alpha · x + (1−alpha) · slot` across the accounting struct —
+/// keeps the seeding/blending logic in one unit-tested place and lets each signal
+/// carry its own `alpha` (e.g. [`EWMA_ALPHA_FAST`] for the cliff detector).
+#[derive(Debug, Clone, Copy)]
+struct Ewma {
+    alpha: f64,
+    /// `None` until the first sample seeds it.
+    value: Option<f64>,
 }
 
-/// [`ewma`] with an explicit smoothing factor — used for the FAST I/O/publish
-/// latency estimate ([`EWMA_ALPHA_FAST`]) that powers the cliff detector.
-fn ewma_with(slot: &mut f64, sample: f64, prior_samples: u64, alpha: f64) {
-    if prior_samples == 0 {
-        *slot = sample;
-    } else {
-        *slot = alpha * sample + (1.0 - alpha) * *slot;
+impl Ewma {
+    /// An EWMA with the default smoothing ([`EWMA_ALPHA`]).
+    const fn new() -> Self {
+        Self::with_alpha(EWMA_ALPHA)
+    }
+
+    /// An EWMA with an explicit smoothing factor (e.g. [`EWMA_ALPHA_FAST`] for the
+    /// FAST I/O/publish latency estimate that powers the cliff detector).
+    const fn with_alpha(alpha: f64) -> Self {
+        Self { alpha, value: None }
+    }
+
+    /// Fold in a sample: the first seeds the average exactly, later samples blend
+    /// at `alpha`.
+    fn update(&mut self, sample: f64) {
+        self.value = Some(match self.value {
+            None => sample,
+            Some(prev) => self.alpha * sample + (1.0 - self.alpha) * prev,
+        });
+    }
+
+    /// The current average, or `None` before the first sample.
+    #[must_use]
+    fn value(&self) -> Option<f64> {
+        self.value
     }
 }
 
@@ -2786,6 +2827,42 @@ mod tests {
         clippy::cast_possible_wrap
     )]
     use super::*;
+
+    #[test]
+    fn ewma_seeds_first_sample_then_blends() {
+        let mut e = Ewma::with_alpha(0.5);
+        assert!(e.value().is_none(), "an unseeded average reads as None");
+        e.update(10.0);
+        assert!(
+            (e.value().unwrap() - 10.0).abs() < 1e-12,
+            "the first sample seeds the average exactly (no bias toward 0)"
+        );
+        e.update(20.0); // 0.5*20 + 0.5*10
+        assert!((e.value().unwrap() - 15.0).abs() < 1e-12);
+        e.update(20.0); // 0.5*20 + 0.5*15
+        assert!((e.value().unwrap() - 17.5).abs() < 1e-12);
+    }
+
+    #[test]
+    fn ewma_alpha_one_has_no_memory() {
+        let mut e = Ewma::with_alpha(1.0);
+        e.update(5.0);
+        e.update(99.0);
+        assert!(
+            (e.value().unwrap() - 99.0).abs() < 1e-12,
+            "alpha=1 tracks the latest sample"
+        );
+    }
+
+    #[test]
+    fn ewma_default_alpha_blends_with_history() {
+        let mut e = Ewma::new();
+        e.update(100.0);
+        e.update(0.0);
+        // alpha*0 + (1-alpha)*100, derived from the constant so the test tracks it.
+        let expected = (1.0 - EWMA_ALPHA) * 100.0;
+        assert!((e.value().unwrap() - expected).abs() < 1e-12);
+    }
 
     fn ms(n: u64) -> Duration {
         Duration::from_millis(n)
