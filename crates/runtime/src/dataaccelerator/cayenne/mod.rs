@@ -453,7 +453,9 @@ fn warn_if_low_disk_blocking(label: &str, path: &str) {
         path,
         available_mib = available / (1024 * 1024),
         total_mib = total / (1024 * 1024),
-        percent_free = available * 100 / total,
+        // saturating_mul so `available * 100` can't overflow u64 on a very large
+        // volume; a purely-informational percentage in a low-disk warning.
+        percent_free = available.saturating_mul(100) / total,
         "Cayenne {label} volume is low on free space. Under memory pressure the in-memory CDC tier spills here; if it fills, ingestion fails. Free space or point the acceleration at a larger volume."
     );
 }
