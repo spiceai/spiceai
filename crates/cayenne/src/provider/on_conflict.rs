@@ -527,17 +527,26 @@ impl OnConflictUpdate {
 /// concurrent changes is order-independent.
 pub(crate) struct Int64DeletionDelta {
     /// `(delete_sequence, pks)` groups folded via `extend_max_deletes`.
-    pub(crate) pure: Vec<(i64, Vec<i64>)>,
+    pub(crate) pure: Vec<Int64DeleteGroup>,
     /// `(delete_sequence, pks, insert_sequence)` groups folded via `extend_max_conflicts`.
-    pub(crate) reinsert: Vec<(i64, Vec<i64>, i64)>,
+    pub(crate) reinsert: Vec<Int64ReinsertGroup>,
 }
+
+/// One `extend_max_deletes` group: a delete sequence and the int64 PKs deleted at it.
+type Int64DeleteGroup = (i64, Vec<i64>);
+/// One `extend_max_conflicts` group: delete sequence, int64 PKs, and the re-insert sequence.
+type Int64ReinsertGroup = (i64, Vec<i64>, i64);
+/// Key-based counterpart of [`Int64DeleteGroup`].
+type RowKeyDeleteGroup = (i64, Vec<Box<[u8]>>);
+/// Key-based counterpart of [`Int64ReinsertGroup`].
+type RowKeyReinsertGroup = (i64, Vec<Box<[u8]>>, i64);
 
 /// Key-based counterpart to [`Int64DeletionDelta`].
 pub(crate) struct RowKeyDeletionDelta {
     /// `(delete_sequence, keys)` groups folded via `extend_max_deletes`.
-    pub(crate) pure: Vec<(i64, Vec<Box<[u8]>>)>,
+    pub(crate) pure: Vec<RowKeyDeleteGroup>,
     /// `(delete_sequence, keys, insert_sequence)` groups folded via `extend_max_conflicts`.
-    pub(crate) reinsert: Vec<(i64, Vec<Box<[u8]>>, i64)>,
+    pub(crate) reinsert: Vec<RowKeyReinsertGroup>,
 }
 
 pub(crate) enum OnConflictDeletionUpdate {

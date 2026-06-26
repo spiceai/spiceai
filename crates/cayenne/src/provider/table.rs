@@ -8237,7 +8237,7 @@ impl CayenneTableProvider {
         {
             self.publish_staged_key_deletion_cache(
                 &prepared.deleted_pk_i64,
-                prepared.deleted_row_keys,
+                &prepared.deleted_row_keys,
                 delete_sequence,
                 insert_sequence,
             )?;
@@ -8356,7 +8356,7 @@ impl CayenneTableProvider {
     fn publish_staged_key_deletion_cache(
         &self,
         deleted_pk_i64: &[i64],
-        deleted_row_keys: Vec<Box<[u8]>>,
+        deleted_row_keys: &[Box<[u8]>],
         delete_sequence: i64,
         insert_sequence: i64,
     ) -> CatalogResult<()> {
@@ -8649,7 +8649,7 @@ impl CayenneTableProvider {
 
                 OnConflictDeletionUpdate::Int64Pk(Int64DeletionDelta {
                     pure: Vec::new(),
-                    reinsert: vec![(delete_sequence, deleted_pk_i64.to_vec(), insert_sequence)],
+                    reinsert: vec![(delete_sequence, deleted_pk_i64.clone(), insert_sequence)],
                 })
             }
             PkDeletionStrategyWithCache::RowConverterBased { .. } => {
