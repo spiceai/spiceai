@@ -25,7 +25,7 @@ use uuid::Uuid;
 
 use super::mongodb_arrow_type_to_spicepod_str;
 
-/// Secret name under which the MongoDB connection string is stored on a Spice
+/// Secret name under which the `MongoDB` connection string is stored on a Spice
 /// Cloud app and referenced from the spicepod as
 /// `${secrets:MONGO_CONNECTION_STRING}`.
 pub(crate) const MONGO_CONNECTION_STRING_SECRET: &str = "MONGO_CONNECTION_STRING";

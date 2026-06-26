@@ -1955,6 +1955,7 @@ fn parse_and_rename_spicepod(yaml_str: &str, run_id: &Uuid) -> anyhow::Result<Sp
 ///
 /// `cayenne` is only used when `setup_config.storage` is `DirectIngest`.
 /// `scp` provides the scheduler state location and query memory limit.
+#[expect(clippy::too_many_arguments)]
 async fn generate_initial_spicepod(
     run_id: &Uuid,
     setup_config: &SetupConfig,
