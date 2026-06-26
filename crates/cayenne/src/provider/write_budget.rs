@@ -225,7 +225,11 @@ impl EncodeBudget {
         forget_or_owe(&self.semaphore, &self.pending_forget, current - max_permits);
         let gate_delta =
             maintenance_gate_cap(current).saturating_sub(maintenance_gate_cap(max_permits));
-        forget_or_owe(&self.maintenance_gate, &self.pending_gate_forget, gate_delta);
+        forget_or_owe(
+            &self.maintenance_gate,
+            &self.pending_gate_forget,
+            gate_delta,
+        );
         self.total.store(max_permits, Ordering::Release);
         Some(current)
     }
