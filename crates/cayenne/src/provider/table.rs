@@ -7330,13 +7330,16 @@ impl CayenneTableProvider {
             .await
             .map_err(|err| Error::Catalog { source: err })?;
 
-        // ATOMIC upgrade: replay the precomputed groups against the LIVE index under `rcu`
-        deletion_snapshot.rcu(|current| {
-            let mut updated = current.tombstones.as_ref().clone();
-            for (delete_seq, pks) in &by_delete_seq {
-                updated =
-                    updated.extend_max_conflicts(pks.iter().copied(), *delete_seq, flush_sequence);
-            }
+        // ATOMIC upgrade: replay the precomputed groups against the LIVE index
+        // under `rcu`, folding EVERY group in one pass (a single bloom rebuild)
+        // rather than one `extend_max_conflicts` per group.
+        deletion_snapshot.rcu(move |current| {
+            let updated = current.tombstones.extend_max(
+                std::iter::empty::<(i64, i64)>(),
+                by_delete_seq.iter().flat_map(|(delete_seq, pks)| {
+                    pks.iter().map(move |&pk| (pk, *delete_seq, flush_sequence))
+                }),
+            );
             Arc::new(Int64PkDeletionSnapshot::from_index(updated))
         });
         self.refresh_deletion_memory_accounting();
@@ -8847,18 +8850,19 @@ impl CayenneTableProvider {
                 } = &self.pk_deletion_strategy
                 {
                     deletion_snapshot.rcu(|current| {
-                        let mut updated = current.tombstones.as_ref().clone();
-                        for (delete_seq, pks) in &delta.pure {
-                            updated = updated
-                                .extend_max_deletes(pks.iter().map(|&pk| (pk, *delete_seq)));
-                        }
-                        for (delete_seq, pks, insert_seq) in &delta.reinsert {
-                            updated = updated.extend_max_conflicts(
-                                pks.iter().copied(),
-                                *delete_seq,
-                                *insert_seq,
-                            );
-                        }
+                        // Fold the pure-delete and reinsert groups in ONE pass
+                        // (single bloom rebuild) instead of one `extend_max_*`
+                        // call per group — see `DeletionIndex::extend_max`.
+                        let updated = current.tombstones.extend_max(
+                            delta.pure.iter().flat_map(|(delete_seq, pks)| {
+                                pks.iter().map(move |&pk| (pk, *delete_seq))
+                            }),
+                            delta.reinsert.iter().flat_map(
+                                |(delete_seq, pks, insert_seq)| {
+                                    pks.iter().map(move |&pk| (pk, *delete_seq, *insert_seq))
+                                },
+                            ),
+                        );
                         Arc::new(Int64PkDeletionSnapshot::from_index(updated))
                     });
                 }
@@ -8870,18 +8874,19 @@ impl CayenneTableProvider {
                 } = &self.pk_deletion_strategy
                 {
                     deletion_snapshot.rcu(|current| {
-                        let mut updated = current.tombstones.as_ref().clone();
-                        for (delete_seq, keys) in &delta.pure {
-                            updated = updated
-                                .extend_max_deletes(keys.iter().map(|k| (k, *delete_seq)));
-                        }
-                        for (delete_seq, keys, insert_seq) in &delta.reinsert {
-                            updated = updated.extend_max_conflicts(
-                                keys.iter(),
-                                *delete_seq,
-                                *insert_seq,
-                            );
-                        }
+                        // One-pass fold (single bloom rebuild) over both groups;
+                        // see `KeyDeletionIndex::extend_max`.
+                        let updated = current.tombstones.extend_max(
+                            delta.pure.iter().flat_map(|(delete_seq, keys)| {
+                                keys.iter().map(move |k| (&**k, *delete_seq))
+                            }),
+                            delta.reinsert.iter().flat_map(
+                                |(delete_seq, keys, insert_seq)| {
+                                    keys.iter()
+                                        .map(move |k| (&**k, *delete_seq, *insert_seq))
+                                },
+                            ),
+                        );
                         Arc::new(RowConverterDeletionSnapshot::from_index(updated))
                     });
                 }
