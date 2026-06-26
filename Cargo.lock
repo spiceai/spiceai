@@ -3206,7 +3206,7 @@ dependencies = [
  "fundu",
  "futures",
  "moka",
- "opentelemetry",
+ "opentelemetry 0.31.0",
  "parking_lot 0.12.5",
  "pingora-lru",
  "rand 0.10.1",
@@ -4093,7 +4093,7 @@ dependencies = [
  "datafusion",
  "futures",
  "linkme",
- "opentelemetry",
+ "opentelemetry 0.31.0",
  "paste",
  "runtime",
  "runtime-rate-control",
@@ -4284,7 +4284,7 @@ dependencies = [
  "datafusion-table-providers",
  "linkme",
  "mysql_async",
- "opentelemetry",
+ "opentelemetry 0.31.0",
  "paste",
  "runtime",
  "secrecy",
@@ -4346,7 +4346,7 @@ dependencies = [
  "datafusion-table-providers",
  "fundu",
  "futures",
- "opentelemetry",
+ "opentelemetry 0.31.0",
  "runtime",
  "secrecy",
  "snafu",
@@ -13211,6 +13211,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "opentelemetry"
+version = "0.32.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b0142c63252a9e054e68a4c61a5778f7b14f576274d593f8ce883d191a099682"
+dependencies = [
+ "futures-core",
+ "futures-sink",
+ "js-sys",
+ "pin-project-lite",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "opentelemetry-http"
 version = "0.31.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -13219,7 +13232,7 @@ dependencies = [
  "async-trait",
  "bytes",
  "http 1.4.1",
- "opentelemetry",
+ "opentelemetry 0.31.0",
  "reqwest 0.12.24",
 ]
 
@@ -13230,10 +13243,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1f69cd6acbb9af919df949cd1ec9e5e7fdc2ef15d234b6b795aaa525cc02f71f"
 dependencies = [
  "http 1.4.1",
- "opentelemetry",
+ "opentelemetry 0.31.0",
  "opentelemetry-http",
  "opentelemetry-proto",
- "opentelemetry_sdk",
+ "opentelemetry_sdk 0.31.0",
  "prost 0.14.3",
  "reqwest 0.12.24",
  "thiserror 2.0.18",
@@ -13248,8 +13261,8 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "14095eb06b569eb5d538fa4555969f7e8a410ed7910c903bfd295f9e1a50d7ea"
 dependencies = [
  "once_cell",
- "opentelemetry",
- "opentelemetry_sdk",
+ "opentelemetry 0.31.0",
+ "opentelemetry_sdk 0.31.0",
  "prometheus",
 ]
 
@@ -13259,8 +13272,8 @@ version = "0.31.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a7175df06de5eaee9909d4805a3d07e28bb752c34cab57fa9cff549da596b30f"
 dependencies = [
- "opentelemetry",
- "opentelemetry_sdk",
+ "opentelemetry 0.31.0",
+ "opentelemetry_sdk 0.31.0",
  "prost 0.14.3",
  "tonic",
  "tonic-prost",
@@ -13274,9 +13287,9 @@ checksum = "f27fcd074586dab55936b003c6a499acaabd6debbd539c3f36356bca2ef2fce2"
 dependencies = [
  "http 1.4.1",
  "once_cell",
- "opentelemetry",
+ "opentelemetry 0.31.0",
  "opentelemetry-http",
- "opentelemetry_sdk",
+ "opentelemetry_sdk 0.31.0",
  "reqwest 0.12.24",
  "serde",
  "serde_json",
@@ -13293,8 +13306,24 @@ dependencies = [
  "futures-channel",
  "futures-executor",
  "futures-util",
- "opentelemetry",
+ "opentelemetry 0.31.0",
  "percent-encoding",
+ "rand 0.9.4",
+ "thiserror 2.0.18",
+]
+
+[[package]]
+name = "opentelemetry_sdk"
+version = "0.32.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9b59f80e1ac4d5ff7a2db8fb6c80badb7f0f3f858211fba08dd9aaec750894f9"
+dependencies = [
+ "futures-channel",
+ "futures-executor",
+ "futures-util",
+ "opentelemetry 0.32.0",
+ "percent-encoding",
+ "portable-atomic",
  "rand 0.9.4",
  "thiserror 2.0.18",
  "tokio",
@@ -13388,8 +13417,8 @@ dependencies = [
  "arrow",
  "arrow-buffer",
  "async-trait",
- "opentelemetry",
- "opentelemetry_sdk",
+ "opentelemetry 0.31.0",
+ "opentelemetry_sdk 0.32.1",
  "tracing",
 ]
 
@@ -16144,11 +16173,11 @@ dependencies = [
  "object_store",
  "object_store_occ",
  "opendal 0.55.0",
- "opentelemetry",
+ "opentelemetry 0.31.0",
  "opentelemetry-otlp",
  "opentelemetry-prometheus",
  "opentelemetry-proto",
- "opentelemetry_sdk",
+ "opentelemetry_sdk 0.32.1",
  "otel-arrow",
  "package",
  "parking_lot 0.12.5",
@@ -16262,7 +16291,7 @@ dependencies = [
  "futures",
  "hex",
  "object_store",
- "opentelemetry",
+ "opentelemetry 0.31.0",
  "runtime-object-store",
  "runtime-parameters",
  "runtime-secrets",
@@ -16346,7 +16375,7 @@ dependencies = [
  "futures",
  "object_store",
  "object_store_occ",
- "opentelemetry",
+ "opentelemetry 0.31.0",
  "parking_lot 0.12.5",
  "prost 0.14.3",
  "runtime-datafusion",
@@ -16389,7 +16418,7 @@ dependencies = [
  "insta",
  "itertools 0.14.0",
  "object_store",
- "opentelemetry",
+ "opentelemetry 0.31.0",
  "parking_lot 0.12.5",
  "runtime-datafusion-index",
  "runtime-datafusion-udfs",
@@ -16443,7 +16472,7 @@ dependencies = [
  "half",
  "insta",
  "llms",
- "opentelemetry",
+ "opentelemetry 0.31.0",
  "reqwest 0.12.24",
  "runtime-auth",
  "runtime-rate-control",
@@ -16565,7 +16594,7 @@ dependencies = [
  "futures",
  "headers",
  "http 1.4.1",
- "opentelemetry",
+ "opentelemetry 0.31.0",
  "percent-encoding",
  "regex",
  "runtime-auth",
@@ -18264,7 +18293,7 @@ dependencies = [
  "keyring",
  "nix 0.29.0",
  "open",
- "opentelemetry",
+ "opentelemetry 0.31.0",
  "pem",
  "predicates",
  "rand 0.10.1",
@@ -18383,11 +18412,11 @@ dependencies = [
  "event_stream",
  "futures",
  "mimalloc",
- "opentelemetry",
+ "opentelemetry 0.31.0",
  "opentelemetry-http",
  "opentelemetry-prometheus",
  "opentelemetry-zipkin",
- "opentelemetry_sdk",
+ "opentelemetry_sdk 0.32.1",
  "otel-arrow",
  "prometheus",
  "repl",
@@ -19349,8 +19378,8 @@ dependencies = [
  "flight_client",
  "futures",
  "hostname 0.4.2",
- "opentelemetry",
- "opentelemetry_sdk",
+ "opentelemetry 0.31.0",
+ "opentelemetry_sdk 0.32.1",
  "otel-arrow",
  "pin-project",
  "sha2 0.10.9",
@@ -19473,9 +19502,9 @@ dependencies = [
  "nix 0.30.1",
  "object_store",
  "octocrab",
- "opentelemetry",
+ "opentelemetry 0.31.0",
  "opentelemetry-otlp",
- "opentelemetry_sdk",
+ "opentelemetry_sdk 0.32.1",
  "otel-arrow",
  "rand 0.10.1",
  "rcgen",
@@ -20490,7 +20519,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1ac28f2d093c6c477eaa76b23525478f38de514fa9aeb1285738d4b97a9552fc"
 dependencies = [
  "js-sys",
- "opentelemetry",
+ "opentelemetry 0.31.0",
  "smallvec 1.15.1",
  "tracing",
  "tracing-core",
@@ -21731,7 +21760,7 @@ dependencies = [
  "itertools 0.14.0",
  "moka",
  "object_store",
- "opentelemetry",
+ "opentelemetry 0.31.0",
  "rstest 0.26.1",
  "tempfile",
  "tokio",
