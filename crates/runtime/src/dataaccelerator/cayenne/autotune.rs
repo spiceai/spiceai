@@ -855,10 +855,12 @@ mod tests {
         assert_eq!(hw.ebs_upload_concurrency_cap(), Some(4));
 
         // An IMDS EBS baseline (burst-prone small instance) sets the ceiling even
-        // without a probe measurement: 625 MiB/s / 90 (fallback per-stream) ≈ 7.
+        // without a probe measurement: 625 MiB/s / 90 (fallback per-stream) = 6.9,
+        // floored to 6 (a cap must never round UP past the bandwidth ceiling — 7
+        // streams would demand 630 MiB/s > 625).
         let mut hw = profile(16, 64 * GIB, ResolvedAccelerationStorage::Unknown);
         hw.ebs_baseline_mbps = Some(625.0);
-        assert_eq!(hw.ebs_upload_concurrency_cap(), Some(7));
+        assert_eq!(hw.ebs_upload_concurrency_cap(), Some(6));
     }
 
     // ---- inline_flush_caps (relocated from mod.rs) ------------------------
