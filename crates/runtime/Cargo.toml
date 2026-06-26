@@ -122,7 +122,7 @@ postcard.workspace = true
 prometheus.workspace = true
 prost.workspace = true
 rand.workspace = true
-rayon = "1.11.0"
+rayon = { workspace = true }
 regex.workspace = true
 reqwest.workspace = true
 rmcp = { workspace = true, optional = true, features = [
@@ -139,6 +139,9 @@ runtime-async = { path = "../runtime-async" }
 runtime-auth = { path = "../runtime-auth" }
 runtime-cluster = { path = "../runtime-cluster" }
 runtime-datafusion = { path = "../runtime-datafusion" }
+runtime-query-engine = { path = "../runtime-query-engine" }
+runtime-search = { path = "../runtime-search" }
+runtime-tools = { path = "../runtime-tools" }
 runtime-datafusion-index = { path = "../runtime-datafusion-index" }
 runtime-datafusion-udfs = { path = "../runtime-datafusion-udfs" }
 runtime-object-store = { path = "../runtime-object-store" }
@@ -192,7 +195,7 @@ turso-shared = { workspace = true }
 twox-hash.workspace = true
 url.workspace = true
 util = { path = "../util", features = ["datafusion", "http"] }
-utoipa = { version = "5", features = ["axum_extras"], optional = true }
+utoipa = { workspace = true, features = ["axum_extras"], optional = true }
 utoipa-swagger-ui = { version = "9", features = [
     "axum",
     "vendored",
@@ -289,6 +292,7 @@ elasticsearch = [
     "dep:elasticsearch",
     "dep:duration-parse",
     "search/elasticsearch",
+    "runtime-search/elasticsearch",
 ]
 duckdb = [
     "dep:duckdb",
@@ -297,6 +301,7 @@ duckdb = [
     "datafusion-optimizer-rules/duckdb",
     "runtime-acceleration/duckdb",
     "search/duckdb",
+    "runtime-search/duckdb",
 ]
 dynamodb = [
     "dep:aws-sdk-dynamodb",
@@ -315,7 +320,7 @@ iceberg-write = []
 imap = ["data_components/imap"]
 kafka = ["data_components/kafka"]
 keyring-secret-store = ["runtime-secrets/keyring-secret-store"]
-mcp = ["dep:rmcp", "tools/mcp"]
+mcp = ["dep:rmcp", "runtime-tools/mcp", "tools/mcp"]
 metal = ["llms/metal"]
 distributed = ["llms/distributed", "models"]
 models = [
@@ -337,6 +342,8 @@ openapi = [
     "dep:utoipa",
     "mcp",
     "runtime-api-types/openapi",
+    "runtime-search/openapi",
+    "runtime-tools/openapi",
 ]
 oracle = ["data_components/oracle"]
 pingora = ["cache/pingora"]

@@ -256,7 +256,16 @@ fn http_base_url_from_endpoints(
 )]
 fn derive_http_base_url(flight_url: &str) -> Option<String> {
     if flight_url.contains("flight.spiceai.io") {
-        return Some("https://data.spiceai.io".to_string());
+        // Spice Cloud serves Flight (gRPC) on a `*-flight.spiceai.io` host and HTTP
+        // on the matching `*-data.spiceai.io` host. Region-specific cnames (e.g.
+        // `us-west-2-prod-aws-flight.spiceai.io`) must map to the SAME region's data
+        // host, so substitute the `flight` label rather than returning a hardcoded
+        // generic `data.spiceai.io` (which does not route to a region-cname app).
+        return Some(
+            flight_url
+                .trim_end_matches('/')
+                .replace("flight.spiceai.io", "data.spiceai.io"),
+        );
     }
 
     let http_flight_url = flight_url
@@ -321,6 +330,22 @@ mod tests {
         assert_eq!(
             derive_http_base_url("localhost:50051"),
             Some("localhost:50051:8090".to_string())
+        );
+    }
+
+    #[test]
+    fn derive_http_base_url_maps_generic_spiceai_flight_to_data() {
+        assert_eq!(
+            derive_http_base_url("https://flight.spiceai.io"),
+            Some("https://data.spiceai.io".to_string())
+        );
+    }
+
+    #[test]
+    fn derive_http_base_url_maps_regional_spiceai_flight_to_data() {
+        assert_eq!(
+            derive_http_base_url("https://us-west-2-prod-aws-flight.spiceai.io"),
+            Some("https://us-west-2-prod-aws-data.spiceai.io".to_string())
         );
     }
 }

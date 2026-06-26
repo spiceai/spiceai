@@ -36,7 +36,7 @@ use cache::Caching;
 #[cfg(not(windows))]
 use cayenne::optimizer_rules::{
     CayenneAntiJoinSortMergeRewriter, CayenneDynamicFilterSharing, CayenneJoinRewriter,
-    CayenneMaintainedAggregateRewriter, CayenneOptimizerConfig,
+    CayenneMaintainedAggregateRewriter, CayenneOptimizerConfig, CayenneStatsAggregateRewriter,
 };
 #[cfg(not(windows))]
 use cayenne::{
@@ -55,7 +55,7 @@ use datafusion::optimizer::{Optimizer, OptimizerRule};
 use datafusion::{
     catalog::{CatalogProvider, MemoryCatalogProvider},
     execution::{
-        DiskManager, SessionStateBuilder,
+        DiskManager, FunctionRegistry, SessionStateBuilder,
         disk_manager::DiskManagerMode,
         memory_pool::{GreedyMemoryPool, TrackConsumersPool},
         object_store::ObjectStoreRegistry,
@@ -175,12 +175,14 @@ impl CayennePhysicalOptimizerRules {
     const MAINTAINED_AGGREGATE: u8 = 1 << 1;
     const ANTI_JOIN_SORT_MERGE: u8 = 1 << 2;
     const EXACT_JOIN_FILTER: u8 = 1 << 3;
+    const STATS_AGGREGATE: u8 = 1 << 4;
 
     const fn auto_enabled() -> Self {
         Self {
             enabled_rules: Self::DYNAMIC_FILTER_SHARING
                 | Self::MAINTAINED_AGGREGATE
-                | Self::ANTI_JOIN_SORT_MERGE,
+                | Self::ANTI_JOIN_SORT_MERGE
+                | Self::STATS_AGGREGATE,
         }
     }
 
@@ -189,7 +191,8 @@ impl CayennePhysicalOptimizerRules {
             enabled_rules: Self::DYNAMIC_FILTER_SHARING
                 | Self::MAINTAINED_AGGREGATE
                 | Self::ANTI_JOIN_SORT_MERGE
-                | Self::EXACT_JOIN_FILTER,
+                | Self::EXACT_JOIN_FILTER
+                | Self::STATS_AGGREGATE,
         }
     }
 
@@ -320,6 +323,17 @@ impl CayenneOptimizerRules {
     pub fn set_maintained_aggregate(&mut self, enabled: bool) {
         self.physical
             .set(CayennePhysicalOptimizerRules::MAINTAINED_AGGREGATE, enabled);
+    }
+
+    #[must_use]
+    pub const fn stats_aggregate(self) -> bool {
+        self.physical
+            .is_enabled(CayennePhysicalOptimizerRules::STATS_AGGREGATE)
+    }
+
+    pub fn set_stats_aggregate(&mut self, enabled: bool) {
+        self.physical
+            .set(CayennePhysicalOptimizerRules::STATS_AGGREGATE, enabled);
     }
 
     #[must_use]
@@ -635,14 +649,20 @@ impl DataFusionBuilder {
     #[must_use]
     pub fn build(self) -> DataFusion {
         let mut config = self.config;
-        let effective_memory_limit = effective_query_memory_limit(self.memory_limit);
         // Request a dedicated compaction memory budget when a fraction is
-        // configured (Cayenne acceleration + dedicated thread pools). The query
-        // pool is only shrunk after the dedicated compaction RuntimeEnv builds
-        // successfully; otherwise queries keep the full configured budget.
+        // configured (Cayenne acceleration + dedicated thread pools). Its presence
+        // is also the "Cayenne in-memory acceleration active" signal that gates the
+        // coordinated host-memory partition below: a reduced query-pool default
+        // that leaves room for the off-pool Cayenne in-memory CDC tier so
+        // query_pool + compaction + tier + headroom ≤ host. The query pool is only
+        // shrunk by the compaction carve after the dedicated compaction RuntimeEnv
+        // builds successfully; otherwise queries keep the full configured budget.
         let compaction_memory_fraction = self
             .compaction_memory_fraction
             .and_then(validate_compaction_memory_fraction);
+        let cayenne_active = compaction_memory_fraction.is_some();
+        let effective_memory_limit =
+            effective_query_memory_limit(self.memory_limit, cayenne_active);
         let compaction_memory_bytes = compaction_memory_fraction.map(|fraction| {
             #[expect(
                 clippy::cast_precision_loss,
@@ -675,6 +695,43 @@ impl DataFusionBuilder {
                 },
                 None => (effective_memory_limit, None, None),
             };
+
+        // After the compaction carve, `effective_memory_limit` is the query memory
+        // pool size. Coordinate the off-pool Cayenne in-memory CDC tier budget
+        // against it (and the carved compaction pool) so the three never sum past
+        // host RAM. `set_compaction_runtime` installs `mem_tier_budget_bytes`
+        // instead of the old, isolation-sized `get_total_memory() / 4`.
+        let query_memory_pool_bytes = effective_memory_limit;
+        let mem_tier_budget_bytes = cayenne_active.then(|| {
+            let total_memory = crate::resource_monitor::get_total_memory();
+            let budget = coordinated_mem_tier_budget(
+                total_memory,
+                query_memory_pool_bytes,
+                compaction_memory_bytes.unwrap_or(0),
+            );
+            if self.memory_limit.is_some() && budget <= total_memory / MEM_TIER_FLOOR_FRACTION {
+                tracing::warn!(
+                    query_memory_pool_bytes,
+                    total_memory,
+                    mem_tier_budget_bytes = budget,
+                    "Cayenne in-memory CDC ingestion has limited memory on this host because runtime.query.memory_limit reserves most of it for queries, so ingestion will spill to disk more often. Consider lowering runtime.query.memory_limit to give in-memory CDC more room."
+                );
+            }
+            budget
+        });
+
+        // Cayenne HTAP runs large analytical queries (sorts, hash aggregations,
+        // sort-merge joins) that spill to disk via the DiskManager. Its default is
+        // the OS temp directory; on hosts that mount the data on a separate volume
+        // (e.g. EBS at /media/ebs) the root volume backing OS-tmp is often too
+        // small, so a spill fails and the query exhausts the memory pool
+        // (ResourceExhausted) instead of spilling — the SF1000 Q10/Q18 symptom.
+        // Guide operators to point spill at a roomy volume.
+        if cayenne_active && self.temp_directory.is_none() {
+            tracing::info!(
+                "Cayenne acceleration is active but runtime.query.temp_directory is unset: large analytical queries spill to the OS temp directory. If your data is on a separate volume (e.g. EBS) and the root volume is small, set runtime.query.temp_directory to a path with ample free space so large queries can spill instead of failing."
+            );
+        }
 
         if let Some(spill_compression) = self.spill_compression {
             config = config.with_spill_compression(spill_compression);
@@ -799,6 +856,10 @@ impl DataFusionBuilder {
                     CayenneMaintainedAggregateRewriter::new(),
                 ));
             }
+            if self.cayenne_optimizer_rules.stats_aggregate() {
+                state = state
+                    .with_physical_optimizer_rule(Arc::new(CayenneStatsAggregateRewriter::new()));
+            }
             if self.cayenne_optimizer_rules.anti_join_sort_merge() {
                 state = state.with_physical_optimizer_rule(Arc::new(
                     CayenneAntiJoinSortMergeRewriter::new(),
@@ -856,8 +917,40 @@ impl DataFusionBuilder {
             panic!("Unable to register JSON functions: {e}");
         }
 
-        if let Err(e) = datafusion_spark::register_all(&mut state) {
-            panic!("Unable to register Spark functions: {e}");
+        // Register Spark-compatible functions, but skip Spark's `trunc` (scalar) and
+        // `avg` (aggregate): `register_all` would register them *over* the built-ins
+        // of the same name. Spark `trunc` is date-truncation and shadows numeric
+        // `trunc(<float>, <int>)` (see spiceai/spiceai#11415). Spark `avg` uses a different
+        // partial-aggregate state layout (`[sum, count:Int64]`) than the built-in
+        // (`[count:UInt64, sum]`); harmless single-node, but it corrupts DISTRIBUTED
+        // plans — the scheduler bakes the shuffle/stage schema from Spark `avg`'s
+        // `state_fields` while executors run the built-in `avg`, so the coalescing
+        // shuffle reader downcasts the wrong primitive type and panics ("primitive
+        // array"). Keep the built-ins; register every other Spark function (mirrors
+        // `datafusion_spark::register_all`).
+        for udf in datafusion_spark::all_default_scalar_functions() {
+            if udf.name() == "trunc" {
+                continue;
+            }
+            let name = udf.name().to_string();
+            if let Err(e) = state.register_udf(udf) {
+                panic!("Unable to register Spark scalar function `{name}`: {e}");
+            }
+        }
+        for udaf in datafusion_spark::all_default_aggregate_functions() {
+            if udaf.name() == "avg" {
+                continue;
+            }
+            let name = udaf.name().to_string();
+            if let Err(e) = state.register_udaf(udaf) {
+                panic!("Unable to register Spark aggregate function `{name}`: {e}");
+            }
+        }
+        for udwf in datafusion_spark::all_default_window_functions() {
+            let name = udwf.name().to_string();
+            if let Err(e) = state.register_udwf(udwf) {
+                panic!("Unable to register Spark window function `{name}`: {e}");
+            }
         }
 
         let catalog = MemoryCatalogProvider::new();
@@ -1027,6 +1120,8 @@ impl DataFusionBuilder {
             compaction_runtime: OnceLock::new(),
             compaction_runtime_env,
             compaction_memory_bytes,
+            query_memory_pool_bytes,
+            mem_tier_budget_bytes,
             io_runtime: self.io_runtime,
             metrics: self.metrics,
             resource_monitor: self.resource_monitor,
@@ -1303,18 +1398,87 @@ impl Default for AnalyzerRulesBuilder {
     }
 }
 
-fn effective_query_memory_limit(memory_limit: Option<u64>) -> u64 {
+/// Default fraction of host/container RAM for the query memory pool (before the
+/// compaction carve) when the operator sets no explicit `runtime.query.memory_limit`.
+const DEFAULT_QUERY_MEMORY_PERCENT: u64 = 90;
+
+/// Reduced default used when Cayenne in-memory acceleration is active. The query
+/// pool, the carved compaction pool, AND the off-pool Cayenne in-memory CDC tier
+/// (`cdc_durability: memory`) are each derived from total RAM; sized in isolation
+/// they sum to >100% of host — the SF1000 process-OOM (RSS 242 GiB on a 256 GiB
+/// box, the query pool never reporting exhaustion because the tier is off-pool).
+/// Capping the query+compaction block at 75% reserves the remaining 25% for the
+/// tier (~12.5%) plus caches / inline memtables / encode buffers / OS headroom
+/// (~12.5%). See [`coordinated_mem_tier_budget`].
+const CAYENNE_QUERY_MEMORY_PERCENT: u64 = 75;
+
+fn effective_query_memory_limit(memory_limit: Option<u64>, cayenne_active: bool) -> u64 {
     memory_limit.unwrap_or_else(|| {
         let total_memory = crate::resource_monitor::get_total_memory();
-        let default_limit = total_memory.saturating_mul(90) / 100;
+        let percent = if cayenne_active {
+            CAYENNE_QUERY_MEMORY_PERCENT
+        } else {
+            DEFAULT_QUERY_MEMORY_PERCENT
+        };
+        let default_limit = total_memory.saturating_mul(percent) / 100;
 
         tracing::debug!(
-            "No memory limit specified, defaulting to 90% of total memory: {}",
+            cayenne_active,
+            "No query memory limit specified, defaulting to {percent}% of total memory: {}",
             util::human_readable_bytes(default_limit as usize)
         );
 
         default_limit
     })
+}
+
+/// 1/N of host RAM bounding the aggregate off-pool Cayenne in-memory CDC tier (the
+/// ceiling), and the headroom reserve held beyond the pools+tier for caches,
+/// inline memtables, encode buffers, and OS/allocator overhead. Both 1/8 ⇒ with
+/// the 75% query+compaction block the host partitions as 75% / 12.5% / 12.5%.
+const MEM_TIER_CEILING_FRACTION: u64 = 8;
+const MEM_TIER_HEADROOM_FRACTION: u64 = 8;
+/// Floor (1/N of host) so a global aggregate cap is ALWAYS installed — a tier
+/// budget of 0 disables the global cap entirely (per-table caps then sum unbounded
+/// across a fleet: the original no-global-cap OOM). Binds only when an operator
+/// pins an explicit, greedy `runtime.query.memory_limit` that leaves no
+/// coordinated room; memory mode then leans on the per-table caps + spill/durable
+/// backstops, and the caller warns.
+pub(crate) const MEM_TIER_FLOOR_FRACTION: u64 = 32;
+
+/// Coordinated aggregate byte budget for the off-pool Cayenne in-memory CDC tier.
+///
+/// The query pool, carved compaction pool, and this tier are otherwise each
+/// derived from total RAM IN ISOLATION (`builder.rs` query pool, compaction carve,
+/// and `mod.rs` `get_total_memory()/4`) and sum to >100% of host. Sizing the tier
+/// as the host RAM left AFTER the query pool, the compaction pool, and a headroom
+/// reserve is the missing cross-subsystem coordination. For the coordinated
+/// default inputs — a query pool sized to leave room (see
+/// [`effective_query_memory_limit`]) — it yields
+/// `query_pool + compaction + tier + headroom ≤ host`. The result is clamped to
+/// `[host/32, host/8]`: the `host/8` ceiling keeps the tier ≤ 1/8 of host when the
+/// pools are small, and the `host/32` floor guarantees a nonzero global aggregate
+/// cap is ALWAYS installed (a 0 budget would disable the cap — the original
+/// no-global-cap OOM).
+///
+/// PRECONDITION: the `≤ host` guarantee holds only while the inputs leave at least
+/// `floor + headroom` of room. An oversized explicit `runtime.query.memory_limit`
+/// makes the `host/32` floor win over the strict budget; the caller
+/// ([`DataFusionBuilder::build`]) detects that and warns, and memory mode then
+/// leans on the per-table caps + spill/durable backstops.
+pub(crate) fn coordinated_mem_tier_budget(
+    total_memory: u64,
+    query_pool_bytes: u64,
+    compaction_pool_bytes: u64,
+) -> u64 {
+    let headroom = total_memory / MEM_TIER_HEADROOM_FRACTION;
+    let ceiling = total_memory / MEM_TIER_CEILING_FRACTION;
+    let floor = (total_memory / MEM_TIER_FLOOR_FRACTION).min(ceiling);
+    let remainder = total_memory
+        .saturating_sub(query_pool_bytes)
+        .saturating_sub(compaction_pool_bytes)
+        .saturating_sub(headroom);
+    remainder.clamp(floor, ceiling)
 }
 
 #[cfg(not(windows))]
@@ -1538,8 +1702,11 @@ mod tests {
     use datafusion_expr::{Expr, LogicalPlan};
 
     use super::{
-        CayenneOptimizerRules, DataFusionBuilder, build_compaction_runtime_env,
-        configure_hash_join_memory_limits,
+        CAYENNE_QUERY_MEMORY_PERCENT, CayenneOptimizerRules, DEFAULT_QUERY_MEMORY_PERCENT,
+        DataFusionBuilder, MEM_TIER_CEILING_FRACTION, MEM_TIER_FLOOR_FRACTION,
+        MEM_TIER_HEADROOM_FRACTION, build_compaction_runtime_env,
+        configure_hash_join_memory_limits, coordinated_mem_tier_budget,
+        effective_query_memory_limit,
         runtime_env_with_effective_memory_limit_and_object_store_registry,
         validate_compaction_memory_fraction,
     };
@@ -1551,6 +1718,86 @@ mod tests {
     #[cfg(not(windows))]
     use std::collections::HashMap;
     use std::sync::Arc;
+
+    /// An explicit `runtime.query.memory_limit` is honored verbatim regardless of
+    /// whether Cayenne is active — the coordinated default only applies when unset.
+    #[test]
+    fn effective_query_memory_limit_honors_explicit_value() {
+        assert_eq!(
+            effective_query_memory_limit(Some(123 << 30), true),
+            123 << 30
+        );
+        assert_eq!(
+            effective_query_memory_limit(Some(123 << 30), false),
+            123 << 30
+        );
+        assert_eq!(effective_query_memory_limit(Some(7), true), 7);
+    }
+
+    // Compile-time invariants on the host-partition constants: the Cayenne
+    // query-pool default must be below the non-Cayenne default, and the partition
+    // (75% query+compaction, one-eighth tier ceiling, one-eighth headroom) sums to
+    // 100% of host. `const` assertions (compile-time) rather than a runtime test
+    // asserting constant values (which clippy flags as assertions_on_constants).
+    const _: () = assert!(CAYENNE_QUERY_MEMORY_PERCENT < DEFAULT_QUERY_MEMORY_PERCENT);
+    const _: () = assert!(CAYENNE_QUERY_MEMORY_PERCENT == 75);
+    const _: () = assert!(MEM_TIER_CEILING_FRACTION == 8); // one-eighth = 12.5%
+    const _: () = assert!(MEM_TIER_HEADROOM_FRACTION == 8); // one-eighth = 12.5%
+
+    /// THE invariant: for the coordinated default partition (Cayenne active, no
+    /// explicit limit), `query_pool + compaction + mem_tier + headroom` never
+    /// exceeds host RAM — across a wide range of host sizes and compaction
+    /// fractions. This is the cross-subsystem coordination that prevents the
+    /// SF1000 process OOM (the three budgets summed to 115% of host before).
+    #[test]
+    fn coordinated_partition_never_overcommits_host() {
+        // Mirrors the memory math in `DataFusionBuilder::build` for the default
+        // (unset `memory_limit`) path so the asserted invariant tracks the build.
+        let totals_gib: [u64; 7] = [8, 16, 32, 64, 128, 256, 1024];
+        let compaction_percents: [u64; 5] = [5, 10, 20, 30, 50];
+        for gib in totals_gib {
+            let total = gib << 30;
+            for compaction_pct in compaction_percents {
+                let pre_carve = total.saturating_mul(CAYENNE_QUERY_MEMORY_PERCENT) / 100;
+                let compaction = pre_carve.saturating_mul(compaction_pct) / 100;
+                let query_pool = pre_carve.saturating_sub(compaction);
+                let tier = coordinated_mem_tier_budget(total, query_pool, compaction);
+                let headroom = total / MEM_TIER_HEADROOM_FRACTION;
+                let sum = query_pool + compaction + tier + headroom;
+                assert!(
+                    sum <= total,
+                    "overcommit at {gib} GiB host, compaction {compaction_pct}%: query={query_pool} compaction={compaction} tier={tier} headroom={headroom} sum={sum} > total={total}"
+                );
+            }
+        }
+    }
+
+    /// The tier budget is always clamped to `[host/32, host/8]`: never 0 (a 0
+    /// budget disables the global aggregate cap, the original no-global-cap OOM)
+    /// and never more than 1/8 of host even when the pools are tiny.
+    #[test]
+    fn coordinated_tier_budget_stays_within_clamp() {
+        for gib in [16_u64, 64, 256, 1024] {
+            let total = gib << 30;
+            let floor = (total / MEM_TIER_FLOOR_FRACTION).min(total / MEM_TIER_CEILING_FRACTION);
+            let ceiling = total / MEM_TIER_CEILING_FRACTION;
+
+            // Tiny pools → tier grows to the ceiling (uses spare RAM), never above.
+            let big = coordinated_mem_tier_budget(total, total / 100, 0);
+            assert_eq!(
+                big, ceiling,
+                "small pools should grow the tier to the ceiling"
+            );
+
+            // A greedy pool that consumes all of host → tier floored, never 0.
+            let small = coordinated_mem_tier_budget(total, total, 0);
+            assert_eq!(
+                small, floor,
+                "a greedy pool floors the tier (still a nonzero cap)"
+            );
+            assert!(small > 0, "the global aggregate cap must never be disabled");
+        }
+    }
 
     /// Verifies that the default analyzer rules are in the expected order.
     ///
@@ -1848,9 +2095,10 @@ mod tests {
             vec![
                 "CayenneDynamicFilterSharing",
                 "CayenneMaintainedAggregateRewriter",
+                "CayenneStatsAggregateRewriter",
                 "CayenneAntiJoinSortMergeRewriter",
             ],
-            "Default Cayenne physical optimizer selection should preserve prior safe defaults without re-enabling the exact join filter"
+            "Default Cayenne physical optimizer selection should preserve prior safe defaults (now including the metadata-only stats aggregate fold) without re-enabling the exact join filter"
         );
     }
 
@@ -1951,6 +2199,8 @@ mod tests {
         dynamic_filter_sharing.set_dynamic_filter_sharing(true);
         let mut maintained_aggregate = CayenneOptimizerRules::none();
         maintained_aggregate.set_maintained_aggregate(true);
+        let mut stats_aggregate = CayenneOptimizerRules::none();
+        stats_aggregate.set_stats_aggregate(true);
         let mut anti_join_sort_merge = CayenneOptimizerRules::none();
         anti_join_sort_merge.set_anti_join_sort_merge(true);
         let mut exact_join_filter = CayenneOptimizerRules::none();
@@ -1987,6 +2237,11 @@ mod tests {
                 maintained_aggregate,
                 vec![],
                 vec!["CayenneMaintainedAggregateRewriter"],
+            ),
+            (
+                stats_aggregate,
+                vec![],
+                vec!["CayenneStatsAggregateRewriter"],
             ),
             (
                 anti_join_sort_merge,

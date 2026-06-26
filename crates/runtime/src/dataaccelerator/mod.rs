@@ -2367,23 +2367,17 @@ mod accelerator_compat_tests {
                 // For Vortex, check if unsupported types are converted to Utf8
                 if matches!(engine, Engine::Cayenne) {
                     // Cayenne converts these unsupported types and Map to a string
-                    // (Utf8) column. Then, with force_view_read_schema (default on
-                    // in the accelerator factory), it advertises Utf8 columns as
-                    // Utf8View on the read schema. So the expected stored type is
-                    // Utf8 for unsupported/Map and the original type otherwise; any
-                    // stored Utf8 surfaces as Utf8View. (Binary / LargeUtf8 /
-                    // LargeBinary are NOT viewified — see `viewify_read_schema`.)
-                    let expected_stored = if vortex_unsupported_types.contains(original_type)
+                    // (Utf8) column. The accelerator factory now defaults
+                    // force_view_read_schema to OFF, so the read schema keeps native
+                    // Utf8 (no Utf8View viewification unless the table opts in with
+                    // `cayenne_force_view_types: true`). So the expected type is Utf8
+                    // for unsupported/Map and the original type otherwise.
+                    let expected_table = if vortex_unsupported_types.contains(original_type)
                         || matches!(original_type, DataType::Map(_, _))
                     {
                         DataType::Utf8
                     } else {
                         original_type.clone()
-                    };
-                    let expected_table = if expected_stored == DataType::Utf8 {
-                        DataType::Utf8View
-                    } else {
-                        expected_stored
                     };
                     assert_eq!(
                         table_type, &expected_table,

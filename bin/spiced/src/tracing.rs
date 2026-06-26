@@ -30,7 +30,7 @@ use opentelemetry_sdk::{
 use opentelemetry_zipkin::ZipkinExporter;
 use reqwest::Client;
 use runtime::{datafusion::DataFusion, task_history};
-use runtime_datafusion::query_engine::QueryEngine;
+use runtime_query_engine::query_engine::QueryEngine;
 use std::time::Duration;
 use tracing::Subscriber;
 use tracing_log::LogTracer;

@@ -49,7 +49,7 @@ use tonic::async_trait;
 use tonic::codec::CompressionEncoding;
 
 use crate::{tracers::OnceTracer, warn_once};
-use runtime_datafusion::query_engine::{QueryEngine, UpdateType};
+use runtime_query_engine::query_engine::{QueryEngine, UpdateType};
 
 type Result<T, E = Error> = std::result::Result<T, E>;
 

@@ -1,0 +1,22 @@
+# Spice Cloud (SCP) federated cluster scenario for the Ballista distributed-query
+# bench. `source: direct` (no CDC ingest) + no acceleration: the spicepod passed
+# via testoperator's `-p` is deployed verbatim, so its datasets (public-S3 TPC-H
+# parquet) are federated and queried directly over Ballista distributed query.
+# Resources come from the SPIDAPTER_* env vars the cluster-bench workflow exports.
+compute:
+  scp:
+    channel: ${SPIDAPTER_CHANNEL:-nightly}
+    image_tag: ${SPIDAPTER_IMAGE_TAG:-}
+    scheduler_state_location: ${SCHEDULER_STATE_LOCATION:-}
+    organization_tag: ${SPIDAPTER_ORGANIZATION_TAG:-}
+    query_memory_limit: ${SPIDAPTER_QUERY_MEMORY_LIMIT:-}
+    resources:
+      app_memory: ${SPIDAPTER_APP_MEMORY_LIMIT:-62Gi}
+      app_storage_size_gb: ${SPIDAPTER_APP_STORAGE_SIZE_GB:-~}
+      executor_replicas: ${SPIDAPTER_EXECUTOR_REPLICAS:-4}
+      executor_memory: ${SPIDAPTER_EXECUTOR_MEMORY_LIMIT:-62Gi}
+      executor_storage_size_gb: ${SPIDAPTER_EXECUTOR_STORAGE_SIZE_GB:-~}
+      ephemeral_storage_gb: ${SPIDAPTER_EPHEMERAL_STORAGE_LIMIT_GB:-}
+# No `acceleration:` — federated query only (the field is unused for source: direct).
+source:
+  direct: {}

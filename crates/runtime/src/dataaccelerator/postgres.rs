@@ -30,7 +30,7 @@ use std::{any::Any, sync::Arc};
 
 use crate::{
     component::dataset::acceleration::Engine,
-    datafusion::udf::deny_spice_functions_for_table_providers, parameters::ParameterSpec,
+    datafusion::udf::deny_spice_functions_for_postgres_table_providers, parameters::ParameterSpec,
     register_data_accelerator,
 };
 
@@ -71,10 +71,12 @@ impl PostgresAccelerator {
     pub fn new() -> Self {
         Self {
             // Keep plans referencing Spice-only functions (e.g. `json_get_str`)
-            // evaluating locally instead of failing in `Postgres`. Wired before
-            // the `DataFusion` 53 upgrade (#11118) dropped it; see issue #10703.
+            // and DataFusion array functions (e.g. `array_contains`) — which
+            // `Postgres` doesn't implement — evaluating locally instead of
+            // failing in `Postgres`. Wired before the `DataFusion` 53 upgrade
+            // (#11118) dropped it; see issue #10703.
             postgres_factory: PostgresTableProviderFactory::new()
-                .with_function_support(deny_spice_functions_for_table_providers()),
+                .with_function_support(deny_spice_functions_for_postgres_table_providers()),
         }
     }
 }

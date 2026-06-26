@@ -274,6 +274,20 @@ impl CayenneAccelerationExec {
         filters
     }
 
+    /// Returns `true` if any underlying file source carries a pushed-down
+    /// filter — a static predicate or a dynamic join filter.
+    ///
+    /// Whole-table statistics (`num_rows`, per-column `sum`/`min`/`max`) describe
+    /// the *unfiltered* file, so a stats-based aggregate fold
+    /// ([`crate::stats_aggregate`]) must decline whenever a filter is present:
+    /// the metadata cannot answer an aggregate restricted to a row subset.
+    #[must_use]
+    pub(crate) fn has_pushed_filter(&self) -> bool {
+        file_scan_configs(&self.inner)
+            .iter()
+            .any(|config| config.file_source().filter().is_some())
+    }
+
     /// Push additional dynamic filters into the underlying file source.
     ///
     /// Returns `Ok(None)` when the scan source declined all filters or the inner

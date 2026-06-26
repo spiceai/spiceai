@@ -618,6 +618,15 @@ impl CayenneContext {
         self.ingest_stats.record_publish_latency(d);
     }
 
+    /// Current memory pressure (`used / budget`), or `None` when unsampled. A
+    /// single relaxed atomic load — for hot paths (e.g. the checkpoint tick's
+    /// critical-pressure check) that need only this one signal, not the full
+    /// [`ingest_snapshot`](Self::ingest_snapshot) (mutex + clock + p99 + QPH).
+    #[must_use]
+    pub(crate) fn mem_pressure(&self) -> Option<f64> {
+        self.ingest_stats.mem_pressure()
+    }
+
     /// A snapshot of the current ingest accounting (rate + response), enriched with
     /// the now-relative CDC goal signals (replication lag, freshness) and the
     /// query-side goal signals (p99 latency, QPH) — the wall clock and the
