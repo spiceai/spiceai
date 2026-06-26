@@ -121,7 +121,17 @@ pub fn tls_incoming(
         })
         .map(move |stream| {
             let acceptor = acceptor.clone();
-            async move { acceptor.accept(stream).await }
+            async move {
+                // TEMP: time the handshake to detect CPU-bound slowness under
+                // load. REVERT before PR.
+                let t = std::time::Instant::now();
+                let r = acceptor.accept(stream).await;
+                let ms = t.elapsed().as_millis();
+                if ms > 500 {
+                    tracing::warn!("TLS_HS_SLOW {ms}ms ok={}", r.is_ok());
+                }
+                r
+            }
         })
         .buffer_unordered(MAX_CONCURRENT_TLS_HANDSHAKES)
         .filter_map({
@@ -137,8 +147,16 @@ pub fn tls_incoming(
                             Some(Ok(tls))
                         }
                         Err(e) => {
-                            hs_err.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                            tracing::debug!("Flight: TLS handshake error: {e}");
+                            let n = hs_err
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            // TEMP: sample the handshake error reason at WARN
+                            // (first 30 + every 5000th) to diagnose the ~16%
+                            // failure rate. REVERT before PR.
+                            if n < 30 || n % 5000 == 0 {
+                                tracing::warn!("TLS_HS_ERR n={n}: {e:?}");
+                            } else {
+                                tracing::debug!("Flight: TLS handshake error: {e}");
+                            }
                             None
                         }
                     }
