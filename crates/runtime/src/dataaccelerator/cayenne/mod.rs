@@ -644,17 +644,14 @@ impl CayenneAccelerator {
     ) -> cayenne::metadata::VortexConfig {
         let mut config = cayenne::metadata::VortexConfig {
             footer_cache_mb,
-            // Default the query/scan path to Arrow view types (Utf8View/BinaryView)
-            // so DataFusion plans joins/aggregates on view arrays and the
-            // hash-join build-side `concat_batches` cannot hit the i32 2 GiB offset
-            // overflow (CH-benCH q21 @SF1000). The stored schema stays Utf8/Binary.
-            // Operators can opt out with `cayenne_force_view_types: false`.
-            force_view_read_schema: true,
+            // Default the query/scan path to native Arrow types (Utf8/Binary).
+            force_view_read_schema: false,
             ..Default::default()
         };
         if let Some(acceleration) = source.acceleration()
             && let Some(v) = acceleration.params.get("cayenne_force_view_types")
         {
+            // Any value other than `false` enables view types
             config.force_view_read_schema = !v.trim().eq_ignore_ascii_case("false");
         }
 
@@ -794,6 +791,17 @@ impl CayenneAccelerator {
                 }
             }
 
+            // In-memory CDC tier PK-hash shard count (intra-apply fan-out on the
+            // `cdc_durability: memory` path). Default 1 = the unchanged serial
+            // path; N>1 partitions the PK space into N independent serial
+            // domains. Clamped to >=1 in `Table::new_internal`.
+            config.cdc_mem_tier_shards = parse_usize_aliases(
+                acceleration,
+                &["cayenne_cdc_mem_tier_shards", "cdc_mem_tier_shards"],
+                config.cdc_mem_tier_shards,
+            )
+            .max(1);
+
             if let Some((key, value)) = ["cayenne_pk_conflict_detection", "pk_conflict_detection"]
                 .iter()
                 .find_map(|key| acceleration.params.get(*key).map(|value| (*key, value)))
@@ -926,7 +934,8 @@ impl CayenneAccelerator {
                         crate::component::dataset::OnSchemaChange::AppendNewColumns => {
                             cayenne::metadata::SchemaEvolutionMode::AddColumnsOnly
                         }
-                        crate::component::dataset::OnSchemaChange::SyncAllColumns => {
+                        crate::component::dataset::OnSchemaChange::SyncAllColumns
+                        | crate::component::dataset::OnSchemaChange::DropAndRecreate => {
                             cayenne::metadata::SchemaEvolutionMode::Widen
                         }
                         crate::component::dataset::OnSchemaChange::Block
@@ -1608,8 +1617,8 @@ fn wrap_with_native_vector_indexes(
 const PARAMETERS: &[ParameterSpec] = &concat_arrays::<
     ParameterSpec,
     S3_PARAMS_LEN,
-    46,
-    { S3_PARAMS_LEN + 46 },
+    47,
+    { S3_PARAMS_LEN + 47 },
 >(
     S3_PARAMETERS,
     [
@@ -1701,6 +1710,8 @@ const PARAMETERS: &[ParameterSpec] = &concat_arrays::<
             .description("Minimum resident RAM-tier bytes before the periodic background tick durably checkpoints, in cdc_durability: memory mode only. Bounds snapshot/delete-file churn: below this size a tick is skipped unless the tier age reached cdc_mem_tier_max_age_ms. Query freshness is unaffected (RAM rows are visible immediately); only the deferred slot ack waits. The write-path byte-cap spill is not gated. Auto-derived as 1/8 of the derived cdc_mem_tier_max_bytes (clamped to 32-128 MiB; 32 MiB on hosts at or under 16 GiB). Set 0 to flush on every tick."),
         ParameterSpec::component("cdc_mem_tier_checkpoint_interval_ms")
             .description("Periodic background mem-tier checkpoint interval in milliseconds, in cdc_durability: memory mode only. The accelerator spawns a per-table background task that checkpoints the RAM tier every interval (mirroring the background compactor); this advances the deferred source slot ack on an idle or pure-upsert stream that never trips a delete/truncate event trigger or a write-path cap. Default 1000 (1 s). Set 0 to disable the periodic task."),
+        ParameterSpec::component("cdc_mem_tier_shards")
+            .description("Number of PK-hash shards the in-RAM CDC tier is partitioned into, in cdc_durability: memory mode only (non-partitioned, key-based merge-on-read tables). Each shard is an independent serial validate->append domain keyed by the RowConverter OwnedRow bytes, so disjoint keys validate and append in parallel within one apply (intra-apply fan-out) while a key's whole version history — upserts AND delete tombstones — stays confined to its one owning shard (last-writer-wins preserved). Checkpoints are always all-shards-atomic on a single source-position axis. Default 1 (the byte-identical serial path). Raise (e.g. 4) on update/insert-heavy CDC tables to lift the per-apply serialization ceiling."),
         ParameterSpec::component("tuning")
             .description("Auto-tuning mode. 'auto': derive the correct configuration values from the detected environment (cgroup-aware cores + memory, storage class) and the inferred schema (cardinality, row width, primary key) — no closed loop. 'adaptive': additionally run a per-table closed-feedback controller that measures the live CDC ingest rate, delete fraction, and arrival burstiness AND the runtime's whole-system response (apply latency vs offered load, read amplification that slows queries, cgroup-aware memory pressure) and adapts the inline-memtable flush caps, the in-memory CDC tier byte cap, compaction cadence/trigger, and write concurrency over time, within the environment-derived [floor, ceiling]. DEFAULT: when this is unset, the mode is 'adaptive' if extended schema inference produced metadata (the dataset set 'schema_inference: extended' and the source emitted it) — opting into extended schema enables self-tuning, and that metadata is the adaptive warm-start — otherwise 'auto'. Set 'cayenne_tuning: auto' explicitly to opt out of the closed loop even with extended schema. 'schema_inference: extended' also sharpens the 'adaptive' warm-start (inferred cardinality/size) but is not required for an explicit 'adaptive' — without it the controller relearns the row width from observed ingest and converges from the hardware-derived warm-start. In BOTH modes an explicit per-parameter value (e.g. cayenne_segment_cache_mb: 512) overrides the derived value; under 'adaptive' an explicitly-set actuator is pinned (the loop will not move it).")
             .one_of(&["auto", "adaptive"]),

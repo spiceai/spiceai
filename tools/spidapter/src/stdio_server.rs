@@ -20,8 +20,9 @@ use arrow::datatypes::DataType;
 use async_trait::async_trait;
 use spice_cloud_client::CloudClient;
 use spicepod::component::runtime::{
-    Scheduler, default_max_partition_assignments_per_interval, default_max_partitions_per_executor,
-    default_partition_assignment_interval, default_partition_discovery_timeout,
+    Query, Scheduler, default_max_partition_assignments_per_interval,
+    default_max_partitions_per_executor, default_partition_assignment_interval,
+    default_partition_discovery_timeout,
 };
 use spicepod::param::{ParamValue, Params};
 use spicepod::spec::SpicepodDefinition;
@@ -77,6 +78,10 @@ struct ScpRunState {
     ec2_guards: Vec<Ec2Guard>,
     dynamodb_guard: Option<DynamoDbGuard>,
     mongodb_guard: Option<MongoDbGuard>,
+    /// Deletes the Spice Cloud app if the run is dropped without an explicit
+    /// teardown (panic, interrupt, dropped handler). `take`n/`disarm`ed by the
+    /// teardown path so it never double-deletes. See [`commands::ScpAppGuard`].
+    app_guard: Option<commands::ScpAppGuard>,
 }
 
 /// State for an active benchmark run provisioned via `setup`.
@@ -1510,21 +1515,33 @@ impl Handler for SpidapterHandler {
                     "[stdio] teardown(preserve): keeping MongoDB database '{database}' alive"
                 );
             }
-            // For SCP: skip app deletion so the deployed spiced stays running.
+            // For SCP: disarm the app guard and skip app deletion so the deployed
+            // spiced stays running (dropping `state` below must not delete it).
+            if let RunState::Scp(scp) = &mut state
+                && let Some(guard) = &mut scp.app_guard
+            {
+                guard.disarm();
+            }
             eprintln!("[stdio] teardown(preserve): skipping resource deletion");
             return Ok(TeardownResponse { ok: true });
         }
 
         match state {
-            RunState::Scp(scp) => {
+            RunState::Scp(mut scp) => {
                 eprintln!(
                     "[stdio] teardown: deleting app {} at {}",
                     scp.app_id,
                     scp.cloud.base_url()
                 );
+                // On `?` failure here, `scp` (and its still-armed `app_guard`) is
+                // dropped, so the guard retries the delete on drop. On success we
+                // disarm it below so it does not delete the app a second time.
                 commands::delete_app(&scp.cloud, scp.app_id)
                     .await
                     .map_err(|e| format!("Failed to delete app {}: {e}", scp.app_id))?;
+                if let Some(mut guard) = scp.app_guard.take() {
+                    guard.disarm();
+                }
                 eprintln!("[stdio] teardown: app {} deleted", scp.app_id);
             }
             RunState::Local(mut local_state) => {
@@ -1689,15 +1706,22 @@ pub async fn run_stdio_server(args: &StdioArgs) -> anyhow::Result<()> {
 
     let handler = SpidapterHandler::new(args, scenario);
     let mut server = Server::new(handler);
-    tokio::select! {
+    let result = tokio::select! {
         r = server.run_stdio() => {
             r.map_err(|e| anyhow::anyhow!("Stdio server error: {e}"))
         }
         _ = tokio::signal::ctrl_c() => {
-            eprintln!("[stdio] Received interrupt, cleaning up resources...");
+            eprintln!("[stdio] Received interrupt, cleaning up active runs...");
             Ok(())
         }
-    }
+    };
+    // Drop the server (and the handler it owns) here so every active run's state is
+    // torn down before we return. For SCP runs the embedded `ScpAppGuard` deletes
+    // the Spice Cloud app on drop, so an interrupt no longer orphans apps. (The
+    // previous code logged "cleaning up" but dropped the server implicitly without
+    // any SCP cleanup, since `ScpRunState` had no Drop.)
+    drop(server);
+    result
 }
 
 async fn post_setup_sink_action(
@@ -2038,6 +2062,37 @@ async fn generate_initial_spicepod(
                     .insert("s3_region".to_string(), ParamValue::String(region))
             });
             spicepod.runtime.scheduler = Some(sched);
+        }
+    }
+
+    // Route Ballista shuffle output and query spill/temp files onto the
+    // executor's data PVC. The cluster-bench workflow exports these env vars
+    // (with `{github_run_id}`/`{github_run_attempt}` placeholders already
+    // substituted); they are inherited down through testoperator into this
+    // process. Without them the executor's work_dir falls back to
+    // `env::temp_dir()` (`/tmp`), which in the cloud is a small EmptyDir whose
+    // `sizeLimit` a SF10+ shuffle blows past — getting the executor pod evicted
+    // mid-query and livelocking the run. Mirrors the SCHEDULER_STATE_LOCATION
+    // env handling above.
+    if let Ok(shuffle_location) = std::env::var("SPIDAPTER_SHUFFLE_LOCATION") {
+        let shuffle_location = shuffle_location.trim();
+        if !shuffle_location.is_empty() {
+            spicepod
+                .runtime
+                .params
+                .insert("shuffle_location".to_string(), shuffle_location.to_string());
+        }
+    }
+    if let Ok(temp_directory) = std::env::var("SPIDAPTER_QUERY_TEMP_DIRECTORY") {
+        let temp_directory = temp_directory.trim();
+        if !temp_directory.is_empty() {
+            let mut query = spicepod
+                .runtime
+                .query
+                .clone()
+                .unwrap_or_else(Query::default);
+            query.temp_directory = Some(temp_directory.to_string());
+            spicepod.runtime.query = Some(query);
         }
     }
 

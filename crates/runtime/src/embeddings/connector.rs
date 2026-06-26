@@ -49,7 +49,7 @@ use std::any::Any;
 use std::sync::Arc;
 use tokio::sync::{Mutex, RwLock};
 
-use super::table::EmbeddingTable;
+use runtime_search::embeddings::table::EmbeddingTable;
 
 pub struct EmbeddingConnector {
     inner_connector: Arc<dyn DataConnector>,

@@ -67,7 +67,7 @@ pub use http::get_api_doc;
 use llms::rerank::RerankerModelStore;
 use model::{EmbeddingModelStore, LLMChatCompletionsModelStore};
 
-use crate::tools::{Tooling, catalog::SpiceToolCatalog, factory::default_available_catalogs};
+use crate::tools::{Tooling, factory::default_available_catalogs};
 use model_components::model::Model;
 pub use notify::Error as NotifyError;
 use snafu::prelude::*;
@@ -132,6 +132,7 @@ pub mod secrets {
     pub use runtime_secrets::*;
 }
 pub mod cluster;
+mod secrets_preflight;
 pub mod spice_metrics;
 pub mod status;
 pub mod task_history;
@@ -525,7 +526,9 @@ pub struct LogErrors(pub bool);
 pub struct Runtime {
     app: Arc<RwLock<Option<Arc<App>>>>,
     df: Arc<DataFusion>,
-    models: Arc<RwLock<HashMap<String, Model>>>,
+    // `Arc<Model>` (not `Model`) so a handle can be cloned out of the lock and
+    // moved into `spawn_blocking` to run synchronous inference off the runtime.
+    models: Arc<RwLock<HashMap<String, Arc<Model>>>>,
     llm_runtime_stores: Arc<model::LlmRuntimeStores>,
     http_rate_control_registry: Arc<dataconnector::http_rate_control::HttpRateControlRegistry>,
     embeds: Arc<RwLock<EmbeddingModelStore>>,
@@ -1820,7 +1823,7 @@ impl Runtime {
     ///
     /// For tools from catalog, the name is prefixed with the catalog name. e.g. `catalog_name/tool_name`.
     fn list_all_tools(self: &Arc<Self>) -> impl Stream<Item = Arc<dyn SpiceModelTool>> {
-        let default_catalogs = default_available_catalogs(Arc::clone(self));
+        let default_catalogs = default_available_catalogs(self);
         let stream_self = Arc::clone(self);
         stream! {
             let tool_lock = stream_self.tools.read().await;
@@ -1833,7 +1836,7 @@ impl Runtime {
                     Tooling::Tool(tool) | Tooling::FunctionTool(tool) => {
                         yield Arc::clone(tool);
                     }
-                    Tooling::Catalog(catalog) => {
+                    Tooling::Catalog { tools: catalog, .. } => {
                         // Do not list tools from default catalogs. They are already listed individually as tools.
                         if default_catalog_names.contains(&name.as_str()) {
                             continue;
@@ -1852,7 +1855,7 @@ impl Runtime {
         let tools = self.tools.read().await;
         let tool: Arc<dyn SpiceModelTool> =
             if let Some((catalog_name, name)) = tool_name.split_once('/') {
-                let Some(Tooling::Catalog(catalog)) = tools.get(catalog_name) else {
+                let Some(Tooling::Catalog { tools: catalog, .. }) = tools.get(catalog_name) else {
                     return None;
                 };
                 return catalog.get(name).await;

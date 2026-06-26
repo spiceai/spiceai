@@ -1053,7 +1053,7 @@ async fn openai_responses_api_tools() -> Result<(), anyhow::Error> {
             };
             let tools = get_tools(
                 Arc::clone(&rt),
-                &runtime::tools::options::SpiceToolsOptions::Auto,
+                &runtime_tools::options::SpiceToolsOptions::Auto,
             )
             .await;
 

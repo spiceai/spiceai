@@ -17,7 +17,6 @@ limitations under the License.
 use std::{collections::HashMap, future::Future, pin::Pin, sync::Arc, time::Instant};
 
 use crate::cluster::partition::get_partition_filter_exprs;
-use crate::component::dataset::acceleration::Mode;
 use crate::dataaccelerator::BootstrapStatus;
 use crate::dataaccelerator::spice_sys::OpenOption;
 use crate::dataaccelerator::spice_sys::caching_engine::CachingEngineSys;
@@ -679,12 +678,19 @@ impl Runtime {
             return Err(err);
         }
 
-        // In file_update mode, schema mismatches are handled by create_accelerated_table
-        // which detects changes and recreates the acceleration with the new schema.
-        let allow_schema_mismatch = ds
-            .acceleration
-            .as_ref()
-            .is_some_and(|a| a.mode == Mode::FileUpdate);
+        // Bypass the deferred-mismatch gate when the dataset recreates on a schema change, so
+        // create_accelerated_table drops + recreates the table with the new schema instead of
+        // deferring. `recreates_on_schema_mismatch` is the single source of truth for the exact
+        // conditions (`file_update` with refreshes enabled, or `on_schema_change:
+        // drop_and_recreate` + `refresh_mode: full` on a recreate-capable engine); sharing it
+        // keeps this gate and the recreate decision in create_accelerated_table aligned.
+        let allow_schema_mismatch = ds.acceleration.as_ref().is_some_and(|a| {
+            crate::schema_evolution::recreates_on_schema_mismatch(
+                a,
+                ds.on_schema_change,
+                data_connector.resolve_refresh_mode(a.refresh_mode),
+            )
+        });
 
         // Test dataset connectivity by attempting to get a read provider.
         // Acquire the load semaphore (if provided) to limit concurrent source queries.
@@ -1002,10 +1008,16 @@ impl Runtime {
             }
             .build()
         })?;
-        let allow_schema_mismatch = ds
-            .acceleration
-            .as_ref()
-            .is_some_and(|a| a.mode == Mode::FileUpdate);
+        // Same recreate-bypass as the initial-load gate. Previously this honored only
+        // `file_update`, so a reloaded `on_schema_change: drop_and_recreate` dataset would not
+        // recreate on an incompatible source change; the shared helper fixes that.
+        let allow_schema_mismatch = ds.acceleration.as_ref().is_some_and(|a| {
+            crate::schema_evolution::recreates_on_schema_mismatch(
+                a,
+                ds.on_schema_change,
+                connector.resolve_refresh_mode(a.refresh_mode),
+            )
+        });
         let federated_table = FederatedTable::new(
             Arc::clone(&ds),
             read_table,
