@@ -21,7 +21,7 @@ use async_openai::{
         ChatCompletionRequestToolMessageArgs, FunctionCall,
     },
 };
-use runtime_datafusion::allowlist::ResolvedTableAwareAllowlist;
+use runtime_query_engine::allowlist::ResolvedTableAwareAllowlist;
 use schemars::{JsonSchema, schema_for};
 use serde::Serialize;
 use serde_json::Value;
@@ -29,12 +29,14 @@ use snafu::Snafu;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use crate::datafusion::{SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA};
-use crate::{Runtime, tools::catalog::SpiceToolCatalog};
+use crate::Runtime;
+use runtime_datafusion::{SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA};
+use runtime_tools::catalog::SpiceToolCatalog;
+use runtime_tools::options::SpiceToolsOptions;
 
+use super::Tooling;
 use super::builtin::catalog::BuiltinToolCatalog;
 use super::factory::default_catalog_names;
-use super::{Tooling, options::SpiceToolsOptions};
 use tools::{SpiceModelTool, rename::with_name};
 
 #[derive(Debug, Snafu)]
@@ -276,7 +278,7 @@ async fn all_available_tools(
             continue;
         }
 
-        if let Tooling::Catalog(catalog) = tooling
+        if let Tooling::Catalog { tools: catalog, .. } = tooling
             && default_catalog_names.contains(&catalog.name())
         {
             continue;
@@ -302,7 +304,7 @@ async fn get_tool_by_name(
     table_allowlist: Option<ResolvedTableAwareAllowlist>,
 ) -> Option<Vec<Arc<dyn SpiceModelTool>>> {
     if let Some((catalog_name, catalog_tool)) = tool_name.split_once(':') {
-        let Some(Tooling::Catalog(catalog)) = all_tools.get(catalog_name) else {
+        let Some(Tooling::Catalog { tools: catalog, .. }) = all_tools.get(catalog_name) else {
             return None;
         };
 
@@ -339,9 +341,14 @@ async fn get_tool_by_name(
     if let Some(ref allowlist) = table_allowlist
         && BuiltinToolCatalog::is_builtin_tool(tool_name)
     {
-        if let Ok(t) = BuiltinToolCatalog::new(Arc::clone(&rt))
-            .with_table_allowlist(allowlist.clone())
-            .construct_builtin(tool_name, None, None, &HashMap::new())
+        if let Ok(t) = BuiltinToolCatalog::new(
+            rt.datafusion() as Arc<dyn runtime_query_engine::query_engine::QueryEngine>,
+            Arc::clone(&rt.app),
+            rt.status(),
+            rt.datafusion().search_cache_provider(),
+        )
+        .with_table_allowlist(allowlist.clone())
+        .construct_builtin(tool_name, None, None, &HashMap::new())
         {
             return Some(vec![t]);
         }

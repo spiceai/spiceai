@@ -41,7 +41,7 @@ use datafusion_physical_expr::{PhysicalExpr, create_physical_expr};
 use datafusion_physical_plan::metrics::Count;
 use datafusion_pruning::{FilePruner, build_pruning_predicate};
 
-use super::table::ColumnStatsAccumulator;
+use super::column_stats::ColumnStatsAccumulator;
 
 /// Build a physical conjunction from data-column scan filters for file/segment pruning.
 pub(crate) fn build_listing_pruning_predicate(

@@ -27,25 +27,26 @@ use crate::datafusion::udtf::json_properties::{
     FLATTEN_JSON_PROPERTIES_UDTF_NAME, FlattenJsonPropertiesScalar, FlattenJsonPropertiesTableFunc,
 };
 use crate::datafusion::udtf::json_tree::{JSON_TREE_UDTF_NAME, JsonTreeScalar, JsonTreeTableFunc};
-use crate::embeddings::udtf::{VECTOR_SEARCH_UDTF_NAME, VectorSearchTableFunc};
+use crate::embeddings::udtf::VectorSearchTableFunc;
 use crate::executor_table::{EXECUTOR_TABLE_UDTF_NAME, ExecutorTableFunc};
-use crate::search::full_text::udtf::{TEXT_SEARCH_UDTF_NAME, TextSearchTableFunc};
-use crate::search::rerank::{RERANK_UDTF_NAME, RerankTableFunc};
-use crate::search::rrf;
-use crate::search::rrf::RRF_UDF_NAME;
-use crate::search::util::parse_explicit_primary_keys;
 use datafusion::execution::FunctionRegistry;
 use datafusion::functions::math::random::RandomFunc;
 use datafusion::logical_expr::ScalarUDF;
 use datafusion::prelude::SessionContext;
 use datafusion_table_providers::util::supported_functions::{FunctionRestriction, FunctionSupport};
 use parking_lot::RwLock;
-use runtime_datafusion::query_engine::QueryEngine;
 #[cfg(feature = "models")]
 use runtime_datafusion_udfs::{
     ai::{AI_UDF_NAME, Ai},
     embed::{self, EMBED_UDF_NAME},
 };
+use runtime_query_engine::query_engine::QueryEngine;
+use runtime_search::full_text_udtf::TextSearchTableFunc;
+use runtime_search::rerank::{RERANK_UDTF_NAME, RerankTableFunc};
+use runtime_search::rrf;
+use runtime_search::rrf::RRF_UDF_NAME;
+use runtime_search::search_engine::parse_explicit_primary_keys;
+use runtime_search::udtf::{TEXT_SEARCH_UDTF_NAME, VECTOR_SEARCH_UDTF_NAME};
 use runtime_secrets::{ExposeSecret, get_params_with_secrets};
 #[cfg(not(feature = "models"))]
 const EMBED_UDF_NAME: &str = "embed";
@@ -86,10 +87,19 @@ pub async fn register_udfs(runtime: &crate::Runtime) {
     let ctx = &runtime.df.ctx;
     register_core_scalar_udfs(ctx);
 
-    ctx.register_udf(TextSearchTableFunc::new(Arc::downgrade(&runtime.df)).into());
+    ctx.register_udf(
+        TextSearchTableFunc::new(
+            Arc::downgrade(&runtime.df) as _,
+            crate::search::util::RuntimeTableProviderExplorer,
+        )
+        .into(),
+    );
     ctx.register_udtf(
         TEXT_SEARCH_UDTF_NAME,
-        Arc::new(TextSearchTableFunc::new(Arc::downgrade(&runtime.df))),
+        Arc::new(TextSearchTableFunc::new(
+            Arc::downgrade(&runtime.df) as _,
+            crate::search::util::RuntimeTableProviderExplorer,
+        )),
     );
 
     // `executor_table('endpoint','table')` — fetch a peer executor's partition
@@ -122,11 +132,11 @@ pub async fn register_udfs(runtime: &crate::Runtime) {
     // UDF stub (so `rerank(...)` can appear nested inside another UDTF's arg
     // list, same trick vector_search/text_search/rrf use) and a UDTF (the
     // actual `FROM rerank(...)` implementation).
-    let session_ctx: Arc<SessionContext> = Arc::clone(ctx);
+    let weak_df: std::sync::Weak<dyn runtime_query_engine::query_engine::QueryEngine> =
+        Arc::downgrade(&runtime.df) as _;
     ctx.register_udf(
         RerankTableFunc::new(
-            Arc::downgrade(&runtime.df),
-            Arc::clone(&session_ctx),
+            std::sync::Weak::clone(&weak_df),
             runtime.rerankers(),
             runtime.completion_llms(),
         )
@@ -135,8 +145,7 @@ pub async fn register_udfs(runtime: &crate::Runtime) {
     ctx.register_udtf(
         RERANK_UDTF_NAME,
         Arc::new(RerankTableFunc::new(
-            Arc::downgrade(&runtime.df),
-            session_ctx,
+            weak_df,
             runtime.rerankers(),
             runtime.completion_llms(),
         )),
@@ -289,7 +298,7 @@ async fn maybe_register_function_as_tool(runtime: &crate::Runtime, decl: &Functi
     }
     let df_dyn = Arc::clone(&runtime.df) as Arc<dyn QueryEngine>;
     let df_weak = Arc::downgrade(&df_dyn);
-    match crate::tools::builtin::function_tool::build(decl, df_weak) {
+    match runtime_tools::builtin::function_tool::build(decl, df_weak) {
         Ok(adapter) => {
             let tool: Arc<dyn tools::SpiceModelTool> = Arc::new(adapter);
             let name = decl.name.clone();
@@ -819,6 +828,105 @@ pub fn deny_spice_functions_for_table_providers() -> FunctionSupport {
     deny_spice_specific_functions().as_ref().clone()
 }
 
+/// `DataFusion`'s built-in nested (array/list/map) scalar functions, by canonical
+/// name AND every alias.
+///
+/// Aliases are essential here: when a function is invoked by an alias, the
+/// planner keeps the alias in the logical plan (e.g. `array_contains(...)` shows
+/// up as `array_contains`, not its canonical `array_has`), and federation matches
+/// the deny-list against that name. Collecting only canonical names would let
+/// every alias federate and be unparsed straight into the remote engine — which
+/// is exactly how `array_contains` was reaching Redshift.
+fn datafusion_nested_function_names() -> &'static [String] {
+    // The default nested-function set is fixed for the lifetime of the process,
+    // so compute the name+alias list once instead of re-allocating it on every
+    // Postgres table-provider construction.
+    static NAMES: LazyLock<Vec<String>> = LazyLock::new(|| {
+        datafusion::functions_nested::all_default_nested_functions()
+            .iter()
+            .flat_map(|udf| {
+                std::iter::once(udf.name().to_string()).chain(udf.aliases().iter().cloned())
+            })
+            .collect()
+    });
+    NAMES.as_slice()
+}
+
+/// `DataFusion` array functions that `PostgreSQL` implements under the SAME name,
+/// with a matching argument signature AND matching semantics, so they can keep
+/// being federated (pushed down) to a `PostgreSQL`-wire backend rather than being
+/// denied. Anything not on this list is denied for Postgres (see
+/// [`denied_function_names_for_postgres`]).
+///
+/// Cross-checked against the `DataFusion` array functions and `PostgreSQL`'s array functions:
+/// - <https://datafusion.apache.org/user-guide/sql/scalar_functions.html#array-functions>
+/// - <https://www.postgresql.org/docs/current/functions-array.html>
+///
+/// Everything else in `DataFusion`'s array family is denied because `PostgreSQL`
+/// either:
+/// - lacks the function entirely — `array_has`/`array_contains` (`PostgreSQL` uses
+///   the `@>`/`= ANY` operators), `make_array` (`ARRAY[...]` syntax), `flatten`,
+///   `range`/`generate_series` (set-returning, not an array), the set ops
+///   (`array_distinct`/`array_union`/`array_intersect`/`array_except`),
+///   element/slice accessors (`array_element`/`array_slice`/`array_pop_*`),
+///   `array_distance`, `array_max`/`array_min`, `map_*`, ...;
+/// - spells it differently — `DataFusion`'s canonical `array_concat` vs
+///   `PostgreSQL`'s `array_cat`. These could be a candidate for function rewrite later.
+/// - uses an incompatible signature — `array_length(array)` is valid in
+///   `DataFusion` (dimension optional) but `PostgreSQL` requires the dimension;
+///   `array_dims` returns a list in `DataFusion` but `text` in `PostgreSQL`. Could also be a candidate for function rewrite later.
+/// - diverges in semantics — `array_remove`/`array_replace` affect only the
+///   first match in `DataFusion` but every match in `PostgreSQL`;
+/// - is too new / unavailable on Redshift — `array_reverse`, `array_sort`
+///   (`PostgreSQL` 16/17+).
+const POSTGRES_PUSHABLE_ARRAY_FUNCTIONS: &[&str] = &[
+    "array_append",    // (array, element) — identical to PostgreSQL
+    "array_prepend",   // (element, array) — identical to PostgreSQL
+    "array_ndims",     // (array) -> int
+    "array_position",  // (array, element[, start]) -> int
+    "array_positions", // (array, element) -> int[]
+    "array_to_string", // (array, delimiter[, null_string]) -> text
+    "cardinality",     // (array) -> int
+    "string_to_array", // (string, delimiter[, null_string]) -> text[]
+];
+
+/// The Spice UDF deny-list extended with the `DataFusion` array functions that
+/// `PostgreSQL` can't run, for `PostgreSQL` and PostgreSQL-wire backends (e.g.
+/// Redshift). The PostgreSQL-compatible array functions
+/// ([`POSTGRES_PUSHABLE_ARRAY_FUNCTIONS`]) are kept OUT of the deny-list so they
+/// continue to push down. Shared source of truth for both the connector and
+/// accelerator deny-lists.
+fn denied_function_names_for_postgres() -> Vec<String> {
+    let builtins = BUILTIN_DENIED_SPICE_FUNCTION_NAMES.clone();
+    let user = USER_FUNCTION_NAMES.read().clone();
+    let denied_array = deny_list_excluding_native(
+        datafusion_nested_function_names(),
+        POSTGRES_PUSHABLE_ARRAY_FUNCTIONS,
+    );
+    let mut denied = Vec::with_capacity(builtins.len() + user.len() + denied_array.len());
+    denied.extend(builtins);
+    denied.extend(user);
+    denied.extend(denied_array);
+    denied
+}
+
+/// Postgres-flavored deny-list as a value (not `Arc`): the full Spice UDF
+/// deny-list extended with the `DataFusion` array functions `PostgreSQL` (and
+/// PostgreSQL-wire backends like Redshift) can't execute, while still allowing
+/// the array functions that match `PostgreSQL` exactly to push down. Used both
+/// with `PostgresTableProviderFactory::with_function_support` (accelerator) and
+/// the `PostgreSQL` data connector's federation deny-list. See issue #10703.
+#[must_use]
+pub fn deny_spice_functions_for_postgres_table_providers() -> FunctionSupport {
+    FunctionSupport::new(
+        Some(FunctionRestriction::Deny(
+            denied_function_names_for_postgres(),
+        )),
+        None,
+        None,
+    )
+}
+
 fn json_functions() -> Vec<String> {
     let mut ctx = SessionContext::new();
     let existing: HashSet<_> = ctx.state().scalar_functions().keys().cloned().collect();
@@ -833,7 +941,9 @@ fn json_functions() -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
-    use datafusion::arrow::datatypes::DataType;
+    use datafusion::arrow::array::AsArray;
+    use datafusion::arrow::datatypes::{DataType, Float64Type};
+    use datafusion::execution::SessionStateBuilder;
     use datafusion::logical_expr::expr::ScalarFunction;
     use datafusion::logical_expr::{ColumnarValue, Volatility as DataFusionVolatility, create_udf};
     use datafusion::prelude::{Expr, lit};
@@ -842,6 +952,7 @@ mod tests {
         json_as_text_udf, json_contains_udf, json_get_bool_udf, json_get_float_udf,
         json_get_int_udf, json_get_json_udf, json_get_str_udf, json_get_udf, json_length_udf,
     };
+    use runtime_datafusion_udfs::inner_product::DOT_PRODUCT_UDF_ALIAS;
 
     use super::*;
 
@@ -1079,6 +1190,86 @@ mod tests {
     }
 
     #[test]
+    fn postgres_deny_list_denies_incompatible_array_functions() {
+        // PostgreSQL (and PostgreSQL-wire backends such as Redshift) can't run
+        // DataFusion's array functions that it lacks, spells differently, or
+        // implements with a different signature/semantics. The reported failure
+        // is `array_contains` (canonical `array_has`) being pushed into Redshift.
+        let support = deny_spice_functions_for_postgres_table_providers();
+        for name in [
+            "array_has",      // canonical name
+            "array_contains", // alias the planner actually puts in the plan (the reported bug)
+            "list_has",       // another array_has alias
+            "make_array",     // PostgreSQL uses `ARRAY[...]` syntax
+            "array_concat",   // PostgreSQL spells it `array_cat`
+            "array_cat",      // ...and that DataFusion spelling is only an alias here
+            "array_length",   // PostgreSQL requires an explicit dimension argument
+            "array_remove",   // DataFusion removes first match, PostgreSQL removes all
+            "array_replace",  // DataFusion replaces first match, PostgreSQL replaces all
+            "array_dims",     // DataFusion returns a list, PostgreSQL returns text
+            "flatten",
+        ] {
+            assert!(
+                !support.supports(&make_named_expr(name)),
+                "{name} is incompatible with PostgreSQL and must be denied"
+            );
+        }
+        // The exact PostgreSQL function names keep pushing down.
+        for &name in POSTGRES_PUSHABLE_ARRAY_FUNCTIONS {
+            assert!(
+                support.supports(&make_named_expr(name)),
+                "{name} matches PostgreSQL exactly and should still federate"
+            );
+        }
+        // ...but their DataFusion-only aliases (which PostgreSQL doesn't define)
+        // stay denied so they aren't unparsed into invalid remote SQL.
+        for name in [
+            "list_append",
+            "array_push_back",
+            "array_join",
+            "list_position",
+        ] {
+            assert!(
+                !support.supports(&make_named_expr(name)),
+                "{name} is a DataFusion-only alias with no PostgreSQL equivalent and must be denied"
+            );
+        }
+        // Spice-only functions stay denied too.
+        assert!(
+            !support.supports(&make_named_expr(EMBED_UDF_NAME)),
+            "Spice-only functions must remain denied for Postgres"
+        );
+        // Ordinary scalar functions still federate.
+        assert!(
+            support.supports(&make_named_expr("upper")),
+            "non-array, non-Spice functions must not be denied for Postgres"
+        );
+        // The generic table-providers deny-list does NOT touch array functions,
+        // confirming this carve-out is Postgres-specific.
+        assert!(
+            deny_spice_functions_for_table_providers().supports(&make_named_expr("array_has")),
+            "the generic deny-list must not deny array functions"
+        );
+    }
+
+    #[test]
+    fn postgres_pushable_array_functions_are_real_datafusion_functions() {
+        // Guard against typos / drift: every name we allow to push down must
+        // actually be a DataFusion nested function, otherwise the carve-out is a
+        // no-op that silently denies it.
+        let known: HashSet<&str> = datafusion_nested_function_names()
+            .iter()
+            .map(String::as_str)
+            .collect();
+        for name in POSTGRES_PUSHABLE_ARRAY_FUNCTIONS {
+            assert!(
+                known.contains(*name),
+                "{name} is in the Postgres pushable list but is not a DataFusion nested function"
+            );
+        }
+    }
+
+    #[test]
     fn duckdb_deny_list_allows_dialect_native_functions() {
         // The DuckDB unparser dialect rewrites these into native DuckDB SQL
         // (cosine_distance -> array_cosine_distance, inner_product ->
@@ -1175,5 +1366,81 @@ mod tests {
             BTreeSet::from([COSINE_DISTANCE_UDF_NAME, INNER_PRODUCT_UDF_NAME, "rand"]),
             "unexpected change to the set of Spice functions pushable to DuckDB"
         );
+    }
+
+    /// Build a `SessionContext` the way `builder.rs` does: `DataFusion` defaults
+    /// first (which, with `nested_expressions`, register `DataFusion` 54's
+    /// `cosine_distance` / `inner_product` / `dot_product`), then Spice's core
+    /// scalar UDFs, which override them by name.
+    fn ctx_like_runtime() -> SessionContext {
+        let state = SessionStateBuilder::new().with_default_features().build();
+        let ctx = SessionContext::new_with_state(state);
+        register_core_scalar_udfs(&ctx);
+        ctx
+    }
+
+    async fn eval_f64(ctx: &SessionContext, sql: &str) -> datafusion::common::Result<f64> {
+        let batches = ctx.sql(sql).await?.collect().await?;
+        Ok(batches[0].column(0).as_primitive::<Float64Type>().value(0))
+    }
+
+    /// Locks in that Spice's `cosine_distance` — not `DataFusion` 54's same-named
+    /// built-in — is the impl bound after registration, and that it keeps the
+    /// `(1 - similarity) / 2` remap to `[0, 1]`. `DataFusion`'s built-in returns
+    /// `1 - similarity` over `[0, 2]`; if it ever shadowed Spice's UDF the
+    /// orthogonal case below would be `1.0` instead of `0.5`, silently changing
+    /// every `vector_search` relevance score (`score = 1 - cosine_distance`).
+    #[tokio::test]
+    async fn cosine_distance_keeps_spice_zero_to_one_semantics() {
+        let ctx = ctx_like_runtime();
+
+        let identical = eval_f64(&ctx, "SELECT cosine_distance([1.0, 0.0], [1.0, 0.0])")
+            .await
+            .expect("cosine_distance over List literals should evaluate");
+        assert!(
+            (identical - 0.0).abs() < 1e-9,
+            "identical vectors must be 0.0, got {identical}"
+        );
+
+        let orthogonal = eval_f64(&ctx, "SELECT cosine_distance([1.0, 0.0], [0.0, 1.0])")
+            .await
+            .expect("cosine_distance over List literals should evaluate");
+        assert!(
+            (orthogonal - 0.5).abs() < 1e-9,
+            "orthogonal vectors must be 0.5 (Spice's [0,1] remap); 1.0 would mean \
+             DataFusion 54's built-in shadowed Spice's cosine_distance, got {orthogonal}"
+        );
+
+        let opposite = eval_f64(&ctx, "SELECT cosine_distance([1.0, 0.0], [-1.0, 0.0])")
+            .await
+            .expect("cosine_distance over List literals should evaluate");
+        assert!(
+            (opposite - 1.0).abs() < 1e-9,
+            "opposite vectors must be 1.0 (top of Spice's [0,1] range), got {opposite}"
+        );
+    }
+
+    /// Locks in that both `inner_product` and its `dot_product` alias resolve to
+    /// Spice's SIMD UDF rather than `DataFusion` 54's built-in. Spice's impl
+    /// accepts only `FixedSizeList<Float32, N>`; `DataFusion`'s accepts
+    /// `List`/`LargeList` of any numeric and would return `11.0` for the call
+    /// below. A `FixedSizeList` coercion error is therefore the discriminator
+    /// that Spice's impl — including for the `dot_product` alias key — is bound.
+    #[tokio::test]
+    async fn inner_product_and_dot_product_bind_to_spice_impl() {
+        let ctx = ctx_like_runtime();
+
+        for name in [INNER_PRODUCT_UDF_NAME, DOT_PRODUCT_UDF_ALIAS] {
+            let err = eval_f64(&ctx, &format!("SELECT {name}([1.0, 2.0], [3.0, 4.0])"))
+                .await
+                .expect_err(&format!(
+                    "{name} over List<Float64> must error — Spice's FixedSizeList<Float32>-only \
+                     impl should be bound, not DataFusion 54's List-accepting built-in"
+                ));
+            assert!(
+                err.to_string().contains("FixedSizeList"),
+                "{name}: expected a FixedSizeList coercion error from Spice's impl, got: {err}"
+            );
+        }
     }
 }

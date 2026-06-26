@@ -208,7 +208,12 @@ pub(crate) async fn ensure_spice_cloud_app(
     eprintln!("[stdio] create_result: {create_result:?}");
     match create_result {
         Ok(app) => {
+            // Arm a guard the instant the app exists: if `apply_storage_config`
+            // fails below, the guard deletes the just-created app on drop instead of
+            // orphaning it. Disarm on success so the caller owns the live app.
+            let mut guard = ScpAppGuard::new(cloud.clone(), app.id);
             apply_storage_config(cloud, app.id, config).await?;
+            guard.disarm();
             Ok(app.id)
         }
         Err(spice_cloud_client::error::Error::Conflict { .. }) => {
@@ -344,6 +349,53 @@ pub(crate) async fn create_deployment(
 pub(crate) async fn delete_app(cloud: &CloudClient, app_id: i64) -> anyhow::Result<()> {
     cloud.delete_app(app_id).await?;
     Ok(())
+}
+
+/// RAII guard that deletes a Spice Cloud app when dropped.
+pub(crate) struct ScpAppGuard {
+    /// `(cloud, app_id)` while armed; `None` once disarmed.
+    app: Option<(CloudClient, i64)>,
+}
+
+impl ScpAppGuard {
+    pub(crate) fn new(cloud: CloudClient, app_id: i64) -> Self {
+        Self {
+            app: Some((cloud, app_id)),
+        }
+    }
+
+    /// Disarm so the app is NOT deleted on drop (it was deleted explicitly, or is
+    /// being intentionally preserved). Returns the guarded app id, if still armed.
+    pub(crate) fn disarm(&mut self) -> Option<i64> {
+        self.app.take().map(|(_, app_id)| app_id)
+    }
+}
+
+impl Drop for ScpAppGuard {
+    fn drop(&mut self) {
+        let Some((cloud, app_id)) = self.app.take() else {
+            return;
+        };
+        eprintln!(
+            "[stdio] ScpAppGuard: deleting orphaned app {app_id} at {}",
+            cloud.base_url()
+        );
+        std::thread::spawn(move || {
+            let Ok(rt) = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            else {
+                eprintln!("[stdio] ScpAppGuard: failed to build tokio runtime for cleanup");
+                return;
+            };
+            match rt.block_on(delete_app(&cloud, app_id)) {
+                Ok(()) => eprintln!("[stdio] ScpAppGuard: deleted app {app_id}"),
+                Err(e) => eprintln!("[stdio] ScpAppGuard: failed to delete app {app_id}: {e}"),
+            }
+        })
+        .join()
+        .ok();
+    }
 }
 
 /// Wait for a Spice Cloud deployment to become ready by polling the SQL endpoint.
