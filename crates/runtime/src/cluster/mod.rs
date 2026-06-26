@@ -46,7 +46,7 @@ use ballista_core::{ConfigProducer, RuntimeProducer};
 use ballista_executor::execution_loop;
 use ballista_executor::executor::Executor;
 use ballista_scheduler::cluster::memory::{InMemoryClusterState, InMemoryJobState};
-use ballista_scheduler::cluster::{BallistaCluster, ClusterState};
+use ballista_scheduler::cluster::{BallistaCluster, ClusterState, JobState};
 use ballista_scheduler::config::{OnCancelTasksFn, SchedulerConfig};
 use ballista_scheduler::scheduler_process;
 use ballista_scheduler::scheduler_server::SchedulerServer;
@@ -443,6 +443,7 @@ mod reaper;
 pub(crate) mod scheduler_registry;
 mod servers;
 mod service;
+pub(crate) mod shared_job_state;
 
 use crate::cluster::partition::service::PartitionService;
 pub use accelerated_partition_provider::AcceleratedPartitionProvider;
@@ -1929,12 +1930,86 @@ async fn create_scheduler_server(
             .with_ballista_shuffle_memory_mode(shuffle_memory_mode)
     });
 
-    // Manually create the BallistaCluster with our custom config_producer
-    let job_state = Arc::new(InMemoryJobState::new(
-        metrics_node_id,
-        session_builder,
-        config_producer,
-    ));
+    // Back job state with shared object storage when a scheduler state location is
+    // configured, so in-flight jobs survive scheduler loss and any scheduler can
+    // resume them; otherwise keep job state in memory.
+    //
+    // The spicepod loads asynchronously after the runtime is built. Wait for it with
+    // a fibonacci backoff and keep retrying until it loads (warning periodically)
+    // rather than giving up — when a state location is configured we must honor it,
+    // not silently degrade to in-memory.
+    let scheduler_cfg = {
+        let mut backoff = util::fibonacci_backoff::FibonacciBackoffBuilder::new()
+            .max_retries(None)
+            .build();
+        let started = std::time::Instant::now();
+        let mut last_warn = std::time::Instant::now();
+        // Keep retrying until the spicepod loads (a configured state location must
+        // be honored, never silently degraded), but stay responsive to shutdown so
+        // a process told to stop while the app is still loading can't deadlock here.
+        let shutdown = crate::shutdown_signal();
+        tokio::pin!(shutdown);
+        loop {
+            if let Some(app) = rt.read_app().await {
+                break app.runtime.scheduler.clone();
+            }
+            if last_warn.elapsed() >= std::time::Duration::from_secs(30) {
+                tracing::warn!(
+                    "still waiting for the spicepod to load before configuring the \
+                     scheduler's job state ({}s elapsed)",
+                    started.elapsed().as_secs()
+                );
+                last_warn = std::time::Instant::now();
+            }
+            let delay = backoff
+                .next_duration()
+                .unwrap_or_else(|| std::time::Duration::from_secs(30))
+                .min(std::time::Duration::from_secs(30));
+            tokio::select! {
+                () = tokio::time::sleep(delay) => {}
+                () = &mut shutdown => {
+                    return Err(crate::Error::FailedToStartClusterScheduler {
+                        source: "shutdown requested while waiting for the spicepod to load".into(),
+                    });
+                }
+            }
+        }
+    };
+    let job_state: Arc<dyn JobState> = if let Some(scheduler_cfg) = scheduler_cfg {
+        tracing::info!(
+            state_location = %scheduler_cfg.state_location,
+            "Scheduler using shared object-store job state"
+        );
+        let (store, base_prefix) = scheduler_registry::build_object_store(
+            rt.as_ref(),
+            &scheduler_cfg.state_location,
+            &scheduler_cfg,
+        )
+        .await
+        .map_err(|e| crate::Error::FailedToStartClusterScheduler {
+            source: Box::new(e),
+        })?;
+        let codec: BallistaCodec<LogicalPlanNode, PhysicalPlanNode> = BallistaCodec::new(
+            SpiceLogicalCodec::new_codec(),
+            SpicePhysicalCodec::new(Arc::clone(rt))
+                .boxed()
+                .context(FailedToStartClusterSchedulerSnafu)?,
+        );
+        Arc::new(shared_job_state::SharedJobState::new(
+            metrics_node_id,
+            store,
+            base_prefix,
+            codec,
+            session_builder,
+            config_producer,
+        ))
+    } else {
+        Arc::new(InMemoryJobState::new(
+            metrics_node_id,
+            session_builder,
+            config_producer,
+        ))
+    };
     let cluster = BallistaCluster::new(cluster_state, job_state);
 
     let scheduler_config = SchedulerConfig {
