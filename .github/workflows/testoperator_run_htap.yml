@@ -82,6 +82,29 @@ jobs:
     runs-on: ${{ github.event.inputs.runner_type }}
     timeout-minutes: 120
     steps:
+      - name: Log run parameters
+        # Surface every dispatch input (and the resolved eager-aggregation state)
+        # in the log + job summary so a run is self-describing. Inputs are passed
+        # via env (not inlined) to avoid script injection.
+        env:
+          INPUTS_JSON: ${{ toJSON(github.event.inputs) }}
+          EAGER_AGGREGATION: ${{ github.event.inputs.eager_aggregation }}
+        run: |
+          eager_state="OFF"
+          [ "$EAGER_AGGREGATION" = "true" ] && eager_state="ON (SPICED_EAGER_AGGREGATION=1)"
+          {
+            echo "## HTAP run parameters"
+            echo "**Eager aggregation:** $eager_state"
+            echo ""
+            echo '```json'
+            echo "$INPUTS_JSON"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "::group::HTAP run parameters"
+          echo "Eager aggregation: $eager_state"
+          echo "$INPUTS_JSON"
+          echo "::endgroup::"
+
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
       - name: Set up Rust toolchain
