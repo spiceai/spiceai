@@ -1237,14 +1237,19 @@ pub async fn initialize_cluster_executor(
                 .unwrap_or_else(|| env::temp_dir().to_string_lossy().to_string())
         }
         Some(loc) => {
-            // Local disk mode with explicit path
-            // Validate the path exists or can be created
+            // Local disk mode with explicit path — ensure the work dir exists.
+            // Cluster-bench points this at a per-run subdir of the /data PVC,
+            // which won't exist until created; create it so the executor doesn't
+            // fall back to (and fill) the default temp dir.
             let path = std::path::Path::new(loc);
             if !path.exists() {
-                tracing::warn!(
-                    "shuffle_location '{}' does not exist. Ensure the directory exists and is writable by the executor process.",
-                    loc
-                );
+                if let Err(e) = std::fs::create_dir_all(path) {
+                    tracing::warn!(
+                        "failed to create shuffle_location '{}': {}. Shuffle writes may fail or fall back to the default temp dir.",
+                        loc,
+                        e
+                    );
+                }
             }
             loc.to_string()
         }

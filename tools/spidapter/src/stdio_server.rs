@@ -2064,6 +2064,31 @@ async fn generate_initial_spicepod(
         }
     }
 
+    // Route Ballista shuffle output and query temp/spill files to the
+    // configured (PVC-backed) locations instead of the executor's default temp
+    // dir. Without this, cluster-bench executors write shuffle to the small
+    // `tmp` EmptyDir, exceed its limit, and get evicted mid-query (livelocking
+    // the run). Executors take this config from the scheduler, so inject it into
+    // the scheduler spicepod here (mirrors SCHEDULER_STATE_LOCATION above). The
+    // env vars are exported by the cluster-bench workflow from the test config.
+    if let Some(loc) = std::env::var("SPIDAPTER_SHUFFLE_LOCATION")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+    {
+        spicepod
+            .runtime
+            .params
+            .insert("shuffle_location".to_string(), loc.trim().to_string());
+    }
+    if let Some(dir) = std::env::var("SPIDAPTER_QUERY_TEMP_DIRECTORY")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+    {
+        let mut query = spicepod.runtime.query.take().unwrap_or_default();
+        query.temp_directory = Some(dir.trim().to_string());
+        spicepod.runtime.query = Some(query);
+    }
+
     Ok(spicepod)
 }
 
