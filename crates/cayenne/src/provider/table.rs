@@ -2151,26 +2151,32 @@ impl CayenneTableProvider {
             .await
     }
 
-    /// Update the listing table to point to a new snapshot directory.
+    /// Publish an overwrite's new snapshot to the in-memory state as a SINGLE
+    /// atomic visibility flip, held under one `listing_fence` write acquisition.
     ///
-    /// This ensures subsequent queries in the same context will read from the new data.
-    /// Holds [`Self::listing_fence`] for write across the Arc swap so any in-flight
-    /// [`Self::scan`] using `listing_fence.read()` either resolves entirely
-    /// before this swap or entirely after it.
-    pub(crate) async fn update_listing_table_for_snapshot(
-        &self,
-        new_snapshot_id: &str,
-    ) -> Result<()> {
-        // [sound output_ordering] Rebinding the listing to a snapshot changes the
-        // live file set; invalidate the sorted attestation (the sorted compaction
-        // rewrite swaps the listing directly, not via this path).
-        self.current_sorted_snapshot.store(Arc::new(None));
+    /// A scan holds `listing_fence.read()` across plan-build and captures the
+    /// deletion snapshot and the `current_snapshot_id` at *different* points (see
+    /// the scan path). If the snapshot-id flip, the deletion-cache clear, and the
+    /// listing-table swap are not published under a single fence barrier, a scan
+    /// can interleave between them and observe the NEW snapshot id with the OLD
+    /// deletion caches — a key the overwrite reinserted is hidden by a stale
+    /// tombstone (silent row vanish) — or the OLD id with cleared caches (a
+    /// deleted row reappears, silent resurrection). This mirrors the
+    /// proven-correct compaction publish in
+    /// `rewrite_current_snapshot_for_compaction`.
+    ///
+    /// Every step under the fence is synchronous (`create_listing_table` builds
+    /// the table *before* the fence and performs no I/O), so the fence guards only
+    /// the in-memory pointer swaps — never an `.await` that touches disk or the
+    /// metastore.
+    pub(crate) async fn publish_overwrite_snapshot(&self, new_snapshot_id: &str) -> Result<()> {
         let snapshot_dir_url = Self::snapshot_dir_url(
             &self.table_metadata.path,
             &self.table_metadata.table_id,
             new_snapshot_id,
         );
-
+        // Build the new listing table BEFORE acquiring the fence (synchronous, no
+        // I/O), then flip every visibility-affecting pointer atomically below.
         let new_listing_table = Self::create_listing_table(
             &snapshot_dir_url,
             self.table_schema(),
@@ -2179,6 +2185,16 @@ impl CayenneTableProvider {
         )?;
 
         let _fence = self.listing_fence.write().await;
+        self.update_current_snapshot_id(new_snapshot_id);
+        self.clear_all_deletion_caches();
+        // `commit_overwrite_in_txn` already cleared the inlined data/deletes in the
+        // catalog atomically with the snapshot flip, but didn't bump
+        // `inlined_generation`; bump it here, under the fence, so a scan never pairs
+        // the new snapshot with stale pre-overwrite inline batches.
+        self.invalidate_inlined_cache();
+        self.mark_maintained_aggregates_stale();
+        // `update_current_snapshot_id` above already cleared the sorted-output
+        // attestation; the overwrite rebinds to a non-sorted snapshot, so it stays cleared.
         self.listing_table.store(new_listing_table);
         Ok(())
     }
@@ -9227,17 +9243,19 @@ impl CayenneTableProvider {
             return Err(Error::Catalog { source: e });
         }
 
-        // Now that catalog is committed, update the in-memory listing table.
-        // Hold listing_fence for write across the Arc swap so any concurrent
-        // scan() picks up either the old or the new listing atomically.
+        // Now that the catalog is committed, publish the new snapshot to the in-memory
+        // state as a SINGLE atomic visibility flip under listing_fence: the snapshot-id
+        // update, deletion-cache clear, and listing swap must be visible together, or a
+        // concurrent scan (holding listing_fence.read() and capturing the deletion
+        // snapshot and snapshot id at different points) can observe a torn state and
+        // silently vanish/resurrect rows. Mirrors `publish_overwrite_snapshot` and the
+        // compaction publish in `rewrite_current_snapshot_for_compaction`.
         {
             let _fence = self.listing_fence.write().await;
+            self.update_current_snapshot_id(&new_snapshot_id);
+            self.clear_all_deletion_caches();
             self.listing_table.store(new_listing_table);
         }
-
-        // Update in-memory state to match the new catalog
-        self.update_current_snapshot_id(&new_snapshot_id);
-        self.clear_all_deletion_caches();
 
         // Old snapshot directories are cleaned up in the background
         self.trigger_old_snapshot_cleanup(&new_snapshot_id).await;
@@ -29666,9 +29684,10 @@ mod tests {
     //
     // Property under test: `scan()` holds `listing_fence.read()` across the
     // inner DataFusion listing call, and `refresh_listing_table` /
-    // `update_listing_table_for_snapshot` hold `listing_fence.write()` across
-    // the ArcSwap store. Any reader/writer overlap is therefore serialized by
-    // the fence.
+    // `publish_overwrite_snapshot` hold `listing_fence.write()` across the
+    // ArcSwap store (and, for the overwrite publish, the snapshot-id flip and
+    // deletion-cache clear). Any reader/writer overlap is therefore serialized
+    // by the fence.
 
     /// A held `listing_fence` read guard blocks an attempted write fence
     /// acquisition until the read guard is dropped.
