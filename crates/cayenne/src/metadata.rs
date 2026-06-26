@@ -1547,9 +1547,10 @@ pub struct TableStatistics {
     /// the authoritative rewritten count.
     pub num_rows: i64,
     /// Serialized per-column NDV (distinct-count) `HyperLogLog` sketches
-    /// ([`crate::hll::NdvSketches`]), `None` when no integer column has a sketch.
-    /// Merged across writes register-wise; used to size distributed joins on
-    /// sparse integer keys. See [`crate::hll`].
+    /// ([`crate::hll::NdvSketches`]), `None` when no NDV-tracked column has a
+    /// sketch. Merged across writes register-wise; used to size distributed
+    /// joins and group-bys on integer, string, and temporal (date/time/timestamp)
+    /// keys. See [`crate::hll`].
     pub ndv_sketches: Option<Vec<u8>>,
 }
 
