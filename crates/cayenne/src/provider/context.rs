@@ -786,7 +786,7 @@ impl CayenneContext {
             tracing::warn!(
                 table = %self.dataset,
                 constraint = tuning::binding_constraint(snapshot),
-                "Cayenne adaptive tuning: SLO appears infeasible on this hardware — every relevant actuator is at its limit and the goal is still violated. Relax the goal or scale the binding resource."
+                "Cayenne adaptive tuning: SLO appears infeasible on this hardware — no further tuning adjustment is available (actuator bounds or resource gating) and the goal is still violated. See `constraint` for the binding resource; relax the goal or scale it."
             );
         }
     }
