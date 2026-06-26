@@ -395,18 +395,44 @@ async fn init_csv_runtime(
     engine: &str,
     accel_params: HashMap<String, String>,
 ) -> Result<Runtime, anyhow::Error> {
+    // file_update storage mode, default (`block`) policy — the historical CSV recreate path.
+    init_csv_runtime_with(
+        csv_path,
+        engine,
+        accel_params,
+        Mode::FileUpdate,
+        spicepod::component::dataset::OnSchemaChange::Block,
+        None,
+    )
+    .await
+}
+
+/// Loads a CSV-accelerated `sample` dataset for `engine`, varying the storage `mode`,
+/// `on_schema_change` policy, and `refresh_mode`, then waits for the acceleration checkpoint so
+/// the next phase can detect the prior schema. Shared by the `file_update` and
+/// `drop_and_recreate` CSV phase tests.
+async fn init_csv_runtime_with(
+    csv_path: &str,
+    engine: &str,
+    accel_params: HashMap<String, String>,
+    mode: Mode,
+    on_schema_change: spicepod::component::dataset::OnSchemaChange,
+    refresh_mode: Option<spicepod::acceleration::RefreshMode>,
+) -> Result<Runtime, anyhow::Error> {
     register_test_connectors().await;
 
     let mut ds = Dataset::new(format!("file:{csv_path}"), "sample");
+    ds.on_schema_change = on_schema_change;
     ds.acceleration = Some(Acceleration {
         enabled: true,
         engine: Some(engine.to_string()),
-        mode: Mode::FileUpdate,
+        mode,
+        refresh_mode,
         params: Some(Params::from_string_map(accel_params)),
         ..Acceleration::default()
     });
 
-    let app = AppBuilder::new("test_file_update_csv")
+    let app = AppBuilder::new("test_csv_schema_evolution")
         .with_dataset(ds.clone())
         .build();
 
@@ -536,6 +562,166 @@ async fn test_file_update_csv_cayenne() -> Result<(), anyhow::Error> {
         ),
     ]);
     run_file_update_csv_phases("cayenne", params, &csv_file.to_string_lossy()).await
+}
+
+// --- `on_schema_change: drop_and_recreate` + `refresh_mode: full` tests ---
+//
+// These exercise the policy-driven recreate path added for issue #10008: a non-widening
+// (incompatible) source schema change under `refresh_mode: full` drops and recreates the
+// accelerated table with the new schema, while a widening change is still applied in place.
+// This is distinct from `mode: file_update` (a storage mode) — here the recreate is driven
+// by the dataset-level `on_schema_change: drop_and_recreate` policy with the default
+// `mode: file` storage. Assertions are explicit (row counts + column set) so the cases pass
+// on first CI run without pre-accepted insta `.snap` files.
+
+#[cfg(any(feature = "duckdb", feature = "sqlite", not(windows)))]
+async fn init_drop_recreate_csv_runtime(
+    csv_path: &str,
+    engine: &str,
+    accel_params: HashMap<String, String>,
+) -> Result<Runtime, anyhow::Error> {
+    // The policy lives at the dataset level; storage stays the default `file` mode and the
+    // recreate is triggered by `drop_and_recreate` + `refresh_mode: full`, NOT `file_update`.
+    init_csv_runtime_with(
+        csv_path,
+        engine,
+        accel_params,
+        Mode::File,
+        spicepod::component::dataset::OnSchemaChange::DropAndRecreate,
+        Some(spicepod::acceleration::RefreshMode::Full),
+    )
+    .await
+}
+
+#[cfg(any(feature = "duckdb", feature = "sqlite", not(windows)))]
+#[expect(clippy::expect_used)]
+async fn assert_csv_query(
+    rt: &Arc<Runtime>,
+    sql: &str,
+    expected_rows: usize,
+    expected_cols: &[&str],
+) {
+    let batches = run_query(rt, sql).await.expect("query should succeed");
+    let rows: usize = batches
+        .iter()
+        .map(arrow::array::RecordBatch::num_rows)
+        .sum();
+    assert_eq!(
+        rows, expected_rows,
+        "`{sql}` returned {rows} rows, expected {expected_rows}"
+    );
+    let schema = batches.first().expect("at least one record batch").schema();
+    let actual_cols: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
+    for col in expected_cols {
+        assert!(
+            actual_cols.contains(col),
+            "expected column `{col}` in result columns {actual_cols:?}"
+        );
+    }
+    assert_eq!(
+        actual_cols.len(),
+        expected_cols.len(),
+        "result column set {actual_cols:?} does not match expected {expected_cols:?}"
+    );
+}
+
+#[cfg(any(feature = "duckdb", feature = "sqlite", not(windows)))]
+async fn run_drop_recreate_csv_phases(
+    engine: &str,
+    accel_params: HashMap<String, String>,
+    csv_path: &str,
+) -> Result<(), anyhow::Error> {
+    let _tracing = init_tracing(Some("integration=debug,info"));
+    let sql = "SELECT * FROM sample ORDER BY id";
+
+    test_request_context()
+        .scope(async {
+            // Phase 1: initial load (4 columns).
+            std::fs::write(csv_path, CSV_INITIAL).expect("write csv");
+            let rt = Arc::new(
+                init_drop_recreate_csv_runtime(csv_path, engine, accel_params.clone()).await?,
+            );
+            assert_csv_query(&rt, sql, 2, &["id", "name", "age", "city"]).await;
+            rt.shutdown().await;
+            drop(rt);
+
+            // Phase 2: additive column (widening) — the new column is adopted and existing
+            // rows are preserved. This asserts the observable outcome only; the in-place-ALTER
+            // vs drop+recreate distinction is covered by the classifier/policy unit tests.
+            std::fs::write(csv_path, CSV_ADD_COLUMN).expect("write csv");
+            let rt = Arc::new(
+                init_drop_recreate_csv_runtime(csv_path, engine, accel_params.clone()).await?,
+            );
+            assert_csv_query(&rt, sql, 2, &["id", "name", "age", "city", "lname"]).await;
+            rt.shutdown().await;
+            drop(rt);
+
+            // Phase 3: dropped column (incompatible) — drops + recreates with the new schema.
+            std::fs::write(csv_path, CSV_DROP_COLUMN).expect("write csv");
+            let rt = Arc::new(
+                init_drop_recreate_csv_runtime(csv_path, engine, accel_params.clone()).await?,
+            );
+            assert_csv_query(&rt, sql, 2, &["id", "name", "city"]).await;
+            rt.shutdown().await;
+            drop(rt);
+
+            // Phase 4: no-change restart — stable, data preserved (no recreate).
+            let rt = Arc::new(
+                init_drop_recreate_csv_runtime(csv_path, engine, accel_params.clone()).await?,
+            );
+            assert_csv_query(&rt, sql, 2, &["id", "name", "city"]).await;
+            rt.shutdown().await;
+            drop(rt);
+
+            Ok(())
+        })
+        .await
+}
+
+#[cfg(feature = "duckdb")]
+#[tokio::test]
+async fn test_drop_recreate_full_csv_duckdb() -> Result<(), anyhow::Error> {
+    let temp_dir = tempfile::tempdir()?;
+    let accel_file = temp_dir.path().join("sample.duckdb");
+    let csv_file = temp_dir.path().join("sample.csv");
+    let params = HashMap::from([(
+        "duckdb_file".to_string(),
+        accel_file.to_string_lossy().to_string(),
+    )]);
+    run_drop_recreate_csv_phases("duckdb", params, &csv_file.to_string_lossy()).await
+}
+
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn test_drop_recreate_full_csv_sqlite() -> Result<(), anyhow::Error> {
+    let temp_dir = tempfile::tempdir()?;
+    let accel_file = temp_dir.path().join("sample.db");
+    let csv_file = temp_dir.path().join("sample.csv");
+    let params = HashMap::from([(
+        "sqlite_file".to_string(),
+        accel_file.to_string_lossy().to_string(),
+    )]);
+    run_drop_recreate_csv_phases("sqlite", params, &csv_file.to_string_lossy()).await
+}
+
+#[cfg(not(windows))]
+#[tokio::test]
+async fn test_drop_recreate_full_csv_cayenne() -> Result<(), anyhow::Error> {
+    let temp_dir = tempfile::tempdir()?;
+    let data_dir = temp_dir.path().join("data");
+    let metadata_dir = temp_dir.path().join("metadata");
+    let csv_file = temp_dir.path().join("sample.csv");
+    let params = HashMap::from([
+        (
+            "cayenne_file_path".to_string(),
+            data_dir.to_string_lossy().to_string(),
+        ),
+        (
+            "cayenne_metadata_dir".to_string(),
+            metadata_dir.to_string_lossy().to_string(),
+        ),
+    ]);
+    run_drop_recreate_csv_phases("cayenne", params, &csv_file.to_string_lossy()).await
 }
 
 // --- Widening schema evolution (`on_schema_change`) tests ---

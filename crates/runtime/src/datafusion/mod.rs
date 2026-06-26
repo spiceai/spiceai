@@ -50,14 +50,15 @@ use crate::dataupdate::{
 use crate::federated_table::FederatedTable;
 use crate::schema_evolution::{
     SCHEMA_EVOLUTION_APPLIED, SCHEMA_EVOLUTION_DETECTED, SCHEMA_EVOLUTION_FAILED,
-    dataset_constraint_columns, engine_supports_in_place_evolution, evolution_allowed,
+    dataset_constraint_columns, emit_schema_evolution_event, engine_supports_in_place_evolution,
+    evolution_allowed, policy_recreates_on_incompatible, recreates_on_schema_mismatch,
     reorder_to_checkpoint_order, restrict_schema_to, schema_evolution_labels, widening_plan_kind,
 };
-use crate::search::full_text::udtf::TEXT_SEARCH_UDTF_NAME;
 use crate::secrets::Secrets;
 use crate::tracing_util::view_registered_trace;
 use crate::view::prepare_view;
 use crate::{status, view};
+use runtime_search::udtf::TEXT_SEARCH_UDTF_NAME;
 
 use snafu::ResultExt;
 use {
@@ -76,6 +77,7 @@ use arrow_tools::schema_evolution::{EvolutionContext, SchemaEvolution, WideningP
 use builder::DataFusionBuilder;
 use cache::TabledCacheProvider;
 use cache::result::embeddings::CachedEmbeddingResult;
+use cache::result::query::QueryResult;
 use cache::result::search::CachedSearchResult;
 use cache::{CacheProvider, Caching, QueryResultsCacheProvider, key::RawCacheKey};
 use data_components::{
@@ -87,9 +89,9 @@ use datafusion::catalog::SchemaProvider;
 use datafusion::common::{Constraint, Constraints, ToDFSchema};
 use datafusion::datasource::TableProvider;
 use datafusion::error::DataFusionError;
-use datafusion::execution::SessionState;
 use datafusion::execution::context::SessionContext;
 use datafusion::execution::runtime_env::RuntimeEnv;
+use datafusion::execution::{SendableRecordBatchStream, SessionState};
 use datafusion::logical_expr::LogicalPlan;
 use datafusion::logical_expr::dml::InsertOp;
 use datafusion::physical_plan::collect;
@@ -113,8 +115,8 @@ use runtime_acceleration::snapshot::AccelerationLayout;
 ))]
 use runtime_acceleration::snapshot::SnapshotManager;
 use runtime_async::ManagedTokioRuntime;
-use runtime_datafusion::query_engine::Error as QueryEngineError;
 use runtime_datafusion_index::IndexedTableProvider;
+use runtime_query_engine::query_engine::Error as QueryEngineError;
 use runtime_table_partition::provider::PartitionTableProvider;
 use schema::ensure_schema_exists;
 use snafu::prelude::*;
@@ -2900,6 +2902,15 @@ impl DataFusion {
         let is_file_update =
             acceleration_settings.mode == Mode::FileUpdate && refresh_mode != RefreshMode::Disabled;
 
+        // Whether a change the in-place policy can't evolve should drop + recreate the table
+        // (`file_update` mode, or `on_schema_change: drop_and_recreate` under `refresh_mode:
+        // full` on a recreate-capable engine; a full refresh re-fetches every row, so dropping
+        // loses no un-recoverable data). This is the same helper the initial-load and reload
+        // schema-mismatch gates consult, so "bypass the deferred-mismatch gate" and "recreate
+        // here" cannot disagree.
+        let allow_recreate =
+            recreates_on_schema_mismatch(acceleration_settings, policy, refresh_mode);
+
         // `block` consults no classifier and reads the checkpoint only on the
         // file_update path — today's code paths verbatim.
         if policy == OnSchemaChange::Block && !is_file_update {
@@ -3045,6 +3056,12 @@ impl DataFusion {
                                     "Applied widening schema evolution to the '{engine}' acceleration: {change}",
                                     engine = acceleration_settings.engine,
                                 );
+                                emit_schema_evolution_event(
+                                    &dataset_name,
+                                    "applied",
+                                    &change,
+                                    false,
+                                );
                                 // The table schema changed; cached plans are obsolete.
                                 self.clear_cached_plans().await;
                                 return Ok(Some(Arc::clone(&plan.evolved_schema)));
@@ -3057,13 +3074,13 @@ impl DataFusion {
                                 tracing::warn!(
                                     dataset = %dataset.name,
                                     "Failed to apply widening schema evolution ({change}): {e}{fallback}",
-                                    fallback = if is_file_update {
-                                        ". The acceleration is recreated (file_update mode)"
+                                    fallback = if allow_recreate {
+                                        ". The acceleration is dropped and recreated with the new schema"
                                     } else {
                                         ". The new schema is not applied; a restart retries the evolution"
                                     },
                                 );
-                                if !is_file_update {
+                                if !allow_recreate {
                                     // Evolution failed and we will not drop-recreate: pin
                                     // back to the un-evolved engine-table schema so the
                                     // registered provider matches it. Use `comparison_schema`,
@@ -3093,40 +3110,63 @@ impl DataFusion {
                             1,
                             &schema_evolution_labels(&dataset_name, "incompatible", "fail_policy"),
                         );
+                        emit_schema_evolution_event(&dataset_name, "fail_policy", &reason, true);
                         return SchemaChangeFailPolicySnafu {
                             dataset_name,
                             change: reason,
                         }
                         .fail();
                     }
-                    SCHEMA_EVOLUTION_FAILED.add(
-                        1,
-                        &schema_evolution_labels(&dataset_name, "incompatible", "incompatible"),
-                    );
-                    tracing::warn!(
-                        dataset = %dataset.name,
-                        "Schema change detected that cannot be evolved under `on_schema_change: {policy}`: {reason}{fallback}",
-                        fallback = if is_file_update {
-                            ". The acceleration is recreated (file_update mode)"
-                        } else {
-                            ". The new schema is not applied; revert the source schema change to recover"
-                        },
-                    );
+                    if allow_recreate {
+                        // `drop_and_recreate` (full mode) or `file_update`: the change
+                        // cannot be applied in place, so fall through to the snapshot +
+                        // drop + recreate path below, which logs and emits the APPLIED
+                        // (action=recreate) metric + event once the table is dropped.
+                        tracing::warn!(
+                            dataset = %dataset.name,
+                            "Schema change detected that cannot be applied in place ({reason}); the acceleration is dropped and recreated with the new schema (on_schema_change: {policy})",
+                        );
+                    } else {
+                        SCHEMA_EVOLUTION_FAILED.add(
+                            1,
+                            &schema_evolution_labels(&dataset_name, "incompatible", "incompatible"),
+                        );
+                        // `drop_and_recreate` reaching here means the recreate gate failed
+                        // (not `refresh_mode: full`, or an engine without `drop_table`); point
+                        // the user at the requirement rather than only "revert".
+                        tracing::warn!(
+                            dataset = %dataset.name,
+                            "Schema change detected that cannot be evolved under `on_schema_change: {policy}`: {reason}.{fallback}",
+                            fallback = if policy_recreates_on_incompatible(policy) {
+                                " `drop_and_recreate` recreates the table only with `refresh_mode: full` on a supported engine (DuckDB, SQLite, Turso, Cayenne); the new schema is not applied. Use `refresh_mode: full`, or revert the source schema change, to recover"
+                            } else {
+                                " The new schema is not applied; revert the source schema change to recover"
+                            },
+                        );
+                        emit_schema_evolution_event(&dataset_name, "incompatible", &reason, true);
+                    }
                 }
             }
         }
 
-        // file_update mode contract: anything the policy did not evolve falls back to
-        // snapshot + drop-recreate (today's behavior verbatim under `block`).
-        if is_file_update
+        // Recreate path: `file_update` mode, or `on_schema_change: drop_and_recreate`
+        // under `refresh_mode: full` (`allow_recreate`). Anything the in-place policy did
+        // not evolve falls back to snapshot + drop + recreate with the new schema (under
+        // `block`, this is `file_update`'s today's-behavior-verbatim contract).
+        if allow_recreate
             && let Some(diff) = arrow_tools::schema::schema_difference(
                 &comparison_schema,
                 &normalized_refresh_schema,
             )
         {
+            let dataset_name = dataset.name.to_string();
+            let trigger = if is_file_update {
+                "file_update mode"
+            } else {
+                "on_schema_change: drop_and_recreate"
+            };
             tracing::warn!(
-                "Dataset {} schema change detected in file_update mode. {diff}. Acceleration file is replaced.",
-                dataset.name
+                "Dataset {dataset_name} schema change detected ({trigger}). {diff}. The acceleration is dropped and recreated with the new schema.",
             );
 
             // Snapshot before recreating (best-effort)
@@ -3136,7 +3176,7 @@ impl DataFusion {
             {
                 dataaccelerator::snapshots::snapshot_before_recreate(
                     acceleration_settings,
-                    &dataset.name.to_string(),
+                    &dataset_name,
                     layout,
                     accel_engine,
                     Arc::clone(&existing_schema),
@@ -3152,16 +3192,28 @@ impl DataFusion {
                 .get_accelerator_engine(acceleration_settings.engine)
                 .await
                 .ok_or_else(|| Error::ExpectedAccelerationSettings {
-                    name: dataset.name.to_string(),
+                    name: dataset_name.clone(),
                 })?;
             accelerator
-                .drop_table(&dataset.name.to_string(), dataset)
+                .drop_table(&dataset_name, dataset)
                 .await
                 .map_err(|e| dataaccelerator::Error::AccelerationCreationFailed { source: e })
                 .context(UnableToCreateDataAcceleratorSnafu)?;
 
             // Clear the checkpoint so the refresh treats this as a fresh table
             let _ = cp.delete().await;
+
+            // The table is recreated with a new schema; cached logical plans reference the
+            // old schema and must be dropped (mirrors the in-place evolution path above).
+            self.clear_cached_plans().await;
+
+            SCHEMA_EVOLUTION_APPLIED.add(
+                1,
+                &schema_evolution_labels(&dataset_name, "recreate", "recreate"),
+            );
+            // Use the same `recreate` action label as the SCHEMA_EVOLUTION_APPLIED metric
+            // above so metrics and task_history rows correlate by action for this outcome.
+            emit_schema_evolution_event(&dataset_name, "recreate", &diff, false);
         }
 
         Ok(None)
@@ -3994,13 +4046,6 @@ impl DataFusion {
             .table_names())
     }
 
-    /// Create a [`Query`] based on a constructed [`LogicalPlan`].
-    ///
-    /// The `plan` should be valid, constructed off the [`DataFusion`]'s [`SessionContext`].
-    pub fn query_from_logical_plan(self: &Arc<Self>, plan: &LogicalPlan) -> Query {
-        Query::from_logical_plan(self, plan)
-    }
-
     pub fn query_builder<'a>(self: &Arc<Self>, sql: &'a str) -> QueryBuilder<'a> {
         QueryBuilder::new(sql, Arc::clone(self))
     }
@@ -4232,7 +4277,7 @@ impl runtime_cluster::context::PartitionDiscoverer for DataFusion {
 }
 
 #[async_trait::async_trait]
-impl runtime_datafusion::query_engine::QueryEngine for DataFusion {
+impl runtime_query_engine::query_engine::QueryEngine for DataFusion {
     fn session_context(&self) -> &Arc<SessionContext> {
         &self.ctx
     }
@@ -4252,7 +4297,7 @@ impl runtime_datafusion::query_engine::QueryEngine for DataFusion {
     async fn get_arrow_schema(
         &self,
         table_ref: TableReference,
-    ) -> runtime_datafusion::query_engine::Result<Schema> {
+    ) -> runtime_query_engine::query_engine::Result<Schema> {
         DataFusion::get_arrow_schema(self, table_ref.clone())
             .await
             .map_err(|e| QueryEngineError::GetSchema {
@@ -4265,7 +4310,7 @@ impl runtime_datafusion::query_engine::QueryEngine for DataFusion {
         DataFusion::get_user_table_names(self)
     }
 
-    fn get_public_table_names(&self) -> runtime_datafusion::query_engine::Result<Vec<String>> {
+    fn get_public_table_names(&self) -> runtime_query_engine::query_engine::Result<Vec<String>> {
         DataFusion::get_public_table_names(self).map_err(|e| QueryEngineError::GetTableNames {
             source: DataFusionError::External(Box::new(e)),
         })
@@ -4281,9 +4326,8 @@ impl runtime_datafusion::query_engine::QueryEngine for DataFusion {
 
     async fn execute_query(
         &self,
-        request: runtime_datafusion::query_engine::QueryRequest,
-    ) -> runtime_datafusion::query_engine::Result<datafusion::execution::SendableRecordBatchStream>
-    {
+        request: runtime_query_engine::query_engine::QueryRequest,
+    ) -> runtime_query_engine::query_engine::Result<SendableRecordBatchStream> {
         let arc_self = self
             .datafusion_ref
             .get()
@@ -4304,14 +4348,37 @@ impl runtime_datafusion::query_engine::QueryEngine for DataFusion {
         if let Some(allowlist) = request.table_allowlist {
             qb = qb.allow_tables(allowlist);
         }
-        let result = qb
-            .build()
+        let QueryResult { data, .. } =
+            qb.build()
+                .run()
+                .await
+                .map_err(|e| QueryEngineError::QueryExecution {
+                    source: DataFusionError::External(Box::new(e)),
+                })?;
+        Ok(data)
+    }
+
+    async fn execute_plan(
+        &self,
+        plan: LogicalPlan,
+    ) -> runtime_query_engine::query_engine::Result<SendableRecordBatchStream> {
+        let arc_self = self
+            .datafusion_ref
+            .get()
+            .and_then(std::sync::Weak::upgrade)
+            .ok_or_else(|| QueryEngineError::QueryExecution {
+                source: DataFusionError::Internal(
+                    "DataFusion self-reference not initialized (call set_self_ref first)"
+                        .to_string(),
+                ),
+            })?;
+        let QueryResult { data, .. } = Query::from_logical_plan(&arc_self, plan)
             .run()
             .await
             .map_err(|e| QueryEngineError::QueryExecution {
                 source: DataFusionError::External(Box::new(e)),
             })?;
-        Ok(result.data)
+        Ok(data)
     }
 
     async fn write_data(
@@ -4319,8 +4386,8 @@ impl runtime_datafusion::query_engine::QueryEngine for DataFusion {
         table_ref: &TableReference,
         schema: Arc<Schema>,
         data: Vec<RecordBatch>,
-        update_type: runtime_datafusion::query_engine::UpdateType,
-    ) -> runtime_datafusion::query_engine::Result<()> {
+        update_type: runtime_query_engine::query_engine::UpdateType,
+    ) -> runtime_query_engine::query_engine::Result<()> {
         let update = DataUpdate {
             schema,
             data,
@@ -4467,10 +4534,6 @@ pub fn is_spice_internal_dataset(dataset: &TableReference) -> bool {
 // so it can be used for comparison.
 fn resolve_table_reference(table: TableReference) -> ResolvedTableReference {
     table.resolve(SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA)
-}
-
-pub(crate) fn resolved_equality(a: TableReference, b: TableReference) -> bool {
-    resolve_table_reference(a) == resolve_table_reference(b)
 }
 
 #[must_use]

@@ -28,6 +28,7 @@ futures.workspace = true
 itertools.workspace = true
 llms = { path = "../llms", default-features = false, optional = true }
 runtime-datafusion-index = { path = "../runtime-datafusion-index" }
+runtime-query-engine = { path = "../runtime-query-engine" }
 runtime-table-partition = { path = "../runtime-table-partition" }
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
