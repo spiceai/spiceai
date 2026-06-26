@@ -456,11 +456,14 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> JobState for Shar
     async fn remove_job(&self, job_id: &str) -> Result<()> {
         self.local_jobs.remove(job_id);
         self.queued_jobs.remove(job_id);
-        // Delete metadata first: if it fails we keep the graph so meta still
-        // points at a valid blob. A subsequent graph-delete failure is then only
-        // a storage leak rather than dangling metadata pointing at nothing.
+        // Delete metadata first, and only delete the graph if that succeeds.
+        // `ObjectState::delete` treats NotFound as success, so an error here is a
+        // real object-store failure: keep the graph so meta still points at a
+        // valid blob rather than dangling to a missing graph. (A graph-delete
+        // failure afterwards is then only a storage leak, not a correctness bug.)
         if let Err(e) = self.meta.delete(job_id).await {
-            tracing::warn!("failed to delete job meta for {job_id}: {e}");
+            tracing::warn!("failed to delete job meta for {job_id}; keeping graph: {e}");
+            return Ok(());
         }
         if let Err(e) = self.store.delete(&self.graph_path(job_id)).await
             && !matches!(e, object_store::Error::NotFound { .. })
