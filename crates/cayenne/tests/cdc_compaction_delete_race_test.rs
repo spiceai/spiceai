@@ -187,7 +187,7 @@ async fn run_once(fixture: &TestFixture, table_name: &str) -> TestResult<()> {
     // giving a wide window during which a delete can interleave.
     let population: i64 = 3000;
     let block = 25;
-    for start in (0..population).step_by(block as usize) {
+    for start in (0..population).step_by(usize::try_from(block).expect("block size fits usize")) {
         let ids: Vec<i64> = (start..(start + block).min(population)).collect();
         insert_block(&table, ids).await?;
     }
@@ -327,7 +327,7 @@ async fn run_once_position(fixture: &TestFixture, table_name: &str) -> TestResul
 
     let population: i64 = 3000;
     let block = 25;
-    for start in (0..population).step_by(block as usize) {
+    for start in (0..population).step_by(usize::try_from(block).expect("block size fits usize")) {
         let ids: Vec<i64> = (start..(start + block).min(population)).collect();
         insert_block(&table, ids).await?;
     }

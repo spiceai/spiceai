@@ -123,6 +123,12 @@ impl Rng {
     fn below(&mut self, n: u64) -> u64 {
         self.next_u64() % n
     }
+    /// Uniform in `[0, n)` returned as `i64`. `n` must be > 0. Convenience for
+    /// the i64 key/value spaces these tests work in.
+    fn below_i64(&mut self, n: i64) -> i64 {
+        let bound = u64::try_from(n).expect("bound must be non-negative");
+        i64::try_from(self.below(bound)).expect("value below an i64 bound fits in i64")
+    }
 }
 
 // ============================================================================
@@ -297,21 +303,21 @@ enum Op {
 }
 
 fn gen_op(rng: &mut Rng, key_space: i64) -> Op {
-    let key = (rng.below(key_space as u64)) as i64;
+    let key = rng.below_i64(key_space);
     match rng.below(100) {
         0..=39 => Op::Upsert {
             key,
-            value: rng.below(1_000_000) as i64,
+            value: rng.below_i64(1_000_000),
         },
         40..=64 => Op::Delete { key },
         65..=72 => Op::DeleteAll,
         73..=84 => {
             // Overwrite a random subset of the key space.
-            let n = rng.below(key_space as u64) + 1;
+            let n = rng.below_i64(key_space) + 1;
             let mut rows = Vec::new();
             for _ in 0..n {
-                let k = rng.below(key_space as u64) as i64;
-                let v = rng.below(1_000_000) as i64;
+                let k = rng.below_i64(key_space);
+                let v = rng.below_i64(1_000_000);
                 // last-writer-wins within the batch (dedup keys)
                 if let Some(slot) = rows.iter_mut().find(|(ek, _): &&mut (i64, i64)| *ek == k) {
                     slot.1 = v;
@@ -463,17 +469,14 @@ async fn run_concurrent_mutations_seed(
     // The model is owned solely by this task (compaction never changes logical
     // contents), so no shared-state synchronization is needed.
     for _ in 0..250 {
-        let key = rng.below(population as u64) as i64;
-        match rng.below(100) {
-            0..=64 => {
-                delete(&table, col("id").eq(lit(key))).await?;
-                model.remove(&key);
-            }
-            _ => {
-                let value = rng.below(1_000_000) as i64;
-                upsert(&table, key, value).await?;
-                model.insert(key, value);
-            }
+        let key = rng.below_i64(population);
+        if let 0..=64 = rng.below(100) {
+            delete(&table, col("id").eq(lit(key))).await?;
+            model.remove(&key);
+        } else {
+            let value = rng.below_i64(1_000_000);
+            upsert(&table, key, value).await?;
+            model.insert(key, value);
         }
         tokio::time::sleep(std::time::Duration::from_millis(1)).await;
     }
@@ -583,7 +586,8 @@ async fn run_concurrent_reads_seed(fixture: &TestFixture, mode: Mode, seed: u64)
         while !read_stop.load(Ordering::Relaxed) {
             match read_rows(&read_ctx, &read_name).await {
                 Ok(live) => {
-                    if live.len() as i64 != n || (0..n).any(|k| !live.contains_key(&k)) {
+                    let live_count = i64::try_from(live.len()).expect("row count fits i64");
+                    if live_count != n || (0..n).any(|k| !live.contains_key(&k)) {
                         violation = Some(format!(
                             "torn read: saw {} rows (expected {n}); missing={:?}",
                             live.len(),
@@ -609,7 +613,7 @@ async fn run_concurrent_reads_seed(fixture: &TestFixture, mode: Mode, seed: u64)
     for _ in 0..150 {
         let rows: Vec<(i64, i64)> = keyset
             .iter()
-            .map(|&k| (k, rng.below(1_000_000) as i64))
+            .map(|&k| (k, rng.below_i64(1_000_000)))
             .collect();
         overwrite(&table, &rows).await?;
         tokio::time::sleep(std::time::Duration::from_millis(1)).await;
@@ -627,7 +631,7 @@ async fn run_concurrent_reads_seed(fixture: &TestFixture, mode: Mode, seed: u64)
     // And it still converges to the last overwrite.
     let live = read_rows(&ctx, &table_name).await?;
     assert_eq!(
-        live.len() as i64,
+        i64::try_from(live.len()).expect("row count fits i64"),
         n,
         "final row count must be N (mode={mode:?})"
     );
