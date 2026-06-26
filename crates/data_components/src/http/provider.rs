@@ -4446,8 +4446,12 @@ mod tests {
     async fn test_query_params_any_order_works() {
         use datafusion::prelude::SessionContext;
 
-        let url = Url::parse("https://api.tvmaze.com").expect("valid URL");
-        let provider = HttpTableProvider::new(url, Client::new(), "json".to_string(), false)
+        // Local mock returning a JSON array for any request, so both param orderings below
+        // produce rows deterministically. Replaces a previously flaky dependency on
+        // api.tvmaze.com — the property under test is that the provider builds a valid
+        // request regardless of query-param order, not the upstream API's contents.
+        let base = start_status_code_server(200, "OK", r#"[{"id":1,"name":"test"}]"#).await;
+        let provider = HttpTableProvider::new(base, Client::new(), "json".to_string(), false)
             .with_allowed_paths(vec!["/search/people".to_string()])
             .expect("allowed paths")
             .enable_query_filters(128);
@@ -4789,6 +4793,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "hits a live external API (jsonplaceholder.typicode.com); flaky in CI — run with --ignored"]
     async fn test_integration_jsonplaceholder_single_post() {
         use datafusion::prelude::SessionContext;
 
@@ -4854,6 +4859,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "hits a live external API (jsonplaceholder.typicode.com); flaky in CI — run with --ignored"]
     async fn test_integration_jsonplaceholder_multiple_posts() {
         use datafusion::prelude::SessionContext;
 
@@ -4926,6 +4932,7 @@ mod tests {
         assert!(found_posts[2], "Should have found post 3");
     }
     #[tokio::test]
+    #[ignore = "hits a live external API (jsonplaceholder.typicode.com); flaky in CI — run with --ignored"]
     async fn test_integration_jsonplaceholder_all_posts() {
         use datafusion::prelude::SessionContext;
 
@@ -4998,6 +5005,7 @@ mod tests {
         assert!(found_last_post, "Should have found post with id 100");
     }
     #[tokio::test]
+    #[ignore = "hits a live external API (api.tvmaze.com); flaky in CI — run with --ignored"]
     async fn test_integration_tvmaze_single_show() {
         use datafusion::prelude::SessionContext;
 
@@ -5057,12 +5065,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_integration_tvmaze_404_not_found() {
+    async fn test_http_404_status_passthrough() {
         use datafusion::prelude::SessionContext;
 
-        // Use an invalid route that returns 404 with JSON error body
-        let url = Url::parse("https://api.tvmaze.com").expect("valid URL");
-        let provider = HttpTableProvider::new(url, Client::new(), "json".to_string(), false)
+        // Local mock returning 404 with a JSON error body. Replaces a previously flaky
+        // dependency on api.tvmaze.com — this exercises the provider's 4xx passthrough
+        // (the row is still produced, carrying the status code and the error body).
+        let body = r#"{"name":"Not Found","message":"Page not found.","status":404}"#;
+        let base = start_status_code_server(404, "Not Found", body).await;
+        let provider = HttpTableProvider::new(base, Client::new(), "json".to_string(), false)
             .with_allowed_paths(vec!["/search/invalid_404".to_string()])
             .expect("allowed paths");
 
@@ -5102,20 +5113,21 @@ mod tests {
             .expect("content should be string array");
 
         let content = content_col.value(0);
-        // TVMaze returns JSON error: {"name":"Not Found","message":"Page not found.","code":0,"status":404,...}
         assert!(
             content.contains("Not Found"),
-            "404 response should contain 'Not Found' in body"
+            "404 response should contain 'Not Found' in body, got: {content}"
         );
     }
 
     #[tokio::test]
-    async fn test_integration_httpbin_500_server_error() {
+    async fn test_http_500_status_passthrough() {
         use datafusion::prelude::SessionContext;
 
-        // httpbin.org provides endpoints that return specific HTTP status codes
-        let url = Url::parse("https://httpbin.org").expect("valid URL");
-        let provider = HttpTableProvider::new(url, Client::new(), "json".to_string(), false)
+        // Local mock returning 500 with an empty body. Replaces a previously flaky
+        // dependency on httpbin.org — this exercises the provider's 5xx passthrough
+        // (the row is still produced, carrying the status code and an empty body).
+        let base = start_status_code_server(500, "Internal Server Error", "").await;
+        let provider = HttpTableProvider::new(base, Client::new(), "json".to_string(), false)
             .with_allowed_paths(vec!["/status/500".to_string()])
             .expect("allowed paths");
 
@@ -5161,6 +5173,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "hits a live external API (api.tvmaze.com); flaky in CI — run with --ignored"]
     async fn test_integration_tvmaze_multiple_shows() {
         use datafusion::prelude::SessionContext;
 
@@ -5238,6 +5251,7 @@ mod tests {
         assert!(found_game_thrones, "Should have found Game of Thrones");
     }
     #[tokio::test]
+    #[ignore = "hits a live external API (api.tvmaze.com); flaky in CI — run with --ignored"]
     async fn test_integration_tvmaze_projection() {
         use datafusion::prelude::SessionContext;
 
@@ -5286,6 +5300,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "hits a live external API (api.tvmaze.com); flaky in CI — run with --ignored"]
     async fn test_integration_tvmaze_aggregation() {
         use datafusion::prelude::SessionContext;
 
@@ -5364,6 +5379,7 @@ mod tests {
     /// paginate through search results, and `pagination_data_pointer` to extract
     /// the `docs` array from each page.
     #[tokio::test]
+    #[ignore = "hits a live external API (openlibrary.org); flaky in CI — run with --ignored"]
     async fn test_integration_openlibrary_query_param_pagination() {
         use datafusion::prelude::SessionContext;
 
@@ -5782,6 +5798,43 @@ mod tests {
             Url::parse("https://api.example.com/items?page=0").expect("test URL should be valid");
         record_pagination_request_url(&mut state, &evicted_url)
             .expect("evicted URL should not be retained forever");
+    }
+
+    /// Spin up a throwaway localhost HTTP server that answers every request with a fixed
+    /// status line and body, then returns its base URL. Used by the HTTP error-status tests
+    /// so they exercise the provider's 4xx/5xx passthrough deterministically instead of
+    /// depending on public echo services (httpbin.org, tvmaze), which made those tests flaky.
+    async fn start_status_code_server(
+        status_code: u16,
+        reason: &'static str,
+        body: &'static str,
+    ) -> Url {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("mock server should bind");
+        let address = listener.local_addr().expect("mock server should have addr");
+
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                tokio::spawn(async move {
+                    // Drain the request line/headers so the client isn't reset before it reads.
+                    let mut buffer = [0_u8; 1024];
+                    let _ = stream.read(&mut buffer).await;
+                    let response = format!(
+                        "HTTP/1.1 {status_code} {reason}\r\nContent-Type: application/json\r\nContent-Length: {len}\r\nConnection: close\r\n\r\n{body}",
+                        len = body.len(),
+                    );
+                    let _ = stream.write_all(response.as_bytes()).await;
+                });
+            }
+        });
+
+        Url::parse(&format!("http://{address}")).expect("mock URL should be valid")
     }
 
     async fn start_query_param_pagination_server(stop_offset: usize) -> (Url, Arc<AtomicUsize>) {

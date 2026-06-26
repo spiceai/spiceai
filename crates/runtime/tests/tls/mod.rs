@@ -327,24 +327,37 @@ async fn test_ballista_backoff_config_available() -> Result<(), anyhow::Error> {
 
     test_request_context()
         .scope(async {
-            // Verify the FibonacciBackoffBuilder is available and can be configured
-            // This is the same backoff mechanism used in the Ballista executor poll loop
+            // Verify the FibonacciBackoffBuilder is available and can be configured.
+            // This is the same backoff mechanism used in the Ballista executor poll loop.
+            //
+            // Disable randomization for this assertion: the production default applies a
+            // ±30% jitter to each interval, and because the base interval table starts with
+            // two equal entries (1000ms, 1000ms), a jittered later delay can legitimately be
+            // smaller than an earlier one. Asserting "non-decreasing" against jittered values
+            // is therefore inherently flaky. With jitter off we verify the deterministic
+            // underlying progression, which is the property this test actually cares about.
             let mut backoff = FibonacciBackoffBuilder::new()
+                .randomization_factor(0.0)
                 .max_duration(Some(Duration::from_secs(30)))
                 .build();
 
-            // Verify backoff produces increasing delays
+            // Verify backoff produces non-decreasing delays.
             let mut prev_delay = Duration::ZERO;
             for i in 0..5 {
                 if let Some(delay) = backoff.next_duration() {
                     tracing::debug!("Backoff iteration {}: {:?}", i, delay);
                     assert!(
-                        delay >= prev_delay || i == 0,
-                        "Backoff delays should be non-decreasing"
+                        delay >= prev_delay,
+                        "Backoff delay at iteration {i} ({delay:?}) should be >= previous ({prev_delay:?})"
                     );
                     prev_delay = delay;
                 }
             }
+            // Confirm the sequence actually advanced rather than yielding nothing.
+            assert!(
+                prev_delay > Duration::ZERO,
+                "backoff should have produced at least one positive delay"
+            );
 
             tracing::info!(
                 "✅ Fibonacci backoff available for Ballista scheduler disconnection handling"
