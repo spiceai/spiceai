@@ -2712,7 +2712,7 @@ fn tier_bound_fraction(base: f64, storage: StorageClass, measured_mbps: Option<f
 /// actuator bounds themselves.
 pub(crate) fn binding_constraint(s: &IngestSnapshot) -> &'static str {
     if s.mem_pressure.is_some_and(|p| p > MEM_PRESSURE_OK) {
-        "memory-bound (buffers are shrinking to stay within the RAM budget — add memory or lower runtime.query.memory_limit)"
+        "memory-bound (at/over the RAM budget — the controller can't grow buffers to meet the SLO; add memory or lower runtime.query.memory_limit)"
     } else if !s.cpu_ok() {
         if s.cpu_burstable {
             "CPU-bound (burstable instance — CPU credits likely depleted; use a non-burstable instance)"
@@ -2736,8 +2736,12 @@ pub(crate) fn binding_constraint(s: &IngestSnapshot) -> &'static str {
             ),
         )
     {
-        if s.data_tier_is_slow() || s.metastore_tier_is_slow() {
-            "storage/EBS-bandwidth-bound (provision more IOPS/throughput, move the metastore to faster storage, or relax the SLO)"
+        if matches!(s.data_storage, StorageClass::Ebs)
+            || matches!(s.metastore_storage, StorageClass::Ebs)
+        {
+            "storage-bound: EBS write bandwidth (provision more IOPS/throughput, move the metastore to faster storage, or relax the SLO)"
+        } else if s.data_tier_is_slow() || s.metastore_tier_is_slow() {
+            "storage-bound: slow or undetected tier (use faster/local storage, or relax the SLO)"
         } else {
             "write-path I/O-bound (the storage write path can't keep up)"
         }
