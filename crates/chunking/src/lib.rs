@@ -45,7 +45,7 @@ type ChunkIter<'a> = Box<dyn Iterator<Item = &'a str> + 'a>;
 pub trait Chunker: Sync + Send {
     fn chunk_indices<'a>(&self, text: &'a str) -> ChunkIndicesIter<'a>;
 
-    /// Chunks a given `text`, and for each returning the starting (inclusive) and ending (exclusive) indexes into the input `text`.
+    /// Chunks a given `text`, and for each returning the starting (inclusive) and ending (exclusive) **byte** indexes into the input `text`.
     fn chunk_with_offsets<'a>(
         &self,
         text: &'a str,
@@ -54,6 +54,39 @@ pub trait Chunker: Sync + Send {
             self.chunk_indices(text)
                 .map(|(idx, chunk)| ((idx, idx + chunk.len()), chunk)),
         )
+    }
+
+    /// Like [`Chunker::chunk_with_offsets`] but returns **character** offsets
+    /// (0-based start inclusive, end exclusive) rather than byte offsets.
+    ///
+    /// The search read path recovers the matched snippet with DataFusion
+    /// `substring`, which is 1-based and character-counted (PostgreSQL
+    /// semantics). Persisting character offsets — rather than the byte offsets
+    /// `chunk_with_offsets` yields — lets the reader extract the exact chunk for
+    /// non-ASCII text, where a byte index and a character index diverge. See
+    /// issue #11269.
+    fn chunk_with_char_offsets<'a>(
+        &self,
+        text: &'a str,
+    ) -> Box<dyn Iterator<Item = ((usize, usize), &'a str)> + 'a> {
+        // `chunk_indices` yields byte starts in non-decreasing document order, so
+        // walk the char cursor forward between successive starts in O(n) total
+        // rather than re-scanning the prefix for every chunk.
+        let mut prev_byte = 0usize;
+        let mut prev_char = 0usize;
+        Box::new(self.chunk_indices(text).map(move |(byte_idx, chunk)| {
+            let char_start = if byte_idx >= prev_byte {
+                prev_char + text[prev_byte..byte_idx].chars().count()
+            } else {
+                // Defensive: a chunker that emits out-of-order starts (none do
+                // today) still gets a correct, if non-incremental, answer.
+                text[..byte_idx].chars().count()
+            };
+            prev_byte = byte_idx;
+            prev_char = char_start;
+            let char_end = char_start + chunk.chars().count();
+            ((char_start, char_end), chunk)
+        }))
     }
 
     fn chunks<'a>(&self, text: &'a str) -> ChunkIter<'a> {
@@ -391,6 +424,89 @@ mod tests {
                 "Offset range should extract the correct chunk"
             );
         }
+    }
+
+    /// Recover a chunk from `text` using 0-based, end-exclusive character
+    /// offsets — mirrors how the search read path applies the stored offsets via
+    /// DataFusion `substring`.
+    fn chars_in_range(text: &str, start: usize, end: usize) -> String {
+        text.chars().skip(start).take(end - start).collect()
+    }
+
+    #[test]
+    fn test_chunk_with_char_offsets_ascii() {
+        let cfg = ChunkingConfig {
+            target_chunk_size: 5,
+            overlap_size: 0,
+            trim_whitespace: false,
+            file_format: None,
+        };
+        let chunker = RecursiveSplittingChunker::with_character_sizer(&cfg)
+            .expect("failed to create chunker");
+
+        let text = "Hello world";
+        // With trimming disabled and pure-ASCII text, character offsets equal
+        // byte offsets, so they must match `chunk_with_offsets` exactly.
+        let byte_chunks: Vec<_> = chunker.chunk_with_offsets(text).collect();
+        let char_chunks: Vec<_> = chunker.chunk_with_char_offsets(text).collect();
+        assert_eq!(
+            byte_chunks, char_chunks,
+            "ASCII char offsets == byte offsets"
+        );
+
+        for ((start, end), chunk) in &char_chunks {
+            assert_eq!(
+                chars_in_range(text, *start, *end),
+                *chunk,
+                "char offset range should recover the chunk"
+            );
+        }
+    }
+
+    #[test]
+    fn test_chunk_with_char_offsets_non_ascii() {
+        let cfg = ChunkingConfig {
+            target_chunk_size: 4,
+            overlap_size: 0,
+            trim_whitespace: false,
+            file_format: None,
+        };
+        let chunker = RecursiveSplittingChunker::with_character_sizer(&cfg)
+            .expect("failed to create chunker");
+
+        // Multi-byte characters: each of these is 1 char but 2-4 bytes in UTF-8.
+        let text = "café über señor ☕ data";
+        let byte_chunks: Vec<_> = chunker.chunk_with_offsets(text).collect();
+        let char_chunks: Vec<_> = chunker.chunk_with_char_offsets(text).collect();
+
+        assert!(!char_chunks.is_empty(), "expected at least one chunk");
+        assert_eq!(
+            byte_chunks.len(),
+            char_chunks.len(),
+            "byte and char chunking should yield the same chunks"
+        );
+
+        // Every chunk must be recoverable from the text via its character range.
+        for ((start, end), chunk) in &char_chunks {
+            assert_eq!(
+                chars_in_range(text, *start, *end),
+                *chunk,
+                "char offset range should recover the chunk for non-ASCII text"
+            );
+        }
+
+        // The bug being fixed (#11269): byte offsets and character offsets
+        // diverge once a multi-byte character precedes a chunk. Confirm the two
+        // forms actually differ here, so this test would fail if the helper
+        // silently fell back to byte offsets.
+        let any_offset_differs = byte_chunks
+            .iter()
+            .zip(&char_chunks)
+            .any(|((b_off, _), (c_off, _))| b_off != c_off);
+        assert!(
+            any_offset_differs,
+            "char offsets must diverge from byte offsets for multi-byte text"
+        );
     }
 
     #[test]
