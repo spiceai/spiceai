@@ -2834,13 +2834,13 @@ mod tests {
         assert!(e.value().is_none(), "an unseeded average reads as None");
         e.update(10.0);
         assert!(
-            (e.value().unwrap() - 10.0).abs() < 1e-12,
+            (e.value().unwrap_or(f64::NAN) - 10.0).abs() < 1e-12,
             "the first sample seeds the average exactly (no bias toward 0)"
         );
         e.update(20.0); // 0.5*20 + 0.5*10
-        assert!((e.value().unwrap() - 15.0).abs() < 1e-12);
+        assert!((e.value().unwrap_or(f64::NAN) - 15.0).abs() < 1e-12);
         e.update(20.0); // 0.5*20 + 0.5*15
-        assert!((e.value().unwrap() - 17.5).abs() < 1e-12);
+        assert!((e.value().unwrap_or(f64::NAN) - 17.5).abs() < 1e-12);
     }
 
     #[test]
@@ -2849,7 +2849,7 @@ mod tests {
         e.update(5.0);
         e.update(99.0);
         assert!(
-            (e.value().unwrap() - 99.0).abs() < 1e-12,
+            (e.value().unwrap_or(f64::NAN) - 99.0).abs() < 1e-12,
             "alpha=1 tracks the latest sample"
         );
     }
@@ -2861,7 +2861,7 @@ mod tests {
         e.update(0.0);
         // alpha*0 + (1-alpha)*100, derived from the constant so the test tracks it.
         let expected = (1.0 - EWMA_ALPHA) * 100.0;
-        assert!((e.value().unwrap() - expected).abs() < 1e-12);
+        assert!((e.value().unwrap_or(f64::NAN) - expected).abs() < 1e-12);
     }
 
     fn ms(n: u64) -> Duration {
