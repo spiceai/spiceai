@@ -23,5 +23,7 @@ mod distributed_task_history;
 pub mod harness;
 mod in_memory_shuffle;
 mod job_store;
+#[cfg(not(target_os = "windows"))]
+mod scheduler_failover;
 mod simple;
 mod write_through_idle_timeout;
