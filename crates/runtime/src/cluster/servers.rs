@@ -203,17 +203,14 @@ pub async fn start_executor_flight_server(
         });
     }
 
-    // The executor Flight server is the cluster shuffle endpoint: many reducer
-    // partitions fetch concurrently, and a stage cancellation (e.g. a failed sibling
-    // task, or a query that errors mid-flight) resets the in-flight fetch streams in
-    // bursts. Shuffle clients now pool a single multiplexed HTTP/2 connection per
-    // peer (datafusion-ballista `shuffle_reader::fetch_partition_remote`), so those
-    // legitimate RST_STREAMs concentrate on one connection and trip h2's default
-    // Rapid-Reset flood protection (`GOAWAY ENHANCE_YOUR_CALM` after only 20
-    // pending-accept resets, hyperium/hyper#2877). This endpoint is internal —
-    // reachable only by the scheduler and peer executors over cluster mTLS — so the
-    // flood heuristic is a false positive here; raise the threshold well above any
-    // realistic shuffle cancellation burst.
+    // The executor Flight server is the cluster shuffle endpoint: reducer partitions
+    // fetch concurrently over a pooled, multiplexed HTTP/2 connection per peer, and a
+    // stage cancellation resets the in-flight fetch streams in bursts. Those legitimate
+    // RST_STREAMs would otherwise trip h2's Rapid-Reset flood protection
+    // (`GOAWAY ENHANCE_YOUR_CALM` after 20 pending-accept resets, hyperium/hyper#2877).
+    // This endpoint is internal — reachable only by the scheduler and peer executors
+    // over cluster mTLS — so the threshold is set well above any realistic shuffle
+    // cancellation burst.
     const EXECUTOR_MAX_PENDING_ACCEPT_RESET_STREAMS: usize = 100_000;
     let server = configure_flight_server_transport(Server::builder())
         .http2_max_pending_accept_reset_streams(Some(

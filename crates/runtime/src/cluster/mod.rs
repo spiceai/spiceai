@@ -47,7 +47,7 @@ use ballista_core::{ConfigProducer, RuntimeProducer};
 use ballista_executor::execution_loop;
 use ballista_executor::executor::Executor;
 use ballista_scheduler::cluster::memory::{InMemoryClusterState, InMemoryJobState};
-use ballista_scheduler::cluster::{BallistaCluster, ClusterState};
+use ballista_scheduler::cluster::{BallistaCluster, ClusterState, JobState};
 use ballista_scheduler::config::{OnCancelTasksFn, SchedulerConfig};
 use ballista_scheduler::scheduler_process;
 use ballista_scheduler::scheduler_server::SchedulerServer;
@@ -444,6 +444,7 @@ mod reaper;
 pub(crate) mod scheduler_registry;
 mod servers;
 mod service;
+pub(crate) mod shared_job_state;
 
 use crate::cluster::partition::service::PartitionService;
 pub use accelerated_partition_provider::AcceleratedPartitionProvider;
@@ -1870,59 +1871,20 @@ async fn create_scheduler_server(
                 .cloned()
                 .unwrap_or_default();
 
-            let mut cfg = current_context
+            let cfg = current_context
                 .copied_config()
                 .with_target_partitions(target_partitions)
                 .with_option_extension(SpiceClusterConfig::default())
                 .with_option_extension(incoming_request_context)
                 .with_ballista_shuffle_format(ballista_shuffle_format)
-                .with_ballista_shuffle_memory_mode(shuffle_memory_mode)
-                // Enforce the DataFusion settings distributed (Ballista) execution
-                // requires for correctness — the same set the executor applies via
-                // `new_with_ballista`. The session builder otherwise rebuilds from
-                // `current_context.copied_config()` (the local single-node config),
-                // and this config is serialized into the task props sent to
-                // executors, so it governs both the distributed plan and its
-                // execution. Among other things this disables CollectLeft broadcast
-                // joins (whose left child must be a single partition — invalid once
-                // the input is a multi-partition shuffle) and round-robin
-                // repartition.
-                .ballista_restricted_configuration();
+                .with_ballista_shuffle_memory_mode(shuffle_memory_mode);
 
-            // The following optimizations all rely on shared mutable state within a
-            // single process and are incorrect (or fatal) once a plan is split into
-            // stages that run in separate executor processes. They are not disabled
-            // by `ballista_restricted_configuration`, so disable them explicitly on
-            // the session/planning config (which is serialized into executor task
-            // props):
-            {
-                let opts = cfg.options_mut();
-
-                // File-scan work-stealing shares one queue of unopened files across
-                // all of a scan's partition streams. In-process that means each file
-                // is read once; under Ballista every executor process rebuilds the
-                // full queue and reads the whole input — N-fold scan amplification
-                // and N-fold inflated aggregate results.
-                opts.execution.enable_file_scan_work_stealing = false;
-
-                // The hash-join dynamic filter builds a min/max filter from the
-                // build side at runtime and pushes it into the probe-side scan via
-                // shared plan state; across a stage boundary it can never be
-                // populated, and its serialized form carries probe-side column
-                // indices that don't resolve against the receiving stage's schema.
-                // (TopK/aggregate dynamic filters are left enabled — they merely
-                // stay empty across stages rather than erroring.)
-                opts.optimizer.enable_join_dynamic_filter_pushdown = false;
-
-                // Uncorrelated scalar subqueries are otherwise executed by a
-                // `ScalarSubqueryExec` that evaluates them eagerly on one node into a
-                // shared results container; a shuffle boundary between the exec and
-                // its dependent `ScalarSubqueryExpr`s leaves a child stage unable to
-                // decode the expr. Disabling this rewrites them to left joins via
-                // `ScalarSubqueryToJoin` (DataFusion's documented escape hatch for
-                // distributed execution frameworks), which distribute correctly.
-                opts.optimizer.enable_physical_uncorrelated_scalar_subquery = false;
-            }
+            // Apply the DataFusion configuration that distributed (Ballista) execution
+            // requires for correctness. The session builder rebuilds from
+            // `current_context.copied_config()` (the local single-node config), and
+            // this config is serialized into the task props sent to executors, so it
+            // governs both the distributed plan and its execution.
+            let mut cfg = apply_distributed_execution_config(cfg);
 
             // Apply object store shuffle configuration if specified
             if let Some(ref storage_type) = shuffle_storage_type {
@@ -1976,12 +1938,86 @@ async fn create_scheduler_server(
             .with_ballista_shuffle_memory_mode(shuffle_memory_mode)
     });
 
-    // Manually create the BallistaCluster with our custom config_producer
-    let job_state = Arc::new(InMemoryJobState::new(
-        metrics_node_id,
-        session_builder,
-        config_producer,
-    ));
+    // Back job state with shared object storage when a scheduler state location is
+    // configured, so in-flight jobs survive scheduler loss and any scheduler can
+    // resume them; otherwise keep job state in memory.
+    //
+    // The spicepod loads asynchronously after the runtime is built. Wait for it with
+    // a fibonacci backoff and keep retrying until it loads (warning periodically)
+    // rather than giving up — when a state location is configured we must honor it,
+    // not silently degrade to in-memory.
+    let scheduler_cfg = {
+        let mut backoff = util::fibonacci_backoff::FibonacciBackoffBuilder::new()
+            .max_retries(None)
+            .build();
+        let started = std::time::Instant::now();
+        let mut last_warn = std::time::Instant::now();
+        // Keep retrying until the spicepod loads (a configured state location must
+        // be honored, never silently degraded), but stay responsive to shutdown so
+        // a process told to stop while the app is still loading can't deadlock here.
+        let shutdown = crate::shutdown_signal();
+        tokio::pin!(shutdown);
+        loop {
+            if let Some(app) = rt.read_app().await {
+                break app.runtime.scheduler.clone();
+            }
+            if last_warn.elapsed() >= std::time::Duration::from_secs(30) {
+                tracing::warn!(
+                    "still waiting for the spicepod to load before configuring the \
+                     scheduler's job state ({}s elapsed)",
+                    started.elapsed().as_secs()
+                );
+                last_warn = std::time::Instant::now();
+            }
+            let delay = backoff
+                .next_duration()
+                .unwrap_or_else(|| std::time::Duration::from_secs(30))
+                .min(std::time::Duration::from_secs(30));
+            tokio::select! {
+                () = tokio::time::sleep(delay) => {}
+                () = &mut shutdown => {
+                    return Err(crate::Error::FailedToStartClusterScheduler {
+                        source: "shutdown requested while waiting for the spicepod to load".into(),
+                    });
+                }
+            }
+        }
+    };
+    let job_state: Arc<dyn JobState> = if let Some(scheduler_cfg) = scheduler_cfg {
+        tracing::info!(
+            state_location = %scheduler_cfg.state_location,
+            "Scheduler using shared object-store job state"
+        );
+        let (store, base_prefix) = scheduler_registry::build_object_store(
+            rt.as_ref(),
+            &scheduler_cfg.state_location,
+            &scheduler_cfg,
+        )
+        .await
+        .map_err(|e| crate::Error::FailedToStartClusterScheduler {
+            source: Box::new(e),
+        })?;
+        let codec: BallistaCodec<LogicalPlanNode, PhysicalPlanNode> = BallistaCodec::new(
+            SpiceLogicalCodec::new_codec(),
+            SpicePhysicalCodec::new(Arc::clone(rt))
+                .boxed()
+                .context(FailedToStartClusterSchedulerSnafu)?,
+        );
+        Arc::new(shared_job_state::SharedJobState::new(
+            metrics_node_id,
+            store,
+            base_prefix,
+            codec,
+            session_builder,
+            config_producer,
+        ))
+    } else {
+        Arc::new(InMemoryJobState::new(
+            metrics_node_id,
+            session_builder,
+            config_producer,
+        ))
+    };
     let cluster = BallistaCluster::new(cluster_state, job_state);
 
     let scheduler_config = SchedulerConfig {
@@ -2003,13 +2039,11 @@ async fn create_scheduler_server(
         on_work_available: Some(on_work_available),
         on_cancel_tasks: Some(on_cancel_tasks),
 
-        // 120s timeout with a 10s heartbeat interval (12 missed beats). Raised from
-        // 30s: under heavy distributed queries the executor->scheduler heartbeat can
-        // lapse for tens of seconds while an executor is busy, and a 30s timeout
-        // falsely marks a live, busy executor dead -> the scheduler removes it ->
-        // its in-flight stage tasks fail -> the query flaps/hangs. A larger tolerance
-        // rides over transient lapses without meaningfully delaying real dead-executor
-        // detection for a cluster doing minutes-long distributed queries.
+        // Mark an executor dead after 120s without a heartbeat (heartbeats are sent
+        // every 10s, i.e. 12 missed beats). A heavy distributed query can keep an
+        // executor busy enough that its heartbeats lapse for tens of seconds, so the
+        // tolerance keeps a live, busy executor registered while still detecting a
+        // genuinely dead one promptly relative to minutes-long distributed queries.
         executor_timeout_seconds: 120,
 
         // The Spice executor uses pull-based polling (execution_loop::poll_loop),
@@ -2231,6 +2265,51 @@ async fn executor_bind_object_stores(rt: Arc<Runtime>) -> crate::Result<()> {
     Ok(())
 }
 
+/// Apply the DataFusion configuration that distributed (Ballista) execution requires
+/// for correctness, returning the adjusted [`SessionConfig`].
+///
+/// This is the same set the executor applies via `new_with_ballista`, applied here so
+/// the scheduler-side plan and the config serialized into executor task props agree.
+fn apply_distributed_execution_config(cfg: SessionConfig) -> SessionConfig {
+    // `ballista_restricted_configuration` enforces the settings that distributed
+    // execution requires — among other things it disables CollectLeft broadcast joins
+    // (whose left child must be a single partition, invalid once the input is a
+    // multi-partition shuffle) and round-robin repartition.
+    let mut cfg = cfg.ballista_restricted_configuration();
+
+    // These optimizations rely on shared mutable state within a single process and are
+    // incorrect (or fatal) once a plan is split into stages that run in separate
+    // executor processes; `ballista_restricted_configuration` does not cover them.
+    {
+        let opts = cfg.options_mut();
+
+        // File-scan work-stealing shares one queue of unopened files across all of a
+        // scan's partition streams. In-process each file is read once; under Ballista
+        // every executor process rebuilds the full queue and reads the whole input —
+        // N-fold scan amplification and N-fold inflated aggregates.
+        opts.execution.enable_file_scan_work_stealing = false;
+
+        // The hash-join dynamic filter builds a min/max filter from the build side at
+        // runtime and pushes it into the probe-side scan via shared plan state; across
+        // a stage boundary it can never be populated, and its serialized form carries
+        // probe-side column indices that don't resolve against the receiving stage's
+        // schema. (TopK/aggregate dynamic filters stay enabled — they merely remain
+        // empty across stages rather than erroring.)
+        opts.optimizer.enable_join_dynamic_filter_pushdown = false;
+
+        // An uncorrelated scalar subquery is otherwise executed by a
+        // `ScalarSubqueryExec` that evaluates it eagerly on one node into a shared
+        // results container; a shuffle boundary between the exec and its dependent
+        // `ScalarSubqueryExpr`s leaves a child stage unable to decode the expr.
+        // Disabling this rewrites them to left joins via `ScalarSubqueryToJoin`
+        // (DataFusion's documented escape hatch for distributed execution frameworks),
+        // which distribute correctly.
+        opts.optimizer.enable_physical_uncorrelated_scalar_subquery = false;
+    }
+
+    cfg
+}
+
 #[cfg(test)]
 mod tests {
     use super::ClusterTlsConfig;
@@ -2245,6 +2324,20 @@ mod tests {
         CapturedX509Certificate, EcdsaCurve, InMemorySigningKeyPair, KeyAlgorithm, Sign, Signer,
         X509Certificate,
     };
+
+    #[test]
+    fn distributed_execution_config_disables_single_process_optimizations() {
+        let cfg = super::apply_distributed_execution_config(
+            ::datafusion::prelude::SessionConfig::new(),
+        );
+        let opts = cfg.options();
+        // Single-process-only optimizations must be disabled for distributed execution.
+        assert!(!opts.execution.enable_file_scan_work_stealing);
+        assert!(!opts.optimizer.enable_join_dynamic_filter_pushdown);
+        assert!(!opts.optimizer.enable_physical_uncorrelated_scalar_subquery);
+        // Ballista restricted configuration disables round-robin repartition.
+        assert!(!opts.optimizer.enable_round_robin_repartition);
+    }
 
     fn create_signed_certificate(
         subject_cn: &str,

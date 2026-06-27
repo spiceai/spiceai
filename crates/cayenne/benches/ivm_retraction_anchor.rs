@@ -385,6 +385,7 @@ fn registry_schema() -> SchemaRef {
 
 fn sum_spec() -> MaintainedAggregateSpec {
     MaintainedAggregateSpec {
+        filter: None,
         group_by: vec!["group".to_string()],
         aggregates: vec![MaintainedAggregateExpr {
             function: MaintainedAggregateFunction::Sum,
@@ -510,6 +511,7 @@ fn retract_schema() -> SchemaRef {
 
 fn retract_spec() -> MaintainedAggregateSpec {
     MaintainedAggregateSpec {
+        filter: None,
         group_by: vec!["group".to_string()],
         aggregates: vec![MaintainedAggregateExpr {
             function: MaintainedAggregateFunction::Sum,
