@@ -1154,6 +1154,33 @@ impl DeletionIndex {
         }
     }
 
+    /// Fold BOTH pure deletes and upsert conflicts into the index in a SINGLE
+    /// pass — one `core.extend` (hence one bloom rebuild) instead of one
+    /// `extend_max_*` call per `(sequence, keys)` group. `pure` entries are
+    /// `(pk, delete_seq)`; `conflicts` are `(pk, delete_seq, insert_seq)`.
+    ///
+    /// Because the merge is per-key max, combining all groups into one
+    /// order-independent fold is exactly what makes replaying a multi-group
+    /// deletion delta under `rcu` against the live index cheap. Prefer this over
+    /// chaining `extend_max_deletes`/`extend_max_conflicts` in a loop, which
+    /// rebuilds the bloom once per group — the compounding cost called out on
+    /// [`Self::extend_max_deletes`].
+    #[must_use]
+    pub fn extend_max(
+        &self,
+        pure: impl IntoIterator<Item = (i64, i64)>,
+        conflicts: impl IntoIterator<Item = (i64, i64, i64)>,
+    ) -> Self {
+        Self {
+            core: self.core.extend(
+                pure.into_iter()
+                    .map(|(pk, delete_seq)| (pk, delete_seq, SEQUENCE_ABSENT))
+                    .chain(conflicts),
+                |pk| hash_key_i64(*pk),
+            ),
+        }
+    }
+
     /// Build a new index with every **deletion** at or below `cutoff` removed,
     /// retaining deletions with `delete_seq > cutoff` and all insert records.
     ///
@@ -1471,6 +1498,29 @@ impl KeyDeletionIndex {
             core: self.core.extend(
                 keys.into_iter()
                     .map(|key| (hash_key_128(key.as_ref()), delete_sequence, insert_sequence)),
+                |key_hash| bloom_half(*key_hash),
+            ),
+        }
+    }
+
+    /// Key-based counterpart to [`DeletionIndex::extend_max`]: folds pure
+    /// deletes (`(key, delete_seq)`) and upsert conflicts
+    /// (`(key, delete_seq, insert_seq)`) in a SINGLE pass / one bloom rebuild.
+    #[must_use]
+    pub fn extend_max<K: AsRef<[u8]>>(
+        &self,
+        pure: impl IntoIterator<Item = (K, i64)>,
+        conflicts: impl IntoIterator<Item = (K, i64, i64)>,
+    ) -> Self {
+        Self {
+            core: self.core.extend(
+                pure.into_iter()
+                    .map(|(key, delete_seq)| {
+                        (hash_key_128(key.as_ref()), delete_seq, SEQUENCE_ABSENT)
+                    })
+                    .chain(conflicts.into_iter().map(|(key, delete_seq, insert_seq)| {
+                        (hash_key_128(key.as_ref()), delete_seq, insert_seq)
+                    })),
                 |key_hash| bloom_half(*key_hash),
             ),
         }
