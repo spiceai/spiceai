@@ -87,7 +87,7 @@ pub(crate) async fn run(args: &DatasetTestArgs) -> anyhow::Result<RowCounts> {
             let scale_factor = args.scale_factor.unwrap_or(1.0);
             #[expect(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
             let terminals = (scale_factor * 10.0) as usize;
-            prepare_chbench_source(scale_factor, terminals, None).await?;
+            prepare_chbench_source(scale_factor, terminals, None, false).await?;
         }
 
         let instance = SpicedInstance::start(start_request).await?;
@@ -351,6 +351,7 @@ pub(crate) async fn prepare_chbench_source(
     scale_factor: f64,
     terminals: usize,
     rate: Option<u32>,
+    skip_seed: bool,
 ) -> anyhow::Result<chbench_driver::PostgresChBenchDriver> {
     if scale_factor < 1.0 || scale_factor.fract() != 0.0 {
         anyhow::bail!(
@@ -375,7 +376,13 @@ pub(crate) async fn prepare_chbench_source(
 
     let source = chbench_source_from_env()?;
     let driver = chbench_driver::PostgresChBenchDriver::connect(config, source).await?;
-    driver.prepare().await?;
+    if skip_seed {
+        // Source is assumed already populated (e.g. restored from a template).
+        // Connect only, so the workload can run against the existing data.
+        println!("Skipping CH-benCHmark seed (--skip-prepare): using existing source data");
+    } else {
+        driver.prepare().await?;
+    }
 
     println!("CH-benCHmark source is ready");
     Ok(driver)

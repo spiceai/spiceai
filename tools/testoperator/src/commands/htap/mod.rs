@@ -71,7 +71,15 @@ pub(crate) async fn run(args: &HtapArgs) -> anyhow::Result<()> {
     let terminals = args.terminals.unwrap_or((scale_factor * 10.0) as usize);
     let duration = Duration::from_secs(test_args.common.duration);
     let driver: Arc<dyn chbench_driver::ChBenchDriver> =
-        Arc::new(prepare_chbench_source(scale_factor, terminals, args.rate).await?);
+        Arc::new(prepare_chbench_source(scale_factor, terminals, args.rate, args.skip_prepare).await?);
+
+    // --prepare-only: the source is now seeded; exit before starting spiced so
+    // an external harness can snapshot the pristine source (e.g. to a Postgres
+    // template database) for fast reuse across subsequent runs.
+    if args.prepare_only {
+        println!("--prepare-only: source prepared, exiting without running the workload");
+        return Ok(());
+    }
 
     // 2. Start spiced.
     let mut spiced_instance = SpicedInstance::start(start_request).await?;
