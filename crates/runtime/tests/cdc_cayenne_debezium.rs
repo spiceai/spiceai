@@ -22,8 +22,8 @@ limitations under the License.
 //! [`ChangeEnvelope`] carrying a `{op, primary_keys, data}` [`ChangeBatch`]
 //! (`op` ∈ `c`/`u`/`d`/`r`; see [`data_components::debezium`]) and feeds a
 //! [`ChangesStream`] to [`RefreshTask::start_changes_stream`] — exactly the same
-//! envelope shape every other CDC connector (Postgres WAL, DynamoDB Streams,
-//! MongoDB Change Streams) produces. From Cayenne's perspective the source is
+//! envelope shape every other CDC connector (Postgres WAL, `DynamoDB` Streams,
+//! `MongoDB` Change Streams) produces. From Cayenne's perspective the source is
 //! irrelevant: these tests build envelopes in the precise wire shape the
 //! Debezium connector emits and drive them through the *real* runtime apply
 //! loop into a primary-keyed, upsert Cayenne table.
