@@ -741,12 +741,12 @@ impl CayenneDeletionSink {
         };
 
         // Build a fresh snapshot with the new deletions and publish via ArcSwap.
-        // Writes are serialised by the per-table write lock so the load+rebuild+store
-        // sequence is race-free.
-        let updated = current
-            .tombstones
-            .extend_max_deletes(written_row_keys.iter().map(|key| (key, delete_sequence)));
-        deletion_snapshot.store(Arc::new(RowConverterDeletionSnapshot::from_index(updated)));
+        deletion_snapshot.rcu(|current| {
+            let updated = current
+                .tombstones
+                .extend_max_deletes(written_row_keys.iter().map(|key| (key, delete_sequence)));
+            Arc::new(RowConverterDeletionSnapshot::from_index(updated))
+        });
         self.refresh_deletion_memory_accounting();
 
         let deleted_count =
@@ -855,12 +855,12 @@ impl CayenneDeletionSink {
         self.catalog.add_delete_file(result.delete_file).await?;
 
         // Build a fresh snapshot with the new deletions and publish via ArcSwap.
-        // Writes are serialised by the per-table write lock so the load+rebuild+store
-        // sequence is race-free.
-        let updated = current
-            .tombstones
-            .extend_max_deletes(pk_values.iter().map(|&pk| (pk, delete_sequence)));
-        deletion_snapshot.store(Arc::new(Int64PkDeletionSnapshot::from_index(updated)));
+        deletion_snapshot.rcu(|current| {
+            let updated = current
+                .tombstones
+                .extend_max_deletes(pk_values.iter().map(|&pk| (pk, delete_sequence)));
+            Arc::new(Int64PkDeletionSnapshot::from_index(updated))
+        });
         self.refresh_deletion_memory_accounting();
 
         let deleted_count =
