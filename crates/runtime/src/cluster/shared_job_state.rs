@@ -531,3 +531,169 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> JobState for Shar
         (self.config_producer)()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ballista_core::serde::protobuf::{FailedJob, QueuedJob, RunningJob, SuccessfulJob};
+    use object_store::memory::InMemory;
+
+    type TestState = SharedJobState<
+        datafusion_proto::protobuf::LogicalPlanNode,
+        datafusion_proto::protobuf::PhysicalPlanNode,
+    >;
+
+    /// A `SharedJobState` backed by an in-memory object store. The codec and
+    /// session/config builders are never exercised by these tests (which stay on
+    /// the metadata/ownership paths and never `load_graph`), so trivial stubs are
+    /// sufficient.
+    fn test_state() -> TestState {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let config_producer: ConfigProducer = Arc::new(SessionConfig::new);
+        let session_builder: SessionBuilder = Arc::new(|_cfg| Ok(SessionContext::new().state()));
+        SharedJobState::new(
+            "scheduler-test",
+            store,
+            "",
+            BallistaCodec::default(),
+            session_builder,
+            config_producer,
+        )
+    }
+
+    fn job_status(job_id: &str, status: Status) -> JobStatus {
+        JobStatus {
+            job_id: job_id.to_string(),
+            job_name: "test".to_string(),
+            status: Some(status),
+        }
+    }
+
+    fn meta_with(job_id: &str, status: Status, owner: Uuid, epoch: u64) -> JobMetadata {
+        TestState::metadata(job_id, &job_status(job_id, status), Some(owner), epoch, 0)
+    }
+
+    #[test]
+    fn is_terminal_classifies_status() {
+        let owner = Uuid::new_v4();
+        assert!(
+            meta_with("j", Status::Successful(SuccessfulJob::default()), owner, 0).is_terminal()
+        );
+        assert!(meta_with("j", Status::Failed(FailedJob::default()), owner, 0).is_terminal());
+        assert!(!meta_with("j", Status::Running(RunningJob::default()), owner, 0).is_terminal());
+        assert!(!meta_with("j", Status::Queued(QueuedJob::default()), owner, 0).is_terminal());
+    }
+
+    #[test]
+    fn is_terminal_treats_corrupt_status_as_terminal() {
+        let mut meta = meta_with(
+            "j",
+            Status::Running(RunningJob::default()),
+            Uuid::new_v4(),
+            0,
+        );
+        // Not a decodable `JobStatus` protobuf.
+        meta.status = vec![0xff, 0xff, 0xff, 0xff];
+        assert!(meta.job_status().is_err(), "status should be undecodable");
+        // An undecodable persisted status must be treated as terminal so a job with
+        // corrupt metadata is never taken over and resumed.
+        assert!(meta.is_terminal());
+    }
+
+    #[tokio::test]
+    async fn try_acquire_refuses_unknown_self_owned_and_corrupt() {
+        let state = test_state();
+
+        // Unknown job: nothing to acquire.
+        assert!(
+            state
+                .try_acquire_job("missing")
+                .await
+                .expect("acquire")
+                .is_none(),
+            "unknown job should not be acquirable"
+        );
+
+        // A job this scheduler already owns is not re-acquired.
+        let self_owned = meta_with(
+            "self",
+            Status::Running(RunningJob::default()),
+            state.owner_instance_id,
+            3,
+        );
+        state
+            .meta
+            .insert_or_update("self", &self_owned)
+            .await
+            .expect("persist self-owned meta");
+        assert!(
+            state
+                .try_acquire_job("self")
+                .await
+                .expect("acquire")
+                .is_none(),
+            "a self-owned job should not be re-acquired"
+        );
+
+        // A foreign-owned job whose status is corrupt is treated as terminal, so
+        // takeover is refused (rather than driving a job we can't decode).
+        let mut corrupt = meta_with(
+            "corrupt",
+            Status::Running(RunningJob::default()),
+            Uuid::new_v4(),
+            1,
+        );
+        corrupt.status = vec![0xff, 0xff, 0xff, 0xff];
+        state
+            .meta
+            .insert_or_update("corrupt", &corrupt)
+            .await
+            .expect("persist corrupt meta");
+        assert!(
+            state
+                .try_acquire_job("corrupt")
+                .await
+                .expect("acquire")
+                .is_none(),
+            "a job with corrupt status should not be taken over"
+        );
+    }
+
+    #[tokio::test]
+    async fn remove_job_deletes_meta_and_graph() {
+        let state = test_state();
+        let meta = meta_with(
+            "j1",
+            Status::Running(RunningJob::default()),
+            state.owner_instance_id,
+            0,
+        );
+        state
+            .meta
+            .insert_or_update("j1", &meta)
+            .await
+            .expect("persist meta");
+        // The graph blob is deleted by path and never decoded, so dummy bytes are fine.
+        state
+            .store
+            .put(&state.graph_path("j1"), b"graph-blob".to_vec().into())
+            .await
+            .expect("persist graph blob");
+
+        assert!(
+            state.get_job_status("j1").await.expect("status").is_some(),
+            "job should be visible before removal"
+        );
+
+        state.remove_job("j1").await.expect("remove");
+
+        assert!(
+            state.get_job_status("j1").await.expect("status").is_none(),
+            "metadata should be gone after removal"
+        );
+        assert!(
+            state.store.get(&state.graph_path("j1")).await.is_err(),
+            "graph blob should be gone after removal"
+        );
+    }
+}
