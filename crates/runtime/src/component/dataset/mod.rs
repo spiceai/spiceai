@@ -204,6 +204,7 @@ pub enum OnSchemaChange {
     Fail,
     AppendNewColumns,
     SyncAllColumns,
+    DropAndRecreate,
 }
 
 impl From<spicepod_dataset::OnSchemaChange> for OnSchemaChange {
@@ -213,6 +214,7 @@ impl From<spicepod_dataset::OnSchemaChange> for OnSchemaChange {
             spicepod_dataset::OnSchemaChange::Fail => OnSchemaChange::Fail,
             spicepod_dataset::OnSchemaChange::AppendNewColumns => OnSchemaChange::AppendNewColumns,
             spicepod_dataset::OnSchemaChange::SyncAllColumns => OnSchemaChange::SyncAllColumns,
+            spicepod_dataset::OnSchemaChange::DropAndRecreate => OnSchemaChange::DropAndRecreate,
         }
     }
 }
@@ -224,6 +226,7 @@ impl Display for OnSchemaChange {
             OnSchemaChange::Fail => write!(f, "fail"),
             OnSchemaChange::AppendNewColumns => write!(f, "append_new_columns"),
             OnSchemaChange::SyncAllColumns => write!(f, "sync_all_columns"),
+            OnSchemaChange::DropAndRecreate => write!(f, "drop_and_recreate"),
         }
     }
 }
