@@ -16,14 +16,16 @@ limitations under the License.
 
 //! A small, mergeable [`HyperLogLog`] cardinality sketch maintained incrementally
 //! on the Cayenne write path, plus a [`NdvSketches`] container that holds one
-//! sketch per (integer) column and (de)serializes them for the metastore.
+//! sketch per NDV-tracked column (integer, string, or temporal) and (de)serializes
+//! them for the metastore.
 //!
 //! Why a purpose-built sketch: `DataFusion`'s `approx_distinct` `HyperLogLog` is
 //! private to its aggregate executor and not importable, and no other HLL crate
 //! is in the dependency graph. The estimate only needs to be accurate enough to
-//! *size distributed joins* on sparse integer keys (e.g. CDC `o_custkey` spanning
-//! ~1e9 with ~1M distinct), so a standard register-array HLL at precision
-//! [`PRECISION`] (≈1.6% standard error) is more than sufficient.
+//! *size distributed joins and group-bys* on keys whose distinct count diverges
+//! sharply from their min/max range (e.g. CDC `o_custkey` spanning ~1e9 with ~1M
+//! distinct, or string group keys like `n_name`), so a standard register-array
+//! HLL at precision [`PRECISION`] (≈1.6% standard error) is more than sufficient.
 //!
 //! Mergeability is the reason this is incremental rather than recomputed: HLL is
 //! a register-wise max, so a write's sketch folds into the metastore aggregate
@@ -105,6 +107,14 @@ impl HyperLogLog {
         self.add_hash(hash);
     }
 
+    /// Add a raw byte value (e.g. a UTF-8 string or binary key). Uses the same
+    /// stable, explicit byte hashing as [`add_i128`](Self::add_i128) so the
+    /// mapping is consistent across runs and builds for the persisted sketch.
+    pub fn add_bytes(&mut self, value: &[u8]) {
+        let hash = hash_index::hash_key_bytes(&[value]);
+        self.add_hash(hash);
+    }
+
     /// Merge another sketch into this one (register-wise max). No-op on a
     /// precision mismatch (treated as incompatible rather than panicking).
     pub fn merge(&mut self, other: &Self) {
@@ -180,7 +190,7 @@ impl Default for HyperLogLog {
 }
 
 /// Per-column NDV sketches, keyed by column index in the table schema. Only
-/// integer columns (join-key candidates) get a sketch.
+/// NDV-tracked columns (integers, strings, temporal) get a sketch.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct NdvSketches {
     columns: BTreeMap<u32, HyperLogLog>,
@@ -360,6 +370,23 @@ mod tests {
         assert!(
             est <= 3,
             "duplicate-only sketch estimated {est}, expected ~1"
+        );
+    }
+
+    #[test]
+    fn add_bytes_counts_distinct_strings() {
+        let mut hll = HyperLogLog::new();
+        for v in 0..10_000u64 {
+            // Distinct strings; repeat each a few times to confirm dedup.
+            let s = format!("name-{v}");
+            for _ in 0..3 {
+                hll.add_bytes(s.as_bytes());
+            }
+        }
+        let est = hll.estimate();
+        assert!(
+            within_error(est, 10_000, 0.05),
+            "string est={est} outside 5% of 10,000"
         );
     }
 

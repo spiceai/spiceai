@@ -755,20 +755,30 @@ impl DataAccelerator for DuckDBAccelerator {
             move || -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 let mut conn = pool.connect_sync()?;
                 let duckdb_conn = DuckDB::duckdb_conn(&mut conn).boxed()?;
+                let tx = duckdb_conn.get_underlying_conn_mut().transaction().boxed()?;
+
+                // DuckDB accelerations use one of two layouts: a base table with the
+                // logical name (append history), or a view with the logical name over
+                // internal `__data_{name}_{unix_ms}` table(s) (the post-overwrite,
+                // full-refresh layout). `DROP TABLE` errors on a view (and `DROP VIEW` on a
+                // table), so dispatch on the actual object type, then drop every internal
+                // data table so the acceleration can be recreated cleanly with a new schema.
                 let escaped = table_name.replace('"', "\"\"");
-                let drop_sql = format!("DROP TABLE IF EXISTS \"{escaped}\"");
-                duckdb_conn
-                    .get_underlying_conn_mut()
-                    .execute(&drop_sql, [])
-                    .boxed()?;
-                // Also drop any internal DuckDB tables associated with this table
-                let internal_name = format!("__data_{table_name}").replace('"', "\"\"");
-                let internal_drop = format!("DROP TABLE IF EXISTS \"{internal_name}\"");
-                let _ = duckdb_conn
-                    .get_underlying_conn_mut()
-                    .execute(&internal_drop, []);
+                if duckdb_view_exists(&tx, &table_name)? {
+                    tx.execute(&format!("DROP VIEW IF EXISTS \"{escaped}\""), [])
+                        .boxed()?;
+                } else if duckdb_table_exists(&tx, &table_name)? {
+                    tx.execute(&format!("DROP TABLE IF EXISTS \"{escaped}\""), [])
+                        .boxed()?;
+                }
+                for (internal_table, _) in list_internal_data_tables(&tx, &table_name)? {
+                    let escaped_internal = internal_table.replace('"', "\"\"");
+                    tx.execute(&format!("DROP TABLE IF EXISTS \"{escaped_internal}\""), [])
+                        .boxed()?;
+                }
+                tx.commit().boxed()?;
                 tracing::info!(
-                    "Dropped DuckDB table '{table_name}' for schema recreation (file_update mode)"
+                    "Dropped DuckDB acceleration '{table_name}' (view/table + internal data tables) for schema recreation"
                 );
                 Ok(())
             },

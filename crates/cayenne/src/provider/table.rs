@@ -2140,15 +2140,41 @@ impl CayenneTableProvider {
 
     /// Atomically commit a snapshot rewrite to the catalog.
     ///
-    /// Delegates to [`MetadataCatalog::commit_compaction`], which advances the
-    /// snapshot pointer and clears file-level delete/insert tracking while
-    /// preserving inlined rows. This is the correct commit primitive for sort
-    /// rewrites and file compaction; true overwrite operations use the catalog's
-    /// overwrite path directly.
-    pub(crate) async fn commit_snapshot_rewrite(&self, new_snapshot_id: &str) -> CatalogResult<()> {
-        self.catalog
-            .commit_compaction(&self.table_metadata.table_id, new_snapshot_id)
-            .await
+    /// With `fence = None` this delegates to
+    /// [`MetadataCatalog::commit_compaction`], which advances the snapshot
+    /// pointer and clears ALL file-level delete/insert/protected-snapshot
+    /// tracking while preserving inlined rows. That wholesale clear is only
+    /// correct when no mutation can have interleaved the rewrite (the rewrite
+    /// held `write_lock` throughout, e.g. position-delete tables).
+    ///
+    /// With `fence = Some((cutoff, folded))` it delegates to the sequence-fenced
+    /// [`MetadataCatalog::commit_compaction_fenced`], which clears only delete
+    /// files / insert records with `sequence_number <= cutoff` and only the
+    /// `folded` protected snapshots — preserving deletes/upserts that committed
+    /// after the rewrite captured its cutoff (the concurrent key-delete path).
+    pub(crate) async fn commit_snapshot_rewrite(
+        &self,
+        new_snapshot_id: &str,
+        fence: Option<&(i64, std::collections::HashSet<String>)>,
+    ) -> CatalogResult<()> {
+        match fence {
+            None => {
+                self.catalog
+                    .commit_compaction(&self.table_metadata.table_id, new_snapshot_id)
+                    .await
+            }
+            Some((cutoff, folded)) => {
+                let folded_ids: Vec<String> = folded.iter().cloned().collect();
+                self.catalog
+                    .commit_compaction_fenced(
+                        &self.table_metadata.table_id,
+                        new_snapshot_id,
+                        *cutoff,
+                        &folded_ids,
+                    )
+                    .await
+            }
+        }
     }
 
     /// Publish an overwrite's new snapshot to the in-memory state as a SINGLE
@@ -4959,6 +4985,21 @@ impl CayenneTableProvider {
             count,
         )
         .await
+    }
+
+    /// The highest sequence number handed out so far (the global high-water):
+    /// `allocator.next - 1`, where `next` is the lowest UNUSED sequence.
+    ///
+    /// Used by the compaction convergence fence. The caller MUST hold
+    /// `write_lock` while reading this, so that no writer is mid-publish: under
+    /// `write_lock` every sequence `<= sequence_high_water()` belongs to a write
+    /// that has already published its data/tombstones, and every later write
+    /// will receive a strictly greater sequence. That makes the returned value a
+    /// sound compaction cutoff — a rewrite scan taken after this read sees every
+    /// mutation `<= cutoff`, and mutations that arrive afterward (`> cutoff`) are
+    /// carried forward rather than cleared.
+    async fn sequence_high_water(&self) -> i64 {
+        self.seq_allocator.lock().await.next - 1
     }
 
     async fn load_table_statistics(
@@ -9251,9 +9292,13 @@ impl CayenneTableProvider {
         )?;
 
         // Atomically update the catalog to point to the new sorted snapshot.
-        // commit_compaction clears delete files and insert records, which is
-        // correct here since the sort rewrites all live data into the new snapshot.
-        if let Err(e) = self.commit_snapshot_rewrite(&new_snapshot_id).await {
+        // `fence = None` => wholesale clear of delete files / insert records.
+        // This is only safe because `sort_and_rewrite_data` is documented as
+        // "must not run concurrently with CDC" (see its safety section) and
+        // defers while staged work is in flight. FOLLOW-UP: give this path the
+        // same sequence fence as `rewrite_current_snapshot_for_compaction` if it
+        // ever becomes reachable concurrently with writers.
+        if let Err(e) = self.commit_snapshot_rewrite(&new_snapshot_id, None).await {
             cleanup_failed_snapshot.await;
             return Err(Error::Catalog { source: e });
         }
@@ -10461,11 +10506,119 @@ impl CayenneTableProvider {
 
     async fn rewrite_current_snapshot_for_compaction(&self) -> Result<()> {
         let compaction_start = std::time::Instant::now();
+
+        // CONVERGENCE FENCE — prevents a delete/upsert that races this rewrite
+        // from being lost (see `cdc_compaction_delete_race_test.rs`). This
+        // rewrite snapshots the visible rows, encodes them (slow), then drops
+        // the table's deletion state. Without a fence, a delete that lands after
+        // the snapshot but before the drop is wiped while its row is already in
+        // the new file — resurrecting it. `compaction_lock` (held here) and
+        // `write_lock` (held by writers) are distinct, so writes DO interleave.
+        let uses_position_deletes =
+            self.should_capture_positions() || self.pk_deletion_strategy.is_position_based();
+
+        // Position-delete tables: tombstones are file-scoped (a row position in a
+        // named data file), not sequence-tagged, so they cannot be carried
+        // forward by sequence once compaction rewrites the file away. The only
+        // safe option is to exclude writers for the whole rewrite (mirrors
+        // `compact_protected_snapshots_subset`), via a BLOCKING `write_lock`
+        // acquire so the full-snapshot rewrite always makes progress (see below).
+        let (_position_write_guard, _position_visibility_guard) = if uses_position_deletes {
+            // Blocking acquire (not try_lock): the full-snapshot rewrite must
+            // always make progress — a try_lock+defer would starve it on a busy
+            // table (the documented "files accumulate unboundedly" failure mode)
+            // and would no-op a direct/explicit compaction call. We wait for the
+            // current writer instead, then exclude writers for the rest of the
+            // rewrite. Deadlock-safe: the full rewrite is only ever invoked
+            // holding `compaction_lock` (never `write_lock`), so this can't
+            // re-enter the lock.
+            let write_guard = self.write_lock_arc().lock_owned().await;
+            let visibility_guard = self.visibility_lock_arc().lock_owned().await;
+            (Some(write_guard), Some(visibility_guard))
+        } else {
+            (None, None)
+        };
+
         // Use the dedicated compaction memory environment (carved budget) when
         // injected, so this rewrite accounts its memory against the isolated
         // compaction pool rather than competing with queries for the query pool.
         let ctx = self.create_compaction_session_context();
-        let mut stream = self.visible_file_stream_for_rewrite(&ctx).await?;
+
+        // Build the visible stream and, for key-delete tables, capture a COHERENT
+        // `(cutoff, folded protected snapshots)` fence under `write_lock`. Under
+        // `write_lock` no writer is mid-publish, so every mutation with
+        // `seq <= cutoff` is already visible to the scan; anything that arrives
+        // afterward gets `seq > cutoff` and is carried forward (NOT cleared) at
+        // the end.
+        //
+        // The lock is dropped once the stream object exists (its inputs are
+        // pinned), so the dominant cost — reading every input file and
+        // re-encoding the consolidated output below — runs concurrent with
+        // writers. The lock is NOT I/O-free, though: when an inline memtable is
+        // present it spans `checkpoint_inlined_data` (writes a Vortex file +
+        // listing-fence swap, bounded by the memtable size; skipped entirely
+        // when there is no inline data), so a writer can block for that flush.
+        // The checkpoint MUST stay inside the lock — it has to land in
+        // `folded_before`, and running it lock-free would let a racing inline
+        // write trigger a re-checkpoint during the scan and spuriously abort the
+        // pass (the documented files-accumulate failure mode); see the
+        // folded-set bracket below.
+        //
+        // `folded` MUST be exactly the protected snapshots the scan folded in:
+        // clearing one the scan did NOT fold loses its rows; failing to clear one
+        // it DID fold duplicates them. `write_lock` alone does not give that — a
+        // pipelined CDC finalize publishes a protected snapshot under
+        // `listing_fence.write()` WITHOUT `write_lock`, so it can interleave
+        // between the scan's plan capture and our read. We hold `compaction_lock`
+        // (clears are serialized), so the protected set can only GROW during this
+        // pass; bracket the scan with two reads and ABORT the pass if it changed
+        // (best-effort — the next trigger retries), which is the only safe option
+        // short of plumbing the folded set out of the scan. The inline checkpoint
+        // is run explicitly FIRST so the protected snapshot it may create is in
+        // both reads (otherwise `visible_file_stream_for_rewrite` would create it
+        // between the two reads and spuriously abort every pass with inline data).
+        //
+        // Position-delete tables already hold `write_lock` for the whole rewrite
+        // (above) and clear everything at the end, so they need no fence.
+        let (mut stream, fence): (
+            SendableRecordBatchStream,
+            Option<(i64, std::collections::HashSet<String>)>,
+        ) = if uses_position_deletes {
+            let stream = self.visible_file_stream_for_rewrite(&ctx).await?;
+            (stream, None)
+        } else {
+            let _capture_guard = self.write_lock_arc().lock_owned().await;
+            if self.cached_inlined_row_count() > 0 {
+                self.checkpoint_inlined_data().await?;
+            }
+            let folded_before: std::collections::HashSet<String> = self
+                .protected_snapshots
+                .load_full()
+                .keys()
+                .cloned()
+                .collect();
+            let stream = self.visible_file_stream_for_rewrite(&ctx).await?;
+            let cutoff = self.sequence_high_water().await;
+            let folded_after: std::collections::HashSet<String> = self
+                .protected_snapshots
+                .load_full()
+                .keys()
+                .cloned()
+                .collect();
+            if folded_before != folded_after {
+                // A concurrent finalize published a protected snapshot during the
+                // scan; we can no longer tell which snapshots the scan folded.
+                // Abort before any new snapshot dir is created; retry next trigger.
+                tracing::debug!(
+                    target: "cayenne::compaction",
+                    table = self.table_metadata.table_name.as_str(),
+                    "Aborting full rewrite: protected-snapshot set changed during scan \
+                     (concurrent finalize); will retry on the next trigger",
+                );
+                return Ok(());
+            }
+            (stream, Some((cutoff, folded_before)))
+        };
 
         if self.context.has_sort_columns() {
             tracing::info!(
@@ -10633,7 +10786,10 @@ impl CayenneTableProvider {
             }
         };
 
-        if let Err(e) = self.commit_snapshot_rewrite(&new_snapshot_id).await {
+        if let Err(e) = self
+            .commit_snapshot_rewrite(&new_snapshot_id, fence.as_ref())
+            .await
+        {
             self.cleanup_failed_compaction_snapshot(&new_snapshot_id, is_s3)
                 .await;
             return Err(Error::Catalog { source: e });
@@ -10665,7 +10821,20 @@ impl CayenneTableProvider {
             let _fence = self.listing_fence.write().await;
             self.listing_table.store(new_listing_table);
             self.update_current_snapshot_id(&new_snapshot_id);
-            self.clear_all_deletion_caches();
+            match &fence {
+                // Position-delete tables held `write_lock` across the whole
+                // rewrite, so no mutation interleaved and clearing everything is
+                // exactly correct.
+                None => self.clear_all_deletion_caches(),
+                // Key-delete tables ran the encode concurrently with writers.
+                // Drop only what the rewrite materialized (`seq <= cutoff` +
+                // the folded protected snapshots); deletes/upserts that raced
+                // the rewrite (`seq > cutoff`, or a protected snapshot created
+                // during the window) are preserved.
+                Some((cutoff, folded)) => {
+                    self.prune_deletion_caches_after_full_rewrite(*cutoff, folded);
+                }
+            }
 
             // [sound output_ordering attestation] When sort columns are
             // configured this rewrite consolidated the entire snapshot into a
@@ -12341,11 +12510,26 @@ impl CayenneTableProvider {
         pk_deletion_snapshot_for_strategy(&self.pk_deletion_strategy).max_sequence_number()
     }
 
-    /// Clear all cached deletion vectors and insert records.
+    /// Clear ALL cached deletion vectors, insert records, and protected
+    /// snapshots, unconditionally.
     ///
-    /// This should be called after compaction operations that have applied all deletions
-    /// and written a clean snapshot.
+    /// # Precondition (DANGEROUS otherwise)
     ///
+    /// The caller MUST guarantee that no mutation could have committed
+    /// concurrently with the operation whose results this clear publishes —
+    /// otherwise a delete/upsert that landed mid-operation is wiped while its
+    /// row is already in the new snapshot, resurrecting it (the CDC convergence
+    /// bug; see `cdc_compaction_delete_race_test.rs`). That guarantee holds only
+    /// when EITHER:
+    /// * the operation excluded writers by holding `write_lock` from before it
+    ///   captured its input through this clear (the position-delete full-rewrite
+    ///   path, which cannot sequence-fence its file-scoped tombstones), OR
+    /// * the operation is a full atomic REPLACEMENT of all data (overwrite),
+    ///   after which prior deletions are meaningless by definition.
+    ///
+    /// A compaction that ran CONCURRENTLY with writers (the key-delete
+    /// full-rewrite path) must NOT use this — it must carry forward post-cutoff
+    /// mutations via [`Self::prune_deletion_caches_after_full_rewrite`] instead.
     pub(crate) fn clear_all_deletion_caches(&self) {
         // Clear caches based on the current strategy.
         // ArcSwap stores publish a fresh empty snapshot atomically; readers see either
@@ -12385,6 +12569,59 @@ impl CayenneTableProvider {
         tracing::debug!(
             "Cleared all deletion and insert records caches for table {}",
             self.table_metadata.table_name
+        );
+    }
+
+    /// Sequence-fenced counterpart of [`Self::clear_all_deletion_caches`] for the
+    /// concurrent (key-delete) full-rewrite path.
+    ///
+    /// A full-snapshot rewrite materializes every row visible as of its captured
+    /// `cutoff` (the sequence high-water at fence-capture time) and folds the
+    /// `folded_protected_ids` protected snapshots into the new file. Afterwards
+    /// it must drop ONLY that materialized state, while preserving anything that
+    /// a concurrent writer committed after the cutoff:
+    ///
+    /// * deletion tombstones with `delete_seq <= cutoff` are dropped (their rows
+    ///   were excluded from the new file); tombstones `> cutoff` are kept (a
+    ///   delete that raced the rewrite — its row IS in the new file, so the
+    ///   tombstone must survive to keep hiding it). This reuses
+    ///   [`Self::prune_deletion_index_at_or_below`].
+    /// * exactly the `folded_protected_ids` protected snapshots are removed; a
+    ///   protected snapshot created during the rewrite window is not in that set
+    ///   and is retained (its data is NOT in the new file).
+    ///
+    /// Position deletions are untouched: this path is only taken for key-delete
+    /// tables (position-delete tables hold `write_lock` across the whole rewrite
+    /// and use [`Self::clear_all_deletion_caches`] instead).
+    pub(crate) fn prune_deletion_caches_after_full_rewrite(
+        &self,
+        cutoff: i64,
+        folded_protected_ids: &std::collections::HashSet<String>,
+    ) {
+        // Drop tombstones <= cutoff; keep tombstones > cutoff and re-insertion
+        // records. Refreshes deletion memory accounting internally.
+        self.prune_deletion_index_at_or_below(cutoff);
+
+        // Remove exactly the protected snapshots folded into this rewrite,
+        // leaving any created during the window intact (copy-on-write).
+        if !folded_protected_ids.is_empty() {
+            self.protected_snapshots.rcu(|current| {
+                let mut next = HashMap::clone(current);
+                next.retain(|id, _| !folded_protected_ids.contains(id));
+                Arc::new(next)
+            });
+        }
+
+        // The visible PK set used for auto-conflict detection may reference rows
+        // whose physical location just changed; drop it so it is rebuilt lazily.
+        self.clear_cached_pk_keyset();
+
+        tracing::debug!(
+            target: "cayenne::compaction",
+            table = self.table_metadata.table_name.as_str(),
+            cutoff,
+            folded_protected = folded_protected_ids.len(),
+            "Pruned deletion caches after sequence-fenced full rewrite"
         );
     }
 

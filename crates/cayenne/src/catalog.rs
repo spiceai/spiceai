@@ -515,7 +515,37 @@ pub trait MetadataCatalog: Send + Sync {
     -> CatalogResult<()>;
 
     /// Atomically update snapshot and clear delete files in a single transaction.
+    ///
+    /// Clears ALL delete files / insert records / protected-snapshot sequence
+    /// rows for the table. This is only correct when the rewrite excluded
+    /// concurrent writers (it held `write_lock` throughout). For the concurrent
+    /// key-delete path use [`Self::commit_compaction_fenced`] instead.
     async fn commit_compaction(&self, table_id: &str, new_snapshot_id: &str) -> CatalogResult<()>;
+
+    /// Sequence-fenced variant of [`Self::commit_compaction`] for compactions
+    /// that ran concurrently with writers.
+    ///
+    /// In one transaction, in this order (matching `commit_compaction`'s
+    /// crash-safety ordering):
+    /// 1. `DELETE FROM cayenne_delete_file       WHERE table_id = ? AND sequence_number <= cutoff`
+    /// 2. `DELETE FROM cayenne_insert_record     WHERE table_id = ? AND sequence_number <= cutoff`
+    /// 3. `DELETE FROM cayenne_snapshot_sequence WHERE table_id = ? AND snapshot_id IN (protected_snapshot_ids_to_clear)`
+    /// 4. `UPDATE cayenne_table SET current_snapshot_id = ? WHERE table_id = ?`
+    ///
+    /// Delete files / insert records with `sequence_number > cutoff` (deletes or
+    /// upserts that committed after the rewrite captured its cutoff) are
+    /// preserved, as are protected snapshots not named in
+    /// `protected_snapshot_ids_to_clear` (created during the rewrite window).
+    /// Protected snapshots are cleared by explicit id rather than by sequence
+    /// because their `sequence_number` column records the delete-fence at
+    /// creation, not the snapshot's own creation sequence.
+    async fn commit_compaction_fenced(
+        &self,
+        table_id: &str,
+        new_snapshot_id: &str,
+        cutoff: i64,
+        protected_snapshot_ids_to_clear: &[String],
+    ) -> CatalogResult<()>;
 
     /// Atomically swap a subset of protected snapshots for a single merged
     /// snapshot (fast protected-snapshot compaction, "Step 1").

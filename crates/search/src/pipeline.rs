@@ -18,7 +18,6 @@ use datafusion::{
     common::Column,
     datasource::DefaultTableSource,
     error::DataFusionError,
-    execution::SendableRecordBatchStream,
     sql::{
         TableReference,
         sqlparser::{
@@ -65,13 +64,7 @@ impl Error {
     }
 }
 
-/// [`QueryEngine`] defines the minimal interface needed to execute [`LogicalPlan`].
-///
-/// This allows extensibility beyond [`SessionContext::execute_logical_plan`] then [`DataFrame::execute_stream`].
-#[async_trait::async_trait]
-pub trait QueryEngine: Send + Sync {
-    async fn run(&self, plan: LogicalPlan) -> Result<SendableRecordBatchStream, DataFusionError>;
-}
+pub use runtime_query_engine::query_engine::QueryEngine;
 
 pub struct SearchPipeline<A>
 where
@@ -143,13 +136,13 @@ impl<A: CandidateAggregation> SearchPipeline<A> {
                 )
                 .context(SearchRequestConstructionSnafu)?;
 
-                let data =
-                    self.engine
-                        .run(lp)
-                        .await
-                        .map_err(|e| Error::CandidateGenerationError {
-                            source: generation::Error::QueryError { source: e },
-                        })?;
+                let data = self.engine.execute_plan(lp).await.map_err(|e| {
+                    Error::CandidateGenerationError {
+                        source: generation::Error::InternalError {
+                            source: Box::new(e),
+                        },
+                    }
+                })?;
 
                 Ok(VectorSearchGenerationResult {
                     data,
