@@ -829,9 +829,12 @@ async fn get_vectors_with_chunker(
         // TODO: filter_map doesn't handle nulls
         .map(|s| match s {
             Some(s) if !s.is_empty() => {
+                // Persist character offsets (start, end), not byte offsets: the
+                // read path recovers the snippet with DataFusion `substring`,
+                // which is 1-based and character-counted. See issue #11269.
                 let chunks = chunker
-                    .chunk_indices(s)
-                    .map(|(idx, s)| (idx, s.to_string()))
+                    .chunk_with_char_offsets(s)
+                    .map(|(offsets, s)| (offsets, s.to_string()))
                     .collect_vec();
                 (chunks.len(), chunks)
             }
@@ -895,16 +898,10 @@ async fn get_vectors_with_chunker(
             }
         }
 
-        // Explicitly find `end` to handle when chunks have overlap.
+        // `chunk_with_char_offsets` already supplies the exact (start, end)
+        // character span per chunk, including when chunks overlap.
         for i in 0..chunkz_in_row {
-            let start = chunk_offsets[curr + i];
-            let end = start
-                + chunks
-                    .as_slice()
-                    .get(curr + i)
-                    .map(String::len)
-                    .unwrap_or_default();
-
+            let (start, end) = chunk_offsets[curr + i];
             chunks_builder.values().append_value(start as i32);
             chunks_builder.values().append_value(end as i32);
             chunks_builder.append(true);
