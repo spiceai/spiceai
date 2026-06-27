@@ -141,7 +141,15 @@ fn make_envelope(
 
     let record = RecordBatch::try_new(Arc::new(wrapper), vec![op_array, pk_array, data_array])
         .expect("wrapper RecordBatch");
-    let batch = ChangeBatch::try_new(record).expect("ChangeBatch");
+    // Debezium stamps each batch with the upstream commit time (`source.ts_ms`)
+    // via `ChangeBatch::with_source_commit_ts_ms`
+    // (crates/data_components/src/debezium_kafka.rs); the Cayenne apply path reads
+    // it back through `source_commit_ts_ms()` for the replication-lag signal. Stamp
+    // a non-None, monotonic value derived from the source offset so that
+    // propagation path is exercised rather than left `None`.
+    let batch = ChangeBatch::try_new(record)
+        .expect("ChangeBatch")
+        .with_source_commit_ts_ms(Some(1_700_000_000_000 + seq));
 
     ChangeEnvelope::new(
         Box::new(RecordingCommitter {
