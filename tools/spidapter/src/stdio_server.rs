@@ -2020,12 +2020,9 @@ async fn generate_initial_spicepod(
                 acceleration_engine_str(*acceleration),
                 datasets,
             ),
-            FederatedStorageConfig::MongoDB { uri, acceleration } => generate_mongodb_spicepod(
-                run_id,
-                uri,
-                datasets,
-                acceleration_engine_str(*acceleration),
-            ),
+            FederatedStorageConfig::MongoDB { acceleration, .. } => {
+                generate_mongodb_spicepod(run_id, datasets, acceleration_engine_str(*acceleration))
+            }
         }
     };
 

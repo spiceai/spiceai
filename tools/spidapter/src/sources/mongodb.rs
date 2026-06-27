@@ -25,9 +25,13 @@ use uuid::Uuid;
 
 use super::mongodb_arrow_type_to_spicepod_str;
 
+/// Secret name under which the `MongoDB` connection string is stored on a Spice
+/// Cloud app and referenced from the spicepod as
+/// `${secrets:MONGO_CONNECTION_STRING}`.
+pub(crate) const MONGO_CONNECTION_STRING_SECRET: &str = "MONGO_CONNECTION_STRING";
+
 pub(crate) fn generate_mongodb_spicepod(
     run_id: &Uuid,
-    uri: &str,
     datasets: &HashMap<String, DatasetConfig>,
     acceleration_engine: &str,
 ) -> SpicepodDefinition {
@@ -44,10 +48,8 @@ pub(crate) fn generate_mongodb_spicepod(
     };
 
     for (dataset_name, dataset_config) in datasets {
-        // Use the connection URI verbatim — the caller is responsible for any
-        // TLS settings. (EC2-provisioned mongo encodes tls=false in its URI;
-        // connect-mode URIs like Atlas carry their own tls/ssl settings.)
-        let conn_str = uri.to_string();
+        // `MONGO_CONNECTION_STRING_SECRET` is set in `build_local_extra_envs`
+        let conn_str = format!("${{secrets:{MONGO_CONNECTION_STRING_SECRET}}}");
         let param_map = HashMap::from([
             ("mongodb_connection_string".to_string(), conn_str),
             // Increase cursor batch sizes to reduce round-trips on high-volume streams.
