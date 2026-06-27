@@ -10385,12 +10385,19 @@ impl CayenneTableProvider {
         self.rebuild_live_snapshot_manifests().await;
     }
 
-    /// Debug-only invariant check: the manifest file-name set persisted for
-    /// `snapshot_id` must equal the directory listing that produced it. Compiled
-    /// out of release builds. `listed` is the listing the caller just wrote the
-    /// manifest from, so any divergence means the metastore round-trip lost or
-    /// duplicated a row (or a concurrent writer mutated the manifest) — a bug,
-    /// not a data-loss path, since the scan still reads the directory.
+    /// Debug-only invariant check: every file the caller just authored manifest
+    /// rows for (`listed`) must read back from the manifest. Compiled out of
+    /// release builds.
+    ///
+    /// This is a metastore ROUND-TRIP check (did the rows we wrote persist?), so
+    /// it asserts `listed ⊆ manifest`, NOT exact equality. Once a compaction
+    /// rewrite commits, its new snapshot becomes the current snapshot and a
+    /// concurrent append may legitimately add its own files (and manifest rows)
+    /// to it before this check runs; those extra manifest entries are expected
+    /// and must not trip the assert. A LISTED file MISSING from the manifest is
+    /// the real bug (a dropped round-trip row) and still fails. (A duplicated
+    /// manifest row is not detectable here — both sides are name sets — and is
+    /// not the failure mode this guards against.)
     #[cfg(debug_assertions)]
     async fn debug_assert_manifest_matches_listing(
         &self,
@@ -10418,12 +10425,18 @@ impl CayenneTableProvider {
         let listed_names: std::collections::BTreeSet<&str> =
             listed.iter().map(|(name, _)| name.as_str()).collect();
 
-        debug_assert_eq!(
-            manifest_names, listed_names,
-            "cayenne_snapshot_file manifest for table {} snapshot {snapshot_id} \
-             does not match the directory listing (manifest={manifest_names:?}, \
-             listing={listed_names:?})",
+        // Cheap check first (no allocation); only materialize the diff for the
+        // panic message on failure.
+        debug_assert!(
+            listed_names.is_subset(&manifest_names),
+            "cayenne_snapshot_file manifest for table {} snapshot {snapshot_id} is missing \
+             files the caller just listed (round-trip dropped rows): missing={:?} \
+             (manifest={manifest_names:?}, listed={listed_names:?})",
             self.table_metadata.table_name,
+            listed_names
+                .difference(&manifest_names)
+                .copied()
+                .collect::<Vec<&str>>(),
         );
     }
 
