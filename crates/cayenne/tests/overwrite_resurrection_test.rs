@@ -176,17 +176,27 @@ async fn read_value(ctx: &SessionContext, name: &str, key: i64) -> TestResult<Op
         .sql(&format!("SELECT value FROM {name} WHERE id = {key}"))
         .await?;
     let results = df.collect().await?;
+
+    let mut values: Vec<i64> = Vec::new();
     for b in &results {
-        if b.num_rows() > 0 {
-            let v = b
-                .column(0)
-                .as_any()
-                .downcast_ref::<Int64Array>()
-                .expect("Int64");
-            return Ok(Some(v.value(0)));
+        if b.num_rows() == 0 {
+            continue;
+        }
+        let v = b
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("Int64");
+        for i in 0..v.len() {
+            values.push(v.value(i));
         }
     }
-    Ok(None)
+
+    match values.as_slice() {
+        [] => Ok(None),
+        [single] => Ok(Some(*single)),
+        _ => Err(format!("Expected at most one row for id {key}, got {}", values.len()).into()),
+    }
 }
 
 /// Row created via OVERWRITE, deleted, then re-upserted. Expected: present.
