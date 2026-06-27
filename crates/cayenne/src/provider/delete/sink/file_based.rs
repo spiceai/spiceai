@@ -103,12 +103,6 @@ pub struct FileBasedDeletionSink {
     protected_snapshots: Arc<ArcSwap<HashMap<String, i64>>>,
     /// Table ID for catalog operations.
     table_id: String,
-    /// A write-clone of the owning provider (shares all of its `Arc`-backed
-    /// state). Used during orphaned-DV cleanup to read the live current-snapshot
-    /// ID (folded into the surviving-sequence floor) and to prune the in-memory
-    /// PK deletion index of the tombstones whose delete files were removed, so
-    /// the memory is reclaimed immediately rather than only on the next reload.
-    provider: CayenneTableProvider,
     /// Table base path for constructing snapshot directory paths.
     table_path: String,
     /// Shared runtime environment for cache invalidation after file deletion.
@@ -137,8 +131,6 @@ impl FileBasedDeletionSink {
     /// * `catalog` - Metadata catalog for clearing snapshot sequence records.
     /// * `protected_snapshots` - In-memory protected snapshots map.
     /// * `table_id` - Table ID for catalog operations.
-    /// * `provider` - A write-clone of the owning provider (shared `Arc` state),
-    ///   used for orphaned-DV cleanup (current-snapshot lookup + deletion-index prune).
     /// * `table_path` - Table base path for snapshot directory construction.
     /// * `runtime_env` - Shared runtime environment for cache invalidation.
     #[expect(clippy::too_many_arguments)]
@@ -150,7 +142,6 @@ impl FileBasedDeletionSink {
         catalog: Arc<dyn MetadataCatalog>,
         protected_snapshots: Arc<ArcSwap<HashMap<String, i64>>>,
         table_id: String,
-        provider: CayenneTableProvider,
         table_path: String,
         runtime_env: Arc<RuntimeEnv>,
         write_lock: Arc<TokioMutex<()>>,
@@ -164,7 +155,6 @@ impl FileBasedDeletionSink {
             catalog,
             protected_snapshots,
             table_id,
-            provider,
             table_path,
             runtime_env,
             write_lock,
@@ -439,13 +429,9 @@ impl DeletionSink for FileBasedDeletionSink {
         }
 
         // Clean up emptied protected snapshots: catalog, in-memory map, and directory.
-        // Removing snapshots raises the surviving sequence floor, which can orphan
-        // key-based deletion vectors that only shadowed the now-deleted rows, so
-        // sweep those afterwards (issue #9388).
         if !result.emptied_snapshot_ids.is_empty() {
             self.cleanup_emptied_snapshots(&result.emptied_snapshot_ids)
                 .await;
-            self.cleanup_orphaned_deletion_vectors().await;
         }
 
         Ok(result.total_deleted_rows)
@@ -504,168 +490,5 @@ impl FileBasedDeletionSink {
                 self.table_name
             );
         }
-    }
-
-    /// Remove key-based deletion vectors orphaned by snapshot removal (issue #9388).
-    ///
-    /// A key-based DV with `sequence_number = D` only shadows data in snapshots
-    /// whose threshold sequence is strictly `< D` (a delete applies to data files
-    /// with `data_sequence_number < D` — see [`crate::metadata::DeleteFile::sequence_number`]).
-    /// Once every surviving snapshot has threshold `>= D`, the DV shadows nothing
-    /// and is a query-time no-op. When retention empties protected snapshots the
-    /// surviving floor rises, which can orphan the DVs that masked those snapshots'
-    /// rows — e.g. an upsert's supersede of a row whose old copy has now expired.
-    /// Such DVs live in the base snapshot's `deletions/` dir (written via
-    /// `current_snapshot_id`), so the per-snapshot directory cleanup above never
-    /// removes them; left in place they only inflate the in-memory deletion cache
-    /// and add load-time I/O on restart.
-    ///
-    /// This is purely a startup-cache / storage optimization with no query-time
-    /// effect. It is conservative: a DV is removed only once *no* surviving
-    /// snapshot could be shadowed by it, so it can never resurrect a live row. An
-    /// orphan masking a snapshot that lingers (out-of-order/backfill data) is
-    /// collected on a later retention pass once that snapshot ages out too.
-    ///
-    /// Only key-based DVs (those with no `source_data_file_path`) are considered;
-    /// position-based DVs are tied to specific data files and cleaned up by their
-    /// own path. Errors are logged as warnings — the data files are already gone,
-    /// so cleanup is best-effort.
-    ///
-    /// # Current snapshot
-    ///
-    /// The protected-snapshot map does NOT include the current/genesis snapshot,
-    /// which the scan applies ALL key DVs to (the full deletion view, not the
-    /// `delete_seq > threshold` partial filter). Normally that snapshot is genesis
-    /// or compaction output and holds no row a surviving DV shadows, but a
-    /// plain-append current snapshot (tagged `[0, current_seq]`) or a
-    /// position-then-PK migration can, so the floor must also account for it or a
-    /// prune could resurrect a live current-snapshot row. We fold the current
-    /// snapshot's manifest into the floor here. (`CayenneTableProvider` solves the
-    /// identical problem for the seq-prefix bake in `bake_clean_prefix_holds`;
-    /// rather than call that — its `selected_set` semantics differ — we reproduce
-    /// its current-snapshot clause inline: empty manifest is genesis-clean,
-    /// otherwise the floor is capped at the smallest file `min_sequence`.)
-    ///
-    /// # In-memory deletion index
-    ///
-    /// Removing the catalog rows + `.arrow` files reclaims only restart cost; the
-    /// orphaned tombstones also sit in the in-memory PK deletion index for the
-    /// life of the process. After the rows are removed we therefore prune the
-    /// index of every tombstone at or below the same floor via
-    /// [`CayenneTableProvider::prune_deletion_index_at_or_below`] (which the
-    /// seq-prefix bake also uses), reclaiming the memory immediately. This is
-    /// sound for the same reason the row removal is: the floor proves no surviving
-    /// snapshot is shadowed, so those tombstones (and their paired re-insert
-    /// records, removed with the same DV rows) affect no live row.
-    async fn cleanup_orphaned_deletion_vectors(&self) {
-        // Floor = minimum threshold over all surviving protected snapshots. For
-        // PK/upsert tables every PROTECTED data-bearing snapshot is tracked here.
-        // If none survive, the protected side imposes no bound (i64::MAX) and the
-        // current-snapshot manifest below becomes the only constraint.
-        let protected_floor = self
-            .protected_snapshots
-            .load()
-            .values()
-            .copied()
-            .min()
-            .unwrap_or(i64::MAX);
-
-        // Fold in the current snapshot: a key DV with delete sequence D deletes a
-        // current-snapshot row iff that row's sequence is `< D`, so the snapshot is
-        // safe against pruning D only when its smallest row sequence is `>= D`. An
-        // empty manifest is genesis (no rows to resurrect). If the manifest cannot
-        // be read we cannot prove safety, so skip the sweep this pass.
-        let current_snapshot_id = self.provider.get_current_snapshot_id();
-        let current_floor = match self
-            .catalog
-            .get_snapshot_files(&self.table_id, &current_snapshot_id)
-            .await
-        {
-            Ok(files) => files
-                .iter()
-                .map(|f| f.min_sequence)
-                .min()
-                .unwrap_or(i64::MAX),
-            Err(e) => {
-                tracing::warn!(
-                    "Retention: failed to read current snapshot manifest for orphaned DV cleanup on table {}: {e}",
-                    self.table_name
-                );
-                return;
-            }
-        };
-
-        let floor = protected_floor.min(current_floor);
-
-        let delete_files = match self.catalog.get_table_delete_files(&self.table_id).await {
-            Ok(files) => files,
-            Err(e) => {
-                tracing::warn!(
-                    "Retention: failed to list delete files for orphaned DV cleanup on table {}: {e}",
-                    self.table_name
-                );
-                return;
-            }
-        };
-
-        // Key-based DVs (no source file) whose delete sequence is at or below the
-        // surviving floor shadow nothing live. `source_data_file_path` is the
-        // reliable key-vs-position discriminator (the catalog does not persist
-        // `deletion_type`).
-        let orphaned: Vec<(String, String, bool)> = delete_files
-            .into_iter()
-            .filter(|df| df.source_data_file_path.is_none() && df.sequence_number <= floor)
-            .map(|df| (df.delete_file_id, df.path, df.path_is_relative))
-            .collect();
-
-        if orphaned.is_empty() {
-            return;
-        }
-
-        let ids: Vec<String> = orphaned.iter().map(|(id, _, _)| id.clone()).collect();
-
-        // Remove catalog rows FIRST. The loader reads these rows and opens each
-        // referenced file, so removing the row is what reclaims the startup cost —
-        // and ordering it before the unlink ensures a crash can never leave a
-        // catalog row pointing at a missing `.arrow` file (which the loader would
-        // error on). Bail without unlinking if the catalog write fails.
-        if let Err(e) = self.catalog.remove_delete_files(&self.table_id, &ids).await {
-            tracing::warn!(
-                "Retention: failed to remove {} orphaned delete-file row(s) for table {}: {e}",
-                ids.len(),
-                self.table_name
-            );
-            return;
-        }
-
-        // Best-effort unlink of the now-unreferenced `.arrow` files.
-        for (_, path, path_is_relative) in &orphaned {
-            if *path_is_relative {
-                // Relative paths are object-store keys, not local filesystem
-                // paths; the catalog row removal already prevents them being
-                // loaded, so leave object-store cleanup out of this local sweep.
-                continue;
-            }
-            match tokio::fs::remove_file(path).await {
-                Ok(()) => {}
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Err(e) => tracing::warn!(
-                    "Retention: failed to delete orphaned DV file {path} for table {}: {e}",
-                    self.table_name
-                ),
-            }
-        }
-
-        // Reclaim the memory now: drop the just-removed tombstones from the
-        // in-memory PK deletion index (no-op for position-based tables). Safe at
-        // `floor` for the same reason the catalog removal is — see the doc above.
-        self.provider.prune_deletion_index_at_or_below(floor);
-
-        tracing::debug!(
-            table = %self.table_name,
-            floor,
-            "Retention: cleaned up {} orphaned key-based deletion vector(s)",
-            ids.len()
-        );
     }
 }
