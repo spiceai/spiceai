@@ -2003,8 +2003,14 @@ async fn create_scheduler_server(
         on_work_available: Some(on_work_available),
         on_cancel_tasks: Some(on_cancel_tasks),
 
-        // Faster failure detection: 30s timeout with 10s heartbeat interval
-        executor_timeout_seconds: 30,
+        // 120s timeout with a 10s heartbeat interval (12 missed beats). Raised from
+        // 30s: under heavy distributed queries the executor->scheduler heartbeat can
+        // lapse for tens of seconds while an executor is busy, and a 30s timeout
+        // falsely marks a live, busy executor dead -> the scheduler removes it ->
+        // its in-flight stage tasks fail -> the query flaps/hangs. A larger tolerance
+        // rides over transient lapses without meaningfully delaying real dead-executor
+        // detection for a cluster doing minutes-long distributed queries.
+        executor_timeout_seconds: 120,
 
         // The Spice executor uses pull-based polling (execution_loop::poll_loop),
         // so the scheduler must use PullStaged to register executors via PollWork RPCs.
