@@ -56,6 +56,7 @@ pub mod sqlite;
 #[cfg(feature = "turso")]
 pub mod turso;
 
+pub(crate) mod imds;
 pub(crate) mod snapshots;
 pub mod spice_sys;
 pub(crate) mod storage;
