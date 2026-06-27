@@ -1275,24 +1275,19 @@ impl HttpTableProvider {
             .map(|(k, v)| (k.as_str().to_string(), v.to_str().unwrap_or("").to_string()))
             .collect();
 
-        // Reading the response body can fail after a successful status line — e.g. the
-        // connection is reset or times out mid-stream, or the body arrives truncated. Those
-        // are transient network conditions an overloaded or rate-limited upstream produces
-        // routinely, so they must be retried just like a failed send (previously they were
-        // classified permanent and dropped on the first hiccup). Only a genuine decode error
-        // — the bytes arrived but could not be decoded — is permanent, since retrying it
-        // would deterministically fail again.
-        let content = response.text().await.map_err(|e| {
-            // A decode error means the bytes arrived but could not be decoded — retrying would
-            // deterministically fail again, so it is permanent. Every other failure here
-            // (timeout, connection reset, truncated body) is a transient network condition and
-            // must be retried.
-            if e.is_decode() {
-                RetryError::permanent(Error::HttpRequest { source: e })
-            } else {
-                RetryError::transient(Error::HttpRequest { source: e })
-            }
-        })?;
+        // Reading the response body can fail after a successful status line — connection
+        // reset, read timeout, truncated body, or a decompression error on a partially
+        // received gzip/brotli/zstd stream. These are all transient network conditions an
+        // overloaded or rate-limited upstream produces routinely, so retry them like a failed
+        // send rather than dropping the row on the first hiccup (previously every body-read
+        // failure was classified permanent). Note `reqwest::Error::is_decode()` also fires on a
+        // truncated compressed body, so it is NOT a reliable "permanent" signal; this mirrors
+        // the retriable-error classification in `graphql/mod.rs`, which groups
+        // is_timeout/is_connect/is_body/is_decode together as transient.
+        let content = response
+            .text()
+            .await
+            .map_err(|e| RetryError::transient(Error::HttpRequest { source: e }))?;
 
         let detected_format = if detected_format.is_empty() {
             let inferred = Self::infer_format_from_content(&content);

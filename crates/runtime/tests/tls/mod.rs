@@ -331,11 +331,12 @@ async fn test_ballista_backoff_config_available() -> Result<(), anyhow::Error> {
             // This is the same backoff mechanism used in the Ballista executor poll loop.
             //
             // Disable randomization for this assertion: the production default applies a
-            // ±30% jitter to each interval, and because the base interval table starts with
-            // two equal entries (1000ms, 1000ms), a jittered later delay can legitimately be
-            // smaller than an earlier one. Asserting "non-decreasing" against jittered values
-            // is therefore inherently flaky. With jitter off we verify the deterministic
-            // underlying progression, which is the property this test actually cares about.
+            // ±30% jitter to each interval, so two sampled consecutive delays can be
+            // non-monotonic even though the base intervals strictly increase — an earlier
+            // interval jittered up can exceed a later interval jittered down (e.g. 2000ms→~2600ms
+            // followed by 3000ms→~2100ms). Asserting "non-decreasing" against jittered values is
+            // therefore inherently flaky. With jitter off we verify the deterministic underlying
+            // progression, which is the property this test actually cares about.
             let mut backoff = FibonacciBackoffBuilder::new()
                 .randomization_factor(0.0)
                 .max_duration(Some(Duration::from_secs(30)))
