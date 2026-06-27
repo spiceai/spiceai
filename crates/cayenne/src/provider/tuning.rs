@@ -2762,7 +2762,9 @@ pub(crate) fn binding_constraint(s: &IngestSnapshot) -> &'static str {
     } else {
         MEM_PRESSURE_OK
     };
-    if s.mem_pressure.is_some_and(|p| p > mem_gate) {
+    // `>=`, not `>`: the controller's `mem_ok` is `p < mem_gate`, so it already
+    // blocks growth at exactly `p == mem_gate` — bind on memory at the same point.
+    if s.mem_pressure.is_some_and(|p| p >= mem_gate) {
         "memory-bound (at/over the RAM budget — the controller can't grow buffers to meet the SLO; add memory or lower runtime.query.memory_limit)"
     } else if !s.cpu_ok() {
         if s.cpu_burstable {
@@ -4397,6 +4399,17 @@ mod tests {
         assert!(
             !binding_constraint(&unknown).contains("memory"),
             "the Unknown default keeps the standard 0.75 memory gate"
+        );
+        // Boundary: exactly at the shifted gate still binds on memory (`>=`,
+        // matching the controller's `mem_ok = p < gate`), not the tier below.
+        let at_gate = IngestSnapshot {
+            mem_pressure: Some(MEM_PRESSURE_OK - SLOW_TIER_MEM_DRAIN_OFFSET),
+            data_storage: StorageClass::Ebs,
+            ..snap()
+        };
+        assert!(
+            binding_constraint(&at_gate).contains("memory"),
+            "memory binds at exactly the shifted gate"
         );
         // CPU next.
         let s = IngestSnapshot {
