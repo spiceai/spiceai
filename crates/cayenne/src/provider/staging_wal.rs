@@ -61,10 +61,12 @@ use super::constants::{STAGING_DIR_NAME, STAGING_WAL_FILENAME, STAGING_WAL_TMP_F
 use super::table::CayenneTableProvider;
 use crate::metastore::MetastoreTransaction;
 use crate::provider::Error;
+use arrow::record_batch::RecordBatch;
 use datafusion::execution::SendableRecordBatchStream;
 use futures::TryStreamExt;
 use object_store::ObjectStoreExt;
 use object_store::path::Path as ObjectStorePath;
+use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 use tokio::io::AsyncWriteExt;
@@ -362,6 +364,9 @@ impl CayenneStagedAppend {
             target_snapshot_id: self.target_snapshot_id,
             target_kind: self.target_kind,
             row_count: self.row_count,
+            // Default: no incremental IVM feed. The write path attaches captured
+            // batches via `set_ivm_feed_batches` only for IVM tables.
+            ivm_feed_batches: None,
         })
     }
 
@@ -401,6 +406,14 @@ pub struct PreparedStagedAppend {
     target_snapshot_id: String,
     target_kind: StagingWalTargetKind,
     row_count: u64,
+    /// IVM feed: the insert `RecordBatches` captured at Stage A, present ONLY when
+    /// this table has a registered maintained aggregate AND the write is
+    /// incrementally feedable (set by the write path; `None` for non-IVM tables —
+    /// the common case, zero cost — or when the write must fall back to a full
+    /// rebuild). Consumed under the publish fence by
+    /// [`CayenneTableProvider::feed_staged_ivm_under_fence`]: `Some` feeds the
+    /// registry incrementally, `None` marks it stale (if IVM is registered).
+    ivm_feed_batches: Option<Arc<Vec<RecordBatch>>>,
 }
 
 impl std::fmt::Debug for PreparedStagedAppend {
@@ -411,6 +424,7 @@ impl std::fmt::Debug for PreparedStagedAppend {
             .field("target_snapshot_id", &self.target_snapshot_id)
             .field("target_kind", &self.target_kind)
             .field("row_count", &self.row_count)
+            .field("has_ivm_feed", &self.ivm_feed_batches.is_some())
             .finish()
     }
 }
@@ -427,6 +441,15 @@ impl PreparedStagedAppend {
     #[must_use]
     pub fn row_count(&self) -> u64 {
         self.row_count
+    }
+
+    /// Attach the IVM insert batches captured at Stage A (write path → receipt),
+    /// to be fed to the maintained-aggregate registry under the publish fence in
+    /// `apply_under_barrier` / `apply_under_held_barrier`. `None` (the default)
+    /// means no incremental feed — the registry is marked stale if IVM is
+    /// registered, falling queries back to a base scan.
+    pub(crate) fn set_ivm_feed_batches(&mut self, batches: Option<Arc<Vec<RecordBatch>>>) {
+        self.ivm_feed_batches = batches;
     }
 
     async fn lock_current_snapshot_for_apply(&self) -> Option<OwnedMutexGuard<()>> {
@@ -522,7 +545,12 @@ impl PreparedStagedAppend {
             self.table
                 .publish_current_snapshot_files_changed_under_held_fence();
         }
-        self.table.mark_maintained_aggregates_stale();
+        // IVM: feed the maintained-aggregate registry from this staged publish,
+        // atomically with the held listing fence (the serializer for concurrent
+        // finish() tasks) so applier-enqueue order == epoch order. `None` feed
+        // (non-IVM table, or a non-incremental write) marks stale instead.
+        self.table
+            .feed_staged_ivm_under_fence(self.ivm_feed_batches.as_ref());
         Ok(())
     }
 
@@ -557,7 +585,12 @@ impl PreparedStagedAppend {
             self.table
                 .publish_current_snapshot_files_changed_under_held_fence();
         }
-        self.table.mark_maintained_aggregates_stale();
+        // IVM: feed the maintained-aggregate registry from this staged publish,
+        // atomically with the held listing fence (the serializer for concurrent
+        // finish() tasks) so applier-enqueue order == epoch order. `None` feed
+        // (non-IVM table, or a non-incremental write) marks stale instead.
+        self.table
+            .feed_staged_ivm_under_fence(self.ivm_feed_batches.as_ref());
         Ok(())
     }
 
