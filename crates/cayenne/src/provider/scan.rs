@@ -283,9 +283,7 @@ impl CayenneAccelerationExec {
     /// the metadata cannot answer an aggregate restricted to a row subset.
     #[must_use]
     pub(crate) fn has_pushed_filter(&self) -> bool {
-        file_scan_configs(&self.inner)
-            .iter()
-            .any(|config| config.file_source().filter().is_some())
+        plan_has_pushed_filter(&self.inner)
     }
 
     /// Push additional dynamic filters into the underlying file source.
@@ -333,20 +331,43 @@ impl CayenneAccelerationExec {
 /// reads only `total_byte_size`/`num_rows`, and join-cardinality estimation
 /// prefers NDV when present, so the restored NDV is what carries the estimate —
 /// min/max are not needed here and only re-introduce the assertion hazard.
+///
+/// The refilled NDV is capped at the child's `num_rows`: a column cannot have
+/// more distinct values than it has rows. The overlay NDV is the whole-table HLL
+/// aggregate, which only ever GROWS — it is never shrunk on a delete, an
+/// upsert-supersede, or a retention drop, and is not filter-aware — so on a
+/// churned or selectively-filtered scan it can exceed the child's live row count.
+/// Without the cap that never-shrink over-count would inflate the per-key NDV and
+/// mis-drive `estimate_inner_join_cardinality`.
 fn restore_absent_column_statistics(mut child: Statistics, overlay: &Statistics) -> Statistics {
     if child.column_statistics.len() != overlay.column_statistics.len() {
         return child;
     }
+    let child_num_rows = child.num_rows;
     for (col, src) in child
         .column_statistics
         .iter_mut()
         .zip(overlay.column_statistics.iter())
     {
         if matches!(col.distinct_count, Precision::Absent) {
-            col.distinct_count = src.distinct_count;
+            col.distinct_count = cap_distinct_count_at_rows(src.distinct_count, child_num_rows);
         }
     }
     child
+}
+
+/// Clamp an NDV (`distinct_count`) to a row count — a column cannot have more
+/// distinct values than it has rows. Returns the NDV unchanged when either side
+/// is unknown or it is already within bounds; a clamped value is `Inexact`
+/// (it is a derived bound, not a measured count).
+fn cap_distinct_count_at_rows(
+    distinct_count: Precision<usize>,
+    num_rows: Precision<usize>,
+) -> Precision<usize> {
+    match (distinct_count.get_value(), num_rows.get_value()) {
+        (Some(&ndv), Some(&rows)) if ndv > rows => Precision::Inexact(rows),
+        _ => distinct_count,
+    }
 }
 
 fn compute_scan_identity(plan: &Arc<dyn ExecutionPlan>) -> Option<Arc<ScanIdentity>> {
@@ -422,6 +443,19 @@ fn file_scan_configs(plan: &Arc<dyn ExecutionPlan>) -> Vec<&FileScanConfig> {
     let mut configs = Vec::new();
     collect_file_scan_configs(plan, &mut configs);
     configs
+}
+
+/// Whether any file source in `plan`'s subtree carries a pushed-down filter (a
+/// static predicate or a dynamic join filter). The file-metadata `num_rows`
+/// describes the *unfiltered* file, so a consumer reasoning about a scan's live
+/// row count — e.g. the deletion filter's delete-aware `num_rows`, which
+/// subtracts a whole-table deletion count — must not treat a filtered scan's
+/// (subset) count as the whole-table count. Reused by
+/// [`CayenneAccelerationExec::has_pushed_filter`] and the deletion-filter execs.
+pub(crate) fn plan_has_pushed_filter(plan: &Arc<dyn ExecutionPlan>) -> bool {
+    file_scan_configs(plan)
+        .iter()
+        .any(|config| config.file_source().filter().is_some())
 }
 
 /// Counts file-backed scan sources (snapshot generations) and the total files
@@ -1117,7 +1151,9 @@ mod tests {
                 max_value: Precision::Inexact(ScalarValue::Int64(Some(9999))),
                 min_value: Precision::Inexact(ScalarValue::Int64(Some(1))),
                 sum_value: Precision::Absent,
-                distinct_count: Precision::Inexact(42),
+                // <= the 3-row union count, so the row-count cap is a no-op here;
+                // the cap has its own tests (`overlay_refilled_ndv_*`).
+                distinct_count: Precision::Inexact(2),
                 byte_size: Precision::Absent,
             }],
         });
@@ -1147,7 +1183,7 @@ mod tests {
         let col = &restored.column_statistics[0];
         assert!(matches!(col.min_value, Precision::Absent));
         assert!(matches!(col.max_value, Precision::Absent));
-        assert_eq!(col.distinct_count, Precision::Inexact(42));
+        assert_eq!(col.distinct_count, Precision::Inexact(2));
         assert_eq!(
             restored.num_rows, poisoned.num_rows,
             "overlay must not override the child's filter-aware num_rows"
@@ -1219,5 +1255,78 @@ mod tests {
         // Absent distinct_count is filled from the overlay.
         assert_eq!(col.distinct_count, Precision::Inexact(50));
         assert_eq!(restored.num_rows, Precision::Exact(100));
+    }
+
+    /// The refilled NDV is capped at the child's `num_rows`: a column cannot have
+    /// more distinct values than it has rows. The whole-table overlay NDV is an
+    /// HLL union that only grows (never shrinks on delete/upsert-supersede), so it
+    /// can exceed the live row count; the cap keeps it from inflating the join
+    /// cardinality estimate.
+    #[test]
+    fn overlay_refilled_ndv_is_capped_at_num_rows() {
+        use datafusion_common::ColumnStatistics;
+
+        let child = Statistics {
+            num_rows: Precision::Exact(3),
+            total_byte_size: Precision::Absent,
+            column_statistics: vec![ColumnStatistics {
+                null_count: Precision::Absent,
+                max_value: Precision::Absent,
+                min_value: Precision::Absent,
+                sum_value: Precision::Absent,
+                distinct_count: Precision::Absent,
+                byte_size: Precision::Absent,
+            }],
+        };
+        let overlay = Statistics {
+            num_rows: Precision::Absent,
+            total_byte_size: Precision::Absent,
+            column_statistics: vec![ColumnStatistics {
+                null_count: Precision::Absent,
+                max_value: Precision::Absent,
+                min_value: Precision::Absent,
+                sum_value: Precision::Absent,
+                // Over-counts the live 3 rows (HLL never-shrink drift).
+                distinct_count: Precision::Inexact(42),
+                byte_size: Precision::Absent,
+            }],
+        };
+
+        let restored = restore_absent_column_statistics(child, &overlay);
+        // Capped at num_rows (3), not the inflated overlay NDV (42).
+        assert_eq!(
+            restored.column_statistics[0].distinct_count,
+            Precision::Inexact(3)
+        );
+    }
+
+    /// The NDV cap clamps only when the NDV strictly exceeds the row count, and is
+    /// a no-op when either side is unknown.
+    #[test]
+    fn cap_distinct_count_at_rows_clamps_only_when_exceeding() {
+        // Exceeds rows -> clamped to rows (Inexact).
+        assert_eq!(
+            cap_distinct_count_at_rows(Precision::Inexact(42), Precision::Exact(3)),
+            Precision::Inexact(3)
+        );
+        // Within bounds -> unchanged.
+        assert_eq!(
+            cap_distinct_count_at_rows(Precision::Inexact(2), Precision::Exact(3)),
+            Precision::Inexact(2)
+        );
+        // Equal -> unchanged.
+        assert_eq!(
+            cap_distinct_count_at_rows(Precision::Exact(3), Precision::Exact(3)),
+            Precision::Exact(3)
+        );
+        // Unknown NDV or unknown rows -> unchanged.
+        assert_eq!(
+            cap_distinct_count_at_rows(Precision::Absent, Precision::Exact(3)),
+            Precision::Absent
+        );
+        assert_eq!(
+            cap_distinct_count_at_rows(Precision::Inexact(5), Precision::Absent),
+            Precision::Inexact(5)
+        );
     }
 }
