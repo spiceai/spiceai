@@ -90,7 +90,7 @@ runs:
     - name: Cache spidapter binary
       if: inputs.force_rebuild != 'true' && steps.minio-download.outputs.found != 'true'
       id: cache-spidapter
-      uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+      uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
       with:
         path: |
           target/release/spidapter${{ steps.detect-os.outputs.ext }}
@@ -139,7 +139,7 @@ runs:
 
     - name: Save to cache
       if: inputs.force_rebuild != 'true' && steps.minio-download.outputs.found != 'true' && steps.cache-spidapter.outputs.cache-hit != 'true'
-      uses: actions/cache/save@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+      uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
       with:
         path: |
           target/release/spidapter${{ steps.detect-os.outputs.ext }}
