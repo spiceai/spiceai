@@ -206,8 +206,7 @@ async fn create_staged_table(
         },
     };
 
-    let mut builder =
-        cayenne::CayenneTableProviderBuilder::new(Arc::clone(&catalog), runtime_env);
+    let mut builder = cayenne::CayenneTableProviderBuilder::new(Arc::clone(&catalog), runtime_env);
     if ivm {
         builder = builder.with_maintained_aggregates(count_sum_specs());
     }
@@ -236,7 +235,10 @@ async fn staged_publish(provider: &CayenneTableProvider, batch: RecordBatch) -> 
          the in-mem path has its own feed; this lane measures the staged feed"
     );
     let rows = write.rows();
-    write.finish().await.expect("staged publish (stage B finish)");
+    write
+        .finish()
+        .await
+        .expect("staged publish (stage B finish)");
     rows
 }
 
@@ -440,28 +442,32 @@ fn bench_feed_vs_rebuild(c: &mut Criterion) {
         // recompute the whole view. iter_custom builds a fresh registry per
         // iteration outside the timer; the timer wraps only the rebuild.
         group.throughput(Throughput::Elements(rows as u64));
-        group.bench_with_input(BenchmarkId::new("full_rebuild_rows", rows), &rows, |b, _| {
-            let mut all: Vec<RecordBatch> = base.clone();
-            all.push(delta.clone());
-            b.iter_custom(|iters| {
-                let mut total = Duration::ZERO;
-                for _ in 0..iters {
-                    let schema = table_schema();
-                    let reg = MaintainedAggregateRegistry::try_new_with_pk(
-                        &count_sum_specs(),
-                        &schema,
-                        &[0],
-                        usize::MAX,
-                    )
-                    .expect("rebuild registry");
-                    let start = Instant::now();
-                    reg.rebuild_from_batches(2, &all).expect("full rebuild");
-                    total += start.elapsed();
-                    black_box(reg.is_empty());
-                }
-                total
-            });
-        });
+        group.bench_with_input(
+            BenchmarkId::new("full_rebuild_rows", rows),
+            &rows,
+            |b, _| {
+                let mut all: Vec<RecordBatch> = base.clone();
+                all.push(delta.clone());
+                b.iter_custom(|iters| {
+                    let mut total = Duration::ZERO;
+                    for _ in 0..iters {
+                        let schema = table_schema();
+                        let reg = MaintainedAggregateRegistry::try_new_with_pk(
+                            &count_sum_specs(),
+                            &schema,
+                            &[0],
+                            usize::MAX,
+                        )
+                        .expect("rebuild registry");
+                        let start = Instant::now();
+                        reg.rebuild_from_batches(2, &all).expect("full rebuild");
+                        total += start.elapsed();
+                        black_box(reg.is_empty());
+                    }
+                    total
+                });
+            },
+        );
     }
     group.finish();
 }

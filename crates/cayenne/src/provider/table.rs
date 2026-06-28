@@ -27087,9 +27087,7 @@ mod tests {
     /// A maintained-aggregate spec over the (id, value) table: GROUP BY id,
     /// COUNT(*), SUM(value). Both outputs are Int64 (supported).
     fn id_count_sum_spec() -> MaintainedAggregateSpec {
-        use crate::maintained_aggregate::{
-            MaintainedAggregateExpr, MaintainedAggregateFunction,
-        };
+        use crate::maintained_aggregate::{MaintainedAggregateExpr, MaintainedAggregateFunction};
         MaintainedAggregateSpec {
             filter: None,
             group_by: vec!["id".to_string()],
@@ -27246,7 +27244,10 @@ mod tests {
         // Sanity: the staged-disk path is active (not the in-mem tier), so the
         // write returns a pending finalize and routes through
         // `apply_under_barrier` -> `feed_staged_ivm_under_fence`.
-        assert!(!provider.is_cdc_memory_mode(), "must use the staged File path");
+        assert!(
+            !provider.is_cdc_memory_mode(),
+            "must use the staged File path"
+        );
 
         let write = provider
             .write_cdc_append_stream(
