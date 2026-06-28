@@ -64,7 +64,7 @@ const RAW_ROWS_PER_FILE: i64 = 1_000;
 /// Live rows left per file after key-deletion (< `QUERY_LIMIT`).
 const LIVE_ROWS_PER_FILE: i64 = 40;
 const FILE_COUNT: i64 = 3;
-/// 40 < QUERY_LIMIT < 120 (= FILE_COUNT * LIVE_ROWS_PER_FILE).
+/// 40 < `QUERY_LIMIT` < 120 (= `FILE_COUNT` * `LIVE_ROWS_PER_FILE`).
 const QUERY_LIMIT: usize = 100;
 
 // Compile-time invariant: each file's raw count exceeds its live count, so a
@@ -121,8 +121,9 @@ async fn write_heavily_deleted_file(
         ],
     )?;
     let inserted = common::insert_batch(table.as_ref(), batch).await?;
+    let inserted = i64::try_from(inserted)?;
     assert_eq!(
-        inserted as i64, RAW_ROWS_PER_FILE,
+        inserted, RAW_ROWS_PER_FILE,
         "insert must write every raw row before deletion"
     );
 
@@ -162,7 +163,7 @@ async fn limit_underdelivery_key_deletion_impl(fixture: TestFixture) -> TestResu
     // FILE_COUNT*RAW. If this fails, the deletion path didn't engage and the
     // limit assertion below would be meaningless.
     let total_live = collected_row_count(&ctx, "SELECT * FROM limit_underdelivery").await?;
-    let expected_live = (FILE_COUNT * LIVE_ROWS_PER_FILE) as usize;
+    let expected_live = usize::try_from(FILE_COUNT * LIVE_ROWS_PER_FILE)?;
     assert_eq!(
         total_live, expected_live,
         "precondition: key-deletion must leave exactly {expected_live} live rows (got {total_live})"

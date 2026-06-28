@@ -17613,6 +17613,9 @@ impl CayenneTableProvider {
         // over live rows, so suppress the pushed limit here. Position-based
         // deletion applies inside the Vortex access plan, so its pushed limit
         // already counts live rows and is left intact.
+        // Revisit this if the key-deletion predicate is pushed into the Vortex
+        // scan itself; at that point the scan could safely apply `limit` after
+        // filtering instead of counting rows deleted above the scan.
         let scan_pushdown_limit =
             if self.has_pending_deletions() && !self.pk_deletion_strategy.is_position_based() {
                 None
