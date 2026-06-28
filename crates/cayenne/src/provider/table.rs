@@ -17605,6 +17605,22 @@ impl CayenneTableProvider {
             });
         let statistic_file_limit = if data_filters.is_empty() { limit } else { None };
 
+        // Key-based deletion (`Int64Pk` / `RowConverterBased`) applies its filter
+        // ABOVE the Vortex scan (`apply_deletion_filter` in `scan()`), so a raw
+        // row-count limit pushed INTO the scan would count rows the filter then
+        // removes — under-delivering (returning fewer rows than exist, even 0).
+        // The outer `GlobalLimitExec` in `scan()` already applies the real limit
+        // over live rows, so suppress the pushed limit here. Position-based
+        // deletion applies inside the Vortex access plan, so its pushed limit
+        // already counts live rows and is left intact.
+        let scan_pushdown_limit = if self.has_pending_deletions()
+            && !self.pk_deletion_strategy.is_position_based()
+        {
+            None
+        } else {
+            limit
+        };
+
         let SnapshotFilesForScan {
             file_groups: mut partitioned_file_lists,
             statistics,
@@ -17708,7 +17724,7 @@ impl CayenneTableProvider {
                     .with_constraints(Constraints::default())
                     .with_statistics(statistics)
                     .with_projection_indices(projection.cloned())?
-                    .with_limit(limit)
+                    .with_limit(scan_pushdown_limit)
                     .with_output_ordering(output_ordering)
                     .with_partitioned_by_file_group(grouped_by_partition)
                     .build(),
@@ -17810,8 +17826,15 @@ impl CayenneTableProvider {
         // past this listing, so the plan being built here (and its execution,
         // however long it runs) can open the files it resolves.
         self.note_snapshot_listed(request.snapshot_id);
-        let collect_stats = request.options.collect_stat
-            && !(self.pk_deletion_strategy.is_position_based() && self.has_pending_deletions());
+        // Per-file stats drive the LIMIT-based file-set truncation in
+        // `collect_scan_files_with_limit`, which sums RAW (pre-deletion) footer
+        // row counts. With ANY pending deletion those counts overcount live
+        // rows, so truncating by them can drop files the LIMIT still needs and
+        // under-deliver — returning fewer rows than exist (key-based deletion
+        // could even return 0). Disable stats-driven truncation whenever a
+        // deletion is pending, not just for position-based (the only case
+        // guarded before this fix).
+        let collect_stats = request.options.collect_stat && !self.has_pending_deletions();
         let store = request
             .state
             .runtime_env()
@@ -19343,10 +19366,15 @@ impl TableProvider for CayenneTableProvider {
             return None;
         }
 
-        // Position deletes are applied inside the Vortex access plan. If no
-        // cached table stats are available, the synchronous ListingTable stats
-        // are raw file-footer stats and do not account for the pending bitmap.
-        if self.pk_deletion_strategy.is_position_based() && self.has_pending_deletions() {
+        // Any pending deletion (position OR key) makes the synchronous
+        // ListingTable footer stats over-count live rows: position deletes are
+        // applied inside the Vortex access plan and key deletes via the deletion
+        // filter wrapped above the scan, neither of which is reflected in raw
+        // file-footer stats. Don't hand an over-count to the optimizer (it
+        // mis-sizes joins / enables unsafe count pushdown). The narrow
+        // position-only guard left key-based pending deletes leaking the
+        // over-count in the pre-first-maintenance window.
+        if self.has_pending_deletions() {
             return None;
         }
 
