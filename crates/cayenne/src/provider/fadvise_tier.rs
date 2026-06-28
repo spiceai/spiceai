@@ -74,7 +74,10 @@ use std::path::PathBuf;
 pub(crate) fn flush_and_evict(path: &std::path::Path) -> io::Result<()> {
     use std::os::fd::AsRawFd;
 
-    let file = std::fs::OpenOptions::new().read(true).write(true).open(path)?;
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)?;
     let fd = file.as_raw_fd();
 
     // 1) Make dirty pages clean so DONTNEED can actually drop them. offset=0,
