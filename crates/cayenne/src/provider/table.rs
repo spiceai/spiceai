@@ -12162,6 +12162,17 @@ impl CayenneTableProvider {
         Some(PendingMaintainedAggregateInsert { epoch, batches })
     }
 
+    /// Whether the staged write path should buffer + capture insert batches for an
+    /// incremental IVM feed: only when a maintained aggregate is registered AND it
+    /// supports retraction (so a later upsert/supersession retracts the old
+    /// contribution via the per-PK index — the same gate the in-mem feed uses).
+    /// Non-retraction registries fall back to a full rebuild (the staged publish's
+    /// `feed_staged_ivm_under_fence(None)` marks them stale), so there is no point
+    /// paying the Stage-A buffer for them.
+    pub(crate) fn should_capture_staged_ivm_feed(&self) -> bool {
+        !self.maintained_aggregates.is_empty() && self.maintained_aggregates.supports_retraction()
+    }
+
     /// Feed the maintained-aggregate registry from a STAGED-disk publish.
     ///
     /// MUST be called while the partition's `listing_fence` is held for write
@@ -12180,17 +12191,6 @@ impl CayenneTableProvider {
     /// (mark stale → queries fall back to a base scan). Enqueue uses `try_send`
     /// (never awaits under the fence); a full queue or dead applier fails safe to
     /// stale at the consumed epoch, so the dense `+1` epoch chain is never gapped.
-    /// Whether the staged write path should buffer + capture insert batches for an
-    /// incremental IVM feed: only when a maintained aggregate is registered AND it
-    /// supports retraction (so a later upsert/supersession retracts the old
-    /// contribution via the per-PK index — the same gate the in-mem feed uses).
-    /// Non-retraction registries fall back to a full rebuild (the staged publish's
-    /// `feed_staged_ivm_under_fence(None)` marks them stale), so there is no point
-    /// paying the Stage-A buffer for them.
-    pub(crate) fn should_capture_staged_ivm_feed(&self) -> bool {
-        !self.maintained_aggregates.is_empty() && self.maintained_aggregates.supports_retraction()
-    }
-
     pub(crate) fn feed_staged_ivm_under_fence(&self, batches: Option<&Arc<Vec<RecordBatch>>>) {
         if self.maintained_aggregates.is_empty() {
             return; // non-IVM table (the common case) — zero cost.
