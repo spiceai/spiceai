@@ -23,7 +23,7 @@ limitations under the License.
 //! set — the scan-under-compaction p99 regression (`vs_duckdb_scan_under_compaction`,
 //! `vs_chdb_scan_under_compaction`). Once the merged output is durable we drop
 //! its pages so the next *query* — not background maintenance — owns the cache.
-//! This is the RocksDB / DuckDB posture: compaction reorganizes data, it does
+//! This is the `RocksDB` / `DuckDB` posture: compaction reorganizes data, it does
 //! not warm the cache; reads warm the cache on demand.
 //!
 //! ## Data safety (unconditional)
@@ -39,7 +39,7 @@ limitations under the License.
 //! *directory* (`fsync_tier::ordering_sync_dir_std`). So at the call site the
 //! output `.vortex` pages are still **dirty**, and a bare `DONTNEED` would skip
 //! them and drop nothing. We first `sync_file_range(WAIT_BEFORE|WRITE|WAIT_AFTER)`
-//! — RocksDB's `RangeSync` — to write the page cache back to the device WITHOUT
+//! — `RocksDB`'s `RangeSync` — to write the page cache back to the device WITHOUT
 //! a device-cache flush or metadata-journal barrier (cheaper than `fdatasync`,
 //! adds no FUA barrier on EBS), leaving the pages clean and droppable.
 //!
@@ -100,6 +100,10 @@ pub(crate) fn flush_and_evict(path: &std::path::Path) -> io::Result<()> {
 
 /// Non-Linux hosts: no portable post-hoc page-drop exists. No-op.
 #[cfg(not(target_os = "linux"))]
+#[expect(
+    clippy::unnecessary_wraps,
+    reason = "signature must match the fallible Linux variant so callers are platform-agnostic"
+)]
 pub(crate) fn flush_and_evict(_path: &std::path::Path) -> std::io::Result<()> {
     Ok(())
 }
