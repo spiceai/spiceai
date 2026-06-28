@@ -20,6 +20,8 @@ cayenne_full_accel: &cayenne_accel
   refresh_mode: full
 
 runtime:
+  query:
+    target_partitions: 48
   caching:
     sql_results:
       enabled: false
