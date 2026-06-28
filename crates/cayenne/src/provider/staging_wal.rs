@@ -1075,20 +1075,22 @@ impl CayenneTableProvider {
                     self.staging_may_have_files()
                         .store(false, Ordering::Release);
                 }
-                // Durability: after removing the WAL marker (the "commit success" signal),
-                // fsync the staging directory so the unlink is persisted. A crash without
-                // this sync could make the removal non-durable, causing a false-positive
-                // "incomplete write" detection on the next open even though the data move
-                // succeeded and was synced. This completes the "WAL absent = durably
-                // committed" contract for local FS staged appends (symmetric to the
-                // sync after data file moves).
-                if let Err(e) = Self::sync_snapshot_dir(&staging_dir).await {
-                    tracing::warn!(
-                        "Failed to sync staging dir after WAL removal for table {}: {e} (data is safe; may see stale WAL on restart)",
-                        self.table_name(),
-                    );
-                    // Non-fatal: data files are already durable. A lingering WAL is conservative.
-                }
+                // No staging-dir fsync after the WAL unlink. The data move's
+                // target-snapshot dir fsync (`move_staging_files_local`) already
+                // made this commit durable BEFORE this point, so persisting the
+                // WAL *unlink* is a recovery-hygiene ordering hint, not a
+                // durability barrier — and it bought nothing end-to-end (the
+                // next line `remove_dir`s this same directory without a sync
+                // anyway). A crash in this window self-heals: recovery's
+                // `ensure_no_incomplete_write` audit finds every WAL-listed file
+                // already in the target snapshot and re-drives the idempotent
+                // (now no-op) move, then removes the stale WAL. Dropping this
+                // barrier cuts one ordering-tier `fsync(2)` from EVERY staged
+                // commit — a real saving on EBS / provisioned-IOPS, where each
+                // barrier is a billed, capped operation. The durable commit
+                // boundary (the target-dir fsync) and the recovery substrate
+                // (the WAL-content fsync + the post-rename staging-dir fsync)
+                // are untouched.
                 match tokio::fs::remove_dir(&staging_dir).await {
                     Ok(()) => {}
                     Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
