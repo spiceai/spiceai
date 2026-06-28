@@ -652,7 +652,10 @@ impl CayenneContext {
         snap.replication_lag_secs = self.ingest_stats.replication_lag_secs(now_ms);
         snap.freshness_secs = self.ingest_stats.freshness_secs(now_ms);
         snap.query_latency_p99_ms = self.query_observations.p99_latency_ms();
-        snap.qph = self.query_observations.qph();
+        // QPH is system-wide (a query spanning datasets counts once), so every
+        // table's controller reads the process-global aggregate — NOT this table's
+        // own rate, which would multiply-count joins across their participants.
+        snap.qph = tuning::global_qph();
         // Per-table static storage classes + measured calibration-probe throughput
         // (detected at registration) — the loop reasons over them via
         // `IngestSnapshot` (the continuous slow-tier bias), keeping `decide` pure.
