@@ -942,6 +942,17 @@ pub struct VortexConfig {
     /// land). A slow tier biases toward larger inline-flush to amortize commits.
     #[serde(skip)]
     pub metastore_storage_class: StorageClass,
+    /// Measured sequential write throughput of the DATA volume in MiB/s, from the
+    /// runtime's startup calibration probe; `None` when unprobed (remote/object
+    /// store) or the probe failed. Refines [`Self::data_storage_class`] into the
+    /// tuner's *continuous* slow-tier bias (a fast io2 volume gets less
+    /// amortization pressure than a slow gp3). Detected runtime fact — `#[serde(skip)]`.
+    #[serde(skip)]
+    pub data_storage_write_mbps: Option<f64>,
+    /// Measured sequential write throughput of the METASTORE volume in MiB/s
+    /// (calibration probe); refines the publish-bias bar. `None` when unprobed.
+    #[serde(skip)]
+    pub metastore_storage_write_mbps: Option<f64>,
     /// Force the **read/query** scan to emit Arrow *view* types (`Utf8View`/
     /// `BinaryView`) for `Utf8`/`Binary` columns, decoupled from the stored
     /// schema (which keeps the original types for writes/CDC/stats/keyset). Lets
@@ -1248,6 +1259,8 @@ impl Default for VortexConfig {
             goal_convergence_window_secs: None,
             data_storage_class: StorageClass::default(),
             metastore_storage_class: StorageClass::default(),
+            data_storage_write_mbps: None,
+            metastore_storage_write_mbps: None,
             force_view_read_schema: false,
         }
     }
@@ -1534,9 +1547,10 @@ pub struct TableStatistics {
     /// the authoritative rewritten count.
     pub num_rows: i64,
     /// Serialized per-column NDV (distinct-count) `HyperLogLog` sketches
-    /// ([`crate::hll::NdvSketches`]), `None` when no integer column has a sketch.
-    /// Merged across writes register-wise; used to size distributed joins on
-    /// sparse integer keys. See [`crate::hll`].
+    /// ([`crate::hll::NdvSketches`]), `None` when no NDV-tracked column has a
+    /// sketch. Merged across writes register-wise; used to size distributed
+    /// joins and group-bys on integer, string, and temporal (date/time/timestamp)
+    /// keys. See [`crate::hll`].
     pub ndv_sketches: Option<Vec<u8>>,
 }
 
