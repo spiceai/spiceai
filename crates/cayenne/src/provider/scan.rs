@@ -445,13 +445,18 @@ fn file_scan_configs(plan: &Arc<dyn ExecutionPlan>) -> Vec<&FileScanConfig> {
     configs
 }
 
-/// Whether any file source in `plan`'s subtree carries a pushed-down filter (a
-/// static predicate or a dynamic join filter). The file-metadata `num_rows`
-/// describes the *unfiltered* file, so a consumer reasoning about a scan's live
-/// row count — e.g. the deletion filter's delete-aware `num_rows`, which
-/// subtracts a whole-table deletion count — must not treat a filtered scan's
-/// (subset) count as the whole-table count. Reused by
-/// [`CayenneAccelerationExec::has_pushed_filter`] and the deletion-filter execs.
+/// Whether any file source reachable from `plan` carries a pushed-down filter (a
+/// static predicate or a dynamic join filter). Reachability is exactly what
+/// [`file_scan_configs`] walks — it descends only identity-preserving wrappers
+/// and `UnionExec` (the Cayenne base+delta shape), not arbitrary intermediate
+/// operators — so a filter buried under a non-passthrough node is not detected.
+/// That matches the intended callers, whose `FileScanConfig`s sit directly under
+/// such wrappers: the file-metadata `num_rows` describes the *unfiltered* file,
+/// so a consumer reasoning about a scan's live row count — e.g. the deletion
+/// filter's delete-aware `num_rows`, which subtracts a whole-table deletion count
+/// — must not treat a filtered scan's (subset) count as the whole-table count.
+/// Reused by [`CayenneAccelerationExec::has_pushed_filter`] and the
+/// deletion-filter execs.
 pub(crate) fn plan_has_pushed_filter(plan: &Arc<dyn ExecutionPlan>) -> bool {
     file_scan_configs(plan)
         .iter()

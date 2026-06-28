@@ -265,16 +265,28 @@ fn deletion_filtered_statistics(
     let Precision::Inexact(rows) = stats.num_rows else {
         return stats;
     };
-    if net_deletions == 0 || rows == 0 {
+    // Keep the pre-deletion upper bound when the subtraction would over-apply
+    // (`net_deletions >= rows`). `net_deletions` is derived from whole-table
+    // tombstone key counts and can meet or exceed this scan's `num_rows` (e.g. a
+    // count mismatch between the union row estimate and the deletion index);
+    // collapsing to `num_rows = 0` is the dangerous direction — it can make a
+    // non-empty relation look empty and get it wrongly broadcast. Over-estimating
+    // (keeping the upper bound) only declines a broadcast, the safe direction.
+    if net_deletions == 0 || rows == 0 || net_deletions >= rows {
         return stats;
     }
-    let live = rows.saturating_sub(net_deletions);
+    let live = rows - net_deletions;
     // Scale total_byte_size by the surviving row fraction so build-side byte
-    // thresholds see the live footprint, not the pre-deletion one.
+    // thresholds see the live footprint, not the pre-deletion one. Use saturating
+    // multiplication and round the division UP: systematically under-estimating
+    // bytes would bias build-side selection toward broadcasting (the riskier
+    // direction), so bias the estimate high instead.
     if let Precision::Inexact(bytes) = stats.total_byte_size {
-        let scaled = u128::try_from(bytes).unwrap_or(0) * u128::try_from(live).unwrap_or(0)
-            / u128::try_from(rows).unwrap_or(1);
-        stats.total_byte_size = Precision::Inexact(usize::try_from(scaled).unwrap_or(bytes));
+        let bytes_u128 = u128::try_from(bytes).unwrap_or(u128::MAX);
+        let live_u128 = u128::try_from(live).unwrap_or(u128::MAX);
+        let rows_u128 = u128::try_from(rows).unwrap_or(u128::MAX);
+        let scaled = bytes_u128.saturating_mul(live_u128).div_ceil(rows_u128);
+        stats.total_byte_size = Precision::Inexact(usize::try_from(scaled).unwrap_or(usize::MAX));
     }
     stats.num_rows = Precision::Inexact(live);
     stats
@@ -1428,10 +1440,12 @@ mod tests {
         assert_eq!(agg.num_rows, Precision::Inexact(2));
     }
 
-    /// Over-subtraction guard: more pending deletes than input rows clamps
-    /// `num_rows` at 0 (no underflow), staying `Inexact`.
+    /// Over-apply guard: when the (whole-table) deletion count meets or exceeds
+    /// the scan's row count, keep the pre-deletion upper bound rather than
+    /// collapsing `num_rows` toward 0 — collapsing is the dangerous direction (it
+    /// can make a non-empty relation look empty and get it wrongly broadcast).
     #[test]
-    fn deletion_filter_clamps_num_rows_at_zero() {
+    fn deletion_filter_keeps_upper_bound_when_deletes_exceed_rows() {
         let tombstones = Arc::new(DeletionIndex::from_map(HashMap::from([
             (1_i64, 5_i64),
             (2, 5),
@@ -1446,10 +1460,11 @@ mod tests {
             0,
             None,
         );
+        // 5 deletes >= 3 scanned rows -> keep the upper bound (3), not 0.
         let agg = exec
             .partition_statistics(None)
             .expect("aggregate statistics");
-        assert_eq!(agg.num_rows, Precision::Inexact(0));
+        assert_eq!(agg.num_rows, Precision::Inexact(3));
     }
 
     /// `net_table_deletions` keeps the pre-deletion upper bound (returns 0) when
