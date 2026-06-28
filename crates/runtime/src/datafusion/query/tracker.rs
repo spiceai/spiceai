@@ -116,8 +116,17 @@ impl QueryTracker {
         // tuning (the safe direction).
         if self.error_message.is_none() {
             let latency_ms = query_duration.as_secs_f64() * 1000.0;
+            let mut touched_cayenne = false;
             for ds in self.datasets.iter() {
-                cayenne::record_query_latency(ds.table(), latency_ms);
+                touched_cayenne |= cayenne::record_query_latency(ds.table(), latency_ms);
+            }
+            // QPH is system-wide: count each Cayenne-touching query exactly ONCE
+            // (a join over several datasets is one unit of throughput, not N), so
+            // record it globally outside the per-dataset loop. Skipped when the
+            // query touched no Cayenne table — those queries can't move QPH that a
+            // Cayenne controller could influence.
+            if touched_cayenne {
+                cayenne::record_global_query(latency_ms);
             }
         }
 
