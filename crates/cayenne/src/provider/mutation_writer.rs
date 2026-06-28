@@ -1441,14 +1441,18 @@ impl<'a> AppendMutationWriter<'a> {
                         message: format!("IVM staged capture failed to read a batch: {e}"),
                     })?);
                 }
-                let captured = Arc::new(buffered.clone());
+                // Share ONE backing buffer between the re-stream and the publish
+                // receipt: `RecordBatch` is cheaply clonable (it shares the
+                // underlying Arrow buffers), so the encoder re-stream clones each
+                // batch lazily off the shared `Arc<Vec<_>>` rather than duplicating
+                // the whole `Vec`.
+                let captured = Arc::new(buffered);
+                let stream_batches = Arc::clone(&captured);
                 let restream: SendableRecordBatchStream = Box::pin(RecordBatchStreamAdapter::new(
                     schema,
-                    futures::stream::iter(
-                        buffered
-                            .into_iter()
-                            .map(Ok::<_, datafusion::error::DataFusionError>),
-                    ),
+                    futures::stream::iter((0..stream_batches.len()).map(move |i| {
+                        Ok::<_, datafusion::error::DataFusionError>(stream_batches[i].clone())
+                    })),
                 ));
                 (restream, Some(captured))
             } else {

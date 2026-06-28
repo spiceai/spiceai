@@ -12206,16 +12206,22 @@ impl CayenneTableProvider {
         let Some(tx) = &self.maintained_aggregate_tx else {
             return;
         };
-        if tx
-            .try_send(MaintainedAggregateApply::Insert {
-                epoch: pending.epoch,
-                batches: pending.batches,
-            })
-            .is_err()
-        {
+        if let Err(send_err) = tx.try_send(MaintainedAggregateApply::Insert {
+            epoch: pending.epoch,
+            batches: pending.batches,
+        }) {
             // Bounded queue full / applier gone: fail safe to stale at THIS
             // epoch (synchronously, no await under the fence). The epoch is
             // consumed, so the strict-`+1` chain the applier expects stays dense.
+            // Surface the degradation: this forces queries onto base scans until
+            // the next full rebuild, so it must be diagnosable in production
+            // (distinguish a full bounded queue from a gone applier).
+            tracing::warn!(
+                table = %self.table_name(),
+                epoch = pending.epoch,
+                error = %send_err,
+                "staged IVM feed: maintained-aggregate enqueue failed (queue full or applier gone); marking stale — queries fall back to base scans until the next rebuild"
+            );
             self.maintained_aggregates.mark_stale(pending.epoch);
         }
     }
