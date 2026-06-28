@@ -2265,7 +2265,7 @@ async fn executor_bind_object_stores(rt: Arc<Runtime>) -> crate::Result<()> {
     Ok(())
 }
 
-/// Apply the DataFusion configuration that distributed (Ballista) execution requires
+/// Apply the `DataFusion` configuration that distributed (Ballista) execution requires
 /// for correctness, returning the adjusted [`SessionConfig`].
 ///
 /// This is the same set the executor applies via `new_with_ballista`, applied here so

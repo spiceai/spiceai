@@ -179,6 +179,11 @@ pub async fn start_internal_cluster_server(
     Ok(())
 }
 
+/// Upper bound on h2 pending-accept resets the executor Flight server tolerates
+/// before tripping Rapid-Reset flood protection. Set well above any realistic
+/// shuffle cancellation burst; see `start_executor_flight_server` for rationale.
+const EXECUTOR_MAX_PENDING_ACCEPT_RESET_STREAMS: usize = 100_000;
+
 /// Starts the executor Flight server for both Ballista shuffle data and Spice SQL queries.
 ///
 /// This server uses a composite Flight service that routes:
@@ -213,7 +218,6 @@ pub async fn start_executor_flight_server(
     // in production that path is secured by cluster mTLS. Running without mTLS requires
     // the dev-only `--allow-insecure-connections` flag, which is not used in deployments
     // exposed to untrusted clients, so relaxing the Rapid-Reset threshold is safe.
-    const EXECUTOR_MAX_PENDING_ACCEPT_RESET_STREAMS: usize = 100_000;
     let server = configure_flight_server_transport(Server::builder())
         .http2_max_pending_accept_reset_streams(Some(EXECUTOR_MAX_PENDING_ACCEPT_RESET_STREAMS));
 
