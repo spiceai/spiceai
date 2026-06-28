@@ -59,14 +59,22 @@ use std::path::PathBuf;
 /// Flush `path`'s dirty pages to the device, then drop its now-clean pages from
 /// the page cache. Best-effort: callers log and ignore the result.
 ///
-/// `O_RDONLY` is sufficient — `sync_file_range`/`posix_fadvise` act on the
-/// inode's page cache, not the fd's write mode. Cayenne holds no fd for the
-/// output (object_store closed the writer), so we re-open.
+/// We re-open the output read-write. `O_RDONLY` is in fact sufficient —
+/// `sync_file_range`/`posix_fadvise` act on the inode's page-cache
+/// `address_space` (the kernel's `ksys_sync_file_range` does NO `FMODE_WRITE`
+/// check; `EBADF` is raised only for an *invalid* fd, not a read-only one) — but
+/// we open `O_RDWR` as zero-cost defense-in-depth: it matches `RocksDB`'s
+/// writable-fd `RangeSync` posture and retires the recurring "sync_file_range
+/// needs a writable fd" objection. (The real failure axes are filesystem-level
+/// — ZFS no-ops, ext4-on-WSL `ENOSYS` — not fd mode.) The file is a
+/// process-owned, durable, not-yet-published compaction output, so it is always
+/// on a writable mount; Cayenne holds no fd for it (object_store closed the
+/// writer), so we re-open.
 #[cfg(target_os = "linux")]
 pub(crate) fn flush_and_evict(path: &std::path::Path) -> io::Result<()> {
     use std::os::fd::AsRawFd;
 
-    let file = std::fs::File::open(path)?;
+    let file = std::fs::OpenOptions::new().read(true).write(true).open(path)?;
     let fd = file.as_raw_fd();
 
     // 1) Make dirty pages clean so DONTNEED can actually drop them. offset=0,
@@ -117,7 +125,7 @@ pub(crate) async fn evict_files(paths: Vec<PathBuf>) {
     if paths.is_empty() {
         return;
     }
-    let _ = tokio::task::spawn_blocking(move || {
+    if let Err(join_error) = tokio::task::spawn_blocking(move || {
         for path in &paths {
             if let Err(error) = flush_and_evict(path) {
                 tracing::debug!(
@@ -129,7 +137,17 @@ pub(crate) async fn evict_files(paths: Vec<PathBuf>) {
             }
         }
     })
-    .await;
+    .await
+    {
+        // The blocking task panicked or the runtime is shutting down. Still
+        // best-effort (compaction already committed), but log so a vanished
+        // eviction is diagnosable rather than silent.
+        tracing::debug!(
+            target: "cayenne::compaction",
+            %join_error,
+            "compaction page-cache evict task did not run to completion (best-effort, ignored)"
+        );
+    }
 }
 
 #[cfg(test)]
