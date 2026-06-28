@@ -17613,13 +17613,12 @@ impl CayenneTableProvider {
         // over live rows, so suppress the pushed limit here. Position-based
         // deletion applies inside the Vortex access plan, so its pushed limit
         // already counts live rows and is left intact.
-        let scan_pushdown_limit = if self.has_pending_deletions()
-            && !self.pk_deletion_strategy.is_position_based()
-        {
-            None
-        } else {
-            limit
-        };
+        let scan_pushdown_limit =
+            if self.has_pending_deletions() && !self.pk_deletion_strategy.is_position_based() {
+                None
+            } else {
+                limit
+            };
 
         let SnapshotFilesForScan {
             file_groups: mut partitioned_file_lists,

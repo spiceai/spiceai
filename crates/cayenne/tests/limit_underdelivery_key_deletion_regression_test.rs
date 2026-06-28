@@ -96,11 +96,11 @@ async fn setup_table(
             ..VortexConfig::default()
         },
     };
-    let catalog: Arc<dyn MetadataCatalog> = Arc::clone(&fixture.catalog) as Arc<dyn MetadataCatalog>;
+    let catalog: Arc<dyn MetadataCatalog> =
+        Arc::clone(&fixture.catalog) as Arc<dyn MetadataCatalog>;
     let ctx = SessionContext::new();
-    let table = Arc::new(
-        CayenneTableProvider::create_table(catalog, options, ctx.runtime_env()).await?,
-    );
+    let table =
+        Arc::new(CayenneTableProvider::create_table(catalog, options, ctx.runtime_env()).await?);
     ctx.register_table(name, Arc::clone(&table) as Arc<dyn TableProvider>)?;
     Ok((table, ctx))
 }
