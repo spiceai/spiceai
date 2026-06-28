@@ -10012,6 +10012,37 @@ impl CayenneTableProvider {
         Ok(files)
     }
 
+    /// Best-effort page-cache hygiene after a background compaction writes its
+    /// cold output: drop the just-written files' clean pages so the `O(table)`
+    /// rewrite doesn't evict the hot query working set (the scan-under-compaction
+    /// p99). Linux + local-FS only (no page cache on S3; no `posix_fadvise` on
+    /// macOS). Call AFTER `sync_snapshot_dir` (the output is durable, so its
+    /// pages are droppable without data loss) and BEFORE the listing-fence
+    /// publish (the output is not yet query-visible, so the dropped pages race
+    /// no reader). Never fails — a cache hint must not abort a compaction.
+    async fn evict_compaction_output_pages(&self, snapshot_id: &str) {
+        let files = match self.list_snapshot_files_with_sizes_local(snapshot_id).await {
+            Ok(files) => files,
+            Err(error) => {
+                tracing::debug!(
+                    target: "cayenne::compaction",
+                    %error,
+                    "skipping compaction page-cache evict: could not list output files"
+                );
+                return;
+            }
+        };
+        if files.is_empty() {
+            return;
+        }
+        let snapshot_dir = self.snapshot_dir_path_for(snapshot_id);
+        let paths: Vec<std::path::PathBuf> = files
+            .into_iter()
+            .map(|(name, _size)| snapshot_dir.join(name))
+            .collect();
+        super::fadvise_tier::evict_files(paths).await;
+    }
+
     async fn list_snapshot_files_with_sizes_s3(
         &self,
         snapshot_id: &str,
@@ -11386,6 +11417,12 @@ impl CayenneTableProvider {
                     .await;
                 return Err(Error::Catalog { source: e });
             }
+            // Page-cache hygiene: the merged output is durable but NOT yet
+            // query-visible (the listing-fence swap below publishes it), so
+            // dropping its just-written pages here races no reader. Stops the
+            // O(table) background compaction from evicting the hot query working
+            // set (scan-under-compaction p99). Linux + local only; best-effort.
+            self.evict_compaction_output_pages(&new_snapshot_id).await;
         }
 
         let old_ids: Vec<String> = inputs.iter().map(|(id, _)| id.clone()).collect();
@@ -11880,6 +11917,10 @@ impl CayenneTableProvider {
                     .await;
                 return Err(Error::Catalog { source: e });
             }
+            // Page-cache hygiene (see the size-tier compaction path): drop the
+            // merged output's just-written pages while it is durable but not yet
+            // query-visible, so the bake doesn't evict the hot query working set.
+            self.evict_compaction_output_pages(&new_snapshot_id).await;
         }
 
         let old_ids: Vec<String> = selected.iter().map(|(id, _)| id.clone()).collect();
