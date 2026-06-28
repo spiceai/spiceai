@@ -27028,7 +27028,7 @@ mod tests {
     // ----------------------------------------------------------------------
 
     /// Mirror of `create_cdc_upsert_table_with_vortex_config` (id Int64, value
-    /// Int64, PK=id, on_conflict Upsert(id)) but registers maintained-aggregate
+    /// Int64, PK=id, `on_conflict` `Upsert(id)`) but registers maintained-aggregate
     /// views on the BUILDER and pins the table to the STAGED-disk CDC path
     /// (`cdc_durability: File`, `inline_max_rows: 0`, `deletion_mode: Key`) so
     /// every write exercises `feed_staged_ivm_under_fence`, not the in-mem feed.
@@ -27110,7 +27110,7 @@ mod tests {
     /// and its OUTPUT SCHEMA to materialize the served batch. Modeled on
     /// `maintained_aggregate::tests::aggregate_exec_for`: a `MemorySourceConfig`
     /// input over the table schema, `count(*)` via a non-null literal (=>
-    /// `CountQueryColumn::AllRows`), `sum(value)` over the column, AggregateMode::Single.
+    /// `CountQueryColumn::AllRows`), `sum(value)` over the column, `AggregateMode::Single`.
     fn build_id_count_sum_aggregate_exec() -> AggregateExec {
         use arrow::datatypes::{DataType, Field, Schema};
         use datafusion::physical_expr::aggregate::AggregateExprBuilder;
@@ -27197,7 +27197,7 @@ mod tests {
     }
 
     /// Read the served (id, count, sum) rows out of a maintained-aggregate batch
-    /// sorted by id. Column layout: [0]=id (group key), [1]=count(*), [2]=sum(value),
+    /// sorted by id. Column layout: [0]=id (group key), [1]=`count(*)`, [2]=`sum(value)`,
     /// all Int64 (see `build_id_count_sum_aggregate_exec` / `id_count_sum_spec`).
     fn collect_id_count_sum(batch: &RecordBatch) -> Vec<(i64, i64, i64)> {
         use arrow::array::Int64Array;
@@ -27279,7 +27279,7 @@ mod tests {
         );
     }
 
-    /// TEST 2 — REORDER GATE: pipelined staged finish() out of order keeps the
+    /// TEST 2 — REORDER GATE: pipelined staged `finish()` out of order keeps the
     /// registry FRESH.
     ///
     /// Stage TWO writes (each returns `has_pending_finalize`), then finish them in

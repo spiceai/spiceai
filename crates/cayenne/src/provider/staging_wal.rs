@@ -406,7 +406,7 @@ pub struct PreparedStagedAppend {
     target_snapshot_id: String,
     target_kind: StagingWalTargetKind,
     row_count: u64,
-    /// IVM feed: the insert RecordBatches captured at Stage A, present ONLY when
+    /// IVM feed: the insert `RecordBatches` captured at Stage A, present ONLY when
     /// this table has a registered maintained aggregate AND the write is
     /// incrementally feedable (set by the write path; `None` for non-IVM tables —
     /// the common case, zero cost — or when the write must fall back to a full
