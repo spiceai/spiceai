@@ -119,6 +119,10 @@ name = "ivm_retraction_anchor"
 
 [[bench]]
 harness = false
+name = "staged_ivm_feed"
+
+[[bench]]
+harness = false
 name = "folded_txn_decomposition"
 
 [[bench]]
