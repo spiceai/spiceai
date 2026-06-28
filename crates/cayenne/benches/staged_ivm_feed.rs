@@ -79,7 +79,7 @@ use std::hint::black_box;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use arrow::array::{Array, Int64Array, RecordBatch};
+use arrow::array::{Int64Array, RecordBatch};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use cayenne::maintained_aggregate::{
     MaintainedAggregateExpr, MaintainedAggregateFunction, MaintainedAggregateRegistry,
