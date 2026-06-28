@@ -3184,7 +3184,10 @@ mod tests {
         // Global SLOs set once at runtime.params.
         let global: HashMap<String, String> = [
             ("cayenne_goal_freshness".to_string(), "10s".to_string()),
-            ("cayenne_goal_replication_lag".to_string(), "30s".to_string()),
+            (
+                "cayenne_goal_replication_lag".to_string(),
+                "30s".to_string(),
+            ),
         ]
         .into_iter()
         .collect();
@@ -3194,7 +3197,10 @@ mod tests {
         let accel = Acceleration {
             params: [
                 ("cayenne_goal_freshness".to_string(), "2s".to_string()),
-                ("cayenne_goal_query_latency".to_string(), "250ms".to_string()),
+                (
+                    "cayenne_goal_query_latency".to_string(),
+                    "250ms".to_string(),
+                ),
             ]
             .into_iter()
             .collect(),
