@@ -207,15 +207,15 @@ pub async fn start_executor_flight_server(
     // fetch concurrently over a pooled, multiplexed HTTP/2 connection per peer, and a
     // stage cancellation resets the in-flight fetch streams in bursts. Those legitimate
     // RST_STREAMs would otherwise trip h2's Rapid-Reset flood protection
-    // (`GOAWAY ENHANCE_YOUR_CALM` after 20 pending-accept resets, hyperium/hyper#2877).
-    // This endpoint is internal — reachable only by the scheduler and peer executors
-    // over cluster mTLS — so the threshold is set well above any realistic shuffle
-    // cancellation burst.
+    // (`GOAWAY ENHANCE_YOUR_CALM` after 20 pending-accept resets, hyperium/hyper#2877),
+    // so the threshold is set well above any realistic shuffle cancellation burst. This
+    // is an internal cluster endpoint reached only by the scheduler and peer executors;
+    // in production that path is secured by cluster mTLS. Running without mTLS requires
+    // the dev-only `--allow-insecure-connections` flag, which is not used in deployments
+    // exposed to untrusted clients, so relaxing the Rapid-Reset threshold is safe.
     const EXECUTOR_MAX_PENDING_ACCEPT_RESET_STREAMS: usize = 100_000;
     let server = configure_flight_server_transport(Server::builder())
-        .http2_max_pending_accept_reset_streams(Some(
-            EXECUTOR_MAX_PENDING_ACCEPT_RESET_STREAMS,
-        ));
+        .http2_max_pending_accept_reset_streams(Some(EXECUTOR_MAX_PENDING_ACCEPT_RESET_STREAMS));
 
     if cluster_server_config.is_some() {
         tracing::info!("Cluster mTLS enabled for executor flight server");

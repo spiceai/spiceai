@@ -2327,9 +2327,8 @@ mod tests {
 
     #[test]
     fn distributed_execution_config_disables_single_process_optimizations() {
-        let cfg = super::apply_distributed_execution_config(
-            ::datafusion::prelude::SessionConfig::new(),
-        );
+        let cfg =
+            super::apply_distributed_execution_config(::datafusion::prelude::SessionConfig::new());
         let opts = cfg.options();
         // Single-process-only optimizations must be disabled for distributed execution.
         assert!(!opts.execution.enable_file_scan_work_stealing);
