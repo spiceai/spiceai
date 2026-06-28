@@ -117,8 +117,8 @@ pub use scan::CayenneAccelerationExec;
 pub use staging_wal::{CayenneStagedAppend, PreparedStagedAppend};
 pub use table::{CayenneCdcWrite, CayenneTableProvider, CayenneTableProviderBuilder};
 pub use tuning::{
-    QueryObservations, deregister_query_observations, record_query_latency,
-    register_query_observations, set_cpu_burstable, set_global_memory_budget,
+    QueryObservations, deregister_query_observations, global_qph, record_global_query,
+    record_query_latency, register_query_observations, set_cpu_burstable, set_global_memory_budget,
 };
 pub use write_budget::{cap_global_encode_concurrency, set_global_encode_concurrency};
 
