@@ -1767,6 +1767,11 @@ mod tests {
         // hits the unhandled fallback and returns a plan error.
         let mut config = datafusion::prelude::SessionConfig::new();
         config.options_mut().sql_parser.dialect = datafusion::common::config::Dialect::PostgreSQL;
+        // Pin target_partitions so EXPLAIN snapshots are deterministic across
+        // machines. Without this it defaults to num_cpus, making the
+        // `RepartitionExec: RoundRobinBatch(N)` count vary by runner core count
+        // and flake the `filter_pushdown_explain` snapshot in CI.
+        config.options_mut().execution.target_partitions = 3;
         let ctx = Arc::new(SessionContext::new_with_config(config));
         ctx.state().config_mut().set_extension(Arc::new(
             RequestContext::builder(Protocol::Internal).build(),

@@ -124,6 +124,7 @@ static UNSUPPORTED_LOCAL_PARTITION_PATTERN: LazyLock<Regex> =
 
 fn maintained_aggregate_specs_for_cayenne(
     acceleration: Option<&Acceleration>,
+    schema: &Schema,
 ) -> Result<Vec<cayenne::maintained_aggregate::MaintainedAggregateSpec>> {
     let Some(acceleration) = acceleration else {
         return Ok(Vec::new());
@@ -142,36 +143,111 @@ fn maintained_aggregate_specs_for_cayenne(
         });
     }
 
-    Ok(maintained_aggregates
+    maintained_aggregates
         .iter()
-        .map(
-            |aggregate| cayenne::maintained_aggregate::MaintainedAggregateSpec {
-                group_by: aggregate.group_by.clone(),
-                aggregates: aggregate
-                    .aggregates
-                    .iter()
-                    .map(|expr| {
-                        let function = match expr.function {
-                            spicepod_acceleration::MaintainedAggregateFunction::Count => {
-                                cayenne::maintained_aggregate::MaintainedAggregateFunction::Count
-                            }
-                            spicepod_acceleration::MaintainedAggregateFunction::Sum => {
-                                cayenne::maintained_aggregate::MaintainedAggregateFunction::Sum
-                            }
-                            spicepod_acceleration::MaintainedAggregateFunction::Avg => {
-                                cayenne::maintained_aggregate::MaintainedAggregateFunction::Avg
-                            }
-                        };
+        .map(|aggregate| {
+            // An optional `filter` is the maintained equivalent of a query
+            // `WHERE`: it is parsed against the table schema into a physical
+            // predicate so the view maintains only the matching rows and the
+            // optimizer can serve a query carrying the identical predicate.
+            let filter = aggregate
+                .filter_sql
+                .as_deref()
+                .map(|sql| parse_maintained_aggregate_filter(sql, schema))
+                .transpose()?;
 
-                        cayenne::maintained_aggregate::MaintainedAggregateExpr {
-                            function,
-                            column: expr.column.clone(),
+            let aggregates = aggregate
+                .aggregates
+                .iter()
+                .map(|expr| {
+                    let function = match expr.function {
+                        spicepod_acceleration::MaintainedAggregateFunction::Count => {
+                            cayenne::maintained_aggregate::MaintainedAggregateFunction::Count
                         }
-                    })
-                    .collect(),
-            },
-        )
-        .collect())
+                        spicepod_acceleration::MaintainedAggregateFunction::Sum => {
+                            cayenne::maintained_aggregate::MaintainedAggregateFunction::Sum
+                        }
+                        spicepod_acceleration::MaintainedAggregateFunction::Avg => {
+                            cayenne::maintained_aggregate::MaintainedAggregateFunction::Avg
+                        }
+                    };
+
+                    cayenne::maintained_aggregate::MaintainedAggregateExpr {
+                        function,
+                        column: expr.column.clone(),
+                    }
+                })
+                .collect();
+
+            Ok(cayenne::maintained_aggregate::MaintainedAggregateSpec {
+                filter,
+                group_by: aggregate.group_by.clone(),
+                aggregates,
+            })
+        })
+        .collect()
+}
+
+/// Parse a maintained-aggregate `filter` SQL predicate into a physical
+/// expression over the table `schema`. The resulting expression references the
+/// table columns by their schema position, so it lines up with the CDC batches
+/// the view is maintained from. For serving, the view answers a query only when
+/// this predicate is structurally equal to the query's `FilterExec` predicate
+/// (see `MaintainedAggregateView::matches_query`): that holds when the query
+/// filters the scan output directly, but a projection or type-coercion between
+/// the scan and the filter changes the predicate's column indices/literal types
+/// and the view silently falls back to a re-scan. Declare the filter to match
+/// the predicate the query carries over the scan output.
+fn parse_maintained_aggregate_filter(
+    sql: &str,
+    schema: &Schema,
+) -> Result<Arc<dyn datafusion::physical_expr::PhysicalExpr>> {
+    use datafusion::common::ToDFSchema;
+
+    let df_schema = schema
+        .clone()
+        .to_dfschema()
+        .map_err(|source| Error::InvalidConfiguration {
+            detail: Arc::from(format!(
+                "Cayenne maintained_aggregates filter '{sql}' could not bind to the table schema: {source}"
+            )),
+        })?;
+    let context = datafusion::prelude::SessionContext::new();
+    let logical = context
+        .parse_sql_expr(sql, &df_schema)
+        .map_err(|source| Error::InvalidConfiguration {
+            detail: Arc::from(format!(
+                "Cayenne maintained_aggregates filter '{sql}' is not a valid SQL predicate over the table columns: {source}"
+            )),
+        })?;
+    let physical = datafusion::physical_expr::create_physical_expr(
+        &logical,
+        &df_schema,
+        &datafusion_expr::execution_props::ExecutionProps::new(),
+    )
+    .map_err(|source| Error::InvalidConfiguration {
+        detail: Arc::from(format!(
+            "Cayenne maintained_aggregates filter '{sql}' could not be planned: {source}"
+        )),
+    })?;
+    // A filter is a `WHERE` condition, so it must evaluate to Boolean. Reject a
+    // non-Boolean predicate (e.g. `filter: 1`) at config time with a clear error,
+    // rather than letting it fail later during maintenance.
+    let data_type = physical
+        .data_type(schema)
+        .map_err(|source| Error::InvalidConfiguration {
+            detail: Arc::from(format!(
+                "Cayenne maintained_aggregates filter '{sql}' could not be type-checked: {source}"
+            )),
+        })?;
+    if data_type != DataType::Boolean {
+        return Err(Error::InvalidConfiguration {
+            detail: Arc::from(format!(
+                "Cayenne maintained_aggregates filter '{sql}' must be a Boolean predicate (a WHERE condition), but it evaluates to {data_type}"
+            )),
+        });
+    }
+    Ok(physical)
 }
 
 /// Transform schema according to `unsupported_type_action` policy.
@@ -311,6 +387,78 @@ const SMALL_WRITE_INLINE_MAX_BYTES: usize = cayenne::metadata::DEFAULT_INLINE_MA
 const SMALL_WRITE_INLINE_MAX_BUFFER_BYTES: usize =
     cayenne::metadata::DEFAULT_INLINE_MAX_BUFFER_BYTES;
 const APPEND_SMALL_WRITE_REFRESH_INTERVAL_THRESHOLD: Duration = Duration::from_mins(5);
+
+/// Map the runtime's detected acceleration storage class onto the Cayenne-local
+/// [`cayenne::metadata::StorageClass`] (the crates can't share the enum — `runtime`
+/// depends on `cayenne`). The continuous slow-tier bias is refined further by the
+/// measured throughput threaded alongside it.
+fn to_cayenne_storage_class(
+    storage: crate::dataaccelerator::storage::ResolvedAccelerationStorage,
+) -> cayenne::metadata::StorageClass {
+    use crate::dataaccelerator::storage::ResolvedAccelerationStorage as Resolved;
+    use cayenne::metadata::StorageClass as Class;
+    match storage {
+        Resolved::LocalSsd => Class::LocalSsd,
+        Resolved::Ebs => Class::Ebs,
+        Resolved::Tmpfs => Class::Tmpfs,
+        Resolved::Unknown => Class::Unknown,
+    }
+}
+
+/// Warn (once per canonicalized path) when the filesystem backing `path` is low on
+/// free space.
+/// Under memory pressure the in-memory CDC tier spills to this volume; if it fills,
+/// ingestion fails — so surface it at startup rather than discovering it on a crash.
+async fn warn_if_low_disk(label: &str, path: &str) {
+    // `disk_space_bytes` canonicalizes + enumerates every mount (blocking OS I/O);
+    // run it off the Tokio runtime so it can't stall a worker during concurrent
+    // table registration.
+    let label = label.to_string();
+    let path = path.to_string();
+    let _ = tokio::task::spawn_blocking(move || warn_if_low_disk_blocking(&label, &path)).await;
+}
+
+fn warn_if_low_disk_blocking(label: &str, path: &str) {
+    use std::sync::{LazyLock, Mutex};
+    /// Below this fraction free OR this many absolute bytes free ⇒ warn.
+    const LOW_DISK_FRACTION_DENOM: u64 = 10; // < 10% free
+    const LOW_DISK_FLOOR_BYTES: u64 = 2 * 1024 * 1024 * 1024; // < 2 GiB free
+    static CHECKED: LazyLock<Mutex<std::collections::HashSet<std::path::PathBuf>>> =
+        LazyLock::new(|| Mutex::new(std::collections::HashSet::new()));
+
+    // Check each distinct canonicalized path once per process, BEFORE probing free
+    // space (`disk_space_bytes` re-enumerates every mount). Canonicalizing collapses
+    // equivalent paths (trailing slash, symlinks); distinct dirs on the same mount
+    // each warn once — keyed by path, not mount point.
+    let key = std::path::Path::new(path)
+        .canonicalize()
+        .unwrap_or_else(|_| std::path::PathBuf::from(path));
+    if !CHECKED
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(key)
+    {
+        return;
+    }
+    let Some((available, total)) = crate::dataaccelerator::storage::disk_space_bytes(path) else {
+        return;
+    };
+    if total == 0
+        || (available >= total / LOW_DISK_FRACTION_DENOM && available >= LOW_DISK_FLOOR_BYTES)
+    {
+        return;
+    }
+    tracing::warn!(
+        label,
+        path,
+        available_mib = available / (1024 * 1024),
+        total_mib = total / (1024 * 1024),
+        // saturating_mul so `available * 100` can't overflow u64 on a very large
+        // volume; a purely-informational percentage in a low-disk warning.
+        percent_free = available.saturating_mul(100) / total,
+        "Cayenne {label} volume is low on free space. Under memory pressure the in-memory CDC tier spills here; if it fills, ingestion fails. Free space or point the acceleration at a larger volume."
+    );
+}
 
 fn apply_refresh_mode_defaults(
     config: &mut cayenne::metadata::VortexConfig,
@@ -687,6 +835,38 @@ impl CayenneAccelerator {
             )
             .await;
 
+            // Thread the detected storage medium + measured throughput onto the
+            // Cayenne config so the closed-loop tuner reasons over them. Previously
+            // these were left at the `StorageClass::Unknown` default (never wired
+            // from `hw`), so the loop applied the EBS slow-tier bias even on local
+            // NVMe; mapping the real class fixes that, and the measured throughput
+            // refines the class into a *continuous* bias (see `tuning::tier_scale`).
+            config.data_storage_class = to_cayenne_storage_class(hw.data_storage);
+            config.metastore_storage_class = to_cayenne_storage_class(hw.metastore_storage);
+            config.data_storage_write_mbps = hw.data_perf.write_mbps;
+            config.metastore_storage_write_mbps = hw.metastore_perf.write_mbps;
+
+            // Bound the process-global encode budget by the instance EBS write
+            // bandwidth: a single EBS volume is a shared, bandwidth-bounded pipe, so
+            // many parallel uploads to it just fan out small files without adding
+            // throughput (the regression that made a lag-violated EBS table keep
+            // ADDING write shards). Only ever lowers the budget; local NVMe /
+            // instance store propose no cap.
+            if let Some(cap) = hw.ebs_upload_concurrency_cap() {
+                cayenne::cap_global_encode_concurrency(cap);
+            }
+            // T-family burstable CPU (IMDS): the tuner withholds CPU-stealing moves
+            // at a lower busy-fraction, since CPU credits deplete under sustained
+            // load and throttle the vCPUs to a low baseline.
+            cayenne::set_cpu_burstable(hw.burstable);
+
+            // Low-disk startup warning: a full data/spill volume turns a
+            // memory-pressure spill into a crash. Best-effort, once per path.
+            if let Some(dir) = data_dir.as_deref() {
+                warn_if_low_disk("data", fs_probe_path(dir)).await;
+            }
+            warn_if_low_disk("metastore", fs_probe_path(&metadata_dir)).await;
+
             // Storage-aware target Vortex file size on local disk (the `auto`
             // baseline): smaller files reduce write amplification on EBS-class
             // network storage; larger files improve scan throughput on RAM-backed
@@ -934,7 +1114,8 @@ impl CayenneAccelerator {
                         crate::component::dataset::OnSchemaChange::AppendNewColumns => {
                             cayenne::metadata::SchemaEvolutionMode::AddColumnsOnly
                         }
-                        crate::component::dataset::OnSchemaChange::SyncAllColumns => {
+                        crate::component::dataset::OnSchemaChange::SyncAllColumns
+                        | crate::component::dataset::OnSchemaChange::DropAndRecreate => {
                             cayenne::metadata::SchemaEvolutionMode::Widen
                         }
                         crate::component::dataset::OnSchemaChange::Block
@@ -1430,7 +1611,8 @@ impl CayenneAccelerator {
         // Get metastore type and metadata directory
         let acceleration = source.acceleration();
         let metadata_dir = Self::resolve_metadata_dir(acceleration);
-        let maintained_aggregate_specs = maintained_aggregate_specs_for_cayenne(acceleration)?;
+        let maintained_aggregate_specs =
+            maintained_aggregate_specs_for_cayenne(acceleration, &schema)?;
         let metastore_type = acceleration
             .and_then(|a| a.params.get("cayenne_metastore"))
             .map_or("sqlite", String::as_str)
@@ -2978,18 +3160,29 @@ mod tests {
                     function: spicepod_acceleration::MaintainedAggregateFunction::Count,
                     column: None,
                 }],
+                filter_sql: None,
             }]
             .into(),
             ..Default::default()
         }
     }
 
+    fn maintained_aggregate_test_schema() -> Schema {
+        Schema::new(vec![
+            arrow_schema::Field::new("customer_id", DataType::Int64, false),
+            arrow_schema::Field::new("amount", DataType::Int64, true),
+        ])
+    }
+
     #[test]
     fn maintained_aggregate_specs_convert_for_unpartitioned_cayenne() {
         let acceleration = maintained_aggregate_acceleration();
 
-        let specs = maintained_aggregate_specs_for_cayenne(Some(&acceleration))
-            .expect("unpartitioned maintained aggregate config should convert");
+        let specs = maintained_aggregate_specs_for_cayenne(
+            Some(&acceleration),
+            &maintained_aggregate_test_schema(),
+        )
+        .expect("unpartitioned maintained aggregate config should convert");
 
         assert_eq!(specs.len(), 1);
         assert_eq!(specs[0].group_by, vec!["customer_id".to_string()]);
@@ -3009,8 +3202,11 @@ mod tests {
             acceleration.maintained_aggregates.as_slice().to_vec(),
         );
 
-        let specs = maintained_aggregate_specs_for_cayenne(Some(&acceleration))
-            .expect("disabled maintained aggregate config should parse");
+        let specs = maintained_aggregate_specs_for_cayenne(
+            Some(&acceleration),
+            &maintained_aggregate_test_schema(),
+        )
+        .expect("disabled maintained aggregate config should parse");
 
         assert!(specs.is_empty());
     }
@@ -3023,14 +3219,85 @@ mod tests {
             expression: "region".to_string(),
         }];
 
-        let error = maintained_aggregate_specs_for_cayenne(Some(&acceleration))
-            .expect_err("partitioned maintained aggregate config should be rejected");
+        let error = maintained_aggregate_specs_for_cayenne(
+            Some(&acceleration),
+            &maintained_aggregate_test_schema(),
+        )
+        .expect_err("partitioned maintained aggregate config should be rejected");
 
         let Error::InvalidConfiguration { detail } = error else {
             panic!("expected InvalidConfiguration, got {error:?}");
         };
         assert!(detail.contains("maintained_aggregates"));
         assert!(detail.contains("partitioned"));
+    }
+
+    fn maintained_aggregate_acceleration_with_filter(filter: &str) -> Acceleration {
+        let mut views = maintained_aggregate_acceleration()
+            .maintained_aggregates
+            .as_slice()
+            .to_vec();
+        views[0].filter_sql = Some(filter.to_string());
+        Acceleration {
+            maintained_aggregates: views.into(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn maintained_aggregate_specs_parse_config_filter() {
+        let acceleration = maintained_aggregate_acceleration_with_filter("amount > 100");
+
+        let specs = maintained_aggregate_specs_for_cayenne(
+            Some(&acceleration),
+            &maintained_aggregate_test_schema(),
+        )
+        .expect("a valid maintained aggregate filter should convert");
+
+        assert_eq!(specs.len(), 1);
+        assert!(
+            specs[0].filter.is_some(),
+            "the config filter must be parsed onto the maintained aggregate spec"
+        );
+    }
+
+    #[test]
+    fn maintained_aggregate_specs_reject_unknown_filter_column() {
+        let acceleration = maintained_aggregate_acceleration_with_filter("nonexistent_column > 1");
+
+        let error = maintained_aggregate_specs_for_cayenne(
+            Some(&acceleration),
+            &maintained_aggregate_test_schema(),
+        )
+        .expect_err("a filter referencing an unknown column must be rejected");
+
+        let Error::InvalidConfiguration { detail } = error else {
+            panic!("expected InvalidConfiguration, got {error:?}");
+        };
+        assert!(
+            detail.contains("filter"),
+            "the error must identify the maintained-aggregate filter: {detail}"
+        );
+    }
+
+    #[test]
+    fn maintained_aggregate_specs_reject_non_boolean_filter() {
+        // `amount` alone is an Int64 column, not a `WHERE` predicate.
+        let acceleration = maintained_aggregate_acceleration_with_filter("amount");
+
+        let error = maintained_aggregate_specs_for_cayenne(
+            Some(&acceleration),
+            &maintained_aggregate_test_schema(),
+        )
+        .expect_err("a non-Boolean filter must be rejected at config time");
+
+        let Error::InvalidConfiguration { detail } = error else {
+            panic!("expected InvalidConfiguration, got {error:?}");
+        };
+        assert!(
+            detail.contains("Boolean"),
+            "the error must say the filter must be a Boolean predicate: {detail}"
+        );
     }
 
     #[test]

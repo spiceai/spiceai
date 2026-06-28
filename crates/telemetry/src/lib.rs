@@ -1018,6 +1018,18 @@ pub struct CayenneAutotuneState {
     pub data_storage_class: u64,
     /// Detected metastore storage tier (same code mapping as `data_storage_class`).
     pub metastore_storage_class: u64,
+    /// Calibration-probe measured data-volume write throughput (MiB/s); `< 0` ⇒
+    /// unprobed (remote / object-store / probe failed). Drives the continuous
+    /// slow-tier bias.
+    pub data_storage_write_mbps: f64,
+    /// Calibration-probe measured metastore-volume write throughput (MiB/s); `< 0`
+    /// ⇒ unprobed.
+    pub metastore_storage_write_mbps: f64,
+    /// `1` when the goal-driven controller has declared the SLO infeasible on this
+    /// hardware (no further adjustment possible — actuator bounds or resource gating —
+    /// and the goal still violated); `0` otherwise. Reflects current state — self-clears
+    /// if the SLO becomes reachable again — so an operator can alert on a sustained `1`.
+    pub goal_slo_infeasible: u64,
 }
 
 static CAYENNE_AT_ROWS_PER_SEC: OnceLock<Gauge<f64>> = OnceLock::new();
@@ -1045,6 +1057,9 @@ static CAYENNE_AT_GOAL_QPH: OnceLock<Gauge<f64>> = OnceLock::new();
 static CAYENNE_AT_CPU_PRESSURE: OnceLock<Gauge<f64>> = OnceLock::new();
 static CAYENNE_AT_IO_LATENCY_MS: OnceLock<Gauge<f64>> = OnceLock::new();
 static CAYENNE_AT_PUBLISH_LATENCY_MS: OnceLock<Gauge<f64>> = OnceLock::new();
+static CAYENNE_AT_DATA_STORAGE_WRITE_MIBPS: OnceLock<Gauge<f64>> = OnceLock::new();
+static CAYENNE_AT_METASTORE_STORAGE_WRITE_MIBPS: OnceLock<Gauge<f64>> = OnceLock::new();
+static CAYENNE_AT_GOAL_SLO_INFEASIBLE: OnceLock<Gauge<u64>> = OnceLock::new();
 static CAYENNE_AT_DATA_STORAGE_CLASS: OnceLock<Gauge<u64>> = OnceLock::new();
 static CAYENNE_AT_METASTORE_STORAGE_CLASS: OnceLock<Gauge<u64>> = OnceLock::new();
 
@@ -1342,6 +1357,42 @@ pub fn track_cayenne_autotune_state(state: &CayenneAutotuneState, dimensions: &[
                 .build()
         })
         .record(state.metastore_storage_class, dimensions);
+    if state.data_storage_write_mbps >= 0.0 {
+        CAYENNE_AT_DATA_STORAGE_WRITE_MIBPS
+            .get_or_init(|| {
+                cayenne_operational_meter()
+                    .f64_gauge("cayenne_data_storage_write_mibps")
+                    .with_description(
+                        "Calibration-probe measured data-volume write throughput; drives the continuous slow-tier bias.",
+                    )
+                    .with_unit("MiB/s")
+                    .build()
+            })
+            .record(state.data_storage_write_mbps, dimensions);
+    }
+    if state.metastore_storage_write_mbps >= 0.0 {
+        CAYENNE_AT_METASTORE_STORAGE_WRITE_MIBPS
+            .get_or_init(|| {
+                cayenne_operational_meter()
+                    .f64_gauge("cayenne_metastore_storage_write_mibps")
+                    .with_description(
+                        "Calibration-probe measured metastore-volume write throughput; drives the continuous publish bias.",
+                    )
+                    .with_unit("MiB/s")
+                    .build()
+            })
+            .record(state.metastore_storage_write_mbps, dimensions);
+    }
+    CAYENNE_AT_GOAL_SLO_INFEASIBLE
+        .get_or_init(|| {
+            cayenne_operational_meter()
+                .u64_gauge("cayenne_goal_slo_infeasible")
+                .with_description(
+                    "1 when the goal-driven tuner has declared the SLO infeasible on this hardware (no further adjustment possible due to bounds or gating, goal still violated); 0 otherwise.",
+                )
+                .build()
+        })
+        .record(state.goal_slo_infeasible, dimensions);
 }
 
 static CAYENNE_AT_ADJUSTMENTS: OnceLock<Counter<u64>> = OnceLock::new();
