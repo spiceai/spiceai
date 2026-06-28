@@ -784,6 +784,35 @@ fn staging_wal_local_writer_uses_single_open() {
 }
 
 #[test]
+fn remove_staging_wal_does_not_fsync_after_unlink() {
+    // The post-WAL-unlink staging-dir fsync (one ordering-tier `fsync(2)` on
+    // EVERY staged commit — append and delete-staged) was removed. It only
+    // persisted the WAL's *removal* (recovery hygiene): the durable commit
+    // boundary — the move-target dir fsync in `move_staging_files_local` —
+    // already fired BEFORE it, and the very next line `remove_dir`s the same
+    // directory without a sync, so persisting the inner unlink bought nothing
+    // end-to-end. A crash in its window self-heals: `ensure_no_incomplete_write`
+    // finds every WAL-listed file already in the target snapshot and re-drives
+    // the idempotent (now no-op) move, then removes the stale WAL. Dropping it
+    // saves a billed, capped barrier per staged commit on EBS/provisioned-IOPS.
+    //
+    // The recovery substrate (the WAL-content fsync + the post-rename
+    // staging-dir fsync at the top of `write_staging_wal_local`) is untouched —
+    // only this trailing barrier is gone. Lock the win.
+    let body = extract_fn_body(STAGING_WAL_SRC, "remove_staging_wal_for")
+        .expect("remove_staging_wal_for not found in staging_wal.rs");
+    let fsync_count = body.matches("sync_snapshot_dir").count();
+    assert_eq!(
+        fsync_count, 0,
+        "remove_staging_wal_for must not `sync_snapshot_dir` after the WAL \
+         unlink — the move-target dir fsync already made the commit durable and \
+         the unlink is recovery-hygiene only (a crash self-heals via the \
+         idempotent re-move). Found {fsync_count} call(s). If a durability \
+         barrier is genuinely required here, document why and update this assertion."
+    );
+}
+
+#[test]
 fn partitioned_wal_local_writer_uses_single_open_for_tmp_file() {
     let body = extract_fn_body(PARTITIONED_WAL_SRC, "write_to")
         .expect("write_to not found in partitioned_wal.rs");
