@@ -39,8 +39,10 @@ limitations under the License.
 //! `CAYENNE_PROPTEST_OPS_SCALE` multiplies the per-seed op count. Both default
 //! to 1 (a fast local run).
 //!
-//! If a config exposes an unfixed defect it is `#[ignore]`d with a description
-//! of the defect (not a label); remove the ignore once it is fixed.
+//! All configs currently converge — the convergence/resurrection defects this
+//! harness surfaced are fixed (see the PR description for the linked fixes). If
+//! a future config exposes a new defect, `#[ignore]` it with a description of
+//! the defect (not a label) until it is fixed.
 
 #![allow(clippy::expect_used)]
 #![allow(clippy::clone_on_ref_ptr)]
