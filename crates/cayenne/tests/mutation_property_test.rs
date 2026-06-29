@@ -305,8 +305,9 @@ fn assert_converged(live: &Model, model: &Model, ctx_msg: &str) {
 /// Run a query expected to return a single `i64` scalar (a NULL aggregate maps
 /// to 0). Used by the aggregate-query checks below.
 async fn scalar_i64(ctx: &SessionContext, sql: &str) -> TestResult<i64> {
-    // Callers use COUNT(*) (never null) or COALESCE(SUM(...), 0), so the single
-    // result cell is always a non-null i64.
+    // Callers use COUNT(*) (never null) or COALESCE(SUM(...), 0), so the query
+    // must yield exactly one non-null i64 cell. A missing row is a bug in the
+    // query/engine, NOT a legitimate 0 — fail loudly rather than masking it.
     let batches = ctx.sql(sql).await?.collect().await?;
     for b in &batches {
         if b.num_rows() > 0 {
@@ -318,7 +319,7 @@ async fn scalar_i64(ctx: &SessionContext, sql: &str) -> TestResult<i64> {
             return Ok(arr.value(0));
         }
     }
-    Ok(0)
+    Err(format!("scalar query returned no rows: {sql}").into())
 }
 
 /// Cross-check the table against the model through AGGREGATE + FILTER + POINT
@@ -406,6 +407,10 @@ fn random_rows(rng: &mut Rng, key_space: i64, batch_size: i64) -> Vec<(i64, i64)
 
 fn gen_op(rng: &mut Rng, w: &OpWeights, key_space: i64, batch_size: i64) -> Op {
     let total = w.upsert + w.delete + w.delete_all + w.overwrite + w.compact + w.restart;
+    debug_assert!(
+        total > 0,
+        "OpWeights must have a positive total weight (else the workload runs no real ops)"
+    );
     let mut pick = rng.below(u64::from(total)) as u32;
     for (weight, kind) in [
         (w.upsert, 0u8),
