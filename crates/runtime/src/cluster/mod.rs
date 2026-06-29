@@ -2283,12 +2283,6 @@ fn apply_distributed_execution_config(cfg: SessionConfig) -> SessionConfig {
     {
         let opts = cfg.options_mut();
 
-        // File-scan work-stealing shares one queue of unopened files across all of a
-        // scan's partition streams. In-process each file is read once; under Ballista
-        // every executor process rebuilds the full queue and reads the whole input —
-        // N-fold scan amplification and N-fold inflated aggregates.
-        opts.execution.enable_file_scan_work_stealing = false;
-
         // The hash-join dynamic filter builds a min/max filter from the build side at
         // runtime and pushes it into the probe-side scan via shared plan state; across
         // a stage boundary it can never be populated, and its serialized form carries
@@ -2331,7 +2325,6 @@ mod tests {
             super::apply_distributed_execution_config(::datafusion::prelude::SessionConfig::new());
         let opts = cfg.options();
         // Single-process-only optimizations must be disabled for distributed execution.
-        assert!(!opts.execution.enable_file_scan_work_stealing);
         assert!(!opts.optimizer.enable_join_dynamic_filter_pushdown);
         assert!(!opts.optimizer.enable_physical_uncorrelated_scalar_subquery);
         // Ballista restricted configuration disables round-robin repartition.
