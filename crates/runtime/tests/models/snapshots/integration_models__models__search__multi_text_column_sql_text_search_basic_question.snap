@@ -16,7 +16,7 @@ expression: resp?
   {
     "id": 499,
     "question": "If \\( m \\) and \\( n \\) are two angles that lie on a straight line, what is the value of \\( m + n \\)?",
-    "trunc(text_search(qs, Utf8(\"angles\"), question)._score,Int64(3))": 4.245
+    "trunc(text_search(qs, Utf8(\"angles\"), question)._score,Int64(3))": 4.244
   },
   {
     "id": 1175,

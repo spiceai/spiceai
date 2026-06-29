@@ -24,8 +24,9 @@ name: postgres-cayenne[file]-adaptive-turso
 # Background compaction stays at the auto-derived (non-zero) default — the controller rides its
 # tick. No per-ACTUATOR knob value is set anywhere: an explicit knob would *pin* it under adaptive
 # (collapsing its tuning bounds to a point), so the un-pinned baseline gives the loop full freedom.
-# The `cayenne_goal_*` SLOs below are NOT actuator knobs — they are the high-level targets the
-# closed loop converges toward (it still moves the un-pinned actuators freely to hit them).
+# The `cayenne_goal_*` SLOs (set globally under `runtime.params`) are NOT actuator knobs — they
+# are the high-level targets the closed loop converges toward (it still moves the un-pinned
+# actuators freely to hit them).
 #
 # sql_results / task_history stay off to match the baseline and the -cdc-tuned configs, so a
 # comparison isolates the effect of adaptive tuning, not caching/history overhead.
@@ -46,6 +47,18 @@ runtime:
       enabled: false
   task_history:
     enabled: false
+  # Goal-driven adaptive SLOs, set GLOBALLY once here and inherited by every Cayenne
+  # dataset (override per-dataset via the same acceleration.params key). These are the
+  # high-level targets the closed loop converges toward — NOT actuator knobs.
+  # Replication-lag/freshness drive the CDC (changes) tables (inert on the full-refresh
+  # reference tables); query-latency (p99) applies to all. QPH is GLOBAL-ONLY: it is
+  # measured across all datasets (a query/join spans several, counted once), so it
+  # cannot be set per-dataset.
+  params:
+    cayenne_goal_replication_lag: '5s'
+    cayenne_goal_freshness: '30s'
+    cayenne_goal_query_latency: '10s'
+    cayenne_goal_qph: '5000'
 
 datasets:
   # ---- TPC-C core tables (mutated by OLTP workload) ----
@@ -74,14 +87,10 @@ datasets:
         # metastore backend. This is a structural backend choice, not a tunable actuator, so it
         # does not pin any knob under adaptive tuning.
         cayenne_metastore: turso
-        # Goal-driven SLOs the closed loop converges toward. Replication-lag and
-        # freshness apply to the CDC (changes) tables; they are inert on the
-        # full-refresh reference tables that share this anchor (no CDC ingest).
-        # Query-latency (p99) and QPH apply to all tables.
-        cayenne_goal_replication_lag: '5s'
-        cayenne_goal_freshness: '30s'
-        cayenne_goal_query_latency: '10s'
-        cayenne_goal_qph: '5000'
+        # Goal-driven SLOs are set globally under `runtime.params` (above) and
+        # inherited by every dataset, so they are intentionally not repeated here.
+        # (A dataset that needed a sharper target would override the relevant
+        # cayenne_goal_* here; QPH is global-only and cannot be overridden.)
 
   - from: postgres:district
     name: district

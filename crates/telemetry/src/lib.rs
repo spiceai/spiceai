@@ -1000,9 +1000,11 @@ pub struct CayenneAutotuneState {
     pub query_latency_p99_ms: f64,
     /// Query-latency goal target (ms); `< 0` ⇒ no goal configured.
     pub goal_query_latency_ms: f64,
-    /// Measured query throughput on this table (queries/hour); `< 0` ⇒ unavailable.
+    /// Measured SYSTEM-WIDE query throughput (queries/hour); `< 0` ⇒ unavailable.
+    /// Global, not per-table — a query spanning datasets is counted once, and the
+    /// gauge is emitted without a per-table dimension.
     pub qph: f64,
-    /// QPH goal target (queries/hour); `< 0` ⇒ no goal configured.
+    /// System-wide QPH goal target (queries/hour); `< 0` ⇒ no goal configured.
     pub goal_qph: f64,
     /// cgroup-aware CPU busy-fraction of available cores; `< 0` ⇒ unavailable
     /// (non-Linux or not yet sampled).
@@ -1273,25 +1275,29 @@ pub fn track_cayenne_autotune_state(state: &CayenneAutotuneState, dimensions: &[
             })
             .record(state.goal_query_latency_ms, dimensions);
     }
+    // QPH is a system-wide metric (a query, e.g. a join, spans datasets and is
+    // counted once), so these two gauges are GLOBAL — recorded with no per-table
+    // dimension, they collapse to a single series even though every table's
+    // controller tick reports the same value.
     if state.qph >= 0.0 {
         CAYENNE_AT_QPH
             .get_or_init(|| {
                 cayenne_operational_meter()
                     .f64_gauge("cayenne_query_throughput_qph")
-                    .with_description("Measured query throughput on this table (queries/hour).")
+                    .with_description("Measured system-wide query throughput (queries/hour).")
                     .build()
             })
-            .record(state.qph, dimensions);
+            .record(state.qph, &[]);
     }
     if state.goal_qph >= 0.0 {
         CAYENNE_AT_GOAL_QPH
             .get_or_init(|| {
                 cayenne_operational_meter()
                     .f64_gauge("cayenne_goal_query_throughput_qph")
-                    .with_description("Configured query-throughput (QPH) goal target.")
+                    .with_description("Configured system-wide query-throughput (QPH) goal target.")
                     .build()
             })
-            .record(state.goal_qph, dimensions);
+            .record(state.goal_qph, &[]);
     }
 
     // Environment/data signals the closed loop reasons over (Part A). The three

@@ -1585,18 +1585,24 @@ pub fn register_query_observations(name: &str) -> Arc<QueryObservations> {
 
 /// Push one finished query's wall latency to a table's observations, if it is a
 /// registered (Cayenne-accelerated) table. Called by the runtime's query tracker
-/// for every dataset a query touched; a no-op for unregistered tables.
-pub fn record_query_latency(name: &str, latency_ms: f64) {
+/// for every dataset a query touched; a no-op for unregistered tables. Returns
+/// `true` iff the table was Cayenne-registered, so the caller can decide whether
+/// the query touched Cayenne at all (and thus counts toward global QPH).
+pub fn record_query_latency(name: &str, latency_ms: f64) -> bool {
     let map = QUERY_OBSERVATIONS.read();
     // Fast path: the runtime pushes the already-bare table name
     // (`TableReference::table()`), so a borrowed lookup hits with no allocation or
     // parse — this runs per dataset per query.
     if let Some(obs) = map.get(name) {
         obs.record_query(latency_ms);
+        true
     } else if let Some(obs) = map.get(table_registry_key(name).as_str()) {
         // Fallback for a schema-qualified name (rare; never on the runtime hot
         // path) — normalize to the bare key registration used.
         obs.record_query(latency_ms);
+        true
+    } else {
+        false
     }
 }
 
@@ -1608,6 +1614,31 @@ pub fn record_query_latency(name: &str, latency_ms: f64) {
 /// and avoid leaking handles.
 pub fn deregister_query_observations(name: &str) {
     QUERY_OBSERVATIONS.write().remove(&table_registry_key(name));
+}
+
+/// Process-global query observations aggregating EVERY Cayenne-touching query
+/// exactly once (regardless of how many datasets it touched), so QPH — a
+/// SYSTEM-WIDE metric — is measured globally rather than summed across per-table
+/// handles (which would multiply-count a join across its participants). The
+/// per-table handles in [`QUERY_OBSERVATIONS`] still serve per-dataset p99 latency.
+static GLOBAL_QUERY_OBSERVATIONS: LazyLock<QueryObservations> =
+    LazyLock::new(QueryObservations::new);
+
+/// Record one finished query against the global QPH aggregate. The runtime calls
+/// this ONCE per query (not once per touched dataset), only when the query touched
+/// at least one Cayenne table. Latency is folded into the global histogram too,
+/// but only the global QPH is consumed today.
+pub fn record_global_query(latency_ms: f64) {
+    GLOBAL_QUERY_OBSERVATIONS.record_query(latency_ms);
+}
+
+/// System-wide queries-per-hour, or `None` when there is no current query signal
+/// (no queries yet, or the system has gone idle). Every per-dataset controller's
+/// QPH goal reads THIS — never a per-table rate — because a query spanning N
+/// datasets is one unit of system throughput, not N.
+#[must_use]
+pub fn global_qph() -> Option<f64> {
+    GLOBAL_QUERY_OBSERVATIONS.qph()
 }
 
 // ---------------------------------------------------------------------------
@@ -4084,6 +4115,17 @@ mod tests {
         // lifetime average here (→ 0 as the anchor ages) would falsely violate a
         // QPH goal forever and drive tuning that no tuning can satisfy.
         assert!(QueryObservations::new().qph().is_none());
+    }
+
+    #[test]
+    fn global_qph_positive_after_record() {
+        // QPH is measured against the process-global aggregate (a query spanning
+        // datasets counts once). It is a shared singleton across tests, so once any
+        // query is recorded it reports a positive rate (the idle horizon is minutes,
+        // far beyond a test) — assert the post-record signal, not a None precondition.
+        record_global_query(12.0);
+        let qph = global_qph().expect("global qph after a recorded query");
+        assert!(qph > 0.0, "expected positive global qph, got {qph}");
     }
 
     // ---- environment gates (Part A) ---------------------------------------
