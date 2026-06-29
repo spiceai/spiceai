@@ -34,6 +34,7 @@ use ::datafusion::sql::ResolvedTableReference;
 use app::App;
 use ballista_core::config::ShuffleFormat as BallistaShuffleFormat;
 use ballista_core::extension::SessionConfigExt;
+use ballista_core::extension::SessionConfigHelperExt;
 use ballista_core::registry::BallistaFunctionRegistry;
 use ballista_core::serde::BallistaCodec;
 use ballista_core::serde::protobuf::executor_resource::Resource;
@@ -1870,13 +1871,20 @@ async fn create_scheduler_server(
                 .cloned()
                 .unwrap_or_default();
 
-            let mut cfg = current_context
+            let cfg = current_context
                 .copied_config()
                 .with_target_partitions(target_partitions)
                 .with_option_extension(SpiceClusterConfig::default())
                 .with_option_extension(incoming_request_context)
                 .with_ballista_shuffle_format(ballista_shuffle_format)
                 .with_ballista_shuffle_memory_mode(shuffle_memory_mode);
+
+            // Apply the DataFusion configuration that distributed (Ballista) execution
+            // requires for correctness. The session builder rebuilds from
+            // `current_context.copied_config()` (the local single-node config), and
+            // this config is serialized into the task props sent to executors, so it
+            // governs both the distributed plan and its execution.
+            let mut cfg = apply_distributed_execution_config(cfg);
 
             // Apply object store shuffle configuration if specified
             if let Some(ref storage_type) = shuffle_storage_type {
@@ -2031,7 +2039,7 @@ async fn create_scheduler_server(
         on_work_available: Some(on_work_available),
         on_cancel_tasks: Some(on_cancel_tasks),
 
-        // Faster failure detection: 30s timeout with 10s heartbeat interval
+        // Mark an executor dead after 30s without a heartbeat (heartbeats every 10s).
         executor_timeout_seconds: 30,
 
         // The Spice executor uses pull-based polling (execution_loop::poll_loop),
@@ -2253,6 +2261,45 @@ async fn executor_bind_object_stores(rt: Arc<Runtime>) -> crate::Result<()> {
     Ok(())
 }
 
+/// Apply the `DataFusion` configuration that distributed (Ballista) execution requires
+/// for correctness, returning the adjusted [`SessionConfig`].
+///
+/// This is the same set the executor applies via `new_with_ballista`, applied here so
+/// the scheduler-side plan and the config serialized into executor task props agree.
+fn apply_distributed_execution_config(cfg: SessionConfig) -> SessionConfig {
+    // `ballista_restricted_configuration` enforces the settings that distributed
+    // execution requires — among other things it disables CollectLeft broadcast joins
+    // (whose left child must be a single partition, invalid once the input is a
+    // multi-partition shuffle) and round-robin repartition.
+    let mut cfg = cfg.ballista_restricted_configuration();
+
+    // These optimizations rely on shared mutable state within a single process and are
+    // incorrect (or fatal) once a plan is split into stages that run in separate
+    // executor processes; `ballista_restricted_configuration` does not cover them.
+    {
+        let opts = cfg.options_mut();
+
+        // The hash-join dynamic filter builds a min/max filter from the build side at
+        // runtime and pushes it into the probe-side scan via shared plan state; across
+        // a stage boundary it can never be populated, and its serialized form carries
+        // probe-side column indices that don't resolve against the receiving stage's
+        // schema. (TopK/aggregate dynamic filters stay enabled — they merely remain
+        // empty across stages rather than erroring.)
+        opts.optimizer.enable_join_dynamic_filter_pushdown = false;
+
+        // An uncorrelated scalar subquery is otherwise executed by a
+        // `ScalarSubqueryExec` that evaluates it eagerly on one node into a shared
+        // results container; a shuffle boundary between the exec and its dependent
+        // `ScalarSubqueryExpr`s leaves a child stage unable to decode the expr.
+        // Disabling this rewrites them to left joins via `ScalarSubqueryToJoin`
+        // (DataFusion's documented escape hatch for distributed execution frameworks),
+        // which distribute correctly.
+        opts.optimizer.enable_physical_uncorrelated_scalar_subquery = false;
+    }
+
+    cfg
+}
+
 #[cfg(test)]
 mod tests {
     use super::ClusterTlsConfig;
@@ -2267,6 +2314,18 @@ mod tests {
         CapturedX509Certificate, EcdsaCurve, InMemorySigningKeyPair, KeyAlgorithm, Sign, Signer,
         X509Certificate,
     };
+
+    #[test]
+    fn distributed_execution_config_disables_single_process_optimizations() {
+        let cfg =
+            super::apply_distributed_execution_config(::datafusion::prelude::SessionConfig::new());
+        let opts = cfg.options();
+        // Single-process-only optimizations must be disabled for distributed execution.
+        assert!(!opts.optimizer.enable_join_dynamic_filter_pushdown);
+        assert!(!opts.optimizer.enable_physical_uncorrelated_scalar_subquery);
+        // Ballista restricted configuration disables round-robin repartition.
+        assert!(!opts.optimizer.enable_round_robin_repartition);
+    }
 
     fn create_signed_certificate(
         subject_cn: &str,
