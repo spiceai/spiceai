@@ -81,6 +81,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 value: Some(AnyValue {
                     value: Some(Value::StringValue("test".to_string())),
                 }),
+                ..Default::default()
             }],
             ..Default::default()
         }),

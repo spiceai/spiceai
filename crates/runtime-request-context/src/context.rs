@@ -173,6 +173,21 @@ impl RequestContext {
         REQUEST_CONTEXT.scope(self, f).await
     }
 
+    /// Spawns `future` onto the Tokio runtime bound to the current request
+    /// context, so work that outlives the calling task — e.g. a background job
+    /// — still runs as the originating principal. Outside a request this binds
+    /// the internal context.
+    pub fn spawn_current<F>(future: F) -> tokio::task::JoinHandle<F::Output>
+    where
+        F: Future + Send + 'static,
+        F::Output: Send + 'static,
+    {
+        let context = REQUEST_CONTEXT
+            .try_with(Arc::clone)
+            .unwrap_or_else(|_| Arc::clone(&INTERNAL_REQUEST_CONTEXT));
+        tokio::spawn(context.scope(future))
+    }
+
     /// Wraps provided stream with the current request context.
     pub fn scope_stream<S>(self: Arc<Self>, stream: S) -> impl Stream<Item = S::Item>
     where
@@ -675,6 +690,33 @@ mod tests {
     use http::{HeaderMap, HeaderValue};
 
     use crate::{CacheControl, CacheKeyType, Protocol, RequestContextBuilder};
+
+    /// A task spawned via `spawn_current` observes the spawning request's
+    /// context rather than the internal context. Results-cache namespacing and
+    /// principal-scoped authz/masking depend on it.
+    #[tokio::test]
+    async fn spawn_current_carries_request_context() {
+        use crate::{AsyncMarker, CacheNamespace, RequestContext};
+        use std::sync::Arc;
+        use tokio::sync::oneshot;
+
+        let context = Arc::new(RequestContext::builder(Protocol::Http).build());
+        let (tx, rx) = oneshot::channel();
+        context
+            .scope(async move {
+                RequestContext::spawn_current(async move {
+                    let namespace =
+                        RequestContext::current(AsyncMarker::new().await).cache_namespace();
+                    tx.send(namespace).expect("receiver alive");
+                });
+            })
+            .await;
+
+        assert_eq!(
+            rx.await.expect("spawned task reported its context"),
+            CacheNamespace::Public
+        );
+    }
 
     #[test]
     fn test_bind_client_supplied_cache_key() {

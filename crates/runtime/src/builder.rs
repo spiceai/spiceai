@@ -63,6 +63,21 @@ const CAYENNE_SORT_MERGE_MEMORY_POOL_FRACTION_PARAM: &str =
 const CAYENNE_FILTER_PROPAGATION_PARAM: &str = "cayenne_filter_propagation";
 const CAYENNE_OPTIMIZER_RULES_PARAM: &str = "cayenne_optimizer_rules";
 
+/// Goal-driven adaptive-tuning SLO setpoints, settable GLOBALLY here at
+/// `runtime.params` and overridden per-dataset via the matching
+/// `acceleration.params` key (see `dataaccelerator::cayenne`). `cayenne_goal_qph`
+/// is the exception: QPH is a system-wide metric (a join spans datasets), so it
+/// is global-only and a per-dataset value is ignored. Declared here so the keys
+/// are part of the recognized `runtime.params` vocabulary and don't false-warn as
+/// unknown; the values are resolved (and validated) where the per-dataset Cayenne
+/// config is built. NOTE: `cayenne_goal_convergence_window` is deliberately NOT
+/// here — it paces HOW the loop chases these SLOs (a control-cadence/benchmarking
+/// knob), not a target outcome, so it stays a per-dataset advanced override.
+const CAYENNE_GOAL_REPLICATION_LAG_PARAM: &str = "cayenne_goal_replication_lag";
+const CAYENNE_GOAL_FRESHNESS_PARAM: &str = "cayenne_goal_freshness";
+const CAYENNE_GOAL_QUERY_LATENCY_PARAM: &str = "cayenne_goal_query_latency";
+const CAYENNE_GOAL_QPH_PARAM: &str = "cayenne_goal_qph";
+
 /// Process-global `SQLite` metastore pragma tuning keys (cache, mmap, busy
 /// timeout, WAL autocheckpoint, `auto_vacuum`). Consumed once at startup in
 /// `build_internal`; declared here so they're part of the recognized
@@ -100,6 +115,10 @@ const KNOWN_CAYENNE_RUNTIME_PARAMS: &[&str] = &[
     CAYENNE_METASTORE_WAL_AUTOCHECKPOINT_PAGES_PARAM,
     CAYENNE_METASTORE_WAL_TRUNCATE_THRESHOLD_MB_PARAM,
     CAYENNE_METASTORE_AUTO_VACUUM_PARAM,
+    CAYENNE_GOAL_REPLICATION_LAG_PARAM,
+    CAYENNE_GOAL_FRESHNESS_PARAM,
+    CAYENNE_GOAL_QUERY_LATENCY_PARAM,
+    CAYENNE_GOAL_QPH_PARAM,
 ];
 
 /// Recognized `runtime.params` keys that don't belong to a larger prefix
