@@ -185,7 +185,8 @@ impl ExecutionPlan for BroadcastJoinFlightSqlExec {
         // mirroring `FlightSqlExec`'s own schema alignment.
         let target = Arc::clone(&self.output_schema);
         let target_for_map = Arc::clone(&target);
-        let stream = query_to_stream(client, self.sql.clone(), Arc::clone(&self.cookie_store))
+        let stream =
+            query_to_stream(client, self.sql.clone(), Arc::clone(&self.cookie_store))
             .map(move |res| res.and_then(|batch| coerce_batch(batch, &target_for_map)));
         Ok(Box::pin(RecordBatchStreamAdapter::new(target, stream)))
     }
