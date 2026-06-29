@@ -1378,6 +1378,12 @@ pub struct CayenneTableProvider {
     /// does not spawn one background compaction task per append while a prior
     /// notification is still pending.
     post_write_compaction_scheduled: Arc<AtomicBool>,
+    /// Coalesces orphaned-deletion-vector cleanup sweeps. Set when file-based
+    /// retention empties a protected snapshot (raising the surviving-sequence
+    /// floor, which can orphan key DVs); a single lock-free sweep on the dedicated
+    /// compaction runtime drains it. Mirrors `post_write_compaction_scheduled` so a
+    /// burst of retention passes spawns at most one in-flight sweep.
+    orphan_dv_sweep_scheduled: Arc<AtomicBool>,
     /// Coalesces write-driven listing refreshes and table-statistics updates
     /// so CDC catch-up bursts do not synchronously pay metastore/listing work
     /// on every append.
@@ -3997,9 +4003,13 @@ impl CayenneTableProvider {
         // Returns the fully constructed PkDeletionStrategy with embedded caches.
         let table_id = table_metadata.table_id.clone();
         let catalog_for_load = Arc::clone(&catalog);
-        let pk_deletion_strategy =
-            Self::load_deletion_vectors_all(&table_id, catalog_for_load, pk_deletion_strategy_kind)
-                .await?;
+        let pk_deletion_strategy = Self::load_deletion_vectors_all(
+            &table_id,
+            &table_metadata.current_snapshot_id,
+            catalog_for_load,
+            pk_deletion_strategy_kind,
+        )
+        .await?;
 
         let listing_table = Self::create_listing_table(
             &snapshot_dir_url,
@@ -4196,6 +4206,7 @@ impl CayenneTableProvider {
             last_moved_snapshot_files: Arc::new(ParkingMutex::new(None)),
             compaction_lock: Arc::new(tokio::sync::Mutex::new(())),
             post_write_compaction_scheduled: Arc::new(AtomicBool::new(false)),
+            orphan_dv_sweep_scheduled: Arc::new(AtomicBool::new(false)),
             post_write_maintenance: Arc::new(PostWriteMaintenance::default()),
             maintained_aggregates,
             maintained_aggregate_epoch: Arc::new(AtomicU64::new(0)),
@@ -4940,6 +4951,7 @@ impl CayenneTableProvider {
             // attempts on the same table coordinate, even across clones.
             compaction_lock: Arc::clone(&self.compaction_lock),
             post_write_compaction_scheduled: Arc::clone(&self.post_write_compaction_scheduled),
+            orphan_dv_sweep_scheduled: Arc::clone(&self.orphan_dv_sweep_scheduled),
             post_write_maintenance: Arc::clone(&self.post_write_maintenance),
             maintained_aggregates: Arc::clone(&self.maintained_aggregates),
             maintained_aggregate_epoch: Arc::clone(&self.maintained_aggregate_epoch),
@@ -9598,6 +9610,259 @@ impl CayenneTableProvider {
         });
     }
 
+    /// Signal that orphaned key-based deletion vectors may now exist (file-based
+    /// retention emptied a protected snapshot, raising the surviving-sequence
+    /// floor). Spawns at most one lock-free [`Self::sweep_orphaned_deletion_vectors`]
+    /// pass on the dedicated compaction runtime, coalescing a burst of retention
+    /// passes into a single in-flight sweep — mirroring
+    /// [`Self::schedule_post_write_compaction`].
+    ///
+    /// No-op when the `orphaned_dv_cleanup_min_files` knob is 0: nothing is
+    /// spawned, no lock is taken, and no catalog query runs (the pre-feature
+    /// behavior, and the SF-1000 CH-BenCHmark A/B baseline).
+    pub(crate) fn schedule_orphan_dv_sweep(&self) {
+        if self
+            .table_metadata
+            .vortex_config
+            .orphaned_dv_cleanup_min_files
+            == 0
+        {
+            return;
+        }
+        // Coalesce: at most one in-flight sweep per table.
+        if self.orphan_dv_sweep_scheduled.swap(true, Ordering::AcqRel) {
+            return;
+        }
+
+        let table = self.clone_for_write();
+        super::compaction::spawn_compaction(async move {
+            tokio::task::yield_now().await;
+            table.sweep_orphaned_deletion_vectors().await;
+            table
+                .orphan_dv_sweep_scheduled
+                .store(false, Ordering::Release);
+        });
+    }
+
+    /// Synchronously run one orphaned-DV sweep. Test-only deterministic drain for
+    /// the otherwise background [`Self::schedule_orphan_dv_sweep`] path.
+    #[doc(hidden)]
+    pub async fn drain_orphan_dv_sweep(&self) {
+        self.sweep_orphaned_deletion_vectors().await;
+    }
+
+    /// Surviving-sequence floor for orphaned-DV cleanup: the minimum data sequence
+    /// any live snapshot could hold, folding BOTH the protected snapshots' persisted
+    /// thresholds AND the current snapshot's manifest `min_sequence`. A key DV with
+    /// delete sequence `D` shadows only data with sequence `< D`, so it is orphaned
+    /// (shadows nothing live) exactly when `D <= floor`. Empty on both sides →
+    /// `i64::MAX` (genesis; nothing to protect). The current snapshot is folded in
+    /// because the scan applies ALL key DVs to it (the full deletion view), so a
+    /// plain-append or position-then-PK current snapshot could still hold a row a
+    /// sub-floor DV shadows — see the seq-prefix bake's `bake_clean_prefix_holds`.
+    async fn compute_orphan_dv_floor(
+        catalog: &dyn MetadataCatalog,
+        table_id: &str,
+        current_snapshot_id: &str,
+    ) -> CatalogResult<i64> {
+        let protected_floor = catalog
+            .get_all_snapshot_sequences(table_id)
+            .await?
+            .values()
+            .copied()
+            .min()
+            .unwrap_or(i64::MAX);
+        let current_floor = catalog
+            .get_snapshot_files(table_id, current_snapshot_id)
+            .await?
+            .iter()
+            .map(|f| f.min_sequence)
+            .min()
+            .unwrap_or(i64::MAX);
+        Ok(protected_floor.min(current_floor))
+    }
+
+    /// Reconcile key-based deletion vectors whose `.arrow` file is missing (the
+    /// file-first sweep crash window). For each: if its delete sequence is at or
+    /// below the surviving-sequence floor it is a provable orphan whose row removal
+    /// was interrupted — self-heal it (info log + remove the dangling row). If it is
+    /// ABOVE the floor it could still shadow live data, so a missing file is genuine
+    /// data loss and we error (a defensive improvement over a generic missing-file
+    /// failure). The floor is computed once here, only because ≥1 file was missing.
+    async fn reconcile_missing_key_deletion_vectors(
+        catalog: &dyn MetadataCatalog,
+        table_id: &str,
+        current_snapshot_id: &str,
+        missing: Vec<crate::provider::delete::MissingKeyDeletionVector>,
+    ) -> CatalogResult<()> {
+        let floor = Self::compute_orphan_dv_floor(catalog, table_id, current_snapshot_id).await?;
+
+        let mut orphaned_ids: Vec<String> = Vec::with_capacity(missing.len());
+        for m in missing {
+            if m.sequence_number <= floor {
+                tracing::info!(
+                    table_id,
+                    path = %m.path,
+                    sequence = m.sequence_number,
+                    floor,
+                    "Loader: encountered deleted orphaned DV in catalog (file already removed); self-healing the dangling row"
+                );
+                orphaned_ids.push(m.delete_file_id);
+            } else {
+                return Err(CatalogError::InvalidOperationNoSource {
+                    message: format!(
+                        "Deletion vector file missing but still within the surviving-sequence \
+                         floor (delete_file_id={}, path={}, sequence={} > floor={}): possible \
+                         data loss",
+                        m.delete_file_id, m.path, m.sequence_number, floor
+                    ),
+                });
+            }
+        }
+
+        if !orphaned_ids.is_empty() {
+            catalog.remove_delete_files(table_id, &orphaned_ids).await?;
+        }
+        Ok(())
+    }
+
+    /// Lock-free, throttled cleanup of orphaned key-based deletion vectors (issue
+    /// #9388). Reclaims the `.arrow` files (and their catalog rows) that file-based
+    /// retention leaves behind: an orphaned key DV lives in the CURRENT snapshot's
+    /// `deletions/` dir, which never rotates under sustained CDC, so nothing else
+    /// reaps it (compaction's bake reclaims the in-memory tombstone and the catalog
+    /// row, but not the physical file — the measured dir/byte leak).
+    ///
+    /// Runs entirely OFF the file-based DELETE critical section: it holds NO
+    /// `write_lock` and NO `listing_fence`. This is sound because (a) orphaned DVs
+    /// are query-time no-ops, (b) scans never read DV `.arrow` files lazily (they
+    /// are materialized into the in-memory index only at load/refresh), so a
+    /// runtime unlink is invisible to scans, and (c) the floor is monotonic on the
+    /// live timeline — concurrent writes only ever take HIGHER sequences, so they
+    /// can never make a `D <= floor` DV needed again.
+    ///
+    /// The in-memory deletion index is deliberately NOT pruned here — compaction's
+    /// seq-prefix bake (`prune_deletion_caches_after_full_rewrite`) owns that, and
+    /// the orphaned tombstones (query-time no-ops) even push its size trigger.
+    ///
+    /// INVARIANT (restore): safe to delete these files because Acceleration
+    /// Snapshot restore is a wholesale, self-contained, offline re-extraction — it
+    /// brings back its OWN archived DV files and never reuses the live table's
+    /// (potentially GC'd) files. If restore ever becomes an in-place flip of
+    /// `current_snapshot_id` on a LIVE table reusing live files, it must account for
+    /// orphaned-DV deletion (keep DVs alive longer or reject restoring below the GC
+    /// point) — see the matching note on the snapshot set/restore code.
+    async fn sweep_orphaned_deletion_vectors(&self) {
+        let min_files = self
+            .table_metadata
+            .vortex_config
+            .orphaned_dv_cleanup_min_files;
+        if min_files == 0 {
+            return;
+        }
+
+        let table_id = &self.table_metadata.table_id;
+        let current_snapshot_id = self.get_current_snapshot_id();
+
+        let floor = match Self::compute_orphan_dv_floor(
+            self.catalog.as_ref(),
+            table_id,
+            &current_snapshot_id,
+        )
+        .await
+        {
+            Ok(floor) => floor,
+            Err(e) => {
+                tracing::warn!(
+                    table = self.table_metadata.table_name.as_str(),
+                    "Orphaned-DV sweep: failed to compute surviving-sequence floor: {e}"
+                );
+                return;
+            }
+        };
+
+        // Bounded fetch of orphan-eligible key DVs (source NULL, sequence <= floor).
+        // The cap bounds the per-sweep working set; if more remain, the next
+        // retention pass re-arms the sweep. `max(min_files)` guarantees the gate
+        // below can fire even for an unusually large threshold.
+        const ORPHAN_DV_SWEEP_MAX_BATCH: usize = 50_000;
+        let fetch_limit = ORPHAN_DV_SWEEP_MAX_BATCH.max(min_files);
+        let orphaned = match self
+            .catalog
+            .get_orphan_eligible_delete_files(table_id, floor, fetch_limit)
+            .await
+        {
+            Ok(files) => files,
+            Err(e) => {
+                tracing::warn!(
+                    table = self.table_metadata.table_name.as_str(),
+                    "Orphaned-DV sweep: failed to list orphan-eligible delete files: {e}"
+                );
+                return;
+            }
+        };
+
+        // Throttle: only sweep once enough orphans have accumulated to amortize the
+        // pass. Below the threshold, leave them — a later retention pass rechecks.
+        if orphaned.len() < min_files {
+            return;
+        }
+
+        // Unlink the `.arrow` file FIRST, then remove its catalog row. A crash in
+        // the non-atomic window leaves a DISCOVERABLE dangling row (file gone, row
+        // present) that the tolerant loader self-heals and the next sweep retries —
+        // never an untracked leaked file (which the reverse order would produce).
+        let mut removed_ids: Vec<String> = Vec::with_capacity(orphaned.len());
+        for df in &orphaned {
+            if df.path_is_relative {
+                // Relative paths are object-store keys, not local fs paths; the
+                // local unlink does not apply. Still drop the row so the loader
+                // stops referencing it (object-store GC is out of scope here).
+                removed_ids.push(df.delete_file_id.clone());
+                continue;
+            }
+            match tokio::fs::remove_file(&df.path).await {
+                Ok(()) => removed_ids.push(df.delete_file_id.clone()),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    // Already gone (a prior interrupted sweep) — still drop the row.
+                    removed_ids.push(df.delete_file_id.clone());
+                }
+                Err(e) => {
+                    // Leave the row so a later sweep retries the unlink.
+                    tracing::warn!(
+                        table = self.table_metadata.table_name.as_str(),
+                        path = %df.path,
+                        "Orphaned-DV sweep: failed to unlink DV file: {e}"
+                    );
+                }
+            }
+        }
+
+        if removed_ids.is_empty() {
+            return;
+        }
+
+        if let Err(e) = self
+            .catalog
+            .remove_delete_files(table_id, &removed_ids)
+            .await
+        {
+            tracing::warn!(
+                table = self.table_metadata.table_name.as_str(),
+                "Orphaned-DV sweep: failed to remove {} delete-file row(s): {e}",
+                removed_ids.len()
+            );
+            return;
+        }
+
+        tracing::debug!(
+            table = self.table_metadata.table_name.as_str(),
+            floor,
+            "Orphaned-DV sweep: reclaimed {} orphaned key-based deletion vector(s)",
+            removed_ids.len()
+        );
+    }
+
     pub(crate) fn schedule_inline_checkpoint_if_memtable_pressure_exceeded(&self) {
         if self
             .inline_checkpoint_scheduled
@@ -12747,8 +13012,10 @@ impl CayenneTableProvider {
     ///
     /// Returns an error if deletion vectors cannot be loaded from the catalog.
     async fn refresh_deletion_cache(&self) -> CatalogResult<()> {
+        let current_snapshot_id = self.get_current_snapshot_id();
         let fresh_strategy = Self::load_deletion_vectors_all(
             &self.table_metadata.table_id,
+            &current_snapshot_id,
             Arc::clone(&self.catalog),
             self.pk_deletion_strategy.strategy(),
         )
@@ -13090,8 +13357,10 @@ impl CayenneTableProvider {
         // Reload deletion vectors from the catalog (SQLite) — the source of truth.
         // This picks up any deletions committed by writes that completed after the
         // source provider was opened.
+        let current_snapshot_id = self.get_current_snapshot_id();
         let fresh_strategy = Self::load_deletion_vectors_all(
             &self.table_metadata.table_id,
+            &current_snapshot_id,
             Arc::clone(&self.catalog),
             self.pk_deletion_strategy.strategy(),
         )
@@ -17189,6 +17458,7 @@ impl CayenneTableProvider {
     /// The fully constructed `PkDeletionStrategy` with all caches populated.
     async fn load_deletion_vectors_all(
         table_id: &str,
+        current_snapshot_id: &str,
         catalog: Arc<dyn MetadataCatalog>,
         strategy: PkDeletionStrategy,
     ) -> CatalogResult<PkDeletionStrategyWithCache> {
@@ -17284,7 +17554,7 @@ impl CayenneTableProvider {
         // HashMap<Box<[u8]>, i64>) where:
         // - per_file_row_ids: file path -> bitmap of deleted row positions
         // - deleted_row_keys: PK bytes -> max delete sequence
-        let (per_file_row_ids, deleted_row_keys, derived_reinserted) =
+        let (per_file_row_ids, deleted_row_keys, derived_reinserted, missing_key_dvs) =
             task::spawn_blocking(move || detect_deletion_type_and_read(delete_files))
                 .await
                 .map_err(|err| CatalogError::InvalidOperation {
@@ -17297,6 +17567,23 @@ impl CayenneTableProvider {
                         source: Box::new(err),
                     })
                 })?;
+
+        // Self-heal any key-based DV whose `.arrow` file is missing. The file-first
+        // orphaned-DV sweep unlinks the file before removing its catalog row, so a
+        // crash in that window leaves a dangling row. Provably-orphaned dangling
+        // rows (delete sequence at or below the surviving floor) are removed with an
+        // info log; a missing file still within the floor is genuine data loss and
+        // errors. Lazy: the floor queries run only when ≥1 file was missing, so the
+        // common (all-present) path pays nothing.
+        if !missing_key_dvs.is_empty() {
+            Self::reconcile_missing_key_deletion_vectors(
+                catalog.as_ref(),
+                table_id,
+                current_snapshot_id,
+                missing_key_dvs,
+            )
+            .await?;
+        }
 
         // Lever L1 (metadata-only publish): merge the per-key reinsert sequences
         // DERIVED from each delete vector's keys + its `reinsert_sequence` column

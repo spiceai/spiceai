@@ -713,6 +713,23 @@ pub struct VortexConfig {
     /// [`crate::provider::table::BAKE_DELETION_INDEX_TRIGGER`]).
     #[serde(default = "default_bake_deletion_index_trigger")]
     pub bake_deletion_index_trigger: usize,
+    /// Number of orphan-eligible key-based deletion vectors (count of
+    /// `cayenne_delete_file` rows, NOT masked rows) that must accumulate before a
+    /// cleanup sweep runs. A key DV is orphan-eligible once retention has emptied
+    /// the protected snapshot(s) it shadowed, raising the surviving-sequence floor
+    /// above its delete sequence so it shadows nothing.
+    ///
+    /// `0` disables orphaned-DV cleanup entirely — no background sweep is ever
+    /// spawned, so the file-based DELETE path acquires no extra locks and runs no
+    /// catalog scan (the pre-feature behavior, and the A/B baseline). A larger
+    /// value sweeps less often (cheaper, but orphaned `.arrow` files linger on disk
+    /// longer); a smaller value reclaims disk sooner. The sweep is lock-free and
+    /// runs off the write path on the dedicated compaction runtime, so this only
+    /// trades sweep frequency against lingering disk — never ingest latency.
+    ///
+    /// Defaults to `0` (disabled).
+    #[serde(default = "default_orphaned_dv_cleanup_min_files")]
+    pub orphaned_dv_cleanup_min_files: usize,
     /// Number of protected snapshots that can accumulate before snapshot-maintenance
     /// compaction is eligible to run. Kept separate from `compaction_trigger_files`
     /// so small-file compaction tuning does not silently change scan amplification
@@ -1019,6 +1036,13 @@ fn default_bake_deletion_index_trigger() -> usize {
     crate::provider::table::BAKE_DELETION_INDEX_TRIGGER
 }
 
+fn default_orphaned_dv_cleanup_min_files() -> usize {
+    // Ship disabled. Flip to a validated threshold once the SF-1000 CH-BenCHmark
+    // A/B confirms the lock-free off-path sweep reclaims orphaned DV files without
+    // regressing CDC ingest (tpmC) or staleness.
+    0
+}
+
 fn default_compaction_trigger_protected_snapshots() -> usize {
     8
 }
@@ -1225,6 +1249,7 @@ impl Default for VortexConfig {
             write_concurrency: None,
             compaction_trigger_files: default_compaction_trigger_files(),
             bake_deletion_index_trigger: default_bake_deletion_index_trigger(),
+            orphaned_dv_cleanup_min_files: default_orphaned_dv_cleanup_min_files(),
             compaction_trigger_protected_snapshots: default_compaction_trigger_protected_snapshots(
             ),
             compaction_trigger_snapshot_age_ms: default_compaction_trigger_snapshot_age_ms(),
