@@ -6,51 +6,51 @@ expression: normalize_search_response(resp)
   "duration_ms": "duration_ms_val",
   "results": [
     {
-      "_score": "0.73",
+      "_score": "0.77",
       "dataset": "spice.public.qs",
       "matches": {
         "answer": [
-          "a) $-|-9| = -9$  \nb) $-(-9) = 9$  \nc) $2-(-6) = 2 + 6 = 8$  \nd) $2-|-6| = 2 - 6 = -4$"
+          "The multiples of 4 between 1 and 30 are 4, 8, 12, 16, 20, 24, and 28. Counting these, there are $\\boxed{7}$ multiples."
         ]
       },
       "primary_key": {
-        "id": 708
+        "id": 468
       }
     },
     {
-      "_score": "0.70",
+      "_score": "0.76",
       "dataset": "spice.public.qs",
       "matches": {
         "answer": [
-          "a. \\( h(7) = -3(7) - 4 = -21 - 4 = \\boxed{-25} \\)\nb. \\( h(-4) = -3(-4) - 4 = 12 - 4 = \\boxed{8} \\)"
+          "The base number is \\(\\boxed{2}\\), because \\(2^5 = 2 \\times 2 \\times 2 \\times 2 \\times 2 = 32\\)."
         ]
       },
       "primary_key": {
-        "id": 255
+        "id": 1277
       }
     },
     {
-      "_score": "0.66",
+      "_score": "0.76",
       "dataset": "spice.public.qs",
       "matches": {
         "answer": [
-          "`(a b c)`, because `(a b c)` is the first S-expression of this non-empty list."
+          "\\[\n2 - 2(-3)^2 = 2 - 2(9) = 2 - 18 = \\boxed{-16}\n\\]"
         ]
       },
       "primary_key": {
-        "id": 868
+        "id": 189
       }
     },
     {
-      "_score": "0.64",
+      "_score": "0.76",
       "dataset": "spice.public.qs",
       "matches": {
         "answer": [
-          "a. \\( G(3) = 3 - 1 = \\boxed{2} \\)\nb. \\( G(-5) = -5 - 1 = \\boxed{-6} \\)\nc. \\( G(0) = 0 - 1 = \\boxed{-1} \\)"
+          "The fifth root of 32 is \\(\\boxed{2}\\), because \\(2 \\times 2 \\times 2 \\times 2 \\times 2 = 32\\)."
         ]
       },
       "primary_key": {
-        "id": 251
+        "id": 948
       }
     }
   ]
