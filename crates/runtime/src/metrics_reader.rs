@@ -145,6 +145,7 @@ fn sdk_metrics_to_otlp(rm: &ResourceMetrics) -> ExportMetricsServiceRequest {
                     value: Some(AnyValue {
                         value: Some(otel_value_to_proto(v)),
                     }),
+                    ..Default::default()
                 })
                 .collect(),
             dropped_attributes_count: 0,
@@ -170,6 +171,7 @@ fn sdk_metrics_to_otlp(rm: &ResourceMetrics) -> ExportMetricsServiceRequest {
                     value: Some(AnyValue {
                         value: Some(otel_value_to_proto(&kv.value)),
                     }),
+                    ..Default::default()
                 })
                 .collect(),
             dropped_attributes_count: 0,
@@ -498,6 +500,7 @@ fn convert_attributes_iter<'a>(
             value: Some(AnyValue {
                 value: Some(otel_value_to_proto(&kv.value)),
             }),
+            ..Default::default()
         })
         .collect()
 }
