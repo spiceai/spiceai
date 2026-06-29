@@ -26,6 +26,11 @@ PGU="${CHBENCH_PG_USER:-bench}"; export PGPASSWORD="${CHBENCH_PG_PASS:-bench}"
 REPO_ROOT="${REPO_ROOT:-${GITHUB_WORKSPACE:-$PWD}}"
 TESTOP_PREFIX="${TESTOP_PREFIX:-}"
 
+# psql may not be preinstalled on the runner (the cleanup step installs it too).
+if ! command -v psql >/dev/null 2>&1; then
+  sudo apt-get update -qq && sudo apt-get install -y -qq postgresql-client || true
+fi
+
 psql_pg() { psql -h "$PGH" -p "$PGP" -U "$PGU" -d postgres -v ON_ERROR_STOP=1 -tAc "$1"; }
 pgmajor=$(psql_pg "SHOW server_version" | cut -d. -f1)
 driver=$(git -C "$REPO_ROOT" rev-parse "HEAD:tools/chbench-driver" 2>/dev/null || echo nogit)
