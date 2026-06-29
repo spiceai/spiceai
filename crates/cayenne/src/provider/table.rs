@@ -4531,7 +4531,30 @@ impl CayenneTableProvider {
         )?;
 
         // Create session context once with object store registered (if S3).
-        let session_state = Arc::new(self.create_session_context().state());
+        // For Maintenance-class (compaction) LOCAL writes, optionally route the
+        // output through the custom fallocate / bytes_per_sync / O_DIRECT writer
+        // via a private object-store registry scoped to this write (see
+        // `compaction_session_context`). Gated OFF by default; falls back to the
+        // default writer on any setup error so it can never fail a compaction.
+        let writer_cfg = super::compaction_writer::config();
+        let use_compaction_writer = writer_cfg.enabled()
+            && matches!(write_class, super::delta_encoding::WriteClass::Maintenance)
+            && !self.table_metadata.path.starts_with("s3://");
+        let session_state = if use_compaction_writer {
+            match self.compaction_session_context(writer_cfg) {
+                Ok(ctx) => Arc::new(ctx.state()),
+                Err(error) => {
+                    tracing::warn!(
+                        target: "cayenne::compaction",
+                        %error,
+                        "compaction-writer session setup failed; falling back to the default writer"
+                    );
+                    Arc::new(self.create_session_context().state())
+                }
+            }
+        } else {
+            Arc::new(self.create_session_context().state())
+        };
 
         // Progress tracking for S3 Express uploads
         let is_s3_storage = self.table_metadata.path.starts_with("s3://");
@@ -12284,6 +12307,56 @@ impl CayenneTableProvider {
             SessionConfig::default(),
             Arc::clone(self.context.runtime_env()),
         )
+    }
+
+    /// Session context whose `file://` object store is the custom
+    /// [`super::compaction_writer::CompactionLocalStore`] (fallocate /
+    /// `bytes_per_sync` / `O_DIRECT`), scoped to THIS compaction-output write.
+    ///
+    /// Uses a private `RuntimeEnv` with a fresh object-store registry so the
+    /// override never touches the SHARED runtime's `file://` store that queries
+    /// and CDC appends use — only this `Maintenance`-class write is routed
+    /// through the custom writer. The query memory pool is shared so the encode
+    /// still respects `runtime.query.memory_limit`. Gated off by default; only
+    /// called when [`super::compaction_writer::config`] is enabled.
+    fn compaction_session_context(
+        &self,
+        cfg: super::compaction_writer::CompactionWriterConfig,
+    ) -> Result<SessionContext> {
+        use datafusion::execution::object_store::{DefaultObjectStoreRegistry, ObjectStoreRegistry};
+        use datafusion::execution::runtime_env::RuntimeEnvBuilder;
+        use object_store::local::LocalFileSystem;
+
+        let shared = self.context.runtime_env();
+        let registry = Arc::new(DefaultObjectStoreRegistry::new());
+        // Inner store + root "/" mirror object_store's `LocalFileSystem::new()`
+        // mapping (object path = absolute fs path minus the leading slash), so
+        // reads/list/delete delegate identically to the default local store.
+        let inner: Arc<dyn object_store::ObjectStore> = Arc::new(LocalFileSystem::new());
+        let wrapped = Arc::new(super::compaction_writer::CompactionLocalStore::new(
+            inner,
+            std::path::PathBuf::from("/"),
+            cfg,
+        ));
+        let file_url = url::Url::parse("file:///").map_err(|source| Error::UrlParse {
+            url: "file:///".to_string(),
+            source,
+        })?;
+        registry.register_store(&file_url, wrapped);
+
+        let runtime_env = RuntimeEnvBuilder::default()
+            .with_object_store_registry(registry)
+            .with_memory_pool(Arc::clone(&shared.memory_pool))
+            .build_arc()
+            .map_err(|e| Error::Internal {
+                table: self.table_metadata.table_name.clone(),
+                message: format!("failed to build compaction-writer runtime env: {e}"),
+            })?;
+
+        Ok(SessionContext::new_with_config_rt(
+            SessionConfig::default(),
+            runtime_env,
+        ))
     }
 
     /// Spawn the single ordered background applier for `registry`, returning the
