@@ -173,6 +173,17 @@ jobs:
             TESTOP_PREFIX="taskset -c 32-39,96-103"
             echo "CPU pinning: spiced -> 64 logical CPUs, testoperator -> 16 logical CPUs"
           fi
+          # Diagnostics: capture per-query EXPLAIN / EXPLAIN ANALYZE + the
+          # eager-aggregation decline map against the LIVE benchmarked spiced
+          # (hot, fully-loaded acceleration) after the workload, before teardown.
+          # Enabling SPICED_LOG here makes the rule's accept/decline lines (which
+          # testoperator tees into explain-capture/spiced.log) available to the
+          # decline map.
+          CAPTURE_ARGS=""
+          if [ "${{ github.event.inputs.capture_explain }}" = "true" ]; then
+            export SPICED_LOG="info,eager_aggregation=debug"
+            CAPTURE_ARGS="--capture-explain ${{ runner.temp }}/explain-capture"
+          fi
           $TESTOP_PREFIX testoperator run htap \
             -s "${SPICED_BIN}" \
             -p '${{ steps.set_spicepod_path.outputs.SPICEPOD_PATH }}' \
@@ -184,6 +195,7 @@ jobs:
             --concurrency ${{ github.event.inputs.concurrency }} \
             ${{ github.event.inputs.query_overrides != '' && format('--query-overrides {0}', github.event.inputs.query_overrides) || '' }} \
             --ready-wait ${{ github.event.inputs.ready_wait }} \
+            $CAPTURE_ARGS \
             --disable-progress-bars \
             --metrics
         env:
@@ -195,22 +207,9 @@ jobs:
           # Dedicated in-cluster PG pod on xlarge; per-run docker container (loopback) elsewhere.
           CHBENCH_PG_HOST: ${{ github.event.inputs.runner_type == 'spiceai-dev-xlarge-runners' && 'chbench-postgres.dataplatform.svc.cluster.local' || '127.0.0.1' }}
 
-      # Diagnostics: re-launch spiced standalone against the data the run left on
-      # disk (no re-seed) and capture per-query EXPLAIN / EXPLAIN ANALYZE and the
-      # eager-aggregation decline map. Best-effort — never fails the job.
-      - name: Capture EXPLAIN / decline map
-        if: always() && github.event.inputs.capture_explain == 'true'
-        continue-on-error: true
-        env:
-          SPICED_BIN: /usr/local/bin/spiced
-          SPICEPOD_PATH: ${{ steps.set_spicepod_path.outputs.SPICEPOD_PATH }}
-          QUERY_DIR: crates/test-framework/src/queries/chbench
-          OUT_DIR: ${{ runner.temp }}/explain-capture
-          # Mirror the run's eager-aggregation state so captured plans match.
-          SPICED_EAGER_AGGREGATION: ${{ github.event.inputs.eager_aggregation == 'true' && '1' || '' }}
-          CHBENCH_PG_HOST: ${{ github.event.inputs.runner_type == 'spiceai-dev-xlarge-runners' && 'chbench-postgres.dataplatform.svc.cluster.local' || '127.0.0.1' }}
-        run: ./.github/scripts/chbench_explain_capture.sh
-
+      # EXPLAIN / EXPLAIN ANALYZE / decline-map capture now runs in-process via
+      # `testoperator run htap --capture-explain` (above), against the live,
+      # fully-loaded spiced — so the artifact below is written by the run step.
       - name: Upload EXPLAIN / decline-map artifact
         if: always() && github.event.inputs.capture_explain == 'true'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7

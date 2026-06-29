@@ -17,6 +17,7 @@ limitations under the License.
 //! HTAP test command — runs concurrent TPC-C OLTP workload against the source
 //! Postgres database while executing CH-benCH analytical queries through spiced.
 
+mod capture;
 mod correctness;
 mod reporting;
 mod spice;
@@ -63,6 +64,13 @@ pub(crate) async fn run(args: &HtapArgs) -> anyhow::Result<()> {
     if !test_args.common.scrape_spiced_metrics {
         start_request = start_request
             .with_additional_args(vec!["--metrics".to_string(), "127.0.0.1:9090".to_string()]);
+    }
+
+    // When capturing EXPLAINs, tee spiced's log to the capture dir so the
+    // decline map can read the rule's accept/decline lines after the run.
+    if let Some(dir) = &args.capture_explain {
+        std::fs::create_dir_all(dir)?;
+        start_request = start_request.with_log_capture(dir.join("spiced.log"));
     }
 
     // 1. Prepare the source (schema + seed data).
@@ -388,6 +396,19 @@ pub(crate) async fn run(args: &HtapArgs) -> anyhow::Result<()> {
     }
 
     telemetry.emit().await?;
+
+    // Optional: capture per-query EXPLAIN / EXPLAIN ANALYZE + the eager-aggregation
+    // decline map against the still-running, fully-loaded spiced. Best-effort —
+    // diagnostics must never fail the benchmark.
+    if let Some(dir) = &args.capture_explain {
+        let overrides = test_args
+            .query_overrides
+            .clone()
+            .map(test_framework::queries::QueryOverrides::from);
+        if let Err(e) = capture::run(&spice_clients, &spiced_instance, dir, overrides).await {
+            eprintln!("EXPLAIN/decline capture failed (non-fatal): {e}");
+        }
+    }
 
     // Optional: hold spiced alive after the benchmark so you can run ad-hoc
     // queries against it. Set SPICED_KEEP_ALIVE to block here until you press
