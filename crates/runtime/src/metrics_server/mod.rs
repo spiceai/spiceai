@@ -967,6 +967,7 @@ mod tests {
                                                 "localhost".to_string(),
                                             )),
                                         }),
+                                        ..Default::default()
                                     }],
                                     start_time_unix_nano: 0,
                                     time_unix_nano: 0,
