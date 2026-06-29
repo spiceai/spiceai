@@ -295,10 +295,11 @@ async fn compaction_sorts_sort_column_tables(
         common::insert_batch(&table, make_batch_from_ids(&schema, ids)).await?;
     }
 
-    assert!(
-        run_compaction(&table).await,
-        "test setup should produce a compaction candidate"
-    );
+    // The post-write background trigger may have already compacted (and sorted) the
+    // data. Drive one explicit pass to handle the case where it hasn't yet; if it
+    // already ran, this is a no-op. Either way the sort assertion below proves
+    // compaction fired (rows were inserted in descending order per batch).
+    let _ = run_compaction(&table).await;
 
     let ids = unordered_ids(&ctx, "compaction_sorted").await;
     assert_eq!(
@@ -691,20 +692,23 @@ async fn production_trigger_compacts_append_only_table(
         "append-only table must have no protected snapshots"
     );
 
-    // Drive the PRODUCTION current-snapshot path directly (not the test-only
-    // maybe_compact_small_files loop). Retry a bounded number of times: a
-    // spawned post-write compaction may transiently hold the compaction lock.
+    // Drive the PRODUCTION current-snapshot path. The post-write background trigger
+    // runs the same path, so it may have already compacted by the time we get here.
+    // Treat "file count already ≤ 2" as evidence compaction fired — whether via our
+    // explicit call or the background path, the production trigger ran.
     let mut committed = false;
     for _ in 0..50 {
-        if table.compact_current_snapshot_small_files().await? {
-            committed = true;
-        }
         let snapshot_id = fixture
             .catalog
             .get_table("prod_append_only")
             .await?
             .current_snapshot_id;
         if count_vortex_files(&fixture.data_path, &table_id, &snapshot_id).await <= 2 {
+            committed = true;
+            break;
+        }
+        if table.compact_current_snapshot_small_files().await? {
+            committed = true;
             break;
         }
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
@@ -812,9 +816,16 @@ async fn compaction_survives_provider_reopen(
         common::insert_batch(&table, make_batch(&schema, start, batch_rows)).await?;
     }
 
-    // Consolidate via the production path.
+    // Consolidate via the production path. The post-write background trigger runs
+    // the same path, so compaction may have already committed before our explicit
+    // call. Treat "file count already ≤ 2" as evidence it fired.
     let mut committed = false;
     for _ in 0..50 {
+        let snap = fixture.catalog.get_table("compaction_reopen").await?.current_snapshot_id;
+        if count_vortex_files(&fixture.data_path, &table_id, &snap).await <= 2 {
+            committed = true;
+            break;
+        }
         if table.compact_current_snapshot_small_files().await? {
             committed = true;
             break;
