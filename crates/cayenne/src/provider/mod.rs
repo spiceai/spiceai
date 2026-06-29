@@ -79,6 +79,7 @@ pub(crate) mod delete;
 pub mod deletion_index;
 pub(crate) mod deletion_strategy;
 pub(crate) mod delta_encoding;
+pub(crate) mod fadvise_tier;
 pub(crate) mod file_pruning;
 pub(crate) mod fsync_tier;
 pub(crate) mod inlined_cache;
@@ -117,10 +118,10 @@ pub use scan::CayenneAccelerationExec;
 pub use staging_wal::{CayenneStagedAppend, PreparedStagedAppend};
 pub use table::{CayenneCdcWrite, CayenneTableProvider, CayenneTableProviderBuilder};
 pub use tuning::{
-    QueryObservations, deregister_query_observations, record_query_latency,
-    register_query_observations, set_global_memory_budget,
+    QueryObservations, deregister_query_observations, global_qph, record_global_query,
+    record_query_latency, register_query_observations, set_cpu_burstable, set_global_memory_budget,
 };
-pub use write_budget::set_global_encode_concurrency;
+pub use write_budget::{cap_global_encode_concurrency, set_global_encode_concurrency};
 
 // Re-export deletion utilities for advanced use cases
 pub use delete::CayenneDeletionSink;

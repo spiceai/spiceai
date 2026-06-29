@@ -6886,6 +6886,118 @@ impl CayenneTableProvider {
     /// `epochs` are returned per shard; the caller uses the MAX (every shard's
     /// segment shares the apply's source coverage; the checkpoint watermark math
     /// is Phase 5).
+    /// Validate ONE shard's sub-batches against its existence view, returning the
+    /// rows to append plus the tombstones and kept keys for that shard. Pure,
+    /// synchronous CPU work over per-shard state that is independent of every
+    /// other shard (a key has exactly one owner — §3.2), so
+    /// [`Self::validate_and_append_sharded`] runs the N shards CONCURRENTLY on
+    /// scoped threads. No `.await` and no shared mutable state — that
+    /// independence is what makes the fan-out sound.
+    fn validate_one_shard(
+        &self,
+        s: usize,
+        shard_batches: Vec<RecordBatch>,
+        sharded_index: Option<&ShardedPkIndex>,
+        pk_indices: &[usize],
+        converter: &RowConverter,
+        on_conflict: &OnConflict,
+    ) -> Result<(Vec<RecordBatch>, OnConflictDeletions, HashSet<OwnedRow>)> {
+        let upsert_options = on_conflict.get_upsert_options();
+        let mut incoming_keys: HashSet<OwnedRow> = HashSet::new();
+        let mut delete_specs: HashMap<Arc<str>, Vec<u64>> = HashMap::new();
+        let mut deleted_pk_i64: Vec<i64> = Vec::new();
+        let mut deleted_row_keys: Vec<Box<[u8]>> = Vec::new();
+        let mut deleted_inlined_pk_i64: Vec<i64> = Vec::new();
+        let mut deleted_inlined_row_keys: Vec<Box<[u8]>> = Vec::new();
+        let mut reinserted_over_tombstone: usize = 0;
+        let mut kept_keys: HashSet<OwnedRow> = HashSet::new();
+        let mut filtered_batches: Vec<RecordBatch> = Vec::new();
+
+        for batch in shard_batches {
+            if batch.num_rows() == 0 {
+                continue;
+            }
+            let Some(index) = sharded_index else {
+                // No validation (pk_conflict_detection: none / no PK): keep all.
+                filtered_batches.push(batch);
+                continue;
+            };
+
+            // Bloom-split fast path: partition the sub-batch into definitely-new
+            // MISS rows (appended directly, no validation) and HIT rows (the
+            // existing validate path). Only the `Bloom` existence view supports
+            // the MISS test; the `Exact` view's O(1) probe already short-circuits
+            // an absent key, so it runs the whole sub-batch through validation.
+            let hit_batch = match index.existence_ref(s) {
+                PkExistenceRef::Bloom(bloom) => {
+                    let (miss, hit, miss_keys) = Self::bloom_split_shard_batch(
+                        &batch,
+                        bloom,
+                        pk_indices,
+                        converter,
+                        &incoming_keys,
+                    )?;
+                    // MISS rows are kept verbatim (new keys are never dropped),
+                    // recorded so a later same-shard HIT row observes them.
+                    if let Some(miss) = miss
+                        && miss.num_rows() > 0
+                    {
+                        incoming_keys.extend(miss_keys.iter().cloned());
+                        kept_keys.extend(miss_keys);
+                        filtered_batches.push(miss);
+                    }
+                    hit
+                }
+                PkExistenceRef::Exact(_) => Some(batch),
+            };
+
+            let Some(hit_batch) = hit_batch else {
+                continue;
+            };
+            if hit_batch.num_rows() == 0 {
+                continue;
+            }
+
+            let mut ctx = OnConflictContext {
+                pk_indices,
+                converter,
+                on_conflict,
+                upsert_options: &upsert_options,
+                existing: index.existence_ref(s),
+                incoming_keys: &incoming_keys,
+            };
+            let result = self.apply_on_conflict_to_batch(hit_batch, &mut ctx)?;
+            for (file_path, rows) in result.delete_specs {
+                delete_specs.entry(file_path).or_default().extend(rows);
+            }
+            deleted_pk_i64.extend(result.deleted_pk_i64);
+            deleted_row_keys.extend(result.deleted_row_keys);
+            deleted_inlined_pk_i64.extend(result.deleted_inlined_pk_i64);
+            deleted_inlined_row_keys.extend(result.deleted_inlined_row_keys);
+            reinserted_over_tombstone += result.reinserted_over_tombstone;
+            incoming_keys.extend(result.kept_keys.iter().cloned());
+            kept_keys.extend(result.kept_keys);
+            if let Some(fb) = result.filtered_batch
+                && fb.num_rows() > 0
+            {
+                filtered_batches.push(fb);
+            }
+        }
+
+        Ok((
+            filtered_batches,
+            OnConflictDeletions {
+                delete_specs,
+                deleted_pk_i64,
+                deleted_row_keys,
+                deleted_inlined_pk_i64,
+                deleted_inlined_row_keys,
+                reinserted_over_tombstone,
+            },
+            kept_keys,
+        ))
+    }
+
     pub(crate) async fn validate_and_append_sharded(
         &self,
         batches: Vec<RecordBatch>,
@@ -6896,7 +7008,6 @@ impl CayenneTableProvider {
         total_incoming_bytes: u64,
     ) -> Result<ShardedApplyResult> {
         let n = self.mem_tier.shard_count().max(1);
-        let upsert_options = on_conflict.get_upsert_options();
 
         // 1. Split every raw batch into N per-shard sub-batches (order-preserving
         //    Arrow filter on the OwnedRow shard hash).
@@ -6923,10 +7034,11 @@ impl CayenneTableProvider {
             per_shard_bytes[0] = per_shard_bytes[0].saturating_add(total_incoming_bytes - assigned);
         }
 
-        // 2. Validate each shard synchronously against ITS existence view, then
-        //    build that shard's `OnConflictDeletions`. `incoming_keys` is per
-        //    shard (a key has one owner, so the global cross-batch dup check is
-        //    exactly the per-shard one — §3.2).
+        // 2. Validate each shard CONCURRENTLY against ITS existence view, building
+        //    that shard's `OnConflictDeletions`. The shards are independent — a key
+        //    has exactly one owner (§3.2), so each uses its own existence view,
+        //    `incoming_keys`, and tombstone accumulators with no cross-shard state
+        //    (see `validate_one_shard`).
         //
         //    BLOOM-SPLIT (§5 Phase 6): when a shard's existence view is a `Bloom`,
         //    each sub-batch is first partitioned by `bloom.maybe_contains` (gated
@@ -6937,106 +7049,63 @@ impl CayenneTableProvider {
         //    HIT-path row in the same shard sees them, and they are inserted into
         //    the shard's bloom UNDER `locks[s]` in `append_to_shard` (below) so the
         //    durable existence index reflects them atomically with the segment swap.
+        //
+        //    Scoped OS threads fan the N shards out: validation is the dominant
+        //    per-apply CPU cost on insert-heavy tables, and the shards are
+        //    embarrassingly parallel. `std::thread::scope` lets the borrowed
+        //    `&self`/index/converter cross the thread boundary without
+        //    `'static`/`Arc` gymnastics and joins every thread before returning, so
+        //    `sharded_index` is free to move again at step 3. This blocks the
+        //    caller for `max(shard)` validation CPU instead of the prior
+        //    `sum(shard)`; the per-apply thread spawn (~tens of µs) is negligible
+        //    against the multi-hundred-ms fat applies where N>1 is configured.
         let mut per_shard_validated: Vec<(
             Vec<RecordBatch>,
             OnConflictDeletions,
             HashSet<OwnedRow>,
-        )> = Vec::with_capacity(n);
-        for (s, shard_batches) in per_shard_batches.into_iter().enumerate() {
-            let mut incoming_keys: HashSet<OwnedRow> = HashSet::new();
-            let mut delete_specs: HashMap<Arc<str>, Vec<u64>> = HashMap::new();
-            let mut deleted_pk_i64: Vec<i64> = Vec::new();
-            let mut deleted_row_keys: Vec<Box<[u8]>> = Vec::new();
-            let mut deleted_inlined_pk_i64: Vec<i64> = Vec::new();
-            let mut deleted_inlined_row_keys: Vec<Box<[u8]>> = Vec::new();
-            let mut reinserted_over_tombstone: usize = 0;
-            let mut kept_keys: HashSet<OwnedRow> = HashSet::new();
-            let mut filtered_batches: Vec<RecordBatch> = Vec::new();
-
-            for batch in shard_batches {
-                if batch.num_rows() == 0 {
-                    continue;
-                }
-                let Some(index) = sharded_index.as_ref() else {
-                    // No validation (pk_conflict_detection: none / no PK): keep all.
-                    filtered_batches.push(batch);
-                    continue;
-                };
-
-                // Bloom-split fast path: partition the sub-batch into definitely-new
-                // MISS rows (appended directly, no validation) and HIT rows (the
-                // existing validate path). Only the `Bloom` existence view supports
-                // the MISS test; the `Exact` view's O(1) probe already short-circuits
-                // an absent key, so it runs the whole sub-batch through validation.
-                let hit_batch = match index.existence_ref(s) {
-                    PkExistenceRef::Bloom(bloom) => {
-                        let (miss, hit, miss_keys) = Self::bloom_split_shard_batch(
-                            &batch,
-                            bloom,
-                            pk_indices,
-                            converter,
-                            &incoming_keys,
-                        )?;
-                        // MISS rows are kept verbatim (new keys are never dropped),
-                        // recorded so a later same-shard HIT row observes them.
-                        if let Some(miss) = miss
-                            && miss.num_rows() > 0
-                        {
-                            incoming_keys.extend(miss_keys.iter().cloned());
-                            kept_keys.extend(miss_keys);
-                            filtered_batches.push(miss);
+        )> = {
+            let index_ref = sharded_index.as_ref();
+            std::thread::scope(|scope| {
+                // Spawn a validation thread per NON-EMPTY shard; a shard with no
+                // rows routed to it this apply needs no validation, so it yields
+                // the empty result inline and skips the spawn/join — mirroring the
+                // `has_rows` skip in the append step below. One entry per shard in
+                // order, so the index alignment steps 3/4 rely on is preserved.
+                let handles: Vec<Option<_>> = per_shard_batches
+                    .into_iter()
+                    .enumerate()
+                    .map(|(s, shard_batches)| {
+                        if shard_batches.is_empty() {
+                            None
+                        } else {
+                            Some(scope.spawn(move || {
+                                self.validate_one_shard(
+                                    s,
+                                    shard_batches,
+                                    index_ref,
+                                    pk_indices,
+                                    converter,
+                                    on_conflict,
+                                )
+                            }))
                         }
-                        hit
-                    }
-                    PkExistenceRef::Exact(_) => Some(batch),
-                };
-
-                let Some(hit_batch) = hit_batch else {
-                    continue;
-                };
-                if hit_batch.num_rows() == 0 {
-                    continue;
-                }
-
-                let mut ctx = OnConflictContext {
-                    pk_indices,
-                    converter,
-                    on_conflict,
-                    upsert_options: &upsert_options,
-                    existing: index.existence_ref(s),
-                    incoming_keys: &incoming_keys,
-                };
-                let result = self.apply_on_conflict_to_batch(hit_batch, &mut ctx)?;
-                for (file_path, rows) in result.delete_specs {
-                    delete_specs.entry(file_path).or_default().extend(rows);
-                }
-                deleted_pk_i64.extend(result.deleted_pk_i64);
-                deleted_row_keys.extend(result.deleted_row_keys);
-                deleted_inlined_pk_i64.extend(result.deleted_inlined_pk_i64);
-                deleted_inlined_row_keys.extend(result.deleted_inlined_row_keys);
-                reinserted_over_tombstone += result.reinserted_over_tombstone;
-                incoming_keys.extend(result.kept_keys.iter().cloned());
-                kept_keys.extend(result.kept_keys);
-                if let Some(fb) = result.filtered_batch
-                    && fb.num_rows() > 0
-                {
-                    filtered_batches.push(fb);
-                }
-            }
-
-            per_shard_validated.push((
-                filtered_batches,
-                OnConflictDeletions {
-                    delete_specs,
-                    deleted_pk_i64,
-                    deleted_row_keys,
-                    deleted_inlined_pk_i64,
-                    deleted_inlined_row_keys,
-                    reinserted_over_tombstone,
-                },
-                kept_keys,
-            ));
-        }
+                    })
+                    .collect();
+                handles
+                    .into_iter()
+                    .map(|handle| match handle {
+                        // Empty shard: no validation ran; yield the empty result.
+                        None => Ok((Vec::new(), OnConflictDeletions::default(), HashSet::new())),
+                        Some(h) => match h.join() {
+                            Ok(result) => result,
+                            // A panic in shard validation is a bug; re-raise it
+                            // faithfully rather than masking it as a normal error.
+                            Err(payload) => std::panic::resume_unwind(payload),
+                        },
+                    })
+                    .collect::<Result<Vec<_>>>()
+            })?
+        };
 
         // 3. Restore the per-shard existence index to the cache BEFORE the appends
         //    so each shard's `append_to_shard` can record its kept keys into that
@@ -10052,6 +10121,37 @@ impl CayenneTableProvider {
         Ok(files)
     }
 
+    /// Best-effort page-cache hygiene after a background compaction writes its
+    /// cold output: drop the just-written files' clean pages so the `O(table)`
+    /// rewrite doesn't evict the hot query working set (the scan-under-compaction
+    /// p99). Linux + local-FS only (no page cache on S3; no `posix_fadvise` on
+    /// macOS). Call AFTER `sync_snapshot_dir` (the output is durable, so its
+    /// pages are droppable without data loss) and BEFORE the listing-fence
+    /// publish (the output is not yet query-visible, so the dropped pages race
+    /// no reader). Never fails — a cache hint must not abort a compaction.
+    async fn evict_compaction_output_pages(&self, snapshot_id: &str) {
+        let files = match self.list_snapshot_files_with_sizes_local(snapshot_id).await {
+            Ok(files) => files,
+            Err(error) => {
+                tracing::debug!(
+                    target: "cayenne::compaction",
+                    %error,
+                    "skipping compaction page-cache evict: could not list output files"
+                );
+                return;
+            }
+        };
+        if files.is_empty() {
+            return;
+        }
+        let snapshot_dir = self.snapshot_dir_path_for(snapshot_id);
+        let paths: Vec<std::path::PathBuf> = files
+            .into_iter()
+            .map(|(name, _size)| snapshot_dir.join(name))
+            .collect();
+        super::fadvise_tier::evict_files(paths).await;
+    }
+
     async fn list_snapshot_files_with_sizes_s3(
         &self,
         snapshot_id: &str,
@@ -11426,6 +11526,12 @@ impl CayenneTableProvider {
                     .await;
                 return Err(Error::Catalog { source: e });
             }
+            // Page-cache hygiene: the merged output is durable but NOT yet
+            // query-visible (the listing-fence swap below publishes it), so
+            // dropping its just-written pages here races no reader. Stops the
+            // O(table) background compaction from evicting the hot query working
+            // set (scan-under-compaction p99). Linux + local only; best-effort.
+            self.evict_compaction_output_pages(&new_snapshot_id).await;
         }
 
         let old_ids: Vec<String> = inputs.iter().map(|(id, _)| id.clone()).collect();
@@ -11920,6 +12026,10 @@ impl CayenneTableProvider {
                     .await;
                 return Err(Error::Catalog { source: e });
             }
+            // Page-cache hygiene (see the size-tier compaction path): drop the
+            // merged output's just-written pages while it is durable but not yet
+            // query-visible, so the bake doesn't evict the hot query working set.
+            self.evict_compaction_output_pages(&new_snapshot_id).await;
         }
 
         let old_ids: Vec<String> = selected.iter().map(|(id, _)| id.clone()).collect();
@@ -12200,6 +12310,70 @@ impl CayenneTableProvider {
 
         let epoch = self.next_maintained_aggregate_epoch();
         Some(PendingMaintainedAggregateInsert { epoch, batches })
+    }
+
+    /// Whether the staged write path should buffer + capture insert batches for an
+    /// incremental IVM feed: only when a maintained aggregate is registered AND it
+    /// supports retraction (so a later upsert/supersession retracts the old
+    /// contribution via the per-PK index — the same gate the in-mem feed uses).
+    /// Non-retraction registries fall back to a full rebuild (the staged publish's
+    /// `feed_staged_ivm_under_fence(None)` marks them stale), so there is no point
+    /// paying the Stage-A buffer for them.
+    pub(crate) fn should_capture_staged_ivm_feed(&self) -> bool {
+        !self.maintained_aggregates.is_empty() && self.maintained_aggregates.supports_retraction()
+    }
+
+    /// Feed the maintained-aggregate registry from a STAGED-disk publish.
+    ///
+    /// MUST be called while the partition's `listing_fence` is held for write
+    /// (both staged apply paths hold it: `apply_under_barrier` acquires it
+    /// internally, `apply_under_held_barrier`'s caller holds it). The fence is the
+    /// serializer that concurrent, pipelined staged `finish()` tasks for one table
+    /// contend for — so assigning the epoch (`next_maintained_aggregate_epoch`)
+    /// AND enqueuing the delta here, atomically under that fence, guarantees
+    /// applier-enqueue order == epoch order. This is the invariant the in-mem feed
+    /// gets from its `write_guard`; an off-fence enqueue can deliver epoch N+1
+    /// before N to the FIFO applier, and `begin_maintenance_pass` permanently
+    /// stales the registry on any epoch gap.
+    ///
+    /// `batches`: `Some` = the captured insert batches for an incrementally
+    /// feedable write; `None` = non-IVM table (no-op) or a non-incremental write
+    /// (mark stale → queries fall back to a base scan). Enqueue uses `try_send`
+    /// (never awaits under the fence); a full queue or dead applier fails safe to
+    /// stale at the consumed epoch, so the dense `+1` epoch chain is never gapped.
+    pub(crate) fn feed_staged_ivm_under_fence(&self, batches: Option<&Arc<Vec<RecordBatch>>>) {
+        if self.maintained_aggregates.is_empty() {
+            return; // non-IVM table (the common case) — zero cost.
+        }
+        let Some(batches) = batches else {
+            self.mark_maintained_aggregates_stale();
+            return;
+        };
+        let Some(pending) = self.prepare_maintained_aggregate_insert_batches(Arc::clone(batches))
+        else {
+            return; // empty batches — nothing to feed, no epoch consumed.
+        };
+        let Some(tx) = &self.maintained_aggregate_tx else {
+            return;
+        };
+        if let Err(send_err) = tx.try_send(MaintainedAggregateApply::Insert {
+            epoch: pending.epoch,
+            batches: pending.batches,
+        }) {
+            // Bounded queue full / applier gone: fail safe to stale at THIS
+            // epoch (synchronously, no await under the fence). The epoch is
+            // consumed, so the strict-`+1` chain the applier expects stays dense.
+            // Surface the degradation: this forces queries onto base scans until
+            // the next full rebuild, so it must be diagnosable in production
+            // (distinguish a full bounded queue from a gone applier).
+            tracing::warn!(
+                table = %self.table_name(),
+                epoch = pending.epoch,
+                error = %send_err,
+                "staged IVM feed: maintained-aggregate enqueue failed (queue full or applier gone); marking stale — queries fall back to base scans until the next rebuild"
+            );
+            self.maintained_aggregates.mark_stale(pending.epoch);
+        }
     }
 
     async fn apply_maintained_aggregate_insert_batches(
@@ -17645,6 +17819,24 @@ impl CayenneTableProvider {
             });
         let statistic_file_limit = if data_filters.is_empty() { limit } else { None };
 
+        // Key-based deletion (`Int64Pk` / `RowConverterBased`) applies its filter
+        // ABOVE the Vortex scan (`apply_deletion_filter` in `scan()`), so a raw
+        // row-count limit pushed INTO the scan would count rows the filter then
+        // removes — under-delivering (returning fewer rows than exist, even 0).
+        // The outer `GlobalLimitExec` in `scan()` already applies the real limit
+        // over live rows, so suppress the pushed limit here. Position-based
+        // deletion applies inside the Vortex access plan, so its pushed limit
+        // already counts live rows and is left intact.
+        // Revisit this if the key-deletion predicate is pushed into the Vortex
+        // scan itself; at that point the scan could safely apply `limit` after
+        // filtering instead of counting rows deleted above the scan.
+        let scan_pushdown_limit =
+            if self.has_pending_deletions() && !self.pk_deletion_strategy.is_position_based() {
+                None
+            } else {
+                limit
+            };
+
         let SnapshotFilesForScan {
             file_groups: mut partitioned_file_lists,
             statistics,
@@ -17748,7 +17940,7 @@ impl CayenneTableProvider {
                     .with_constraints(Constraints::default())
                     .with_statistics(statistics)
                     .with_projection_indices(projection.cloned())?
-                    .with_limit(limit)
+                    .with_limit(scan_pushdown_limit)
                     .with_output_ordering(output_ordering)
                     .with_partitioned_by_file_group(grouped_by_partition)
                     .build(),
@@ -17850,8 +18042,15 @@ impl CayenneTableProvider {
         // past this listing, so the plan being built here (and its execution,
         // however long it runs) can open the files it resolves.
         self.note_snapshot_listed(request.snapshot_id);
-        let collect_stats = request.options.collect_stat
-            && !(self.pk_deletion_strategy.is_position_based() && self.has_pending_deletions());
+        // Per-file stats drive the LIMIT-based file-set truncation in
+        // `collect_scan_files_with_limit`, which sums RAW (pre-deletion) footer
+        // row counts. With ANY pending deletion those counts overcount live
+        // rows, so truncating by them can drop files the LIMIT still needs and
+        // under-deliver — returning fewer rows than exist (key-based deletion
+        // could even return 0). Disable stats-driven truncation whenever a
+        // deletion is pending, not just for position-based (the only case
+        // guarded before this fix).
+        let collect_stats = request.options.collect_stat && !self.has_pending_deletions();
         let store = request
             .state
             .runtime_env()
@@ -19383,10 +19582,15 @@ impl TableProvider for CayenneTableProvider {
             return None;
         }
 
-        // Position deletes are applied inside the Vortex access plan. If no
-        // cached table stats are available, the synchronous ListingTable stats
-        // are raw file-footer stats and do not account for the pending bitmap.
-        if self.pk_deletion_strategy.is_position_based() && self.has_pending_deletions() {
+        // Any pending deletion (position OR key) makes the synchronous
+        // ListingTable footer stats over-count live rows: position deletes are
+        // applied inside the Vortex access plan and key deletes via the deletion
+        // filter wrapped above the scan, neither of which is reflected in raw
+        // file-footer stats. Don't hand an over-count to the optimizer (it
+        // mis-sizes joins / enables unsafe count pushdown). The narrow
+        // position-only guard left key-based pending deletes leaking the
+        // over-count in the pre-first-maintenance window.
+        if self.has_pending_deletions() {
             return None;
         }
 
@@ -19963,6 +20167,9 @@ impl super::compaction::CompactionRunner for CayenneTableProvider {
                 publish_latency_ms: snap.publish_latency_ms.unwrap_or(-1.0),
                 data_storage_class: snap.data_storage.metric_code(),
                 metastore_storage_class: snap.metastore_storage.metric_code(),
+                data_storage_write_mbps: snap.data_write_mbps.unwrap_or(-1.0),
+                metastore_storage_write_mbps: snap.metastore_write_mbps.unwrap_or(-1.0),
+                goal_slo_infeasible: u64::from(self.context.goal_slo_infeasible()),
             },
             &[telemetry::KeyValue::new("table", table.clone())],
         );
@@ -26959,6 +27166,341 @@ mod tests {
         }
         pairs.sort_unstable();
         pairs
+    }
+
+    // `AggregateExec` is referenced in the signatures below (return type /
+    // `&AggregateExec` param); table.rs's top level does not import it.
+    use datafusion::physical_plan::aggregates::AggregateExec;
+
+    // ----------------------------------------------------------------------
+    // Staged-disk CDC path → maintained-aggregate (IVM) feed.
+    //
+    // These tests gate the reorder-fix invariant: the STAGED publish path now
+    // feeds the maintained-aggregate registry (previously only the in-mem path
+    // did), and epoch-assign + applier-enqueue MUST be atomic under the held
+    // listing fence. Pipelined/detached staged finish() tasks would otherwise
+    // enqueue epochs out of order and `begin_maintenance_pass` would PERMANENTLY
+    // stale the registry on a +1 gap.
+    // ----------------------------------------------------------------------
+
+    /// Mirror of `create_cdc_upsert_table_with_vortex_config` (id Int64, value
+    /// Int64, PK=id, `on_conflict` `Upsert(id)`) but registers maintained-aggregate
+    /// views on the BUILDER and pins the table to the STAGED-disk CDC path
+    /// (`cdc_durability: File`, `inline_max_rows: 0`, `deletion_mode: Key`) so
+    /// every write exercises `feed_staged_ivm_under_fence`, not the in-mem feed.
+    async fn create_cdc_upsert_table_with_maintained_aggregates(
+        table_name: &str,
+        runtime_env: Arc<RuntimeEnv>,
+        specs: Vec<MaintainedAggregateSpec>,
+    ) -> (CayenneTableProvider, Arc<dyn MetadataCatalog>, TempDir) {
+        use arrow::datatypes::{DataType, Field, Schema};
+
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let metadata_dir = format!("{}/metadata", temp_dir.path().to_str().expect("str path"));
+        let data_dir = format!("{}/data", temp_dir.path().to_str().expect("str path"));
+        std::fs::create_dir_all(&metadata_dir).expect("metadata dir created");
+
+        let connection_string = format!("sqlite://{metadata_dir}/cayenne.db");
+        let catalog = Arc::new(CayenneCatalog::new(connection_string).expect("catalog created"))
+            as Arc<dyn MetadataCatalog>;
+        catalog.init().await.expect("catalog initialized");
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("value", DataType::Int64, false),
+        ]));
+
+        let options = CreateTableOptions {
+            table_name: table_name.to_string(),
+            schema,
+            primary_key: vec!["id".to_string()],
+            on_conflict: Some(OnConflict::Upsert(
+                datafusion_table_providers::util::column_reference::ColumnReference::new(vec![
+                    "id".to_string(),
+                ]),
+            )),
+            base_path: data_dir,
+            partition_column: None,
+            // Force the staged-disk path: File (not the default Memory), no inline
+            // memtable, key-mode deletes (so the PK retraction index is built =>
+            // `supports_retraction()` => `should_capture_staged_ivm_feed()` true).
+            vortex_config: VortexConfig {
+                cdc_durability: crate::metadata::CdcDurability::File,
+                inline_max_rows: 0,
+                deletion_mode: crate::metadata::DeletionMode::Key,
+                ..VortexConfig::default()
+            },
+        };
+
+        let provider = CayenneTableProviderBuilder::new(Arc::clone(&catalog), runtime_env)
+            .with_maintained_aggregates(specs)
+            .create(options)
+            .await
+            .expect("table created");
+        (provider, catalog, temp_dir)
+    }
+
+    /// A maintained-aggregate spec over the (id, value) table: GROUP BY id,
+    /// COUNT(*), SUM(value). Both outputs are Int64 (supported).
+    fn id_count_sum_spec() -> MaintainedAggregateSpec {
+        use crate::maintained_aggregate::{MaintainedAggregateExpr, MaintainedAggregateFunction};
+        MaintainedAggregateSpec {
+            filter: None,
+            group_by: vec!["id".to_string()],
+            aggregates: vec![
+                MaintainedAggregateExpr {
+                    function: MaintainedAggregateFunction::Count,
+                    column: None, // COUNT(*)
+                },
+                MaintainedAggregateExpr {
+                    function: MaintainedAggregateFunction::Sum,
+                    column: Some("value".to_string()),
+                },
+            ],
+        }
+    }
+
+    /// Build an `AggregateExec` for `GROUP BY id, COUNT(*), SUM(value)` over the
+    /// (id Int64, value Int64) schema. The exec never runs — the registry only
+    /// reads its SHAPE (group-by + aggregate functions/columns) to match a view
+    /// and its OUTPUT SCHEMA to materialize the served batch. Modeled on
+    /// `maintained_aggregate::tests::aggregate_exec_for`: a `MemorySourceConfig`
+    /// input over the table schema, `count(*)` via a non-null literal (=>
+    /// `CountQueryColumn::AllRows`), `sum(value)` over the column, `AggregateMode::Single`.
+    fn build_id_count_sum_aggregate_exec() -> AggregateExec {
+        use arrow::datatypes::{DataType, Field, Schema};
+        use datafusion::physical_expr::aggregate::AggregateExprBuilder;
+        use datafusion::physical_expr::expressions::{col, lit};
+        use datafusion::physical_plan::aggregates::{AggregateMode, PhysicalGroupBy};
+        use datafusion_functions_aggregate::count::count_udaf;
+        use datafusion_functions_aggregate::sum::sum_udaf;
+
+        let schema: SchemaRef = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("value", DataType::Int64, false),
+        ]));
+        let input = MemorySourceConfig::try_new_exec(&[vec![]], Arc::clone(&schema), None)
+            .expect("memory source exec for aggregate input");
+
+        let group_by = PhysicalGroupBy::new_single(vec![(
+            col("id", schema.as_ref()).expect("id column"),
+            "id".to_string(),
+        )]);
+
+        // ORDER MATTERS: the view match is order-sensitive, so this must be
+        // [count(*), sum(value)] to mirror `id_count_sum_spec`.
+        let count_expr = AggregateExprBuilder::new(count_udaf(), vec![lit(1_i8)])
+            .schema(Arc::clone(&schema))
+            .alias("count(*)".to_string())
+            .build()
+            .map(Arc::new)
+            .expect("count(*) aggregate expr");
+        let sum_expr = AggregateExprBuilder::new(
+            sum_udaf(),
+            vec![col("value", schema.as_ref()).expect("value column")],
+        )
+        .schema(Arc::clone(&schema))
+        .alias("sum(value)".to_string())
+        .build()
+        .map(Arc::new)
+        .expect("sum(value) aggregate expr");
+
+        let aggr_exprs = vec![count_expr, sum_expr];
+        let filters = vec![None; aggr_exprs.len()];
+        AggregateExec::try_new(
+            AggregateMode::Single,
+            group_by,
+            aggr_exprs,
+            filters,
+            input,
+            schema,
+        )
+        .expect("id/count/sum AggregateExec")
+    }
+
+    /// Poll the maintained-aggregate registry until it serves a fresh batch at
+    /// the table's current scan epoch (the value `scan()` would capture), or fail
+    /// after ~5s. The staged feed enqueues to a BACKGROUND applier with no sync
+    /// drain, so a serve right after `finish()` legitimately returns `None`
+    /// (registry epoch still trails the just-assigned epoch) until the applier
+    /// catches up. A timeout here is a real failure: under the off-fence (buggy)
+    /// design an out-of-order enqueue PERMANENTLY stales the registry, so the
+    /// serve never becomes `Some` and this helper times out — which is exactly
+    /// what makes TEST 2 a regression gate for the reorder fix.
+    async fn poll_maintained_serve(
+        provider: &CayenneTableProvider,
+        aggregate_exec: &AggregateExec,
+    ) -> RecordBatch {
+        use std::sync::atomic::Ordering;
+        for _ in 0..50 {
+            let epoch = provider.maintained_aggregate_epoch.load(Ordering::Acquire);
+            let served = provider
+                .maintained_aggregates
+                .batch_for_aggregate(aggregate_exec, epoch)
+                .expect("maintained serve must not error");
+            if let Some(batch) = served
+                && batch.num_rows() > 0
+            {
+                return batch;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        panic!(
+            "maintained aggregate never served a fresh non-empty batch within ~5s \
+             (applier never caught up, or the registry was permanently staled by an \
+             out-of-order staged epoch enqueue)"
+        );
+    }
+
+    /// Read the served (id, count, sum) rows out of a maintained-aggregate batch
+    /// sorted by id. Column layout: [0]=id (group key), [1]=`count(*)`, [2]=`sum(value)`,
+    /// all Int64 (see `build_id_count_sum_aggregate_exec` / `id_count_sum_spec`).
+    fn collect_id_count_sum(batch: &RecordBatch) -> Vec<(i64, i64, i64)> {
+        use arrow::array::Int64Array;
+        let ids = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("id is Int64");
+        let counts = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("count(*) is Int64");
+        let sums = batch
+            .column(2)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("sum(value) is Int64");
+        let mut rows: Vec<(i64, i64, i64)> = (0..batch.num_rows())
+            .map(|r| (ids.value(r), counts.value(r), sums.value(r)))
+            .collect();
+        rows.sort_unstable();
+        rows
+    }
+
+    /// TEST 1 — the staged-disk CDC path feeds the maintained-aggregate registry.
+    ///
+    /// The table starts EMPTY, so the open-time rebuild initializes the registry
+    /// with ZERO groups at epoch 0. A served result with groups can therefore only
+    /// have come from the staged feed. One staged write (two new keys) is published
+    /// via `write_cdc_append_stream` + `finish()`; we then poll the registry and
+    /// assert it serves the correct per-id count/sum.
+    #[tokio::test]
+    async fn test_staged_write_feeds_maintained_aggregate() {
+        let ctx = SessionContext::new();
+        let (provider, _catalog, _tmp) = create_cdc_upsert_table_with_maintained_aggregates(
+            "staged_ivm_feed",
+            ctx.runtime_env(),
+            vec![id_count_sum_spec()],
+        )
+        .await;
+        let schema = Arc::clone(&provider.table_metadata.schema);
+
+        // Sanity: the staged-disk path is active (not the in-mem tier), so the
+        // write returns a pending finalize and routes through
+        // `apply_under_barrier` -> `feed_staged_ivm_under_fence`.
+        assert!(
+            !provider.is_cdc_memory_mode(),
+            "must use the staged File path"
+        );
+
+        let write = provider
+            .write_cdc_append_stream(
+                single_batch_stream(id_value_batch(Arc::clone(&schema), &[1, 2], &[10, 20])),
+                &ctx.task_ctx(),
+            )
+            .await
+            .expect("staged CDC write should prepare");
+        assert!(
+            write.has_pending_finalize(),
+            "staged File-mode write must defer to a finalize publish"
+        );
+        write.finish().await.expect("finalize staged write");
+
+        // The published rows are visible to a normal scan...
+        assert_eq!(
+            collect_id_value_pairs(&ctx, &provider, "staged_ivm_feed").await,
+            vec![(1, 10), (2, 20)],
+        );
+
+        // ...and the maintained-aggregate registry, fed under the fence, serves
+        // the same relation incrementally once the background applier catches up.
+        let aggregate_exec = build_id_count_sum_aggregate_exec();
+        let served = poll_maintained_serve(&provider, &aggregate_exec).await;
+        assert_eq!(
+            collect_id_count_sum(&served),
+            vec![(1, 1, 10), (2, 1, 20)],
+            "staged feed must populate count(*)=1 and sum(value)=value per key"
+        );
+    }
+
+    /// TEST 2 — REORDER GATE: pipelined staged `finish()` out of order keeps the
+    /// registry FRESH.
+    ///
+    /// Stage TWO writes (each returns `has_pending_finalize`), then finish them in
+    /// the OPPOSITE order from staging (second, then first). Because each staged
+    /// `finish()` assigns its IVM epoch AND enqueues atomically under the held
+    /// listing fence, the applier still receives a dense, in-order +1 epoch chain
+    /// and the registry stays fresh — serving the MERGED aggregate over both keys.
+    ///
+    /// Under the OLD off-fence design the epoch would be assigned before the fence,
+    /// so finishing out of order delivers epoch N+1 before N to the FIFO applier;
+    /// `begin_maintenance_pass` then PERMANENTLY stales the registry on the +1 gap,
+    /// `batch_for_aggregate` never returns Some, and `poll_maintained_serve` times
+    /// out -> this test fails. With the fence-atomic fix it passes.
+    #[tokio::test]
+    async fn test_pipelined_staged_finish_keeps_registry_fresh() {
+        let ctx = SessionContext::new();
+        let (provider, _catalog, _tmp) = create_cdc_upsert_table_with_maintained_aggregates(
+            "staged_ivm_reorder",
+            ctx.runtime_env(),
+            vec![id_count_sum_spec()],
+        )
+        .await;
+        let schema = Arc::clone(&provider.table_metadata.schema);
+
+        // Stage two disjoint-key writes; both durable, both pending finalize.
+        let first = provider
+            .write_cdc_append_stream(
+                single_batch_stream(id_value_batch(Arc::clone(&schema), &[1], &[10])),
+                &ctx.task_ctx(),
+            )
+            .await
+            .expect("first staged write should prepare");
+        assert!(first.has_pending_finalize());
+
+        let second = provider
+            .write_cdc_append_stream(
+                single_batch_stream(id_value_batch(Arc::clone(&schema), &[2], &[20])),
+                &ctx.task_ctx(),
+            )
+            .await
+            .expect("second staged write should prepare while first finalize is pending");
+        assert!(second.has_pending_finalize());
+
+        // Finish OUT OF ORDER (second before first). The fence serializes the two
+        // finish() tasks: each assigns its epoch + enqueues atomically, so the
+        // applier sees a dense +1 chain regardless of finish ordering.
+        second.finish().await.expect("finalize second staged write");
+        first.finish().await.expect("finalize first staged write");
+
+        // Both keys are visible to a normal scan...
+        assert_eq!(
+            collect_id_value_pairs(&ctx, &provider, "staged_ivm_reorder").await,
+            vec![(1, 10), (2, 20)],
+        );
+
+        // ...and the registry is STILL FRESH (not permanently staled by a reordered
+        // epoch enqueue) and serves the merged aggregate over both keys.
+        let aggregate_exec = build_id_count_sum_aggregate_exec();
+        let served = poll_maintained_serve(&provider, &aggregate_exec).await;
+        assert_eq!(
+            collect_id_count_sum(&served),
+            vec![(1, 1, 10), (2, 1, 20)],
+            "pipelined out-of-order staged finishes must keep the IVM registry fresh \
+             and serve the merged aggregate (fence-atomic epoch+enqueue)"
+        );
     }
 
     // ----------------------------------------------------------------------

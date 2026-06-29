@@ -88,6 +88,13 @@ aegis = { version = "0.9.3", default-features = false, features = [
 [target.'cfg(target_os = "macos")'.dependencies]
 libc = "0.2"
 
+# Linux compaction page-cache hygiene (`provider/fadvise_tier.rs`):
+# `sync_file_range` + `posix_fadvise(POSIX_FADV_DONTNEED)` are Linux-only and
+# not exposed by std. Keeps a background compaction from evicting the hot query
+# working set. See the module docs.
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
+
 [features]
 default = []
 turso = ["dep:turso"]
@@ -116,6 +123,10 @@ name = "metastore_operations"
 [[bench]]
 harness = false
 name = "ivm_retraction_anchor"
+
+[[bench]]
+harness = false
+name = "staged_ivm_feed"
 
 [[bench]]
 harness = false

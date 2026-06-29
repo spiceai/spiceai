@@ -316,36 +316,50 @@ fn parse_u64_aliases_with_hint(
 /// `fundu` for consistency with the other Spice duration knobs (e.g.
 /// `retention_period`). `None` when unset; a warning + `None` when present but
 /// unparseable.
-fn parse_goal_duration_secs(
-    acceleration: &Acceleration,
+/// Resolve a `cayenne_goal_*` setpoint's raw string with global+override
+/// semantics: a per-dataset (`acceleration.params`) value OVERRIDES the
+/// runtime-level (`runtime.params`) global default. `None` when neither sets it —
+/// the legacy "no goal" case, where the controller stays on its signal-driven path.
+fn resolve_goal_raw<'a>(
+    acceleration: &'a Acceleration,
+    runtime_params: &'a std::collections::HashMap<String, String>,
     key: &str,
-    table_name: &str,
-) -> Option<f64> {
-    let raw = acceleration.params.get(key)?;
+) -> Option<&'a str> {
+    acceleration
+        .params
+        .get(key)
+        .or_else(|| runtime_params.get(key))
+        .map(String::as_str)
+}
+
+/// Parse a goal duration setpoint (`5s`/`1m`/`250ms`) from its already-resolved
+/// raw value. `None` when unset; a warning + `None` when present but unparseable.
+/// `source_desc` names where the value applies, for the diagnostic.
+fn parse_goal_duration_secs(raw: Option<&str>, key: &str, source_desc: &str) -> Option<f64> {
+    let raw = raw?;
     match fundu::parse_duration(raw) {
         Ok(d) => Some(d.as_secs_f64()),
         Err(e) => {
             tracing::warn!(
                 target: "spiced::acceleration::cayenne",
-                table = %table_name,
-                "Invalid '{key}' duration '{raw}': {e}; ignoring. Expected a duration like '5s' or '1m'."
+                "Invalid '{key}' duration '{raw}' ({source_desc}): {e}; ignoring. Expected a duration like '5s' or '1m'."
             );
             None
         }
     }
 }
 
-/// Parse a positive goal float param (e.g. queries-per-hour). `None` when unset; a
-/// warning + `None` when present but unparseable or non-positive.
-fn parse_goal_f64(acceleration: &Acceleration, key: &str, table_name: &str) -> Option<f64> {
-    let raw = acceleration.params.get(key)?;
+/// Parse a positive goal float param (e.g. queries-per-hour) from its resolved raw
+/// value. `None` when unset; a warning + `None` when present but unparseable or
+/// non-positive. `source_desc` names where the value applies, for the diagnostic.
+fn parse_goal_f64(raw: Option<&str>, key: &str, source_desc: &str) -> Option<f64> {
+    let raw = raw?;
     match raw.parse::<f64>() {
         Ok(v) if v.is_finite() && v > 0.0 => Some(v),
         _ => {
             tracing::warn!(
                 target: "spiced::acceleration::cayenne",
-                table = %table_name,
-                "Invalid '{key}' value '{raw}'; expected a positive number, ignoring."
+                "Invalid '{key}' value '{raw}' ({source_desc}); expected a positive number, ignoring."
             );
             None
         }
@@ -387,6 +401,78 @@ const SMALL_WRITE_INLINE_MAX_BYTES: usize = cayenne::metadata::DEFAULT_INLINE_MA
 const SMALL_WRITE_INLINE_MAX_BUFFER_BYTES: usize =
     cayenne::metadata::DEFAULT_INLINE_MAX_BUFFER_BYTES;
 const APPEND_SMALL_WRITE_REFRESH_INTERVAL_THRESHOLD: Duration = Duration::from_mins(5);
+
+/// Map the runtime's detected acceleration storage class onto the Cayenne-local
+/// [`cayenne::metadata::StorageClass`] (the crates can't share the enum — `runtime`
+/// depends on `cayenne`). The continuous slow-tier bias is refined further by the
+/// measured throughput threaded alongside it.
+fn to_cayenne_storage_class(
+    storage: crate::dataaccelerator::storage::ResolvedAccelerationStorage,
+) -> cayenne::metadata::StorageClass {
+    use crate::dataaccelerator::storage::ResolvedAccelerationStorage as Resolved;
+    use cayenne::metadata::StorageClass as Class;
+    match storage {
+        Resolved::LocalSsd => Class::LocalSsd,
+        Resolved::Ebs => Class::Ebs,
+        Resolved::Tmpfs => Class::Tmpfs,
+        Resolved::Unknown => Class::Unknown,
+    }
+}
+
+/// Warn (once per canonicalized path) when the filesystem backing `path` is low on
+/// free space.
+/// Under memory pressure the in-memory CDC tier spills to this volume; if it fills,
+/// ingestion fails — so surface it at startup rather than discovering it on a crash.
+async fn warn_if_low_disk(label: &str, path: &str) {
+    // `disk_space_bytes` canonicalizes + enumerates every mount (blocking OS I/O);
+    // run it off the Tokio runtime so it can't stall a worker during concurrent
+    // table registration.
+    let label = label.to_string();
+    let path = path.to_string();
+    let _ = tokio::task::spawn_blocking(move || warn_if_low_disk_blocking(&label, &path)).await;
+}
+
+fn warn_if_low_disk_blocking(label: &str, path: &str) {
+    use std::sync::{LazyLock, Mutex};
+    /// Below this fraction free OR this many absolute bytes free ⇒ warn.
+    const LOW_DISK_FRACTION_DENOM: u64 = 10; // < 10% free
+    const LOW_DISK_FLOOR_BYTES: u64 = 2 * 1024 * 1024 * 1024; // < 2 GiB free
+    static CHECKED: LazyLock<Mutex<std::collections::HashSet<std::path::PathBuf>>> =
+        LazyLock::new(|| Mutex::new(std::collections::HashSet::new()));
+
+    // Check each distinct canonicalized path once per process, BEFORE probing free
+    // space (`disk_space_bytes` re-enumerates every mount). Canonicalizing collapses
+    // equivalent paths (trailing slash, symlinks); distinct dirs on the same mount
+    // each warn once — keyed by path, not mount point.
+    let key = std::path::Path::new(path)
+        .canonicalize()
+        .unwrap_or_else(|_| std::path::PathBuf::from(path));
+    if !CHECKED
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(key)
+    {
+        return;
+    }
+    let Some((available, total)) = crate::dataaccelerator::storage::disk_space_bytes(path) else {
+        return;
+    };
+    if total == 0
+        || (available >= total / LOW_DISK_FRACTION_DENOM && available >= LOW_DISK_FLOOR_BYTES)
+    {
+        return;
+    }
+    tracing::warn!(
+        label,
+        path,
+        available_mib = available / (1024 * 1024),
+        total_mib = total / (1024 * 1024),
+        // saturating_mul so `available * 100` can't overflow u64 on a very large
+        // volume; a purely-informational percentage in a low-disk warning.
+        percent_free = available.saturating_mul(100) / total,
+        "Cayenne {label} volume is low on free space. Under memory pressure the in-memory CDC tier spills here; if it fills, ingestion fails. Free space or point the acceleration at a larger volume."
+    );
+}
 
 fn apply_refresh_mode_defaults(
     config: &mut cayenne::metadata::VortexConfig,
@@ -762,6 +848,38 @@ impl CayenneAccelerator {
                 fs_probe_path(&metadata_dir),
             )
             .await;
+
+            // Thread the detected storage medium + measured throughput onto the
+            // Cayenne config so the closed-loop tuner reasons over them. Previously
+            // these were left at the `StorageClass::Unknown` default (never wired
+            // from `hw`), so the loop applied the EBS slow-tier bias even on local
+            // NVMe; mapping the real class fixes that, and the measured throughput
+            // refines the class into a *continuous* bias (see `tuning::tier_scale`).
+            config.data_storage_class = to_cayenne_storage_class(hw.data_storage);
+            config.metastore_storage_class = to_cayenne_storage_class(hw.metastore_storage);
+            config.data_storage_write_mbps = hw.data_perf.write_mbps;
+            config.metastore_storage_write_mbps = hw.metastore_perf.write_mbps;
+
+            // Bound the process-global encode budget by the instance EBS write
+            // bandwidth: a single EBS volume is a shared, bandwidth-bounded pipe, so
+            // many parallel uploads to it just fan out small files without adding
+            // throughput (the regression that made a lag-violated EBS table keep
+            // ADDING write shards). Only ever lowers the budget; local NVMe /
+            // instance store propose no cap.
+            if let Some(cap) = hw.ebs_upload_concurrency_cap() {
+                cayenne::cap_global_encode_concurrency(cap);
+            }
+            // T-family burstable CPU (IMDS): the tuner withholds CPU-stealing moves
+            // at a lower busy-fraction, since CPU credits deplete under sustained
+            // load and throttle the vCPUs to a low baseline.
+            cayenne::set_cpu_burstable(hw.burstable);
+
+            // Low-disk startup warning: a full data/spill volume turns a
+            // memory-pressure spill into a crash. Best-effort, once per path.
+            if let Some(dir) = data_dir.as_deref() {
+                warn_if_low_disk("data", fs_probe_path(dir)).await;
+            }
+            warn_if_low_disk("metastore", fs_probe_path(&metadata_dir)).await;
 
             // Storage-aware target Vortex file size on local disk (the `auto`
             // baseline): smaller files reduce write amplification on EBS-class
@@ -1239,19 +1357,47 @@ impl CayenneAccelerator {
             // unless the operator explicitly opted out with `cayenne_tuning: auto`,
             // and provided the background compaction tick the controller rides is
             // enabled. Query latency is stored in ms.
-            config.goal_replication_lag_secs =
-                parse_goal_duration_secs(acceleration, "cayenne_goal_replication_lag", table_name);
-            config.goal_freshness_secs =
-                parse_goal_duration_secs(acceleration, "cayenne_goal_freshness", table_name);
-            config.goal_query_latency_ms =
-                parse_goal_duration_secs(acceleration, "cayenne_goal_query_latency", table_name)
-                    .map(|secs| secs * 1000.0);
+            // SLO setpoints resolve a GLOBAL default (`runtime.params`) with a
+            // per-dataset (`acceleration.params`) override: set an SLO once for the
+            // whole runtime and sharpen it per table where needed.
+            let app = source.app();
+            let runtime_params = &app.runtime.params;
+            config.goal_replication_lag_secs = parse_goal_duration_secs(
+                resolve_goal_raw(acceleration, runtime_params, "cayenne_goal_replication_lag"),
+                "cayenne_goal_replication_lag",
+                table_name,
+            );
+            config.goal_freshness_secs = parse_goal_duration_secs(
+                resolve_goal_raw(acceleration, runtime_params, "cayenne_goal_freshness"),
+                "cayenne_goal_freshness",
+                table_name,
+            );
+            config.goal_query_latency_ms = parse_goal_duration_secs(
+                resolve_goal_raw(acceleration, runtime_params, "cayenne_goal_query_latency"),
+                "cayenne_goal_query_latency",
+                table_name,
+            )
+            .map(|secs| secs * 1000.0);
+            // The convergence window paces HOW the loop chases the SLOs (step
+            // cadence = window / N), not a target outcome — a control/benchmarking
+            // knob with a sensible default. It stays a PER-DATASET advanced override
+            // and is intentionally NOT part of the global SLO surface.
             config.goal_convergence_window_secs = parse_goal_duration_secs(
-                acceleration,
+                acceleration
+                    .params
+                    .get("cayenne_goal_convergence_window")
+                    .map(String::as_str),
                 "cayenne_goal_convergence_window",
                 table_name,
             );
-            config.goal_qph = parse_goal_f64(acceleration, "cayenne_goal_qph", table_name);
+            // QPH is a SYSTEM-WIDE metric — a query (e.g. a join) spans datasets and
+            // is counted once globally — so its goal is configured GLOBALLY only,
+            // under `runtime.params`. There is no per-dataset QPH goal.
+            config.goal_qph = parse_goal_f64(
+                runtime_params.get("cayenne_goal_qph").map(String::as_str),
+                "cayenne_goal_qph",
+                "runtime.params",
+            );
             let any_goal = config.goal_replication_lag_secs.is_some()
                 || config.goal_freshness_secs.is_some()
                 || config.goal_query_latency_ms.is_some()
@@ -1694,8 +1840,8 @@ fn wrap_with_native_vector_indexes(
 const PARAMETERS: &[ParameterSpec] = &concat_arrays::<
     ParameterSpec,
     S3_PARAMS_LEN,
-    47,
-    { S3_PARAMS_LEN + 47 },
+    46,
+    { S3_PARAMS_LEN + 46 },
 >(
     S3_PARAMETERS,
     [
@@ -1793,15 +1939,16 @@ const PARAMETERS: &[ParameterSpec] = &concat_arrays::<
             .description("Auto-tuning mode. 'auto': derive the correct configuration values from the detected environment (cgroup-aware cores + memory, storage class) and the inferred schema (cardinality, row width, primary key) — no closed loop. 'adaptive': additionally run a per-table closed-feedback controller that measures the live CDC ingest rate, delete fraction, and arrival burstiness AND the runtime's whole-system response (apply latency vs offered load, read amplification that slows queries, cgroup-aware memory pressure) and adapts the inline-memtable flush caps, the in-memory CDC tier byte cap, compaction cadence/trigger, and write concurrency over time, within the environment-derived [floor, ceiling]. DEFAULT: when this is unset, the mode is 'adaptive' if extended schema inference produced metadata (the dataset set 'schema_inference: extended' and the source emitted it) — opting into extended schema enables self-tuning, and that metadata is the adaptive warm-start — otherwise 'auto'. Set 'cayenne_tuning: auto' explicitly to opt out of the closed loop even with extended schema. 'schema_inference: extended' also sharpens the 'adaptive' warm-start (inferred cardinality/size) but is not required for an explicit 'adaptive' — without it the controller relearns the row width from observed ingest and converges from the hardware-derived warm-start. In BOTH modes an explicit per-parameter value (e.g. cayenne_segment_cache_mb: 512) overrides the derived value; under 'adaptive' an explicitly-set actuator is pinned (the loop will not move it).")
             .one_of(&["auto", "adaptive"]),
         ParameterSpec::component("goal_replication_lag")
-            .description("Goal-driven adaptive tuning: target end-to-end CDC replication lag as a duration (e.g. '5s'). When set (and cayenne_tuning is not 'auto'), the closed-loop controller converges toward this SLO in small, bounded steps within cayenne_goal_convergence_window."),
+            .description("Goal-driven adaptive tuning: target end-to-end CDC replication lag as a duration (e.g. '5s'). Best set GLOBALLY at runtime.params (cayenne_goal_replication_lag) and overridden here per-dataset. When set (and cayenne_tuning is not 'auto'), the closed-loop controller converges toward this SLO in small, bounded steps."),
         ParameterSpec::component("goal_freshness")
-            .description("Goal-driven adaptive tuning: target data freshness — age of the newest queryable data — as a duration (e.g. '30s')."),
+            .description("Goal-driven adaptive tuning: target data freshness — age of the newest queryable data — as a duration (e.g. '30s'). Settable globally at runtime.params and overridden here per-dataset."),
         ParameterSpec::component("goal_query_latency")
-            .description("Goal-driven adaptive tuning: target p99 query latency on this table as a duration (e.g. '10s' or '250ms')."),
-        ParameterSpec::component("goal_qph")
-            .description("Goal-driven adaptive tuning: target query throughput in queries per hour (higher is better), e.g. '5000'."),
+            .description("Goal-driven adaptive tuning: target p99 query latency on this table as a duration (e.g. '10s' or '250ms'). Settable globally at runtime.params and overridden here per-dataset."),
+        // NOTE: there is no per-dataset `goal_qph` ParameterSpec — QPH is a
+        // system-wide metric (a query/join spans datasets), so its goal is
+        // configured globally only, under `runtime.params`.
         ParameterSpec::component("goal_convergence_window")
-            .description("Goal-driven adaptive tuning: the time budget to converge toward the configured cayenne_goal_* SLOs, as a duration (e.g. '1m'). Default 60s."),
+            .description("Advanced: the control-loop pacing window — the time budget over which the loop steps toward the configured cayenne_goal_* SLOs, as a duration (e.g. '1m'). Default 60s. This paces HOW fast the loop chases the goals, not a target outcome; it is a per-dataset knob, not part of the global SLO surface."),
         ParameterSpec::runtime("cdc_prefetch_buffer")
             .description("Per-dataset override for the CDC source-reader prefetch channel depth (envelopes)."),
         ParameterSpec::runtime("cdc_max_coalesced_envelopes")
@@ -3029,6 +3176,55 @@ mod tests {
     use datafusion_table_providers::UnsupportedTypeAction;
     use search::index::{SearchIndex, VectorIndex};
     use std::sync::Arc;
+
+    #[test]
+    fn resolve_goal_raw_global_default_then_per_dataset_override() {
+        use std::collections::HashMap;
+
+        // Global SLOs set once at runtime.params.
+        let global: HashMap<String, String> = [
+            ("cayenne_goal_freshness".to_string(), "10s".to_string()),
+            (
+                "cayenne_goal_replication_lag".to_string(),
+                "30s".to_string(),
+            ),
+        ]
+        .into_iter()
+        .collect();
+
+        // Dataset overrides freshness, inherits the global replication_lag, and
+        // sets a latency goal that the global doesn't have.
+        let accel = Acceleration {
+            params: [
+                ("cayenne_goal_freshness".to_string(), "2s".to_string()),
+                (
+                    "cayenne_goal_query_latency".to_string(),
+                    "250ms".to_string(),
+                ),
+            ]
+            .into_iter()
+            .collect(),
+            ..Default::default()
+        };
+
+        // Per-dataset value wins over the global default.
+        assert_eq!(
+            resolve_goal_raw(&accel, &global, "cayenne_goal_freshness"),
+            Some("2s")
+        );
+        // Unset on the dataset → inherits the global default.
+        assert_eq!(
+            resolve_goal_raw(&accel, &global, "cayenne_goal_replication_lag"),
+            Some("30s")
+        );
+        // Set only on the dataset (no global) → the dataset value.
+        assert_eq!(
+            resolve_goal_raw(&accel, &global, "cayenne_goal_query_latency"),
+            Some("250ms")
+        );
+        // Set nowhere → None (legacy "no goal"; controller stays signal-driven).
+        assert_eq!(resolve_goal_raw(&accel, &global, "cayenne_goal_qph"), None);
+    }
 
     fn http_response_headers_field() -> Field {
         Field::new(

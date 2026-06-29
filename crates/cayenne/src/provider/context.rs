@@ -95,6 +95,18 @@ pub struct CayenneContext {
     /// that gate's own fresh-sample test (independent of the controller's
     /// `last_adjust_samples`). `0` until the first check.
     bake_gate_last_samples: std::sync::atomic::AtomicU64,
+    /// Consecutive eligible control ticks on which a goal stayed violated while the
+    /// controller had no move left — no eligible adjustment, whether because every
+    /// relevant lever is clamped at its bound OR the helpful lever is blocked by a
+    /// resource gate (e.g. memory/CPU pressure). At
+    /// [`tuning::GOAL_INFEASIBLE_STUCK_TICKS`] the SLO is declared infeasible on the
+    /// current hardware — surfaced via [`Self::goal_slo_infeasible`] (telemetry) and
+    /// one operator warning per infeasible *episode* (fired on the crossing tick).
+    /// Deliberately NOT a permanent latch: reset to 0 whenever the controller makes a
+    /// move again or the goal is met, so the signal self-clears if the SLO becomes
+    /// reachable (and re-warns only if a fresh episode crosses the threshold again).
+    /// `0` when not goal-driven.
+    goal_stuck_ticks: std::sync::atomic::AtomicU64,
     /// Wall-clock of the previous recorded CDC write, used to derive the
     /// inter-batch arrival interval (the offered-load signal). `None` until the
     /// first write.
@@ -256,6 +268,7 @@ impl CayenneContext {
             last_adjust: parking_lot::Mutex::new(None),
             last_adjust_samples: std::sync::atomic::AtomicU64::new(0),
             bake_gate_last_samples: std::sync::atomic::AtomicU64::new(0),
+            goal_stuck_ticks: std::sync::atomic::AtomicU64::new(0),
             last_write: parking_lot::Mutex::new(None),
         })
     }
@@ -639,11 +652,17 @@ impl CayenneContext {
         snap.replication_lag_secs = self.ingest_stats.replication_lag_secs(now_ms);
         snap.freshness_secs = self.ingest_stats.freshness_secs(now_ms);
         snap.query_latency_p99_ms = self.query_observations.p99_latency_ms();
-        snap.qph = self.query_observations.qph();
-        // Per-table static storage classes (detected at registration) — the loop
-        // reasons over them via `IngestSnapshot`, keeping `decide` pure.
+        // QPH is system-wide (a query spanning datasets counts once), so every
+        // table's controller reads the process-global aggregate — NOT this table's
+        // own rate, which would multiply-count joins across their participants.
+        snap.qph = tuning::global_qph();
+        // Per-table static storage classes + measured calibration-probe throughput
+        // (detected at registration) — the loop reasons over them via
+        // `IngestSnapshot` (the continuous slow-tier bias), keeping `decide` pure.
         snap.data_storage = self.config.data_storage_class;
         snap.metastore_storage = self.config.metastore_storage_class;
+        snap.data_write_mbps = self.config.data_storage_write_mbps;
+        snap.metastore_write_mbps = self.config.metastore_storage_write_mbps;
         snap
     }
 
@@ -714,12 +733,77 @@ impl CayenneContext {
             min_dwell,
             samples_at_last_move,
             &self.goals,
-        )?;
+        );
+
+        // Infeasible-SLO tracking before we (maybe) apply: a goal that stays
+        // violated on eligible ticks with NO move available means the controller has
+        // run out of levers — surface it instead of crawling into the wall silently.
+        self.track_goal_feasibility(
+            &snapshot,
+            since_last,
+            min_dwell,
+            samples_at_last_move,
+            adj.is_some(),
+        );
+
+        let adj = adj?;
         self.live_actuators.apply(&adj);
         *self.last_adjust.lock() = Some(now);
         self.last_adjust_samples
             .store(snapshot.samples, Ordering::Relaxed);
         Some(adj)
+    }
+
+    /// Update the infeasible-SLO tracker for one control tick (see
+    /// [`Self::goal_stuck_ticks`]). A made move or a met goal resets the counter; an
+    /// eligible tick (past warmup + dwell) that is still violated with no move
+    /// increments it. On crossing [`tuning::GOAL_INFEASIBLE_STUCK_TICKS`] it warns
+    /// once for that episode, naming the binding constraint; the gauge
+    /// ([`Self::goal_slo_infeasible`]) reflects current state and is read separately.
+    fn track_goal_feasibility(
+        &self,
+        snapshot: &tuning::IngestSnapshot,
+        since_last: std::time::Duration,
+        min_dwell: std::time::Duration,
+        samples_at_last_move: u64,
+        moved: bool,
+    ) {
+        use std::sync::atomic::Ordering;
+        if !self.goals.any_active() {
+            return;
+        }
+        let ingest_fresh = snapshot.samples > samples_at_last_move;
+        let violated = self.goals.any_actionable_violation(snapshot, ingest_fresh);
+        if moved || !violated {
+            self.goal_stuck_ticks.store(0, Ordering::Relaxed);
+            return;
+        }
+        // Violated but no move: only "stuck" once we are eligible to have moved
+        // (past warmup + the goal dwell) — otherwise `None` just means dwell/warmup.
+        let dwell = self.goals.control_dwell(min_dwell);
+        if snapshot.samples < tuning::WARMUP_BATCHES || since_last < dwell {
+            return;
+        }
+        let stuck = self.goal_stuck_ticks.fetch_add(1, Ordering::Relaxed) + 1;
+        if stuck == tuning::GOAL_INFEASIBLE_STUCK_TICKS {
+            tracing::warn!(
+                table = %self.dataset,
+                constraint = tuning::binding_constraint(snapshot),
+                "Cayenne adaptive tuning: SLO appears infeasible on this hardware — no further tuning adjustment is available (actuator bounds or resource gating) and the goal is still violated. See `constraint` for the binding resource; relax the goal or scale it."
+            );
+        }
+    }
+
+    /// Whether the goal-driven controller has declared the configured SLO infeasible
+    /// on this hardware (no eligible adjustment available — actuator bounds or resource
+    /// gating — and the goal still violated for
+    /// ~[`tuning::GOAL_INFEASIBLE_STUCK_TICKS`] eligible ticks). Surfaced as a
+    /// telemetry gauge so silent underperformance becomes visible.
+    #[must_use]
+    pub(crate) fn goal_slo_infeasible(&self) -> bool {
+        self.goal_stuck_ticks
+            .load(std::sync::atomic::Ordering::Relaxed)
+            >= tuning::GOAL_INFEASIBLE_STUCK_TICKS
     }
 
     /// Create a `VortexFormat` from configuration.
