@@ -17,7 +17,7 @@ To propose features or report issues, please [file an issue](https://github.com/
 
 ### [v2.2](https://github.com/spiceai/spiceai/milestone/99) (July 2026)
 
-**Focus:** Reactive Actions & Event Processing.
+**Focus:** Schema Registry, Distributed Search & Event Processing.
 
 **DataFusion:** v55
 
