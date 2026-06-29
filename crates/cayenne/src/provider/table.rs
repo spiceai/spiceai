@@ -9711,9 +9711,9 @@ impl CayenneTableProvider {
             } else {
                 return Err(CatalogError::InvalidOperationNoSource {
                     message: format!(
-                        "Deletion vector file missing but still within the surviving-sequence \
-                         floor (delete_file_id={}, path={}, sequence={} > floor={}): possible \
-                         data loss",
+                        "Deletion vector file is missing and its delete sequence is above the \
+                         surviving-sequence floor (delete_file_id={}, path={}, sequence={} > \
+                         floor={}), so it may still shadow live data: possible data loss",
                         m.delete_file_id, m.path, m.sequence_number, floor
                     ),
                 });
@@ -9781,15 +9781,19 @@ impl CayenneTableProvider {
             }
         };
 
-        // Bounded fetch of orphan-eligible key DVs (source NULL, sequence <= floor).
-        // The cap bounds the per-sweep working set; if more remain, the next
-        // retention pass re-arms the sweep. `max(min_files)` guarantees the gate
-        // below can fire even for an unusually large threshold.
-        const ORPHAN_DV_SWEEP_MAX_BATCH: usize = 50_000;
-        let fetch_limit = ORPHAN_DV_SWEEP_MAX_BATCH.max(min_files);
+        // Hard per-sweep cap on the orphan working set. This is a fixed upper bound
+        // (NOT `max(min_files)`, which would let a large knob defeat the cap): it
+        // bounds the fetch allocation, the unlink loop, AND — critically — the
+        // single `remove_delete_files` DELETE, which binds one parameter per id and
+        // would exceed the metastore's bound-parameter limit (e.g. SQLite's
+        // ~32766) on a huge batch. The effective threshold is clamped to the cap so
+        // the gate below can still fire; a backlog beyond the cap drains on later
+        // retention passes.
+        const ORPHAN_DV_SWEEP_MAX_BATCH: usize = 4096;
+        let effective_min = min_files.min(ORPHAN_DV_SWEEP_MAX_BATCH);
         let orphaned = match self
             .catalog
-            .get_orphan_eligible_delete_files(table_id, floor, fetch_limit)
+            .get_orphan_eligible_delete_files(table_id, floor, ORPHAN_DV_SWEEP_MAX_BATCH)
             .await
         {
             Ok(files) => files,
@@ -9804,7 +9808,7 @@ impl CayenneTableProvider {
 
         // Throttle: only sweep once enough orphans have accumulated to amortize the
         // pass. Below the threshold, leave them — a later retention pass rechecks.
-        if orphaned.len() < min_files {
+        if orphaned.len() < effective_min {
             return;
         }
 
