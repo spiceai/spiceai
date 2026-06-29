@@ -6508,6 +6508,75 @@ impl CayenneTableProvider {
         let mut deleted_row_keys: Vec<Box<[u8]>> = Vec::new();
         let mut deleted_inlined_pk_i64: Vec<i64> = Vec::new();
         let mut deleted_inlined_row_keys: Vec<Box<[u8]>> = Vec::new();
+        // Reinsert-over-tombstone resurrections recorded below — counted once per
+        // key so `total_superseded` can exclude them from the live-row delta (a
+        // resurrection adds a live row, it does not supersede one).
+        let mut reinserted_over_tombstone: usize = 0;
+
+        // Re-insert-over-tombstone probe (upsert correctness): a key may be ABSENT
+        // from the visible existence index yet still carry a pending DELETE
+        // tombstone — e.g. after `INSERT OVERWRITE` clears the PK keyset and a
+        // later `DELETE` leaves a tombstone. A plain insert for such a key would
+        // stay hidden forever (a row is visible iff `insert_seq > delete_seq`, and
+        // a plain insert records no `insert_seq`). When this table has pending
+        // deletions, snapshot the deletion index once so the per-row `else` branch
+        // below can detect those keys and route them through the on-conflict
+        // re-insert path (which records an `insert_seq` that supersedes the
+        // tombstone). Gated on `Upsert` + `has_pending_deletions()` so there is no
+        // cost on the common no-pending-deletes path.
+        let reinsert_over_tombstone: Option<PkDeletionSnapshot> =
+            if matches!(ctx.on_conflict, OnConflict::Upsert(_)) && self.has_pending_deletions() {
+                Some(pk_deletion_snapshot_for_strategy(
+                    &self.pk_deletion_strategy,
+                ))
+            } else {
+                None
+            };
+
+        // Route a key with NO live existence-index entry but a pending DELETE
+        // tombstone through the on-conflict re-insert path so the new row gets an
+        // `insert_seq` that supersedes the tombstone. Shared by the `Exact`-miss
+        // and `Bloom`-miss paths below: both are "this key is not known live", so
+        // a tombstone is the only reason to record an insert-record — without it
+        // the re-inserted row stays permanently hidden. Pushes to BOTH a file and
+        // an inline list (mirroring the conflict path, so the prior version is
+        // masked wherever it lives) but counts the key once via
+        // `reinserted_over_tombstone` so `total_superseded` nets the resurrection
+        // out of the live-row delta (a resurrection adds a live row; it supersedes
+        // none). A no-op (no tombstone snapshot, or key not tombstoned).
+        let probe_reinsert_over_tombstone =
+            |row_idx: usize,
+             key: &OwnedRow,
+             deleted_pk_i64: &mut Vec<i64>,
+             deleted_inlined_pk_i64: &mut Vec<i64>,
+             deleted_row_keys: &mut Vec<Box<[u8]>>,
+             deleted_inlined_row_keys: &mut Vec<Box<[u8]>>,
+             reinserted_over_tombstone: &mut usize| {
+                let Some(snapshot) = &reinsert_over_tombstone else {
+                    return;
+                };
+                match snapshot {
+                    PkDeletionSnapshot::Int64Pk { tombstones } => {
+                        if let Some(arr) = int64_pk_array {
+                            let value = arr.value(row_idx);
+                            if tombstones.get(value).is_some() {
+                                deleted_pk_i64.push(value);
+                                deleted_inlined_pk_i64.push(value);
+                                *reinserted_over_tombstone += 1;
+                            }
+                        }
+                    }
+                    PkDeletionSnapshot::RowConverterBased { tombstones } => {
+                        if tombstones.get(key.as_ref()).is_some() {
+                            let row_key = key.as_ref().to_vec().into_boxed_slice();
+                            deleted_row_keys.push(row_key.clone());
+                            deleted_inlined_row_keys.push(row_key);
+                            *reinserted_over_tombstone += 1;
+                        }
+                    }
+                    PkDeletionSnapshot::PositionBased => {}
+                }
+            };
 
         // Hoist the PK-null check out of the per-row loop: an Arrow column with no
         // null buffer reports `null_count() == 0` in O(1), so when no PK column is
@@ -6594,6 +6663,19 @@ impl CayenneTableProvider {
                             }
                         }
                     } else {
+                        // Key has no live existence-index entry. If it still
+                        // carries a pending DELETE tombstone this is a reinsert
+                        // over that tombstone — route it so the new row supersedes
+                        // it (otherwise it stays permanently hidden).
+                        probe_reinsert_over_tombstone(
+                            row_idx,
+                            &key,
+                            &mut deleted_pk_i64,
+                            &mut deleted_inlined_pk_i64,
+                            &mut deleted_row_keys,
+                            &mut deleted_inlined_row_keys,
+                            &mut reinserted_over_tombstone,
+                        );
                         true
                     }
                 }
@@ -6626,6 +6708,24 @@ impl CayenneTableProvider {
                             }
                             PkDeletionStrategyWithCache::PositionBased { .. } => {}
                         }
+                    } else {
+                        // Bloom MISS ⇒ key is definitely not live (blooms have no
+                        // false negatives). But an over-budget table can still hold
+                        // a pending DELETE tombstone for it (e.g. reinsert after a
+                        // delete), and the plain-insert path records no
+                        // `insert_seq`, so the row would stay hidden. Probe for that
+                        // tombstone and route the reinsert, same as the `Exact`-miss
+                        // path — otherwise the resurrection bug recurs on the bloom
+                        // fallback.
+                        probe_reinsert_over_tombstone(
+                            row_idx,
+                            &key,
+                            &mut deleted_pk_i64,
+                            &mut deleted_inlined_pk_i64,
+                            &mut deleted_row_keys,
+                            &mut deleted_inlined_row_keys,
+                            &mut reinserted_over_tombstone,
+                        );
                     }
                     true
                 }
@@ -6684,6 +6784,7 @@ impl CayenneTableProvider {
             deleted_row_keys,
             deleted_inlined_pk_i64,
             deleted_inlined_row_keys,
+            reinserted_over_tombstone,
         })
     }
 
@@ -6808,6 +6909,7 @@ impl CayenneTableProvider {
         let mut deleted_row_keys: Vec<Box<[u8]>> = Vec::new();
         let mut deleted_inlined_pk_i64: Vec<i64> = Vec::new();
         let mut deleted_inlined_row_keys: Vec<Box<[u8]>> = Vec::new();
+        let mut reinserted_over_tombstone: usize = 0;
         let mut kept_keys: HashSet<OwnedRow> = HashSet::new();
         let mut filtered_batches: Vec<RecordBatch> = Vec::new();
 
@@ -6872,6 +6974,7 @@ impl CayenneTableProvider {
             deleted_row_keys.extend(result.deleted_row_keys);
             deleted_inlined_pk_i64.extend(result.deleted_inlined_pk_i64);
             deleted_inlined_row_keys.extend(result.deleted_inlined_row_keys);
+            reinserted_over_tombstone += result.reinserted_over_tombstone;
             incoming_keys.extend(result.kept_keys.iter().cloned());
             kept_keys.extend(result.kept_keys);
             if let Some(fb) = result.filtered_batch
@@ -6889,6 +6992,7 @@ impl CayenneTableProvider {
                 deleted_row_keys,
                 deleted_inlined_pk_i64,
                 deleted_inlined_row_keys,
+                reinserted_over_tombstone,
             },
             kept_keys,
         ))
@@ -7967,6 +8071,8 @@ impl CayenneTableProvider {
             deleted_row_keys,
             deleted_inlined_pk_i64,
             deleted_inlined_row_keys,
+            // Already folded into `superseded` above; not needed past this point.
+            reinserted_over_tombstone: _,
         } = on_conflict_deletions;
 
         // Inline-bearing batches now STAGE inert (Option D): the tombstone is
@@ -8564,6 +8670,9 @@ impl CayenneTableProvider {
             deleted_row_keys,
             deleted_inlined_pk_i64,
             deleted_inlined_row_keys,
+            // Live-row-delta accounting only (see `total_superseded`); the actual
+            // delete/reinsert I/O below works off the key lists.
+            reinserted_over_tombstone: _,
         } = on_conflict_deletions;
 
         let has_file_key_deletions = !deleted_pk_i64.is_empty() || !deleted_row_keys.is_empty();
@@ -19697,6 +19806,7 @@ impl CayenneTableProvider {
             Arc::clone(&self.catalog),
             Arc::clone(&self.protected_snapshots),
             self.table_metadata.table_id.clone(),
+            self.clone_for_write(),
             self.table_metadata.path.clone(),
             Arc::clone(self.context.runtime_env()),
             Arc::clone(&self.write_lock),
