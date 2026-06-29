@@ -635,3 +635,107 @@ async fn test_time_retention_with_user_filter_impl(
 
     Ok(())
 }
+
+/// P1 regression: time retention must NOT hide NULL-timestamp rows. The delete
+/// side never removes them (`NULL < cutoff` is NULL; whole-file drop needs
+/// `max(col) < threshold`, false when the max is NULL/absent), so the read-side
+/// keep filter must retain them. Before the fix, `keep_filter` was `col >= cutoff`
+/// and `NULL >= cutoff` is NULL under three-valued logic, so NULL-timestamp rows
+/// were permanently invisible yet never reclaimed. The fix makes the keep filter
+/// `col >= cutoff OR col IS NULL`.
+async fn test_time_retention_keeps_null_timestamps_impl(
+    fixture: TestFixture,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let table_dir = fixture.data_path.join("time_retention_null");
+    std::fs::create_dir_all(&table_dir)?;
+
+    // `event_time` is NULLABLE (true) so a NULL timestamp can be inserted.
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new(
+            "event_time",
+            DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+            true,
+        ),
+    ]));
+
+    let table_options = CreateTableOptions {
+        table_name: "time_retention_null".to_string(),
+        schema: Arc::clone(&schema),
+        primary_key: vec![],
+        on_conflict: None,
+        base_path: table_dir.to_string_lossy().to_string(),
+        partition_column: None,
+        vortex_config: cayenne::metadata::VortexConfig::default(),
+    };
+
+    // A 1-hour window keeps the test robust to wall-clock execution time (the
+    // cutoff is recomputed at query time): id=1 stays comfortably fresh and id=2
+    // stays comfortably expired no matter how long insert+register+query takes.
+    let retention_builder =
+        cayenne::TimeRetentionFilterBuilder::try_new("event_time", 3600, &schema)
+            .expect("to create retention builder");
+
+    let catalog_arc = Arc::clone(&fixture.catalog) as Arc<dyn MetadataCatalog>;
+    let ctx = SessionContext::new();
+    let table_provider = Arc::new(
+        CayenneTableProviderBuilder::new(catalog_arc, ctx.runtime_env())
+            .with_time_retention_filter_builder(retention_builder)
+            .create(table_options)
+            .await?,
+    );
+
+    // id=1 fresh (now → within the 1h window), id=2 two hours old (far past the
+    // window → expired), id=3 NULL timestamp. Each row is its own batch → its own
+    // Vortex file.
+    let now_us = chrono::Utc::now().timestamp_micros();
+    let fresh_us = now_us; // within retention regardless of test speed
+    let old_us = now_us - 7_200_000_000; // 2h ago → always expired (window is 1h)
+    let rows: [(i64, Option<i64>); 3] = [(1, Some(fresh_us)), (2, Some(old_us)), (3, None)];
+    for (id, ts) in rows {
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int64Array::from(vec![id])),
+                Arc::new(TimestampMicrosecondArray::from(vec![ts]).with_timezone("UTC")),
+            ],
+        )?;
+        let inserted = common::insert_batch(table_provider.as_ref(), batch).await?;
+        assert_eq!(inserted, 1, "Should insert 1 row for id={id}");
+    }
+
+    let query_ctx =
+        SessionContext::new_with_config_rt(SessionConfig::new(), ctx.runtime_env());
+    query_ctx.register_table(
+        "time_retention_null",
+        Arc::clone(&table_provider) as Arc<dyn TableProvider>,
+    )?;
+    let batches = query_ctx
+        .sql("SELECT id FROM time_retention_null ORDER BY id")
+        .await?
+        .collect()
+        .await?;
+    let mut ids = Vec::new();
+    for batch in &batches {
+        let col = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("id column");
+        for i in 0..col.len() {
+            ids.push(col.value(i));
+        }
+    }
+
+    // id=1 (fresh) visible, id=2 (expired) hidden, id=3 (NULL timestamp) STAYS
+    // VISIBLE. Before the fix this returned [1] — id=3 was wrongly hidden.
+    assert_eq!(
+        ids,
+        vec![1, 3],
+        "NULL-timestamp rows must remain visible; only the expired non-null row is hidden"
+    );
+
+    Ok(())
+}
+
+test_with_backends!(test_time_retention_keeps_null_timestamps_impl);

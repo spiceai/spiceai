@@ -570,22 +570,18 @@ impl FileBasedDeletionSink {
             .min()
             .unwrap_or(i64::MAX);
 
-        // Fold in the current snapshot: a key DV with delete sequence D deletes a
-        // current-snapshot row iff that row's sequence is `< D`, so the snapshot is
-        // safe against pruning D only when its smallest row sequence is `>= D`. An
-        // empty manifest is genesis (no rows to resurrect). If the manifest cannot
-        // be read we cannot prove safety, so skip the sweep this pass.
+        // Fold in the current snapshot. The manifest is the source, BUT an EMPTY
+        // manifest does NOT prove an empty snapshot, so it is corroborated against
+        // the authoritative directory listing before being treated as genesis — see
+        // `current_snapshot_floor`. If the manifest can't be read we cannot prove
+        // safety, so skip the sweep this pass.
         let current_snapshot_id = self.provider.get_current_snapshot_id();
-        let current_floor = match self
+        let manifest_files = match self
             .catalog
             .get_snapshot_files(&self.table_id, &current_snapshot_id)
             .await
         {
-            Ok(files) => files
-                .iter()
-                .map(|f| f.min_sequence)
-                .min()
-                .unwrap_or(i64::MAX),
+            Ok(files) => files,
             Err(e) => {
                 tracing::warn!(
                     "Retention: failed to read current snapshot manifest for orphaned DV cleanup on table {}: {e}",
@@ -593,6 +589,39 @@ impl FileBasedDeletionSink {
                 );
                 return;
             }
+        };
+        // Only consult the listing when the manifest is empty (the ambiguous case);
+        // when it is populated the directory flag is unused.
+        let directory_is_empty = if manifest_files.is_empty() {
+            match self
+                .provider
+                .list_snapshot_files_with_sizes(&current_snapshot_id)
+                .await
+            {
+                Ok(listed) => listed.is_empty(),
+                Err(e) => {
+                    tracing::warn!(
+                        "Retention: failed to list current snapshot files for orphaned DV cleanup on table {}: {e}",
+                        self.table_name
+                    );
+                    return;
+                }
+            }
+        } else {
+            false
+        };
+        let manifest_min_sequences: Vec<i64> =
+            manifest_files.iter().map(|f| f.min_sequence).collect();
+        let Some(current_floor) =
+            current_snapshot_floor(&manifest_min_sequences, directory_is_empty)
+        else {
+            tracing::debug!(
+                table = %self.table_name,
+                snapshot_id = %current_snapshot_id,
+                "Retention: current snapshot manifest empty but directory non-empty; \
+                 skipping orphaned-DV cleanup this pass (cannot prove no live row is shadowed)"
+            );
+            return;
         };
 
         let floor = protected_floor.min(current_floor);
@@ -667,5 +696,51 @@ impl FileBasedDeletionSink {
             "Retention: cleaned up {} orphaned key-based deletion vector(s)",
             ids.len()
         );
+    }
+}
+
+/// Compute the current-snapshot sequence floor for orphaned-DV cleanup, or `None`
+/// when the sweep must be SKIPPED this pass.
+///
+/// A key deletion vector with delete sequence `D` shadows a current-snapshot row
+/// iff that row's sequence is `< D`, so the floor is the snapshot's smallest row
+/// sequence. The `cayenne_snapshot_file` manifest is the source — BUT it is a
+/// best-effort, non-authoritative optimization (populated lazily by
+/// compaction/overwrite/the post-write rebuild, which is skipped under
+/// compaction-lock contention, tolerates per-snapshot failures, and is not re-run
+/// by the retention path; a half-populated manifest survives restart). An EMPTY
+/// manifest therefore does NOT prove an empty snapshot — it must be corroborated
+/// against the authoritative directory listing:
+/// - manifest populated → the smallest `min_sequence` bounds the floor;
+/// - empty manifest + empty directory → genuine genesis (`i64::MAX`, nothing to resurrect);
+/// - empty manifest + non-empty directory → `None`: skip the sweep, because a key
+///   DV could shadow a live row in the snapshot and pruning at `i64::MAX` would
+///   resurrect it durably.
+fn current_snapshot_floor(manifest_min_sequences: &[i64], directory_is_empty: bool) -> Option<i64> {
+    match manifest_min_sequences.iter().copied().min() {
+        Some(min_sequence) => Some(min_sequence),
+        None if directory_is_empty => Some(i64::MAX),
+        None => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::current_snapshot_floor;
+
+    /// The orphaned-DV cleanup floor must never trust an empty manifest as genesis
+    /// while data files still exist — that was the P1 resurrection bug.
+    #[test]
+    fn current_snapshot_floor_corroborates_empty_manifest_against_directory() {
+        // Populated manifest → smallest min_sequence bounds the floor (directory
+        // flag is irrelevant and ignored).
+        assert_eq!(current_snapshot_floor(&[30, 10, 20], false), Some(10));
+        assert_eq!(current_snapshot_floor(&[5], true), Some(5));
+        // Empty manifest + empty directory → genuine genesis.
+        assert_eq!(current_snapshot_floor(&[], true), Some(i64::MAX));
+        // REGRESSION: empty manifest + data files on disk → skip (NOT i64::MAX).
+        // Pre-fix this returned i64::MAX unconditionally, pruning deletion vectors
+        // that could still shadow live current-snapshot rows (durable resurrection).
+        assert_eq!(current_snapshot_floor(&[], false), None);
     }
 }

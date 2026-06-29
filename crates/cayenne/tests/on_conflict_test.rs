@@ -215,3 +215,234 @@ async fn test_pk_conflict_detection_none_rejects_upsert_impl(
 
     Ok(())
 }
+
+// --- P1 regression: in-batch duplicate primary keys ---
+// A single `INSERT ... VALUES (1,'a'),(1,'b')` is ONE RecordBatch with two rows
+// sharing a PK. Before the fix the Exact path kept both (silent double-insert);
+// dedup is now derived from the OnConflict variant (Upsert keep-last, DoNothing
+// keep-first) as an in-batch pre-pass.
+
+test_with_backends!(test_upsert_in_batch_duplicate_keeps_last_impl);
+test_with_backends!(test_upsert_in_batch_duplicate_over_existing_keeps_last_impl);
+test_with_backends!(test_do_nothing_in_batch_duplicate_keeps_first_impl);
+test_with_backends!(test_upsert_in_batch_duplicate_composite_pk_impl);
+
+/// Helper: collect `(id, name)` rows sorted by id.
+async fn collect_id_name(
+    ctx: &SessionContext,
+    sql: &str,
+) -> Result<Vec<(i64, String)>, Box<dyn std::error::Error>> {
+    let batches = ctx.sql(sql).await?.collect().await?;
+    let mut out = Vec::new();
+    for batch in &batches {
+        let ids = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow::array::Int64Array>()
+            .expect("id column");
+        let names = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<arrow::array::StringArray>()
+            .expect("name column");
+        for i in 0..batch.num_rows() {
+            out.push((ids.value(i), names.value(i).to_string()));
+        }
+    }
+    out.sort_by_key(|(id, _)| *id);
+    Ok(out)
+}
+
+async fn make_id_name_table(
+    fixture: &common::TestFixture,
+    name: &str,
+    on_conflict: OnConflict,
+) -> Result<(Arc<CayenneTableProvider>, SessionContext), Box<dyn std::error::Error>> {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("name", DataType::Utf8, false),
+    ]));
+    let table_options = CreateTableOptions {
+        table_name: name.to_string(),
+        schema,
+        primary_key: vec!["id".to_string()],
+        on_conflict: Some(on_conflict),
+        base_path: fixture.data_path.to_string_lossy().to_string(),
+        partition_column: None,
+        vortex_config: cayenne::metadata::VortexConfig::default(),
+    };
+    let catalog_arc: Arc<dyn MetadataCatalog> = fixture.catalog.clone();
+    let ctx = SessionContext::new();
+    let table = Arc::new(
+        CayenneTableProvider::create_table(catalog_arc, table_options, ctx.runtime_env()).await?,
+    );
+    ctx.register_table(
+        name,
+        Arc::clone(&table) as Arc<dyn datafusion::datasource::TableProvider>,
+    )?;
+    Ok((table, ctx))
+}
+
+/// Upsert: a single batch with a duplicate PK keeps the LAST occurrence.
+async fn test_upsert_in_batch_duplicate_keeps_last_impl(
+    fixture: common::TestFixture,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (_table, ctx) = make_id_name_table(
+        &fixture,
+        "upsert_in_batch_dup",
+        OnConflict::Upsert(ColumnReference::new(vec!["id".to_string()])),
+    )
+    .await?;
+
+    ctx.sql("INSERT INTO upsert_in_batch_dup VALUES (1, 'a'), (1, 'b')")
+        .await?
+        .collect()
+        .await?;
+
+    let rows = collect_id_name(&ctx, "SELECT id, name FROM upsert_in_batch_dup ORDER BY id").await?;
+    assert_eq!(
+        rows,
+        vec![(1, "b".to_string())],
+        "Upsert in-batch duplicate must keep exactly one row, the LAST value"
+    );
+    Ok(())
+}
+
+/// Upsert: an in-batch duplicate that ALSO conflicts with a pre-existing row must
+/// still yield one row (the last in-batch value) — exercises the delete path so a
+/// double-counted supersede would corrupt the live-row bookkeeping.
+async fn test_upsert_in_batch_duplicate_over_existing_keeps_last_impl(
+    fixture: common::TestFixture,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (_table, ctx) = make_id_name_table(
+        &fixture,
+        "upsert_in_batch_dup_existing",
+        OnConflict::Upsert(ColumnReference::new(vec!["id".to_string()])),
+    )
+    .await?;
+
+    ctx.sql("INSERT INTO upsert_in_batch_dup_existing VALUES (1, 'orig')")
+        .await?
+        .collect()
+        .await?;
+    ctx.sql("INSERT INTO upsert_in_batch_dup_existing VALUES (1, 'a'), (1, 'b')")
+        .await?
+        .collect()
+        .await?;
+
+    let rows = collect_id_name(
+        &ctx,
+        "SELECT id, name FROM upsert_in_batch_dup_existing ORDER BY id",
+    )
+    .await?;
+    assert_eq!(
+        rows,
+        vec![(1, "b".to_string())],
+        "Upsert in-batch duplicate over an existing row must leave one row, the LAST value"
+    );
+    Ok(())
+}
+
+/// `DoNothing`: a single batch with a duplicate PK keeps the FIRST occurrence.
+async fn test_do_nothing_in_batch_duplicate_keeps_first_impl(
+    fixture: common::TestFixture,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (_table, ctx) = make_id_name_table(
+        &fixture,
+        "do_nothing_in_batch_dup",
+        OnConflict::DoNothing(ColumnReference::new(vec!["id".to_string()])),
+    )
+    .await?;
+
+    ctx.sql("INSERT INTO do_nothing_in_batch_dup VALUES (1, 'a'), (1, 'b')")
+        .await?
+        .collect()
+        .await?;
+
+    let rows =
+        collect_id_name(&ctx, "SELECT id, name FROM do_nothing_in_batch_dup ORDER BY id").await?;
+    assert_eq!(
+        rows,
+        vec![(1, "a".to_string())],
+        "DoNothing in-batch duplicate must keep exactly one row, the FIRST value"
+    );
+    Ok(())
+}
+
+/// Composite PK: in-batch dedup keys on the FULL composite, so only rows sharing
+/// every PK column collapse (Upsert keep-last); a partial-key match does not.
+async fn test_upsert_in_batch_duplicate_composite_pk_impl(
+    fixture: common::TestFixture,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("region", DataType::Utf8, false),
+        Field::new("id", DataType::Int64, false),
+        Field::new("value", DataType::Int64, false),
+    ]));
+    let table_options = CreateTableOptions {
+        table_name: "upsert_in_batch_dup_composite".to_string(),
+        schema,
+        primary_key: vec!["region".to_string(), "id".to_string()],
+        on_conflict: Some(OnConflict::Upsert(ColumnReference::new(vec![
+            "region".to_string(),
+            "id".to_string(),
+        ]))),
+        base_path: fixture.data_path.to_string_lossy().to_string(),
+        partition_column: None,
+        vortex_config: cayenne::metadata::VortexConfig::default(),
+    };
+    let catalog_arc: Arc<dyn MetadataCatalog> = fixture.catalog.clone();
+    let ctx = SessionContext::new();
+    let table = Arc::new(
+        CayenneTableProvider::create_table(catalog_arc, table_options, ctx.runtime_env()).await?,
+    );
+    ctx.register_table(
+        "upsert_in_batch_dup_composite",
+        Arc::clone(&table) as Arc<dyn datafusion::datasource::TableProvider>,
+    )?;
+
+    // ('US',1) duplicated (keep last → 200); ('EU',1) distinct composite → kept.
+    ctx.sql(
+        "INSERT INTO upsert_in_batch_dup_composite VALUES \
+         ('US', 1, 100), ('US', 1, 200), ('EU', 1, 300)",
+    )
+    .await?
+    .collect()
+    .await?;
+
+    let batches = ctx
+        .sql("SELECT region, id, value FROM upsert_in_batch_dup_composite ORDER BY region, id")
+        .await?
+        .collect()
+        .await?;
+    let mut rows = Vec::new();
+    for batch in &batches {
+        let regions = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow::array::StringArray>()
+            .expect("region column");
+        let ids = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<arrow::array::Int64Array>()
+            .expect("id column");
+        let values = batch
+            .column(2)
+            .as_any()
+            .downcast_ref::<arrow::array::Int64Array>()
+            .expect("value column");
+        for i in 0..batch.num_rows() {
+            rows.push((regions.value(i).to_string(), ids.value(i), values.value(i)));
+        }
+    }
+    assert_eq!(
+        rows,
+        vec![
+            ("EU".to_string(), 1, 300),
+            ("US".to_string(), 1, 200),
+        ],
+        "composite-PK in-batch dedup collapses only the full-key duplicate, keep-last"
+    );
+    Ok(())
+}
