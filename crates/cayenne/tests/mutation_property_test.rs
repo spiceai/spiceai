@@ -350,8 +350,11 @@ async fn verify_aggregate_queries(
 
     // Filtered count exercises a value predicate + pushdown.
     const THRESH: i64 = 500_000;
-    let filtered =
-        scalar_i64(ctx, &format!("SELECT COUNT(*) FROM {name} WHERE value >= {THRESH}")).await?;
+    let filtered = scalar_i64(
+        ctx,
+        &format!("SELECT COUNT(*) FROM {name} WHERE value >= {THRESH}"),
+    )
+    .await?;
     let expected_filtered =
         i64::try_from(model.values().filter(|&&v| v >= THRESH).count()).expect("fits i64");
     assert_eq!(
@@ -589,7 +592,10 @@ async fn run_concurrent(fixture: &TestFixture, w: &Workload, seed: u64) -> TestR
     table.maybe_compact_small_files().await?;
 
     let live = read_rows(&ctx, &name).await?;
-    let msg = format!("concurrent convergence failed mode={:?} seed={seed}", w.mode);
+    let msg = format!(
+        "concurrent convergence failed mode={:?} seed={seed}",
+        w.mode
+    );
     assert_converged(&live, &model, &msg);
     verify_aggregate_queries(&ctx, &name, &model, w.population, &msg).await?;
     Ok(())
