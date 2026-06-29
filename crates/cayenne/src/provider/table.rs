@@ -10616,22 +10616,29 @@ impl CayenneTableProvider {
     ///
     /// The per-snapshot `cayenne_snapshot_file` manifest is a BEST-EFFORT
     /// auxiliary structure built *from* the directory listing
-    /// ([`Self::upsert_snapshot_manifest_from_listing`]); scans resolve a
-    /// snapshot's files from the directory listing on both local and S3
-    /// ([`Self::list_snapshot_files_with_sizes`]), NEVER from this manifest — so
-    /// a `listed ⊄ manifest` discrepancy has no scan-correctness effect.
+    /// ([`Self::upsert_snapshot_manifest_from_listing`]). Scans resolve a
+    /// snapshot's files from the directory listing by default
+    /// ([`Self::list_files_for_snapshot_scan`]); only the opt-in
+    /// `scan_from_manifest` mode reads file paths from the manifest, and that
+    /// mode requires the manifest to be COMPLETE-OR-EMPTY (never partial) — an
+    /// invariant maintained separately so no scan ever observes a partial
+    /// manifest (see [`Self::backfill_snapshot_manifest_if_empty`]).
     ///
-    /// Such a discrepancy is also an *expected, benign race*: this runs from the
-    /// detached best-effort rebuild ([`Self::rebuild_live_snapshot_manifests`])
-    /// and after the compaction commit, both of which can interleave with a
-    /// concurrent publish / compaction / background rebuild that transiently
-    /// prunes or repoints a snapshot's manifest rows between the listing and this
-    /// read-back. A `debug_assert!` here therefore flaked debug-build tests (see
-    /// `tests/mutation_property_test.rs`), so the check warns for observability
-    /// instead of panicking; a genuine *persistent* drop would surface as a
-    /// sustained warning, not data loss. (Extra manifest rows a concurrent append
-    /// legitimately adds are ignored — both sides are name sets and only the
-    /// `listed ⊄ manifest` direction is logged.)
+    /// This check reads the manifest non-atomically relative to the `listed`
+    /// snapshot it was handed, so the detached best-effort rebuild
+    /// ([`Self::rebuild_live_snapshot_manifests`]) and the post-compaction commit
+    /// — interleaving with a concurrent publish / compaction / rebuild that
+    /// transiently prunes or repoints a snapshot's rows — can momentarily present
+    /// `listed ⊄ manifest`. That is a transient of THIS check, not a committed
+    /// state a `scan_from_manifest` read resolves files from, and the check is
+    /// debug-only (compiled out of release), so it cannot change production
+    /// correctness either way. A `debug_assert!` here flaked debug-build tests
+    /// (see `tests/mutation_property_test.rs`), so it warns instead of panicking;
+    /// a genuine *persistent* discrepancy would surface as a sustained warning
+    /// (and, under `scan_from_manifest`, would be a real complete-or-empty
+    /// violation to chase). Extra manifest rows a concurrent append legitimately
+    /// adds are ignored — both sides are name sets and only the `listed ⊄
+    /// manifest` direction is logged.
     #[cfg(debug_assertions)]
     async fn debug_log_manifest_listing_mismatch(
         &self,
@@ -10670,7 +10677,8 @@ impl CayenneTableProvider {
                     .copied()
                     .collect::<Vec<&str>>(),
                 "cayenne_snapshot_file manifest is transiently missing files the caller \
-                 just listed (best-effort manifest; scans use the directory listing)"
+                 just listed under concurrent maintenance (best-effort manifest; not the \
+                 default scan's file source, and scan_from_manifest keeps it complete-or-empty)"
             );
         }
     }

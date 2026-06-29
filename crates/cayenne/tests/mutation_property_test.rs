@@ -68,8 +68,11 @@ limitations under the License.
 //!   *manifest ⊋ listing* assertion (extra manifest files from a concurrent
 //!   append) is intentionally tolerated. The opposite, *listed ⊋ manifest*,
 //!   discrepancy is a benign race on the BEST-EFFORT `cayenne_snapshot_file`
-//!   manifest (scans resolve files from the directory listing, never from that
-//!   manifest), so the check now logs a warning instead of panicking — see
+//!   manifest: the default scan path resolves files from the directory listing,
+//!   and the opt-in `scan_from_manifest` mode relies on the manifest being
+//!   complete-or-empty (never partial), so the transient `listed ⊋ manifest`
+//!   this debug check observes is not a state a scan resolves files from. The
+//!   check now logs a warning instead of panicking — see
 //!   `CayenneTableProvider::debug_log_manifest_listing_mismatch`.
 
 #![allow(clippy::expect_used)]
