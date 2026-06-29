@@ -305,21 +305,27 @@ fn assert_converged(live: &Model, model: &Model, ctx_msg: &str) {
 /// Run a query expected to return a single `i64` scalar (a NULL aggregate maps
 /// to 0). Used by the aggregate-query checks below.
 async fn scalar_i64(ctx: &SessionContext, sql: &str) -> TestResult<i64> {
-    // Callers use COUNT(*) (never null) or COALESCE(SUM(...), 0), so the query
-    // must yield exactly one non-null i64 cell. A missing row is a bug in the
-    // query/engine, NOT a legitimate 0 — fail loudly rather than masking it.
+    // Callers are single-cell aggregates (COUNT(*) / COALESCE(SUM(...), 0)) that
+    // must return EXACTLY ONE non-null i64 row. Neither zero rows nor extra rows
+    // are legitimate here, so fail loudly rather than masking a query/engine bug
+    // (e.g. silently reading the first of several rows).
     let batches = ctx.sql(sql).await?.collect().await?;
-    for b in &batches {
-        if b.num_rows() > 0 {
-            let arr = b
-                .column(0)
-                .as_any()
-                .downcast_ref::<Int64Array>()
-                .expect("i64 scalar result");
-            return Ok(arr.value(0));
-        }
+    let total_rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
+    if total_rows != 1 {
+        return Err(
+            format!("scalar query returned {total_rows} rows, expected exactly 1: {sql}").into(),
+        );
     }
-    Err(format!("scalar query returned no rows: {sql}").into())
+    let b = batches
+        .iter()
+        .find(|b| b.num_rows() > 0)
+        .expect("exactly one row exists");
+    let arr = b
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .expect("i64 scalar result");
+    Ok(arr.value(0))
 }
 
 /// Cross-check the table against the model through AGGREGATE + FILTER + POINT
