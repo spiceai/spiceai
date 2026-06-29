@@ -46,7 +46,7 @@ expression: "normalize_search_response(resp, round_scores)"
       "dataset": "qs",
       "matches": {
         "answer": [
-          "is 2.)"
+          " is 2."
         ]
       },
       "primary_key": {
