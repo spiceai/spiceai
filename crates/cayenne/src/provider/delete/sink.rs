@@ -124,6 +124,15 @@ pub struct CayenneDeletionSink {
     /// allocations through the SAME allocator as every other writer of this
     /// table, so memory and the DB `current_sequence_number` never diverge.
     seq_allocator: Arc<TokioMutex<super::super::table::SeqAllocator>>,
+    /// Whether this sink must return a VERIFIED deleted-row count — i.e. it backs
+    /// a user-visible `DELETE`, where the count is surfaced to the SQL client as
+    /// "rows affected". When false (the CDC/internal default), the `pk IN (...)`
+    /// fast path may persist deletions WITHOUT a scan and return 0; that count is
+    /// a known non-authoritative upper bound (see
+    /// [`Self::delete_filtered_rows_from_tables`]). When true, the fast path is
+    /// bypassed so the scan-based path returns an exact count of the live rows
+    /// actually removed.
+    count_exact: bool,
 }
 
 impl CayenneDeletionSink {
@@ -158,7 +167,19 @@ impl CayenneDeletionSink {
             runtime_env,
             write_lock,
             seq_allocator,
+            count_exact: false,
         }
+    }
+
+    /// Mark this sink as needing an exact, verified deleted-row count (a
+    /// user-visible `DELETE`, where "rows affected" is shown to the client).
+    /// Bypasses the count-skipping `pk IN (...)` fast path so the scan-based
+    /// path counts only the live rows actually removed. The default (unset)
+    /// keeps the fast path for CDC/internal callers that do not surface the
+    /// count. See [`Self::count_exact`].
+    pub(crate) fn with_exact_count(mut self) -> Self {
+        self.count_exact = true;
+        self
     }
 
     fn refresh_deletion_memory_accounting(&self) {
@@ -303,35 +324,42 @@ impl CayenneDeletionSink {
 
         let coerced_filters = self.coerce_filters_for_schema()?;
 
-        // If filters encode PK deletion values directly, extract them and write
-        // deletion vectors without performing full scan.
+        // PK-IN-list fast path: when the filter encodes the PK deletion values
+        // directly (`pk IN (...)`), extract them and write deletion vectors
+        // WITHOUT a full table scan.
         //
-        // The fast path always returns 0: the extracted key set is the filter's
-        // upper bound on deletions, not a verified per-row count, so we can't
-        // produce a meaningful "rows deleted" number without a scan. Callers
-        // (CDC, `InlineAwareDeletionSink`) must not depend on this count — the
-        // authoritative count for user-visible DELETEs comes from the inline
-        // path in `InlineAwareDeletionSink`.
-        match self.try_extract_pks_from_filters(&coerced_filters) {
-            Some(ExtractedPkDeletes::Int64(pk_values)) => {
-                tracing::debug!(
-                    table = %table_name,
-                    count = pk_values.len(),
-                    "Fast-path delete: extracted Int64 PK values directly from filters, skipping table scan"
-                );
-                self.persist_int64_pk_deletions(pk_values).await?;
-                return Ok(0);
+        // This path cannot produce a verified count: the extracted key set is
+        // the filter's UPPER BOUND on deletions (some keys may not exist), so a
+        // meaningful "rows deleted" number would require the scan it is avoiding.
+        // It therefore returns 0. CDC/internal callers don't surface the count
+        // and take this fast path.
+        //
+        // A user-visible `DELETE` (`count_exact`) surfaces "rows affected" to the
+        // client, so it must NOT take the fast path: it falls through to the
+        // scan-based path below, which extracts PKs from the LIVE rows the scan
+        // matched and thus counts only rows actually removed.
+        if !self.count_exact {
+            match self.try_extract_pks_from_filters(&coerced_filters) {
+                Some(ExtractedPkDeletes::Int64(pk_values)) => {
+                    tracing::debug!(
+                        table = %table_name,
+                        count = pk_values.len(),
+                        "Fast-path delete: extracted Int64 PK values directly from filters, skipping table scan"
+                    );
+                    self.persist_int64_pk_deletions(pk_values).await?;
+                    return Ok(0);
+                }
+                Some(ExtractedPkDeletes::RowKeys(row_keys)) => {
+                    tracing::debug!(
+                        table = %table_name,
+                        count = row_keys.len(),
+                        "Fast-path delete: extracted row keys directly from filters, skipping table scan"
+                    );
+                    self.persist_key_based_deletions(row_keys).await?;
+                    return Ok(0);
+                }
+                None => {}
             }
-            Some(ExtractedPkDeletes::RowKeys(row_keys)) => {
-                tracing::debug!(
-                    table = %table_name,
-                    count = row_keys.len(),
-                    "Fast-path delete: extracted row keys directly from filters, skipping table scan"
-                );
-                self.persist_key_based_deletions(row_keys).await?;
-                return Ok(0);
-            }
-            None => {}
         }
 
         let physical_filters = self.build_physical_filters(&coerced_filters)?;
