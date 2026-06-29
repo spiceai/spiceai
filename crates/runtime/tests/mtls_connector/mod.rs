@@ -203,8 +203,7 @@ async fn start_upstream(pki: &ConnectorTestPki, csv_path: &std::path::Path) -> u
     let probe_identity = reqwest::Identity::from_pem(&probe_id_buf).expect("probe identity");
     let probe = reqwest::Client::builder()
         .use_rustls_tls()
-        .tls_built_in_root_certs(false)
-        .add_root_certificate(probe_ca)
+        .tls_certs_only([probe_ca])
         .identity(probe_identity)
         .build()
         .expect("probe client");

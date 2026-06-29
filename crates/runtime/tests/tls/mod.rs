@@ -136,8 +136,7 @@ async fn test_tls_endpoints() -> Result<(), anyhow::Error> {
                 reqwest::tls::Certificate::from_pem(&root_cert_bytes).expect("valid certificate");
             let http_client = reqwest::Client::builder()
                 .use_rustls_tls()
-                .tls_built_in_root_certs(false)
-                .add_root_certificate(root_cert_reqwest)
+                .tls_certs_only([root_cert_reqwest])
                 .build()?;
 
             // Wait for the servers to start
