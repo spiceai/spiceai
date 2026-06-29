@@ -10152,6 +10152,49 @@ impl CayenneTableProvider {
         super::fadvise_tier::evict_files(paths).await;
     }
 
+    /// Best-effort page-cache hygiene for compaction INPUTS after the merge has
+    /// consumed them and the swap has retired them. The merge streams `O(table)`
+    /// of input `.vortex` bytes through the page cache (the same buffered read
+    /// path as queries); once the merged output is published those inputs are
+    /// superseded, so dropping their now-cold pages reclaims the cache for live
+    /// queries instead of leaving it pinned until the deferred retire-sweep
+    /// physically deletes the dirs.
+    ///
+    /// Inputs are read-only (a merge never writes them) so every page is already
+    /// clean — a bare `POSIX_FADV_DONTNEED` drops them, with no `sync_file_range`
+    /// writeback needed (unlike the dirty-output [`Self::evict_compaction_output_pages`]).
+    ///
+    /// Trade-off vs the output counterpart: an output is private until published,
+    /// but an input was query-visible until the swap, so a scan that started
+    /// BEFORE the swap may still be reading one and would re-fault the dropped
+    /// pages. Callers therefore invoke this only AFTER the listing-fence swap +
+    /// retire (new scans already see the merged output), bounding the cost to
+    /// rare in-flight readers of about-to-be-deleted files — the `RocksDB`
+    /// posture. Linux + local only; never fails.
+    async fn evict_compaction_input_pages(&self, input_snapshot_ids: &[String]) {
+        let mut paths: Vec<std::path::PathBuf> = Vec::new();
+        for snapshot_id in input_snapshot_ids {
+            match self.list_snapshot_files_with_sizes_local(snapshot_id).await {
+                Ok(files) => {
+                    let snapshot_dir = self.snapshot_dir_path_for(snapshot_id);
+                    paths.extend(files.into_iter().map(|(name, _size)| snapshot_dir.join(name)));
+                }
+                Err(error) => {
+                    tracing::debug!(
+                        target: "cayenne::compaction",
+                        snapshot_id = snapshot_id.as_str(),
+                        %error,
+                        "skipping compaction input page-cache evict: could not list input files"
+                    );
+                }
+            }
+        }
+        if paths.is_empty() {
+            return;
+        }
+        super::fadvise_tier::evict_clean_files(paths).await;
+    }
+
     async fn list_snapshot_files_with_sizes_s3(
         &self,
         snapshot_id: &str,
@@ -11640,6 +11683,15 @@ impl CayenneTableProvider {
         self.retire_snapshot_dirs(old_ids.iter().map(String::as_str));
         self.sweep_retired_snapshot_dirs();
 
+        // Page-cache hygiene for the merged-away INPUTS (Tier 1): the merge just
+        // streamed them through the cache; now that the swap has superseded them
+        // and they are retired, drop their clean pages so live queries — not dead
+        // inputs awaiting the deferred sweep — own the cache. After the swap, so
+        // new scans already see the merged output. Linux + local; best-effort.
+        if !is_s3 {
+            self.evict_compaction_input_pages(&old_ids).await;
+        }
+
         tracing::info!(
             target: "cayenne::compaction",
             table = self.table_metadata.table_name.as_str(),
@@ -12159,6 +12211,13 @@ impl CayenneTableProvider {
         // aged-out retirements — identical to the size-tier path.
         self.retire_snapshot_dirs(old_ids.iter().map(String::as_str));
         self.sweep_retired_snapshot_dirs();
+
+        // Page-cache hygiene for the merged-away INPUTS (Tier 1) — see the
+        // size-tier path. After the swap + retire so new scans see the merged
+        // output; drops the inputs' clean pages the bake just read. Best-effort.
+        if !is_s3 {
+            self.evict_compaction_input_pages(&old_ids).await;
+        }
 
         Ok(true)
     }
