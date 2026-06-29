@@ -9456,7 +9456,7 @@ impl CayenneTableProvider {
 
     fn new_current_files_above_compaction_threshold(&self) -> bool {
         let cfg = self.context.compaction_picker_config();
-        return self.new_files_since_last_compaction.load(Ordering::Relaxed) > cfg.trigger_files;
+        self.new_files_since_last_compaction.load(Ordering::Relaxed) > cfg.trigger_files
     }
 
     /// Compact current snapshot files into a new snapshot dir, with atomic,
@@ -9494,20 +9494,18 @@ impl CayenneTableProvider {
         // simply skips this pass (its protected-snapshot path still compacts).
         let (_position_write_guard, _position_visibility_guard) = if self.should_capture_positions()
         {
-            match self.write_lock_arc().try_lock_owned() {
-                Ok(guard) => (
-                    Some(guard),
-                    Some(self.visibility_lock_arc().lock_owned().await),
-                ),
-                Err(_) => {
-                    tracing::trace!(
-                        target: "cayenne::compaction",
-                        table = self.table_metadata.table_name.as_str(),
-                        "Skipping current-snapshot small-file compaction: writer active on position-delete table",
-                    );
-                    return Ok(false);
-                }
-            }
+            let Ok(guard) = self.write_lock_arc().try_lock_owned() else {
+                tracing::trace!(
+                    target: "cayenne::compaction",
+                    table = self.table_metadata.table_name.as_str(),
+                    "Skipping current-snapshot small-file compaction: writer active on position-delete table",
+                );
+                return Ok(false);
+            };
+            (
+                Some(guard),
+                Some(self.visibility_lock_arc().lock_owned().await),
+            )
         } else {
             (None, None)
         };
