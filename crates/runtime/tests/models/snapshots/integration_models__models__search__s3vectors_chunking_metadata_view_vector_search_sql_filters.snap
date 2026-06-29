@@ -16,11 +16,6 @@ expression: resp?
   {
     "id": 1035,
     "answer": "The primary effect of α₁-adrenergic blockers is to decrease systemic vascular resistance (SVR) by causing vasodilation.",
-    "_score": 0.3
-  },
-  {
-    "id": 1035,
-    "answer": "The primary effect of α₁-adrenergic blockers is to decrease systemic vascular resistance (SVR) by causing vasodilation.",
     "_score": 0.29
   },
   {
