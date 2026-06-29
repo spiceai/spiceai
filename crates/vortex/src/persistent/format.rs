@@ -1003,6 +1003,79 @@ mod tests {
         Ok(())
     }
 
+    /// Verifies the Vortex -> DataFusion statistics boundary: a written Vortex
+    /// file surfaces per-column byte sizes (from the footer's
+    /// `UncompressedSizeInBytes`) into `ColumnStatistics.byte_size` — including
+    /// for variable-width (`Utf8`) columns — and `total_byte_size` is their sum.
+    #[tokio::test]
+    async fn propagates_per_column_byte_size() -> anyhow::Result<()> {
+        use datafusion_catalog::TableProvider;
+
+        let ctx = TestSessionContext::default();
+
+        // Mixed schema: a fixed-width Int and a variable-width Utf8 column.
+        ctx.session
+            .sql(
+                "CREATE EXTERNAL TABLE t (id INT NOT NULL, s VARCHAR NOT NULL) \
+                 STORED AS vortex LOCATION 'table/'",
+            )
+            .await?
+            .collect()
+            .await?;
+
+        // Write a known number of rows through the real Vortex writer.
+        let n = 8usize;
+        ctx.session
+            .sql(
+                "INSERT INTO t VALUES \
+                 (1,'aa'),(2,'bb'),(3,'cc'),(4,'dd'),(5,'ee'),(6,'ff'),(7,'gg'),(8,'hh')",
+            )
+            .await?
+            .collect()
+            .await?;
+
+        // Read the scan statistics the way the optimizer does (all columns).
+        let provider = ctx.session.table_provider("t").await?;
+        let state = ctx.session.state();
+        let scan = provider.scan(&state, None, &[], None).await?;
+        let stats = scan.partition_statistics(None)?;
+
+        assert_eq!(stats.num_rows.get_value(), Some(&n), "row count");
+
+        let id_bytes = stats.column_statistics[0].byte_size;
+        let s_bytes = stats.column_statistics[1].byte_size;
+
+        // Both columns — including the Utf8 one — must carry a per-column size.
+        assert!(
+            id_bytes.get_value().is_some(),
+            "Int column byte_size must be populated, got {id_bytes:?}"
+        );
+        assert!(
+            s_bytes.get_value().is_some(),
+            "Utf8 column byte_size must be populated, got {s_bytes:?}"
+        );
+
+        // The fixed-width column's uncompressed size is at least 4 bytes/value.
+        assert!(
+            *id_bytes.get_value().unwrap() >= 4 * n,
+            "Int32 byte_size should be >= 4*rows, got {id_bytes:?}"
+        );
+
+        // total_byte_size is the sum of the per-column byte sizes.
+        let sum: usize = stats
+            .column_statistics
+            .iter()
+            .map(|c| *c.byte_size.get_value().expect("every column has byte_size"))
+            .sum();
+        assert_eq!(
+            stats.total_byte_size.get_value(),
+            Some(&sum),
+            "total_byte_size must equal the sum of per-column byte_size"
+        );
+
+        Ok(())
+    }
+
     #[test]
     fn format_plumbs_footer_initial_read_size() {
         let mut opts = VortexTableOptions::default();
