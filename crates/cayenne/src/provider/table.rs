@@ -11043,7 +11043,7 @@ impl CayenneTableProvider {
         // briefly blocks scans/appends, but the expensive work (scan + encode)
         // already completed off-fence.
         {
-            let _fence = self.listing_fence.write().await;
+            let listing_guard = self.listing_fence.write().await;
             let generation_now = self.current_dir_generation.load(Ordering::Relaxed);
             if generation_now != generation_before {
                 // No catalog/in-memory mutation happened; discard the rewritten
@@ -11057,56 +11057,57 @@ impl CayenneTableProvider {
                     "Aborting current-snapshot compaction: a concurrent append \
                      landed during the re-encode; discarding output and retrying"
                 );
-                drop(_fence);
+                drop(listing_guard);
                 self.cleanup_failed_compaction_snapshot(&new_snapshot_id, is_s3)
                     .await;
                 return Ok(false);
-            } else if let Err(e) = self
+            }
+            if let Err(e) = self
                 .commit_snapshot_rewrite(&new_snapshot_id, fence.as_ref())
                 .await
             {
-                drop(_fence);
+                drop(listing_guard);
                 self.cleanup_failed_compaction_snapshot(&new_snapshot_id, is_s3)
                     .await;
                 return Err(Error::Catalog { source: e });
-            } else {
-                self.listing_table.store(new_listing_table);
-                self.update_current_snapshot_id(&new_snapshot_id);
-                match &fence {
-                    // Position-delete tables held `write_lock` across the whole
-                    // rewrite, so no mutation interleaved and clearing everything
-                    // is exactly correct.
-                    None => self.clear_all_deletion_caches(),
-                    // Key-delete tables ran the encode concurrently with writers.
-                    // Drop only what the rewrite materialized (`seq <= cutoff` +
-                    // the folded protected snapshots); deletes/upserts that raced
-                    // the rewrite (`seq > cutoff`, or a protected snapshot created
-                    // during the window) are preserved.
-                    Some((cutoff, folded)) => {
-                        self.prune_deletion_caches_after_full_rewrite(*cutoff, folded);
-                    }
-                }
-
-                // [sound output_ordering attestation] When sort columns are
-                // configured this rewrite consolidated the entire snapshot into a
-                // single globally-sorted, non-overlapping run (the stream was
-                // sorted via `sort_stream` above and written by a single writer —
-                // see `snapshot_shard_count`). Attest THIS snapshot id as sorted so
-                // a subsequent `scan` may advertise `output_ordering` by the sort
-                // columns. MUST run AFTER `update_current_snapshot_id` (which
-                // clears the attestation) and under the held listing fence.
-                if self.context.has_sort_columns() {
-                    self.current_sorted_snapshot
-                        .store(Arc::new(Some(new_snapshot_id.clone())));
-                }
-
-                // Persist accumulated stats from the rewrite — keeps DataFusion's
-                // synchronous statistics path consistent with the new snapshot.
-                // The rewrite materializes exactly the live rows, so its min/max +
-                // NDV + count are authoritative: replace the aggregate, correcting
-                // any drift the incremental merges/deltas accumulated.
-                self.replace_table_stats_after_rewrite(&stats_acc).await;
             }
+
+            self.listing_table.store(new_listing_table);
+            self.update_current_snapshot_id(&new_snapshot_id);
+            match &fence {
+                // Position-delete tables held `write_lock` across the whole
+                // rewrite, so no mutation interleaved and clearing everything
+                // is exactly correct.
+                None => self.clear_all_deletion_caches(),
+                // Key-delete tables ran the encode concurrently with writers.
+                // Drop only what the rewrite materialized (`seq <= cutoff` +
+                // the folded protected snapshots); deletes/upserts that raced
+                // the rewrite (`seq > cutoff`, or a protected snapshot created
+                // during the window) are preserved.
+                Some((cutoff, folded)) => {
+                    self.prune_deletion_caches_after_full_rewrite(*cutoff, folded);
+                }
+            }
+
+            // [sound output_ordering attestation] When sort columns are
+            // configured this rewrite consolidated the entire snapshot into a
+            // single globally-sorted, non-overlapping run (the stream was
+            // sorted via `sort_stream` above and written by a single writer —
+            // see `snapshot_shard_count`). Attest THIS snapshot id as sorted so
+            // a subsequent `scan` may advertise `output_ordering` by the sort
+            // columns. MUST run AFTER `update_current_snapshot_id` (which
+            // clears the attestation) and under the held listing fence.
+            if self.context.has_sort_columns() {
+                self.current_sorted_snapshot
+                    .store(Arc::new(Some(new_snapshot_id.clone())));
+            }
+
+            // Persist accumulated stats from the rewrite — keeps DataFusion's
+            // synchronous statistics path consistent with the new snapshot.
+            // The rewrite materializes exactly the live rows, so its min/max +
+            // NDV + count are authoritative: replace the aggregate, correcting
+            // any drift the incremental merges/deltas accumulated.
+            self.replace_table_stats_after_rewrite(&stats_acc).await;
         };
 
         // Commit succeeded: `new_snapshot_id` is now current, so the old
