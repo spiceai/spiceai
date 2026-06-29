@@ -388,6 +388,78 @@ const SMALL_WRITE_INLINE_MAX_BUFFER_BYTES: usize =
     cayenne::metadata::DEFAULT_INLINE_MAX_BUFFER_BYTES;
 const APPEND_SMALL_WRITE_REFRESH_INTERVAL_THRESHOLD: Duration = Duration::from_mins(5);
 
+/// Map the runtime's detected acceleration storage class onto the Cayenne-local
+/// [`cayenne::metadata::StorageClass`] (the crates can't share the enum — `runtime`
+/// depends on `cayenne`). The continuous slow-tier bias is refined further by the
+/// measured throughput threaded alongside it.
+fn to_cayenne_storage_class(
+    storage: crate::dataaccelerator::storage::ResolvedAccelerationStorage,
+) -> cayenne::metadata::StorageClass {
+    use crate::dataaccelerator::storage::ResolvedAccelerationStorage as Resolved;
+    use cayenne::metadata::StorageClass as Class;
+    match storage {
+        Resolved::LocalSsd => Class::LocalSsd,
+        Resolved::Ebs => Class::Ebs,
+        Resolved::Tmpfs => Class::Tmpfs,
+        Resolved::Unknown => Class::Unknown,
+    }
+}
+
+/// Warn (once per canonicalized path) when the filesystem backing `path` is low on
+/// free space.
+/// Under memory pressure the in-memory CDC tier spills to this volume; if it fills,
+/// ingestion fails — so surface it at startup rather than discovering it on a crash.
+async fn warn_if_low_disk(label: &str, path: &str) {
+    // `disk_space_bytes` canonicalizes + enumerates every mount (blocking OS I/O);
+    // run it off the Tokio runtime so it can't stall a worker during concurrent
+    // table registration.
+    let label = label.to_string();
+    let path = path.to_string();
+    let _ = tokio::task::spawn_blocking(move || warn_if_low_disk_blocking(&label, &path)).await;
+}
+
+fn warn_if_low_disk_blocking(label: &str, path: &str) {
+    use std::sync::{LazyLock, Mutex};
+    /// Below this fraction free OR this many absolute bytes free ⇒ warn.
+    const LOW_DISK_FRACTION_DENOM: u64 = 10; // < 10% free
+    const LOW_DISK_FLOOR_BYTES: u64 = 2 * 1024 * 1024 * 1024; // < 2 GiB free
+    static CHECKED: LazyLock<Mutex<std::collections::HashSet<std::path::PathBuf>>> =
+        LazyLock::new(|| Mutex::new(std::collections::HashSet::new()));
+
+    // Check each distinct canonicalized path once per process, BEFORE probing free
+    // space (`disk_space_bytes` re-enumerates every mount). Canonicalizing collapses
+    // equivalent paths (trailing slash, symlinks); distinct dirs on the same mount
+    // each warn once — keyed by path, not mount point.
+    let key = std::path::Path::new(path)
+        .canonicalize()
+        .unwrap_or_else(|_| std::path::PathBuf::from(path));
+    if !CHECKED
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(key)
+    {
+        return;
+    }
+    let Some((available, total)) = crate::dataaccelerator::storage::disk_space_bytes(path) else {
+        return;
+    };
+    if total == 0
+        || (available >= total / LOW_DISK_FRACTION_DENOM && available >= LOW_DISK_FLOOR_BYTES)
+    {
+        return;
+    }
+    tracing::warn!(
+        label,
+        path,
+        available_mib = available / (1024 * 1024),
+        total_mib = total / (1024 * 1024),
+        // saturating_mul so `available * 100` can't overflow u64 on a very large
+        // volume; a purely-informational percentage in a low-disk warning.
+        percent_free = available.saturating_mul(100) / total,
+        "Cayenne {label} volume is low on free space. Under memory pressure the in-memory CDC tier spills here; if it fills, ingestion fails. Free space or point the acceleration at a larger volume."
+    );
+}
+
 fn apply_refresh_mode_defaults(
     config: &mut cayenne::metadata::VortexConfig,
     acceleration: &Acceleration,
@@ -762,6 +834,38 @@ impl CayenneAccelerator {
                 fs_probe_path(&metadata_dir),
             )
             .await;
+
+            // Thread the detected storage medium + measured throughput onto the
+            // Cayenne config so the closed-loop tuner reasons over them. Previously
+            // these were left at the `StorageClass::Unknown` default (never wired
+            // from `hw`), so the loop applied the EBS slow-tier bias even on local
+            // NVMe; mapping the real class fixes that, and the measured throughput
+            // refines the class into a *continuous* bias (see `tuning::tier_scale`).
+            config.data_storage_class = to_cayenne_storage_class(hw.data_storage);
+            config.metastore_storage_class = to_cayenne_storage_class(hw.metastore_storage);
+            config.data_storage_write_mbps = hw.data_perf.write_mbps;
+            config.metastore_storage_write_mbps = hw.metastore_perf.write_mbps;
+
+            // Bound the process-global encode budget by the instance EBS write
+            // bandwidth: a single EBS volume is a shared, bandwidth-bounded pipe, so
+            // many parallel uploads to it just fan out small files without adding
+            // throughput (the regression that made a lag-violated EBS table keep
+            // ADDING write shards). Only ever lowers the budget; local NVMe /
+            // instance store propose no cap.
+            if let Some(cap) = hw.ebs_upload_concurrency_cap() {
+                cayenne::cap_global_encode_concurrency(cap);
+            }
+            // T-family burstable CPU (IMDS): the tuner withholds CPU-stealing moves
+            // at a lower busy-fraction, since CPU credits deplete under sustained
+            // load and throttle the vCPUs to a low baseline.
+            cayenne::set_cpu_burstable(hw.burstable);
+
+            // Low-disk startup warning: a full data/spill volume turns a
+            // memory-pressure spill into a crash. Best-effort, once per path.
+            if let Some(dir) = data_dir.as_deref() {
+                warn_if_low_disk("data", fs_probe_path(dir)).await;
+            }
+            warn_if_low_disk("metastore", fs_probe_path(&metadata_dir)).await;
 
             // Storage-aware target Vortex file size on local disk (the `auto`
             // baseline): smaller files reduce write amplification on EBS-class

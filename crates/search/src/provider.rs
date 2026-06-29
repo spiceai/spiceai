@@ -396,15 +396,19 @@ impl SearchQueryProvider {
                 .map(Expr::Column)
                 .collect(),
             vec![
+                // Stored offsets are 0-based character offsets; DataFusion
+                // `substring` is 1-based and character-counted, so the start
+                // position is `chunk_offset[1] + 1` and the length is
+                // `chunk_offset[2] - chunk_offset[1]`. See issue #11269.
                 // cast(
                 //   substring(
-                //      search_column, chunk_offset[1], chunk_offset[2] - chunk_offset[1]),
+                //      search_column, chunk_offset[1] + 1, chunk_offset[2] - chunk_offset[1]),
                 //   ),
                 //  'Utf8') as '_match'
                 cast(
                     substring(
                         col(search_col),
-                        array_element(col(search_offset), lit(1)),
+                        binary_expr(first.clone(), Operator::Plus, lit(1)),
                         binary_expr(second, Operator::Minus, first),
                     ),
                     DataType::Utf8,

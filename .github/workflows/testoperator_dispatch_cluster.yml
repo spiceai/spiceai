@@ -63,7 +63,7 @@ jobs:
       image_tag: ${{ steps.resolve.outputs.image_tag }}
       need_build: ${{ steps.resolve.outputs.need_build }}
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           ref: ${{ github.event.inputs.spiced_ref || 'trunk' }}
           fetch-depth: 1
@@ -131,7 +131,7 @@ jobs:
       (needs.build-image.result == 'success' || needs.build-image.result == 'skipped')
     runs-on: spiceai-dev-runners
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
       - name: Verify dispatch directory
         env:

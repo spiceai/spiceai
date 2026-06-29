@@ -52,11 +52,28 @@ limitations under the License.
 use data_components::inferred_schema::InferredSchema;
 
 use crate::component::dataset::acceleration::{Acceleration, StorageProfile};
+use crate::dataaccelerator::imds;
 use crate::dataaccelerator::storage::{
-    ResolvedAccelerationStorage, resolve_acceleration_storage_async,
+    ResolvedAccelerationStorage, StoragePerf, probe_storage_perf_async,
+    resolve_acceleration_storage_async,
 };
 
 const MIB: u64 = 1024 * 1024;
+
+/// Floor-convert a non-negative `f64` to `usize`, mapping non-finite/negative to 0.
+/// For the bandwidth→stream-count derivation (small, already-rounded values).
+#[expect(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "guarded: only finite, positive, small (≤ a few thousand) values reach the cast"
+)]
+fn f64_to_usize_floor(v: f64) -> usize {
+    if v.is_finite() && v > 0.0 {
+        v as usize
+    } else {
+        0
+    }
+}
 
 /// Inline-memtable flush floor in bytes (2 MiB). A host at or under the scaling
 /// threshold keeps this historical small-write cap. Coupled to
@@ -120,7 +137,11 @@ impl MemTierCaps {
 /// limits, and `std::thread::available_parallelism` honors CPU quotas on Linux.
 /// Construct via [`HardwareProfile::detect`] in production or
 /// [`HardwareProfile::new`] in tests.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// Not `Eq` (it carries measured `f64` throughput/latency from the calibration
+/// probe). [`HardwareProfile::new`] keeps its four-signal signature and defaults
+/// the measured fields to "unmeasured"; [`HardwareProfile::detect`] fills them.
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) struct HardwareProfile {
     /// Logical cores available to the process (the encode-shard / write
     /// concurrency ceiling).
@@ -132,11 +153,27 @@ pub(crate) struct HardwareProfile {
     /// Storage medium backing the *metastore* (where inline-memtable BLOBs live
     /// and the per-scan re-read cost is paid).
     pub metastore_storage: ResolvedAccelerationStorage,
+    /// Measured write performance of the data volume (calibration probe). Drives
+    /// the closed loop's *continuous* slow-tier bias — a 4 GiB/s io2 volume and a
+    /// 125 MiB/s gp3 volume both classify as `Ebs` but should not get the same
+    /// amortization pressure. `StoragePerf::default()` (all `None`) when unprobed.
+    pub data_perf: StoragePerf,
+    /// Measured write performance of the metastore volume (drives the publish bias).
+    pub metastore_perf: StoragePerf,
+    /// T-family burstable CPU instance (from IMDS): CPU credits deplete under
+    /// sustained load. The tuner withholds CPU-stealing moves sooner here.
+    pub burstable: bool,
+    /// EBS-optimized baseline bandwidth in MiB/s (from IMDS) for a burst-prone
+    /// instance; bounds aggregate upload concurrency. `None` off-AWS or for sizes
+    /// that run at/above baseline continuously.
+    pub ebs_baseline_mbps: Option<f64>,
 }
 
 impl HardwareProfile {
-    /// Construct from explicit signals. Used by tests and by callers that have
-    /// already resolved the storage classes.
+    /// Construct from the four core host signals; measured/instance fields default
+    /// to "unmeasured". Used by tests and by callers that have already resolved
+    /// the storage classes. [`Self::detect`] additionally runs the calibration
+    /// probe and the IMDS instance probe.
     #[must_use]
     pub fn new(
         cores: usize,
@@ -149,6 +186,10 @@ impl HardwareProfile {
             total_mem_bytes,
             data_storage,
             metastore_storage,
+            data_perf: StoragePerf::default(),
+            metastore_perf: StoragePerf::default(),
+            burstable: false,
+            ebs_baseline_mbps: None,
         }
     }
 
@@ -166,10 +207,79 @@ impl HardwareProfile {
     ) -> Self {
         let cores = std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get);
         let total_mem_bytes = crate::resource_monitor::get_total_memory();
-        let data_storage = resolve_acceleration_storage_async(storage_profile, data_path).await;
-        let metastore_storage =
-            resolve_acceleration_storage_async(storage_profile, metastore_path).await;
-        Self::new(cores, total_mem_bytes, data_storage, metastore_storage)
+        // The two storage classifications, the two calibration probes (cloud-agnostic,
+        // memoized per volume — the only storage signal for a memory-tier table that
+        // never spills), and the best-effort EC2 instance probe are all independent
+        // I/O. Run them concurrently so cold startup is bounded by the slowest, not
+        // their sum: the two probes hit different volumes and IMDS is network, so
+        // (esp. on a slow EBS volume or off-AWS where IMDS eats its full timeout)
+        // this turns sum-of-latencies into max-of-latencies.
+        let (data_storage, metastore_storage, data_perf, metastore_perf, instance) = tokio::join!(
+            resolve_acceleration_storage_async(storage_profile, data_path),
+            resolve_acceleration_storage_async(storage_profile, metastore_path),
+            probe_storage_perf_async(data_path),
+            probe_storage_perf_async(metastore_path),
+            imds::detect_instance_profile(),
+        );
+
+        let mut profile = Self::new(cores, total_mem_bytes, data_storage, metastore_storage);
+        profile.data_perf = data_perf;
+        profile.metastore_perf = metastore_perf;
+        if let Some(instance) = instance {
+            profile.burstable = instance.burstable;
+            profile.ebs_baseline_mbps = instance.ebs_baseline_mbps;
+        }
+        profile
+    }
+
+    /// Aggregate upload-concurrency cap (number of parallel encode/upload streams)
+    /// implied by the instance's EBS write bandwidth, or `None` to leave the
+    /// core-derived budget unchanged.
+    ///
+    /// Only constrains confirmed network/EBS-class media: a single EBS volume is a
+    /// shared, bandwidth-bounded pipe, so many parallel uploads to it don't add
+    /// throughput — they just fan out small files (the regression that made a
+    /// lag-violated EBS table keep ADDING write shards). Local `NVMe` / instance
+    /// store parallelize well and are left uncapped. The ceiling is the
+    /// authoritative IMDS baseline when known, else the calibration probe's
+    /// measured single-stream throughput; divided by a per-stream estimate and
+    /// floored so meaningful parallelism is always retained. The caller mins this
+    /// with the core budget, so it only ever *reduces* concurrency.
+    #[must_use]
+    pub fn ebs_upload_concurrency_cap(&self) -> Option<usize> {
+        // Effective per-multipart-upload-stream throughput to a single EBS volume,
+        // used as the divisor that turns a bandwidth ceiling into a stream count.
+        // When the probe measured the volume, that single-stream rate IS the
+        // per-stream estimate (so a probe-only ceiling/per-stream ≈ 1 → the
+        // MIN_STREAMS floor, the conservative "one stream saturates this volume"
+        // outcome). The 90 MiB/s fallback (≈ a gp3-class single-stream rate) and the
+        // [64, 512] clamp only bite when an authoritative IMDS baseline is present
+        // but the probe is absent; they bound the IMDS-derived stream count to a
+        // sane range. A coarse divisor for a cap that only ever *lowers* concurrency.
+        const PER_STREAM_FALLBACK_MBPS: f64 = 90.0;
+        const MIN_STREAMS: usize = 4;
+        // The IMDS baseline is a fail-safe ONLY for unclassified storage: a
+        // confirmed local NVMe/instance-store (or tmpfs) parallelizes well and is
+        // never capped, even on an EBS-optimized instance (i*/d* families) whose
+        // baseline is known but whose data lives on the local volume.
+        let is_ebs = matches!(self.data_storage, ResolvedAccelerationStorage::Ebs)
+            || (matches!(self.data_storage, ResolvedAccelerationStorage::Unknown)
+                && self.ebs_baseline_mbps.is_some());
+        if !is_ebs {
+            return None;
+        }
+        let ceiling_mbps = self
+            .ebs_baseline_mbps
+            .or(self.data_perf.write_mbps)
+            .filter(|m| *m > 0.0)?;
+        let per_stream = self
+            .data_perf
+            .write_mbps
+            .unwrap_or(PER_STREAM_FALLBACK_MBPS)
+            .clamp(64.0, 512.0);
+        // Floor (not round): a cap must never round UP past the bandwidth ceiling.
+        let streams = f64_to_usize_floor(ceiling_mbps / per_stream);
+        Some(streams.max(MIN_STREAMS))
     }
 
     /// Byte budget (in MB) for the in-memory primary-key keyset used to detect
@@ -735,6 +845,44 @@ mod tests {
         assert_eq!(p(ResolvedAccelerationStorage::Tmpfs), Some(64));
         assert_eq!(p(ResolvedAccelerationStorage::LocalSsd), None);
         assert_eq!(p(ResolvedAccelerationStorage::Unknown), None);
+    }
+
+    #[test]
+    fn ebs_upload_concurrency_cap_only_binds_on_ebs() {
+        // Local SSD parallelizes well → never capped, even with a measurement.
+        let mut hw = profile(16, 64 * GIB, ResolvedAccelerationStorage::LocalSsd);
+        hw.data_perf.write_mbps = Some(125.0);
+        assert_eq!(hw.ebs_upload_concurrency_cap(), None);
+
+        // A measured-slow EBS volume: one stream saturates it → cap to the floor (4).
+        let mut hw = profile(16, 64 * GIB, ResolvedAccelerationStorage::Ebs);
+        hw.data_perf.write_mbps = Some(125.0);
+        assert_eq!(hw.ebs_upload_concurrency_cap(), Some(4));
+
+        // An IMDS EBS baseline (burst-prone small instance) sets the ceiling even
+        // without a probe measurement: 625 MiB/s / 90 (fallback per-stream) = 6.9,
+        // floored to 6 (a cap must never round UP past the bandwidth ceiling — 7
+        // streams would demand 630 MiB/s > 625).
+        let mut hw = profile(16, 64 * GIB, ResolvedAccelerationStorage::Unknown);
+        hw.ebs_baseline_mbps = Some(625.0);
+        assert_eq!(hw.ebs_upload_concurrency_cap(), Some(6));
+
+        // Regression: a CONFIRMED local NVMe/instance-store volume stays UNCAPPED
+        // even on an EBS-optimized instance whose IMDS baseline is known — the
+        // baseline fail-safe only binds unclassified (Unknown) media, never a fast
+        // local disk. Tmpfs (RAM-backed) likewise ignores the baseline.
+        for fast in [
+            ResolvedAccelerationStorage::LocalSsd,
+            ResolvedAccelerationStorage::Tmpfs,
+        ] {
+            let mut hw = profile(16, 64 * GIB, fast);
+            hw.ebs_baseline_mbps = Some(625.0);
+            assert_eq!(
+                hw.ebs_upload_concurrency_cap(),
+                None,
+                "{fast:?} parallelizes well → never capped by an IMDS baseline"
+            );
+        }
     }
 
     // ---- inline_flush_caps (relocated from mod.rs) ------------------------
