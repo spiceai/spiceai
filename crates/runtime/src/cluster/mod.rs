@@ -2039,12 +2039,8 @@ async fn create_scheduler_server(
         on_work_available: Some(on_work_available),
         on_cancel_tasks: Some(on_cancel_tasks),
 
-        // Mark an executor dead after 120s without a heartbeat (heartbeats are sent
-        // every 10s, i.e. 12 missed beats). A heavy distributed query can keep an
-        // executor busy enough that its heartbeats lapse for tens of seconds, so the
-        // tolerance keeps a live, busy executor registered while still detecting a
-        // genuinely dead one promptly relative to minutes-long distributed queries.
-        executor_timeout_seconds: 120,
+        // Mark an executor dead after 30s without a heartbeat (heartbeats every 10s).
+        executor_timeout_seconds: 30,
 
         // The Spice executor uses pull-based polling (execution_loop::poll_loop),
         // so the scheduler must use PullStaged to register executors via PollWork RPCs.
