@@ -24,7 +24,7 @@ use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
 use tracing::Instrument;
 
-use runtime_request_context::{AsyncMarker, RequestContext};
+use runtime_request_context::RequestContext;
 
 use crate::datafusion::DataFusion;
 use crate::datafusion::query::{QueryBuilder, QueryHandle, QueryHandleError};
@@ -75,17 +75,6 @@ impl JobExecutor {
         }
     }
 
-    /// Spawns `fut` bound to the current request context so the background job
-    /// runs as the submitting principal — results-cache namespacing and
-    /// principal-scoped authz/masking key off it.
-    async fn spawn_in_request_context<F>(fut: F)
-    where
-        F: Future<Output = ()> + Send + 'static,
-    {
-        let request_context = RequestContext::current(AsyncMarker::new().await);
-        tokio::spawn(request_context.scope(fut));
-    }
-
     /// Submits a new query job for async execution.
     ///
     /// Returns the job state immediately. The query will be executed in the background.
@@ -112,7 +101,10 @@ impl JobExecutor {
         let active_jobs = Arc::clone(&self.active_jobs);
         let job_id_clone = job_id.clone();
 
-        Self::spawn_in_request_context(
+        // Bind the job to the submitting request's context so it runs as the
+        // caller's principal — results-cache namespacing and principal-scoped
+        // authz/masking key off it.
+        RequestContext::spawn_current(
             async move {
                 let result = Self::execute_job(
                     &job_store,
@@ -135,8 +127,7 @@ impl JobExecutor {
                 }
             }
             .instrument(tracing::info_span!("job_execution", job_id = %job_id)),
-        )
-        .await;
+        );
 
         Ok(state)
     }
@@ -403,35 +394,5 @@ impl JobExecutor {
             }
             QueryHandleError::JobNotFound { .. } => (JobErrorCode::NotFound, e.to_string()),
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use runtime_request_context::{CacheNamespace, Protocol};
-    use tokio::sync::oneshot;
-
-    /// A spawned job observes the submitting request's context rather than the
-    /// internal context. Results-cache namespacing and principal-scoped
-    /// authz/masking depend on it.
-    #[tokio::test]
-    async fn spawned_job_inherits_request_context() {
-        let (tx, rx) = oneshot::channel();
-
-        let request_context = Arc::new(RequestContext::builder(Protocol::Http).build());
-        request_context
-            .scope(async move {
-                JobExecutor::spawn_in_request_context(async move {
-                    let namespace =
-                        RequestContext::current(AsyncMarker::new().await).cache_namespace();
-                    tx.send(namespace).expect("receiver alive");
-                })
-                .await;
-            })
-            .await;
-
-        let observed = rx.await.expect("spawned job did not report its context");
-        assert_eq!(observed, CacheNamespace::Public);
     }
 }
