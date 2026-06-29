@@ -118,9 +118,9 @@ pub use staging_wal::{CayenneStagedAppend, PreparedStagedAppend};
 pub use table::{CayenneCdcWrite, CayenneTableProvider, CayenneTableProviderBuilder};
 pub use tuning::{
     QueryObservations, deregister_query_observations, record_query_latency,
-    register_query_observations, set_global_memory_budget,
+    register_query_observations, set_cpu_burstable, set_global_memory_budget,
 };
-pub use write_budget::set_global_encode_concurrency;
+pub use write_budget::{cap_global_encode_concurrency, set_global_encode_concurrency};
 
 // Re-export deletion utilities for advanced use cases
 pub use delete::CayenneDeletionSink;

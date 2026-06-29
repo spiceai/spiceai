@@ -241,6 +241,14 @@ macro_rules! handle_error {
     }};
 }
 
+/// How a distributed query is started: planned and submitted fresh, or recovered
+/// and resumed from an existing job whose owning scheduler was lost.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DistributedSubmitMode {
+    New,
+    Resume,
+}
+
 impl Query {
     fn ensure_not_cancelled(
         token: &tokio_util::sync::CancellationToken,
@@ -515,7 +523,12 @@ impl Query {
         }
 
         let result = self
-            .submit_distributed_internal(job_id, request_context, span.clone())
+            .submit_distributed_internal(
+                job_id,
+                request_context,
+                span.clone(),
+                DistributedSubmitMode::New,
+            )
             .await;
         if let Err(e) = &result {
             tracing::error!(target: "task_history", parent: &span, "{e}");
@@ -523,12 +536,52 @@ impl Query {
         result
     }
 
-    /// Internal implementation for submitting a distributed query.
+    /// Resumes a distributed query whose owning scheduler was lost, driving the
+    /// recovered execution graph to completion on this scheduler and returning a
+    /// handle to its results. `job_id` must match the original submission.
+    pub async fn resume_distributed(self, job_id: &str) -> Result<QueryHandle> {
+        let request_context = RequestContext::current(AsyncMarker::new().await);
+
+        let span = tracing::span!(
+            target: "task_history",
+            tracing::Level::INFO,
+            "sql_query",
+            input = %self.sql,
+            runtime_query = false,
+            distributed = true,
+            job_id = %job_id,
+            ballista_job_id = tracing::field::Empty,
+            stage_count = tracing::field::Empty,
+            executor_count = tracing::field::Empty,
+            total_tasks = tracing::field::Empty,
+            total_executor_ms = tracing::field::Empty,
+        );
+
+        if let Some(traceparent) = request_context.trace_parent() {
+            crate::http::traceparent::override_task_history_with_trace_parent(&span, traceparent);
+        }
+
+        let result = self
+            .submit_distributed_internal(
+                job_id,
+                request_context,
+                span.clone(),
+                DistributedSubmitMode::Resume,
+            )
+            .await;
+        if let Err(e) = &result {
+            tracing::error!(target: "task_history", parent: &span, "{e}");
+        }
+        result
+    }
+
+    /// Internal implementation for submitting (or resuming) a distributed query.
     async fn submit_distributed_internal(
         self,
         job_id: &str,
         request_context: Arc<RequestContext>,
         span: Span,
+        mode: DistributedSubmitMode,
     ) -> Result<QueryHandle> {
         // Get the scheduler server
         let scheduler = Self::get_scheduler_server(&self.df)?;
@@ -563,43 +616,70 @@ impl Query {
                 pre_parsed_plan,
                 ..
             } => {
-                // Use the existing get_plan_or_cached which handles all cache
-                // control, stale-while-revalidate, and query tracking. The
-                // cache itself is namespaced per principal and refuses to
-                // store write-capable plans, so a read-only caller cannot
-                // observe a cached entry produced by a write-capable plan.
-                match Query::get_plan_or_cached(
-                    &self.df,
-                    &session,
-                    Arc::clone(&request_context),
-                    sql,
-                    parameters.clone(),
-                    tracker,
-                    pre_parsed_plan.clone(),
-                )
-                .await?
-                {
-                    cache::PlanOrCached::Cached(cached_result) => {
-                        tracing::debug!(job_id, "Returning cached result for distributed query");
-                        // Return a QueryHandle with cached results
-                        let schema = cached_result.data.schema();
-                        return Ok(QueryHandle::new_with_cached_result(
-                            job_id.to_string(),
-                            schema,
-                            Arc::clone(&self.df),
-                            None, // Cache key already used for lookup
-                            cached_result.data,
-                            Arc::clone(&request_context),
-                        ));
-                    }
-                    cache::PlanOrCached::Plan(plan, tracker, cache_manager) => {
-                        // Plan needs execution - cache_manager contains the raw cache key for storing results
-                        let cache_key = if cache_manager.should_cache_results() {
-                            Some(cache_manager.raw_cache_key)
-                        } else {
-                            None
-                        };
-                        (*plan, tracker, cache_key)
+                if mode == DistributedSubmitMode::Resume {
+                    // Recovery drives the already-persisted execution graph: it must
+                    // never short-circuit on a cached result (that would skip
+                    // recover_job and leave the running job orphaned) nor write a
+                    // fresh cache entry. Plan without consulting the result cache.
+                    let plan = if let Some(plan) = pre_parsed_plan.clone() {
+                        *plan
+                    } else {
+                        let cache_namespace = request_context.cache_namespace();
+                        let (ns_tag, ns_id) = cache_namespace.hash_inputs();
+                        let sql_raw_cache_key = CacheKey::Query(sql, parameters.as_ref())
+                            .as_raw_key_in_namespace(Self::plan_hasher(&self.df), ns_tag, ns_id);
+                        Query::get_plan(
+                            &self.df,
+                            &session,
+                            sql,
+                            &sql_raw_cache_key,
+                            parameters.clone(),
+                        )
+                        .await?
+                    };
+                    (plan, tracker, None)
+                } else {
+                    // Use the existing get_plan_or_cached which handles all cache
+                    // control, stale-while-revalidate, and query tracking. The
+                    // cache itself is namespaced per principal and refuses to
+                    // store write-capable plans, so a read-only caller cannot
+                    // observe a cached entry produced by a write-capable plan.
+                    match Query::get_plan_or_cached(
+                        &self.df,
+                        &session,
+                        Arc::clone(&request_context),
+                        sql,
+                        parameters.clone(),
+                        tracker,
+                        pre_parsed_plan.clone(),
+                    )
+                    .await?
+                    {
+                        cache::PlanOrCached::Cached(cached_result) => {
+                            tracing::debug!(
+                                job_id,
+                                "Returning cached result for distributed query"
+                            );
+                            // Return a QueryHandle with cached results
+                            let schema = cached_result.data.schema();
+                            return Ok(QueryHandle::new_with_cached_result(
+                                job_id.to_string(),
+                                schema,
+                                Arc::clone(&self.df),
+                                None, // Cache key already used for lookup
+                                cached_result.data,
+                                Arc::clone(&request_context),
+                            ));
+                        }
+                        cache::PlanOrCached::Plan(plan, tracker, cache_manager) => {
+                            // Plan needs execution - cache_manager contains the raw cache key for storing results
+                            let cache_key = if cache_manager.should_cache_results() {
+                                Some(cache_manager.raw_cache_key)
+                            } else {
+                                None
+                            };
+                            (*plan, tracker, cache_key)
+                        }
                     }
                 }
             }
@@ -615,8 +695,11 @@ impl Query {
                     ns_id,
                 );
 
-                // Check for cached results using the standard cache lookup
-                if let Some(cache_provider) = self.df.results_cache_provider()
+                // Check for cached results using the standard cache lookup.
+                // Resume drives the persisted graph, so skip the short-circuit
+                // entirely (returning a cached result would orphan the job).
+                if mode != DistributedSubmitMode::Resume
+                    && let Some(cache_provider) = self.df.results_cache_provider()
                     && let Ok(Some(cached_result)) =
                         cache_provider.get_raw_key(&plan_cache_key).await
                 {
@@ -645,7 +728,9 @@ impl Query {
                     }
                 }
 
-                (logical_plan.as_ref().clone(), tracker, Some(plan_cache_key))
+                // Don't cache results for a recovered job.
+                let cache_key = (mode != DistributedSubmitMode::Resume).then_some(plan_cache_key);
+                (logical_plan.as_ref().clone(), tracker, cache_key)
             }
         };
 
@@ -702,13 +787,25 @@ impl Query {
             t
         });
 
-        // Submit the job to the Ballista scheduler
-        let ballista_job_id = scheduler
-            .submit_job(job_id, session_ctx, &plan, None)
-            .await
-            .map_err(|e| Error::JobSubmissionFailed {
-                message: e.to_string(),
-            })?;
+        // Submit the job to the Ballista scheduler, or resume driving an
+        // existing one whose owning scheduler was lost. The job id is used as
+        // the Ballista job id so it can be addressed across schedulers.
+        let ballista_job_id = if mode == DistributedSubmitMode::Resume {
+            scheduler
+                .recover_job(job_id)
+                .await
+                .map_err(|e| Error::JobSubmissionFailed {
+                    message: e.to_string(),
+                })?;
+            job_id.to_string()
+        } else {
+            scheduler
+                .submit_job_with_id(job_id, job_id, session_ctx, &plan, None)
+                .await
+                .map_err(|e| Error::JobSubmissionFailed {
+                    message: e.to_string(),
+                })?
+        };
 
         tracing::debug!(
             job_id,

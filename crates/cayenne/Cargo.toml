@@ -272,6 +272,11 @@ required-features = ["duckdb-bench"]
 
 [[bench]]
 harness = false
+name = "vs_duckdb_maintained_filtered_groupby"
+required-features = ["duckdb-bench"]
+
+[[bench]]
+harness = false
 name = "vs_duckdb_join"
 required-features = ["duckdb-bench"]
 
@@ -360,6 +365,14 @@ required-features = ["chdb-bench", "duckdb-bench"]
 harness = false
 name = "vs_chdb_groupby"
 required-features = ["chdb-bench", "duckdb-bench"]
+
+# chDB-only (does NOT link DuckDB): the maintained filtered-aggregate comparison
+# must run chDB in a process without DuckDB, since both bundled engines abort if
+# linked + run together. Sibling of vs_duckdb_maintained_filtered_groupby.
+[[bench]]
+harness = false
+name = "vs_chdb_maintained_filtered_groupby"
+required-features = ["chdb-bench"]
 
 [[bench]]
 harness = false

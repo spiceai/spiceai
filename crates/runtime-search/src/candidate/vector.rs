@@ -489,9 +489,16 @@ impl ChunkedNonIndexVectorGeneration {
                         .map(|pk| Column::new(Some("rank"), pk).into())
                         .collect::<Vec<LogicalExpr>>(),
                     vec![
+                        // Stored offsets are 0-based character offsets; DataFusion
+                        // `substring` is 1-based and character-counted, so the start
+                        // position is `offset[1] + 1`. See issue #11269.
                         substring(
                             ident(self.embedding_column.clone()),
-                            array_element(col("rank.offset"), lit(1)),
+                            binary_expr(
+                                array_element(col("rank.offset"), lit(1)),
+                                Operator::Plus,
+                                lit(1),
+                            ),
                             binary_expr(
                                 array_element(col("rank.offset"), lit(2)),
                                 Operator::Minus,
