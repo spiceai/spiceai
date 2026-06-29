@@ -19,7 +19,7 @@
 #   SCALE_FACTOR (req), TERMINALS (opt), SPICEPOD_PATH (req), SPICED_BIN (req),
 #   CHBENCH_PG_HOST/PORT/USER/PASS (req), TESTOP_PREFIX (opt),
 #   REPO_ROOT (default: $GITHUB_WORKSPACE) for the chbench-driver fingerprint.
-set -uo pipefail
+set -euo pipefail
 SF="${SCALE_FACTOR:?}"; TMPL="chbench_tmpl_sf${SF}"
 PGH="${CHBENCH_PG_HOST:?}"; PGP="${CHBENCH_PG_PORT:-5432}"
 PGU="${CHBENCH_PG_USER:-bench}"; export PGPASSWORD="${CHBENCH_PG_PASS:-bench}"
@@ -68,7 +68,8 @@ else
   psql -h "$PGH" -p "$PGP" -U "$PGU" -d "$TMPL" -v ON_ERROR_STOP=1 -tAc "CHECKPOINT" >/dev/null 2>&1 || true
   psql_pg "ALTER DATABASE $TMPL WITH IS_TEMPLATE true ALLOW_CONNECTIONS false" >/dev/null
   psql_pg "COMMENT ON DATABASE $TMPL IS '$fp'" >/dev/null
-  echo "seeded + froze template $TMPL ($(psql_pg "SELECT pg_size_pretty(pg_database_size('$TMPL'))"))"
+  tmpl_size=$(psql_pg "SELECT pg_size_pretty(pg_database_size('$TMPL'))")
+  echo "seeded + froze template $TMPL ($tmpl_size)"
 fi
 
 # Restore the working chbench from the template (fast physical copy).
