@@ -39,6 +39,8 @@ postgres_connection_params: &postgres_params
   pg_sslmode: disable
 
 runtime:
+  flight:
+    ipc_compression: lz4_frame
   caching:
     sql_results:
       enabled: false
@@ -64,6 +66,10 @@ datasets:
       refresh_mode: changes
       params: &cayenne_params
         cayenne_tuning: adaptive
+        # In-memory CDC intra-apply sharding: 4 PK-hash shards validate+append in
+        # parallel within one apply on the memory-tier (changes) tables. Inert on the
+        # full-refresh reference tables that share this anchor (not CDC memory mode).
+        cayenne_cdc_mem_tier_shards: '4'
         # The only line that differs from the sqlite-default adaptive twin: select the Turso
         # metastore backend. This is a structural backend choice, not a tunable actuator, so it
         # does not pin any knob under adaptive tuning.

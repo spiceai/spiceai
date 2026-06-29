@@ -826,6 +826,16 @@ pub struct VortexConfig {
     /// the primary flush path and the write-path spill remains a rare backstop.
     #[serde(default = "default_cdc_mem_tier_max_bytes")]
     pub cdc_mem_tier_max_bytes: i64,
+    /// Number of PK-hash shards for the in-mem CDC tier (`cdc_durability: memory`).
+    /// Each shard is an independent sub-tier (its own segments + tombstones + publish
+    /// lock), so ONE apply fans its rows across shards by `shard_of_pk` and runs the
+    /// validate→append per shard in parallel (intra-apply parallelism — the win is
+    /// inside a single apply, since `write_lock` already serializes applies). `1` is
+    /// the unsharded path, byte-identical to pre-sharding. `>1` is gated behind the
+    /// SF-1000 N-sweep; the checkpoint is ALWAYS whole-tier-atomic regardless of N
+    /// (a single-shard checkpoint would pin the source watermark → unbounded WAL).
+    #[serde(default = "default_cdc_mem_tier_shards")]
+    pub cdc_mem_tier_shards: usize,
     /// Max wall-clock milliseconds a RAM-tier epoch may age before a forced
     /// checkpoint, in `cdc_durability: memory` mode only. Bounds the crash-replay
     /// window for cold/low-traffic tables (whose byte cap would otherwise never
@@ -932,6 +942,17 @@ pub struct VortexConfig {
     /// land). A slow tier biases toward larger inline-flush to amortize commits.
     #[serde(skip)]
     pub metastore_storage_class: StorageClass,
+    /// Measured sequential write throughput of the DATA volume in MiB/s, from the
+    /// runtime's startup calibration probe; `None` when unprobed (remote/object
+    /// store) or the probe failed. Refines [`Self::data_storage_class`] into the
+    /// tuner's *continuous* slow-tier bias (a fast io2 volume gets less
+    /// amortization pressure than a slow gp3). Detected runtime fact — `#[serde(skip)]`.
+    #[serde(skip)]
+    pub data_storage_write_mbps: Option<f64>,
+    /// Measured sequential write throughput of the METASTORE volume in MiB/s
+    /// (calibration probe); refines the publish-bias bar. `None` when unprobed.
+    #[serde(skip)]
+    pub metastore_storage_write_mbps: Option<f64>,
     /// Force the **read/query** scan to emit Arrow *view* types (`Utf8View`/
     /// `BinaryView`) for `Utf8`/`Binary` columns, decoupled from the stored
     /// schema (which keeps the original types for writes/CDC/stats/keyset). Lets
@@ -939,12 +960,8 @@ pub struct VortexConfig {
     /// offset overflow in hash-join build-side `concat_batches` (e.g. `CH-benCH`
     /// q21 at SF1000, where `su_name` fans out across a ~100M-row join).
     ///
-    /// Runtime-configurable: the accelerator factory sets it (default on; opt out
-    /// with the `cayenne_force_view_types` acceleration param). It is `#[serde(skip)]`
-    /// because it is a read-only scan behavior re-derived on every open, NOT
-    /// serialized into Cayenne metadata — so toggling it never affects stored data
-    /// and it is intentionally excluded from `configuration_matches`. Off by default
-    /// for direct construction (unit tests keep `Utf8`). See `viewify_read_schema`.
+    /// Runtime-configurable: the accelerator factory sets it (default off; opt in
+    /// with `cayenne_force_view_types: true`).
     #[serde(skip)]
     pub force_view_read_schema: bool,
 }
@@ -1064,6 +1081,14 @@ fn default_inline_flush_max_bytes() -> i64 {
 /// backstop.
 fn default_cdc_mem_tier_max_bytes() -> i64 {
     256 * 1024 * 1024
+}
+
+/// One shard by default — the unsharded path, byte-identical to pre-sharding.
+/// `>1` (intra-apply parallelism) is opted into per-table via the accelerator and
+/// sized from the SF-1000 N-sweep; never auto-scaled (finer N = finer bloom slices
+/// + more metastore refills, so the knee is empirical).
+fn default_cdc_mem_tier_shards() -> usize {
+    1
 }
 
 /// Default minimum tier size before the PERIODIC tick durably checkpoints
@@ -1217,6 +1242,7 @@ impl Default for VortexConfig {
             deletion_mode: DeletionMode::default(),
             cdc_durability: CdcDurability::default(),
             cdc_mem_tier_max_bytes: default_cdc_mem_tier_max_bytes(),
+            cdc_mem_tier_shards: default_cdc_mem_tier_shards(),
             cdc_mem_tier_max_age_ms: default_cdc_mem_tier_max_age_ms(),
             cdc_mem_tier_min_flush_bytes: default_cdc_mem_tier_min_flush_bytes(),
             cdc_mem_tier_checkpoint_interval_ms: default_cdc_mem_tier_checkpoint_interval_ms(),
@@ -1233,6 +1259,8 @@ impl Default for VortexConfig {
             goal_convergence_window_secs: None,
             data_storage_class: StorageClass::default(),
             metastore_storage_class: StorageClass::default(),
+            data_storage_write_mbps: None,
+            metastore_storage_write_mbps: None,
             force_view_read_schema: false,
         }
     }
@@ -1519,9 +1547,10 @@ pub struct TableStatistics {
     /// the authoritative rewritten count.
     pub num_rows: i64,
     /// Serialized per-column NDV (distinct-count) `HyperLogLog` sketches
-    /// ([`crate::hll::NdvSketches`]), `None` when no integer column has a sketch.
-    /// Merged across writes register-wise; used to size distributed joins on
-    /// sparse integer keys. See [`crate::hll`].
+    /// ([`crate::hll::NdvSketches`]), `None` when no NDV-tracked column has a
+    /// sketch. Merged across writes register-wise; used to size distributed
+    /// joins and group-bys on integer, string, and temporal (date/time/timestamp)
+    /// keys. See [`crate::hll`].
     pub ndv_sketches: Option<Vec<u8>>,
 }
 

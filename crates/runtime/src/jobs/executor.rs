@@ -101,9 +101,15 @@ impl JobExecutor {
 
         tokio::spawn(
             async move {
-                let result =
-                    Self::execute_job(&job_store, df, &job_id_clone, &active_jobs, cancel_token)
-                        .await;
+                let result = Self::execute_job(
+                    &job_store,
+                    df,
+                    &job_id_clone,
+                    &active_jobs,
+                    cancel_token,
+                    false,
+                )
+                .await;
 
                 // Remove from active jobs
                 {
@@ -119,6 +125,55 @@ impl JobExecutor {
         );
 
         Ok(state)
+    }
+
+    /// Re-drives an existing job whose owning scheduler was lost, resuming its
+    /// distributed execution on this scheduler. No-op if this scheduler is
+    /// already driving the job locally.
+    pub async fn resume(&self, job_id: &str) {
+        let cancel_token = CancellationToken::new();
+        {
+            let mut active = self.active_jobs.write().await;
+            if active.contains_key(job_id) {
+                return;
+            }
+            active.insert(
+                job_id.to_string(),
+                ActiveJobInfo {
+                    cancel_token: cancel_token.clone(),
+                    query_handle: None,
+                },
+            );
+        }
+
+        let job_store = Arc::clone(&self.job_store);
+        let df = Arc::clone(&self.df);
+        let active_jobs = Arc::clone(&self.active_jobs);
+        let job_id_owned = job_id.to_string();
+
+        tokio::spawn(
+            async move {
+                let result = Self::execute_job(
+                    &job_store,
+                    df,
+                    &job_id_owned,
+                    &active_jobs,
+                    cancel_token,
+                    true,
+                )
+                .await;
+
+                {
+                    let mut active = active_jobs.write().await;
+                    active.remove(&job_id_owned);
+                }
+
+                if let Err(e) = result {
+                    tracing::error!(job_id = %job_id_owned, error = %e, "Job recovery failed");
+                }
+            }
+            .instrument(tracing::info_span!("job_recovery", job_id = %job_id)),
+        );
     }
 
     /// Requests cancellation of a running job.
@@ -173,9 +228,15 @@ impl JobExecutor {
         job_id: &str,
         active_jobs: &RwLock<std::collections::HashMap<String, ActiveJobInfo>>,
         cancel: CancellationToken,
+        resume: bool,
     ) -> Result<()> {
-        // Get job and mark as running
-        let state = job_store.set_job_running(job_id).await?;
+        // Get job and mark as running. During recovery another scheduler may have
+        // already claimed this job; treat that race as a no-op.
+        let state = match job_store.set_job_running(job_id).await {
+            Ok(state) => state,
+            Err(super::error::Error::ConcurrentModification { .. }) if resume => return Ok(()),
+            Err(e) => return Err(e),
+        };
 
         // Check for early cancellation
         if cancel.is_cancelled() {
@@ -205,7 +266,12 @@ impl JobExecutor {
 
         let query = query_builder.build();
 
-        let query_handle = match query.submit_distributed(job_id).await {
+        let submit_result = if resume {
+            query.resume_distributed(job_id).await
+        } else {
+            query.submit_distributed(job_id).await
+        };
+        let query_handle = match submit_result {
             Ok(handle) => handle,
             Err(e) => {
                 let error_code = Self::query_error_to_code(&e);

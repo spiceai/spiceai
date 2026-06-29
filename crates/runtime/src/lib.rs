@@ -67,7 +67,7 @@ pub use http::get_api_doc;
 use llms::rerank::RerankerModelStore;
 use model::{EmbeddingModelStore, LLMChatCompletionsModelStore};
 
-use crate::tools::{Tooling, catalog::SpiceToolCatalog, factory::default_available_catalogs};
+use crate::tools::{Tooling, factory::default_available_catalogs};
 use model_components::model::Model;
 pub use notify::Error as NotifyError;
 use snafu::prelude::*;
@@ -132,6 +132,7 @@ pub mod secrets {
     pub use runtime_secrets::*;
 }
 pub mod cluster;
+mod secrets_preflight;
 pub mod spice_metrics;
 pub mod status;
 pub mod task_history;
@@ -525,13 +526,11 @@ pub struct LogErrors(pub bool);
 pub struct Runtime {
     app: Arc<RwLock<Option<Arc<App>>>>,
     df: Arc<DataFusion>,
-    models: Arc<RwLock<HashMap<String, Model>>>,
-    completion_llms: Arc<RwLock<LLMChatCompletionsModelStore>>,
-    /// Per-model rate controllers for AI UDF concurrency control.
-    model_rate_controllers: Arc<RwLock<HashMap<String, Arc<runtime_rate_control::RateController>>>>,
+    // `Arc<Model>` (not `Model`) so a handle can be cloned out of the lock and
+    // moved into `spawn_blocking` to run synchronous inference off the runtime.
+    models: Arc<RwLock<HashMap<String, Arc<Model>>>>,
+    llm_runtime_stores: Arc<model::LlmRuntimeStores>,
     http_rate_control_registry: Arc<dataconnector::http_rate_control::HttpRateControlRegistry>,
-    // LLMs that support the OpenAI Responses API
-    responses_llms: Arc<RwLock<LLMResponsesModelStore>>,
     embeds: Arc<RwLock<EmbeddingModelStore>>,
     /// Registered reranker models (native cross-encoders, reranker-API
     /// providers). Consumed by the `rerank()` UDTF; may be empty when only
@@ -636,7 +635,7 @@ impl Runtime {
 
     #[must_use]
     pub fn completion_llms(&self) -> Arc<RwLock<LLMChatCompletionsModelStore>> {
-        Arc::clone(&self.completion_llms)
+        self.llm_runtime_stores.completion_llms()
     }
 
     #[must_use]
@@ -644,11 +643,38 @@ impl Runtime {
         Arc::clone(&self.rerankers)
     }
 
+    pub async fn responses_api_support_for_model(
+        &self,
+        model_name: &str,
+    ) -> Option<crate::model::ResponsesApiSupport> {
+        self.llm_runtime_stores
+            .responses_api_support()
+            .read()
+            .await
+            .get(model_name)
+            .cloned()
+    }
+
+    pub async fn responses_supported_model_names(&self) -> HashSet<String> {
+        self.llm_runtime_stores
+            .responses_api_support()
+            .read()
+            .await
+            .iter()
+            .filter_map(|(name, support)| support.supports_responses_api().then_some(name.clone()))
+            .collect()
+    }
+
     #[must_use]
     pub fn model_rate_controllers(
         &self,
     ) -> Arc<RwLock<HashMap<String, Arc<runtime_rate_control::RateController>>>> {
-        Arc::clone(&self.model_rate_controllers)
+        self.llm_runtime_stores.rate_controllers()
+    }
+
+    #[must_use]
+    pub fn responses_llms(&self) -> Arc<RwLock<LLMResponsesModelStore>> {
+        self.llm_runtime_stores.responses_llms()
     }
 
     #[must_use]
@@ -1797,7 +1823,7 @@ impl Runtime {
     ///
     /// For tools from catalog, the name is prefixed with the catalog name. e.g. `catalog_name/tool_name`.
     fn list_all_tools(self: &Arc<Self>) -> impl Stream<Item = Arc<dyn SpiceModelTool>> {
-        let default_catalogs = default_available_catalogs(Arc::clone(self));
+        let default_catalogs = default_available_catalogs(self);
         let stream_self = Arc::clone(self);
         stream! {
             let tool_lock = stream_self.tools.read().await;
@@ -1810,7 +1836,7 @@ impl Runtime {
                     Tooling::Tool(tool) | Tooling::FunctionTool(tool) => {
                         yield Arc::clone(tool);
                     }
-                    Tooling::Catalog(catalog) => {
+                    Tooling::Catalog { tools: catalog, .. } => {
                         // Do not list tools from default catalogs. They are already listed individually as tools.
                         if default_catalog_names.contains(&name.as_str()) {
                             continue;
@@ -1829,7 +1855,7 @@ impl Runtime {
         let tools = self.tools.read().await;
         let tool: Arc<dyn SpiceModelTool> =
             if let Some((catalog_name, name)) = tool_name.split_once('/') {
-                let Some(Tooling::Catalog(catalog)) = tools.get(catalog_name) else {
+                let Some(Tooling::Catalog { tools: catalog, .. }) = tools.get(catalog_name) else {
                     return None;
                 };
                 return catalog.get(name).await;

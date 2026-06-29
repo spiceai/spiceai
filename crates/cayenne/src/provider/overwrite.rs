@@ -45,7 +45,8 @@ use datafusion::execution::SendableRecordBatchStream;
 use tokio::sync::OwnedMutexGuard;
 
 use super::Result;
-use super::table::{CayenneTableProvider, ColumnStatsAccumulator};
+use super::column_stats::ColumnStatsAccumulator;
+use super::table::CayenneTableProvider;
 use crate::CayenneCatalog;
 use crate::catalog::CatalogResult;
 use crate::metastore::MetastoreTransaction;
@@ -184,18 +185,12 @@ impl PreparedOverwrite {
     ///
     /// Returns an error if swapping the listing table fails. Other steps are best-effort.
     pub async fn finish(self) -> Result<u64> {
-        self.table.update_current_snapshot_id(&self.new_snapshot_id);
-        self.table.clear_all_deletion_caches();
-        // commit_overwrite_in_txn DELETEs cayenne_inlined_data /
-        // cayenne_inlined_delete for this table atomically with the snapshot
-        // flip, but doesn't go through the inline-mutation path that bumps
-        // `inlined_generation`. Bump it here so scans don't return stale
-        // pre-overwrite inline batches alongside the new snapshot.
-        self.table.invalidate_inlined_cache();
-        self.table.mark_maintained_aggregates_stale();
-
+        // Publish the new snapshot as a single atomic visibility flip under the listing
+        // fence (snapshot id + deletion caches + inline cache + listing swap), so a
+        // concurrent scan never observes a torn state. Full rationale on
+        // `CayenneTableProvider::publish_overwrite_snapshot`.
         self.table
-            .update_listing_table_for_snapshot(&self.new_snapshot_id)
+            .publish_overwrite_snapshot(&self.new_snapshot_id)
             .await?;
 
         // Manifest snapshot model: the catalog flip is committed, so the OLD

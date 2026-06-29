@@ -32,8 +32,9 @@ use tokio::runtime::Runtime;
 
 use common::{
     CAYENNE_LANES, CayenneFixture, DuckDbFixture, Metastore, capture_comparison_plans,
-    cayenne_insert, cayenne_query, cayenne_query_warm, duckdb_insert_parquet, duckdb_query_scalar,
-    make_batch, schema, setup_cayenne_for, setup_duckdb, warm_session_for, write_parquet,
+    cayenne_insert, cayenne_query, cayenne_query_warm, duckdb_exec, duckdb_insert_parquet,
+    duckdb_query_scalar, make_batch, schema, setup_cayenne_for, setup_duckdb, warm_session_for,
+    write_parquet,
 };
 
 const ROW_COUNTS: &[usize] = &[16_384, 131_072, 1_048_576];
@@ -240,9 +241,129 @@ fn bench_scan(c: &mut Criterion) {
                 });
             },
         );
+
+        // --- metadata-foldable whole-table aggregates ---
+        // The complete set of aggregates Cayenne can answer from the Vortex file
+        // footer without a scan. `count_col`/`min_value`/`max_value` already fold
+        // via DataFusion's built-in `AggregateStatistics` rule; `sum_value`
+        // (above) and `avg_value` newly fold via `CayenneStatsAggregateRewriter`;
+        // `agg_rollup` exercises a mixed query that only folds as a whole when the
+        // rule covers every function (DataFusion declines the node because of the
+        // unsupported `SUM`/`AVG`).
+        let metadata_shapes: &[(&str, &str, &str)] = &[
+            (
+                "count_col",
+                "SELECT COUNT(value) FROM t",
+                "SELECT COUNT(value) FROM scan_bench",
+            ),
+            (
+                "min_value",
+                "SELECT MIN(value) FROM t",
+                "SELECT MIN(value) FROM scan_bench",
+            ),
+            (
+                "max_value",
+                "SELECT MAX(value) FROM t",
+                "SELECT MAX(value) FROM scan_bench",
+            ),
+            (
+                "avg_value",
+                "SELECT AVG(value) FROM t",
+                "SELECT AVG(value) FROM scan_bench",
+            ),
+            (
+                "agg_rollup",
+                "SELECT COUNT(*), SUM(value), MIN(value), MAX(value), AVG(value) FROM t",
+                "SELECT COUNT(*), SUM(value), MIN(value), MAX(value), AVG(value) FROM scan_bench",
+            ),
+        ];
+
+        for (shape, cayenne_sql, duckdb_sql) in metadata_shapes {
+            rt.block_on(capture_comparison_plans(
+                &format!("scan/{rows}/{shape}"),
+                &plan_cayenne_fixture.table,
+                &duckdb_fixture.conn,
+                cayenne_sql,
+                duckdb_sql,
+            ));
+            bench_metadata_shape(
+                &mut group,
+                &rt,
+                &cayenne_fixtures,
+                &warm_ctx,
+                &duckdb_fixture,
+                rows,
+                shape,
+                cayenne_sql,
+                duckdb_sql,
+            );
+        }
     }
 
     group.finish();
+}
+
+/// Run one whole-table aggregate shape across every Cayenne lane (cold +
+/// `cayenne_warm`) and DuckDB. Uses `duckdb_exec` so any result shape — a
+/// `Float64` `AVG` scalar or a multi-column rollup — is handled, unlike the
+/// `i64`-typed [`duckdb_query_scalar`] used by the hand-written scalar shapes
+/// above. The Cayenne and DuckDB SQL differ only in table name (`t` vs
+/// `scan_bench`).
+#[allow(clippy::too_many_arguments)]
+fn bench_metadata_shape(
+    group: &mut criterion::BenchmarkGroup<'_, criterion::measurement::WallTime>,
+    rt: &Runtime,
+    cayenne_fixtures: &[(&'static str, Arc<CayenneFixture>)],
+    warm_ctx: &Arc<datafusion::prelude::SessionContext>,
+    duckdb_fixture: &Arc<DuckDbFixture>,
+    rows: usize,
+    shape: &str,
+    cayenne_sql: &str,
+    duckdb_sql: &str,
+) {
+    for (lane_label, fixture) in cayenne_fixtures {
+        let fixture = Arc::clone(fixture);
+        let sql = cayenne_sql.to_string();
+        group.bench_with_input(
+            BenchmarkId::new(format!("{lane_label}/{shape}"), rows),
+            &rows,
+            |b, &_rows| {
+                b.iter(|| {
+                    rt.block_on(async {
+                        let batches = cayenne_query(&fixture.table, &sql).await;
+                        black_box(batches);
+                    });
+                });
+            },
+        );
+    }
+
+    let wc = Arc::clone(warm_ctx);
+    let warm_sql = cayenne_sql.to_string();
+    group.bench_with_input(
+        BenchmarkId::new(format!("cayenne_warm/{shape}"), rows),
+        &rows,
+        |b, &_rows| {
+            b.iter(|| {
+                rt.block_on(async {
+                    let batches = cayenne_query_warm(&wc, &warm_sql).await;
+                    black_box(batches);
+                });
+            });
+        },
+    );
+
+    let df = Arc::clone(duckdb_fixture);
+    let duckdb_sql_owned = duckdb_sql.to_string();
+    group.bench_with_input(
+        BenchmarkId::new(format!("duckdb/{shape}"), rows),
+        &rows,
+        |b, &_rows| {
+            b.iter(|| {
+                duckdb_exec(&df.conn, &duckdb_sql_owned);
+            });
+        },
+    );
 }
 
 criterion_group!(benches, bench_scan);
