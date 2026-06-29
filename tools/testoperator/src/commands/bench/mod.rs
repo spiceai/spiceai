@@ -341,12 +341,15 @@ fn chbench_source_from_env() -> anyhow::Result<chbench_driver::PostgresSourceCon
     Ok(source)
 }
 
-/// Validate scale factor, build the CH-benCH config, connect to the source
-/// Postgres, create the schema and load seed data.
+/// Validate scale factor, build the CH-benCH config, and connect to the source
+/// Postgres. Unless `skip_seed` is set, also create the schema and load seed data.
 ///
 /// `scale_factor` maps to TPC-C warehouses (must be a positive integer >= 1).
 /// `terminals` specifies the target number of terminals.
 /// `rate` optionally caps the workload-wide transaction rate (txn/s); `None` runs the OLTP workload closed-loop at maximum throughput.
+/// `skip_seed` connects to an already-prepared source (e.g. one restored from a
+/// template) WITHOUT creating the schema or loading seed data — the caller is
+/// responsible for ensuring the source already matches `scale_factor`.
 pub(crate) async fn prepare_chbench_source(
     scale_factor: f64,
     terminals: usize,
@@ -378,8 +381,11 @@ pub(crate) async fn prepare_chbench_source(
     let driver = chbench_driver::PostgresChBenchDriver::connect(config, source).await?;
     if skip_seed {
         // Source is assumed already populated (e.g. restored from a template).
-        // Connect only, so the workload can run against the existing data.
-        println!("Skipping CH-benCHmark seed (--skip-prepare): using existing source data");
+        // Verify it actually is — and matches the requested scale factor —
+        // before running against it; a missing/mismatched source would otherwise
+        // yield silently-wrong results instead of a clear error.
+        driver.verify_prepared().await?;
+        println!("Skipping CH-benCHmark seed (--skip-prepare): verified existing source");
     } else {
         driver.prepare().await?;
     }

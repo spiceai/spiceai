@@ -70,8 +70,9 @@ pub(crate) async fn run(args: &HtapArgs) -> anyhow::Result<()> {
     #[expect(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
     let terminals = args.terminals.unwrap_or((scale_factor * 10.0) as usize);
     let duration = Duration::from_secs(test_args.common.duration);
-    let driver: Arc<dyn chbench_driver::ChBenchDriver> =
-        Arc::new(prepare_chbench_source(scale_factor, terminals, args.rate, args.skip_prepare).await?);
+    let driver: Arc<dyn chbench_driver::ChBenchDriver> = Arc::new(
+        prepare_chbench_source(scale_factor, terminals, args.rate, args.skip_prepare).await?,
+    );
 
     // --prepare-only: the source is now seeded; exit before starting spiced so
     // an external harness can snapshot the pristine source (e.g. to a Postgres
