@@ -148,9 +148,9 @@ aws-smithy-runtime = "1.11.1"
 aws-smithy-runtime-api = "1.11.6"
 aws-smithy-types = "1.4.5"
 axum = { version = "0.8", features = ["macros"] }
-ballista-core = { git = "https://github.com/spiceai/datafusion-ballista.git", rev = "989c9b79f2a091a3c16141529a6aa9fb4a51bb4e" } # branch: phillip/cluster-shuffle-scheduler-fixes
-ballista-executor = { git = "https://github.com/spiceai/datafusion-ballista.git", rev = "989c9b79f2a091a3c16141529a6aa9fb4a51bb4e" }
-ballista-scheduler = { git = "https://github.com/spiceai/datafusion-ballista.git", rev = "989c9b79f2a091a3c16141529a6aa9fb4a51bb4e" }
+ballista-core = { git = "https://github.com/spiceai/datafusion-ballista.git", rev = "0f6d5d9980b9a4ed84bdecf877e5c1346435f3da" } # branch: spiceai-54
+ballista-executor = { git = "https://github.com/spiceai/datafusion-ballista.git", rev = "0f6d5d9980b9a4ed84bdecf877e5c1346435f3da" }
+ballista-scheduler = { git = "https://github.com/spiceai/datafusion-ballista.git", rev = "0f6d5d9980b9a4ed84bdecf877e5c1346435f3da" }
 base64 = "0.22.1"
 bb8 = "0.9"
 bb8-postgres = "0.9"
