@@ -65,7 +65,8 @@ pub(crate) async fn run(args: &HtapArgs) -> anyhow::Result<()> {
             .with_additional_args(vec!["--metrics".to_string(), "127.0.0.1:9090".to_string()]);
     }
 
-    // 1. Prepare the source (schema + seed data).
+    // 1. Prepare the source: seed schema + data — or, with --skip-prepare,
+    //    connect to an already-prepared source and verify it matches the SF.
     let scale_factor = test_args.scale_factor.unwrap_or(1.0);
     #[expect(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
     let terminals = args.terminals.unwrap_or((scale_factor * 10.0) as usize);

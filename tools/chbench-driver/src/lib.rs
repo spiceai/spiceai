@@ -77,7 +77,7 @@ pub enum Error {
         "--skip-prepare source has {found} warehouse(s) but --scale-factor expects {expected}; \
          restore a matching template or drop --skip-prepare to re-seed"
     ))]
-    SourceScaleMismatch { found: i64, expected: i64 },
+    SourceScaleMismatch { found: u64, expected: u64 },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -200,8 +200,10 @@ impl PostgresChBenchDriver {
                 action: "verify --skip-prepare source (is the warehouse table seeded?)".into(),
                 source,
             })?;
-        let found: i64 = row.get(0);
-        let expected = i64::try_from(self.config.warehouses).unwrap_or(i64::MAX);
+        // count(*) is non-negative; compare in u64 so the configured warehouse
+        // count (usize) needs no lossy cast (usize -> u64 is always lossless).
+        let found = u64::try_from(row.get::<_, i64>(0)).unwrap_or(0);
+        let expected = self.config.warehouses as u64;
         ensure!(
             found == expected,
             SourceScaleMismatchSnafu { found, expected }
