@@ -195,7 +195,11 @@ async fn read_value(ctx: &SessionContext, name: &str, key: i64) -> TestResult<Op
     match values.as_slice() {
         [] => Ok(None),
         [single] => Ok(Some(*single)),
-        _ => Err(format!("Expected at most one row for id {key}, got {}", values.len()).into()),
+        _ => Err(format!(
+            "Expected at most one row for id {key}, got {}",
+            values.len()
+        )
+        .into()),
     }
 }
 
