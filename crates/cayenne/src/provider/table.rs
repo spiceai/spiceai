@@ -10012,6 +10012,37 @@ impl CayenneTableProvider {
         Ok(files)
     }
 
+    /// Best-effort page-cache hygiene after a background compaction writes its
+    /// cold output: drop the just-written files' clean pages so the `O(table)`
+    /// rewrite doesn't evict the hot query working set (the scan-under-compaction
+    /// p99). Linux + local-FS only (no page cache on S3; no `posix_fadvise` on
+    /// macOS). Call AFTER `sync_snapshot_dir` (the output is durable, so its
+    /// pages are droppable without data loss) and BEFORE the listing-fence
+    /// publish (the output is not yet query-visible, so the dropped pages race
+    /// no reader). Never fails — a cache hint must not abort a compaction.
+    async fn evict_compaction_output_pages(&self, snapshot_id: &str) {
+        let files = match self.list_snapshot_files_with_sizes_local(snapshot_id).await {
+            Ok(files) => files,
+            Err(error) => {
+                tracing::debug!(
+                    target: "cayenne::compaction",
+                    %error,
+                    "skipping compaction page-cache evict: could not list output files"
+                );
+                return;
+            }
+        };
+        if files.is_empty() {
+            return;
+        }
+        let snapshot_dir = self.snapshot_dir_path_for(snapshot_id);
+        let paths: Vec<std::path::PathBuf> = files
+            .into_iter()
+            .map(|(name, _size)| snapshot_dir.join(name))
+            .collect();
+        super::fadvise_tier::evict_files(paths).await;
+    }
+
     async fn list_snapshot_files_with_sizes_s3(
         &self,
         snapshot_id: &str,
@@ -11386,6 +11417,12 @@ impl CayenneTableProvider {
                     .await;
                 return Err(Error::Catalog { source: e });
             }
+            // Page-cache hygiene: the merged output is durable but NOT yet
+            // query-visible (the listing-fence swap below publishes it), so
+            // dropping its just-written pages here races no reader. Stops the
+            // O(table) background compaction from evicting the hot query working
+            // set (scan-under-compaction p99). Linux + local only; best-effort.
+            self.evict_compaction_output_pages(&new_snapshot_id).await;
         }
 
         let old_ids: Vec<String> = inputs.iter().map(|(id, _)| id.clone()).collect();
@@ -11880,6 +11917,10 @@ impl CayenneTableProvider {
                     .await;
                 return Err(Error::Catalog { source: e });
             }
+            // Page-cache hygiene (see the size-tier compaction path): drop the
+            // merged output's just-written pages while it is durable but not yet
+            // query-visible, so the bake doesn't evict the hot query working set.
+            self.evict_compaction_output_pages(&new_snapshot_id).await;
         }
 
         let old_ids: Vec<String> = selected.iter().map(|(id, _)| id.clone()).collect();
@@ -12160,6 +12201,70 @@ impl CayenneTableProvider {
 
         let epoch = self.next_maintained_aggregate_epoch();
         Some(PendingMaintainedAggregateInsert { epoch, batches })
+    }
+
+    /// Whether the staged write path should buffer + capture insert batches for an
+    /// incremental IVM feed: only when a maintained aggregate is registered AND it
+    /// supports retraction (so a later upsert/supersession retracts the old
+    /// contribution via the per-PK index — the same gate the in-mem feed uses).
+    /// Non-retraction registries fall back to a full rebuild (the staged publish's
+    /// `feed_staged_ivm_under_fence(None)` marks them stale), so there is no point
+    /// paying the Stage-A buffer for them.
+    pub(crate) fn should_capture_staged_ivm_feed(&self) -> bool {
+        !self.maintained_aggregates.is_empty() && self.maintained_aggregates.supports_retraction()
+    }
+
+    /// Feed the maintained-aggregate registry from a STAGED-disk publish.
+    ///
+    /// MUST be called while the partition's `listing_fence` is held for write
+    /// (both staged apply paths hold it: `apply_under_barrier` acquires it
+    /// internally, `apply_under_held_barrier`'s caller holds it). The fence is the
+    /// serializer that concurrent, pipelined staged `finish()` tasks for one table
+    /// contend for — so assigning the epoch (`next_maintained_aggregate_epoch`)
+    /// AND enqueuing the delta here, atomically under that fence, guarantees
+    /// applier-enqueue order == epoch order. This is the invariant the in-mem feed
+    /// gets from its `write_guard`; an off-fence enqueue can deliver epoch N+1
+    /// before N to the FIFO applier, and `begin_maintenance_pass` permanently
+    /// stales the registry on any epoch gap.
+    ///
+    /// `batches`: `Some` = the captured insert batches for an incrementally
+    /// feedable write; `None` = non-IVM table (no-op) or a non-incremental write
+    /// (mark stale → queries fall back to a base scan). Enqueue uses `try_send`
+    /// (never awaits under the fence); a full queue or dead applier fails safe to
+    /// stale at the consumed epoch, so the dense `+1` epoch chain is never gapped.
+    pub(crate) fn feed_staged_ivm_under_fence(&self, batches: Option<&Arc<Vec<RecordBatch>>>) {
+        if self.maintained_aggregates.is_empty() {
+            return; // non-IVM table (the common case) — zero cost.
+        }
+        let Some(batches) = batches else {
+            self.mark_maintained_aggregates_stale();
+            return;
+        };
+        let Some(pending) = self.prepare_maintained_aggregate_insert_batches(Arc::clone(batches))
+        else {
+            return; // empty batches — nothing to feed, no epoch consumed.
+        };
+        let Some(tx) = &self.maintained_aggregate_tx else {
+            return;
+        };
+        if let Err(send_err) = tx.try_send(MaintainedAggregateApply::Insert {
+            epoch: pending.epoch,
+            batches: pending.batches,
+        }) {
+            // Bounded queue full / applier gone: fail safe to stale at THIS
+            // epoch (synchronously, no await under the fence). The epoch is
+            // consumed, so the strict-`+1` chain the applier expects stays dense.
+            // Surface the degradation: this forces queries onto base scans until
+            // the next full rebuild, so it must be diagnosable in production
+            // (distinguish a full bounded queue from a gone applier).
+            tracing::warn!(
+                table = %self.table_name(),
+                epoch = pending.epoch,
+                error = %send_err,
+                "staged IVM feed: maintained-aggregate enqueue failed (queue full or applier gone); marking stale — queries fall back to base scans until the next rebuild"
+            );
+            self.maintained_aggregates.mark_stale(pending.epoch);
+        }
     }
 
     async fn apply_maintained_aggregate_insert_batches(
@@ -26952,6 +27057,341 @@ mod tests {
         }
         pairs.sort_unstable();
         pairs
+    }
+
+    // `AggregateExec` is referenced in the signatures below (return type /
+    // `&AggregateExec` param); table.rs's top level does not import it.
+    use datafusion::physical_plan::aggregates::AggregateExec;
+
+    // ----------------------------------------------------------------------
+    // Staged-disk CDC path → maintained-aggregate (IVM) feed.
+    //
+    // These tests gate the reorder-fix invariant: the STAGED publish path now
+    // feeds the maintained-aggregate registry (previously only the in-mem path
+    // did), and epoch-assign + applier-enqueue MUST be atomic under the held
+    // listing fence. Pipelined/detached staged finish() tasks would otherwise
+    // enqueue epochs out of order and `begin_maintenance_pass` would PERMANENTLY
+    // stale the registry on a +1 gap.
+    // ----------------------------------------------------------------------
+
+    /// Mirror of `create_cdc_upsert_table_with_vortex_config` (id Int64, value
+    /// Int64, PK=id, `on_conflict` `Upsert(id)`) but registers maintained-aggregate
+    /// views on the BUILDER and pins the table to the STAGED-disk CDC path
+    /// (`cdc_durability: File`, `inline_max_rows: 0`, `deletion_mode: Key`) so
+    /// every write exercises `feed_staged_ivm_under_fence`, not the in-mem feed.
+    async fn create_cdc_upsert_table_with_maintained_aggregates(
+        table_name: &str,
+        runtime_env: Arc<RuntimeEnv>,
+        specs: Vec<MaintainedAggregateSpec>,
+    ) -> (CayenneTableProvider, Arc<dyn MetadataCatalog>, TempDir) {
+        use arrow::datatypes::{DataType, Field, Schema};
+
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let metadata_dir = format!("{}/metadata", temp_dir.path().to_str().expect("str path"));
+        let data_dir = format!("{}/data", temp_dir.path().to_str().expect("str path"));
+        std::fs::create_dir_all(&metadata_dir).expect("metadata dir created");
+
+        let connection_string = format!("sqlite://{metadata_dir}/cayenne.db");
+        let catalog = Arc::new(CayenneCatalog::new(connection_string).expect("catalog created"))
+            as Arc<dyn MetadataCatalog>;
+        catalog.init().await.expect("catalog initialized");
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("value", DataType::Int64, false),
+        ]));
+
+        let options = CreateTableOptions {
+            table_name: table_name.to_string(),
+            schema,
+            primary_key: vec!["id".to_string()],
+            on_conflict: Some(OnConflict::Upsert(
+                datafusion_table_providers::util::column_reference::ColumnReference::new(vec![
+                    "id".to_string(),
+                ]),
+            )),
+            base_path: data_dir,
+            partition_column: None,
+            // Force the staged-disk path: File (not the default Memory), no inline
+            // memtable, key-mode deletes (so the PK retraction index is built =>
+            // `supports_retraction()` => `should_capture_staged_ivm_feed()` true).
+            vortex_config: VortexConfig {
+                cdc_durability: crate::metadata::CdcDurability::File,
+                inline_max_rows: 0,
+                deletion_mode: crate::metadata::DeletionMode::Key,
+                ..VortexConfig::default()
+            },
+        };
+
+        let provider = CayenneTableProviderBuilder::new(Arc::clone(&catalog), runtime_env)
+            .with_maintained_aggregates(specs)
+            .create(options)
+            .await
+            .expect("table created");
+        (provider, catalog, temp_dir)
+    }
+
+    /// A maintained-aggregate spec over the (id, value) table: GROUP BY id,
+    /// COUNT(*), SUM(value). Both outputs are Int64 (supported).
+    fn id_count_sum_spec() -> MaintainedAggregateSpec {
+        use crate::maintained_aggregate::{MaintainedAggregateExpr, MaintainedAggregateFunction};
+        MaintainedAggregateSpec {
+            filter: None,
+            group_by: vec!["id".to_string()],
+            aggregates: vec![
+                MaintainedAggregateExpr {
+                    function: MaintainedAggregateFunction::Count,
+                    column: None, // COUNT(*)
+                },
+                MaintainedAggregateExpr {
+                    function: MaintainedAggregateFunction::Sum,
+                    column: Some("value".to_string()),
+                },
+            ],
+        }
+    }
+
+    /// Build an `AggregateExec` for `GROUP BY id, COUNT(*), SUM(value)` over the
+    /// (id Int64, value Int64) schema. The exec never runs — the registry only
+    /// reads its SHAPE (group-by + aggregate functions/columns) to match a view
+    /// and its OUTPUT SCHEMA to materialize the served batch. Modeled on
+    /// `maintained_aggregate::tests::aggregate_exec_for`: a `MemorySourceConfig`
+    /// input over the table schema, `count(*)` via a non-null literal (=>
+    /// `CountQueryColumn::AllRows`), `sum(value)` over the column, `AggregateMode::Single`.
+    fn build_id_count_sum_aggregate_exec() -> AggregateExec {
+        use arrow::datatypes::{DataType, Field, Schema};
+        use datafusion::physical_expr::aggregate::AggregateExprBuilder;
+        use datafusion::physical_expr::expressions::{col, lit};
+        use datafusion::physical_plan::aggregates::{AggregateMode, PhysicalGroupBy};
+        use datafusion_functions_aggregate::count::count_udaf;
+        use datafusion_functions_aggregate::sum::sum_udaf;
+
+        let schema: SchemaRef = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("value", DataType::Int64, false),
+        ]));
+        let input = MemorySourceConfig::try_new_exec(&[vec![]], Arc::clone(&schema), None)
+            .expect("memory source exec for aggregate input");
+
+        let group_by = PhysicalGroupBy::new_single(vec![(
+            col("id", schema.as_ref()).expect("id column"),
+            "id".to_string(),
+        )]);
+
+        // ORDER MATTERS: the view match is order-sensitive, so this must be
+        // [count(*), sum(value)] to mirror `id_count_sum_spec`.
+        let count_expr = AggregateExprBuilder::new(count_udaf(), vec![lit(1_i8)])
+            .schema(Arc::clone(&schema))
+            .alias("count(*)".to_string())
+            .build()
+            .map(Arc::new)
+            .expect("count(*) aggregate expr");
+        let sum_expr = AggregateExprBuilder::new(
+            sum_udaf(),
+            vec![col("value", schema.as_ref()).expect("value column")],
+        )
+        .schema(Arc::clone(&schema))
+        .alias("sum(value)".to_string())
+        .build()
+        .map(Arc::new)
+        .expect("sum(value) aggregate expr");
+
+        let aggr_exprs = vec![count_expr, sum_expr];
+        let filters = vec![None; aggr_exprs.len()];
+        AggregateExec::try_new(
+            AggregateMode::Single,
+            group_by,
+            aggr_exprs,
+            filters,
+            input,
+            schema,
+        )
+        .expect("id/count/sum AggregateExec")
+    }
+
+    /// Poll the maintained-aggregate registry until it serves a fresh batch at
+    /// the table's current scan epoch (the value `scan()` would capture), or fail
+    /// after ~5s. The staged feed enqueues to a BACKGROUND applier with no sync
+    /// drain, so a serve right after `finish()` legitimately returns `None`
+    /// (registry epoch still trails the just-assigned epoch) until the applier
+    /// catches up. A timeout here is a real failure: under the off-fence (buggy)
+    /// design an out-of-order enqueue PERMANENTLY stales the registry, so the
+    /// serve never becomes `Some` and this helper times out — which is exactly
+    /// what makes TEST 2 a regression gate for the reorder fix.
+    async fn poll_maintained_serve(
+        provider: &CayenneTableProvider,
+        aggregate_exec: &AggregateExec,
+    ) -> RecordBatch {
+        use std::sync::atomic::Ordering;
+        for _ in 0..50 {
+            let epoch = provider.maintained_aggregate_epoch.load(Ordering::Acquire);
+            let served = provider
+                .maintained_aggregates
+                .batch_for_aggregate(aggregate_exec, epoch)
+                .expect("maintained serve must not error");
+            if let Some(batch) = served
+                && batch.num_rows() > 0
+            {
+                return batch;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        panic!(
+            "maintained aggregate never served a fresh non-empty batch within ~5s \
+             (applier never caught up, or the registry was permanently staled by an \
+             out-of-order staged epoch enqueue)"
+        );
+    }
+
+    /// Read the served (id, count, sum) rows out of a maintained-aggregate batch
+    /// sorted by id. Column layout: [0]=id (group key), [1]=`count(*)`, [2]=`sum(value)`,
+    /// all Int64 (see `build_id_count_sum_aggregate_exec` / `id_count_sum_spec`).
+    fn collect_id_count_sum(batch: &RecordBatch) -> Vec<(i64, i64, i64)> {
+        use arrow::array::Int64Array;
+        let ids = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("id is Int64");
+        let counts = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("count(*) is Int64");
+        let sums = batch
+            .column(2)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("sum(value) is Int64");
+        let mut rows: Vec<(i64, i64, i64)> = (0..batch.num_rows())
+            .map(|r| (ids.value(r), counts.value(r), sums.value(r)))
+            .collect();
+        rows.sort_unstable();
+        rows
+    }
+
+    /// TEST 1 — the staged-disk CDC path feeds the maintained-aggregate registry.
+    ///
+    /// The table starts EMPTY, so the open-time rebuild initializes the registry
+    /// with ZERO groups at epoch 0. A served result with groups can therefore only
+    /// have come from the staged feed. One staged write (two new keys) is published
+    /// via `write_cdc_append_stream` + `finish()`; we then poll the registry and
+    /// assert it serves the correct per-id count/sum.
+    #[tokio::test]
+    async fn test_staged_write_feeds_maintained_aggregate() {
+        let ctx = SessionContext::new();
+        let (provider, _catalog, _tmp) = create_cdc_upsert_table_with_maintained_aggregates(
+            "staged_ivm_feed",
+            ctx.runtime_env(),
+            vec![id_count_sum_spec()],
+        )
+        .await;
+        let schema = Arc::clone(&provider.table_metadata.schema);
+
+        // Sanity: the staged-disk path is active (not the in-mem tier), so the
+        // write returns a pending finalize and routes through
+        // `apply_under_barrier` -> `feed_staged_ivm_under_fence`.
+        assert!(
+            !provider.is_cdc_memory_mode(),
+            "must use the staged File path"
+        );
+
+        let write = provider
+            .write_cdc_append_stream(
+                single_batch_stream(id_value_batch(Arc::clone(&schema), &[1, 2], &[10, 20])),
+                &ctx.task_ctx(),
+            )
+            .await
+            .expect("staged CDC write should prepare");
+        assert!(
+            write.has_pending_finalize(),
+            "staged File-mode write must defer to a finalize publish"
+        );
+        write.finish().await.expect("finalize staged write");
+
+        // The published rows are visible to a normal scan...
+        assert_eq!(
+            collect_id_value_pairs(&ctx, &provider, "staged_ivm_feed").await,
+            vec![(1, 10), (2, 20)],
+        );
+
+        // ...and the maintained-aggregate registry, fed under the fence, serves
+        // the same relation incrementally once the background applier catches up.
+        let aggregate_exec = build_id_count_sum_aggregate_exec();
+        let served = poll_maintained_serve(&provider, &aggregate_exec).await;
+        assert_eq!(
+            collect_id_count_sum(&served),
+            vec![(1, 1, 10), (2, 1, 20)],
+            "staged feed must populate count(*)=1 and sum(value)=value per key"
+        );
+    }
+
+    /// TEST 2 — REORDER GATE: pipelined staged `finish()` out of order keeps the
+    /// registry FRESH.
+    ///
+    /// Stage TWO writes (each returns `has_pending_finalize`), then finish them in
+    /// the OPPOSITE order from staging (second, then first). Because each staged
+    /// `finish()` assigns its IVM epoch AND enqueues atomically under the held
+    /// listing fence, the applier still receives a dense, in-order +1 epoch chain
+    /// and the registry stays fresh — serving the MERGED aggregate over both keys.
+    ///
+    /// Under the OLD off-fence design the epoch would be assigned before the fence,
+    /// so finishing out of order delivers epoch N+1 before N to the FIFO applier;
+    /// `begin_maintenance_pass` then PERMANENTLY stales the registry on the +1 gap,
+    /// `batch_for_aggregate` never returns Some, and `poll_maintained_serve` times
+    /// out -> this test fails. With the fence-atomic fix it passes.
+    #[tokio::test]
+    async fn test_pipelined_staged_finish_keeps_registry_fresh() {
+        let ctx = SessionContext::new();
+        let (provider, _catalog, _tmp) = create_cdc_upsert_table_with_maintained_aggregates(
+            "staged_ivm_reorder",
+            ctx.runtime_env(),
+            vec![id_count_sum_spec()],
+        )
+        .await;
+        let schema = Arc::clone(&provider.table_metadata.schema);
+
+        // Stage two disjoint-key writes; both durable, both pending finalize.
+        let first = provider
+            .write_cdc_append_stream(
+                single_batch_stream(id_value_batch(Arc::clone(&schema), &[1], &[10])),
+                &ctx.task_ctx(),
+            )
+            .await
+            .expect("first staged write should prepare");
+        assert!(first.has_pending_finalize());
+
+        let second = provider
+            .write_cdc_append_stream(
+                single_batch_stream(id_value_batch(Arc::clone(&schema), &[2], &[20])),
+                &ctx.task_ctx(),
+            )
+            .await
+            .expect("second staged write should prepare while first finalize is pending");
+        assert!(second.has_pending_finalize());
+
+        // Finish OUT OF ORDER (second before first). The fence serializes the two
+        // finish() tasks: each assigns its epoch + enqueues atomically, so the
+        // applier sees a dense +1 chain regardless of finish ordering.
+        second.finish().await.expect("finalize second staged write");
+        first.finish().await.expect("finalize first staged write");
+
+        // Both keys are visible to a normal scan...
+        assert_eq!(
+            collect_id_value_pairs(&ctx, &provider, "staged_ivm_reorder").await,
+            vec![(1, 10), (2, 20)],
+        );
+
+        // ...and the registry is STILL FRESH (not permanently staled by a reordered
+        // epoch enqueue) and serves the merged aggregate over both keys.
+        let aggregate_exec = build_id_count_sum_aggregate_exec();
+        let served = poll_maintained_serve(&provider, &aggregate_exec).await;
+        assert_eq!(
+            collect_id_count_sum(&served),
+            vec![(1, 1, 10), (2, 1, 20)],
+            "pipelined out-of-order staged finishes must keep the IVM registry fresh \
+             and serve the merged aggregate (fence-atomic epoch+enqueue)"
+        );
     }
 
     // ----------------------------------------------------------------------
