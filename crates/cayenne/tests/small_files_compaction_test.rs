@@ -821,7 +821,11 @@ async fn compaction_survives_provider_reopen(
     // call. Treat "file count already ≤ 2" as evidence it fired.
     let mut committed = false;
     for _ in 0..50 {
-        let snap = fixture.catalog.get_table("compaction_reopen").await?.current_snapshot_id;
+        let snap = fixture
+            .catalog
+            .get_table("compaction_reopen")
+            .await?
+            .current_snapshot_id;
         if count_vortex_files(&fixture.data_path, &table_id, &snap).await <= 2 {
             committed = true;
             break;
