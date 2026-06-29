@@ -1479,6 +1479,14 @@ fn effective_query_memory_limit(memory_limit: Option<u64>, cayenne_active: bool)
 /// the 75% query+compaction block the host partitions as 75% / 12.5% / 12.5%.
 const MEM_TIER_CEILING_FRACTION: u64 = 8;
 const MEM_TIER_HEADROOM_FRACTION: u64 = 8;
+/// Raised tier ceiling (1/N of host, > the base `MEM_TIER_CEILING_FRACTION`) the
+/// tier may FLOAT up to on a query-light deployment — one where the operator set a
+/// low `runtime.query.memory_limit`, leaving RAM the default partition would not
+/// otherwise use. The float only consumes room left beyond a DOUBLED headroom
+/// reserve and never exceeds the coordinated remainder, so `query_pool +
+/// compaction + tier + headroom <= host` (the #11449 invariant) is preserved
+/// exactly. 1/6 ≈ 16.7%, a modest bump from the 12.5% base.
+const MEM_TIER_FLOAT_CEILING_FRACTION: u64 = 6;
 /// Floor (1/N of host) so a global aggregate cap is ALWAYS installed — a tier
 /// budget of 0 disables the global cap entirely (per-table caps then sum unbounded
 /// across a fleet: the original no-global-cap OOM). Binds only when an operator
@@ -1513,12 +1521,29 @@ pub(crate) fn coordinated_mem_tier_budget(
     compaction_pool_bytes: u64,
 ) -> u64 {
     let headroom = total_memory / MEM_TIER_HEADROOM_FRACTION;
-    let ceiling = total_memory / MEM_TIER_CEILING_FRACTION;
-    let floor = (total_memory / MEM_TIER_FLOOR_FRACTION).min(ceiling);
+    let base_ceiling = total_memory / MEM_TIER_CEILING_FRACTION;
+    let floor = (total_memory / MEM_TIER_FLOOR_FRACTION).min(base_ceiling);
     let remainder = total_memory
         .saturating_sub(query_pool_bytes)
         .saturating_sub(compaction_pool_bytes)
         .saturating_sub(headroom);
+    // Floating ceiling for query-light deployments: when the query + compaction
+    // pools are sized well below the default partition (an operator who set a low
+    // `runtime.query.memory_limit`), let the tier reclaim part of the freed RAM
+    // above the base host/8 cap — up to `host / MEM_TIER_FLOAT_CEILING_FRACTION` —
+    // but only the room left beyond a DOUBLED headroom reserve, so the off-pool
+    // caches/memtables the single headroom covers keep their slack. Raising only the
+    // ceiling never lifts the result above `remainder` (the ceiling caps from above,
+    // and `remainder` is computed with the single headroom), so the floating ceiling
+    // preserves the #11449 no-overcommit invariant `query_pool + compaction + tier +
+    // headroom <= host` for ANY ceiling — subject to the same `remainder >= floor`
+    // PRECONDITION above: when the floor wins (`remainder < floor`) the clamp returns
+    // `floor > remainder` and the caller warns instead.
+    let float_room = total_memory
+        .saturating_sub(query_pool_bytes)
+        .saturating_sub(compaction_pool_bytes)
+        .saturating_sub(2 * headroom);
+    let ceiling = base_ceiling.max(float_room.min(total_memory / MEM_TIER_FLOAT_CEILING_FRACTION));
     remainder.clamp(floor, ceiling)
 }
 
@@ -1744,8 +1769,8 @@ mod tests {
 
     use super::{
         CAYENNE_QUERY_MEMORY_PERCENT, CayenneOptimizerRules, DEFAULT_QUERY_MEMORY_PERCENT,
-        DataFusionBuilder, MEM_TIER_CEILING_FRACTION, MEM_TIER_FLOOR_FRACTION,
-        MEM_TIER_HEADROOM_FRACTION, build_compaction_runtime_env,
+        DataFusionBuilder, MEM_TIER_CEILING_FRACTION, MEM_TIER_FLOAT_CEILING_FRACTION,
+        MEM_TIER_FLOOR_FRACTION, MEM_TIER_HEADROOM_FRACTION, build_compaction_runtime_env,
         configure_hash_join_memory_limits, coordinated_mem_tier_budget,
         effective_query_memory_limit,
         runtime_env_with_effective_memory_limit_and_object_store_registry,
@@ -1813,21 +1838,40 @@ mod tests {
         }
     }
 
-    /// The tier budget is always clamped to `[host/32, host/8]`: never 0 (a 0
-    /// budget disables the global aggregate cap, the original no-global-cap OOM)
-    /// and never more than 1/8 of host even when the pools are tiny.
+    /// The tier budget is always clamped to `[host/32, host/MEM_TIER_FLOAT_CEILING]`:
+    /// never 0 (a 0 budget disables the global aggregate cap, the original
+    /// no-global-cap OOM) and never above the float ceiling even when the pools are
+    /// tiny. The float (host/6) only engages on a query-light deployment and never
+    /// breaks the no-overcommit invariant.
     #[test]
     fn coordinated_tier_budget_stays_within_clamp() {
         for gib in [16_u64, 64, 256, 1024] {
             let total = gib << 30;
-            let floor = (total / MEM_TIER_FLOOR_FRACTION).min(total / MEM_TIER_CEILING_FRACTION);
-            let ceiling = total / MEM_TIER_CEILING_FRACTION;
+            let base_ceiling = total / MEM_TIER_CEILING_FRACTION;
+            let float_ceiling = total / MEM_TIER_FLOAT_CEILING_FRACTION;
+            let floor = (total / MEM_TIER_FLOOR_FRACTION).min(base_ceiling);
 
-            // Tiny pools → tier grows to the ceiling (uses spare RAM), never above.
+            // A tiny query pool (query-light) → the tier floats up to the raised
+            // ceiling to use the spare RAM, never above it.
             let big = coordinated_mem_tier_budget(total, total / 100, 0);
             assert_eq!(
-                big, ceiling,
-                "small pools should grow the tier to the ceiling"
+                big, float_ceiling,
+                "a query-light deployment floats the tier to the raised ceiling"
+            );
+            // ...and even at the raised ceiling the no-overcommit invariant holds.
+            let headroom = total / MEM_TIER_HEADROOM_FRACTION;
+            assert!(
+                (total / 100) + big + headroom <= total,
+                "the float must not overcommit host RAM"
+            );
+
+            // A moderate query pool at the default 75% partition stays at/under the
+            // BASE ceiling (the float only helps when the pool is sized down).
+            let pre_carve = total.saturating_mul(CAYENNE_QUERY_MEMORY_PERCENT) / 100;
+            let moderate = coordinated_mem_tier_budget(total, pre_carve, 0);
+            assert!(
+                moderate <= base_ceiling,
+                "the default partition does not float above the base ceiling"
             );
 
             // A greedy pool that consumes all of host → tier floored, never 0.

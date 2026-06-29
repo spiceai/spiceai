@@ -42,9 +42,7 @@ use std::task::{Context, Poll};
 use std::time::Instant;
 
 use super::deletion_index::{DeletionIndex, KeyDeletionIndex};
-use super::deletion_strategy::{
-    Int64PkDeletionSnapshot, PkDeletionStrategyWithCache, RowConverterDeletionSnapshot,
-};
+use super::deletion_strategy::PkDeletionStrategyWithCache;
 use super::table::{
     CayenneTableProvider, InlinedDeletionMaps, OnConflictExt, UpsertOptions,
     record_cayenne_write_phase,
@@ -362,6 +360,9 @@ pub(crate) struct BatchValidationResult {
     pub(crate) deleted_inlined_pk_i64: Vec<i64>,
     /// Inlined row key bytes being deleted.
     pub(crate) deleted_inlined_row_keys: Vec<Box<[u8]>>,
+    /// Count of reinsert-over-tombstone resurrections among the keys above; see
+    /// [`OnConflictDeletions::reinserted_over_tombstone`].
+    pub(crate) reinserted_over_tombstone: usize,
 }
 
 pub(crate) struct PreparedInsertStream {
@@ -441,6 +442,15 @@ pub(crate) struct OnConflictDeletions {
     pub(crate) deleted_inlined_pk_i64: Vec<i64>,
     /// Deleted inlined row keys.
     pub(crate) deleted_inlined_row_keys: Vec<Box<[u8]>>,
+    /// How many of the keys in the lists above are reinsert-over-tombstone
+    /// resurrections (a key ABSENT from the visible existence index that still
+    /// carried a pending DELETE tombstone) rather than supersedes of a live row.
+    /// These are pushed to the key-lists ONLY to drive the reinsert-marker
+    /// machinery (reserve an `insert_sequence`, write the insert-record); they
+    /// replace no live row, so `total_superseded` excludes them from the
+    /// live-row delta. Counted ONCE per resurrected key even though the key is
+    /// pushed to both a file and an inline list. See `apply_on_conflict_to_batch`.
+    pub(crate) reinserted_over_tombstone: usize,
 }
 
 impl OnConflictDeletions {
@@ -461,13 +471,22 @@ impl OnConflictDeletions {
     /// contribute only the EXCESS beyond the key-based total — exactly the
     /// conflicts with no key twin (the `PositionBased` strategy, whose key
     /// lists stay empty).
+    ///
+    /// Reinsert-over-tombstone resurrections (`reinserted_over_tombstone`) are
+    /// subtracted from BOTH the file-key and inline-key totals: a resurrected
+    /// key sits in both a file and an inline list (to drive the reinsert marker)
+    /// but supersedes no live row, so it must not inflate the live-row delta. A
+    /// table uses a single PK strategy, so the count's keys live in exactly one
+    /// of the `i64`/row-key list pairs and `saturating_sub` never underflows.
     pub(crate) fn total_superseded(&self) -> usize {
         let position_deletes = self.delete_specs.values().map(Vec::len).sum::<usize>();
-        let file_key_deletes = self.deleted_pk_i64.len() + self.deleted_row_keys.len();
-        file_key_deletes
-            + position_deletes.saturating_sub(file_key_deletes)
-            + self.deleted_inlined_pk_i64.len()
-            + self.deleted_inlined_row_keys.len()
+        let reinserts = self.reinserted_over_tombstone;
+        let file_key_deletes =
+            (self.deleted_pk_i64.len() + self.deleted_row_keys.len()).saturating_sub(reinserts);
+        let inline_key_deletes = (self.deleted_inlined_pk_i64.len()
+            + self.deleted_inlined_row_keys.len())
+        .saturating_sub(reinserts);
+        file_key_deletes + position_deletes.saturating_sub(file_key_deletes) + inline_key_deletes
     }
 }
 
@@ -516,13 +535,48 @@ impl OnConflictUpdate {
     }
 }
 
+/// A replayable deletion-index delta, folded into the LIVE index under `rcu`
+/// at publish time.
+///
+/// Carrying the operations — rather than a snapshot prebuilt from a `load` at
+/// prepare time — is what makes the on-conflict publish lost-update-safe:
+/// `commit_on_conflict_deletion_update` re-applies the delta against whatever
+/// index is live when it commits, so a concurrent compaction prune or
+/// delete-sink add (which serialize on a DIFFERENT lock than the on-conflict
+/// finalize) can never be clobbered by storing a snapshot built off a stale
+/// load. The `extend_max_*` folds are per-key max, so replaying the delta over
+/// concurrent changes is order-independent.
+pub(crate) struct Int64DeletionDelta {
+    /// `(delete_sequence, pks)` groups folded via `extend_max_deletes`.
+    pub(crate) pure: Vec<Int64DeleteGroup>,
+    /// `(delete_sequence, pks, insert_sequence)` groups folded via `extend_max_conflicts`.
+    pub(crate) reinsert: Vec<Int64ReinsertGroup>,
+}
+
+/// One `extend_max_deletes` group: a delete sequence and the int64 PKs deleted at it.
+type Int64DeleteGroup = (i64, Vec<i64>);
+/// One `extend_max_conflicts` group: delete sequence, int64 PKs, and the re-insert sequence.
+type Int64ReinsertGroup = (i64, Vec<i64>, i64);
+/// Key-based counterpart of [`Int64DeleteGroup`].
+type RowKeyDeleteGroup = (i64, Vec<Box<[u8]>>);
+/// Key-based counterpart of [`Int64ReinsertGroup`].
+type RowKeyReinsertGroup = (i64, Vec<Box<[u8]>>, i64);
+
+/// Key-based counterpart to [`Int64DeletionDelta`].
+pub(crate) struct RowKeyDeletionDelta {
+    /// `(delete_sequence, keys)` groups folded via `extend_max_deletes`.
+    pub(crate) pure: Vec<RowKeyDeleteGroup>,
+    /// `(delete_sequence, keys, insert_sequence)` groups folded via `extend_max_conflicts`.
+    pub(crate) reinsert: Vec<RowKeyReinsertGroup>,
+}
+
 pub(crate) enum OnConflictDeletionUpdate {
     /// No key-based deletion-cache change (pure position deletes or no deletes).
     None,
-    /// New `Int64Pk` deletion snapshot to publish.
-    Int64Pk(Arc<Int64PkDeletionSnapshot>),
-    /// New `RowConverterBased` deletion snapshot to publish.
-    RowConverter(Arc<RowConverterDeletionSnapshot>),
+    /// `Int64Pk` deletion delta to fold into the live index.
+    Int64Pk(Int64DeletionDelta),
+    /// `RowConverterBased` deletion delta to fold into the live index.
+    RowConverter(RowKeyDeletionDelta),
 }
 
 #[derive(Clone)]
@@ -786,6 +840,7 @@ pub(crate) struct OnConflictValidationStream {
     pub(crate) deleted_row_keys: Vec<Box<[u8]>>,
     pub(crate) deleted_inlined_pk_i64: Vec<i64>,
     pub(crate) deleted_inlined_row_keys: Vec<Box<[u8]>>,
+    reinserted_over_tombstone: usize,
     post_validation: Arc<ParkingMutex<Option<PostValidationState>>>,
     finalized: bool,
 }
@@ -818,6 +873,7 @@ impl OnConflictValidationStream {
             deleted_row_keys: Vec::new(),
             deleted_inlined_pk_i64: Vec::new(),
             deleted_inlined_row_keys: Vec::new(),
+            reinserted_over_tombstone: 0,
             post_validation,
             finalized: false,
         }
@@ -867,6 +923,7 @@ impl OnConflictValidationStream {
             deleted_row_keys,
             deleted_inlined_pk_i64,
             deleted_inlined_row_keys,
+            reinserted_over_tombstone,
         } = validation_result.map_err(datafusion_common::DataFusionError::from)?;
 
         for (file_path, rows) in batch_delete_specs {
@@ -878,6 +935,7 @@ impl OnConflictValidationStream {
         self.deleted_inlined_pk_i64.extend(deleted_inlined_pk_i64);
         self.deleted_inlined_row_keys
             .extend(deleted_inlined_row_keys);
+        self.reinserted_over_tombstone += reinserted_over_tombstone;
 
         self.incoming_keys.extend(kept_keys.iter().cloned());
         self.kept_keys.extend(kept_keys);
@@ -904,6 +962,7 @@ impl OnConflictValidationStream {
                 deleted_row_keys: std::mem::take(&mut self.deleted_row_keys),
                 deleted_inlined_pk_i64: std::mem::take(&mut self.deleted_inlined_pk_i64),
                 deleted_inlined_row_keys: std::mem::take(&mut self.deleted_inlined_row_keys),
+                reinserted_over_tombstone: self.reinserted_over_tombstone,
             },
             validated_keys: std::mem::take(&mut self.kept_keys),
         };

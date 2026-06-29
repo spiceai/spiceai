@@ -442,8 +442,11 @@ impl SearchIndex for ChunkedSearchIndex {
         let (offsets, chunks): (Vec<Vec<(usize, usize)>>, Vec<Vec<_>>) = arr_str
             .map(|s_opt| {
                 if let Some(s) = s_opt {
+                    // Character offsets, not byte offsets: the read path extracts
+                    // the snippet with DataFusion `substring` (1-based, char-counted).
+                    // See issue #11269.
                     self.chunker
-                        .chunk_with_offsets(s)
+                        .chunk_with_char_offsets(s)
                         .collect::<Vec<_>>()
                         .into_iter()
                         .unzip::<_, _, Vec<(usize, usize)>, Vec<&str>>()
@@ -856,6 +859,109 @@ mod tests {
         // [2, 1, 3, 4, 1] with budget=5: 2+1=3, +3=6>5 → flush; 3, +4=7>5 → flush; 4, +1=5 → ok.
         let groups = group_rows_by_chunk_budget(&[2, 1, 3, 4, 1], 5);
         assert_eq!(groups, vec![(0, 2), (2, 1), (3, 2)]);
+    }
+
+    /// Regression for issue #11269: the chunk offsets persisted by the write
+    /// path (`to_offset_array` of `chunk_with_char_offsets`) must round-trip
+    /// through the read path's `substring` extraction and recover each chunk
+    /// exactly — including for non-ASCII text, where byte offsets (the old
+    /// behavior) produced shifted/garbled snippets.
+    #[tokio::test]
+    async fn substring_read_path_recovers_chunks_including_unicode() {
+        use arrow::array::ArrayRef;
+        use arrow::datatypes::{DataType, Field, Schema};
+        use arrow::record_batch::RecordBatch;
+        use chunking::{ChunkingConfig, RecursiveSplittingChunker};
+        use datafusion::datasource::MemTable;
+        use datafusion::logical_expr::Operator;
+        use datafusion::prelude::{
+            SessionContext, array_element, binary_expr, cast, col, lit, substring,
+        };
+        use std::sync::Arc;
+
+        let cfg = ChunkingConfig {
+            target_chunk_size: 4,
+            overlap_size: 0,
+            trim_whitespace: false,
+            file_format: None,
+        };
+        let text_chunker =
+            RecursiveSplittingChunker::with_character_sizer(&cfg).expect("create chunker");
+
+        // Multi-byte characters so byte and character offsets diverge — the heart
+        // of the bug. The first chunk also exercises the 0-based→1-based fix.
+        let text = "café über señor data points";
+        let chunked: Vec<((usize, usize), String)> = text_chunker
+            .chunk_with_char_offsets(text)
+            .map(|(off, c)| (off, c.to_string()))
+            .collect();
+        assert!(
+            chunked.len() >= 2,
+            "need multiple chunks to exercise offsets, got {}",
+            chunked.len()
+        );
+
+        let offsets: Vec<Vec<(usize, usize)>> = vec![chunked.iter().map(|(off, _)| *off).collect()];
+        let offset_arr = to_offset_array(&offsets, false);
+        let n = chunked.len();
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("q", DataType::Utf8, false),
+            Field::new("q_offset", offset_arr.data_type().clone(), false),
+        ]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(StringArray::from(vec![text; n])) as ArrayRef,
+                Arc::new(offset_arr) as ArrayRef,
+            ],
+        )
+        .expect("build record batch");
+
+        let ctx = SessionContext::new();
+        let table = MemTable::try_new(schema, vec![vec![batch]]).expect("create memtable");
+        let df = ctx.read_table(Arc::new(table)).expect("read table");
+
+        // Mirrors the extraction in `SearchTableProvider::add_match_column`
+        // (crates/search/src/provider.rs) and the candidate vector read path
+        // (crates/runtime-search/src/candidate/vector.rs): 0-based character
+        // offsets, 1-based char-counted `substring`, so start = offset[1] + 1
+        // and length = offset[2] - offset[1].
+        let start = array_element(col("q_offset"), lit(1));
+        let extracted = df
+            .select(vec![
+                cast(
+                    substring(
+                        col("q"),
+                        binary_expr(start.clone(), Operator::Plus, lit(1)),
+                        binary_expr(
+                            array_element(col("q_offset"), lit(2)),
+                            Operator::Minus,
+                            start,
+                        ),
+                    ),
+                    DataType::Utf8,
+                )
+                .alias("match"),
+            ])
+            .expect("select substring");
+
+        let results = extracted.collect().await.expect("collect results");
+        let total: usize = results.iter().map(RecordBatch::num_rows).sum();
+        assert_eq!(total, n, "one extracted snippet per chunk");
+
+        let col0 = results[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("utf8 match column");
+        for (i, (_, chunk)) in chunked.iter().enumerate() {
+            assert_eq!(
+                col0.value(i),
+                chunk.as_str(),
+                "extracted snippet must equal the original chunk (row {i})"
+            );
+        }
     }
 
     #[test]

@@ -220,8 +220,10 @@ pub(crate) fn is_pk_visible_row_key(
 }
 
 /// Demote child scan statistics to `Inexact` because a deletion filter removes
-/// (and, under `InsertRecordHandling::Apply`, may also re-add) an unknown subset
-/// of input rows.
+/// (and, under `InsertRecordHandling::Apply`, may also re-add) a subset of input
+/// rows, and — for the table-wide aggregate — subtract the pending merge-on-read
+/// deletion count from `num_rows`/`total_byte_size` so consumers size the *live*
+/// relation rather than the pre-deletion on-disk count.
 ///
 /// The child here is a Cayenne Vortex scan whose per-partition statistics — row
 /// counts and column min/max — are derived exactly from file-level metadata
@@ -236,10 +238,92 @@ pub(crate) fn is_pk_visible_row_key(
 /// - **Absent** statistics (e.g. the scan ran with `collect_stat = false`, so no
 ///   file metadata was materialized) stay `Absent` through `to_inexact()` — i.e.
 ///   the unknown-input case degrades to unknown output, not a fabricated value.
+///
+/// `net_deletions` is the count of rows the filter is expected to remove for the
+/// statistics being produced — the recorded deletions net of upsert re-insertions
+/// that keep their row (see [`net_table_deletions`]). It is subtracted from
+/// `num_rows` (clamped at 0), and `total_byte_size` is scaled by the surviving
+/// fraction. Without this subtraction a table with N pending merge-on-read
+/// deletes reports its full `live + N` on-disk row count, mis-sizing
+/// `JoinSelection`'s build-side / broadcast choice (which reads `num_rows` /
+/// `total_byte_size` directly) until the next compaction resets the count.
+/// Under-counting the removals is the safe direction — an over-sized `num_rows`
+/// only declines a broadcast — whereas over-subtracting could broadcast an
+/// actually-large table, so `net_deletions` is a deliberately conservative lower
+/// bound on rows removed and callers pass `0` where the applicable subset is
+/// unknown (per-partition stats; protected-snapshot scans).
 fn deletion_filtered_statistics(
     input_statistics: datafusion_common::Statistics,
+    net_deletions: usize,
 ) -> datafusion_common::Statistics {
-    input_statistics.to_inexact()
+    use datafusion_common::stats::Precision;
+
+    let mut stats = input_statistics.to_inexact();
+    // `to_inexact()` maps Exact -> Inexact and leaves Absent as Absent, so only an
+    // Inexact (known) row count can — and should — be reduced here. Nothing to do
+    // when there are no deletions to apply or the relation is already empty.
+    let Precision::Inexact(rows) = stats.num_rows else {
+        return stats;
+    };
+    // Keep the pre-deletion upper bound when the subtraction would over-apply
+    // (`net_deletions >= rows`). `net_deletions` is derived from whole-table
+    // tombstone key counts and can meet or exceed this scan's `num_rows` (e.g. a
+    // count mismatch between the union row estimate and the deletion index);
+    // collapsing to `num_rows = 0` is the dangerous direction — it can make a
+    // non-empty relation look empty and get it wrongly broadcast. Over-estimating
+    // (keeping the upper bound) only declines a broadcast, the safe direction.
+    if net_deletions == 0 || rows == 0 || net_deletions >= rows {
+        return stats;
+    }
+    let live = rows - net_deletions;
+    // Scale total_byte_size by the surviving row fraction so build-side byte
+    // thresholds see the live footprint, not the pre-deletion one. Use saturating
+    // multiplication and round the division UP: systematically under-estimating
+    // bytes would bias build-side selection toward broadcasting (the riskier
+    // direction), so bias the estimate high instead.
+    if let Precision::Inexact(bytes) = stats.total_byte_size {
+        let bytes_u128 = u128::try_from(bytes).unwrap_or(u128::MAX);
+        let live_u128 = u128::try_from(live).unwrap_or(u128::MAX);
+        let rows_u128 = u128::try_from(rows).unwrap_or(u128::MAX);
+        let scaled = bytes_u128.saturating_mul(live_u128).div_ceil(rows_u128);
+        stats.total_byte_size = Precision::Inexact(usize::try_from(scaled).unwrap_or(usize::MAX));
+    }
+    stats.num_rows = Precision::Inexact(live);
+    stats
+}
+
+/// Estimate how many rows a deletion filter removes from the *table-wide*
+/// statistics, given the recorded deletion/insert counts.
+///
+/// The caller invokes this only for the whole-table aggregate (`partition ==
+/// None`) and only when there is no protected-snapshot cutoff — per-partition
+/// stats can't attribute the table's deletes to one partition, and under a cutoff
+/// only deletions newer than it apply (an unknown subset); both keep the
+/// pre-deletion upper bound by passing no subtraction.
+///
+/// Returns `0` (keep the upper bound) when the input scan has a pushed filter:
+/// the file-metadata `num_rows` then describes the *filtered subset*, while
+/// `delete_len` is whole-table, so subtracting it could drive `num_rows` far
+/// below the live count — the dangerous over-subtraction direction, where a
+/// too-small build side gets wrongly broadcast. Otherwise the net removal is the
+/// recorded deletion count, less — under [`InsertRecordHandling::Apply`] — the
+/// upsert re-insertions that keep their row (a conservative lower bound on rows
+/// removed).
+fn net_table_deletions(
+    insert_record_handling: InsertRecordHandling,
+    input_has_pushed_filter: bool,
+    delete_len: usize,
+    insert_len: usize,
+) -> usize {
+    if input_has_pushed_filter {
+        return 0;
+    }
+    match insert_record_handling {
+        // A deleted-then-reinserted PK keeps a live row, so it is not removed.
+        InsertRecordHandling::Apply => delete_len.saturating_sub(insert_len),
+        // Re-inserts never override the delete; every recorded delete removes a row.
+        InsertRecordHandling::Ignore => delete_len,
+    }
 }
 
 // ============================================================================
@@ -375,8 +459,23 @@ impl ExecutionPlan for KeyBasedDeletionFilterExec {
         &self,
         partition: Option<usize>,
     ) -> datafusion_common::Result<Arc<datafusion_common::Statistics>> {
+        // Only the whole-table aggregate (`partition == None`) is delete-aware, and
+        // only outside a protected-snapshot cutoff — see `net_table_deletions`. Both
+        // gates short-circuit here so the per-partition path skips the scan-subtree
+        // filter walk entirely.
+        let net_deletions = if partition.is_none() && self.min_delete_seq_to_apply.is_none() {
+            net_table_deletions(
+                self.insert_record_handling,
+                crate::provider::scan::plan_has_pushed_filter(&self.input),
+                self.tombstones.delete_len(),
+                self.tombstones.insert_len(),
+            )
+        } else {
+            0
+        };
         Ok(Arc::new(deletion_filtered_statistics(
             self.input.partition_statistics(partition)?.as_ref().clone(),
+            net_deletions,
         )))
     }
 
@@ -741,8 +840,23 @@ impl ExecutionPlan for Int64PkDeletionFilterExec {
         &self,
         partition: Option<usize>,
     ) -> datafusion_common::Result<Arc<datafusion_common::Statistics>> {
+        // Only the whole-table aggregate (`partition == None`) is delete-aware, and
+        // only outside a protected-snapshot cutoff — see `net_table_deletions`. Both
+        // gates short-circuit here so the per-partition path skips the scan-subtree
+        // filter walk entirely.
+        let net_deletions = if partition.is_none() && self.min_delete_seq_to_apply.is_none() {
+            net_table_deletions(
+                self.insert_record_handling,
+                crate::provider::scan::plan_has_pushed_filter(&self.input),
+                self.tombstones.delete_len(),
+                self.tombstones.insert_len(),
+            )
+        } else {
+            0
+        };
         Ok(Arc::new(deletion_filtered_statistics(
             self.input.partition_statistics(partition)?.as_ref().clone(),
+            net_deletions,
         )))
     }
 
@@ -1226,12 +1340,15 @@ mod tests {
         let stats = exec
             .partition_statistics(Some(0))
             .expect("partition statistics");
+        // Per-partition: the upper bound (3), precision relaxed — the per-partition
+        // delete distribution is unknown, so no subtraction here.
         assert_eq!(stats.num_rows, Precision::Inexact(3));
-        // Aggregate (partition = None) must also be inexact, not unknown.
+        // Aggregate (partition = None) is delete-aware: 3 rows - 1 deleted key
+        // (Ignore -> the delete is not overridden) = 2 live rows.
         let agg = exec
             .partition_statistics(None)
             .expect("aggregate statistics");
-        assert_eq!(agg.num_rows, Precision::Inexact(3));
+        assert_eq!(agg.num_rows, Precision::Inexact(2));
     }
 
     /// Same downgrade for the byte-keyed (composite/non-integer PK) filter.
@@ -1254,6 +1371,149 @@ mod tests {
         assert_eq!(stats.num_rows, Precision::Inexact(3));
     }
 
+    /// The table-wide aggregate (`partition == None`) is delete-aware: it
+    /// subtracts the pending merge-on-read deletion count from `num_rows` so
+    /// `JoinSelection` (which reads `num_rows`/`total_byte_size` directly) sizes
+    /// the LIVE relation, not the pre-deletion on-disk count. Per-partition stats
+    /// keep the upper bound, since the per-partition delete distribution is unknown.
+    #[test]
+    fn deletion_filter_aggregate_num_rows_is_delete_aware() {
+        // 3-row scan, 1 deleted key (Ignore: the delete is never overridden).
+        let exec = Int64PkDeletionFilterExec::new(
+            exact_int64_scan(),
+            int64_tombstones(),
+            InsertRecordHandling::Ignore,
+            0,
+            None,
+        );
+        let agg = exec
+            .partition_statistics(None)
+            .expect("aggregate statistics");
+        assert_eq!(agg.num_rows, Precision::Inexact(2));
+        let per = exec
+            .partition_statistics(Some(0))
+            .expect("partition statistics");
+        assert_eq!(per.num_rows, Precision::Inexact(3));
+    }
+
+    /// Protected-snapshot scans (`min_delete_seq_to_apply` set) keep the upper
+    /// bound: only deletions newer than the cutoff apply and we don't cheaply
+    /// know how many that is, so no subtraction.
+    #[test]
+    fn deletion_filter_protected_snapshot_keeps_upper_bound() {
+        let exec = Int64PkDeletionFilterExec::new(
+            exact_int64_scan(),
+            int64_tombstones(),
+            InsertRecordHandling::Ignore,
+            0,
+            Some(0),
+        );
+        let agg = exec
+            .partition_statistics(None)
+            .expect("aggregate statistics");
+        assert_eq!(agg.num_rows, Precision::Inexact(3));
+    }
+
+    /// Upsert-churn safety: a key that was deleted AND re-inserted keeps its row
+    /// under `InsertRecordHandling::Apply`, so it must NOT be subtracted. With
+    /// `delete_len == insert_len` the net removal is 0 — guarding against
+    /// catastrophically under-sizing a heavily-upserted CDC table (the dangerous
+    /// over-subtraction direction that would wrongly broadcast a large relation).
+    #[test]
+    fn deletion_filter_does_not_subtract_reinserted_upserts() {
+        // 2 deleted keys, 1 of them re-inserted (upsert, insert_seq > delete_seq)
+        // -> net removed = delete_len(2) - insert_len(1) = 1.
+        let tombstones = Arc::new(DeletionIndex::from_maps(
+            HashMap::from([(2_i64, 5_i64), (3_i64, 5_i64)]),
+            HashMap::from([(2_i64, 10_i64)]),
+        ));
+        let exec = Int64PkDeletionFilterExec::new(
+            exact_int64_scan(),
+            tombstones,
+            InsertRecordHandling::Apply,
+            0,
+            None,
+        );
+        let agg = exec
+            .partition_statistics(None)
+            .expect("aggregate statistics");
+        assert_eq!(agg.num_rows, Precision::Inexact(2));
+    }
+
+    /// Over-apply guard: when the (whole-table) deletion count meets or exceeds
+    /// the scan's row count, keep the pre-deletion upper bound rather than
+    /// collapsing `num_rows` toward 0 — collapsing is the dangerous direction (it
+    /// can make a non-empty relation look empty and get it wrongly broadcast).
+    #[test]
+    fn deletion_filter_keeps_upper_bound_when_deletes_exceed_rows() {
+        let tombstones = Arc::new(DeletionIndex::from_map(HashMap::from([
+            (1_i64, 5_i64),
+            (2, 5),
+            (3, 5),
+            (4, 5),
+            (5, 5),
+        ])));
+        let exec = Int64PkDeletionFilterExec::new(
+            exact_int64_scan(),
+            tombstones,
+            InsertRecordHandling::Ignore,
+            0,
+            None,
+        );
+        // 5 deletes >= 3 scanned rows -> keep the upper bound (3), not 0.
+        let agg = exec
+            .partition_statistics(None)
+            .expect("aggregate statistics");
+        assert_eq!(agg.num_rows, Precision::Inexact(3));
+    }
+
+    /// `net_table_deletions` keeps the pre-deletion upper bound (returns 0) when
+    /// the input scan has a pushed filter — its `num_rows` is the filtered subset,
+    /// so subtracting the whole-table `delete_len` would over-subtract (the
+    /// dangerous direction). Otherwise it subtracts `delete_len` (`Ignore`) or
+    /// `delete_len - insert_len` (`Apply`), clamped at 0.
+    #[test]
+    fn net_table_deletions_keeps_upper_bound_under_pushed_filter() {
+        // No pushed filter: subtract.
+        assert_eq!(
+            net_table_deletions(InsertRecordHandling::Ignore, false, 10, 0),
+            10
+        );
+        assert_eq!(
+            net_table_deletions(InsertRecordHandling::Apply, false, 10, 3),
+            7
+        );
+        // Pushed filter: keep the upper bound (num_rows is the filtered subset).
+        assert_eq!(
+            net_table_deletions(InsertRecordHandling::Ignore, true, 10, 0),
+            0
+        );
+        assert_eq!(
+            net_table_deletions(InsertRecordHandling::Apply, true, 10, 3),
+            0
+        );
+        // Apply with more re-inserts than deletes clamps at 0 (no underflow).
+        assert_eq!(
+            net_table_deletions(InsertRecordHandling::Apply, false, 3, 5),
+            0
+        );
+    }
+
+    /// `total_byte_size` is scaled by the surviving row fraction so build-side
+    /// byte thresholds see the live footprint.
+    #[test]
+    fn deletion_filtered_statistics_scales_byte_size_by_survivors() {
+        let input = Statistics {
+            num_rows: Precision::Exact(10),
+            total_byte_size: Precision::Exact(100),
+            column_statistics: vec![],
+        };
+        // Remove 4 of 10 -> 6 live; bytes 100 * 6/10 = 60.
+        let out = deletion_filtered_statistics(input, 4);
+        assert_eq!(out.num_rows, Precision::Inexact(6));
+        assert_eq!(out.total_byte_size, Precision::Inexact(60));
+    }
+
     /// Column min/max bounds survive the downgrade (still useful for range
     /// pruning) — deleting rows can only shrink a range, so the bounds stay
     /// conservative; only their precision relaxes to `Inexact`.
@@ -1271,7 +1531,7 @@ mod tests {
                 byte_size: Precision::Absent,
             }],
         };
-        let out = deletion_filtered_statistics(input_stats);
+        let out = deletion_filtered_statistics(input_stats, 0);
         let col = &out.column_statistics[0];
         assert_eq!(
             col.min_value,
@@ -1292,7 +1552,8 @@ mod tests {
     fn deletion_filter_keeps_unknown_when_metadata_absent() {
         let schema = Schema::new(vec![Field::new("id", DataType::Int64, false)]);
         let unknown = Statistics::new_unknown(&schema);
-        let out = deletion_filtered_statistics(unknown);
+        // Absent stays Absent regardless of the deletion count (nothing to reduce).
+        let out = deletion_filtered_statistics(unknown, 5);
         assert_eq!(out.num_rows, Precision::Absent);
         assert_eq!(out.total_byte_size, Precision::Absent);
     }

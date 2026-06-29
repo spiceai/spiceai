@@ -9,10 +9,10 @@ name: testoperator cluster bench dispatch
 # Spice Cloud resource usage bounded.
 
 on:
-  # No automatic schedule for now — the distributed cluster benchmark is run
-  # manually via workflow_dispatch until the outstanding cluster issues are
-  # resolved (executor ephemeral-storage eviction, see #11433, plus the
-  # related ballista fixes). Re-add a `schedule:` cron once it runs clean.
+  schedule:
+    # Daily SF10 distributed TPC-H baseline (08:00 UTC). Scheduled runs build
+    # from trunk and fan out the tpch/sf10/distributed dispatch matrix.
+    - cron: '0 8 * * *'
   workflow_dispatch:
     inputs:
       spiced_ref:
@@ -63,7 +63,7 @@ jobs:
       image_tag: ${{ steps.resolve.outputs.image_tag }}
       need_build: ${{ steps.resolve.outputs.need_build }}
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           ref: ${{ github.event.inputs.spiced_ref || 'trunk' }}
           fetch-depth: 1
@@ -130,12 +130,14 @@ jobs:
       needs.resolve-image.result == 'success' &&
       (needs.build-image.result == 'success' || needs.build-image.result == 'skipped')
     runs-on: spiceai-dev-runners
+    env:
+      # Scheduled runs target the SF10 distributed matrix; manual dispatch
+      # overrides via the dispatch_dir input.
+      DISPATCH_DIR: ${{ github.event.inputs.dispatch_dir || (github.event_name == 'schedule' && 'tpch/sf10/distributed') || '.' }}
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
       - name: Verify dispatch directory
-        env:
-          DISPATCH_DIR: ${{ github.event.inputs.dispatch_dir || '.' }}
         run: |
           set -euo pipefail
           dir="tools/testoperator/dispatch_cluster/${DISPATCH_DIR}"
@@ -159,7 +161,6 @@ jobs:
       - name: Dispatch each spicepod
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          DISPATCH_DIR: ${{ github.event.inputs.dispatch_dir || '.' }}
           IMAGE_TAG: ${{ needs.resolve-image.outputs.image_tag }}
           SPICED_SHA: ${{ needs.resolve-image.outputs.spiced_sha }}
           # Each dispatch yaml entry today is a single `tests.bench` block. We

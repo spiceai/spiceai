@@ -18,11 +18,7 @@ use crate::Runtime;
 use crate::cluster::datafusion::codec::udtf_args::{
     RrfArgs, TextSearchArgs, UdtfArgs, UdtfArgsExt, VectorSearchArgs,
 };
-use crate::embeddings::udtf::{
-    DistanceMetric, VectorSearchTableFunc, VectorSearchTableFuncArgs, VectorSearchUDTFProvider,
-};
-use crate::search::full_text::udtf::{TextSearchTableFunc, TextSearchTableFuncArgs};
-use crate::search::rrf::ReciprocalRankFusion;
+use crate::embeddings::udtf::{VectorSearchTableFunc, VectorSearchUDTFProvider};
 use crate::udtfs::{ListUDFTable, ListUDFTableFunc};
 use arrow_schema::SchemaRef;
 use ballista_core::serde::BallistaLogicalExtensionCodec;
@@ -36,6 +32,9 @@ use datafusion_proto::logical_plan::LogicalExtensionCodec;
 use prost::Message;
 use runtime_proto::rrf_nested_query::Query;
 use runtime_proto::udtf_args::Args;
+use runtime_search::full_text_udtf::TextSearchTableFunc;
+use runtime_search::rrf::ReciprocalRankFusion;
+use runtime_search::udtf::{DistanceMetric, TextSearchTableFuncArgs, VectorSearchTableFuncArgs};
 use search::provider::{SearchQueryProvider, UdtfSource};
 use std::collections::HashMap;
 use std::fmt::Debug;
@@ -101,14 +100,18 @@ impl SpiceLogicalCodec {
                 udtf.call(&[])
             }
             Args::TextSearch(text_args) => {
-                let udtf = TextSearchTableFunc::new(Arc::downgrade(&runtime.df));
-                let exprs = TextSearchTableFunc::to_expr(&TextSearchTableFuncArgs {
+                let udtf = TextSearchTableFunc::new(
+                    Arc::downgrade(&runtime.df) as _,
+                    crate::search::util::RuntimeTableProviderExplorer,
+                );
+                let exprs = TextSearchTableFuncArgs {
                     tbl: SqlTableReference::parse_str(&text_args.table),
                     query: text_args.query,
                     column: text_args.column,
                     limit: text_args.limit.map(Self::limit_from_u64).transpose()?,
                     include_score: text_args.include_score,
-                });
+                }
+                .to_expr();
                 udtf.call(&exprs)
             }
             Args::VectorSearch(vector_args) => {
@@ -116,7 +119,7 @@ impl SpiceLogicalCodec {
                     Arc::downgrade(&runtime.df),
                     HashMap::new(), // explicit_pks - will be inferred from table
                 );
-                let exprs = VectorSearchTableFunc::to_expr(&VectorSearchTableFuncArgs {
+                let exprs = VectorSearchTableFuncArgs {
                     tbl: SqlTableReference::parse_str(&vector_args.table),
                     queries: vec![vector_args.query.clone()],
                     query: vector_args.query,
@@ -128,7 +131,8 @@ impl SpiceLogicalCodec {
                         .as_deref()
                         .map(DistanceMetric::parse)
                         .transpose()?,
-                })?;
+                }
+                .to_expr()?;
                 udtf.call(&exprs)
             }
             Args::Rrf(rrf_args) => Self::invoke_rrf(&rrf_args, runtime),
@@ -157,33 +161,34 @@ impl SpiceLogicalCodec {
                     let Some(args) = &ts.args else {
                         return exec_err!("TextSearch nested query missing args");
                     };
-                    let text_exprs = TextSearchTableFunc::to_expr(&TextSearchTableFuncArgs {
+                    let text_exprs = TextSearchTableFuncArgs {
                         tbl: SqlTableReference::parse_str(&args.table),
                         query: args.query.clone(),
                         column: args.column.clone(),
                         limit: args.limit.map(Self::limit_from_u64).transpose()?,
                         include_score: args.include_score,
-                    });
+                    }
+                    .to_expr();
                     (text_exprs, ts.rank_weight)
                 }
                 Query::VectorSearch(vs) => {
                     let Some(args) = &vs.args else {
                         return exec_err!("VectorSearch nested query missing args");
                     };
-                    let vector_exprs =
-                        VectorSearchTableFunc::to_expr(&VectorSearchTableFuncArgs {
-                            tbl: SqlTableReference::parse_str(&args.table),
-                            queries: vec![args.query.clone()],
-                            query: args.query.clone(),
-                            column: args.column.clone(),
-                            limit: args.limit.map(Self::limit_from_u64).transpose()?,
-                            include_score: args.include_score,
-                            distance_metric: args
-                                .distance_metric
-                                .as_deref()
-                                .map(DistanceMetric::parse)
-                                .transpose()?,
-                        })?;
+                    let vector_exprs = VectorSearchTableFuncArgs {
+                        tbl: SqlTableReference::parse_str(&args.table),
+                        queries: vec![args.query.clone()],
+                        query: args.query.clone(),
+                        column: args.column.clone(),
+                        limit: args.limit.map(Self::limit_from_u64).transpose()?,
+                        include_score: args.include_score,
+                        distance_metric: args
+                            .distance_metric
+                            .as_deref()
+                            .map(DistanceMetric::parse)
+                            .transpose()?,
+                    }
+                    .to_expr()?;
                     (vector_exprs, vs.rank_weight)
                 }
             };

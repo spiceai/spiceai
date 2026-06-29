@@ -14,6 +14,13 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+// OpenTelemetry 0.32 deprecated the Zipkin exporter in favor of OTLP. Spice still
+// supports Zipkin task-history export; migrating to OTLP is tracked separately.
+#![expect(
+    deprecated,
+    reason = "Zipkin exporter deprecated in opentelemetry 0.32; Spice still supports Zipkin export"
+)]
+
 use std::sync::Arc;
 
 use app::spicepod::component::runtime::OutputLevel;
@@ -30,7 +37,7 @@ use opentelemetry_sdk::{
 use opentelemetry_zipkin::ZipkinExporter;
 use reqwest::Client;
 use runtime::{datafusion::DataFusion, task_history};
-use runtime_datafusion::query_engine::QueryEngine;
+use runtime_query_engine::query_engine::QueryEngine;
 use std::time::Duration;
 use tracing::Subscriber;
 use tracing_log::LogTracer;
@@ -380,8 +387,8 @@ impl SpanExporter for OtelExportMultiplexer {
         }
     }
 
-    fn shutdown(&mut self) -> OTelSdkResult {
-        if let Some(exporter) = &mut self.zipkin {
+    fn shutdown(&self) -> OTelSdkResult {
+        if let Some(exporter) = self.zipkin.as_ref() {
             let _ = exporter.shutdown();
         }
 
@@ -390,8 +397,8 @@ impl SpanExporter for OtelExportMultiplexer {
         Ok(())
     }
 
-    fn force_flush(&mut self) -> OTelSdkResult {
-        if let Some(exporter) = &mut self.zipkin {
+    fn force_flush(&self) -> OTelSdkResult {
+        if let Some(exporter) = self.zipkin.as_ref() {
             let _ = exporter.force_flush();
         }
 

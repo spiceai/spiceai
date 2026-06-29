@@ -16,7 +16,7 @@ limitations under the License.
 
 //! A small, mergeable [`HyperLogLog`] cardinality sketch maintained incrementally
 //! on the Cayenne write path, plus a [`NdvSketches`] container that holds one
-//! sketch per NDV-tracked column (integer, string, or date) and (de)serializes
+//! sketch per NDV-tracked column (integer, string, or temporal) and (de)serializes
 //! them for the metastore.
 //!
 //! Why a purpose-built sketch: `DataFusion`'s `approx_distinct` `HyperLogLog` is
