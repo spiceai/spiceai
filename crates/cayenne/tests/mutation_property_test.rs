@@ -86,7 +86,11 @@ impl Rng {
         z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
         z ^ (z >> 31)
     }
+    /// Uniform in `[0, n)`. Callers conceptually require `n > 0` (a key space,
+    /// population, or weight total); a zero bound means a misconfigured workload,
+    /// so fail fast instead of silently coercing to `below(1)` and always returning 0.
     fn below(&mut self, n: u64) -> u64 {
+        debug_assert!(n > 0, "Rng::below requires a positive bound (got 0)");
         self.next_u64() % n.max(1)
     }
 }
