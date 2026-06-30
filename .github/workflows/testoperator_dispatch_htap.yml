@@ -2,8 +2,6 @@ name: testoperator dispatch htap
 
 on:
   schedule:
-    # htap-sf100, every 3h (0200, 0500, 0800, 1100, 1400, 1700, 2000, 2300) — HTAP CH-benCHmark SF100 (spiceai-dev-xlarge-runners)
-    - cron: '0 2,5,8,11,14,17,20,23 * * *'
     # htap-sf1000, twice daily (0000, 1200) — HTAP CH-benCHmark SF1000 (spiceai-dev-xlarge-runners)
     - cron: '0 0,12 * * *'
     # htap-sf1, twice daily (0600, 1800) — HTAP CH-benCHmark SF1 (spiceai-dev-large-runners)
@@ -98,7 +96,6 @@ jobs:
           FLAGS=""
           if [ -z "$SF" ]; then
             case "${{ github.event.schedule }}" in
-              '0 2,5,8,11,14,17,20,23 * * *') SF=sf100 ;;
               '0 0,12 * * *')                 SF=sf1000 ;;
               '0 6,18 * * *')                 SF=sf1 ;;
               *)                              SF= ;;   # unrecognized cron — dispatch nothing

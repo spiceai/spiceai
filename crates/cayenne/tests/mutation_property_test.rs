@@ -14,67 +14,35 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-//! Randomized convergence + isolation ("property") tests for Cayenne mutations,
-//! compaction, overwrite, and restart.
+//! Randomized fuzz (property-style) convergence + isolation tests for Cayenne
+//! mutations, compaction, overwrite, and restart. Each test drives a randomized
+//! operation sequence and asserts the table converges to an in-memory model —
+//! i.e. it fuzzes the mutation/compaction state machine for data-loss,
+//! resurrection, and torn-read defects.
 //!
-//! Each test maintains a trivial in-memory model (`BTreeMap<key, value>`) of the
-//! rows that should be observable and asserts the table matches it. Three
-//! properties, each catching a different bug class:
+//! Each convergence test is one parametrized harness ([`Workload`]) run with a
+//! different config — controlling deletion mode, sequential vs concurrent,
+//! per-operation weights (so e.g. "no deletions" or "fewer compactions" is just
+//! a weight change), batch size, op count, and the upsert conflict-detection
+//! path (exact PK index vs over-budget bloom existence filter via
+//! `pk_keyset_cache_mb`). All share one in-memory model (`BTreeMap<key,value>`)
+//! and one convergence check that reports `missing` (loss), `extra`
+//! (resurrection), and `wrong_value` separately. Beyond the row-set compare,
+//! each settled state is also cross-checked through aggregate/filter/point
+//! queries (`COUNT(*)`, `SUM(value)`, `WHERE value >= …`, `WHERE id = …`) so
+//! defects that the deduplicated id→value map misses (phantom/duplicate rows,
+//! pushdown bugs) are caught. The concurrent configs also fuzz mid-stream
+//! restarts (reopen-from-catalog under a lock) racing the background compactor.
 //!
-//! 1. [`prop_sequential_*`] — single-threaded random walk over
-//!    {upsert, delete, delete-all, overwrite, compact, restart}, checked after
-//!    every op and after a reopen-from-catalog. Catches ordering / state-machine
-//!    / durability bugs. (Cannot catch concurrency races: it has no concurrency.)
+//! Coverage is env-scalable for CI without code changes (see `env_scale`):
+//! `CAYENNE_PROPTEST_SCALE` multiplies the seed count of every config, and
+//! `CAYENNE_PROPTEST_OPS_SCALE` multiplies the per-seed op count. Both default
+//! to 1 (a fast local run).
 //!
-//! 2. [`prop_concurrent_mutations_during_compaction_*`] — random mutations
-//!    (upsert/delete/overwrite) applied CONCURRENTLY with a background
-//!    compaction loop, then quiesce and assert convergence. Catches lost-write
-//!    races such as the compaction-vs-delete bug (see
-//!    `cdc_compaction_delete_race_test.rs`). This is an *eventual-consistency*
-//!    property: it reads only after quiescence.
-//!
-//! 3. [`prop_concurrent_reads_observe_consistent_snapshot_*`] — a CONCURRENT
-//!    READER asserting a held invariant *during* the storm. The workload keeps
-//!    cardinality invariant (repeated `INSERT OVERWRITE` of the SAME key set),
-//!    so every committed state has exactly N rows / N distinct keys; a reader
-//!    that ever sees a different count observed a TORN publish. This is a
-//!    *read-atomicity / snapshot-isolation* property — the class our
-//!    convergence-only tests are blind to (a torn publish converges fine). It
-//!    targets the overwrite torn-publish P0 (spiceai/spiceai#11461). NOTE: it is
-//!    timing-dependent — a probabilistic catch, not a guaranteed one.
-//!
-//! ## Deletion-mode coverage
-//!
-//! `DeletionMode::Auto` (the default) resolves to POSITION even for PK tables,
-//! so the compaction sequence-FENCE path is only reached under an explicit
-//! `DeletionMode::Key`. Every property is therefore run as a separate test case
-//! per [`Mode`] so BOTH compaction branches (key-mode sequence fence,
-//! position-mode serialize) are exercised.
-//!
-//! On failure tests print the seed and op history for deterministic replay.
-//!
-//! ## Known pre-existing bugs found by this harness (filed separately)
-//!
-//! Two cases are `#[ignore]`d because they fail on PRE-EXISTING defects that are
-//! independent of the compaction convergence fix this branch introduces. Both
-//! are real and should be fixed separately; remove the `#[ignore]` when they are.
-//!
-//! * **BUG A** — `INSERT OVERWRITE` of key `k`, then `DELETE` of `k`, then a
-//!   later `UPSERT` of `k` loses the re-upsert: the row stays hidden, as if the
-//!   delete tombstone still applied. Deterministic, reproduces in BOTH deletion
-//!   modes, and the failing op sequence contains NO compaction — so it is not
-//!   the compaction fix. Minimal shape:
-//!   `overwrite([(1, a)]); delete(id = 1); upsert(1, b);` then `SELECT` returns
-//!   no row for id 1 (expected `(1, b)`).
-//!
-//! * **BUG B** — under concurrent mutations + background compaction, rows that
-//!   were never mutated VANISH, and a debug assertion fires:
-//!   `cayenne_snapshot_file` manifest for the new snapshot lists data files that
-//!   are absent from the snapshot's on-disk directory (manifest = N files,
-//!   listing = {}). The inconsistency is in manifest/listing/cleanup code the
-//!   fix does not modify, and it surfaces even in fully-serialized position
-//!   mode. (`cdc_compaction_delete_race_test.rs` still covers the fix itself
-//!   concurrently.)
+//! All configs currently converge — the convergence/resurrection defects this
+//! harness surfaced are fixed (see the PR description for the linked fixes). If
+//! a future config exposes a new defect, `#[ignore]` it with a description of
+//! the defect (not a label) until it is fixed.
 
 #![allow(clippy::expect_used)]
 #![allow(clippy::clone_on_ref_ptr)]
@@ -103,11 +71,10 @@ type TestResult<T> = Result<T, Box<dyn std::error::Error>>;
 type Model = BTreeMap<i64, i64>;
 
 // ============================================================================
-// Deterministic PRNG (SplitMix64) — no external dep, fully reproducible by seed.
+// Deterministic PRNG (SplitMix64)
 // ============================================================================
 
 struct Rng(u64);
-
 impl Rng {
     fn new(seed: u64) -> Self {
         Rng(seed ^ 0x2545_F491_4F6C_DD1D)
@@ -119,53 +86,81 @@ impl Rng {
         z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
         z ^ (z >> 31)
     }
-    /// Uniform in `[0, n)`. `n` must be > 0.
+    /// Uniform in `[0, n)`. Callers conceptually require `n > 0` (a key space,
+    /// population, or weight total); a zero bound means a misconfigured workload,
+    /// so fail fast instead of silently coercing to `below(1)` and always returning 0.
     fn below(&mut self, n: u64) -> u64 {
-        self.next_u64() % n
+        debug_assert!(n > 0, "Rng::below requires a positive bound (got 0)");
+        self.next_u64() % n.max(1)
     }
-    /// Uniform in `[0, n)` returned as `i64`. `n` must be > 0. Convenience for
-    /// the i64 key/value spaces these tests work in.
+    /// [`Rng::below`] for the `i64` key/value space the model uses. Keeps the
+    /// `u64`↔`i64` conversions in one checked place (the bound must be
+    /// non-negative; the result is in `[0, n)` and so always fits `i64`).
     fn below_i64(&mut self, n: i64) -> i64 {
-        let bound = u64::try_from(n).expect("bound must be non-negative");
-        i64::try_from(self.below(bound)).expect("value below an i64 bound fits in i64")
+        let bound = u64::try_from(n).expect("Rng::below_i64 bound must be non-negative");
+        i64::try_from(self.below(bound)).expect("value in [0, n) fits i64")
     }
 }
 
 // ============================================================================
-// Deletion-mode matrix — every property runs once per mode so both compaction
-// fence branches are covered.
+// Workload configuration
 // ============================================================================
 
 #[derive(Clone, Copy, Debug)]
 enum Mode {
-    /// Explicit key-delete mode: the compaction sequence-FENCE path.
-    KeyPk,
-    /// Default (`Auto` => Position) mode: the compaction SERIALIZE path.
-    PositionPk,
+    /// Explicit `deletion_mode: key` — the deletion index is authoritative.
+    Key,
+    /// Default (`auto` resolves to position even for PK tables).
+    Position,
 }
 
-impl Mode {
-    fn config(self) -> VortexConfig {
-        let base = VortexConfig {
-            target_vortex_file_size_mb: 1,
-            compaction_trigger_files: 4,
-            compaction_background_interval_ms: 0,
-            // Force every write to a snapshot file so compaction always has
-            // candidates and (for position mode) deletes are file-scoped.
-            inline_max_rows: 0,
-            ..VortexConfig::default()
-        };
-        match self {
-            Mode::KeyPk => VortexConfig {
-                deletion_mode: DeletionMode::Key,
-                ..base
-            },
-            // PositionPk leaves deletion_mode at its `Auto` default, which
-            // resolves to Position for a PK table.
-            Mode::PositionPk => base,
-        }
-    }
+#[derive(Clone, Copy, Debug)]
+enum Concurrency {
+    /// Single-threaded random walk; model-checked after every op and after a
+    /// reopen-from-catalog at the end.
+    Sequential,
+    /// A foreground mutation stream concurrent with a background compaction loop;
+    /// convergence checked once after quiesce + a final compaction.
+    ConcurrentWithCompaction,
 }
+
+/// Relative weights for the random op generator. Set a weight to 0 to exclude
+/// that op (e.g. `delete: 0` for "no deletions"). `compact` applies only to
+/// [`Concurrency::Sequential`] (the concurrent path drives compaction from its
+/// background loop, so a foreground `compact` is a no-op there). `restart`
+/// applies to BOTH: sequential reopens inline; concurrent reopens under a lock
+/// that quiesces the background compactor first.
+#[derive(Clone, Copy)]
+struct OpWeights {
+    upsert: u32,
+    delete: u32,
+    delete_all: u32,
+    overwrite: u32,
+    compact: u32,
+    restart: u32,
+}
+
+#[derive(Clone, Copy)]
+struct Workload {
+    mode: Mode,
+    concurrency: Concurrency,
+    weights: OpWeights,
+    /// Initial seeded rows (and the key-space upper bound for random keys).
+    population: i64,
+    /// Rows written per upsert/overwrite op (1 = single-row; larger = batches).
+    batch_size: i64,
+    /// Number of foreground ops.
+    ops: usize,
+    /// Seeds to run.
+    seeds: u64,
+    /// `pk_keyset_cache_mb` for the table: `None` = default exact PK index,
+    /// `Some(0)` = force the over-budget bloom existence-filter conflict path.
+    pk_keyset_cache_mb: Option<usize>,
+}
+
+// ============================================================================
+// Table + IO helpers
+// ============================================================================
 
 fn schema() -> Arc<Schema> {
     Arc::new(Schema::new(vec![
@@ -174,13 +169,35 @@ fn schema() -> Arc<Schema> {
     ]))
 }
 
+fn config(mode: Mode, pk_keyset_cache_mb: Option<usize>) -> VortexConfig {
+    let base = VortexConfig {
+        target_vortex_file_size_mb: 1,
+        compaction_trigger_files: 4,
+        compaction_background_interval_ms: 0,
+        inline_max_rows: 0,
+        // `Some(0)` forces the over-budget bloom existence-filter path for upsert
+        // conflict detection (instead of the exact PK keyset); `None` keeps the
+        // default exact index. Lets one harness fuzz both existence paths.
+        pk_keyset_cache_mb,
+        ..VortexConfig::default()
+    };
+    match mode {
+        Mode::Key => VortexConfig {
+            deletion_mode: DeletionMode::Key,
+            ..base
+        },
+        Mode::Position => base,
+    }
+}
+
 async fn create_table(
     fixture: &TestFixture,
-    table_name: &str,
+    name: &str,
     mode: Mode,
+    pk_keyset_cache_mb: Option<usize>,
 ) -> TestResult<(Arc<CayenneTableProvider>, SessionContext)> {
-    let table_options = CreateTableOptions {
-        table_name: table_name.to_string(),
+    let opts = CreateTableOptions {
+        table_name: name.to_string(),
         schema: schema(),
         primary_key: vec!["id".to_string()],
         on_conflict: Some(OnConflict::Upsert(ColumnReference::new(vec![
@@ -188,39 +205,32 @@ async fn create_table(
         ]))),
         base_path: fixture.data_path.to_string_lossy().to_string(),
         partition_column: None,
-        vortex_config: mode.config(),
+        vortex_config: config(mode, pk_keyset_cache_mb),
     };
     let catalog: Arc<dyn MetadataCatalog> =
         Arc::clone(&fixture.catalog) as Arc<dyn MetadataCatalog>;
     let ctx = SessionContext::new();
-    let table = Arc::new(
-        CayenneTableProvider::create_table(catalog, table_options, ctx.runtime_env()).await?,
-    );
-    ctx.register_table(table_name, Arc::clone(&table) as Arc<dyn TableProvider>)?;
+    let table =
+        Arc::new(CayenneTableProvider::create_table(catalog, opts, ctx.runtime_env()).await?);
+    ctx.register_table(name, Arc::clone(&table) as Arc<dyn TableProvider>)?;
     Ok((table, ctx))
 }
 
-/// Reopen the table fresh from catalog metadata (restart simulation), returning
-/// a new provider + ctx registered under `table_name`.
 async fn reopen_table(
     fixture: &TestFixture,
-    table_name: &str,
+    name: &str,
 ) -> TestResult<(Arc<CayenneTableProvider>, SessionContext)> {
     let catalog: Arc<dyn MetadataCatalog> =
         Arc::clone(&fixture.catalog) as Arc<dyn MetadataCatalog>;
     let ctx = SessionContext::new();
     let provider = Arc::new(
         CayenneTableProviderBuilder::new(catalog, ctx.runtime_env())
-            .open(table_name)
+            .open(name)
             .await?,
     );
-    ctx.register_table(table_name, Arc::clone(&provider) as Arc<dyn TableProvider>)?;
+    ctx.register_table(name, Arc::clone(&provider) as Arc<dyn TableProvider>)?;
     Ok((provider, ctx))
 }
-
-// ============================================================================
-// Mutations
-// ============================================================================
 
 fn rows_to_batch(rows: &[(i64, i64)]) -> RecordBatch {
     let ids: Vec<i64> = rows.iter().map(|(k, _)| *k).collect();
@@ -235,8 +245,8 @@ fn rows_to_batch(rows: &[(i64, i64)]) -> RecordBatch {
     .expect("valid batch")
 }
 
-async fn upsert(table: &Arc<CayenneTableProvider>, key: i64, value: i64) -> TestResult<()> {
-    common::insert_batch(table.as_ref(), rows_to_batch(&[(key, value)])).await?;
+async fn upsert(table: &Arc<CayenneTableProvider>, rows: &[(i64, i64)]) -> TestResult<()> {
+    common::insert_batch(table.as_ref(), rows_to_batch(rows)).await?;
     Ok(())
 }
 
@@ -247,9 +257,6 @@ async fn delete(table: &Arc<CayenneTableProvider>, filter: Expr) -> TestResult<(
     Ok(())
 }
 
-/// `INSERT OVERWRITE` — replaces ALL table contents with `rows`. Routes through
-/// `CayenneDataSink::write_all` -> `begin_overwrite` -> `PreparedOverwrite::finish`
-/// (the production overwrite path; the #11461 torn-publish site).
 async fn overwrite(table: &Arc<CayenneTableProvider>, rows: &[(i64, i64)]) -> TestResult<()> {
     let ctx = SessionContext::new();
     let exec = MemorySourceConfig::try_new_exec(&[vec![rows_to_batch(rows)]], schema(), None)?;
@@ -260,41 +267,142 @@ async fn overwrite(table: &Arc<CayenneTableProvider>, rows: &[(i64, i64)]) -> Te
     Ok(())
 }
 
-async fn read_rows(ctx: &SessionContext, table_name: &str) -> TestResult<Model> {
+async fn read_rows(ctx: &SessionContext, name: &str) -> TestResult<Model> {
     let df = ctx
-        .sql(&format!("SELECT id, value FROM {table_name} ORDER BY id"))
+        .sql(&format!("SELECT id, value FROM {name} ORDER BY id"))
         .await?;
-    let results = df.collect().await?;
     let mut model = Model::new();
-    for batch in &results {
-        let ids = batch
+    for b in &df.collect().await? {
+        let ids = b
             .column(0)
             .as_any()
             .downcast_ref::<Int64Array>()
-            .expect("id column Int64");
-        let values = batch
+            .expect("id");
+        let vals = b
             .column(1)
             .as_any()
             .downcast_ref::<Int64Array>()
-            .expect("value column Int64");
-        for idx in 0..batch.num_rows() {
-            // A duplicate key is a hard convergence failure (resurrected row);
-            // flag it with a sentinel so the equality assert catches it.
-            if model.insert(ids.value(idx), values.value(idx)).is_some() {
-                model.insert(ids.value(idx), i64::MIN);
+            .expect("value");
+        for i in 0..b.num_rows() {
+            if model.insert(ids.value(i), vals.value(i)).is_some() {
+                model.insert(ids.value(i), i64::MIN); // duplicate sentinel
             }
         }
     }
     Ok(model)
 }
 
+fn assert_converged(live: &Model, model: &Model, ctx_msg: &str) {
+    let missing: Vec<(i64, i64)> = model
+        .iter()
+        .filter(|(k, _)| !live.contains_key(k))
+        .map(|(&k, &v)| (k, v))
+        .collect();
+    let extra: Vec<(i64, i64)> = live
+        .iter()
+        .filter(|(k, _)| !model.contains_key(k))
+        .map(|(&k, &v)| (k, v))
+        .collect();
+    let wrong: Vec<(i64, i64, i64)> = model
+        .iter()
+        .filter_map(|(&k, &v)| live.get(&k).filter(|&&lv| lv != v).map(|&lv| (k, v, lv)))
+        .collect();
+    assert!(
+        missing.is_empty() && extra.is_empty() && wrong.is_empty(),
+        "{ctx_msg}\nmissing(loss)={missing:?}\nextra(resurrect)={extra:?}\nwrong_value(k,expected,got)={wrong:?}"
+    );
+}
+
+/// Run a query expected to return a single non-null `i64` scalar. Callers
+/// `COALESCE` nullable aggregates (e.g. `COALESCE(SUM(...), 0)`) so the single
+/// cell is never NULL; this helper does not itself map NULL to a value. Used by
+/// the aggregate-query checks below.
+async fn scalar_i64(ctx: &SessionContext, sql: &str) -> TestResult<i64> {
+    // Callers are single-cell aggregates (COUNT(*) / COALESCE(SUM(...), 0)) that
+    // must return EXACTLY ONE non-null i64 row. Neither zero rows nor extra rows
+    // are legitimate here, so fail loudly rather than masking a query/engine bug
+    // (e.g. silently reading the first of several rows).
+    let batches = ctx.sql(sql).await?.collect().await?;
+    let total_rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
+    if total_rows != 1 {
+        return Err(
+            format!("scalar query returned {total_rows} rows, expected exactly 1: {sql}").into(),
+        );
+    }
+    let b = batches
+        .iter()
+        .find(|b| b.num_rows() > 0)
+        .expect("exactly one row exists");
+    let arr = b
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .expect("i64 scalar result");
+    Ok(arr.value(0))
+}
+
+/// Cross-check the table against the model through AGGREGATE + FILTER + POINT
+/// queries, not just the `SELECT id, value` row scan. These exercise different
+/// execution paths (aggregation, filter pushdown, PK point-lookup pushdown over
+/// the merge-on-read deletion filter), so they catch defects the row-set compare
+/// can miss — e.g. a phantom/duplicate physical row that inflates `COUNT(*)` /
+/// `SUM(value)` while the deduplicated id→value map still looks right.
+async fn verify_aggregate_queries(
+    ctx: &SessionContext,
+    name: &str,
+    model: &Model,
+    key_space: i64,
+    ctx_msg: &str,
+) -> TestResult<()> {
+    const THRESH: i64 = 500_000;
+
+    // Total row count must equal the number of live keys (no phantom/dup rows).
+    let count = scalar_i64(ctx, &format!("SELECT COUNT(*) FROM {name}")).await?;
+    assert_eq!(
+        count,
+        i64::try_from(model.len()).expect("model len fits i64"),
+        "{ctx_msg}: COUNT(*) mismatch"
+    );
+
+    // SUM over all values — sensitive to duplicates and wrong values that a
+    // per-key compare might not surface if the dup carries the same key.
+    let sum = scalar_i64(ctx, &format!("SELECT COALESCE(SUM(value), 0) FROM {name}")).await?;
+    let expected_sum: i64 = model.values().copied().sum();
+    assert_eq!(sum, expected_sum, "{ctx_msg}: SUM(value) mismatch");
+
+    // Filtered count exercises a value predicate + pushdown.
+    let filtered = scalar_i64(
+        ctx,
+        &format!("SELECT COUNT(*) FROM {name} WHERE value >= {THRESH}"),
+    )
+    .await?;
+    let expected_filtered =
+        i64::try_from(model.values().filter(|&&v| v >= THRESH).count()).expect("fits i64");
+    assert_eq!(
+        filtered, expected_filtered,
+        "{ctx_msg}: COUNT(*) WHERE value >= {THRESH} mismatch"
+    );
+
+    // Point lookups across the key space (PK filter pushdown + deletion filter):
+    // each key is present exactly once or absent, matching the model.
+    let step = (key_space / 8).max(1);
+    let mut k = 0;
+    while k < key_space {
+        let got = scalar_i64(ctx, &format!("SELECT COUNT(*) FROM {name} WHERE id = {k}")).await?;
+        let expected = i64::from(model.contains_key(&k));
+        assert_eq!(got, expected, "{ctx_msg}: COUNT(*) WHERE id = {k} mismatch");
+        k += step;
+    }
+    Ok(())
+}
+
 // ============================================================================
-// 1. Sequential random walk (incl. overwrite + restart)
+// Op generation + model
 // ============================================================================
 
 #[derive(Clone, Debug)]
 enum Op {
-    Upsert { key: i64, value: i64 },
+    Upsert { rows: Vec<(i64, i64)> },
     Delete { key: i64 },
     DeleteAll,
     Overwrite { rows: Vec<(i64, i64)> },
@@ -302,40 +410,71 @@ enum Op {
     Restart,
 }
 
-fn gen_op(rng: &mut Rng, key_space: i64) -> Op {
-    let key = rng.below_i64(key_space);
-    match rng.below(100) {
-        0..=39 => Op::Upsert {
-            key,
-            value: rng.below_i64(1_000_000),
-        },
-        40..=64 => Op::Delete { key },
-        65..=72 => Op::DeleteAll,
-        73..=84 => {
-            // Overwrite a random subset of the key space.
-            let n = rng.below_i64(key_space) + 1;
-            let mut rows = Vec::new();
-            for _ in 0..n {
-                let k = rng.below_i64(key_space);
-                let v = rng.below_i64(1_000_000);
-                // last-writer-wins within the batch (dedup keys)
-                if let Some(slot) = rows.iter_mut().find(|(ek, _): &&mut (i64, i64)| *ek == k) {
-                    slot.1 = v;
-                } else {
-                    rows.push((k, v));
-                }
-            }
-            Op::Overwrite { rows }
+fn random_rows(rng: &mut Rng, key_space: i64, batch_size: i64) -> Vec<(i64, i64)> {
+    debug_assert!(
+        batch_size > 0,
+        "random_rows requires a positive batch_size (an op writes >= 1 row); a \
+         zero batch means a misconfigured workload that writes nothing"
+    );
+    let mut rows: Vec<(i64, i64)> = Vec::new();
+    // `.max(1)` keeps this division-/loop-safe in release builds; the
+    // debug_assert above catches the misconfiguration in tests.
+    for _ in 0..batch_size.max(1) {
+        let k = rng.below_i64(key_space);
+        let v = rng.below_i64(1_000_000);
+        // last-writer-wins within the batch (a batch may not repeat a PK)
+        if let Some(slot) = rows.iter_mut().find(|(ek, _): &&mut (i64, i64)| *ek == k) {
+            slot.1 = v;
+        } else {
+            rows.push((k, v));
         }
-        85..=92 => Op::Compact,
-        _ => Op::Restart,
     }
+    rows
+}
+
+fn gen_op(rng: &mut Rng, w: &OpWeights, key_space: i64, batch_size: i64) -> Op {
+    let total = w.upsert + w.delete + w.delete_all + w.overwrite + w.compact + w.restart;
+    debug_assert!(
+        total > 0,
+        "OpWeights must have a positive total weight (else the workload runs no real ops)"
+    );
+    let mut pick = u32::try_from(rng.below(u64::from(total)))
+        .expect("rng.below(total) is < total, which fits u32");
+    for (weight, kind) in [
+        (w.upsert, 0u8),
+        (w.delete, 1),
+        (w.delete_all, 2),
+        (w.overwrite, 3),
+        (w.compact, 4),
+        (w.restart, 5),
+    ] {
+        if pick < weight {
+            return match kind {
+                0 => Op::Upsert {
+                    rows: random_rows(rng, key_space, batch_size),
+                },
+                1 => Op::Delete {
+                    key: rng.below_i64(key_space),
+                },
+                2 => Op::DeleteAll,
+                3 => Op::Overwrite {
+                    rows: random_rows(rng, key_space, batch_size),
+                },
+                4 => Op::Compact,
+                _ => Op::Restart,
+            };
+        }
+        pick -= weight;
+    }
+    Op::Compact // unreachable when total > 0
 }
 
 fn apply_model(model: &mut Model, op: &Op) {
     match op {
-        Op::Upsert { key, value } => {
-            model.insert(*key, *value);
+        Op::Upsert { rows } => {
+            for (k, v) in rows {
+                model.insert(*k, *v);
+            }
         }
         Op::Delete { key } => {
             model.remove(key);
@@ -351,24 +490,22 @@ fn apply_model(model: &mut Model, op: &Op) {
     }
 }
 
-async fn run_sequential_seed(
-    fixture: &TestFixture,
-    mode: Mode,
-    seed: u64,
-    steps: usize,
-    key_space: i64,
-) -> TestResult<()> {
-    let table_name = format!("seq_{mode:?}_{seed}");
-    let (mut table, mut ctx) = create_table(fixture, &table_name, mode).await?;
+// ============================================================================
+// Harness
+// ============================================================================
+
+async fn run_sequential(fixture: &TestFixture, w: &Workload, seed: u64) -> TestResult<()> {
+    let name = format!("seq_{:?}_{seed}", w.mode);
+    let (mut table, mut ctx) = create_table(fixture, &name, w.mode, w.pk_keyset_cache_mb).await?;
     let mut rng = Rng::new(seed);
     let mut model = Model::new();
-    let mut history: Vec<Op> = Vec::with_capacity(steps);
+    let mut history: Vec<Op> = Vec::with_capacity(w.ops);
 
-    for step in 0..steps {
-        let op = gen_op(&mut rng, key_space);
+    for step in 0..w.ops {
+        let op = gen_op(&mut rng, &w.weights, w.population, w.batch_size);
         history.push(op.clone());
         match &op {
-            Op::Upsert { key, value } => upsert(&table, *key, *value).await?,
+            Op::Upsert { rows } => upsert(&table, rows).await?,
             Op::Delete { key } => delete(&table, col("id").eq(lit(*key))).await?,
             Op::DeleteAll => delete(&table, lit(true)).await?,
             Op::Overwrite { rows } => overwrite(&table, rows).await?,
@@ -376,197 +513,397 @@ async fn run_sequential_seed(
                 table.maybe_compact_small_files().await?;
             }
             Op::Restart => {
-                let (t, c) = reopen_table(fixture, &table_name).await?;
+                let (t, c) = reopen_table(fixture, &name).await?;
                 table = t;
                 ctx = c;
             }
         }
         apply_model(&mut model, &op);
-
-        let live = read_rows(&ctx, &table_name).await?;
-        assert_eq!(
-            live, model,
-            "diverged after step {step} (op {op:?}) mode={mode:?} seed={seed}\nhistory={history:?}"
+        let live = read_rows(&ctx, &name).await?;
+        assert_converged(
+            &live,
+            &model,
+            &format!(
+                "seq diverged after step {step} ({op:?}) mode={:?} seed={seed}\nhistory={history:?}",
+                w.mode
+            ),
         );
     }
 
-    // Final guarantee: compact + restart must not change the converged state.
     table.maybe_compact_small_files().await?;
-    let (_t, c) = reopen_table(fixture, &table_name).await?;
-    let final_state = read_rows(&c, &table_name).await?;
-    assert_eq!(
-        final_state, model,
-        "final compact+restart diverged mode={mode:?} seed={seed}\nhistory={history:?}"
+    let (_t, c) = reopen_table(fixture, &name).await?;
+    let final_state = read_rows(&c, &name).await?;
+    let msg = format!(
+        "seq final compact+restart diverged mode={:?} seed={seed}\nhistory={history:?}",
+        w.mode
     );
+    assert_converged(&final_state, &model, &msg);
+    verify_aggregate_queries(&c, &name, &model, w.population, &msg).await?;
     Ok(())
 }
 
-async fn run_sequential_mode(fixture: &TestFixture, mode: Mode) -> TestResult<()> {
-    for seed in 0..8u64 {
-        run_sequential_seed(fixture, mode, seed, 40, 6).await?;
-    }
-    Ok(())
-}
-
-async fn prop_sequential_key_impl(fixture: TestFixture) -> TestResult<()> {
-    run_sequential_mode(&fixture, Mode::KeyPk).await
-}
-async fn prop_sequential_position_impl(fixture: TestFixture) -> TestResult<()> {
-    run_sequential_mode(&fixture, Mode::PositionPk).await
-}
-
-// IGNORED pending BUG A (see the module note above). These currently fail
-// deterministically in BOTH modes with NO compaction in the failing sequence,
-// so the cause is independent of the compaction convergence fix. Remove the
-// `#[ignore]` once bug A is fixed.
-#[tokio::test]
-#[ignore = "pre-existing BUG A: INSERT OVERWRITE then Delete{k} then re-Upsert{k} loses the re-upsert (row stays hidden); not the compaction fix"]
-async fn prop_sequential_key() -> TestResult<()> {
-    common::run_with_backend(BackendType::Sqlite, prop_sequential_key_impl)
-        .await
-        .map_err(|e| -> Box<dyn std::error::Error> { e })
-}
-#[tokio::test]
-#[ignore = "pre-existing BUG A: INSERT OVERWRITE then Delete{k} then re-Upsert{k} loses the re-upsert (row stays hidden); not the compaction fix"]
-async fn prop_sequential_position() -> TestResult<()> {
-    common::run_with_backend(BackendType::Sqlite, prop_sequential_position_impl)
-        .await
-        .map_err(|e| -> Box<dyn std::error::Error> { e })
-}
-
-// ============================================================================
-// 2. Convergence under concurrent mutations + background compaction
-// ============================================================================
-
-async fn run_concurrent_mutations_seed(
-    fixture: &TestFixture,
-    mode: Mode,
-    seed: u64,
-) -> TestResult<()> {
-    let table_name = format!("conc_{mode:?}_{seed}");
-    let (table, ctx) = create_table(fixture, &table_name, mode).await?;
+async fn run_concurrent(fixture: &TestFixture, w: &Workload, seed: u64) -> TestResult<()> {
+    let name = format!("conc_{:?}_{seed}", w.mode);
+    let (table0, ctx0) = create_table(fixture, &name, w.mode, w.pk_keyset_cache_mb).await?;
     let mut rng = Rng::new(seed);
 
-    let population: i64 = 1000;
-    for start in (0..population).step_by(20) {
-        let rows: Vec<(i64, i64)> = (start..(start + 20).min(population))
+    for start in (0..w.population).step_by(20) {
+        let rows: Vec<(i64, i64)> = (start..(start + 20).min(w.population))
             .map(|k| (k, k * 10))
             .collect();
-        common::insert_batch(table.as_ref(), rows_to_batch(&rows)).await?;
+        upsert(&table0, &rows).await?;
     }
-    let mut model: Model = (0..population).map(|k| (k, k * 10)).collect();
+    let mut model: Model = (0..w.population).map(|k| (k, k * 10)).collect();
+
+    // Restart-swappable table handle shared with the background compactor.
+    // Foreground ops AND compaction take a READ lock (so they still run
+    // concurrently — read locks are shared); a `Restart` op takes the WRITE
+    // lock, which quiesces both, reopens the table from the catalog, and swaps
+    // the handle. This exercises restart/recovery CONCURRENTLY with compaction
+    // (the compactor holds its read lock across each pass, so a restart waits
+    // for an in-flight compaction rather than tearing it). The read context is
+    // tracked separately and only used for the post-quiesce assertions (the
+    // mutation helpers build their own contexts), so it just follows the latest
+    // reopened provider.
+    let handle = Arc::new(tokio::sync::RwLock::new(Arc::clone(&table0)));
+    let mut ctx = ctx0;
+    drop(table0);
 
     let stop = Arc::new(AtomicBool::new(false));
-    let bg_table = Arc::clone(&table);
+    let bg_handle = Arc::clone(&handle);
     let bg_stop = Arc::clone(&stop);
     let compactor = tokio::spawn(async move {
         while !bg_stop.load(Ordering::Relaxed) {
-            let _ = bg_table.maybe_compact_small_files().await;
+            {
+                // Hold the read lock across the pass so a concurrent restart
+                // (write lock) waits for it instead of swapping mid-compaction.
+                let t = bg_handle.read().await;
+                let _ = t.maybe_compact_small_files().await;
+            }
             tokio::task::yield_now().await;
         }
     });
 
-    // The model is owned solely by this task (compaction never changes logical
-    // contents), so no shared-state synchronization is needed.
-    for _ in 0..250 {
-        let key = rng.below_i64(population);
-        if let 0..=64 = rng.below(100) {
-            delete(&table, col("id").eq(lit(key))).await?;
-            model.remove(&key);
-        } else {
-            let value = rng.below_i64(1_000_000);
-            upsert(&table, key, value).await?;
-            model.insert(key, value);
+    // Foreground stream. `compact` is driven by the background loop (a foreground
+    // Compact op is a no-op here); `restart` reopens under the write lock.
+    for _ in 0..w.ops {
+        let op = gen_op(&mut rng, &w.weights, w.population, w.batch_size);
+        match &op {
+            Op::Upsert { rows } => {
+                let t = handle.read().await;
+                upsert(&t, rows).await?;
+            }
+            Op::Delete { key } => {
+                let t = handle.read().await;
+                delete(&t, col("id").eq(lit(*key))).await?;
+            }
+            Op::DeleteAll => {
+                let t = handle.read().await;
+                delete(&t, lit(true)).await?;
+            }
+            Op::Overwrite { rows } => {
+                let t = handle.read().await;
+                overwrite(&t, rows).await?;
+            }
+            Op::Restart => {
+                // Exclusive: waits for any in-flight compaction, then reopens
+                // from the catalog and swaps in the fresh provider + context.
+                let mut guard = handle.write().await;
+                let (nt, nc) = reopen_table(fixture, &name).await?;
+                *guard = nt;
+                ctx = nc;
+            }
+            Op::Compact => continue,
         }
+        apply_model(&mut model, &op);
         tokio::time::sleep(std::time::Duration::from_millis(1)).await;
     }
 
     stop.store(true, Ordering::Relaxed);
     compactor.await.expect("compaction task joins");
+    let table = Arc::clone(&*handle.read().await);
     table.maybe_compact_small_files().await?;
 
-    let live = read_rows(&ctx, &table_name).await?;
-    assert_eq!(
-        live,
-        model,
-        "CONVERGENCE FAILURE (mode={mode:?} seed={seed}) after concurrent mutations + compaction\n\
-         missing_from_live={:?}\nextra_in_live={:?}",
-        model
-            .iter()
-            .filter(|(k, _)| !live.contains_key(k))
-            .collect::<Vec<_>>(),
-        live.iter()
-            .filter(|(k, _)| !model.contains_key(k))
-            .collect::<Vec<_>>(),
+    let live = read_rows(&ctx, &name).await?;
+    let msg = format!(
+        "concurrent convergence failed mode={:?} seed={seed}",
+        w.mode
     );
+    assert_converged(&live, &model, &msg);
+    verify_aggregate_queries(&ctx, &name, &model, w.population, &msg).await?;
     Ok(())
 }
 
-async fn run_concurrent_mutations_mode(fixture: &TestFixture, mode: Mode) -> TestResult<()> {
-    for seed in 0..4u64 {
-        run_concurrent_mutations_seed(fixture, mode, seed).await?;
+async fn run_workload(fixture: TestFixture, w: Workload) -> TestResult<()> {
+    for seed in 0..w.seeds {
+        match w.concurrency {
+            Concurrency::Sequential => run_sequential(&fixture, &w, seed).await?,
+            Concurrency::ConcurrentWithCompaction => run_concurrent(&fixture, &w, seed).await?,
+        }
     }
     Ok(())
 }
 
-async fn prop_concurrent_mutations_key_impl(fixture: TestFixture) -> TestResult<()> {
-    run_concurrent_mutations_mode(&fixture, Mode::KeyPk).await
-}
-async fn prop_concurrent_mutations_position_impl(fixture: TestFixture) -> TestResult<()> {
-    run_concurrent_mutations_mode(&fixture, Mode::PositionPk).await
-}
-
-// Multi-threaded (the `test_with_backends!` macro is current-thread) so
-// compaction and mutations run on separate workers — the widest race window.
+// ============================================================================
+// Exhaustiveness knobs (env-scalable for CI)
+// ============================================================================
 //
-// IGNORED pending BUG B (see the module note above): under concurrent
-// mutations + background compaction, never-mutated rows vanish and a debug
-// assertion fires because the `cayenne_snapshot_file` manifest disagrees with
-// the on-disk snapshot listing. The defect is in manifest/listing/cleanup code
-// the compaction convergence fix does not touch, and it surfaces even in
-// fully-serialized position mode. The compaction fix itself is covered
-// concurrently by `cdc_compaction_delete_race_test.rs` (not ignored). Remove
-// the `#[ignore]` once bug B is fixed.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "pre-existing BUG B: vanished rows + cayenne_snapshot_file manifest != directory listing under concurrent compaction; in manifest code outside the fix"]
-async fn prop_concurrent_mutations_key_sqlite() -> TestResult<()> {
-    common::run_with_backend(BackendType::Sqlite, prop_concurrent_mutations_key_impl)
-        .await
-        .map_err(|e| -> Box<dyn std::error::Error> { e })
+// Defaults keep a local `cargo test` fast. CI can dial up coverage without code
+// changes:
+//   * `CAYENNE_PROPTEST_SCALE`     — multiplies the SEED count of every config
+//     (each seed is an independent random walk / fresh interleaving, so this is
+//     the highest-value, roughly-linear-cost knob for finding rare races).
+//   * `CAYENNE_PROPTEST_OPS_SCALE` — multiplies the per-seed OP count (longer
+//     sequences = deeper histories; costlier in the concurrent configs because
+//     each op carries a small real-time sleep, so scale this more gently).
+// Both default to 1 and accept any positive integer; a missing/zero/unparseable
+// value is treated as 1.
+fn env_scale(var: &str) -> u64 {
+    std::env::var(var)
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|&v| v > 0)
+        .unwrap_or(1)
 }
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "pre-existing BUG B: vanished rows + cayenne_snapshot_file manifest != directory listing under concurrent compaction; in manifest code outside the fix"]
-async fn prop_concurrent_mutations_position_sqlite() -> TestResult<()> {
-    common::run_with_backend(BackendType::Sqlite, prop_concurrent_mutations_position_impl)
-        .await
-        .map_err(|e| -> Box<dyn std::error::Error> { e })
+fn scaled_seeds(base: u64) -> u64 {
+    base * env_scale("CAYENNE_PROPTEST_SCALE")
+}
+fn scaled_ops(base: usize) -> usize {
+    base * usize::try_from(env_scale("CAYENNE_PROPTEST_OPS_SCALE")).expect("scale fits usize")
 }
 
 // ============================================================================
-// 3. Snapshot-isolation under concurrent reads (targets the #11461 class)
+// Named configs
 // ============================================================================
+
+const SEQUENTIAL_MIXED: OpWeights = OpWeights {
+    upsert: 40,
+    delete: 25,
+    delete_all: 8,
+    overwrite: 12,
+    compact: 8,
+    restart: 7,
+};
+const CONCURRENT_MIXED: OpWeights = OpWeights {
+    upsert: 40,
+    delete: 60,
+    delete_all: 0,
+    overwrite: 0,
+    // Compaction is driven by the background loop (foreground `compact` is a
+    // no-op here); `restart` reopens the table from the catalog mid-stream, under
+    // a lock, concurrently with that compaction — exercising restart/recovery
+    // durability against racing compaction.
+    compact: 0,
+    restart: 4,
+};
+const CONCURRENT_UPSERT_ONLY: OpWeights = OpWeights {
+    upsert: 100,
+    delete: 0,
+    delete_all: 0,
+    overwrite: 0,
+    compact: 0,
+    restart: 0,
+};
+
+fn sequential(mode: Mode) -> Workload {
+    Workload {
+        mode,
+        concurrency: Concurrency::Sequential,
+        weights: SEQUENTIAL_MIXED,
+        population: 6,
+        batch_size: 1,
+        ops: scaled_ops(50),
+        seeds: scaled_seeds(24),
+        pk_keyset_cache_mb: None,
+    }
+}
+fn concurrent_mixed(mode: Mode) -> Workload {
+    Workload {
+        mode,
+        concurrency: Concurrency::ConcurrentWithCompaction,
+        weights: CONCURRENT_MIXED,
+        population: 300,
+        batch_size: 1,
+        ops: scaled_ops(250),
+        seeds: scaled_seeds(16),
+        pk_keyset_cache_mb: None,
+    }
+}
+// High-collision variant: a small key space with many ops drives repeated
+// delete/re-upsert on the SAME keys while the background compactor folds, which
+// is exactly the interleaving that surfaced the deletion-index lost-update race.
+// `concurrent_mixed`'s large key space rarely revisits a key, so this dense
+// config exercises the race far more per op. `pk_keyset_cache_mb` selects the
+// upsert conflict-detection path: `None` = exact PK index, `Some(0)` = bloom
+// existence filter (the over-budget path with its own re-insert-over-tombstone
+// handling).
+fn concurrent_mixed_dense(mode: Mode, pk_keyset_cache_mb: Option<usize>) -> Workload {
+    Workload {
+        mode,
+        concurrency: Concurrency::ConcurrentWithCompaction,
+        weights: CONCURRENT_MIXED,
+        population: 16,
+        batch_size: 1,
+        // Long per-seed sequences (depth) on a tiny key space matter more than
+        // seed count here; keep the default seed count low so a local run stays
+        // quick, and let CI raise it via `CAYENNE_PROPTEST_SCALE`.
+        ops: scaled_ops(400),
+        seeds: scaled_seeds(6),
+        pk_keyset_cache_mb,
+    }
+}
+fn concurrent_upsert_only(mode: Mode) -> Workload {
+    Workload {
+        mode,
+        concurrency: Concurrency::ConcurrentWithCompaction,
+        weights: CONCURRENT_UPSERT_ONLY,
+        population: 300,
+        batch_size: 1,
+        ops: scaled_ops(200),
+        seeds: scaled_seeds(10),
+        pk_keyset_cache_mb: None,
+    }
+}
+
+// --- Sequential convergence (GREEN) ---
+async fn prop_sequential_key_impl(f: TestFixture) -> TestResult<()> {
+    run_workload(f, sequential(Mode::Key)).await
+}
+async fn prop_sequential_position_impl(f: TestFixture) -> TestResult<()> {
+    run_workload(f, sequential(Mode::Position)).await
+}
+test_with_backends!(prop_sequential_key_impl);
+test_with_backends!(prop_sequential_position_impl);
+
+// --- Focused regression: re-upsert after overwrite+delete stays visible ---
 //
-// Repeated `INSERT OVERWRITE` of the SAME key set keeps cardinality invariant:
-// every committed state has exactly N rows / N distinct keys. A concurrent
-// reader that EVER sees a different count/key-set observed a torn publish
-// (vanished or resurrected rows). On a branch WITHOUT the #11461 fix this is
-// expected to surface; it is timing-dependent (probabilistic), so it makes many
-// overwrite passes and runs reads on a separate worker.
+// The minimal deterministic shape behind the sequential walks: INSERT OVERWRITE
+// a key, DELETE it, then UPSERT it again — the re-upserted value must be visible
+// (the delete tombstone must not outlive the later re-insert). The
+// `prop_sequential_*` walks cover this shape probabilistically across seeds;
+// pinning the exact three-op sequence makes a regression point straight at the
+// cause instead of surfacing as a rare seed-dependent walk failure. Run in both
+// deletion modes, which take different prune paths (key index vs position).
+async fn reupsert_after_overwrite_delete_is_visible_impl(f: TestFixture) -> TestResult<()> {
+    for mode in [Mode::Key, Mode::Position] {
+        let name = format!("reupsert_min_{mode:?}");
+        let (table, ctx) = create_table(&f, &name, mode, None).await?;
+
+        overwrite(&table, &[(1, 100)]).await?;
+        delete(&table, col("id").eq(lit(1))).await?;
+        upsert(&table, &[(1, 200)]).await?;
+
+        let live = read_rows(&ctx, &name).await?;
+        assert_eq!(
+            live.get(&1).copied(),
+            Some(200),
+            "re-upsert after overwrite+delete was lost (mode={mode:?}, expected 200, live={live:?})"
+        );
+    }
+    Ok(())
+}
+test_with_backends!(reupsert_after_overwrite_delete_is_visible_impl);
+
+// --- Concurrent pure-upsert convergence (GREEN control: loss needs deletes) ---
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn prop_concurrent_upsert_only_key_sqlite() -> TestResult<()> {
+    common::run_with_backend(BackendType::Sqlite, |f| {
+        run_workload(f, concurrent_upsert_only(Mode::Key))
+    })
+    .await
+    .map_err(|e| -> Box<dyn std::error::Error> { e })
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn prop_concurrent_upsert_only_position_sqlite() -> TestResult<()> {
+    common::run_with_backend(BackendType::Sqlite, |f| {
+        run_workload(f, concurrent_upsert_only(Mode::Position))
+    })
+    .await
+    .map_err(|e| -> Box<dyn std::error::Error> { e })
+}
+
+// --- Concurrent mixed delete/upsert convergence ---
+//
+// Heavy concurrent delete+upsert against a background compaction loop. This
+// previously lost a re-upserted row (pure loss, ~1 in 3 runs): a background
+// compaction's deletion-index prune (`load_full` + `store`) and a concurrent
+// re-upsert's insert-record publish (`load_full` + `store`) could interleave so
+// the prune's store clobbered the re-insert's store — the re-inserted key lost
+// the insert-record that supersedes its pending tombstone, so the row stayed
+// hidden and was dropped when the holding snapshot was later consolidated. Fixed
+// by publishing every deletion-index update through `ArcSwap::rcu` (no lost
+// updates), so these now converge.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn prop_concurrent_mixed_key_sqlite() -> TestResult<()> {
+    common::run_with_backend(BackendType::Sqlite, |f| {
+        run_workload(f, concurrent_mixed(Mode::Key))
+    })
+    .await
+    .map_err(|e| -> Box<dyn std::error::Error> { e })
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn prop_concurrent_mixed_position_sqlite() -> TestResult<()> {
+    common::run_with_backend(BackendType::Sqlite, |f| {
+        run_workload(f, concurrent_mixed(Mode::Position))
+    })
+    .await
+    .map_err(|e| -> Box<dyn std::error::Error> { e })
+}
+
+// Dense (small key space) variant of the above — many ops per key against the
+// background compactor, maximizing same-key delete/re-upsert/compaction races.
+// Run on BOTH conflict-detection paths: the exact PK index (default) and the
+// over-budget bloom existence filter (`pk_keyset_cache_mb = Some(0)`), since the
+// re-insert-over-tombstone handling differs between them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn prop_concurrent_mixed_dense_key_sqlite() -> TestResult<()> {
+    common::run_with_backend(BackendType::Sqlite, |f| {
+        run_workload(f, concurrent_mixed_dense(Mode::Key, None))
+    })
+    .await
+    .map_err(|e| -> Box<dyn std::error::Error> { e })
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn prop_concurrent_mixed_dense_position_sqlite() -> TestResult<()> {
+    common::run_with_backend(BackendType::Sqlite, |f| {
+        run_workload(f, concurrent_mixed_dense(Mode::Position, None))
+    })
+    .await
+    .map_err(|e| -> Box<dyn std::error::Error> { e })
+}
+// Same dense stress, but forcing the bloom existence-filter conflict path.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn prop_concurrent_mixed_dense_bloom_key_sqlite() -> TestResult<()> {
+    common::run_with_backend(BackendType::Sqlite, |f| {
+        run_workload(f, concurrent_mixed_dense(Mode::Key, Some(0)))
+    })
+    .await
+    .map_err(|e| -> Box<dyn std::error::Error> { e })
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn prop_concurrent_mixed_dense_bloom_position_sqlite() -> TestResult<()> {
+    common::run_with_backend(BackendType::Sqlite, |f| {
+        run_workload(f, concurrent_mixed_dense(Mode::Position, Some(0)))
+    })
+    .await
+    .map_err(|e| -> Box<dyn std::error::Error> { e })
+}
+
+// ============================================================================
+// Snapshot-isolation under concurrent reads (overwrite torn-publish class)
+// ============================================================================
 
 async fn run_concurrent_reads_seed(fixture: &TestFixture, mode: Mode, seed: u64) -> TestResult<()> {
-    let table_name = format!("iso_{mode:?}_{seed}");
-    let (table, ctx) = create_table(fixture, &table_name, mode).await?;
+    let name = format!("iso_{mode:?}_{seed}");
+    let (table, ctx) = create_table(fixture, &name, mode, None).await?;
     let mut rng = Rng::new(seed);
 
     let n: i64 = 200;
     let keyset: Vec<i64> = (0..n).collect();
-    // Seed the invariant key set.
     let seed_rows: Vec<(i64, i64)> = keyset.iter().map(|&k| (k, 0)).collect();
     overwrite(&table, &seed_rows).await?;
 
     let stop = Arc::new(AtomicBool::new(false));
-
-    // Background compaction loop.
     let comp_table = Arc::clone(&table);
     let comp_stop = Arc::clone(&stop);
     let compactor = tokio::spawn(async move {
@@ -576,26 +913,20 @@ async fn run_concurrent_reads_seed(fixture: &TestFixture, mode: Mode, seed: u64)
         }
     });
 
-    // Background reader: assert the cardinality/key-set invariant on every read.
     let read_ctx = SessionContext::new();
-    read_ctx.register_table(&table_name, Arc::clone(&table) as Arc<dyn TableProvider>)?;
+    read_ctx.register_table(&name, Arc::clone(&table) as Arc<dyn TableProvider>)?;
     let read_stop = Arc::clone(&stop);
-    let read_name = table_name.clone();
+    let read_name = name.clone();
     let reader = tokio::spawn(async move {
         let mut violation: Option<String> = None;
         while !read_stop.load(Ordering::Relaxed) {
             match read_rows(&read_ctx, &read_name).await {
                 Ok(live) => {
-                    let live_count = i64::try_from(live.len()).expect("row count fits i64");
-                    if live_count != n || (0..n).any(|k| !live.contains_key(&k)) {
-                        violation = Some(format!(
-                            "torn read: saw {} rows (expected {n}); missing={:?}",
-                            live.len(),
-                            (0..n)
-                                .filter(|k| !live.contains_key(k))
-                                .take(8)
-                                .collect::<Vec<_>>(),
-                        ));
+                    if i64::try_from(live.len()).expect("live len fits i64") != n
+                        || (0..n).any(|k| !live.contains_key(&k))
+                    {
+                        violation =
+                            Some(format!("torn read: saw {} rows (expected {n})", live.len()));
                         break;
                     }
                 }
@@ -609,7 +940,6 @@ async fn run_concurrent_reads_seed(fixture: &TestFixture, mode: Mode, seed: u64)
         violation
     });
 
-    // Foreground: repeatedly overwrite the SAME key set with fresh values.
     for _ in 0..150 {
         let rows: Vec<(i64, i64)> = keyset
             .iter()
@@ -628,10 +958,9 @@ async fn run_concurrent_reads_seed(fixture: &TestFixture, mode: Mode, seed: u64)
         violation.unwrap_or_default()
     );
 
-    // And it still converges to the last overwrite.
-    let live = read_rows(&ctx, &table_name).await?;
+    let live = read_rows(&ctx, &name).await?;
     assert_eq!(
-        i64::try_from(live.len()).expect("row count fits i64"),
+        i64::try_from(live.len()).expect("live len fits i64"),
         n,
         "final row count must be N (mode={mode:?})"
     );
@@ -645,22 +974,19 @@ async fn run_concurrent_reads_mode(fixture: &TestFixture, mode: Mode) -> TestRes
     Ok(())
 }
 
-async fn prop_concurrent_reads_key_impl(fixture: TestFixture) -> TestResult<()> {
-    run_concurrent_reads_mode(&fixture, Mode::KeyPk).await
-}
-async fn prop_concurrent_reads_position_impl(fixture: TestFixture) -> TestResult<()> {
-    run_concurrent_reads_mode(&fixture, Mode::PositionPk).await
-}
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn prop_concurrent_reads_observe_consistent_snapshot_key_sqlite() -> TestResult<()> {
-    common::run_with_backend(BackendType::Sqlite, prop_concurrent_reads_key_impl)
-        .await
-        .map_err(|e| -> Box<dyn std::error::Error> { e })
+    common::run_with_backend(BackendType::Sqlite, |f| async move {
+        run_concurrent_reads_mode(&f, Mode::Key).await
+    })
+    .await
+    .map_err(|e| -> Box<dyn std::error::Error> { e })
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn prop_concurrent_reads_observe_consistent_snapshot_position_sqlite() -> TestResult<()> {
-    common::run_with_backend(BackendType::Sqlite, prop_concurrent_reads_position_impl)
-        .await
-        .map_err(|e| -> Box<dyn std::error::Error> { e })
+    common::run_with_backend(BackendType::Sqlite, |f| async move {
+        run_concurrent_reads_mode(&f, Mode::Position).await
+    })
+    .await
+    .map_err(|e| -> Box<dyn std::error::Error> { e })
 }
