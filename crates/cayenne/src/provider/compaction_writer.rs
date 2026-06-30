@@ -20,7 +20,7 @@ limitations under the License.
 //!
 //! # Why this exists
 //!
-//! object_store's `LocalFileSystem` writer never lets Cayenne touch the output
+//! `object_store`'s `LocalFileSystem` writer never lets Cayenne touch the output
 //! fd: it streams parts into a staging file and renames on complete, fsyncing
 //! neither the contents (Cayenne fsyncs the snapshot *directory* separately) nor
 //! preallocating. That blocks three durability/throughput levers that only exist
@@ -48,12 +48,17 @@ limitations under the License.
 //! compaction output. All reads/list/delete/copy still go straight to the inner
 //! `LocalFileSystem`.
 //!
-//! `O_DIRECT` needs block-aligned offset, length, AND buffer. object_store calls
+//! `O_DIRECT` needs block-aligned offset, length, AND buffer. `object_store` calls
 //! `put_part` in submission order but polls the returned futures in PARALLEL, and
 //! this codebase must never block the async runtime. So each upload owns a single
 //! **dedicated writer thread**: `put_part` hands the bytes to it over a channel
 //! (returning a future that resolves on ack), and the thread does all I/O
-//! sequentially and off-reactor. Sequential processing lets the `O_DIRECT` path
+//! sequentially and off-reactor. The ack future is the backpressure handle: it
+//! resolves only once the writer thread has consumed the part, so a driver that
+//! awaits it (`object_store`'s `WriteMultipart` / `BufWriter`, which `DataFusion`'s
+//! file sink uses, caps outstanding parts at `max_concurrency`) keeps at most its
+//! concurrency window of parts queued — the channel depth is bounded by the
+//! driver, not by the file size. Sequential processing lets the `O_DIRECT` path
 //! re-chunk arbitrary part sizes into a 4 KiB-aligned bounce buffer and pad +
 //! `ftruncate` the final partial block — so true `O_DIRECT` works for any part
 //! size with no Vortex-emission change.
@@ -82,7 +87,7 @@ use object_store::{
     PutMultipartOptions, PutOptions, PutPayload, PutResult,
 };
 
-/// The `MultipartUpload::put_part` return type (object_store's `UploadPart`
+/// The `MultipartUpload::put_part` return type (`object_store`'s `UploadPart`
 /// alias), written explicitly to avoid depending on its crate-root re-export.
 type UploadPart = futures::future::BoxFuture<'static, object_store::Result<()>>;
 
@@ -98,6 +103,10 @@ const FALLOC_CHUNK: u64 = 64 << 20; // 64 MiB
 /// Runtime configuration, parsed once from the environment. All knobs default
 /// OFF; `enabled()` gates whether the wrapper is installed at all.
 #[derive(Debug, Clone, Copy)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "independent on/off compaction-writer knobs parsed from the environment; plain bools read more clearly here than two-variant enums"
+)]
 pub(crate) struct CompactionWriterConfig {
     enabled: bool,
     direct_io: bool,
@@ -154,7 +163,11 @@ pub(crate) struct CompactionLocalStore {
 }
 
 impl CompactionLocalStore {
-    pub(crate) fn new(inner: Arc<dyn ObjectStore>, root: PathBuf, cfg: CompactionWriterConfig) -> Self {
+    pub(crate) fn new(
+        inner: Arc<dyn ObjectStore>,
+        root: PathBuf,
+        cfg: CompactionWriterConfig,
+    ) -> Self {
         Self { inner, root, cfg }
     }
 
@@ -192,11 +205,27 @@ impl ObjectStore for CompactionLocalStore {
     async fn put_multipart_opts(
         &self,
         location: &Path,
-        _opts: PutMultipartOptions,
+        opts: PutMultipartOptions,
     ) -> object_store::Result<Box<dyn MultipartUpload>> {
         let dest = self.to_fs_path(location);
-        let upload = CompactionUpload::create(dest, self.cfg).map_err(io_err)?;
-        Ok(Box::new(upload))
+        match CompactionUpload::create(dest, self.cfg) {
+            Ok(upload) => Ok(Box::new(upload)),
+            // Best-effort: if the custom writer can't be set up for this output
+            // (staging create/open failure, permission issue, …), fall back to the
+            // inner local store so a writer-setup error never fails a compaction.
+            // Mirrors the session-level fallback in `table.rs`
+            // (`compaction_session_context`), which only covers session setup, not
+            // this per-output `create`.
+            Err(error) => {
+                tracing::debug!(
+                    target: "cayenne::compaction",
+                    %error,
+                    location = %location,
+                    "compaction writer setup failed for output; falling back to inner store"
+                );
+                self.inner.put_multipart_opts(location, opts).await
+            }
+        }
     }
 
     async fn get_opts(
@@ -218,10 +247,7 @@ impl ObjectStore for CompactionLocalStore {
         self.inner.list(prefix)
     }
 
-    async fn list_with_delimiter(
-        &self,
-        prefix: Option<&Path>,
-    ) -> object_store::Result<ListResult> {
+    async fn list_with_delimiter(&self, prefix: Option<&Path>) -> object_store::Result<ListResult> {
         self.inner.list_with_delimiter(prefix).await
     }
 
@@ -235,7 +261,7 @@ impl ObjectStore for CompactionLocalStore {
     }
 }
 
-/// Map a `std::io::Error` to an object_store error tagged to this store.
+/// Map a `std::io::Error` to an `object_store` error tagged to this store.
 fn io_err(source: std::io::Error) -> object_store::Error {
     object_store::Error::Generic {
         store: "CompactionLocalStore",
@@ -248,7 +274,10 @@ fn io_err(source: std::io::Error) -> object_store::Error {
 // ---------------------------------------------------------------------------
 
 enum Msg {
-    Part(PutPayload, tokio::sync::oneshot::Sender<std::io::Result<()>>),
+    Part(
+        PutPayload,
+        tokio::sync::oneshot::Sender<std::io::Result<()>>,
+    ),
     Complete(tokio::sync::oneshot::Sender<std::io::Result<PutResult>>),
 }
 
@@ -268,7 +297,10 @@ impl CompactionUpload {
         let parent = dest
             .parent()
             .ok_or_else(|| {
-                std::io::Error::new(std::io::ErrorKind::InvalidInput, "output path has no parent")
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "output path has no parent",
+                )
             })?
             .to_path_buf();
         std::fs::create_dir_all(&parent)?;
@@ -311,7 +343,9 @@ impl MultipartUpload for CompactionUpload {
         async move {
             match rx.await {
                 Ok(r) => r.map_err(io_err),
-                Err(_) => Err(io_err(std::io::Error::other("compaction writer dropped ack"))),
+                Err(_) => Err(io_err(std::io::Error::other(
+                    "compaction writer dropped ack",
+                ))),
             }
         }
         .boxed()
@@ -351,12 +385,16 @@ impl MultipartUpload for CompactionUpload {
 
 impl Drop for CompactionUpload {
     fn drop(&mut self) {
-        // Dropped without complete(): signal the thread to stop, then best-effort
-        // remove the staging file so a partial write never lingers.
+        // Dropped without complete()/abort() (e.g. a cancelled write future): close
+        // the channel so the writer thread's `recv` returns `Err` and it stops.
+        // Do NOT `join()` here — `Drop` can run on a tokio worker, and joining would
+        // block that worker for the duration of an in-flight write. Detach instead:
+        // the thread observes the closed channel and removes its own staging file
+        // (see `Writer::run`); complete()/abort() still join off-reactor via
+        // `spawn_blocking`. The `remove_file` below is a non-blocking best-effort
+        // backstop for the (panic) case where the thread never reaches its cleanup.
         self.tx.take();
-        if let Some(handle) = self.handle.take() {
-            let _ = handle.join();
-        }
+        drop(self.handle.take()); // detach the writer thread; never block in Drop
         let _ = std::fs::remove_file(&self.staging);
     }
 }
@@ -445,7 +483,7 @@ impl Writer {
     }
 
     fn write_part(&mut self, payload: &PutPayload) -> std::io::Result<()> {
-        for bytes in payload.iter() {
+        for bytes in payload {
             if self.direct {
                 self.write_direct(bytes)?;
             } else {
@@ -476,6 +514,10 @@ impl Writer {
         Ok(())
     }
 
+    #[expect(
+        clippy::expect_used,
+        reason = "self.buf is Some in O_DIRECT mode, the only mode that reaches write_direct"
+    )]
     fn write_direct(&mut self, mut src: &[u8]) -> std::io::Result<()> {
         let cap = self.buf.as_ref().expect("o_direct buffer present").cap;
         while !src.is_empty() {
@@ -513,8 +555,13 @@ impl Writer {
             self.file.sync_all()?;
         }
         std::fs::rename(&self.staging, &self.dest)?;
-        // Persist the rename (dirent) so the published name survives a crash.
-        if self.fs_hints {
+        // Persist the rename (dirent) so the published name survives a crash. Gate
+        // on `final_fsync` (the durability knob that also gates the content fsync
+        // above), NOT `fs_hints`: `fs_hints` is cleared when an optional perf hint
+        // (fallocate / sync_file_range) is rejected by the filesystem — which is
+        // unrelated to, and must not silently disable, dirent durability. Best-
+        // effort: a dir-fsync failure must not fail the compaction.
+        if self.cfg.final_fsync {
             let _ = fsync_dir(&self.parent);
         }
         let metadata = std::fs::metadata(&self.dest)?;
@@ -526,6 +573,10 @@ impl Writer {
 
     /// Write the final partial block under `O_DIRECT`: zero-pad up to a `BLOCK`
     /// boundary, do the aligned write, then `ftruncate` to the true length.
+    #[expect(
+        clippy::expect_used,
+        reason = "self.buf is Some in O_DIRECT mode, the only mode that reaches flush_direct_tail"
+    )]
     fn flush_direct_tail(&mut self) -> std::io::Result<()> {
         if self.buf_len > 0 {
             let buf_len = self.buf_len;
@@ -566,16 +617,24 @@ impl Writer {
 struct AlignedBuf {
     ptr: std::ptr::NonNull<u8>,
     cap: usize,
+    layout: std::alloc::Layout,
 }
 
 impl AlignedBuf {
     fn new(cap: usize) -> Self {
-        assert!(cap % BLOCK == 0 && cap > 0, "aligned buf cap must be a BLOCK multiple");
-        let layout = std::alloc::Layout::from_size_align(cap, BLOCK).expect("valid layout");
+        assert!(
+            cap.is_multiple_of(BLOCK) && cap > 0,
+            "aligned buf cap must be a BLOCK multiple"
+        );
+        // SAFETY: `BLOCK` is a non-zero power of two, and `cap` (asserted a positive
+        // `BLOCK` multiple, only ever `ODIRECT_BUF_CAP`) rounded up to `BLOCK` cannot
+        // overflow `isize` — the two preconditions of `from_size_align_unchecked`.
+        let layout = unsafe { std::alloc::Layout::from_size_align_unchecked(cap, BLOCK) };
         // SAFETY: layout has non-zero size; we check the result for null.
         let ptr = unsafe { std::alloc::alloc_zeroed(layout) };
-        let ptr = std::ptr::NonNull::new(ptr).unwrap_or_else(|| std::alloc::handle_alloc_error(layout));
-        Self { ptr, cap }
+        let ptr =
+            std::ptr::NonNull::new(ptr).unwrap_or_else(|| std::alloc::handle_alloc_error(layout));
+        Self { ptr, cap, layout }
     }
 
     fn as_slice(&self) -> &[u8] {
@@ -591,9 +650,8 @@ impl AlignedBuf {
 
 impl Drop for AlignedBuf {
     fn drop(&mut self) {
-        let layout = std::alloc::Layout::from_size_align(self.cap, BLOCK).expect("valid layout");
-        // SAFETY: `ptr`/`layout` are exactly what `alloc_zeroed` returned.
-        unsafe { std::alloc::dealloc(self.ptr.as_ptr(), layout) };
+        // SAFETY: `ptr`/`layout` are exactly what `alloc_zeroed` returned in `new`.
+        unsafe { std::alloc::dealloc(self.ptr.as_ptr(), self.layout) };
     }
 }
 
@@ -767,6 +825,10 @@ mod tests {
         }
     }
 
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "i % 251 is always in [0, 250], so the u8 cast never truncates"
+    )]
     async fn round_trip(direct: bool, total: usize) {
         let dir = tempfile::tempdir().expect("tempdir");
         let store = store_over(dir.path(), cfg(direct));
@@ -800,7 +862,16 @@ mod tests {
 
     #[tokio::test]
     async fn buffered_round_trip_various_sizes() {
-        for total in [0usize, 1, 4095, 4096, 4097, 100_000, 1 << 20, (1 << 20) + 123] {
+        for total in [
+            0usize,
+            1,
+            4095,
+            4096,
+            4097,
+            100_000,
+            1 << 20,
+            (1 << 20) + 123,
+        ] {
             round_trip(false, total).await;
         }
     }
@@ -809,7 +880,16 @@ mod tests {
     async fn direct_round_trip_various_sizes() {
         // O_DIRECT falls back to buffered if the fs rejects it; correctness holds
         // either way, which is what we assert.
-        for total in [0usize, 1, 4095, 4096, 4097, 100_000, 1 << 20, (1 << 20) + 123] {
+        for total in [
+            0usize,
+            1,
+            4095,
+            4096,
+            4097,
+            100_000,
+            1 << 20,
+            (1 << 20) + 123,
+        ] {
             round_trip(true, total).await;
         }
     }
@@ -823,7 +903,10 @@ mod tests {
             .put_multipart_opts(&location, PutMultipartOptions::default())
             .await
             .expect("begin multipart");
-        upload.put_part(vec![1u8; 10_000].into()).await.expect("part");
+        upload
+            .put_part(vec![1u8; 10_000].into())
+            .await
+            .expect("part");
         upload.abort().await.expect("abort");
 
         assert!(

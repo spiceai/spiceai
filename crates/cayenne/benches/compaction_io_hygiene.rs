@@ -120,11 +120,7 @@ mod linux_impl {
     /// Output-file sizes. A real compaction output is `O(table)` (often GB); these
     /// modest sizes keep the bench bounded while still exposing the per-byte
     /// scaling of writeback, page-drop, and cold-read.
-    const SIZES: &[(&str, usize)] = &[
-        ("8MiB", 8 << 20),
-        ("32MiB", 32 << 20),
-        ("64MiB", 64 << 20),
-    ];
+    const SIZES: &[(&str, usize)] = &[("8MiB", 8 << 20), ("32MiB", 32 << 20), ("64MiB", 64 << 20)];
 
     /// A disk-backed temp dir (honours `TMPDIR`). `DONTNEED` is a no-op on tmpfs;
     /// the `mincore` check warns if this dir happens to be shmem-backed.

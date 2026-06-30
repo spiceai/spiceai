@@ -10605,7 +10605,11 @@ impl CayenneTableProvider {
             match self.list_snapshot_files_with_sizes_local(snapshot_id).await {
                 Ok(files) => {
                     let snapshot_dir = self.snapshot_dir_path_for(snapshot_id);
-                    paths.extend(files.into_iter().map(|(name, _size)| snapshot_dir.join(name)));
+                    paths.extend(
+                        files
+                            .into_iter()
+                            .map(|(name, _size)| snapshot_dir.join(name)),
+                    );
                 }
                 Err(error) => {
                     tracing::debug!(
@@ -12821,7 +12825,9 @@ impl CayenneTableProvider {
         &self,
         cfg: super::compaction_writer::CompactionWriterConfig,
     ) -> Result<SessionContext> {
-        use datafusion::execution::object_store::{DefaultObjectStoreRegistry, ObjectStoreRegistry};
+        use datafusion::execution::object_store::{
+            DefaultObjectStoreRegistry, ObjectStoreRegistry,
+        };
         use datafusion::execution::runtime_env::RuntimeEnvBuilder;
         use object_store::local::LocalFileSystem;
 
