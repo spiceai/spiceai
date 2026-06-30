@@ -11837,9 +11837,9 @@ impl CayenneTableProvider {
     /// passes into a single in-flight sweep — mirroring
     /// [`Self::schedule_post_write_compaction`].
     ///
-    /// No-op when the `orphaned_dv_cleanup_min_files` knob is disabled (`None`,
-    /// i.e. the spicepod param set to `0`): nothing is spawned, no lock is taken,
-    /// and no catalog query runs (the pre-feature behavior).
+    /// No-op when the `orphaned_dv_cleanup_min_files` knob is 0: nothing is
+    /// spawned, no lock is taken, and no catalog query runs (the pre-feature
+    /// behavior, and the SF-1000 CH-BenCHmark A/B baseline).
     pub(crate) fn schedule_orphan_dv_sweep(&self) {
         if self
             .table_metadata
@@ -11929,7 +11929,7 @@ impl CayenneTableProvider {
         let mut orphaned_ids: Vec<String> = Vec::with_capacity(missing.len());
         for m in missing {
             if m.sequence_number <= floor {
-                tracing::warn!(
+                tracing::info!(
                     table_id,
                     path = %m.path,
                     sequence = m.sequence_number,
