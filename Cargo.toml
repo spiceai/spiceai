@@ -425,6 +425,12 @@ datafusion-spark = { git = "https://github.com/spiceai/datafusion.git", rev = "e
 datafusion-sql = { git = "https://github.com/spiceai/datafusion.git", rev = "ec52d75bb6c796a047f052a5e00a227145b872f1" }
 datafusion-substrait = { git = "https://github.com/spiceai/datafusion.git", rev = "ec52d75bb6c796a047f052a5e00a227145b872f1" }
 
+# Redirect lopdf to a fork that makes ttf-parser optional behind a `font_embedding`
+# feature (RUSTSEC-2026-0192 — ttf-parser unmaintained). pdf-extract already uses
+# `default-features = false` for lopdf, so it stops pulling ttf-parser automatically.
+# Remove once https://github.com/J-F-Liu/lopdf/pull/512 merges and a new version ships.
+lopdf = { git = "https://github.com/Jeadie/lopdf.git", branch = "fix/make-ttf-parser-optional" }
+
 # Local vendored fork of `mysql-common-derive` (path: vendor/mysql-common-derive)
 # that drops the unmaintained `proc-macro-error2` dependency (RUSTSEC-2026-0173).
 # Pulled in transitively via `mysql_async` (the MySQL connector); it was the sole
