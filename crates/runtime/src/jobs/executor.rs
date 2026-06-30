@@ -24,6 +24,8 @@ use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
 use tracing::Instrument;
 
+use runtime_request_context::RequestContext;
+
 use crate::datafusion::DataFusion;
 use crate::datafusion::query::{QueryBuilder, QueryHandle, QueryHandleError};
 use crate::http::v1::queries::SubmitQueryRequest;
@@ -99,7 +101,10 @@ impl JobExecutor {
         let active_jobs = Arc::clone(&self.active_jobs);
         let job_id_clone = job_id.clone();
 
-        tokio::spawn(
+        // Bind the job to the submitting request's context so it runs as the
+        // caller's principal — results-cache namespacing and principal-scoped
+        // authz/masking key off it.
+        RequestContext::spawn_current(
             async move {
                 let result = Self::execute_job(
                     &job_store,

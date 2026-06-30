@@ -43,6 +43,10 @@ pub(crate) enum SnapshotMaintenanceTrigger {
         oldest_snapshot_age: Duration,
         trigger_age: Duration,
     },
+    SmallFileCount {
+        number_picker_candidate_files: usize,
+        compaction_trigger_files: usize,
+    },
 }
 
 fn should_warn_protected_snapshot_age(
