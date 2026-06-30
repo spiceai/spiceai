@@ -1589,33 +1589,6 @@ impl Runtime {
         init_results
     }
 
-    /// Returns a list of valid datasets from the given App, skipping any that fail to parse and logging an error for them.
-    #[cfg(any(feature = "duckdb", feature = "sqlite"))]
-    pub(crate) async fn get_initialized_datasets(
-        self: Arc<Self>,
-        app: &Arc<App>,
-        log_errors: LogErrors,
-    ) -> Vec<Arc<Dataset>> {
-        let valid_datasets = Arc::clone(&self).get_valid_datasets(app, log_errors);
-        futures::stream::iter(valid_datasets)
-            .filter_map(|ds| async move {
-                match (ds.is_accelerated(), ds.is_accelerator_initialized().await) {
-                    (true, true) | (false, _) => Some(Arc::clone(&ds)),
-                    (true, false) => {
-                        if log_errors.0 {
-                            metrics::datasets::LOAD_ERROR.add(1, &[]);
-                            tracing::error!(
-                                dataset = &ds.name.to_string(),
-                                "Dataset is accelerated but the accelerator failed to initialize."
-                            );
-                        }
-                        None
-                    }
-                }
-            })
-            .collect()
-            .await
-    }
 }
 
 pub struct RegisterDatasetContext {
