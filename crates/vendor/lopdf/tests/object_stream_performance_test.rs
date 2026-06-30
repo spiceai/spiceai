@@ -95,7 +95,8 @@ fn test_save_performance_with_trailer_objects() {
     doc.trailer.set("Root", catalog_id);
     doc.trailer.set("Info", info_id);
     for i in 0..10 {
-        doc.trailer.set(format!("Custom{}", i).as_bytes(), Object::Integer(i));
+        doc.trailer
+            .set(format!("Custom{}", i).as_bytes(), Object::Integer(i));
     }
 
     // Measure save performance
@@ -118,7 +119,10 @@ fn test_save_performance_with_trailer_objects() {
 
     // Verify compression worked
     let content = String::from_utf8_lossy(&output);
-    assert!(content.contains("/ObjStm"), "Object streams should be created");
+    assert!(
+        content.contains("/ObjStm"),
+        "Object streams should be created"
+    );
 }
 
 #[test]
@@ -159,8 +163,14 @@ fn test_encryption_check_performance() {
 
     let duration = start.elapsed();
 
-    println!("Encryption check performance: {:?} for 101 objects", duration);
+    println!(
+        "Encryption check performance: {:?} for 101 objects",
+        duration
+    );
 
-    assert!(!encrypt_compressible, "Encryption dict should not be compressible");
+    assert!(
+        !encrypt_compressible,
+        "Encryption dict should not be compressible"
+    );
     assert!(duration.as_micros() < 1000, "Check should be very fast");
 }

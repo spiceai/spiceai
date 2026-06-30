@@ -99,11 +99,15 @@ fn test_trailer_with_all_pdf_types() {
     doc.trailer.set("Bool", Object::Boolean(true));
     doc.trailer.set("Int", Object::Integer(42));
     doc.trailer.set("Real", Object::Real(1.25));
-    doc.trailer
-        .set("String", Object::String(b"test".to_vec(), lopdf::StringFormat::Literal));
+    doc.trailer.set(
+        "String",
+        Object::String(b"test".to_vec(), lopdf::StringFormat::Literal),
+    );
     doc.trailer.set("Name", Object::Name(b"Test".to_vec()));
-    doc.trailer
-        .set("Array", Object::Array(vec![Object::Integer(1), Object::Integer(2)]));
+    doc.trailer.set(
+        "Array",
+        Object::Array(vec![Object::Integer(1), Object::Integer(2)]),
+    );
     doc.trailer
         .set("Dict", Object::Dictionary(dictionary! { "Key" => "Value" }));
 
@@ -151,10 +155,14 @@ fn test_very_large_trailer() {
 
     // Should still be efficient
     let start = std::time::Instant::now();
-    let compressible = ObjectStream::can_be_compressed(obj_id, doc.objects.get(&obj_id).unwrap(), &doc);
+    let compressible =
+        ObjectStream::can_be_compressed(obj_id, doc.objects.get(&obj_id).unwrap(), &doc);
     let duration = start.elapsed();
 
-    assert!(compressible, "Object should be compressible even with large trailer");
+    assert!(
+        compressible,
+        "Object should be compressible even with large trailer"
+    );
     assert!(
         duration.as_micros() < 100,
         "Check should be fast even with large trailer"
@@ -172,15 +180,20 @@ fn test_concurrent_modification_safety() {
     doc.trailer.set("Ref1", obj1_id);
 
     // Check first object
-    let result1 = ObjectStream::can_be_compressed(obj1_id, doc.objects.get(&obj1_id).unwrap(), &doc);
+    let result1 =
+        ObjectStream::can_be_compressed(obj1_id, doc.objects.get(&obj1_id).unwrap(), &doc);
 
     // Modify trailer between checks
     doc.trailer.set("Ref2", obj2_id);
     doc.trailer.set("Encrypt", obj1_id); // Now obj1 is encryption dict
 
     // Check again - result should change
-    let result2 = ObjectStream::can_be_compressed(obj1_id, doc.objects.get(&obj1_id).unwrap(), &doc);
+    let result2 =
+        ObjectStream::can_be_compressed(obj1_id, doc.objects.get(&obj1_id).unwrap(), &doc);
 
     assert!(result1, "Initially should be compressible");
-    assert!(!result2, "Should not be compressible after becoming encryption dict");
+    assert!(
+        !result2,
+        "Should not be compressible after becoming encryption dict"
+    );
 }

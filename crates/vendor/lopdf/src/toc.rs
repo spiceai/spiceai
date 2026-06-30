@@ -61,7 +61,9 @@ impl Destination {
 type OutlinePageIds = IndexMap<Vec<u8>, ((u32, u16), usize, usize)>;
 
 fn setup_outline_page_ids<'a>(
-    outlines: &'a Vec<Outline>, result: &mut OutlinePageIds, level: usize,
+    outlines: &'a Vec<Outline>,
+    result: &mut OutlinePageIds,
+    level: usize,
 ) -> Result<&'a Vec<Outline>> {
     for outline in outlines.iter() {
         match outline {
@@ -109,8 +111,9 @@ impl Document {
                     s = String::from_utf8_lossy(&title).to_string();
                 } else if title[0] == 0xfe && title[1] == 0xff {
                     if title.len() & 1 != 0 {
-                        toc.errors
-                            .push(format!("Title encoded UTF16_BE {title:?} has invalid length!"));
+                        toc.errors.push(format!(
+                            "Title encoded UTF16_BE {title:?} has invalid length!"
+                        ));
                         continue;
                     }
                     let t16: Vec<u16> = title
@@ -121,8 +124,9 @@ impl Document {
                     s = String::from_utf16_lossy(&t16);
                 } else if title[0] == 0xff && title[1] == 0xfe {
                     if title.len() & 1 != 0 {
-                        toc.errors
-                            .push(format!("Title encoded UTF16_LE {title:?} has invalid length!"));
+                        toc.errors.push(format!(
+                            "Title encoded UTF16_LE {title:?} has invalid length!"
+                        ));
                         continue;
                     }
                     let t16: Vec<u16> = title

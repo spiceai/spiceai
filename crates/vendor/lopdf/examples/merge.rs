@@ -139,11 +139,14 @@ fn main() {
         // --- Page 4
 
         if layer == 0 {
-            layer_parent[0] = Some(document.add_bookmark(Bookmark::new(display, color, format, object), None));
+            layer_parent[0] =
+                Some(document.add_bookmark(Bookmark::new(display, color, format, object), None));
             last_layer = 0;
         } else if layer == 1 {
-            layer_parent[1] =
-                Some(document.add_bookmark(Bookmark::new(display, color, format, object), layer_parent[0]));
+            layer_parent[1] = Some(document.add_bookmark(
+                Bookmark::new(display, color, format, object),
+                layer_parent[0],
+            ));
             last_layer = 1;
         } else if last_layer >= layer || last_layer == layer - 1 {
             layer_parent[layer as usize] = Some(document.add_bookmark(
@@ -157,8 +160,10 @@ fn main() {
                 layer_parent[(last_layer - 1) as usize],
             ));
         } else {
-            layer_parent[1] =
-                Some(document.add_bookmark(Bookmark::new(display, color, format, object), layer_parent[0]));
+            layer_parent[1] = Some(document.add_bookmark(
+                Bookmark::new(display, color, format, object),
+                layer_parent[0],
+            ));
             last_layer = 1;
         }
     }
@@ -226,7 +231,9 @@ fn main() {
             let mut dictionary = dictionary.clone();
             dictionary.set("Parent", pages_object.as_ref().unwrap().0);
 
-            document.objects.insert(*object_id, Object::Dictionary(dictionary));
+            document
+                .objects
+                .insert(*object_id, Object::Dictionary(dictionary));
         }
     }
 
@@ -250,10 +257,15 @@ fn main() {
         // Set new "Kids" list (collected from documents pages) for "Pages"
         dictionary.set(
             "Kids",
-            documents_pages.into_keys().map(Object::Reference).collect::<Vec<_>>(),
+            documents_pages
+                .into_keys()
+                .map(Object::Reference)
+                .collect::<Vec<_>>(),
         );
 
-        document.objects.insert(page_id, Object::Dictionary(dictionary));
+        document
+            .objects
+            .insert(page_id, Object::Dictionary(dictionary));
     }
 
     // Build a new "Catalog" with updated fields
@@ -263,7 +275,9 @@ fn main() {
         dictionary.set("PageMode", "UseOutlines");
         dictionary.remove(b"Outlines"); // Outlines not supported in merged PDFs
 
-        document.objects.insert(catalog_id, Object::Dictionary(dictionary));
+        document
+            .objects
+            .insert(catalog_id, Object::Dictionary(dictionary));
     }
 
     document.trailer.set("Root", catalog_id);

@@ -10,7 +10,9 @@ impl Document {
         if let Ok(info) = self.trailer.get_mut(b"Info")
             && let Some(dict) = match info {
                 Object::Dictionary(dict) => Some(dict),
-                Object::Reference(id) => self.objects.get_mut(id).and_then(|o| o.as_dict_mut().ok()),
+                Object::Reference(id) => {
+                    self.objects.get_mut(id).and_then(|o| o.as_dict_mut().ok())
+                }
                 _ => None,
             }
         {
@@ -43,13 +45,20 @@ impl Document {
     pub fn delete_pages(&mut self, page_numbers: &[u32]) {
         let pages = self.get_pages();
         for page_number in page_numbers {
-            if let Some(page) = pages.get(page_number).and_then(|page_id| self.delete_object(*page_id)) {
+            if let Some(page) = pages
+                .get(page_number)
+                .and_then(|page_id| self.delete_object(*page_id))
+            {
                 let mut page_tree_ref = page
                     .as_dict()
                     .and_then(|dict| dict.get(b"Parent"))
                     .and_then(Object::as_reference);
                 while let Ok(page_tree_id) = page_tree_ref {
-                    if let Some(page_tree) = self.objects.get_mut(&page_tree_id).and_then(|pt| pt.as_dict_mut().ok()) {
+                    if let Some(page_tree) = self
+                        .objects
+                        .get_mut(&page_tree_id)
+                        .and_then(|pt| pt.as_dict_mut().ok())
+                    {
                         if let Ok(count) = page_tree.get(b"Count").and_then(Object::as_i64) {
                             page_tree.set("Count", count - 1);
                         }
@@ -270,7 +279,9 @@ impl Document {
     }
 
     pub fn change_page_content(&mut self, page_id: ObjectId, content: Vec<u8>) -> Result<()> {
-        let contents = self.get_dictionary(page_id).and_then(|page| page.get(b"Contents"))?;
+        let contents = self
+            .get_dictionary(page_id)
+            .and_then(|page| page.get(b"Contents"))?;
         match contents {
             Object::Reference(id) => self.change_content_stream(*id, content),
             Object::Array(arr) => {

@@ -102,11 +102,14 @@ fn load_pdf<P: AsRef<Path>>(path: P) -> Result<Document, Error> {
 
 #[cfg(feature = "async")]
 fn load_pdf<P: AsRef<Path>>(path: P) -> Result<Document, Error> {
-    Builder::new_current_thread().build().unwrap().block_on(async move {
-        Document::load_with_options(path, LoadOptions::with_filter(filter_func))
-            .await
-            .map_err(|e| Error::other(e.to_string()))
-    })
+    Builder::new_current_thread()
+        .build()
+        .unwrap()
+        .block_on(async move {
+            Document::load_with_options(path, LoadOptions::with_filter(filter_func))
+                .await
+                .map_err(|e| Error::other(e.to_string()))
+        })
 }
 
 fn get_pdf_text(doc: &Document) -> Result<PdfText, Error> {
@@ -146,7 +149,12 @@ fn get_pdf_text(doc: &Document) -> Result<PdfText, Error> {
     Ok(pdf_text)
 }
 
-fn pdf2text<P: AsRef<Path> + Debug>(path: P, output: P, pretty: bool, password: &str) -> Result<(), Error> {
+fn pdf2text<P: AsRef<Path> + Debug>(
+    path: P,
+    output: P,
+    pretty: bool,
+    password: &str,
+) -> Result<(), Error> {
     println!("Load {path:?}");
     let mut doc = load_pdf(&path)?;
     if doc.is_encrypted() {
@@ -174,12 +182,20 @@ fn main() -> Result<(), Error> {
     let args = Args::parse_args();
 
     let start_time = Instant::now();
-    let pdf_path = PathBuf::from(shellexpand::full(args.pdf_path.to_str().unwrap()).unwrap().to_string());
+    let pdf_path = PathBuf::from(
+        shellexpand::full(args.pdf_path.to_str().unwrap())
+            .unwrap()
+            .to_string(),
+    );
     let output = match args.output {
         Some(o) => o.join(pdf_path.file_name().unwrap()),
         None => args.pdf_path,
     };
-    let mut output = PathBuf::from(shellexpand::full(output.to_str().unwrap()).unwrap().to_string());
+    let mut output = PathBuf::from(
+        shellexpand::full(output.to_str().unwrap())
+            .unwrap()
+            .to_string(),
+    );
     output.set_extension("text");
     pdf2text(&pdf_path, &output, args.pretty, &args.password)?;
     println!(

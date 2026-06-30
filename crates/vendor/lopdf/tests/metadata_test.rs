@@ -72,21 +72,24 @@ fn test_metadata_extraction_encrypted_empty_password() {
         "Pages" => lopdf::Object::Reference((2, 0))
     };
     let catalog_id = doc.add_object(catalog_dict);
-    doc.trailer.set("Root", lopdf::Object::Reference(catalog_id));
+    doc.trailer
+        .set("Root", lopdf::Object::Reference(catalog_id));
 
     let pages_dict = lopdf::dictionary! {
         "Type" => "Pages",
         "Kids" => vec![lopdf::Object::Reference((3, 0))],
         "Count" => 1
     };
-    doc.objects.insert((2, 0), lopdf::Object::Dictionary(pages_dict));
+    doc.objects
+        .insert((2, 0), lopdf::Object::Dictionary(pages_dict));
 
     let page_dict = lopdf::dictionary! {
         "Type" => "Page",
         "Parent" => lopdf::Object::Reference((2, 0)),
         "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()]
     };
-    doc.objects.insert((3, 0), lopdf::Object::Dictionary(page_dict));
+    doc.objects
+        .insert((3, 0), lopdf::Object::Dictionary(page_dict));
 
     let info_dict = lopdf::dictionary! {
         "Title" => lopdf::Object::String(b"Test Encrypted PDF".to_vec(), lopdf::StringFormat::Literal),
@@ -139,21 +142,24 @@ fn test_metadata_extraction_encrypted_with_password() {
         "Pages" => lopdf::Object::Reference((2, 0))
     };
     let catalog_id = doc.add_object(catalog_dict);
-    doc.trailer.set("Root", lopdf::Object::Reference(catalog_id));
+    doc.trailer
+        .set("Root", lopdf::Object::Reference(catalog_id));
 
     let pages_dict = lopdf::dictionary! {
         "Type" => "Pages",
         "Kids" => vec![lopdf::Object::Reference((3, 0))],
         "Count" => 1
     };
-    doc.objects.insert((2, 0), lopdf::Object::Dictionary(pages_dict));
+    doc.objects
+        .insert((2, 0), lopdf::Object::Dictionary(pages_dict));
 
     let page_dict = lopdf::dictionary! {
         "Type" => "Page",
         "Parent" => lopdf::Object::Reference((2, 0)),
         "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()]
     };
-    doc.objects.insert((3, 0), lopdf::Object::Dictionary(page_dict));
+    doc.objects
+        .insert((3, 0), lopdf::Object::Dictionary(page_dict));
 
     let info_dict = lopdf::dictionary! {
         "Title" => lopdf::Object::String(b"Password Protected PDF".to_vec(), lopdf::StringFormat::Literal),
@@ -184,7 +190,10 @@ fn test_metadata_extraction_encrypted_with_password() {
 
     let buffer = std::fs::read(&encrypted_path).unwrap();
     let metadata_mem = Document::load_metadata_mem_with_password(&buffer, "user_pass").unwrap();
-    assert_eq!(metadata_mem.title, Some("Password Protected PDF".to_string()));
+    assert_eq!(
+        metadata_mem.title,
+        Some("Password Protected PDF".to_string())
+    );
     assert_eq!(metadata_mem.author, Some("Protected Author".to_string()));
     assert_eq!(metadata_mem.page_count, 1);
     assert!(metadata.encrypted);
@@ -218,21 +227,24 @@ fn test_metadata_extraction_encrypted_wrong_password() {
         "Pages" => lopdf::Object::Reference((2, 0))
     };
     let catalog_id = doc.add_object(catalog_dict);
-    doc.trailer.set("Root", lopdf::Object::Reference(catalog_id));
+    doc.trailer
+        .set("Root", lopdf::Object::Reference(catalog_id));
 
     let pages_dict = lopdf::dictionary! {
         "Type" => "Pages",
         "Kids" => vec![lopdf::Object::Reference((3, 0))],
         "Count" => 1
     };
-    doc.objects.insert((2, 0), lopdf::Object::Dictionary(pages_dict));
+    doc.objects
+        .insert((2, 0), lopdf::Object::Dictionary(pages_dict));
 
     let page_dict = lopdf::dictionary! {
         "Type" => "Page",
         "Parent" => lopdf::Object::Reference((2, 0)),
         "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()]
     };
-    doc.objects.insert((3, 0), lopdf::Object::Dictionary(page_dict));
+    doc.objects
+        .insert((3, 0), lopdf::Object::Dictionary(page_dict));
 
     let encryption_version = lopdf::EncryptionVersion::V2 {
         document: &doc,
@@ -268,21 +280,24 @@ fn test_metadata_extraction_preserves_custom_info_entries() {
         "Pages" => lopdf::Object::Reference((2, 0))
     };
     let catalog_id = doc.add_object(catalog_dict);
-    doc.trailer.set("Root", lopdf::Object::Reference(catalog_id));
+    doc.trailer
+        .set("Root", lopdf::Object::Reference(catalog_id));
 
     let pages_dict = lopdf::dictionary! {
         "Type" => "Pages",
         "Kids" => vec![lopdf::Object::Reference((3, 0))],
         "Count" => 1
     };
-    doc.objects.insert((2, 0), lopdf::Object::Dictionary(pages_dict));
+    doc.objects
+        .insert((2, 0), lopdf::Object::Dictionary(pages_dict));
 
     let page_dict = lopdf::dictionary! {
         "Type" => "Page",
         "Parent" => lopdf::Object::Reference((2, 0)),
         "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()]
     };
-    doc.objects.insert((3, 0), lopdf::Object::Dictionary(page_dict));
+    doc.objects
+        .insert((3, 0), lopdf::Object::Dictionary(page_dict));
 
     let mip_guid_enabled = "MSIP_Label_754d9351-9ade-4bd5-893a-95071572330d_Enabled";
     let mip_guid_name = "MSIP_Label_754d9351-9ade-4bd5-893a-95071572330d_Name";

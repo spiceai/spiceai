@@ -118,7 +118,10 @@ impl XrefEntry {
             XrefEntry::Normal { offset, generation } => {
                 writeln!(file, "{offset:>010} {generation:>05} n ")?;
             }
-            XrefEntry::Compressed { container: _, index: _ } => {
+            XrefEntry::Compressed {
+                container: _,
+                index: _,
+            } => {
                 writeln!(file, "{:>010} {:>05} f ", 0, 65535)?;
             }
             XrefEntry::Free => {
@@ -185,7 +188,11 @@ pub struct XrefStreamBuilder<'a> {
 impl<'a> XrefStreamBuilder<'a> {
     /// Create a new builder from an Xref
     pub fn new(xref: &'a Xref) -> Self {
-        let entries: Vec<_> = xref.entries.iter().map(|(&id, entry)| (id, entry)).collect();
+        let entries: Vec<_> = xref
+            .entries
+            .iter()
+            .map(|(&id, entry)| (id, entry))
+            .collect();
 
         Self {
             xref,

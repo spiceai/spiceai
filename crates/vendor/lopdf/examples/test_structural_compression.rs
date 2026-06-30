@@ -89,7 +89,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let in_original = no_objstm_str.contains(pattern);
         let in_compressed = with_objstm_str.contains(pattern);
 
-        println!("{}: original={}, compressed={}", pattern, in_original, in_compressed);
+        println!(
+            "{}: original={}, compressed={}",
+            pattern, in_original, in_compressed
+        );
 
         if in_compressed {
             println!("  WARNING: Object {} should have been compressed!", pattern);
@@ -133,7 +136,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Total compressed objects: {}", compressed_objects);
 
     if compressed_objects < 5 {
-        println!("\nERROR: Expected at least 5 objects to be compressed (Catalog, Pages, Page, and Fonts)");
+        println!(
+            "\nERROR: Expected at least 5 objects to be compressed (Catalog, Pages, Page, and Fonts)"
+        );
         println!("Only {} objects were compressed!", compressed_objects);
     } else {
         println!("\n✓ SUCCESS: Structural objects are being compressed!");

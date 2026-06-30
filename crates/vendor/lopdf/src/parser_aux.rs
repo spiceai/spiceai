@@ -36,13 +36,20 @@ impl Stream {
 
 impl Document {
     /// Get decoded page content;
-    pub fn get_and_decode_page_content(&self, page_id: ObjectId) -> Result<Content<Vec<Operation>>> {
+    pub fn get_and_decode_page_content(
+        &self,
+        page_id: ObjectId,
+    ) -> Result<Content<Vec<Operation>>> {
         let content_data = self.get_page_content(page_id)?;
         Content::decode(&content_data)
     }
 
     /// Add content to a page. All existing content will be unchanged.
-    pub fn add_to_page_content(&mut self, page_id: ObjectId, content: Content<Vec<Operation>>) -> Result<()> {
+    pub fn add_to_page_content(
+        &mut self,
+        page_id: ObjectId,
+        content: Content<Vec<Operation>>,
+    ) -> Result<()> {
         let content_data = Content::encode(&content)?;
         self.add_page_contents(page_id, content_data)?;
         Ok(())
@@ -74,11 +81,15 @@ impl Document {
     }
 
     fn extract_text_chunks_from_page(
-        &self, pages: &BTreeMap<u32, (u32, u16)>, page_number: u32,
+        &self,
+        pages: &BTreeMap<u32, (u32, u16)>,
+        page_number: u32,
     ) -> Result<Vec<Result<String>>> {
         let mut collected_chunks_and_errs: Vec<std::result::Result<String, Error>> = Vec::new();
 
-        let page_id = *pages.get(&page_number).ok_or(Error::PageNumberNotFound(page_number))?;
+        let page_id = *pages
+            .get(&page_number)
+            .ok_or(Error::PageNumberNotFound(page_number))?;
         let fonts = self.get_page_fonts(page_id)?;
         let encodings: BTreeMap<Vec<u8>, Encoding> = fonts
             .into_iter()
@@ -152,7 +163,11 @@ impl Document {
                             current_text.push('\n');
                         }
                         if let Some(string_operand) = operation.operands.get(2) {
-                            let res = collect_text(&mut current_text, encoding, std::slice::from_ref(string_operand));
+                            let res = collect_text(
+                                &mut current_text,
+                                encoding,
+                                std::slice::from_ref(string_operand),
+                            );
                             if let Err(err) = res {
                                 collected_chunks_and_errs.push(Err(err));
                             }
@@ -179,7 +194,11 @@ impl Document {
     }
 
     pub fn replace_text(
-        &mut self, page_number: u32, text: &str, other_text: &str, default_str: Option<&str>,
+        &mut self,
+        page_number: u32,
+        text: &str,
+        other_text: &str,
+        default_str: Option<&str>,
     ) -> Result<()> {
         let page = page_number.saturating_sub(1) as usize;
         let page_id = self
@@ -205,11 +224,17 @@ impl Document {
                     current_encoding = encodings.get(current_font);
                 }
                 "Tj" | "TJ" => match current_encoding {
-                    Some(encoding) => {
-                        try_to_replace_encoded_text(operation, encoding, text, other_text, default_str.unwrap_or(""))?
-                    }
+                    Some(encoding) => try_to_replace_encoded_text(
+                        operation,
+                        encoding,
+                        text,
+                        other_text,
+                        default_str.unwrap_or(""),
+                    )?,
                     None => {
-                        warn!("Could not decode extracted text, some of the occurances might not be properly replaced")
+                        warn!(
+                            "Could not decode extracted text, some of the occurances might not be properly replaced"
+                        )
                     }
                 },
                 _ => {}
@@ -220,7 +245,11 @@ impl Document {
     }
 
     pub fn replace_partial_text(
-        &mut self, page_number: u32, search_text: &str, replacement_text: &str, default_char: Option<&str>,
+        &mut self,
+        page_number: u32,
+        search_text: &str,
+        replacement_text: &str,
+        default_char: Option<&str>,
     ) -> Result<usize> {
         let page = page_number.saturating_sub(1) as usize;
         let page_id = self
@@ -275,7 +304,11 @@ impl Document {
     }
 
     pub fn insert_image(
-        &mut self, page_id: ObjectId, img_object: Stream, position: (f32, f32), size: (f32, f32),
+        &mut self,
+        page_id: ObjectId,
+        img_object: Stream,
+        position: (f32, f32),
+        size: (f32, f32),
     ) -> Result<()> {
         let img_id = self.add_object(img_object);
         let img_name = format!("X{}", img_id.0);
@@ -295,9 +328,10 @@ impl Document {
                 position.1.into(),
             ],
         ));
-        content
-            .operations
-            .push(Operation::new("Do", vec![Name(img_name.as_bytes().to_vec())]));
+        content.operations.push(Operation::new(
+            "Do",
+            vec![Name(img_name.as_bytes().to_vec())],
+        ));
         content.operations.push(Operation::new("Q", vec![]));
 
         self.change_page_content(page_id, content.encode()?)
@@ -310,9 +344,10 @@ impl Document {
         let mut content = self.get_and_decode_page_content(page_id)?;
         content.operations.insert(0, Operation::new("q", vec![]));
         content.operations.push(Operation::new("Q", vec![]));
-        content
-            .operations
-            .push(Operation::new("Do", vec![Name(form_name.as_bytes().to_vec())]));
+        content.operations.push(Operation::new(
+            "Do",
+            vec![Name(form_name.as_bytes().to_vec())],
+        ));
         let modified_content = content.encode()?;
         self.add_xobject(page_id, form_name, form_id)?;
 
@@ -358,7 +393,10 @@ pub fn substr(s: &str, start: usize, len: usize) -> &str {
     &s[start_idx..end_idx]
 }
 pub fn substring(s: &str, start: usize) -> &str {
-    s.char_indices().nth(start).map(|(idx, _)| &s[idx..]).unwrap_or("")
+    s.char_indices()
+        .nth(start)
+        .map(|(idx, _)| &s[idx..])
+        .unwrap_or("")
 }
 
 fn encode(encoding: &Encoding, txt: &str, default_str: &str) -> Vec<u8> {
@@ -381,7 +419,11 @@ fn encode(encoding: &Encoding, txt: &str, default_str: &str) -> Vec<u8> {
     }
 }
 fn try_to_replace_encoded_text(
-    operation: &mut Operation, encoding: &Encoding, text_to_replace: &str, replacement: &str, default_str: &str,
+    operation: &mut Operation,
+    encoding: &Encoding,
+    text_to_replace: &str,
+    replacement: &str,
+    default_str: &str,
 ) -> Result<()> {
     for operand in &mut operation.operands {
         match operand {
@@ -428,7 +470,11 @@ fn try_to_replace_encoded_text(
 }
 
 fn replace_partial_in_operation(
-    operation: &mut Operation, encoding: &Encoding, search_text: &str, replacement_text: &str, default_char: &str,
+    operation: &mut Operation,
+    encoding: &Encoding,
+    search_text: &str,
+    replacement_text: &str,
+    default_char: &str,
 ) -> Result<usize> {
     let mut replacement_count = 0;
 
@@ -444,8 +490,13 @@ fn replace_partial_in_operation(
                 }
             }
             Object::Array(arr) => {
-                replacement_count +=
-                    replace_partial_in_array(arr, encoding, search_text, replacement_text, default_char)?;
+                replacement_count += replace_partial_in_array(
+                    arr,
+                    encoding,
+                    search_text,
+                    replacement_text,
+                    default_char,
+                )?;
             }
             _ => {}
         }
@@ -455,7 +506,11 @@ fn replace_partial_in_operation(
 }
 
 fn replace_partial_in_array(
-    arr: &mut [Object], encoding: &Encoding, search_text: &str, replacement_text: &str, default_char: &str,
+    arr: &mut [Object],
+    encoding: &Encoding,
+    search_text: &str,
+    replacement_text: &str,
+    default_char: &str,
 ) -> Result<usize> {
     let mut replacement_count = 0;
 
@@ -545,9 +600,14 @@ pub fn decode_xref_stream(mut stream: Stream) -> Result<(Xref, Dictionary)> {
                     }
                     2 => {
                         // compressed object
-                        let container = read_big_endian_integer(&mut reader, bytes2.as_mut_slice())?;
-                        let index = read_big_endian_integer(&mut reader, bytes3.as_mut_slice())? as u16;
-                        xref.insert((start + j) as u32, XrefEntry::Compressed { container, index });
+                        let container =
+                            read_big_endian_integer(&mut reader, bytes2.as_mut_slice())?;
+                        let index =
+                            read_big_endian_integer(&mut reader, bytes3.as_mut_slice())? as u16;
+                        xref.insert(
+                            (start + j) as u32,
+                            XrefEntry::Compressed { container, index },
+                        );
                     }
                     _ => {}
                 }
@@ -689,12 +749,18 @@ mod tests {
             Operation::new("BT", vec![]),
             Operation::new("Tf", vec!["F1".into(), 12.into()]),
             Operation::new("Td", vec![100.into(), 700.into()]),
-            Operation::new("\"", vec![0.into(), 0.into(), Object::string_literal("from-quote-op")]),
+            Operation::new(
+                "\"",
+                vec![0.into(), 0.into(), Object::string_literal("from-quote-op")],
+            ),
             Operation::new("ET", vec![]),
         ]);
 
         let text = doc.extract_text(&[1]).unwrap();
-        assert!(text.contains("from-quote-op"), "\" string operand lost: {text:?}");
+        assert!(
+            text.contains("from-quote-op"),
+            "\" string operand lost: {text:?}"
+        );
     }
 
     /// PDF 1.7 / ISO 32000-1 §9.4.2 — `T*` moves to the start of the

@@ -8,7 +8,10 @@ use std::sync::Arc;
 fn main() {
     // Collect command line arguments: input_file angle output_file
     let args: Vec<String> = std::env::args().collect();
-    assert!(args.len() >= 4, "Not enough arguments: input_file output_file version");
+    assert!(
+        args.len() >= 4,
+        "Not enough arguments: input_file output_file version"
+    );
     let input_file = &args[1];
     let output_file = &args[2];
     let version = args[3].parse::<i64>().unwrap_or(0);
@@ -132,7 +135,10 @@ fn main() {
 async fn main() {
     // Collect command line arguments: input_file angle output_file
     let args: Vec<String> = std::env::args().collect();
-    assert!(args.len() >= 4, "Not enough arguments: input_file output_file version");
+    assert!(
+        args.len() >= 4,
+        "Not enough arguments: input_file output_file version"
+    );
     let input_file = &args[1];
     let output_file = &args[2];
     let version = args[3].parse::<i64>().unwrap_or(0);

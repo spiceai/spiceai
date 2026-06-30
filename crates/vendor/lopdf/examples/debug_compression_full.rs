@@ -107,7 +107,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     writeln!(debug_log, "\nSummary:")?;
-    writeln!(debug_log, "  Compressible objects: {}", compressible_objects.len())?;
+    writeln!(
+        debug_log,
+        "  Compressible objects: {}",
+        compressible_objects.len()
+    )?;
     writeln!(
         debug_log,
         "  Non-compressible objects: {}",
@@ -120,7 +124,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     doc.save_with_options(&mut buffer, options)?;
     std::fs::write(&output_file, &buffer)?;
 
-    println!("Saved compressed PDF: {} ({} bytes)", output_file, buffer.len());
+    println!(
+        "Saved compressed PDF: {} ({} bytes)",
+        output_file,
+        buffer.len()
+    );
 
     // Load compressed PDF back
     println!("\n4. Loading compressed PDF back for analysis...");
@@ -255,7 +263,10 @@ fn print_analysis(analysis: &DocumentAnalysis) {
     println!("  Object streams: {}", analysis.object_streams);
     println!("  Compressed objects: {}", analysis.compressed_objects);
     println!("  Page objects: {:?}", analysis.page_objects);
-    println!("  Content streams: {} found", analysis.content_streams.len());
+    println!(
+        "  Content streams: {} found",
+        analysis.content_streams.len()
+    );
     println!("  Fonts: {} found", analysis.fonts.len());
 }
 
@@ -269,18 +280,35 @@ fn describe_object(obj: &Object) -> String {
         Object::String(_, _) => "String".to_string(),
         Object::Array(a) => format!("Array[{}]", a.len()),
         Object::Dictionary(d) => {
-            let keys: Vec<_> = d.iter().take(3).map(|(k, _)| String::from_utf8_lossy(k)).collect();
+            let keys: Vec<_> = d
+                .iter()
+                .take(3)
+                .map(|(k, _)| String::from_utf8_lossy(k))
+                .collect();
             format!("Dict{{{}...}}", keys.join(", "))
         }
         Object::Stream(s) => {
-            let keys: Vec<_> = s.dict.iter().take(3).map(|(k, _)| String::from_utf8_lossy(k)).collect();
-            format!("Stream{{dict: {{{}...}}, len: {}}}", keys.join(", "), s.content.len())
+            let keys: Vec<_> = s
+                .dict
+                .iter()
+                .take(3)
+                .map(|(k, _)| String::from_utf8_lossy(k))
+                .collect();
+            format!(
+                "Stream{{dict: {{{}...}}, len: {}}}",
+                keys.join(", "),
+                s.content.len()
+            )
         }
         Object::Reference(id) => format!("Ref({} {} R)", id.0, id.1),
     }
 }
 
-fn compare_analyses(original: &DocumentAnalysis, compressed: &DocumentAnalysis, log: &mut File) -> std::io::Result<()> {
+fn compare_analyses(
+    original: &DocumentAnalysis,
+    compressed: &DocumentAnalysis,
+    log: &mut File,
+) -> std::io::Result<()> {
     writeln!(log, "\n=== STRUCTURE COMPARISON ===")?;
 
     if original.pages != compressed.pages {
@@ -352,15 +380,25 @@ fn verify_critical_objects(doc: &Document, log: &mut File) -> std::io::Result<()
                 if let Object::Dictionary(page_dict) = obj {
                     match page_dict.get(b"Contents") {
                         Ok(Object::Reference(content_id)) => match doc.get_object(*content_id) {
-                            Ok(_) => writeln!(log, "  Contents {} {} R: OK", content_id.0, content_id.1)?,
-                            Err(e) => writeln!(log, "  Contents {} {} R: ERROR - {}", content_id.0, content_id.1, e)?,
+                            Ok(_) => {
+                                writeln!(log, "  Contents {} {} R: OK", content_id.0, content_id.1)?
+                            }
+                            Err(e) => writeln!(
+                                log,
+                                "  Contents {} {} R: ERROR - {}",
+                                content_id.0, content_id.1, e
+                            )?,
                         },
                         Ok(Object::Array(contents)) => {
                             writeln!(log, "  Contents array with {} elements", contents.len())?;
                             for (i, content_ref) in contents.iter().enumerate() {
                                 if let Object::Reference(content_id) = content_ref {
                                     match doc.get_object(*content_id) {
-                                        Ok(_) => writeln!(log, "    [{}] {} {} R: OK", i, content_id.0, content_id.1)?,
+                                        Ok(_) => writeln!(
+                                            log,
+                                            "    [{}] {} {} R: OK",
+                                            i, content_id.0, content_id.1
+                                        )?,
                                         Err(e) => writeln!(
                                             log,
                                             "    [{}] {} {} R: ERROR - {}",
@@ -375,7 +413,11 @@ fn verify_critical_objects(doc: &Document, log: &mut File) -> std::io::Result<()
                 }
             }
             Err(e) => {
-                writeln!(log, "Page {} ({} {} R): ERROR - {}", num, page_id.0, page_id.1, e)?;
+                writeln!(
+                    log,
+                    "Page {} ({} {} R): ERROR - {}",
+                    num, page_id.0, page_id.1, e
+                )?;
             }
         }
     }
@@ -453,7 +495,10 @@ fn collect_references(obj: &Object, refs: &mut ReferenceLocations, from_id: Obje
         Object::Dictionary(dict) => {
             for (key, value) in dict.iter() {
                 if let Object::Reference(ref_id) = value {
-                    refs.insert(*ref_id, (format!("dict[{}]", String::from_utf8_lossy(key)), from_id));
+                    refs.insert(
+                        *ref_id,
+                        (format!("dict[{}]", String::from_utf8_lossy(key)), from_id),
+                    );
                 }
                 collect_references(value, refs, from_id);
             }
@@ -463,7 +508,10 @@ fn collect_references(obj: &Object, refs: &mut ReferenceLocations, from_id: Obje
                 if let Object::Reference(ref_id) = value {
                     refs.insert(
                         *ref_id,
-                        (format!("stream.dict[{}]", String::from_utf8_lossy(key)), from_id),
+                        (
+                            format!("stream.dict[{}]", String::from_utf8_lossy(key)),
+                            from_id,
+                        ),
                     );
                 }
                 collect_references(value, refs, from_id);
@@ -492,7 +540,10 @@ fn validate_with_external_tools(pdf_path: &str) {
 
     // Try to use qpdf if available
     println!("\nTrying qpdf --check...");
-    match std::process::Command::new("qpdf").args(["--check", pdf_path]).output() {
+    match std::process::Command::new("qpdf")
+        .args(["--check", pdf_path])
+        .output()
+    {
         Ok(output) => {
             if output.status.success() {
                 println!("✓ qpdf validation passed");
@@ -508,7 +559,10 @@ fn validate_with_external_tools(pdf_path: &str) {
 
     // Try to use mutool if available
     println!("\nTrying mutool info...");
-    match std::process::Command::new("mutool").args(["info", pdf_path]).output() {
+    match std::process::Command::new("mutool")
+        .args(["info", pdf_path])
+        .output()
+    {
         Ok(output) => {
             if output.status.success() {
                 println!("✓ mutool validation passed");

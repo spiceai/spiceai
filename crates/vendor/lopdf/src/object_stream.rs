@@ -60,7 +60,8 @@ impl ObjectStream {
             .get(..first_offset)
             .ok_or(Error::InvalidOffset(first_offset))?;
 
-        let numbers_str = std::str::from_utf8(index_block).map_err(|e| Error::InvalidObjectStream(e.to_string()))?;
+        let numbers_str = std::str::from_utf8(index_block)
+            .map_err(|e| Error::InvalidObjectStream(e.to_string()))?;
         let numbers: Vec<_> = numbers_str
             .split_whitespace()
             .map(|number| u32::from_str(number).ok())
@@ -94,9 +95,15 @@ impl ObjectStream {
             Some(((id, 0), object))
         };
         #[cfg(feature = "rayon")]
-        let objects = numbers[..len].par_chunks(2).filter_map(chunks_filter_map).collect();
+        let objects = numbers[..len]
+            .par_chunks(2)
+            .filter_map(chunks_filter_map)
+            .collect();
         #[cfg(not(feature = "rayon"))]
-        let objects = numbers[..len].chunks(2).filter_map(chunks_filter_map).collect();
+        let objects = numbers[..len]
+            .chunks(2)
+            .filter_map(chunks_filter_map)
+            .collect();
 
         Ok(ObjectStream {
             objects,

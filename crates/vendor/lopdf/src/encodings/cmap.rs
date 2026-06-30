@@ -78,9 +78,19 @@ impl ToUnicodeCMap {
                                     offset: u32::wrapping_sub(dst_vec[0][0] as u32, start),
                                 },
                             ),
-                            1 => cmap.put(start, end, code_len, BfRangeTarget::HexString(dst_vec[0].clone())),
+                            1 => cmap.put(
+                                start,
+                                end,
+                                code_len,
+                                BfRangeTarget::HexString(dst_vec[0].clone()),
+                            ),
                             0 => return Err(UnicodeCMapError::InvalidCodeRange),
-                            _ => cmap.put(start, end, code_len, BfRangeTarget::ArrayOfHexStrings(dst_vec.clone())),
+                            _ => cmap.put(
+                                start,
+                                end,
+                                code_len,
+                                BfRangeTarget::ArrayOfHexStrings(dst_vec.clone()),
+                            ),
                         }
                     }
                 }
@@ -105,12 +115,15 @@ impl ToUnicodeCMap {
                                 Some(hex_str_vec.clone())
                             } else if hex_str_vec.len() == 1 {
                                 // For ranges like <01> <05> <0041>
-                                Some(vec![hex_str_vec[0].wrapping_add((src_code - range.start()) as u16)])
+                                Some(vec![
+                                    hex_str_vec[0].wrapping_add((src_code - range.start()) as u16),
+                                ])
                             } else if !hex_str_vec.is_empty() {
                                 // For ranges like <01> <05> [<0041> <0042> ...]
                                 let mut current_hex_str = hex_str_vec.clone();
                                 if let Some(last_val) = current_hex_str.last_mut() {
-                                    *last_val = last_val.wrapping_add((src_code - range.start()) as u16);
+                                    *last_val =
+                                        last_val.wrapping_add((src_code - range.start()) as u16);
                                     Some(current_hex_str)
                                 } else {
                                     None
@@ -132,10 +145,13 @@ impl ToUnicodeCMap {
                     if let Some(uni_seq) = unicode_sequence
                         && !uni_seq.is_empty()
                     {
-                        rev_map.entry(uni_seq).or_insert_with(Vec::new).push(ReverseCMapEntry {
-                            source_code: src_code,
-                            code_len,
-                        });
+                        rev_map
+                            .entry(uni_seq)
+                            .or_insert_with(Vec::new)
+                            .push(ReverseCMapEntry {
+                                source_code: src_code,
+                                code_len,
+                            });
                     }
                 }
             }
@@ -154,22 +170,24 @@ impl ToUnicodeCMap {
 
         let bf_ranges_map = &self.bf_ranges[(code_len - 1) as usize];
 
-        bf_ranges_map.get_key_value(&code).map(|(range, value)| match value {
-            HexString(vec) => {
-                let mut ret_vec = vec.clone();
-                *(ret_vec.last_mut().unwrap()) += (code - range.start()) as u16;
-                ret_vec
-            }
-            UTF16CodePoint { offset } => vec![u32::wrapping_add(code, *offset) as u16],
-            ArrayOfHexStrings(vec_of_strings) => {
-                let idx = (code - range.start()) as usize;
-                if idx < vec_of_strings.len() {
-                    vec_of_strings[idx].clone()
-                } else {
-                    vec![ToUnicodeCMap::REPLACEMENT_CHAR]
+        bf_ranges_map
+            .get_key_value(&code)
+            .map(|(range, value)| match value {
+                HexString(vec) => {
+                    let mut ret_vec = vec.clone();
+                    *(ret_vec.last_mut().unwrap()) += (code - range.start()) as u16;
+                    ret_vec
                 }
-            }
-        })
+                UTF16CodePoint { offset } => vec![u32::wrapping_add(code, *offset) as u16],
+                ArrayOfHexStrings(vec_of_strings) => {
+                    let idx = (code - range.start()) as usize;
+                    if idx < vec_of_strings.len() {
+                        vec_of_strings[idx].clone()
+                    } else {
+                        vec![ToUnicodeCMap::REPLACEMENT_CHAR]
+                    }
+                }
+            })
     }
 
     pub fn get_or_replacement_char(&self, code: SourceCode, code_len: CodeLen) -> Vec<u16> {
@@ -177,7 +195,13 @@ impl ToUnicodeCMap {
             .unwrap_or(vec![ToUnicodeCMap::REPLACEMENT_CHAR])
     }
 
-    pub fn put(&mut self, src_code_lo: SourceCode, src_code_hi: SourceCode, code_len: CodeLen, target: BfRangeTarget) {
+    pub fn put(
+        &mut self,
+        src_code_lo: SourceCode,
+        src_code_hi: SourceCode,
+        code_len: CodeLen,
+        target: BfRangeTarget,
+    ) {
         if code_len > 4 || code_len == 0 {
             error!("Code lenght should be between l and 4 bytes, got {code_len}, ignoring");
             return;
@@ -198,7 +222,10 @@ impl ToUnicodeCMap {
 
     /// Gets the source code(s) for a given Unicode sequence.
     /// Prioritizes shorter byte sequences if multiple mappings exist.
-    pub fn get_source_codes_for_unicode(&self, unicode_sequence: &[u16]) -> Option<&[ReverseCMapEntry]> {
+    pub fn get_source_codes_for_unicode(
+        &self,
+        unicode_sequence: &[u16],
+    ) -> Option<&[ReverseCMapEntry]> {
         if let Some(map) = &self.reverse_map {
             // TODO: Add prioritization logic if needed (e.g., prefer shorter code_len)
             map.get(unicode_sequence).map(|v| v.as_slice())
@@ -274,8 +301,17 @@ mod tests {
         assert_eq!(cmap.get(0x11, 2), Some(vec![0x0042]));
 
         // Out-of-bounds lookups return replacement char instead of panicking
-        assert_eq!(cmap.get(0x12, 2), Some(vec![ToUnicodeCMap::REPLACEMENT_CHAR]));
-        assert_eq!(cmap.get(0x13, 2), Some(vec![ToUnicodeCMap::REPLACEMENT_CHAR]));
-        assert_eq!(cmap.get(0x14, 2), Some(vec![ToUnicodeCMap::REPLACEMENT_CHAR]));
+        assert_eq!(
+            cmap.get(0x12, 2),
+            Some(vec![ToUnicodeCMap::REPLACEMENT_CHAR])
+        );
+        assert_eq!(
+            cmap.get(0x13, 2),
+            Some(vec![ToUnicodeCMap::REPLACEMENT_CHAR])
+        );
+        assert_eq!(
+            cmap.get(0x14, 2),
+            Some(vec![ToUnicodeCMap::REPLACEMENT_CHAR])
+        );
     }
 }

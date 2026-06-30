@@ -20,7 +20,10 @@ pub enum Error {
         found: &'static str,
     },
     #[error("dictionary has wrong type: ")]
-    DictType { expected: &'static str, found: String },
+    DictType {
+        expected: &'static str,
+        found: String,
+    },
     /// PDF document is already encrypted.
     #[error("PDF document is already encrypted")]
     AlreadyEncrypted,

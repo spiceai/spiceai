@@ -9,7 +9,10 @@ fn main() {
 
     // Add some simple objects that can be compressed
     let obj1_id = doc.add_object(Object::Integer(42));
-    let obj2_id = doc.add_object(Object::String(b"Hello".to_vec(), lopdf::StringFormat::Literal));
+    let obj2_id = doc.add_object(Object::String(
+        b"Hello".to_vec(),
+        lopdf::StringFormat::Literal,
+    ));
     let obj3_id = doc.add_object(dictionary! {
         "Type" => "TestObject",
         "Value" => 123
@@ -70,7 +73,11 @@ fn main() {
             println!("  Content size: {} bytes", stream.content.len());
 
             // Check if it looks compressed
-            let looks_compressed = stream.content.iter().take(10).any(|&b| !(32..=127).contains(&b));
+            let looks_compressed = stream
+                .content
+                .iter()
+                .take(10)
+                .any(|&b| !(32..=127).contains(&b));
             println!("  Content looks compressed: {}", looks_compressed);
 
             if !looks_compressed {

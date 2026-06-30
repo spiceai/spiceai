@@ -37,7 +37,10 @@ pub fn write_to_bytes(encoding: &CodedCharacterSet, text: &str, out: &mut Vec<u8
     for c in text.encode_utf16() {
         let g = Glyph::from_utf16_code_unit(c);
 
-        let Some(n) = encoding.iter().position(|glyph| glyph.is_some_and(|f| f == g)) else {
+        let Some(n) = encoding
+            .iter()
+            .position(|glyph| glyph.is_some_and(|f| f == g))
+        else {
             continue;
         };
 
@@ -89,22 +92,25 @@ impl Encoding<'_> {
                 let mut considered_source_code = 0u32;
                 for byte in bytes {
                     if bytes_in_considered_code == 4 {
-                        let mut value = unicode_map.get_or_replacement_char(considered_source_code, 4);
+                        let mut value =
+                            unicode_map.get_or_replacement_char(considered_source_code, 4);
                         considered_source_code = 0;
                         bytes_in_considered_code = 0;
                         output_bytes.append(&mut value);
                     }
                     bytes_in_considered_code += 1;
                     considered_source_code = considered_source_code * 256 + *byte as u32;
-                    if let Some(mut value) = unicode_map.get(considered_source_code, bytes_in_considered_code) {
+                    if let Some(mut value) =
+                        unicode_map.get(considered_source_code, bytes_in_considered_code)
+                    {
                         considered_source_code = 0;
                         bytes_in_considered_code = 0;
                         output_bytes.append(&mut value);
                     }
                 }
                 if bytes_in_considered_code > 0 {
-                    let mut value =
-                        unicode_map.get_or_replacement_char(considered_source_code, bytes_in_considered_code);
+                    let mut value = unicode_map
+                        .get_or_replacement_char(considered_source_code, bytes_in_considered_code);
                     output_bytes.append(&mut value);
                 }
                 let utf16_str: Vec<u8> = output_bytes
@@ -136,13 +142,17 @@ impl Encoding<'_> {
             Self::SimpleEncoding(b"UniGB-UCS2-H") | Self::SimpleEncoding(b"UniGB-UTF16-H") => {
                 encode_utf16_be(text, out)
             }
-            Self::SimpleEncoding(b"WinAnsiEncoding") => write_to_bytes(&WIN_ANSI_ENCODING, text, out),
+            Self::SimpleEncoding(b"WinAnsiEncoding") => {
+                write_to_bytes(&WIN_ANSI_ENCODING, text, out)
+            }
             Self::UnicodeMapEncoding(unicode_map) => {
                 let mut i = 0;
                 while i < text.chars().count() {
                     let current_unicode_seq: Vec<u16> = substr(text, i, 1).encode_utf16().collect();
 
-                    if let Some(entries) = unicode_map.get_source_codes_for_unicode(&current_unicode_seq) {
+                    if let Some(entries) =
+                        unicode_map.get_source_codes_for_unicode(&current_unicode_seq)
+                    {
                         if let Some(entry) = entries.first() {
                             // TODO: Add logic to pick the best entry if multiple
                             let mut bytes_for_code = Vec::new();
@@ -215,8 +225,18 @@ mod tests {
     fn unicode_with_2byte_code_does_not_convert_single_bytes() {
         let mut cmap = ToUnicodeCMap::new();
 
-        cmap.put(0x0000, 0x0002, 2, cmap::BfRangeTarget::UTF16CodePoint { offset: 0 });
-        cmap.put(0x0024, 0x0025, 2, cmap::BfRangeTarget::UTF16CodePoint { offset: 0 });
+        cmap.put(
+            0x0000,
+            0x0002,
+            2,
+            cmap::BfRangeTarget::UTF16CodePoint { offset: 0 },
+        );
+        cmap.put(
+            0x0024,
+            0x0025,
+            2,
+            cmap::BfRangeTarget::UTF16CodePoint { offset: 0 },
+        );
 
         let bytes: [u8; 2] = [0x00, 0x24];
 

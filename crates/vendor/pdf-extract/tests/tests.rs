@@ -55,7 +55,7 @@ impl ExpectedText<'_> {
                     if e.kind() != std::io::ErrorKind::AlreadyExists {
                         panic!("Failed to create directory {}, {}", docs_cache, e);
                     }
-                } 
+                }
             }
             let file_path = format!("{}/{}", docs_cache, filename.replace(".link", ""));
             if std::path::Path::new(&file_path).exists() {

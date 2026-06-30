@@ -21,7 +21,11 @@ fn load_document(path: &str) -> Result<Document, Box<dyn std::error::Error>> {
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = env::args().collect();
-    let input_file = if args.len() > 1 { &args[1] } else { "assets/example.pdf" };
+    let input_file = if args.len() > 1 {
+        &args[1]
+    } else {
+        "assets/example.pdf"
+    };
 
     println!("Analyzing PDF: {}", input_file);
     let doc = load_document(input_file)?;

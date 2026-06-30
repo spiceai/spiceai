@@ -66,7 +66,10 @@ mod tests_with_parsing {
 
     #[test]
     fn test_replace() {
-        assert_eq!(replace_text().unwrap().extract_text(&[1]).unwrap(), "Modified text!\n");
+        assert_eq!(
+            replace_text().unwrap().extract_text(&[1]).unwrap(),
+            "Modified text!\n"
+        );
     }
 
     fn replace_unicode_text() -> Result<Document> {

@@ -4,14 +4,22 @@ fn main() {
     println!("Testing Object Stream creation...\n");
 
     // Create a simple object stream with a few objects
-    let mut obj_stream = ObjectStream::builder().max_objects(10).compression_level(6).build();
+    let mut obj_stream = ObjectStream::builder()
+        .max_objects(10)
+        .compression_level(6)
+        .build();
 
     // Add some simple objects
     obj_stream.add_object((1, 0), Object::Integer(42)).unwrap();
     obj_stream
-        .add_object((2, 0), Object::String(b"Hello".to_vec(), lopdf::StringFormat::Literal))
+        .add_object(
+            (2, 0),
+            Object::String(b"Hello".to_vec(), lopdf::StringFormat::Literal),
+        )
         .unwrap();
-    obj_stream.add_object((3, 0), Object::Boolean(true)).unwrap();
+    obj_stream
+        .add_object((3, 0), Object::Boolean(true))
+        .unwrap();
 
     println!("Added {} objects to stream", obj_stream.object_count());
 

@@ -191,7 +191,6 @@ pub fn zapfdigbats_names_to_unicode(name: &str) -> Option<u16> {
         ("a88", 0x2773),
         ("a89", 0x2768),
         ("a9", 0x2720),
-
         ("a90", 0x2769),
         ("a91", 0x276c),
         ("a92", 0x276d),
@@ -205,6 +204,6 @@ pub fn zapfdigbats_names_to_unicode(name: &str) -> Option<u16> {
         ("space", 0x0020),
     ];
 
-    let result = names.binary_search_by_key(&name, |&(name,_code)| &name);
+    let result = names.binary_search_by_key(&name, |&(name, _code)| &name);
     result.ok().map(|indx| names[indx].1)
 }

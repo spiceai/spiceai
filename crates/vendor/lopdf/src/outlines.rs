@@ -9,12 +9,18 @@ pub enum Outline {
 
 impl Document {
     pub fn get_outline(
-        &self, node: &Dictionary, named_destinations: &mut IndexMap<Vec<u8>, Destination>,
+        &self,
+        node: &Dictionary,
+        named_destinations: &mut IndexMap<Vec<u8>, Destination>,
     ) -> Result<Option<Outline>> {
         let action = match self.get_dict_in_dict(node, b"A") {
             Ok(a) => a,
             Err(_) => {
-                return self.build_outline_result(node.get(b"Dest")?, node.get(b"Title")?, named_destinations);
+                return self.build_outline_result(
+                    node.get(b"Dest")?,
+                    node.get(b"Title")?,
+                    named_destinations,
+                );
             }
         };
         let command = action.get(b"S")?.as_name()?;
@@ -25,15 +31,27 @@ impl Document {
         let title_ref = match title_obj.as_reference() {
             Ok(o) => o,
             Err(_) => match title_obj.as_str() {
-                Ok(_) => return self.build_outline_result(action.get(b"D")?, title_obj, named_destinations),
+                Ok(_) => {
+                    return self.build_outline_result(
+                        action.get(b"D")?,
+                        title_obj,
+                        named_destinations,
+                    );
+                }
                 Err(err) => return Err(err),
             },
         };
-        self.build_outline_result(action.get(b"D")?, self.get_object(title_ref)?, named_destinations)
+        self.build_outline_result(
+            action.get(b"D")?,
+            self.get_object(title_ref)?,
+            named_destinations,
+        )
     }
 
     pub fn get_outlines(
-        &self, mut node: Option<Object>, mut outlines: Option<Vec<Outline>>,
+        &self,
+        mut node: Option<Object>,
+        mut outlines: Option<Vec<Outline>>,
         named_destinations: &mut IndexMap<Vec<u8>, Destination>,
     ) -> Result<Option<Vec<Outline>>> {
         if outlines.is_none() {
@@ -75,7 +93,8 @@ impl Document {
             }
             if let Ok(first) = node.get(b"First") {
                 let sub_outlines = Vec::new();
-                let sub_outlines = self.get_outlines(Some(first.clone()), Some(sub_outlines), named_destinations)?;
+                let sub_outlines =
+                    self.get_outlines(Some(first.clone()), Some(sub_outlines), named_destinations)?;
                 if let Some(sub_outlines) = sub_outlines
                     && !sub_outlines.is_empty()
                     && let Some(ref mut outlines) = outlines
@@ -92,7 +111,10 @@ impl Document {
     }
 
     fn build_outline_result(
-        &self, dest: &Object, title: &Object, named_destinations: &mut IndexMap<Vec<u8>, Destination>,
+        &self,
+        dest: &Object,
+        title: &Object,
+        named_destinations: &mut IndexMap<Vec<u8>, Destination>,
     ) -> Result<Option<Outline>> {
         let outline = match dest {
             Object::Array(obj_array) => Outline::Destination(Destination::new(
@@ -109,9 +131,17 @@ impl Document {
                 }
             }
             Object::Reference(object_id) => {
-                return self.build_outline_result(self.get_object(*object_id)?, title, named_destinations);
+                return self.build_outline_result(
+                    self.get_object(*object_id)?,
+                    title,
+                    named_destinations,
+                );
             }
-            _ => return Err(Error::InvalidOutline(format!("Unexpected destination {dest:?}"))),
+            _ => {
+                return Err(Error::InvalidOutline(format!(
+                    "Unexpected destination {dest:?}"
+                )));
+            }
         };
         Ok(Some(outline))
     }

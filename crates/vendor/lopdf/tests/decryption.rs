@@ -25,7 +25,10 @@ fn test_load_encrypted_pdf_from_assets() {
     let text = doc.extract_text(&page_numbers).unwrap();
 
     // Verify we can extract meaningful text
-    assert!(text.contains("USCIS"), "Should contain USCIS text from the form");
+    assert!(
+        text.contains("USCIS"),
+        "Should contain USCIS text from the form"
+    );
     assert!(text.contains("Form G-1145"), "Should contain form number");
 
     // Verify we can access objects
@@ -39,12 +42,18 @@ fn test_load_encrypted_pdf_from_assets() {
     }
 
     // Verify trailer has required entries
-    assert!(doc.trailer.get(b"Root").is_ok(), "Trailer should have Root entry");
+    assert!(
+        doc.trailer.get(b"Root").is_ok(),
+        "Trailer should have Root entry"
+    );
     assert!(
         doc.trailer.get(b"Encrypt").is_err(),
         "Encrypt entry should be removed after decryption"
     );
-    assert!(doc.trailer.get(b"Info").is_ok(), "Trailer should have Info entry");
+    assert!(
+        doc.trailer.get(b"Info").is_ok(),
+        "Trailer should have Info entry"
+    );
 }
 
 #[cfg(not(feature = "async"))]
@@ -93,7 +102,8 @@ fn test_decrypt_pdf_with_empty_password() {
             "F1" => Object::Reference(font_id)
         }
     };
-    doc.objects.insert(resources_id, Object::Dictionary(resources_dict));
+    doc.objects
+        .insert(resources_id, Object::Dictionary(resources_dict));
 
     // Create page
     let page_dict = lopdf::dictionary! {
@@ -116,7 +126,8 @@ fn test_decrypt_pdf_with_empty_password() {
     // Create content stream
     let content = b"BT\n/F1 12 Tf\n100 700 Td\n(Hello, Encrypted World!) Tj\nET\n";
     let content_stream = lopdf::Stream::new(lopdf::dictionary! {}, content.to_vec());
-    doc.objects.insert(content_id, Object::Stream(content_stream));
+    doc.objects
+        .insert(content_id, Object::Stream(content_stream));
 
     // Save to a temporary file
     let temp_dir = tempfile::tempdir().unwrap();
@@ -167,8 +178,12 @@ fn test_decrypt_pdf_with_object_streams() {
     let mut doc = Document::with_version("1.5");
 
     // Add an ID to the trailer
-    let id1 = vec![10u8, 20, 30, 40, 50, 60, 70, 80, 90, 100, 110, 120, 130, 140, 150, 160];
-    let id2 = vec![160u8, 150, 140, 130, 120, 110, 100, 90, 80, 70, 60, 50, 40, 30, 20, 10];
+    let id1 = vec![
+        10u8, 20, 30, 40, 50, 60, 70, 80, 90, 100, 110, 120, 130, 140, 150, 160,
+    ];
+    let id2 = vec![
+        160u8, 150, 140, 130, 120, 110, 100, 90, 80, 70, 60, 50, 40, 30, 20, 10,
+    ];
     doc.trailer.set(
         "ID",
         Object::Array(vec![
@@ -299,7 +314,11 @@ fn test_encrypted_pdf_raw_object_extraction() {
     );
     doc.objects.insert(
         (12, 0),
-        Object::Array(vec![Object::Integer(1), Object::Integer(2), Object::Integer(3)]),
+        Object::Array(vec![
+            Object::Integer(1),
+            Object::Integer(2),
+            Object::Integer(3),
+        ]),
     );
 
     // Encrypt
@@ -324,7 +343,10 @@ fn test_encrypted_pdf_raw_object_extraction() {
     assert!(loaded_doc.is_encrypted());
 
     // Verify that all objects were properly decrypted
-    assert_eq!(loaded_doc.get_object((10, 0)).unwrap().as_i64().unwrap(), 42);
+    assert_eq!(
+        loaded_doc.get_object((10, 0)).unwrap().as_i64().unwrap(),
+        42
+    );
 
     let string_obj = loaded_doc.get_object((11, 0)).unwrap();
     if let Object::String(bytes, _) = string_obj {
@@ -418,11 +440,19 @@ fn test_encrypted_pdf_preserves_structure() {
     assert!(loaded_doc.is_encrypted());
 
     // Verify structure is preserved
-    let root = loaded_doc.trailer.get(b"Root").unwrap().as_reference().unwrap();
+    let root = loaded_doc
+        .trailer
+        .get(b"Root")
+        .unwrap()
+        .as_reference()
+        .unwrap();
     let catalog = loaded_doc.get_object(root).unwrap();
 
     if let Object::Dictionary(dict) = catalog {
-        assert_eq!(dict.get(b"Type").unwrap(), &Object::Name(b"Catalog".to_vec()));
+        assert_eq!(
+            dict.get(b"Type").unwrap(),
+            &Object::Name(b"Catalog".to_vec())
+        );
         assert!(dict.has(b"Pages"));
         assert!(dict.has(b"Metadata"));
     } else {
@@ -432,7 +462,10 @@ fn test_encrypted_pdf_preserves_structure() {
     // Check metadata stream was decrypted correctly
     let metadata_obj = loaded_doc.get_object((3, 0)).unwrap();
     if let Object::Stream(stream) = metadata_obj {
-        assert_eq!(stream.dict.get(b"Type").unwrap(), &Object::Name(b"Metadata".to_vec()));
+        assert_eq!(
+            stream.dict.get(b"Type").unwrap(),
+            &Object::Name(b"Metadata".to_vec())
+        );
         // Note: Content might be compressed, so we just check it exists
         assert!(!stream.content.is_empty());
     } else {
@@ -486,7 +519,8 @@ async fn test_decrypt_pdf_with_empty_password_async() {
             "F1" => Object::Reference(font_id)
         }
     };
-    doc.objects.insert(resources_id, Object::Dictionary(resources_dict));
+    doc.objects
+        .insert(resources_id, Object::Dictionary(resources_dict));
 
     // Create page
     let page_dict = lopdf::dictionary! {
@@ -509,7 +543,8 @@ async fn test_decrypt_pdf_with_empty_password_async() {
     // Create content stream
     let content = b"BT\n/F1 12 Tf\n100 700 Td\n(Hello, Async Encrypted World!) Tj\nET\n";
     let content_stream = lopdf::Stream::new(lopdf::dictionary! {}, content.to_vec());
-    doc.objects.insert(content_id, Object::Stream(content_stream));
+    doc.objects
+        .insert(content_id, Object::Stream(content_stream));
 
     // Save to a temporary file
     let temp_dir = tempfile::tempdir().unwrap();
@@ -592,7 +627,8 @@ fn test_load_with_password_correct_password() {
             "F1" => Object::Reference(font_id)
         }
     };
-    doc.objects.insert(resources_id, Object::Dictionary(resources_dict));
+    doc.objects
+        .insert(resources_id, Object::Dictionary(resources_dict));
 
     // Create page
     let page_dict = lopdf::dictionary! {
@@ -615,7 +651,8 @@ fn test_load_with_password_correct_password() {
     // Create content stream
     let content = b"BT\n/F1 12 Tf\n100 700 Td\n(Password Protected Content!) Tj\nET\n";
     let content_stream = lopdf::Stream::new(lopdf::dictionary! {}, content.to_vec());
-    doc.objects.insert(content_id, Object::Stream(content_stream));
+    doc.objects
+        .insert(content_id, Object::Stream(content_stream));
 
     // Encrypt the document with a NON-EMPTY password
     let permissions = lopdf::Permissions::all();
@@ -643,7 +680,8 @@ fn test_load_with_password_correct_password() {
     );
 
     // load_with_password() with correct password should work
-    let loaded_with_password = Document::load_with_password(&encrypted_path, "user_secret").unwrap();
+    let loaded_with_password =
+        Document::load_with_password(&encrypted_path, "user_secret").unwrap();
     assert!(
         !loaded_with_password.is_encrypted(),
         "Should not appear encrypted after successful decryption"
@@ -779,7 +817,10 @@ fn test_load_with_password_empty_password_when_required() {
     // Try to load with empty password when document requires a real password
     // This should fail with InvalidPassword
     let result = Document::load_with_password(&path, "");
-    assert!(result.is_err(), "Should fail when empty password doesn't work");
+    assert!(
+        result.is_err(),
+        "Should fail when empty password doesn't work"
+    );
 
     if let Err(Error::InvalidPassword) = result {
         // Good - got the expected error
@@ -834,7 +875,8 @@ fn test_load_mem_with_password() {
 
     let content = b"BT\n/F1 12 Tf\n100 700 Td\n(Memory Loaded!) Tj\nET\n";
     let content_stream = lopdf::Stream::new(lopdf::dictionary! {}, content.to_vec());
-    doc.objects.insert(content_id, Object::Stream(content_stream));
+    doc.objects
+        .insert(content_id, Object::Stream(content_stream));
 
     // Encrypt with password
     let encryption_version = lopdf::EncryptionVersion::V2 {
@@ -852,7 +894,8 @@ fn test_load_mem_with_password() {
     let mut buffer = Vec::new();
     doc.save_to(&mut buffer).unwrap();
 
-    let loaded_doc = Document::load_mem_with_options(&buffer, LoadOptions::with_password("mem_user")).unwrap();
+    let loaded_doc =
+        Document::load_mem_with_options(&buffer, LoadOptions::with_password("mem_user")).unwrap();
     assert!(
         !loaded_doc.is_encrypted(),
         "Should not appear encrypted after decryption"
@@ -909,7 +952,8 @@ async fn test_load_with_password_async() {
 
     let content = b"BT\n/F1 12 Tf\n100 700 Td\n(Async Password Protected!) Tj\nET\n";
     let content_stream = lopdf::Stream::new(lopdf::dictionary! {}, content.to_vec());
-    doc.objects.insert(content_id, Object::Stream(content_stream));
+    doc.objects
+        .insert(content_id, Object::Stream(content_stream));
 
     // Encrypt
     let encryption_version = lopdf::EncryptionVersion::V2 {
@@ -928,7 +972,9 @@ async fn test_load_with_password_async() {
     let path = temp_dir.path().join("test_async_password.pdf");
     doc.save(&path).unwrap();
 
-    let loaded_doc = Document::load_with_password(&path, "async_user").await.unwrap();
+    let loaded_doc = Document::load_with_password(&path, "async_user")
+        .await
+        .unwrap();
     assert!(
         !loaded_doc.is_encrypted(),
         "Should not appear encrypted after decryption"
@@ -988,7 +1034,8 @@ fn test_load_with_password_multipage_pdf() {
             "F1" => Object::Reference(font_id)
         }
     };
-    doc.objects.insert(resources_id, Object::Dictionary(resources_dict));
+    doc.objects
+        .insert(resources_id, Object::Dictionary(resources_dict));
 
     // Create page 1
     let page1_dict = lopdf::dictionary! {
@@ -1031,15 +1078,18 @@ fn test_load_with_password_multipage_pdf() {
     // Create content streams
     let content1 = b"BT\n/F1 12 Tf\n100 700 Td\n(Page 1 Content!) Tj\nET\n";
     let content1_stream = lopdf::Stream::new(lopdf::dictionary! {}, content1.to_vec());
-    doc.objects.insert(content1_id, Object::Stream(content1_stream));
+    doc.objects
+        .insert(content1_id, Object::Stream(content1_stream));
 
     let content2 = b"BT\n/F1 12 Tf\n100 700 Td\n(Page 2 Content!) Tj\nET\n";
     let content2_stream = lopdf::Stream::new(lopdf::dictionary! {}, content2.to_vec());
-    doc.objects.insert(content2_id, Object::Stream(content2_stream));
+    doc.objects
+        .insert(content2_id, Object::Stream(content2_stream));
 
     let content3 = b"BT\n/F1 12 Tf\n100 700 Td\n(Page 3 Content!) Tj\nET\n";
     let content3_stream = lopdf::Stream::new(lopdf::dictionary! {}, content3.to_vec());
-    doc.objects.insert(content3_id, Object::Stream(content3_stream));
+    doc.objects
+        .insert(content3_id, Object::Stream(content3_stream));
 
     // Encrypt the document with a NON-EMPTY password
     let permissions = lopdf::Permissions::all();
@@ -1072,7 +1122,12 @@ fn test_load_with_password_multipage_pdf() {
     assert!(loaded_doc.encryption_state.is_some());
 
     let pages = loaded_doc.get_pages();
-    assert_eq!(pages.len(), 3, "Should have exactly 3 pages, but got {}", pages.len());
+    assert_eq!(
+        pages.len(),
+        3,
+        "Should have exactly 3 pages, but got {}",
+        pages.len()
+    );
 
     let object_count = loaded_doc.objects.len();
     println!("Loaded document has {} objects", object_count);
@@ -1145,7 +1200,8 @@ fn test_load_with_password_with_compressed_streams() {
             "F1" => Object::Reference(font_id)
         }
     };
-    doc.objects.insert(resources_id, Object::Dictionary(resources_dict));
+    doc.objects
+        .insert(resources_id, Object::Dictionary(resources_dict));
 
     // Create page 1
     let page1_dict = lopdf::dictionary! {
@@ -1177,14 +1233,22 @@ fn test_load_with_password_with_compressed_streams() {
 
     // Create content streams - Note: these will be compressed by the Stream
     let content1 = b"BT\n/F1 12 Tf\n100 700 Td\n(Compressed Page 1!) Tj\nET\n";
-    let mut content1_stream = lopdf::Stream::new(lopdf::dictionary! { "Filter" => "FlateDecode" }, content1.to_vec());
+    let mut content1_stream = lopdf::Stream::new(
+        lopdf::dictionary! { "Filter" => "FlateDecode" },
+        content1.to_vec(),
+    );
     content1_stream.compress().unwrap();
-    doc.objects.insert(content1_id, Object::Stream(content1_stream));
+    doc.objects
+        .insert(content1_id, Object::Stream(content1_stream));
 
     let content2 = b"BT\n/F1 12 Tf\n100 700 Td\n(Compressed Page 2!) Tj\nET\n";
-    let mut content2_stream = lopdf::Stream::new(lopdf::dictionary! { "Filter" => "FlateDecode" }, content2.to_vec());
+    let mut content2_stream = lopdf::Stream::new(
+        lopdf::dictionary! { "Filter" => "FlateDecode" },
+        content2.to_vec(),
+    );
     content2_stream.compress().unwrap();
-    doc.objects.insert(content2_id, Object::Stream(content2_stream));
+    doc.objects
+        .insert(content2_id, Object::Stream(content2_stream));
 
     // Encrypt the document
     let permissions = lopdf::Permissions::all();
@@ -1206,7 +1270,10 @@ fn test_load_with_password_with_compressed_streams() {
 
     // Get file size for debugging
     let file_metadata = std::fs::metadata(&encrypted_path).unwrap();
-    println!("Compressed encrypted PDF size: {} bytes", file_metadata.len());
+    println!(
+        "Compressed encrypted PDF size: {} bytes",
+        file_metadata.len()
+    );
 
     let loaded_doc = Document::load_with_password(&encrypted_path, "user_secret").unwrap();
     assert!(
@@ -1217,7 +1284,12 @@ fn test_load_with_password_with_compressed_streams() {
 
     let pages = loaded_doc.get_pages();
     println!("Loaded {} pages", pages.len());
-    assert_eq!(pages.len(), 2, "Should have exactly 2 pages, but got {}", pages.len());
+    assert_eq!(
+        pages.len(),
+        2,
+        "Should have exactly 2 pages, but got {}",
+        pages.len()
+    );
 
     let object_count = loaded_doc.objects.len();
     println!("Loaded document has {} objects", object_count);
@@ -1275,7 +1347,8 @@ fn test_load_with_password_stream_with_endobj_bytes() {
     // Add "endobj" bytes in the stream content
     content.extend_from_slice(b"endobj fake marker");
     let content_stream = lopdf::Stream::new(lopdf::dictionary! {}, content);
-    doc.objects.insert(content_id, Object::Stream(content_stream));
+    doc.objects
+        .insert(content_id, Object::Stream(content_stream));
 
     // Add another object that should be loaded after the stream
     doc.objects.insert(second_obj_id, Object::Integer(42));
@@ -1298,7 +1371,10 @@ fn test_load_with_password_stream_with_endobj_bytes() {
     let encrypted_path = temp_dir.path().join("test_stream_with_endobj.pdf");
     doc.save(&encrypted_path).unwrap();
 
-    println!("PDF with endobj in stream saved to: {}", encrypted_path.display());
+    println!(
+        "PDF with endobj in stream saved to: {}",
+        encrypted_path.display()
+    );
 
     // Load with password
     let loaded_doc = Document::load_with_password(&encrypted_path, "user_secret").unwrap();
@@ -1424,7 +1500,8 @@ fn test_encrypt_decrypt_multipage_roundtrip() {
             "F1" => Object::Reference(font_id)
         }
     };
-    doc.objects.insert(resources_id, Object::Dictionary(resources_dict));
+    doc.objects
+        .insert(resources_id, Object::Dictionary(resources_dict));
 
     // Create pages and content
     for (i, (page_id, content_id)) in page_ids.iter().zip(content_ids.iter()).enumerate() {
@@ -1444,7 +1521,8 @@ fn test_encrypt_decrypt_multipage_roundtrip() {
             i + 1
         );
         let content_stream = lopdf::Stream::new(lopdf::dictionary! {}, content.into_bytes());
-        doc.objects.insert(*content_id, Object::Stream(content_stream));
+        doc.objects
+            .insert(*content_id, Object::Stream(content_stream));
     }
 
     // Create font
@@ -1493,7 +1571,12 @@ fn test_encrypt_decrypt_multipage_roundtrip() {
     );
 
     // Verify all 5 pages are loaded
-    assert_eq!(loaded_pages.len(), 5, "Should have 5 pages, got {}", loaded_pages.len());
+    assert_eq!(
+        loaded_pages.len(),
+        5,
+        "Should have 5 pages, got {}",
+        loaded_pages.len()
+    );
 
     // Extract text from all pages
     let page_numbers: Vec<u32> = loaded_pages.keys().cloned().collect();
@@ -1553,8 +1636,14 @@ fn test_was_encrypted_method() {
     let catalog_id = doc.add_object(catalog_dict);
     doc.trailer.set("Root", Object::Reference(catalog_id));
 
-    assert!(!doc.is_encrypted(), "Unencrypted doc should not be encrypted");
-    assert!(!doc.was_encrypted(), "Unencrypted doc was not originally encrypted");
+    assert!(
+        !doc.is_encrypted(),
+        "Unencrypted doc should not be encrypted"
+    );
+    assert!(
+        !doc.was_encrypted(),
+        "Unencrypted doc was not originally encrypted"
+    );
 
     // Test 2: Create and load encrypted document
     let id1 = vec![1u8; 16];
@@ -1588,8 +1677,14 @@ fn test_was_encrypted_method() {
     let loaded = Document::load_with_password(&path, "user").unwrap();
 
     // After loading with correct password: decrypted but was_encrypted is true
-    assert!(!loaded.is_encrypted(), "Should not appear encrypted after decryption");
-    assert!(loaded.was_encrypted(), "Should remember it was originally encrypted");
+    assert!(
+        !loaded.is_encrypted(),
+        "Should not appear encrypted after decryption"
+    );
+    assert!(
+        loaded.was_encrypted(),
+        "Should remember it was originally encrypted"
+    );
 
     // Test 3: Load encrypted doc without correct password (empty doesn't work)
     let loaded_locked = Document::load(&path).unwrap();

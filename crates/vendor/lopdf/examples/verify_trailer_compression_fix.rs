@@ -44,11 +44,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let catalog_obj = doc.objects.get(&catalog_id).unwrap();
     let can_compress_catalog = ObjectStream::can_be_compressed(catalog_id, catalog_obj, &doc);
-    println!("  Catalog (Root): can_be_compressed = {}", can_compress_catalog);
+    println!(
+        "  Catalog (Root): can_be_compressed = {}",
+        can_compress_catalog
+    );
 
     let info_obj = doc.objects.get(&info_id).unwrap();
     let can_compress_info = ObjectStream::can_be_compressed(info_id, info_obj, &doc);
-    println!("  Info dictionary: can_be_compressed = {}", can_compress_info);
+    println!(
+        "  Info dictionary: can_be_compressed = {}",
+        can_compress_info
+    );
 
     // Save with and without object streams
     let mut normal_output = Vec::new();
@@ -66,13 +72,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("  Without object streams: {} bytes", normal_output.len());
     println!("  With object streams: {} bytes", compressed_output.len());
 
-    let reduction_pct = (1.0 - (compressed_output.len() as f64 / normal_output.len() as f64)) * 100.0;
+    let reduction_pct =
+        (1.0 - (compressed_output.len() as f64 / normal_output.len() as f64)) * 100.0;
     println!("  Size reduction: {:.1}%", reduction_pct);
 
     // Check if catalog is in object stream
     let content = String::from_utf8_lossy(&compressed_output);
     let has_objstm = content.contains("/ObjStm");
-    let catalog_as_individual = content.contains(&format!("{} 0 obj\n<</Type/Catalog", catalog_id.0));
+    let catalog_as_individual =
+        content.contains(&format!("{} 0 obj\n<</Type/Catalog", catalog_id.0));
     let info_as_individual = content.contains(&format!("{} 0 obj\n<</Title", info_id.0));
 
     println!("\nCompression results:");
@@ -80,7 +88,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("  Catalog as individual object: {}", catalog_as_individual);
     println!("  Info as individual object: {}", info_as_individual);
 
-    if can_compress_catalog && can_compress_info && has_objstm && !catalog_as_individual && !info_as_individual {
+    if can_compress_catalog
+        && can_compress_info
+        && has_objstm
+        && !catalog_as_individual
+        && !info_as_individual
+    {
         println!("\n✅ SUCCESS: Trailer-referenced objects are properly compressed!");
     } else {
         println!("\n❌ FAILURE: Fix not working correctly");

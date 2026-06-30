@@ -63,7 +63,10 @@ impl IncrementalDocument {
     pub fn get_or_create_resources(&mut self, page_id: ObjectId) -> Result<&mut Object> {
         self.opt_clone_object_to_new_document(page_id)?;
         let resources_id = {
-            let page = self.new_document.get_object(page_id).and_then(Object::as_dict)?;
+            let page = self
+                .new_document
+                .get_object(page_id)
+                .and_then(Object::as_dict)?;
             if page.has(b"Resources") {
                 page.get(b"Resources").and_then(Object::as_reference).ok()
             } else {
@@ -88,9 +91,15 @@ impl IncrementalDocument {
     ///
     /// Get Object that has the key `Resources -> XObject`.
     pub fn add_xobject<N: Into<Vec<u8>>>(
-        &mut self, page_id: ObjectId, xobject_name: N, xobject_id: ObjectId,
+        &mut self,
+        page_id: ObjectId,
+        xobject_name: N,
+        xobject_id: ObjectId,
     ) -> Result<()> {
-        if let Ok(resources) = self.get_or_create_resources(page_id).and_then(Object::as_dict_mut) {
+        if let Ok(resources) = self
+            .get_or_create_resources(page_id)
+            .and_then(Object::as_dict_mut)
+        {
             if !resources.has(b"XObject") {
                 resources.set("XObject", Dictionary::new());
             }
@@ -112,13 +121,21 @@ impl IncrementalDocument {
     ///
     /// Get Object that has the key `Resources -> ExtGState`.
     pub fn add_graphics_state<N: Into<Vec<u8>>>(
-        &mut self, page_id: ObjectId, gs_name: N, gs_id: ObjectId,
+        &mut self,
+        page_id: ObjectId,
+        gs_name: N,
+        gs_id: ObjectId,
     ) -> Result<()> {
-        if let Ok(resources) = self.get_or_create_resources(page_id).and_then(Object::as_dict_mut) {
+        if let Ok(resources) = self
+            .get_or_create_resources(page_id)
+            .and_then(Object::as_dict_mut)
+        {
             if !resources.has(b"ExtGState") {
                 resources.set("ExtGState", Dictionary::new());
             }
-            let states = resources.get_mut(b"ExtGState").and_then(Object::as_dict_mut)?;
+            let states = resources
+                .get_mut(b"ExtGState")
+                .and_then(Object::as_dict_mut)?;
             states.set(gs_name, Object::Reference(gs_id));
         }
         Ok(())

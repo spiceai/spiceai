@@ -131,7 +131,10 @@ fn build_doc_with_tounicode(tounicode: &str, encoded_text: Vec<u8>) -> Document 
             Operation::new("BT", vec![]),
             Operation::new("Tf", vec!["F1".into(), 12.into()]),
             Operation::new("Td", vec![50.into(), 700.into()]),
-            Operation::new("Tj", vec![Object::String(encoded_text, StringFormat::Hexadecimal)]),
+            Operation::new(
+                "Tj",
+                vec![Object::String(encoded_text, StringFormat::Hexadecimal)],
+            ),
             Operation::new("ET", vec![]),
         ],
     };
@@ -184,7 +187,9 @@ fn extract_text_does_not_error_with_empty_bfrange_font2() {
 
     let doc = build_doc_with_tounicode(FONT2_TOUNICODE, encoded_text);
 
-    let text = doc.extract_text(&[1]).expect("extract_text should not error");
+    let text = doc
+        .extract_text(&[1])
+        .expect("extract_text should not error");
     assert_eq!(text.trim_end(), " $'8~€");
 }
 
@@ -206,6 +211,8 @@ fn extract_text_does_not_error_with_empty_bfrange_font1() {
 
     let doc = build_doc_with_tounicode(FONT1_TOUNICODE, encoded_text);
 
-    let text = doc.extract_text(&[1]).expect("extract_text should not error");
+    let text = doc
+        .extract_text(&[1])
+        .expect("extract_text should not error");
     assert_eq!(text.trim_end(), " #%7a");
 }

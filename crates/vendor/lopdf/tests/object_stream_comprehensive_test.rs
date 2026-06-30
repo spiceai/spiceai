@@ -3,7 +3,10 @@ use lopdf::{Document, Object, ObjectStream, Stream, dictionary};
 #[test]
 fn test_can_be_compressed_stream_objects() {
     let mut doc = Document::new();
-    let stream_id = doc.add_object(Stream::new(dictionary! { "Type" => "XObject" }, vec![1, 2, 3]));
+    let stream_id = doc.add_object(Stream::new(
+        dictionary! { "Type" => "XObject" },
+        vec![1, 2, 3],
+    ));
 
     let stream_obj = doc.objects.get(&stream_id).unwrap();
     assert!(
@@ -235,7 +238,10 @@ fn test_can_be_compressed_regular_objects() {
     // Test various regular object types that should be compressible
     let int_id = doc.add_object(Object::Integer(42));
     let bool_id = doc.add_object(Object::Boolean(true));
-    let string_id = doc.add_object(Object::String(b"Hello".to_vec(), lopdf::StringFormat::Literal));
+    let string_id = doc.add_object(Object::String(
+        b"Hello".to_vec(),
+        lopdf::StringFormat::Literal,
+    ));
     let name_id = doc.add_object(Object::Name(b"Test".to_vec()));
     let array_id = doc.add_object(Object::Array(vec![Object::Integer(1), Object::Integer(2)]));
     let dict_id = doc.add_object(Object::Dictionary(dictionary! {
@@ -355,7 +361,10 @@ fn test_object_stream_invalid_generation() {
     // Note: The current implementation doesn't validate generation in add_object
     // It only checks during can_be_compressed. This test documents current behavior.
     let result = obj_stream.add_object((1, 1), Object::Integer(42));
-    assert!(result.is_ok(), "add_object currently doesn't validate generation");
+    assert!(
+        result.is_ok(),
+        "add_object currently doesn't validate generation"
+    );
 }
 
 #[test]

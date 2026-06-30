@@ -80,7 +80,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("\nCompressed PDF saved to: {}", output_path);
 
     if reduction_from_original > 20.0 {
-        println!("\n✅ SUCCESS: Achieved {:.1}% size reduction!", reduction_from_original);
+        println!(
+            "\n✅ SUCCESS: Achieved {:.1}% size reduction!",
+            reduction_from_original
+        );
     } else {
         println!(
             "\n⚠️  Size reduction is {:.1}% (expected 26-38%)",

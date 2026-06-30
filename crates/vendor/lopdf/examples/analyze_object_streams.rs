@@ -76,7 +76,8 @@ fn analyze_document(doc: &Document) {
                         println!("  Decompressed size: {} bytes", decompressed.len());
 
                         // Parse the offset table
-                        if let Ok(first_offset) = stream.dict.get(b"First").and_then(|o| o.as_i64()) {
+                        if let Ok(first_offset) = stream.dict.get(b"First").and_then(|o| o.as_i64())
+                        {
                             if first_offset as usize <= decompressed.len() {
                                 let offset_table = &decompressed[..first_offset as usize];
                                 if let Ok(offset_str) = std::str::from_utf8(offset_table) {
@@ -84,7 +85,10 @@ fn analyze_document(doc: &Document) {
                                     println!("  Objects in stream:");
                                     for chunk in numbers.chunks(2) {
                                         if chunk.len() == 2 {
-                                            println!("    - Object {}: offset {}", chunk[0], chunk[1]);
+                                            println!(
+                                                "    - Object {}: offset {}",
+                                                chunk[0], chunk[1]
+                                            );
                                             if let Ok(obj_num) = chunk[0].parse::<u32>() {
                                                 compressed_objects.insert(obj_num, id.0);
                                             }
@@ -92,7 +96,10 @@ fn analyze_document(doc: &Document) {
                                     }
                                 } else {
                                     println!("  ERROR: Could not parse offset table as UTF-8");
-                                    println!("  First 100 bytes: {:?}", &offset_table[..offset_table.len().min(100)]);
+                                    println!(
+                                        "  First 100 bytes: {:?}",
+                                        &offset_table[..offset_table.len().min(100)]
+                                    );
                                 }
                             } else {
                                 println!(
@@ -164,7 +171,10 @@ fn analyze_document(doc: &Document) {
                                     if let Object::Reference(ref_id) = content_ref
                                         && compressed_objects.contains_key(&ref_id.0)
                                     {
-                                        println!("    ⚠️  Content[{}] {} {} R is compressed!", i, ref_id.0, ref_id.1);
+                                        println!(
+                                            "    ⚠️  Content[{}] {} {} R is compressed!",
+                                            i, ref_id.0, ref_id.1
+                                        );
                                     }
                                 }
                             }
@@ -184,7 +194,10 @@ fn analyze_document(doc: &Document) {
             Err(e) => {
                 println!("  Error getting page object: {}", e);
                 if compressed_objects.contains_key(&page_id.0) {
-                    println!("  Note: Page is in object stream {}", compressed_objects[&page_id.0]);
+                    println!(
+                        "  Note: Page is in object stream {}",
+                        compressed_objects[&page_id.0]
+                    );
                 }
             }
         }
@@ -193,7 +206,10 @@ fn analyze_document(doc: &Document) {
     // Check cross-reference
     println!("\n{}", "=".repeat(80));
     println!("Cross-reference Analysis:");
-    println!("Cross-reference type: {:?}", doc.reference_table.cross_reference_type);
+    println!(
+        "Cross-reference type: {:?}",
+        doc.reference_table.cross_reference_type
+    );
 
     // Check if any critical objects are compressed
     println!("\n{}", "=".repeat(80));
@@ -203,7 +219,10 @@ fn analyze_document(doc: &Document) {
         && let Object::Reference(root_id) = root
     {
         if compressed_objects.contains_key(&root_id.0) {
-            println!("⚠️  WARNING: Catalog (Root) object {} is compressed!", root_id.0);
+            println!(
+                "⚠️  WARNING: Catalog (Root) object {} is compressed!",
+                root_id.0
+            );
         } else {
             println!("✓ Catalog (Root) object {} is not compressed", root_id.0);
         }

@@ -53,7 +53,10 @@ fn main() {
         match stream.decompressed_content() {
             Ok(decompressed) => {
                 println!("  Decompressed successfully!");
-                println!("  Decompressed content: {:?}", String::from_utf8_lossy(&decompressed));
+                println!(
+                    "  Decompressed content: {:?}",
+                    String::from_utf8_lossy(&decompressed)
+                );
             }
             Err(e) => {
                 println!("  Failed to decompress: {}", e);

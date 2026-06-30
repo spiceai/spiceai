@@ -22,7 +22,11 @@ fn load_document(path: &str) -> Result<Document, Box<dyn std::error::Error>> {
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Get filename from command line or use default
     let args: Vec<String> = env::args().collect();
-    let input_file = if args.len() > 1 { &args[1] } else { "assets/example.pdf" };
+    let input_file = if args.len() > 1 {
+        &args[1]
+    } else {
+        "assets/example.pdf"
+    };
 
     // Check if file exists
     if !Path::new(input_file).exists() {

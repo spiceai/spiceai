@@ -14,7 +14,10 @@ fn main() {
             println!("✓ Successfully loaded encrypted PDF");
             println!("  - Is encrypted: {}", doc.is_encrypted());
             println!("  - Number of pages: {}", doc.get_pages().len());
-            println!("  - Has encryption state: {}", doc.encryption_state.is_some());
+            println!(
+                "  - Has encryption state: {}",
+                doc.encryption_state.is_some()
+            );
 
             // Try to extract text
             let pages = doc.get_pages();
@@ -88,7 +91,10 @@ fn main() {
                 Ok(loaded_doc) => {
                     println!("✓ Encrypted document re-loaded successfully");
                     println!("  - Is encrypted: {}", loaded_doc.is_encrypted());
-                    println!("  - Has encryption state: {}", loaded_doc.encryption_state.is_some());
+                    println!(
+                        "  - Has encryption state: {}",
+                        loaded_doc.encryption_state.is_some()
+                    );
                 }
                 Err(e) => println!("✗ Failed to re-load encrypted document: {:?}", e),
             }
@@ -135,7 +141,10 @@ async fn main() {
             println!("✓ Successfully loaded encrypted PDF");
             println!("  - Is encrypted: {}", doc.is_encrypted());
             println!("  - Number of pages: {}", doc.get_pages().len());
-            println!("  - Has encryption state: {}", doc.encryption_state.is_some());
+            println!(
+                "  - Has encryption state: {}",
+                doc.encryption_state.is_some()
+            );
 
             // Try to extract text
             let pages = doc.get_pages();
@@ -209,7 +218,10 @@ async fn main() {
                 Ok(loaded_doc) => {
                     println!("✓ Encrypted document re-loaded successfully");
                     println!("  - Is encrypted: {}", loaded_doc.is_encrypted());
-                    println!("  - Has encryption state: {}", loaded_doc.encryption_state.is_some());
+                    println!(
+                        "  - Has encryption state: {}",
+                        loaded_doc.encryption_state.is_some()
+                    );
                 }
                 Err(e) => println!("✗ Failed to re-load encrypted document: {:?}", e),
             }

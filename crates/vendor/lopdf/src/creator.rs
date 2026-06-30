@@ -85,9 +85,15 @@ impl Document {
     ///
     /// Get Object that has the key `Resources -> XObject`.
     pub fn add_xobject<N: Into<Vec<u8>>>(
-        &mut self, page_id: ObjectId, xobject_name: N, xobject_id: ObjectId,
+        &mut self,
+        page_id: ObjectId,
+        xobject_name: N,
+        xobject_id: ObjectId,
     ) -> Result<()> {
-        if let Ok(resources) = self.get_or_create_resources(page_id).and_then(Object::as_dict_mut) {
+        if let Ok(resources) = self
+            .get_or_create_resources(page_id)
+            .and_then(Object::as_dict_mut)
+        {
             if !resources.has(b"XObject") {
                 resources.set("XObject", Dictionary::new());
             }
@@ -109,13 +115,21 @@ impl Document {
     ///
     /// Get Object that has the key `Resources -> ExtGState`.
     pub fn add_graphics_state<N: Into<Vec<u8>>>(
-        &mut self, page_id: ObjectId, gs_name: N, gs_id: ObjectId,
+        &mut self,
+        page_id: ObjectId,
+        gs_name: N,
+        gs_id: ObjectId,
     ) -> Result<()> {
-        if let Ok(resources) = self.get_or_create_resources(page_id).and_then(Object::as_dict_mut) {
+        if let Ok(resources) = self
+            .get_or_create_resources(page_id)
+            .and_then(Object::as_dict_mut)
+        {
             if !resources.has(b"ExtGState") {
                 resources.set("ExtGState", Dictionary::new());
             }
-            let states = resources.get_mut(b"ExtGState").and_then(Object::as_dict_mut)?;
+            let states = resources
+                .get_mut(b"ExtGState")
+                .and_then(Object::as_dict_mut)?;
             states.set(gs_name, Object::Reference(gs_id));
         }
         Ok(())
@@ -273,7 +287,10 @@ pub mod tests {
         doc.trailer.set("Info", info_id);
         doc.trailer.set(
             "ID",
-            Object::Array(vec![Object::string_literal(b"ABC"), Object::string_literal(b"DEF")]),
+            Object::Array(vec![
+                Object::string_literal(b"ABC"),
+                Object::string_literal(b"DEF"),
+            ]),
         );
         doc.compress();
         doc
@@ -324,7 +341,10 @@ pub mod tests {
         doc.trailer.set("Info", info_id);
         doc.trailer.set(
             "ID",
-            Object::Array(vec![Object::string_literal(b"ABC"), Object::string_literal(b"DEF")]),
+            Object::Array(vec![
+                Object::string_literal(b"ABC"),
+                Object::string_literal(b"DEF"),
+            ]),
         );
         doc.compress();
         doc
@@ -384,7 +404,10 @@ pub mod tests {
         let font_dict = font_obj.as_dict().unwrap();
 
         // Check base font name
-        assert_eq!(font_dict.get(b"BaseFont").unwrap(), &Object::Name(b"MyFont".to_vec()));
+        assert_eq!(
+            font_dict.get(b"BaseFont").unwrap(),
+            &Object::Name(b"MyFont".to_vec())
+        );
 
         // Check encoding
         assert_eq!(
@@ -393,7 +416,11 @@ pub mod tests {
         );
 
         // Check font descriptor exists and is referenced
-        let descriptor_ref = font_dict.get(b"FontDescriptor").unwrap().as_reference().unwrap();
+        let descriptor_ref = font_dict
+            .get(b"FontDescriptor")
+            .unwrap()
+            .as_reference()
+            .unwrap();
         let descriptor_obj = doc.get_object(descriptor_ref).unwrap().as_dict().unwrap();
         assert_eq!(
             descriptor_obj.get(b"FontName").unwrap(),
@@ -401,7 +428,11 @@ pub mod tests {
         );
 
         // Check font file is embedded
-        let font_file_ref = descriptor_obj.get(b"FontFile2").unwrap().as_reference().unwrap();
+        let font_file_ref = descriptor_obj
+            .get(b"FontFile2")
+            .unwrap()
+            .as_reference()
+            .unwrap();
         let font_stream = doc.get_object(font_file_ref).unwrap().as_stream().unwrap();
         assert_eq!(font_stream.content, font_file);
     }

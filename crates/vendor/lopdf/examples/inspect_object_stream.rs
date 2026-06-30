@@ -37,11 +37,18 @@ fn main() {
 
                         // List first 20 objects
                         println!("\nFirst 20 objects in stream:");
-                        for (count, ((id, generation), obj)) in obj_stream.objects.iter().enumerate() {
+                        for (count, ((id, generation), obj)) in
+                            obj_stream.objects.iter().enumerate()
+                        {
                             if count >= 20 {
                                 break;
                             }
-                            println!("  {} {} R: {:?}", id, generation, obj.type_name().unwrap_or(b"Unknown"));
+                            println!(
+                                "  {} {} R: {:?}",
+                                id,
+                                generation,
+                                obj.type_name().unwrap_or(b"Unknown")
+                            );
 
                             // If it's a dictionary, show some keys
                             if let Object::Dictionary(dict) = obj {
@@ -58,7 +65,10 @@ fn main() {
                                     && let Ok(type_name) = type_obj.as_name()
                                     && type_name == b"Page"
                                 {
-                                    println!("  WARNING: Page object {} {} R is in object stream!", id, generation);
+                                    println!(
+                                        "  WARNING: Page object {} {} R is in object stream!",
+                                        id, generation
+                                    );
                                 }
 
                                 // Check for font descriptors
@@ -112,8 +122,14 @@ fn check_object_status(doc: &Document, id: (u32, u16), name: &str) {
             // Check xref entry
             if let Some(xref_entry) = doc.reference_table.get(id.0) {
                 match xref_entry {
-                    lopdf::xref::XrefEntry::Normal { offset, generation: _ } => {
-                        println!("{} ({} {} R): Normal entry at offset {}", name, id.0, id.1, offset);
+                    lopdf::xref::XrefEntry::Normal {
+                        offset,
+                        generation: _,
+                    } => {
+                        println!(
+                            "{} ({} {} R): Normal entry at offset {}",
+                            name, id.0, id.1, offset
+                        );
                     }
                     lopdf::xref::XrefEntry::Compressed { container, index } => {
                         println!(

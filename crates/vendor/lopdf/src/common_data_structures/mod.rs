@@ -50,7 +50,8 @@ pub fn decode_text_string(obj: &Object) -> Result<String> {
 #[cfg(test)]
 mod test {
     use crate::{
-        Object, StringFormat, common_data_structures::decode_text_string, encodings, text_string, writer::Writer,
+        Object, StringFormat, common_data_structures::decode_text_string, encodings, text_string,
+        writer::Writer,
     };
 
     #[test]

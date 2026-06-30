@@ -51,7 +51,8 @@ mod sync_tests {
     #[test]
     fn load_with_options_default_matches_load() {
         let doc1 = Document::load("assets/example.pdf").unwrap();
-        let doc2 = Document::load_with_options("assets/example.pdf", LoadOptions::default()).unwrap();
+        let doc2 =
+            Document::load_with_options("assets/example.pdf", LoadOptions::default()).unwrap();
         assert_eq!(doc1.version, doc2.version);
         assert_eq!(doc1.objects.len(), doc2.objects.len());
     }
@@ -59,8 +60,11 @@ mod sync_tests {
     #[test]
     fn load_from_with_options_default_matches_load_from() {
         let doc1 = Document::load_from(File::open("assets/example.pdf").unwrap()).unwrap();
-        let doc2 = Document::load_from_with_options(File::open("assets/example.pdf").unwrap(), LoadOptions::default())
-            .unwrap();
+        let doc2 = Document::load_from_with_options(
+            File::open("assets/example.pdf").unwrap(),
+            LoadOptions::default(),
+        )
+        .unwrap();
         assert_eq!(doc1.version, doc2.version);
         assert_eq!(doc1.objects.len(), doc2.objects.len());
     }
@@ -86,14 +90,28 @@ mod sync_tests {
         }
 
         let full = Document::load("assets/example.pdf").unwrap();
-        let filtered =
-            Document::load_with_options("assets/example.pdf", LoadOptions::with_filter(drop_streams)).unwrap();
+        let filtered = Document::load_with_options(
+            "assets/example.pdf",
+            LoadOptions::with_filter(drop_streams),
+        )
+        .unwrap();
 
-        let full_streams = full.objects.values().filter(|o| o.as_stream().is_ok()).count();
-        let filtered_streams = filtered.objects.values().filter(|o| o.as_stream().is_ok()).count();
+        let full_streams = full
+            .objects
+            .values()
+            .filter(|o| o.as_stream().is_ok())
+            .count();
+        let filtered_streams = filtered
+            .objects
+            .values()
+            .filter(|o| o.as_stream().is_ok())
+            .count();
 
         assert!(full_streams > 0, "example.pdf should have streams");
-        assert_eq!(filtered_streams, 0, "filter should have removed all streams");
+        assert_eq!(
+            filtered_streams, 0,
+            "filter should have removed all streams"
+        );
         assert!(
             filtered.objects.len() < full.objects.len(),
             "filtered doc should have fewer objects"
@@ -112,11 +130,15 @@ mod sync_tests {
         }
 
         let buf = std::fs::read("assets/example.pdf").unwrap();
-        let filtered = Document::load_mem_with_options(&buf, LoadOptions::with_filter(only_dicts)).unwrap();
+        let filtered =
+            Document::load_mem_with_options(&buf, LoadOptions::with_filter(only_dicts)).unwrap();
 
         // All remaining objects should be dictionaries
         for obj in filtered.objects.values() {
-            assert!(obj.as_dict().is_ok(), "all objects should be dictionaries after filter");
+            assert!(
+                obj.as_dict().is_ok(),
+                "all objects should be dictionaries after filter"
+            );
         }
     }
 
@@ -149,7 +171,9 @@ mod sync_tests {
 
     #[test]
     fn load_with_options_password_on_encrypted_pdf() {
-        let doc = Document::load_with_options("assets/encrypted.pdf", LoadOptions::with_password("")).unwrap();
+        let doc =
+            Document::load_with_options("assets/encrypted.pdf", LoadOptions::with_password(""))
+                .unwrap();
         assert!(!doc.is_encrypted());
         assert!(doc.encryption_state.is_some());
         let pages = doc.get_pages();

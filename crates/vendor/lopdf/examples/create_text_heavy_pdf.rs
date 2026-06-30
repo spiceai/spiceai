@@ -85,7 +85,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Operation::new("BT", vec![]),
         Operation::new("Tf", vec!["F1".into(), 12.into()]),
         Operation::new("Td", vec![50.into(), 750.into()]),
-        Operation::new("Tj", vec![Object::string_literal("Text-Heavy PDF Compression Demo")]),
+        Operation::new(
+            "Tj",
+            vec![Object::string_literal("Text-Heavy PDF Compression Demo")],
+        ),
         Operation::new("ET", vec![]),
     ];
 

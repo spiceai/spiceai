@@ -93,11 +93,14 @@ fn load_pdf<P: AsRef<Path>>(path: P) -> Result<Document, Error> {
 
 #[cfg(feature = "async")]
 fn load_pdf<P: AsRef<Path>>(path: P) -> Result<Document, Error> {
-    Builder::new_current_thread().build().unwrap().block_on(async move {
-        Document::load_with_options(path, LoadOptions::with_filter(filter_func))
-            .await
-            .map_err(|e| Error::other(e.to_string()))
-    })
+    Builder::new_current_thread()
+        .build()
+        .unwrap()
+        .block_on(async move {
+            Document::load_with_options(path, LoadOptions::with_filter(filter_func))
+                .await
+                .map_err(|e| Error::other(e.to_string()))
+        })
 }
 
 fn pdf2toc<P: AsRef<Path> + Debug>(path: P, output: P, pretty: bool) -> Result<(), Error> {
@@ -127,12 +130,20 @@ fn main() -> Result<(), Error> {
     let args = Args::parse_args();
 
     let start_time = Instant::now();
-    let pdf_path = PathBuf::from(shellexpand::full(args.pdf_path.to_str().unwrap()).unwrap().to_string());
+    let pdf_path = PathBuf::from(
+        shellexpand::full(args.pdf_path.to_str().unwrap())
+            .unwrap()
+            .to_string(),
+    );
     let output = match args.output {
         Some(o) => o.join(pdf_path.file_name().unwrap()),
         None => args.pdf_path,
     };
-    let mut output = PathBuf::from(shellexpand::full(output.to_str().unwrap()).unwrap().to_string());
+    let mut output = PathBuf::from(
+        shellexpand::full(output.to_str().unwrap())
+            .unwrap()
+            .to_string(),
+    );
     output.set_extension("toc");
     pdf2toc(&pdf_path, &output, args.pretty)?;
     println!(

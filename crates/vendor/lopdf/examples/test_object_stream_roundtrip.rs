@@ -79,7 +79,8 @@ fn main() {
     };
 
     let mut original_bytes = Vec::new();
-    doc.save_with_options(&mut original_bytes, options.clone()).unwrap();
+    doc.save_with_options(&mut original_bytes, options.clone())
+        .unwrap();
     println!("Original size: {} bytes", original_bytes.len());
 
     // Write to file for inspection
@@ -113,7 +114,9 @@ fn main() {
     // Save again with object streams
     println!("\nSaving loaded PDF with object streams again...");
     let mut resaved_bytes = Vec::new();
-    loaded_doc.save_with_options(&mut resaved_bytes, options).unwrap();
+    loaded_doc
+        .save_with_options(&mut resaved_bytes, options)
+        .unwrap();
     println!("Resaved size: {} bytes", resaved_bytes.len());
 
     // Write to file for inspection

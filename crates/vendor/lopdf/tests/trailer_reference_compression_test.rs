@@ -133,7 +133,11 @@ fn test_same_object_referenced_multiple_times() {
 
     // Should still be compressible (not encryption dict)
     assert!(
-        ObjectStream::can_be_compressed(shared_dict_id, doc.objects.get(&shared_dict_id).unwrap(), &doc),
+        ObjectStream::can_be_compressed(
+            shared_dict_id,
+            doc.objects.get(&shared_dict_id).unwrap(),
+            &doc
+        ),
         "Object referenced multiple times in trailer should be compressible"
     );
 }
@@ -178,7 +182,11 @@ fn test_missing_encrypt_key() {
         "Catalog should be compressible without Encrypt in trailer"
     );
     assert!(
-        ObjectStream::can_be_compressed(some_dict_id, doc.objects.get(&some_dict_id).unwrap(), &doc),
+        ObjectStream::can_be_compressed(
+            some_dict_id,
+            doc.objects.get(&some_dict_id).unwrap(),
+            &doc
+        ),
         "Dictionary that looks like encryption should be compressible if not referenced as Encrypt"
     );
 }
@@ -281,8 +289,14 @@ fn test_real_world_trailer_structure() {
     doc.trailer.set(
         "ID",
         Object::Array(vec![
-            Object::String(b"<4E4F204944454153>".to_vec(), lopdf::StringFormat::Hexadecimal),
-            Object::String(b"<4E4F204944454153>".to_vec(), lopdf::StringFormat::Hexadecimal),
+            Object::String(
+                b"<4E4F204944454153>".to_vec(),
+                lopdf::StringFormat::Hexadecimal,
+            ),
+            Object::String(
+                b"<4E4F204944454153>".to_vec(),
+                lopdf::StringFormat::Hexadecimal,
+            ),
         ]),
     );
 
@@ -341,7 +355,10 @@ fn test_compression_with_save_integration() {
     let content = String::from_utf8_lossy(&output);
 
     // Verify object streams exist
-    assert!(content.contains("/ObjStm"), "Object streams should be created");
+    assert!(
+        content.contains("/ObjStm"),
+        "Object streams should be created"
+    );
 
     // Verify trailer-referenced objects are compressed
     assert!(
@@ -355,6 +372,12 @@ fn test_compression_with_save_integration() {
 
     // Load and verify the PDF is valid
     let loaded = Document::load_mem(&output).unwrap();
-    assert!(loaded.trailer.get(b"Root").is_ok(), "Loaded PDF should have valid Root");
-    assert!(loaded.trailer.get(b"Info").is_ok(), "Loaded PDF should have valid Info");
+    assert!(
+        loaded.trailer.get(b"Root").is_ok(),
+        "Loaded PDF should have valid Root"
+    );
+    assert!(
+        loaded.trailer.get(b"Info").is_ok(),
+        "Loaded PDF should have valid Info"
+    );
 }

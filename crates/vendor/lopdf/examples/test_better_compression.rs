@@ -31,7 +31,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Analysis complete:");
     println!("  Total objects: {}", doc.objects.len());
     println!("  Non-compressible: {}", non_compressible.len());
-    println!("  Compressible: {}", doc.objects.len() - non_compressible.len());
+    println!(
+        "  Compressible: {}",
+        doc.objects.len() - non_compressible.len()
+    );
 
     // Show some examples
     println!("\nSample non-compressible objects:");
@@ -66,7 +69,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if orphans.is_empty() {
         println!("\n✓ No orphaned references would be created!");
     } else {
-        println!("\n✗ WARNING: {} orphaned references would be created:", orphans.len());
+        println!(
+            "\n✗ WARNING: {} orphaned references would be created:",
+            orphans.len()
+        );
         for (compressed_id, referencer_id) in orphans.iter().take(10) {
             println!(
                 "  {} {} R would be compressed but is referenced by {} {} R",
@@ -78,7 +84,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-fn find_all_non_compressible_objects(doc: &Document) -> (HashSet<ObjectId>, HashMap<ObjectId, String>) {
+fn find_all_non_compressible_objects(
+    doc: &Document,
+) -> (HashSet<ObjectId>, HashMap<ObjectId, String>) {
     let mut non_compressible = HashSet::new();
     let mut reason_map = HashMap::new();
 
@@ -185,7 +193,9 @@ fn collect_all_references(obj: &Object) -> HashSet<ObjectId> {
 }
 
 fn check_for_orphans(
-    doc: &Document, non_compressible: &HashSet<ObjectId>, would_compress: &[ObjectId],
+    doc: &Document,
+    non_compressible: &HashSet<ObjectId>,
+    would_compress: &[ObjectId],
 ) -> Vec<(ObjectId, ObjectId)> {
     let mut orphans = Vec::new();
 

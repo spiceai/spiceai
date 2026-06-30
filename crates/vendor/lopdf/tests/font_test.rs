@@ -30,5 +30,8 @@ fn test_font_data_creation() {
     assert_eq!(font_data.stem_v, 100);
     assert_eq!(font_data.flags, 4);
     assert_eq!(font_data.encoding, "WinAnsiEncoding");
-    assert!(!font_data.bytes().is_empty(), "Font data should not be empty");
+    assert!(
+        !font_data.bytes().is_empty(),
+        "Font data should not be empty"
+    );
 }

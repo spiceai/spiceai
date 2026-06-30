@@ -28,14 +28,21 @@ fn test_object_stream_to_stream_object() {
 
     // Add some objects
     obj_stream.add_object((1, 0), Object::Integer(42)).unwrap();
-    obj_stream.add_object((2, 0), Object::Boolean(true)).unwrap();
-    obj_stream.add_object((3, 0), Object::Name(b"Test".to_vec())).unwrap();
+    obj_stream
+        .add_object((2, 0), Object::Boolean(true))
+        .unwrap();
+    obj_stream
+        .add_object((3, 0), Object::Name(b"Test".to_vec()))
+        .unwrap();
 
     // Convert to stream object
     let stream_obj = obj_stream.to_stream_object().unwrap();
 
     // Verify stream properties
-    assert_eq!(stream_obj.dict.get(b"Type").unwrap(), &Object::Name(b"ObjStm".to_vec()));
+    assert_eq!(
+        stream_obj.dict.get(b"Type").unwrap(),
+        &Object::Name(b"ObjStm".to_vec())
+    );
     assert_eq!(stream_obj.dict.get(b"N").unwrap(), &Object::Integer(3));
     assert!(stream_obj.dict.has(b"First"));
     assert!(stream_obj.dict.has(b"Length"));
@@ -85,11 +92,16 @@ fn test_save_options_with_object_streams() {
     let content = String::from_utf8_lossy(&buffer);
 
     // Verify object streams were created
-    assert!(content.contains("/ObjStm"), "Object streams should be created");
+    assert!(
+        content.contains("/ObjStm"),
+        "Object streams should be created"
+    );
 
     // Verify PDF version is 1.5 or higher
     assert!(
-        content.starts_with("%PDF-1.5") || content.starts_with("%PDF-1.6") || content.starts_with("%PDF-1.7"),
+        content.starts_with("%PDF-1.5")
+            || content.starts_with("%PDF-1.6")
+            || content.starts_with("%PDF-1.7"),
         "PDF version should be 1.5 or higher for object streams"
     );
 }
@@ -135,7 +147,10 @@ fn test_save_options_without_object_streams() {
     let content = String::from_utf8_lossy(&buffer);
 
     // Verify no object streams were created
-    assert!(!content.contains("/ObjStm"), "Object streams should not be created");
+    assert!(
+        !content.contains("/ObjStm"),
+        "Object streams should not be created"
+    );
 
     // Verify objects exist as individual objects
     assert!(content.contains(&format!("{} 0 obj", catalog_id.0)));

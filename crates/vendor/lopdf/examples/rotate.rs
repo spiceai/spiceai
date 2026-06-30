@@ -5,7 +5,10 @@ use std::str::FromStr;
 fn main() {
     // Collect command line arguments: input_file angle output_file
     let args: Vec<String> = std::env::args().collect();
-    assert!(args.len() == 4, "Not enough arguments: input_file angle output_file");
+    assert!(
+        args.len() == 4,
+        "Not enough arguments: input_file angle output_file"
+    );
     let input_file = &args[1];
     let angle = i64::from_str(&args[2]).expect("error in parsing angle argument");
     assert!(angle % 90 == 0, "angle must be a multiple of 90");
@@ -22,7 +25,10 @@ fn main() {
             .expect("Missing page!");
 
         // Get the current rotation if any; the default is 0
-        let current_rotation = page_dict.get(b"Rotate").and_then(|obj| obj.as_i64()).unwrap_or(0);
+        let current_rotation = page_dict
+            .get(b"Rotate")
+            .and_then(|obj| obj.as_i64())
+            .unwrap_or(0);
 
         // Add the angle and update
         page_dict.set("Rotate", (current_rotation + angle) % 360);
@@ -36,7 +42,10 @@ fn main() {
 async fn main() {
     // Collect command line arguments: input_file angle output_file
     let args: Vec<String> = std::env::args().collect();
-    assert!(args.len() == 4, "Not enough arguments: input_file angle output_file");
+    assert!(
+        args.len() == 4,
+        "Not enough arguments: input_file angle output_file"
+    );
     let input_file = &args[1];
     let angle = i64::from_str(&args[2]).expect("error in parsing angle argument");
     assert!(angle % 90 == 0, "angle must be a multiple of 90");
@@ -53,7 +62,10 @@ async fn main() {
             .expect("Missing page!");
 
         // Get the current rotation if any; the default is 0
-        let current_rotation = page_dict.get(b"Rotate").and_then(|obj| obj.as_i64()).unwrap_or(0);
+        let current_rotation = page_dict
+            .get(b"Rotate")
+            .and_then(|obj| obj.as_i64())
+            .unwrap_or(0);
 
         // Add the angle and update
         page_dict.set("Rotate", (current_rotation + angle) % 360);

@@ -126,7 +126,10 @@ mod tests {
                 Operation::new("BT", vec![]),
                 Operation::new("Tf", vec!["F1".into(), 12.into()]),
                 Operation::new("Td", vec![100.into(), 700.into()]),
-                Operation::new("Tj", vec![Object::string_literal("Hello World! Hello Universe!")]),
+                Operation::new(
+                    "Tj",
+                    vec![Object::string_literal("Hello World! Hello Universe!")],
+                ),
                 Operation::new("ET", vec![]),
             ],
         };

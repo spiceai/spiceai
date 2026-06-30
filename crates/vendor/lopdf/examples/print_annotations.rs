@@ -28,15 +28,23 @@ fn handle_pdf_page(doc: Document) -> u32 {
 
     for page in doc.page_iter() {
         for a in doc.get_page_annotations(page).unwrap() {
-            let subtype = a.get_deref(b"Subtype", &doc).and_then(Object::as_name).unwrap_or(b"");
+            let subtype = a
+                .get_deref(b"Subtype", &doc)
+                .and_then(Object::as_name)
+                .unwrap_or(b"");
             println!(
                 "Page {}, {} annotation at {:?}",
                 page_counter,
                 str::from_utf8(subtype).unwrap(),
-                a.get_deref(b"Rect", &doc).and_then(Object::as_array).unwrap()
+                a.get_deref(b"Rect", &doc)
+                    .and_then(Object::as_array)
+                    .unwrap()
             );
             if let Ok(Object::String(c, _)) = a.get_deref(b"Contents", &doc) {
-                println!("  Contents: {:.60}", String::from_utf8_lossy(c).lines().next().unwrap());
+                println!(
+                    "  Contents: {:.60}",
+                    String::from_utf8_lossy(c).lines().next().unwrap()
+                );
             }
             if subtype == b"Link"
                 && let Ok(ahref) = a.get_deref(b"A", &doc).and_then(Object::as_dict)

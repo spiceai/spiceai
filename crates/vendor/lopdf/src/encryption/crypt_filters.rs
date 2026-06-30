@@ -120,7 +120,9 @@ impl CryptFilter for Aes128CryptFilter {
         if key.len() != 16 {
             return Err(DecryptionError::InvalidKeyLength);
         }
-        let key: &[u8; 16] = key.try_into().map_err(|_| DecryptionError::InvalidKeyLength)?;
+        let key: &[u8; 16] = key
+            .try_into()
+            .map_err(|_| DecryptionError::InvalidKeyLength)?;
 
         // The ciphertext needs to be a multiple of 16 bytes to include the padding.
         let ciphertext_len = (plaintext.len() + 16) / 16 * 16;
@@ -158,7 +160,9 @@ impl CryptFilter for Aes128CryptFilter {
         if key.len() != 16 {
             return Err(DecryptionError::InvalidKeyLength);
         }
-        let key: &[u8; 16] = key.try_into().map_err(|_| DecryptionError::InvalidKeyLength)?;
+        let key: &[u8; 16] = key
+            .try_into()
+            .map_err(|_| DecryptionError::InvalidKeyLength)?;
 
         // Ensure that the ciphertext length is a multiple of 16 bytes.
         if !ciphertext.len().is_multiple_of(16) {
@@ -206,7 +210,9 @@ impl CryptFilter for Aes256CryptFilter {
         if key.len() != 32 {
             return Err(DecryptionError::InvalidKeyLength);
         }
-        let key: &[u8; 32] = key.try_into().map_err(|_| DecryptionError::InvalidKeyLength)?;
+        let key: &[u8; 32] = key
+            .try_into()
+            .map_err(|_| DecryptionError::InvalidKeyLength)?;
 
         // The ciphertext needs to be a multiple of 16 bytes to include the padding.
         let ciphertext_len = (plaintext.len() + 16) / 16 * 16;
@@ -244,7 +250,9 @@ impl CryptFilter for Aes256CryptFilter {
         if key.len() != 32 {
             return Err(DecryptionError::InvalidKeyLength);
         }
-        let key: &[u8; 32] = key.try_into().map_err(|_| DecryptionError::InvalidKeyLength)?;
+        let key: &[u8; 32] = key
+            .try_into()
+            .map_err(|_| DecryptionError::InvalidKeyLength)?;
 
         // Ensure that the ciphertext length is a multiple of 16 bytes.
         if !ciphertext.len().is_multiple_of(16) {

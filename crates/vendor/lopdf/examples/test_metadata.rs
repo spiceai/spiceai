@@ -2,7 +2,9 @@ use lopdf::Document;
 use std::env;
 
 fn main() {
-    let pdf_path = env::args().nth(1).unwrap_or_else(|| "assets/example.pdf".to_string());
+    let pdf_path = env::args()
+        .nth(1)
+        .unwrap_or_else(|| "assets/example.pdf".to_string());
 
     let buffer = match std::fs::read(&pdf_path) {
         Ok(buf) => buf,

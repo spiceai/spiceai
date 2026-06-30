@@ -24,12 +24,18 @@ fn main() {
     let mut doc = Document::with_version("1.5");
 
     // Create an object stream manually
-    let mut obj_stream = ObjectStream::builder().max_objects(10).compression_level(6).build();
+    let mut obj_stream = ObjectStream::builder()
+        .max_objects(10)
+        .compression_level(6)
+        .build();
 
     // Add some objects
     obj_stream.add_object((1, 0), Object::Integer(42)).unwrap();
     obj_stream
-        .add_object((2, 0), Object::String(b"Test".to_vec(), lopdf::StringFormat::Literal))
+        .add_object(
+            (2, 0),
+            Object::String(b"Test".to_vec(), lopdf::StringFormat::Literal),
+        )
         .unwrap();
 
     println!("Object stream has {} objects", obj_stream.object_count());
@@ -37,7 +43,10 @@ fn main() {
     // Convert to stream object
     let stream_obj = obj_stream.to_stream_object().unwrap();
     println!("Stream dict: {:?}", stream_obj.dict);
-    println!("Stream has Filter: {}", stream_obj.dict.get(b"Filter").is_ok());
+    println!(
+        "Stream has Filter: {}",
+        stream_obj.dict.get(b"Filter").is_ok()
+    );
 
     // Add it to the document
     let stream_id = doc.add_object(stream_obj);

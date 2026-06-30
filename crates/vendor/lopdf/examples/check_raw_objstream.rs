@@ -96,12 +96,15 @@ fn main() {
                             let stream_content_start = stream_pos + 2;
                             // Check first few bytes
                             let preview = &buffer[stream_content_start
-                                ..stream_content_start.min(buffer.len()).min(stream_content_start + 20)];
+                                ..stream_content_start
+                                    .min(buffer.len())
+                                    .min(stream_content_start + 20)];
                             println!("First 20 bytes of stream: {:?}", preview);
 
                             // Check if it looks compressed
-                            let looks_compressed =
-                                preview.iter().any(|&b| b > 127 || (b < 32 && b != b'\n' && b != b'\r'));
+                            let looks_compressed = preview
+                                .iter()
+                                .any(|&b| b > 127 || (b < 32 && b != b'\n' && b != b'\r'));
                             println!("Looks compressed: {}", looks_compressed);
                         }
                     }

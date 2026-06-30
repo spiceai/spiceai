@@ -13,8 +13,12 @@ fn test_object_stream_add_and_build() {
 
     // Add some objects
     obj_stream.add_object((1, 0), Object::Integer(42)).unwrap();
-    obj_stream.add_object((2, 0), Object::Boolean(true)).unwrap();
-    obj_stream.add_object((3, 0), Object::Name(b"Test".to_vec())).unwrap();
+    obj_stream
+        .add_object((2, 0), Object::Boolean(true))
+        .unwrap();
+    obj_stream
+        .add_object((3, 0), Object::Name(b"Test".to_vec()))
+        .unwrap();
 
     // Build the stream content
     let content = obj_stream.build_stream_content().unwrap();
@@ -22,7 +26,10 @@ fn test_object_stream_add_and_build() {
 
     // Convert to stream object
     let stream_obj = obj_stream.to_stream_object().unwrap();
-    assert_eq!(stream_obj.dict.get(b"Type").unwrap(), &Object::Name(b"ObjStm".to_vec()));
+    assert_eq!(
+        stream_obj.dict.get(b"Type").unwrap(),
+        &Object::Name(b"ObjStm".to_vec())
+    );
     assert_eq!(stream_obj.dict.get(b"N").unwrap(), &Object::Integer(3));
 }
 
@@ -89,7 +96,10 @@ fn test_save_with_object_streams() {
     assert!(content.starts_with("%PDF-1.5"));
 
     // Verify object streams were created
-    assert!(content.contains("/ObjStm"), "Object streams should be created");
+    assert!(
+        content.contains("/ObjStm"),
+        "Object streams should be created"
+    );
 
     // Verify that structural objects are NOT present as individual objects
     assert!(
@@ -150,7 +160,10 @@ fn test_object_stream_parses_objects_with_leading_whitespace() {
         .get(&(10u32, 0u16) as &ObjectId)
         .expect("object 10 missing");
     if let Object::Dictionary(dict) = obj10 {
-        assert_eq!(dict.get(b"BaseFont").unwrap().as_name().unwrap(), b"Calibri");
+        assert_eq!(
+            dict.get(b"BaseFont").unwrap().as_name().unwrap(),
+            b"Calibri"
+        );
     } else {
         panic!("object 10 should be a Dictionary, got {:?}", obj10);
     }
@@ -161,7 +174,10 @@ fn test_object_stream_parses_objects_with_leading_whitespace() {
         .get(&(11u32, 0u16) as &ObjectId)
         .expect("object 11 missing");
     if let Object::Dictionary(dict) = obj11 {
-        assert_eq!(dict.get(b"FontName").unwrap().as_name().unwrap(), b"Calibri");
+        assert_eq!(
+            dict.get(b"FontName").unwrap().as_name().unwrap(),
+            b"Calibri"
+        );
     } else {
         panic!("object 11 should be a Dictionary, got {:?}", obj11);
     }

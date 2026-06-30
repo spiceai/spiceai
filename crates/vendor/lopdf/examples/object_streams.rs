@@ -54,7 +54,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             Operation::new("BT", vec![]),
             Operation::new("Tf", vec!["F2".into(), 16.into()]),
             Operation::new("Td", vec![50.into(), 650.into()]),
-            Operation::new("Tj", vec![Object::string_literal("This PDF uses object streams!")]),
+            Operation::new(
+                "Tj",
+                vec![Object::string_literal("This PDF uses object streams!")],
+            ),
             Operation::new("ET", vec![]),
             Operation::new("BT", vec![]),
             Operation::new("Tf", vec!["F1".into(), 12.into()]),
