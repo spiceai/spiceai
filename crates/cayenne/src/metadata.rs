@@ -292,7 +292,7 @@ pub enum CompressionStrategy {
 ///
 /// The exact level → scheme-set mapping lives in
 /// `provider::delta_encoding::strategy_builder_for_level`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(try_from = "String", into = "String")]
 pub enum DeltaEncoding {
     /// Size-gated: light for small deltas, full for large writes.
@@ -1222,12 +1222,28 @@ impl VortexConfig {
 impl Default for VortexConfig {
     fn default() -> Self {
         Self {
+            footer_cache_mb: None,
             segment_cache_mb: 256,
             // Balanced file size for scan throughput and write amplification
             target_vortex_file_size_mb: 256,
+            // No sort columns by default
+            sort_columns: Vec::new(),
+            // Shard key derives from the primary key unless overridden
+            shard_key_columns: Vec::new(),
+            compression_strategy: CompressionStrategy::default(),
+            // `auto`: size-gated light encoding for small deltas (re-encoded
+            // by compaction). Local micro A/B (2026-06-06) was neutral on the
+            // upsert/bulk lanes; the aggregate CPU-per-delta benefit targets
+            // production-scale CDC and is to be validated there. Set the
+            // param to `7` to opt out (pre-feature behavior).
+            delta_encoding: DeltaEncoding::default(),
             upload_concurrency: default_upload_concurrency(),
+            write_concurrency: None,
             compaction_trigger_files: default_compaction_trigger_files(),
             bake_deletion_index_trigger: default_bake_deletion_index_trigger(),
+            // Orphaned-DV cleanup disabled by default (pre-feature behavior, and
+            // the A/B baseline); opt in with `cayenne_orphaned_dv_cleanup_min_files`.
+            orphaned_dv_cleanup_min_files: None,
             compaction_trigger_protected_snapshots: default_compaction_trigger_protected_snapshots(
             ),
             compaction_trigger_snapshot_age_ms: default_compaction_trigger_snapshot_age_ms(),
@@ -1240,15 +1256,31 @@ impl Default for VortexConfig {
             inline_flush_max_rows: default_inline_flush_max_rows(),
             inline_flush_max_segments: default_inline_flush_max_segments(),
             inline_flush_max_bytes: default_inline_flush_max_bytes(),
+            pk_conflict_detection: PkConflictDetection::default(),
+            pk_keyset_cache_mb: None,
+            deletion_mode: DeletionMode::default(),
+            cdc_durability: CdcDurability::default(),
             cdc_mem_tier_max_bytes: default_cdc_mem_tier_max_bytes(),
             cdc_mem_tier_shards: default_cdc_mem_tier_shards(),
             cdc_mem_tier_max_age_ms: default_cdc_mem_tier_max_age_ms(),
             cdc_mem_tier_min_flush_bytes: default_cdc_mem_tier_min_flush_bytes(),
             cdc_mem_tier_checkpoint_interval_ms: default_cdc_mem_tier_checkpoint_interval_ms(),
+            dynamic_tuning: false,
+            pinned_tuning_actuators: PinnedTuningActuators::default(),
             // Directory listing stays the scan's file source by default; the
             // manifest is a dual-source supplement until proven complete.
             scan_from_manifest: false,
-            ..Default::default()
+            schema_evolution: SchemaEvolutionMode::default(),
+            goal_replication_lag_secs: None,
+            goal_freshness_secs: None,
+            goal_query_latency_ms: None,
+            goal_qph: None,
+            goal_convergence_window_secs: None,
+            data_storage_class: StorageClass::default(),
+            metastore_storage_class: StorageClass::default(),
+            data_storage_write_mbps: None,
+            metastore_storage_write_mbps: None,
+            force_view_read_schema: false,
         }
     }
 }

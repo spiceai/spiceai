@@ -9625,7 +9625,7 @@ impl CayenneTableProvider {
             .table_metadata
             .vortex_config
             .orphaned_dv_cleanup_min_files
-            == 0
+            .is_none()
         {
             return;
         }
@@ -9762,13 +9762,14 @@ impl CayenneTableProvider {
     /// orphaned-DV deletion (keep DVs alive longer or reject restoring below the GC
     /// point) — see the matching note on the snapshot set/restore code.
     async fn sweep_orphaned_deletion_vectors(&self) {
-        let min_files = self
+        let Some(min_files) = self
             .table_metadata
             .vortex_config
-            .orphaned_dv_cleanup_min_files;
-        if min_files == 0 {
+            .orphaned_dv_cleanup_min_files
+        else {
             return;
-        }
+        };
+        let min_files = min_files.get();
 
         let table_id = &self.table_metadata.table_id;
         let current_snapshot_id = self.get_current_snapshot_id();
