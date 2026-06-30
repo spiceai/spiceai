@@ -22,7 +22,7 @@ use datafusion::common::{
     not_impl_err,
 };
 use datafusion::datasource::TableType;
-use datafusion::functions_aggregate::expr_fn::{first_value, max};
+use datafusion::functions_aggregate::expr_fn::{first_value, sum};
 use datafusion::functions_window::expr_fn::row_number;
 use datafusion::logical_expr::{
     ColumnarValue, DocSection, Documentation, Expr, Partitioning, ScalarFunctionArgs,
@@ -798,9 +798,8 @@ impl ReciprocalRankFusion {
 
         if let Some(joined) = maybe_joined {
             tracing::trace!("{RRF_UDF_NAME} made reranked & fused DF for: {args:?}");
-            // Take the highest scores from multiple matches
             let mut agg_cols =
-                vec![max(col(RRF_FUSED_SCORE_COLUMN_NAME)).alias(RRF_FUSED_SCORE_COLUMN_NAME)];
+                vec![sum(col(RRF_FUSED_SCORE_COLUMN_NAME)).alias(RRF_FUSED_SCORE_COLUMN_NAME)];
 
             // The first column is the score_expr, which gets special treatment above.
             // These are unaliased, because they get flattened by coalesce() in the first select.
@@ -1011,10 +1010,32 @@ impl ReciprocalRankFusion {
             )))
     }
 
+    fn coalesced_qualified_field(df: &DataFrame, name: &str) -> Result<Expr> {
+        let qualified_fields = df
+            .schema()
+            .qualified_fields_with_unqualified_name(name)
+            .iter()
+            .filter_map(|(maybe_table_reference, field)| {
+                maybe_table_reference
+                    .as_ref()
+                    .map(|table_reference| col_qualified!(table_reference.clone(), field.name()))
+            })
+            .collect::<Vec<_>>();
+
+        match qualified_fields.len() {
+            0 => exec_err!("{RRF_UDF_NAME}: Cannot resolve column {name} when fusing results"),
+            1 => Ok(qualified_fields
+                .into_iter()
+                .next()
+                .unwrap_or_else(|| unreachable!("single-element vector cannot be empty"))),
+            _ => Ok(coalesce(qualified_fields)),
+        }
+    }
+
     // Reduces 2 or more search subquery DFs into a single one
     fn fold_join(a: DataFrame, b: DataFrame, join_key: &str) -> Result<DataFrame> {
-        let (tbl_a, id_a) = Self::first_qualified_field(&a, join_key)?;
-        let (tbl_b, id_b) = Self::first_qualified_field(&b, join_key)?;
+        let key_a = Self::coalesced_qualified_field(&a, join_key)?;
+        let key_b = Self::coalesced_qualified_field(&b, join_key)?;
 
         // Drop embedding columns before the full outer join — they are non-nullable
         // in Arrow but the join produces nulls for unmatched rows, causing a schema
@@ -1037,11 +1058,7 @@ impl ReciprocalRankFusion {
         let a = drop_embedding_cols(a)?;
         let b = drop_embedding_cols(b)?;
 
-        a.join_on(
-            b,
-            JoinType::Full,
-            vec![col_qualified!(tbl_a, id_a).eq(col_qualified!(tbl_b, id_b))],
-        )
+        a.join_on(b, JoinType::Full, vec![key_a.eq(key_b)])
     }
 
     // Window and rank a search subquery by its `_score` field.
@@ -1320,14 +1337,19 @@ impl TableProvider for ReciprocalRankFusion {
 #[cfg(test)]
 mod tests {
     use crate::rrf::ReciprocalRankFusionArgs;
+    use arrow::array::{Float64Array, StringArray};
+    use arrow::record_batch::RecordBatch;
     use datafusion::arrow::datatypes::DataType;
+    use datafusion::arrow::util::pretty::pretty_format_batches;
+    use datafusion::catalog::MemTable;
 
     use datafusion::logical_expr::Expr;
     use datafusion::logical_expr::expr::FieldMetadata;
     use datafusion::logical_expr::{ColumnarValue, Volatility, create_udf};
+    use datafusion::prelude::{SessionContext, coalesce};
     use datafusion::scalar::ScalarValue;
     use datafusion_expr::expr::ScalarFunction;
-    use datafusion_expr::lit;
+    use datafusion_expr::{col, lit};
     use std::collections::BTreeMap;
     use std::sync::Arc;
 
@@ -1497,6 +1519,94 @@ mod tests {
             parsed.rrf_subquery_arguments[0].rank_weight,
             Some(2.5),
             "rank_weight should be 2.5"
+        );
+    }
+
+    #[tokio::test]
+    async fn fold_join_merges_rows_missing_from_search_0() {
+        let ctx = SessionContext::new();
+        let schema = Arc::new(arrow_schema::Schema::new(vec![
+            arrow_schema::Field::new("id", DataType::Utf8, false),
+            arrow_schema::Field::new("rank", DataType::Float64, false),
+        ]));
+
+        let make_table = |ids: Vec<&str>, ranks: Vec<f64>| {
+            Arc::new(
+                MemTable::try_new(
+                    Arc::clone(&schema),
+                    vec![vec![RecordBatch::try_new(
+                        Arc::clone(&schema),
+                        vec![
+                            Arc::new(StringArray::from(ids)),
+                            Arc::new(Float64Array::from(ranks)),
+                        ],
+                    )
+                    .expect("valid batch")]],
+                )
+                .expect("valid memtable"),
+            )
+        };
+
+        ctx.register_table("t0", make_table(vec!["A"], vec![1.0]))
+            .expect("register t0");
+        ctx.register_table("t1", make_table(vec!["B"], vec![1.0]))
+            .expect("register t1");
+        ctx.register_table("t2", make_table(vec!["B"], vec![2.0]))
+            .expect("register t2");
+
+        let joined = ReciprocalRankFusion::fold_join(
+            ReciprocalRankFusion::fold_join(
+                ctx.table("t0")
+                    .await
+                    .expect("t0 dataframe")
+                    .alias("search_0")
+                    .expect("alias search_0"),
+                ctx.table("t1")
+                    .await
+                    .expect("t1 dataframe")
+                    .alias("search_1")
+                    .expect("alias search_1"),
+                "id",
+            )
+            .expect("first fold join"),
+            ctx.table("t2")
+                .await
+                .expect("t2 dataframe")
+                .alias("search_2")
+                .expect("alias search_2"),
+            "id",
+        )
+        .expect("second fold join");
+
+        let batches = joined
+            .select(vec![
+                coalesce(vec![
+                    col("search_0.id"),
+                    col("search_1.id"),
+                    col("search_2.id"),
+                ])
+                .alias("id"),
+            ])
+            .expect("select coalesced id")
+            .sort(vec![col("id").sort(true, true)])
+            .expect("sort ids")
+            .collect()
+            .await
+            .expect("collect joined rows");
+
+        let formatted = pretty_format_batches(&batches)
+            .expect("format joined rows")
+            .to_string();
+        assert_eq!(
+            formatted,
+            concat!(
+                "+----+\n",
+                "| id |\n",
+                "+----+\n",
+                "| A  |\n",
+                "| B  |\n",
+                "+----+"
+            )
         );
     }
 }
