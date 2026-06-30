@@ -721,17 +721,13 @@ pub struct VortexConfig {
     /// the protected snapshot(s) it shadowed, raising the surviving-sequence floor
     /// above its delete sequence so it shadows nothing.
     ///
-    /// `None` (unset/null, the default) disables orphaned-DV cleanup entirely — no
-    /// background sweep is ever spawned, so the file-based DELETE path acquires no
-    /// extra locks and runs no catalog scan (the pre-feature behavior, and the A/B
-    /// baseline). `Some(n)` enables it with threshold `n >= 1`. The `NonZeroUsize`
-    /// type makes a misconfigured `0` unrepresentable; the spicepod param
-    /// (`cayenne_orphaned_dv_cleanup_min_files`) maps `0` (or unset) to `None`. A
-    /// larger value sweeps less often (cheaper, but orphaned `.arrow` files linger
-    /// on disk longer); a smaller value reclaims disk sooner. The sweep is
-    /// lock-free and runs off the write path on the dedicated compaction runtime,
-    /// so this only trades sweep frequency against lingering disk — never ingest
-    /// latency.
+    /// `0` disables orphaned-DV cleanup entirely — no background sweep is ever
+    /// spawned, so the file-based DELETE path acquires no extra locks and runs no
+    /// catalog scan (the pre-feature behavior, and the A/B baseline). A larger
+    /// value sweeps less often (cheaper, but orphaned `.arrow` files linger on disk
+    /// longer); a smaller value reclaims disk sooner. The sweep is lock-free and
+    /// runs off the write path on the dedicated compaction runtime, so this only
+    /// trades sweep frequency against lingering disk — never ingest latency.
     pub orphaned_dv_cleanup_min_files: Option<NonZeroUsize>,
     /// Number of protected snapshots that can accumulate before snapshot-maintenance
     /// compaction is eligible to run. Kept separate from `compaction_trigger_files`
@@ -1245,9 +1241,8 @@ impl Default for VortexConfig {
             write_concurrency: None,
             compaction_trigger_files: default_compaction_trigger_files(),
             bake_deletion_index_trigger: default_bake_deletion_index_trigger(),
-            // Orphaned-DV cleanup disabled by default (None = pre-feature behavior,
-            // and the A/B baseline); opt in by setting the spicepod param
-            // `cayenne_orphaned_dv_cleanup_min_files` to a value >= 1.
+            // Orphaned-DV cleanup disabled by default (pre-feature behavior, and
+            // the A/B baseline); opt in with `cayenne_orphaned_dv_cleanup_min_files`.
             orphaned_dv_cleanup_min_files: None,
             compaction_trigger_protected_snapshots: default_compaction_trigger_protected_snapshots(
             ),
