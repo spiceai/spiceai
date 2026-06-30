@@ -16,6 +16,8 @@ limitations under the License.
 
 //! Data structures for Cayenne metadata.
 
+use std::num::NonZeroUsize;
+
 use arrow_schema::SchemaRef;
 use datafusion_table_providers::util::on_conflict::OnConflict;
 use serde::{Deserialize, Serialize};
@@ -713,6 +715,20 @@ pub struct VortexConfig {
     /// [`crate::provider::table::BAKE_DELETION_INDEX_TRIGGER`]).
     #[serde(default = "default_bake_deletion_index_trigger")]
     pub bake_deletion_index_trigger: usize,
+    /// Number of orphan-eligible key-based deletion vectors (count of
+    /// `cayenne_delete_file` rows, NOT masked rows) that must accumulate before a
+    /// cleanup sweep runs. A key DV is orphan-eligible once retention has emptied
+    /// the protected snapshot(s) it shadowed, raising the surviving-sequence floor
+    /// above its delete sequence so it shadows nothing.
+    ///
+    /// `0` disables orphaned-DV cleanup entirely — no background sweep is ever
+    /// spawned, so the file-based DELETE path acquires no extra locks and runs no
+    /// catalog scan (the pre-feature behavior, and the A/B baseline). A larger
+    /// value sweeps less often (cheaper, but orphaned `.arrow` files linger on disk
+    /// longer); a smaller value reclaims disk sooner. The sweep is lock-free and
+    /// runs off the write path on the dedicated compaction runtime, so this only
+    /// trades sweep frequency against lingering disk — never ingest latency.
+    pub orphaned_dv_cleanup_min_files: Option<NonZeroUsize>,
     /// Number of protected snapshots that can accumulate before snapshot-maintenance
     /// compaction is eligible to run. Kept separate from `compaction_trigger_files`
     /// so small-file compaction tuning does not silently change scan amplification
@@ -1266,6 +1282,9 @@ impl Default for VortexConfig {
             write_concurrency: None,
             compaction_trigger_files: default_compaction_trigger_files(),
             bake_deletion_index_trigger: default_bake_deletion_index_trigger(),
+            // Orphaned-DV cleanup disabled by default (pre-feature behavior, and
+            // the A/B baseline); opt in with `cayenne_orphaned_dv_cleanup_min_files`.
+            orphaned_dv_cleanup_min_files: None,
             compaction_trigger_protected_snapshots: default_compaction_trigger_protected_snapshots(
             ),
             compaction_trigger_snapshot_age_ms: default_compaction_trigger_snapshot_age_ms(),

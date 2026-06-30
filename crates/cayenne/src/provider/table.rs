@@ -10152,7 +10152,19 @@ impl CayenneTableProvider {
     /// pass on the dedicated compaction runtime, coalescing a burst of retention
     /// passes into a single in-flight sweep — mirroring
     /// [`Self::schedule_post_write_compaction`].
+    ///
+    /// No-op when the `orphaned_dv_cleanup_min_files` knob is 0: nothing is
+    /// spawned, no lock is taken, and no catalog query runs (the pre-feature
+    /// behavior, and the SF-1000 CH-BenCHmark A/B baseline).
     pub(crate) fn schedule_orphan_dv_sweep(&self) {
+        if self
+            .table_metadata
+            .vortex_config
+            .orphaned_dv_cleanup_min_files
+            .is_none()
+        {
+            return;
+        }
         // Coalesce: at most one in-flight sweep per table.
         if self.orphan_dv_sweep_scheduled.swap(true, Ordering::AcqRel) {
             return;
@@ -10173,68 +10185,15 @@ impl CayenneTableProvider {
             let _clear = ClearOnDrop(Arc::clone(&table.orphan_dv_sweep_scheduled));
 
             tokio::task::yield_now().await;
-            table
-                .sweep_orphaned_deletion_vectors(ORPHANED_DV_CLEANUP_MIN_FILES)
-                .await;
+            table.sweep_orphaned_deletion_vectors().await;
         });
     }
 
-    /// Synchronously run one orphaned-DV sweep at the given threshold. Test-only
-    /// deterministic drain for the otherwise background
-    /// [`Self::schedule_orphan_dv_sweep`] path (which always uses the production
-    /// constant [`ORPHANED_DV_CLEANUP_MIN_FILES`]); the explicit `min_files` lets
-    /// tests drive the sweep with a small, deterministic orphan count.
+    /// Synchronously run one orphaned-DV sweep. Test-only deterministic drain for
+    /// the otherwise background [`Self::schedule_orphan_dv_sweep`] path.
     #[doc(hidden)]
-    pub async fn drain_orphan_dv_sweep(&self, min_files: usize) {
-        self.sweep_orphaned_deletion_vectors(min_files).await;
-    }
-
-    /// Quiesce this provider instance before it is dropped or replaced in-process
-    /// (a graceful restart, or a test that reopens the table): await every
-    /// fire-and-forget maintenance task it may have scheduled — post-write
-    /// compaction, orphan-DV sweep, inline checkpoint — and flush the post-write
-    /// maintenance loop, so nothing from THIS instance keeps mutating the shared
-    /// catalog after a new provider opens against it.
-    ///
-    /// A real process restart discards all in-memory state and kills these
-    /// detached tasks outright. An in-process drop cannot: a detached pass keeps a
-    /// `clone_for_write` alive and can commit AFTER a fresh provider opens against
-    /// the same catalog. The two instances hold DISTINCT `compaction_lock`s, so
-    /// they do not serialize — a full-snapshot rewrite in one and a
-    /// protected-snapshot subset-merge in the other can interleave and leave a
-    /// folded snapshot still registered in `cayenne_snapshot_sequence`,
-    /// double-counting its rows on the next load. Draining first makes an
-    /// in-process reopen behave like a clean restart.
-    #[doc(hidden)]
-    pub async fn drain_in_flight_maintenance(&self) -> CatalogResult<()> {
-        loop {
-            // Retention / stats / listing-refresh loop (has its own barrier).
-            self.flush_pending_maintenance().await?;
-            // Fire-and-forget compaction / orphan-DV sweep / inline checkpoint
-            // each set their flag BEFORE spawning and clear it when done, so spin
-            // until all are clear — no scheduled-or-running detached pass remains.
-            while self.post_write_compaction_scheduled.load(Ordering::Acquire)
-                || self.orphan_dv_sweep_scheduled.load(Ordering::Acquire)
-                || self.inline_checkpoint_scheduled.load(Ordering::Acquire)
-            {
-                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
-            }
-            // A drained compaction/sweep may have re-queued maintenance; repeat
-            // until a full pass finds nothing pending.
-            if self
-                .post_write_maintenance
-                .scheduled
-                .load(Ordering::Acquire)
-            {
-                continue;
-            }
-            break;
-        }
-        // Final barrier: serialize behind any compaction pass that grabbed the
-        // lock without one of the flags above; once held, nothing is mid-flight.
-        // Released immediately — the caller is about to drop/replace this instance.
-        drop(self.compaction_lock.lock().await);
-        Ok(())
+    pub async fn drain_orphan_dv_sweep(&self) {
+        self.sweep_orphaned_deletion_vectors().await;
     }
 
     /// Surviving-sequence floor for orphaned-DV cleanup: the minimum data sequence
@@ -10338,16 +10297,25 @@ impl CayenneTableProvider {
     /// `current_snapshot_id` on a LIVE table reusing live files, it must account for
     /// orphaned-DV deletion (keep DVs alive longer or reject restoring below the GC
     /// point) — see the matching note on the snapshot set/restore code.
-    async fn sweep_orphaned_deletion_vectors(&self, min_files: usize) {
+    async fn sweep_orphaned_deletion_vectors(&self) {
         // Hard per-sweep cap on the orphan working set. This is a fixed upper bound
-        // (NOT `max(min_files)`, which would let a large threshold defeat the cap):
-        // it bounds the fetch allocation, the unlink loop, AND — critically — the
+        // (NOT `max(min_files)`, which would let a large knob defeat the cap): it
+        // bounds the fetch allocation, the unlink loop, AND — critically — the
         // single `remove_delete_files` DELETE, which binds one parameter per id and
         // would exceed the metastore's bound-parameter limit (e.g. SQLite's
         // ~32766) on a huge batch. The effective threshold is clamped to the cap so
         // the gate below can still fire; a backlog beyond the cap drains on later
         // retention passes.
         const ORPHAN_DV_SWEEP_MAX_BATCH: usize = 4096;
+
+        let Some(min_files) = self
+            .table_metadata
+            .vortex_config
+            .orphaned_dv_cleanup_min_files
+        else {
+            return;
+        };
+        let min_files = min_files.get();
 
         let table_id = &self.table_metadata.table_id;
         let current_snapshot_id = self.get_current_snapshot_id();
