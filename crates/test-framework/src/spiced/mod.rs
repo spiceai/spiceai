@@ -80,6 +80,7 @@ pub struct StartRequest {
     additional_args: Vec<String>,
     prepared: bool,
     capture_log: Option<PathBuf>,
+    extra_env: Vec<(String, String)>,
 }
 
 impl StartRequest {
@@ -92,7 +93,18 @@ impl StartRequest {
             data_dir: None,
             additional_args: Vec::new(),
             capture_log: None,
+            extra_env: Vec::new(),
         })
+    }
+
+    /// Set an environment variable explicitly on the spawned spiced process,
+    /// overriding inheritance. Use this for env that MUST reach spiced rather
+    /// than relying on it propagating through wrapper scripts (e.g.
+    /// `SPICED_EAGER_AGGREGATION`). Only honored for owned (spawned) instances.
+    #[must_use]
+    pub fn with_env(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
+        self.extra_env.push((key.into(), value.into()));
+        self
     }
 
     #[must_use]
@@ -266,6 +278,13 @@ impl SpicedInstance {
             && !metrics_addr.is_empty()
         {
             cmd.arg("--metrics").arg(metrics_addr);
+        }
+
+        // Set any explicitly-forwarded env vars on the spiced process (these
+        // override inheritance, so they reach spiced even when it's launched via
+        // a wrapper script).
+        for (key, value) in &start_request.extra_env {
+            cmd.env(key, value);
         }
 
         // Add any additional arguments

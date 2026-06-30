@@ -71,6 +71,36 @@ pub(crate) async fn run(args: &HtapArgs) -> anyhow::Result<()> {
     if let Some(dir) = &args.capture_explain {
         std::fs::create_dir_all(dir)?;
         start_request = start_request.with_log_capture(dir.join("spiced.log"));
+
+        // The eager-aggregation rule logs its accept/decline decisions under the
+        // `eager_aggregation` target, which spiced's DEFAULT filter suppresses
+        // (it's not an internal component, so it sits at the global WARN level).
+        // Force it on for the captured spiced so the decline map is populated —
+        // explicitly on the process, not via inheritance. Preserve any existing
+        // SPICED_LOG and just ensure the target is included.
+        let spiced_log = match std::env::var("SPICED_LOG") {
+            Ok(v) if v.contains("eager_aggregation") => v,
+            Ok(v) if !v.is_empty() => format!("{v},eager_aggregation=debug"),
+            _ => "info,eager_aggregation=debug".to_string(),
+        };
+        start_request = start_request.with_env("SPICED_LOG", spiced_log);
+    }
+
+    // Forward the eager-aggregation experiment env vars explicitly onto the
+    // spawned spiced, rather than relying on inheritance through the launch
+    // wrapper (e.g. the CI taskset pin script). Log what we forward so eager
+    // enablement is unambiguous in the run output.
+    for key in [
+        "SPICED_EAGER_AGGREGATION",
+        "SPICED_EAGER_AGGREGATION_MIN_REDUCTION_FACTOR",
+        "SPICED_EAGER_AGGREGATION_MAX_PUSHED_GROUPS",
+    ] {
+        if let Ok(value) = std::env::var(key)
+            && !value.is_empty()
+        {
+            println!("htap: forwarding {key}={value} to spiced");
+            start_request = start_request.with_env(key, value);
+        }
     }
 
     // 1. Prepare the source (schema + seed data).
