@@ -392,24 +392,33 @@ async fn reciprocal_rank_fusion_plan(
     })?;
 
     let mut builder = LogicalPlanBuilder::from(first_plan.clone());
+    let mut joined_table_names = vec![first_table_name.clone()];
 
     // 3) FULL OUTER JOIN remaining tables on primary key columns
     for (table_name, plan) in ranked_plans.iter().skip(1) {
-        builder = builder.join(
+        let on_exprs = primary_key.iter().map(|pk| {
+            let left_key_parts = joined_table_names
+                .iter()
+                .map(|joined_table| col(pk.clone().with_relation(joined_table.clone())))
+                .collect::<Vec<_>>();
+            let left_key = if left_key_parts.len() == 1 {
+                left_key_parts
+                    .into_iter()
+                    .next()
+                    .unwrap_or_else(|| unreachable!("primary key expressions cannot be empty"))
+            } else {
+                coalesce(left_key_parts)
+            };
+
+            left_key.eq(col(pk.clone().with_relation(table_name.clone())))
+        });
+
+        builder = builder.join_on(
             plan.clone(),
             JoinType::Full,
-            (
-                primary_key
-                    .iter()
-                    .map(|pk| pk.clone().with_relation(first_table_name.clone()))
-                    .collect(),
-                primary_key
-                    .iter()
-                    .map(|pk| pk.clone().with_relation(table_name.clone()))
-                    .collect(),
-            ),
-            None,
+            on_exprs,
         )?;
+        joined_table_names.push(table_name.clone());
     }
 
     // 4) Build the RRF score: SUM(COALESCE(1.0/(rank + k), 0)) across all tables
@@ -477,7 +486,11 @@ async fn reciprocal_rank_fusion_plan(
 
 #[cfg(test)]
 mod tests {
+    use arrow::array::RecordBatch;
     use arrow::datatypes::{DataType, Field, Schema};
+    use datafusion::execution::SendableRecordBatchStream;
+    use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+    use futures::stream;
 
     use super::*;
 
@@ -614,6 +627,74 @@ mod tests {
 
         let result = verify_schema_compatibility(&[schema1, schema2]);
         assert!(result.is_ok(), "Compatible schemas should pass validation");
+    }
+
+    fn stream_from_batch(batch: RecordBatch) -> SendableRecordBatchStream {
+        let schema = batch.schema();
+        Box::pin(RecordBatchStreamAdapter::new(
+            schema,
+            stream::iter(vec![Ok(batch)]),
+        ))
+    }
+
+    #[tokio::test]
+    async fn reciprocal_rank_fusion_merges_documents_missing_from_first_stream() {
+        let make_batch = |scores: Vec<f64>, values: Vec<&str>, ids: Vec<&str>| {
+            RecordBatch::try_from_iter(vec![
+                (
+                    SEARCH_SCORE_COLUMN_NAME,
+                    Arc::new(arrow::array::Float64Array::from(scores)) as _,
+                ),
+                (
+                    SEARCH_VALUE_COLUMN_NAME,
+                    Arc::new(arrow::array::StringArray::from(values)) as _,
+                ),
+                ("id", Arc::new(arrow::array::StringArray::from(ids)) as _),
+            ])
+            .expect("valid record batch")
+        };
+
+        let stream_0 = VectorSearchGenerationResult {
+            data: stream_from_batch(make_batch(vec![10.0], vec!["A-from-s0"], vec!["A"])),
+            derived_from: "body".to_string(),
+        };
+        let stream_1 = VectorSearchGenerationResult {
+            data: stream_from_batch(make_batch(
+                vec![9.0, 8.0],
+                vec!["B-from-s1", "D-from-s1"],
+                vec!["B", "D"],
+            )),
+            derived_from: "body".to_string(),
+        };
+        let stream_2 = VectorSearchGenerationResult {
+            data: stream_from_batch(make_batch(
+                vec![7.0, 6.0],
+                vec!["B-from-s2", "E-from-s2"],
+                vec!["B", "E"],
+            )),
+            derived_from: "body".to_string(),
+        };
+
+        let result = ReciprocalRankFusion
+            .aggregate(vec![stream_0, stream_1, stream_2], vec![Column::from_name("id")], 10)
+            .await
+            .expect("rrf aggregation should succeed");
+
+        let batches = collect_batches(result.data)
+            .await
+            .expect("should collect fused batches");
+        let formatted = arrow::util::pretty::pretty_format_batches(&batches)
+            .expect("should format output")
+            .to_string();
+
+        assert!(
+            formatted.matches("| B  |").count() == 1,
+            "expected document B exactly once, got:\n{formatted}"
+        );
+        assert!(
+            formatted.contains("| B  | 0.03225806451612903"),
+            "expected fused B score to sum stream 2 and 3 contributions, got:\n{formatted}"
+        );
     }
 
     /// Test that verify_schema_compatibility accepts schemas with different nullability
