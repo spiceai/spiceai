@@ -5209,10 +5209,13 @@ impl CayenneTableProvider {
     /// the join-key stats that the base+delta `UnionExec` wipes to
     /// `Precision::Absent`, restoring `JoinSelection`'s ability to size joins.
     ///
-    /// Only `column_statistics` are populated (downgraded to inexact via
-    /// [`Self::column_statistics_to_inexact`]); `num_rows`/`total_byte_size`
-    /// are left `Absent` so the physical scan's own filter-aware `num_rows`
-    /// always wins. Columns not present in the aggregate map to
+    /// `column_statistics` are populated (downgraded to inexact via
+    /// [`Self::column_statistics_to_inexact`]). `num_rows` carries the maintained
+    /// whole-table count (as inexact) so the scan can restore it when the
+    /// base+delta `UnionExec` collapses `num_rows` to `Absent` (a stat-less
+    /// branch poisons the union sum); it is used only as a fallback — a present,
+    /// filter-aware child `num_rows` still wins. `total_byte_size` is left
+    /// `Absent`. Columns not present in the aggregate map to
     /// `ColumnStatistics::new_unknown()`.
     ///
     /// Returns `None` when the aggregate is cold or its column count does not
@@ -5247,7 +5250,7 @@ impl CayenneTableProvider {
             .collect();
 
         Some(Arc::new(Statistics {
-            num_rows: DFPrecision::Absent,
+            num_rows: table_stats.num_rows.to_inexact(),
             total_byte_size: DFPrecision::Absent,
             column_statistics,
         }))
@@ -16681,10 +16684,32 @@ impl CayenneTableProvider {
             stats
         };
 
-        // The rows moved from RAM to a file; they were already counted live on
-        // append, so the live count is unchanged (only the stats blob re-merges).
-        self.persist_table_stats(&stats, RowCountUpdate::Unchanged)
-            .await;
+        // Seed the persisted live `num_rows` from the mem-tier rows that just
+        // became durable. Unlike the inline/staged path — which persists
+        // `Delta(live_rows_delta)` at write time (`try_inline_or_restream` /
+        // `AppendMutationWriter`) — the RAM-append path (`append_to_shard`) only
+        // nets these rows into the in-memory `inlined_row_count`; it never feeds
+        // the persisted aggregate. So the checkpoint is where they enter the
+        // maintained count, or a `cdc_durability: memory` table reports
+        // `num_rows: 0` to the optimizer forever (collapsing every hash join's
+        // build/probe sizing). Add only `flushed_mem_rows` (the retained,
+        // post-tombstone RAM corpus): any inline rows swept into the same
+        // checkpoint file were ALREADY persisted at inline-commit time, so
+        // `total_rows` would double-count them. Residual drift from superseding
+        // already-durable rows (not netted here) is bounded by compaction's
+        // periodic `Set` re-baseline, matching the staged path's tradeoff. The
+        // stats blob re-merges idempotently regardless of the count delta.
+        let row_count_update = if let Ok(delta) = i64::try_from(flushed_mem_rows) {
+            RowCountUpdate::Delta(delta)
+        } else {
+            tracing::warn!(
+                table = self.table_metadata.table_name.as_str(),
+                flushed_mem_rows,
+                "mem-tier checkpoint flushed row count exceeds i64::MAX; skipping num_rows delta to avoid poisoning the maintained count"
+            );
+            RowCountUpdate::Unchanged
+        };
+        self.persist_table_stats(&stats, row_count_update).await;
 
         record_cayenne_write_phase(
             &self.table_metadata.table_name,
