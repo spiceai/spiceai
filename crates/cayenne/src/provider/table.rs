@@ -4612,7 +4612,30 @@ impl CayenneTableProvider {
         )?;
 
         // Create session context once with object store registered (if S3).
-        let session_state = Arc::new(self.create_session_context().state());
+        // For Maintenance-class (compaction) LOCAL writes, optionally route the
+        // output through the custom fallocate / bytes_per_sync / O_DIRECT writer
+        // via a private object-store registry scoped to this write (see
+        // `compaction_session_context`). Gated OFF by default; falls back to the
+        // default writer on any setup error so it can never fail a compaction.
+        let writer_cfg = super::compaction_writer::config();
+        let use_compaction_writer = writer_cfg.enabled()
+            && matches!(write_class, super::delta_encoding::WriteClass::Maintenance)
+            && !self.table_metadata.path.starts_with("s3://");
+        let session_state = if use_compaction_writer {
+            match self.compaction_session_context(writer_cfg) {
+                Ok(ctx) => Arc::new(ctx.state()),
+                Err(error) => {
+                    tracing::warn!(
+                        target: "cayenne::compaction",
+                        %error,
+                        "compaction-writer session setup failed; falling back to the default writer"
+                    );
+                    Arc::new(self.create_session_context().state())
+                }
+            }
+        } else {
+            Arc::new(self.create_session_context().state())
+        };
 
         // Progress tracking for S3 Express uploads
         let is_s3_storage = self.table_metadata.path.starts_with("s3://");
@@ -10706,6 +10729,53 @@ impl CayenneTableProvider {
         super::fadvise_tier::evict_files(paths).await;
     }
 
+    /// Best-effort page-cache hygiene for compaction INPUTS after the merge has
+    /// consumed them and the swap has retired them. The merge streams `O(table)`
+    /// of input `.vortex` bytes through the page cache (the same buffered read
+    /// path as queries); once the merged output is published those inputs are
+    /// superseded, so dropping their now-cold pages reclaims the cache for live
+    /// queries instead of leaving it pinned until the deferred retire-sweep
+    /// physically deletes the dirs.
+    ///
+    /// Inputs are read-only (a merge never writes them) so every page is already
+    /// clean — a bare `POSIX_FADV_DONTNEED` drops them, with no `sync_file_range`
+    /// writeback needed (unlike the dirty-output [`Self::evict_compaction_output_pages`]).
+    ///
+    /// Trade-off vs the output counterpart: an output is private until published,
+    /// but an input was query-visible until the swap, so a scan that started
+    /// BEFORE the swap may still be reading one and would re-fault the dropped
+    /// pages. Callers therefore invoke this only AFTER the listing-fence swap +
+    /// retire (new scans already see the merged output), bounding the cost to
+    /// rare in-flight readers of about-to-be-deleted files — the `RocksDB`
+    /// posture. Linux + local only; never fails.
+    async fn evict_compaction_input_pages(&self, input_snapshot_ids: &[String]) {
+        let mut paths: Vec<std::path::PathBuf> = Vec::new();
+        for snapshot_id in input_snapshot_ids {
+            match self.list_snapshot_files_with_sizes_local(snapshot_id).await {
+                Ok(files) => {
+                    let snapshot_dir = self.snapshot_dir_path_for(snapshot_id);
+                    paths.extend(
+                        files
+                            .into_iter()
+                            .map(|(name, _size)| snapshot_dir.join(name)),
+                    );
+                }
+                Err(error) => {
+                    tracing::debug!(
+                        target: "cayenne::compaction",
+                        snapshot_id = snapshot_id.as_str(),
+                        %error,
+                        "skipping compaction input page-cache evict: could not list input files"
+                    );
+                }
+            }
+        }
+        if paths.is_empty() {
+            return;
+        }
+        super::fadvise_tier::evict_clean_files(paths).await;
+    }
+
     async fn list_snapshot_files_with_sizes_s3(
         &self,
         snapshot_id: &str,
@@ -12287,6 +12357,15 @@ impl CayenneTableProvider {
         self.retire_snapshot_dirs(old_ids.iter().map(String::as_str));
         self.sweep_retired_snapshot_dirs();
 
+        // Page-cache hygiene for the merged-away INPUTS (Tier 1): the merge just
+        // streamed them through the cache; now that the swap has superseded them
+        // and they are retired, drop their clean pages so live queries — not dead
+        // inputs awaiting the deferred sweep — own the cache. After the swap, so
+        // new scans already see the merged output. Linux + local; best-effort.
+        if !is_s3 {
+            self.evict_compaction_input_pages(&old_ids).await;
+        }
+
         tracing::info!(
             target: "cayenne::compaction",
             table = self.table_metadata.table_name.as_str(),
@@ -12807,6 +12886,13 @@ impl CayenneTableProvider {
         self.retire_snapshot_dirs(old_ids.iter().map(String::as_str));
         self.sweep_retired_snapshot_dirs();
 
+        // Page-cache hygiene for the merged-away INPUTS (Tier 1) — see the
+        // size-tier path. After the swap + retire so new scans see the merged
+        // output; drops the inputs' clean pages the bake just read. Best-effort.
+        if !is_s3 {
+            self.evict_compaction_input_pages(&old_ids).await;
+        }
+
         Ok(true)
     }
 
@@ -12872,6 +12958,58 @@ impl CayenneTableProvider {
             SessionConfig::default(),
             Arc::clone(self.context.runtime_env()),
         )
+    }
+
+    /// Session context whose `file://` object store is the custom
+    /// [`super::compaction_writer::CompactionLocalStore`] (fallocate /
+    /// `bytes_per_sync` / `O_DIRECT`), scoped to THIS compaction-output write.
+    ///
+    /// Uses a private `RuntimeEnv` with a fresh object-store registry so the
+    /// override never touches the SHARED runtime's `file://` store that queries
+    /// and CDC appends use — only this `Maintenance`-class write is routed
+    /// through the custom writer. The query memory pool is shared so the encode
+    /// still respects `runtime.query.memory_limit`. Gated off by default; only
+    /// called when [`super::compaction_writer::config`] is enabled.
+    fn compaction_session_context(
+        &self,
+        cfg: super::compaction_writer::CompactionWriterConfig,
+    ) -> Result<SessionContext> {
+        use datafusion::execution::object_store::{
+            DefaultObjectStoreRegistry, ObjectStoreRegistry,
+        };
+        use datafusion::execution::runtime_env::RuntimeEnvBuilder;
+        use object_store::local::LocalFileSystem;
+
+        let shared = self.context.runtime_env();
+        let registry = Arc::new(DefaultObjectStoreRegistry::new());
+        // Inner store + root "/" mirror object_store's `LocalFileSystem::new()`
+        // mapping (object path = absolute fs path minus the leading slash), so
+        // reads/list/delete delegate identically to the default local store.
+        let inner: Arc<dyn object_store::ObjectStore> = Arc::new(LocalFileSystem::new());
+        let wrapped = Arc::new(super::compaction_writer::CompactionLocalStore::new(
+            inner,
+            std::path::PathBuf::from("/"),
+            cfg,
+        ));
+        let file_url = url::Url::parse("file:///").map_err(|source| Error::UrlParse {
+            url: "file:///".to_string(),
+            source,
+        })?;
+        registry.register_store(&file_url, wrapped);
+
+        let runtime_env = RuntimeEnvBuilder::default()
+            .with_object_store_registry(registry)
+            .with_memory_pool(Arc::clone(&shared.memory_pool))
+            .build_arc()
+            .map_err(|e| Error::Internal {
+                table: self.table_metadata.table_name.clone(),
+                message: format!("failed to build compaction-writer runtime env: {e}"),
+            })?;
+
+        Ok(SessionContext::new_with_config_rt(
+            SessionConfig::default(),
+            runtime_env,
+        ))
     }
 
     /// Spawn the single ordered background applier for `registry`, returning the
