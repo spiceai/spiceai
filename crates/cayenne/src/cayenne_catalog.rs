@@ -1719,6 +1719,62 @@ impl MetadataCatalog for CayenneCatalog {
             })
     }
 
+    // INVARIANT (orphaned-DV cleanup): this is a low-level pointer flip on the
+    // live catalog. Today it is only used as part of a wholesale, self-contained
+    // Acceleration Snapshot restore, which re-extracts the snapshot's OWN data and
+    // deletion-vector (`.arrow`) files and metastore before/around this flip and
+    // reloads the provider from scratch — so it never reuses the live table's files.
+    // The orphaned-DV cleanup (`CayenneTableProvider::sweep_orphaned_deletion_vectors`)
+    // relies on that: it deletes DV files once they are below the surviving-sequence
+    // floor. If this primitive is ever used to flip `current_snapshot_id` to an
+    // OLDER snapshot on a LIVE table WITHOUT re-extracting its files, that older
+    // state could reference DV files the sweep already deleted. Before doing so,
+    // either keep orphaned DVs alive longer or reject restoring below the cleanup
+    // point. See the matching note on `sweep_orphaned_deletion_vectors`.
+    async fn get_orphan_eligible_delete_files(
+        &self,
+        table_id: &str,
+        max_sequence: i64,
+        limit: usize,
+    ) -> CatalogResult<Vec<DeleteFile>> {
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        self.metastore
+            .query_helper(
+                QueryParams {
+                    sql: "SELECT delete_file_id, table_id, path, path_is_relative,
+                        format, delete_count, file_size_bytes, source_data_file_path, sequence_number,
+                        reinsert_sequence
+                 FROM cayenne_delete_file
+                 WHERE table_id = ?1 AND source_data_file_path IS NULL AND sequence_number <= ?2
+                 LIMIT ?3",
+                    params: vec![
+                        MetastoreValue::Text(table_id.to_string()),
+                        MetastoreValue::Integer(max_sequence),
+                        MetastoreValue::Integer(limit),
+                    ],
+                },
+                |row| {
+                    Ok(DeleteFile {
+                        delete_file_id: row.get_string(0)?,
+                        table_id: row.get_string(1)?,
+                        source_data_file_path: row.get_optional_string(7)?,
+                        path: row.get_string(2)?,
+                        path_is_relative: row.get_bool(3)?,
+                        format: row.get_string(4)?,
+                        delete_count: row.get_i64(5)?,
+                        file_size_bytes: row.get_i64(6)?,
+                        deletion_type: crate::metadata::DeletionType::default(),
+                        sequence_number: row.get_optional_i64(8)?.unwrap_or(0),
+                        reinsert_sequence: row.get_optional_i64(9)?,
+                    })
+                },
+            )
+            .await
+            .map_err(|e| CatalogError::FailedToGetTableDeleteFiles {
+                source: Box::new(e),
+            })
+    }
+
     async fn remove_delete_files(
         &self,
         table_id: &str,

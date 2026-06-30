@@ -54,5 +54,5 @@ pub(crate) use filter_exec::{
 };
 pub(crate) use vector_io::{
     DeletionIdentifier, DeletionVectorWriteResult, DeletionVectorWriteSpec, DeletionVectorWriter,
-    detect_deletion_type_and_read,
+    MissingKeyDeletionVector, detect_deletion_type_and_read,
 };
