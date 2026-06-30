@@ -345,6 +345,8 @@ async fn verify_aggregate_queries(
     key_space: i64,
     ctx_msg: &str,
 ) -> TestResult<()> {
+    const THRESH: i64 = 500_000;
+
     // Total row count must equal the number of live keys (no phantom/dup rows).
     let count = scalar_i64(ctx, &format!("SELECT COUNT(*) FROM {name}")).await?;
     assert_eq!(
@@ -360,7 +362,6 @@ async fn verify_aggregate_queries(
     assert_eq!(sum, expected_sum, "{ctx_msg}: SUM(value) mismatch");
 
     // Filtered count exercises a value predicate + pushdown.
-    const THRESH: i64 = 500_000;
     let filtered = scalar_i64(
         ctx,
         &format!("SELECT COUNT(*) FROM {name} WHERE value >= {THRESH}"),
@@ -403,8 +404,8 @@ enum Op {
 fn random_rows(rng: &mut Rng, key_space: i64, batch_size: i64) -> Vec<(i64, i64)> {
     let mut rows: Vec<(i64, i64)> = Vec::new();
     for _ in 0..batch_size.max(1) {
-        let k = rng.below(key_space as u64) as i64;
-        let v = rng.below(1_000_000) as i64;
+        let k = rng.below(key_space.cast_unsigned()).cast_signed();
+        let v = rng.below(1_000_000).cast_signed();
         // last-writer-wins within the batch (a batch may not repeat a PK)
         if let Some(slot) = rows.iter_mut().find(|(ek, _): &&mut (i64, i64)| *ek == k) {
             slot.1 = v;
@@ -421,7 +422,8 @@ fn gen_op(rng: &mut Rng, w: &OpWeights, key_space: i64, batch_size: i64) -> Op {
         total > 0,
         "OpWeights must have a positive total weight (else the workload runs no real ops)"
     );
-    let mut pick = rng.below(u64::from(total)) as u32;
+    let mut pick = u32::try_from(rng.below(u64::from(total)))
+        .expect("rng.below(total) is < total, which fits u32");
     for (weight, kind) in [
         (w.upsert, 0u8),
         (w.delete, 1),
@@ -436,7 +438,7 @@ fn gen_op(rng: &mut Rng, w: &OpWeights, key_space: i64, batch_size: i64) -> Op {
                     rows: random_rows(rng, key_space, batch_size),
                 },
                 1 => Op::Delete {
-                    key: rng.below(key_space as u64) as i64,
+                    key: rng.below(key_space.cast_unsigned()).cast_signed(),
                 },
                 2 => Op::DeleteAll,
                 3 => Op::Overwrite {
@@ -651,7 +653,7 @@ fn scaled_seeds(base: u64) -> u64 {
     base * env_scale("CAYENNE_PROPTEST_SCALE")
 }
 fn scaled_ops(base: usize) -> usize {
-    base * env_scale("CAYENNE_PROPTEST_OPS_SCALE") as usize
+    base * usize::try_from(env_scale("CAYENNE_PROPTEST_OPS_SCALE")).expect("scale fits usize")
 }
 
 // ============================================================================
@@ -875,7 +877,9 @@ async fn run_concurrent_reads_seed(fixture: &TestFixture, mode: Mode, seed: u64)
         while !read_stop.load(Ordering::Relaxed) {
             match read_rows(&read_ctx, &read_name).await {
                 Ok(live) => {
-                    if live.len() as i64 != n || (0..n).any(|k| !live.contains_key(&k)) {
+                    if i64::try_from(live.len()).expect("live len fits i64") != n
+                        || (0..n).any(|k| !live.contains_key(&k))
+                    {
                         violation =
                             Some(format!("torn read: saw {} rows (expected {n})", live.len()));
                         break;
@@ -894,7 +898,7 @@ async fn run_concurrent_reads_seed(fixture: &TestFixture, mode: Mode, seed: u64)
     for _ in 0..150 {
         let rows: Vec<(i64, i64)> = keyset
             .iter()
-            .map(|&k| (k, rng.below(1_000_000) as i64))
+            .map(|&k| (k, rng.below(1_000_000).cast_signed()))
             .collect();
         overwrite(&table, &rows).await?;
         tokio::time::sleep(std::time::Duration::from_millis(1)).await;
@@ -911,7 +915,7 @@ async fn run_concurrent_reads_seed(fixture: &TestFixture, mode: Mode, seed: u64)
 
     let live = read_rows(&ctx, &name).await?;
     assert_eq!(
-        live.len() as i64,
+        i64::try_from(live.len()).expect("live len fits i64"),
         n,
         "final row count must be N (mode={mode:?})"
     );
