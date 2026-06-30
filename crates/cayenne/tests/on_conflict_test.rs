@@ -299,7 +299,8 @@ async fn test_upsert_in_batch_duplicate_keeps_last_impl(
         .collect()
         .await?;
 
-    let rows = collect_id_name(&ctx, "SELECT id, name FROM upsert_in_batch_dup ORDER BY id").await?;
+    let rows =
+        collect_id_name(&ctx, "SELECT id, name FROM upsert_in_batch_dup ORDER BY id").await?;
     assert_eq!(
         rows,
         vec![(1, "b".to_string())],
@@ -359,8 +360,11 @@ async fn test_do_nothing_in_batch_duplicate_keeps_first_impl(
         .collect()
         .await?;
 
-    let rows =
-        collect_id_name(&ctx, "SELECT id, name FROM do_nothing_in_batch_dup ORDER BY id").await?;
+    let rows = collect_id_name(
+        &ctx,
+        "SELECT id, name FROM do_nothing_in_batch_dup ORDER BY id",
+    )
+    .await?;
     assert_eq!(
         rows,
         vec![(1, "a".to_string())],
@@ -438,10 +442,7 @@ async fn test_upsert_in_batch_duplicate_composite_pk_impl(
     }
     assert_eq!(
         rows,
-        vec![
-            ("EU".to_string(), 1, 300),
-            ("US".to_string(), 1, 200),
-        ],
+        vec![("EU".to_string(), 1, 300), ("US".to_string(), 1, 200),],
         "composite-PK in-batch dedup collapses only the full-key duplicate, keep-last"
     );
     Ok(())

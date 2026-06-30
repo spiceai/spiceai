@@ -141,7 +141,8 @@ async fn rows_k_sum(ctx: &SessionContext, sql: &str) -> TestResult<Vec<(i64, i64
 
 async fn maintained_aggregate_pushed_filter_impl(fixture: TestFixture) -> TestResult<()> {
     let ctx = cayenne_ctx();
-    let catalog: Arc<dyn MetadataCatalog> = Arc::clone(&fixture.catalog) as Arc<dyn MetadataCatalog>;
+    let catalog: Arc<dyn MetadataCatalog> =
+        Arc::clone(&fixture.catalog) as Arc<dyn MetadataCatalog>;
 
     // 1) Create an upsert (Int64-PK) table, FILE-backed (`inline_max_rows: 0`), so
     //    the pushed predicate lands on a file source.
@@ -149,7 +150,9 @@ async fn maintained_aggregate_pushed_filter_impl(fixture: TestFixture) -> TestRe
         table_name: TABLE.to_string(),
         schema: table_schema(),
         primary_key: vec!["id".to_string()],
-        on_conflict: Some(OnConflict::Upsert(ColumnReference::new(vec!["id".to_string()]))),
+        on_conflict: Some(OnConflict::Upsert(ColumnReference::new(vec![
+            "id".to_string(),
+        ]))),
         base_path: fixture.data_path.to_string_lossy().to_string(),
         partition_column: None,
         vortex_config: VortexConfig {
@@ -158,7 +161,8 @@ async fn maintained_aggregate_pushed_filter_impl(fixture: TestFixture) -> TestRe
         },
     };
     let table = Arc::new(
-        CayenneTableProvider::create_table(Arc::clone(&catalog), options, ctx.runtime_env()).await?,
+        CayenneTableProvider::create_table(Arc::clone(&catalog), options, ctx.runtime_env())
+            .await?,
     );
 
     // 2) Insert two groups, each with one row below and one at/above the threshold.
@@ -243,15 +247,20 @@ test_with_backends!(maintained_aggregate_pushed_filter_impl);
 /// stays open on exactly the merge-on-read CDC tables maintained views target. This
 /// asserts the DEEP walk closes it (Gate C) AND that a deletion filter alone (no
 /// query predicate) does NOT over-decline the view (Gate A).
-async fn maintained_aggregate_pushed_filter_with_deletes_impl(fixture: TestFixture) -> TestResult<()> {
+async fn maintained_aggregate_pushed_filter_with_deletes_impl(
+    fixture: TestFixture,
+) -> TestResult<()> {
     let ctx = cayenne_ctx();
-    let catalog: Arc<dyn MetadataCatalog> = Arc::clone(&fixture.catalog) as Arc<dyn MetadataCatalog>;
+    let catalog: Arc<dyn MetadataCatalog> =
+        Arc::clone(&fixture.catalog) as Arc<dyn MetadataCatalog>;
 
     let options = CreateTableOptions {
         table_name: TABLE_DEL.to_string(),
         schema: table_schema(),
         primary_key: vec!["id".to_string()],
-        on_conflict: Some(OnConflict::Upsert(ColumnReference::new(vec!["id".to_string()]))),
+        on_conflict: Some(OnConflict::Upsert(ColumnReference::new(vec![
+            "id".to_string(),
+        ]))),
         base_path: fixture.data_path.to_string_lossy().to_string(),
         partition_column: None,
         vortex_config: VortexConfig {
@@ -260,7 +269,8 @@ async fn maintained_aggregate_pushed_filter_with_deletes_impl(fixture: TestFixtu
         },
     };
     let table = Arc::new(
-        CayenneTableProvider::create_table(Arc::clone(&catalog), options, ctx.runtime_env()).await?,
+        CayenneTableProvider::create_table(Arc::clone(&catalog), options, ctx.runtime_env())
+            .await?,
     );
 
     // Same four rows + a fifth (id=5, k=10, v=999) that we DELETE, so the table

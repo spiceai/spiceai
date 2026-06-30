@@ -20334,7 +20334,8 @@ impl super::compaction::CompactionRunner for CayenneTableProvider {
         let key_mode = !self.should_capture_positions();
         let over_mem_ceiling = key_mode && self.deletion_index_over_memory_ceiling();
         if key_mode
-            && (deletion_index_len >= self.context.bake_deletion_index_trigger() || over_mem_ceiling)
+            && (deletion_index_len >= self.context.bake_deletion_index_trigger()
+                || over_mem_ceiling)
         {
             // Apply-back-pressure gate: the bake's merge (re-encode survivors +
             // publish) competes with the CDC apply for the same write path

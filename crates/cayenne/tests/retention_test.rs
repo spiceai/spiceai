@@ -704,8 +704,7 @@ async fn test_time_retention_keeps_null_timestamps_impl(
         assert_eq!(inserted, 1, "Should insert 1 row for id={id}");
     }
 
-    let query_ctx =
-        SessionContext::new_with_config_rt(SessionConfig::new(), ctx.runtime_env());
+    let query_ctx = SessionContext::new_with_config_rt(SessionConfig::new(), ctx.runtime_env());
     query_ctx.register_table(
         "time_retention_null",
         Arc::clone(&table_provider) as Arc<dyn TableProvider>,
