@@ -9636,11 +9636,20 @@ impl CayenneTableProvider {
 
         let table = self.clone_for_write();
         super::compaction::spawn_compaction(async move {
+            // Clear the coalescing flag on ANY exit — normal completion, early
+            // return, a panic during unwind, or the task being dropped on abort —
+            // so a stuck flag can never permanently suppress future sweeps on a
+            // long-lived provider.
+            struct ClearOnDrop(Arc<AtomicBool>);
+            impl Drop for ClearOnDrop {
+                fn drop(&mut self) {
+                    self.0.store(false, Ordering::Release);
+                }
+            }
+            let _clear = ClearOnDrop(Arc::clone(&table.orphan_dv_sweep_scheduled));
+
             tokio::task::yield_now().await;
             table.sweep_orphaned_deletion_vectors().await;
-            table
-                .orphan_dv_sweep_scheduled
-                .store(false, Ordering::Release);
         });
     }
 
