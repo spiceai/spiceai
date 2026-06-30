@@ -596,8 +596,12 @@ impl DataAccelerator for DuckDBAccelerator {
                         if engine_str != "duckdb" {
                             return None;
                         }
-                        let mode_str = format!("{:?}", acceleration.mode).to_lowercase();
-                        if !matches!(mode_str.as_str(), "file" | "file_create" | "file_update") {
+                        if !matches!(
+                            acceleration.mode,
+                            spicepod::acceleration::Mode::File
+                                | spicepod::acceleration::Mode::FileCreate
+                                | spicepod::acceleration::Mode::FileUpdate
+                        ) {
                             return None;
                         }
                         // Compute the DuckDB file path from spicepod params

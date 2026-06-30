@@ -144,6 +144,18 @@ impl From<runtime_acceleration::AccelerationParseError> for Error {
             AccelerationParseError::MultipleRefreshExpressionSpecified => {
                 Error::MultipleRefreshExpressionSpecified
             }
+            AccelerationParseError::IndexColumnNotFound { index, valid_columns } => {
+                Error::IndexColumnNotFound { index, valid_columns }
+            }
+            AccelerationParseError::PrimaryKeyColumnNotFound { invalid_column, valid_columns } => {
+                Error::PrimaryKeyColumnNotFound { invalid_column, valid_columns }
+            }
+            AccelerationParseError::UnableToGetTableConstraints { source } => {
+                Error::UnableToGetTableConstraints { source }
+            }
+            AccelerationParseError::OnConflictTargetMismatch { extra_detail } => {
+                Error::OnConflictTargetMismatch { extra_detail }
+            }
             _ => Error::InvalidConfiguration {
                 config_key: "acceleration".into(),
                 message: e.to_string(),
