@@ -73,7 +73,7 @@ test_with_backends!(test_file_based_retention_targeted_cache_invalidation_impl);
 
 /// Test: File-based retention physically deletes files that are fully expired.
 ///
-/// Setup (3-second retention, position-based / no PK):
+/// Setup (5-second retention, position-based / no PK):
 ///   - file 1: `event_time` = now           → fresh (kept)
 ///   - file 2: `event_time` = now - 2s      → within retention (kept)
 ///   - file 3: `event_time` = now - 10s     → expired (deleted)
@@ -81,11 +81,11 @@ test_with_backends!(test_file_based_retention_targeted_cache_invalidation_impl);
 /// Steps:
 /// 1. Insert 3 batches (separate Vortex files).
 /// 2. Verify 3 `.vortex` files exist on disk.
-/// 3. Call `delete_from` with `event_time < cutoff` (cutoff = now - 3s).
+/// 3. Call `delete_from` with `event_time < cutoff` (cutoff = now - 5s).
 /// 4. Verify only 2 `.vortex` files remain.
 /// 5. Verify count(*) = 2 and ids = [1, 2].
 async fn test_file_based_retention_deletes_expired_files_impl(fixture: TestFixture) -> TestResult {
-    let retention_seconds = 3;
+    let retention_seconds = 5;
     let table_name = "file_ret_delete";
     let ctx = SessionContext::new();
     let table =
@@ -94,7 +94,7 @@ async fn test_file_based_retention_deletes_expired_files_impl(fixture: TestFixtu
     // Insert each row as a separate batch → separate Vortex file.
     let now_us = chrono::Utc::now().timestamp_micros();
     insert_row(&table, 1, now_us).await?; // fresh
-    insert_row(&table, 2, now_us - 2_000_000).await?; // 2s ago — within retention
+    insert_row(&table, 2, now_us - 2_000_000).await?; // 2s ago — within retention (3s margin)
     insert_row(&table, 3, now_us - 10_000_000).await?; // 10s ago — expired
 
     let dir = table_id_dir(&fixture, &table, table_name);
@@ -396,7 +396,7 @@ async fn test_cache_delta_applied_after_append_impl(fixture: TestFixture) -> Tes
 async fn test_file_based_retention_targeted_cache_invalidation_impl(
     fixture: TestFixture,
 ) -> TestResult {
-    let retention_seconds = 3;
+    let retention_seconds = 5;
     let table_name = "cache_inv_delete";
     let ctx = SessionContext::new();
     let runtime_env = ctx.runtime_env();
@@ -411,7 +411,7 @@ async fn test_file_based_retention_targeted_cache_invalidation_impl(
     // Insert 3 rows as separate files
     let now_us = chrono::Utc::now().timestamp_micros();
     insert_row(&table, 1, now_us).await?; // fresh
-    insert_row(&table, 2, now_us - 2_000_000).await?; // 2s ago — within retention
+    insert_row(&table, 2, now_us - 2_000_000).await?; // 2s ago — within retention (3s margin)
     insert_row(&table, 3, now_us - 10_000_000).await?; // 10s ago — expired
 
     // Query to populate the list-files cache.
@@ -539,14 +539,14 @@ async fn test_file_based_retention_targeted_cache_invalidation_impl(
 /// but using the `Int64Pk` deletion strategy. No protected snapshots exist
 /// because no upserts have been performed.
 ///
-/// Setup (3-second retention, Int64 PK, `on_conflict`: None):
+/// Setup (5-second retention, Int64 PK, `on_conflict`: None):
 ///   - file 1: `event_time` = now           → fresh (kept)
 ///   - file 2: `event_time` = now - 2s      → within retention (kept)
 ///   - file 3: `event_time` = now - 10s     → expired (deleted)
 ///
 /// After deletion: 2 files remain, count(*) = 2, ids = [1, 2].
 async fn test_pk_file_based_retention_main_table_only_impl(fixture: TestFixture) -> TestResult {
-    let retention_seconds = 3;
+    let retention_seconds = 5;
     let table_name = "pk_file_ret_main";
     let ctx = SessionContext::new();
     let table = create_pk_retention_table(
@@ -561,7 +561,7 @@ async fn test_pk_file_based_retention_main_table_only_impl(fixture: TestFixture)
 
     let now_us = chrono::Utc::now().timestamp_micros();
     insert_row(&table, 1, now_us).await?; // fresh
-    insert_row(&table, 2, now_us - 2_000_000).await?; // 2s ago — within retention
+    insert_row(&table, 2, now_us - 2_000_000).await?; // 2s ago — within retention (3s margin)
     insert_row(&table, 3, now_us - 10_000_000).await?; // 10s ago — expired
 
     let dir = table_id_dir(&fixture, &table, table_name);
