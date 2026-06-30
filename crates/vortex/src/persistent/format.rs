@@ -1010,7 +1010,7 @@ mod tests {
     /// projected columns' bytes rather than the full unprojected row width.
     #[tokio::test]
     async fn propagates_per_column_byte_size() -> anyhow::Result<()> {
-        let ctx = TestSessionContext::default();
+        let ctx = TestSessionContext::new(true);
 
         // Wide schema: fixed-width Int, a narrow Utf8, and a FAT Utf8 (`data`)
         // standing in for a `VARCHAR(500)`-style column.
