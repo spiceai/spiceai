@@ -19,3 +19,4 @@ serde_json.workspace = true
 spicepod = { path = "../../crates/spicepod" }
 tiktoken-rs = "0.9.1"
 tokenizers = { workspace = true, features = ["http"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

@@ -16,6 +16,7 @@ limitations under the License.
 
 #![allow(clippy::missing_errors_doc)]
 
+use async_trait::async_trait;
 use bytes::Bytes;
 use snafu::prelude::*;
 use std::{
@@ -86,8 +87,9 @@ pub trait DocumentParserFactory: Send + Sync {
     fn as_any(&self) -> &dyn Any;
 }
 
+#[async_trait]
 pub trait DocumentParser: Send + Sync {
-    fn parse(&self, raw: &Bytes) -> Result<Arc<dyn Document>>;
+    async fn parse(&self, raw: &Bytes) -> Result<Arc<dyn Document>>;
 }
 
 pub trait Document {

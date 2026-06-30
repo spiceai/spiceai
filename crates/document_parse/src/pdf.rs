@@ -15,6 +15,7 @@ limitations under the License.
 */
 
 use bytes::Bytes;
+use liteparse::{LiteParse, LiteParseConfig, OutputFormat, types::PdfInput};
 use snafu::ResultExt;
 use std::{any::Any, collections::HashMap, sync::Arc};
 
@@ -47,14 +48,24 @@ impl PdfParser {
     }
 }
 
+#[async_trait::async_trait]
 impl DocumentParser for PdfParser {
-    fn parse(&self, raw: &Bytes) -> Result<Arc<dyn Document>> {
-        let doc =
-            pdf_extract::extract_text_from_mem(raw)
-                .boxed()
-                .context(InternalParsingSnafu {
-                    format: DocumentType::Pdf,
-                })?;
+    async fn parse(&self, raw: &Bytes) -> Result<Arc<dyn Document>> {
+        let config = LiteParseConfig {
+            ocr_enabled: false,
+            output_format: OutputFormat::Text,
+            quiet: true,
+            ..Default::default()
+        };
+
+        let doc = LiteParse::new(config)
+            .parse_input(PdfInput::Bytes(raw.to_vec()))
+            .await
+            .map(|parsed| parsed.text)
+            .boxed()
+            .context(InternalParsingSnafu {
+                format: DocumentType::Pdf,
+            })?;
         Ok(Arc::new(PdfDocument { doc }))
     }
 }
