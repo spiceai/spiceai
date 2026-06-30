@@ -95,8 +95,8 @@ use datafusion_catalog::{Session, TableProvider};
 use datafusion_common::stats::Precision as DFPrecision;
 use datafusion_common::tree_node::TreeNode;
 use datafusion_common::{
-    ColumnStatistics, Constraints, DFSchema, Result as DataFusionResult, ScalarValue, Statistics,
-    project_schema,
+    ColumnStatistics, Constraints, DFSchema, DataFusionError, Result as DataFusionResult,
+    ScalarValue, Statistics, project_schema,
 };
 use datafusion_datasource::file::FileSource;
 use datafusion_datasource::file_groups::FileGroup;
@@ -138,6 +138,7 @@ use vortex_datafusion::VortexFormat;
 use vortex_datafusion::VortexSource;
 use vortex_datafusion::WriteShardConfig;
 
+use super::compaction::{FileEntry, pick_candidates};
 use super::context::CayenneContext;
 use super::deletion_index::{DeletionIndex, KeyDeletionIndex};
 use super::deletion_strategy::{
@@ -1284,6 +1285,13 @@ pub struct CayenneTableProvider {
     /// Reset to 0 after a compaction rewrite. Conservative: can only cause
     /// extra listings, never missed compactions.
     new_files_since_last_compaction: Arc<AtomicUsize>,
+    /// Monotonic *version stamp* for the current snapshot directory's file set
+    /// (NOT a file count). Bumped by one on every current-dir publish in
+    /// [`Self::publish_current_snapshot_files_changed_under_held_fence`]
+    ///
+    /// Unlike [`Self::new_files_since_last_compaction`] this tracks ONLY
+    /// current-dir changes.
+    current_dir_generation: Arc<AtomicU64>,
     /// Side-channel carrying `(snapshot_id, ObjectMeta of moved files)` from a
     /// current-snapshot staged move, so the next
     /// `publish_current_snapshot_files_changed_under_held_fence` can DELTA-APPLY
@@ -4193,6 +4201,7 @@ impl CayenneTableProvider {
                 ResourceStarvationTracker::new(POSITION_COMPACTION_SKIP_WARN_AFTER),
             )),
             new_files_since_last_compaction: Arc::new(AtomicUsize::new(0)),
+            current_dir_generation: Arc::new(AtomicU64::new(0)),
             last_moved_snapshot_files: Arc::new(ParkingMutex::new(None)),
             compaction_lock: Arc::new(tokio::sync::Mutex::new(())),
             post_write_compaction_scheduled: Arc::new(AtomicBool::new(false)),
@@ -4933,6 +4942,7 @@ impl CayenneTableProvider {
             snapshot_scan_refs: Arc::clone(&self.snapshot_scan_refs),
             position_compaction_skip_streak: Arc::clone(&self.position_compaction_skip_streak),
             new_files_since_last_compaction: Arc::clone(&self.new_files_since_last_compaction),
+            current_dir_generation: Arc::clone(&self.current_dir_generation),
             // Shared so a writer clone's move records the published files where the
             // (same-table) publish on any clone can delta-apply them.
             last_moved_snapshot_files: Arc::clone(&self.last_moved_snapshot_files),
@@ -6508,6 +6518,75 @@ impl CayenneTableProvider {
         let mut deleted_row_keys: Vec<Box<[u8]>> = Vec::new();
         let mut deleted_inlined_pk_i64: Vec<i64> = Vec::new();
         let mut deleted_inlined_row_keys: Vec<Box<[u8]>> = Vec::new();
+        // Reinsert-over-tombstone resurrections recorded below — counted once per
+        // key so `total_superseded` can exclude them from the live-row delta (a
+        // resurrection adds a live row, it does not supersede one).
+        let mut reinserted_over_tombstone: usize = 0;
+
+        // Re-insert-over-tombstone probe (upsert correctness): a key may be ABSENT
+        // from the visible existence index yet still carry a pending DELETE
+        // tombstone — e.g. after `INSERT OVERWRITE` clears the PK keyset and a
+        // later `DELETE` leaves a tombstone. A plain insert for such a key would
+        // stay hidden forever (a row is visible iff `insert_seq > delete_seq`, and
+        // a plain insert records no `insert_seq`). When this table has pending
+        // deletions, snapshot the deletion index once so the per-row `else` branch
+        // below can detect those keys and route them through the on-conflict
+        // re-insert path (which records an `insert_seq` that supersedes the
+        // tombstone). Gated on `Upsert` + `has_pending_deletions()` so there is no
+        // cost on the common no-pending-deletes path.
+        let reinsert_over_tombstone: Option<PkDeletionSnapshot> =
+            if matches!(ctx.on_conflict, OnConflict::Upsert(_)) && self.has_pending_deletions() {
+                Some(pk_deletion_snapshot_for_strategy(
+                    &self.pk_deletion_strategy,
+                ))
+            } else {
+                None
+            };
+
+        // Route a key with NO live existence-index entry but a pending DELETE
+        // tombstone through the on-conflict re-insert path so the new row gets an
+        // `insert_seq` that supersedes the tombstone. Shared by the `Exact`-miss
+        // and `Bloom`-miss paths below: both are "this key is not known live", so
+        // a tombstone is the only reason to record an insert-record — without it
+        // the re-inserted row stays permanently hidden. Pushes to BOTH a file and
+        // an inline list (mirroring the conflict path, so the prior version is
+        // masked wherever it lives) but counts the key once via
+        // `reinserted_over_tombstone` so `total_superseded` nets the resurrection
+        // out of the live-row delta (a resurrection adds a live row; it supersedes
+        // none). A no-op (no tombstone snapshot, or key not tombstoned).
+        let probe_reinsert_over_tombstone =
+            |row_idx: usize,
+             key: &OwnedRow,
+             deleted_pk_i64: &mut Vec<i64>,
+             deleted_inlined_pk_i64: &mut Vec<i64>,
+             deleted_row_keys: &mut Vec<Box<[u8]>>,
+             deleted_inlined_row_keys: &mut Vec<Box<[u8]>>,
+             reinserted_over_tombstone: &mut usize| {
+                let Some(snapshot) = &reinsert_over_tombstone else {
+                    return;
+                };
+                match snapshot {
+                    PkDeletionSnapshot::Int64Pk { tombstones } => {
+                        if let Some(arr) = int64_pk_array {
+                            let value = arr.value(row_idx);
+                            if tombstones.get(value).is_some() {
+                                deleted_pk_i64.push(value);
+                                deleted_inlined_pk_i64.push(value);
+                                *reinserted_over_tombstone += 1;
+                            }
+                        }
+                    }
+                    PkDeletionSnapshot::RowConverterBased { tombstones } => {
+                        if tombstones.get(key.as_ref()).is_some() {
+                            let row_key = key.as_ref().to_vec().into_boxed_slice();
+                            deleted_row_keys.push(row_key.clone());
+                            deleted_inlined_row_keys.push(row_key);
+                            *reinserted_over_tombstone += 1;
+                        }
+                    }
+                    PkDeletionSnapshot::PositionBased => {}
+                }
+            };
 
         // Hoist the PK-null check out of the per-row loop: an Arrow column with no
         // null buffer reports `null_count() == 0` in O(1), so when no PK column is
@@ -6594,6 +6673,19 @@ impl CayenneTableProvider {
                             }
                         }
                     } else {
+                        // Key has no live existence-index entry. If it still
+                        // carries a pending DELETE tombstone this is a reinsert
+                        // over that tombstone — route it so the new row supersedes
+                        // it (otherwise it stays permanently hidden).
+                        probe_reinsert_over_tombstone(
+                            row_idx,
+                            &key,
+                            &mut deleted_pk_i64,
+                            &mut deleted_inlined_pk_i64,
+                            &mut deleted_row_keys,
+                            &mut deleted_inlined_row_keys,
+                            &mut reinserted_over_tombstone,
+                        );
                         true
                     }
                 }
@@ -6626,6 +6718,24 @@ impl CayenneTableProvider {
                             }
                             PkDeletionStrategyWithCache::PositionBased { .. } => {}
                         }
+                    } else {
+                        // Bloom MISS ⇒ key is definitely not live (blooms have no
+                        // false negatives). But an over-budget table can still hold
+                        // a pending DELETE tombstone for it (e.g. reinsert after a
+                        // delete), and the plain-insert path records no
+                        // `insert_seq`, so the row would stay hidden. Probe for that
+                        // tombstone and route the reinsert, same as the `Exact`-miss
+                        // path — otherwise the resurrection bug recurs on the bloom
+                        // fallback.
+                        probe_reinsert_over_tombstone(
+                            row_idx,
+                            &key,
+                            &mut deleted_pk_i64,
+                            &mut deleted_inlined_pk_i64,
+                            &mut deleted_row_keys,
+                            &mut deleted_inlined_row_keys,
+                            &mut reinserted_over_tombstone,
+                        );
                     }
                     true
                 }
@@ -6684,6 +6794,7 @@ impl CayenneTableProvider {
             deleted_row_keys,
             deleted_inlined_pk_i64,
             deleted_inlined_row_keys,
+            reinserted_over_tombstone,
         })
     }
 
@@ -6808,6 +6919,7 @@ impl CayenneTableProvider {
         let mut deleted_row_keys: Vec<Box<[u8]>> = Vec::new();
         let mut deleted_inlined_pk_i64: Vec<i64> = Vec::new();
         let mut deleted_inlined_row_keys: Vec<Box<[u8]>> = Vec::new();
+        let mut reinserted_over_tombstone: usize = 0;
         let mut kept_keys: HashSet<OwnedRow> = HashSet::new();
         let mut filtered_batches: Vec<RecordBatch> = Vec::new();
 
@@ -6872,6 +6984,7 @@ impl CayenneTableProvider {
             deleted_row_keys.extend(result.deleted_row_keys);
             deleted_inlined_pk_i64.extend(result.deleted_inlined_pk_i64);
             deleted_inlined_row_keys.extend(result.deleted_inlined_row_keys);
+            reinserted_over_tombstone += result.reinserted_over_tombstone;
             incoming_keys.extend(result.kept_keys.iter().cloned());
             kept_keys.extend(result.kept_keys);
             if let Some(fb) = result.filtered_batch
@@ -6889,6 +7002,7 @@ impl CayenneTableProvider {
                 deleted_row_keys,
                 deleted_inlined_pk_i64,
                 deleted_inlined_row_keys,
+                reinserted_over_tombstone,
             },
             kept_keys,
         ))
@@ -7967,6 +8081,8 @@ impl CayenneTableProvider {
             deleted_row_keys,
             deleted_inlined_pk_i64,
             deleted_inlined_row_keys,
+            // Already folded into `superseded` above; not needed past this point.
+            reinserted_over_tombstone: _,
         } = on_conflict_deletions;
 
         // Inline-bearing batches now STAGE inert (Option D): the tombstone is
@@ -8564,6 +8680,9 @@ impl CayenneTableProvider {
             deleted_row_keys,
             deleted_inlined_pk_i64,
             deleted_inlined_row_keys,
+            // Live-row-delta accounting only (see `total_superseded`); the actual
+            // delete/reinsert I/O below works off the key lists.
+            reinserted_over_tombstone: _,
         } = on_conflict_deletions;
 
         let has_file_key_deletions = !deleted_pk_i64.is_empty() || !deleted_row_keys.is_empty();
@@ -9227,7 +9346,7 @@ impl CayenneTableProvider {
         // currently visible rows. The rewrite commit clears deletion/protected
         // snapshot state, so the input stream must have already applied it.
         let ctx = self.create_session_context();
-        let stream = self.visible_file_stream_for_rewrite(&ctx).await?;
+        let (stream, _) = self.visible_file_stream_for_rewrite(&ctx).await?;
 
         // Sort the stream using our existing sort logic
         let sorted_stream = self.sort_stream(stream)?;
@@ -9442,6 +9561,109 @@ impl CayenneTableProvider {
         }
 
         Ok(total_passes > 0)
+    }
+
+    fn new_current_files_above_compaction_threshold(&self) -> bool {
+        let cfg = self.context.compaction_picker_config();
+        self.new_files_since_last_compaction.load(Ordering::Relaxed) > cfg.trigger_files
+    }
+
+    /// Compact current snapshot files into a new snapshot dir, with atomic,
+    /// **concurrent-append-guarded** pointer flip.
+    ///
+    /// New files added to the current snapshot dir during compaction trigger
+    /// a pointer flip abort.
+    ///
+    /// Returns `Ok(true)` if a compaction committed, `Ok(false)` on any no-op
+    /// (nothing accumulated, no qualifying small-file tier, lock busy, inflight
+    /// staged append, or a concurrent-append abort).
+    ///
+    // Long-term (not yet implemented): instead of re-encoding the
+    // whole snapshot and aborting on a concurrent append, re-encode only the
+    // picked small-file subset and hard-link (local) / `CopyObject` (S3) the
+    // un-picked settled files — and the concurrently-appended files — into the
+    // new dir.
+    #[doc(hidden)]
+    pub async fn compact_current_snapshot_small_files(&self) -> Result<bool> {
+        // A staged append is mid-finalization; files would be neither cleanly in
+        //  nor out of our scan.
+        if self.has_inflight_staging_appends() {
+            return Ok(false);
+        }
+
+        if !self.new_current_files_above_compaction_threshold() {
+            return Ok(false);
+        }
+
+        // Position-delete-mode tables: serialize against writers + visibility
+        // flips for the whole pass, identical to the protected-snapshot subset
+        // path. Their position tombstones are file-path scoped and the
+        // append-counter guard does not observe deletes, so a full re-encode must
+        // run without a concurrent writer. A continuously-writing position table
+        // simply skips this pass (its protected-snapshot path still compacts).
+        let (_position_write_guard, _position_visibility_guard) = if self.should_capture_positions()
+        {
+            let Ok(guard) = self.write_lock_arc().try_lock_owned() else {
+                tracing::trace!(
+                    target: "cayenne::compaction",
+                    table = self.table_metadata.table_name.as_str(),
+                    "Skipping current-snapshot small-file compaction: writer active on position-delete table",
+                );
+                return Ok(false);
+            };
+            (
+                Some(guard),
+                Some(self.visibility_lock_arc().lock_owned().await),
+            )
+        } else {
+            (None, None)
+        };
+
+        let Ok(_guard) = self.compaction_lock.try_lock() else {
+            tracing::trace!(
+                target: "cayenne::compaction",
+                table = self.table_metadata.table_name.as_str(),
+                "Skipping current-snapshot small-file compaction: another pass already running",
+            );
+            return Ok(false);
+        };
+
+        let cfg = self.context.compaction_picker_config();
+
+        // Pick over the CURRENT snapshot's files only (not the protected set):
+        // this trigger is about current-dir small-file accumulation. If no tier
+        // has enough small files, there is nothing to consolidate.
+        let snapshot_id = self.get_current_snapshot_id();
+        let files = self.list_snapshot_files_with_sizes(&snapshot_id).await?;
+        if files.len() < 2 {
+            return Ok(false);
+        }
+        let Some(candidate) = pick_candidates(
+            files.iter().map(|(path, size)| FileEntry {
+                path: path.as_str(),
+                size_bytes: *size,
+            }),
+            &cfg,
+        ) else {
+            return Ok(false);
+        };
+
+        self.log_snapshot_maintenance_trigger(SnapshotMaintenanceTrigger::SmallFileCount {
+            number_picker_candidate_files: candidate.paths.len(),
+            compaction_trigger_files: cfg.trigger_files,
+        });
+        tracing::debug!(
+            target: "cayenne::compaction",
+            table = self.table_metadata.table_name.as_str(),
+            tier = candidate.tier.as_str(),
+            picked_files = candidate.paths.len(),
+            picked_bytes = candidate.total_bytes,
+            total_files = files.len(),
+            "Running current-snapshot small-file compaction"
+        );
+
+        // Full re-encode into a fresh snapshot with the concurrent-append guard.
+        self.rewrite_current_snapshot_for_compaction_tracked().await
     }
 
     pub(crate) fn schedule_post_write_compaction(&self) {
@@ -9808,7 +10030,6 @@ impl CayenneTableProvider {
     ///
     /// Returns `Ok(true)` if the pass produced a new snapshot.
     async fn run_one_compaction_pass(&self) -> Result<bool> {
-        use super::compaction::{FileEntry, pick_candidates};
         let pass_start = std::time::Instant::now();
 
         if self.has_inflight_staging_appends() {
@@ -9972,6 +10193,16 @@ impl CayenneTableProvider {
                 oldest_snapshot_age_ms = duration_millis_saturating(oldest_snapshot_age),
                 trigger_age_ms = duration_millis_saturating(trigger_age),
                 "Running protected snapshot maintenance compaction because the age trigger fired"
+            ),
+            SnapshotMaintenanceTrigger::SmallFileCount {
+                number_picker_candidate_files: files,
+                compaction_trigger_files: trigger,
+            } => tracing::info!(
+                target: "cayenne::compaction",
+                table = self.table_metadata.table_name.as_str(),
+                small_files = files,
+                trigger,
+                "Running current-snapshot compaction because the small-file count trigger fired"
             ),
         }
     }
@@ -10584,10 +10815,9 @@ impl CayenneTableProvider {
     /// count doubles as the pass counter) and, on a memory-exhaustion failure,
     /// the dedicated-pool exhaustion counter. This is the single entry point the
     /// background and post-write compaction triggers call.
-    async fn rewrite_current_snapshot_for_compaction_tracked(&self) -> Result<()> {
+    async fn rewrite_current_snapshot_for_compaction_tracked(&self) -> Result<bool> {
         let pass_start = Instant::now();
         let result = self.rewrite_current_snapshot_for_compaction().await;
-
         let table = self.table_metadata.table_name.clone();
         let result_label = if result.is_ok() {
             "completed"
@@ -10602,13 +10832,12 @@ impl CayenneTableProvider {
                 telemetry::KeyValue::new("result", result_label),
             ],
         );
-        if let Err(e) = &result
-            && matches!(
-                e,
-                Error::DataFusion { source }
-                    if matches!(source, datafusion_common::DataFusionError::ResourcesExhausted(_))
-            )
-        {
+        if matches!(
+            &result,
+            Result::Err(Error::DataFusion {
+                source: DataFusionError::ResourcesExhausted(_)
+            })
+        ) {
             telemetry::track_cayenne_compaction_memory_exhausted(&[
                 telemetry::KeyValue::new("table", table),
                 telemetry::KeyValue::new("kind", "full"),
@@ -10617,7 +10846,17 @@ impl CayenneTableProvider {
         result
     }
 
-    async fn rewrite_current_snapshot_for_compaction(&self) -> Result<()> {
+    /// Consolidate the full visible row set into a single new current snapshot
+    /// dir and atomically flip the current-snapshot pointer to it.
+    ///
+    /// Returns `Ok(true)` if a new snapshot was committed, `Ok(false)` if the
+    /// pass was a no-op — the source had no live rows, a **concurrent append
+    /// landed during the off-fence re-encode** (append fence) and the commit
+    /// aborted to avoid losing it, or the **protected-snapshot set changed during
+    /// the scan** (delete fence) so the folded set could no longer be determined.
+    /// All aborts leave the old snapshot current and intact; a later trigger
+    /// retries.
+    async fn rewrite_current_snapshot_for_compaction(&self) -> Result<bool> {
         let compaction_start = std::time::Instant::now();
 
         // CONVERGENCE FENCE — prevents a delete/upsert that races this rewrite
@@ -10656,26 +10895,32 @@ impl CayenneTableProvider {
         // injected, so this rewrite accounts its memory against the isolated
         // compaction pool rather than competing with queries for the query pool.
         let ctx = self.create_compaction_session_context();
-
-        // Build the visible stream and, for key-delete tables, capture a COHERENT
-        // `(cutoff, folded protected snapshots)` fence under `write_lock`. Under
-        // `write_lock` no writer is mid-publish, so every mutation with
-        // `seq <= cutoff` is already visible to the scan; anything that arrives
-        // afterward gets `seq > cutoff` and is carried forward (NOT cleared) at
-        // the end.
+        // This rewrite is guarded by TWO independent, composed fences:
         //
-        // The lock is dropped once the stream object exists (its inputs are
-        // pinned), so the dominant cost — reading every input file and
+        //   * `generation_before` — the concurrent-APPEND fence (current-dir
+        //     generation sampled before the scan lists files, re-checked under the
+        //     commit fence below). An append publishes new files into the OLD
+        //     current dir without changing `current_snapshot_id`; a blind flip
+        //     would strand them, so we abort the commit if the generation moved.
+        //   * `fence = (cutoff, folded protected snapshots)` — the concurrent
+        //     DELETE/UPSERT fence (key-delete tables only). Captured COHERENTLY
+        //     under `write_lock`: every mutation with `seq <= cutoff` is already
+        //     visible to the scan; anything arriving afterward gets `seq > cutoff`
+        //     and is carried forward (NOT cleared) at the end. The two fences are
+        //     orthogonal — appends bump the generation (caught by the first),
+        //     deletes do not (carried forward by the second) — so both are needed.
+        //
+        // The `write_lock` is dropped once the stream object exists (its inputs
+        // are pinned), so the dominant cost — reading every input file and
         // re-encoding the consolidated output below — runs concurrent with
         // writers. The lock is NOT I/O-free, though: when an inline memtable is
         // present it spans `checkpoint_inlined_data` (writes a Vortex file +
-        // listing-fence swap, bounded by the memtable size; skipped entirely
-        // when there is no inline data), so a writer can block for that flush.
-        // The checkpoint MUST stay inside the lock — it has to land in
-        // `folded_before`, and running it lock-free would let a racing inline
-        // write trigger a re-checkpoint during the scan and spuriously abort the
-        // pass (the documented files-accumulate failure mode); see the
-        // folded-set bracket below.
+        // listing-fence swap, bounded by the memtable size; skipped entirely when
+        // there is no inline data), so a writer can block for that flush. The
+        // checkpoint MUST stay inside the lock — it has to land in `folded_before`,
+        // and running it lock-free would let a racing inline write trigger a
+        // re-checkpoint during the scan and spuriously abort the pass (the
+        // documented files-accumulate failure mode); see the folded-set bracket.
         //
         // `folded` MUST be exactly the protected snapshots the scan folded in:
         // clearing one the scan did NOT fold loses its rows; failing to clear one
@@ -10688,17 +10933,22 @@ impl CayenneTableProvider {
         // (best-effort — the next trigger retries), which is the only safe option
         // short of plumbing the folded set out of the scan. The inline checkpoint
         // is run explicitly FIRST so the protected snapshot it may create is in
-        // both reads (otherwise `visible_file_stream_for_rewrite` would create it
-        // between the two reads and spuriously abort every pass with inline data).
+        // both reads — `visible_file_stream_for_rewrite` ALSO checkpoints inline
+        // data internally, so without the explicit-first checkpoint it would
+        // create that snapshot between the two reads and spuriously abort every
+        // pass with inline data (after the explicit checkpoint the internal one is
+        // a no-op since the memtable is already drained).
         //
         // Position-delete tables already hold `write_lock` for the whole rewrite
-        // (above) and clear everything at the end, so they need no fence.
-        let (mut stream, fence): (
+        // (above) and clear everything at the end, so they need no key-delete
+        // fence (their `fence` is `None`).
+        let (mut stream, fence, generation_before): (
             SendableRecordBatchStream,
             Option<(i64, std::collections::HashSet<String>)>,
+            u64,
         ) = if uses_position_deletes {
-            let stream = self.visible_file_stream_for_rewrite(&ctx).await?;
-            (stream, None)
+            let (stream, generation_before) = self.visible_file_stream_for_rewrite(&ctx).await?;
+            (stream, None, generation_before)
         } else {
             let _capture_guard = self.write_lock_arc().lock_owned().await;
             if self.cached_inlined_row_count() > 0 {
@@ -10710,7 +10960,7 @@ impl CayenneTableProvider {
                 .keys()
                 .cloned()
                 .collect();
-            let stream = self.visible_file_stream_for_rewrite(&ctx).await?;
+            let (stream, generation_before) = self.visible_file_stream_for_rewrite(&ctx).await?;
             let cutoff = self.sequence_high_water().await;
             let folded_after: std::collections::HashSet<String> = self
                 .protected_snapshots
@@ -10728,9 +10978,9 @@ impl CayenneTableProvider {
                     "Aborting full rewrite: protected-snapshot set changed during scan \
                      (concurrent finalize); will retry on the next trigger",
                 );
-                return Ok(());
+                return Ok(false);
             }
-            (stream, Some((cutoff, folded_before)))
+            (stream, Some((cutoff, folded_before)), generation_before)
         };
 
         if self.context.has_sort_columns() {
@@ -10787,7 +11037,7 @@ impl CayenneTableProvider {
             // returning the same empty state and pick None, so this is rare.
             self.cleanup_failed_compaction_snapshot(&new_snapshot_id, is_s3)
                 .await;
-            return Ok(());
+            return Ok(false);
         }
 
         if !is_s3 {
@@ -10899,14 +11149,104 @@ impl CayenneTableProvider {
             }
         };
 
-        if let Err(e) = self
-            .commit_snapshot_rewrite(&new_snapshot_id, fence.as_ref())
-            .await
+        // --- Commit: concurrent-append guard + fenced catalog commit + in-memory
+        // swap, all under one `listing_fence.write()` so the append guard is
+        // atomic with respect to appends. An append's `finalize_staged_write`
+        // moves its files into the OLD current dir and bumps
+        // `current_dir_generation` via its publish, all while holding this same
+        // fence. So while we hold it: (a) no append can land, and (b) the
+        // generation cannot move between our check and the swap.
+        //
+        // If the generation changed since `generation_before` (sampled before the
+        // scan listing), an append landed during the off-fence re-encode — its
+        // files are in the old dir, absent from `new_snapshot_id`, and a blind
+        // flip would lose them. Abort: discard the new dir, leave the old snapshot
+        // current (intact, no loss), and let a later trigger retry. (Long term we
+        // would instead hard-link/copy the just-appended files into the new dir
+        // and proceed; for now an abort is the safe, simple choice.)
+        //
+        // We key off `current_dir_generation`, NOT `new_files_since_last_compaction`:
+        // the latter is an over-counted trigger signal that the rewrite's own
+        // `write_to_snapshot` (to the new, not-yet-current snapshot) and background
+        // mem-tier checkpoints (to protected snapshots) also bump — neither of
+        // which changes the current dir, so keying off it would abort every pass.
+        //
+        // The catalog commit and the in-memory listing swap both run under the
+        // fence in the original order (catalog first, so a catalog failure leaves
+        // the in-memory state untouched for a clean abort). The catalog commit is
+        // `fence`-aware: for key-delete tables it carries forward `seq > cutoff`
+        // mutations (the concurrent-delete fence) instead of clearing every
+        // tombstone, and the in-memory deletion caches are pruned to match (see
+        // the `match &fence` below). Holding the fence across the catalog write
+        // briefly blocks scans/appends, but the expensive work (scan + encode)
+        // already completed off-fence.
         {
-            self.cleanup_failed_compaction_snapshot(&new_snapshot_id, is_s3)
-                .await;
-            return Err(Error::Catalog { source: e });
-        }
+            let listing_guard = self.listing_fence.write().await;
+            let generation_now = self.current_dir_generation.load(Ordering::Relaxed);
+            if generation_now != generation_before {
+                // No catalog/in-memory mutation happened; discard the rewritten
+                // output and retry on a later trigger.
+                tracing::debug!(
+                    target: "cayenne::compaction",
+                    table = self.table_metadata.table_name.as_str(),
+                    new_snapshot_id = new_snapshot_id.as_str(),
+                    generation_before,
+                    generation_now,
+                    "Aborting current-snapshot compaction: a concurrent append \
+                     landed during the re-encode; discarding output and retrying"
+                );
+                drop(listing_guard);
+                self.cleanup_failed_compaction_snapshot(&new_snapshot_id, is_s3)
+                    .await;
+                return Ok(false);
+            }
+            if let Err(e) = self
+                .commit_snapshot_rewrite(&new_snapshot_id, fence.as_ref())
+                .await
+            {
+                drop(listing_guard);
+                self.cleanup_failed_compaction_snapshot(&new_snapshot_id, is_s3)
+                    .await;
+                return Err(Error::Catalog { source: e });
+            }
+
+            self.listing_table.store(new_listing_table);
+            self.update_current_snapshot_id(&new_snapshot_id);
+            match &fence {
+                // Position-delete tables held `write_lock` across the whole
+                // rewrite, so no mutation interleaved and clearing everything
+                // is exactly correct.
+                None => self.clear_all_deletion_caches(),
+                // Key-delete tables ran the encode concurrently with writers.
+                // Drop only what the rewrite materialized (`seq <= cutoff` +
+                // the folded protected snapshots); deletes/upserts that raced
+                // the rewrite (`seq > cutoff`, or a protected snapshot created
+                // during the window) are preserved.
+                Some((cutoff, folded)) => {
+                    self.prune_deletion_caches_after_full_rewrite(*cutoff, folded);
+                }
+            }
+
+            // [sound output_ordering attestation] When sort columns are
+            // configured this rewrite consolidated the entire snapshot into a
+            // single globally-sorted, non-overlapping run (the stream was
+            // sorted via `sort_stream` above and written by a single writer —
+            // see `snapshot_shard_count`). Attest THIS snapshot id as sorted so
+            // a subsequent `scan` may advertise `output_ordering` by the sort
+            // columns. MUST run AFTER `update_current_snapshot_id` (which
+            // clears the attestation) and under the held listing fence.
+            if self.context.has_sort_columns() {
+                self.current_sorted_snapshot
+                    .store(Arc::new(Some(new_snapshot_id.clone())));
+            }
+
+            // Persist accumulated stats from the rewrite — keeps DataFusion's
+            // synchronous statistics path consistent with the new snapshot.
+            // The rewrite materializes exactly the live rows, so its min/max +
+            // NDV + count are authoritative: replace the aggregate, correcting
+            // any drift the incremental merges/deltas accumulated.
+            self.replace_table_stats_after_rewrite(&stats_acc).await;
+        };
 
         // Commit succeeded: `new_snapshot_id` is now current, so the old
         // snapshot's manifest rows are dead. Prune them and assert the live
@@ -10923,53 +11263,6 @@ impl CayenneTableProvider {
             }
             self.debug_assert_manifest_matches_listing(&new_snapshot_id, &files)
                 .await;
-        }
-
-        // Hold the listing fence across the listing-table swap and the
-        // current-snapshot-id update so new plan-build calls observe the
-        // swap atomically. Deletion caches and stats are touched under the
-        // fence too — readers that already hold a snapshot of these (loaded
-        // during plan-build under read fence) won't observe a torn state.
-        {
-            let _fence = self.listing_fence.write().await;
-            self.listing_table.store(new_listing_table);
-            self.update_current_snapshot_id(&new_snapshot_id);
-            match &fence {
-                // Position-delete tables held `write_lock` across the whole
-                // rewrite, so no mutation interleaved and clearing everything is
-                // exactly correct.
-                None => self.clear_all_deletion_caches(),
-                // Key-delete tables ran the encode concurrently with writers.
-                // Drop only what the rewrite materialized (`seq <= cutoff` +
-                // the folded protected snapshots); deletes/upserts that raced
-                // the rewrite (`seq > cutoff`, or a protected snapshot created
-                // during the window) are preserved.
-                Some((cutoff, folded)) => {
-                    self.prune_deletion_caches_after_full_rewrite(*cutoff, folded);
-                }
-            }
-
-            // [sound output_ordering attestation] When sort columns are
-            // configured this rewrite consolidated the entire snapshot into a
-            // single globally-sorted, non-overlapping run (the stream was sorted
-            // via `sort_stream` above and written by a single writer — see
-            // `snapshot_shard_count`). Attest THIS snapshot id as sorted so a
-            // subsequent `scan` may advertise `output_ordering` by the sort
-            // columns. MUST run AFTER `update_current_snapshot_id` (which clears
-            // the attestation) and under the held listing fence, so a concurrent
-            // scan observes the new listing and the attestation atomically. Any
-            // later listing mutation clears it again (see the clear sites).
-            if self.context.has_sort_columns() {
-                self.current_sorted_snapshot
-                    .store(Arc::new(Some(new_snapshot_id.clone())));
-            }
-
-            // Persist accumulated stats from the rewrite — keeps DataFusion's
-            // synchronous statistics path consistent with the new snapshot. The
-            // rewrite materializes exactly the live rows, so its min/max + NDV +
-            // count are authoritative: replace the aggregate, correcting any
-            // drift the incremental merges/deltas accumulated.
-            self.replace_table_stats_after_rewrite(&stats_acc).await;
         }
 
         // Checkpoint the PK existence index for fast restart (best-effort). The
@@ -10998,21 +11291,33 @@ impl CayenneTableProvider {
             "Snapshot compaction completed"
         );
 
-        Ok(())
+        Ok(true)
     }
 
+    /// Build the consolidation input stream (the full visible scan) and capture
+    /// the concurrent-append fence value to verify at commit.
+    ///
+    /// The returned `u64` is [`Self::current_dir_generation`] sampled AFTER any
+    /// inline-data checkpoint and BEFORE the scan's file listing. Re-checking it
+    /// under the commit fence detects a current-dir append that landed during the
+    /// off-fence re-encode (whose files a blind snapshot flip would lose). It
+    /// deliberately tracks ONLY current-dir publishes — not the rewrite's own
+    /// output write or background mem-tier checkpoints — so the fence does not
+    /// abort on changes that leave the current dir untouched.
     async fn visible_file_stream_for_rewrite(
         &self,
         ctx: &SessionContext,
-    ) -> Result<SendableRecordBatchStream> {
+    ) -> Result<(SendableRecordBatchStream, u64)> {
         if self.cached_inlined_row_count() > 0 {
             self.checkpoint_inlined_data().await?;
         }
 
+        let generation_before = self.current_dir_generation.load(Ordering::Relaxed);
+
         let state = ctx.state();
         let plan = TableProvider::scan(self, &state, None, &[], None).await?;
         let stream = datafusion_physical_plan::execute_stream(plan, state.task_ctx())?;
-        Ok(stream)
+        Ok((stream, generation_before))
     }
 
     /// Fast, write-lock-free consolidation of a size-tiered subset of the
@@ -11091,13 +11396,12 @@ impl CayenneTableProvider {
                     telemetry::KeyValue::new("result", result_label),
                 ],
             );
-            if let Err(e) = &result
-                && matches!(
-                    e,
-                    Error::DataFusion { source }
-                        if matches!(source, datafusion_common::DataFusionError::ResourcesExhausted(_))
-                )
-            {
+            if matches!(
+                &result,
+                Result::Err(Error::DataFusion {
+                    source: DataFusionError::ResourcesExhausted(_)
+                })
+            ) {
                 telemetry::track_cayenne_compaction_memory_exhausted(&[
                     telemetry::KeyValue::new("table", table),
                     telemetry::KeyValue::new("kind", "subset"),
@@ -13194,6 +13498,14 @@ impl CayenneTableProvider {
     /// `listing_fence.read()` across its listing call) and cannot cross a fence
     /// boundary.
     pub(crate) fn publish_current_snapshot_files_changed_under_held_fence(&self) {
+        // Advance the current-dir generation: this is the single fence-held
+        // chokepoint where appended files become visible to scans, so a snapshot
+        // rewrite's concurrent-append fence keys off this. The bump happens while
+        // the caller holds `listing_fence.write()`, so a rewrite re-reading it
+        // under its own commit fence observes every publish that landed during
+        // its off-fence re-encode. See [`Self::current_dir_generation`].
+        self.current_dir_generation.fetch_add(1, Ordering::Relaxed);
+
         // [sound output_ordering] This delta-applies newly-added (UNSORTED) files
         // onto the current snapshot's cached listing in place — invalidate the
         // sorted attestation so the scan won't advertise stale ordering.
@@ -13209,8 +13521,7 @@ impl CayenneTableProvider {
         // Re-check the recorded snapshot id against the live current snapshot: a
         // stale entry left by a move whose publish was skipped must never be
         // applied onto a different snapshot's listing.
-        let additions = self.last_moved_snapshot_files.lock().take();
-        let applied_delta = match additions {
+        let applied_delta = match self.last_moved_snapshot_files.lock().take() {
             Some((recorded_snapshot, metas))
                 if recorded_snapshot == current_snapshot && !metas.is_empty() =>
             {
@@ -19686,6 +19997,7 @@ impl CayenneTableProvider {
             Arc::clone(&self.catalog),
             Arc::clone(&self.protected_snapshots),
             self.table_metadata.table_id.clone(),
+            self.clone_for_write(),
             self.table_metadata.path.clone(),
             Arc::clone(self.context.runtime_env()),
             Arc::clone(&self.write_lock),
@@ -19974,6 +20286,19 @@ impl super::compaction::CompactionRunner for CayenneTableProvider {
                     Err(e) => return Err(e.to_string()),
                 }
             }
+        }
+        // Attempt a pass of compacting current (i.e. append-based) data files.
+        // When compaction runs, protected snapshots are folded in.
+        let compaction_ran = self
+            .compact_current_snapshot_small_files()
+            .await
+            .map_err(|e| e.to_string())?;
+        if compaction_ran {
+            // Because that re-encode also folds in any protected snapshots and
+            // clears them (`clear_all_deletion_caches`), a committed pass leaves
+            // nothing for the protected subset path this tick, so return early on
+            // success and let the next tick re-evaluate.
+            return Ok(true);
         }
 
         // Cheap lock-free early-out first: skip acquiring `compaction_lock` /
