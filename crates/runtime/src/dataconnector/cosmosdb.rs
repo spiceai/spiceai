@@ -43,9 +43,9 @@ use super::{
     ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory,
     ParameterSpec, Parameters,
 };
-use crate::component::ComponentType;
+use runtime_api_types::v1::ComponentType;
 use crate::component::dataset::Dataset;
-use crate::component::metrics::{MetricSpec, MetricType, MetricsProvider, ObserveMetricCallback};
+use runtime_metrics::component::{MetricSpec, MetricType, MetricsProvider, ObserveMetricCallback};
 
 const CONNECTOR_NAME: &str = "cosmosdb";
 

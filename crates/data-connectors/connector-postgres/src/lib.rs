@@ -38,7 +38,7 @@ use datafusion_table_providers::sql::db_connection_pool::{
 };
 use datafusion_table_providers::sql::sql_provider_datafusion::{SqlTable, expr::Engine};
 use runtime::component::dataset::Dataset;
-use runtime::component::metrics::MetricsProvider;
+use runtime_metrics::component::MetricsProvider;
 use runtime::dataconnector::{
     ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory,
     DataConnectorResult, NewDataConnectorResult,

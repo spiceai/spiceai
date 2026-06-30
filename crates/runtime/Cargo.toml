@@ -136,6 +136,7 @@ rmcp = { workspace = true, optional = true, features = [
 runtime-acceleration = { path = "../runtime-acceleration" }
 runtime-api-types = { path = "../runtime-api-types" }
 runtime-async = { path = "../runtime-async" }
+runtime-metrics = { path = "../runtime-metrics" }
 runtime-auth = { path = "../runtime-auth" }
 runtime-cluster = { path = "../runtime-cluster" }
 runtime-datafusion = { path = "../runtime-datafusion" }

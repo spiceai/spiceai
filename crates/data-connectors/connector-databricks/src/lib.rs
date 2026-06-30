@@ -45,10 +45,10 @@ use opentelemetry::KeyValue;
 use runtime::Runtime;
 use runtime::catalogconnector::{CatalogConnector, Error as CatalogError, Result as CatalogResult};
 use runtime::component::ComponentInitialization;
-use runtime::component::ComponentType;
+use runtime_api_types::v1::ComponentType;
 use runtime::component::catalog::Catalog;
 use runtime::component::dataset::Dataset;
-use runtime::component::metrics::{MetricSpec, MetricType, MetricsProvider, ObserveMetricCallback};
+use runtime_metrics::component::{MetricSpec, MetricType, MetricsProvider, ObserveMetricCallback};
 use runtime::dataconnector::{
     ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory,
     DataConnectorResult, NewDataConnectorResult, http_rate_control,

@@ -14,24 +14,14 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::sync::LazyLock;
+use super::{Histogram, LazyLock, Meter, global};
 
-use opentelemetry::{
-    global,
-    metrics::{Counter, Gauge, Histogram, Meter, UpDownCounter},
-};
+pub static SECRETS_METER: LazyLock<Meter> = LazyLock::new(|| global::meter("secrets_store"));
 
-pub(crate) mod catalogs;
-pub(crate) mod cluster;
-pub(crate) mod components;
-pub(crate) mod datasets;
-pub(crate) mod embeddings;
-pub(crate) mod llms;
-pub(crate) mod models;
-pub(crate) mod rerankers;
-pub(crate) mod secrets;
-pub(crate) mod spiced_runtime;
-pub(crate) mod telemetry;
-pub(crate) mod tools;
-pub(crate) mod views;
-pub(crate) mod workers;
+pub static STORES_LOAD_DURATION_MS: LazyLock<Histogram<f64>> = LazyLock::new(|| {
+    SECRETS_METER
+        .f64_histogram("secrets_store_load_duration_ms")
+        .with_description("Duration in milliseconds to load the secret stores.")
+        .with_unit("ms")
+        .build()
+});

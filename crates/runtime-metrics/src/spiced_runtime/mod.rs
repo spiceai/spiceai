@@ -14,18 +14,20 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::sync::LazyLock;
+use super::{Counter, LazyLock, Meter, global};
 
-use opentelemetry::{
-    global,
-    metrics::{Counter, Meter},
-};
+pub static RUNTIME_METER: LazyLock<Meter> = LazyLock::new(|| global::meter("runtime"));
 
-static METER: LazyLock<Meter> = LazyLock::new(|| global::meter("query"));
+pub static FLIGHT_SERVER_START: LazyLock<Counter<u64>> = LazyLock::new(|| {
+    RUNTIME_METER
+        .u64_counter("runtime_flight_server_started")
+        .with_description("Indicates the runtime Flight server has started.")
+        .build()
+});
 
-pub(crate) static FAILURES: LazyLock<Counter<u64>> = LazyLock::new(|| {
-    METER
-        .u64_counter("query_failures")
-        .with_description("Number of query failures.")
+pub static HTTP_SERVER_START: LazyLock<Counter<u64>> = LazyLock::new(|| {
+    RUNTIME_METER
+        .u64_counter("runtime_http_server_started")
+        .with_description("Indicates the runtime HTTP server has started.")
         .build()
 });

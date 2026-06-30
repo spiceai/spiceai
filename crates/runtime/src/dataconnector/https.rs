@@ -16,7 +16,7 @@ limitations under the License.
 
 use crate::component::dataset::Dataset;
 use crate::component::dataset::acceleration::RefreshMode;
-use crate::component::metrics::MetricsProvider;
+use runtime_metrics::component::MetricsProvider;
 use crate::component::{ComponentInitialization, DatasetHealthMonitor, StartupOptions};
 use crate::dataconnector::client_identity::{
     ClientIdentityConfig, ClientIdentityConfigError, TLS_CLIENT_CERTIFICATE,

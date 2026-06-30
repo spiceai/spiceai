@@ -22,7 +22,7 @@ use data_components::graphql::{
 use data_components::rate_limit::RateLimiter;
 use datafusion::datasource::TableProvider;
 use runtime::component::dataset::Dataset;
-use runtime::component::metrics::MetricsProvider;
+use runtime_metrics::component::MetricsProvider;
 use runtime::dataconnector::http_rate_control::{
     HttpRateControlMetricSource, HttpRateControlMetrics, HttpRateControlMetricsProvider,
 };

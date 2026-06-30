@@ -22,7 +22,7 @@ use crate::accelerated_table::refresh_task::changes::{
 };
 use crate::component::dataset::acceleration::{Engine, RefreshMode};
 use crate::component::dataset::{Dataset, OnSchemaChange};
-use crate::component::metrics::MetricsProvider;
+use runtime_metrics::component::MetricsProvider;
 use crate::dataaccelerator::spice_sys::{self, OpenOption, debezium_kafka::DebeziumKafkaSys};
 use crate::dataconnector::{
     ConnectorComponent,

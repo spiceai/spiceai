@@ -20,7 +20,7 @@ use crate::component::ComponentInitialization;
 use crate::component::dataset::Dataset;
 #[cfg(feature = "duckdb")]
 use crate::component::dataset::acceleration::Engine;
-use crate::component::metrics::MetricsProvider;
+use runtime_metrics::component::MetricsProvider;
 #[cfg(feature = "duckdb")]
 use crate::component::view::View;
 use crate::dataconnector::{DataConnector, DataConnectorError, DataConnectorResult};

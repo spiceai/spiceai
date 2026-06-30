@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 use super::RefreshTask;
-use crate::accelerated_table::metrics;
+use runtime_metrics::acceleration as metrics;
 use crate::accelerated_table::refresh::Refresh;
 use crate::accelerated_table::refresh_task::deletion::build_batch_delete_expr_from_change_batch;
 use crate::component::dataset::OnSchemaChange;

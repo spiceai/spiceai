@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use super::metrics;
+use runtime_metrics::acceleration as metrics;
 use super::refresh::Refresh;
 use super::refresh::get_timestamp;
 use super::sink::AccelerationSink;
@@ -32,7 +32,7 @@ use crate::datafusion::is_spice_internal_dataset;
 use crate::datafusion::managed_runtime::{self, ManagedRuntimeError};
 use crate::datafusion::refresh_sql;
 use crate::federated_table::FederatedTable;
-use crate::metrics::telemetry::track_bytes_processed;
+use runtime_metrics::telemetry::track_bytes_processed;
 use crate::{
     component::dataset::acceleration::RefreshMode,
     dataconnector::get_data,

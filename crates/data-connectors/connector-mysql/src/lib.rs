@@ -25,9 +25,9 @@ use datafusion_table_providers::sql::db_connection_pool::{
 };
 use mysql_async::{Metrics, prelude::Queryable};
 use opentelemetry::KeyValue;
-use runtime::component::ComponentType;
+use runtime_api_types::v1::ComponentType;
 use runtime::component::dataset::Dataset;
-use runtime::component::metrics::{MetricSpec, MetricType, MetricsProvider, ObserveMetricCallback};
+use runtime_metrics::component::{MetricSpec, MetricType, MetricsProvider, ObserveMetricCallback};
 use runtime::dataconnector::{
     ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory,
     DataConnectorResult, NewDataConnectorResult,

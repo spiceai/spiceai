@@ -112,7 +112,6 @@ mod init;
 pub mod internal_table;
 pub mod jobs;
 mod management;
-mod metrics;
 pub mod metrics_reader;
 mod metrics_server;
 pub mod model;

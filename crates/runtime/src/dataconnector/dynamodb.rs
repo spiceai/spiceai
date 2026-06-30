@@ -19,10 +19,10 @@ use super::{
     ParameterSpec, Parameters, parameters::aws::initiate_config_with_auth_method,
 };
 use crate::accelerated_table::sink::table::TableSink;
-use crate::component::ComponentType;
+use runtime_api_types::v1::ComponentType;
 use crate::component::dataset::Dataset;
 use crate::component::dataset::acceleration::RefreshMode;
-use crate::component::metrics::{MetricSpec, MetricType, MetricsProvider, ObserveMetricCallback};
+use runtime_metrics::component::{MetricSpec, MetricType, MetricsProvider, ObserveMetricCallback};
 use crate::dataaccelerator::spice_sys::OpenOption;
 use crate::dataaccelerator::spice_sys::dynamodb::{DynamoDBCheckpointMetadata, DynamoDBSys};
 use crate::federated_table::FederatedTable;

@@ -63,7 +63,6 @@ use tokio::task::JoinHandle;
 
 pub mod caching;
 pub mod federation;
-mod metrics;
 pub mod refresh;
 pub mod refresh_task;
 mod refresh_task_runner;
