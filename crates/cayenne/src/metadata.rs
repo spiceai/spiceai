@@ -16,6 +16,8 @@ limitations under the License.
 
 //! Data structures for Cayenne metadata.
 
+use std::num::NonZeroUsize;
+
 use arrow_schema::SchemaRef;
 use datafusion_table_providers::util::on_conflict::OnConflict;
 use serde::{Deserialize, Serialize};
@@ -290,16 +292,15 @@ pub enum CompressionStrategy {
 ///
 /// The exact level → scheme-set mapping lives in
 /// `provider::delta_encoding::strategy_builder_for_level`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(try_from = "String", into = "String")]
 pub enum DeltaEncoding {
     /// Size-gated: light for small deltas, full for large writes.
-    Auto,
-    /// Fixed encoding level `0..=10` applied to every delta write.
-    Level(u8),
-}
-
-impl Default for DeltaEncoding {
+    /// Local micro A/B (2026-06-06) was neutral on the
+    /// upsert/bulk lanes; the aggregate CPU-per-delta benefit targets
+    /// production-scale CDC and is to be validated there. Set the
+    /// param to `7` to opt out (pre-feature behavior).
+    ///
     /// `Auto` — size-gated light encoding for small deltas. This is also what
     /// pre-feature stored table configs deserialize to via
     /// `#[serde(default)]`, so existing tables pick up the policy on upgrade
@@ -307,9 +308,10 @@ impl Default for DeltaEncoding {
     /// change never forces a table re-create). Set the
     /// `cayenne_delta_encoding` param to `7` to opt out (the full default
     /// cascade, byte-for-byte the pre-feature behavior).
-    fn default() -> Self {
-        Self::Auto
-    }
+    #[default]
+    Auto,
+    /// Fixed encoding level `0..=10` applied to every delta write.
+    Level(u8),
 }
 
 /// Maximum supported [`DeltaEncoding`] level.
@@ -713,6 +715,24 @@ pub struct VortexConfig {
     /// [`crate::provider::table::BAKE_DELETION_INDEX_TRIGGER`]).
     #[serde(default = "default_bake_deletion_index_trigger")]
     pub bake_deletion_index_trigger: usize,
+    /// Number of orphan-eligible key-based deletion vectors (count of
+    /// `cayenne_delete_file` rows, NOT masked rows) that must accumulate before a
+    /// cleanup sweep runs. A key DV is orphan-eligible once retention has emptied
+    /// the protected snapshot(s) it shadowed, raising the surviving-sequence floor
+    /// above its delete sequence so it shadows nothing.
+    ///
+    /// `None` (unset/null, the default) disables orphaned-DV cleanup entirely — no
+    /// background sweep is ever spawned, so the file-based DELETE path acquires no
+    /// extra locks and runs no catalog scan (the pre-feature behavior, and the A/B
+    /// baseline). `Some(n)` enables it with threshold `n >= 1`. The `NonZeroUsize`
+    /// type makes a misconfigured `0` unrepresentable; the spicepod param
+    /// (`cayenne_orphaned_dv_cleanup_min_files`) maps `0` (or unset) to `None`. A
+    /// larger value sweeps less often (cheaper, but orphaned `.arrow` files linger
+    /// on disk longer); a smaller value reclaims disk sooner. The sweep is
+    /// lock-free and runs off the write path on the dedicated compaction runtime,
+    /// so this only trades sweep frequency against lingering disk — never ingest
+    /// latency.
+    pub orphaned_dv_cleanup_min_files: Option<NonZeroUsize>,
     /// Number of protected snapshots that can accumulate before snapshot-maintenance
     /// compaction is eligible to run. Kept separate from `compaction_trigger_files`
     /// so small-file compaction tuning does not silently change scan amplification
@@ -1225,6 +1245,10 @@ impl Default for VortexConfig {
             write_concurrency: None,
             compaction_trigger_files: default_compaction_trigger_files(),
             bake_deletion_index_trigger: default_bake_deletion_index_trigger(),
+            // Orphaned-DV cleanup disabled by default (None = pre-feature behavior,
+            // and the A/B baseline); opt in by setting the spicepod param
+            // `cayenne_orphaned_dv_cleanup_min_files` to a value >= 1.
+            orphaned_dv_cleanup_min_files: None,
             compaction_trigger_protected_snapshots: default_compaction_trigger_protected_snapshots(
             ),
             compaction_trigger_snapshot_age_ms: default_compaction_trigger_snapshot_age_ms(),
