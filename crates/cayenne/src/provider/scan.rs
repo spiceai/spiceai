@@ -1293,7 +1293,7 @@ mod tests {
     /// A non-positive overlay count (cold/un-seeded aggregate, or the window
     /// before the first checkpoint seeds a `cdc_durability: memory` table) carries
     /// no information and must NOT be restored: doing so mis-sizes the join and,
-    /// via the NDV cap, would zero every refilled distinct_count. The child stays
+    /// via the NDV cap, would zero every refilled `distinct_count`. The child stays
     /// Absent — better than reporting an invalid 0.
     #[test]
     fn restore_does_not_backfill_num_rows_from_zero_overlay() {
