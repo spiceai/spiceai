@@ -290,25 +290,6 @@ pub trait MetadataCatalog: Send + Sync {
     /// Get all active delete files for a table (across all virtual files).
     async fn get_table_delete_files(&self, table_id: &str) -> CatalogResult<Vec<DeleteFile>>;
 
-    /// Get orphan-eligible key-based delete files for a table, bounded by `limit`.
-    ///
-    /// Returns rows that are both key-based (`source_data_file_path IS NULL` — the
-    /// reliable discriminator, since the catalog does not persist `deletion_type`)
-    /// and at or below `max_sequence` (`sequence_number <= max_sequence`). The
-    /// caller passes the surviving-sequence floor as `max_sequence`: a key DV with
-    /// delete sequence `D` only shadows data with sequence `< D`, so once the floor
-    /// is `>= D` it shadows nothing and is safe to remove.
-    ///
-    /// This is the bounded query the orphaned-DV cleanup sweep uses instead of
-    /// fetching every delete-file row and filtering in memory; `limit` caps the
-    /// per-sweep working set (the sweep requeues if more remain).
-    async fn get_orphan_eligible_delete_files(
-        &self,
-        table_id: &str,
-        max_sequence: i64,
-        limit: usize,
-    ) -> CatalogResult<Vec<DeleteFile>>;
-
     /// Remove delete files (deletion vectors) by ID for a table.
     async fn remove_delete_files(
         &self,

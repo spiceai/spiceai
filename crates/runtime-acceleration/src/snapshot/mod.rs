@@ -1537,17 +1537,6 @@ impl SnapshotManager {
 
     /// Attempts to download the latest snapshot, returning details if successful.
     ///
-    /// INVARIANT (Cayenne orphaned-DV cleanup): restore is wholesale and
-    /// self-contained — the downloaded archive carries its OWN data and
-    /// deletion-vector (`.arrow`) files plus metastore slice, and extraction
-    /// replaces the local table directory before the provider is (re)opened. It
-    /// never reuses the live table's files. Cayenne's orphaned-DV sweep
-    /// (`CayenneTableProvider::sweep_orphaned_deletion_vectors`) deletes DV files
-    /// once they fall below the surviving-sequence floor and depends on this: if
-    /// restore is ever changed to reuse the live table's files (e.g. an in-place
-    /// pointer flip without re-extraction), it must account for DV deletion —
-    /// keep orphaned DVs alive longer or restrict which snapshots can be restored.
-    ///
     /// # Errors
     ///
     /// - If there is an error communicating with the object store.
