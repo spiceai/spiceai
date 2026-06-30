@@ -81,7 +81,10 @@ members = [
     "tools/testoperator",
     "tools/chbench-driver",
     "tools/parsley",
-    "tools/pr-builds"
+    "tools/pr-builds",
+    "crates/vendor/ttf-parser",
+    "crates/vendor/lopdf",
+    "crates/vendor/pdf-extract",
 ]
 
 # Explicitly set the resolver to version 2, which is the default for packages with edition >= 2021
@@ -201,6 +204,7 @@ dotenvy = "0.15"
 duration-parse = { path = "crates/duration-parse" }
 duckdb = "1.10503" # 1.10503.x corresponds to DuckDB v1.5.3
 dyn-hash = "1.0.0"
+encoding_rs = "0.8.34"
 fundu = "2.0.1"
 futures = "0.3.32"
 gethostname = "1.1.0"
@@ -227,6 +231,7 @@ indexmap = "2"
 insta = { version = "1.46.3", features = ["filters"] }
 itertools = "0.14"
 linkme = "0.3.35"
+log = "0.4.22"
 logos = "0.16.1"
 mailparse = "0.16.1"
 moka = { version = "0.12", features = ["future"] }
