@@ -336,10 +336,10 @@ async fn run_failover(recovery_timeout: Duration) -> Result<(), anyhow::Error> {
     // (s1 has no executor to dispatch to) — this is the deterministic hold.
     let (_executor_rt, executor_handle) =
         build_executor("executor", &pki, &s2.cluster_addr, &csv_path).await?;
-    wait_for_executor_count(&executor_manager(&s2.rt), 1, Duration::from_secs(60)).await?;
+    wait_for_executor_count(&executor_manager(&s2.rt), 1, Duration::from_mins(1)).await?;
 
-    let s1_je = wait_for_job_executor(&s1.rt, Duration::from_secs(60)).await?;
-    let s2_je = wait_for_job_executor(&s2.rt, Duration::from_secs(60)).await?;
+    let s1_je = wait_for_job_executor(&s1.rt, Duration::from_mins(1)).await?;
+    let s2_je = wait_for_job_executor(&s2.rt, Duration::from_mins(1)).await?;
 
     // Submit the async distributed query to s1. It registers as Running but
     // cannot complete — s1 owns no executor.
@@ -363,7 +363,7 @@ async fn run_failover(recovery_timeout: Duration) -> Result<(), anyhow::Error> {
     wait_for_job(
         &s1_je,
         &job_id,
-        Duration::from_secs(60),
+        Duration::from_mins(1),
         "Running on s1",
         |s| s.status == JobStatus::Running,
     )
