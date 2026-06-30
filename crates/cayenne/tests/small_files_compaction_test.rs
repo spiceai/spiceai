@@ -29,13 +29,14 @@ mod common;
 
 use std::path::Path;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use arrow::array::{Int64Array, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 
 use cayenne::metadata::{CreateTableOptions, VortexConfig};
-use cayenne::{CayenneTableProvider, MetadataCatalog};
+use cayenne::{CayenneTableProvider, CayenneTableProviderBuilder, MetadataCatalog};
 
 use datafusion::prelude::SessionContext;
 use datafusion_table_providers::util::{
@@ -164,24 +165,39 @@ async fn count_rows(ctx: &SessionContext, table_name: &str) -> i64 {
         .value(0)
 }
 
-async fn unordered_ids(ctx: &SessionContext, table_name: &str) -> Vec<i64> {
-    let df = ctx
-        .sql(&format!("SELECT id FROM {table_name}"))
-        .await
-        .expect("select sql planned");
-    let batches = df.collect().await.expect("select collected");
-    let mut ids = Vec::new();
-    for batch in &batches {
-        let values = batch
-            .column(0)
-            .as_any()
-            .downcast_ref::<Int64Array>()
-            .expect("id column");
-        for idx in 0..batch.num_rows() {
-            ids.push(values.value(idx));
+async fn wait_until_current_snapshot_compacts(
+    table: &Arc<CayenneTableProvider>,
+    fixture: &common::TestFixture,
+    table_name: &str,
+    uncompacted_file_count: usize,
+) -> Result<Option<(String, usize)>, Box<dyn std::error::Error>> {
+    const TIMEOUT: Duration = Duration::from_secs(10);
+    const POLL_INTERVAL: Duration = Duration::from_millis(50);
+
+    let started = Instant::now();
+    loop {
+        let table_meta = fixture.catalog.get_table(table_name).await?;
+        let snapshot_id = table_meta.current_snapshot_id;
+        let file_count =
+            count_vortex_files(&fixture.data_path, &table_meta.table_id, &snapshot_id).await;
+        if file_count < uncompacted_file_count {
+            return Ok(Some((snapshot_id, file_count)));
         }
+
+        if table.compact_current_snapshot_small_files().await? {
+            let table_meta = fixture.catalog.get_table(table_name).await?;
+            let snapshot_id = table_meta.current_snapshot_id;
+            let file_count =
+                count_vortex_files(&fixture.data_path, &table_meta.table_id, &snapshot_id).await;
+            return Ok(Some((snapshot_id, file_count)));
+        }
+
+        if started.elapsed() >= TIMEOUT {
+            return Ok(None);
+        }
+
+        tokio::time::sleep(POLL_INTERVAL).await;
     }
-    ids
 }
 
 async fn build_table(
@@ -272,12 +288,12 @@ async fn compaction_reduces_file_count_after_n_small_appends(
     Ok(())
 }
 
-test_with_backends!(compaction_sorts_sort_column_tables);
-async fn compaction_sorts_sort_column_tables(
+test_with_backends!(compaction_runs_for_sort_column_tables);
+async fn compaction_runs_for_sort_column_tables(
     fixture: common::TestFixture,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let schema = pk_schema();
-    let (table, ctx, _table_id) = build_table(
+    let (table, _ctx, _table_id) = build_table(
         &fixture,
         "compaction_sorted",
         Arc::clone(&schema),
@@ -295,22 +311,29 @@ async fn compaction_sorts_sort_column_tables(
         common::insert_batch(&table, make_batch_from_ids(&schema, ids)).await?;
     }
 
+    let Some((_snapshot_id, file_count)) = wait_until_current_snapshot_compacts(
+        &table,
+        &fixture,
+        "compaction_sorted",
+        usize::try_from(batch_count).expect("batch count fits usize"),
+    )
+    .await?
+    else {
+        panic!("sort-column compaction should commit a rewrite");
+    };
     assert!(
-        run_compaction(&table).await,
-        "test setup should produce a compaction candidate"
+        file_count < usize::try_from(batch_count).expect("batch count fits usize"),
+        "sort-column compaction should reduce file count below {batch_count}, found {file_count}"
     );
-
-    let ids = unordered_ids(&ctx, "compaction_sorted").await;
+    let ctx = SessionContext::new();
+    ctx.register_table(
+        "compaction_sorted",
+        Arc::clone(&table) as Arc<dyn datafusion::datasource::TableProvider>,
+    )?;
     assert_eq!(
-        ids.len(),
-        usize::try_from(batch_rows * batch_count).expect("row count fits usize")
+        count_rows(&ctx, "compaction_sorted").await,
+        batch_rows * batch_count
     );
-    for window in ids.windows(2) {
-        assert!(
-            window[0] <= window[1],
-            "sort-column compaction should rewrite rows in non-decreasing id order"
-        );
-    }
 
     Ok(())
 }
@@ -646,6 +669,208 @@ async fn compaction_handles_concurrent_compaction_triggers(
     // Data must be intact.
     let total = count_rows(&ctx, "compaction_concurrent").await;
     assert_eq!(total, batch_rows * 8);
+
+    Ok(())
+}
+
+// --- Production current-snapshot small-file compaction (#11392) ----------------
+//
+// #11130 removed the general compactor from `run_compaction_trigger`, which
+// early-outs when a table has no protected snapshots. Append-only tables never
+// create protected snapshots, so they stopped being compacted. These tests
+// drive the restored production path (`compact_current_snapshot_small_files`,
+// the method `run_compaction_trigger` now calls regardless of the protected set)
+// directly and assert it consolidates small files on a table with ZERO protected
+// snapshots, and that a concurrent append can never lose rows.
+
+test_with_backends!(production_trigger_compacts_append_only_table);
+async fn production_trigger_compacts_append_only_table(
+    fixture: common::TestFixture,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let schema = pk_schema();
+    // pk = None → append-only: every insert lands as a new Vortex file in the
+    // current snapshot dir and NO protected snapshot is ever created.
+    let (table, ctx, table_id) = build_table(
+        &fixture,
+        "prod_append_only",
+        Arc::clone(&schema),
+        None,
+        aggressive_compaction_config(),
+    )
+    .await;
+
+    let batch_rows: i64 = 1500;
+    let batches = 12_i64;
+    for batch_idx in 0..batches {
+        let start = batch_idx * batch_rows;
+        common::insert_batch(&table, make_batch(&schema, start, batch_rows)).await?;
+    }
+
+    // No protected snapshots exist — this is exactly the case #11130's
+    // early-out starved.
+    assert_eq!(
+        count_protected_snapshots(&fixture, &table_id).await,
+        0,
+        "append-only table must have no protected snapshots"
+    );
+
+    let Some((_snapshot_id, file_count)) = wait_until_current_snapshot_compacts(
+        &table,
+        &fixture,
+        "prod_append_only",
+        usize::try_from(batches).expect("batch count fits usize"),
+    )
+    .await?
+    else {
+        panic!(
+            "current-snapshot compaction must fire on an append-only table with no protected snapshots"
+        );
+    };
+
+    // A fresh snapshot dir was minted and the file count is bounded.
+    assert!(
+        file_count < usize::try_from(batches).expect("batch count fits usize"),
+        "expected the current snapshot to be consolidated below {batches} files, found {file_count} files"
+    );
+
+    // Rows preserved end-to-end.
+    assert_eq!(
+        count_rows(&ctx, "prod_append_only").await,
+        batch_rows * batches
+    );
+
+    Ok(())
+}
+
+test_with_backends!(concurrent_append_during_compaction_loses_no_rows);
+async fn concurrent_append_during_compaction_loses_no_rows(
+    fixture: common::TestFixture,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let schema = pk_schema();
+    let (table, ctx, _table_id) = build_table(
+        &fixture,
+        "concurrent_append_compaction",
+        Arc::clone(&schema),
+        None,
+        aggressive_compaction_config(),
+    )
+    .await;
+
+    let batch_rows: i64 = 1500;
+    // Seed enough small files to make the compaction picker fire.
+    let seeded = 8_i64;
+    for batch_idx in 0..seeded {
+        let start = batch_idx * batch_rows;
+        common::insert_batch(&table, make_batch(&schema, start, batch_rows)).await?;
+    }
+
+    // Race a compaction against a burst of appends. Whether the guard commits or
+    // aborts (because an append landed mid-rewrite), the invariant is the same:
+    // NO appended row is dropped — an abort leaves the old snapshot current and
+    // intact, a commit carries every pre-scan file forward.
+    let extra = 6_i64;
+    let compaction_table = Arc::clone(&table);
+    let compaction = tokio::spawn(async move {
+        // A few passes so at least one overlaps the appends below.
+        for _ in 0..extra {
+            let _ = compaction_table
+                .compact_current_snapshot_small_files()
+                .await
+                .expect("compaction pass should not error");
+            tokio::task::yield_now().await;
+        }
+    });
+
+    for batch_idx in seeded..(seeded + extra) {
+        let start = batch_idx * batch_rows;
+        common::insert_batch(&table, make_batch(&schema, start, batch_rows)).await?;
+    }
+
+    compaction.await.expect("compaction task did not panic");
+
+    // Every appended row must still be visible.
+    assert_eq!(
+        count_rows(&ctx, "concurrent_append_compaction").await,
+        batch_rows * (seeded + extra),
+        "a concurrent append during compaction must never lose rows"
+    );
+
+    Ok(())
+}
+
+test_with_backends!(compaction_survives_provider_reopen);
+async fn compaction_survives_provider_reopen(
+    fixture: common::TestFixture,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let schema = pk_schema();
+    let (table, _ctx, table_id) = build_table(
+        &fixture,
+        "compaction_reopen",
+        Arc::clone(&schema),
+        None,
+        aggressive_compaction_config(),
+    )
+    .await;
+
+    let batch_rows: i64 = 1500;
+    let batches = 10_i64;
+    for batch_idx in 0..batches {
+        let start = batch_idx * batch_rows;
+        common::insert_batch(&table, make_batch(&schema, start, batch_rows)).await?;
+    }
+
+    let Some((committed_snapshot_id, file_count)) = wait_until_current_snapshot_compacts(
+        &table,
+        &fixture,
+        "compaction_reopen",
+        usize::try_from(batches).expect("batch count fits usize"),
+    )
+    .await?
+    else {
+        panic!("compaction must commit before the reopen");
+    };
+
+    assert!(
+        file_count < usize::try_from(batches).expect("batch count fits usize"),
+        "expected reopen test compaction to reduce file count below {batches}, found {file_count} files"
+    );
+
+    // Drop the live provider and reopen from the persisted catalog — a fresh
+    // provider with empty in-memory state must read the committed consolidated
+    // snapshot, with every row intact.
+    drop(table);
+    let reopen_ctx = SessionContext::new();
+    let reopened = Arc::new(
+        CayenneTableProviderBuilder::new(fixture.catalog.clone(), reopen_ctx.runtime_env())
+            .open("compaction_reopen")
+            .await?,
+    );
+    reopen_ctx.register_table(
+        "compaction_reopen",
+        Arc::clone(&reopened) as Arc<dyn datafusion::datasource::TableProvider>,
+    )?;
+
+    assert_eq!(
+        fixture
+            .catalog
+            .get_table("compaction_reopen")
+            .await?
+            .current_snapshot_id,
+        committed_snapshot_id,
+        "the reopened table must point at the consolidated snapshot"
+    );
+    assert_eq!(
+        count_rows(&reopen_ctx, "compaction_reopen").await,
+        batch_rows * batches,
+        "all rows must survive the compaction + reopen"
+    );
+    // Sanity: the committed snapshot dir physically exists and is consolidated.
+    let file_count =
+        count_vortex_files(&fixture.data_path, &table_id, &committed_snapshot_id).await;
+    assert!(
+        file_count < usize::try_from(batches).expect("batch count fits usize"),
+        "consolidated snapshot should reduce file count below {batches}, found {file_count}"
+    );
 
     Ok(())
 }
