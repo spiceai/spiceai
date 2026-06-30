@@ -20353,7 +20353,13 @@ impl CayenneTableProvider {
             Arc::clone(self.context.runtime_env()),
             write_lock,
             Arc::clone(&self.seq_allocator),
-        ))
+        )
+        // `build_deletion_vector_sink` backs only user-visible DELETE paths
+        // (`delete_from`, `delete_using_deletion_vectors`), which surface "rows
+        // affected" — so require a verified count (bypass the count-skipping
+        // PK-IN-list fast path). CDC/internal sinks are built elsewhere and keep
+        // the fast path.
+        .with_exact_count())
     }
 
     /// Delete rows by hash-probing key columns against a set of matched keys.
