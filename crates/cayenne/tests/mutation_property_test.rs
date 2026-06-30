@@ -313,8 +313,10 @@ fn assert_converged(live: &Model, model: &Model, ctx_msg: &str) {
     );
 }
 
-/// Run a query expected to return a single `i64` scalar (a NULL aggregate maps
-/// to 0). Used by the aggregate-query checks below.
+/// Run a query expected to return a single non-null `i64` scalar. Callers
+/// `COALESCE` nullable aggregates (e.g. `COALESCE(SUM(...), 0)`) so the single
+/// cell is never NULL; this helper does not itself map NULL to a value. Used by
+/// the aggregate-query checks below.
 async fn scalar_i64(ctx: &SessionContext, sql: &str) -> TestResult<i64> {
     // Callers are single-cell aggregates (COUNT(*) / COALESCE(SUM(...), 0)) that
     // must return EXACTLY ONE non-null i64 row. Neither zero rows nor extra rows
@@ -409,7 +411,14 @@ enum Op {
 }
 
 fn random_rows(rng: &mut Rng, key_space: i64, batch_size: i64) -> Vec<(i64, i64)> {
+    debug_assert!(
+        batch_size > 0,
+        "random_rows requires a positive batch_size (an op writes >= 1 row); a \
+         zero batch means a misconfigured workload that writes nothing"
+    );
     let mut rows: Vec<(i64, i64)> = Vec::new();
+    // `.max(1)` keeps this division-/loop-safe in release builds; the
+    // debug_assert above catches the misconfiguration in tests.
     for _ in 0..batch_size.max(1) {
         let k = rng.below_i64(key_space);
         let v = rng.below_i64(1_000_000);
