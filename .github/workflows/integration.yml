@@ -63,7 +63,9 @@ jobs:
   check_changes:
     runs-on: spiceai-dev-runners
     outputs:
-      relevant_changes: ${{ steps.check.outputs.relevant_changes }}
+      # Always treat a manual workflow_dispatch run as having relevant changes so the
+      # tests run even when no relevant files changed.
+      relevant_changes: ${{ steps.check.outputs.relevant_changes == 'true' || github.event_name == 'workflow_dispatch' }}
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
