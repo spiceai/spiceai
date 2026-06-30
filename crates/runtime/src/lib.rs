@@ -1900,3 +1900,11 @@ impl From<http::Error> for Error {
         Error::UnableToStartHttpServer { source: err }
     }
 }
+
+impl From<runtime_acceleration::AccelerationParseError> for Error {
+    fn from(err: runtime_acceleration::AccelerationParseError) -> Self {
+        Error::InvalidAccelerationConfiguration {
+            source: Box::new(err),
+        }
+    }
+}

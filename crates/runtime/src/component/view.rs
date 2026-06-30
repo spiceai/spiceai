@@ -133,7 +133,7 @@ impl View {
     pub async fn is_accelerator_initialized(&self) -> bool {
         if let Some(acceleration_settings) = &self.acceleration {
             let Some(accelerator) = self
-                .runtime()
+                .runtime
                 .accelerator_engine_registry()
                 .get_accelerator_engine(acceleration_settings.engine)
                 .await
@@ -255,8 +255,8 @@ impl AccelerationSource for View {
         Arc::clone(&self.app)
     }
 
-    fn runtime(&self) -> Arc<Runtime> {
-        Arc::clone(&self.runtime)
+    fn secrets(&self) -> Arc<tokio::sync::RwLock<crate::secrets::Secrets>> {
+        self.runtime.secrets()
     }
 
     fn acceleration(&self) -> Option<&Acceleration> {
@@ -273,6 +273,10 @@ impl AccelerationSource for View {
 
     fn as_any(&self) -> &dyn std::any::Any {
         self
+    }
+
+    fn runtime_any(&self) -> Option<std::sync::Arc<dyn std::any::Any + Send + Sync>> {
+        Some(Arc::clone(&self.runtime) as std::sync::Arc<dyn std::any::Any + Send + Sync>)
     }
 }
 

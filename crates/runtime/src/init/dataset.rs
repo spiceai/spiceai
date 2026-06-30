@@ -100,7 +100,7 @@ impl Runtime {
             .filter(|ds| init_results.get(&ds.name).is_some_and(Result::is_ok))
             .map(|ds| ds.clone_arc())
             .collect();
-        if let Err(err) = validate_snapshot_paths(initialized_sources).await {
+        if let Err(err) = validate_snapshot_paths(initialized_sources, &self.accelerator_engine_registry).await {
             tracing::error!("{err}");
             return;
         }

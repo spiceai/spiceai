@@ -2683,7 +2683,7 @@ impl DataFusion {
         }
 
         // Get the acceleration layout (used for snapshots and size metrics)
-        let acceleration_layout = get_acceleration_layout(dataset).await.ok();
+        let acceleration_layout = get_acceleration_layout(dataset, &self.accelerator_engine_registry).await.ok();
 
         if acceleration_settings.snapshot_behavior.create_enabled() {
             if let Some(ref layout) = acceleration_layout {
@@ -3170,7 +3170,7 @@ impl DataFusion {
             );
 
             // Snapshot before recreating (best-effort)
-            if let Ok(layout) = get_acceleration_layout(dataset).await
+            if let Ok(layout) = get_acceleration_layout(dataset, &self.accelerator_engine_registry).await
                 && let Some(accel_engine) =
                     engine_to_acceleration_engine(acceleration_settings.engine)
             {
@@ -4805,7 +4805,7 @@ async fn build_snapshot_refresh_state(
     }
 
     // 4. obtain (or warn) a SnapshotManager for this dataset.
-    let acceleration_layout = get_acceleration_layout(dataset)
+    let acceleration_layout = get_acceleration_layout(dataset, &df.accelerator_engine_registry)
         .await
         .context(SnapshotRefreshModeLayoutUnavailableSnafu)?;
     if !acceleration_layout.is_enabled() {

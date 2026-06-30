@@ -23,7 +23,7 @@ use crate::dataaccelerator::cayenne::CayenneAccelerator;
 use crate::{
     component::dataset::acceleration::Acceleration,
     dataaccelerator::{
-        AccelerationSource, acceleration_file_path,
+        AccelerationSource, AcceleratorEngineRegistry, acceleration_file_path,
         spice_sys::{OpenOption, dataset_checkpoint::DatasetCheckpoint},
     },
 };
@@ -194,6 +194,7 @@ pub(crate) async fn snapshot_before_recreate(
 
 pub(crate) async fn validate_snapshot_paths(
     sources: Vec<Arc<dyn AccelerationSource>>,
+    registry: &AcceleratorEngineRegistry,
 ) -> Result<(), SharedAccelerationSnapshotError> {
     let mut paths: HashMap<PathBuf, Vec<String>> = HashMap::new();
 
@@ -210,7 +211,7 @@ pub(crate) async fn validate_snapshot_paths(
             continue;
         }
 
-        match acceleration_file_path(source.as_ref()).await {
+        match acceleration_file_path(source.as_ref(), registry).await {
             Ok(path) => {
                 paths
                     .entry(path)
@@ -425,7 +426,7 @@ mod tests {
             unimplemented!("not needed for validation tests")
         }
 
-        fn runtime(&self) -> Arc<crate::Runtime> {
+        fn secrets(&self) -> Arc<tokio::sync::RwLock<crate::secrets::Secrets>> {
             unimplemented!("not needed for validation tests")
         }
 

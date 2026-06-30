@@ -131,6 +131,27 @@ pub enum Error {
 
 pub type Result<T> = std::result::Result<T, Error>;
 
+impl From<runtime_acceleration::AccelerationParseError> for Error {
+    fn from(e: runtime_acceleration::AccelerationParseError) -> Self {
+        use runtime_acceleration::AccelerationParseError;
+        match e {
+            AccelerationParseError::UnableToParseColumnReference { column_ref, source } => {
+                Error::UnableToParseColumnReference { column_ref, source }
+            }
+            AccelerationParseError::UnableToParseFieldAsDuration { source, field } => {
+                Error::UnableToParseFieldAsDuration { source, field }
+            }
+            AccelerationParseError::MultipleRefreshExpressionSpecified => {
+                Error::MultipleRefreshExpressionSpecified
+            }
+            _ => Error::InvalidConfiguration {
+                config_key: "acceleration".into(),
+                message: e.to_string(),
+            },
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub enum TimeFormat {
     #[default]
@@ -797,8 +818,8 @@ impl AccelerationSource for Dataset {
         self.app()
     }
 
-    fn runtime(&self) -> Arc<Runtime> {
-        self.runtime()
+    fn secrets(&self) -> Arc<tokio::sync::RwLock<crate::secrets::Secrets>> {
+        self.runtime.secrets()
     }
 
     fn acceleration(&self) -> Option<&Acceleration> {
@@ -815,6 +836,10 @@ impl AccelerationSource for Dataset {
 
     fn as_any(&self) -> &dyn std::any::Any {
         self
+    }
+
+    fn runtime_any(&self) -> Option<std::sync::Arc<dyn std::any::Any + Send + Sync>> {
+        Some(Arc::clone(&self.runtime) as std::sync::Arc<dyn std::any::Any + Send + Sync>)
     }
 }
 

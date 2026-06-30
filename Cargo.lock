@@ -16267,6 +16267,7 @@ name = "runtime-acceleration"
 version = "2.1.0-unstable"
 dependencies = [
  "anyhow",
+ "app",
  "arrow",
  "arrow-schema",
  "arrow_tools",
@@ -16276,6 +16277,7 @@ dependencies = [
  "chrono",
  "criterion 0.7.0",
  "datafusion",
+ "datafusion-table-providers",
  "duckdb",
  "fundu",
  "futures",
@@ -16299,6 +16301,7 @@ dependencies = [
  "turso",
  "url",
  "util",
+ "utoipa",
  "uuid 1.23.2",
 ]
 

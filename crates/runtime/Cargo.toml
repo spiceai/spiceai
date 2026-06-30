@@ -341,6 +341,7 @@ openapi = [
     "dep:utoipa-swagger-ui",
     "dep:utoipa",
     "mcp",
+    "runtime-acceleration/openapi",
     "runtime-api-types/openapi",
     "runtime-search/openapi",
     "runtime-tools/openapi",

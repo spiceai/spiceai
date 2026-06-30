@@ -16,14 +16,8 @@ limitations under the License.
 
 use super::{AccelerationSource, BootstrapStatus, DataAccelerator};
 use crate::{
-    App, Runtime,
-    component::{
-        dataset::{
-            Dataset,
-            acceleration::{Acceleration, Engine, Mode, RefreshMode},
-        },
-        view::View,
-    },
+    App,
+    component::dataset::acceleration::{Acceleration, Engine, Mode, RefreshMode},
     dataaccelerator::{
         FilePathError,
         snapshots::{download_snapshot_if_needed, snapshot_before_recreate},
@@ -196,7 +190,6 @@ impl DuckDBAccelerator {
                 let num_accelerating_datasets = self.get_num_accelerating_datasets(
                     Some(duckdb_file.as_str()),
                     &source.app(),
-                    source.runtime(),
                 );
                 let storage =
                     resolve_acceleration_storage_async(acceleration.storage_profile, &duckdb_file)
@@ -224,7 +217,7 @@ impl DuckDBAccelerator {
             }
             (_, Mode::Memory) => {
                 let num_accelerating_datasets =
-                    self.get_num_accelerating_datasets(None, &source.app(), source.runtime());
+                    self.get_num_accelerating_datasets(None, &source.app());
                 let max_size = Self::get_pool_max_size(
                     num_accelerating_datasets,
                     acceleration,
@@ -256,32 +249,39 @@ impl DuckDBAccelerator {
         &self,
         path: Option<&str>,
         app: &Arc<App>,
-        rt: Arc<Runtime>,
     ) -> u32 {
         let mut instance_usage: u32 = 1;
 
-        let datasets = rt.get_valid_datasets(app, crate::LogErrors(false));
-        for ds in datasets {
-            if let Some(acceleration) = &ds.acceleration {
-                if acceleration.engine != Engine::DuckDB {
-                    continue;
+        for spicepod_ds in &app.datasets {
+            let Some(acceleration) = &spicepod_ds.acceleration else {
+                continue;
+            };
+            let engine_str = acceleration.engine.as_deref().unwrap_or("arrow");
+            if engine_str.to_lowercase() != "duckdb" {
+                continue;
+            }
+            // If the path is Some, we're counting the number of file instances
+            if let Some(this_file_path) = path {
+                if matches!(
+                    acceleration.mode,
+                    spicepod::acceleration::Mode::File
+                        | spicepod::acceleration::Mode::FileCreate
+                        | spicepod::acceleration::Mode::FileUpdate
+                ) {
+                    // Check the duckdb_file param to see if they share a file
+                    let ds_file = acceleration
+                        .params
+                        .as_ref()
+                        .and_then(|p| p.as_string_map().get("duckdb_file").cloned())
+                        .unwrap_or_else(|| format!("{}.db", spicepod_ds.name));
+                    if ds_file == this_file_path {
+                        instance_usage += 1;
+                    }
                 }
-
-                // If the path is Some, we're counting the number of file instances
-                if let Some(this_file_path) = path {
-                    if matches!(
-                        acceleration.mode,
-                        Mode::File | Mode::FileCreate | Mode::FileUpdate
-                    ) && let Ok(file_path) = self.file_path(ds.as_ref())
-                        && this_file_path == file_path
-                    {
-                        instance_usage += 1;
-                    }
-                } else {
-                    // If the path is None, we're just counting the number of memory instances
-                    if acceleration.mode == Mode::Memory {
-                        instance_usage += 1;
-                    }
+            } else {
+                // If the path is None, we're just counting the number of memory instances
+                if acceleration.mode == spicepod::acceleration::Mode::Memory {
+                    instance_usage += 1;
                 }
             }
         }
@@ -582,42 +582,45 @@ impl DataAccelerator for DuckDBAccelerator {
                     cmd.options.insert("open".to_string(), duckdb_file);
                 }
 
-                let datasets: Vec<Arc<Dataset>> = Arc::clone(&source.runtime())
-                    .get_initialized_datasets(&source.app(), crate::LogErrors(false))
-                    .await;
-
-                let views: Vec<Arc<View>> = Arc::clone(&source.runtime())
-                    .get_initialized_views(&source.app(), crate::LogErrors(false))
-                    .await;
-
                 let self_path = self.file_path(source)?;
-                let attach_databases = datasets
-                    .into_iter()
-                    .map(|ds| ds as Arc<dyn AccelerationSource>)
-                    .chain(
-                        views
-                            .into_iter()
-                            .map(|view| view as Arc<dyn AccelerationSource>),
-                    )
-                    .filter_map(|other_source| {
-                        if other_source.acceleration().is_some_and(|a| {
-                            a.engine == Engine::DuckDB
-                                && matches!(
-                                    a.mode,
-                                    Mode::File | Mode::FileCreate | Mode::FileUpdate
-                                )
-                        }) {
-                            if other_source.name() == source.name() {
-                                None
-                            } else {
-                                let other_path = self.file_path(other_source.as_ref());
-                                other_path.ok().filter(|p| p != &self_path)
-                            }
+                let app = source.app();
+                // Collect file paths for all other DuckDB file-mode datasets/views
+                // by inspecting the spicepod-level configuration in the app.
+                let attach_databases: HashSet<String> = app
+                    .datasets
+                    .iter()
+                    .filter_map(|spicepod_ds| {
+                        let acceleration = spicepod_ds.acceleration.as_ref()?;
+                        let engine_str =
+                            acceleration.engine.as_deref().unwrap_or("arrow").to_lowercase();
+                        if engine_str != "duckdb" {
+                            return None;
+                        }
+                        let mode_str = format!("{:?}", acceleration.mode).to_lowercase();
+                        if !matches!(mode_str.as_str(), "file" | "file_create" | "file_update") {
+                            return None;
+                        }
+                        // Compute the DuckDB file path from spicepod params
+                        let ds_name =
+                            datafusion::common::TableReference::parse_str(&spicepod_ds.name);
+                        if ds_name.to_string() == source.name().to_string() {
+                            return None;
+                        }
+                        // Use the configured duckdb_file param or default naming
+                        let other_path = acceleration
+                            .params
+                            .as_ref()
+                            .and_then(|p| p.as_string_map().get("duckdb_file").cloned())
+                            .unwrap_or_else(|| {
+                                format!("{}/{}.db", spice_data_base_path(), spicepod_ds.name)
+                            });
+                        if other_path != self_path {
+                            Some(other_path)
                         } else {
                             None
                         }
                     })
-                    .collect::<HashSet<_>>(); // collect unique paths using HashSet
+                    .collect();
 
                 if !attach_databases.is_empty() {
                     cmd.options.insert(

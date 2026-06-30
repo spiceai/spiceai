@@ -460,29 +460,48 @@ impl DataAccelerator for SqliteAccelerator {
                 cmd.options.insert("file".to_string(), sqlite_file);
             }
 
-            let datasets = source
-                .runtime()
-                .get_initialized_datasets(&source.app(), crate::LogErrors(false))
-                .await;
             let self_path = self.file_path(source)?;
-            let attach_databases = datasets
+            let app = source.app();
+            // Compute file paths for all other SQLite file-mode datasets from
+            // spicepod-level configuration in the app.
+            let attach_databases: Vec<String> = app
+                .datasets
                 .iter()
-                .filter_map(|other_dataset| {
-                    if other_dataset.acceleration.as_ref().is_some_and(|a| {
-                        a.engine == Engine::Sqlite
-                            && matches!(a.mode, Mode::File | Mode::FileCreate | Mode::FileUpdate)
-                    }) {
-                        if other_dataset.name() == source.name() {
-                            None
-                        } else {
-                            let other_path = self.file_path(other_dataset.as_ref());
-                            other_path.ok().filter(|p| p != &self_path)
-                        }
+                .filter_map(|spicepod_ds| {
+                    let acceleration = spicepod_ds.acceleration.as_ref()?;
+                    let engine_str =
+                        acceleration.engine.as_deref().unwrap_or("arrow").to_lowercase();
+                    if engine_str != "sqlite" {
+                        return None;
+                    }
+                    if !matches!(
+                        acceleration.mode,
+                        spicepod::acceleration::Mode::File
+                            | spicepod::acceleration::Mode::FileCreate
+                            | spicepod::acceleration::Mode::FileUpdate
+                    ) {
+                        return None;
+                    }
+                    let ds_name =
+                        datafusion::common::TableReference::parse_str(&spicepod_ds.name);
+                    if ds_name.to_string() == source.name().to_string() {
+                        return None;
+                    }
+                    // Use the configured sqlite_file param or default naming
+                    let other_path = acceleration
+                        .params
+                        .as_ref()
+                        .and_then(|p| p.as_string_map().get("sqlite_file").cloned())
+                        .unwrap_or_else(|| {
+                            format!("{}/{}.db", spice_data_base_path(), spicepod_ds.name)
+                        });
+                    if other_path != self_path {
+                        Some(other_path)
                     } else {
                         None
                     }
                 })
-                .collect::<Vec<_>>();
+                .collect();
 
             if !attach_databases.is_empty() {
                 cmd.options
