@@ -6,7 +6,6 @@
 #![expect(clippy::unwrap_used)]
 #![expect(clippy::redundant_clone)]
 #![expect(clippy::equatable_if_let)]
-#![expect(dead_code)]
 
 pub mod content;
 pub mod encryption;
