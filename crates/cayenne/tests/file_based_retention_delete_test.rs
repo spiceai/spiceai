@@ -47,7 +47,7 @@ use datafusion_table_providers::util::{
     column_reference::ColumnReference, on_conflict::OnConflict,
 };
 use object_store::ObjectMeta;
-use std::num::NonZeroUsize;
+use std::num::{NonZero, NonZeroUsize};
 use std::sync::Arc;
 
 type TestResult = Result<(), Box<dyn std::error::Error>>;
@@ -981,7 +981,7 @@ async fn test_orphaned_key_dv_cleaned_after_retention_impl(fixture: TestFixture)
         table_name,
         retention_seconds,
         true,
-        Some(1), // enable orphaned-DV cleanup; the sweep is driven via drain_orphan_dv_sweep
+        NonZero::new(1), // enable orphaned-DV cleanup; the sweep is driven via drain_orphan_dv_sweep
         ctx.runtime_env(),
     )
     .await?;
@@ -1061,7 +1061,7 @@ async fn test_needed_key_dv_retained_after_retention_impl(fixture: TestFixture) 
         table_name,
         retention_seconds,
         true,
-        Some(1), // enable orphaned-DV cleanup; the sweep is driven via drain_orphan_dv_sweep
+        NonZero::new(1), // enable orphaned-DV cleanup; the sweep is driven via drain_orphan_dv_sweep
         ctx.runtime_env(),
     )
     .await?;
@@ -1129,7 +1129,7 @@ async fn test_all_snapshots_emptied_cleans_all_orphaned_dvs_impl(
         table_name,
         retention_seconds,
         true,
-        Some(1), // enable orphaned-DV cleanup; the sweep is driven via drain_orphan_dv_sweep
+        NonZero::new(1), // enable orphaned-DV cleanup; the sweep is driven via drain_orphan_dv_sweep
         ctx.runtime_env(),
     )
     .await?;
@@ -1235,7 +1235,7 @@ async fn test_orphaned_dv_cleanup_below_threshold_retained_impl(
         table_name,
         retention_seconds,
         true,
-        Some(2), // threshold of 2; the single orphan below is under it
+        NonZero::new(2), // threshold of 2; the single orphan below is under it
         ctx.runtime_env(),
     )
     .await?;
