@@ -1596,18 +1596,6 @@ impl MetadataCatalog for CayenneCatalog {
             })
     }
 
-    // INVARIANT (orphaned-DV cleanup): this is a low-level pointer flip on the
-    // live catalog. Today it is only used as part of a wholesale, self-contained
-    // Acceleration Snapshot restore, which re-extracts the snapshot's OWN data and
-    // deletion-vector (`.arrow`) files and metastore before/around this flip and
-    // reloads the provider from scratch — so it never reuses the live table's files.
-    // The orphaned-DV cleanup (`CayenneTableProvider::sweep_orphaned_deletion_vectors`)
-    // relies on that: it deletes DV files once they are below the surviving-sequence
-    // floor. If this primitive is ever used to flip `current_snapshot_id` to an
-    // OLDER snapshot on a LIVE table WITHOUT re-extracting its files, that older
-    // state could reference DV files the sweep already deleted. Before doing so,
-    // either keep orphaned DVs alive longer or reject restoring below the cleanup
-    // point. See the matching note on `sweep_orphaned_deletion_vectors`.
     async fn set_current_snapshot(&self, table_id: &str, snapshot_id: &str) -> CatalogResult<()> {
         self.metastore
             .execute_helper(ExecuteParams {
@@ -1731,6 +1719,18 @@ impl MetadataCatalog for CayenneCatalog {
             })
     }
 
+    // INVARIANT (orphaned-DV cleanup): this is a low-level pointer flip on the
+    // live catalog. Today it is only used as part of a wholesale, self-contained
+    // Acceleration Snapshot restore, which re-extracts the snapshot's OWN data and
+    // deletion-vector (`.arrow`) files and metastore before/around this flip and
+    // reloads the provider from scratch — so it never reuses the live table's files.
+    // The orphaned-DV cleanup (`CayenneTableProvider::sweep_orphaned_deletion_vectors`)
+    // relies on that: it deletes DV files once they are below the surviving-sequence
+    // floor. If this primitive is ever used to flip `current_snapshot_id` to an
+    // OLDER snapshot on a LIVE table WITHOUT re-extracting its files, that older
+    // state could reference DV files the sweep already deleted. Before doing so,
+    // either keep orphaned DVs alive longer or reject restoring below the cleanup
+    // point. See the matching note on `sweep_orphaned_deletion_vectors`.
     async fn get_orphan_eligible_delete_files(
         &self,
         table_id: &str,

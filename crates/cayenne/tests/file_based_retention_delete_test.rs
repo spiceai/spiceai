@@ -47,6 +47,7 @@ use datafusion_table_providers::util::{
     column_reference::ColumnReference, on_conflict::OnConflict,
 };
 use object_store::ObjectMeta;
+use std::num::NonZeroUsize;
 use std::sync::Arc;
 
 type TestResult = Result<(), Box<dyn std::error::Error>>;
@@ -553,7 +554,7 @@ async fn test_pk_file_based_retention_main_table_only_impl(fixture: TestFixture)
         table_name,
         retention_seconds,
         false,
-        0, // no PK upsert here → no key DVs to clean up
+        None, // no PK upsert here → no key DVs to clean up
         ctx.runtime_env(),
     )
     .await?;
@@ -660,7 +661,7 @@ async fn create_pk_retention_table(
     table_name: &str,
     retention_seconds: u64,
     with_upsert: bool,
-    cleanup_min_files: usize,
+    orphaned_dv_cleanup_min_files: Option<NonZeroUsize>,
     runtime_env: Arc<RuntimeEnv>,
 ) -> Result<Arc<CayenneTableProvider>, Box<dyn std::error::Error>> {
     let table_dir = fixture.data_path.join(table_name);
@@ -682,7 +683,7 @@ async fn create_pk_retention_table(
     // via `CayenneTableProvider::drain_orphan_dv_sweep`.
     let vortex_config = cayenne::metadata::VortexConfig {
         inline_max_rows: 0,
-        orphaned_dv_cleanup_min_files: cleanup_min_files,
+        orphaned_dv_cleanup_min_files,
         ..cayenne::metadata::VortexConfig::default()
     };
 
@@ -980,7 +981,7 @@ async fn test_orphaned_key_dv_cleaned_after_retention_impl(fixture: TestFixture)
         table_name,
         retention_seconds,
         true,
-        1, // enable orphaned-DV cleanup; the sweep is driven via drain_orphan_dv_sweep
+        Some(1), // enable orphaned-DV cleanup; the sweep is driven via drain_orphan_dv_sweep
         ctx.runtime_env(),
     )
     .await?;
@@ -1060,7 +1061,7 @@ async fn test_needed_key_dv_retained_after_retention_impl(fixture: TestFixture) 
         table_name,
         retention_seconds,
         true,
-        1, // enable orphaned-DV cleanup; the sweep is driven via drain_orphan_dv_sweep
+        Some(1), // enable orphaned-DV cleanup; the sweep is driven via drain_orphan_dv_sweep
         ctx.runtime_env(),
     )
     .await?;
@@ -1128,7 +1129,7 @@ async fn test_all_snapshots_emptied_cleans_all_orphaned_dvs_impl(
         table_name,
         retention_seconds,
         true,
-        1, // enable orphaned-DV cleanup; the sweep is driven via drain_orphan_dv_sweep
+        Some(1), // enable orphaned-DV cleanup; the sweep is driven via drain_orphan_dv_sweep
         ctx.runtime_env(),
     )
     .await?;
@@ -1185,7 +1186,7 @@ async fn test_orphaned_dv_cleanup_disabled_when_knob_zero_impl(fixture: TestFixt
         table_name,
         retention_seconds,
         true,
-        0, // cleanup DISABLED
+        None, // cleanup DISABLED
         ctx.runtime_env(),
     )
     .await?;
@@ -1234,7 +1235,7 @@ async fn test_orphaned_dv_cleanup_below_threshold_retained_impl(
         table_name,
         retention_seconds,
         true,
-        2, // threshold of 2; the single orphan below is under it
+        Some(2), // threshold of 2; the single orphan below is under it
         ctx.runtime_env(),
     )
     .await?;
@@ -1281,7 +1282,7 @@ async fn test_loader_self_heals_orphaned_missing_dv_impl(fixture: TestFixture) -
         table_name,
         retention_seconds,
         true,
-        0, // disable the sweep so the orphan (row + file) lingers
+        None, // disable the sweep so the orphan (row + file) lingers
         ctx.runtime_env(),
     )
     .await?;
@@ -1332,7 +1333,7 @@ async fn test_loader_errors_on_missing_needed_dv_impl(fixture: TestFixture) -> T
         table_name,
         retention_seconds,
         true,
-        0,
+        None,
         ctx.runtime_env(),
     )
     .await?;
