@@ -127,8 +127,10 @@ pub struct CayenneDeletionSink {
     /// Whether this sink must return a VERIFIED deleted-row count — i.e. it backs
     /// a user-visible `DELETE`, where the count is surfaced to the SQL client as
     /// "rows affected". When false (the CDC/internal default), the `pk IN (...)`
-    /// fast path may persist deletions WITHOUT a scan and return 0; that count is
-    /// a known non-authoritative upper bound (see
+    /// fast path may persist deletions WITHOUT a scan and return 0. That 0 is a
+    /// deliberate non-authoritative placeholder, not an upper bound — the filter's
+    /// extracted PK key set is the upper bound on deletions, and computing the
+    /// exact figure would need the scan this path skips (see
     /// [`Self::delete_filtered_rows_from_tables`]). When true, the fast path is
     /// bypassed so the scan-based path returns an exact count of the live rows
     /// actually removed.
