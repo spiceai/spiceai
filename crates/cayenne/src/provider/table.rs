@@ -9762,6 +9762,16 @@ impl CayenneTableProvider {
     /// orphaned-DV deletion (keep DVs alive longer or reject restoring below the GC
     /// point) — see the matching note on the snapshot set/restore code.
     async fn sweep_orphaned_deletion_vectors(&self) {
+        // Hard per-sweep cap on the orphan working set. This is a fixed upper bound
+        // (NOT `max(min_files)`, which would let a large knob defeat the cap): it
+        // bounds the fetch allocation, the unlink loop, AND — critically — the
+        // single `remove_delete_files` DELETE, which binds one parameter per id and
+        // would exceed the metastore's bound-parameter limit (e.g. SQLite's
+        // ~32766) on a huge batch. The effective threshold is clamped to the cap so
+        // the gate below can still fire; a backlog beyond the cap drains on later
+        // retention passes.
+        const ORPHAN_DV_SWEEP_MAX_BATCH: usize = 4096;
+
         let Some(min_files) = self
             .table_metadata
             .vortex_config
@@ -9791,15 +9801,6 @@ impl CayenneTableProvider {
             }
         };
 
-        // Hard per-sweep cap on the orphan working set. This is a fixed upper bound
-        // (NOT `max(min_files)`, which would let a large knob defeat the cap): it
-        // bounds the fetch allocation, the unlink loop, AND — critically — the
-        // single `remove_delete_files` DELETE, which binds one parameter per id and
-        // would exceed the metastore's bound-parameter limit (e.g. SQLite's
-        // ~32766) on a huge batch. The effective threshold is clamped to the cap so
-        // the gate below can still fire; a backlog beyond the cap drains on later
-        // retention passes.
-        const ORPHAN_DV_SWEEP_MAX_BATCH: usize = 4096;
         let effective_min = min_files.min(ORPHAN_DV_SWEEP_MAX_BATCH);
         let orphaned = match self
             .catalog
