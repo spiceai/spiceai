@@ -105,7 +105,7 @@ mod time_impl {
             // can only fail if the format description below is invalid.
             // A `Time` carries no date, so only the time components are emitted.
             let format =
-                time::format_description::parse_borrowed::<3>("D:[hour][minute][second]Z").unwrap();
+                time::format_description::parse_borrowed::<2>("D:[hour][minute][second]Z").unwrap();
             Object::string_literal(date.format(&format).unwrap().into_bytes())
         }
     }
@@ -114,7 +114,7 @@ mod time_impl {
         fn from(date: OffsetDateTime) -> Self {
             Object::string_literal({
                 // D:%Y%m%d%H%M%S:%z'
-                let format = time::format_description::parse_borrowed::<3>(
+                let format = time::format_description::parse_borrowed::<2>(
                     "D:[year][month][day][hour][minute][second][offset_hour sign:mandatory]'[offset_minute]'",
                 )
                 .unwrap();
@@ -131,7 +131,7 @@ mod time_impl {
         type Error = time::Error;
 
         fn try_from(value: super::DateTime) -> Result<OffsetDateTime, Self::Error> {
-            let format = time::format_description::parse_borrowed::<3>(
+            let format = time::format_description::parse_borrowed::<2>(
                 "[year][month][day][hour][minute][second][offset_hour sign:mandatory][offset_minute]",
             )
             .unwrap();
