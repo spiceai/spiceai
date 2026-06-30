@@ -46,7 +46,6 @@ use crate::{
     embeddings::connector::EmbeddingConnector,
     error_spaced,
     federated_table::FederatedTable,
-    metrics::{self, components::register_component_metric},
     search::full_text::connector::FullTextConnector,
     status,
     tracing_util::dataset_registered_trace,
@@ -58,6 +57,7 @@ use datafusion::sql::TableReference;
 use futures::StreamExt;
 use futures::future::join_all;
 use opentelemetry::KeyValue;
+use runtime_metrics::{self as metrics, components::register_component_metric};
 use snafu::prelude::*;
 use tokio::sync::Semaphore;
 use util::{RetryError, fibonacci_backoff::FibonacciBackoffBuilder, retry};

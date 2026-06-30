@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use crate::Runtime;
 use crate::auth::EndpointAuth;
 use crate::datafusion::DataFusion;
 use crate::datafusion::app_context_extension::AppContextExtension;
@@ -23,7 +24,6 @@ use crate::datafusion::sql_validator::validate_sql_query_read_only;
 use crate::dataupdate::DataUpdateBroadcaster;
 use crate::opentelemetry::create_metrics_service;
 use crate::tls::TlsConfig;
-use crate::{Runtime, metrics as runtime_metrics};
 use app::{App, spicepod::component::runtime::FlightIpcCompression};
 use arrow::array::RecordBatch;
 use arrow::datatypes::{DataType, Schema};
@@ -51,6 +51,7 @@ use governor::{Quota, RateLimiter};
 use metrics::track_flight_request;
 use middleware::{RequestContextLayer, WriteRateLimitLayer};
 use runtime_auth::{AuthRequestContext, FlightBasicAuth, layer::flight::BasicAuthLayer};
+use runtime_metrics;
 use runtime_request_context::{AsyncMarker, RequestContext};
 use snafu::prelude::*;
 use std::num::NonZeroU32;

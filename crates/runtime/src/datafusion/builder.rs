@@ -30,7 +30,7 @@ use crate::cluster::ExecutorRegistry;
 use crate::cluster::ResolvedClusterConfig;
 #[cfg(not(windows))]
 use crate::dataaccelerator::upsert_dedup::UpsertDedupTableProvider;
-use crate::{config::ClusterRole, metrics::telemetry::track_bytes_processed, status};
+use crate::{config::ClusterRole, status};
 use crate::{dataaccelerator::AcceleratorEngineRegistry, datafusion::SPICE_SCP_SCHEMA};
 use cache::Caching;
 #[cfg(not(windows))]
@@ -106,6 +106,7 @@ use runtime_datafusion::{
     url_table::{DynamicUrlCatalogList, SpiceUrlTableFactory},
 };
 use runtime_datafusion_index::analyzer::IndexTableScanExtensionPlanner;
+use runtime_metrics::telemetry::track_bytes_processed;
 use runtime_object_store::registry::SpiceObjectStoreRegistry;
 use spicepod::component::runtime::SpillCompression as SpiceSpillCompression;
 use spicepod::metric::Metrics;

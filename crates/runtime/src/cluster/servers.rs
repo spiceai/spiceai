@@ -15,6 +15,7 @@ limitations under the License.
 */
 
 use super::composite_flight_service::CompositeFlightService;
+use crate::Runtime;
 use crate::auth::EndpointAuth;
 use crate::cluster::ExecutorRegistry;
 use crate::cluster::{ClusterServiceImpl, SchedulerPeers};
@@ -24,10 +25,10 @@ use crate::flight::{
     is_address_in_use_error, session_auth,
 };
 use crate::tls::flight_incoming::tls_incoming;
-use crate::{Runtime, metrics as runtime_metrics};
 use ballista_core::serde::protobuf::scheduler_grpc_server::SchedulerGrpcServer;
 use governor::RateLimiter;
 use runtime_auth::layer::flight::BasicAuthLayer;
+use runtime_metrics;
 use runtime_proto::cluster_service_server::ClusterServiceServer;
 use std::net::SocketAddr;
 use std::sync::Arc;

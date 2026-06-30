@@ -23,6 +23,8 @@ use data_components::{
 use dataformat_json::{SpiceJsonOptions, unnest_struct_schema};
 use datafusion::catalog::TableProvider;
 use futures::StreamExt;
+use runtime_api_types::v1::ComponentType;
+use runtime_metrics::component::{MetricSpec, MetricType, MetricsProvider, ObserveMetricCallback};
 use serde::{Deserialize, Serialize};
 use snafu::prelude::*;
 use std::time::Duration;
@@ -30,11 +32,7 @@ use std::{any::Any, pin::Pin, sync::Arc};
 use tonic::async_trait;
 
 use crate::{
-    component::{
-        ComponentType,
-        dataset::{Dataset, acceleration::RefreshMode},
-        metrics::{MetricSpec, MetricType, MetricsProvider, ObserveMetricCallback},
-    },
+    component::dataset::{Dataset, acceleration::RefreshMode},
     dataaccelerator::spice_sys::{self, OpenOption, kafka::KafkaSys},
     dataconnector::{
         ConnectorComponent, DataConnector, DataConnectorFactory, parameters::ConnectorParams,
