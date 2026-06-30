@@ -10788,8 +10788,9 @@ impl CayenneTableProvider {
         let listed_names: std::collections::BTreeSet<&str> =
             listed.iter().map(|(name, _)| name.as_str()).collect();
 
-        // Cheap check first (no allocation); only materialize the diff for the
-        // log message on a mismatch.
+        // The subset check itself allocates nothing (the two name sets above are
+        // already built); only build the `missing` diff Vec for the log message
+        // when there is actually a mismatch.
         if !listed_names.is_subset(&manifest_names) {
             tracing::warn!(
                 table = %self.table_metadata.table_name,
