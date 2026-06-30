@@ -6956,7 +6956,7 @@ dependencies = [
  "bytes",
  "calamine",
  "docx-rs",
- "pdf-extract 0.12.0 (registry+https://github.com/rust-lang/crates.io-index)",
+ "pdf-extract",
  "quick-xml 0.38.4",
  "snafu",
  "tokio",
@@ -7127,15 +7127,6 @@ dependencies = [
  "tokio",
  "tracing",
  "util",
-]
-
-[[package]]
-name = "ecb"
-version = "0.1.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1a8bfa975b1aec2145850fcaa1c6fe269a16578c44705a532ae3edc92b8881c7"
-dependencies = [
- "cipher 0.4.4",
 ]
 
 [[package]]
@@ -7432,15 +7423,6 @@ name = "euclid"
 version = "0.20.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2bb7ef65b3777a325d1eeefefab5b6d4959da54747e33bd6258e789640f307ad"
-dependencies = [
- "num-traits",
-]
-
-[[package]]
-name = "euclid"
-version = "0.22.14"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f1a05365e3b1c6d1650318537c7460c6923f1abdd272ad6842baa2b509957a06"
 dependencies = [
  "num-traits",
 ]
@@ -11050,33 +11032,6 @@ dependencies = [
 
 [[package]]
 name = "lopdf"
-version = "0.42.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "25aab26d99567469098e64a02f42679f8965c6401263eefa31d8f2dcc37a221c"
-dependencies = [
- "aes 0.8.4",
- "bitflags 2.13.0",
- "cbc 0.1.2",
- "ecb 0.1.2",
- "encoding_rs",
- "flate2",
- "getrandom 0.4.2",
- "indexmap 2.14.0",
- "itoa",
- "log",
- "md-5 0.10.6",
- "nom 8.0.0",
- "rand 0.10.1",
- "rangemap",
- "sha2 0.10.9",
- "stringprep",
- "thiserror 2.0.18",
- "ttf-parser 0.25.1 (registry+https://github.com/rust-lang/crates.io-index)",
- "weezl 0.1.12",
-]
-
-[[package]]
-name = "lopdf"
 version = "0.43.0"
 dependencies = [
  "aes 0.9.1",
@@ -11085,7 +11040,7 @@ dependencies = [
  "chrono",
  "clap",
  "criterion 0.8.2",
- "ecb 0.2.0",
+ "ecb",
  "encoding_rs",
  "env_logger",
  "flate2",
@@ -11109,7 +11064,7 @@ dependencies = [
  "thiserror 2.0.18",
  "time",
  "tokio",
- "ttf-parser 0.25.1",
+ "ttf-parser",
  "wasm-bindgen-test",
  "weezl 0.2.1",
 ]
@@ -13920,32 +13875,15 @@ dependencies = [
  "adobe-cmap-parser",
  "cff-parser",
  "encoding_rs",
- "euclid 0.22.14",
+ "euclid",
  "log",
- "lopdf 0.43.0",
- "postscript 0.19.0",
+ "lopdf",
+ "postscript",
  "simple_logger",
  "test-log",
  "type1-encoding-parser",
  "unicode-normalization",
  "ureq",
-]
-
-[[package]]
-name = "pdf-extract"
-version = "0.12.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "417e8fdc940f1d5bc62c5f89864c3a2255f74f69aa353c98509213d67df61e73"
-dependencies = [
- "adobe-cmap-parser",
- "cff-parser",
- "encoding_rs",
- "euclid 0.20.14",
- "log",
- "lopdf 0.42.0",
- "postscript 0.14.1",
- "type1-encoding-parser",
- "unicode-normalization",
 ]
 
 [[package]]
@@ -14435,12 +14373,6 @@ dependencies = [
  "serde_json",
  "uuid 1.23.2",
 ]
-
-[[package]]
-name = "postscript"
-version = "0.14.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "78451badbdaebaf17f053fd9152b3ffb33b516104eacb45e7864aaa9c712f306"
 
 [[package]]
 name = "postscript"
@@ -20971,12 +20903,6 @@ dependencies = [
  "tiny-skia-path",
  "xmlwriter",
 ]
-
-[[package]]
-name = "ttf-parser"
-version = "0.25.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d2df906b07856748fa3f6e0ad0cbaa047052d4a7dd609e231c4f72cee8c36f31"
 
 [[package]]
 name = "tungstenite"
