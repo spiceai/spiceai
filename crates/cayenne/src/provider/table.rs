@@ -16104,16 +16104,15 @@ impl CayenneTableProvider {
         // already-durable rows (not netted here) is bounded by compaction's
         // periodic `Set` re-baseline, matching the staged path's tradeoff. The
         // stats blob re-merges idempotently regardless of the count delta.
-        let row_count_update = match i64::try_from(flushed_mem_rows) {
-            Ok(delta) => RowCountUpdate::Delta(delta),
-            Err(_) => {
-                tracing::warn!(
-                    table = self.table_metadata.table_name.as_str(),
-                    flushed_mem_rows,
-                    "mem-tier checkpoint flushed row count exceeds i64::MAX; skipping num_rows delta to avoid poisoning the maintained count"
-                );
-                RowCountUpdate::Unchanged
-            }
+        let row_count_update = if let Ok(delta) = i64::try_from(flushed_mem_rows) {
+            RowCountUpdate::Delta(delta)
+        } else {
+            tracing::warn!(
+                table = self.table_metadata.table_name.as_str(),
+                flushed_mem_rows,
+                "mem-tier checkpoint flushed row count exceeds i64::MAX; skipping num_rows delta to avoid poisoning the maintained count"
+            );
+            RowCountUpdate::Unchanged
         };
         self.persist_table_stats(&stats, row_count_update).await;
 
