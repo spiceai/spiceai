@@ -93,6 +93,13 @@ impl Rng {
         debug_assert!(n > 0, "Rng::below requires a positive bound (got 0)");
         self.next_u64() % n.max(1)
     }
+    /// [`Rng::below`] for the `i64` key/value space the model uses. Keeps the
+    /// `u64`↔`i64` conversions in one checked place (the bound must be
+    /// non-negative; the result is in `[0, n)` and so always fits `i64`).
+    fn below_i64(&mut self, n: i64) -> i64 {
+        let bound = u64::try_from(n).expect("Rng::below_i64 bound must be non-negative");
+        i64::try_from(self.below(bound)).expect("value in [0, n) fits i64")
+    }
 }
 
 // ============================================================================
@@ -404,8 +411,8 @@ enum Op {
 fn random_rows(rng: &mut Rng, key_space: i64, batch_size: i64) -> Vec<(i64, i64)> {
     let mut rows: Vec<(i64, i64)> = Vec::new();
     for _ in 0..batch_size.max(1) {
-        let k = rng.below(key_space.cast_unsigned()).cast_signed();
-        let v = rng.below(1_000_000).cast_signed();
+        let k = rng.below_i64(key_space);
+        let v = rng.below_i64(1_000_000);
         // last-writer-wins within the batch (a batch may not repeat a PK)
         if let Some(slot) = rows.iter_mut().find(|(ek, _): &&mut (i64, i64)| *ek == k) {
             slot.1 = v;
@@ -438,7 +445,7 @@ fn gen_op(rng: &mut Rng, w: &OpWeights, key_space: i64, batch_size: i64) -> Op {
                     rows: random_rows(rng, key_space, batch_size),
                 },
                 1 => Op::Delete {
-                    key: rng.below(key_space.cast_unsigned()).cast_signed(),
+                    key: rng.below_i64(key_space),
                 },
                 2 => Op::DeleteAll,
                 3 => Op::Overwrite {
@@ -759,6 +766,35 @@ async fn prop_sequential_position_impl(f: TestFixture) -> TestResult<()> {
 test_with_backends!(prop_sequential_key_impl);
 test_with_backends!(prop_sequential_position_impl);
 
+// --- Focused regression: re-upsert after overwrite+delete stays visible ---
+//
+// The minimal deterministic shape behind the sequential walks: INSERT OVERWRITE
+// a key, DELETE it, then UPSERT it again — the re-upserted value must be visible
+// (the delete tombstone must not outlive the later re-insert). The
+// `prop_sequential_*` walks cover this shape probabilistically across seeds;
+// pinning the exact three-op sequence makes a regression point straight at the
+// cause instead of surfacing as a rare seed-dependent walk failure. Run in both
+// deletion modes, which take different prune paths (key index vs position).
+async fn reupsert_after_overwrite_delete_is_visible_impl(f: TestFixture) -> TestResult<()> {
+    for mode in [Mode::Key, Mode::Position] {
+        let name = format!("reupsert_min_{mode:?}");
+        let (table, ctx) = create_table(&f, &name, mode, None).await?;
+
+        overwrite(&table, &[(1, 100)]).await?;
+        delete(&table, col("id").eq(lit(1))).await?;
+        upsert(&table, &[(1, 200)]).await?;
+
+        let live = read_rows(&ctx, &name).await?;
+        assert_eq!(
+            live.get(&1).copied(),
+            Some(200),
+            "re-upsert after overwrite+delete was lost (mode={mode:?}, expected 200, live={live:?})"
+        );
+    }
+    Ok(())
+}
+test_with_backends!(reupsert_after_overwrite_delete_is_visible_impl);
+
 // --- Concurrent pure-upsert convergence (GREEN control: loss needs deletes) ---
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn prop_concurrent_upsert_only_key_sqlite() -> TestResult<()> {
@@ -898,7 +934,7 @@ async fn run_concurrent_reads_seed(fixture: &TestFixture, mode: Mode, seed: u64)
     for _ in 0..150 {
         let rows: Vec<(i64, i64)> = keyset
             .iter()
-            .map(|&k| (k, rng.below(1_000_000).cast_signed()))
+            .map(|&k| (k, rng.below_i64(1_000_000)))
             .collect();
         overwrite(&table, &rows).await?;
         tokio::time::sleep(std::time::Duration::from_millis(1)).await;
