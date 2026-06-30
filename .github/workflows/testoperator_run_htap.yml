@@ -121,6 +121,25 @@ jobs:
         if: github.event.inputs.runner_type != 'spiceai-dev-xlarge-runners'
         uses: ./.github/actions/setup-chbench-postgres
 
+      # The xlarge PG pod is long-lived, so cache a pristine seed as a Postgres
+      # template database and restore chbench from it (FILE_COPY, seconds) instead
+      # of re-seeding (~tens of minutes at SF1000). On a miss it seeds once via
+      # `testoperator --prepare-only`, freezes the template, then restores. After
+      # this the run below uses `--skip-prepare`. Ephemeral docker-PG runners have
+      # nothing to cache, so they skip this and seed normally.
+      - name: Restore or seed CH-benCH from template
+        if: github.event.inputs.runner_type == 'spiceai-dev-xlarge-runners'
+        run: bash .github/scripts/chbench_template.sh
+        env:
+          SCALE_FACTOR: ${{ github.event.inputs.scale_factor }}
+          TERMINALS: ${{ github.event.inputs.terminals }}
+          SPICEPOD_PATH: ${{ steps.set_spicepod_path.outputs.SPICEPOD_PATH }}
+          SPICED_BIN: /usr/local/bin/spiced
+          CHBENCH_PG_HOST: chbench-postgres.dataplatform.svc.cluster.local
+          CHBENCH_PG_PORT: '5432'
+          CHBENCH_PG_USER: bench
+          CHBENCH_PG_PASS: bench
+
       - name: Run CH-benCHmark - ${{ github.event.inputs.spicepod_path }}
         run: |
           # On the xlarge runner (64-core EPYC, 2 threads/core, SMT siblings are
@@ -151,6 +170,7 @@ jobs:
             --concurrency ${{ github.event.inputs.concurrency }} \
             ${{ github.event.inputs.query_overrides != '' && format('--query-overrides {0}', github.event.inputs.query_overrides) || '' }} \
             --ready-wait ${{ github.event.inputs.ready_wait }} \
+            ${{ github.event.inputs.runner_type == 'spiceai-dev-xlarge-runners' && '--skip-prepare' || '' }} \
             --disable-progress-bars \
             --metrics
         env:

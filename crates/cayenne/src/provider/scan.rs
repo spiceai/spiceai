@@ -322,12 +322,12 @@ impl CayenneAccelerationExec {
     }
 }
 
-/// Refills only the `Precision::Absent` `distinct_count` (NDV) in `child` from
-/// `overlay`, restoring the join-key NDV that the Cayenne base+delta `UnionExec`
-/// drops (a stat-less/empty delta branch makes `col_stats_union` return `Absent`,
-/// collapsing `estimate_inner_join_cardinality` to `min(L, R)`). Present child
-/// stats — filter-aware `num_rows`/`null_count` and any surviving column stat —
-/// are preserved; a column-count mismatch is a defensive no-op.
+/// Refills the `Precision::Absent` `num_rows` and per-column `distinct_count`
+/// (NDV) in `child` from `overlay`, restoring the table size and join-key NDV
+/// that the Cayenne base+delta `UnionExec` drops. A stat-less branch (e.g. a
+/// `collect_stats=false` scan during pending deletions) makes the union return
+/// `num_rows = Absent` — the `(Absent, _) => Absent` rule discards the known
+/// per-branch counts — and makes `col_stats_union` drop NDV.
 ///
 /// `UnionExec` can't fix this itself: an `Absent` branch means *unknown*, not
 /// *empty*, so it must drop the NDV, which isn't additive across branches of
@@ -354,6 +354,12 @@ impl CayenneAccelerationExec {
 fn restore_absent_column_statistics(mut child: Statistics, overlay: &Statistics) -> Statistics {
     if child.column_statistics.len() != overlay.column_statistics.len() {
         return child;
+    }
+    // Backfill an Absent num_rows from the overlay's maintained whole-table count
+    if matches!(child.num_rows, Precision::Absent)
+        && matches!(overlay.num_rows, Precision::Exact(n) | Precision::Inexact(n) if n > 0)
+    {
+        child.num_rows = overlay.num_rows;
     }
     let child_num_rows = child.num_rows;
     for (col, src) in child
@@ -1300,6 +1306,94 @@ mod tests {
         // Absent distinct_count is filled from the overlay.
         assert_eq!(col.distinct_count, Precision::Inexact(50));
         assert_eq!(restored.num_rows, Precision::Exact(100));
+    }
+
+    /// The base+delta `UnionExec` collapses `num_rows` to `Absent` when a branch
+    /// is stat-less (e.g. `collect_stats=false` during pending deletions). The
+    /// overlay's maintained whole-table count backfills it.
+    #[test]
+    fn restore_backfills_absent_num_rows_from_overlay() {
+        use datafusion_common::ColumnStatistics;
+
+        let child = Statistics {
+            num_rows: Precision::Absent, // union collapsed the per-branch counts
+            total_byte_size: Precision::Absent,
+            column_statistics: vec![ColumnStatistics::new_unknown()],
+        };
+        let overlay = Statistics {
+            num_rows: Precision::Inexact(21_420_000), // maintained table count
+            total_byte_size: Precision::Absent,
+            column_statistics: vec![ColumnStatistics::new_unknown()],
+        };
+
+        let restored = restore_absent_column_statistics(child, &overlay);
+        assert_eq!(restored.num_rows, Precision::Inexact(21_420_000));
+    }
+
+    /// A non-positive overlay count (cold/un-seeded aggregate, or the window
+    /// before the first checkpoint seeds a `cdc_durability: memory` table) carries
+    /// no information and must NOT be restored: doing so mis-sizes the join and,
+    /// via the NDV cap, would zero every refilled `distinct_count`. The child stays
+    /// Absent — better than reporting an invalid 0.
+    #[test]
+    fn restore_does_not_backfill_num_rows_from_zero_overlay() {
+        use datafusion_common::ColumnStatistics;
+
+        let child = Statistics {
+            num_rows: Precision::Absent,
+            total_byte_size: Precision::Absent,
+            column_statistics: vec![ColumnStatistics {
+                null_count: Precision::Absent,
+                max_value: Precision::Absent,
+                min_value: Precision::Absent,
+                sum_value: Precision::Absent,
+                distinct_count: Precision::Absent,
+                byte_size: Precision::Absent,
+            }],
+        };
+        let overlay = Statistics {
+            num_rows: Precision::Inexact(0), // un-seeded maintained count
+            total_byte_size: Precision::Absent,
+            column_statistics: vec![ColumnStatistics {
+                null_count: Precision::Absent,
+                max_value: Precision::Absent,
+                min_value: Precision::Absent,
+                sum_value: Precision::Absent,
+                distinct_count: Precision::Inexact(98_421), // good HLL NDV
+                byte_size: Precision::Absent,
+            }],
+        };
+
+        let restored = restore_absent_column_statistics(child, &overlay);
+        // num_rows left Absent (not restored to 0)...
+        assert_eq!(restored.num_rows, Precision::Absent);
+        // ...so the NDV cap does not collapse the refilled distinct_count to 0:
+        // with an Absent row count the cap is a no-op and the good NDV survives.
+        assert_eq!(
+            restored.column_statistics[0].distinct_count,
+            Precision::Inexact(98_421),
+        );
+    }
+
+    /// A present (filter-aware) child `num_rows` must win over the whole-table
+    /// overlay count — the overlay is only a fallback for an `Absent` count.
+    #[test]
+    fn restore_preserves_present_num_rows_over_overlay() {
+        use datafusion_common::ColumnStatistics;
+
+        let child = Statistics {
+            num_rows: Precision::Inexact(500),
+            total_byte_size: Precision::Absent,
+            column_statistics: vec![ColumnStatistics::new_unknown()],
+        };
+        let overlay = Statistics {
+            num_rows: Precision::Inexact(21_420_000),
+            total_byte_size: Precision::Absent,
+            column_statistics: vec![ColumnStatistics::new_unknown()],
+        };
+
+        let restored = restore_absent_column_statistics(child, &overlay);
+        assert_eq!(restored.num_rows, Precision::Inexact(500));
     }
 
     /// The refilled NDV is capped at the child's `num_rows`: a column cannot have

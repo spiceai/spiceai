@@ -43,6 +43,10 @@ ignore = [
   # and the unsoundness (custom-logger `rand::rng()`) is not exercised by this
   # transitive use. Owner: data connectors/runtime.
   "RUSTSEC-2026-0097",
+  # `document_parse` pulls `ttf-parser` through `pdf-extract`/`lopdf`; the author
+  # marked it unmaintained and there is no safe upgrade (the suggested `skrifa`
+  # alternative is not wired through `lopdf`/`pdf-extract`). Owner: document_parse.
+  "RUSTSEC-2026-0192",
 ]
 
 [bans]
