@@ -965,6 +965,28 @@ pub struct Query {
     /// spillable, whereas sort-merge joins spill to disk.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prefer_hash_join: Option<bool>,
+
+    /// Enable the cost-based eager-aggregation physical optimizer, which pushes a
+    /// partial aggregation below a join when a statistics-based cost model
+    /// predicts a large row reduction, then re-aggregates above the join. Maps to
+    /// `datafusion.optimizer.enable_eager_aggregation`. Defaults to `true` in
+    /// spiced (DataFusion's own default is `false`); set to `false` to disable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub eager_aggregation: Option<bool>,
+
+    /// Minimum predicted row-reduction factor required for the eager-aggregation
+    /// cost gate to push an aggregation below a join. Maps to
+    /// `datafusion.optimizer.eager_aggregation_min_reduction_factor`; unset uses
+    /// the DataFusion default (`4`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub eager_aggregation_min_reduction_factor: Option<usize>,
+
+    /// Absolute cap on the number of groups an eager-aggregation push may
+    /// introduce (`0` = uncapped). Maps to
+    /// `datafusion.optimizer.eager_aggregation_max_pushed_groups`; unset uses the
+    /// DataFusion default (`0`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub eager_aggregation_max_pushed_groups: Option<usize>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -1391,6 +1413,9 @@ mod tests {
                 target_partitions: None,
                 max_concurrent_queries: None,
                 prefer_hash_join: None,
+                eager_aggregation: None,
+                eager_aggregation_min_reduction_factor: None,
+                eager_aggregation_max_pushed_groups: None,
             })
         );
 
@@ -1409,6 +1434,9 @@ mod tests {
                 target_partitions: None,
                 max_concurrent_queries: None,
                 prefer_hash_join: None,
+                eager_aggregation: None,
+                eager_aggregation_min_reduction_factor: None,
+                eager_aggregation_max_pushed_groups: None,
             })
         );
 
@@ -1428,6 +1456,9 @@ mod tests {
                 target_partitions: None,
                 max_concurrent_queries: None,
                 prefer_hash_join: None,
+                eager_aggregation: None,
+                eager_aggregation_min_reduction_factor: None,
+                eager_aggregation_max_pushed_groups: None,
             })
         );
 
@@ -1454,6 +1485,9 @@ mod tests {
                 target_partitions: None,
                 max_concurrent_queries: None,
                 prefer_hash_join: None,
+                eager_aggregation: None,
+                eager_aggregation_min_reduction_factor: None,
+                eager_aggregation_max_pushed_groups: None,
             })
         );
 
@@ -1472,6 +1506,9 @@ mod tests {
                 target_partitions: None,
                 max_concurrent_queries: None,
                 prefer_hash_join: None,
+                eager_aggregation: None,
+                eager_aggregation_min_reduction_factor: None,
+                eager_aggregation_max_pushed_groups: None,
             })
         );
 
@@ -1491,6 +1528,9 @@ mod tests {
                 target_partitions: None,
                 max_concurrent_queries: None,
                 prefer_hash_join: None,
+                eager_aggregation: None,
+                eager_aggregation_min_reduction_factor: None,
+                eager_aggregation_max_pushed_groups: None,
             })
         );
 
