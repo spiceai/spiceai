@@ -73,6 +73,7 @@ limitations under the License.
 //!   coordinator (feature-gated).
 pub(crate) mod column_stats;
 pub(crate) mod compaction;
+pub(crate) mod compaction_writer;
 pub(crate) mod constants;
 pub(crate) mod context;
 pub(crate) mod delete;
