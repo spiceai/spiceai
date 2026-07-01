@@ -206,7 +206,8 @@ impl RuntimeStatus {
         let worker_name = name.to_string();
         let metric_value = status.discriminant();
         self.update_component_status(&format!("worker:{worker_name}"), status);
-        runtime_metrics::models::STATUS.record(metric_value, &[KeyValue::new("worker", worker_name)]);
+        runtime_metrics::workers::STATUS
+            .record(metric_value, &[KeyValue::new("worker", worker_name)]);
     }
 
     /// Update the status of a cluster node

@@ -417,15 +417,14 @@ pub static SCHEDULER_RESULT_FETCH_COUNT: LazyLock<Counter<u64>> = LazyLock::new(
 
 /// Duration of result fetch operations in milliseconds.
 /// Labels: `node_id`
-pub static SCHEDULER_RESULT_FETCH_DURATION_MS: LazyLock<Histogram<f64>> =
-    LazyLock::new(|| {
-        CLUSTER_METER
-            .f64_histogram("scheduler_result_fetch_duration_ms")
-            .with_description("Duration of result fetch operations in milliseconds.")
-            .with_unit("ms")
-            .with_boundaries(DURATION_MS_HISTOGRAM_BUCKETS.to_vec())
-            .build()
-    });
+pub static SCHEDULER_RESULT_FETCH_DURATION_MS: LazyLock<Histogram<f64>> = LazyLock::new(|| {
+    CLUSTER_METER
+        .f64_histogram("scheduler_result_fetch_duration_ms")
+        .with_description("Duration of result fetch operations in milliseconds.")
+        .with_unit("ms")
+        .with_boundaries(DURATION_MS_HISTOGRAM_BUCKETS.to_vec())
+        .build()
+});
 
 // =============================================================================
 // Scheduler Operations Metrics

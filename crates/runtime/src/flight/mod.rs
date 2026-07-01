@@ -70,7 +70,7 @@ mod flightsql;
 mod get_flight_info;
 mod get_schema;
 mod handshake;
-mod metrics;
+pub(crate) mod metrics;
 pub mod middleware;
 mod mtls;
 mod session;
