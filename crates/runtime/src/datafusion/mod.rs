@@ -1824,25 +1824,25 @@ impl DataFusion {
             // is absent from the catalog: the placeholder — itself a fully
             // functional provider — stays registered until the real provider
             // atomically replaces it.
-            if let Some(real_provider) = ready.table_provider.clone() {
-                if let Err(e) = self.replace_table(&table_ref, real_provider) {
-                    // The swap failed after we claimed the placeholder. Restore
-                    // it so a later query retries the initialization instead of
-                    // leaving the table stuck as a placeholder that is no longer
-                    // tracked — but only if nothing has been registered under
-                    // this reference since we claimed it, so we can't clobber a
-                    // newer placeholder from a concurrent re-registration with
-                    // our stale one.
-                    let mut pending = self.pending_initializations.write().await;
-                    if !pending.contains_key(&table_ref) {
-                        pending.insert(table_ref.clone(), placeholder);
-                        self.pending_initializations_count
-                            .fetch_add(1, std::sync::atomic::Ordering::Release);
-                    }
-                    return Err(DataFusionError::External(Box::new(std::io::Error::other(
-                        e.to_string(),
-                    ))));
+            if let Some(real_provider) = ready.table_provider.clone()
+                && let Err(e) = self.replace_table(&table_ref, real_provider)
+            {
+                // The swap failed after we claimed the placeholder. Restore
+                // it so a later query retries the initialization instead of
+                // leaving the table stuck as a placeholder that is no longer
+                // tracked — but only if nothing has been registered under
+                // this reference since we claimed it, so we can't clobber a
+                // newer placeholder from a concurrent re-registration with
+                // our stale one.
+                let mut pending = self.pending_initializations.write().await;
+                if !pending.contains_key(&table_ref) {
+                    pending.insert(table_ref.clone(), placeholder);
+                    self.pending_initializations_count
+                        .fetch_add(1, std::sync::atomic::Ordering::Release);
                 }
+                return Err(DataFusionError::External(Box::new(std::io::Error::other(
+                    e.to_string(),
+                ))));
             }
         }
 
