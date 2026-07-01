@@ -66,24 +66,15 @@ pub(crate) async fn run(args: &HtapArgs) -> anyhow::Result<()> {
             .with_additional_args(vec!["--metrics".to_string(), "127.0.0.1:9090".to_string()]);
     }
 
-    // When capturing EXPLAINs, tee spiced's log to the capture dir so the
-    // decline map can read the rule's accept/decline lines after the run.
+    // When capturing EXPLAINs, tee spiced's stdout/stderr to the capture dir.
+    // The eager-aggregation rule emits its accept/decline decisions to stderr
+    // (eprintln), so the decline map is populated at the DEFAULT log level — no
+    // SPICED_LOG override is needed. We deliberately do NOT raise the log level
+    // here: forcing verbose logging for the whole run slowed readiness and
+    // skewed the benchmark's throughput/latency numbers.
     if let Some(dir) = &args.capture_explain {
         std::fs::create_dir_all(dir)?;
         start_request = start_request.with_log_capture(dir.join("spiced.log"));
-
-        // The eager-aggregation rule logs its accept/decline decisions under the
-        // `eager_aggregation` target, which spiced's DEFAULT filter suppresses
-        // (it's not an internal component, so it sits at the global WARN level).
-        // Force it on for the captured spiced so the decline map is populated —
-        // explicitly on the process, not via inheritance. Preserve any existing
-        // SPICED_LOG and just ensure the target is included.
-        let spiced_log = match std::env::var("SPICED_LOG") {
-            Ok(v) if v.contains("eager_aggregation") => v,
-            Ok(v) if !v.is_empty() => format!("{v},eager_aggregation=debug"),
-            _ => "info,eager_aggregation=debug".to_string(),
-        };
-        start_request = start_request.with_env("SPICED_LOG", spiced_log);
     }
 
     // Forward the eager-aggregation experiment env vars explicitly onto the

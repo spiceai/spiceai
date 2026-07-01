@@ -195,9 +195,9 @@ jobs:
           # Diagnostics: capture per-query EXPLAIN / EXPLAIN ANALYZE + the
           # eager-aggregation decline map against the LIVE benchmarked spiced
           # (hot, fully-loaded acceleration) after the workload, before teardown.
-          # testoperator sets SPICED_LOG (with the eager_aggregation target) on
-          # the spiced it spawns, so the rule's accept/decline lines are captured
-          # without relying on env inheritance.
+          # The rule emits its decisions via stderr (eprintln), so this works at
+          # the default log level — no SPICED_LOG override (which would slow the
+          # run and skew the benchmark numbers).
           CAPTURE_ARGS=""
           if [ "${{ github.event.inputs.capture_explain }}" = "true" ]; then
             CAPTURE_ARGS="--capture-explain ${{ runner.temp }}/explain-capture"
