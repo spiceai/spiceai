@@ -169,6 +169,9 @@ impl CayenneContext {
             write_concurrency: wc_init,
             mem_tier_max_bytes: config.cdc_mem_tier_max_bytes,
             target_vortex_file_size_bytes: target_file_size_bytes_init,
+            // Starts at 0 (no queries shed). Only a violated lag/freshness goal
+            // under CPU contention drives it up — inert otherwise.
+            query_admission_reserve: 0,
         }));
         // Bounds keep the controller within sane, memory-/cpu-safe ranges. The
         // memtable and mem-tier ceilings are derived from the runtime-installed
@@ -233,6 +236,11 @@ impl CayenneContext {
             } else {
                 tuning::adaptive_target_file_size_bounds(target_file_size_bytes_init)
             },
+            // Reserve up to `cores` query-admission slots for CDC apply under
+            // contention; the process-global governor re-clamps the reported demand
+            // to the real admission pool's `max - 1`, so this cores-scale ceiling is
+            // a safe upper bound regardless of `runtime.query.max_concurrent_queries`.
+            query_admission_reserve: (0, cores),
         };
         // Register (idempotently) this table's query-observations handle in the
         // process-global registry so the runtime's query tracker can push p99
@@ -670,6 +678,14 @@ impl CayenneContext {
     #[must_use]
     pub(crate) fn live_actuator_values(&self) -> tuning::ActuatorValues {
         self.live_actuators.values()
+    }
+
+    /// Whether closed-loop dynamic tuning is active for this table (an SLO goal is
+    /// set / `cayenne_tuning: adaptive`). Gates the per-tick query-admission reserve
+    /// report so it is a strict no-op for non-adaptive tables.
+    #[must_use]
+    pub(crate) fn dynamic_tuning_enabled(&self) -> bool {
+        self.dynamic_tuning
     }
 
     /// The operator-configured tuning goals (for telemetry/observability — the

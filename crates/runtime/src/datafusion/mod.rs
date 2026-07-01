@@ -1462,6 +1462,25 @@ impl DataFusion {
             "Cayenne global encode-concurrency budget active (caps aggregate write-encode shards across all tables)"
         );
 
+        // Install the process-global query-admission governor so the per-table
+        // adaptive CDC controller can SHED concurrent analytical queries when a
+        // memory-mode table is behind its freshness/lag SLO AND CPU is the
+        // contended resource — handing cores back to the CDC apply — then restore
+        // them when it catches up. Reuses the SAME count-based admission semaphore
+        // the query path acquires from (deadlock-safe: it admits whole queries, not
+        // partitions). A no-op when admission is unbounded
+        // (`runtime.query.max_concurrent_queries` unset → no semaphore).
+        if let Some(semaphore) = self.query_admission_semaphore.as_ref() {
+            // No queries run at install time, so `available_permits()` is the pool's
+            // full capacity (`max_concurrent_queries`).
+            let max = semaphore.available_permits();
+            cayenne::set_query_admission_governor(Arc::clone(semaphore), max);
+            tracing::info!(
+                max_concurrent_queries = max,
+                "Cayenne adaptive query-admission throttle active (controller sheds concurrent queries when CDC is behind its freshness/lag SLO under CPU contention)"
+            );
+        }
+
         // Install the process-global in-memory CDC tier byte budget: the hard
         // aggregate RAM ceiling for `cdc_durability: memory` across ALL Cayenne
         // tables. Per-table `cayenne_cdc_mem_tier_max_bytes` is sized in
