@@ -138,6 +138,19 @@ pub fn optimal_left_deep_join_plan(
         };
     }
 
+    // Safety gate: every operator's expressions must resolve against its
+    // input schema(s). Reordering an island beneath a wrapper, with `Projection`s
+    // between the joins can leave a parent `Projection`/`Aggregate` referencing a column the
+    // new child order no longer exposes at that point.
+    if !plan_columns_resolve(&reordered) {
+        return ReorderOutcome::Failed {
+            plan: original,
+            error: plan_datafusion_err!(
+                "reordered plan references a column that does not resolve in its input schema (reconstruction dropped a column needed by a wrapper)"
+            ),
+        };
+    }
+
     ReorderOutcome::Completed(Transformed::yes(reordered))
 }
 
@@ -155,9 +168,16 @@ fn build_reordered_plan(
     cost_estimator: &dyn JoinCostEstimator,
 ) -> Result<Option<LogicalPlan>> {
     // Convert join subtree to query graph
-    let (query_graph, wrappers) = JoinGraph::try_from_logical_plan(plan)?;
+    let (query_graph, wrappers) = JoinGraph::try_from_logical_plan(plan, cost_estimator)?;
 
-    if query_graph.node_count() < 3 {
+    // Fewer than 3 relations: no top-level join order to choose. Normally a
+    // no-op — UNLESS reordering already changed the plan inside an opaque node's
+    // nested join island (a join subtree the flattener sealed as a single leaf,
+    // e.g. the preserved side of a semi/anti join). In that case the plan HAS
+    // changed even though the top-level graph is too small to reorder, so fall
+    // through and reconstruct it from the (reordered) nodes instead of discarding
+    // the work.
+    if query_graph.node_count() < 3 && !query_graph.opaque_islands_reordered() {
         return Ok(None);
     }
 
@@ -232,6 +252,33 @@ fn join_keys_resolve(plan: &LogicalPlan) -> bool {
         }
     }
     plan.inputs().iter().all(|input| join_keys_resolve(input))
+}
+
+/// Returns `false` if any operator in `plan` references a column that does not
+/// resolve in its input schema(s) — a generalization of [`join_keys_resolve`] to
+/// every node's expressions (`Projection`/`Aggregate`/`Sort`/`Filter`/…). Catches
+/// a reconstruction that reordered an island beneath a wrapper such that a parent
+/// projection now references a column the new child order no longer exposes.
+/// Conservative: a spurious rejection only forfeits the reorder (falls back to
+/// the valid original), never changes results.
+fn plan_columns_resolve(plan: &LogicalPlan) -> bool {
+    let inputs = plan.inputs();
+    for expr in plan.expressions() {
+        for col in expr.column_refs() {
+            // Leaves reference their own output schema; operators reference their
+            // inputs'. A correlated outer column (rare post-decorrelation) that
+            // resolves in neither is treated as unresolved → conservative bail.
+            let resolved = if inputs.is_empty() {
+                plan.schema().has_column(col)
+            } else {
+                inputs.iter().any(|input| input.schema().has_column(col))
+            };
+            if !resolved {
+                return false;
+            }
+        }
+    }
+    inputs.iter().all(|input| plan_columns_resolve(input))
 }
 
 /// Generates an optimized linear join plan from a query graph using the Ibaraki-Kameda algorithm.
