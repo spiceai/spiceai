@@ -1111,10 +1111,14 @@ fn flatten_joins_recursive(
             // as opaque (one un-reordered node). Such joins cost their build
             // side, not inner-join ordering, so little is lost.
             if join.filter.is_some() {
-                // Seal as opaque, but first reorder any inner-join island on the
-                // preserved (LHS) side — e.g. the 5-way chain under chbench q21's
-                // `NOT EXISTS` inequality. Without this the whole join collapses
-                // to one un-reordered node.
+                // Seal as opaque, but first reorder any inner-join island inside
+                // its inputs — both the preserved (LHS) side and the RHS blob
+                // (`reorder_opaque_inputs` maps over every child). E.g. the 5-way
+                // chain under chbench q21's `NOT EXISTS` inequality on the LHS.
+                // Reordering either side is safe: each island preserves its
+                // input's row set and schema, so the semi/anti result is
+                // unchanged. Without this the whole join collapses to one
+                // un-reordered node.
                 return join_graph
                     .add_opaque_reordered_node(LogicalPlan::Join(join), cost_estimator);
             }
