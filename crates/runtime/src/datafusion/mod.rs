@@ -1795,11 +1795,25 @@ impl DataFusion {
             // registration paths that take the catalog lock first).
             {
                 let mut pending = self.pending_initializations.write().await;
-                if pending.remove(&table_ref).is_none() {
-                    continue;
+                match pending.remove(&table_ref) {
+                    // Our placeholder is still the pending one — claim it.
+                    Some(current) if Arc::ptr_eq(&current, &placeholder) => {
+                        self.pending_initializations_count
+                            .fetch_sub(1, std::sync::atomic::Ordering::Release);
+                    }
+                    // A concurrent re-registration (e.g. a schema-change
+                    // recreate) replaced the placeholder after we snapshotted it
+                    // and ran `ensure_ready`. The entry we removed belongs to
+                    // that newer registration and carries its own fresh pending
+                    // initialization; put it back untouched and skip our
+                    // now-stale swap so we don't drop it or register stale data.
+                    Some(current) => {
+                        pending.insert(table_ref.clone(), current);
+                        continue;
+                    }
+                    // Already drained by a concurrent resolver.
+                    None => continue,
                 }
-                self.pending_initializations_count
-                    .fetch_sub(1, std::sync::atomic::Ordering::Release);
             }
 
             // Swap the placeholder out of the catalog with the real provider
@@ -1813,11 +1827,15 @@ impl DataFusion {
             if let Some(real_provider) = ready.table_provider.clone() {
                 if let Err(e) = self.replace_table(&table_ref, real_provider) {
                     // The swap failed after we claimed the placeholder. Restore
-                    // it to the pending registry so a later query retries the
-                    // initialization instead of leaving the table stuck as a
-                    // placeholder that is no longer tracked.
+                    // it so a later query retries the initialization instead of
+                    // leaving the table stuck as a placeholder that is no longer
+                    // tracked — but only if nothing has been registered under
+                    // this reference since we claimed it, so we can't clobber a
+                    // newer placeholder from a concurrent re-registration with
+                    // our stale one.
                     let mut pending = self.pending_initializations.write().await;
-                    if pending.insert(table_ref.clone(), placeholder).is_none() {
+                    if !pending.contains_key(&table_ref) {
+                        pending.insert(table_ref.clone(), placeholder);
                         self.pending_initializations_count
                             .fetch_add(1, std::sync::atomic::Ordering::Release);
                     }
