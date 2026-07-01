@@ -48,6 +48,7 @@ use snafu::{ResultExt, Snafu};
 pub(super) async fn download_snapshot_if_needed(
     acceleration: &Acceleration,
     source: &dyn AccelerationSource,
+    registry: Arc<AcceleratorEngineRegistry>,
     layout: AccelerationLayout,
     engine: AccelerationEngine,
     engine_override: Option<Arc<dyn SnapshotEngine>>,
@@ -72,11 +73,13 @@ pub(super) async fn download_snapshot_if_needed(
     let dataset_name = source.name().to_string();
     let source = source.clone_arc();
     let snapshot_behavior = acceleration.snapshot_behavior.clone();
+    let registry_for_cp = Arc::clone(&registry);
     let checkpoint_factory = make_checkpointer_factory(move || {
         let source = Arc::clone(&source);
         let snapshot_behavior = snapshot_behavior.clone();
+        let registry = Arc::clone(&registry_for_cp);
         async move {
-            DatasetCheckpoint::try_new(source.as_ref(), OpenOption::OpenExisting)
+            DatasetCheckpoint::try_new(source.as_ref(), registry, OpenOption::OpenExisting)
                 .await
                 .boxed()
                 .map(|checkpoint| {

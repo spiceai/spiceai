@@ -2449,7 +2449,7 @@ impl DataFusion {
             self.runtime_status
                 .update_dataset(&dataset.name, status::ComponentStatus::Ready);
         } else if let Ok(checkpoint) =
-            DatasetCheckpoint::try_new(dataset, OpenOption::OpenExisting).await
+            DatasetCheckpoint::try_new(dataset, self.accelerator_engine_registry(), OpenOption::OpenExisting).await
             && checkpoint.exists().await
         {
             // For append refreshes that rely on a time column (i.e. file-based appends) that have
@@ -2732,7 +2732,7 @@ impl DataFusion {
         }
 
         accelerated_table_builder.checkpointer_opt(
-            DatasetCheckpoint::try_new(dataset, OpenOption::CreateIfNotExists)
+            DatasetCheckpoint::try_new(dataset, self.accelerator_engine_registry(), OpenOption::CreateIfNotExists)
                 .await
                 .map(|checkpoint| {
                     checkpoint
@@ -2917,7 +2917,7 @@ impl DataFusion {
             return Ok(None);
         }
 
-        let Ok(cp) = DatasetCheckpoint::try_new(dataset, OpenOption::OpenExisting).await else {
+        let Ok(cp) = DatasetCheckpoint::try_new(dataset, self.accelerator_engine_registry(), OpenOption::OpenExisting).await else {
             return Ok(None);
         };
         let Some(existing_schema) = cp.get_schema().await.ok().flatten() else {
@@ -3873,7 +3873,7 @@ impl DataFusion {
 
         // Detect if data for view was already loaded so we don't need to wait for the first refresh to complete to mark it as ready.
         let mut initial_load_complete = false;
-        if let Ok(checkpoint) = DatasetCheckpoint::try_new(view, OpenOption::OpenExisting).await
+        if let Ok(checkpoint) = DatasetCheckpoint::try_new(view, self.accelerator_engine_registry(), OpenOption::OpenExisting).await
             && checkpoint.exists().await
         {
             initial_load_complete = true;
@@ -3905,7 +3905,7 @@ impl DataFusion {
         builder.initial_load_complete(initial_load_complete);
         builder.caching(Some(Arc::clone(&self.caching)));
         builder.checkpointer_opt(
-            DatasetCheckpoint::try_new(view, OpenOption::CreateIfNotExists)
+            DatasetCheckpoint::try_new(view, self.accelerator_engine_registry(), OpenOption::CreateIfNotExists)
                 .await
                 .map(|checkpoint| {
                     checkpoint
@@ -4831,15 +4831,17 @@ async fn build_snapshot_refresh_state(
     let source_for_checkpointer: Arc<dyn crate::dataaccelerator::AccelerationSource> =
         Arc::new(dataset.clone());
     let snapshot_behavior_for_checkpointer = acceleration_settings.snapshot_behavior.clone();
+    let registry_for_checkpointer = Arc::clone(&df.accelerator_engine_registry);
     let checkpoint_factory =
         runtime_acceleration::dataset_checkpoint::make_checkpointer_factory(move || {
             let source = Arc::clone(&source_for_checkpointer);
             let snapshot_behavior = snapshot_behavior_for_checkpointer.clone();
+            let registry = Arc::clone(&registry_for_checkpointer);
             async move {
                 use crate::dataaccelerator::spice_sys::OpenOption;
                 use crate::dataaccelerator::spice_sys::dataset_checkpoint::DatasetCheckpoint;
                 use snafu::ResultExt;
-                DatasetCheckpoint::try_new(source.as_ref(), OpenOption::OpenExisting)
+                DatasetCheckpoint::try_new(source.as_ref(), registry, OpenOption::OpenExisting)
                     .await
                     .boxed()
                     .map(|checkpoint| {

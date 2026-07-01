@@ -624,7 +624,8 @@ impl FederatedTable {
             return None;
         }
 
-        let checkpoint = DatasetCheckpoint::try_new(dataset.as_ref(), OpenOption::OpenExisting)
+        let registry = dataset.runtime.accelerator_engine_registry();
+        let checkpoint = DatasetCheckpoint::try_new(dataset.as_ref(), registry, OpenOption::OpenExisting)
             .await
             .ok()?;
         Some(checkpoint.to_arc())

@@ -48,9 +48,12 @@ pub trait AccelerationSource: Send + Sync {
     /// Returns a reference to `Any` for downcasting
     fn as_any(&self) -> &dyn std::any::Any;
 
-    /// Returns the runtime as a type-erased `Arc<dyn Any>` for runtime-internal use.
-    /// `Dataset` and `View` return `Some(Arc<Runtime>)`; other sources return `None`.
-    fn runtime_any(&self) -> Option<Arc<dyn std::any::Any + Send + Sync>> {
-        None
+    /// Returns all initialized acceleration sources (datasets and views) known to this source's
+    /// runtime. Used by DuckDB to attach peer file-mode databases. Default returns empty.
+    fn initialized_sources<'a>(
+        &'a self,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Vec<Arc<dyn AccelerationSource>>> + Send + 'a>>
+    {
+        Box::pin(async { vec![] })
     }
 }

@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use super::{AccelerationSource, BootstrapStatus, DataAccelerator};
+use super::{AccelerationSource, AcceleratorEngineRegistry, BootstrapStatus, DataAccelerator};
 use crate::{
     App,
     component::dataset::acceleration::{Acceleration, Engine, Mode, RefreshMode},
@@ -457,6 +457,7 @@ impl DataAccelerator for DuckDBAccelerator {
     async fn init(
         &self,
         source: &dyn AccelerationSource,
+        registry: Arc<AcceleratorEngineRegistry>,
     ) -> Result<BootstrapStatus, Box<dyn std::error::Error + Send + Sync>> {
         if !source.is_file_accelerated() {
             return Ok(BootstrapStatus::none());
@@ -515,6 +516,7 @@ impl DataAccelerator for DuckDBAccelerator {
             let bootstrap_status = download_snapshot_if_needed(
                 acceleration,
                 source,
+                registry,
                 runtime_acceleration::snapshot::AccelerationLayout::file(PathBuf::from(path)),
                 AccelerationEngine::DuckDB,
                 None,
@@ -583,41 +585,26 @@ impl DataAccelerator for DuckDBAccelerator {
                 }
 
                 let self_path = self.file_path(source)?;
-                let app = source.app();
-                // Collect file paths for all other DuckDB file-mode datasets/views
-                // by inspecting the spicepod-level configuration in the app.
-                let attach_databases: HashSet<String> = app
-                    .datasets
-                    .iter()
-                    .filter_map(|spicepod_ds| {
-                        let acceleration = spicepod_ds.acceleration.as_ref()?;
-                        let engine_str =
-                            acceleration.engine.as_deref().unwrap_or("arrow").to_lowercase();
-                        if engine_str != "duckdb" {
+                // Collect file paths for all other initialized DuckDB file-mode datasets/views.
+                let attach_databases: HashSet<String> = source
+                    .initialized_sources()
+                    .await
+                    .into_iter()
+                    .filter_map(|other| {
+                        let acceleration = other.acceleration()?;
+                        if acceleration.engine != Engine::DuckDB {
                             return None;
                         }
                         if !matches!(
                             acceleration.mode,
-                            spicepod::acceleration::Mode::File
-                                | spicepod::acceleration::Mode::FileCreate
-                                | spicepod::acceleration::Mode::FileUpdate
+                            Mode::File | Mode::FileCreate | Mode::FileUpdate
                         ) {
                             return None;
                         }
-                        // Compute the DuckDB file path from spicepod params
-                        let ds_name =
-                            datafusion::common::TableReference::parse_str(&spicepod_ds.name);
-                        if ds_name.to_string() == source.name().to_string() {
+                        if other.name() == source.name() {
                             return None;
                         }
-                        // Use the configured duckdb_file param or default naming
-                        let other_path = acceleration
-                            .params
-                            .as_ref()
-                            .and_then(|p| p.as_string_map().get("duckdb_file").cloned())
-                            .unwrap_or_else(|| {
-                                format!("{}/{}.db", spice_data_base_path(), spicepod_ds.name)
-                            });
+                        let other_path = self.file_path(other.as_ref()).ok()?;
                         if other_path != self_path {
                             Some(other_path)
                         } else {
@@ -2173,7 +2160,7 @@ mod tests {
         assert!(!accelerator.is_initialized(&dataset));
 
         accelerator
-            .init(&dataset)
+            .init(&dataset, dataset.runtime.accelerator_engine_registry())
             .await
             .expect("initialization should be successful");
 

@@ -69,18 +69,6 @@ pub use snapshots::{CayenneSnapshotValidationError, validate_cayenne_snapshot_co
 pub use types::{AccelerationSource, AcceleratorEngineRegistry};
 pub use runtime_acceleration::BootstrapStatus;
 
-/// Gets the registered `DataAccelerator` instance for the given engine by accessing the
-/// runtime's accelerator engine registry through the source's type-erased runtime handle.
-async fn get_registered_accelerator(
-    source: &dyn AccelerationSource,
-    engine: Engine,
-) -> Option<Arc<dyn DataAccelerator>> {
-    let runtime = source
-        .runtime_any()?
-        .downcast::<crate::Runtime>()
-        .ok()?;
-    runtime.accelerator_engine_registry().get_accelerator_engine(engine).await
-}
 
 #[derive(Clone, Copy)]
 pub struct AcceleratorRegistration {
@@ -408,6 +396,7 @@ pub trait DataAccelerator: Send + Sync {
     async fn init(
         &self,
         _source: &dyn AccelerationSource,
+        _registry: Arc<AcceleratorEngineRegistry>,
     ) -> Result<BootstrapStatus, Box<dyn std::error::Error + Send + Sync>> {
         Ok(BootstrapStatus::none())
     }

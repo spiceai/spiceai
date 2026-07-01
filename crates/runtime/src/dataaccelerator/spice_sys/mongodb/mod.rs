@@ -93,9 +93,10 @@ pub struct MongoSys {
 
 impl MongoSys {
     pub async fn try_new(dataset: &Dataset, open_option: OpenOption) -> Result<Self> {
+        let registry = dataset.runtime.accelerator_engine_registry();
         Ok(Self {
             dataset_name: dataset.name.to_string(),
-            acceleration_connection: acceleration_connection(dataset, open_option).await?,
+            acceleration_connection: acceleration_connection(dataset, registry, open_option).await?,
         })
     }
 

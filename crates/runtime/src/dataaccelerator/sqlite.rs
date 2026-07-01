@@ -19,7 +19,7 @@ use std::sync::Arc;
 use crate::{
     component::dataset::acceleration::{Engine, Mode},
     dataaccelerator::{
-        FilePathError,
+        AcceleratorEngineRegistry, FilePathError,
         snapshots::{download_snapshot_if_needed, snapshot_before_recreate},
         storage::{ResolvedAccelerationStorage, resolve_acceleration_storage_async},
     },
@@ -364,6 +364,7 @@ impl DataAccelerator for SqliteAccelerator {
     async fn init(
         &self,
         source: &dyn AccelerationSource,
+        registry: Arc<AcceleratorEngineRegistry>,
     ) -> Result<BootstrapStatus, Box<dyn std::error::Error + Send + Sync>> {
         if !source.is_file_accelerated() {
             return Ok(BootstrapStatus::none());
@@ -421,6 +422,7 @@ impl DataAccelerator for SqliteAccelerator {
             let bootstrap_status = download_snapshot_if_needed(
                 acceleration,
                 source,
+                registry,
                 runtime_acceleration::snapshot::AccelerationLayout::file(PathBuf::from(path)),
                 AccelerationEngine::Sqlite,
                 None,
@@ -1015,7 +1017,7 @@ mod tests {
         assert!(!accelerator.is_initialized(&dataset));
 
         accelerator
-            .init(&dataset)
+            .init(&dataset, dataset.runtime.accelerator_engine_registry())
             .await
             .expect("initialization should be successful");
 
