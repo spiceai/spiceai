@@ -848,12 +848,7 @@ impl ExecutionPlan for FlightSqlExec {
         }
 
         let inner =
-            query_to_stream(
-                client,
-                sql,
-                Arc::clone(&self.cookie_store),
-            )
-            .map(move |result| {
+            query_to_stream(client, sql, Arc::clone(&self.cookie_store)).map(move |result| {
                 result.and_then(|batch| coerce_batch_to_schema(&batch, &target_schema))
             });
 
@@ -1320,11 +1315,7 @@ mod tests {
         let client: FlightSqlClient =
             arrow_flight::sql::client::FlightSqlServiceClient::new(channel);
 
-        let batches = query_to_stream(
-            client,
-            "SELECT 1".to_string(),
-            Arc::clone(&cookie_store),
-        )
+        let batches = query_to_stream(client, "SELECT 1".to_string(), Arc::clone(&cookie_store))
             .try_collect::<Vec<_>>()
             .await
             .expect("query should succeed");
@@ -1586,10 +1577,9 @@ mod tests {
         let handle = tokio::spawn(async move {
             tonic::transport::Server::builder()
                 .add_service(FlightServiceServer::new(service))
-                .serve_with_incoming_shutdown(
-                    TcpListenerStream::new(listener),
-                    async move { let _ = shutdown_rx.await; },
-                )
+                .serve_with_incoming_shutdown(TcpListenerStream::new(listener), async move {
+                    let _ = shutdown_rx.await;
+                })
                 .await
         });
 
@@ -1604,14 +1594,10 @@ mod tests {
             arrow_flight::sql::client::FlightSqlServiceClient::new(channel);
         client.set_token(TOKEN_VALUE.to_string());
 
-        let _batches = query_to_stream(
-            client,
-            "SELECT 1".to_string(),
-            Arc::clone(&cookie_store),
-        )
-        .try_collect::<Vec<_>>()
-        .await
-        .expect("query should succeed");
+        let _batches = query_to_stream(client, "SELECT 1".to_string(), Arc::clone(&cookie_store))
+            .try_collect::<Vec<_>>()
+            .await
+            .expect("query should succeed");
 
         assert!(
             token_seen.load(Ordering::SeqCst),
@@ -1619,7 +1605,10 @@ mod tests {
         );
 
         let _ = shutdown_tx.send(());
-        handle.await.expect("server should finish").expect("server should exit cleanly");
+        handle
+            .await
+            .expect("server should finish")
+            .expect("server should exit cleanly");
     }
 
     // -----------------------------------------------------------------------
@@ -1634,110 +1623,113 @@ mod tests {
     }
     #[async_trait]
     impl FlightService for TokenFlightSqlService {
-    type HandshakeStream = EmptyResponseStream<arrow_flight::HandshakeResponse>;
-    type ListFlightsStream = EmptyResponseStream<FlightInfo>;
-    type DoGetStream = EmptyResponseStream<FlightData>;
-    type DoPutStream = EmptyResponseStream<PutResult>;
-    type DoExchangeStream = EmptyResponseStream<FlightData>;
-    type DoActionStream = EmptyResponseStream<arrow_flight::Result>;
-    type ListActionsStream = EmptyResponseStream<ActionType>;
+        type HandshakeStream = EmptyResponseStream<arrow_flight::HandshakeResponse>;
+        type ListFlightsStream = EmptyResponseStream<FlightInfo>;
+        type DoGetStream = EmptyResponseStream<FlightData>;
+        type DoPutStream = EmptyResponseStream<PutResult>;
+        type DoExchangeStream = EmptyResponseStream<FlightData>;
+        type DoActionStream = EmptyResponseStream<arrow_flight::Result>;
+        type ListActionsStream = EmptyResponseStream<ActionType>;
 
-    async fn handshake(
-        &self,
-        _request: Request<tonic::Streaming<arrow_flight::HandshakeRequest>>,
-    ) -> Result<Response<Self::HandshakeStream>, Status> {
-        Err(Status::unimplemented("handshake"))
-    }
-
-    async fn list_flights(
-        &self,
-        _request: Request<Criteria>,
-    ) -> Result<Response<Self::ListFlightsStream>, Status> {
-        Err(Status::unimplemented("list_flights"))
-    }
-
-    async fn get_flight_info(
-        &self,
-        _request: Request<FlightDescriptor>,
-    ) -> Result<Response<FlightInfo>, Status> {
-        // Return an endpoint pointing back at this server so the client
-        // must create a per-endpoint FlightSqlServiceClient and call DoGet on it.
-        let endpoint = FlightEndpoint {
-            ticket: Some(Ticket { ticket: Bytes::from_static(b"tok-ticket") }),
-            location: vec![Location { uri: self.location.clone() }],
-            expiration_time: None,
-            app_metadata: Bytes::new(),
-        };
-        Ok(Response::new(FlightInfo {
-            schema: Bytes::new(),
-            flight_descriptor: None,
-            endpoint: vec![endpoint],
-            total_records: -1,
-            total_bytes: -1,
-            ordered: false,
-            app_metadata: Bytes::new(),
-        }))
-    }
-
-    async fn poll_flight_info(
-        &self,
-        _request: Request<FlightDescriptor>,
-    ) -> Result<Response<PollInfo>, Status> {
-        Err(Status::unimplemented("poll_flight_info"))
-    }
-
-    async fn get_schema(
-        &self,
-        _request: Request<FlightDescriptor>,
-    ) -> Result<Response<SchemaResult>, Status> {
-        Err(Status::unimplemented("get_schema"))
-    }
-
-    async fn do_get(
-        &self,
-        request: Request<Ticket>,
-    ) -> Result<Response<Self::DoGetStream>, Status> {
-        // Enforce bearer-token auth: reject if the token is missing or wrong.
-        let auth = request
-            .metadata()
-            .get("authorization")
-            .and_then(|v| v.to_str().ok())
-            .ok_or_else(|| Status::unauthenticated("missing authorization header"))?;
-        if auth != format!("Bearer {}", self.expected_token) {
-            return Err(Status::unauthenticated("invalid bearer token"));
+        async fn handshake(
+            &self,
+            _request: Request<tonic::Streaming<arrow_flight::HandshakeRequest>>,
+        ) -> Result<Response<Self::HandshakeStream>, Status> {
+            Err(Status::unimplemented("handshake"))
         }
-        self.cookie_seen.store(true, Ordering::SeqCst);
-        self.token_seen.store(true, Ordering::SeqCst);
-        Ok(Response::new(tokio_stream::empty()))
-    }
 
-    async fn do_put(
-        &self,
-        _request: Request<tonic::Streaming<FlightData>>,
-    ) -> Result<Response<Self::DoPutStream>, Status> {
-        Err(Status::unimplemented("do_put"))
-    }
+        async fn list_flights(
+            &self,
+            _request: Request<Criteria>,
+        ) -> Result<Response<Self::ListFlightsStream>, Status> {
+            Err(Status::unimplemented("list_flights"))
+        }
 
-    async fn do_exchange(
-        &self,
-        _request: Request<tonic::Streaming<FlightData>>,
-    ) -> Result<Response<Self::DoExchangeStream>, Status> {
-        Err(Status::unimplemented("do_exchange"))
-    }
+        async fn get_flight_info(
+            &self,
+            _request: Request<FlightDescriptor>,
+        ) -> Result<Response<FlightInfo>, Status> {
+            // Return an endpoint pointing back at this server so the client
+            // must create a per-endpoint FlightSqlServiceClient and call DoGet on it.
+            let endpoint = FlightEndpoint {
+                ticket: Some(Ticket {
+                    ticket: Bytes::from_static(b"tok-ticket"),
+                }),
+                location: vec![Location {
+                    uri: self.location.clone(),
+                }],
+                expiration_time: None,
+                app_metadata: Bytes::new(),
+            };
+            Ok(Response::new(FlightInfo {
+                schema: Bytes::new(),
+                flight_descriptor: None,
+                endpoint: vec![endpoint],
+                total_records: -1,
+                total_bytes: -1,
+                ordered: false,
+                app_metadata: Bytes::new(),
+            }))
+        }
 
-    async fn do_action(
-        &self,
-        _request: Request<Action>,
-    ) -> Result<Response<Self::DoActionStream>, Status> {
-        Err(Status::unimplemented("do_action"))
-    }
+        async fn poll_flight_info(
+            &self,
+            _request: Request<FlightDescriptor>,
+        ) -> Result<Response<PollInfo>, Status> {
+            Err(Status::unimplemented("poll_flight_info"))
+        }
 
-    async fn list_actions(
-        &self,
-        _request: Request<Empty>,
-    ) -> Result<Response<Self::ListActionsStream>, Status> {
-        Err(Status::unimplemented("list_actions"))
-    }
+        async fn get_schema(
+            &self,
+            _request: Request<FlightDescriptor>,
+        ) -> Result<Response<SchemaResult>, Status> {
+            Err(Status::unimplemented("get_schema"))
+        }
+
+        async fn do_get(
+            &self,
+            request: Request<Ticket>,
+        ) -> Result<Response<Self::DoGetStream>, Status> {
+            // Enforce bearer-token auth: reject if the token is missing or wrong.
+            let auth = request
+                .metadata()
+                .get("authorization")
+                .and_then(|v| v.to_str().ok())
+                .ok_or_else(|| Status::unauthenticated("missing authorization header"))?;
+            if auth != format!("Bearer {}", self.expected_token) {
+                return Err(Status::unauthenticated("invalid bearer token"));
+            }
+            self.cookie_seen.store(true, Ordering::SeqCst);
+            self.token_seen.store(true, Ordering::SeqCst);
+            Ok(Response::new(tokio_stream::empty()))
+        }
+
+        async fn do_put(
+            &self,
+            _request: Request<tonic::Streaming<FlightData>>,
+        ) -> Result<Response<Self::DoPutStream>, Status> {
+            Err(Status::unimplemented("do_put"))
+        }
+
+        async fn do_exchange(
+            &self,
+            _request: Request<tonic::Streaming<FlightData>>,
+        ) -> Result<Response<Self::DoExchangeStream>, Status> {
+            Err(Status::unimplemented("do_exchange"))
+        }
+
+        async fn do_action(
+            &self,
+            _request: Request<Action>,
+        ) -> Result<Response<Self::DoActionStream>, Status> {
+            Err(Status::unimplemented("do_action"))
+        }
+
+        async fn list_actions(
+            &self,
+            _request: Request<Empty>,
+        ) -> Result<Response<Self::ListActionsStream>, Status> {
+            Err(Status::unimplemented("list_actions"))
+        }
     }
 }
-
