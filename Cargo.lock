@@ -4061,7 +4061,7 @@ checksum = "510ca239cf13b7f8d16a2b48f263de7b4f8c566f0af58d901031473c76afb1e3"
 name = "connector-abfs"
 version = "2.1.0-unstable"
 dependencies = [
- "object_store",
+ "object_store 0.13.2",
  "runtime",
  "secrecy",
  "snafu",
@@ -4084,7 +4084,7 @@ dependencies = [
  "datafusion",
  "datafusion-table-providers",
  "futures",
- "parking_lot 0.12.5",
+ "parking_lot",
  "runtime",
  "secrecy",
  "sha2 0.10.9",
@@ -4266,7 +4266,7 @@ dependencies = [
 name = "connector-gcs"
 version = "2.1.0-unstable"
 dependencies = [
- "object_store",
+ "object_store 0.13.2",
  "runtime",
  "snafu",
  "tokio",
@@ -4282,7 +4282,7 @@ dependencies = [
  "datafusion",
  "globset",
  "opentelemetry",
- "reqwest 0.12.24",
+ "reqwest 0.13.4",
  "runtime",
  "secrecy",
  "snafu",
@@ -4307,7 +4307,7 @@ dependencies = [
  "governor",
  "graphql-parser",
  "http 1.4.1",
- "reqwest 0.12.24",
+ "reqwest 0.13.4",
  "runtime",
  "runtime-rate-control",
  "runtime-secrets",
@@ -20073,7 +20073,7 @@ version = "2.1.0-unstable"
 dependencies = [
  "chrono",
  "jsonwebtoken 10.4.0",
- "reqwest 0.12.24",
+ "reqwest 0.13.4",
  "secrecy",
  "serde",
  "sha2 0.10.9",

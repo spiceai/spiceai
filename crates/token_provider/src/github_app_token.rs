@@ -292,9 +292,9 @@ async fn generate_token(
         .header("Accept", "application/vnd.github+json")
         .header("Authorization", format!("Bearer {jwt_token}"))
         .header("X-GitHub-Api-Version", "2022-11-28")
-        .header("User-Agent", "spice")
         .send()
         .await
+        .and_then(reqwest::Response::error_for_status)
         .context(UnableToGetGitHubInstallationAccessTokenSnafu {})?;
 
     #[expect(clippy::items_after_statements)]
