@@ -118,6 +118,16 @@ pub(crate) static INGESTION_LAG_MS: LazyLock<Gauge<i64>> = LazyLock::new(|| {
         .build()
 });
 
+pub(crate) static CDC_REPLICATION_LAG_MS: LazyLock<Gauge<i64>> = LazyLock::new(|| {
+    METER
+        .i64_gauge("dataset_acceleration_cdc_replication_lag_ms")
+        .with_description(
+            "CDC replication lag in milliseconds: wall-clock now minus the freshest applied upstream commit timestamp. Low/zero = caught up; growing = falling behind.",
+        )
+        .with_unit("ms")
+        .build()
+});
+
 pub(crate) static SIZE_BYTES: LazyLock<Gauge<u64>> = LazyLock::new(|| {
     METER
         .u64_gauge("dataset_acceleration_size_bytes")

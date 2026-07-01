@@ -35,7 +35,7 @@ use super::{
     pgoutput::{DecodedMessage, Decoder},
     schema_evolution::RelationSchemaTracker,
 };
-use crate::cdc::{ChangeEnvelope, ChangesStream, StreamError};
+use crate::cdc::{ChangeEnvelope, ChangesStream, StreamError, build_heartbeat_envelope};
 
 pub struct WalStreamInput {
     pub params: ReplicationParams,
@@ -494,7 +494,7 @@ fn wal_stream(
                     metrics.set_confirmed_flush_lsn(applied);
                     client.update_applied_lsn(Lsn(applied));
                 }
-                ReplicationEvent::KeepAlive { wal_end, reply_requested: _, .. } => {
+                ReplicationEvent::KeepAlive { wal_end, server_time_micros, .. } => {
                     metrics.set_server_wal_end(wal_end.0);
                     // KeepAlive `wal_end` can advance even when this publication
                     // emitted no table changes. If no decoded transaction is
@@ -511,6 +511,31 @@ fn wal_stream(
                     );
                     metrics.set_confirmed_flush_lsn(applied);
                     client.update_applied_lsn(Lsn(applied));
+
+                    // Idle heartbeat: a keepalive means the server has sent us all
+                    // WAL through `wal_end`, so when no transaction is mid-buffer we
+                    // are caught up to the source. Emit a zero-row heartbeat stamped
+                    // with the server's own clock (`server_time_micros`) — a direct,
+                    // liveness-backed signal that only advances when the server
+                    // actually replied — so the replication-lag gauge reads ~0 while
+                    // idle instead of freezing at the last transaction's commit time.
+                    // Skipped while a transaction is buffered: we still owe its rows,
+                    // so the dataset is not caught up.
+                    if txn.is_none()
+                        && let Some(server_ts_ms) = pg_epoch_to_system_time(server_time_micros)
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .ok()
+                            .and_then(|d| i64::try_from(d.as_millis()).ok())
+                    {
+                        match build_heartbeat_envelope(&working_schema, server_ts_ms) {
+                            Ok(envelope) => yield envelope,
+                            Err(error) => tracing::warn!(
+                                dataset = %dataset_name,
+                                %error,
+                                "Failed to build Postgres CDC heartbeat envelope; replication-lag gauge may go stale while the stream is idle"
+                            ),
+                        }
+                    }
                 }
                 ReplicationEvent::Message { .. } => {}
                 ReplicationEvent::StoppedAt { reached } => {

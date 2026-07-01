@@ -97,7 +97,9 @@ use super::{
     config::ReplicationParams,
     pgoutput, resilience, slot,
 };
-use crate::cdc::{ChangeEnvelope, ChangesStream, CommitChange, CommitError, StreamError};
+use crate::cdc::{
+    ChangeEnvelope, ChangesStream, CommitChange, CommitError, StreamError, build_heartbeat_envelope,
+};
 use crate::postgres_replication::pgoutput::RelationId;
 
 /// Bounded per-member delivery queue. When one member's sink stops draining,
@@ -988,7 +990,11 @@ async fn run_pump(source: Arc<SharedSource>) {
                     source.for_each_member_metrics(|m| m.set_confirmed_flush_lsn(flush));
                     client.update_applied_lsn(Lsn(flush));
                 }
-                ReplicationEvent::KeepAlive { wal_end, .. } => {
+                ReplicationEvent::KeepAlive {
+                    wal_end,
+                    server_time_micros,
+                    ..
+                } => {
                     source.for_each_member_metrics(|m| m.set_server_wal_end(wal_end.0));
                     if !txn_open {
                         source.ack.credit_idle(wal_end.0);
@@ -996,6 +1002,40 @@ async fn run_pump(source: Arc<SharedSource>) {
                     let flush = source.ack.flush_lsn();
                     source.for_each_member_metrics(|m| m.set_confirmed_flush_lsn(flush));
                     client.update_applied_lsn(Lsn(flush));
+
+                    // Idle heartbeat: with no transaction mid-buffer the shared slot is
+                    // caught up to the source as of the keepalive's server clock. Fan a
+                    // zero-row heartbeat (stamped with `server_time_micros`, a direct
+                    // liveness-backed server signal) out to every live member so each
+                    // dataset's replication-lag gauge reads ~0 while idle instead of
+                    // freezing at its last commit. The `NoOpCommitter` inside
+                    // `build_heartbeat_envelope` advances no LSN — the idle credit above
+                    // already moved the slot forward.
+                    if !txn_open
+                        && let Some(server_ts_ms) =
+                            client::pg_epoch_to_system_time(server_time_micros)
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .ok()
+                                .and_then(|d| i64::try_from(d.as_millis()).ok())
+                    {
+                        for (member_key, member) in source.live_members() {
+                            match build_heartbeat_envelope(&member.schema, server_ts_ms) {
+                                Ok(envelope) => {
+                                    if member.sender.send(Ok(envelope)).await.is_err() {
+                                        source.detach_member(
+                                            &member_key,
+                                            "changes stream receiver dropped",
+                                        );
+                                    }
+                                }
+                                Err(error) => tracing::warn!(
+                                    dataset = %member.dataset_name,
+                                    %error,
+                                    "Failed to build Postgres CDC heartbeat envelope; replication-lag gauge may go stale while the stream is idle"
+                                ),
+                            }
+                        }
+                    }
                 }
                 ReplicationEvent::Message { .. } => {}
                 ReplicationEvent::StoppedAt { reached } => {

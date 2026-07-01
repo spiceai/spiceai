@@ -1367,6 +1367,23 @@ impl RefreshTask {
             .record(u64::try_from(burst_bytes).unwrap_or(u64::MAX), &labels);
         metrics::CDC_APPLY_BURST_ROWS_TOTAL.add(burst_rows, &labels);
 
+        // CDC replication lag: wall-clock now minus the freshest upstream commit
+        // timestamp in this burst. `source_commit_ts_ms` is stamped by the source
+        // connector (Postgres commit time, MongoDB change-stream cluster time,
+        // Debezium source ts); the max over the burst is the most recent.
+        // Sources that don't stamp a timestamp leave it `None` and record nothing.
+        if let Some(max_commit_ts_ms) = burst
+            .iter()
+            .filter_map(|item| item.as_ref().ok())
+            .filter_map(|env| env.change_batch.source_commit_ts_ms())
+            .max()
+        {
+            metrics::CDC_REPLICATION_LAG_MS.record(
+                (util::time::now_unix_ms() - max_commit_ts_ms).max(0),
+                &labels,
+            );
+        }
+
         // Walk the burst preserving arrival order, processing contiguous
         // runs of Ok envelopes together and Err items individually so error
         // handling and ordering semantics match the pre-coalesce behavior.
