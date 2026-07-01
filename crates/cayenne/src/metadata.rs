@@ -728,16 +728,17 @@ pub struct VortexConfig {
     /// compaction's seq-prefix bake (see [`crate::provider::memory_account`]: "the
     /// real bound on deletions is compaction"), not by this knob.
     ///
-    /// `Some(20)` is the default. `None` (or the spicepod param set to `0`)
-    /// disables cleanup entirely — no background sweep is spawned, so the
-    /// file-based DELETE path acquires no extra locks and runs no catalog scan
-    /// (the pre-feature behavior). The `NonZeroUsize` type makes a misconfigured
-    /// `0` unrepresentable; the spicepod param (`cayenne_orphaned_dv_cleanup_min_files`)
-    /// maps `0` (or unset) to the default. A larger value sweeps less often
+    /// `Some(20)` is the default. `None` disables cleanup entirely — no
+    /// background sweep is spawned, so the file-based DELETE path acquires no
+    /// extra locks and runs no catalog scan (the pre-feature behavior). The
+    /// `NonZeroUsize` type makes a misconfigured `0` unrepresentable; the spicepod
+    /// param (`cayenne_orphaned_dv_cleanup_min_files`) maps `0` to `None`
+    /// (disabled) and, when left unset, falls back to this default (`20`). A
+    /// larger value sweeps less often
     /// (cheaper, but orphaned `.arrow` files linger on disk longer); a smaller
     /// value reclaims disk sooner. Each orphaned `.arrow` file's size scales with
     /// the number of deletions it records, so lingering disk ≈
-    /// `n_tables × threshold × avg_dv_size` (avg_dv_size was ~63 KiB, up to
+    /// `n_tables × threshold × avg_dv_size` (`avg_dv_size` was ~63 KiB, up to
     /// ~870 KiB, in an SF-100 CH-benCHmark sample). The sweep is lock-free and
     /// runs off the write path on the dedicated compaction runtime, so this only
     /// trades sweep frequency against lingering disk — never ingest latency.
