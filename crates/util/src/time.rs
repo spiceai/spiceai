@@ -28,15 +28,6 @@ pub fn system_time_to_unix_ms(t: SystemTime) -> Option<i64> {
     i64::try_from(t.duration_since(UNIX_EPOCH).ok()?.as_millis()).ok()
 }
 
-/// Current wall-clock time in milliseconds since the Unix epoch. Used to compute
-/// CDC replication lag as `now_unix_ms() - source_commit_ts_ms`. Falls back to `0`
-/// only in the impossible cases the clock is pre-epoch or the value overflows
-/// `i64`.
-#[must_use]
-pub fn now_unix_ms() -> i64 {
-    system_time_to_unix_ms(SystemTime::now()).unwrap_or(0)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
