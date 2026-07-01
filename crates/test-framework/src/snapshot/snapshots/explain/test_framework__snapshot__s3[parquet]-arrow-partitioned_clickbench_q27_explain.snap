@@ -13,19 +13,18 @@ description: "Query: clickbench_q27"
 | physical_plan | ProjectionExec: expr=[SearchPhrase@0 as SearchPhrase]                                                                                      |
 |               |   SortPreservingMergeExec: [to_timestamp(EventTime@1) ASC NULLS LAST, SearchPhrase@0 ASC NULLS LAST], fetch=10                             |
 |               |     SortExec: TopK(fetch=10), expr=[to_timestamp(EventTime@1) ASC NULLS LAST, SearchPhrase@0 ASC NULLS LAST], preserve_partitioning=[true] |
-|               |       ProjectionExec: expr=[SearchPhrase@1 as SearchPhrase, EventTime@0 as EventTime]                                                      |
-|               |         FilterExec: SearchPhrase@1 !=                                                                                                      |
-|               |           SchemaCastScanExec                                                                                                               |
-|               |             PartitionedUnionExec                                                                                                           |
-|               |               BytesProcessedExec                                                                                                           |
-|               |                 DataSourceExec: partitions=16, partition_sizes=[<redacted>]                                                                |
-|               |               BytesProcessedExec                                                                                                           |
-|               |                 DataSourceExec: partitions=16, partition_sizes=[<redacted>]                                                                |
-|               |               BytesProcessedExec                                                                                                           |
-|               |                 DataSourceExec: partitions=16, partition_sizes=[<redacted>]                                                                |
-|               |               BytesProcessedExec                                                                                                           |
-|               |                 DataSourceExec: partitions=16, partition_sizes=[<redacted>]                                                                |
-|               |               BytesProcessedExec                                                                                                           |
-|               |                 DataSourceExec: partitions=16, partition_sizes=[<redacted>]                                                                |
+|               |       FilterExec: SearchPhrase@1 != , projection=[SearchPhrase@1, EventTime@0]                                                             |
+|               |         SchemaCastScanExec                                                                                                                 |
+|               |           PartitionedUnionExec                                                                                                             |
+|               |             BytesProcessedExec                                                                                                             |
+|               |               DataSourceExec: partitions=16, partition_sizes=[<redacted>]                                                                  |
+|               |             BytesProcessedExec                                                                                                             |
+|               |               DataSourceExec: partitions=16, partition_sizes=[<redacted>]                                                                  |
+|               |             BytesProcessedExec                                                                                                             |
+|               |               DataSourceExec: partitions=16, partition_sizes=[<redacted>]                                                                  |
+|               |             BytesProcessedExec                                                                                                             |
+|               |               DataSourceExec: partitions=16, partition_sizes=[<redacted>]                                                                  |
+|               |             BytesProcessedExec                                                                                                             |
+|               |               DataSourceExec: partitions=16, partition_sizes=[<redacted>]                                                                  |
 |               |                                                                                                                                            |
 +---------------+--------------------------------------------------------------------------------------------------------------------------------------------+
