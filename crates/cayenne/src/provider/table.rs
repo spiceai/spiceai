@@ -7262,6 +7262,20 @@ impl CayenneTableProvider {
         let apply_epoch = self
             .mem_tier_apply_epoch
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        // Reserve ONE (delete, data) sequence pair for the WHOLE apply, here under
+        // `write_lock` (the caller holds it for the entire apply), and share it
+        // across every shard's append below. The shards' key spaces are disjoint
+        // (PK-sharded), so a single `delete < data` point is correct for all of
+        // them. Pulling this `.await` OUT of each shard's publish lock is the
+        // pipelining that makes `append_to_shard` synchronous while it holds that
+        // lock — the property the off-`write_lock` checkpoint relies on to clear
+        // the shard tiers without deadlocking a concurrent apply. `write_lock`
+        // serializes this reservation against the checkpoint capture's
+        // snapshot-sequence reservation (the capture also takes `write_lock` at
+        // N>1), so the publish lock is not needed for the ordering here. Bonus: it
+        // cuts the per-apply metastore seq reservations from 2N to 2.
+        let base_sequence = self.reserve_sequences_local(2).await?;
+        let reserved_sequences = (base_sequence, base_sequence + 1);
         let append_futures = per_shard_validated.iter().enumerate().filter_map(
             |(s, (filtered_batches, deletions, kept))| {
                 let has_rows = filtered_batches.iter().any(|b| b.num_rows() > 0);
@@ -7280,6 +7294,7 @@ impl CayenneTableProvider {
                     kept,
                     // Upsert path: maintained-aggregate retraction is DELETE-driven.
                     None,
+                    Some(reserved_sequences),
                 ))
             },
         );
@@ -15907,6 +15922,10 @@ impl CayenneTableProvider {
             let apply_epoch = self
                 .mem_tier_apply_epoch
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            // One shared (delete, data) pair, reserved here under `write_lock` and
+            // passed in so the shard append's lock-held region stays synchronous
+            // (see `validate_and_append_sharded` / `append_to_shard`).
+            let base_sequence = self.reserve_sequences_local(2).await?;
             let no_keys: HashSet<OwnedRow> = HashSet::new();
             self.append_to_shard(
                 0,
@@ -15917,6 +15936,7 @@ impl CayenneTableProvider {
                 Some(apply_epoch),
                 &no_keys,
                 None,
+                Some((base_sequence, base_sequence + 1)),
             )
             .await?;
             return Ok(apply_epoch);
@@ -15955,6 +15975,12 @@ impl CayenneTableProvider {
         let apply_epoch = self
             .mem_tier_apply_epoch
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        // One shared (delete, data) pair for the whole apply, reserved here under
+        // `write_lock` and passed into every shard's append so each shard's
+        // publish-lock-held region is synchronous — the property the off-`write_lock`
+        // checkpoint relies on (see `validate_and_append_sharded`).
+        let base_sequence = self.reserve_sequences_local(2).await?;
+        let reserved_sequences = (base_sequence, base_sequence + 1);
         let no_keys: HashSet<OwnedRow> = HashSet::new();
         let append_futures = per_shard
             .iter()
@@ -15973,6 +15999,7 @@ impl CayenneTableProvider {
                     &no_keys,
                     // N>1 sharded delete: no maintained-aggregate retraction (see append_to_shard).
                     None,
+                    Some(reserved_sequences),
                 ))
             });
         futures::future::try_join_all(append_futures).await?;
@@ -16225,6 +16252,10 @@ impl CayenneTableProvider {
             None,
             &no_keys,
             maintained_aggregate_delete_rows,
+            // N=1 / legacy path: reserve the (delete, data) pair under the publish
+            // lock inside `append_to_shard` (the N=1 checkpoint takes no write_lock,
+            // so that lock is what serializes it against the checkpoint).
+            None,
         )
         .await
     }
@@ -16264,6 +16295,21 @@ impl CayenneTableProvider {
         // — so a maintained aggregate over an N>1 table does not retract on the
         // sharded path (a known limit of the opt-in N>1 path).
         maintained_aggregate_delete_rows: Option<&RecordBatch>,
+        // Pre-reserved `(delete_sequence, data_sequence)` pair for this apply, or
+        // `None` to reserve it here under the publish lock. `Some` ONLY on the N>1
+        // sharded callers (`validate_and_append_sharded` /
+        // `append_delete_intents_sharded`), which reserve ONE pair per apply up
+        // front under `write_lock` and share it across all shards (their key spaces
+        // are disjoint, so one `delete < data` point is correct). Passing it in
+        // keeps this lock-held region fully SYNCHRONOUS — no `reserve_sequences_local`
+        // `.await` while holding the publish lock — which is what lets the
+        // off-`write_lock` checkpoint clear take the shard locks without deadlocking
+        // a concurrent apply (a lock held across the reserve-await was the
+        // apply-vs-clear cycle). `None` on the N=1 / legacy callers reserves under
+        // the lock exactly as before (byte-identical: at N=1 the checkpoint takes no
+        // `write_lock`, so this lock is the only thing serializing the reservation
+        // against the checkpoint's snapshot-sequence reservation).
+        reserved_sequences: Option<(i64, i64)>,
     ) -> Result<u64> {
         // INVARIANT: at N>1 every mem-tier append MUST carry a `source_position` (the
         // per-apply `apply_epoch` slot-ack axis). A `None`-stamped append on a sharded
@@ -16332,17 +16378,30 @@ impl CayenneTableProvider {
             );
             let fence_work_start = Instant::now();
 
-            // Reserve the (delete, data) pair INSIDE the publish lock: append
-            // sequence assignment must be mutually exclusive with a checkpoint's
-            // snapshot-sequence reservation — see the capture block in
-            // `checkpoint_mem_tier` for the full ordering invariant (an
-            // unserialized reserve permanently over-counts). Both the append and
-            // the checkpoint capture now reserve under THIS lock (no longer the
-            // listing fence). delete below data so new rows survive their own
-            // tombstones; shared durable allocator for monotonicity.
-            let base_sequence = self.reserve_sequences_local(2).await?;
-            let delete_sequence = base_sequence;
-            let data_sequence = base_sequence + 1;
+            // Sequence assignment. `delete` below `data` so new rows survive their
+            // own tombstones; the shared durable allocator keeps one monotone domain.
+            //
+            // `None` (N=1 / legacy callers): reserve the (delete, data) pair HERE,
+            // INSIDE the publish lock. The N=1 checkpoint takes no `write_lock`, so
+            // this lock is the ONLY thing serializing this reservation against the
+            // checkpoint's snapshot-sequence reservation (both reserve under it) —
+            // an unserialized reserve permanently over-counts (§2.3d). This `.await`
+            // under the lock is harmless at N=1: there is exactly one publish lock,
+            // so no cross-lock hold-and-wait can form.
+            //
+            // `Some` (N>1 sharded callers): the pair was reserved ONCE for the whole
+            // apply under `write_lock`. At N>1 `write_lock` already excludes the
+            // checkpoint capture (which also takes `write_lock`), so the publish lock
+            // is not needed to serialize the reservation — and NOT awaiting here is
+            // what keeps the lock-held region synchronous, so an append never holds a
+            // publish lock across an await and the off-`write_lock` checkpoint clear
+            // cannot deadlock it.
+            let (delete_sequence, data_sequence) = if let Some(pair) = reserved_sequences {
+                pair
+            } else {
+                let base_sequence = self.reserve_sequences_local(2).await?;
+                (base_sequence, base_sequence + 1)
+            };
             // STAMP the off-lock-built key set with the reserved delete sequence
             // (O(1) — only the scalar is set; the keys were built off-lock). This
             // is the single sequence applied to EVERY superseded key in this apply
@@ -16582,16 +16641,28 @@ impl CayenneTableProvider {
         // covers rows never captured.
         let n = self.mem_tier.shard_count();
         let capture_start = Instant::now();
-        // LOAD-BEARING: at N>1 `write_lock` is held across the WHOLE checkpoint
-        // (capture + off-fence encode + commit + clear), NOT just the capture.
-        // Scoping it to the capture alone (releasing before the encode) DEADLOCKED
-        // under sustained N>1 load — a concurrent apply racing the checkpoint's clear
-        // hung spiced after ~57 checkpoints in the SF-100 N=4 run (20-min log silence,
-        // health endpoint dead). So this serialization is required for deadlock-safety.
-        // It does NOT cause the WAL-drain stall: with this hold in place, checkpoints
-        // still fire ~57× yet the source slot does not advance — the real stall is
-        // downstream in the slot-ack watermark (under investigation), not here.
-        let _capture_write_guard = if acquire_write_lock_for_capture && n > 1 {
+        // At N>1 the capture takes `write_lock` so it observes an apply's N shard
+        // appends as all-or-none (the torn-capture guard above). It is held ONLY for
+        // the capture and RELEASED before the off-fence encode (see the drop after
+        // the capture timer below), so concurrent CDC applies run IN PARALLEL with
+        // the durable encode — the off-`write_lock` checkpoint that lets the heavy
+        // tables (order_line/stock) keep draining at N>1 instead of stalling behind
+        // every checkpoint's encode.
+        //
+        // A prior attempt to release here DEADLOCKED: a concurrent apply held a shard
+        // publish lock across its `reserve_sequences_local().await` while the clear
+        // walked the shard locks in index order → a cross-lock cycle. That is now
+        // structurally impossible — the sharded apply reserves its (delete, data)
+        // pair ONCE up front (under `write_lock`) and passes it down, so
+        // `append_to_shard` holds a publish lock only for a synchronous swap, never
+        // across an await (see `validate_and_append_sharded` / `append_to_shard`).
+        // With no lock-across-await on the apply side, the clear's index-order
+        // acquisition cannot form a cycle with an apply.
+        //
+        // When the caller already holds `write_lock` (the inline-spill / `evolve_schema`
+        // path, `acquire_write_lock_for_capture == false`), this is `None` and the
+        // caller's lock correctly stays held through the whole checkpoint.
+        let mut capture_write_guard = if acquire_write_lock_for_capture && n > 1 {
             Some(self.write_lock.lock().await)
         } else {
             None
@@ -16680,17 +16751,24 @@ impl CayenneTableProvider {
             )
         };
         // The all-shards-atomic capture window: the per-shard snapshot load +
-        // sequence reservation under the publish locks. At N>1 `write_lock` is held
-        // from before this span through the WHOLE checkpoint (capture + encode +
-        // commit — see the LOAD-BEARING note above; the encode is NOT off-write_lock
-        // here), so this metric isolates the CAPTURE portion of that hold. The encode
-        // portion is `mem_tier_checkpoint` (total) minus this; comparing the two
-        // localizes a per-checkpoint apply-stall to the capture vs the encode.
+        // sequence reservation under the publish locks (and `write_lock` at N>1).
+        // The encode/commit below run OUTSIDE this window, so this metric isolates
+        // the CAPTURE portion; the encode portion is `mem_tier_checkpoint` (total)
+        // minus this.
         record_cayenne_write_phase(
             &self.table_metadata.table_name,
             "mem_tier_checkpoint_capture",
             capture_start,
         );
+        // Capture complete — RELEASE `write_lock` before the off-fence encode/commit
+        // so concurrent applies proceed IN PARALLEL with the durable encode (the
+        // off-`write_lock` checkpoint). Everything below reads only the immutable
+        // captured `shard_snapshots`/`snapshot` (Arc clones) and the already-reserved
+        // `snapshot_sequence`, which pins the ordering invariant — a post-capture
+        // apply reserves strictly above it and its new segment is preserved by the
+        // clear's `retain_after`. A no-op when the caller holds `write_lock`
+        // (spill/evolve): `capture_write_guard` is None.
+        drop(capture_write_guard.take());
         // Emptiness must be judged on the REAL captured shard snapshots, not the
         // synthetic union view: `union_snapshot_view` carries the cross-shard
         // tombstone union + the summed byte/row counts but ALWAYS has empty
@@ -21067,6 +21145,20 @@ impl super::compaction::CompactionRunner for CayenneTableProvider {
                 "Cayenne dynamic auto-tune adjustment applied",
             );
         }
+
+        // Report this table's query-admission reserve demand to the process-global
+        // governor EVERY tick (not only when `retune` moved it): the governor holds
+        // permits on the shared admission semaphore to shed concurrent queries when
+        // this table is behind under CPU contention, and it converges its held set
+        // over ticks as running queries free permits — so it must see the current
+        // demand each tick. Gated on dynamic tuning so it is a strict no-op for
+        // non-adaptive tables (and a no-op when no governor is installed).
+        if self.context.dynamic_tuning_enabled() {
+            super::query_admission::set_table_admission_reserve(
+                table.as_str(),
+                self.context.live_actuator_values().query_admission_reserve,
+            );
+        }
     }
 
     fn background_interval_hint(&self) -> Option<std::time::Duration> {
@@ -24856,6 +24948,140 @@ mod tests {
                 "shard {s} drained by the background tick at N>1"
             );
         }
+    }
+
+    /// REGRESSION + STRESS (off-`write_lock` N>1 checkpoint — the apply-vs-clear
+    /// deadlock). The checkpoint releases `write_lock` right after the all-shards
+    /// capture, so a concurrent CDC apply runs IN PARALLEL with the off-fence
+    /// encode and the per-shard clear. The clear walks the shard publish locks in
+    /// index order while an apply takes those same locks via its fan-out. What makes
+    /// that safe is the PIPELINED sequence reservation: the sharded apply reserves
+    /// its `(delete, data)` pair ONCE up front (under `write_lock`) and passes it
+    /// down, so `append_to_shard` holds a publish lock only for a synchronous swap —
+    /// never across an `.await`. If an append held a lock across its
+    /// `reserve_sequences_local().await` (the pre-pipeline shape) it would form a
+    /// cross-lock cycle with the clear's index-order walk and hang spiced (the
+    /// SF-100 N=4 ~57-checkpoint deadlock). This test hammers a sharded (N=4) table
+    /// with concurrent writers while a checkpoint loop drains it, all under a
+    /// timeout: a deadlock hangs and trips the timeout. It also asserts LWW
+    /// correctness (disjoint per-writer key ranges — latest round wins, identical to
+    /// a serial run) and that the tier fully drains + the slot advances to the final
+    /// apply epoch despite the concurrent clears.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn sharded_cdc_concurrent_applies_and_checkpoint_no_deadlock() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        const N: usize = 4;
+        const WRITERS: i64 = 4;
+        const ROUNDS: i64 = 40;
+        const KEYS_PER_WRITER: i64 = 8;
+
+        let ctx = SessionContext::new();
+        let runtime_env = ctx.runtime_env();
+        let (provider, _catalog, _tmp) =
+            create_sharded_cdc_upsert_table("concurrent_ckpt_n4", Arc::clone(&runtime_env), N)
+                .await;
+        let provider = Arc::new(provider);
+        let schema = Arc::clone(&provider.table_metadata.schema);
+
+        let durable = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        provider.install_slot_advancer(Arc::new(EpochRecorder(Arc::clone(&durable))));
+
+        // Background checkpoint loop: fire the production drain trigger repeatedly so
+        // a checkpoint's off-fence encode/clear overlaps the writers' applies — the
+        // exact window the fix must keep deadlock-free. Stops when the writers do.
+        let stop = Arc::new(AtomicBool::new(false));
+        let ckpt = {
+            let provider = Arc::clone(&provider);
+            let stop = Arc::clone(&stop);
+            tokio::spawn(async move {
+                while !stop.load(Ordering::Relaxed) {
+                    provider.run_mem_tier_checkpoint_tick().await;
+                    tokio::task::yield_now().await;
+                }
+            })
+        };
+
+        // Concurrent writers, each on a DISJOINT key range so the converged state is
+        // deterministic regardless of interleaving: every key is written by exactly
+        // one writer and that writer's rounds are sequential, so the latest round
+        // (highest sequence) is the LWW winner. Writers still collide on shards and
+        // race the checkpoint clear — the contention the fix targets.
+        let writers: Vec<_> = (0..WRITERS)
+            .map(|w| {
+                let provider = Arc::clone(&provider);
+                let schema = Arc::clone(&schema);
+                let ctx = ctx.clone();
+                tokio::spawn(async move {
+                    let mut max_epoch = 0_u64;
+                    for r in 0..ROUNDS {
+                        let rows: Vec<(i64, i64)> =
+                            (0..KEYS_PER_WRITER).map(|i| (w * 1000 + i, r)).collect();
+                        if let Some(e) =
+                            apply_upsert_burst(&ctx, &provider, Arc::clone(&schema), &rows).await
+                        {
+                            max_epoch = max_epoch.max(e);
+                        }
+                    }
+                    max_epoch
+                })
+            })
+            .collect();
+
+        // A deadlock would hang in `join_all`; the timeout turns that into a clear,
+        // non-flaky failure (the fix can only ever pass — no deadlock is reachable).
+        let results = tokio::time::timeout(
+            std::time::Duration::from_mins(1),
+            futures::future::join_all(writers),
+        )
+        .await
+        .expect(
+            "concurrent applies + checkpoint deadlocked at N>1 — the apply-vs-clear cycle \
+             (a publish lock held across the reserve-await racing the clear's index-order walk)",
+        );
+        let global_max_epoch = results
+            .into_iter()
+            .map(|r| r.expect("writer task panicked"))
+            .max()
+            .expect("at least one writer");
+        assert!(
+            global_max_epoch > 0,
+            "the writers actually applied to the tier"
+        );
+
+        // Stop the checkpoint loop, then drain whatever is still resident.
+        stop.store(true, Ordering::Relaxed);
+        ckpt.await.expect("checkpoint loop task panicked");
+        provider
+            .checkpoint_mem_tier()
+            .await
+            .expect("final drain checkpoint");
+
+        // The tier fully drained and the slot advanced to the final apply epoch — the
+        // WAL-drain property holds even with applies racing the clears.
+        for s in 0..N {
+            assert!(
+                provider.mem_tier.shard(s).load().is_empty(),
+                "shard {s} fully drained after the final checkpoint"
+            );
+        }
+        assert_eq!(
+            durable.load(Ordering::SeqCst),
+            global_max_epoch,
+            "the slot must advance to the latest apply epoch once everything is durable",
+        );
+
+        // LWW correctness: every key shows its LAST round's value (ROUNDS-1),
+        // identical to a serial run — no apply was lost or reordered by a concurrent
+        // checkpoint/clear, and the shared per-apply sequence pair preserved ordering.
+        let mut expected: Vec<(i64, i64)> = (0..WRITERS)
+            .flat_map(|w| (0..KEYS_PER_WRITER).map(move |i| (w * 1000 + i, ROUNDS - 1)))
+            .collect();
+        expected.sort_unstable();
+        assert_eq!(
+            collect_id_value_pairs(&ctx, &provider, "concurrent_ckpt_n4").await,
+            expected,
+            "concurrent sharded applies under a checkpoint loop converge to the serial LWW result",
+        );
     }
 
     /// REGRESSION (SF-100 N=4 WAL-drain stall, ROOT CAUSE). The `!pending_pk_deletions`
