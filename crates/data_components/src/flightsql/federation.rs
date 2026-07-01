@@ -101,13 +101,13 @@ impl SQLExecutor for FlightSQLTable {
         schema: SchemaRef,
         _filters: &[Arc<dyn datafusion::physical_plan::PhysicalExpr>],
     ) -> DataFusionResult<SendableRecordBatchStream> {
+        let mut client = self.client.clone();
+        if let Some(token) = &self.token {
+            client.set_token(token.clone());
+        }
         Ok(Box::pin(RecordBatchStreamAdapter::new(
             schema,
-            query_to_stream(
-                self.client.clone(),
-                query.to_string(),
-                Arc::clone(&self.cookie_store),
-            ),
+            query_to_stream(client, query.to_string(), Arc::clone(&self.cookie_store)),
         )))
     }
 
