@@ -1,0 +1,95 @@
+[package]
+authors = [
+    "Junfeng Liu <china.liujunfeng@gmail.com>",
+    "Emulator <emulator@hotmail.it>",
+]
+categories = ["text-processing"]
+description = "A Rust library for PDF document manipulation."
+documentation = "https://docs.rs/crate/lopdf/"
+edition = "2024"
+exclude = ["/tests", "/benches", "/assets", "/.vscode", "/.github"]
+homepage = "https://github.com/J-F-Liu/lopdf"
+keywords = ["pdf", "editing", "manipulation", "merge"]
+license = "MIT"
+name = "lopdf"
+readme = "README.md"
+repository = "https://github.com/J-F-Liu/lopdf.git"
+rust-version = "1.88"
+version = "0.43.0"
+
+[dependencies]
+aes = "0.9"
+bitflags = "2.13"
+cbc = "0.2"
+chrono = { workspace = true, optional = true, features = ["std", "clock"] }
+ecb = "0.2"
+encoding_rs = { workspace = true }
+flate2 = "1.1"
+getrandom = "0.4"
+image = { version = "0.25", optional = true }
+indexmap = { workspace = true }
+itoa = "1.0"
+jiff = { version = "0.2", optional = true }
+log = { workspace = true }
+md-5 = "0.11"
+nom = "8.0"
+rand = { workspace = true }
+rangemap = "1.7"
+rayon = { workspace = true, optional = true }
+serde = { workspace = true, optional = true }
+sha2 = "0.11"
+stringprep = "0.1.5"
+thiserror = "2.0"
+time = { version = "0.3", features = [
+    "formatting",
+    "parsing",
+], optional = true }
+tokio = { workspace = true, optional = true, features = ["fs", "io-util"] }
+ttf-parser = { path = "../ttf-parser" }
+weezl = "0.2"
+
+[dev-dependencies]
+clap = { workspace = true }
+criterion = "0.8"
+env_logger = "0.11"
+serde_json = { workspace = true }
+shellexpand = "3.1"
+tempfile = { workspace = true }
+ttf-parser = { path = "../ttf-parser" }
+wasm-bindgen-test = "0.3"
+
+[features]
+async = ["tokio/rt-multi-thread", "tokio/macros"]
+chrono = ["dep:chrono"]
+default = ["chrono", "jiff", "rayon", "time"]
+embed_image = ["image"]
+jiff = ["dep:jiff"]
+serde = ["dep:serde"]
+time = ["dep:time"]
+wasm_js = ["getrandom/wasm_js"]
+
+[[example]]
+name = "extract_toc"
+required-features = ["serde"]
+
+[[example]]
+name = "extract_text"
+required-features = ["serde"]
+
+[[example]]
+name = "print_annotations"
+required-features = ["default"]
+
+[[example]]
+name = "rotate"
+
+[[bench]]
+harness = false
+name = "datetime"
+
+[[bench]]
+harness = false
+name = "parse"
+
+[badges]
+travis-ci = { repository = "J-F-Liu/lopdf" }
