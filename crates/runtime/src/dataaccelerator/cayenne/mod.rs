@@ -1211,8 +1211,9 @@ impl CayenneAccelerator {
                 config.bake_deletion_index_trigger,
             );
             // Orphaned-DV cleanup threshold. Parsed as a usize and mapped through
-            // NonZeroUsize so 0 (or unset) means disabled (None) and >= 1 enables
-            // the sweep — see VortexConfig::orphaned_dv_cleanup_min_files.
+            // NonZeroUsize so 0 means disabled (None) and >= 1 enables the sweep.
+            // Unset falls back to the struct default (currently 20 — enabled) via
+            // the fallback below — see VortexConfig::orphaned_dv_cleanup_min_files.
             config.orphaned_dv_cleanup_min_files =
                 std::num::NonZeroUsize::new(autotune::auto_or_usize(
                     acceleration,
@@ -1909,7 +1910,7 @@ const PARAMETERS: &[ParameterSpec] = &concat_arrays::<
         ParameterSpec::component("bake_deletion_index_trigger")
             .description("Deletion-index size (count of live primary-key tombstones) at or above which the seq-prefix bake (key-delete merge-on-read compaction) runs. The bake consolidates the settled older prefix of protected snapshots so their tombstones drop out of the live deletion index, lowering per-query merge-on-read probe cost at the cost of write amplification. A larger value bakes less often (bounds write-amp); a smaller value bakes more often (smaller index, cheaper probe). Key-delete tables only. Default: 50000."),
         ParameterSpec::component("orphaned_dv_cleanup_min_files")
-            .description("Number of orphan-eligible key-based deletion vectors (cayenne_delete_file rows) that must accumulate before a background cleanup sweep reclaims their .arrow files. A key deletion vector becomes orphaned once time-based retention empties the protected snapshot(s) it shadowed. The sweep is lock-free and runs off the write path on the dedicated compaction runtime, so this only trades sweep frequency against lingering disk — never ingest latency. Set to 0 (or leave unset) to disable cleanup entirely (the default, pre-feature behavior); a value >= 1 enables it. Default: 0 (disabled)."),
+            .description("Per-table threshold: number of orphan-eligible key-based deletion vectors (cayenne_delete_file rows) that must accumulate on a table before a background cleanup sweep reclaims their .arrow files. A key deletion vector becomes orphaned ONLY once time-based retention (retention_period + time_column) empties the protected snapshot(s) it shadowed; without a retention policy nothing is ever orphaned and the sweep is a no-op. This bounds only the orphaned tail — the live, not-yet-orphaned DV set is bounded separately by compaction, not by this knob. Each orphaned .arrow file's size scales with the number of deletions it recorded, so lingering disk is roughly (tables × threshold × avg DV size). The sweep is lock-free and runs off the write path on the dedicated compaction runtime, so this only trades sweep frequency against lingering disk — never ingest latency. Set to 0 to disable cleanup entirely. Default: 20."),
         ParameterSpec::component("compaction_trigger_protected_snapshots")
             .description("Number of protected snapshots before snapshot-maintenance compaction runs. This is separate from compaction_trigger_files so small-file tuning does not silently change scan amplification behavior. Default: 4 for refresh_mode: caching, changes, or append with refresh_check_interval <= 5m; 8 otherwise."),
         ParameterSpec::component("compaction_trigger_snapshot_age_ms")
@@ -4332,11 +4333,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_orphaned_dv_cleanup_param_zero_and_unset_disable() {
+    async fn test_orphaned_dv_cleanup_param_zero_disables_unset_defaults() {
         let app = Arc::new(AppBuilder::new("test").build());
         let rt = Arc::new(crate::Runtime::builder().build().await);
 
-        // Unset → disabled (None).
+        // Unset → enabled at the default threshold (20).
         let unset = DatasetBuilder::try_new("orphan_unset".to_string(), "orphan_unset")
             .expect("dataset builder")
             .with_app(Arc::clone(&app))
@@ -4345,8 +4346,9 @@ mod tests {
             .expect("dataset");
         let unset_config = CayenneAccelerator::get_vortex_config("orphan_unset", &unset).await;
         assert_eq!(
-            unset_config.orphaned_dv_cleanup_min_files, None,
-            "unset param must disable orphaned-DV cleanup"
+            unset_config.orphaned_dv_cleanup_min_files,
+            std::num::NonZeroUsize::new(20),
+            "unset param must default orphaned-DV cleanup to 20"
         );
 
         // Explicit 0 → disabled (None), since NonZeroUsize cannot represent 0.
