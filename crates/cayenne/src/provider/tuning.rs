@@ -4652,7 +4652,7 @@ mod tests {
     /// The query-admission reserve is BUDGETED by the query SLOs: the CDC apply may
     /// borrow query cores while QPH (and query-latency) have headroom, but not
     /// through their targets — exactly "QPH target met + lag missed ⇒ redirect
-    /// resources to ingest, but only down to the QPH floor." QPH is HigherBetter, so
+    /// resources to ingest, but only down to the QPH floor." QPH is `HigherBetter`, so
     /// against a 1000 target: comfortably met at ≥1500 (headroom), violated at <800.
     #[test]
     fn query_admission_reserve_is_budgeted_by_the_query_slos() {
