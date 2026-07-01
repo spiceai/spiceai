@@ -2,17 +2,17 @@
 source: crates/test-framework/src/spicetest/datasets/worker.rs
 description: "Query: tpcds_q18"
 ---
-+------------------+---------------+----------+--------------+------+--------+---------+--------+----------+--------+------+
-| i_item_id        | ca_country    | ca_state | ca_county    | agg1 | agg2   | agg3    | agg4   | agg5     | agg6   | agg7 |
-+------------------+---------------+----------+--------------+------+--------+---------+--------+----------+--------+------+
-| AAAAAAAAAAHLBAAA | United States | CO       | Adams County | 41.0 | 97.51  | 3126.04 | 89.7   | -866.12  | 1986.0 | 4.0  |
-| AAAAAAAAAAIBBAAA | United States | CO       | Adams County | 4.0  | 98.16  | 190.03  | 86.38  | -8.11    | 1940.0 | 5.0  |
-| AAAAAAAAAANNCAAA | United States | CO       | Adams County | 75.0 | 175.01 | 0.0     | 17.5   | -3531.0  | 1982.0 | 2.0  |
-| AAAAAAAAABKGAAAA | United States | CO       | Adams County | 97.0 | 56.87  | 0.0     | 3.98   | -3243.68 | 1971.0 | 5.0  |
-| AAAAAAAAACOAAAAA | United States | CO       | Adams County | 73.0 | 70.12  | 0.0     | 16.82  | -2968.18 | 1957.0 | 1.0  |
-| AAAAAAAAACODBAAA | United States | CO       | Adams County | 3.0  | 101.3  | 0.0     | 25.32  | -99.72   | 1971.0 | 5.0  |
-| AAAAAAAAADOBBAAA | United States | CO       | Adams County | 45.0 | 169.67 | 4402.88 | 134.03 | -1720.43 | 1981.0 | 3.0  |
-| AAAAAAAAADOECAAA | United States | CO       | Adams County | 26.0 | 40.53  | 0.0     | 22.29  | 177.32   | 1958.0 | 6.0  |
-| AAAAAAAAADPDBAAA | United States | CO       | Adams County | 69.0 | 19.78  | 0.0     | 9.89   | -321.54  | 1980.0 | 4.0  |
-| AAAAAAAAAFIDBAAA | United States | CO       | Adams County | 46.0 | 101.08 | 0.0     | 65.7   | 1355.62  | 1959.0 | 2.0  |
-+------------------+---------------+----------+--------------+------+--------+---------+--------+----------+--------+------+
++------------------+---------------+----------+--------------+-----------+------------+-------------+------------+--------------+-------------+----------+
+| i_item_id        | ca_country    | ca_state | ca_county    | agg1      | agg2       | agg3        | agg4       | agg5         | agg6        | agg7     |
++------------------+---------------+----------+--------------+-----------+------------+-------------+------------+--------------+-------------+----------+
+| AAAAAAAAAAHLBAAA | United States | CO       | Adams County | 41.000000 | 97.510000  | 3126.040000 | 89.700000  | -866.120000  | 1986.000000 | 4.000000 |
+| AAAAAAAAAAIBBAAA | United States | CO       | Adams County | 4.000000  | 98.160000  | 190.030000  | 86.380000  | -8.110000    | 1940.000000 | 5.000000 |
+| AAAAAAAAAANNCAAA | United States | CO       | Adams County | 75.000000 | 175.010000 | 0.000000    | 17.500000  | -3531.000000 | 1982.000000 | 2.000000 |
+| AAAAAAAAABKGAAAA | United States | CO       | Adams County | 97.000000 | 56.870000  | 0.000000    | 3.980000   | -3243.680000 | 1971.000000 | 5.000000 |
+| AAAAAAAAACOAAAAA | United States | CO       | Adams County | 73.000000 | 70.120000  | 0.000000    | 16.820000  | -2968.180000 | 1957.000000 | 1.000000 |
+| AAAAAAAAACODBAAA | United States | CO       | Adams County | 3.000000  | 101.300000 | 0.000000    | 25.320000  | -99.720000   | 1971.000000 | 5.000000 |
+| AAAAAAAAADOBBAAA | United States | CO       | Adams County | 45.000000 | 169.670000 | 4402.880000 | 134.030000 | -1720.430000 | 1981.000000 | 3.000000 |
+| AAAAAAAAADOECAAA | United States | CO       | Adams County | 26.000000 | 40.530000  | 0.000000    | 22.290000  | 177.320000   | 1958.000000 | 6.000000 |
+| AAAAAAAAADPDBAAA | United States | CO       | Adams County | 69.000000 | 19.780000  | 0.000000    | 9.890000   | -321.540000  | 1980.000000 | 4.000000 |
+| AAAAAAAAAFIDBAAA | United States | CO       | Adams County | 46.000000 | 101.080000 | 0.000000    | 65.700000  | 1355.620000  | 1959.000000 | 2.000000 |
++------------------+---------------+----------+--------------+-----------+------------+-------------+------------+--------------+-------------+----------+

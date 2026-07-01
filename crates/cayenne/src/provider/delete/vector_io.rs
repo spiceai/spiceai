@@ -54,6 +54,19 @@ struct KeyDeletionReadState {
     reinsert_sequence: Option<i64>,
 }
 
+/// A key-based deletion-vector whose catalog row exists but whose `.arrow` file is
+/// missing on disk. Reported (instead of erroring) by [`detect_deletion_type_and_read`]
+/// so the async loader can discriminate a self-healable orphan (the file-first
+/// orphaned-DV sweep unlinked the file but a crash interrupted the row removal)
+/// from genuine data loss, by comparing `sequence_number` against the
+/// surviving-sequence floor. Position-based DVs are never reported here.
+#[derive(Debug, Clone)]
+pub struct MissingKeyDeletionVector {
+    pub delete_file_id: String,
+    pub path: String,
+    pub sequence_number: i64,
+}
+
 /// Directory under the table snapshot where deletion vectors are stored.
 const DELETION_DIR_NAME: &str = "deletions";
 /// File extension used for deletion-vector files.
@@ -416,8 +429,12 @@ pub fn detect_deletion_type_and_read(
     HashMap<String, RoaringBitmap>,
     HashMap<Box<[u8]>, i64>,
     HashMap<Box<[u8]>, i64>,
+    Vec<MissingKeyDeletionVector>,
 )> {
     let mut per_file_row_ids: HashMap<String, RoaringBitmap> = HashMap::new();
+    // Key-based DV rows whose `.arrow` file is missing — reported, not errored, so
+    // the async loader can self-heal provable orphans (see `MissingKeyDeletionVector`).
+    let mut missing_key_dvs: Vec<MissingKeyDeletionVector> = Vec::new();
     // Metadata-only publish: keep delete and reinsert sequence state in one map
     // while reading key-based vectors. This avoids cloning every key in the hot
     // read loop just to update a second map; the legacy return shape is derived
@@ -438,12 +455,32 @@ pub fn detect_deletion_type_and_read(
         let path = std::path::Path::new(&delete_file.path);
         tracing::debug!("detect_deletion_type_and_read: reading file {:?}", path);
 
-        let file = std::fs::File::open(path).map_err(|e| {
-            datafusion_common::DataFusionError::Execution(format!(
-                "Failed to open deletion vector file {}: {e}",
-                path.display()
-            ))
-        })?;
+        let file = match std::fs::File::open(path) {
+            Ok(file) => file,
+            // A missing KEY-based DV file is tolerated and reported: the file-first
+            // orphaned-DV sweep unlinks the file before removing its catalog row, so
+            // a crash in that window leaves a discoverable dangling row. The async
+            // loader decides self-heal vs error against the floor. Position-based DVs
+            // (source_data_file_path = Some) are tied to a live data file, so a
+            // missing one is still a hard error.
+            Err(e)
+                if e.kind() == std::io::ErrorKind::NotFound
+                    && delete_file.source_data_file_path.is_none() =>
+            {
+                missing_key_dvs.push(MissingKeyDeletionVector {
+                    delete_file_id: delete_file.delete_file_id.clone(),
+                    path: delete_file.path.clone(),
+                    sequence_number: delete_file.sequence_number,
+                });
+                continue;
+            }
+            Err(e) => {
+                return Err(datafusion_common::DataFusionError::Execution(format!(
+                    "Failed to open deletion vector file {}: {e}",
+                    path.display()
+                )));
+            }
+        };
 
         let reader = FileReader::try_new(file, None).map_err(|e| {
             datafusion_common::DataFusionError::Execution(format!(
@@ -565,7 +602,12 @@ pub fn detect_deletion_type_and_read(
         file_count
     );
 
-    Ok((per_file_row_ids, deleted_row_keys, reinserted_row_keys))
+    Ok((
+        per_file_row_ids,
+        deleted_row_keys,
+        reinserted_row_keys,
+        missing_key_dvs,
+    ))
 }
 
 // ============================================================================

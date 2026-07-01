@@ -180,6 +180,69 @@ async fn test_int64_pk_delete_no_matches_impl(fixture: TestFixture) -> TestResul
 test_with_backends!(test_int64_pk_delete_no_matches_impl);
 
 // =============================================================================
+// Regression: user-visible `DELETE ... WHERE id IN (...)` reports the EXACT
+// number of live rows removed.
+//
+// A single-Int64-PK `DELETE WHERE id IN (...)` is extracted straight from the
+// filter and applied via deletion vectors. The CDC fast path (#11049)
+// intentionally skips the scan and returns 0 for that shape; a user-visible
+// DELETE surfaces "rows affected" to the SQL client, so it must instead return
+// the verified count (the fix routes user DELETEs through the scan-based count
+// path). The count must also be EXACT: IN-list ids that don't exist must not
+// inflate it past the rows actually removed.
+// =============================================================================
+
+async fn test_int64_pk_delete_in_list_reports_exact_count_impl(
+    fixture: TestFixture,
+) -> TestResult<()> {
+    let (table, ctx, schema) = setup_int64_pk_table(&fixture, "in_list_count_test").await?;
+
+    let batch = RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(Int64Array::from((0i64..10).collect::<Vec<i64>>())),
+            Arc::new(StringArray::from(
+                (0i64..10).map(|i| format!("n{i}")).collect::<Vec<_>>(),
+            )),
+            Arc::new(Int64Array::from(
+                (0i64..10).map(|i| i * 100).collect::<Vec<i64>>(),
+            )),
+        ],
+    )?;
+    insert_batch(&table, batch).await?;
+    // Force the rows out of the inline memtable into listing-table files. The
+    // count bug lives in the FILE deletion path's `pk IN (...)` fast path; an
+    // inline-resident delete is counted by a different (already-correct) path,
+    // so without this checkpoint a small table would not exercise the fix.
+    table.checkpoint_inlined_data().await?;
+    assert_eq!(get_row_count(&ctx, "in_list_count_test").await?, 10);
+
+    // DELETE WHERE id IN (0,1,2,3,4) — all five exist.
+    let in_list = col("id").in_list((0i64..5).map(lit).collect::<Vec<_>>(), false);
+    let deleted = delete_records(&table, in_list).await?;
+    assert_eq!(
+        deleted, 5,
+        "user DELETE WHERE id IN (...) must report the exact live-row count, not the \
+         CDC fast-path 0"
+    );
+    assert_eq!(get_row_count(&ctx, "in_list_count_test").await?, 5);
+
+    // EXACTNESS: an IN-list mixing live (5,6) and non-existent (999,1000) ids must
+    // count only the rows actually removed, not the IN-list's upper bound.
+    let mixed = col("id").in_list(vec![lit(5i64), lit(6i64), lit(999i64), lit(1000i64)], false);
+    let deleted_mixed = delete_records(&table, mixed).await?;
+    assert_eq!(
+        deleted_mixed, 2,
+        "count must be the EXACT number of live rows removed (2), not the IN-list size (4)"
+    );
+    assert_eq!(get_row_count(&ctx, "in_list_count_test").await?, 3);
+
+    Ok(())
+}
+
+test_with_backends!(test_int64_pk_delete_in_list_reports_exact_count_impl);
+
+// =============================================================================
 // Edge Case 2: Delete all rows
 // =============================================================================
 
