@@ -3389,7 +3389,7 @@ mod tests {
     // =========================================================================
 
     /// A dirty index must downgrade PK equality pushdown from Exact to Inexact so
-    /// DataFusion keeps a FilterExec and re-applies the predicate, instead of
+    /// `DataFusion` keeps a `FilterExec` and re-applies the predicate, instead of
     /// trusting a stale index that could silently drop existing rows.
     #[test]
     fn test_dirty_index_downgrades_pushdown_to_inexact() {
@@ -3422,7 +3422,7 @@ mod tests {
 
     /// A dirty index must not be used in `scan` — the plan must NOT contain an
     /// `IndexedLookupExec`, and the query must still return the correct row via a
-    /// full MemTable scan.
+    /// full `MemTable` scan.
     #[tokio::test]
     async fn test_dirty_index_bypassed_in_scan() {
         let batch = create_large_test_batch(300);
