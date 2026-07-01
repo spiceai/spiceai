@@ -104,6 +104,7 @@ pub(crate) mod tuning;
 pub(crate) mod utils;
 pub(crate) mod vortex_format;
 pub(crate) mod write_budget;
+pub(crate) mod zorder;
 
 // Re-export the main type at the module level for convenience
 pub use compaction::{set_compaction_runtime_env, set_compaction_runtime_handle};

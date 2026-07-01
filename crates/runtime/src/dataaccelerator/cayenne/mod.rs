@@ -1045,6 +1045,23 @@ impl CayenneAccelerator {
                 );
             }
 
+            // The cold object-store tier requires key-based deletes: position
+            // deletes are file-path scoped and cannot survive the warm→cold
+            // rewrite. Force key when the cold tier is enabled and a primary key
+            // exists (the engine additionally skips promotion for position-mode
+            // tables, so this keeps the cold tier from being silently inert).
+            if config.cold_tier_enabled()
+                && workload.has_primary_key
+                && config.deletion_mode != cayenne::metadata::DeletionMode::Key
+            {
+                if config.deletion_mode == cayenne::metadata::DeletionMode::Position {
+                    tracing::warn!(
+                        "Dataset '{table_name}': the cold object-store tier (cayenne_cold_tier_location) requires key-based deletes; overriding cayenne_deletion_mode 'position' -> 'key'."
+                    );
+                }
+                config.deletion_mode = cayenne::metadata::DeletionMode::Key;
+            }
+
             // CDC durability mode (file | memory). Memory mode appends CDC
             // batches to an in-RAM tier and defers the source slot ack to a
             // checkpoint; it is only meaningful for the small-write/CDC
@@ -1165,6 +1182,47 @@ impl CayenneAccelerator {
                     .filter(|s| !s.is_empty())
                     .collect();
             }
+
+            // Cold object-store tier (storage-cascade bottom tier). Presence of a
+            // non-empty `cayenne_cold_tier_location` enables it; the rest tune the
+            // clustering key, cold file size, and the warm→cold promotion trigger.
+            if let Some(loc) = acceleration.params.get("cayenne_cold_tier_location") {
+                let loc = loc.trim();
+                if !loc.is_empty() {
+                    config.cold_tier_location = Some(loc.to_string());
+                }
+            }
+            if let Some(cols) = acceleration.params.get("cayenne_cold_clustering_columns") {
+                config.cold_clustering_columns = cols
+                    .split(',')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect();
+            }
+            // Numeric cold knobs go through the same `auto_or_*` helpers as the
+            // warm tuning params, so they honor `auto`, warn on invalid input,
+            // and clamp consistently with the rest of the config surface.
+            config.cold_target_file_size_mb = autotune::auto_or_usize(
+                acceleration,
+                &["cayenne_cold_target_file_size_mb"],
+                config.cold_target_file_size_mb,
+            )
+            .max(1);
+            config.cold_tier_warm_max_bytes = autotune::auto_or_i64(
+                acceleration,
+                &["cayenne_cold_tier_warm_max_bytes"],
+                config.cold_tier_warm_max_bytes,
+            );
+            config.cold_tier_warm_max_files = autotune::auto_or_usize(
+                acceleration,
+                &["cayenne_cold_tier_warm_max_files"],
+                config.cold_tier_warm_max_files,
+            );
+            config.cold_tier_background_interval_ms = autotune::auto_or_u64(
+                acceleration,
+                &["cayenne_cold_tier_background_interval_ms"],
+                config.cold_tier_background_interval_ms,
+            );
 
             // Upload concurrency: `auto`/unset keeps the available-parallelism
             // default; 0 → warn + minimum 1. The aggregate across all tables is
@@ -1737,6 +1795,21 @@ impl CayenneAccelerator {
         if let Some(retention_builder) = time_retention_filter_builder {
             builder = builder.with_time_retention_filter_builder(retention_builder);
         }
+        // Cold tier: when enabled with an s3:// location, reuse the warm S3
+        // object store for the cold tier (v1: an s3:// cold location shares the
+        // warm bucket). A local `file://` cold tier needs no store — the default
+        // local store resolves it. Cloned before the warm store is moved below.
+        let cold_object_store = if table_options.vortex_config.cold_tier_enabled()
+            && table_options
+                .vortex_config
+                .cold_tier_location
+                .as_deref()
+                .is_some_and(|l| l.starts_with("s3://"))
+        {
+            object_store.clone()
+        } else {
+            None
+        };
         if let Some(object_store) = object_store {
             tracing::info!(
                 "Using S3 Express One Zone storage for {} acceleration: {}",
@@ -1750,6 +1823,9 @@ impl CayenneAccelerator {
                     "S3 Express One Zone storage detected but object store configuration is missing",
                 )),
             });
+        }
+        if let Some(cold) = cold_object_store {
+            builder = builder.with_cold_object_store(cold);
         }
         tracing::debug!("create_cayenne_table_provider: calling builder.create for {table_name}");
         let cayenne_table = builder
@@ -1770,6 +1846,15 @@ impl CayenneAccelerator {
         if provider.spawn_background_mem_tier_checkpoint() {
             tracing::debug!(
                 "Background mem-tier checkpoint task spawned for Cayenne table {table_name}",
+            );
+        }
+        // Cold-tier promotion (storage-cascade bottom tier); a no-op unless
+        // cayenne_cold_tier_location is set. Runs on the same internal
+        // background-worker infra as the mem-tier checkpointer, on its own
+        // cadence — no spicepod `workers:` section, nothing user-facing.
+        if provider.spawn_background_cold_tier_promotion() {
+            tracing::debug!(
+                "Background cold-tier promotion task spawned for Cayenne table {table_name}",
             );
         }
         Ok(provider)
@@ -1851,8 +1936,8 @@ fn wrap_with_native_vector_indexes(
 const PARAMETERS: &[ParameterSpec] = &concat_arrays::<
     ParameterSpec,
     S3_PARAMS_LEN,
-    47,
-    { S3_PARAMS_LEN + 47 },
+    53,
+    { S3_PARAMS_LEN + 53 },
 >(
     S3_PARAMETERS,
     [
@@ -1881,6 +1966,18 @@ const PARAMETERS: &[ParameterSpec] = &concat_arrays::<
             .description("When 'true' (default), Cayenne advertises and decodes string and binary columns as Arrow view types (Utf8View/BinaryView) on the query/scan path so DataFusion plans joins and aggregates on view arrays, avoiding the i32 2 GiB offset overflow in hash-join build-side batch concatenation at scale. The stored schema keeps Utf8/Binary for writes, CDC, and stats. Set 'false' to opt out.")
             .one_of(&["true", "false"])
             .default("true"),
+        ParameterSpec::component("cold_tier_location")
+            .description("Object-store URL prefix for the cold tier (storage-cascade bottom tier), e.g. 's3://bucket/prefix' or 'file:///mnt/cold'. When set, a background promotion stage graduates the warm local-disk tier to read-optimized, Z-order-clustered Vortex files on this store, and queries span warm + cold with per-tier pushdown. Unset (default) disables the cold tier. Requires key-based deletes and a primary key (auto-resolved). v1: an s3:// cold location must share the warm bucket; partitioned and position-delete tables are not supported."),
+        ParameterSpec::component("cold_clustering_columns")
+            .description("Comma-separated liquid-clustering key columns for cold files (multi-column Z-order), e.g. 'tenant_id,ts'. When unset, falls back to cayenne_sort_columns, then the primary key. Clustering tightens each cold file's per-column zone maps so selective queries on any clustering dimension prune at the storage layer."),
+        ParameterSpec::component("cold_target_file_size_mb")
+            .description("Target size for cold-tier Vortex files in MB. Larger than the warm cayenne_target_file_size_mb because object stores favor fewer, larger objects and cold scans are range reads. Default: 512."),
+        ParameterSpec::component("cold_tier_warm_max_bytes")
+            .description("The warm tier graduates to cold once its total Vortex bytes reach this threshold. 0 (default) disables the byte trigger; set with cold_tier_warm_max_files to bound warm-tier size."),
+        ParameterSpec::component("cold_tier_warm_max_files")
+            .description("The warm tier graduates to cold once its Vortex file count reaches this threshold. 0 (default) disables the file-count trigger."),
+        ParameterSpec::component("cold_tier_background_interval_ms")
+            .description("How often the background loop evaluates the warm→cold promotion trigger. Cold tiering is not latency-critical, so this is coarser than compaction. Default: 60000 (60s)."),
         ParameterSpec::component("sort_columns")
             .description("Comma-separated list of columns to sort data by during inserts (e.g., 'timestamp,user_id')."),
         ParameterSpec::component("shard_key_columns")

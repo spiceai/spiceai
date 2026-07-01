@@ -984,6 +984,47 @@ pub struct VortexConfig {
     /// with `cayenne_force_view_types: true`).
     #[serde(skip)]
     pub force_view_read_schema: bool,
+
+    // ---- Cold object-store tier (storage-cascade bottom tier; cascade model) ----
+    /// Absolute object-store URL prefix for the cold tier (e.g.
+    /// `s3://bucket/prefix`). `None`/empty (the default) disables the cold tier.
+    /// Set from the `cayenne_cold_tier_location` spicepod param. Persisted so a
+    /// reopened table knows where its cold files live; NOT compared by
+    /// `configuration_matches`, so toggling it never recreates the table (the
+    /// cold tier is a strict superset of behavior over an unchanged warm tier).
+    pub cold_tier_location: Option<String>,
+    /// Liquid-clustering key columns for cold files (multi-column Z-order).
+    /// Empty = fall back to `sort_columns`, then the primary key. Set from
+    /// `cayenne_cold_clustering_columns`.
+    pub cold_clustering_columns: Vec<String>,
+    /// Target size for cold Vortex files in MB. Larger than the warm
+    /// `target_vortex_file_size_mb` because object stores favor fewer, larger
+    /// objects and cold scans are range reads. Set from
+    /// `cayenne_cold_target_file_size_mb`. Defaults to 512.
+    pub cold_target_file_size_mb: usize,
+    /// Promotion fires only once the warm tier exceeds this many bytes
+    /// (`<= 0` disables the byte trigger). Set from
+    /// `cayenne_cold_tier_warm_max_bytes`.
+    pub cold_tier_warm_max_bytes: i64,
+    /// Promotion fires only once the warm tier exceeds this many files
+    /// (`0` disables the file-count trigger). Set from
+    /// `cayenne_cold_tier_warm_max_files`.
+    pub cold_tier_warm_max_files: usize,
+    /// How often (ms) the background loop evaluates the cold-promotion trigger.
+    /// Cold tiering is not latency-critical, so this is much coarser than the
+    /// compaction interval. Set from `cayenne_cold_tier_background_interval_ms`.
+    /// Defaults to 60s.
+    pub cold_tier_background_interval_ms: u64,
+}
+
+impl VortexConfig {
+    /// Whether the cold object-store tier is enabled (a non-empty location set).
+    #[must_use]
+    pub fn cold_tier_enabled(&self) -> bool {
+        self.cold_tier_location
+            .as_ref()
+            .is_some_and(|s| !s.trim().is_empty())
+    }
 }
 
 /// Evolution set permitted when a widening schema difference is detected at
@@ -1286,6 +1327,12 @@ impl Default for VortexConfig {
             data_storage_write_mbps: None,
             metastore_storage_write_mbps: None,
             force_view_read_schema: false,
+            cold_tier_location: None,
+            cold_clustering_columns: Vec::new(),
+            cold_target_file_size_mb: 512,
+            cold_tier_warm_max_bytes: 0,
+            cold_tier_warm_max_files: 0,
+            cold_tier_background_interval_ms: 60_000,
         }
     }
 }
@@ -1542,6 +1589,43 @@ pub struct SnapshotFile {
     pub min_sequence: i64,
     /// Inclusive maximum commit sequence of the rows in this file.
     pub max_sequence: i64,
+}
+
+/// One row of the cold-tier object-store manifest (`cayenne_cold_tier_file`).
+///
+/// The cold tier is the bottom of the storage cascade (RAM mem-tier →
+/// local-disk warm Vortex snapshot → object-store cold). A background promotion
+/// stage rewrites settled/aged warm files as read-optimized (Z-order clustered)
+/// Vortex files on the cold object store and records one row here per file.
+///
+/// Unlike [`SnapshotFile`], cold files are **table-scoped** (not a member of any
+/// snapshot directory) and append-only: a promoted file is referenced only from
+/// this table, never from `cayenne_snapshot_file`. `file_url` is the *absolute*
+/// object-store URL (e.g. `s3://bucket/prefix/{table_id}/cold/<id>.vortex`),
+/// because the cold location may differ from the table's warm path. The embedded
+/// `statistics_blob` (serialized Vortex [`FileStatistics`]: per-column min/max/
+/// null/sum) lets the scan prune cold files at listing time with no object-store
+/// round-trip. `min_sequence`/`max_sequence` carry the file's commit-seq range
+/// (cold files hold the oldest, fully-superseded data — below all protected
+/// snapshots and retention at promotion time).
+#[derive(Debug, Clone)]
+pub struct ColdTierFile {
+    /// Table this cold file belongs to (`UUIDv7`).
+    pub table_id: String,
+    /// Absolute object-store URL of the `.vortex` data file on the cold store.
+    pub file_url: String,
+    /// Live row count in the file (post-merge, single-version-per-key).
+    pub row_count: i64,
+    /// `ObjectMeta::size` of the file in bytes.
+    pub file_size_bytes: i64,
+    /// Inclusive minimum commit sequence of the rows in this file.
+    pub min_sequence: i64,
+    /// Inclusive maximum commit sequence of the rows in this file.
+    pub max_sequence: i64,
+    /// Serialized Vortex `FileStatistics` flatbuffer (per-column min/max/null/
+    /// sum). Always populated at promotion (copied from the written footer) so
+    /// listing-time pruning never falls back to a full scan.
+    pub statistics_blob: Vec<u8>,
 }
 
 /// Table-level statistics stored as a serialized Vortex [`FileStatistics`] blob.
