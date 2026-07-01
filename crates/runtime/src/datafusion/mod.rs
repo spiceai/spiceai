@@ -1783,6 +1783,24 @@ impl DataFusion {
                 DataFusionError::External(Box::new(std::io::Error::other(e.to_string())))
             })?;
 
+            // Serialize the catalog swap and the pending-registry
+            // bookkeeping under a single hold of the pending-initializations
+            // write lock. This is the global lock that makes the whole
+            // critical section — "is this placeholder still pending?", the
+            // swap, and the drain — atomic with respect to other resolvers,
+            // so two concurrent callers can never both swap the same table.
+            // `ensure_ready` (which awaits source I/O) intentionally runs
+            // above, outside the lock.
+            let mut pending = self.pending_initializations.write().await;
+
+            // A concurrent resolver already drained this placeholder and
+            // registered the real provider. Don't swap again — a redundant
+            // swap is wasted work and, historically, reopened the
+            // deregister/register window that this guarding closes.
+            if !pending.contains_key(&table_ref) {
+                continue;
+            }
+
             // Swap the placeholder out of the catalog with the real
             // provider so federation analysis on the eventual logical
             // plan downcasts to the underlying
@@ -1793,14 +1811,11 @@ impl DataFusion {
                 })?;
             }
 
-            // Drop from the pending registry. Decrement only if the
-            // entry was still present (concurrent resolvers may have
-            // already removed it).
-            let mut pending = self.pending_initializations.write().await;
-            if pending.remove(&table_ref).is_some() {
-                self.pending_initializations_count
-                    .fetch_sub(1, std::sync::atomic::Ordering::Release);
-            }
+            // Drop from the pending registry. The presence check above ran
+            // under this same lock hold, so the entry is guaranteed present.
+            pending.remove(&table_ref);
+            self.pending_initializations_count
+                .fetch_sub(1, std::sync::atomic::Ordering::Release);
         }
 
         Ok(())
@@ -1813,9 +1828,13 @@ impl DataFusion {
         name: &TableReference,
         provider: Arc<dyn TableProvider>,
     ) -> Result<()> {
-        // DataFusion has no atomic replace; deregister + register is
-        // the documented pattern.
-        let _ = self.ctx.deregister_table(name.clone());
+        // Register the real provider directly, without a preceding
+        // `deregister_table`. The underlying schema provider registers via an
+        // atomic map insert that overwrites (and returns) the previous
+        // provider, so this replaces the placeholder in a single step with no
+        // window where the table is absent from the catalog. The earlier
+        // deregister-then-register opened exactly such a gap, which a
+        // concurrent query planner could observe as "table not found".
         self.ctx
             .register_table(name.clone(), provider)
             .map_err(find_datafusion_root)
