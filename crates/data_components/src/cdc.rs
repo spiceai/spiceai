@@ -220,14 +220,6 @@ impl CommitChange for NoOpCommitter {
     }
 }
 
-/// Construct an empty [`ChangeEnvelope`] whose only job is to flip
-/// `is_dataset_ready=true`. The batch contains zero rows and uses a no-op
-/// committer.
-///
-/// Connectors should emit one of these envelopes once they consider
-/// themselves caught up to the source if no real change events are available
-/// to carry the ready signal. See the [`ChangesStream`] documentation for the
-/// readiness contract.
 /// Build a zero-row [`ChangeBatch`] whose data struct is all-nullable so it
 /// coalesces (concats) with the truncate/snapshot/live change batches without an
 /// Arrow "arrays of different data types" error. Shared by the ready-signal and
@@ -273,6 +265,14 @@ fn empty_change_batch(schema: &SchemaRef) -> Result<ChangeBatch, ChangeBatchErro
     ChangeBatch::try_new(record)
 }
 
+/// Construct an empty [`ChangeEnvelope`] whose only job is to flip
+/// `is_dataset_ready=true`. The batch contains zero rows and uses a no-op
+/// committer.
+///
+/// Connectors should emit one of these envelopes once they consider themselves
+/// caught up to the source if no real change events are available to carry the
+/// ready signal. See the [`ChangesStream`] documentation for the readiness
+/// contract.
 pub fn build_ready_signal_envelope(schema: &SchemaRef) -> Result<ChangeEnvelope, ChangeBatchError> {
     Ok(ChangeEnvelope::new(
         Box::new(NoOpCommitter),

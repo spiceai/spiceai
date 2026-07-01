@@ -1012,11 +1012,9 @@ async fn run_pump(source: Arc<SharedSource>) {
                     // `build_heartbeat_envelope` advances no LSN — the idle credit above
                     // already moved the slot forward.
                     if !txn_open
-                        && let Some(server_ts_ms) =
-                            client::pg_epoch_to_system_time(server_time_micros)
-                                .duration_since(std::time::UNIX_EPOCH)
-                                .ok()
-                                .and_then(|d| i64::try_from(d.as_millis()).ok())
+                        && let Some(server_ts_ms) = util::time::system_time_to_unix_ms(
+                            client::pg_epoch_to_system_time(server_time_micros),
+                        )
                     {
                         for (member_key, member) in source.live_members() {
                             match build_heartbeat_envelope(&member.schema, server_ts_ms) {

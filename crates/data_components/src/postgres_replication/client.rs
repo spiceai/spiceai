@@ -522,10 +522,9 @@ fn wal_stream(
                     // Skipped while a transaction is buffered: we still owe its rows,
                     // so the dataset is not caught up.
                     if txn.is_none()
-                        && let Some(server_ts_ms) = pg_epoch_to_system_time(server_time_micros)
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .ok()
-                            .and_then(|d| i64::try_from(d.as_millis()).ok())
+                        && let Some(server_ts_ms) = util::time::system_time_to_unix_ms(
+                            pg_epoch_to_system_time(server_time_micros),
+                        )
                     {
                         match build_heartbeat_envelope(&working_schema, server_ts_ms) {
                             Ok(envelope) => yield envelope,

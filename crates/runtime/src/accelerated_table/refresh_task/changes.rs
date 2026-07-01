@@ -1423,15 +1423,18 @@ impl RefreshTask {
         }
         metrics::CDC_APPLY_BURST_DURATION_MS.record(elapsed_ms(burst_start), &labels);
 
-        // Record replication lag only now that the burst's Ok runs have applied
-        // (the early `return false` above skips it, so a failed apply never reports
-        // fresh lag). Skip if the wall clock is unreadable (pre-epoch / overflow)
-        // rather than reporting a misleading 0ms.
-        if let (Some(max_commit_ts_ms), Some(now_ms)) = (
-            max_commit_ts_ms,
-            util::time::system_time_to_unix_ms(std::time::SystemTime::now()),
-        ) {
-            metrics::CDC_REPLICATION_LAG_MS.record((now_ms - max_commit_ts_ms).max(0), &labels);
+        // Record CDC progress only now that the burst's Ok runs have applied (the
+        // early `return false` above skips it, so a failed apply never reports fresh
+        // progress). The raw applied-commit watermark is emitted whenever the burst
+        // carried a source timestamp; the derived lag additionally needs a readable
+        // wall clock (skipped on pre-epoch / overflow rather than reporting a
+        // misleading 0ms).
+        if let Some(max_commit_ts_ms) = max_commit_ts_ms {
+            metrics::CDC_APPLIED_COMMIT_UNIX_TIME_MS.record(max_commit_ts_ms, &labels);
+            if let Some(now_ms) = util::time::system_time_to_unix_ms(std::time::SystemTime::now()) {
+                metrics::CDC_REPLICATION_LAG_MS
+                    .record(now_ms.saturating_sub(max_commit_ts_ms).max(0), &labels);
+            }
         }
         true
     }
