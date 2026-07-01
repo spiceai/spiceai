@@ -202,7 +202,7 @@ Testing focus DRIs are responsible for:
 * Running the cookbook for the focus area component
 * Performing additional ad-hoc testing for the focus area component
 
-* Focus area #1:
+* Focus area 1:
   * [ ] DRI
   * [ ] DRI
 
