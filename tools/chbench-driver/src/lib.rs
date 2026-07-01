@@ -72,12 +72,6 @@ pub enum Error {
 
     #[snafu(display("Failed to {action}: {message}"))]
     Arrow { action: String, message: String },
-
-    #[snafu(display(
-        "--skip-prepare source has {found} warehouse(s) but --scale-factor expects {expected}; \
-         restore a matching template or drop --skip-prepare to re-seed"
-    ))]
-    SourceScaleMismatch { found: u64, expected: u64 },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -178,37 +172,6 @@ impl PostgresChBenchDriver {
                 message: e.to_string(),
             })?;
         Ok(Arc::new(pool))
-    }
-
-    /// Verify the source already holds a prepared CH-benCH dataset matching the
-    /// configured warehouse count. Used on the `--skip-prepare` path, where the
-    /// source is restored externally (e.g. from a Postgres template) rather than
-    /// seeded here, so a missing or wrong-scale source would otherwise produce
-    /// silently-wrong benchmark results.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`Error::Sql`] if the `warehouse` table is absent (source not
-    /// prepared at all) and [`Error::SourceScaleMismatch`] if its row count does
-    /// not equal the configured scale factor.
-    pub async fn verify_prepared(&self) -> Result<()> {
-        let row = self
-            .client
-            .query_one("SELECT count(*)::bigint FROM warehouse", &[])
-            .await
-            .map_err(|source| Error::Sql {
-                action: "verify --skip-prepare source (is the warehouse table seeded?)".into(),
-                source,
-            })?;
-        // count(*) is non-negative; compare in u64 so the configured warehouse
-        // count (usize) needs no lossy cast (usize -> u64 is always lossless).
-        let found = u64::try_from(row.get::<_, i64>(0)).unwrap_or(0);
-        let expected = self.config.warehouses as u64;
-        ensure!(
-            found == expected,
-            SourceScaleMismatchSnafu { found, expected }
-        );
-        Ok(())
     }
 }
 
