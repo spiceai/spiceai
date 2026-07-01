@@ -445,7 +445,7 @@ impl DeletionSink for FileBasedDeletionSink {
         // a lock-free, throttled background pass on the dedicated compaction runtime
         // (`schedule_orphan_dv_sweep`), so it never extends the `write_lock` /
         // `listing_fence` window that CDC ingest and scans contend on here. We only
-        // signal it; it no-ops when the `orphaned_dv_cleanup_min_files` knob is 0.
+        // signal it; it no-ops when `orphaned_dv_cleanup_min_files` is unset (None).
         if !result.emptied_snapshot_ids.is_empty() {
             self.cleanup_emptied_snapshots(&result.emptied_snapshot_ids)
                 .await;
