@@ -1783,39 +1783,49 @@ impl DataFusion {
                 DataFusionError::External(Box::new(std::io::Error::other(e.to_string())))
             })?;
 
-            // Serialize the catalog swap and the pending-registry
-            // bookkeeping under a single hold of the pending-initializations
-            // write lock. This is the global lock that makes the whole
-            // critical section — "is this placeholder still pending?", the
-            // swap, and the drain — atomic with respect to other resolvers,
-            // so two concurrent callers can never both swap the same table.
-            // `ensure_ready` (which awaits source I/O) intentionally runs
-            // above, outside the lock.
-            let mut pending = self.pending_initializations.write().await;
-
-            // A concurrent resolver already drained this placeholder and
-            // registered the real provider. Don't swap again — a redundant
-            // swap is wasted work and, historically, reopened the
-            // deregister/register window that this guarding closes.
-            if !pending.contains_key(&table_ref) {
-                continue;
+            // Atomically claim this placeholder before swapping: the resolver
+            // that removes it from the pending registry owns the swap, and any
+            // concurrent resolver that finds it already gone skips its own
+            // swap. This is the global serialization point that stops two
+            // callers from both swapping the same table — a redundant swap is
+            // wasted work and, historically, reopened the deregister/register
+            // window this fix closes. The lock is released before touching the
+            // catalog, so we never hold `pending_initializations` across a
+            // `ctx` table operation (avoiding any lock-order coupling with the
+            // registration paths that take the catalog lock first).
+            {
+                let mut pending = self.pending_initializations.write().await;
+                if pending.remove(&table_ref).is_none() {
+                    continue;
+                }
+                self.pending_initializations_count
+                    .fetch_sub(1, std::sync::atomic::Ordering::Release);
             }
 
-            // Swap the placeholder out of the catalog with the real
-            // provider so federation analysis on the eventual logical
-            // plan downcasts to the underlying
-            // `FederatedTableProviderAdaptor`.
+            // Swap the placeholder out of the catalog with the real provider
+            // so federation analysis on the eventual logical plan downcasts to
+            // the underlying `FederatedTableProviderAdaptor`. `replace_table`
+            // is an atomic overwrite (a single map insert), so even though the
+            // pending lock is no longer held there is no window where the table
+            // is absent from the catalog: the placeholder — itself a fully
+            // functional provider — stays registered until the real provider
+            // atomically replaces it.
             if let Some(real_provider) = ready.table_provider.clone() {
-                self.replace_table(&table_ref, real_provider).map_err(|e| {
-                    DataFusionError::External(Box::new(std::io::Error::other(e.to_string())))
-                })?;
+                if let Err(e) = self.replace_table(&table_ref, real_provider) {
+                    // The swap failed after we claimed the placeholder. Restore
+                    // it to the pending registry so a later query retries the
+                    // initialization instead of leaving the table stuck as a
+                    // placeholder that is no longer tracked.
+                    let mut pending = self.pending_initializations.write().await;
+                    if pending.insert(table_ref.clone(), placeholder).is_none() {
+                        self.pending_initializations_count
+                            .fetch_add(1, std::sync::atomic::Ordering::Release);
+                    }
+                    return Err(DataFusionError::External(Box::new(std::io::Error::other(
+                        e.to_string(),
+                    ))));
+                }
             }
-
-            // Drop from the pending registry. The presence check above ran
-            // under this same lock hold, so the entry is guaranteed present.
-            pending.remove(&table_ref);
-            self.pending_initializations_count
-                .fetch_sub(1, std::sync::atomic::Ordering::Release);
         }
 
         Ok(())
