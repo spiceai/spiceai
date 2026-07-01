@@ -28,7 +28,6 @@ use crate::tls::flight_incoming::tls_incoming;
 use ballista_core::serde::protobuf::scheduler_grpc_server::SchedulerGrpcServer;
 use governor::RateLimiter;
 use runtime_auth::layer::flight::BasicAuthLayer;
-use runtime_metrics;
 use runtime_proto::cluster_service_server::ClusterServiceServer;
 use std::net::SocketAddr;
 use std::sync::Arc;

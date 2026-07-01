@@ -29,8 +29,6 @@ use tokio_util::sync::CancellationToken;
 use datafusion::sql::TableReference;
 use opentelemetry::KeyValue;
 
-use runtime_metrics;
-
 // Re-export ComponentStatus from the shared API types crate
 pub use runtime_api_types::v1::ComponentStatus;
 

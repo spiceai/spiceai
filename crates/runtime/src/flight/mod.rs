@@ -51,7 +51,6 @@ use governor::{Quota, RateLimiter};
 use metrics::track_flight_request;
 use middleware::{RequestContextLayer, WriteRateLimitLayer};
 use runtime_auth::{AuthRequestContext, FlightBasicAuth, layer::flight::BasicAuthLayer};
-use runtime_metrics;
 use runtime_request_context::{AsyncMarker, RequestContext};
 use snafu::prelude::*;
 use std::num::NonZeroU32;
