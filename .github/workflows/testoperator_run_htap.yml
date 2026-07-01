@@ -35,16 +35,6 @@ on:
         required: false
         type: string
         default: '4'
-      eager_aggregation:
-        description: 'Enable cost-based eager aggregation (SPICED_EAGER_AGGREGATION)'
-        required: false
-        type: boolean
-        default: false
-      capture_explain:
-        description: 'After the run, capture per-query EXPLAIN / EXPLAIN ANALYZE / eager-aggregation decline map as an artifact'
-        required: false
-        type: boolean
-        default: true
       query_overrides:
         description: 'Query overrides'
         required: false
@@ -87,29 +77,6 @@ jobs:
     runs-on: ${{ github.event.inputs.runner_type }}
     timeout-minutes: 120
     steps:
-      - name: Log run parameters
-        # Surface every dispatch input (and the resolved eager-aggregation state)
-        # in the log + job summary so a run is self-describing. Inputs are passed
-        # via env (not inlined) to avoid script injection.
-        env:
-          INPUTS_JSON: ${{ toJSON(github.event.inputs) }}
-          EAGER_AGGREGATION: ${{ github.event.inputs.eager_aggregation }}
-        run: |
-          eager_state="OFF"
-          [ "$EAGER_AGGREGATION" = "true" ] && eager_state="ON (SPICED_EAGER_AGGREGATION=1)"
-          {
-            echo "## HTAP run parameters"
-            echo "**Eager aggregation:** $eager_state"
-            echo ""
-            echo '```json'
-            echo "$INPUTS_JSON"
-            echo '```'
-          } >> "$GITHUB_STEP_SUMMARY"
-          echo "::group::HTAP run parameters"
-          echo "Eager aggregation: $eager_state"
-          echo "$INPUTS_JSON"
-          echo "::endgroup::"
-
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
       - name: Set up Rust toolchain
@@ -192,16 +159,6 @@ jobs:
             TESTOP_PREFIX="taskset -c 32-39,96-103"
             echo "CPU pinning: spiced -> 64 logical CPUs, testoperator -> 16 logical CPUs"
           fi
-          # Diagnostics: capture per-query EXPLAIN / EXPLAIN ANALYZE + the
-          # eager-aggregation decline map against the LIVE benchmarked spiced
-          # (hot, fully-loaded acceleration) after the workload, before teardown.
-          # The rule emits its decisions via stderr (eprintln), so this works at
-          # the default log level — no SPICED_LOG override (which would slow the
-          # run and skew the benchmark numbers).
-          CAPTURE_ARGS=""
-          if [ "${{ github.event.inputs.capture_explain }}" = "true" ]; then
-            CAPTURE_ARGS="--capture-explain ${{ runner.temp }}/explain-capture"
-          fi
           $TESTOP_PREFIX testoperator run htap \
             -s "${SPICED_BIN}" \
             -p '${{ steps.set_spicepod_path.outputs.SPICEPOD_PATH }}' \
@@ -213,30 +170,14 @@ jobs:
             --concurrency ${{ github.event.inputs.concurrency }} \
             ${{ github.event.inputs.query_overrides != '' && format('--query-overrides {0}', github.event.inputs.query_overrides) || '' }} \
             --ready-wait ${{ github.event.inputs.ready_wait }} \
-            $CAPTURE_ARGS \
             ${{ github.event.inputs.runner_type == 'spiceai-dev-xlarge-runners' && '--skip-prepare' || '' }} \
             --disable-progress-bars \
             --metrics
         env:
           SPICEAI_BENCHMARK_METRICS_KEY: ${{ secrets.SPICEAI_BENCHMARK_METRICS_KEY }}
           SPICED_COMMIT: ${{ steps.setup-spiced.outputs.SPICED_COMMIT }}
-          # Experiment toggle: inherited by testoperator -> spiced (spawned without
-          # env_clear). On => the cost-based eager-aggregation optimizer; empty => off.
-          SPICED_EAGER_AGGREGATION: ${{ github.event.inputs.eager_aggregation == 'true' && '1' || '' }}
           # Dedicated in-cluster PG pod on xlarge; per-run docker container (loopback) elsewhere.
           CHBENCH_PG_HOST: ${{ github.event.inputs.runner_type == 'spiceai-dev-xlarge-runners' && 'chbench-postgres.dataplatform.svc.cluster.local' || '127.0.0.1' }}
-
-      # EXPLAIN / EXPLAIN ANALYZE / decline-map capture now runs in-process via
-      # `testoperator run htap --capture-explain` (above), against the live,
-      # fully-loaded spiced — so the artifact below is written by the run step.
-      - name: Upload EXPLAIN / decline-map artifact
-        if: always() && github.event.inputs.capture_explain == 'true'
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
-        with:
-          name: chbench-explain-${{ github.event.inputs.scale_factor }}-eager-${{ github.event.inputs.eager_aggregation }}-${{ github.run_id }}
-          path: ${{ runner.temp }}/explain-capture
-          if-no-files-found: warn
-          retention-days: 30
 
       # The dedicated PG pod is long-lived and shared across runs, so a crashed
       # or cancelled run can leave inactive replication slots (which retain WAL

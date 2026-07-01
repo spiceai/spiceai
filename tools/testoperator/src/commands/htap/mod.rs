@@ -17,7 +17,6 @@ limitations under the License.
 //! HTAP test command — runs concurrent TPC-C OLTP workload against the source
 //! Postgres database while executing CH-benCH analytical queries through spiced.
 
-mod capture;
 mod correctness;
 mod reporting;
 mod spice;
@@ -64,34 +63,6 @@ pub(crate) async fn run(args: &HtapArgs) -> anyhow::Result<()> {
     if !test_args.common.scrape_spiced_metrics {
         start_request = start_request
             .with_additional_args(vec!["--metrics".to_string(), "127.0.0.1:9090".to_string()]);
-    }
-
-    // When capturing EXPLAINs, tee spiced's stdout/stderr to the capture dir.
-    // The eager-aggregation rule emits its accept/decline decisions to stderr
-    // (eprintln), so the decline map is populated at the DEFAULT log level — no
-    // SPICED_LOG override is needed. We deliberately do NOT raise the log level
-    // here: forcing verbose logging for the whole run slowed readiness and
-    // skewed the benchmark's throughput/latency numbers.
-    if let Some(dir) = &args.capture_explain {
-        std::fs::create_dir_all(dir)?;
-        start_request = start_request.with_log_capture(dir.join("spiced.log"));
-    }
-
-    // Forward the eager-aggregation experiment env vars explicitly onto the
-    // spawned spiced, rather than relying on inheritance through the launch
-    // wrapper (e.g. the CI taskset pin script). Log what we forward so eager
-    // enablement is unambiguous in the run output.
-    for key in [
-        "SPICED_EAGER_AGGREGATION",
-        "SPICED_EAGER_AGGREGATION_MIN_REDUCTION_FACTOR",
-        "SPICED_EAGER_AGGREGATION_MAX_PUSHED_GROUPS",
-    ] {
-        if let Ok(value) = std::env::var(key)
-            && !value.is_empty()
-        {
-            println!("htap: forwarding {key}={value} to spiced");
-            start_request = start_request.with_env(key, value);
-        }
     }
 
     // 1. Prepare the source: seed schema + data — or, with --skip-prepare,
@@ -427,19 +398,6 @@ pub(crate) async fn run(args: &HtapArgs) -> anyhow::Result<()> {
     }
 
     telemetry.emit().await?;
-
-    // Optional: capture per-query EXPLAIN / EXPLAIN ANALYZE + the eager-aggregation
-    // decline map against the still-running, fully-loaded spiced. Best-effort —
-    // diagnostics must never fail the benchmark.
-    if let Some(dir) = &args.capture_explain {
-        let overrides = test_args
-            .query_overrides
-            .clone()
-            .map(test_framework::queries::QueryOverrides::from);
-        if let Err(e) = capture::run(&spice_clients, &spiced_instance, dir, overrides).await {
-            eprintln!("EXPLAIN/decline capture failed (non-fatal): {e}");
-        }
-    }
 
     // Optional: hold spiced alive after the benchmark so you can run ad-hoc
     // queries against it. Set SPICED_KEEP_ALIVE to block here until you press

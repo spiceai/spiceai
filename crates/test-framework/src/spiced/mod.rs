@@ -16,11 +16,9 @@ limitations under the License.
 
 use std::{
     fmt::Display,
-    io::{Read, Write},
     path::PathBuf,
-    process::{Child, Command, Stdio},
+    process::{Child, Command},
     sync::Arc,
-    thread,
     time::Duration,
 };
 
@@ -66,9 +64,6 @@ pub enum SpicedInstance {
         child: Child,
         tempdir: TempDir,
         version: SpicedVersion,
-        /// When log capture is requested, the file spiced's stdout/stderr are
-        /// teed into (see [`StartRequest::with_log_capture`]). `None` otherwise.
-        log_path: Option<PathBuf>,
     },
 }
 
@@ -79,8 +74,6 @@ pub struct StartRequest {
     data_dir: Option<PathBuf>,
     additional_args: Vec<String>,
     prepared: bool,
-    capture_log: Option<PathBuf>,
-    extra_env: Vec<(String, String)>,
 }
 
 impl StartRequest {
@@ -92,37 +85,12 @@ impl StartRequest {
             prepared: false,
             data_dir: None,
             additional_args: Vec::new(),
-            capture_log: None,
-            extra_env: Vec::new(),
         })
-    }
-
-    /// Set an environment variable explicitly on the spawned spiced process,
-    /// overriding inheritance. Use this for env that MUST reach spiced rather
-    /// than relying on it propagating through wrapper scripts (e.g.
-    /// `SPICED_EAGER_AGGREGATION`). Only honored for owned (spawned) instances.
-    #[must_use]
-    pub fn with_env(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
-        self.extra_env.push((key.into(), value.into()));
-        self
     }
 
     #[must_use]
     pub fn with_data_dir(mut self, data_dir: PathBuf) -> Self {
         self.data_dir = Some(data_dir);
-        self
-    }
-
-    /// Tee the spawned spiced's stdout/stderr into `path` (in addition to the
-    /// parent's stdout/stderr, so live job-log output is preserved).
-    ///
-    /// Used by diagnostics that need to grep spiced's log after the fact — e.g.
-    /// the HTAP `--capture-explain` decline map, which reads the
-    /// `eager_aggregation` planner lines emitted while EXPLAINing each query.
-    /// Only honored for owned (spawned) instances.
-    #[must_use]
-    pub fn with_log_capture(mut self, path: PathBuf) -> Self {
-        self.capture_log = Some(path);
         self
     }
 
@@ -280,49 +248,18 @@ impl SpicedInstance {
             cmd.arg("--metrics").arg(metrics_addr);
         }
 
-        // Set any explicitly-forwarded env vars on the spiced process (these
-        // override inheritance, so they reach spiced even when it's launched via
-        // a wrapper script).
-        for (key, value) in &start_request.extra_env {
-            cmd.env(key, value);
-        }
-
         // Add any additional arguments
         for arg in start_request.additional_args {
             cmd.arg(arg);
         }
 
-        // If log capture was requested, pipe spiced's stdout/stderr so we can tee
-        // them to a file (for post-run diagnostics like the eager-aggregation
-        // decline map) while still echoing to the parent's console.
-        let capture_log = start_request.capture_log.clone();
-        if capture_log.is_some() {
-            cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
-        }
-
-        let mut child = cmd.spawn()?;
-
-        let log_path = match capture_log {
-            Some(path) => spawn_log_tee(&mut child, &path),
-            None => None,
-        };
+        let child = cmd.spawn()?;
 
         Ok(Self::Owned {
             child,
             tempdir,
             version: SpicedVersion::new(version),
-            log_path,
         })
-    }
-
-    /// Path of the file spiced's output is being teed into, if log capture was
-    /// requested via [`StartRequest::with_log_capture`].
-    #[must_use]
-    pub fn log_capture_path(&self) -> Option<PathBuf> {
-        match self {
-            Self::Owned { log_path, .. } => log_path.clone(),
-            _ => None,
-        }
     }
 
     #[must_use]
@@ -536,47 +473,6 @@ impl SpicedInstance {
         };
 
         Some(Process::new(Pid::from_u32(child.id())))
-    }
-}
-
-/// Tee the child's piped stdout/stderr into `path` and echo them to the
-/// parent's stdout/stderr. Returns the log path on success (the file is created
-/// truncated). Best-effort: on any IO error capture is silently skipped and
-/// `None` is returned, leaving the run otherwise unaffected.
-///
-/// The two reader threads are detached; they exit on EOF when the child's pipes
-/// close (i.e. when spiced is stopped/killed).
-fn spawn_log_tee(child: &mut Child, path: &PathBuf) -> Option<PathBuf> {
-    let file = std::fs::File::create(path).ok()?;
-    if let Some(out) = child.stdout.take() {
-        let f = file.try_clone().ok();
-        thread::spawn(move || tee_stream(out, f, false));
-    }
-    if let Some(err) = child.stderr.take() {
-        thread::spawn(move || tee_stream(err, Some(file), true));
-    }
-    Some(path.clone())
-}
-
-/// Copy `src` to the capture file (if any) and the parent's stdout/stderr until
-/// EOF. Write errors are ignored — this is best-effort diagnostics plumbing.
-fn tee_stream<R: Read>(mut src: R, mut file: Option<std::fs::File>, is_stderr: bool) {
-    let mut buf = [0u8; 8192];
-    loop {
-        match src.read(&mut buf) {
-            Ok(0) | Err(_) => break,
-            Ok(n) => {
-                let chunk = &buf[..n];
-                if let Some(f) = file.as_mut() {
-                    let _ = f.write_all(chunk);
-                }
-                if is_stderr {
-                    let _ = std::io::stderr().write_all(chunk);
-                } else {
-                    let _ = std::io::stdout().write_all(chunk);
-                }
-            }
-        }
     }
 }
 
