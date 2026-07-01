@@ -146,7 +146,7 @@ pub fn optimal_left_deep_join_plan(
         return ReorderOutcome::Failed {
             plan: original,
             error: plan_datafusion_err!(
-                "reordered plan references a column that does not resolve in its input schema (reconstruction dropped a column needed by a wrapper)"
+                "reordered plan references a column that does not resolve in its input schema"
             ),
         };
     }
