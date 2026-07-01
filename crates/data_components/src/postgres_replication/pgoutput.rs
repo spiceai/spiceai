@@ -93,7 +93,7 @@ pub struct TupleData {
     pub columns: Vec<Option<Value>>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Value {
     /// Text-format representation (pgoutput emits text for most types).
     Text(String),
