@@ -487,6 +487,26 @@ fn maintained_aggregate_source(
     plan: &Arc<dyn ExecutionPlan>,
 ) -> Option<MaintainedAggregateSource<'_>> {
     if let Some(cayenne_scan) = plan.downcast_ref::<CayenneAccelerationExec>() {
+        // Soundness guard — mirrors `CayenneStatsAggregateRewriter::optimize`,
+        // which declines when `scan.has_pushed_filter()`. A maintained aggregate
+        // view answers the *unfiltered* relation, but the physical `FilterPushdown`
+        // pass can push a query's `WHERE` ONTO the scan and REMOVE the `FilterExec`
+        // above it (the inner Vortex source accepts the predicate; see
+        // `CayenneAccelerationExec::handle_child_pushdown_result`). Reaching the bare
+        // scan with a pushed filter therefore means the scan returns a row *subset*
+        // the whole-relation view cannot answer — serving it would silently drop the
+        // predicate and return wrong results. Decline so the real scan+aggregate runs.
+        // (A *surviving* `FilterExec` is still captured by the `FilterExec` branch
+        // below and matched against a filtered view, so filtered views are unaffected.)
+        //
+        // DEEP walk: on a merge-on-read table with pending tombstones the scan is
+        // wrapped in a deletion-filter exec and the predicate is pushed onto the file
+        // source BELOW it, which the shallow `has_pushed_filter` (identity-preserving
+        // whitelist) would miss — leaving the bug open on exactly the delete-heavy CDC
+        // tables this view targets.
+        if cayenne_scan.has_pushed_filter_deep() {
+            return None;
+        }
         return cayenne_scan
             .maintained_aggregates()
             .map(|(registry, scan_epoch)| (registry, scan_epoch, None));
