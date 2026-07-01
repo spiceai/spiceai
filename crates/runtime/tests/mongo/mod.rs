@@ -380,7 +380,7 @@ async fn mongodb_json_nesting_folds_into_catch_all() -> Result<(), anyhow::Error
                 () = tokio::time::sleep(std::time::Duration::from_mins(1)) => {
                     return Err(anyhow::anyhow!("Timed out waiting for datasets to load"));
                 }
-                () = cloned_rt.load_components() => {}
+                () = Arc::clone(&cloned_rt).load_components() => {}
             }
 
             let batches =
@@ -399,7 +399,9 @@ async fn mongodb_json_nesting_folds_into_catch_all() -> Result<(), anyhow::Error
                     .ok_or_else(|| anyhow::anyhow!("missing catch-all `data` column"))?
                     .as_any()
                     .downcast_ref::<StringArray>()
-                    .ok_or_else(|| anyhow::anyhow!("catch-all `data` should be a Utf8 JSON string"))?;
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("catch-all `data` should be a Utf8 JSON string")
+                    })?;
                 for row in 0..batch.num_rows() {
                     let catch_all: serde_json::Value = serde_json::from_str(data.value(row))
                         .map_err(|e| anyhow::anyhow!("catch-all must be valid JSON: {e}"))?;
@@ -415,7 +417,10 @@ async fn mongodb_json_nesting_folds_into_catch_all() -> Result<(), anyhow::Error
             let (name0, data0) = &rows[0];
             assert_eq!(name0, "Alice");
             assert_eq!(data0["email"], json!("alice@example.com"));
-            assert!(data0.get("age").is_some(), "scalar `age` must be in the catch-all");
+            assert!(
+                data0.get("age").is_some(),
+                "scalar `age` must be in the catch-all"
+            );
             assert!(
                 data0["address"].is_object(),
                 "nested `address` must be preserved as JSON in the catch-all"
@@ -433,7 +438,10 @@ async fn mongodb_json_nesting_folds_into_catch_all() -> Result<(), anyhow::Error
             let (name1, data1) = &rows[1];
             assert_eq!(name1, "Bob");
             assert_eq!(data1["email"], json!("bob@example.com"));
-            assert!(data1["tags"].is_array(), "array `tags` must be preserved in the catch-all");
+            assert!(
+                data1["tags"].is_array(),
+                "array `tags` must be preserved in the catch-all"
+            );
             assert!(data1.get("name").is_none());
 
             running_container.remove().await?;
