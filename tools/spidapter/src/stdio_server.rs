@@ -2051,6 +2051,9 @@ async fn generate_initial_spicepod(
                     default_max_partition_assignments_per_interval(),
                 max_partitions_per_executor: default_max_partitions_per_executor(),
                 partition_discovery_timeout: default_partition_discovery_timeout(),
+                // None → the runtime applies the tuned ClusterGrpcClient defaults
+                // (fast keep-alive so a dropped connection recovers before the reap).
+                grpc_client: None,
             };
 
             let region = resolve_aws_region(setup_config);
