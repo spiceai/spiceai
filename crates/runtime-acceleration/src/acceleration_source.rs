@@ -52,8 +52,9 @@ pub trait AccelerationSource: Send + Sync {
     /// runtime. Used by DuckDB to attach peer file-mode databases. Default returns empty.
     fn initialized_sources<'a>(
         &'a self,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Vec<Arc<dyn AccelerationSource>>> + Send + 'a>>
-    {
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Vec<Arc<dyn AccelerationSource>>> + Send + 'a>,
+    > {
         Box::pin(async { vec![] })
     }
 }
