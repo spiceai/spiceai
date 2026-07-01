@@ -47,6 +47,7 @@ use datafusion_table_providers::util::{
     column_reference::ColumnReference, on_conflict::OnConflict,
 };
 use object_store::ObjectMeta;
+use std::num::{NonZero, NonZeroUsize};
 use std::sync::Arc;
 
 type TestResult = Result<(), Box<dyn std::error::Error>>;
@@ -58,6 +59,13 @@ test_with_backends!(test_file_based_retention_mixed_file_not_deleted_impl);
 
 // PK-based file retention tests
 test_with_backends!(test_pk_file_based_retention_main_table_only_impl);
+test_with_backends!(test_orphaned_key_dv_cleaned_after_retention_impl);
+test_with_backends!(test_needed_key_dv_retained_after_retention_impl);
+test_with_backends!(test_all_snapshots_emptied_cleans_all_orphaned_dvs_impl);
+test_with_backends!(test_orphaned_dv_cleanup_disabled_when_knob_zero_impl);
+test_with_backends!(test_orphaned_dv_cleanup_below_threshold_retained_impl);
+test_with_backends!(test_loader_self_heals_orphaned_missing_dv_impl);
+test_with_backends!(test_loader_errors_on_missing_needed_dv_impl);
 
 // List-files cache maintenance tests
 test_with_backends!(test_cache_delta_applied_after_append_impl);
@@ -65,7 +73,7 @@ test_with_backends!(test_file_based_retention_targeted_cache_invalidation_impl);
 
 /// Test: File-based retention physically deletes files that are fully expired.
 ///
-/// Setup (3-second retention, position-based / no PK):
+/// Setup (5-second retention, position-based / no PK):
 ///   - file 1: `event_time` = now           → fresh (kept)
 ///   - file 2: `event_time` = now - 2s      → within retention (kept)
 ///   - file 3: `event_time` = now - 10s     → expired (deleted)
@@ -73,11 +81,11 @@ test_with_backends!(test_file_based_retention_targeted_cache_invalidation_impl);
 /// Steps:
 /// 1. Insert 3 batches (separate Vortex files).
 /// 2. Verify 3 `.vortex` files exist on disk.
-/// 3. Call `delete_from` with `event_time < cutoff` (cutoff = now - 3s).
+/// 3. Call `delete_from` with `event_time < cutoff` (cutoff = now - 5s).
 /// 4. Verify only 2 `.vortex` files remain.
 /// 5. Verify count(*) = 2 and ids = [1, 2].
 async fn test_file_based_retention_deletes_expired_files_impl(fixture: TestFixture) -> TestResult {
-    let retention_seconds = 3;
+    let retention_seconds = 5;
     let table_name = "file_ret_delete";
     let ctx = SessionContext::new();
     let table =
@@ -86,7 +94,7 @@ async fn test_file_based_retention_deletes_expired_files_impl(fixture: TestFixtu
     // Insert each row as a separate batch → separate Vortex file.
     let now_us = chrono::Utc::now().timestamp_micros();
     insert_row(&table, 1, now_us).await?; // fresh
-    insert_row(&table, 2, now_us - 2_000_000).await?; // 2s ago — within retention
+    insert_row(&table, 2, now_us - 2_000_000).await?; // 2s ago — within retention (3s margin)
     insert_row(&table, 3, now_us - 10_000_000).await?; // 10s ago — expired
 
     let dir = table_id_dir(&fixture, &table, table_name);
@@ -388,7 +396,7 @@ async fn test_cache_delta_applied_after_append_impl(fixture: TestFixture) -> Tes
 async fn test_file_based_retention_targeted_cache_invalidation_impl(
     fixture: TestFixture,
 ) -> TestResult {
-    let retention_seconds = 3;
+    let retention_seconds = 5;
     let table_name = "cache_inv_delete";
     let ctx = SessionContext::new();
     let runtime_env = ctx.runtime_env();
@@ -403,7 +411,7 @@ async fn test_file_based_retention_targeted_cache_invalidation_impl(
     // Insert 3 rows as separate files
     let now_us = chrono::Utc::now().timestamp_micros();
     insert_row(&table, 1, now_us).await?; // fresh
-    insert_row(&table, 2, now_us - 2_000_000).await?; // 2s ago — within retention
+    insert_row(&table, 2, now_us - 2_000_000).await?; // 2s ago — within retention (3s margin)
     insert_row(&table, 3, now_us - 10_000_000).await?; // 10s ago — expired
 
     // Query to populate the list-files cache.
@@ -531,14 +539,14 @@ async fn test_file_based_retention_targeted_cache_invalidation_impl(
 /// but using the `Int64Pk` deletion strategy. No protected snapshots exist
 /// because no upserts have been performed.
 ///
-/// Setup (3-second retention, Int64 PK, `on_conflict`: None):
+/// Setup (5-second retention, Int64 PK, `on_conflict`: None):
 ///   - file 1: `event_time` = now           → fresh (kept)
 ///   - file 2: `event_time` = now - 2s      → within retention (kept)
 ///   - file 3: `event_time` = now - 10s     → expired (deleted)
 ///
 /// After deletion: 2 files remain, count(*) = 2, ids = [1, 2].
 async fn test_pk_file_based_retention_main_table_only_impl(fixture: TestFixture) -> TestResult {
-    let retention_seconds = 3;
+    let retention_seconds = 5;
     let table_name = "pk_file_ret_main";
     let ctx = SessionContext::new();
     let table = create_pk_retention_table(
@@ -546,13 +554,14 @@ async fn test_pk_file_based_retention_main_table_only_impl(fixture: TestFixture)
         table_name,
         retention_seconds,
         false,
+        None, // no PK upsert here → no key DVs to clean up
         ctx.runtime_env(),
     )
     .await?;
 
     let now_us = chrono::Utc::now().timestamp_micros();
     insert_row(&table, 1, now_us).await?; // fresh
-    insert_row(&table, 2, now_us - 2_000_000).await?; // 2s ago — within retention
+    insert_row(&table, 2, now_us - 2_000_000).await?; // 2s ago — within retention (3s margin)
     insert_row(&table, 3, now_us - 10_000_000).await?; // 10s ago — expired
 
     let dir = table_id_dir(&fixture, &table, table_name);
@@ -652,6 +661,7 @@ async fn create_pk_retention_table(
     table_name: &str,
     retention_seconds: u64,
     with_upsert: bool,
+    orphaned_dv_cleanup_min_files: Option<NonZeroUsize>,
     runtime_env: Arc<RuntimeEnv>,
 ) -> Result<Arc<CayenneTableProvider>, Box<dyn std::error::Error>> {
     let table_dir = fixture.data_path.join(table_name);
@@ -667,8 +677,13 @@ async fn create_pk_retention_table(
         None
     };
 
+    // `cleanup_min_files` controls the orphaned-DV cleanup knob: 0 disables the
+    // sweep entirely; a positive value sweeps once that many orphan-eligible DVs
+    // accumulate. Tests drive the (otherwise background) sweep deterministically
+    // via `CayenneTableProvider::drain_orphan_dv_sweep`.
     let vortex_config = cayenne::metadata::VortexConfig {
         inline_max_rows: 0,
+        orphaned_dv_cleanup_min_files,
         ..cayenne::metadata::VortexConfig::default()
     };
 
@@ -691,6 +706,23 @@ async fn create_pk_retention_table(
         CayenneTableProviderBuilder::new(catalog_arc, runtime_env)
             .with_time_retention_filter_builder(retention_builder)
             .create(table_options)
+            .await?,
+    ))
+}
+
+/// Reopen a table by constructing a fresh provider from the same catalog,
+/// simulating a process restart (runs the loader path, including missing-DV
+/// reconciliation).
+async fn reopen_table(
+    fixture: &TestFixture,
+    table_name: &str,
+    runtime_env: Arc<RuntimeEnv>,
+) -> Result<Arc<CayenneTableProvider>, Box<dyn std::error::Error>> {
+    let catalog: Arc<dyn MetadataCatalog> =
+        Arc::clone(&fixture.catalog) as Arc<dyn MetadataCatalog>;
+    Ok(Arc::new(
+        CayenneTableProviderBuilder::new(catalog, runtime_env)
+            .open(table_name)
             .await?,
     ))
 }
@@ -859,4 +891,480 @@ fn dummy_cache_value() -> CachedFileList {
         e_tag: None,
         version: None,
     }])
+}
+
+/// Count key-based deletion-vector files registered in the catalog for a table.
+///
+/// Key-based DVs (the kind PK/upsert tables write) carry no
+/// `source_data_file_path`; position-based DVs always have one. Note the
+/// catalog does not persist `deletion_type`, so it cannot be used to classify a
+/// DV — `source_data_file_path.is_none()` is the reliable discriminator.
+async fn count_key_based_delete_files(
+    fixture: &TestFixture,
+    table: &CayenneTableProvider,
+) -> usize {
+    let table_id = table.metadata().table_id.clone();
+    let dfs = fixture
+        .catalog
+        .get_table_delete_files(&table_id)
+        .await
+        .expect("get delete files");
+    dfs.iter()
+        .filter(|df| df.source_data_file_path.is_none())
+        .count()
+}
+
+/// Physically delete every `.arrow` deletion-vector file under `root` (simulating
+/// the file-first sweep having unlinked the file but crashed before removing the
+/// catalog row). Returns the number deleted.
+fn delete_arrow_files(root: &std::path::Path) -> usize {
+    fn walk(dir: &std::path::Path, count: &mut usize) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.filter_map(std::result::Result::ok) {
+            let path = entry.path();
+            if path.is_dir() {
+                walk(&path, count);
+            } else if path.extension().is_some_and(|ext| ext == "arrow") {
+                std::fs::remove_file(&path).expect("remove .arrow file");
+                *count += 1;
+            }
+        }
+    }
+    let mut count = 0;
+    walk(root, &mut count);
+    count
+}
+
+/// Count `.arrow` deletion-vector files physically present anywhere under `root`.
+fn count_arrow_files(root: &std::path::Path) -> usize {
+    fn walk(dir: &std::path::Path, count: &mut usize) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.filter_map(std::result::Result::ok) {
+            let path = entry.path();
+            if path.is_dir() {
+                walk(&path, count);
+            } else if path.extension().is_some_and(|ext| ext == "arrow") {
+                *count += 1;
+            }
+        }
+    }
+    let mut count = 0;
+    walk(root, &mut count);
+    count
+}
+
+/// Test: a key-based deletion vector orphaned by retention is cleaned up.
+///
+/// Setup (PK table with upsert, 60-second retention):
+/// - insert id=1 @ now-100s: old copy lands in protected snapshot M
+/// - upsert id=1 @ now: fresh copy lands in protected snapshot N, plus a
+///   key-based DV superseding the old copy
+///
+/// Retention (`event_time < now-60s`) deletes M's expired file, fully emptying
+/// M. The DV (which only ever shadowed M's now-deleted row) is orphaned: it
+/// lives in the base snapshot's `deletions/` dir, so retention's snapshot
+/// cleanup never removes it. This test asserts the orphan is cleaned from both
+/// the catalog and disk, while the surviving row is unaffected. Issue #9388.
+///
+/// The window is 60s (not a few seconds) so the background-checkpoint polls
+/// below cannot let the `now` row age past the cutoff before the delete runs.
+async fn test_orphaned_key_dv_cleaned_after_retention_impl(fixture: TestFixture) -> TestResult {
+    let retention_seconds = 60;
+    let table_name = "orphan_dv_cleanup";
+    let ctx = SessionContext::new();
+    let table = create_pk_retention_table(
+        &fixture,
+        table_name,
+        retention_seconds,
+        true,
+        NonZero::new(1), // enable orphaned-DV cleanup; the sweep is driven via drain_orphan_dv_sweep
+        ctx.runtime_env(),
+    )
+    .await?;
+    let table_id = table.metadata().table_id.clone();
+    // Deletion-vector `.arrow` files are written under the base table path
+    // (`<base>/<snapshot_id>/deletions/`), a sibling of the `table_id` data
+    // directory, so walk the whole base path to find them.
+    let base_dir = fixture.data_path.join(table_name);
+
+    let now_us = chrono::Utc::now().timestamp_micros();
+
+    // Old copy of id=1 (will expire under retention).
+    insert_row(&table, 1, now_us - 100_000_000).await?;
+    common::poll_inlined_data_count_zero(&fixture.catalog, &table_id).await?;
+
+    // Upsert id=1 with a fresh timestamp → new protected snapshot + key DV.
+    insert_row(&table, 1, now_us).await?;
+    common::poll_inlined_data_count_zero(&fixture.catalog, &table_id).await?;
+
+    assert_eq!(
+        count_key_based_delete_files(&fixture, &table).await,
+        1,
+        "Upsert should have written one key-based deletion vector"
+    );
+    assert_eq!(
+        count_arrow_files(&base_dir),
+        1,
+        "The DV .arrow file should exist on disk before retention"
+    );
+
+    // Retention deletes the expired old copy, emptying snapshot M.
+    let deleted = execute_delete(&table, retention_delete_filter(retention_seconds)).await?;
+    assert_eq!(deleted, 1, "Retention should delete the 1 expired row");
+
+    // The surviving (re-upserted) row is unaffected.
+    assert_table_contents(&ctx, &table, table_name, &[1], "after retention").await?;
+
+    // Drive the (otherwise background, dedicated-runtime) orphaned-DV sweep
+    // deterministically before asserting on its effects.
+    table.drain_orphan_dv_sweep().await;
+
+    // The orphaned DV must be gone from both the catalog and disk.
+    assert_eq!(
+        count_key_based_delete_files(&fixture, &table).await,
+        0,
+        "Orphaned key-based deletion vector should be removed from the catalog"
+    );
+    assert_eq!(
+        count_arrow_files(&base_dir),
+        0,
+        "Orphaned DV .arrow file should be removed from disk"
+    );
+
+    Ok(())
+}
+
+/// Test: a still-needed key-based DV is NOT pruned when retention runs.
+///
+/// A DV that shadows a *surviving* snapshot (threshold below the DV's delete
+/// sequence) must be retained even though an unrelated snapshot was emptied by
+/// retention. This guards the sequence-floor rule against over-pruning.
+///
+/// Setup (PK table with upsert, 60-second retention):
+/// - insert id=1 @ now-100s: old copy in M (expired → emptied by retention)
+/// - insert id=2 @ now: fresh copy in A (survives)
+/// - upsert id=2 @ now: fresh copy in B (survives), plus a DV shadowing A's
+///   copy of id=2 — still needed after retention
+///
+/// 60s window so the checkpoint polls can't let the `now` id=2 rows age past
+/// the cutoff (which would delete the data the test expects to survive).
+async fn test_needed_key_dv_retained_after_retention_impl(fixture: TestFixture) -> TestResult {
+    let retention_seconds = 60;
+    let table_name = "needed_dv_retained";
+    let ctx = SessionContext::new();
+    let table = create_pk_retention_table(
+        &fixture,
+        table_name,
+        retention_seconds,
+        true,
+        NonZero::new(1), // enable orphaned-DV cleanup; the sweep is driven via drain_orphan_dv_sweep
+        ctx.runtime_env(),
+    )
+    .await?;
+    let table_id = table.metadata().table_id.clone();
+
+    let now_us = chrono::Utc::now().timestamp_micros();
+
+    // id=1 old copy → snapshot M (will be emptied by retention, triggers cleanup).
+    insert_row(&table, 1, now_us - 100_000_000).await?;
+    common::poll_inlined_data_count_zero(&fixture.catalog, &table_id).await?;
+
+    // id=2 fresh copy → snapshot A (survives retention).
+    insert_row(&table, 2, now_us).await?;
+    common::poll_inlined_data_count_zero(&fixture.catalog, &table_id).await?;
+
+    // Upsert id=2 fresh → snapshot B + DV shadowing A's copy (still needed).
+    insert_row(&table, 2, now_us).await?;
+    common::poll_inlined_data_count_zero(&fixture.catalog, &table_id).await?;
+
+    assert_eq!(
+        count_key_based_delete_files(&fixture, &table).await,
+        1,
+        "Upserting id=2 should have written one key-based deletion vector"
+    );
+
+    // Retention empties M (id=1 expired); A and B are fresh and survive.
+    let deleted = execute_delete(&table, retention_delete_filter(retention_seconds)).await?;
+    assert_eq!(
+        deleted, 1,
+        "Retention should delete only the expired id=1 row"
+    );
+
+    // id=1 is gone; id=2 survives exactly once (the upserted copy).
+    assert_table_contents(&ctx, &table, table_name, &[2], "after retention").await?;
+
+    // Run the sweep: it must NOT prune the still-needed DV (its delete sequence is
+    // above the surviving floor, so it is not orphan-eligible).
+    table.drain_orphan_dv_sweep().await;
+
+    // The DV shadowing A's copy of id=2 is still needed → must be retained.
+    assert_eq!(
+        count_key_based_delete_files(&fixture, &table).await,
+        1,
+        "A deletion vector that still shadows a surviving snapshot must be retained"
+    );
+
+    Ok(())
+}
+
+/// Test: when retention empties EVERY protected snapshot, all orphaned key-based
+/// DVs are cleaned up (exercises the `floor = i64::MAX` branch).
+///
+/// Both copies of id=1 carry expired timestamps, so retention empties both the
+/// original and the upsert snapshot. With no surviving protected snapshots and
+/// an empty current snapshot, the floor is unbounded and the now-orphaned DV is
+/// swept.
+async fn test_all_snapshots_emptied_cleans_all_orphaned_dvs_impl(
+    fixture: TestFixture,
+) -> TestResult {
+    let retention_seconds = 60;
+    let table_name = "all_emptied_dv_cleanup";
+    let ctx = SessionContext::new();
+    let table = create_pk_retention_table(
+        &fixture,
+        table_name,
+        retention_seconds,
+        true,
+        NonZero::new(1), // enable orphaned-DV cleanup; the sweep is driven via drain_orphan_dv_sweep
+        ctx.runtime_env(),
+    )
+    .await?;
+    let table_id = table.metadata().table_id.clone();
+    let base_dir = fixture.data_path.join(table_name);
+
+    let now_us = chrono::Utc::now().timestamp_micros();
+
+    // Two expired copies of id=1: the upsert creates a key DV, and BOTH copies'
+    // snapshots are old enough (well past the 60s window) to be emptied by
+    // retention.
+    insert_row(&table, 1, now_us - 200_000_000).await?;
+    common::poll_inlined_data_count_zero(&fixture.catalog, &table_id).await?;
+    insert_row(&table, 1, now_us - 100_000_000).await?;
+    common::poll_inlined_data_count_zero(&fixture.catalog, &table_id).await?;
+
+    assert_eq!(
+        count_key_based_delete_files(&fixture, &table).await,
+        1,
+        "Upsert should have written one key-based deletion vector"
+    );
+
+    let deleted = execute_delete(&table, retention_delete_filter(retention_seconds)).await?;
+    assert_eq!(deleted, 2, "Retention should delete both expired copies");
+
+    // Drive the orphaned-DV sweep deterministically.
+    table.drain_orphan_dv_sweep().await;
+
+    // All data is gone, and so is the orphaned DV (catalog + disk).
+    assert_table_contents(&ctx, &table, table_name, &[], "after retention").await?;
+    assert_eq!(
+        count_key_based_delete_files(&fixture, &table).await,
+        0,
+        "All orphaned key-based deletion vectors should be removed from the catalog"
+    );
+    assert_eq!(
+        count_arrow_files(&base_dir),
+        0,
+        "All orphaned DV .arrow files should be removed from disk"
+    );
+
+    Ok(())
+}
+
+/// Test: with the knob set to 0, orphaned-DV cleanup is fully disabled — the
+/// orphaned DV (catalog row + `.arrow` file) is left in place. This is the A/B
+/// baseline that must reproduce pre-feature behavior (no sweep, no locks).
+async fn test_orphaned_dv_cleanup_disabled_when_knob_zero_impl(fixture: TestFixture) -> TestResult {
+    let retention_seconds = 60;
+    let table_name = "orphan_dv_disabled";
+    let ctx = SessionContext::new();
+    let table = create_pk_retention_table(
+        &fixture,
+        table_name,
+        retention_seconds,
+        true,
+        None, // cleanup DISABLED
+        ctx.runtime_env(),
+    )
+    .await?;
+    let table_id = table.metadata().table_id.clone();
+    let base_dir = fixture.data_path.join(table_name);
+
+    let now_us = chrono::Utc::now().timestamp_micros();
+    insert_row(&table, 1, now_us - 100_000_000).await?;
+    common::poll_inlined_data_count_zero(&fixture.catalog, &table_id).await?;
+    insert_row(&table, 1, now_us).await?;
+    common::poll_inlined_data_count_zero(&fixture.catalog, &table_id).await?;
+
+    assert_eq!(count_key_based_delete_files(&fixture, &table).await, 1);
+    assert_eq!(count_arrow_files(&base_dir), 1);
+
+    let deleted = execute_delete(&table, retention_delete_filter(retention_seconds)).await?;
+    assert_eq!(deleted, 1, "Retention should delete the expired row");
+
+    // Even after draining, a disabled sweep does nothing.
+    table.drain_orphan_dv_sweep().await;
+
+    assert_eq!(
+        count_key_based_delete_files(&fixture, &table).await,
+        1,
+        "Cleanup disabled (knob=0): orphaned DV row must remain in the catalog"
+    );
+    assert_eq!(
+        count_arrow_files(&base_dir),
+        1,
+        "Cleanup disabled (knob=0): orphaned DV .arrow file must remain on disk"
+    );
+
+    Ok(())
+}
+
+/// Test: when fewer orphan-eligible DVs accumulate than the configured threshold,
+/// the sweep does not run, so the orphan is retained until the threshold is met.
+async fn test_orphaned_dv_cleanup_below_threshold_retained_impl(
+    fixture: TestFixture,
+) -> TestResult {
+    let retention_seconds = 60;
+    let table_name = "orphan_dv_below_threshold";
+    let ctx = SessionContext::new();
+    let table = create_pk_retention_table(
+        &fixture,
+        table_name,
+        retention_seconds,
+        true,
+        NonZero::new(2), // threshold of 2; the single orphan below is under it
+        ctx.runtime_env(),
+    )
+    .await?;
+    let table_id = table.metadata().table_id.clone();
+    let base_dir = fixture.data_path.join(table_name);
+
+    let now_us = chrono::Utc::now().timestamp_micros();
+    insert_row(&table, 1, now_us - 100_000_000).await?;
+    common::poll_inlined_data_count_zero(&fixture.catalog, &table_id).await?;
+    insert_row(&table, 1, now_us).await?;
+    common::poll_inlined_data_count_zero(&fixture.catalog, &table_id).await?;
+
+    assert_eq!(count_key_based_delete_files(&fixture, &table).await, 1);
+
+    let deleted = execute_delete(&table, retention_delete_filter(retention_seconds)).await?;
+    assert_eq!(deleted, 1, "Retention should delete the expired row");
+
+    table.drain_orphan_dv_sweep().await;
+
+    assert_eq!(
+        count_key_based_delete_files(&fixture, &table).await,
+        1,
+        "1 orphan-eligible DV is below the threshold of 2 → sweep must not run"
+    );
+    assert_eq!(
+        count_arrow_files(&base_dir),
+        1,
+        "Below-threshold orphan DV .arrow file must remain on disk"
+    );
+
+    Ok(())
+}
+
+/// Test: on reopen, the loader self-heals a provably-orphaned key DV whose `.arrow`
+/// file is missing (the file-first sweep crash window: file unlinked, row not yet
+/// removed). The dangling catalog row is dropped with an info log and the table
+/// opens normally; surviving data is intact.
+async fn test_loader_self_heals_orphaned_missing_dv_impl(fixture: TestFixture) -> TestResult {
+    let retention_seconds = 60;
+    let table_name = "loader_self_heal_orphan";
+    let ctx = SessionContext::new();
+    let table = create_pk_retention_table(
+        &fixture,
+        table_name,
+        retention_seconds,
+        true,
+        None, // disable the sweep so the orphan (row + file) lingers
+        ctx.runtime_env(),
+    )
+    .await?;
+    let table_id = table.metadata().table_id.clone();
+    let base_dir = fixture.data_path.join(table_name);
+
+    let now_us = chrono::Utc::now().timestamp_micros();
+    insert_row(&table, 1, now_us - 100_000_000).await?;
+    common::poll_inlined_data_count_zero(&fixture.catalog, &table_id).await?;
+    insert_row(&table, 1, now_us).await?;
+    common::poll_inlined_data_count_zero(&fixture.catalog, &table_id).await?;
+
+    // Retention empties M → the DV is orphaned (delete sequence at/below floor).
+    let deleted = execute_delete(&table, retention_delete_filter(retention_seconds)).await?;
+    assert_eq!(deleted, 1);
+    assert_eq!(count_key_based_delete_files(&fixture, &table).await, 1);
+    assert_eq!(count_arrow_files(&base_dir), 1);
+
+    // Simulate the file-first sweep: unlink the file but leave the catalog row.
+    assert_eq!(
+        delete_arrow_files(&base_dir),
+        1,
+        "should remove the orphaned DV .arrow file"
+    );
+    drop(table);
+
+    // Reopen: the loader self-heals the dangling row (no error).
+    let reopened = reopen_table(&fixture, table_name, ctx.runtime_env()).await?;
+    assert_eq!(
+        count_key_based_delete_files(&fixture, &reopened).await,
+        0,
+        "Loader should self-heal the orphaned dangling delete-file row on reopen"
+    );
+    assert_table_contents(&ctx, &reopened, table_name, &[1], "after reopen").await?;
+
+    Ok(())
+}
+
+/// Test: on reopen, a missing key DV whose delete sequence is still ABOVE the
+/// surviving floor (it could still shadow live data) is genuine data loss — the
+/// loader errors rather than silently dropping it.
+async fn test_loader_errors_on_missing_needed_dv_impl(fixture: TestFixture) -> TestResult {
+    let retention_seconds = 60;
+    let table_name = "loader_needed_missing";
+    let ctx = SessionContext::new();
+    let table = create_pk_retention_table(
+        &fixture,
+        table_name,
+        retention_seconds,
+        true,
+        None,
+        ctx.runtime_env(),
+    )
+    .await?;
+    let table_id = table.metadata().table_id.clone();
+    let base_dir = fixture.data_path.join(table_name);
+
+    // insert id=1 then upsert id=1 (both fresh, no retention): the DV shadows the
+    // surviving original copy, so its delete sequence is above the floor → NEEDED.
+    let now_us = chrono::Utc::now().timestamp_micros();
+    insert_row(&table, 1, now_us).await?;
+    common::poll_inlined_data_count_zero(&fixture.catalog, &table_id).await?;
+    insert_row(&table, 1, now_us).await?;
+    common::poll_inlined_data_count_zero(&fixture.catalog, &table_id).await?;
+    assert_eq!(count_key_based_delete_files(&fixture, &table).await, 1);
+    assert_eq!(count_arrow_files(&base_dir), 1);
+
+    // Delete the needed DV's file (genuine data loss), leaving the catalog row.
+    assert_eq!(delete_arrow_files(&base_dir), 1);
+    drop(table);
+
+    // Reopen must fail: a missing file still within the floor is not a self-healable
+    // orphan.
+    let catalog: Arc<dyn MetadataCatalog> =
+        Arc::clone(&fixture.catalog) as Arc<dyn MetadataCatalog>;
+    let result = CayenneTableProviderBuilder::new(catalog, ctx.runtime_env())
+        .open(table_name)
+        .await;
+    assert!(
+        result.is_err(),
+        "Reopen must fail when a still-needed deletion-vector file is missing (data loss)"
+    );
+
+    Ok(())
 }
