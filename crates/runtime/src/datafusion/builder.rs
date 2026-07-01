@@ -800,10 +800,16 @@ impl DataFusionBuilder {
         let eager_aggregation = self.eager_aggregation.unwrap_or(true);
         config.options_mut().optimizer.enable_eager_aggregation = eager_aggregation;
         if let Some(factor) = self.eager_aggregation_min_reduction_factor {
-            config
-                .options_mut()
-                .optimizer
-                .eager_aggregation_min_reduction_factor = factor;
+            if factor > 0 {
+                config
+                    .options_mut()
+                    .optimizer
+                    .eager_aggregation_min_reduction_factor = factor;
+            } else {
+                tracing::warn!(
+                    "Ignoring runtime.query.eager_aggregation_min_reduction_factor=0; value must be greater than 0"
+                );
+            }
         }
         if let Some(cap) = self.eager_aggregation_max_pushed_groups {
             config
@@ -2091,6 +2097,67 @@ mod tests {
             4,
             "Without an override target_partitions should fall back to DataFusion's default"
         );
+    }
+
+    #[test]
+    fn test_eager_aggregation_wires_through_to_session_config() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime");
+        let handle = rt.handle().clone();
+
+        // Default: spiced enables eager aggregation even though DataFusion's own
+        // default is off.
+        let df_default = DataFusionBuilder::new(
+            status::RuntimeStatus::new(),
+            Arc::new(AcceleratorEngineRegistry::default()),
+            handle.clone(),
+        )
+        .build();
+        assert!(
+            df_default
+                .ctx
+                .state()
+                .config()
+                .options()
+                .optimizer
+                .enable_eager_aggregation,
+            "eager aggregation should default to enabled in spiced"
+        );
+
+        // An explicit `false` disables the rule.
+        let df_off = DataFusionBuilder::new(
+            status::RuntimeStatus::new(),
+            Arc::new(AcceleratorEngineRegistry::default()),
+            handle.clone(),
+        )
+        .eager_aggregation(Some(false))
+        .build();
+        assert!(
+            !df_off
+                .ctx
+                .state()
+                .config()
+                .options()
+                .optimizer
+                .enable_eager_aggregation,
+            "eager_aggregation: false should disable the rule"
+        );
+
+        // The two tuning knobs wire through to the optimizer options.
+        let df_tuned = DataFusionBuilder::new(
+            status::RuntimeStatus::new(),
+            Arc::new(AcceleratorEngineRegistry::default()),
+            handle,
+        )
+        .eager_aggregation(Some(true))
+        .eager_aggregation_min_reduction_factor(Some(8))
+        .eager_aggregation_max_pushed_groups(Some(1024))
+        .build();
+        let options = df_tuned.ctx.state().config().options().clone();
+        assert_eq!(options.optimizer.eager_aggregation_min_reduction_factor, 8);
+        assert_eq!(options.optimizer.eager_aggregation_max_pushed_groups, 1024);
     }
 
     #[test]
