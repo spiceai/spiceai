@@ -170,9 +170,8 @@ pub struct JoinGraph {
     /// and out of `LogicalPlan::Filter` nodes that sit between joins.
     /// The enumerator must reapply these on top of the reordered plan.
     filters: Vec<Expr>,
-    /// Set when an opaque node's nested island was reordered in place (a
-    /// semi/anti/outer join's input, a wrapped subquery body — see
-    /// [`reorder_opaque_inputs`]). Such a reorder changes the plan even when the
+    /// Set when an opaque join node's nested inner-join island was reordered in place
+    /// (see [`reorder_opaque_inputs`]). Such a reorder changes the plan even when the
     /// top-level graph has too few nodes to reorder; `build_reordered_plan` must then
     /// still emit the reconstructed plan rather than discarding the work via its `< 3` no-op.
     opaque_islands_reordered: bool,
