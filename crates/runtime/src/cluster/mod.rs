@@ -66,6 +66,7 @@ use runtime_proto::{
 };
 use runtime_secrets::Secrets;
 use snafu::ResultExt;
+use spicepod::component::runtime::ClusterGrpcClient;
 use std::collections::{HashMap, HashSet};
 use std::env;
 use std::io;
@@ -188,6 +189,7 @@ enum SchedulerConnectionState {
     },
 }
 
+#[expect(clippy::too_many_arguments)]
 fn spawn_scheduler_poll_loop(
     scheduler_address: String,
     client_tls_config: Option<ClientTlsConfig>,
@@ -196,6 +198,7 @@ fn spawn_scheduler_poll_loop(
     readiness_sender: Arc<Mutex<Option<oneshot::Sender<String>>>>,
     poll_now_notify: Option<Arc<Notify>>,
     available_task_slots: Arc<tokio::sync::Semaphore>,
+    grpc_client: ClusterGrpcClient,
 ) -> SchedulerPollHandle {
     let cancel = CancellationToken::new();
     let token = cancel.clone();
@@ -219,24 +222,35 @@ fn spawn_scheduler_poll_loop(
                 SchedulerConnectionState::NeedsEndpoint => {
                     let endpoint_url =
                         normalize_scheduler_endpoint(&scheduler_address, tls_enabled);
-                    let scheduler_endpoint = match create_grpc_client_endpoint(
-                        endpoint_url.clone(),
-                        Some(&GrpcClientConfig::default()),
-                    ) {
-                        Ok(endpoint) => endpoint,
-                        Err(err) => {
-                            tracing::warn!(
-                                "Failed to create scheduler endpoint {endpoint_url}: {err}"
-                            );
-                            if let Some(delay) = backoff.next_duration() {
-                                tokio::select! {
-                                    () = token.cancelled() => break,
-                                    () = tokio::time::sleep(delay) => {}
-                                }
-                            }
-                            continue;
-                        }
+                    let grpc_config = GrpcClientConfig {
+                        connect_timeout_seconds: grpc_client.connect_timeout_seconds,
+                        timeout_seconds: grpc_client.timeout_seconds,
+                        tcp_keepalive_seconds: grpc_client.tcp_keep_alive_seconds,
+                        http2_keepalive_interval_seconds: grpc_client
+                            .http2_keep_alive_interval_seconds,
                     };
+                    let scheduler_endpoint =
+                        match create_grpc_client_endpoint(endpoint_url.clone(), Some(&grpc_config))
+                        {
+                            // Override ballista's hardcoded 20s keep-alive ping timeout so a
+                            // dropped connection is detected within (ping interval + this) and
+                            // reconnected before the scheduler's executor-timeout reap window.
+                            Ok(endpoint) => endpoint.keep_alive_timeout(Duration::from_secs(
+                                grpc_client.keep_alive_timeout_seconds,
+                            )),
+                            Err(err) => {
+                                tracing::warn!(
+                                    "Failed to create scheduler endpoint {endpoint_url}: {err}"
+                                );
+                                if let Some(delay) = backoff.next_duration() {
+                                    tokio::select! {
+                                        () = token.cancelled() => break,
+                                        () = tokio::time::sleep(delay) => {}
+                                    }
+                                }
+                                continue;
+                            }
+                        };
 
                     let scheduler_endpoint = if let Some(tls_config) = client_tls_config.clone() {
                         match scheduler_endpoint.tls_config(tls_config) {
@@ -386,6 +400,7 @@ fn update_scheduler_pollers(
     readiness_sender: &Arc<Mutex<Option<oneshot::Sender<String>>>>,
     poll_now_notify: Option<&Arc<Notify>>,
     available_task_slots: &Arc<tokio::sync::Semaphore>,
+    grpc_client: &ClusterGrpcClient,
 ) {
     let next_schedulers: HashSet<String> = addresses.into_iter().collect();
 
@@ -415,6 +430,7 @@ fn update_scheduler_pollers(
             Arc::clone(readiness_sender),
             poll_now_notify.cloned(),
             Arc::clone(available_task_slots),
+            grpc_client.clone(),
         );
         pollers.insert(address, handle);
     }
@@ -1193,6 +1209,17 @@ pub async fn initialize_cluster_executor(
         .boxed()
         .context(FailedToStartClusterExecutorSnafu)?;
 
+    // Tune the executor->scheduler gRPC client (poll_work) so a silently-dropped
+    // connection is detected and reconnected well under `executor_timeout`. Without
+    // this, a stale connection hangs each poll_work for the request timeout, gapping
+    // the poll_work-carried heartbeat and flapping the executor.
+    let scheduler_grpc_client_for_manager: ClusterGrpcClient = app_def
+        .runtime
+        .scheduler
+        .as_ref()
+        .and_then(|s| s.grpc_client.clone())
+        .unwrap_or_default();
+
     // Resolve executor settings from the scheduler's app definition before the
     // executor Flight server starts.
     if let Some(ref telemetry_config) = rt.telemetry_config {
@@ -1502,6 +1529,7 @@ pub async fn initialize_cluster_executor(
             &readiness_sender,
             Some(&poll_now_notify),
             &available_task_slots_for_manager,
+            &scheduler_grpc_client_for_manager,
         );
 
         let mut refresh = tokio::time::interval(SCHEDULER_REFRESH_INTERVAL);
@@ -1544,6 +1572,7 @@ pub async fn initialize_cluster_executor(
                             &readiness_sender,
                             Some(&poll_now_notify),
                             &available_task_slots_for_manager,
+                            &scheduler_grpc_client_for_manager,
                         );
                     }
                 }
