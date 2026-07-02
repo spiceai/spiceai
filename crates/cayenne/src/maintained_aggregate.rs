@@ -23,6 +23,7 @@ limitations under the License.
 //! freshness epoch exactly matches the scan snapshot epoch captured by
 //! [`crate::provider::CayenneAccelerationExec`].
 
+use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
 use std::sync::Arc;
@@ -87,6 +88,16 @@ pub enum MaintainedAggregateFunction {
     /// `DataFusion`'s `AVG` output type); integer inputs fold their running sum
     /// exactly into an `i128` accumulator, floats into an `f64` one.
     Avg,
+    /// SQL `MIN(column)` over the signed/unsigned integer families. Unlike
+    /// `SUM` (which widens to `BIGINT`), the output preserves the input type
+    /// (`MIN(Int32) -> Int32`). Retraction-hard: deleting the current minimum
+    /// needs the next-smallest value, so a per-group ordered multiset
+    /// ([`SortedScalarIndex`]) keeps the live values. Integer families only in
+    /// this slice; float `MIN`/`MAX` (NaN ordering) is a follow-up.
+    Min,
+    /// SQL `MAX(column)` — the mirror of [`Self::Min`], reading the largest
+    /// live value from the same ordered-multiset structure.
+    Max,
 }
 
 /// Shared maintained aggregate state for a single Cayenne table.
@@ -172,6 +183,11 @@ enum AggregateOutputType {
     Int64,
     UInt64,
     Float64,
+    /// The output type equals the aggregate's input column type — `MIN`/`MAX`,
+    /// which preserve type rather than widen. The concrete `DataType` lives on
+    /// the [`ResolvedAggregateExpr`]'s resolved column, so field matching for
+    /// this variant is done by [`ResolvedAggregateExpr::output_matches_field`].
+    SameAsInput,
 }
 
 impl AggregateOutputType {
@@ -180,6 +196,9 @@ impl AggregateOutputType {
             Self::Count | Self::Int64 => field.data_type() == &DataType::Int64,
             Self::UInt64 => field.data_type() == &DataType::UInt64,
             Self::Float64 => field.data_type() == &DataType::Float64,
+            // Matched against the input column type in
+            // `ResolvedAggregateExpr::output_matches_field`, never here.
+            Self::SameAsInput => false,
         }
     }
 }
@@ -229,6 +248,83 @@ enum AggregateAccumulator {
         sum: i128,
         count: i64,
     },
+    /// SQL `MIN(column)`: the smallest live value in the group, read as the
+    /// first key of a retraction-capable ordered multiset.
+    Min {
+        column_index: usize,
+        index: SortedScalarIndex,
+    },
+    /// SQL `MAX(column)`: the largest live value, read as the last key of the
+    /// same ordered-multiset structure.
+    Max {
+        column_index: usize,
+        index: SortedScalarIndex,
+    },
+}
+
+/// A per-group ordered multiset of the live (non-null) values feeding a
+/// maintained `MIN`/`MAX` — the structure that makes those *retraction-hard*
+/// aggregates incrementally maintainable. `COUNT`/`SUM`/`AVG` invert a
+/// retraction by subtracting; `MIN`/`MAX` cannot — deleting the current
+/// extremum needs the next value, which only a kept ordered structure has.
+/// Keyed by a lossless `i128` order key over the whole signed/unsigned integer
+/// family, so `BTreeMap` gives O(log distinct) insert/retract and O(1)
+/// `MIN` (first key) / `MAX` (last key). Only non-null values are stored, so an
+/// empty index means the extremum is SQL `NULL`. The exact input-typed
+/// [`ScalarValue`] is stored (not the widened key) because the strict
+/// [`scalar_for_field`] requires the output scalar to match the column type
+/// exactly. Distinct values ≤ live rows, so it is bounded by the same per-PK
+/// entry cap as the retraction index and inherits its fail-safe-to-`Stale`
+/// memory bound.
+#[derive(Debug, Clone, Default)]
+struct SortedScalarIndex {
+    entries: BTreeMap<i128, (ScalarValue, u64)>,
+}
+
+impl SortedScalarIndex {
+    /// Add one live value. `checked_add` on the per-value count matches the
+    /// crate-wide "never silently clamp a maintained counter" discipline.
+    fn insert(&mut self, scalar: ScalarValue) -> DataFusionResult<()> {
+        let key = scalar_order_key(&scalar)?;
+        if let Some((_, count)) = self.entries.get_mut(&key) {
+            *count = count.checked_add(1).ok_or_else(count_overflow)?;
+        } else {
+            self.entries.insert(key, (scalar, 1));
+        }
+        Ok(())
+    }
+
+    /// Remove one live value (the inverse of [`Self::insert`]). A key that is
+    /// absent, or a count that underflows, is a state inconsistency the caller
+    /// turns into a fail-safe-to-stale, exactly like the additive retraction path.
+    fn retract(&mut self, scalar: &ScalarValue) -> DataFusionResult<()> {
+        let key = scalar_order_key(scalar)?;
+        let Some((_, count)) = self.entries.get_mut(&key) else {
+            return Err(retract_underflow());
+        };
+        *count = count.checked_sub(1).ok_or_else(retract_underflow)?;
+        if *count == 0 {
+            self.entries.remove(&key);
+        }
+        Ok(())
+    }
+
+    /// The smallest live value (SQL `MIN`), or `None` when no non-null value
+    /// remains (the group's `MIN` is `NULL`).
+    fn min_scalar(&self) -> Option<ScalarValue> {
+        self.entries
+            .values()
+            .next()
+            .map(|(scalar, _)| scalar.clone())
+    }
+
+    /// The largest live value (SQL `MAX`), or `None` when the index is empty.
+    fn max_scalar(&self) -> Option<ScalarValue> {
+        self.entries
+            .values()
+            .next_back()
+            .map(|(scalar, _)| scalar.clone())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -883,16 +979,24 @@ impl MaintainedAggregateView {
             return Ok(None);
         }
 
-        let mut rows = Vec::with_capacity(self.groups.len());
-        if self.groups.is_empty() && self.spec.group_by.is_empty() {
-            rows.push((Vec::new(), GroupAccumulator::try_new(&self.spec)?));
-        } else {
-            rows.extend(
+        // Iterate the live groups BY REFERENCE — never clone the accumulator. A
+        // maintained MIN/MAX accumulator owns the whole per-group ordered multiset,
+        // so cloning it (as this did) made materialize O(total distinct) ≈ O(rows)
+        // and defeated the O(groups) serve the whole lever depends on; for the
+        // additive accumulators it was needless allocation. The empty global
+        // aggregate (no groups, no GROUP BY) still emits one SQL row from a
+        // default accumulator, which must outlive `rows`.
+        let default_global;
+        let rows: Vec<(&[ScalarValue], &GroupAccumulator)> =
+            if self.groups.is_empty() && self.spec.group_by.is_empty() {
+                default_global = GroupAccumulator::try_new(&self.spec)?;
+                vec![(&[][..], &default_global)]
+            } else {
                 self.groups
                     .iter()
-                    .map(|(key, acc)| (key.clone(), acc.clone())),
-            );
-        }
+                    .map(|(key, acc)| (key.as_slice(), acc))
+                    .collect()
+            };
 
         let output_columns = schema
             .fields()
@@ -945,7 +1049,7 @@ impl MaintainedAggregateView {
             .aggregates
             .iter()
             .zip(schema.fields().iter().skip(self.spec.group_by.len()))
-            .all(|(aggregate, field)| aggregate.output_type.matches_field(field))
+            .all(|(aggregate, field)| aggregate.output_matches_field(field))
     }
 }
 
@@ -1023,6 +1127,22 @@ impl ResolvedAggregateExpr {
                     expr.function
                 )));
             }
+            // `MIN`/`MAX` preserve the input type (no widening) and are
+            // maintained via an ordered multiset over the integer families. A
+            // float or otherwise-unsupported column falls to the catch-all below
+            // (the view does not build; the query re-scans — correct, not fast).
+            (
+                MaintainedAggregateFunction::Min | MaintainedAggregateFunction::Max,
+                Some(data_type),
+            ) if data_type.is_signed_integer() || data_type.is_unsigned_integer() => {
+                AggregateOutputType::SameAsInput
+            }
+            (MaintainedAggregateFunction::Min | MaintainedAggregateFunction::Max, None) => {
+                return Err(DataFusionError::Plan(format!(
+                    "{:?} maintained aggregate requires a column",
+                    expr.function
+                )));
+            }
             (function, Some(data_type)) => {
                 return Err(DataFusionError::Plan(format!(
                     "{function:?} maintained aggregate does not support column type {data_type}"
@@ -1035,6 +1155,20 @@ impl ResolvedAggregateExpr {
             column,
             output_type,
         })
+    }
+
+    /// Whether this aggregate's output `field` matches the maintained result
+    /// type. For `MIN`/`MAX` ([`AggregateOutputType::SameAsInput`]) the output
+    /// preserves the input column type, so it is checked against the resolved
+    /// column's `DataType`; every other aggregate has a fixed output type.
+    fn output_matches_field(&self, field: &FieldRef) -> bool {
+        match self.output_type {
+            AggregateOutputType::SameAsInput => self
+                .column
+                .as_ref()
+                .is_some_and(|column| field.data_type() == &column.data_type),
+            fixed => fixed.matches_field(field),
+        }
     }
 }
 
@@ -1134,6 +1268,18 @@ impl AggregateAccumulator {
                     count: 0,
                 }
             }
+            (MaintainedAggregateFunction::Min, AggregateOutputType::SameAsInput, Some(column)) => {
+                Self::Min {
+                    column_index: column.index,
+                    index: SortedScalarIndex::default(),
+                }
+            }
+            (MaintainedAggregateFunction::Max, AggregateOutputType::SameAsInput, Some(column)) => {
+                Self::Max {
+                    column_index: column.index,
+                    index: SortedScalarIndex::default(),
+                }
+            }
             _ => {
                 return Err(DataFusionError::Internal(format!(
                     "invalid maintained aggregate accumulator state: {expr:?}"
@@ -1216,6 +1362,22 @@ impl AggregateAccumulator {
                     *count = count.checked_add(1).ok_or_else(count_overflow)?;
                 }
             }
+            // `MIN`/`MAX` insert identically — add the live value to the ordered
+            // multiset; the query reads the min/max end. A null contributes
+            // nothing to an extremum, so it is left out of the index.
+            Self::Min {
+                column_index,
+                index,
+            }
+            | Self::Max {
+                column_index,
+                index,
+            } => {
+                if !batch.column(*column_index).is_null(row) {
+                    let scalar = ScalarValue::try_from_array(batch.column(*column_index), row)?;
+                    index.insert(scalar)?;
+                }
+            }
         }
         Ok(())
     }
@@ -1279,6 +1441,17 @@ impl AggregateAccumulator {
                     *count = count.checked_sub(1).ok_or_else(retract_underflow)?;
                 }
             }
+            // `MIN`/`MAX` retract identically — remove the captured live value
+            // from the ordered multiset; the extremum falls back to the next
+            // value automatically. A null contributed nothing, so it retracts
+            // nothing.
+            Self::Min { index, .. } | Self::Max { index, .. } => {
+                if let Some(scalar) = input
+                    && !scalar.is_null()
+                {
+                    index.retract(scalar)?;
+                }
+            }
         }
         Ok(())
     }
@@ -1322,6 +1495,11 @@ impl AggregateAccumulator {
                     scalar_for_field(field, Some(ScalarValue::Float64(Some(sum_f64 / count_f64))))
                 }
             }
+            // The stored extremum is already the exact input-typed scalar, so
+            // `scalar_for_field` passes it through; an empty index yields a typed
+            // `NULL` (SQL `MIN`/`MAX` over no non-null rows).
+            Self::Min { index, .. } => scalar_for_field(field, index.min_scalar()),
+            Self::Max { index, .. } => scalar_for_field(field, index.max_scalar()),
         }
     }
 }
@@ -1379,6 +1557,8 @@ fn query_spec_for_aggregate(aggregate: &AggregateExec) -> Option<QueryAggregateS
             "count" => MaintainedAggregateFunction::Count,
             "sum" => MaintainedAggregateFunction::Sum,
             "avg" => MaintainedAggregateFunction::Avg,
+            "min" => MaintainedAggregateFunction::Min,
+            "max" => MaintainedAggregateFunction::Max,
             _ => return None,
         };
 
@@ -1391,7 +1571,10 @@ fn query_spec_for_aggregate(aggregate: &AggregateExec) -> Option<QueryAggregateS
                     CountQueryColumn::Column(column) => Some(column),
                 }
             }
-            MaintainedAggregateFunction::Sum | MaintainedAggregateFunction::Avg => {
+            MaintainedAggregateFunction::Sum
+            | MaintainedAggregateFunction::Avg
+            | MaintainedAggregateFunction::Min
+            | MaintainedAggregateFunction::Max => {
                 if expressions.len() != 1 {
                     return None;
                 }
@@ -1556,6 +1739,27 @@ fn scalar_as_f64(scalar: &ScalarValue) -> DataFusionResult<f64> {
     }
 }
 
+/// The order key for a maintained `MIN`/`MAX` value: a lossless `i128` over the
+/// whole signed (`Int8`..`Int64`) and unsigned (`UInt8`..`UInt64`) integer
+/// family. `i128` holds every `i64` and every `u64`, and its natural order
+/// matches SQL ordering within a single fixed-type column, so it is a correct
+/// total order for the `BTreeMap`. Float `MIN`/`MAX` (NaN ordering) is a
+/// deliberate follow-up and errors here — the view then simply does not build,
+/// and the query falls back to a base-table scan (correct, not accelerated).
+fn scalar_order_key(scalar: &ScalarValue) -> DataFusionResult<i128> {
+    match scalar {
+        ScalarValue::Int64(Some(v)) => Ok(i128::from(*v)),
+        ScalarValue::Int32(Some(v)) => Ok(i128::from(*v)),
+        ScalarValue::Int16(Some(v)) => Ok(i128::from(*v)),
+        ScalarValue::Int8(Some(v)) => Ok(i128::from(*v)),
+        ScalarValue::UInt64(Some(v)) => Ok(i128::from(*v)),
+        ScalarValue::UInt32(Some(v)) => Ok(i128::from(*v)),
+        ScalarValue::UInt16(Some(v)) => Ok(i128::from(*v)),
+        ScalarValue::UInt8(Some(v)) => Ok(i128::from(*v)),
+        _ => Err(type_mismatch("a signed or unsigned integer", scalar)),
+    }
+}
+
 fn scalar_for_field(
     field: &FieldRef,
     scalar: Option<ScalarValue>,
@@ -1679,6 +1883,7 @@ mod tests {
     };
     use datafusion_functions_aggregate::average::avg_udaf;
     use datafusion_functions_aggregate::count::count_udaf;
+    use datafusion_functions_aggregate::min_max::{max_udaf, min_udaf};
     use datafusion_functions_aggregate::sum::sum_udaf;
 
     fn schema() -> SchemaRef {
@@ -2011,6 +2216,8 @@ mod tests {
                     MaintainedAggregateFunction::Count => count_udaf(),
                     MaintainedAggregateFunction::Sum => sum_udaf(),
                     MaintainedAggregateFunction::Avg => avg_udaf(),
+                    MaintainedAggregateFunction::Min => min_udaf(),
+                    MaintainedAggregateFunction::Max => max_udaf(),
                 };
                 AggregateExprBuilder::new(udaf, aggregate_args)
                     .schema(Arc::clone(&schema))
@@ -2333,6 +2540,143 @@ mod tests {
                 other => panic!("unexpected group {other}"),
             }
         }
+        Ok(())
+    }
+
+    /// Serve `MIN(i)`, `MAX(i)` GROUP BY `name` from the registry, returning the
+    /// per-group extrema (NULL extrema are omitted). `i` is the module schema's
+    /// `Int64` column; the group key is `name`.
+    fn min_max_by_name(
+        registry: &MaintainedAggregateRegistry,
+    ) -> DataFusionResult<(BTreeMap<String, i64>, BTreeMap<String, i64>)> {
+        let aggregate = aggregate_exec_for(&[
+            ("min(i)", MaintainedAggregateFunction::Min, Some("i")),
+            ("max(i)", MaintainedAggregateFunction::Max, Some("i")),
+        ])?;
+        let epoch = registry.state.read().epoch;
+        let result = registry
+            .batch_for_aggregate(&aggregate, epoch)?
+            .expect("registry should be fresh");
+        let names = as_string_array(result.column(0))?;
+        let mins = as_int64_array(result.column(1))?;
+        let maxs = as_int64_array(result.column(2))?;
+        let mut min_out = BTreeMap::new();
+        let mut max_out = BTreeMap::new();
+        for row in 0..result.num_rows() {
+            let name = names.value(row).to_string();
+            if !mins.is_null(row) {
+                min_out.insert(name.clone(), mins.value(row));
+            }
+            if !maxs.is_null(row) {
+                max_out.insert(name, maxs.value(row));
+            }
+        }
+        Ok((min_out, max_out))
+    }
+
+    fn min_max_i_spec() -> MaintainedAggregateSpec {
+        MaintainedAggregateSpec {
+            filter: None,
+            group_by: vec!["name".to_string()],
+            aggregates: vec![
+                MaintainedAggregateExpr {
+                    function: MaintainedAggregateFunction::Min,
+                    column: Some("i".to_string()),
+                },
+                MaintainedAggregateExpr {
+                    function: MaintainedAggregateFunction::Max,
+                    column: Some("i".to_string()),
+                },
+            ],
+        }
+    }
+
+    /// The retraction-hard core: deleting the current group MIN or MAX must
+    /// expose the next value from the maintained ordered multiset — the exact
+    /// case `COUNT`/`SUM` (invert-by-subtract) cannot do and the reason MIN/MAX
+    /// needs the kept ordered structure. PK = `u` (column 2).
+    #[test]
+    fn maintains_min_max_with_retraction() -> DataFusionResult<()> {
+        let registry = MaintainedAggregateRegistry::try_new_with_pk(
+            &[min_max_i_spec()],
+            &schema(),
+            &[2],
+            usize::MAX,
+        )?;
+        // group a: i = {10(pk1), 20(pk2), 5(pk3)} -> min 5, max 20.
+        // group b: i = {7(pk4)}                    -> min 7, max 7.
+        registry.apply_insert_batches(
+            1,
+            &[group_batch(&[("a", 1, 10), ("a", 2, 20), ("a", 3, 5), ("b", 4, 7)])],
+        )?;
+        let (min, max) = min_max_by_name(&registry)?;
+        assert_eq!(min.get("a"), Some(&5));
+        assert_eq!(max.get("a"), Some(&20));
+        assert_eq!(min.get("b"), Some(&7));
+        assert_eq!(max.get("b"), Some(&7));
+
+        // Delete pk=3 (the current MIN of a, value 5): MIN falls back to 10, MAX unchanged.
+        registry.apply_pk_deletes(2, &group_batch(&[("", 3, 0)]).project(&[2])?)?;
+        let (min, max) = min_max_by_name(&registry)?;
+        assert_eq!(
+            min.get("a"),
+            Some(&10),
+            "MIN exposes the next value after the extremum is retracted"
+        );
+        assert_eq!(max.get("a"), Some(&20));
+
+        // Delete pk=2 (the current MAX of a, value 20): a = {10}, min == max == 10.
+        registry.apply_pk_deletes(3, &group_batch(&[("", 2, 0)]).project(&[2])?)?;
+        let (min, max) = min_max_by_name(&registry)?;
+        assert_eq!(min.get("a"), Some(&10));
+        assert_eq!(
+            max.get("a"),
+            Some(&10),
+            "MAX exposes the next value after the extremum is retracted"
+        );
+        Ok(())
+    }
+
+    /// NULLs never feed an extremum, but a row still counts toward the group's
+    /// existence: an entirely-NULL group survives with NULL MIN/MAX, and a
+    /// partially-NULL group reports the extremum of its non-null values.
+    #[test]
+    fn min_max_ignores_nulls_and_keeps_all_null_group() -> DataFusionResult<()> {
+        let registry = MaintainedAggregateRegistry::try_new_with_pk(
+            &[min_max_i_spec()],
+            &schema(),
+            &[2],
+            usize::MAX,
+        )?;
+        // group a: i = {NULL(pk1), 3(pk2), NULL(pk3)} -> min == max == 3.
+        // group b: i = {NULL(pk4)}                    -> min == max == NULL (group present).
+        let null_i_batch = RecordBatch::try_new(
+            schema(),
+            vec![
+                Arc::new(StringArray::from(vec![
+                    Some("a"),
+                    Some("a"),
+                    Some("a"),
+                    Some("b"),
+                ])),
+                Arc::new(Int64Array::from(vec![None, Some(3_i64), None, None])),
+                Arc::new(UInt64Array::from(vec![1_u64, 2, 3, 4])),
+                Arc::new(Float64Array::from(vec![None, None, None, None] as Vec<Option<f64>>)),
+            ],
+        )
+        .expect("null-i batch should be valid");
+        registry.apply_insert_batches(1, &[null_i_batch])?;
+        let (min, max) = min_max_by_name(&registry)?;
+        assert_eq!(min.get("a"), Some(&3));
+        assert_eq!(max.get("a"), Some(&3));
+        assert_eq!(min.get("b"), None, "all-NULL group b has NULL MIN");
+        assert_eq!(max.get("b"), None, "all-NULL group b has NULL MAX");
+
+        // Retract pk=2 (a's only non-null i): a is now entirely NULL -> NULL MIN/MAX, group still live.
+        registry.apply_pk_deletes(2, &group_batch(&[("", 2, 0)]).project(&[2])?)?;
+        let (min, max) = min_max_by_name(&registry)?;
+        assert_eq!(min.get("a"), None, "a is now all-NULL i -> NULL MIN");
+        assert_eq!(max.get("a"), None);
         Ok(())
     }
 
