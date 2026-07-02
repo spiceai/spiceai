@@ -227,11 +227,22 @@ async fn next_envelope(
     stream: &mut ChangesStream,
     what: &str,
 ) -> Result<ChangeEnvelope, anyhow::Error> {
-    tokio::time::timeout(Duration::from_secs(30), stream.next())
-        .await
-        .map_err(|_| anyhow::anyhow!("timed out waiting for {what}"))?
-        .ok_or_else(|| anyhow::anyhow!("stream ended waiting for {what}"))?
-        .map_err(|e| anyhow::anyhow!("stream error waiting for {what}: {e}"))
+    // Skip idle heartbeat envelopes (zero-row, not a readiness signal): they carry
+    // only a replication-lag timestamp and interleave with real changes on any
+    // Postgres keepalive. Bound the TOTAL wait so a genuinely missing change still
+    // times out instead of looping on heartbeats forever.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let envelope = tokio::time::timeout_at(deadline, stream.next())
+            .await
+            .map_err(|_| anyhow::anyhow!("timed out waiting for {what}"))?
+            .ok_or_else(|| anyhow::anyhow!("stream ended waiting for {what}"))?
+            .map_err(|e| anyhow::anyhow!("stream error waiting for {what}: {e}"))?;
+        if envelope.change_batch.record.num_rows() == 0 && !envelope.is_dataset_ready() {
+            continue;
+        }
+        return Ok(envelope);
+    }
 }
 
 fn ops_of(envelope: &ChangeEnvelope) -> Vec<String> {
