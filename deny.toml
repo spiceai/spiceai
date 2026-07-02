@@ -47,10 +47,13 @@ ignore = [
   # marked it unmaintained and there is no safe upgrade (the suggested `skrifa`
   # alternative is not wired through `lopdf`/`pdf-extract`). Owner: document_parse.
   "RUSTSEC-2026-0192",
-  # `azure_core`, `calamine`, `reqsign`, `opendal`, and `object_store` all pull
-  # `quick-xml` < 0.41.0; no safe upgrade is available yet. Owner: data connectors/runtime.
+  # `quick-xml` quadratic duplicate-attribute check on start tags (DoS). Pulled
+  # transitively in several versions (via vortex, AWS-XML, and serialization
+  # dependencies); no single safe upgrade across all pins yet. Owner: data components/runtime.
   "RUSTSEC-2026-0194",
-  # Same quick-xml < 0.41.0 chain as RUSTSEC-2026-0194. Owner: data connectors/runtime.
+  # `quick-xml` unbounded namespace-declaration allocation in `NsReader`
+  # (memory-exhaustion DoS), same transitive chain as RUSTSEC-2026-0194; no safe
+  # upgrade yet. Owner: data components/runtime.
   "RUSTSEC-2026-0195",
 ]
 
