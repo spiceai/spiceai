@@ -92,7 +92,7 @@ use tokio_stream::wrappers::ReceiverStream;
 
 use super::{
     Error, ReplicationMetricsCollector, ReplicationStreamInput, Result, bootstrap,
-    changes::{ChangeOp, DecodedChange},
+    changes::{ChangeOp, DecodedChange, push_update_change},
     client,
     config::ReplicationParams,
     pgoutput, resilience, slot,
@@ -1108,13 +1108,19 @@ async fn handle_decoded(
                 && let Some(member) = source.member(member_key)
             {
                 member.metrics.inc_update();
-                // Fill unchanged-TOAST markers from the old tuple (REPLICA
-                // IDENTITY FULL) before buffering.
-                let new = super::changes::merge_unchanged_toast(new, old.as_ref());
-                txn.entry(relation_id).or_default().push(DecodedChange {
-                    op: ChangeOp::Update,
-                    row: new,
-                });
+                let Some(rel) = decoder.relation(relation_id) else {
+                    member_fatal(
+                        source,
+                        member_key,
+                        format!(
+                            "change event before Relation for id {relation_id} in {}",
+                            member.dataset_name
+                        ),
+                    )
+                    .await;
+                    return;
+                };
+                push_update_change(txn.entry(relation_id).or_default(), rel, old, new);
             }
         }
         DecodedMessage::Delete { relation_id, old } => {

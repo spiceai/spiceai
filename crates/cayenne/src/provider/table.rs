@@ -4718,14 +4718,16 @@ impl CayenneTableProvider {
         let total_rows = total_rows_written.load(Ordering::Relaxed);
         // Files added ≈ number of concurrent shard writers (each writes ≥1 file
         // when it receives rows). Drives only the compaction-trigger heuristic.
-        // Must use the SAME size-aware count `write_shard_format` used above, so
-        // a small write that produced a single file reports `1` here (not the
-        // full write concurrency), keeping the heuristic accurate.
-        let writer_ops = if total_rows > 0 {
-            self.snapshot_shard_count(target_partitions, target_size_bytes, estimated_bytes)
-        } else {
-            0
-        };
+        // This is `encode_shards` — the size-aware request ALREADY CLAMPED to
+        // `target_partitions` (the Vortex sink clamps to it via `build_shard_spec`),
+        // so it matches the files actually produced. Using the raw
+        // `snapshot_shard_count` would over-count whenever `target_partitions` caps
+        // the fan-out below the size-based request — e.g. the concurrent per-shard
+        // checkpoint encode pins `target_partitions = 1` (one file per shard), where
+        // the raw request would report the full write concurrency and over-trigger
+        // compaction by the fan-out ratio. For every caller whose `target_partitions`
+        // already meets the size-based count, this is unchanged.
+        let writer_ops = if total_rows > 0 { encode_shards } else { 0 };
 
         // Log final summary for S3 Express uploads
         if is_s3_storage {
@@ -4759,6 +4761,120 @@ impl CayenneTableProvider {
         }
 
         Ok((total_rows, writer_ops, stats_accumulator))
+    }
+
+    /// Encode each captured mem-tier shard (plus the inline corpus) as its OWN
+    /// Vortex file on its OWN task, CONCURRENTLY, into one snapshot directory —
+    /// the N>1 mem-tier checkpoint drain-parallelism lever.
+    ///
+    /// The merged single-stream encode (`write_to_snapshot` over one concatenated
+    /// `MemorySource`) pins a checkpoint at ~one core no matter how high
+    /// `cayenne_write_concurrency` is: that knob shards only the OUTPUT FILE
+    /// LAYOUT, and the writer input is a single coordinated stream (see
+    /// `write_to_snapshot`'s "no upstream repartition" note), so the compression
+    /// runs serially. The captured shards are already disjoint and materialized,
+    /// so encoding them as N independent streams — each `tokio::spawn`ed so the
+    /// CPU-bound encode lands on its own worker (a plain `join_all` would poll them
+    /// on one thread and serialize them) — turns the drain into an ~N-core
+    /// operation, which is what lets the highest-volume tables keep the source WAL
+    /// drained under load.
+    ///
+    /// Each unit is capped at `ceil(unit_bytes / target_size)` encode shards, so a
+    /// shard no larger than one target Vortex file stays a SINGLE file+permit (the
+    /// common case — the N units then fit the process-global encode budget
+    /// concurrently rather than each fanning out internally and over-subscribing it,
+    /// and the per-checkpoint file count stays ~N, which compaction folds), while a
+    /// shard LARGER than one target file rolls into just enough files to honor the
+    /// target size (never one oversized file). The parallelism is the N spawned
+    /// tasks, NOT intra-shard fan-out — the single coordinated stream serializes
+    /// that (the very cost this restructure avoids). Filenames never collide — every
+    /// `write_to_snapshot` mints a fresh `write_id` (uuid) prefix for its files — so
+    /// N writes into one dir produce disjoint files, all discovered by the
+    /// post-write listing refresh (the commit is dir-based). Returns the summed file
+    /// count and the merged column-stats accumulator.
+    async fn encode_snapshot_shards_concurrently(
+        &self,
+        snapshot_id: &str,
+        units: Vec<Vec<RecordBatch>>,
+        target_size_bytes: usize,
+        schema: &SchemaRef,
+    ) -> Result<(usize, Arc<ColumnStatsAccumulator>)> {
+        let mut handles = Vec::with_capacity(units.len());
+        for unit in units {
+            // A shallow writer clone (all Arc fields) so the encode can run on its
+            // own task; it shares the table's catalog / object store / budget.
+            let provider = self.clone_for_write();
+            let snapshot_id = snapshot_id.to_string();
+            let schema = Arc::clone(schema);
+            handles.push(tokio::spawn(async move {
+                let unit_bytes = unit
+                    .iter()
+                    .map(|b| b.get_array_memory_size() as u64)
+                    .fold(0u64, u64::saturating_add);
+                let estimated_bytes = Some(unit_bytes);
+                let exec = datafusion::datasource::memory::MemorySourceConfig::try_new_exec(
+                    &[unit],
+                    Arc::clone(&schema),
+                    None,
+                )?;
+                let ctx = provider.create_session_context();
+                let stream = datafusion_physical_plan::execute_stream(exec, ctx.task_ctx())?;
+                // Cap this shard's encode fan-out so no output file exceeds the
+                // target Vortex file size: a shard no larger than one target file
+                // stays a SINGLE file (the common case — the cross-shard
+                // parallelism is the N spawned tasks, not intra-shard fan-out, which
+                // the single coordinated stream serializes), while a larger shard
+                // rolls into `ceil(bytes / target)` files instead of one oversized
+                // file. `write_to_snapshot` clamps the actual fan-out to the budget.
+                let shard_target_partitions =
+                    Self::shard_encode_target_partitions(unit_bytes, target_size_bytes);
+                provider
+                    .write_to_snapshot(
+                        stream,
+                        target_size_bytes,
+                        &snapshot_id,
+                        shard_target_partitions,
+                        estimated_bytes,
+                        super::delta_encoding::WriteClass::Delta,
+                    )
+                    .await
+            }));
+        }
+        // Fold the N independent writes back into the single (file_count, stats)
+        // pair the checkpoint commit expects. A task panic surfaces as a checkpoint
+        // error (so the slot is NOT advanced and the tier is not cleared); the
+        // already-written shard files are unreferenced and swept as orphans.
+        let mut total_files = 0usize;
+        let merged_stats = Arc::new(ColumnStatsAccumulator::new(schema));
+        for handle in handles {
+            let (_rows, files, stats) = handle.await.map_err(|source| Error::Internal {
+                table: self.table_name().to_string(),
+                message: format!("mem-tier checkpoint shard encode task failed: {source}"),
+            })??;
+            total_files = total_files.saturating_add(files);
+            merged_stats.merge_from(stats.as_ref());
+        }
+        Ok((total_files, merged_stats))
+    }
+
+    /// The per-shard encode fan-out for the concurrent checkpoint encode: how many
+    /// files a shard of `unit_bytes` (uncompressed Arrow) must split into so no
+    /// output file exceeds the target Vortex file size — `ceil(unit_bytes / target)`,
+    /// min 1. A shard no larger than one target file stays a single file; a larger
+    /// shard rolls into just enough files to honor the target. Arrow over-counts vs
+    /// the compressed on-disk size, the safe direction (files land under the target
+    /// with margin). `write_to_snapshot` further clamps the result to the write
+    /// budget. `target_size_bytes == 0` means size rolling is DISABLED (one file per
+    /// write is intended — see the config warning), so the shard stays a single
+    /// file, matching the pre-roll behavior.
+    fn shard_encode_target_partitions(unit_bytes: u64, target_size_bytes: usize) -> usize {
+        if target_size_bytes == 0 {
+            return 1;
+        }
+        let target = u64::try_from(target_size_bytes).unwrap_or(u64::MAX);
+        usize::try_from(unit_bytes.div_ceil(target))
+            .unwrap_or(usize::MAX)
+            .max(1)
     }
 
     /// Effective number of concurrent shard writers the Vortex sink will use for
@@ -9841,9 +9957,9 @@ impl CayenneTableProvider {
     /// passes into a single in-flight sweep — mirroring
     /// [`Self::schedule_post_write_compaction`].
     ///
-    /// No-op when the `orphaned_dv_cleanup_min_files` knob is unset (`None`):
-    /// nothing is spawned, no lock is taken, and no catalog query runs (the
-    /// pre-feature behavior, and the SF-1000 CH-BenCHmark A/B baseline).
+    /// No-op when the `orphaned_dv_cleanup_min_files` knob is disabled (`None`,
+    /// i.e. the spicepod param set to `0`): nothing is spawned, no lock is taken,
+    /// and no catalog query runs (the pre-feature behavior).
     pub(crate) fn schedule_orphan_dv_sweep(&self) {
         if self
             .table_metadata
@@ -16794,19 +16910,36 @@ impl CayenneTableProvider {
         // The inline removal map is the WHOLE-TIER tombstone union (carried on
         // `snapshot.tombstones` — shard 0's at N==1, the cross-shard union at N>1),
         // so the global inline corpus is hidden by every shard's deletes.
-        let mut batches = self.pruned_inlined_batches(&inlined_view, &snapshot, None)?;
-        // Visible mem-tier rows: concatenate every captured shard's visible batches
-        // (disjoint keys ⇒ a concatenation, each shard applying its OWN tombstones —
-        // §2.3e). At N==1 this is exactly `visible_mem_tier_batches(shard 0)`.
-        let mut mem_batches: Vec<RecordBatch> = Vec::new();
+        let inline_batches = self.pruned_inlined_batches(&inlined_view, &snapshot, None)?;
+        // Visible mem-tier rows, kept as PER-SHARD groups so the N>1 checkpoint can
+        // encode one INDEPENDENT stream per shard concurrently (the drain-parallelism
+        // lever — see `encode_snapshot_shards_concurrently`). Disjoint keys ⇒ the
+        // groups concatenate, each shard applying its OWN tombstones (§2.3e). At N==1
+        // this is exactly `[visible_mem_tier_batches(shard 0)]`.
+        let mut shard_groups: Vec<Vec<RecordBatch>> = Vec::new();
         for shard in &shard_snapshots {
             if shard.is_empty() || shard.segments.is_empty() {
                 continue;
             }
-            mem_batches.extend(self.visible_mem_tier_batches(shard, None)?);
+            let group = self.visible_mem_tier_batches(shard, None)?;
+            if !group.is_empty() {
+                shard_groups.push(group);
+            }
         }
-        let flushed_mem_rows: usize = mem_batches.iter().map(RecordBatch::num_rows).sum();
-        batches.extend(mem_batches);
+        let flushed_mem_rows: usize = shard_groups
+            .iter()
+            .flat_map(|group| group.iter())
+            .map(RecordBatch::num_rows)
+            .sum();
+        // The merged corpus (inline + every shard) drives the shard-count-independent
+        // bookkeeping below — emptiness, `corpus_keys`, `total_rows` — and, at N==1,
+        // IS the single-stream encode input (byte-identical to the pre-sharding
+        // path). The N>1 encode reads `inline_batches` + `shard_groups` directly
+        // instead. Building this from Arc clones keeps both views available.
+        let mut batches = inline_batches.clone();
+        for group in &shard_groups {
+            batches.extend(group.iter().cloned());
+        }
 
         // PK membership of the flushed corpus, driving the reinserted vs
         // pure-delete tombstone split at durable-commit time (see
@@ -16964,16 +17097,46 @@ impl CayenneTableProvider {
             };
             let new_snapshot_id = uuid::Uuid::now_v7().to_string();
             let target_size_bytes = self.context.target_file_size_bytes();
-            let (_rows, checkpoint_file_count, stats) = self
-                .write_to_snapshot(
-                    stream,
-                    target_size_bytes,
+            let (checkpoint_file_count, stats) = if n == 1 {
+                // N==1: the single coordinated encode over the merged corpus —
+                // byte-identical to the pre-sharding path.
+                let (_rows, files, stats) = self
+                    .write_to_snapshot(
+                        stream,
+                        target_size_bytes,
+                        &new_snapshot_id,
+                        ctx.state().config().target_partitions(),
+                        estimated_bytes,
+                        super::delta_encoding::WriteClass::Delta,
+                    )
+                    .await?;
+                (files, stats)
+            } else {
+                // N>1: encode each captured shard as its OWN Vortex file on its OWN
+                // task, CONCURRENTLY, into the SAME snapshot dir — THE drain
+                // parallelism lever. The merged single-stream encode above pins the
+                // whole checkpoint at ~one core regardless of `cayenne_write_concurrency`
+                // (that knob shards only the OUTPUT FILE LAYOUT; the writer input is
+                // one coordinated stream). N disjoint shard streams each get their
+                // own encoder ⇒ ~N-core drain, so the highest-volume tables
+                // (order_line/stock) keep the WAL drained instead of falling behind.
+                // The inline corpus (usually empty in memory-mode CDC) rides as one
+                // extra unit. Filenames never collide (each write mints a fresh
+                // `write_id` uuid prefix) and the commit below is dir-based, so the N
+                // files are all discovered by the post-write listing refresh.
+                let mut units: Vec<Vec<RecordBatch>> = Vec::with_capacity(shard_groups.len() + 1);
+                if !inline_batches.is_empty() {
+                    units.push(inline_batches);
+                }
+                units.extend(shard_groups);
+                self.encode_snapshot_shards_concurrently(
                     &new_snapshot_id,
-                    ctx.state().config().target_partitions(),
-                    estimated_bytes,
-                    super::delta_encoding::WriteClass::Delta,
+                    units,
+                    target_size_bytes,
+                    &schema,
                 )
-                .await?;
+                .await?
+            };
 
             let is_s3 = self.table_metadata.path.starts_with("s3://");
             if !is_s3 {
@@ -24277,6 +24440,171 @@ mod tests {
                 "sharded result at N={n} must equal the serial (N=1) result row-for-row"
             );
         }
+    }
+
+    /// CONCURRENT PER-SHARD CHECKPOINT ENCODE equivalence — the drain-parallelism
+    /// lever's correctness guard. At N>1 the mem-tier checkpoint encodes each
+    /// captured shard as its OWN Vortex file, CONCURRENTLY, into one snapshot dir
+    /// (`encode_snapshot_shards_concurrently`), instead of the serial single-stream
+    /// encode over the merged corpus. This asserts that concurrent per-shard encode
+    /// produces a DURABLE result row-for-row identical to the serial (N=1) encode,
+    /// and that the tier fully drains — so a filename collision, a lost shard file,
+    /// or a bad stats/row merge would fail here. Replays the SAME schedule at
+    /// N ∈ {1, 4, 8}, flushes to durable, and reads the converged view back from
+    /// the file(s).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn sharded_cdc_concurrent_checkpoint_encode_equals_serial() {
+        async fn replay_then_checkpoint(
+            table: &str,
+            applies: &[Vec<(i64, i64)>],
+            n: usize,
+        ) -> Vec<(i64, i64)> {
+            let ctx = SessionContext::new();
+            let runtime_env = ctx.runtime_env();
+            let (provider, _catalog, _tmp) =
+                create_sharded_cdc_upsert_table(table, Arc::clone(&runtime_env), n).await;
+            let schema = Arc::clone(&provider.table_metadata.schema);
+            for burst in applies {
+                apply_upsert_burst(&ctx, &provider, Arc::clone(&schema), burst).await;
+            }
+            // Flush the RAM tier to durable Vortex. At N>1 this drives the
+            // concurrent per-shard encode under test; at N=1 the byte-identical
+            // single-stream path.
+            provider
+                .checkpoint_mem_tier()
+                .await
+                .expect("checkpoint drains the mem tier");
+            // Every shard's tier must be empty after the checkpoint (the flush
+            // covered the whole captured prefix and cleared it).
+            assert!(
+                provider.mem_tier.is_empty(),
+                "N={n}: mem tier fully drained after the checkpoint"
+            );
+            // The converged view now comes entirely from the durable file(s).
+            collect_id_value_pairs(&ctx, &provider, table).await
+        }
+
+        let applies = random_pk_version_applies();
+        let serial = replay_then_checkpoint("ckpt_eq_n1", &applies, 1).await;
+        assert!(
+            !serial.is_empty(),
+            "the serial checkpoint replay produced durable rows"
+        );
+
+        for &n in &[4_usize, 8] {
+            let table = format!("ckpt_eq_n{n}");
+            let sharded = replay_then_checkpoint(&table, &applies, n).await;
+            assert_eq!(
+                sharded, serial,
+                "N={n}: concurrent per-shard checkpoint encode must equal the serial durable result row-for-row"
+            );
+        }
+    }
+
+    /// Recursively count `.vortex` files under a directory — the physical
+    /// read-amp signal (the number of files a scan must open).
+    fn count_vortex_files_under(dir: &std::path::Path) -> usize {
+        let mut count = 0;
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return 0;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                count += count_vortex_files_under(&path);
+            } else if path.extension().is_some_and(|ext| ext == "vortex") {
+                count += 1;
+            }
+        }
+        count
+    }
+
+    /// CONCURRENT PER-SHARD CHECKPOINT FILE COUNT + compaction-trigger wiring.
+    /// The N>1 concurrent encode writes ONE Vortex file per non-empty shard
+    /// (`target_partitions = 1`), NOT the merged `write_concurrency` fan-out the
+    /// single-stream path produced — fewer, PK-clustered files = lower read-amp.
+    /// And the checkpoint's file count must advance `new_files_since_last_compaction`,
+    /// so accumulated checkpoint files eventually trigger a read-amp-collapsing
+    /// compaction (the write-amp/read-amp feedback the SF1000 runs surfaced).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn sharded_cdc_checkpoint_writes_one_file_per_shard_and_feeds_compaction_trigger() {
+        use std::sync::atomic::Ordering;
+        let n = 4_usize;
+        let ctx = SessionContext::new();
+        let runtime_env = ctx.runtime_env();
+        let (provider, _catalog, tmp) =
+            create_sharded_cdc_upsert_table("ckpt_filecount", Arc::clone(&runtime_env), n).await;
+        let schema = Arc::clone(&provider.table_metadata.schema);
+
+        for burst in &random_pk_version_applies() {
+            apply_upsert_burst(&ctx, &provider, Arc::clone(&schema), burst).await;
+        }
+
+        // The checkpoint encodes one file per shard with a NON-EMPTY captured
+        // prefix — mirrors the `shard.is_empty() || shard.segments.is_empty()`
+        // skip in `checkpoint_mem_tier_inner`.
+        let non_empty_shards = (0..n)
+            .filter(|&s| {
+                let tier = provider.mem_tier.shard(s).load();
+                !tier.is_empty() && !tier.segments.is_empty()
+            })
+            .count();
+        assert!(
+            non_empty_shards > 1,
+            "the schedule must populate multiple shards to exercise the concurrent encode (got {non_empty_shards})"
+        );
+
+        let files_before = count_vortex_files_under(tmp.path());
+        let trigger_before = provider
+            .new_files_since_last_compaction
+            .load(Ordering::Relaxed);
+
+        provider.checkpoint_mem_tier().await.expect("checkpoint");
+
+        // (a) Physical file count: exactly one Vortex file per non-empty shard —
+        // the concurrent per-shard encode, NOT one merged stream fanned to
+        // `write_concurrency` files.
+        let files_written = count_vortex_files_under(tmp.path()) - files_before;
+        assert_eq!(
+            files_written, non_empty_shards,
+            "N>1 checkpoint must write exactly one Vortex file per non-empty shard (concurrent per-shard encode)"
+        );
+
+        // (b) The compaction-trigger wiring: the checkpoint's file count advanced
+        // `new_files_since_last_compaction`, so accumulated checkpoint files feed
+        // the read-amp-collapsing compaction trigger.
+        let trigger_after = provider
+            .new_files_since_last_compaction
+            .load(Ordering::Relaxed);
+        assert!(
+            trigger_after - trigger_before >= non_empty_shards,
+            "checkpoint file count ({non_empty_shards}) must advance new_files_since_last_compaction ({trigger_before} -> {trigger_after})"
+        );
+    }
+
+    /// TARGET FILE SIZE HONORED per shard. The concurrent per-shard checkpoint
+    /// encode caps each shard's fan-out at `ceil(unit_bytes / target)`, so a shard
+    /// larger than one target Vortex file rolls into multiple target-sized files
+    /// instead of one oversized file (the `target_partitions = 1` hazard). This
+    /// unit-tests the fan-out arithmetic directly; the end-to-end roll of a large
+    /// write into multiple files is covered by
+    /// `protected_snapshot_subset_compaction_parallelizes_large_merges`.
+    #[test]
+    fn shard_encode_target_partitions_honors_target_file_size() {
+        let mb: usize = 1024 * 1024;
+        let f = CayenneTableProvider::shard_encode_target_partitions;
+        // A shard no larger than one target file stays a SINGLE file (common case).
+        assert_eq!(f(0, 512 * mb), 1);
+        assert_eq!(f((300 * mb) as u64, 512 * mb), 1);
+        assert_eq!(f((512 * mb) as u64, 512 * mb), 1);
+        // A shard larger than one target file rolls into ceil(bytes / target) files
+        // — never one oversized file.
+        assert_eq!(f((512 * mb + 1) as u64, 512 * mb), 2);
+        assert_eq!(f((1024 * mb) as u64, 512 * mb), 2);
+        assert_eq!(f((1024 * mb + 1) as u64, 512 * mb), 3);
+        // A 0 target disables size rolling -> a single file, never a div-by-zero.
+        assert_eq!(f((10 * mb) as u64, 0), 1);
+        assert!(f(0, 0) >= 1);
     }
 
     /// §3.5 SHARD-KEY GUARD — the one normative spec fix. For an Int64 PK, the
