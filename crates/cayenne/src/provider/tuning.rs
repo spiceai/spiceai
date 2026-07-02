@@ -4900,6 +4900,21 @@ mod tests {
     }
 
     #[test]
+    fn fold_row_freshness_clock_skew_clamps_to_zero() {
+        // Source commit ts AHEAD of the host apply clock (NTP skew between the PG box
+        // and the host) ⇒ a negative raw lag, which MUST clamp to 0 — never underflow
+        // the unsigned subtraction into a huge spurious "freshness" that would trip a
+        // false shrink. Guards the `saturating_sub(...).max(0)` in `fold_row_freshness`.
+        let stats = IngestStats::new();
+        stats.fold_row_freshness(10_000, Some(12_000)); // "committed" 2s after it applied
+        assert_eq!(
+            stats.peak_row_freshness_secs(10_100),
+            Some(0.0),
+            "source clock ahead of host ⇒ lag clamps to 0, no unsigned underflow",
+        );
+    }
+
+    #[test]
     fn burstable_cpu_withholds_shards_at_lower_pressure() {
         // CPU busy-fraction between the burstable gate (0.50) and the default
         // (0.75), buffers maxed so write concurrency is the remaining behind-lever.
