@@ -92,12 +92,14 @@ use tokio_stream::wrappers::ReceiverStream;
 
 use super::{
     Error, ReplicationMetricsCollector, ReplicationStreamInput, Result, bootstrap,
-    changes::{ChangeOp, DecodedChange},
+    changes::{ChangeOp, DecodedChange, push_update_change},
     client,
     config::ReplicationParams,
     pgoutput, resilience, slot,
 };
-use crate::cdc::{ChangeEnvelope, ChangesStream, CommitChange, CommitError, StreamError};
+use crate::cdc::{
+    ChangeEnvelope, ChangesStream, CommitChange, CommitError, StreamError, build_heartbeat_envelope,
+};
 use crate::postgres_replication::pgoutput::RelationId;
 
 /// Bounded per-member delivery queue. When one member's sink stops draining,
@@ -988,7 +990,11 @@ async fn run_pump(source: Arc<SharedSource>) {
                     source.for_each_member_metrics(|m| m.set_confirmed_flush_lsn(flush));
                     client.update_applied_lsn(Lsn(flush));
                 }
-                ReplicationEvent::KeepAlive { wal_end, .. } => {
+                ReplicationEvent::KeepAlive {
+                    wal_end,
+                    server_time_micros,
+                    ..
+                } => {
                     source.for_each_member_metrics(|m| m.set_server_wal_end(wal_end.0));
                     if !txn_open {
                         source.ack.credit_idle(wal_end.0);
@@ -996,6 +1002,38 @@ async fn run_pump(source: Arc<SharedSource>) {
                     let flush = source.ack.flush_lsn();
                     source.for_each_member_metrics(|m| m.set_confirmed_flush_lsn(flush));
                     client.update_applied_lsn(Lsn(flush));
+
+                    // Idle heartbeat: with no transaction mid-buffer the shared slot is
+                    // caught up to the source as of the keepalive's server clock. Fan a
+                    // zero-row heartbeat (stamped with `server_time_micros`, a direct
+                    // liveness-backed server signal) out to every live member so each
+                    // dataset's replication-lag gauge reads ~0 while idle instead of
+                    // freezing at its last commit. The `NoOpCommitter` inside
+                    // `build_heartbeat_envelope` advances no LSN — the idle credit above
+                    // already moved the slot forward.
+                    if !txn_open
+                        && let Some(server_ts_ms) = util::time::system_time_to_unix_ms(
+                            client::pg_epoch_to_system_time(server_time_micros),
+                        )
+                    {
+                        for (member_key, member) in source.live_members() {
+                            match build_heartbeat_envelope(&member.schema, server_ts_ms) {
+                                Ok(envelope) => {
+                                    if member.sender.send(Ok(envelope)).await.is_err() {
+                                        source.detach_member(
+                                            &member_key,
+                                            "changes stream receiver dropped",
+                                        );
+                                    }
+                                }
+                                Err(error) => tracing::warn!(
+                                    dataset = %member.dataset_name,
+                                    %error,
+                                    "Failed to build Postgres CDC heartbeat envelope; replication-lag gauge may go stale while the stream is idle"
+                                ),
+                            }
+                        }
+                    }
                 }
                 ReplicationEvent::Message { .. } => {}
                 ReplicationEvent::StoppedAt { reached } => {
@@ -1108,13 +1146,19 @@ async fn handle_decoded(
                 && let Some(member) = source.member(member_key)
             {
                 member.metrics.inc_update();
-                // Fill unchanged-TOAST markers from the old tuple (REPLICA
-                // IDENTITY FULL) before buffering.
-                let new = super::changes::merge_unchanged_toast(new, old.as_ref());
-                txn.entry(relation_id).or_default().push(DecodedChange {
-                    op: ChangeOp::Update,
-                    row: new,
-                });
+                let Some(rel) = decoder.relation(relation_id) else {
+                    member_fatal(
+                        source,
+                        member_key,
+                        format!(
+                            "change event before Relation for id {relation_id} in {}",
+                            member.dataset_name
+                        ),
+                    )
+                    .await;
+                    return;
+                };
+                push_update_change(txn.entry(relation_id).or_default(), rel, old, new);
             }
         }
         DecodedMessage::Delete { relation_id, old } => {
