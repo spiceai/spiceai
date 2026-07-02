@@ -1,12 +1,22 @@
 version: v1
 kind: Spicepod
-name: postgres-cayenne[file]-cdc-tuned-memory-ivm-sf1000
+name: postgres-cayenne[file]-cdc-tuned-memory-cold-sf1000
 
-# In-memory CDC durability variant of `…-cdc-tuned-sf1000`. The memtable tier absorbs writes and
-# flushes by size/age (the `mem_tier_*` knobs below), trading per-batch durable persist for ingest
-# throughput. Sized for a 64 vCPU / 256 GiB host (m7a.16xlarge-class) with EBS gp3 — the CDC write
-# path issues few fsyncs, so gp3 base IOPS is sufficient. Everything except the durability knobs is
-# inherited verbatim from the file-durability pod.
+# Cold-object-store-tier variant of `…-cdc-tuned-memory-sf1000`. Everything from that pod is
+# inherited verbatim (RAM mem-tier absorbs writes, flushes by size/age to the warm local-disk
+# Vortex tier); this variant adds the third, colder storage tier below the warm tier. The full
+# cascade is: RAM mem-tier -> warm local-disk Vortex -> COLD object store. A background promoter
+# graduates the warm tier to read-optimized, Z-order-clustered Vortex on the cold store once the
+# per-table warm-size trigger is crossed, and queries span all three tiers with per-tier
+# pushdown/pruning. See the `cayenne_cold_tier_*` knobs on &accel_high_volume below.
+#
+# The cold store is the shared local MinIO (`s3://benchmarks`, the same bucket the analytical
+# bench configs use). Because the warm tier is local `mode: file`, Cayenne does not itself
+# register the s3:// cold store (v1 only auto-registers it when the warm tier is already on S3),
+# so the `cold_tier_store_anchor` anchor dataset below references the bucket to register a path-style
+# MinIO object store that the shared registry then reuses for cold promotion + cross-tier scans.
+# The HTAP run workflow provides S3_ENDPOINT/S3_KEY/S3_SECRET (from the TEST_MINIO_* secrets).
+# Sized for a 64 vCPU / 256 GiB host (m7a.16xlarge-class) with EBS gp3.
 runtime:
   flight:
     ipc_compression: lz4_frame
@@ -37,6 +47,29 @@ postgres_connection_params: &postgres_params
   pg_sslmode: disable
 
 datasets:
+  # ------------------------------------------------------------------
+  # Cold-tier object-store registration anchor.
+  #
+  # The Cayenne cold tier writes to `s3://benchmarks/cayenne-cold-sf1000/` (the shared local
+  # MinIO). With a local `mode: file` warm tier, Cayenne does not itself register the s3:// cold
+  # store (v1 only auto-registers it when the warm tier is on S3-Express — and MinIO is standard
+  # S3, not Express). This federated dataset references the same bucket so the runtime registers a
+  # path-style MinIO object store under `s3://benchmarks`; the object-store registry is shared
+  # across the query and compaction runtimes, so cold promotion + cross-tier scans reuse it. This
+  # dataset is NOT part of the CH-benCH schema and no query set touches it — it exists solely to
+  # register the store. `region.parquet` is a tiny (few-row) object present in the bench bucket; if
+  # it is ever absent, point this at any existing object in `s3://benchmarks`.
+  # ------------------------------------------------------------------
+  - from: s3://benchmarks/tpch_sf1/region.parquet
+    name: cold_tier_store_anchor
+    params:
+      file_format: parquet
+      allow_http: true
+      s3_auth: key
+      s3_endpoint: ${secrets:S3_ENDPOINT}
+      s3_key: ${secrets:S3_KEY}
+      s3_secret: ${secrets:S3_SECRET}
+
   # ------------------------------------------------------------------
   # High-volume PK upsert tables.
   # ------------------------------------------------------------------
@@ -89,6 +122,26 @@ datasets:
         cayenne_compaction_background_interval_ms: '3000'
         cdc_max_coalesce_age_ms: '3000'
         cdc_max_coalesced_bytes: '536870912' # 512 MB
+        # --- Cold object-store tier (RAM mem-tier -> warm local disk -> COLD) ---
+        # Presence of the location enables the cold tier (and forces key deletes, already set
+        # above). Cayenne namespaces cold files by table_id under this prefix, so one shared
+        # location is safe for every high-volume table. Resolves to the MinIO store registered by
+        # the `cold_tier_store_anchor` anchor dataset.
+        cayenne_cold_tier_location: s3://benchmarks/cayenne-cold-sf1000/
+        # Read-optimized cold files, larger than the 512 MB warm target so cold scans open fewer
+        # footers.
+        cayenne_cold_target_file_size_mb: '1024'
+        # Promote a table's warm tier to cold once it exceeds 4 GiB. THE key tuning knob: promotion
+        # re-materializes the whole visible table (Z-order clustered), so this is sized so the big
+        # tables (order_line, stock, customer, oorder) graduate after the initial-snapshot
+        # bootstrap while the small ones (district, new_order) stay warm — not so low that it
+        # re-promotes per batch.
+        cayenne_cold_tier_warm_max_bytes: '4294967296'
+        # Background promoter cadence — re-checks the warm-size trigger every 30s.
+        cayenne_cold_tier_background_interval_ms: '30000'
+        # cayenne_cold_clustering_columns omitted -> Z-order falls back to the primary key
+        # (sensible default for chbench point/range lookups); tune per-table if a scan dimension
+        # dominates.
 
   - from: postgres:customer
     name: customer
@@ -174,37 +227,6 @@ datasets:
         cayenne_compaction_trigger_snapshot_age_ms: '30000'
         cayenne_compaction_max_files_per_pick: '128'
         cayenne_segment_cache_mb: '2048'
-      # Predicate-aware maintained aggregates for the two single-table CH-benCH
-      # queries over order_line (the heaviest table) — q1 and q6. Each view's
-      # group-by, aggregate set/order, and filter match the query's plan exactly,
-      # so the optimizer serves it from the incrementally-maintained view
-      # (O(groups)) instead of a full re-scan of the 60M+/SF row order_line. The
-      # other 20 CH-benCH queries join/correlate across tables, which this lever
-      # does not yet maintain, so adding views for them would be pure ingest
-      # overhead with no matching query. The TPC-C Delivery txn sets ol_delivery_d
-      # (NULL -> timestamp), flipping a row's filter-match; the per-PK contribution
-      # index retracts the old value and applies the new one, keeping each exact.
-      maintained_aggregates:
-        # q1: SUM/AVG of qty & amount + COUNT, grouped by ol_number, over
-        # delivered order lines.
-        - group_by: [ol_number]
-          filter_sql: "ol_delivery_d > '2007-01-02 00:00:00.000000'"
-          aggregates:
-            - function: sum
-              column: ol_quantity
-            - function: sum
-              column: ol_amount
-            - function: avg
-              column: ol_quantity
-            - function: avg
-              column: ol_amount
-            - function: count
-        # q6: global revenue SUM over a delivery-date window + quantity range.
-        - group_by: []
-          filter_sql: "ol_delivery_d >= '1997-01-01 00:00:00' AND ol_delivery_d < '2030-01-01 00:00:00' AND ol_quantity BETWEEN 1 AND 100000"
-          aggregates:
-            - function: sum
-              column: ol_amount
 
   - from: postgres:stock
     name: stock

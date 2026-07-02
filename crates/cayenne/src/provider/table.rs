@@ -1010,6 +1010,12 @@ pub struct CayenneTableProvider {
     /// Optional object store configuration for remote storage (e.g., S3 Express One Zone).
     /// When set, this object store is registered with `SessionContext` for data file operations.
     object_store_config: Option<crate::metadata::ObjectStoreConfig>,
+    /// Optional object store for the COLD tier (storage-cascade bottom tier).
+    /// When set, the cross-tier scan reads promoted Vortex files from here and
+    /// the promotion stage writes them here. May target a different
+    /// bucket/endpoint than `object_store_config` (the warm tier). Registered
+    /// with the query `RuntimeEnv` at scan time via `register_object_store_if_needed`.
+    cold_object_store_config: Option<crate::metadata::ObjectStoreConfig>,
     /// `RuntimeEnv` identities where `object_store_config` has already been
     /// verified/registered. This avoids probing the registry on every scan in
     /// the common case while still handling distinct query runtimes correctly.
@@ -1439,6 +1445,12 @@ pub struct CayenneTableProvider {
     /// `None`/never-spawned in file mode (and when the interval is 0).
     background_mem_tier_checkpointer:
         Arc<std::sync::OnceLock<super::compaction::BackgroundMemTierCheckpointer>>,
+    /// Per-table background cold-tier promoter (storage-cascade bottom tier).
+    /// `None` until armed; runs on its own `cold_tier_background_interval_ms`
+    /// cadence via the same internal worker infra as the mem-tier checkpointer,
+    /// decoupled from the compaction tick.
+    background_cold_tier_promoter:
+        Arc<std::sync::OnceLock<super::compaction::BackgroundColdTierPromoter>>,
 }
 
 /// Builder for constructing a `CayenneTableProvider` with optional configuration.
@@ -1467,6 +1479,7 @@ pub struct CayenneTableProviderBuilder {
     retention_filters: Vec<Expr>,
     time_retention_filter_builder: Option<super::retention::TimeRetentionFilterBuilder>,
     object_store_config: Option<crate::metadata::ObjectStoreConfig>,
+    cold_object_store_config: Option<crate::metadata::ObjectStoreConfig>,
     context: Option<Arc<CayenneContext>>,
     maintained_aggregates: Vec<MaintainedAggregateSpec>,
 }
@@ -1505,6 +1518,7 @@ struct CayenneTableProviderOpenOptions {
     retention_filters: Vec<Expr>,
     time_retention_filter_builder: Option<super::retention::TimeRetentionFilterBuilder>,
     object_store_config: Option<crate::metadata::ObjectStoreConfig>,
+    cold_object_store_config: Option<crate::metadata::ObjectStoreConfig>,
     context: Option<Arc<CayenneContext>>,
     maintained_aggregate_specs: Vec<MaintainedAggregateSpec>,
 }
@@ -1519,6 +1533,7 @@ impl CayenneTableProviderBuilder {
             retention_filters: Vec::new(),
             time_retention_filter_builder: None,
             object_store_config: None,
+            cold_object_store_config: None,
             context: None,
             maintained_aggregates: Vec::new(),
         }
@@ -1556,6 +1571,17 @@ impl CayenneTableProviderBuilder {
         self
     }
 
+    /// Set the object store for the cold tier (storage-cascade bottom tier).
+    ///
+    /// When set (together with `cayenne_cold_tier_location`), the promotion
+    /// stage writes read-optimized Vortex files here and the cross-tier scan
+    /// reads them. May target a different bucket/endpoint than the warm store.
+    #[must_use]
+    pub fn with_cold_object_store(mut self, config: crate::metadata::ObjectStoreConfig) -> Self {
+        self.cold_object_store_config = Some(config);
+        self
+    }
+
     /// Set a shared [`CayenneContext`] for this table provider.
     ///
     /// Use this to share a single context (with caches) across multiple table providers
@@ -1584,6 +1610,7 @@ impl CayenneTableProviderBuilder {
             retention_filters: self.retention_filters,
             time_retention_filter_builder: self.time_retention_filter_builder,
             object_store_config: self.object_store_config,
+            cold_object_store_config: self.cold_object_store_config,
             context: self.context,
             maintained_aggregate_specs: self.maintained_aggregates,
         };
@@ -1605,6 +1632,7 @@ impl CayenneTableProviderBuilder {
             retention_filters: self.retention_filters,
             time_retention_filter_builder: self.time_retention_filter_builder,
             object_store_config: self.object_store_config,
+            cold_object_store_config: self.cold_object_store_config,
             context: self.context,
             maintained_aggregate_specs: self.maintained_aggregates,
         };
@@ -2032,7 +2060,7 @@ impl CayenneTableProvider {
 
     /// Returns the table ID from the catalog.
     #[must_use]
-    pub(crate) fn table_id(&self) -> &str {
+    pub fn table_id(&self) -> &str {
         &self.table_metadata.table_id
     }
 
@@ -3989,6 +4017,7 @@ impl CayenneTableProvider {
             retention_filters,
             time_retention_filter_builder,
             object_store_config,
+            cold_object_store_config,
             context,
             maintained_aggregate_specs,
         } = options;
@@ -4203,6 +4232,7 @@ impl CayenneTableProvider {
             visibility_lock: Arc::new(tokio::sync::Mutex::new(())),
             scan_state_lock: Arc::new(tokio::sync::RwLock::new(())),
             object_store_config,
+            cold_object_store_config,
             object_store_registered_runtime_envs: Arc::new(ParkingMutex::new(
                 object_store_registered_runtime_envs,
             )),
@@ -4283,6 +4313,7 @@ impl CayenneTableProvider {
             maintained_aggregate_tx,
             background_compactor: Arc::new(std::sync::OnceLock::new()),
             background_mem_tier_checkpointer: Arc::new(std::sync::OnceLock::new()),
+            background_cold_tier_promoter: Arc::new(std::sync::OnceLock::new()),
         };
 
         provider.refresh_deletion_memory_accounting();
@@ -5106,6 +5137,7 @@ impl CayenneTableProvider {
             visibility_lock: Arc::clone(&self.visibility_lock),
             scan_state_lock: Arc::clone(&self.scan_state_lock),
             object_store_config: self.object_store_config.clone(),
+            cold_object_store_config: self.cold_object_store_config.clone(),
             object_store_registered_runtime_envs: Arc::clone(
                 &self.object_store_registered_runtime_envs,
             ),
@@ -5172,6 +5204,7 @@ impl CayenneTableProvider {
             // Shared so the single periodic checkpoint task (spawned on the
             // original `Arc`) survives writer clones and its drop signal is shared.
             background_mem_tier_checkpointer: Arc::clone(&self.background_mem_tier_checkpointer),
+            background_cold_tier_promoter: Arc::clone(&self.background_cold_tier_promoter),
         }
     }
 
@@ -11971,6 +12004,322 @@ impl CayenneTableProvider {
         let plan = TableProvider::scan(self, &state, None, &[], None).await?;
         let stream = datafusion_physical_plan::execute_stream(plan, state.task_ctx())?;
         Ok((stream, generation_before))
+    }
+
+    /// Resolve the cold-tier clustering columns to schema indices:
+    /// `cayenne_cold_clustering_columns` → else `cayenne_sort_columns` → else the
+    /// primary key. Returns the indices that exist in the schema (empty = no
+    /// clustering, promotion writes unsorted).
+    fn resolve_cold_clustering_indices(&self) -> Vec<usize> {
+        let schema = self.table_schema();
+        let vc = &self.table_metadata.vortex_config;
+        let names: Vec<String> = if !vc.cold_clustering_columns.is_empty() {
+            vc.cold_clustering_columns.clone()
+        } else if !self.context.sort_columns().is_empty() {
+            self.context.sort_columns().to_vec()
+        } else {
+            self.table_metadata.primary_key.clone()
+        };
+        names
+            .iter()
+            .filter_map(|n| schema.index_of(n).ok())
+            .collect()
+    }
+
+    /// Z-order (Morton) cluster a stream by appending a transient interleaved-bits
+    /// key column, sorting on it via the proven external `SortExec` path
+    /// (`util::stream_utils::sort_stream`, disk-spilling), then stripping the key.
+    /// Empty `clustering_indices` returns the stream unchanged.
+    fn zorder_sort_stream(
+        &self,
+        stream: SendableRecordBatchStream,
+        clustering_indices: Vec<usize>,
+        task_ctx: &Arc<datafusion_execution::TaskContext>,
+    ) -> Result<SendableRecordBatchStream> {
+        if clustering_indices.is_empty() {
+            return Ok(stream);
+        }
+        let original_schema = stream.schema();
+        let augmented_schema = super::zorder::zorder_augmented_schema(&original_schema);
+        let idx = clustering_indices;
+        let augmented = stream
+            .map(move |res| res.and_then(|b| super::zorder::append_zorder_key_column(&b, &idx)));
+        let augmented_stream: SendableRecordBatchStream = Box::pin(RecordBatchStreamAdapter::new(
+            Arc::clone(&augmented_schema),
+            augmented,
+        ));
+        let sort_cols = vec![super::zorder::ZORDER_COLUMN_NAME.to_string()];
+        let sorted = util::stream_utils::sort_stream(augmented_stream, &sort_cols, task_ctx)
+            .map_err(|e| Error::Internal {
+                table: self.table_metadata.table_name.clone(),
+                message: format!("cold-tier Z-order sort failed: {e}"),
+            })?;
+        let orig = Arc::clone(&original_schema);
+        let stripped = sorted
+            .map(move |res| res.and_then(|b| super::zorder::strip_zorder_key_column(&b, &orig)));
+        Ok(Box::pin(RecordBatchStreamAdapter::new(
+            original_schema,
+            stripped,
+        )))
+    }
+
+    /// Write a (Z-ordered, deletes-applied) stream to the cold object store as
+    /// read-optimized Vortex files, returning one [`ColdTierFile`] per written
+    /// file with accurate per-file footer statistics (for listing-time pruning).
+    ///
+    /// Single ordered run (`target_partitions = 1`) so the Z-order survives across
+    /// cold files — each file is a contiguous slice of the sorted order, giving
+    /// tight, non-overlapping zone maps.
+    async fn write_stream_to_cold(
+        &self,
+        cold_location: &str,
+        cold_config: Option<&crate::metadata::ObjectStoreConfig>,
+        stream: SendableRecordBatchStream,
+        max_sequence: i64,
+    ) -> Result<(Vec<crate::metadata::ColdTierFile>, u64)> {
+        let promotion_id = uuid::Uuid::now_v7().to_string();
+        let cold_base = cold_location.trim_end_matches('/');
+        let cold_dir_url = format!(
+            "{cold_base}/{}/cold/{promotion_id}/",
+            self.table_metadata.table_id
+        );
+
+        // A local `file://` cold tier needs its target directory created before
+        // the object-store write. Reuse the warm helper so cold dir creation gets
+        // the same fsync-the-parent crash-safety (and error propagation) instead
+        // of a bare create_dir_all. S3/object stores need no mkdir.
+        if !cold_base.starts_with("s3://") {
+            let local = cold_dir_url
+                .strip_prefix("file://")
+                .unwrap_or(cold_dir_url.as_str());
+            Self::ensure_snapshot_dir_exists(std::path::Path::new(local)).await?;
+        }
+
+        let target_size_bytes =
+            self.table_metadata.vortex_config.cold_target_file_size_mb * 1024 * 1024;
+        let write_format = self.write_shard_format(1, target_size_bytes, None);
+        let cold_listing_table = Self::create_listing_table(
+            &cold_dir_url,
+            self.table_schema(),
+            &write_format,
+            &self.pk_deletion_strategy,
+        )?;
+
+        // Session context with the COLD object store registered when configured
+        // (S3 cold; may be a different bucket/endpoint than the warm store). A
+        // local `file://` cold location needs no config — the default local
+        // store in the registry resolves it.
+        let ctx = self.create_compaction_session_context();
+        if let Some(cold_config) = cold_config {
+            let cold_renv = ctx.runtime_env();
+            Self::register_object_store_if_needed(&cold_renv, cold_config);
+        }
+        let session_state = Arc::new(ctx.state());
+
+        let schema = self.table_schema();
+        let writer_input: Arc<dyn ExecutionPlan> = Arc::new(StreamingExec::new(
+            Arc::clone(&schema),
+            Box::pin(RecordBatchStreamAdapter::new(Arc::clone(&schema), stream)),
+        ));
+        let insert_plan = cold_listing_table
+            .insert_into(session_state.as_ref(), writer_input, InsertOp::Append)
+            .await?;
+        collect(insert_plan, session_state.task_ctx()).await?;
+
+        // List the written cold files and read each footer for accurate per-file
+        // stats + row counts (so listing-time pruning is exact).
+        let cold_table_url = ListingTableUrl::parse(&cold_dir_url)?;
+        let store = session_state.runtime_env().object_store(&cold_table_url)?;
+        let object_store_url_str = cold_table_url.object_store().as_str().to_string();
+        let format = self.context.file_format();
+        let prefix = cold_table_url.prefix().clone();
+
+        let mut listing = store.list(Some(&prefix));
+        let mut cold_files = Vec::new();
+        let mut total_rows = 0u64;
+        while let Some(meta) = listing.next().await {
+            let meta = meta.map_err(|e| Error::Internal {
+                table: self.table_metadata.table_name.clone(),
+                message: format!("cold-tier file listing failed: {e}"),
+            })?;
+            if !meta.location.to_string().ends_with(".vortex") || meta.size == 0 {
+                continue;
+            }
+            let stats = format
+                .infer_stats(session_state.as_ref(), &store, self.table_schema(), &meta)
+                .await?;
+            let row_count = stats
+                .num_rows
+                .get_value()
+                .copied()
+                .and_then(|v| i64::try_from(v).ok())
+                .unwrap_or(0);
+            total_rows += u64::try_from(row_count.max(0)).unwrap_or(0);
+            let statistics_blob =
+                crate::stats::statistics_to_persisted_blob(&stats, &self.table_metadata.schema)
+                    .unwrap_or_else(|| {
+                        tracing::warn!(
+                            target: "cayenne::compaction",
+                            table = self.table_metadata.table_name.as_str(),
+                            file = %meta.location,
+                            "Cold-tier file statistics could not be serialized; listing-time pruning cannot skip this file"
+                        );
+                        Vec::new()
+                    });
+            cold_files.push(crate::metadata::ColdTierFile {
+                table_id: self.table_metadata.table_id.clone(),
+                file_url: format!("{object_store_url_str}{}", meta.location),
+                row_count,
+                file_size_bytes: i64::try_from(meta.size).unwrap_or(i64::MAX),
+                // v1 promotion re-materializes the whole table, so a per-file
+                // lower bound isn't meaningful; 0 keeps the cold file always
+                // eligible for the phase-2 max_sequence-keyed GC/retention reader.
+                min_sequence: 0,
+                max_sequence,
+                statistics_blob,
+            });
+        }
+
+        Ok((cold_files, total_rows))
+    }
+
+    /// Cold-tier graduation (storage-cascade bottom tier; v1 = whole-table).
+    ///
+    /// When the warm tier has grown past `cayenne_cold_tier_warm_max_bytes` /
+    /// `_files`, graduate the table's whole durable content to the cold object
+    /// store: flush the in-RAM/inline tiers, read the canonical visible stream
+    /// (all deletes applied, single-version per key — the proven rewrite read),
+    /// Z-order cluster it, write read-optimized Vortex to the cold store, then
+    /// atomically register the cold files + overwrite-clear the warm tier + flip
+    /// to a fresh empty warm snapshot. Subsequent CDC writes accumulate in warm
+    /// again until the next graduation. Reuses `commit_overwrite` semantics, so a
+    /// crash is all-or-nothing.
+    ///
+    /// Returns `Ok(true)` if a graduation committed, `Ok(false)` if the cold tier
+    /// is disabled, unsupported (position-delete), or not yet triggered.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if flushing the mem/inline tiers, the canonical visible
+    /// read, the cold object-store write, or the atomic catalog commit fails.
+    ///
+    /// Holds `write_lock` for the whole graduation (mirrors `begin_overwrite`), so
+    /// no append races the capture→write→commit and the generation fence is
+    /// unnecessary. Heavy + infrequent (gated by the warm-size thresholds).
+    pub async fn promote_warm_to_cold(&self) -> Result<bool> {
+        let vc = &self.table_metadata.vortex_config;
+        if !vc.cold_tier_enabled() {
+            return Ok(false);
+        }
+        // `cold_tier_enabled()` guarantees a non-empty location.
+        let cold_location = vc.cold_tier_location.clone().unwrap_or_default();
+        // v1: key-mode only. Position deletes are file-path scoped and cannot
+        // survive the warm→cold rewrite (mirrors the full-rewrite serialization).
+        if self.should_capture_positions() || self.pk_deletion_strategy.is_position_based() {
+            return Ok(false);
+        }
+
+        // Trigger: warm tier large/numerous enough to graduate.
+        let current_snapshot_id = self.get_current_snapshot_id();
+        let warm = self
+            .list_compaction_candidate_files_with_sizes(&current_snapshot_id)
+            .await?;
+        if warm.is_empty() {
+            return Ok(false);
+        }
+        let warm_bytes: i64 = warm
+            .iter()
+            .map(|(_, s)| i64::try_from(*s).unwrap_or(i64::MAX))
+            .sum();
+        let warm_files = warm.len();
+        let over_bytes =
+            vc.cold_tier_warm_max_bytes > 0 && warm_bytes >= vc.cold_tier_warm_max_bytes;
+        let over_files =
+            vc.cold_tier_warm_max_files > 0 && warm_files >= vc.cold_tier_warm_max_files;
+        if !(over_bytes || over_files) {
+            return Ok(false);
+        }
+
+        tracing::info!(
+            target: "cayenne::compaction",
+            table = self.table_metadata.table_name.as_str(),
+            warm_bytes,
+            warm_files,
+            "Promoting warm tier to cold object store (Z-order clustered graduation)"
+        );
+
+        // Exclude writers for the whole graduation (mirrors begin_overwrite).
+        let _write_guard = self.write_lock_arc().lock_owned().await;
+
+        // Flush the in-RAM mem tier + inline into durable so the canonical visible
+        // read below captures the whole live set.
+        if self.cdc_durability().is_memory() {
+            self.checkpoint_mem_tier_holding_write_lock().await?;
+        }
+        if self.cached_inlined_row_count() > 0 {
+            self.checkpoint_inlined_data().await?;
+        }
+
+        let max_sequence = self.sequence_high_water().await;
+
+        // Canonical visible read (all tiers, all deletes applied, single-version
+        // per key) — reuses the proven rewrite read so cold is correct by
+        // construction.
+        let ctx = self.create_compaction_session_context();
+        let (stream, _generation_before) = self.visible_file_stream_for_rewrite(&ctx).await?;
+
+        // Z-order cluster for a read-optimized cold layout.
+        let clustering = self.resolve_cold_clustering_indices();
+        let task_ctx = ctx.task_ctx();
+        let stream = self.zorder_sort_stream(stream, clustering, &task_ctx)?;
+
+        // Write the clustered, deletes-applied rows to the cold object store.
+        let (cold_files, total_rows) = self
+            .write_stream_to_cold(
+                &cold_location,
+                self.cold_object_store_config.as_ref(),
+                stream,
+                max_sequence,
+            )
+            .await?;
+        if cold_files.is_empty() {
+            // Nothing live to promote (e.g. every row deleted): the writer
+            // produced no cold files, so there is nothing to register or clean
+            // up. Gate on files-written rather than `total_rows` — a file that
+            // was written but whose footer row count couldn't be inferred must
+            // still be committed, not silently orphaned in the cold store.
+            return Ok(false);
+        }
+
+        // Commit: atomically register cold files + overwrite-clear warm + flip to
+        // a fresh empty warm snapshot, then sync the in-memory state.
+        let new_snapshot_id = uuid::Uuid::now_v7().to_string();
+        if !self.table_metadata.path.starts_with("s3://") {
+            let dir = self.snapshot_dir_path_for(&new_snapshot_id);
+            Self::ensure_snapshot_dir_exists(&dir).await?;
+        }
+        self.catalog
+            .commit_overwrite_to_cold(&self.table_metadata.table_id, &new_snapshot_id, &cold_files)
+            .await?;
+        self.publish_overwrite_snapshot(&new_snapshot_id).await?;
+        if let Err(error) = self.prune_snapshot_manifest_to(&new_snapshot_id).await {
+            tracing::warn!(
+                target: "cayenne::compaction",
+                table = self.table_metadata.table_name.as_str(),
+                %error,
+                "Failed to prune stale manifest rows after cold-tier promotion"
+            );
+        }
+        self.trigger_old_snapshot_cleanup(&new_snapshot_id).await;
+
+        tracing::info!(
+            target: "cayenne::compaction",
+            table = self.table_metadata.table_name.as_str(),
+            cold_files = cold_files.len(),
+            total_rows,
+            "Cold-tier promotion committed"
+        );
+        Ok(true)
     }
 
     /// Fast, write-lock-free consolidation of a size-tiered subset of the
@@ -19039,6 +19388,160 @@ impl CayenneTableProvider {
             .await
     }
 
+    /// Build the cold object-store tier scan branch, or `Ok(None)` when the cold
+    /// tier is disabled or empty (no added plan nodes — byte-identical to a
+    /// warm-only scan).
+    ///
+    /// Cold files come from the `cayenne_cold_tier_file` metastore manifest
+    /// (table-scoped, absolute object-store URLs), and each row carries its
+    /// serialized Vortex `FileStatistics` blob — so listing-time pruning runs
+    /// with NO object-store round-trip. The returned plan is a Vortex
+    /// `DataSourceExec`; the caller wraps it with the key-based (`Ignore`)
+    /// deletion filter and unions it into the scan tree.
+    async fn build_cold_tier_scan_plan(
+        &self,
+        state: &dyn Session,
+        projection: Option<&Vec<usize>>,
+        filters: &[Expr],
+        limit: Option<usize>,
+        scan_config: &SessionConfig,
+        read_schema_override: Option<SchemaRef>,
+    ) -> datafusion_common::Result<Option<Arc<dyn ExecutionPlan>>> {
+        // Cold tier disabled (no location) → no branch. The object store for the
+        // cold URLs is resolved from the session registry: the default local
+        // store for `file://` cold, or the cold S3 store registered at scan top.
+        if !self.table_metadata.vortex_config.cold_tier_enabled() {
+            return Ok(None);
+        }
+
+        let cold_files = self
+            .catalog
+            .list_cold_tier_files(&self.table_metadata.table_id)
+            .await
+            .map_err(|e| {
+                // No directory-listing fallback exists for cold (unlike the warm
+                // manifest), so a metastore error must fail the query rather than
+                // silently drop cold rows.
+                datafusion_common::DataFusionError::Execution(format!(
+                    "Failed to list cold-tier files for table {}: {e}",
+                    self.table_metadata.table_name
+                ))
+            })?;
+        // No early all-empty guard needed: the per-file loop skips zero-size
+        // files and the `object_store_url is None` / `kept.is_empty()` checks
+        // below both return `Ok(None)` when nothing survives.
+
+        let base_schema = read_schema_override.unwrap_or_else(|| self.table_schema());
+        let options = Self::create_listing_options(
+            self.context.file_format(),
+            &self.pk_deletion_strategy,
+            scan_config,
+        );
+        let scan_schema = Self::snapshot_scan_schema(&base_schema, &options);
+
+        // Data-column pruning predicate (cold tier is never partitioned — gated
+        // at config time — so every filter is a data filter). Reuses the warm
+        // path's predicate + pruner; stats come from the persisted blob, so
+        // pruning costs no object-store round-trip.
+        let listing_pruning_predicate = if filters.is_empty() {
+            None
+        } else {
+            super::file_pruning::build_listing_pruning_predicate(&scan_schema, filters)?
+        };
+
+        let table_name = self.table_metadata.table_name.clone();
+        let mut object_store_url: Option<ListingTableUrl> = None;
+        let mut kept: Vec<PartitionedFile> = Vec::with_capacity(cold_files.len());
+        for file in &cold_files {
+            if file.file_size_bytes <= 0 {
+                continue;
+            }
+            // Absolute cold URL -> (object-store URL, bucket-relative path) — the
+            // same derivation DataFusion uses to resolve a file against a store.
+            // All cold files share one configured cold location, so the first
+            // file's object-store URL identifies the store for the whole branch.
+            let listing_url = ListingTableUrl::parse(&file.file_url)?;
+            if object_store_url.is_none() {
+                object_store_url = Some(listing_url.clone());
+            }
+            let object_meta = ObjectMeta {
+                location: listing_url.prefix().clone(),
+                last_modified: chrono::DateTime::UNIX_EPOCH,
+                size: u64::try_from(file.file_size_bytes).unwrap_or(0),
+                e_tag: None,
+                version: None,
+            };
+            let mut part_file = PartitionedFile::from(object_meta);
+            if let Some(stats) = crate::stats::statistics_from_persisted_blob(
+                &file.statistics_blob,
+                &self.table_metadata.schema,
+                file.row_count,
+            ) {
+                part_file = part_file.with_statistics(stats);
+            }
+            if let Some(ref predicate) = listing_pruning_predicate
+                && super::file_pruning::should_prune_partitioned_file(
+                    &part_file,
+                    &scan_schema,
+                    predicate,
+                )?
+            {
+                tracing::debug!(
+                    table = %table_name,
+                    file = %file.file_url,
+                    "Pruned cold-tier file at listing time via persisted footer statistics"
+                );
+                continue;
+            }
+            kept.push(part_file);
+        }
+
+        let Some(table_url) = object_store_url else {
+            return Ok(None);
+        };
+        if kept.is_empty() {
+            // Every cold file pruned for this query.
+            return Ok(None);
+        }
+
+        // Key-based deletion (cold tier is key-mode only) filters ABOVE the
+        // Vortex scan, so a pushed row-count limit would under-deliver; suppress
+        // it and rely on the outer GlobalLimitExec (mirror
+        // create_snapshot_scan_plan_with_config).
+        let scan_pushdown_limit =
+            if self.has_pending_deletions() && !self.pk_deletion_strategy.is_position_based() {
+                None
+            } else {
+                limit
+            };
+
+        let file_groups = FileGroup::new(kept).split_files(options.target_partitions);
+        let (file_groups, statistics) =
+            compute_all_files_statistics(file_groups, Arc::clone(&scan_schema), true, false)?;
+
+        let file_source = options
+            .format
+            .file_source(Self::snapshot_file_table_schema(&base_schema, &options));
+
+        let plan = options
+            .format
+            .create_physical_plan(
+                state,
+                FileScanConfigBuilder::new(table_url.object_store(), file_source)
+                    .with_file_groups(file_groups)
+                    .with_constraints(Constraints::default())
+                    .with_statistics(statistics)
+                    .with_projection_indices(projection.cloned())?
+                    .with_limit(scan_pushdown_limit)
+                    // Cold files are an unsorted internal union branch — never
+                    // advertise an ordering.
+                    .with_output_ordering(Vec::new())
+                    .build(),
+            )
+            .await?;
+        Ok(Some(plan))
+    }
+
     /// Resolve a snapshot's data files from the manifest (`cayenne_snapshot_file`)
     /// instead of by listing the snapshot directory.
     ///
@@ -20073,6 +20576,13 @@ impl TableProvider for CayenneTableProvider {
         if let Some(ref config) = self.object_store_config {
             self.register_object_store_for_runtime(state.runtime_env(), config);
         }
+        // Register the cold-tier object store too (may be a different bucket).
+        // Uses the URL-keyed idempotent path, NOT `register_object_store_for_runtime`,
+        // because that one dedups per runtime-env and would skip the cold store
+        // after the warm store already claimed the per-env slot.
+        if let Some(ref cold_config) = self.cold_object_store_config {
+            Self::register_object_store_if_needed(state.runtime_env(), cold_config);
+        }
 
         // Warm the inlined cache before taking the consistency guards so the
         // read under `scan_state_lock` is a cheap cache hit in the common case.
@@ -20432,6 +20942,27 @@ impl TableProvider for CayenneTableProvider {
             })
             .await?;
 
+        // Build the COLD object-store tier branch (storage-cascade bottom tier).
+        // Cold files hold OLD, fully-superseded data, so they take the
+        // `Ignore`-re-inserts deletion treatment (`apply_deletion_filter`) — the
+        // same camp as protected snapshots. Using the `Apply` variant here would
+        // resurrect a stale cold row for a key re-inserted after deletion.
+        // `Ok(None)` (disabled / empty / all-pruned) adds zero plan nodes.
+        let cold_plan: Option<Arc<dyn ExecutionPlan>> = self
+            .build_cold_tier_scan_plan(
+                state,
+                effective_projection.as_ref(),
+                scan_filters,
+                limit,
+                scan_listing_config,
+                Some(Arc::clone(&read_schema)),
+            )
+            .await?
+            .map(|cold| {
+                self.apply_deletion_filter(cold, &pk_indices_in_projection, &deletion_snapshot)
+            })
+            .transpose()?;
+
         // Build a MemoryExec plan for the inlined data captured under the
         // read guard above (consistent with the deletion view used for the
         // file-backed deletion filter).
@@ -20545,6 +21076,17 @@ impl TableProvider for CayenneTableProvider {
             let mut all_plans = vec![filtered_main_plan];
             all_plans.extend(protected_snapshot_plans);
             UnionExec::try_new(all_plans)?
+        };
+
+        // Union the cold object-store tier if present. Added as its own union
+        // step (NOT by changing `main_plan`'s filter) so the warm-only and
+        // protected-snapshot arms above stay byte-identical. The cold branch is a
+        // Vortex `DataSourceExec`, so FilterPushdown still pushes the scan
+        // predicate into it and the redundant top FilterExec is still removed.
+        let plan: Arc<dyn ExecutionPlan> = if let Some(cold_exec) = cold_plan {
+            UnionExec::try_new(vec![plan, cold_exec])?
+        } else {
+            plan
         };
 
         // Union inlined data if present
@@ -20782,10 +21324,10 @@ impl TableProvider for CayenneTableProvider {
                 self.checkpoint_inlined_data_if_present_for_delete().await?;
             }
 
-            return self.delete_using_deletion_vectors(&filters);
+            return self.delete_using_deletion_vectors(&filters).await;
         }
 
-        let file_sink = self.build_deletion_vector_sink(&filters, None)?;
+        let file_sink = self.build_deletion_vector_sink(&filters, None).await?;
         Ok(Arc::new(DeletionExec::new(Arc::new(
             InlineAwareDeletionSink {
                 table: self.clone_for_write(),
@@ -20901,12 +21443,14 @@ impl CayenneTableProvider {
     }
 
     /// Main deletion-vector path via [`CayenneDeletionSink`].
-    fn delete_using_deletion_vectors(
+    async fn delete_using_deletion_vectors(
         &self,
         filters: &[Expr],
     ) -> datafusion_common::Result<Arc<dyn ExecutionPlan>> {
-        let sink: Arc<dyn DeletionSink> =
-            Arc::new(self.build_deletion_vector_sink(filters, Some(Arc::clone(&self.write_lock)))?);
+        let sink: Arc<dyn DeletionSink> = Arc::new(
+            self.build_deletion_vector_sink(filters, Some(Arc::clone(&self.write_lock)))
+                .await?,
+        );
         Ok(Arc::new(DeletionExec::new(Arc::new(
             PkKeysetInvalidatingDeletionSink {
                 table: self.clone_for_write(),
@@ -20915,16 +21459,79 @@ impl CayenneTableProvider {
         ))))
     }
 
-    fn build_deletion_vector_sink(
+    /// Build a `ListingTable` per distinct live cold-file directory (storage-
+    /// cascade bottom tier), so a key-based DELETE scan finds cold-resident keys
+    /// and records their tombstones. Empty when the cold tier is disabled/empty.
+    ///
+    /// Dirs are derived from the `cayenne_cold_tier_file` manifest URLs (the
+    /// authoritative live set), NOT a directory scan — so a superseded physical
+    /// cold generation left behind by replace-all promotion is never scanned.
+    async fn build_cold_tier_listing_tables(
+        &self,
+    ) -> datafusion_common::Result<Vec<Arc<ListingTable>>> {
+        if !self.table_metadata.vortex_config.cold_tier_enabled() {
+            return Ok(Vec::new());
+        }
+        // Register the cold store on the provider's context runtime env (S3
+        // cold); a local `file://` cold needs no registration.
+        if let Some(ref cold_config) = self.cold_object_store_config {
+            Self::register_object_store_if_needed(self.context.runtime_env(), cold_config);
+        }
+        let cold_files = self
+            .catalog
+            .list_cold_tier_files(&self.table_metadata.table_id)
+            .await
+            .map_err(|e| {
+                datafusion_common::DataFusionError::Execution(format!(
+                    "Failed to list cold-tier files for delete on table {}: {e}",
+                    self.table_metadata.table_name
+                ))
+            })?;
+        let mut dirs: Vec<String> = Vec::new();
+        for f in &cold_files {
+            if f.file_size_bytes <= 0 {
+                continue;
+            }
+            if let Some(idx) = f.file_url.rfind('/') {
+                let dir = &f.file_url[..=idx];
+                if !dirs.iter().any(|d| d == dir) {
+                    dirs.push(dir.to_string());
+                }
+            }
+        }
+        let mut tables = Vec::with_capacity(dirs.len());
+        for dir in dirs {
+            let table = Self::create_listing_table(
+                &dir,
+                self.table_schema(),
+                self.context.file_format(),
+                &self.pk_deletion_strategy,
+            )
+            .map_err(|e| {
+                datafusion_common::DataFusionError::Execution(format!(
+                    "Failed to create cold-tier listing table for delete: {e}"
+                ))
+            })?;
+            tables.push(table);
+        }
+        Ok(tables)
+    }
+
+    async fn build_deletion_vector_sink(
         &self,
         filters: &[Expr],
         write_lock: Option<Arc<tokio::sync::Mutex<()>>>,
     ) -> datafusion_common::Result<CayenneDeletionSink> {
-        let snapshot_tables: Vec<Arc<ListingTable>> = self
+        let mut snapshot_tables: Vec<Arc<ListingTable>> = self
             .build_protected_snapshot_listing_tables()?
             .into_iter()
             .map(|(_, table)| table)
             .collect();
+        // Also scan the cold tier so a key-delete of a cold-resident row is
+        // found and tombstoned (the cross-tier scan then hides it via the shared
+        // key-delete filter). Cold uses key-based deletes, so this is only ever
+        // non-empty for key-delete tables.
+        snapshot_tables.extend(self.build_cold_tier_listing_tables().await?);
 
         Ok(CayenneDeletionSink::new(
             self.table_metadata.clone(),
@@ -21131,6 +21738,13 @@ impl super::compaction::CompactionRunner for CayenneTableProvider {
         // `compact_protected_snapshots_subset`, because their tombstones are
         // file-path scoped and would otherwise be lost if they target a file
         // that is swapped away by the merge.
+
+        // NOTE: cold-tier graduation (storage-cascade bottom tier) does NOT run
+        // here. It is a heavy whole-table rewrite + object-store upload, so it
+        // runs on its OWN dedicated background worker (`BackgroundColdTierPromoter`
+        // → `run_cold_tier_promotion_tick` → `promote_warm_to_cold`) on the
+        // `cold_tier_background_interval_ms` cadence, decoupled from this
+        // compaction tick so it never stalls regular size-tier compaction.
 
         // Seq-prefix BAKE (Stage 2) — runs FIRST, gated on the deletion-index
         // size (the very quantity it shrinks). The bake exists to keep the
@@ -21412,6 +22026,63 @@ impl CayenneTableProvider {
         self.background_mem_tier_checkpointer
             .set(checkpointer)
             .is_ok()
+    }
+
+    /// Spawn the periodic cold-tier promotion task for this provider, if the cold
+    /// tier is enabled, the configured interval is non-zero, and no task is
+    /// already spawned. Must be called after the provider is wrapped in an `Arc`
+    /// (the scheduler holds a `Weak<Self>`); the task is owned by the provider
+    /// (stored in `background_cold_tier_promoter`) and aborts when the last `Arc`
+    /// drops. A no-op (`false`) when the cold tier is disabled.
+    ///
+    /// Returns `true` if a task was spawned by this call, `false` otherwise.
+    #[must_use]
+    pub fn spawn_background_cold_tier_promotion(self: &Arc<Self>) -> bool {
+        if self.background_cold_tier_promoter.get().is_some() {
+            return false;
+        }
+        if !self.table_metadata.vortex_config.cold_tier_enabled() {
+            return false;
+        }
+        let interval = std::time::Duration::from_millis(
+            self.table_metadata
+                .vortex_config
+                .cold_tier_background_interval_ms,
+        );
+        let Some(promoter) = super::compaction::BackgroundColdTierPromoter::spawn(
+            Arc::downgrade(self) as std::sync::Weak<dyn super::compaction::ColdTierPromotionRunner>,
+            interval,
+        ) else {
+            return false;
+        };
+        self.background_cold_tier_promoter.set(promoter).is_ok()
+    }
+}
+
+#[async_trait::async_trait]
+impl super::compaction::ColdTierPromotionRunner for CayenneTableProvider {
+    async fn run_cold_tier_promotion_tick(&self) {
+        match self.promote_warm_to_cold().await {
+            Ok(true) => {
+                tracing::debug!(
+                    target: "cayenne::compaction",
+                    table = self.table_metadata.table_name.as_str(),
+                    "Cold-tier promotion tick graduated the warm tier to the cold object store"
+                );
+            }
+            Ok(false) => {}
+            Err(e) => {
+                tracing::warn!(
+                    target: "cayenne::compaction",
+                    table = self.table_metadata.table_name.as_str(),
+                    "Cold-tier promotion tick failed (warm tier left intact; retry next tick): {e}"
+                );
+            }
+        }
+    }
+
+    fn cold_tier_promotion_target_name(&self) -> &str {
+        &self.table_metadata.table_name
     }
 }
 
