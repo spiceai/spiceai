@@ -6,6 +6,10 @@ on:
     - cron: '0 0,12 * * *'
     # htap-sf1, twice daily (0600, 1800) — HTAP CH-benCHmark SF1 (spiceai-dev-large-runners)
     - cron: '0 6,18 * * *'
+    # htap-sf1000-cold, once daily (0800) — HTAP CH-benCHmark SF1000 cold-object-store tier
+    # (spiceai-dev-xlarge-runners). Lighter once-a-day cadence while the cold tier is new; it shares
+    # the twice-daily sf1000 batch's serialized run concurrency group, so it queues, never contends.
+    - cron: '0 8 * * *'
 
   workflow_dispatch:
     inputs:
@@ -22,6 +26,7 @@ on:
           - 'sf10'
           - 'sf100'
           - 'sf1000'
+          - 'sf1000-cold'
 
 jobs:
   dispatch-htap:
@@ -98,6 +103,7 @@ jobs:
             case "${{ github.event.schedule }}" in
               '0 0,12 * * *')                 SF=sf1000 ;;
               '0 6,18 * * *')                 SF=sf1 ;;
+              '0 8 * * *')                    SF=sf1000-cold ;;
               *)                              SF= ;;   # unrecognized cron — dispatch nothing
             esac
             FLAGS="--max-concurrent 1 --max-concurrent-wait-timeout-mins 180"
