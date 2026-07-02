@@ -1036,6 +1036,21 @@ impl Handler for SpidapterHandler {
         };
 
         let mut setup_config = SetupConfig::from_metadata(&metadata).set_storage(storage);
+        // A scenario-level `spicepod:` path (e.g. the hand-tuned / adaptive Mongo CDC
+        // pods) deploys a full spicepod verbatim instead of generating one. An explicit
+        // `spicepod_path` in the setup metadata still wins; an empty scenario value
+        // (unset `${MONGO_SPICEPOD_PATH:-}`) falls through to generation.
+        if setup_config.spicepod_path.is_none()
+            && let Some(pod) = self
+                .scenario
+                .spicepod
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+        {
+            eprintln!("[stdio] Using scenario spicepod (skipping generation): {pod}");
+            setup_config.spicepod_path = Some(pod.to_string());
+        }
         // For non-direct sources, still honour the env AWS_REGION override.
         setup_config.aws_region_override = std::env::var("AWS_REGION").ok();
 
@@ -1701,6 +1716,7 @@ pub async fn run_stdio_server(args: &StdioArgs) -> anyhow::Result<()> {
             compute: None,
             acceleration: None,
             source: SourceConfig::Direct(DirectConfig::default()),
+            spicepod: None,
         }
     };
 
@@ -2429,5 +2445,44 @@ mod tests {
                 .contains("only a single partition column is supported"),
             "unexpected error: {err}"
         );
+    }
+
+    /// The bundled tuned/adaptive Mongo CDC pods must parse through the same loader
+    /// used at runtime (`load_spicepod_from_path`), have all 8 TPC-H datasets, and
+    /// carry Cayenne CDC acceleration. Guards against a param key / column type /
+    /// structure that the `SpicepodDefinition` deserializer rejects.
+    #[test]
+    fn bundled_mongo_spicepods_parse() {
+        let pods: [(&str, &str); 4] = [
+            ("mongo-sf10-tuned", include_str!("../scenarios/pods/mongo/mongo-sf10-tuned.yaml")),
+            ("mongo-sf100-tuned", include_str!("../scenarios/pods/mongo/mongo-sf100-tuned.yaml")),
+            ("mongo-sf1000-tuned", include_str!("../scenarios/pods/mongo/mongo-sf1000-tuned.yaml")),
+            ("mongo-adaptive", include_str!("../scenarios/pods/mongo/mongo-adaptive.yaml")),
+        ];
+        let run_id = Uuid::nil();
+        for (name, yaml) in pods {
+            let pod = parse_and_rename_spicepod(yaml, &run_id)
+                .unwrap_or_else(|e| panic!("pod `{name}` failed to parse: {e}"));
+            assert_eq!(
+                pod.datasets.len(),
+                8,
+                "pod `{name}` should declare all 8 TPC-H datasets"
+            );
+            for ds in &pod.datasets {
+                let spicepod::component::ComponentOrReference::Component(ds) = ds else {
+                    panic!("pod `{name}` dataset must be an inline component");
+                };
+                let accel = ds
+                    .acceleration
+                    .as_ref()
+                    .unwrap_or_else(|| panic!("pod `{name}` dataset `{}` missing acceleration", ds.name));
+                assert_eq!(
+                    accel.engine.as_deref(),
+                    Some("cayenne"),
+                    "pod `{name}` dataset `{}` must use the cayenne engine",
+                    ds.name
+                );
+            }
+        }
     }
 }

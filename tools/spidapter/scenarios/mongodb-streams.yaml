@@ -12,3 +12,7 @@ source:
   mongodb_streams:
     connect:
       uri: ${MONGODB_ATLAS_URI}
+# Optional: deploy a full tuned/adaptive spicepod verbatim instead of generating one.
+# Set MONGO_SPICEPOD_PATH to a scenarios/pods/mongo/*.yaml path (baked into the spidapter
+# image). Empty/unset → generate the default pod (previous behaviour).
+spicepod: ${MONGO_SPICEPOD_PATH:-}
