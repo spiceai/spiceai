@@ -25,15 +25,15 @@ use datafusion_table_providers::sql::db_connection_pool::{
 };
 use mysql_async::{Metrics, prelude::Queryable};
 use opentelemetry::KeyValue;
-use runtime_api_types::v1::ComponentType;
 use runtime::component::dataset::Dataset;
-use runtime_metrics::component::{MetricSpec, MetricType, MetricsProvider, ObserveMetricCallback};
 use runtime::dataconnector::{
     ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory,
     DataConnectorResult, NewDataConnectorResult,
 };
 use runtime::datafusion::udf::deny_spice_functions_for_table_providers;
 use runtime::parameters::ParameterSpec;
+use runtime_api_types::v1::ComponentType;
+use runtime_metrics::component::{MetricSpec, MetricType, MetricsProvider, ObserveMetricCallback};
 use secrecy::ExposeSecret;
 use snafu::prelude::*;
 use std::any::Any;

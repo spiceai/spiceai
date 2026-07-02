@@ -34,11 +34,11 @@ use data_components::postgres_replication::{
 use datafusion::sql::TableReference;
 use futures::StreamExt;
 use opentelemetry::KeyValue;
-use runtime_api_types::v1::ComponentType;
 use runtime::component::dataset::Dataset;
-use runtime_metrics::component::{MetricSpec, MetricType, MetricsProvider, ObserveMetricCallback};
 use runtime::federated_table::FederatedTable;
 use runtime::parameters::{ExposedParamLookup, Parameters};
+use runtime_api_types::v1::ComponentType;
+use runtime_metrics::component::{MetricSpec, MetricType, MetricsProvider, ObserveMetricCallback};
 use secrecy::SecretString;
 
 const DEFAULT_STATUS_INTERVAL: Duration = Duration::from_secs(10);
