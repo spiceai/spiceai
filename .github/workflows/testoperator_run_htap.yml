@@ -59,7 +59,7 @@ on:
       collect_diagnostics:
         description: 'Capture additional diagnostics'
         required: false
-        default: true
+        default: false
         type: boolean
 
 # Serialize ALL SF100 + SF1000 CH-benCHmark runs across every variant (sqlite/turso cdc-tuned,
