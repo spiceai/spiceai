@@ -754,6 +754,73 @@ pub(crate) struct WriteSample {
     pub delete_rows: u64,
 }
 
+/// A tumbling-window maximum of a signal. The instantaneous `now − ts` freshness/
+/// lag gauges are sampled at a random phase and ramp without bound while a table
+/// is idle, so they both miss transient stalls AND mislead post-load — useless as
+/// an SLO control signal. This holds the PEAK folded into the in-progress window
+/// plus the last completed window's peak (so a reader always has a full-window
+/// value), tumbling every [`Self::WINDOW_MS`]. Copy/cheap: three scalars, no
+/// allocation; lives inside the mutex-guarded [`EwmaInner`].
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct WindowMax {
+    /// Start (epoch ms) of the in-progress window; `i64::MIN` before the first fold.
+    cur_start_ms: i64,
+    /// Peak folded into the in-progress window.
+    cur_max: f64,
+    /// Peak of the last completed window.
+    prev_max: f64,
+}
+
+impl WindowMax {
+    /// Rolling window width. ~[`DEFAULT_GOAL_CONVERGENCE_WINDOW`] (60s) so the peak
+    /// spans a full goal-convergence window — the horizon the SLO is stated over.
+    const WINDOW_MS: i64 = 60_000;
+
+    const fn new() -> Self {
+        Self {
+            cur_start_ms: i64::MIN,
+            cur_max: 0.0,
+            prev_max: 0.0,
+        }
+    }
+
+    /// Tumble the window if [`Self::WINDOW_MS`] elapsed since it opened. Idempotent
+    /// within a window, so it is safe to call from both `fold` (writer) and `peak`
+    /// (reader) — whichever crosses the boundary first advances it. A gap spanning
+    /// MORE than one window means the intervening windows saw no folds (idle), so
+    /// only a single-window gap carries a `prev`; a longer gap resets to 0 — the
+    /// idle-immunity that keeps a parked table from latching a stale peak.
+    fn roll(&mut self, now_ms: i64) {
+        if self.cur_start_ms == i64::MIN {
+            self.cur_start_ms = now_ms;
+        } else if now_ms.saturating_sub(self.cur_start_ms) >= Self::WINDOW_MS {
+            let elapsed_windows = now_ms.saturating_sub(self.cur_start_ms) / Self::WINDOW_MS;
+            self.prev_max = if elapsed_windows == 1 {
+                self.cur_max
+            } else {
+                0.0
+            };
+            self.cur_max = 0.0;
+            self.cur_start_ms = now_ms;
+        }
+    }
+
+    /// Fold a non-negative `value` observed at `now_ms` into the current window.
+    fn fold(&mut self, now_ms: i64, value: f64) {
+        self.roll(now_ms);
+        if value > self.cur_max {
+            self.cur_max = value;
+        }
+    }
+
+    /// The windowed peak at `now_ms` = max(in-progress, last-completed), after
+    /// rolling so an idle table's peak decays instead of latching forever.
+    fn peak(&mut self, now_ms: i64) -> f64 {
+        self.roll(now_ms);
+        self.cur_max.max(self.prev_max)
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 struct EwmaInner {
     rows_per_sec: Ewma,
@@ -784,6 +851,13 @@ struct EwmaInner {
     /// FAST EWMA of the `publish` latency, paired with `publish_latency_ms` for the
     /// publish-side cliff detector.
     publish_latency_fast_ms: Ewma,
+    /// Tumbling-window PEAK of the per-apply end-to-end row freshness (`apply
+    /// wall-clock − the applied batch's source-commit ts`) — the true worst-case
+    /// PG-commit→queryable lag the freshness SLO is stated against, and the signal
+    /// the freshness-goal shrink lever reads. Idle-immune (only folded on an apply
+    /// that carried a source-commit ts, so a post-idle batch reports its own small
+    /// lag, never the idle duration), unlike the unbounded instantaneous gauges.
+    row_freshness_peak: WindowMax,
 }
 
 impl Default for EwmaInner {
@@ -800,6 +874,7 @@ impl Default for EwmaInner {
             io_latency_fast_ms: Ewma::with_alpha(EWMA_ALPHA_FAST),
             publish_latency_ms: Ewma::new(),
             publish_latency_fast_ms: Ewma::with_alpha(EWMA_ALPHA_FAST),
+            row_freshness_peak: WindowMax::new(),
         }
     }
 }
@@ -971,6 +1046,39 @@ impl IngestStats {
             i64::MIN => None,
             ts => Some(u64_to_f64(now_ms.saturating_sub(ts).max(0).unsigned_abs()) / 1000.0),
         }
+    }
+
+    /// Fold this apply's end-to-end row freshness — `now_ms − source_commit_ts_ms`,
+    /// the age at apply time of the batch we just made queryable — into the rolling
+    /// windowed peak. This is the true PG-commit→queryable lag per batch; its peak
+    /// over the window is the worst-case freshness the SLO is stated against, and
+    /// what the freshness-goal shrink lever controls on. A no-op when the source
+    /// carries no commit ts (nothing to measure). Idle-immune BY CONSTRUCTION: a
+    /// batch that arrives after an idle gap carries a RECENT `source_commit_ts_ms`,
+    /// so its measured lag is small — the wall-clock idle never enters the signal
+    /// (unlike `freshness_secs`/`replication_lag_secs`, which both ramp on idle).
+    /// Negative (source clock ahead of host) clamps to 0; the absolute value is only
+    /// as good as source↔host clock sync, so the controller keys off the threshold.
+    pub fn fold_row_freshness(&self, now_ms: i64, source_commit_ts_ms: Option<i64>) {
+        let Some(ts) = source_commit_ts_ms else {
+            return;
+        };
+        let lag_secs = u64_to_f64(now_ms.saturating_sub(ts).max(0).unsigned_abs()) / 1000.0;
+        self.inner.lock().row_freshness_peak.fold(now_ms, lag_secs);
+    }
+
+    /// The windowed-peak per-apply row freshness in seconds (worst PG-commit→
+    /// queryable lag over the rolling window), or `None` before the first apply that
+    /// carried a source-commit ts. The freshness-goal control/SLO signal — robust to
+    /// the instantaneous gauge's sampling-phase blindness and idle ramp.
+    #[must_use]
+    pub fn peak_row_freshness_secs(&self, now_ms: i64) -> Option<f64> {
+        let mut inner = self.inner.lock();
+        // `cur_start_ms == i64::MIN` ⇒ never folded (no apply yet with a commit ts).
+        if inner.row_freshness_peak.cur_start_ms == i64::MIN {
+            return None;
+        }
+        Some(inner.row_freshness_peak.peak(now_ms))
     }
 
     /// Take a consistent snapshot of the derived signals for the controller.
@@ -2346,6 +2454,21 @@ fn decide_goal(
     // when genuinely new ingest has arrived since the last move.
     let ingest_v = goals.ingest_violation(s);
     let ingest_violated = ingest_fresh && ingest_v > 0.0;
+    // Freshness split out from the combined ingest violation: freshness owns the
+    // mem-tier SHRINK lever (a violated freshness SLO ⇒ apply-visibility lag ⇒
+    // checkpoint smaller epochs sooner), while replication-lag keeps the buffer
+    // GROW levers. Kept mutually exclusive on the mem-tier actuator (the shrink
+    // tier fires first and the buffer-grow branches are gated `!freshness_violated`)
+    // so the two never target it in opposite directions on one tick — no limit
+    // cycle. Gated on `ingest_fresh` like every ingest signal: `s.freshness_secs`
+    // carries the windowed-PEAK per-apply row freshness (idle-immune by
+    // construction — see `IngestStats::fold_row_freshness`), but the fresh-sample
+    // gate is still required so a parked table with a decaying peak never ratchets
+    // the tier down.
+    let fresh_v = goals
+        .freshness
+        .map_or(0.0, |g| g.violation(s.freshness_secs));
+    let freshness_violated = ingest_fresh && fresh_v > 0.0;
     // Environment/data gates (same semantics as the legacy ladder): CPU-bound
     // withholds CPU-stealing moves; I/O-/publish-bound and mutation-heavy withhold the
     // write-concurrency lever (more shards = more files / uploads / key churn). On a
@@ -2523,12 +2646,46 @@ fn decide_goal(
         }
     }
 
+    // (2.9) Freshness-shrink tier: a violated FRESHNESS SLO means data is taking
+    // too long to become queryable — the mem-tier checkpoint capture stalls behind a
+    // deep apply backlog and new rows queue behind it. SHRINK the mem-tier so
+    // checkpoints fire on smaller epochs: earlier backpressure keeps the apply
+    // backlog (and the capture stall) shallow, so PG-commit→queryable lag falls.
+    // EMPIRICALLY VALIDATED — a SF-100 3-node A/B pinning 1 GiB→256 MiB cut
+    // worst-table freshness P99 4.4s→2.7s (under a 3s SLO) with QPH +3.6% and no
+    // read-amp cost; this automates that one-shot pin as a closed loop. Ordered
+    // BEFORE the ingest grow tier, and that tier's buffer-grow branches are gated
+    // `!freshness_violated`, so freshness owns the mem-tier lever and never
+    // limit-cycles against the lag-grow. `clamp_move_i64(…, b.mem_tier_max_bytes)`
+    // supplies the `MEM_TIER_MIN_BYTES` floor AND free pin-respect: an operator
+    // `cayenne_cdc_mem_tier_max_bytes` collapses the bounds to a point, so this
+    // no-ops rather than fighting the pin. No `mem_ok` gate — a shrink never needs
+    // memory headroom (and a memory-pressure shrink already ran in an earlier tier).
+    if freshness_violated
+        && let Some(v) = clamp_move_i64(
+            cur.mem_tier_max_bytes,
+            goal_shrink_i64(cur.mem_tier_max_bytes, b.mem_tier_max_bytes, fresh_v),
+            b.mem_tier_max_bytes,
+        )
+    {
+        return Some(Adjustment {
+            actuator: Actuator::MemTierMaxBytes,
+            new_value: u64::try_from(v).unwrap_or(0),
+            reason: "freshness goal: shrink the in-memory CDC tier → checkpoint smaller epochs sooner (shallower apply backlog, lower visibility lag)",
+        });
+    }
+
     // (3) Ingest/lag tier: a violated replication-lag/freshness goal. Grow buffers
     // first (help lag AND queries), then the mem-tier, then add write shards —
     // gated so extra shards (= more files) never fire while a query goal is
     // violated, read-amp is high, or the stream is delete-heavy.
     if ingest_violated {
-        if mem_ok
+        // Buffer growth is withheld under a freshness violation (see the mem-tier
+        // grow gate below): when data is too slow to become queryable, growing
+        // buffers is the wrong direction. Under a pure LAG violation it fires as
+        // before.
+        if !freshness_violated
+            && mem_ok
             && let Some(v) = clamp_move_i64(
                 cur.inline_flush_max_bytes,
                 goal_grow_i64(
@@ -2545,7 +2702,13 @@ fn decide_goal(
                 reason: "replication-lag goal: enlarge memtable (fewer files + amortized commits)",
             });
         }
-        if mem_ok
+        // Gated `!freshness_violated`: growing the tier is the LAG lever (fewer
+        // writer-blocking spills); it is the opposite of the freshness-shrink lever,
+        // so it must not fire when freshness is the violation being served (else the
+        // two limit-cycle the tier up/down). Freshness owns the tier; lag falls back
+        // to the throughput levers below when freshness is also violated.
+        if !freshness_violated
+            && mem_ok
             && let Some(v) = clamp_move_i64(
                 cur.mem_tier_max_bytes,
                 goal_grow_i64(cur.mem_tier_max_bytes, b.mem_tier_max_bytes, ingest_v),
@@ -2825,6 +2988,16 @@ fn goal_grow_i64(v: i64, (lo, hi): (i64, i64), violation: f64) -> i64 {
     v.saturating_add(step)
 }
 
+/// Shrink an `i64` actuator by one goal-mode step (the `saturating_sub` twin of
+/// [`goal_grow_i64`]). The result is clamped to `[floor, ceiling]` by
+/// `clamp_move_i64` at the call site — the floor (e.g. [`MEM_TIER_MIN_BYTES`])
+/// bounds how far the freshness lever can shrink the mem-tier.
+fn goal_shrink_i64(v: i64, (lo, hi): (i64, i64), violation: f64) -> i64 {
+    let range = u64::try_from(hi.saturating_sub(lo)).unwrap_or(0);
+    let step = i64::try_from(goal_step_magnitude_u64(range, violation)).unwrap_or(i64::MAX);
+    v.saturating_sub(step)
+}
+
 fn goal_grow_usize(v: usize, (lo, hi): (usize, usize), violation: f64) -> usize {
     let range = u64::try_from(hi.saturating_sub(lo)).unwrap_or(u64::MAX);
     let step = usize::try_from(goal_step_magnitude_u64(range, violation)).unwrap_or(usize::MAX);
@@ -2996,7 +3169,10 @@ mod tests {
         clippy::cast_possible_truncation,
         clippy::cast_sign_loss,
         clippy::cast_precision_loss,
-        clippy::cast_possible_wrap
+        clippy::cast_possible_wrap,
+        // Controller/WindowMax tests assert on exact, small, representable f64 values
+        // (folded literals + clean n/1000 divisions) where `==` is exact and correct.
+        clippy::float_cmp
     )]
     use super::*;
 
@@ -3924,14 +4100,23 @@ mod tests {
     }
 
     #[test]
-    fn freshness_goal_violated_grows_memtable() {
+    fn freshness_goal_violated_shrinks_mem_tier_not_memtable() {
+        // A violated freshness SLO SHRINKS the in-memory CDC tier (checkpoint smaller
+        // epochs sooner) and WITHHOLDS the buffer-grow levers — the inversion of the
+        // pre-lever-3 "freshness grows the memtable" response, which pushed buffers in
+        // the wrong direction for a visibility-lag violation (the SF-100 A/B showed
+        // 1 GiB→256 MiB *cut* freshness P99 4.4s→2.7s).
         let s = IngestSnapshot {
             freshness_secs: Some(30.0),
             ..snap()
         };
         let goals = Goals::from_targets(None, Some(5.0), None, None, Duration::from_mins(1));
         let adj = goal_decide(&s, &actuators(), &bounds(), &goals).expect("a move");
-        assert_eq!(adj.actuator, Actuator::InlineFlushBytes);
+        assert_eq!(adj.actuator, Actuator::MemTierMaxBytes);
+        assert!(
+            adj.new_value < actuators().mem_tier_max_bytes as u64,
+            "freshness violation shrinks the tier, never grows the memtable",
+        );
     }
 
     #[test]
@@ -4508,6 +4693,212 @@ mod tests {
         assert!(decide_fresh(&fast, &actuators(), &bounds()).is_none());
     }
 
+    // ---- lever 3: freshness-goal mem-tier shrink ---------------------------
+
+    /// Base actuators with the mem-tier at 1 GiB — the SF-100 adaptive value the
+    /// A/B started from, with headroom above the 64 MiB floor to shrink into.
+    fn actuators_1gib() -> ActuatorValues {
+        let mut a = actuators();
+        a.mem_tier_max_bytes = 1024 * 1024 * 1024;
+        a
+    }
+
+    #[test]
+    fn freshness_violation_shrinks_mem_tier() {
+        // A violated freshness SLO (peak row freshness 5s past a 3s target) shrinks
+        // the in-memory CDC tier — the automated form of the validated 1 GiB→256 MiB
+        // pin (SF-100 3-node A/B: worst-table freshness P99 4.4s→2.7s).
+        let s = IngestSnapshot {
+            freshness_secs: Some(5.0),
+            ..snap()
+        };
+        let goals = Goals::from_targets(None, Some(3.0), None, None, Duration::from_mins(1));
+        let a = actuators_1gib();
+        let adj = goal_decide(&s, &a, &bounds(), &goals).expect("freshness violation must act");
+        assert_eq!(adj.actuator, Actuator::MemTierMaxBytes);
+        assert!(
+            adj.new_value < a.mem_tier_max_bytes as u64,
+            "freshness violation must SHRINK the tier: got {} vs cur {}",
+            adj.new_value,
+            a.mem_tier_max_bytes,
+        );
+    }
+
+    #[test]
+    fn lag_only_violation_still_grows_mem_tier() {
+        // A pure replication-lag violation (freshness met) keeps the existing GROW
+        // behavior — the shrink lever must not regress it. Memtable maxed so the
+        // mem-tier grow is the surfaced move.
+        let s = IngestSnapshot {
+            replication_lag_secs: Some(30.0),
+            freshness_secs: Some(0.0),
+            ..snap()
+        };
+        let goals = Goals::from_targets(Some(5.0), Some(3.0), None, None, Duration::from_mins(1));
+        let mut a = actuators();
+        a.inline_flush_max_bytes = bounds().inline_flush_max_bytes.1;
+        let adj = goal_decide(&s, &a, &bounds(), &goals).expect("lag violation must act");
+        assert_eq!(adj.actuator, Actuator::MemTierMaxBytes);
+        assert!(
+            adj.new_value > a.mem_tier_max_bytes as u64,
+            "lag-only violation must GROW the tier",
+        );
+    }
+
+    #[test]
+    fn freshness_and_lag_both_violated_shrinks_not_grows() {
+        // Both violated: freshness OWNS the tier — it shrinks, and the lag-grow is
+        // suppressed on the same tick (the no-limit-cycle invariant).
+        let s = IngestSnapshot {
+            replication_lag_secs: Some(30.0),
+            freshness_secs: Some(5.0),
+            ..snap()
+        };
+        let goals = Goals::from_targets(Some(5.0), Some(3.0), None, None, Duration::from_mins(1));
+        let a = actuators_1gib();
+        let adj = goal_decide(&s, &a, &bounds(), &goals).expect("must act");
+        assert_eq!(adj.actuator, Actuator::MemTierMaxBytes);
+        assert!(
+            adj.new_value < a.mem_tier_max_bytes as u64,
+            "with both violated, the freshness shrink must win over the lag grow",
+        );
+    }
+
+    #[test]
+    fn freshness_shrink_respects_operator_pin() {
+        // An operator hard-pin collapses the mem-tier bounds to a point; the shrink
+        // must no-op rather than fight the pin.
+        let s = IngestSnapshot {
+            freshness_secs: Some(5.0),
+            ..snap()
+        };
+        let goals = Goals::from_targets(None, Some(3.0), None, None, Duration::from_mins(1));
+        let a = actuators_1gib();
+        let pinned = TuningBounds {
+            mem_tier_max_bytes: (a.mem_tier_max_bytes, a.mem_tier_max_bytes),
+            ..bounds()
+        };
+        let adj = decide_with_goals(&s, &a, &pinned, ms(60_000), ms(30_000), 0, &goals);
+        assert!(
+            adj.is_none_or(|adj| adj.actuator != Actuator::MemTierMaxBytes),
+            "a pinned tier must never be moved by the freshness lever",
+        );
+    }
+
+    #[test]
+    fn freshness_shrink_gated_on_fresh_samples() {
+        // Idle table (samples unchanged since the last move): freshness is not
+        // actionable (it climbs on the wall clock with no new data) — no shrink.
+        let s = IngestSnapshot {
+            freshness_secs: Some(5.0),
+            ..snap()
+        };
+        let goals = Goals::from_targets(None, Some(3.0), None, None, Duration::from_mins(1));
+        let a = actuators_1gib();
+        let adj = decide_with_goals(&s, &a, &bounds(), ms(60_000), ms(30_000), s.samples, &goals);
+        assert!(
+            adj.is_none_or(|adj| adj.actuator != Actuator::MemTierMaxBytes),
+            "an idle table must not ratchet the tier down on wall-clock freshness",
+        );
+    }
+
+    #[test]
+    fn freshness_shrink_stops_at_floor() {
+        // Already at the floor: the shrink clamps to a no-op and yields the lever to
+        // the throughput moves rather than returning a spurious same-value move.
+        let s = IngestSnapshot {
+            freshness_secs: Some(5.0),
+            ..snap()
+        };
+        let goals = Goals::from_targets(None, Some(3.0), None, None, Duration::from_mins(1));
+        let mut a = actuators();
+        a.mem_tier_max_bytes = bounds().mem_tier_max_bytes.0;
+        let adj = goal_decide(&s, &a, &bounds(), &goals);
+        assert!(
+            adj.is_none_or(|adj| adj.actuator != Actuator::MemTierMaxBytes),
+            "at the floor the tier cannot shrink further",
+        );
+    }
+
+    // ---- metric #3: windowed-peak row freshness ----------------------------
+
+    #[test]
+    fn window_max_folds_peak_and_tumbles() {
+        let mut w = WindowMax::new();
+        w.fold(0, 1.0);
+        w.fold(1_000, 4.0);
+        w.fold(2_000, 2.0);
+        assert_eq!(w.peak(3_000), 4.0, "peak is the max within the window");
+        // Advance one full window: the completed window's peak (4.0) carries as prev.
+        w.fold(WindowMax::WINDOW_MS + 500, 1.5);
+        assert_eq!(
+            w.peak(WindowMax::WINDOW_MS + 600),
+            4.0,
+            "the just-completed window's peak counts for one more window",
+        );
+        // One more window (relative to the 1.5 fold): window-0's 4.0 has aged out of
+        // the 2-window memory; window-1's 1.5 becomes prev, the new 0.5 is current.
+        let t = 2 * WindowMax::WINDOW_MS + 600;
+        w.fold(t, 0.5);
+        assert_eq!(
+            w.peak(t + 10),
+            1.5,
+            "the 2-window-old peak (4.0) decayed; window-1's 1.5 remains as prev",
+        );
+        // A further window with only a small value: 1.5 decays too, leaving 0.5.
+        let t2 = 3 * WindowMax::WINDOW_MS + 700;
+        w.fold(t2, 0.3);
+        assert_eq!(
+            w.peak(t2 + 10),
+            0.5,
+            "after another window the 1.5 decays; only 0.5 (prev) + 0.3 (cur) remain",
+        );
+    }
+
+    #[test]
+    fn window_max_multi_window_idle_gap_drops_stale_peak() {
+        let mut w = WindowMax::new();
+        w.fold(0, 9.0);
+        // Jump 3 windows ahead (idle) with a fresh small sample.
+        let t = 3 * WindowMax::WINDOW_MS;
+        w.fold(t, 0.25);
+        assert_eq!(
+            w.peak(t + 10),
+            0.25,
+            "a multi-window idle gap drops the old peak, leaving only the new value",
+        );
+    }
+
+    #[test]
+    fn fold_row_freshness_is_idle_immune() {
+        let stats = IngestStats::new();
+        // No source ts folded yet ⇒ no peak signal.
+        assert_eq!(stats.peak_row_freshness_secs(10_000), None);
+        // A batch committed 4s before it applied ⇒ 4s row freshness.
+        stats.fold_row_freshness(10_000, Some(6_000));
+        assert_eq!(stats.peak_row_freshness_secs(10_500), Some(4.0));
+        // After a long idle, a batch that just committed applies ~fresh: the peak
+        // reflects the SMALL new lag (0.5s), never the multi-window idle duration.
+        let later = 10_000 + 5 * WindowMax::WINDOW_MS;
+        stats.fold_row_freshness(later, Some(later - 500));
+        assert_eq!(
+            stats.peak_row_freshness_secs(later + 10),
+            Some(0.5),
+            "post-idle freshness is the batch's own small lag, not the idle gap",
+        );
+    }
+
+    #[test]
+    fn fold_row_freshness_skips_without_source_ts() {
+        let stats = IngestStats::new();
+        stats.fold_row_freshness(10_000, None);
+        assert_eq!(
+            stats.peak_row_freshness_secs(10_100),
+            None,
+            "no source commit ts ⇒ nothing folded, no signal",
+        );
+    }
+
     #[test]
     fn burstable_cpu_withholds_shards_at_lower_pressure() {
         // CPU busy-fraction between the burstable gate (0.50) and the default
@@ -4564,12 +4955,12 @@ mod tests {
         let b = bounds();
 
         // GROW: freshness behind (60s vs 5s) AND CPU contended (0.95), with the
-        // higher-priority ingest buffers already maxed and the write-concurrency /
-        // compaction levers withheld under CPU contention — so shedding queries is
-        // the only lever left that helps the lag goal.
+        // freshness SHRINK lever already exhausted (mem-tier at its floor) and the
+        // write-concurrency / compaction levers withheld under CPU contention — so
+        // shedding queries is the last lever left that serves the freshness goal.
         let buffers_maxed_reserve_zero = ActuatorValues {
             inline_flush_max_bytes: b.inline_flush_max_bytes.1,
-            mem_tier_max_bytes: b.mem_tier_max_bytes.1,
+            mem_tier_max_bytes: b.mem_tier_max_bytes.0,
             ..actuators()
         };
         let behind_contended = IngestSnapshot {
@@ -4660,11 +5051,11 @@ mod tests {
         let goals =
             Goals::from_targets(None, Some(5.0), None, Some(1000.0), Duration::from_mins(1));
         let b = bounds();
-        // Higher-priority ingest buffers already maxed, so the reserve is the lever
-        // in play (mirrors the sibling test's setup).
+        // Freshness shrink lever exhausted (mem-tier at floor), so the reserve is the
+        // lever in play (mirrors the sibling test's setup).
         let buffers_maxed = ActuatorValues {
             inline_flush_max_bytes: b.inline_flush_max_bytes.1,
-            mem_tier_max_bytes: b.mem_tier_max_bytes.1,
+            mem_tier_max_bytes: b.mem_tier_max_bytes.0,
             ..actuators()
         };
 

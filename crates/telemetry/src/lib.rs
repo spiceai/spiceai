@@ -1236,7 +1236,7 @@ pub fn track_cayenne_autotune_state(state: &CayenneAutotuneState, dimensions: &[
             .get_or_init(|| {
                 cayenne_operational_meter()
                     .f64_gauge("cayenne_ingest_freshness_seconds")
-                    .with_description("Measured freshness — age of the newest applied data.")
+                    .with_description("Measured freshness — windowed-peak per-apply row freshness (worst PG-commit→queryable lag over the last ~60s). Peak, not instantaneous: captures transient stalls and does not ramp on an idle table.")
                     .with_unit("s")
                     .build()
             })
