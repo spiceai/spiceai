@@ -1,0 +1,31 @@
+---
+source: crates/test-framework/src/snapshot/mod.rs
+description: "Query: tpch_simple_q2"
+---
++---------------+-------------------------------------------------------------------------------+
+| plan_type     | plan                                                                          |
++---------------+-------------------------------------------------------------------------------+
+| logical_plan  | Filter: lineitem.l_linenumber = (<subquery>)                                  |
+|               |   Subquery:                                                                   |
+|               |     Aggregate: groupBy=[[]], aggr=[[max(lineitem.l_linenumber)]]              |
+|               |       TableScan: lineitem projection=[l_linenumber]                           |
+|               |   TableScan: lineitem projection=[l_linenumber]                               |
+| physical_plan | ScalarSubqueryExec: subqueries=1                                              |
+|               |   FilterExec: l_linenumber@0 = scalar_subquery(<pending>)                     |
+|               |     RepartitionExec: partitioning=RoundRobinBatch(32), input_partitions=1     |
+|               |       SchemaCastScanExec                                                      |
+|               |         FallbackOnZeroResultsScanExec                                         |
+|               |           CayenneAccelerationExec: snapshots_scanned=0, files_scanned=0       |
+|               |             BytesProcessedExec                                                |
+|               |               EmptyExec                                                       |
+|               |   AggregateExec: mode=Final, gby=[], aggr=[max(lineitem.l_linenumber)]        |
+|               |     CoalescePartitionsExec                                                    |
+|               |       AggregateExec: mode=Partial, gby=[], aggr=[max(lineitem.l_linenumber)]  |
+|               |         RepartitionExec: partitioning=RoundRobinBatch(32), input_partitions=1 |
+|               |           SchemaCastScanExec                                                  |
+|               |             FallbackOnZeroResultsScanExec                                     |
+|               |               CayenneAccelerationExec: snapshots_scanned=0, files_scanned=0   |
+|               |                 BytesProcessedExec                                            |
+|               |                   EmptyExec                                                   |
+|               |                                                                               |
++---------------+-------------------------------------------------------------------------------+
