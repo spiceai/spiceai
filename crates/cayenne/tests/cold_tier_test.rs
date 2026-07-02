@@ -158,7 +158,10 @@ async fn test_cold_tier_promotion_cross_tier_scan_and_delete_impl(
     );
 
     // Cold files are registered in the metastore manifest with the full row set.
-    let cold = fixture.catalog.list_cold_tier_files(table.table_id()).await?;
+    let cold = fixture
+        .catalog
+        .list_cold_tier_files(table.table_id())
+        .await?;
     assert!(
         !cold.is_empty(),
         "expected cold-tier files registered after promotion"
@@ -244,10 +247,13 @@ async fn test_cold_tier_promotion_cross_tier_scan_and_delete_impl(
             .is_empty(),
         "the delete stays applied across a second promotion"
     );
-    let cold2 = fixture.catalog.list_cold_tier_files(table.table_id()).await?;
-    let cold2_rows: i64 = cold2.iter().map(|f| f.row_count).sum();
+    let cold2 = fixture
+        .catalog
+        .list_cold_tier_files(table.table_id())
+        .await?;
+    let regraduated_rows: i64 = cold2.iter().map(|f| f.row_count).sum();
     assert_eq!(
-        cold2_rows, 202,
+        regraduated_rows, 202,
         "cold manifest holds exactly the live row set after replace-all promotion"
     );
 

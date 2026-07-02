@@ -688,6 +688,8 @@ impl CayenneCatalog {
             .await
     }
 
+    /// # Errors
+    ///
     /// Returns [`CatalogError::InvalidOperationNoSource`] if either UUID is
     /// malformed.
     /// Returns [`CatalogError::FailedToSetCurrentSnapshot`] if the
@@ -2941,7 +2943,8 @@ impl MetadataCatalog for CayenneCatalog {
                     }
                     Err(e) => {
                         return Err(CatalogError::InvalidOperation {
-                            message: "Failed to commit cold-tier promotion transaction.".to_string(),
+                            message: "Failed to commit cold-tier promotion transaction."
+                                .to_string(),
                             source: Box::new(e),
                         });
                     }

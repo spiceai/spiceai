@@ -11928,9 +11928,10 @@ impl CayenneTableProvider {
         let idx = clustering_indices;
         let augmented = stream
             .map(move |res| res.and_then(|b| super::zorder::append_zorder_key_column(&b, &idx)));
-        let augmented_stream: SendableRecordBatchStream = Box::pin(
-            RecordBatchStreamAdapter::new(Arc::clone(&augmented_schema), augmented),
-        );
+        let augmented_stream: SendableRecordBatchStream = Box::pin(RecordBatchStreamAdapter::new(
+            Arc::clone(&augmented_schema),
+            augmented,
+        ));
         let sort_cols = vec![super::zorder::ZORDER_COLUMN_NAME.to_string()];
         let sorted = util::stream_utils::sort_stream(augmented_stream, &sort_cols, task_ctx)
             .map_err(|e| Error::Internal {
@@ -12029,12 +12030,7 @@ impl CayenneTableProvider {
                 continue;
             }
             let stats = format
-                .infer_stats(
-                    session_state.as_ref(),
-                    &store,
-                    self.table_schema(),
-                    &meta,
-                )
+                .infer_stats(session_state.as_ref(), &store, self.table_schema(), &meta)
                 .await?;
             let row_count = stats
                 .num_rows
@@ -12045,7 +12041,15 @@ impl CayenneTableProvider {
             total_rows += u64::try_from(row_count.max(0)).unwrap_or(0);
             let statistics_blob =
                 crate::stats::statistics_to_persisted_blob(&stats, &self.table_metadata.schema)
-                    .unwrap_or_default();
+                    .unwrap_or_else(|| {
+                        tracing::warn!(
+                            target: "cayenne::compaction",
+                            table = self.table_metadata.table_name.as_str(),
+                            file = %meta.location,
+                            "Cold-tier file statistics could not be serialized; listing-time pruning cannot skip this file"
+                        );
+                        Vec::new()
+                    });
             cold_files.push(crate::metadata::ColdTierFile {
                 table_id: self.table_metadata.table_id.clone(),
                 file_url: format!("{object_store_url_str}{}", meta.location),
@@ -12078,6 +12082,11 @@ impl CayenneTableProvider {
     /// Returns `Ok(true)` if a graduation committed, `Ok(false)` if the cold tier
     /// is disabled, unsupported (position-delete), or not yet triggered.
     ///
+    /// # Errors
+    ///
+    /// Returns an error if flushing the mem/inline tiers, the canonical visible
+    /// read, the cold object-store write, or the atomic catalog commit fails.
+    ///
     /// Holds `write_lock` for the whole graduation (mirrors `begin_overwrite`), so
     /// no append races the capture→write→commit and the generation fence is
     /// unnecessary. Heavy + infrequent (gated by the warm-size thresholds).
@@ -12107,8 +12116,10 @@ impl CayenneTableProvider {
             .map(|(_, s)| i64::try_from(*s).unwrap_or(i64::MAX))
             .sum();
         let warm_files = warm.len();
-        let over_bytes = vc.cold_tier_warm_max_bytes > 0 && warm_bytes >= vc.cold_tier_warm_max_bytes;
-        let over_files = vc.cold_tier_warm_max_files > 0 && warm_files >= vc.cold_tier_warm_max_files;
+        let over_bytes =
+            vc.cold_tier_warm_max_bytes > 0 && warm_bytes >= vc.cold_tier_warm_max_bytes;
+        let over_files =
+            vc.cold_tier_warm_max_files > 0 && warm_files >= vc.cold_tier_warm_max_files;
         if !(over_bytes || over_files) {
             return Ok(false);
         }
@@ -12155,9 +12166,12 @@ impl CayenneTableProvider {
                 max_sequence,
             )
             .await?;
-        if total_rows == 0 || cold_files.is_empty() {
-            // Nothing live to promote (e.g. every row deleted). Leave warm as-is;
-            // the empty cold write produced no files to clean up.
+        if cold_files.is_empty() {
+            // Nothing live to promote (e.g. every row deleted): the writer
+            // produced no cold files, so there is nothing to register or clean
+            // up. Gate on files-written rather than `total_rows` — a file that
+            // was written but whose footer row count couldn't be inferred must
+            // still be committed, not silently orphaned in the cold store.
             return Ok(false);
         }
 

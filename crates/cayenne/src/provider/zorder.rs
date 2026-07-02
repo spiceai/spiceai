@@ -1,5 +1,5 @@
 /*
-Copyright 2024-2025 The Spice.ai OSS Authors
+Copyright 2026 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -63,7 +63,9 @@ pub const ZORDER_COLUMN_NAME: &str = "__cayenne_zorder_key";
 /// most-negative value maps to `0x0000…` and the most-positive to `0xFFFF…`).
 #[inline]
 fn key_from_i64(v: i64) -> [u8; BYTES_PER_COLUMN] {
-    ((v as u64) ^ (1u64 << 63)).to_be_bytes()
+    // Reinterpret the two's-complement bits as unsigned (no value change), then
+    // flip the sign bit so the ordering becomes unsigned-big-endian monotonic.
+    (v.cast_unsigned() ^ (1u64 << 63)).to_be_bytes()
 }
 
 /// Unsigned integers are already order-preserving as big-endian bytes.
@@ -149,16 +151,37 @@ fn column_order_keys(array: &dyn Array) -> DFResult<Vec<[u8; BYTES_PER_COLUMN]>>
             let a = arr.as_primitive::<Float64Type>();
             keys_with_nulls(n, |i| (!a.is_null(i)).then(|| key_from_f64(a.value(i))))
         }
-        DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View => {
-            let arr = cast(array, &DataType::Utf8)?;
-            let a = arr.as_string::<i32>();
+        // String/binary families read the value's byte prefix directly per
+        // offset width — no cast to the `i32`-offset variant, which would fail
+        // (or truncate) once a `Large`/`View` array's data exceeds `i32::MAX`.
+        DataType::Utf8 => {
+            let a = array.as_string::<i32>();
             keys_with_nulls(n, |i| {
                 (!a.is_null(i)).then(|| key_from_bytes(a.value(i).as_bytes()))
             })
         }
-        DataType::Binary | DataType::LargeBinary | DataType::BinaryView => {
-            let arr = cast(array, &DataType::Binary)?;
-            let a = arr.as_binary::<i32>();
+        DataType::LargeUtf8 => {
+            let a = array.as_string::<i64>();
+            keys_with_nulls(n, |i| {
+                (!a.is_null(i)).then(|| key_from_bytes(a.value(i).as_bytes()))
+            })
+        }
+        DataType::Utf8View => {
+            let a = array.as_string_view();
+            keys_with_nulls(n, |i| {
+                (!a.is_null(i)).then(|| key_from_bytes(a.value(i).as_bytes()))
+            })
+        }
+        DataType::Binary => {
+            let a = array.as_binary::<i32>();
+            keys_with_nulls(n, |i| (!a.is_null(i)).then(|| key_from_bytes(a.value(i))))
+        }
+        DataType::LargeBinary => {
+            let a = array.as_binary::<i64>();
+            keys_with_nulls(n, |i| (!a.is_null(i)).then(|| key_from_bytes(a.value(i))))
+        }
+        DataType::BinaryView => {
+            let a = array.as_binary_view();
             keys_with_nulls(n, |i| (!a.is_null(i)).then(|| key_from_bytes(a.value(i))))
         }
         // Unsupported type: contribute nothing to the curve (all rows equal on
@@ -236,7 +259,11 @@ pub fn zorder_keys(columns: &[ArrayRef]) -> DFResult<BinaryArray> {
 #[must_use]
 pub fn zorder_augmented_schema(base: &Schema) -> SchemaRef {
     let mut fields: Vec<Arc<Field>> = base.fields().iter().map(Arc::clone).collect();
-    fields.push(Arc::new(Field::new(ZORDER_COLUMN_NAME, DataType::Binary, false)));
+    fields.push(Arc::new(Field::new(
+        ZORDER_COLUMN_NAME,
+        DataType::Binary,
+        false,
+    )));
     Arc::new(Schema::new(Fields::from(fields)))
 }
 
@@ -270,14 +297,10 @@ pub fn append_zorder_key_column(
 /// # Errors
 ///
 /// Returns an error if batch construction fails.
-pub fn strip_zorder_key_column(
-    batch: &RecordBatch,
-    original: &SchemaRef,
-) -> DFResult<RecordBatch> {
+pub fn strip_zorder_key_column(batch: &RecordBatch, original: &SchemaRef) -> DFResult<RecordBatch> {
     let n = original.fields().len();
     let arrays = batch.columns()[..n].to_vec();
-    RecordBatch::try_new(Arc::clone(original), arrays)
-        .map_err(DataFusionError::from)
+    RecordBatch::try_new(Arc::clone(original), arrays).map_err(DataFusionError::from)
 }
 
 #[cfg(test)]
