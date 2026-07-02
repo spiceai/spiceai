@@ -1752,7 +1752,11 @@ mod tests {
         )) as Arc<dyn ExecutionPlan>;
 
         // Mirror DataFusion's coercion of `AVG(Int32)` -> `avg(CAST(v AS Float64))`.
-        let avg_arg = cast(col("v", schema.as_ref())?, schema.as_ref(), DataType::Float64)?;
+        let avg_arg = cast(
+            col("v", schema.as_ref())?,
+            schema.as_ref(),
+            DataType::Float64,
+        )?;
         let avg_expr = AggregateExprBuilder::new(avg_udaf(), vec![avg_arg])
             .schema(Arc::clone(&schema))
             .alias("avg(v)".to_string())
