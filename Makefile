@@ -150,7 +150,7 @@ _LINT_PKG_FLAGS := $(foreach p,$(PACKAGES),-p $(p))
 _LINT_WORKSPACE_FLAGS := $(_LINT_PKG_FLAGS)
 _FMT_FLAGS := $(_LINT_PKG_FLAGS)
 else
-_LINT_WORKSPACE_FLAGS := --workspace --exclude libnfs
+_LINT_WORKSPACE_FLAGS := --workspace --exclude libnfs --exclude lopdf --exclude ttf-parser --exclude pdf-extract
 _FMT_FLAGS := --all
 endif
 # Apply FEATURES if provided, otherwise default to hardcoded features only for workspace-wide linting
