@@ -74,6 +74,10 @@ pub(super) fn emit_replication_metrics(
     for (metric_name, map) in gauge_metrics {
         if let Some(samples) = metrics.samples.get(metric_name) {
             for sample in samples {
+                // Skip NaN samples so the map holds the last observed *real* value
+                if sample.value.is_nan() {
+                    continue;
+                }
                 let dataset = sample
                     .labels
                     .get("name")
