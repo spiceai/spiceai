@@ -1194,10 +1194,13 @@ pub(crate) struct IngestSnapshot {
     pub replication_lag_secs: Option<f64>,
     /// Windowed-PEAK per-apply row freshness in seconds — the worst-case
     /// PG-commit→queryable lag (`apply_wall_clock − batch_source_commit_ts`) over the
-    /// last ~60s, populated from [`IngestStats::peak_row_freshness_secs`]; `None`
-    /// before the first apply that carried a source-commit ts. NOT the instantaneous
+    /// rolling goal-convergence window ([`WindowMax::WINDOW_MS`], derived from
+    /// [`DEFAULT_GOAL_CONVERGENCE_WINDOW`]), populated from
+    /// [`IngestStats::peak_row_freshness_secs`]. NOT the instantaneous
     /// `now − last_visible` age: the peak captures transient stalls and is idle-immune,
-    /// so it is the freshness-goal control/SLO signal. Lower is better.
+    /// so it is the freshness-goal control/SLO signal. Falls back to that instantaneous
+    /// age on sources without a commit timestamp (or before the first timestamped
+    /// apply); `None` only before the first apply of any kind. Lower is better.
     pub freshness_secs: Option<f64>,
     /// p99 query latency in ms observed on this table (pushed down from the
     /// runtime), or `None` when no queries have run. Lower is better; drives the
