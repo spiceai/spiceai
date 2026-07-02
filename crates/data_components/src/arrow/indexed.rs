@@ -29,6 +29,7 @@ limitations under the License.
 use std::collections::HashMap;
 use std::fmt::{self, Debug};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use arrow::array::{Array, RecordBatch};
 use arrow::datatypes::SchemaRef;
@@ -96,6 +97,17 @@ pub struct IndexedMemTable {
     primary_key_columns: Vec<String>,
     /// Secondary indexes on non-primary key columns.
     secondary_indexes: Vec<SecondaryIndex>,
+    /// Whether the hash index(es) may be stale relative to the underlying data.
+    ///
+    /// Set conservatively at plan time by any DML entry point
+    /// (`insert_into`/`delete_from`/`update`/`truncate`) and cleared by
+    /// [`IndexedMemTable::perform_maintenance`] after a successful rebuild. While
+    /// dirty, the index is treated as untrusted: PK/secondary equality filters are
+    /// reported as `Inexact` (so `DataFusion` keeps a `FilterExec`) and `scan`
+    /// bypasses the index for a full `MemTable` scan. This prevents an out-of-date
+    /// index from silently dropping existing rows on an `Exact`-pushdown point
+    /// lookup (see issue #11262).
+    dirty: AtomicBool,
 }
 
 impl Debug for IndexedMemTable {
@@ -105,6 +117,7 @@ impl Debug for IndexedMemTable {
             .field("indexed", &self.index.is_some())
             .field("primary_key_columns", &self.primary_key_columns)
             .field("secondary_indexes_count", &self.secondary_indexes.len())
+            .field("dirty", &self.is_dirty())
             .finish()
     }
 }
@@ -182,7 +195,23 @@ impl IndexedMemTable {
             index,
             primary_key_columns,
             secondary_indexes: Vec::new(),
+            dirty: AtomicBool::new(false),
         })
+    }
+
+    /// Returns true if the index may be stale relative to the underlying data.
+    #[must_use]
+    pub fn is_dirty(&self) -> bool {
+        self.dirty.load(Ordering::Acquire)
+    }
+
+    /// Marks the index as potentially stale.
+    ///
+    /// Called by every DML entry point at plan time. Conservative by design: a DML
+    /// plan that is built but never executed still marks the table dirty, which only
+    /// costs an index rebuild (or full-scan fallback) on the next read.
+    fn mark_dirty(&self) {
+        self.dirty.store(true, Ordering::Release);
     }
 
     /// Returns true if this table has an index.
@@ -598,12 +627,22 @@ impl TableProvider for IndexedMemTable {
         // `WHERE id=10 AND version=101` would ignore `version=101` and return
         // the row for id=10 regardless of its version).
         if self.index.is_some() && self.extract_pk_equality_value(&owned_filters).is_some() {
+            // When the index is dirty (a DML/retention/synchronized write happened
+            // without a subsequent rebuild), it can no longer be trusted: report the
+            // PK filter as Inexact instead of Exact so DataFusion keeps a FilterExec
+            // and re-applies the predicate over the full-scan fallback in `scan`,
+            // rather than dropping the filter and trusting a stale index (#11262).
+            let pk_dirty = self.is_dirty();
             let pk_column = &self.primary_key_columns[0];
             return Ok(filters
                 .iter()
                 .map(|f| {
                     if Self::extract_equality_value(f, pk_column).is_some() {
-                        TableProviderFilterPushDown::Exact
+                        if pk_dirty {
+                            TableProviderFilterPushDown::Inexact
+                        } else {
+                            TableProviderFilterPushDown::Exact
+                        }
                     } else {
                         TableProviderFilterPushDown::Inexact
                     }
@@ -641,10 +680,20 @@ impl TableProvider for IndexedMemTable {
             "IndexedMemTable::scan called"
         );
 
+        // If the index may be stale (a DML/retention/synchronized write happened
+        // without a rebuild), bypass it entirely and serve a full MemTable scan.
+        // DataFusion re-applies the equality predicate (reported Inexact while
+        // dirty), so this is correct — just slower until the index is rebuilt.
+        // Trusting a stale Exact index here would silently drop existing rows
+        // (#11262).
+        let index_usable = !self.is_dirty();
+
         // Check if we can use the primary key index for a point lookup
-        if let (Some(index), Some(pk_value)) =
-            (&self.index, self.extract_pk_equality_value(filters))
-        {
+        if let (true, Some(index), Some(pk_value)) = (
+            index_usable,
+            &self.index,
+            self.extract_pk_equality_value(filters),
+        ) {
             // Perform indexed lookup
             let hash = pk_value.hash();
             let pk_columns = self.primary_key_columns.clone();
@@ -705,7 +754,9 @@ impl TableProvider for IndexedMemTable {
         // Check if we can use a secondary index for lookup
         // Note: Secondary indexes with unique=true work like primary key lookups (single result)
         // Non-unique secondary indexes still provide fast lookup but may have collisions
-        if let Some((secondary, key_value)) = self.find_secondary_index_match(filters) {
+        if let (true, Some((secondary, key_value))) =
+            (index_usable, self.find_secondary_index_match(filters))
+        {
             tracing::debug!(
                 secondary_index_name = %secondary.name,
                 secondary_columns = ?secondary.columns,
@@ -780,9 +831,12 @@ impl TableProvider for IndexedMemTable {
         input: Arc<dyn ExecutionPlan>,
         overwrite: InsertOp,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        // Delegate to inner MemTable for insert
-        // Note: The index will need to be rebuilt after insert
-        // This is a simplified implementation; production would update the index incrementally
+        // Delegate to inner MemTable for insert. Mark the index dirty at plan time:
+        // the data the index points at is about to change, and the index is only
+        // rebuilt later via `perform_maintenance` (and not at all for direct DML).
+        // Until then, reads fall back to a full scan instead of trusting a stale
+        // index (#11262).
+        self.mark_dirty();
         let result = self.inner.insert_into(state, input, overwrite).await?;
 
         // TODO: Update index incrementally instead of rebuilding
@@ -800,6 +854,9 @@ impl TableProvider for IndexedMemTable {
         state: &dyn Session,
         filters: Vec<Expr>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
+        // Deletes shift row locations in the MemTable, invalidating stored
+        // RowLocations; mark dirty so reads bypass the stale index (#11262).
+        self.mark_dirty();
         self.inner.delete_from(state, filters).await
     }
 
@@ -837,10 +894,15 @@ impl TableProvider for IndexedMemTable {
         assignments: Vec<(String, Expr)>,
         filters: Vec<Expr>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
+        // Updates rewrite rows in place, invalidating index entries; mark dirty so
+        // reads bypass the stale index (#11262).
+        self.mark_dirty();
         self.inner.update(state, assignments, filters).await
     }
 
     async fn truncate(&self, state: &dyn Session) -> Result<Arc<dyn ExecutionPlan>> {
+        // Truncate removes all rows; every stored RowLocation is now invalid.
+        self.mark_dirty();
         self.inner.truncate(state).await
     }
 }
@@ -848,7 +910,12 @@ impl TableProvider for IndexedMemTable {
 #[async_trait]
 impl IndexMaintenanceProvider for IndexedMemTable {
     async fn perform_maintenance(&self) -> Result<()> {
-        self.rebuild_index().await
+        // Rebuild first; only clear the dirty flag once the index is consistent with
+        // the data. A failed rebuild leaves the table dirty so reads keep falling
+        // back to a full scan rather than serving stale results (#11262).
+        self.rebuild_index().await?;
+        self.dirty.store(false, Ordering::Release);
+        Ok(())
     }
 }
 
@@ -1100,6 +1167,7 @@ mod tests {
             index,
             primary_key_columns,
             secondary_indexes: Vec::new(),
+            dirty: AtomicBool::new(false),
         })
     }
 
@@ -3314,5 +3382,168 @@ mod tests {
             ],
             "PK filter should be Exact, non-PK filter should be Inexact"
         );
+    }
+
+    // =========================================================================
+    // Stale-index ("dirty") correctness tests (issue #11262)
+    // =========================================================================
+
+    /// A dirty index must downgrade PK equality pushdown from Exact to Inexact so
+    /// `DataFusion` keeps a `FilterExec` and re-applies the predicate, instead of
+    /// trusting a stale index that could silently drop existing rows.
+    #[test]
+    fn test_dirty_index_downgrades_pushdown_to_inexact() {
+        let batch = create_large_test_batch(300);
+        let schema = batch.schema();
+        let table = create_test_indexed_table(schema, vec![vec![batch]], vec!["id".to_string()])
+            .expect("failed to create table");
+
+        let pk_filter = col("id").eq(lit(42_i64));
+
+        // Clean index: Exact.
+        assert_eq!(
+            table
+                .supports_filters_pushdown(&[&pk_filter])
+                .expect("pushdown check failed"),
+            vec![TableProviderFilterPushDown::Exact]
+        );
+
+        // After a DML marks the table dirty: Inexact.
+        table.mark_dirty();
+        assert!(table.is_dirty());
+        assert_eq!(
+            table
+                .supports_filters_pushdown(&[&pk_filter])
+                .expect("pushdown check failed"),
+            vec![TableProviderFilterPushDown::Inexact],
+            "dirty index must report Inexact so the predicate is re-applied"
+        );
+    }
+
+    /// A dirty index must not be used in `scan` — the plan must NOT contain an
+    /// `IndexedLookupExec`, and the query must still return the correct row via a
+    /// full `MemTable` scan.
+    #[tokio::test]
+    async fn test_dirty_index_bypassed_in_scan() {
+        let batch = create_large_test_batch(300);
+        let schema = batch.schema();
+        let table = create_test_indexed_table(schema, vec![vec![batch]], vec!["id".to_string()])
+            .expect("failed to create table");
+        table.mark_dirty();
+
+        let ctx = SessionContext::new();
+        ctx.register_table("test", Arc::new(table))
+            .expect("failed to register");
+
+        // The plan must fall back to a full scan, not an indexed point lookup.
+        let plan = explain_plan(&ctx, "SELECT id, name FROM test WHERE id = 42").await;
+        assert!(
+            !plan.contains("IndexedLookupExec"),
+            "dirty index must be bypassed; got plan:\n{plan}"
+        );
+
+        // And the result must still be correct.
+        let batches = ctx
+            .sql("SELECT id, name FROM test WHERE id = 42")
+            .await
+            .expect("query failed")
+            .collect()
+            .await
+            .expect("collect failed");
+        let total_rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
+        assert_eq!(total_rows, 1, "full-scan fallback must return the row");
+        let id_col = batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("expected int64");
+        assert_eq!(id_col.value(0), 42);
+    }
+
+    /// The concrete data-loss repro from issue #11262: insert a new PK through the
+    /// `TableProvider::insert_into` path, then look it up by PK. Before the fix the
+    /// index (never rebuilt after a direct insert) reported an Exact miss and
+    /// returned 0 rows; now the insert marks the table dirty so the lookup falls
+    /// back to a full scan and finds the row. After maintenance the fast path is
+    /// restored.
+    #[tokio::test]
+    async fn test_insert_then_pk_lookup_finds_new_row() {
+        let batch = create_large_test_batch(300); // ids 0..=299
+        let schema = batch.schema();
+        let table = Arc::new(
+            create_test_indexed_table(schema, vec![vec![batch]], vec!["id".to_string()])
+                .expect("failed to create table"),
+        );
+        assert!(!table.is_dirty(), "freshly built index must be clean");
+
+        let ctx = SessionContext::new();
+        ctx.register_table("test", Arc::clone(&table) as Arc<dyn TableProvider>)
+            .expect("failed to register");
+
+        // Insert a row whose key is absent from the (pre-built) index.
+        ctx.sql("INSERT INTO test VALUES (5000, 'name_5000')")
+            .await
+            .expect("insert failed")
+            .collect()
+            .await
+            .expect("insert collect failed");
+
+        assert!(
+            table.is_dirty(),
+            "insert through the provider must mark the index dirty"
+        );
+
+        // The new key must be found despite the index not having been rebuilt.
+        let find_5000 = || async {
+            let batches = ctx
+                .sql("SELECT id FROM test WHERE id = 5000")
+                .await
+                .expect("query failed")
+                .collect()
+                .await
+                .expect("collect failed");
+            batches.iter().map(RecordBatch::num_rows).sum::<usize>()
+        };
+        assert_eq!(
+            find_5000().await,
+            1,
+            "newly inserted PK must be returned (full-scan fallback)"
+        );
+
+        // After maintenance the index is consistent again and the fast path returns.
+        table
+            .perform_maintenance()
+            .await
+            .expect("maintenance failed");
+        assert!(!table.is_dirty(), "maintenance must clear the dirty flag");
+        let pk_filter = col("id").eq(lit(5000_i64));
+        assert_eq!(
+            table
+                .supports_filters_pushdown(&[&pk_filter])
+                .expect("pushdown check failed"),
+            vec![TableProviderFilterPushDown::Exact],
+            "clean index must restore Exact pushdown"
+        );
+        assert_eq!(find_5000().await, 1, "row still found after maintenance");
+    }
+
+    /// A failed rebuild must leave the table dirty so reads keep using the
+    /// full-scan fallback rather than serving stale results.
+    #[tokio::test]
+    async fn test_dirty_persists_until_successful_maintenance() {
+        let batch = create_large_test_batch(300);
+        let schema = batch.schema();
+        let table = create_test_indexed_table(schema, vec![vec![batch]], vec!["id".to_string()])
+            .expect("failed to create table");
+
+        table.mark_dirty();
+        assert!(table.is_dirty());
+
+        // A successful maintenance clears the flag.
+        table
+            .perform_maintenance()
+            .await
+            .expect("maintenance failed");
+        assert!(!table.is_dirty());
     }
 }
