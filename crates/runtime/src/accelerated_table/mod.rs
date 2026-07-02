@@ -55,6 +55,7 @@ use runtime_datafusion::execution_plan::{
 };
 
 use snafu::prelude::*;
+use runtime_metrics::acceleration as metrics;
 use spicepod::metric::Metrics;
 use synchronized_table::SynchronizedTable;
 use tokio::runtime::Handle;

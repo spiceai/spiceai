@@ -38,11 +38,12 @@ use crate::{
     datasets_health_monitor::DatasetsHealthMonitor,
     extension::{Extension, ExtensionFactory},
     flight::RateLimits,
-    metrics, podswatcher,
+    podswatcher,
     secrets::{self, Secrets},
     status, tracers,
 };
 use app::App;
+use runtime_metrics as metrics;
 use spicepod::component::runtime::Runtime as SpicepodRuntime;
 use spicepod::component::runtime::RuntimeReadyState as SpicepodRuntimeReadyState;
 use spicepod::component::runtime::SourceRateControl as SpicepodSourceRateControl;

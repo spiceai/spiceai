@@ -29,8 +29,6 @@ use tokio_util::sync::CancellationToken;
 use datafusion::sql::TableReference;
 use opentelemetry::KeyValue;
 
-use runtime_metrics;
-
 // Re-export ComponentStatus from the shared API types crate
 pub use runtime_api_types::v1::ComponentStatus;
 
@@ -210,7 +208,7 @@ impl RuntimeStatus {
         let worker_name = name.to_string();
         let metric_value = status.discriminant();
         self.update_component_status(&format!("worker:{worker_name}"), status);
-        runtime_metrics::models::STATUS
+        runtime_metrics::workers::STATUS
             .record(metric_value, &[KeyValue::new("worker", worker_name)]);
     }
 

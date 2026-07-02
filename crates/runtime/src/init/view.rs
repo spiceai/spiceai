@@ -20,10 +20,10 @@ use crate::{
     AcceleratorEngineNotAvailableSnafu, AcceleratorInitializationFailedSnafu, LogErrors, Result,
     Runtime, UnableToAttachViewSnafu,
     component::view::{View, ViewBuilder},
-    metrics,
     secrets::Secrets,
     status, view, warn_spaced,
 };
+use runtime_metrics as metrics;
 use app::App;
 use datafusion::sql::{TableReference, parser::DFParser, sqlparser::dialect::PostgreSqlDialect};
 #[cfg(feature = "duckdb")]
