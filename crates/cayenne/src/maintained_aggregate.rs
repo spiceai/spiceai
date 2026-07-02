@@ -2566,8 +2566,7 @@ mod tests {
         let registry =
             MaintainedAggregateRegistry::try_new_with_pk(&[spec], &schema, &[2], usize::MAX)?;
         // Sum = 2 * i64::MAX overflows i64 but fits comfortably in i128.
-        registry
-            .apply_insert_batches(1, &[batch(&[("a", i64::MAX, 1), ("a", i64::MAX, 2)])])?;
+        registry.apply_insert_batches(1, &[batch(&[("a", i64::MAX, 1), ("a", i64::MAX, 2)])])?;
 
         let input =
             MemorySourceConfig::try_new_exec(&[vec![batch(&[])]], Arc::clone(&schema), None)?;
