@@ -66,7 +66,6 @@ use runtime_proto::{
 };
 use runtime_secrets::Secrets;
 use snafu::ResultExt;
-use spicepod::component::runtime::ClusterGrpcClient;
 use std::collections::{HashMap, HashSet};
 use std::env;
 use std::io;
@@ -91,6 +90,112 @@ const SCHEDULER_BACKOFF_MAX: Duration = Duration::from_secs(5);
 /// registering all accelerated tables yet). At ~5s per attempt this gives a
 /// few minutes of patience before the executor startup hard-fails.
 const ALLOCATE_INITIAL_PARTITIONS_MAX_RETRIES: usize = 60;
+
+const CLUSTER_GRPC_HTTP2_KEEP_ALIVE_INTERVAL_SECONDS_PARAM: &str =
+    "cluster_grpc_http2_keep_alive_interval_seconds";
+const CLUSTER_GRPC_KEEP_ALIVE_TIMEOUT_SECONDS_PARAM: &str =
+    "cluster_grpc_keep_alive_timeout_seconds";
+const CLUSTER_GRPC_TIMEOUT_SECONDS_PARAM: &str = "cluster_grpc_timeout_seconds";
+const CLUSTER_GRPC_TCP_KEEP_ALIVE_SECONDS_PARAM: &str = "cluster_grpc_tcp_keep_alive_seconds";
+const CLUSTER_GRPC_CONNECT_TIMEOUT_SECONDS_PARAM: &str = "cluster_grpc_connect_timeout_seconds";
+
+/// `runtime.params` keys with a `cluster_grpc_` prefix that the runtime
+/// recognizes, so they don't false-warn as unknown at startup.
+pub(crate) const CLUSTER_GRPC_RUNTIME_PARAMS: &[&str] = &[
+    CLUSTER_GRPC_HTTP2_KEEP_ALIVE_INTERVAL_SECONDS_PARAM,
+    CLUSTER_GRPC_KEEP_ALIVE_TIMEOUT_SECONDS_PARAM,
+    CLUSTER_GRPC_TIMEOUT_SECONDS_PARAM,
+    CLUSTER_GRPC_TCP_KEEP_ALIVE_SECONDS_PARAM,
+    CLUSTER_GRPC_CONNECT_TIMEOUT_SECONDS_PARAM,
+];
+
+/// gRPC client tuning for internal cluster communication (the executor's
+/// `poll_work` calls to the scheduler), read from the `cluster_grpc_*` keys in
+/// `runtime.params`. The defaults detect a silently-dropped connection within
+/// (ping interval + ping timeout) so it is torn down and reconnected well under
+/// `executor_timeout`. Without this, a stale connection hangs each `poll_work`
+/// for the request timeout, which gaps the `poll_work`-carried heartbeat and
+/// flaps the executor.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ClusterGrpcClientConfig {
+    /// HTTP/2 keep-alive ping interval, in seconds.
+    http2_keep_alive_interval_seconds: u64,
+    /// HTTP/2 keep-alive ping timeout, in seconds: how long to wait for a ping
+    /// ack before declaring the connection dead.
+    keep_alive_timeout_seconds: u64,
+    /// Per-request timeout, in seconds, for cluster gRPC calls.
+    timeout_seconds: u64,
+    /// TCP keep-alive interval, in seconds.
+    tcp_keep_alive_seconds: u64,
+    /// Connection-establishment timeout, in seconds.
+    connect_timeout_seconds: u64,
+}
+
+impl Default for ClusterGrpcClientConfig {
+    fn default() -> Self {
+        Self {
+            http2_keep_alive_interval_seconds: 5,
+            keep_alive_timeout_seconds: 5,
+            timeout_seconds: 10,
+            tcp_keep_alive_seconds: 60,
+            connect_timeout_seconds: 20,
+        }
+    }
+}
+
+impl ClusterGrpcClientConfig {
+    fn from_params(params: &HashMap<String, String>) -> Self {
+        let defaults = Self::default();
+        Self {
+            http2_keep_alive_interval_seconds: parse_cluster_grpc_param(
+                params,
+                CLUSTER_GRPC_HTTP2_KEEP_ALIVE_INTERVAL_SECONDS_PARAM,
+                defaults.http2_keep_alive_interval_seconds,
+            ),
+            keep_alive_timeout_seconds: parse_cluster_grpc_param(
+                params,
+                CLUSTER_GRPC_KEEP_ALIVE_TIMEOUT_SECONDS_PARAM,
+                defaults.keep_alive_timeout_seconds,
+            ),
+            timeout_seconds: parse_cluster_grpc_param(
+                params,
+                CLUSTER_GRPC_TIMEOUT_SECONDS_PARAM,
+                defaults.timeout_seconds,
+            ),
+            tcp_keep_alive_seconds: parse_cluster_grpc_param(
+                params,
+                CLUSTER_GRPC_TCP_KEEP_ALIVE_SECONDS_PARAM,
+                defaults.tcp_keep_alive_seconds,
+            ),
+            connect_timeout_seconds: parse_cluster_grpc_param(
+                params,
+                CLUSTER_GRPC_CONNECT_TIMEOUT_SECONDS_PARAM,
+                defaults.connect_timeout_seconds,
+            ),
+        }
+    }
+}
+
+fn parse_cluster_grpc_param(params: &HashMap<String, String>, key: &str, default: u64) -> u64 {
+    match params.get(key) {
+        None => default,
+        Some(raw) => match raw.parse::<u64>() {
+            Ok(0) => {
+                tracing::warn!(
+                    "runtime.params.{key}={raw:?} must be a positive number of seconds; using default {default}"
+                );
+                default
+            }
+            Ok(value) => value,
+            Err(e) => {
+                tracing::warn!(
+                    "runtime.params.{key}={raw:?} is not a valid number of seconds ({e}); using default {default}"
+                );
+                default
+            }
+        },
+    }
+}
 
 #[derive(Clone)]
 pub enum DistributedNode {
@@ -198,7 +303,7 @@ fn spawn_scheduler_poll_loop(
     readiness_sender: Arc<Mutex<Option<oneshot::Sender<String>>>>,
     poll_now_notify: Option<Arc<Notify>>,
     available_task_slots: Arc<tokio::sync::Semaphore>,
-    grpc_client: ClusterGrpcClient,
+    grpc_client: ClusterGrpcClientConfig,
 ) -> SchedulerPollHandle {
     let cancel = CancellationToken::new();
     let token = cancel.clone();
@@ -400,7 +505,7 @@ fn update_scheduler_pollers(
     readiness_sender: &Arc<Mutex<Option<oneshot::Sender<String>>>>,
     poll_now_notify: Option<&Arc<Notify>>,
     available_task_slots: &Arc<tokio::sync::Semaphore>,
-    grpc_client: &ClusterGrpcClient,
+    grpc_client: &ClusterGrpcClientConfig,
 ) {
     let next_schedulers: HashSet<String> = addresses.into_iter().collect();
 
@@ -1209,16 +1314,8 @@ pub async fn initialize_cluster_executor(
         .boxed()
         .context(FailedToStartClusterExecutorSnafu)?;
 
-    // Tune the executor->scheduler gRPC client (poll_work) so a silently-dropped
-    // connection is detected and reconnected well under `executor_timeout`. Without
-    // this, a stale connection hangs each poll_work for the request timeout, gapping
-    // the poll_work-carried heartbeat and flapping the executor.
-    let scheduler_grpc_client_for_manager: ClusterGrpcClient = app_def
-        .runtime
-        .scheduler
-        .as_ref()
-        .and_then(|s| s.grpc_client.clone())
-        .unwrap_or_default();
+    let scheduler_grpc_client_for_manager =
+        ClusterGrpcClientConfig::from_params(&app_def.runtime.params);
 
     // Resolve executor settings from the scheduler's app definition before the
     // executor Flight server starts.
@@ -2343,6 +2440,40 @@ mod tests {
         CapturedX509Certificate, EcdsaCurve, InMemorySigningKeyPair, KeyAlgorithm, Sign, Signer,
         X509Certificate,
     };
+
+    #[test]
+    fn cluster_grpc_client_config_from_params() {
+        use super::ClusterGrpcClientConfig;
+        use std::collections::HashMap;
+
+        // No params → defaults.
+        let config = ClusterGrpcClientConfig::from_params(&HashMap::new());
+        assert_eq!(config, ClusterGrpcClientConfig::default());
+
+        // Valid overrides apply; invalid and zero values fall back to the default.
+        let params: HashMap<String, String> = [
+            ("cluster_grpc_http2_keep_alive_interval_seconds", "30"),
+            ("cluster_grpc_keep_alive_timeout_seconds", "0"),
+            ("cluster_grpc_timeout_seconds", "not-a-number"),
+            ("cluster_grpc_tcp_keep_alive_seconds", "120"),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+        let config = ClusterGrpcClientConfig::from_params(&params);
+        let defaults = ClusterGrpcClientConfig::default();
+        assert_eq!(config.http2_keep_alive_interval_seconds, 30);
+        assert_eq!(
+            config.keep_alive_timeout_seconds,
+            defaults.keep_alive_timeout_seconds
+        );
+        assert_eq!(config.timeout_seconds, defaults.timeout_seconds);
+        assert_eq!(config.tcp_keep_alive_seconds, 120);
+        assert_eq!(
+            config.connect_timeout_seconds,
+            defaults.connect_timeout_seconds
+        );
+    }
 
     #[test]
     fn distributed_execution_config_disables_single_process_optimizations() {

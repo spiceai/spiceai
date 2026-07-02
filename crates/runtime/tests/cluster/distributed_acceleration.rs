@@ -249,7 +249,6 @@ async fn cluster_distributes_accelerated_table_with_federated_source() -> Result
                 max_partitions_per_executor: 10,
                 partition_discovery_timeout:
                     spicepod::component::runtime::default_partition_discovery_timeout(),
-                grpc_client: None,
             };
 
             let app = AppBuilder::new("repro_federated_source")
@@ -340,7 +339,6 @@ async fn cluster_distributes_accelerated_table_with_column_metadata() -> Result<
                 max_partitions_per_executor: 10,
                 partition_discovery_timeout:
                     spicepod::component::runtime::default_partition_discovery_timeout(),
-                grpc_client: None,
             };
 
             let app = AppBuilder::new("repro_column_metadata")
@@ -1299,6 +1297,5 @@ fn make_named_scheduler_config_with_max_partitions_per_executor(
         max_partitions_per_executor,
         partition_discovery_timeout:
             spicepod::component::runtime::default_partition_discovery_timeout(),
-        grpc_client: None,
     }
 }

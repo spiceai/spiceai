@@ -120,7 +120,6 @@ async fn build_scheduler(
         max_partitions_per_executor: 10,
         partition_discovery_timeout:
             spicepod::component::runtime::default_partition_discovery_timeout(),
-        grpc_client: None,
     };
 
     let app = AppBuilder::new(format!("failover_{name}"))

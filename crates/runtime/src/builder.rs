@@ -124,7 +124,8 @@ const KNOWN_CAYENNE_RUNTIME_PARAMS: &[&str] = &[
 /// Recognized `runtime.params` keys that don't belong to a larger prefix
 /// family (the family lists live next to the code that consumes them:
 /// `KNOWN_CAYENNE_RUNTIME_PARAMS`, `changes::CDC_RUNTIME_PARAMS`,
-/// `http_rate_control::HTTP_RATE_CONTROL_RUNTIME_PARAMS`).
+/// `http_rate_control::HTTP_RATE_CONTROL_RUNTIME_PARAMS`,
+/// `cluster::CLUSTER_GRPC_RUNTIME_PARAMS`).
 const MISC_RUNTIME_PARAMS: &[&str] = &[
     "url_tables",
     "geo",
@@ -148,11 +149,13 @@ fn known_runtime_params() -> Vec<&'static str> {
         KNOWN_CAYENNE_RUNTIME_PARAMS.len()
             + crate::accelerated_table::refresh_task::changes::CDC_RUNTIME_PARAMS.len()
             + dataconnector::http_rate_control::HTTP_RATE_CONTROL_RUNTIME_PARAMS.len()
+            + crate::cluster::CLUSTER_GRPC_RUNTIME_PARAMS.len()
             + MISC_RUNTIME_PARAMS.len(),
     );
     known.extend_from_slice(KNOWN_CAYENNE_RUNTIME_PARAMS);
     known.extend_from_slice(crate::accelerated_table::refresh_task::changes::CDC_RUNTIME_PARAMS);
     known.extend_from_slice(dataconnector::http_rate_control::HTTP_RATE_CONTROL_RUNTIME_PARAMS);
+    known.extend_from_slice(crate::cluster::CLUSTER_GRPC_RUNTIME_PARAMS);
     known.extend_from_slice(MISC_RUNTIME_PARAMS);
     known
 }
