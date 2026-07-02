@@ -220,21 +220,17 @@ impl CommitChange for NoOpCommitter {
     }
 }
 
-/// Construct an empty [`ChangeEnvelope`] whose only job is to flip
-/// `is_dataset_ready=true`. The batch contains zero rows and uses a no-op
-/// committer.
-///
-/// Connectors should emit one of these envelopes once they consider
-/// themselves caught up to the source if no real change events are available
-/// to carry the ready signal. See the [`ChangesStream`] documentation for the
-/// readiness contract.
-pub fn build_ready_signal_envelope(schema: &SchemaRef) -> Result<ChangeEnvelope, ChangeBatchError> {
+/// Build a zero-row [`ChangeBatch`] whose data struct is all-nullable so it
+/// coalesces (concats) with the truncate/snapshot/live change batches without an
+/// Arrow "arrays of different data types" error. Shared by the ready-signal and
+/// heartbeat envelope builders.
+fn empty_change_batch(schema: &SchemaRef) -> Result<ChangeBatch, ChangeBatchError> {
     // Normalize fields to all-nullable so this empty barrier batch's struct type
     // matches the truncate/snapshot/live change batches it coalesces with. The
     // dataset schema may declare non-null columns (e.g. a `nullable: false`
     // primary key in the spicepod), but every other change batch uses the
     // nullable schema; without this, concat fails ("arrays of different data
-    // types") when the ready signal is coalesced with real data.
+    // types") when the batch is coalesced with real data.
     let nullable_schema = Schema::new(
         schema
             .fields()
@@ -266,12 +262,40 @@ pub fn build_ready_signal_envelope(schema: &SchemaRef) -> Result<ChangeEnvelope,
         vec![op_array, Arc::new(pk_list), Arc::new(data_struct)],
     )
     .context(ArrowSnafu)?;
-    let batch = ChangeBatch::try_new(record)?;
+    ChangeBatch::try_new(record)
+}
 
+/// Construct an empty [`ChangeEnvelope`] whose only job is to flip
+/// `is_dataset_ready=true`. The batch contains zero rows and uses a no-op
+/// committer.
+///
+/// Connectors should emit one of these envelopes once they consider themselves
+/// caught up to the source if no real change events are available to carry the
+/// ready signal. See the [`ChangesStream`] documentation for the readiness
+/// contract.
+pub fn build_ready_signal_envelope(schema: &SchemaRef) -> Result<ChangeEnvelope, ChangeBatchError> {
     Ok(ChangeEnvelope::new(
         Box::new(NoOpCommitter),
-        batch,
+        empty_change_batch(schema)?,
         true, // is_dataset_ready
+    ))
+}
+
+/// Build a zero-row "heartbeat" envelope carrying only an upstream commit
+/// timestamp (`source_commit_ts_ms`, ms since the Unix epoch). A CDC source emits
+/// it while its stream is idle (caught up to the source's change-log head) so the
+/// replication-lag gauge (`now - source_commit_ts_ms`) keeps reading ~0 when
+/// caught up instead of freezing at the last real event's age. It carries no
+/// rows, uses a [`NoOpCommitter`] (advances no source offset), and is NOT a
+/// readiness signal.
+pub fn build_heartbeat_envelope(
+    schema: &SchemaRef,
+    source_commit_ts_ms: i64,
+) -> Result<ChangeEnvelope, ChangeBatchError> {
+    Ok(ChangeEnvelope::new(
+        Box::new(NoOpCommitter),
+        empty_change_batch(schema)?.with_source_commit_ts_ms(Some(source_commit_ts_ms)),
+        false, // not a readiness signal
     ))
 }
 
