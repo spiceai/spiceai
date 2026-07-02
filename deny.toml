@@ -47,6 +47,11 @@ ignore = [
   # marked it unmaintained and there is no safe upgrade (the suggested `skrifa`
   # alternative is not wired through `lopdf`/`pdf-extract`). Owner: document_parse.
   "RUSTSEC-2026-0192",
+  # `azure_core`, `calamine`, `reqsign`, `opendal`, and `object_store` all pull
+  # `quick-xml` < 0.41.0; no safe upgrade is available yet. Owner: data connectors/runtime.
+  "RUSTSEC-2026-0194",
+  # Same quick-xml < 0.41.0 chain as RUSTSEC-2026-0194. Owner: data connectors/runtime.
+  "RUSTSEC-2026-0195",
 ]
 
 [bans]
