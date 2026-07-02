@@ -16,8 +16,6 @@ limitations under the License.
 
 //! Data structures for Cayenne metadata.
 
-use std::num::NonZeroUsize;
-
 use arrow_schema::SchemaRef;
 use datafusion_table_providers::util::on_conflict::OnConflict;
 use serde::{Deserialize, Serialize};
@@ -715,34 +713,6 @@ pub struct VortexConfig {
     /// [`crate::provider::table::BAKE_DELETION_INDEX_TRIGGER`]).
     #[serde(default = "default_bake_deletion_index_trigger")]
     pub bake_deletion_index_trigger: usize,
-    /// Per-table threshold: number of orphan-eligible key-based deletion vectors
-    /// (count of `cayenne_delete_file` rows, NOT masked rows) that must accumulate
-    /// on a single table before its cleanup sweep runs. A key DV becomes
-    /// orphan-eligible only once **time-based retention** empties the protected
-    /// snapshot(s) it shadowed, raising the surviving-sequence floor above its
-    /// delete sequence so it shadows nothing (issue #9388). Without a retention
-    /// policy no DVs are ever orphaned and the sweep is a no-op.
-    ///
-    /// This governs ONLY the orphaned tail. The live (not-yet-orphaned) DV set —
-    /// DVs still shadowing rows in un-emptied snapshots — is bounded separately by
-    /// compaction's seq-prefix bake (see [`crate::provider::memory_account`]: "the
-    /// real bound on deletions is compaction"), not by this knob.
-    ///
-    /// `Some(20)` is the default. `None` disables cleanup entirely — no
-    /// background sweep is spawned, so the file-based DELETE path acquires no
-    /// extra locks and runs no catalog scan (the pre-feature behavior). The
-    /// `NonZeroUsize` type makes a misconfigured `0` unrepresentable; the spicepod
-    /// param (`cayenne_orphaned_dv_cleanup_min_files`) maps `0` to `None`
-    /// (disabled) and, when left unset, falls back to this default (`20`). A
-    /// larger value sweeps less often
-    /// (cheaper, but orphaned `.arrow` files linger on disk longer); a smaller
-    /// value reclaims disk sooner. Each orphaned `.arrow` file's size scales with
-    /// the number of deletions it records, so lingering disk ≈
-    /// `n_tables × threshold × avg_dv_size` (`avg_dv_size` was ~63 KiB, up to
-    /// ~870 KiB, in an SF-100 CH-benCHmark sample). The sweep is lock-free and
-    /// runs off the write path on the dedicated compaction runtime, so this only
-    /// trades sweep frequency against lingering disk — never ingest latency.
-    pub orphaned_dv_cleanup_min_files: Option<NonZeroUsize>,
     /// Number of protected snapshots that can accumulate before snapshot-maintenance
     /// compaction is eligible to run. Kept separate from `compaction_trigger_files`
     /// so small-file compaction tuning does not silently change scan amplification
@@ -1255,12 +1225,6 @@ impl Default for VortexConfig {
             write_concurrency: None,
             compaction_trigger_files: default_compaction_trigger_files(),
             bake_deletion_index_trigger: default_bake_deletion_index_trigger(),
-            // Orphaned-DV cleanup enabled by default at a per-table threshold of 20
-            // (retention-only: a no-op until time-based retention orphans DVs; the
-            // sweep is lock-free/off-path, so enabling it does not affect ingest —
-            // validated no-regression on CH-benCHmark SF-1000). Set the spicepod
-            // param `cayenne_orphaned_dv_cleanup_min_files` to `0` to disable.
-            orphaned_dv_cleanup_min_files: NonZeroUsize::new(20),
             compaction_trigger_protected_snapshots: default_compaction_trigger_protected_snapshots(
             ),
             compaction_trigger_snapshot_age_ms: default_compaction_trigger_snapshot_age_ms(),
