@@ -74,7 +74,7 @@ use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::net::TcpListener;
 use tokio::sync::{Notify, RwLock, oneshot};
 use tokio_util::sync::CancellationToken;
@@ -494,10 +494,22 @@ async fn fetch_scheduler_membership(
     }
 }
 
+/// How long a scheduler must be continuously absent from the registry before
+/// its poller is cancelled. Registry entries can flap when a scheduler's
+/// heartbeat write stalls briefly (e.g. an object-store blip): the entry goes
+/// stale and reappears seconds later. Cancelling the poller on the first
+/// missed observation destroys its undelivered task-status buffer and kills
+/// its in-flight tasks, which leaves completed stages unreported and wedges
+/// the running job. Polling a genuinely-dead scheduler for the grace period is
+/// harmless (the poll fails and backs off), so err on the side of keeping the
+/// poller alive.
+const SCHEDULER_POLLER_REMOVAL_GRACE: Duration = Duration::from_secs(60);
+
 #[expect(clippy::too_many_arguments)]
 fn update_scheduler_pollers(
     pollers: &mut HashMap<String, SchedulerPollHandle>,
     known_schedulers: &mut HashSet<String>,
+    scheduler_missing_since: &mut HashMap<String, Instant>,
     addresses: Vec<String>,
     client_tls_config: Option<&ClientTlsConfig>,
     executor: &Arc<Executor>,
@@ -509,14 +521,29 @@ fn update_scheduler_pollers(
 ) {
     let next_schedulers: HashSet<String> = addresses.into_iter().collect();
 
+    // A scheduler observed in the registry again is no longer missing.
+    scheduler_missing_since.retain(|address, _| !next_schedulers.contains(address));
+
     let added: Vec<String> = next_schedulers
         .difference(known_schedulers)
         .cloned()
         .collect();
-    let removed: Vec<String> = known_schedulers
-        .difference(&next_schedulers)
-        .cloned()
-        .collect();
+
+    let mut removed: Vec<String> = Vec::new();
+    let mut still_in_grace: Vec<String> = Vec::new();
+    for address in known_schedulers.difference(&next_schedulers) {
+        let missing_since = scheduler_missing_since
+            .entry(address.clone())
+            .or_insert_with(Instant::now);
+        if missing_since.elapsed() >= SCHEDULER_POLLER_REMOVAL_GRACE {
+            removed.push(address.clone());
+        } else {
+            still_in_grace.push(address.clone());
+        }
+    }
+    for address in &removed {
+        scheduler_missing_since.remove(address);
+    }
 
     if !added.is_empty() || !removed.is_empty() {
         let added_list = added.join(",");
@@ -550,6 +577,9 @@ fn update_scheduler_pollers(
     }
 
     *known_schedulers = next_schedulers;
+    // Schedulers still within the removal grace keep their pollers and remain
+    // "known" so a registry re-appearance is not treated as a new scheduler.
+    known_schedulers.extend(still_in_grace);
 }
 
 pub(crate) mod accelerated_partition_provider;
@@ -1587,6 +1617,7 @@ pub async fn initialize_cluster_executor(
     let poll_manager = tokio::spawn(async move {
         let mut pollers: HashMap<String, SchedulerPollHandle> = HashMap::new();
         let mut known_schedulers: HashSet<String> = HashSet::new();
+        let mut scheduler_missing_since: HashMap<String, Instant> = HashMap::new();
 
         // Initialize control stream manager for metrics collection
         let mut control_stream_manager = ControlStreamManager::new(
@@ -1619,6 +1650,7 @@ pub async fn initialize_cluster_executor(
         update_scheduler_pollers(
             &mut pollers,
             &mut known_schedulers,
+            &mut scheduler_missing_since,
             current_addresses,
             client_tls_config_for_manager.as_ref(),
             &executor_for_manager,
@@ -1662,6 +1694,7 @@ pub async fn initialize_cluster_executor(
                         update_scheduler_pollers(
                             &mut pollers,
                             &mut known_schedulers,
+                            &mut scheduler_missing_since,
                             addresses,
                             client_tls_config_for_manager.as_ref(),
                             &executor_for_manager,
