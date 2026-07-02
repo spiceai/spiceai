@@ -2162,9 +2162,26 @@ mod tests {
         .eager_aggregation_min_reduction_factor(Some(8))
         .eager_aggregation_max_pushed_groups(Some(1024))
         .build();
-        let options = df_tuned.ctx.state().config().options().clone();
-        assert_eq!(options.optimizer.eager_aggregation_min_reduction_factor, 8);
-        assert_eq!(options.optimizer.eager_aggregation_max_pushed_groups, 1024);
+        assert_eq!(
+            df_tuned
+                .ctx
+                .state()
+                .config()
+                .options()
+                .optimizer
+                .eager_aggregation_min_reduction_factor,
+            8
+        );
+        assert_eq!(
+            df_tuned
+                .ctx
+                .state()
+                .config()
+                .options()
+                .optimizer
+                .eager_aggregation_max_pushed_groups,
+            1024
+        );
     }
 
     #[test]
