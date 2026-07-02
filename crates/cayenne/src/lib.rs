@@ -69,6 +69,12 @@ pub mod logical_optimizer;
 pub mod maintained_aggregate;
 pub mod metadata;
 pub mod metastore;
+
+/// Z-order clustering kernel, re-exported for benchmarks only. Not a stable API.
+#[doc(hidden)]
+pub mod __bench_zorder {
+    pub use crate::provider::zorder::zorder_keys;
+}
 pub mod optimizer_rules;
 #[cfg(feature = "partition-table-provider")]
 pub(crate) mod partition_creator;

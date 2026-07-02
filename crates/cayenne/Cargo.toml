@@ -125,6 +125,10 @@ libc = "0.2"
 
 [[bench]]
 harness = false
+name = "zorder_clustering"
+
+[[bench]]
+harness = false
 name = "metastore_operations"
 
 [[bench]]

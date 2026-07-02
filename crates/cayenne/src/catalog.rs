@@ -21,7 +21,7 @@ limitations under the License.
 //! (`SQLite`, Turso, etc.).
 
 use super::metadata::{
-    CreateTableOptions, DeleteFile, InlinedData, InlinedDataStats, InlinedDelete,
+    ColdTierFile, CreateTableOptions, DeleteFile, InlinedData, InlinedDataStats, InlinedDelete,
     PartitionMetadata, SnapshotFile, SnapshotFileStatistics, TableMetadata, TableStatistics,
 };
 use arrow_schema::SchemaRef;
@@ -680,6 +680,28 @@ pub trait MetadataCatalog: Send + Sync {
 
     /// Clear all manifest rows for a table.
     async fn clear_snapshot_files(&self, table_id: &str) -> CatalogResult<()>;
+
+    /// List every cold-tier file for a table (the cold scan's file source).
+    /// Read under the scan's listing fence so the cold file set is captured
+    /// consistently with the warm snapshot and deletion snapshot.
+    async fn list_cold_tier_files(&self, table_id: &str) -> CatalogResult<Vec<ColdTierFile>>;
+
+    /// Atomically graduate the table's durable content to the cold tier. In ONE
+    /// transaction: insert the cold-file rows AND perform the overwrite clear
+    /// (drop the warm `cayenne_snapshot_file` manifest, delete files, insert
+    /// records, inline data, snapshot sequences, per-file/table stats, pk index)
+    /// + repoint `current_snapshot_id` to `new_snapshot_id` (a fresh empty warm
+    /// snapshot). All-or-nothing, so a crash mid-promotion never leaves rows in
+    /// BOTH tiers (double-count) or NEITHER (loss). The deletion state is cleared
+    /// because the cold files were written with all deletes already applied
+    /// (single-version) — exactly the semantics of `commit_overwrite`, whose new
+    /// content here lives on the cold object store instead of a warm snapshot.
+    async fn commit_overwrite_to_cold(
+        &self,
+        table_id: &str,
+        new_snapshot_id: &str,
+        cold_files: &[ColdTierFile],
+    ) -> CatalogResult<()>;
 
     /// Upsert the persisted primary-key existence index (a bloom checkpoint),
     /// tagged with the snapshot id it covers. Stored in the metastore so it is
