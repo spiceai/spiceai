@@ -199,6 +199,7 @@ jobs:
             --disable-progress-bars \
             --validate=${{ github.event.inputs.validate_results }} \
             --metrics \
+            --disable-caching \
             --scale-factor ${{ github.event.inputs.scale_factor }}
         env:
           S3_ENDPOINT: ${{ secrets.TEST_MINIO_ENDPOINT }}
@@ -263,6 +264,7 @@ jobs:
             --disable-progress-bars \
             --validate=${{ github.event.inputs.validate_results }} \
             --metrics \
+            --disable-caching \
             --scale-factor ${{ github.event.inputs.scale_factor }}
         env:
           S3_ENDPOINT: ${{ secrets.TEST_MINIO_ENDPOINT }}
