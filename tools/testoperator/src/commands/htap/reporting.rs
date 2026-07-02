@@ -74,6 +74,10 @@ pub(super) fn emit_replication_metrics(
     for (metric_name, map) in gauge_metrics {
         if let Some(samples) = metrics.samples.get(metric_name) {
             for sample in samples {
+                // Skip NaN samples so the map holds the last observed *real* value
+                if sample.value.is_nan() {
+                    continue;
+                }
                 let dataset = sample
                     .labels
                     .get("name")
@@ -99,6 +103,36 @@ pub(super) fn emit_replication_metrics(
         }
     }
 
+    // Full lag_ms time series per dataset (every scraped sample), used to compute
+    // P99 and max over the under-load window. The last-value gauge above only
+    // captures the pipeline state when the scraper stopped, which understates the
+    // worst lag seen during the run.
+    let mut lag_ms_series: BTreeMap<String, Vec<f64>> = BTreeMap::new();
+    if let Some(samples) = metrics.samples.get("dataset_postgres_replication_lag_ms") {
+        for sample in samples {
+            if sample.value.is_nan() {
+                continue;
+            }
+            let dataset = sample
+                .labels
+                .get("name")
+                .cloned()
+                .unwrap_or_else(|| "unknown".to_string());
+            lag_ms_series.entry(dataset).or_default().push(sample.value);
+        }
+    }
+    // (p99, max) of the lag_ms series for a dataset, or (0, 0) if no samples.
+    let lag_p99_max = |dataset: &String| -> (f64, f64) {
+        match lag_ms_series.get(dataset) {
+            Some(values) if !values.is_empty() => {
+                let mut sorted = values.clone();
+                sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+                (percentile(&sorted, 0.99), *sorted.last().unwrap_or(&0.0))
+            }
+            _ => (0.0, 0.0),
+        }
+    };
+
     if lag_ms.is_empty()
         && lag_bytes.is_empty()
         && inserts.is_empty()
@@ -113,9 +147,11 @@ pub(super) fn emit_replication_metrics(
     println!("\nReplication Metrics ({phase})");
     // Header
     println!(
-        "  {:<14} {:>10} {:>12} {:>10} {:>10} {:>10} {:>10} {:>10}",
+        "  {:<14} {:>10} {:>10} {:>10} {:>12} {:>10} {:>10} {:>10} {:>10} {:>10}",
         "dataset",
         "lag_ms",
+        "lag_p99_ms",
+        "lag_max_ms",
         "lag_bytes",
         "inserts",
         "updates",
@@ -135,8 +171,11 @@ pub(super) fn emit_replication_metrics(
         .collect();
 
     let mut worst_lag_ms: f64 = 0.0;
+    let mut worst_lag_p99: f64 = 0.0;
+    let mut worst_lag_max: f64 = 0.0;
     for dataset in &all_datasets {
         let l_ms = lag_ms.get(*dataset).copied().unwrap_or(0.0);
+        let (l_p99, l_max) = lag_p99_max(dataset);
         let l_bytes = lag_bytes.get(*dataset).copied().unwrap_or(0.0);
         let ins = inserts.get(*dataset).copied().unwrap_or(0.0);
         let upd = updates.get(*dataset).copied().unwrap_or(0.0);
@@ -144,22 +183,32 @@ pub(super) fn emit_replication_metrics(
         let recv = recv_errors.get(*dataset).copied().unwrap_or(0.0);
         let reconn = reconnects.get(*dataset).copied().unwrap_or(0.0);
         println!(
-            "  {dataset:<14} {l_ms:>10.0} {l_bytes:>12.0} {ins:>10.0} {upd:>10.0} {del:>10.0} {recv:>10.0} {reconn:>10.0}",
+            "  {dataset:<14} {l_ms:>10.0} {l_p99:>10.0} {l_max:>10.0} {l_bytes:>12.0} {ins:>10.0} {upd:>10.0} {del:>10.0} {recv:>10.0} {reconn:>10.0}",
         );
 
         if record_telemetry {
-            crate::metrics::REPLICATION_LAG_MS
-                .record(l_ms, &[KeyValue::new("dataset", (*dataset).clone())]);
+            let attributes = [KeyValue::new("dataset", (*dataset).clone())];
+            crate::metrics::REPLICATION_LAG_MS.record(l_ms, &attributes);
+            crate::metrics::REPLICATION_LAG_P99_MS.record(l_p99, &attributes);
+            crate::metrics::REPLICATION_LAG_MAX_MS.record(l_max, &attributes);
         }
         if l_ms > worst_lag_ms {
             worst_lag_ms = l_ms;
         }
+        if l_p99 > worst_lag_p99 {
+            worst_lag_p99 = l_p99;
+        }
+        if l_max > worst_lag_max {
+            worst_lag_max = l_max;
+        }
     }
     println!();
 
-    // Headline: worst replication lag across all datasets.
+    // Headline: worst replication lag across all datasets (last value, P99, and max).
     if record_telemetry {
         crate::metrics::REPLICATION_LAG_MS.record(worst_lag_ms, &[]);
+        crate::metrics::REPLICATION_LAG_P99_MS.record(worst_lag_p99, &[]);
+        crate::metrics::REPLICATION_LAG_MAX_MS.record(worst_lag_max, &[]);
     }
 }
 
