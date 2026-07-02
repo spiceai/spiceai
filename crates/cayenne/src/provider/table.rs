@@ -4779,14 +4779,19 @@ impl CayenneTableProvider {
     /// operation, which is what lets the highest-volume tables keep the source WAL
     /// drained under load.
     ///
-    /// Each unit uses `target_partitions = 1`: one output file, one encode permit,
-    /// so the N units fit the process-global encode budget concurrently (rather
-    /// than each fanning out internally and over-subscribing it) and the
-    /// per-checkpoint file count stays ~N (compaction folds them). Filenames never
-    /// collide — every `write_to_snapshot` mints a fresh `write_id` (uuid) prefix
-    /// for its files — so N writes into one dir produce disjoint files, all
-    /// discovered by the post-write listing refresh (the commit is dir-based).
-    /// Returns the summed file count and the merged column-stats accumulator.
+    /// Each unit is capped at `ceil(unit_bytes / target_size)` encode shards, so a
+    /// shard no larger than one target Vortex file stays a SINGLE file+permit (the
+    /// common case — the N units then fit the process-global encode budget
+    /// concurrently rather than each fanning out internally and over-subscribing it,
+    /// and the per-checkpoint file count stays ~N, which compaction folds), while a
+    /// shard LARGER than one target file rolls into just enough files to honor the
+    /// target size (never one oversized file). The parallelism is the N spawned
+    /// tasks, NOT intra-shard fan-out — the single coordinated stream serializes
+    /// that (the very cost this restructure avoids). Filenames never collide — every
+    /// `write_to_snapshot` mints a fresh `write_id` (uuid) prefix for its files — so
+    /// N writes into one dir produce disjoint files, all discovered by the
+    /// post-write listing refresh (the commit is dir-based). Returns the summed file
+    /// count and the merged column-stats accumulator.
     async fn encode_snapshot_shards_concurrently(
         &self,
         snapshot_id: &str,
@@ -4802,11 +4807,11 @@ impl CayenneTableProvider {
             let snapshot_id = snapshot_id.to_string();
             let schema = Arc::clone(schema);
             handles.push(tokio::spawn(async move {
-                let estimated_bytes = Some(
-                    unit.iter()
-                        .map(|b| b.get_array_memory_size() as u64)
-                        .fold(0u64, u64::saturating_add),
-                );
+                let unit_bytes = unit
+                    .iter()
+                    .map(|b| b.get_array_memory_size() as u64)
+                    .fold(0u64, u64::saturating_add);
+                let estimated_bytes = Some(unit_bytes);
                 let exec = datafusion::datasource::memory::MemorySourceConfig::try_new_exec(
                     &[unit],
                     Arc::clone(&schema),
@@ -4814,16 +4819,21 @@ impl CayenneTableProvider {
                 )?;
                 let ctx = provider.create_session_context();
                 let stream = datafusion_physical_plan::execute_stream(exec, ctx.task_ctx())?;
-                // `target_partitions = 1`: one file + one encode permit per shard.
-                // The parallelism is the N spawned tasks, NOT internal fan-out
-                // (which the single coordinated stream serializes — the very cost
-                // this restructure avoids).
+                // Cap this shard's encode fan-out so no output file exceeds the
+                // target Vortex file size: a shard no larger than one target file
+                // stays a SINGLE file (the common case — the cross-shard
+                // parallelism is the N spawned tasks, not intra-shard fan-out, which
+                // the single coordinated stream serializes), while a larger shard
+                // rolls into `ceil(bytes / target)` files instead of one oversized
+                // file. `write_to_snapshot` clamps the actual fan-out to the budget.
+                let shard_target_partitions =
+                    Self::shard_encode_target_partitions(unit_bytes, target_size_bytes);
                 provider
                     .write_to_snapshot(
                         stream,
                         target_size_bytes,
                         &snapshot_id,
-                        1,
+                        shard_target_partitions,
                         estimated_bytes,
                         super::delta_encoding::WriteClass::Delta,
                     )
@@ -4845,6 +4855,26 @@ impl CayenneTableProvider {
             merged_stats.merge_from(stats.as_ref());
         }
         Ok((total_files, merged_stats))
+    }
+
+    /// The per-shard encode fan-out for the concurrent checkpoint encode: how many
+    /// files a shard of `unit_bytes` (uncompressed Arrow) must split into so no
+    /// output file exceeds the target Vortex file size — `ceil(unit_bytes / target)`,
+    /// min 1. A shard no larger than one target file stays a single file; a larger
+    /// shard rolls into just enough files to honor the target. Arrow over-counts vs
+    /// the compressed on-disk size, the safe direction (files land under the target
+    /// with margin). `write_to_snapshot` further clamps the result to the write
+    /// budget. `target_size_bytes == 0` means size rolling is DISABLED (one file per
+    /// write is intended — see the config warning), so the shard stays a single
+    /// file, matching the pre-roll behavior.
+    fn shard_encode_target_partitions(unit_bytes: u64, target_size_bytes: usize) -> usize {
+        if target_size_bytes == 0 {
+            return 1;
+        }
+        let target = u64::try_from(target_size_bytes).unwrap_or(u64::MAX);
+        usize::try_from(unit_bytes.div_ceil(target))
+            .unwrap_or(usize::MAX)
+            .max(1)
     }
 
     /// Effective number of concurrent shard writers the Vortex sink will use for
@@ -17094,8 +17124,7 @@ impl CayenneTableProvider {
                 // extra unit. Filenames never collide (each write mints a fresh
                 // `write_id` uuid prefix) and the commit below is dir-based, so the N
                 // files are all discovered by the post-write listing refresh.
-                let mut units: Vec<Vec<RecordBatch>> =
-                    Vec::with_capacity(shard_groups.len() + 1);
+                let mut units: Vec<Vec<RecordBatch>> = Vec::with_capacity(shard_groups.len() + 1);
                 if !inline_batches.is_empty() {
                     units.push(inline_batches);
                 }
@@ -24551,6 +24580,31 @@ mod tests {
             trigger_after - trigger_before >= non_empty_shards,
             "checkpoint file count ({non_empty_shards}) must advance new_files_since_last_compaction ({trigger_before} -> {trigger_after})"
         );
+    }
+
+    /// TARGET FILE SIZE HONORED per shard. The concurrent per-shard checkpoint
+    /// encode caps each shard's fan-out at `ceil(unit_bytes / target)`, so a shard
+    /// larger than one target Vortex file rolls into multiple target-sized files
+    /// instead of one oversized file (the `target_partitions = 1` hazard). This
+    /// unit-tests the fan-out arithmetic directly; the end-to-end roll of a large
+    /// write into multiple files is covered by
+    /// `protected_snapshot_subset_compaction_parallelizes_large_merges`.
+    #[test]
+    fn shard_encode_target_partitions_honors_target_file_size() {
+        let mb: usize = 1024 * 1024;
+        let f = CayenneTableProvider::shard_encode_target_partitions;
+        // A shard no larger than one target file stays a SINGLE file (common case).
+        assert_eq!(f(0, 512 * mb), 1);
+        assert_eq!(f((300 * mb) as u64, 512 * mb), 1);
+        assert_eq!(f((512 * mb) as u64, 512 * mb), 1);
+        // A shard larger than one target file rolls into ceil(bytes / target) files
+        // — never one oversized file.
+        assert_eq!(f((512 * mb + 1) as u64, 512 * mb), 2);
+        assert_eq!(f((1024 * mb) as u64, 512 * mb), 2);
+        assert_eq!(f((1024 * mb + 1) as u64, 512 * mb), 3);
+        // A 0 target disables size rolling -> a single file, never a div-by-zero.
+        assert_eq!(f((10 * mb) as u64, 0), 1);
+        assert!(f(0, 0) >= 1);
     }
 
     /// §3.5 SHARD-KEY GUARD — the one normative spec fix. For an Int64 PK, the

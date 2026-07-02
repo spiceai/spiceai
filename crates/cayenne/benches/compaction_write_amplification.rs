@@ -97,7 +97,13 @@ fn delta_batch(delta_index: usize) -> RecordBatch {
     let ids: Vec<i64> = (0..ROWS_PER_DELTA as i64).map(|i| base + i).collect();
     let values: Vec<i64> = ids.iter().map(|id| id * 7).collect();
     let names: Vec<String> = (0..ROWS_PER_DELTA)
-        .map(|i| format!("row_prefix_{:03}_{}", i % 64, entropy_suffix(base as usize + i)))
+        .map(|i| {
+            format!(
+                "row_prefix_{:03}_{}",
+                i % 64,
+                entropy_suffix(base as usize + i)
+            )
+        })
         .collect();
     RecordBatch::try_new(
         test_schema(),
@@ -130,7 +136,10 @@ struct Fixture {
 /// absorbed inline — the file-tier analog of the mem-tier checkpoint's light
 /// delta. The background compactor is pinned far out so only the explicit
 /// `compact_protected_snapshots_subset` call runs.
-async fn setup_table(table_name: &str, runtime_env: Arc<datafusion::execution::runtime_env::RuntimeEnv>) -> Fixture {
+async fn setup_table(
+    table_name: &str,
+    runtime_env: Arc<datafusion::execution::runtime_env::RuntimeEnv>,
+) -> Fixture {
     let temp_dir = tempfile::tempdir().expect("temp dir");
     let data_path = temp_dir.path().join("data");
     tokio::fs::create_dir_all(&data_path)
@@ -148,7 +157,9 @@ async fn setup_table(table_name: &str, runtime_env: Arc<datafusion::execution::r
             table_name: table_name.to_string(),
             schema: test_schema(),
             primary_key: vec!["id".to_string()],
-            on_conflict: Some(OnConflict::Upsert(ColumnReference::new(vec!["id".to_string()]))),
+            on_conflict: Some(OnConflict::Upsert(ColumnReference::new(vec![
+                "id".to_string(),
+            ]))),
             base_path: data_path.to_string_lossy().to_string(),
             partition_column: None,
             vortex_config: VortexConfig {
@@ -228,7 +239,10 @@ fn vortex_bytes_and_files(dir: &Path) -> (u64, usize) {
 }
 
 /// Accumulate `DELTAS` light protected snapshots into a fresh table.
-async fn accumulate_deltas(table: &str, runtime_env: Arc<datafusion::execution::runtime_env::RuntimeEnv>) -> Fixture {
+async fn accumulate_deltas(
+    table: &str,
+    runtime_env: Arc<datafusion::execution::runtime_env::RuntimeEnv>,
+) -> Fixture {
     let fixture = setup_table(table, runtime_env).await;
     for d in 0..DELTAS {
         let rows = write_delta(&fixture, delta_batch(d)).await;
@@ -272,12 +286,25 @@ fn bench_compaction_write_amplification(c: &mut Criterion) {
     let full_ratio = full_bytes as f64 / denom;
     #[expect(clippy::cast_precision_loss)]
     let write_amp = (light_bytes + full_bytes) as f64 / denom;
-    eprintln!("{:<22} {:>14} {:>8} {:>10}", "phase", "vortex_bytes", "files", "bytes/logical");
-    eprintln!("{:<22} {light_bytes:>14} {light_files:>8} {light_ratio:>10.3}", "light deltas (K)");
-    eprintln!("{:<22} {full_bytes:>14} {full_files:>8} {full_ratio:>10.3}", "full compacted (1)");
+    eprintln!(
+        "{:<22} {:>14} {:>8} {:>10}",
+        "phase", "vortex_bytes", "files", "bytes/logical"
+    );
+    eprintln!(
+        "{:<22} {light_bytes:>14} {light_files:>8} {light_ratio:>10.3}",
+        "light deltas (K)"
+    );
+    eprintln!(
+        "{:<22} {full_bytes:>14} {full_files:>8} {full_ratio:>10.3}",
+        "full compacted (1)"
+    );
     eprintln!(
         "write-amp (light+full)/logical = {write_amp:.3}  |  light-vs-full on-disk = {:.2}x\n",
-        if full_bytes > 0 { light_bytes as f64 / full_bytes as f64 } else { 0.0 }
+        if full_bytes > 0 {
+            light_bytes as f64 / full_bytes as f64
+        } else {
+            0.0
+        }
     );
 
     // --- Timed: the full-cascade re-encode (compaction duration). Throughput in
@@ -292,7 +319,10 @@ fn bench_compaction_write_amplification(c: &mut Criterion) {
             || {
                 lane += 1;
                 let ctx = SessionContext::new();
-                runtime.block_on(accumulate_deltas(&format!("wamp_{lane}"), ctx.runtime_env()))
+                runtime.block_on(accumulate_deltas(
+                    &format!("wamp_{lane}"),
+                    ctx.runtime_env(),
+                ))
             },
             |fixture| {
                 let merged = runtime.block_on(
