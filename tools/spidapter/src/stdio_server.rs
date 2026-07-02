@@ -1048,8 +1048,20 @@ impl Handler for SpidapterHandler {
                 .map(str::trim)
                 .filter(|s| !s.is_empty())
         {
-            eprintln!("[stdio] Using scenario spicepod (skipping generation): {pod}");
-            setup_config.spicepod_path = Some(pod.to_string());
+            // Resolve a relative scenario `spicepod:` against the scenario base path
+            // (where the scenario YAML and its `pods/` live) so resolution doesn't
+            // depend on the process CWD. Absolute paths — the common case:
+            // `MONGO_SPICEPOD_PATH` locally or the in-image `/app/scenarios/...` path —
+            // are used as-is. `load_spicepod_from_path` then reads the resolved path.
+            let pod_path = match self.args.scenario_base_path.as_deref() {
+                Some(base) if std::path::Path::new(pod).is_relative() => std::path::Path::new(base)
+                    .join(pod)
+                    .to_string_lossy()
+                    .into_owned(),
+                _ => pod.to_string(),
+            };
+            eprintln!("[stdio] Using scenario spicepod (skipping generation): {pod_path}");
+            setup_config.spicepod_path = Some(pod_path);
         }
         // For non-direct sources, still honour the env AWS_REGION override.
         setup_config.aws_region_override = std::env::var("AWS_REGION").ok();
@@ -2447,9 +2459,11 @@ mod tests {
         );
     }
 
-    /// The bundled tuned/adaptive Mongo CDC pods must parse through the same loader
-    /// used at runtime (`load_spicepod_from_path`), have all 8 TPC-H datasets, and
-    /// carry Cayenne CDC acceleration. Guards against a param key / column type /
+    /// The bundled tuned/adaptive Mongo CDC pods must parse through
+    /// `parse_and_rename_spicepod` — the parser `load_spicepod_from_path` applies
+    /// after reading the file — have all 8 TPC-H datasets, and carry Cayenne CDC
+    /// acceleration. The pod bytes are embedded with `include_str!` so the test
+    /// covers exactly the committed files. Guards against a param key / column type /
     /// structure that the `SpicepodDefinition` deserializer rejects.
     #[test]
     fn bundled_mongo_spicepods_parse() {
