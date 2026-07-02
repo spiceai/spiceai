@@ -772,9 +772,15 @@ struct WindowMax {
 }
 
 impl WindowMax {
-    /// Rolling window width, DERIVED from [`DEFAULT_GOAL_CONVERGENCE_WINDOW`] (60s)
-    /// so the value and its doc can never drift if the default changes: the peak
-    /// spans a full goal-convergence window — the horizon the SLO is stated over.
+    /// Peak window width, DERIVED from [`DEFAULT_GOAL_CONVERGENCE_WINDOW`] (60s) so
+    /// the value and its doc can never drift if the default changes: the peak spans
+    /// a full goal-convergence window — the horizon the SLO is stated over. FIXED to
+    /// the DEFAULT: it does NOT track a per-dataset `cayenne_goal_convergence_window`
+    /// override (that override retunes the controller's step dwell, not this
+    /// observability window), so a table with a non-default convergence window still
+    /// reports its freshness peak over this ~60s horizon. Making it track the
+    /// configured window would mean threading a live `window_ms` through
+    /// `IngestStats`; deliberately deferred as out of scope for the signal.
     #[expect(
         clippy::cast_possible_truncation,
         reason = "a minutes-scale convergence window's millis fit i64 with vast headroom"
@@ -2663,9 +2669,13 @@ fn decide_goal(
     // deep apply backlog and new rows queue behind it. SHRINK the mem-tier so
     // checkpoints fire on smaller epochs: earlier backpressure keeps the apply
     // backlog (and the capture stall) shallow, so PG-commit→queryable lag falls.
-    // EMPIRICALLY VALIDATED — a SF-100 3-node A/B pinning 1 GiB→256 MiB cut
-    // worst-table freshness P99 4.4s→2.7s (under a 3s SLO) with QPH +3.6% and no
-    // read-amp cost; this automates that one-shot pin as a closed loop. Ordered
+    // This is a SAFE CONTROL RESPONSE to a violated freshness SLO, NOT a proven
+    // perf win. A SF-100 3-node A/B (1 GiB→256 MiB pin) coincided with a lower
+    // worst-table freshness tail, but a no-goal control run on the same binary
+    // reproduced the same tail — run-to-run variance dominated, so the magnitude is
+    // unestablished on that rig and wants a lower-variance venue to measure. What is
+    // sound: shrinking the tier checkpoints smaller epochs sooner, the correct
+    // direction for a visibility-lag violation, at no correctness/QPH cost. Ordered
     // BEFORE the ingest grow tier, and that tier's buffer-grow branches are gated
     // `!freshness_violated`, so freshness owns the mem-tier lever and never
     // limit-cycles against the lag-grow. `clamp_move_i64(…, b.mem_tier_max_bytes)`
