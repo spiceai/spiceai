@@ -1205,6 +1205,13 @@ pub(crate) struct LiveActuators {
     /// per-file stats and compression for scans, less fan-out to probe), bounded
     /// by the static config (storage-tier-aware). `<= 0` keeps size-rolling off.
     target_vortex_file_size_bytes: AtomicI64,
+    /// Query-admission permits to reserve for CDC apply (the CPU-fairness lever).
+    /// Reported each background tick to the process-global query-admission
+    /// governor, which holds that many permits on the shared admission semaphore so
+    /// that many fewer analytical queries run concurrently — handing CPU back to
+    /// the apply when it is behind under contention. `0` (the default) reserves
+    /// nothing, so the lever is inert unless a lag/freshness goal drives it up.
+    query_admission_reserve: AtomicUsize,
     /// Observed bytes-per-row, seeded from the initial (schema-aware) config and
     /// then *relearned* from live ingest (EWMA bytes ÷ rows) so the row cap a byte
     /// budget implies tracks the table's real row width — not a stale static
@@ -1233,6 +1240,7 @@ impl LiveActuators {
             write_concurrency: AtomicUsize::new(init.write_concurrency),
             mem_tier_max_bytes: AtomicI64::new(init.mem_tier_max_bytes),
             target_vortex_file_size_bytes: AtomicI64::new(init.target_vortex_file_size_bytes),
+            query_admission_reserve: AtomicUsize::new(init.query_admission_reserve),
             bytes_per_row: AtomicI64::new(
                 (init.inline_flush_max_bytes / init.inline_flush_max_rows.max(1)).max(1),
             ),
@@ -1258,6 +1266,7 @@ impl LiveActuators {
             target_vortex_file_size_bytes: self
                 .target_vortex_file_size_bytes
                 .load(Ordering::Relaxed),
+            query_admission_reserve: self.query_admission_reserve.load(Ordering::Relaxed),
         }
     }
 
@@ -1348,6 +1357,12 @@ impl LiveActuators {
                     Ordering::Relaxed,
                 );
             }
+            Actuator::QueryAdmissionReserve => {
+                self.query_admission_reserve.store(
+                    usize::try_from(adj.new_value).unwrap_or(usize::MAX),
+                    Ordering::Relaxed,
+                );
+            }
         }
     }
 }
@@ -1364,6 +1379,7 @@ pub(crate) struct ActuatorValues {
     pub write_concurrency: usize,
     pub mem_tier_max_bytes: i64,
     pub target_vortex_file_size_bytes: i64,
+    pub query_admission_reserve: usize,
 }
 
 /// Static `[floor, ceiling]` per dynamically-tuned actuator, derived by the static
@@ -1378,6 +1394,7 @@ pub(crate) struct TuningBounds {
     pub write_concurrency: (usize, usize),
     pub mem_tier_max_bytes: (i64, i64),
     pub target_vortex_file_size_bytes: (i64, i64),
+    pub query_admission_reserve: (usize, usize),
 }
 
 // ---------------------------------------------------------------------------
@@ -1394,6 +1411,13 @@ pub(crate) enum Actuator {
     BakeDeletionIndexTrigger,
     WriteConcurrency,
     TargetVortexFileSize,
+    /// Number of query-admission permits to RESERVE for CDC apply (shed that many
+    /// concurrent analytical queries). The CPU-fairness lever: GROWN when a
+    /// lag/freshness goal is unmet AND CPU is the contended resource (queries are
+    /// starving the apply); RELEASED as soon as CPU frees or the lag goal is met.
+    /// Reported to the process-global [`super::query_admission`] governor, which
+    /// holds that many permits on the shared admission semaphore.
+    QueryAdmissionReserve,
 }
 
 impl Actuator {
@@ -1408,6 +1432,7 @@ impl Actuator {
             Self::BakeDeletionIndexTrigger => "bake_deletion_index_trigger",
             Self::WriteConcurrency => "write_concurrency",
             Self::TargetVortexFileSize => "target_vortex_file_size_bytes",
+            Self::QueryAdmissionReserve => "query_admission_reserve",
         }
     }
 }
@@ -1820,6 +1845,44 @@ impl Goals {
             && self
                 .query_latency_p99
                 .is_none_or(|g| g.comfortably_met(s.query_latency_p99_ms))
+            && self.qph.is_none_or(|g| g.comfortably_met(s.qph))
+    }
+
+    /// Are the ingest-side goals (replication-lag + freshness) comfortably met?
+    /// One of the RELEASE triggers for the query-admission reserve — the reserve's
+    /// justification (CDC behind) is gone, so hand the query slots back.
+    ///
+    /// The reserve's release must NEVER be gated on a query goal being MET: the
+    /// reserve suppresses queries, so a query goal (QPH/latency) could stay below
+    /// "met" *because of the throttle itself*, and the reserve would never release
+    /// (self-perpetuation). Releasing on a query goal being VIOLATED is the OPPOSITE
+    /// direction and is safe — see [`Self::query_comfortably_met`] and the release
+    /// tier — because throttling moves a query goal TOWARD violation, so
+    /// "release on violated" is a stable negative-feedback brake, not a latch.
+    fn ingest_comfortably_met(self, s: &IngestSnapshot) -> bool {
+        self.replication_lag
+            .is_none_or(|g| g.comfortably_met(s.replication_lag_secs))
+            && self
+                .freshness
+                .is_none_or(|g| g.comfortably_met(s.freshness_secs))
+    }
+
+    /// Are the query-side goals (query-latency-p99 + QPH) comfortably met? The
+    /// HEADROOM gate for GROWING the query-admission reserve. That lever sheds
+    /// analytical queries to hand cores to the CDC apply, trading query throughput
+    /// for ingest freshness — so it should only spend query capacity it demonstrably
+    /// HAS: grow the reserve while the query SLOs sit comfortably above target, and
+    /// stop once throttling has consumed that headroom. This makes the query SLOs
+    /// the reserve's BUDGET — the apply may borrow query cores down to (but not
+    /// through) the QPH/latency targets. `None` (unset) query goals read as
+    /// comfortably met, so with no query SLO configured the reserve grows purely on
+    /// the ingest+CPU signals (the prior behavior). Safe as a GROW gate — it only
+    /// makes throttling LESS aggressive, never a latch: the self-perpetuation trap
+    /// on [`Self::ingest_comfortably_met`] is specific to gating RELEASE on a query
+    /// goal being met; this gates GROW, the opposite move.
+    fn query_comfortably_met(self, s: &IngestSnapshot) -> bool {
+        self.query_latency_p99
+            .is_none_or(|g| g.comfortably_met(s.query_latency_p99_ms))
             && self.qph.is_none_or(|g| g.comfortably_met(s.qph))
     }
 }
@@ -2308,6 +2371,45 @@ fn decide_goal(
         );
     let mutation_heavy = s.delete_fraction > MUTATION_HEAVY_FRACTION;
 
+    // (1b) Release the query-admission reserve as soon as its justification is gone
+    // OR it has overshot a query SLO. Three triggers, all safe/stable:
+    //   - CPU no longer contended (`cpu_ok`) — shedding queries can't help the apply
+    //     if CPU isn't the bottleneck, so nothing to relieve;
+    //   - the ingest goal is comfortably met (`ingest_comfortably_met`) — the apply
+    //     caught up, the reserve's whole reason is gone;
+    //   - a query SLO (QPH or query-latency) is now VIOLATED (`query_violated`) — the
+    //     throttle has borrowed too much query capacity and pushed a query goal past
+    //     target, so back off. This is the QUERY-SLO BRAKE: throttling moves QPH/
+    //     latency toward violation, so releasing ON violation is stable negative
+    //     feedback (never a latch). It is NOT the self-perpetuation trap documented
+    //     on `ingest_comfortably_met` — that prohibits releasing on a query goal
+    //     being MET; braking on VIOLATED is the opposite, safe direction.
+    // Checked BEFORE the query and ingest tiers — handing query slots back (and
+    // honoring the query SLOs) is high priority. Fast handback (legacy ±⅓ step);
+    // the bound floor is 0.
+    if cur.query_admission_reserve > 0
+        && (cpu_ok || goals.ingest_comfortably_met(s) || query_violated)
+        && let Some(v) = clamp_move_usize(
+            cur.query_admission_reserve,
+            shrink_usize(cur.query_admission_reserve),
+            b.query_admission_reserve,
+        )
+    {
+        // Attribute the release: a query-SLO overshoot is the interesting case (the
+        // throttle traded away too much), distinct from the reserve simply no longer
+        // being needed.
+        let reason = if query_violated {
+            "query SLO (QPH/latency) at target — stop borrowing query capacity: release a reserved query-admission slot"
+        } else {
+            "CPU uncontended or ingest goal met: release a reserved query-admission slot"
+        };
+        return Some(Adjustment {
+            actuator: Actuator::QueryAdmissionReserve,
+            new_value: u64::try_from(v).unwrap_or(0),
+            reason,
+        });
+    }
+
     // (2) Query-health tier: a violated latency/QPH goal. Larger/fewer files and
     // more compaction help queries; shedding write shards cuts file fan-out.
     if query_violated {
@@ -2489,6 +2591,43 @@ fn decide_goal(
                 actuator: Actuator::CompactionIntervalMs,
                 new_value: v,
                 reason: "replication-lag goal: compact more to keep the snapshot lean",
+            });
+        }
+        // CPU is the contended resource, ingest is behind, AND the query SLOs have
+        // headroom to spend: shed concurrent analytical queries to hand cores back to
+        // the CDC apply. Three conjuncts:
+        //   - `!cpu_ok` — shedding queries only helps when CPU is the contention (the
+        //     complement of the CPU-gated levers above: raising write shards and
+        //     compacting more are WITHHELD under contention, so admitting fewer
+        //     queries is the only lever left);
+        //   - `ingest_violated` (this tier's guard) — there is a lag/freshness goal to
+        //     serve;
+        //   - `query_comfortably_met` — the query SLOs (QPH + query-latency) sit
+        //     comfortably above target, so we can borrow query capacity WITHOUT
+        //     breaching them. This makes the query SLOs the reserve's BUDGET: the apply
+        //     borrows query cores down to (not through) the QPH/latency targets, and
+        //     tier (1b) brakes the moment throttling pushes a query goal to violation.
+        //     Exactly the "QPH target met + lag target missed ⇒ redirect resources to
+        //     ingest" trade — and, since unset query goals read as met, a strict no-op
+        //     versus the prior ingest+CPU-only behavior when no query SLO is configured.
+        // Bounded step like every other goal move; the governor re-clamps the reported
+        // demand to the real admission pool's `max - 1`.
+        if !cpu_ok
+            && goals.query_comfortably_met(s)
+            && let Some(v) = clamp_move_usize(
+                cur.query_admission_reserve,
+                goal_grow_usize(
+                    cur.query_admission_reserve,
+                    b.query_admission_reserve,
+                    ingest_v,
+                ),
+                b.query_admission_reserve,
+            )
+        {
+            return Some(Adjustment {
+                actuator: Actuator::QueryAdmissionReserve,
+                new_value: u64::try_from(v).unwrap_or(0),
+                reason: "ingest goal behind under CPU contention with query-SLO headroom: reserve query-admission slots for CDC apply (shed concurrent analytical queries)",
             });
         }
     }
@@ -2924,6 +3063,7 @@ mod tests {
             write_concurrency: (1, 16),
             mem_tier_max_bytes: (64 * 1024 * 1024, 2048 * 1024 * 1024),
             target_vortex_file_size_bytes: (64 * 1024 * 1024, 1024 * 1024 * 1024),
+            query_admission_reserve: (0, 16),
         }
     }
 
@@ -2938,6 +3078,7 @@ mod tests {
             write_concurrency: 4,
             mem_tier_max_bytes: 256 * 1024 * 1024,
             target_vortex_file_size_bytes: 256 * 1024 * 1024,
+            query_admission_reserve: 0,
         }
     }
 
@@ -3524,6 +3665,10 @@ mod tests {
                 Actuator::TargetVortexFileSize => (
                     b.target_vortex_file_size_bytes.0 as u64,
                     b.target_vortex_file_size_bytes.1 as u64,
+                ),
+                Actuator::QueryAdmissionReserve => (
+                    b.query_admission_reserve.0 as u64,
+                    b.query_admission_reserve.1 as u64,
                 ),
             };
             assert!(
@@ -4411,6 +4556,198 @@ mod tests {
             ..snap()
         };
         assert!(!goals.any_actionable_violation(&met, true));
+    }
+
+    #[test]
+    fn query_admission_reserve_grows_under_lag_with_cpu_contention_and_releases_when_clear() {
+        let goals = Goals::from_targets(None, Some(5.0), None, None, Duration::from_mins(1));
+        let b = bounds();
+
+        // GROW: freshness behind (60s vs 5s) AND CPU contended (0.95), with the
+        // higher-priority ingest buffers already maxed and the write-concurrency /
+        // compaction levers withheld under CPU contention — so shedding queries is
+        // the only lever left that helps the lag goal.
+        let buffers_maxed_reserve_zero = ActuatorValues {
+            inline_flush_max_bytes: b.inline_flush_max_bytes.1,
+            mem_tier_max_bytes: b.mem_tier_max_bytes.1,
+            ..actuators()
+        };
+        let behind_contended = IngestSnapshot {
+            freshness_secs: Some(60.0),
+            cpu_pressure: Some(0.95),
+            ..snap()
+        };
+        let adj = decide_with_goals(
+            &behind_contended,
+            &buffers_maxed_reserve_zero,
+            &b,
+            ms(60_000),
+            ms(30_000),
+            0,
+            &goals,
+        )
+        .expect("lag behind + CPU contended + buffers maxed ⇒ reserve query-admission slots");
+        assert_eq!(adj.actuator, Actuator::QueryAdmissionReserve);
+        assert!(
+            adj.new_value > 0,
+            "the reserve grows from 0 to shed concurrent queries (got {})",
+            adj.new_value
+        );
+
+        // RELEASE (CPU uncontended): a reserve is held but CPU is no longer the
+        // contended resource — nothing to relieve, so hand query slots back even
+        // though the lag goal is still violated. Tier (1b) runs before the ingest
+        // grow, so the release wins.
+        let reserve_held = ActuatorValues {
+            query_admission_reserve: 3,
+            ..actuators()
+        };
+        let behind_uncontended = IngestSnapshot {
+            freshness_secs: Some(60.0),
+            cpu_pressure: Some(0.10),
+            ..snap()
+        };
+        let adj = decide_with_goals(
+            &behind_uncontended,
+            &reserve_held,
+            &b,
+            ms(60_000),
+            ms(30_000),
+            0,
+            &goals,
+        )
+        .expect("CPU uncontended ⇒ release a reserved query-admission slot");
+        assert_eq!(adj.actuator, Actuator::QueryAdmissionReserve);
+        assert!(
+            (adj.new_value as usize) < 3,
+            "the reserve is released toward 0 (got {})",
+            adj.new_value
+        );
+
+        // RELEASE (lag goal met): CPU is still contended, but the apply has caught
+        // up — the reserve's justification is gone, so release it. Keyed on the
+        // INGEST goal, never the (here unset) query goal, so it can't self-perpetuate.
+        let met_contended = IngestSnapshot {
+            freshness_secs: Some(1.0),
+            cpu_pressure: Some(0.95),
+            ..snap()
+        };
+        let adj = decide_with_goals(
+            &met_contended,
+            &reserve_held,
+            &b,
+            ms(60_000),
+            ms(30_000),
+            0,
+            &goals,
+        )
+        .expect("lag goal met ⇒ release a reserved query-admission slot");
+        assert_eq!(adj.actuator, Actuator::QueryAdmissionReserve);
+        assert!(
+            (adj.new_value as usize) < 3,
+            "released once the lag goal is met"
+        );
+    }
+
+    /// The query-admission reserve is BUDGETED by the query SLOs: the CDC apply may
+    /// borrow query cores while QPH (and query-latency) have headroom, but not
+    /// through their targets — exactly "QPH target met + lag missed ⇒ redirect
+    /// resources to ingest, but only down to the QPH floor." QPH is `HigherBetter`, so
+    /// against a 1000 target: comfortably met at ≥1500 (headroom), violated at <800.
+    #[test]
+    fn query_admission_reserve_is_budgeted_by_the_query_slos() {
+        // freshness goal 5s + QPH goal 1000.
+        let goals =
+            Goals::from_targets(None, Some(5.0), None, Some(1000.0), Duration::from_mins(1));
+        let b = bounds();
+        // Higher-priority ingest buffers already maxed, so the reserve is the lever
+        // in play (mirrors the sibling test's setup).
+        let buffers_maxed = ActuatorValues {
+            inline_flush_max_bytes: b.inline_flush_max_bytes.1,
+            mem_tier_max_bytes: b.mem_tier_max_bytes.1,
+            ..actuators()
+        };
+
+        // GROW: freshness behind (60s) + CPU contended (0.95) + QPH comfortably met
+        // (1600 ≥ 1.5×1000 ⇒ headroom) ⇒ shed queries for the apply. The exact
+        // "hitting QPH, missing lag ⇒ redirect to ingest" case.
+        let behind_qph_headroom = IngestSnapshot {
+            freshness_secs: Some(60.0),
+            cpu_pressure: Some(0.95),
+            qph: Some(1600.0),
+            ..snap()
+        };
+        let adj = decide_with_goals(
+            &behind_qph_headroom,
+            &buffers_maxed,
+            &b,
+            ms(60_000),
+            ms(30_000),
+            0,
+            &goals,
+        )
+        .expect("lag behind + CPU contended + QPH headroom ⇒ reserve query slots");
+        assert_eq!(adj.actuator, Actuator::QueryAdmissionReserve);
+        assert!(
+            adj.new_value > 0,
+            "grows while QPH has headroom (got {})",
+            adj.new_value
+        );
+
+        // HOLD (headroom spent): same lag + CPU, but QPH now in the deadband
+        // (1100: 0.8×1000=800 ≤ 1100 < 1.5×1000=1500 ⇒ neither met nor violated).
+        // The reserve must NOT keep growing — that would eat into the QPH SLO.
+        let behind_qph_deadband = IngestSnapshot {
+            freshness_secs: Some(60.0),
+            cpu_pressure: Some(0.95),
+            qph: Some(1100.0),
+            ..snap()
+        };
+        let adj = decide_with_goals(
+            &behind_qph_deadband,
+            &buffers_maxed,
+            &b,
+            ms(60_000),
+            ms(30_000),
+            0,
+            &goals,
+        );
+        assert!(
+            !matches!(adj, Some(a) if a.actuator == Actuator::QueryAdmissionReserve && a.new_value > 0),
+            "must NOT grow the reserve once QPH headroom is spent (got {adj:?})"
+        );
+
+        // BRAKE (QPH violated): a reserve is held, lag still behind, CPU still
+        // contended — but throttling has pushed QPH below target (700 < 0.8×1000=800
+        // ⇒ violated). Tier (1b) releases to stop borrowing past the QPH SLO, and
+        // wins over the query-health tier. This is the safe direction (release ON
+        // violated), NOT the self-perpetuation trap (release on met).
+        let reserve_held = ActuatorValues {
+            query_admission_reserve: 3,
+            ..actuators()
+        };
+        let behind_qph_violated = IngestSnapshot {
+            freshness_secs: Some(60.0),
+            cpu_pressure: Some(0.95),
+            qph: Some(700.0),
+            ..snap()
+        };
+        let adj = decide_with_goals(
+            &behind_qph_violated,
+            &reserve_held,
+            &b,
+            ms(60_000),
+            ms(30_000),
+            0,
+            &goals,
+        )
+        .expect("QPH violated ⇒ release to honor the query SLO");
+        assert_eq!(adj.actuator, Actuator::QueryAdmissionReserve);
+        assert!(
+            (adj.new_value as usize) < 3,
+            "released to stop breaching the QPH SLO (got {})",
+            adj.new_value
+        );
     }
 
     #[test]
