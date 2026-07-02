@@ -772,9 +772,14 @@ struct WindowMax {
 }
 
 impl WindowMax {
-    /// Rolling window width. ~[`DEFAULT_GOAL_CONVERGENCE_WINDOW`] (60s) so the peak
+    /// Rolling window width, DERIVED from [`DEFAULT_GOAL_CONVERGENCE_WINDOW`] (60s)
+    /// so the value and its doc can never drift if the default changes: the peak
     /// spans a full goal-convergence window — the horizon the SLO is stated over.
-    const WINDOW_MS: i64 = 60_000;
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "a minutes-scale convergence window's millis fit i64 with vast headroom"
+    )]
+    const WINDOW_MS: i64 = DEFAULT_GOAL_CONVERGENCE_WINDOW.as_millis() as i64;
 
     const fn new() -> Self {
         Self {
@@ -1187,8 +1192,12 @@ pub(crate) struct IngestSnapshot {
     /// commit ts`), or `None` when no source timestamp is available. Lower is
     /// better; drives the replication-lag goal.
     pub replication_lag_secs: Option<f64>,
-    /// Freshness in seconds (`now − newest applied data wall-clock`), or `None`
-    /// before the first apply. Lower is better; drives the freshness goal.
+    /// Windowed-PEAK per-apply row freshness in seconds — the worst-case
+    /// PG-commit→queryable lag (`apply_wall_clock − batch_source_commit_ts`) over the
+    /// last ~60s, populated from [`IngestStats::peak_row_freshness_secs`]; `None`
+    /// before the first apply that carried a source-commit ts. NOT the instantaneous
+    /// `now − last_visible` age: the peak captures transient stalls and is idle-immune,
+    /// so it is the freshness-goal control/SLO signal. Lower is better.
     pub freshness_secs: Option<f64>,
     /// p99 query latency in ms observed on this table (pushed down from the
     /// runtime), or `None` when no queries have run. Lower is better; drives the
