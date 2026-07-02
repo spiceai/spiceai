@@ -6,7 +6,7 @@ expression: resp?
   {
     "id": 525,
     "question": "In a group of 3 machines where 2 are faulty, what is the probability that the first two machines tested are both faulty?",
-    "trunc(rrf(vector_search(qs, Utf8(\"second\")), text_search(qs, Utf8(\"second\")), Utf8(\"id\") FieldMetadata { inner: {\"spice.parameter_name\": \"join_key\"} })._fused_score,Int64(3))": 0.02
+    "trunc(rrf(vector_search(qs, Utf8(\"second\")), text_search(qs, Utf8(\"second\")), Utf8(\"id\") FieldMetadata { inner: {\"spice.parameter_name\": \"join_key\"} })._fused_score,Int64(3))": 0.019
   },
   {
     "id": 772,

@@ -10,7 +10,7 @@ expression: normalize_search_response(resp, round_scores)
       "dataset": "clickbench_chunking",
       "matches": {
         "Referer": [
-          "https://go.mail/folder-1/online=on&acceTWg&bvm=bv.48705608,d.bGE&cad=rjt&fu=0&int[234][to]=&inpu"
+          "https://go.mail/folder-1/online=on&acceTWg&bvm=bv.48705608,d.bGE&cad=rjt&fu=0&int[234][to]=&input"
         ]
       }
     },
@@ -19,7 +19,7 @@ expression: normalize_search_response(resp, round_scores)
       "dataset": "clickbench_chunking",
       "matches": {
         "Referer": [
-          "https://go.mail/folder-1/online=on&acceTWg&bvm=bv.48705608,d.bGE&cad=rjt&fu=0&int[234][to]=&inpu"
+          "https://go.mail/folder-1/online=on&acceTWg&bvm=bv.48705608,d.bGE&cad=rjt&fu=0&int[234][to]=&input"
         ]
       }
     }

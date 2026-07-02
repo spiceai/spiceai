@@ -10,7 +10,7 @@ expression: normalize_search_response(resp, round_scores)
       "dataset": "spice.public.cached_search_bypass",
       "matches": {
         "cp_description": [
-          "Programmes receive just likely, key homes. Relevant"
+          "Programmes receive just likely, key homes. Relevant,"
         ]
       },
       "primary_key": {
@@ -22,7 +22,7 @@ expression: normalize_search_response(resp, round_scores)
       "dataset": "spice.public.cached_search_bypass",
       "matches": {
         "cp_description": [
-          "Heavily direct problems try eventually on a nurses. Courses may make "
+          "Heavily direct problems try eventually on a nurses. Courses may make a"
         ]
       },
       "primary_key": {
