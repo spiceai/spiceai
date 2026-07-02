@@ -817,7 +817,14 @@ impl DataFusionBuilder {
                 .optimizer
                 .eager_aggregation_max_pushed_groups = cap;
         }
-        tracing::info!(eager_aggregation, "Applied runtime.query.eager_aggregation");
+        if self.eager_aggregation.is_some() {
+            tracing::info!(eager_aggregation, "Applied runtime.query.eager_aggregation");
+        } else {
+            tracing::info!(
+                eager_aggregation,
+                "runtime.query.eager_aggregation not set; defaulting to spiced default"
+            );
+        }
 
         // Sizes DataFusion's *native* hash-join InList dynamic-filter budget
         // (`optimizer.hash_join_inlist_pushdown_max_size`) from the runtime
