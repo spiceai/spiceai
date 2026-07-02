@@ -33,7 +33,11 @@
 #   TEST_PKG / TEST_BIN  override the crate/binary (default: cayenne /
 #                 mutation_property_test).
 #
-set -uo pipefail
+# `-e` so an early failure (e.g. the build step) fast-fails before spawning CPU
+# hogs; the reproduction check below runs the tests inside an `if ! ...` guard,
+# which is exempt from `-e`, so a failing test iteration is still handled
+# explicitly rather than aborting the script.
+set -euo pipefail
 
 REPO_ROOT="$(git -C "$(dirname "${BASH_SOURCE[0]}")" rev-parse --show-toplevel)"
 cd "$REPO_ROOT"
