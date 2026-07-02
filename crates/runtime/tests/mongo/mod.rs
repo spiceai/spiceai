@@ -330,7 +330,7 @@ async fn init_mongodb_json_nesting_db(port: u16) -> Result<(), anyhow::Error> {
     Ok(())
 }
 
-/// JSON nesting (`json_object: "*"`) on a federated MongoDB dataset: the declared
+/// JSON nesting (`json_object: "*"`) on a federated `MongoDB` dataset: the declared
 /// static columns (`_id`, `name`) stay top-level, and every other document field
 /// is folded into one sorted-JSON catch-all `Utf8` column (`data`). Asserts both
 /// that non-declared fields (scalar, nested, array) land in the catch-all and

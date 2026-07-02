@@ -451,7 +451,7 @@ async fn debezium_delete_then_reinsert_resurrects_row() {
 /// block is intentionally minimal: `to_change_batch` projects against the
 /// caller-supplied table schema, not the event's self-description.
 #[cfg(feature = "debezium")]
-fn debezium_create_event(after: serde_json::Value) -> ChangeEvent {
+fn debezium_create_event(after: &serde_json::Value) -> ChangeEvent {
     let value = serde_json::json!({
         "schema": { "type": "struct", "fields": [], "optional": false, "name": "test.Envelope" },
         "payload": {
@@ -492,10 +492,10 @@ async fn debezium_json_nesting_folds_into_catch_all() {
 
     let events = [
         debezium_create_event(
-            serde_json::json!({ "id": 1, "email": "alice@example.com", "age": 30 }),
+            &serde_json::json!({ "id": 1, "email": "alice@example.com", "age": 30 }),
         ),
         debezium_create_event(
-            serde_json::json!({ "id": 2, "email": "bob@example.com", "age": 25 }),
+            &serde_json::json!({ "id": 2, "email": "bob@example.com", "age": 25 }),
         ),
     ];
 
