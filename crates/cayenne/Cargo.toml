@@ -116,6 +116,17 @@ test-log = { version = "0.2", features = ["trace"] }
 tokio = { workspace = true, features = ["test-util", "rt-multi-thread", "fs"] }
 tokio-stream = { workspace = true }
 
+# The `compaction_io_hygiene` bench reproduces the Linux-only fadvise/fsync
+# primitives (`sync_file_range`, `posix_fadvise`, `mincore`) directly. cayenne
+# already depends on libc for `target_os = "linux"`, but a bench is a separate
+# crate and must name the dep itself.
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+libc = "0.2"
+
+[[bench]]
+harness = false
+name = "zorder_clustering"
+
 [[bench]]
 harness = false
 name = "metastore_operations"
@@ -365,6 +376,10 @@ name = "delta_encoding_sweep"
 
 [[bench]]
 harness = false
+name = "compaction_write_amplification"
+
+[[bench]]
+harness = false
 name = "scan_under_write_attribution"
 
 [[bench]]
@@ -406,3 +421,7 @@ name = "publish_metadata_wall"
 [[bench]]
 harness = false
 name = "cdc_apply_simd"
+
+[[bench]]
+harness = false
+name = "compaction_io_hygiene"

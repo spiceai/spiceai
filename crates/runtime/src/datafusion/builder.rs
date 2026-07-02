@@ -373,6 +373,9 @@ pub struct DataFusionBuilder {
     memory_limit: Option<u64>,
     target_partitions: Option<usize>,
     prefer_hash_join: Option<bool>,
+    eager_aggregation: Option<bool>,
+    eager_aggregation_min_reduction_factor: Option<usize>,
+    eager_aggregation_max_pushed_groups: Option<usize>,
     temp_directory: Option<String>,
     accelerated_refresh_semaphore: Option<Arc<Semaphore>>,
     query_admission_semaphore: Option<Arc<Semaphore>>,
@@ -433,6 +436,9 @@ impl DataFusionBuilder {
             memory_limit: None,
             target_partitions: None,
             prefer_hash_join: None,
+            eager_aggregation: None,
+            eager_aggregation_min_reduction_factor: None,
+            eager_aggregation_max_pushed_groups: None,
             temp_directory: None,
             accelerated_refresh_semaphore: None,
             query_admission_semaphore: None,
@@ -489,6 +495,24 @@ impl DataFusionBuilder {
     #[must_use]
     pub fn prefer_hash_join(mut self, prefer_hash_join: Option<bool>) -> Self {
         self.prefer_hash_join = prefer_hash_join;
+        self
+    }
+
+    #[must_use]
+    pub fn eager_aggregation(mut self, eager_aggregation: Option<bool>) -> Self {
+        self.eager_aggregation = eager_aggregation;
+        self
+    }
+
+    #[must_use]
+    pub fn eager_aggregation_min_reduction_factor(mut self, factor: Option<usize>) -> Self {
+        self.eager_aggregation_min_reduction_factor = factor;
+        self
+    }
+
+    #[must_use]
+    pub fn eager_aggregation_max_pushed_groups(mut self, cap: Option<usize>) -> Self {
+        self.eager_aggregation_max_pushed_groups = cap;
         self
     }
 
@@ -763,6 +787,44 @@ impl DataFusionBuilder {
         if let Some(prefer_hash_join) = self.prefer_hash_join {
             config.options_mut().optimizer.prefer_hash_join = prefer_hash_join;
             tracing::info!(prefer_hash_join, "Applied runtime.query.prefer_hash_join");
+        }
+
+        // Cost-based eager-aggregation physical optimizer
+        // (`datafusion.optimizer.enable_eager_aggregation`): pushes a partial
+        // aggregation below a join when a statistics-based cost model predicts a
+        // large row reduction, then re-aggregates above the join. Enabled by
+        // default in spiced (DataFusion's own default is off); disable via
+        // `runtime.query.eager_aggregation: false`. The cost gate can be tuned
+        // with `runtime.query.eager_aggregation_min_reduction_factor`
+        // (DataFusion default 4) and `..._max_pushed_groups` (default 0 =
+        // uncapped); unset leaves the DataFusion default in place.
+        let eager_aggregation = self.eager_aggregation.unwrap_or(true);
+        config.options_mut().optimizer.enable_eager_aggregation = eager_aggregation;
+        if let Some(factor) = self.eager_aggregation_min_reduction_factor {
+            if factor > 0 {
+                config
+                    .options_mut()
+                    .optimizer
+                    .eager_aggregation_min_reduction_factor = factor;
+            } else {
+                tracing::warn!(
+                    "Ignoring runtime.query.eager_aggregation_min_reduction_factor=0; value must be greater than 0"
+                );
+            }
+        }
+        if let Some(cap) = self.eager_aggregation_max_pushed_groups {
+            config
+                .options_mut()
+                .optimizer
+                .eager_aggregation_max_pushed_groups = cap;
+        }
+        if self.eager_aggregation.is_some() {
+            tracing::info!(eager_aggregation, "Applied runtime.query.eager_aggregation");
+        } else {
+            tracing::info!(
+                eager_aggregation,
+                "runtime.query.eager_aggregation not set; defaulting to spiced default"
+            );
         }
 
         // Sizes DataFusion's *native* hash-join InList dynamic-filter budget
@@ -2042,6 +2104,84 @@ mod tests {
                 .target_partitions,
             4,
             "Without an override target_partitions should fall back to DataFusion's default"
+        );
+    }
+
+    #[test]
+    fn test_eager_aggregation_wires_through_to_session_config() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime");
+        let handle = rt.handle().clone();
+
+        // Default: spiced enables eager aggregation even though DataFusion's own
+        // default is off.
+        let df_default = DataFusionBuilder::new(
+            status::RuntimeStatus::new(),
+            Arc::new(AcceleratorEngineRegistry::default()),
+            handle.clone(),
+        )
+        .build();
+        assert!(
+            df_default
+                .ctx
+                .state()
+                .config()
+                .options()
+                .optimizer
+                .enable_eager_aggregation,
+            "eager aggregation should default to enabled in spiced"
+        );
+
+        // An explicit `false` disables the rule.
+        let df_off = DataFusionBuilder::new(
+            status::RuntimeStatus::new(),
+            Arc::new(AcceleratorEngineRegistry::default()),
+            handle.clone(),
+        )
+        .eager_aggregation(Some(false))
+        .build();
+        assert!(
+            !df_off
+                .ctx
+                .state()
+                .config()
+                .options()
+                .optimizer
+                .enable_eager_aggregation,
+            "eager_aggregation: false should disable the rule"
+        );
+
+        // The two tuning knobs wire through to the optimizer options.
+        let df_tuned = DataFusionBuilder::new(
+            status::RuntimeStatus::new(),
+            Arc::new(AcceleratorEngineRegistry::default()),
+            handle,
+        )
+        .eager_aggregation(Some(true))
+        .eager_aggregation_min_reduction_factor(Some(8))
+        .eager_aggregation_max_pushed_groups(Some(1024))
+        .build();
+        assert_eq!(
+            df_tuned
+                .ctx
+                .state()
+                .config()
+                .options()
+                .optimizer
+                .eager_aggregation_min_reduction_factor,
+            8
+        );
+        assert_eq!(
+            df_tuned
+                .ctx
+                .state()
+                .config()
+                .options()
+                .optimizer
+                .eager_aggregation_max_pushed_groups,
+            1024
         );
     }
 

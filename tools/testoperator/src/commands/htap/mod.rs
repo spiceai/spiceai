@@ -65,13 +65,23 @@ pub(crate) async fn run(args: &HtapArgs) -> anyhow::Result<()> {
             .with_additional_args(vec!["--metrics".to_string(), "127.0.0.1:9090".to_string()]);
     }
 
-    // 1. Prepare the source (schema + seed data).
+    // 1. Prepare the source: seed schema + data — or, with --skip-prepare,
+    //    connect to an already-prepared source and verify it matches the SF.
     let scale_factor = test_args.scale_factor.unwrap_or(1.0);
     #[expect(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
     let terminals = args.terminals.unwrap_or((scale_factor * 10.0) as usize);
     let duration = Duration::from_secs(test_args.common.duration);
-    let driver: Arc<dyn chbench_driver::ChBenchDriver> =
-        Arc::new(prepare_chbench_source(scale_factor, terminals, args.rate).await?);
+    let driver: Arc<dyn chbench_driver::ChBenchDriver> = Arc::new(
+        prepare_chbench_source(scale_factor, terminals, args.rate, args.skip_prepare).await?,
+    );
+
+    // --prepare-only: the source is now seeded; exit before starting spiced so
+    // an external harness can snapshot the pristine source (e.g. to a Postgres
+    // template database) for fast reuse across subsequent runs.
+    if args.prepare_only {
+        println!("--prepare-only: source prepared, exiting without running the workload");
+        return Ok(());
+    }
 
     // 2. Start spiced.
     let mut spiced_instance = SpicedInstance::start(start_request).await?;

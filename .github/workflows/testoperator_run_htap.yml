@@ -121,6 +121,25 @@ jobs:
         if: github.event.inputs.runner_type != 'spiceai-dev-xlarge-runners'
         uses: ./.github/actions/setup-chbench-postgres
 
+      # The xlarge PG pod is long-lived, so cache a pristine seed as a Postgres
+      # template database and restore chbench from it (FILE_COPY, seconds) instead
+      # of re-seeding (~tens of minutes at SF1000). On a miss it seeds once via
+      # `testoperator --prepare-only`, freezes the template, then restores. After
+      # this the run below uses `--skip-prepare`. Ephemeral docker-PG runners have
+      # nothing to cache, so they skip this and seed normally.
+      - name: Restore or seed CH-benCH from template
+        if: github.event.inputs.runner_type == 'spiceai-dev-xlarge-runners'
+        run: bash .github/scripts/chbench_template.sh
+        env:
+          SCALE_FACTOR: ${{ github.event.inputs.scale_factor }}
+          TERMINALS: ${{ github.event.inputs.terminals }}
+          SPICEPOD_PATH: ${{ steps.set_spicepod_path.outputs.SPICEPOD_PATH }}
+          SPICED_BIN: /usr/local/bin/spiced
+          CHBENCH_PG_HOST: chbench-postgres.dataplatform.svc.cluster.local
+          CHBENCH_PG_PORT: '5432'
+          CHBENCH_PG_USER: bench
+          CHBENCH_PG_PASS: bench
+
       - name: Run CH-benCHmark - ${{ github.event.inputs.spicepod_path }}
         run: |
           # On the xlarge runner (64-core EPYC, 2 threads/core, SMT siblings are
@@ -151,6 +170,7 @@ jobs:
             --concurrency ${{ github.event.inputs.concurrency }} \
             ${{ github.event.inputs.query_overrides != '' && format('--query-overrides {0}', github.event.inputs.query_overrides) || '' }} \
             --ready-wait ${{ github.event.inputs.ready_wait }} \
+            ${{ github.event.inputs.runner_type == 'spiceai-dev-xlarge-runners' && '--skip-prepare' || '' }} \
             --disable-progress-bars \
             --metrics
         env:
@@ -158,6 +178,12 @@ jobs:
           SPICED_COMMIT: ${{ steps.setup-spiced.outputs.SPICED_COMMIT }}
           # Dedicated in-cluster PG pod on xlarge; per-run docker container (loopback) elsewhere.
           CHBENCH_PG_HOST: ${{ github.event.inputs.runner_type == 'spiceai-dev-xlarge-runners' && 'chbench-postgres.dataplatform.svc.cluster.local' || '127.0.0.1' }}
+          # MinIO credentials for spiced, mirroring testoperator_run_bench.yml. Consumed only by
+          # configs that reference the local S3 (`${secrets:S3_ENDPOINT}` etc.) — e.g. the Cayenne
+          # cold-object-store-tier chbench config; harmless/unused for every other HTAP config.
+          S3_ENDPOINT: ${{ secrets.TEST_MINIO_ENDPOINT }}
+          S3_KEY: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
+          S3_SECRET: ${{ secrets.TEST_MINIO_SECRET_KEY }}
 
       # The dedicated PG pod is long-lived and shared across runs, so a crashed
       # or cancelled run can leave inactive replication slots (which retain WAL
@@ -203,4 +229,24 @@ jobs:
               -v ON_ERROR_STOP=0 -f /tmp/chbench-slot-cleanup.sql || true
           else
             echo "No psql client available; skipping replication slot cleanup."
+          fi
+
+      # The MinIO `benchmarks` bucket is shared across runs, so the Cayenne cold-object-store tier
+      # (cayenne_cold_tier_location: s3://benchmarks/cayenne-cold-sf1000/) would otherwise accumulate
+      # cold files every run: each promotion writes a new UUID-named prefix and nothing GCs them
+      # (the query path reads the metastore manifest, never an S3 listing, so a fresh run never
+      # references a prior run's objects — they are dead weight, not a collision). Drop the whole
+      # cold prefix after the run. Gated to the cold config; `mc` + the `spice-minio` alias come from
+      # the Install MinIO step above. Runs on failure/cancel too so a crashed run leaves no orphans.
+      - name: Clean up Cayenne cold-tier S3 objects
+        if: always() && endsWith(github.event.inputs.spicepod_path, 'cold-sf1000.yaml')
+        run: |
+          if command -v mc >/dev/null 2>&1; then
+            echo "Removing cold-tier objects under spice-minio/benchmarks/cayenne-cold-sf1000/ (best-effort; an empty prefix is expected when no promotion ran) ..."
+            # Non-fatal: mc prints its own diagnostics (empty prefix, or an auth/endpoint failure) to
+            # the log, but a cleanup miss must never fail the benchmark run. No success/"already clean"
+            # message here, so a real mc failure is not misreported.
+            mc rm --recursive --force spice-minio/benchmarks/cayenne-cold-sf1000/ || true
+          else
+            echo "mc client not found; skipping cold-tier S3 cleanup."
           fi
