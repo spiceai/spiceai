@@ -372,6 +372,10 @@ name = "delta_encoding_sweep"
 
 [[bench]]
 harness = false
+name = "compaction_write_amplification"
+
+[[bench]]
+harness = false
 name = "scan_under_write_attribution"
 
 [[bench]]
