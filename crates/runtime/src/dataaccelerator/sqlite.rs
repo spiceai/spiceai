@@ -471,8 +471,11 @@ impl DataAccelerator for SqliteAccelerator {
                 .iter()
                 .filter_map(|spicepod_ds| {
                     let acceleration = spicepod_ds.acceleration.as_ref()?;
-                    let engine_str =
-                        acceleration.engine.as_deref().unwrap_or("arrow").to_lowercase();
+                    let engine_str = acceleration
+                        .engine
+                        .as_deref()
+                        .unwrap_or("arrow")
+                        .to_lowercase();
                     if engine_str != "sqlite" {
                         return None;
                     }
@@ -484,8 +487,7 @@ impl DataAccelerator for SqliteAccelerator {
                     ) {
                         return None;
                     }
-                    let ds_name =
-                        datafusion::common::TableReference::parse_str(&spicepod_ds.name);
+                    let ds_name = datafusion::common::TableReference::parse_str(&spicepod_ds.name);
                     if ds_name.to_string() == source.name().to_string() {
                         return None;
                     }

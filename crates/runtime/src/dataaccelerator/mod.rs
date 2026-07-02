@@ -64,11 +64,10 @@ pub mod swappable;
 pub mod types;
 pub mod upsert_dedup;
 
-pub(crate) use snapshots::{validate_snapshot_paths};
+pub use runtime_acceleration::BootstrapStatus;
+pub(crate) use snapshots::validate_snapshot_paths;
 pub use snapshots::{CayenneSnapshotValidationError, validate_cayenne_snapshot_consistency};
 pub use types::{AccelerationSource, AcceleratorEngineRegistry};
-pub use runtime_acceleration::BootstrapStatus;
-
 
 #[derive(Clone, Copy)]
 pub struct AcceleratorRegistration {

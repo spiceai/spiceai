@@ -990,7 +990,9 @@ mod tests {
         });
 
         let accelerator = TursoAccelerator::new();
-        let result = accelerator.init(&dataset, dataset.runtime.accelerator_engine_registry()).await;
+        let result = accelerator
+            .init(&dataset, dataset.runtime.accelerator_engine_registry())
+            .await;
         assert!(result.is_err());
         let error = result.expect_err("Expected error for remote Turso database");
         assert!(
@@ -1020,7 +1022,9 @@ mod tests {
             ..Default::default()
         });
 
-        let result2 = accelerator.init(&dataset2, dataset2.runtime.accelerator_engine_registry()).await;
+        let result2 = accelerator
+            .init(&dataset2, dataset2.runtime.accelerator_engine_registry())
+            .await;
         assert!(result2.is_err());
         let error2 = result2.expect_err("Expected error for remote Turso database with auth token");
         assert!(

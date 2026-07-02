@@ -66,7 +66,8 @@ impl KafkaSys {
         let registry = dataset.runtime.accelerator_engine_registry();
         Ok(Self {
             dataset_name: dataset.name.to_string(),
-            acceleration_connection: acceleration_connection(dataset, registry, open_option).await?,
+            acceleration_connection: acceleration_connection(dataset, registry, open_option)
+                .await?,
             schema_ensured: OffsetSchemaState::default(),
         })
     }

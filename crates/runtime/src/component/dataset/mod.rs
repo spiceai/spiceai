@@ -144,12 +144,20 @@ impl From<runtime_acceleration::AccelerationParseError> for Error {
             AccelerationParseError::MultipleRefreshExpressionSpecified => {
                 Error::MultipleRefreshExpressionSpecified
             }
-            AccelerationParseError::IndexColumnNotFound { index, valid_columns } => {
-                Error::IndexColumnNotFound { index, valid_columns }
-            }
-            AccelerationParseError::PrimaryKeyColumnNotFound { invalid_column, valid_columns } => {
-                Error::PrimaryKeyColumnNotFound { invalid_column, valid_columns }
-            }
+            AccelerationParseError::IndexColumnNotFound {
+                index,
+                valid_columns,
+            } => Error::IndexColumnNotFound {
+                index,
+                valid_columns,
+            },
+            AccelerationParseError::PrimaryKeyColumnNotFound {
+                invalid_column,
+                valid_columns,
+            } => Error::PrimaryKeyColumnNotFound {
+                invalid_column,
+                valid_columns,
+            },
             AccelerationParseError::UnableToGetTableConstraints { source } => {
                 Error::UnableToGetTableConstraints { source }
             }
@@ -852,8 +860,13 @@ impl AccelerationSource for Dataset {
 
     fn initialized_sources<'a>(
         &'a self,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Vec<Arc<dyn runtime_acceleration::AccelerationSource>>> + Send + 'a>>
-    {
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = Vec<Arc<dyn runtime_acceleration::AccelerationSource>>>
+                + Send
+                + 'a,
+        >,
+    > {
         let app = self.app();
         let runtime = Arc::clone(&self.runtime);
         Box::pin(async move {

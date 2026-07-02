@@ -277,8 +277,13 @@ impl AccelerationSource for View {
 
     fn initialized_sources<'a>(
         &'a self,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Vec<Arc<dyn runtime_acceleration::AccelerationSource>>> + Send + 'a>>
-    {
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = Vec<Arc<dyn runtime_acceleration::AccelerationSource>>>
+                + Send
+                + 'a,
+        >,
+    > {
         let app = self.app();
         let runtime = Arc::clone(&self.runtime);
         Box::pin(async move {

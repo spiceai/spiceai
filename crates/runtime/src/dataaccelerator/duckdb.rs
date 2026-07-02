@@ -187,10 +187,8 @@ impl DuckDBAccelerator {
 
         let pool = match (duckdb_file, acceleration.mode) {
             (Ok(duckdb_file), Mode::File | Mode::FileCreate | Mode::FileUpdate) => {
-                let num_accelerating_datasets = self.get_num_accelerating_datasets(
-                    Some(duckdb_file.as_str()),
-                    &source.app(),
-                );
+                let num_accelerating_datasets =
+                    self.get_num_accelerating_datasets(Some(duckdb_file.as_str()), &source.app());
                 let storage =
                     resolve_acceleration_storage_async(acceleration.storage_profile, &duckdb_file)
                         .await;
@@ -245,11 +243,7 @@ impl DuckDBAccelerator {
         Ok(pool)
     }
 
-    fn get_num_accelerating_datasets(
-        &self,
-        path: Option<&str>,
-        app: &Arc<App>,
-    ) -> u32 {
+    fn get_num_accelerating_datasets(&self, path: Option<&str>, app: &Arc<App>) -> u32 {
         let mut instance_usage: u32 = 1;
 
         for spicepod_ds in &app.datasets {

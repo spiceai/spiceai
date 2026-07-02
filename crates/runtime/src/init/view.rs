@@ -299,11 +299,12 @@ impl Runtime {
                 }
             };
 
-            match accelerator.init(view.as_ref(), Arc::clone(&self.accelerator_engine_registry)).await.context(
-                AcceleratorInitializationFailedSnafu {
+            match accelerator
+                .init(view.as_ref(), Arc::clone(&self.accelerator_engine_registry))
+                .await
+                .context(AcceleratorInitializationFailedSnafu {
                     name: acceleration_settings.engine.to_string(),
-                },
-            ) {
+                }) {
                 Ok(_) => {
                     // Initialization successful, continue to next view
                 }
@@ -319,7 +320,6 @@ impl Runtime {
             }
         }
     }
-
 
     #[expect(clippy::result_large_err)]
     fn load_view(self: Arc<Self>, view: &Arc<View>, secrets: Arc<RwLock<Secrets>>) -> Result<()> {
