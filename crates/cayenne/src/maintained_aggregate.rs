@@ -1212,7 +1212,7 @@ impl AggregateAccumulator {
                 if !batch.column(*column_index).is_null(row) {
                     let scalar = ScalarValue::try_from_array(batch.column(*column_index), row)?;
                     let delta = scalar_as_i128(&scalar)?;
-                    *sum = sum.checked_add(delta).ok_or_else(sum_overflow)?;
+                    *sum = sum.checked_add(delta).ok_or_else(avg_overflow)?;
                     *count = count.checked_add(1).ok_or_else(count_overflow)?;
                 }
             }
@@ -1275,7 +1275,7 @@ impl AggregateAccumulator {
                     && !scalar.is_null()
                 {
                     let delta = scalar_as_i128(scalar)?;
-                    *sum = sum.checked_sub(delta).ok_or_else(sum_overflow)?;
+                    *sum = sum.checked_sub(delta).ok_or_else(retract_underflow)?;
                     *count = count.checked_sub(1).ok_or_else(retract_underflow)?;
                 }
             }
@@ -1642,6 +1642,18 @@ fn sum_overflow() -> DataFusionError {
 fn retract_underflow() -> DataFusionError {
     DataFusionError::Execution(
         "Maintained aggregate retraction underflowed its state; falling back to base table scan"
+            .to_string(),
+    )
+}
+
+/// The `AVG(int)` running sum overflowed its `i128` accumulator on the insert
+/// path. AVG-specific (not [`sum_overflow`], whose "SUM" text would misreport the
+/// failing aggregate); with `i128` headroom this is effectively unreachable, but
+/// it fails safe. The retract path reuses [`retract_underflow`], matching
+/// `COUNT`/`SUM(UInt64)`.
+fn avg_overflow() -> DataFusionError {
+    DataFusionError::Execution(
+        "Maintained aggregate AVG running sum overflowed its i128 accumulator; falling back to base table scan"
             .to_string(),
     )
 }
