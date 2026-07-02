@@ -62,6 +62,7 @@ impl StalenessReport {
             "  {:<14} {:>10} {:>10} {:>10} {:>10}",
             "dataset", "p50_ms", "p99_ms", "max_ms", "samples"
         );
+        let mut worst_max = Duration::ZERO;
         for table in &self.probe_tables {
             if let Some(stats) = self.tables.get(table.as_str()) {
                 println!(
@@ -72,16 +73,29 @@ impl StalenessReport {
                     stats.max.as_millis(),
                     stats.samples,
                 );
+                let attributes = [KeyValue::new("dataset", table.clone())];
                 #[expect(clippy::cast_precision_loss)]
                 let p99_ms = stats.p99.as_millis() as f64;
-                crate::metrics::DATA_FRESHNESS_P99
-                    .record(p99_ms, &[KeyValue::new("dataset", table.clone())]);
+                #[expect(clippy::cast_precision_loss)]
+                let max_ms = stats.max.as_millis() as f64;
+                crate::metrics::DATA_FRESHNESS_P99.record(p99_ms, &attributes);
+                crate::metrics::DATA_FRESHNESS_MAX.record(max_ms, &attributes);
+                if stats.max > worst_max {
+                    worst_max = stats.max;
+                }
             }
         }
-        println!("  worst P99:     {}ms", self.worst_p99.as_millis());
+        println!(
+            "  worst P99:     {}ms    worst max: {}ms",
+            self.worst_p99.as_millis(),
+            worst_max.as_millis(),
+        );
         #[expect(clippy::cast_precision_loss)]
-        let worst_ms = self.worst_p99.as_millis() as f64;
-        crate::metrics::DATA_FRESHNESS_P99.record(worst_ms, &[]);
+        let worst_p99_ms = self.worst_p99.as_millis() as f64;
+        #[expect(clippy::cast_precision_loss)]
+        let worst_max_ms = worst_max.as_millis() as f64;
+        crate::metrics::DATA_FRESHNESS_P99.record(worst_p99_ms, &[]);
+        crate::metrics::DATA_FRESHNESS_MAX.record(worst_max_ms, &[]);
     }
 }
 
