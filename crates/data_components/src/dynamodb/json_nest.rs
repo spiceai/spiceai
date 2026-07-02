@@ -116,8 +116,8 @@ mod tests {
             json!(42.0)
         );
         assert_eq!(
-            attribute_value_to_json(&AttributeValue::N("3.14".to_string())),
-            json!(3.14)
+            attribute_value_to_json(&AttributeValue::N("2.5".to_string())),
+            json!(2.5)
         );
     }
 
