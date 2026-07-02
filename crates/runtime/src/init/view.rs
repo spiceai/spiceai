@@ -23,12 +23,12 @@ use crate::{
     secrets::Secrets,
     status, view, warn_spaced,
 };
-use runtime_metrics as metrics;
 use app::App;
 use datafusion::sql::{TableReference, parser::DFParser, sqlparser::dialect::PostgreSqlDialect};
 #[cfg(feature = "duckdb")]
 use futures::stream::StreamExt;
 use itertools::Itertools;
+use runtime_metrics as metrics;
 use snafu::prelude::*;
 use tokio::sync::RwLock;
 use util::topological_ordering::{
