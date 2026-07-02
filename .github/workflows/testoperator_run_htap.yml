@@ -239,12 +239,14 @@ jobs:
       # cold prefix after the run. Gated to the cold config; `mc` + the `spice-minio` alias come from
       # the Install MinIO step above. Runs on failure/cancel too so a crashed run leaves no orphans.
       - name: Clean up Cayenne cold-tier S3 objects
-        if: always() && contains(github.event.inputs.spicepod_path, 'cold')
+        if: always() && endsWith(github.event.inputs.spicepod_path, 'cold-sf1000.yaml')
         run: |
           if command -v mc >/dev/null 2>&1; then
-            echo "Removing cold-tier objects under spice-minio/benchmarks/cayenne-cold-sf1000/ ..."
-            mc rm --recursive --force spice-minio/benchmarks/cayenne-cold-sf1000/ \
-              || echo "Nothing to remove (prefix already clean)."
+            echo "Removing cold-tier objects under spice-minio/benchmarks/cayenne-cold-sf1000/ (best-effort; an empty prefix is expected when no promotion ran) ..."
+            # Non-fatal: mc prints its own diagnostics (empty prefix, or an auth/endpoint failure) to
+            # the log, but a cleanup miss must never fail the benchmark run. No success/"already clean"
+            # message here, so a real mc failure is not misreported.
+            mc rm --recursive --force spice-minio/benchmarks/cayenne-cold-sf1000/ || true
           else
             echo "mc client not found; skipping cold-tier S3 cleanup."
           fi
