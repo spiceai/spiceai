@@ -50,6 +50,8 @@ pub struct StalenessReport {
     pub tables: HashMap<String, StalenessStats>,
     /// Ordered list of probed table names (for consistent output).
     pub probe_tables: Vec<String>,
+    /// Worst-case P99 across all tables.
+    pub worst_p99: Duration,
     /// Worst-case max across all tables.
     pub worst_max: Duration,
 }
@@ -81,9 +83,13 @@ impl StalenessReport {
                 crate::metrics::DATA_FRESHNESS_MAX.record(max_ms, &attributes);
             }
         }
+        println!("  worst P99: {}ms", self.worst_p99.as_millis());
         println!("  worst max: {}ms", self.worst_max.as_millis());
         #[expect(clippy::cast_precision_loss)]
+        let worst_p99_ms = self.worst_p99.as_millis() as f64;
+        #[expect(clippy::cast_precision_loss)]
         let worst_max_ms = self.worst_max.as_millis() as f64;
+        crate::metrics::DATA_FRESHNESS_P99.record(worst_p99_ms, &[]);
         crate::metrics::DATA_FRESHNESS_MAX.record(worst_max_ms, &[]);
     }
 }
@@ -209,6 +215,7 @@ pub(super) async fn query_max_bench_ts_spice(
 /// Build the final report from raw gap samples (in microseconds).
 fn build_report(samples: HashMap<String, Vec<i64>>, probe_tables: Vec<String>) -> StalenessReport {
     let mut tables = HashMap::new();
+    let mut worst_p99 = Duration::ZERO;
     let mut worst_max = Duration::ZERO;
 
     for (table, mut gaps) in samples {
@@ -243,6 +250,9 @@ fn build_report(samples: HashMap<String, Vec<i64>>, probe_tables: Vec<String>) -
         let p99 = Duration::from_micros(gaps[pct(0.99)].cast_unsigned());
         let max = Duration::from_micros(gaps[n - 1].cast_unsigned());
 
+        if p99 > worst_p99 {
+            worst_p99 = p99;
+        }
         if max > worst_max {
             worst_max = max;
         }
@@ -261,6 +271,7 @@ fn build_report(samples: HashMap<String, Vec<i64>>, probe_tables: Vec<String>) -
     StalenessReport {
         tables,
         probe_tables,
+        worst_p99,
         worst_max,
     }
 }
