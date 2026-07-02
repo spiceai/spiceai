@@ -10024,9 +10024,7 @@ impl CayenneTableProvider {
             // Fire-and-forget compaction / orphan-DV sweep / inline checkpoint
             // each set their flag BEFORE spawning and clear it when done, so spin
             // until all are clear — no scheduled-or-running detached pass remains.
-            while self
-                .post_write_compaction_scheduled
-                .load(Ordering::Acquire)
+            while self.post_write_compaction_scheduled.load(Ordering::Acquire)
                 || self.orphan_dv_sweep_scheduled.load(Ordering::Acquire)
                 || self.inline_checkpoint_scheduled.load(Ordering::Acquire)
             {
@@ -10034,7 +10032,11 @@ impl CayenneTableProvider {
             }
             // A drained compaction/sweep may have re-queued maintenance; repeat
             // until a full pass finds nothing pending.
-            if self.post_write_maintenance.scheduled.load(Ordering::Acquire) {
+            if self
+                .post_write_maintenance
+                .scheduled
+                .load(Ordering::Acquire)
+            {
                 continue;
             }
             break;
