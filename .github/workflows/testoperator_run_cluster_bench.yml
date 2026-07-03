@@ -324,18 +324,6 @@ jobs:
           # env vars, which testoperator's child process inherits from this step's
           # env block.
 
-          # Dev cluster resource sizing. Pin the scheduler (app) and executors to
-          # a 4Gi memory footprint so the run schedules on a dev cluster instead
-          # of the 62Gi production defaults baked into the federated-direct
-          # scenario, and run 3 executors. Applied directly here (not via
-          # workflow_dispatch inputs) because this is a dev-only test. Only the
-          # env vars the federated-direct scenario already references take effect
-          # (app/executor memory limit + executor replicas); CPU limits, resource
-          # requests, and scheduler replica count are not wired into that scenario.
-          export SPIDAPTER_APP_MEMORY_LIMIT="4Gi"
-          export SPIDAPTER_EXECUTOR_MEMORY_LIMIT="4Gi"
-          export SPIDAPTER_EXECUTOR_REPLICAS="3"
-
           # Tag the created app with `organization: spicehq`. spidapter only sets
           # the organization tag when this env var is non-empty.
           export SPIDAPTER_ORGANIZATION_TAG="spicehq"
