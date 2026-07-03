@@ -9,7 +9,7 @@ inputs:
   go_version:
     description: 'Go version to use for building'
     required: false
-    default: '1.24.1'
+    default: '1.26.1'
 
 runs:
   using: 'composite'
