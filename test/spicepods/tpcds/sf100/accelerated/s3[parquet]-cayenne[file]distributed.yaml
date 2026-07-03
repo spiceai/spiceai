@@ -1,0 +1,177 @@
+version: v1
+kind: Spicepod
+name: s3[parquet]-cayenne[file]-distributed
+datasets:
+  - from: s3://spiceai-public-datasets/tpcds_sf100/catalog_sales.parquet
+    name: catalog_sales
+    params: &s3_params
+      file_format: parquet
+      s3_auth: public
+      s3_region: us-east-1
+    acceleration: &acceleration
+      enabled: true
+      engine: cayenne
+      mode: file
+      partition_by:
+        - bucket(6, cs_sold_date_sk)
+  - from: s3://spiceai-public-datasets/tpcds_sf100/catalog_returns.parquet
+    name: catalog_returns
+    params: *s3_params
+    acceleration:
+      <<: *acceleration
+      partition_by:
+        - bucket(6, cr_returned_date_sk)
+  - from: s3://spiceai-public-datasets/tpcds_sf100/inventory.parquet
+    name: inventory
+    params: *s3_params
+    acceleration:
+      <<: *acceleration
+      partition_by:
+        - bucket(6, inv_date_sk)
+  - from: s3://spiceai-public-datasets/tpcds_sf100/store_sales.parquet
+    name: store_sales
+    params: *s3_params
+    acceleration:
+      <<: *acceleration
+      partition_by:
+        - bucket(6, ss_sold_date_sk)
+  - from: s3://spiceai-public-datasets/tpcds_sf100/store_returns.parquet
+    name: store_returns
+    params: *s3_params
+    acceleration:
+      <<: *acceleration
+      partition_by:
+        - bucket(6, sr_returned_date_sk)
+  - from: s3://spiceai-public-datasets/tpcds_sf100/web_sales.parquet
+    name: web_sales
+    params: *s3_params
+    acceleration:
+      <<: *acceleration
+      partition_by:
+        - bucket(6, ws_sold_date_sk)
+  - from: s3://spiceai-public-datasets/tpcds_sf100/web_returns.parquet
+    name: web_returns
+    params: *s3_params
+    acceleration:
+      <<: *acceleration
+      partition_by:
+        - bucket(6, wr_returned_date_sk)
+  - from: s3://spiceai-public-datasets/tpcds_sf100/customer.parquet
+    name: customer
+    params: *s3_params
+    acceleration:
+      <<: *acceleration
+      partition_by:
+        - bucket(6, c_customer_sk)
+  - from: s3://spiceai-public-datasets/tpcds_sf100/customer_address.parquet
+    name: customer_address
+    params: *s3_params
+    acceleration:
+      <<: *acceleration
+      partition_by:
+        - bucket(6, ca_address_sk)
+  - from: s3://spiceai-public-datasets/tpcds_sf100/customer_demographics.parquet
+    name: customer_demographics
+    params: *s3_params
+    acceleration:
+      <<: *acceleration
+      partition_by:
+        - bucket(6, cd_demo_sk)
+  - from: s3://spiceai-public-datasets/tpcds_sf100/date_dim.parquet
+    name: date_dim
+    params: *s3_params
+    acceleration:
+      <<: *acceleration
+      partition_by:
+        - bucket(6, d_date_sk)
+  - from: s3://spiceai-public-datasets/tpcds_sf100/household_demographics.parquet
+    name: household_demographics
+    params: *s3_params
+    acceleration:
+      <<: *acceleration
+      partition_by:
+        - bucket(6, hd_demo_sk)
+  - from: s3://spiceai-public-datasets/tpcds_sf100/item.parquet
+    name: item
+    params: *s3_params
+    acceleration:
+      <<: *acceleration
+      partition_by:
+        - bucket(6, i_item_sk)
+  - from: s3://spiceai-public-datasets/tpcds_sf100/promotion.parquet
+    name: promotion
+    params: *s3_params
+    acceleration:
+      <<: *acceleration
+      partition_by:
+        - bucket(6, p_promo_sk)
+  - from: s3://spiceai-public-datasets/tpcds_sf100/ship_mode.parquet
+    name: ship_mode
+    params: *s3_params
+    acceleration:
+      <<: *acceleration
+      partition_by:
+        - bucket(6, sm_ship_mode_sk)
+  - from: s3://spiceai-public-datasets/tpcds_sf100/store.parquet
+    name: store
+    params: *s3_params
+    acceleration:
+      <<: *acceleration
+      partition_by:
+        - bucket(6, s_store_sk)
+  - from: s3://spiceai-public-datasets/tpcds_sf100/time_dim.parquet
+    name: time_dim
+    params: *s3_params
+    acceleration:
+      <<: *acceleration
+      partition_by:
+        - bucket(6, t_time_sk)
+  - from: s3://spiceai-public-datasets/tpcds_sf100/warehouse.parquet
+    name: warehouse
+    params: *s3_params
+    acceleration:
+      <<: *acceleration
+      partition_by:
+        - bucket(6, w_warehouse_sk)
+  - from: s3://spiceai-public-datasets/tpcds_sf100/web_page.parquet
+    name: web_page
+    params: *s3_params
+    acceleration:
+      <<: *acceleration
+      partition_by:
+        - bucket(6, wp_web_page_sk)
+  - from: s3://spiceai-public-datasets/tpcds_sf100/web_site.parquet
+    name: web_site
+    params: *s3_params
+    acceleration:
+      <<: *acceleration
+      partition_by:
+        - bucket(6, web_site_sk)
+  - from: s3://spiceai-public-datasets/tpcds_sf100/reason.parquet
+    name: reason
+    params: *s3_params
+    acceleration:
+      <<: *acceleration
+      partition_by:
+        - bucket(6, r_reason_sk)
+  - from: s3://spiceai-public-datasets/tpcds_sf100/call_center.parquet
+    name: call_center
+    params: *s3_params
+    acceleration:
+      <<: *acceleration
+      partition_by:
+        - bucket(6, cc_call_center_sk)
+  - from: s3://spiceai-public-datasets/tpcds_sf100/income_band.parquet
+    name: income_band
+    params: *s3_params
+    acceleration:
+      <<: *acceleration
+      partition_by:
+        - bucket(6, ib_income_band_sk)
+  - from: s3://spiceai-public-datasets/tpcds_sf100/catalog_page.parquet
+    name: catalog_page
+    params: *s3_params
+    acceleration:
+      <<: *acceleration
+      partition_by:
+        - bucket(6, cp_catalog_page_sk)
