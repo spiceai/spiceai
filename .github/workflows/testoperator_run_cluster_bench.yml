@@ -264,7 +264,7 @@ jobs:
       - name: Management login (prod)
         uses: ./.github/actions/management-login
         with:
-          token-url: https://spice.ai/api/oauth/token
+          token-url: https://dev.spice.ai/api/oauth/token
           client-id: ${{ secrets.SPICE_MANAGEMENT_CLIENT_ID_DEV }}
           client-secret: ${{ secrets.SPICE_MANAGEMENT_CLIENT_SECRET_DEV }}
           # Exports SPICEAI_API_KEY for subsequent steps. Same prod creds
@@ -273,7 +273,7 @@ jobs:
       - name: Run the cluster benchmark - ${{ env.CB_SPICEPOD_PATH }}
         env:
           SPICEAI_API_KEY: ${{ env.SPICEAI_API_KEY }}
-          SPICE_CLOUD_API_URL: https://api.spice.ai
+          SPICE_CLOUD_API_URL: https://dev-api.spice.ai
           S3_ENDPOINT: ${{ secrets.TEST_MINIO_ENDPOINT }}
           S3_KEY: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
           S3_SECRET: ${{ secrets.TEST_MINIO_SECRET_KEY }}
