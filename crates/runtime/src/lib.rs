@@ -996,7 +996,7 @@ impl Runtime {
     /// table had no data at initial-load time). A periodic rebroadcast keeps the
     /// coordinator's join-sizing statistics fresh as the executor's local data grows.
     pub(crate) async fn run_executor_statistics_reporter(self: Arc<Self>) {
-        let mut interval = tokio::time::interval(std::time::Duration::from_secs(45));
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         // The statistics source (`local_executor_table_statistics`) reads the
         // Cayenne metastore aggregate, which is maintained incrementally on the
