@@ -149,9 +149,9 @@ aws-smithy-runtime = "1.11.1"
 aws-smithy-runtime-api = "1.11.6"
 aws-smithy-types = "1.4.5"
 axum = { version = "0.8", features = ["macros"] }
-ballista-core = { git = "https://github.com/spiceai/datafusion-ballista.git", rev = "7ffff076b7bcd733f5c05dd60398b2f65da99781" } # branch: phillip/shuffle-fetch-flow-control (spiceai-54 + PR #62, validation)
-ballista-executor = { git = "https://github.com/spiceai/datafusion-ballista.git", rev = "7ffff076b7bcd733f5c05dd60398b2f65da99781" }
-ballista-scheduler = { git = "https://github.com/spiceai/datafusion-ballista.git", rev = "7ffff076b7bcd733f5c05dd60398b2f65da99781" }
+ballista-core = { git = "https://github.com/spiceai/datafusion-ballista.git", rev = "f96ad3a83b9da568afd96c4000d414cd68773e63" } # branch: phillip/shuffle-scale-fixes (spiceai-54 + PRs #62+#63, validation)
+ballista-executor = { git = "https://github.com/spiceai/datafusion-ballista.git", rev = "f96ad3a83b9da568afd96c4000d414cd68773e63" }
+ballista-scheduler = { git = "https://github.com/spiceai/datafusion-ballista.git", rev = "f96ad3a83b9da568afd96c4000d414cd68773e63" }
 base64 = "0.22.1"
 bb8 = "0.9"
 bb8-postgres = "0.9"
@@ -394,7 +394,7 @@ inherits = "dev"
 lto = "off"
 
 [patch.crates-io]
-datafusion = { git = "https://github.com/spiceai/datafusion.git", rev = "c94202b4b6c6d8da2a4f87bfdd6e4a21dad8a953" } # branch: phillip/shuffle-fetch-flow-control (spiceai-54 + PR #62, validation)
+datafusion = { git = "https://github.com/spiceai/datafusion.git", rev = "c94202b4b6c6d8da2a4f87bfdd6e4a21dad8a953" } # branch: phillip/shuffle-scale-fixes (spiceai-54 + PRs #62+#63, validation)
 datafusion-catalog = { git = "https://github.com/spiceai/datafusion.git", rev = "c94202b4b6c6d8da2a4f87bfdd6e4a21dad8a953" }
 datafusion-catalog-listing = { git = "https://github.com/spiceai/datafusion.git", rev = "c94202b4b6c6d8da2a4f87bfdd6e4a21dad8a953" }
 datafusion-common = { git = "https://github.com/spiceai/datafusion.git", rev = "c94202b4b6c6d8da2a4f87bfdd6e4a21dad8a953" }
