@@ -393,23 +393,40 @@ async fn reciprocal_rank_fusion_plan(
 
     let mut builder = LogicalPlanBuilder::from(first_plan.clone());
 
-    // 3) FULL OUTER JOIN remaining tables on primary key columns
+    // 3) FULL OUTER JOIN remaining tables on primary key columns.
+    //
+    // Each new table is keyed against the COALESCE of the primary key across
+    // *every* table already joined, not just the first stream. Keying only on
+    // the first stream's PK (which is NULL for any document absent from that
+    // stream) is wrong under a FULL OUTER JOIN: a document matched by streams 2+
+    // but not stream 1 fails the equality and lands in its own row per stream.
+    // With no aggregation afterward, the API then returns the same primary key
+    // multiple times, each row carrying only part of the RRF sum, displacing
+    // legitimate results within `limit`. Coalescing the already-joined keys
+    // keeps one row per document so the per-row RRF sum below is complete. Needs
+    // >=3 fused streams to trigger; see issue #11265.
+    let mut joined_tables: Vec<TableReference> = vec![first_table_name.clone()];
     for (table_name, plan) in ranked_plans.iter().skip(1) {
-        builder = builder.join(
-            plan.clone(),
-            JoinType::Full,
-            (
-                primary_key
+        let on_exprs: Vec<LogicalExpr> = primary_key
+            .iter()
+            .map(|pk| {
+                let left_keys: Vec<LogicalExpr> = joined_tables
                     .iter()
-                    .map(|pk| pk.clone().with_relation(first_table_name.clone()))
-                    .collect(),
-                primary_key
-                    .iter()
-                    .map(|pk| pk.clone().with_relation(table_name.clone()))
-                    .collect(),
-            ),
-            None,
-        )?;
+                    .map(|t| col(pk.clone().with_relation(t.clone())))
+                    .collect();
+                let left = if left_keys.len() == 1 {
+                    left_keys
+                        .into_iter()
+                        .next()
+                        .expect("left_keys has exactly one element")
+                } else {
+                    coalesce(left_keys)
+                };
+                left.eq(col(pk.clone().with_relation(table_name.clone())))
+            })
+            .collect();
+        builder = builder.join_on(plan.clone(), JoinType::Full, on_exprs)?;
+        joined_tables.push(table_name.clone());
     }
 
     // 4) Build the RRF score: SUM(COALESCE(1.0/(rank + k), 0)) across all tables
@@ -663,6 +680,109 @@ mod tests {
         assert!(
             result.is_ok(),
             "Utf8 and LargeUtf8 should be considered semantically equivalent"
+        );
+    }
+
+    /// Regression test for #11265: with >=3 fused streams, the chained FULL OUTER
+    /// JOIN keyed every table against the *first* stream's primary key. That key
+    /// is NULL for any document absent from stream 1, so a document matched by
+    /// streams 2+ but not stream 1 failed the equality and split into one row per
+    /// stream — each carrying only part of the RRF sum, and with no aggregation
+    /// afterward the API returned the same primary key more than once. The fix
+    /// keys each join on the COALESCE of the key across every already-joined
+    /// stream, so each document produces exactly one row carrying the full RRF
+    /// sum. Document `C` is present in streams 2 & 3 but absent from stream 1.
+    #[tokio::test]
+    async fn rrf_plan_dedups_doc_absent_from_first_stream_11265() {
+        use arrow::array::{Float64Array, RecordBatch, StringArray};
+
+        // A ranked-input table with (id, _score, _value) rows. `_value` mirrors
+        // `id` here; only its presence matters (the plan projects one per stream).
+        fn make_table(rows: &[(&str, f64)]) -> Arc<MemTable> {
+            let schema = Arc::new(Schema::new(vec![
+                Field::new("id", DataType::Utf8, false),
+                Field::new(SEARCH_SCORE_COLUMN_NAME, DataType::Float64, false),
+                Field::new(SEARCH_VALUE_COLUMN_NAME, DataType::Utf8, false),
+            ]));
+            let ids = StringArray::from(rows.iter().map(|(id, _)| *id).collect::<Vec<_>>());
+            let scores = Float64Array::from(rows.iter().map(|(_, s)| *s).collect::<Vec<_>>());
+            let values = StringArray::from(rows.iter().map(|(id, _)| *id).collect::<Vec<_>>());
+            let batch = RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![Arc::new(ids), Arc::new(scores), Arc::new(values)],
+            )
+            .expect("record batch");
+            Arc::new(MemTable::try_new(schema, vec![vec![batch]]).expect("mem table"))
+        }
+
+        let ctx = SessionContext::new();
+        // Stream 1: A,B ; Stream 2: B,C ; Stream 3: C,D. Higher `_score` ranks
+        // first. `C` is in streams 2 & 3 but NOT stream 1 (the #11265 case).
+        ctx.register_table("t0", make_table(&[("A", 0.9), ("B", 0.8)]))
+            .expect("register t0");
+        ctx.register_table("t1", make_table(&[("B", 0.9), ("C", 0.7)]))
+            .expect("register t1");
+        ctx.register_table("t2", make_table(&[("C", 0.95), ("D", 0.6)]))
+            .expect("register t2");
+
+        let tables = vec![
+            TableReference::bare("t0"),
+            TableReference::bare("t1"),
+            TableReference::bare("t2"),
+        ];
+        let primary_key = vec![Column::from_name("id")];
+        let k = DEFAULT_RRF_K;
+
+        let plan = reciprocal_rank_fusion_plan(&ctx, &tables, &primary_key, &[], k, 100)
+            .await
+            .expect("build RRF plan");
+        let batches = ctx
+            .execute_logical_plan(plan)
+            .await
+            .expect("execute plan")
+            .collect()
+            .await
+            .expect("collect");
+
+        // Map each output document id to its fused score, asserting no id repeats.
+        let mut scores: HashMap<String, f64> = HashMap::new();
+        let mut total_rows = 0usize;
+        for batch in &batches {
+            let ids = batch
+                .column_by_name("id")
+                .expect("id column present")
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .expect("id column is Utf8");
+            let sc = batch
+                .column_by_name(SEARCH_SCORE_COLUMN_NAME)
+                .expect("score column present")
+                .as_any()
+                .downcast_ref::<Float64Array>()
+                .expect("score column is Float64");
+            for i in 0..batch.num_rows() {
+                total_rows += 1;
+                let prev = scores.insert(ids.value(i).to_string(), sc.value(i));
+                assert!(
+                    prev.is_none(),
+                    "document {} appeared more than once — the chained RRF join \
+                     failed to dedup (#11265)",
+                    ids.value(i)
+                );
+            }
+        }
+
+        // Exactly one row per distinct document; the pre-fix join emitted a
+        // second row for C (present in streams 2 & 3 but not stream 1).
+        assert_eq!(total_rows, 4, "expected exactly one row per document");
+
+        // C's fused score is the full RRF sum of both stream contributions
+        // (rank 2 in stream 2 + rank 1 in stream 3), not a single split fragment.
+        let expected_c = 1.0 / (2.0 + k) + 1.0 / (1.0 + k);
+        let actual_c = *scores.get("C").expect("C present in fused output");
+        assert!(
+            (actual_c - expected_c).abs() < 1e-9,
+            "C fused score {actual_c} != expected RRF sum {expected_c}"
         );
     }
 }

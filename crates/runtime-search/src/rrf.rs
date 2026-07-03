@@ -1013,9 +1013,6 @@ impl ReciprocalRankFusion {
 
     // Reduces 2 or more search subquery DFs into a single one
     fn fold_join(a: DataFrame, b: DataFrame, join_key: &str) -> Result<DataFrame> {
-        let (tbl_a, id_a) = Self::first_qualified_field(&a, join_key)?;
-        let (tbl_b, id_b) = Self::first_qualified_field(&b, join_key)?;
-
         // Drop embedding columns before the full outer join — they are non-nullable
         // in Arrow but the join produces nulls for unmatched rows, causing a schema
         // violation. They are excluded from the final projection anyway.
@@ -1037,10 +1034,43 @@ impl ReciprocalRankFusion {
         let a = drop_embedding_cols(a)?;
         let b = drop_embedding_cols(b)?;
 
+        // `a` is the accumulator of every stream fused so far and therefore holds
+        // one qualified copy of the join key per stream (`search_0.pk`,
+        // `search_1.pk`, ...). Keying the next join on only the *first* stream's
+        // copy is wrong under a FULL OUTER JOIN: that copy is NULL for any
+        // document absent from stream 0, so a document present in later streams
+        // but not stream 0 never matches and splits into one row per stream. The
+        // downstream `max(_fused_score)` aggregation then keeps a single stream's
+        // partial contribution instead of the RRF sum, roughly halving the fused
+        // score and corrupting the top-K. Coalescing across every already-joined
+        // copy of the key keeps one row per document. Needs >=3 fused streams to
+        // trigger; see issue #11265.
+        let a_keys: Vec<Expr> = a
+            .schema()
+            .qualified_fields_with_unqualified_name(join_key)
+            .into_iter()
+            .filter_map(|(maybe_tr, f)| {
+                maybe_tr.map(|tr| col_qualified!(tr.clone(), f.name().clone()))
+            })
+            .collect();
+        let a_key = match a_keys.len() {
+            0 => {
+                return Err(DataFusionError::Execution(format!(
+                    "{RRF_UDF_NAME}: Cannot resolve column {join_key} when fusing results"
+                )));
+            }
+            1 => a_keys
+                .into_iter()
+                .next()
+                .expect("a_keys has exactly one element"),
+            _ => coalesce(a_keys),
+        };
+        let (tbl_b, id_b) = Self::first_qualified_field(&b, join_key)?;
+
         a.join_on(
             b,
             JoinType::Full,
-            vec![col_qualified!(tbl_a, id_a).eq(col_qualified!(tbl_b, id_b))],
+            vec![a_key.eq(col_qualified!(tbl_b, id_b))],
         )
     }
 
@@ -1319,7 +1349,7 @@ impl TableProvider for ReciprocalRankFusion {
 
 #[cfg(test)]
 mod tests {
-    use crate::rrf::ReciprocalRankFusionArgs;
+    use crate::rrf::{ReciprocalRankFusion, ReciprocalRankFusionArgs};
     use datafusion::arrow::datatypes::DataType;
 
     use datafusion::logical_expr::Expr;
@@ -1497,6 +1527,55 @@ mod tests {
             parsed.rrf_subquery_arguments[0].rank_weight,
             Some(2.5),
             "rank_weight should be 2.5"
+        );
+    }
+
+    /// Regression test for #11265: with >=3 fused streams, keying every chained
+    /// FULL OUTER JOIN on the first stream's copy of the join key split a
+    /// document present in later streams but absent from stream 0 into one row
+    /// per stream. `fold_join` must instead key on the COALESCE of the key
+    /// across every already-joined stream so each document produces exactly one
+    /// row. Document `C` below is in streams 1 & 2 but not stream 0 — the
+    /// pre-fix code emitted 5 rows (a duplicate `C`); the fix emits 4.
+    #[tokio::test]
+    async fn fold_join_dedups_doc_absent_from_first_stream_11265() {
+        use datafusion::arrow::array::{RecordBatch, StringArray};
+        use datafusion::arrow::datatypes::{Field, Schema};
+        use datafusion::datasource::MemTable;
+        use datafusion::prelude::SessionContext;
+
+        fn table(ids: &[&str]) -> Arc<MemTable> {
+            let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Utf8, false)]));
+            let batch = RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![Arc::new(StringArray::from(ids.to_vec()))],
+            )
+            .expect("record batch");
+            Arc::new(MemTable::try_new(schema, vec![vec![batch]]).expect("mem table"))
+        }
+
+        let ctx = SessionContext::new();
+        ctx.register_table("search_0", table(&["A", "B"]))
+            .expect("register search_0");
+        ctx.register_table("search_1", table(&["B", "C"]))
+            .expect("register search_1");
+        ctx.register_table("search_2", table(&["C", "D"]))
+            .expect("register search_2");
+
+        let s0 = ctx.table("search_0").await.expect("read search_0");
+        let s1 = ctx.table("search_1").await.expect("read search_1");
+        let s2 = ctx.table("search_2").await.expect("read search_2");
+
+        let j01 = ReciprocalRankFusion::fold_join(s0, s1, "id").expect("fold streams 0,1");
+        let j012 = ReciprocalRankFusion::fold_join(j01, s2, "id").expect("fold streams 01,2");
+
+        let batches = j012.collect().await.expect("collect fused rows");
+        let rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
+
+        assert_eq!(
+            rows, 4,
+            "fold_join must produce exactly one row per document {{A,B,C,D}}; the \
+             pre-fix first-stream-keyed join split C into a second row (#11265)"
         );
     }
 }
