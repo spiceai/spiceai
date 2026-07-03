@@ -1,0 +1,82 @@
+version: v1
+kind: Spicepod
+name: s3[parquet]-cayenne[file]-distributed
+datasets:
+  - from: s3://benchmarks/tpch_sf1/customer.parquet
+    name: customer
+    params: &s3_params
+      file_format: parquet
+      allow_http: true
+      s3_auth: key
+      s3_endpoint: ${secrets:S3_ENDPOINT}
+      s3_key: ${secrets:S3_KEY}
+      s3_secret: ${secrets:S3_SECRET}
+    acceleration:
+      enabled: true
+      engine: cayenne
+      mode: file
+      partition_by:
+        - bucket(6, c_name)
+  - from: s3://benchmarks/tpch_sf1/lineitem.parquet
+    name: lineitem
+    params: *s3_params
+    acceleration:
+      enabled: true
+      engine: cayenne
+      mode: file
+      partition_by:
+        - date_part('year', l_shipdate)
+  - from: s3://benchmarks/tpch_sf1/nation.parquet
+    name: nation
+    params: *s3_params
+    acceleration: &acceleration
+      enabled: true
+      engine: cayenne
+      mode: file
+      partition_by:
+        - bucket(3, n_name)
+  - from: s3://benchmarks/tpch_sf1/orders.parquet
+    name: orders
+    params: *s3_params
+    acceleration:
+      enabled: true
+      engine: cayenne
+      mode: file
+      partition_by:
+        - bucket(6, o_custkey)
+  - from: s3://benchmarks/tpch_sf1/part.parquet
+    name: part
+    params: *s3_params
+    acceleration:
+      enabled: true
+      engine: cayenne
+      mode: file
+      partition_by:
+        - bucket(6, p_name)
+  - from: s3://benchmarks/tpch_sf1/partsupp.parquet
+    name: partsupp
+    params: *s3_params
+    acceleration:
+      enabled: true
+      engine: cayenne
+      mode: file
+      partition_by:
+        - bucket(6, ps_partkey)
+  - from: s3://benchmarks/tpch_sf1/region.parquet
+    name: region
+    params: *s3_params
+    acceleration:
+      enabled: true
+      engine: cayenne
+      mode: file
+      partition_by:
+        - bucket(3, r_name)
+  - from: s3://benchmarks/tpch_sf1/supplier.parquet
+    name: supplier
+    params: *s3_params
+    acceleration:
+      enabled: true
+      engine: cayenne
+      mode: file
+      partition_by:
+        - bucket(6, s_name)
