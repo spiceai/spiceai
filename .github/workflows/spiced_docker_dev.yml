@@ -226,7 +226,6 @@ jobs:
             build.on_trunk=${{ needs.setup.outputs.on_trunk }}
             build.ref_type=${{ github.ref_type }}
             build.ref_name=${{ github.ref_name }}
-            build.channel=internal
 
       - name: Validate ARM64 image
         run: |
@@ -304,7 +303,6 @@ jobs:
             build.on_trunk=${{ needs.setup.outputs.on_trunk }}
             build.ref_type=${{ github.ref_type }}
             build.ref_name=${{ github.ref_name }}
-            build.channel=internal
 
       - name: Validate AMD64 image
         run: |
