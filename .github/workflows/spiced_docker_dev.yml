@@ -69,6 +69,8 @@ jobs:
       run_arm64: ${{ steps.set_targets.outputs.run_arm64 }}
       image: ${{ steps.set_image_metadata.outputs.image }}
       tag: ${{ steps.set_image_metadata.outputs.tag }}
+      revision: ${{ steps.provenance.outputs.revision }}
+      on_trunk: ${{ steps.provenance.outputs.on_trunk }}
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
@@ -97,6 +99,24 @@ jobs:
           echo "rel_version=${version}" >> $GITHUB_OUTPUT
           echo "dev_label=${dev_label}" >> $GITHUB_OUTPUT
           echo "Building dev image with version: \"${version}\""
+
+      - name: Determine build provenance
+        id: provenance
+        run: |
+          # Raw commit actually built (HEAD = `inputs.ref || github.sha`).
+          revision="$(git rev-parse HEAD)"
+          # "Is this trunk code": is the built commit reachable from trunk's tip?
+          # Only trunk's recent history is needed, so fetch a shallow slice rather
+          # than the whole repo.
+          git fetch --depth=100 --no-tags origin trunk
+          if git merge-base --is-ancestor HEAD FETCH_HEAD 2>/dev/null; then
+            on_trunk=true
+          else
+            on_trunk=false
+          fi
+          echo "revision=${revision}" >> "$GITHUB_OUTPUT"
+          echo "on_trunk=${on_trunk}" >> "$GITHUB_OUTPUT"
+          echo "Provenance: revision=${revision} on_trunk=${on_trunk} ref_type=${GITHUB_REF_TYPE} ref_name=${GITHUB_REF_NAME}"
 
       - name: Set target architectures
         id: set_targets
@@ -199,6 +219,14 @@ jobs:
           build-args: |
             CARGO_FEATURES=${{ env.CARGO_FEATURES }}
             RUST_PROFILE=${{ env.RUST_PROFILE }}
+          # Provenance labels baked into the image config (survive the multi-arch
+          # `imagetools create` in publish, readable via `docker inspect`).
+          labels: |
+            org.opencontainers.image.revision=${{ needs.setup.outputs.revision }}
+            build.on_trunk=${{ needs.setup.outputs.on_trunk }}
+            build.ref_type=${{ github.ref_type }}
+            build.ref_name=${{ github.ref_name }}
+            build.channel=internal
 
       - name: Validate ARM64 image
         run: |
@@ -269,6 +297,14 @@ jobs:
           build-args: |
             CARGO_FEATURES=${{ env.CARGO_FEATURES }}
             RUST_PROFILE=${{ env.RUST_PROFILE }}
+          # Provenance labels baked into the image config (survive the multi-arch
+          # `imagetools create` in publish, readable via `docker inspect`).
+          labels: |
+            org.opencontainers.image.revision=${{ needs.setup.outputs.revision }}
+            build.on_trunk=${{ needs.setup.outputs.on_trunk }}
+            build.ref_type=${{ github.ref_type }}
+            build.ref_name=${{ github.ref_name }}
+            build.channel=internal
 
       - name: Validate AMD64 image
         run: |
