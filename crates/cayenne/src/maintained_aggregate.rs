@@ -1127,14 +1127,20 @@ impl ResolvedAggregateExpr {
                     expr.function
                 )));
             }
-            // `MIN`/`MAX` preserve the input type (no widening) and are
-            // maintained via an ordered multiset over the integer families. A
-            // float or otherwise-unsupported column falls to the catch-all below
-            // (the view does not build; the query re-scans — correct, not fast).
+            // `MIN`/`MAX` preserve the input type (no widening) and are maintained
+            // via an ordered multiset. Supported: the signed/unsigned integer
+            // families and the integer-backed temporal types (`Date32`/`Date64`/
+            // `Timestamp`), all monotonic in their backing integer so the `i128`
+            // order key sorts them exactly. Float `MIN`/`MAX` (NaN ordering) is a
+            // follow-up and falls to the catch-all below (the view does not build;
+            // the query re-scans — correct, not fast).
             (
                 MaintainedAggregateFunction::Min | MaintainedAggregateFunction::Max,
                 Some(data_type),
-            ) if data_type.is_signed_integer() || data_type.is_unsigned_integer() => {
+            ) if data_type.is_signed_integer()
+                || data_type.is_unsigned_integer()
+                || is_maintainable_temporal(data_type) =>
+            {
                 AggregateOutputType::SameAsInput
             }
             (MaintainedAggregateFunction::Min | MaintainedAggregateFunction::Max, None) => {
@@ -1685,6 +1691,18 @@ fn is_maintainable_float(data_type: &DataType) -> bool {
     matches!(data_type, DataType::Float32 | DataType::Float64)
 }
 
+/// Temporal types a maintained `MIN`/`MAX` can order via the integer order key:
+/// `Date32` (days), `Date64` (millis), and every `Timestamp` unit (instant) are
+/// monotonic in their backing integer, so `scalar_order_key` extracts that integer
+/// and the `i128` key sorts them exactly. `Time`/`Duration`/`Interval` are omitted
+/// (an `Interval` is not a single monotonic integer).
+fn is_maintainable_temporal(data_type: &DataType) -> bool {
+    matches!(
+        data_type,
+        DataType::Date32 | DataType::Date64 | DataType::Timestamp(_, _)
+    )
+}
+
 /// Coerce a non-null signed-integer input scalar to `i64`, widening the
 /// `Int8`/`Int16`/`Int32`/`Int64` family losslessly. SQL `SUM(int)` widens to
 /// `BIGINT` (`DataFusion`'s `Int64` sum output), so a narrower CDC column
@@ -1740,12 +1758,16 @@ fn scalar_as_f64(scalar: &ScalarValue) -> DataFusionResult<f64> {
 }
 
 /// The order key for a maintained `MIN`/`MAX` value: a lossless `i128` over the
-/// whole signed (`Int8`..`Int64`) and unsigned (`UInt8`..`UInt64`) integer
-/// family. `i128` holds every `i64` and every `u64`, and its natural order
-/// matches SQL ordering within a single fixed-type column, so it is a correct
-/// total order for the `BTreeMap`. Float `MIN`/`MAX` (NaN ordering) is a
-/// deliberate follow-up and errors here — the view then simply does not build,
-/// and the query falls back to a base-table scan (correct, not accelerated).
+/// signed (`Int8`..`Int64`) and unsigned (`UInt8`..`UInt64`) integer families and
+/// the integer-backed temporal types (`Date32` days, `Date64` millis, and every
+/// `Timestamp` unit's instant). `i128` holds every `i64` and every `u64`, and its
+/// natural order matches SQL ordering within a single fixed-type column — a column
+/// carries one temporal unit + timezone, so the backing integers are directly
+/// comparable — so it is a correct total order for the `BTreeMap`. The exact
+/// input-typed `ScalarValue` is stored alongside the key, preserving the unit and
+/// timezone on output. Float `MIN`/`MAX` (NaN ordering) is a deliberate follow-up
+/// and errors here — the view then simply does not build, and the query falls back
+/// to a base-table scan (correct, not accelerated).
 fn scalar_order_key(scalar: &ScalarValue) -> DataFusionResult<i128> {
     match scalar {
         ScalarValue::Int64(Some(v)) => Ok(i128::from(*v)),
@@ -1756,7 +1778,15 @@ fn scalar_order_key(scalar: &ScalarValue) -> DataFusionResult<i128> {
         ScalarValue::UInt32(Some(v)) => Ok(i128::from(*v)),
         ScalarValue::UInt16(Some(v)) => Ok(i128::from(*v)),
         ScalarValue::UInt8(Some(v)) => Ok(i128::from(*v)),
-        _ => Err(type_mismatch("a signed or unsigned integer", scalar)),
+        // Integer-backed temporal types share the ordering — a column carries a
+        // single unit/timezone, so the backing integers are directly comparable.
+        ScalarValue::Date32(Some(v)) => Ok(i128::from(*v)),
+        ScalarValue::Date64(Some(v)) => Ok(i128::from(*v)),
+        ScalarValue::TimestampSecond(Some(v), _) => Ok(i128::from(*v)),
+        ScalarValue::TimestampMillisecond(Some(v), _) => Ok(i128::from(*v)),
+        ScalarValue::TimestampMicrosecond(Some(v), _) => Ok(i128::from(*v)),
+        ScalarValue::TimestampNanosecond(Some(v), _) => Ok(i128::from(*v)),
+        _ => Err(type_mismatch("a signed/unsigned integer or temporal", scalar)),
     }
 }
 
@@ -1873,8 +1903,10 @@ mod tests {
     use super::*;
     use std::collections::BTreeMap;
 
-    use arrow::array::{Float64Array, Int32Array, Int64Array, StringArray, UInt64Array};
-    use arrow_schema::{Field, Schema};
+    use arrow::array::{
+        Float64Array, Int32Array, Int64Array, StringArray, TimestampMicrosecondArray, UInt64Array,
+    };
+    use arrow_schema::{Field, Schema, TimeUnit};
     use datafusion::physical_expr::aggregate::AggregateExprBuilder;
     use datafusion::physical_expr::expressions::{cast, col, lit};
     use datafusion::physical_plan::aggregates::PhysicalGroupBy;
@@ -2677,6 +2709,92 @@ mod tests {
         let (min, max) = min_max_by_name(&registry)?;
         assert_eq!(min.get("a"), None, "a is now all-NULL i -> NULL MIN");
         assert_eq!(max.get("a"), None);
+        Ok(())
+    }
+
+    /// The dominant real-world MIN/MAX pattern is temporal — "earliest / latest
+    /// event per group". `Date`/`Timestamp` are integer-backed and monotonic, so
+    /// they reuse the integer order key (no NaN complexity) and preserve the exact
+    /// unit/timezone on output. Retraction-hard case included: deleting the current
+    /// earliest or latest exposes the next. PK = `pk` (column 2).
+    #[test]
+    fn maintains_min_max_over_timestamps() -> DataFusionResult<()> {
+        let ts_type = DataType::Timestamp(TimeUnit::Microsecond, None);
+        let ts_schema = Arc::new(Schema::new(vec![
+            Field::new("name", DataType::Utf8, true),
+            Field::new("ts", ts_type.clone(), true),
+            Field::new("pk", DataType::Int64, false),
+        ]));
+        let spec = MaintainedAggregateSpec {
+            filter: None,
+            group_by: vec!["name".to_string()],
+            aggregates: vec![
+                MaintainedAggregateExpr {
+                    function: MaintainedAggregateFunction::Min,
+                    column: Some("ts".to_string()),
+                },
+                MaintainedAggregateExpr {
+                    function: MaintainedAggregateFunction::Max,
+                    column: Some("ts".to_string()),
+                },
+            ],
+        };
+        let registry = MaintainedAggregateRegistry::try_new_with_pk(
+            std::slice::from_ref(&spec),
+            &ts_schema,
+            &[2],
+            usize::MAX,
+        )?;
+        // (ts_micros, pk); all rows are group "a".
+        let ts_batch = |rows: &[(i64, i64)]| {
+            RecordBatch::try_new(
+                Arc::clone(&ts_schema),
+                vec![
+                    Arc::new(StringArray::from(vec![Some("a"); rows.len()])),
+                    Arc::new(TimestampMicrosecondArray::from(
+                        rows.iter().map(|(t, _)| *t).collect::<Vec<_>>(),
+                    )),
+                    Arc::new(Int64Array::from(
+                        rows.iter().map(|(_, p)| *p).collect::<Vec<_>>(),
+                    )),
+                ],
+            )
+            .expect("timestamp batch should be valid")
+        };
+        let out_schema = Arc::new(Schema::new(vec![
+            Field::new("name", DataType::Utf8, true),
+            Field::new("min_ts", ts_type.clone(), true),
+            Field::new("max_ts", ts_type, true),
+        ]));
+        let serve = |epoch: u64| -> DataFusionResult<(i64, i64)> {
+            let batch = registry
+                .batch_for_spec(&spec, epoch, Arc::clone(&out_schema))?
+                .expect("registry fresh and view matches");
+            assert_eq!(batch.num_rows(), 1, "single group 'a'");
+            let mins = batch
+                .column(1)
+                .as_any()
+                .downcast_ref::<TimestampMicrosecondArray>()
+                .expect("min_ts is TimestampMicrosecond");
+            let maxs = batch
+                .column(2)
+                .as_any()
+                .downcast_ref::<TimestampMicrosecondArray>()
+                .expect("max_ts is TimestampMicrosecond");
+            Ok((mins.value(0), maxs.value(0)))
+        };
+
+        // ts {100(pk1), 300(pk2), 200(pk3)} -> min 100, max 300.
+        registry.apply_insert_batches(1, &[ts_batch(&[(100, 1), (300, 2), (200, 3)])])?;
+        assert_eq!(serve(1)?, (100, 300));
+
+        // Delete pk2 (ts=300, current MAX) -> MAX exposes the next-latest, 200.
+        registry.apply_pk_deletes(2, &ts_batch(&[(0, 2)]).project(&[2])?)?;
+        assert_eq!(serve(2)?, (100, 200), "MAX exposes the next-latest timestamp");
+
+        // Delete pk1 (ts=100, current MIN) -> MIN exposes the next-earliest, 200.
+        registry.apply_pk_deletes(3, &ts_batch(&[(0, 1)]).project(&[2])?)?;
+        assert_eq!(serve(3)?, (200, 200), "MIN exposes the next-earliest timestamp");
         Ok(())
     }
 
