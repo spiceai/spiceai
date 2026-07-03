@@ -258,8 +258,20 @@ impl CayenneDataSink {
                     Arc::clone(&self.schema),
                     futures::stream::iter(segment.into_iter().map(Ok)),
                 ));
+            let segment_start = std::time::Instant::now();
             let _write_guard = self.table.write_lock().lock().await;
-            total_rows += self.write_all_append(segment_stream, context).await?;
+            let lock_wait_ms = segment_start.elapsed().as_millis();
+            let segment_rows = self.write_all_append(segment_stream, context).await?;
+            total_rows += segment_rows;
+            tracing::info!(
+                table = self.table.table_name(),
+                segment = segments,
+                rows = segment_rows,
+                bytes = segment_bytes,
+                lock_wait_ms,
+                duration_ms = segment_start.elapsed().as_millis(),
+                "Streaming append segment published"
+            );
         }
         if segments > 1 {
             tracing::debug!(

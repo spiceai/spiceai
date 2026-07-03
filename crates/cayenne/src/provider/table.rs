@@ -1624,7 +1624,7 @@ pub(crate) type InlinedDeletionMaps = crate::provider::mem_tier::InMemTombstones
 
 pub(crate) fn record_cayenne_write_phase(table_name: &str, phase: &'static str, start: Instant) {
     let elapsed = start.elapsed();
-    tracing::debug!(
+    tracing::info!(
         table = table_name,
         phase,
         duration_ms = elapsed.as_millis(),
@@ -10541,9 +10541,12 @@ impl CayenneTableProvider {
             }
         }
 
-        if state.refresh_listing || had_stats || retention_deleted > 0 {
-            self.schedule_post_write_compaction();
-        }
+        // Evaluate compaction after every write, including pure appends: the
+        // scheduler self-gates on the small-file and protected-snapshot
+        // triggers, and append-only ingest is exactly the path that
+        // accumulates protected snapshots (one per published segment) with no
+        // other maintenance edge to reclaim them.
+        self.schedule_post_write_compaction();
 
         // b1★ (cycle-4): persist any durable tombstone flips that the staged-batch
         // fold left owed. On a busy table the next batch's Stage-A drains these,
