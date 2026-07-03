@@ -281,10 +281,6 @@ impl DataConnectorFactory for MongoDBFactory {
                 .ok()
                 .map(|s| s.expose_secret().to_string());
             if !has_schema_infer_max_records && let Some(value) = legacy_num_docs {
-                tracing::warn!(
-                    "The 'num_docs_to_infer_schema' parameter is deprecated for the {component}; use 'schema_infer_max_records' instead.",
-                    component = params.component
-                );
                 params
                     .parameters
                     .insert("schema_infer_max_records".to_string(), value.into());
