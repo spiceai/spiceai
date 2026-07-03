@@ -6161,10 +6161,8 @@ impl CayenneTableProvider {
                         .collect();
                     let rows = converter.convert_columns(&pk_columns)?;
                     for r in 0..batch.num_rows() {
-                        let key = rows.row(r).owned();
-                        if !keyset.keys.contains_key(&key) {
-                            keyset.insert(key, RowLocation::FileUnlocated);
-                        }
+                        // Single hash lookup, preserving any durable-scan `RowLocation`.
+                        keyset.insert_if_absent(rows.row(r).owned(), RowLocation::FileUnlocated);
                     }
                 }
             }
