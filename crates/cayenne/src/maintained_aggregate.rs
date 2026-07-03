@@ -1129,17 +1129,19 @@ impl ResolvedAggregateExpr {
             }
             // `MIN`/`MAX` preserve the input type (no widening) and are maintained
             // via an ordered multiset. Supported: the signed/unsigned integer
-            // families and the integer-backed temporal types (`Date32`/`Date64`/
-            // `Timestamp`), all monotonic in their backing integer so the `i128`
-            // order key sorts them exactly. Float `MIN`/`MAX` (NaN ordering) is a
-            // follow-up and falls to the catch-all below (the view does not build;
-            // the query re-scans — correct, not fast).
+            // families, the integer-backed temporal types (`Date32`/`Date64`/
+            // `Timestamp`), and `Decimal128` (its backing value is an `i128`) — all
+            // totally ordered by an integer, so the `i128` order key sorts them
+            // exactly. Float `MIN`/`MAX` (NaN ordering) and `Decimal256` (i256, too
+            // wide for the key) are follow-ups and fall to the catch-all below (the
+            // view does not build; the query re-scans — correct, not fast).
             (
                 MaintainedAggregateFunction::Min | MaintainedAggregateFunction::Max,
                 Some(data_type),
             ) if data_type.is_signed_integer()
                 || data_type.is_unsigned_integer()
-                || is_maintainable_temporal(data_type) =>
+                || is_maintainable_temporal(data_type)
+                || matches!(data_type, DataType::Decimal128(_, _)) =>
             {
                 AggregateOutputType::SameAsInput
             }
@@ -1786,7 +1788,13 @@ fn scalar_order_key(scalar: &ScalarValue) -> DataFusionResult<i128> {
         ScalarValue::TimestampMillisecond(Some(v), _) => Ok(i128::from(*v)),
         ScalarValue::TimestampMicrosecond(Some(v), _) => Ok(i128::from(*v)),
         ScalarValue::TimestampNanosecond(Some(v), _) => Ok(i128::from(*v)),
-        _ => Err(type_mismatch("a signed/unsigned integer or temporal", scalar)),
+        // `Decimal128`'s backing value IS an `i128`; a column carries one fixed
+        // scale, so ordering by that integer orders by the decimal value.
+        ScalarValue::Decimal128(Some(v), _, _) => Ok(*v),
+        _ => Err(type_mismatch(
+            "a signed/unsigned integer, temporal, or decimal128",
+            scalar,
+        )),
     }
 }
 
@@ -1904,7 +1912,8 @@ mod tests {
     use std::collections::BTreeMap;
 
     use arrow::array::{
-        Float64Array, Int32Array, Int64Array, StringArray, TimestampMicrosecondArray, UInt64Array,
+        Decimal128Array, Float64Array, Int32Array, Int64Array, StringArray,
+        TimestampMicrosecondArray, UInt64Array,
     };
     use arrow_schema::{Field, Schema, TimeUnit};
     use datafusion::physical_expr::aggregate::AggregateExprBuilder;
@@ -2795,6 +2804,95 @@ mod tests {
         // Delete pk1 (ts=100, current MIN) -> MIN exposes the next-earliest, 200.
         registry.apply_pk_deletes(3, &ts_batch(&[(0, 1)]).project(&[2])?)?;
         assert_eq!(serve(3)?, (200, 200), "MIN exposes the next-earliest timestamp");
+        Ok(())
+    }
+
+    /// Financial MIN/MAX (min/max amount per group) over `Decimal128`, whose
+    /// backing value is an `i128` — the order key IS that integer (a column has
+    /// one fixed scale, so no scaling is needed). Also covers a duplicated value
+    /// (the multiset keeps a count, so one retraction of a value seen twice does
+    /// not drop it). `Decimal256` (i256) stays a follow-up. PK = `pk` (column 2).
+    #[test]
+    fn maintains_min_max_over_decimal128() -> DataFusionResult<()> {
+        let dec_type = DataType::Decimal128(12, 2);
+        let dec_schema = Arc::new(Schema::new(vec![
+            Field::new("name", DataType::Utf8, true),
+            Field::new("amt", dec_type.clone(), true),
+            Field::new("pk", DataType::Int64, false),
+        ]));
+        let spec = MaintainedAggregateSpec {
+            filter: None,
+            group_by: vec!["name".to_string()],
+            aggregates: vec![
+                MaintainedAggregateExpr {
+                    function: MaintainedAggregateFunction::Min,
+                    column: Some("amt".to_string()),
+                },
+                MaintainedAggregateExpr {
+                    function: MaintainedAggregateFunction::Max,
+                    column: Some("amt".to_string()),
+                },
+            ],
+        };
+        let registry = MaintainedAggregateRegistry::try_new_with_pk(
+            std::slice::from_ref(&spec),
+            &dec_schema,
+            &[2],
+            usize::MAX,
+        )?;
+        // (raw i128 at scale 2, pk); all rows are group "a".
+        let dec_batch = |rows: &[(i128, i64)]| {
+            let amounts = Decimal128Array::from(rows.iter().map(|(a, _)| *a).collect::<Vec<_>>())
+                .with_precision_and_scale(12, 2)
+                .expect("valid decimal precision/scale");
+            RecordBatch::try_new(
+                Arc::clone(&dec_schema),
+                vec![
+                    Arc::new(StringArray::from(vec![Some("a"); rows.len()])),
+                    Arc::new(amounts),
+                    Arc::new(Int64Array::from(
+                        rows.iter().map(|(_, p)| *p).collect::<Vec<_>>(),
+                    )),
+                ],
+            )
+            .expect("decimal batch should be valid")
+        };
+        let out_schema = Arc::new(Schema::new(vec![
+            Field::new("name", DataType::Utf8, true),
+            Field::new("min_amt", dec_type.clone(), true),
+            Field::new("max_amt", dec_type, true),
+        ]));
+        let serve = |epoch: u64| -> DataFusionResult<(i128, i128)> {
+            let batch = registry
+                .batch_for_spec(&spec, epoch, Arc::clone(&out_schema))?
+                .expect("registry fresh and view matches");
+            assert_eq!(batch.num_rows(), 1, "single group 'a'");
+            let mins = batch
+                .column(1)
+                .as_any()
+                .downcast_ref::<Decimal128Array>()
+                .expect("min_amt is Decimal128");
+            let maxs = batch
+                .column(2)
+                .as_any()
+                .downcast_ref::<Decimal128Array>()
+                .expect("max_amt is Decimal128");
+            Ok((mins.value(0), maxs.value(0)))
+        };
+
+        // amt {1.50(pk1), 9.99(pk2), 1.50(pk3, dup), -0.50(pk4)} -> min -50, max 999 (raw).
+        registry
+            .apply_insert_batches(1, &[dec_batch(&[(150, 1), (999, 2), (150, 3), (-50, 4)])])?;
+        assert_eq!(serve(1)?, (-50, 999));
+
+        // Delete pk2 (9.99, current MAX) -> MAX falls back to 1.50 (raw 150).
+        registry.apply_pk_deletes(2, &dec_batch(&[(0, 2)]).project(&[2])?)?;
+        assert_eq!(serve(2)?, (-50, 150), "MAX exposes the next-largest amount");
+
+        // Delete pk4 (-0.50, current MIN) -> MIN falls back to 1.50; the dup (pk1,pk3)
+        // keeps the value 150 present with count 2, so the group stays non-empty.
+        registry.apply_pk_deletes(3, &dec_batch(&[(0, 4)]).project(&[2])?)?;
+        assert_eq!(serve(3)?, (150, 150), "MIN exposes the next-smallest amount");
         Ok(())
     }
 
