@@ -265,8 +265,8 @@ jobs:
         uses: ./.github/actions/management-login
         with:
           token-url: https://spice.ai/api/oauth/token
-          client-id: ${{ secrets.SPICE_MANAGEMENT_CLIENT_ID_PROD }}
-          client-secret: ${{ secrets.SPICE_MANAGEMENT_CLIENT_SECRET_PROD }}
+          client-id: ${{ secrets.SPICE_MANAGEMENT_CLIENT_ID_DEV }}
+          client-secret: ${{ secrets.SPICE_MANAGEMENT_CLIENT_SECRET_DEV }}
           # Exports SPICEAI_API_KEY for subsequent steps. Same prod creds
           # spicebench's run_spicebench.yml uses.
 
@@ -323,7 +323,18 @@ jobs:
           # spidapter reads its config from SPIDAPTER_*/SPICEAI_*/AWS_*/SCHEDULER_*
           # env vars, which testoperator's child process inherits from this step's
           # env block.
-          export SPIDAPTER_EXECUTOR_REPLICAS="${EXECUTOR_REPLICAS}"
+
+          # Dev cluster resource sizing. Pin the scheduler (app) and executors to
+          # a 4Gi memory footprint so the run schedules on a dev cluster instead
+          # of the 62Gi production defaults baked into the federated-direct
+          # scenario, and run 3 executors. Applied directly here (not via
+          # workflow_dispatch inputs) because this is a dev-only test. Only the
+          # env vars the federated-direct scenario already references take effect
+          # (app/executor memory limit + executor replicas); CPU limits, resource
+          # requests, and scheduler replica count are not wired into that scenario.
+          export SPIDAPTER_APP_MEMORY_LIMIT="4Gi"
+          export SPIDAPTER_EXECUTOR_MEMORY_LIMIT="4Gi"
+          export SPIDAPTER_EXECUTOR_REPLICAS="3"
 
           resolve_spidapter_template() {
             local value="$1"
