@@ -263,7 +263,7 @@ impl CayenneDataSink {
             let lock_wait_ms = segment_start.elapsed().as_millis();
             let segment_rows = self.write_all_append(segment_stream, context).await?;
             total_rows += segment_rows;
-            tracing::info!(
+            tracing::warn!(
                 table = self.table.table_name(),
                 segment = segments,
                 rows = segment_rows,

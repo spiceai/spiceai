@@ -1624,7 +1624,7 @@ pub(crate) type InlinedDeletionMaps = crate::provider::mem_tier::InMemTombstones
 
 pub(crate) fn record_cayenne_write_phase(table_name: &str, phase: &'static str, start: Instant) {
     let elapsed = start.elapsed();
-    tracing::info!(
+    tracing::warn!(
         table = table_name,
         phase,
         duration_ms = elapsed.as_millis(),
@@ -9934,7 +9934,7 @@ impl CayenneTableProvider {
 
             match result {
                 Ok(true) => {
-                    tracing::debug!(
+                    tracing::warn!(
                         table = table.table_metadata.table_name.as_str(),
                         "Post-write compaction pass completed"
                     );
@@ -10764,7 +10764,7 @@ impl CayenneTableProvider {
             SnapshotMaintenanceTrigger::ProtectedSnapshotCount {
                 protected_snapshot_count,
                 trigger_count,
-            } => tracing::info!(
+            } => tracing::warn!(
                 target: "cayenne::compaction",
                 table = self.table_metadata.table_name.as_str(),
                 protected_snapshot_count,
