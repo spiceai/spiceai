@@ -125,6 +125,10 @@ libc = "0.2"
 
 [[bench]]
 harness = false
+name = "zorder_clustering"
+
+[[bench]]
+harness = false
 name = "metastore_operations"
 
 [[bench]]
@@ -369,6 +373,10 @@ name = "apply_on_conflict_keys_double_clone"
 [[bench]]
 harness = false
 name = "delta_encoding_sweep"
+
+[[bench]]
+harness = false
+name = "compaction_write_amplification"
 
 [[bench]]
 harness = false

@@ -59,6 +59,12 @@ use data_components::cdc::{
     ChangeBatch, ChangeEnvelope, ChangesStream, CommitChange, CommitError, StreamError,
     changes_schema,
 };
+#[cfg(feature = "debezium")]
+use data_components::debezium::arrow::changes::to_change_batch;
+#[cfg(feature = "debezium")]
+use data_components::debezium::change_event::ChangeEvent;
+#[cfg(feature = "debezium")]
+use data_components::schema_projection::SchemaProjection;
 use datafusion::datasource::TableProvider;
 use datafusion::physical_plan::collect;
 use datafusion::prelude::SessionContext;
@@ -184,6 +190,15 @@ fn stream_of(ops: &[Op<'_>], commits: &Arc<TokioMutex<Vec<i64>>>) -> ChangesStre
 async fn setup_keyed_cayenne(
     table_name: &str,
 ) -> (TempDir, Arc<CayenneCatalog>, Arc<CayenneTableProvider>) {
+    setup_keyed_cayenne_with_schema(table_name, data_schema()).await
+}
+
+/// Like [`setup_keyed_cayenne`] but with a caller-supplied data schema — e.g. the
+/// decomposed `{id, data}` schema a `json_object` Debezium dataset exposes.
+async fn setup_keyed_cayenne_with_schema(
+    table_name: &str,
+    schema: Arc<Schema>,
+) -> (TempDir, Arc<CayenneCatalog>, Arc<CayenneTableProvider>) {
     let temp = TempDir::new().expect("temp dir");
     let data_path = temp.path().join("data");
     tokio::fs::create_dir_all(&data_path)
@@ -195,7 +210,6 @@ async fn setup_keyed_cayenne(
     let catalog = Arc::new(CayenneCatalog::new(conn).expect("CayenneCatalog::new"));
     catalog.init().await.expect("catalog init");
 
-    let schema = data_schema();
     let ctx = SessionContext::new();
     let table = CayenneTableProvider::create_table(
         Arc::clone(&catalog) as Arc<dyn MetadataCatalog>,
@@ -430,4 +444,138 @@ async fn debezium_delete_then_reinsert_resurrects_row() {
         vec![(1, Some("v2".to_string()))],
         "the re-insert after the delete must win; id=1 is present with v2"
     );
+}
+
+/// Build a Debezium `create` change event with the given `after` payload, in the
+/// on-the-wire envelope shape the connector deserializes. The embedded `schema`
+/// block is intentionally minimal: `to_change_batch` projects against the
+/// caller-supplied table schema, not the event's self-description.
+#[cfg(feature = "debezium")]
+fn debezium_create_event(after: &serde_json::Value) -> ChangeEvent {
+    let value = serde_json::json!({
+        "schema": { "type": "struct", "fields": [], "optional": false, "name": "test.Envelope" },
+        "payload": {
+            "before": null,
+            "after": after,
+            "source": {
+                "version": "x", "connector": "x", "name": "x", "ts_ms": 0,
+                "snapshot": "false", "db": "x", "table": "x"
+            },
+            "op": "c",
+            "ts_ms": 0,
+            "transaction": null
+        }
+    });
+    serde_json::from_value(value).expect("valid Debezium change event")
+}
+
+/// JSON nesting (`json_object`) end-to-end for Debezium: real Debezium change
+/// events are decomposed by the connector's `to_change_batch` — the declared `id`
+/// stays a top-level column while every other `after` field folds into one
+/// sorted-key JSON catch-all `data` column — then applied through the runtime
+/// changes stream into a keyed Cayenne accelerator and read back via SQL.
+#[cfg(feature = "debezium")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn debezium_json_nesting_folds_into_catch_all() {
+    // The decomposed schema the dataset exposes: static `id` + catch-all `data`.
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("data", DataType::Utf8, true),
+    ]));
+    let (_temp, _catalog, table) =
+        setup_keyed_cayenne_with_schema("dbz_json_nest", Arc::clone(&schema)).await;
+
+    // `id` is the declared static (primary-key) column; every other `after` field
+    // folds into `data`.
+    let projection = SchemaProjection::nesting(vec!["id".to_string()], "data".to_string());
+    let pk = ["id".to_string()];
+
+    let events = [
+        debezium_create_event(
+            &serde_json::json!({ "id": 1, "email": "alice@example.com", "age": 30 }),
+        ),
+        debezium_create_event(
+            &serde_json::json!({ "id": 2, "email": "bob@example.com", "age": 25 }),
+        ),
+    ];
+
+    let commits = Arc::new(TokioMutex::new(Vec::new()));
+    let envelopes: Vec<Result<ChangeEnvelope, StreamError>> = events
+        .iter()
+        .enumerate()
+        .map(|(seq, event)| {
+            // The real decomposition: fold non-declared `after` fields into `data`.
+            let batch = to_change_batch(&schema, &pk, event, Some(&projection))
+                .expect("Debezium change event should decompose into a change batch");
+            Ok(ChangeEnvelope::new(
+                Box::new(RecordingCommitter {
+                    id: i64::try_from(seq).expect("seq fits i64"),
+                    commits: Arc::clone(&commits),
+                }),
+                batch,
+                true,
+            ))
+        })
+        .collect();
+    let stream = fstream::iter(envelopes).boxed();
+
+    let task = make_refresh_task(
+        Arc::clone(&table) as Arc<dyn TableProvider>,
+        "dbz_json_nest",
+    );
+    let refresh = Arc::new(RwLock::new(Refresh::default()));
+    task.start_changes_stream(
+        refresh,
+        stream,
+        None,
+        None,
+        Arc::new(AtomicBool::new(false)),
+    )
+    .await
+    .expect("start_changes_stream");
+
+    // Read the accelerated table back and assert the decomposition.
+    let ctx = SessionContext::new();
+    let plan = table
+        .scan(&ctx.state(), None, &[], None)
+        .await
+        .expect("scan");
+    let batches = collect(plan, ctx.task_ctx()).await.expect("collect");
+
+    let mut rows: Vec<(i64, serde_json::Value)> = Vec::new();
+    for batch in &batches {
+        let ids = batch
+            .column_by_name("id")
+            .expect("id column")
+            .as_primitive::<Int64Type>();
+        let data = batch
+            .column_by_name("data")
+            .expect("catch-all data column")
+            .as_string::<i32>();
+        for row in 0..batch.num_rows() {
+            let catch_all: serde_json::Value =
+                serde_json::from_str(data.value(row)).expect("catch-all must be valid JSON");
+            rows.push((ids.value(row), catch_all));
+        }
+    }
+    rows.sort_by_key(|(id, _)| *id);
+
+    assert_eq!(rows.len(), 2, "two decomposed rows");
+
+    let (id0, data0) = &rows[0];
+    assert_eq!(*id0, 1);
+    assert_eq!(data0["email"], serde_json::json!("alice@example.com"));
+    assert!(
+        data0.get("age").is_some(),
+        "non-declared `age` must fold into the catch-all"
+    );
+    assert!(
+        data0.get("id").is_none(),
+        "declared static `id` must not leak into the catch-all"
+    );
+
+    let (id1, data1) = &rows[1];
+    assert_eq!(*id1, 2);
+    assert_eq!(data1["email"], serde_json::json!("bob@example.com"));
+    assert!(data1.get("id").is_none());
 }

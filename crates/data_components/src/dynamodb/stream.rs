@@ -13,12 +13,13 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
-use super::{Error, JsonNesting, Result};
+use super::{Error, Result};
 use crate::arrow::struct_builder::StructBuilder;
 use crate::cdc::{ChangeBatch, ChangeBatchError, changes_schema};
 use crate::dynamodb::arrow::append_item_to_struct_builder;
-use crate::dynamodb::json_nest::json_nest_row_except_fields;
+use crate::dynamodb::json_nest::project_dynamodb_row;
 use crate::dynamodb::unnest::unnest_dynamodb_row;
+use crate::schema_projection::SchemaProjection;
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::error::ArrowError;
 use arrow_array::builder::{ArrayBuilder, ListBuilder, StringBuilder, make_builder};
@@ -124,7 +125,7 @@ pub fn process_batch(
     primary_keys: &[String],
     unnest_depth: Option<usize>,
     time_format: &str,
-    json_nesting: Option<&JsonNesting>,
+    projection: Option<&SchemaProjection>,
 ) -> Result<(ChangeBatch, Checkpoint, Option<SystemTime>), StreamError> {
     let records = batch.records;
 
@@ -151,12 +152,9 @@ pub fn process_batch(
                             .context(FailedToUnnestSnafu)?,
                     };
 
-                    let final_streams_item = match json_nesting {
+                    let final_streams_item = match projection.filter(|p| p.has_catch_all()) {
                         None => unnested_streams_item,
-                        Some(json_nesting) => {
-                            json_nest_row_except_fields(unnested_streams_item, json_nesting)
-                                .context(FailedToUnnestSnafu)?
-                        }
+                        Some(projection) => project_dynamodb_row(unnested_streams_item, projection),
                     };
 
                     let op = if matches!(event_name, OperationType::Insert) {
@@ -315,6 +313,28 @@ mod tests {
 
     mod process_batch {
         use super::*;
+        use crate::schema_projection::{ColumnSource, ProjectedColumn, SchemaProjection};
+
+        /// Build a JSON-nesting `SchemaProjection`: the given names are kept as
+        /// static columns and `catch_all` collects the rest.
+        fn nesting_projection(static_fields: &[&str], catch_all: &str) -> SchemaProjection {
+            let mut columns: Vec<ProjectedColumn> = static_fields
+                .iter()
+                .map(|name| ProjectedColumn {
+                    output_name: (*name).to_string(),
+                    source: ColumnSource::Field,
+                    declared_type: None,
+                    nullable: true,
+                })
+                .collect();
+            columns.push(ProjectedColumn {
+                output_name: catch_all.to_string(),
+                source: ColumnSource::JsonObject,
+                declared_type: None,
+                nullable: true,
+            });
+            SchemaProjection::new(columns, &[]).expect("valid projection")
+        }
 
         #[test]
         fn test_process_batch_insert_operation() {
@@ -814,10 +834,7 @@ mod tests {
             ]));
             let primary_keys = vec!["id".to_string()];
 
-            let json_nesting = JsonNesting {
-                static_fields: HashSet::from(["id".to_string()]),
-                json_field_name: "Data".to_string(),
-            };
+            let projection = nesting_projection(&["id"], "Data");
 
             let result = process_batch(
                 create_stream_result(batch),
@@ -825,7 +842,7 @@ mod tests {
                 &primary_keys,
                 None,
                 TIME_FORMAT,
-                Some(&json_nesting),
+                Some(&projection),
             );
 
             let (change_batch, _checkpoint, _watermark) =
@@ -900,10 +917,7 @@ mod tests {
             ]));
             let primary_keys = vec!["PK".to_string(), "SK".to_string()];
 
-            let json_nesting = JsonNesting {
-                static_fields: HashSet::from(["PK".to_string(), "SK".to_string()]),
-                json_field_name: "Data".to_string(),
-            };
+            let projection = nesting_projection(&["PK", "SK"], "Data");
 
             let result = process_batch(
                 create_stream_result(batch),
@@ -911,7 +925,7 @@ mod tests {
                 &primary_keys,
                 None,
                 TIME_FORMAT,
-                Some(&json_nesting),
+                Some(&projection),
             );
 
             let (change_batch, _checkpoint, _watermark) =
@@ -979,10 +993,7 @@ mod tests {
             ]));
             let primary_keys = vec!["id".to_string()];
 
-            let json_nesting = JsonNesting {
-                static_fields: HashSet::from(["id".to_string(), "name".to_string()]),
-                json_field_name: "Data".to_string(),
-            };
+            let projection = nesting_projection(&["id", "name"], "Data");
 
             let result = process_batch(
                 create_stream_result(batch),
@@ -990,7 +1001,7 @@ mod tests {
                 &primary_keys,
                 None,
                 TIME_FORMAT,
-                Some(&json_nesting),
+                Some(&projection),
             );
 
             let (change_batch, _checkpoint, _watermark) =

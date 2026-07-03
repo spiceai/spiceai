@@ -15,6 +15,7 @@ limitations under the License.
 */
 
 use crate::cdc::{ChangeBatch, ChangeBatchError, changes_schema};
+use crate::schema_projection::SchemaProjection;
 use arrow::{
     array::{ArrayRef, ListArray, RecordBatch, StringArray, StructArray, new_null_array},
     datatypes::{Field, Schema, SchemaRef},
@@ -22,6 +23,7 @@ use arrow::{
 use arrow_buffer::OffsetBuffer;
 use datafusion_table_providers::mongodb::{
     Error as MongoDBError,
+    projection::project_bson_document,
     utils::{
         arrow::mongo_docs_to_arrow,
         unnest::{UnnestBehavior, UnnestParameters, unnest_bson_documents},
@@ -74,6 +76,7 @@ pub fn change_events_to_change_batch(
     table_schema: &SchemaRef,
     primary_keys: &[String],
     unnest_parameters: &UnnestParameters,
+    projection: Option<&SchemaProjection>,
 ) -> Result<Option<ChangeBatch>> {
     let mut rows = Vec::with_capacity(events.len());
     let primary_keys = Arc::<[String]>::from(primary_keys.to_vec());
@@ -130,7 +133,7 @@ pub fn change_events_to_change_batch(
         return truncate_change_batch(table_schema).map(Some);
     }
 
-    build_change_batch(rows, table_schema, unnest_parameters).map(Some)
+    build_change_batch(rows, table_schema, unnest_parameters, projection).map(Some)
 }
 
 pub fn truncate_change_batch(table_schema: &SchemaRef) -> Result<ChangeBatch> {
@@ -174,6 +177,7 @@ fn build_change_batch(
     rows: Vec<ChangeRow>,
     table_schema: &SchemaRef,
     unnest_parameters: &UnnestParameters,
+    projection: Option<&SchemaProjection>,
 ) -> Result<ChangeBatch> {
     let change_data_schema = nullable_clone(table_schema);
     let row_count = rows.len();
@@ -183,6 +187,17 @@ fn build_change_batch(
     let documents = match unnest_parameters.behavior {
         UnnestBehavior::Depth(0) => documents,
         _ => unnest_bson_documents(documents, unnest_parameters).context(ConversionSnafu)?,
+    };
+
+    // Fold non-declared fields into the catch-all column when JSON nesting is
+    // configured, matching the scan path. The change-data schema is already the
+    // projected (declared + catch-all) schema.
+    let documents = match projection.filter(|p| p.has_catch_all()) {
+        Some(p) => documents
+            .into_iter()
+            .map(|d| project_bson_document(d, p))
+            .collect(),
+        None => documents,
     };
 
     let data_batch = mongo_docs_to_arrow(&documents, Arc::clone(&change_data_schema))
@@ -289,6 +304,7 @@ mod tests {
             &schema(),
             &["_id".to_string()],
             &default_unnest_parameters(0),
+            None,
         )
         .expect("change batch should build")
         .expect("batch should not be empty");
@@ -326,6 +342,7 @@ mod tests {
             &schema(),
             &["_id".to_string()],
             &default_unnest_parameters(0),
+            None,
         )
         .expect("change batch should build")
         .expect("batch should not be empty");
@@ -341,6 +358,7 @@ mod tests {
             &schema(),
             &["_id".to_string()],
             &default_unnest_parameters(0),
+            None,
         )
         .expect("empty change batch should not fail");
 
@@ -360,6 +378,7 @@ mod tests {
             &schema(),
             &["_id".to_string()],
             &default_unnest_parameters(0),
+            None,
         )
         .expect("change batch should build")
         .expect("batch should not be empty");
@@ -389,6 +408,7 @@ mod tests {
             &schema(),
             &["_id".to_string()],
             &default_unnest_parameters(0),
+            None,
         )
         .expect("change batch should build")
         .expect("batch should not be empty");
@@ -412,6 +432,7 @@ mod tests {
             &schema(),
             &["_id".to_string()],
             &default_unnest_parameters(0),
+            None,
         )
         .expect_err("missing fullDocument should fail");
 
@@ -431,6 +452,7 @@ mod tests {
             &schema(),
             &["_id".to_string()],
             &default_unnest_parameters(0),
+            None,
         )
         .expect_err("missing documentKey should fail");
 
@@ -451,6 +473,7 @@ mod tests {
             &schema(),
             &["_id".to_string()],
             &default_unnest_parameters(0),
+            None,
         )
         .expect_err("unsupported operation should fail");
 
