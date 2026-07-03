@@ -513,6 +513,13 @@ async fn run_sequential(fixture: &TestFixture, w: &Workload, seed: u64) -> TestR
                 table.maybe_compact_small_files().await?;
             }
             Op::Restart => {
+                // Faithful restart: a real process crash kills this instance's
+                // detached maintenance (compaction/sweep/checkpoint). An in-process
+                // reopen must DRAIN it first, or a compaction from the old instance
+                // can commit against the shared catalog concurrently with the
+                // reopened provider (distinct `compaction_lock`s), corrupting the
+                // protected-snapshot set. See `drain_in_flight_maintenance`.
+                table.drain_in_flight_maintenance().await?;
                 let (t, c) = reopen_table(fixture, &name).await?;
                 table = t;
                 ctx = c;
@@ -531,6 +538,9 @@ async fn run_sequential(fixture: &TestFixture, w: &Workload, seed: u64) -> TestR
     }
 
     table.maybe_compact_small_files().await?;
+    // Faithful restart (see the loop's Op::Restart): drain this instance's
+    // in-flight detached maintenance before reopening from the catalog.
+    table.drain_in_flight_maintenance().await?;
     let (_t, c) = reopen_table(fixture, &name).await?;
     let final_state = read_rows(&c, &name).await?;
     let msg = format!(
@@ -608,7 +618,12 @@ async fn run_concurrent(fixture: &TestFixture, w: &Workload, seed: u64) -> TestR
             Op::Restart => {
                 // Exclusive: waits for any in-flight compaction, then reopens
                 // from the catalog and swaps in the fresh provider + context.
+                // Drain the OLD instance's detached maintenance first so it cannot
+                // commit against the shared catalog after the reopen (its
+                // `compaction_lock` is distinct from the reopened provider's — the
+                // background compactor's read lock does NOT gate it).
                 let mut guard = handle.write().await;
+                guard.drain_in_flight_maintenance().await?;
                 let (nt, nc) = reopen_table(fixture, &name).await?;
                 *guard = nt;
                 ctx = nc;
@@ -623,6 +638,9 @@ async fn run_concurrent(fixture: &TestFixture, w: &Workload, seed: u64) -> TestR
     compactor.await.expect("compaction task joins");
     let table = Arc::clone(&*handle.read().await);
     table.maybe_compact_small_files().await?;
+    // Quiesce before the final assertion so no detached compaction from this (or
+    // an earlier, since-replaced) instance commits mid-read.
+    table.drain_in_flight_maintenance().await?;
 
     let live = read_rows(&ctx, &name).await?;
     let msg = format!(

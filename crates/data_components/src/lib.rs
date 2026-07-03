@@ -160,6 +160,10 @@ pub mod s3_single_file_cached;
 #[cfg(feature = "s3_vectors")]
 pub mod s3_vectors;
 pub mod schema_discovery;
+/// Connector-agnostic schema projection (JSON nesting). The core lives in the
+/// `datafusion-table-providers` fork so providers defined there (`MongoDB`) can
+/// reuse it; re-exported here for the in-repo connectors (`DynamoDB`, Debezium).
+pub use datafusion_table_providers::schema_projection;
 #[cfg(feature = "scylladb")]
 pub mod scylladb;
 pub mod sql_expr;

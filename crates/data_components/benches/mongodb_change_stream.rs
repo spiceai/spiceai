@@ -110,6 +110,7 @@ fn bench_mongodb_change_stream_conversion(c: &mut Criterion) {
                         black_box(&schema),
                         black_box(&primary_keys),
                         black_box(&unnest_parameters),
+                        None,
                     )
                     .expect("conversion should succeed")
                     .expect("batch should not be empty");
@@ -130,6 +131,7 @@ fn bench_mongodb_change_stream_conversion(c: &mut Criterion) {
                         black_box(&schema),
                         black_box(&primary_keys),
                         black_box(&unnest_parameters),
+                        None,
                     )
                     .expect("conversion should succeed")
                     .expect("batch should not be empty");
