@@ -144,6 +144,13 @@ pub static DEFAULT_DATAFUSION_CONFIG: LazyLock<RwLock<SessionConfig>> = LazyLock
     // https://docs.rs/datafusion/latest/datafusion/config/struct.ParquetOptions.html#structfield.pushdown_filters
     df_config.options_mut().execution.parquet.pushdown_filters = true;
 
+    // Parse decimal-text literals (e.g. `0.06`) as Decimal128 instead of Float64 so constant
+    // folding stays exact. With the Float64 default, TPC-H q6's `l_discount BETWEEN
+    // 0.06 - 0.01 AND 0.06 + 0.01` folds the upper bound to 0.06999999999999999, silently
+    // excluding l_discount = 0.07 rows whenever the filter is evaluated against a Float64
+    // column (e.g. accelerated/parquet data). Decimal folding yields exactly 0.07.
+    df_config.options_mut().sql_parser.parse_float_as_decimal = true;
+
     RwLock::new(df_config)
 });
 
