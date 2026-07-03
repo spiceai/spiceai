@@ -34,6 +34,10 @@ pub const DEFAULT_INLINE_FLUSH_MAX_ROWS: i64 = 10_000;
 pub const DEFAULT_INLINE_FLUSH_MAX_SEGMENTS: i64 = 64;
 /// Default maximum serialized IPC bytes to keep inline before flushing to Vortex.
 pub const DEFAULT_INLINE_FLUSH_MAX_BYTES: i64 = 8 * 1_048_576;
+/// Default maximum age of buffered streaming-append data before the sink cuts
+/// the segment and publishes it (bounds ingest-to-queryable latency for
+/// long-lived insert streams).
+pub const DEFAULT_STREAM_PUBLISH_INTERVAL_MS: u64 = 2_000;
 
 /// Metadata about a table in the catalog.
 #[derive(Debug, Clone)]
@@ -813,6 +817,13 @@ pub struct VortexConfig {
         alias = "inline_memtable_max_bytes"
     )]
     pub inline_flush_max_bytes: i64,
+    /// Maximum age (ms) of buffered data in a streaming append before the sink
+    /// cuts the segment and publishes it, bounding ingest-to-queryable latency
+    /// for long-lived insert streams (e.g. ADBC bulk ingest). Each segment is a
+    /// complete prepare→stage→publish write. Set to 0 to disable and publish
+    /// only when the stream ends (pre-feature behavior).
+    #[serde(default = "default_stream_publish_interval_ms")]
+    pub stream_publish_interval_ms: u64,
     /// Whether inserts should scan existing data for primary-key conflicts. Set to `none` only
     /// when the source enforces PK uniqueness and ingestion cannot replay existing rows.
     #[serde(default)]
@@ -1093,6 +1104,10 @@ fn default_inline_flush_max_bytes() -> i64 {
     DEFAULT_INLINE_FLUSH_MAX_BYTES
 }
 
+fn default_stream_publish_interval_ms() -> u64 {
+    DEFAULT_STREAM_PUBLISH_INTERVAL_MS
+}
+
 /// Default per-table RAM-tier byte cap for `cdc_durability: memory` (256 MiB —
 /// the serde/engine floor; the accelerator's auto-tune derives a memory-scaled
 /// value of ~1/64 of host RAM clamped to 256 MiB–1 GiB when the param is unset,
@@ -1273,6 +1288,7 @@ impl Default for VortexConfig {
             inline_flush_max_rows: default_inline_flush_max_rows(),
             inline_flush_max_segments: default_inline_flush_max_segments(),
             inline_flush_max_bytes: default_inline_flush_max_bytes(),
+            stream_publish_interval_ms: default_stream_publish_interval_ms(),
             pk_conflict_detection: PkConflictDetection::default(),
             pk_keyset_cache_mb: None,
             deletion_mode: DeletionMode::default(),
