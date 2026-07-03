@@ -5169,7 +5169,7 @@ mod tests {
             .expect("should resolve the accelerated table provider");
 
         assert!(
-            resolved.downcast_ref::<MemTable>().is_some(),
+            resolved.is::<MemTable>(),
             "get_accelerated_table_provider must peel MetadataEnrichedTableProvider to reach the inner provider"
         );
     }

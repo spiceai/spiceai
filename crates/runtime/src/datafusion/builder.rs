@@ -1379,9 +1379,7 @@ fn is_cayenne_accelerated_table_provider(provider: &dyn TableProvider) -> bool {
 
 #[cfg(not(windows))]
 fn is_cayenne_table_provider(provider: &dyn TableProvider) -> bool {
-    if provider.downcast_ref::<CayenneTableProvider>().is_some()
-        || has_cayenne_accelerator_metadata(provider)
-    {
+    if provider.is::<CayenneTableProvider>() || has_cayenne_accelerator_metadata(provider) {
         return true;
     }
 
