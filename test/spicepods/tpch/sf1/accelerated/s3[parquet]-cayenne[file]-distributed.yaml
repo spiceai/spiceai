@@ -7,9 +7,8 @@ datasets:
     params: &s3_params
       file_format: parquet
       allow_http: true
-      s3_auth: key
-      s3_key: ${secrets:S3_KEY}
-      s3_secret: ${secrets:S3_SECRET}
+      s3_auth: public
+      s3_region: us-west-2
     acceleration:
       enabled: true
       engine: cayenne
