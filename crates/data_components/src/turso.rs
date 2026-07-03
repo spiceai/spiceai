@@ -509,7 +509,10 @@ impl TursoTableProvider {
     /// to the target type (e.g., INTEGER too large for Int8, invalid JSON) are converted to NULL.
     /// This design choice prioritizes query availability over failing entire result sets due to
     /// individual value conversion issues. This is standard behavior for database queries where
-    /// some data may be malformed or out of range.
+    /// some data may be malformed or out of range. Because a soft-failed value is otherwise
+    /// indistinguishable from genuinely-NULL data, [`Self::count_conversion_failures`] detects
+    /// these cases after the batch is built and emits a per-scan WARN so schema/type drift is
+    /// observable rather than silent.
     ///
     /// **Write-time validation is critical**: To prevent bad data from entering the database,
     /// see `scalar_value_to_turso()` which enforces strict validation during INSERT operations.
@@ -1140,7 +1143,60 @@ impl TursoTableProvider {
             columns.push(column);
         }
 
-        Ok(RecordBatch::try_new(Arc::clone(schema), columns)?)
+        let batch = RecordBatch::try_new(Arc::clone(schema), columns)?;
+        Self::warn_on_conversion_failures(rows, &batch);
+        Ok(batch)
+    }
+
+    /// Counts, per column, stored values that were non-NULL in Turso but produced a NULL
+    /// Arrow cell — i.e. a type conversion in [`Self::values_to_record_batch`] soft-failed
+    /// and silently dropped a real value. A genuine `TursoValue::Null` (or a short row with
+    /// no value for the column) is never counted. The returned vector is indexed by column.
+    ///
+    /// Read-side conversions intentionally fall back to NULL to keep queries available in the
+    /// face of schema/type drift, so this is detection-only: it never alters the batch.
+    #[must_use]
+    pub(crate) fn count_conversion_failures(
+        rows: &[Vec<TursoValue>],
+        batch: &RecordBatch,
+    ) -> Vec<usize> {
+        (0..batch.num_columns())
+            .map(|col_idx| {
+                let array = batch.column(col_idx);
+                rows.iter()
+                    .enumerate()
+                    .filter(|(row_idx, row)| {
+                        array.is_null(*row_idx)
+                            && !matches!(row.get(col_idx), Some(TursoValue::Null) | None)
+                    })
+                    .count()
+            })
+            .collect()
+    }
+
+    /// Emits a single per-scan WARN summarizing any silent read-side conversion failures
+    /// (see [`Self::count_conversion_failures`]), so schema/type drift is observable instead
+    /// of masquerading as genuinely-NULL data.
+    fn warn_on_conversion_failures(rows: &[Vec<TursoValue>], batch: &RecordBatch) {
+        let failures = Self::count_conversion_failures(rows, batch);
+        let total: usize = failures.iter().sum();
+        if total == 0 {
+            return;
+        }
+        let schema = batch.schema();
+        let per_column: Vec<String> = failures
+            .iter()
+            .enumerate()
+            .filter(|(_, count)| **count > 0)
+            .map(|(col_idx, count)| format!("{}={count}", schema.field(col_idx).name()))
+            .collect();
+        tracing::warn!(
+            "Turso read: {total} non-NULL stored value(s) failed type conversion and were \
+             returned as NULL (per column: {}). This usually indicates schema/type drift \
+             between the write and read paths (e.g. an out-of-range integer, an unparseable \
+             timestamp, or external mutation of the acceleration database).",
+            per_column.join(", ")
+        );
     }
 
     /// Returns AST analyzer rules for Turso-specific SQL transformations.
@@ -2875,5 +2931,71 @@ mod tests {
             .expect("should be TimestampMillisecondArray");
         assert!(!arr.is_null(0), "Millisecond identity should not be NULL");
         assert_eq!(arr.value(0), millis_2300);
+    }
+
+    #[test]
+    fn test_count_conversion_failures_distinguishes_drift_from_genuine_null() {
+        use arrow::datatypes::{DataType, Field};
+
+        // Int8 column. Row 0: in-range integer (ok), row 1: genuine NULL,
+        // row 2: 999 which overflows i8 and soft-fails to NULL on read.
+        let schema = Arc::new(arrow::datatypes::Schema::new(vec![Field::new(
+            "small",
+            DataType::Int8,
+            true,
+        )]));
+        let rows = vec![
+            vec![TursoValue::Integer(42)],
+            vec![TursoValue::Null],
+            vec![TursoValue::Integer(999)],
+        ];
+
+        let batch = TursoTableProvider::values_to_record_batch(&rows, &schema)
+            .expect("batch should build even with an out-of-range value");
+        let arr = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow::array::Int8Array>()
+            .expect("should be Int8Array");
+
+        // The soft-fail behavior itself is preserved: both the genuine NULL and the
+        // overflowed value read back as NULL cells.
+        assert_eq!(arr.value(0), 42);
+        assert!(arr.is_null(1), "genuine NULL stays NULL");
+        assert!(arr.is_null(2), "out-of-range value soft-fails to NULL");
+
+        // The regression: only the out-of-range non-NULL value counts as a conversion
+        // failure — the genuine NULL must not be counted.
+        let failures = TursoTableProvider::count_conversion_failures(&rows, &batch);
+        assert_eq!(
+            failures,
+            vec![1],
+            "exactly one conversion failure (the 999), genuine NULL excluded"
+        );
+    }
+
+    #[test]
+    fn test_count_conversion_failures_zero_when_all_values_valid() {
+        use arrow::datatypes::{DataType, Field};
+
+        let schema = Arc::new(arrow::datatypes::Schema::new(vec![Field::new(
+            "n",
+            DataType::Int64,
+            true,
+        )]));
+        let rows = vec![
+            vec![TursoValue::Integer(1)],
+            vec![TursoValue::Null],
+            vec![TursoValue::Integer(2)],
+        ];
+
+        let batch =
+            TursoTableProvider::values_to_record_batch(&rows, &schema).expect("batch should build");
+        let failures = TursoTableProvider::count_conversion_failures(&rows, &batch);
+        assert_eq!(
+            failures,
+            vec![0],
+            "no conversion failures when every non-NULL value converts cleanly"
+        );
     }
 }

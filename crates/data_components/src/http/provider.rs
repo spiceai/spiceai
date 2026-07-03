@@ -1899,7 +1899,7 @@ impl HttpExec {
             .filter(|f| !nesting.metadata_fields.contains(f.name()))
             .map(|f| f.name().as_str())
             .collect();
-        let catchall_projected = body_field_names.contains(&nesting.json_field_name.as_str());
+        let catchall_projected = body_field_names.contains(&nesting.json_field_name());
 
         // Build body-derived columns via string builders, in projected
         // (not full-schema) order, restricted to non-metadata fields.
