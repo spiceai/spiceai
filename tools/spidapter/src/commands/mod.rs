@@ -140,6 +140,25 @@ fn resources_over(
     }
 }
 
+/// Build the tag map for a new app.
+///
+/// Cluster deployments are marked with `kind=cluster`. The `organization` tag
+/// is set only when the caller supplies a non-empty value (from the scenario
+/// config or the `SPIDAPTER_ORGANIZATION_TAG` env var); it is omitted otherwise.
+fn build_app_tags(
+    deployment_mode: &DeploymentMode,
+    organization_tag: Option<&str>,
+) -> BTreeMap<String, String> {
+    let mut tags = BTreeMap::new();
+    if matches!(deployment_mode, DeploymentMode::Cluster) {
+        tags.insert("kind".to_string(), "cluster".to_string());
+    }
+    if let Some(org) = organization_tag.filter(|org| !org.is_empty()) {
+        tags.insert("organization".to_string(), org.to_string());
+    }
+    tags
+}
+
 pub(crate) async fn ensure_spice_cloud_app(
     cloud: &CloudClient,
     app_name: &str,
@@ -186,16 +205,10 @@ pub(crate) async fn ensure_spice_cloud_app(
         description: None,
         visibility: "private".to_string(),
         cname: Some(cname),
-        tags: {
-            let mut tags = BTreeMap::new();
-            if matches!(deployment_mode, DeploymentMode::Cluster) {
-                tags.insert("kind".to_string(), "cluster".to_string());
-            }
-            if let Some(org) = &config.organization_tag {
-                tags.insert("organization".to_string(), org.clone());
-            }
-            Some(tags)
-        },
+        tags: Some(build_app_tags(
+            deployment_mode,
+            config.organization_tag.as_deref(),
+        )),
         replicas: config.app_replicas,
         resources: Some(resources),
         executor,
@@ -501,6 +514,33 @@ mod tests {
     #[test]
     fn run_id_short_for_nil_uuid() {
         assert_eq!(run_id_short(&uuid::Uuid::nil()), "00000000");
+    }
+
+    // ── build_app_tags ───────────────────────────────────────────────────────
+
+    #[test]
+    fn build_app_tags_omits_organization_when_absent() {
+        let tags = build_app_tags(&DeploymentMode::Cluster, None);
+        assert!(!tags.contains_key("organization"));
+        assert_eq!(tags.get("kind").map(String::as_str), Some("cluster"));
+    }
+
+    #[test]
+    fn build_app_tags_omits_organization_when_empty() {
+        let tags = build_app_tags(&DeploymentMode::SingleNode, Some(""));
+        assert!(!tags.contains_key("organization"));
+    }
+
+    #[test]
+    fn build_app_tags_sets_provided_organization() {
+        let tags = build_app_tags(&DeploymentMode::Cluster, Some("spicehq"));
+        assert_eq!(tags.get("organization").map(String::as_str), Some("spicehq"));
+    }
+
+    #[test]
+    fn build_app_tags_omits_kind_for_non_cluster() {
+        let tags = build_app_tags(&DeploymentMode::SingleNode, None);
+        assert!(!tags.contains_key("kind"));
     }
 
     // ── flight_url_from_cname ─────────────────────────────────────────────────

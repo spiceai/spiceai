@@ -627,9 +627,9 @@ struct SpidapterHandler {
 
 impl SpidapterHandler {
     fn new(args: &StdioArgs, mut scenario: ScenarioConfig) -> Self {
-        // Apply env var overrides for SCP image tag and channel so the workflow
-        // can pass SPIDAPTER_IMAGE_TAG / SPIDAPTER_CHANNEL without modifying the
-        // scenario YAML.
+        // Apply env var overrides for SCP image tag, channel, and organization
+        // tag so the workflow can pass SPIDAPTER_IMAGE_TAG / SPIDAPTER_CHANNEL /
+        // SPIDAPTER_ORGANIZATION_TAG without modifying the scenario YAML.
         if let Some(ComputeConfig::Scp(ref mut scp)) = scenario.compute {
             if let Ok(tag) = std::env::var("SPIDAPTER_IMAGE_TAG")
                 && !tag.is_empty()
@@ -641,6 +641,11 @@ impl SpidapterHandler {
             {
                 use spice_cloud_client::types::UpdateChannel;
                 scp.channel = channel.parse::<UpdateChannel>().ok();
+            }
+            if let Ok(organization) = std::env::var("SPIDAPTER_ORGANIZATION_TAG")
+                && !organization.is_empty()
+            {
+                scp.organization_tag = Some(organization);
             }
         }
         Self {

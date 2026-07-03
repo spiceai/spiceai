@@ -336,6 +336,19 @@ jobs:
           export SPIDAPTER_EXECUTOR_MEMORY_LIMIT="4Gi"
           export SPIDAPTER_EXECUTOR_REPLICAS="3"
 
+          # Tag the created app with `organization: spicehq`. spidapter only sets
+          # the organization tag when this env var is non-empty.
+          export SPIDAPTER_ORGANIZATION_TAG="spicehq"
+
+          # Thread the `ready_wait` input into the post-SQL-ready executor-connect
+          # wait. Without this, spidapter falls back to its hardcoded 120s default
+          # (SPIDAPTER_DEPLOYMENT_READY_WAIT in provision/spice_cloud.rs), which is
+          # too short for the cluster's executors to register. Note: this is a
+          # fixed sleep, not a poll — the run always waits the full duration after
+          # spiced accepts SQL.
+          export SPIDAPTER_DEPLOYMENT_READY_WAIT="${READY_WAIT}"
+          echo "SPIDAPTER_DEPLOYMENT_READY_WAIT=${READY_WAIT}"
+
           resolve_spidapter_template() {
             local value="$1"
             value="${value//\{github_run_id\}/${GITHUB_RUN_ID}}"
