@@ -64,7 +64,7 @@ datasets:
         # cost from the write path. On crash the un-checkpointed tail replays from the slot and the
         # PK-idempotent apply converges exactly-once. This is the counterpart to `…-cdc-tuned-sf1000`.
         cayenne_cdc_durability: memory
-        cayenne_cdc_mem_tier_max_bytes: '2147483648'
+        cayenne_cdc_mem_tier_max_bytes: '1073741824' # 1 GiB
         cayenne_cdc_mem_tier_min_flush_bytes: '268435456'
         cayenne_cdc_mem_tier_max_age_ms: '30000'
         # In-memory CDC intra-apply sharding: 4 PK-hash shards validate+append in

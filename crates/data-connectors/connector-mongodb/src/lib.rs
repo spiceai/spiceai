@@ -34,6 +34,7 @@ use datafusion_table_providers::mongodb::{
 use mongodb::bson::{Bson, Document, doc};
 use runtime::component::dataset::Dataset;
 use runtime::component::dataset::acceleration::RefreshMode;
+use runtime::dataconnector::schema_projection::{ProjectionPolicy, parse_schema_projection};
 use runtime::dataconnector::{
     ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory,
     DataConnectorResult,
@@ -748,9 +749,15 @@ impl DataConnector for MongoDB {
         &self,
         dataset: &Dataset,
     ) -> DataConnectorResult<Arc<dyn TableProvider>> {
+        // JSON-nesting / declared-schema projection. `_id` is MongoDB's only
+        // primary key and must stay a declared column when a catch-all is used.
+        let projection = parse_schema_projection(
+            dataset,
+            &ProjectionPolicy::new("mongodb").with_required_columns(vec!["_id".to_string()]),
+        )?;
         let provider = self
             .mongodb_factory
-            .table_provider(dataset.path().into(), dataset.schema.clone())
+            .table_provider(dataset.path().into(), dataset.schema.clone(), projection)
             .await
             .context(UnableToGetReadProviderSnafu {
                 dataconnector: "mongodb",

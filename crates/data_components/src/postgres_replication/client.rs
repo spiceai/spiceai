@@ -365,11 +365,8 @@ fn wal_stream(
                         }
                         DecodedMessage::Update { relation_id, old, new } => {
                             let rel = resolve_relation(&decoder, relation_id)?;
-                            // Fill unchanged-TOAST markers from the old tuple
-                            // (REPLICA IDENTITY FULL) before buffering.
-                            let new = super::changes::merge_unchanged_toast(new, old.as_ref());
                             txn.get_or_insert_with(|| TransactionBuffer::new(0))
-                                .push_update(rel, new);
+                                .push_update(rel, old, new);
                             metrics.inc_update();
                         }
                         DecodedMessage::Delete { relation_id, old } => {
