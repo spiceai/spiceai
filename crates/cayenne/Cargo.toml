@@ -141,6 +141,10 @@ name = "mem_tier_shard_split_converter"
 
 [[bench]]
 harness = false
+name = "sharded_validation_inline"
+
+[[bench]]
+harness = false
 name = "staged_ivm_feed"
 
 [[bench]]

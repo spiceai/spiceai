@@ -7338,54 +7338,88 @@ impl CayenneTableProvider {
         //    `'static`/`Arc` gymnastics and joins every thread before returning, so
         //    `sharded_index` is free to move again at step 3. This blocks the
         //    caller for `max(shard)` validation CPU instead of the prior
-        //    `sum(shard)`; the per-apply thread spawn (~tens of µs) is negligible
-        //    against the multi-hundred-ms fat applies where N>1 is configured.
+        //    `sum(shard)`. Spawning OS threads (~tens of µs each) only pays with ≥2
+        //    non-empty shards doing real work; ≤1 non-empty shard — the common
+        //    single-row CDC-transaction shape under sustained load, where the spawn
+        //    (not the validation) would bound apply throughput and thus lag — takes
+        //    the inline branch below and skips the thread machinery entirely.
         let mut per_shard_validated: Vec<(
             Vec<RecordBatch>,
             OnConflictDeletions,
             HashSet<OwnedRow>,
         )> = {
             let index_ref = sharded_index.as_ref();
-            std::thread::scope(|scope| {
-                // Spawn a validation thread per NON-EMPTY shard; a shard with no
-                // rows routed to it this apply needs no validation, so it yields
-                // the empty result inline and skips the spawn/join — mirroring the
-                // `has_rows` skip in the append step below. One entry per shard in
-                // order, so the index alignment steps 3/4 rely on is preserved.
-                let handles: Vec<Option<_>> = per_shard_batches
+            let non_empty_shards = per_shard_batches.iter().filter(|b| !b.is_empty()).count();
+            if non_empty_shards <= 1 {
+                // INLINE: with ≤1 non-empty shard there is no cross-shard
+                // parallelism to exploit, so an OS-thread spawn (~tens of µs) would
+                // dwarf the ~ns of validation work. Validate on the caller thread and
+                // skip the `std::thread::scope` machinery. Behaviour is identical to
+                // the threaded path — shards are independent, one result entry per
+                // shard in order — only the thread is elided. This is the common
+                // single-row CDC-transaction shape under sustained load, where the
+                // spawn (not the validation) bounds apply throughput and thus lag.
+                per_shard_batches
                     .into_iter()
                     .enumerate()
                     .map(|(s, shard_batches)| {
                         if shard_batches.is_empty() {
-                            None
+                            Ok((Vec::new(), OnConflictDeletions::default(), HashSet::new()))
                         } else {
-                            Some(scope.spawn(move || {
-                                self.validate_one_shard(
-                                    s,
-                                    shard_batches,
-                                    index_ref,
-                                    pk_indices,
-                                    converter,
-                                    on_conflict,
-                                )
-                            }))
+                            self.validate_one_shard(
+                                s,
+                                shard_batches,
+                                index_ref,
+                                pk_indices,
+                                converter,
+                                on_conflict,
+                            )
                         }
                     })
-                    .collect();
-                handles
-                    .into_iter()
-                    .map(|handle| match handle {
-                        // Empty shard: no validation ran; yield the empty result.
-                        None => Ok((Vec::new(), OnConflictDeletions::default(), HashSet::new())),
-                        Some(h) => match h.join() {
-                            Ok(result) => result,
-                            // A panic in shard validation is a bug; re-raise it
-                            // faithfully rather than masking it as a normal error.
-                            Err(payload) => std::panic::resume_unwind(payload),
-                        },
-                    })
-                    .collect::<Result<Vec<_>>>()
-            })?
+                    .collect::<Result<Vec<_>>>()?
+            } else {
+                // PARALLEL: ≥2 non-empty shards — spawn a validation thread per
+                // NON-EMPTY shard; a shard with no rows this apply yields the empty
+                // result inline and skips the spawn/join. One entry per shard in
+                // order, so the index alignment steps 3/4 rely on is preserved.
+                std::thread::scope(|scope| {
+                    let handles: Vec<Option<_>> = per_shard_batches
+                        .into_iter()
+                        .enumerate()
+                        .map(|(s, shard_batches)| {
+                            if shard_batches.is_empty() {
+                                None
+                            } else {
+                                Some(scope.spawn(move || {
+                                    self.validate_one_shard(
+                                        s,
+                                        shard_batches,
+                                        index_ref,
+                                        pk_indices,
+                                        converter,
+                                        on_conflict,
+                                    )
+                                }))
+                            }
+                        })
+                        .collect();
+                    handles
+                        .into_iter()
+                        .map(|handle| match handle {
+                            // Empty shard: no validation ran; yield the empty result.
+                            None => {
+                                Ok((Vec::new(), OnConflictDeletions::default(), HashSet::new()))
+                            }
+                            Some(h) => match h.join() {
+                                Ok(result) => result,
+                                // A panic in shard validation is a bug; re-raise it
+                                // faithfully rather than masking it as a normal error.
+                                Err(payload) => std::panic::resume_unwind(payload),
+                            },
+                        })
+                        .collect::<Result<Vec<_>>>()
+                })?
+            }
         };
 
         // 3. Restore the per-shard existence index to the cache BEFORE the appends
