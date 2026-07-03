@@ -22,7 +22,7 @@ datasets:
       engine: cayenne
       mode: file
       partition_by:
-        - date_part('year', l_shipdate)
+        - bucket(6, l_shipdate)
   - from: s3://spiceai-public-datasets/tpch_sf100/nation.parquet
     name: nation
     params: *s3_params
