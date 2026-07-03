@@ -99,12 +99,16 @@ fn bench_converter_reuse(c: &mut Criterion) {
         let cols = pk_columns(rows);
 
         // Pre-fix: a fresh RowConverter every batch, then encode.
-        group.bench_with_input(BenchmarkId::new("rebuild_per_batch", rows), &rows, |b, _| {
-            b.iter(|| {
-                let converter = RowConverter::new(sort_fields()).expect("rc");
-                black_box(converter.convert_columns(black_box(&cols)).expect("conv"))
-            });
-        });
+        group.bench_with_input(
+            BenchmarkId::new("rebuild_per_batch", rows),
+            &rows,
+            |b, _| {
+                b.iter(|| {
+                    let converter = RowConverter::new(sort_fields()).expect("rc");
+                    black_box(converter.convert_columns(black_box(&cols)).expect("conv"))
+                });
+            },
+        );
 
         // Post-fix: reuse the apply's already-built converter, then encode.
         let shared = RowConverter::new(sort_fields()).expect("rc");

@@ -5950,7 +5950,6 @@ impl CayenneTableProvider {
     /// validate->append. The routing is keyed on the `OwnedRow` bytes so it agrees
     /// with the per-shard bloom/keyset and tombstone routing (see [`shard_of_pk`]).
     fn split_batch_by_pk_shard(
-        &self,
         batch: &RecordBatch,
         pk_indices: &[usize],
         converter: &RowConverter,
@@ -7298,7 +7297,7 @@ impl CayenneTableProvider {
         let mut per_shard_batches: Vec<Vec<RecordBatch>> = vec![Vec::new(); n];
         let mut per_shard_bytes: Vec<u64> = vec![0; n];
         for batch in &batches {
-            let shards = self.split_batch_by_pk_shard(batch, pk_indices, converter, n)?;
+            let shards = Self::split_batch_by_pk_shard(batch, pk_indices, converter, n)?;
             for (s, sub) in shards.into_iter().enumerate() {
                 if sub.num_rows() == 0 {
                     continue;
@@ -24908,22 +24907,19 @@ mod tests {
             ],
         )
         .expect("batch built");
-        let converter = provider
-            .build_pk_converter(&pk_indices)
-            .expect("converter");
+        let converter = provider.build_pk_converter(&pk_indices).expect("converter");
 
         // n=1 is the unsharded fast path: the batch comes back unchanged.
-        let one = provider
-            .split_batch_by_pk_shard(&batch, &pk_indices, &converter, 1)
+        let one = CayenneTableProvider::split_batch_by_pk_shard(&batch, &pk_indices, &converter, 1)
             .expect("split n=1");
         assert_eq!(one.len(), 1);
         assert_eq!(one[0].num_rows(), batch.num_rows());
 
         // n=4: disjoint partition, no rows lost, deterministic routing.
         let n = 4;
-        let shards = provider
-            .split_batch_by_pk_shard(&batch, &pk_indices, &converter, n)
-            .expect("split n=4");
+        let shards =
+            CayenneTableProvider::split_batch_by_pk_shard(&batch, &pk_indices, &converter, n)
+                .expect("split n=4");
         assert_eq!(shards.len(), n);
 
         let mut seen = std::collections::HashSet::new();
