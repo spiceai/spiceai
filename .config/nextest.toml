@@ -8,3 +8,13 @@ slow-timeout = { period = "120s", terminate-after = 3 }
 # If you encounter flaky tests or resource contention in CI, consider reducing this
 # to a fixed number of threads or a lower expression (for example, "num-cpus/2").
 test-threads = "num-cpus"
+
+# Correctness/convergence property tests: the accelerated table MUST converge to
+# the reference model on every run. These are deterministic correctness checks,
+# not best-effort work — so a retry that happens to pass only HIDES a real bug
+# (e.g. the post-compaction duplicate-row race that surfaced as a masked "flake"
+# under CI load). Give them zero retries so any single failure is a hard failure,
+# never a silently-recovered flake.
+[[profile.default.overrides]]
+filter = 'binary(=mutation_property_test) | binary(=cdc_compaction_delete_race_test) | binary(=maintained_aggregate_filter_test)'
+retries = 0
