@@ -124,7 +124,8 @@ const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::component("schema_infer_max_records")
         .description("Number of documents to use to infer the schema. Defaults to 400."),
     ParameterSpec::component("num_docs_to_infer_schema")
-        .description("Deprecated: use 'schema_infer_max_records' instead. Number of documents to use to infer the schema. Defaults to 400."),
+        .description("Number of documents to use to infer the schema. Defaults to 400.")
+        .deprecated("Use 'schema_infer_max_records' instead."),
     ParameterSpec::component("pool_min")
         .description("The minimum number of connections to keep open in the pool, lazily created when requested.")
         .default(DEFAULT_CONNECTION_POOL_MIN_STR),
