@@ -9981,11 +9981,20 @@ impl CayenneTableProvider {
         // full snapshot rewrite) on the dedicated compaction runtime, isolated
         // from the query (compute) and CDC (refresh) runtimes.
         super::compaction::spawn_compaction(async move {
+            // Clear the coalescing flag on ANY exit — normal completion, early
+            // return, a panic during unwind, or the task being dropped on abort —
+            // so a stuck flag can never permanently suppress future compaction
+            // scheduling or hang `drain_in_flight_maintenance`.
+            struct ClearOnDrop(Arc<AtomicBool>);
+            impl Drop for ClearOnDrop {
+                fn drop(&mut self) {
+                    self.0.store(false, Ordering::Release);
+                }
+            }
+            let _clear = ClearOnDrop(Arc::clone(&table.post_write_compaction_scheduled));
+
             tokio::task::yield_now().await;
             let result = super::compaction::CompactionRunner::run_compaction_trigger(&table).await;
-            table
-                .post_write_compaction_scheduled
-                .store(false, Ordering::Release);
 
             match result {
                 Ok(true) => {
@@ -10046,6 +10055,54 @@ impl CayenneTableProvider {
     #[doc(hidden)]
     pub async fn drain_orphan_dv_sweep(&self, min_files: usize) {
         self.sweep_orphaned_deletion_vectors(min_files).await;
+    }
+
+    /// Quiesce this provider instance before it is dropped or replaced in-process
+    /// (a graceful restart, or a test that reopens the table): await every
+    /// fire-and-forget maintenance task it may have scheduled — post-write
+    /// compaction, orphan-DV sweep, inline checkpoint — and flush the post-write
+    /// maintenance loop, so nothing from THIS instance keeps mutating the shared
+    /// catalog after a new provider opens against it.
+    ///
+    /// A real process restart discards all in-memory state and kills these
+    /// detached tasks outright. An in-process drop cannot: a detached pass keeps a
+    /// `clone_for_write` alive and can commit AFTER a fresh provider opens against
+    /// the same catalog. The two instances hold DISTINCT `compaction_lock`s, so
+    /// they do not serialize — a full-snapshot rewrite in one and a
+    /// protected-snapshot subset-merge in the other can interleave and leave a
+    /// folded snapshot still registered in `cayenne_snapshot_sequence`,
+    /// double-counting its rows on the next load. Draining first makes an
+    /// in-process reopen behave like a clean restart.
+    #[doc(hidden)]
+    pub async fn drain_in_flight_maintenance(&self) -> CatalogResult<()> {
+        loop {
+            // Retention / stats / listing-refresh loop (has its own barrier).
+            self.flush_pending_maintenance().await?;
+            // Fire-and-forget compaction / orphan-DV sweep / inline checkpoint
+            // each set their flag BEFORE spawning and clear it when done, so spin
+            // until all are clear — no scheduled-or-running detached pass remains.
+            while self.post_write_compaction_scheduled.load(Ordering::Acquire)
+                || self.orphan_dv_sweep_scheduled.load(Ordering::Acquire)
+                || self.inline_checkpoint_scheduled.load(Ordering::Acquire)
+            {
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            }
+            // A drained compaction/sweep may have re-queued maintenance; repeat
+            // until a full pass finds nothing pending.
+            if self
+                .post_write_maintenance
+                .scheduled
+                .load(Ordering::Acquire)
+            {
+                continue;
+            }
+            break;
+        }
+        // Final barrier: serialize behind any compaction pass that grabbed the
+        // lock without one of the flags above; once held, nothing is mid-flight.
+        // Released immediately — the caller is about to drop/replace this instance.
+        drop(self.compaction_lock.lock().await);
+        Ok(())
     }
 
     /// Surviving-sequence floor for orphaned-DV cleanup: the minimum data sequence
@@ -10346,6 +10403,17 @@ impl CayenneTableProvider {
 
         let table = self.clone_for_write();
         tokio::spawn(async move {
+            // Clear the coalescing flag on ANY exit (completion, early return,
+            // panic unwind, or abort-drop) so a stuck flag can never permanently
+            // suppress future checkpoints or hang `drain_in_flight_maintenance`.
+            struct ClearOnDrop(Arc<AtomicBool>);
+            impl Drop for ClearOnDrop {
+                fn drop(&mut self) {
+                    self.0.store(false, Ordering::Release);
+                }
+            }
+            let _clear = ClearOnDrop(Arc::clone(&table.inline_checkpoint_scheduled));
+
             tokio::task::yield_now().await;
             let result = async {
                 let _write_guard = table.write_lock.lock().await;
@@ -10354,10 +10422,6 @@ impl CayenneTableProvider {
                     .await
             }
             .await;
-
-            table
-                .inline_checkpoint_scheduled
-                .store(false, Ordering::Release);
 
             if let Err(e) = result {
                 tracing::warn!(
