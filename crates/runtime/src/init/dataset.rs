@@ -1010,10 +1010,10 @@ impl Runtime {
         &self,
         ds: Arc<Dataset>,
     ) -> (Arc<Dataset>, Option<Vec<datafusion_expr::Expr>>) {
-        if !ds
+        if ds
             .acceleration
             .as_ref()
-            .is_some_and(|acc| !acc.partition_by.is_empty())
+            .is_none_or(|acc| acc.partition_by.is_empty())
         {
             return (ds, None);
         }
