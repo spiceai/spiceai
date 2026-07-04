@@ -1714,7 +1714,7 @@ mod tests {
     }
 
     /// End-to-end rewrite for `AVG` over a narrow signed-integer column (Postgres
-    /// `INTEGER` → arrow `Int32`, the common CDC case). DataFusion plans
+    /// `INTEGER` → arrow `Int32`, the common CDC case). `DataFusion` plans
     /// `AVG(Int32)` as `avg(CAST(v AS Float64))`, so this also guards the
     /// matcher's cast-see-through: the rewriter must resolve the underlying
     /// `Int32` column against the table schema, match the maintained `AVG` spec,
