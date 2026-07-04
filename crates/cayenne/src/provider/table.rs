@@ -2023,11 +2023,14 @@ impl CayenneTableProvider {
                     .map(|s| Self::statistics_to_inexact(s.clone()));
                 stats_cache.optimizer = df_stats;
                 // Preserve the exactness of the (unchanged) count across the
-                // schema-width re-derivation.
+                // schema-width re-derivation. Conservative when `raw` is cold
+                // (pre-first-persist): treat the count as NOT exact rather than
+                // trusting it — `optimizer` is `None` in that case too, so nothing
+                // is served, but this never leaves a stale-Exact flag behind.
                 stats_cache.count_exact = stats_cache
                     .raw
                     .as_ref()
-                    .is_none_or(|raw| raw.num_rows_exact);
+                    .is_some_and(|raw| raw.num_rows_exact);
             }
             // Per-file statistics were inferred against the old logical schema
             // width; drop them so the next scan re-infers at the evolved width.
@@ -16759,10 +16762,16 @@ impl CayenneTableProvider {
         // (`flushed_mem_rows` counts the new versions but not the durable rows they
         // supersede, which stay physically resident until compaction). Without this
         // the maintained count climbs toward "every row ever flushed". Reset by the
-        // checkpoint clear. See `mem_tier_pending_superseded`.
-        self.mem_tier_pending_superseded.fetch_add(
-            i64::try_from(superseded).unwrap_or(i64::MAX),
+        // checkpoint clear. See `mem_tier_pending_superseded`. Saturating so a
+        // long-lived process between checkpoints can never wrap `i64` negative (a
+        // negative accumulator would inflate the checkpoint delta via its
+        // `saturating_sub`); clamped at `i64::MAX` it only ever over-nets, keeping
+        // the maintained count Inexact-and-conservative rather than inflated.
+        let superseded_delta = i64::try_from(superseded).unwrap_or(i64::MAX);
+        let _ = self.mem_tier_pending_superseded.fetch_update(
             Ordering::Relaxed,
+            Ordering::Relaxed,
+            |current| Some(current.saturating_add(superseded_delta)),
         );
 
         self.apply_maintained_aggregate_insert_batches(maintained_aggregate_insert)
