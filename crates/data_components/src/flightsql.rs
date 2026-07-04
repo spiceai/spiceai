@@ -1370,10 +1370,10 @@ mod tests {
     /// unfiltered scan.
     #[tokio::test]
     async fn scan_marks_stamped_statistics_inexact_when_filter_pushed() {
+        use super::FlightSQLTable;
         use datafusion::catalog::TableProvider;
         use datafusion::common::stats::Precision;
         use datafusion::common::{ColumnStatistics, ScalarValue, Statistics};
-        use datafusion::physical_plan::ExecutionPlan;
         use datafusion::prelude::{SessionContext, col, lit};
 
         let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, true)]));
@@ -1432,7 +1432,10 @@ mod tests {
             "filtered scan must degrade num_rows to inexact (issue #11599)"
         );
         assert!(
-            matches!(filtered.column_statistics[0].max_value, Precision::Inexact(_)),
+            matches!(
+                filtered.column_statistics[0].max_value,
+                Precision::Inexact(_)
+            ),
             "filtered scan must degrade column bounds to inexact so MIN/MAX are not folded"
         );
     }
