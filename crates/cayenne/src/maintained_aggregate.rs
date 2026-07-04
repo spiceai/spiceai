@@ -81,7 +81,11 @@ pub enum MaintainedAggregateFunction {
     /// (`Float32`/`Float64`) families. Narrower widths widen losslessly to the
     /// `BIGINT`/`Float64` sum output, matching `DataFusion`'s `SUM` output type.
     Sum,
-    /// SQL `AVG(column)` for `Float32`/`Float64` inputs.
+    /// SQL `AVG(column)` over the signed-integer (`Int8`..`Int64`),
+    /// unsigned-integer (`UInt8`..`UInt64`), or floating-point
+    /// (`Float32`/`Float64`) families. The output is always `Float64` (matching
+    /// `DataFusion`'s `AVG` output type); integer inputs fold their running sum
+    /// exactly into an `i128` accumulator, floats into an `f64` one.
     Avg,
 }
 
@@ -213,6 +217,16 @@ enum AggregateAccumulator {
     AvgFloat64 {
         column_index: usize,
         sum: f64,
+        count: i64,
+    },
+    /// `AVG` over the signed/unsigned integer family. The running sum is folded
+    /// exactly in `i128` (never materialized as an integer — always divided down
+    /// to the `Float64` AVG output), so it is exactly invertible on the retract
+    /// path and, unlike `SumInt64`'s `i64`, wide enough to average many values
+    /// near `i64::MAX`/`u64::MAX` without overflowing.
+    AvgInt128 {
+        column_index: usize,
+        sum: i128,
         count: i64,
     },
 }
@@ -988,6 +1002,15 @@ impl ResolvedAggregateExpr {
             {
                 AggregateOutputType::UInt64
             }
+            // SQL `AVG(int)` outputs `Float64` (DataFusion's AVG output type) for
+            // the whole signed/unsigned integer family; the running sum is folded
+            // exactly in `i128` (see `AvgInt128`), so a narrow CDC column (Postgres
+            // `INTEGER` -> arrow `Int32`) is averaged without overflow.
+            (MaintainedAggregateFunction::Avg, Some(data_type))
+                if data_type.is_signed_integer() || data_type.is_unsigned_integer() =>
+            {
+                AggregateOutputType::Float64
+            }
             // `SUM`/`AVG` over floating-point widen to `Float64` (DataFusion's
             // float sum/avg output type); `Float32` widens losslessly.
             (
@@ -1094,6 +1117,16 @@ impl AggregateAccumulator {
                     value: None,
                 }
             }
+            (MaintainedAggregateFunction::Avg, AggregateOutputType::Float64, Some(column))
+                if column.data_type.is_signed_integer()
+                    || column.data_type.is_unsigned_integer() =>
+            {
+                Self::AvgInt128 {
+                    column_index: column.index,
+                    sum: 0,
+                    count: 0,
+                }
+            }
             (MaintainedAggregateFunction::Avg, AggregateOutputType::Float64, Some(column)) => {
                 Self::AvgFloat64 {
                     column_index: column.index,
@@ -1171,13 +1204,25 @@ impl AggregateAccumulator {
                     *count = count.checked_add(1).ok_or_else(count_overflow)?;
                 }
             }
+            Self::AvgInt128 {
+                column_index,
+                sum,
+                count,
+            } => {
+                if !batch.column(*column_index).is_null(row) {
+                    let scalar = ScalarValue::try_from_array(batch.column(*column_index), row)?;
+                    let delta = scalar_as_i128(&scalar)?;
+                    *sum = sum.checked_add(delta).ok_or_else(avg_overflow)?;
+                    *count = count.checked_add(1).ok_or_else(count_overflow)?;
+                }
+            }
         }
         Ok(())
     }
 
     /// Inverse of [`Self::apply_insert_row`], subtracting a previously-captured
-    /// input scalar. `COUNT`/`SUM(Int64|UInt64)` are exactly invertible;
-    /// `SUM/AVG(Float64)` subtract and rely on a periodic
+    /// input scalar. `COUNT`/`SUM(Int64|UInt64)`/`AVG(int)` are exactly
+    /// invertible; `SUM/AVG(Float64)` subtract and rely on a periodic
     /// [`MaintainedAggregateRegistry::rebuild_from_batches`] to bound float
     /// drift. A null input contributed nothing, so it retracts nothing.
     fn retract_row(&mut self, input: Option<&ScalarValue>) -> DataFusionResult<()> {
@@ -1225,6 +1270,15 @@ impl AggregateAccumulator {
                     *count = count.checked_sub(1).ok_or_else(retract_underflow)?;
                 }
             }
+            Self::AvgInt128 { sum, count, .. } => {
+                if let Some(scalar) = input
+                    && !scalar.is_null()
+                {
+                    let delta = scalar_as_i128(scalar)?;
+                    *sum = sum.checked_sub(delta).ok_or_else(retract_underflow)?;
+                    *count = count.checked_sub(1).ok_or_else(retract_underflow)?;
+                }
+            }
         }
         Ok(())
     }
@@ -1249,6 +1303,23 @@ impl AggregateAccumulator {
                 } else {
                     let count_f64 = exact_i64_to_f64(*count)?;
                     scalar_for_field(field, Some(ScalarValue::Float64(Some(*sum / count_f64))))
+                }
+            }
+            Self::AvgInt128 { sum, count, .. } => {
+                if *count == 0 {
+                    scalar_for_field(field, Some(ScalarValue::Float64(None)))
+                } else {
+                    let count_f64 = exact_i64_to_f64(*count)?;
+                    // The exact `i128` sum is divided down to the `Float64` AVG
+                    // output; the cast rounds to nearest for sums beyond 2^53,
+                    // which is inherent to producing an `f64` average and matches
+                    // DataFusion's `AVG(int)` -> `Float64` result.
+                    #[expect(
+                        clippy::cast_precision_loss,
+                        reason = "AVG output is Float64; rounding the i128 sum to f64 is intended"
+                    )]
+                    let sum_f64 = *sum as f64;
+                    scalar_for_field(field, Some(ScalarValue::Float64(Some(sum_f64 / count_f64))))
                 }
             }
         }
@@ -1457,6 +1528,24 @@ fn scalar_as_u64(scalar: &ScalarValue) -> DataFusionResult<u64> {
     }
 }
 
+/// Coerce a non-null integer input scalar to `i128`, widening the whole
+/// signed (`Int8`..`Int64`) and unsigned (`UInt8`..`UInt64`) family losslessly
+/// (`u64` fits in `i128`). Used by maintained `AVG(int)`, whose `i128` running
+/// sum has ample headroom to average many values near `i64::MAX`/`u64::MAX`.
+fn scalar_as_i128(scalar: &ScalarValue) -> DataFusionResult<i128> {
+    match scalar {
+        ScalarValue::Int64(Some(v)) => Ok(i128::from(*v)),
+        ScalarValue::Int32(Some(v)) => Ok(i128::from(*v)),
+        ScalarValue::Int16(Some(v)) => Ok(i128::from(*v)),
+        ScalarValue::Int8(Some(v)) => Ok(i128::from(*v)),
+        ScalarValue::UInt64(Some(v)) => Ok(i128::from(*v)),
+        ScalarValue::UInt32(Some(v)) => Ok(i128::from(*v)),
+        ScalarValue::UInt16(Some(v)) => Ok(i128::from(*v)),
+        ScalarValue::UInt8(Some(v)) => Ok(i128::from(*v)),
+        _ => Err(type_mismatch("an integer", scalar)),
+    }
+}
+
 /// Coerce a non-null floating-point input scalar to `f64`, widening `Float32`
 /// to `Float64` losslessly (`DataFusion`'s float sum/avg output type).
 fn scalar_as_f64(scalar: &ScalarValue) -> DataFusionResult<f64> {
@@ -1553,6 +1642,18 @@ fn sum_overflow() -> DataFusionError {
 fn retract_underflow() -> DataFusionError {
     DataFusionError::Execution(
         "Maintained aggregate retraction underflowed its state; falling back to base table scan"
+            .to_string(),
+    )
+}
+
+/// The `AVG(int)` running sum overflowed its `i128` accumulator on the insert
+/// path. AVG-specific (not [`sum_overflow`], whose "SUM" text would misreport the
+/// failing aggregate); with `i128` headroom this is effectively unreachable, but
+/// it fails safe. The retract path reuses [`retract_underflow`], matching
+/// `COUNT`/`SUM(UInt64)`.
+fn avg_overflow() -> DataFusionError {
+    DataFusionError::Execution(
+        "Maintained aggregate AVG running sum overflowed its i128 accumulator; falling back to base table scan"
             .to_string(),
     )
 }
@@ -2333,6 +2434,181 @@ mod tests {
             "group a = 10 + updated 7 (Int32 widened)"
         );
         assert_eq!(by_name.get("b"), None, "group b fully retracted by delete");
+        Ok(())
+    }
+
+    /// `AVG` over a narrow signed-integer column (Postgres `INTEGER` → arrow
+    /// `Int32`, the common CDC case) must (a) be accepted at registry
+    /// construction and (b) maintain an exact `i128` running sum + count across
+    /// insert, in-place update (retract-then-apply-new), and delete, dividing
+    /// down to the `Float64` AVG output. Mirrors
+    /// [`sum_over_int32_widens_on_insert_and_retract`] for `AvgInt128` — before
+    /// integer support this failed planning with "Avg maintained aggregate does
+    /// not support column type Int32".
+    #[test]
+    fn avg_over_int32_maintains_exactly_on_insert_and_retract() -> DataFusionResult<()> {
+        let i32_schema = Arc::new(Schema::new(vec![
+            Field::new("name", DataType::Utf8, true),
+            Field::new("v", DataType::Int32, true),
+            Field::new("pk", DataType::Int64, true),
+        ]));
+        let i32_batch = |rows: &[(&str, i32, i64)]| {
+            RecordBatch::try_new(
+                Arc::clone(&i32_schema),
+                vec![
+                    Arc::new(StringArray::from(
+                        rows.iter().map(|(n, _, _)| Some(*n)).collect::<Vec<_>>(),
+                    )),
+                    Arc::new(Int32Array::from(
+                        rows.iter().map(|(_, v, _)| *v).collect::<Vec<_>>(),
+                    )),
+                    Arc::new(Int64Array::from(
+                        rows.iter().map(|(_, _, pk)| *pk).collect::<Vec<_>>(),
+                    )),
+                ],
+            )
+            .expect("int32 batch should be valid")
+        };
+
+        let spec = MaintainedAggregateSpec {
+            filter: None,
+            group_by: vec!["name".to_string()],
+            aggregates: vec![MaintainedAggregateExpr {
+                function: MaintainedAggregateFunction::Avg,
+                column: Some("v".to_string()),
+            }],
+        };
+        // PK = column index 2 (`pk`). Construction must succeed for Int32 AVG.
+        let registry =
+            MaintainedAggregateRegistry::try_new_with_pk(&[spec], &i32_schema, &[2], usize::MAX)?;
+
+        registry
+            .apply_insert_batches(1, &[i32_batch(&[("a", 10, 1), ("a", 20, 2), ("b", 5, 3)])])?;
+        // UPDATE pk=2 in place (retract-old-then-apply-new): v 20 -> 7, so
+        // group a averages (10 + 7) / 2 = 8.5.
+        registry.apply_insert_batches(2, &[i32_batch(&[("a", 7, 2)])])?;
+        // DELETE pk=3 via a PK-projected batch (PK = column 2): retracts group b.
+        registry.apply_pk_deletes(3, &i32_batch(&[("", 0, 3)]).project(&[2])?)?;
+
+        // Serve via a real AggregateExec. DataFusion's AVG over an integer column
+        // outputs `Float64`, so the maintained output field is `Float64` too.
+        let input = MemorySourceConfig::try_new_exec(
+            &[vec![i32_batch(&[])]],
+            Arc::clone(&i32_schema),
+            None,
+        )?;
+        let avg_arg = cast(
+            col("v", i32_schema.as_ref())?,
+            i32_schema.as_ref(),
+            DataType::Int64,
+        )?;
+        let avg_v = AggregateExprBuilder::new(avg_udaf(), vec![avg_arg])
+            .schema(Arc::clone(&i32_schema))
+            .alias("avg(v)")
+            .build()
+            .map(Arc::new)?;
+        let aggregate = AggregateExec::try_new(
+            AggregateMode::Single,
+            PhysicalGroupBy::new_single(vec![(
+                col("name", i32_schema.as_ref())?,
+                "name".to_string(),
+            )]),
+            vec![avg_v],
+            vec![None],
+            input,
+            Arc::clone(&i32_schema),
+        )?;
+        let result = registry
+            .batch_for_aggregate(&aggregate, 3)?
+            .expect("registry should be fresh");
+        let names = as_string_array(result.column(0))?;
+        let avgs = as_float64_array(result.column(1))?;
+        let mut by_name = BTreeMap::new();
+        for row in 0..result.num_rows() {
+            if !avgs.is_null(row) {
+                by_name.insert(names.value(row).to_string(), avgs.value(row));
+            }
+        }
+        let avg_a = by_name.get("a").copied().expect("group a present");
+        assert!(
+            (avg_a - 8.5).abs() < 1e-9,
+            "group a = avg(10, updated 7) = 8.5, got {avg_a}"
+        );
+        assert_eq!(by_name.get("b"), None, "group b fully retracted by delete");
+        Ok(())
+    }
+
+    /// The `i128` running sum has the headroom `SumInt64`'s `i64` lacks: two
+    /// `Int64` rows at `i64::MAX` sum to ~1.8e19 (past `i64::MAX`), which would
+    /// overflow a `SUM`, but `AVG` accumulates in `i128` and returns their
+    /// average (`i64::MAX`) as `Float64` without erroring.
+    #[test]
+    fn avg_over_int64_near_max_does_not_overflow() -> DataFusionResult<()> {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("name", DataType::Utf8, true),
+            Field::new("v", DataType::Int64, true),
+            Field::new("pk", DataType::Int64, true),
+        ]));
+        let batch = |rows: &[(&str, i64, i64)]| {
+            RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![
+                    Arc::new(StringArray::from(
+                        rows.iter().map(|(n, _, _)| Some(*n)).collect::<Vec<_>>(),
+                    )),
+                    Arc::new(Int64Array::from(
+                        rows.iter().map(|(_, v, _)| *v).collect::<Vec<_>>(),
+                    )),
+                    Arc::new(Int64Array::from(
+                        rows.iter().map(|(_, _, pk)| *pk).collect::<Vec<_>>(),
+                    )),
+                ],
+            )
+            .expect("int64 batch should be valid")
+        };
+
+        let spec = MaintainedAggregateSpec {
+            filter: None,
+            group_by: vec!["name".to_string()],
+            aggregates: vec![MaintainedAggregateExpr {
+                function: MaintainedAggregateFunction::Avg,
+                column: Some("v".to_string()),
+            }],
+        };
+        let registry =
+            MaintainedAggregateRegistry::try_new_with_pk(&[spec], &schema, &[2], usize::MAX)?;
+        // Sum = 2 * i64::MAX overflows i64 but fits comfortably in i128.
+        registry.apply_insert_batches(1, &[batch(&[("a", i64::MAX, 1), ("a", i64::MAX, 2)])])?;
+
+        let input =
+            MemorySourceConfig::try_new_exec(&[vec![batch(&[])]], Arc::clone(&schema), None)?;
+        let avg_v = AggregateExprBuilder::new(avg_udaf(), vec![col("v", schema.as_ref())?])
+            .schema(Arc::clone(&schema))
+            .alias("avg(v)")
+            .build()
+            .map(Arc::new)?;
+        let aggregate = AggregateExec::try_new(
+            AggregateMode::Single,
+            PhysicalGroupBy::new_single(vec![(col("name", schema.as_ref())?, "name".to_string())]),
+            vec![avg_v],
+            vec![None],
+            input,
+            Arc::clone(&schema),
+        )?;
+        let result = registry
+            .batch_for_aggregate(&aggregate, 1)?
+            .expect("registry should be fresh");
+        let avgs = as_float64_array(result.column(1))?;
+        let avg_a = avgs.value(0);
+        #[expect(
+            clippy::cast_precision_loss,
+            reason = "test-only reference value; avg of two i64::MAX is i64::MAX"
+        )]
+        let expected = i64::MAX as f64;
+        assert!(
+            (avg_a - expected).abs() / expected < 1e-15,
+            "avg of two i64::MAX values is i64::MAX, got {avg_a}"
+        );
         Ok(())
     }
 
