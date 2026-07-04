@@ -80,7 +80,7 @@ pub struct Runtime {
     #[serde(default, skip_serializing_if = "is_default")]
     pub ready_state: RuntimeReadyState,
 
-    /// Configures log level for the runtime. Can be overriden if flags or environment variables
+    /// Configures log level for the runtime. Can be overridden if flags or environment variables
     /// are set.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub output_level: Option<OutputLevel>,
