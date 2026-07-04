@@ -1917,14 +1917,26 @@ mod tests {
     #[test]
     fn test_cql_decimal_to_i128_lossless_conversions() {
         // Equal scale: mantissa passes through unchanged, both signs.
-        assert_eq!(cql_decimal_to_i128(&decimal_mantissa_be(1234), 2, 2), Ok(1234));
-        assert_eq!(cql_decimal_to_i128(&decimal_mantissa_be(-1234), 2, 2), Ok(-1234));
+        assert_eq!(
+            cql_decimal_to_i128(&decimal_mantissa_be(1234), 2, 2),
+            Ok(1234)
+        );
+        assert_eq!(
+            cql_decimal_to_i128(&decimal_mantissa_be(-1234), 2, 2),
+            Ok(-1234)
+        );
 
         // Up-scaling always adds trailing zeros without loss: 12 (scale 0) -> scale 2 == 1200.
-        assert_eq!(cql_decimal_to_i128(&decimal_mantissa_be(12), 0, 2), Ok(1200));
+        assert_eq!(
+            cql_decimal_to_i128(&decimal_mantissa_be(12), 0, 2),
+            Ok(1200)
+        );
 
         // Exact down-scale: 12.3400 (mantissa 123400, scale 4) -> scale 2 == 1234, no digits lost.
-        assert_eq!(cql_decimal_to_i128(&decimal_mantissa_be(123_400), 4, 2), Ok(1234));
+        assert_eq!(
+            cql_decimal_to_i128(&decimal_mantissa_be(123_400), 4, 2),
+            Ok(1234)
+        );
 
         // An empty mantissa is zero.
         assert_eq!(cql_decimal_to_i128(&[], 0, 2), Ok(0));
@@ -1936,12 +1948,18 @@ mod tests {
         // without dropping the trailing 5. Previously this silently truncated to 12.34.
         let err = cql_decimal_to_i128(&decimal_mantissa_be(12_345), 3, 2)
             .expect_err("scale-3 value must not silently truncate to scale 2");
-        assert!(err.contains("truncate significant digits"), "unexpected error: {err}");
+        assert!(
+            err.contains("truncate significant digits"),
+            "unexpected error: {err}"
+        );
 
         // The same holds for negative values (-12345 -> -12.345).
         let err = cql_decimal_to_i128(&decimal_mantissa_be(-12_345), 3, 2)
             .expect_err("negative scale-3 value must not silently truncate");
-        assert!(err.contains("truncate significant digits"), "unexpected error: {err}");
+        assert!(
+            err.contains("truncate significant digits"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]
@@ -1949,8 +1967,8 @@ mod tests {
         // Regression for #11267: a mantissa wider than 16 bytes cannot fit an i128. Previously
         // this became a silent NULL; it must now report the reason.
         let wide = [0x7F_u8; 17];
-        let err =
-            cql_decimal_to_i128(&wide, 0, 2).expect_err("17-byte mantissa exceeds Decimal128 range");
+        let err = cql_decimal_to_i128(&wide, 0, 2)
+            .expect_err("17-byte mantissa exceeds Decimal128 range");
         assert!(err.contains("128-bit range"), "unexpected error: {err}");
 
         // A very negative source scale forces a large power-of-ten multiply. Before the fix the
