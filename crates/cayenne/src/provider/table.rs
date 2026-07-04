@@ -4107,12 +4107,12 @@ impl CayenneTableProvider {
             context.file_format(),
             &pk_deletion_strategy,
         )?;
-        let loaded_table_statistics =
-            Self::load_table_statistics(&catalog, &table_metadata).await;
+        let loaded_table_statistics = Self::load_table_statistics(&catalog, &table_metadata).await;
         // Legacy/absent stats are trusted exact once (see the migration note); the
         // next mem-tier checkpoint delta taints a drifted one.
-        let table_statistics_count_exact =
-            loaded_table_statistics.as_ref().is_none_or(|(_, exact)| *exact);
+        let table_statistics_count_exact = loaded_table_statistics
+            .as_ref()
+            .is_none_or(|(_, exact)| *exact);
         let table_statistics = loaded_table_statistics.map(|(df, _)| df);
         // An empty `pk_column_indices` (no primary key) yields no index and the
         // legacy insert-only behavior; otherwise the per-PK index is bounded by
@@ -16760,8 +16760,10 @@ impl CayenneTableProvider {
         // supersede, which stay physically resident until compaction). Without this
         // the maintained count climbs toward "every row ever flushed". Reset by the
         // checkpoint clear. See `mem_tier_pending_superseded`.
-        self.mem_tier_pending_superseded
-            .fetch_add(i64::try_from(superseded).unwrap_or(i64::MAX), Ordering::Relaxed);
+        self.mem_tier_pending_superseded.fetch_add(
+            i64::try_from(superseded).unwrap_or(i64::MAX),
+            Ordering::Relaxed,
+        );
 
         self.apply_maintained_aggregate_insert_batches(maintained_aggregate_insert)
             .await;
@@ -29699,7 +29701,7 @@ mod tests {
 
     /// Assert the `COUNT(*)` metadata-fold soundness invariant for `provider`.
     ///
-    /// The `COUNT(*)` fold (`CayenneStatsAggregateRewriter` and DataFusion's
+    /// The `COUNT(*)` fold (`CayenneStatsAggregateRewriter` and `DataFusion`'s
     /// built-in `AggregateStatistics`) answers from the physical scan's
     /// `partition_statistics(None).num_rows`, but ONLY when that is
     /// `Precision::Exact` (the footer-sum path served when
@@ -29709,7 +29711,7 @@ mod tests {
     ///   * a real `SELECT id,value` scan (bypasses every COUNT fold) returns
     ///     exactly the live model rows;
     ///   * `SELECT COUNT(*)` equals the live count;
-    ///   * whenever the scan reports an `Exact` num_rows (the only case the fold
+    ///   * whenever the scan reports an `Exact` `num_rows` (the only case the fold
     ///     trusts), it equals the true live row count — i.e. the fold cannot
     ///     over-count.
     ///
@@ -29717,7 +29719,7 @@ mod tests {
     /// stats-only over-count (the fold lies, a real scan is correct); a failure
     /// on the first localizes physical resurrection (a real scan over-counts too).
     ///
-    /// Returns `true` if the scan reported an `Exact` num_rows at this step (i.e.
+    /// Returns `true` if the scan reported an `Exact` `num_rows` at this step (i.e.
     /// the foldable path was actually exercised), so the caller can assert the
     /// test was not vacuously green.
     async fn assert_count_star_fold_never_overcounts(
@@ -29742,7 +29744,8 @@ mod tests {
         // COUNT(*) end-to-end.
         let count = query_count_star(ctx, provider, table_name).await;
         assert_eq!(
-            count, live,
+            count,
+            live,
             "[{step}] COUNT(*) mismatch: got {count}, live {live} \
              (real scan returned {} rows, has_pending_deletions={pending})",
             rows.len()
@@ -29759,7 +29762,8 @@ mod tests {
         if let DFPrecision::Exact(n) = stats.num_rows {
             let n = i64::try_from(n).expect("num_rows fits i64");
             assert_eq!(
-                n, live,
+                n,
+                live,
                 "[{step}] FOLD-UNSOUND: scan reports Exact num_rows={n} but only {live} rows are \
                  live (has_pending_deletions={pending}) — COUNT(*) would over-count by {}",
                 n - live
@@ -29789,6 +29793,7 @@ mod tests {
     ///     `Delta(flushed_mem_rows)` does not net supersedes of durable rows.
     #[tokio::test]
     async fn memory_cdc_supersede_maintained_count_tracks_live() {
+        const KEYS: i64 = 8;
         let ctx = SessionContext::new();
         let runtime_env = ctx.runtime_env();
         let table_name = "count_star_overcount";
@@ -29809,7 +29814,6 @@ mod tests {
 
         // Live-row model (id -> value).
         let mut model: std::collections::BTreeMap<i64, i64> = std::collections::BTreeMap::new();
-        const KEYS: i64 = 8;
         let ids: Vec<i64> = (0..KEYS).collect();
 
         let append_and_checkpoint = |vals: Vec<i64>| {
@@ -29872,7 +29876,7 @@ mod tests {
             // `local_executor_table_statistics` (runtime::cluster::partition) reports
             // to the coordinator, which folds `COUNT(*)` on it — but ONLY when it is
             // `Exact`. Two invariants:
-            let live = usize::try_from(model.len()).expect("live count fits usize");
+            let live = model.len();
             let stats = provider
                 .optimizer_table_statistics()
                 .expect("maintained stats present after checkpoint");
