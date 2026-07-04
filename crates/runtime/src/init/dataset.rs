@@ -997,6 +997,51 @@ impl Runtime {
         true
     }
 
+    /// Resolve executor partition scoping for `ds` before creating its accelerated table.
+    ///
+    /// On an executor node (partition assignments present) with a `partition_by`
+    /// configured dataset, returns the dataset with `partition_by` cleared and its
+    /// engine converted to unpartitioned, plus `Some` partition filters for the
+    /// partitions assigned to this executor. `Some(empty)` — no partition assigned —
+    /// resolves downstream to a `false` predicate (load no rows) rather than an
+    /// unfiltered full-table load. Otherwise returns `ds` unchanged with `None`
+    /// (not partition-scoped; retrieve everything).
+    async fn resolve_executor_partition_scoping(
+        &self,
+        ds: Arc<Dataset>,
+    ) -> (Arc<Dataset>, Option<Vec<datafusion_expr::Expr>>) {
+        if !ds
+            .acceleration
+            .as_ref()
+            .is_some_and(|acc| !acc.partition_by.is_empty())
+        {
+            return (ds, None);
+        }
+        let Some(assignments) = self.partition_assignments() else {
+            return (ds, None);
+        };
+
+        let assignments = assignments.read().await;
+        let resolved = ds.name.clone().resolve(
+            crate::datafusion::SPICE_DEFAULT_CATALOG,
+            crate::datafusion::SPICE_DEFAULT_SCHEMA,
+        );
+        let partition_filters = get_partition_filter_exprs(&resolved, &assignments);
+        tracing::debug!(
+            "For table={}, extracted {} partition filter(s) for assigned partitions.",
+            ds.name,
+            partition_filters.len(),
+        );
+
+        // Clear partition_by and convert engine to unpartitioned.
+        let mut ds_mod = (*ds).clone();
+        if let Some(acc) = ds_mod.acceleration.as_mut() {
+            acc.partition_by = vec![];
+            acc.engine = acc.engine.to_unpartitioned();
+        }
+        (Arc::new(ds_mod), Some(partition_filters))
+    }
+
     async fn reload_accelerated_dataset(
         self: Arc<Self>,
         ds: Arc<Dataset>,
@@ -1032,6 +1077,11 @@ impl Runtime {
             .remove_dataset_or_view_schedule(&ds.name)
             .await?;
 
+        // Mirror the initial-load path: on an executor, scope the recreated table
+        // to this node's assigned partitions so a hot reload doesn't load the full
+        // source table (or duplicate it across executors).
+        let (ds, initial_partition_filters) = self.resolve_executor_partition_scoping(ds).await;
+
         // create new accelerated table for updated data connector
         let accelerated_table = Arc::new(
             self.df
@@ -1041,7 +1091,7 @@ impl Runtime {
                     federated_table,
                     self.secrets(),
                     BootstrapStatus::None,
-                    None,
+                    initial_partition_filters,
                 )
                 .await
                 .context(UnableToCreateAcceleratedTableSnafu {
@@ -1237,41 +1287,12 @@ impl Runtime {
             return Ok(());
         }
 
-        // Apply partition filters if assigned (Executor mode)
-        let mut ds = ds;
-        // `None` here means the dataset is not partition-scoped (retrieve
-        // everything). In executor partitioned mode we always set `Some`, so an
-        // executor with no assigned partition gets `Some(empty)` — a `false`
-        // predicate that loads no rows — rather than an unfiltered full load.
-        let mut initial_partition_filters: Option<Vec<datafusion_expr::Expr>> = None;
-        // Only apply partition logic if the dataset is configured for partitioning
-        if ds
-            .acceleration
-            .as_ref()
-            .is_some_and(|acc| !acc.partition_by.is_empty())
-            && let Some(assignments) = self.partition_assignments()
-        {
-            let assignments = assignments.read().await;
-            let resolved = ds.name.clone().resolve(
-                crate::datafusion::SPICE_DEFAULT_CATALOG,
-                crate::datafusion::SPICE_DEFAULT_SCHEMA,
-            );
-            let partition_filters = get_partition_filter_exprs(&resolved, &assignments);
-            tracing::debug!(
-                "For table={}, extracted {} partition filter(s) for assigned partitions.",
-                ds.name,
-                partition_filters.len(),
-            );
-            initial_partition_filters = Some(partition_filters);
-
-            // Clear partition_by and convert engine to unpartitioned
-            let mut ds_mod = (*ds).clone();
-            if let Some(acc) = ds_mod.acceleration.as_mut() {
-                acc.partition_by = vec![];
-                acc.engine = acc.engine.to_unpartitioned();
-            }
-            ds = Arc::new(ds_mod);
-        }
+        // Apply partition filters if assigned (Executor mode). `None` means the
+        // dataset is not partition-scoped (retrieve everything); in executor
+        // partitioned mode this is `Some`, so an executor with no assigned
+        // partition gets `Some(empty)` — a `false` predicate that loads no rows —
+        // rather than an unfiltered full load.
+        let (ds, initial_partition_filters) = self.resolve_executor_partition_scoping(ds).await;
 
         // ACCELERATED TABLE
         let acceleration_settings =
