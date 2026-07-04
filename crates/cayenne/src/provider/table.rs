@@ -12645,7 +12645,14 @@ impl CayenneTableProvider {
             // as already-applied (`seq <= fence`) without ever being applied
             // during the rewrite, permanently masking it and resurrecting the
             // rows it deletes. Both values must come from one coherent load.
-            let fence_max_delete_seq = deletion_snapshot.max_sequence_number().unwrap_or(0);
+            //
+            // The durable max still over-claims a delete that is pending in the
+            // mem tier below it (cross-shard / off-fence commit reorder), so cap
+            // the fence strictly below that pending floor — see
+            // `protected_snapshot_merge_fence`.
+            let fence_max_delete_seq = self.protected_snapshot_merge_fence(
+                deletion_snapshot.max_sequence_number().unwrap_or(0),
+            );
             (candidates, fence_max_delete_seq, deletion_snapshot)
         };
         let phase1_fence_ms = compaction_start.elapsed().as_millis();
@@ -13192,7 +13199,12 @@ impl CayenneTableProvider {
                 .map(|id| (id.clone(), protected.get(id).copied().unwrap_or(0)))
                 .collect();
             let deletion_snapshot = self.pk_deletion_snapshot();
-            let fence_max_delete_seq = deletion_snapshot.max_sequence_number().unwrap_or(0);
+            // Cap below the smallest still-pending mem-tier delete so a reordered
+            // pending delete below the durable max is never tagged as baked — see
+            // `protected_snapshot_merge_fence`.
+            let fence_max_delete_seq = self.protected_snapshot_merge_fence(
+                deletion_snapshot.max_sequence_number().unwrap_or(0),
+            );
             (ids, thresholds, fence_max_delete_seq, deletion_snapshot)
         };
 
@@ -14201,6 +14213,55 @@ impl CayenneTableProvider {
     #[must_use]
     fn deletion_index_max_sequence(&self) -> Option<i64> {
         pk_deletion_snapshot_for_strategy(&self.pk_deletion_strategy).max_sequence_number()
+    }
+
+    /// The smallest still-pending mem-tier delete sequence across all shards, or
+    /// `None` when no mem-tier tombstone is pending.
+    ///
+    /// This is the floor a protected-snapshot compaction fence must stay strictly
+    /// below (see `InMemTombstones::min_delete_sequence`). The durable deletion
+    /// index max (`deletion_index_max_sequence`) can sit ABOVE a delete that is
+    /// still pending in the mem tier: a later apply's delete can fold into the
+    /// durable index ahead of an earlier apply's (off-fence / cross-shard commit
+    /// reorder). Fencing a merged snapshot at/above such a pending delete tags it
+    /// as already-baked, so the scan skips it forever and resurrects the deleted
+    /// row (durable over-count). O(pending tombstones) — off the query hot path
+    /// (only the periodic protected-snapshot compaction calls it).
+    #[must_use]
+    fn min_pending_mem_tier_delete_sequence(&self) -> Option<i64> {
+        self.mem_tier
+            .shards()
+            .iter()
+            .filter_map(|shard| shard.load().tombstones.min_delete_sequence())
+            .min()
+    }
+
+    /// The deletion fence to tag a freshly-merged protected snapshot with: the
+    /// just-loaded durable deletion-index max, CAPPED strictly below the smallest
+    /// still-pending mem-tier delete.
+    ///
+    /// The uncapped durable max over-claims. Under N>1 off-fence CDC a later
+    /// apply's delete can fold into the durable index ahead of an earlier apply's
+    /// (cross-shard / commit reorder), so the durable max can sit ABOVE a delete
+    /// that is still pending in the mem tier and therefore was NEVER baked into
+    /// the merged files. Tagging the merged snapshot with that max makes the scan
+    /// treat the pending delete as already-applied (`delete_seq <= threshold`) and
+    /// skip it forever, resurrecting the deleted row (measured: order_line
+    /// +14.9M / +19.6% at SF-100 N=4). Capping below the pending floor forces
+    /// those deletes to apply at scan instead.
+    ///
+    /// No under-count: a pending upsert's `(delete, data)` pair is one atomic
+    /// apply, so its reinsert row is ALSO pending (never in these durable merged
+    /// files). Lowering the fence can only apply MORE deletes to the old rows the
+    /// merge carried, never hide a reinsert that was baked in. The cap fires only
+    /// when a pending delete sits below the durable max (the reorder gap); with no
+    /// pending mem-tier delete it is the durable max unchanged.
+    #[must_use]
+    fn protected_snapshot_merge_fence(&self, durable_max_delete_seq: i64) -> i64 {
+        self.min_pending_mem_tier_delete_sequence()
+            .map_or(durable_max_delete_seq, |pending_floor| {
+                durable_max_delete_seq.min(pending_floor - 1)
+            })
     }
 
     /// Clear ALL cached deletion vectors, insert records, and protected
@@ -28534,6 +28595,54 @@ mod tests {
              protected-snapshot scan skip (delete_seq 20 <= threshold 40); the row is \
              not baked out of the snapshot's file: {pairs:?}"
         );
+    }
+
+    /// A protected-snapshot merge fence is CAPPED strictly below the smallest
+    /// still-pending mem-tier delete, so a delete that reordered below the durable
+    /// index max (a later apply folded ahead of it) is never tagged as
+    /// already-baked — the SF-100 N=4 order_line +14.9M over-count. The uncapped
+    /// durable max would skip such a delete at scan forever and resurrect the row.
+    /// No under-count: the pending `(delete, data)` pair is one atomic apply, so
+    /// the reinsert is also pending (never in the merged durable files) — lowering
+    /// the fence only applies more deletes to old rows.
+    #[tokio::test]
+    async fn protected_snapshot_merge_fence_caps_below_pending_mem_tier_delete() {
+        let ctx = SessionContext::new();
+        let (provider, _tmp, _ids) =
+            build_seq_prefix_fixture("merge_fence_cap", ctx.runtime_env(), &[10, 20]).await;
+
+        // No pending mem-tier delete yet: the fence is the durable max unchanged.
+        assert_eq!(provider.min_pending_mem_tier_delete_sequence(), None);
+        assert_eq!(provider.protected_snapshot_merge_fence(32), 32);
+
+        // Durable deletion index max = 32 (a later apply's delete folded ahead).
+        install_int64_deletes(&provider, &[(999, 32)]);
+        assert_eq!(provider.deletion_index_max_sequence(), Some(32));
+
+        // A delete for key 0 (its reinsert row is data@31) is STILL PENDING in the
+        // mem tier at delete_seq 30 — reordered below the durable max. Append it as
+        // one atomic apply segment (empty batches: only the tombstone matters here).
+        let mut seg = crate::provider::mem_tier::SegmentTombstones::from_int64_keys([0_i64]);
+        seg.stamp(30);
+        let cur = provider.mem_tier.shard(0).load();
+        let next = cur.append_segment(Arc::new(vec![]), 31, seg, 0, 0, 0);
+        provider.mem_tier.shard(0).store(Arc::new(next));
+
+        assert_eq!(
+            provider.min_pending_mem_tier_delete_sequence(),
+            Some(30),
+            "the pending floor is the mem-tier delete, below the durable max"
+        );
+        // The fence must NOT reach the durable max (32) — that would skip delete@30
+        // forever. It caps strictly below the pending floor.
+        assert_eq!(
+            provider.protected_snapshot_merge_fence(32),
+            29,
+            "fence caps strictly below the pending mem-tier delete (30), not the durable max (32)"
+        );
+        // When the durable max is already below the pending floor there is no
+        // reorder gap, so the fence stays the durable max (no needless re-apply).
+        assert_eq!(provider.protected_snapshot_merge_fence(10), 10);
     }
 
     /// STAGE-2 DELIVERABLE TEST (6) — REGRESSION FIX. An OLDER-prefix candidate
