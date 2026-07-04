@@ -204,12 +204,12 @@ impl CayenneDataSink {
         interval: std::time::Duration,
     ) -> super::Result<u64> {
         const MIN_SEGMENT_BYTES: usize = 8 * 1024 * 1024;
-        const MAX_SEGMENT_BYTES: usize = 64 * 1024 * 1024;
+        const MAX_SEGMENT_BYTES: usize = 256 * 1024 * 1024;
         let target = self.context.target_file_size_bytes();
         let byte_cap = if target == 0 {
             MAX_SEGMENT_BYTES
         } else {
-            (target / 8).clamp(MIN_SEGMENT_BYTES, MAX_SEGMENT_BYTES)
+            target.clamp(MIN_SEGMENT_BYTES, MAX_SEGMENT_BYTES)
         };
 
         let mut total_rows: u64 = 0;
