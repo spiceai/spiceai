@@ -1553,7 +1553,7 @@ impl RefreshTask {
             .as_ref()
             .map(super::refresh::RefreshSQL::to_sql);
         if let Some(ref s) = effective_sql {
-            filters.extend(s.effective_partition_filters());
+            s.extend_effective_partition_filters(&mut filters);
         }
 
         if let Some(cpu_runtime_handle) = self.cpu_runtime.clone() {

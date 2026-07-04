@@ -142,8 +142,9 @@ impl RefreshSQL {
 
     /// The partition filters as stored: `None` when the table is not
     /// partition-scoped, `Some` (possibly empty) when it is. Callers applying
-    /// the predicate to a refresh should use [`Self::effective_partition_filters`],
-    /// which resolves the empty-`Some` case to a `false` predicate.
+    /// the predicate to a refresh should use
+    /// [`Self::extend_effective_partition_filters`], which resolves the
+    /// empty-`Some` case to a `false` predicate.
     #[must_use]
     pub fn partition_filters(&self) -> Option<&[datafusion_expr::Expr]> {
         self.partition_filters.as_deref()
@@ -152,23 +153,23 @@ impl RefreshSQL {
     /// Set the partition filters. Pass `None` for a non-partition-scoped table,
     /// or `Some(filters)` for the assigned partitions — where an empty `Vec`
     /// means this executor owns no partition of the table and should load no
-    /// rows (see [`Self::effective_partition_filters`]).
+    /// rows (see [`Self::extend_effective_partition_filters`]).
     pub fn set_partition_filters(&mut self, filters: Option<Vec<datafusion_expr::Expr>>) {
         self.partition_filters = filters;
     }
 
-    /// The partition predicate(s) to AND into the refresh query, resolving the
-    /// three stored states:
-    /// - `None` → no predicate (retrieve everything).
+    /// Append the partition predicate(s) to AND into the refresh query onto
+    /// `out`, resolving the three stored states without allocating a temporary
+    /// `Vec`:
+    /// - `None` → nothing appended (retrieve everything).
     /// - `Some(filters)` (non-empty) → the assigned partitions' predicate.
     /// - `Some(empty)` → a single `false` predicate, so an executor with no
     ///   assigned partition loads no rows instead of the whole table.
-    #[must_use]
-    pub fn effective_partition_filters(&self) -> Vec<datafusion_expr::Expr> {
+    pub fn extend_effective_partition_filters(&self, out: &mut Vec<datafusion_expr::Expr>) {
         match &self.partition_filters {
-            None => vec![],
-            Some(filters) if filters.is_empty() => vec![datafusion_expr::lit(false)],
-            Some(filters) => filters.clone(),
+            None => {}
+            Some(filters) if filters.is_empty() => out.push(datafusion_expr::lit(false)),
+            Some(filters) => out.extend(filters.iter().cloned()),
         }
     }
 
@@ -1397,12 +1398,18 @@ mod tests {
         )
     }
 
+    fn effective(sql: &RefreshSQL) -> Vec<datafusion_expr::Expr> {
+        let mut out = vec![];
+        sql.extend_effective_partition_filters(&mut out);
+        out
+    }
+
     #[test]
     fn partition_filters_none_applies_no_predicate() {
         let sql = test_refresh_sql();
         assert!(sql.partition_filters().is_none());
         assert!(
-            sql.effective_partition_filters().is_empty(),
+            effective(&sql).is_empty(),
             "None must retrieve everything (no predicate)"
         );
         assert_eq!(sql.display_sql(), "SELECT * FROM t");
@@ -1412,9 +1419,8 @@ mod tests {
     fn partition_filters_empty_some_applies_false_predicate() {
         let mut sql = test_refresh_sql();
         sql.set_partition_filters(Some(vec![]));
-        let effective = sql.effective_partition_filters();
         assert_eq!(
-            effective,
+            effective(&sql),
             vec![datafusion_expr::lit(false)],
             "an executor with no assigned partition must load no rows"
         );
@@ -1426,8 +1432,18 @@ mod tests {
         let mut sql = test_refresh_sql();
         let predicate = datafusion_expr::col("bucket").eq(datafusion_expr::lit(0_i64));
         sql.set_partition_filters(Some(vec![predicate.clone()]));
-        assert_eq!(sql.effective_partition_filters(), vec![predicate]);
+        assert_eq!(effective(&sql), vec![predicate]);
         assert!(sql.display_sql().contains("+1 partition filter(s)"));
+    }
+
+    #[test]
+    fn extend_effective_partition_filters_appends_without_clearing() {
+        let mut sql = test_refresh_sql();
+        sql.set_partition_filters(Some(vec![]));
+        let existing = datafusion_expr::col("a").eq(datafusion_expr::lit(1_i64));
+        let mut out = vec![existing.clone()];
+        sql.extend_effective_partition_filters(&mut out);
+        assert_eq!(out, vec![existing, datafusion_expr::lit(false)]);
     }
 
     // Mock implementation of DatasetCheckpointer trait
