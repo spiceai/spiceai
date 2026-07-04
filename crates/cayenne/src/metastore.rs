@@ -117,7 +117,13 @@ pub const EXPECTED_TABLES: &[ExpectedTable] = &[
     },
     ExpectedTable {
         name: "cayenne_table_statistics",
-        columns: &["table_id", "statistics_blob", "num_rows", "ndv_sketches"],
+        columns: &[
+            "table_id",
+            "statistics_blob",
+            "num_rows",
+            "ndv_sketches",
+            "num_rows_exact",
+        ],
     },
     ExpectedTable {
         name: "cayenne_snapshot_file_statistics",

@@ -2583,8 +2583,8 @@ impl MetadataCatalog for CayenneCatalog {
         self.metastore
             .execute_helper(ExecuteParams {
                 sql: "INSERT OR REPLACE INTO cayenne_table_statistics \
-                      (table_id, statistics_blob, num_rows, ndv_sketches) \
-                      VALUES (?1, ?2, ?3, ?4)",
+                      (table_id, statistics_blob, num_rows, ndv_sketches, num_rows_exact) \
+                      VALUES (?1, ?2, ?3, ?4, ?5)",
                 params: vec![
                     MetastoreValue::Text(stats.table_id.clone()),
                     MetastoreValue::Blob(stats.statistics_blob.clone()),
@@ -2593,6 +2593,7 @@ impl MetadataCatalog for CayenneCatalog {
                         .ndv_sketches
                         .clone()
                         .map_or(MetastoreValue::Null, MetastoreValue::Blob),
+                    MetastoreValue::Integer(i64::from(stats.num_rows_exact)),
                 ],
             })
             .await
@@ -2604,7 +2605,7 @@ impl MetadataCatalog for CayenneCatalog {
             .query_helper(
                 QueryParams {
                     sql: r"
-                    SELECT table_id, statistics_blob, num_rows, ndv_sketches
+                    SELECT table_id, statistics_blob, num_rows, ndv_sketches, num_rows_exact
                     FROM cayenne_table_statistics
                     WHERE table_id = ?1
                     ",
@@ -2616,6 +2617,10 @@ impl MetadataCatalog for CayenneCatalog {
                         statistics_blob: row.get_blob(1)?,
                         num_rows: row.get_i64(2)?,
                         ndv_sketches: row.get_optional_blob(3)?,
+                        // Legacy rows (pre-migration backfill DEFAULT 1) read back
+                        // as exact — trusted once; the next mem-tier checkpoint
+                        // delta taints them if they have since drifted.
+                        num_rows_exact: row.get_i64(4)? != 0,
                     })
                 },
             )
