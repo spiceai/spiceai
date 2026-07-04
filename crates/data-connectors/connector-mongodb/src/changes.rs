@@ -19,7 +19,7 @@ use async_trait::async_trait;
 use data_components::{
     cdc::{
         ChangeEnvelope, ChangesStream, CommitChange, CommitError, NoOpCommitter, StreamError,
-        build_heartbeat_envelope, build_ready_signal_envelope, wrap_data_as_change_batch,
+        build_ready_signal_envelope, wrap_data_as_change_batch,
     },
     mongodb::stream::{
         change_events_to_change_batch, default_unnest_parameters, nullable_clone,
@@ -31,11 +31,11 @@ use datafusion::{
     physical_plan::SendableRecordBatchStream, prelude::SessionContext,
 };
 use datafusion_table_providers::mongodb::connection_pool::MongoDBConnectionPool;
-use futures::{Stream, StreamExt as FuturesStreamExt};
+use futures::StreamExt as FuturesStreamExt;
 use mongodb::{
-    ClientSession, Collection,
+    Collection,
     bson::Document,
-    change_stream::{event::ChangeStreamEvent, event::ResumeToken, session::SessionChangeStream},
+    change_stream::{ChangeStream, event::ChangeStreamEvent, event::ResumeToken},
     options::FullDocumentType,
 };
 use runtime::{
@@ -51,11 +51,7 @@ use runtime::{
     federated_table::FederatedTable,
     parameters::{ExposedParamLookup, Parameters},
 };
-use std::{
-    sync::Arc,
-    sync::atomic::{AtomicI64, Ordering},
-    time::Duration,
-};
+use std::{sync::Arc, time::Duration};
 use tokio_stream::StreamExt as TokioStreamExt;
 
 const DEFAULT_CHANGE_STREAM_BATCH_MAX_SIZE: usize = 1_000;
@@ -95,26 +91,10 @@ pub fn build_changes_stream(
                 "Failed to connect to MongoDB Change Stream for dataset `{}` collection `{collection_name}`: {error}",
                 dataset.name
             )))?;
-
         let collection = connection
             .client
             .database(&connection.db_name)
             .collection::<Document>(&collection_name);
-
-        // Run the change stream under an EXPLICIT session so we can read the
-        // server's `operation_time` between getMores — including the empty ones
-        // emitted while idle. That timestamp drives the idle heartbeat's
-        // `source_commit_ts_ms` (see `mongodb_event_stream`): it advances only
-        // when the server actually replied, so a stalled cursor can't make the
-        // replication-lag gauge read falsely fresh the way wall-clock `now()` would.
-        let mut session = collection
-            .client()
-            .start_session()
-            .await
-            .map_err(|error| StreamError::External(format!(
-                "Failed to start MongoDB session for dataset `{}` collection `{collection_name}`: {error}",
-                dataset.name
-            )))?;
 
         let mongo_sys = if dataset.is_file_accelerated() {
             initialize_mongo_sys(&dataset).await
@@ -139,7 +119,7 @@ pub fn build_changes_stream(
                     dataset.name
                 )))?;
 
-            match try_open_change_stream(&collection, &config, Some(resume_token), &mut session).await {
+            match try_open_change_stream(&collection, &config, Some(resume_token)).await {
                 Ok(stream) => {
                     tracing::info!(
                         dataset = %dataset.name,
@@ -187,7 +167,6 @@ pub fn build_changes_stream(
                 &dataset.name,
                 &collection_name,
                 None,
-                &mut session,
             )
             .await?;
             let resume_token = initial_change_stream.resume_token().ok_or_else(|| {
@@ -263,74 +242,23 @@ pub fn build_changes_stream(
                 &dataset.name,
                 &collection_name,
                 Some(resume_token),
-                &mut session,
             )
             .await?
         };
 
         let unnest_parameters = default_unnest_parameters(config.unnest_depth);
-
-        // Idle heartbeat: while the change stream produces no events, the source is
-        // caught up to the oplog head, so emit a zero-row heartbeat to keep the
-        // replication-lag gauge (`now - source_commit_ts_ms`) reading ~0 instead of
-        // freezing at the last real event's age.
-        //
-        // The heartbeat is stamped with the SERVER's `operation_time` (the cluster
-        // time the cursor has scanned through). Unlike wall-clock `now()`, it advances
-        // only when the server actually replied.
-        let heartbeat_interval = config.batch_max_duration.saturating_mul(2);
-
-        // Latest server operation time (ms since the Unix epoch)
-        let server_commit_ms = Arc::new(AtomicI64::new(0));
-        let event_stream = mongodb_event_stream(
-            live_change_stream,
-            session,
-            Arc::clone(&server_commit_ms),
-            dataset.name.clone(),
-        );
-        let event_batches = event_stream.chunks_timeout(
+        let event_batches = live_change_stream.chunks_timeout(
             config.batch_max_size,
             config.batch_max_duration,
         );
         tokio::pin!(event_batches);
 
-        loop {
-            let batch = match tokio::time::timeout(
-                heartbeat_interval,
-                TokioStreamExt::next(&mut event_batches),
-            )
-            .await
-            {
-                // Change stream ended.
-                Ok(None) => break,
-                Ok(Some(batch)) => batch,
-                // Idle window elapsed: the source is caught up. Emit a heartbeat
-                // stamped with the freshest server time observed, then keep tailing.
-                // Skip while it's still 0 (no getMore has replied yet) so we never
-                // emit a timestamp we can't vouch for.
-                Err(_elapsed) => {
-                    let server_ms = server_commit_ms.load(Ordering::Relaxed);
-                    if server_ms > 0 {
-                        match build_heartbeat_envelope(&schema, server_ms) {
-                            Ok(envelope) => yield envelope,
-                            Err(error) => tracing::warn!(
-                                dataset = %dataset.name,
-                                %error,
-                                "Failed to build MongoDB CDC heartbeat envelope; replication-lag gauge may go stale while the stream is idle"
-                            ),
-                        }
-                    }
-                    continue;
-                }
-            };
-
-            // Surface the first cursor error in the chunk (matches the previous
-            // `collect_change_events` short-circuit); the wrapper already tagged it
-            // with dataset context.
-            let events = batch.into_iter().collect::<Result<Vec<_>, _>>()?;
-            if events.is_empty() {
+        while let Some(batch) = TokioStreamExt::next(&mut event_batches).await {
+            if batch.is_empty() {
                 continue;
             }
+
+            let events = collect_change_events(batch, &dataset)?;
 
             let tail_token = events.last().map(|event| event.id.clone());
             let tail_cluster_time = events
@@ -558,8 +486,7 @@ async fn try_open_change_stream(
     collection: &Collection<Document>,
     config: &ChangeStreamConfig,
     resume_token: Option<ResumeToken>,
-    session: &mut ClientSession,
-) -> mongodb::error::Result<SessionChangeStream<ChangeStreamEvent<Document>>> {
+) -> mongodb::error::Result<ChangeStream<ChangeStreamEvent<Document>>> {
     let mut watch = collection
         .watch()
         .full_document(FullDocumentType::UpdateLookup)
@@ -570,10 +497,7 @@ async fn try_open_change_stream(
         watch = watch.resume_after(resume_token);
     }
 
-    // Bind the watch to our explicit session so its getMores run on it and
-    // advance `session.operation_time()` (read by the idle heartbeat). The
-    // returned stream owns its cursor and does not retain the session borrow.
-    watch.session(session).await
+    watch.await
 }
 
 async fn open_change_stream(
@@ -582,9 +506,8 @@ async fn open_change_stream(
     dataset_name: &datafusion::sql::TableReference,
     collection_name: &str,
     resume_token: Option<ResumeToken>,
-    session: &mut ClientSession,
-) -> Result<SessionChangeStream<ChangeStreamEvent<Document>>, StreamError> {
-    try_open_change_stream(collection, config, resume_token, session)
+) -> Result<ChangeStream<ChangeStreamEvent<Document>>, StreamError> {
+    try_open_change_stream(collection, config, resume_token)
         .await
         .map_err(|error| {
             StreamError::External(format!(
@@ -615,33 +538,19 @@ async fn snapshot_stream(
         .map_err(|error| data_components::cdc::StreamError::Arrow(error.to_string()))
 }
 
-/// Adapt a session-bound change stream into a plain `Stream` of events so the
-/// caller can reuse `chunks_timeout` (a `SessionChangeStream` is not a `Stream`,
-/// since advancing it needs `&mut ClientSession`).
-fn mongodb_event_stream(
-    mut stream: SessionChangeStream<ChangeStreamEvent<Document>>,
-    mut session: ClientSession,
-    server_commit_ms: Arc<AtomicI64>,
-    dataset_name: datafusion::sql::TableReference,
-) -> impl Stream<Item = Result<ChangeStreamEvent<Document>, StreamError>> {
-    try_stream! {
-        while stream.is_alive() {
-            let maybe_event = stream.next_if_any(&mut session).await.map_err(|error| {
-                StreamError::External(format!(
-                    "Failed to read MongoDB Change Stream event for dataset `{dataset_name}`: {error}"
-                ))
-            })?;
-
-            if let Some(ts) = session.operation_time() {
-                server_commit_ms.store(i64::from(ts.time).saturating_mul(1000), Ordering::Relaxed);
-            }
-
-            if let Some(event) = maybe_event {
-                yield event;
-            }
-            // `None` => empty getMore: nothing to yield; the clock is already updated.
-        }
-    }
+fn collect_change_events(
+    batch: Vec<mongodb::error::Result<ChangeStreamEvent<Document>>>,
+    dataset: &Dataset,
+) -> Result<Vec<ChangeStreamEvent<Document>>, data_components::cdc::StreamError> {
+    batch
+        .into_iter()
+        .collect::<mongodb::error::Result<Vec<_>>>()
+        .map_err(|error| {
+            data_components::cdc::StreamError::External(format!(
+                "Failed to read MongoDB Change Stream event for dataset `{}`: {error}",
+                dataset.name
+            ))
+        })
 }
 
 fn resolve_primary_keys(
