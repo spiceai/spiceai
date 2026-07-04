@@ -33340,7 +33340,9 @@ mod tests {
             .iter()
             .map(|&i| Arc::clone(key2_batch.column(i)))
             .collect();
-        let key2_rows = converter.convert_columns(&key2_cols).expect("convert key 2");
+        let key2_rows = converter
+            .convert_columns(&key2_cols)
+            .expect("convert key 2");
         assert!(
             bloom.maybe_contains(key2_rows.row(0).as_ref()),
             "the un-checkpointed RAM key must be folded into the persisted-bloom rebuild"
