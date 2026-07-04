@@ -19,7 +19,10 @@ limitations under the License.
 //! These tests verify the Azure Blob Storage integration, including patches from
 //! the `spiceai/arrow-rs` fork that optimize Parquet reading on Azure.
 
-use crate::{RecordBatch, init_tracing, utils::test_request_context};
+use crate::{
+    RecordBatch, init_tracing,
+    utils::{register_test_connectors, test_request_context},
+};
 
 use anyhow::anyhow;
 use app::AppBuilder;
@@ -145,6 +148,7 @@ async fn run_queries() -> Result<(), anyhow::Error> {
         .build();
 
     configure_test_datafusion();
+    register_test_connectors().await;
     let rt = Runtime::builder().with_app(app).build().await;
 
     let cloned_rt = Arc::new(rt.clone());
@@ -276,6 +280,7 @@ async fn run_parquet_query_with_meta() -> Result<(), anyhow::Error> {
         .build();
 
     configure_test_datafusion();
+    register_test_connectors().await;
     let rt = Runtime::builder().with_app(app).build().await;
     let cloned_rt = Arc::new(rt.clone());
 

@@ -52,10 +52,6 @@ const DEFAULT_SLEEP_DURATION: Duration = Duration::from_millis(500);
 
 impl DynamodbStreamProducer {
     async fn collect(&mut self) -> (DynamoDBStreamBatch, bool) {
-        // Captured BEFORE polling: when every shard comes back empty the stream is
-        // caught up, and the heartbeat watermark must reflect the moment this cycle started.
-        let cycle_start = SystemTime::now();
-
         let mut poll_results = Vec::new();
         let mut had_error = false;
 
@@ -100,7 +96,7 @@ impl DynamodbStreamProducer {
             }
         }
 
-        (combine_shard_batches(&poll_results, cycle_start), had_error)
+        (combine_shard_batches(&poll_results), had_error)
     }
 
     async fn initialize_shards_iterators(&mut self) -> bool {
@@ -195,10 +191,7 @@ impl DynamodbStreamProducer {
     }
 }
 
-fn combine_shard_batches(
-    poll_results: &[ShardPollResult],
-    cycle_start: SystemTime,
-) -> DynamoDBStreamBatch {
+fn combine_shard_batches(poll_results: &[ShardPollResult]) -> DynamoDBStreamBatch {
     // Collect records, checkpoints and watermarks
     let mut records = Vec::new();
     let mut shard_watermarks = Vec::new();
@@ -254,10 +247,8 @@ fn combine_shard_batches(
         tracing::trace!("Calculated watermark: {:?}", min_watermark);
         min_watermark
     } else if empty_shards_num == poll_results.len() {
-        // Caught up: no shard had records, so the freshest point we can
-        // attest to is the moment this poll cycle began.
-        tracing::trace!("All shards are empty, watermark is the start of this collect cycle");
-        Some(cycle_start)
+        tracing::trace!("All shards are empty, watermark is Now()");
+        Some(SystemTime::now())
     } else {
         tracing::trace!("No eligible shards with watermarks, watermark is None");
         None
@@ -324,13 +315,14 @@ mod tests {
         #[test]
         fn test_empty_poll_results() {
             let results: Vec<ShardPollResult> = vec![];
-            let cycle_start = system_time_from_secs(1234);
-            let batch = combine_shard_batches(&results, cycle_start);
+            let batch = combine_shard_batches(&results);
 
             assert!(batch.records.is_empty());
             assert!(batch.checkpoint.shards.is_empty());
-            // No shards at all → caught up → watermark is the cycle start, not `now()`.
-            assert_eq!(batch.watermark, Some(cycle_start));
+            let lag = SystemTime::now()
+                .duration_since(batch.watermark.expect("watermark"))
+                .expect("lag");
+            assert!(lag <= Duration::from_millis(100));
         }
 
         #[test]
@@ -344,7 +336,7 @@ mod tests {
                 current_watermark: Some(system_time_from_secs(1000)),
             }];
 
-            let batch = combine_shard_batches(&results, SystemTime::now());
+            let batch = combine_shard_batches(&results);
 
             assert_eq!(batch.records.len(), 2);
             assert_eq!(batch.checkpoint.shards.len(), 1);
@@ -361,14 +353,14 @@ mod tests {
                 current_watermark: Some(system_time_from_secs(1000)),
             }];
 
-            let cycle_start = system_time_from_secs(1234);
-            let batch = combine_shard_batches(&results, cycle_start);
+            let batch = combine_shard_batches(&results);
 
             assert!(batch.records.is_empty());
             assert_eq!(batch.checkpoint.shards.len(), 1);
-            // The only shard was empty → caught up → watermark is the cycle start
-            // (the shard's `current_watermark` is not eligible for an empty poll).
-            assert_eq!(batch.watermark, Some(cycle_start));
+            let lag = SystemTime::now()
+                .duration_since(batch.watermark.expect("watermark"))
+                .expect("lag");
+            assert!(lag <= Duration::from_millis(100));
         }
 
         #[test]
@@ -380,7 +372,7 @@ mod tests {
                 current_watermark: Some(system_time_from_secs(1000)),
             }];
 
-            let batch = combine_shard_batches(&results, SystemTime::now());
+            let batch = combine_shard_batches(&results);
 
             assert!(batch.records.is_empty());
             assert_eq!(batch.checkpoint.shards.len(), 1);
@@ -409,7 +401,7 @@ mod tests {
                 },
             ];
 
-            let batch = combine_shard_batches(&results, SystemTime::now());
+            let batch = combine_shard_batches(&results);
 
             assert_eq!(batch.records.len(), 3);
             assert_eq!(batch.checkpoint.shards.len(), 2);
@@ -440,7 +432,7 @@ mod tests {
                 },
             ];
 
-            let batch = combine_shard_batches(&results, SystemTime::now());
+            let batch = combine_shard_batches(&results);
 
             assert_eq!(batch.watermark, Some(system_time_from_secs(1000)));
         }
@@ -474,7 +466,7 @@ mod tests {
                 },
             ];
 
-            let batch = combine_shard_batches(&results, SystemTime::now());
+            let batch = combine_shard_batches(&results);
 
             // Only shard-1 (records) and shard-3 (failed) contribute
             // Minimum is 500 from shard-3
@@ -492,7 +484,7 @@ mod tests {
                 current_watermark: None, // No watermark
             }];
 
-            let batch = combine_shard_batches(&results, SystemTime::now());
+            let batch = combine_shard_batches(&results);
 
             assert!(!batch.records.is_empty());
             assert!(batch.watermark.is_none());
@@ -521,7 +513,7 @@ mod tests {
                 },
             ];
 
-            let batch = combine_shard_batches(&results, SystemTime::now());
+            let batch = combine_shard_batches(&results);
 
             assert_eq!(batch.checkpoint.shards.len(), 3);
             assert!(batch.checkpoint.shards.contains_key("shard-1"));
@@ -558,7 +550,7 @@ mod tests {
                 },
             ];
 
-            let batch = combine_shard_batches(&results, SystemTime::now());
+            let batch = combine_shard_batches(&results);
 
             // With the fix, duplicates are skipped, so we get exactly 1 checkpoint and 1 record
             let checkpoint_count = batch.checkpoint.shards.len();

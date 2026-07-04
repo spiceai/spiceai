@@ -37,10 +37,8 @@ use datafusion::arrow::datatypes::{Schema, SchemaRef};
 use super::{
     AccelerationConnection, Error, Result, acceleration_connection, offsets::OffsetSchemaState,
 };
-use crate::{
-    component::dataset::Dataset, dataaccelerator::spice_sys::OpenOption,
-    dataconnector::kafka::KafkaMetadata,
-};
+use crate::{component::dataset::Dataset, dataaccelerator::spice_sys::OpenOption};
+pub(super) use data_components::kafka::KafkaMetadata;
 use data_components::kafka::KafkaOffset;
 
 const KAFKA_TABLE_NAME: &str = "spice_sys_kafka";
@@ -69,7 +67,7 @@ impl KafkaSys {
         })
     }
 
-    pub(crate) async fn get(&self) -> Result<Option<KafkaMetadata>> {
+    pub async fn get(&self) -> Result<Option<KafkaMetadata>> {
         match &self.acceleration_connection {
             #[cfg(feature = "duckdb")]
             AccelerationConnection::DuckDB(pool) => self.get_duckdb(pool),
@@ -83,7 +81,7 @@ impl KafkaSys {
         }
     }
 
-    pub(crate) async fn upsert(&self, metadata: &KafkaMetadata) -> Result<()> {
+    pub async fn upsert(&self, metadata: &KafkaMetadata) -> Result<()> {
         match &self.acceleration_connection {
             #[cfg(feature = "duckdb")]
             AccelerationConnection::DuckDB(pool) => self.upsert_duckdb(pool, metadata),
@@ -97,7 +95,7 @@ impl KafkaSys {
         }
     }
 
-    pub(crate) async fn upsert_offsets(&self, offsets: &[KafkaOffset]) -> Result<()> {
+    pub async fn upsert_offsets(&self, offsets: &[KafkaOffset]) -> Result<()> {
         match &self.acceleration_connection {
             #[cfg(feature = "duckdb")]
             AccelerationConnection::DuckDB(pool) => self.upsert_offsets_duckdb(pool, offsets),

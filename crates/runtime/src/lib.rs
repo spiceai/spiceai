@@ -86,7 +86,7 @@ use crate::udtfs::ListUDFTableFunc;
 use runtime_async::cancellable_task::{CancellableTaskHandle, spawn_cancellable_task};
 pub mod accelerated_table;
 pub mod auth;
-mod builder;
+pub mod builder;
 pub mod catalogconnector;
 mod changes;
 pub mod component;
