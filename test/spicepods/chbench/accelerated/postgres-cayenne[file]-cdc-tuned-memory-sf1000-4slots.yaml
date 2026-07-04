@@ -1,7 +1,16 @@
 version: v1
 kind: Spicepod
-name: postgres-cayenne[file]-cdc-tuned-memory-sf1000
+name: postgres-cayenne[file]-cdc-tuned-memory-sf1000-4slots
 
+
+# EXPERIMENTAL 4-slot variant of `postgres-cayenne[file]-cdc-tuned-memory-sf1000`. Identical to
+# that pod EXCEPT the changes-mode tables are split across 4 shared replication slots (see the
+# grouped-slots comment below the `datasets:` key) instead of one slot per table. Kept as a
+# SEPARATE pod so it can be benchmarked and iterated WITHOUT changing the default memory-sf1000
+# pod that existing benchmarks track. NOT yet the default: grouping alone does not make SF-1000
+# converge (every topology still stalls the heavy tables order_line/stock) — promoting this to
+# the standard tuned settings should wait until the downstream source-decode / durable-apply
+# work lands.
 # In-memory CDC durability variant of `…-cdc-tuned-sf1000`. The memtable tier absorbs writes and
 # flushes by size/age (the `mem_tier_*` knobs below), trading per-batch durable persist for ingest
 # throughput. Sized for a 64 vCPU / 256 GiB host (m7a.16xlarge-class) with EBS gp3 — the CDC write
@@ -41,11 +50,45 @@ datasets:
   # High-volume PK upsert tables.
   # ------------------------------------------------------------------
 
+  # GROUPED SHARED REPLICATION SLOTS (4 groups) for the changes-mode tables.
+  #
+  # Chosen from three SF-1000 diagnostic runs (see the CDC back-pressure waterfall tooling).
+  # Each Postgres logical slot spawns
+  # ONE walsender that decodes the FULL WAL stream and filters to its tables, so
+  # server decode cost scales with the slot COUNT — while a single slot funnels the
+  # whole change stream through ONE client pump. The runs bracket that trade-off:
+  #
+  #   * slot-per-table (7 slots, run 28684210964): server re-decodes the WAL 7x;
+  #     even low-volume `warehouse` backed up 374 MiB. order_line received 0.50x
+  #     realtime, stock 0.58x — server walsender decode was the ceiling.
+  #   * single shared slot (run 28692447178): server decode dropped to 1x but the
+  #     lone client pump could not drain the merged stream — received collapsed to
+  #     0.03x on every table, the walsender sat 81% in WalSenderWriteData (blocked
+  #     writing to us), and new_order's ~84s apply bursts head-of-line-blocked the
+  #     shared connection, tripping wal_sender_timeout (~6 resets, all tables).
+  #   * 3 groups: order_line | {stock+customer+district+oorder+warehouse} | new_order
+  #     (run 28694417436): isolation confined the reset storm to new_order's slot,
+  #     but the 5-table `main` group's single pump bottlenecked — stock dragged
+  #     customer/district/oorder/warehouse from ~1.0x (their 7-slot rate) down to
+  #     0.39x diverging, and order_line on its own slot still only reached 0.56x.
+  #
+  # 4 groups isolates BOTH heavy producers (order_line ~28M changes, stock ~15M) on
+  # their own pumps, isolates the bursty apply-bound new_order (its 84s write bursts
+  # cannot HOL-block a shared connection), and shares only the light reference-ish
+  # upsert tables (customer/district/oorder/warehouse, ~10M combined — well under
+  # what one pump handled at 7 slots). Server decode is held at 4x (vs 7x baseline).
+  #   spiceai_cdc_order_line -> order_line  (heaviest producer; own pump)
+  #   spiceai_cdc_stock      -> stock       (2nd heaviest; own pump — split out of `main`)
+  #   spiceai_cdc_ref        -> customer, district, oorder, warehouse (light; shared)
+  #   spiceai_cdc_new_order  -> new_order   (bursty apply-bound; isolated for HOL safety)
+  # Each group derives its own `{slot}_pub`; connection params match via the anchor.
+  # Trade-off retained per-group: confirmed_flush_lsn is the min across a group's
+  # members, so a stall pins WAL retention for that group only (fine for the bench).
   - from: postgres:district
     name: district
     params:
       <<: *postgres_params
-      pg_replication_slot: spice_district
+      pg_replication_slot: spiceai_cdc_ref
       pg_replication_initial_snapshot: 'true'
       pg_replication_bootstrap_batch_size: '1048576'
     acceleration:
@@ -94,7 +137,7 @@ datasets:
     name: customer
     params:
       <<: *postgres_params
-      pg_replication_slot: spice_customer
+      pg_replication_slot: spiceai_cdc_ref
       pg_replication_initial_snapshot: 'true'
       pg_replication_bootstrap_batch_size: '1048576'
     acceleration:
@@ -117,7 +160,7 @@ datasets:
     name: new_order
     params:
       <<: *postgres_params
-      pg_replication_slot: spice_new_order
+      pg_replication_slot: spiceai_cdc_new_order
       pg_replication_initial_snapshot: 'true'
       pg_replication_bootstrap_batch_size: '1048576'
     acceleration:
@@ -136,7 +179,7 @@ datasets:
     name: oorder
     params:
       <<: *postgres_params
-      pg_replication_slot: spice_oorder
+      pg_replication_slot: spiceai_cdc_ref
       pg_replication_initial_snapshot: 'true'
       pg_replication_bootstrap_batch_size: '1048576'
     acceleration:
@@ -155,7 +198,7 @@ datasets:
     name: order_line
     params:
       <<: *postgres_params
-      pg_replication_slot: spice_order_line
+      pg_replication_slot: spiceai_cdc_order_line
       pg_replication_initial_snapshot: 'true'
       pg_replication_bootstrap_batch_size: '1048576'
     acceleration:
@@ -179,7 +222,7 @@ datasets:
     name: stock
     params:
       <<: *postgres_params
-      pg_replication_slot: spice_stock
+      pg_replication_slot: spiceai_cdc_stock
       pg_replication_initial_snapshot: 'true'
       pg_replication_bootstrap_batch_size: '1048576'
     acceleration:
@@ -203,7 +246,7 @@ datasets:
     name: warehouse
     params:
       <<: *postgres_params
-      pg_replication_slot: spice_warehouse
+      pg_replication_slot: spiceai_cdc_ref
       pg_replication_initial_snapshot: 'true'
       pg_replication_bootstrap_batch_size: '1048576'
     acceleration:
