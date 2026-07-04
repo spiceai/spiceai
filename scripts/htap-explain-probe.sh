@@ -51,9 +51,18 @@ mkdir -p "$OUTDIR"
 SQL_URL="http://${HTTP_HOST}:${HTTP_PORT}/v1/sql"
 READY_URL="http://${HTTP_HOST}:${HTTP_PORT}/v1/ready"
 
-# Resolve the query list. "all" enumerates q*.sql (version-sorted so q2 < q10).
+# Resolve the query list. "all" enumerates q*.sql (numeric-sorted so q2 < q10).
 if [ "$EXPLAIN_QUERIES" = "all" ]; then
-  QUERIES=$(cd "$CHBENCH_DIR" 2>/dev/null && ls q*.sql 2>/dev/null | sed 's/\.sql$//' | sort -V)
+  QUERIES="$(
+    if [ -d "$CHBENCH_DIR" ]; then
+      for f in "$CHBENCH_DIR"/q*.sql; do
+        [ -e "$f" ] || continue
+        b=$(basename "$f" .sql)
+        n=${b#q}
+        printf '%s\t%s\n' "$n" "$b"
+      done | sort -n -k1,1 | cut -f2 | paste -sd' ' -
+    fi
+  )"
 else
   QUERIES="$EXPLAIN_QUERIES"
 fi
