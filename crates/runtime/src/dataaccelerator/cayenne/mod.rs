@@ -1268,18 +1268,6 @@ impl CayenneAccelerator {
                 &["cayenne_bake_deletion_index_trigger"],
                 config.bake_deletion_index_trigger,
             );
-            // Orphaned-DV cleanup threshold. Parsed as a usize and mapped through
-            // NonZeroUsize so 0 means disabled (None) and >= 1 enables the sweep.
-            // Unset falls back to the struct default (currently 20 — enabled) via
-            // the fallback below — see VortexConfig::orphaned_dv_cleanup_min_files.
-            config.orphaned_dv_cleanup_min_files =
-                std::num::NonZeroUsize::new(autotune::auto_or_usize(
-                    acceleration,
-                    &["cayenne_orphaned_dv_cleanup_min_files"],
-                    config
-                        .orphaned_dv_cleanup_min_files
-                        .map_or(0, std::num::NonZeroUsize::get),
-                ));
             config.compaction_trigger_protected_snapshots = autotune::auto_or_usize(
                 acceleration,
                 &["cayenne_compaction_trigger_protected_snapshots"],
@@ -1937,8 +1925,8 @@ fn wrap_with_native_vector_indexes(
 const PARAMETERS: &[ParameterSpec] = &concat_arrays::<
     ParameterSpec,
     S3_PARAMS_LEN,
-    53,
-    { S3_PARAMS_LEN + 53 },
+    52,
+    { S3_PARAMS_LEN + 52 },
 >(
     S3_PARAMETERS,
     [
@@ -2006,8 +1994,6 @@ const PARAMETERS: &[ParameterSpec] = &concat_arrays::<
             .description("Minimum number of small Vortex files in the current snapshot before tiered compaction runs. A 'small' file is one whose size is below cayenne_target_file_size_mb / 4. Default: 4 for refresh_mode: caching, changes, or append with refresh_check_interval <= 5m; 8 otherwise."),
         ParameterSpec::component("bake_deletion_index_trigger")
             .description("Deletion-index size (count of live primary-key tombstones) at or above which the seq-prefix bake (key-delete merge-on-read compaction) runs. The bake consolidates the settled older prefix of protected snapshots so their tombstones drop out of the live deletion index, lowering per-query merge-on-read probe cost at the cost of write amplification. A larger value bakes less often (bounds write-amp); a smaller value bakes more often (smaller index, cheaper probe). Key-delete tables only. Default: 50000."),
-        ParameterSpec::component("orphaned_dv_cleanup_min_files")
-            .description("Per-table threshold: number of orphan-eligible key-based deletion vectors (cayenne_delete_file rows) that must accumulate on a table before a background cleanup sweep reclaims their .arrow files. A key deletion vector becomes orphaned ONLY once time-based retention (retention_period + time_column) empties the protected snapshot(s) it shadowed; without a retention policy nothing is ever orphaned and the sweep is a no-op. This bounds only the orphaned tail — the live, not-yet-orphaned DV set is bounded separately by compaction, not by this knob. Each orphaned .arrow file's size scales with the number of deletions it recorded, so lingering disk is roughly (tables × threshold × avg DV size). The sweep is lock-free and runs off the write path on the dedicated compaction runtime, so this only trades sweep frequency against lingering disk — never ingest latency. Set to 0 to disable cleanup entirely. Default: 20."),
         ParameterSpec::component("compaction_trigger_protected_snapshots")
             .description("Number of protected snapshots before snapshot-maintenance compaction runs. This is separate from compaction_trigger_files so small-file tuning does not silently change scan amplification behavior. Default: 4 for refresh_mode: caching, changes, or append with refresh_check_interval <= 5m; 8 otherwise."),
         ParameterSpec::component("compaction_trigger_snapshot_age_ms")
@@ -4404,10 +4390,6 @@ mod tests {
                     "cayenne_compaction_background_interval_ms".to_string(),
                     "45000".to_string(),
                 ),
-                (
-                    "cayenne_orphaned_dv_cleanup_min_files".to_string(),
-                    "2500".to_string(),
-                ),
             ]
             .into_iter()
             .collect(),
@@ -4422,55 +4404,6 @@ mod tests {
         assert_eq!(config.compaction_max_levels, 5);
         assert_eq!(config.compaction_max_files_per_pick, 64);
         assert_eq!(config.compaction_background_interval_ms, 45_000);
-        assert_eq!(
-            config.orphaned_dv_cleanup_min_files,
-            std::num::NonZeroUsize::new(2500),
-            "cayenne_orphaned_dv_cleanup_min_files param should resolve to Some(2500)"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_orphaned_dv_cleanup_param_zero_disables_unset_defaults() {
-        let app = Arc::new(AppBuilder::new("test").build());
-        let rt = Arc::new(crate::Runtime::builder().build().await);
-
-        // Unset → enabled at the default threshold (20).
-        let unset = DatasetBuilder::try_new("orphan_unset".to_string(), "orphan_unset")
-            .expect("dataset builder")
-            .with_app(Arc::clone(&app))
-            .with_runtime(Arc::clone(&rt))
-            .build()
-            .expect("dataset");
-        let unset_config = CayenneAccelerator::get_vortex_config("orphan_unset", &unset).await;
-        assert_eq!(
-            unset_config.orphaned_dv_cleanup_min_files,
-            std::num::NonZeroUsize::new(20),
-            "unset param must default orphaned-DV cleanup to 20"
-        );
-
-        // Explicit 0 → disabled (None), since NonZeroUsize cannot represent 0.
-        let mut zero = DatasetBuilder::try_new("orphan_zero".to_string(), "orphan_zero")
-            .expect("dataset builder")
-            .with_app(app)
-            .with_runtime(rt)
-            .build()
-            .expect("dataset");
-        zero.acceleration = Some(Acceleration {
-            engine: Engine::Cayenne,
-            mode: Mode::File,
-            params: [(
-                "cayenne_orphaned_dv_cleanup_min_files".to_string(),
-                "0".to_string(),
-            )]
-            .into_iter()
-            .collect(),
-            ..Default::default()
-        });
-        let zero_config = CayenneAccelerator::get_vortex_config("orphan_zero", &zero).await;
-        assert_eq!(
-            zero_config.orphaned_dv_cleanup_min_files, None,
-            "explicit 0 must disable orphaned-DV cleanup"
-        );
     }
 
     #[test]

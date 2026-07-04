@@ -90,18 +90,52 @@ pub fn change_events_to_change_batch(
                 })?;
                 rows.push(ChangeRow::new("c", Arc::clone(&primary_keys), document));
             }
-            OperationType::Update => {
-                let document = event.full_document.context(MissingFullDocumentSnafu {
-                    operation: "update",
-                })?;
-                rows.push(ChangeRow::new("u", Arc::clone(&primary_keys), document));
-            }
-            OperationType::Replace => {
-                let document = event.full_document.context(MissingFullDocumentSnafu {
-                    operation: "replace",
-                })?;
-                rows.push(ChangeRow::new("u", Arc::clone(&primary_keys), document));
-            }
+            OperationType::Update => match event.full_document {
+                Some(document) => {
+                    rows.push(ChangeRow::new("u", Arc::clone(&primary_keys), document));
+                }
+                None => match event.document_key {
+                    Some(key) => {
+                        tracing::warn!(
+                            operation = "update",
+                            "MongoDB change stream post-image was unavailable (document \
+                             deleted before UpdateLookup); substituting a synthetic delete"
+                        );
+                        rows.push(ChangeRow::new("d", Arc::clone(&primary_keys), key));
+                    }
+                    None => {
+                        tracing::warn!(
+                            operation = "update",
+                            "MongoDB change stream post-image was unavailable (document \
+                             deleted before UpdateLookup) and documentKey was missing; \
+                             skipping event"
+                        );
+                    }
+                },
+            },
+            OperationType::Replace => match event.full_document {
+                Some(document) => {
+                    rows.push(ChangeRow::new("u", Arc::clone(&primary_keys), document));
+                }
+                None => match event.document_key {
+                    Some(key) => {
+                        tracing::warn!(
+                            operation = "replace",
+                            "MongoDB change stream post-image was unavailable (document \
+                             deleted before UpdateLookup); substituting a synthetic delete"
+                        );
+                        rows.push(ChangeRow::new("d", Arc::clone(&primary_keys), key));
+                    }
+                    None => {
+                        tracing::warn!(
+                            operation = "replace",
+                            "MongoDB change stream post-image was unavailable (document \
+                             deleted before UpdateLookup) and documentKey was missing; \
+                             skipping event"
+                        );
+                    }
+                },
+            },
             OperationType::Delete => {
                 let document = event.document_key.context(MissingDocumentKeySnafu)?;
                 rows.push(ChangeRow::new("d", Arc::clone(&primary_keys), document));
@@ -419,24 +453,46 @@ mod tests {
     }
 
     #[test]
-    fn update_requires_full_document() {
+    fn update_without_full_document_becomes_delete() {
         let events = vec![event(doc! {
             "_id": { "_data": "update-token" },
             "operationType": "update",
             "ns": { "db": "db", "coll": "users" },
-            "documentKey": { "_id": "1" }
+            "documentKey": { "_id": "x" }
         })];
 
-        let error = change_events_to_change_batch(
+        let batch = change_events_to_change_batch(
             events,
             &schema(),
             &["_id".to_string()],
             &default_unnest_parameters(0),
             None,
         )
-        .expect_err("missing fullDocument should fail");
+        .expect("change batch should build")
+        .expect("batch should not be empty");
 
-        assert!(matches!(error, StreamError::MissingFullDocument { .. }));
+        assert_eq!(batch.record.num_rows(), 1);
+        assert!(matches!(batch.op(0), ChangeOperation::Delete));
+    }
+
+    #[test]
+    fn update_without_full_document_or_key_is_skipped() {
+        let events = vec![event(doc! {
+            "_id": { "_data": "update-token" },
+            "operationType": "update",
+            "ns": { "db": "db", "coll": "users" }
+        })];
+
+        let batch = change_events_to_change_batch(
+            events,
+            &schema(),
+            &["_id".to_string()],
+            &default_unnest_parameters(0),
+            None,
+        )
+        .expect("change batch should build");
+
+        assert!(batch.is_none());
     }
 
     #[test]
