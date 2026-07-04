@@ -1239,7 +1239,11 @@ impl Runtime {
 
         // Apply partition filters if assigned (Executor mode)
         let mut ds = ds;
-        let mut initial_partition_filters = vec![];
+        // `None` here means the dataset is not partition-scoped (retrieve
+        // everything). In executor partitioned mode we always set `Some`, so an
+        // executor with no assigned partition gets `Some(empty)` — a `false`
+        // predicate that loads no rows — rather than an unfiltered full load.
+        let mut initial_partition_filters: Option<Vec<datafusion_expr::Expr>> = None;
         // Only apply partition logic if the dataset is configured for partitioning
         if ds
             .acceleration
@@ -1253,14 +1257,12 @@ impl Runtime {
                 crate::datafusion::SPICE_DEFAULT_SCHEMA,
             );
             let partition_filters = get_partition_filter_exprs(&resolved, &assignments);
-            if !partition_filters.is_empty() {
-                tracing::debug!(
-                    "For table={}, extracted {} partition filter(s) for assigned partitions.",
-                    ds.name,
-                    partition_filters.len(),
-                );
-                initial_partition_filters = partition_filters;
-            }
+            tracing::debug!(
+                "For table={}, extracted {} partition filter(s) for assigned partitions.",
+                ds.name,
+                partition_filters.len(),
+            );
+            initial_partition_filters = Some(partition_filters);
 
             // Clear partition_by and convert engine to unpartitioned
             let mut ds_mod = (*ds).clone();

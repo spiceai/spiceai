@@ -1533,7 +1533,7 @@ impl RefreshTask {
         }) {
             Some(Ok((mut parsed, _schema))) => {
                 if let Some(base) = &refresh.sql {
-                    parsed.set_partition_filters(base.partition_filters().to_vec());
+                    parsed.set_partition_filters(base.partition_filters().map(<[_]>::to_vec));
                 }
                 Some(parsed)
             }
@@ -1553,7 +1553,7 @@ impl RefreshTask {
             .as_ref()
             .map(super::refresh::RefreshSQL::to_sql);
         if let Some(ref s) = effective_sql {
-            filters.extend(s.partition_filters().iter().cloned());
+            filters.extend(s.effective_partition_filters());
         }
 
         if let Some(cpu_runtime_handle) = self.cpu_runtime.clone() {
