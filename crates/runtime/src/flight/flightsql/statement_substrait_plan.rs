@@ -175,8 +175,12 @@ pub(crate) async fn do_get(
         .map_err(handle_query_error)?;
 
     let ipc_write_options = Service::ipc_write_options_for_context(&context)?;
-    let (output, from_cache) =
-        Service::query_result_to_flight_stream(query_result, ipc_write_options);
+    let (output, from_cache) = Service::query_result_to_flight_stream(
+        query_result,
+        ipc_write_options,
+        datafusion.cpu_runtime().cloned(),
+        Arc::clone(&context),
+    );
     let timed_output = TimedStream::new(output, move || start);
 
     let mut response =

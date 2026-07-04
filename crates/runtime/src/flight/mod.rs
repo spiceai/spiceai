@@ -53,12 +53,20 @@ use middleware::{RequestContextLayer, WriteRateLimitLayer};
 use runtime_auth::{AuthRequestContext, FlightBasicAuth, layer::flight::BasicAuthLayer};
 use runtime_request_context::{AsyncMarker, RequestContext};
 use snafu::prelude::*;
+use std::future::Future;
 use std::num::NonZeroU32;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::task::Poll;
+use tokio::runtime::Handle;
+use tokio::sync::mpsc;
+use tokio::task::JoinHandle;
+use tokio_stream::wrappers::ReceiverStream;
 use tokio_util::sync::CancellationToken;
 use tonic::transport::Server;
 use tonic::{Request, Response, Status, Streaming};
+use tracing::{Instrument, Span};
 
 mod actions;
 mod async_actions;
@@ -278,6 +286,8 @@ impl Service {
         Ok(Self::query_result_to_flight_stream(
             query_result,
             ipc_write_options,
+            datafusion.cpu_runtime().cloned(),
+            context,
         ))
     }
 
@@ -313,6 +323,8 @@ impl Service {
     fn query_result_to_flight_stream(
         query_result: QueryResult,
         ipc_write_options: IpcWriteOptions,
+        cpu_runtime: Option<Handle>,
+        request_context: Arc<RequestContext>,
     ) -> (BoxStream<'static, Result<FlightData, Status>>, CacheStatus) {
         // Reuse the same options for all messages.
         let options = ipc_write_options;
@@ -353,41 +365,107 @@ impl Service {
         let data_stream = query_result.data;
         let cache_status = query_result.cache_status;
 
-        let flights_stream = try_stream! {
-            yield schema_flight_data;
+        // Without a dedicated CPU runtime, encode inline on the caller's (IO)
+        // runtime as before. This preserves the historical behavior when
+        // `runtime.params.dedicated_thread_pool=disabled`.
+        let Some(cpu_handle) = cpu_runtime else {
+            let flights_stream = try_stream! {
+                yield schema_flight_data;
 
-            // Use fused stream for better performance
+                // Use fused stream for better performance
+                let mut data_stream = data_stream.fuse();
+
+                while let Some(batch_result) = data_stream.next().await {
+                    match batch_result {
+                        Ok(batch) => {
+                            let (dicts, batch_data) = encode_flight_batch(
+                                batch,
+                                needs_view_cast,
+                                &schema,
+                                &encoder,
+                                &mut dict_tracker,
+                                &options,
+                                &mut compression_context,
+                            )?;
+
+                            // Yield dictionaries first
+                            for dict in dicts {
+                                yield dict;
+                            }
+                            yield batch_data;
+                        }
+                        Err(e) => {
+                            let e = find_datafusion_root(e);
+                            Err(handle_datafusion_error(e))?;
+                        }
+                    }
+                }
+            };
+
+            return (flights_stream.boxed(), cache_status);
+        };
+
+        // Offload IPC encoding onto the dedicated CPU runtime so serialization
+        // does not contend with socket servicing on the IO runtime, which drives
+        // every concurrent query's response. A small bounded channel provides
+        // back-pressure (so egress memory stays bounded and a slow client stalls
+        // execution) while letting the encode of batch N overlap the socket
+        // write of batch N-1 — so this reduces transfer time without adding to
+        // first-byte latency.
+        let (tx, rx) = mpsc::channel::<Result<FlightData, Status>>(FLIGHT_ENCODE_CHANNEL_CAPACITY);
+        let span = Span::current();
+
+        let encode_task = async move {
+            if tx.send(Ok(schema_flight_data)).await.is_err() {
+                return;
+            }
+
             let mut data_stream = data_stream.fuse();
 
             while let Some(batch_result) = data_stream.next().await {
                 match batch_result {
-                    Ok(batch) => {
-                        // Cast view columns to match the expanded schema we advertised.
-                        let batch = if needs_view_cast {
-                            arrow_tools::schema::cast_view_columns(batch, &schema)
-                                .map_err(|e| Status::internal(e.to_string()))?
-                        } else {
-                            batch
-                        };
-                        let (dicts, batch_data) = encoder
-                            .encode(&batch, &mut dict_tracker, &options, &mut compression_context)
-                            .map_err(|e| Status::internal(e.to_string()))?;
-
-                        // Yield dictionaries first
-                        for dict in dicts {
-                            yield dict.into();
+                    Ok(batch) => match encode_flight_batch(
+                        batch,
+                        needs_view_cast,
+                        &schema,
+                        &encoder,
+                        &mut dict_tracker,
+                        &options,
+                        &mut compression_context,
+                    ) {
+                        Ok((dicts, batch_data)) => {
+                            for dict in dicts {
+                                if tx.send(Ok(dict)).await.is_err() {
+                                    return;
+                                }
+                            }
+                            if tx.send(Ok(batch_data)).await.is_err() {
+                                return;
+                            }
                         }
-                        yield batch_data.into();
-                    }
+                        Err(status) => {
+                            let _ = tx.send(Err(status)).await;
+                            return;
+                        }
+                    },
                     Err(e) => {
                         let e = find_datafusion_root(e);
-                        Err(handle_datafusion_error(e))?;
+                        let _ = tx.send(Err(handle_datafusion_error(e))).await;
+                        return;
                     }
                 }
             }
         };
 
-        (flights_stream.boxed(), cache_status)
+        let encode_handle = cpu_handle.spawn(request_context.scope(encode_task).instrument(span));
+
+        let stream = FlightEncodeStream {
+            receiver: ReceiverStream::new(rx),
+            encode_handle: Some(encode_handle),
+            encode_error: None,
+        };
+
+        (stream.boxed(), cache_status)
     }
 
     async fn wrap_response_stream_with_scope<S>(
@@ -402,6 +480,110 @@ impl Service {
         let (metadata, stream, extensions) = response.into_parts();
         let scoped_stream = request_context.scope_stream(stream);
         Response::from_parts(metadata, scoped_stream.boxed(), extensions)
+    }
+}
+
+/// Number of already-encoded `FlightData` messages buffered between the
+/// off-IO-runtime encode task and the tonic response writer. Kept small so
+/// per-stream egress memory stays bounded, while still letting the encode of
+/// batch N overlap the socket write of batch N-1.
+const FLIGHT_ENCODE_CHANNEL_CAPACITY: usize = 2;
+
+/// Encode one [`RecordBatch`] into its Flight dictionary + record-batch
+/// messages, applying the `Utf8View`/`BinaryView` → `Large*` cast when the
+/// advertised schema was expanded. Shared by the inline and off-runtime encode
+/// paths so both stay byte-for-byte identical on the wire.
+fn encode_flight_batch(
+    batch: RecordBatch,
+    needs_view_cast: bool,
+    schema: &Arc<Schema>,
+    encoder: &IpcDataGenerator,
+    dict_tracker: &mut DictionaryTracker,
+    options: &IpcWriteOptions,
+    compression_context: &mut CompressionContext,
+) -> Result<(Vec<FlightData>, FlightData), Status> {
+    // Cast view columns to match the expanded schema we advertised.
+    let batch = if needs_view_cast {
+        arrow_tools::schema::cast_view_columns(batch, schema)
+            .map_err(|e| Status::internal(e.to_string()))?
+    } else {
+        batch
+    };
+
+    let (dicts, batch_data) = encoder
+        .encode(&batch, dict_tracker, options, compression_context)
+        .map_err(|e| Status::internal(e.to_string()))?;
+
+    Ok((
+        dicts.into_iter().map(Into::into).collect(),
+        batch_data.into(),
+    ))
+}
+
+/// Response stream for the off-runtime Flight encode pipeline. Wraps the
+/// receiver of already-encoded [`FlightData`] and owns the encode task's
+/// [`JoinHandle`] so that:
+///   1. a panic in the encode task surfaces as a stream error instead of a
+///      silent truncation (which would look like a successful short result), and
+///   2. dropping the response stream (client disconnect) aborts the encode task,
+///      which in turn drops the upstream execution stream.
+///
+/// Mirrors the `RuntimeDriverStream` pattern used for execution offload.
+struct FlightEncodeStream {
+    receiver: ReceiverStream<Result<FlightData, Status>>,
+    encode_handle: Option<JoinHandle<()>>,
+    encode_error: Option<Status>,
+}
+
+impl Stream for FlightEncodeStream {
+    type Item = Result<FlightData, Status>;
+
+    fn poll_next(
+        self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> Poll<Option<Self::Item>> {
+        let this = self.get_mut();
+
+        // Observe the encode task's terminal state so a panic becomes a stream
+        // error rather than a silent end-of-stream. Buffered messages already in
+        // the channel are still drained below.
+        if let Some(handle) = this.encode_handle.as_mut() {
+            match Future::poll(Pin::new(handle), cx) {
+                Poll::Ready(Ok(())) => {
+                    this.encode_handle = None;
+                }
+                Poll::Ready(Err(err)) => {
+                    this.encode_handle = None;
+                    if err.is_panic() {
+                        this.encode_error = Some(Status::internal(format!(
+                            "Flight encode task panicked: {err}"
+                        )));
+                    }
+                    // A cancelled task means we aborted it on drop; nothing to surface.
+                }
+                Poll::Pending => {}
+            }
+        }
+
+        if let Some(err) = this.encode_error.take() {
+            return Poll::Ready(Some(Err(err)));
+        }
+
+        Pin::new(&mut this.receiver).poll_next(cx)
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.receiver.size_hint()
+    }
+}
+
+impl Drop for FlightEncodeStream {
+    fn drop(&mut self) {
+        if let Some(handle) = self.encode_handle.take()
+            && !handle.is_finished()
+        {
+            handle.abort();
+        }
     }
 }
 
