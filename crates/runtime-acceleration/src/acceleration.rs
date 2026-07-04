@@ -14,24 +14,24 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-#[cfg(feature = "duckdb")]
-use spicepod::param::Params as SpicepodParams;
+use crate::Engine;
+use crate::snapshot::SnapshotBehavior;
+use arrow::datatypes::SchemaRef;
+use datafusion::common::{Constraint, Constraints};
 use datafusion_table_providers::util::{
     column_reference::ColumnReference, constraints::UpsertOptions, on_conflict::OnConflict,
 };
-use crate::snapshot::SnapshotBehavior;
 use serde::{Deserialize, Serialize};
+use snafu::Snafu;
 use spicepod::acceleration::{SnapshotsCompaction, SnapshotsCreationPolicy, SnapshotsTrigger};
+#[cfg(feature = "duckdb")]
+use spicepod::param::Params as SpicepodParams;
 use spicepod::{
     acceleration::{self as spicepod_acceleration},
     param::Params,
     partitioning::PartitionedBy,
 };
 use std::{collections::HashMap, fmt::Display, sync::Arc, time::Duration};
-use crate::Engine;
-use arrow::datatypes::SchemaRef;
-use datafusion::common::{Constraint, Constraints};
-use snafu::Snafu;
 
 /// Errors that can occur when parsing acceleration configuration.
 #[derive(Debug, Snafu)]
@@ -60,7 +60,10 @@ pub enum ParseError {
     #[snafu(display(
         "Column for index '{index}' was not found in the schema. Valid columns: {valid_columns}"
     ))]
-    IndexColumnNotFound { index: String, valid_columns: String },
+    IndexColumnNotFound {
+        index: String,
+        valid_columns: String,
+    },
 
     #[snafu(display(
         "Primary key column '{invalid_column}' was not found in the schema. Valid columns: {valid_columns}"
@@ -75,9 +78,7 @@ pub enum ParseError {
         source: datafusion::error::DataFusionError,
     },
 
-    #[snafu(display(
-        "Only one on_conflict target can be specified: {extra_detail}"
-    ))]
+    #[snafu(display("Only one on_conflict target can be specified: {extra_detail}"))]
     OnConflictTargetMismatch { extra_detail: String },
 }
 
@@ -679,12 +680,12 @@ impl TryFrom<spicepod_acceleration::Acceleration> for Acceleration {
             let Some(duration) = duration else {
                 return Ok(None);
             };
-            fundu::parse_duration(&duration)
-                .map(Some)
-                .map_err(|e| ParseError::UnableToParseFieldAsDuration {
+            fundu::parse_duration(&duration).map(Some).map_err(|e| {
+                ParseError::UnableToParseFieldAsDuration {
                     source: e,
                     field: field.into(),
-                })
+                }
+            })
         };
 
         let primary_key = match acceleration.primary_key {
@@ -708,10 +709,11 @@ impl TryFrom<spicepod_acceleration::Acceleration> for Acceleration {
         let mut params = acceleration.params.clone();
 
         let engine_str = acceleration.engine.as_deref().unwrap_or("arrow");
-        let engine = match Engine::try_from(engine_str)
-            .map_err(|_| ParseError::AcceleratorEngineNotAvailable {
+        let engine = match Engine::try_from(engine_str).map_err(|_| {
+            ParseError::AcceleratorEngineNotAvailable {
                 name: engine_str.to_string(),
-            })? {
+            }
+        })? {
             Engine::Arrow if !acceleration.partition_by.is_empty() => Engine::PartitionedArrow,
             #[cfg(feature = "duckdb")]
             Engine::DuckDB if !acceleration.partition_by.is_empty() => {
@@ -944,12 +946,14 @@ fn parse_duration_param(
         return Ok(None);
     };
     match value {
-        spicepod::param::ParamValue::String(s) => fundu::parse_duration(&s)
-            .map(Some)
-            .map_err(|e| ParseError::UnableToParseFieldAsDuration {
-                source: e,
-                field: param_name.into(),
-            }),
+        spicepod::param::ParamValue::String(s) => {
+            fundu::parse_duration(&s).map(Some).map_err(|e| {
+                ParseError::UnableToParseFieldAsDuration {
+                    source: e,
+                    field: param_name.into(),
+                }
+            })
+        }
         _ => Err(ParseError::InvalidAccelerationConfiguration {
             detail: format!(
                 "Invalid '{param_name}' param value: {value:?}. Expected a duration string."
