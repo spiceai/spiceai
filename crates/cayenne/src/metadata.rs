@@ -37,7 +37,7 @@ pub const DEFAULT_INLINE_FLUSH_MAX_BYTES: i64 = 8 * 1_048_576;
 /// Default maximum age of buffered streaming-append data before the sink cuts
 /// the segment and publishes it (bounds ingest-to-queryable latency for
 /// long-lived insert streams).
-pub const DEFAULT_STREAM_PUBLISH_INTERVAL_MS: u64 = 2_000;
+pub const DEFAULT_STREAM_PUBLISH_INTERVAL_MS: u64 = 10_000;
 
 /// Metadata about a table in the catalog.
 #[derive(Debug, Clone)]
