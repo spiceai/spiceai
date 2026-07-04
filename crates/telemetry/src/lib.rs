@@ -561,6 +561,52 @@ pub fn track_cayenne_mem_tier_epoch(apply_epoch: u64, durable_epoch: u64, dimens
         .record(durable_epoch, dimensions);
 }
 
+static CAYENNE_MEM_TIER_RESERVE_REFUSED: OnceLock<Counter<u64>> = OnceLock::new();
+
+/// Counts in-memory CDC tier reservation refusals (`cdc_durability: memory`): a
+/// `try_reserve_bytes` that could not fit an append into the process-global
+/// mem-tier byte budget, forcing the writer to wait for another table's
+/// checkpoint, spill its own tier, or fall back to the durable path. A non-zero,
+/// growing count is direct memory-mode ingest backpressure — the mem-tier budget
+/// is the bottleneck (pair with `cayenne_mem_tier_budget_used/total_bytes`
+/// occupancy). No labels: the budget is process-global.
+pub fn track_cayenne_mem_tier_reserve_refused() {
+    CAYENNE_MEM_TIER_RESERVE_REFUSED
+        .get_or_init(|| {
+            cayenne_operational_meter()
+                .u64_counter("cayenne_mem_tier_reserve_refused_total")
+                .with_description(
+                    "In-memory CDC tier reservation refusals (budget full → wait / spill / durable fallback).",
+                )
+                .build()
+        })
+        .add(1, &[]);
+}
+
+static CAYENNE_MEM_TIER_ACQUIRE_WAIT_MS: OnceLock<Histogram<f64>> = OnceLock::new();
+
+/// Records how long a write blocked waiting for in-memory CDC tier budget
+/// (`cdc_durability: memory`) before another table's checkpoint released bytes —
+/// i.e. `reserve_bytes_or_wait` on the process-global `MemTierBudget`. This makes
+/// the mem-tier budget observable as a *valve* (like the encode budget's
+/// `cayenne_encode_acquire_wait_ms`): a high wait means the global tier budget,
+/// not the encode path, is gating ingest. Uses the fine contention buckets (the
+/// wait is bounded by `BUDGET_WAIT`). `dimensions` should carry `table`.
+pub fn track_cayenne_mem_tier_acquire_wait(duration: Duration, dimensions: &[KeyValue]) {
+    CAYENNE_MEM_TIER_ACQUIRE_WAIT_MS
+        .get_or_init(|| {
+            cayenne_operational_meter()
+                .f64_histogram("cayenne_mem_tier_acquire_wait_ms")
+                .with_description(
+                    "Time a write blocked waiting for in-memory CDC tier budget to free (reserve_bytes_or_wait), labeled by table.",
+                )
+                .with_unit("ms")
+                .with_boundaries(CONTENTION_MS_HISTOGRAM_BUCKETS.to_vec())
+                .build()
+        })
+        .record(duration.as_secs_f64() * 1000.0, dimensions);
+}
+
 static CAYENNE_COMPACTION_DURATION_MS: OnceLock<Histogram<f64>> = OnceLock::new();
 
 /// Build-once accessor for the compaction-duration histogram. The first call
@@ -647,6 +693,53 @@ pub fn register_cayenne_compaction_metrics(compaction_pool_bytes: u64) {
     let _ = cayenne_compaction_memory_exhausted();
     // Publish the carved pool size against the real meter.
     cayenne_compaction_memory_pool_bytes().record(compaction_pool_bytes, &[]);
+}
+
+static CAYENNE_ENCODE_ACQUIRE_WAIT_MS: OnceLock<Histogram<f64>> = OnceLock::new();
+
+/// Records how long a Cayenne write blocked acquiring encode-concurrency permits
+/// from the process-global budget (`cayenne::write_budget`). This is the direct
+/// CDC apply-path backpressure signal for the shared encode semaphore — the
+/// documented cause of the multi-second checkpoint stalls when a fleet of tables
+/// oversubscribes the encode budget: near-zero under headroom, seconds when
+/// saturated. `dimensions` should carry `class` (`delta` | `maintenance`). Uses
+/// the fine contention buckets — most acquisitions are sub-millisecond, but a
+/// starved one can stall into the multi-second tail.
+pub fn track_cayenne_encode_acquire_wait(duration: Duration, dimensions: &[KeyValue]) {
+    CAYENNE_ENCODE_ACQUIRE_WAIT_MS
+        .get_or_init(|| {
+            cayenne_operational_meter()
+                .f64_histogram("cayenne_encode_acquire_wait_ms")
+                .with_description(
+                    "Time a Cayenne write blocked acquiring encode-concurrency permits from the process-global budget (labeled by write class).",
+                )
+                .with_unit("ms")
+                .with_boundaries(CONTENTION_MS_HISTOGRAM_BUCKETS.to_vec())
+                .build()
+        })
+        .record(duration.as_secs_f64() * 1000.0, dimensions);
+}
+
+static CAYENNE_COMPACTION_ACQUIRE_WAIT_MS: OnceLock<Histogram<f64>> = OnceLock::new();
+
+/// Records how long a Cayenne background compaction pass blocked acquiring a
+/// permit from the fleet-wide compaction semaphore before it could run. A high
+/// wait means compaction is starved for its own concurrency slot (peer tables
+/// saturate the pool), letting the protected set and read-amp run away — which in
+/// turn slows the CDC write path. `dimensions` should carry `table`.
+pub fn track_cayenne_compaction_acquire_wait(duration: Duration, dimensions: &[KeyValue]) {
+    CAYENNE_COMPACTION_ACQUIRE_WAIT_MS
+        .get_or_init(|| {
+            cayenne_operational_meter()
+                .f64_histogram("cayenne_compaction_acquire_wait_ms")
+                .with_description(
+                    "Time a Cayenne background compaction pass blocked acquiring a permit from the fleet-wide compaction semaphore (labeled by table).",
+                )
+                .with_unit("ms")
+                .with_boundaries(CONTENTION_MS_HISTOGRAM_BUCKETS.to_vec())
+                .build()
+        })
+        .record(duration.as_secs_f64() * 1000.0, dimensions);
 }
 
 /// Registers per-tokio-runtime observable gauges so `/metrics` shows, per runtime,

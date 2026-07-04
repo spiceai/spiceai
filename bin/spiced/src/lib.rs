@@ -788,6 +788,14 @@ pub async fn run(args: Args) -> Result<()> {
         }
         tokio_handles.push(("main", Handle::current()));
         telemetry::register_tokio_runtime_metrics(tokio_handles);
+
+        // Cayenne write-path backpressure occupancy gauges (encode budget, in-memory
+        // CDC tier byte budget, compaction semaphore). Pull-based observable gauges on
+        // the global `cayenne` meter; registered here — after `init_metrics` — for the
+        // same reason as the compaction metrics above (bind to the real Prometheus
+        // meter, not the early noop one). Localizes *which* valve is stalling the CDC
+        // apply path when ingest falls behind.
+        runtime::dataaccelerator::cayenne::register_cayenne_backpressure_gauges();
     }
 
     let (tls_config, client_auth_mode) = tls::load_tls_config(

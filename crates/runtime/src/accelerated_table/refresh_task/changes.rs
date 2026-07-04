@@ -966,10 +966,18 @@ impl RefreshTask {
         let (tx, mut rx) = tokio::sync::mpsc::channel::<
             Result<cdc::ChangeEnvelope, cdc::StreamError>,
         >(cdc_cfg.prefetch_buffer);
+        // Weak handle so the apply loop can read the channel's live occupancy
+        // (`max_capacity - capacity`) for the backpressure gauge without keeping a
+        // strong `Sender` alive — an extra strong sender would stop `rx.recv()`
+        // ever returning `None`, hanging end-of-stream. `upgrade()` only succeeds
+        // while the reader's real sender lives, so it can never resurrect a closed
+        // channel.
+        let tx_probe = tx.downgrade();
 
         let reader_dataset = dataset_name.clone();
         let reader_handle = tokio::spawn(async move {
             let mut stream = changes_stream;
+            let send_labels = [KeyValue::new("dataset", reader_dataset.to_string())];
             // `select!` on `tx.closed()` lets the reader exit promptly even
             // when it is parked in `stream.next()`. This matters at shutdown:
             // when the parent task is aborted, its locals (including `rx`)
@@ -989,7 +997,12 @@ impl RefreshTask {
                     }
                     item = stream.next() => {
                         let Some(item) = item else { return; };
-                        if tx.send(item).await.is_err() {
+                        // Time blocked on send: non-zero => the prefetch channel is
+                        // full and the apply loop can't drain fast enough (apply-bound).
+                        let send_start = Instant::now();
+                        let send_res = tx.send(item).await;
+                        metrics::CDC_READER_SEND_WAIT_MS.record(elapsed_ms(send_start), &send_labels);
+                        if send_res.is_err() {
                             tracing::debug!(
                                 "CDC consumer for {reader_dataset} dropped; reader exiting"
                             );
@@ -1011,6 +1024,9 @@ impl RefreshTask {
         // silently stop advancing.
         let mut pending_commit: Option<tokio::task::JoinHandle<Result<(), String>>> = None;
         let mut pending_finalize: Option<PendingFinalizeCommit> = None;
+        // Previous iteration's recv-start, for the apply-cadence metric
+        // (`cdc_apply_cycle_ms`): the period between successive burst applies.
+        let mut prev_recv_start: Option<Instant> = None;
         let mut carried_item: Option<Result<cdc::ChangeEnvelope, cdc::StreamError>> = None;
         let mut last_cycle_start = Instant::now();
         let write_ctx = SessionContext::new();
@@ -1045,6 +1061,12 @@ impl RefreshTask {
             // record ~0, which is correct — no wait occurred. Pairs with
             // CDC_APPLY_BURST_DURATION_MS for full per-batch attribution.
             let recv_start = Instant::now();
+            // Apply cadence: period between successive burst recv-starts (ground-truths
+            // the per-stage attribution, which overstates the cycle where phases overlap).
+            if let Some(prev) = prev_recv_start {
+                metrics::CDC_APPLY_CYCLE_MS.record(elapsed_ms(prev), &recv_wait_labels);
+            }
+            prev_recv_start = Some(recv_start);
             let next_item = match carried_item.take() {
                 Some(item) => Some(item),
                 // While waiting for the next source item, also drive any deferred
@@ -1121,9 +1143,42 @@ impl RefreshTask {
                 },
             };
             metrics::CDC_SOURCE_RECV_WAIT_MS.record(elapsed_ms(recv_start), &recv_wait_labels);
+            // Sample prefetch-channel occupancy at the moment the apply loop wakes
+            // (the just-received `first` is out of the buffer; whatever remains is
+            // the backlog the reader has queued ahead). Near capacity => apply-bound.
+            if let Some(tx) = tx_probe.upgrade() {
+                let capacity = tx.max_capacity() as u64;
+                let occupancy = capacity.saturating_sub(tx.capacity() as u64);
+                metrics::CDC_PREFETCH_BUFFER_OCCUPANCY.record(occupancy, &recv_wait_labels);
+                metrics::CDC_PREFETCH_BUFFER_CAPACITY.record(capacity, &recv_wait_labels);
+            }
             let Some(first) = next_item else {
                 break;
             };
+            // Staleness of this envelope AT ARRIVAL (now − its source commit ts):
+            // lag already present before the accelerator acts, separating source-side
+            // lag from lag the apply path adds (`cdc_source_arrival_lag_ms`).
+            if let Ok(env) = &first {
+                if let Some(commit_ts_ms) = env.change_batch.source_commit_ts_ms() {
+                    // Ingress frontier: how far the source-time we've RECEIVED has
+                    // advanced (rate vs wall = received ×realtime). Compare to the
+                    // applied frontier (egress) to split delivery vs apply slowdown.
+                    metrics::CDC_RECEIVED_COMMIT_UNIX_TIME_MS.record(commit_ts_ms, &recv_wait_labels);
+                    if let Some(now_ms) = util::time::system_time_to_unix_ms(std::time::SystemTime::now()) {
+                        metrics::CDC_SOURCE_ARRIVAL_LAG_MS.record(
+                            now_ms.saturating_sub(commit_ts_ms).max(0) as f64,
+                            &recv_wait_labels,
+                        );
+                    }
+                }
+            }
+            // First envelope of this burst is now in hand; time from here until the
+            // apply below is the per-batch queued/coalescing latency
+            // (`cdc_coalesce_batch_age_ms`). `flush_reason` records what ended the
+            // coalesce (`cdc_coalesce_flush_total`).
+            let batch_first_received = Instant::now();
+            let mut linger_hit_deadline = false;
+            let mut shutdown_flush = false;
             // Coalesce a contiguous run of buffered envelopes into one
             // accelerator write, in two phases.
             //
@@ -1183,10 +1238,12 @@ impl RefreshTask {
                     // Flush immediately on shutdown rather than waiting out the
                     // window — teardown must not block on intentional linger.
                     if self.runtime_status.is_shutdown() {
+                        shutdown_flush = true;
                         break;
                     }
                     let remaining = deadline.saturating_duration_since(Instant::now());
                     if remaining.is_zero() {
+                        linger_hit_deadline = true;
                         break;
                     }
                     // `rx.recv()` is cancel-safe, so a timeout drops no envelope.
@@ -1207,11 +1264,45 @@ impl RefreshTask {
                             channel_closed = true;
                             break;
                         }
-                        Err(_elapsed) => break,
+                        // The linger window elapsed with no further envelope — this
+                        // is a deadline flush (the common low-volume case), the same
+                        // outcome as the `remaining.is_zero()` check above.
+                        Err(_elapsed) => {
+                            linger_hit_deadline = true;
+                            break;
+                        }
                     }
                 }
                 metrics::CDC_LINGER_WAIT_MS.record(elapsed_ms(linger_start), &recv_wait_labels);
             }
+
+            // Attribute what ended coalescing and how long the head-of-batch
+            // envelope was queued, before the write begins. Priority: a carried
+            // item means the next envelope overflowed the byte budget; else a full
+            // burst is the envelope cap; else channel-close / shutdown / the linger
+            // deadline; else Phase-1 drained the buffer (or linger was disabled).
+            let flush_reason = if carried_item.is_some() {
+                "byte_cap"
+            } else if burst.len() >= max_burst {
+                "envelope_cap"
+            } else if channel_closed {
+                "channel_closed"
+            } else if shutdown_flush {
+                "shutdown"
+            } else if linger_hit_deadline {
+                "deadline"
+            } else {
+                "buffer_drained"
+            };
+            metrics::CDC_COALESCE_BATCH_AGE_MS
+                .record(elapsed_ms(batch_first_received), &recv_wait_labels);
+            metrics::CDC_COALESCE_FLUSH_TOTAL.add(
+                1,
+                &[
+                    KeyValue::new("dataset", dataset_name.to_string()),
+                    KeyValue::new("reason", flush_reason),
+                ],
+            );
 
             // Mark the start of this burst's processing cycle: the next burst's
             // linger deadline is measured from here, so the apply below counts as

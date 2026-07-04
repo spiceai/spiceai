@@ -101,8 +101,11 @@ pub fn spawn_staleness_probe(
     driver: Arc<dyn ChBenchDriver>,
     spice_client: spiceai::Client,
     cancel: CancellationToken,
+    max_reasonable_gap: Duration,
 ) -> tokio::task::JoinHandle<anyhow::Result<StalenessReport>> {
-    tokio::spawn(async move { run_staleness_probe(driver, spice_client, cancel).await })
+    tokio::spawn(
+        async move { run_staleness_probe(driver, spice_client, cancel, max_reasonable_gap).await },
+    )
 }
 
 /// Core probe loop. Runs until cancelled, collecting gap samples for each table.
@@ -110,6 +113,7 @@ async fn run_staleness_probe(
     driver: Arc<dyn ChBenchDriver>,
     spice_client: spiceai::Client,
     cancel: CancellationToken,
+    max_reasonable_gap: Duration,
 ) -> anyhow::Result<StalenessReport> {
     let poll_interval = Duration::from_secs(5);
     let probe_tables = driver.probe_tables();
@@ -147,7 +151,16 @@ async fn run_staleness_probe(
             match (source_result, spice_result) {
                 (Ok(Some(source_ts)), Ok(Some(spice_ts))) => {
                     let gap_us = (source_ts - spice_ts).max(0);
-                    if let Some(table_samples) = samples.get_mut(*table) {
+                    // Discard absurd samples (e.g. a bootstrap-era catch-up reading)
+                    // so a single outlier can't dominate p99/max on a short window.
+                    if u128::try_from(gap_us).unwrap_or(0) > max_reasonable_gap.as_micros() {
+                        eprintln!(
+                            "Staleness probe: dropping absurd {table} freshness sample \
+                             {}ms (> {}ms cap; likely bootstrap/catch-up)",
+                            gap_us / 1_000,
+                            max_reasonable_gap.as_millis(),
+                        );
+                    } else if let Some(table_samples) = samples.get_mut(*table) {
                         table_samples.push(gap_us);
                     }
                 }

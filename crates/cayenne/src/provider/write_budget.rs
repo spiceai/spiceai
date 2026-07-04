@@ -40,6 +40,7 @@ limitations under the License.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock};
+use std::time::Instant;
 
 use parking_lot::RwLock;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
@@ -264,6 +265,39 @@ pub fn cap_global_encode_concurrency(max_permits: usize) {
     }
 }
 
+/// Point-in-time occupancy of the process-global encode budget, for operator
+/// metrics. `available`/`total` are the main-semaphore permits (aggregate encode
+/// concurrency headroom / ceiling); `maintenance_gate_available` is the headroom
+/// left in the reserved maintenance slice. `available == 0` under a growing WAL
+/// backlog is the direct signature of the encode-semaphore stall that this
+/// budget exists to bound.
+#[derive(Debug, Clone, Copy)]
+pub struct EncodeBudgetSnapshot {
+    /// Available (unheld) main-semaphore permits — aggregate encode-concurrency
+    /// headroom right now. `0` means every permit is held (writes queue).
+    pub available: u64,
+    /// The current budget ceiling (total main permits).
+    pub total: u64,
+    /// Available permits in the reserved maintenance slice (compaction/rewrite
+    /// outputs); `Delta` writes never consume these.
+    pub maintenance_gate_available: u64,
+}
+
+/// Snapshot the process-global encode budget's occupancy, or `None` when no
+/// budget is installed (unit tests / embedders that don't wire it up). Cheap and
+/// lock-light: a read-guard plus three atomic loads — safe to call from a metrics
+/// scrape callback.
+#[must_use]
+pub fn encode_budget_snapshot() -> Option<EncodeBudgetSnapshot> {
+    let guard = GLOBAL_ENCODE_BUDGET.read();
+    let budget = guard.as_ref()?;
+    Some(EncodeBudgetSnapshot {
+        available: budget.semaphore.available_permits() as u64,
+        total: budget.total.load(Ordering::Acquire) as u64,
+        maintenance_gate_available: budget.maintenance_gate.available_permits() as u64,
+    })
+}
+
 /// Acquire up to `shards` encode permits from the global budget, atomically.
 ///
 /// Returns the held permits (which release on drop, so callers scope them to
@@ -303,6 +337,11 @@ async fn acquire_from(
     // satisfiable under the current — possibly just-shrunk — budget and can
     // never block forever waiting for more permits than it can ever hold.
     let total = budget.total.load(Ordering::Acquire);
+    // Time the blocking acquire so the wait attributable to encode-budget
+    // contention is observable (`cayenne_encode_acquire_wait_ms{class}`). This is
+    // the CDC apply-path backpressure signal: near-zero under headroom, seconds
+    // when a fleet of tables saturates the shared budget.
+    let wait_start = Instant::now();
     let gate = match class {
         WriteClass::Delta => None,
         WriteClass::Maintenance => {
@@ -327,6 +366,14 @@ async fn acquire_from(
         .acquire_many_owned(main_count)
         .await
         .ok()?;
+    let class_label = match class {
+        WriteClass::Delta => "delta",
+        WriteClass::Maintenance => "maintenance",
+    };
+    telemetry::track_cayenne_encode_acquire_wait(
+        wait_start.elapsed(),
+        &[telemetry::KeyValue::new("class", class_label)],
+    );
     Some(EncodePermits {
         _main: main,
         _gate: gate,

@@ -14,6 +14,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use std::path::PathBuf;
+
 use clap::Parser;
 
 use super::DatasetTestArgs;
@@ -54,4 +56,18 @@ pub struct HtapArgs {
     /// repeated. Mutually exclusive with `--prepare-only`.
     #[arg(long, conflicts_with = "prepare_only")]
     pub(crate) skip_prepare: bool,
+
+    /// Write the full scraped metrics time-series plus run metadata (commit,
+    /// config) to this path as JSON when the run completes. This is the durable,
+    /// machine-readable artifact the `scripts/chbench-waterfall.py` backpressure
+    /// analysis consumes; CI uploads it as a workflow artifact.
+    #[arg(long)]
+    pub(crate) metrics_dump: Option<PathBuf>,
+
+    /// Fail the run if any changes-mode table's apply-phase coverage (instrumented
+    /// write-phase time ÷ apply-burst wall time) falls below this fraction (0.0–1.0).
+    /// A low ratio means a CDC apply bottleneck hides in un-instrumented code. Default
+    /// 0.0 = report only (no gate); set e.g. 0.85 on the HTAP smoke to catch regressions.
+    #[arg(long, default_value_t = 0.0)]
+    pub(crate) min_phase_coverage: f64,
 }

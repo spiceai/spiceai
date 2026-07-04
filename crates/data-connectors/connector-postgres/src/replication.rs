@@ -255,15 +255,41 @@ const METRICS: &[MetricSpec] = &[
     )
     .description(
         "Most recent LSN Spice has acknowledged to Postgres. Matches \
-             `pg_replication_slots.confirmed_flush_lsn`.",
-    ),
+             `pg_replication_slots.confirmed_flush_lsn`. Compare its advance rate \
+             against the applied watermark to spot slot-ack racing ahead of apply.",
+    )
+    .auto_register(),
     MetricSpec::new(
         "replication_server_wal_end_lsn",
         MetricType::ObservableGaugeU64,
     )
     .description(
         "Most recent WAL end LSN reported by the Postgres server (via keepalive or WAL data).",
-    ),
+    )
+    .auto_register(),
+    MetricSpec::new(
+        "replication_reader_input_wait_micros_total",
+        MetricType::ObservableCounterU64,
+    )
+    .description(
+        "Cumulative microseconds the replication reader spent BLOCKED awaiting the \
+         next event from the source socket. High relative to \
+         `reader_processing_micros_total` ⇒ source/network can't deliver fast \
+         enough (source-bound); low ⇒ our decode/build is the limiter.",
+    )
+    .unit("us")
+    .auto_register(),
+    MetricSpec::new(
+        "replication_reader_processing_micros_total",
+        MetricType::ObservableCounterU64,
+    )
+    .description(
+        "Cumulative microseconds the replication reader spent decoding + building \
+         change batches (and yielding downstream) after a socket event. The \
+         source-vs-our-decode discriminator, paired with reader_input_wait_micros_total.",
+    )
+    .unit("us")
+    .auto_register(),
     MetricSpec::new(
         "replication_transactions_total",
         MetricType::ObservableCounterU64,
@@ -351,6 +377,17 @@ const METRICS: &[MetricSpec] = &[
          error just means the connection wobbled and we recovered.",
     )
     .auto_register(),
+    MetricSpec::new(
+        "replication_disconnected_ms_total",
+        MetricType::ObservableCounterU64,
+    )
+    .description(
+        "Cumulative milliseconds the replication stream was disconnected across all \
+         reconnects (drop → successful resume, including backoff). Paired with \
+         replication_reconnects_total it quantifies the DURATION cost of a reconnect \
+         storm — no changes are delivered and lag grows while disconnected.",
+    )
+    .auto_register(),
 ];
 
 #[derive(Debug, Clone)]
@@ -403,6 +440,16 @@ impl MetricsProvider for PostgresMetricsProvider {
             "replication_server_wal_end_lsn" => {
                 Some(ObserveMetricCallback::U64(Box::new(move |instrument| {
                     instrument.observe(m.server_wal_end_lsn(), &attributes);
+                })))
+            }
+            "replication_reader_input_wait_micros_total" => {
+                Some(ObserveMetricCallback::U64(Box::new(move |instrument| {
+                    instrument.observe(m.reader_input_wait_micros_total(), &attributes);
+                })))
+            }
+            "replication_reader_processing_micros_total" => {
+                Some(ObserveMetricCallback::U64(Box::new(move |instrument| {
+                    instrument.observe(m.reader_processing_micros_total(), &attributes);
                 })))
             }
             "replication_transactions_total" => {
@@ -467,6 +514,11 @@ impl MetricsProvider for PostgresMetricsProvider {
             "replication_reconnects_total" => {
                 Some(ObserveMetricCallback::U64(Box::new(move |instrument| {
                     instrument.observe(m.replication_reconnects_total(), &attributes);
+                })))
+            }
+            "replication_disconnected_ms_total" => {
+                Some(ObserveMetricCallback::U64(Box::new(move |instrument| {
+                    instrument.observe(m.replication_disconnected_ms_total(), &attributes);
                 })))
             }
             _ => None,

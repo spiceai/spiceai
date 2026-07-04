@@ -4595,8 +4595,20 @@ impl CayenneTableProvider {
         // use the whole budget; `Maintenance` (compaction outputs, sorted
         // rewrites, overwrites) is capped below it so a latency-bound delta
         // encode never queues behind a whole multi-shard compaction pass.
+        // Attribute the time blocked on the shared encode budget to a dedicated
+        // write phase so `cayenne_write_phase_duration_ms{phase="encode_permit_wait"}`
+        // splits semaphore-wait out of the aggregate write cost (the outer
+        // `cdc_apply_fixed_cost_ms{phase="write"}` in the runtime apply loop). The
+        // `cayenne_encode_acquire_wait_ms{class}` histogram inside `acquire_from`
+        // carries the same signal without the table label; this one keys by table.
+        let encode_permit_wait_start = Instant::now();
         let _encode_permits =
             super::write_budget::acquire_encode_permits(encode_shards, write_class).await;
+        record_cayenne_write_phase(
+            self.table_name(),
+            "encode_permit_wait",
+            encode_permit_wait_start,
+        );
 
         // Construct snapshot directory URL
         let snapshot_dir_url = Self::snapshot_dir_url(
@@ -16411,12 +16423,18 @@ impl CayenneTableProvider {
     /// including this table's own background tick) can always make progress
     /// while we wait, and the wait is deadline-bounded regardless.
     pub(crate) async fn wait_for_budget_or_spill(&self, incoming_bytes: u64) -> Result<bool> {
-        if crate::provider::mem_tier_budget::reserve_bytes_or_wait(
+        let budget_wait_start = Instant::now();
+        let reserved = crate::provider::mem_tier_budget::reserve_bytes_or_wait(
             incoming_bytes,
             crate::provider::mem_tier_budget::BUDGET_WAIT,
         )
-        .await
-        {
+        .await;
+        // Attribute the mem-tier budget wait (the global MemTierBudget valve).
+        telemetry::track_cayenne_mem_tier_acquire_wait(
+            budget_wait_start.elapsed(),
+            &[telemetry::KeyValue::new("table", self.table_name().to_string())],
+        );
+        if reserved {
             // Another table's flush freed the bytes and the reservation is
             // already recorded — proceed WITHOUT spilling: the freeing table
             // paid the flush.

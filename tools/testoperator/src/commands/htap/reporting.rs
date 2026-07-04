@@ -20,6 +20,7 @@ limitations under the License.
 //! Cayenne sections are emitted only when the corresponding `cayenne_*` series
 //! are present, so a non-Cayenne accelerator (e.g. `DuckDB`) cleanly skips them.
 
+use test_framework::anyhow::{self, Context};
 use test_framework::opentelemetry::KeyValue;
 
 /// Emits replication metrics scraped from spiced's `/metrics` endpoint.
@@ -187,10 +188,13 @@ pub(super) fn emit_replication_metrics(
         );
 
         if record_telemetry {
-            let attributes = [KeyValue::new("dataset", (*dataset).clone())];
-            crate::metrics::REPLICATION_LAG_MS.record(l_ms, &attributes);
-            crate::metrics::REPLICATION_LAG_P99_MS.record(l_p99, &attributes);
-            crate::metrics::REPLICATION_LAG_MAX_MS.record(l_max, &attributes);
+            let dataset_attr = [KeyValue::new("dataset", (*dataset).clone())];
+            crate::metrics::REPLICATION_LAG_MS.record(l_ms, &dataset_attr);
+            crate::metrics::REPLICATION_LAG_P99_MS.record(l_p99, &dataset_attr);
+            crate::metrics::REPLICATION_LAG_MAX_MS.record(l_max, &dataset_attr);
+            // Persist the WAL backlog in bytes — the source-side backpressure
+            // signal (previously printed only).
+            crate::metrics::REPLICATION_LAG_BYTES.record(l_bytes, &dataset_attr);
         }
         if l_ms > worst_lag_ms {
             worst_lag_ms = l_ms;
@@ -201,6 +205,26 @@ pub(super) fn emit_replication_metrics(
         if l_max > worst_lag_max {
             worst_lag_max = l_max;
         }
+    }
+
+    // Caught-up interpretation: `lag_ms` is wall-clock now minus the last applied
+    // commit watermark, so on an idle/drained stream it grows unbounded even though
+    // no WAL is outstanding. `lag_bytes == 0` (server_wal_end == confirmed_flush)
+    // means we have consumed all WAL — i.e. caught up — so flag those datasets rather
+    // than letting a large post-drain `lag_ms` read as real staleness.
+    let caught_up: Vec<&String> = all_datasets
+        .iter()
+        .copied()
+        .filter(|d| lag_bytes.get(*d).copied().unwrap_or(0.0) == 0.0)
+        .filter(|d| lag_ms.get(*d).copied().unwrap_or(0.0) > 0.0)
+        .collect();
+    if !caught_up.is_empty() {
+        let names: Vec<&str> = caught_up.iter().map(|s| s.as_str()).collect();
+        println!(
+            "  caught-up (lag_bytes=0 ⇒ all WAL consumed; the nonzero lag_ms is an idle \
+             stale-watermark, not real staleness): {}",
+            names.join(", ")
+        );
     }
     println!();
 
@@ -434,6 +458,297 @@ fn percentile(sorted: &[f64], q: f64) -> f64 {
 #[expect(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 fn to_u64(value: f64) -> u64 {
     if value <= 0.0 { 0 } else { value as u64 }
+}
+
+/// Prints a compact CDC-backpressure summary localizing *where* the apply path
+/// stalls, from the series the scraper collected under load. Human-facing (the
+/// full time-series is persisted by [`write_metrics_dump`] for the waterfall
+/// analysis): per-dataset prefetch-channel occupancy, plus the process-global
+/// encode-budget headroom / acquire-wait and compaction acquire-wait, and the
+/// in-memory CDC tier occupancy.
+/// Per-table apply-phase coverage: `Σ(cayenne_write_phase _sum over phases) ÷
+/// cdc_apply_burst_duration _sum`, from the cumulative histogram sums. A LOW ratio
+/// means a CDC apply bottleneck sits in un-instrumented code (a blind spot — e.g. a
+/// prior run showed one table at 0.8% coverage hiding a real stall). A HIGH ratio
+/// (>100%) is normal and not a problem: write phases are non-additive (parallel
+/// shards, commit/finalize overlapping the next burst). Returns (table, coverage).
+pub(super) fn phase_coverage(
+    metrics: &crate::spiced_metrics::SpicedMetrics,
+) -> Vec<(String, f64)> {
+    use std::collections::BTreeMap;
+    // Sum the latest cumulative value of each distinct series into a `group`-label bucket.
+    let sum_latest_by = |name: &str, group: &str| -> BTreeMap<String, f64> {
+        let mut series_max: BTreeMap<String, (String, f64)> = BTreeMap::new();
+        if let Some(samples) = metrics.samples.get(name) {
+            for s in samples {
+                if s.value.is_nan() {
+                    continue;
+                }
+                let g = s.labels.get(group).cloned().unwrap_or_default();
+                let mut fp: Vec<String> =
+                    s.labels.iter().map(|(k, v)| format!("{k}={v}")).collect();
+                fp.sort();
+                let e = series_max.entry(fp.join(",")).or_insert((g, f64::MIN));
+                if s.value > e.1 {
+                    e.1 = s.value;
+                }
+            }
+        }
+        let mut out: BTreeMap<String, f64> = BTreeMap::new();
+        for (_, (g, v)) in series_max {
+            if v.is_finite() {
+                *out.entry(g).or_insert(0.0) += v;
+            }
+        }
+        out
+    };
+    let phase_sum = sum_latest_by("cayenne_write_phase_duration_ms_sum", "table");
+    let burst_sum = sum_latest_by("dataset_acceleration_cdc_apply_burst_duration_ms_sum", "dataset");
+    let mut out: Vec<(String, f64)> = burst_sum
+        .into_iter()
+        .filter(|(_, bsum)| *bsum > 0.0) // skip static/full-refresh tables (no CDC bursts)
+        .map(|(table, bsum)| {
+            let psum = phase_sum.get(&table).copied().unwrap_or(0.0);
+            (table, psum / bsum)
+        })
+        .collect();
+    out.sort_by(|a, b| a.0.cmp(&b.0));
+    out
+}
+
+/// Print per-table phase coverage and, when `min_coverage > 0`, return the tables
+/// under that threshold (the caller decides warn vs. fail). Prints nothing if there
+/// are no CDC apply bursts (non-Cayenne / non-changes run).
+pub(super) fn emit_phase_coverage(
+    metrics: &crate::spiced_metrics::SpicedMetrics,
+    min_coverage: f64,
+) -> Vec<(String, f64)> {
+    let coverage = phase_coverage(metrics);
+    if coverage.is_empty() {
+        return Vec::new();
+    }
+    println!("\nApply-phase coverage (Σ write-phase ÷ apply-burst; <85% ⇒ instrumentation blind spot)");
+    let mut violations = Vec::new();
+    for (table, cov) in &coverage {
+        let flag = if *cov < 0.85 { "  <<< BLIND SPOT" } else { "" };
+        println!("  {table:<20} {:>6.1}%{flag}", cov * 100.0);
+        if min_coverage > 0.0 && *cov < min_coverage {
+            violations.push((table.clone(), *cov));
+        }
+    }
+    violations
+}
+
+pub(super) fn emit_backpressure_summary(metrics: &crate::spiced_metrics::SpicedMetrics) {
+    use std::collections::BTreeMap;
+
+    // Gauge series -> sorted values per label value (keyed by `label`).
+    let gauge_series_by_label = |name: &str, label: &str| -> BTreeMap<String, Vec<f64>> {
+        let mut per: BTreeMap<String, Vec<f64>> = BTreeMap::new();
+        if let Some(samples) = metrics.samples.get(name) {
+            for sample in samples {
+                if sample.value.is_nan() {
+                    continue;
+                }
+                let key = sample
+                    .labels
+                    .get(label)
+                    .cloned()
+                    .unwrap_or_else(|| "-".to_string());
+                per.entry(key).or_default().push(sample.value);
+            }
+        }
+        for values in per.values_mut() {
+            values.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        }
+        per
+    };
+
+    // p90/p99 of a histogram whose `_bucket` series is summed across all label
+    // sets (process-global valves have low cardinality — class/table — and we
+    // want the aggregate stall distribution).
+    let hist_pcts = |name: &str| -> Option<(f64, f64)> {
+        let mut le_counts: BTreeMap<u64, f64> = BTreeMap::new();
+        let samples = metrics.samples.get(name)?;
+        for sample in samples {
+            let Some(le_raw) = sample.labels.get("le") else {
+                continue;
+            };
+            let le = if le_raw.eq_ignore_ascii_case("+inf") || le_raw.eq_ignore_ascii_case("inf") {
+                f64::INFINITY
+            } else {
+                match le_raw.parse::<f64>() {
+                    Ok(v) => v,
+                    Err(_) => continue,
+                }
+            };
+            *le_counts.entry(le.to_bits()).or_insert(0.0) += sample.value;
+        }
+        let mut bounds: Vec<(f64, f64)> = le_counts
+            .into_iter()
+            .map(|(bits, count)| (f64::from_bits(bits), count))
+            .collect();
+        bounds.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+        if bounds.last().is_none_or(|&(_, total)| total <= 0.0) {
+            return None;
+        }
+        Some((
+            histogram_quantile(&bounds, 0.90),
+            histogram_quantile(&bounds, 0.99),
+        ))
+    };
+
+    let prefetch =
+        gauge_series_by_label("dataset_acceleration_cdc_prefetch_buffer_occupancy", "dataset");
+    let recv_wait_present = metrics
+        .samples
+        .contains_key("dataset_acceleration_cdc_source_recv_wait_ms_bucket");
+    if prefetch.is_empty()
+        && !recv_wait_present
+        && !metrics.samples.contains_key("cayenne_encode_permits_available")
+    {
+        return; // No CDC/Cayenne backpressure series scraped (non-Cayenne / no CDC).
+    }
+
+    println!("\nCDC Backpressure Summary (under load)");
+
+    // Stage 2: prefetch channel occupancy per dataset (near capacity => apply-bound).
+    if !prefetch.is_empty() {
+        let capacity = gauge_series_by_label(
+            "dataset_acceleration_cdc_prefetch_buffer_capacity",
+            "dataset",
+        );
+        println!("  Prefetch channel (occupancy of capacity; high => apply-bound)");
+        println!("    {:<16} {:>8} {:>8} {:>8} {:>10}", "dataset", "p50", "p99", "max", "capacity");
+        for (dataset, values) in &prefetch {
+            let p50 = percentile(values, 0.50);
+            let p99 = percentile(values, 0.99);
+            let max = *values.last().unwrap_or(&0.0);
+            let cap = capacity
+                .get(dataset)
+                .and_then(|v| v.last().copied())
+                .unwrap_or(0.0);
+            println!("    {dataset:<16} {p50:>8.0} {p99:>8.0} {max:>8.0} {cap:>10.0}");
+        }
+    }
+
+    // Stage 4a: process-global encode budget headroom + acquire-wait.
+    let encode_avail = gauge_series_by_label("cayenne_encode_permits_available", "");
+    if let Some(values) = encode_avail.get("-") {
+        let min = values.first().copied().unwrap_or(0.0);
+        let p50 = percentile(values, 0.50);
+        let total = gauge_series_by_label("cayenne_encode_permits_total", "")
+            .get("-")
+            .and_then(|v| v.last().copied())
+            .unwrap_or(0.0);
+        println!(
+            "  Encode budget permits available: min={min:.0} p50={p50:.0} of total={total:.0} (0 => encode-semaphore stall)"
+        );
+    }
+    if let Some((p90, p99)) = hist_pcts("cayenne_encode_acquire_wait_ms_bucket") {
+        println!("  Encode acquire wait: p90={p90:.1}ms p99={p99:.1}ms");
+    }
+
+    // Stage 6: compaction semaphore acquire-wait + headroom.
+    if let Some((p90, p99)) = hist_pcts("cayenne_compaction_acquire_wait_ms_bucket") {
+        println!("  Compaction acquire wait: p90={p90:.1}ms p99={p99:.1}ms");
+    }
+    if let Some(values) = gauge_series_by_label("cayenne_compaction_permits_available", "").get("-")
+    {
+        let min = values.first().copied().unwrap_or(0.0);
+        let total = gauge_series_by_label("cayenne_compaction_permits_total", "")
+            .get("-")
+            .and_then(|v| v.last().copied())
+            .unwrap_or(0.0);
+        println!("  Compaction permits available: min={min:.0} of total={total:.0}");
+    }
+
+    // Stage 4c: in-memory CDC tier byte-budget occupancy (memory durability mode).
+    if let Some(values) = gauge_series_by_label("cayenne_mem_tier_budget_used_bytes", "").get("-") {
+        let max = values.last().copied().unwrap_or(0.0);
+        let total = gauge_series_by_label("cayenne_mem_tier_budget_total_bytes", "")
+            .get("-")
+            .and_then(|v| v.last().copied())
+            .unwrap_or(0.0);
+        println!("  Mem-tier bytes used: max={max:.0} of total={total:.0}");
+    }
+    println!();
+}
+
+/// Serializes the full scraped metrics time-series plus run metadata to `path` as
+/// JSON — the durable, machine-readable artifact `scripts/chbench-waterfall.py`
+/// consumes and CI uploads.
+pub(super) fn write_metrics_dump(
+    path: &std::path::Path,
+    run: &serde_json::Value,
+    metrics: Option<&crate::spiced_metrics::SpicedMetrics>,
+    pg_stats: &[crate::pg_stats::PgStatSample],
+) -> anyhow::Result<()> {
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating metrics-dump directory {}", parent.display()))?;
+    }
+    // Reduce the raw per-second series so the artifact stays small enough to
+    // upload + analyze at SF-1000 (the full dump is dominated by cumulative
+    // histogram `_bucket` series and reaches ~1 GB). Counters/histograms/summaries
+    // are cumulative, so only their FINAL sample per label-set is meaningful to the
+    // waterfall (it computes quantiles over the final buckets); GAUGES keep their
+    // full time series (occupancy/permits/lag percentiles need it).
+    let reduced = metrics.map(|m| reduce_samples_for_dump(&m.samples));
+    let dump = serde_json::json!({
+        "run": run,
+        "samples": reduced,
+        "pg_stats": pg_stats,
+    });
+    let bytes = serde_json::to_vec(&dump).context("serializing metrics dump")?;
+    std::fs::write(path, bytes)
+        .with_context(|| format!("writing metrics dump to {}", path.display()))?;
+    Ok(())
+}
+
+/// Reduce the raw per-second series for the dump — see [`write_metrics_dump`].
+/// Gauges keep their full time series (percentiles/min/max/windowing). Cumulative
+/// (counter/histogram/summary) series keep the FIRST and LAST sample per distinct
+/// label-set, so the analysis can compute *windowed* deltas (Δ_sum/Δ_count,
+/// Δ_bucket, Δ_count/Δt across `ts_ms`) rather than lifetime totals — a stall is
+/// diluted by lifetime aggregation, and the first snapshot lets the whole-run
+/// window exclude the bootstrap/initial-snapshot writes baked into it.
+fn reduce_samples_for_dump(
+    samples: &std::collections::HashMap<String, Vec<crate::spiced_metrics::MetricSample>>,
+) -> std::collections::BTreeMap<&str, Vec<&crate::spiced_metrics::MetricSample>> {
+    use crate::spiced_metrics::MetricType;
+    use std::collections::BTreeMap;
+
+    let mut out: BTreeMap<&str, Vec<&crate::spiced_metrics::MetricSample>> = BTreeMap::new();
+    for (name, series) in samples {
+        let is_gauge = series
+            .first()
+            .is_some_and(|s| s.metric_type == MetricType::Gauge);
+        if is_gauge {
+            out.insert(name.as_str(), series.iter().collect());
+        } else {
+            // First + last cumulative sample per label-set (preserving scrape order).
+            let mut first_idx: BTreeMap<Vec<(&str, &str)>, usize> = BTreeMap::new();
+            let mut last_idx: BTreeMap<Vec<(&str, &str)>, usize> = BTreeMap::new();
+            for (i, s) in series.iter().enumerate() {
+                let mut key: Vec<(&str, &str)> =
+                    s.labels.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+                key.sort_unstable();
+                first_idx.entry(key.clone()).or_insert(i);
+                last_idx.insert(key, i);
+            }
+            let mut idxs: Vec<usize> = first_idx
+                .into_values()
+                .chain(last_idx.into_values())
+                .collect();
+            idxs.sort_unstable();
+            idxs.dedup();
+            out.insert(name.as_str(), idxs.into_iter().map(|i| &series[i]).collect());
+        }
+    }
+    out
 }
 
 /// Standard Prometheus `histogram_quantile` over ascending `(le, cumulative)`
