@@ -488,6 +488,7 @@ mod tests {
             &schema(),
             &["_id".to_string()],
             &default_unnest_parameters(0),
+            None,
         )
         .expect("change batch should build");
 
