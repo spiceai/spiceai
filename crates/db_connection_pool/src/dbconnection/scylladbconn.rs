@@ -450,10 +450,20 @@ fn convert_cqlvalue_rows_to_record_batch(
                 for row in rows {
                     if let Some(Some(CqlValue::Decimal(decimal))) = row.get(col_idx) {
                         let (bytes, source_scale) = decimal.as_signed_be_bytes_slice_and_exponent();
-                        if let Some(mantissa) = cql_decimal_to_i128(bytes, source_scale, *scale) {
-                            builder.append_value(mantissa);
-                        } else {
-                            builder.append_null();
+                        match cql_decimal_to_i128(bytes, source_scale, *scale) {
+                            Ok(mantissa) => builder.append_value(mantissa),
+                            // Refuse to silently corrupt: a value that can't be rescaled to the
+                            // column's fixed scale without truncation/overflow surfaces as a clear
+                            // error rather than a wrong number (lossy down-scale) or a NULL (wide
+                            // mantissa) — see https://github.com/spiceai/spiceai/issues/11267.
+                            Err(reason) => {
+                                return Err(Error::ConversionError {
+                                    message: format!(
+                                        "column '{}': CQL decimal cannot be represented as Decimal128({precision}, {scale}): {reason}",
+                                        field.name()
+                                    ),
+                                });
+                            }
                         }
                     } else {
                         builder.append_null();
@@ -613,42 +623,74 @@ fn cql_decimal_to_f64(bytes: &[u8], scale: i32) -> f64 {
     }
 }
 
-/// Convert CQL decimal bytes to i128 for Arrow Decimal128 with target scale.
+/// Convert CQL decimal bytes to an `i128` mantissa for Arrow `Decimal128` at `target_scale`.
 ///
-/// `CqlDecimal` represents: `int_val` / `10^source_scale`
-/// Arrow Decimal128 stores: mantissa / `10^target_scale`
+/// `CqlDecimal` represents `int_val / 10^source_scale`, where `int_val` is stored as two's
+/// complement big-endian bytes; Arrow `Decimal128` stores `mantissa / 10^target_scale`. Rescaling
+/// is therefore `mantissa = int_val * 10^(target_scale - source_scale)`.
 ///
-/// We need to rescale: mantissa = `int_val` * `10^(target_scale - source_scale)`
-fn cql_decimal_to_i128(bytes: &[u8], source_scale: i32, target_scale: i8) -> Option<i128> {
+/// Returns `Err` — rather than silently corrupting data — whenever the value cannot be represented
+/// exactly at `target_scale`, so the caller can surface a clear error instead of writing wrong
+/// numbers:
+/// - a mantissa wider than 128 bits (`bytes.len() > 16`) does not fit an `i128`;
+/// - down-scaling that would drop non-zero fractional digits (e.g. `12.345` at `target_scale` 2)
+///   is a lossy truncation;
+/// - up-scaling whose rescaled result overflows `i128` (including a very negative `source_scale`
+///   that would otherwise panic in `10_i128.pow(..)`).
+///
+/// Losslessly-representable values (exact down-scale, in-range up-scale, equal scale) succeed.
+fn cql_decimal_to_i128(bytes: &[u8], source_scale: i32, target_scale: i8) -> Result<i128, String> {
     if bytes.is_empty() {
-        return Some(0);
+        return Ok(0);
     }
 
-    // Check if value fits in i128 (max 16 bytes for signed)
+    // A signed mantissa wider than 16 bytes cannot fit an i128 (Decimal128's storage).
     if bytes.len() > 16 {
-        return None;
+        return Err(format!(
+            "mantissa is {} bytes wide, which exceeds the 128-bit range of Decimal128",
+            bytes.len()
+        ));
     }
 
-    // Parse two's complement big-endian bytes to i128
+    // Parse two's complement big-endian bytes to i128 (sign-extended).
     let is_negative = (bytes[0] & 0x80) != 0;
     let mut value: i128 = if is_negative { -1 } else { 0 };
-
     for &byte in bytes {
         value = (value << 8) | i128::from(byte);
     }
 
-    // Rescale: multiply/divide to match target scale
+    // Rescale to target_scale, refusing any conversion that would lose precision or overflow.
     let scale_diff = i32::from(target_scale) - source_scale;
     match scale_diff.cmp(&0) {
-        std::cmp::Ordering::Greater => {
-            // Need more decimal places: multiply
-            value.checked_mul(10_i128.pow(scale_diff.unsigned_abs()))
-        }
+        // More fractional digits requested: multiply. checked_pow/checked_mul guard overflow — a
+        // very negative source_scale would otherwise panic in the unchecked `10_i128.pow(..)`.
+        std::cmp::Ordering::Greater => 10_i128
+            .checked_pow(scale_diff.unsigned_abs())
+            .and_then(|factor| value.checked_mul(factor))
+            .ok_or_else(|| {
+                format!(
+                    "value overflows Decimal128 when rescaled from scale {source_scale} to {target_scale}"
+                )
+            }),
+        // Fewer fractional digits requested: divide, but only when the division is exact. A
+        // non-zero remainder means significant digits would be dropped (the silent-truncation bug).
         std::cmp::Ordering::Less => {
-            // Need fewer decimal places: divide (rounds toward zero)
-            Some(value / 10_i128.pow((-scale_diff).unsigned_abs()))
+            let factor = 10_i128
+                .checked_pow((-scale_diff).unsigned_abs())
+                .ok_or_else(|| {
+                    format!(
+                        "value overflows Decimal128 when rescaled from scale {source_scale} to {target_scale}"
+                    )
+                })?;
+            if value % factor == 0 {
+                Ok(value / factor)
+            } else {
+                Err(format!(
+                    "value has more precision (scale {source_scale}) than the column's Decimal128 scale {target_scale}; rescaling would truncate significant digits"
+                ))
+            }
         }
-        std::cmp::Ordering::Equal => Some(value),
+        std::cmp::Ordering::Equal => Ok(value),
     }
 }
 
@@ -1863,5 +1905,58 @@ mod tests {
 
         let batch = result.expect("should create batch");
         assert_eq!(batch.schema().metadata(), &metadata);
+    }
+
+    /// Two's-complement big-endian bytes for an `i128` mantissa, matching the wire form that
+    /// `CqlDecimal::as_signed_be_bytes_slice_and_exponent` yields (sign-extension makes the full
+    /// 16-byte width equivalent to the minimal form the conversion sees in production).
+    fn decimal_mantissa_be(value: i128) -> [u8; 16] {
+        value.to_be_bytes()
+    }
+
+    #[test]
+    fn test_cql_decimal_to_i128_lossless_conversions() {
+        // Equal scale: mantissa passes through unchanged, both signs.
+        assert_eq!(cql_decimal_to_i128(&decimal_mantissa_be(1234), 2, 2), Ok(1234));
+        assert_eq!(cql_decimal_to_i128(&decimal_mantissa_be(-1234), 2, 2), Ok(-1234));
+
+        // Up-scaling always adds trailing zeros without loss: 12 (scale 0) -> scale 2 == 1200.
+        assert_eq!(cql_decimal_to_i128(&decimal_mantissa_be(12), 0, 2), Ok(1200));
+
+        // Exact down-scale: 12.3400 (mantissa 123400, scale 4) -> scale 2 == 1234, no digits lost.
+        assert_eq!(cql_decimal_to_i128(&decimal_mantissa_be(123_400), 4, 2), Ok(1234));
+
+        // An empty mantissa is zero.
+        assert_eq!(cql_decimal_to_i128(&[], 0, 2), Ok(0));
+    }
+
+    #[test]
+    fn test_cql_decimal_to_i128_lossy_downscale_errors() {
+        // Regression for #11267: 12.345 (mantissa 12345, scale 3) cannot fit Decimal128 scale 2
+        // without dropping the trailing 5. Previously this silently truncated to 12.34.
+        let err = cql_decimal_to_i128(&decimal_mantissa_be(12_345), 3, 2)
+            .expect_err("scale-3 value must not silently truncate to scale 2");
+        assert!(err.contains("truncate significant digits"), "unexpected error: {err}");
+
+        // The same holds for negative values (-12345 -> -12.345).
+        let err = cql_decimal_to_i128(&decimal_mantissa_be(-12_345), 3, 2)
+            .expect_err("negative scale-3 value must not silently truncate");
+        assert!(err.contains("truncate significant digits"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn test_cql_decimal_to_i128_overflow_errors_without_panicking() {
+        // Regression for #11267: a mantissa wider than 16 bytes cannot fit an i128. Previously
+        // this became a silent NULL; it must now report the reason.
+        let wide = [0x7F_u8; 17];
+        let err =
+            cql_decimal_to_i128(&wide, 0, 2).expect_err("17-byte mantissa exceeds Decimal128 range");
+        assert!(err.contains("128-bit range"), "unexpected error: {err}");
+
+        // A very negative source scale forces a large power-of-ten multiply. Before the fix the
+        // unchecked `10_i128.pow(..)` panicked; it must now report overflow instead of aborting.
+        let err = cql_decimal_to_i128(&decimal_mantissa_be(1), -100, 2)
+            .expect_err("extreme up-scale overflows Decimal128");
+        assert!(err.contains("overflows"), "unexpected error: {err}");
     }
 }
