@@ -43,8 +43,8 @@ datasets:
 
   # GROUPED SHARED REPLICATION SLOTS (4 groups) for the changes-mode tables.
   #
-  # Chosen from three SF-1000 diagnostic runs (see the CDC back-pressure waterfall
-  # tooling + docs/cdc-backpressure-waterfall.md). Each Postgres logical slot spawns
+  # Chosen from three SF-1000 diagnostic runs (see the CDC back-pressure waterfall tooling).
+  # Each Postgres logical slot spawns
   # ONE walsender that decodes the FULL WAL stream and filters to its tables, so
   # server decode cost scales with the slot COUNT — while a single slot funnels the
   # whole change stream through ONE client pump. The runs bracket that trade-off:
