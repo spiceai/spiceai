@@ -2038,7 +2038,13 @@ fn convert_timestamp_to_turso(
             }
 
             match unit {
-                TimeUnit::Second => Ok(TursoValue::Integer(value * timestamp_conversion::MILLIS_PER_SECOND)),
+                TimeUnit::Second => value
+                    .checked_mul(timestamp_conversion::MILLIS_PER_SECOND)
+                    .map(TursoValue::Integer)
+                    .ok_or_else(|| {
+                        format!("Timestamp value {value}s overflows millisecond conversion")
+                    })
+                    .map_err(Into::into),
                 TimeUnit::Millisecond => Ok(TursoValue::Integer(value)),
                 TimeUnit::Microsecond => Err(
                     "TimestampMicrosecond not supported with integer_millis format - use rfc3339 format to preserve sub-millisecond precision"
