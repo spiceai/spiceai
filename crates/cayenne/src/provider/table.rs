@@ -10541,12 +10541,9 @@ impl CayenneTableProvider {
             }
         }
 
-        // Evaluate compaction after every write, including pure appends: the
-        // scheduler self-gates on the small-file and protected-snapshot
-        // triggers, and append-only ingest is exactly the path that
-        // accumulates protected snapshots (one per published segment) with no
-        // other maintenance edge to reclaim them.
-        self.schedule_post_write_compaction();
+        if state.refresh_listing || had_stats || retention_deleted > 0 {
+            self.schedule_post_write_compaction();
+        }
 
         // b1★ (cycle-4): persist any durable tombstone flips that the staged-batch
         // fold left owed. On a busy table the next batch's Stage-A drains these,
