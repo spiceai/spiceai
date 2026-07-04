@@ -2082,7 +2082,7 @@ datasets:
         let duration = config_minutes
             .push_interval_duration()
             .expect("should parse duration");
-        assert_eq!(duration, std::time::Duration::from_mins(5));
+        assert_eq!(duration, std::time::Duration::from_secs(5 * 60));
 
         let config_hours = OtelExporterConfig {
             enabled: true,
