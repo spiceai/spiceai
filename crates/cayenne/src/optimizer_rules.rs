@@ -1603,7 +1603,7 @@ mod tests {
     };
     use crate::provider::CayenneAccelerationExec;
     use crate::provider::scan::ScanDynamicFilter;
-    use arrow::array::{Int64Array, StringArray};
+    use arrow::array::{Int32Array, Int64Array, StringArray};
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow::record_batch::RecordBatch;
     use datafusion::common::{JoinType, NullEquality};
@@ -1628,9 +1628,10 @@ mod tests {
     use datafusion_datasource::file_stream::FileOpener;
     use datafusion_datasource::source::DataSourceExec;
     use datafusion_datasource::{PartitionedFile, TableSchema};
+    use datafusion_functions_aggregate::average::avg_udaf;
     use datafusion_functions_aggregate::count::count_udaf;
     use datafusion_functions_aggregate::sum::sum_udaf;
-    use datafusion_physical_expr::expressions::{DynamicFilterPhysicalExpr, col, lit};
+    use datafusion_physical_expr::expressions::{DynamicFilterPhysicalExpr, cast, col, lit};
     use datafusion_physical_expr::projection::ProjectionExprs;
     use datafusion_physical_expr::{PhysicalExpr, conjunction};
     use datafusion_physical_plan::DisplayFormatType;
@@ -1708,6 +1709,75 @@ mod tests {
             optimized
                 .downcast_ref::<MaintainedAggregateExec>()
                 .is_some()
+        );
+        Ok(())
+    }
+
+    /// End-to-end rewrite for `AVG` over a narrow signed-integer column (Postgres
+    /// `INTEGER` → arrow `Int32`, the common CDC case). `DataFusion` plans
+    /// `AVG(Int32)` as `avg(CAST(v AS Float64))`, so this also guards the
+    /// matcher's cast-see-through: the rewriter must resolve the underlying
+    /// `Int32` column against the table schema, match the maintained `AVG` spec,
+    /// and replace the `AggregateExec` with a `MaintainedAggregateExec`.
+    #[test]
+    fn maintained_aggregate_rewriter_replaces_avg_over_int32() -> DFResult<()> {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("name", DataType::Utf8, true),
+            Field::new("v", DataType::Int32, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(StringArray::from(vec![Some("a"), Some("a"), Some("b")])),
+                Arc::new(Int32Array::from(vec![Some(10), Some(20), Some(5)])),
+            ],
+        )
+        .expect("int32 test batch should be valid");
+
+        let registry = Arc::new(MaintainedAggregateRegistry::try_new(
+            &[MaintainedAggregateSpec {
+                filter: None,
+                group_by: vec!["name".to_string()],
+                aggregates: vec![MaintainedAggregateExpr {
+                    function: MaintainedAggregateFunction::Avg,
+                    column: Some("v".to_string()),
+                }],
+            }],
+            &schema,
+        )?);
+        registry.apply_insert_batches(1, std::slice::from_ref(&batch))?;
+        let memory = MemorySourceConfig::try_new_exec(&[vec![batch]], Arc::clone(&schema), None)?;
+        let cayenne_scan = Arc::new(CayenneAccelerationExec::new_with_maintained_aggregates(
+            memory, registry, 1,
+        )) as Arc<dyn ExecutionPlan>;
+
+        // Mirror DataFusion's coercion of `AVG(Int32)` -> `avg(CAST(v AS Float64))`.
+        let avg_arg = cast(
+            col("v", schema.as_ref())?,
+            schema.as_ref(),
+            DataType::Float64,
+        )?;
+        let avg_expr = AggregateExprBuilder::new(avg_udaf(), vec![avg_arg])
+            .schema(Arc::clone(&schema))
+            .alias("avg(v)".to_string())
+            .build()?;
+        let aggregate = Arc::new(AggregateExec::try_new(
+            AggregateMode::Single,
+            PhysicalGroupBy::new_single(vec![(col("name", schema.as_ref())?, "name".to_string())]),
+            vec![Arc::new(avg_expr)],
+            vec![None],
+            cayenne_scan,
+            Arc::clone(&schema),
+        )?) as Arc<dyn ExecutionPlan>;
+
+        let optimized = CayenneMaintainedAggregateRewriter::new()
+            .optimize(aggregate, &ConfigOptions::default())?;
+
+        assert!(
+            optimized
+                .downcast_ref::<MaintainedAggregateExec>()
+                .is_some(),
+            "AVG over an Int32 column must rewrite to the maintained aggregate"
         );
         Ok(())
     }
