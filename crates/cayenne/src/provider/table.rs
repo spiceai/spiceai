@@ -1718,6 +1718,28 @@ const BAKE_KEEP_RECENT_SNAPSHOTS: usize = 3;
 /// value is read per-trigger via `self.context.bake_deletion_index_trigger()`.
 pub(crate) const BAKE_DELETION_INDEX_TRIGGER: usize = 50_000;
 
+/// Per-table threshold: number of orphan-eligible key-based deletion vectors
+/// (count of `cayenne_delete_file` rows, NOT masked rows) that must accumulate on
+/// a single table before its cleanup sweep runs. A key DV becomes orphan-eligible
+/// only once **time-based retention** empties the protected snapshot(s) it
+/// shadowed, raising the surviving-sequence floor above its delete sequence so it
+/// shadows nothing (issue #9388). Without a retention policy no DVs are ever
+/// orphaned and the sweep is a no-op.
+///
+/// This governs ONLY the orphaned tail. The live (not-yet-orphaned) DV set — DVs
+/// still shadowing rows in un-emptied snapshots — is bounded separately by
+/// compaction's seq-prefix bake (see [`crate::provider::memory_account`]: "the
+/// real bound on deletions is compaction"), not by this threshold. A larger value
+/// would sweep less often (cheaper, but orphaned `.arrow` files linger on disk
+/// longer); a smaller value reclaims disk sooner. Each orphaned `.arrow` file's
+/// size scales with the number of deletions it records, so lingering disk ≈
+/// `n_tables × threshold × avg_dv_size` (`avg_dv_size` was ~63 KiB, up to ~870 KiB
+/// in an SF-100 CH-benCHmark sample). The sweep is lock-free and runs off the
+/// write path on the dedicated compaction runtime, so the threshold only trades
+/// sweep frequency against lingering disk — never ingest latency, which is why it
+/// is a fixed constant rather than a tunable knob.
+pub(crate) const ORPHANED_DV_CLEANUP_MIN_FILES: usize = 20;
+
 /// Fraction of the (process-wide) query memory pool a single table's key-deletion
 /// index may occupy before the seq-prefix bake becomes a MANDATORY OOM backstop —
 /// overriding BOTH the count trigger ([`BAKE_DELETION_INDEX_TRIGGER`]) and the
@@ -10130,19 +10152,7 @@ impl CayenneTableProvider {
     /// pass on the dedicated compaction runtime, coalescing a burst of retention
     /// passes into a single in-flight sweep — mirroring
     /// [`Self::schedule_post_write_compaction`].
-    ///
-    /// No-op when the `orphaned_dv_cleanup_min_files` knob is disabled (`None`,
-    /// i.e. the spicepod param set to `0`): nothing is spawned, no lock is taken,
-    /// and no catalog query runs (the pre-feature behavior).
     pub(crate) fn schedule_orphan_dv_sweep(&self) {
-        if self
-            .table_metadata
-            .vortex_config
-            .orphaned_dv_cleanup_min_files
-            .is_none()
-        {
-            return;
-        }
         // Coalesce: at most one in-flight sweep per table.
         if self.orphan_dv_sweep_scheduled.swap(true, Ordering::AcqRel) {
             return;
@@ -10163,15 +10173,20 @@ impl CayenneTableProvider {
             let _clear = ClearOnDrop(Arc::clone(&table.orphan_dv_sweep_scheduled));
 
             tokio::task::yield_now().await;
-            table.sweep_orphaned_deletion_vectors().await;
+            table
+                .sweep_orphaned_deletion_vectors(ORPHANED_DV_CLEANUP_MIN_FILES)
+                .await;
         });
     }
 
-    /// Synchronously run one orphaned-DV sweep. Test-only deterministic drain for
-    /// the otherwise background [`Self::schedule_orphan_dv_sweep`] path.
+    /// Synchronously run one orphaned-DV sweep at the given threshold. Test-only
+    /// deterministic drain for the otherwise background
+    /// [`Self::schedule_orphan_dv_sweep`] path (which always uses the production
+    /// constant [`ORPHANED_DV_CLEANUP_MIN_FILES`]); the explicit `min_files` lets
+    /// tests drive the sweep with a small, deterministic orphan count.
     #[doc(hidden)]
-    pub async fn drain_orphan_dv_sweep(&self) {
-        self.sweep_orphaned_deletion_vectors().await;
+    pub async fn drain_orphan_dv_sweep(&self, min_files: usize) {
+        self.sweep_orphaned_deletion_vectors(min_files).await;
     }
 
     /// Quiesce this provider instance before it is dropped or replaced in-process
@@ -10323,25 +10338,16 @@ impl CayenneTableProvider {
     /// `current_snapshot_id` on a LIVE table reusing live files, it must account for
     /// orphaned-DV deletion (keep DVs alive longer or reject restoring below the GC
     /// point) — see the matching note on the snapshot set/restore code.
-    async fn sweep_orphaned_deletion_vectors(&self) {
+    async fn sweep_orphaned_deletion_vectors(&self, min_files: usize) {
         // Hard per-sweep cap on the orphan working set. This is a fixed upper bound
-        // (NOT `max(min_files)`, which would let a large knob defeat the cap): it
-        // bounds the fetch allocation, the unlink loop, AND — critically — the
+        // (NOT `max(min_files)`, which would let a large threshold defeat the cap):
+        // it bounds the fetch allocation, the unlink loop, AND — critically — the
         // single `remove_delete_files` DELETE, which binds one parameter per id and
         // would exceed the metastore's bound-parameter limit (e.g. SQLite's
         // ~32766) on a huge batch. The effective threshold is clamped to the cap so
         // the gate below can still fire; a backlog beyond the cap drains on later
         // retention passes.
         const ORPHAN_DV_SWEEP_MAX_BATCH: usize = 4096;
-
-        let Some(min_files) = self
-            .table_metadata
-            .vortex_config
-            .orphaned_dv_cleanup_min_files
-        else {
-            return;
-        };
-        let min_files = min_files.get();
 
         let table_id = &self.table_metadata.table_id;
         let current_snapshot_id = self.get_current_snapshot_id();
