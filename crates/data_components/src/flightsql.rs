@@ -485,8 +485,28 @@ impl FlightSQLTable {
         let exec = exec.with_token(self.token.clone());
         // Project the table-level statistics onto the scan's (projected) output
         // schema so the column-statistics list lines up with the output columns.
+        //
+        // When filters are pushed down to the remote scan, the stamped statistics
+        // still describe the *unfiltered* slice the executor reported (they are the
+        // whole-table row count / column bounds, not the filtered subset). Every
+        // pushdown-eligible filter is reported `Exact` (see
+        // `supports_filters_pushdown`), so DataFusion drops the coordinator-side
+        // `FilterExec` — and if the stamped `num_rows`/bounds stay `Exact`, the
+        // `aggregate_statistics` optimizer rule folds `COUNT(*)`/`MIN`/`MAX` to
+        // those unfiltered values, silently ignoring the predicate (e.g. a filtered
+        // `COUNT(*)` returns the full table count — issue #11599). Marking the
+        // statistics inexact when any filter is applied disables that fold while
+        // keeping the bounds usable for join sizing.
         let exec = match &self.statistics {
-            Some(stats) => exec.with_statistics(stats.clone().project(projections)),
+            Some(stats) => {
+                let stats = stats.clone().project(projections);
+                let stats = if filters.is_empty() {
+                    stats
+                } else {
+                    stats.to_inexact()
+                };
+                exec.with_statistics(stats)
+            }
             None => exec,
         };
         Ok(Arc::new(exec))
@@ -1327,6 +1347,94 @@ mod tests {
 
     fn has_metric(metrics: &datafusion::physical_plan::metrics::MetricsSet, name: &str) -> bool {
         metrics.sum_by_name(name).is_some()
+    }
+
+    /// A `FlightSqlClient` connected lazily to a non-routable address: enough to
+    /// build a `FlightSQLTable`/scan plan without ever attempting a connection.
+    fn lazy_client() -> FlightSqlClient {
+        use arrow_flight::flight_service_client::FlightServiceClient;
+        use arrow_flight::sql::client::FlightSqlServiceClient;
+        use tonic::transport::Endpoint;
+
+        let channel = Endpoint::from_static("http://127.0.0.1:1").connect_lazy();
+        let cookie_channel = CookieService::new(channel, Arc::new(CookieStore::new()));
+        FlightSqlServiceClient::new_from_inner(FlightServiceClient::new(cookie_channel))
+    }
+
+    /// Regression test for #11599: a cluster leaf scan carries the executor's
+    /// *unfiltered* row-count/bounds as stamped statistics. Because pushed-down
+    /// filters are reported `Exact` (dropping the `FilterExec`), leaving those
+    /// statistics `Exact` lets `aggregate_statistics` fold a filtered `COUNT(*)`
+    /// to the unfiltered total. The scan must therefore mark its statistics
+    /// inexact whenever a filter is pushed to it, while leaving them exact for an
+    /// unfiltered scan.
+    #[tokio::test]
+    async fn scan_marks_stamped_statistics_inexact_when_filter_pushed() {
+        use datafusion::catalog::TableProvider;
+        use datafusion::common::stats::Precision;
+        use datafusion::common::{ColumnStatistics, ScalarValue, Statistics};
+        use datafusion::physical_plan::ExecutionPlan;
+        use datafusion::prelude::{SessionContext, col, lit};
+
+        let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, true)]));
+        let stats = Statistics {
+            num_rows: Precision::Exact(150_000),
+            total_byte_size: Precision::Exact(1_200_000),
+            column_statistics: vec![ColumnStatistics {
+                null_count: Precision::Exact(0),
+                max_value: Precision::Exact(ScalarValue::Int64(Some(149_999))),
+                min_value: Precision::Exact(ScalarValue::Int64(Some(0))),
+                sum_value: Precision::Absent,
+                distinct_count: Precision::Absent,
+                byte_size: Precision::Exact(1_200_000),
+            }],
+        };
+
+        let table = FlightSQLTable::create_with_schema(
+            "flightsql",
+            "executor-1",
+            lazy_client(),
+            TableReference::bare("customer"),
+            Arc::clone(&schema),
+            Arc::new(CookieStore::new()),
+        )
+        .with_statistics(Some(stats));
+
+        let session = SessionContext::new().state();
+
+        // No filter → stamped statistics stay exact (folding a bare COUNT(*) is correct).
+        let plan = table
+            .scan(&session, None, &[], None)
+            .await
+            .expect("unfiltered scan should build");
+        let unfiltered = plan
+            .partition_statistics(None)
+            .expect("statistics should be available");
+        assert_eq!(
+            unfiltered.num_rows,
+            Precision::Exact(150_000),
+            "unfiltered scan must keep exact num_rows"
+        );
+
+        // With a pushed-down filter → statistics must be inexact so the
+        // aggregate-statistics rule cannot fold the (now filtered) COUNT(*).
+        let filter = col("v").eq(lit(0_i64));
+        let plan = table
+            .scan(&session, None, std::slice::from_ref(&filter), None)
+            .await
+            .expect("filtered scan should build");
+        let filtered = plan
+            .partition_statistics(None)
+            .expect("statistics should be available");
+        assert_eq!(
+            filtered.num_rows,
+            Precision::Inexact(150_000),
+            "filtered scan must degrade num_rows to inexact (issue #11599)"
+        );
+        assert!(
+            matches!(filtered.column_statistics[0].max_value, Precision::Inexact(_)),
+            "filtered scan must degrade column bounds to inexact so MIN/MAX are not folded"
+        );
     }
 
     fn build_exec(client: FlightSqlClient, cookie_store: Arc<CookieStore>) -> FlightSqlExec {
