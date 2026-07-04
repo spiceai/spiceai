@@ -98,10 +98,19 @@ done
 
 echo "htap-explain-probe: probing [$(echo "$QUERIES" | tr '\n' ' ')] every ${EXPLAIN_INTERVAL}s -> $OUTDIR/<query>_{explain,analyze}_<ts>.txt"
 
-# Probe until spiced exits. The parent harness normally kills this sampler when
-# the run ends; the pgrep check is a self-terminating fallback.
+# Probe until the associated spiced exits. The parent harness normally kills this
+# sampler when the run ends; this PID check is a self-terminating fallback.
+SPICED_PID="${SPICED_PID:-}"
+if [ -z "$SPICED_PID" ]; then
+  SPICED_PID="$(pgrep -x -o spiced 2>/dev/null || true)"
+fi
+if [ -z "$SPICED_PID" ] || ! ps -p "$SPICED_PID" -o comm= 2>/dev/null | grep -qx 'spiced'; then
+  echo "htap-explain-probe: could not resolve target spiced PID; exiting" >&2
+  exit 0
+fi
+
 round=0
-while pgrep -x spiced >/dev/null 2>&1; do
+while kill -0 "$SPICED_PID" 2>/dev/null && ps -p "$SPICED_PID" -o comm= 2>/dev/null | grep -qx 'spiced'; do
   round=$((round + 1))
   round_start=$SECONDS
   n=0
