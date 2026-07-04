@@ -6001,28 +6001,39 @@ impl CayenneTableProvider {
         pk_indices: &[usize],
         converter: &RowConverter,
     ) -> Result<CachedPkKeyset> {
-        // Snapshot the un-checkpointed mem-tier BEFORE the durable scan below, so a
-        // concurrent off-`write_lock` checkpoint that flushes-and-clears a shard
-        // mid-rebuild cannot hide a live key: it is either in this snapshot or
-        // already durable in the scan that follows. Cheap: N `ArcSwap` pointer
-        // clones. Folded into the keyset at the end (a no-op for non-memory tables).
-        let mem_snapshots: Vec<Arc<crate::provider::mem_tier::MemTier>> = self
-            .mem_tier
-            .shards()
-            .iter()
-            .map(ArcSwap::load_full)
-            .collect();
-
-        // Wait-free Arc::clone — the inner HashMap is shared, not cloned,
-        // so the scan does not pay an O(N) String + i64 clone per call.
-        let protected_snapshots = self.protected_snapshots.load_full();
+        // Capture the snapshot LIST — un-checkpointed mem-tier shards, the
+        // protected set, and the current snapshot id — COHERENTLY under the
+        // listing fence. A protected-snapshot compaction installs a NEW current
+        // and demotes the old current into `protected` atomically under the WRITE
+        // fence; without this read fence a swap landing BETWEEN the `protected`
+        // and `current` loads would leave the just-demoted old-current snapshot in
+        // NEITHER set, so its keys are dropped from the rebuilt keyset. The next
+        // UPDATE of such a key then false-negates in `apply_on_conflict_to_batch`
+        // (existence miss), records NO supersede tombstone, and leaks the prior
+        // copy — a durable over-count (SF-100 order_line/stock leak the pre-update
+        // version of every key whose snapshot transitioned during a rebuild). The
+        // mem-tier snapshot stays inside the same fence so a concurrent
+        // off-`write_lock` checkpoint cannot hide a live key either: it is in this
+        // snapshot or already durable in the scan that follows.
+        let (mem_snapshots, protected_snapshots, current_snapshot_id) = {
+            let _fence = self.listing_fence.read().await;
+            let mem_snapshots: Vec<Arc<crate::provider::mem_tier::MemTier>> = self
+                .mem_tier
+                .shards()
+                .iter()
+                .map(ArcSwap::load_full)
+                .collect();
+            // Wait-free Arc::clone — the inner HashMap is shared, not cloned.
+            let protected_snapshots = self.protected_snapshots.load_full();
+            let current_snapshot_id = self.get_current_snapshot_id();
+            (mem_snapshots, protected_snapshots, current_snapshot_id)
+        };
 
         let ctx = self.create_session_context();
         // Only read PK columns - no need to load all columns for keyset building
         let pk_projection = pk_indices.to_vec();
 
         // Scan the current snapshot directly from its listed Vortex files.
-        let current_snapshot_id = self.get_current_snapshot_id();
         let scan_plan = self
             .create_snapshot_scan_plan(
                 &ctx.state(),
@@ -6175,6 +6186,36 @@ impl CayenneTableProvider {
         Ok(())
     }
 
+    /// Fold the un-checkpointed RAM mem-tier PKs into `bloom` — the bloom analog
+    /// of [`Self::fold_mem_tier_keys_into_keyset`]. The persisted-bloom fast path
+    /// ([`Self::try_load_persisted_pk_index`]) reconstructs existence from the
+    /// sidecar (which covers the current snapshot as of the last checkpoint) plus
+    /// the durable protected/inline delta — but the sidecar predates the RAM tier.
+    /// In `cdc_durability: memory` a key written after that checkpoint lives ONLY
+    /// in the mem tier, so without this fold the next UPDATE of that key
+    /// false-negatives in [`Self::apply_on_conflict_to_batch`]
+    /// (`existing_keys.get(&key)` is `None`), records NO supersede tombstone, and
+    /// leaks the prior copy — a durable over-count that mirrors the full-rebuild
+    /// bug the [`Self::fold_mem_tier_keys_into_keyset`] fold closes. A superset is
+    /// safe: a mem-tier-tombstoned key re-added is a redundant, correct upsert
+    /// tombstone. `mem_snapshots` MUST be captured coherently with the durable
+    /// reads (see the caller) so a concurrent checkpoint cannot hide a key.
+    fn fold_mem_tier_keys_into_bloom(
+        mem_snapshots: &[Arc<crate::provider::mem_tier::MemTier>],
+        pk_indices: &[usize],
+        converter: &RowConverter,
+        bloom: &mut PkBloom,
+    ) -> Result<()> {
+        for tier in mem_snapshots {
+            for seg in tier.segments.iter() {
+                for batch in seg.batches.iter() {
+                    Self::insert_batch_pks_into_bloom(batch, pk_indices, converter, bloom)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
     // ---- Phase 3: persist/checkpoint the PK existence index across restarts ----
     // Persisted in the metastore (`cayenne_pk_index`) so it is captured by
     // metastore snapshots — letting both a restart AND a node bootstrapped from a
@@ -6242,9 +6283,9 @@ impl CayenneTableProvider {
         &self,
         pk_indices: &[usize],
         converter: &RowConverter,
+        protected_snapshots: &HashMap<String, i64>,
         bloom: &mut PkBloom,
     ) -> Result<()> {
-        let protected_snapshots = self.protected_snapshots.load_full();
         let ctx = self.create_session_context();
         let pk_projection = pk_indices.to_vec();
         let projected_pk_indices: Vec<usize> = (0..pk_indices.len()).collect();
@@ -6356,10 +6397,13 @@ impl CayenneTableProvider {
     /// the full `load_existing_keyset`) unless the table is upsert-eligible, the
     /// sidecar exists and validates, AND its checkpoint snapshot still equals the
     /// current snapshot (guaranteeing the bloom covers the full current snapshot —
-    /// upsert tables only add sequence-tagged protected/inline data after a
-    /// checkpoint, never rewriting the current snapshot except via compaction,
-    /// which re-persists). The post-checkpoint delta is folded in to keep the
-    /// no-false-negative invariant.
+    /// upsert tables only add data after a checkpoint, never rewriting the current
+    /// snapshot except via compaction, which re-persists). The FULL post-checkpoint
+    /// delta is folded in to keep the no-false-negative invariant: the durable
+    /// protected/inline layers AND the un-checkpointed RAM mem-tier (the last is
+    /// essential in `cdc_durability: memory`, where a key written after the
+    /// checkpoint lives only in RAM — omitting it false-negatives that key's next
+    /// update and leaks the prior copy, a durable over-count).
     async fn try_load_persisted_pk_index(
         &self,
         pk_indices: &[usize],
@@ -6390,9 +6434,31 @@ impl CayenneTableProvider {
             );
             return Ok(None);
         }
+        // Capture the mem-tier shards, the protected set, and the current snapshot
+        // id COHERENTLY under the listing fence — identical to the full rebuild in
+        // `load_existing_keyset`. A compaction/checkpoint landing between these
+        // reads must not leave a live key in NEITHER the durable delta
+        // (protected/inline, extended below) NOR the RAM mem-tier fold, which would
+        // drop it from the bloom and false-negative the next update (over-count).
+        // The mem-tier snapshot is taken inside the same fence so a concurrent
+        // off-`write_lock` checkpoint cannot hide a live key: it is in this snapshot
+        // or already durable in the protected/current scan.
+        let (mem_snapshots, protected_snapshots, current_snapshot_id) = {
+            let _fence = self.listing_fence.read().await;
+            let mem_snapshots: Vec<Arc<crate::provider::mem_tier::MemTier>> = self
+                .mem_tier
+                .shards()
+                .iter()
+                .map(ArcSwap::load_full)
+                .collect();
+            let protected_snapshots = self.protected_snapshots.load_full();
+            let current_snapshot_id = self.get_current_snapshot_id();
+            (mem_snapshots, protected_snapshots, current_snapshot_id)
+        };
+
         // Gate on the snapshot tag: the bloom covers the full current snapshot
         // only if nothing rewrote it since the checkpoint (compaction re-persists).
-        if checkpoint_snapshot != self.get_current_snapshot_id() {
+        if checkpoint_snapshot != current_snapshot_id {
             return Ok(None);
         }
         let Some((mut bloom, blob_snapshot)) = deserialize_pk_bloom_sidecar(&bytes) else {
@@ -6413,8 +6479,18 @@ impl CayenneTableProvider {
             );
             return Ok(None);
         }
-        self.extend_bloom_with_protected_and_inline(pk_indices, converter, &mut bloom)
-            .await?;
+        self.extend_bloom_with_protected_and_inline(
+            pk_indices,
+            converter,
+            &protected_snapshots,
+            &mut bloom,
+        )
+        .await?;
+        // Fold the un-checkpointed RAM mem-tier too: in `cdc_durability: memory` it
+        // is post-checkpoint delta just like the protected/inline layers, and a
+        // RAM-only key omitted here would false-negative its next update and leak
+        // the prior copy (durable over-count). Mirrors `load_existing_keyset`.
+        Self::fold_mem_tier_keys_into_bloom(&mem_snapshots, pk_indices, converter, &mut bloom)?;
         tracing::debug!(
             table = self.table_metadata.table_name.as_str(),
             checkpoint_snapshot = checkpoint_snapshot.as_str(),
@@ -33171,6 +33247,120 @@ mod tests {
             pairs,
             vec![(1, 111), (2, 200), (3, 30), (4, 40), (5, 50)],
             "upserts after a checkpoint-accelerated reopen must stay correct (no drops/duplicates)"
+        );
+    }
+
+    /// Regression: the persisted-bloom fast path (`try_load_persisted_pk_index`)
+    /// must fold the un-checkpointed RAM mem-tier, exactly like the full
+    /// `load_existing_keyset` rebuild does. A key written to the mem tier AFTER the
+    /// last checkpoint lives ONLY in RAM — it is in neither the persisted sidecar
+    /// bloom (which covers the checkpointed snapshot) nor the protected/inline
+    /// delta. Without the `fold_mem_tier_keys_into_bloom` fold, a rebuild through
+    /// this fast path drops that key, so its next UPDATE false-negatives its
+    /// existence check, records NO supersede tombstone, and leaks the prior copy —
+    /// a durable over-count (COUNT(*) = 3 instead of 2).
+    #[tokio::test]
+    async fn test_persisted_bloom_rebuild_folds_uncheckpointed_mem_tier_key() {
+        let ctx = SessionContext::new();
+        let runtime_env = ctx.runtime_env();
+        let (provider, _catalog, _tmp) = create_cdc_upsert_table_with_vortex_config(
+            "persisted_bloom_mem_fold",
+            Arc::clone(&runtime_env),
+            VortexConfig {
+                cdc_durability: crate::metadata::CdcDurability::Memory,
+                deletion_mode: crate::metadata::DeletionMode::Key,
+                ..VortexConfig::default()
+            },
+        )
+        .await;
+        assert!(provider.is_cdc_memory_mode(), "memory mode must be active");
+        provider.install_slot_advancer(Arc::new(NoopSlotAdvancer));
+        let schema = Arc::clone(&provider.table_metadata.schema);
+
+        // 1. Land key 1 durably, then compact — this persists the PK-index bloom
+        //    checkpoint for the current snapshot (covering key 1 only).
+        let _ = provider
+            .write_cdc_append_stream(
+                single_batch_stream(id_value_batch(Arc::clone(&schema), &[1], &[10])),
+                &ctx.task_ctx(),
+            )
+            .await
+            .expect("append key 1 to RAM");
+        provider
+            .checkpoint_mem_tier()
+            .await
+            .expect("checkpoint key 1 to durable");
+        provider
+            .rewrite_current_snapshot_for_compaction()
+            .await
+            .expect("compaction persists the pk-index bloom");
+        assert!(
+            provider
+                .catalog
+                .get_pk_index(&provider.table_metadata.table_id)
+                .await
+                .expect("query pk index")
+                .is_some(),
+            "compaction must persist the PK-index bloom checkpoint"
+        );
+
+        // 2. Land key 2 in the RAM mem-tier ONLY (no checkpoint): it is absent from
+        //    the persisted bloom AND the durable snapshot — it lives only in RAM.
+        let _ = provider
+            .write_cdc_append_stream(
+                single_batch_stream(id_value_batch(Arc::clone(&schema), &[2], &[20])),
+                &ctx.task_ctx(),
+            )
+            .await
+            .expect("append key 2 to RAM (un-checkpointed)");
+
+        // 3. The rebuilt index MUST contain the RAM-only key 2. Load it directly via
+        //    the fast path: without the mem-tier fold the returned bloom omits key 2.
+        let pk_indices = provider
+            .primary_key_indices()
+            .expect("pk indices")
+            .expect("table has a primary key");
+        let converter = provider.build_pk_converter(&pk_indices).expect("converter");
+        let loaded = provider
+            .try_load_persisted_pk_index(&pk_indices, &converter)
+            .await
+            .expect("load persisted index")
+            .expect("persisted bloom present after compaction");
+        let CachedPkIndex::Bloom(bloom) = &loaded else {
+            panic!("fast path must return a Bloom");
+        };
+        let key2_batch = id_value_batch(Arc::clone(&schema), &[2], &[0]);
+        let key2_cols: Vec<_> = pk_indices
+            .iter()
+            .map(|&i| Arc::clone(key2_batch.column(i)))
+            .collect();
+        let key2_rows = converter.convert_columns(&key2_cols).expect("convert key 2");
+        assert!(
+            bloom.maybe_contains(key2_rows.row(0).as_ref()),
+            "the un-checkpointed RAM key must be folded into the persisted-bloom rebuild"
+        );
+
+        // 4. End-to-end: drop the cached keyset so the next write cold-rebuilds via
+        //    the fast path, then UPDATE key 2. The upsert must supersede the prior
+        //    copy (found via the mem-tier fold), not leak it.
+        provider.clear_cached_pk_keyset();
+        let _ = provider
+            .write_cdc_append_stream(
+                single_batch_stream(id_value_batch(Arc::clone(&schema), &[2], &[222])),
+                &ctx.task_ctx(),
+            )
+            .await
+            .expect("update key 2");
+        assert_eq!(
+            query_count_star(&ctx, &provider, "persisted_bloom_mem_fold").await,
+            2,
+            "the RAM-only key's update must supersede its prior copy, not leak it \
+             (regression: persisted-bloom rebuild dropped the un-checkpointed mem-tier key)"
+        );
+        assert_eq!(
+            collect_id_value_pairs(&ctx, &provider, "persisted_bloom_mem_fold").await,
+            vec![(1, 10), (2, 222)],
+            "key 2 must show only the updated value; key 1 unchanged"
         );
     }
 
