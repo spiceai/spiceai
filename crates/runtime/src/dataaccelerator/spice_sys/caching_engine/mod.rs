@@ -42,11 +42,10 @@ impl CachingEngineSys {
                 AccelerationConnection::DuckDB(pool) => self.update_fetched_at_duckdb(pool),
                 #[cfg(feature = "postgres-accel")]
                 AccelerationConnection::Postgres(_) => Err(Error::NoAccelerationConnection),
-                #[cfg(feature = "sqlite")]
                 AccelerationConnection::SQLite(_) => Err(Error::NoAccelerationConnection),
                 #[cfg(feature = "turso")]
                 AccelerationConnection::Turso(_) => Err(Error::NoAccelerationConnection),
-                #[cfg(all(not(windows), feature = "sqlite"))]
+                #[cfg(not(windows))]
                 AccelerationConnection::Cayenne(_) => Err(Error::NoAccelerationConnection),
             }
         }

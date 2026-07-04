@@ -36,30 +36,23 @@ The test is marked with `#[ignore]` to prevent it from running during normal tes
 
 #### Run for all accelerators (SQLite, Turso, DuckDB, Arrow, Vortex)
 
+SQLite, Arrow, and Vortex are always compiled in; Turso and DuckDB are opt-in feature flags.
+
 ```bash
-cargo test --package runtime --lib --features sqlite,turso,duckdb,vortex -- --ignored --nocapture benchmark_roundtrip
+cargo test --package runtime --lib --features turso,duckdb -- --ignored --nocapture benchmark_roundtrip
 ```
 
 #### Run for specific accelerators
 
 ```bash
-# SQLite only
-cargo test --package runtime --lib --features sqlite -- --ignored --nocapture benchmark_roundtrip
+# SQLite, Arrow, or Vortex (always available, no feature flag needed)
+cargo test --package runtime --lib -- --ignored --nocapture benchmark_roundtrip
 
 # Turso only
 cargo test --package runtime --lib --features turso -- --ignored --nocapture benchmark_roundtrip
 
 # DuckDB only
 cargo test --package runtime --lib --features duckdb -- --ignored --nocapture benchmark_roundtrip
-
-# Arrow only (no feature flag needed, always available)
-cargo test --package runtime --lib -- --ignored --nocapture benchmark_roundtrip
-
-# Vortex only
-cargo test --package runtime --lib --features vortex -- --ignored --nocapture benchmark_roundtrip
-
-# SQLite + DuckDB + Arrow + Vortex
-cargo test --package runtime --lib --features sqlite,duckdb,vortex -- --ignored --nocapture benchmark_roundtrip
 ```
 
 ### Test Parameters

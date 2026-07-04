@@ -624,7 +624,7 @@ async fn test_snapshot_lock_contention_effect_on_queries() -> anyhow::Result<()>
 /// This test creates real accelerator instances for each supported engine type
 /// and measures the lock contention impact when snapshots are created during query load.
 ///
-/// Run with: `cargo test -p runtime --features "snapshots duckdb sqlite" test_lock_contention_across_accelerator_engines -- --ignored --nocapture`
+/// Run with: `cargo test -p runtime --features "snapshots duckdb" test_lock_contention_across_accelerator_engines -- --ignored --nocapture`
 #[tokio::test]
 #[ignore = "Performance test - requires accelerator features and manual execution"]
 async fn test_lock_contention_across_accelerator_engines() -> anyhow::Result<()> {
@@ -640,7 +640,6 @@ async fn test_lock_contention_across_accelerator_engines() -> anyhow::Result<()>
         }
     }
 
-    #[cfg(feature = "sqlite")]
     {
         println!("\n--- Testing SQLite Engine ---");
         if let Err(e) = run_engine_contention_test(EngineType::Sqlite).await {
@@ -666,7 +665,6 @@ async fn test_lock_contention_across_accelerator_engines() -> anyhow::Result<()>
 enum EngineType {
     #[cfg(feature = "duckdb")]
     DuckDB,
-    #[cfg(feature = "sqlite")]
     Sqlite,
     Cayenne,
 }
@@ -676,7 +674,6 @@ impl std::fmt::Display for EngineType {
         match self {
             #[cfg(feature = "duckdb")]
             Self::DuckDB => write!(f, "DuckDB"),
-            #[cfg(feature = "sqlite")]
             Self::Sqlite => write!(f, "SQLite"),
             Self::Cayenne => write!(f, "Cayenne"),
         }
@@ -688,7 +685,6 @@ impl EngineType {
         match self {
             #[cfg(feature = "duckdb")]
             Self::DuckDB => AccelerationEngine::DuckDB,
-            #[cfg(feature = "sqlite")]
             Self::Sqlite => AccelerationEngine::Sqlite,
             Self::Cayenne => AccelerationEngine::Cayenne,
         }
@@ -749,7 +745,6 @@ async fn run_engine_contention_test(engine_type: EngineType) -> anyhow::Result<(
                 .await
                 .map_err(|e| anyhow::anyhow!("DuckDB table creation failed: {e}"))?
         }
-        #[cfg(feature = "sqlite")]
         EngineType::Sqlite => {
             use runtime::dataaccelerator::sqlite::SqliteAccelerator;
 
@@ -786,13 +781,11 @@ async fn run_engine_contention_test(engine_type: EngineType) -> anyhow::Result<(
     };
 
     // Insert test data for file-based engines
-    #[cfg(any(feature = "duckdb", feature = "sqlite"))]
     match engine_type {
         #[cfg(feature = "duckdb")]
         EngineType::DuckDB => {
             insert_test_data(&accelerator, &schema, 10_000).await?;
         }
-        #[cfg(feature = "sqlite")]
         EngineType::Sqlite => {
             insert_test_data(&accelerator, &schema, 10_000).await?;
         }
@@ -961,7 +954,6 @@ async fn run_engine_contention_test(engine_type: EngineType) -> anyhow::Result<(
 }
 
 /// Insert test data into an accelerator table
-#[cfg(any(feature = "duckdb", feature = "sqlite"))]
 async fn insert_test_data(
     table: &Arc<dyn TableProvider>,
     schema: &Arc<Schema>,

@@ -24,7 +24,6 @@ const DYNAMODB_STREAMS_TABLE_NAME: &str = "spice_sys_dynamodb_streams";
 mod duckdb;
 #[cfg(feature = "postgres-accel")]
 mod postgres;
-#[cfg(feature = "sqlite")]
 mod sqlite;
 #[cfg(feature = "turso")]
 mod turso;
@@ -56,19 +55,11 @@ impl DynamoDBSys {
             AccelerationConnection::DuckDB(pool) => self.get_duckdb(pool),
             #[cfg(feature = "postgres-accel")]
             AccelerationConnection::Postgres(pool) => self.get_postgres(pool).await,
-            #[cfg(feature = "sqlite")]
             AccelerationConnection::SQLite(conn) => self.get_sqlite(conn).await,
             #[cfg(feature = "turso")]
             AccelerationConnection::Turso(pool) => self.get_turso(pool).await,
-            #[cfg(all(not(windows), feature = "sqlite"))]
+            #[cfg(not(windows))]
             AccelerationConnection::Cayenne(conn) => self.get_sqlite(conn).await,
-            #[cfg(not(any(
-                feature = "sqlite",
-                feature = "duckdb",
-                feature = "postgres-accel",
-                feature = "turso"
-            )))]
-            _ => None,
         }
     }
 
@@ -78,19 +69,11 @@ impl DynamoDBSys {
             AccelerationConnection::DuckDB(pool) => self.upsert_duckdb(pool, metadata),
             #[cfg(feature = "postgres-accel")]
             AccelerationConnection::Postgres(pool) => self.upsert_postgres(pool, metadata).await,
-            #[cfg(feature = "sqlite")]
             AccelerationConnection::SQLite(conn) => self.upsert_sqlite(conn, metadata).await,
             #[cfg(feature = "turso")]
             AccelerationConnection::Turso(pool) => self.upsert_turso(pool, metadata).await,
-            #[cfg(all(not(windows), feature = "sqlite"))]
+            #[cfg(not(windows))]
             AccelerationConnection::Cayenne(conn) => self.upsert_sqlite(conn, metadata).await,
-            #[cfg(not(any(
-                feature = "sqlite",
-                feature = "duckdb",
-                feature = "postgres-accel",
-                feature = "turso"
-            )))]
-            _ => Err(Error::NoAccelerationConnection),
         }
     }
 }

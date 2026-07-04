@@ -26,9 +26,7 @@ mod duckdb;
 #[cfg(feature = "duckdb")]
 pub use duckdb::DuckDBSnapshotEngine;
 
-#[cfg(feature = "sqlite")]
 mod sqlite;
-#[cfg(feature = "sqlite")]
 pub use sqlite::SqliteSnapshotEngine;
 
 #[cfg(feature = "turso")]
@@ -43,20 +41,11 @@ pub enum SnapshotEngineError {
     DuckDB { source: duckdb::DuckDBSnapshotError },
 
     #[snafu(display("SQLite snapshot error: {source}"))]
-    #[cfg(feature = "sqlite")]
     Sqlite { source: sqlite::SqliteSnapshotError },
 
     #[snafu(display("Turso snapshot error: {source}"))]
     #[cfg(feature = "turso")]
     Turso { source: turso::TursoSnapshotError },
-
-    /// Placeholder variant for when no snapshot-capable feature is enabled.
-    #[snafu(display(
-        "No snapshot engine is available. Enable a snapshot engine feature \
-         (e.g., 'duckdb', 'sqlite', or 'turso')."
-    ))]
-    #[cfg(not(any(feature = "duckdb", feature = "sqlite", feature = "turso")))]
-    Generic,
 
     /// Open-ended variant used by engines that live outside `runtime-acceleration`
     /// (e.g. `CayenneSnapshotEngine` in the runtime crate). The owning crate
@@ -214,7 +203,6 @@ pub fn create_snapshot_engine(
             }
             Arc::new(DuckDBSnapshotEngine::new(compaction_enabled))
         }
-        #[cfg(feature = "sqlite")]
         AccelerationEngine::Sqlite => Arc::new(SqliteSnapshotEngine::new()),
         #[cfg(feature = "turso")]
         AccelerationEngine::Turso => Arc::new(TursoSnapshotEngine::new()),

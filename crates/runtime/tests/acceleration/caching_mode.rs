@@ -631,7 +631,6 @@ async fn test_caching_mode_multi_filter_ideal() -> Result<(), anyhow::Error> {
 /// NOTE: Currently SQLite/Cayenne caching mode has similar issues to `DuckDB` - queries return empty results.
 /// Investigation needed. Test runs when sqlite feature is enabled but is currently failing.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[cfg(feature = "sqlite")]
 async fn test_caching_mode_multi_filter_cayenne() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some(
         "integration=info,runtime=info,data_components=info,runtime::accelerated_table::caching=info",

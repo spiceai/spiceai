@@ -151,7 +151,7 @@ runtime-rate-control = { path = "../runtime-rate-control" }
 runtime-request-context = { path = "../runtime-request-context" }
 runtime-secrets = { path = "../runtime-secrets", default-features = false }
 runtime-table-partition = { path = "../runtime-table-partition" }
-rusqlite = { workspace = true, optional = true }
+rusqlite = { workspace = true }
 rustls.workspace = true
 rustls-pemfile.workspace = true
 elasticsearch = { path = "../elasticsearch", optional = true }
@@ -178,7 +178,7 @@ tera = { version = "1.17" }
 tiberius = { workspace = true, optional = true }
 token_provider = { path = "../token_provider" }
 tokio.workspace = true
-tokio-rusqlite = { workspace = true, optional = true }
+tokio-rusqlite = { workspace = true }
 tokio-rustls = "0.26.0"
 tokio-stream.workspace = true
 tokio-util.workspace = true
@@ -375,23 +375,11 @@ spark = ["data_components/spark_connect"]
 # Registers the Cayenne catalog connector. Intended for benchmarking only;
 # deliberately excluded from the default feature set.
 spicebench = []
-sqlite = [
-    "dep:tokio-rusqlite",
-    "db_connection_pool/sqlite",
-    "data_components/sqlite",
-    "dep:rusqlite",
-    "runtime-acceleration/sqlite",
-]
 turso = [
     "dep:turso",
-    "dep:tokio-rusqlite",
-    "db_connection_pool/sqlite",
-    "data_components/sqlite",
     "data_components/turso",
-    "dep:rusqlite",
     "runtime-acceleration/turso",
 ]
-vortex = []
 [target.'cfg(not(windows))'.dependencies]
 cayenne = { path = "../cayenne", features = ["turso", "partition-table-provider"] }
 vortex.workspace = true

@@ -16,7 +16,7 @@ async-stream = { workspace = true, optional = true }
 async-trait.workspace = true
 clickhouse-rs = { workspace = true, optional = true }
 datafusion.workspace = true
-datafusion-table-providers = { workspace = true }
+datafusion-table-providers = { workspace = true, features = ["sqlite", "sqlite-federation"] }
 dyn-clone = { version = "1.0.17", optional = true }
 futures.workspace = true
 odbc-api = { workspace = true, optional = true }
@@ -69,8 +69,4 @@ snowflake = [
   "dep:snowflake-api",
   "dep:pkcs8",
   "dep:serde_json",
-]
-sqlite = [
-  "datafusion-table-providers/sqlite",
-  "datafusion-table-providers/sqlite-federation",
 ]

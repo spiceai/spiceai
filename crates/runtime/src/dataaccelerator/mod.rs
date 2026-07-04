@@ -51,7 +51,6 @@ pub mod partitioned_arrow;
 pub mod partitioned_duckdb;
 #[cfg(feature = "postgres-accel")]
 pub mod postgres;
-#[cfg(feature = "sqlite")]
 pub mod sqlite;
 #[cfg(feature = "turso")]
 pub mod turso;
@@ -1007,7 +1006,6 @@ mod test {
     }
 
     #[tokio::test]
-    #[cfg(feature = "sqlite")]
     async fn test_file_mode_sqlite_creation() {
         use crate::builder::RuntimeBuilder;
         use std::{fs, path::Path};
@@ -1045,7 +1043,6 @@ mod test {
     }
 
     #[tokio::test]
-    #[cfg(feature = "sqlite")]
     async fn test_file_mode_sqlite_creation_default_path() {
         use crate::builder::RuntimeBuilder;
         use crate::make_spice_data_directory;
@@ -1381,9 +1378,7 @@ mod accelerator_compat_tests {
         // For Cayenne, test both SQLite and Turso metastore backends
         // Format: (engine, mode, timestamp_format, metastore_type)
         let test_configs = vec![
-            #[cfg(feature = "sqlite")]
             (Engine::Sqlite, "memory", None, None),
-            #[cfg(feature = "sqlite")]
             (Engine::Sqlite, "file", None, None),
             #[cfg(feature = "turso")]
             (Engine::Turso, "memory", Some("rfc3339"), None),
@@ -1479,7 +1474,6 @@ mod accelerator_compat_tests {
             };
 
             let table = match engine {
-                #[cfg(feature = "sqlite")]
                 Engine::Sqlite => {
                     use crate::dataaccelerator::sqlite::SqliteAccelerator;
                     match SqliteAccelerator::new()
@@ -2741,7 +2735,6 @@ mod accelerator_compat_tests {
                 };
 
                 let bool_table: Arc<dyn TableProvider> = match engine {
-                    #[cfg(feature = "sqlite")]
                     Engine::Sqlite => {
                         use crate::dataaccelerator::sqlite::SqliteAccelerator;
                         SqliteAccelerator::new()
@@ -4053,7 +4046,7 @@ mod accelerator_compat_tests {
     }
 
     #[tokio::test]
-    #[ignore = "Run with --ignored flag: cargo test --features sqlite,turso,duckdb,cayenne -- --ignored --nocapture benchmark_roundtrip"]
+    #[ignore = "Run with --ignored flag: cargo test --features turso,duckdb,cayenne -- --ignored --nocapture benchmark_roundtrip"]
     async fn benchmark_roundtrip() {
         use std::sync::Mutex;
         use std::time::Instant;

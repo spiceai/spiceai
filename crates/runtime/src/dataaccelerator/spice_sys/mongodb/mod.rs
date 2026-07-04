@@ -39,22 +39,12 @@ use serde::{Deserialize, Serialize};
 use super::{AccelerationConnection, Error, Result, acceleration_connection};
 use crate::{component::dataset::Dataset, dataaccelerator::spice_sys::OpenOption};
 
-#[cfg_attr(
-    not(any(
-        feature = "sqlite",
-        feature = "duckdb",
-        feature = "postgres-accel",
-        feature = "turso"
-    )),
-    expect(dead_code)
-)]
 const MONGODB_TABLE_NAME: &str = "spice_sys_mongodb";
 
 #[cfg(feature = "duckdb")]
 mod duckdb;
 #[cfg(feature = "postgres-accel")]
 mod postgres;
-#[cfg(feature = "sqlite")]
 mod sqlite;
 #[cfg(feature = "turso")]
 mod turso;
@@ -78,15 +68,6 @@ pub struct MongoCheckpointMetadata {
 }
 
 pub struct MongoSys {
-    #[cfg_attr(
-        not(any(
-            feature = "sqlite",
-            feature = "duckdb",
-            feature = "postgres-accel",
-            feature = "turso"
-        )),
-        expect(dead_code)
-    )]
     pub dataset_name: String,
     acceleration_connection: AccelerationConnection,
 }
@@ -105,33 +86,16 @@ impl MongoSys {
             AccelerationConnection::DuckDB(pool) => self.get_duckdb(pool),
             #[cfg(feature = "postgres-accel")]
             AccelerationConnection::Postgres(pool) => self.get_postgres(pool).await,
-            #[cfg(feature = "sqlite")]
             AccelerationConnection::SQLite(conn) => self.get_sqlite(conn).await,
             #[cfg(feature = "turso")]
             AccelerationConnection::Turso(pool) => self.get_turso(pool).await,
-            #[cfg(all(not(windows), feature = "sqlite"))]
+            #[cfg(not(windows))]
             AccelerationConnection::Cayenne(conn) => self.get_sqlite(conn).await,
-            #[cfg(not(any(
-                feature = "sqlite",
-                feature = "duckdb",
-                feature = "postgres-accel",
-                feature = "turso"
-            )))]
-            _ => None,
         }
     }
 
     pub async fn upsert(
         &self,
-        #[cfg_attr(
-            not(any(
-                feature = "sqlite",
-                feature = "duckdb",
-                feature = "postgres-accel",
-                feature = "turso"
-            )),
-            expect(unused_variables)
-        )]
         metadata: &MongoCheckpointMetadata,
     ) -> Result<()> {
         match &self.acceleration_connection {
@@ -139,19 +103,11 @@ impl MongoSys {
             AccelerationConnection::DuckDB(pool) => self.upsert_duckdb(pool, metadata),
             #[cfg(feature = "postgres-accel")]
             AccelerationConnection::Postgres(pool) => self.upsert_postgres(pool, metadata).await,
-            #[cfg(feature = "sqlite")]
             AccelerationConnection::SQLite(conn) => self.upsert_sqlite(conn, metadata).await,
             #[cfg(feature = "turso")]
             AccelerationConnection::Turso(pool) => self.upsert_turso(pool, metadata).await,
-            #[cfg(all(not(windows), feature = "sqlite"))]
+            #[cfg(not(windows))]
             AccelerationConnection::Cayenne(conn) => self.upsert_sqlite(conn, metadata).await,
-            #[cfg(not(any(
-                feature = "sqlite",
-                feature = "duckdb",
-                feature = "postgres-accel",
-                feature = "turso"
-            )))]
-            _ => Err(Error::NoAccelerationConnection),
         }
     }
 
@@ -161,19 +117,11 @@ impl MongoSys {
             AccelerationConnection::DuckDB(pool) => self.delete_duckdb(pool),
             #[cfg(feature = "postgres-accel")]
             AccelerationConnection::Postgres(pool) => self.delete_postgres(pool).await,
-            #[cfg(feature = "sqlite")]
             AccelerationConnection::SQLite(conn) => self.delete_sqlite(conn).await,
             #[cfg(feature = "turso")]
             AccelerationConnection::Turso(pool) => self.delete_turso(pool).await,
-            #[cfg(all(not(windows), feature = "sqlite"))]
+            #[cfg(not(windows))]
             AccelerationConnection::Cayenne(conn) => self.delete_sqlite(conn).await,
-            #[cfg(not(any(
-                feature = "sqlite",
-                feature = "duckdb",
-                feature = "postgres-accel",
-                feature = "turso"
-            )))]
-            _ => Err(Error::NoAccelerationConnection),
         }
     }
 

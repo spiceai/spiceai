@@ -570,7 +570,6 @@ pub enum AccelerationEngine {
     Cayenne,
     #[cfg(feature = "duckdb")]
     DuckDB,
-    #[cfg(feature = "sqlite")]
     Sqlite,
     #[cfg(feature = "turso")]
     Turso,
@@ -584,7 +583,6 @@ impl AccelerationEngine {
             Self::Cayenne => ".cayenne",
             #[cfg(feature = "duckdb")]
             Self::DuckDB => ".duckdb",
-            #[cfg(feature = "sqlite")]
             Self::Sqlite => ".sqlite",
             #[cfg(feature = "turso")]
             Self::Turso => ".turso",
@@ -597,7 +595,6 @@ impl std::fmt::Display for AccelerationEngine {
             Self::Cayenne => write!(f, "cayenne"),
             #[cfg(feature = "duckdb")]
             Self::DuckDB => write!(f, "duckdb"),
-            #[cfg(feature = "sqlite")]
             Self::Sqlite => write!(f, "sqlite"),
             #[cfg(feature = "turso")]
             Self::Turso => write!(f, "turso"),
@@ -3182,7 +3179,6 @@ mod tests {
     /// runs against the file pre-snapshot.
     fn write_sample_local_db(path: &std::path::Path, engine: &AccelerationEngine) {
         match engine {
-            #[cfg(any(feature = "sqlite", feature = "turso"))]
             AccelerationEngine::Sqlite | AccelerationEngine::Turso => {
                 let conn = rusqlite::Connection::open(path).expect("open sample sqlite db");
                 conn.query_row("PRAGMA journal_mode=WAL", [], |_| Ok(()))
@@ -4997,25 +4993,21 @@ mod tests {
 
     // ==================== SQLite Engine Tests ====================
 
-    #[cfg(feature = "sqlite")]
     #[tokio::test]
     async fn sqlite_download_returns_none_without_metadata() {
         generic_download_returns_none_without_metadata(&AccelerationEngine::Sqlite).await;
     }
 
-    #[cfg(feature = "sqlite")]
     #[tokio::test]
     async fn sqlite_create_snapshot_updates_metadata() {
         generic_create_snapshot_updates_metadata(&AccelerationEngine::Sqlite).await;
     }
 
-    #[cfg(feature = "sqlite")]
     #[tokio::test]
     async fn sqlite_download_snapshot_with_valid_metadata() {
         generic_download_snapshot_with_valid_metadata(&AccelerationEngine::Sqlite).await;
     }
 
-    #[cfg(feature = "sqlite")]
     #[test]
     fn sqlite_engine_does_not_support_compaction() {
         generic_engine_compaction_support(&AccelerationEngine::Sqlite, false);

@@ -531,7 +531,6 @@ async fn test_file_update_csv_duckdb() -> Result<(), anyhow::Error> {
     run_file_update_csv_phases("duckdb", params, &csv_file.to_string_lossy()).await
 }
 
-#[cfg(feature = "sqlite")]
 #[tokio::test]
 async fn test_file_update_csv_sqlite() -> Result<(), anyhow::Error> {
     let temp_dir = tempfile::tempdir()?;
@@ -574,7 +573,6 @@ async fn test_file_update_csv_cayenne() -> Result<(), anyhow::Error> {
 // `mode: file` storage. Assertions are explicit (row counts + column set) so the cases pass
 // on first CI run without pre-accepted insta `.snap` files.
 
-#[cfg(any(feature = "duckdb", feature = "sqlite", not(windows)))]
 async fn init_drop_recreate_csv_runtime(
     csv_path: &str,
     engine: &str,
@@ -593,7 +591,6 @@ async fn init_drop_recreate_csv_runtime(
     .await
 }
 
-#[cfg(any(feature = "duckdb", feature = "sqlite", not(windows)))]
 #[expect(clippy::expect_used)]
 async fn assert_csv_query(
     rt: &Arc<Runtime>,
@@ -625,7 +622,6 @@ async fn assert_csv_query(
     );
 }
 
-#[cfg(any(feature = "duckdb", feature = "sqlite", not(windows)))]
 async fn run_drop_recreate_csv_phases(
     engine: &str,
     accel_params: HashMap<String, String>,
@@ -691,7 +687,6 @@ async fn test_drop_recreate_full_csv_duckdb() -> Result<(), anyhow::Error> {
     run_drop_recreate_csv_phases("duckdb", params, &csv_file.to_string_lossy()).await
 }
 
-#[cfg(feature = "sqlite")]
 #[tokio::test]
 async fn test_drop_recreate_full_csv_sqlite() -> Result<(), anyhow::Error> {
     let temp_dir = tempfile::tempdir()?;

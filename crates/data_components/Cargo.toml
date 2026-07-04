@@ -44,7 +44,7 @@ dataformat-json = { path = "../dataformat-json" }
 datafusion.workspace = true
 datafusion-datasource.workspace = true
 datafusion-federation = { workspace = true }
-datafusion-table-providers = { workspace = true }
+datafusion-table-providers = { workspace = true, features = ["sqlite", "sqlite-federation"] }
 db_connection_pool = { path = "../db_connection_pool" }
 delta_kernel = { workspace = true, optional = true }
 document_parse = { path = "../document_parse" }
@@ -89,7 +89,7 @@ regex.workspace = true
 reqwest.workspace = true
 runtime-rate-control = { path = "../runtime-rate-control" }
 runtime-request-context = { path = "../runtime-request-context" }
-rusqlite = { workspace = true, optional = true }
+rusqlite = { workspace = true }
 elasticsearch = { path = "../elasticsearch", optional = true }
 s3_vectors = { path = "../s3_vectors", optional = true }
 s3_vectors_metadata_filter = { path = "../s3_vectors_metadata_filter", optional = true }
@@ -190,11 +190,6 @@ snowflake = [
     "db_connection_pool/snowflake",
 ]
 spark_connect = ["dep:spark-connect-rs"]
-sqlite = [
-    "dep:rusqlite",
-    "datafusion-table-providers/sqlite",
-    "datafusion-table-providers/sqlite-federation",
-]
 turso = ["dep:turso", "dep:turso-shared", "datafusion-table-providers/sqlite-federation"]
 
 test_hadoop_catalog_docker = []

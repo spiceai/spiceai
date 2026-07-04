@@ -83,11 +83,11 @@ nextest:
 test-integration:
 	# Test if .env file exists, and login to Spice if not
 	@test -f .env || (`spice login`)
-	@cargo test -p runtime --test integration --features postgres,mysql,delta_lake,duckdb,sqlite,turso -- --nocapture
+	@cargo test -p runtime --test integration --features postgres,mysql,delta_lake,duckdb,turso -- --nocapture
 
 .PHONY: test-integration-without-spiceai-dataset
 test-integration-without-spiceai-dataset:
-	@cargo test -p runtime --test integration --features postgres,mysql,delta_lake,duckdb,sqlite,turso -- --nocapture --skip spiceai_integration_test
+	@cargo test -p runtime --test integration --features postgres,mysql,delta_lake,duckdb,turso -- --nocapture --skip spiceai_integration_test
 
 .PHONY: test-integration-models
 test-integration-models:
@@ -202,7 +202,6 @@ check-rust-features:
 	cargo check $(CARGO_PROFILE) --no-default-features --features adbc
 	cargo check $(CARGO_PROFILE) --no-default-features --features duckdb
 	cargo check $(CARGO_PROFILE) --no-default-features --features postgres
-	cargo check $(CARGO_PROFILE) --no-default-features --features sqlite
 	cargo check $(CARGO_PROFILE) --no-default-features --features mysql
 	cargo check $(CARGO_PROFILE) --no-default-features --features keyring-secret-store
 	cargo check $(CARGO_PROFILE) --no-default-features --features flightsql
@@ -266,7 +265,7 @@ TARGET_DIR := $(or $(CARGO_TARGET_DIR),target)
 # Default install includes models. Use -data suffix variants to build without models.
 # Data-only features (default features minus models)
 # Note: postgres-accel enables the PostgreSQL data accelerator (separate from postgres connector)
-SPICED_DATA_FEATURES := duckdb,postgres,postgres-accel,sqlite,mysql,flightsql,delta_lake,databricks,dremio,clickhouse,cosmosdb,sharepoint,snapshots,snowflake,spark,ftp,sftp,debezium,kafka,anonymous_telemetry,mssql,dynamodb,imap,alloc-snmalloc,oracle,runtime/s3_vectors,mongodb,iceberg-write,turso,smb,pingora,scylladb
+SPICED_DATA_FEATURES := duckdb,postgres,postgres-accel,mysql,flightsql,delta_lake,databricks,dremio,clickhouse,cosmosdb,sharepoint,snapshots,snowflake,spark,ftp,sftp,debezium,kafka,anonymous_telemetry,mssql,dynamodb,imap,alloc-snmalloc,oracle,runtime/s3_vectors,mongodb,iceberg-write,turso,smb,pingora,scylladb
 
 .PHONY: install
 install: build
@@ -391,12 +390,12 @@ install-spiced-dev: build-spiced-dev
 ################################################################################
 .PHONY: distributed
 distributed:
-	make install SPICED_NON_DEFAULT_FEATURES="vortex"
+	make install
 	./scripts/distributed.sh
 
 .PHONY: distributed-dev
 distributed-dev:
-	make install-dev SPICED_NON_DEFAULT_FEATURES="vortex"
+	make install-dev
 	./scripts/distributed.sh
 
 ################################################################################

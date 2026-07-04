@@ -50,7 +50,6 @@ const KAFKA_OFFSETS_TABLE_NAME: &str = "spice_sys_kafka_offsets";
 mod duckdb;
 #[cfg(feature = "postgres-accel")]
 mod postgres;
-#[cfg(feature = "sqlite")]
 mod sqlite;
 #[cfg(feature = "turso")]
 mod turso;
@@ -76,19 +75,11 @@ impl KafkaSys {
             AccelerationConnection::DuckDB(pool) => self.get_duckdb(pool),
             #[cfg(feature = "postgres-accel")]
             AccelerationConnection::Postgres(pool) => self.get_postgres(pool).await,
-            #[cfg(feature = "sqlite")]
             AccelerationConnection::SQLite(pool) => self.get_sqlite(pool).await,
             #[cfg(feature = "turso")]
             AccelerationConnection::Turso(pool) => self.get_turso(pool).await,
-            #[cfg(all(not(windows), feature = "sqlite"))]
+            #[cfg(not(windows))]
             AccelerationConnection::Cayenne(pool) => self.get_sqlite(pool).await,
-            #[cfg(not(any(
-                feature = "sqlite",
-                feature = "duckdb",
-                feature = "postgres-accel",
-                feature = "turso"
-            )))]
-            _ => Ok(None),
         }
     }
 
@@ -98,19 +89,11 @@ impl KafkaSys {
             AccelerationConnection::DuckDB(pool) => self.upsert_duckdb(pool, metadata),
             #[cfg(feature = "postgres-accel")]
             AccelerationConnection::Postgres(pool) => self.upsert_postgres(pool, metadata).await,
-            #[cfg(feature = "sqlite")]
             AccelerationConnection::SQLite(pool) => self.upsert_sqlite(pool, metadata).await,
             #[cfg(feature = "turso")]
             AccelerationConnection::Turso(pool) => self.upsert_turso(pool, metadata).await,
-            #[cfg(all(not(windows), feature = "sqlite"))]
+            #[cfg(not(windows))]
             AccelerationConnection::Cayenne(pool) => self.upsert_sqlite(pool, metadata).await,
-            #[cfg(not(any(
-                feature = "sqlite",
-                feature = "duckdb",
-                feature = "postgres-accel",
-                feature = "turso"
-            )))]
-            _ => Err(Error::NoAccelerationConnection),
         }
     }
 
@@ -122,21 +105,13 @@ impl KafkaSys {
             AccelerationConnection::Postgres(pool) => {
                 self.upsert_offsets_postgres(pool, offsets).await
             }
-            #[cfg(feature = "sqlite")]
             AccelerationConnection::SQLite(pool) => self.upsert_offsets_sqlite(pool, offsets).await,
             #[cfg(feature = "turso")]
             AccelerationConnection::Turso(pool) => self.upsert_offsets_turso(pool, offsets).await,
-            #[cfg(all(not(windows), feature = "sqlite"))]
+            #[cfg(not(windows))]
             AccelerationConnection::Cayenne(pool) => {
                 self.upsert_offsets_sqlite(pool, offsets).await
             }
-            #[cfg(not(any(
-                feature = "sqlite",
-                feature = "duckdb",
-                feature = "postgres-accel",
-                feature = "turso"
-            )))]
-            _ => Err(Error::NoAccelerationConnection),
         }
     }
 

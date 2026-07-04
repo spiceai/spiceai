@@ -62,7 +62,6 @@ postgres = []
 sharepoint = []
 snowflake = []
 spark = []
-sqlite = []
 turso = []
 
 append = ["test-framework/file_append"]

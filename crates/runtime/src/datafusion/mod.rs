@@ -107,12 +107,6 @@ use parking_lot::Mutex as ParkingMutex;
 use query::QueryBuilder;
 use runtime_acceleration::snapshot::AccelerationEngine;
 use runtime_acceleration::snapshot::AccelerationLayout;
-#[cfg(any(
-    feature = "duckdb",
-    feature = "sqlite",
-    feature = "postgres",
-    not(windows)
-))]
 use runtime_acceleration::snapshot::SnapshotManager;
 use runtime_async::ManagedTokioRuntime;
 use runtime_datafusion_index::IndexedTableProvider;
@@ -559,7 +553,6 @@ fn engine_to_acceleration_engine(engine: Engine) -> Option<AccelerationEngine> {
         Engine::DuckDB | Engine::PartitionedDuckDB | Engine::TableModePartitionedDuckDB => {
             Some(AccelerationEngine::DuckDB)
         }
-        #[cfg(feature = "sqlite")]
         Engine::Sqlite => Some(AccelerationEngine::Sqlite),
         #[cfg(feature = "turso")]
         Engine::Turso => Some(AccelerationEngine::Turso),
@@ -4766,18 +4759,11 @@ async fn build_snapshot_creation_config(
         }
     };
 
-    #[cfg(any(
-        feature = "duckdb",
-        feature = "sqlite",
-        feature = "postgres",
-        not(windows)
-    ))]
     let acceleration_engine = match acceleration_settings.engine {
         #[cfg(feature = "duckdb")]
         Engine::DuckDB | Engine::PartitionedDuckDB | Engine::TableModePartitionedDuckDB => {
             AccelerationEngine::DuckDB
         }
-        #[cfg(feature = "sqlite")]
         Engine::Sqlite => AccelerationEngine::Sqlite,
         #[cfg(feature = "turso")]
         Engine::Turso => AccelerationEngine::Turso,
@@ -4790,24 +4776,6 @@ async fn build_snapshot_creation_config(
         }
     };
 
-    #[cfg(not(any(
-        feature = "duckdb",
-        feature = "sqlite",
-        feature = "postgres",
-        not(windows)
-    )))]
-    {
-        let _ = acceleration_layout;
-        let _ = snapshot_creation_trigger;
-        return Err(Error::UnsupportedAccelerationEngineForSnapshots);
-    }
-
-    #[cfg(any(
-        feature = "duckdb",
-        feature = "sqlite",
-        feature = "postgres",
-        not(windows)
-    ))]
     Ok(SnapshotManager::try_new(
         dataset.name.to_string(),
         acceleration_settings.snapshot_behavior.clone(),

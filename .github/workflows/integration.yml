@@ -138,7 +138,7 @@ jobs:
         run: |
           set -euo pipefail
 
-          FEATURES="postgres,mysql,delta_lake,duckdb,sqlite,spark,databricks,dynamodb,oracle,kafka,iceberg-write,snapshots,mongodb"
+          FEATURES="postgres,mysql,delta_lake,duckdb,spark,databricks,dynamodb,oracle,kafka,iceberg-write,snapshots,mongodb"
           if [[ "${{ github.event.inputs.run_all_tests }}" == "true" ]]; then
             FEATURES="${FEATURES},extended_tests"
             echo "Including extended_tests"
@@ -149,7 +149,7 @@ jobs:
           cargo nextest archive -p runtime --test integration --features ${FEATURES} --archive-file integration.tar.zst
           cargo nextest archive -p runtime --test retention_oom --features ${FEATURES} --archive-file retention_oom.tar.zst
           cargo nextest archive -p runtime --test integration_aws_sdk --features databricks,delta_lake --archive-file integration_aws_sdk.tar.zst
-          cargo nextest archive -p runtime --test integration_snapshot_refresh --features duckdb,sqlite,turso,snapshots --archive-file integration_snapshot_refresh.tar.zst
+          cargo nextest archive -p runtime --test integration_snapshot_refresh --features duckdb,turso,snapshots --archive-file integration_snapshot_refresh.tar.zst
           cargo nextest archive -p aws-sdk-credential-bridge --test credential_provider --archive-file integration_aws_sdk_credential_bridge.tar.zst
           cargo nextest archive -p runtime-table-partition --test partition_table_provider --archive-file partition_table_test.tar.zst
           cargo nextest archive -p data_components --test hadoop_catalog_test --archive-file data_components_hadoop.tar.zst

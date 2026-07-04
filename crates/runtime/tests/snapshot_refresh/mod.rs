@@ -68,7 +68,6 @@ use crate::{init_tracing, run_query};
 mod cayenne;
 #[cfg(feature = "duckdb")]
 mod duckdb;
-#[cfg(feature = "sqlite")]
 mod sqlite;
 #[cfg(feature = "turso")]
 mod turso;
@@ -85,7 +84,6 @@ pub(crate) enum EngineKind {
     Cayenne,
     #[cfg(feature = "duckdb")]
     DuckDB,
-    #[cfg(feature = "sqlite")]
     Sqlite,
     #[cfg(feature = "turso")]
     Turso,
@@ -97,7 +95,6 @@ impl EngineKind {
             Self::Cayenne => "cayenne",
             #[cfg(feature = "duckdb")]
             Self::DuckDB => "duckdb",
-            #[cfg(feature = "sqlite")]
             Self::Sqlite => "sqlite",
             #[cfg(feature = "turso")]
             Self::Turso => "turso",
@@ -109,7 +106,6 @@ impl EngineKind {
             Self::Cayenne => "cayenne",
             #[cfg(feature = "duckdb")]
             Self::DuckDB => "duckdb",
-            #[cfg(feature = "sqlite")]
             Self::Sqlite => "sqlite",
             #[cfg(feature = "turso")]
             Self::Turso => "turso",
@@ -267,7 +263,6 @@ impl SnapshotRefreshFixture {
                     local_db_path.to_string_lossy().into_owned(),
                 );
             }
-            #[cfg(feature = "sqlite")]
             EngineKind::Sqlite => {
                 params.insert(
                     "sqlite_file".to_string(),

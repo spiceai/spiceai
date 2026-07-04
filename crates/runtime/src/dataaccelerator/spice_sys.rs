@@ -16,23 +16,11 @@ limitations under the License.
 
 //! Durable storage for Spice operational data related to acceleration.
 
-#[cfg(any(
-    feature = "duckdb",
-    feature = "sqlite",
-    feature = "turso",
-    feature = "postgres-accel"
-))]
 use std::path::Path;
 #[cfg(any(feature = "duckdb", feature = "turso"))]
 use std::sync::Arc;
 
 use super::AccelerationSource;
-#[cfg(any(
-    feature = "duckdb",
-    feature = "sqlite",
-    feature = "turso",
-    feature = "postgres-accel"
-))]
 use snafu::ResultExt;
 use snafu::{OptionExt, Snafu};
 
@@ -44,9 +32,9 @@ use {
     datafusion_table_providers::util::secrets::to_secret_map,
 };
 
-#[cfg(all(not(windows), feature = "sqlite"))]
+#[cfg(not(windows))]
 use super::DataAccelerator;
-#[cfg(all(not(windows), feature = "sqlite"))]
+#[cfg(not(windows))]
 use super::cayenne::{CayenneAccelerator, Error as CayenneError};
 #[cfg(feature = "turso")]
 use super::turso::{Error as TursoError, TursoAccelerator};
@@ -56,19 +44,12 @@ use {
     super::partitioned_duckdb::{Error as PartitionedDuckDbError, PartitionedDuckDBAccelerator},
     datafusion_table_providers::sql::db_connection_pool::duckdbpool::DuckDbConnectionPool,
 };
-#[cfg(feature = "sqlite")]
 use {
     super::sqlite::{Error as SqliteError, SqliteAccelerator},
     datafusion_table_providers::sql::db_connection_pool::sqlitepool::SqliteConnectionPool,
 };
 
 use crate::component::dataset::acceleration::Engine;
-#[cfg(any(
-    feature = "duckdb",
-    feature = "sqlite",
-    feature = "turso",
-    feature = "postgres-accel"
-))]
 use crate::dataaccelerator::get_registered_accelerator;
 
 pub mod dataset_checkpoint;
@@ -94,11 +75,10 @@ enum AccelerationConnection {
     DuckDB(Arc<DuckDbConnectionPool>),
     #[cfg(feature = "postgres-accel")]
     Postgres(PostgresConnectionPool),
-    #[cfg(feature = "sqlite")]
     SQLite(SqliteConnectionPool),
     #[cfg(feature = "turso")]
     Turso(Arc<super::turso::TursoConnectionPool>),
-    #[cfg(all(not(windows), feature = "sqlite"))]
+    #[cfg(not(windows))]
     Cayenne(SqliteConnectionPool),
 }
 
@@ -126,15 +106,12 @@ pub enum Error {
     #[snafu(display("Unable to create Partitioned DuckDB connection pool: {source}"))]
     PartitionedDuckDbPool { source: PartitionedDuckDbError },
 
-    #[cfg(feature = "sqlite")]
     #[snafu(display("Failed to resolve SQLite file path: {source}"))]
     SqliteFilePath { source: SqliteError },
 
-    #[cfg(feature = "sqlite")]
     #[snafu(display("SQLite file does not exist at {path}"))]
     SqliteFileMissing { path: String },
 
-    #[cfg(feature = "sqlite")]
     #[snafu(display("Unable to create SQLite connection pool: {source}"))]
     SqlitePool { source: SqliteError },
 
@@ -145,10 +122,6 @@ pub enum Error {
     #[cfg(not(feature = "duckdb"))]
     #[snafu(display("Spice wasn't built with DuckDB support enabled"))]
     DuckDbFeatureNotEnabled,
-
-    #[cfg(not(feature = "sqlite"))]
-    #[snafu(display("Spice wasn't built with SQLite support enabled"))]
-    SqliteFeatureNotEnabled,
 
     #[cfg(not(feature = "postgres-accel"))]
     #[snafu(display("Spice wasn't built with PostgreSQL acceleration support enabled"))]
@@ -170,15 +143,15 @@ pub enum Error {
     #[snafu(display("Spice wasn't built with Turso support enabled"))]
     TursoFeatureNotEnabled,
 
-    #[cfg(all(not(windows), feature = "sqlite"))]
+    #[cfg(not(windows))]
     #[snafu(display("Failed to resolve Cayenne file path: {source}"))]
     CayenneFilePath { source: CayenneError },
 
-    #[cfg(all(not(windows), feature = "sqlite"))]
+    #[cfg(not(windows))]
     #[snafu(display("Cayenne metadata directory does not exist at {path}"))]
     CayenneMetadataMissing { path: String },
 
-    #[cfg(all(not(windows), feature = "sqlite"))]
+    #[cfg(not(windows))]
     #[snafu(display("Unable to create Cayenne connection pool: {source}"))]
     CayennePool {
         source: Box<dyn std::error::Error + Send + Sync>,
@@ -202,14 +175,6 @@ pub enum Error {
 }
 
 impl Error {
-    #[cfg(any(
-        feature = "sqlite",
-        feature = "duckdb",
-        feature = "postgres",
-        feature = "turso",
-        feature = "kafka",
-        feature = "mongodb"
-    ))]
     fn external(err: impl Into<Box<dyn std::error::Error + Send + Sync>>) -> Self {
         Self::External { source: err.into() }
     }
@@ -225,10 +190,6 @@ pub enum OpenOption {
 
 async fn acceleration_connection(
     source: &dyn AccelerationSource,
-    #[cfg_attr(
-        not(any(feature = "duckdb", feature = "sqlite", feature = "turso")),
-        expect(unused_variables)
-    )]
     open_option: OpenOption,
 ) -> Result<AccelerationConnection> {
     let acceleration_settings = source.acceleration().context(AccelerationNotEnabledSnafu)?;
@@ -310,7 +271,6 @@ async fn acceleration_connection(
         Engine::DuckDB | Engine::PartitionedDuckDB | Engine::TableModePartitionedDuckDB => {
             DuckDbFeatureNotEnabledSnafu.fail()
         }
-        #[cfg(feature = "sqlite")]
         Engine::Sqlite => {
             let accelerator = get_registered_accelerator(source, acceleration_settings.engine)
                 .await
@@ -338,8 +298,6 @@ async fn acceleration_connection(
 
             Ok(AccelerationConnection::SQLite(conn))
         }
-        #[cfg(not(feature = "sqlite"))]
-        Engine::Sqlite => SqliteFeatureNotEnabledSnafu.fail(),
         #[cfg(feature = "postgres-accel")]
         Engine::PostgreSQL => {
             let secret_map = to_secret_map(acceleration_settings.params.clone());
@@ -383,7 +341,7 @@ async fn acceleration_connection(
         }
         #[cfg(not(feature = "turso"))]
         Engine::Turso => TursoFeatureNotEnabledSnafu.fail(),
-        #[cfg(all(not(windows), feature = "sqlite"))]
+        #[cfg(not(windows))]
         Engine::Cayenne => {
             use datafusion_table_providers::sqlite::SqliteTableProviderFactory;
             use std::sync::Arc;
@@ -465,7 +423,7 @@ async fn acceleration_connection(
 
             Ok(AccelerationConnection::Cayenne(pool))
         }
-        #[cfg(any(windows, not(feature = "sqlite")))]
+        #[cfg(windows)]
         Engine::Cayenne => UnsupportedEngineSnafu {
             engine: Engine::Cayenne,
         }

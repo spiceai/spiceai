@@ -52,7 +52,6 @@ use util::{RetryError, fibonacci_backoff::FibonacciBackoffBuilder, retry};
 #[cfg(feature = "duckdb")]
 mod duckdb;
 
-#[cfg(feature = "sqlite")]
 mod sqlite;
 
 #[tokio::test]
@@ -69,7 +68,6 @@ async fn spill_to_disk_and_rehydration() -> Result<(), anyhow::Error> {
         let config = vec![
             #[cfg(feature = "duckdb")]
             ("duckdb", Some("spill_to_disk_duckdb.db")),
-            #[cfg(feature = "sqlite")]
             ("sqlite", Some("spill_to_disk_sqlite.db")),
         ];
 

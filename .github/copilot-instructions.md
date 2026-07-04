@@ -51,7 +51,7 @@ Spice is a SQL query, search, and LLM-inference engine in Rust for data apps and
 ```bash
 make install            # Release build
 make install-dev        # Dev build (faster)
-SPICED_CUSTOM_FEATURES="postgres sqlite" make build-runtime  # Custom features
+SPICED_CUSTOM_FEATURES="postgres" make build-runtime  # Custom features
 
 make lint-rust-fix      # Auto-fix Rust issues
 make test               # Unit tests

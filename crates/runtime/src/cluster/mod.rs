@@ -1276,20 +1276,7 @@ pub async fn initialize_cluster_executor(
         .get("shuffle_format")
         .map_or("arrow_ipc", String::as_str);
 
-    #[cfg(feature = "vortex")]
     let shuffle_format = raw_shuffle_format;
-
-    #[cfg(not(feature = "vortex"))]
-    let shuffle_format = {
-        if raw_shuffle_format == "vortex" {
-            tracing::warn!(
-                "Vortex shuffle format requested but 'vortex' feature is not enabled. Executor will use ArrowIpc."
-            );
-            "arrow_ipc"
-        } else {
-            raw_shuffle_format
-        }
-    };
     let shuffle_location_display = shuffle_location.map_or("disk (temp_directory)", String::as_str);
     tracing::info!(
         "Executor shuffle configuration: shuffle_format={}, shuffle_location={}, work_dir={}",
@@ -1729,20 +1716,9 @@ async fn create_scheduler_server(
         });
 
     // Convert shuffle_format param to ballista ShuffleFormat
-    #[cfg(feature = "vortex")]
     let ballista_shuffle_format = match shuffle_format.as_str() {
         "vortex" => BallistaShuffleFormat::Vortex,
         _ => BallistaShuffleFormat::ArrowIpc,
-    };
-
-    #[cfg(not(feature = "vortex"))]
-    let ballista_shuffle_format = {
-        if shuffle_format.as_str() == "vortex" {
-            tracing::warn!(
-                "Vortex shuffle format requested but 'vortex' feature is not enabled. Falling back to ArrowIpc."
-            );
-        }
-        BallistaShuffleFormat::ArrowIpc
     };
 
     // Create metrics collector with the scheduler's advertise address as node_id

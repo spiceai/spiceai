@@ -399,12 +399,9 @@ mod tests {
         assert_eq!(&schema2, retrieved_schema.as_ref());
 
         // Verify that the updated_at timestamp has changed
-        #[cfg(any(feature = "postgres-accel", feature = "sqlite", feature = "turso"))]
         let AccelerationConnection::DuckDB(pool) = &checkpoint.acceleration_connection else {
             panic!("Unexpected acceleration connection type");
         };
-        #[cfg(not(any(feature = "postgres-accel", feature = "sqlite", feature = "turso")))]
-        let AccelerationConnection::DuckDB(pool) = &checkpoint.acceleration_connection;
         let mut db_conn = Arc::clone(pool)
             .connect_sync()
             .expect("Failed to connect to DuckDB");

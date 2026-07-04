@@ -206,14 +206,12 @@ async fn test_acceleration_refresh_duckdb_full_variant() -> Result<(), anyhow::E
 }
 
 // SQLite (feature-gated)
-#[cfg(feature = "sqlite")]
 #[tokio::test]
 async fn test_acceleration_refresh_sqlite_append_variant() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,info"));
     test_refresh_append_for_engine("sqlite").await
 }
 
-#[cfg(feature = "sqlite")]
 #[tokio::test]
 async fn test_acceleration_refresh_sqlite_full_variant() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,info"));

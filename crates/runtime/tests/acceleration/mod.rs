@@ -29,17 +29,15 @@ mod caching_mode_post_filter;
 mod checkpoint_duckdb;
 #[cfg(feature = "postgres-accel")]
 mod checkpoint_postgres;
-#[cfg(feature = "sqlite")]
 mod checkpoint_sqlite;
 #[cfg(feature = "turso")]
 mod checkpoint_turso;
 #[cfg(feature = "duckdb")]
 mod cron;
-#[cfg(feature = "sqlite")]
 mod file_watcher;
 mod hash_index;
 mod localpod_sync;
-#[cfg(all(feature = "postgres-accel", feature = "duckdb", feature = "sqlite"))]
+#[cfg(all(feature = "postgres-accel", feature = "duckdb"))]
 mod on_conflict;
 #[cfg(not(target_os = "windows"))]
 mod on_conflict_cayenne;

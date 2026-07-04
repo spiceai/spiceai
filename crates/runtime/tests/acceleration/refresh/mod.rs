@@ -8,5 +8,5 @@ mod refresh_duckdb;
 mod refresh_modes;
 #[cfg(feature = "postgres-accel")]
 mod refresh_postgres;
-#[cfg(all(feature = "sqlite", feature = "postgres-accel"))]
+#[cfg(feature = "postgres-accel")]
 mod refresh_sqlite;

@@ -118,12 +118,6 @@ mod results_cache;
 mod retention;
 mod s3;
 mod s3_location_pruning;
-#[cfg(any(
-    feature = "postgres",
-    feature = "duckdb",
-    feature = "sqlite",
-    feature = "turso"
-))]
 mod schema_evolution;
 #[cfg(feature = "sharepoint")]
 mod sharepoint;
@@ -136,7 +130,6 @@ mod snowflake_catalog;
 #[cfg(feature = "spark")]
 mod spark;
 mod spiceai;
-#[cfg(feature = "sqlite")]
 mod sqlite;
 mod tls;
 mod tls_reload;

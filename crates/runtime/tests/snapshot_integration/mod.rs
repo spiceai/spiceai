@@ -505,7 +505,6 @@ async fn prepare_duckdb_fixture(test_name: &str) -> Result<SnapshotFixture> {
     })
 }
 
-#[cfg(feature = "sqlite")]
 async fn prepare_sqlite_fixture(test_name: &str) -> Result<SnapshotFixture> {
     configure_test_datafusion();
 
@@ -741,7 +740,6 @@ async fn snapshot_int_test2_duckdb_bootstrap_without_federation() -> Result<()> 
         .await
 }
 
-#[cfg(feature = "sqlite")]
 #[tokio::test]
 async fn snapshot_int_test3_sqlite_bootstrap_from_s3() -> Result<()> {
     let _guard = init_tracing(Some("integration=debug,info"));
