@@ -94,10 +94,7 @@ impl MongoSys {
         }
     }
 
-    pub async fn upsert(
-        &self,
-        metadata: &MongoCheckpointMetadata,
-    ) -> Result<()> {
+    pub async fn upsert(&self, metadata: &MongoCheckpointMetadata) -> Result<()> {
         match &self.acceleration_connection {
             #[cfg(feature = "duckdb")]
             AccelerationConnection::DuckDB(pool) => self.upsert_duckdb(pool, metadata),

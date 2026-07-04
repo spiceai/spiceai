@@ -43,7 +43,6 @@ runtime = { path = "../../crates/runtime", features = [
     "sharepoint",
     "snowflake",
     "spark",
-    "sqlite",
     "turso",
     # Models for model source parameters
     "models",
