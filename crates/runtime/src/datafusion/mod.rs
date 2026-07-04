@@ -2590,6 +2590,12 @@ impl DataFusion {
             .validate_time_format(dataset.name.to_string(), &refresh_schema)
             .context(InvalidTimeColumnTimeFormatSnafu)?;
 
+        // A partition-scoped table (executor mode) carries partition predicates —
+        // e.g. `bucket(N, col)` — that the federated source cannot evaluate. Force
+        // the refresh to run in the local session context (which registers those
+        // UDFs) rather than unparsing them into SQL pushed to the source.
+        let is_partition_scoped = initial_partition_filters.is_some();
+
         // Apply initial partition filters before the refresher starts to avoid a race
         // where the first refresh runs without partition filters. `Some(empty)`
         // (executor owns no partition of this table) is preserved so the refresh
@@ -2817,8 +2823,13 @@ impl DataFusion {
         accelerated_table_builder.initial_load_complete(initial_load_complete);
 
         // Caching mode requires federation to be disabled so that queries go through
-        // AcceleratedTable::scan to trigger the cache miss/hit logic
-        if acceleration_settings.disable_federation || matches!(refresh_mode, RefreshMode::Caching)
+        // AcceleratedTable::scan to trigger the cache miss/hit logic. Partition-scoped
+        // (executor) tables likewise disable federation so their partition predicates
+        // (e.g. `bucket(N, col)`) are evaluated locally instead of pushed to a source
+        // that does not know those UDFs.
+        if acceleration_settings.disable_federation
+            || matches!(refresh_mode, RefreshMode::Caching)
+            || is_partition_scoped
         {
             accelerated_table_builder.disable_federation();
         }
