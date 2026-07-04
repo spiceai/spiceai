@@ -2095,7 +2095,7 @@ datasets:
         let duration = config_hours
             .push_interval_duration()
             .expect("should parse duration");
-        assert_eq!(duration, std::time::Duration::from_hours(1));
+        assert_eq!(duration, std::time::Duration::from_secs(60 * 60));
 
         // Sub-second intervals should also work
         let config_ms = OtelExporterConfig {
