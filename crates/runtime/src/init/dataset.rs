@@ -1041,7 +1041,7 @@ impl Runtime {
                     federated_table,
                     self.secrets(),
                     BootstrapStatus::None,
-                    vec![],
+                    None,
                 )
                 .await
                 .context(UnableToCreateAcceleratedTableSnafu {
