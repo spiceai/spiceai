@@ -1158,18 +1158,18 @@ impl RefreshTask {
             // Staleness of this envelope AT ARRIVAL (now − its source commit ts):
             // lag already present before the accelerator acts, separating source-side
             // lag from lag the apply path adds (`cdc_source_arrival_lag_ms`).
-            if let Ok(env) = &first {
-                if let Some(commit_ts_ms) = env.change_batch.source_commit_ts_ms() {
-                    // Ingress frontier: how far the source-time we've RECEIVED has
-                    // advanced (rate vs wall = received ×realtime). Compare to the
-                    // applied frontier (egress) to split delivery vs apply slowdown.
-                    metrics::CDC_RECEIVED_COMMIT_UNIX_TIME_MS.record(commit_ts_ms, &recv_wait_labels);
-                    if let Some(now_ms) = util::time::system_time_to_unix_ms(std::time::SystemTime::now()) {
-                        metrics::CDC_SOURCE_ARRIVAL_LAG_MS.record(
-                            now_ms.saturating_sub(commit_ts_ms).max(0) as f64,
-                            &recv_wait_labels,
-                        );
-                    }
+            if let Ok(env) = &first
+                && let Some(commit_ts_ms) = env.change_batch.source_commit_ts_ms()
+            {
+                // Ingress frontier: how far the source-time we've RECEIVED has
+                // advanced (rate vs wall = received ×realtime). Compare to the
+                // applied frontier (egress) to split delivery vs apply slowdown.
+                metrics::CDC_RECEIVED_COMMIT_UNIX_TIME_MS.record(commit_ts_ms, &recv_wait_labels);
+                if let Some(now_ms) = util::time::system_time_to_unix_ms(std::time::SystemTime::now()) {
+                    metrics::CDC_SOURCE_ARRIVAL_LAG_MS.record(
+                        now_ms.saturating_sub(commit_ts_ms).max(0) as f64,
+                        &recv_wait_labels,
+                    );
                 }
             }
             // First envelope of this burst is now in hand; time from here until the
@@ -2116,11 +2116,13 @@ impl RefreshTask {
                 // A pending finalize is the durable Stage-B path — never memory
                 // mode (an in-memory-staged write has nothing to finalize), so no
                 // epoch to defer here.
+                record_cdc_apply_path(&self.dataset_name, "durable_append");
                 return Ok(UpsertOutcome {
                     pending_finalize: Some(spawn_cayenne_finalize(cayenne_write)),
                     in_memory_epoch: None,
                 });
             }
+            record_cdc_apply_path(&self.dataset_name, "inmem_append");
 
             cayenne_write
                 .finish()
@@ -2472,18 +2474,31 @@ impl RefreshTask {
                     epoch,
                     "Delete sub-batch absorbed into the in-memory CDC tier"
                 );
+                record_cdc_apply_path(dataset_name, "inmem_delete");
                 self.update_last_updated_at();
                 return Ok(Some(epoch));
             }
         }
 
+        // Durable delete fallback (in-memory absorb declined, e.g. deletes cleared
+        // the slot-advancer). This synchronous path — lock wait, delete, then
+        // whole-burst maintenance — is far more expensive than in-memory absorption
+        // and, before these sub-phases, was invisible in the write-phase breakdown
+        // (it is not a cayenne write_phase). Decompose it so a table pinned here
+        // (new_order) shows WHERE its apply time goes.
+        record_cdc_apply_path(dataset_name, "durable_delete");
         let (keyless_rows, keyed_rows): (Vec<_>, Vec<_>) = row_indices
             .iter()
             .copied()
             .partition(|row| change_batch.primary_keys(*row).is_empty());
 
         let mut wrote = false;
+        // Serialized with every other writer (and compaction); under contention this
+        // acquire alone can dominate a delete burst.
+        let lock_start = Instant::now();
         let _lock_guard = self.accelerator_write_mutex.lock().await;
+        record_cdc_fixed_cost(dataset_name, "durable_delete_lock_wait", lock_start);
+        let apply_start = Instant::now();
 
         if !keyless_rows.is_empty() {
             let selected_batch = select_rows(&change_batch.data_batch(), &keyless_rows)?;
@@ -2518,9 +2533,14 @@ impl RefreshTask {
                 .context(crate::accelerated_table::FailedToWriteDataSnafu)?;
             wrote = true;
         }
+        record_cdc_fixed_cost(dataset_name, "durable_delete_apply", apply_start);
 
         if wrote {
+            // Whole-burst maintenance (compaction trigger) runs synchronously here —
+            // a prime contributor to a long durable-delete burst; time it separately.
+            let maint_start = Instant::now();
             perform_change_write_maintenance(&self.accelerator).await?;
+            record_cdc_fixed_cost(dataset_name, "durable_delete_maintenance", maint_start);
             self.update_last_updated_at();
         }
 
@@ -2611,6 +2631,20 @@ fn record_cdc_fixed_cost(dataset_name: &TableReference, phase: &'static str, sta
         KeyValue::new("phase", phase),
     ];
     metrics::CDC_APPLY_FIXED_COST_MS.record(elapsed_ms(start), &labels);
+}
+
+/// Count which apply path a change sub-batch took. `inmem_append` / `inmem_delete`
+/// defer durability to the checkpoint (cheap); `durable_append` / `durable_delete`
+/// take the synchronous durable path (whole-burst commit + maintenance) — the
+/// expensive path a table is forced onto when a burst can't defer (e.g. deletes
+/// clear the slot-advancer). Reveals WHY a table's apply time is high, which the
+/// phase-coverage gap can only hint at.
+fn record_cdc_apply_path(dataset_name: &TableReference, path: &'static str) {
+    let labels = [
+        KeyValue::new("dataset", dataset_name.to_string()),
+        KeyValue::new("path", path),
+    ];
+    metrics::CDC_APPLY_PATH_TOTAL.add(1, &labels);
 }
 
 fn select_rows(

@@ -110,6 +110,7 @@ REQUIRED_METRICS = [
     ("dataset_acceleration_cdc_reader_send_wait_ms", "histogram", "dataset"),
     # counters (final cumulative)
     ("dataset_acceleration_cdc_coalesce_flush_total", "counter", "dataset,reason"),
+    ("dataset_acceleration_cdc_apply_path_total", "counter", "dataset,path"),
     ("dataset_postgres_replication_reader_input_wait_micros_total", "counter", "name"),
     ("dataset_postgres_replication_reader_processing_micros_total", "counter", "name"),
     ("dataset_postgres_replication_reconnects_total", "counter", "name"),
@@ -679,6 +680,26 @@ def render(data):
                 note = "  -> mixed flush reasons (no single dominant trigger)"
             p(f"    flush reasons: {reason_str}{note}")
 
+        # Apply-path mix: which path the sub-batches took. durable_* = the expensive
+        # synchronous whole-burst commit+maintenance (e.g. delete bursts that clear
+        # the slot-advancer), the usual reason a table's apply time balloons.
+        paths = counter_totals_by(data, DA + "cdc_apply_path_total", "path", want)
+        if paths:
+            tot = sum(paths.values()) or 1.0
+            p("    apply-path mix: " + " ".join(
+                f"{k}={int(v)}({v / tot * 100:.0f}%)"
+                for k, v in sorted(paths.items(), key=lambda kv: -kv[1])))
+        # Durable-delete decomposition (present only when a dataset hit the durable
+        # delete fallback): where that path's time went — lock contention, the delete
+        # itself, or the synchronous post-write maintenance/compaction trigger.
+        dd = [(lbl, hist_mean(data, DA + "cdc_apply_fixed_cost_ms", {**want, "phase": ph}))
+              for lbl, ph in (("lock_wait", "durable_delete_lock_wait"),
+                              ("apply", "durable_delete_apply"),
+                              ("maintenance", "durable_delete_maintenance"))]
+        if any(v > 0 for _, v in dd):
+            p("    durable-delete breakdown (mean ms/invocation): "
+              + " ".join(f"{lbl}={v:.0f}" for lbl, v in dd))
+
     # ---- Cayenne write-phase breakdown (per table, mean ms) ----
     tables = label_values(data, CY + "write_phase_duration_ms_count", "table")
     phases_seen = label_values(data, CY + "write_phase_duration_ms_count", "phase")
@@ -709,7 +730,11 @@ def render(data):
         # commit/finalize overlap the next burst) and include any off-burst writes, so
         # the numerator can exceed the burst wall time.
         p("")
-        p("    phase coverage (Σ write-phase time ÷ apply-burst wall; <85% ⇒ blind spot):")
+        p("    phase coverage — two levels localize any blind spot (<85% ⇒ gap):")
+        p("      write/burst  = apply-loop 'write' stage ÷ apply-burst wall "
+          "(low ⇒ gap is apply-loop framing: coalesce/commit/finalize)")
+        p("      cayenne/write = Σ cayenne write-phase ÷ 'write' stage "
+          "(low ⇒ gap is INSIDE the cayenne write call — an un-instrumented span)")
         for t in tables:
             phase_sum = sum(
                 hist_mean(data, CY + "write_phase_duration_ms", {"table": t, "phase": ph})
@@ -720,10 +745,20 @@ def render(data):
                          * hist_count(data, DA + "cdc_apply_burst_duration_ms", {"dataset": t}))
             if burst_sum <= 0:
                 continue  # static/full-refresh table: no CDC apply bursts
-            cov = phase_sum / burst_sum
-            flag = "  <<< BLIND SPOT (<85%)" if cov < 0.85 else ""
-            p(f"      {t:<20} {cov * 100:>6.1f}%  "
-              f"(phases {phase_sum / 1000:.1f}s / burst {burst_sum / 1000:.1f}s){flag}")
+            # 'write' apply-loop stage total (the cayenne write call wall time).
+            write_sum = (hist_mean(data, DA + "cdc_apply_fixed_cost_ms", {"dataset": t, "phase": "write"})
+                         * hist_count(data, DA + "cdc_apply_fixed_cost_ms", {"dataset": t, "phase": "write"}))
+            write_burst = write_sum / burst_sum if burst_sum else 0.0
+            cay_write = (phase_sum / write_sum) if write_sum > 0 else 0.0
+            # Where the gap is: framing (write/burst low) vs inside-cayenne (cayenne/write low).
+            if write_burst < 0.85:
+                tag = "  <<< gap in apply-loop framing"
+            elif cay_write < 0.85:
+                tag = "  <<< gap INSIDE cayenne write call"
+            else:
+                tag = ""
+            p(f"      {t:<20} write/burst={write_burst * 100:>5.1f}%  "
+              f"cayenne/write={cay_write * 100:>5.1f}%  (burst {burst_sum / 1000:.0f}s){tag}")
 
     # ---- Process-global backpressure valves ----
     p("\nProcess-global backpressure valves (SHARED across ALL datasets)")

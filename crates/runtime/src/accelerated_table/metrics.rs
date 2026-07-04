@@ -228,6 +228,21 @@ pub(crate) static CDC_APPLY_FIXED_COST_MS: LazyLock<Histogram<f64>> = LazyLock::
         .build()
 });
 
+/// Which apply path each CDC sub-batch took, labeled by `path`
+/// (`inmem_append` | `inmem_delete` | `durable_append` | `durable_delete`). The
+/// `durable_*` paths take the synchronous whole-burst commit + maintenance and are
+/// far more expensive; a table pinned to them (e.g. delete-bearing bursts that clear
+/// the slot-advancer) explains a large apply time that the write-phase breakdown
+/// alone leaves unattributed.
+pub(crate) static CDC_APPLY_PATH_TOTAL: LazyLock<Counter<u64>> = LazyLock::new(|| {
+    METER
+        .u64_counter("dataset_acceleration_cdc_apply_path_total")
+        .with_description(
+            "Count of CDC apply sub-batches by path (inmem_append/inmem_delete/durable_append/durable_delete).",
+        )
+        .build()
+});
+
 /// Time the CDC apply loop spent blocked waiting to receive the next batch from
 /// the source-reader channel (i.e. waiting on the replication-slot read + WAL
 /// decode that the reader task performs). This is the discriminator for the
