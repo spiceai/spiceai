@@ -996,7 +996,7 @@ impl Runtime {
     /// table had no data at initial-load time). A periodic rebroadcast keeps the
     /// coordinator's join-sizing statistics fresh as the executor's local data grows.
     pub(crate) async fn run_executor_statistics_reporter(self: Arc<Self>) {
-        let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(45));
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         // The statistics source (`local_executor_table_statistics`) reads the
         // Cayenne metastore aggregate, which is maintained incrementally on the
@@ -1004,7 +1004,17 @@ impl Runtime {
         // result mid-ingest. So there is no non-degrading cache here — each tick
         // simply broadcasts the current aggregate.
         loop {
-            interval.tick().await;
+            // Rebroadcast on write completion (debounced so a burst of segment
+            // publishes coalesces into one pass) with the interval tick as the
+            // idle heartbeat.
+            let df_for_notify = self.datafusion();
+            tokio::select! {
+                _ = interval.tick() => {}
+                () = df_for_notify.write_completed_notified() => {
+                    tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+                    interval.reset();
+                }
+            }
             let Some(broadcaster) = self.executor_outbound_broadcaster() else {
                 continue;
             };
