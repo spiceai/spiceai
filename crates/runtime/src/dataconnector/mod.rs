@@ -177,6 +177,7 @@ pub mod iceberg;
 pub mod iceberg_cluster;
 pub mod parameters;
 pub mod s3;
+pub mod schema_projection;
 pub mod sink;
 pub mod spiceai;
 
