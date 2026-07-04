@@ -1476,7 +1476,8 @@ impl SQLExecutor for TursoTableProvider {
             ) = (&col_name, &col_type, &not_null)
             {
                 let data_type = match col_type.to_uppercase().as_str() {
-                    "INTEGER" | "BLOB" => DataType::Int64,
+                    "INTEGER" => DataType::Int64,
+                    "BLOB" => DataType::Binary,
                     "REAL" | "FLOAT" | "DOUBLE" => DataType::Float64,
                     "DATE_TEXT" => DataType::Date32,
                     _ => DataType::Utf8,
