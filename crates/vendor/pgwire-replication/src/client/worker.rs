@@ -348,12 +348,16 @@ impl WorkerState {
                     *last_status_sent = Instant::now();
                 }
 
-                self.send_event(Ok(ReplicationEvent::KeepAlive {
-                    wal_end,
-                    reply_requested,
-                    server_time_micros,
-                }))
-                .await;
+                self.send_event(
+                    stream,
+                    Ok(ReplicationEvent::KeepAlive {
+                        wal_end,
+                        reply_requested,
+                        server_time_micros,
+                    }),
+                    last_status_sent,
+                )
+                .await?;
 
                 Ok(false)
             }
@@ -371,15 +375,20 @@ impl WorkerState {
                         _ => wal_end, // should never happen if parser only returns Begin/Commit
                     };
 
-                    self.send_event(Ok(boundary_ev)).await;
+                    self.send_event(stream, Ok(boundary_ev), last_status_sent)
+                        .await?;
 
                     // Stop condition (prefer boundary LSN semantics when available)
                     if let Some(stop_lsn) = self.cfg.stop_at_lsn {
                         if reached_lsn >= stop_lsn {
-                            self.send_event(Ok(ReplicationEvent::StoppedAt {
-                                reached: reached_lsn,
-                            }))
-                            .await;
+                            self.send_event(
+                                stream,
+                                Ok(ReplicationEvent::StoppedAt {
+                                    reached: reached_lsn,
+                                }),
+                                last_status_sent,
+                            )
+                            .await?;
                             let _ = write_copy_done(stream).await;
                             return Ok(true); // should stop.
                         }
@@ -392,42 +401,134 @@ impl WorkerState {
                 if let Some(stop_lsn) = self.cfg.stop_at_lsn {
                     if wal_end >= stop_lsn {
                         // Send final event, then stop signal
-                        self.send_event(Ok(ReplicationEvent::XLogData {
-                            wal_start,
-                            wal_end,
-                            server_time_micros,
-                            data,
-                        }))
-                        .await;
+                        self.send_event(
+                            stream,
+                            Ok(ReplicationEvent::XLogData {
+                                wal_start,
+                                wal_end,
+                                server_time_micros,
+                                data,
+                            }),
+                            last_status_sent,
+                        )
+                        .await?;
 
-                        self.send_event(Ok(ReplicationEvent::StoppedAt { reached: wal_end }))
-                            .await;
+                        self.send_event(
+                            stream,
+                            Ok(ReplicationEvent::StoppedAt { reached: wal_end }),
+                            last_status_sent,
+                        )
+                        .await?;
 
                         let _ = write_copy_done(stream).await;
                         return Ok(true);
                     }
                 }
 
-                self.send_event(Ok(ReplicationEvent::XLogData {
-                    wal_start,
-                    wal_end,
-                    server_time_micros,
-                    data,
-                }))
-                .await;
+                self.send_event(
+                    stream,
+                    Ok(ReplicationEvent::XLogData {
+                        wal_start,
+                        wal_end,
+                        server_time_micros,
+                        data,
+                    }),
+                    last_status_sent,
+                )
+                .await?;
 
                 Ok(false)
             }
         }
     }
 
-    /// Send an event to the client channel.
+    /// Send an event to the consumer channel without letting a full channel
+    /// starve server feedback.
     ///
-    /// If the channel is full or closed, we log and continue - the client
-    /// may have stopped listening but we don't want to crash the worker.
-    async fn send_event(&self, event: std::result::Result<ReplicationEvent, PgWireError>) {
-        if self.out.send(event).await.is_err() {
-            tracing::debug!("event channel closed, client may have disconnected");
+    /// A plain `out.send().await` on a full events channel parks the entire
+    /// worker until the consumer drains — and while parked, the worker sends no
+    /// standby status updates and services no keepalives. PostgreSQL then sees
+    /// no feedback for `> wal_sender_timeout` and terminates the walsender
+    /// (connection reset), forcing a reconnect and WAL replay. This is the
+    /// coupling this method breaks.
+    ///
+    /// Hot path: a non-blocking `try_reserve` sends immediately (no timer, no
+    /// `select!`). Only when the channel is full do we enter a loop that keeps
+    /// emitting standby status updates every [`status_interval`] while awaiting
+    /// capacity, so the server's liveness window is satisfied regardless of
+    /// consumer progress.
+    ///
+    /// While parked here the worker is not reading the socket, so a server
+    /// keepalive with `reply_requested=true` may sit unread — that is fine,
+    /// because the proactive feedback we send on `status_interval` satisfies
+    /// `wal_sender_timeout` whether or not the request byte was observed.
+    ///
+    /// Gated by [`ReplicationConfig::feedback_while_backpressured`] (default
+    /// `true`); when disabled this reverts to the original blocking `send`.
+    ///
+    /// [`status_interval`]: ReplicationConfig::status_interval
+    /// [`ReplicationConfig::feedback_while_backpressured`]: ReplicationConfig::feedback_while_backpressured
+    async fn send_event<S: AsyncRead + AsyncWrite + Unpin>(
+        &mut self,
+        stream: &mut BufReader<S>,
+        event: std::result::Result<ReplicationEvent, PgWireError>,
+        last_status_sent: &mut Instant,
+    ) -> Result<()> {
+        // Opt-out: original hard-backpressure semantics.
+        if !self.cfg.feedback_while_backpressured {
+            if self.out.send(event).await.is_err() {
+                tracing::debug!("event channel closed, client may have disconnected");
+            }
+            return Ok(());
+        }
+
+        // Hot path: capacity available right now — no timer/select overhead.
+        match self.out.try_reserve() {
+            Ok(permit) => {
+                permit.send(event);
+                return Ok(());
+            }
+            Err(mpsc::error::TrySendError::Closed(())) => {
+                tracing::debug!("event channel closed, client may have disconnected");
+                return Ok(());
+            }
+            Err(mpsc::error::TrySendError::Full(())) => {}
+        }
+
+        // Backpressured: wait for capacity, but keep the server alive by
+        // re-sending standby status feedback every `status_interval`.
+        loop {
+            let feedback_deadline = *last_status_sent + self.cfg.status_interval;
+            tokio::select! {
+                biased;
+
+                // Shutdown must be able to interrupt a stalled send.
+                _ = self.stop_rx.changed() => {
+                    if *self.stop_rx.borrow() {
+                        // Caller's loop observes stop on the next iteration and
+                        // finishes; the event is dropped along with the stream.
+                        return Ok(());
+                    }
+                }
+
+                reserved = tokio::time::timeout_at(feedback_deadline, self.out.reserve()) => {
+                    match reserved {
+                        Ok(Ok(permit)) => {
+                            permit.send(event);
+                            return Ok(());
+                        }
+                        Ok(Err(_)) => {
+                            tracing::debug!("event channel closed, client may have disconnected");
+                            return Ok(());
+                        }
+                        Err(_elapsed) => {
+                            let applied = self.progress.load_applied();
+                            self.send_feedback(stream, applied, false).await?;
+                            *last_status_sent = Instant::now();
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -761,5 +862,85 @@ mod tests {
         // Any time after 2000-01-01 should be positive
         let ts = current_pg_timestamp();
         assert!(ts > 0);
+    }
+
+    /// Regression test for the feedback/backpressure coupling: when the consumer
+    /// stops draining the events channel, `send_event` must keep emitting standby
+    /// status updates every `status_interval` instead of parking silently. If it
+    /// didn't, Postgres would see no feedback and terminate the walsender on
+    /// `wal_sender_timeout`.
+    #[tokio::test]
+    async fn feedback_continues_while_events_channel_is_full() {
+        use tokio::io::{duplex, AsyncReadExt};
+
+        // Capacity-1 consumer channel, primed to full and never drained. `_rx`
+        // keeps it open so `send_event` blocks on backpressure (not closure).
+        let (out_tx, _rx) =
+            mpsc::channel::<std::result::Result<ReplicationEvent, PgWireError>>(1);
+        out_tx
+            .try_send(Ok(ReplicationEvent::KeepAlive {
+                wal_end: Lsn(0),
+                reply_requested: false,
+                server_time_micros: 0,
+            }))
+            .expect("prime channel to full");
+
+        let (_stop_tx, stop_rx) = watch::channel(false);
+        // Short real interval so the three feedback sends complete quickly.
+        let cfg = ReplicationConfig {
+            status_interval: std::time::Duration::from_millis(20),
+            feedback_while_backpressured: true,
+            ..Default::default()
+        };
+        let progress = Arc::new(SharedProgress::new(Lsn(42)));
+        let mut worker = WorkerState::new(cfg, progress, stop_rx, out_tx.clone());
+
+        // In-memory socket; the worker writes standby status updates on its side.
+        let (client_io, mut server_io) = duplex(64 * 1024);
+
+        let mut send = tokio::spawn(async move {
+            let mut stream = BufReader::new(client_io);
+            let mut last_status_sent = Instant::now();
+            worker
+                .send_event(
+                    &mut stream,
+                    Ok(ReplicationEvent::KeepAlive {
+                        wal_end: Lsn(0),
+                        reply_requested: false,
+                        server_time_micros: 0,
+                    }),
+                    &mut last_status_sent,
+                )
+                .await
+        });
+
+        // Read three standby status updates, one per `status_interval`. Under the
+        // old coupling zero frames would ever arrive and `read_exact` would hang.
+        for _ in 0..3 {
+            let mut tag = [0u8; 1];
+            server_io.read_exact(&mut tag).await.expect("read frame tag");
+            assert_eq!(tag[0], b'd', "expected a CopyData frame");
+            let mut len = [0u8; 4];
+            server_io.read_exact(&mut len).await.expect("read frame len");
+            let payload_len = (u32::from_be_bytes(len) as usize) - 4;
+            let mut payload = vec![0u8; payload_len];
+            server_io
+                .read_exact(&mut payload)
+                .await
+                .expect("read frame payload");
+            assert_eq!(
+                payload[0],
+                b'r',
+                "CopyData payload should be a standby status update"
+            );
+        }
+
+        // Feedback flowed *while* the send was still backpressured — the point of
+        // the fix.
+        assert!(
+            !send.is_finished(),
+            "send_event should still be parked on the full channel"
+        );
+        send.abort();
     }
 }
