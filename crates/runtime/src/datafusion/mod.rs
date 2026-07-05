@@ -2823,13 +2823,8 @@ impl DataFusion {
         accelerated_table_builder.initial_load_complete(initial_load_complete);
 
         // Caching mode requires federation to be disabled so that queries go through
-        // AcceleratedTable::scan to trigger the cache miss/hit logic. Partition-scoped
-        // (executor) tables likewise disable federation so their partition predicates
-        // (e.g. `bucket(N, col)`) are evaluated locally instead of pushed to a source
-        // that does not know those UDFs.
-        if acceleration_settings.disable_federation
-            || matches!(refresh_mode, RefreshMode::Caching)
-            || is_partition_scoped
+        // AcceleratedTable::scan to trigger the cache miss/hit logic
+        if acceleration_settings.disable_federation || matches!(refresh_mode, RefreshMode::Caching)
         {
             accelerated_table_builder.disable_federation();
         }
