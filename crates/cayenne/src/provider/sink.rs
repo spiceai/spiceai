@@ -195,8 +195,8 @@ impl CayenneDataSink {
     /// PK on-conflict handling keeps whole-payload retries convergent.
     ///
     /// The size cap bounds buffered memory per active stream (segments are
-    /// buffered before writing): 1/8 of the target file size, clamped to
-    /// [8 MiB, 64 MiB] (64 MiB when size-rolling is disabled).
+    /// buffered before writing): the configured target file size, clamped to
+    /// [8 MiB, 256 MiB] (256 MiB when size-rolling is disabled).
     async fn write_append_segmented(
         &self,
         mut data: SendableRecordBatchStream,
@@ -263,7 +263,7 @@ impl CayenneDataSink {
             let lock_wait_ms = segment_start.elapsed().as_millis();
             let segment_rows = self.write_all_append(segment_stream, context).await?;
             total_rows += segment_rows;
-            tracing::warn!(
+            tracing::debug!(
                 table = self.table.table_name(),
                 segment = segments,
                 rows = segment_rows,

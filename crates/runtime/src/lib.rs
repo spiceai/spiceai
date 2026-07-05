@@ -1011,7 +1011,16 @@ impl Runtime {
             tokio::select! {
                 _ = interval.tick() => {}
                 () = df_for_notify.write_completed_notified() => {
+                    // Debounce, then drain the (at most one) permit stored by
+                    // writes that completed during the sleep so a burst yields
+                    // a single rebroadcast; writes after this point store a
+                    // fresh permit and trigger the next pass.
                     tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+                    let _ = tokio::time::timeout(
+                        std::time::Duration::ZERO,
+                        df_for_notify.write_completed_notified(),
+                    )
+                    .await;
                     interval.reset();
                 }
             }
