@@ -1630,6 +1630,7 @@ mod tests {
     use datafusion_datasource::{PartitionedFile, TableSchema};
     use datafusion_functions_aggregate::average::avg_udaf;
     use datafusion_functions_aggregate::count::count_udaf;
+    use datafusion_functions_aggregate::min_max::{max_udaf, min_udaf};
     use datafusion_functions_aggregate::sum::sum_udaf;
     use datafusion_physical_expr::expressions::{DynamicFilterPhysicalExpr, cast, col, lit};
     use datafusion_physical_expr::projection::ProjectionExprs;
@@ -1678,6 +1679,81 @@ mod tests {
             input,
             schema,
         )?))
+    }
+
+    /// `MIN(value)`, `MAX(value)` GROUP BY `name` over the `[name, value]` scan,
+    /// `Single` mode — the grouped ordered-aggregate shape the maintained
+    /// MIN/MAX view serves.
+    fn maintained_minmax_aggregate(
+        input: Arc<dyn ExecutionPlan>,
+        schema: Arc<Schema>,
+    ) -> DFResult<Arc<dyn ExecutionPlan>> {
+        let group_by =
+            PhysicalGroupBy::new_single(vec![(col("name", schema.as_ref())?, "name".to_string())]);
+        let min_expr = AggregateExprBuilder::new(min_udaf(), vec![col("value", schema.as_ref())?])
+            .schema(Arc::clone(&schema))
+            .alias("min(value)".to_string())
+            .build()?;
+        let max_expr = AggregateExprBuilder::new(max_udaf(), vec![col("value", schema.as_ref())?])
+            .schema(Arc::clone(&schema))
+            .alias("max(value)".to_string())
+            .build()?;
+        Ok(Arc::new(AggregateExec::try_new(
+            AggregateMode::Single,
+            group_by,
+            vec![Arc::new(min_expr), Arc::new(max_expr)],
+            vec![None, None],
+            input,
+            schema,
+        )?))
+    }
+
+    /// The frontier bet's real-path faithfulness precondition: a grouped
+    /// `MIN`/`MAX` query is served from maintained state — the optimizer rewrites
+    /// the `AggregateExec` to a `MaintainedAggregateExec`, so the answer is
+    /// O(groups) maintained state, not an O(rows) re-scan. Pairs with the
+    /// module's value-correctness tests (`maintains_min_max_with_retraction`), so
+    /// together they prove the served path is both selected AND correct. MIN/MAX
+    /// inherits the P0-1 `has_pushed_filter_deep` guard from the shared,
+    /// function-agnostic `maintained_aggregate_source`.
+    #[test]
+    fn maintained_aggregate_rewriter_serves_min_max_group_by() -> DFResult<()> {
+        let schema = maintained_aggregate_test_schema();
+        let batch = maintained_aggregate_test_batch();
+        let registry = Arc::new(MaintainedAggregateRegistry::try_new(
+            &[MaintainedAggregateSpec {
+                filter: None,
+                group_by: vec!["name".to_string()],
+                aggregates: vec![
+                    MaintainedAggregateExpr {
+                        function: MaintainedAggregateFunction::Min,
+                        column: Some("value".to_string()),
+                    },
+                    MaintainedAggregateExpr {
+                        function: MaintainedAggregateFunction::Max,
+                        column: Some("value".to_string()),
+                    },
+                ],
+            }],
+            &schema,
+        )?);
+        registry.apply_insert_batches(1, std::slice::from_ref(&batch))?;
+        let memory = MemorySourceConfig::try_new_exec(&[vec![batch]], Arc::clone(&schema), None)?;
+        let cayenne_scan = Arc::new(CayenneAccelerationExec::new_with_maintained_aggregates(
+            memory, registry, 1,
+        )) as Arc<dyn ExecutionPlan>;
+        let aggregate = maintained_minmax_aggregate(cayenne_scan, schema)?;
+
+        let optimized = CayenneMaintainedAggregateRewriter::new()
+            .optimize(aggregate, &ConfigOptions::default())?;
+
+        assert!(
+            optimized
+                .downcast_ref::<MaintainedAggregateExec>()
+                .is_some(),
+            "a grouped MIN/MAX query must be served from maintained state (precondition: rewrite fired)"
+        );
+        Ok(())
     }
 
     #[test]

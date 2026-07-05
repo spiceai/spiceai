@@ -145,6 +145,10 @@ name = "sharded_validation_inline"
 
 [[bench]]
 harness = false
+name = "maintained_minmax_anchor"
+
+[[bench]]
+harness = false
 name = "staged_ivm_feed"
 
 [[bench]]
