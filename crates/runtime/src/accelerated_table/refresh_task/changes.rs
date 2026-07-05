@@ -1239,6 +1239,10 @@ impl RefreshTask {
                 "byte_cap"
             } else if channel_closed {
                 "stream_end"
+            } else if self.runtime_status.is_shutdown() {
+                // The linger loop exits early on shutdown; without this arm those
+                // bursts would misreport as `age_deadline` and skew tuning signals.
+                "shutdown"
             } else if cdc_cfg.max_coalesce_age_ms > 0 {
                 "age_deadline"
             } else {

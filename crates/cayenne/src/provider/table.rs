@@ -19508,11 +19508,14 @@ impl CayenneTableProvider {
         Some(vec![exprs])
     }
 
-    /// File groups smaller than this opt out of `repartition_file_scans`
-    /// byte-range splitting on internal and protected-snapshot scans (see
-    /// `create_snapshot_scan_plan_with_config`). A small
-    /// group split into `target_partitions` scan units pays a Vortex footer-open
-    /// per split for no decode parallelism worth having.
+    /// When a scan's file groups' TOTAL bytes (summed across the whole
+    /// `DataSourceExec` — the same set `repartition_file_scans` redistributes)
+    /// are below this, opt out of byte-range splitting on internal and
+    /// protected-snapshot scans (see `create_snapshot_scan_plan_with_config`).
+    /// The total is the right quantity because the re-split's per-range payload
+    /// is `total / target_partitions`: below this threshold each range carries
+    /// < ~5 MiB at 48 partitions, so a Vortex footer-open per split costs more
+    /// than the decode parallelism it buys.
     const SMALL_GROUP_REPARTITION_OPT_OUT_BYTES: u64 = 256 * 1024 * 1024;
 
     async fn create_snapshot_scan_plan(
@@ -19572,8 +19575,9 @@ impl CayenneTableProvider {
         // `with_target_partitions(1)` alone is insufficient: the physical
         // optimizer re-splits using the OUTER session's `target_partitions`.
         disable_repartition: bool,
-        // Auto-variant of `disable_repartition` for small file groups: when the
-        // listed group's total bytes are below this threshold, opt out of
+        // Auto-variant of `disable_repartition` for small scans: when the TOTAL
+        // bytes across ALL listed file groups (the set the optimizer would
+        // redistribute as one unit) are below this threshold, opt out of
         // byte-range splitting the same way (`0` disables the auto opt-out — the
         // main query branch keeps default splitting behavior).
         small_group_repartition_opt_out_bytes: u64,
@@ -22548,7 +22552,11 @@ impl super::compaction::MemTierCheckpointRunner for CayenneTableProvider {
                 .vortex_config
                 .cdc_mem_tier_min_flush_bytes;
             let resident = i64::try_from(self.mem_tier.total_bytes()).unwrap_or(i64::MAX);
-            let pressure_bypass = mem_critical && min_flush > 0 && resident >= min_flush / 4;
+            // `.max(1)` guards the degenerate `min_flush` 1-3 range where integer
+            // division yields 0 (label accuracy only: at such configs the normal
+            // size gate below admits any non-empty tier regardless).
+            let pressure_bypass =
+                mem_critical && min_flush > 0 && resident >= (min_flush / 4).max(1);
             if pressure_bypass {
                 fired_outcome = "fired_pressure_bypass";
                 tracing::debug!(
