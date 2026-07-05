@@ -911,6 +911,46 @@ pub(crate) async fn reserve_sequences_in(
     Ok(first)
 }
 
+/// One memoized, deletion-filtered mem-tier visible set for the scan path.
+///
+/// Keyed the SAME way as [`MergedScanDeletions`] — (file-index `Arc` ptr, the
+/// per-shard content `version` hash, structural epoch) — so any concurrent
+/// append/clear/publish forces a rebuild and a stale pairing can never be
+/// served. Where `merged_scan_deletions` memoizes the merged tombstone
+/// *snapshot*, this memoizes the merge-on-read *output*: the visible batches
+/// after `filter_inlined_batch_for_deletions` has already run.
+///
+/// Stored PER SEGMENT (each with its statistics), not as one flat batch list,
+/// because the deletion filtering is version-invariant but a query's pruning
+/// predicate is per-query: the memo serves the deletion-filtered batches and
+/// the caller re-applies the (cheap, statistics-only) pruning at serve time.
+/// This kills the per-table-reference re-filtering a multi-reference query
+/// (q20/q21 semi-/anti-joins reference the CDC table 2-3×) paid on every
+/// reference, and lets repeated same-version queries skip merge-on-read
+/// entirely.
+struct MemTierVisibleMemo {
+    /// `PkDeletionSnapshot::index_ptr()` of the file-side index the visibility
+    /// was filtered against (`None` for position-based, which does not filter
+    /// here).
+    file_index_ptr: Option<usize>,
+    /// [`crate::provider::mem_tier::ShardedMemTier::version_hash_of`] of the
+    /// shards the batches were built from.
+    tier_version: u64,
+    /// Structural epoch observed when the memo was built.
+    structural_epoch: u64,
+    /// Per-segment deletion-filtered visible batches, unpruned. `Arc<[_]>` so a
+    /// memo hit is an `Arc`-pointer clone, never an O(segments) copy.
+    segments: Arc<[VisibleMemTierSegment]>,
+}
+
+/// One retained mem-tier segment's deletion-filtered visible batches plus the
+/// segment statistics a query's pruning predicate is evaluated against at serve
+/// time. See [`MemTierVisibleMemo`].
+struct VisibleMemTierSegment {
+    statistics: Arc<Statistics>,
+    batches: Vec<RecordBatch>,
+}
+
 /// Cayenne table provider that reads from Vortex virtual files.
 ///
 /// This provider manages a table composed of multiple "virtual files", where each file
@@ -1124,6 +1164,12 @@ pub struct CayenneTableProvider {
     /// O(tier-tombstones) `with_mem_tier_tombstones` extend that correlated
     /// plans (q20: 322ms -> 74s) paid per outer-group rescan.
     merged_scan_deletions: Arc<arc_swap::ArcSwapOption<MergedScanDeletions>>,
+    /// Memo for the per-scan mem-tier visible batch set (the merge-on-read
+    /// OUTPUT), keyed identically to `merged_scan_deletions`. See
+    /// [`MemTierVisibleMemo`]. Eliminates the per-table-reference re-filtering a
+    /// multi-reference query paid, and serves repeated same-version queries
+    /// without re-running `filter_inlined_batch_for_deletions`.
+    mem_tier_visible_memo: Arc<arc_swap::ArcSwapOption<MemTierVisibleMemo>>,
     /// Count of staged inline-conflict tombstones written with `published =
     /// false` whose owning snapshot has not yet finalized (flipped the flag).
     ///
@@ -4323,6 +4369,7 @@ impl CayenneTableProvider {
             inlined_generation: Arc::new(AtomicU64::new(0)),
             inlined_structural_epoch: Arc::new(AtomicU64::new(0)),
             merged_scan_deletions: Arc::new(arc_swap::ArcSwapOption::const_empty()),
+            mem_tier_visible_memo: Arc::new(arc_swap::ArcSwapOption::const_empty()),
             pending_inline_tombstones: Arc::new(AtomicU64::new(0)),
             published_inlined_seq: Arc::new(AtomicI64::new(initial_inlined_seq)),
             seq_allocator,
@@ -5230,6 +5277,7 @@ impl CayenneTableProvider {
             inlined_generation: Arc::clone(&self.inlined_generation),
             inlined_structural_epoch: Arc::clone(&self.inlined_structural_epoch),
             merged_scan_deletions: Arc::clone(&self.merged_scan_deletions),
+            mem_tier_visible_memo: Arc::clone(&self.mem_tier_visible_memo),
             pending_inline_tombstones: Arc::clone(&self.pending_inline_tombstones),
             published_inlined_seq: Arc::clone(&self.published_inlined_seq),
             // Shared so every writer clone of the same table allocates from one
@@ -17502,6 +17550,15 @@ impl CayenneTableProvider {
             // throughput bottleneck (an eager lock-held O(tier) re-filter
             // measured ~72% of `cdc_path_inmemory`).
             self.mem_tier.shard(shard_id).store(Arc::new(next));
+            // Drop the visible-batch memo (it holds full-tier `RecordBatch`
+            // clones for the PRE-append version): an append changes the visible
+            // set, so — unlike the extend-in-place merged-scan-deletions memo
+            // below — it cannot be cheaply updated, and leaving it stored would
+            // pin the old batches' RAM until the next scan. store(None) releases
+            // them now; the next scan rebuilds. (Under sustained CDC the memo
+            // rarely hits anyway — every append re-keys the tier version — so
+            // this loses no hit-rate while it does reclaim the RAM.)
+            self.mem_tier_visible_memo.store(None);
             // §5 Phase 6: record this shard's kept keys into the cached sharded
             // existence index for THIS shard, still UNDER `locks[shard_id]`, so the
             // bloom INSERT is atomic with the segment swap above (a later HIT-path
@@ -18587,6 +18644,13 @@ impl CayenneTableProvider {
         let survivors = cur.retain_after(flushed_segment_count);
         let released = cur.bytes.saturating_sub(survivors.bytes);
         self.mem_tier.shard(shard_id).store(Arc::new(survivors));
+        // Drop the visible-batch memo: it may pin `RecordBatch`es (Arc refs to
+        // the tier buffers) from the pre-clear tier version, which would keep the
+        // just-flushed prefix's RAM alive until the next scan rebuilds the memo —
+        // defeating this clear's purpose (releasing RAM at checkpoint, especially
+        // under memory pressure or when the table goes idle afterward). Rebuilt
+        // lazily on the next scan; a store(None) is a single atomic publish.
+        self.mem_tier_visible_memo.store(None);
         released
     }
 
@@ -18703,26 +18767,111 @@ impl CayenneTableProvider {
         pruning_predicate: Option<&Arc<dyn PhysicalExpr>>,
         target_partitions: usize,
     ) -> datafusion_common::Result<Option<Arc<dyn ExecutionPlan>>> {
+        // Memo key — same three-part discipline as `merged_scan_deletions`: the
+        // file-side index identity, the per-shard content-version hash, and the
+        // structural epoch. A hit requires all three, so any concurrent
+        // append/clear/publish forces a rebuild; a mid-build advance bumps one
+        // part, so a possibly-inconsistent memo is invalidated on the NEXT scan
+        // and is never served. `file_index_ptr` is read from the SAME source
+        // `filter_inlined_batch_for_deletions` reads live (`pk_deletion_strategy`
+        // via `pk_deletion_snapshot`), so the key reflects what the memoized
+        // batches were filtered against.
+        let file_index_ptr = self.pk_deletion_snapshot().index_ptr();
+        let tier_version = crate::provider::mem_tier::ShardedMemTier::version_hash_of(shards);
+        let structural_epoch = self.inlined_structural_epoch.load(Ordering::Relaxed);
+
+        let segments = if let Some(memo) = self.mem_tier_visible_memo.load_full()
+            && memo.file_index_ptr == file_index_ptr
+            && memo.tier_version == tier_version
+            && memo.structural_epoch == structural_epoch
+        {
+            Arc::clone(&memo.segments)
+        } else {
+            let built: Arc<[VisibleMemTierSegment]> = Arc::from(
+                self.visible_mem_tier_segments_unpruned(shards)
+                    .map_err(|e| {
+                        datafusion_common::DataFusionError::Execution(format!(
+                            "Failed to apply in-memory CDC tier deletion visibility for table {}: {e}",
+                            self.table_metadata.table_name
+                        ))
+                    })?,
+            );
+            self.mem_tier_visible_memo
+                .store(Some(Arc::new(MemTierVisibleMemo {
+                    file_index_ptr,
+                    tier_version,
+                    structural_epoch,
+                    segments: Arc::clone(&built),
+                })));
+            built
+        };
+
+        if segments.is_empty() {
+            return Ok(None);
+        }
+
+        // Serve: apply the per-query (statistics-only) pruning predicate to each
+        // memoized segment, then concatenate the surviving visible batches.
+        // Disjoint keys across shards ⇒ concatenation, not merge (§2.3e).
+        let schema = Arc::clone(&self.table_metadata.schema);
         let mut visible_batches: Vec<RecordBatch> = Vec::new();
-        for shard in shards {
-            if shard.is_empty() || shard.segments.is_empty() {
+        for segment in segments.iter() {
+            if let Some(predicate) = pruning_predicate
+                && super::file_pruning::should_prune_statistics(
+                    segment.statistics.as_ref(),
+                    &schema,
+                    predicate,
+                )
+            {
                 continue;
             }
-            let shard_visible = self
-                .visible_mem_tier_batches(shard, pruning_predicate)
-                .map_err(|e| {
-                    datafusion_common::DataFusionError::Execution(format!(
-                        "Failed to apply in-memory CDC tier deletion visibility for table {}: {e}",
-                        self.table_metadata.table_name
-                    ))
-                })?;
-            visible_batches.extend(shard_visible);
+            visible_batches.extend(segment.batches.iter().cloned());
         }
 
         if visible_batches.is_empty() {
             return Ok(None);
         }
         self.finish_mem_tier_scan_plan(visible_batches, effective_projection, target_partitions)
+    }
+
+    /// Build the per-segment, deletion-filtered visible batches for every shard,
+    /// WITHOUT applying any pruning predicate — the memoizable, version-invariant
+    /// core of the sharded mem-tier scan (see [`MemTierVisibleMemo`]). Each shard
+    /// applies its OWN tombstones to its OWN segments (correct because shard
+    /// `s`'s tombstones only reference shard `s`'s keys); the flat result
+    /// concatenates every shard's retained segments. The per-query pruning
+    /// predicate is applied by the caller against each returned segment's
+    /// statistics.
+    fn visible_mem_tier_segments_unpruned(
+        &self,
+        shards: &[Arc<crate::provider::mem_tier::MemTier>],
+    ) -> Result<Vec<VisibleMemTierSegment>> {
+        let mut out: Vec<VisibleMemTierSegment> = Vec::new();
+        for shard in shards {
+            if shard.is_empty() || shard.segments.is_empty() {
+                continue;
+            }
+            let inlined_deletions = Self::mem_tier_deletion_maps(shard);
+            for segment in shard.segments.iter() {
+                let mut batches: Vec<RecordBatch> = Vec::new();
+                for batch in segment.batches.iter() {
+                    if let Some(visible) = self.filter_inlined_batch_for_deletions(
+                        batch.clone(),
+                        segment.data_sequence,
+                        &inlined_deletions,
+                    )? {
+                        batches.push(visible);
+                    }
+                }
+                if !batches.is_empty() {
+                    out.push(VisibleMemTierSegment {
+                        statistics: Arc::clone(&segment.statistics),
+                        batches,
+                    });
+                }
+            }
+        }
+        Ok(out)
     }
 
     /// Shared tail of the mem-tier scan plan: apply the effective projection and
@@ -33401,6 +33550,91 @@ mod tests {
         assert!(
             !Arc::ptr_eq(&first, &third),
             "an append must invalidate the memo (tier version changed)"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn mem_tier_visible_memo_reuses_and_invalidates() {
+        let ctx = SessionContext::new();
+        let runtime_env = ctx.runtime_env();
+        let (provider, _catalog, _tmp) = create_cdc_upsert_table_with_vortex_config(
+            "visible_memo",
+            Arc::clone(&runtime_env),
+            VortexConfig {
+                cdc_durability: crate::metadata::CdcDurability::Memory,
+                deletion_mode: crate::metadata::DeletionMode::Key,
+                inline_max_rows: 1024,
+                ..VortexConfig::default()
+            },
+        )
+        .await;
+        let schema = Arc::clone(&provider.table_metadata.schema);
+        provider.install_slot_advancer(Arc::new(NoopSlotAdvancer));
+
+        // A resident RAM tier (no checkpoint) so the scan takes the mem-tier
+        // visible-batch path that the memo covers.
+        let write = provider
+            .write_cdc_append_stream(
+                single_batch_stream(id_value_batch(Arc::clone(&schema), &[1, 2], &[10, 20])),
+                &ctx.task_ctx(),
+            )
+            .await
+            .expect("RAM append");
+        assert!(
+            write.in_memory_epoch().is_some(),
+            "append engaged the RAM tier"
+        );
+
+        // First scan builds + stores the visible-batch memo.
+        assert_eq!(
+            collect_id_value_pairs(&ctx, &provider, "visible_memo").await,
+            vec![(1, 10), (2, 20)],
+        );
+        let first = provider
+            .mem_tier_visible_memo
+            .load_full()
+            .expect("first scan stored the visible-batch memo");
+
+        // A quiescent re-scan (no writes) must HIT the same memo entry, not
+        // rebuild it — the per-reference re-filtering this fix removes.
+        assert_eq!(
+            collect_id_value_pairs(&ctx, &provider, "visible_memo").await,
+            vec![(1, 10), (2, 20)],
+        );
+        let second = provider
+            .mem_tier_visible_memo
+            .load_full()
+            .expect("memo still present");
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "a quiescent re-scan must HIT the visible-batch memo, not rebuild it"
+        );
+
+        // An append bumps the tier version → the next scan rebuilds a DIFFERENT
+        // entry AND reflects the new row (no stale visibility served).
+        let write2 = provider
+            .write_cdc_append_stream(
+                single_batch_stream(id_value_batch(Arc::clone(&schema), &[3], &[30])),
+                &ctx.task_ctx(),
+            )
+            .await
+            .expect("second RAM append");
+        assert!(
+            write2.in_memory_epoch().is_some(),
+            "second append engaged RAM"
+        );
+        assert_eq!(
+            collect_id_value_pairs(&ctx, &provider, "visible_memo").await,
+            vec![(1, 10), (2, 20), (3, 30)],
+            "post-append scan reflects the new row"
+        );
+        let third = provider
+            .mem_tier_visible_memo
+            .load_full()
+            .expect("memo rebuilt after append");
+        assert!(
+            !Arc::ptr_eq(&first, &third),
+            "an append must invalidate the visible-batch memo (tier version changed)"
         );
     }
 
