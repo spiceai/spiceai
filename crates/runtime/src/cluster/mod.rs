@@ -1269,14 +1269,27 @@ pub async fn initialize_cluster_executor(
     };
 
     // Log shuffle configuration
-    // Normalize shuffle_format based on feature availability
+    // Normalize shuffle_format based on platform availability. Vortex is a
+    // `cfg(not(windows))` dependency (see crates/runtime/Cargo.toml), so on
+    // Windows a requested `vortex` shuffle format must fall back to ArrowIpc.
     let raw_shuffle_format = app_def
         .runtime
         .params
         .get("shuffle_format")
         .map_or("arrow_ipc", String::as_str);
 
+    #[cfg(not(windows))]
     let shuffle_format = raw_shuffle_format;
+
+    #[cfg(windows)]
+    let shuffle_format = if raw_shuffle_format == "vortex" {
+        tracing::warn!(
+            "Vortex shuffle format requested but Vortex is not available on Windows. Executor will use ArrowIpc."
+        );
+        "arrow_ipc"
+    } else {
+        raw_shuffle_format
+    };
     let shuffle_location_display = shuffle_location.map_or("disk (temp_directory)", String::as_str);
     tracing::info!(
         "Executor shuffle configuration: shuffle_format={}, shuffle_location={}, work_dir={}",
@@ -1715,10 +1728,23 @@ async fn create_scheduler_server(
             }) as _
         });
 
-    // Convert shuffle_format param to ballista ShuffleFormat
+    // Convert shuffle_format param to ballista ShuffleFormat. Vortex is a
+    // `cfg(not(windows))` dependency, so on Windows a requested `vortex` shuffle
+    // format warns and falls back to ArrowIpc.
+    #[cfg(not(windows))]
     let ballista_shuffle_format = match shuffle_format.as_str() {
         "vortex" => BallistaShuffleFormat::Vortex,
         _ => BallistaShuffleFormat::ArrowIpc,
+    };
+
+    #[cfg(windows)]
+    let ballista_shuffle_format = {
+        if shuffle_format.as_str() == "vortex" {
+            tracing::warn!(
+                "Vortex shuffle format requested but Vortex is not available on Windows. Falling back to ArrowIpc."
+            );
+        }
+        BallistaShuffleFormat::ArrowIpc
     };
 
     // Create metrics collector with the scheduler's advertise address as node_id

@@ -3178,15 +3178,22 @@ mod tests {
     /// engines, writes opaque test bytes since no engine-side validation
     /// runs against the file pre-snapshot.
     fn write_sample_local_db(path: &std::path::Path, engine: &AccelerationEngine) {
+        // Creates a real (empty) SQLite WAL-mode database. Shared by the Sqlite
+        // and (feature-gated) Turso arms so the body isn't duplicated.
+        let write_sample_sqlite = |path: &std::path::Path| {
+            let conn = rusqlite::Connection::open(path).expect("open sample sqlite db");
+            conn.query_row("PRAGMA journal_mode=WAL", [], |_| Ok(()))
+                .expect("set wal");
+            conn.execute("CREATE TABLE sample(id INTEGER PRIMARY KEY)", [])
+                .expect("create sample table");
+            drop(conn);
+        };
         match engine {
-            AccelerationEngine::Sqlite | AccelerationEngine::Turso => {
-                let conn = rusqlite::Connection::open(path).expect("open sample sqlite db");
-                conn.query_row("PRAGMA journal_mode=WAL", [], |_| Ok(()))
-                    .expect("set wal");
-                conn.execute("CREATE TABLE sample(id INTEGER PRIMARY KEY)", [])
-                    .expect("create sample table");
-                drop(conn);
-            }
+            AccelerationEngine::Sqlite => write_sample_sqlite(path),
+            // `AccelerationEngine::Turso` only exists under the `turso` feature,
+            // so this arm must be feature-gated to compile without it.
+            #[cfg(feature = "turso")]
+            AccelerationEngine::Turso => write_sample_sqlite(path),
             _ => {
                 std::fs::write(path, b"test snapshot content").expect("write test file");
             }
