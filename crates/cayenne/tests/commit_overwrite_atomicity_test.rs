@@ -205,6 +205,7 @@ async fn plant_full_pre_overwrite_state(
             statistics_blob: vec![0xDE, 0xAD, 0xBE, 0xEF],
             num_rows: 42,
             ndv_sketches: None,
+            num_rows_exact: true,
         })
         .await
         .expect("upsert_table_statistics");
