@@ -43,6 +43,9 @@ impl Acceleration {
     }
 
     pub fn validate_indexes(&self, schema: &SchemaRef) -> dataset::Result<()> {
+        if !self.indexes.is_empty() {
+            Self::ensure_schema_populated(schema, "indexes")?;
+        }
         for column in self.indexes.keys() {
             for index_column in column.iter() {
                 if schema.field_with_name(index_column).is_err() {
@@ -60,6 +63,7 @@ impl Acceleration {
 
     pub fn validate_primary_key(&self, schema: &SchemaRef) -> dataset::Result<()> {
         if let Some(columns) = &self.primary_key {
+            Self::ensure_schema_populated(schema, "a primary key")?;
             for column in columns.iter() {
                 if schema.field_with_name(column).is_err() {
                     return dataset::PrimaryKeyColumnNotFoundSnafu {
@@ -71,6 +75,20 @@ impl Acceleration {
             }
         }
 
+        Ok(())
+    }
+
+    /// A configured constraint (primary key or index) can only be validated against a schema
+    /// that actually has columns. An empty schema means the source table could not be resolved
+    /// (e.g. it does not exist), so report that root cause instead of a misleading
+    /// "column was not found. Valid columns: " message listing no valid columns.
+    fn ensure_schema_populated(schema: &SchemaRef, constraint: &str) -> dataset::Result<()> {
+        if schema.fields().is_empty() {
+            return dataset::AcceleratedSchemaEmptySnafu {
+                constraint: constraint.to_string(),
+            }
+            .fail();
+        }
         Ok(())
     }
 
@@ -116,5 +134,120 @@ impl Acceleration {
         tracing::trace!("Table constraints: {table_constraints:?}");
 
         Ok(Some(Constraints::new_unverified(table_constraints)))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::component::dataset::Error;
+    use arrow::datatypes::{DataType, Field, Schema};
+    use datafusion_table_providers::util::column_reference::ColumnReference;
+    use std::sync::Arc;
+
+    fn empty_schema() -> SchemaRef {
+        Arc::new(Schema::empty())
+    }
+
+    fn schema_with(columns: &[&str]) -> SchemaRef {
+        Arc::new(Schema::new(
+            columns
+                .iter()
+                .map(|c| Field::new(*c, DataType::Int32, false))
+                .collect::<Vec<_>>(),
+        ))
+    }
+
+    fn acceleration_with_primary_key(pk: &str) -> Acceleration {
+        Acceleration {
+            primary_key: Some(ColumnReference::try_from(pk).expect("valid column reference")),
+            ..Acceleration::default()
+        }
+    }
+
+    fn acceleration_with_index(index: &str) -> Acceleration {
+        let mut indexes = HashMap::new();
+        indexes.insert(
+            ColumnReference::try_from(index).expect("valid column reference"),
+            IndexType::Enabled,
+        );
+        Acceleration {
+            indexes,
+            ..Acceleration::default()
+        }
+    }
+
+    // Regression test for #10920: when the source table does not exist, the schema resolves to
+    // zero columns. The primary-key validation must report the empty schema (missing table) as
+    // the root cause, not a misleading "Primary key column '...' was not found. Valid columns: ".
+    #[test]
+    fn empty_schema_with_primary_key_reports_empty_schema_not_missing_column() {
+        let acceleration = acceleration_with_primary_key("marker_id");
+        let err = acceleration
+            .validate_primary_key(&empty_schema())
+            .expect_err("empty schema with a primary key must fail");
+
+        assert!(
+            matches!(err, Error::AcceleratedSchemaEmpty { .. }),
+            "expected AcceleratedSchemaEmpty, got: {err}"
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.contains("no columns") && msg.contains("does not exist"),
+            "message should point at the empty schema / missing table: {msg}"
+        );
+        assert!(
+            !msg.contains("was not found in the schema"),
+            "message should not be the misleading column-not-found error: {msg}"
+        );
+    }
+
+    #[test]
+    fn empty_schema_with_index_reports_empty_schema_not_missing_column() {
+        let acceleration = acceleration_with_index("marker_id");
+        let err = acceleration
+            .validate_indexes(&empty_schema())
+            .expect_err("empty schema with an index must fail");
+
+        assert!(
+            matches!(err, Error::AcceleratedSchemaEmpty { .. }),
+            "expected AcceleratedSchemaEmpty, got: {err}"
+        );
+    }
+
+    // An empty schema is only an error when a constraint is actually configured against it.
+    #[test]
+    fn empty_schema_without_constraints_is_ok() {
+        let acceleration = Acceleration::default();
+        acceleration
+            .validate_primary_key(&empty_schema())
+            .expect("no primary key configured, so an empty schema is fine");
+        acceleration
+            .validate_indexes(&empty_schema())
+            .expect("no indexes configured, so an empty schema is fine");
+    }
+
+    // A populated schema that is simply missing the configured column must keep the existing,
+    // more specific "column was not found" error (behavior preserved).
+    #[test]
+    fn populated_schema_missing_primary_key_column_keeps_column_not_found_error() {
+        let acceleration = acceleration_with_primary_key("marker_id");
+        let err = acceleration
+            .validate_primary_key(&schema_with(&["id", "value"]))
+            .expect_err("missing primary key column must fail");
+
+        assert!(
+            matches!(err, Error::PrimaryKeyColumnNotFound { .. }),
+            "expected PrimaryKeyColumnNotFound, got: {err}"
+        );
+        assert!(err.to_string().contains("was not found in the schema"));
+    }
+
+    #[test]
+    fn populated_schema_with_primary_key_column_is_ok() {
+        let acceleration = acceleration_with_primary_key("marker_id");
+        acceleration
+            .validate_primary_key(&schema_with(&["marker_id", "value"]))
+            .expect("primary key column present, so validation passes");
     }
 }

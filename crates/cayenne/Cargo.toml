@@ -125,11 +125,27 @@ libc = "0.2"
 
 [[bench]]
 harness = false
+name = "zorder_clustering"
+
+[[bench]]
+harness = false
 name = "metastore_operations"
 
 [[bench]]
 harness = false
 name = "ivm_retraction_anchor"
+
+[[bench]]
+harness = false
+name = "mem_tier_shard_split_converter"
+
+[[bench]]
+harness = false
+name = "sharded_validation_inline"
+
+[[bench]]
+harness = false
+name = "maintained_minmax_anchor"
 
 [[bench]]
 harness = false
@@ -409,6 +425,10 @@ required-features = ["chdb-bench", "duckdb-bench"]
 [[bench]]
 harness = false
 name = "mem_tier_join_shapes"
+
+[[bench]]
+harness = false
+name = "mem_tier_seal_cadence"
 
 [[bench]]
 harness = false

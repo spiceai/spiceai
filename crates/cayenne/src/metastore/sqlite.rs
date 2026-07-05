@@ -611,6 +611,7 @@ impl SqliteMetastore {
             statistics_blob BLOB NOT NULL,
             num_rows BIGINT NOT NULL DEFAULT 0,
             ndv_sketches BLOB,
+            num_rows_exact INTEGER NOT NULL DEFAULT 1,
             FOREIGN KEY (table_id) REFERENCES cayenne_table(table_id) ON DELETE CASCADE
         )
     ";
@@ -651,6 +652,29 @@ impl SqliteMetastore {
             max_sequence BIGINT NOT NULL DEFAULT 0,
             FOREIGN KEY (table_id) REFERENCES cayenne_table(table_id) ON DELETE CASCADE,
             PRIMARY KEY (table_id, snapshot_id, file_path)
+        )
+    ";
+
+    /// Cold-tier object-store manifest (storage-cascade bottom tier). One row
+    /// per Vortex file promoted to the cold object store. Table-scoped (no
+    /// `snapshot_id`) and append-only: a promoted file is referenced only here,
+    /// never from `cayenne_snapshot_file`. `file_url` is the absolute
+    /// object-store URL (the cold location may differ from the warm table path).
+    /// `statistics_blob` is the file's serialized Vortex `FileStatistics`
+    /// (NOT NULL — always captured at promotion) so the scan prunes cold files
+    /// at listing time without re-reading any footer. Captured in metastore
+    /// snapshots via `EXPECTED_TABLES`.
+    const COLD_TIER_FILE_TABLE_DDL: &'static str = r"
+        CREATE TABLE IF NOT EXISTS cayenne_cold_tier_file (
+            table_id TEXT NOT NULL,
+            file_url TEXT NOT NULL,
+            row_count BIGINT NOT NULL DEFAULT 0,
+            file_size_bytes BIGINT NOT NULL DEFAULT 0,
+            min_sequence BIGINT NOT NULL DEFAULT 0,
+            max_sequence BIGINT NOT NULL DEFAULT 0,
+            statistics_blob BLOB NOT NULL,
+            FOREIGN KEY (table_id) REFERENCES cayenne_table(table_id) ON DELETE CASCADE,
+            PRIMARY KEY (table_id, file_url)
         )
     ";
 
@@ -843,7 +867,7 @@ impl MetastoreBackend for SqliteMetastore {
             .call(|conn| {
                 // Create tables in a transaction
                 conn.execute_batch(&format!(
-                    "{}; {}; {}; {}; {}; {}; {}; {}; {}; {}; {}; {};",
+                    "{}; {}; {}; {}; {}; {}; {}; {}; {}; {}; {}; {}; {};",
                     Self::TABLE_TABLE_DDL,
                     Self::TABLE_NAME_UNIQUE_INDEX_DDL,
                     Self::DELETE_FILE_TABLE_DDL,
@@ -853,6 +877,7 @@ impl MetastoreBackend for SqliteMetastore {
                     Self::TABLE_STATISTICS_DDL,
                     Self::SNAPSHOT_FILE_STATISTICS_TABLE_DDL,
                     Self::SNAPSHOT_FILE_TABLE_DDL,
+                    Self::COLD_TIER_FILE_TABLE_DDL,
                     Self::INLINED_DATA_TABLE_DDL,
                     Self::INLINED_DELETE_TABLE_DDL,
                     Self::PK_INDEX_TABLE_DDL
@@ -866,6 +891,14 @@ impl MetastoreBackend for SqliteMetastore {
                 );
                 let _ = conn.execute(
                     "ALTER TABLE cayenne_table_statistics ADD COLUMN ndv_sketches BLOB",
+                    [],
+                );
+                // Whether the maintained `num_rows` is a provably-exact live count.
+                // Legacy rows predate the mem-tier drift fix; DEFAULT 1 trusts their
+                // count once (the next mem-tier checkpoint delta taints a drifted
+                // one to 0, after which only a full-rewrite `Set` restores exactness).
+                let _ = conn.execute(
+                    "ALTER TABLE cayenne_table_statistics ADD COLUMN num_rows_exact INTEGER NOT NULL DEFAULT 1",
                     [],
                 );
 

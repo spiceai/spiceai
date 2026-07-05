@@ -481,8 +481,19 @@ fn wal_stream(
                         last_emitted_commit_lsn = end_lsn.0;
                         yield envelope;
                     } else {
-                        // Empty transaction — still advance the LSN.
-                        advance(&confirmed_flush, end_lsn.0);
+                        // Empty/filtered transaction: only advance the ACK once
+                        // every previously emitted envelope has committed
+                        // (applied >= last_emitted_commit_lsn). If commits are
+                        // still in flight, skip — advancing now could ACK the
+                        // replication slot past envelopes that were yielded but
+                        // whose committers have not yet run. The next keepalive
+                        // advances retention once those commits drain.
+                        advance_if_fully_acked(
+                            &confirmed_flush,
+                            false,
+                            last_emitted_commit_lsn,
+                            end_lsn.0,
+                        );
                     }
                     // Forward the durable LSN to the replication client so it
                     // can send StandbyStatusUpdate in the background, and mirror
@@ -500,7 +511,7 @@ fn wal_stream(
                     // so it is safe to let Postgres recycle retained WAL through
                     // that point. During a pending transaction, keep reporting the
                     // last applied commit LSN so we never ACK past buffered rows.
-                    let applied = keepalive_applied_lsn(
+                    let applied = advance_if_fully_acked(
                         &confirmed_flush,
                         txn.is_some(),
                         last_emitted_commit_lsn,
@@ -596,7 +607,14 @@ pub(crate) fn log_transient_reconnect(attempt: u32, dataset: &str, error: &str, 
     }
 }
 
-fn keepalive_applied_lsn(
+/// Advance the confirmed-flush ACK to `wal_end`, but only when it is safe to do
+/// so: no transaction is mid-buffer (`transaction_pending`) and every previously
+/// emitted envelope has committed (`applied >= last_emitted_commit_lsn`).
+/// Otherwise the ACK is left where it is so we never acknowledge the replication
+/// slot past rows whose committers have not yet run. Returns the current
+/// confirmed-flush LSN. Called both from keepalive handling and from the
+/// empty/filtered-transaction path in the commit handler.
+fn advance_if_fully_acked(
     confirmed_flush: &AtomicU64,
     transaction_pending: bool,
     last_emitted_commit_lsn: u64,
@@ -722,7 +740,7 @@ mod tests {
     fn keepalive_advances_filtered_lsn_when_idle() {
         let confirmed = AtomicU64::new(100);
 
-        let applied = keepalive_applied_lsn(&confirmed, false, 100, 250);
+        let applied = advance_if_fully_acked(&confirmed, false, 100, 250);
 
         assert_eq!(applied, 250);
         assert_eq!(confirmed.load(Ordering::Relaxed), 250);
@@ -732,7 +750,7 @@ mod tests {
     fn keepalive_does_not_advance_past_uncommitted_emitted_envelope() {
         let confirmed = AtomicU64::new(100);
 
-        let applied = keepalive_applied_lsn(&confirmed, false, 200, 250);
+        let applied = advance_if_fully_acked(&confirmed, false, 200, 250);
 
         assert_eq!(applied, 100);
         assert_eq!(confirmed.load(Ordering::Relaxed), 100);
@@ -742,10 +760,49 @@ mod tests {
     fn keepalive_does_not_advance_past_pending_transaction() {
         let confirmed = AtomicU64::new(100);
 
-        let applied = keepalive_applied_lsn(&confirmed, true, 100, 250);
+        let applied = advance_if_fully_acked(&confirmed, true, 100, 250);
 
         assert_eq!(applied, 100);
         assert_eq!(confirmed.load(Ordering::Relaxed), 100);
+    }
+
+    #[test]
+    fn empty_txn_does_not_ack_past_unacked_envelope() {
+        // An envelope was emitted (last_emitted_commit_lsn = 100) but its
+        // committer has not run yet (confirmed_flush still at 50). An empty
+        // transaction ending at 120 must not advance the ACK.
+        let flush = AtomicU64::new(50);
+
+        advance_if_fully_acked(&flush, false, 100, 120);
+
+        assert_eq!(flush.load(Ordering::Relaxed), 50);
+    }
+
+    #[test]
+    fn empty_txn_acks_after_commit_drains() {
+        let flush = AtomicU64::new(50);
+
+        // Committer has not run: no advance.
+        advance_if_fully_acked(&flush, false, 100, 120);
+        assert_eq!(flush.load(Ordering::Relaxed), 50);
+
+        // Committer runs, catching the ACK up to the emitted commit LSN.
+        flush.store(100, Ordering::Relaxed);
+
+        // Now an empty transaction may advance retention to its end LSN.
+        advance_if_fully_acked(&flush, false, 100, 120);
+        assert_eq!(flush.load(Ordering::Relaxed), 120);
+    }
+
+    #[test]
+    fn empty_txn_never_regresses() {
+        // The ACK is already ahead of the empty transaction's end LSN; it must
+        // not move backwards.
+        let flush = AtomicU64::new(200);
+
+        advance_if_fully_acked(&flush, false, 100, 150);
+
+        assert_eq!(flush.load(Ordering::Relaxed), 200);
     }
 
     #[test]

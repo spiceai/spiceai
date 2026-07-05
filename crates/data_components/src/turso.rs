@@ -509,7 +509,10 @@ impl TursoTableProvider {
     /// to the target type (e.g., INTEGER too large for Int8, invalid JSON) are converted to NULL.
     /// This design choice prioritizes query availability over failing entire result sets due to
     /// individual value conversion issues. This is standard behavior for database queries where
-    /// some data may be malformed or out of range.
+    /// some data may be malformed or out of range. Because a soft-failed value is otherwise
+    /// indistinguishable from genuinely-NULL data, [`Self::count_conversion_failures`] detects
+    /// these cases after the batch is built and emits a per-scan WARN so schema/type drift is
+    /// observable rather than silent.
     ///
     /// **Write-time validation is critical**: To prevent bad data from entering the database,
     /// see `scalar_value_to_turso()` which enforces strict validation during INSERT operations.
@@ -1140,7 +1143,60 @@ impl TursoTableProvider {
             columns.push(column);
         }
 
-        Ok(RecordBatch::try_new(Arc::clone(schema), columns)?)
+        let batch = RecordBatch::try_new(Arc::clone(schema), columns)?;
+        Self::warn_on_conversion_failures(rows, &batch);
+        Ok(batch)
+    }
+
+    /// Counts, per column, stored values that were non-NULL in Turso but produced a NULL
+    /// Arrow cell — i.e. a type conversion in [`Self::values_to_record_batch`] soft-failed
+    /// and silently dropped a real value. A genuine `TursoValue::Null` (or a short row with
+    /// no value for the column) is never counted. The returned vector is indexed by column.
+    ///
+    /// Read-side conversions intentionally fall back to NULL to keep queries available in the
+    /// face of schema/type drift, so this is detection-only: it never alters the batch.
+    #[must_use]
+    pub(crate) fn count_conversion_failures(
+        rows: &[Vec<TursoValue>],
+        batch: &RecordBatch,
+    ) -> Vec<usize> {
+        (0..batch.num_columns())
+            .map(|col_idx| {
+                let array = batch.column(col_idx);
+                rows.iter()
+                    .enumerate()
+                    .filter(|(row_idx, row)| {
+                        array.is_null(*row_idx)
+                            && !matches!(row.get(col_idx), Some(TursoValue::Null) | None)
+                    })
+                    .count()
+            })
+            .collect()
+    }
+
+    /// Emits a single per-scan WARN summarizing any silent read-side conversion failures
+    /// (see [`Self::count_conversion_failures`]), so schema/type drift is observable instead
+    /// of masquerading as genuinely-NULL data.
+    fn warn_on_conversion_failures(rows: &[Vec<TursoValue>], batch: &RecordBatch) {
+        let failures = Self::count_conversion_failures(rows, batch);
+        let total: usize = failures.iter().sum();
+        if total == 0 {
+            return;
+        }
+        let schema = batch.schema();
+        let per_column: Vec<String> = failures
+            .iter()
+            .enumerate()
+            .filter(|(_, count)| **count > 0)
+            .map(|(col_idx, count)| format!("{}={count}", schema.field(col_idx).name()))
+            .collect();
+        tracing::warn!(
+            "Turso read: {total} non-NULL stored value(s) failed type conversion and were \
+             returned as NULL (per column: {}). This usually indicates schema/type drift \
+             between the write and read paths (e.g. an out-of-range integer, an unparseable \
+             timestamp, or external mutation of the acceleration database).",
+            per_column.join(", ")
+        );
     }
 
     /// Returns AST analyzer rules for Turso-specific SQL transformations.
@@ -1419,12 +1475,7 @@ impl SQLExecutor for TursoTableProvider {
                 TursoValue::Integer(not_null),
             ) = (&col_name, &col_type, &not_null)
             {
-                let data_type = match col_type.to_uppercase().as_str() {
-                    "INTEGER" | "BLOB" => DataType::Int64,
-                    "REAL" | "FLOAT" | "DOUBLE" => DataType::Float64,
-                    "DATE_TEXT" => DataType::Date32,
-                    _ => DataType::Utf8,
-                };
+                let data_type = sqlite_declared_type_to_arrow(col_type);
                 let nullable = *not_null == 0;
                 fields.push(Field::new(col_name.as_str(), data_type, nullable));
             }
@@ -1897,6 +1948,19 @@ impl DataSink for TursoDataSink {
     }
 }
 
+/// Maps a `SQLite`/Turso declared column type (as reported by `PRAGMA` `table_info`) to the Arrow [`DataType`] used when inferring a table schema.
+///
+/// `SQLite` type affinity is loose, so this matches the declared type names Turso emits and falls back to [`DataType::Utf8`] (`TEXT` affinity) for anything unrecognized. `BLOB` maps to [`DataType::Binary`] so blob columns round-trip through [`TursoValue::Blob`] instead of being coerced to [`DataType::Int64`].
+fn sqlite_declared_type_to_arrow(declared_type: &str) -> DataType {
+    match declared_type.to_uppercase().as_str() {
+        "INTEGER" => DataType::Int64,
+        "BLOB" => DataType::Binary,
+        "REAL" | "FLOAT" | "DOUBLE" => DataType::Float64,
+        "DATE_TEXT" => DataType::Date32,
+        _ => DataType::Utf8,
+    }
+}
+
 /// Converts a timestamp value to Turso storage format (RFC3339 TEXT or INTEGER milliseconds).
 ///
 /// # Arguments
@@ -1982,7 +2046,13 @@ fn convert_timestamp_to_turso(
             }
 
             match unit {
-                TimeUnit::Second => Ok(TursoValue::Integer(value * timestamp_conversion::MILLIS_PER_SECOND)),
+                TimeUnit::Second => value
+                    .checked_mul(timestamp_conversion::MILLIS_PER_SECOND)
+                    .map(TursoValue::Integer)
+                    .ok_or_else(|| {
+                        format!("Timestamp value {value}s overflows millisecond conversion")
+                    })
+                    .map_err(Into::into),
                 TimeUnit::Millisecond => Ok(TursoValue::Integer(value)),
                 TimeUnit::Microsecond => Err(
                     "TimestampMicrosecond not supported with integer_millis format - use rfc3339 format to preserve sub-millisecond precision"
@@ -2875,5 +2945,164 @@ mod tests {
             .expect("should be TimestampMillisecondArray");
         assert!(!arr.is_null(0), "Millisecond identity should not be NULL");
         assert_eq!(arr.value(0), millis_2300);
+    }
+
+    #[test]
+    fn test_count_conversion_failures_distinguishes_drift_from_genuine_null() {
+        use arrow::datatypes::{DataType, Field};
+
+        // Int8 column. Row 0: in-range integer (ok), row 1: genuine NULL,
+        // row 2: 999 which overflows i8 and soft-fails to NULL on read.
+        let schema = Arc::new(arrow::datatypes::Schema::new(vec![Field::new(
+            "small",
+            DataType::Int8,
+            true,
+        )]));
+        let rows = vec![
+            vec![TursoValue::Integer(42)],
+            vec![TursoValue::Null],
+            vec![TursoValue::Integer(999)],
+        ];
+
+        let batch = TursoTableProvider::values_to_record_batch(&rows, &schema)
+            .expect("batch should build even with an out-of-range value");
+        let arr = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow::array::Int8Array>()
+            .expect("should be Int8Array");
+
+        // The soft-fail behavior itself is preserved: both the genuine NULL and the
+        // overflowed value read back as NULL cells.
+        assert_eq!(arr.value(0), 42);
+        assert!(arr.is_null(1), "genuine NULL stays NULL");
+        assert!(arr.is_null(2), "out-of-range value soft-fails to NULL");
+
+        // The regression: only the out-of-range non-NULL value counts as a conversion
+        // failure — the genuine NULL must not be counted.
+        let failures = TursoTableProvider::count_conversion_failures(&rows, &batch);
+        assert_eq!(
+            failures,
+            vec![1],
+            "exactly one conversion failure (the 999), genuine NULL excluded"
+        );
+    }
+
+    #[test]
+    fn test_count_conversion_failures_zero_when_all_values_valid() {
+        use arrow::datatypes::{DataType, Field};
+
+        let schema = Arc::new(arrow::datatypes::Schema::new(vec![Field::new(
+            "n",
+            DataType::Int64,
+            true,
+        )]));
+        let rows = vec![
+            vec![TursoValue::Integer(1)],
+            vec![TursoValue::Null],
+            vec![TursoValue::Integer(2)],
+        ];
+
+        let batch =
+            TursoTableProvider::values_to_record_batch(&rows, &schema).expect("batch should build");
+        let failures = TursoTableProvider::count_conversion_failures(&rows, &batch);
+        assert_eq!(
+            failures,
+            vec![0],
+            "no conversion failures when every non-NULL value converts cleanly"
+        );
+    }
+
+    #[test]
+    fn test_sqlite_declared_type_to_arrow_mapping() {
+        // Guardrail over the full set of declared types this mapper recognizes.
+        // BLOB must map to Binary (regression: it was previously coerced to Int64,
+        // which lost the bytes and mis-typed the inferred schema).
+        let cases: &[(&str, DataType)] = &[
+            ("INTEGER", DataType::Int64),
+            ("BLOB", DataType::Binary),
+            ("REAL", DataType::Float64),
+            ("FLOAT", DataType::Float64),
+            ("DOUBLE", DataType::Float64),
+            ("DATE_TEXT", DataType::Date32),
+            ("TEXT", DataType::Utf8),
+            // Unknown / SQLite affinity fallthrough -> TEXT (Utf8).
+            ("VARCHAR(255)", DataType::Utf8),
+        ];
+        for (declared, expected) in cases {
+            assert_eq!(
+                &sqlite_declared_type_to_arrow(declared),
+                expected,
+                "declared type {declared} should map to {expected:?}"
+            );
+            // PRAGMA table_info can report the type in any case; mapping is
+            // case-insensitive, so the lowercased form must map identically.
+            assert_eq!(
+                &sqlite_declared_type_to_arrow(&declared.to_lowercase()),
+                expected,
+                "declared type {} (lowercased) should map to {expected:?}",
+                declared.to_lowercase()
+            );
+        }
+    }
+
+    #[test]
+    fn test_blob_column_roundtrips_as_binary() {
+        use arrow::array::BinaryArray;
+
+        // A column inferred as Binary (from a BLOB declared type) must decode
+        // TursoValue::Blob rows into a BinaryArray preserving the exact bytes,
+        // with NULLs surfaced as null entries.
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "payload",
+            DataType::Binary,
+            true,
+        )]));
+        let rows = vec![
+            vec![TursoValue::Blob(vec![0x00, 0xDE, 0xAD, 0xBE, 0xEF])],
+            vec![TursoValue::Null],
+            vec![TursoValue::Blob(Vec::new())],
+        ];
+
+        let batch = TursoTableProvider::values_to_record_batch(&rows, &schema)
+            .expect("BLOB rows should build a Binary batch");
+        let arr = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<BinaryArray>()
+            .expect("column should be a BinaryArray");
+
+        assert_eq!(arr.len(), 3);
+        assert_eq!(arr.value(0), &[0x00, 0xDE, 0xAD, 0xBE, 0xEF]);
+        assert!(arr.is_null(1), "TursoValue::Null should decode to null");
+        assert_eq!(arr.value(2), &[] as &[u8], "empty blob should round-trip");
+    }
+
+    #[test]
+    fn test_convert_timestamp_to_turso_integer_millis_second_overflow_returns_error() {
+        // integer_millis multiplies a seconds value by 1_000; i64::MAX seconds
+        // overflows that multiplication and must return an error rather than
+        // silently wrapping to a bogus millisecond value.
+        let result = convert_timestamp_to_turso(
+            i64::MAX,
+            TimeUnit::Second,
+            None,
+            TimestampFormat::IntegerMillis,
+        );
+        let Err(e) = result else {
+            panic!("i64::MAX seconds should overflow the millisecond conversion");
+        };
+        assert!(
+            e.to_string().contains("overflows millisecond conversion"),
+            "unexpected error message: {e}"
+        );
+
+        // A value that fits must still succeed and be scaled by 1_000.
+        let ok =
+            convert_timestamp_to_turso(5, TimeUnit::Second, None, TimestampFormat::IntegerMillis);
+        let Ok(TursoValue::Integer(millis)) = ok else {
+            panic!("in-range seconds value should convert to an integer millis value");
+        };
+        assert_eq!(millis, 5_000, "5s should convert to 5000ms");
     }
 }
