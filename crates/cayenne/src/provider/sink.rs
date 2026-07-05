@@ -161,6 +161,15 @@ impl DataSink for CayenneDataSink {
             self.write_all_overwrite(normalized, context)
                 .await
                 .map_err(Into::into)
+        } else if let Some(interval) = self.context.stream_publish_interval() {
+            // Append path with bounded publish latency: cut the input stream
+            // into age/size-bounded segments and run a complete
+            // prepare→stage→publish write per segment, so rows on a long-lived
+            // insert stream (e.g. ADBC bulk ingest) become queryable within
+            // ~`interval` of arrival instead of only when the stream ends.
+            self.write_append_segmented(normalized, context, interval)
+                .await
+                .map_err(Into::into)
         } else {
             // Append path: `write_all_append` uses the existing-staging helpers
             // that assume the caller already holds the write lock.
@@ -173,6 +182,108 @@ impl DataSink for CayenneDataSink {
 }
 
 impl CayenneDataSink {
+    /// Append with bounded ingest-to-queryable latency: consume the input in
+    /// segments, each capped by age (`interval`, measured from the segment's
+    /// first buffered batch) and by in-memory size, and run the full existing
+    /// append write (prepare → stage → publish) per segment under the table
+    /// write lock.
+    ///
+    /// Each segment is exactly one pre-existing whole-stream write, so
+    /// durability and crash recovery per segment are unchanged. On a
+    /// mid-stream error, segments already published stay published — the same
+    /// visible state as if the client had sent them as separate requests;
+    /// PK on-conflict handling keeps whole-payload retries convergent.
+    ///
+    /// The size cap bounds buffered memory per active stream (segments are
+    /// buffered before writing): 1/8 of the target file size, clamped to
+    /// [8 MiB, 64 MiB] (64 MiB when size-rolling is disabled).
+    async fn write_append_segmented(
+        &self,
+        mut data: SendableRecordBatchStream,
+        context: &Arc<TaskContext>,
+        interval: std::time::Duration,
+    ) -> super::Result<u64> {
+        const MIN_SEGMENT_BYTES: usize = 8 * 1024 * 1024;
+        const MAX_SEGMENT_BYTES: usize = 256 * 1024 * 1024;
+        let target = self.context.target_file_size_bytes();
+        let byte_cap = if target == 0 {
+            MAX_SEGMENT_BYTES
+        } else {
+            target.clamp(MIN_SEGMENT_BYTES, MAX_SEGMENT_BYTES)
+        };
+
+        let mut total_rows: u64 = 0;
+        let mut segments: u64 = 0;
+        let mut stream_ended = false;
+        while !stream_ended {
+            let mut segment: Vec<arrow::record_batch::RecordBatch> = Vec::new();
+            let mut segment_bytes = 0usize;
+            let mut deadline: Option<tokio::time::Instant> = None;
+            loop {
+                if segment_bytes >= byte_cap {
+                    break;
+                }
+                let next = if let Some(deadline) = deadline {
+                    match tokio::time::timeout_at(deadline, data.next()).await {
+                        Ok(item) => item,
+                        Err(_elapsed) => break,
+                    }
+                } else {
+                    // Empty segment: wait for the first batch without a
+                    // deadline so an idle stream never publishes empties and
+                    // the age budget starts at first buffered data.
+                    data.next().await
+                };
+                match next {
+                    Some(Ok(batch)) => {
+                        segment_bytes += batch.get_array_memory_size();
+                        segment.push(batch);
+                        if deadline.is_none() {
+                            deadline = Some(tokio::time::Instant::now() + interval);
+                        }
+                    }
+                    Some(Err(e)) => return Err(e.into()),
+                    None => {
+                        stream_ended = true;
+                        break;
+                    }
+                }
+            }
+            if segment.is_empty() {
+                continue;
+            }
+            segments += 1;
+            let segment_stream: SendableRecordBatchStream =
+                Box::pin(RecordBatchStreamAdapter::new(
+                    Arc::clone(&self.schema),
+                    futures::stream::iter(segment.into_iter().map(Ok)),
+                ));
+            let segment_start = std::time::Instant::now();
+            let _write_guard = self.table.write_lock().lock().await;
+            let lock_wait_ms = segment_start.elapsed().as_millis();
+            let segment_rows = self.write_all_append(segment_stream, context).await?;
+            total_rows += segment_rows;
+            tracing::warn!(
+                table = self.table.table_name(),
+                segment = segments,
+                rows = segment_rows,
+                bytes = segment_bytes,
+                lock_wait_ms,
+                duration_ms = segment_start.elapsed().as_millis(),
+                "Streaming append segment published"
+            );
+        }
+        if segments > 1 {
+            tracing::debug!(
+                table = self.table.table_name(),
+                segments,
+                rows = total_rows,
+                "Streaming append published in segments"
+            );
+        }
+        Ok(total_rows)
+    }
+
     /// Append data from a record batch stream into the Cayenne table.
     ///
     /// Writes data to the current snapshot (via [`CayenneTableProvider::chunk_and_write_parallel`])
@@ -234,5 +345,141 @@ impl CayenneDataSink {
             .await
             .map_err(super::Error::from)?;
         prepared.finish().await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use arrow::array::Int64Array;
+    use arrow::record_batch::RecordBatch;
+    use arrow_schema::{DataType, Field, Schema};
+    use datafusion::datasource::sink::DataSink;
+    use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+    use datafusion::prelude::SessionContext;
+    use datafusion_expr::dml::InsertOp;
+    use datafusion_table_providers::util::column_reference::ColumnReference;
+    use datafusion_table_providers::util::on_conflict::OnConflict;
+    use tokio::sync::Notify;
+
+    use super::CayenneDataSink;
+    use crate::CayenneCatalog;
+    use crate::MetadataCatalog;
+    use crate::metadata::{CreateTableOptions, VortexConfig};
+    use crate::provider::context::CayenneContext;
+    use crate::provider::table::{CayenneTableProvider, CayenneTableProviderBuilder};
+
+    async fn visible_rows(ctx: &SessionContext, provider: &CayenneTableProvider) -> usize {
+        let df = ctx
+            .read_table(Arc::new(provider.clone_for_write()))
+            .expect("read_table");
+        df.count().await.expect("count")
+    }
+
+    /// The age-bounded segment cut: rows streamed on a still-open append stream
+    /// become queryable within ~`stream_publish_interval_ms`, without waiting
+    /// for the stream to end. Guards the events-mode ingest-to-queryable
+    /// latency fix (long-lived ADBC bulk-ingest streams).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn stream_publish_interval_publishes_before_stream_end() {
+        let ctx = SessionContext::new();
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let metadata_dir = format!("{}/metadata", temp_dir.path().to_str().expect("path"));
+        let data_dir = format!("{}/data", temp_dir.path().to_str().expect("path"));
+        std::fs::create_dir_all(&metadata_dir).expect("metadata dir");
+        let connection_string = format!("sqlite://{metadata_dir}/cayenne.db");
+        let catalog = Arc::new(CayenneCatalog::new(connection_string).expect("catalog"))
+            as Arc<dyn MetadataCatalog>;
+        catalog.init().await.expect("catalog init");
+
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let vortex_config = VortexConfig {
+            stream_publish_interval_ms: 100,
+            ..VortexConfig::default()
+        };
+        let context = CayenneContext::new(&vortex_config, ctx.runtime_env(), "seg_pub");
+        let sink_context = Arc::clone(&context);
+        let options = CreateTableOptions {
+            table_name: "seg_pub".to_string(),
+            schema: Arc::clone(&schema),
+            primary_key: vec!["id".to_string()],
+            on_conflict: Some(OnConflict::Upsert(ColumnReference::new(vec![
+                "id".to_string(),
+            ]))),
+            base_path: data_dir,
+            partition_column: None,
+            vortex_config,
+        };
+        let provider = CayenneTableProviderBuilder::new(Arc::clone(&catalog), ctx.runtime_env())
+            .with_context(context)
+            .create(options)
+            .await
+            .expect("table created");
+
+        let release_second = Arc::new(Notify::new());
+        let release_for_stream = Arc::clone(&release_second);
+        let stream_schema = Arc::clone(&schema);
+        let batches = futures::stream::unfold(0_i64, move |i| {
+            let release = Arc::clone(&release_for_stream);
+            let schema = Arc::clone(&stream_schema);
+            async move {
+                match i {
+                    0 => {
+                        let batch = RecordBatch::try_new(
+                            Arc::clone(&schema),
+                            vec![Arc::new(Int64Array::from(vec![1_i64, 2]))],
+                        )
+                        .expect("batch");
+                        Some((Ok(batch), 1))
+                    }
+                    1 => {
+                        // Hold the stream open until the test observes the
+                        // first segment's rows.
+                        release.notified().await;
+                        let batch = RecordBatch::try_new(
+                            Arc::clone(&schema),
+                            vec![Arc::new(Int64Array::from(vec![3_i64]))],
+                        )
+                        .expect("batch");
+                        Some((Ok(batch), 2))
+                    }
+                    _ => None,
+                }
+            }
+        });
+        let stream = Box::pin(RecordBatchStreamAdapter::new(Arc::clone(&schema), batches));
+
+        let sink = CayenneDataSink::new(
+            provider.clone_for_write(),
+            InsertOp::Append,
+            Arc::clone(&schema),
+            sink_context,
+        );
+        let task_ctx = ctx.task_ctx();
+        let write = tokio::spawn(async move { sink.write_all(stream, &task_ctx).await });
+
+        // Rows from the first batch must become visible while the stream is
+        // still open (the second batch is gated on `release_second`).
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        loop {
+            if visible_rows(&ctx, &provider).await == 2 {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "first segment was not published while the stream was open"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+
+        release_second.notify_one();
+        let written = write.await.expect("join").expect("write_all");
+        assert_eq!(written, 3, "all rows accounted across segments");
+        assert_eq!(
+            visible_rows(&ctx, &provider).await,
+            3,
+            "all rows visible after stream end"
+        );
     }
 }

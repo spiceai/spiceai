@@ -1004,7 +1004,17 @@ impl Runtime {
         // result mid-ingest. So there is no non-degrading cache here — each tick
         // simply broadcasts the current aggregate.
         loop {
-            interval.tick().await;
+            // Rebroadcast on write completion (debounced so a burst of segment
+            // publishes coalesces into one pass) with the interval tick as the
+            // idle heartbeat.
+            let df_for_notify = self.datafusion();
+            tokio::select! {
+                _ = interval.tick() => {}
+                () = df_for_notify.write_completed_notified() => {
+                    tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+                    interval.reset();
+                }
+            }
             let Some(broadcaster) = self.executor_outbound_broadcaster() else {
                 continue;
             };
