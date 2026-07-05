@@ -62,13 +62,25 @@ struct ColumnStatsState {
 pub(crate) enum RowCountUpdate {
     /// Add a signed net delta for this commit (`inserted - superseded - deleted`).
     /// Used by the normal write/CDC-upsert path.
-    Delta(i64),
+    ///
+    /// `exact` records whether this delta is a provably-exact net (e.g. the staged
+    /// path's `inserted - superseded`) or a best-effort estimate that can still
+    /// drift the maintained count (the mem-tier checkpoint delta, whose durable
+    /// supersede netting is best-effort). A `false` here taints
+    /// `TableStatistics::num_rows_exact` so the count is served `Inexact` — the
+    /// COUNT(*) metadata fold then declines rather than answering from a count that
+    /// may over-count. `true` preserves the prior exactness (an exact delta atop an
+    /// already-exact count stays exact); only a [`Self::Set`] re-establishes
+    /// exactness from a tainted state.
+    Delta { delta: i64, exact: bool },
     /// Replace with an authoritative live count. Used by compaction and overwrite
     /// rewrites, which materialize exactly the live rows and so bound any drift
-    /// the incremental deltas might accumulate.
+    /// the incremental deltas might accumulate. Re-establishes
+    /// `num_rows_exact = true`.
     Set(i64),
     /// Leave the count unchanged — rows moved, not added (e.g. the inline-data
-    /// checkpoint flush, whose rows were already counted on insert).
+    /// checkpoint flush, whose rows were already counted on insert). Preserves the
+    /// existing `num_rows_exact`.
     Unchanged,
 }
 

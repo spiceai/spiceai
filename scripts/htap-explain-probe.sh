@@ -51,9 +51,18 @@ mkdir -p "$OUTDIR"
 SQL_URL="http://${HTTP_HOST}:${HTTP_PORT}/v1/sql"
 READY_URL="http://${HTTP_HOST}:${HTTP_PORT}/v1/ready"
 
-# Resolve the query list. "all" enumerates q*.sql (version-sorted so q2 < q10).
+# Resolve the query list. "all" enumerates q*.sql (numeric-sorted so q2 < q10).
 if [ "$EXPLAIN_QUERIES" = "all" ]; then
-  QUERIES=$(cd "$CHBENCH_DIR" 2>/dev/null && ls q*.sql 2>/dev/null | sed 's/\.sql$//' | sort -V)
+  QUERIES="$(
+    if [ -d "$CHBENCH_DIR" ]; then
+      for f in "$CHBENCH_DIR"/q*.sql; do
+        [ -e "$f" ] || continue
+        b=$(basename "$f" .sql)
+        n=${b#q}
+        printf '%s\t%s\n' "$n" "$b"
+      done | sort -n -k1,1 | cut -f2 | paste -sd' ' -
+    fi
+  )"
 else
   QUERIES="$EXPLAIN_QUERIES"
 fi
@@ -98,10 +107,29 @@ done
 
 echo "htap-explain-probe: probing [$(echo "$QUERIES" | tr '\n' ' ')] every ${EXPLAIN_INTERVAL}s -> $OUTDIR/<query>_{explain,analyze}_<ts>.txt"
 
-# Probe until spiced exits. The parent harness normally kills this sampler when
-# the run ends; the pgrep check is a self-terminating fallback.
+# Probe until the associated spiced exits. The parent harness normally kills this
+# sampler when the run ends; this PID check is a self-terminating fallback.
+# Prefer the newest matching spiced (-n): on a shared dev box or CI host an
+# older long-running spiced would otherwise be picked, causing us to probe (or
+# self-terminate against) an unrelated instance. Set SPICED_PID explicitly to
+# override this heuristic when several spiced processes are running.
+SPICED_PID="${SPICED_PID:-}"
+if [ -z "$SPICED_PID" ]; then
+  SPICED_PID="$(pgrep -x -n spiced 2>/dev/null || true)"
+fi
+case "$SPICED_PID" in
+  '' | *[!0-9]*)
+    echo "htap-explain-probe: could not resolve a single numeric spiced PID (got '${SPICED_PID:-<empty>}'); set SPICED_PID explicitly to disambiguate; exiting" >&2
+    exit 0
+    ;;
+esac
+if ! ps -p "$SPICED_PID" -o comm= 2>/dev/null | grep -qx 'spiced'; then
+  echo "htap-explain-probe: resolved SPICED_PID=$SPICED_PID is not a running spiced process; exiting" >&2
+  exit 0
+fi
+
 round=0
-while pgrep -x spiced >/dev/null 2>&1; do
+while kill -0 "$SPICED_PID" 2>/dev/null && ps -p "$SPICED_PID" -o comm= 2>/dev/null | grep -qx 'spiced'; do
   round=$((round + 1))
   round_start=$SECONDS
   n=0
