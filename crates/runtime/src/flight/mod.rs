@@ -38,7 +38,6 @@ use arrow_flight::{
     Ticket, flight_service_server::FlightServiceServer,
 };
 use arrow_ipc::{CompressionType, writer::IpcWriteOptions};
-use async_stream::try_stream;
 use bytes::Bytes;
 use cache::result::{CacheStatus, query::QueryResult};
 use datafusion::common::ParamValues;
@@ -374,62 +373,16 @@ impl Service {
         // and applies back-pressure under real pressure.
         let account = EgressAccount::register(memory_pool, "flight_egress");
 
-        // Without a dedicated CPU runtime, encode inline on the caller's (IO)
-        // runtime as before. This preserves the historical behavior when
-        // `runtime.params.dedicated_thread_pool=disabled`.
-        let Some(cpu_handle) = cpu_runtime else {
-            let flights_stream = try_stream! {
-                let schema_size = flight_data_size(&schema_flight_data);
-                account.reserve(schema_size).await;
-                yield schema_flight_data;
-                account.release(schema_size);
-
-                // Use fused stream for better performance
-                let mut data_stream = data_stream.fuse();
-
-                while let Some(batch_result) = data_stream.next().await {
-                    match batch_result {
-                        Ok(batch) => {
-                            let (dicts, batch_data) = encode_flight_batch(
-                                batch,
-                                needs_view_cast,
-                                &schema,
-                                &encoder,
-                                &mut dict_tracker,
-                                &options,
-                                &mut compression_context,
-                            )?;
-
-                            // Yield dictionaries first
-                            for dict in dicts {
-                                let dict_size = flight_data_size(&dict);
-                                account.reserve(dict_size).await;
-                                yield dict;
-                                account.release(dict_size);
-                            }
-                            let batch_size = flight_data_size(&batch_data);
-                            account.reserve(batch_size).await;
-                            yield batch_data;
-                            account.release(batch_size);
-                        }
-                        Err(e) => {
-                            let e = find_datafusion_root(e);
-                            Err(handle_datafusion_error(e))?;
-                        }
-                    }
-                }
-            };
-
-            return (flights_stream.boxed(), cache_status);
-        };
-
-        // Offload IPC encoding onto the dedicated CPU runtime so serialization
-        // does not contend with socket servicing on the IO runtime, which drives
-        // every concurrent query's response. A small bounded channel provides
-        // back-pressure (so egress memory stays bounded and a slow client stalls
-        // execution) while letting the encode of batch N overlap the socket
-        // write of batch N-1 — so this reduces transfer time without adding to
-        // first-byte latency.
+        // Encode on the dedicated CPU runtime when one is configured, otherwise on
+        // the current (IO) runtime — the fallback when
+        // `runtime.params.dedicated_thread_pool=disabled`. Either way encoding runs
+        // as a task feeding a small bounded channel: it never blocks the tonic
+        // response writer inline, the channel back-pressures so egress memory stays
+        // bounded (and a slow client stalls execution), and the encode of batch N
+        // overlaps the socket write of batch N-1, reducing transfer time. With a
+        // dedicated CPU runtime that overlap is free; on the shared IO-runtime
+        // fallback the spawn costs one scheduling hop before the first byte.
+        let encode_runtime = cpu_runtime.unwrap_or_else(Handle::current);
         let (tx, rx) = mpsc::channel::<Result<FlightData, Status>>(FLIGHT_ENCODE_CHANNEL_CAPACITY);
         let span = Span::current();
 
@@ -483,12 +436,12 @@ impl Service {
             }
         };
 
-        let encode_handle = cpu_handle.spawn(request_context.scope(encode_task).instrument(span));
+        let encode_handle =
+            encode_runtime.spawn(request_context.scope(encode_task).instrument(span));
 
         let stream = FlightEncodeStream {
             receiver: ReceiverStream::new(rx),
             encode_handle: Some(encode_handle),
-            encode_error: None,
             account,
         };
 
@@ -510,16 +463,15 @@ impl Service {
     }
 }
 
-/// Number of already-encoded `FlightData` messages buffered between the
-/// off-IO-runtime encode task and the tonic response writer. Kept small so
-/// per-stream egress memory stays bounded, while still letting the encode of
-/// batch N overlap the socket write of batch N-1.
+/// Number of already-encoded `FlightData` messages buffered between the encode
+/// task and the tonic response writer. Kept small so per-stream egress memory
+/// stays bounded, while still letting the encode of batch N overlap the socket
+/// write of batch N-1.
 const FLIGHT_ENCODE_CHANNEL_CAPACITY: usize = 2;
 
 /// Encode one [`RecordBatch`] into its Flight dictionary + record-batch
 /// messages, applying the `Utf8View`/`BinaryView` → `Large*` cast when the
-/// advertised schema was expanded. Shared by the inline and off-runtime encode
-/// paths so both stay byte-for-byte identical on the wire.
+/// advertised schema was expanded.
 fn encode_flight_batch(
     batch: RecordBatch,
     needs_view_cast: bool,
@@ -553,19 +505,22 @@ fn flight_data_size(flight_data: &FlightData) -> usize {
     flight_data.data_header.len() + flight_data.data_body.len() + flight_data.app_metadata.len()
 }
 
-/// Response stream for the off-runtime Flight encode pipeline. Wraps the
-/// receiver of already-encoded [`FlightData`] and owns the encode task's
-/// [`JoinHandle`] so that:
-///   1. a panic in the encode task surfaces as a stream error instead of a
-///      silent truncation (which would look like a successful short result), and
+/// Response stream for the Flight encode pipeline. Wraps the receiver of
+/// already-encoded [`FlightData`] and owns the encode task's [`JoinHandle`] so
+/// that:
+///   1. buffered messages are drained first, then a panic — or an unexpected
+///      cancellation (e.g. runtime shutdown) — of the encode task surfaces as a
+///      stream error instead of a silent truncation (which would look like a
+///      successful short result), and
 ///   2. dropping the response stream (client disconnect) aborts the encode task,
 ///      which in turn drops the upstream execution stream.
 ///
-/// Mirrors the `RuntimeDriverStream` pattern used for execution offload.
+/// Uses the same join-handle-backed approach as `RuntimeDriverStream` (execution
+/// offload); unlike that stream it polls drain-first (point 1 above) rather than
+/// observing the handle first.
 struct FlightEncodeStream {
     receiver: ReceiverStream<Result<FlightData, Status>>,
     encode_handle: Option<JoinHandle<()>>,
-    encode_error: Option<Status>,
     /// Egress reservation shared with the encode task. The encode task reserves
     /// each message's bytes before it enters the channel; we release them here
     /// as each message is handed to tonic. Dropping this (client disconnect)
@@ -582,37 +537,36 @@ impl Stream for FlightEncodeStream {
     ) -> Poll<Option<Self::Item>> {
         let this = self.get_mut();
 
-        // Observe the encode task's terminal state so a panic becomes a stream
-        // error rather than a silent end-of-stream. Buffered messages already in
-        // the channel are still drained below.
-        if let Some(handle) = this.encode_handle.as_mut() {
-            match Future::poll(Pin::new(handle), cx) {
-                Poll::Ready(Ok(())) => {
-                    this.encode_handle = None;
-                }
-                Poll::Ready(Err(err)) => {
-                    this.encode_handle = None;
-                    if err.is_panic() {
-                        this.encode_error = Some(Status::internal(format!(
-                            "Flight encode task panicked: {err}"
-                        )));
-                    }
-                    // A cancelled task means we aborted it on drop; nothing to surface.
-                }
-                Poll::Pending => {}
+        // Drain already-encoded messages first, so a panic/cancellation surfaces
+        // only after the client has received everything the encode task sent.
+        if let Some(item) = std::task::ready!(Pin::new(&mut this.receiver).poll_next(cx)) {
+            if let Ok(flight_data) = &item {
+                // Message handed to tonic — release its egress reservation.
+                this.account.release(flight_data_size(flight_data));
             }
+            return Poll::Ready(Some(item));
         }
 
-        if let Some(err) = this.encode_error.take() {
-            return Poll::Ready(Some(Err(err)));
+        // Channel closed: the encode task has ended. Surface a panic — or an
+        // unexpected cancellation that we did not trigger via `Drop::abort` (e.g.
+        // runtime shutdown) — as a stream error rather than a silent end-of-stream
+        // that would look like a successful short result. While the channel is
+        // closed but the handle has not resolved yet, `ready!` yields `Pending` so
+        // a panic is still reported instead of ending silently.
+        let Some(handle) = this.encode_handle.as_mut() else {
+            return Poll::Ready(None);
+        };
+        let result = std::task::ready!(Future::poll(Pin::new(handle), cx));
+        this.encode_handle = None;
+        match result {
+            Ok(()) => Poll::Ready(None),
+            Err(err) if err.is_panic() => Poll::Ready(Some(Err(Status::internal(format!(
+                "Flight encode task panicked: {err}"
+            ))))),
+            Err(_) => Poll::Ready(Some(Err(Status::internal(
+                "Flight encode task was cancelled before completing",
+            )))),
         }
-
-        let polled = Pin::new(&mut this.receiver).poll_next(cx);
-        if let Poll::Ready(Some(Ok(flight_data))) = &polled {
-            // Message handed to tonic — release its egress reservation.
-            this.account.release(flight_data_size(flight_data));
-        }
-        polled
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {

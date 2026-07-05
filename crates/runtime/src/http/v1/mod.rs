@@ -654,4 +654,68 @@ mod tests {
             serde_json::from_str::<serde_json::Value>(&result_with_sql).expect("to parse")
         );
     }
+
+    /// The chunked `/v1/sql` JSON body must be byte-identical to the buffered
+    /// `arrow_to_json` output across multi-batch, empty, and NULL cases.
+    #[tokio::test]
+    async fn json_array_body_stream_matches_buffered_output() {
+        use arrow::array::ArrayRef;
+        use datafusion::error::DataFusionError;
+        use datafusion::execution::memory_pool::{MemoryPool, UnboundedMemoryPool};
+        use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, true),
+            Field::new("name", DataType::Utf8, true),
+        ]));
+        let make = |ids: Vec<Option<i64>>, names: Vec<Option<&str>>| {
+            RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![
+                    Arc::new(Int64Array::from(ids)) as ArrayRef,
+                    Arc::new(StringArray::from(names)) as ArrayRef,
+                ],
+            )
+            .expect("record batch")
+        };
+
+        let cases: Vec<Vec<RecordBatch>> = vec![
+            // Multiple batches, an empty batch mid-stream, and NULL values.
+            vec![
+                make(vec![Some(1), None], vec![Some("a"), Some("b")]),
+                make(vec![], vec![]),
+                make(vec![Some(3)], vec![None]),
+            ],
+            // Empty result.
+            vec![],
+            // Single empty batch.
+            vec![make(vec![], vec![])],
+        ];
+
+        for batches in cases {
+            let expected = write_to_json_string(&batches).expect("buffered json");
+
+            let pool: Arc<dyn MemoryPool> = Arc::new(UnboundedMemoryPool::default());
+            let account = EgressAccount::register(&pool, "test_egress");
+
+            let mut batches = batches.into_iter();
+            let first = batches.next();
+            let rest: SendableRecordBatchStream = Box::pin(RecordBatchStreamAdapter::new(
+                Arc::clone(&schema),
+                futures::stream::iter(batches.map(Ok::<_, DataFusionError>)),
+            ));
+
+            let mut body = std::pin::pin!(json_array_body_stream(first, rest, account));
+            let mut streamed = Vec::new();
+            while let Some(chunk) = body.next().await {
+                streamed.extend_from_slice(&chunk.expect("chunk"));
+            }
+
+            assert_eq!(
+                String::from_utf8(streamed).expect("utf8"),
+                expected,
+                "streamed JSON must match buffered arrow_to_json output"
+            );
+        }
+    }
 }
