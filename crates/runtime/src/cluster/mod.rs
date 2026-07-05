@@ -2485,10 +2485,13 @@ mod tests {
 
         // Valid overrides apply; invalid and zero values fall back to the default.
         let params: HashMap<String, String> = [
-            ("cluster_grpc_http2_keep_alive_interval_seconds", "30"),
-            ("cluster_grpc_keep_alive_timeout_seconds", "0"),
-            ("cluster_grpc_timeout_seconds", "not-a-number"),
-            ("cluster_grpc_tcp_keep_alive_seconds", "120"),
+            (
+                super::CLUSTER_GRPC_HTTP2_KEEP_ALIVE_INTERVAL_SECONDS_PARAM,
+                "30",
+            ),
+            (super::CLUSTER_GRPC_KEEP_ALIVE_TIMEOUT_SECONDS_PARAM, "0"),
+            (super::CLUSTER_GRPC_TIMEOUT_SECONDS_PARAM, "not-a-number"),
+            (super::CLUSTER_GRPC_TCP_KEEP_ALIVE_SECONDS_PARAM, "120"),
         ]
         .into_iter()
         .map(|(k, v)| (k.to_string(), v.to_string()))
