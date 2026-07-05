@@ -150,6 +150,7 @@ pub const EXPECTED_TABLES: &[ExpectedTable] = &[
             "file_size_bytes",
             "min_sequence",
             "max_sequence",
+            "digest",
         ],
     },
     ExpectedTable {

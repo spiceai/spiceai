@@ -11330,6 +11330,137 @@ impl CayenneTableProvider {
         Ok(files)
     }
 
+    /// Whether end-to-end integrity checksums are enabled for this table (WAL
+    /// records and Vortex data files). Provider-level accessor so sibling
+    /// modules (e.g. `staging_wal`) can read the flag without touching the
+    /// private `context` field.
+    pub(crate) fn integrity_checksums(&self) -> bool {
+        self.context.integrity_checksums()
+    }
+
+    /// Read the full bytes of a published data file, for integrity-digest
+    /// compute (at flush) or verification (before first read). `file_name` is
+    /// the snapshot-relative name as returned by
+    /// [`Self::list_snapshot_files_with_sizes`]. This is a whole-file read, so
+    /// it runs only when `integrity_checksums` is enabled.
+    async fn read_data_file_bytes(&self, snapshot_id: &str, file_name: &str) -> Result<Vec<u8>> {
+        if self.table_metadata.path.starts_with("s3://") {
+            let Some(prefix) = self.snapshot_object_store_prefix(snapshot_id)? else {
+                return Err(Error::Internal {
+                    table: self.table_metadata.table_name.clone(),
+                    message: format!(
+                        "cannot resolve object-store prefix for snapshot '{snapshot_id}' to read '{file_name}'"
+                    ),
+                });
+            };
+            let config = self.require_object_store()?;
+            let path = ObjectStorePath::from(format!("{}{file_name}", prefix.as_ref()));
+            let result = config
+                .store
+                .get(&path)
+                .await
+                .map_err(|e| Error::ObjectStore {
+                    operation: "read data file for integrity digest",
+                    table: self.table_metadata.table_name.clone(),
+                    source: e,
+                })?;
+            let bytes = result.bytes().await.map_err(|e| Error::ObjectStore {
+                operation: "read data file for integrity digest",
+                table: self.table_metadata.table_name.clone(),
+                source: e,
+            })?;
+            Ok(bytes.to_vec())
+        } else {
+            let path = self.snapshot_dir_path_for(snapshot_id).join(file_name);
+            Ok(tokio::fs::read(path).await?)
+        }
+    }
+
+    /// Verify the integrity digest of every manifest data file that has one and
+    /// has not yet been verified this process (see
+    /// [`crate::provider::file_digest`]). Reads each such file's bytes once and
+    /// caches the pass, so this is the "verify on first read" bound — no
+    /// steady-state per-scan cost once every file is verified.
+    ///
+    /// A digest mismatch fails the scan as a **detected fault** rather than
+    /// letting corrupted bytes decode into silently-wrong rows. Files without a
+    /// stored digest (integrity was off at flush, or a pre-feature row) are
+    /// skipped — they are unverifiable, not corrupt. A no-op unless
+    /// `integrity_checksums` is enabled.
+    async fn verify_data_file_integrity(&self) -> datafusion_common::Result<()> {
+        if !self.context.integrity_checksums() {
+            return Ok(());
+        }
+
+        let table_id = self.table_metadata.table_id.clone();
+        let files = self
+            .catalog
+            .get_all_snapshot_files(&table_id)
+            .await
+            .map_err(|e| {
+                datafusion_common::DataFusionError::Execution(format!(
+                    "Failed to load manifest for integrity verification of table {}: {e}",
+                    self.table_metadata.table_name
+                ))
+            })?;
+
+        for file in files {
+            let Some(stored) = file.digest.as_deref() else {
+                continue;
+            };
+            let key = format!("{}/{}", file.snapshot_id, file.file_path);
+            if self.context.is_data_file_verified(&key) {
+                continue;
+            }
+
+            let bytes = match self
+                .read_data_file_bytes(&file.snapshot_id, &file.file_path)
+                .await
+            {
+                Ok(bytes) => bytes,
+                // The manifest can transiently list a file the scan will not
+                // actually read (e.g. a retired snapshot's row not yet pruned).
+                // A file we cannot read is not proof of corruption — skip it. If
+                // the scan genuinely needs the file, it fails on its own read
+                // path. Only a digest MISMATCH is treated as a detected fault.
+                Err(error) => {
+                    tracing::debug!(
+                        table = self.table_metadata.table_name.as_str(),
+                        snapshot_id = file.snapshot_id.as_str(),
+                        file = file.file_path.as_str(),
+                        %error,
+                        "skipping integrity verification: data file not readable",
+                    );
+                    continue;
+                }
+            };
+
+            match super::file_digest::check(stored, &bytes) {
+                super::file_digest::DigestCheck::Match => {
+                    self.context.mark_data_file_verified(key);
+                }
+                super::file_digest::DigestCheck::Mismatch => {
+                    return Err(datafusion_common::DataFusionError::Execution(format!(
+                        "Data-file integrity check FAILED for '{}' in snapshot '{}' of table {}: \
+                         stored digest {stored} does not match the file contents (corruption \
+                         detected). Refusing to return possibly-wrong rows.",
+                        file.file_path, file.snapshot_id, self.table_metadata.table_name,
+                    )));
+                }
+                super::file_digest::DigestCheck::Unsupported => {
+                    tracing::debug!(
+                        table = self.table_metadata.table_name.as_str(),
+                        file = file.file_path.as_str(),
+                        stored,
+                        "skipping integrity verification: unsupported/unparseable digest algorithm",
+                    );
+                }
+            }
+        }
+
+        Ok(())
+    }
+
     /// Returns true if the file name looks like a compactable Vortex data file
     /// (and not a hidden file or staging-WAL artifact).
     fn is_compactable_data_file(name: &str) -> bool {
@@ -11401,16 +11532,22 @@ impl CayenneTableProvider {
         // existing ranges could clobber a compaction-authored merged `[min, max]`
         // with the per-file fallback and overstate `min_sequence` (an unsafe
         // reference-in-place input for the seq-prefix bake).
-        let existing: std::collections::HashMap<String, (i64, i64)> = match tag {
+        let existing: std::collections::HashMap<String, (i64, i64, Option<String>)> = match tag {
             ManifestSequenceTag::PreserveOrUniform { .. } => self
                 .catalog
                 .get_snapshot_files(&table_id, snapshot_id)
                 .await?
                 .into_iter()
-                .map(|f| (f.file_path, (f.min_sequence, f.max_sequence)))
+                .map(|f| (f.file_path, (f.min_sequence, f.max_sequence, f.digest)))
                 .collect(),
             ManifestSequenceTag::Uniform { .. } => std::collections::HashMap::new(),
         };
+
+        // Compute a per-file integrity digest only when the feature is enabled.
+        // Vortex data files are immutable once published, so a digest already
+        // recorded for this (snapshot, file) is reused rather than recomputed —
+        // bounding the whole-file read-back to a file's first appearance.
+        let compute_digests = self.context.integrity_checksums();
 
         for (file_name, size) in &files {
             // Reuse the per-file footer row count when the scan path already
@@ -11425,6 +11562,7 @@ impl CayenneTableProvider {
                 .flatten()
                 .map_or(0, |stats| stats.num_rows);
 
+            let existing_entry = existing.get(file_name);
             let (min_sequence, max_sequence) = match tag {
                 ManifestSequenceTag::Uniform { min, max } => (min, max),
                 // Preserve a compaction-authored merged range; for a brand-new
@@ -11433,9 +11571,39 @@ impl CayenneTableProvider {
                 // snapshot (conservative: `min = 0` keeps it always
                 // bake-eligible, never wrongly referenced, never resurrecting a
                 // deleted row).
-                ManifestSequenceTag::PreserveOrUniform { min, max } => {
-                    existing.get(file_name).copied().unwrap_or((min, max))
+                ManifestSequenceTag::PreserveOrUniform { min, max } => existing_entry
+                    .map_or((min, max), |(existing_min, existing_max, _)| {
+                        (*existing_min, *existing_max)
+                    }),
+            };
+
+            // Reuse a digest a prior flush already recorded for this immutable
+            // file (preserved even when the feature is now off, so toggling off
+            // never wipes it); otherwise compute one from the file bytes when
+            // the feature is on.
+            let digest = if let Some(existing_digest) =
+                existing_entry.and_then(|(_, _, digest)| digest.clone())
+            {
+                Some(existing_digest)
+            } else if compute_digests {
+                match self.read_data_file_bytes(snapshot_id, file_name).await {
+                    Ok(bytes) => Some(super::file_digest::compute(&bytes)),
+                    // A digest is a best-effort integrity aid; a transient
+                    // read-back failure must not abort the commit. Leave it
+                    // unset (the file stays unverifiable) and surface the miss.
+                    Err(error) => {
+                        tracing::warn!(
+                            table = self.table_metadata.table_name.as_str(),
+                            snapshot_id,
+                            file = file_name.as_str(),
+                            %error,
+                            "could not read data file to compute integrity digest; leaving it unset",
+                        );
+                        None
+                    }
                 }
+            } else {
+                None
             };
 
             self.catalog
@@ -11447,6 +11615,7 @@ impl CayenneTableProvider {
                     file_size_bytes: i64::try_from(*size).unwrap_or(i64::MAX),
                     min_sequence,
                     max_sequence,
+                    digest,
                 })
                 .await?;
         }
@@ -21346,6 +21515,13 @@ impl TableProvider for CayenneTableProvider {
             Self::register_object_store_if_needed(state.runtime_env(), cold_config);
         }
 
+        // End-to-end data-file integrity: when enabled, verify each manifest
+        // file's stored digest once before serving reads from it. A mismatch
+        // fails the scan as a detected fault instead of decoding corrupted bytes
+        // into silently-wrong rows. No-op (and zero I/O) when the feature is off
+        // or once every file has been verified this process.
+        self.verify_data_file_integrity().await?;
+
         // Warm the inlined cache before taking the consistency guards so the
         // read under `scan_state_lock` is a cheap cache hit in the common case.
         // If a writer invalidates the cache after this point, the guarded
@@ -29016,6 +29192,7 @@ mod tests {
                 file_size_bytes: 1,
                 min_sequence: 0,
                 max_sequence: 0,
+                digest: None,
             })
             .await
             .expect("seed a sentinel manifest row");
@@ -29193,6 +29370,7 @@ mod tests {
                     file_size_bytes: 100,
                     min_sequence: seq,
                     max_sequence: seq,
+                    digest: None,
                 })
                 .await
                 .expect("upsert manifest row");
@@ -29258,6 +29436,7 @@ mod tests {
                     file_size_bytes: 100,
                     min_sequence: min_seq,
                     max_sequence: max_seq,
+                    digest: None,
                 })
                 .await
                 .expect("upsert manifest row");
@@ -29435,6 +29614,7 @@ mod tests {
                         file_size_bytes: i64::try_from(size).unwrap_or(0),
                         min_sequence: seq,
                         max_sequence: seq,
+                        digest: None,
                     })
                     .await
                     .expect("pin manifest sequence");
@@ -29612,6 +29792,7 @@ mod tests {
                         file_size_bytes: i64::try_from(size).unwrap_or(0),
                         min_sequence: seq,
                         max_sequence: seq,
+                        digest: None,
                     })
                     .await
                     .expect("pin manifest sequence");
@@ -30009,6 +30190,7 @@ mod tests {
                         file_size_bytes: i64::try_from(size).unwrap_or(0),
                         min_sequence: seq,
                         max_sequence: seq,
+                        digest: None,
                     })
                     .await
                     .expect("re-pin manifest sequence");
@@ -30114,6 +30296,7 @@ mod tests {
                     file_size_bytes: i64::try_from(size).unwrap_or(0),
                     min_sequence: 5, // <= T=20: the write-range trap
                     max_sequence: 5,
+                    digest: None,
                 })
                 .await
                 .expect("pin low write-range");
@@ -30495,6 +30678,7 @@ mod tests {
             file_size_bytes: 100,
             min_sequence: 1,
             max_sequence: 1,
+            digest: None,
         };
         let all_rows = vec![
             // current snapshot owns one file...
@@ -30543,6 +30727,7 @@ mod tests {
             file_size_bytes: 100,
             min_sequence: 1,
             max_sequence: 1,
+            digest: None,
         };
         for row in [
             mk("snapA", "a0.vortex"),

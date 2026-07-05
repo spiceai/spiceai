@@ -1112,6 +1112,143 @@ async fn test_wal_with_files_in_snapshot_self_heals_impl(
 }
 
 // ============================================================================
+// Integrity checksums (#11639): a checksum-framed staging WAL that fails its
+// integrity check is DETECTED and DISCARDED on recovery (not parsed as garbage
+// nor surfaced as a fatal "manual resolution" fault), converging to the last
+// committed snapshot. Covers the corrupt/truncated WAL-tail acceptance case.
+// ============================================================================
+
+test_with_backends!(test_corrupt_framed_wal_discarded_on_recovery_impl);
+
+async fn test_corrupt_framed_wal_discarded_on_recovery_impl(
+    fixture: common::TestFixture,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let vortex_config = cayenne::metadata::VortexConfig {
+        integrity_checksums: true,
+        inline_max_rows: 0,
+        compaction_background_interval_ms: 0,
+        ..Default::default()
+    };
+    let (table, ctx) = setup_table_with_context(&fixture, "wal_corrupt", vortex_config).await;
+
+    // Baseline committed data — the "last durably-acknowledged state" recovery
+    // must converge to.
+    common::insert_batch(&table, make_batch(&[1, 2, 3], &["a", "b", "c"])).await?;
+    assert_staging_empty(&staging_dir(&table));
+
+    // Plant an un-finalized staged append whose WAL is a checksum-framed record
+    // with a corrupted (mismatching) checksum — the on-disk shape of a torn
+    // write or bit-rot. A dummy staged file rides along so discarding the record
+    // also drops its orphaned staged data.
+    let corrupt_dir = staging_child_dir(&table, "manual-corrupt");
+    std::fs::create_dir_all(&corrupt_dir)?;
+    std::fs::write(
+        corrupt_dir.join("orphan-000.vortex"),
+        b"not a real vortex file",
+    )?;
+    let payload = br#"{"table_name":"wal_corrupt","target_snapshot":"snap-x","target_kind":"current_snapshot","staged_files":["orphan-000.vortex"],"created_at":"2026-07-05T00:00:00Z"}"#;
+    std::fs::write(
+        corrupt_dir.join(STAGING_WAL_FILENAME),
+        corrupt_framed_wal_bytes(payload),
+    )?;
+
+    // Drive recovery through the staging path. It must NOT error — the corrupt
+    // record is discarded, not surfaced as a fatal fault — and the new append
+    // must commit cleanly.
+    let staged = begin_staged_append_with_rows(&table, &[(4, "d")]).await?;
+    staged.commit().await?;
+
+    assert!(
+        !corrupt_dir.exists(),
+        "recovery must discard the corrupt staging WAL and its orphaned staged files"
+    );
+
+    // Converged to the last committed state plus the new append; the corrupt
+    // append's data never appears (it was never committed).
+    let rows = query_all(&ctx, "wal_corrupt").await;
+    assert_eq!(
+        rows,
+        vec![
+            (1, "a".to_string()),
+            (2, "b".to_string()),
+            (3, "c".to_string()),
+            (4, "d".to_string()),
+        ]
+    );
+
+    Ok(())
+}
+
+// ============================================================================
+// Integrity checksums (#11639): a corrupted Vortex DATA file is detected on
+// read as a fault (error), never returned as silently-wrong rows. The digest
+// is computed at flush (here via the overwrite path, which authors the
+// manifest) and verified before the file is first scanned.
+// ============================================================================
+
+test_with_backends!(test_corrupt_data_file_detected_on_read_impl);
+
+async fn test_corrupt_data_file_detected_on_read_impl(
+    fixture: common::TestFixture,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let vortex_config = cayenne::metadata::VortexConfig {
+        integrity_checksums: true,
+        inline_max_rows: 0,
+        compaction_background_interval_ms: 0,
+        ..Default::default()
+    };
+    let (table, ctx) = setup_table_with_context(&fixture, "data_corrupt", vortex_config).await;
+
+    // Overwrite writes fresh `.vortex` files AND authors the manifest, which
+    // (with integrity on) computes and stores each file's digest.
+    overwrite_batch(&table, make_batch(&[1, 2, 3, 4], &["a", "b", "c", "d"])).await?;
+
+    // Locate the published data file via the manifest — the same source
+    // `verify_data_file_integrity` reads — so this does not depend on the
+    // provider's in-memory current-snapshot id (the overwrite advances it on a
+    // clone). Asserting a digest was recorded also proves the compute-at-flush
+    // path ran.
+    let meta = table.metadata();
+    let files = fixture
+        .catalog
+        .get_all_snapshot_files(&meta.table_id)
+        .await?;
+    let digested = files
+        .iter()
+        .find(|f| f.digest.is_some())
+        .expect("overwrite with integrity on must record a digested data file in the manifest");
+    let vortex_file = PathBuf::from(&meta.path)
+        .join(&meta.table_id)
+        .join(&digested.snapshot_id)
+        .join(&digested.file_path);
+    assert!(
+        vortex_file.exists(),
+        "manifest-listed data file should exist on disk: {}",
+        vortex_file.display()
+    );
+
+    // Corrupt it in place — silent bit-rot of committed data. Do this BEFORE any
+    // scan so the (once-per-process) verification runs against the corrupted
+    // bytes rather than a cached pass.
+    flip_middle_byte(&vortex_file)?;
+
+    // The first read of the corrupted file must FAIL as a detected fault, not
+    // return silently-wrong rows.
+    let df = ctx.sql("SELECT * FROM data_corrupt").await?;
+    let result = df.collect().await;
+    let Err(err) = result else {
+        panic!("expected a detected-fault error reading a corrupted data file, got Ok");
+    };
+    let msg = err.to_string();
+    assert!(
+        msg.contains("integrity check FAILED") || msg.to_lowercase().contains("corruption"),
+        "expected an integrity/corruption error, got: {msg}"
+    );
+
+    Ok(())
+}
+
+// ============================================================================
 // Test 18: Writer with pending staging WAL while inline compaction runs.
 // This exercises the mutation writer + compaction interaction under the
 // new pre-recovery audit. A writer that has written its WAL but not yet
@@ -1397,6 +1534,56 @@ fn write_manual_staging_wal(
     Ok(wal_path)
 }
 
+/// Build a checksum-framed staging-WAL record with a DELIBERATELY wrong
+/// checksum, so Cayenne's recovery detects the mismatch and discards it.
+/// Mirrors the `cayenne::provider::wal_checksum` wire format; the leading bytes
+/// MUST equal `wal_checksum::MAGIC` for the record to be recognized as framed
+/// (an unframed blob is instead treated as a legacy pre-feature pure-JSON
+/// record and parsed directly).
+fn corrupt_framed_wal_bytes(payload: &[u8]) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(b"CAYWALv1"); // wal_checksum::MAGIC
+    bytes.push(1); // wal_checksum::FORMAT_VERSION
+    bytes.extend_from_slice(&(payload.len() as u64).to_le_bytes());
+    bytes.extend_from_slice(&0u64.to_le_bytes()); // wrong checksum (real XXH3 is never 0 here)
+    bytes.extend_from_slice(payload);
+    bytes
+}
+
+/// Flip a byte in the middle of a file on disk to simulate silent bit-rot.
+fn flip_middle_byte(path: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
+    let mut bytes = std::fs::read(path)?;
+    assert!(
+        !bytes.is_empty(),
+        "data file to corrupt should not be empty"
+    );
+    let mid = bytes.len() / 2;
+    bytes[mid] ^= 0xFF;
+    std::fs::write(path, bytes)?;
+    Ok(())
+}
+
+/// Insert a batch in OVERWRITE mode via the public `insert_into` API. Unlike a
+/// plain append, the overwrite path authors the snapshot manifest, which is
+/// where per-file integrity digests are computed and stored.
+async fn overwrite_batch(
+    provider: &CayenneTableProvider,
+    batch: RecordBatch,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let ctx = SessionContext::new();
+    let schema = Arc::clone(batch.schema_ref());
+    let exec = datafusion::datasource::memory::MemorySourceConfig::try_new_exec(
+        &[vec![batch]],
+        schema,
+        None,
+    )?;
+    let plan = provider
+        .insert_into(&ctx.state(), exec, InsertOp::Overwrite)
+        .await?;
+    collect(plan, ctx.task_ctx()).await?;
+    Ok(())
+}
+
 fn staging_wal_paths(table: &CayenneTableProvider) -> Vec<PathBuf> {
     let root = staging_dir(table);
     if !root.exists() {
@@ -1537,6 +1724,41 @@ async fn setup_table_with_vortex_config(
     ctx.register_table(table_name, Arc::clone(&table) as Arc<dyn TableProvider>)
         .expect("register");
 
+    (table, ctx)
+}
+
+/// Like [`setup_table_with_vortex_config`] but injects a `CayenneContext` built
+/// from the config, mirroring how the accelerator factory constructs a provider
+/// (`with_context`). Required for `#[serde(skip)]` runtime-only config fields
+/// (e.g. `integrity_checksums`, `force_view_read_schema`) to reach the provider:
+/// the bare `create_table` path rebuilds the context from the metastore-reloaded
+/// config, which drops those non-persisted fields.
+async fn setup_table_with_context(
+    fixture: &common::TestFixture,
+    table_name: &str,
+    vortex_config: cayenne::metadata::VortexConfig,
+) -> (Arc<CayenneTableProvider>, SessionContext) {
+    let table_options = CreateTableOptions {
+        table_name: table_name.to_string(),
+        schema: test_schema(),
+        primary_key: vec![],
+        on_conflict: None,
+        base_path: fixture.data_path.to_string_lossy().to_string(),
+        partition_column: None,
+        vortex_config: vortex_config.clone(),
+    };
+    let catalog: Arc<dyn MetadataCatalog> =
+        Arc::clone(&fixture.catalog) as Arc<dyn MetadataCatalog>;
+    let ctx = SessionContext::new();
+    let context = cayenne::CayenneContext::new(&vortex_config, ctx.runtime_env(), table_name);
+    let table = cayenne::CayenneTableProviderBuilder::new(catalog, ctx.runtime_env())
+        .with_context(context)
+        .create(table_options)
+        .await
+        .expect("create table with injected context");
+    let table = Arc::new(table);
+    ctx.register_table(table_name, Arc::clone(&table) as Arc<dyn TableProvider>)
+        .expect("register");
     (table, ctx)
 }
 

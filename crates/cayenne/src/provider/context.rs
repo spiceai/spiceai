@@ -111,6 +111,12 @@ pub struct CayenneContext {
     /// inter-batch arrival interval (the offered-load signal). `None` until the
     /// first write.
     last_write: parking_lot::Mutex<Option<std::time::Instant>>,
+    /// Set of data files whose integrity digest has already been verified this
+    /// process, keyed by `"<snapshot_id>/<file_path>"`. Used only when
+    /// `integrity_checksums` is enabled, to bound verification to one whole-file
+    /// read per file per process ("verify on first read"). Data files are
+    /// immutable once published, so a verified file never needs re-checking.
+    verified_data_files: parking_lot::Mutex<std::collections::HashSet<String>>,
 }
 
 /// Default byte budget for the in-memory PK keyset cache when
@@ -278,6 +284,7 @@ impl CayenneContext {
             bake_gate_last_samples: std::sync::atomic::AtomicU64::new(0),
             goal_stuck_ticks: std::sync::atomic::AtomicU64::new(0),
             last_write: parking_lot::Mutex::new(None),
+            verified_data_files: parking_lot::Mutex::new(std::collections::HashSet::new()),
         })
     }
 
@@ -534,6 +541,27 @@ impl CayenneContext {
     #[must_use]
     pub(crate) fn force_view_read_schema(&self) -> bool {
         self.config.force_view_read_schema
+    }
+
+    /// Whether end-to-end integrity checksums are enabled for the staging WAL
+    /// and Vortex data files. See
+    /// [`crate::metadata::VortexConfig::integrity_checksums`].
+    #[must_use]
+    pub(crate) fn integrity_checksums(&self) -> bool {
+        self.config.integrity_checksums
+    }
+
+    /// Whether the data file keyed by `"<snapshot_id>/<file_path>"` has already
+    /// had its integrity digest verified in this process.
+    #[must_use]
+    pub(crate) fn is_data_file_verified(&self, key: &str) -> bool {
+        self.verified_data_files.lock().contains(key)
+    }
+
+    /// Record that the data file keyed by `"<snapshot_id>/<file_path>"` passed
+    /// integrity verification, so it is not re-read on later scans.
+    pub(crate) fn mark_data_file_verified(&self, key: String) {
+        self.verified_data_files.lock().insert(key);
     }
 
     /// Maximum number of consecutive compaction passes per trigger.
