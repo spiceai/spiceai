@@ -17381,6 +17381,15 @@ impl CayenneTableProvider {
             // throughput bottleneck (an eager lock-held O(tier) re-filter
             // measured ~72% of `cdc_path_inmemory`).
             self.mem_tier.shard(shard_id).store(Arc::new(next));
+            // Drop the visible-batch memo (it holds full-tier `RecordBatch`
+            // clones for the PRE-append version): an append changes the visible
+            // set, so — unlike the extend-in-place merged-scan-deletions memo
+            // below — it cannot be cheaply updated, and leaving it stored would
+            // pin the old batches' RAM until the next scan. store(None) releases
+            // them now; the next scan rebuilds. (Under sustained CDC the memo
+            // rarely hits anyway — every append re-keys the tier version — so
+            // this loses no hit-rate while it does reclaim the RAM.)
+            self.mem_tier_visible_memo.store(None);
             // §5 Phase 6: record this shard's kept keys into the cached sharded
             // existence index for THIS shard, still UNDER `locks[shard_id]`, so the
             // bloom INSERT is atomic with the segment swap above (a later HIT-path
@@ -18466,6 +18475,13 @@ impl CayenneTableProvider {
         let survivors = cur.retain_after(flushed_segment_count);
         let released = cur.bytes.saturating_sub(survivors.bytes);
         self.mem_tier.shard(shard_id).store(Arc::new(survivors));
+        // Drop the visible-batch memo: it may pin `RecordBatch`es (Arc refs to
+        // the tier buffers) from the pre-clear tier version, which would keep the
+        // just-flushed prefix's RAM alive until the next scan rebuilds the memo —
+        // defeating this clear's purpose (releasing RAM at checkpoint, especially
+        // under memory pressure or when the table goes idle afterward). Rebuilt
+        // lazily on the next scan; a store(None) is a single atomic publish.
+        self.mem_tier_visible_memo.store(None);
         released
     }
 

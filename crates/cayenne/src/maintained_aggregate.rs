@@ -273,9 +273,19 @@ enum AggregateAccumulator {
 /// empty index means the extremum is SQL `NULL`. The exact input-typed
 /// [`ScalarValue`] is stored (not the widened key) because the strict
 /// [`scalar_for_field`] requires the output scalar to match the column type
-/// exactly. Distinct values ≤ live rows, so it is bounded by the same per-PK
-/// entry cap as the retraction index and inherits its fail-safe-to-`Stale`
-/// memory bound.
+/// exactly.
+///
+/// Memory bound (PK-indexed views only): a PK-indexed `MIN`/`MAX` view stores
+/// exactly one multiset value per live PK, so its total multiset size tracks
+/// `pk_index.len()` (distinct values ≤ live rows) — the quantity
+/// [`MaintainedAggregateView::index_len`] returns and `max_index_entries` caps,
+/// fail-safe-to-[`RegistryStatus::Stale`]. So for the CDC norm (every CDC table
+/// carries a primary key), the multiset is co-bounded by that cap. An
+/// **insert-only view without a primary key** (`pk_columns` empty) is NOT
+/// covered: `index_len` counts only `pk_index` (empty here), so the multiset is
+/// bounded solely by the column's distinct-value cardinality, not the entry
+/// cap. Extending `index_len` to include the multiset size would close that gap
+/// (see the maintained-MIN/MAX follow-ups).
 #[derive(Debug, Clone, Default)]
 struct SortedScalarIndex {
     entries: BTreeMap<i128, (ScalarValue, u64)>,
