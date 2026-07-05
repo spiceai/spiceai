@@ -2387,16 +2387,44 @@ impl RefreshTask {
         )?;
 
         if let Some(combined) = combined {
-            let delete_plan = self
-                .accelerator
-                .delete_from(session_state, vec![combined])
-                .await
-                .map_err(find_datafusion_root)
-                .context(crate::accelerated_table::FailedToWriteDataSnafu)?;
-            collect(delete_plan, ctx.task_ctx())
-                .await
-                .map_err(find_datafusion_root)
-                .context(crate::accelerated_table::FailedToWriteDataSnafu)?;
+            // The CDC apply loop discards the "rows affected" count, so route
+            // Cayenne's durable delete through its count-skipping fast path
+            // instead of the scan-to-count `delete_from` (see
+            // `CayenneTableProvider::delete_from_cdc_fast`, issue #11633). Non-
+            // Cayenne accelerators — and shapes Cayenne declines (position /
+            // retention) — fall back to the generic `delete_from` below.
+            let applied_on_fast_path = {
+                #[cfg(not(windows))]
+                {
+                    if let Some(cayenne) = self.cayenne_accelerator() {
+                        cayenne
+                            .delete_from_cdc_fast(std::slice::from_ref(&combined))
+                            .await
+                            .map_err(find_datafusion_root)
+                            .context(crate::accelerated_table::FailedToWriteDataSnafu)?
+                            .is_some()
+                    } else {
+                        false
+                    }
+                }
+                #[cfg(windows)]
+                {
+                    false
+                }
+            };
+
+            if !applied_on_fast_path {
+                let delete_plan = self
+                    .accelerator
+                    .delete_from(session_state, vec![combined])
+                    .await
+                    .map_err(find_datafusion_root)
+                    .context(crate::accelerated_table::FailedToWriteDataSnafu)?;
+                collect(delete_plan, ctx.task_ctx())
+                    .await
+                    .map_err(find_datafusion_root)
+                    .context(crate::accelerated_table::FailedToWriteDataSnafu)?;
+            }
             wrote = true;
         }
 

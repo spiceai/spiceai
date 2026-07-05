@@ -22089,7 +22089,7 @@ impl TableProvider for CayenneTableProvider {
             return self.delete_using_deletion_vectors(&filters).await;
         }
 
-        let file_sink = self.build_deletion_vector_sink(&filters, None).await?;
+        let file_sink = self.build_deletion_vector_sink(&filters, None, true).await?;
         Ok(Arc::new(DeletionExec::new(Arc::new(
             InlineAwareDeletionSink {
                 table: self.clone_for_write(),
@@ -22210,7 +22210,7 @@ impl CayenneTableProvider {
         filters: &[Expr],
     ) -> datafusion_common::Result<Arc<dyn ExecutionPlan>> {
         let sink: Arc<dyn DeletionSink> = Arc::new(
-            self.build_deletion_vector_sink(filters, Some(Arc::clone(&self.write_lock)))
+            self.build_deletion_vector_sink(filters, Some(Arc::clone(&self.write_lock)), true)
                 .await?,
         );
         Ok(Arc::new(DeletionExec::new(Arc::new(
@@ -22279,10 +22279,17 @@ impl CayenneTableProvider {
         Ok(tables)
     }
 
+    /// Build the [`CayenneDeletionSink`] behind the deletion-vector delete paths.
+    ///
+    /// `exact_count` requires a VERIFIED deleted-row count (a user-visible DELETE,
+    /// which surfaces "rows affected"); `false` keeps #11049's count-skipping
+    /// `pk IN (...)` fast path for callers that discard the count (see
+    /// [`Self::delete_from_cdc_fast`]).
     async fn build_deletion_vector_sink(
         &self,
         filters: &[Expr],
         write_lock: Option<Arc<tokio::sync::Mutex<()>>>,
+        exact_count: bool,
     ) -> datafusion_common::Result<CayenneDeletionSink> {
         let mut snapshot_tables: Vec<Arc<ListingTable>> = self
             .build_protected_snapshot_listing_tables()?
@@ -22310,12 +22317,47 @@ impl CayenneTableProvider {
             write_lock,
             Arc::clone(&self.seq_allocator),
         )
-        // `build_deletion_vector_sink` backs only user-visible DELETE paths
-        // (`delete_from`, `delete_using_deletion_vectors`), which surface "rows
-        // affected" — so require a verified count (bypass the count-skipping
-        // PK-IN-list fast path). CDC/internal sinks are built elsewhere and keep
-        // the fast path.
-        .with_exact_count())
+        .with_exact_count(exact_count))
+    }
+
+    /// Durable CDC key-delete that keeps #11049's count-skipping `pk IN (...)`
+    /// fast path.
+    ///
+    /// User `DELETE` and the durable CDC apply loop both funnel through
+    /// [`TableProvider::delete_from`], which requires a verified "rows affected"
+    /// count. CDC discards that count, so the scan-to-count #11514 added for user
+    /// DELETEs is pure overhead here — it turned every durable CDC delete batch
+    /// into a full table scan and regressed SF1000 HTAP data-freshness ~67%
+    /// (issue #11633). The apply loop calls this instead to opt out: it builds the
+    /// same key-based [`InlineAwareDeletionSink`] as `delete_from` but with a
+    /// non-exact inner sink, so a `pk IN (...)` (or composite OR-of-AND) filter
+    /// persists deletion vectors without scanning.
+    ///
+    /// Returns `Ok(Some(_))` when handled (the count is non-authoritative and must
+    /// be discarded), or `Ok(None)` for shapes this path does not fast-path
+    /// (file-based retention, position-based deletes — never regressed by #11514),
+    /// which the caller must route through `delete_from` unchanged.
+    pub async fn delete_from_cdc_fast(
+        &self,
+        filters: &[Expr],
+    ) -> datafusion_common::Result<Option<u64>> {
+        if self.file_based_deletes_preferred(filters)
+            || self.pk_deletion_strategy.is_position_based()
+        {
+            return Ok(None);
+        }
+
+        let file_sink = self.build_deletion_vector_sink(filters, None, false).await?;
+        let sink = InlineAwareDeletionSink {
+            table: self.clone_for_write(),
+            file_sink,
+            filters: filters.to_vec(),
+        };
+        let deleted = sink
+            .delete_from()
+            .await
+            .map_err(datafusion_common::DataFusionError::External)?;
+        Ok(Some(deleted))
     }
 
     /// Delete rows by hash-probing key columns against a set of matched keys.
