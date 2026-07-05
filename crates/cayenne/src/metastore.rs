@@ -153,6 +153,23 @@ pub const EXPECTED_TABLES: &[ExpectedTable] = &[
         ],
     },
     ExpectedTable {
+        // Cold-tier object-store manifest. Table-scoped (no snapshot_id),
+        // append-only. Carries each cold file's stats blob inline (one row, no
+        // join) so listing-time pruning needs no object-store round-trip.
+        // Column order MUST match the DDL in `sqlite.rs`/`turso.rs` and the
+        // export/import column order.
+        name: "cayenne_cold_tier_file",
+        columns: &[
+            "table_id",
+            "file_url",
+            "row_count",
+            "file_size_bytes",
+            "min_sequence",
+            "max_sequence",
+            "statistics_blob",
+        ],
+    },
+    ExpectedTable {
         name: "cayenne_pk_index",
         columns: &["table_id", "snapshot_id", "index_blob"],
     },

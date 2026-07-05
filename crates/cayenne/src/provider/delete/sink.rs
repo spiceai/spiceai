@@ -111,8 +111,10 @@ pub struct CayenneDeletionSink {
     pk_row_converter: Option<Arc<RowConverter>>,
     /// Indices of primary key columns in the table schema.
     pk_column_indices: Vec<usize>,
-    /// Additional listing tables from protected snapshots that should also be scanned for deletions.
-    protected_snapshot_tables: Vec<Arc<ListingTable>>,
+    /// Extra listing tables to also scan for deletion keys, beyond the main
+    /// listing table — the protected snapshots and (for cold-tier tables) the
+    /// cold-tier files. The sink treats every entry uniformly.
+    additional_scan_tables: Vec<Arc<ListingTable>>,
     /// Shared `RuntimeEnv` for S3 object store access.
     runtime_env: Arc<RuntimeEnv>,
     /// Shared write lock to prevent concurrent writes/refreshes from racing with deletions.
@@ -150,7 +152,7 @@ impl CayenneDeletionSink {
         table_memory: Arc<CayenneMemoryAccount>,
         pk_row_converter: Option<Arc<RowConverter>>,
         pk_column_indices: Vec<usize>,
-        protected_snapshot_tables: Vec<Arc<ListingTable>>,
+        additional_scan_tables: Vec<Arc<ListingTable>>,
         runtime_env: Arc<RuntimeEnv>,
         write_lock: Option<Arc<TokioMutex<()>>>,
         seq_allocator: Arc<TokioMutex<super::super::table::SeqAllocator>>,
@@ -165,7 +167,7 @@ impl CayenneDeletionSink {
             table_memory,
             pk_row_converter,
             pk_column_indices,
-            protected_snapshot_tables,
+            additional_scan_tables,
             runtime_env,
             write_lock,
             seq_allocator,
@@ -954,10 +956,11 @@ impl DeletionSink for CayenneDeletionSink {
         // operation), so we never observe a torn swap here.
         let listing_table = self.listing_table.load_full();
 
-        // Collect all tables to scan: main listing table + protected snapshots
+        // Collect all tables to scan: main listing table + the extra tables
+        // (protected snapshots and, for cold-tier tables, the cold-tier files).
         let mut all_tables = vec![Arc::clone(&listing_table)];
-        for protected_table in &self.protected_snapshot_tables {
-            all_tables.push(Arc::clone(protected_table));
+        for extra_table in &self.additional_scan_tables {
+            all_tables.push(Arc::clone(extra_table));
         }
 
         if self.filters.is_empty() {
