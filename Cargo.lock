@@ -6451,7 +6451,7 @@ dependencies = [
 [[package]]
 name = "datafusion-table-providers"
 version = "0.1.0"
-source = "git+https://github.com/spiceai/datafusion-table-providers.git?rev=56df6c511a6e73f9d9003317ca2d9324b7ebc321#56df6c511a6e73f9d9003317ca2d9324b7ebc321"
+source = "git+https://github.com/spiceai/datafusion-table-providers.git?rev=1fb175390df26f56b93664e73307311b1092979d#1fb175390df26f56b93664e73307311b1092979d"
 dependencies = [
  "adbc_core",
  "adbc_driver_manager",
