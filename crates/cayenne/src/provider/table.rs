@@ -28772,7 +28772,7 @@ mod tests {
     /// A protected-snapshot merge fence is CAPPED strictly below the smallest
     /// still-pending mem-tier delete, so a delete that reordered below the durable
     /// index max (a later apply folded ahead of it) is never tagged as
-    /// already-baked — the SF-100 N=4 order_line +14.9M over-count. The uncapped
+    /// already-baked — the SF-100 N=4 `order_line` +14.9M over-count. The uncapped
     /// durable max would skip such a delete at scan forever and resurrect the row.
     /// No under-count: the pending `(delete, data)` pair is one atomic apply, so
     /// the reinsert is also pending (never in the merged durable files) — lowering
