@@ -1475,12 +1475,7 @@ impl SQLExecutor for TursoTableProvider {
                 TursoValue::Integer(not_null),
             ) = (&col_name, &col_type, &not_null)
             {
-                let data_type = match col_type.to_uppercase().as_str() {
-                    "INTEGER" | "BLOB" => DataType::Int64,
-                    "REAL" | "FLOAT" | "DOUBLE" => DataType::Float64,
-                    "DATE_TEXT" => DataType::Date32,
-                    _ => DataType::Utf8,
-                };
+                let data_type = sqlite_declared_type_to_arrow(col_type);
                 let nullable = *not_null == 0;
                 fields.push(Field::new(col_name.as_str(), data_type, nullable));
             }
@@ -1953,6 +1948,19 @@ impl DataSink for TursoDataSink {
     }
 }
 
+/// Maps a `SQLite`/Turso declared column type (as reported by `PRAGMA` `table_info`) to the Arrow [`DataType`] used when inferring a table schema.
+///
+/// `SQLite` type affinity is loose, so this matches the declared type names Turso emits and falls back to [`DataType::Utf8`] (`TEXT` affinity) for anything unrecognized. `BLOB` maps to [`DataType::Binary`] so blob columns round-trip through [`TursoValue::Blob`] instead of being coerced to [`DataType::Int64`].
+fn sqlite_declared_type_to_arrow(declared_type: &str) -> DataType {
+    match declared_type.to_uppercase().as_str() {
+        "INTEGER" => DataType::Int64,
+        "BLOB" => DataType::Binary,
+        "REAL" | "FLOAT" | "DOUBLE" => DataType::Float64,
+        "DATE_TEXT" => DataType::Date32,
+        _ => DataType::Utf8,
+    }
+}
+
 /// Converts a timestamp value to Turso storage format (RFC3339 TEXT or INTEGER milliseconds).
 ///
 /// # Arguments
@@ -2038,7 +2046,13 @@ fn convert_timestamp_to_turso(
             }
 
             match unit {
-                TimeUnit::Second => Ok(TursoValue::Integer(value * timestamp_conversion::MILLIS_PER_SECOND)),
+                TimeUnit::Second => value
+                    .checked_mul(timestamp_conversion::MILLIS_PER_SECOND)
+                    .map(TursoValue::Integer)
+                    .ok_or_else(|| {
+                        format!("Timestamp value {value}s overflows millisecond conversion")
+                    })
+                    .map_err(Into::into),
                 TimeUnit::Millisecond => Ok(TursoValue::Integer(value)),
                 TimeUnit::Microsecond => Err(
                     "TimestampMicrosecond not supported with integer_millis format - use rfc3339 format to preserve sub-millisecond precision"
@@ -2997,5 +3011,98 @@ mod tests {
             vec![0],
             "no conversion failures when every non-NULL value converts cleanly"
         );
+    }
+
+    #[test]
+    fn test_sqlite_declared_type_to_arrow_mapping() {
+        // Guardrail over the full set of declared types this mapper recognizes.
+        // BLOB must map to Binary (regression: it was previously coerced to Int64,
+        // which lost the bytes and mis-typed the inferred schema).
+        let cases: &[(&str, DataType)] = &[
+            ("INTEGER", DataType::Int64),
+            ("BLOB", DataType::Binary),
+            ("REAL", DataType::Float64),
+            ("FLOAT", DataType::Float64),
+            ("DOUBLE", DataType::Float64),
+            ("DATE_TEXT", DataType::Date32),
+            ("TEXT", DataType::Utf8),
+            // Unknown / SQLite affinity fallthrough -> TEXT (Utf8).
+            ("VARCHAR(255)", DataType::Utf8),
+        ];
+        for (declared, expected) in cases {
+            assert_eq!(
+                &sqlite_declared_type_to_arrow(declared),
+                expected,
+                "declared type {declared} should map to {expected:?}"
+            );
+            // PRAGMA table_info can report the type in any case; mapping is
+            // case-insensitive, so the lowercased form must map identically.
+            assert_eq!(
+                &sqlite_declared_type_to_arrow(&declared.to_lowercase()),
+                expected,
+                "declared type {} (lowercased) should map to {expected:?}",
+                declared.to_lowercase()
+            );
+        }
+    }
+
+    #[test]
+    fn test_blob_column_roundtrips_as_binary() {
+        use arrow::array::BinaryArray;
+
+        // A column inferred as Binary (from a BLOB declared type) must decode
+        // TursoValue::Blob rows into a BinaryArray preserving the exact bytes,
+        // with NULLs surfaced as null entries.
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "payload",
+            DataType::Binary,
+            true,
+        )]));
+        let rows = vec![
+            vec![TursoValue::Blob(vec![0x00, 0xDE, 0xAD, 0xBE, 0xEF])],
+            vec![TursoValue::Null],
+            vec![TursoValue::Blob(Vec::new())],
+        ];
+
+        let batch = TursoTableProvider::values_to_record_batch(&rows, &schema)
+            .expect("BLOB rows should build a Binary batch");
+        let arr = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<BinaryArray>()
+            .expect("column should be a BinaryArray");
+
+        assert_eq!(arr.len(), 3);
+        assert_eq!(arr.value(0), &[0x00, 0xDE, 0xAD, 0xBE, 0xEF]);
+        assert!(arr.is_null(1), "TursoValue::Null should decode to null");
+        assert_eq!(arr.value(2), &[] as &[u8], "empty blob should round-trip");
+    }
+
+    #[test]
+    fn test_convert_timestamp_to_turso_integer_millis_second_overflow_returns_error() {
+        // integer_millis multiplies a seconds value by 1_000; i64::MAX seconds
+        // overflows that multiplication and must return an error rather than
+        // silently wrapping to a bogus millisecond value.
+        let result = convert_timestamp_to_turso(
+            i64::MAX,
+            TimeUnit::Second,
+            None,
+            TimestampFormat::IntegerMillis,
+        );
+        let Err(e) = result else {
+            panic!("i64::MAX seconds should overflow the millisecond conversion");
+        };
+        assert!(
+            e.to_string().contains("overflows millisecond conversion"),
+            "unexpected error message: {e}"
+        );
+
+        // A value that fits must still succeed and be scaled by 1_000.
+        let ok =
+            convert_timestamp_to_turso(5, TimeUnit::Second, None, TimestampFormat::IntegerMillis);
+        let Ok(TursoValue::Integer(millis)) = ok else {
+            panic!("in-range seconds value should convert to an integer millis value");
+        };
+        assert_eq!(millis, 5_000, "5s should convert to 5000ms");
     }
 }

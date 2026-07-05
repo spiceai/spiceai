@@ -18,7 +18,8 @@ use std::sync::Arc;
 
 use arrow::{
     array::{
-        ArrayRef, Date64Array, ListArray, ListBuilder, RecordBatch, StringArray, StringBuilder,
+        ArrayRef, ListArray, ListBuilder, RecordBatch, StringArray, StringBuilder,
+        TimestampMillisecondArray,
     },
     error::ArrowError,
 };
@@ -110,7 +111,7 @@ impl ImapTableProvider {
         }
 
         let mut fields: Vec<ArrayRef> = vec![
-            Arc::new(Date64Array::from(dates)),
+            Arc::new(TimestampMillisecondArray::from(dates)),
             Arc::new(StringArray::from(subjects)),
             Arc::new(build_listarray_for_strings(froms)),
             Arc::new(build_listarray_for_strings(tos)),
@@ -136,6 +137,7 @@ impl From<Error> for DataFusionError {
 }
 
 pub(crate) struct EmailMessage {
+    /// Send time as milliseconds since the Unix epoch (see `parse_date_millis`).
     date: i64,
     subject: Option<String>,
     from: Option<Vec<Option<String>>>,

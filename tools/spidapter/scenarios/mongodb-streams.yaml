@@ -12,3 +12,9 @@ source:
   mongodb_streams:
     connect:
       uri: ${MONGODB_ATLAS_URI}
+# Optional: deploy a full tuned/adaptive spicepod verbatim instead of generating one.
+# Set MONGO_SPICEPOD_PATH to an ABSOLUTE path to a pods/mongo/*.yaml — in the spidapter
+# image that is /app/scenarios/pods/mongo/<pod>.yaml (e.g. mongo-sf100-tuned.yaml).
+# A relative value is resolved against the scenario base path (--scenario-base-path),
+# NOT the process CWD. Empty/unset → generate the default pod (previous behaviour).
+spicepod: ${MONGO_SPICEPOD_PATH:-}

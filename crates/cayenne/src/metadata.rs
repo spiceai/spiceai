@@ -874,6 +874,24 @@ pub struct VortexConfig {
     /// to 1 s.
     #[serde(default = "default_cdc_mem_tier_checkpoint_interval_ms")]
     pub cdc_mem_tier_checkpoint_interval_ms: u64,
+    /// Max wall-clock milliseconds the ACTIVE ingestion piece may age before a
+    /// **seal** durably shadows it and advances the source replication slot, in
+    /// `cdc_durability: memory` mode only. This is the fresh-durability cadence
+    /// that DECOUPLES the slot ack (and thus replication/freshness lag) from the
+    /// heavy protected-snapshot checkpoint: a seal writes the un-sealed RAM delta
+    /// to the durable-but-unpublished inline corpus (one metastore commit, no
+    /// Vortex encode, no listing-fence publish, no read-amp) and fires the slot
+    /// advancer, so the slot advances every ~`seal_age_ms` instead of every
+    /// `max_age_ms`/`min_flush_bytes` checkpoint. Reads are unaffected — they
+    /// already union the RAM tier; the shadow is invisible in-process and is only
+    /// replayed on crash recovery. Bounds replication lag WITHOUT the read-amp of a
+    /// faster full checkpoint. `0` disables sealing (slot ack reverts to the
+    /// checkpoint cadence — the pre-seal behavior). Defaults to 2 s so replication
+    /// freshness stays under ~3 s. Should be `<= cdc_mem_tier_max_age_ms` to have
+    /// any effect (a seal older than the checkpoint window is superseded by the
+    /// checkpoint's own slot advance).
+    #[serde(default = "default_cdc_mem_tier_seal_age_ms")]
+    pub cdc_mem_tier_seal_age_ms: u64,
     /// Enable the closed-loop dynamic auto-tuner (see `provider::tuning`). Set by
     /// the `cayenne_tuning` mode: `auto` (default) → `false` (static derivation
     /// only); `adaptive` → `true` (static warm-start + the closed loop). When on,
@@ -1192,6 +1210,18 @@ fn default_cdc_mem_tier_checkpoint_interval_ms() -> u64 {
     1_000
 }
 
+/// Default seal cadence for `cdc_durability: memory` (2 s). A seal durably
+/// shadows the un-sealed RAM delta into the unpublished inline corpus and
+/// advances the source slot WITHOUT a full protected-snapshot checkpoint, so
+/// replication/freshness lag is bounded by this (not by `max_age_ms` /
+/// `min_flush_bytes`). 2 s keeps freshness under ~3 s while amortizing the
+/// per-seal metastore commit. Set to 0 to disable sealing (slot ack reverts to
+/// the checkpoint cadence). Like the age cap, this is a time-domain durability
+/// policy bound and is deliberately NOT hardware-derived.
+fn default_cdc_mem_tier_seal_age_ms() -> u64 {
+    2_000
+}
+
 impl VortexConfig {
     /// Surface parameter values that *parse* but won't behave as a user likely
     /// intends — out-of-range values that get silently clamped at their use site,
@@ -1303,6 +1333,7 @@ impl Default for VortexConfig {
             cdc_mem_tier_max_age_ms: default_cdc_mem_tier_max_age_ms(),
             cdc_mem_tier_min_flush_bytes: default_cdc_mem_tier_min_flush_bytes(),
             cdc_mem_tier_checkpoint_interval_ms: default_cdc_mem_tier_checkpoint_interval_ms(),
+            cdc_mem_tier_seal_age_ms: default_cdc_mem_tier_seal_age_ms(),
             dynamic_tuning: false,
             pinned_tuning_actuators: PinnedTuningActuators::default(),
             // Directory listing stays the scan's file source by default; the
@@ -1394,6 +1425,16 @@ mod tests {
         assert!(
             config.cdc_mem_tier_checkpoint_interval_ms > 0,
             "cdc_mem_tier_checkpoint_interval_ms must default non-zero so the periodic task runs"
+        );
+        assert!(
+            config.cdc_mem_tier_seal_age_ms > 0,
+            "cdc_mem_tier_seal_age_ms must default non-zero so sealing (fast durable slot \
+             advance) is ON by default — the feature must not be gated behind an opt-in flag"
+        );
+        assert!(
+            config.cdc_mem_tier_seal_age_ms <= config.cdc_mem_tier_max_age_ms,
+            "the seal cadence must default at or below the checkpoint age cap, or seals never \
+             fire before the checkpoint supersedes them"
         );
 
         let from_empty: VortexConfig = serde_json::from_str("{}").expect("valid empty config");
@@ -1646,6 +1687,17 @@ pub struct TableStatistics {
     /// the sum of every insert ever made. Compaction and overwrite reset it to
     /// the authoritative rewritten count.
     pub num_rows: i64,
+    /// Whether [`Self::num_rows`] is a provably-exact live count (`true`) or a
+    /// best-effort estimate that may over-count (`false`).
+    ///
+    /// The mem-tier checkpoint applies a `Delta` whose durable-supersede netting
+    /// is best-effort, so it taints this to `false`; a full-rewrite compaction /
+    /// overwrite `Set`s an authoritative count and restores `true`. Consumers that
+    /// answer `COUNT(*)` from statistics (the `stats_aggregate` fold and the
+    /// distributed executor-statistics reporter) must treat a `false` count as
+    /// `Precision::Inexact`, so the fold declines and a real scan answers instead
+    /// — preventing a drifted count from producing a wrong `COUNT(*)`.
+    pub num_rows_exact: bool,
     /// Serialized per-column NDV (distinct-count) `HyperLogLog` sketches
     /// ([`crate::hll::NdvSketches`]), `None` when no NDV-tracked column has a
     /// sketch. Merged across writes register-wise; used to size distributed
