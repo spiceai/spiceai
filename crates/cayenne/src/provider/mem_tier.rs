@@ -109,6 +109,28 @@ impl InMemTombstones {
         Some((lo, hi))
     }
 
+    /// The SMALLEST delete sequence among all still-pending (un-checkpointed)
+    /// tombstones in this tier aggregate, across both strategies, or `None` when
+    /// there are none.
+    ///
+    /// This is the floor a protected-snapshot compaction fence MUST stay strictly
+    /// below. A later apply's delete can fold into the DURABLE deletion index
+    /// ahead of an earlier apply's (off-fence / cross-shard commit reorder — the
+    /// anti-pattern `table.rs`'s checkpoint-threshold comment documents), so the
+    /// durable max can sit ABOVE a delete that is still pending here and NOT baked
+    /// into a merged snapshot's files. Fencing at/above such a pending delete tags
+    /// the merged snapshot as having applied it, so the scan skips it forever
+    /// (`delete_seq <= threshold`) and resurrects the deleted row — a durable
+    /// over-count. Values are per-key MAX delete sequences (the fold keeps max),
+    /// which is exactly the key's current pending state.
+    pub(crate) fn min_delete_sequence(&self) -> Option<i64> {
+        self.int64_pk
+            .values()
+            .chain(self.row_keys.values())
+            .copied()
+            .min()
+    }
+
     /// Merge `other`'s tombstones into `self`, keeping the max delete sequence
     /// per key (monotone — a later epoch can only raise a key's delete sequence).
     ///
@@ -921,6 +943,39 @@ mod tests {
             tier.tombstones.int64_pk.len(),
             APPENDS,
             "every appended key accumulated into the final shared corpus"
+        );
+    }
+
+    /// The pending-delete FLOOR (`min_delete_sequence`) is the smallest per-key
+    /// delete sequence across BOTH strategies — the value a protected-snapshot
+    /// compaction fence must stay strictly below so a delete still pending in the
+    /// mem tier is never tagged as already-baked (which resurrects the row).
+    #[test]
+    fn min_delete_sequence_is_the_pending_floor() {
+        let mut ts = InMemTombstones::default();
+        assert_eq!(ts.min_delete_sequence(), None, "empty tier has no floor");
+
+        // Fold three int64 segments at out-of-order sequences; the floor is the min.
+        for (key, seq) in [(10_i64, 40_i64), (20, 25), (30, 60)] {
+            let mut seg = SegmentTombstones::from_int64_keys([key]);
+            seg.stamp(seq);
+            ts.merge_segment(&seg);
+        }
+        assert_eq!(
+            ts.min_delete_sequence(),
+            Some(25),
+            "floor is the smallest per-key delete sequence, not the last folded"
+        );
+
+        // A row-key tombstone at an even lower sequence lowers the floor: the
+        // floor spans both strategies.
+        let mut row_seg = SegmentTombstones::from_row_keys([Box::from(&b"k"[..])]);
+        row_seg.stamp(12);
+        ts.merge_segment(&row_seg);
+        assert_eq!(
+            ts.min_delete_sequence(),
+            Some(12),
+            "floor spans int64 and row-key tombstones"
         );
     }
 
