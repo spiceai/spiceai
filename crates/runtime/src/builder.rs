@@ -487,6 +487,15 @@ impl RuntimeBuilder {
                 clamp_cayenne_compaction_memory_fraction(requested)
             });
 
+        // Estimate the off-pool per-table Cayenne CDC cache reservation (keyset /
+        // segment / coalesce / inline, summed over enabled changes-mode Cayenne
+        // tables). The DataFusion builder reduces the query-memory default by the
+        // amount this exceeds the base host/8 headroom, so the query pool + the
+        // in-memory tier + the per-table caches stay within host RAM as the table
+        // count grows.
+        let cayenne_cdc_reservation_bytes =
+            estimate_cayenne_cdc_reservation_bytes(self.app.as_ref(), &spicepod_rt.params);
+
         #[cfg(not(windows))]
         if cayenne_footer_cache_mb.is_some() {
             self.accelerator_engine_registry
@@ -692,6 +701,7 @@ impl RuntimeBuilder {
         .cayenne_sort_merge_memory_pool_fraction(cayenne_sort_merge_memory_pool_fraction)
         .cayenne_footer_cache_mb(cayenne_footer_cache_mb)
         .compaction_memory_fraction(compaction_memory_fraction)
+        .cayenne_cdc_reservation_bytes(cayenne_cdc_reservation_bytes)
         .cayenne_optimizer_rules(cayenne_optimizer_rules);
 
         if let Some(DistributedNode::Scheduler {
@@ -987,6 +997,102 @@ fn parse_usize_runtime_param(params: &HashMap<String, String>, key: &str) -> Opt
             None
         }
     }
+}
+
+/// Estimate the aggregate bytes that enabled `refresh_mode: changes` Cayenne tables
+/// reserve OUTSIDE the `DataFusion` query pool: per table, the PK keyset cache +
+/// segment cache + CDC coalesce buffer + inline memtable. Each uses the explicit
+/// per-table param (matching the accelerator's key lists, incl. `cayenne_`-prefixed
+/// aliases) when set, else the accelerator's auto-derived cap (mirroring
+/// `dataaccelerator::cayenne::autotune::HardwareProfile` — keep the fractions in
+/// sync). The globally coordinated in-memory tier and the virtual (non-resident)
+/// metastore mmap are intentionally excluded: the tier is already capped at host/5
+/// and the mmap is page-cache-backed. Returns 0 when no changes-mode Cayenne table
+/// is configured, which disables the query-pool reduction.
+fn estimate_cayenne_cdc_reservation_bytes(
+    app: Option<&Arc<app::App>>,
+    runtime_params: &HashMap<String, String>,
+) -> u64 {
+    const MIB: u64 = 1024 * 1024;
+    const GIB: u64 = 1024 * MIB;
+    // Auto-derived per-table cap fractions (mirror of the accelerator's autotune).
+    const KEYSET_CACHE_HOST_FRACTION: u64 = 32; // ~1/32 host, clamped [256 MiB, 8 GiB]
+    const SEGMENT_CACHE_HOST_FRACTION: u64 = 128; // ~1/128 host, clamped [256 MiB, 1 GiB]
+    const DEFAULT_COALESCE_BYTES: u64 = 128 * MIB;
+    const DEFAULT_INLINE_BYTES: u64 = 8 * MIB;
+
+    // Parse the first matching key as a trimmed u64 (params may carry whitespace,
+    // matching the rest of the runtime/dataset param parsing).
+    fn parse_u64(map: &HashMap<String, String>, keys: &[&str]) -> Option<u64> {
+        keys.iter()
+            .find_map(|k| map.get(*k))
+            .and_then(|v| v.trim().parse::<u64>().ok())
+    }
+
+    let Some(app) = app else {
+        return 0;
+    };
+    let total_memory = crate::resource_monitor::get_total_memory();
+    // Global CDC coalesce-buffer size (default 128 MiB); a per-dataset
+    // `cdc_max_coalesced_bytes` overlays it per table (see `cdc_config_overlay`).
+    let global_coalesce_bytes =
+        parse_u64(runtime_params, &["cdc_max_coalesced_bytes"]).unwrap_or(DEFAULT_COALESCE_BYTES);
+
+    let mut total: u64 = 0;
+    for dataset in &app.datasets {
+        let Some(accel) = dataset.acceleration.as_ref() else {
+            continue;
+        };
+        if !accel.enabled
+            || !accel
+                .engine
+                .as_deref()
+                .is_some_and(|engine| engine.eq_ignore_ascii_case("cayenne"))
+            || accel.refresh_mode != Some(spicepod::acceleration::RefreshMode::Changes)
+        {
+            continue;
+        }
+        let params = accel
+            .params
+            .as_ref()
+            .map(spicepod::param::Params::as_string_map)
+            .unwrap_or_default();
+        // MB-valued cache params -> bytes; else the accelerator's auto host-fraction cap.
+        let keyset = parse_u64(
+            &params,
+            &["cayenne_pk_keyset_cache_mb", "pk_keyset_cache_mb"],
+        )
+        .map_or_else(
+            || (total_memory / KEYSET_CACHE_HOST_FRACTION).clamp(256 * MIB, 8 * GIB),
+            |mb| mb.saturating_mul(MIB),
+        );
+        let segment = parse_u64(&params, &["cayenne_segment_cache_mb", "segment_cache_mb"])
+            .map_or_else(
+                || (total_memory / SEGMENT_CACHE_HOST_FRACTION).clamp(256 * MIB, GIB),
+                |mb| mb.saturating_mul(MIB),
+            );
+        // Inline memtable is byte-valued; match the accelerator's key list including
+        // the `cayenne_`-prefixed aliases (see dataaccelerator::cayenne mod.rs).
+        let inline = parse_u64(
+            &params,
+            &[
+                "cayenne_inline_flush_max_bytes",
+                "inline_flush_max_bytes",
+                "cayenne_inline_memtable_max_bytes",
+                "inline_memtable_max_bytes",
+            ],
+        )
+        .unwrap_or(DEFAULT_INLINE_BYTES);
+        // Per-dataset coalesce override wins over the global (mirrors cdc_config_overlay).
+        let coalesce =
+            parse_u64(&params, &["cdc_max_coalesced_bytes"]).unwrap_or(global_coalesce_bytes);
+        total = total
+            .saturating_add(keyset)
+            .saturating_add(segment)
+            .saturating_add(coalesce)
+            .saturating_add(inline);
+    }
+    total
 }
 
 fn parse_f64_runtime_param(params: &HashMap<String, String>, key: &str) -> Option<f64> {
