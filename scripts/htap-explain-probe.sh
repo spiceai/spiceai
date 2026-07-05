@@ -109,12 +109,22 @@ echo "htap-explain-probe: probing [$(echo "$QUERIES" | tr '\n' ' ')] every ${EXP
 
 # Probe until the associated spiced exits. The parent harness normally kills this
 # sampler when the run ends; this PID check is a self-terminating fallback.
+# Prefer the newest matching spiced (-n): on a shared dev box or CI host an
+# older long-running spiced would otherwise be picked, causing us to probe (or
+# self-terminate against) an unrelated instance. Set SPICED_PID explicitly to
+# override this heuristic when several spiced processes are running.
 SPICED_PID="${SPICED_PID:-}"
 if [ -z "$SPICED_PID" ]; then
-  SPICED_PID="$(pgrep -x -o spiced 2>/dev/null || true)"
+  SPICED_PID="$(pgrep -x -n spiced 2>/dev/null || true)"
 fi
-if [ -z "$SPICED_PID" ] || ! ps -p "$SPICED_PID" -o comm= 2>/dev/null | grep -qx 'spiced'; then
-  echo "htap-explain-probe: could not resolve target spiced PID; exiting" >&2
+case "$SPICED_PID" in
+  '' | *[!0-9]*)
+    echo "htap-explain-probe: could not resolve a single numeric spiced PID (got '${SPICED_PID:-<empty>}'); set SPICED_PID explicitly to disambiguate; exiting" >&2
+    exit 0
+    ;;
+esac
+if ! ps -p "$SPICED_PID" -o comm= 2>/dev/null | grep -qx 'spiced'; then
+  echo "htap-explain-probe: resolved SPICED_PID=$SPICED_PID is not a running spiced process; exiting" >&2
   exit 0
 fi
 
