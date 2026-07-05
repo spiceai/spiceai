@@ -612,10 +612,10 @@ impl MemTier {
     /// to `sealed_through` — recording that `segments[0..sealed_through]` are now
     /// durably shadowed. Monotone and clamped: never lowers the boundary and never
     /// exceeds `segments.len()` (a concurrent append only grows the tail, so the
-    /// captured `sealed_through` stays valid). Bumps `version` (the sealed/active
-    /// split is content the merged-scan memo need not distinguish, but a version
-    /// bump keeps "a store happened" observable and is cheap). O(1): clones only
-    /// the `Arc` segment/​tombstone pointers, never the payload.
+    /// captured `sealed_through` stays valid). Preserves `version`: the
+    /// sealed/active split is read-transparent, so seals must not invalidate
+    /// version-keyed merge-on-read memos. O(1): clones only the `Arc`
+    /// segment/tombstone pointers, never the payload.
     #[must_use]
     pub(crate) fn mark_sealed_through(&self, sealed_through: usize) -> Self {
         let sealed_segments = sealed_through
@@ -629,7 +629,7 @@ impl MemTier {
             superseded: self.superseded,
             epoch: self.epoch,
             oldest_append: self.oldest_append,
-            version: self.version + 1,
+            version: self.version,
             sealed_segments,
         }
     }
@@ -1269,9 +1269,26 @@ mod tests {
         // Segment payloads and aggregates are untouched by a seal (O(1) rebrand).
         assert_eq!(sealed.segments.len(), 2);
         assert_eq!(sealed.rows, tier.rows);
-        assert!(
-            sealed.version > tier.version,
-            "seal bumps the content version"
+        assert_eq!(
+            sealed.version, tier.version,
+            "seal preserves the content version"
+        );
+
+        let other_shard = Arc::new(MemTier::empty().append_segment(
+            Arc::new(vec![batch(&[42])]),
+            1,
+            SegmentTombstones::default(),
+            16,
+            1,
+            0,
+        ));
+        let before_hash =
+            ShardedMemTier::version_hash_of(&[Arc::new(tier.clone()), Arc::clone(&other_shard)]);
+        let after_hash =
+            ShardedMemTier::version_hash_of(&[Arc::new(sealed.clone()), Arc::clone(&other_shard)]);
+        assert_eq!(
+            after_hash, before_hash,
+            "seal is transparent to the version-keyed scan memo"
         );
 
         // A later append is active again (boundary unchanged by the append).
