@@ -101,9 +101,9 @@ mod tests {
                 .map(|tt| tt.name().to_string())
                 .collect::<Vec<String>>(),
             vec![
-                "not_in_default_catalogs/foo",
-                "not_in_default_catalogs/bar",
-                "not_in_default_catalogs/baz",
+                "not_in_default_catalogs__foo",
+                "not_in_default_catalogs__bar",
+                "not_in_default_catalogs__baz",
             ]
         );
     }

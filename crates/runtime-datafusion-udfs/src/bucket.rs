@@ -555,6 +555,103 @@ mod tests {
         );
     }
 
+    /// Golden-value guard that pins `bucket()`'s output for a representative
+    /// value of every non-string Arrow type the partition transform hashes.
+    ///
+    /// `bucket(n, value) = hash(value) % n` is the partition transform behind
+    /// `runtime-table-partition`: a value MUST map to the same bucket for the
+    /// lifetime of a persisted dataset, or an equality-filter prune silently
+    /// skips the partition that holds the matching rows — missing-row data loss
+    /// (#11277). The hash is therefore part of the on-disk format, and
+    /// `vendored_hash.rs` freezes it to `DataFusion` 53's `ahash`. But that module
+    /// still delegates the actual hashing to the external `ahash` crate, pinned
+    /// only as `^0.8` — and ahash gives **no** cross-version output guarantee, so
+    /// a routine `cargo update` (or a build that enables ahash's AES path) can
+    /// silently re-bucket every existing partitioned dataset.
+    ///
+    /// These goldens make that drift LOUD: any change here fails CI instead of
+    /// silently corrupting pruning. The pre-existing snapshot tests only locked
+    /// the string (`bucket_scalar`/`bucket_array`) and decimal paths; the integer,
+    /// unsigned, boolean, float, and binary paths — the common partition keys,
+    /// e.g. `bucket(50, org_id)` or `bucket(3, user_id)` — had no guard at all.
+    ///
+    /// A large modulus (`MAX_NUM_BUCKETS`) is used so the assertion captures the
+    /// low 6 decimal digits of the hash, not just a handful of low bits. Edge
+    /// values fill each integer width so every width's hashing path is distinct.
+    ///
+    /// If a value here ever needs to change, that is a breaking change to the
+    /// on-disk partition format: regenerate the goldens **and** version/migrate
+    /// the format — do not blindly update them to make CI green.
+    #[test]
+    fn test_bucket_hash_stability_golden_values() {
+        // (type label, input value, expected `bucket(MAX_NUM_BUCKETS, value)`).
+        let cases: [(&str, ScalarValue, i64); 14] = [
+            ("Int8", ScalarValue::Int8(Some(-128)), 924_318),
+            ("Int16", ScalarValue::Int16(Some(-12_345)), 180_632),
+            ("Int32", ScalarValue::Int32(Some(-1_234_567)), 143_530),
+            ("Int64", ScalarValue::Int64(Some(-123_456_789_012)), 397_203),
+            ("UInt8", ScalarValue::UInt8(Some(255)), 670_181),
+            ("UInt16", ScalarValue::UInt16(Some(65_535)), 162_628),
+            ("UInt32", ScalarValue::UInt32(Some(4_000_000_000)), 663_368),
+            (
+                "UInt64",
+                ScalarValue::UInt64(Some(18_000_000_000_000_000_000)),
+                279_638,
+            ),
+            ("Boolean_true", ScalarValue::Boolean(Some(true)), 719_061),
+            ("Boolean_false", ScalarValue::Boolean(Some(false)), 627_404),
+            ("Float32", ScalarValue::Float32(Some(1.5)), 157_006),
+            ("Float64", ScalarValue::Float64(Some(-2.5)), 749_390),
+            (
+                "Utf8",
+                ScalarValue::Utf8(Some("user_42".to_string())),
+                594_815,
+            ),
+            (
+                "Binary",
+                ScalarValue::Binary(Some(vec![0x00, 0x01, 0x02, 0xff])),
+                682_122,
+            ),
+        ];
+
+        for (label, value, expected) in cases {
+            let bucket = compute_bucket(&value, MAX_NUM_BUCKETS, &DataType::Int64)
+                .expect("compute_bucket should succeed for a supported type");
+            let ScalarValue::Int64(Some(actual)) = bucket else {
+                panic!("expected an Int64 bucket for {label}, got {bucket:?}");
+            };
+            assert_eq!(
+                actual, expected,
+                "bucket() output for {label} drifted from the frozen on-disk value \
+                 {expected} to {actual}. The partition hash must not change (see \
+                 #11277 and vendored_hash.rs); if this is an intentional, \
+                 format-versioned migration, update the golden AND bump the format."
+            );
+        }
+
+        // The vectorized array path must agree with the scalar path (it shares
+        // `create_hashes`); lock it for a non-string type — the existing
+        // `bucket_array` snapshot only covers strings. Element 0 reuses the
+        // Int64 scalar value above and must match its golden (397_203).
+        let arr: ArrayRef = std::sync::Arc::new(arrow::array::Int64Array::from(vec![
+            -123_456_789_012_i64,
+            0,
+            9_999_999_999,
+        ]));
+        let bucketed = compute_bucket_array(&arr, MAX_NUM_BUCKETS, &DataType::Int64)
+            .expect("compute_bucket_array should succeed for Int64");
+        let bucketed = bucketed
+            .as_any()
+            .downcast_ref::<arrow::array::Int64Array>()
+            .expect("bucket array should be Int64");
+        assert_eq!(
+            bucketed.values(),
+            &[397_203_i64, 627_404, 929_657],
+            "vectorized bucket() output for an Int64 column drifted from its frozen \
+             on-disk values (see #11277)"
+        );
+    }
+
     #[test]
     fn test_first_arg_wrong_scalar_type_error_message() {
         // Test error message when first argument is a scalar but wrong type
