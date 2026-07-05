@@ -17720,12 +17720,11 @@ impl CayenneTableProvider {
         }
 
         let total_rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
-        let estimated_bytes = Some(
-            batches
-                .iter()
-                .map(|b| b.get_array_memory_size() as u64)
-                .fold(0u64, u64::saturating_add),
-        );
+        let estimated_flushed_bytes = batches
+            .iter()
+            .map(|b| b.get_array_memory_size() as u64)
+            .fold(0u64, u64::saturating_add);
+        let estimated_bytes = Some(estimated_flushed_bytes);
         tracing::info!(
             table = %self.table_metadata.table_name,
             rows = flushed_mem_rows,
@@ -17965,6 +17964,19 @@ impl CayenneTableProvider {
             &self.table_metadata.table_name,
             "mem_tier_checkpoint",
             checkpoint_start,
+        );
+        // Per-checkpoint flush cadence: one line per durable mem-tier snapshot.
+        // Enable with `cayenne::mem_tier=debug` to profile flush cadence, sizes,
+        // and (with the tick's pressure-bypass log) trigger attribution during an
+        // HTAP run.
+        tracing::debug!(
+            target: "cayenne::mem_tier",
+            table = self.table_metadata.table_name.as_str(),
+            flushed_rows = flushed_mem_rows,
+            flushed_bytes = estimated_flushed_bytes,
+            durable_epoch = flushed_epoch,
+            elapsed_ms = u64::try_from(checkpoint_start.elapsed().as_millis()).unwrap_or(u64::MAX),
+            "Mem-tier checkpoint flushed a durable snapshot"
         );
         // ONLY NOW — after the Vortex file + metastore pointer are durable — tell
         // the runtime it may advance the source slot to cover this epoch.
@@ -19731,7 +19743,7 @@ impl CayenneTableProvider {
         let group_bytes: u64 = partitioned_file_lists
             .iter()
             .flat_map(|group| group.iter())
-            .map(|file| u64::try_from(file.object_meta.size).unwrap_or(u64::MAX))
+            .map(|file| file.object_meta.size)
             .sum();
         let disable_repartition = disable_repartition
             || (small_group_repartition_opt_out_bytes > 0
