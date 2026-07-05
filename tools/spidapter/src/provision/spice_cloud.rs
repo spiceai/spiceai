@@ -40,7 +40,7 @@ pub(crate) async fn provision_scp_app(
     cayenne: Option<&CayenneConfig>,
 ) -> anyhow::Result<RunState> {
     let api_url = args.spice_cloud_api_url.trim_end_matches('/');
-    let cloud = commands::build_cloud_client(Some(api_url), args.api_key.as_deref())?;
+    let cloud = commands::build_cloud_client(Some(api_url), args.api_key.as_deref()).await?;
 
     let cname = commands::resolve_default_cname(&cloud).await?;
     let flight_url = scp

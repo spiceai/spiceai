@@ -1,58 +1,8 @@
-use crate::dynamodb::{DynamoDBRow, JsonSerializationSnafu, Result};
+use crate::dynamodb::DynamoDBRow;
 use aws_sdk_dynamodb::types::AttributeValue;
 use base64::{Engine as _, engine::general_purpose};
 use serde_json::{Value, json};
-use snafu::ResultExt;
-use std::collections::BTreeMap;
-use std::collections::{HashMap, HashSet};
-
-#[derive(Debug, Clone)]
-pub struct JsonNesting {
-    pub static_fields: HashSet<String>,
-    pub json_field_name: String,
-}
-/// With the following configuration: `JsonNesting` {`static_fields`: {"PK", "SK", "Baz"}, `json_field_name`: "Data"}
-///
-/// This schema:
-/// PK (string) | SK (string) | Foo (Map) | Bar (List) | Baz (string)
-///
-/// Becomes this:
-/// PK (string) | SK (string) | Baz (string) | Data ({"Foo": <map>, "Bar": <list>})
-pub fn json_nest_except_fields(
-    rows: Vec<DynamoDBRow>,
-    json_nesting: &JsonNesting,
-) -> Result<Vec<DynamoDBRow>> {
-    rows.into_iter()
-        .map(|row| json_nest_row_except_fields(row, json_nesting))
-        .collect()
-}
-
-pub fn json_nest_row_except_fields(
-    row: DynamoDBRow,
-    json_nesting: &JsonNesting,
-) -> Result<DynamoDBRow> {
-    let mut result = HashMap::new();
-    // To make fields sorted alphabetically
-    let mut data_map = BTreeMap::new();
-
-    for (key, value) in row {
-        if json_nesting.static_fields.contains(&key) {
-            result.insert(key, value);
-        } else {
-            data_map.insert(key, attribute_value_to_json(&value));
-        }
-    }
-
-    if !data_map.is_empty() {
-        let json_string = serde_json::to_string(&data_map).context(JsonSerializationSnafu)?;
-        result.insert(
-            json_nesting.json_field_name.clone(),
-            AttributeValue::S(json_string),
-        );
-    }
-
-    Ok(result)
-}
+use std::collections::HashMap;
 
 fn attribute_value_to_json(attr: &AttributeValue) -> Value {
     match attr {
@@ -88,409 +38,191 @@ fn attribute_value_to_json(attr: &AttributeValue) -> Value {
     }
 }
 
+/// `RowShape` adapter for `DynamoDB`. A row (`HashMap<String, AttributeValue>`)
+/// is viewed as an `AttributeValue::M`; nested objects are nested `M` values.
+/// This lets the generic [`crate::schema_projection`] core reshape `DynamoDB`
+/// rows without any DynamoDB-specific projection logic.
+///
+/// `RowShape` is defined in the `datafusion-table-providers` fork, and
+/// `AttributeValue` is also a foreign type, so the impl goes on this local
+/// newtype to satisfy the orphan rule.
+struct AttrShape(AttributeValue);
+
+impl crate::schema_projection::RowShape for AttrShape {
+    fn into_object(self) -> std::result::Result<Vec<(String, Self)>, Self> {
+        match self.0 {
+            AttributeValue::M(map) => Ok(map.into_iter().map(|(k, v)| (k, AttrShape(v))).collect()),
+            other => Err(AttrShape(other)),
+        }
+    }
+
+    fn from_object(entries: Vec<(String, Self)>) -> Self {
+        AttrShape(AttributeValue::M(
+            entries.into_iter().map(|(k, v)| (k, v.0)).collect(),
+        ))
+    }
+
+    fn to_json(&self) -> Value {
+        attribute_value_to_json(&self.0)
+    }
+
+    fn from_json_string(json: String) -> Self {
+        AttrShape(AttributeValue::S(json))
+    }
+}
+
+/// Reshape one `DynamoDB` row through a [`SchemaProjection`], preserving the
+/// `HashMap` row type. Wraps the row as an `AttributeValue::M`, projects, and
+/// unwraps. A non-`M` result (only possible for a non-object row, which a
+/// `DynamoDB` item never is) yields an empty row.
+///
+/// [`SchemaProjection`]: crate::schema_projection::SchemaProjection
+#[must_use]
+pub fn project_dynamodb_row(
+    row: DynamoDBRow,
+    projection: &crate::schema_projection::SchemaProjection,
+) -> DynamoDBRow {
+    let wrapped = AttrShape(AttributeValue::M(row.into_iter().collect()));
+    match projection.project_row(wrapped).0 {
+        AttributeValue::M(map) => map.into_iter().collect(),
+        _ => HashMap::new(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aws_sdk_dynamodb::types::AttributeValue;
-    use serde_json::Value;
-    use std::collections::{HashMap, HashSet};
+    use aws_smithy_types::Blob;
+    use serde_json::json;
 
-    fn make_string_attr(s: &str) -> AttributeValue {
-        AttributeValue::S(s.to_string())
-    }
-
-    fn make_number_attr(n: &str) -> AttributeValue {
-        AttributeValue::N(n.to_string())
-    }
-
-    fn make_bool_attr(b: bool) -> AttributeValue {
-        AttributeValue::Bool(b)
-    }
-
-    fn make_list_attr(items: Vec<AttributeValue>) -> AttributeValue {
-        AttributeValue::L(items)
-    }
-
-    fn make_map_attr(items: HashMap<String, AttributeValue>) -> AttributeValue {
-        AttributeValue::M(items)
-    }
-
-    fn extract_data_field(row: &DynamoDBRow) -> Option<Value> {
-        if let Some(AttributeValue::S(json_str)) = row.get("Data") {
-            serde_json::from_str(json_str).ok()
-        } else {
-            None
-        }
+    fn decode_b64(v: &Value) -> Vec<u8> {
+        general_purpose::STANDARD
+            .decode(v.as_str().expect("base64 string"))
+            .expect("valid base64")
     }
 
     #[test]
-    fn test_basic_nesting() {
-        let mut row = HashMap::new();
-        row.insert("PK".to_string(), make_string_attr("pk1"));
-        row.insert("SK".to_string(), make_string_attr("sk1"));
-        row.insert("Foo".to_string(), make_string_attr("foo_value"));
-        row.insert("Bar".to_string(), make_string_attr("bar_value"));
-
-        let static_fields: HashSet<String> =
-            ["PK".to_string(), "SK".to_string()].into_iter().collect();
-
-        let result = json_nest_except_fields(
-            vec![row],
-            &JsonNesting {
-                static_fields,
-                json_field_name: "Data".to_string(),
-            },
-        )
-        .expect("result");
-
-        assert_eq!(result.len(), 1);
-        let result_row = &result[0];
-
-        // Check static fields are at top level
-        assert_eq!(result_row.get("PK"), Some(&make_string_attr("pk1")));
-        assert_eq!(result_row.get("SK"), Some(&make_string_attr("sk1")));
-
-        // Check nested fields are in Data
-        let data = extract_data_field(result_row).expect("Data field should exist");
-        assert_eq!(data["Foo"], "foo_value");
-        assert_eq!(data["Bar"], "bar_value");
-    }
-
-    #[test]
-    fn test_all_static_fields() {
-        let mut row = HashMap::new();
-        row.insert("PK".to_string(), make_string_attr("pk1"));
-        row.insert("SK".to_string(), make_string_attr("sk1"));
-
-        let static_fields: HashSet<String> =
-            ["PK".to_string(), "SK".to_string()].into_iter().collect();
-
-        let result = json_nest_except_fields(
-            vec![row],
-            &JsonNesting {
-                static_fields,
-                json_field_name: "Data".to_string(),
-            },
-        )
-        .expect("result");
-
-        assert_eq!(result.len(), 1);
-        let result_row = &result[0];
-
-        // All fields should be at top level
-        assert_eq!(result_row.get("PK"), Some(&make_string_attr("pk1")));
-        assert_eq!(result_row.get("SK"), Some(&make_string_attr("sk1")));
-
-        // No Data field should exist
-        assert!(result_row.get("Data").is_none());
-    }
-
-    #[test]
-    fn test_no_static_fields() {
-        let mut row = HashMap::new();
-        row.insert("Foo".to_string(), make_string_attr("foo_value"));
-        row.insert("Bar".to_string(), make_string_attr("bar_value"));
-
-        let static_fields: HashSet<String> = HashSet::new();
-
-        let result = json_nest_except_fields(
-            vec![row],
-            &JsonNesting {
-                static_fields,
-                json_field_name: "Data".to_string(),
-            },
-        )
-        .expect("result");
-
-        assert_eq!(result.len(), 1);
-        let result_row = &result[0];
-
-        // All fields should be nested in Data
-        let data = extract_data_field(result_row).expect("Data field should exist");
-        assert_eq!(data["Foo"], "foo_value");
-        assert_eq!(data["Bar"], "bar_value");
-
-        // Only Data field should exist
-        assert_eq!(result_row.len(), 1);
-    }
-
-    #[test]
-    fn test_empty_rows() {
-        let static_fields: HashSet<String> = ["PK".to_string()].into_iter().collect();
-
-        let result = json_nest_except_fields(
-            vec![],
-            &JsonNesting {
-                static_fields,
-                json_field_name: "Data".to_string(),
-            },
-        )
-        .expect("result");
-
-        assert_eq!(result.len(), 0);
-    }
-
-    #[test]
-    fn test_multiple_rows() {
-        let mut row1 = HashMap::new();
-        row1.insert("PK".to_string(), make_string_attr("pk1"));
-        row1.insert("Foo".to_string(), make_string_attr("foo1"));
-
-        let mut row2 = HashMap::new();
-        row2.insert("PK".to_string(), make_string_attr("pk2"));
-        row2.insert("Foo".to_string(), make_string_attr("foo2"));
-
-        let static_fields: HashSet<String> = ["PK".to_string()].into_iter().collect();
-
-        let result = json_nest_except_fields(
-            vec![row1, row2],
-            &JsonNesting {
-                static_fields,
-                json_field_name: "Data".to_string(),
-            },
-        )
-        .expect("result");
-
-        assert_eq!(result.len(), 2);
-
-        // Check first row
-        assert_eq!(result[0].get("PK"), Some(&make_string_attr("pk1")));
-        let data1 = extract_data_field(&result[0]).expect("Data field should exist");
-        assert_eq!(data1["Foo"], "foo1");
-
-        // Check second row
-        assert_eq!(result[1].get("PK"), Some(&make_string_attr("pk2")));
-        let data2 = extract_data_field(&result[1]).expect("Data field should exist");
-        assert_eq!(data2["Foo"], "foo2");
-    }
-
-    #[test]
-    fn test_different_attribute_types() {
-        let mut inner_map = HashMap::new();
-        inner_map.insert("nested_key".to_string(), make_string_attr("nested_value"));
-
-        let mut row = HashMap::new();
-        row.insert("PK".to_string(), make_string_attr("pk1"));
-        row.insert("StringField".to_string(), make_string_attr("string_value"));
-        row.insert("NumberField".to_string(), make_number_attr("42.5"));
-        row.insert("BoolField".to_string(), make_bool_attr(true));
-        row.insert(
-            "ListField".to_string(),
-            make_list_attr(vec![make_string_attr("item1"), make_string_attr("item2")]),
+    fn string_becomes_json_string() {
+        assert_eq!(
+            attribute_value_to_json(&AttributeValue::S("hello".to_string())),
+            json!("hello")
         );
-        row.insert("MapField".to_string(), make_map_attr(inner_map));
-
-        let static_fields: HashSet<String> = ["PK".to_string()].into_iter().collect();
-
-        let result = json_nest_except_fields(
-            vec![row],
-            &JsonNesting {
-                static_fields,
-                json_field_name: "Data".to_string(),
-            },
-        )
-        .expect("result");
-
-        assert_eq!(result.len(), 1);
-        let result_row = &result[0];
-
-        assert_eq!(result_row.get("PK"), Some(&make_string_attr("pk1")));
-
-        let data = extract_data_field(result_row).expect("Data field should exist");
-
-        // Check different types
-        assert_eq!(data["StringField"], "string_value");
-        assert_eq!(data["NumberField"], 42.5);
-        assert_eq!(data["BoolField"], true);
-        assert_eq!(data["ListField"], json!(["item1", "item2"]));
-        assert_eq!(data["MapField"]["nested_key"], "nested_value");
     }
 
     #[test]
-    fn test_null_attribute() {
-        let mut row = HashMap::new();
-        row.insert("PK".to_string(), make_string_attr("pk1"));
-        row.insert("NullField".to_string(), AttributeValue::Null(true));
-
-        let static_fields: HashSet<String> = ["PK".to_string()].into_iter().collect();
-
-        let result = json_nest_except_fields(
-            vec![row],
-            &JsonNesting {
-                static_fields,
-                json_field_name: "Data".to_string(),
-            },
-        )
-        .expect("result");
-
-        let data = extract_data_field(&result[0]).expect("Data field should exist");
-        assert_eq!(data["NullField"], Value::Null);
-    }
-
-    #[test]
-    fn test_string_set() {
-        let mut row = HashMap::new();
-        row.insert("PK".to_string(), make_string_attr("pk1"));
-        row.insert(
-            "StringSet".to_string(),
-            AttributeValue::Ss(vec![
-                "value1".to_string(),
-                "value2".to_string(),
-                "value3".to_string(),
-            ]),
+    fn number_parses_int_and_float() {
+        assert_eq!(
+            attribute_value_to_json(&AttributeValue::N("42".to_string())),
+            json!(42.0)
         );
-
-        let static_fields: HashSet<String> = ["PK".to_string()].into_iter().collect();
-
-        let result = json_nest_except_fields(
-            vec![row],
-            &JsonNesting {
-                static_fields,
-                json_field_name: "Data".to_string(),
-            },
-        )
-        .expect("result");
-
-        let data = extract_data_field(&result[0]).expect("Data field should exist");
-        assert_eq!(data["StringSet"], json!(["value1", "value2", "value3"]));
-    }
-
-    #[test]
-    fn test_number_set() {
-        let mut row = HashMap::new();
-        row.insert("PK".to_string(), make_string_attr("pk1"));
-        row.insert(
-            "NumberSet".to_string(),
-            AttributeValue::Ns(vec!["1".to_string(), "2".to_string(), "3".to_string()]),
+        assert_eq!(
+            attribute_value_to_json(&AttributeValue::N("2.5".to_string())),
+            json!(2.5)
         );
-
-        let static_fields: HashSet<String> = ["PK".to_string()].into_iter().collect();
-
-        let result = json_nest_except_fields(
-            vec![row],
-            &JsonNesting {
-                static_fields,
-                json_field_name: "Data".to_string(),
-            },
-        )
-        .expect("result");
-
-        let data = extract_data_field(&result[0]).expect("Data field should exist");
-        assert_eq!(data["NumberSet"], json!(["1", "2", "3"]));
     }
 
     #[test]
-    fn test_binary_data() {
-        let mut row = HashMap::new();
-        row.insert("PK".to_string(), make_string_attr("pk1"));
-        row.insert(
-            "BinaryField".to_string(),
-            AttributeValue::B(aws_smithy_types::Blob::new(vec![1, 2, 3, 4])),
+    fn number_falls_back_to_string_when_not_f64_parseable() {
+        // DynamoDB numbers can exceed f64 range / be non-numeric text; those are
+        // preserved verbatim as a JSON string rather than lost.
+        assert_eq!(
+            attribute_value_to_json(&AttributeValue::N("not-a-number".to_string())),
+            json!("not-a-number")
         );
-
-        let static_fields: HashSet<String> = ["PK".to_string()].into_iter().collect();
-
-        let result = json_nest_except_fields(
-            vec![row],
-            &JsonNesting {
-                static_fields,
-                json_field_name: "Data".to_string(),
-            },
-        )
-        .expect("result");
-
-        let data = extract_data_field(&result[0]).expect("Data field should exist");
-
-        // Verify it's a base64 encoded string
-        if let Value::String(encoded) = &data["BinaryField"] {
-            let decoded = general_purpose::STANDARD.decode(encoded).expect("result");
-            assert_eq!(decoded, vec![1, 2, 3, 4]);
-        } else {
-            panic!("BinaryField should be a string");
-        }
     }
 
     #[test]
-    fn test_case_sensitive_field_names() {
-        let mut row = HashMap::new();
-        row.insert("pk".to_string(), make_string_attr("lowercase"));
-        row.insert("PK".to_string(), make_string_attr("uppercase"));
-        row.insert("Pk".to_string(), make_string_attr("mixedcase"));
-
-        let static_fields: HashSet<String> = ["PK".to_string()].into_iter().collect();
-
-        let result = json_nest_except_fields(
-            vec![row],
-            &JsonNesting {
-                static_fields,
-                json_field_name: "Data".to_string(),
-            },
-        )
-        .expect("result");
-
-        let result_row = &result[0];
-
-        // Only exact match "PK" should be static
-        assert_eq!(result_row.get("PK"), Some(&make_string_attr("uppercase")));
-
-        // Others should be nested
-        let data = extract_data_field(result_row).expect("Data field should exist");
-        assert_eq!(data["pk"], "lowercase");
-        assert_eq!(data["Pk"], "mixedcase");
-    }
-
-    #[test]
-    fn test_deeply_nested_structures() {
-        let mut level2_map = HashMap::new();
-        level2_map.insert("deep".to_string(), make_string_attr("value"));
-
-        let mut level1_map = HashMap::new();
-        level1_map.insert("level2".to_string(), make_map_attr(level2_map));
-
-        let mut row = HashMap::new();
-        row.insert("PK".to_string(), make_string_attr("pk1"));
-        row.insert("NestedMap".to_string(), make_map_attr(level1_map));
-
-        let static_fields: HashSet<String> = ["PK".to_string()].into_iter().collect();
-
-        let result = json_nest_except_fields(
-            vec![row],
-            &JsonNesting {
-                static_fields,
-                json_field_name: "Data".to_string(),
-            },
-        )
-        .expect("result");
-
-        let data = extract_data_field(&result[0]).expect("Data field should exist");
-        assert_eq!(data["NestedMap"]["level2"]["deep"], "value");
-    }
-
-    #[test]
-    fn test_number_parsing() {
-        let mut row = HashMap::new();
-        row.insert("PK".to_string(), make_string_attr("pk1"));
-        row.insert("IntNum".to_string(), make_number_attr("42"));
-        row.insert(
-            "FloatNum".to_string(),
-            make_number_attr("3.141592653589793"),
+    fn bool_becomes_json_bool() {
+        assert_eq!(
+            attribute_value_to_json(&AttributeValue::Bool(true)),
+            json!(true)
         );
-        row.insert("ScientificNum".to_string(), make_number_attr("1.23e10"));
+        assert_eq!(
+            attribute_value_to_json(&AttributeValue::Bool(false)),
+            json!(false)
+        );
+    }
 
-        let static_fields: HashSet<String> = ["PK".to_string()].into_iter().collect();
+    #[test]
+    fn map_becomes_object() {
+        let map = HashMap::from([
+            ("name".to_string(), AttributeValue::S("Alice".to_string())),
+            ("age".to_string(), AttributeValue::N("30".to_string())),
+        ]);
+        let v = attribute_value_to_json(&AttributeValue::M(map));
+        assert_eq!(v["name"], json!("Alice"));
+        assert_eq!(v["age"], json!(30.0));
+    }
 
-        let result = json_nest_except_fields(
-            vec![row],
-            &JsonNesting {
-                static_fields,
-                json_field_name: "Data".to_string(),
-            },
-        )
-        .expect("result");
+    #[test]
+    fn list_becomes_array_preserving_element_types() {
+        let list = vec![
+            AttributeValue::S("a".to_string()),
+            AttributeValue::N("1".to_string()),
+            AttributeValue::Bool(true),
+        ];
+        assert_eq!(
+            attribute_value_to_json(&AttributeValue::L(list)),
+            json!(["a", 1.0, true])
+        );
+    }
 
-        let data = extract_data_field(&result[0]).expect("Data field should exist");
-        assert_eq!(data["IntNum"], 42.0);
-        assert_eq!(data["FloatNum"], std::f64::consts::PI);
-        assert_eq!(data["ScientificNum"], 1.23e10);
+    #[test]
+    fn string_set_becomes_array_of_strings() {
+        assert_eq!(
+            attribute_value_to_json(&AttributeValue::Ss(vec!["x".to_string(), "y".to_string()])),
+            json!(["x", "y"])
+        );
+    }
+
+    #[test]
+    fn number_set_is_preserved_as_strings() {
+        // Number sets keep their string representation (unlike a scalar `N`, which
+        // is parsed to a JSON number).
+        assert_eq!(
+            attribute_value_to_json(&AttributeValue::Ns(vec!["1".to_string(), "2".to_string()])),
+            json!(["1", "2"])
+        );
+    }
+
+    #[test]
+    fn binary_becomes_base64_string() {
+        let v = attribute_value_to_json(&AttributeValue::B(Blob::new(vec![1u8, 2, 3, 4])));
+        assert_eq!(decode_b64(&v), vec![1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn binary_set_becomes_array_of_base64_strings() {
+        let v = attribute_value_to_json(&AttributeValue::Bs(vec![
+            Blob::new(vec![0u8]),
+            Blob::new(vec![255u8]),
+        ]));
+        let arr = v.as_array().expect("array");
+        assert_eq!(arr.len(), 2);
+        assert_eq!(decode_b64(&arr[0]), vec![0]);
+        assert_eq!(decode_b64(&arr[1]), vec![255]);
+    }
+
+    #[test]
+    fn null_becomes_json_null() {
+        assert_eq!(
+            attribute_value_to_json(&AttributeValue::Null(true)),
+            Value::Null
+        );
+    }
+
+    #[test]
+    fn nested_map_and_list_recurse() {
+        let inner = HashMap::from([("deep".to_string(), AttributeValue::S("value".to_string()))]);
+        let map = HashMap::from([
+            ("nested".to_string(), AttributeValue::M(inner)),
+            (
+                "items".to_string(),
+                AttributeValue::L(vec![AttributeValue::N("1".to_string())]),
+            ),
+        ]);
+        let v = attribute_value_to_json(&AttributeValue::M(map));
+        assert_eq!(v["nested"]["deep"], json!("value"));
+        assert_eq!(v["items"], json!([1.0]));
     }
 }

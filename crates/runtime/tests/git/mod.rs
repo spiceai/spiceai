@@ -31,7 +31,7 @@ use tempfile::TempDir;
 
 use crate::{
     configure_test_datafusion, init_tracing, run_query_and_check_results,
-    utils::test_request_context,
+    utils::{register_test_connectors, test_request_context},
 };
 
 /// Returns `true` when the `git` CLI is available on `PATH`.
@@ -124,6 +124,7 @@ async fn git_connector_local_repo_lists_files() -> Result<(), anyhow::Error> {
                 .build();
 
             configure_test_datafusion();
+            register_test_connectors().await;
             let mut rt = Runtime::builder().with_app(app).build().await;
             let cloned_rt = Arc::new(rt.clone());
 
@@ -184,6 +185,7 @@ async fn git_connector_local_repo_include_glob() -> Result<(), anyhow::Error> {
                 .build();
 
             configure_test_datafusion();
+            register_test_connectors().await;
             let mut rt = Runtime::builder().with_app(app).build().await;
             let cloned_rt = Arc::new(rt.clone());
 

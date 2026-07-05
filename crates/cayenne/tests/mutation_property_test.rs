@@ -666,14 +666,18 @@ async fn run_sequential(fixture: &TestFixture, w: &Workload, seed: u64) -> TestR
                 settle(&table, w.durability).await?;
             }
             Op::Restart => {
-                // A clean restart, not a crash: drain debounced maintenance (so the
-                // persisted count reflects every prior write) and checkpoint the RAM
-                // tier (so no un-acked mem rows are lost) before reopening — the
-                // model expects every applied op.
-                table.flush_pending_maintenance().await?;
+                // A clean restart, not a crash. For memory durability checkpoint the
+                // RAM tier first so no un-acked mem rows are lost (the model expects
+                // every applied op). Then DRAIN this instance's detached maintenance:
+                // a real crash would kill it, and an in-process reopen must drain it
+                // or the old instance's compaction can commit against the shared
+                // catalog concurrently with the reopened provider (distinct
+                // `compaction_lock`s), corrupting the protected-snapshot set. See
+                // `drain_in_flight_maintenance`.
                 if w.durability == Durability::Memory {
                     table.checkpoint_mem_tier().await?;
                 }
+                table.drain_in_flight_maintenance().await?;
                 let (t, c) = reopen_table(fixture, &name).await?;
                 table = t;
                 ctx = c;
@@ -695,9 +699,11 @@ async fn run_sequential(fixture: &TestFixture, w: &Workload, seed: u64) -> TestR
         );
     }
 
-    // Final settle (checkpoints the RAM tier for memory) so the reopened state is
-    // durable, then re-verify from a fresh provider.
+    // Final settle (memory: checkpoint RAM + bake; both: compact) so the reopened
+    // state is durable, then drain this instance's in-flight detached maintenance
+    // before reopening from the catalog (see the loop's Op::Restart).
     settle(&table, w.durability).await?;
+    table.drain_in_flight_maintenance().await?;
     let (t, c) = reopen_table(fixture, &name).await?;
     let final_state = read_rows(&c, &name).await?;
     let msg = format!(
@@ -780,14 +786,19 @@ async fn run_concurrent(fixture: &TestFixture, w: &Workload, seed: u64) -> TestR
             Op::Restart => {
                 // Exclusive: waits for any in-flight compaction, then reopens
                 // from the catalog and swaps in the fresh provider + context.
+                // Drain the OLD instance's detached maintenance first so it cannot
+                // commit against the shared catalog after the reopen (its
+                // `compaction_lock` is distinct from the reopened provider's — the
+                // background compactor's read lock does NOT gate it).
                 let mut guard = handle.write().await;
-                // Clean restart: drain debounced maintenance + checkpoint the RAM
-                // tier before reopen so the persisted count is current and no
-                // un-acked mem rows are lost (the model expects every applied op).
-                guard.flush_pending_maintenance().await?;
+                // Clean restart: for memory durability checkpoint the RAM tier
+                // (persist un-acked mem rows), then drain this instance's detached
+                // maintenance so it cannot commit against the shared catalog after
+                // the reopen.
                 if w.durability == Durability::Memory {
                     guard.checkpoint_mem_tier().await?;
                 }
+                guard.drain_in_flight_maintenance().await?;
                 let (nt, nc) = reopen_table(fixture, &name).await?;
                 if w.durability == Durability::Memory {
                     nt.install_slot_advancer(Arc::new(NoopSlotAdvancer));
@@ -805,6 +816,9 @@ async fn run_concurrent(fixture: &TestFixture, w: &Workload, seed: u64) -> TestR
     compactor.await.expect("compaction task joins");
     let table = Arc::clone(&*handle.read().await);
     settle(&table, w.durability).await?;
+    // Quiesce before the final assertion so no detached compaction from this (or
+    // an earlier, since-replaced) instance commits mid-read.
+    table.drain_in_flight_maintenance().await?;
 
     let live = read_rows(&ctx, &name).await?;
     let msg = format!(

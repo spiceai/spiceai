@@ -16,8 +16,6 @@ limitations under the License.
 
 //! Data structures for Cayenne metadata.
 
-use std::num::NonZeroUsize;
-
 use arrow_schema::SchemaRef;
 use datafusion_table_providers::util::on_conflict::OnConflict;
 use serde::{Deserialize, Serialize};
@@ -715,34 +713,6 @@ pub struct VortexConfig {
     /// [`crate::provider::table::BAKE_DELETION_INDEX_TRIGGER`]).
     #[serde(default = "default_bake_deletion_index_trigger")]
     pub bake_deletion_index_trigger: usize,
-    /// Per-table threshold: number of orphan-eligible key-based deletion vectors
-    /// (count of `cayenne_delete_file` rows, NOT masked rows) that must accumulate
-    /// on a single table before its cleanup sweep runs. A key DV becomes
-    /// orphan-eligible only once **time-based retention** empties the protected
-    /// snapshot(s) it shadowed, raising the surviving-sequence floor above its
-    /// delete sequence so it shadows nothing (issue #9388). Without a retention
-    /// policy no DVs are ever orphaned and the sweep is a no-op.
-    ///
-    /// This governs ONLY the orphaned tail. The live (not-yet-orphaned) DV set —
-    /// DVs still shadowing rows in un-emptied snapshots — is bounded separately by
-    /// compaction's seq-prefix bake (see [`crate::provider::memory_account`]: "the
-    /// real bound on deletions is compaction"), not by this knob.
-    ///
-    /// `Some(20)` is the default. `None` disables cleanup entirely — no
-    /// background sweep is spawned, so the file-based DELETE path acquires no
-    /// extra locks and runs no catalog scan (the pre-feature behavior). The
-    /// `NonZeroUsize` type makes a misconfigured `0` unrepresentable; the spicepod
-    /// param (`cayenne_orphaned_dv_cleanup_min_files`) maps `0` to `None`
-    /// (disabled) and, when left unset, falls back to this default (`20`). A
-    /// larger value sweeps less often
-    /// (cheaper, but orphaned `.arrow` files linger on disk longer); a smaller
-    /// value reclaims disk sooner. Each orphaned `.arrow` file's size scales with
-    /// the number of deletions it records, so lingering disk ≈
-    /// `n_tables × threshold × avg_dv_size` (`avg_dv_size` was ~63 KiB, up to
-    /// ~870 KiB, in an SF-100 CH-benCHmark sample). The sweep is lock-free and
-    /// runs off the write path on the dedicated compaction runtime, so this only
-    /// trades sweep frequency against lingering disk — never ingest latency.
-    pub orphaned_dv_cleanup_min_files: Option<NonZeroUsize>,
     /// Number of protected snapshots that can accumulate before snapshot-maintenance
     /// compaction is eligible to run. Kept separate from `compaction_trigger_files`
     /// so small-file compaction tuning does not silently change scan amplification
@@ -994,6 +964,47 @@ pub struct VortexConfig {
     /// with `cayenne_force_view_types: true`).
     #[serde(skip)]
     pub force_view_read_schema: bool,
+
+    // ---- Cold object-store tier (storage-cascade bottom tier; cascade model) ----
+    /// Absolute object-store URL prefix for the cold tier (e.g.
+    /// `s3://bucket/prefix`). `None`/empty (the default) disables the cold tier.
+    /// Set from the `cayenne_cold_tier_location` spicepod param. Persisted so a
+    /// reopened table knows where its cold files live; NOT compared by
+    /// `configuration_matches`, so toggling it never recreates the table (the
+    /// cold tier is a strict superset of behavior over an unchanged warm tier).
+    pub cold_tier_location: Option<String>,
+    /// Liquid-clustering key columns for cold files (multi-column Z-order).
+    /// Empty = fall back to `sort_columns`, then the primary key. Set from
+    /// `cayenne_cold_clustering_columns`.
+    pub cold_clustering_columns: Vec<String>,
+    /// Target size for cold Vortex files in MB. Larger than the warm
+    /// `target_vortex_file_size_mb` because object stores favor fewer, larger
+    /// objects and cold scans are range reads. Set from
+    /// `cayenne_cold_target_file_size_mb`. Defaults to 512.
+    pub cold_target_file_size_mb: usize,
+    /// Promotion fires only once the warm tier exceeds this many bytes
+    /// (`<= 0` disables the byte trigger). Set from
+    /// `cayenne_cold_tier_warm_max_bytes`.
+    pub cold_tier_warm_max_bytes: i64,
+    /// Promotion fires only once the warm tier exceeds this many files
+    /// (`0` disables the file-count trigger). Set from
+    /// `cayenne_cold_tier_warm_max_files`.
+    pub cold_tier_warm_max_files: usize,
+    /// How often (ms) the background loop evaluates the cold-promotion trigger.
+    /// Cold tiering is not latency-critical, so this is much coarser than the
+    /// compaction interval. Set from `cayenne_cold_tier_background_interval_ms`.
+    /// Defaults to 60s.
+    pub cold_tier_background_interval_ms: u64,
+}
+
+impl VortexConfig {
+    /// Whether the cold object-store tier is enabled (a non-empty location set).
+    #[must_use]
+    pub fn cold_tier_enabled(&self) -> bool {
+        self.cold_tier_location
+            .as_ref()
+            .is_some_and(|s| !s.trim().is_empty())
+    }
 }
 
 /// Evolution set permitted when a widening schema difference is detected at
@@ -1255,12 +1266,6 @@ impl Default for VortexConfig {
             write_concurrency: None,
             compaction_trigger_files: default_compaction_trigger_files(),
             bake_deletion_index_trigger: default_bake_deletion_index_trigger(),
-            // Orphaned-DV cleanup enabled by default at a per-table threshold of 20
-            // (retention-only: a no-op until time-based retention orphans DVs; the
-            // sweep is lock-free/off-path, so enabling it does not affect ingest —
-            // validated no-regression on CH-benCHmark SF-1000). Set the spicepod
-            // param `cayenne_orphaned_dv_cleanup_min_files` to `0` to disable.
-            orphaned_dv_cleanup_min_files: NonZeroUsize::new(20),
             compaction_trigger_protected_snapshots: default_compaction_trigger_protected_snapshots(
             ),
             compaction_trigger_snapshot_age_ms: default_compaction_trigger_snapshot_age_ms(),
@@ -1298,6 +1303,12 @@ impl Default for VortexConfig {
             data_storage_write_mbps: None,
             metastore_storage_write_mbps: None,
             force_view_read_schema: false,
+            cold_tier_location: None,
+            cold_clustering_columns: Vec::new(),
+            cold_target_file_size_mb: 512,
+            cold_tier_warm_max_bytes: 0,
+            cold_tier_warm_max_files: 0,
+            cold_tier_background_interval_ms: 60_000,
         }
     }
 }
@@ -1554,6 +1565,43 @@ pub struct SnapshotFile {
     pub min_sequence: i64,
     /// Inclusive maximum commit sequence of the rows in this file.
     pub max_sequence: i64,
+}
+
+/// One row of the cold-tier object-store manifest (`cayenne_cold_tier_file`).
+///
+/// The cold tier is the bottom of the storage cascade (RAM mem-tier →
+/// local-disk warm Vortex snapshot → object-store cold). A background promotion
+/// stage rewrites settled/aged warm files as read-optimized (Z-order clustered)
+/// Vortex files on the cold object store and records one row here per file.
+///
+/// Unlike [`SnapshotFile`], cold files are **table-scoped** (not a member of any
+/// snapshot directory) and append-only: a promoted file is referenced only from
+/// this table, never from `cayenne_snapshot_file`. `file_url` is the *absolute*
+/// object-store URL (e.g. `s3://bucket/prefix/{table_id}/cold/<id>.vortex`),
+/// because the cold location may differ from the table's warm path. The embedded
+/// `statistics_blob` (serialized Vortex [`FileStatistics`]: per-column min/max/
+/// null/sum) lets the scan prune cold files at listing time with no object-store
+/// round-trip. `min_sequence`/`max_sequence` carry the file's commit-seq range
+/// (cold files hold the oldest, fully-superseded data — below all protected
+/// snapshots and retention at promotion time).
+#[derive(Debug, Clone)]
+pub struct ColdTierFile {
+    /// Table this cold file belongs to (`UUIDv7`).
+    pub table_id: String,
+    /// Absolute object-store URL of the `.vortex` data file on the cold store.
+    pub file_url: String,
+    /// Live row count in the file (post-merge, single-version-per-key).
+    pub row_count: i64,
+    /// `ObjectMeta::size` of the file in bytes.
+    pub file_size_bytes: i64,
+    /// Inclusive minimum commit sequence of the rows in this file.
+    pub min_sequence: i64,
+    /// Inclusive maximum commit sequence of the rows in this file.
+    pub max_sequence: i64,
+    /// Serialized Vortex `FileStatistics` flatbuffer (per-column min/max/null/
+    /// sum). Always populated at promotion (copied from the written footer) so
+    /// listing-time pruning never falls back to a full scan.
+    pub statistics_blob: Vec<u8>,
 }
 
 /// Table-level statistics stored as a serialized Vortex [`FileStatistics`] blob.

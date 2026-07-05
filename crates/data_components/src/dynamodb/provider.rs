@@ -25,7 +25,7 @@ use crate::dynamodb::arrow::dynamodb_items_to_arrow;
 use crate::dynamodb::dml::delete::DynamoDBDeletionSink;
 use crate::dynamodb::dml::insert::DynamoDBInsertSink;
 use crate::dynamodb::dml::update::{DynamoDBUpdateExec, UpdateConfig};
-use crate::dynamodb::json_nest::{JsonNesting, json_nest_except_fields};
+use crate::dynamodb::json_nest::project_dynamodb_row;
 use crate::dynamodb::request_builder::DynamoDBRequestPlanBuilder;
 use crate::dynamodb::request_plan::{DynamoDBRequestPlan, QueryParams, ScanParams};
 use crate::dynamodb::schema::infer_arrow_schema_from_rows;
@@ -33,6 +33,7 @@ use crate::dynamodb::stream::{StreamError, process_batch, record_batch_to_change
 use crate::dynamodb::table_schema::DynamoDBTableSchema;
 use crate::dynamodb::unnest::unnest_dynamodb_rows;
 use crate::schema_discovery::merge_inferred_and_declared_schemas;
+use crate::schema_projection::SchemaProjection;
 use arrow::datatypes::SchemaRef;
 use async_trait::async_trait;
 use aws_config::SdkConfig;
@@ -86,7 +87,7 @@ pub struct DynamoDBTableProvider {
     config_partitions: Option<usize>,
     table_total_item_count: Option<i64>,
     pub ready_lag: Duration,
-    json_nesting: Option<JsonNesting>,
+    projection: Option<SchemaProjection>,
     write_parallelism: usize,
     streams_enabled: bool,
 }
@@ -122,7 +123,7 @@ impl DynamoDBTableProvider {
         time_format: String,
         ready_lag: Duration,
         metrics_collector: Arc<MetricsCollector>,
-        json_nesting: Option<&JsonNesting>,
+        projection: Option<&SchemaProjection>,
         write_parallelism: usize,
         declared_schema: Option<SchemaRef>,
     ) -> Result<Self, Error> {
@@ -149,16 +150,17 @@ impl DynamoDBTableProvider {
             unnest_depth,
             schema_infer_max_records,
             &time_format,
-            json_nesting,
+            projection,
             declared_schema,
         )
         .await?;
 
-        // Check that all static fields are present in the table schema
-        if let Some(static_fields) =
-            json_nesting.map(|json_nesting| json_nesting.static_fields.clone())
-        {
-            let missing_fields: Vec<String> = static_fields
+        // When JSON nesting is configured, every declared (static) column must
+        // be present in the table schema. (Pure type-pinning projections, with
+        // no catch-all, may legitimately declare columns absent from the source.)
+        if let Some(projection) = projection.filter(|p| p.has_catch_all()) {
+            let missing_fields: Vec<String> = projection
+                .static_fields()
                 .iter()
                 .filter(|field_name| table_schema.index_of(field_name).is_err())
                 .cloned()
@@ -209,7 +211,7 @@ impl DynamoDBTableProvider {
             config_partitions,
             table_total_item_count,
             ready_lag,
-            json_nesting: json_nesting.cloned(),
+            projection: projection.cloned(),
             write_parallelism,
             streams_enabled,
         })
@@ -283,7 +285,7 @@ impl DynamoDBTableProvider {
             config_partitions,
             table_total_item_count: None,
             ready_lag,
-            json_nesting: None,
+            projection: None,
             write_parallelism,
             streams_enabled: false,
         })
@@ -341,7 +343,7 @@ impl DynamoDBTableProvider {
         unnest_depth: Option<usize>,
         schema_infer_max_records: i32,
         time_format: &str,
-        json_nesting: Option<&JsonNesting>,
+        projection: Option<&SchemaProjection>,
         declared_schema: Option<SchemaRef>,
     ) -> Result<TableMetadata> {
         let response = db_client
@@ -426,9 +428,14 @@ impl DynamoDBTableProvider {
             Some(depth) => unnest_dynamodb_rows(rows, depth)?,
         };
 
-        let final_rows = match json_nesting {
+        // Apply JSON nesting (only when a catch-all is configured); type-only
+        // projections leave rows untouched.
+        let final_rows = match projection.filter(|p| p.has_catch_all()) {
             None => unnested_rows,
-            Some(json_nesting) => json_nest_except_fields(unnested_rows, json_nesting)?,
+            Some(projection) => unnested_rows
+                .into_iter()
+                .map(|row| project_dynamodb_row(row, projection))
+                .collect(),
         };
 
         tracing::debug!(
@@ -490,7 +497,7 @@ impl DynamoDBTableProvider {
         let primary_keys = self.table_schema.primary_keys().clone();
         let unnest_depth = self.unnest_depth;
         let time_format = Arc::clone(&self.table_schema.time_format());
-        let json_nesting = self.json_nesting.clone();
+        let projection = self.projection.clone();
 
         let stream = self
             .streams_client
@@ -504,7 +511,7 @@ impl DynamoDBTableProvider {
                     &primary_keys,
                     unnest_depth,
                     &time_format,
-                    json_nesting.as_ref(),
+                    projection.as_ref(),
                 )
                 .map_err(crate::cdc::StreamError::DynamoDB)
             });
@@ -615,10 +622,15 @@ impl TableProvider for DynamoDBTableProvider {
             projected_schema = SchemaRef::from(self.table_schema.schema().project(&[idx])?);
         }
 
+        // Pushing a projection expression down to DynamoDB is incompatible with
+        // JSON nesting: the catch-all needs every non-declared attribute, so we
+        // must fetch the whole item. Signal "nesting on" with the static set
+        // (its presence, not contents, gates pushdown in build_request_plan).
         let json_nesting_static_fields = self
-            .json_nesting
+            .projection
             .as_ref()
-            .map(|json_nesting| json_nesting.static_fields.clone());
+            .filter(|p| p.has_catch_all())
+            .map(|p| p.static_fields().clone());
 
         let request_plan = self.request_plan_builder.build_request_plan(
             filters,
@@ -656,7 +668,7 @@ impl TableProvider for DynamoDBTableProvider {
             projected_schema,
             total_partitions,
             self.table_schema.time_format(),
-            self.json_nesting.clone(),
+            self.projection.clone(),
         )))
     }
 
@@ -738,7 +750,7 @@ pub struct DynamoDBTableProviderExec {
     unnest_depth: Option<usize>,
     time_format: Arc<String>,
     properties: Arc<PlanProperties>,
-    json_nesting: Option<JsonNesting>,
+    projection: Option<SchemaProjection>,
 }
 
 impl DynamoDBTableProviderExec {
@@ -750,7 +762,7 @@ impl DynamoDBTableProviderExec {
         projected_schema: SchemaRef,
         partitions: usize,
         time_format: Arc<String>,
-        json_nesting: Option<JsonNesting>,
+        projection: Option<SchemaProjection>,
     ) -> Self {
         Self {
             client,
@@ -758,7 +770,7 @@ impl DynamoDBTableProviderExec {
             projected_schema: Arc::clone(&projected_schema),
             unnest_depth,
             time_format,
-            json_nesting,
+            projection,
             properties: Arc::new(PlanProperties::new(
                 EquivalenceProperties::new(projected_schema),
                 Partitioning::UnknownPartitioning(partitions),
@@ -822,7 +834,7 @@ impl ExecutionPlan for DynamoDBTableProviderExec {
         let request_plan = self.request_plan.clone();
         let unnest_depth = self.unnest_depth;
         let time_format = Arc::clone(&self.time_format);
-        let json_nesting = self.json_nesting.clone();
+        let projection = self.projection.clone();
 
         let total_partitions = match self.properties.partitioning {
             Partitioning::RoundRobinBatch(_) | Partitioning::Hash(_, _) => 1,
@@ -858,10 +870,12 @@ impl ExecutionPlan for DynamoDBTableProviderExec {
                     Some(depth) => unnest_dynamodb_rows(rows, depth).map_err(to_execution_error)?,
                 };
 
-                let final_rows = match json_nesting.clone() {
+                let final_rows = match projection.as_ref().filter(|p| p.has_catch_all()) {
                     None => unnested_rows,
-                    Some(ref json_nesting) => json_nest_except_fields(unnested_rows, json_nesting)
-                        .map_err(to_execution_error)?,
+                    Some(projection) => unnested_rows
+                        .into_iter()
+                        .map(|row| project_dynamodb_row(row, projection))
+                        .collect(),
                 };
 
                 let batch = dynamodb_items_to_arrow(&final_rows, Arc::clone(&schema), &time_format)
