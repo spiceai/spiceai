@@ -17720,12 +17720,11 @@ impl CayenneTableProvider {
         }
 
         let total_rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
-        let estimated_bytes = Some(
-            batches
-                .iter()
-                .map(|b| b.get_array_memory_size() as u64)
-                .fold(0u64, u64::saturating_add),
-        );
+        let estimated_flushed_bytes = batches
+            .iter()
+            .map(|b| b.get_array_memory_size() as u64)
+            .fold(0u64, u64::saturating_add);
+        let estimated_bytes = Some(estimated_flushed_bytes);
         tracing::info!(
             table = %self.table_metadata.table_name,
             rows = flushed_mem_rows,
@@ -17965,6 +17964,15 @@ impl CayenneTableProvider {
             &self.table_metadata.table_name,
             "mem_tier_checkpoint",
             checkpoint_start,
+        );
+        tracing::debug!(
+            target: "cayenne::mem_tier",
+            table = self.table_metadata.table_name.as_str(),
+            flushed_rows = flushed_mem_rows,
+            flushed_bytes = estimated_flushed_bytes,
+            durable_epoch = flushed_epoch,
+            elapsed_ms = u64::try_from(checkpoint_start.elapsed().as_millis()).unwrap_or(u64::MAX),
+            "Mem-tier checkpoint flushed a durable snapshot"
         );
         // ONLY NOW — after the Vortex file + metastore pointer are durable — tell
         // the runtime it may advance the source slot to cover this epoch.
@@ -19386,6 +19394,10 @@ impl CayenneTableProvider {
                     // Protected-snapshot scans are internal union branches, not the
                     // user point-lookup path — keep default repartition.
                     false,
+                    // …but small delta snapshots must not be byte-range-split
+                    // `target_partitions` ways: with tens of protected snapshots
+                    // that multiplies file opens ~50× for no parallelism gain
+                    Self::SMALL_GROUP_REPARTITION_OPT_OUT_BYTES,
                 )
                 .await?;
 
@@ -19496,6 +19508,13 @@ impl CayenneTableProvider {
         Some(vec![exprs])
     }
 
+    /// File groups smaller than this opt out of `repartition_file_scans`
+    /// byte-range splitting on internal and protected-snapshot scans (see
+    /// `create_snapshot_scan_plan_with_config`). A small
+    /// group split into `target_partitions` scan units pays a Vortex footer-open
+    /// per split for no decode parallelism worth having.
+    const SMALL_GROUP_REPARTITION_OPT_OUT_BYTES: u64 = 256 * 1024 * 1024;
+
     async fn create_snapshot_scan_plan(
         &self,
         state: &dyn Session,
@@ -19520,6 +19539,9 @@ impl CayenneTableProvider {
             None,
             // Internal reads are not user point-lookups — keep default repartition.
             false,
+            // Internal reads (compaction, keyset) also benefit from keeping small
+            // groups whole: merging N small runs otherwise pays N × tp footer opens.
+            Self::SMALL_GROUP_REPARTITION_OPT_OUT_BYTES,
         )
         .await
     }
@@ -19550,6 +19572,11 @@ impl CayenneTableProvider {
         // `with_target_partitions(1)` alone is insufficient: the physical
         // optimizer re-splits using the OUTER session's `target_partitions`.
         disable_repartition: bool,
+        // Auto-variant of `disable_repartition` for small file groups: when the
+        // listed group's total bytes are below this threshold, opt out of
+        // byte-range splitting the same way (`0` disables the auto opt-out — the
+        // main query branch keeps default splitting behavior).
+        small_group_repartition_opt_out_bytes: u64,
     ) -> datafusion_common::Result<Arc<dyn ExecutionPlan>> {
         // The reference schema the Vortex decode targets. Internal reads
         // (compaction, keyset, stats) pass `None` -> stored `Utf8`/`Binary`,
@@ -19694,6 +19721,27 @@ impl CayenneTableProvider {
         let mut file_source = options
             .format
             .file_source(Self::snapshot_file_table_schema(&base_schema, &options));
+
+        // Small groups gain no decode parallelism worth having from being
+        // byte-range-split into `target_partitions` scan units, but pay a Vortex
+        // footer-open per split (measured at SF-1000: 44 protected snapshots ×
+        // ~4 physical files → 2,226 opens per order_line scan). Opt them out the
+        // same way selective scans do; downstream RoundRobin repartitioning
+        // restores operator parallelism above the unsplit source. Large groups
+        // (e.g. the compacted base) still split.
+        //
+        // NOTE: this disables ONLY the optimizer's byte-range re-split. The
+        // listing above already distributed whole files across partitions
+        // (`split_files`), so file-level scan parallelism (one stream per file)
+        // is preserved either way.
+        let group_bytes: u64 = partitioned_file_lists
+            .iter()
+            .flat_map(|group| group.iter())
+            .map(|file| file.object_meta.size)
+            .sum();
+        let disable_repartition = disable_repartition
+            || (small_group_repartition_opt_out_bytes > 0
+                && group_bytes < small_group_repartition_opt_out_bytes);
 
         // Selective scans opt the Vortex source out of `repartition_file_scans`
         // so the matching file group is not byte-range-split into N partitions
@@ -21256,6 +21304,12 @@ impl TableProvider for CayenneTableProvider {
                 allow_sorted_ordering,
                 Some(Arc::clone(&read_schema)),
                 is_pk_selective_scan,
+                // The main branch keeps default splitting (opt-out disabled).
+                // Unlike protected-snapshot branches — which sit under a Union
+                // whose sibling branches already saturate the cores — the main
+                // branch is often the scan's ONLY source, so byte-range
+                // splitting can be its only decode parallelism.
+                0,
             )
             .await;
         self.record_listing_scan_duration(listing_scan_start.elapsed());
@@ -22453,6 +22507,7 @@ impl super::compaction::MemTierCheckpointRunner for CayenneTableProvider {
         // tick. `checkpoint_mem_tier` also early-returns `Ok(0)` on an empty
         // tier, so this is purely to avoid contending the lock with the write
         // path when there is nothing to do.
+        let mut fired_outcome: &'static str = "fired";
         {
             // Whole-tier gate (SUM/oldest across shards, never per-shard): a
             // checkpoint is always all-shards-atomic (§3.4 Fix 2), so the trigger
@@ -22478,24 +22533,32 @@ impl super::compaction::MemTierCheckpointRunner for CayenneTableProvider {
             // is refreshed ~every 1s by the controller's `on_background_tick`
             // (`observe_environment`); `None` (non-Linux / no budget) leaves the
             // churn gate fully intact.
+            //
+            // The bypass is PROPORTIONAL: it fires only when the resident tier is
+            // worth releasing (>= `min_flush / 4`). Sustained critical pressure
+            // (e.g. large analytical joins holding the query pool) with a small
+            // tier would otherwise force-flush one coalesced CDC batch per tick —
+            // freeing ~nothing while emitting a snapshot dir per tick
             let mem_critical = self
                 .context
                 .mem_pressure()
                 .is_some_and(|p| p >= super::tuning::MEM_PRESSURE_CRITICAL);
-            if mem_critical {
+            let min_flush = self
+                .table_metadata
+                .vortex_config
+                .cdc_mem_tier_min_flush_bytes;
+            let resident = i64::try_from(self.mem_tier.total_bytes()).unwrap_or(i64::MAX);
+            let pressure_bypass = mem_critical && min_flush > 0 && resident >= min_flush / 4;
+            if pressure_bypass {
+                fired_outcome = "fired_pressure_bypass";
                 tracing::debug!(
                     target: "cayenne::mem_tier",
                     table = %self.table_metadata.table_name,
                     "Critical memory pressure: forcing a mem-tier checkpoint (bypassing the churn gate) to release resident RAM"
                 );
             }
-            let min_flush = self
-                .table_metadata
-                .vortex_config
-                .cdc_mem_tier_min_flush_bytes;
-            if min_flush > 0 && !mem_critical {
-                let size_ready =
-                    i64::try_from(self.mem_tier.total_bytes()).unwrap_or(i64::MAX) >= min_flush;
+            if min_flush > 0 && !pressure_bypass {
+                let size_ready = resident >= min_flush;
                 if !size_ready && !self.mem_tier_age_cap_reached_whole_tier() {
                     emit_tick("skipped_gate");
                     return;
@@ -22521,7 +22584,7 @@ impl super::compaction::MemTierCheckpointRunner for CayenneTableProvider {
                 "Periodic mem-tier checkpoint failed (deferred slot ack not advanced; will retry next tick): {e}"
             );
         } else {
-            emit_tick("fired");
+            emit_tick(fired_outcome);
         }
     }
 
@@ -25062,6 +25125,102 @@ mod tests {
         );
     }
 
+    /// The critical-memory-pressure churn-gate bypass must be PROPORTIONAL: a
+    /// tiny resident tier (≈ one coalesced CDC batch) must NOT be force-flushed
+    /// every tick — that frees ~no RAM yet emits a snapshot dir per tick
+    #[tokio::test]
+    #[expect(
+        clippy::items_after_statements,
+        reason = "the no-op SlotAdvancer is defined inline next to its single use"
+    )]
+    async fn mem_tier_critical_pressure_bypass_skips_tiny_tier() {
+        let runtime_env = SessionContext::new().runtime_env();
+        // Huge min_flush, no age cap: only the pressure bypass could flush.
+        let (provider, _tmp) = create_memory_mode_table_with_caps(
+            "pressure_tiny_tier",
+            runtime_env,
+            i64::MAX,
+            0,
+            1_i64 << 40, // 1 TiB min_flush -> bypass threshold 256 GiB
+        )
+        .await;
+        struct NoopAdvancer;
+        #[async_trait::async_trait]
+        impl crate::provider::mem_tier::SlotAdvancer for NoopAdvancer {
+            async fn on_checkpoint_durable(&self, _durable_epoch: u64) {}
+        }
+        provider.install_slot_advancer(Arc::new(NoopAdvancer));
+
+        let no_deletions = OnConflictDeletions::default();
+        let b = int64_id_batch(&[1, 2, 3]);
+        let bytes = b.get_array_memory_size() as u64;
+        provider
+            .append_to_mem_tier(vec![b], &no_deletions, bytes, 0)
+            .await
+            .expect("append");
+
+        provider.context.set_mem_pressure_for_test(0.99);
+        provider.run_mem_tier_checkpoint_tick().await;
+        assert!(
+            !provider.mem_tier.tier().load().is_empty(),
+            "critical pressure must not flush a tiny tier: releasing ~nothing is \
+             not worth a snapshot dir per tick (the churn gate holds)"
+        );
+    }
+
+    /// Counterpart: under critical pressure a tier holding at least
+    /// `min_flush / 4` IS flushed (the bypass releases meaningful RAM), even
+    /// though the normal size/age gate would still hold.
+    #[tokio::test]
+    #[expect(
+        clippy::items_after_statements,
+        reason = "the no-op SlotAdvancer is defined inline next to its single use"
+    )]
+    async fn mem_tier_critical_pressure_bypass_flushes_worthwhile_tier() {
+        let runtime_env = SessionContext::new().runtime_env();
+        let no_deletions = OnConflictDeletions::default();
+        let ids: Vec<i64> = (0..400).collect();
+        let b = int64_id_batch(&ids);
+        let bytes = b.get_array_memory_size() as u64;
+        // min_flush = 4× the batch: the resident tier lands exactly at the
+        // `min_flush / 4` bypass threshold while staying under `min_flush`
+        // (so the normal size gate holds and only the bypass can flush).
+        let min_flush = i64::try_from(bytes * 4).expect("fits in i64");
+        let (provider, _tmp) = create_memory_mode_table_with_caps(
+            "pressure_worthwhile_tier",
+            runtime_env,
+            i64::MAX,
+            0,
+            min_flush,
+        )
+        .await;
+        struct NoopAdvancer;
+        #[async_trait::async_trait]
+        impl crate::provider::mem_tier::SlotAdvancer for NoopAdvancer {
+            async fn on_checkpoint_durable(&self, _durable_epoch: u64) {}
+        }
+        provider.install_slot_advancer(Arc::new(NoopAdvancer));
+
+        provider
+            .append_to_mem_tier(vec![b], &no_deletions, bytes, 0)
+            .await
+            .expect("append");
+
+        // Without pressure the churn gate holds (below min_flush, no age cap).
+        provider.run_mem_tier_checkpoint_tick().await;
+        assert!(
+            !provider.mem_tier.tier().load().is_empty(),
+            "below min_flush with no age cap: the churn gate holds without pressure"
+        );
+
+        provider.context.set_mem_pressure_for_test(0.99);
+        provider.run_mem_tier_checkpoint_tick().await;
+        assert!(
+            provider.mem_tier.tier().load().is_empty(),
+            "critical pressure flushes a tier at/above min_flush/4 (worth releasing)"
+        );
+    }
+
     /// Replayability safety gate (`cdc_durability: memory` is the default): the RAM
     /// path must engage ONLY after the runtime arms it via `install_slot_advancer`
     /// — which the runtime does only on the first batch whose committer reports
@@ -27368,6 +27527,77 @@ mod tests {
              (is_pk_selective_scan={fast_path_fires}, scan-build={before_sel_groups}); \
              supports_repartitioning()=false must stop repartition_file_scans from \
              byte-range-splitting the selective scan"
+        );
+    }
+
+    /// Small file groups opt the Vortex source out of `repartition_file_scans`
+    /// on internal/protected-snapshot scan plans: byte-range-splitting a small
+    /// snapshot into `target_partitions` scan units multiplies footer opens
+    /// ~tp× for no decode parallelism
+    #[tokio::test]
+    async fn small_snapshot_groups_opt_out_of_repartitioning() {
+        fn scan_source_allows_repartitioning(plan: &Arc<dyn ExecutionPlan>) -> Option<bool> {
+            if let Some(exec) = plan.downcast_ref::<datafusion_datasource::source::DataSourceExec>()
+            {
+                let config = exec.data_source().downcast_ref::<FileScanConfig>()?;
+                let vortex = config.file_source().downcast_ref::<VortexSource>()?;
+                return Some(vortex.supports_repartitioning());
+            }
+            plan.children()
+                .into_iter()
+                .find_map(scan_source_allows_repartitioning)
+        }
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("value", DataType::Int64, false),
+        ]));
+        let ctx = SessionContext::new();
+        // inline_max_rows = 0 ⇒ the insert lands as an on-disk Vortex file.
+        let vortex_config = VortexConfig {
+            inline_max_rows: 0,
+            ..VortexConfig::default()
+        };
+        let (provider, _temp_dir) = create_cayenne_table_with_config(
+            "small_group_repartition_opt_out",
+            Arc::clone(&schema),
+            vortex_config,
+            vec!["id".to_string()],
+            ctx.runtime_env(),
+        )
+        .await;
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int64Array::from_iter_values(0..1000)),
+                Arc::new(Int64Array::from_iter_values(0..1000)),
+            ],
+        )
+        .expect("batch built");
+        insert_batch_with_context(&ctx, &provider, batch).await;
+
+        // Internal/protected-branch path: the tiny group opts out of splitting.
+        let snapshot_id = provider.get_current_snapshot_id();
+        let internal_plan = provider
+            .create_snapshot_scan_plan(&ctx.state(), &snapshot_id, None, &[], None)
+            .await
+            .expect("internal scan plan");
+        assert_eq!(
+            scan_source_allows_repartitioning(&internal_plan),
+            Some(false),
+            "a small file group must report supports_repartitioning()==false so \
+             repartition_file_scans does not byte-range-split it"
+        );
+
+        // Main-branch control: default splitting stays enabled (threshold 0).
+        let main_plan = provider
+            .scan(&ctx.state(), None, &[], None)
+            .await
+            .expect("main scan plan");
+        assert_eq!(
+            scan_source_allows_repartitioning(&main_plan),
+            Some(true),
+            "the main query branch keeps default repartitioning"
         );
     }
 

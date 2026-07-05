@@ -1231,7 +1231,23 @@ impl RefreshTask {
                 pending_commit: &mut pending_commit,
                 deferred_commits: deferred_commits.as_ref(),
             };
-            if !self.apply_burst(&mut apply_context, burst).await {
+            // Which cap closed this burst — the tuning signal for `cdc_max_coalesced_envelopes` /
+            // `cdc_max_coalesced_bytes` / `cdc_max_coalesce_age_ms`
+            let close_reason = if burst.len() >= max_burst {
+                "envelope_cap"
+            } else if carried_item.is_some() || burst_bytes >= max_burst_bytes {
+                "byte_cap"
+            } else if channel_closed {
+                "stream_end"
+            } else if cdc_cfg.max_coalesce_age_ms > 0 {
+                "age_deadline"
+            } else {
+                "drained"
+            };
+            if !self
+                .apply_burst(&mut apply_context, burst, close_reason)
+                .await
+            {
                 rx.close();
                 reader_handle.abort();
                 break;
@@ -1346,6 +1362,7 @@ impl RefreshTask {
         &self,
         context: &mut ApplyContext<'_>,
         burst: Vec<Result<cdc::ChangeEnvelope, cdc::StreamError>>,
+        close_reason: &'static str,
     ) -> bool {
         let burst_start = Instant::now();
         let burst_envelopes = u64::try_from(burst.len()).unwrap_or(u64::MAX);
@@ -1407,6 +1424,15 @@ impl RefreshTask {
                 }
             }
         }
+        tracing::debug!(
+            dataset = %context.dataset_name,
+            envelopes = burst_envelopes,
+            bytes = burst_bytes,
+            rows = burst_rows,
+            close_reason,
+            apply_ms = elapsed_ms(burst_start),
+            "Applied coalesced CDC change burst"
+        );
         metrics::CDC_APPLY_BURST_DURATION_MS.record(elapsed_ms(burst_start), &labels);
         true
     }
