@@ -19740,7 +19740,7 @@ impl CayenneTableProvider {
         // is preserved either way.
         let group_bytes: u64 = partitioned_file_lists
             .iter()
-            .flat_map(|group| group.iter())
+            .flat_map(FileGroup::iter)
             .map(|file| file.object_meta.size)
             .sum();
         let disable_repartition = disable_repartition
