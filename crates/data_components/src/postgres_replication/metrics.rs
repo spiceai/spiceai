@@ -79,6 +79,16 @@ pub struct MetricsCollector {
     /// reconnect storm — during that time no changes are delivered and lag grows,
     /// and Postgres replays from the held floor on resume.
     replication_disconnected_ms_total: AtomicU64,
+    /// Liveness: `1` while this dataset's stream is attached and routing, `0` once it
+    /// detaches (receiver dropped / sink died / mid-snapshot failure). A detached
+    /// member pins the shared slot's WAL retention and its rate ladder is meaningless
+    /// — this is a FIRST-CLASS signal the analysis checks before any classification.
+    /// Defaults to `1` (attached) so the per-dataset (non-shared) path reads live.
+    member_attached: AtomicU64,
+    /// The replication slot this dataset is a member of (for shared slots, several
+    /// datasets share one). Lets the analysis join the per-dataset view to the
+    /// authoritative per-slot backlog and show grouping. Set at (shared) attach.
+    slot_name: RwLock<Option<String>>,
 
     // Watermark: commit time of the most-recent transaction we've ingested.
     // Used to compute `replication_lag_ms = now - watermark`.
@@ -88,7 +98,23 @@ pub struct MetricsCollector {
 impl MetricsCollector {
     #[must_use]
     pub fn new() -> Arc<Self> {
-        Arc::new(Self::default())
+        let collector = Self::default();
+        // Attached by default; the shared path flips this to 0 on detach.
+        collector.member_attached.store(1, Ordering::Relaxed);
+        Arc::new(collector)
+    }
+
+    /// Mark the member attached (`true`) or detached (`false`).
+    pub fn set_member_attached(&self, attached: bool) {
+        self.member_attached
+            .store(u64::from(attached), Ordering::Relaxed);
+    }
+
+    /// Record which replication slot this member belongs to (shared-slot grouping).
+    pub fn set_slot_name(&self, slot: String) {
+        if let Ok(mut guard) = self.slot_name.write() {
+            *guard = Some(slot);
+        }
     }
 
     pub fn inc_insert(&self) {
@@ -378,6 +404,14 @@ impl Metrics {
         self.collector
             .replication_disconnected_ms_total
             .load(Ordering::Relaxed)
+    }
+    #[must_use]
+    pub fn member_attached(&self) -> u64 {
+        self.collector.member_attached.load(Ordering::Relaxed)
+    }
+    #[must_use]
+    pub fn slot_name(&self) -> Option<String> {
+        self.collector.slot_name.read().ok().and_then(|g| g.clone())
     }
 }
 

@@ -119,6 +119,7 @@ REQUIRED_METRICS = [
     ("dataset_postgres_replication_reader_processing_micros_total", "counter", "name"),
     ("dataset_postgres_replication_reconnects_total", "counter", "name"),
     ("dataset_postgres_replication_disconnected_ms_total", "counter", "name"),
+    ("dataset_postgres_replication_member_attached", "gauge", "name,slot"),
     ("cayenne_mem_tier_reserve_refused_total", "counter", "(none) (memory mode)"),
     ("cayenne_mem_tier_checkpoint_tick_total", "counter", "table,outcome (memory mode)"),
 ]
@@ -241,6 +242,21 @@ def hist_count(data, base, want=None):
     return sum(_delta(f, l) for f, l in _pairs(data, base + "_count", want).values())
 
 
+def hist_top_finite_le(data, base, want=None):
+    """Largest finite bucket edge (`le`) of a histogram — the ceiling a quantile can
+    report. A quantile landing at/above this is a bucket-edge artifact (the true value
+    is in the +inf bucket), not a measurement, so callers render it as `≥ceiling`."""
+    top = None
+    for f, _ in _pairs(data, base + "_bucket", want).values():
+        le = f.get("labels", {}).get("le")
+        if le is None or le.lower() in ("+inf", "inf"):
+            continue
+        v = _parse_float(le)
+        if v is not None and (top is None or v > top):
+            top = v
+    return top
+
+
 def hist_quantile(data, base, q, want=None):
     """Windowed histogram_quantile over Δ`_bucket` (Δ per le, summed across series)."""
     per_le = {}
@@ -355,7 +371,8 @@ WAL_ACCUMULATING_BYTES_PER_S = 64 * 1024  # server-side byte backlog growth => s
 
 def classify_dataset(lag_p99, fill, arrival_p99, wal_slope, wal_max, top_stage,
                      memory_mode, residual_p99, apply_ratio, lag_slope_s,
-                     input_share, send_wait_p99, received_ratio=None, reconnects=0.0):
+                     input_share, send_wait_p99, received_ratio=None, reconnects=0.0,
+                     member_attached=1.0):
     """Decision tree over the measured evidence (thresholds heuristic; the deciding
     inputs are printed so the label is auditable).
 
@@ -380,8 +397,14 @@ def classify_dataset(lag_p99, fill, arrival_p99, wal_slope, wal_max, top_stage,
           f"reader_input_share={'?' if input_share is None else f'{input_share * 100:.0f}%'} "
           f"reader_send_wait_p99={send_wait_p99:.0f}ms "
           f"received_rate={'?' if received_ratio is None else f'{received_ratio:.2f}x'} "
-          f"reconnects={reconnects:.0f} memory_mode={memory_mode}")
-    # (1) Stream instability first: a dropping/replaying connection replays already-
+          f"reconnects={reconnects:.0f} member_attached={member_attached:.0f} memory_mode={memory_mode}")
+    # (0) Liveness FIRST: a member that detached mid-window has a frozen frontier and a
+    # meaningless rate ladder, and it pins the shared slot's WAL retention. Classifying
+    # it by its (stale) rates would be actively misleading — surface the death instead.
+    if member_attached == 0:
+        return ("STREAM-DEAD (member detached mid-window; frontier frozen + slot WAL "
+                "retention pinned — rate ladder below is stale, do not trust it)", ev)
+    # (1) Stream instability next: a dropping/replaying connection replays already-
     # applied rows (inflating apply) and resets the received/applied frontiers, so
     # every source-vs-apply signal below is unreliable until this is fixed.
     if reconnects >= 1:
@@ -497,6 +520,13 @@ def render(data):
         # Arrival + replication lag are absolute host-clock deltas, so skew-correct them.
         arrival_p50 = _skew_corr(hist_quantile(data, DA + "cdc_source_arrival_lag_ms", 0.50, want))
         arrival_p99 = _skew_corr(hist_quantile(data, DA + "cdc_source_arrival_lag_ms", 0.99, want))
+        # Top finite arrival bucket: a quantile at/above it is a bucket-edge artifact
+        # (true value is in the +inf overflow), rendered `≥ceiling` so a round number
+        # like 500000 isn't mistaken for a measurement.
+        arr_top = hist_top_finite_le(data, DA + "cdc_source_arrival_lag_ms", want)
+
+        def _fmt_arr(v):
+            return f"≥{v:>8.0f}" if (arr_top is not None and v >= arr_top) else f"{v:>9.0f}"
         age_p50 = hist_quantile(data, DA + "cdc_coalesce_batch_age_ms", 0.50, want)
         age_p99 = hist_quantile(data, DA + "cdc_coalesce_batch_age_ms", 0.99, want)
         cycle_p50 = hist_quantile(data, DA + "cdc_apply_cycle_ms", 0.50, want)
@@ -524,12 +554,38 @@ def render(data):
         cap = gauge_values(data, DA + "cdc_prefetch_buffer_capacity", want)
         cap_last = cap[-1] if cap else 0.0
 
-        p(f"\n  dataset: {ds}   ({int(bursts)} bursts, apply cadence p50={cycle_p50:.0f}ms)")
+        # Liveness (member_attached) + shared-slot grouping (its `slot` label). A member
+        # that detached mid-window has a stale rate ladder and pins the slot's WAL — the
+        # classifier treats this FIRST. Absent on pre-#member_attached dumps ⇒ assume live.
+        att = gauge_values(data, PG + "member_attached", {"name": ds})
+        member_attached_min = min(att) if att else 1.0
+        slot_of_ds = next((x["labels"].get("slot") for x in samples(data, PG + "member_attached")
+                           if x.get("labels", {}).get("name") == ds and x.get("labels", {}).get("slot")), None)
+        # AUTHORITATIVE per-slot retained WAL from pg_stats (source view; does not stall
+        # when the walsender is WriteData-blocked, unlike the client-view lag_bytes).
+        # Also derive the authoritative accumulation slope (bytes/s) for the classifier's
+        # SOURCE-throughput branch — the client-view slope flattens exactly when blocked.
+        auth_wal = 0.0
+        auth_slope = None
+        if slot_of_ds:
+            pts = sorted(
+                (s["ts_ms"], (s.get("slot_retained_bytes") or {}).get(slot_of_ds))
+                for s in (data.get("pg_stats") or [])
+                if s.get("ts_ms") and (s.get("slot_retained_bytes") or {}).get(slot_of_ds) is not None
+            )
+            for _, b in pts:
+                auth_wal = max(auth_wal, b)
+            if len(pts) >= 2 and pts[-1][0] > pts[0][0]:
+                auth_slope = (pts[-1][1] - pts[0][1]) / ((pts[-1][0] - pts[0][0]) / 1000.0)
+
+        slot_hdr = f" slot={slot_of_ds}" if slot_of_ds else ""
+        dead_hdr = "  [STREAM-DEAD: detached mid-window]" if member_attached_min == 0 else ""
+        p(f"\n  dataset: {ds}   ({int(bursts)} bursts, apply cadence p50={cycle_p50:.0f}ms){slot_hdr}{dead_hdr}")
 
         # Ground-truth additive decomposition of end-to-end lag: what arrived
         # already-stale (source) + how long it queued (coalesce) + the write.
         p("    lag decomposition (ground truth, p50 | p99 ms):")
-        p(f"      source arrival    {arrival_p50:>9.0f} | {arrival_p99:>9.0f}   "
+        p(f"      source arrival    {_fmt_arr(arrival_p50)} | {_fmt_arr(arrival_p99)}   "
           "(already stale on receipt: WAL flush + network + decode)")
         p(f"      queued/coalesce   {age_p50:>9.0f} | {age_p99:>9.0f}   "
           "(batch age: first envelope -> flush)")
@@ -537,8 +593,20 @@ def render(data):
         lag_p99 = percentile(lag_series, 0.99)
         p(f"      apply/write       {burst:>9.0f} | {apply_p99:>9.0f}   "
           "(apply_burst_duration mean | p99)")
+        # Prefer the AUTHORITATIVE source-side backlog (per-slot, doesn't stall when the
+        # walsender is WriteData-blocked); fall back to the client-view when absent.
+        backlog = auth_wal if auth_wal > 0 else wal_max
+        auth_note = ""
+        if auth_wal > 0:
+            src = f"authoritative {fmt_bytes(auth_wal)}"
+            if wal_max > 0 and auth_wal > wal_max * 3:
+                src += (f" — client-view {fmt_bytes(wal_max)} understates {auth_wal / wal_max:.0f}x "
+                        "⇒ walsender blocked on us")
+            auth_note = f"   WAL backlog: {src}"
+        else:
+            auth_note = f"   WAL backlog max={fmt_bytes(wal_max)} (client-view)"
         p(f"      => replication lag  p99={lag_p99:.0f}ms max={lag_max:.0f}ms last={lag_last:.0f}ms"
-          f"   WAL backlog max={fmt_bytes(wal_max)}")
+          f"{auth_note}")
         trend = ("DIVERGING" if lag_slope_s > 0.1 else
                  "draining" if lag_slope_s < -0.1 else "steady")
         # Progress ladder (2nd, independent approach): source-time advanced ÷ wall at
@@ -571,16 +639,17 @@ def render(data):
         explained_p99 = arrival_p99 + age_p99 + apply_p99
         residual_p99 = lag_p99 - explained_p99
         if lag_p99 > 0:
+            # Only a POSITIVE residual is interesting (a stage the waterfall doesn't
+            # attribute). A ≤0 residual just means the pieces (each an independent
+            # percentile) over-cover the lag — tail-percentile misalignment, not a
+            # finding — so collapse it to one line instead of drawing attention.
             if residual_p99 > 0.15 * lag_p99:
-                tail = ("— UNATTRIBUTED (a stage the waterfall doesn't cover: "
-                        "downstream commit/finalize/visibility; memory mode: see checkpoint stage)")
-            elif residual_p99 < -0.15 * lag_p99:
-                tail = ("— ≤0: decomposition already covers the lag (no hidden stage); "
-                        "the negative gap is tail-percentile misalignment of the pieces")
+                p(f"      residual (p99, approx): +{residual_p99:.0f}ms "
+                  f"(+{residual_p99 / lag_p99 * 100:.0f}% of lag) — UNATTRIBUTED "
+                  "(a stage not covered: downstream commit/finalize/visibility; "
+                  "memory mode: see checkpoint stage)")
             else:
-                tail = "— decomposition accounts for the lag"
-            p(f"      residual (p99, approx): {residual_p99:>+.0f}ms "
-              f"({residual_p99 / lag_p99 * 100:+.0f}% of lag) {tail}")
+                p("      residual (p99): ≤0 — decomposition covers the lag")
 
         # Apply-loop component breakdown. NON-additive (mixes idle-waits and work,
         # and commit/finalize overlap the next burst) — see docs. Diagnostic for
@@ -631,10 +700,15 @@ def render(data):
             p(f"    stream health: {int(reconnects_delta)} reconnect(s), "
               f"disconnected {disconnected_ms_delta / 1000:.1f}s of the {window_ms / 1000:.0f}s window "
               f"({downtime_pct:.0f}% down) — replay on each resume inflates apply + resets frontiers")
+        # Prefer authoritative source-side backlog + slope for the classifier (the
+        # client-view flattens when the walsender is WriteData-blocked); fall back to
+        # client-view when the pg_stats slot join is unavailable (older dumps).
+        cls_wal_max = backlog
+        cls_wal_slope = auth_slope if auth_slope is not None else wal_slope
         cls, evidence = classify_dataset(
-            lag_p99, fill, arrival_p99, wal_slope, wal_max, top_label, memory_mode,
+            lag_p99, fill, arrival_p99, cls_wal_slope, cls_wal_max, top_label, memory_mode,
             residual_p99, apply_ratio, lag_slope_s, input_share, send_wait_p99,
-            received_ratio, reconnects_delta
+            received_ratio, reconnects_delta, member_attached_min
         )
         low_conf = (f"  [LOW-CONFIDENCE: {len(occ)} occupancy samples < "
                     f"{LOW_CONF_MIN_SAMPLES}]" if 0 < len(occ) < LOW_CONF_MIN_SAMPLES else "")
@@ -644,7 +718,8 @@ def render(data):
             p(f"      prefetch fill p50={occ_p50:.0f} p99={occ_p99:.0f} / cap={cap_last:.0f}")
         # Correlate the two independent approaches (lag/arrival/reader-split classifier
         # vs the rate ladder). Agreement raises confidence; disagreement flags a gap.
-        cls_dir = ("stream" if "STREAM-UNSTABLE" in cls else
+        cls_dir = ("dead" if "STREAM-DEAD" in cls else
+                   "stream" if "STREAM-UNSTABLE" in cls else
                    "apply" if "APPLY" in cls else
                    "source" if ("SOURCE" in cls or "READER" in cls or "IDLE" in cls) else
                    "durability" if "DURABILITY" in cls else "?")
@@ -652,9 +727,9 @@ def render(data):
                       "source" if ladder.startswith("INGRESS") else
                       "both" if ladder.startswith("BOTH") else
                       "healthy" if ladder.startswith("keeping up") else "?")
-        if cls_dir == "stream":
-            # The rate ladder is unreliable under reconnect/replay, so don't score it.
-            agree = "n/a (stream unstable — ladder unreliable under replay)"
+        if cls_dir in ("stream", "dead"):
+            # The rate ladder is unreliable under reconnect/replay or after detach.
+            agree = "n/a (stream not healthy — ladder unreliable)"
         else:
             agree = ("AGREE" if cls_dir == ladder_dir
                      or (cls_dir == "source" and ladder_dir in ("source", "healthy"))
@@ -734,25 +809,30 @@ def render(data):
                 row.append(f"{m:>15.2f}")
             p(" ".join(row))
 
-        # Phase coverage (§A): what fraction of each table's apply-burst wall time is
-        # accounted for by instrumented write phases. Computed from already-exported
-        # sums — Σ(phase _sum over phases) ÷ Σ(apply_burst _sum) — so no runtime/hot-path
-        # cost. A LOW ratio reliably flags an instrumentation blind spot (a bottleneck
-        # in un-instrumented code, e.g. new_order's 0.8% hid a real stall); a HIGH ratio
-        # does NOT guarantee full attribution — phases are non-additive (parallel shards,
-        # commit/finalize overlap the next burst) and include any off-burst writes, so
-        # the numerator can exceed the burst wall time.
+        # Phase coverage — two levels localize a blind spot (<85% ⇒ gap):
+        #   write/burst   = apply-loop 'write' stage ÷ apply-burst wall
+        #                   (low ⇒ gap is apply-loop framing: coalesce/linger/commit)
+        #   cayenne/write = Σ(BURST-scoped outer write-path phases) ÷ 'write' stage
+        #                   (low ⇒ an un-instrumented span INSIDE the write call)
+        # CRITICAL scoping rule: the numerator sums ONLY the mutually-exclusive OUTER
+        # burst-path brackets — every `cdc_path_*` phase (inmemory / inmemory_sharded /
+        # inlined / staged / fallback), exactly one of which brackets each burst's whole
+        # cayenne write. It must NOT sum every write_phase: the inner sub-phases NEST
+        # inside the outer bracket (double-count) and BACKGROUND-scoped phases
+        # (mem_tier_checkpoint*, off-burst fence work, deferred tombstone flips during
+        # checkpoint) are not burst work at all — summing all of them pushed the ratio to
+        # 270–460% and false-flagged every table. Prefix-matching `cdc_path_` auto-covers
+        # any new outer variant; a ratio >100% then means a genuine scoping error.
+        outer_phases = [ph for ph in phases_seen if ph.startswith("cdc_path_")]
         p("")
         p("    phase coverage — two levels localize any blind spot (<85% ⇒ gap):")
-        p("      write/burst  = apply-loop 'write' stage ÷ apply-burst wall "
-          "(low ⇒ gap is apply-loop framing: coalesce/commit/finalize)")
-        p("      cayenne/write = Σ cayenne write-phase ÷ 'write' stage "
-          "(low ⇒ gap is INSIDE the cayenne write call — an un-instrumented span)")
+        p("      write/burst   = apply-loop 'write' stage ÷ apply-burst wall")
+        p("      cayenne/write = Σ outer cdc_path_* phase ÷ 'write' stage")
         for t in tables:
-            phase_sum = sum(
+            outer_sum = sum(
                 hist_mean(data, CY + "write_phase_duration_ms", {"table": t, "phase": ph})
                 * hist_count(data, CY + "write_phase_duration_ms", {"table": t, "phase": ph})
-                for ph in phases_seen
+                for ph in outer_phases
             )
             burst_sum = (hist_mean(data, DA + "cdc_apply_burst_duration_ms", {"dataset": t})
                          * hist_count(data, DA + "cdc_apply_burst_duration_ms", {"dataset": t}))
@@ -762,12 +842,13 @@ def render(data):
             write_sum = (hist_mean(data, DA + "cdc_apply_fixed_cost_ms", {"dataset": t, "phase": "write"})
                          * hist_count(data, DA + "cdc_apply_fixed_cost_ms", {"dataset": t, "phase": "write"}))
             write_burst = write_sum / burst_sum if burst_sum else 0.0
-            cay_write = (phase_sum / write_sum) if write_sum > 0 else 0.0
-            # Where the gap is: framing (write/burst low) vs inside-cayenne (cayenne/write low).
-            if write_burst < 0.85:
-                tag = "  <<< gap in apply-loop framing"
+            cay_write = (outer_sum / write_sum) if write_sum > 0 else 0.0
+            if cay_write > 1.05:
+                tag = "  <<< SCOPING ERROR (>100%: an outer write-path phase is unlisted)"
+            elif write_burst < 0.85:
+                tag = "  <<< gap in apply-loop framing (coalesce/linger/commit)"
             elif cay_write < 0.85:
-                tag = "  <<< gap INSIDE cayenne write call"
+                tag = "  <<< BLIND SPOT: un-instrumented span inside the write call"
             else:
                 tag = ""
             p(f"      {t:<20} write/burst={write_burst * 100:>5.1f}%  "

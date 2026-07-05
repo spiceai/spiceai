@@ -441,6 +441,11 @@ impl SharedSource {
         let was_snapshotting = self.ack.detach(key);
         lock(&self.detached).insert(key.clone());
         if let Some(member) = removed {
+            // First-class liveness signal: flip the member-attached gauge to 0 so the
+            // analysis classifies this dataset STREAM-DEAD (its rate ladder is stale)
+            // rather than trusting a frozen frontier. The collector Arc outlives the
+            // MemberHandle (the connector's metrics provider still observes it).
+            member.metrics.set_member_attached(false);
             tracing::warn!(
                 dataset = %member.dataset_name,
                 table = %format_member(key),
@@ -619,6 +624,10 @@ async fn attach_member(
 
     let snapshotting = need_snapshot && params.initial_snapshot;
     let (sender, receiver) = mpsc::channel(MEMBER_CHANNEL_CAPACITY);
+    // Liveness + grouping signals for the analysis: mark attached and record which
+    // shared slot this dataset joined (a detach flips attached→0; see detach_member).
+    metrics.set_slot_name(source.key.slot_name.clone());
+    metrics.set_member_attached(true);
     source.ack.register(&member_key, snapshotting);
     lock(&source.members).insert(
         member_key.clone(),

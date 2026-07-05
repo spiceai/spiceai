@@ -388,6 +388,17 @@ const METRICS: &[MetricSpec] = &[
          storm — no changes are delivered and lag grows while disconnected.",
     )
     .auto_register(),
+    MetricSpec::new(
+        "replication_member_attached",
+        MetricType::ObservableGaugeU64,
+    )
+    .description(
+        "1 while this dataset's replication stream is attached and routing, 0 once it \
+         detaches (receiver dropped, sink died, mid-snapshot failure). A detached member \
+         pins the shared slot's WAL retention and its rate ladder is stale — a first-class \
+         liveness signal. Carries a `slot` label for shared-slot grouping.",
+    )
+    .auto_register(),
 ];
 
 #[derive(Debug, Clone)]
@@ -519,6 +530,17 @@ impl MetricsProvider for PostgresMetricsProvider {
             "replication_disconnected_ms_total" => {
                 Some(ObserveMetricCallback::U64(Box::new(move |instrument| {
                     instrument.observe(m.replication_disconnected_ms_total(), &attributes);
+                })))
+            }
+            "replication_member_attached" => {
+                Some(ObserveMetricCallback::U64(Box::new(move |instrument| {
+                    // Append the shared-slot label (known once the member attaches) so
+                    // the analysis can group datasets by slot + join authoritative backlog.
+                    let mut attrs = attributes.clone();
+                    if let Some(slot) = m.slot_name() {
+                        attrs.push(KeyValue::new("slot", slot));
+                    }
+                    instrument.observe(m.member_attached(), &attrs);
                 })))
             }
             _ => None,
