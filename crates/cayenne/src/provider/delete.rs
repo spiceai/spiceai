@@ -41,6 +41,10 @@ limitations under the License.
 //! - [`sink`]: Deletion orchestration - scans for matching rows, persists deletion vectors, updates caches
 
 mod filter_exec;
+// Composite-integer-PK -> i64 packing (order-preserving, guarded). Not yet
+// consumed by the deletion strategy; allow(dead_code) until wired in.
+// #[allow(dead_code)]
+// mod packed_pk;
 mod sink;
 mod vector_io;
 
