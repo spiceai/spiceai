@@ -181,7 +181,7 @@ impl ClusterGrpcClientConfig {
 fn parse_cluster_grpc_param(params: &HashMap<String, String>, key: &str, default: u64) -> u64 {
     match params.get(key) {
         None => default,
-        Some(raw) => match raw.parse::<u64>() {
+        Some(raw) => match raw.trim().parse::<u64>() {
             Ok(0) => {
                 tracing::warn!(
                     "runtime.params.{key}={raw:?} must be a positive number of seconds; using default {default}"
@@ -2486,11 +2486,12 @@ mod tests {
         let config = ClusterGrpcClientConfig::from_params(&HashMap::new());
         assert_eq!(config, ClusterGrpcClientConfig::default());
 
-        // Valid overrides apply; invalid and zero values fall back to the default.
+        // Valid overrides apply (tolerating incidental whitespace); invalid and zero
+        // values fall back to the default.
         let params: HashMap<String, String> = [
             (
                 super::CLUSTER_GRPC_HTTP2_KEEP_ALIVE_INTERVAL_SECONDS_PARAM,
-                "30",
+                " 30 ",
             ),
             (super::CLUSTER_GRPC_KEEP_ALIVE_TIMEOUT_SECONDS_PARAM, "0"),
             (super::CLUSTER_GRPC_TIMEOUT_SECONDS_PARAM, "not-a-number"),
