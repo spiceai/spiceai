@@ -37,7 +37,6 @@ use tokio_util::sync::CancellationToken;
 /// Per-table staleness statistics.
 #[derive(Debug, Clone)]
 pub struct StalenessStats {
-    pub p50: Duration,
     pub p99: Duration,
     pub max: Duration,
     pub samples: u64,
@@ -61,15 +60,14 @@ impl StalenessReport {
     pub fn emit(&self) {
         println!("\nData Freshness");
         println!(
-            "  {:<14} {:>10} {:>10} {:>10} {:>10}",
-            "dataset", "p50_ms", "p99_ms", "max_ms", "samples"
+            "  {:<14} {:>10} {:>10} {:>10}",
+            "dataset", "p99_ms", "max_ms", "samples"
         );
         for table in &self.probe_tables {
             if let Some(stats) = self.tables.get(table.as_str()) {
                 println!(
-                    "  {:<14} {:>10} {:>10} {:>10} {:>10}",
+                    "  {:<14} {:>10} {:>10} {:>10}",
                     table,
-                    stats.p50.as_millis(),
                     stats.p99.as_millis(),
                     stats.max.as_millis(),
                     stats.samples,
@@ -223,7 +221,6 @@ fn build_report(samples: HashMap<String, Vec<i64>>, probe_tables: Vec<String>) -
             tables.insert(
                 table,
                 StalenessStats {
-                    p50: Duration::ZERO,
                     p99: Duration::ZERO,
                     max: Duration::ZERO,
                     samples: 0,
@@ -246,7 +243,6 @@ fn build_report(samples: HashMap<String, Vec<i64>>, probe_tables: Vec<String>) -
             idx.min(n - 1)
         };
 
-        let p50 = Duration::from_micros(gaps[pct(0.50)].cast_unsigned());
         let p99 = Duration::from_micros(gaps[pct(0.99)].cast_unsigned());
         let max = Duration::from_micros(gaps[n - 1].cast_unsigned());
 
@@ -260,7 +256,6 @@ fn build_report(samples: HashMap<String, Vec<i64>>, probe_tables: Vec<String>) -
         tables.insert(
             table,
             StalenessStats {
-                p50,
                 p99,
                 max,
                 samples: n as u64,
