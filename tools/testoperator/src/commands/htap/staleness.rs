@@ -41,6 +41,11 @@ pub struct StalenessStats {
     pub p99: Duration,
     pub max: Duration,
     pub samples: u64,
+    /// Samples discarded as absurd (> the reasonable-gap cap). Surfaced next to the
+    /// percentiles so a legitimately pathological run isn't silently trimmed — a
+    /// high discard count means the cap may be hiding real staleness, not just
+    /// bootstrap/catch-up noise.
+    pub discarded: u64,
 }
 
 /// Data freshness report across all probed tables.
@@ -66,8 +71,13 @@ impl StalenessReport {
         );
         for table in &self.probe_tables {
             if let Some(stats) = self.tables.get(table.as_str()) {
+                let discarded = if stats.discarded > 0 {
+                    format!("  ({} discarded > cap)", stats.discarded)
+                } else {
+                    String::new()
+                };
                 println!(
-                    "  {:<14} {:>10} {:>10} {:>10} {:>10}",
+                    "  {:<14} {:>10} {:>10} {:>10} {:>10}{discarded}",
                     table,
                     stats.p50.as_millis(),
                     stats.p99.as_millis(),
@@ -123,6 +133,8 @@ async fn run_staleness_probe(
         .iter()
         .map(|t| ((*t).to_string(), Vec::new()))
         .collect();
+    // Per-table count of samples discarded as absurd (surfaced next to percentiles).
+    let mut discarded: HashMap<String, u64> = HashMap::new();
 
     // Ordered list of table names for consistent report output.
     let probe_table_names: Vec<String> = probe_tables.iter().map(|t| (*t).to_string()).collect();
@@ -154,6 +166,7 @@ async fn run_staleness_probe(
                     // Discard absurd samples (e.g. a bootstrap-era catch-up reading)
                     // so a single outlier can't dominate p99/max on a short window.
                     if u128::try_from(gap_us).unwrap_or(0) > max_reasonable_gap.as_micros() {
+                        *discarded.entry((*table).to_string()).or_insert(0) += 1;
                         eprintln!(
                             "Staleness probe: dropping absurd {table} freshness sample \
                              {}ms (> {}ms cap; likely bootstrap/catch-up)",
@@ -176,7 +189,7 @@ async fn run_staleness_probe(
         }
     }
 
-    Ok(build_report(samples, probe_table_names))
+    Ok(build_report(samples, discarded, probe_table_names))
 }
 
 /// Query `MAX(_bench_ts)` from Spice via Flight SQL, returning microseconds since epoch.
@@ -226,12 +239,17 @@ pub(super) async fn query_max_bench_ts_spice(
 }
 
 /// Build the final report from raw gap samples (in microseconds).
-fn build_report(samples: HashMap<String, Vec<i64>>, probe_tables: Vec<String>) -> StalenessReport {
+fn build_report(
+    samples: HashMap<String, Vec<i64>>,
+    discarded: HashMap<String, u64>,
+    probe_tables: Vec<String>,
+) -> StalenessReport {
     let mut tables = HashMap::new();
     let mut worst_p99 = Duration::ZERO;
     let mut worst_max = Duration::ZERO;
 
     for (table, mut gaps) in samples {
+        let n_discarded = discarded.get(&table).copied().unwrap_or(0);
         if gaps.is_empty() {
             tables.insert(
                 table,
@@ -240,6 +258,7 @@ fn build_report(samples: HashMap<String, Vec<i64>>, probe_tables: Vec<String>) -
                     p99: Duration::ZERO,
                     max: Duration::ZERO,
                     samples: 0,
+                    discarded: n_discarded,
                 },
             );
             continue;
@@ -277,6 +296,7 @@ fn build_report(samples: HashMap<String, Vec<i64>>, probe_tables: Vec<String>) -
                 p99,
                 max,
                 samples: n as u64,
+                discarded: n_discarded,
             },
         );
     }

@@ -564,12 +564,16 @@ pub(super) fn emit_backpressure_summary(metrics: &crate::spiced_metrics::SpicedM
         per
     };
 
-    // p90/p99 of a histogram whose `_bucket` series is summed across all label
-    // sets (process-global valves have low cardinality — class/table — and we
-    // want the aggregate stall distribution).
+    // p90/p99 of a histogram, aggregating its `_bucket` series across all label
+    // sets (process-global valves have low cardinality — class/table — and we want
+    // the aggregate stall distribution). Prometheus histogram buckets are cumulative
+    // since process start, so we take each (label-set, le) series' LATEST value (its
+    // max over scrapes) and only THEN sum across label sets — summing across scrapes
+    // would multiply/time-weight earlier snapshots and skew the quantiles.
     let hist_pcts = |name: &str| -> Option<(f64, f64)> {
-        let mut le_counts: BTreeMap<u64, f64> = BTreeMap::new();
         let samples = metrics.samples.get(name)?;
+        // latest[label-set fingerprint][le] = max cumulative bucket value seen.
+        let mut latest: BTreeMap<String, BTreeMap<u64, f64>> = BTreeMap::new();
         for sample in samples {
             let Some(le_raw) = sample.labels.get("le") else {
                 continue;
@@ -582,7 +586,23 @@ pub(super) fn emit_backpressure_summary(metrics: &crate::spiced_metrics::SpicedM
                     Err(_) => continue,
                 }
             };
-            *le_counts.entry(le.to_bits()).or_insert(0.0) += sample.value;
+            let mut fp: Vec<String> = sample
+                .labels
+                .iter()
+                .filter(|(k, _)| k.as_str() != "le")
+                .map(|(k, v)| format!("{k}={v}"))
+                .collect();
+            fp.sort();
+            let per_le = latest.entry(fp.join(",")).or_default();
+            let v = per_le.entry(le.to_bits()).or_insert(0.0);
+            *v = v.max(sample.value); // cumulative ⇒ latest == max
+        }
+        // Sum the latest per-label-set buckets into the aggregate distribution.
+        let mut le_counts: BTreeMap<u64, f64> = BTreeMap::new();
+        for per_le in latest.into_values() {
+            for (le_bits, count) in per_le {
+                *le_counts.entry(le_bits).or_insert(0.0) += count;
+            }
         }
         let mut bounds: Vec<(f64, f64)> = le_counts
             .into_iter()
@@ -678,34 +698,43 @@ pub(super) fn emit_backpressure_summary(metrics: &crate::spiced_metrics::SpicedM
 /// Serializes the full scraped metrics time-series plus run metadata to `path` as
 /// JSON — the durable, machine-readable artifact `scripts/chbench-waterfall.py`
 /// consumes and CI uploads.
-pub(super) fn write_metrics_dump(
+pub(super) async fn write_metrics_dump(
     path: &std::path::Path,
     run: &serde_json::Value,
     metrics: Option<&crate::spiced_metrics::SpicedMetrics>,
     pg_stats: &[crate::pg_stats::PgStatSample],
 ) -> anyhow::Result<()> {
-    if let Some(parent) = path.parent()
-        && !parent.as_os_str().is_empty()
-    {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("creating metrics-dump directory {}", parent.display()))?;
-    }
     // Reduce the raw per-second series so the artifact stays small enough to
     // upload + analyze at SF-1000 (the full dump is dominated by cumulative
-    // histogram `_bucket` series and reaches ~1 GB). Counters/histograms/summaries
-    // are cumulative, so only their FINAL sample per label-set is meaningful to the
-    // waterfall (it computes quantiles over the final buckets); GAUGES keep their
-    // full time series (occupancy/permits/lag percentiles need it).
+    // histogram `_bucket` series and reaches ~1 GB). GAUGES keep their full time
+    // series (occupancy/permits/lag percentiles need it); cumulative series
+    // (counter/histogram/summary) keep the FIRST and LAST sample per label-set so the
+    // waterfall can compute *windowed* deltas (Δ over the run, excluding bootstrap) —
+    // see `reduce_samples_for_dump`. Building the owned dump value borrows `metrics`,
+    // so it happens here; the heavy JSON encode + filesystem write are moved to a
+    // blocking thread so the ~34 MB serialize/write can't stall the async runtime
+    // (diagnostics/shutdown tasks) — repo guidance forbids blocking in async paths.
     let reduced = metrics.map(|m| reduce_samples_for_dump(&m.samples));
     let dump = serde_json::json!({
         "run": run,
         "samples": reduced,
         "pg_stats": pg_stats,
     });
-    let bytes = serde_json::to_vec(&dump).context("serializing metrics dump")?;
-    std::fs::write(path, bytes)
-        .with_context(|| format!("writing metrics dump to {}", path.display()))?;
-    Ok(())
+    let path = path.to_path_buf();
+    tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+        if let Some(parent) = path.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("creating metrics-dump directory {}", parent.display()))?;
+        }
+        let bytes = serde_json::to_vec(&dump).context("serializing metrics dump")?;
+        std::fs::write(&path, bytes)
+            .with_context(|| format!("writing metrics dump to {}", path.display()))?;
+        Ok(())
+    })
+    .await
+    .context("metrics-dump write task panicked")?
 }
 
 /// Reduce the raw per-second series for the dump — see [`write_metrics_dump`].

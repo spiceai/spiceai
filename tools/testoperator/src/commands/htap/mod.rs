@@ -370,7 +370,7 @@ pub(crate) async fn run(args: &HtapArgs) -> anyhow::Result<()> {
     // Persist the full scraped time-series + run metadata for offline waterfall
     // analysis (scripts/chbench-waterfall.py) and CI artifact upload.
     if let Some(dump_path) = &args.metrics_dump {
-        match reporting::write_metrics_dump(dump_path, &run_metadata, spiced_metrics.as_ref(), &pg_stats) {
+        match reporting::write_metrics_dump(dump_path, &run_metadata, spiced_metrics.as_ref(), &pg_stats).await {
             Ok(()) => println!("\nWrote metrics dump to {}", dump_path.display()),
             Err(e) => eprintln!("Failed to write metrics dump to {}: {e}", dump_path.display()),
         }

@@ -228,6 +228,13 @@ pub(crate) static CDC_APPLY_FIXED_COST_MS: LazyLock<Histogram<f64>> = LazyLock::
         .build()
 });
 
+// TODO(cdc-metrics): a `cdc_apply_unaccounted_ms = burst_ms − Σ(in-burst write phases)`
+// histogram is a few lines given the burst brackets + fixed-cost phases are both here,
+// and would surface an instrumentation blind spot (a delete-heavy table measured ~0.8%
+// phase coverage of burst wall clock) at record time. The waterfall computes the same
+// ratio from the exported sums today (two-level coverage), so this is a convenience /
+// CI-gate follow-up.
+
 /// Which apply path each CDC sub-batch took, labeled by `path`
 /// (`inmem_append` | `inmem_delete` | `durable_append` | `durable_delete`). The
 /// `durable_*` paths take the synchronous whole-burst commit + maintenance and are

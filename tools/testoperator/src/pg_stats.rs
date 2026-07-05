@@ -50,6 +50,14 @@ pub struct PgStatSample {
     pub wal_records: i64,
     /// Cumulative committed transactions for the benchmark DB — Δ/Δt = txn/s.
     pub xact_commit: i64,
+    /// AUTHORITATIVE per-slot retained WAL in bytes, from the source's own
+    /// `pg_replication_slots` (`pg_current_wal_lsn() − confirmed_flush_lsn`). Unlike
+    /// the client-view `dataset_postgres_replication_lag_bytes` (server_wal_end −
+    /// confirmed_flush), this does NOT stall when the walsender is WriteData-blocked
+    /// — the client stops receiving keepalives so its wal_end freezes, but the
+    /// source's WAL head keeps advancing. The two diverging is itself a strong
+    /// "sender is blocked on us" signal; this is the truth for drain/caught-up.
+    pub slot_retained_bytes: BTreeMap<String, i64>,
 }
 
 fn now_unix_ms() -> i64 {
@@ -178,6 +186,28 @@ impl PgStatsScraper {
             && let Some(r) = rows.first()
         {
             s.xact_commit = r.get("xc");
+        }
+
+        // Authoritative per-slot retained WAL from the source's own view (does not
+        // stall when the walsender is WriteData-blocked, unlike the client-view
+        // lag_bytes). Guard the subtraction with a NULL confirmed_flush (slot created
+        // but not yet consumed) and clamp negatives to 0 (a slot momentarily ahead of
+        // the read wal head races to 0, not a huge unsigned wrap).
+        if let Ok(rows) = client
+            .query(
+                "SELECT slot_name, \
+                 GREATEST((pg_current_wal_lsn() - confirmed_flush_lsn), 0)::int8 AS retained \
+                 FROM pg_replication_slots \
+                 WHERE slot_type = 'logical' AND confirmed_flush_lsn IS NOT NULL",
+                &[],
+            )
+            .await
+        {
+            for r in &rows {
+                let slot: String = r.get("slot_name");
+                let retained: i64 = r.get("retained");
+                s.slot_retained_bytes.insert(slot, retained);
+            }
         }
 
         Some(s)

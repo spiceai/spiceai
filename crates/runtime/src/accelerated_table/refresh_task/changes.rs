@@ -1159,6 +1159,10 @@ impl RefreshTask {
             // lag already present before the accelerator acts, separating source-side
             // lag from lag the apply path adds (`cdc_source_arrival_lag_ms`).
             if let Ok(env) = &first
+                // Exclude heartbeats: their server-clock timestamp would advance the
+                // received frontier past data not actually received mid-backlog,
+                // corrupting the rate ladder (see ChangeBatch::is_heartbeat).
+                && !env.change_batch.is_heartbeat()
                 && let Some(commit_ts_ms) = env.change_batch.source_commit_ts_ms()
             {
                 // Ingress frontier: how far the source-time we've RECEIVED has
@@ -1166,6 +1170,8 @@ impl RefreshTask {
                 // applied frontier (egress) to split delivery vs apply slowdown.
                 metrics::CDC_RECEIVED_COMMIT_UNIX_TIME_MS.record(commit_ts_ms, &recv_wait_labels);
                 if let Some(now_ms) = util::time::system_time_to_unix_ms(std::time::SystemTime::now()) {
+                    // `saturating_sub` already floors at 0 (u64); the `max(0)` is a
+                    // belt-and-suspenders clamp for the `as f64` cast, not dead code.
                     metrics::CDC_SOURCE_ARRIVAL_LAG_MS.record(
                         now_ms.saturating_sub(commit_ts_ms).max(0) as f64,
                         &recv_wait_labels,
@@ -1469,6 +1475,10 @@ impl RefreshTask {
         let max_commit_ts_ms = burst
             .iter()
             .filter_map(|item| item.as_ref().ok())
+            // Exclude heartbeats: a keepalive interleaved in a backlogged burst carries
+            // the server clock, which would inflate the applied frontier + lag gauge
+            // (applied appearing to outrun received). See ChangeBatch::is_heartbeat.
+            .filter(|env| !env.change_batch.is_heartbeat())
             .filter_map(|env| env.change_batch.source_commit_ts_ms())
             .max();
 

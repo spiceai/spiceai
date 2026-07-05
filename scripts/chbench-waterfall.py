@@ -74,6 +74,10 @@ CY = "cayenne_"                       # cayenne operational meter
 #                counter totals) — a single instant query or scrape suffices.
 #   * A configurable `metric_prefix` in spiced would prefix every name; a future
 #     adapter should accept a prefix override. This tool assumes no prefix.
+#   * JOIN KEY: the replication (`dataset_postgres_replication_*`) series label the
+#     dataset `name`, while the acceleration (`dataset_acceleration_cdc_*`) series
+#     label it `dataset` — same value, different key. A consumer joining the two
+#     rungs must treat `name == dataset` (this tool special-cases it per lookup).
 #
 # (base_name, kind, key_labels)
 REQUIRED_METRICS = [
@@ -391,6 +395,11 @@ def classify_dataset(lag_p99, fill, arrival_p99, wal_slope, wal_max, top_stage,
         return ("APPLY-bound (prefetch buffer saturated; accelerator can't drain "
                 "what the reader already delivered)", ev)
     # Server-side WAL bytes accumulating => the source genuinely can't ship.
+    # CAVEAT: wal_slope is the CLIENT-view backlog (server_wal_end − confirmed_flush).
+    # When the walsender is WriteData-blocked (client not draining) its keepalives stop
+    # arriving, so the client's wal_end — and this slope — go FLAT exactly when the
+    # source pipe is the story. Corroborate with the source-side authoritative retained
+    # WAL + walsender WriteData% in the pg_stats section before trusting a quiet slope.
     if wal_slope > WAL_ACCUMULATING_BYTES_PER_S:
         return "SOURCE-throughput-bound (WAL bytes accumulating server-side)", ev
     # Independent rate signal: ingress kept up (~realtime) but apply didn't => the
@@ -412,7 +421,11 @@ def classify_dataset(lag_p99, fill, arrival_p99, wal_slope, wal_max, top_stage,
                     "source/network/PG can't deliver fast enough)", ev)
         if input_share is not None and input_share <= 0.4:
             return ("READER-decode-bound (socket has data; OUR decode/build is the "
-                    "limiter — the reader is CPU/scheduling constrained)", ev)
+                    "limiter — the reader is CPU/scheduling constrained). NOTE: on the "
+                    "SHARED-slot path the 'decode/build' bucket also includes time BLOCKED "
+                    "delivering to a slow member's channel (downstream back-pressure, not "
+                    "decode) — cross-check the source-side walsender WriteData% before "
+                    "trusting this for multi-member sources", ev)
         return ("READER/delivery-bound (mixed socket-wait vs decode; see "
                 "reader_input_share)", ev)
     if wal_max < 1_048_576 and arrival_p99 < 1000:
@@ -839,10 +852,33 @@ def render(data):
         p("\nSource-side Postgres (pg_stats)")
         p("-" * 60)
         dt = (pg[-1]["ts_ms"] - pg[0]["ts_ms"]) / 1000.0
-        rate = lambda f: (pg[-1].get(f, 0) - pg[0].get(f, 0)) / dt
+        # Cumulative counters; clamp negative deltas to 0 (a pg_stat_reset() mid-run
+        # would otherwise yield a nonsense negative rate).
+        rate = lambda f: max(0.0, (pg[-1].get(f, 0) - pg[0].get(f, 0))) / dt
         wal_rate, rec_rate, xact_rate = rate("wal_bytes"), rate("wal_records"), rate("xact_commit")
         p(f"  source production: {fmt_bytes(wal_rate)}/s WAL, {rec_rate:.0f} records/s, "
           f"{xact_rate:.0f} txn/s  (independent 'produced' rate)")
+        # AUTHORITATIVE retained WAL from pg_replication_slots (source view). Unlike the
+        # client-view lag_bytes (server_wal_end − confirmed_flush, which freezes when the
+        # walsender is WriteData-blocked), this keeps advancing with the source WAL head —
+        # it is the truth for drain/caught-up. A large gap between the two = the sender is
+        # blocked on us (client-view badly understates the real backlog).
+        retained_max = {}
+        for s in pg:
+            for slot, b in (s.get("slot_retained_bytes") or {}).items():
+                retained_max[slot] = max(retained_max.get(slot, 0), b)
+        if retained_max:
+            auth_total = sum(retained_max.values())
+            client_total = sum(
+                max(gauge_values(data, PG + "lag_bytes", {"name": ds}) or [0])
+                for ds in datasets
+            )
+            p("  authoritative retained WAL (pg_replication_slots, max/window): "
+              + " ".join(f"{sl}={fmt_bytes(b)}" for sl, b in sorted(retained_max.items())))
+            if client_total > 0 and auth_total > client_total * 3:
+                p(f"  -> AUTHORITATIVE total {fmt_bytes(auth_total)} vs client-view "
+                  f"{fmt_bytes(client_total)} ({auth_total / client_total:.0f}x): the walsender is "
+                  "blocked writing to us — client-view lag_bytes badly understates the real backlog.")
         ws, ab = collections.Counter(), collections.Counter()
         nws = []
         for s in pg:
@@ -858,12 +894,18 @@ def render(data):
             p("  active-backend waits (top): "
               + " ".join(f"{k}={v}" for k, v in ab.most_common(6)))
         idle = ws.get("WalSenderWaitForWAL", 0) / tot
+        # `WalSenderWriteData` (PG16+) / `ClientWrite` = the walsender is blocked WRITING
+        # to us ⇒ WE are the constraint (not draining fast enough), independent of the
+        # reader-side attribution (which the shared path muddies — see the reader-split
+        # caveat). This is direct source-side evidence of a client bottleneck.
+        write_blocked = (ws.get("WalSenderWriteData", 0) + ws.get("ClientWrite", 0)) / tot
         if idle > 0.5:
             p("  -> walsenders mostly idle-waiting-for-WAL: source WAL production is the "
               "limit (see active-backend lock waits / box load), NOT our reader/decode.")
-        elif ws.get("ClientWrite", 0) / tot > 0.3:
-            p("  -> walsenders blocking on ClientWrite: WE aren't draining the socket "
-              "fast enough (apply/decode-bound; TCP flow control throttling the walsender).")
+        elif write_blocked > 0.3:
+            p(f"  -> walsenders {write_blocked * 100:.0f}% blocked writing to us "
+              "(WalSenderWriteData/ClientWrite): WE aren't draining fast enough — the CLIENT "
+              "is the constraint (source-side proof, independent of the reader split).")
         else:
             p("  -> walsenders busy (decode/send): source is producing and shipping "
               "(compare with received/applied rate ladder).")

@@ -408,6 +408,18 @@ impl ChangeBatch {
         self.source_commit_ts_ms
     }
 
+    /// Whether this is a zero-row heartbeat (see [`build_heartbeat_envelope`]) — it
+    /// carries only a `source_commit_ts_ms` to keep the idle lag gauge fresh, not an
+    /// actual change. Consumers that derive *received/applied progress frontiers* must
+    /// exclude heartbeats: they are stamped with the server clock on a "keepalive ⇒
+    /// caught up" premise that is FALSE mid-backlog (keepalives interleave between
+    /// transactions), so counting them advances the frontier past data not yet
+    /// received/applied and corrupts the progress-rate ladder.
+    #[must_use]
+    pub fn is_heartbeat(&self) -> bool {
+        self.record.num_rows() == 0
+    }
+
     #[must_use]
     pub fn op(&self, row: usize) -> ChangeOperation {
         let Some(op_col) = self

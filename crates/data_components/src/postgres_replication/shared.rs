@@ -1112,6 +1112,16 @@ async fn run_pump(source: Arc<SharedSource>) {
             // commit/keepalive (should_flush) — the frequent per-row XLogData events
             // just accumulate, keeping the hot decode path free of the per-event
             // member-iteration fan-out.
+            //
+            // CAVEAT (waterfall reader-split): this bucket is "decode + route + DELIVER",
+            // and delivery includes `await`ing the bounded per-member channel in
+            // `deliver_commit`. When a member's sink is slow the pump BLOCKS on that send
+            // — downstream back-pressure, not our decode cost — yet it lands here and
+            // deflates the reader input-share, which can make the classifier read
+            // READER-decode-bound when the truth is apply-bound. A dedicated
+            // `member_send_wait_micros` accumulator around the send `await`s (below and in
+            // `deliver_commit`) would make input-share honest; until then the waterfall
+            // annotates the shared-path processing bucket accordingly. TODO(cdc-metrics).
             proc_us_acc = proc_us_acc
                 .saturating_add(u64::try_from(processing_start.elapsed().as_micros()).unwrap_or(u64::MAX));
             if should_flush {
