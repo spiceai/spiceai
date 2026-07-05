@@ -791,11 +791,27 @@ impl FileFormat for VortexFormat {
 
                 let null_count = stats_set.get_as::<usize>(Stat::NullCount, &PType::U64.into());
 
+                // Surface the column sum from the Vortex footer (`Stat::Sum`) so
+                // whole-table `SUM`/`AVG` can be answered from metadata without a
+                // scan. We deliberately keep the sum in its *own* widened dtype
+                // (`Stat::Sum.dtype`) rather than casting down to the column's
+                // arrow type: the sum of e.g. an `Int32` column is an `Int64` in
+                // DataFusion, and narrowing here would lose width or overflow.
+                let sum = match Stat::Sum.dtype(stats_dtype) {
+                    Some(sum_dtype) => scalar_stat_to_df(
+                        Stat::Sum,
+                        stats_set.get(Stat::Sum),
+                        stats_dtype,
+                        &sum_dtype,
+                    ),
+                    None => stats::Precision::Absent,
+                };
+
                 column_statistics.push(ColumnStatistics {
                     null_count: null_count.to_df(),
                     min_value: min.to_df(),
                     max_value: max.to_df(),
-                    sum_value: Precision::Absent,
+                    sum_value: sum.to_df(),
                     distinct_count: distinct_count_from_is_constant(stats_set.get_as::<bool>(
                         Stat::IsConstant,
                         &DType::Bool(Nullability::NonNullable),
@@ -983,6 +999,119 @@ mod tests {
             .await?
             .collect()
             .await?;
+
+        Ok(())
+    }
+
+    /// Verifies the Vortex -> DataFusion statistics boundary: a written
+    /// Vortex file surfaces per-column byte sizes (from the footer's
+    /// `UncompressedSizeInBytes`) into `ColumnStatistics.byte_size` — including for
+    /// variable-width (`Utf8`) columns — and a projected scan reports only the
+    /// projected columns' bytes rather than the full unprojected row width.
+    #[tokio::test]
+    async fn propagates_per_column_byte_size() -> anyhow::Result<()> {
+        let ctx = TestSessionContext::new(true);
+
+        // Wide schema: fixed-width Int, a narrow Utf8, and a FAT Utf8 (`data`)
+        // standing in for a `VARCHAR(500)`-style column.
+        ctx.session
+            .sql(
+                "CREATE EXTERNAL TABLE t \
+                 (id INT NOT NULL, s VARCHAR NOT NULL, data VARCHAR NOT NULL) \
+                 STORED AS vortex LOCATION 'table/'",
+            )
+            .await?
+            .collect()
+            .await?;
+
+        // Write a known number of rows; `data` holds a long value so dropping it
+        // via projection produces a large, unmistakable drop in total_byte_size.
+        let n = 8usize;
+        let wide = "x".repeat(200);
+        let values = (1..=n)
+            .map(|i| format!("({i}, 's{i}', '{wide}')"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        ctx.session
+            .sql(&format!("INSERT INTO t VALUES {values}"))
+            .await?
+            .collect()
+            .await?;
+
+        let provider = ctx.session.table_provider("t").await?;
+        let state = ctx.session.state();
+
+        // --- All columns: per-column byte_size present, total == sum ---------
+        let all = provider
+            .scan(&state, None, &[], None)
+            .await?
+            .partition_statistics(None)?;
+        assert_eq!(all.num_rows.get_value(), Some(&n), "row count");
+
+        let id_bytes = *all.column_statistics[0]
+            .byte_size
+            .get_value()
+            .expect("Int column byte_size must be populated");
+        let s_bytes = *all.column_statistics[1]
+            .byte_size
+            .get_value()
+            .expect("narrow Utf8 byte_size must be populated");
+        let data_bytes = *all.column_statistics[2]
+            .byte_size
+            .get_value()
+            .expect("wide Utf8 byte_size must be populated");
+
+        assert!(
+            id_bytes >= 4 * n,
+            "Int32 byte_size should be >= 4*rows, got {id_bytes}"
+        );
+        assert!(
+            data_bytes > s_bytes,
+            "wide column must report more bytes than the narrow one ({data_bytes} vs {s_bytes})"
+        );
+
+        let all_total = *all
+            .total_byte_size
+            .get_value()
+            .expect("all-columns total present");
+        assert_eq!(
+            all_total,
+            id_bytes + s_bytes + data_bytes,
+            "all-columns total_byte_size must equal the sum of per-column byte_size"
+        );
+
+        // --- Projected scans: total reflects ONLY the projected columns ------
+        // Project [id] (fixed-width): total is just the int column.
+        let proj_id_cols = vec![0usize];
+        let proj_id = provider
+            .scan(&state, Some(&proj_id_cols), &[], None)
+            .await?
+            .partition_statistics(None)?;
+        assert_eq!(
+            proj_id.total_byte_size.get_value(),
+            Some(&id_bytes),
+            "projecting [id] must report only the id column's bytes"
+        );
+
+        // Project [s] (variable-width survives, fat `data` dropped).
+        let proj_s_cols = vec![1usize];
+        let proj_s = provider
+            .scan(&state, Some(&proj_s_cols), &[], None)
+            .await?
+            .partition_statistics(None)?;
+        assert_eq!(
+            proj_s.total_byte_size.get_value(),
+            Some(&s_bytes),
+            "projecting [s] must report only the s column's bytes, not the full row"
+        );
+        assert!(
+            *proj_s
+                .total_byte_size
+                .get_value()
+                .expect("projected total present")
+                < all_total,
+            "projected total must drop the unprojected wide `data` column"
+        );
 
         Ok(())
     }

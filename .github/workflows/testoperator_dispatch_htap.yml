@@ -2,12 +2,19 @@ name: testoperator dispatch htap
 
 on:
   schedule:
-    # htap-sf100, every 3h (0200, 0500, 0800, 1100, 1400, 1700, 2000, 2300) — HTAP CH-benCHmark SF100 (spiceai-dev-xlarge-runners)
-    - cron: '0 2,5,8,11,14,17,20,23 * * *'
-    # htap-sf1000, twice daily (0000, 1200) — HTAP CH-benCHmark SF1000 (spiceai-dev-xlarge-runners)
-    - cron: '0 0,12 * * *'
+    # htap-sf1000-tuned-adaptive, every 3 hours (0000, 0300, …, 2100) — the two high-value SF1000
+    # configs (cdc-tuned-memory + adaptive) for frequent tuned-vs-adaptive trend data
+    # (spiceai-dev-xlarge-runners).
+    - cron: '0 */3 * * *'
+    # htap-sf1000 (other configs), once daily (0100) — the remaining SF1000 configs
+    # (cdc-tuned-turso, cdc-tuned-memory-ivm, adaptive-turso, duckdb baseline) on the xlarge pool.
+    - cron: '0 1 * * *'
     # htap-sf1, twice daily (0600, 1800) — HTAP CH-benCHmark SF1 (spiceai-dev-large-runners)
     - cron: '0 6,18 * * *'
+    # htap-sf1000-cold, once daily (0800) — HTAP CH-benCHmark SF1000 cold-object-store tier
+    # (spiceai-dev-xlarge-runners). Lighter once-a-day cadence while the cold tier is new; it shares
+    # the SF1000 serialized run concurrency group, so it queues, never contends.
+    - cron: '0 8 * * *'
 
   workflow_dispatch:
     inputs:
@@ -24,6 +31,8 @@ on:
           - 'sf10'
           - 'sf100'
           - 'sf1000'
+          - 'sf1000-tuned-adaptive'
+          - 'sf1000-cold'
 
 jobs:
   dispatch-htap:
@@ -38,7 +47,7 @@ jobs:
       group: testoperator-dispatch-htap-${{ github.event.schedule || github.event.ref }}
       cancel-in-progress: false
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           persist-credentials: false
 
@@ -98,9 +107,10 @@ jobs:
           FLAGS=""
           if [ -z "$SF" ]; then
             case "${{ github.event.schedule }}" in
-              '0 2,5,8,11,14,17,20,23 * * *') SF=sf100 ;;
-              '0 0,12 * * *')                 SF=sf1000 ;;
+              '0 */3 * * *')                  SF=sf1000-tuned-adaptive ;;
+              '0 1 * * *')                    SF=sf1000 ;;
               '0 6,18 * * *')                 SF=sf1 ;;
+              '0 8 * * *')                    SF=sf1000-cold ;;
               *)                              SF= ;;   # unrecognized cron — dispatch nothing
             esac
             FLAGS="--max-concurrent 1 --max-concurrent-wait-timeout-mins 180"

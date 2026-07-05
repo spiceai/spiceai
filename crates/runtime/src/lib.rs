@@ -67,7 +67,7 @@ pub use http::get_api_doc;
 use llms::rerank::RerankerModelStore;
 use model::{EmbeddingModelStore, LLMChatCompletionsModelStore};
 
-use crate::tools::{Tooling, catalog::SpiceToolCatalog, factory::default_available_catalogs};
+use crate::tools::{Tooling, factory::default_available_catalogs};
 use model_components::model::Model;
 pub use notify::Error as NotifyError;
 use snafu::prelude::*;
@@ -86,7 +86,7 @@ use crate::udtfs::ListUDFTableFunc;
 use runtime_async::cancellable_task::{CancellableTaskHandle, spawn_cancellable_task};
 pub mod accelerated_table;
 pub mod auth;
-mod builder;
+pub mod builder;
 pub mod catalogconnector;
 mod changes;
 pub mod component;
@@ -132,6 +132,7 @@ pub mod secrets {
     pub use runtime_secrets::*;
 }
 pub mod cluster;
+mod secrets_preflight;
 pub mod spice_metrics;
 pub mod status;
 pub mod task_history;
@@ -1822,7 +1823,7 @@ impl Runtime {
     ///
     /// For tools from catalog, the name is prefixed with the catalog name. e.g. `catalog_name/tool_name`.
     fn list_all_tools(self: &Arc<Self>) -> impl Stream<Item = Arc<dyn SpiceModelTool>> {
-        let default_catalogs = default_available_catalogs(Arc::clone(self));
+        let default_catalogs = default_available_catalogs(self);
         let stream_self = Arc::clone(self);
         stream! {
             let tool_lock = stream_self.tools.read().await;
@@ -1835,7 +1836,7 @@ impl Runtime {
                     Tooling::Tool(tool) | Tooling::FunctionTool(tool) => {
                         yield Arc::clone(tool);
                     }
-                    Tooling::Catalog(catalog) => {
+                    Tooling::Catalog { tools: catalog, .. } => {
                         // Do not list tools from default catalogs. They are already listed individually as tools.
                         if default_catalog_names.contains(&name.as_str()) {
                             continue;
@@ -1854,7 +1855,7 @@ impl Runtime {
         let tools = self.tools.read().await;
         let tool: Arc<dyn SpiceModelTool> =
             if let Some((catalog_name, name)) = tool_name.split_once('/') {
-                let Some(Tooling::Catalog(catalog)) = tools.get(catalog_name) else {
+                let Some(Tooling::Catalog { tools: catalog, .. }) = tools.get(catalog_name) else {
                     return None;
                 };
                 return catalog.get(name).await;

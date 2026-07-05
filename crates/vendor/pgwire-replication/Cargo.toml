@@ -1,0 +1,95 @@
+[package]
+name = "pgwire-replication"
+version = "0.3.2"
+edition = "2021"
+rust-version = "1.88"
+resolver = "2"
+license = "Apache-2.0 OR MIT"
+
+authors = ["Vahid Negahdari <vahid.negahdari@gmail.com>"]
+description = "Tokio-based Postgres wire-protocol logical replication client (pgoutput) with TLS and SCRAM."
+keywords = [
+    "postgres",
+    "pgoutput",
+    "replication",
+    "wal",
+    "pgwire",
+]
+categories = ["database", "network-programming", "asynchronous"]
+repository = "https://github.com/vnvo/pgwire-replication"
+homepage = "https://github.com/vnvo/pgwire-replication"
+documentation = "https://docs.rs/pgwire-replication"
+readme = "README.md"
+exclude = ["Cargo.lock"]
+
+
+[features]
+default = ["tls-rustls", "scram"]
+tls-rustls = [
+    "dep:rustls",
+    "dep:tokio-rustls",
+    "dep:webpki-roots",
+]
+scram = ["dep:base64", "dep:hmac", "dep:sha2", "dep:rand"]
+md5 = ["dep:md5"]
+# NOTE (spiceai vendoring): upstream's `integration-tests` feature and its
+# `testcontainers`/`tokio-postgres`/`tracing-subscriber` optional deps were
+# dropped. `testcontainers 0.27` pins `bollard-stubs =1.52.0-rc`, which is
+# incompatible with the `=1.47.1-rc` pin from `testoperator`'s `bollard 0.18`.
+# The upstream `tests/integration_postgres.rs` (its only consumer) is likewise
+# not vendored. Library source is otherwise unmodified from crates.io 0.3.2.
+
+[dependencies]
+bytes = "1"
+tokio = { version = "1", features = [
+    "net",
+    "io-util",
+    "time",
+    "macros",
+    "rt-multi-thread",
+    "sync",
+] }
+tokio-util = "0.7"
+thiserror = "1"
+anyhow = "1"
+tracing = "0.1"
+
+# Optional TLS
+rustls = { version = "0.23", features = ["ring"], optional = true }
+tokio-rustls = { version = "0.26", optional = true }
+webpki-roots = { version = "0.26", optional = true }
+
+# Optional auth
+base64 = { version = "0.22", optional = true }
+hmac = { version = "0.12", optional = true }
+sha2 = { version = "0.10", optional = true }
+rand = { version = "0.9", optional = true }
+md5 = { version = "0.7", optional = true }
+
+[dev-dependencies]
+# `hex` and `proptest` (upstream dev-deps) are omitted: their only consumers
+# were the un-vendored `tests/integration_postgres.rs`. `tempfile` is used by
+# the `tls` unit tests, `tokio-postgres` by the examples, `criterion` by the bench.
+tempfile = "3"
+tokio-postgres = "0.7"
+
+criterion = { version = "0.5", features = ["html_reports"] }
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
+[[bench]]
+name = "protocol_bench"
+harness = false
+
+[[example]]
+name = "with_tls"
+path = "examples/with_tls.rs"
+required-features = ["tls-rustls"]
+
+[[example]]
+name = "with_mtls"
+path = "examples/with_mtls.rs"
+required-features = ["tls-rustls"]
+

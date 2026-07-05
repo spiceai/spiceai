@@ -19,7 +19,7 @@ use crate::accelerated_table::refresh::Refresh;
 use crate::accelerated_table::refresh_task::deletion::build_batch_delete_expr_from_change_batch;
 use crate::component::dataset::OnSchemaChange;
 use crate::datafusion::error::{find_datafusion_root, format_datafusion_error};
-use crate::schema_evolution::evolution_allowed;
+use crate::schema_evolution::{emit_schema_evolution_event, evolution_allowed};
 use crate::{dataupdate::StreamingDataUpdateExecutionPlan, status};
 use arrow::array::{
     Array, ArrayRef, Int32Array, Int64Array, RecordBatch, StringArray, UInt32Array,
@@ -55,6 +55,7 @@ use futures::{StreamExt, stream};
 use opentelemetry::KeyValue;
 use runtime_datafusion::execution_plan::schema_cast::SchemaCastScanExec;
 use runtime_datafusion_index::IndexedTableProvider;
+use runtime_search::embeddings::table::EmbeddingTable;
 use runtime_table_partition::provider::PartitionTableProvider;
 #[cfg(test)]
 use snafu::OptionExt;
@@ -2118,6 +2119,7 @@ impl RefreshTask {
                 if matches!(evolution.policy, OnSchemaChange::Fail) {
                     SCHEMA_EVOLUTION_FAILED
                         .add(1, &schema_evolution_labels(&dataset, kind, "fail_policy"));
+                    emit_schema_evolution_event(&dataset, "fail_policy", &change, true);
                     return Err(crate::accelerated_table::Error::FailedToWriteData {
                         source: DataFusionError::Execution(format!(
                             "schema change detected on the CDC stream for {dataset} ({change}) and `on_schema_change: fail` is set. \
@@ -2136,6 +2138,7 @@ impl RefreshTask {
                             "widening schema change detected on the CDC stream ({change}) but `on_schema_change: {}` only evolves added columns; values continue to be cast to the current schema. Set `on_schema_change: sync_all_columns` to evolve types",
                             evolution.policy
                         );
+                        emit_schema_evolution_event(&dataset, "blocked_by_policy", &change, true);
                     }
                     return Ok(());
                 }
@@ -2153,6 +2156,7 @@ impl RefreshTask {
                         dataset = %dataset,
                         "applied live schema evolution from the CDC stream: {change}"
                     );
+                    emit_schema_evolution_event(&dataset, "cdc_live", &change, false);
                     return Ok(());
                 }
                 SCHEMA_EVOLUTION_FAILED.add(
@@ -2164,6 +2168,7 @@ impl RefreshTask {
                         dataset = %dataset,
                         "widening schema change detected on the CDC stream ({change}) but this acceleration engine cannot evolve mid-stream; incoming values are cast to the current schema (new columns dropped) until restart. Restart Spice to apply the evolution"
                     );
+                    emit_schema_evolution_event(&dataset, "restart_required", &change, true);
                 }
                 Ok(())
             }
@@ -2177,6 +2182,7 @@ impl RefreshTask {
                         1,
                         &schema_evolution_labels(&dataset, "incompatible", "fail_policy"),
                     );
+                    emit_schema_evolution_event(&dataset, "fail_policy", &reason, true);
                     return Err(crate::accelerated_table::Error::FailedToWriteData {
                         source: DataFusionError::Execution(format!(
                             "incompatible schema change detected on the CDC stream for {dataset}: {reason}. `on_schema_change: fail` is set"
@@ -2192,6 +2198,7 @@ impl RefreshTask {
                         dataset = %dataset,
                         "incompatible schema change detected on the CDC stream: {reason}. Values continue to be cast to the current schema"
                     );
+                    emit_schema_evolution_event(&dataset, "incompatible", &reason, true);
                 }
                 Ok(())
             }
@@ -2531,9 +2538,7 @@ async fn delete_matching_rows_from_arrow_provider(
         .await;
     }
 
-    if let Some(embedding_table) =
-        provider.downcast_ref::<crate::embeddings::table::EmbeddingTable>()
-    {
+    if let Some(embedding_table) = provider.downcast_ref::<EmbeddingTable>() {
         return Box::pin(delete_matching_rows_from_arrow_provider(
             embedding_table.get_underlying_ref(),
             rows,
@@ -2590,9 +2595,7 @@ async fn perform_change_write_maintenance(
         .await;
     }
 
-    if let Some(embedding_table) =
-        provider.downcast_ref::<crate::embeddings::table::EmbeddingTable>()
-    {
+    if let Some(embedding_table) = provider.downcast_ref::<EmbeddingTable>() {
         return Box::pin(perform_change_write_maintenance(
             embedding_table.get_underlying_ref(),
         ))
@@ -5365,6 +5368,12 @@ mod tests {
         assert!(!evolution_allowed(OnSchemaChange::AppendNewColumns, &typed));
         assert!(evolution_allowed(OnSchemaChange::SyncAllColumns, &additive));
         assert!(evolution_allowed(OnSchemaChange::SyncAllColumns, &typed));
+        // `drop_and_recreate` evolves the full widening set in place like `sync_all_columns`.
+        assert!(evolution_allowed(
+            OnSchemaChange::DropAndRecreate,
+            &additive
+        ));
+        assert!(evolution_allowed(OnSchemaChange::DropAndRecreate, &typed));
         assert!(!evolution_allowed(OnSchemaChange::Block, &additive));
         assert!(!evolution_allowed(OnSchemaChange::Fail, &additive));
         assert_eq!(widening_plan_kind(&additive), "added_columns");

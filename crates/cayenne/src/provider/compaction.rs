@@ -706,6 +706,100 @@ impl Drop for BackgroundMemTierCheckpointer {
     }
 }
 
+/// Periodic driver for the cold-tier promotion worker (storage-cascade bottom
+/// tier). Implemented by `CayenneTableProvider`; mirrors [`MemTierCheckpointRunner`]
+/// so the scheduler is decoupled from the provider and unit-testable with a stub.
+#[async_trait::async_trait]
+pub(crate) trait ColdTierPromotionRunner: Send + Sync {
+    /// Run one promotion tick. A no-op when the cold tier is disabled or the warm
+    /// tier has not crossed its promotion threshold. Errors are logged by the
+    /// implementation (a failed promotion leaves the warm tier intact and the
+    /// next tick retries).
+    async fn run_cold_tier_promotion_tick(&self);
+
+    /// Identifier used in log messages.
+    fn cold_tier_promotion_target_name(&self) -> &str;
+
+    /// The (possibly re-read) interval for the NEXT wake. `None` keeps the
+    /// spawn-time interval.
+    fn cold_tier_promotion_interval_hint(&self) -> Option<Duration> {
+        None
+    }
+}
+
+/// Per-table background cold-tier promoter (storage-cascade bottom tier).
+///
+/// Owns a tokio task that wakes every `interval` and runs ONE promotion tick
+/// (`run_cold_tier_promotion_tick`), which graduates the warm tier to the cold
+/// object store when its size/file thresholds are crossed. Modeled exactly on
+/// [`BackgroundMemTierCheckpointer`]: a `Weak` runner so the task never pins the
+/// provider, a `select!` over `sleep(interval)` vs a shutdown `Notify`, the
+/// interval re-read each wake, and `Drop`-fires-shutdown + a bounded detached
+/// drain. Runs on the shared low-priority compaction runtime via
+/// [`spawn_compaction`], on its OWN cadence — so the heavy whole-table
+/// graduation never blocks the compaction tick or the query/refresh runtimes.
+pub(crate) struct BackgroundColdTierPromoter {
+    handle: Option<tokio::task::JoinHandle<()>>,
+    shutdown: Arc<Notify>,
+}
+
+impl BackgroundColdTierPromoter {
+    /// Spawn the periodic promotion task. Returns `None` if `interval` is zero
+    /// (the task is disabled).
+    pub(crate) fn spawn(
+        runner: Weak<dyn ColdTierPromotionRunner>,
+        interval: Duration,
+    ) -> Option<Self> {
+        if interval.is_zero() {
+            return None;
+        }
+
+        let shutdown = Arc::new(Notify::new());
+        let shutdown_task = Arc::clone(&shutdown);
+
+        let handle = spawn_compaction(async move {
+            let mut current = interval;
+            loop {
+                tokio::select! {
+                    () = tokio::time::sleep(current) => {}
+                    () = shutdown_task.notified() => break,
+                }
+
+                let Some(runner) = runner.upgrade() else {
+                    break;
+                };
+
+                if let Some(next) = runner.cold_tier_promotion_interval_hint() {
+                    current = next;
+                }
+
+                tracing::trace!(
+                    target: "cayenne::compaction",
+                    table = runner.cold_tier_promotion_target_name(),
+                    "Periodic cold-tier promotion wake",
+                );
+
+                runner.run_cold_tier_promotion_tick().await;
+            }
+        });
+
+        Some(Self {
+            handle: Some(handle),
+            shutdown,
+        })
+    }
+}
+
+impl Drop for BackgroundColdTierPromoter {
+    fn drop(&mut self) {
+        self.shutdown.notify_one();
+        let Some(handle) = self.handle.take() else {
+            return;
+        };
+        spawn_checkpointer_drain_thread(handle);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

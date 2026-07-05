@@ -11,6 +11,8 @@ version.workspace = true
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
+adbc_core = { workspace = true, optional = true }
+adbc_driver_manager = { workspace = true, optional = true }
 ahash.workspace = true
 arrow.workspace = true
 arrow-array.workspace = true
@@ -127,7 +129,7 @@ rdkafka = { workspace = true, features = ["cmake-build"], optional = true }
 
 [features]
 bench = [] # Feature for benchmarking that exposes internal functions
-adbc = ["datafusion-table-providers/adbc-federation"]
+adbc = ["dep:adbc_core", "dep:adbc_driver_manager", "datafusion-table-providers/adbc-federation"]
 # Shared Spice federation deny-list wrapper (crate::federation). Requires the
 # upstream `impl SQLExecutor for SqlTable`, which is gated behind
 # `datafusion-table-providers/federation`.

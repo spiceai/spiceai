@@ -71,21 +71,30 @@ limitations under the License.
 //! - [`constants`]: Staging-dir name, WAL filename, and other shared constants.
 //! - [`partitioned_wal`]: Cross-partition WAL for the partitioned-table
 //!   coordinator (feature-gated).
+pub(crate) mod column_stats;
 pub(crate) mod compaction;
+pub(crate) mod compaction_writer;
 pub(crate) mod constants;
 pub(crate) mod context;
 pub(crate) mod delete;
 pub mod deletion_index;
 pub(crate) mod deletion_strategy;
 pub(crate) mod delta_encoding;
+pub(crate) mod fadvise_tier;
 pub(crate) mod file_pruning;
 pub(crate) mod fsync_tier;
+pub(crate) mod inlined_cache;
+pub(crate) mod maintenance;
+pub(crate) mod manifest;
 pub(crate) mod mem_tier;
 pub(crate) mod mem_tier_budget;
 pub(crate) mod memory_account;
 pub(crate) mod mutation_writer;
+pub(crate) mod on_conflict;
 pub(crate) mod overwrite;
 pub mod partitioned_wal;
+pub(crate) mod pk_index;
+pub(crate) mod query_admission;
 pub(crate) mod retention;
 pub(crate) mod scan;
 pub(crate) mod sink;
@@ -96,23 +105,27 @@ pub(crate) mod tuning;
 pub(crate) mod utils;
 pub(crate) mod vortex_format;
 pub(crate) mod write_budget;
+pub(crate) mod zorder;
 
 // Re-export the main type at the module level for convenience
 pub use compaction::{set_compaction_runtime_env, set_compaction_runtime_handle};
 pub use context::CayenneContext;
 pub use mem_tier::SlotAdvancer;
-pub use mem_tier_budget::set_global_mem_tier_bytes;
+pub use mem_tier_budget::{
+    global_mem_tier_total, set_global_mem_tier_bytes, update_global_mem_tier_total,
+};
 pub use overwrite::PreparedOverwrite;
 pub use partitioned_wal::{PARTITIONED_WAL_DIR, PartitionedWal, PartitionedWalEntry};
+pub use query_admission::set_query_admission_governor;
 pub use retention::TimeRetentionFilterBuilder;
 pub use scan::CayenneAccelerationExec;
 pub use staging_wal::{CayenneStagedAppend, PreparedStagedAppend};
 pub use table::{CayenneCdcWrite, CayenneTableProvider, CayenneTableProviderBuilder};
 pub use tuning::{
-    QueryObservations, deregister_query_observations, record_query_latency,
-    register_query_observations, set_global_memory_budget,
+    QueryObservations, deregister_query_observations, global_qph, record_global_query,
+    record_query_latency, register_query_observations, set_cpu_burstable, set_global_memory_budget,
 };
-pub use write_budget::set_global_encode_concurrency;
+pub use write_budget::{cap_global_encode_concurrency, set_global_encode_concurrency};
 
 // Re-export deletion utilities for advanced use cases
 pub use delete::CayenneDeletionSink;

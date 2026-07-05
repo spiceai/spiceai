@@ -50,7 +50,7 @@ limitations under the License.
 use std::collections::HashMap;
 #[cfg(target_os = "linux")]
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicI64, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
 
@@ -121,6 +121,16 @@ const MEM_PRESSURE_HIGH: f64 = 0.85;
 /// [`MEM_PRESSURE_HIGH`] avoids grow/shrink flapping near the limit.
 const MEM_PRESSURE_OK: f64 = 0.75;
 
+/// Memory-usage fraction at which pressure is CRITICAL: close enough to the host
+/// ceiling that one ×2/3 shrink step per dwell is too slow. At or above this the
+/// controller (a) collapses the live memory caps — inline memtable then mem-tier —
+/// straight to their floors in a single move, and (b) the impure mem-tier
+/// checkpoint tick bypasses its churn gate to force an immediate drain, actually
+/// releasing resident RAM (a cap shrink alone does not evict already-resident
+/// bytes). A last-resort safety valve ABOVE [`MEM_PRESSURE_HIGH`], atop the
+/// structural query-pool/tier partition that already prevents overcommit.
+pub(crate) const MEM_PRESSURE_CRITICAL: f64 = 0.90;
+
 /// CPU busy-fraction (of available cores, cgroup-aware) below which the controller
 /// re-enables CPU-stealing moves — adding write-encode shards and shrinking the
 /// compaction interval both compete with query threads, so they are withheld until
@@ -146,6 +156,49 @@ const PUBLISH_BOUND_FRACTION: f64 = 0.5;
 /// *sooner* — the closed-loop counterpart to the warm-start's per-tier file-size
 /// pre-sizing. Fast media (local SSD, tmpfs) use the base fraction unchanged.
 const SLOW_TIER_BOUND_SCALE: f64 = 0.5;
+
+/// EWMA smoothing for the FAST per-batch I/O/publish latency estimate that powers
+/// the cliff detector. Higher than [`EWMA_ALPHA`] so it tracks a sudden latency
+/// step (an EBS burst-credit cliff, the instance EBS pipe saturating) within a
+/// batch or two — where the slow EWMA lags and the additive controller would crawl
+/// down over many dwells while replication lag balloons.
+const EWMA_ALPHA_FAST: f64 = 0.6;
+
+/// I/O cliff trigger: the fast latency EWMA exceeding the slow EWMA by this factor
+/// is a step-change in write/publish latency, not noise. The controller answers
+/// with one decisive, multiplicative backoff (shed write shards, then amortize via
+/// the memtable) instead of an additive crawl — the I/O analogue of
+/// [`MEM_PRESSURE_CRITICAL`]'s fast path. ~3× separates a genuine cliff from EWMA
+/// jitter at [`EWMA_ALPHA_FAST`].
+const IO_CLIFF_RATIO: f64 = 3.0;
+
+/// A cliff additionally requires the fast EWMA to clear this absolute floor (ms),
+/// so a multiplicative jump within sub-millisecond noise (0.1 → 0.5 ms) cannot
+/// trip it — only latency that actually threatens the offered-load window.
+const IO_CLIFF_FLOOR_MS: f64 = 10.0;
+
+/// Continuous slow-tier bias bounds (see [`tier_scale`]). Measured write
+/// throughput at/below [`TIER_SCALE_SLOW_MBPS`] gets the full slow-tier scale
+/// ([`SLOW_TIER_BOUND_SCALE`]); at/above [`TIER_SCALE_FAST_MBPS`] gets none (1.0);
+/// linearly interpolated between. ~125 MiB/s ≈ a gp3 baseline volume; ~1 GiB/s ≈
+/// fast local `NVMe` or a high-provisioned io2 — which should not get the same
+/// commit-amortization pressure as slow gp3 even though both classify as `Ebs`.
+const TIER_SCALE_SLOW_MBPS: f64 = 125.0;
+const TIER_SCALE_FAST_MBPS: f64 = 1024.0;
+
+/// Slow-tier drain offset: on EBS/object-store media the controller starts
+/// shrinking the live memory buffers at a memory pressure this much BELOW
+/// [`MEM_PRESSURE_HIGH`] / [`MEM_PRESSURE_OK`], so it drains earlier in smaller
+/// increments rather than hitting the big synchronous critical drain — whose large
+/// write burst would compete with ingest for the same slow pipe and worsen
+/// backpressure exactly when the table is already struggling.
+const SLOW_TIER_MEM_DRAIN_OFFSET: f64 = 0.07;
+
+/// CPU growth gate on a T-family burstable instance: lower than [`CPU_PRESSURE_OK`]
+/// so the controller stops adding CPU-stealing work (write shards, more compaction)
+/// well before CPU credits deplete and the vCPUs throttle to a low baseline — a
+/// cliff the busy-fraction sampler cannot see coming.
+const CPU_PRESSURE_OK_BURSTABLE: f64 = 0.50;
 
 /// Idle horizon for [`QueryObservations::qph`]: with no query observed within this
 /// window the table is treated as having no QPH signal (the goal is skipped) rather
@@ -224,6 +277,17 @@ const GOAL_RELAX_FRACTION: f64 = 0.50;
 /// outside the deadband.
 const GOAL_MIN_STEP_FRACTION: f64 = 0.25;
 
+/// Consecutive eligible control ticks (past warmup + dwell) on which a goal stays
+/// violated while the controller has NO move left to make — every relevant lever
+/// already clamped at its bound — before the SLO is declared infeasible on the
+/// current hardware. At [`STEPS_PER_WINDOW`] ticks per convergence window this is
+/// ~2 windows of being maxed out, long enough to rule out transient convergence.
+/// Surfaced as a telemetry gauge + one operator warning per infeasible episode,
+/// naming the binding constraint (e.g. EBS-bandwidth-bound) so silent
+/// underperformance becomes actionable (provision more IOPS/throughput, or relax
+/// the SLO). The signal self-clears if the controller resumes progress.
+pub(crate) const GOAL_INFEASIBLE_STUCK_TICKS: u64 = 2 * STEPS_PER_WINDOW as u64;
+
 // ---------------------------------------------------------------------------
 // Environment detection: process memory budget + cgroup-aware usage
 // ---------------------------------------------------------------------------
@@ -246,6 +310,14 @@ static CGROUP_V1_MEMORY_USAGE_PATH: OnceLock<Option<String>> = OnceLock::new();
 /// because CPU is shared across tables (like the memory budget).
 static CPU_PRESSURE_MILLI: AtomicU64 = AtomicU64::new(u64::MAX);
 
+/// Whether the host is a T-family burstable EC2 instance (detected via IMDS,
+/// installed by the runtime). On a burstable instance CPU credits deplete under
+/// sustained load and the vCPUs throttle to a low baseline — a cliff the
+/// busy-fraction sampler alone cannot see — so the controller withholds
+/// CPU-stealing moves at a lower busy-fraction ([`CPU_PRESSURE_OK_BURSTABLE`]).
+/// Process-global: the instance type is a host fact, not a per-table one.
+static CPU_BURSTABLE: AtomicBool = AtomicBool::new(false);
+
 #[cfg(target_os = "linux")]
 static CGROUP_V2_CPU_STAT_PATH: OnceLock<Option<String>> = OnceLock::new();
 
@@ -264,6 +336,16 @@ static CPU_PREV_SAMPLE: LazyLock<Mutex<Option<(u64, Instant)>>> =
 /// the encode-concurrency budget.
 pub fn set_global_memory_budget(bytes: u64) {
     GLOBAL_MEMORY_BUDGET.store(bytes, Ordering::Relaxed);
+}
+
+/// Record whether the host is a T-family burstable EC2 instance (from IMDS).
+/// Idempotent; called by the runtime at table registration.
+pub fn set_cpu_burstable(burstable: bool) {
+    CPU_BURSTABLE.store(burstable, Ordering::Relaxed);
+}
+
+fn cpu_burstable() -> bool {
+    CPU_BURSTABLE.load(Ordering::Relaxed)
 }
 
 fn global_memory_budget() -> Option<u64> {
@@ -672,29 +754,140 @@ pub(crate) struct WriteSample {
     pub delete_rows: u64,
 }
 
-#[derive(Debug, Default, Clone, Copy)]
+/// A tumbling-window maximum of a signal. The instantaneous `now − ts` freshness/
+/// lag gauges are sampled at a random phase and ramp without bound while a table
+/// is idle, so they both miss transient stalls AND mislead post-load — useless as
+/// an SLO control signal. This holds the PEAK folded into the in-progress window
+/// plus the last completed window's peak (so a reader always has a full-window
+/// value), tumbling every [`Self::WINDOW_MS`]. Copy/cheap: three scalars, no
+/// allocation; lives inside the mutex-guarded [`EwmaInner`].
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct WindowMax {
+    /// Start (epoch ms) of the in-progress window; `i64::MIN` before the first fold.
+    cur_start_ms: i64,
+    /// Peak folded into the in-progress window.
+    cur_max: f64,
+    /// Peak of the last completed window.
+    prev_max: f64,
+}
+
+impl WindowMax {
+    /// Peak window width, DERIVED from [`DEFAULT_GOAL_CONVERGENCE_WINDOW`] (60s) so
+    /// the value and its doc can never drift if the default changes: the peak spans
+    /// a full goal-convergence window — the horizon the SLO is stated over. FIXED to
+    /// the DEFAULT: it does NOT track a per-dataset `cayenne_goal_convergence_window`
+    /// override (that override retunes the controller's step dwell, not this
+    /// observability window), so a table with a non-default convergence window still
+    /// reports its freshness peak over this ~60s horizon. Making it track the
+    /// configured window would mean threading a live `window_ms` through
+    /// `IngestStats`; deliberately deferred as out of scope for the signal.
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "a minutes-scale convergence window's millis fit i64 with vast headroom"
+    )]
+    const WINDOW_MS: i64 = DEFAULT_GOAL_CONVERGENCE_WINDOW.as_millis() as i64;
+
+    const fn new() -> Self {
+        Self {
+            cur_start_ms: i64::MIN,
+            cur_max: 0.0,
+            prev_max: 0.0,
+        }
+    }
+
+    /// Tumble the window if [`Self::WINDOW_MS`] elapsed since it opened. Idempotent
+    /// within a window, so it is safe to call from both `fold` (writer) and `peak`
+    /// (reader) — whichever crosses the boundary first advances it. A gap spanning
+    /// MORE than one window means the intervening windows saw no folds (idle), so
+    /// only a single-window gap carries a `prev`; a longer gap resets to 0 — the
+    /// idle-immunity that keeps a parked table from latching a stale peak.
+    fn roll(&mut self, now_ms: i64) {
+        if self.cur_start_ms == i64::MIN {
+            self.cur_start_ms = now_ms;
+        } else if now_ms.saturating_sub(self.cur_start_ms) >= Self::WINDOW_MS {
+            let elapsed_windows = now_ms.saturating_sub(self.cur_start_ms) / Self::WINDOW_MS;
+            self.prev_max = if elapsed_windows == 1 {
+                self.cur_max
+            } else {
+                0.0
+            };
+            self.cur_max = 0.0;
+            self.cur_start_ms = now_ms;
+        }
+    }
+
+    /// Fold a non-negative `value` observed at `now_ms` into the current window.
+    fn fold(&mut self, now_ms: i64, value: f64) {
+        self.roll(now_ms);
+        if value > self.cur_max {
+            self.cur_max = value;
+        }
+    }
+
+    /// The windowed peak at `now_ms` = max(in-progress, last-completed), after
+    /// rolling so an idle table's peak decays instead of latching forever.
+    fn peak(&mut self, now_ms: i64) -> f64 {
+        self.roll(now_ms);
+        self.cur_max.max(self.prev_max)
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
 struct EwmaInner {
-    rows_per_sec: f64,
-    bytes_per_sec: f64,
-    apply_ms: f64,
-    arrival_gap_ms: f64,
+    rows_per_sec: Ewma,
+    bytes_per_sec: Ewma,
+    apply_ms: Ewma,
+    arrival_gap_ms: Ewma,
     /// EWMA of `arrival_gap_ms²`, paired with `arrival_gap_ms` to derive the
     /// arrival-interval variance (and thus the burstiness CV) without storing a
     /// history: `Var = E[x²] − E[x]²`.
-    arrival_gap_ms_sq: f64,
+    arrival_gap_ms_sq: Ewma,
     /// EWMA of the per-batch mutation fraction (`superseded delete_rows / rows`),
     /// in `[0, 1]` — the mutation-heavy gate signal (updates + deletes).
-    delete_fraction: f64,
+    delete_fraction: Ewma,
+    /// Count of recorded batches, for the controller's warmup/fresh-sample gates
+    /// (NOT the EWMA seeding — each [`Ewma`] self-seeds on its first sample).
     samples: u64,
     /// EWMA per-batch object-store/disk write latency (the `vortex_write` phase),
-    /// ms; paired with `io_samples` for cold-start priming. `0` / no samples ⇒
-    /// the table has not spilled to Vortex (pure-inline) → I/O signal unavailable.
-    io_latency_ms: f64,
-    io_samples: u64,
+    /// ms. Unseeded (`value() == None`) ⇒ the table has not spilled to Vortex
+    /// (pure-inline) → I/O signal unavailable.
+    io_latency_ms: Ewma,
+    /// FAST EWMA (alpha [`EWMA_ALPHA_FAST`]) of the same `vortex_write` latency,
+    /// for the cliff detector: a sudden step (burst-credit depletion) shows up
+    /// here several dwells before the slow `io_latency_ms` catches up.
+    io_latency_fast_ms: Ewma,
     /// EWMA per-batch metastore publish latency (the `publish` phase — the
-    /// single-writer commit), ms; paired with `publish_samples`.
-    publish_latency_ms: f64,
-    publish_samples: u64,
+    /// single-writer commit), ms.
+    publish_latency_ms: Ewma,
+    /// FAST EWMA of the `publish` latency, paired with `publish_latency_ms` for the
+    /// publish-side cliff detector.
+    publish_latency_fast_ms: Ewma,
+    /// Tumbling-window PEAK of the per-apply end-to-end row freshness (`apply
+    /// wall-clock − the applied batch's source-commit ts`) — the true worst-case
+    /// PG-commit→queryable lag the freshness SLO is stated against, and the signal
+    /// the freshness-goal shrink lever reads. Idle-immune (only folded on an apply
+    /// that carried a source-commit ts, so a post-idle batch reports its own small
+    /// lag, never the idle duration), unlike the unbounded instantaneous gauges.
+    row_freshness_peak: WindowMax,
+}
+
+impl Default for EwmaInner {
+    fn default() -> Self {
+        Self {
+            rows_per_sec: Ewma::new(),
+            bytes_per_sec: Ewma::new(),
+            apply_ms: Ewma::new(),
+            arrival_gap_ms: Ewma::new(),
+            arrival_gap_ms_sq: Ewma::new(),
+            delete_fraction: Ewma::new(),
+            samples: 0,
+            io_latency_ms: Ewma::new(),
+            io_latency_fast_ms: Ewma::with_alpha(EWMA_ALPHA_FAST),
+            publish_latency_ms: Ewma::new(),
+            publish_latency_fast_ms: Ewma::with_alpha(EWMA_ALPHA_FAST),
+            row_freshness_peak: WindowMax::new(),
+        }
+    }
 }
 
 /// Per-table rolling accounting of both the **input** (ingest rate) and the
@@ -772,18 +965,15 @@ impl IngestStats {
         };
 
         let mut inner = self.inner.lock();
-        let prior = inner.samples;
-        ewma(&mut inner.rows_per_sec, inst_rows_per_sec, prior);
-        ewma(&mut inner.bytes_per_sec, inst_bytes_per_sec, prior);
-        ewma(&mut inner.apply_ms, apply_ms, prior);
-        ewma(&mut inner.arrival_gap_ms, arrival_gap_ms, prior);
-        ewma(
-            &mut inner.arrival_gap_ms_sq,
-            arrival_gap_ms * arrival_gap_ms,
-            prior,
-        );
-        ewma(&mut inner.delete_fraction, inst_delete_fraction, prior);
-        inner.samples = prior.saturating_add(1);
+        inner.rows_per_sec.update(inst_rows_per_sec);
+        inner.bytes_per_sec.update(inst_bytes_per_sec);
+        inner.apply_ms.update(apply_ms);
+        inner.arrival_gap_ms.update(arrival_gap_ms);
+        inner
+            .arrival_gap_ms_sq
+            .update(arrival_gap_ms * arrival_gap_ms);
+        inner.delete_fraction.update(inst_delete_fraction);
+        inner.samples = inner.samples.saturating_add(1);
     }
 
     /// Update the observed read amplification (small-file count). Called by the
@@ -800,6 +990,15 @@ impl IngestStats {
         if let Some(milli) = pressure_to_milli(fraction) {
             self.mem_pressure_milli.store(milli, Ordering::Relaxed);
         }
+    }
+
+    /// Current memory pressure (`used / budget`), or `None` when unsampled
+    /// (non-Linux, no budget installed). A single relaxed atomic load — the cheap
+    /// path for hot loops that need only this one signal, not a full
+    /// [`IngestSnapshot`].
+    #[must_use]
+    pub fn mem_pressure(&self) -> Option<f64> {
+        milli_to_pressure(self.mem_pressure_milli.load(Ordering::Relaxed))
     }
 
     /// Fold in an upstream commit timestamp (ms since the Unix epoch) for a freshly
@@ -821,18 +1020,18 @@ impl IngestStats {
     /// so a pure-inline table leaves `io_latency_ms` unavailable.
     pub fn record_io_latency(&self, d: Duration) {
         let mut inner = self.inner.lock();
-        let prior = inner.io_samples;
-        ewma(&mut inner.io_latency_ms, duration_ms(d), prior);
-        inner.io_samples = prior.saturating_add(1);
+        let ms = duration_ms(d);
+        inner.io_latency_ms.update(ms);
+        inner.io_latency_fast_ms.update(ms);
     }
 
     /// Fold one CDC batch's metastore publish latency (the `publish` phase — the
     /// single-writer commit) into the rolling EWMA.
     pub fn record_publish_latency(&self, d: Duration) {
         let mut inner = self.inner.lock();
-        let prior = inner.publish_samples;
-        ewma(&mut inner.publish_latency_ms, duration_ms(d), prior);
-        inner.publish_samples = prior.saturating_add(1);
+        let ms = duration_ms(d);
+        inner.publish_latency_ms.update(ms);
+        inner.publish_latency_fast_ms.update(ms);
     }
 
     /// Replication lag in seconds relative to `now_ms` (age of the newest applied
@@ -860,15 +1059,55 @@ impl IngestStats {
         }
     }
 
+    /// Fold this apply's end-to-end row freshness — `now_ms − source_commit_ts_ms`,
+    /// the age at apply time of the batch we just made queryable — into the rolling
+    /// windowed peak. This is the true PG-commit→queryable lag per batch; its peak
+    /// over the window is the worst-case freshness the SLO is stated against, and
+    /// what the freshness-goal shrink lever controls on. A no-op when the source
+    /// carries no commit ts (nothing to measure). Idle-immune BY CONSTRUCTION: a
+    /// batch that arrives after an idle gap carries a RECENT `source_commit_ts_ms`,
+    /// so its measured lag is small — the wall-clock idle never enters the signal
+    /// (unlike `freshness_secs`/`replication_lag_secs`, which both ramp on idle).
+    /// Negative (source clock ahead of host) clamps to 0; the absolute value is only
+    /// as good as source↔host clock sync, so the controller keys off the threshold.
+    pub fn fold_row_freshness(&self, now_ms: i64, source_commit_ts_ms: Option<i64>) {
+        let Some(ts) = source_commit_ts_ms else {
+            return;
+        };
+        let lag_secs = u64_to_f64(now_ms.saturating_sub(ts).max(0).unsigned_abs()) / 1000.0;
+        self.inner.lock().row_freshness_peak.fold(now_ms, lag_secs);
+    }
+
+    /// The windowed-peak per-apply row freshness in seconds (worst PG-commit→
+    /// queryable lag over the rolling window), or `None` before the first apply that
+    /// carried a source-commit ts. The freshness-goal control/SLO signal — robust to
+    /// the instantaneous gauge's sampling-phase blindness and idle ramp.
+    #[must_use]
+    pub fn peak_row_freshness_secs(&self, now_ms: i64) -> Option<f64> {
+        let mut inner = self.inner.lock();
+        // `cur_start_ms == i64::MIN` ⇒ never folded (no apply yet with a commit ts).
+        if inner.row_freshness_peak.cur_start_ms == i64::MIN {
+            return None;
+        }
+        Some(inner.row_freshness_peak.peak(now_ms))
+    }
+
     /// Take a consistent snapshot of the derived signals for the controller.
     #[must_use]
     pub fn snapshot(&self) -> IngestSnapshot {
         let inner = *self.inner.lock();
+        // Resolve each EWMA to its current value; an unseeded average reads as the
+        // cold-start `0.0` the prior bare-f64 slots defaulted to.
+        let rows_per_sec = inner.rows_per_sec.value().unwrap_or(0.0);
+        let bytes_per_sec = inner.bytes_per_sec.value().unwrap_or(0.0);
+        let apply_ms = inner.apply_ms.value().unwrap_or(0.0);
+        let arrival_gap_ms = inner.arrival_gap_ms.value().unwrap_or(0.0);
+        let delete_fraction = inner.delete_fraction.value().unwrap_or(0.0);
         // Key response signal: apply latency relative to the offered-load
         // interval. > 1 means we absorb a batch slower than batches arrive — the
         // table is falling behind regardless of the absolute rate.
-        let apply_vs_arrival = if inner.arrival_gap_ms > 0.0 {
-            inner.apply_ms / inner.arrival_gap_ms
+        let apply_vs_arrival = if arrival_gap_ms > 0.0 {
+            apply_ms / arrival_gap_ms
         } else {
             0.0
         };
@@ -877,28 +1116,28 @@ impl IngestStats {
         // σ/μ = sqrt(E[x²] − E[x]²) / E[x]. CV ≈ 0 is a metronome-steady stream;
         // CV > 1 means the gap's spread exceeds its mean (spiky). `0` until the
         // mean is positive (cold start) so it can't fire a spurious "bursty".
-        let arrival_cv = if inner.arrival_gap_ms > 0.0 {
-            let variance =
-                (inner.arrival_gap_ms_sq - inner.arrival_gap_ms * inner.arrival_gap_ms).max(0.0);
-            variance.sqrt() / inner.arrival_gap_ms
+        let arrival_cv = if arrival_gap_ms > 0.0 {
+            let arrival_gap_ms_sq = inner.arrival_gap_ms_sq.value().unwrap_or(0.0);
+            let variance = (arrival_gap_ms_sq - arrival_gap_ms * arrival_gap_ms).max(0.0);
+            variance.sqrt() / arrival_gap_ms
         } else {
             0.0
         };
         IngestSnapshot {
-            rows_per_sec: inner.rows_per_sec,
+            rows_per_sec,
             // Real bytes/sec once the first write has been recorded; -1.0 before
             // then (cold start) so the gauge is suppressed rather than emitting 0.
             bytes_per_sec: if self.total_bytes.load(Ordering::Relaxed) > 0 {
-                inner.bytes_per_sec
+                bytes_per_sec
             } else {
                 -1.0
             },
-            apply_ms: inner.apply_ms,
-            arrival_gap_ms: inner.arrival_gap_ms,
+            apply_ms,
+            arrival_gap_ms,
             apply_vs_arrival,
             read_amp: self.read_amp.load(Ordering::Relaxed),
             mem_pressure,
-            delete_fraction: inner.delete_fraction,
+            delete_fraction,
             arrival_cv,
             samples: inner.samples,
             // The now-relative CDC signals, the query-side metrics, and the
@@ -912,10 +1151,17 @@ impl IngestStats {
             query_latency_p99_ms: None,
             qph: None,
             cpu_pressure: cpu_pressure(),
-            io_latency_ms: (inner.io_samples > 0).then_some(inner.io_latency_ms),
-            publish_latency_ms: (inner.publish_samples > 0).then_some(inner.publish_latency_ms),
+            cpu_burstable: cpu_burstable(),
+            io_latency_ms: inner.io_latency_ms.value(),
+            publish_latency_ms: inner.publish_latency_ms.value(),
+            io_latency_fast_ms: inner.io_latency_fast_ms.value(),
+            publish_latency_fast_ms: inner.publish_latency_fast_ms.value(),
             data_storage: StorageClass::default(),
             metastore_storage: StorageClass::default(),
+            // Filled by `CayenneContext::ingest_snapshot` from the per-table config
+            // (the measured calibration-probe throughput), like the storage classes.
+            data_write_mbps: None,
+            metastore_write_mbps: None,
         }
     }
 }
@@ -952,8 +1198,15 @@ pub(crate) struct IngestSnapshot {
     /// commit ts`), or `None` when no source timestamp is available. Lower is
     /// better; drives the replication-lag goal.
     pub replication_lag_secs: Option<f64>,
-    /// Freshness in seconds (`now − newest applied data wall-clock`), or `None`
-    /// before the first apply. Lower is better; drives the freshness goal.
+    /// Windowed-PEAK per-apply row freshness in seconds — the worst-case
+    /// PG-commit→queryable lag (`apply_wall_clock − batch_source_commit_ts`) over the
+    /// rolling goal-convergence window ([`WindowMax::WINDOW_MS`], derived from
+    /// [`DEFAULT_GOAL_CONVERGENCE_WINDOW`]), populated from
+    /// [`IngestStats::peak_row_freshness_secs`]. NOT the instantaneous
+    /// `now − last_visible` age: the peak captures transient stalls and is idle-immune,
+    /// so it is the freshness-goal control/SLO signal. Falls back to that instantaneous
+    /// age on sources without a commit timestamp (or before the first timestamped
+    /// apply); `None` only before the first apply of any kind. Lower is better.
     pub freshness_secs: Option<f64>,
     /// p99 query latency in ms observed on this table (pushed down from the
     /// runtime), or `None` when no queries have run. Lower is better; drives the
@@ -966,21 +1219,82 @@ pub(crate) struct IngestSnapshot {
     /// when unavailable (non-Linux / unreadable). High ⇒ withhold CPU-stealing
     /// moves (write-concurrency growth, compaction-interval shrink). Process-global.
     pub cpu_pressure: Option<f64>,
+    /// Host is a T-family burstable EC2 instance (CPU credits deplete under
+    /// sustained load). The CPU growth gate tightens to [`CPU_PRESSURE_OK_BURSTABLE`].
+    /// Process-global (a host fact).
+    pub cpu_burstable: bool,
     /// EWMA per-batch object-store/disk write latency in ms, or `None` until the
     /// table spills to Vortex. High vs the arrival interval ⇒ bias to fewer/larger files.
     pub io_latency_ms: Option<f64>,
     /// EWMA per-batch metastore publish latency in ms, or `None` before the first
     /// publish. High vs the arrival interval ⇒ bias to larger inline-flush (amortize commits).
     pub publish_latency_ms: Option<f64>,
-    /// Storage medium of the table's data files, surfaced for observability/telemetry.
-    /// The slow-tier write bias is realized in the static warm-start (the accelerator
-    /// sizes the initial inline-flush by storage class) and dynamically via the
-    /// measured `io_latency_ms` signal — `decide` does not read this field directly.
+    /// FAST EWMA of the per-batch write latency ([`EWMA_ALPHA_FAST`]), or `None`
+    /// until the table spills. Paired with [`Self::io_latency_ms`] for the cliff
+    /// detector: `fast ≫ slow` is a burst-credit/pipe-saturation step change.
+    pub io_latency_fast_ms: Option<f64>,
+    /// FAST EWMA of the per-batch publish latency, for the publish-side cliff.
+    pub publish_latency_fast_ms: Option<f64>,
+    /// Storage medium of the table's data files. Drives the *continuous* slow-tier
+    /// I/O-bound bias ([`tier_scale`]) together with [`Self::data_write_mbps`], the
+    /// `cliff` fast path, and the slow-tier earlier-drain gate; also surfaced for
+    /// telemetry.
     pub data_storage: StorageClass,
-    /// Storage medium of the metastore, surfaced for observability/telemetry. The
-    /// slow-tier commit-amortization bias is realized via the static warm-start and
-    /// the measured `publish_latency_ms` signal — not read by `decide` directly.
+    /// Storage medium of the metastore. Drives the continuous publish-bound bias
+    /// with [`Self::metastore_write_mbps`]; surfaced for telemetry.
     pub metastore_storage: StorageClass,
+    /// Measured data-volume write throughput (MiB/s) from the calibration probe, or
+    /// `None` when unprobed. Refines [`Self::data_storage`] into a continuous bias —
+    /// the only storage signal for a memory-tier table that never spills (and so
+    /// produces no `io_latency_ms`).
+    pub data_write_mbps: Option<f64>,
+    /// Measured metastore-volume write throughput (MiB/s), refining the publish bias.
+    pub metastore_write_mbps: Option<f64>,
+}
+
+impl IngestSnapshot {
+    /// CPU has headroom to add CPU-stealing work (write shards, more compaction).
+    /// The gate tightens to [`CPU_PRESSURE_OK_BURSTABLE`] on a T-family burstable
+    /// instance, where credits deplete under sustained load. Unknown pressure ⇒
+    /// `true` (the CPU rule is inert). Single source of truth for the gate, shared
+    /// by both decide ladders and [`binding_constraint`].
+    fn cpu_ok(&self) -> bool {
+        let gate = if self.cpu_burstable {
+            CPU_PRESSURE_OK_BURSTABLE
+        } else {
+            CPU_PRESSURE_OK
+        };
+        self.cpu_pressure.is_none_or(|p| p < gate)
+    }
+
+    /// The data volume is on a slow/networked tier — the continuous,
+    /// measurement-aware predicate ([`tier_scale`] `< 1.0`), so a fast-measured io2
+    /// volume is correctly treated as fast even though its class is `Ebs`.
+    fn data_tier_is_slow(&self) -> bool {
+        tier_scale(self.data_storage, self.data_write_mbps) < 1.0
+    }
+
+    /// The metastore volume is on a slow/networked tier (see [`Self::data_tier_is_slow`]).
+    fn metastore_tier_is_slow(&self) -> bool {
+        tier_scale(self.metastore_storage, self.metastore_write_mbps) < 1.0
+    }
+
+    /// A *confirmed* slow tier, for the earlier-drain decision: a measured-slow
+    /// volume, or a known networked class (`Ebs`). The `Unknown` default (no
+    /// detection, no measurement) is deliberately excluded so undetected storage
+    /// keeps the standard memory thresholds — earlier draining only kicks in with
+    /// positive evidence the write path is slow, never as a blanket default change.
+    fn confirmed_slow_tier(&self) -> bool {
+        let confirmed = |class: StorageClass, mbps: Option<f64>| {
+            if mbps.is_some() {
+                tier_scale(class, mbps) < 1.0
+            } else {
+                matches!(class, StorageClass::Ebs)
+            }
+        };
+        confirmed(self.data_storage, self.data_write_mbps)
+            || confirmed(self.metastore_storage, self.metastore_write_mbps)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1017,6 +1331,13 @@ pub(crate) struct LiveActuators {
     /// per-file stats and compression for scans, less fan-out to probe), bounded
     /// by the static config (storage-tier-aware). `<= 0` keeps size-rolling off.
     target_vortex_file_size_bytes: AtomicI64,
+    /// Query-admission permits to reserve for CDC apply (the CPU-fairness lever).
+    /// Reported each background tick to the process-global query-admission
+    /// governor, which holds that many permits on the shared admission semaphore so
+    /// that many fewer analytical queries run concurrently — handing CPU back to
+    /// the apply when it is behind under contention. `0` (the default) reserves
+    /// nothing, so the lever is inert unless a lag/freshness goal drives it up.
+    query_admission_reserve: AtomicUsize,
     /// Observed bytes-per-row, seeded from the initial (schema-aware) config and
     /// then *relearned* from live ingest (EWMA bytes ÷ rows) so the row cap a byte
     /// budget implies tracks the table's real row width — not a stale static
@@ -1045,6 +1366,7 @@ impl LiveActuators {
             write_concurrency: AtomicUsize::new(init.write_concurrency),
             mem_tier_max_bytes: AtomicI64::new(init.mem_tier_max_bytes),
             target_vortex_file_size_bytes: AtomicI64::new(init.target_vortex_file_size_bytes),
+            query_admission_reserve: AtomicUsize::new(init.query_admission_reserve),
             bytes_per_row: AtomicI64::new(
                 (init.inline_flush_max_bytes / init.inline_flush_max_rows.max(1)).max(1),
             ),
@@ -1070,6 +1392,7 @@ impl LiveActuators {
             target_vortex_file_size_bytes: self
                 .target_vortex_file_size_bytes
                 .load(Ordering::Relaxed),
+            query_admission_reserve: self.query_admission_reserve.load(Ordering::Relaxed),
         }
     }
 
@@ -1160,6 +1483,12 @@ impl LiveActuators {
                     Ordering::Relaxed,
                 );
             }
+            Actuator::QueryAdmissionReserve => {
+                self.query_admission_reserve.store(
+                    usize::try_from(adj.new_value).unwrap_or(usize::MAX),
+                    Ordering::Relaxed,
+                );
+            }
         }
     }
 }
@@ -1176,6 +1505,7 @@ pub(crate) struct ActuatorValues {
     pub write_concurrency: usize,
     pub mem_tier_max_bytes: i64,
     pub target_vortex_file_size_bytes: i64,
+    pub query_admission_reserve: usize,
 }
 
 /// Static `[floor, ceiling]` per dynamically-tuned actuator, derived by the static
@@ -1190,6 +1520,7 @@ pub(crate) struct TuningBounds {
     pub write_concurrency: (usize, usize),
     pub mem_tier_max_bytes: (i64, i64),
     pub target_vortex_file_size_bytes: (i64, i64),
+    pub query_admission_reserve: (usize, usize),
 }
 
 // ---------------------------------------------------------------------------
@@ -1206,6 +1537,13 @@ pub(crate) enum Actuator {
     BakeDeletionIndexTrigger,
     WriteConcurrency,
     TargetVortexFileSize,
+    /// Number of query-admission permits to RESERVE for CDC apply (shed that many
+    /// concurrent analytical queries). The CPU-fairness lever: GROWN when a
+    /// lag/freshness goal is unmet AND CPU is the contended resource (queries are
+    /// starving the apply); RELEASED as soon as CPU frees or the lag goal is met.
+    /// Reported to the process-global [`super::query_admission`] governor, which
+    /// holds that many permits on the shared admission semaphore.
+    QueryAdmissionReserve,
 }
 
 impl Actuator {
@@ -1220,6 +1558,7 @@ impl Actuator {
             Self::BakeDeletionIndexTrigger => "bake_deletion_index_trigger",
             Self::WriteConcurrency => "write_concurrency",
             Self::TargetVortexFileSize => "target_vortex_file_size_bytes",
+            Self::QueryAdmissionReserve => "query_admission_reserve",
         }
     }
 }
@@ -1397,18 +1736,24 @@ pub fn register_query_observations(name: &str) -> Arc<QueryObservations> {
 
 /// Push one finished query's wall latency to a table's observations, if it is a
 /// registered (Cayenne-accelerated) table. Called by the runtime's query tracker
-/// for every dataset a query touched; a no-op for unregistered tables.
-pub fn record_query_latency(name: &str, latency_ms: f64) {
+/// for every dataset a query touched; a no-op for unregistered tables. Returns
+/// `true` iff the table was Cayenne-registered, so the caller can decide whether
+/// the query touched Cayenne at all (and thus counts toward global QPH).
+pub fn record_query_latency(name: &str, latency_ms: f64) -> bool {
     let map = QUERY_OBSERVATIONS.read();
     // Fast path: the runtime pushes the already-bare table name
     // (`TableReference::table()`), so a borrowed lookup hits with no allocation or
     // parse — this runs per dataset per query.
     if let Some(obs) = map.get(name) {
         obs.record_query(latency_ms);
+        true
     } else if let Some(obs) = map.get(table_registry_key(name).as_str()) {
         // Fallback for a schema-qualified name (rare; never on the runtime hot
         // path) — normalize to the bare key registration used.
         obs.record_query(latency_ms);
+        true
+    } else {
+        false
     }
 }
 
@@ -1420,6 +1765,31 @@ pub fn record_query_latency(name: &str, latency_ms: f64) {
 /// and avoid leaking handles.
 pub fn deregister_query_observations(name: &str) {
     QUERY_OBSERVATIONS.write().remove(&table_registry_key(name));
+}
+
+/// Process-global query observations aggregating EVERY Cayenne-touching query
+/// exactly once (regardless of how many datasets it touched), so QPH — a
+/// SYSTEM-WIDE metric — is measured globally rather than summed across per-table
+/// handles (which would multiply-count a join across its participants). The
+/// per-table handles in [`QUERY_OBSERVATIONS`] still serve per-dataset p99 latency.
+static GLOBAL_QUERY_OBSERVATIONS: LazyLock<QueryObservations> =
+    LazyLock::new(QueryObservations::new);
+
+/// Record one finished query against the global QPH aggregate. The runtime calls
+/// this ONCE per query (not once per touched dataset), only when the query touched
+/// at least one Cayenne table. Latency is folded into the global histogram too,
+/// but only the global QPH is consumed today.
+pub fn record_global_query(latency_ms: f64) {
+    GLOBAL_QUERY_OBSERVATIONS.record_query(latency_ms);
+}
+
+/// System-wide queries-per-hour, or `None` when there is no current query signal
+/// (no queries yet, or the system has gone idle). Every per-dataset controller's
+/// QPH goal reads THIS — never a per-table rate — because a query spanning N
+/// datasets is one unit of system throughput, not N.
+#[must_use]
+pub fn global_qph() -> Option<f64> {
+    GLOBAL_QUERY_OBSERVATIONS.qph()
 }
 
 // ---------------------------------------------------------------------------
@@ -1551,6 +1921,25 @@ impl Goals {
         (self.convergence_window / STEPS_PER_WINDOW).max(GOAL_DWELL_FLOOR)
     }
 
+    /// The control dwell to enforce given the legacy `min_dwell`: the
+    /// window-derived goal dwell when any goal is active, else `min_dwell`. Lets the
+    /// caller compute "is this control tick eligible to move?" the same way
+    /// [`decide_with_goals`] does, for the infeasibility tracker.
+    pub(crate) fn control_dwell(self, min_dwell: Duration) -> Duration {
+        if self.any_active() {
+            self.dwell()
+        } else {
+            min_dwell
+        }
+    }
+
+    /// True when an active goal's measured value is past target. Lag/freshness count
+    /// only when `ingest_fresh` (they grow with the wall clock on an idle table, so
+    /// a parked table isn't "failing" its SLO). Drives the infeasible-SLO tracker.
+    pub(crate) fn any_actionable_violation(self, s: &IngestSnapshot, ingest_fresh: bool) -> bool {
+        self.query_violation(s) > 0.0 || (ingest_fresh && self.ingest_violation(s) > 0.0)
+    }
+
     /// Max violation among the lag/freshness goals — drives the ingest tier's step
     /// size; identifies the driving goal for attribution.
     fn ingest_violation(self, s: &IngestSnapshot) -> f64 {
@@ -1582,6 +1971,44 @@ impl Goals {
             && self
                 .query_latency_p99
                 .is_none_or(|g| g.comfortably_met(s.query_latency_p99_ms))
+            && self.qph.is_none_or(|g| g.comfortably_met(s.qph))
+    }
+
+    /// Are the ingest-side goals (replication-lag + freshness) comfortably met?
+    /// One of the RELEASE triggers for the query-admission reserve — the reserve's
+    /// justification (CDC behind) is gone, so hand the query slots back.
+    ///
+    /// The reserve's release must NEVER be gated on a query goal being MET: the
+    /// reserve suppresses queries, so a query goal (QPH/latency) could stay below
+    /// "met" *because of the throttle itself*, and the reserve would never release
+    /// (self-perpetuation). Releasing on a query goal being VIOLATED is the OPPOSITE
+    /// direction and is safe — see [`Self::query_comfortably_met`] and the release
+    /// tier — because throttling moves a query goal TOWARD violation, so
+    /// "release on violated" is a stable negative-feedback brake, not a latch.
+    fn ingest_comfortably_met(self, s: &IngestSnapshot) -> bool {
+        self.replication_lag
+            .is_none_or(|g| g.comfortably_met(s.replication_lag_secs))
+            && self
+                .freshness
+                .is_none_or(|g| g.comfortably_met(s.freshness_secs))
+    }
+
+    /// Are the query-side goals (query-latency-p99 + QPH) comfortably met? The
+    /// HEADROOM gate for GROWING the query-admission reserve. That lever sheds
+    /// analytical queries to hand cores to the CDC apply, trading query throughput
+    /// for ingest freshness — so it should only spend query capacity it demonstrably
+    /// HAS: grow the reserve while the query SLOs sit comfortably above target, and
+    /// stop once throttling has consumed that headroom. This makes the query SLOs
+    /// the reserve's BUDGET — the apply may borrow query cores down to (but not
+    /// through) the QPH/latency targets. `None` (unset) query goals read as
+    /// comfortably met, so with no query SLO configured the reserve grows purely on
+    /// the ingest+CPU signals (the prior behavior). Safe as a GROW gate — it only
+    /// makes throttling LESS aggressive, never a latch: the self-perpetuation trap
+    /// on [`Self::ingest_comfortably_met`] is specific to gating RELEASE on a query
+    /// goal being met; this gates GROW, the opposite move.
+    fn query_comfortably_met(self, s: &IngestSnapshot) -> bool {
+        self.query_latency_p99
+            .is_none_or(|g| g.comfortably_met(s.query_latency_p99_ms))
             && self.qph.is_none_or(|g| g.comfortably_met(s.qph))
     }
 }
@@ -1623,8 +2050,37 @@ pub(crate) fn decide_with_goals(
         return None;
     }
 
-    let mem_high = s.mem_pressure.is_some_and(|p| p > MEM_PRESSURE_HIGH);
-    let mem_ok = s.mem_pressure.is_none_or(|p| p < MEM_PRESSURE_OK);
+    // Slow-tier earlier drain: on EBS/object-store media (any tier the continuous
+    // bias does not rate as fast) the controller starts shrinking the live memory
+    // buffers EARLIER — at thresholds [`SLOW_TIER_MEM_DRAIN_OFFSET`] below the
+    // defaults — so it drains in small increments instead of hitting the big
+    // synchronous critical drain, whose large write burst would compete with ingest
+    // for the same slow pipe. A fast-measured volume (scale 1.0) keeps the defaults.
+    // Continuous slow-tier scales, computed once and reused for the I/O/publish
+    // bound bars below (a fast-measured volume scales to 1.0 — no bias).
+    let data_scale = tier_scale(s.data_storage, s.data_write_mbps);
+    let meta_scale = tier_scale(s.metastore_storage, s.metastore_write_mbps);
+    // Earlier-drain applies only to a CONFIRMED slow tier (known EBS or a
+    // measured-slow volume), NOT the `Unknown` default — undetected storage keeps
+    // the standard memory thresholds, so this never changes behavior blanket.
+    let drain_offset = if s.confirmed_slow_tier() {
+        SLOW_TIER_MEM_DRAIN_OFFSET
+    } else {
+        0.0
+    };
+    let mem_high = s
+        .mem_pressure
+        .is_some_and(|p| p > MEM_PRESSURE_HIGH - drain_offset);
+    let mem_ok = s
+        .mem_pressure
+        .is_none_or(|p| p < MEM_PRESSURE_OK - drain_offset);
+    // CRITICAL pressure: approaching the host ceiling. The shrink below collapses
+    // the live caps straight to their floors (not one ×2/3 step) so they stop
+    // admitting growth at once; the impure checkpoint tick pairs this with a
+    // forced mem-tier drain to release resident RAM. A host-ceiling backstop, so it
+    // is NOT shifted by the slow-tier offset (the earlier `mem_high` drain is what
+    // keeps a slow tier from reaching it).
+    let mem_critical = s.mem_pressure.is_some_and(|p| p >= MEM_PRESSURE_CRITICAL);
     // Fresh-sample gate: the rate/latency EWMAs only advance on a CDC write, so a
     // table that fell behind and then went idle keeps a stale `apply_vs_arrival`
     // above 1 indefinitely. Without this gate the controller would re-fire the
@@ -1643,19 +2099,24 @@ pub(crate) fn decide_with_goals(
     // window, gated on fresh ingest) biases toward fewer/larger files + amortized
     // commits. Each collapses to legacy behavior when its signal is unavailable
     // (`cpu_ok` true, `io_bound`/`publish_bound` false).
-    let cpu_ok = s.cpu_pressure.is_none_or(|p| p < CPU_PRESSURE_OK);
+    let cpu_ok = s.cpu_ok();
     let io_bound = ingest_fresh
         && latency_bound(
             s.io_latency_ms,
             s.arrival_gap_ms,
-            tier_bound_fraction(IO_BOUND_FRACTION, s.data_storage),
+            IO_BOUND_FRACTION * data_scale,
         );
     let publish_bound = ingest_fresh
         && latency_bound(
             s.publish_latency_ms,
             s.arrival_gap_ms,
-            tier_bound_fraction(PUBLISH_BOUND_FRACTION, s.metastore_storage),
+            PUBLISH_BOUND_FRACTION * meta_scale,
         );
+    // I/O cliff: the FAST latency EWMA has jumped well above the slow one — a
+    // step-change (EBS burst-credit depletion, the instance EBS pipe saturating),
+    // not noise. Gated on fresh ingest like the other write-derived signals.
+    let io_cliff = ingest_fresh && is_cliff(s.io_latency_fast_ms, s.io_latency_ms);
+    let publish_cliff = ingest_fresh && is_cliff(s.publish_latency_fast_ms, s.publish_latency_ms);
 
     // (1) Memory pressure [hard, highest priority]: the cgroup-aware budget is
     // nearly exhausted. Shrink the two live memory buffers — the inline memtable
@@ -1664,26 +2125,84 @@ pub(crate) fn decide_with_goals(
     // already-tight box; query read-amp is instead relieved by compaction (which
     // costs CPU, not memory).
     if mem_high {
-        if let Some(v) = clamp_move_i64(
+        // Under CRITICAL pressure jump straight to the floor in one move; otherwise
+        // take a single ×2/3 step and re-evaluate next dwell. Same shape for the
+        // inline memtable and the mem-tier cap (`reasons` = (critical, normal)).
+        let shrink = |cur_v: i64,
+                      bounds: (i64, i64),
+                      actuator: Actuator,
+                      reasons: (&'static str, &'static str)| {
+            let target = if mem_critical {
+                bounds.0
+            } else {
+                shrink_i64(cur_v)
+            };
+            clamp_move_i64(cur_v, target, bounds).map(|v| Adjustment {
+                actuator,
+                new_value: u64::try_from(v).unwrap_or(0),
+                reason: if mem_critical { reasons.0 } else { reasons.1 },
+            })
+        };
+        if let Some(adj) = shrink(
             cur.inline_flush_max_bytes,
-            shrink_i64(cur.inline_flush_max_bytes),
             b.inline_flush_max_bytes,
+            Actuator::InlineFlushBytes,
+            (
+                "critical memory pressure: collapse memtable to floor",
+                "memory pressure: shrink memtable to stay within the cgroup budget",
+            ),
         ) {
+            return Some(adj);
+        }
+        if let Some(adj) = shrink(
+            cur.mem_tier_max_bytes,
+            b.mem_tier_max_bytes,
+            Actuator::MemTierMaxBytes,
+            (
+                "critical memory pressure: collapse the in-memory CDC tier cap to floor",
+                "memory pressure: shrink the in-memory CDC tier cap to free RAM",
+            ),
+        ) {
+            return Some(adj);
+        }
+    }
+
+    // (1b) I/O cliff fast path [below memory, above both ladders]: a sudden
+    // multiplicative jump in per-batch write/publish latency vs its slow EWMA — an
+    // EBS burst-credit cliff, or the shared instance EBS pipe saturating. The
+    // additive/±50% ladders would crawl the write levers down over many dwells
+    // while replication lag balloons; instead make ONE decisive move, the I/O
+    // analogue of the critical-memory fast path. First shed write shards
+    // (concurrent uploads only fragment a bandwidth-saturated pipe into more small
+    // files — no throughput gained), then, once shards bottom out, amortize via a
+    // larger memtable (fewer, larger writes/commits). Applies in BOTH legacy and
+    // goal modes so an SLO-driven table can't keep adding shards into a cliff;
+    // memory pressure (above) still wins. As the slow EWMA catches up the ratio
+    // falls back under the trigger and the cliff clears, so this self-limits.
+    if io_cliff || publish_cliff {
+        let write_concurrency = cur.write_concurrency.max(1);
+        if let Some(v) = clamp_move_usize(
+            write_concurrency,
+            shrink_usize(write_concurrency),
+            b.write_concurrency,
+        ) {
+            return Some(Adjustment {
+                actuator: Actuator::WriteConcurrency,
+                new_value: u64::try_from(v).unwrap_or(0),
+                reason: "io/publish cliff: shed write shards (parallel uploads only fragment a saturated pipe)",
+            });
+        }
+        if mem_ok
+            && let Some(v) = clamp_move_i64(
+                cur.inline_flush_max_bytes,
+                grow_i64(cur.inline_flush_max_bytes),
+                b.inline_flush_max_bytes,
+            )
+        {
             return Some(Adjustment {
                 actuator: Actuator::InlineFlushBytes,
                 new_value: u64::try_from(v).unwrap_or(0),
-                reason: "memory pressure: shrink memtable to stay within the cgroup budget",
-            });
-        }
-        if let Some(v) = clamp_move_i64(
-            cur.mem_tier_max_bytes,
-            shrink_i64(cur.mem_tier_max_bytes),
-            b.mem_tier_max_bytes,
-        ) {
-            return Some(Adjustment {
-                actuator: Actuator::MemTierMaxBytes,
-                new_value: u64::try_from(v).unwrap_or(0),
-                reason: "memory pressure: shrink the in-memory CDC tier cap to free RAM",
+                reason: "io/publish cliff: enlarge memtable to amortize writes onto the saturated pipe",
             });
         }
     }
@@ -1953,26 +2472,84 @@ fn decide_goal(
     // when genuinely new ingest has arrived since the last move.
     let ingest_v = goals.ingest_violation(s);
     let ingest_violated = ingest_fresh && ingest_v > 0.0;
+    // Freshness split out from the combined ingest violation: freshness owns the
+    // mem-tier SHRINK lever (a violated freshness SLO ⇒ apply-visibility lag ⇒
+    // checkpoint smaller epochs sooner), while replication-lag keeps the buffer
+    // GROW levers. Kept mutually exclusive on the mem-tier actuator (the shrink
+    // tier fires first and the buffer-grow branches are gated `!freshness_violated`)
+    // so the two never target it in opposite directions on one tick — no limit
+    // cycle. Gated on `ingest_fresh` like every ingest signal: `s.freshness_secs`
+    // carries the windowed-PEAK per-apply row freshness (idle-immune by
+    // construction — see `IngestStats::fold_row_freshness`), but the fresh-sample
+    // gate is still required so a parked table with a decaying peak never ratchets
+    // the tier down.
+    let fresh_v = goals
+        .freshness
+        .map_or(0.0, |g| g.violation(s.freshness_secs));
+    let freshness_violated = ingest_fresh && fresh_v > 0.0;
     // Environment/data gates (same semantics as the legacy ladder): CPU-bound
     // withholds CPU-stealing moves; I/O-/publish-bound and mutation-heavy withhold the
     // write-concurrency lever (more shards = more files / uploads / key churn). On a
     // slow storage tier the I/O-/publish-bound bar is halved (see `tier_bound_fraction`),
     // so EBS/object-store tables stop adding shards and lean on buffer growth +
     // compaction sooner — the closed-loop half of the storage-tier awareness.
-    let cpu_ok = s.cpu_pressure.is_none_or(|p| p < CPU_PRESSURE_OK);
+    let cpu_ok = s.cpu_ok();
     let io_bound = ingest_fresh
         && latency_bound(
             s.io_latency_ms,
             s.arrival_gap_ms,
-            tier_bound_fraction(IO_BOUND_FRACTION, s.data_storage),
+            tier_bound_fraction(IO_BOUND_FRACTION, s.data_storage, s.data_write_mbps),
         );
     let publish_bound = ingest_fresh
         && latency_bound(
             s.publish_latency_ms,
             s.arrival_gap_ms,
-            tier_bound_fraction(PUBLISH_BOUND_FRACTION, s.metastore_storage),
+            tier_bound_fraction(
+                PUBLISH_BOUND_FRACTION,
+                s.metastore_storage,
+                s.metastore_write_mbps,
+            ),
         );
     let mutation_heavy = s.delete_fraction > MUTATION_HEAVY_FRACTION;
+
+    // (1b) Release the query-admission reserve as soon as its justification is gone
+    // OR it has overshot a query SLO. Three triggers, all safe/stable:
+    //   - CPU no longer contended (`cpu_ok`) — shedding queries can't help the apply
+    //     if CPU isn't the bottleneck, so nothing to relieve;
+    //   - the ingest goal is comfortably met (`ingest_comfortably_met`) — the apply
+    //     caught up, the reserve's whole reason is gone;
+    //   - a query SLO (QPH or query-latency) is now VIOLATED (`query_violated`) — the
+    //     throttle has borrowed too much query capacity and pushed a query goal past
+    //     target, so back off. This is the QUERY-SLO BRAKE: throttling moves QPH/
+    //     latency toward violation, so releasing ON violation is stable negative
+    //     feedback (never a latch). It is NOT the self-perpetuation trap documented
+    //     on `ingest_comfortably_met` — that prohibits releasing on a query goal
+    //     being MET; braking on VIOLATED is the opposite, safe direction.
+    // Checked BEFORE the query and ingest tiers — handing query slots back (and
+    // honoring the query SLOs) is high priority. Fast handback (legacy ±⅓ step);
+    // the bound floor is 0.
+    if cur.query_admission_reserve > 0
+        && (cpu_ok || goals.ingest_comfortably_met(s) || query_violated)
+        && let Some(v) = clamp_move_usize(
+            cur.query_admission_reserve,
+            shrink_usize(cur.query_admission_reserve),
+            b.query_admission_reserve,
+        )
+    {
+        // Attribute the release: a query-SLO overshoot is the interesting case (the
+        // throttle traded away too much), distinct from the reserve simply no longer
+        // being needed.
+        let reason = if query_violated {
+            "query SLO (QPH/latency) at target — stop borrowing query capacity: release a reserved query-admission slot"
+        } else {
+            "CPU uncontended or ingest goal met: release a reserved query-admission slot"
+        };
+        return Some(Adjustment {
+            actuator: Actuator::QueryAdmissionReserve,
+            new_value: u64::try_from(v).unwrap_or(0),
+            reason,
+        });
+    }
 
     // (2) Query-health tier: a violated latency/QPH goal. Larger/fewer files and
     // more compaction help queries; shedding write shards cuts file fan-out.
@@ -2087,12 +2664,50 @@ fn decide_goal(
         }
     }
 
+    // (2.9) Freshness-shrink tier: a violated FRESHNESS SLO means data is taking
+    // too long to become queryable — the mem-tier checkpoint capture stalls behind a
+    // deep apply backlog and new rows queue behind it. SHRINK the mem-tier so
+    // checkpoints fire on smaller epochs: earlier backpressure keeps the apply
+    // backlog (and the capture stall) shallow, so PG-commit→queryable lag falls.
+    // This is a SAFE CONTROL RESPONSE to a violated freshness SLO, NOT a proven
+    // perf win. A SF-100 3-node A/B (1 GiB→256 MiB pin) coincided with a lower
+    // worst-table freshness tail, but a no-goal control run on the same binary
+    // reproduced the same tail — run-to-run variance dominated, so the magnitude is
+    // unestablished on that rig and wants a lower-variance venue to measure. What is
+    // sound: shrinking the tier checkpoints smaller epochs sooner, the correct
+    // direction for a visibility-lag violation, at no correctness/QPH cost. Ordered
+    // BEFORE the ingest grow tier, and that tier's buffer-grow branches are gated
+    // `!freshness_violated`, so freshness owns the mem-tier lever and never
+    // limit-cycles against the lag-grow. `clamp_move_i64(…, b.mem_tier_max_bytes)`
+    // supplies the `MEM_TIER_MIN_BYTES` floor AND free pin-respect: an operator
+    // `cayenne_cdc_mem_tier_max_bytes` collapses the bounds to a point, so this
+    // no-ops rather than fighting the pin. No `mem_ok` gate — a shrink never needs
+    // memory headroom (and a memory-pressure shrink already ran in an earlier tier).
+    if freshness_violated
+        && let Some(v) = clamp_move_i64(
+            cur.mem_tier_max_bytes,
+            goal_shrink_i64(cur.mem_tier_max_bytes, b.mem_tier_max_bytes, fresh_v),
+            b.mem_tier_max_bytes,
+        )
+    {
+        return Some(Adjustment {
+            actuator: Actuator::MemTierMaxBytes,
+            new_value: u64::try_from(v).unwrap_or(0),
+            reason: "freshness goal: shrink the in-memory CDC tier → checkpoint smaller epochs sooner (shallower apply backlog, lower visibility lag)",
+        });
+    }
+
     // (3) Ingest/lag tier: a violated replication-lag/freshness goal. Grow buffers
     // first (help lag AND queries), then the mem-tier, then add write shards —
     // gated so extra shards (= more files) never fire while a query goal is
     // violated, read-amp is high, or the stream is delete-heavy.
     if ingest_violated {
-        if mem_ok
+        // Buffer growth is withheld under a freshness violation (see the mem-tier
+        // grow gate below): when data is too slow to become queryable, growing
+        // buffers is the wrong direction. Under a pure LAG violation it fires as
+        // before.
+        if !freshness_violated
+            && mem_ok
             && let Some(v) = clamp_move_i64(
                 cur.inline_flush_max_bytes,
                 goal_grow_i64(
@@ -2109,7 +2724,13 @@ fn decide_goal(
                 reason: "replication-lag goal: enlarge memtable (fewer files + amortized commits)",
             });
         }
-        if mem_ok
+        // Gated `!freshness_violated`: growing the tier is the LAG lever (fewer
+        // writer-blocking spills); it is the opposite of the freshness-shrink lever,
+        // so it must not fire when freshness is the violation being served (else the
+        // two limit-cycle the tier up/down). Freshness owns the tier; lag falls back
+        // to the throughput levers below when freshness is also violated.
+        if !freshness_violated
+            && mem_ok
             && let Some(v) = clamp_move_i64(
                 cur.mem_tier_max_bytes,
                 goal_grow_i64(cur.mem_tier_max_bytes, b.mem_tier_max_bytes, ingest_v),
@@ -2155,6 +2776,43 @@ fn decide_goal(
                 actuator: Actuator::CompactionIntervalMs,
                 new_value: v,
                 reason: "replication-lag goal: compact more to keep the snapshot lean",
+            });
+        }
+        // CPU is the contended resource, ingest is behind, AND the query SLOs have
+        // headroom to spend: shed concurrent analytical queries to hand cores back to
+        // the CDC apply. Three conjuncts:
+        //   - `!cpu_ok` — shedding queries only helps when CPU is the contention (the
+        //     complement of the CPU-gated levers above: raising write shards and
+        //     compacting more are WITHHELD under contention, so admitting fewer
+        //     queries is the only lever left);
+        //   - `ingest_violated` (this tier's guard) — there is a lag/freshness goal to
+        //     serve;
+        //   - `query_comfortably_met` — the query SLOs (QPH + query-latency) sit
+        //     comfortably above target, so we can borrow query capacity WITHOUT
+        //     breaching them. This makes the query SLOs the reserve's BUDGET: the apply
+        //     borrows query cores down to (not through) the QPH/latency targets, and
+        //     tier (1b) brakes the moment throttling pushes a query goal to violation.
+        //     Exactly the "QPH target met + lag target missed ⇒ redirect resources to
+        //     ingest" trade — and, since unset query goals read as met, a strict no-op
+        //     versus the prior ingest+CPU-only behavior when no query SLO is configured.
+        // Bounded step like every other goal move; the governor re-clamps the reported
+        // demand to the real admission pool's `max - 1`.
+        if !cpu_ok
+            && goals.query_comfortably_met(s)
+            && let Some(v) = clamp_move_usize(
+                cur.query_admission_reserve,
+                goal_grow_usize(
+                    cur.query_admission_reserve,
+                    b.query_admission_reserve,
+                    ingest_v,
+                ),
+                b.query_admission_reserve,
+            )
+        {
+            return Some(Adjustment {
+                actuator: Actuator::QueryAdmissionReserve,
+                new_value: u64::try_from(v).unwrap_or(0),
+                reason: "ingest goal behind under CPU contention with query-SLO headroom: reserve query-admission slots for CDC apply (shed concurrent analytical queries)",
             });
         }
     }
@@ -2251,11 +2909,46 @@ fn duration_ms(d: Duration) -> f64 {
     d.as_secs_f64() * 1000.0
 }
 
-fn ewma(slot: &mut f64, sample: f64, prior_samples: u64) {
-    if prior_samples == 0 {
-        *slot = sample;
-    } else {
-        *slot = EWMA_ALPHA * sample + (1.0 - EWMA_ALPHA) * *slot;
+/// An exponentially-weighted moving average with first-sample seeding.
+///
+/// The first [`update`](Self::update) seeds the average to the sample exactly (no
+/// bias toward an initial zero); each later sample blends in at `alpha`
+/// (`next = alpha·sample + (1−alpha)·prev`). Encapsulating the smoothing — rather
+/// than scattering `alpha · x + (1−alpha) · slot` across the accounting struct —
+/// keeps the seeding/blending logic in one unit-tested place and lets each signal
+/// carry its own `alpha` (e.g. [`EWMA_ALPHA_FAST`] for the cliff detector).
+#[derive(Debug, Clone, Copy)]
+struct Ewma {
+    alpha: f64,
+    /// `None` until the first sample seeds it.
+    value: Option<f64>,
+}
+
+impl Ewma {
+    /// An EWMA with the default smoothing ([`EWMA_ALPHA`]).
+    const fn new() -> Self {
+        Self::with_alpha(EWMA_ALPHA)
+    }
+
+    /// An EWMA with an explicit smoothing factor (e.g. [`EWMA_ALPHA_FAST`] for the
+    /// FAST I/O/publish latency estimate that powers the cliff detector).
+    const fn with_alpha(alpha: f64) -> Self {
+        Self { alpha, value: None }
+    }
+
+    /// Fold in a sample: the first seeds the average exactly, later samples blend
+    /// at `alpha`.
+    fn update(&mut self, sample: f64) {
+        self.value = Some(match self.value {
+            None => sample,
+            Some(prev) => self.alpha * sample + (1.0 - self.alpha) * prev,
+        });
+    }
+
+    /// The current average, or `None` before the first sample.
+    #[must_use]
+    fn value(&self) -> Option<f64> {
+        self.value
     }
 }
 
@@ -2317,6 +3010,16 @@ fn goal_grow_i64(v: i64, (lo, hi): (i64, i64), violation: f64) -> i64 {
     v.saturating_add(step)
 }
 
+/// Shrink an `i64` actuator by one goal-mode step (the `saturating_sub` twin of
+/// [`goal_grow_i64`]). The result is clamped to `[floor, ceiling]` by
+/// `clamp_move_i64` at the call site — the floor (e.g. [`MEM_TIER_MIN_BYTES`])
+/// bounds how far the freshness lever can shrink the mem-tier.
+fn goal_shrink_i64(v: i64, (lo, hi): (i64, i64), violation: f64) -> i64 {
+    let range = u64::try_from(hi.saturating_sub(lo)).unwrap_or(0);
+    let step = i64::try_from(goal_step_magnitude_u64(range, violation)).unwrap_or(i64::MAX);
+    v.saturating_sub(step)
+}
+
 fn goal_grow_usize(v: usize, (lo, hi): (usize, usize), violation: f64) -> usize {
     let range = u64::try_from(hi.saturating_sub(lo)).unwrap_or(u64::MAX);
     let step = usize::try_from(goal_step_magnitude_u64(range, violation)).unwrap_or(usize::MAX);
@@ -2367,15 +3070,101 @@ fn latency_bound(latency_ms: Option<f64>, arrival_gap_ms: f64, frac: f64) -> boo
     matches!(latency_ms, Some(l) if arrival_gap_ms > 0.0 && l > frac * arrival_gap_ms)
 }
 
-/// The effective latency-bound fraction for a storage tier: slow/networked media
-/// (EBS, object store) trip the I/O-/publish-bound gate at a lower fraction
-/// ([`SLOW_TIER_BOUND_SCALE`]); fast media keep the base. Reads the detected tier so
-/// the closed loop is storage-aware without a dedicated decide branch.
-fn tier_bound_fraction(base: f64, storage: StorageClass) -> f64 {
-    if storage.is_slow_tier() {
-        base * SLOW_TIER_BOUND_SCALE
+/// True when the FAST latency EWMA has stepped well above the slow one — the I/O
+/// cliff signal. Requires both a multiplicative jump ([`IO_CLIFF_RATIO`]) and an
+/// absolute floor ([`IO_CLIFF_FLOOR_MS`]) so a 3× jump within sub-millisecond noise
+/// can't trip it. `None` on either EWMA (the table hasn't spilled) ⇒ false.
+fn is_cliff(fast_ms: Option<f64>, slow_ms: Option<f64>) -> bool {
+    matches!(
+        (fast_ms, slow_ms),
+        (Some(fast), Some(slow))
+            if slow > 0.0 && fast > IO_CLIFF_FLOOR_MS && fast > IO_CLIFF_RATIO * slow
+    )
+}
+
+/// Continuous slow-tier bias factor in `[SLOW_TIER_BOUND_SCALE, 1.0]`. When the
+/// calibration probe measured the volume's write throughput, the factor scales
+/// linearly with it — `≤ TIER_SCALE_SLOW_MBPS` (a gp3-baseline volume) gets the
+/// full slow-tier bias, `≥ TIER_SCALE_FAST_MBPS` (fast `NVMe` / high io2) gets none,
+/// interpolated between — so a fast io2 volume is no longer penalized like slow
+/// gp3 just because both classify as `Ebs`. Without a measurement (remote path,
+/// probe failure, or a never-spilling memory-tier table), it falls back to the
+/// binary class (`Unknown` treated slow — the safe default).
+fn tier_scale(storage: StorageClass, measured_mbps: Option<f64>) -> f64 {
+    if let Some(mbps) = measured_mbps.filter(|m| m.is_finite() && *m > 0.0) {
+        let span = TIER_SCALE_FAST_MBPS - TIER_SCALE_SLOW_MBPS;
+        let t = ((mbps - TIER_SCALE_SLOW_MBPS) / span).clamp(0.0, 1.0);
+        SLOW_TIER_BOUND_SCALE + t * (1.0 - SLOW_TIER_BOUND_SCALE)
+    } else if storage.is_slow_tier() {
+        SLOW_TIER_BOUND_SCALE
     } else {
-        base
+        1.0
+    }
+}
+
+/// The effective latency-bound fraction for a storage tier: slow/networked media
+/// trip the I/O-/publish-bound gate at a lower fraction so the closed loop
+/// amortizes commits and withholds shards sooner. Continuous in the measured
+/// throughput (see [`tier_scale`]); reads the detected tier + probe result so the
+/// loop is storage-aware without a dedicated decide branch.
+fn tier_bound_fraction(base: f64, storage: StorageClass, measured_mbps: Option<f64>) -> f64 {
+    base * tier_scale(storage, measured_mbps)
+}
+
+/// Classify the resource most likely binding when a goal stays violated with no
+/// actuator move left — the body of the infeasible-SLO operator warning. Pure;
+/// reasons over the same signals the controller gates on, in priority order:
+/// memory (the hard #1), then CPU, then the write path / storage, else the static
+/// actuator bounds themselves.
+pub(crate) fn binding_constraint(s: &IngestSnapshot) -> &'static str {
+    // Mirror the controller's EFFECTIVE memory gate: a confirmed slow tier blocks
+    // buffer growth `SLOW_TIER_MEM_DRAIN_OFFSET` earlier (the earlier-drain gate in
+    // `decide`), so memory is the binding constraint at that same shifted threshold —
+    // otherwise a slow-tier goal stuck behind the shifted gate is misclassified as
+    // non-memory-bound.
+    let mem_gate = if s.confirmed_slow_tier() {
+        MEM_PRESSURE_OK - SLOW_TIER_MEM_DRAIN_OFFSET
+    } else {
+        MEM_PRESSURE_OK
+    };
+    // `>=`, not `>`: the controller's `mem_ok` is `p < mem_gate`, so it already
+    // blocks growth at exactly `p == mem_gate` — bind on memory at the same point.
+    if s.mem_pressure.is_some_and(|p| p >= mem_gate) {
+        "memory-bound (at/over the RAM budget — the controller can't grow buffers to meet the SLO; add memory or lower runtime.query.memory_limit)"
+    } else if !s.cpu_ok() {
+        if s.cpu_burstable {
+            "CPU-bound (burstable instance — CPU credits likely depleted; use a non-burstable instance)"
+        } else {
+            "CPU-bound (encode/compaction is saturating cores; scale up CPU)"
+        }
+    } else if is_cliff(s.io_latency_fast_ms, s.io_latency_ms)
+        || is_cliff(s.publish_latency_fast_ms, s.publish_latency_ms)
+        || latency_bound(
+            s.io_latency_ms,
+            s.arrival_gap_ms,
+            tier_bound_fraction(IO_BOUND_FRACTION, s.data_storage, s.data_write_mbps),
+        )
+        || latency_bound(
+            s.publish_latency_ms,
+            s.arrival_gap_ms,
+            tier_bound_fraction(
+                PUBLISH_BOUND_FRACTION,
+                s.metastore_storage,
+                s.metastore_write_mbps,
+            ),
+        )
+    {
+        if matches!(s.data_storage, StorageClass::Ebs)
+            || matches!(s.metastore_storage, StorageClass::Ebs)
+        {
+            "storage-bound: EBS write bandwidth (provision more IOPS/throughput, move the metastore to faster storage, or relax the SLO)"
+        } else if s.data_tier_is_slow() || s.metastore_tier_is_slow() {
+            "storage-bound: slow or undetected tier (use faster/local storage, or relax the SLO)"
+        } else {
+            "write-path I/O-bound (the storage write path can't keep up)"
+        }
+    } else {
+        "actuator limits reached (the configured tuning bounds can't meet the SLO on this hardware — relax the SLO or scale up)"
     }
 }
 
@@ -2402,9 +3191,48 @@ mod tests {
         clippy::cast_possible_truncation,
         clippy::cast_sign_loss,
         clippy::cast_precision_loss,
-        clippy::cast_possible_wrap
+        clippy::cast_possible_wrap,
+        // Controller/WindowMax tests assert on exact, small, representable f64 values
+        // (folded literals + clean n/1000 divisions) where `==` is exact and correct.
+        clippy::float_cmp
     )]
     use super::*;
+
+    #[test]
+    fn ewma_seeds_first_sample_then_blends() {
+        let mut e = Ewma::with_alpha(0.5);
+        assert!(e.value().is_none(), "an unseeded average reads as None");
+        e.update(10.0);
+        assert!(
+            (e.value().unwrap_or(f64::NAN) - 10.0).abs() < 1e-12,
+            "the first sample seeds the average exactly (no bias toward 0)"
+        );
+        e.update(20.0); // 0.5*20 + 0.5*10
+        assert!((e.value().unwrap_or(f64::NAN) - 15.0).abs() < 1e-12);
+        e.update(20.0); // 0.5*20 + 0.5*15
+        assert!((e.value().unwrap_or(f64::NAN) - 17.5).abs() < 1e-12);
+    }
+
+    #[test]
+    fn ewma_alpha_one_has_no_memory() {
+        let mut e = Ewma::with_alpha(1.0);
+        e.update(5.0);
+        e.update(99.0);
+        assert!(
+            (e.value().unwrap_or(f64::NAN) - 99.0).abs() < 1e-12,
+            "alpha=1 tracks the latest sample"
+        );
+    }
+
+    #[test]
+    fn ewma_default_alpha_blends_with_history() {
+        let mut e = Ewma::new();
+        e.update(100.0);
+        e.update(0.0);
+        // alpha*0 + (1-alpha)*100, derived from the constant so the test tracks it.
+        let expected = (1.0 - EWMA_ALPHA) * 100.0;
+        assert!((e.value().unwrap_or(f64::NAN) - expected).abs() < 1e-12);
+    }
 
     fn ms(n: u64) -> Duration {
         Duration::from_millis(n)
@@ -2433,6 +3261,7 @@ mod tests {
             write_concurrency: (1, 16),
             mem_tier_max_bytes: (64 * 1024 * 1024, 2048 * 1024 * 1024),
             target_vortex_file_size_bytes: (64 * 1024 * 1024, 1024 * 1024 * 1024),
+            query_admission_reserve: (0, 16),
         }
     }
 
@@ -2447,6 +3276,7 @@ mod tests {
             write_concurrency: 4,
             mem_tier_max_bytes: 256 * 1024 * 1024,
             target_vortex_file_size_bytes: 256 * 1024 * 1024,
+            query_admission_reserve: 0,
         }
     }
 
@@ -2469,10 +3299,15 @@ mod tests {
             query_latency_p99_ms: None,
             qph: None,
             cpu_pressure: None,
+            cpu_burstable: false,
             io_latency_ms: None,
             publish_latency_ms: None,
+            io_latency_fast_ms: None,
+            publish_latency_fast_ms: None,
             data_storage: StorageClass::Unknown,
             metastore_storage: StorageClass::Unknown,
+            data_write_mbps: None,
+            metastore_write_mbps: None,
         }
     }
 
@@ -3029,6 +3864,10 @@ mod tests {
                     b.target_vortex_file_size_bytes.0 as u64,
                     b.target_vortex_file_size_bytes.1 as u64,
                 ),
+                Actuator::QueryAdmissionReserve => (
+                    b.query_admission_reserve.0 as u64,
+                    b.query_admission_reserve.1 as u64,
+                ),
             };
             assert!(
                 (lo..=hi).contains(&adj.new_value),
@@ -3283,14 +4122,23 @@ mod tests {
     }
 
     #[test]
-    fn freshness_goal_violated_grows_memtable() {
+    fn freshness_goal_violated_shrinks_mem_tier_not_memtable() {
+        // A violated freshness SLO SHRINKS the in-memory CDC tier (checkpoint smaller
+        // epochs sooner) and WITHHOLDS the buffer-grow levers — the inversion of the
+        // pre-lever-3 "freshness grows the memtable" response, which pushed buffers in
+        // the wrong direction for a visibility-lag violation (the SF-100 A/B showed
+        // 1 GiB→256 MiB *cut* freshness P99 4.4s→2.7s).
         let s = IngestSnapshot {
             freshness_secs: Some(30.0),
             ..snap()
         };
         let goals = Goals::from_targets(None, Some(5.0), None, None, Duration::from_mins(1));
         let adj = goal_decide(&s, &actuators(), &bounds(), &goals).expect("a move");
-        assert_eq!(adj.actuator, Actuator::InlineFlushBytes);
+        assert_eq!(adj.actuator, Actuator::MemTierMaxBytes);
+        assert!(
+            adj.new_value < actuators().mem_tier_max_bytes as u64,
+            "freshness violation shrinks the tier, never grows the memtable",
+        );
     }
 
     #[test]
@@ -3621,6 +4469,17 @@ mod tests {
         assert!(QueryObservations::new().qph().is_none());
     }
 
+    #[test]
+    fn global_qph_positive_after_record() {
+        // QPH is measured against the process-global aggregate (a query spanning
+        // datasets counts once). It is a shared singleton across tests, so once any
+        // query is recorded it reports a positive rate (the idle horizon is minutes,
+        // far beyond a test) — assert the post-record signal, not a None precondition.
+        record_global_query(12.0);
+        let qph = global_qph().expect("global qph after a recorded query");
+        assert!(qph > 0.0, "expected positive global qph, got {qph}");
+    }
+
     // ---- environment gates (Part A) ---------------------------------------
 
     #[test]
@@ -3707,26 +4566,675 @@ mod tests {
 
     #[test]
     fn tier_bound_fraction_lowers_bar_for_slow_storage() {
-        // Slow/networked tiers (EBS, object store / unknown) halve the latency bar;
-        // fast tiers (local SSD, tmpfs) keep it.
+        // With no measurement, the binary class fallback: slow/networked tiers
+        // (EBS, object store / unknown) halve the latency bar; fast tiers keep it.
         let scaled = IO_BOUND_FRACTION * SLOW_TIER_BOUND_SCALE;
+        let close = |a: f64, b: f64| (a - b).abs() < f64::EPSILON;
+        assert!(close(
+            tier_bound_fraction(IO_BOUND_FRACTION, StorageClass::Ebs, None),
+            scaled
+        ));
+        assert!(close(
+            tier_bound_fraction(IO_BOUND_FRACTION, StorageClass::Unknown, None),
+            scaled
+        ));
+        assert!(close(
+            tier_bound_fraction(IO_BOUND_FRACTION, StorageClass::LocalSsd, None),
+            IO_BOUND_FRACTION
+        ));
+        assert!(close(
+            tier_bound_fraction(IO_BOUND_FRACTION, StorageClass::Tmpfs, None),
+            IO_BOUND_FRACTION
+        ));
+    }
+
+    #[test]
+    fn tier_scale_is_continuous_in_measured_throughput() {
+        // A measured-slow EBS volume (gp3 baseline) gets the full slow-tier scale;
+        // a measured-fast EBS volume (io2) gets none — even though both are `Ebs`.
+        let close = |a: f64, b: f64| (a - b).abs() < 1e-9;
+        assert!(close(
+            tier_scale(StorageClass::Ebs, Some(TIER_SCALE_SLOW_MBPS)),
+            SLOW_TIER_BOUND_SCALE
+        ));
+        assert!(close(
+            tier_scale(StorageClass::Ebs, Some(50.0)),
+            SLOW_TIER_BOUND_SCALE
+        )); // below the slow floor clamps to the full bias
+        assert!(close(
+            tier_scale(StorageClass::Ebs, Some(TIER_SCALE_FAST_MBPS)),
+            1.0
+        ));
+        assert!(close(tier_scale(StorageClass::Ebs, Some(4096.0)), 1.0)); // above fast clamps to none
+        // Monotonic and strictly between at a mid throughput.
+        let mid = tier_scale(StorageClass::Ebs, Some(512.0));
+        assert!(mid > SLOW_TIER_BOUND_SCALE && mid < 1.0);
+        // No measurement → class fallback (Unknown is slow, LocalSsd is fast).
+        assert!(close(
+            tier_scale(StorageClass::Unknown, None),
+            SLOW_TIER_BOUND_SCALE
+        ));
+        assert!(close(tier_scale(StorageClass::LocalSsd, None), 1.0));
+        // A non-finite/zero measurement is ignored (falls back to class).
+        assert!(close(tier_scale(StorageClass::LocalSsd, Some(0.0)), 1.0));
+        assert!(close(
+            tier_scale(StorageClass::Ebs, Some(f64::NAN)),
+            SLOW_TIER_BOUND_SCALE
+        ));
+    }
+
+    #[test]
+    fn is_cliff_requires_ratio_and_floor() {
+        // A clear step (fast ≫ slow, above the floor) is a cliff.
+        assert!(is_cliff(Some(100.0), Some(20.0)));
+        // Ratio met but below the absolute floor → not a cliff (sub-ms noise).
+        assert!(!is_cliff(Some(0.6), Some(0.1)));
+        // Above the floor but ratio not met → not a cliff.
+        assert!(!is_cliff(Some(15.0), Some(12.0)));
+        // Missing either EWMA (never spilled) → not a cliff.
+        assert!(!is_cliff(None, Some(20.0)));
+        assert!(!is_cliff(Some(100.0), None));
+        assert!(!is_cliff(Some(100.0), Some(0.0)));
+    }
+
+    #[test]
+    fn io_cliff_sheds_write_shards_first() {
+        // Fast write EWMA ≫ slow → shed a write shard in one move.
+        let s = IngestSnapshot {
+            io_latency_ms: Some(20.0),
+            io_latency_fast_ms: Some(200.0),
+            arrival_gap_ms: 100.0,
+            ..snap()
+        };
+        let mut a = actuators();
+        a.write_concurrency = 8;
+        let adj = decide_fresh(&s, &a, &bounds()).expect("cliff should act");
+        assert_eq!(adj.actuator, Actuator::WriteConcurrency);
+        assert!(adj.new_value < 8);
+    }
+
+    #[test]
+    fn io_cliff_amortizes_via_memtable_when_shards_floored() {
+        // Publish-side cliff with shards already at the floor → grow the memtable.
+        let s = IngestSnapshot {
+            publish_latency_ms: Some(20.0),
+            publish_latency_fast_ms: Some(200.0),
+            arrival_gap_ms: 100.0,
+            ..snap()
+        };
+        let mut a = actuators();
+        a.write_concurrency = 1;
+        let adj = decide_fresh(&s, &a, &bounds()).expect("cliff should amortize");
+        assert_eq!(adj.actuator, Actuator::InlineFlushBytes);
+    }
+
+    #[test]
+    fn io_cliff_fires_in_goal_mode_before_adding_shards() {
+        // A lag-violated goal would add shards; a concurrent cliff sheds instead.
+        let s = IngestSnapshot {
+            apply_vs_arrival: 2.0,
+            replication_lag_secs: Some(60.0),
+            io_latency_ms: Some(20.0),
+            io_latency_fast_ms: Some(200.0),
+            arrival_gap_ms: 100.0,
+            ..snap()
+        };
+        let mut a = actuators();
+        a.write_concurrency = 8;
+        let goals = Goals::from_targets(Some(5.0), None, None, None, Duration::from_mins(1));
+        let adj = decide_with_goals(&s, &a, &bounds(), ms(60_000), ms(30_000), 0, &goals)
+            .expect("cliff should act in goal mode");
+        assert_eq!(adj.actuator, Actuator::WriteConcurrency);
+        assert!(adj.new_value < 8);
+    }
+
+    #[test]
+    fn slow_tier_drains_memtable_earlier_than_fast_tier() {
+        // Pressure between the slow and default HIGH thresholds: the slow tier
+        // shrinks the memtable; the fast tier neither grows nor shrinks from memory.
+        let pressure = MEM_PRESSURE_HIGH - SLOW_TIER_MEM_DRAIN_OFFSET / 2.0;
+        let cur_inline =
+            u64::try_from(actuators().inline_flush_max_bytes).expect("non-negative inline cap");
+
+        let slow = IngestSnapshot {
+            mem_pressure: Some(pressure),
+            data_storage: StorageClass::Ebs,
+            ..snap()
+        };
+        let adj = decide_fresh(&slow, &actuators(), &bounds()).expect("slow tier should drain");
+        assert_eq!(adj.actuator, Actuator::InlineFlushBytes);
+        assert!(adj.new_value < cur_inline);
+
+        let fast = IngestSnapshot {
+            mem_pressure: Some(pressure),
+            data_storage: StorageClass::LocalSsd,
+            metastore_storage: StorageClass::LocalSsd,
+            ..snap()
+        };
+        // Above the fast OK band (0.75) but below its HIGH (0.85): no memory move.
+        assert!(decide_fresh(&fast, &actuators(), &bounds()).is_none());
+    }
+
+    // ---- lever 3: freshness-goal mem-tier shrink ---------------------------
+
+    /// Base actuators with the mem-tier at 1 GiB — the SF-100 adaptive value the
+    /// A/B started from, with headroom above the 64 MiB floor to shrink into.
+    fn actuators_1gib() -> ActuatorValues {
+        let mut a = actuators();
+        a.mem_tier_max_bytes = 1024 * 1024 * 1024;
+        a
+    }
+
+    #[test]
+    fn freshness_violation_shrinks_mem_tier() {
+        // A violated freshness SLO (peak row freshness 5s past a 3s target) shrinks
+        // the in-memory CDC tier — the automated form of the validated 1 GiB→256 MiB
+        // pin (SF-100 3-node A/B: worst-table freshness P99 4.4s→2.7s).
+        let s = IngestSnapshot {
+            freshness_secs: Some(5.0),
+            ..snap()
+        };
+        let goals = Goals::from_targets(None, Some(3.0), None, None, Duration::from_mins(1));
+        let a = actuators_1gib();
+        let adj = goal_decide(&s, &a, &bounds(), &goals).expect("freshness violation must act");
+        assert_eq!(adj.actuator, Actuator::MemTierMaxBytes);
         assert!(
-            (tier_bound_fraction(IO_BOUND_FRACTION, StorageClass::Ebs) - scaled).abs()
-                < f64::EPSILON
+            adj.new_value < a.mem_tier_max_bytes as u64,
+            "freshness violation must SHRINK the tier: got {} vs cur {}",
+            adj.new_value,
+            a.mem_tier_max_bytes,
+        );
+    }
+
+    #[test]
+    fn lag_only_violation_still_grows_mem_tier() {
+        // A pure replication-lag violation (freshness met) keeps the existing GROW
+        // behavior — the shrink lever must not regress it. Memtable maxed so the
+        // mem-tier grow is the surfaced move.
+        let s = IngestSnapshot {
+            replication_lag_secs: Some(30.0),
+            freshness_secs: Some(0.0),
+            ..snap()
+        };
+        let goals = Goals::from_targets(Some(5.0), Some(3.0), None, None, Duration::from_mins(1));
+        let mut a = actuators();
+        a.inline_flush_max_bytes = bounds().inline_flush_max_bytes.1;
+        let adj = goal_decide(&s, &a, &bounds(), &goals).expect("lag violation must act");
+        assert_eq!(adj.actuator, Actuator::MemTierMaxBytes);
+        assert!(
+            adj.new_value > a.mem_tier_max_bytes as u64,
+            "lag-only violation must GROW the tier",
+        );
+    }
+
+    #[test]
+    fn freshness_and_lag_both_violated_shrinks_not_grows() {
+        // Both violated: freshness OWNS the tier — it shrinks, and the lag-grow is
+        // suppressed on the same tick (the no-limit-cycle invariant).
+        let s = IngestSnapshot {
+            replication_lag_secs: Some(30.0),
+            freshness_secs: Some(5.0),
+            ..snap()
+        };
+        let goals = Goals::from_targets(Some(5.0), Some(3.0), None, None, Duration::from_mins(1));
+        let a = actuators_1gib();
+        let adj = goal_decide(&s, &a, &bounds(), &goals).expect("must act");
+        assert_eq!(adj.actuator, Actuator::MemTierMaxBytes);
+        assert!(
+            adj.new_value < a.mem_tier_max_bytes as u64,
+            "with both violated, the freshness shrink must win over the lag grow",
+        );
+    }
+
+    #[test]
+    fn freshness_shrink_respects_operator_pin() {
+        // An operator hard-pin collapses the mem-tier bounds to a point; the shrink
+        // must no-op rather than fight the pin.
+        let s = IngestSnapshot {
+            freshness_secs: Some(5.0),
+            ..snap()
+        };
+        let goals = Goals::from_targets(None, Some(3.0), None, None, Duration::from_mins(1));
+        let a = actuators_1gib();
+        let pinned = TuningBounds {
+            mem_tier_max_bytes: (a.mem_tier_max_bytes, a.mem_tier_max_bytes),
+            ..bounds()
+        };
+        let adj = decide_with_goals(&s, &a, &pinned, ms(60_000), ms(30_000), 0, &goals);
+        assert!(
+            adj.is_none_or(|adj| adj.actuator != Actuator::MemTierMaxBytes),
+            "a pinned tier must never be moved by the freshness lever",
+        );
+    }
+
+    #[test]
+    fn freshness_shrink_gated_on_fresh_samples() {
+        // Idle table (samples unchanged since the last move): freshness is not
+        // actionable (it climbs on the wall clock with no new data) — no shrink.
+        let s = IngestSnapshot {
+            freshness_secs: Some(5.0),
+            ..snap()
+        };
+        let goals = Goals::from_targets(None, Some(3.0), None, None, Duration::from_mins(1));
+        let a = actuators_1gib();
+        let adj = decide_with_goals(&s, &a, &bounds(), ms(60_000), ms(30_000), s.samples, &goals);
+        assert!(
+            adj.is_none_or(|adj| adj.actuator != Actuator::MemTierMaxBytes),
+            "an idle table must not ratchet the tier down on wall-clock freshness",
+        );
+    }
+
+    #[test]
+    fn freshness_shrink_stops_at_floor() {
+        // Already at the floor: the shrink clamps to a no-op and yields the lever to
+        // the throughput moves rather than returning a spurious same-value move.
+        let s = IngestSnapshot {
+            freshness_secs: Some(5.0),
+            ..snap()
+        };
+        let goals = Goals::from_targets(None, Some(3.0), None, None, Duration::from_mins(1));
+        let mut a = actuators();
+        a.mem_tier_max_bytes = bounds().mem_tier_max_bytes.0;
+        let adj = goal_decide(&s, &a, &bounds(), &goals);
+        assert!(
+            adj.is_none_or(|adj| adj.actuator != Actuator::MemTierMaxBytes),
+            "at the floor the tier cannot shrink further",
+        );
+    }
+
+    // ---- metric #3: windowed-peak row freshness ----------------------------
+
+    #[test]
+    fn window_max_folds_peak_and_tumbles() {
+        let mut w = WindowMax::new();
+        w.fold(0, 1.0);
+        w.fold(1_000, 4.0);
+        w.fold(2_000, 2.0);
+        assert_eq!(w.peak(3_000), 4.0, "peak is the max within the window");
+        // Advance one full window: the completed window's peak (4.0) carries as prev.
+        w.fold(WindowMax::WINDOW_MS + 500, 1.5);
+        assert_eq!(
+            w.peak(WindowMax::WINDOW_MS + 600),
+            4.0,
+            "the just-completed window's peak counts for one more window",
+        );
+        // One more window (relative to the 1.5 fold): window-0's 4.0 has aged out of
+        // the 2-window memory; window-1's 1.5 becomes prev, the new 0.5 is current.
+        let t = 2 * WindowMax::WINDOW_MS + 600;
+        w.fold(t, 0.5);
+        assert_eq!(
+            w.peak(t + 10),
+            1.5,
+            "the 2-window-old peak (4.0) decayed; window-1's 1.5 remains as prev",
+        );
+        // A further window with only a small value: 1.5 decays too, leaving 0.5.
+        let t2 = 3 * WindowMax::WINDOW_MS + 700;
+        w.fold(t2, 0.3);
+        assert_eq!(
+            w.peak(t2 + 10),
+            0.5,
+            "after another window the 1.5 decays; only 0.5 (prev) + 0.3 (cur) remain",
+        );
+    }
+
+    #[test]
+    fn window_max_multi_window_idle_gap_drops_stale_peak() {
+        let mut w = WindowMax::new();
+        w.fold(0, 9.0);
+        // Jump 3 windows ahead (idle) with a fresh small sample.
+        let t = 3 * WindowMax::WINDOW_MS;
+        w.fold(t, 0.25);
+        assert_eq!(
+            w.peak(t + 10),
+            0.25,
+            "a multi-window idle gap drops the old peak, leaving only the new value",
+        );
+    }
+
+    #[test]
+    fn fold_row_freshness_is_idle_immune() {
+        let stats = IngestStats::new();
+        // No source ts folded yet ⇒ no peak signal.
+        assert_eq!(stats.peak_row_freshness_secs(10_000), None);
+        // A batch committed 4s before it applied ⇒ 4s row freshness.
+        stats.fold_row_freshness(10_000, Some(6_000));
+        assert_eq!(stats.peak_row_freshness_secs(10_500), Some(4.0));
+        // After a long idle, a batch that just committed applies ~fresh: the peak
+        // reflects the SMALL new lag (0.5s), never the multi-window idle duration.
+        let later = 10_000 + 5 * WindowMax::WINDOW_MS;
+        stats.fold_row_freshness(later, Some(later - 500));
+        assert_eq!(
+            stats.peak_row_freshness_secs(later + 10),
+            Some(0.5),
+            "post-idle freshness is the batch's own small lag, not the idle gap",
+        );
+    }
+
+    #[test]
+    fn fold_row_freshness_skips_without_source_ts() {
+        let stats = IngestStats::new();
+        stats.fold_row_freshness(10_000, None);
+        assert_eq!(
+            stats.peak_row_freshness_secs(10_100),
+            None,
+            "no source commit ts ⇒ nothing folded, no signal",
+        );
+    }
+
+    #[test]
+    fn fold_row_freshness_clock_skew_clamps_to_zero() {
+        // Source commit ts AHEAD of the host apply clock (NTP skew between the PG box
+        // and the host) ⇒ a negative raw lag, which MUST clamp to 0 — never underflow
+        // the unsigned subtraction into a huge spurious "freshness" that would trip a
+        // false shrink. Guards the `saturating_sub(...).max(0)` in `fold_row_freshness`.
+        let stats = IngestStats::new();
+        stats.fold_row_freshness(10_000, Some(12_000)); // "committed" 2s after it applied
+        assert_eq!(
+            stats.peak_row_freshness_secs(10_100),
+            Some(0.0),
+            "source clock ahead of host ⇒ lag clamps to 0, no unsigned underflow",
+        );
+    }
+
+    #[test]
+    fn burstable_cpu_withholds_shards_at_lower_pressure() {
+        // CPU busy-fraction between the burstable gate (0.50) and the default
+        // (0.75), buffers maxed so write concurrency is the remaining behind-lever.
+        let base = IngestSnapshot {
+            apply_vs_arrival: 2.0,
+            cpu_pressure: Some(0.6),
+            read_amp: 1,
+            ..snap()
+        };
+        let mut a = actuators();
+        a.inline_flush_max_bytes = bounds().inline_flush_max_bytes.1;
+        a.mem_tier_max_bytes = bounds().mem_tier_max_bytes.1;
+        a.write_concurrency = 2;
+
+        let normal = IngestSnapshot {
+            cpu_burstable: false,
+            ..base
+        };
+        let adj = decide_fresh(&normal, &a, &bounds()).expect("normal instance raises shards");
+        assert_eq!(adj.actuator, Actuator::WriteConcurrency);
+
+        let bursty = IngestSnapshot {
+            cpu_burstable: true,
+            ..base
+        };
+        // Burstable: cpu not ok (0.6 > 0.50) → the shard lever (and CPU-gated
+        // compaction) are withheld; nothing left to do.
+        assert!(decide_fresh(&bursty, &a, &bounds()).is_none());
+    }
+
+    #[test]
+    fn any_actionable_violation_gates_lag_on_fresh_ingest() {
+        let goals = Goals::from_targets(Some(5.0), None, None, None, Duration::from_mins(1));
+        let violated = IngestSnapshot {
+            replication_lag_secs: Some(60.0),
+            ..snap()
+        };
+        // Fresh ingest: 60s lag vs a 5s goal is an actionable violation.
+        assert!(goals.any_actionable_violation(&violated, true));
+        // Stale/idle: lag grows with the wall clock, so it is NOT actionable.
+        assert!(!goals.any_actionable_violation(&violated, false));
+        // Comfortably met: not violated.
+        let met = IngestSnapshot {
+            replication_lag_secs: Some(1.0),
+            ..snap()
+        };
+        assert!(!goals.any_actionable_violation(&met, true));
+    }
+
+    #[test]
+    fn query_admission_reserve_grows_under_lag_with_cpu_contention_and_releases_when_clear() {
+        let goals = Goals::from_targets(None, Some(5.0), None, None, Duration::from_mins(1));
+        let b = bounds();
+
+        // GROW: freshness behind (60s vs 5s) AND CPU contended (0.95), with the
+        // freshness SHRINK lever already exhausted (mem-tier at its floor) and the
+        // write-concurrency / compaction levers withheld under CPU contention — so
+        // shedding queries is the last lever left that serves the freshness goal.
+        let buffers_maxed_reserve_zero = ActuatorValues {
+            inline_flush_max_bytes: b.inline_flush_max_bytes.1,
+            mem_tier_max_bytes: b.mem_tier_max_bytes.0,
+            ..actuators()
+        };
+        let behind_contended = IngestSnapshot {
+            freshness_secs: Some(60.0),
+            cpu_pressure: Some(0.95),
+            ..snap()
+        };
+        let adj = decide_with_goals(
+            &behind_contended,
+            &buffers_maxed_reserve_zero,
+            &b,
+            ms(60_000),
+            ms(30_000),
+            0,
+            &goals,
+        )
+        .expect("lag behind + CPU contended + buffers maxed ⇒ reserve query-admission slots");
+        assert_eq!(adj.actuator, Actuator::QueryAdmissionReserve);
+        assert!(
+            adj.new_value > 0,
+            "the reserve grows from 0 to shed concurrent queries (got {})",
+            adj.new_value
+        );
+
+        // RELEASE (CPU uncontended): a reserve is held but CPU is no longer the
+        // contended resource — nothing to relieve, so hand query slots back even
+        // though the lag goal is still violated. Tier (1b) runs before the ingest
+        // grow, so the release wins.
+        let reserve_held = ActuatorValues {
+            query_admission_reserve: 3,
+            ..actuators()
+        };
+        let behind_uncontended = IngestSnapshot {
+            freshness_secs: Some(60.0),
+            cpu_pressure: Some(0.10),
+            ..snap()
+        };
+        let adj = decide_with_goals(
+            &behind_uncontended,
+            &reserve_held,
+            &b,
+            ms(60_000),
+            ms(30_000),
+            0,
+            &goals,
+        )
+        .expect("CPU uncontended ⇒ release a reserved query-admission slot");
+        assert_eq!(adj.actuator, Actuator::QueryAdmissionReserve);
+        assert!(
+            (adj.new_value as usize) < 3,
+            "the reserve is released toward 0 (got {})",
+            adj.new_value
+        );
+
+        // RELEASE (lag goal met): CPU is still contended, but the apply has caught
+        // up — the reserve's justification is gone, so release it. Keyed on the
+        // INGEST goal, never the (here unset) query goal, so it can't self-perpetuate.
+        let met_contended = IngestSnapshot {
+            freshness_secs: Some(1.0),
+            cpu_pressure: Some(0.95),
+            ..snap()
+        };
+        let adj = decide_with_goals(
+            &met_contended,
+            &reserve_held,
+            &b,
+            ms(60_000),
+            ms(30_000),
+            0,
+            &goals,
+        )
+        .expect("lag goal met ⇒ release a reserved query-admission slot");
+        assert_eq!(adj.actuator, Actuator::QueryAdmissionReserve);
+        assert!(
+            (adj.new_value as usize) < 3,
+            "released once the lag goal is met"
+        );
+    }
+
+    /// The query-admission reserve is BUDGETED by the query SLOs: the CDC apply may
+    /// borrow query cores while QPH (and query-latency) have headroom, but not
+    /// through their targets — exactly "QPH target met + lag missed ⇒ redirect
+    /// resources to ingest, but only down to the QPH floor." QPH is `HigherBetter`, so
+    /// against a 1000 target: comfortably met at ≥1500 (headroom), violated at <800.
+    #[test]
+    fn query_admission_reserve_is_budgeted_by_the_query_slos() {
+        // freshness goal 5s + QPH goal 1000.
+        let goals =
+            Goals::from_targets(None, Some(5.0), None, Some(1000.0), Duration::from_mins(1));
+        let b = bounds();
+        // Freshness shrink lever exhausted (mem-tier at floor), so the reserve is the
+        // lever in play (mirrors the sibling test's setup).
+        let buffers_maxed = ActuatorValues {
+            inline_flush_max_bytes: b.inline_flush_max_bytes.1,
+            mem_tier_max_bytes: b.mem_tier_max_bytes.0,
+            ..actuators()
+        };
+
+        // GROW: freshness behind (60s) + CPU contended (0.95) + QPH comfortably met
+        // (1600 ≥ 1.5×1000 ⇒ headroom) ⇒ shed queries for the apply. The exact
+        // "hitting QPH, missing lag ⇒ redirect to ingest" case.
+        let behind_qph_headroom = IngestSnapshot {
+            freshness_secs: Some(60.0),
+            cpu_pressure: Some(0.95),
+            qph: Some(1600.0),
+            ..snap()
+        };
+        let adj = decide_with_goals(
+            &behind_qph_headroom,
+            &buffers_maxed,
+            &b,
+            ms(60_000),
+            ms(30_000),
+            0,
+            &goals,
+        )
+        .expect("lag behind + CPU contended + QPH headroom ⇒ reserve query slots");
+        assert_eq!(adj.actuator, Actuator::QueryAdmissionReserve);
+        assert!(
+            adj.new_value > 0,
+            "grows while QPH has headroom (got {})",
+            adj.new_value
+        );
+
+        // HOLD (headroom spent): same lag + CPU, but QPH now in the deadband
+        // (1100: 0.8×1000=800 ≤ 1100 < 1.5×1000=1500 ⇒ neither met nor violated).
+        // The reserve must NOT keep growing — that would eat into the QPH SLO.
+        let behind_qph_deadband = IngestSnapshot {
+            freshness_secs: Some(60.0),
+            cpu_pressure: Some(0.95),
+            qph: Some(1100.0),
+            ..snap()
+        };
+        let adj = decide_with_goals(
+            &behind_qph_deadband,
+            &buffers_maxed,
+            &b,
+            ms(60_000),
+            ms(30_000),
+            0,
+            &goals,
         );
         assert!(
-            (tier_bound_fraction(IO_BOUND_FRACTION, StorageClass::Unknown) - scaled).abs()
-                < f64::EPSILON
+            !matches!(adj, Some(a) if a.actuator == Actuator::QueryAdmissionReserve && a.new_value > 0),
+            "must NOT grow the reserve once QPH headroom is spent (got {adj:?})"
         );
+
+        // BRAKE (QPH violated): a reserve is held, lag still behind, CPU still
+        // contended — but throttling has pushed QPH below target (700 < 0.8×1000=800
+        // ⇒ violated). Tier (1b) releases to stop borrowing past the QPH SLO, and
+        // wins over the query-health tier. This is the safe direction (release ON
+        // violated), NOT the self-perpetuation trap (release on met).
+        let reserve_held = ActuatorValues {
+            query_admission_reserve: 3,
+            ..actuators()
+        };
+        let behind_qph_violated = IngestSnapshot {
+            freshness_secs: Some(60.0),
+            cpu_pressure: Some(0.95),
+            qph: Some(700.0),
+            ..snap()
+        };
+        let adj = decide_with_goals(
+            &behind_qph_violated,
+            &reserve_held,
+            &b,
+            ms(60_000),
+            ms(30_000),
+            0,
+            &goals,
+        )
+        .expect("QPH violated ⇒ release to honor the query SLO");
+        assert_eq!(adj.actuator, Actuator::QueryAdmissionReserve);
         assert!(
-            (tier_bound_fraction(IO_BOUND_FRACTION, StorageClass::LocalSsd) - IO_BOUND_FRACTION)
-                .abs()
-                < f64::EPSILON
+            (adj.new_value as usize) < 3,
+            "released to stop breaching the QPH SLO (got {})",
+            adj.new_value
         );
+    }
+
+    #[test]
+    fn binding_constraint_classifies_the_bottleneck() {
+        // Memory dominates (the hard #1).
+        let s = IngestSnapshot {
+            mem_pressure: Some(0.95),
+            ..snap()
+        };
+        assert!(binding_constraint(&s).contains("memory"));
+        // Slow-tier earlier-drain gate: a confirmed slow tier (EBS) is memory-bound
+        // at `MEM_PRESSURE_OK - SLOW_TIER_MEM_DRAIN_OFFSET` (0.68) — the same gate the
+        // controller blocks buffer growth at — whereas the Unknown default keeps the
+        // standard 0.75 gate and shrugs the identical pressure off.
+        let slow = IngestSnapshot {
+            mem_pressure: Some(0.70),
+            data_storage: StorageClass::Ebs,
+            ..snap()
+        };
         assert!(
-            (tier_bound_fraction(IO_BOUND_FRACTION, StorageClass::Tmpfs) - IO_BOUND_FRACTION).abs()
-                < f64::EPSILON
+            binding_constraint(&slow).contains("memory"),
+            "confirmed slow tier binds on memory at the shifted gate"
         );
+        let unknown = IngestSnapshot {
+            mem_pressure: Some(0.70),
+            ..snap()
+        };
+        assert!(
+            !binding_constraint(&unknown).contains("memory"),
+            "the Unknown default keeps the standard 0.75 memory gate"
+        );
+        // Boundary: exactly at the shifted gate still binds on memory (`>=`,
+        // matching the controller's `mem_ok = p < gate`), not the tier below.
+        let at_gate = IngestSnapshot {
+            mem_pressure: Some(MEM_PRESSURE_OK - SLOW_TIER_MEM_DRAIN_OFFSET),
+            data_storage: StorageClass::Ebs,
+            ..snap()
+        };
+        assert!(
+            binding_constraint(&at_gate).contains("memory"),
+            "memory binds at exactly the shifted gate"
+        );
+        // CPU next.
+        let s = IngestSnapshot {
+            cpu_pressure: Some(0.9),
+            ..snap()
+        };
+        assert!(binding_constraint(&s).contains("CPU"));
+        // Slow-tier write path → storage/EBS.
+        let s = IngestSnapshot {
+            data_storage: StorageClass::Ebs,
+            io_latency_ms: Some(80.0),
+            arrival_gap_ms: 100.0,
+            ..snap()
+        };
+        let c = binding_constraint(&s);
+        assert!(c.contains("EBS") || c.contains("storage"));
+        // Nothing saturated → the actuator bounds themselves are the limit.
+        assert!(binding_constraint(&snap()).contains("actuator"));
     }
 
     #[test]

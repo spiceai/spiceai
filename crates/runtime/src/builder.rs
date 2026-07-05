@@ -63,6 +63,21 @@ const CAYENNE_SORT_MERGE_MEMORY_POOL_FRACTION_PARAM: &str =
 const CAYENNE_FILTER_PROPAGATION_PARAM: &str = "cayenne_filter_propagation";
 const CAYENNE_OPTIMIZER_RULES_PARAM: &str = "cayenne_optimizer_rules";
 
+/// Goal-driven adaptive-tuning SLO setpoints, settable GLOBALLY here at
+/// `runtime.params` and overridden per-dataset via the matching
+/// `acceleration.params` key (see `dataaccelerator::cayenne`). `cayenne_goal_qph`
+/// is the exception: QPH is a system-wide metric (a join spans datasets), so it
+/// is global-only and a per-dataset value is ignored. Declared here so the keys
+/// are part of the recognized `runtime.params` vocabulary and don't false-warn as
+/// unknown; the values are resolved (and validated) where the per-dataset Cayenne
+/// config is built. NOTE: `cayenne_goal_convergence_window` is deliberately NOT
+/// here — it paces HOW the loop chases these SLOs (a control-cadence/benchmarking
+/// knob), not a target outcome, so it stays a per-dataset advanced override.
+const CAYENNE_GOAL_REPLICATION_LAG_PARAM: &str = "cayenne_goal_replication_lag";
+const CAYENNE_GOAL_FRESHNESS_PARAM: &str = "cayenne_goal_freshness";
+const CAYENNE_GOAL_QUERY_LATENCY_PARAM: &str = "cayenne_goal_query_latency";
+const CAYENNE_GOAL_QPH_PARAM: &str = "cayenne_goal_qph";
+
 /// Process-global `SQLite` metastore pragma tuning keys (cache, mmap, busy
 /// timeout, WAL autocheckpoint, `auto_vacuum`). Consumed once at startup in
 /// `build_internal`; declared here so they're part of the recognized
@@ -100,6 +115,10 @@ const KNOWN_CAYENNE_RUNTIME_PARAMS: &[&str] = &[
     CAYENNE_METASTORE_WAL_AUTOCHECKPOINT_PAGES_PARAM,
     CAYENNE_METASTORE_WAL_TRUNCATE_THRESHOLD_MB_PARAM,
     CAYENNE_METASTORE_AUTO_VACUUM_PARAM,
+    CAYENNE_GOAL_REPLICATION_LAG_PARAM,
+    CAYENNE_GOAL_FRESHNESS_PARAM,
+    CAYENNE_GOAL_QUERY_LATENCY_PARAM,
+    CAYENNE_GOAL_QPH_PARAM,
 ];
 
 /// Recognized `runtime.params` keys that don't belong to a larger prefix
@@ -159,6 +178,7 @@ pub struct RuntimeBuilder {
 }
 
 impl RuntimeBuilder {
+    #[must_use]
     pub fn new() -> Self {
         RuntimeBuilder {
             app: None,
@@ -181,27 +201,32 @@ impl RuntimeBuilder {
         }
     }
 
+    #[must_use]
     pub fn with_app(mut self, app: app::App) -> Self {
         self.app = Some(Arc::new(app));
         self
     }
 
+    #[must_use]
     pub fn with_app_opt(mut self, app: Option<Arc<app::App>>) -> Self {
         self.app = app;
         self
     }
 
+    #[must_use]
     pub fn with_runtime_config(mut self, config: Config) -> Self {
         self.runtime_config = Arc::new(config);
         self
     }
 
+    #[must_use]
     pub fn with_extensions(mut self, extensions: Vec<Box<dyn ExtensionFactory>>) -> Self {
         self.extensions = extensions;
         self
     }
 
     /// Extensions that will be automatically loaded if a component requests them and the user hasn't explicitly loaded it.
+    #[must_use]
     pub fn with_autoload_extensions(
         mut self,
         extensions: HashMap<String, Box<dyn ExtensionFactory>>,
@@ -210,16 +235,19 @@ impl RuntimeBuilder {
         self
     }
 
+    #[must_use]
     pub fn with_pods_watcher(mut self, pods_watcher: podswatcher::PodsWatcher) -> Self {
         self.pods_watcher = Some(pods_watcher);
         self
     }
 
+    #[must_use]
     pub fn with_datasets_health_monitor(mut self) -> Self {
         self.datasets_health_monitor_enabled = true;
         self
     }
 
+    #[must_use]
     pub fn with_metrics_server(
         mut self,
         metrics_endpoint: SocketAddr,
@@ -230,6 +258,7 @@ impl RuntimeBuilder {
         self
     }
 
+    #[must_use]
     pub fn with_metrics_server_opt(
         mut self,
         metrics_endpoint: Option<SocketAddr>,
@@ -240,16 +269,19 @@ impl RuntimeBuilder {
         self
     }
 
+    #[must_use]
     pub fn with_rate_limits(mut self, rate_limits: RateLimits) -> Self {
         self.rate_limits = Some(Arc::new(rate_limits));
         self
     }
 
+    #[must_use]
     pub fn with_io_runtime(mut self, io_runtime: Handle) -> Self {
         self.io_runtime = Some(io_runtime);
         self
     }
 
+    #[must_use]
     pub fn with_resolved_cluster_config(
         mut self,
         resolved_cluster_config: ResolvedClusterConfig,
@@ -261,6 +293,7 @@ impl RuntimeBuilder {
     /// Sets a `SetOnce` handle that will be resolved with the spicepod
     /// `TelemetryConfig` once it is available.  For executors, this is set
     /// after the app definition is fetched from the scheduler.
+    #[must_use]
     pub fn with_telemetry_config(
         mut self,
         telemetry_config: Arc<tokio::sync::SetOnce<TelemetryConfig>>,
@@ -274,6 +307,7 @@ impl RuntimeBuilder {
     /// This reader is used by:
     /// - `GetMetrics` RPC to return local metrics to peer schedulers
     /// - Executors responding to metrics requests from schedulers via control stream
+    #[must_use]
     pub fn with_metrics_reader(mut self, metrics_reader: MetricsReader) -> Self {
         self.metrics_reader = Some(metrics_reader);
         self
@@ -478,7 +512,32 @@ impl RuntimeBuilder {
 
         // Create resource monitor early so it can be passed to DataFusion
         let resource_monitor = crate::resource_monitor::ResourceMonitor::new();
-        let secrets = Arc::new(RwLock::new(Self::load_secrets(self.app.as_ref()).await));
+        let loaded_secrets = Self::load_secrets(self.app.as_ref()).await;
+
+        // Diagnostics-only: resolve every `${ store:key }` reference in the
+        // app up front so secret problems surface as one consolidated report
+        // instead of scattered per-component errors. Skipped on cluster
+        // executors, where secrets resolve via scheduler RPC and the
+        // scheduler has already validated them. Never changes component
+        // loading; never logs secret values.
+        //
+        // Runs on the owned `Secrets` before it is wrapped in the shared
+        // `RwLock` below, so no lock guard is held across the lookups' awaits.
+        // Wrapped in `in_tracing_context_async` for the same reason as
+        // `load_secrets`: this runs before `spiced::init_tracing` installs the
+        // global subscriber, so without a temporary subscriber the summary
+        // would be dropped on the floor.
+        let is_cluster_executor = matches!(
+            self.resolved_cluster_config
+                .as_ref()
+                .and_then(ResolvedClusterConfig::effective_role),
+            Some(ClusterRole::Executor)
+        );
+        if !is_cluster_executor && let Some(app) = self.app.as_ref() {
+            in_tracing_context_async(crate::secrets_preflight::run(app, &loaded_secrets)).await;
+        }
+
+        let secrets = Arc::new(RwLock::new(loaded_secrets));
 
         // Create the shared app reference early so DataFusion, Runtime, and PartitionService share it.
         let shared_app: Arc<RwLock<Option<Arc<App>>>> = Arc::new(RwLock::new(self.app));
@@ -616,6 +675,9 @@ impl RuntimeBuilder {
         .target_partitions(target_partitions)
         .max_concurrent_queries(max_concurrent_queries)
         .prefer_hash_join(query.prefer_hash_join)
+        .eager_aggregation(query.eager_aggregation)
+        .eager_aggregation_min_reduction_factor(query.eager_aggregation_min_reduction_factor)
+        .eager_aggregation_max_pushed_groups(query.eager_aggregation_max_pushed_groups)
         .temp_directory(query.temp_directory)
         .spill_compression(query.spill_compression)
         .with_task_history(task_history)
@@ -1058,6 +1120,9 @@ fn parse_cayenne_optimizer_rules(
             "exact_join_filter" | "join_rewriter" | "exact_accumulator" => {
                 rules.set_exact_join_filter(true);
             }
+            "stats_aggregate" | "metadata_aggregate" | "aggregate_pushdown" => {
+                rules.set_stats_aggregate(true);
+            }
             _ => {
                 // Don't discard the rest of an explicit list because of one bad
                 // token; collect the unknown ones, keep the recognized rules,
@@ -1333,6 +1398,23 @@ mod test {
                 false,
             ),
             semi_join_only
+        );
+
+        // `stats_aggregate` is on under both `auto` and `all`, and is also
+        // selectable by token (including its aliases) without enabling anything else.
+        assert!(CayenneOptimizerRules::auto_enabled().stats_aggregate());
+        assert!(CayenneOptimizerRules::all_enabled().stats_aggregate());
+        let mut stats_aggregate_only = CayenneOptimizerRules::none();
+        stats_aggregate_only.set_stats_aggregate(true);
+        assert_eq!(
+            parse_cayenne_optimizer_rules(
+                &HashMap::from([(
+                    CAYENNE_OPTIMIZER_RULES_PARAM.to_string(),
+                    "metadata_aggregate".to_string(),
+                )]),
+                false,
+            ),
+            stats_aggregate_only
         );
 
         assert_eq!(

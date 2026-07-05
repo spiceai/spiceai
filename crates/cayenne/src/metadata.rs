@@ -290,16 +290,15 @@ pub enum CompressionStrategy {
 ///
 /// The exact level → scheme-set mapping lives in
 /// `provider::delta_encoding::strategy_builder_for_level`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(try_from = "String", into = "String")]
 pub enum DeltaEncoding {
     /// Size-gated: light for small deltas, full for large writes.
-    Auto,
-    /// Fixed encoding level `0..=10` applied to every delta write.
-    Level(u8),
-}
-
-impl Default for DeltaEncoding {
+    /// Local micro A/B (2026-06-06) was neutral on the
+    /// upsert/bulk lanes; the aggregate CPU-per-delta benefit targets
+    /// production-scale CDC and is to be validated there. Set the
+    /// param to `7` to opt out (pre-feature behavior).
+    ///
     /// `Auto` — size-gated light encoding for small deltas. This is also what
     /// pre-feature stored table configs deserialize to via
     /// `#[serde(default)]`, so existing tables pick up the policy on upgrade
@@ -307,9 +306,10 @@ impl Default for DeltaEncoding {
     /// change never forces a table re-create). Set the
     /// `cayenne_delta_encoding` param to `7` to opt out (the full default
     /// cascade, byte-for-byte the pre-feature behavior).
-    fn default() -> Self {
-        Self::Auto
-    }
+    #[default]
+    Auto,
+    /// Fixed encoding level `0..=10` applied to every delta write.
+    Level(u8),
 }
 
 /// Maximum supported [`DeltaEncoding`] level.
@@ -942,6 +942,17 @@ pub struct VortexConfig {
     /// land). A slow tier biases toward larger inline-flush to amortize commits.
     #[serde(skip)]
     pub metastore_storage_class: StorageClass,
+    /// Measured sequential write throughput of the DATA volume in MiB/s, from the
+    /// runtime's startup calibration probe; `None` when unprobed (remote/object
+    /// store) or the probe failed. Refines [`Self::data_storage_class`] into the
+    /// tuner's *continuous* slow-tier bias (a fast io2 volume gets less
+    /// amortization pressure than a slow gp3). Detected runtime fact — `#[serde(skip)]`.
+    #[serde(skip)]
+    pub data_storage_write_mbps: Option<f64>,
+    /// Measured sequential write throughput of the METASTORE volume in MiB/s
+    /// (calibration probe); refines the publish-bias bar. `None` when unprobed.
+    #[serde(skip)]
+    pub metastore_storage_write_mbps: Option<f64>,
     /// Force the **read/query** scan to emit Arrow *view* types (`Utf8View`/
     /// `BinaryView`) for `Utf8`/`Binary` columns, decoupled from the stored
     /// schema (which keeps the original types for writes/CDC/stats/keyset). Lets
@@ -949,14 +960,51 @@ pub struct VortexConfig {
     /// offset overflow in hash-join build-side `concat_batches` (e.g. `CH-benCH`
     /// q21 at SF1000, where `su_name` fans out across a ~100M-row join).
     ///
-    /// Runtime-configurable: the accelerator factory sets it (default on; opt out
-    /// with the `cayenne_force_view_types` acceleration param). It is `#[serde(skip)]`
-    /// because it is a read-only scan behavior re-derived on every open, NOT
-    /// serialized into Cayenne metadata — so toggling it never affects stored data
-    /// and it is intentionally excluded from `configuration_matches`. Off by default
-    /// for direct construction (unit tests keep `Utf8`). See `viewify_read_schema`.
+    /// Runtime-configurable: the accelerator factory sets it (default off; opt in
+    /// with `cayenne_force_view_types: true`).
     #[serde(skip)]
     pub force_view_read_schema: bool,
+
+    // ---- Cold object-store tier (storage-cascade bottom tier; cascade model) ----
+    /// Absolute object-store URL prefix for the cold tier (e.g.
+    /// `s3://bucket/prefix`). `None`/empty (the default) disables the cold tier.
+    /// Set from the `cayenne_cold_tier_location` spicepod param. Persisted so a
+    /// reopened table knows where its cold files live; NOT compared by
+    /// `configuration_matches`, so toggling it never recreates the table (the
+    /// cold tier is a strict superset of behavior over an unchanged warm tier).
+    pub cold_tier_location: Option<String>,
+    /// Liquid-clustering key columns for cold files (multi-column Z-order).
+    /// Empty = fall back to `sort_columns`, then the primary key. Set from
+    /// `cayenne_cold_clustering_columns`.
+    pub cold_clustering_columns: Vec<String>,
+    /// Target size for cold Vortex files in MB. Larger than the warm
+    /// `target_vortex_file_size_mb` because object stores favor fewer, larger
+    /// objects and cold scans are range reads. Set from
+    /// `cayenne_cold_target_file_size_mb`. Defaults to 512.
+    pub cold_target_file_size_mb: usize,
+    /// Promotion fires only once the warm tier exceeds this many bytes
+    /// (`<= 0` disables the byte trigger). Set from
+    /// `cayenne_cold_tier_warm_max_bytes`.
+    pub cold_tier_warm_max_bytes: i64,
+    /// Promotion fires only once the warm tier exceeds this many files
+    /// (`0` disables the file-count trigger). Set from
+    /// `cayenne_cold_tier_warm_max_files`.
+    pub cold_tier_warm_max_files: usize,
+    /// How often (ms) the background loop evaluates the cold-promotion trigger.
+    /// Cold tiering is not latency-critical, so this is much coarser than the
+    /// compaction interval. Set from `cayenne_cold_tier_background_interval_ms`.
+    /// Defaults to 60s.
+    pub cold_tier_background_interval_ms: u64,
+}
+
+impl VortexConfig {
+    /// Whether the cold object-store tier is enabled (a non-empty location set).
+    #[must_use]
+    pub fn cold_tier_enabled(&self) -> bool {
+        self.cold_tier_location
+            .as_ref()
+            .is_some_and(|s| !s.trim().is_empty())
+    }
 }
 
 /// Evolution set permitted when a widening schema difference is detected at
@@ -1252,7 +1300,15 @@ impl Default for VortexConfig {
             goal_convergence_window_secs: None,
             data_storage_class: StorageClass::default(),
             metastore_storage_class: StorageClass::default(),
+            data_storage_write_mbps: None,
+            metastore_storage_write_mbps: None,
             force_view_read_schema: false,
+            cold_tier_location: None,
+            cold_clustering_columns: Vec::new(),
+            cold_target_file_size_mb: 512,
+            cold_tier_warm_max_bytes: 0,
+            cold_tier_warm_max_files: 0,
+            cold_tier_background_interval_ms: 60_000,
         }
     }
 }
@@ -1511,6 +1567,43 @@ pub struct SnapshotFile {
     pub max_sequence: i64,
 }
 
+/// One row of the cold-tier object-store manifest (`cayenne_cold_tier_file`).
+///
+/// The cold tier is the bottom of the storage cascade (RAM mem-tier →
+/// local-disk warm Vortex snapshot → object-store cold). A background promotion
+/// stage rewrites settled/aged warm files as read-optimized (Z-order clustered)
+/// Vortex files on the cold object store and records one row here per file.
+///
+/// Unlike [`SnapshotFile`], cold files are **table-scoped** (not a member of any
+/// snapshot directory) and append-only: a promoted file is referenced only from
+/// this table, never from `cayenne_snapshot_file`. `file_url` is the *absolute*
+/// object-store URL (e.g. `s3://bucket/prefix/{table_id}/cold/<id>.vortex`),
+/// because the cold location may differ from the table's warm path. The embedded
+/// `statistics_blob` (serialized Vortex [`FileStatistics`]: per-column min/max/
+/// null/sum) lets the scan prune cold files at listing time with no object-store
+/// round-trip. `min_sequence`/`max_sequence` carry the file's commit-seq range
+/// (cold files hold the oldest, fully-superseded data — below all protected
+/// snapshots and retention at promotion time).
+#[derive(Debug, Clone)]
+pub struct ColdTierFile {
+    /// Table this cold file belongs to (`UUIDv7`).
+    pub table_id: String,
+    /// Absolute object-store URL of the `.vortex` data file on the cold store.
+    pub file_url: String,
+    /// Live row count in the file (post-merge, single-version-per-key).
+    pub row_count: i64,
+    /// `ObjectMeta::size` of the file in bytes.
+    pub file_size_bytes: i64,
+    /// Inclusive minimum commit sequence of the rows in this file.
+    pub min_sequence: i64,
+    /// Inclusive maximum commit sequence of the rows in this file.
+    pub max_sequence: i64,
+    /// Serialized Vortex `FileStatistics` flatbuffer (per-column min/max/null/
+    /// sum). Always populated at promotion (copied from the written footer) so
+    /// listing-time pruning never falls back to a full scan.
+    pub statistics_blob: Vec<u8>,
+}
+
 /// Table-level statistics stored as a serialized Vortex [`FileStatistics`] blob.
 ///
 /// Stores per-column statistics (min, max, null count) maintained incrementally
@@ -1537,10 +1630,22 @@ pub struct TableStatistics {
     /// the sum of every insert ever made. Compaction and overwrite reset it to
     /// the authoritative rewritten count.
     pub num_rows: i64,
+    /// Whether [`Self::num_rows`] is a provably-exact live count (`true`) or a
+    /// best-effort estimate that may over-count (`false`).
+    ///
+    /// The mem-tier checkpoint applies a `Delta` whose durable-supersede netting
+    /// is best-effort, so it taints this to `false`; a full-rewrite compaction /
+    /// overwrite `Set`s an authoritative count and restores `true`. Consumers that
+    /// answer `COUNT(*)` from statistics (the `stats_aggregate` fold and the
+    /// distributed executor-statistics reporter) must treat a `false` count as
+    /// `Precision::Inexact`, so the fold declines and a real scan answers instead
+    /// — preventing a drifted count from producing a wrong `COUNT(*)`.
+    pub num_rows_exact: bool,
     /// Serialized per-column NDV (distinct-count) `HyperLogLog` sketches
-    /// ([`crate::hll::NdvSketches`]), `None` when no integer column has a sketch.
-    /// Merged across writes register-wise; used to size distributed joins on
-    /// sparse integer keys. See [`crate::hll`].
+    /// ([`crate::hll::NdvSketches`]), `None` when no NDV-tracked column has a
+    /// sketch. Merged across writes register-wise; used to size distributed
+    /// joins and group-bys on integer, string, and temporal (date/time/timestamp)
+    /// keys. See [`crate::hll`].
     pub ndv_sketches: Option<Vec<u8>>,
 }
 

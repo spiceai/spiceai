@@ -187,8 +187,7 @@ fn build_http_client(ca_pem: &str, client_pem_pair: Option<(&str, &str)>) -> req
     let ca = reqwest::tls::Certificate::from_pem(ca_pem.as_bytes()).expect("valid CA");
     let mut builder = reqwest::Client::builder()
         .use_rustls_tls()
-        .tls_built_in_root_certs(false)
-        .add_root_certificate(ca);
+        .tls_certs_only([ca]);
     if let Some((cert_pem, key_pem)) = client_pem_pair {
         let mut buf = Vec::with_capacity(cert_pem.len() + key_pem.len() + 1);
         buf.extend_from_slice(cert_pem.as_bytes());

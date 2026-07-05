@@ -40,7 +40,6 @@ use datafusion::{
 use datafusion_table_providers::util::column_reference::ColumnReference;
 use futures::{StreamExt, TryStreamExt};
 use itertools::Itertools;
-use runtime_datafusion::allowlist::ResolvedTableAwareAllowlist;
 use runtime_datafusion_index::IndexedTableProvider;
 #[cfg(test)]
 use runtime_datafusion_udfs::{
@@ -52,6 +51,7 @@ use runtime_datafusion_udfs::{
     l2_norm::L2_NORM_UDF_NAME,
     truncate::TRUNCATE_SCALAR_UDF_NAME,
 };
+use runtime_query_engine::allowlist::ResolvedTableAwareAllowlist;
 use runtime_request_context::RequestContext;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -71,23 +71,22 @@ use crate::{
         request_context_extension::get_current_datafusion,
         udf::{UserFunctionInfo, effective_user_function_volatility, user_function_infos},
     },
-    embeddings::table::{EmbeddingInputMode, EmbeddingTable},
-    embeddings::udtf::VECTOR_SEARCH_UDTF_NAME,
-    search::{
-        full_text::udtf::TEXT_SEARCH_UDTF_NAME, rerank::RERANK_UDTF_NAME, rrf::RRF_UDF_NAME,
-        util::find_concrete_table_provider,
+    search::util::find_concrete_table_provider,
+    tools::{SpiceModelTool, utils::tool_call_error_response},
+};
+use runtime_query_engine::query_engine::QueryEngine;
+use runtime_search::{
+    embeddings::table::EmbeddingTable,
+    rerank::RERANK_UDTF_NAME,
+    rrf::RRF_UDF_NAME,
+    udtf::{EmbeddingInputMode, TEXT_SEARCH_UDTF_NAME, VECTOR_SEARCH_UDTF_NAME},
+};
+use runtime_tools::builtin::{
+    sample::{
+        SampleTableMethod, SampleTableParams, distinct::DistinctColumnsParams,
+        random::RandomSampleParams, tool::SampleDataTool,
     },
-    tools::{
-        SpiceModelTool,
-        builtin::{
-            sample::{
-                SampleTableMethod, SampleTableParams, distinct::DistinctColumnsParams,
-                random::RandomSampleParams, tool::SampleDataTool,
-            },
-            table_schema::{TableSchemaTool, TableSchemaToolParams},
-        },
-        utils::tool_call_error_response,
-    },
+    table_schema::{TableSchemaTool, TableSchemaToolParams},
 };
 
 #[cfg(test)]
@@ -437,8 +436,13 @@ async fn table_schema_context(
     rt: Arc<Runtime>,
     table_allowlist: Option<ResolvedTableAwareAllowlist>,
 ) -> Result<String, Box<dyn StdError + Send + Sync>> {
-    let table_schema_tool =
-        TableSchemaTool::new(rt, None, None).with_table_allowlist(table_allowlist);
+    let table_schema_tool = TableSchemaTool::new(
+        rt.datafusion() as Arc<dyn QueryEngine>,
+        Arc::clone(&rt.app),
+        None,
+        None,
+    )
+    .with_table_allowlist(table_allowlist);
     let params = TableSchemaToolParams::new(tables.iter().map(ToString::to_string).collect());
     tool_context_text(&table_schema_tool, &params).await
 }
@@ -1210,7 +1214,7 @@ async fn sample_context_blocks(
                     sample_context_method_order(&method),
                 );
                 let content = tool_context_text(
-                    &SampleDataTool::new(rt.datafusion(), method.clone())
+                    &SampleDataTool::new(rt.datafusion() as Arc<dyn QueryEngine>, method.clone())
                         .with_table_allowlist(allowlist),
                     &params,
                 )

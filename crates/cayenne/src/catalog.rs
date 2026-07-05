@@ -21,7 +21,7 @@ limitations under the License.
 //! (`SQLite`, Turso, etc.).
 
 use super::metadata::{
-    CreateTableOptions, DeleteFile, InlinedData, InlinedDataStats, InlinedDelete,
+    ColdTierFile, CreateTableOptions, DeleteFile, InlinedData, InlinedDataStats, InlinedDelete,
     PartitionMetadata, SnapshotFile, SnapshotFileStatistics, TableMetadata, TableStatistics,
 };
 use arrow_schema::SchemaRef;
@@ -290,6 +290,25 @@ pub trait MetadataCatalog: Send + Sync {
     /// Get all active delete files for a table (across all virtual files).
     async fn get_table_delete_files(&self, table_id: &str) -> CatalogResult<Vec<DeleteFile>>;
 
+    /// Get orphan-eligible key-based delete files for a table, bounded by `limit`.
+    ///
+    /// Returns rows that are both key-based (`source_data_file_path IS NULL` — the
+    /// reliable discriminator, since the catalog does not persist `deletion_type`)
+    /// and at or below `max_sequence` (`sequence_number <= max_sequence`). The
+    /// caller passes the surviving-sequence floor as `max_sequence`: a key DV with
+    /// delete sequence `D` only shadows data with sequence `< D`, so once the floor
+    /// is `>= D` it shadows nothing and is safe to remove.
+    ///
+    /// This is the bounded query the orphaned-DV cleanup sweep uses instead of
+    /// fetching every delete-file row and filtering in memory; `limit` caps the
+    /// per-sweep working set (the sweep requeues if more remain).
+    async fn get_orphan_eligible_delete_files(
+        &self,
+        table_id: &str,
+        max_sequence: i64,
+        limit: usize,
+    ) -> CatalogResult<Vec<DeleteFile>>;
+
     /// Remove delete files (deletion vectors) by ID for a table.
     async fn remove_delete_files(
         &self,
@@ -515,7 +534,37 @@ pub trait MetadataCatalog: Send + Sync {
     -> CatalogResult<()>;
 
     /// Atomically update snapshot and clear delete files in a single transaction.
+    ///
+    /// Clears ALL delete files / insert records / protected-snapshot sequence
+    /// rows for the table. This is only correct when the rewrite excluded
+    /// concurrent writers (it held `write_lock` throughout). For the concurrent
+    /// key-delete path use [`Self::commit_compaction_fenced`] instead.
     async fn commit_compaction(&self, table_id: &str, new_snapshot_id: &str) -> CatalogResult<()>;
+
+    /// Sequence-fenced variant of [`Self::commit_compaction`] for compactions
+    /// that ran concurrently with writers.
+    ///
+    /// In one transaction, in this order (matching `commit_compaction`'s
+    /// crash-safety ordering):
+    /// 1. `DELETE FROM cayenne_delete_file       WHERE table_id = ? AND sequence_number <= cutoff`
+    /// 2. `DELETE FROM cayenne_insert_record     WHERE table_id = ? AND sequence_number <= cutoff`
+    /// 3. `DELETE FROM cayenne_snapshot_sequence WHERE table_id = ? AND snapshot_id IN (protected_snapshot_ids_to_clear)`
+    /// 4. `UPDATE cayenne_table SET current_snapshot_id = ? WHERE table_id = ?`
+    ///
+    /// Delete files / insert records with `sequence_number > cutoff` (deletes or
+    /// upserts that committed after the rewrite captured its cutoff) are
+    /// preserved, as are protected snapshots not named in
+    /// `protected_snapshot_ids_to_clear` (created during the rewrite window).
+    /// Protected snapshots are cleared by explicit id rather than by sequence
+    /// because their `sequence_number` column records the delete-fence at
+    /// creation, not the snapshot's own creation sequence.
+    async fn commit_compaction_fenced(
+        &self,
+        table_id: &str,
+        new_snapshot_id: &str,
+        cutoff: i64,
+        protected_snapshot_ids_to_clear: &[String],
+    ) -> CatalogResult<()>;
 
     /// Atomically swap a subset of protected snapshots for a single merged
     /// snapshot (fast protected-snapshot compaction, "Step 1").
@@ -631,6 +680,28 @@ pub trait MetadataCatalog: Send + Sync {
 
     /// Clear all manifest rows for a table.
     async fn clear_snapshot_files(&self, table_id: &str) -> CatalogResult<()>;
+
+    /// List every cold-tier file for a table (the cold scan's file source).
+    /// Read under the scan's listing fence so the cold file set is captured
+    /// consistently with the warm snapshot and deletion snapshot.
+    async fn list_cold_tier_files(&self, table_id: &str) -> CatalogResult<Vec<ColdTierFile>>;
+
+    /// Atomically graduate the table's durable content to the cold tier. In ONE
+    /// transaction: insert the cold-file rows AND perform the overwrite clear
+    /// (drop the warm `cayenne_snapshot_file` manifest, delete files, insert
+    /// records, inline data, snapshot sequences, per-file/table stats, pk index)
+    /// + repoint `current_snapshot_id` to `new_snapshot_id` (a fresh empty warm
+    /// snapshot). All-or-nothing, so a crash mid-promotion never leaves rows in
+    /// BOTH tiers (double-count) or NEITHER (loss). The deletion state is cleared
+    /// because the cold files were written with all deletes already applied
+    /// (single-version) — exactly the semantics of `commit_overwrite`, whose new
+    /// content here lives on the cold object store instead of a warm snapshot.
+    async fn commit_overwrite_to_cold(
+        &self,
+        table_id: &str,
+        new_snapshot_id: &str,
+        cold_files: &[ColdTierFile],
+    ) -> CatalogResult<()>;
 
     /// Upsert the persisted primary-key existence index (a bloom checkpoint),
     /// tagged with the snapshot id it covers. Stored in the metastore so it is

@@ -31,11 +31,11 @@ use super::{
 };
 
 pub(crate) mod aws;
-pub(crate) mod azure;
-pub(crate) mod gcs;
+pub mod azure;
+pub mod gcs;
 
 #[async_trait]
-pub(crate) trait Validator {
+pub trait Validator {
     type Error;
 
     /// Parameters may be changed while validating.

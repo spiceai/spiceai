@@ -27,10 +27,11 @@ use std::collections::HashMap;
 use std::collections::hash_map::Entry;
 use std::sync::Arc;
 
-use arrow::array::{Array, ArrayRef, RecordBatch, new_empty_array};
+use arrow::array::{Array, ArrayRef, BooleanArray, RecordBatch, new_empty_array};
 use arrow_schema::{DataType, FieldRef, SchemaRef};
 use datafusion::datasource::memory::MemorySourceConfig;
 use datafusion::error::Result as DataFusionResult;
+use datafusion::logical_expr::ColumnarValue;
 use datafusion::physical_plan::aggregates::{AggregateExec, AggregateMode};
 use datafusion_common::{DataFusionError, ScalarValue};
 use datafusion_execution::{SendableRecordBatchStream, TaskContext};
@@ -47,6 +48,17 @@ pub struct MaintainedAggregateSpec {
     pub group_by: Vec<String>,
     /// Aggregate expressions maintained for each group.
     pub aggregates: Vec<MaintainedAggregateExpr>,
+    /// Optional row predicate (a physical expression over the table/input
+    /// schema) that selects which rows contribute to the view — the maintained
+    /// equivalent of a query `WHERE`. `None` maintains the aggregate over every
+    /// row (the original behavior). When set, maintenance applies only rows the
+    /// predicate selects, and the optimizer serves a query from this view only
+    /// when the query's filter matches this predicate exactly (see
+    /// [`MaintainedAggregateView::matches_query`]). This is what lets the
+    /// flagship serve filtered analytical queries (e.g. CH-benCH q1/q6) that
+    /// every general-purpose engine must re-scan O(rows) for, while Cayenne
+    /// maintains the filtered relation from the CDC delta and serves O(groups).
+    pub filter: Option<Arc<dyn PhysicalExpr>>,
 }
 
 /// One aggregate expression inside a maintained aggregate view.
@@ -69,7 +81,11 @@ pub enum MaintainedAggregateFunction {
     /// (`Float32`/`Float64`) families. Narrower widths widen losslessly to the
     /// `BIGINT`/`Float64` sum output, matching `DataFusion`'s `SUM` output type.
     Sum,
-    /// SQL `AVG(column)` for `Float32`/`Float64` inputs.
+    /// SQL `AVG(column)` over the signed-integer (`Int8`..`Int64`),
+    /// unsigned-integer (`UInt8`..`UInt64`), or floating-point
+    /// (`Float32`/`Float64`) families. The output is always `Float64` (matching
+    /// `DataFusion`'s `AVG` output type); integer inputs fold their running sum
+    /// exactly into an `i128` accumulator, floats into an `f64` one.
     Avg,
 }
 
@@ -104,6 +120,11 @@ enum RegistryStatus {
 #[derive(Debug)]
 struct MaintainedAggregateView {
     spec: ResolvedAggregateSpec,
+    /// Optional row predicate over the input schema. When set, only rows the
+    /// predicate selects are folded into `groups`/`pk_index`; a non-matching row
+    /// is treated exactly as an absent row (not indexed, not accumulated), so all
+    /// retraction logic is reused unchanged. See [`MaintainedAggregateSpec::filter`].
+    filter: Option<Arc<dyn PhysicalExpr>>,
     groups: HashMap<Vec<ScalarValue>, GroupAccumulator>,
     /// Primary-key column indices in the input batch. Empty means no per-PK
     /// index is maintained, so retraction is unavailable and the legacy
@@ -198,12 +219,28 @@ enum AggregateAccumulator {
         sum: f64,
         count: i64,
     },
+    /// `AVG` over the signed/unsigned integer family. The running sum is folded
+    /// exactly in `i128` (never materialized as an integer — always divided down
+    /// to the `Float64` AVG output), so it is exactly invertible on the retract
+    /// path and, unlike `SumInt64`'s `i64`, wide enough to average many values
+    /// near `i64::MAX`/`u64::MAX` without overflowing.
+    AvgInt128 {
+        column_index: usize,
+        sum: i128,
+        count: i64,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct QueryAggregateSpec {
     group_by: Vec<String>,
     aggregates: Vec<QueryAggregateExpr>,
+    /// The query's row predicate (captured from a `FilterExec` between the
+    /// aggregate and the Cayenne scan), or `None` for an unfiltered query. A
+    /// view serves the query only when this matches the view's own filter
+    /// exactly — a filtered view must never answer an unfiltered query, and vice
+    /// versa, or the result would be wrong.
+    filter: Option<Arc<dyn PhysicalExpr>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -508,7 +545,7 @@ impl MaintainedAggregateRegistry {
         aggregate: &AggregateExec,
         scan_epoch: u64,
     ) -> DataFusionResult<Option<RecordBatch>> {
-        self.batch_for_aggregate_with_output(aggregate, aggregate, scan_epoch)
+        self.batch_for_aggregate_with_output(aggregate, aggregate, scan_epoch, None)
     }
 
     /// Materialize a maintained aggregate batch by matching `query_aggregate`
@@ -526,19 +563,73 @@ impl MaintainedAggregateRegistry {
         query_aggregate: &AggregateExec,
         output_aggregate: &AggregateExec,
         scan_epoch: u64,
+        filter: Option<Arc<dyn PhysicalExpr>>,
     ) -> DataFusionResult<Option<RecordBatch>> {
-        let Some(query) = query_spec_for_aggregate(query_aggregate) else {
+        let Some(mut query) = query_spec_for_aggregate(query_aggregate) else {
             return Ok(None);
         };
+        query.filter = filter;
+        self.serve(&query, scan_epoch, output_aggregate.schema())
+    }
 
+    /// Serve a maintained view directly from a declared [`MaintainedAggregateSpec`]
+    /// (group-by + aggregates + optional filter) into `output_schema`, without an
+    /// `AggregateExec`. Exercises the exact fresh/epoch gate, view match (incl.
+    /// filter equality), and O(groups) materialize the optimizer rewrite uses —
+    /// the entry point for benches/tests that measure the maintained serve cost.
+    ///
+    /// # Returns
+    ///
+    /// `Ok(Some(batch))` when the registry is fresh at `scan_epoch`, a view
+    /// matches `spec` exactly, and it materializes into `output_schema`.
+    /// `Ok(None)` is the fallback signal (the caller should run normal
+    /// execution) when the registry is stale at `scan_epoch`, no view matches
+    /// `spec`, or the matched view does not fit `output_schema`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error only when a matched view fails to build its result
+    /// arrays (e.g. a group-key or scalar-value conversion error) — not for the
+    /// stale / no-match / schema-mismatch fallbacks above, which are `Ok(None)`.
+    pub fn batch_for_spec(
+        &self,
+        spec: &MaintainedAggregateSpec,
+        scan_epoch: u64,
+        output_schema: SchemaRef,
+    ) -> DataFusionResult<Option<RecordBatch>> {
+        let query = QueryAggregateSpec {
+            group_by: spec.group_by.clone(),
+            aggregates: spec
+                .aggregates
+                .iter()
+                .map(|aggregate| QueryAggregateExpr {
+                    function: aggregate.function,
+                    column: aggregate.column.clone(),
+                })
+                .collect(),
+            filter: spec.filter.clone(),
+        };
+        self.serve(&query, scan_epoch, output_schema)
+    }
+
+    /// Shared serve path: only answer from a maintained view when the registry is
+    /// fresh at the scan epoch and a view matches the query shape exactly.
+    fn serve(
+        &self,
+        query: &QueryAggregateSpec,
+        scan_epoch: u64,
+        output_schema: SchemaRef,
+    ) -> DataFusionResult<Option<RecordBatch>> {
         let state = self.state.read();
         if state.status != RegistryStatus::Fresh || state.epoch != scan_epoch {
             return Ok(None);
         }
 
         for view in &state.views {
-            if view.matches_query(&query) {
-                return view.materialize(output_aggregate.schema());
+            if view.matches_query(query) {
+                // Moved on the diverging return path — at most one view matches,
+                // so no clone of the schema is needed.
+                return view.materialize(output_schema);
             }
         }
 
@@ -552,12 +643,64 @@ impl MaintainedAggregateView {
         schema: &SchemaRef,
         pk_columns: Vec<usize>,
     ) -> DataFusionResult<Self> {
+        // A filter is a `WHERE` condition, so it must evaluate to Boolean.
+        // Validate at construction so a non-Boolean predicate fails fast here with
+        // a clear error, rather than later in `evaluate_filter_mask` with an
+        // internal error. This guards every caller — config, tests, benches, and
+        // any future programmatic construction.
+        if let Some(filter) = &spec.filter {
+            let data_type = filter.data_type(schema)?;
+            if data_type != DataType::Boolean {
+                return Err(DataFusionError::Plan(format!(
+                    "maintained aggregate filter must be a Boolean predicate, but it evaluates to {data_type}"
+                )));
+            }
+        }
         Ok(Self {
             spec: ResolvedAggregateSpec::try_new(spec, schema)?,
+            filter: spec.filter.clone(),
             groups: HashMap::new(),
             pk_columns,
             pk_index: HashMap::new(),
         })
+    }
+
+    /// Evaluate the view's row predicate over `batch`, returning a per-row
+    /// boolean mask. `None` (no filter configured) means every row contributes.
+    /// SQL `WHERE` semantics: a row contributes only when the predicate is
+    /// exactly `TRUE` (a `NULL`/`FALSE` result excludes it).
+    fn evaluate_filter_mask(&self, batch: &RecordBatch) -> DataFusionResult<Option<BooleanArray>> {
+        let Some(filter) = &self.filter else {
+            return Ok(None);
+        };
+        let array = match filter.evaluate(batch)? {
+            ColumnarValue::Array(array) => array,
+            scalar @ ColumnarValue::Scalar(_) => scalar.into_array(batch.num_rows())?,
+        };
+        let mask = array
+            .as_any()
+            .downcast_ref::<BooleanArray>()
+            .ok_or_else(|| {
+                DataFusionError::Internal(format!(
+                    "maintained aggregate filter must evaluate to Boolean, got {}",
+                    array.data_type()
+                ))
+            })?;
+        Ok(Some(mask.clone()))
+    }
+
+    /// Fold one row into its group, creating the group accumulator on first use.
+    fn insert_into_group(
+        &mut self,
+        group_key: Vec<ScalarValue>,
+        batch: &RecordBatch,
+        row: usize,
+    ) -> DataFusionResult<()> {
+        let group = match self.groups.entry(group_key) {
+            Entry::Occupied(entry) => entry.into_mut(),
+            Entry::Vacant(entry) => entry.insert(GroupAccumulator::try_new(&self.spec)?),
+        };
+        group.apply_insert_row(batch, row)
     }
 
     fn clear(&mut self) {
@@ -648,18 +791,39 @@ impl MaintainedAggregateView {
             return Ok(());
         }
 
+        // `None` mask => every row contributes (unfiltered view, original path).
+        let mask = self.evaluate_filter_mask(batch)?;
         let indexed = !self.pk_columns.is_empty();
         for row in 0..batch.num_rows() {
-            let group_key =
-                Self::scalar_key(batch, row, self.spec.group_by.iter().map(|c| c.index))?;
+            let matches = mask
+                .as_ref()
+                .is_none_or(|mask| mask.is_valid(row) && mask.value(row));
 
-            if indexed {
+            // Indexed views: an upsert whose PK is already indexed is an UPDATE,
+            // so retract the prior contribution first. This runs even when the new
+            // row no longer matches the filter, so a row updated OUT of the
+            // predicate correctly drops its old contribution. `None` for
+            // insert-only (no PK) views, which never retract.
+            let pk = if indexed {
                 let pk = Self::scalar_key(batch, row, self.pk_columns.iter().copied())?;
-                // An upsert whose PK is already indexed is an UPDATE: retract
-                // the prior contribution before applying the new row.
                 if let Some(old) = self.pk_index.remove(&pk) {
                     self.retract_entry(&old)?;
                 }
+                Some(pk)
+            } else {
+                None
+            };
+
+            // A non-matching row contributes nothing and is left unindexed —
+            // identical to an absent row, so a later DELETE/UPDATE retraction is a
+            // correct no-op or re-add (its prior contribution was retracted above).
+            if !matches {
+                continue;
+            }
+
+            let group_key =
+                Self::scalar_key(batch, row, self.spec.group_by.iter().map(|c| c.index))?;
+            if let Some(pk) = pk {
                 let inputs = self.capture_inputs(batch, row)?;
                 self.pk_index.insert(
                     pk,
@@ -669,23 +833,38 @@ impl MaintainedAggregateView {
                     },
                 );
             }
-
-            let group = match self.groups.entry(group_key) {
-                Entry::Occupied(entry) => entry.into_mut(),
-                Entry::Vacant(entry) => entry.insert(GroupAccumulator::try_new(&self.spec)?),
-            };
-            group.apply_insert_row(batch, row)?;
+            self.insert_into_group(group_key, batch, row)?;
         }
 
         Ok(())
     }
 
     fn matches_query(&self, query: &QueryAggregateSpec) -> bool {
-        self.spec
-            .group_by
-            .iter()
-            .map(|c| c.name.as_str())
-            .eq(query.group_by.iter().map(String::as_str))
+        // Filter must match EXACTLY: an unfiltered view (filter `None`) answers
+        // only unfiltered queries; a filtered view answers only a query carrying
+        // the identical predicate. `Arc<dyn PhysicalExpr>` compares structurally
+        // (DataFusion's `DynEq`), so two equivalent predicates over the same
+        // schema match. A mismatch (or an unrecognized predicate) falls back to
+        // the base-table scan — correct, just not accelerated.
+        //
+        // BOUNDARY (known limitation): the comparison is index- and type-sensitive
+        // (`Column{index}`, typed `Literal`). The view's filter is parsed against
+        // the table schema (config time) while the query's filter is the
+        // `FilterExec` predicate captured from the physical plan. If a projection
+        // or type-coercion sits between the scan and the filter (e.g. a
+        // `SchemaCastScanExec` reordering columns or advertising `Utf8View` over a
+        // stored `Utf8`), the predicates differ structurally and this returns
+        // `false`, so the view SILENTLY does not serve and the query re-scans. A
+        // future slice can normalize both predicates to a schema-independent
+        // (column-name + canonical-literal) form before comparison; until then,
+        // declare the filter so it matches the query's scan-output predicate.
+        self.filter == query.filter
+            && self
+                .spec
+                .group_by
+                .iter()
+                .map(|c| c.name.as_str())
+                .eq(query.group_by.iter().map(String::as_str))
             && self.spec.aggregates.len() == query.aggregates.len()
             && self
                 .spec
@@ -823,6 +1002,15 @@ impl ResolvedAggregateExpr {
             {
                 AggregateOutputType::UInt64
             }
+            // SQL `AVG(int)` outputs `Float64` (DataFusion's AVG output type) for
+            // the whole signed/unsigned integer family; the running sum is folded
+            // exactly in `i128` (see `AvgInt128`), so a narrow CDC column (Postgres
+            // `INTEGER` -> arrow `Int32`) is averaged without overflow.
+            (MaintainedAggregateFunction::Avg, Some(data_type))
+                if data_type.is_signed_integer() || data_type.is_unsigned_integer() =>
+            {
+                AggregateOutputType::Float64
+            }
             // `SUM`/`AVG` over floating-point widen to `Float64` (DataFusion's
             // float sum/avg output type); `Float32` widens losslessly.
             (
@@ -929,6 +1117,16 @@ impl AggregateAccumulator {
                     value: None,
                 }
             }
+            (MaintainedAggregateFunction::Avg, AggregateOutputType::Float64, Some(column))
+                if column.data_type.is_signed_integer()
+                    || column.data_type.is_unsigned_integer() =>
+            {
+                Self::AvgInt128 {
+                    column_index: column.index,
+                    sum: 0,
+                    count: 0,
+                }
+            }
             (MaintainedAggregateFunction::Avg, AggregateOutputType::Float64, Some(column)) => {
                 Self::AvgFloat64 {
                     column_index: column.index,
@@ -1006,13 +1204,25 @@ impl AggregateAccumulator {
                     *count = count.checked_add(1).ok_or_else(count_overflow)?;
                 }
             }
+            Self::AvgInt128 {
+                column_index,
+                sum,
+                count,
+            } => {
+                if !batch.column(*column_index).is_null(row) {
+                    let scalar = ScalarValue::try_from_array(batch.column(*column_index), row)?;
+                    let delta = scalar_as_i128(&scalar)?;
+                    *sum = sum.checked_add(delta).ok_or_else(avg_overflow)?;
+                    *count = count.checked_add(1).ok_or_else(count_overflow)?;
+                }
+            }
         }
         Ok(())
     }
 
     /// Inverse of [`Self::apply_insert_row`], subtracting a previously-captured
-    /// input scalar. `COUNT`/`SUM(Int64|UInt64)` are exactly invertible;
-    /// `SUM/AVG(Float64)` subtract and rely on a periodic
+    /// input scalar. `COUNT`/`SUM(Int64|UInt64)`/`AVG(int)` are exactly
+    /// invertible; `SUM/AVG(Float64)` subtract and rely on a periodic
     /// [`MaintainedAggregateRegistry::rebuild_from_batches`] to bound float
     /// drift. A null input contributed nothing, so it retracts nothing.
     fn retract_row(&mut self, input: Option<&ScalarValue>) -> DataFusionResult<()> {
@@ -1060,6 +1270,15 @@ impl AggregateAccumulator {
                     *count = count.checked_sub(1).ok_or_else(retract_underflow)?;
                 }
             }
+            Self::AvgInt128 { sum, count, .. } => {
+                if let Some(scalar) = input
+                    && !scalar.is_null()
+                {
+                    let delta = scalar_as_i128(scalar)?;
+                    *sum = sum.checked_sub(delta).ok_or_else(retract_underflow)?;
+                    *count = count.checked_sub(1).ok_or_else(retract_underflow)?;
+                }
+            }
         }
         Ok(())
     }
@@ -1084,6 +1303,23 @@ impl AggregateAccumulator {
                 } else {
                     let count_f64 = exact_i64_to_f64(*count)?;
                     scalar_for_field(field, Some(ScalarValue::Float64(Some(*sum / count_f64))))
+                }
+            }
+            Self::AvgInt128 { sum, count, .. } => {
+                if *count == 0 {
+                    scalar_for_field(field, Some(ScalarValue::Float64(None)))
+                } else {
+                    let count_f64 = exact_i64_to_f64(*count)?;
+                    // The exact `i128` sum is divided down to the `Float64` AVG
+                    // output; the cast rounds to nearest for sums beyond 2^53,
+                    // which is inherent to producing an `f64` average and matches
+                    // DataFusion's `AVG(int)` -> `Float64` result.
+                    #[expect(
+                        clippy::cast_precision_loss,
+                        reason = "AVG output is Float64; rounding the i128 sum to f64 is intended"
+                    )]
+                    let sum_f64 = *sum as f64;
+                    scalar_for_field(field, Some(ScalarValue::Float64(Some(sum_f64 / count_f64))))
                 }
             }
         }
@@ -1171,6 +1407,10 @@ fn query_spec_for_aggregate(aggregate: &AggregateExec) -> Option<QueryAggregateS
     Some(QueryAggregateSpec {
         group_by,
         aggregates,
+        // The aggregate node carries no filter; the optimizer captures any
+        // `FilterExec` predicate during plan descent and sets it via
+        // `batch_for_aggregate_with_output`.
+        filter: None,
     })
 }
 
@@ -1288,6 +1528,24 @@ fn scalar_as_u64(scalar: &ScalarValue) -> DataFusionResult<u64> {
     }
 }
 
+/// Coerce a non-null integer input scalar to `i128`, widening the whole
+/// signed (`Int8`..`Int64`) and unsigned (`UInt8`..`UInt64`) family losslessly
+/// (`u64` fits in `i128`). Used by maintained `AVG(int)`, whose `i128` running
+/// sum has ample headroom to average many values near `i64::MAX`/`u64::MAX`.
+fn scalar_as_i128(scalar: &ScalarValue) -> DataFusionResult<i128> {
+    match scalar {
+        ScalarValue::Int64(Some(v)) => Ok(i128::from(*v)),
+        ScalarValue::Int32(Some(v)) => Ok(i128::from(*v)),
+        ScalarValue::Int16(Some(v)) => Ok(i128::from(*v)),
+        ScalarValue::Int8(Some(v)) => Ok(i128::from(*v)),
+        ScalarValue::UInt64(Some(v)) => Ok(i128::from(*v)),
+        ScalarValue::UInt32(Some(v)) => Ok(i128::from(*v)),
+        ScalarValue::UInt16(Some(v)) => Ok(i128::from(*v)),
+        ScalarValue::UInt8(Some(v)) => Ok(i128::from(*v)),
+        _ => Err(type_mismatch("an integer", scalar)),
+    }
+}
+
 /// Coerce a non-null floating-point input scalar to `f64`, widening `Float32`
 /// to `Float64` losslessly (`DataFusion`'s float sum/avg output type).
 fn scalar_as_f64(scalar: &ScalarValue) -> DataFusionResult<f64> {
@@ -1388,6 +1646,18 @@ fn retract_underflow() -> DataFusionError {
     )
 }
 
+/// The `AVG(int)` running sum overflowed its `i128` accumulator on the insert
+/// path. AVG-specific (not [`sum_overflow`], whose "SUM" text would misreport the
+/// failing aggregate); with `i128` headroom this is effectively unreachable, but
+/// it fails safe. The retract path reuses [`retract_underflow`], matching
+/// `COUNT`/`SUM(UInt64)`.
+fn avg_overflow() -> DataFusionError {
+    DataFusionError::Execution(
+        "Maintained aggregate AVG running sum overflowed its i128 accumulator; falling back to base table scan"
+            .to_string(),
+    )
+}
+
 fn type_mismatch(expected: &'static str, scalar: &ScalarValue) -> DataFusionError {
     DataFusionError::Execution(format!(
         "Maintained aggregate expected {expected} input but received {scalar:?}"
@@ -1446,6 +1716,7 @@ mod tests {
     #[test]
     fn applies_null_aware_count_sum_and_avg() -> DataFusionResult<()> {
         let spec = MaintainedAggregateSpec {
+            filter: None,
             group_by: vec!["name".to_string()],
             aggregates: vec![
                 MaintainedAggregateExpr {
@@ -1517,6 +1788,7 @@ mod tests {
     #[test]
     fn stale_epoch_does_not_serve() -> DataFusionResult<()> {
         let spec = MaintainedAggregateSpec {
+            filter: None,
             group_by: vec!["name".to_string()],
             aggregates: vec![MaintainedAggregateExpr {
                 function: MaintainedAggregateFunction::Count,
@@ -1542,6 +1814,7 @@ mod tests {
     #[test]
     fn out_of_order_apply_epoch_falls_back_to_stale() -> DataFusionResult<()> {
         let spec = MaintainedAggregateSpec {
+            filter: None,
             group_by: vec!["name".to_string()],
             aggregates: vec![MaintainedAggregateExpr {
                 function: MaintainedAggregateFunction::Count,
@@ -1576,6 +1849,7 @@ mod tests {
     #[test]
     fn count_null_literal_is_not_rewritten_as_count_all() -> DataFusionResult<()> {
         let spec = MaintainedAggregateSpec {
+            filter: None,
             group_by: vec!["name".to_string()],
             aggregates: vec![MaintainedAggregateExpr {
                 function: MaintainedAggregateFunction::Count,
@@ -1609,6 +1883,7 @@ mod tests {
     #[test]
     fn global_empty_aggregate_returns_sql_row() -> DataFusionResult<()> {
         let spec = MaintainedAggregateSpec {
+            filter: None,
             group_by: vec![],
             aggregates: vec![
                 MaintainedAggregateExpr {
@@ -1642,6 +1917,7 @@ mod tests {
     #[test]
     fn sum_overflow_returns_error() -> DataFusionResult<()> {
         let spec = MaintainedAggregateSpec {
+            filter: None,
             group_by: vec![],
             aggregates: vec![MaintainedAggregateExpr {
                 function: MaintainedAggregateFunction::Sum,
@@ -1672,6 +1948,7 @@ mod tests {
             true,
         )]));
         let spec = MaintainedAggregateSpec {
+            filter: None,
             group_by: vec!["group_key".to_string()],
             aggregates: vec![MaintainedAggregateExpr {
                 function: MaintainedAggregateFunction::Count,
@@ -1784,6 +2061,7 @@ mod tests {
 
     fn sum_i_spec() -> MaintainedAggregateSpec {
         MaintainedAggregateSpec {
+            filter: None,
             group_by: vec!["name".to_string()],
             aggregates: vec![MaintainedAggregateExpr {
                 function: MaintainedAggregateFunction::Sum,
@@ -1973,6 +2251,7 @@ mod tests {
     #[test]
     fn retracts_all_aggregate_types() -> DataFusionResult<()> {
         let spec = MaintainedAggregateSpec {
+            filter: None,
             group_by: vec!["name".to_string()],
             aggregates: vec![
                 MaintainedAggregateExpr {
@@ -2090,6 +2369,7 @@ mod tests {
         };
 
         let spec = MaintainedAggregateSpec {
+            filter: None,
             group_by: vec!["name".to_string()],
             aggregates: vec![MaintainedAggregateExpr {
                 function: MaintainedAggregateFunction::Sum,
@@ -2154,6 +2434,181 @@ mod tests {
             "group a = 10 + updated 7 (Int32 widened)"
         );
         assert_eq!(by_name.get("b"), None, "group b fully retracted by delete");
+        Ok(())
+    }
+
+    /// `AVG` over a narrow signed-integer column (Postgres `INTEGER` → arrow
+    /// `Int32`, the common CDC case) must (a) be accepted at registry
+    /// construction and (b) maintain an exact `i128` running sum + count across
+    /// insert, in-place update (retract-then-apply-new), and delete, dividing
+    /// down to the `Float64` AVG output. Mirrors
+    /// [`sum_over_int32_widens_on_insert_and_retract`] for `AvgInt128` — before
+    /// integer support this failed planning with "Avg maintained aggregate does
+    /// not support column type Int32".
+    #[test]
+    fn avg_over_int32_maintains_exactly_on_insert_and_retract() -> DataFusionResult<()> {
+        let i32_schema = Arc::new(Schema::new(vec![
+            Field::new("name", DataType::Utf8, true),
+            Field::new("v", DataType::Int32, true),
+            Field::new("pk", DataType::Int64, true),
+        ]));
+        let i32_batch = |rows: &[(&str, i32, i64)]| {
+            RecordBatch::try_new(
+                Arc::clone(&i32_schema),
+                vec![
+                    Arc::new(StringArray::from(
+                        rows.iter().map(|(n, _, _)| Some(*n)).collect::<Vec<_>>(),
+                    )),
+                    Arc::new(Int32Array::from(
+                        rows.iter().map(|(_, v, _)| *v).collect::<Vec<_>>(),
+                    )),
+                    Arc::new(Int64Array::from(
+                        rows.iter().map(|(_, _, pk)| *pk).collect::<Vec<_>>(),
+                    )),
+                ],
+            )
+            .expect("int32 batch should be valid")
+        };
+
+        let spec = MaintainedAggregateSpec {
+            filter: None,
+            group_by: vec!["name".to_string()],
+            aggregates: vec![MaintainedAggregateExpr {
+                function: MaintainedAggregateFunction::Avg,
+                column: Some("v".to_string()),
+            }],
+        };
+        // PK = column index 2 (`pk`). Construction must succeed for Int32 AVG.
+        let registry =
+            MaintainedAggregateRegistry::try_new_with_pk(&[spec], &i32_schema, &[2], usize::MAX)?;
+
+        registry
+            .apply_insert_batches(1, &[i32_batch(&[("a", 10, 1), ("a", 20, 2), ("b", 5, 3)])])?;
+        // UPDATE pk=2 in place (retract-old-then-apply-new): v 20 -> 7, so
+        // group a averages (10 + 7) / 2 = 8.5.
+        registry.apply_insert_batches(2, &[i32_batch(&[("a", 7, 2)])])?;
+        // DELETE pk=3 via a PK-projected batch (PK = column 2): retracts group b.
+        registry.apply_pk_deletes(3, &i32_batch(&[("", 0, 3)]).project(&[2])?)?;
+
+        // Serve via a real AggregateExec. DataFusion's AVG over an integer column
+        // outputs `Float64`, so the maintained output field is `Float64` too.
+        let input = MemorySourceConfig::try_new_exec(
+            &[vec![i32_batch(&[])]],
+            Arc::clone(&i32_schema),
+            None,
+        )?;
+        let avg_arg = cast(
+            col("v", i32_schema.as_ref())?,
+            i32_schema.as_ref(),
+            DataType::Int64,
+        )?;
+        let avg_v = AggregateExprBuilder::new(avg_udaf(), vec![avg_arg])
+            .schema(Arc::clone(&i32_schema))
+            .alias("avg(v)")
+            .build()
+            .map(Arc::new)?;
+        let aggregate = AggregateExec::try_new(
+            AggregateMode::Single,
+            PhysicalGroupBy::new_single(vec![(
+                col("name", i32_schema.as_ref())?,
+                "name".to_string(),
+            )]),
+            vec![avg_v],
+            vec![None],
+            input,
+            Arc::clone(&i32_schema),
+        )?;
+        let result = registry
+            .batch_for_aggregate(&aggregate, 3)?
+            .expect("registry should be fresh");
+        let names = as_string_array(result.column(0))?;
+        let avgs = as_float64_array(result.column(1))?;
+        let mut by_name = BTreeMap::new();
+        for row in 0..result.num_rows() {
+            if !avgs.is_null(row) {
+                by_name.insert(names.value(row).to_string(), avgs.value(row));
+            }
+        }
+        let avg_a = by_name.get("a").copied().expect("group a present");
+        assert!(
+            (avg_a - 8.5).abs() < 1e-9,
+            "group a = avg(10, updated 7) = 8.5, got {avg_a}"
+        );
+        assert_eq!(by_name.get("b"), None, "group b fully retracted by delete");
+        Ok(())
+    }
+
+    /// The `i128` running sum has the headroom `SumInt64`'s `i64` lacks: two
+    /// `Int64` rows at `i64::MAX` sum to ~1.8e19 (past `i64::MAX`), which would
+    /// overflow a `SUM`, but `AVG` accumulates in `i128` and returns their
+    /// average (`i64::MAX`) as `Float64` without erroring.
+    #[test]
+    fn avg_over_int64_near_max_does_not_overflow() -> DataFusionResult<()> {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("name", DataType::Utf8, true),
+            Field::new("v", DataType::Int64, true),
+            Field::new("pk", DataType::Int64, true),
+        ]));
+        let batch = |rows: &[(&str, i64, i64)]| {
+            RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![
+                    Arc::new(StringArray::from(
+                        rows.iter().map(|(n, _, _)| Some(*n)).collect::<Vec<_>>(),
+                    )),
+                    Arc::new(Int64Array::from(
+                        rows.iter().map(|(_, v, _)| *v).collect::<Vec<_>>(),
+                    )),
+                    Arc::new(Int64Array::from(
+                        rows.iter().map(|(_, _, pk)| *pk).collect::<Vec<_>>(),
+                    )),
+                ],
+            )
+            .expect("int64 batch should be valid")
+        };
+
+        let spec = MaintainedAggregateSpec {
+            filter: None,
+            group_by: vec!["name".to_string()],
+            aggregates: vec![MaintainedAggregateExpr {
+                function: MaintainedAggregateFunction::Avg,
+                column: Some("v".to_string()),
+            }],
+        };
+        let registry =
+            MaintainedAggregateRegistry::try_new_with_pk(&[spec], &schema, &[2], usize::MAX)?;
+        // Sum = 2 * i64::MAX overflows i64 but fits comfortably in i128.
+        registry.apply_insert_batches(1, &[batch(&[("a", i64::MAX, 1), ("a", i64::MAX, 2)])])?;
+
+        let input =
+            MemorySourceConfig::try_new_exec(&[vec![batch(&[])]], Arc::clone(&schema), None)?;
+        let avg_v = AggregateExprBuilder::new(avg_udaf(), vec![col("v", schema.as_ref())?])
+            .schema(Arc::clone(&schema))
+            .alias("avg(v)")
+            .build()
+            .map(Arc::new)?;
+        let aggregate = AggregateExec::try_new(
+            AggregateMode::Single,
+            PhysicalGroupBy::new_single(vec![(col("name", schema.as_ref())?, "name".to_string())]),
+            vec![avg_v],
+            vec![None],
+            input,
+            Arc::clone(&schema),
+        )?;
+        let result = registry
+            .batch_for_aggregate(&aggregate, 1)?
+            .expect("registry should be fresh");
+        let avgs = as_float64_array(result.column(1))?;
+        let avg_a = avgs.value(0);
+        #[expect(
+            clippy::cast_precision_loss,
+            reason = "test-only reference value; avg of two i64::MAX is i64::MAX"
+        )]
+        let expected = i64::MAX as f64;
+        assert!(
+            (avg_a - expected).abs() / expected < 1e-15,
+            "avg of two i64::MAX values is i64::MAX, got {avg_a}"
+        );
         Ok(())
     }
 

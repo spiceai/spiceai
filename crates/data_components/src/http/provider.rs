@@ -1275,10 +1275,19 @@ impl HttpTableProvider {
             .map(|(k, v)| (k.as_str().to_string(), v.to_str().unwrap_or("").to_string()))
             .collect();
 
+        // Reading the response body can fail after a successful status line — connection
+        // reset, read timeout, truncated body, or a decompression error on a partially
+        // received gzip/brotli/zstd stream. These are all transient network conditions an
+        // overloaded or rate-limited upstream produces routinely, so retry them like a failed
+        // send rather than dropping the row on the first hiccup (previously every body-read
+        // failure was classified permanent). Note `reqwest::Error::is_decode()` also fires on a
+        // truncated compressed body, so it is NOT a reliable "permanent" signal; this mirrors
+        // the retriable-error classification in `graphql/mod.rs`, which groups
+        // is_timeout/is_connect/is_body/is_decode together as transient.
         let content = response
             .text()
             .await
-            .map_err(|e| RetryError::permanent(Error::HttpRequest { source: e }))?;
+            .map_err(|e| RetryError::transient(Error::HttpRequest { source: e }))?;
 
         let detected_format = if detected_format.is_empty() {
             let inferred = Self::infer_format_from_content(&content);
@@ -1890,7 +1899,7 @@ impl HttpExec {
             .filter(|f| !nesting.metadata_fields.contains(f.name()))
             .map(|f| f.name().as_str())
             .collect();
-        let catchall_projected = body_field_names.contains(&nesting.json_field_name.as_str());
+        let catchall_projected = body_field_names.contains(&nesting.json_field_name());
 
         // Build body-derived columns via string builders, in projected
         // (not full-schema) order, restricted to non-metadata fields.
@@ -4443,6 +4452,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "hits a live external API (api.tvmaze.com); not deterministic in CI — run with --ignored"]
     async fn test_query_params_any_order_works() {
         use datafusion::prelude::SessionContext;
 
@@ -4489,8 +4499,36 @@ mod tests {
         );
     }
 
-    // Integration tests that make real HTTP requests
-    // These are marked with #[ignore] by default to avoid network dependencies in CI
+    #[test]
+    fn is_retryable_status_covers_5xx_and_429_only() {
+        // 5xx server errors are transient and must be retried.
+        for status in [500_u16, 502, 503, 504, 599] {
+            assert!(
+                HttpTableProvider::is_retryable_status(status),
+                "{status} (5xx) should be retryable"
+            );
+        }
+        // 429 Too Many Requests is retryable (rate limiting).
+        assert!(
+            HttpTableProvider::is_retryable_status(429),
+            "429 should be retryable"
+        );
+        // 2xx/3xx success-ish and 4xx client errors (other than 429) are NOT retried —
+        // they are deterministic responses the caller should see, not transient faults.
+        for status in [200_u16, 204, 301, 400, 401, 403, 404, 410, 422, 600] {
+            assert!(
+                !HttpTableProvider::is_retryable_status(status),
+                "{status} should not be retryable"
+            );
+        }
+    }
+
+    // Integration tests that make real HTTP requests.
+    // These are marked with #[ignore] because they depend on live external services and are
+    // therefore not deterministic in CI; run them explicitly with `cargo test -- --ignored`.
+    // The runtime's resilience against transient upstream failures (timeouts, connection
+    // resets mid-body, 5xx, 429) is exercised in production via the configured retry/backoff
+    // and timeouts; the retry *policy* is unit-tested above without depending on the network.
 
     // Tests for globset pattern matching
     #[test]
@@ -4789,6 +4827,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "hits a live external API (jsonplaceholder.typicode.com); not deterministic in CI — run with --ignored"]
     async fn test_integration_jsonplaceholder_single_post() {
         use datafusion::prelude::SessionContext;
 
@@ -4854,6 +4893,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "hits a live external API (jsonplaceholder.typicode.com); not deterministic in CI — run with --ignored"]
     async fn test_integration_jsonplaceholder_multiple_posts() {
         use datafusion::prelude::SessionContext;
 
@@ -4926,6 +4966,7 @@ mod tests {
         assert!(found_posts[2], "Should have found post 3");
     }
     #[tokio::test]
+    #[ignore = "hits a live external API (jsonplaceholder.typicode.com); not deterministic in CI — run with --ignored"]
     async fn test_integration_jsonplaceholder_all_posts() {
         use datafusion::prelude::SessionContext;
 
@@ -4998,6 +5039,7 @@ mod tests {
         assert!(found_last_post, "Should have found post with id 100");
     }
     #[tokio::test]
+    #[ignore = "hits a live external API (api.tvmaze.com); not deterministic in CI — run with --ignored"]
     async fn test_integration_tvmaze_single_show() {
         use datafusion::prelude::SessionContext;
 
@@ -5057,6 +5099,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "hits a live external API (api.tvmaze.com); not deterministic in CI — run with --ignored"]
     async fn test_integration_tvmaze_404_not_found() {
         use datafusion::prelude::SessionContext;
 
@@ -5110,6 +5153,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "hits a live external API (httpbin.org); not deterministic in CI — run with --ignored"]
     async fn test_integration_httpbin_500_server_error() {
         use datafusion::prelude::SessionContext;
 
@@ -5161,6 +5205,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "hits a live external API (api.tvmaze.com); not deterministic in CI — run with --ignored"]
     async fn test_integration_tvmaze_multiple_shows() {
         use datafusion::prelude::SessionContext;
 
@@ -5238,6 +5283,7 @@ mod tests {
         assert!(found_game_thrones, "Should have found Game of Thrones");
     }
     #[tokio::test]
+    #[ignore = "hits a live external API (api.tvmaze.com); not deterministic in CI — run with --ignored"]
     async fn test_integration_tvmaze_projection() {
         use datafusion::prelude::SessionContext;
 
@@ -5286,6 +5332,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "hits a live external API (api.tvmaze.com); not deterministic in CI — run with --ignored"]
     async fn test_integration_tvmaze_aggregation() {
         use datafusion::prelude::SessionContext;
 
@@ -5364,6 +5411,7 @@ mod tests {
     /// paginate through search results, and `pagination_data_pointer` to extract
     /// the `docs` array from each page.
     #[tokio::test]
+    #[ignore = "hits a live external API (openlibrary.org); not deterministic in CI — run with --ignored"]
     async fn test_integration_openlibrary_query_param_pagination() {
         use datafusion::prelude::SessionContext;
 

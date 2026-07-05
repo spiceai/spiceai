@@ -33,6 +33,13 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio_rustls::{TlsAcceptor, server::TlsStream};
 use tokio_stream::wrappers::TcpListenerStream;
 
+/// Maximum number of TLS handshakes to drive concurrently off the listener.
+/// Generous because handshakes are I/O-bound and cheap to hold; the goal is to
+/// keep the TCP accept queue drained under a connection burst (e.g. a
+/// distributed shuffle where many peers each open dozens of fetch connections
+/// at once).
+const MAX_CONCURRENT_TLS_HANDSHAKES: usize = 1024;
+
 /// Build a stream of accepted+handshaked TLS connections suitable for
 /// `tonic::transport::Server::serve_with_incoming`.
 pub fn tls_incoming(
@@ -42,33 +49,37 @@ pub fn tls_incoming(
     let acceptor = TlsAcceptor::from(server_config);
     let tcp = TcpListenerStream::new(listener);
 
-    // Per-connection TLS handshake. We spawn one task per accept so a slow
-    // handshake from one client does not block accepting the next.
+    // Drive many TLS handshakes concurrently. A burst of incoming connections —
+    // e.g. a distributed shuffle where each reducer opens up to 64 fetch
+    // connections per peer with no client-side pooling — must not back up behind
+    // a single in-flight handshake. The previous implementation spawned a task
+    // per accept but then `join.await`ed each one inline in the stream, which
+    // serialized acceptance: the next TCP connection was not accepted until the
+    // current handshake finished, overflowing the listener accept queue under
+    // load so peers saw `connection reset by peer`. `buffer_unordered` keeps
+    // accepting (draining the backlog) while up to `MAX_CONCURRENT_TLS_HANDSHAKES`
+    // handshakes proceed at once. A failed handshake is logged and dropped —
+    // yielding `Err` would terminate the tonic server.
     let handshakes = tcp
-        .filter_map(move |conn| {
-            let acceptor = acceptor.clone();
-            async move {
-                let stream = match conn {
-                    Ok(s) => s,
-                    Err(e) => {
-                        tracing::debug!("Flight: TCP accept error: {e}");
-                        return None;
-                    }
-                };
-                Some(tokio::spawn(async move { acceptor.accept(stream).await }))
-            }
-        })
-        .filter_map(|join| async move {
-            match join.await {
-                Ok(Ok(tls)) => Some(Ok(tls)),
-                Ok(Err(e)) => {
-                    tracing::debug!("Flight: TLS handshake error: {e}");
-                    // Yielding an `Err` here would terminate the tonic server.
-                    // Drop the bad connection silently instead.
+        .filter_map(|conn| async move {
+            match conn {
+                Ok(stream) => Some(stream),
+                Err(e) => {
+                    tracing::debug!("Flight: TCP accept error: {e}");
                     None
                 }
-                Err(join_err) => {
-                    tracing::debug!("Flight: TLS handshake task panicked: {join_err}");
+            }
+        })
+        .map(move |stream| {
+            let acceptor = acceptor.clone();
+            async move { acceptor.accept(stream).await }
+        })
+        .buffer_unordered(MAX_CONCURRENT_TLS_HANDSHAKES)
+        .filter_map(|res| async move {
+            match res {
+                Ok(tls) => Some(Ok(tls)),
+                Err(e) => {
+                    tracing::debug!("Flight: TLS handshake error: {e}");
                     None
                 }
             }

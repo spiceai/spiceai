@@ -86,11 +86,8 @@ impl TransactionBuffer {
         });
     }
 
-    pub fn push_update(&mut self, _relation: &Relation, new: TupleData) {
-        self.changes.push(DecodedChange {
-            op: ChangeOp::Update,
-            row: new,
-        });
+    pub fn push_update(&mut self, relation: &Relation, old: Option<TupleData>, new: TupleData) {
+        push_update_change(&mut self.changes, relation, old, new);
     }
 
     pub fn push_delete(&mut self, _relation: &Relation, old: TupleData) {
@@ -142,6 +139,49 @@ pub fn merge_unchanged_toast(mut new: TupleData, old: Option<&TupleData>) -> Tup
         }
     }
     new
+}
+
+/// Buffer a pgoutput UPDATE.
+///
+/// A Postgres primary-key update is represented as one UPDATE message with the
+/// old key tuple plus the new row. Accelerators apply `ChangeOp::Update` as an
+/// upsert keyed by the new primary key, so a primary-key change must also emit a
+/// delete for the old key; otherwise the old accelerated row is orphaned.
+pub fn push_update_change(
+    changes: &mut Vec<DecodedChange>,
+    relation: &Relation,
+    old: Option<TupleData>,
+    new: TupleData,
+) {
+    let new = merge_unchanged_toast(new, old.as_ref());
+    let key_changed = old
+        .as_ref()
+        .is_some_and(|old| primary_key_changed(relation, old, &new));
+
+    if key_changed && let Some(old) = old {
+        changes.push(DecodedChange {
+            op: ChangeOp::Delete,
+            row: old,
+        });
+    }
+
+    changes.push(DecodedChange {
+        op: ChangeOp::Update,
+        row: new,
+    });
+}
+
+fn primary_key_changed(relation: &Relation, old: &TupleData, new: &TupleData) -> bool {
+    relation
+        .columns
+        .iter()
+        .enumerate()
+        .filter(|(_, column)| column.is_key)
+        .any(|(idx, _)| {
+            let old_value = old.columns.get(idx).and_then(Option::as_ref);
+            let new_value = new.columns.get(idx).and_then(Option::as_ref);
+            old_value.is_some() && new_value.is_some() && old_value != new_value
+        })
 }
 
 /// Build a `ChangeBatch` from a list of decoded changes, typing the `data`
@@ -1315,6 +1355,63 @@ mod tests {
             assert_eq!(id_value(&batch, 0), 1);
             assert!(!name_is_null(&batch, 0));
         }
+    }
+
+    #[test]
+    fn push_update_change_keeps_non_pk_update_as_single_upsert() {
+        let relation = make_relation();
+        let mut changes = Vec::new();
+        push_update_change(
+            &mut changes,
+            &relation,
+            Some(tuple_for("1", Some("Old"))),
+            tuple_for("1", Some("Updated")),
+        );
+
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].op, ChangeOp::Update);
+        assert_eq!(changes[0].row.columns[0], Some(PgValue::Text("1".into())));
+    }
+
+    #[test]
+    fn push_update_change_emits_old_key_delete_for_pk_update() {
+        let relation = make_relation();
+        let mut changes = Vec::new();
+        push_update_change(
+            &mut changes,
+            &relation,
+            Some(tuple_for("1", None)),
+            tuple_for("1001", Some("Updated")),
+        );
+
+        assert_eq!(changes.len(), 2);
+        assert_eq!(changes[0].op, ChangeOp::Delete);
+        assert_eq!(changes[0].row.columns[0], Some(PgValue::Text("1".into())));
+        assert_eq!(changes[1].op, ChangeOp::Update);
+        assert_eq!(
+            changes[1].row.columns[0],
+            Some(PgValue::Text("1001".into()))
+        );
+    }
+
+    #[test]
+    fn primary_key_update_change_batch_is_delete_then_update() {
+        let schema = non_nullable_users_schema();
+        let relation = make_relation();
+        let mut changes = Vec::new();
+        push_update_change(
+            &mut changes,
+            &relation,
+            Some(tuple_for("1", None)),
+            tuple_for("1001", Some("Updated")),
+        );
+
+        let batch = build_change_batch(&schema, &relation, &changes).expect("build");
+        assert_op_column(&batch, &["d", "u"]);
+        assert_eq!(id_value(&batch, 0), 1);
+        assert_eq!(id_value(&batch, 1), 1001);
+        assert!(name_is_null(&batch, 0));
+        assert!(!name_is_null(&batch, 1));
     }
 
     #[test]

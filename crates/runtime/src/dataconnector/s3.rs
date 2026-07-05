@@ -108,6 +108,22 @@ pub struct S3 {
     pub(crate) tokio_io_runtime: tokio::runtime::Handle,
 }
 
+impl S3 {
+    /// Creates a new `S3` connector with the given parameters, runtime, and I/O runtime handle.
+    #[must_use]
+    pub fn new(
+        params: Parameters,
+        runtime: Option<Runtime>,
+        tokio_io_runtime: tokio::runtime::Handle,
+    ) -> Self {
+        Self {
+            params,
+            runtime,
+            tokio_io_runtime,
+        }
+    }
+}
+
 impl std::fmt::Debug for S3 {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "S3(params: {:?})", self.params)
@@ -129,9 +145,9 @@ impl S3Factory {
     }
 }
 
-pub(crate) const S3_DOCS: &str = "https://spiceai.org/docs/components/data-connectors/s3";
+pub const S3_DOCS: &str = "https://spiceai.org/docs/components/data-connectors/s3";
 
-pub(crate) static PARAMETERS: LazyLock<Vec<ParameterSpec>> = LazyLock::new(|| {
+pub static PARAMETERS: LazyLock<Vec<ParameterSpec>> = LazyLock::new(|| {
     let mut all_parameters = Vec::new();
     all_parameters.extend_from_slice(&[
             ParameterSpec::component("region")

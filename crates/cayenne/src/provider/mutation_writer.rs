@@ -78,13 +78,12 @@ use parking_lot::Mutex as ParkingMutex;
 use tokio::sync::OwnedMutexGuard;
 
 use super::Result;
+use super::column_stats::ColumnStatsAccumulator;
 use super::context::CayenneContext;
 use super::mem_tier_budget;
+use super::on_conflict::{PostValidationState, PreparedShardedInsertStream};
 use super::staging_wal::{CayenneStagedAppend, PreparedStagedAppend, StagingWalTargetKind};
-use super::table::{
-    CayenneCdcWrite, CayenneTableProvider, ColumnStatsAccumulator, PostValidationState,
-    PreparedShardedInsertStream, record_cayenne_write_phase,
-};
+use super::table::{CayenneCdcWrite, CayenneTableProvider, record_cayenne_write_phase};
 
 /// Record METRIC 4 (`cayenne_cdc_burst_rows` / `cayenne_cdc_burst_bytes`) for one
 /// prepared CDC batch at the staged/inlined write entry, labeled by table. The
@@ -1424,6 +1423,42 @@ impl<'a> AppendMutationWriter<'a> {
             .staging_may_have_files()
             .store(true, Ordering::Release);
 
+        // IVM staged capture (Edit B): when the table has a retraction-capable
+        // maintained aggregate, buffer the insert batches and re-stream them into
+        // the encoder unchanged; the buffer feeds the registry incrementally at
+        // publish (attached to the receipt below). Non-IVM / non-retraction tables
+        // (the common case) stream straight through at zero cost. The Stage-A
+        // buffer is accepted for the prototype (the only staged IVM table is a
+        // small rollup); a large staged IVM table needs deferred two-phase capture.
+        let (stream, ivm_captured): (SendableRecordBatchStream, Option<Arc<Vec<RecordBatch>>>) =
+            if self.table.should_capture_staged_ivm_feed() {
+                let schema = stream.schema();
+                let mut buffered: Vec<RecordBatch> = Vec::new();
+                let mut src = stream;
+                while let Some(batch) = src.next().await {
+                    buffered.push(batch.map_err(|e| super::Error::Internal {
+                        table: self.table.table_name().to_string(),
+                        message: format!("IVM staged capture failed to read a batch: {e}"),
+                    })?);
+                }
+                // Share ONE backing buffer between the re-stream and the publish
+                // receipt: `RecordBatch` is cheaply clonable (it shares the
+                // underlying Arrow buffers), so the encoder re-stream clones each
+                // batch lazily off the shared `Arc<Vec<_>>` rather than duplicating
+                // the whole `Vec`.
+                let captured = Arc::new(buffered);
+                let stream_batches = Arc::clone(&captured);
+                let restream: SendableRecordBatchStream = Box::pin(RecordBatchStreamAdapter::new(
+                    schema,
+                    futures::stream::iter((0..stream_batches.len()).map(move |i| {
+                        Ok::<_, datafusion::error::DataFusionError>(stream_batches[i].clone())
+                    })),
+                ));
+                (restream, Some(captured))
+            } else {
+                (stream, None)
+            };
+
         let write_start = Instant::now();
         let (rows, writer_ops, stats_acc) = match self
             .table
@@ -1466,7 +1501,7 @@ impl<'a> AppendMutationWriter<'a> {
             rows,
         );
         let prepare_start = Instant::now();
-        let prepared_append = match staged_append.prepare().await {
+        let mut prepared_append = match staged_append.prepare().await {
             Ok(prepared_append) => prepared_append,
             Err(e) => {
                 if let Err(cleanup_err) = self
@@ -1483,6 +1518,11 @@ impl<'a> AppendMutationWriter<'a> {
             }
         };
         record_cayenne_write_phase(self.table.table_name(), "stage_wal_prepare", prepare_start);
+
+        // Hand the captured insert batches to the receipt so the staged publish
+        // (apply_under_barrier / apply_under_held_barrier) feeds the maintained-
+        // aggregate registry under the held listing fence.
+        prepared_append.set_ivm_feed_batches(ivm_captured);
 
         Ok((rows, writer_ops, stats_acc, prepared_append))
     }

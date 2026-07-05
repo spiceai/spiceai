@@ -24,6 +24,7 @@ use crate::component::dataset::acceleration::{Engine, RefreshMode};
 use crate::component::dataset::{Dataset, OnSchemaChange};
 use crate::component::metrics::MetricsProvider;
 use crate::dataaccelerator::spice_sys::{self, OpenOption, debezium_kafka::DebeziumKafkaSys};
+use crate::dataconnector::schema_projection::{ProjectionPolicy, parse_schema_projection};
 use crate::dataconnector::{
     ConnectorComponent,
     kafka::{SidecarOffsetCommitHook, SidecarOffsetStore},
@@ -138,6 +139,21 @@ impl Debezium {
                 .expose()
                 .ok()
                 .map(ToString::to_string),
+            ssl_certificate_location: params
+                .get("kafka_ssl_certificate_location")
+                .expose()
+                .ok()
+                .map(ToString::to_string),
+            ssl_key_location: params
+                .get("kafka_ssl_key_location")
+                .expose()
+                .ok()
+                .map(ToString::to_string),
+            ssl_key_password: params
+                .get("kafka_ssl_key_password")
+                .expose()
+                .ok()
+                .map(ToString::to_string),
             enable_ssl_certificate_verification: params
                 .get("kafka_enable_ssl_certificate_verification")
                 .expose()
@@ -240,6 +256,15 @@ const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::runtime("kafka_ssl_ca_location")
         .secret()
         .description("Path to the SSL/TLS CA certificate file for server verification."),
+    ParameterSpec::runtime("kafka_ssl_certificate_location")
+        .secret()
+        .description("Path to the client SSL/TLS certificate file for mTLS authentication."),
+    ParameterSpec::runtime("kafka_ssl_key_location")
+        .secret()
+        .description("Path to the client SSL/TLS private key file for mTLS authentication."),
+    ParameterSpec::runtime("kafka_ssl_key_password")
+        .secret()
+        .description("Password for the client SSL/TLS private key, if encrypted."),
     ParameterSpec::runtime("kafka_enable_ssl_certificate_verification")
         .default("true")
         .description("Enable SSL/TLS certificate verification. Default: 'true'."),
@@ -463,6 +488,18 @@ impl DataConnector for Debezium {
             }
         };
 
+        // JSON-nesting / declared-schema projection. Primary-key (Kafka key)
+        // columns must be declared explicitly — never folded into the catch-all
+        // — so CDC UPDATE/DELETE apply keeps working.
+        let projection = parse_schema_projection(
+            dataset,
+            &ProjectionPolicy::new("debezium").with_required_columns(metadata.primary_keys.clone()),
+        )?;
+        let schema = match &projection {
+            Some(p) => p.project_schema(schema),
+            None => schema,
+        };
+
         ensure!(
             !metadata.primary_keys.is_empty()
                 || matches!(acceleration.engine.to_unpartitioned(), Engine::Arrow),
@@ -511,6 +548,7 @@ impl DataConnector for Debezium {
             metadata.primary_keys,
             kafka_consumer,
             self.batching,
+            projection,
         );
 
         if let Some(debezium_kafka_sys) = debezium_kafka_sys {
