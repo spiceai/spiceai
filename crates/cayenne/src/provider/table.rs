@@ -25360,7 +25360,7 @@ mod tests {
     }
 
     /// N>1 ALL-SHARDS seal: a seal captures EVERY shard's active piece
-    /// all-shards-atomically (write_lock + publish locks), durably shadows the
+    /// all-shards-atomically (`write_lock` + publish locks), durably shadows the
     /// cross-shard union as ONE inline BLOB, and advances the slot to the MAX
     /// apply-epoch across shards. Reads are preserved, and a crash before any bake
     /// recovers every row from the shadow (no loss) — across all 4 shards. This is
@@ -25425,6 +25425,296 @@ mod tests {
             collect_id_value_pairs(&ctx, &reopened, "seal_all_shards").await,
             before,
             "every row across all 4 shards survives a crash (recovered from the shadow) — no loss"
+        );
+    }
+
+    /// A sealed tombstone that hides a DURABLE (file-backed) row must survive a
+    /// subsequent BAKE and a restart — no resurrection AND no double count. This
+    /// covers the interaction my crash-only delete test does not: the bake
+    /// re-flushes the tier (rows + tombstone) to Vortex, clears RAM, and deletes
+    /// the shadow, so the deleted key must stay hidden through all of it.
+    #[tokio::test]
+    async fn mem_tier_seal_delete_survives_bake_and_recovery() {
+        let runtime_env = SessionContext::new().runtime_env();
+        let (provider, catalog, _tmp) =
+            create_memory_mode_upsert_table("seal_del_bake", Arc::clone(&runtime_env)).await;
+        provider.install_slot_advancer(Arc::new(EpochRecorder(Arc::new(
+            std::sync::atomic::AtomicU64::new(0),
+        ))));
+        let no_deletions = OnConflictDeletions::default();
+
+        // Seed [1,2,3] durable via a bake.
+        let seed = int64_id_batch(&[1, 2, 3]);
+        let seed_bytes = seed.get_array_memory_size() as u64;
+        provider
+            .append_to_mem_tier(vec![seed], &no_deletions, seed_bytes, 0)
+            .await
+            .expect("seed append");
+        provider.checkpoint_mem_tier().await.expect("seed bake");
+        assert_eq!(scan_sorted_ids(&provider).await, vec![1, 2, 3]);
+
+        // Delete the DURABLE key 2 and SEAL the tombstone (durable delete-vector).
+        provider
+            .write_cdc_delete_keys_in_memory(&int64_id_batch(&[2]))
+            .await
+            .expect("delete")
+            .expect("absorbed");
+        provider.seal_mem_tier_durable().await.expect("seal delete");
+        assert_eq!(scan_sorted_ids(&provider).await, vec![1, 3]);
+
+        // Append more, then BAKE the whole tier (inserts + the tombstone) → Vortex,
+        // clear RAM, delete the shadow.
+        let more = int64_id_batch(&[4, 5]);
+        let more_bytes = more.get_array_memory_size() as u64;
+        provider
+            .append_to_mem_tier(vec![more], &no_deletions, more_bytes, 0)
+            .await
+            .expect("append 4,5");
+        provider.checkpoint_mem_tier().await.expect("bake");
+        assert_eq!(
+            scan_sorted_ids(&provider).await,
+            vec![1, 3, 4, 5],
+            "the bake preserves the sealed delete and does not double-count"
+        );
+
+        // CRASH → reopen: key 2 stays hidden through bake + restart.
+        drop(provider);
+        let reopened = CayenneTableProviderBuilder::new(catalog, runtime_env)
+            .open("seal_del_bake")
+            .await
+            .expect("reopen");
+        assert_eq!(
+            scan_sorted_ids(&reopened).await,
+            vec![1, 3, 4, 5],
+            "the sealed delete survives bake + restart — no resurrection, no double count"
+        );
+    }
+
+    /// MANY seals accumulate durable shadows in the inline corpus; a crash before
+    /// any bake must recover EVERY sealed piece — no loss, no double count.
+    #[tokio::test]
+    async fn mem_tier_multiple_seals_accumulate_then_recover() {
+        let runtime_env = SessionContext::new().runtime_env();
+        let (provider, catalog, _tmp) =
+            create_memory_mode_upsert_table("multi_seal", Arc::clone(&runtime_env)).await;
+        provider.install_slot_advancer(Arc::new(EpochRecorder(Arc::new(
+            std::sync::atomic::AtomicU64::new(0),
+        ))));
+        let no_deletions = OnConflictDeletions::default();
+
+        // Three append+seal cycles (accumulating shadows, NO bake between them).
+        for chunk in [vec![1_i64, 2, 3], vec![4, 5], vec![6, 7]] {
+            let batch = int64_id_batch(&chunk);
+            let bytes = batch.get_array_memory_size() as u64;
+            provider
+                .append_to_mem_tier(vec![batch], &no_deletions, bytes, 0)
+                .await
+                .expect("append");
+            provider.seal_mem_tier_durable().await.expect("seal");
+        }
+        assert_eq!(scan_sorted_ids(&provider).await, vec![1, 2, 3, 4, 5, 6, 7]);
+
+        // CRASH → reopen: all three accumulated shadows recover.
+        drop(provider);
+        let reopened = CayenneTableProviderBuilder::new(catalog, runtime_env)
+            .open("multi_seal")
+            .await
+            .expect("reopen");
+        assert_eq!(
+            scan_sorted_ids(&reopened).await,
+            vec![1, 2, 3, 4, 5, 6, 7],
+            "every accumulated seal shadow recovers — no loss, no double count"
+        );
+    }
+
+    /// UPSERT supersession through a seal: an upsert of a DURABLE key writes the new
+    /// row to the shadow and a tombstone hiding the old durable row; after a crash
+    /// the NEW value must win (no resurrection of the old value, no double count).
+    #[tokio::test]
+    async fn mem_tier_seal_upsert_supersede_recovers_new_value() {
+        let ctx = SessionContext::new();
+        let runtime_env = ctx.runtime_env();
+        let (provider, catalog, _tmp) =
+            create_sharded_cdc_upsert_table("seal_upsert", Arc::clone(&runtime_env), 1).await;
+        let schema = Arc::clone(&provider.table_metadata.schema);
+
+        // Seed and bake to a durable file.
+        apply_upsert_burst(
+            &ctx,
+            &provider,
+            Arc::clone(&schema),
+            &[(1, 10), (2, 20), (3, 30)],
+        )
+        .await;
+        provider.checkpoint_mem_tier().await.expect("seed bake");
+        // Upsert key 2 to a NEW value, superseding the durable (2,20).
+        apply_upsert_burst(&ctx, &provider, Arc::clone(&schema), &[(2, 25)]).await;
+        provider.seal_mem_tier_durable().await.expect("seal upsert");
+        let mut before = collect_id_value_pairs(&ctx, &provider, "seal_upsert").await;
+        before.sort_unstable();
+        assert_eq!(
+            before,
+            vec![(1, 10), (2, 25), (3, 30)],
+            "new value wins live"
+        );
+
+        // CRASH → reopen: key 2 = 25 (new), not 20 (old durable).
+        drop(provider);
+        let reopened = CayenneTableProviderBuilder::new(catalog, runtime_env)
+            .open("seal_upsert")
+            .await
+            .expect("reopen");
+        let mut after = collect_id_value_pairs(&ctx, &reopened, "seal_upsert").await;
+        after.sort_unstable();
+        assert_eq!(
+            after,
+            vec![(1, 10), (2, 25), (3, 30)],
+            "upsert supersession survives seal + restart — new value wins, no resurrection"
+        );
+    }
+
+    /// N>1 cross-shard file-hiding tombstones: supersede several DURABLE keys that
+    /// hash to different shards, seal all shards, crash, and reopen. The
+    /// cross-shard tombstone UNION must be durable so the superseded values win
+    /// across every shard (no resurrection of the old durable values).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn mem_tier_seal_all_shards_supersede_durable_recovers() {
+        let ctx = SessionContext::new();
+        let runtime_env = ctx.runtime_env();
+        let (provider, catalog, _tmp) =
+            create_sharded_cdc_upsert_table("seal_shard_super", Arc::clone(&runtime_env), 4).await;
+        let schema = Arc::clone(&provider.table_metadata.schema);
+
+        // Seed 8 keys across shards, bake to a durable file.
+        apply_upsert_burst(
+            &ctx,
+            &provider,
+            Arc::clone(&schema),
+            &[
+                (1, 10),
+                (2, 20),
+                (3, 30),
+                (4, 40),
+                (5, 50),
+                (6, 60),
+                (7, 70),
+                (8, 80),
+            ],
+        )
+        .await;
+        provider.checkpoint_mem_tier().await.expect("seed bake");
+
+        // Supersede keys 2,5,8 (distinct shards) → cross-shard file-hiding tombstones.
+        apply_upsert_burst(
+            &ctx,
+            &provider,
+            Arc::clone(&schema),
+            &[(2, 25), (5, 55), (8, 85)],
+        )
+        .await;
+        provider
+            .seal_mem_tier_durable()
+            .await
+            .expect("all-shards seal with tombstones");
+        let expected = vec![
+            (1, 10),
+            (2, 25),
+            (3, 30),
+            (4, 40),
+            (5, 55),
+            (6, 60),
+            (7, 70),
+            (8, 85),
+        ];
+        let mut before = collect_id_value_pairs(&ctx, &provider, "seal_shard_super").await;
+        before.sort_unstable();
+        assert_eq!(before, expected, "superseded values win live across shards");
+
+        // CRASH → reopen: superseded values win (no resurrection of old durable rows).
+        drop(provider);
+        let reopened = CayenneTableProviderBuilder::new(catalog, runtime_env)
+            .open("seal_shard_super")
+            .await
+            .expect("reopen");
+        let mut after = collect_id_value_pairs(&ctx, &reopened, "seal_shard_super").await;
+        after.sort_unstable();
+        assert_eq!(
+            after, expected,
+            "cross-shard file-hiding tombstones survive seal + restart — superseded values win, no resurrection"
+        );
+    }
+
+    /// Replay `applies` through a fresh N==1 memory-mode upsert table, sealing after
+    /// every `seal_every` applies (0 = never seal). When `crash_before_final` is set,
+    /// a FINAL seal makes the whole tail durable, then the table is dropped and
+    /// reopened (proving the whole converged view is recoverable from the shadows);
+    /// otherwise it is scanned live. Returns the sorted converged `(id, value)` view.
+    async fn replay_with_seals(
+        table: &str,
+        applies: &[Vec<(i64, i64)>],
+        seal_every: usize,
+        crash_before_final: bool,
+    ) -> Vec<(i64, i64)> {
+        let ctx = SessionContext::new();
+        let runtime_env = ctx.runtime_env();
+        let (provider, catalog, _tmp) =
+            create_sharded_cdc_upsert_table(table, Arc::clone(&runtime_env), 1).await;
+        let schema = Arc::clone(&provider.table_metadata.schema);
+        for (i, burst) in applies.iter().enumerate() {
+            apply_upsert_burst(&ctx, &provider, Arc::clone(&schema), burst).await;
+            if seal_every > 0 && (i + 1) % seal_every == 0 {
+                provider
+                    .seal_mem_tier_durable()
+                    .await
+                    .expect("periodic seal");
+            }
+        }
+        let provider = if crash_before_final {
+            // Seal the un-sealed tail so EVERYTHING is durable, then crash + reopen.
+            provider.seal_mem_tier_durable().await.expect("final seal");
+            drop(provider);
+            CayenneTableProviderBuilder::new(catalog, runtime_env)
+                .open(table)
+                .await
+                .expect("reopen")
+        } else {
+            provider
+        };
+        let mut result = collect_id_value_pairs(&ctx, &provider, table).await;
+        result.sort_unstable();
+        result
+    }
+
+    /// HEADLINE PROPERTY — seals are TRANSPARENT to the converged result. The SAME
+    /// random `(pk, version)` apply schedule, replayed (a) with NO seals, (b) with
+    /// periodic seals, and (c) with periodic seals + a crash-and-reopen, must all
+    /// converge to the IDENTICAL last-writer-wins view. This exercises inserts,
+    /// repeated-key upserts (LWW supersession → file/shadow-hiding tombstones), the
+    /// unpublished inline shadow, and crash recovery over a non-trivial schedule.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn seal_is_transparent_to_the_converged_result() {
+        let applies = random_pk_version_applies();
+
+        // Reference: never seal, scanned live from RAM (the pre-seal behavior).
+        let reference = replay_with_seals("seal_eq_ref", &applies, 0, false).await;
+        assert!(
+            !reference.is_empty(),
+            "the reference replay produced a non-trivial converged view"
+        );
+
+        // Periodic seals, scanned live — must not change the converged view.
+        let sealed_live = replay_with_seals("seal_eq_live", &applies, 5, false).await;
+        assert_eq!(
+            sealed_live, reference,
+            "interleaved seals do not change the live converged result"
+        );
+
+        // Periodic seals + a crash before the final scan — the shadows must recover
+        // the EXACT converged view (no loss, no double count, no resurrection).
+        let sealed_recovered = replay_with_seals("seal_eq_recover", &applies, 5, true).await;
+        assert_eq!(
+            sealed_recovered, reference,
+            "seals + crash-recovery converge to the identical result — durability without corruption"
         );
     }
 
