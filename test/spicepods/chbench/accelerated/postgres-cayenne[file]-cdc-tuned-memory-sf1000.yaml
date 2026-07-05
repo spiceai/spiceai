@@ -87,8 +87,8 @@ datasets:
         cayenne_compaction_trigger_snapshot_age_ms: '15000'
         cayenne_compaction_max_files_per_pick: '64'
         cayenne_compaction_background_interval_ms: '3000'
-        cdc_max_coalesce_age_ms: '3000'
-        cdc_max_coalesced_bytes: '536870912' # 512 MB
+        cdc_max_coalesce_age_ms: '5000'
+        cdc_max_coalesced_bytes: '1073741824' # 1 GB
 
   - from: postgres:customer
     name: customer
