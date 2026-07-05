@@ -290,7 +290,9 @@ fn retract_batch(pk_start: i64, count: usize, groups: usize, rng: &mut Rng) -> R
     let group_count = groups.max(1) as i64;
     let pk: Vec<i64> = (0..count as i64).map(|i| pk_start + i).collect();
     let group: Vec<i64> = pk.iter().map(|p| p % group_count).collect();
-    let value: Vec<i64> = (0..count).map(|_| (rng.below(2001) as i64) - 1000).collect();
+    let value: Vec<i64> = (0..count)
+        .map(|_| (rng.below(2001) as i64) - 1000)
+        .collect();
     RecordBatch::try_new(
         retract_schema(),
         vec![
@@ -438,9 +440,13 @@ fn bench_recompute_vs_serve(c: &mut Criterion) {
             .map_or(THREAD_COUNT, std::num::NonZeroUsize::get)
             .min(THREAD_COUNT);
 
-        group.bench_with_input(BenchmarkId::new("recompute_1thread", rows), &rows, |b, _| {
-            b.iter(|| black_box(recompute(&base).len()));
-        });
+        group.bench_with_input(
+            BenchmarkId::new("recompute_1thread", rows),
+            &rows,
+            |b, _| {
+                b.iter(|| black_box(recompute(&base).len()));
+            },
+        );
         group.bench_with_input(
             BenchmarkId::new(format!("recompute_{thread_count}thread"), rows),
             &rows,

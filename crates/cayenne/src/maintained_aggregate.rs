@@ -2652,7 +2652,12 @@ mod tests {
         // group b: i = {7(pk4)}                    -> min 7, max 7.
         registry.apply_insert_batches(
             1,
-            &[group_batch(&[("a", 1, 10), ("a", 2, 20), ("a", 3, 5), ("b", 4, 7)])],
+            &[group_batch(&[
+                ("a", 1, 10),
+                ("a", 2, 20),
+                ("a", 3, 5),
+                ("b", 4, 7),
+            ])],
         )?;
         let (min, max) = min_max_by_name(&registry)?;
         assert_eq!(min.get("a"), Some(&5));
@@ -2706,7 +2711,9 @@ mod tests {
                 ])),
                 Arc::new(Int64Array::from(vec![None, Some(3_i64), None, None])),
                 Arc::new(UInt64Array::from(vec![1_u64, 2, 3, 4])),
-                Arc::new(Float64Array::from(vec![None, None, None, None] as Vec<Option<f64>>)),
+                Arc::new(Float64Array::from(
+                    vec![None, None, None, None] as Vec<Option<f64>>
+                )),
             ],
         )
         .expect("null-i batch should be valid");
@@ -2803,11 +2810,19 @@ mod tests {
 
         // Delete pk2 (ts=300, current MAX) -> MAX exposes the next-latest, 200.
         registry.apply_pk_deletes(2, &ts_batch(&[(0, 2)]).project(&[2])?)?;
-        assert_eq!(serve(2)?, (100, 200), "MAX exposes the next-latest timestamp");
+        assert_eq!(
+            serve(2)?,
+            (100, 200),
+            "MAX exposes the next-latest timestamp"
+        );
 
         // Delete pk1 (ts=100, current MIN) -> MIN exposes the next-earliest, 200.
         registry.apply_pk_deletes(3, &ts_batch(&[(0, 1)]).project(&[2])?)?;
-        assert_eq!(serve(3)?, (200, 200), "MIN exposes the next-earliest timestamp");
+        assert_eq!(
+            serve(3)?,
+            (200, 200),
+            "MIN exposes the next-earliest timestamp"
+        );
         Ok(())
     }
 
@@ -2896,7 +2911,11 @@ mod tests {
         // Delete pk4 (-0.50, current MIN) -> MIN falls back to 1.50; the dup (pk1,pk3)
         // keeps the value 150 present with count 2, so the group stays non-empty.
         registry.apply_pk_deletes(3, &dec_batch(&[(0, 4)]).project(&[2])?)?;
-        assert_eq!(serve(3)?, (150, 150), "MIN exposes the next-smallest amount");
+        assert_eq!(
+            serve(3)?,
+            (150, 150),
+            "MIN exposes the next-smallest amount"
+        );
         Ok(())
     }
 
