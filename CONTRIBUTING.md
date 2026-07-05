@@ -125,6 +125,12 @@ spice run
 sudo apt update
 sudo apt install build-essential curl openssl libssl-dev pkg-config protobuf-compiler cmake
 
+# On arm64 (aarch64) also install clang and lld — the build uses the clang/lld
+# linker for aarch64 targets (see .cargo/config.toml), and omitting them fails
+# with `clang: error: invalid linker name in argument '-fuse-ld=lld'`.
+# See docs/DISTRIBUTIONS.md ("Linux arm64 Notes") for details.
+sudo apt install clang lld
+
 # Install Rust
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y # install unattended
 source $HOME/.cargo/env
