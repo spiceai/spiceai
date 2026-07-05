@@ -117,6 +117,8 @@ pub(crate) const CLUSTER_GRPC_RUNTIME_PARAMS: &[&str] = &[
 /// for the request timeout, which gaps the `poll_work`-carried heartbeat and
 /// flaps the executor.
 #[derive(Debug, Clone, PartialEq, Eq)]
+// Every field is a duration in seconds; the shared `_seconds` postfix names the unit.
+#[allow(clippy::struct_field_names)]
 struct ClusterGrpcClientConfig {
     /// HTTP/2 keep-alive ping interval, in seconds.
     http2_keep_alive_interval_seconds: u64,
@@ -303,11 +305,12 @@ fn spawn_scheduler_poll_loop(
     readiness_sender: Arc<Mutex<Option<oneshot::Sender<String>>>>,
     poll_now_notify: Option<Arc<Notify>>,
     available_task_slots: Arc<tokio::sync::Semaphore>,
-    grpc_client: ClusterGrpcClientConfig,
+    grpc_client: &ClusterGrpcClientConfig,
 ) -> SchedulerPollHandle {
     let cancel = CancellationToken::new();
     let token = cancel.clone();
     let tls_enabled = client_tls_config.is_some();
+    let grpc_client = grpc_client.clone();
 
     let task = tokio::spawn(async move {
         let mut backoff = FibonacciBackoffBuilder::new()
@@ -503,7 +506,7 @@ async fn fetch_scheduler_membership(
 /// the running job. Polling a genuinely-dead scheduler for the grace period is
 /// harmless (the poll fails and backs off), so err on the side of keeping the
 /// poller alive.
-const SCHEDULER_POLLER_REMOVAL_GRACE: Duration = Duration::from_secs(60);
+const SCHEDULER_POLLER_REMOVAL_GRACE: Duration = Duration::from_mins(1);
 
 #[expect(clippy::too_many_arguments)]
 fn update_scheduler_pollers(
@@ -562,7 +565,7 @@ fn update_scheduler_pollers(
             Arc::clone(readiness_sender),
             poll_now_notify.cloned(),
             Arc::clone(available_task_slots),
-            grpc_client.clone(),
+            grpc_client,
         );
         pollers.insert(address, handle);
     }
