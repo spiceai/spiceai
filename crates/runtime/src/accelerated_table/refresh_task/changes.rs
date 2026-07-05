@@ -1367,20 +1367,6 @@ impl RefreshTask {
             .record(u64::try_from(burst_bytes).unwrap_or(u64::MAX), &labels);
         metrics::CDC_APPLY_BURST_ROWS_TOTAL.add(burst_rows, &labels);
 
-        // Freshest upstream commit timestamp in this burst, for the CDC
-        // replication-lag gauge. Computed here (before the burst is consumed by the
-        // apply loop below) but RECORDED only after the burst's Ok runs apply
-        // successfully — the gauge reflects APPLIED data, so a failed apply must not
-        // report artificially fresh lag. `source_commit_ts_ms` is stamped by the
-        // source connector (Postgres commit time, MongoDB change-stream cluster
-        // time, Debezium source ts); the max over the burst is the most recent.
-        // Sources that don't stamp a timestamp leave it `None`.
-        let max_commit_ts_ms = burst
-            .iter()
-            .filter_map(|item| item.as_ref().ok())
-            .filter_map(|env| env.change_batch.source_commit_ts_ms())
-            .max();
-
         // Walk the burst preserving arrival order, processing contiguous
         // runs of Ok envelopes together and Err items individually so error
         // handling and ordering semantics match the pre-coalesce behavior.
@@ -1422,20 +1408,6 @@ impl RefreshTask {
             }
         }
         metrics::CDC_APPLY_BURST_DURATION_MS.record(elapsed_ms(burst_start), &labels);
-
-        // Record CDC progress only now that the burst's Ok runs have applied (the
-        // early `return false` above skips it, so a failed apply never reports fresh
-        // progress). The raw applied-commit watermark is emitted whenever the burst
-        // carried a source timestamp; the derived lag additionally needs a readable
-        // wall clock (skipped on pre-epoch / overflow rather than reporting a
-        // misleading 0ms).
-        if let Some(max_commit_ts_ms) = max_commit_ts_ms {
-            metrics::CDC_APPLIED_COMMIT_UNIX_TIME_MS.record(max_commit_ts_ms, &labels);
-            if let Some(now_ms) = util::time::system_time_to_unix_ms(std::time::SystemTime::now()) {
-                metrics::CDC_REPLICATION_LAG_MS
-                    .record(now_ms.saturating_sub(max_commit_ts_ms).max(0), &labels);
-            }
-        }
         true
     }
 

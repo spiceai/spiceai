@@ -1939,20 +1939,32 @@ fn write_to_json_value_with_arrow(
 fn write_to_json_bytes_with_arrow(
     data: &[RecordBatch],
 ) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
-    let buf = Vec::new();
-    let mut writer = arrow_json::WriterBuilder::new()
-        .with_explicit_nulls(true)
-        .build::<_, JsonArray>(buf);
-
+    let mut writer = json_array_writer();
     writer.write_batches(data.iter().collect::<Vec<&RecordBatch>>().as_slice())?;
     writer.finish()?;
 
     Ok(writer.into_inner())
 }
 
+/// Creates a JSON-array writer over an owned buffer, using the same encoding as
+/// buffered responses. The buffer can be drained incrementally via
+/// `writer.get_mut()` to stream the array batch-by-batch (see the HTTP `/v1/sql`
+/// streaming path).
+pub(crate) fn json_array_writer() -> arrow_json::Writer<Vec<u8>, JsonArray> {
+    arrow_json::WriterBuilder::new()
+        .with_explicit_nulls(true)
+        .build::<Vec<u8>, JsonArray>(Vec::new())
+}
+
 fn record_batch_has_union_columns(batch: &RecordBatch) -> bool {
-    batch
-        .schema()
+    schema_has_union_columns(&batch.schema())
+}
+
+/// Returns `true` when any (possibly nested) field in `schema` is a union type.
+/// Union columns aren't rendered by the arrow-json array writer, so responses
+/// containing them fall back to the buffered JSON path.
+pub(crate) fn schema_has_union_columns(schema: &arrow::datatypes::Schema) -> bool {
+    schema
         .fields()
         .iter()
         .any(|field| data_type_contains_union(field.data_type()))

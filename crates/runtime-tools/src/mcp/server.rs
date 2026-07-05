@@ -28,6 +28,7 @@ use serde_json::{Map, Value, json};
 use std::{borrow::Cow, collections::HashMap, future::Future, sync::Arc};
 use tokio::sync::RwLock;
 use tools::SpiceModelTool;
+use tools::naming::{decode_tool_name, encode_tool_name};
 use tools::rename::with_name;
 use tracing_futures::Instrument;
 use util::security::{MAX_SAFE_JSON_DEPTH, get_json_depth};
@@ -44,12 +45,14 @@ impl RuntimeServer {
 
     async fn get_tool(&self, tool_name: &str) -> Option<Arc<dyn SpiceModelTool>> {
         let tools = self.tools.read().await;
-        if let Some((catalog_name, name)) = tool_name.split_once('/') {
-            let Tooling::Catalog { tools: catalog, .. } = tools.get(catalog_name)? else {
-                return None;
-            };
-            return catalog.get(name).await;
+        if let Some((catalog_name, name)) = decode_tool_name(tool_name)
+            && let Some(Tooling::Catalog { tools: catalog, .. }) = tools.get(&catalog_name)
+            && let Some(tool) = catalog.get(&name).await
+        {
+            return Some(tool);
         }
+        // Fall back to a direct (non-catalog) lookup. This covers top-level
+        // tools whose names legitimately contain the `__` catalog separator.
         match tools.get(tool_name)? {
             Tooling::Tool(tool) | Tooling::FunctionTool(tool) => Some(Arc::clone(tool)),
             Tooling::Catalog { .. } => None,
@@ -69,7 +72,7 @@ impl RuntimeServer {
                     for tool in catalog.all().await {
                         result.push(with_name(
                             &tool,
-                            format!("{catalog_name}/{}", tool.name()).as_str(),
+                            encode_tool_name(catalog_name, &tool.name()).as_str(),
                         ));
                     }
                 }
@@ -167,9 +170,8 @@ impl ServerHandler for RuntimeServer {
                 }
 
                 let task_name = format!("tool_use::{tool_name}");
-                let mcp_server = tool_name
-                    .split_once('/')
-                    .map_or_else(|| tool_name.to_string(), |(server, _)| server.to_string());
+                let mcp_server = decode_tool_name(tool_name.as_ref())
+                    .map_or_else(|| tool_name.to_string(), |(server, _)| server);
                 let span = tracing::span!(target: "task_history", tracing::Level::INFO, "tool_use::mcp", tool = %tool_name, input = %input);
                 tracing::info!(target: "task_history", parent: &span, task_override = %task_name, mcp_server = %mcp_server, "labels");
 

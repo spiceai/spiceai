@@ -125,7 +125,8 @@ const KNOWN_CAYENNE_RUNTIME_PARAMS: &[&str] = &[
 /// Recognized `runtime.params` keys that don't belong to a larger prefix
 /// family (the family lists live next to the code that consumes them:
 /// `KNOWN_CAYENNE_RUNTIME_PARAMS`, `changes::CDC_RUNTIME_PARAMS`,
-/// `http_rate_control::HTTP_RATE_CONTROL_RUNTIME_PARAMS`).
+/// `http_rate_control::HTTP_RATE_CONTROL_RUNTIME_PARAMS`,
+/// `cluster::CLUSTER_GRPC_RUNTIME_PARAMS`).
 const MISC_RUNTIME_PARAMS: &[&str] = &[
     "url_tables",
     "geo",
@@ -149,11 +150,13 @@ fn known_runtime_params() -> Vec<&'static str> {
         KNOWN_CAYENNE_RUNTIME_PARAMS.len()
             + crate::accelerated_table::refresh_task::changes::CDC_RUNTIME_PARAMS.len()
             + dataconnector::http_rate_control::HTTP_RATE_CONTROL_RUNTIME_PARAMS.len()
+            + crate::cluster::CLUSTER_GRPC_RUNTIME_PARAMS.len()
             + MISC_RUNTIME_PARAMS.len(),
     );
     known.extend_from_slice(KNOWN_CAYENNE_RUNTIME_PARAMS);
     known.extend_from_slice(crate::accelerated_table::refresh_task::changes::CDC_RUNTIME_PARAMS);
     known.extend_from_slice(dataconnector::http_rate_control::HTTP_RATE_CONTROL_RUNTIME_PARAMS);
+    known.extend_from_slice(crate::cluster::CLUSTER_GRPC_RUNTIME_PARAMS);
     known.extend_from_slice(MISC_RUNTIME_PARAMS);
     known
 }
@@ -179,6 +182,7 @@ pub struct RuntimeBuilder {
 }
 
 impl RuntimeBuilder {
+    #[must_use]
     pub fn new() -> Self {
         RuntimeBuilder {
             app: None,
@@ -201,27 +205,32 @@ impl RuntimeBuilder {
         }
     }
 
+    #[must_use]
     pub fn with_app(mut self, app: app::App) -> Self {
         self.app = Some(Arc::new(app));
         self
     }
 
+    #[must_use]
     pub fn with_app_opt(mut self, app: Option<Arc<app::App>>) -> Self {
         self.app = app;
         self
     }
 
+    #[must_use]
     pub fn with_runtime_config(mut self, config: Config) -> Self {
         self.runtime_config = Arc::new(config);
         self
     }
 
+    #[must_use]
     pub fn with_extensions(mut self, extensions: Vec<Box<dyn ExtensionFactory>>) -> Self {
         self.extensions = extensions;
         self
     }
 
     /// Extensions that will be automatically loaded if a component requests them and the user hasn't explicitly loaded it.
+    #[must_use]
     pub fn with_autoload_extensions(
         mut self,
         extensions: HashMap<String, Box<dyn ExtensionFactory>>,
@@ -230,16 +239,19 @@ impl RuntimeBuilder {
         self
     }
 
+    #[must_use]
     pub fn with_pods_watcher(mut self, pods_watcher: podswatcher::PodsWatcher) -> Self {
         self.pods_watcher = Some(pods_watcher);
         self
     }
 
+    #[must_use]
     pub fn with_datasets_health_monitor(mut self) -> Self {
         self.datasets_health_monitor_enabled = true;
         self
     }
 
+    #[must_use]
     pub fn with_metrics_server(
         mut self,
         metrics_endpoint: SocketAddr,
@@ -250,6 +262,7 @@ impl RuntimeBuilder {
         self
     }
 
+    #[must_use]
     pub fn with_metrics_server_opt(
         mut self,
         metrics_endpoint: Option<SocketAddr>,
@@ -260,16 +273,19 @@ impl RuntimeBuilder {
         self
     }
 
+    #[must_use]
     pub fn with_rate_limits(mut self, rate_limits: RateLimits) -> Self {
         self.rate_limits = Some(Arc::new(rate_limits));
         self
     }
 
+    #[must_use]
     pub fn with_io_runtime(mut self, io_runtime: Handle) -> Self {
         self.io_runtime = Some(io_runtime);
         self
     }
 
+    #[must_use]
     pub fn with_resolved_cluster_config(
         mut self,
         resolved_cluster_config: ResolvedClusterConfig,
@@ -281,6 +297,7 @@ impl RuntimeBuilder {
     /// Sets a `SetOnce` handle that will be resolved with the spicepod
     /// `TelemetryConfig` once it is available.  For executors, this is set
     /// after the app definition is fetched from the scheduler.
+    #[must_use]
     pub fn with_telemetry_config(
         mut self,
         telemetry_config: Arc<tokio::sync::SetOnce<TelemetryConfig>>,
@@ -294,6 +311,7 @@ impl RuntimeBuilder {
     /// This reader is used by:
     /// - `GetMetrics` RPC to return local metrics to peer schedulers
     /// - Executors responding to metrics requests from schedulers via control stream
+    #[must_use]
     pub fn with_metrics_reader(mut self, metrics_reader: MetricsReader) -> Self {
         self.metrics_reader = Some(metrics_reader);
         self
