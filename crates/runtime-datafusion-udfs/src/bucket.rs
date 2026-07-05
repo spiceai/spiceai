@@ -563,7 +563,7 @@ mod tests {
     /// lifetime of a persisted dataset, or an equality-filter prune silently
     /// skips the partition that holds the matching rows — missing-row data loss
     /// (#11277). The hash is therefore part of the on-disk format, and
-    /// `vendored_hash.rs` freezes it to DataFusion 53's `ahash`. But that module
+    /// `vendored_hash.rs` freezes it to `DataFusion` 53's `ahash`. But that module
     /// still delegates the actual hashing to the external `ahash` crate, pinned
     /// only as `^0.8` — and ahash gives **no** cross-version output guarantee, so
     /// a routine `cargo update` (or a build that enables ahash's AES path) can
