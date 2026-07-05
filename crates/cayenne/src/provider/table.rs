@@ -22579,6 +22579,15 @@ impl super::compaction::MemTierCheckpointRunner for CayenneTableProvider {
         // if a spill is mid-flight, this tick simply waits and then finds an
         // empty/smaller tier — it never races the clear.
         let _guard = self.mem_checkpoint_lock.lock().await;
+        // Re-check under the lock: a concurrent write-path spill may have drained
+        // the tier while this tick waited. Skip so the `fired*` outcomes count
+        // only ticks that actually checkpoint. (Deliberately NOT keyed on the
+        // checkpoint returning `Ok(0)`: the tombstones-only path also returns 0
+        // rows yet does real durable work, including the slot-advancer fire.)
+        if self.mem_tier.is_empty() {
+            emit_tick("skipped_empty");
+            return;
+        }
         if let Err(e) = self.checkpoint_mem_tier().await {
             // A failed checkpoint must NOT advance the slot — `checkpoint_mem_tier`
             // already guarantees that (the advancer fires only post-fence). The
