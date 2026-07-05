@@ -775,16 +775,6 @@ async fn changes_stream_from_checkpoint(
             msg.map(|(change_batch, checkpoint, watermark)| {
                 let lag = watermark.and_then(|v| SystemTime::now().duration_since(v).ok());
 
-                // Stamp the upstream commit timestamp onto the batch so the
-                // accelerator's unified CDC replication-lag metric can compute
-                // `now - source_commit_ts_ms`. The watermark is the oldest
-                // unprocessed shard's newest record commit time, or — when every
-                // shard is caught up — the start of the poll cycle, so an idle
-                // stream's empty heartbeat batch keeps the gauge fresh instead of
-                // freezing at the last real event's age.
-                let change_batch = change_batch
-                    .with_source_commit_ts_ms(watermark.and_then(util::time::system_time_to_unix_ms));
-
                 tracing::debug!(
                     dataset = %dataset_name,
                     watermark = watermark.map_or_else(|| "-".to_string(), |w| humantime::format_rfc3339(w).to_string()),

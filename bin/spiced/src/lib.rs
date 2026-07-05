@@ -77,13 +77,60 @@ pub async fn register_external_connectors() {
     )
     .await;
 
+    register_connector_factory(connector_abfs::CONNECTOR_NAME, connector_abfs::factory()).await;
+    // Also register the "abfss" prefix (secure variant uses the same factory)
+    register_connector_factory("abfss", connector_abfs::factory()).await;
+
+    register_connector_factory(connector_gcs::CONNECTOR_NAME, connector_gcs::factory()).await;
+    // Also register the "gs" prefix alias for GCS
+    register_connector_factory("gs", connector_gcs::factory()).await;
+
+    register_connector_factory(connector_glue::CONNECTOR_NAME, connector_glue::factory()).await;
+
+    register_connector_factory(
+        connector_ducklake::CONNECTOR_NAME,
+        connector_ducklake::factory(),
+    )
+    .await;
+    register_connector_factory(connector_git::CONNECTOR_NAME, connector_git::factory()).await;
+    register_connector_factory(
+        connector_github::CONNECTOR_NAME,
+        connector_github::factory(),
+    )
+    .await;
+    register_connector_factory(
+        connector_spiceai::CONNECTOR_NAME,
+        connector_spiceai::factory(),
+    )
+    .await;
+    // Also register the legacy "spiceai" prefix
+    register_connector_factory(
+        connector_spiceai::LEGACY_CONNECTOR_NAME,
+        connector_spiceai::legacy_factory(),
+    )
+    .await;
+
     // Feature-gated connectors
+
     #[cfg(feature = "clickhouse")]
     register_connector_factory(
         connector_clickhouse::CONNECTOR_NAME,
         connector_clickhouse::factory(),
     )
     .await;
+
+    #[cfg(feature = "cosmosdb")]
+    register_connector_factory(
+        connector_cosmosdb::CONNECTOR_NAME,
+        connector_cosmosdb::factory(),
+    )
+    .await;
+
+    #[cfg(feature = "adbc")]
+    register_connector_factory(connector_adbc::CONNECTOR_NAME, connector_adbc::factory()).await;
+
+    #[cfg(feature = "kafka")]
+    register_connector_factory(connector_kafka::CONNECTOR_NAME, connector_kafka::factory()).await;
 
     #[cfg(feature = "databricks")]
     register_connector_factory(

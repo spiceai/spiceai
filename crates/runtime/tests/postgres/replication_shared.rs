@@ -227,22 +227,11 @@ async fn next_envelope(
     stream: &mut ChangesStream,
     what: &str,
 ) -> Result<ChangeEnvelope, anyhow::Error> {
-    // Skip idle heartbeat envelopes (zero-row, not a readiness signal): they carry
-    // only a replication-lag timestamp and interleave with real changes on any
-    // Postgres keepalive. Bound the TOTAL wait so a genuinely missing change still
-    // times out instead of looping on heartbeats forever.
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
-    loop {
-        let envelope = tokio::time::timeout_at(deadline, stream.next())
-            .await
-            .map_err(|_| anyhow::anyhow!("timed out waiting for {what}"))?
-            .ok_or_else(|| anyhow::anyhow!("stream ended waiting for {what}"))?
-            .map_err(|e| anyhow::anyhow!("stream error waiting for {what}: {e}"))?;
-        if envelope.change_batch.record.num_rows() == 0 && !envelope.is_dataset_ready() {
-            continue;
-        }
-        return Ok(envelope);
-    }
+    tokio::time::timeout(Duration::from_secs(30), stream.next())
+        .await
+        .map_err(|_| anyhow::anyhow!("timed out waiting for {what}"))?
+        .ok_or_else(|| anyhow::anyhow!("stream ended waiting for {what}"))?
+        .map_err(|e| anyhow::anyhow!("stream error waiting for {what}: {e}"))
 }
 
 fn ops_of(envelope: &ChangeEnvelope) -> Vec<String> {
@@ -694,6 +683,91 @@ async fn shared_slot_multiplexes_multiple_datasets() -> Result<(), anyhow::Error
     drop(stream_d);
     drop(dup);
     drop(mismatch);
+    drop_replication_slot_when_inactive(&source, SLOT).await?;
+    source
+        .simple_query(&format!("DROP PUBLICATION IF EXISTS {PUBLICATION}"))
+        .await?;
+    Ok(())
+}
+
+/// Regression for #11290: a partitioned source table on a shared slot. Without
+/// `publish_via_partition_root` on the publication, pgoutput attributes changes
+/// to each *leaf* partition, whose relation name has no registered member — so
+/// the shared router drops every post-snapshot change (and `credit_idle`
+/// advances the ack floor past them). The dataset boots with a correct snapshot
+/// and then silently never updates. The publication must therefore be created
+/// with the option so changes are reported under the parent relation the
+/// dataset subscribes to; the inserts/updates/deletes below all route through
+/// leaf partitions and must still reach the stream.
+#[tokio::test(flavor = "multi_thread")]
+async fn shared_slot_partitioned_source_table_streams_changes() -> Result<(), anyhow::Error> {
+    let _tracing = init_tracing(Some("data_components::postgres_replication=debug,info"));
+
+    let port = common::get_random_port()?;
+    let _container = common::start_postgres_docker_container_with_logical_wal(port).await?;
+    let port = u16::try_from(port).expect("port fits in u16");
+    let source = pg_client(port).await?;
+
+    // Range-partitioned parent with two leaf partitions. The partition key is
+    // part of the primary key (required by Postgres for a partitioned PK),
+    // which also gives every leaf a replica identity for UPDATE/DELETE.
+    source
+        .simple_query(
+            "CREATE TABLE public.shared_repl_part (id int, name text, PRIMARY KEY (id)) \
+                 PARTITION BY RANGE (id); \
+             CREATE TABLE public.shared_repl_part_lo \
+                 PARTITION OF public.shared_repl_part FOR VALUES FROM (0) TO (100); \
+             CREATE TABLE public.shared_repl_part_hi \
+                 PARTITION OF public.shared_repl_part FOR VALUES FROM (100) TO (1000); \
+             INSERT INTO public.shared_repl_part VALUES (1, 'lo1'), (150, 'hi1');",
+        )
+        .await?;
+
+    // Snapshot of the parent covers rows across all partitions.
+    let mut stream = start_replication_stream(input_for(port, "shared_repl_part"));
+    let boot = next_envelope(&mut stream, "bootstrap partitioned").await?;
+    assert_eq!(
+        boot.change_batch.record.num_rows(),
+        2,
+        "bootstrap covers rows from both partitions"
+    );
+    assert!(boot.is_dataset_ready(), "bootstrap must mark ready");
+    boot.commit().await?;
+
+    // With publish_via_partition_root the publication lists the parent, not the
+    // leaves — which is also what keeps `has_table` true across restarts.
+    assert_eq!(
+        publication_tables(&source).await?,
+        HashSet::from(["shared_repl_part".to_string()]),
+        "publication lists the partitioned parent, not its leaves"
+    );
+    assert_eq!(slot_count(&source).await?, 1, "exactly one slot");
+
+    // The core regression: post-snapshot WAL changes must route to the dataset
+    // even though Postgres applies them via leaf partitions — one row per
+    // partition, covering insert/update/delete.
+    source
+        .simple_query("INSERT INTO public.shared_repl_part VALUES (50, 'lo50')")
+        .await?;
+    expect_single_change(&mut stream, "insert into low partition", "c", 50).await?;
+
+    source
+        .simple_query("INSERT INTO public.shared_repl_part VALUES (200, 'hi200')")
+        .await?;
+    expect_single_change(&mut stream, "insert into high partition", "c", 200).await?;
+
+    source
+        .simple_query("UPDATE public.shared_repl_part SET name = 'lo50x' WHERE id = 50")
+        .await?;
+    expect_single_change(&mut stream, "update in low partition", "u", 50).await?;
+
+    source
+        .simple_query("DELETE FROM public.shared_repl_part WHERE id = 200")
+        .await?;
+    expect_single_change(&mut stream, "delete in high partition", "d", 200).await?;
+
+    // --- Cleanup ---
+    drop(stream);
     drop_replication_slot_when_inactive(&source, SLOT).await?;
     source
         .simple_query(&format!("DROP PUBLICATION IF EXISTS {PUBLICATION}"))
