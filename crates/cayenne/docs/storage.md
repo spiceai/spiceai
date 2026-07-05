@@ -380,13 +380,16 @@ RowConverterDeletionSnapshot  { tombstones: Arc<KeyDeletionIndex> }    KeyDeleti
 
 ### E. CDC mem-tier — **ephemeral** (RAM-only; re-streamed exactly-once)
 
-The *only* data-bearing state with no durable copy. `mem_tier: Arc<ArcSwap<MemTier>>` (`provider/mem_tier.rs`), empty in `file` mode. Discarded on crash; the source slot holds at most the last-checkpointed LSN, the source re-streams everything past it, and the PK-idempotent apply reconciles exactly-once. The `SlotAdvancer` callback advances the slot **only after** a checkpoint's Vortex + metastore writes are durable.
+The *only* data-bearing state with no durable copy. `mem_tier: Arc<ArcSwap<MemTier>>` (`provider/mem_tier.rs`), empty in `file` mode. Discarded on crash; the source slot holds at most the last-durable LSN, the source re-streams everything past it, and the PK-idempotent apply reconciles exactly-once. The `SlotAdvancer` callback advances the slot **only after** the covering rows/tombstones are durable.
+
+**Ingestion / immutable split (the seal).** The tier is split at `sealed_segments`: `segments[0..sealed_segments]` are the **immutable piece** (already durably *shadowed*), `segments[sealed_segments..]` the **active ingestion piece**. A periodic **seal** (`cdc_mem_tier_seal_age_ms`, default 2 s) durably shadows the active piece into the *unpublished* inline corpus — insert rows as an inline BLOB (`commit_inlined_data_durable`, no `publish_inlined_mutation`), tombstones as delete-vectors (`commit_mem_tier_checkpoint_metadata`, update dropped) — then fires the `SlotAdvancer`. This **decouples the slot ack (replication/freshness lag) from the heavy protected-snapshot bake**: the slot advances every seal cadence, with no Vortex encode, no listing-fence publish, and no read amplification. Reads are unaffected — they still union the *whole* RAM tier (the split is invisible to the scan path); the shadow is invisible in-process (`published_inlined_seq` is not advanced) and is replayed only on restart (the watermark reseeds from the durable `current_sequence_number`; `publish_orphan_inlined_deletes` re-activates shadow tombstones). A later bake re-flushes the same rows to Vortex and clears the shadow (`mem_tier_shadow_present` forces the clear even though the *published* inline view is empty). Seal and bake are serialized by `mem_checkpoint_lock` (single-drainer for `fire_slot_advancer`). Sealing engages on the N==1 default; the opt-in N>1 sharded path keeps the whole-tier-atomic checkpoint as its slot-ack cadence.
 
 **`MemTier`**:
 
 | Field | Type | Role |
 |-------|------|------|
 | `segments` | `Arc<Vec<MemSegment>>` | append-log; one `MemSegment` per CDC apply |
+| `sealed_segments` | `usize` | ingestion/immutable split point — `segments[0..sealed_segments]` are durably shadowed |
 | `tombstones` | `InMemTombstones` | accumulated max-delete-seq per key — persistent `im::HashMap` (O(1) clone on append) |
 | `bytes` / `rows` / `superseded` | `u64` | budget + observability |
 | `epoch` / `version` | `u64` | epoch persists across post-checkpoint clears; version bumps on append *and* retain |

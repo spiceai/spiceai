@@ -1299,6 +1299,24 @@ pub struct CayenneTableProvider {
     /// Per-table RAM-tier age cap in ms for memory mode
     /// (`cayenne_cdc_mem_tier_max_age_ms`); 0 disables the age trigger.
     mem_tier_max_age_ms: u64,
+    /// Set by [`Self::seal_mem_tier_durable`] when a seal has written a
+    /// durable-but-unpublished inline shadow (insert BLOB and/or delete vectors)
+    /// that a later bake must clear once it re-flushes the same rows to Vortex.
+    /// Because the shadow is UNPUBLISHED, the bake's usual `!inlined_view.is_empty()`
+    /// clear gate would skip it (the published inline view is empty), so the bake
+    /// ORs this flag in — otherwise the shadow and the freshly-baked Vortex snapshot
+    /// would both be durable and a restart would double-count the rows. Reset to
+    /// `false` inside [`Self::clear_inlined_state_after_checkpoint`] once the shadow
+    /// is deleted. Seal and bake are serialized by `mem_checkpoint_lock`, so no
+    /// concurrent seal can re-set it mid-clear. Shared across writer clones.
+    mem_tier_shadow_present: Arc<std::sync::atomic::AtomicBool>,
+    /// Wall-clock instant the source slot was last advanced (by a seal OR a bake —
+    /// both call [`Self::fire_slot_advancer`]). The periodic tick fires a SEAL when
+    /// this ages past `cdc_mem_tier_seal_age_ms` and the active ingestion piece is
+    /// non-empty, bounding replication/freshness lag to the seal cadence
+    /// INDEPENDENTLY of the (coarser) bake cadence. Read by [`Self::seal_due`].
+    /// Shared across writer clones.
+    last_slot_advance_at: Arc<ParkingMutex<Instant>>,
     /// Approximate count of new Vortex files created in the *current* snapshot
     /// since the last successful compaction pass (or since table open).
     /// Used as a cheap early-out in `run_one_compaction_pass` so that during
@@ -4307,6 +4325,8 @@ impl CayenneTableProvider {
             mem_tier_apply_epoch: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             slot_advancer: Arc::new(ParkingMutex::new(None)),
             mem_tier_max_age_ms,
+            mem_tier_shadow_present: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            last_slot_advance_at: Arc::new(ParkingMutex::new(Instant::now())),
             // Local providers can use `ensure_no_incomplete_write`'s
             // non-destructive fast path: it probes `_staging/` and returns if
             // the directory is absent or empty. Starting every provider in the
@@ -5199,6 +5219,8 @@ impl CayenneTableProvider {
             mem_tier_apply_epoch: Arc::clone(&self.mem_tier_apply_epoch),
             slot_advancer: Arc::clone(&self.slot_advancer),
             mem_tier_max_age_ms: self.mem_tier_max_age_ms,
+            mem_tier_shadow_present: Arc::clone(&self.mem_tier_shadow_present),
+            last_slot_advance_at: Arc::clone(&self.last_slot_advance_at),
             staging_wal_present: Arc::clone(&self.staging_wal_present),
             staging_may_have_files: Arc::clone(&self.staging_may_have_files),
             inflight_staging_appends: Arc::clone(&self.inflight_staging_appends),
@@ -17557,7 +17579,10 @@ impl CayenneTableProvider {
                 // All-shards clear (acquires each shard's publish lock itself).
                 self.clear_flushed_mem_tier_state_all_shards(
                     &flushed_counts,
-                    !inlined_view.is_empty(),
+                    !inlined_view.is_empty()
+                        || self
+                            .mem_tier_shadow_present
+                            .load(std::sync::atomic::Ordering::Acquire),
                 )
                 .await?;
             } else {
@@ -17569,7 +17594,10 @@ impl CayenneTableProvider {
                 // needed.
                 self.clear_flushed_mem_tier_state_all_shards(
                     &flushed_counts,
-                    !inlined_view.is_empty(),
+                    !inlined_view.is_empty()
+                        || self
+                            .mem_tier_shadow_present
+                            .load(std::sync::atomic::Ordering::Acquire),
                 )
                 .await?;
             }
@@ -17643,8 +17671,14 @@ impl CayenneTableProvider {
             // all-shards clear keeps the invariant ("every clear arm holds the
             // publish lock") unconditional. Lock order: fence (outer) → publish
             // (inner), same as phase 2.
-            self.clear_flushed_mem_tier_state_all_shards(&flushed_counts, !inlined_view.is_empty())
-                .await?;
+            self.clear_flushed_mem_tier_state_all_shards(
+                &flushed_counts,
+                !inlined_view.is_empty()
+                    || self
+                        .mem_tier_shadow_present
+                        .load(std::sync::atomic::Ordering::Acquire),
+            )
+            .await?;
             self.refresh_listing_table_under_held_fence().await?;
             stats
         } else {
@@ -17762,7 +17796,10 @@ impl CayenneTableProvider {
                 }
                 self.clear_flushed_mem_tier_state_all_shards(
                     &flushed_counts,
-                    !inlined_view.is_empty(),
+                    !inlined_view.is_empty()
+                        || self
+                            .mem_tier_shadow_present
+                            .load(std::sync::atomic::Ordering::Acquire),
                 )
                 .await?;
                 self.refresh_listing_table_under_held_fence().await?;
@@ -17834,6 +17871,217 @@ impl CayenneTableProvider {
         self.fire_slot_advancer(flushed_epoch).await;
 
         Ok(u64::try_from(flushed_mem_rows).unwrap_or(u64::MAX))
+    }
+
+    /// SEAL the ACTIVE ingestion piece: durably shadow the un-sealed RAM delta
+    /// into the UNPUBLISHED inline corpus and advance the source replication slot,
+    /// WITHOUT the heavy protected-snapshot checkpoint. This is the fresh-durability
+    /// cadence that decouples the slot ack (replication/freshness lag) from the
+    /// read hand-off and the Vortex bake.
+    ///
+    /// Per the user's contract: the slot stays tied to DURABILITY (never advanced
+    /// before the delta is crash-recoverable) but is UNTIED from reads (which
+    /// already union the RAM tier — the shadow is invisible in-process). A crash
+    /// after a seal loses the RAM tier but the durable shadow is replayed on
+    /// restart; a crash before the seal re-streams the un-acked tail from the
+    /// source, and the PK-idempotent apply converges exactly-once either way.
+    ///
+    /// Mechanics (N==1 — the default; see the shard gate below):
+    /// 1. Capture the active piece (`segments[sealed_segments..]`) and the epoch it
+    ///    makes durable, BEFORE any await — appends after this stay active.
+    /// 2. Persist its VISIBLE rows (post merge-on-read) as ONE durable-but-
+    ///    unpublished inline-corpus BLOB ([`Self::commit_inlined_data_durable`] with
+    ///    no [`Self::publish_inlined_mutation`], so `published_inlined_seq` stays
+    ///    below the seal sequence and the shadow is invisible to live scans; on
+    ///    restart the watermark reseeds from the durable `current_sequence_number`
+    ///    and the shadow becomes the recovered corpus). NO Vortex encode, NO
+    ///    listing-fence publish, NO protected snapshot ⇒ NO read amplification.
+    /// 3. Persist its TOMBSTONES durably ([`Self::commit_mem_tier_checkpoint_metadata`]
+    ///    with `target_snapshot_id = None`) but UNPUBLISHED (drop the returned
+    ///    in-memory update): a tombstone may hide a DURABLE file/inline row, so it
+    ///    must be crash-durable before the slot advances past its delete — else a
+    ///    restart resurrects the deleted row. Reads keep hiding these rows via the
+    ///    RAM tier's merge-on-read tombstones, so no in-memory publish is needed.
+    /// 4. Advance the seal boundary (active → immutable) under the shard publish
+    ///    lock, then — and only then — fire the slot advancer for the captured epoch.
+    ///
+    /// Serialized against the checkpoint by `mem_checkpoint_lock` (single-drainer:
+    /// the runtime's deferred-commit queue front-requeues on failure, so two
+    /// concurrent `fire_slot_advancer` drains would corrupt its ordering). Returns
+    /// the number of visible rows sealed (0 when there is nothing to seal, when not
+    /// in memory mode, or on the N>1 opt-in path, which is left on the checkpoint
+    /// cadence — a documented limitation, never a correctness gap).
+    ///
+    /// `pub` + `#[doc(hidden)]` so benches / external harnesses can drive a seal
+    /// deterministically (mirrors [`Self::checkpoint_mem_tier`]); production fires
+    /// it from the background tick via [`Self::seal_due`].
+    #[doc(hidden)]
+    pub async fn seal_mem_tier_durable(&self) -> Result<u64> {
+        if !self.is_cdc_memory_mode() {
+            return Ok(0);
+        }
+        // N>1 sharding: the slot-ack epoch is a SINGLE all-shards-atomic axis, so a
+        // per-shard seal would tear the cross-shard watermark (advance past an
+        // epoch not yet durable in another shard). The N==1 default gets sealing;
+        // the opt-in N>1 SF-1000 sweep keeps the whole-tier-atomic checkpoint as
+        // its slot-ack path (unchanged, still correct — just not sub-checkpoint
+        // fresh). Extending the seal to an all-shards-atomic capture is a follow-up.
+        if self.mem_tier.shard_count() != 1 {
+            return Ok(0);
+        }
+        // Single-drainer w.r.t. the bake: `mem_checkpoint_lock` is the same lock the
+        // periodic tick and the write-path spill hold around `checkpoint_mem_tier`,
+        // so a seal never races a checkpoint's `fire_slot_advancer`.
+        let _checkpoint = self.mem_checkpoint_lock.lock().await;
+
+        let snapshot = self.mem_tier.shard(0).load_full();
+        if !snapshot.has_unsealed_segments() {
+            return Ok(0);
+        }
+        // Capture the seal boundary + the epoch this seal makes durable BEFORE any
+        // await. Appends after this point grow the tail (append-only) and stay
+        // ACTIVE — they are sealed on the next cycle, and the slot is advanced only
+        // to `seal_epoch`, never past the un-sealed tail.
+        let sealed_through = snapshot.segments.len();
+        let seal_epoch = snapshot.epoch;
+
+        // The delta view: the active segments with tombstone/byte/row aggregates
+        // rebuilt from just those segments (NOT the whole tier — the sealed prefix
+        // was already shadowed by earlier seals).
+        let delta = snapshot.unsealed_view();
+        // VISIBLE rows (each segment's rows minus this delta's own merge-on-read
+        // tombstones) — the exact set the bake would flush for this delta, so the
+        // shadow is byte-consistent with the eventual Vortex snapshot.
+        let visible = self.visible_mem_tier_batches(&delta, None)?;
+        let sealed_rows: u64 = visible
+            .iter()
+            .map(|b| b.num_rows() as u64)
+            .fold(0, u64::saturating_add);
+        let has_tombstones = Self::mem_tier_has_tombstones(&delta);
+
+        if visible.is_empty() && !has_tombstones {
+            // Every active row was superseded within the delta and no tombstone
+            // hides a durable row: the epoch is vacuously durable (no data, no
+            // durable-hiding delete to lose). Advance the boundary + slot so the
+            // active piece is not re-scanned next seal.
+            self.mark_shard_sealed_through(0, sealed_through).await;
+            self.fire_slot_advancer(seal_epoch).await;
+            return Ok(0);
+        }
+
+        // PK membership of the delta's visible rows drives the reinserted-vs-pure
+        // tombstone split (a delete whose key is re-inserted in this delta stamps
+        // the reinsert sequence so the shadow copy survives; a pure delete hides a
+        // durable copy). Same derivation the checkpoint uses.
+        let corpus_keys = self.checkpoint_corpus_pk_keys(&visible)?;
+
+        // ONE seal sequence stamps both the inline BLOB rows and the
+        // reinsert/registration stamp. Reserved AFTER every delta segment's append,
+        // so it is strictly above their `data_sequence`/`delete_sequence` — a
+        // re-inserted key's shadow copy (at `seal_sequence`) therefore survives its
+        // own tombstone (`delete_sequence < seal_sequence`). The allocator's block
+        // refill already bumped the durable `current_sequence_number` to at least
+        // this value, so on restart the inline watermark reseeds above it and the
+        // shadow is visible (R1: no acked-but-invisible row).
+        let seal_sequence = self
+            .reserve_sequences_local(1)
+            .await
+            .map_err(|source| Error::Catalog { source })?;
+
+        // (a) Durable INSERTS → one unpublished inline-corpus BLOB. Durable commit
+        // only — NO `publish_inlined_mutation`, so no `inlined_generation` bump, no
+        // watermark advance, and live scans keep serving the RAM tier (the shadow
+        // is a pure recovery artifact until restart).
+        if !visible.is_empty() {
+            let ipc_bytes =
+                serialize_batches_to_ipc(&visible).map_err(|e| Error::Arrow { source: e })?;
+            self.commit_inlined_data_durable(
+                InlinedDataRewrite::default(),
+                vec![InlinedData::pending_catalog_insert(
+                    self.table_metadata.table_id.clone(),
+                    None,
+                    ipc_bytes,
+                    i64::try_from(sealed_rows).unwrap_or(i64::MAX),
+                )],
+                Some(seal_sequence),
+            )
+            .await
+            .map_err(|source| Error::Catalog { source })?;
+        }
+
+        // (b) Durable TOMBSTONES → delete vectors + metastore commit, UNPUBLISHED
+        // (drop the returned in-memory `OnConflictUpdate`). `target_snapshot_id =
+        // None`: the inserts live in the inline BLOB, not a Vortex snapshot, so no
+        // protected snapshot is registered. Idempotent w.r.t. a later bake that
+        // re-commits the same tombstones (the deletion index merges by max
+        // sequence). Reads continue to hide these rows via the RAM tier's
+        // merge-on-read tombstones; the durable index is only consulted on restart.
+        if has_tombstones {
+            let _unpublished = self
+                .commit_mem_tier_checkpoint_metadata(&delta, None, seal_sequence, &corpus_keys)
+                .await
+                .map_err(|source| Error::Catalog { source })?;
+        }
+
+        // Flag the durable-but-unpublished shadow so the next bake clears it (its
+        // published inline view is empty, so the bake's usual clear gate would miss
+        // it and a restart would double-count the re-flushed rows). Released with
+        // Release so a later Acquire load in the bake observes it.
+        self.mem_tier_shadow_present
+            .store(true, std::sync::atomic::Ordering::Release);
+
+        // Advance the ingestion/immutable split (active → sealed) under the shard
+        // publish lock so the boundary store is atomic w.r.t. a concurrent append's
+        // tier swap.
+        self.mark_shard_sealed_through(0, sealed_through).await;
+
+        // ONLY NOW — after the durable inline BLOB + delete vectors are committed —
+        // may the runtime advance the source slot to cover `seal_epoch`. A crash
+        // before this point leaves the slot un-advanced, so the source re-streams
+        // the tail and the PK-idempotent apply converges exactly-once.
+        self.fire_slot_advancer(seal_epoch).await;
+
+        tracing::debug!(
+            table = %self.table_metadata.table_name,
+            rows = sealed_rows,
+            epoch = seal_epoch,
+            sealed_through,
+            "Sealed the active mem-tier ingestion piece into the durable inline shadow"
+        );
+        Ok(sealed_rows)
+    }
+
+    /// Advance ONE shard's ingestion/immutable split to `sealed_through` under that
+    /// shard's `mem_tier_publish_lock`, so the `load_full → mark_sealed_through →
+    /// store` is atomic w.r.t. a concurrent append's tier swap (appends push new
+    /// active segments under the same lock). `mark_sealed_through` clamps to the
+    /// live segment count and never regresses the boundary, so a captured
+    /// `sealed_through` stays valid even after intervening appends grew the tail.
+    async fn mark_shard_sealed_through(&self, shard_id: usize, sealed_through: usize) {
+        let _publish = self.mem_tier_publish_locks[shard_id].lock().await;
+        let cur = self.mem_tier.shard(shard_id).load_full();
+        let sealed = cur.mark_sealed_through(sealed_through);
+        self.mem_tier.shard(shard_id).store(Arc::new(sealed));
+    }
+
+    /// Whether the periodic tick should fire a [`Self::seal_mem_tier_durable`] this
+    /// cycle: sealing is enabled (`cdc_mem_tier_seal_age_ms > 0`), the table is on
+    /// the N==1 seal path, the ACTIVE ingestion piece holds un-sealed segments, and
+    /// the source slot last advanced more than one seal cadence ago. A cheap
+    /// lock-free precondition — the seal itself re-checks the active piece under the
+    /// lock and is a no-op if another path drained it first.
+    fn seal_due(&self) -> bool {
+        let Some(seal_age) = self.context.mem_tier_seal_age() else {
+            return false;
+        };
+        // Only the unsharded default seals today (see `seal_mem_tier_durable`).
+        if self.mem_tier.shard_count() != 1 {
+            return false;
+        }
+        if !self.mem_tier.shard(0).load().has_unsealed_segments() {
+            return false;
+        }
+        self.last_slot_advance_at.lock().elapsed() >= seal_age
     }
 
     /// Swap the mem tier to its remainder after a checkpoint flushed every
@@ -17934,6 +18182,9 @@ impl CayenneTableProvider {
     /// up (memory mode). A no-op in file mode / when the runtime did not install
     /// a handle.
     async fn fire_slot_advancer(&self, durable_epoch: u64) {
+        // Reset the freshness clock: the slot just advanced (via a seal or a bake),
+        // so the next seal is due one `seal_age` from now. Read by `seal_due`.
+        *self.last_slot_advance_at.lock() = Instant::now();
         // Observability: emit the durable watermark alongside the live apply-epoch
         // counter so `cayenne_mem_tier_{durable,apply}_epoch` expose the slot-ack
         // gap. A gap that GROWS while checkpoints keep firing is a stuck watermark
@@ -18379,6 +18630,13 @@ impl CayenneTableProvider {
         // The durable corpus is now empty: arm the zero-corpus rebuild fast
         // path (the structural bump below forces that rebuild).
         self.durable_inlined_row_count.store(0, Ordering::Relaxed);
+        // The catalog `clear_inlined_data_and_deletes` above deleted every inline
+        // row for this table, INCLUDING any unpublished seal shadow — so the bake
+        // no longer needs to force the clear. Reset the flag (Release, paired with
+        // the bake/seal Acquire loads). A seal cannot race this: seals and bakes
+        // are serialized by `mem_checkpoint_lock`.
+        self.mem_tier_shadow_present
+            .store(false, std::sync::atomic::Ordering::Release);
         // b1★ (cycle-4): the catalog `DELETE FROM cayenne_inlined_delete` above
         // removed EVERY tombstone for this table, including any whose durable
         // `published = 1` flip was still deferred (recorded in
@@ -22360,7 +22618,29 @@ impl super::compaction::MemTierCheckpointRunner for CayenneTableProvider {
                 let size_ready =
                     i64::try_from(self.mem_tier.total_bytes()).unwrap_or(i64::MAX) >= min_flush;
                 if !size_ready && !self.mem_tier_age_cap_reached_whole_tier() {
-                    emit_tick("skipped_gate");
+                    // Not worth a full bake yet. Advance the source slot CHEAPLY via
+                    // a SEAL if the active ingestion piece has aged past the seal
+                    // cadence (`cdc_mem_tier_seal_age_ms`) — this bounds
+                    // replication/freshness lag to the seal cadence WITHOUT the
+                    // read amplification of a faster full checkpoint (a seal writes
+                    // an unpublished inline shadow, no Vortex snapshot). The seal
+                    // takes `mem_checkpoint_lock` itself (single-drainer vs the bake),
+                    // so it is NOT pre-held here.
+                    if self.seal_due() {
+                        match self.seal_mem_tier_durable().await {
+                            Ok(_) => emit_tick("sealed"),
+                            Err(e) => {
+                                emit_tick("seal_failed");
+                                tracing::warn!(
+                                    target: "cayenne::mem_tier",
+                                    table = %self.table_metadata.table_name,
+                                    "Periodic mem-tier seal failed (slot ack not advanced; will retry next tick): {e}"
+                                );
+                            }
+                        }
+                    } else {
+                        emit_tick("skipped_gate");
+                    }
                     return;
                 }
             }
@@ -24617,6 +24897,263 @@ mod tests {
             scan_sorted_ids(&reopened).await,
             vec![1, 3],
             "the absorbed delete is durable across restart"
+        );
+    }
+
+    /// SEAL basics: a seal durably shadows the active ingestion piece and advances
+    /// the source slot to the delta epoch, WITHOUT clearing the RAM tier — so reads
+    /// stay served from RAM (the shadow is unpublished/invisible in-process) and the
+    /// segments become the immutable piece (`sealed_segments == segments.len()`).
+    #[tokio::test]
+    async fn mem_tier_seal_advances_slot_and_preserves_ram_reads() {
+        let runtime_env = SessionContext::new().runtime_env();
+        let (provider, _catalog, _tmp) =
+            create_memory_mode_upsert_table("seal_reads", Arc::clone(&runtime_env)).await;
+        let durable = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        provider.install_slot_advancer(Arc::new(EpochRecorder(Arc::clone(&durable))));
+
+        let no_deletions = OnConflictDeletions::default();
+        let b1 = int64_id_batch(&[1, 2, 3]);
+        let bytes1 = b1.get_array_memory_size() as u64;
+        provider
+            .append_to_mem_tier(vec![b1], &no_deletions, bytes1, 0)
+            .await
+            .expect("append epoch 1");
+        let b2 = int64_id_batch(&[4, 5]);
+        let bytes2 = b2.get_array_memory_size() as u64;
+        let epoch2 = provider
+            .append_to_mem_tier(vec![b2], &no_deletions, bytes2, 0)
+            .await
+            .expect("append epoch 2");
+
+        let sealed = provider.seal_mem_tier_durable().await.expect("seal");
+        assert_eq!(sealed, 5, "all 5 visible rows are sealed");
+        assert_eq!(
+            durable.load(std::sync::atomic::Ordering::SeqCst),
+            epoch2,
+            "the seal advanced the source slot to the delta epoch"
+        );
+
+        // Reads are unchanged — still served from the RAM tier (the shadow is an
+        // unpublished recovery artifact).
+        assert_eq!(
+            scan_sorted_ids(&provider).await,
+            vec![1, 2, 3, 4, 5],
+            "RAM reads are preserved after a seal"
+        );
+        // A seal does NOT clear the tier (unlike a bake); it only advances the split.
+        let tier = provider.mem_tier.tier().load();
+        assert!(!tier.is_empty(), "seal must not clear the tier");
+        assert_eq!(
+            tier.sealed_segments,
+            tier.segments.len(),
+            "every segment is now the immutable (sealed) piece"
+        );
+    }
+
+    /// A seal with nothing new in the active ingestion piece is a no-op: it returns
+    /// 0 and does NOT advance the slot (no durable work, nothing to ack).
+    #[tokio::test]
+    async fn mem_tier_seal_is_noop_when_nothing_unsealed() {
+        let runtime_env = SessionContext::new().runtime_env();
+        let (provider, _catalog, _tmp) =
+            create_memory_mode_upsert_table("seal_noop", Arc::clone(&runtime_env)).await;
+        let durable = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        provider.install_slot_advancer(Arc::new(EpochRecorder(Arc::clone(&durable))));
+
+        // Empty tier: nothing to seal.
+        assert_eq!(
+            provider.seal_mem_tier_durable().await.expect("empty seal"),
+            0
+        );
+        assert_eq!(
+            durable.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "an empty seal advances nothing"
+        );
+
+        let no_deletions = OnConflictDeletions::default();
+        let b = int64_id_batch(&[1, 2]);
+        let bytes = b.get_array_memory_size() as u64;
+        provider
+            .append_to_mem_tier(vec![b], &no_deletions, bytes, 0)
+            .await
+            .expect("append");
+        assert_eq!(provider.seal_mem_tier_durable().await.expect("seal 1"), 2);
+        assert_eq!(durable.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        // Overwrite the recorder with a sentinel; a second seal (nothing new) must
+        // NOT fire the advancer, so the sentinel survives.
+        durable.store(999, std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(
+            provider.seal_mem_tier_durable().await.expect("re-seal noop"),
+            0,
+            "re-sealing with no active piece is a no-op"
+        );
+        assert_eq!(
+            durable.load(std::sync::atomic::Ordering::SeqCst),
+            999,
+            "a no-op seal does not advance the slot"
+        );
+    }
+
+    /// SEAL then BAKE must not double-count: the bake re-flushes the sealed rows to
+    /// a Vortex snapshot AND must delete the durable shadow, so each row survives
+    /// exactly once — verified both live and across a restart (a leaked shadow would
+    /// resurface as a duplicate on reopen, since its slot was already advanced).
+    #[tokio::test]
+    async fn mem_tier_seal_then_bake_no_double_count() {
+        let runtime_env = SessionContext::new().runtime_env();
+        let (provider, catalog, _tmp) =
+            create_memory_mode_upsert_table("seal_bake", Arc::clone(&runtime_env)).await;
+        let durable = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        provider.install_slot_advancer(Arc::new(EpochRecorder(Arc::clone(&durable))));
+
+        let no_deletions = OnConflictDeletions::default();
+        let b1 = int64_id_batch(&[1, 2, 3]);
+        let bytes1 = b1.get_array_memory_size() as u64;
+        provider
+            .append_to_mem_tier(vec![b1], &no_deletions, bytes1, 0)
+            .await
+            .expect("append 1");
+        provider.seal_mem_tier_durable().await.expect("seal");
+        // More appends land in a fresh active piece after the seal.
+        let b2 = int64_id_batch(&[4, 5]);
+        let bytes2 = b2.get_array_memory_size() as u64;
+        provider
+            .append_to_mem_tier(vec![b2], &no_deletions, bytes2, 0)
+            .await
+            .expect("append 2");
+
+        provider.checkpoint_mem_tier().await.expect("bake");
+        assert!(
+            provider.mem_tier.tier().load().is_empty(),
+            "the bake clears the tier"
+        );
+        assert_eq!(
+            scan_sorted_ids(&provider).await,
+            vec![1, 2, 3, 4, 5],
+            "each row appears exactly once after the bake (the shadow was cleared)"
+        );
+
+        drop(provider);
+        let reopened = CayenneTableProviderBuilder::new(catalog, runtime_env)
+            .open("seal_bake")
+            .await
+            .expect("reopen");
+        assert_eq!(
+            scan_sorted_ids(&reopened).await,
+            vec![1, 2, 3, 4, 5],
+            "no double count after restart — the bake deleted the durable shadow"
+        );
+    }
+
+    /// NO LOSS: once a seal has advanced the slot, the sealed rows MUST survive a
+    /// crash (recovered from the durable shadow) — the opposite of
+    /// `mem_tier_crash_before_checkpoint_loses_ram_then_reapply_converges`, where a
+    /// crash BEFORE any seal correctly discards the un-acked RAM. This is the
+    /// load-bearing "slot stays tied to durability" guarantee.
+    #[tokio::test]
+    async fn mem_tier_seal_recovers_rows_after_crash_no_loss() {
+        let runtime_env = SessionContext::new().runtime_env();
+        let (provider, catalog, _tmp) =
+            create_memory_mode_upsert_table("seal_recover", Arc::clone(&runtime_env)).await;
+        let durable = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        provider.install_slot_advancer(Arc::new(EpochRecorder(Arc::clone(&durable))));
+
+        let no_deletions = OnConflictDeletions::default();
+        let b1 = int64_id_batch(&[1, 2, 3]);
+        let bytes1 = b1.get_array_memory_size() as u64;
+        provider
+            .append_to_mem_tier(vec![b1], &no_deletions, bytes1, 0)
+            .await
+            .expect("append 1");
+        let b2 = int64_id_batch(&[4, 5]);
+        let bytes2 = b2.get_array_memory_size() as u64;
+        let epoch2 = provider
+            .append_to_mem_tier(vec![b2], &no_deletions, bytes2, 0)
+            .await
+            .expect("append 2");
+
+        let sealed = provider.seal_mem_tier_durable().await.expect("seal");
+        assert_eq!(sealed, 5);
+        assert_eq!(
+            durable.load(std::sync::atomic::Ordering::SeqCst),
+            epoch2,
+            "the slot advanced only after the durable shadow was committed"
+        );
+
+        // CRASH before any bake: RAM is lost, but the seal already made the rows
+        // durable and advanced the slot, so the source will NOT re-stream them —
+        // they MUST be recovered from the shadow.
+        drop(provider);
+        let reopened = CayenneTableProviderBuilder::new(catalog, runtime_env)
+            .open("seal_recover")
+            .await
+            .expect("reopen");
+        assert_eq!(
+            scan_sorted_ids(&reopened).await,
+            vec![1, 2, 3, 4, 5],
+            "sealed rows survive a crash (recovered from the durable inline shadow) — no loss"
+        );
+    }
+
+    /// NO RESURRECTION: a seal of a delete that hides a DURABLE (file-backed) row
+    /// must persist the tombstone durably before advancing the slot, so a crash
+    /// after the seal does not resurrect the deleted row. This is the correctness
+    /// gate for sealing tombstone-bearing deltas (R7): the slot advanced past the
+    /// delete, so the source will not re-stream it — the durable index must carry it.
+    #[tokio::test]
+    async fn mem_tier_seal_delete_no_resurrection_after_crash() {
+        let runtime_env = SessionContext::new().runtime_env();
+        let (provider, catalog, _tmp) =
+            create_memory_mode_upsert_table("seal_delete", Arc::clone(&runtime_env)).await;
+        let durable = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        provider.install_slot_advancer(Arc::new(EpochRecorder(Arc::clone(&durable))));
+
+        // Seed rows and BAKE them to a durable Vortex file.
+        let no_deletions = OnConflictDeletions::default();
+        let seed = int64_id_batch(&[1, 2, 3]);
+        let seed_bytes = seed.get_array_memory_size() as u64;
+        provider
+            .append_to_mem_tier(vec![seed], &no_deletions, seed_bytes, 0)
+            .await
+            .expect("seed append");
+        provider.checkpoint_mem_tier().await.expect("seed bake");
+        assert_eq!(scan_sorted_ids(&provider).await, vec![1, 2, 3]);
+
+        // Absorb a delete of the FILE-backed key 2 (a RAM tombstone hiding a
+        // durable row).
+        let del_epoch = provider
+            .write_cdc_delete_keys_in_memory(&int64_id_batch(&[2]))
+            .await
+            .expect("absorb delete")
+            .expect("the delete is absorbed into the RAM tier");
+        assert_eq!(
+            scan_sorted_ids(&provider).await,
+            vec![1, 3],
+            "the RAM tombstone hides the durable row before any seal"
+        );
+
+        // SEAL the tombstone-bearing delta: it hides a durable row, so it must be
+        // committed to the durable deletion index before the slot advances.
+        provider.seal_mem_tier_durable().await.expect("seal delete");
+        assert_eq!(
+            durable.load(std::sync::atomic::Ordering::SeqCst),
+            del_epoch,
+            "the slot advanced to the sealed delete epoch"
+        );
+
+        // CRASH before any bake.
+        drop(provider);
+        let reopened = CayenneTableProviderBuilder::new(catalog, runtime_env)
+            .open("seal_delete")
+            .await
+            .expect("reopen");
+        assert_eq!(
+            scan_sorted_ids(&reopened).await,
+            vec![1, 3],
+            "the sealed delete is durable across a crash — key 2 is NOT resurrected"
         );
     }
 
