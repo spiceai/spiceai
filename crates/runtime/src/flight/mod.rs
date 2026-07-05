@@ -21,6 +21,7 @@ use crate::datafusion::error::{SpiceExternalError, find_datafusion_root};
 use crate::datafusion::query::{self, QueryBuilder};
 use crate::datafusion::sql_validator::validate_sql_query_read_only;
 use crate::dataupdate::DataUpdateBroadcaster;
+use crate::egress::EgressAccount;
 use crate::opentelemetry::create_metrics_service;
 use crate::tls::TlsConfig;
 use crate::{Runtime, metrics as runtime_metrics};
@@ -42,6 +43,7 @@ use bytes::Bytes;
 use cache::result::{CacheStatus, query::QueryResult};
 use datafusion::common::ParamValues;
 use datafusion::error::DataFusionError;
+use datafusion::execution::memory_pool::MemoryPool;
 use datafusion::logical_expr::LogicalPlan;
 use datafusion::sql::sqlparser::parser::ParserError;
 use flight_client::Error as FlightClientError;
@@ -287,6 +289,7 @@ impl Service {
             query_result,
             ipc_write_options,
             datafusion.cpu_runtime().cloned(),
+            &datafusion.ctx.runtime_env().memory_pool,
             context,
         ))
     }
@@ -324,6 +327,7 @@ impl Service {
         query_result: QueryResult,
         ipc_write_options: IpcWriteOptions,
         cpu_runtime: Option<Handle>,
+        memory_pool: &Arc<dyn MemoryPool>,
         request_context: Arc<RequestContext>,
     ) -> (BoxStream<'static, Result<FlightData, Status>>, CacheStatus) {
         // Reuse the same options for all messages.
@@ -365,12 +369,20 @@ impl Service {
         let data_stream = query_result.data;
         let cache_status = query_result.cache_status;
 
+        // Charge the encoded FlightData buffered for send against the query
+        // memory pool so egress memory is visible to `runtime.query.memory_limit`
+        // and applies back-pressure under real pressure.
+        let account = EgressAccount::register(memory_pool, "flight_egress");
+
         // Without a dedicated CPU runtime, encode inline on the caller's (IO)
         // runtime as before. This preserves the historical behavior when
         // `runtime.params.dedicated_thread_pool=disabled`.
         let Some(cpu_handle) = cpu_runtime else {
             let flights_stream = try_stream! {
+                let schema_size = flight_data_size(&schema_flight_data);
+                account.reserve(schema_size).await;
                 yield schema_flight_data;
+                account.release(schema_size);
 
                 // Use fused stream for better performance
                 let mut data_stream = data_stream.fuse();
@@ -390,9 +402,15 @@ impl Service {
 
                             // Yield dictionaries first
                             for dict in dicts {
+                                let dict_size = flight_data_size(&dict);
+                                account.reserve(dict_size).await;
                                 yield dict;
+                                account.release(dict_size);
                             }
+                            let batch_size = flight_data_size(&batch_data);
+                            account.reserve(batch_size).await;
                             yield batch_data;
+                            account.release(batch_size);
                         }
                         Err(e) => {
                             let e = find_datafusion_root(e);
@@ -415,43 +433,51 @@ impl Service {
         let (tx, rx) = mpsc::channel::<Result<FlightData, Status>>(FLIGHT_ENCODE_CHANNEL_CAPACITY);
         let span = Span::current();
 
-        let encode_task = async move {
-            if tx.send(Ok(schema_flight_data)).await.is_err() {
-                return;
-            }
+        let encode_task = {
+            let account = Arc::clone(&account);
+            async move {
+                // Reserve when a message enters the channel; the consumer
+                // (`FlightEncodeStream`) releases it once handed to tonic.
+                account.reserve(flight_data_size(&schema_flight_data)).await;
+                if tx.send(Ok(schema_flight_data)).await.is_err() {
+                    return;
+                }
 
-            let mut data_stream = data_stream.fuse();
+                let mut data_stream = data_stream.fuse();
 
-            while let Some(batch_result) = data_stream.next().await {
-                match batch_result {
-                    Ok(batch) => match encode_flight_batch(
-                        batch,
-                        needs_view_cast,
-                        &schema,
-                        &encoder,
-                        &mut dict_tracker,
-                        &options,
-                        &mut compression_context,
-                    ) {
-                        Ok((dicts, batch_data)) => {
-                            for dict in dicts {
-                                if tx.send(Ok(dict)).await.is_err() {
+                while let Some(batch_result) = data_stream.next().await {
+                    match batch_result {
+                        Ok(batch) => match encode_flight_batch(
+                            batch,
+                            needs_view_cast,
+                            &schema,
+                            &encoder,
+                            &mut dict_tracker,
+                            &options,
+                            &mut compression_context,
+                        ) {
+                            Ok((dicts, batch_data)) => {
+                                for dict in dicts {
+                                    account.reserve(flight_data_size(&dict)).await;
+                                    if tx.send(Ok(dict)).await.is_err() {
+                                        return;
+                                    }
+                                }
+                                account.reserve(flight_data_size(&batch_data)).await;
+                                if tx.send(Ok(batch_data)).await.is_err() {
                                     return;
                                 }
                             }
-                            if tx.send(Ok(batch_data)).await.is_err() {
+                            Err(status) => {
+                                let _ = tx.send(Err(status)).await;
                                 return;
                             }
-                        }
-                        Err(status) => {
-                            let _ = tx.send(Err(status)).await;
+                        },
+                        Err(e) => {
+                            let e = find_datafusion_root(e);
+                            let _ = tx.send(Err(handle_datafusion_error(e))).await;
                             return;
                         }
-                    },
-                    Err(e) => {
-                        let e = find_datafusion_root(e);
-                        let _ = tx.send(Err(handle_datafusion_error(e))).await;
-                        return;
                     }
                 }
             }
@@ -463,6 +489,7 @@ impl Service {
             receiver: ReceiverStream::new(rx),
             encode_handle: Some(encode_handle),
             encode_error: None,
+            account,
         };
 
         (stream.boxed(), cache_status)
@@ -520,6 +547,12 @@ fn encode_flight_batch(
     ))
 }
 
+/// Heap/wire bytes a single [`FlightData`] message occupies while buffered for
+/// send — used to charge egress against the query memory pool.
+fn flight_data_size(flight_data: &FlightData) -> usize {
+    flight_data.data_header.len() + flight_data.data_body.len() + flight_data.app_metadata.len()
+}
+
 /// Response stream for the off-runtime Flight encode pipeline. Wraps the
 /// receiver of already-encoded [`FlightData`] and owns the encode task's
 /// [`JoinHandle`] so that:
@@ -533,6 +566,11 @@ struct FlightEncodeStream {
     receiver: ReceiverStream<Result<FlightData, Status>>,
     encode_handle: Option<JoinHandle<()>>,
     encode_error: Option<Status>,
+    /// Egress reservation shared with the encode task. The encode task reserves
+    /// each message's bytes before it enters the channel; we release them here
+    /// as each message is handed to tonic. Dropping this (client disconnect)
+    /// frees any still-buffered bytes via the reservation's `Drop`.
+    account: Arc<EgressAccount>,
 }
 
 impl Stream for FlightEncodeStream {
@@ -569,7 +607,12 @@ impl Stream for FlightEncodeStream {
             return Poll::Ready(Some(Err(err)));
         }
 
-        Pin::new(&mut this.receiver).poll_next(cx)
+        let polled = Pin::new(&mut this.receiver).poll_next(cx);
+        if let Poll::Ready(Some(Ok(flight_data))) = &polled {
+            // Message handed to tonic — release its egress reservation.
+            this.account.release(flight_data_size(flight_data));
+        }
+        polled
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {

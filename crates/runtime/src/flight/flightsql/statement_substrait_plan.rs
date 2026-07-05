@@ -179,6 +179,7 @@ pub(crate) async fn do_get(
         query_result,
         ipc_write_options,
         datafusion.cpu_runtime().cloned(),
+        &datafusion.ctx.runtime_env().memory_pool,
         Arc::clone(&context),
     );
     let timed_output = TimedStream::new(output, move || start);
