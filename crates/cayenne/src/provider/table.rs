@@ -807,6 +807,12 @@ struct CachedTableStatistics {
     /// Allows `persist_table_stats_locked` to attempt an in-memory merge
     /// and avoid a catalog GET on the common steady-state path.
     raw: Option<TableStatistics>,
+    /// Whether the cached `optimizer` count is a provably-exact live count
+    /// (mirrors [`TableStatistics::num_rows_exact`]). When `false`,
+    /// `cached_table_statistics_for_optimizer` serves the `Inexact` view so the
+    /// COUNT(*) fold declines rather than answering from a possibly-drifted count.
+    /// Defaults `false` (conservative: an uninitialized cache is not trusted exact).
+    count_exact: bool,
 }
 
 /// Block size for the in-memory sequence allocator (lever B2). Each metastore
@@ -1121,6 +1127,15 @@ pub struct CayenneTableProvider {
     /// overwrite. Conservative: the fast path requires exactly 0; any other
     /// value falls through to the full metastore read.
     durable_inlined_row_count: Arc<AtomicI64>,
+    /// Durable rows superseded/deleted by mem-tier appends since the last
+    /// checkpoint (accumulated `OnConflictDeletions::total_superseded`, which
+    /// counts file+inline supersedes — NOT in-tier ones, which the flushed-row
+    /// count already collapses). The mem-tier checkpoint subtracts this from
+    /// `flushed_mem_rows` so the persisted `Delta` nets durable supersedes
+    /// (best-effort — see [`crate::provider::column_stats::RowCountUpdate`]),
+    /// keeping the maintained count close to live instead of climbing toward
+    /// "every row ever flushed". Reset to 0 by the checkpoint clear.
+    mem_tier_pending_superseded: Arc<AtomicI64>,
     /// Inline-memtable cache generation counter.
     ///
     /// Incremented (with `Release` ordering) by every
@@ -2103,6 +2118,15 @@ impl CayenneTableProvider {
                     .as_ref()
                     .map(|s| Self::statistics_to_inexact(s.clone()));
                 stats_cache.optimizer = df_stats;
+                // Preserve the exactness of the (unchanged) count across the
+                // schema-width re-derivation. Conservative when `raw` is cold
+                // (pre-first-persist): treat the count as NOT exact rather than
+                // trusting it — `optimizer` is `None` in that case too, so nothing
+                // is served, but this never leaves a stale-Exact flag behind.
+                stats_cache.count_exact = stats_cache
+                    .raw
+                    .as_ref()
+                    .is_some_and(|raw| raw.num_rows_exact);
             }
             // Per-file statistics were inferred against the old logical schema
             // width; drop them so the next scan re-infers at the evolved width.
@@ -4183,7 +4207,13 @@ impl CayenneTableProvider {
             context.file_format(),
             &pk_deletion_strategy,
         )?;
-        let table_statistics = Self::load_table_statistics(&catalog, &table_metadata).await;
+        let loaded_table_statistics = Self::load_table_statistics(&catalog, &table_metadata).await;
+        // Legacy/absent stats are trusted exact once (see the migration note); the
+        // next mem-tier checkpoint delta taints a drifted one.
+        let table_statistics_count_exact = loaded_table_statistics
+            .as_ref()
+            .is_none_or(|(_, exact)| *exact);
+        let table_statistics = loaded_table_statistics.map(|(df, _)| df);
         // An empty `pk_column_indices` (no primary key) yields no index and the
         // legacy insert-only behavior; otherwise the per-PK index is bounded by
         // `MAINTAINED_AGGREGATE_MAX_INDEX_ENTRIES` (fail-safe to a base rebuild).
@@ -4288,6 +4318,7 @@ impl CayenneTableProvider {
                     .map(|s| Self::statistics_to_inexact(s.clone())),
                 optimizer: table_statistics,
                 raw: None, // will be populated on first load/persist
+                count_exact: table_statistics_count_exact,
             })),
             table_statistics_persistence_lock: Arc::new(tokio::sync::Mutex::new(())),
             retention_filters,
@@ -4316,6 +4347,7 @@ impl CayenneTableProvider {
             // At open the mem tier is empty, so the metastore count fetched
             // above is exactly the durable-corpus row count.
             durable_inlined_row_count: Arc::new(AtomicI64::new(inlined_row_count)),
+            mem_tier_pending_superseded: Arc::new(AtomicI64::new(0)),
             inlined_generation: Arc::new(AtomicU64::new(0)),
             inlined_structural_epoch: Arc::new(AtomicU64::new(0)),
             merged_scan_deletions: Arc::new(arc_swap::ArcSwapOption::const_empty()),
@@ -5221,6 +5253,7 @@ impl CayenneTableProvider {
             inline_checkpoint_scheduled: Arc::clone(&self.inline_checkpoint_scheduled),
             inlined_row_count: Arc::clone(&self.inlined_row_count),
             durable_inlined_row_count: Arc::clone(&self.durable_inlined_row_count),
+            mem_tier_pending_superseded: Arc::clone(&self.mem_tier_pending_superseded),
             inlined_generation: Arc::clone(&self.inlined_generation),
             inlined_structural_epoch: Arc::clone(&self.inlined_structural_epoch),
             merged_scan_deletions: Arc::clone(&self.merged_scan_deletions),
@@ -5327,10 +5360,14 @@ impl CayenneTableProvider {
         self.seq_allocator.lock().await.next - 1
     }
 
+    /// Load the persisted optimizer statistics AND their exactness flag
+    /// ([`TableStatistics::num_rows_exact`]) at open. The flag rides alongside the
+    /// derived `Statistics` so the cache can serve the count `Inexact` when it is
+    /// not a provably-exact live count.
     async fn load_table_statistics(
         catalog: &Arc<dyn MetadataCatalog>,
         table_metadata: &TableMetadata,
-    ) -> Option<Statistics> {
+    ) -> Option<(Statistics, bool)> {
         let stats = match catalog.get_table_statistics(&table_metadata.table_id).await {
             Ok(stats) => stats?,
             Err(e) => {
@@ -5342,13 +5379,16 @@ impl CayenneTableProvider {
             }
         };
 
-        Self::table_statistics_to_df(&table_metadata.schema, &stats).or_else(|| {
-            tracing::warn!(
-                "Failed to deserialize table stats for {}",
-                table_metadata.table_name
-            );
-            None
-        })
+        let num_rows_exact = stats.num_rows_exact;
+        Self::table_statistics_to_df(&table_metadata.schema, &stats)
+            .map(|df| (df, num_rows_exact))
+            .or_else(|| {
+                tracing::warn!(
+                    "Failed to deserialize table stats for {}",
+                    table_metadata.table_name
+                );
+                None
+            })
     }
 
     fn table_statistics_to_df(
@@ -5412,7 +5452,15 @@ impl CayenneTableProvider {
             || self.mem_tier.any_tombstones();
 
         let cache = self.table_statistics.read();
-        let cached_ref: Option<&Statistics> = if has_pending_visibility_changes {
+        // Serve the Inexact view when either (a) uncheckpointed visibility changes
+        // mean the persisted count over-counts live rows, OR (b) the maintained
+        // count itself is not a provably-exact live count (`count_exact == false`,
+        // set by the mem-tier checkpoint's best-effort delta and cleared by a
+        // full-rewrite `Set`). (b) is what stops a drifted count from being served
+        // `Exact` to the COUNT(*) fold once no deletions are pending — the fold then
+        // declines and a real scan answers, fixing the distributed over-count.
+        let serve_inexact = has_pending_visibility_changes || !cache.count_exact;
+        let cached_ref: Option<&Statistics> = if serve_inexact {
             cache.optimizer_inexact.as_ref()
         } else {
             cache.optimizer.as_ref()
@@ -5436,7 +5484,7 @@ impl CayenneTableProvider {
 
         // Cache-miss visibility-overlay path: cache.optimizer_inexact is None,
         // so transform optimizer on-the-fly. Rare — test seed only.
-        if has_pending_visibility_changes {
+        if serve_inexact {
             let Some(optimizer) = cache.optimizer.clone() else {
                 drop(cache);
                 // No persisted stats at all (pre-first-maintenance window on a
@@ -5564,6 +5612,7 @@ impl CayenneTableProvider {
         cache.optimizer = None;
         cache.optimizer_inexact = None;
         cache.raw = None;
+        cache.count_exact = false;
     }
 
     pub(crate) fn clear_scan_file_statistics_cache(&self) {
@@ -6071,28 +6120,39 @@ impl CayenneTableProvider {
         pk_indices: &[usize],
         converter: &RowConverter,
     ) -> Result<CachedPkKeyset> {
-        // Snapshot the un-checkpointed mem-tier BEFORE the durable scan below, so a
-        // concurrent off-`write_lock` checkpoint that flushes-and-clears a shard
-        // mid-rebuild cannot hide a live key: it is either in this snapshot or
-        // already durable in the scan that follows. Cheap: N `ArcSwap` pointer
-        // clones. Folded into the keyset at the end (a no-op for non-memory tables).
-        let mem_snapshots: Vec<Arc<crate::provider::mem_tier::MemTier>> = self
-            .mem_tier
-            .shards()
-            .iter()
-            .map(ArcSwap::load_full)
-            .collect();
-
-        // Wait-free Arc::clone — the inner HashMap is shared, not cloned,
-        // so the scan does not pay an O(N) String + i64 clone per call.
-        let protected_snapshots = self.protected_snapshots.load_full();
+        // Capture the snapshot LIST — un-checkpointed mem-tier shards, the
+        // protected set, and the current snapshot id — COHERENTLY under the
+        // listing fence. A protected-snapshot compaction installs a NEW current
+        // and demotes the old current into `protected` atomically under the WRITE
+        // fence; without this read fence a swap landing BETWEEN the `protected`
+        // and `current` loads would leave the just-demoted old-current snapshot in
+        // NEITHER set, so its keys are dropped from the rebuilt keyset. The next
+        // UPDATE of such a key then false-negates in `apply_on_conflict_to_batch`
+        // (existence miss), records NO supersede tombstone, and leaks the prior
+        // copy — a durable over-count (SF-100 order_line/stock leak the pre-update
+        // version of every key whose snapshot transitioned during a rebuild). The
+        // mem-tier snapshot stays inside the same fence so a concurrent
+        // off-`write_lock` checkpoint cannot hide a live key either: it is in this
+        // snapshot or already durable in the scan that follows.
+        let (mem_snapshots, protected_snapshots, current_snapshot_id) = {
+            let _fence = self.listing_fence.read().await;
+            let mem_snapshots: Vec<Arc<crate::provider::mem_tier::MemTier>> = self
+                .mem_tier
+                .shards()
+                .iter()
+                .map(ArcSwap::load_full)
+                .collect();
+            // Wait-free Arc::clone — the inner HashMap is shared, not cloned.
+            let protected_snapshots = self.protected_snapshots.load_full();
+            let current_snapshot_id = self.get_current_snapshot_id();
+            (mem_snapshots, protected_snapshots, current_snapshot_id)
+        };
 
         let ctx = self.create_session_context();
         // Only read PK columns - no need to load all columns for keyset building
         let pk_projection = pk_indices.to_vec();
 
         // Scan the current snapshot directly from its listed Vortex files.
-        let current_snapshot_id = self.get_current_snapshot_id();
         let scan_plan = self
             .create_snapshot_scan_plan(
                 &ctx.state(),
@@ -6245,6 +6305,36 @@ impl CayenneTableProvider {
         Ok(())
     }
 
+    /// Fold the un-checkpointed RAM mem-tier PKs into `bloom` — the bloom analog
+    /// of [`Self::fold_mem_tier_keys_into_keyset`]. The persisted-bloom fast path
+    /// ([`Self::try_load_persisted_pk_index`]) reconstructs existence from the
+    /// sidecar (which covers the current snapshot as of the last checkpoint) plus
+    /// the durable protected/inline delta — but the sidecar predates the RAM tier.
+    /// In `cdc_durability: memory` a key written after that checkpoint lives ONLY
+    /// in the mem tier, so without this fold the next UPDATE of that key
+    /// false-negatives in [`Self::apply_on_conflict_to_batch`]
+    /// (`existing_keys.get(&key)` is `None`), records NO supersede tombstone, and
+    /// leaks the prior copy — a durable over-count that mirrors the full-rebuild
+    /// bug the [`Self::fold_mem_tier_keys_into_keyset`] fold closes. A superset is
+    /// safe: a mem-tier-tombstoned key re-added is a redundant, correct upsert
+    /// tombstone. `mem_snapshots` MUST be captured coherently with the durable
+    /// reads (see the caller) so a concurrent checkpoint cannot hide a key.
+    fn fold_mem_tier_keys_into_bloom(
+        mem_snapshots: &[Arc<crate::provider::mem_tier::MemTier>],
+        pk_indices: &[usize],
+        converter: &RowConverter,
+        bloom: &mut PkBloom,
+    ) -> Result<()> {
+        for tier in mem_snapshots {
+            for seg in tier.segments.iter() {
+                for batch in seg.batches.iter() {
+                    Self::insert_batch_pks_into_bloom(batch, pk_indices, converter, bloom)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
     // ---- Phase 3: persist/checkpoint the PK existence index across restarts ----
     // Persisted in the metastore (`cayenne_pk_index`) so it is captured by
     // metastore snapshots — letting both a restart AND a node bootstrapped from a
@@ -6312,14 +6402,14 @@ impl CayenneTableProvider {
         &self,
         pk_indices: &[usize],
         converter: &RowConverter,
+        protected_snapshots: &HashMap<String, i64>,
         bloom: &mut PkBloom,
     ) -> Result<()> {
-        let protected_snapshots = self.protected_snapshots.load_full();
         let ctx = self.create_session_context();
         let pk_projection = pk_indices.to_vec();
         let projected_pk_indices: Vec<usize> = (0..pk_indices.len()).collect();
 
-        for (snapshot_id, _max_delete_seq) in protected_snapshots.iter() {
+        for snapshot_id in protected_snapshots.keys() {
             let scan_plan = self
                 .create_snapshot_scan_plan(
                     &ctx.state(),
@@ -6426,10 +6516,13 @@ impl CayenneTableProvider {
     /// the full `load_existing_keyset`) unless the table is upsert-eligible, the
     /// sidecar exists and validates, AND its checkpoint snapshot still equals the
     /// current snapshot (guaranteeing the bloom covers the full current snapshot —
-    /// upsert tables only add sequence-tagged protected/inline data after a
-    /// checkpoint, never rewriting the current snapshot except via compaction,
-    /// which re-persists). The post-checkpoint delta is folded in to keep the
-    /// no-false-negative invariant.
+    /// upsert tables only add data after a checkpoint, never rewriting the current
+    /// snapshot except via compaction, which re-persists). The FULL post-checkpoint
+    /// delta is folded in to keep the no-false-negative invariant: the durable
+    /// protected/inline layers AND the un-checkpointed RAM mem-tier (the last is
+    /// essential in `cdc_durability: memory`, where a key written after the
+    /// checkpoint lives only in RAM — omitting it false-negatives that key's next
+    /// update and leaks the prior copy, a durable over-count).
     async fn try_load_persisted_pk_index(
         &self,
         pk_indices: &[usize],
@@ -6460,9 +6553,31 @@ impl CayenneTableProvider {
             );
             return Ok(None);
         }
+        // Capture the mem-tier shards, the protected set, and the current snapshot
+        // id COHERENTLY under the listing fence — identical to the full rebuild in
+        // `load_existing_keyset`. A compaction/checkpoint landing between these
+        // reads must not leave a live key in NEITHER the durable delta
+        // (protected/inline, extended below) NOR the RAM mem-tier fold, which would
+        // drop it from the bloom and false-negative the next update (over-count).
+        // The mem-tier snapshot is taken inside the same fence so a concurrent
+        // off-`write_lock` checkpoint cannot hide a live key: it is in this snapshot
+        // or already durable in the protected/current scan.
+        let (mem_snapshots, protected_snapshots, current_snapshot_id) = {
+            let _fence = self.listing_fence.read().await;
+            let mem_snapshots: Vec<Arc<crate::provider::mem_tier::MemTier>> = self
+                .mem_tier
+                .shards()
+                .iter()
+                .map(ArcSwap::load_full)
+                .collect();
+            let protected_snapshots = self.protected_snapshots.load_full();
+            let current_snapshot_id = self.get_current_snapshot_id();
+            (mem_snapshots, protected_snapshots, current_snapshot_id)
+        };
+
         // Gate on the snapshot tag: the bloom covers the full current snapshot
         // only if nothing rewrote it since the checkpoint (compaction re-persists).
-        if checkpoint_snapshot != self.get_current_snapshot_id() {
+        if checkpoint_snapshot != current_snapshot_id {
             return Ok(None);
         }
         let Some((mut bloom, blob_snapshot)) = deserialize_pk_bloom_sidecar(&bytes) else {
@@ -6483,8 +6598,18 @@ impl CayenneTableProvider {
             );
             return Ok(None);
         }
-        self.extend_bloom_with_protected_and_inline(pk_indices, converter, &mut bloom)
-            .await?;
+        self.extend_bloom_with_protected_and_inline(
+            pk_indices,
+            converter,
+            &protected_snapshots,
+            &mut bloom,
+        )
+        .await?;
+        // Fold the un-checkpointed RAM mem-tier too: in `cdc_durability: memory` it
+        // is post-checkpoint delta just like the protected/inline layers, and a
+        // RAM-only key omitted here would false-negative its next update and leak
+        // the prior copy (durable over-count). Mirrors `load_existing_keyset`.
+        Self::fold_mem_tier_keys_into_bloom(&mem_snapshots, pk_indices, converter, &mut bloom)?;
         tracing::debug!(
             table = self.table_metadata.table_name.as_str(),
             checkpoint_snapshot = checkpoint_snapshot.as_str(),
@@ -10717,8 +10842,18 @@ impl CayenneTableProvider {
             // accumulated alongside the coalesced stats. Retention deletes below
             // are not yet netted here (TPC-H has none); compaction's `Set` reset
             // bounds any resulting drift.
-            self.persist_table_stats(&stats, RowCountUpdate::Delta(state.live_rows_delta))
-                .await;
+            // `live_rows_delta` is the exactly-netted `inserted - superseded` for
+            // the staged/inline path. Retention deletes below are NOT yet netted
+            // into it, so when retention runs this commit the delta under-counts —
+            // taint exactness in that case (bounded by compaction's `Set` re-baseline).
+            self.persist_table_stats(
+                &stats,
+                RowCountUpdate::Delta {
+                    delta: state.live_rows_delta,
+                    exact: !state.retention_requested,
+                },
+            )
+            .await;
         }
 
         let mut retention_deleted = 0_u64;
@@ -12765,7 +12900,14 @@ impl CayenneTableProvider {
             // as already-applied (`seq <= fence`) without ever being applied
             // during the rewrite, permanently masking it and resurrecting the
             // rows it deletes. Both values must come from one coherent load.
-            let fence_max_delete_seq = deletion_snapshot.max_sequence_number().unwrap_or(0);
+            //
+            // The durable max still over-claims a delete that is pending in the
+            // mem tier below it (cross-shard / off-fence commit reorder), so cap
+            // the fence strictly below that pending floor — see
+            // `protected_snapshot_merge_fence`.
+            let fence_max_delete_seq = self.protected_snapshot_merge_fence(
+                deletion_snapshot.max_sequence_number().unwrap_or(0),
+            );
             (candidates, fence_max_delete_seq, deletion_snapshot)
         };
         let phase1_fence_ms = compaction_start.elapsed().as_millis();
@@ -13312,7 +13454,12 @@ impl CayenneTableProvider {
                 .map(|id| (id.clone(), protected.get(id).copied().unwrap_or(0)))
                 .collect();
             let deletion_snapshot = self.pk_deletion_snapshot();
-            let fence_max_delete_seq = deletion_snapshot.max_sequence_number().unwrap_or(0);
+            // Cap below the smallest still-pending mem-tier delete so a reordered
+            // pending delete below the durable max is never tagged as baked — see
+            // `protected_snapshot_merge_fence`.
+            let fence_max_delete_seq = self.protected_snapshot_merge_fence(
+                deletion_snapshot.max_sequence_number().unwrap_or(0),
+            );
             (ids, thresholds, fence_max_delete_seq, deletion_snapshot)
         };
 
@@ -14323,6 +14470,55 @@ impl CayenneTableProvider {
         pk_deletion_snapshot_for_strategy(&self.pk_deletion_strategy).max_sequence_number()
     }
 
+    /// The smallest still-pending mem-tier delete sequence across all shards, or
+    /// `None` when no mem-tier tombstone is pending.
+    ///
+    /// This is the floor a protected-snapshot compaction fence must stay strictly
+    /// below (see `InMemTombstones::min_delete_sequence`). The durable deletion
+    /// index max (`deletion_index_max_sequence`) can sit ABOVE a delete that is
+    /// still pending in the mem tier: a later apply's delete can fold into the
+    /// durable index ahead of an earlier apply's (off-fence / cross-shard commit
+    /// reorder). Fencing a merged snapshot at/above such a pending delete tags it
+    /// as already-baked, so the scan skips it forever and resurrects the deleted
+    /// row (durable over-count). O(pending tombstones) — off the query hot path
+    /// (only the periodic protected-snapshot compaction calls it).
+    #[must_use]
+    fn min_pending_mem_tier_delete_sequence(&self) -> Option<i64> {
+        self.mem_tier
+            .shards()
+            .iter()
+            .filter_map(|shard| shard.load().tombstones.min_delete_sequence())
+            .min()
+    }
+
+    /// The deletion fence to tag a freshly-merged protected snapshot with: the
+    /// just-loaded durable deletion-index max, CAPPED strictly below the smallest
+    /// still-pending mem-tier delete.
+    ///
+    /// The uncapped durable max over-claims. Under N>1 off-fence CDC a later
+    /// apply's delete can fold into the durable index ahead of an earlier apply's
+    /// (cross-shard / commit reorder), so the durable max can sit ABOVE a delete
+    /// that is still pending in the mem tier and therefore was NEVER baked into
+    /// the merged files. Tagging the merged snapshot with that max makes the scan
+    /// treat the pending delete as already-applied (`delete_seq <= threshold`) and
+    /// skip it forever, resurrecting the deleted row (measured: `order_line`
+    /// +14.9M / +19.6% at SF-100 N=4). Capping below the pending floor forces
+    /// those deletes to apply at scan instead.
+    ///
+    /// No under-count: a pending upsert's `(delete, data)` pair is one atomic
+    /// apply, so its reinsert row is ALSO pending (never in these durable merged
+    /// files). Lowering the fence can only apply MORE deletes to the old rows the
+    /// merge carried, never hide a reinsert that was baked in. The cap fires only
+    /// when a pending delete sits below the durable max (the reorder gap); with no
+    /// pending mem-tier delete it is the durable max unchanged.
+    #[must_use]
+    fn protected_snapshot_merge_fence(&self, durable_max_delete_seq: i64) -> i64 {
+        self.min_pending_mem_tier_delete_sequence()
+            .map_or(durable_max_delete_seq, |pending_floor| {
+                durable_max_delete_seq.min(pending_floor - 1)
+            })
+    }
+
     /// Clear ALL cached deletion vectors, insert records, and protected
     /// snapshots, unconditionally.
     ///
@@ -15098,6 +15294,9 @@ impl CayenneTableProvider {
 
         // Merge min/max/null blob and NDV sketches into the existing aggregate.
         let prev_num_rows = existing_stats.as_ref().map_or(0, |e| e.num_rows);
+        // Whether the prior count was provably exact. Absent existing stats (first
+        // write / overwrite-replace) start exact; a `Set` overrides regardless.
+        let prev_num_rows_exact = existing_stats.as_ref().is_none_or(|e| e.num_rows_exact);
         let statistics_blob = match &existing_stats {
             Some(existing) => accumulator
                 .merged_file_statistics_blob(&existing.statistics_blob)
@@ -15119,11 +15318,21 @@ impl CayenneTableProvider {
         }
         let ndv_sketches = merged_ndv.serialize();
 
-        // Apply the live-row-count update relative to the previous aggregate.
-        let num_rows = match num_rows_update {
-            RowCountUpdate::Delta(delta) => prev_num_rows.saturating_add(delta).max(0),
-            RowCountUpdate::Set(n) => n.max(0),
-            RowCountUpdate::Unchanged => prev_num_rows,
+        // Apply the live-row-count update relative to the previous aggregate, and
+        // track whether the result is still provably exact: a `Set` is
+        // authoritative (compaction/overwrite materialized exactly the live rows);
+        // an `exact` delta preserves the prior exactness; a best-effort delta (the
+        // mem-tier checkpoint, whose durable-supersede netting is approximate)
+        // taints it; `Unchanged` preserves. A tainted (`false`) count is served
+        // `Inexact` so the COUNT(*) fold declines rather than answering from a
+        // possibly-over-counted maintained value.
+        let (num_rows, num_rows_exact) = match num_rows_update {
+            RowCountUpdate::Delta { delta, exact } => (
+                prev_num_rows.saturating_add(delta).max(0),
+                exact && prev_num_rows_exact,
+            ),
+            RowCountUpdate::Set(n) => (n.max(0), true),
+            RowCountUpdate::Unchanged => (prev_num_rows, prev_num_rows_exact),
         };
 
         let stats = TableStatistics {
@@ -15131,6 +15340,7 @@ impl CayenneTableProvider {
             statistics_blob,
             num_rows,
             ndv_sketches,
+            num_rows_exact,
         };
 
         if let Err(e) = self.catalog.upsert_table_statistics(&stats).await {
@@ -15148,6 +15358,7 @@ impl CayenneTableProvider {
         let mut cache = self.table_statistics.write();
         cache.optimizer = df_stats;
         cache.optimizer_inexact = df_stats_inexact;
+        cache.count_exact = stats.num_rows_exact;
         // Keep the raw blob for the next persist to avoid a catalog read.
         cache.raw = Some(stats);
     }
@@ -17282,6 +17493,23 @@ impl CayenneTableProvider {
             - i64::try_from(superseded).unwrap_or(i64::MAX);
         self.inlined_row_count.fetch_add(net, Ordering::Relaxed);
 
+        // Accumulate the durable (file+inline) supersedes this append hid, so the
+        // next mem-tier checkpoint can net them out of its persisted `Delta`
+        // (`flushed_mem_rows` counts the new versions but not the durable rows they
+        // supersede, which stay physically resident until compaction). Without this
+        // the maintained count climbs toward "every row ever flushed". Reset by the
+        // checkpoint clear. See `mem_tier_pending_superseded`. Saturating so a
+        // long-lived process between checkpoints can never wrap `i64` negative (a
+        // negative accumulator would inflate the checkpoint delta via its
+        // `saturating_sub`); clamped at `i64::MAX` it only ever over-nets, keeping
+        // the maintained count Inexact-and-conservative rather than inflated.
+        let superseded_delta = i64::try_from(superseded).unwrap_or(i64::MAX);
+        let _ = self.mem_tier_pending_superseded.fetch_update(
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+            |current| Some(current.saturating_add(superseded_delta)),
+        );
+
         self.apply_maintained_aggregate_insert_batches(maintained_aggregate_insert)
             .await;
         self.apply_maintained_aggregate_delete_pending(maintained_aggregate_delete)
@@ -17853,15 +18081,27 @@ impl CayenneTableProvider {
         // the persisted aggregate. So the checkpoint is where they enter the
         // maintained count, or a `cdc_durability: memory` table reports
         // `num_rows: 0` to the optimizer forever (collapsing every hash join's
-        // build/probe sizing). Add only `flushed_mem_rows` (the retained,
-        // post-tombstone RAM corpus): any inline rows swept into the same
-        // checkpoint file were ALREADY persisted at inline-commit time, so
-        // `total_rows` would double-count them. Residual drift from superseding
-        // already-durable rows (not netted here) is bounded by compaction's
-        // periodic `Set` re-baseline, matching the staged path's tradeoff. The
-        // stats blob re-merges idempotently regardless of the count delta.
-        let row_count_update = if let Ok(delta) = i64::try_from(flushed_mem_rows) {
-            RowCountUpdate::Delta(delta)
+        // build/probe sizing).
+        //
+        // `flushed_mem_rows` is the retained, post-tombstone RAM corpus (any inline
+        // rows swept into the same checkpoint file were ALREADY persisted at
+        // inline-commit time, so `total_rows` would double-count them). But those
+        // rows include NEW versions that supersede already-durable rows which stay
+        // physically resident until compaction — so a raw `Delta(flushed_mem_rows)`
+        // over-counts the live set by the number of durable supersedes, and that
+        // over-count is served `Exact` to the distributed COUNT(*) fold once no
+        // deletions are pending. Net it out with the durable supersedes accumulated
+        // by `append_to_shard` (best-effort: concurrent off-fence appends / a
+        // partial-prefix flush can leave a small residual), and mark the delta
+        // `exact: false` so the maintained count is served `Inexact` — the fold then
+        // declines and a real scan answers `COUNT(*)`. A full-rewrite compaction
+        // `Set` later re-establishes an exact count.
+        let pending_superseded = self.mem_tier_pending_superseded.swap(0, Ordering::Relaxed);
+        let row_count_update = if let Ok(flushed) = i64::try_from(flushed_mem_rows) {
+            RowCountUpdate::Delta {
+                delta: flushed.saturating_sub(pending_superseded),
+                exact: false,
+            }
         } else {
             tracing::warn!(
                 table = self.table_metadata.table_name.as_str(),
@@ -23700,6 +23940,7 @@ mod tests {
             statistics_blob,
             num_rows: 3,
             ndv_sketches: None,
+            num_rows_exact: true,
         };
 
         let stats = CayenneTableProvider::table_statistics_to_df(&schema, &table_stats)
@@ -28765,6 +29006,54 @@ mod tests {
         );
     }
 
+    /// A protected-snapshot merge fence is CAPPED strictly below the smallest
+    /// still-pending mem-tier delete, so a delete that reordered below the durable
+    /// index max (a later apply folded ahead of it) is never tagged as
+    /// already-baked — the SF-100 N=4 `order_line` +14.9M over-count. The uncapped
+    /// durable max would skip such a delete at scan forever and resurrect the row.
+    /// No under-count: the pending `(delete, data)` pair is one atomic apply, so
+    /// the reinsert is also pending (never in the merged durable files) — lowering
+    /// the fence only applies more deletes to old rows.
+    #[tokio::test]
+    async fn protected_snapshot_merge_fence_caps_below_pending_mem_tier_delete() {
+        let ctx = SessionContext::new();
+        let (provider, _tmp, _ids) =
+            build_seq_prefix_fixture("merge_fence_cap", ctx.runtime_env(), &[10, 20]).await;
+
+        // No pending mem-tier delete yet: the fence is the durable max unchanged.
+        assert_eq!(provider.min_pending_mem_tier_delete_sequence(), None);
+        assert_eq!(provider.protected_snapshot_merge_fence(32), 32);
+
+        // Durable deletion index max = 32 (a later apply's delete folded ahead).
+        install_int64_deletes(&provider, &[(999, 32)]);
+        assert_eq!(provider.deletion_index_max_sequence(), Some(32));
+
+        // A delete for key 0 (its reinsert row is data@31) is STILL PENDING in the
+        // mem tier at delete_seq 30 — reordered below the durable max. Append it as
+        // one atomic apply segment (empty batches: only the tombstone matters here).
+        let mut seg = crate::provider::mem_tier::SegmentTombstones::from_int64_keys([0_i64]);
+        seg.stamp(30);
+        let cur = provider.mem_tier.shard(0).load();
+        let next = cur.append_segment(Arc::new(vec![]), 31, seg, 0, 0, 0);
+        provider.mem_tier.shard(0).store(Arc::new(next));
+
+        assert_eq!(
+            provider.min_pending_mem_tier_delete_sequence(),
+            Some(30),
+            "the pending floor is the mem-tier delete, below the durable max"
+        );
+        // The fence must NOT reach the durable max (32) — that would skip delete@30
+        // forever. It caps strictly below the pending floor.
+        assert_eq!(
+            provider.protected_snapshot_merge_fence(32),
+            29,
+            "fence caps strictly below the pending mem-tier delete (30), not the durable max (32)"
+        );
+        // When the durable max is already below the pending floor there is no
+        // reorder gap, so the fence stays the durable max (no needless re-apply).
+        assert_eq!(provider.protected_snapshot_merge_fence(10), 10);
+    }
+
     /// STAGE-2 DELIVERABLE TEST (6) — REGRESSION FIX. An OLDER-prefix candidate
     /// with an EMPTY manifest (its async population has not landed) is BAKED via its
     /// protected-set watermark (its single allocated commit-sequence — the seq of
@@ -30698,6 +30987,209 @@ mod tests {
             3,
             "reopened disk-tier state must preserve exact COUNT(*)"
         );
+    }
+
+    /// Assert the `COUNT(*)` metadata-fold soundness invariant for `provider`.
+    ///
+    /// The `COUNT(*)` fold (`CayenneStatsAggregateRewriter` and `DataFusion`'s
+    /// built-in `AggregateStatistics`) answers from the physical scan's
+    /// `partition_statistics(None).num_rows`, but ONLY when that is
+    /// `Precision::Exact` (the footer-sum path served when
+    /// `has_pending_deletions()` is false). That footer sum is a raw physical row
+    /// count — it does not subtract superseded/deleted rows still resident in
+    /// un-compacted files. This checks three things at a settling step:
+    ///   * a real `SELECT id,value` scan (bypasses every COUNT fold) returns
+    ///     exactly the live model rows;
+    ///   * `SELECT COUNT(*)` equals the live count;
+    ///   * whenever the scan reports an `Exact` `num_rows` (the only case the fold
+    ///     trusts), it equals the true live row count — i.e. the fold cannot
+    ///     over-count.
+    ///
+    /// A failure on the third assertion with the first passing localizes a
+    /// stats-only over-count (the fold lies, a real scan is correct); a failure
+    /// on the first localizes physical resurrection (a real scan over-counts too).
+    ///
+    /// Returns `true` if the scan reported an `Exact` `num_rows` at this step (i.e.
+    /// the foldable path was actually exercised), so the caller can assert the
+    /// test was not vacuously green.
+    async fn assert_count_star_fold_never_overcounts(
+        ctx: &SessionContext,
+        provider: &CayenneTableProvider,
+        table_name: &str,
+        model: &std::collections::BTreeMap<i64, i64>,
+        step: &str,
+    ) -> bool {
+        let live = i64::try_from(model.len()).expect("live count fits i64");
+        let pending = provider.has_pending_deletions();
+
+        // Real scan — bypasses the COUNT metadata fold entirely.
+        let rows = collect_id_value_pairs(ctx, provider, table_name).await;
+        let expected: Vec<(i64, i64)> = model.iter().map(|(&k, &v)| (k, v)).collect();
+        assert_eq!(
+            rows, expected,
+            "[{step}] real scan diverged from the live model \
+             (has_pending_deletions={pending}) — physical resurrection"
+        );
+
+        // COUNT(*) end-to-end.
+        let count = query_count_star(ctx, provider, table_name).await;
+        assert_eq!(
+            count,
+            live,
+            "[{step}] COUNT(*) mismatch: got {count}, live {live} \
+             (real scan returned {} rows, has_pending_deletions={pending})",
+            rows.len()
+        );
+
+        // The exact value the metadata fold consumes.
+        let plan = provider
+            .scan(&ctx.state(), None, &[], None)
+            .await
+            .expect("scan plan builds");
+        let stats = plan
+            .partition_statistics(None)
+            .expect("partition statistics available");
+        if let DFPrecision::Exact(n) = stats.num_rows {
+            let n = i64::try_from(n).expect("num_rows fits i64");
+            assert_eq!(
+                n,
+                live,
+                "[{step}] FOLD-UNSOUND: scan reports Exact num_rows={n} but only {live} rows are \
+                 live (has_pending_deletions={pending}) — COUNT(*) would over-count by {}",
+                n - live
+            );
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Regression for the SF-1000 `COUNT(*)` over-count: the maintained
+    /// `TableStatistics.num_rows` must track the LIVE row set through a memory-CDC
+    /// upsert workload, not "every row ever flushed".
+    ///
+    /// Drives the intersection `mutation_property_test` never exercises: the
+    /// **memory-CDC checkpoint** path (`write_cdc_append_stream` +
+    /// `checkpoint_mem_tier`) superseding already-durable rows, plus the
+    /// **seq-prefix bake**. Each round asserts two invariants:
+    ///  1. single-node soundness — a real scan and `COUNT(*)` never over-count
+    ///     (single-node folds on Vortex footer sums, kept Inexact by the residual
+    ///     supersede tombstones, so `COUNT(*)` real-scans and stays correct);
+    ///  2. the maintained count equals the live set — this is the count the
+    ///     DISTRIBUTED coordinator folds `COUNT(*)` on (via
+    ///     `local_executor_table_statistics` →`optimizer_table_statistics()`,
+    ///     served `Exact` when no visibility changes are pending), so a drift here
+    ///     is the SF-1000 gate over-count. It drifts because the checkpoint
+    ///     `Delta(flushed_mem_rows)` does not net supersedes of durable rows.
+    #[tokio::test]
+    async fn memory_cdc_supersede_maintained_count_tracks_live() {
+        const KEYS: i64 = 8;
+        let ctx = SessionContext::new();
+        let runtime_env = ctx.runtime_env();
+        let table_name = "count_star_overcount";
+        let (provider, _catalog, _tmp) = create_cdc_upsert_table_with_vortex_config(
+            table_name,
+            Arc::clone(&runtime_env),
+            VortexConfig {
+                cdc_durability: crate::metadata::CdcDurability::Memory,
+                deletion_mode: crate::metadata::DeletionMode::Key,
+                inline_max_rows: 0,
+                ..VortexConfig::default()
+            },
+        )
+        .await;
+        assert!(provider.is_cdc_memory_mode(), "memory mode must be active");
+        provider.install_slot_advancer(Arc::new(NoopSlotAdvancer));
+        let schema = Arc::clone(&provider.table_metadata.schema);
+
+        // Live-row model (id -> value).
+        let mut model: std::collections::BTreeMap<i64, i64> = std::collections::BTreeMap::new();
+        let ids: Vec<i64> = (0..KEYS).collect();
+
+        let append_and_checkpoint = |vals: Vec<i64>| {
+            let provider = &provider;
+            let ctx = &ctx;
+            let ids = &ids;
+            let schema = Arc::clone(&schema);
+            async move {
+                let _ = provider
+                    .write_cdc_append_stream(
+                        single_batch_stream(id_value_batch(schema, ids, &vals)),
+                        &ctx.task_ctx(),
+                    )
+                    .await
+                    .expect("memory-mode CDC append");
+                provider
+                    .checkpoint_mem_tier()
+                    .await
+                    .expect("checkpoint RAM tier to a durable snapshot");
+            }
+        };
+
+        // Bootstrap the durable rows.
+        let vals: Vec<i64> = (0..KEYS).map(|k| k * 10).collect();
+        append_and_checkpoint(vals.clone()).await;
+        for (&k, &v) in ids.iter().zip(vals.iter()) {
+            model.insert(k, v);
+        }
+
+        // Many rounds of superseding upserts, each its own checkpoint → a fresh
+        // protected snapshot carrying new versions + tombstones for the prior ones,
+        // then a bake of the older prefix.
+        for round in 1..=12i64 {
+            let vals: Vec<i64> = (0..KEYS).map(|k| round * 1000 + k).collect();
+            append_and_checkpoint(vals.clone()).await;
+            for (&k, &v) in ids.iter().zip(vals.iter()) {
+                model.insert(k, v);
+            }
+            // Drain any debounced post-write maintenance so the bake operates on a
+            // stable snapshot set, then bake the older prefix.
+            provider
+                .flush_pending_maintenance()
+                .await
+                .expect("drain pending maintenance");
+            let _ = provider.bake_seq_prefix_protected_snapshots().await;
+
+            // (1) Single-node soundness: a real scan and `COUNT(*)` never over-count
+            // (single-node folds on footer sums, which stay Inexact while supersede
+            // tombstones linger, so `COUNT(*)` real-scans and is correct).
+            let _ = assert_count_star_fold_never_overcounts(
+                &ctx,
+                &provider,
+                table_name,
+                &model,
+                &format!("round {round}"),
+            )
+            .await;
+
+            // (2) Distributed-gate fix. `optimizer_table_statistics()` is what
+            // `local_executor_table_statistics` (runtime::cluster::partition) reports
+            // to the coordinator, which folds `COUNT(*)` on it — but ONLY when it is
+            // `Exact`. Two invariants:
+            let live = model.len();
+            let stats = provider
+                .optimizer_table_statistics()
+                .expect("maintained stats present after checkpoint");
+            //  (A) correctness: a mem-tier checkpoint taints exactness, so the count
+            //      is served `Inexact` — the coordinator's fold declines and a real
+            //      scan answers instead of folding a possibly-over-counted value.
+            assert!(
+                matches!(stats.num_rows, DFPrecision::Inexact(_)),
+                "round {round}: maintained count must be served Inexact after a mem-tier \
+                 checkpoint (so the distributed COUNT(*) fold declines), got {:?}",
+                stats.num_rows,
+            );
+            //  (B) accuracy (best-effort): the checkpoint delta nets durable
+            //      supersedes, so the value stays at/near live instead of climbing
+            //      toward "every row ever flushed" (here the per-round net delta is
+            //      0, so it is exactly live).
+            assert_eq!(
+                stats.num_rows.get_value().copied(),
+                Some(live),
+                "round {round}: maintained count drifted above the {live} live rows — the \
+                 checkpoint `Delta` did not net durable supersedes",
+            );
+        }
     }
 
     /// A RAM-tier CDC append must NOT invalidate the inline-view cache: it
@@ -33286,6 +33778,122 @@ mod tests {
             pairs,
             vec![(1, 111), (2, 200), (3, 30), (4, 40), (5, 50)],
             "upserts after a checkpoint-accelerated reopen must stay correct (no drops/duplicates)"
+        );
+    }
+
+    /// Regression: the persisted-bloom fast path (`try_load_persisted_pk_index`)
+    /// must fold the un-checkpointed RAM mem-tier, exactly like the full
+    /// `load_existing_keyset` rebuild does. A key written to the mem tier AFTER the
+    /// last checkpoint lives ONLY in RAM — it is in neither the persisted sidecar
+    /// bloom (which covers the checkpointed snapshot) nor the protected/inline
+    /// delta. Without the `fold_mem_tier_keys_into_bloom` fold, a rebuild through
+    /// this fast path drops that key, so its next UPDATE false-negatives its
+    /// existence check, records NO supersede tombstone, and leaks the prior copy —
+    /// a durable over-count (COUNT(*) = 3 instead of 2).
+    #[tokio::test]
+    async fn test_persisted_bloom_rebuild_folds_uncheckpointed_mem_tier_key() {
+        let ctx = SessionContext::new();
+        let runtime_env = ctx.runtime_env();
+        let (provider, _catalog, _tmp) = create_cdc_upsert_table_with_vortex_config(
+            "persisted_bloom_mem_fold",
+            Arc::clone(&runtime_env),
+            VortexConfig {
+                cdc_durability: crate::metadata::CdcDurability::Memory,
+                deletion_mode: crate::metadata::DeletionMode::Key,
+                ..VortexConfig::default()
+            },
+        )
+        .await;
+        assert!(provider.is_cdc_memory_mode(), "memory mode must be active");
+        provider.install_slot_advancer(Arc::new(NoopSlotAdvancer));
+        let schema = Arc::clone(&provider.table_metadata.schema);
+
+        // 1. Land key 1 durably, then compact — this persists the PK-index bloom
+        //    checkpoint for the current snapshot (covering key 1 only).
+        let _ = provider
+            .write_cdc_append_stream(
+                single_batch_stream(id_value_batch(Arc::clone(&schema), &[1], &[10])),
+                &ctx.task_ctx(),
+            )
+            .await
+            .expect("append key 1 to RAM");
+        provider
+            .checkpoint_mem_tier()
+            .await
+            .expect("checkpoint key 1 to durable");
+        provider
+            .rewrite_current_snapshot_for_compaction()
+            .await
+            .expect("compaction persists the pk-index bloom");
+        assert!(
+            provider
+                .catalog
+                .get_pk_index(&provider.table_metadata.table_id)
+                .await
+                .expect("query pk index")
+                .is_some(),
+            "compaction must persist the PK-index bloom checkpoint"
+        );
+
+        // 2. Land key 2 in the RAM mem-tier ONLY (no checkpoint): it is absent from
+        //    the persisted bloom AND the durable snapshot — it lives only in RAM.
+        let _ = provider
+            .write_cdc_append_stream(
+                single_batch_stream(id_value_batch(Arc::clone(&schema), &[2], &[20])),
+                &ctx.task_ctx(),
+            )
+            .await
+            .expect("append key 2 to RAM (un-checkpointed)");
+
+        // 3. The rebuilt index MUST contain the RAM-only key 2. Load it directly via
+        //    the fast path: without the mem-tier fold the returned bloom omits key 2.
+        let pk_indices = provider
+            .primary_key_indices()
+            .expect("pk indices")
+            .expect("table has a primary key");
+        let converter = provider.build_pk_converter(&pk_indices).expect("converter");
+        let loaded = provider
+            .try_load_persisted_pk_index(&pk_indices, &converter)
+            .await
+            .expect("load persisted index")
+            .expect("persisted bloom present after compaction");
+        let CachedPkIndex::Bloom(bloom) = &loaded else {
+            panic!("fast path must return a Bloom");
+        };
+        let key2_batch = id_value_batch(Arc::clone(&schema), &[2], &[0]);
+        let key2_cols: Vec<_> = pk_indices
+            .iter()
+            .map(|&i| Arc::clone(key2_batch.column(i)))
+            .collect();
+        let key2_rows = converter
+            .convert_columns(&key2_cols)
+            .expect("convert key 2");
+        assert!(
+            bloom.maybe_contains(key2_rows.row(0).as_ref()),
+            "the un-checkpointed RAM key must be folded into the persisted-bloom rebuild"
+        );
+
+        // 4. End-to-end: drop the cached keyset so the next write cold-rebuilds via
+        //    the fast path, then UPDATE key 2. The upsert must supersede the prior
+        //    copy (found via the mem-tier fold), not leak it.
+        provider.clear_cached_pk_keyset();
+        let _ = provider
+            .write_cdc_append_stream(
+                single_batch_stream(id_value_batch(Arc::clone(&schema), &[2], &[222])),
+                &ctx.task_ctx(),
+            )
+            .await
+            .expect("update key 2");
+        assert_eq!(
+            query_count_star(&ctx, &provider, "persisted_bloom_mem_fold").await,
+            2,
+            "the RAM-only key's update must supersede its prior copy, not leak it \
+             (regression: persisted-bloom rebuild dropped the un-checkpointed mem-tier key)"
+        );
+        assert_eq!(
+            collect_id_value_pairs(&ctx, &provider, "persisted_bloom_mem_fold").await,
+            vec![(1, 10), (2, 222)],
+            "key 2 must show only the updated value; key 1 unchanged"
         );
     }
 

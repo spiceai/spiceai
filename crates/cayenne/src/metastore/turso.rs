@@ -322,6 +322,7 @@ impl TursoMetastore {
             statistics_blob BLOB NOT NULL,
             num_rows BIGINT NOT NULL DEFAULT 0,
             ndv_sketches BLOB,
+            num_rows_exact INTEGER NOT NULL DEFAULT 1,
             FOREIGN KEY (table_id) REFERENCES cayenne_table(table_id) ON DELETE CASCADE
         )
     ";
@@ -620,6 +621,16 @@ impl MetastoreBackend for TursoMetastore {
         let _ = conn
             .execute(
                 "ALTER TABLE cayenne_table_statistics ADD COLUMN ndv_sketches BLOB",
+                (),
+            )
+            .await;
+        // Whether the maintained `num_rows` is a provably-exact live count. Legacy
+        // rows predate the mem-tier drift fix; DEFAULT 1 trusts their count once
+        // (the next mem-tier checkpoint delta taints a drifted one to 0; only a
+        // full-rewrite `Set` restores exactness). See the sqlite note.
+        let _ = conn
+            .execute(
+                "ALTER TABLE cayenne_table_statistics ADD COLUMN num_rows_exact INTEGER NOT NULL DEFAULT 1",
                 (),
             )
             .await;
