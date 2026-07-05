@@ -1121,7 +1121,13 @@ impl ResolvedAggregateExpr {
                 MaintainedAggregateFunction::Sum | MaintainedAggregateFunction::Avg,
                 Some(data_type),
             ) if is_maintainable_float(data_type) => AggregateOutputType::Float64,
-            (MaintainedAggregateFunction::Sum | MaintainedAggregateFunction::Avg, None) => {
+            (
+                MaintainedAggregateFunction::Sum
+                | MaintainedAggregateFunction::Avg
+                | MaintainedAggregateFunction::Min
+                | MaintainedAggregateFunction::Max,
+                None,
+            ) => {
                 return Err(DataFusionError::Plan(format!(
                     "{:?} maintained aggregate requires a column",
                     expr.function
@@ -1144,12 +1150,6 @@ impl ResolvedAggregateExpr {
                 || matches!(data_type, DataType::Decimal128(_, _)) =>
             {
                 AggregateOutputType::SameAsInput
-            }
-            (MaintainedAggregateFunction::Min | MaintainedAggregateFunction::Max, None) => {
-                return Err(DataFusionError::Plan(format!(
-                    "{:?} maintained aggregate requires a column",
-                    expr.function
-                )));
             }
             (function, Some(data_type)) => {
                 return Err(DataFusionError::Plan(format!(
@@ -1770,6 +1770,10 @@ fn scalar_as_f64(scalar: &ScalarValue) -> DataFusionResult<f64> {
 /// timezone on output. Float `MIN`/`MAX` (NaN ordering) is a deliberate follow-up
 /// and errors here — the view then simply does not build, and the query falls back
 /// to a base-table scan (correct, not accelerated).
+#[expect(
+    clippy::match_same_arms,
+    reason = "each integer/temporal arm binds a different-width value (&i64, &i32, &i8, &u64, ...) so the identical-looking i128::from(*v) bodies cannot be merged into one | pattern"
+)]
 fn scalar_order_key(scalar: &ScalarValue) -> DataFusionResult<i128> {
     match scalar {
         ScalarValue::Int64(Some(v)) => Ok(i128::from(*v)),
