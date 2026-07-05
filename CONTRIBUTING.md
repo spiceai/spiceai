@@ -90,7 +90,7 @@ xcode-select --install
 # Install dependencies
 brew install rust
 
-# Cmake/Protobuf are only required for building the databricks connector
+# CMake and Protobuf are required by several components (gRPC/Flight, Databricks, and other connectors)
 brew install cmake
 brew install protobuf
 
@@ -155,17 +155,13 @@ spice run
 
 #### VSCode Configuration
 
-To configure VSCode to automatically apply the rustfmt style on save and to use the same Clippy rules we enforce in our CI as the default, add the following in your User Settings JSON file:
+To configure VSCode to automatically apply the rustfmt style on save and to run the same Clippy rules we enforce in CI, copy the checked-in template to your (gitignored) workspace settings:
 
-```json
-  "[rust]": {
-    "editor.defaultFormatter": "rust-lang.rust-analyzer",
-    "editor.formatOnSave": true,
-  },
-  "rust-analyzer.check.command": "clippy",
-  "rust-analyzer.check.features": "all",
-  "rust-analyzer.check.extraArgs": ["--", "-Dwarnings", "-Dclippy::expect_used", "-Dclippy::pedantic", "-Dclippy::unwrap_used", "-Dclippy::clone_on_ref_ptr", "-Aclippy::module_name_repetitions"]
+```bash
+cp .vscode/settings.json.template .vscode/settings.json
 ```
+
+The template is the canonical editor config — if CI lint rules change in the `Makefile`, update the template alongside them.
 
 By default, `rust-analyzer` will attempt to rebuild all dependencies when a change is made to a `cargo.toml` file. To prevent this and only rebuild what has changed, add the following in your User Settings JSON file, setting the value to your architecture:
 
