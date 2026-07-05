@@ -394,6 +394,11 @@ pub struct DataFusionBuilder {
     /// dedicated thread pools are enabled (set by the Runtime builder); `None`
     /// leaves the full budget to queries and gives compaction no separate pool.
     compaction_memory_fraction: Option<f64>,
+    /// Estimated aggregate bytes the enabled changes-mode Cayenne tables reserve
+    /// OUTSIDE the query pool (per-table keyset/segment/coalesce/inline caches),
+    /// set by the Runtime builder. When it exceeds the base host/8 headroom, the
+    /// query-memory default is reduced by the excess. 0 = none / not Cayenne CDC.
+    cayenne_cdc_reservation_bytes: u64,
     cayenne_optimizer_rules: CayenneOptimizerRules,
     /// Arbitrary additional analyzer rules.
     additional_analyzer_rules: Vec<Arc<dyn AnalyzerRule + Send + Sync>>,
@@ -453,6 +458,7 @@ impl DataFusionBuilder {
             cayenne_sort_merge_memory_pool_fraction: None,
             cayenne_footer_cache_mb: None,
             compaction_memory_fraction: None,
+            cayenne_cdc_reservation_bytes: 0,
             cayenne_optimizer_rules: CayenneOptimizerRules::default(),
             additional_analyzer_rules: vec![],
             executor_registry: None,
@@ -604,6 +610,16 @@ impl DataFusionBuilder {
         self
     }
 
+    /// Estimated off-pool per-table Cayenne CDC cache reservation (bytes), summed
+    /// over enabled changes-mode Cayenne tables (keyset/segment/coalesce/inline).
+    /// Used to reduce the query-memory default when it exceeds the base host/8
+    /// headroom. Set by the Runtime builder; `0` disables the reduction.
+    #[must_use]
+    pub fn cayenne_cdc_reservation_bytes(mut self, bytes: u64) -> Self {
+        self.cayenne_cdc_reservation_bytes = bytes;
+        self
+    }
+
     /// Carve a dedicated compaction memory pool of `fraction` of the query
     /// memory limit. Set by the Runtime builder only when Cayenne acceleration
     /// is configured and dedicated thread pools are enabled.
@@ -685,8 +701,11 @@ impl DataFusionBuilder {
             .compaction_memory_fraction
             .and_then(validate_compaction_memory_fraction);
         let cayenne_active = compaction_memory_fraction.is_some();
-        let effective_memory_limit =
-            effective_query_memory_limit(self.memory_limit, cayenne_active);
+        let effective_memory_limit = effective_query_memory_limit(
+            self.memory_limit,
+            cayenne_active,
+            self.cayenne_cdc_reservation_bytes,
+        );
         let compaction_memory_bytes = compaction_memory_fraction.map(|fraction| {
             #[expect(
                 clippy::cast_precision_loss,
@@ -1464,29 +1483,66 @@ impl Default for AnalyzerRulesBuilder {
 /// compaction carve) when the operator sets no explicit `runtime.query.memory_limit`.
 const DEFAULT_QUERY_MEMORY_PERCENT: u64 = 90;
 
-/// Reduced default used when Cayenne in-memory acceleration is active. The query
-/// pool, the carved compaction pool, AND the off-pool Cayenne in-memory CDC tier
-/// (`cdc_durability: memory`) are each derived from total RAM; sized in isolation
-/// they sum to >100% of host — the SF1000 process-OOM (RSS 242 GiB on a 256 GiB
-/// box, the query pool never reporting exhaustion because the tier is off-pool).
-/// Capping the query+compaction block at 75% reserves the remaining 25% for the
-/// tier (~12.5%) plus caches / inline memtables / encode buffers / OS headroom
-/// (~12.5%). See [`coordinated_mem_tier_budget`].
-const CAYENNE_QUERY_MEMORY_PERCENT: u64 = 75;
+/// Reduced BASE default used when Cayenne in-memory acceleration is active. The
+/// query pool, the carved compaction pool, AND the off-pool Cayenne in-memory CDC
+/// tier (`cdc_durability: memory`) are each derived from total RAM; sized in
+/// isolation they sum to >100% of host — the SF1000 process-OOM (RSS 242 GiB on a
+/// 256 GiB box, the query pool never reporting exhaustion because the tier is
+/// off-pool). Capping the query+compaction block at 70% reserves the remaining 30%
+/// for the tier (~12.5%, [`coordinated_mem_tier_budget`]) plus the per-table CDC
+/// caches / inline memtables / encode buffers / OS headroom. This is only the BASE:
+/// when the estimated per-table CDC cache reservation (keyset/segment/coalesce/
+/// inline, summed over changes-mode tables) EXCEEDS the base host/8 headroom, the
+/// query default is reduced further by the excess in
+/// [`effective_query_memory_limit`], down to [`CAYENNE_QUERY_MEMORY_FLOOR_PERCENT`].
+const CAYENNE_QUERY_MEMORY_PERCENT: u64 = 70;
 
-fn effective_query_memory_limit(memory_limit: Option<u64>, cayenne_active: bool) -> u64 {
+/// Floor (% of host) the reservation-aware reduction never pushes the query pool
+/// below, so a cache-heavy CDC config (many tables and/or large per-table caches)
+/// cannot starve queries. Beyond it, the mem-tier install-time check warns and
+/// memory mode leans on the per-table caps + spill/durable backstops.
+const CAYENNE_QUERY_MEMORY_FLOOR_PERCENT: u64 = 50;
+
+fn effective_query_memory_limit(
+    memory_limit: Option<u64>,
+    cayenne_active: bool,
+    cdc_reservation_bytes: u64,
+) -> u64 {
     memory_limit.unwrap_or_else(|| {
         let total_memory = crate::resource_monitor::get_total_memory();
-        let percent = if cayenne_active {
-            CAYENNE_QUERY_MEMORY_PERCENT
-        } else {
-            DEFAULT_QUERY_MEMORY_PERCENT
-        };
-        let default_limit = total_memory.saturating_mul(percent) / 100;
+        if !cayenne_active {
+            let default_limit = total_memory.saturating_mul(DEFAULT_QUERY_MEMORY_PERCENT) / 100;
+            tracing::debug!(
+                cayenne_active,
+                "No query memory limit specified, defaulting to {DEFAULT_QUERY_MEMORY_PERCENT}% of total memory: {}",
+                util::human_readable_bytes(default_limit as usize)
+            );
+            return default_limit;
+        }
+
+        // Cayenne CDC active. Base is CAYENNE_QUERY_MEMORY_PERCENT of host, leaving
+        // room for the off-pool in-memory tier (clamped to <= host/8 by
+        // `coordinated_mem_tier_budget`) plus the per-table CDC caches + OS headroom.
+        // The per-table caches (keyset/segment/coalesce/inline) live OUTSIDE the
+        // query pool and scale with table count; they are assumed to fit the base
+        // host/8 headroom. When the estimated reservation EXCEEDS that headroom,
+        // carve the excess out of the query pool: because the tier is already capped
+        // at host/8, `query_pool + compaction + tier(<=host/8) + caches` then stays
+        // within host (the freed query bytes plus the host/8 headroom cover the
+        // caches and OS slack the 75%->70% cut also frees). Floored at
+        // CAYENNE_QUERY_MEMORY_FLOOR_PERCENT so a very cache-heavy config never
+        // starves queries (past the floor the tier install-time check warns).
+        let base = total_memory.saturating_mul(CAYENNE_QUERY_MEMORY_PERCENT) / 100;
+        let base_headroom = total_memory / MEM_TIER_CEILING_FRACTION;
+        let reservation_excess = cdc_reservation_bytes.saturating_sub(base_headroom);
+        let floor = total_memory.saturating_mul(CAYENNE_QUERY_MEMORY_FLOOR_PERCENT) / 100;
+        let default_limit = base.saturating_sub(reservation_excess).max(floor);
 
         tracing::debug!(
             cayenne_active,
-            "No query memory limit specified, defaulting to {percent}% of total memory: {}",
+            cdc_reservation_bytes,
+            reservation_excess,
+            "No query memory limit specified; Cayenne CDC base {CAYENNE_QUERY_MEMORY_PERCENT}% of total, reduced by the per-table CDC reservation above the host/8 headroom to: {}",
             util::human_readable_bytes(default_limit as usize)
         );
 
@@ -1789,7 +1845,8 @@ mod tests {
     use datafusion_expr::{Expr, LogicalPlan};
 
     use super::{
-        CAYENNE_QUERY_MEMORY_PERCENT, CayenneOptimizerRules, DEFAULT_QUERY_MEMORY_PERCENT,
+        CAYENNE_QUERY_MEMORY_FLOOR_PERCENT, CAYENNE_QUERY_MEMORY_PERCENT, CayenneOptimizerRules,
+        DEFAULT_QUERY_MEMORY_PERCENT,
         DataFusionBuilder, MEM_TIER_CEILING_FRACTION, MEM_TIER_FLOAT_CEILING_FRACTION,
         MEM_TIER_FLOOR_FRACTION, MEM_TIER_HEADROOM_FRACTION, build_compaction_runtime_env,
         configure_hash_join_memory_limits, coordinated_mem_tier_budget,
@@ -1811,23 +1868,59 @@ mod tests {
     #[test]
     fn effective_query_memory_limit_honors_explicit_value() {
         assert_eq!(
-            effective_query_memory_limit(Some(123 << 30), true),
+            effective_query_memory_limit(Some(123 << 30), true, 0),
             123 << 30
         );
         assert_eq!(
-            effective_query_memory_limit(Some(123 << 30), false),
+            effective_query_memory_limit(Some(123 << 30), false, 0),
             123 << 30
         );
-        assert_eq!(effective_query_memory_limit(Some(7), true), 7);
+        // A nonzero CDC reservation never overrides an explicit limit.
+        assert_eq!(effective_query_memory_limit(Some(7), true, 1 << 30), 7);
+    }
+
+    /// Cayenne active, no explicit limit: a per-table CDC reservation at/under the
+    /// base host/8 headroom leaves the default at the base 70%; a reservation ABOVE
+    /// the headroom reduces the default by exactly the excess; and a very large
+    /// reservation floors at `CAYENNE_QUERY_MEMORY_FLOOR_PERCENT` (never 0). Reads
+    /// live host RAM, so it asserts the RELATIONSHIPS rather than absolute bytes.
+    #[test]
+    fn effective_query_memory_limit_reduces_by_cdc_reservation() {
+        let total = crate::resource_monitor::get_total_memory();
+        let base = total.saturating_mul(CAYENNE_QUERY_MEMORY_PERCENT) / 100;
+        let headroom = total / MEM_TIER_CEILING_FRACTION;
+        let floor = total.saturating_mul(CAYENNE_QUERY_MEMORY_FLOOR_PERCENT) / 100;
+
+        // Reservation within the base headroom -> no reduction, stays at base 70%.
+        assert_eq!(effective_query_memory_limit(None, true, 0), base);
+        assert_eq!(effective_query_memory_limit(None, true, headroom), base);
+
+        // Reservation above the headroom -> reduced by exactly the excess.
+        let excess = headroom / 2;
+        assert_eq!(
+            effective_query_memory_limit(None, true, headroom + excess),
+            base - excess
+        );
+
+        // A reservation larger than the whole host floors the pool, never 0.
+        let floored = effective_query_memory_limit(None, true, total.saturating_mul(2));
+        assert_eq!(floored, floor);
+        assert!(floored > 0);
+
+        // The reservation never affects the non-Cayenne default.
+        assert_eq!(
+            effective_query_memory_limit(None, false, total),
+            total.saturating_mul(DEFAULT_QUERY_MEMORY_PERCENT) / 100
+        );
     }
 
     // Compile-time invariants on the host-partition constants: the Cayenne
     // query-pool default must be below the non-Cayenne default, and the partition
-    // (75% query+compaction, one-eighth tier ceiling, one-eighth headroom) sums to
+    // (70% query+compaction, one-eighth tier ceiling, one-eighth headroom) sums to
     // 100% of host. `const` assertions (compile-time) rather than a runtime test
     // asserting constant values (which clippy flags as assertions_on_constants).
     const _: () = assert!(CAYENNE_QUERY_MEMORY_PERCENT < DEFAULT_QUERY_MEMORY_PERCENT);
-    const _: () = assert!(CAYENNE_QUERY_MEMORY_PERCENT == 75);
+    const _: () = assert!(CAYENNE_QUERY_MEMORY_PERCENT == 70);
     const _: () = assert!(MEM_TIER_CEILING_FRACTION == 8); // one-eighth = 12.5%
     const _: () = assert!(MEM_TIER_HEADROOM_FRACTION == 8); // one-eighth = 12.5%
 
@@ -1886,7 +1979,7 @@ mod tests {
                 "the float must not overcommit host RAM"
             );
 
-            // A moderate query pool at the default 75% partition stays at/under the
+            // A moderate query pool at the default 70% partition stays at/under the
             // BASE ceiling (the float only helps when the pool is sized down).
             let pre_carve = total.saturating_mul(CAYENNE_QUERY_MEMORY_PERCENT) / 100;
             let moderate = coordinated_mem_tier_budget(total, pre_carve, 0);
