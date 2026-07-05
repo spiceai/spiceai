@@ -150,9 +150,9 @@ aws-smithy-runtime = "1.11.1"
 aws-smithy-runtime-api = "1.11.6"
 aws-smithy-types = "1.4.5"
 axum = { version = "0.8", features = ["macros"] }
-ballista-core = { git = "https://github.com/spiceai/datafusion-ballista.git", rev = "0a99d7c0a44488a202b893d0e53ada35ba96a9a6" } # branch: spiceai-54
-ballista-executor = { git = "https://github.com/spiceai/datafusion-ballista.git", rev = "0a99d7c0a44488a202b893d0e53ada35ba96a9a6" }
-ballista-scheduler = { git = "https://github.com/spiceai/datafusion-ballista.git", rev = "0a99d7c0a44488a202b893d0e53ada35ba96a9a6" }
+ballista-core = { git = "https://github.com/spiceai/datafusion-ballista.git", rev = "ab207a1c0f5649e0fcbb8ac1b85d6a4a6732820f" } # branch: spiceai-54
+ballista-executor = { git = "https://github.com/spiceai/datafusion-ballista.git", rev = "ab207a1c0f5649e0fcbb8ac1b85d6a4a6732820f" }
+ballista-scheduler = { git = "https://github.com/spiceai/datafusion-ballista.git", rev = "ab207a1c0f5649e0fcbb8ac1b85d6a4a6732820f" }
 base64 = "0.22.1"
 bb8 = "0.9"
 bb8-postgres = "0.9"
