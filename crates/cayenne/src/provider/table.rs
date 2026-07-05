@@ -31831,6 +31831,91 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn mem_tier_visible_memo_reuses_and_invalidates() {
+        let ctx = SessionContext::new();
+        let runtime_env = ctx.runtime_env();
+        let (provider, _catalog, _tmp) = create_cdc_upsert_table_with_vortex_config(
+            "visible_memo",
+            Arc::clone(&runtime_env),
+            VortexConfig {
+                cdc_durability: crate::metadata::CdcDurability::Memory,
+                deletion_mode: crate::metadata::DeletionMode::Key,
+                inline_max_rows: 1024,
+                ..VortexConfig::default()
+            },
+        )
+        .await;
+        let schema = Arc::clone(&provider.table_metadata.schema);
+        provider.install_slot_advancer(Arc::new(NoopSlotAdvancer));
+
+        // A resident RAM tier (no checkpoint) so the scan takes the mem-tier
+        // visible-batch path that the memo covers.
+        let write = provider
+            .write_cdc_append_stream(
+                single_batch_stream(id_value_batch(Arc::clone(&schema), &[1, 2], &[10, 20])),
+                &ctx.task_ctx(),
+            )
+            .await
+            .expect("RAM append");
+        assert!(
+            write.in_memory_epoch().is_some(),
+            "append engaged the RAM tier"
+        );
+
+        // First scan builds + stores the visible-batch memo.
+        assert_eq!(
+            collect_id_value_pairs(&ctx, &provider, "visible_memo").await,
+            vec![(1, 10), (2, 20)],
+        );
+        let first = provider
+            .mem_tier_visible_memo
+            .load_full()
+            .expect("first scan stored the visible-batch memo");
+
+        // A quiescent re-scan (no writes) must HIT the same memo entry, not
+        // rebuild it — the per-reference re-filtering this fix removes.
+        assert_eq!(
+            collect_id_value_pairs(&ctx, &provider, "visible_memo").await,
+            vec![(1, 10), (2, 20)],
+        );
+        let second = provider
+            .mem_tier_visible_memo
+            .load_full()
+            .expect("memo still present");
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "a quiescent re-scan must HIT the visible-batch memo, not rebuild it"
+        );
+
+        // An append bumps the tier version → the next scan rebuilds a DIFFERENT
+        // entry AND reflects the new row (no stale visibility served).
+        let write2 = provider
+            .write_cdc_append_stream(
+                single_batch_stream(id_value_batch(Arc::clone(&schema), &[3], &[30])),
+                &ctx.task_ctx(),
+            )
+            .await
+            .expect("second RAM append");
+        assert!(
+            write2.in_memory_epoch().is_some(),
+            "second append engaged RAM"
+        );
+        assert_eq!(
+            collect_id_value_pairs(&ctx, &provider, "visible_memo").await,
+            vec![(1, 10), (2, 20), (3, 30)],
+            "post-append scan reflects the new row"
+        );
+        let third = provider
+            .mem_tier_visible_memo
+            .load_full()
+            .expect("memo rebuilt after append");
+        assert!(
+            !Arc::ptr_eq(&first, &third),
+            "an append must invalidate the visible-batch memo (tier version changed)"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn mem_tier_join_probe_keeps_dynamic_filter_pushdown() {
         use arrow::array::Int64Array;
         use datafusion::datasource::MemTable;
