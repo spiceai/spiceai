@@ -11408,12 +11408,12 @@ impl CayenneTableProvider {
                 .get(&path)
                 .await
                 .map_err(|e| Error::ObjectStore {
-                    operation: "read data file for integrity digest",
+                    operation: "read data file for integrity check",
                     table: self.table_metadata.table_name.clone(),
                     source: e,
                 })?;
             let bytes = result.bytes().await.map_err(|e| Error::ObjectStore {
-                operation: "read data file for integrity digest",
+                operation: "read data file for integrity check",
                 table: self.table_metadata.table_name.clone(),
                 source: e,
             })?;
@@ -11426,9 +11426,17 @@ impl CayenneTableProvider {
 
     /// Verify the integrity digest of every manifest data file that has one and
     /// has not yet been verified this process (see
-    /// [`crate::provider::file_digest`]). Reads each such file's bytes once and
-    /// caches the pass, so this is the "verify on first read" bound — no
-    /// steady-state per-scan cost once every file is verified.
+    /// [`crate::provider::file_digest`]).
+    ///
+    /// The expensive part — the whole-file READ — is bounded to once per file
+    /// per process ("verify on first read"): a verified file is cached in
+    /// [`CayenneContext`] and never re-read. Each scan still runs one manifest
+    /// query (`get_all_snapshot_files`) to discover digest-bearing files and
+    /// iterates its rows; that is a single indexed metastore SELECT, not
+    /// per-file I/O, but it is not zero — for very wide tables a manifest
+    /// generation/epoch cache to skip the query once all files are verified is a
+    /// reasonable follow-up. Unreadable/missing files are not cached, so they are
+    /// re-checked on later scans (harmless: an unreadable file is not corrupt).
     ///
     /// A digest mismatch fails the scan as a **detected fault** rather than
     /// letting corrupted bytes decode into silently-wrong rows. Files without a

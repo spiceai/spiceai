@@ -1534,18 +1534,21 @@ fn write_manual_staging_wal(
     Ok(wal_path)
 }
 
-/// Build a checksum-framed staging-WAL record with a DELIBERATELY wrong
-/// checksum, so Cayenne's recovery detects the mismatch and discards it.
-/// Mirrors the `cayenne::provider::wal_checksum` wire format; the leading bytes
-/// MUST equal `wal_checksum::MAGIC` for the record to be recognized as framed
-/// (an unframed blob is instead treated as a legacy pre-feature pure-JSON
-/// record and parsed directly).
+/// Build a checksum-framed staging-WAL record that DETERMINISTICALLY fails
+/// integrity verification: it declares a payload length longer than the bytes
+/// actually present, so `wal_checksum::verify` reports `Truncated` regardless of
+/// the checksum value (avoiding any reliance on a particular XXH3 output). This
+/// models a torn write / bit-rotted length field. Mirrors the
+/// `cayenne::provider::wal_checksum` wire format; the leading bytes MUST equal
+/// `wal_checksum::MAGIC` for the record to be recognized as framed (an unframed
+/// blob is instead treated as a legacy pre-feature pure-JSON record).
 fn corrupt_framed_wal_bytes(payload: &[u8]) -> Vec<u8> {
+    let declared_len = payload.len() as u64 + 64; // claims more bytes than follow
     let mut bytes = Vec::new();
     bytes.extend_from_slice(b"CAYWALv1"); // wal_checksum::MAGIC
     bytes.push(1); // wal_checksum::FORMAT_VERSION
-    bytes.extend_from_slice(&(payload.len() as u64).to_le_bytes());
-    bytes.extend_from_slice(&0u64.to_le_bytes()); // wrong checksum (real XXH3 is never 0 here)
+    bytes.extend_from_slice(&declared_len.to_le_bytes());
+    bytes.extend_from_slice(&0u64.to_le_bytes()); // checksum (irrelevant: length check fails first)
     bytes.extend_from_slice(payload);
     bytes
 }

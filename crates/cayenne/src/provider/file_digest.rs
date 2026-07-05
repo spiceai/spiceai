@@ -60,10 +60,18 @@ pub(crate) enum DigestCheck {
 /// Check `bytes` against a previously stored digest string.
 #[must_use]
 pub(crate) fn check(stored: &str, bytes: &[u8]) -> DigestCheck {
-    let Some((algorithm, _hex)) = stored.split_once(':') else {
+    let Some((algorithm, hex)) = stored.split_once(':') else {
         return DigestCheck::Unsupported;
     };
     if algorithm != DIGEST_ALGORITHM {
+        return DigestCheck::Unsupported;
+    }
+    // A well-formed xxh3-128 digest is exactly 32 lowercase hex chars (the
+    // canonical form `compute` emits). A value that is prefixed but malformed
+    // (wrong length, non-hex, or uppercase) is treated as unverifiable
+    // (fail-open) rather than reported as a false corruption — the stored digest
+    // itself being garbled is not evidence the file's bytes are wrong.
+    if hex.len() != 32 || !hex.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) {
         return DigestCheck::Unsupported;
     }
     if compute(bytes) == stored {
@@ -123,5 +131,20 @@ mod tests {
         );
         assert_eq!(check("not-a-digest", b"anything"), DigestCheck::Unsupported);
         assert_eq!(check("", b"anything"), DigestCheck::Unsupported);
+    }
+
+    #[test]
+    fn check_malformed_prefixed_digest_is_unsupported() {
+        // Our prefix but a malformed hex body (too short, non-hex, uppercase)
+        // is unverifiable — fail-open, not a false corruption report.
+        assert_eq!(check("xxh3-128:deadbeef", b"x"), DigestCheck::Unsupported); // too short
+        assert_eq!(
+            check("xxh3-128:ZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZ", b"x"),
+            DigestCheck::Unsupported // non-hex
+        );
+        // A well-formed digest for different bytes is a real mismatch, not
+        // unsupported.
+        let digest = compute(b"real bytes");
+        assert_eq!(check(&digest, b"other bytes"), DigestCheck::Mismatch);
     }
 }
