@@ -60,20 +60,30 @@
 //! - `scram` (default) - SCRAM-SHA-256 authentication
 //! - `md5` - MD5 authentication (legacy)
 
-#![warn(
-    clippy::all,
-    clippy::cargo,
-    clippy::perf,
-    clippy::style,
-    clippy::correctness,
-    clippy::suspicious
-)]
+// spiceai vendoring: this is third-party code excluded from the workspace lint
+// policy (see `--exclude pgwire-replication` in the Makefile). It is still
+// compiled as a path dependency of `data_components`, and path deps are linted
+// (not `--cap-lints`-suppressed), so the workspace's forced `-D` clippy flags
+// would otherwise fire on unmodified upstream code. We suppress them here
+// rather than editing upstream sources — mirroring the other vendored crates
+// (lopdf/ttf-parser/pdf-extract). Upstream's own `#![warn(clippy::cargo, ...)]`
+// is intentionally dropped: under the workspace `-Dwarnings` it escalated
+// `clippy::cargo` to deny and reported `cargo_common_metadata` for every other
+// workspace crate.
 #![allow(
-    clippy::module_name_repetitions,
-    clippy::missing_errors_doc,
-    clippy::missing_panics_doc,
-    clippy::must_use_candidate,
-    clippy::multiple_crate_versions
+    clippy::all,
+    clippy::pedantic,
+    clippy::nursery,
+    clippy::cargo,
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::clone_on_ref_ptr,
+    clippy::todo,
+    clippy::assertions_on_result_states,
+    clippy::equatable_if_let,
+    clippy::needless_collect,
+    clippy::redundant_clone,
+    clippy::allow_attributes
 )]
 
 pub mod auth;
