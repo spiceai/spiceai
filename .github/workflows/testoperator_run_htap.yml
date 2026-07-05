@@ -200,7 +200,9 @@ jobs:
           [ -n "$DIAG_PIDS" ] && kill $DIAG_PIDS 2>/dev/null || true
           exit $testop_exit
         env:
-          SPICED_LOG: "runtime::accelerated_table::refresh_task::changes,runtime::cdc=debug,cayenne::mem_tier=debug,info"
+          # Cadence traces: CDC burst applies (changes.rs at trace, runtime::cdc at debug) + Cayenne
+          # mem-tier flushes. Inherited by the testoperator-spawned spiced; lands in this step's log.
+          SPICED_LOG: "runtime::accelerated_table::refresh_task::changes=debug,runtime::cdc=debug,cayenne::mem_tier=debug,info"
           SPICEAI_BENCHMARK_METRICS_KEY: ${{ secrets.SPICEAI_BENCHMARK_METRICS_KEY }}
           SPICED_COMMIT: ${{ steps.setup-spiced.outputs.SPICED_COMMIT }}
           # Dedicated in-cluster PG pod on xlarge; per-run docker container (loopback) elsewhere.
