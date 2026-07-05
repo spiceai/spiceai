@@ -807,6 +807,12 @@ struct CachedTableStatistics {
     /// Allows `persist_table_stats_locked` to attempt an in-memory merge
     /// and avoid a catalog GET on the common steady-state path.
     raw: Option<TableStatistics>,
+    /// Whether the cached `optimizer` count is a provably-exact live count
+    /// (mirrors [`TableStatistics::num_rows_exact`]). When `false`,
+    /// `cached_table_statistics_for_optimizer` serves the `Inexact` view so the
+    /// COUNT(*) fold declines rather than answering from a possibly-drifted count.
+    /// Defaults `false` (conservative: an uninitialized cache is not trusted exact).
+    count_exact: bool,
 }
 
 /// Block size for the in-memory sequence allocator (lever B2). Each metastore
@@ -1081,6 +1087,15 @@ pub struct CayenneTableProvider {
     /// overwrite. Conservative: the fast path requires exactly 0; any other
     /// value falls through to the full metastore read.
     durable_inlined_row_count: Arc<AtomicI64>,
+    /// Durable rows superseded/deleted by mem-tier appends since the last
+    /// checkpoint (accumulated `OnConflictDeletions::total_superseded`, which
+    /// counts file+inline supersedes — NOT in-tier ones, which the flushed-row
+    /// count already collapses). The mem-tier checkpoint subtracts this from
+    /// `flushed_mem_rows` so the persisted `Delta` nets durable supersedes
+    /// (best-effort — see [`crate::provider::column_stats::RowCountUpdate`]),
+    /// keeping the maintained count close to live instead of climbing toward
+    /// "every row ever flushed". Reset to 0 by the checkpoint clear.
+    mem_tier_pending_superseded: Arc<AtomicI64>,
     /// Inline-memtable cache generation counter.
     ///
     /// Incremented (with `Release` ordering) by every
@@ -2057,6 +2072,15 @@ impl CayenneTableProvider {
                     .as_ref()
                     .map(|s| Self::statistics_to_inexact(s.clone()));
                 stats_cache.optimizer = df_stats;
+                // Preserve the exactness of the (unchanged) count across the
+                // schema-width re-derivation. Conservative when `raw` is cold
+                // (pre-first-persist): treat the count as NOT exact rather than
+                // trusting it — `optimizer` is `None` in that case too, so nothing
+                // is served, but this never leaves a stale-Exact flag behind.
+                stats_cache.count_exact = stats_cache
+                    .raw
+                    .as_ref()
+                    .is_some_and(|raw| raw.num_rows_exact);
             }
             // Per-file statistics were inferred against the old logical schema
             // width; drop them so the next scan re-infers at the evolved width.
@@ -4137,7 +4161,13 @@ impl CayenneTableProvider {
             context.file_format(),
             &pk_deletion_strategy,
         )?;
-        let table_statistics = Self::load_table_statistics(&catalog, &table_metadata).await;
+        let loaded_table_statistics = Self::load_table_statistics(&catalog, &table_metadata).await;
+        // Legacy/absent stats are trusted exact once (see the migration note); the
+        // next mem-tier checkpoint delta taints a drifted one.
+        let table_statistics_count_exact = loaded_table_statistics
+            .as_ref()
+            .is_none_or(|(_, exact)| *exact);
+        let table_statistics = loaded_table_statistics.map(|(df, _)| df);
         // An empty `pk_column_indices` (no primary key) yields no index and the
         // legacy insert-only behavior; otherwise the per-PK index is bounded by
         // `MAINTAINED_AGGREGATE_MAX_INDEX_ENTRIES` (fail-safe to a base rebuild).
@@ -4242,6 +4272,7 @@ impl CayenneTableProvider {
                     .map(|s| Self::statistics_to_inexact(s.clone())),
                 optimizer: table_statistics,
                 raw: None, // will be populated on first load/persist
+                count_exact: table_statistics_count_exact,
             })),
             table_statistics_persistence_lock: Arc::new(tokio::sync::Mutex::new(())),
             retention_filters,
@@ -4270,6 +4301,7 @@ impl CayenneTableProvider {
             // At open the mem tier is empty, so the metastore count fetched
             // above is exactly the durable-corpus row count.
             durable_inlined_row_count: Arc::new(AtomicI64::new(inlined_row_count)),
+            mem_tier_pending_superseded: Arc::new(AtomicI64::new(0)),
             inlined_generation: Arc::new(AtomicU64::new(0)),
             inlined_structural_epoch: Arc::new(AtomicU64::new(0)),
             merged_scan_deletions: Arc::new(arc_swap::ArcSwapOption::const_empty()),
@@ -5174,6 +5206,7 @@ impl CayenneTableProvider {
             inline_checkpoint_scheduled: Arc::clone(&self.inline_checkpoint_scheduled),
             inlined_row_count: Arc::clone(&self.inlined_row_count),
             durable_inlined_row_count: Arc::clone(&self.durable_inlined_row_count),
+            mem_tier_pending_superseded: Arc::clone(&self.mem_tier_pending_superseded),
             inlined_generation: Arc::clone(&self.inlined_generation),
             inlined_structural_epoch: Arc::clone(&self.inlined_structural_epoch),
             merged_scan_deletions: Arc::clone(&self.merged_scan_deletions),
@@ -5279,10 +5312,14 @@ impl CayenneTableProvider {
         self.seq_allocator.lock().await.next - 1
     }
 
+    /// Load the persisted optimizer statistics AND their exactness flag
+    /// ([`TableStatistics::num_rows_exact`]) at open. The flag rides alongside the
+    /// derived `Statistics` so the cache can serve the count `Inexact` when it is
+    /// not a provably-exact live count.
     async fn load_table_statistics(
         catalog: &Arc<dyn MetadataCatalog>,
         table_metadata: &TableMetadata,
-    ) -> Option<Statistics> {
+    ) -> Option<(Statistics, bool)> {
         let stats = match catalog.get_table_statistics(&table_metadata.table_id).await {
             Ok(stats) => stats?,
             Err(e) => {
@@ -5294,13 +5331,16 @@ impl CayenneTableProvider {
             }
         };
 
-        Self::table_statistics_to_df(&table_metadata.schema, &stats).or_else(|| {
-            tracing::warn!(
-                "Failed to deserialize table stats for {}",
-                table_metadata.table_name
-            );
-            None
-        })
+        let num_rows_exact = stats.num_rows_exact;
+        Self::table_statistics_to_df(&table_metadata.schema, &stats)
+            .map(|df| (df, num_rows_exact))
+            .or_else(|| {
+                tracing::warn!(
+                    "Failed to deserialize table stats for {}",
+                    table_metadata.table_name
+                );
+                None
+            })
     }
 
     fn table_statistics_to_df(
@@ -5364,7 +5404,15 @@ impl CayenneTableProvider {
             || self.mem_tier.any_tombstones();
 
         let cache = self.table_statistics.read();
-        let cached_ref: Option<&Statistics> = if has_pending_visibility_changes {
+        // Serve the Inexact view when either (a) uncheckpointed visibility changes
+        // mean the persisted count over-counts live rows, OR (b) the maintained
+        // count itself is not a provably-exact live count (`count_exact == false`,
+        // set by the mem-tier checkpoint's best-effort delta and cleared by a
+        // full-rewrite `Set`). (b) is what stops a drifted count from being served
+        // `Exact` to the COUNT(*) fold once no deletions are pending — the fold then
+        // declines and a real scan answers, fixing the distributed over-count.
+        let serve_inexact = has_pending_visibility_changes || !cache.count_exact;
+        let cached_ref: Option<&Statistics> = if serve_inexact {
             cache.optimizer_inexact.as_ref()
         } else {
             cache.optimizer.as_ref()
@@ -5388,7 +5436,7 @@ impl CayenneTableProvider {
 
         // Cache-miss visibility-overlay path: cache.optimizer_inexact is None,
         // so transform optimizer on-the-fly. Rare — test seed only.
-        if has_pending_visibility_changes {
+        if serve_inexact {
             let Some(optimizer) = cache.optimizer.clone() else {
                 drop(cache);
                 // No persisted stats at all (pre-first-maintenance window on a
@@ -5516,6 +5564,7 @@ impl CayenneTableProvider {
         cache.optimizer = None;
         cache.optimizer_inexact = None;
         cache.raw = None;
+        cache.count_exact = false;
     }
 
     pub(crate) fn clear_scan_file_statistics_cache(&self) {
@@ -10634,8 +10683,18 @@ impl CayenneTableProvider {
             // accumulated alongside the coalesced stats. Retention deletes below
             // are not yet netted here (TPC-H has none); compaction's `Set` reset
             // bounds any resulting drift.
-            self.persist_table_stats(&stats, RowCountUpdate::Delta(state.live_rows_delta))
-                .await;
+            // `live_rows_delta` is the exactly-netted `inserted - superseded` for
+            // the staged/inline path. Retention deletes below are NOT yet netted
+            // into it, so when retention runs this commit the delta under-counts —
+            // taint exactness in that case (bounded by compaction's `Set` re-baseline).
+            self.persist_table_stats(
+                &stats,
+                RowCountUpdate::Delta {
+                    delta: state.live_rows_delta,
+                    exact: !state.retention_requested,
+                },
+            )
+            .await;
         }
 
         let mut retention_deleted = 0_u64;
@@ -15076,6 +15135,9 @@ impl CayenneTableProvider {
 
         // Merge min/max/null blob and NDV sketches into the existing aggregate.
         let prev_num_rows = existing_stats.as_ref().map_or(0, |e| e.num_rows);
+        // Whether the prior count was provably exact. Absent existing stats (first
+        // write / overwrite-replace) start exact; a `Set` overrides regardless.
+        let prev_num_rows_exact = existing_stats.as_ref().is_none_or(|e| e.num_rows_exact);
         let statistics_blob = match &existing_stats {
             Some(existing) => accumulator
                 .merged_file_statistics_blob(&existing.statistics_blob)
@@ -15097,11 +15159,21 @@ impl CayenneTableProvider {
         }
         let ndv_sketches = merged_ndv.serialize();
 
-        // Apply the live-row-count update relative to the previous aggregate.
-        let num_rows = match num_rows_update {
-            RowCountUpdate::Delta(delta) => prev_num_rows.saturating_add(delta).max(0),
-            RowCountUpdate::Set(n) => n.max(0),
-            RowCountUpdate::Unchanged => prev_num_rows,
+        // Apply the live-row-count update relative to the previous aggregate, and
+        // track whether the result is still provably exact: a `Set` is
+        // authoritative (compaction/overwrite materialized exactly the live rows);
+        // an `exact` delta preserves the prior exactness; a best-effort delta (the
+        // mem-tier checkpoint, whose durable-supersede netting is approximate)
+        // taints it; `Unchanged` preserves. A tainted (`false`) count is served
+        // `Inexact` so the COUNT(*) fold declines rather than answering from a
+        // possibly-over-counted maintained value.
+        let (num_rows, num_rows_exact) = match num_rows_update {
+            RowCountUpdate::Delta { delta, exact } => (
+                prev_num_rows.saturating_add(delta).max(0),
+                exact && prev_num_rows_exact,
+            ),
+            RowCountUpdate::Set(n) => (n.max(0), true),
+            RowCountUpdate::Unchanged => (prev_num_rows, prev_num_rows_exact),
         };
 
         let stats = TableStatistics {
@@ -15109,6 +15181,7 @@ impl CayenneTableProvider {
             statistics_blob,
             num_rows,
             ndv_sketches,
+            num_rows_exact,
         };
 
         if let Err(e) = self.catalog.upsert_table_statistics(&stats).await {
@@ -15126,6 +15199,7 @@ impl CayenneTableProvider {
         let mut cache = self.table_statistics.write();
         cache.optimizer = df_stats;
         cache.optimizer_inexact = df_stats_inexact;
+        cache.count_exact = stats.num_rows_exact;
         // Keep the raw blob for the next persist to avoid a catalog read.
         cache.raw = Some(stats);
     }
@@ -17260,6 +17334,23 @@ impl CayenneTableProvider {
             - i64::try_from(superseded).unwrap_or(i64::MAX);
         self.inlined_row_count.fetch_add(net, Ordering::Relaxed);
 
+        // Accumulate the durable (file+inline) supersedes this append hid, so the
+        // next mem-tier checkpoint can net them out of its persisted `Delta`
+        // (`flushed_mem_rows` counts the new versions but not the durable rows they
+        // supersede, which stay physically resident until compaction). Without this
+        // the maintained count climbs toward "every row ever flushed". Reset by the
+        // checkpoint clear. See `mem_tier_pending_superseded`. Saturating so a
+        // long-lived process between checkpoints can never wrap `i64` negative (a
+        // negative accumulator would inflate the checkpoint delta via its
+        // `saturating_sub`); clamped at `i64::MAX` it only ever over-nets, keeping
+        // the maintained count Inexact-and-conservative rather than inflated.
+        let superseded_delta = i64::try_from(superseded).unwrap_or(i64::MAX);
+        let _ = self.mem_tier_pending_superseded.fetch_update(
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+            |current| Some(current.saturating_add(superseded_delta)),
+        );
+
         self.apply_maintained_aggregate_insert_batches(maintained_aggregate_insert)
             .await;
         self.apply_maintained_aggregate_delete_pending(maintained_aggregate_delete)
@@ -17831,15 +17922,27 @@ impl CayenneTableProvider {
         // the persisted aggregate. So the checkpoint is where they enter the
         // maintained count, or a `cdc_durability: memory` table reports
         // `num_rows: 0` to the optimizer forever (collapsing every hash join's
-        // build/probe sizing). Add only `flushed_mem_rows` (the retained,
-        // post-tombstone RAM corpus): any inline rows swept into the same
-        // checkpoint file were ALREADY persisted at inline-commit time, so
-        // `total_rows` would double-count them. Residual drift from superseding
-        // already-durable rows (not netted here) is bounded by compaction's
-        // periodic `Set` re-baseline, matching the staged path's tradeoff. The
-        // stats blob re-merges idempotently regardless of the count delta.
-        let row_count_update = if let Ok(delta) = i64::try_from(flushed_mem_rows) {
-            RowCountUpdate::Delta(delta)
+        // build/probe sizing).
+        //
+        // `flushed_mem_rows` is the retained, post-tombstone RAM corpus (any inline
+        // rows swept into the same checkpoint file were ALREADY persisted at
+        // inline-commit time, so `total_rows` would double-count them). But those
+        // rows include NEW versions that supersede already-durable rows which stay
+        // physically resident until compaction — so a raw `Delta(flushed_mem_rows)`
+        // over-counts the live set by the number of durable supersedes, and that
+        // over-count is served `Exact` to the distributed COUNT(*) fold once no
+        // deletions are pending. Net it out with the durable supersedes accumulated
+        // by `append_to_shard` (best-effort: concurrent off-fence appends / a
+        // partial-prefix flush can leave a small residual), and mark the delta
+        // `exact: false` so the maintained count is served `Inexact` — the fold then
+        // declines and a real scan answers `COUNT(*)`. A full-rewrite compaction
+        // `Set` later re-establishes an exact count.
+        let pending_superseded = self.mem_tier_pending_superseded.swap(0, Ordering::Relaxed);
+        let row_count_update = if let Ok(flushed) = i64::try_from(flushed_mem_rows) {
+            RowCountUpdate::Delta {
+                delta: flushed.saturating_sub(pending_superseded),
+                exact: false,
+            }
         } else {
             tracing::warn!(
                 table = self.table_metadata.table_name.as_str(),
@@ -23592,6 +23695,7 @@ mod tests {
             statistics_blob,
             num_rows: 3,
             ndv_sketches: None,
+            num_rows_exact: true,
         };
 
         let stats = CayenneTableProvider::table_statistics_to_df(&schema, &table_stats)
@@ -30638,6 +30742,209 @@ mod tests {
             3,
             "reopened disk-tier state must preserve exact COUNT(*)"
         );
+    }
+
+    /// Assert the `COUNT(*)` metadata-fold soundness invariant for `provider`.
+    ///
+    /// The `COUNT(*)` fold (`CayenneStatsAggregateRewriter` and `DataFusion`'s
+    /// built-in `AggregateStatistics`) answers from the physical scan's
+    /// `partition_statistics(None).num_rows`, but ONLY when that is
+    /// `Precision::Exact` (the footer-sum path served when
+    /// `has_pending_deletions()` is false). That footer sum is a raw physical row
+    /// count — it does not subtract superseded/deleted rows still resident in
+    /// un-compacted files. This checks three things at a settling step:
+    ///   * a real `SELECT id,value` scan (bypasses every COUNT fold) returns
+    ///     exactly the live model rows;
+    ///   * `SELECT COUNT(*)` equals the live count;
+    ///   * whenever the scan reports an `Exact` `num_rows` (the only case the fold
+    ///     trusts), it equals the true live row count — i.e. the fold cannot
+    ///     over-count.
+    ///
+    /// A failure on the third assertion with the first passing localizes a
+    /// stats-only over-count (the fold lies, a real scan is correct); a failure
+    /// on the first localizes physical resurrection (a real scan over-counts too).
+    ///
+    /// Returns `true` if the scan reported an `Exact` `num_rows` at this step (i.e.
+    /// the foldable path was actually exercised), so the caller can assert the
+    /// test was not vacuously green.
+    async fn assert_count_star_fold_never_overcounts(
+        ctx: &SessionContext,
+        provider: &CayenneTableProvider,
+        table_name: &str,
+        model: &std::collections::BTreeMap<i64, i64>,
+        step: &str,
+    ) -> bool {
+        let live = i64::try_from(model.len()).expect("live count fits i64");
+        let pending = provider.has_pending_deletions();
+
+        // Real scan — bypasses the COUNT metadata fold entirely.
+        let rows = collect_id_value_pairs(ctx, provider, table_name).await;
+        let expected: Vec<(i64, i64)> = model.iter().map(|(&k, &v)| (k, v)).collect();
+        assert_eq!(
+            rows, expected,
+            "[{step}] real scan diverged from the live model \
+             (has_pending_deletions={pending}) — physical resurrection"
+        );
+
+        // COUNT(*) end-to-end.
+        let count = query_count_star(ctx, provider, table_name).await;
+        assert_eq!(
+            count,
+            live,
+            "[{step}] COUNT(*) mismatch: got {count}, live {live} \
+             (real scan returned {} rows, has_pending_deletions={pending})",
+            rows.len()
+        );
+
+        // The exact value the metadata fold consumes.
+        let plan = provider
+            .scan(&ctx.state(), None, &[], None)
+            .await
+            .expect("scan plan builds");
+        let stats = plan
+            .partition_statistics(None)
+            .expect("partition statistics available");
+        if let DFPrecision::Exact(n) = stats.num_rows {
+            let n = i64::try_from(n).expect("num_rows fits i64");
+            assert_eq!(
+                n,
+                live,
+                "[{step}] FOLD-UNSOUND: scan reports Exact num_rows={n} but only {live} rows are \
+                 live (has_pending_deletions={pending}) — COUNT(*) would over-count by {}",
+                n - live
+            );
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Regression for the SF-1000 `COUNT(*)` over-count: the maintained
+    /// `TableStatistics.num_rows` must track the LIVE row set through a memory-CDC
+    /// upsert workload, not "every row ever flushed".
+    ///
+    /// Drives the intersection `mutation_property_test` never exercises: the
+    /// **memory-CDC checkpoint** path (`write_cdc_append_stream` +
+    /// `checkpoint_mem_tier`) superseding already-durable rows, plus the
+    /// **seq-prefix bake**. Each round asserts two invariants:
+    ///  1. single-node soundness — a real scan and `COUNT(*)` never over-count
+    ///     (single-node folds on Vortex footer sums, kept Inexact by the residual
+    ///     supersede tombstones, so `COUNT(*)` real-scans and stays correct);
+    ///  2. the maintained count equals the live set — this is the count the
+    ///     DISTRIBUTED coordinator folds `COUNT(*)` on (via
+    ///     `local_executor_table_statistics` →`optimizer_table_statistics()`,
+    ///     served `Exact` when no visibility changes are pending), so a drift here
+    ///     is the SF-1000 gate over-count. It drifts because the checkpoint
+    ///     `Delta(flushed_mem_rows)` does not net supersedes of durable rows.
+    #[tokio::test]
+    async fn memory_cdc_supersede_maintained_count_tracks_live() {
+        const KEYS: i64 = 8;
+        let ctx = SessionContext::new();
+        let runtime_env = ctx.runtime_env();
+        let table_name = "count_star_overcount";
+        let (provider, _catalog, _tmp) = create_cdc_upsert_table_with_vortex_config(
+            table_name,
+            Arc::clone(&runtime_env),
+            VortexConfig {
+                cdc_durability: crate::metadata::CdcDurability::Memory,
+                deletion_mode: crate::metadata::DeletionMode::Key,
+                inline_max_rows: 0,
+                ..VortexConfig::default()
+            },
+        )
+        .await;
+        assert!(provider.is_cdc_memory_mode(), "memory mode must be active");
+        provider.install_slot_advancer(Arc::new(NoopSlotAdvancer));
+        let schema = Arc::clone(&provider.table_metadata.schema);
+
+        // Live-row model (id -> value).
+        let mut model: std::collections::BTreeMap<i64, i64> = std::collections::BTreeMap::new();
+        let ids: Vec<i64> = (0..KEYS).collect();
+
+        let append_and_checkpoint = |vals: Vec<i64>| {
+            let provider = &provider;
+            let ctx = &ctx;
+            let ids = &ids;
+            let schema = Arc::clone(&schema);
+            async move {
+                let _ = provider
+                    .write_cdc_append_stream(
+                        single_batch_stream(id_value_batch(schema, ids, &vals)),
+                        &ctx.task_ctx(),
+                    )
+                    .await
+                    .expect("memory-mode CDC append");
+                provider
+                    .checkpoint_mem_tier()
+                    .await
+                    .expect("checkpoint RAM tier to a durable snapshot");
+            }
+        };
+
+        // Bootstrap the durable rows.
+        let vals: Vec<i64> = (0..KEYS).map(|k| k * 10).collect();
+        append_and_checkpoint(vals.clone()).await;
+        for (&k, &v) in ids.iter().zip(vals.iter()) {
+            model.insert(k, v);
+        }
+
+        // Many rounds of superseding upserts, each its own checkpoint → a fresh
+        // protected snapshot carrying new versions + tombstones for the prior ones,
+        // then a bake of the older prefix.
+        for round in 1..=12i64 {
+            let vals: Vec<i64> = (0..KEYS).map(|k| round * 1000 + k).collect();
+            append_and_checkpoint(vals.clone()).await;
+            for (&k, &v) in ids.iter().zip(vals.iter()) {
+                model.insert(k, v);
+            }
+            // Drain any debounced post-write maintenance so the bake operates on a
+            // stable snapshot set, then bake the older prefix.
+            provider
+                .flush_pending_maintenance()
+                .await
+                .expect("drain pending maintenance");
+            let _ = provider.bake_seq_prefix_protected_snapshots().await;
+
+            // (1) Single-node soundness: a real scan and `COUNT(*)` never over-count
+            // (single-node folds on footer sums, which stay Inexact while supersede
+            // tombstones linger, so `COUNT(*)` real-scans and is correct).
+            let _ = assert_count_star_fold_never_overcounts(
+                &ctx,
+                &provider,
+                table_name,
+                &model,
+                &format!("round {round}"),
+            )
+            .await;
+
+            // (2) Distributed-gate fix. `optimizer_table_statistics()` is what
+            // `local_executor_table_statistics` (runtime::cluster::partition) reports
+            // to the coordinator, which folds `COUNT(*)` on it — but ONLY when it is
+            // `Exact`. Two invariants:
+            let live = model.len();
+            let stats = provider
+                .optimizer_table_statistics()
+                .expect("maintained stats present after checkpoint");
+            //  (A) correctness: a mem-tier checkpoint taints exactness, so the count
+            //      is served `Inexact` — the coordinator's fold declines and a real
+            //      scan answers instead of folding a possibly-over-counted value.
+            assert!(
+                matches!(stats.num_rows, DFPrecision::Inexact(_)),
+                "round {round}: maintained count must be served Inexact after a mem-tier \
+                 checkpoint (so the distributed COUNT(*) fold declines), got {:?}",
+                stats.num_rows,
+            );
+            //  (B) accuracy (best-effort): the checkpoint delta nets durable
+            //      supersedes, so the value stays at/near live instead of climbing
+            //      toward "every row ever flushed" (here the per-round net delta is
+            //      0, so it is exactly live).
+            assert_eq!(
+                stats.num_rows.get_value().copied(),
+                Some(live),
+                "round {round}: maintained count drifted above the {live} live rows — the \
+                 checkpoint `Delta` did not net durable supersedes",
+            );
+        }
     }
 
     /// A RAM-tier CDC append must NOT invalidate the inline-view cache: it

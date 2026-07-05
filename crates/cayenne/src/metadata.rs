@@ -1666,6 +1666,17 @@ pub struct TableStatistics {
     /// the sum of every insert ever made. Compaction and overwrite reset it to
     /// the authoritative rewritten count.
     pub num_rows: i64,
+    /// Whether [`Self::num_rows`] is a provably-exact live count (`true`) or a
+    /// best-effort estimate that may over-count (`false`).
+    ///
+    /// The mem-tier checkpoint applies a `Delta` whose durable-supersede netting
+    /// is best-effort, so it taints this to `false`; a full-rewrite compaction /
+    /// overwrite `Set`s an authoritative count and restores `true`. Consumers that
+    /// answer `COUNT(*)` from statistics (the `stats_aggregate` fold and the
+    /// distributed executor-statistics reporter) must treat a `false` count as
+    /// `Precision::Inexact`, so the fold declines and a real scan answers instead
+    /// — preventing a drifted count from producing a wrong `COUNT(*)`.
+    pub num_rows_exact: bool,
     /// Serialized per-column NDV (distinct-count) `HyperLogLog` sketches
     /// ([`crate::hll::NdvSketches`]), `None` when no NDV-tracked column has a
     /// sketch. Merged across writes register-wise; used to size distributed
