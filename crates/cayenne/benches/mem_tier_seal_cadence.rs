@@ -46,7 +46,9 @@ use cayenne::{CayenneCatalog, CayenneTableProvider, MetadataCatalog, SlotAdvance
 use criterion::{BatchSize, BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use datafusion::execution::runtime_env::RuntimeEnv;
 use datafusion::prelude::SessionContext;
-use datafusion_table_providers::util::{column_reference::ColumnReference, on_conflict::OnConflict};
+use datafusion_table_providers::util::{
+    column_reference::ColumnReference, on_conflict::OnConflict,
+};
 
 struct NoopAdvancer;
 
@@ -70,7 +72,10 @@ fn id_batch(schema: &Arc<Schema>, start: i64, rows: i64) -> RecordBatch {
 /// `delta_rows` rows to the RAM tier. Asserts the write engaged the RAM tier so
 /// both lanes measure a flush of the SAME resident delta. Returns the provider +
 /// its temp dir (kept alive for the timed closure).
-async fn table_with_delta(delta_rows: i64, tag: &str) -> (Arc<CayenneTableProvider>, tempfile::TempDir) {
+async fn table_with_delta(
+    delta_rows: i64,
+    tag: &str,
+) -> (Arc<CayenneTableProvider>, tempfile::TempDir) {
     let temp_dir = tempfile::tempdir().expect("temp dir");
     let metadata_dir = format!("{}/metadata", temp_dir.path().to_str().expect("temp path"));
     let data_dir = format!("{}/data", temp_dir.path().to_str().expect("temp path"));
@@ -135,34 +140,44 @@ fn bench_durable_flush(c: &mut Criterion) {
     let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
     let mut group = c.benchmark_group("mem_tier_durable_flush");
     for &delta_rows in &[1_000_i64, 20_000] {
-        group.throughput(Throughput::Elements(u64::try_from(delta_rows).expect("positive")));
+        group.throughput(Throughput::Elements(
+            u64::try_from(delta_rows).expect("positive"),
+        ));
 
         // SEAL lane: shadow the active delta into the unpublished inline corpus +
         // advance the slot (no Vortex, no fence, no protected snapshot).
-        group.bench_with_input(BenchmarkId::new("seal", delta_rows), &delta_rows, |b, &n| {
-            b.iter_batched(
-                || rt.block_on(table_with_delta(n, "seal")),
-                |(table, _tmp)| {
-                    rt.block_on(async {
-                        black_box(table.seal_mem_tier_durable().await.expect("seal"));
-                    });
-                },
-                BatchSize::SmallInput,
-            );
-        });
+        group.bench_with_input(
+            BenchmarkId::new("seal", delta_rows),
+            &delta_rows,
+            |b, &n| {
+                b.iter_batched(
+                    || rt.block_on(table_with_delta(n, "seal")),
+                    |(table, _tmp)| {
+                        rt.block_on(async {
+                            black_box(table.seal_mem_tier_durable().await.expect("seal"));
+                        });
+                    },
+                    BatchSize::SmallInput,
+                );
+            },
+        );
 
         // BAKE lane: the full protected-snapshot checkpoint of the SAME delta.
-        group.bench_with_input(BenchmarkId::new("bake", delta_rows), &delta_rows, |b, &n| {
-            b.iter_batched(
-                || rt.block_on(table_with_delta(n, "bake")),
-                |(table, _tmp)| {
-                    rt.block_on(async {
-                        black_box(table.checkpoint_mem_tier().await.expect("bake"));
-                    });
-                },
-                BatchSize::SmallInput,
-            );
-        });
+        group.bench_with_input(
+            BenchmarkId::new("bake", delta_rows),
+            &delta_rows,
+            |b, &n| {
+                b.iter_batched(
+                    || rt.block_on(table_with_delta(n, "bake")),
+                    |(table, _tmp)| {
+                        rt.block_on(async {
+                            black_box(table.checkpoint_mem_tier().await.expect("bake"));
+                        });
+                    },
+                    BatchSize::SmallInput,
+                );
+            },
+        );
     }
     group.finish();
 }

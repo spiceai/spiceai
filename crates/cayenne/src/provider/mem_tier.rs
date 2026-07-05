@@ -1218,7 +1218,10 @@ mod tests {
     fn append_leaves_new_segments_unsealed() {
         let mut tier = MemTier::empty();
         assert_eq!(tier.sealed_segments, 0);
-        assert!(!tier.has_unsealed_segments(), "empty tier has no active piece");
+        assert!(
+            !tier.has_unsealed_segments(),
+            "empty tier has no active piece"
+        );
         for i in 0..3 {
             tier = tier.append_segment(
                 Arc::new(vec![batch(&[i])]),
@@ -1231,7 +1234,11 @@ mod tests {
         }
         assert_eq!(tier.segments.len(), 3);
         assert_eq!(tier.sealed_segments, 0, "appends never seal");
-        assert_eq!(tier.unsealed_segments().len(), 3, "all 3 segments are active");
+        assert_eq!(
+            tier.unsealed_segments().len(),
+            3,
+            "all 3 segments are active"
+        );
         assert!(tier.has_unsealed_segments());
     }
 
@@ -1254,12 +1261,18 @@ mod tests {
         // Seal through both existing segments.
         let sealed = tier.mark_sealed_through(2);
         assert_eq!(sealed.sealed_segments, 2);
-        assert!(!sealed.has_unsealed_segments(), "nothing active after full seal");
+        assert!(
+            !sealed.has_unsealed_segments(),
+            "nothing active after full seal"
+        );
         assert_eq!(sealed.unsealed_segments().len(), 0);
         // Segment payloads and aggregates are untouched by a seal (O(1) rebrand).
         assert_eq!(sealed.segments.len(), 2);
         assert_eq!(sealed.rows, tier.rows);
-        assert!(sealed.version > tier.version, "seal bumps the content version");
+        assert!(
+            sealed.version > tier.version,
+            "seal bumps the content version"
+        );
 
         // A later append is active again (boundary unchanged by the append).
         let grown = sealed.append_segment(
@@ -1271,11 +1284,18 @@ mod tests {
             0,
         );
         assert_eq!(grown.sealed_segments, 2);
-        assert_eq!(grown.unsealed_segments().len(), 1, "only the new segment is active");
+        assert_eq!(
+            grown.unsealed_segments().len(),
+            1,
+            "only the new segment is active"
+        );
 
         // Monotone: sealing through a LOWER count never lowers the boundary.
         let not_lowered = grown.mark_sealed_through(1);
-        assert_eq!(not_lowered.sealed_segments, 2, "seal boundary never regresses");
+        assert_eq!(
+            not_lowered.sealed_segments, 2,
+            "seal boundary never regresses"
+        );
         // Clamp: sealing past the end pins at segments.len().
         let clamped = grown.mark_sealed_through(999);
         assert_eq!(clamped.sealed_segments, grown.segments.len());
@@ -1307,7 +1327,10 @@ mod tests {
         // active survive.
         let after_partial = tier.retain_after(2);
         assert_eq!(after_partial.segments.len(), 2);
-        assert_eq!(after_partial.sealed_segments, 1, "3 - 2 = 1 sealed survives");
+        assert_eq!(
+            after_partial.sealed_segments, 1,
+            "3 - 2 = 1 sealed survives"
+        );
         assert_eq!(after_partial.unsealed_segments().len(), 1);
 
         // Flush the first 3 (== sealed) from the ORIGINAL: boundary saturates to 0,
@@ -1344,7 +1367,10 @@ mod tests {
 
         let view = tier.unsealed_view();
         assert_eq!(view.segments.len(), 1, "only the active segment");
-        assert_eq!(view.rows, 2, "row aggregate rebuilt from the active piece only");
+        assert_eq!(
+            view.rows, 2,
+            "row aggregate rebuilt from the active piece only"
+        );
         assert_eq!(view.sealed_segments, 0, "the view is entirely active");
         // The delta's tombstones are ONLY the active segment's (key 200), NOT the
         // sealed segment's (key 100) — the sealed tombstone was already shadowed.

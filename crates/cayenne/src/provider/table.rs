@@ -18023,9 +18023,14 @@ impl CayenneTableProvider {
     /// restart; a crash before the seal re-streams the un-acked tail from the
     /// source, and the PK-idempotent apply converges exactly-once either way.
     ///
-    /// Mechanics (N==1 — the default; see the shard gate below):
-    /// 1. Capture the active piece (`segments[sealed_segments..]`) and the epoch it
-    ///    makes durable, BEFORE any await — appends after this stay active.
+    /// Mechanics (all shards; N==1 is the byte-identical single-shard case):
+    /// 0. Capture EVERY shard's active piece ALL-SHARDS-ATOMICALLY (under
+    ///    `write_lock` at N>1 + all publish locks, exactly as the checkpoint does),
+    ///    so a mid-fan-out apply is observed all-or-none and the cross-shard MAX
+    ///    slot-ack watermark is safe. Disjoint keys ⇒ the shards' visible rows
+    ///    concatenate and their tombstones union with no collision.
+    /// 1. Capture each active piece (`segments[sealed_segments..]`) and the epoch it
+    ///    makes durable, BEFORE the off-lock commit — appends after this stay active.
     /// 2. Persist its VISIBLE rows (post merge-on-read) as ONE durable-but-
     ///    unpublished inline-corpus BLOB ([`Self::commit_inlined_data_durable`] with
     ///    no [`Self::publish_inlined_mutation`], so `published_inlined_seq` stays
@@ -18039,15 +18044,15 @@ impl CayenneTableProvider {
     ///    must be crash-durable before the slot advances past its delete — else a
     ///    restart resurrects the deleted row. Reads keep hiding these rows via the
     ///    RAM tier's merge-on-read tombstones, so no in-memory publish is needed.
-    /// 4. Advance the seal boundary (active → immutable) under the shard publish
-    ///    lock, then — and only then — fire the slot advancer for the captured epoch.
+    /// 4. Advance each shard's seal boundary (active → immutable) under that shard's
+    ///    publish lock, then — and only then — fire the slot advancer for the
+    ///    cross-shard durable epoch.
     ///
     /// Serialized against the checkpoint by `mem_checkpoint_lock` (single-drainer:
     /// the runtime's deferred-commit queue front-requeues on failure, so two
     /// concurrent `fire_slot_advancer` drains would corrupt its ordering). Returns
-    /// the number of visible rows sealed (0 when there is nothing to seal, when not
-    /// in memory mode, or on the N>1 opt-in path, which is left on the checkpoint
-    /// cadence — a documented limitation, never a correctness gap).
+    /// the number of visible rows sealed (0 when there is nothing to seal or when
+    /// not in memory mode).
     ///
     /// `pub` + `#[doc(hidden)]` so benches / external harnesses can drive a seal
     /// deterministically (mirrors [`Self::checkpoint_mem_tier`]); production fires
@@ -18057,81 +18062,125 @@ impl CayenneTableProvider {
         if !self.is_cdc_memory_mode() {
             return Ok(0);
         }
-        // N>1 sharding: the slot-ack epoch is a SINGLE all-shards-atomic axis, so a
-        // per-shard seal would tear the cross-shard watermark (advance past an
-        // epoch not yet durable in another shard). The N==1 default gets sealing;
-        // the opt-in N>1 SF-1000 sweep keeps the whole-tier-atomic checkpoint as
-        // its slot-ack path (unchanged, still correct — just not sub-checkpoint
-        // fresh). Extending the seal to an all-shards-atomic capture is a follow-up.
-        if self.mem_tier.shard_count() != 1 {
-            return Ok(0);
-        }
+        let n = self.mem_tier.shard_count();
         // Single-drainer w.r.t. the bake: `mem_checkpoint_lock` is the same lock the
         // periodic tick and the write-path spill hold around `checkpoint_mem_tier`,
         // so a seal never races a checkpoint's `fire_slot_advancer`.
         let _checkpoint = self.mem_checkpoint_lock.lock().await;
 
-        let snapshot = self.mem_tier.shard(0).load_full();
-        if !snapshot.has_unsealed_segments() {
-            return Ok(0);
-        }
-        // Capture the seal boundary + the epoch this seal makes durable BEFORE any
-        // await. Appends after this point grow the tail (append-only) and stay
-        // ACTIVE — they are sealed on the next cycle, and the slot is advanced only
-        // to `seal_epoch`, never past the un-sealed tail.
-        let sealed_through = snapshot.segments.len();
-        let seal_epoch = snapshot.epoch;
+        // === ALL-SHARDS-ATOMIC CAPTURE (mirrors `checkpoint_mem_tier_inner`) ===
+        // At N>1 take `write_lock` so an apply's N shard appends are observed
+        // ALL-OR-NONE (§3.4 Fix 3): a torn capture would let the MAX watermark ack an
+        // apply_epoch not yet durable in every shard it touched → loss on crash. Then
+        // all shard publish locks in index order (deadlock-free), mutually exclusive
+        // with every shard's append swap. Lock order is `mem_checkpoint → write →
+        // publish`, byte-identical to the checkpoint's, so a seal serializes cleanly
+        // against a bake (both on `mem_checkpoint_lock`) and reuses the checkpoint's
+        // exact, tested hierarchy. The durable encode/commit runs OUTSIDE these locks
+        // on the captured immutable snapshots, so concurrent applies keep flowing.
+        // At N==1 no `write_lock` is taken (a single `ArcSwap` load is already atomic)
+        // — byte-identical to the pre-sharding seal.
+        let mut capture_write_guard = if n > 1 {
+            Some(self.write_lock.lock().await)
+        } else {
+            None
+        };
+        let (shard_snapshots, sealed_through, seal_epoch) = {
+            let mut guards = Vec::with_capacity(n);
+            for lock in self.mem_tier_publish_locks.iter() {
+                guards.push(lock.lock().await);
+            }
+            let shard_snapshots: Vec<Arc<crate::provider::mem_tier::MemTier>> = self
+                .mem_tier
+                .shards()
+                .iter()
+                .map(ArcSwap::load_full)
+                .collect();
+            // Nothing to seal unless SOME shard has an active ingestion piece.
+            if shard_snapshots.iter().all(|s| !s.has_unsealed_segments()) {
+                drop(guards);
+                drop(capture_write_guard.take());
+                return Ok(0);
+            }
+            // Seal each shard's FULL current prefix. After this all-shards-atomic
+            // seal every shard's full prefix is durable (its prior-sealed segments by
+            // earlier shadows, its active piece by this one), so the durable watermark
+            // is the MAX over shards of the max per-apply epoch in the FULL prefix —
+            // the SAME axis and MAX rule the checkpoint uses (safe *because* the
+            // capture is all-shards-atomic; a MIN would under-ack and let a cold shard
+            // stall the slot). `None` at N==1 (no `source_position` is stamped) → fall
+            // back to shard 0's tier `epoch`, the byte-identical single-shard currency.
+            let sealed_through: Vec<usize> =
+                shard_snapshots.iter().map(|s| s.segments.len()).collect();
+            let seal_epoch = shard_snapshots
+                .iter()
+                .filter_map(|s| s.max_source_position_in_prefix(s.segments.len()))
+                .max()
+                .unwrap_or_else(|| shard_snapshots[0].epoch);
+            drop(guards);
+            (shard_snapshots, sealed_through, seal_epoch)
+        };
+        // Release `write_lock` BEFORE the durable encode/commit so concurrent applies
+        // run in parallel with the shadow write (the off-lock seal); everything below
+        // reads only the captured immutable snapshots + the reserved seal sequence.
+        drop(capture_write_guard.take());
 
-        // The delta view: the active segments with tombstone/byte/row aggregates
-        // rebuilt from just those segments (NOT the whole tier — the sealed prefix
-        // was already shadowed by earlier seals).
-        let delta = snapshot.unsealed_view();
-        // VISIBLE rows (each segment's rows minus this delta's own merge-on-read
-        // tombstones) — the exact set the bake would flush for this delta, so the
-        // shadow is byte-consistent with the eventual Vortex snapshot.
-        let visible = self.visible_mem_tier_batches(&delta, None)?;
-        let sealed_rows: u64 = visible
+        // === BUILD the union delta from the captured snapshots (off-lock) ===
+        // Each shard's active piece as a delta view (tombstone/byte aggregates
+        // rebuilt from just its active segments — NOT the whole tier; the sealed
+        // prefix was already shadowed by earlier seals). Disjoint keys across shards
+        // ⇒ the visible rows CONCATENATE and the tombstones UNION with no cross-shard
+        // collision (the §2.3e argument the sharded checkpoint relies on). At N==1
+        // this is exactly shard 0's delta — byte-identical to the pre-sharding seal.
+        let deltas: Vec<Arc<crate::provider::mem_tier::MemTier>> = shard_snapshots
+            .iter()
+            .map(|s| Arc::new(s.unsealed_view()))
+            .collect();
+        let mut union_visible: Vec<RecordBatch> = Vec::new();
+        for delta in &deltas {
+            union_visible.extend(self.visible_mem_tier_batches(delta, None)?);
+        }
+        let sealed_rows: u64 = union_visible
             .iter()
             .map(|b| b.num_rows() as u64)
             .fold(0, u64::saturating_add);
-        let has_tombstones = Self::mem_tier_has_tombstones(&delta);
+        let any_tombstones = deltas.iter().any(|d| Self::mem_tier_has_tombstones(d));
 
-        if visible.is_empty() && !has_tombstones {
-            // Every active row was superseded within the delta and no tombstone
-            // hides a durable row: the epoch is vacuously durable (no data, no
-            // durable-hiding delete to lose). Advance the boundary + slot so the
-            // active piece is not re-scanned next seal.
-            self.mark_shard_sealed_through(0, sealed_through).await;
+        if union_visible.is_empty() && !any_tombstones {
+            // Every active row was superseded within the delta and no tombstone hides
+            // a durable row: the epoch is vacuously durable. Advance the per-shard
+            // boundary + the slot so the active pieces are not re-scanned next seal.
+            for (shard_id, &through) in sealed_through.iter().enumerate() {
+                self.mark_shard_sealed_through(shard_id, through).await;
+            }
             self.fire_slot_advancer(seal_epoch).await;
             return Ok(0);
         }
 
-        // PK membership of the delta's visible rows drives the reinserted-vs-pure
-        // tombstone split (a delete whose key is re-inserted in this delta stamps
-        // the reinsert sequence so the shadow copy survives; a pure delete hides a
-        // durable copy). Same derivation the checkpoint uses.
-        let corpus_keys = self.checkpoint_corpus_pk_keys(&visible)?;
+        // PK membership of the (cross-shard) visible rows drives the reinserted-vs-
+        // pure tombstone split, same as the checkpoint.
+        let corpus_keys = self.checkpoint_corpus_pk_keys(&union_visible)?;
 
-        // ONE seal sequence stamps both the inline BLOB rows and the
-        // reinsert/registration stamp. Reserved AFTER every delta segment's append,
-        // so it is strictly above their `data_sequence`/`delete_sequence` — a
-        // re-inserted key's shadow copy (at `seal_sequence`) therefore survives its
-        // own tombstone (`delete_sequence < seal_sequence`). The allocator's block
-        // refill already bumped the durable `current_sequence_number` to at least
-        // this value, so on restart the inline watermark reseeds above it and the
-        // shadow is visible (R1: no acked-but-invisible row).
+        // ONE seal sequence stamps the inline BLOB rows AND the reinsert stamp.
+        // Reserved AFTER every delta segment's append, so it is strictly above their
+        // `data_sequence`/`delete_sequence` — a re-inserted key's shadow copy (at
+        // `seal_sequence`) survives its own tombstone. The allocator's block refill
+        // already bumped the durable `current_sequence_number` to at least this
+        // value, so on restart the inline watermark reseeds above it and the shadow
+        // is visible (R1: no acked-but-invisible row).
         let seal_sequence = self
             .reserve_sequences_local(1)
             .await
             .map_err(|source| Error::Catalog { source })?;
 
-        // (a) Durable INSERTS → one unpublished inline-corpus BLOB. Durable commit
-        // only — NO `publish_inlined_mutation`, so no `inlined_generation` bump, no
-        // watermark advance, and live scans keep serving the RAM tier (the shadow
-        // is a pure recovery artifact until restart).
-        if !visible.is_empty() {
+        // (a) Durable INSERTS → ONE unpublished inline-corpus BLOB over the
+        // concatenated cross-shard visible rows. Durable commit only — NO
+        // `publish_inlined_mutation`, so no `inlined_generation` bump, no watermark
+        // advance, and live scans keep serving the RAM tier (the shadow is a pure
+        // recovery artifact until restart).
+        if !union_visible.is_empty() {
             let ipc_bytes =
-                serialize_batches_to_ipc(&visible).map_err(|e| Error::Arrow { source: e })?;
+                serialize_batches_to_ipc(&union_visible).map_err(|e| Error::Arrow { source: e })?;
             self.commit_inlined_data_durable(
                 InlinedDataRewrite::default(),
                 vec![InlinedData::pending_catalog_insert(
@@ -18146,44 +18195,56 @@ impl CayenneTableProvider {
             .map_err(|source| Error::Catalog { source })?;
         }
 
-        // (b) Durable TOMBSTONES → delete vectors + metastore commit, UNPUBLISHED
-        // (drop the returned in-memory `OnConflictUpdate`). `target_snapshot_id =
-        // None`: the inserts live in the inline BLOB, not a Vortex snapshot, so no
-        // protected snapshot is registered. Idempotent w.r.t. a later bake that
-        // re-commits the same tombstones (the deletion index merges by max
-        // sequence). Reads continue to hide these rows via the RAM tier's
-        // merge-on-read tombstones; the durable index is only consulted on restart.
-        if has_tombstones {
+        // (b) Durable TOMBSTONES → delete vectors + metastore commit over the
+        // cross-shard UNION of the active deltas' tombstones, UNPUBLISHED (drop the
+        // returned `OnConflictUpdate`). `target_snapshot_id = None`: the inserts live
+        // in the inline BLOB, not a Vortex snapshot. Idempotent w.r.t. a later bake
+        // that re-commits the same tombstones (the deletion index merges by max
+        // sequence). Reads keep hiding these rows via the RAM tier's merge-on-read
+        // tombstones; the durable index is consulted only on restart. At N==1 the
+        // view IS shard 0's delta (byte-identical); at N>1 it is the disjoint-key
+        // union, the same synthetic view the sharded checkpoint builds.
+        if any_tombstones {
+            let union_view = if n == 1 {
+                Arc::clone(&deltas[0])
+            } else {
+                Arc::new(
+                    crate::provider::mem_tier::ShardedMemTier::union_snapshot_view(
+                        &deltas, seal_epoch,
+                    ),
+                )
+            };
             let _unpublished = self
-                .commit_mem_tier_checkpoint_metadata(&delta, None, seal_sequence, &corpus_keys)
+                .commit_mem_tier_checkpoint_metadata(&union_view, None, seal_sequence, &corpus_keys)
                 .await
                 .map_err(|source| Error::Catalog { source })?;
         }
 
         // Flag the durable-but-unpublished shadow so the next bake clears it (its
         // published inline view is empty, so the bake's usual clear gate would miss
-        // it and a restart would double-count the re-flushed rows). Released with
-        // Release so a later Acquire load in the bake observes it.
+        // it and a restart would double-count the re-flushed rows).
         self.mem_tier_shadow_present
             .store(true, std::sync::atomic::Ordering::Release);
 
-        // Advance the ingestion/immutable split (active → sealed) under the shard
-        // publish lock so the boundary store is atomic w.r.t. a concurrent append's
-        // tier swap.
-        self.mark_shard_sealed_through(0, sealed_through).await;
+        // Advance each shard's ingestion/immutable split (active → sealed) under that
+        // shard's publish lock so the boundary store is atomic w.r.t. a concurrent
+        // append's tier swap.
+        for (shard_id, &through) in sealed_through.iter().enumerate() {
+            self.mark_shard_sealed_through(shard_id, through).await;
+        }
 
-        // ONLY NOW — after the durable inline BLOB + delete vectors are committed —
-        // may the runtime advance the source slot to cover `seal_epoch`. A crash
-        // before this point leaves the slot un-advanced, so the source re-streams
-        // the tail and the PK-idempotent apply converges exactly-once.
+        // ONLY NOW — after every shard's active delta is durable — may the runtime
+        // advance the source slot to cover `seal_epoch`. A crash before this point
+        // leaves the slot un-advanced, so the source re-streams the tail and the
+        // PK-idempotent apply converges exactly-once.
         self.fire_slot_advancer(seal_epoch).await;
 
         tracing::debug!(
             table = %self.table_metadata.table_name,
             rows = sealed_rows,
             epoch = seal_epoch,
-            sealed_through,
-            "Sealed the active mem-tier ingestion piece into the durable inline shadow"
+            shards = n,
+            "Sealed the active mem-tier ingestion piece(s) into the durable inline shadow"
         );
         Ok(sealed_rows)
     }
@@ -18202,20 +18263,21 @@ impl CayenneTableProvider {
     }
 
     /// Whether the periodic tick should fire a [`Self::seal_mem_tier_durable`] this
-    /// cycle: sealing is enabled (`cdc_mem_tier_seal_age_ms > 0`), the table is on
-    /// the N==1 seal path, the ACTIVE ingestion piece holds un-sealed segments, and
-    /// the source slot last advanced more than one seal cadence ago. A cheap
-    /// lock-free precondition — the seal itself re-checks the active piece under the
-    /// lock and is a no-op if another path drained it first.
+    /// cycle: sealing is enabled (`cdc_mem_tier_seal_age_ms > 0`), SOME shard's
+    /// ACTIVE ingestion piece holds un-sealed segments, and the source slot last
+    /// advanced more than one seal cadence ago. A cheap lock-free precondition — the
+    /// seal itself re-checks the active pieces under the capture locks and is a
+    /// no-op if another path drained them first.
     fn seal_due(&self) -> bool {
         let Some(seal_age) = self.context.mem_tier_seal_age() else {
             return false;
         };
-        // Only the unsharded default seals today (see `seal_mem_tier_durable`).
-        if self.mem_tier.shard_count() != 1 {
-            return false;
-        }
-        if !self.mem_tier.shard(0).load().has_unsealed_segments() {
+        if !self
+            .mem_tier
+            .shards()
+            .iter()
+            .any(|s| s.load().has_unsealed_segments())
+        {
             return false;
         }
         self.last_slot_advance_at.lock().elapsed() >= seal_age
@@ -25123,7 +25185,10 @@ mod tests {
         // NOT fire the advancer, so the sentinel survives.
         durable.store(999, std::sync::atomic::Ordering::SeqCst);
         assert_eq!(
-            provider.seal_mem_tier_durable().await.expect("re-seal noop"),
+            provider
+                .seal_mem_tier_durable()
+                .await
+                .expect("re-seal noop"),
             0,
             "re-sealing with no active piece is a no-op"
         );
@@ -25291,6 +25356,75 @@ mod tests {
             scan_sorted_ids(&reopened).await,
             vec![1, 3],
             "the sealed delete is durable across a crash — key 2 is NOT resurrected"
+        );
+    }
+
+    /// N>1 ALL-SHARDS seal: a seal captures EVERY shard's active piece
+    /// all-shards-atomically (write_lock + publish locks), durably shadows the
+    /// cross-shard union as ONE inline BLOB, and advances the slot to the MAX
+    /// apply-epoch across shards. Reads are preserved, and a crash before any bake
+    /// recovers every row from the shadow (no loss) — across all 4 shards. This is
+    /// the sharded analogue of `mem_tier_seal_recovers_rows_after_crash_no_loss`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn mem_tier_seal_all_shards_advances_slot_and_recovers() {
+        let ctx = SessionContext::new();
+        let runtime_env = ctx.runtime_env();
+        let (provider, catalog, _tmp) =
+            create_sharded_cdc_upsert_table("seal_all_shards", Arc::clone(&runtime_env), 4).await;
+        // Swap the armed no-op advancer for a recorder (keeps the sharded path armed).
+        let durable = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        provider.install_slot_advancer(Arc::new(EpochRecorder(Arc::clone(&durable))));
+        let schema = Arc::clone(&provider.table_metadata.schema);
+
+        // Bursts of distinct keys, spread across the 4 shards by PK hash.
+        let bursts = [
+            vec![(1_i64, 10_i64), (2, 20), (3, 30)],
+            vec![(4, 40), (5, 50)],
+            vec![(6, 60), (7, 70), (8, 80), (9, 90)],
+        ];
+        let mut last_epoch = 0;
+        for burst in &bursts {
+            if let Some(e) = apply_upsert_burst(&ctx, &provider, Arc::clone(&schema), burst).await {
+                last_epoch = e;
+            }
+        }
+        assert!(last_epoch > 0, "the sharded in-memory apply path engaged");
+        let before = collect_id_value_pairs(&ctx, &provider, "seal_all_shards").await;
+        assert_eq!(
+            before.len(),
+            9,
+            "all 9 keys visible from RAM before any seal"
+        );
+
+        // SEAL all shards atomically → the slot advances to the cross-shard MAX
+        // apply epoch (safe precisely because the capture is all-shards-atomic).
+        let sealed = provider
+            .seal_mem_tier_durable()
+            .await
+            .expect("all-shards seal");
+        assert!(sealed > 0, "the seal shadowed the active pieces");
+        assert_eq!(
+            durable.load(std::sync::atomic::Ordering::SeqCst),
+            last_epoch,
+            "slot advanced to the MAX apply epoch across all shards"
+        );
+        // Reads unchanged — still served from RAM (the shadow is unpublished).
+        assert_eq!(
+            collect_id_value_pairs(&ctx, &provider, "seal_all_shards").await,
+            before,
+            "reads are preserved after an all-shards seal"
+        );
+
+        // CRASH before any bake → recover every row from the durable shadow.
+        drop(provider);
+        let reopened = CayenneTableProviderBuilder::new(catalog, runtime_env)
+            .open("seal_all_shards")
+            .await
+            .expect("reopen");
+        assert_eq!(
+            collect_id_value_pairs(&ctx, &reopened, "seal_all_shards").await,
+            before,
+            "every row across all 4 shards survives a crash (recovered from the shadow) — no loss"
         );
     }
 
