@@ -396,7 +396,7 @@ pub struct DataFusionBuilder {
     compaction_memory_fraction: Option<f64>,
     /// Estimated aggregate bytes the enabled changes-mode Cayenne tables reserve
     /// OUTSIDE the query pool (per-table keyset/segment/coalesce/inline caches),
-    /// set by the Runtime builder. When it exceeds the base host/8 headroom, the
+    /// set by the Runtime builder. When it exceeds the base host/10 headroom, the
     /// query-memory default is reduced by the excess. 0 = none / not Cayenne CDC.
     cayenne_cdc_reservation_bytes: u64,
     cayenne_optimizer_rules: CayenneOptimizerRules,
@@ -612,7 +612,7 @@ impl DataFusionBuilder {
 
     /// Estimated off-pool per-table Cayenne CDC cache reservation (bytes), summed
     /// over enabled changes-mode Cayenne tables (keyset/segment/coalesce/inline).
-    /// Used to reduce the query-memory default when it exceeds the base host/8
+    /// Used to reduce the query-memory default when it exceeds the base host/10
     /// headroom. Set by the Runtime builder; `0` disables the reduction.
     #[must_use]
     pub fn cayenne_cdc_reservation_bytes(mut self, bytes: u64) -> Self {
@@ -1489,11 +1489,12 @@ const DEFAULT_QUERY_MEMORY_PERCENT: u64 = 90;
 /// isolation they sum to >100% of host — the SF1000 process-OOM (RSS 242 GiB on a
 /// 256 GiB box, the query pool never reporting exhaustion because the tier is
 /// off-pool). Capping the query+compaction block at 70% reserves the remaining 30%
-/// for the tier (~12.5%, [`coordinated_mem_tier_budget`]) plus the per-table CDC
-/// caches / inline memtables / encode buffers / OS headroom. This is only the BASE:
-/// when the estimated per-table CDC cache reservation (keyset/segment/coalesce/
-/// inline, summed over changes-mode tables) EXCEEDS the base host/8 headroom, the
-/// query default is reduced further by the excess in
+/// for the in-memory tier (up to 20%, host/5, [`coordinated_mem_tier_budget`]) plus
+/// a 10% (host/10) headroom covering the off-pool per-table CDC caches / inline
+/// memtables / encode buffers / OS overhead — a 70% / 20% / 10% = 100% partition.
+/// This is only the BASE: when the estimated per-table CDC cache reservation
+/// (keyset/segment/coalesce/inline, summed over changes-mode tables) EXCEEDS the
+/// host/10 headroom, the query default is reduced further by the excess in
 /// [`effective_query_memory_limit`], down to [`CAYENNE_QUERY_MEMORY_FLOOR_PERCENT`].
 const CAYENNE_QUERY_MEMORY_PERCENT: u64 = 70;
 
@@ -1521,19 +1522,19 @@ fn effective_query_memory_limit(
         }
 
         // Cayenne CDC active. Base is CAYENNE_QUERY_MEMORY_PERCENT of host, leaving
-        // room for the off-pool in-memory tier (clamped to <= host/8 by
-        // `coordinated_mem_tier_budget`) plus the per-table CDC caches + OS headroom.
-        // The per-table caches (keyset/segment/coalesce/inline) live OUTSIDE the
-        // query pool and scale with table count; they are assumed to fit the base
-        // host/8 headroom. When the estimated reservation EXCEEDS that headroom,
-        // carve the excess out of the query pool: because the tier is already capped
-        // at host/8, `query_pool + compaction + tier(<=host/8) + caches` then stays
-        // within host (the freed query bytes plus the host/8 headroom cover the
-        // caches and OS slack the 75%->70% cut also frees). Floored at
-        // CAYENNE_QUERY_MEMORY_FLOOR_PERCENT so a very cache-heavy config never
-        // starves queries (past the floor the tier install-time check warns).
+        // room for the off-pool in-memory tier (clamped to <= host/5 by
+        // `coordinated_mem_tier_budget`) plus a host/10 headroom for the off-pool
+        // per-table CDC caches + OS overhead — a 70 / 20 / 10 = 100% partition. The
+        // per-table caches (keyset/segment/coalesce/inline) live OUTSIDE the query
+        // pool and scale with table count; they are assumed to fit the host/10
+        // headroom. When the estimated reservation EXCEEDS that headroom, carve the
+        // excess out of the query pool so the freed query bytes cover the excess
+        // caches and `query_pool + compaction + tier + caches + headroom` stays
+        // within host. Floored at CAYENNE_QUERY_MEMORY_FLOOR_PERCENT so a very
+        // cache-heavy config never starves queries (past the floor the tier
+        // install-time check warns).
         let base = total_memory.saturating_mul(CAYENNE_QUERY_MEMORY_PERCENT) / 100;
-        let base_headroom = total_memory / MEM_TIER_CEILING_FRACTION;
+        let base_headroom = total_memory / MEM_TIER_HEADROOM_FRACTION;
         let reservation_excess = cdc_reservation_bytes.saturating_sub(base_headroom);
         let floor = total_memory.saturating_mul(CAYENNE_QUERY_MEMORY_FLOOR_PERCENT) / 100;
         let default_limit = base.saturating_sub(reservation_excess).max(floor);
@@ -1542,7 +1543,7 @@ fn effective_query_memory_limit(
             cayenne_active,
             cdc_reservation_bytes,
             reservation_excess,
-            "No query memory limit specified; Cayenne CDC base {CAYENNE_QUERY_MEMORY_PERCENT}% of total, reduced by the per-table CDC reservation above the host/8 headroom to: {}",
+            "No query memory limit specified; Cayenne CDC base {CAYENNE_QUERY_MEMORY_PERCENT}% of total, reduced by the per-table CDC reservation above the host/10 headroom to: {}",
             util::human_readable_bytes(default_limit as usize)
         );
 
@@ -1551,19 +1552,21 @@ fn effective_query_memory_limit(
 }
 
 /// 1/N of host RAM bounding the aggregate off-pool Cayenne in-memory CDC tier (the
-/// ceiling), and the headroom reserve held beyond the pools+tier for caches,
-/// inline memtables, encode buffers, and OS/allocator overhead. Both 1/8 ⇒ with
-/// the 75% query+compaction block the host partitions as 75% / 12.5% / 12.5%.
-const MEM_TIER_CEILING_FRACTION: u64 = 8;
-const MEM_TIER_HEADROOM_FRACTION: u64 = 8;
+/// ceiling, 1/5 = 20%), and the headroom reserve held beyond the pools+tier for the
+/// off-pool per-table CDC caches, inline memtables, encode buffers, and OS/allocator
+/// overhead (1/10 = 10%). With the 70% query+compaction block the host partitions as
+/// 70% / 20% / 10% = 100%.
+const MEM_TIER_CEILING_FRACTION: u64 = 5;
+const MEM_TIER_HEADROOM_FRACTION: u64 = 10;
 /// Raised tier ceiling (1/N of host, > the base `MEM_TIER_CEILING_FRACTION`) the
 /// tier may FLOAT up to on a query-light deployment — one where the operator set a
 /// low `runtime.query.memory_limit`, leaving RAM the default partition would not
 /// otherwise use. The float only consumes room left beyond a DOUBLED headroom
 /// reserve and never exceeds the coordinated remainder, so `query_pool +
 /// compaction + tier + headroom <= host` (the #11449 invariant) is preserved
-/// exactly. 1/6 ≈ 16.7%, a modest bump from the 12.5% base.
-const MEM_TIER_FLOAT_CEILING_FRACTION: u64 = 6;
+/// exactly. 1/4 = 25%, a modest bump above the 20% base ceiling — the fraction must
+/// stay SMALLER than `MEM_TIER_CEILING_FRACTION` so the float sits ABOVE the base.
+const MEM_TIER_FLOAT_CEILING_FRACTION: u64 = 4;
 /// Floor (1/N of host) so a global aggregate cap is ALWAYS installed — a tier
 /// budget of 0 disables the global cap entirely (per-table caps then sum unbounded
 /// across a fleet: the original no-global-cap OOM). Binds only when an operator
@@ -1582,7 +1585,7 @@ pub(crate) const MEM_TIER_FLOOR_FRACTION: u64 = 32;
 /// default inputs — a query pool sized to leave room (see
 /// [`effective_query_memory_limit`]) — it yields
 /// `query_pool + compaction + tier + headroom ≤ host`. The result is clamped to
-/// `[host/32, host/8]`: the `host/8` ceiling keeps the tier ≤ 1/8 of host when the
+/// `[host/32, host/5]`: the `host/5` ceiling keeps the tier ≤ 1/5 of host when the
 /// pools are small, and the `host/32` floor guarantees a nonzero global aggregate
 /// cap is ALWAYS installed (a 0 budget would disable the cap — the original
 /// no-global-cap OOM).
@@ -1607,7 +1610,7 @@ pub(crate) fn coordinated_mem_tier_budget(
     // Floating ceiling for query-light deployments: when the query + compaction
     // pools are sized well below the default partition (an operator who set a low
     // `runtime.query.memory_limit`), let the tier reclaim part of the freed RAM
-    // above the base host/8 cap — up to `host / MEM_TIER_FLOAT_CEILING_FRACTION` —
+    // above the base host/5 cap — up to `host / MEM_TIER_FLOAT_CEILING_FRACTION` —
     // but only the room left beyond a DOUBLED headroom reserve, so the off-pool
     // caches/memtables the single headroom covers keep their slack. Raising only the
     // ceiling never lifts the result above `remainder` (the ceiling caps from above,
@@ -1846,11 +1849,10 @@ mod tests {
 
     use super::{
         CAYENNE_QUERY_MEMORY_FLOOR_PERCENT, CAYENNE_QUERY_MEMORY_PERCENT, CayenneOptimizerRules,
-        DEFAULT_QUERY_MEMORY_PERCENT,
-        DataFusionBuilder, MEM_TIER_CEILING_FRACTION, MEM_TIER_FLOAT_CEILING_FRACTION,
-        MEM_TIER_FLOOR_FRACTION, MEM_TIER_HEADROOM_FRACTION, build_compaction_runtime_env,
-        configure_hash_join_memory_limits, coordinated_mem_tier_budget,
-        effective_query_memory_limit,
+        DEFAULT_QUERY_MEMORY_PERCENT, DataFusionBuilder, MEM_TIER_CEILING_FRACTION,
+        MEM_TIER_FLOAT_CEILING_FRACTION, MEM_TIER_FLOOR_FRACTION, MEM_TIER_HEADROOM_FRACTION,
+        build_compaction_runtime_env, configure_hash_join_memory_limits,
+        coordinated_mem_tier_budget, effective_query_memory_limit,
         runtime_env_with_effective_memory_limit_and_object_store_registry,
         validate_compaction_memory_fraction,
     };
@@ -1880,7 +1882,7 @@ mod tests {
     }
 
     /// Cayenne active, no explicit limit: a per-table CDC reservation at/under the
-    /// base host/8 headroom leaves the default at the base 70%; a reservation ABOVE
+    /// base host/10 headroom leaves the default at the base 70%; a reservation ABOVE
     /// the headroom reduces the default by exactly the excess; and a very large
     /// reservation floors at `CAYENNE_QUERY_MEMORY_FLOOR_PERCENT` (never 0). Reads
     /// live host RAM, so it asserts the RELATIONSHIPS rather than absolute bytes.
@@ -1888,7 +1890,7 @@ mod tests {
     fn effective_query_memory_limit_reduces_by_cdc_reservation() {
         let total = crate::resource_monitor::get_total_memory();
         let base = total.saturating_mul(CAYENNE_QUERY_MEMORY_PERCENT) / 100;
-        let headroom = total / MEM_TIER_CEILING_FRACTION;
+        let headroom = total / MEM_TIER_HEADROOM_FRACTION;
         let floor = total.saturating_mul(CAYENNE_QUERY_MEMORY_FLOOR_PERCENT) / 100;
 
         // Reservation within the base headroom -> no reduction, stays at base 70%.
@@ -1915,14 +1917,28 @@ mod tests {
     }
 
     // Compile-time invariants on the host-partition constants: the Cayenne
-    // query-pool default must be below the non-Cayenne default, and the partition
-    // (70% query+compaction, one-eighth tier ceiling, one-eighth headroom) sums to
-    // 100% of host. `const` assertions (compile-time) rather than a runtime test
-    // asserting constant values (which clippy flags as assertions_on_constants).
+    // query-pool default must be below the non-Cayenne default, and the default
+    // partition (70% query+compaction, one-fifth tier ceiling, one-tenth headroom)
+    // sums to exactly 100% of host — a 90% allocated block plus a 10% headroom
+    // reserve for the off-pool per-table CDC caches and OS overhead. `const`
+    // assertions (compile-time) rather than a runtime test asserting constant values
+    // (which clippy flags as assertions_on_constants).
     const _: () = assert!(CAYENNE_QUERY_MEMORY_PERCENT < DEFAULT_QUERY_MEMORY_PERCENT);
     const _: () = assert!(CAYENNE_QUERY_MEMORY_PERCENT == 70);
-    const _: () = assert!(MEM_TIER_CEILING_FRACTION == 8); // one-eighth = 12.5%
-    const _: () = assert!(MEM_TIER_HEADROOM_FRACTION == 8); // one-eighth = 12.5%
+    const _: () = assert!(MEM_TIER_CEILING_FRACTION == 5); // one-fifth = 20%
+    const _: () = assert!(MEM_TIER_HEADROOM_FRACTION == 10); // one-tenth = 10%
+    // The default partition must not overcommit host RAM: query+compaction (%) +
+    // tier ceiling (100/CEIL %) + headroom (100/HEAD %) <= 100. Cross-multiplied to
+    // exact integer form (no truncation of fractional percentages). 70/20/10 = 100.
+    const _: () = assert!(
+        CAYENNE_QUERY_MEMORY_PERCENT * MEM_TIER_CEILING_FRACTION * MEM_TIER_HEADROOM_FRACTION
+            + 100 * MEM_TIER_HEADROOM_FRACTION
+            + 100 * MEM_TIER_CEILING_FRACTION
+            <= 100 * MEM_TIER_CEILING_FRACTION * MEM_TIER_HEADROOM_FRACTION
+    );
+    // The float ceiling must sit ABOVE the base ceiling (smaller fraction = larger
+    // share of host) or the query-light float is inert.
+    const _: () = assert!(MEM_TIER_FLOAT_CEILING_FRACTION < MEM_TIER_CEILING_FRACTION);
 
     /// THE invariant: for the coordinated default partition (Cayenne active, no
     /// explicit limit), `query_pool + compaction + mem_tier + headroom` never
@@ -1955,7 +1971,7 @@ mod tests {
     /// The tier budget is always clamped to `[host/32, host/MEM_TIER_FLOAT_CEILING]`:
     /// never 0 (a 0 budget disables the global aggregate cap, the original
     /// no-global-cap OOM) and never above the float ceiling even when the pools are
-    /// tiny. The float (host/6) only engages on a query-light deployment and never
+    /// tiny. The float (host/4) only engages on a query-light deployment and never
     /// breaks the no-overcommit invariant.
     #[test]
     fn coordinated_tier_budget_stays_within_clamp() {

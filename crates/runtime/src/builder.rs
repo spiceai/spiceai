@@ -1055,7 +1055,9 @@ fn estimate_cayenne_cdc_reservation_bytes(
                 .map(|mb| mb.saturating_mul(MIB))
         };
         let keyset = param_mib(&["cayenne_pk_keyset_cache_mb", "pk_keyset_cache_mb"])
-            .unwrap_or_else(|| (total_memory / KEYSET_CACHE_HOST_FRACTION).clamp(256 * MIB, 8 * GIB));
+            .unwrap_or_else(|| {
+                (total_memory / KEYSET_CACHE_HOST_FRACTION).clamp(256 * MIB, 8 * GIB)
+            });
         let segment = param_mib(&["cayenne_segment_cache_mb", "segment_cache_mb"])
             .unwrap_or_else(|| (total_memory / SEGMENT_CACHE_HOST_FRACTION).clamp(256 * MIB, GIB));
         let inline = params
