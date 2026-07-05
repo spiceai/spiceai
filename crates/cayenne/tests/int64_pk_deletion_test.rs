@@ -168,7 +168,9 @@ async fn seed_int64_rows_to_files(
             Arc::new(StringArray::from(
                 (0..n).map(|i| format!("n{i}")).collect::<Vec<_>>(),
             )),
-            Arc::new(Int64Array::from((0..n).map(|i| i * 100).collect::<Vec<i64>>())),
+            Arc::new(Int64Array::from(
+                (0..n).map(|i| i * 100).collect::<Vec<i64>>(),
+            )),
         ],
     )?;
     insert_batch(table, batch).await?;

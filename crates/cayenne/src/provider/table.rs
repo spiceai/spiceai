@@ -22089,7 +22089,9 @@ impl TableProvider for CayenneTableProvider {
             return self.delete_using_deletion_vectors(&filters).await;
         }
 
-        let file_sink = self.build_deletion_vector_sink(&filters, None, true).await?;
+        let file_sink = self
+            .build_deletion_vector_sink(&filters, None, true)
+            .await?;
         Ok(Arc::new(DeletionExec::new(Arc::new(
             InlineAwareDeletionSink {
                 table: self.clone_for_write(),
@@ -22337,6 +22339,12 @@ impl CayenneTableProvider {
     /// be discarded), or `Ok(None)` for shapes this path does not fast-path
     /// (file-based retention, position-based deletes — never regressed by #11514),
     /// which the caller must route through `delete_from` unchanged.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if building the deletion-vector sink fails (e.g. listing
+    /// the protected-snapshot or cold-tier tables) or if persisting the deletion
+    /// vectors fails.
     pub async fn delete_from_cdc_fast(
         &self,
         filters: &[Expr],
@@ -22347,7 +22355,9 @@ impl CayenneTableProvider {
             return Ok(None);
         }
 
-        let file_sink = self.build_deletion_vector_sink(filters, None, false).await?;
+        let file_sink = self
+            .build_deletion_vector_sink(filters, None, false)
+            .await?;
         let sink = InlineAwareDeletionSink {
             table: self.clone_for_write(),
             file_sink,
