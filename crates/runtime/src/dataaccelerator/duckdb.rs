@@ -261,16 +261,11 @@ impl DuckDBAccelerator {
                     spicepod::acceleration::Mode::File
                         | spicepod::acceleration::Mode::FileCreate
                         | spicepod::acceleration::Mode::FileUpdate
-                ) {
-                    // Check the duckdb_file param to see if they share a file
-                    let ds_file = acceleration
-                        .params
-                        .as_ref()
-                        .and_then(|p| p.as_string_map().get("duckdb_file").cloned())
-                        .unwrap_or_else(|| format!("{}.db", spicepod_ds.name));
-                    if ds_file == this_file_path {
-                        instance_usage += 1;
-                    }
+                ) && self
+                    .spicepod_dataset_duckdb_file_path(spicepod_ds)
+                    .is_some_and(|dataset_file_path| dataset_file_path == this_file_path)
+                {
+                    instance_usage += 1;
                 }
             } else {
                 // If the path is None, we're just counting the number of memory instances
@@ -281,6 +276,31 @@ impl DuckDBAccelerator {
         }
 
         instance_usage
+    }
+
+    fn spicepod_dataset_duckdb_file_path(
+        &self,
+        dataset: &spicepod::component::dataset::Dataset,
+    ) -> Option<String> {
+        let acceleration = dataset.acceleration.as_ref()?;
+        let mut params = acceleration
+            .params
+            .as_ref()
+            .map(spicepod::param::Params::as_string_map)
+            .unwrap_or_default();
+
+        let data_directory = params
+            .remove("duckdb_data_dir")
+            .unwrap_or_else(spice_data_base_path);
+        params.insert("data_directory".to_string(), data_directory);
+
+        if let Some(duckdb_file) = params.remove("duckdb_file") {
+            params.insert("duckdb_open".to_string(), duckdb_file);
+        }
+
+        self.duckdb_factory
+            .duckdb_file_path("accelerated_duckdb", &mut params)
+            .ok()
     }
 
     pub(crate) fn default_connection_pool_size(storage: ResolvedAccelerationStorage) -> u32 {

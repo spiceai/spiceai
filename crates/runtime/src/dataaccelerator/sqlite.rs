@@ -271,6 +271,21 @@ impl SqliteAccelerator {
 
         Ok(pool)
     }
+
+    fn spicepod_dataset_sqlite_file_path(
+        &self,
+        dataset: &spicepod::component::dataset::Dataset,
+    ) -> Option<String> {
+        let acceleration = dataset.acceleration.as_ref()?;
+        let mut params = acceleration
+            .params
+            .as_ref()
+            .map(spicepod::param::Params::as_string_map)
+            .unwrap_or_default();
+        params.insert("data_directory".to_string(), spice_data_base_path());
+
+        self.sqlite_factory.sqlite_file_path("accelerated", &params).ok()
+    }
 }
 
 /// Execute a sequence of PRAGMA statements against the shared `SQLite`
@@ -491,14 +506,7 @@ impl DataAccelerator for SqliteAccelerator {
                     if ds_name.to_string() == source.name().to_string() {
                         return None;
                     }
-                    // Use the configured sqlite_file param or default naming
-                    let other_path = acceleration
-                        .params
-                        .as_ref()
-                        .and_then(|p| p.as_string_map().get("sqlite_file").cloned())
-                        .unwrap_or_else(|| {
-                            format!("{}/{}.db", spice_data_base_path(), spicepod_ds.name)
-                        });
+                    let other_path = self.spicepod_dataset_sqlite_file_path(spicepod_ds)?;
                     if other_path != self_path {
                         Some(other_path)
                     } else {
