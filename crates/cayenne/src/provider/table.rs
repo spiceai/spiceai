@@ -25718,6 +25718,75 @@ mod tests {
         );
     }
 
+    /// The PRODUCTION trigger path: the periodic tick must fire a SEAL (not a full
+    /// checkpoint) when the active ingestion piece has aged past
+    /// `cdc_mem_tier_seal_age_ms` while still below the flush threshold — advancing
+    /// the slot, preserving reads, NOT clearing the tier, and making the rows
+    /// crash-durable. `min_flush = i64::MAX` and `max_age = 0` disable the bake
+    /// triggers so the tick's ONLY durable action is the seal.
+    #[tokio::test]
+    async fn mem_tier_tick_fires_seal_below_flush_threshold() {
+        let ctx = SessionContext::new();
+        let runtime_env = ctx.runtime_env();
+        let (provider, catalog, _tmp) = create_cdc_upsert_table_with_vortex_config(
+            "tick_seal",
+            Arc::clone(&runtime_env),
+            VortexConfig {
+                cdc_durability: crate::metadata::CdcDurability::Memory,
+                deletion_mode: crate::metadata::DeletionMode::Key,
+                cdc_mem_tier_min_flush_bytes: i64::MAX,
+                cdc_mem_tier_max_age_ms: 0,
+                cdc_mem_tier_seal_age_ms: 5,
+                ..VortexConfig::default()
+            },
+        )
+        .await;
+        let durable = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        provider.install_slot_advancer(Arc::new(EpochRecorder(Arc::clone(&durable))));
+        let schema = Arc::clone(&provider.table_metadata.schema);
+
+        apply_upsert_burst(
+            &ctx,
+            &provider,
+            Arc::clone(&schema),
+            &[(1, 10), (2, 20), (3, 30)],
+        )
+        .await;
+        // Age the active piece well past the 5 ms seal cadence.
+        tokio::time::sleep(std::time::Duration::from_millis(60)).await;
+
+        provider.run_mem_tier_checkpoint_tick().await;
+        assert!(
+            durable.load(std::sync::atomic::Ordering::SeqCst) > 0,
+            "the tick fired a seal and advanced the slot"
+        );
+        assert!(
+            !provider.mem_tier.tier().load().is_empty(),
+            "a tick SEAL must not clear the tier (a bake would empty it)"
+        );
+        let mut live = collect_id_value_pairs(&ctx, &provider, "tick_seal").await;
+        live.sort_unstable();
+        assert_eq!(
+            live,
+            vec![(1, 10), (2, 20), (3, 30)],
+            "reads preserved after the tick seal"
+        );
+
+        // The tick's seal made the rows crash-durable.
+        drop(provider);
+        let reopened = CayenneTableProviderBuilder::new(catalog, runtime_env)
+            .open("tick_seal")
+            .await
+            .expect("reopen");
+        let mut after = collect_id_value_pairs(&ctx, &reopened, "tick_seal").await;
+        after.sort_unstable();
+        assert_eq!(
+            after,
+            vec![(1, 10), (2, 20), (3, 30)],
+            "the periodic tick's seal made the rows durable across a crash"
+        );
+    }
+
     /// Fix B (ii) — mixed inserts + absorbed deletes inside one deferral
     /// window. At durable-commit time the checkpoint must split the tier's
     /// tombstones by corpus membership: a deleted-then-reinserted key carries
