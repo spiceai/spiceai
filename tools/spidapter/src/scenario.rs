@@ -80,6 +80,13 @@ pub(crate) struct ScenarioConfig {
     pub compute: Option<ComputeConfig>,
     pub acceleration: Option<AccelerationEngine>,
     pub source: SourceConfig,
+    /// Optional path to a full spicepod to deploy verbatim instead of generating
+    /// one from the source + inferred schema. Used to select the hand-tuned /
+    /// adaptive Mongo CDC pods. Env-substituted at scenario load (e.g.
+    /// `spicepod: ${MONGO_SPICEPOD_PATH:-}`); an empty/unset value falls through
+    /// to generation. A `spicepod_path` in the setup metadata takes precedence.
+    #[serde(default)]
+    pub spicepod: Option<String>,
 }
 
 /// Cayenne-specific configuration nested under `source: direct: cayenne:`.
