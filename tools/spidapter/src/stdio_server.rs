@@ -2468,10 +2468,22 @@ mod tests {
     #[test]
     fn bundled_mongo_spicepods_parse() {
         let pods: [(&str, &str); 4] = [
-            ("mongo-sf10-tuned", include_str!("../scenarios/pods/mongo/mongo-sf10-tuned.yaml")),
-            ("mongo-sf100-tuned", include_str!("../scenarios/pods/mongo/mongo-sf100-tuned.yaml")),
-            ("mongo-sf1000-tuned", include_str!("../scenarios/pods/mongo/mongo-sf1000-tuned.yaml")),
-            ("mongo-adaptive", include_str!("../scenarios/pods/mongo/mongo-adaptive.yaml")),
+            (
+                "mongo-sf10-tuned",
+                include_str!("../scenarios/pods/mongo/mongo-sf10-tuned.yaml"),
+            ),
+            (
+                "mongo-sf100-tuned",
+                include_str!("../scenarios/pods/mongo/mongo-sf100-tuned.yaml"),
+            ),
+            (
+                "mongo-sf1000-tuned",
+                include_str!("../scenarios/pods/mongo/mongo-sf1000-tuned.yaml"),
+            ),
+            (
+                "mongo-adaptive",
+                include_str!("../scenarios/pods/mongo/mongo-adaptive.yaml"),
+            ),
         ];
         let run_id = Uuid::nil();
         for (name, yaml) in pods {
@@ -2486,10 +2498,9 @@ mod tests {
                 let spicepod::component::ComponentOrReference::Component(ds) = ds else {
                     panic!("pod `{name}` dataset must be an inline component");
                 };
-                let accel = ds
-                    .acceleration
-                    .as_ref()
-                    .unwrap_or_else(|| panic!("pod `{name}` dataset `{}` missing acceleration", ds.name));
+                let accel = ds.acceleration.as_ref().unwrap_or_else(|| {
+                    panic!("pod `{name}` dataset `{}` missing acceleration", ds.name)
+                });
                 assert_eq!(
                     accel.engine.as_deref(),
                     Some("cayenne"),
