@@ -368,6 +368,19 @@ pub(crate) struct MemTier {
     /// which is preserved across a clear. Cache keys that must distinguish "same
     /// epoch, different tombstones" (the merged-scan-deletions memo) key on this.
     pub(crate) version: u64,
+    /// The ingestion/immutable split point: `segments[0..sealed_segments]` are the
+    /// IMMUTABLE piece — already durably shadowed by a **seal**
+    /// ([`crate::provider::CayenneTableProvider::seal_mem_tier_durable`]) into the
+    /// unpublished inline corpus, so the source slot has been (or may be) advanced
+    /// past them. `segments[sealed_segments..]` are the ACTIVE ingestion piece —
+    /// appended since the last seal and NOT yet durable, so a crash re-streams them
+    /// from the source. Reads union BOTH halves identically (the split is invisible
+    /// to the scan path); it only governs which segments a seal still needs to
+    /// persist and lets a checkpoint reason about what is already durable. Appends
+    /// only ever push to the end (never sealed), so `sealed_segments <=
+    /// segments.len()` always; a checkpoint's [`Self::retain_after`] drops the
+    /// flushed prefix and lowers this by the flushed count.
+    pub(crate) sealed_segments: usize,
 }
 
 impl MemTier {
@@ -383,6 +396,7 @@ impl MemTier {
             epoch: 0,
             oldest_append: None,
             version: 0,
+            sealed_segments: 0,
         }
     }
 
@@ -483,6 +497,9 @@ impl MemTier {
             epoch: self.epoch + 1,
             oldest_append: self.oldest_append.or_else(|| Some(Instant::now())),
             version: self.version + 1,
+            // The appended segment is the newest, so it joins the ACTIVE ingestion
+            // piece (never retroactively sealed): the seal boundary is unchanged.
+            sealed_segments: self.sealed_segments,
         }
     }
 
@@ -499,7 +516,8 @@ impl MemTier {
     #[must_use]
     pub(crate) fn retain_after(&self, flushed_segment_count: usize) -> Self {
         if flushed_segment_count >= self.segments.len() {
-            // Nothing newer survived — empty tier, epoch preserved.
+            // Nothing newer survived — empty tier, epoch preserved. No segments
+            // remain, so the seal boundary resets to 0.
             let mut empty = Self::empty();
             empty.epoch = self.epoch;
             empty.version = self.version + 1;
@@ -534,6 +552,11 @@ impl MemTier {
             // age is measured from now (the next age-cap window starts here).
             oldest_append: Some(Instant::now()),
             version: self.version + 1,
+            // The flushed prefix dropped `flushed_segment_count` leading segments;
+            // any of them that were sealed are gone, so the seal boundary shifts
+            // down by that many (saturating at 0 when the whole sealed prefix was
+            // flushed). The survivors keep their relative sealed/active split.
+            sealed_segments: self.sealed_segments.saturating_sub(flushed_segment_count),
         }
     }
 
@@ -562,6 +585,94 @@ impl MemTier {
             .iter()
             .filter_map(|s| s.source_position)
             .max()
+    }
+
+    /// The ACTIVE ingestion piece: the segments appended since the last seal
+    /// (`segments[sealed_segments..]`). These are the not-yet-durable rows a
+    /// [`crate::provider::CayenneTableProvider::seal_mem_tier_durable`] still needs
+    /// to shadow into the durable inline corpus before the slot may advance past
+    /// them. Empty immediately after a seal (or on an empty tier).
+    #[must_use]
+    pub(crate) fn unsealed_segments(&self) -> &[MemSegment] {
+        // `sealed_segments <= segments.len()` is a construction invariant, but a
+        // capture/append race could in principle observe a stale pair; clamp so a
+        // slice-out-of-bounds can never occur.
+        let start = self.sealed_segments.min(self.segments.len());
+        &self.segments[start..]
+    }
+
+    /// Whether the ACTIVE ingestion piece holds any not-yet-sealed segment — i.e.
+    /// a seal would have work to do. Cheap (index compare); does not walk segments.
+    #[must_use]
+    pub(crate) fn has_unsealed_segments(&self) -> bool {
+        self.sealed_segments < self.segments.len()
+    }
+
+    /// Produce a new tier identical to `self` but with the seal boundary advanced
+    /// to `sealed_through` — recording that `segments[0..sealed_through]` are now
+    /// durably shadowed. Monotone and clamped: never lowers the boundary and never
+    /// exceeds `segments.len()` (a concurrent append only grows the tail, so the
+    /// captured `sealed_through` stays valid). Bumps `version` (the sealed/active
+    /// split is content the merged-scan memo need not distinguish, but a version
+    /// bump keeps "a store happened" observable and is cheap). O(1): clones only
+    /// the `Arc` segment/​tombstone pointers, never the payload.
+    #[must_use]
+    pub(crate) fn mark_sealed_through(&self, sealed_through: usize) -> Self {
+        let sealed_segments = sealed_through
+            .max(self.sealed_segments)
+            .min(self.segments.len());
+        Self {
+            segments: Arc::clone(&self.segments),
+            tombstones: self.tombstones.clone(),
+            bytes: self.bytes,
+            rows: self.rows,
+            superseded: self.superseded,
+            epoch: self.epoch,
+            oldest_append: self.oldest_append,
+            version: self.version + 1,
+            sealed_segments,
+        }
+    }
+
+    /// A synthetic single-tier VIEW over ONLY the ACTIVE ingestion piece
+    /// (`segments[sealed_segments..]`) with the tombstone/byte/row aggregates
+    /// REBUILT from just those segments — the delta a **seal** must durably shadow.
+    /// Structurally the same rebuild as [`Self::retain_after`] (fold each survivor
+    /// segment's own [`SegmentTombstones`] at its own `delete_sequence`), so the
+    /// aggregate tombstone map is exactly the delta's — NOT the whole tier's (whose
+    /// sealed prefix was already persisted by earlier seals; re-persisting it would
+    /// be redundant, though idempotent). `sealed_segments` is 0 (the view is all
+    /// active). Cheap: clones only `Arc`/`im::HashMap` roots, never batch payload.
+    ///
+    /// Correctness of applying only the delta's tombstones to the delta's rows: a
+    /// tombstone hides only rows at a `data_sequence <= delete_sequence`, and the
+    /// active rows are the NEWEST (highest sequences), so a sealed (older, lower
+    /// `delete_sequence`) tombstone can never hide an active row — the delta's own
+    /// tombstones are the complete set that governs its visible rows.
+    #[must_use]
+    pub(crate) fn unsealed_view(&self) -> Self {
+        let unsealed: Vec<MemSegment> = self.unsealed_segments().to_vec();
+        let mut tombstones = InMemTombstones::default();
+        let mut bytes = 0u64;
+        let mut rows = 0u64;
+        let mut superseded = 0u64;
+        for segment in &unsealed {
+            tombstones.merge_segment(&segment.tombstones);
+            bytes = bytes.saturating_add(segment.bytes);
+            rows = rows.saturating_add(segment.rows);
+            superseded = superseded.saturating_add(segment.superseded);
+        }
+        Self {
+            segments: Arc::new(unsealed),
+            tombstones,
+            bytes,
+            rows,
+            superseded,
+            epoch: self.epoch,
+            oldest_append: self.oldest_append,
+            version: self.version,
+            sealed_segments: 0,
+        }
     }
 }
 
@@ -745,6 +856,9 @@ impl ShardedMemTier {
             epoch: durable_epoch,
             oldest_append,
             version: Self::version_hash_of(shards),
+            // Synthetic union view carries no segments (rows are iterated per
+            // shard), so the seal boundary is vacuously 0.
+            sealed_segments: 0,
         }
     }
 
@@ -1095,5 +1209,178 @@ mod tests {
         let advancer: Arc<dyn SlotAdvancer> = Arc::new(Recorder(Arc::clone(&seen)));
         advancer.on_checkpoint_durable(42).await;
         assert_eq!(seen.load(Ordering::SeqCst), 42);
+    }
+
+    /// A fresh tier has no sealed segments; every append lands in the ACTIVE
+    /// ingestion piece (the seal boundary never moves on append), so the whole
+    /// tier is unsealed until a seal runs.
+    #[test]
+    fn append_leaves_new_segments_unsealed() {
+        let mut tier = MemTier::empty();
+        assert_eq!(tier.sealed_segments, 0);
+        assert!(
+            !tier.has_unsealed_segments(),
+            "empty tier has no active piece"
+        );
+        for i in 0..3 {
+            tier = tier.append_segment(
+                Arc::new(vec![batch(&[i])]),
+                i + 1,
+                SegmentTombstones::default(),
+                16,
+                1,
+                0,
+            );
+        }
+        assert_eq!(tier.segments.len(), 3);
+        assert_eq!(tier.sealed_segments, 0, "appends never seal");
+        assert_eq!(
+            tier.unsealed_segments().len(),
+            3,
+            "all 3 segments are active"
+        );
+        assert!(tier.has_unsealed_segments());
+    }
+
+    /// `mark_sealed_through` advances the ingestion/immutable split, is monotone
+    /// (never lowers it), and clamps to `segments.len()`. After sealing, only the
+    /// segments appended AFTER the seal are the active piece.
+    #[test]
+    fn mark_sealed_through_advances_split_monotone_and_clamped() {
+        let mut tier = MemTier::empty();
+        for i in 0..2 {
+            tier = tier.append_segment(
+                Arc::new(vec![batch(&[i])]),
+                i + 1,
+                SegmentTombstones::default(),
+                16,
+                1,
+                0,
+            );
+        }
+        // Seal through both existing segments.
+        let sealed = tier.mark_sealed_through(2);
+        assert_eq!(sealed.sealed_segments, 2);
+        assert!(
+            !sealed.has_unsealed_segments(),
+            "nothing active after full seal"
+        );
+        assert_eq!(sealed.unsealed_segments().len(), 0);
+        // Segment payloads and aggregates are untouched by a seal (O(1) rebrand).
+        assert_eq!(sealed.segments.len(), 2);
+        assert_eq!(sealed.rows, tier.rows);
+        assert!(
+            sealed.version > tier.version,
+            "seal bumps the content version"
+        );
+
+        // A later append is active again (boundary unchanged by the append).
+        let grown = sealed.append_segment(
+            Arc::new(vec![batch(&[9])]),
+            3,
+            SegmentTombstones::default(),
+            16,
+            1,
+            0,
+        );
+        assert_eq!(grown.sealed_segments, 2);
+        assert_eq!(
+            grown.unsealed_segments().len(),
+            1,
+            "only the new segment is active"
+        );
+
+        // Monotone: sealing through a LOWER count never lowers the boundary.
+        let not_lowered = grown.mark_sealed_through(1);
+        assert_eq!(
+            not_lowered.sealed_segments, 2,
+            "seal boundary never regresses"
+        );
+        // Clamp: sealing past the end pins at segments.len().
+        let clamped = grown.mark_sealed_through(999);
+        assert_eq!(clamped.sealed_segments, grown.segments.len());
+        assert!(!clamped.has_unsealed_segments());
+    }
+
+    /// A checkpoint's `retain_after` drops the flushed prefix and lowers the seal
+    /// boundary by exactly the flushed count (saturating at 0), so the survivors
+    /// keep the correct sealed/active split. Covers flushed<sealed and
+    /// flushed>=sealed.
+    #[test]
+    fn retain_after_shifts_seal_boundary_down() {
+        let mut tier = MemTier::empty();
+        for i in 0..4 {
+            tier = tier.append_segment(
+                Arc::new(vec![batch(&[i])]),
+                i + 1,
+                SegmentTombstones::default(),
+                16,
+                1,
+                0,
+            );
+        }
+        // Seal the first 3 of 4 segments (segment 3 is active).
+        let tier = tier.mark_sealed_through(3);
+        assert_eq!(tier.sealed_segments, 3);
+
+        // Flush the first 2 (< sealed): boundary drops to 1, one sealed + one
+        // active survive.
+        let after_partial = tier.retain_after(2);
+        assert_eq!(after_partial.segments.len(), 2);
+        assert_eq!(
+            after_partial.sealed_segments, 1,
+            "3 - 2 = 1 sealed survives"
+        );
+        assert_eq!(after_partial.unsealed_segments().len(), 1);
+
+        // Flush the first 3 (== sealed) from the ORIGINAL: boundary saturates to 0,
+        // only the active segment survives.
+        let after_all_sealed = tier.retain_after(3);
+        assert_eq!(after_all_sealed.segments.len(), 1);
+        assert_eq!(
+            after_all_sealed.sealed_segments, 0,
+            "the whole sealed prefix was flushed"
+        );
+        assert_eq!(after_all_sealed.unsealed_segments().len(), 1);
+
+        // Flush everything: empty tier, boundary 0.
+        let after_full = tier.retain_after(4);
+        assert!(after_full.segments.is_empty());
+        assert_eq!(after_full.sealed_segments, 0);
+    }
+
+    /// `unsealed_view` builds a delta snapshot over ONLY the active piece, with
+    /// tombstone/byte/row aggregates rebuilt from just those segments — the exact
+    /// input a seal shadows. Sealed segments and their tombstones are excluded.
+    #[test]
+    fn unsealed_view_covers_active_piece_with_rebuilt_aggregates() {
+        let mut tier = MemTier::empty();
+        // Sealed segment: 1 row, deletes key 100 (a durable-hiding tombstone).
+        let mut t0 = SegmentTombstones::from_int64_keys([100]);
+        t0.stamp(1);
+        tier = tier.append_segment(Arc::new(vec![batch(&[1])]), 2, t0, 16, 1, 0);
+        tier = tier.mark_sealed_through(1);
+        // Active segment: 2 rows, deletes key 200.
+        let mut t1 = SegmentTombstones::from_int64_keys([200]);
+        t1.stamp(3);
+        tier = tier.append_segment(Arc::new(vec![batch(&[2, 3])]), 4, t1, 32, 2, 0);
+
+        let view = tier.unsealed_view();
+        assert_eq!(view.segments.len(), 1, "only the active segment");
+        assert_eq!(
+            view.rows, 2,
+            "row aggregate rebuilt from the active piece only"
+        );
+        assert_eq!(view.sealed_segments, 0, "the view is entirely active");
+        // The delta's tombstones are ONLY the active segment's (key 200), NOT the
+        // sealed segment's (key 100) — the sealed tombstone was already shadowed.
+        assert!(
+            view.tombstones.int64_pk.contains_key(&200),
+            "active tombstone present"
+        );
+        assert!(
+            !view.tombstones.int64_pk.contains_key(&100),
+            "sealed tombstone excluded from the delta view"
+        );
     }
 }
