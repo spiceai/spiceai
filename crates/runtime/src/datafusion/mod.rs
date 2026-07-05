@@ -2590,12 +2590,6 @@ impl DataFusion {
             .validate_time_format(dataset.name.to_string(), &refresh_schema)
             .context(InvalidTimeColumnTimeFormatSnafu)?;
 
-        // A partition-scoped table (executor mode) carries partition predicates —
-        // e.g. `bucket(N, col)` — that the federated source cannot evaluate. Force
-        // the refresh to run in the local session context (which registers those
-        // UDFs) rather than unparsing them into SQL pushed to the source.
-        let is_partition_scoped = initial_partition_filters.is_some();
-
         // Apply initial partition filters before the refresher starts to avoid a race
         // where the first refresh runs without partition filters. `Some(empty)`
         // (executor owns no partition of this table) is preserved so the refresh
