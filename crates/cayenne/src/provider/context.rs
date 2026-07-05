@@ -581,6 +581,21 @@ impl CayenneContext {
         }
     }
 
+    /// Max age of the ACTIVE ingestion piece before a **seal** durably shadows it
+    /// and advances the source slot (`cdc_durability: memory`). Returns `None` when
+    /// sealing is disabled (`cdc_mem_tier_seal_age_ms == 0`), in which case the
+    /// slot ack reverts to the checkpoint cadence. Like the checkpoint interval
+    /// this is a fixed time-domain durability-policy bound, not a tuned actuator.
+    #[must_use]
+    pub(crate) fn mem_tier_seal_age(&self) -> Option<std::time::Duration> {
+        let ms = self.config.cdc_mem_tier_seal_age_ms;
+        if ms == 0 {
+            None
+        } else {
+            Some(std::time::Duration::from_millis(ms))
+        }
+    }
+
     /// Get the shared semaphore for limiting concurrent file writes / uploads.
     #[must_use]
     pub fn upload_semaphore(&self) -> &Arc<Semaphore> {

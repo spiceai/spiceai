@@ -404,6 +404,12 @@ async fn ensure_publication(
         .get(0);
 
     if exists {
+        // Repair publications created by an older Spice build (or a DBA)
+        // without `publish_via_partition_root`. Without it, pgoutput attributes
+        // a partitioned table's changes to each leaf partition, which the
+        // shared router — keyed by the parent's name — silently drops (#11290).
+        ensure_publish_via_partition_root(client, publication_name).await?;
+
         // Verify the publication includes our table; if not, add it.
         let has_table: bool = client
             .query_one(
@@ -430,7 +436,13 @@ async fn ensure_publication(
     }
 
     let stmt = format!(
-        "CREATE PUBLICATION {pub} FOR TABLE {schema}.{table}",
+        // `publish_via_partition_root = true` makes pgoutput report a
+        // partitioned table's changes under the parent relation (matching the
+        // shared router's parent-keyed members and the parent-table initial
+        // snapshot) instead of each leaf partition. No effect on regular
+        // tables. See #11290.
+        "CREATE PUBLICATION {pub} FOR TABLE {schema}.{table} \
+         WITH (publish_via_partition_root = true)",
         pub = quote_ident(publication_name),
         schema = quote_ident(schema_name),
         table = quote_ident(table_name),
@@ -451,6 +463,58 @@ async fn ensure_publication(
         ignore_duplicate_object(client.simple_query(&add).await)?;
     }
     Ok(true)
+}
+
+/// Ensure an existing publication publishes partitioned-table changes under the
+/// root (parent) relation. `CREATE PUBLICATION` sets this for publications we
+/// create; this repairs a publication created without it by an older Spice
+/// build or a DBA. It is a no-op once the option is set, and harmless for
+/// publications carrying only regular tables.
+///
+/// The `ALTER` requires ownership of the publication. When Spice does not own a
+/// pre-created publication the alter is skipped with a warning rather than
+/// failing setup: leaving `publish_via_partition_root` off is only a problem
+/// for partitioned source tables, so a non-owner with regular tables keeps
+/// working exactly as before.
+async fn ensure_publish_via_partition_root(
+    client: &tokio_postgres::Client,
+    publication_name: &str,
+) -> Result<()> {
+    let via_root: bool = client
+        .query_one(
+            "SELECT pubviaroot FROM pg_publication WHERE pubname = $1",
+            &[&publication_name],
+        )
+        .await
+        .context(SetupExecSnafu)?
+        .get(0);
+    if via_root {
+        return Ok(());
+    }
+
+    let stmt = format!(
+        "ALTER PUBLICATION {pub} SET (publish_via_partition_root = true)",
+        pub = quote_ident(publication_name),
+    );
+    match client.simple_query(&stmt).await {
+        Ok(_) => Ok(()),
+        // 42501 insufficient_privilege: a publication Spice does not own.
+        // Don't fail setup — only partitioned sources need the option.
+        Err(e)
+            if e.as_db_error()
+                .is_some_and(|db| db.code().code() == "42501") =>
+        {
+            tracing::warn!(
+                publication = %publication_name,
+                "Cannot set publish_via_partition_root on a publication Spice \
+                 does not own; changes to partitioned source tables may be \
+                 dropped. Recreate the publication with \
+                 WITH (publish_via_partition_root = true) or grant ownership."
+            );
+            Ok(())
+        }
+        Err(e) => Err(e).context(SetupExecSnafu),
+    }
 }
 
 /// Best-effort removal of a table from a (shared) publication. Used when a

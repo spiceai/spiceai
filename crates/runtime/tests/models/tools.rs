@@ -109,7 +109,7 @@ params:
             tools_list.iter().any(|tool| tool
                 .get("name")
                 .and_then(Value::as_str)
-                .is_some_and(|name| name == "mcp_from_spiced/get_readiness")),
+                .is_some_and(|name| name == "mcp_from_spiced__get_readiness")),
             "expected proxied MCP tools from auth-enabled Spice server: {tools_list:?}"
         );
 
@@ -141,7 +141,7 @@ params:
             tools_list.iter().any(|tool| tool
                 .get("name")
                 .and_then(Value::as_str)
-                .is_some_and(|name| name == "mcp_from_spiced/get_readiness")),
+                .is_some_and(|name| name == "mcp_from_spiced__get_readiness")),
             "expected proxied MCP tools from auth-enabled Spice server: {tools_list:?}"
         );
 

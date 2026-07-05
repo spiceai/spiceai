@@ -1124,6 +1124,15 @@ impl CayenneAccelerator {
                 config.cdc_mem_tier_checkpoint_interval_ms,
                 " (milliseconds)",
             );
+            config.cdc_mem_tier_seal_age_ms = parse_u64_aliases_with_hint(
+                acceleration,
+                &[
+                    "cayenne_cdc_mem_tier_seal_age_ms",
+                    "cdc_mem_tier_seal_age_ms",
+                ],
+                config.cdc_mem_tier_seal_age_ms,
+                " (milliseconds)",
+            );
 
             // Widening schema evolution at table open is gated on the dataset's
             // `on_schema_change` policy. The policy lives on the Dataset

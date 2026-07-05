@@ -17,6 +17,7 @@ limitations under the License.
 #![recursion_limit = "256"]
 
 use ::tools::SpiceModelTool;
+use ::tools::naming::{decode_tool_name, encode_tool_name};
 use ::tools::rename::with_name;
 use async_stream::stream;
 use datafusion_expr::Expr;
@@ -96,6 +97,7 @@ pub mod dataconnector;
 pub mod datafusion;
 pub mod datasets_health_monitor;
 pub mod dataupdate;
+pub(crate) mod egress;
 pub mod embeddings;
 pub mod execution_plan;
 pub mod executor_table;
@@ -1843,7 +1845,7 @@ impl Runtime {
                         }
                         let all = catalog.all().await;
                         for tool in all {
-                            yield with_name(&tool, format!("{}/{}", catalog.name(), tool.name()).as_str());
+                            yield with_name(&tool, encode_tool_name(catalog.name(), &tool.name()).as_str());
                         }
                     }
                 }
@@ -1853,20 +1855,18 @@ impl Runtime {
 
     pub async fn get_tool(self: &Arc<Self>, tool_name: &str) -> Option<Arc<dyn SpiceModelTool>> {
         let tools = self.tools.read().await;
-        let tool: Arc<dyn SpiceModelTool> =
-            if let Some((catalog_name, name)) = tool_name.split_once('/') {
-                let Some(Tooling::Catalog { tools: catalog, .. }) = tools.get(catalog_name) else {
-                    return None;
-                };
-                return catalog.get(name).await;
-            } else {
-                let Some(Tooling::Tool(tool) | Tooling::FunctionTool(tool)) = tools.get(tool_name)
-                else {
-                    return None;
-                };
-                Arc::clone(tool)
-            };
-        Some(tool)
+        if let Some((catalog_name, name)) = decode_tool_name(tool_name)
+            && let Some(Tooling::Catalog { tools: catalog, .. }) = tools.get(&catalog_name)
+            && let Some(tool) = catalog.get(&name).await
+        {
+            return Some(tool);
+        }
+        // Fall back to a direct (non-catalog) lookup — covers top-level tools
+        // whose names legitimately contain the `__` catalog separator.
+        let Some(Tooling::Tool(tool) | Tooling::FunctionTool(tool)) = tools.get(tool_name) else {
+            return None;
+        };
+        Some(Arc::clone(tool))
     }
 }
 
