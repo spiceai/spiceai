@@ -14394,7 +14394,7 @@ impl CayenneTableProvider {
     /// that is still pending in the mem tier and therefore was NEVER baked into
     /// the merged files. Tagging the merged snapshot with that max makes the scan
     /// treat the pending delete as already-applied (`delete_seq <= threshold`) and
-    /// skip it forever, resurrecting the deleted row (measured: order_line
+    /// skip it forever, resurrecting the deleted row (measured: `order_line`
     /// +14.9M / +19.6% at SF-100 N=4). Capping below the pending floor forces
     /// those deletes to apply at scan instead.
     ///
