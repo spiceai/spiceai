@@ -1533,10 +1533,31 @@ impl Handler for SpidapterHandler {
                     scp.app_id,
                     scp.cloud.base_url()
                 );
+                // The token minted at provision can expire during a long run. When
+                // service-account client credentials are set, re-mint a fresh client
+                // for the delete; otherwise reuse the provision client (a static key
+                // has nothing to refresh). Fall back to the provision client if the
+                // refresh itself fails.
+                let refreshed = if std::env::var_os("SPICE_CLOUD_CLIENT_ID").is_some()
+                    && std::env::var_os("SPICE_CLOUD_CLIENT_SECRET").is_some()
+                {
+                    match commands::build_cloud_client(Some(scp.cloud.base_url()), None).await {
+                        Ok(client) => Some(client),
+                        Err(e) => {
+                            eprintln!(
+                                "[stdio] teardown: failed to refresh cloud token, using provision token: {e}"
+                            );
+                            None
+                        }
+                    }
+                } else {
+                    None
+                };
+                let cloud = refreshed.as_ref().unwrap_or(&scp.cloud);
                 // On `?` failure here, `scp` (and its still-armed `app_guard`) is
                 // dropped, so the guard retries the delete on drop. On success we
                 // disarm it below so it does not delete the app a second time.
-                commands::delete_app(&scp.cloud, scp.app_id)
+                commands::delete_app(cloud, scp.app_id)
                     .await
                     .map_err(|e| format!("Failed to delete app {}: {e}", scp.app_id))?;
                 if let Some(mut guard) = scp.app_guard.take() {

@@ -6,8 +6,8 @@ on:
     # configs (cdc-tuned-memory + adaptive) for frequent tuned-vs-adaptive trend data
     # (spiceai-dev-xlarge-runners).
     - cron: '0 */3 * * *'
-    # htap-sf1000 (other configs), once daily (0100) — the remaining SF1000 configs (cdc-tuned,
-    # cdc-tuned-turso, cdc-tuned-memory-ivm, adaptive-turso, duckdb baseline) on the xlarge pool.
+    # htap-sf1000 (other configs), once daily (0100) — the remaining SF1000 configs
+    # (cdc-tuned-turso, cdc-tuned-memory-ivm, adaptive-turso, duckdb baseline) on the xlarge pool.
     - cron: '0 1 * * *'
     # htap-sf1, twice daily (0600, 1800) — HTAP CH-benCHmark SF1 (spiceai-dev-large-runners)
     - cron: '0 6,18 * * *'
