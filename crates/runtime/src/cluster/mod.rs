@@ -118,7 +118,7 @@ pub(crate) const CLUSTER_GRPC_RUNTIME_PARAMS: &[&str] = &[
 /// flaps the executor.
 #[derive(Debug, Clone, PartialEq, Eq)]
 // Every field is a duration in seconds; the shared `_seconds` postfix names the unit.
-#[allow(clippy::struct_field_names)]
+#[expect(clippy::struct_field_names)]
 struct ClusterGrpcClientConfig {
     /// HTTP/2 keep-alive ping interval, in seconds.
     http2_keep_alive_interval_seconds: u64,
