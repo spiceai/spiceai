@@ -863,6 +863,18 @@ impl MetastoreBackend for SqliteMetastore {
     async fn init_schema(&self) -> CatalogResult<()> {
         let guard = self.pool().await?.acquire().await;
 
+        // Refuse to open a catalog written by a newer, incompatible Spice build
+        // BEFORE running any migration against it (a fresh/legacy DB reads 0).
+        let stored_version = guard
+            .call(|conn| conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0)))
+            .await
+            .map_err(
+                |e: tokio_rusqlite::Error<rusqlite::Error>| CatalogError::Database {
+                    message: format!("Failed to read metastore schema version: {e}"),
+                },
+            )?;
+        super::ensure_supported_schema_version(stored_version)?;
+
         guard
             .call(|conn| {
                 // Create tables in a transaction
@@ -908,8 +920,10 @@ impl MetastoreBackend for SqliteMetastore {
                 // cayenne_insert_record, so adding the column is forward-upgrade safe.
                 // (DOWNGRADE is NOT safe: an older binary on a catalog with this
                 // column reads an empty insert-record table for new commits and would
-                // drop the re-inserts — rebuild the catalog before downgrading. A
-                // user_version gate is the productionization follow-up.)
+                // drop the re-inserts — rebuild the catalog before downgrading. The
+                // `user_version` gate at the top/bottom of this fn — bumped to
+                // CAYENNE_METASTORE_SCHEMA_VERSION here — turns that into a loud
+                // failure on any downgrade to a build with a lower max version.)
                 let _ = conn.execute(
                     "ALTER TABLE cayenne_delete_file ADD COLUMN reinsert_sequence BIGINT",
                     [],
@@ -1028,6 +1042,24 @@ impl MetastoreBackend for SqliteMetastore {
             .map_err(
                 |e: tokio_rusqlite::Error<rusqlite::Error>| CatalogError::Database {
                     message: duplicate_delete_file_index_error_message("SQLite", e),
+                },
+            )?;
+
+        // Stamp the current schema version now that all migrations have succeeded,
+        // so a later downgrade to a build with a lower max version fails loudly at
+        // the gate above instead of returning silently wrong results.
+        guard
+            .call(|conn| {
+                conn.pragma_update(
+                    None,
+                    "user_version",
+                    super::CAYENNE_METASTORE_SCHEMA_VERSION,
+                )
+            })
+            .await
+            .map_err(
+                |e: tokio_rusqlite::Error<rusqlite::Error>| CatalogError::Database {
+                    message: format!("Failed to stamp metastore schema version: {e}"),
                 },
             )?;
 
@@ -2195,5 +2227,107 @@ mod tests {
             false,
         )
         .await;
+    }
+
+    async fn read_user_version(metastore: &SqliteMetastore) -> i64 {
+        metastore
+            .query_row(
+                QueryRowParams {
+                    sql: "PRAGMA user_version",
+                    params: vec![],
+                },
+                |row| row.get_i64(0),
+            )
+            .await
+            .expect("read user_version")
+    }
+
+    /// A fresh catalog is stamped with the current schema version, and re-running
+    /// `init_schema` on it is idempotent (no downgrade, no error).
+    #[tokio::test]
+    async fn test_init_schema_stamps_and_preserves_user_version() {
+        let (_dir, metastore) = temp_metastore();
+        metastore.init_schema().await.expect("first init schema");
+        assert_eq!(
+            read_user_version(&metastore).await,
+            crate::metastore::CAYENNE_METASTORE_SCHEMA_VERSION,
+            "fresh catalog must be stamped with the current schema version"
+        );
+
+        metastore
+            .init_schema()
+            .await
+            .expect("re-running init schema is idempotent");
+        assert_eq!(
+            read_user_version(&metastore).await,
+            crate::metastore::CAYENNE_METASTORE_SCHEMA_VERSION,
+            "re-init must leave the stamp at the current version"
+        );
+    }
+
+    /// A legacy catalog (`user_version` 0, written before this gate existed) opens
+    /// cleanly and is migrated forward to the current stamp.
+    #[tokio::test]
+    async fn test_init_schema_upgrades_legacy_zero_version() {
+        let (_dir, metastore) = temp_metastore();
+        metastore.init_schema().await.expect("init schema");
+        // Simulate a pre-gate catalog by resetting the stamp to 0.
+        metastore
+            .execute(ExecuteParams {
+                sql: "PRAGMA user_version = 0",
+                params: vec![],
+            })
+            .await
+            .expect("reset user_version to legacy 0");
+        assert_eq!(read_user_version(&metastore).await, 0, "precondition");
+
+        metastore
+            .init_schema()
+            .await
+            .expect("legacy (v0) catalog must open and migrate");
+        assert_eq!(
+            read_user_version(&metastore).await,
+            crate::metastore::CAYENNE_METASTORE_SCHEMA_VERSION,
+            "legacy catalog must be re-stamped to the current version"
+        );
+    }
+
+    /// A catalog stamped by a NEWER build must be refused loudly rather than
+    /// opened and read with silently-wrong (dropped-row) results (#11291).
+    #[tokio::test]
+    async fn test_init_schema_rejects_newer_user_version() {
+        let (_dir, metastore) = temp_metastore();
+        metastore.init_schema().await.expect("first init schema");
+        // Simulate a catalog written by a future, incompatible build.
+        let newer = crate::metastore::CAYENNE_METASTORE_SCHEMA_VERSION + 1;
+        metastore
+            .execute(ExecuteParams {
+                sql: &format!("PRAGMA user_version = {newer}"),
+                params: vec![],
+            })
+            .await
+            .expect("bump user_version to a future version");
+
+        let err = metastore
+            .init_schema()
+            .await
+            .expect_err("a newer catalog must be rejected");
+        match err {
+            CatalogError::IncompatibleSchemaVersion { found, supported } => {
+                assert_eq!(found, newer);
+                assert_eq!(
+                    supported,
+                    crate::metastore::CAYENNE_METASTORE_SCHEMA_VERSION
+                );
+            }
+            other => panic!("expected IncompatibleSchemaVersion, got: {other}"),
+        }
+
+        // The rejected open must NOT have mutated the stamp (no silent downgrade).
+        assert_eq!(
+            read_user_version(&metastore).await,
+            newer,
+            "a refused open must leave the newer stamp untouched"
+        );
     }
 }
