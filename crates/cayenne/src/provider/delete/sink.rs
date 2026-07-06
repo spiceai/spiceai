@@ -58,8 +58,9 @@ use crate::catalog::MetadataCatalog;
 use crate::metadata::TableMetadata;
 use arc_swap::ArcSwap;
 use arrow::array::ArrayRef;
-use arrow_row::RowConverter;
 use arrow_schema::SchemaRef;
+
+use crate::row_converter::RowConverter;
 use async_trait::async_trait;
 use data_components::delete::DeletionSink;
 use datafusion::datasource::listing::ListingTable;
@@ -175,14 +176,15 @@ impl CayenneDeletionSink {
         }
     }
 
-    /// Mark this sink as needing an exact, verified deleted-row count (a
-    /// user-visible `DELETE`, where "rows affected" is shown to the client).
-    /// Bypasses the count-skipping `pk IN (...)` fast path so the scan-based
-    /// path counts only the live rows actually removed. The default (unset)
-    /// keeps the fast path for CDC/internal callers that do not surface the
-    /// count. See [`Self::count_exact`].
-    pub(crate) fn with_exact_count(mut self) -> Self {
-        self.count_exact = true;
+    /// Set whether this sink must return an exact, verified deleted-row count.
+    ///
+    /// `true` (a user-visible `DELETE`, where "rows affected" is shown to the
+    /// client) bypasses the count-skipping `pk IN (...)` fast path so the
+    /// scan-based path counts only the live rows actually removed. `false` (the
+    /// default) keeps the fast path for CDC/internal callers that do not surface
+    /// the count. See [`Self::count_exact`].
+    pub(crate) fn with_exact_count(mut self, exact: bool) -> Self {
+        self.count_exact = exact;
         self
     }
 

@@ -69,12 +69,15 @@ on:
 # an in-flight benchmark is never killed mid-run. Other scale factors (e.g. manual SF1/SF10 runs)
 # get a unique group (github.run_id) and stay parallel.
 #
-# NOTE: GitHub keeps at most one in-progress + one pending run per group (a newer pending run
-# cancels the older pending one), so when a cron dispatches a batch faster than runs complete,
-# the intermediate dispatches are superseded rather than queued FIFO.
+# queue: max keeps up to 100 runs pending in the group, processed first-in-first-out by the time
+# each started waiting. So a batch dispatched faster than runs complete queues FIFO instead of the
+# newer pending run superseding (cancelling) the older one, which is the default (queue: single).
+# This is what lets the dispatcher fire a whole batch at once and let GitHub serialize it, rather
+# than blocking to feed runs one at a time; see testoperator_dispatch_htap.yml.
 concurrency:
   group: ${{ (github.event.inputs.scale_factor == '100' || github.event.inputs.scale_factor == '1000') && 'chbench-htap-sf100-sf1000' || github.run_id }}
   cancel-in-progress: false
+  queue: max
 
 jobs:
   run-htap:
@@ -200,6 +203,7 @@ jobs:
           [ -n "$DIAG_PIDS" ] && kill $DIAG_PIDS 2>/dev/null || true
           exit $testop_exit
         env:
+          SPICED_LOG: "runtime::accelerated_table::refresh_task::changes=debug,cayenne::mem_tier=debug,info"
           SPICEAI_BENCHMARK_METRICS_KEY: ${{ secrets.SPICEAI_BENCHMARK_METRICS_KEY }}
           SPICED_COMMIT: ${{ steps.setup-spiced.outputs.SPICED_COMMIT }}
           # Dedicated in-cluster PG pod on xlarge; per-run docker container (loopback) elsewhere.

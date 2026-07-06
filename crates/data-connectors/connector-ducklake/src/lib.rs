@@ -20,8 +20,8 @@ limitations under the License.
 
 use async_trait::async_trait;
 use data_components::Read;
-use data_components::ducklake::DuckLakeS3Params;
 use data_components::ducklake::writer::DuckDbFederatedTableWriter;
+use data_components::ducklake::{DuckLakeS3Params, build_ducklake_attach_sql};
 use datafusion::datasource::TableProvider;
 use datafusion::sql::TableReference;
 use datafusion_table_providers::UnsupportedTypeAction;
@@ -165,12 +165,16 @@ const PARAMETERS: &[ParameterSpec] = &[
         .secret(),
     ParameterSpec::component("aws_allow_http")
         .description("Allow HTTP (non-TLS) connections to S3."),
+    ParameterSpec::component("automatic_migration").description(
+        "Automatically migrate an older DuckLake catalog schema to the version required by the ducklake extension on attach. Defaults to false; migration rewrites catalog metadata and cannot be undone.",
+    ),
 ];
 
 fn create_ducklake_factory(
     connection_string: &str,
     catalog_name: &str,
     open_path: Option<&str>,
+    automatic_migration: bool,
     params: &ConnectorParams,
 ) -> AnyErrorResult<(DuckDBTableFactory, Arc<DuckDbConnectionPool>, String)> {
     let pool = if let Some(path) = open_path {
@@ -282,10 +286,8 @@ fn create_ducklake_factory(
             source: Box::new(e),
         })?;
 
-    let escaped_connection_string = connection_string.replace('\'', "''");
-    let escaped_catalog_name = catalog_name.replace('"', "\"\"");
     let attach_sql =
-        format!("ATTACH 'ducklake:{escaped_connection_string}' AS \"{escaped_catalog_name}\"");
+        build_ducklake_attach_sql(connection_string, catalog_name, automatic_migration);
     duckdb_wrapper
         .conn
         .execute(&attach_sql, [])
@@ -336,12 +338,20 @@ impl DataConnectorFactory for DuckLakeFactory {
                 .ok()
                 .map(ToString::to_string);
 
+            let automatic_migration = params
+                .parameters
+                .get("automatic_migration")
+                .expose()
+                .ok()
+                .is_some_and(|v| v.eq_ignore_ascii_case("true"));
+
             let params_for_factory = params.clone();
             let (duckdb_factory, pool, catalog_name) = tokio::task::spawn_blocking(move || {
                 create_ducklake_factory(
                     &connection_string,
                     &catalog_name,
                     open_path.as_deref(),
+                    automatic_migration,
                     &params_for_factory,
                 )
             })
