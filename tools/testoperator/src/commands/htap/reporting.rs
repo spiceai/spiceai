@@ -31,6 +31,7 @@ use test_framework::opentelemetry::KeyValue;
 /// don't overwrite the headline lag metric.
 pub(super) fn emit_replication_metrics(
     metrics: &crate::spiced_metrics::SpicedMetrics,
+    pg_stats: &[crate::pg_stats::PgStatSample],
     phase: &str,
     record_telemetry: bool,
 ) {
@@ -207,23 +208,68 @@ pub(super) fn emit_replication_metrics(
         }
     }
 
-    // Caught-up interpretation: `lag_ms` is wall-clock now minus the last applied
-    // commit watermark, so on an idle/drained stream it grows unbounded even though
-    // no WAL is outstanding. `lag_bytes == 0` (server_wal_end == confirmed_flush)
-    // means we have consumed all WAL — i.e. caught up — so flag those datasets rather
-    // than letting a large post-drain `lag_ms` read as real staleness.
+    // Caught-up interpretation: `lag_ms` is wall-clock now minus the last applied commit
+    // watermark, so on an idle/drained stream it grows unbounded even though no WAL is
+    // outstanding. Client-view `lag_bytes == 0` (server_wal_end == confirmed_flush) is
+    // NOT sufficient — and NOT the safe direction: a fully write-blocked walsender reads
+    // client-view 0 (we acked everything we've SEEN) while the source still retains GiB
+    // it hasn't shipped. So a dataset is "caught up" only when client `lag_bytes == 0`
+    // AND the AUTHORITATIVE per-slot retained WAL (pg_replication_slots, source view) is
+    // ~0. The inverse (client 0 but authoritative large) is the write-blocked failure
+    // mode — surfaced as a WARNING, not silently called caught-up.
+    const CAUGHT_UP_WAL_EPSILON: f64 = 16.0 * 1024.0 * 1024.0; // ~1 WAL segment of padding
+    let mut slot_retained: BTreeMap<String, i64> = BTreeMap::new();
+    for s in pg_stats {
+        for (slot, b) in &s.slot_retained_bytes {
+            let e = slot_retained.entry(slot.clone()).or_insert(0);
+            *e = (*e).max(*b);
+        }
+    }
+    // dataset -> slot from the scraped member_attached gauge labels (shared-slot join).
+    let mut ds_slot: BTreeMap<String, String> = BTreeMap::new();
+    if let Some(samples) = metrics.samples.get("dataset_postgres_replication_member_attached") {
+        for sample in samples {
+            if let (Some(name), Some(slot)) = (sample.labels.get("name"), sample.labels.get("slot")) {
+                ds_slot.insert(name.clone(), slot.clone());
+            }
+        }
+    }
+    // Authoritative retained for a dataset's slot; `None` when we can't join (older
+    // binary / non-shared) — then we can only trust the client-view (best-effort).
+    let auth_retained = |d: &str| -> Option<f64> {
+        ds_slot
+            .get(d)
+            .map(|slot| slot_retained.get(slot).copied().unwrap_or(0) as f64)
+    };
+    let client_zero = |d: &str| lag_bytes.get(d).copied().unwrap_or(0.0) == 0.0;
+
     let caught_up: Vec<&String> = all_datasets
         .iter()
         .copied()
-        .filter(|d| lag_bytes.get(*d).copied().unwrap_or(0.0) == 0.0)
-        .filter(|d| lag_ms.get(*d).copied().unwrap_or(0.0) > 0.0)
+        .filter(|d| client_zero(d) && lag_ms.get(*d).copied().unwrap_or(0.0) > 0.0)
+        .filter(|d| auth_retained(d).is_none_or(|r| r <= CAUGHT_UP_WAL_EPSILON))
         .collect();
     if !caught_up.is_empty() {
         let names: Vec<&str> = caught_up.iter().map(|s| s.as_str()).collect();
         println!(
-            "  caught-up (lag_bytes=0 ⇒ all WAL consumed; the nonzero lag_ms is an idle \
-             stale-watermark, not real staleness): {}",
+            "  caught-up (client lag_bytes=0 AND authoritative slot retained ~0 ⇒ all WAL \
+             consumed; the nonzero lag_ms is an idle stale-watermark, not real staleness): {}",
             names.join(", ")
+        );
+    }
+    // Dangerous inverse: client-view says drained, but the source still retains WAL far
+    // above the padding epsilon — the walsender is write-blocked; do NOT call it caught up.
+    let write_blocked: Vec<(&String, f64)> = all_datasets
+        .iter()
+        .copied()
+        .filter_map(|d| auth_retained(d).map(|r| (d, r)))
+        .filter(|(d, r)| client_zero(d) && *r > CAUGHT_UP_WAL_EPSILON)
+        .collect();
+    for (d, r) in &write_blocked {
+        println!(
+            "  WARNING: {d} reads client lag_bytes=0 but authoritative slot retains {:.1} GiB \
+             — walsender write-blocked, NOT caught up (client-view zero is unsafe here).",
+            r / (1024.0 * 1024.0 * 1024.0)
         );
     }
     println!();

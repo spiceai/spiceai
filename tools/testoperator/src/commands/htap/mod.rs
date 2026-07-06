@@ -356,7 +356,7 @@ pub(crate) async fn run(args: &HtapArgs) -> anyhow::Result<()> {
     // Apply-phase coverage violations (populated below), gated at the end of the run.
     let mut coverage_violations: Vec<(String, f64)> = Vec::new();
     if let Some(metrics) = &spiced_metrics {
-        reporting::emit_replication_metrics(metrics, "under load", true);
+        reporting::emit_replication_metrics(metrics, &pg_stats, "under load", true);
         // For Cayenne backend report additional metrics
         reporting::emit_cayenne_read_amp_percentiles(metrics);
         // Localize CDC backpressure across the pipeline stages (prefetch channel,
@@ -414,6 +414,7 @@ pub(crate) async fn run(args: &HtapArgs) -> anyhow::Result<()> {
                     Ok(metrics) => {
                         reporting::emit_replication_metrics(
                             &metrics,
+                            &pg_stats,
                             "post-drain re-scrape",
                             false,
                         );
