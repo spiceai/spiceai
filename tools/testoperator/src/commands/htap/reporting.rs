@@ -241,7 +241,9 @@ pub(super) fn emit_replication_metrics(
             .get(d)
             .map(|slot| slot_retained.get(slot).copied().unwrap_or(0) as f64)
     };
-    let client_zero = |d: &str| lag_bytes.get(d).copied().unwrap_or(0.0) == 0.0;
+    // Require the lag_bytes series to be PRESENT and 0 — a MISSING series (not
+    // scraped/parsed for this dataset) must NOT read as caught-up via unwrap_or(0.0).
+    let client_zero = |d: &str| lag_bytes.get(d).is_some_and(|v| *v == 0.0);
 
     let caught_up: Vec<&String> = all_datasets
         .iter()
