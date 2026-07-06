@@ -1479,8 +1479,27 @@ impl Query {
             self.handle_schema_error(&request_context, &e);
             return Err(e);
         }
-        let dataset_schema = plan.schema().as_arrow().clone();
-        let parameter_schema = parameter_schema_for_plan(&plan)?;
+
+        // Advertise the schema after the analyzer has applied type coercion,
+        // but before logical optimizer rules run. Execution also analyzes the
+        // plan before planning, so using the raw logical schema here can make
+        // FlightSQL GetFlightInfo disagree with DoGet for expressions such as
+        // `CASE WHEN ... THEN decimal_col ELSE 0 END`.
+        let analyzed_plan = match session.analyzer().execute_and_check(
+            (*plan).clone(),
+            session.config_options(),
+            |_, _| {},
+        ) {
+            Ok(plan) => plan,
+            Err(e) => {
+                let e = find_datafusion_root(e);
+                self.handle_schema_error(&request_context, &e);
+                return Err(e);
+            }
+        };
+
+        let dataset_schema = analyzed_plan.schema().as_arrow().clone();
+        let parameter_schema = parameter_schema_for_plan(&analyzed_plan)?;
 
         Ok((dataset_schema, parameter_schema))
     }
@@ -2624,6 +2643,59 @@ mod tests {
         }
 
         assert_eq!(query.cache_status, CacheStatus::CacheMiss);
+    }
+
+    #[tokio::test]
+    async fn get_schema_preserves_parameter_schema_for_unbound_parameters() {
+        let df = Arc::new(
+            DataFusionBuilder::new(
+                RuntimeStatus::new(),
+                Arc::new(AcceleratorEngineRegistry::new()),
+                Handle::current(),
+            )
+            .build(),
+        );
+
+        let (schema, parameter_schema) = QueryBuilder::new("SELECT $1 + 1 AS x", df)
+            .build()
+            .get_schema()
+            .await
+            .expect("schema should be available");
+
+        assert_eq!(
+            schema.field_with_name("x").expect("x field").data_type(),
+            &DataType::Int64
+        );
+        let parameter_schema = parameter_schema.expect("parameter schema");
+        assert_eq!(parameter_schema.fields().len(), 1);
+        assert_eq!(parameter_schema.field(0).name(), "$1");
+    }
+
+    #[tokio::test]
+    async fn get_schema_uses_analyzed_plan_for_decimal_case_coercion() {
+        let df = Arc::new(
+            DataFusionBuilder::new(
+                RuntimeStatus::new(),
+                Arc::new(AcceleratorEngineRegistry::new()),
+                Handle::current(),
+            )
+            .build(),
+        );
+
+        // Mirrors the CH-benCH Q8 pattern: a decimal branch plus an untyped
+        // integer literal branch. DataFusion's analyzer coerces Int64(0) to
+        // Decimal128(20,0), making the CASE output Decimal128(22,2).
+        let sql = "SELECT CASE WHEN TRUE THEN CAST(1.23 AS DECIMAL(6,2)) ELSE 0 END AS x";
+
+        let (schema, parameter_schema) = QueryBuilder::new(sql, df)
+            .build()
+            .get_schema()
+            .await
+            .expect("schema should be available");
+
+        assert!(parameter_schema.is_none());
+        let field = schema.field_with_name("x").expect("x field");
+        assert_eq!(field.data_type(), &DataType::Decimal128(22, 2));
     }
 
     #[tokio::test]
