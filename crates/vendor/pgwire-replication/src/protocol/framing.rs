@@ -15,37 +15,42 @@ pub struct BackendMessage {
 }
 
 impl BackendMessage {
-    /// Returns true if this is an ErrorResponse ('E')
+    /// Returns true if this is an `ErrorResponse` ('E')
     #[inline]
     pub fn is_error(&self) -> bool {
         self.tag == b'E'
     }
 
-    /// Returns true if this is a ReadyForQuery ('Z')
+    /// Returns true if this is a `ReadyForQuery` ('Z')
     #[inline]
     pub fn is_ready_for_query(&self) -> bool {
         self.tag == b'Z'
     }
 
-    /// Returns true if this is CopyBothResponse ('W')
+    /// Returns true if this is `CopyBothResponse` ('W')
     #[inline]
     pub fn is_copy_both_response(&self) -> bool {
         self.tag == b'W'
     }
 
-    /// Returns true if this is CopyData ('d')
+    /// Returns true if this is `CopyData` ('d')
     #[inline]
     pub fn is_copy_data(&self) -> bool {
         self.tag == b'd'
     }
 
-    /// Returns true if this is AuthenticationRequest ('R')
+    /// Returns true if this is `AuthenticationRequest` ('R')
     #[inline]
     pub fn is_auth_request(&self) -> bool {
         self.tag == b'R'
     }
 }
 
+/// Read a single complete backend message from `rd`.
+///
+/// # Errors
+/// Returns [`PgWireError::Io`] on a read failure or EOF, or
+/// [`PgWireError::Protocol`] if the framed length is invalid or oversized.
 pub async fn read_backend_message<R: AsyncRead + Unpin>(rd: &mut R) -> Result<BackendMessage> {
     let mut reader = MessageReader::new();
     reader.read(rd).await
@@ -53,7 +58,7 @@ pub async fn read_backend_message<R: AsyncRead + Unpin>(rd: &mut R) -> Result<Ba
 
 /// Cancellation-safe backend message reader.
 ///
-/// PostgreSQL backend messages span multiple `read` operations (5-byte header,
+/// `PostgreSQL` backend messages span multiple `read` operations (5-byte header,
 /// then a variable payload). A naive implementation using `read_exact` is
 /// **not** cancellation-safe: if the future is dropped between reads (e.g. by
 /// `tokio::select!` or `tokio::time::timeout`), bytes already pulled from the
@@ -76,10 +81,12 @@ pub struct MessageReader {
 }
 
 impl MessageReader {
+    #[must_use]
     pub fn new() -> Self {
         Self::with_capacity(4096)
     }
 
+    #[must_use]
     pub fn with_capacity(capacity: usize) -> Self {
         Self {
             hdr: [0u8; 5],
@@ -95,6 +102,10 @@ impl MessageReader {
     ///
     /// Cancellation-safe: dropping the returned future preserves all progress
     /// so far on `self`. Re-call to resume.
+    ///
+    /// # Errors
+    /// Returns [`PgWireError::Io`] on a read failure or EOF, or
+    /// [`PgWireError::Protocol`] if the framed length is invalid or oversized.
     pub async fn read<R: AsyncRead + Unpin>(&mut self, rd: &mut R) -> Result<BackendMessage> {
         // Phase 1: fill the 5-byte header
         while self.hdr_filled < 5 {
@@ -121,6 +132,10 @@ impl MessageReader {
                 )));
             }
 
+            #[expect(
+                clippy::cast_sign_loss,
+                reason = "len is checked >= 4 above, so len - 4 is non-negative"
+            )]
             let payload_len = (len - 4) as usize;
 
             if payload_len > MAX_MESSAGE_SIZE {
@@ -137,7 +152,13 @@ impl MessageReader {
             self.payload_len = Some(payload_len);
         }
 
-        let payload_len = self.payload_len.unwrap();
+        // Set either just above (fresh header) or on a prior call resumed after
+        // a dropped future; a typed error keeps this non-panicking.
+        let Some(payload_len) = self.payload_len else {
+            return Err(PgWireError::Internal(
+                "MessageReader: payload length unset after header parse".into(),
+            ));
+        };
 
         // Phase 3: fill the payload
         while self.payload_filled < payload_len {
@@ -214,10 +235,12 @@ const READ_CHUNK: usize = 128 * 1024;
 impl FrameReader {
     /// Create a reader that rejects frames whose payload exceeds
     /// `max_message_size` bytes.
+    #[must_use]
     pub fn new(max_message_size: usize) -> Self {
         Self::with_capacity(READ_CHUNK, max_message_size)
     }
 
+    #[must_use]
     pub fn with_capacity(capacity: usize, max_message_size: usize) -> Self {
         Self {
             buf: BytesMut::with_capacity(capacity),
@@ -227,6 +250,7 @@ impl FrameReader {
 
     /// Bytes currently buffered but not yet consumed.
     #[inline]
+    #[must_use]
     pub fn buffered(&self) -> usize {
         self.buf.len()
     }
@@ -234,6 +258,7 @@ impl FrameReader {
     /// Current allocated capacity of the read buffer. Exposed for diagnostics
     /// and to assert the anti-amplification bound in tests.
     #[inline]
+    #[must_use]
     pub fn capacity(&self) -> usize {
         self.buf.capacity()
     }
@@ -245,6 +270,7 @@ impl FrameReader {
     /// Returns `false` on a header that is not yet fully buffered *or* that is
     /// malformed — a malformed header surfaces as an error from `next`.
     #[inline]
+    #[must_use]
     pub fn has_buffered_frame(&self) -> bool {
         matches!(self.frame_len(), Ok(Some(frame_len)) if self.buf.len() >= frame_len)
     }
@@ -254,6 +280,10 @@ impl FrameReader {
     /// if the header is not yet complete; `Err` if the length is invalid or
     /// exceeds `max_message_size`.
     #[inline]
+    #[expect(
+        clippy::cast_sign_loss,
+        reason = "len is checked >= 4 before the usize casts, so both are non-negative"
+    )]
     fn frame_len(&self) -> Result<Option<usize>> {
         if self.buf.len() < 5 {
             return Ok(None);
@@ -314,8 +344,12 @@ impl FrameReader {
 
     /// Read the next complete backend message.
     ///
-    /// Cancellation-safe — see the type-level docs. Returns an `UnexpectedEof`
-    /// I/O error if the peer closes the stream mid-message.
+    /// Cancellation-safe — see the type-level docs.
+    ///
+    /// # Errors
+    /// Returns [`PgWireError::Io`] (`UnexpectedEof`) if the peer closes the
+    /// stream mid-message, or [`PgWireError::Protocol`] if a framed length is
+    /// invalid or exceeds `max_message_size`.
     pub async fn next<R: AsyncRead + Unpin>(&mut self, rd: &mut R) -> Result<BackendMessage> {
         loop {
             if let Some(msg) = self.try_decode()? {
@@ -337,6 +371,14 @@ impl FrameReader {
 ///
 /// **Not** cancellation-safe — see [`MessageReader`] for a cancel-safe
 /// alternative used in the streaming loop.
+///
+/// # Errors
+/// Returns [`PgWireError::Io`] on a read failure or EOF, or
+/// [`PgWireError::Protocol`] if the framed length is invalid or oversized.
+#[expect(
+    clippy::cast_sign_loss,
+    reason = "len is checked >= 4 above, so len - 4 is non-negative"
+)]
 pub async fn read_backend_message_into<R: AsyncRead + Unpin>(
     rd: &mut R,
     buf: &mut BytesMut,
@@ -369,15 +411,28 @@ pub async fn read_backend_message_into<R: AsyncRead + Unpin>(
     })
 }
 
+/// Send an `SSLRequest` packet.
+///
+/// # Errors
+/// Returns [`PgWireError::Io`] if the write or flush fails.
 pub async fn write_ssl_request<W: AsyncWrite + Unpin>(wr: &mut W) -> Result<()> {
     let mut buf = [0u8; 8];
     buf[0..4].copy_from_slice(&(8i32).to_be_bytes());
-    buf[4..8].copy_from_slice(&(80877103i32).to_be_bytes());
+    buf[4..8].copy_from_slice(&(80_877_103i32).to_be_bytes());
     wr.write_all(&buf).await?;
     wr.flush().await?;
     Ok(())
 }
 
+/// Send a `StartupMessage` with the given protocol version and parameters.
+///
+/// # Errors
+/// Returns [`PgWireError::Io`] if the write or flush fails.
+#[expect(
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap,
+    reason = "startup message length is bounded well below i32::MAX"
+)]
 pub async fn write_startup_message<W: AsyncWrite + Unpin>(
     wr: &mut W,
     protocol_version: i32,
@@ -403,6 +458,15 @@ pub async fn write_startup_message<W: AsyncWrite + Unpin>(
     Ok(())
 }
 
+/// Send a simple Query message.
+///
+/// # Errors
+/// Returns [`PgWireError::Io`] if the write or flush fails.
+#[expect(
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap,
+    reason = "query message length is bounded well below i32::MAX"
+)]
 pub async fn write_query<W: AsyncWrite + Unpin>(wr: &mut W, sql: &str) -> Result<()> {
     let mut buf = BytesMut::with_capacity(sql.len() + 64);
     buf.put_u8(b'Q');
@@ -418,6 +482,15 @@ pub async fn write_query<W: AsyncWrite + Unpin>(wr: &mut W, sql: &str) -> Result
     Ok(())
 }
 
+/// Send a `PasswordMessage` (or SASL response) carrying `payload`.
+///
+/// # Errors
+/// Returns [`PgWireError::Io`] if the write or flush fails.
+#[expect(
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap,
+    reason = "password/SASL message length is bounded well below i32::MAX"
+)]
 pub async fn write_password_message<W: AsyncWrite + Unpin>(
     wr: &mut W,
     payload: &[u8],
@@ -435,6 +508,15 @@ pub async fn write_password_message<W: AsyncWrite + Unpin>(
     Ok(())
 }
 
+/// Send a `CopyData` message carrying `payload` (e.g. a standby status update).
+///
+/// # Errors
+/// Returns [`PgWireError::Io`] if the write or flush fails.
+#[expect(
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap,
+    reason = "CopyData message length is bounded well below i32::MAX"
+)]
 pub async fn write_copy_data<W: AsyncWrite + Unpin>(wr: &mut W, payload: &[u8]) -> Result<()> {
     let mut buf = BytesMut::with_capacity(payload.len() + 16);
     buf.put_u8(b'd');
@@ -449,6 +531,10 @@ pub async fn write_copy_data<W: AsyncWrite + Unpin>(wr: &mut W, payload: &[u8]) 
     Ok(())
 }
 
+/// Send a `CopyDone` message.
+///
+/// # Errors
+/// Returns [`PgWireError::Io`] if the write or flush fails.
 pub async fn write_copy_done<W: AsyncWrite + Unpin>(wr: &mut W) -> Result<()> {
     let mut buf = BytesMut::with_capacity(5);
     buf.put_u8(b'c'); // CopyDone
@@ -459,6 +545,13 @@ pub async fn write_copy_done<W: AsyncWrite + Unpin>(wr: &mut W) -> Result<()> {
 }
 
 #[cfg(test)]
+#[expect(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::cast_possible_wrap,
+    clippy::unreadable_literal,
+    reason = "test wire-frame builders use small, known constants and hex byte vectors"
+)]
 mod tests {
     use super::*;
     use std::io::Cursor;
@@ -470,7 +563,9 @@ mod tests {
         let data = [b'Z', 0, 0, 0, 5, b'I'];
         let mut cursor = Cursor::new(&data[..]);
 
-        let msg = read_backend_message(&mut cursor).await.unwrap();
+        let msg = read_backend_message(&mut cursor)
+            .await
+            .expect("should succeed");
         assert_eq!(msg.tag, b'Z');
         assert_eq!(&msg.payload[..], b"I");
         assert!(msg.is_ready_for_query());
@@ -482,7 +577,9 @@ mod tests {
         let data = [b'N', 0, 0, 0, 4];
         let mut cursor = Cursor::new(&data[..]);
 
-        let msg = read_backend_message(&mut cursor).await.unwrap();
+        let msg = read_backend_message(&mut cursor)
+            .await
+            .expect("should succeed");
         assert_eq!(msg.tag, b'N');
         assert!(msg.payload.is_empty());
     }
@@ -493,7 +590,9 @@ mod tests {
         let data = [b'Z', 0, 0, 0, 3];
         let mut cursor = Cursor::new(&data[..]);
 
-        let err = read_backend_message(&mut cursor).await.unwrap_err();
+        let err = read_backend_message(&mut cursor)
+            .await
+            .expect_err("should error");
         assert!(err.to_string().contains("invalid backend message length"));
     }
 
@@ -504,7 +603,7 @@ mod tests {
         let mut cursor = Cursor::new(&data[..]);
 
         let mut reader = MessageReader::new();
-        let msg = reader.read(&mut cursor).await.unwrap();
+        let msg = reader.read(&mut cursor).await.expect("should succeed");
         assert_eq!(msg.tag, b'Z');
         assert_eq!(&msg.payload[..], b"I");
     }
@@ -517,11 +616,11 @@ mod tests {
 
         let mut reader = MessageReader::new();
 
-        let m1 = reader.read(&mut cursor).await.unwrap();
+        let m1 = reader.read(&mut cursor).await.expect("should succeed");
         assert_eq!(m1.tag, b'Z');
         assert_eq!(&m1.payload[..], b"I");
 
-        let m2 = reader.read(&mut cursor).await.unwrap();
+        let m2 = reader.read(&mut cursor).await.expect("should succeed");
         assert_eq!(m2.tag, b'N');
         assert!(m2.payload.is_empty());
     }
@@ -544,7 +643,10 @@ mod tests {
         let payload = b"abcd";
 
         // Deliver only the first 3 header bytes, then cancel.
-        writer.write_all(&header[..3]).await.unwrap();
+        writer
+            .write_all(&header[..3])
+            .await
+            .expect("should succeed");
 
         let timed_out =
             tokio::time::timeout(std::time::Duration::from_millis(20), reader.read(&mut rd)).await;
@@ -555,10 +657,13 @@ mod tests {
 
         // Deliver the remaining bytes. A correct cancel-safe reader resumes
         // and returns the original message intact.
-        writer.write_all(&header[3..]).await.unwrap();
-        writer.write_all(payload).await.unwrap();
+        writer
+            .write_all(&header[3..])
+            .await
+            .expect("should succeed");
+        writer.write_all(payload).await.expect("should succeed");
 
-        let msg = reader.read(&mut rd).await.unwrap();
+        let msg = reader.read(&mut rd).await.expect("should succeed");
         assert_eq!(msg.tag, b'd');
         assert_eq!(&msg.payload[..], payload);
     }
@@ -581,8 +686,11 @@ mod tests {
         ];
 
         // Full header + first 5 bytes of payload, then cancel.
-        writer.write_all(&header).await.unwrap();
-        writer.write_all(&payload[..5]).await.unwrap();
+        writer.write_all(&header).await.expect("should succeed");
+        writer
+            .write_all(&payload[..5])
+            .await
+            .expect("should succeed");
 
         let timed_out =
             tokio::time::timeout(std::time::Duration::from_millis(20), reader.read(&mut rd)).await;
@@ -592,9 +700,12 @@ mod tests {
         );
 
         // Deliver the rest.
-        writer.write_all(&payload[5..]).await.unwrap();
+        writer
+            .write_all(&payload[5..])
+            .await
+            .expect("should succeed");
 
-        let msg = reader.read(&mut rd).await.unwrap();
+        let msg = reader.read(&mut rd).await.expect("should succeed");
         assert_eq!(msg.tag, b'd');
         assert_eq!(&msg.payload[..], &payload[..]);
     }
@@ -605,7 +716,7 @@ mod tests {
         let mut cursor = Cursor::new(&data[..]);
 
         let mut reader = MessageReader::new();
-        let err = reader.read(&mut cursor).await.unwrap_err();
+        let err = reader.read(&mut cursor).await.expect_err("should error");
         assert!(err.to_string().contains("invalid backend message length"));
     }
 
@@ -622,14 +733,16 @@ mod tests {
         ];
         let mut cursor = Cursor::new(&data[..]);
 
-        let err = read_backend_message(&mut cursor).await.unwrap_err();
+        let err = read_backend_message(&mut cursor)
+            .await
+            .expect_err("should error");
         assert!(err.to_string().contains("too large"));
     }
 
     #[tokio::test]
     async fn write_ssl_request_produces_valid_bytes() {
         let mut buf = Vec::new();
-        write_ssl_request(&mut buf).await.unwrap();
+        write_ssl_request(&mut buf).await.expect("should succeed");
 
         assert_eq!(buf.len(), 8);
         // length = 8
@@ -644,7 +757,7 @@ mod tests {
         let params = [("user", "postgres"), ("database", "test")];
         write_startup_message(&mut buf, 196608, &params)
             .await
-            .unwrap();
+            .expect("should succeed");
 
         // Should contain the parameter strings
         let s = String::from_utf8_lossy(&buf);
@@ -661,7 +774,9 @@ mod tests {
     #[tokio::test]
     async fn write_query_produces_valid_message() {
         let mut buf = Vec::new();
-        write_query(&mut buf, "SELECT 1").await.unwrap();
+        write_query(&mut buf, "SELECT 1")
+            .await
+            .expect("should succeed");
 
         // Should start with 'Q'
         assert_eq!(buf[0], b'Q');
@@ -680,7 +795,9 @@ mod tests {
     #[tokio::test]
     async fn write_password_message_produces_valid_message() {
         let mut buf = Vec::new();
-        write_password_message(&mut buf, b"secret").await.unwrap();
+        write_password_message(&mut buf, b"secret")
+            .await
+            .expect("should succeed");
 
         assert_eq!(buf[0], b'p');
         let len = i32::from_be_bytes([buf[1], buf[2], buf[3], buf[4]]) as usize;
@@ -691,7 +808,9 @@ mod tests {
     #[tokio::test]
     async fn write_copy_data_produces_valid_message() {
         let mut buf = Vec::new();
-        write_copy_data(&mut buf, b"payload").await.unwrap();
+        write_copy_data(&mut buf, b"payload")
+            .await
+            .expect("should succeed");
 
         assert_eq!(buf[0], b'd');
         let len = i32::from_be_bytes([buf[1], buf[2], buf[3], buf[4]]) as usize;
@@ -702,7 +821,7 @@ mod tests {
     #[tokio::test]
     async fn write_copy_done_produces_valid_message() {
         let mut buf = Vec::new();
-        write_copy_done(&mut buf).await.unwrap();
+        write_copy_done(&mut buf).await.expect("should succeed");
 
         assert_eq!(buf.len(), 5);
         assert_eq!(buf[0], b'c');
@@ -729,7 +848,7 @@ mod tests {
         let data = [b'Z', 0, 0, 0, 5, b'I'];
         let mut cursor = Cursor::new(&data[..]);
         let mut reader = FrameReader::new(TEST_MAX);
-        let msg = reader.next(&mut cursor).await.unwrap();
+        let msg = reader.next(&mut cursor).await.expect("should succeed");
         assert_eq!(msg.tag, b'Z');
         assert_eq!(&msg.payload[..], b"I");
     }
@@ -742,18 +861,18 @@ mod tests {
         let mut cursor = Cursor::new(data.as_slice());
         let mut reader = FrameReader::new(TEST_MAX);
 
-        let m1 = reader.next(&mut cursor).await.unwrap();
+        let m1 = reader.next(&mut cursor).await.expect("should succeed");
         assert_eq!(m1.tag, b'Z');
         assert_eq!(&m1.payload[..], b"I");
         // With a single buffered read, the following frames must already be
         // available without another socket read.
         assert!(reader.has_buffered_frame());
 
-        let m2 = reader.next(&mut cursor).await.unwrap();
+        let m2 = reader.next(&mut cursor).await.expect("should succeed");
         assert_eq!(m2.tag, b'N');
         assert!(m2.payload.is_empty());
 
-        let m3 = reader.next(&mut cursor).await.unwrap();
+        let m3 = reader.next(&mut cursor).await.expect("should succeed");
         assert_eq!(m3.tag, b'd');
         assert_eq!(&m3.payload[..], b"copydata");
     }
@@ -766,7 +885,7 @@ mod tests {
         let mut reader = FrameReader::new(TEST_MAX);
 
         let frame = wire_frame(b'd', b"abcd");
-        writer.write_all(&frame[..3]).await.unwrap();
+        writer.write_all(&frame[..3]).await.expect("should succeed");
 
         let timed_out =
             tokio::time::timeout(std::time::Duration::from_millis(20), reader.next(&mut rd)).await;
@@ -775,8 +894,8 @@ mod tests {
             "must time out awaiting remaining header"
         );
 
-        writer.write_all(&frame[3..]).await.unwrap();
-        let msg = reader.next(&mut rd).await.unwrap();
+        writer.write_all(&frame[3..]).await.expect("should succeed");
+        let msg = reader.next(&mut rd).await.expect("should succeed");
         assert_eq!(msg.tag, b'd');
         assert_eq!(&msg.payload[..], b"abcd");
     }
@@ -789,7 +908,7 @@ mod tests {
 
         let payload: [u8; 16] = std::array::from_fn(|i| i as u8);
         let frame = wire_frame(b'd', &payload);
-        writer.write_all(&frame[..9]).await.unwrap(); // header + 4 payload bytes
+        writer.write_all(&frame[..9]).await.expect("should succeed"); // header + 4 payload bytes
 
         let timed_out =
             tokio::time::timeout(std::time::Duration::from_millis(20), reader.next(&mut rd)).await;
@@ -798,8 +917,8 @@ mod tests {
             "must time out awaiting remaining payload"
         );
 
-        writer.write_all(&frame[9..]).await.unwrap();
-        let msg = reader.next(&mut rd).await.unwrap();
+        writer.write_all(&frame[9..]).await.expect("should succeed");
+        let msg = reader.next(&mut rd).await.expect("should succeed");
         assert_eq!(msg.tag, b'd');
         assert_eq!(&msg.payload[..], &payload[..]);
     }
@@ -809,7 +928,7 @@ mod tests {
         let data = [b'Z', 0, 0, 0, 3]; // len < 4
         let mut cursor = Cursor::new(&data[..]);
         let mut reader = FrameReader::new(TEST_MAX);
-        let err = reader.next(&mut cursor).await.unwrap_err();
+        let err = reader.next(&mut cursor).await.expect_err("should error");
         assert!(err.to_string().contains("invalid backend message length"));
     }
 
@@ -819,7 +938,7 @@ mod tests {
         let header = wire_frame(b'd', &vec![0u8; 1000]);
         let mut cursor = Cursor::new(header.as_slice());
         let mut reader = FrameReader::new(100);
-        let err = reader.next(&mut cursor).await.unwrap_err();
+        let err = reader.next(&mut cursor).await.expect_err("should error");
         assert!(err.to_string().contains("too large"));
     }
 
@@ -832,7 +951,7 @@ mod tests {
         // many reads + geometric growth for one message.
         let mut cursor = Cursor::new(frame.as_slice());
         let mut reader = FrameReader::new(TEST_MAX);
-        let msg = reader.next(&mut cursor).await.unwrap();
+        let msg = reader.next(&mut cursor).await.expect("should succeed");
         assert_eq!(msg.tag, b'd');
         assert_eq!(msg.payload.len(), payload.len());
         assert_eq!(&msg.payload[..], &payload[..]);
@@ -853,7 +972,7 @@ mod tests {
         header.push(b'd');
         header.extend_from_slice(&len.to_be_bytes());
         header.extend_from_slice(&[0u8; 8]);
-        writer.write_all(&header).await.unwrap();
+        writer.write_all(&header).await.expect("should succeed");
 
         // The frame never completes, so `next` stays pending.
         let timed_out =

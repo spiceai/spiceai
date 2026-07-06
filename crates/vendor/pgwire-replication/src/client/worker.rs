@@ -19,7 +19,7 @@ use crate::protocol::replication::{
 
 /// Shared replication progress updated by the consumer and read by the worker.
 ///
-/// Stored as an AtomicU64 so progress updates are cheap and monotonic
+/// Stored as an `AtomicU64` so progress updates are cheap and monotonic
 /// without async backpressure.
 pub struct SharedProgress {
     applied: AtomicU64,
@@ -173,7 +173,7 @@ impl WorkerState {
             ("client_encoding", "UTF8"),
             ("application_name", "pgwire-replication"),
         ];
-        write_startup_message(stream, 196608, &params).await
+        write_startup_message(stream, 196_608, &params).await
     }
 
     /// Start the logical replication stream.
@@ -196,8 +196,8 @@ impl WorkerState {
             match msg.tag {
                 b'W' => return Ok(()), // CopyBothResponse - ready to stream
                 b'E' => return Err(PgWireError::Server(parse_error_response(&msg.payload))),
-                b'N' | b'S' | b'K' => continue, // Notice, ParameterStatus, BackendKeyData
-                _ => continue,
+                // Notice / ParameterStatus / BackendKeyData / anything else: keep waiting.
+                _ => {}
             }
         }
     }
@@ -221,13 +221,14 @@ impl WorkerState {
         &mut self,
         stream: &mut S,
     ) -> Result<()> {
+        // How many messages to process in the tight loop before checking
+        // stop signal and sending periodic status feedback.
+        const DRAIN_BATCH: usize = 256;
+
         let mut last_status_sent = Instant::now() - self.cfg.status_interval;
         let mut last_applied = self.progress.load_applied();
         // Incremental, zero-copy, cancellation-safe reader.
         let mut reader = FrameReader::new(self.cfg.max_message_size);
-        // How many messages to process in the tight loop before checking
-        // stop signal and sending periodic status feedback.
-        const DRAIN_BATCH: usize = 256;
 
         loop {
             // Update applied LSN from client
@@ -299,15 +300,12 @@ impl WorkerState {
                     self.cfg.idle_wakeup_interval,
                     reader.next(stream),
                 ) => {
-                    match msg_result {
-                        Ok(res) => res?,
-                        Err(_) => {
-                            let applied = self.progress.load_applied();
-                            last_applied = applied;
-                            self.send_feedback(stream, applied, false).await?;
-                            last_status_sent = Instant::now();
-                            continue;
-                        }
+                    if let Ok(res) = msg_result { res? } else {
+                        let applied = self.progress.load_applied();
+                        last_applied = applied;
+                        self.send_feedback(stream, applied, false).await?;
+                        last_status_sent = Instant::now();
+                        continue;
                     }
                 }
             };
@@ -330,7 +328,7 @@ impl WorkerState {
         }
     }
 
-    /// Handle a CopyData message. Returns true if we should stop.
+    /// Handle a `CopyData` message. Returns true if we should stop.
     async fn handle_copy_data<S: AsyncRead + AsyncWrite + Unpin>(
         &mut self,
         stream: &mut S,
@@ -453,7 +451,7 @@ impl WorkerState {
     ///
     /// A plain `out.send().await` on a full events channel parks the entire
     /// worker until the consumer drains — and while parked, the worker sends no
-    /// standby status updates and services no keepalives. PostgreSQL then sees
+    /// standby status updates and services no keepalives. `PostgreSQL` then sees
     /// no feedback for `> wal_sender_timeout` and terminates the walsender
     /// (connection reset), forcing a reconnect and WAL replay. This is the
     /// coupling this method breaks.
@@ -538,7 +536,7 @@ impl WorkerState {
         }
     }
 
-    /// Handle PostgreSQL authentication exchange.
+    /// Handle `PostgreSQL` authentication exchange.
     async fn authenticate<S: AsyncRead + AsyncWrite + Unpin>(
         &mut self,
         stream: &mut S,
@@ -551,8 +549,8 @@ impl WorkerState {
                     self.handle_auth_request(stream, code, rest).await?;
                 }
                 b'E' => return Err(PgWireError::Server(parse_error_response(&msg.payload))),
-                b'S' | b'K' => {}      // ParameterStatus, BackendKeyData - ignore
                 b'Z' => return Ok(()), // ReadyForQuery - auth complete
+                // ParameterStatus / BackendKeyData / anything else - ignore
                 _ => {}
             }
         }
@@ -588,7 +586,7 @@ impl WorkerState {
                 let mut salt = [0u8; 4];
                 salt.copy_from_slice(&data[..4]);
 
-                let hash = postgres_md5(&self.cfg.password, &self.cfg.user, &salt);
+                let hash = postgres_md5(&self.cfg.password, &self.cfg.user, salt);
                 let mut payload = hash.into_bytes();
                 payload.push(0);
                 write_password_message(stream, &payload).await
@@ -628,7 +626,13 @@ impl WorkerState {
             // Send SASLInitialResponse
             let mut init = Vec::new();
             init.extend_from_slice(b"SCRAM-SHA-256\0");
-            init.extend_from_slice(&(scram.client_first.len() as i32).to_be_bytes());
+            #[expect(
+                clippy::cast_possible_truncation,
+                clippy::cast_possible_wrap,
+                reason = "SASL client-first length (nonce + username) is far below i32::MAX"
+            )]
+            let client_first_len = scram.client_first.len() as i32;
+            init.extend_from_slice(&client_first_len.to_be_bytes());
             init.extend_from_slice(scram.client_first.as_bytes());
             write_password_message(stream, &init).await?;
 
@@ -683,14 +687,16 @@ fn parse_sasl_mechanisms(data: &[u8]) -> Vec<String> {
     mechanisms
 }
 
+#[expect(
+    clippy::cast_sign_loss,
+    reason = "pgoutput LSNs, xid, and content length are unsigned values carried as \
+              signed integers on the wire; these casts are bit-preserving"
+)]
 fn parse_pgoutput_boundary(data: &Bytes) -> Result<Option<ReplicationEvent>> {
-    if data.is_empty() {
-        return Ok(None);
-    }
-
-    let tag = data[0];
-    let mut p = &data[1..];
-
+    #[expect(
+        clippy::cast_possible_wrap,
+        reason = "a pgoutput flags byte is a signed i8 on the wire"
+    )]
     fn take_i8(p: &mut &[u8]) -> Result<i8> {
         if p.is_empty() {
             return Err(PgWireError::Protocol("pgoutput: truncated i8".into()));
@@ -706,7 +712,9 @@ fn parse_pgoutput_boundary(data: &Bytes) -> Result<Option<ReplicationEvent>> {
         }
         let (head, tail) = p.split_at(4);
         *p = tail;
-        Ok(i32::from_be_bytes(head.try_into().unwrap()))
+        let mut b = [0u8; 4];
+        b.copy_from_slice(head);
+        Ok(i32::from_be_bytes(b))
     }
 
     fn take_i64(p: &mut &[u8]) -> Result<i64> {
@@ -715,8 +723,17 @@ fn parse_pgoutput_boundary(data: &Bytes) -> Result<Option<ReplicationEvent>> {
         }
         let (head, tail) = p.split_at(8);
         *p = tail;
-        Ok(i64::from_be_bytes(head.try_into().unwrap()))
+        let mut b = [0u8; 8];
+        b.copy_from_slice(head);
+        Ok(i64::from_be_bytes(b))
     }
+
+    if data.is_empty() {
+        return Ok(None);
+    }
+
+    let tag = data[0];
+    let mut p = &data[1..];
 
     match tag {
         b'B' => {
@@ -800,7 +817,11 @@ async fn read_auth_data<S: AsyncRead + AsyncWrite + Unpin>(
     }
 }
 
-/// Get current time as PostgreSQL timestamp (microseconds since 2000-01-01).
+/// Get current time as `PostgreSQL` timestamp (microseconds since 2000-01-01).
+#[expect(
+    clippy::cast_possible_wrap,
+    reason = "seconds since the UNIX epoch fit in i64 for the next ~292 billion years"
+)]
 fn current_pg_timestamp() -> i64 {
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -808,13 +829,13 @@ fn current_pg_timestamp() -> i64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default();
 
-    let unix_micros = (now.as_secs() as i64) * 1_000_000 + (now.subsec_micros() as i64);
+    let unix_micros = (now.as_secs() as i64) * 1_000_000 + i64::from(now.subsec_micros());
     unix_micros - PG_EPOCH_MICROS
 }
 
-/// Compute PostgreSQL MD5 password hash.
+/// Compute `PostgreSQL` MD5 password hash.
 #[cfg(feature = "md5")]
-fn postgres_md5(password: &str, user: &str, salt: &[u8; 4]) -> String {
+fn postgres_md5(password: &str, user: &str, salt: [u8; 4]) -> String {
     fn md5_hex(data: &[u8]) -> String {
         format!("{:x}", md5::compute(data))
     }
@@ -824,7 +845,7 @@ fn postgres_md5(password: &str, user: &str, salt: &[u8; 4]) -> String {
 
     // Second hash: md5(inner_hash + salt)
     let mut outer_input = inner.into_bytes();
-    outer_input.extend_from_slice(salt);
+    outer_input.extend_from_slice(&salt);
 
     format!("md5{}", md5_hex(&outer_input))
 }
@@ -858,7 +879,7 @@ mod tests {
     fn postgres_md5_known_value() {
         // Test vector: user="md5_user", password="md5_pass", salt=[0x01, 0x02, 0x03, 0x04]
         // Can verify with: SELECT 'md5' || md5(md5('md5_passmd5_user') || E'\\x01020304');
-        let hash = postgres_md5("md5_pass", "md5_user", &[0x01, 0x02, 0x03, 0x04]);
+        let hash = postgres_md5("md5_pass", "md5_user", [0x01, 0x02, 0x03, 0x04]);
         assert!(hash.starts_with("md5"));
         assert_eq!(hash.len(), 35); // "md5" + 32 hex chars
     }
