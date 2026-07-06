@@ -2,18 +2,17 @@ name: testoperator dispatch htap
 
 on:
   schedule:
-    # htap-sf1000-tuned-adaptive, every 3 hours (0000, 0300, …, 2100) — the two high-value SF1000
-    # configs (cdc-tuned-memory + adaptive) for frequent tuned-vs-adaptive trend data
-    # (spiceai-dev-xlarge-runners).
+    # htap-sf1000-adaptive, every 3 hours (0000, 0300, …, 2100) — the high-value SF1000 adaptive
+    # config for frequent adaptive trend data (spiceai-dev-xlarge-runners).
     - cron: '0 */3 * * *'
     # htap-sf1000 (other configs), once daily (0100) — the remaining SF1000 configs
-    # (cdc-tuned-turso, cdc-tuned-memory-ivm, adaptive-turso, duckdb baseline) on the xlarge pool.
+    # (adaptive-turso, duckdb baseline) on the xlarge pool.
     - cron: '0 1 * * *'
     # htap-sf1, twice daily (0600, 1800) — HTAP CH-benCHmark SF1 (spiceai-dev-large-runners)
     - cron: '0 6,18 * * *'
-    # htap-sf1000-cold, once daily (0800) — HTAP CH-benCHmark SF1000 cold-object-store tier
-    # (spiceai-dev-xlarge-runners). Lighter once-a-day cadence while the cold tier is new; it shares
-    # the SF1000 serialized run concurrency group, so it queues, never contends.
+    # htap-sf1000-cold, once daily (0800) — HTAP CH-benCHmark SF1000 adaptive cold-object-store tier
+    # (spiceai-dev-xlarge-runners). Lighter once-a-day cadence; it shares the SF1000 serialized run
+    # concurrency group, so it queues, never contends.
     - cron: '0 8 * * *'
 
   workflow_dispatch:
@@ -31,7 +30,7 @@ on:
           - 'sf10'
           - 'sf100'
           - 'sf1000'
-          - 'sf1000-tuned-adaptive'
+          - 'sf1000-adaptive'
           - 'sf1000-cold'
 
 jobs:
@@ -107,7 +106,7 @@ jobs:
           SF="${{ github.event.inputs.scale_factor }}"
           if [ -z "$SF" ]; then
             case "${{ github.event.schedule }}" in
-              '0 */3 * * *')                  SF=sf1000-tuned-adaptive ;;
+              '0 */3 * * *')                  SF=sf1000-adaptive ;;
               '0 1 * * *')                    SF=sf1000 ;;
               '0 6,18 * * *')                 SF=sf1 ;;
               '0 8 * * *')                    SF=sf1000-cold ;;
