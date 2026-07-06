@@ -20,7 +20,7 @@ limitations under the License.
 //! provider maintains and probes these; the per-row location is recorded as a
 //! [`RowLocation`].
 
-use arrow_row::OwnedRow;
+use crate::row_converter::OwnedRow;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
