@@ -247,12 +247,19 @@ fn encode_boolean_not_null(
     }
 }
 
-/// Splits `len` bytes from the front of `src`, advancing it.
+/// Splits `len` bytes from the front of `src`, advancing it. Errors on a truncated row rather
+/// than panicking, so decoding malformed input returns an `ArrowError`.
 #[inline]
-fn split_off<'a>(src: &mut &'a [u8], len: usize) -> &'a [u8] {
-    let v = &src[..len];
-    *src = &src[len..];
-    v
+fn take<'a>(src: &mut &'a [u8], len: usize) -> Result<&'a [u8], ArrowError> {
+    if src.len() < len {
+        return Err(ArrowError::InvalidArgumentError(format!(
+            "row_converter: truncated row, expected at least {len} bytes, got {}",
+            src.len()
+        )));
+    }
+    let (head, tail) = src.split_at(len);
+    *src = tail;
+    Ok(head)
 }
 
 /// Codec for any primitive type whose native representation implements [`FixedLengthEncoding`].
@@ -314,7 +321,7 @@ where
         let encoded_len = <T::Native as FixedLengthEncoding>::ENCODED_LEN;
         let mut builder = PrimitiveBuilder::<T>::with_capacity(rows.len());
         for row in rows.iter_mut() {
-            let encoded = split_off(row, encoded_len);
+            let encoded = take(row, encoded_len)?;
             if encoded[0] == 1 {
                 let bytes = <<T::Native as FixedLengthEncoding>::Encoded as FromSlice>::from_slice(
                     &encoded[1..],
@@ -361,7 +368,7 @@ impl ColumnCodec for BooleanCodec {
         let true_val = if self.options.descending { !1u8 } else { 1u8 };
         let mut builder = BooleanBuilder::with_capacity(rows.len());
         for row in rows.iter_mut() {
-            let encoded = split_off(row, bool::ENCODED_LEN);
+            let encoded = take(row, bool::ENCODED_LEN)?;
             if encoded[0] == 1 {
                 builder.append_value(encoded[1] == true_val);
             } else {

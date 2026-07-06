@@ -109,7 +109,7 @@ impl ColumnCodec for VariableCodec {
             VarKind::Binary => {
                 let mut builder = BinaryBuilder::new();
                 for row in rows.iter_mut() {
-                    match decode_one(row, opts) {
+                    match decode_one(row, opts)? {
                         Some(value) => builder.append_value(&value),
                         None => builder.append_null(),
                     }
@@ -119,7 +119,7 @@ impl ColumnCodec for VariableCodec {
             VarKind::LargeBinary => {
                 let mut builder = LargeBinaryBuilder::new();
                 for row in rows.iter_mut() {
-                    match decode_one(row, opts) {
+                    match decode_one(row, opts)? {
                         Some(value) => builder.append_value(&value),
                         None => builder.append_null(),
                     }
@@ -129,7 +129,7 @@ impl ColumnCodec for VariableCodec {
             VarKind::Utf8 => {
                 let mut builder = StringBuilder::new();
                 for row in rows.iter_mut() {
-                    match decode_one(row, opts) {
+                    match decode_one(row, opts)? {
                         Some(value) => builder.append_value(bytes_to_str(value)?),
                         None => builder.append_null(),
                     }
@@ -139,7 +139,7 @@ impl ColumnCodec for VariableCodec {
             VarKind::LargeUtf8 => {
                 let mut builder = LargeStringBuilder::new();
                 for row in rows.iter_mut() {
-                    match decode_one(row, opts) {
+                    match decode_one(row, opts)? {
                         Some(value) => builder.append_value(bytes_to_str(value)?),
                         None => builder.append_null(),
                     }
@@ -149,7 +149,7 @@ impl ColumnCodec for VariableCodec {
             VarKind::BinaryView => {
                 let mut builder = BinaryViewBuilder::new();
                 for row in rows.iter_mut() {
-                    match decode_one(row, opts) {
+                    match decode_one(row, opts)? {
                         Some(value) => builder.append_value(&value),
                         None => builder.append_null(),
                     }
@@ -159,7 +159,7 @@ impl ColumnCodec for VariableCodec {
             VarKind::Utf8View => {
                 let mut builder = StringViewBuilder::new();
                 for row in rows.iter_mut() {
-                    match decode_one(row, opts) {
+                    match decode_one(row, opts)? {
                         Some(value) => builder.append_value(bytes_to_str(value)?),
                         None => builder.append_null(),
                     }
@@ -355,18 +355,31 @@ fn block_length_byte(len: usize) -> u8 {
     len as u8
 }
 
+/// Error for a row that ends before a complete value could be decoded.
+fn truncated() -> ArrowError {
+    ArrowError::InvalidArgumentError("row_converter: truncated or malformed row bytes".to_string())
+}
+
 /// Decodes the blocks of a single encoded value, calling `f` with each decoded chunk. Returns
-/// the number of bytes consumed.
-fn decode_blocks(row: &[u8], options: SortOptions, mut f: impl FnMut(&[u8])) -> usize {
+/// the number of bytes consumed, or an error if the row is truncated/malformed. Every index into
+/// `row` is bounds-checked so malformed input yields an `ArrowError` rather than a panic.
+fn decode_blocks(
+    row: &[u8],
+    options: SortOptions,
+    mut f: impl FnMut(&[u8]),
+) -> Result<usize, ArrowError> {
     let (non_empty_sentinel, continuation) = if options.descending {
         (!NON_EMPTY_SENTINEL, !BLOCK_CONTINUATION)
     } else {
         (NON_EMPTY_SENTINEL, BLOCK_CONTINUATION)
     };
 
-    if row[0] != non_empty_sentinel {
+    let Some(&first) = row.first() else {
+        return Err(truncated());
+    };
+    if first != non_empty_sentinel {
         // Empty or null value
-        return 1;
+        return Ok(1);
     }
 
     let block_len = |sentinel: u8| {
@@ -379,41 +392,61 @@ fn decode_blocks(row: &[u8], options: SortOptions, mut f: impl FnMut(&[u8])) -> 
 
     let mut idx = 1;
     for _ in 0..MINI_BLOCK_COUNT {
-        let sentinel = row[idx + MINI_BLOCK_SIZE];
-        if sentinel != continuation {
-            f(&row[idx..idx + block_len(sentinel)]);
-            return idx + MINI_BLOCK_SIZE + 1;
+        let sentinel_idx = idx + MINI_BLOCK_SIZE;
+        if sentinel_idx >= row.len() {
+            return Err(truncated());
         }
-        f(&row[idx..idx + MINI_BLOCK_SIZE]);
-        idx += MINI_BLOCK_SIZE + 1;
+        let sentinel = row[sentinel_idx];
+        if sentinel != continuation {
+            let end = idx + block_len(sentinel);
+            if end > row.len() {
+                return Err(truncated());
+            }
+            f(&row[idx..end]);
+            return Ok(sentinel_idx + 1);
+        }
+        f(&row[idx..sentinel_idx]);
+        idx = sentinel_idx + 1;
     }
 
     loop {
-        let sentinel = row[idx + BLOCK_SIZE];
-        if sentinel != continuation {
-            f(&row[idx..idx + block_len(sentinel)]);
-            return idx + BLOCK_SIZE + 1;
+        let sentinel_idx = idx + BLOCK_SIZE;
+        if sentinel_idx >= row.len() {
+            return Err(truncated());
         }
-        f(&row[idx..idx + BLOCK_SIZE]);
-        idx += BLOCK_SIZE + 1;
+        let sentinel = row[sentinel_idx];
+        if sentinel != continuation {
+            let end = idx + block_len(sentinel);
+            if end > row.len() {
+                return Err(truncated());
+            }
+            f(&row[idx..end]);
+            return Ok(sentinel_idx + 1);
+        }
+        f(&row[idx..sentinel_idx]);
+        idx = sentinel_idx + 1;
     }
 }
 
-/// Decodes one value from `row`, advancing it past the bytes consumed. `None` is a null.
-fn decode_one(row: &mut &[u8], options: SortOptions) -> Option<Vec<u8>> {
+/// Decodes one value from `row`, advancing it past the bytes consumed. `Ok(None)` is a null;
+/// an error is returned for truncated/malformed input.
+fn decode_one(row: &mut &[u8], options: SortOptions) -> Result<Option<Vec<u8>>, ArrowError> {
     let slice: &[u8] = row;
-    let is_null = slice[0] == null_sentinel(options);
+    let Some(&first) = slice.first() else {
+        return Err(truncated());
+    };
+    let is_null = first == null_sentinel(options);
     let mut buf = Vec::new();
-    let consumed = decode_blocks(slice, options, |b| buf.extend_from_slice(b));
+    let consumed = decode_blocks(slice, options, |b| buf.extend_from_slice(b))?;
     *row = &slice[consumed..];
     if is_null {
-        None
+        Ok(None)
     } else {
         if options.descending {
             for b in &mut buf {
                 *b = !*b;
             }
         }
-        Some(buf)
+        Ok(Some(buf))
     }
 }

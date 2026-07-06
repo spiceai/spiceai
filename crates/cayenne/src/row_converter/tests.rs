@@ -35,7 +35,7 @@ use arrow::array::{
 use arrow::datatypes::{DataType, i256};
 use arrow_schema::SortOptions;
 
-use super::{OwnedRow, RowConverter, RowFormatVersion, SortField};
+use super::{OwnedRow, RowConverter, RowFormatVersion, Rows, SortField};
 
 /// Encode `columns` with both the vendored converter and `arrow-row` using `options` for every
 /// field, and assert the encoded bytes are identical row-for-row. Then verify round-trip decode.
@@ -371,4 +371,34 @@ fn version_identifiers_round_trip() {
 fn empty_input_is_handled() {
     let empty: ArrayRef = Arc::new(Int64Array::from(Vec::<Option<i64>>::new()));
     assert_matches_arrow_row(&[empty]);
+}
+
+#[test]
+fn decode_rejects_truncated_fixed_bytes() {
+    let converter =
+        RowConverter::new(vec![SortField::new(DataType::Int64)]).expect("build converter");
+    // A valid Int64 row is 9 bytes; provide only 3.
+    let rows = Rows {
+        buffer: vec![1u8, 0, 0],
+        offsets: vec![0, 3],
+    };
+    assert!(
+        converter.convert_rows(rows.iter()).is_err(),
+        "truncated fixed-width row must error, not panic"
+    );
+}
+
+#[test]
+fn decode_rejects_truncated_variable_bytes() {
+    let converter =
+        RowConverter::new(vec![SortField::new(DataType::Utf8)]).expect("build converter");
+    // Non-empty sentinel (2) claims a block, but no block bytes follow.
+    let rows = Rows {
+        buffer: vec![2u8],
+        offsets: vec![0, 1],
+    };
+    assert!(
+        converter.convert_rows(rows.iter()).is_err(),
+        "truncated variable-width row must error, not panic"
+    );
 }
