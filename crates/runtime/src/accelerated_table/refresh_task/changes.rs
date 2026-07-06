@@ -2387,13 +2387,11 @@ impl RefreshTask {
         )?;
 
         if let Some(combined) = combined {
-            // The CDC apply loop discards the "rows affected" count, so route
-            // Cayenne's durable delete through its count-skipping fast path
-            // instead of the scan-to-count `delete_from` (see
-            // `CayenneTableProvider::delete_from_cdc_fast`, issue #11633). Non-
-            // Cayenne accelerators — and shapes Cayenne declines (position /
-            // retention) — fall back to the generic `delete_from` below.
-            let applied_on_fast_path = {
+            // The CDC apply loop discards the "rows affected" count. Cayenne can
+            // handle key-delete CDC batches through a count-skipping path; non-
+            // Cayenne accelerators and shapes Cayenne declines fall back to the
+            // generic `delete_from` below.
+            let handled_by_cayenne_cdc_path = {
                 #[cfg(not(windows))]
                 {
                     if let Some(cayenne) = self.cayenne_accelerator() {
@@ -2413,7 +2411,7 @@ impl RefreshTask {
                 }
             };
 
-            if !applied_on_fast_path {
+            if !handled_by_cayenne_cdc_path {
                 let delete_plan = self
                     .accelerator
                     .delete_from(session_state, vec![combined])

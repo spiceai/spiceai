@@ -210,11 +210,11 @@ async fn test_int64_pk_delete_no_matches_impl(fixture: TestFixture) -> TestResul
 test_with_backends!(test_int64_pk_delete_no_matches_impl);
 
 // =============================================================================
-// Regression: user-visible `DELETE ... WHERE id IN (...)` reports the EXACT
-// number of live rows removed.
+// User-visible `DELETE ... WHERE id IN (...)` reports the exact number of live
+// rows removed.
 //
 // A single-Int64-PK `DELETE WHERE id IN (...)` is extracted straight from the
-// filter and applied via deletion vectors. The CDC fast path (#11049)
+// filter and applied via deletion vectors. The CDC count-skipping path
 // intentionally skips the scan and returns 0 for that shape; a user-visible
 // DELETE surfaces "rows affected" to the SQL client, so it must instead return
 // the verified count (the fix routes user DELETEs through the scan-based count
@@ -226,8 +226,8 @@ async fn test_int64_pk_delete_in_list_reports_exact_count_impl(
     fixture: TestFixture,
 ) -> TestResult<()> {
     let (table, ctx, schema) = setup_int64_pk_table(&fixture, "in_list_count_test").await?;
-    // File-resident seed: the count bug lived in the FILE deletion path's
-    // `pk IN (...)` fast path (an inline-resident delete is counted separately).
+    // File-resident seed: the file deletion path's `pk IN (...)` fast path is
+    // separate from the inline-resident delete count path.
     seed_int64_rows_to_files(&table, &ctx, &schema, "in_list_count_test", 10).await?;
 
     // DELETE WHERE id IN (0,1,2,3,4) — all five exist.
@@ -255,12 +255,12 @@ async fn test_int64_pk_delete_in_list_reports_exact_count_impl(
 
 test_with_backends!(test_int64_pk_delete_in_list_reports_exact_count_impl);
 
-/// Regression guard for issue #11633: the durable CDC delete path
-/// (`CayenneTableProvider::delete_from_cdc_fast`) must stay on #11049's
-/// count-skipping `pk IN (...)` fast path, NOT the scan-to-count #11514 added for
-/// user DELETEs. CDC counterpart to `test_int64_pk_delete_in_list_reports_exact_count`
-/// above (same file-resident seed): it asserts the fast-path witness (`Some(0)`,
-/// not a scanned count) and that the rows are actually removed.
+/// The durable CDC delete path (`CayenneTableProvider::delete_from_cdc_fast`)
+/// must stay on the count-skipping `pk IN (...)` fast path, not the scan-to-count
+/// path used by user-visible DELETEs. CDC counterpart to
+/// `test_int64_pk_delete_in_list_reports_exact_count` above (same file-resident
+/// seed): it asserts the fast-path witness (`Some(0)`, not a scanned count) and
+/// that the rows are actually removed.
 async fn test_int64_pk_cdc_fast_delete_keeps_fast_path_impl(
     fixture: TestFixture,
 ) -> TestResult<()> {
@@ -274,9 +274,8 @@ async fn test_int64_pk_cdc_fast_delete_keeps_fast_path_impl(
         .await?;
     // The count-skipping fast path returns the deliberate non-authoritative
     // sentinel 0 (the CDC caller discards it). `Some(3)` would mean the
-    // scan-to-count path ran instead — exactly the #11633 regression this guards
-    // against — and `None` would mean the shape was declined back to the
-    // exact-count `delete_from`.
+    // scan-to-count path ran instead, and `None` would mean the shape was
+    // declined back to the exact-count `delete_from`.
     assert_eq!(
         handled,
         Some(0),
