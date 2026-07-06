@@ -16,7 +16,7 @@ limitations under the License.
 
 use std::sync::Arc;
 
-use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
+use arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
 use async_trait::async_trait;
 use datafusion::{
     catalog::{Session, TableProvider},
@@ -40,6 +40,17 @@ fn decode(value: &[u8]) -> String {
         Ok(s) => s,
         Err(_) => charset::decode_latin1(value).to_string(),
     }
+}
+
+/// Parse an RFC822 `Date:` header into milliseconds since the Unix epoch.
+///
+/// `mailparse::dateparse` returns whole **seconds** since the epoch, but the
+/// `date` column is stored in a `Timestamp(Millisecond)` array. The value must
+/// therefore be scaled by 1000; without it every timestamp is 1000x too small
+/// and — because a mailbox's dates span only a few million seconds — the entire
+/// mailbox collapses onto a single near-epoch instant (see #11547).
+fn parse_date_millis(raw: &str) -> Result<i64, mailparse::MailParseError> {
+    dateparse(raw).map(|seconds| seconds.saturating_mul(1000))
 }
 
 macro_rules! parse_addreses_from_envelope {
@@ -75,7 +86,11 @@ macro_rules! parse_addreses_from_envelope {
 impl TableProvider for ImapTableProvider {
     fn schema(&self) -> SchemaRef {
         let mut fields = vec![
-            Field::new("date", DataType::Date64, false),
+            Field::new(
+                "date",
+                DataType::Timestamp(TimeUnit::Millisecond, None),
+                false,
+            ),
             Field::new("subject", DataType::Utf8, true),
             Field::new(
                 "from",
@@ -149,7 +164,7 @@ impl TableProvider for ImapTableProvider {
                 segment: "envelope".to_string(),
             })?;
             let subject = envelope.subject.as_ref().map(|v| decode(v));
-            let date = dateparse(&decode(envelope.date.as_ref().ok_or(
+            let date = parse_date_millis(&decode(envelope.date.as_ref().ok_or(
                 Error::EnvelopeNotFound {
                     segment: "date".to_string(),
                 },
@@ -188,5 +203,87 @@ impl TableProvider for ImapTableProvider {
         let record_batch = self.build_recordbatch(messages)?;
         let table = MemTable::try_new(self.schema(), vec![vec![record_batch]])?;
         table.scan(state, projection, filters, limit).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::imap::session::{ImapAuthMode, ImapSession};
+    use arrow::array::{Array, TimestampMillisecondArray};
+    use secrecy::SecretString;
+
+    fn test_provider(fetch_content: bool) -> ImapTableProvider {
+        let session = ImapSession::new(
+            ImapAuthMode::Plain {
+                username: SecretString::from("user"),
+                password: SecretString::from("pass"),
+            },
+            Arc::from("localhost"),
+            993,
+            Arc::from("INBOX"),
+        );
+        ImapTableProvider::new(session, fetch_content)
+    }
+
+    fn message(date: i64) -> EmailMessage {
+        EmailMessage {
+            date,
+            subject: Some("subject".to_string()),
+            from: None,
+            to: None,
+            cc: None,
+            bcc: None,
+            reply_to: None,
+            message_id: None,
+            in_reply_to: None,
+            body: None,
+        }
+    }
+
+    #[test]
+    fn parse_date_millis_scales_seconds_to_milliseconds() {
+        let raw = "Tue, 1 Jul 2003 10:52:37 +0000";
+        let seconds = dateparse(raw).expect("header parses to seconds");
+        let millis = parse_date_millis(raw).expect("header parses to millis");
+
+        // Regression for #11547: the stored value must be milliseconds — exactly
+        // 1000x the raw seconds mailparse returns — not the seconds themselves.
+        assert_eq!(millis, seconds * 1000);
+        assert_eq!(millis, 1_057_056_757_000);
+    }
+
+    #[test]
+    fn schema_date_column_is_timestamp_millis() {
+        let schema = test_provider(false).schema();
+        let date = schema.field_with_name("date").expect("date column exists");
+        assert_eq!(
+            date.data_type(),
+            &DataType::Timestamp(TimeUnit::Millisecond, None)
+        );
+    }
+
+    #[test]
+    fn build_recordbatch_preserves_distinct_send_times() {
+        // Two messages a day apart. Before #11547's fix the seconds-in-a-Date64
+        // column collapsed every message onto one near-epoch calendar day; the
+        // millisecond timestamps must now stay distinct and exact.
+        let provider = test_provider(false);
+        let day_one = 1_057_056_757_000;
+        let day_two = day_one + 86_400_000;
+        let batch = provider
+            .build_recordbatch(vec![message(day_one), message(day_two)])
+            .expect("record batch builds");
+
+        let dates = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<TimestampMillisecondArray>()
+            .expect("date column is a millisecond timestamp array");
+
+        assert_eq!(dates.len(), 2);
+        assert_eq!(dates.value(0), day_one);
+        assert_eq!(dates.value(1), day_two);
+        assert_ne!(dates.value(0), dates.value(1));
     }
 }

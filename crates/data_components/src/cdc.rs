@@ -220,17 +220,21 @@ impl CommitChange for NoOpCommitter {
     }
 }
 
-/// Build a zero-row [`ChangeBatch`] whose data struct is all-nullable so it
-/// coalesces (concats) with the truncate/snapshot/live change batches without an
-/// Arrow "arrays of different data types" error. Shared by the ready-signal and
-/// heartbeat envelope builders.
-fn empty_change_batch(schema: &SchemaRef) -> Result<ChangeBatch, ChangeBatchError> {
+/// Construct an empty [`ChangeEnvelope`] whose only job is to flip
+/// `is_dataset_ready=true`. The batch contains zero rows and uses a no-op
+/// committer.
+///
+/// Connectors should emit one of these envelopes once they consider
+/// themselves caught up to the source if no real change events are available
+/// to carry the ready signal. See the [`ChangesStream`] documentation for the
+/// readiness contract.
+pub fn build_ready_signal_envelope(schema: &SchemaRef) -> Result<ChangeEnvelope, ChangeBatchError> {
     // Normalize fields to all-nullable so this empty barrier batch's struct type
     // matches the truncate/snapshot/live change batches it coalesces with. The
     // dataset schema may declare non-null columns (e.g. a `nullable: false`
     // primary key in the spicepod), but every other change batch uses the
     // nullable schema; without this, concat fails ("arrays of different data
-    // types") when the batch is coalesced with real data.
+    // types") when the ready signal is coalesced with real data.
     let nullable_schema = Schema::new(
         schema
             .fields()
@@ -262,40 +266,12 @@ fn empty_change_batch(schema: &SchemaRef) -> Result<ChangeBatch, ChangeBatchErro
         vec![op_array, Arc::new(pk_list), Arc::new(data_struct)],
     )
     .context(ArrowSnafu)?;
-    ChangeBatch::try_new(record)
-}
+    let batch = ChangeBatch::try_new(record)?;
 
-/// Construct an empty [`ChangeEnvelope`] whose only job is to flip
-/// `is_dataset_ready=true`. The batch contains zero rows and uses a no-op
-/// committer.
-///
-/// Connectors should emit one of these envelopes once they consider themselves
-/// caught up to the source if no real change events are available to carry the
-/// ready signal. See the [`ChangesStream`] documentation for the readiness
-/// contract.
-pub fn build_ready_signal_envelope(schema: &SchemaRef) -> Result<ChangeEnvelope, ChangeBatchError> {
     Ok(ChangeEnvelope::new(
         Box::new(NoOpCommitter),
-        empty_change_batch(schema)?,
+        batch,
         true, // is_dataset_ready
-    ))
-}
-
-/// Build a zero-row "heartbeat" envelope carrying only an upstream commit
-/// timestamp (`source_commit_ts_ms`, ms since the Unix epoch). A CDC source emits
-/// it while its stream is idle (caught up to the source's change-log head) so the
-/// replication-lag gauge (`now - source_commit_ts_ms`) keeps reading ~0 when
-/// caught up instead of freezing at the last real event's age. It carries no
-/// rows, uses a [`NoOpCommitter`] (advances no source offset), and is NOT a
-/// readiness signal.
-pub fn build_heartbeat_envelope(
-    schema: &SchemaRef,
-    source_commit_ts_ms: i64,
-) -> Result<ChangeEnvelope, ChangeBatchError> {
-    Ok(ChangeEnvelope::new(
-        Box::new(NoOpCommitter),
-        empty_change_batch(schema)?.with_source_commit_ts_ms(Some(source_commit_ts_ms)),
-        false, // not a readiness signal
     ))
 }
 
@@ -408,13 +384,15 @@ impl ChangeBatch {
         self.source_commit_ts_ms
     }
 
-    /// Whether this is a zero-row heartbeat (see [`build_heartbeat_envelope`]) — it
-    /// carries only a `source_commit_ts_ms` to keep the idle lag gauge fresh, not an
-    /// actual change. Consumers that derive *received/applied progress frontiers* must
-    /// exclude heartbeats: they are stamped with the server clock on a "keepalive ⇒
-    /// caught up" premise that is FALSE mid-backlog (keepalives interleave between
-    /// transactions), so counting them advances the frontier past data not yet
-    /// received/applied and corrupts the progress-rate ladder.
+    /// Whether this is a zero-row envelope — a keepalive/heartbeat carrying only a
+    /// `source_commit_ts_ms` to keep the idle lag gauge fresh, not an actual change.
+    /// No source currently emits these (the Postgres heartbeat fan-out was reverted),
+    /// so this is a defensive guard: consumers that derive *received/applied progress
+    /// frontiers* must exclude such envelopes, because they are stamped with the server
+    /// clock on a "keepalive ⇒ caught up" premise that is FALSE mid-backlog (keepalives
+    /// interleave between transactions) — counting them advances the frontier past data
+    /// not yet received/applied and corrupts the progress-rate ladder. It also correctly
+    /// excludes empty-transaction envelopes from the data frontier.
     #[must_use]
     pub fn is_heartbeat(&self) -> bool {
         self.record.num_rows() == 0

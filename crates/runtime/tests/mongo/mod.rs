@@ -231,7 +231,7 @@ async fn mongodb_integration_test() -> Result<(), String> {
             let retry_strategy = FibonacciBackoffBuilder::new().max_retries(Some(10)).build();
             retry(retry_strategy, || async {
                 init_mongodb_db(MONGODB_PORT1).await.map_err(|e| {
-                    tracing::error!("Failed transiently  to initialize MongoDB database: {e}");
+                    tracing::error!("Failed transiently to initialize MongoDB database: {e}");
                     RetryError::transient(e)
                 })
             })
