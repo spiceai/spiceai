@@ -56,6 +56,16 @@ use crate::utils::{
 use crate::{configure_test_datafusion, init_tracing};
 
 const MYSQL_E2E_PORT: u16 = 13322;
+#[cfg(not(target_os = "windows"))]
+const MYSQL_E2E_CAYENNE_PORT: u16 = 13323;
+
+/// The accelerator engine a run of the e2e exercises.
+struct EngineConfig {
+    engine: &'static str,
+    mode: spicepod::acceleration::Mode,
+    /// Engine-specific acceleration params (e.g. cayenne data/metastore dirs).
+    accel_params: HashMap<String, String>,
+}
 
 /// How long to wait for the replication stream to apply a change before
 /// failing.
@@ -131,12 +141,19 @@ fn mysql_params(port: u16) -> HashMap<String, String> {
     ])
 }
 
-fn make_dataset(ds: &ReplicatedDataset, params: &HashMap<String, String>) -> Dataset {
+fn make_dataset(
+    ds: &ReplicatedDataset,
+    params: &HashMap<String, String>,
+    engine: &EngineConfig,
+) -> Dataset {
     let mut dataset = Dataset::new(format!("mysql:{}", ds.table), ds.dataset_name.to_string());
     dataset.params = Some(Params::from_string_map(params.clone()));
     dataset.acceleration = Some(Acceleration {
         enabled: true,
-        engine: Some("duckdb".to_string()),
+        engine: Some(engine.engine.to_string()),
+        mode: engine.mode.clone(),
+        params: (!engine.accel_params.is_empty())
+            .then(|| Params::from_string_map(engine.accel_params.clone())),
         refresh_mode: Some(RefreshMode::Changes),
         primary_key: Some(ds.primary_key.to_string()),
         on_conflict: vec![(ds.primary_key.to_string(), OnConflictBehavior::Upsert)]
@@ -192,8 +209,7 @@ async fn wait_for_scalar_i64(
     }
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn mysql_binlog_replication_end_to_end() -> Result<(), anyhow::Error> {
+async fn run_replication_e2e(port: u16, engine: EngineConfig) -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some(
         "integration=debug,runtime=debug,data_components::mysql_replication=debug,info",
     ));
@@ -201,7 +217,6 @@ async fn mysql_binlog_replication_end_to_end() -> Result<(), anyhow::Error> {
 
     test_request_context()
         .scope(async {
-            let port = MYSQL_E2E_PORT;
             let _container = common::start_mysql_docker_container(port)
                 .await
                 .map_err(|e| anyhow!("start container: {e}"))?;
@@ -221,9 +236,10 @@ async fn mysql_binlog_replication_end_to_end() -> Result<(), anyhow::Error> {
             // 2. Build a Spice app with the replicated datasets.
             // ------------------------------------------------------------
             let params = mysql_params(port);
-            let mut builder = AppBuilder::new("mysql_replication_integration");
+            let mut builder =
+                AppBuilder::new(format!("mysql_replication_integration_{}", engine.engine));
             for ds in DATASETS {
-                builder = builder.with_dataset(make_dataset(ds, &params));
+                builder = builder.with_dataset(make_dataset(ds, &params, &engine));
             }
             let app = builder.build();
 
@@ -341,4 +357,46 @@ async fn mysql_binlog_replication_end_to_end() -> Result<(), anyhow::Error> {
             Ok(())
         })
         .await
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn mysql_binlog_replication_end_to_end() -> Result<(), anyhow::Error> {
+    run_replication_e2e(
+        MYSQL_E2E_PORT,
+        EngineConfig {
+            engine: "duckdb",
+            mode: spicepod::acceleration::Mode::Memory,
+            accel_params: HashMap::new(),
+        },
+    )
+    .await
+}
+
+/// Same lifecycle against the Cayenne accelerator — the file-backed engine
+/// additionally exercises the `spice_sys_mysql_binlog` position sidecar.
+#[cfg(not(target_os = "windows"))]
+#[tokio::test(flavor = "multi_thread")]
+async fn mysql_binlog_replication_end_to_end_cayenne() -> Result<(), anyhow::Error> {
+    let temp_dir = tempfile::tempdir()?;
+    let data_dir = temp_dir.path().join("cayenne");
+    std::fs::create_dir_all(&data_dir)?;
+    let accel_params = HashMap::from([
+        (
+            "cayenne_file_path".to_string(),
+            data_dir.display().to_string(),
+        ),
+        (
+            "cayenne_metadata_dir".to_string(),
+            temp_dir.path().join("metadata.db").display().to_string(),
+        ),
+    ]);
+    run_replication_e2e(
+        MYSQL_E2E_CAYENNE_PORT,
+        EngineConfig {
+            engine: "cayenne",
+            mode: spicepod::acceleration::Mode::File,
+            accel_params,
+        },
+    )
+    .await
 }

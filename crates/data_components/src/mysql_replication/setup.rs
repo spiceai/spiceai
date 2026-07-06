@@ -154,18 +154,21 @@ pub async fn fetch_table_layout(
         .into_iter()
         .map(|row| {
             let name: String = row.get("COLUMN_NAME").unwrap_or_default();
-            let column_type: String = row
-                .get::<String, _>("COLUMN_TYPE")
-                .unwrap_or_default()
-                .to_ascii_lowercase();
+            // Only the type keyword is case-normalized for matching; the
+            // variant labels are extracted from the original string —
+            // lowercasing them would corrupt mixed-case ENUM/SET values.
+            let column_type: String = row.get("COLUMN_TYPE").unwrap_or_default();
             let column_key: String = row.get("COLUMN_KEY").unwrap_or_default();
-            let enum_variants = column_type
-                .starts_with("enum(")
+            let has_prefix = |prefix: &str| {
+                column_type
+                    .get(..prefix.len())
+                    .is_some_and(|p| p.eq_ignore_ascii_case(prefix))
+            };
+            let enum_variants = has_prefix("enum(")
                 .then(|| parse_quoted_variants(&column_type))
                 .flatten()
                 .map(Arc::from);
-            let set_variants = column_type
-                .starts_with("set(")
+            let set_variants = has_prefix("set(")
                 .then(|| parse_quoted_variants(&column_type))
                 .flatten()
                 .map(Arc::from);
@@ -299,6 +302,16 @@ mod tests {
                 "medium".to_string(),
                 "large".to_string()
             ])
+        );
+    }
+
+    #[test]
+    fn variant_labels_preserve_case() {
+        // Labels must replicate exactly as defined — lowercasing them would
+        // make CDC values disagree with federated reads of the same column.
+        assert_eq!(
+            parse_quoted_variants("enum('Small','LARGE')"),
+            Some(vec!["Small".to_string(), "LARGE".to_string()])
         );
     }
 

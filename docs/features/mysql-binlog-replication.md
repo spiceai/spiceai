@@ -44,6 +44,11 @@ append-only `arrow` engine): UPDATE events apply as upserts keyed on the
 primary key and DELETE events are routed by it. The connector fails fast at
 startup with an actionable message if either is missing.
 
+All upsert-capable accelerator engines are supported — `duckdb`, `sqlite`,
+`cayenne`, `postgres`, and `turso` — and each persists the binlog resume
+position in its `spice_sys_mysql_binlog` sidecar when file-backed. The
+`arrow` engine works append-only (UPDATEs insert new rows).
+
 ## Source prerequisites
 
 | Setting | Required value | Notes |
