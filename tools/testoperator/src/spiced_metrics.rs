@@ -38,11 +38,12 @@ pub struct MetricSample {
     pub ts_ms: i64,
 }
 
-/// Unix epoch milliseconds now (0 if the clock is before the epoch).
 fn now_unix_ms() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
+        .ok()
+        .and_then(|d| i64::try_from(d.as_millis()).ok())
+        .unwrap_or(0)
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
