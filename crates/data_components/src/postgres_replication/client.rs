@@ -134,6 +134,9 @@ pub(crate) fn build_replication_config(
         status_interval: params.status_interval,
         idle_wakeup_interval: Duration::from_secs(1),
         buffer_events: 1024,
+        // Keep the crate default (~1 GiB) so large TOAST-row changes are never
+        // rejected; the reader allocates incrementally regardless of this cap.
+        ..Default::default()
     }
 }
 

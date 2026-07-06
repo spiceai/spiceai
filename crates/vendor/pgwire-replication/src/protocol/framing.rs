@@ -1,4 +1,4 @@
-use bytes::{BufMut, Bytes, BytesMut};
+use bytes::{Buf, BufMut, Bytes, BytesMut};
 use std::io;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
@@ -165,6 +165,171 @@ impl MessageReader {
 impl Default for MessageReader {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// Incremental, cancellation-safe, zero-copy backend-message reader.
+///
+/// This is the reader used by the streaming replication loop. Unlike
+/// [`MessageReader`] — which reads each message into a freshly zero-filled
+/// buffer (`resize(len, 0)`) via per-byte-range `read` calls — `FrameReader`
+/// keeps a single growable buffer that it fills with
+/// [`read_buf`](tokio::io::AsyncReadExt::read_buf), reading directly into
+/// **uninitialized** spare capacity (no `memset`), and slices complete frames
+/// out of it with `split_to` (zero-copy: each returned payload shares the
+/// buffer's allocation via refcount). Compared with the previous
+/// `BufReader` + `MessageReader` combination this removes both the
+/// per-message zero-fill and the extra copy the intermediate `BufReader`
+/// added (bytes went kernel → `BufReader` → per-message `BytesMut`; now they
+/// go kernel → one `BytesMut`, and frames are views into it).
+///
+/// # Cancellation safety
+///
+/// [`next`](Self::next) only ever awaits a single `read_buf` call, which
+/// resolves atomically with the buffer advance — a dropped future loses no
+/// bytes. Any partially-buffered frame stays in `buf` and the next call
+/// resumes. This makes it safe to drive from `tokio::select!` /
+/// `tokio::time::timeout`.
+///
+/// # Memory safety under adversarial input
+///
+/// Buffer growth is driven by bytes **actually read**, not by the declared
+/// frame length: capacity is only grown once existing spare is exhausted, and
+/// each grow at most doubles (bounded below by [`READ_CHUNK`], above by the
+/// remaining bytes of the in-flight frame). A frame whose declared length
+/// exceeds `max_message_size` is rejected before any allocation. Together these
+/// bound the amplification of a bogus/oversized length field to ~2× the bytes
+/// the peer actually sent, instead of the eager `resize(declared_len, 0)` the
+/// old reader performed.
+pub struct FrameReader {
+    buf: BytesMut,
+    max_message_size: usize,
+}
+
+/// Minimum spare capacity ensured before each socket read, and the floor for
+/// geometric buffer growth. Larger than a typical TCP segment so many small
+/// WAL messages arrive per syscall.
+const READ_CHUNK: usize = 128 * 1024;
+
+impl FrameReader {
+    /// Create a reader that rejects frames whose payload exceeds
+    /// `max_message_size` bytes.
+    pub fn new(max_message_size: usize) -> Self {
+        Self::with_capacity(READ_CHUNK, max_message_size)
+    }
+
+    pub fn with_capacity(capacity: usize, max_message_size: usize) -> Self {
+        Self {
+            buf: BytesMut::with_capacity(capacity),
+            max_message_size,
+        }
+    }
+
+    /// Bytes currently buffered but not yet consumed.
+    #[inline]
+    pub fn buffered(&self) -> usize {
+        self.buf.len()
+    }
+
+    /// Current allocated capacity of the read buffer. Exposed for diagnostics
+    /// and to assert the anti-amplification bound in tests.
+    #[inline]
+    pub fn capacity(&self) -> usize {
+        self.buf.capacity()
+    }
+
+    /// Returns `true` if a complete frame is already buffered, so
+    /// [`next`](Self::next) will return it without awaiting a socket read.
+    /// Used by the streaming loop to drain buffered frames in a tight loop.
+    ///
+    /// Returns `false` on a header that is not yet fully buffered *or* that is
+    /// malformed — a malformed header surfaces as an error from `next`.
+    #[inline]
+    pub fn has_buffered_frame(&self) -> bool {
+        matches!(self.frame_len(), Ok(Some(frame_len)) if self.buf.len() >= frame_len)
+    }
+
+    /// Total wire length (tag + length field + payload) of the frame at the
+    /// front of the buffer, if its 5-byte header is fully buffered. `Ok(None)`
+    /// if the header is not yet complete; `Err` if the length is invalid or
+    /// exceeds `max_message_size`.
+    #[inline]
+    fn frame_len(&self) -> Result<Option<usize>> {
+        if self.buf.len() < 5 {
+            return Ok(None);
+        }
+        let len = i32::from_be_bytes([self.buf[1], self.buf[2], self.buf[3], self.buf[4]]);
+        if len < 4 {
+            return Err(PgWireError::Protocol(format!(
+                "invalid backend message length: {len}"
+            )));
+        }
+        let payload_len = (len - 4) as usize;
+        if payload_len > self.max_message_size {
+            return Err(PgWireError::Protocol(format!(
+                "backend message too large: {payload_len} bytes (max {})",
+                self.max_message_size
+            )));
+        }
+        // Wire framing: 1 tag byte + `len`, where `len` already counts the
+        // 4-byte length field plus the payload.
+        Ok(Some(1 + len as usize))
+    }
+
+    /// Slice one complete frame out of the buffer without reading, if present.
+    fn try_decode(&mut self) -> Result<Option<BackendMessage>> {
+        let Some(frame_len) = self.frame_len()? else {
+            return Ok(None);
+        };
+        if self.buf.len() < frame_len {
+            return Ok(None);
+        }
+        let mut frame = self.buf.split_to(frame_len);
+        let tag = frame[0];
+        frame.advance(5); // drop tag + 4-byte length field
+        Ok(Some(BackendMessage {
+            tag,
+            payload: frame.freeze(),
+        }))
+    }
+
+    /// Ensure there is spare capacity to read into, growing geometrically so
+    /// accumulating a large frame stays amortized O(n). Growth is driven by
+    /// actual fill (called only when spare is low), never by the declared
+    /// length, and is capped at the in-flight frame's remaining bytes so we
+    /// never over-allocate beyond the message being assembled.
+    fn ensure_read_capacity(&mut self) {
+        let spare = self.buf.capacity() - self.buf.len();
+        if spare >= READ_CHUNK {
+            return;
+        }
+        // At least READ_CHUNK, at most a doubling of current capacity.
+        let mut additional = READ_CHUNK.max(self.buf.capacity());
+        if let Ok(Some(frame_len)) = self.frame_len() {
+            let needed = frame_len.saturating_sub(self.buf.len());
+            additional = additional.min(needed.max(READ_CHUNK));
+        }
+        self.buf.reserve(additional);
+    }
+
+    /// Read the next complete backend message.
+    ///
+    /// Cancellation-safe — see the type-level docs. Returns an `UnexpectedEof`
+    /// I/O error if the peer closes the stream mid-message.
+    pub async fn next<R: AsyncRead + Unpin>(&mut self, rd: &mut R) -> Result<BackendMessage> {
+        loop {
+            if let Some(msg) = self.try_decode()? {
+                return Ok(msg);
+            }
+            self.ensure_read_capacity();
+            let n = rd.read_buf(&mut self.buf).await?;
+            if n == 0 {
+                return Err(PgWireError::Io(std::sync::Arc::new(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "EOF while reading backend message",
+                ))));
+            }
+        }
     }
 }
 
@@ -543,6 +708,157 @@ mod tests {
         assert_eq!(buf[0], b'c');
         // Length = 4 (just the length field itself, no payload)
         assert_eq!(&buf[1..5], &4i32.to_be_bytes());
+    }
+
+    // ==================== FrameReader tests ====================
+
+    const TEST_MAX: usize = 1024 * 1024 * 1024;
+
+    /// Build one wire frame: tag + i32 length (len counts itself + payload) + payload.
+    fn wire_frame(tag: u8, payload: &[u8]) -> Vec<u8> {
+        let len = (4 + payload.len()) as i32;
+        let mut v = Vec::with_capacity(5 + payload.len());
+        v.push(tag);
+        v.extend_from_slice(&len.to_be_bytes());
+        v.extend_from_slice(payload);
+        v
+    }
+
+    #[tokio::test]
+    async fn frame_reader_reads_complete_message() {
+        let data = [b'Z', 0, 0, 0, 5, b'I'];
+        let mut cursor = Cursor::new(&data[..]);
+        let mut reader = FrameReader::new(TEST_MAX);
+        let msg = reader.next(&mut cursor).await.unwrap();
+        assert_eq!(msg.tag, b'Z');
+        assert_eq!(&msg.payload[..], b"I");
+    }
+
+    #[tokio::test]
+    async fn frame_reader_reads_back_to_back_messages() {
+        let mut data = wire_frame(b'Z', b"I");
+        data.extend_from_slice(&wire_frame(b'N', b""));
+        data.extend_from_slice(&wire_frame(b'd', b"copydata"));
+        let mut cursor = Cursor::new(data.as_slice());
+        let mut reader = FrameReader::new(TEST_MAX);
+
+        let m1 = reader.next(&mut cursor).await.unwrap();
+        assert_eq!(m1.tag, b'Z');
+        assert_eq!(&m1.payload[..], b"I");
+        // With a single buffered read, the following frames must already be
+        // available without another socket read.
+        assert!(reader.has_buffered_frame());
+
+        let m2 = reader.next(&mut cursor).await.unwrap();
+        assert_eq!(m2.tag, b'N');
+        assert!(m2.payload.is_empty());
+
+        let m3 = reader.next(&mut cursor).await.unwrap();
+        assert_eq!(m3.tag, b'd');
+        assert_eq!(&m3.payload[..], b"copydata");
+    }
+
+    /// Cancellation-safety: dropping the read future mid-header must not lose
+    /// the bytes already buffered.
+    #[tokio::test]
+    async fn frame_reader_resumes_after_cancellation_mid_header() {
+        let (mut writer, mut rd) = tokio::io::duplex(64);
+        let mut reader = FrameReader::new(TEST_MAX);
+
+        let frame = wire_frame(b'd', b"abcd");
+        writer.write_all(&frame[..3]).await.unwrap();
+
+        let timed_out =
+            tokio::time::timeout(std::time::Duration::from_millis(20), reader.next(&mut rd)).await;
+        assert!(timed_out.is_err(), "must time out awaiting remaining header");
+
+        writer.write_all(&frame[3..]).await.unwrap();
+        let msg = reader.next(&mut rd).await.unwrap();
+        assert_eq!(msg.tag, b'd');
+        assert_eq!(&msg.payload[..], b"abcd");
+    }
+
+    /// Cancellation-safety: dropping the read future mid-payload must resume.
+    #[tokio::test]
+    async fn frame_reader_resumes_after_cancellation_mid_payload() {
+        let (mut writer, mut rd) = tokio::io::duplex(64);
+        let mut reader = FrameReader::new(TEST_MAX);
+
+        let payload: [u8; 16] = std::array::from_fn(|i| i as u8);
+        let frame = wire_frame(b'd', &payload);
+        writer.write_all(&frame[..9]).await.unwrap(); // header + 4 payload bytes
+
+        let timed_out =
+            tokio::time::timeout(std::time::Duration::from_millis(20), reader.next(&mut rd)).await;
+        assert!(timed_out.is_err(), "must time out awaiting remaining payload");
+
+        writer.write_all(&frame[9..]).await.unwrap();
+        let msg = reader.next(&mut rd).await.unwrap();
+        assert_eq!(msg.tag, b'd');
+        assert_eq!(&msg.payload[..], &payload[..]);
+    }
+
+    #[tokio::test]
+    async fn frame_reader_rejects_invalid_length() {
+        let data = [b'Z', 0, 0, 0, 3]; // len < 4
+        let mut cursor = Cursor::new(&data[..]);
+        let mut reader = FrameReader::new(TEST_MAX);
+        let err = reader.next(&mut cursor).await.unwrap_err();
+        assert!(err.to_string().contains("invalid backend message length"));
+    }
+
+    #[tokio::test]
+    async fn frame_reader_rejects_oversized_message() {
+        // Declared payload of 1000 bytes with a 100-byte cap.
+        let header = wire_frame(b'd', &vec![0u8; 1000]);
+        let mut cursor = Cursor::new(header.as_slice());
+        let mut reader = FrameReader::new(100);
+        let err = reader.next(&mut cursor).await.unwrap_err();
+        assert!(err.to_string().contains("too large"));
+    }
+
+    /// A large-but-valid frame must reassemble byte-for-byte across many reads.
+    #[tokio::test]
+    async fn frame_reader_assembles_large_message_incrementally() {
+        let payload: Vec<u8> = (0..(2 * 1024 * 1024)).map(|i| (i % 251) as u8).collect();
+        let frame = wire_frame(b'd', &payload);
+        // Cursor hands out at most `spare` bytes per read_buf, so this drives
+        // many reads + geometric growth for one message.
+        let mut cursor = Cursor::new(frame.as_slice());
+        let mut reader = FrameReader::new(TEST_MAX);
+        let msg = reader.next(&mut cursor).await.unwrap();
+        assert_eq!(msg.tag, b'd');
+        assert_eq!(msg.payload.len(), payload.len());
+        assert_eq!(&msg.payload[..], &payload[..]);
+    }
+
+    /// Anti-amplification: a header claiming a huge (but under-cap) payload,
+    /// followed by only a handful of bytes, must NOT pre-allocate the declared
+    /// size. Buffer growth is driven by bytes actually received.
+    #[tokio::test]
+    async fn frame_reader_bogus_length_does_not_preallocate() {
+        let (mut writer, mut rd) = tokio::io::duplex(64);
+        let mut reader = FrameReader::new(TEST_MAX);
+
+        // Claim ~900 MiB of payload but send only the header + 8 bytes.
+        let claimed = 900 * 1024 * 1024i32;
+        let len = 4 + claimed;
+        let mut header = Vec::new();
+        header.push(b'd');
+        header.extend_from_slice(&len.to_be_bytes());
+        header.extend_from_slice(&[0u8; 8]);
+        writer.write_all(&header).await.unwrap();
+
+        // The frame never completes, so `next` stays pending.
+        let timed_out =
+            tokio::time::timeout(std::time::Duration::from_millis(50), reader.next(&mut rd)).await;
+        assert!(timed_out.is_err(), "incomplete frame must not resolve");
+
+        assert!(
+            reader.capacity() < 4 * 1024 * 1024,
+            "must not pre-allocate the declared 900 MiB; capacity was {}",
+            reader.capacity()
+        );
     }
 
     #[test]

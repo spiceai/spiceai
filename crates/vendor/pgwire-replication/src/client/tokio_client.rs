@@ -262,14 +262,16 @@ async fn run_worker(worker: &mut WorkerState, cfg: &ReplicationConfig) -> Result
         }
 
         let path = cfg.unix_socket_path();
-        let mut stream = UnixStream::connect(&path).await.map_err(|e| {
+        let stream = UnixStream::connect(&path).await.map_err(|e| {
             PgWireError::Io(std::sync::Arc::new(std::io::Error::new(
                 e.kind(),
                 format!("failed to connect to Unix socket {}: {e}", path.display()),
             )))
         })?;
 
-        return worker.run_on_stream(&mut stream).await;
+        // Owned stream: `run_on_stream` splits it into read/write halves after
+        // the handshake so feedback is decoupled from the consume path.
+        return worker.run_on_stream(stream).await;
     }
 
     let tcp = TcpStream::connect((cfg.host.as_str(), cfg.port)).await?;
@@ -277,12 +279,11 @@ async fn run_worker(worker: &mut WorkerState, cfg: &ReplicationConfig) -> Result
 
     #[cfg(feature = "tls-rustls")]
     {
-        use crate::tls::rustls::{maybe_upgrade_to_tls, MaybeTlsStream};
+        use crate::tls::rustls::maybe_upgrade_to_tls;
+        // `MaybeTlsStream` is `AsyncRead + AsyncWrite`, so hand the unified
+        // stream (plain or TLS) to the worker by value and let it split.
         let upgraded = maybe_upgrade_to_tls(tcp, &cfg.tls, &cfg.host).await?;
-        match upgraded {
-            MaybeTlsStream::Plain(mut s) => worker.run_on_stream(&mut s).await,
-            MaybeTlsStream::Tls(mut s) => worker.run_on_stream(s.as_mut()).await,
-        }
+        worker.run_on_stream(upgraded).await
     }
 
     #[cfg(not(feature = "tls-rustls"))]
@@ -290,7 +291,6 @@ async fn run_worker(worker: &mut WorkerState, cfg: &ReplicationConfig) -> Result
         if !matches!(cfg.tls.mode, SslMode::Disable) {
             return Err(PgWireError::Tls("tls-rustls feature not enabled".into()));
         }
-        let mut s = tcp;
-        worker.run_on_stream(&mut s).await
+        worker.run_on_stream(tcp).await
     }
 }

@@ -42,6 +42,7 @@ async fn main() -> anyhow::Result<()> {
         status_interval: std::time::Duration::from_secs(1),
         idle_wakeup_interval: std::time::Duration::from_secs(30),
         buffer_events: 8192,
+        ..Default::default()
     };
 
     let mut repl = ReplicationClient::connect(cfg).await?;

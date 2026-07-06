@@ -313,6 +313,20 @@ pub struct ReplicationConfig {
     ///
     /// Default: 8192 events
     pub buffer_events: usize,
+
+    /// Maximum accepted size (bytes) of a single backend message payload during
+    /// streaming. A frame whose declared length exceeds this is rejected as a
+    /// protocol error before any buffer is allocated for it, bounding the memory
+    /// a malformed or malicious length field can request.
+    ///
+    /// The default is PostgreSQL's ~1 GiB field-size ceiling, so legitimate
+    /// large-row (TOAST) changes are never rejected. Lower it only if you know
+    /// the replicated relations have no large values — the reader already grows
+    /// its buffer incrementally from bytes actually received, so a high cap does
+    /// not by itself cause a large allocation.
+    ///
+    /// Default: 1 GiB
+    pub max_message_size: usize,
 }
 
 impl Default for ReplicationConfig {
@@ -331,6 +345,7 @@ impl Default for ReplicationConfig {
             status_interval: Duration::from_secs(10),
             idle_wakeup_interval: Duration::from_secs(10),
             buffer_events: 8192,
+            max_message_size: crate::protocol::framing::MAX_MESSAGE_SIZE,
         }
     }
 }
@@ -479,6 +494,14 @@ impl ReplicationConfig {
     /// Set the event buffer size.
     pub fn with_buffer_size(mut self, size: usize) -> Self {
         self.buffer_events = size;
+        self
+    }
+
+    /// Set the maximum accepted backend-message payload size (bytes).
+    ///
+    /// See [`max_message_size`](Self::max_message_size). Defaults to ~1 GiB.
+    pub fn with_max_message_size(mut self, size: usize) -> Self {
+        self.max_message_size = size;
         self
     }
 

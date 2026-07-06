@@ -37,7 +37,20 @@ md5 = ["dep:md5"]
 # dropped. `testcontainers 0.27` pins `bollard-stubs =1.52.0-rc`, which is
 # incompatible with the `=1.47.1-rc` pin from `testoperator`'s `bollard 0.18`.
 # The upstream `tests/integration_postgres.rs` (its only consumer) is likewise
-# not vendored. Library source is otherwise unmodified from crates.io 0.3.2.
+# not vendored.
+#
+# Local patches on top of crates.io 0.3.2 (candidates to upstream):
+#   * Streaming read path rewritten around an incremental, zero-copy
+#     `FrameReader` (src/protocol/framing.rs): reads straight into a single
+#     growable buffer via `read_buf` (no per-message zero-fill), slices frames
+#     with `split_to` (no intermediate `BufReader` copy), and grows capacity
+#     from bytes actually received (bounds oversized-length amplification).
+#   * The streaming loop (src/client/worker.rs) now splits the stream after the
+#     handshake and sends standby-status feedback independently of the consume
+#     path, so a slow consumer can no longer starve keepalives and trip the
+#     server's `wal_sender_timeout`.
+#   * `ReplicationConfig::max_message_size` (src/config.rs) makes the accepted
+#     backend-message size a configurable, pre-allocation-checked bound.
 
 [dependencies]
 bytes = "1"
