@@ -816,6 +816,13 @@ impl CayenneAccelerator {
             // Any value other than `false` enables view types
             config.force_view_read_schema = !v.trim().eq_ignore_ascii_case("false");
         }
+        if let Some(acceleration) = source.acceleration()
+            && let Some(v) = acceleration.params.get("cayenne_integrity_checksums")
+        {
+            // Opt in to end-to-end WAL/data-file integrity checksums. Any value
+            // other than `false` enables the feature; unset keeps it off.
+            config.integrity_checksums = !v.trim().eq_ignore_ascii_case("false");
+        }
 
         // Auto-tune the memory-/cpu-/storage-sensitive Vortex knobs from a
         // single detected host profile so they move together for the host

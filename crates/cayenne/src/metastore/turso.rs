@@ -353,6 +353,7 @@ impl TursoMetastore {
             file_size_bytes BIGINT NOT NULL DEFAULT 0,
             min_sequence BIGINT NOT NULL DEFAULT 0,
             max_sequence BIGINT NOT NULL DEFAULT 0,
+            digest TEXT,
             FOREIGN KEY (table_id) REFERENCES cayenne_table(table_id) ON DELETE CASCADE,
             PRIMARY KEY (table_id, snapshot_id, file_path)
         )
@@ -660,6 +661,17 @@ impl MetastoreBackend for TursoMetastore {
         let _ = conn
             .execute(
                 "ALTER TABLE cayenne_delete_file ADD COLUMN reinsert_sequence BIGINT",
+                (),
+            )
+            .await;
+
+        // End-to-end data-file integrity digest (opt-in
+        // `cayenne_integrity_checksums`). NULL on legacy rows / feature-off rows
+        // → verification skipped; forward- and downgrade-safe. Appended last to
+        // match the CREATE TABLE and EXPECTED_TABLES column order.
+        let _ = conn
+            .execute(
+                "ALTER TABLE cayenne_snapshot_file ADD COLUMN digest TEXT",
                 (),
             )
             .await;
