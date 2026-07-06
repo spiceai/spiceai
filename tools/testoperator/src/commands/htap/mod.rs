@@ -424,9 +424,15 @@ pub(crate) async fn run(args: &HtapArgs) -> anyhow::Result<()> {
             if report.converged_at.is_none() {
                 match crate::spiced_metrics::MetricsScraper::scrape_once().await {
                     Ok(metrics) => {
+                        // Re-sample source-side stats fresh: the background scraper
+                        // stopped under load, so its `pg_stats` are stale and would make
+                        // the authoritative slot-retained check report against load-time
+                        // WAL rather than the current (post-drain) state.
+                        let fresh_pg_stats =
+                            crate::pg_stats::PgStatsScraper::sample_once_now().await;
                         reporting::emit_replication_metrics(
                             &metrics,
-                            &pg_stats,
+                            &fresh_pg_stats,
                             "post-drain re-scrape",
                             false,
                         );

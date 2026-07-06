@@ -83,7 +83,9 @@ pub struct MetricsCollector {
     /// detaches (receiver dropped / sink died / mid-snapshot failure). A detached
     /// member pins the shared slot's WAL retention and its rate ladder is meaningless
     /// — this is a FIRST-CLASS signal the analysis checks before any classification.
-    /// Defaults to `1` (attached) so the per-dataset (non-shared) path reads live.
+    /// Initialized to `1` (attached) by `MetricsCollector::new()` — the sole
+    /// constructor — so the per-dataset (non-shared) path reads live; the derived
+    /// `Default` leaves it `0`, so always build collectors via `new()`.
     member_attached: AtomicU64,
     /// The replication slot this dataset is a member of (for shared slots, several
     /// datasets share one). Lets the analysis join the per-dataset view to the

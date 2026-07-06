@@ -260,7 +260,7 @@ jobs:
           if [ -f "${GITHUB_WORKSPACE}/htap-metrics.json" ]; then
             echo "## CDC backpressure waterfall" >> "$GITHUB_STEP_SUMMARY"
             echo '```' >> "$GITHUB_STEP_SUMMARY"
-            python3 scripts/chbench-waterfall.py --markdown "${GITHUB_WORKSPACE}/htap-metrics.json" \
+            python3 scripts/chbench-waterfall.py "${GITHUB_WORKSPACE}/htap-metrics.json" \
               >> "$GITHUB_STEP_SUMMARY" 2>&1 || echo "(waterfall analysis failed; see htap-metrics.json artifact)" >> "$GITHUB_STEP_SUMMARY"
             echo '```' >> "$GITHUB_STEP_SUMMARY"
           else

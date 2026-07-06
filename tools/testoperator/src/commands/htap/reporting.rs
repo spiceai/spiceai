@@ -222,11 +222,15 @@ pub(super) fn emit_replication_metrics(
     // AND the AUTHORITATIVE per-slot retained WAL (pg_replication_slots, source view) is
     // ~0. The inverse (client 0 but authoritative large) is the write-blocked failure
     // mode — surfaced as a WARNING, not silently called caught-up.
+    // Authoritative retained per slot at (nearest to) the scrape: take the LAST
+    // sample's value, not the window max. `pg_stats` is time-ordered, so the final
+    // sample is closest to when the spiced `/metrics` values were read; a max over
+    // the whole window would let a transient early spike falsely read as
+    // "write-blocked" / not-caught-up at a moment the slot is actually drained.
     let mut slot_retained: BTreeMap<String, i64> = BTreeMap::new();
     for s in pg_stats {
         for (slot, b) in &s.slot_retained_bytes {
-            let e = slot_retained.entry(slot.clone()).or_insert(0);
-            *e = (*e).max(*b);
+            slot_retained.insert(slot.clone(), *b);
         }
     }
     // dataset -> slot from the scraped member_attached gauge labels (shared-slot join).

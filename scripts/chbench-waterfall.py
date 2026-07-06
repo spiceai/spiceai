@@ -39,7 +39,7 @@
 # bottleneck.
 #
 # Usage:
-#   scripts/chbench-waterfall.py <metrics.json> [--markdown]
+#   scripts/chbench-waterfall.py <metrics.json>
 #
 # Only the Python standard library is used, so it runs anywhere (locally and on
 # CI runners) with no dependencies.
@@ -1058,8 +1058,6 @@ def main(argv):
     ap = argparse.ArgumentParser(description="CDC backpressure waterfall for CH-BenCHmark runs.")
     ap.add_argument("metrics_json", nargs="?",
                     help="Path to the testoperator --metrics-dump JSON file.")
-    ap.add_argument("--markdown", action="store_true",
-                    help="Emit for a Markdown code block (plain monospaced text; same content).")
     ap.add_argument("--list-metrics", action="store_true",
                     help="Print the metric series the analysis requires, then exit.")
     args = ap.parse_args(argv)

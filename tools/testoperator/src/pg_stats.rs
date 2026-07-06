@@ -32,6 +32,8 @@ use test_framework::{
     tokio_util::sync::CancellationToken,
 };
 
+use crate::spiced_metrics::now_unix_ms;
+
 const SAMPLE_INTERVAL: Duration = Duration::from_secs(2);
 
 /// One timestamped snapshot of source-side Postgres stats.
@@ -58,14 +60,6 @@ pub struct PgStatSample {
     /// source's WAL head keeps advancing. The two diverging is itself a strong
     /// "sender is blocked on us" signal; this is the truth for drain/caught-up.
     pub slot_retained_bytes: BTreeMap<String, i64>,
-}
-
-fn now_unix_ms() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .ok()
-        .and_then(|d| i64::try_from(d.as_millis()).ok())
-        .unwrap_or(0)
 }
 
 /// Background sampler of source Postgres stats. Mirrors `MetricsScraper`: spawn a
@@ -132,6 +126,31 @@ impl PgStatsScraper {
             Some(task) => task.await.unwrap_or_default(),
             None => Vec::new(),
         }
+    }
+
+    /// Take a single fresh sample now (connect, sample once, disconnect). Used by the
+    /// post-drain re-scrape, where the background scraper has already stopped and its
+    /// samples are stale — a stale authoritative slot-retained reading would emit a
+    /// bogus write-blocked/not-caught-up warning. Best-effort: returns an empty vec on
+    /// any failure, so the caller falls back to client-view-only diagnostics.
+    pub async fn sample_once_now() -> Vec<PgStatSample> {
+        let Ok((conn_str, db)) = source_conn_from_env() else {
+            return Vec::new();
+        };
+        let (client, connection) =
+            match tokio_postgres::connect(&conn_str, tokio_postgres::NoTls).await {
+                Ok(pair) => pair,
+                Err(e) => {
+                    eprintln!("pg_stats: could not connect for post-drain re-sample: {e}");
+                    return Vec::new();
+                }
+            };
+        let conn_task = tokio::spawn(async move {
+            let _ = connection.await;
+        });
+        let sample = Self::sample_once(&client, &db).await;
+        conn_task.abort();
+        sample.into_iter().collect()
     }
 
     async fn sample_once(client: &tokio_postgres::Client, db: &str) -> Option<PgStatSample> {

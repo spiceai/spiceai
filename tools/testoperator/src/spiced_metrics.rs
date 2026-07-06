@@ -38,7 +38,12 @@ pub struct MetricSample {
     pub ts_ms: i64,
 }
 
-fn now_unix_ms() -> i64 {
+/// Unix epoch milliseconds now. Canonical scrape-timestamp helper, shared by the
+/// pg_stats sampler. The `0` fallback is intentional and effectively unreachable:
+/// `duration_since(UNIX_EPOCH)` only errors if the system clock is set before 1970,
+/// which cannot happen on a benchmark runner — so threading a `Result` through every
+/// scrape-timestamp call site would be needless plumbing for a can't-happen case.
+pub(crate) fn now_unix_ms() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .ok()
