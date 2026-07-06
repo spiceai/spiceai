@@ -1066,10 +1066,10 @@ impl RefreshTask {
             if let Some(prev) = prev_recv_start {
                 metrics::CDC_APPLY_CYCLE_MS.record(elapsed_ms(prev), &recv_wait_labels);
             }
-prev_recv_start = Some(recv_start);
-let from_carried = carried_item.is_some();
-let next_item = match carried_item.take() {
-    Some(item) => Some(item),
+            prev_recv_start = Some(recv_start);
+            let from_carried = carried_item.is_some();
+            let next_item = match carried_item.take() {
+                Some(item) => Some(item),
                 // While waiting for the next source item, also drive any deferred
                 // Stage-B finalize from the previous durable burst to completion.
                 // The finalize task runs on its own, but its post-finalize side
