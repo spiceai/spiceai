@@ -51,6 +51,11 @@ use crate::postgres::common;
 const SLOT: &str = "spice_itest_shared_slot";
 const PUBLICATION: &str = "spice_itest_shared_slot_pub";
 
+// A second, *independent* slot used by `shared_and_independent_slots_coexist` to
+// run a non-shared dataset alongside the shared-slot group in one process.
+const INDEP_SLOT: &str = "spice_itest_mix_indep_slot";
+const INDEP_PUBLICATION: &str = "spice_itest_mix_indep_pub";
+
 fn dataset_schema() -> SchemaRef {
     Arc::new(Schema::new(vec![
         Field::new("id", DataType::Int32, false),
@@ -80,6 +85,24 @@ fn shared_params(port: u16) -> ReplicationParams {
 
 fn input_for(port: u16, table: &str) -> ReplicationStreamInput {
     input_with_schema(port, table, dataset_schema())
+}
+
+/// A non-shared dataset on its own slot/publication (`shared: false`), for the
+/// mixed-mode coexistence test.
+fn independent_input(port: u16, table: &str) -> ReplicationStreamInput {
+    let mut params = shared_params(port);
+    params.slot_name = INDEP_SLOT.into();
+    params.publication_name = INDEP_PUBLICATION.into();
+    params.shared = false;
+    ReplicationStreamInput {
+        dataset_name: table.to_string(),
+        params,
+        schema: dataset_schema(),
+        primary_keys: vec!["id".into()],
+        schema_name: "public".into(),
+        table_name: table.to_string(),
+        metrics: ReplicationMetricsCollector::new(),
+    }
 }
 
 fn input_with_schema(port: u16, table: &str, schema: SchemaRef) -> ReplicationStreamInput {
@@ -771,6 +794,93 @@ async fn shared_slot_partitioned_source_table_streams_changes() -> Result<(), an
     drop_replication_slot_when_inactive(&source, SLOT).await?;
     source
         .simple_query(&format!("DROP PUBLICATION IF EXISTS {PUBLICATION}"))
+        .await?;
+    Ok(())
+}
+
+/// Mixed deployment: a **shared-slot group** (two member datasets multiplexed
+/// onto one slot) and an **independent-slot dataset** (its own slot) run in the
+/// **same process against the same Postgres at the same time**. This is the gap
+/// the per-mode tests leave open — each of those provisions its own database and
+/// exercises a single mode. Here we prove the two modes coexist: distinct slots
+/// and walsenders, no publication/slot-name interference, and each per-worker
+/// `FrameReader` decoding its own stream correctly under concurrent load.
+#[tokio::test(flavor = "multi_thread")]
+async fn shared_and_independent_slots_coexist() -> Result<(), anyhow::Error> {
+    let _tracing = init_tracing(Some("data_components::postgres_replication=debug,info"));
+
+    let port = common::get_random_port()?;
+    let _container = common::start_postgres_docker_container_with_logical_wal(port).await?;
+    let port = u16::try_from(port).expect("port fits in u16");
+    let source = pg_client(port).await?;
+
+    create_table(&source, "mix_shared_a", &[(1, "a1")]).await?;
+    create_table(&source, "mix_shared_b", &[(1, "b1")]).await?;
+    create_table(&source, "mix_indep", &[(1, "i1")]).await?;
+
+    // Shared-slot group: two members on ONE slot. Independent dataset: its OWN
+    // slot — all three streaming in this one process against this one Postgres.
+    let mut shared_a = start_replication_stream(input_for(port, "mix_shared_a"));
+    let boot_a = next_envelope(&mut shared_a, "bootstrap shared_a").await?;
+    assert_eq!(boot_a.change_batch.record.num_rows(), 1);
+    boot_a.commit().await?;
+
+    let mut shared_b = start_replication_stream(input_for(port, "mix_shared_b"));
+    let boot_b = next_envelope(&mut shared_b, "bootstrap shared_b").await?;
+    assert_eq!(boot_b.change_batch.record.num_rows(), 1);
+    boot_b.commit().await?;
+
+    let mut indep = start_replication_stream(independent_input(port, "mix_indep"));
+    let boot_i = next_envelope(&mut indep, "bootstrap indep").await?;
+    assert_eq!(boot_i.change_batch.record.num_rows(), 1);
+    boot_i.commit().await?;
+
+    // Both slots exist side by side: one shared, one independent.
+    let shared_slots: i64 = source
+        .query_one(
+            "SELECT count(*) FROM pg_replication_slots WHERE slot_name = $1",
+            &[&SLOT],
+        )
+        .await?
+        .get(0);
+    let indep_slots: i64 = source
+        .query_one(
+            "SELECT count(*) FROM pg_replication_slots WHERE slot_name = $1",
+            &[&INDEP_SLOT],
+        )
+        .await?
+        .get(0);
+    assert_eq!(shared_slots, 1, "shared slot must be present");
+    assert_eq!(indep_slots, 1, "independent slot must be present");
+
+    // Concurrent live changes to all three tables must route to the right
+    // stream — the shared pump demultiplexes A vs B by relation, and the
+    // independent slot delivers only its own table.
+    source
+        .simple_query("INSERT INTO public.mix_shared_a VALUES (2, 'a2')")
+        .await?;
+    source
+        .simple_query("INSERT INTO public.mix_shared_b VALUES (2, 'b2')")
+        .await?;
+    source
+        .simple_query("INSERT INTO public.mix_indep VALUES (2, 'i2')")
+        .await?;
+
+    expect_single_change(&mut shared_a, "shared_a live insert", "c", 2).await?;
+    expect_single_change(&mut shared_b, "shared_b live insert", "c", 2).await?;
+    expect_single_change(&mut indep, "indep live insert", "c", 2).await?;
+
+    // --- Cleanup ---
+    drop(shared_a);
+    drop(shared_b);
+    drop(indep);
+    drop_replication_slot_when_inactive(&source, SLOT).await?;
+    drop_replication_slot_when_inactive(&source, INDEP_SLOT).await?;
+    source
+        .simple_query(&format!("DROP PUBLICATION IF EXISTS {PUBLICATION}"))
+        .await?;
+    source
+        .simple_query(&format!("DROP PUBLICATION IF EXISTS {INDEP_PUBLICATION}"))
         .await?;
     Ok(())
 }
