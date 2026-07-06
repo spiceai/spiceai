@@ -770,7 +770,10 @@ mod tests {
 
         let timed_out =
             tokio::time::timeout(std::time::Duration::from_millis(20), reader.next(&mut rd)).await;
-        assert!(timed_out.is_err(), "must time out awaiting remaining header");
+        assert!(
+            timed_out.is_err(),
+            "must time out awaiting remaining header"
+        );
 
         writer.write_all(&frame[3..]).await.unwrap();
         let msg = reader.next(&mut rd).await.unwrap();
@@ -790,7 +793,10 @@ mod tests {
 
         let timed_out =
             tokio::time::timeout(std::time::Duration::from_millis(20), reader.next(&mut rd)).await;
-        assert!(timed_out.is_err(), "must time out awaiting remaining payload");
+        assert!(
+            timed_out.is_err(),
+            "must time out awaiting remaining payload"
+        );
 
         writer.write_all(&frame[9..]).await.unwrap();
         let msg = reader.next(&mut rd).await.unwrap();
