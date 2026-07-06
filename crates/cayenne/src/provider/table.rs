@@ -27883,6 +27883,97 @@ mod tests {
         );
     }
 
+    /// Regression: the durable seal pipeline is read-transparent. It must not bump
+    /// any shard's content version, because the scan path keys both merge-on-read
+    /// memos by the per-shard version vector. This drives the real N>1 CDC writer,
+    /// warms both scan memos, seals via `seal_mem_tier_durable`, then verifies the
+    /// next scan reuses the exact same memo entries.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn mem_tier_seal_pipeline_preserves_scan_memos() {
+        let n = 4_usize;
+        let ctx = SessionContext::new();
+        let runtime_env = ctx.runtime_env();
+        let (provider, _catalog, _tmp) =
+            create_sharded_cdc_upsert_table("seal_memo_stable", Arc::clone(&runtime_env), n).await;
+        let schema = Arc::clone(&provider.table_metadata.schema);
+
+        let base: Vec<(i64, i64)> = (0..16).map(|k| (k, k * 10)).collect();
+        apply_upsert_burst(&ctx, &provider, Arc::clone(&schema), &base).await;
+        provider
+            .checkpoint_mem_tier()
+            .await
+            .expect("flush base to a durable file");
+
+        apply_upsert_burst(&ctx, &provider, Arc::clone(&schema), &[(3, 333)]).await;
+        let mut expected = base.clone();
+        if let Some(slot) = expected.iter_mut().find(|(id, _)| *id == 3) {
+            slot.1 = 333;
+        }
+
+        assert_eq!(
+            collect_id_value_pairs(&ctx, &provider, "seal_memo_stable").await,
+            expected,
+            "initial scan builds the correct file+RAM merge view"
+        );
+        let merged_before = provider
+            .merged_scan_deletions
+            .load_full()
+            .expect("initial scan stored the merged-deletions memo");
+        let visible_before = provider
+            .mem_tier_visible_memo
+            .load_full()
+            .expect("initial scan stored the visible-batch memo");
+        let shards_before: Vec<_> = provider
+            .mem_tier
+            .shards()
+            .iter()
+            .map(ArcSwap::load_full)
+            .collect();
+        let version_before =
+            crate::provider::mem_tier::ShardedMemTier::version_hash_of(&shards_before);
+
+        let sealed = provider
+            .seal_mem_tier_durable()
+            .await
+            .expect("durable seal");
+        assert!(sealed > 0, "the seal shadowed the active RAM delta");
+
+        let shards_after: Vec<_> = provider
+            .mem_tier
+            .shards()
+            .iter()
+            .map(ArcSwap::load_full)
+            .collect();
+        let version_after =
+            crate::provider::mem_tier::ShardedMemTier::version_hash_of(&shards_after);
+        assert_eq!(
+            version_after, version_before,
+            "the seal pipeline must not perturb the scan memo version key"
+        );
+
+        assert_eq!(
+            collect_id_value_pairs(&ctx, &provider, "seal_memo_stable").await,
+            expected,
+            "scan results stay unchanged after the seal"
+        );
+        let merged_after = provider
+            .merged_scan_deletions
+            .load_full()
+            .expect("merged-deletions memo still present");
+        let visible_after = provider
+            .mem_tier_visible_memo
+            .load_full()
+            .expect("visible-batch memo still present");
+        assert!(
+            Arc::ptr_eq(&merged_before, &merged_after),
+            "a seal must not force the merged-deletions memo to rebuild"
+        );
+        assert!(
+            Arc::ptr_eq(&visible_before, &visible_after),
+            "a seal must not force the visible-batch memo to rebuild"
+        );
+    }
+
     #[tokio::test]
     async fn test_write_shard_format_unsorted_round_robin() {
         let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
