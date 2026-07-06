@@ -261,5 +261,8 @@ pub async fn probe_clock_skew_ms() -> Option<i64> {
         }
     }
     conn_task.abort();
-    Some(best_skew)
+    // If every probe failed, `best_rtt` is still `Duration::MAX` and `best_skew` is
+    // its 0 default — report `None` (the docstring's contract) rather than a bogus
+    // 0ms skew that would silently suppress the skew caveat.
+    (best_rtt != Duration::MAX).then_some(best_skew)
 }

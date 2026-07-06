@@ -234,29 +234,57 @@ pub(super) fn emit_replication_metrics(
             }
         }
     }
-    // Authoritative retained for a dataset's slot; `None` when we can't join (older
-    // binary / non-shared) — then we can only trust the client-view (best-effort).
+    // Authoritative retained for a dataset's slot; `None` when we lack an
+    // authoritative view — either we can't join (older binary / non-shared: no
+    // slot label) OR the pg_stats scraper didn't capture that slot (unavailable /
+    // failed). We must NOT fabricate a zero here (`unwrap_or(0)`): a missing slot
+    // sample would then read as "authoritative retained ~0" and falsely confirm
+    // caught-up, when the truth is simply unknown.
     let auth_retained = |d: &str| -> Option<f64> {
         ds_slot
             .get(d)
-            .map(|slot| slot_retained.get(slot).copied().unwrap_or(0) as f64)
+            .and_then(|slot| slot_retained.get(slot).copied())
+            .map(|r| r as f64)
     };
     // Require the lag_bytes series to be PRESENT and 0 — a MISSING series (not
     // scraped/parsed for this dataset) must NOT read as caught-up via unwrap_or(0.0).
     let client_zero = |d: &str| lag_bytes.get(d).is_some_and(|v| *v == 0.0);
 
-    let caught_up: Vec<&String> = all_datasets
+    // Client-view says drained but a nonzero (idle) lag_ms stale-watermark remains.
+    let client_drained: Vec<&String> = all_datasets
         .iter()
         .copied()
         .filter(|d| client_zero(d) && lag_ms.get(*d).copied().unwrap_or(0.0) > 0.0)
-        .filter(|d| auth_retained(d).is_none_or(|r| r <= CAUGHT_UP_WAL_EPSILON))
         .collect();
-    if !caught_up.is_empty() {
-        let names: Vec<&str> = caught_up.iter().map(|s| s.as_str()).collect();
+    // Confirmed caught-up: authoritative WAL agrees the slot is drained (~0).
+    let caught_up_confirmed: Vec<&str> = client_drained
+        .iter()
+        .copied()
+        .filter(|d| auth_retained(d).is_some_and(|r| r <= CAUGHT_UP_WAL_EPSILON))
+        .map(std::string::String::as_str)
+        .collect();
+    // Client-view only: no authoritative view to confirm (older binary / non-shared
+    // slot, or pg_stats unavailable). Reported separately so it is NOT mistaken for
+    // authoritatively confirmed — a write-blocked walsender is undetectable here.
+    let caught_up_clientonly: Vec<&str> = client_drained
+        .iter()
+        .copied()
+        .filter(|d| auth_retained(d).is_none())
+        .map(std::string::String::as_str)
+        .collect();
+    if !caught_up_confirmed.is_empty() {
         println!(
             "  caught-up (client lag_bytes=0 AND authoritative slot retained ~0 ⇒ all WAL \
              consumed; the nonzero lag_ms is an idle stale-watermark, not real staleness): {}",
-            names.join(", ")
+            caught_up_confirmed.join(", ")
+        );
+    }
+    if !caught_up_clientonly.is_empty() {
+        println!(
+            "  likely caught-up, CLIENT-VIEW ONLY (client lag_bytes=0 with nonzero idle lag_ms, \
+             but no authoritative slot-retained view to confirm — a write-blocked walsender \
+             would be undetectable): {}",
+            caught_up_clientonly.join(", ")
         );
     }
     // Dangerous inverse: client-view says drained, but the source still retains WAL far
