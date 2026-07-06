@@ -97,14 +97,14 @@ ensure!(foo.is_implemented(), NotImplemented {
 ```rust
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 ...
-fn foo() -> Result<bool> { true }
+fn foo() -> Result<bool> { Ok(true) }
 ```
 
 *Bad*:
 
 ```rust
 ...
-fn foo() -> Result<bool, Error> { true }
+fn foo() -> Result<bool, Error> { Ok(true) }
 ```
 
 ### Utilize `context` to encapsulate underlying errors into module-specific errors

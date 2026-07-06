@@ -16,7 +16,6 @@ datafusion-dml = { path = "../datafusion-dml" }
 regex = "1.12.3"
 arrow-flight = { workspace = true }
 arrow-ipc = { workspace = true }
-arrow-row = { workspace = true }
 arrow-schema = { workspace = true }
 async-stream = { workspace = true }
 async-trait = { workspace = true }
@@ -103,6 +102,9 @@ duckdb-bench = ["dep:duckdb"]
 chdb-bench = ["dep:chdb-rust"]
 
 [dev-dependencies]
+# Kept only for the `row_converter` byte-identity equivalence test; Cayenne's runtime no
+# longer depends on arrow-row's (unstable) row format.
+arrow-row = { workspace = true }
 criterion = { version = "0.7", features = ["html_reports", "async_tokio"] }
 datafusion-federation.workspace = true
 datafusion-functions-aggregate = { workspace = true }
@@ -142,6 +144,10 @@ name = "mem_tier_shard_split_converter"
 [[bench]]
 harness = false
 name = "sharded_validation_inline"
+
+[[bench]]
+harness = false
+name = "maintained_minmax_anchor"
 
 [[bench]]
 harness = false
