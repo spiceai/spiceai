@@ -32,8 +32,9 @@ limitations under the License.
 //!
 
 use arrow::array::ArrayRef;
-use arrow_row::RowConverter;
 use arrow_schema::DataType;
+
+use crate::row_converter::RowConverter;
 use datafusion_common::ScalarValue;
 use datafusion_expr::Expr;
 use datafusion_expr::Operator;
@@ -376,9 +377,9 @@ fn find_scalar_for_column<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::row_converter::SortField;
     use arrow::array::{Int64Array, RecordBatch, StringArray};
     use arrow::datatypes::{Field, Schema};
-    use arrow_row::SortField;
     use data_components::pk_filter_expr::{
         balanced_binary, build_pk_in_list_from_batch, get_delete_where_expr_from_batch,
     };
