@@ -69,8 +69,9 @@ limitations under the License.
 use crate::provider::deletion_index::{DeletionIndex, KeyDeletionIndex, Tombstone};
 use arrow::array::{ArrayRef, BooleanArray, BooleanBufferBuilder};
 use arrow::compute::{max as arrow_col_max, min as arrow_col_min};
-use arrow_row::RowConverter;
 use datafusion::config::ConfigOptions;
+
+use crate::row_converter::RowConverter;
 use datafusion_execution::SendableRecordBatchStream;
 use datafusion_physical_expr::PhysicalExpr;
 use datafusion_physical_plan::DisplayAs;
@@ -1101,8 +1102,8 @@ impl datafusion_execution::RecordBatchStream for Int64PkDeletionFilterStream {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::row_converter::SortField;
     use arrow::{array::RecordBatch, datatypes::DataType};
-    use arrow_row::SortField;
     use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
     use futures::StreamExt;
     use std::collections::HashMap;
@@ -1360,7 +1361,7 @@ mod tests {
             InsertRecordHandling::Apply,
             vec![0],
             Arc::new(
-                RowConverter::new(vec![arrow_row::SortField::new(DataType::Int64)])
+                RowConverter::new(vec![crate::row_converter::SortField::new(DataType::Int64)])
                     .expect("Int64 row converter"),
             ),
             None,

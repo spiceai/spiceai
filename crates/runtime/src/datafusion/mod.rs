@@ -733,6 +733,11 @@ pub struct DataFusion {
     pending_initializations_count: std::sync::atomic::AtomicUsize,
     query_cancel_registry: Arc<QueryCancelRegistry>,
 
+    /// Signalled after each completed streaming write; the cluster executor
+    /// statistics reporter listens so scheduler-side stats (and the COUNT(*)
+    /// folds derived from them) track publishes instead of a fixed interval.
+    write_stats_notify: tokio::sync::Notify,
+
     pub(crate) accelerator_engine_registry: Arc<AcceleratorEngineRegistry>,
     // Controls the parallelism of accelerated table refreshes
     acceleration_refresh_semaphore: Option<Arc<Semaphore>>,
@@ -2110,6 +2115,11 @@ impl DataFusion {
         Ok(())
     }
 
+    /// Resolves when a streaming write has completed since the previous call.
+    pub async fn write_completed_notified(&self) {
+        self.write_stats_notify.notified().await;
+    }
+
     pub async fn write_streaming_data(
         &self,
         table_reference: &TableReference,
@@ -2201,6 +2211,8 @@ impl DataFusion {
 
         self.runtime_status
             .update_dataset(table_reference, status::ComponentStatus::Ready);
+
+        self.write_stats_notify.notify_one();
 
         if let Some(broadcast_batches) = broadcast_batches
             && self
