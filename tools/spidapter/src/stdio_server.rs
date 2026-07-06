@@ -323,8 +323,9 @@ impl Drop for MongoDbGuard {
         // exit — must leave the database intact so a caller who asked to keep it
         // (or a crashed run) never loses data they may want to inspect.
         //
-        // The cost is that an abnormal exit leaks a throwaway `spidapter_<id>`
-        // database on the shared instance; those are safe to GC by name later.
+        // The cost is that an abnormal exit leaks a throwaway
+        // `spidapter_<YYYY_MM_DD>_<id>` database on the shared instance; those are
+        // safe to GC by name later (the date prefix makes stale ones identifiable).
         if let Some((_, database)) = self.target.take() {
             eprintln!(
                 "[stdio] MongoDbGuard: dropped without explicit teardown; \
@@ -1024,7 +1025,13 @@ impl Handler for SpidapterHandler {
                 // isolated and cleanup is a single drop. The database is created
                 // lazily on first write (by the spicebench sink) and dropped at
                 // teardown via the MongoDbGuard below.
-                let database = format!("spidapter_{short_id}");
+                //
+                // The `YYYY_MM_DD` prefix embeds the creation date in the name so
+                // leaked databases (abnormal exit — see MongoDbGuard) are visible at a
+                // glance and can be aged out by name without a per-database creation
+                // timestamp (MongoDB does not expose one).
+                let date = chrono::Utc::now().format("%Y_%m_%d");
+                let database = format!("spidapter_{date}_{short_id}");
                 let uri = with_mongodb_database(&mongo_conf.uri, &database);
                 eprintln!(
                     "[stdio] MongoDB connect: using per-run database '{database}' \
