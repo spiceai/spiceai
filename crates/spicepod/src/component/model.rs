@@ -211,22 +211,6 @@ impl ModelSource {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[cfg_attr(feature = "schemars", derive(JsonSchema))]
-pub enum ModelType {
-    Llm,
-    Ml,
-}
-
-impl Display for ModelType {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            ModelType::Llm => write!(f, "Llm"),
-            ModelType::Ml => write!(f, "Ml"),
-        }
-    }
-}
-
 impl Model {
     #[must_use]
     pub fn new(from: impl Into<String>, name: impl Into<String>) -> Self {
@@ -333,9 +317,9 @@ impl Model {
     /// - `huggingface:huggingface.co/transformers/gpt-2:latest`
     ///    - Prefix: `huggingface:huggingface.co`
     ///    - Source: `transformers/gpt-2:latest`
-    /// - `file://absolute/path/to/my/model.onnx`
+    /// - `file://absolute/path/to/my/model.gguf`
     ///     - Prefix: `file:`
-    ///     - Source: `/absolute/path/to/my/model.onnx`
+    ///     - Source: `/absolute/path/to/my/model.gguf`
     /// - `openai`
     ///    - Prefix: `openai`
     ///    - Source: None
@@ -347,68 +331,6 @@ impl Model {
         self.get_source()?.parse_from(self.from.as_str())
     }
 
-    /// Attempts to determine the model's type based on its `from` field and, `files` and `params`.
-    ///
-    /// ### Current support/checks
-    ///
-    /// | ModelType | OpenAI  |      Hugging Face       | Spice   | Local          |
-    /// | --------- | ------- | ----------------------- | ------- | -------------- |
-    /// | Llm       | Default | `params.model_type` set | N/A     | File Specified |
-    /// | Ml        |  N/A    | ONNX file specified     | Default | File specified |
-    pub fn model_type(&self) -> Option<ModelType> {
-        let Ok(source) = ModelSource::try_from(self.from.as_str()) else {
-            tracing::error!("Unknown model source from model: {}", self.from);
-            return None;
-        };
-
-        // Some providers only support either ML or LLMs.
-        if matches!(
-            source,
-            ModelSource::Azure
-                | ModelSource::OpenAi
-                | ModelSource::Anthropic
-                | ModelSource::Xai
-                | ModelSource::Databricks
-                | ModelSource::Bedrock
-                | ModelSource::Google
-        ) {
-            return Some(ModelType::Llm);
-        }
-
-        if source == ModelSource::SpiceAI {
-            return Some(ModelType::Ml);
-        }
-
-        let files = self.get_all_files();
-
-        // TODO: Need to scan filenames from HF for [`ModelSource::HuggingFace`]. Below is a hack
-        // to determine if it's an LLM from HF by check if an ML files are set manually.
-        let no_ml_files = files.iter().all(|f| !is_ml_file(Path::new(&f.path)));
-        if source == ModelSource::HuggingFace && no_ml_files {
-            return Some(ModelType::Llm);
-        }
-
-        let is_llm = files.iter().any(|f| {
-            match f.file_type() {
-                // Only true since embeddings aren't [`Model`]s.
-                Some(
-                    ModelFileType::Tokenizer
-                    | ModelFileType::Config
-                    | ModelFileType::TokenizerConfig,
-                ) => true,
-                _ => is_llm_file(Path::new(&f.path)),
-            }
-        });
-        if is_llm {
-            return Some(ModelType::Llm);
-        }
-
-        if files.iter().any(|f| is_ml_file(Path::new(&f.path))) {
-            return Some(ModelType::Ml);
-        }
-
-        None
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -470,7 +392,7 @@ pub enum ModelFileType {
 pub(crate) fn determine_type_from_path(p: &str) -> Option<ModelFileType> {
     let path = Path::new(p);
 
-    if is_ml_file(path) || is_llm_file(path) {
+    if is_llm_file(path) {
         return Some(ModelFileType::Weights);
     }
 
@@ -493,16 +415,6 @@ pub(crate) fn determine_type_from_path(p: &str) -> Option<ModelFileType> {
     }
 
     None
-}
-
-/// Returns true if the file is an ML model file. Possible false negatives, but attempts to be positively certain (i.e. avoid false positives).
-pub(crate) fn is_ml_file(p: &Path) -> bool {
-    let extension = p
-        .extension()
-        .map(|e| e.to_string_lossy().to_string())
-        .unwrap_or_default();
-
-    extension == "onnx"
 }
 
 /// Returns true if the file is an LLM model file. Possible false negatives, but attempts to be positively certain (i.e. avoid false positives).

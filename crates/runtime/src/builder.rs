@@ -747,7 +747,6 @@ impl RuntimeBuilder {
         let mut rt = Runtime {
             app: shared_app,
             df,
-            models: Arc::new(RwLock::new(HashMap::new())),
             llm_runtime_stores: Arc::new(crate::model::LlmRuntimeStores::default()),
             http_rate_control_registry,
             workers: Arc::new(RwLock::new(HashMap::new())),

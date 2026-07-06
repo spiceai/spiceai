@@ -43,7 +43,6 @@ use runtime_request_context::{AsyncMarker, RequestContext};
 use arrow::array::RecordBatch;
 use llms::chat::nsql::{FailedAttempt, QueryGenerationContext, default::DefaultSqlGeneration};
 use serde::{Deserialize, Serialize};
-use spicepod::component::model::ModelType;
 use std::{sync::Arc, time::Duration};
 use tokio::sync::RwLock;
 use tracing_futures::Instrument;
@@ -772,7 +771,7 @@ async fn resolve_nsql_model_name(
 }
 
 fn resolve_nsql_model_name_from_app(app: &app::App) -> Result<String, String> {
-    let compatible_models = compatible_nsql_model_names(app);
+    let compatible_models: Vec<String> = app.models.iter().map(|m| m.name.clone()).collect();
 
     match compatible_models.as_slice() {
         [] => Err(
@@ -787,13 +786,6 @@ fn resolve_nsql_model_name_from_app(app: &app::App) -> Result<String, String> {
     }
 }
 
-fn compatible_nsql_model_names(app: &app::App) -> Vec<String> {
-    app.models
-        .iter()
-        .filter(|model| model.model_type() == Some(ModelType::Llm))
-        .map(|model| model.name.clone())
-        .collect()
-}
 
 #[cfg(test)]
 mod tests {
