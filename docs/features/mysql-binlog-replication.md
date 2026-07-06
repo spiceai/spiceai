@@ -27,7 +27,7 @@ datasets:
       mysql_host: db.internal
       mysql_tcp_port: "3306"
       mysql_user: replicator
-      mysql_pass: ${ secrets:mysql_pass }
+      mysql_pass: ${secrets:mysql_pass}
       mysql_db: mydb
     acceleration:
       enabled: true
