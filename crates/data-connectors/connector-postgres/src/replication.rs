@@ -49,6 +49,10 @@ use secrecy::SecretString;
 const DEFAULT_STATUS_INTERVAL: Duration = Duration::from_secs(5);
 const DEFAULT_BOOTSTRAP_BATCH_SIZE: usize = 8192;
 const MAX_BOOTSTRAP_BATCH_SIZE: usize = 1_048_576;
+// Upper bound on the configurable shared-slot member channel capacity. Matches
+// the bootstrap-batch ceiling — a bounded, backpressure-preserving queue in
+// front of the accelerator prefetch, not an unbounded buffer.
+const MAX_MEMBER_CHANNEL_CAPACITY: usize = 1_048_576;
 
 pub fn build_changes_stream(
     params: &Parameters,
@@ -420,6 +424,20 @@ const METRICS: &[MetricSpec] = &[
          Carries a `slot` label for shared-slot grouping.",
     )
     .auto_register(),
+    MetricSpec::new(
+        "replication_member_send_wait_micros_total",
+        MetricType::ObservableCounterU64,
+    )
+    .description(
+        "Cumulative microseconds the shared-slot pump spent awaiting this dataset's \
+         delivery channel while applying committed changes. Unlike \
+         member_send_stalled_seconds_total, this accrues the full per-commit wait \
+         (including sub-second waits), so it is subtracted from \
+         reader_processing_micros_total to keep downstream back-pressure from being \
+         misattributed to decode cost. Only reported for datasets on a shared slot.",
+    )
+    .unit("us")
+    .auto_register(),
 ];
 
 #[derive(Debug, Clone)]
@@ -573,6 +591,11 @@ impl MetricsProvider for PostgresMetricsProvider {
                     instrument.observe(m.member_send_stalled_seconds_total(), &attributes);
                 })))
             }
+            "replication_member_send_wait_micros_total" => {
+                Some(ObserveMetricCallback::U64(Box::new(move |instrument| {
+                    instrument.observe(m.member_send_wait_micros_total(), &attributes);
+                })))
+            }
             _ => None,
         }
     }
@@ -646,6 +669,14 @@ fn replication_params_from_connector_params(
         DEFAULT_BOOTSTRAP_BATCH_SIZE,
         MAX_BOOTSTRAP_BATCH_SIZE,
     )?;
+    // Only meaningful on the shared path, but parsed unconditionally so a
+    // misconfigured value is rejected up front regardless of slot mode.
+    let member_channel_capacity = optional_usize_in_range(
+        params,
+        "replication_member_channel_capacity",
+        data_components::postgres_replication::shared::DEFAULT_MEMBER_CHANNEL_CAPACITY,
+        MAX_MEMBER_CHANNEL_CAPACITY,
+    )?;
 
     Ok(ReplicationParams {
         host,
@@ -664,6 +695,7 @@ fn replication_params_from_connector_params(
         status_interval,
         bootstrap_batch_size,
         shared,
+        member_channel_capacity,
     })
 }
 
