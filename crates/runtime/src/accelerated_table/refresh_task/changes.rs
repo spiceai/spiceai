@@ -1066,9 +1066,10 @@ impl RefreshTask {
             if let Some(prev) = prev_recv_start {
                 metrics::CDC_APPLY_CYCLE_MS.record(elapsed_ms(prev), &recv_wait_labels);
             }
-            prev_recv_start = Some(recv_start);
-            let next_item = match carried_item.take() {
-                Some(item) => Some(item),
+prev_recv_start = Some(recv_start);
+let from_carried = carried_item.is_some();
+let next_item = match carried_item.take() {
+    Some(item) => Some(item),
                 // While waiting for the next source item, also drive any deferred
                 // Stage-B finalize from the previous durable burst to completion.
                 // The finalize task runs on its own, but its post-finalize side
@@ -1158,13 +1159,14 @@ impl RefreshTask {
             // Staleness of this envelope AT ARRIVAL (now − its source commit ts):
             // lag already present before the accelerator acts, separating source-side
             // lag from lag the apply path adds (`cdc_source_arrival_lag_ms`).
-            if let Ok(env) = &first
-                // Exclude heartbeats: their server-clock timestamp would advance the
-                // received frontier past data not actually received mid-backlog,
-                // corrupting the rate ladder (see ChangeBatch::is_heartbeat).
-                && !env.change_batch.is_heartbeat()
-                && let Some(commit_ts_ms) = env.change_batch.source_commit_ts_ms()
-            {
+if !from_carried
+    && let Ok(env) = &first
+    // Exclude heartbeats: their server-clock timestamp would advance the
+    // received frontier past data not actually received mid-backlog,
+    // corrupting the rate ladder (see ChangeBatch::is_heartbeat).
+    && !env.change_batch.is_heartbeat()
+    && let Some(commit_ts_ms) = env.change_batch.source_commit_ts_ms()
+{
                 // Ingress frontier: how far the source-time we've RECEIVED has
                 // advanced (rate vs wall = received ×realtime). Compare to the
                 // applied frontier (egress) to split delivery vs apply slowdown.
