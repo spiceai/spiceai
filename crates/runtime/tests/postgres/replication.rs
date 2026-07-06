@@ -275,6 +275,12 @@ async fn bootstrap_then_stream_changes() -> Result<(), anyhow::Error> {
 ///    once.
 #[tokio::test(flavor = "multi_thread")]
 async fn large_value_and_burst_replicate_intact() -> Result<(), anyhow::Error> {
+    // Declared before any statements to satisfy clippy::items_after_statements.
+    const BIG_LEN: usize = 4 * 1024 * 1024;
+    const FIRST_ID: i32 = 1000;
+    const LAST_ID: i32 = 1999;
+    const BURST_ROWS: usize = 1000; // LAST_ID - FIRST_ID + 1
+
     let _tracing = init_tracing(Some("data_components::postgres_replication=debug,info"));
 
     let port = common::get_random_port()?;
@@ -305,7 +311,6 @@ async fn large_value_and_burst_replicate_intact() -> Result<(), anyhow::Error> {
 
     // --- 1. Large value (~4 MiB): spans many socket reads, so the FrameReader
     // assembles one frame incrementally instead of in a single read. ---
-    const BIG_LEN: usize = 4 * 1024 * 1024;
     source
         .simple_query(&format!(
             "INSERT INTO public.repl_big VALUES (1, repeat('A', {BIG_LEN}))"
@@ -340,27 +345,30 @@ async fn large_value_and_burst_replicate_intact() -> Result<(), anyhow::Error> {
 
     // --- 2. Burst: 1000 rows in one transaction => many frames buffered
     // together, exercising the tight drain loop. ---
-    const BURST: i32 = 1000;
-    const BURST_START: i32 = 1000;
     source
         .simple_query(&format!(
-            "INSERT INTO public.repl_big SELECT g, 'x' FROM generate_series({BURST_START}, {}) g",
-            BURST_START + BURST - 1
+            "INSERT INTO public.repl_big SELECT g, 'x' FROM generate_series({FIRST_ID}, {LAST_ID}) g"
         ))
         .await?;
 
     let mut seen = std::collections::BTreeSet::new();
     let deadline = std::time::Instant::now() + Duration::from_secs(30);
-    while (seen.len() as i32) < BURST {
+    while seen.len() < BURST_ROWS {
         let remaining = deadline
             .checked_duration_since(std::time::Instant::now())
             .ok_or_else(|| {
-                anyhow::anyhow!("timed out collecting burst; got {} of {BURST}", seen.len())
+                anyhow::anyhow!(
+                    "timed out collecting burst; got {} of {BURST_ROWS}",
+                    seen.len()
+                )
             })?;
         let envelope = tokio::time::timeout(remaining, stream.next())
             .await?
             .ok_or_else(|| {
-                anyhow::anyhow!("burst stream ended early; got {} of {BURST}", seen.len())
+                anyhow::anyhow!(
+                    "burst stream ended early; got {} of {BURST_ROWS}",
+                    seen.len()
+                )
             })??;
         let (committer, change_batch, _) = envelope.into_parts();
         let data_struct = change_batch
@@ -377,12 +385,9 @@ async fn large_value_and_burst_replicate_intact() -> Result<(), anyhow::Error> {
         }
         committer.commit().await?;
     }
-    assert_eq!(seen.len() as i32, BURST, "all burst rows must arrive");
-    assert_eq!(*seen.iter().next().expect("min id"), BURST_START);
-    assert_eq!(
-        *seen.iter().next_back().expect("max id"),
-        BURST_START + BURST - 1
-    );
+    assert_eq!(seen.len(), BURST_ROWS, "all burst rows must arrive");
+    assert_eq!(*seen.iter().next().expect("min id"), FIRST_ID);
+    assert_eq!(*seen.iter().next_back().expect("max id"), LAST_ID);
 
     Ok(())
 }
