@@ -2406,11 +2406,19 @@ impl RefreshTask {
             return Ok(None);
         }
 
-        // Distribution of delete-burst sizes, recorded once per sub-batch on
-        // both the absorb and durable paths so the fleet can see how large
-        // delete bursts get — i.e. whether `cdc_delete_subbatch_max` ever binds.
+        // Distribution of delete-burst sizes — the count of primary-keyed rows,
+        // i.e. the keys that feed the chunked durable `delete_from`. Recorded
+        // once per sub-batch on both the absorb and durable paths so the fleet
+        // can see how large delete bursts get — i.e. whether
+        // `cdc_delete_subbatch_max` ever binds. Keyless delete rows carry no key
+        // (they take the row-match path, not `delete_from`) and are excluded, so
+        // a mixed keyed+keyless burst is not over-counted as keys.
+        let keyed_count = row_indices
+            .iter()
+            .filter(|&&row| !change_batch.primary_keys(row).is_empty())
+            .count();
         metrics::CDC_KEYS_PER_DELETE_BURST.record(
-            u64::try_from(row_indices.len()).unwrap_or(u64::MAX),
+            u64::try_from(keyed_count).unwrap_or(u64::MAX),
             &[KeyValue::new("dataset", dataset_name.to_string())],
         );
 
@@ -2506,11 +2514,12 @@ impl RefreshTask {
         // cross-chunk ordering is not load-bearing; all chunks run under the
         // single `_lock_guard` held for this call, so the burst stays isolated.
         let cap = self.cdc_delete_subbatch_max();
+        let dataset_name_str = dataset_name.to_string();
         for chunk in keyed_rows.chunks(cap) {
             let combined = build_batch_delete_expr_from_change_batch(
                 change_batch,
                 chunk,
-                dataset_name.to_string().as_str(),
+                dataset_name_str.as_str(),
             )?;
 
             if let Some(combined) = combined {

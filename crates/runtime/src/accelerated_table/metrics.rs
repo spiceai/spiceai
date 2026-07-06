@@ -213,8 +213,9 @@ pub(crate) static CDC_KEYS_PER_DELETE_BURST: LazyLock<Histogram<u64>> = LazyLock
 });
 
 /// Count of CDC Delete sub-batches that could NOT be absorbed as in-memory
-/// tombstones (`cdc_durability: memory`, key-mode Cayenne) and fell through to a
-/// durable `delete_from`, broken down by the `reason` attribute:
+/// tombstones (`cdc_durability: memory`, key-mode Cayenne) and fell through to
+/// the durable delete path (keyed rows via `delete_from`, keyless rows via
+/// row-matching), broken down by the `reason` attribute:
 /// `no_capability` (no Cayenne mem-tier delete support — the common non-Cayenne
 /// / non-key-mode case), `no_advancer` (capable but the slot advancer is not
 /// armed), `inextractable_keys` (a delete row carried no primary key), or
