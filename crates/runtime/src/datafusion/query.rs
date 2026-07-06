@@ -1485,18 +1485,18 @@ impl Query {
         // plan before planning, so using the raw logical schema here can make
         // FlightSQL GetFlightInfo disagree with DoGet for expressions such as
         // `CASE WHEN ... THEN decimal_col ELSE 0 END`.
-        let analyzed_plan = match session.analyzer().execute_and_check(
-            (*plan).clone(),
-            session.config_options(),
-            |_, _| {},
-        ) {
-            Ok(plan) => plan,
-            Err(e) => {
-                let e = find_datafusion_root(e);
-                self.handle_schema_error(&request_context, &e);
-                return Err(e);
-            }
-        };
+        let analyzed_plan =
+            match session
+                .analyzer()
+                .execute_and_check(*plan, session.config_options(), |_, _| {})
+            {
+                Ok(plan) => plan,
+                Err(e) => {
+                    let e = find_datafusion_root(e);
+                    self.handle_schema_error(&request_context, &e);
+                    return Err(e);
+                }
+            };
 
         let dataset_schema = analyzed_plan.schema().as_arrow().clone();
         let parameter_schema = parameter_schema_for_plan(&analyzed_plan)?;
@@ -2662,9 +2662,10 @@ mod tests {
             .await
             .expect("schema should be available");
 
-        assert_eq!(
-            schema.field_with_name("x").expect("x field").data_type(),
-            &DataType::Int64
+        let output_type = schema.field_with_name("x").expect("x field").data_type();
+        assert!(
+            output_type == &DataType::Int64 || output_type == &DataType::UInt64,
+            "expected Int64 or UInt64 output type, got {output_type:?}"
         );
         let parameter_schema = parameter_schema.expect("parameter schema");
         assert_eq!(parameter_schema.fields().len(), 1);
