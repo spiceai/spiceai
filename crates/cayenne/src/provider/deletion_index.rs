@@ -1214,7 +1214,7 @@ fn bloom_half(hash: u128) -> u64 {
 }
 
 /// Frozen deletion index for tables with a composite or non-integer primary key.
-/// Probe keys are the byte-encoded form produced by `arrow_row::RowConverter`.
+/// Probe keys are the byte-encoded form produced by `crate::row_converter::RowConverter`.
 ///
 /// Entries are keyed by the **seeded XXH3-128 hash of the key bytes**
 /// ([`hash_key_128`]) rather than the bytes themselves: the hash is the key's
