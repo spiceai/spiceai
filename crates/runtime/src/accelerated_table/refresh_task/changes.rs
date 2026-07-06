@@ -1159,14 +1159,14 @@ impl RefreshTask {
             // Staleness of this envelope AT ARRIVAL (now − its source commit ts):
             // lag already present before the accelerator acts, separating source-side
             // lag from lag the apply path adds (`cdc_source_arrival_lag_ms`).
-if !from_carried
-    && let Ok(env) = &first
-    // Exclude heartbeats: their server-clock timestamp would advance the
-    // received frontier past data not actually received mid-backlog,
-    // corrupting the rate ladder (see ChangeBatch::is_heartbeat).
-    && !env.change_batch.is_heartbeat()
-    && let Some(commit_ts_ms) = env.change_batch.source_commit_ts_ms()
-{
+            if !from_carried
+                && let Ok(env) = &first
+                // Exclude heartbeats: their server-clock timestamp would advance the
+                // received frontier past data not actually received mid-backlog,
+                // corrupting the rate ladder (see ChangeBatch::is_heartbeat).
+                && !env.change_batch.is_heartbeat()
+                && let Some(commit_ts_ms) = env.change_batch.source_commit_ts_ms()
+            {
                 // Ingress frontier: how far the source-time we've RECEIVED has
                 // advanced (rate vs wall = received ×realtime). Compare to the
                 // applied frontier (egress) to split delivery vs apply slowdown.
