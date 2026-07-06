@@ -104,7 +104,14 @@ impl PgStatsScraper {
                 tokio::select! {
                     () = task_token.cancelled() => return samples,
                     () = tokio::time::sleep(SAMPLE_INTERVAL) => {
-                        if let Some(s) = Self::sample_once(&client, &db).await {
+                        let sample = tokio::select! {
+                            () = task_token.cancelled() => return samples,
+                            res = tokio::time::timeout(
+                                Duration::from_secs(5),
+                                Self::sample_once(&client, &db),
+                            ) => res.ok().flatten(),
+                        };
+                        if let Some(s) = sample {
                             samples.push(s);
                         }
                     }
