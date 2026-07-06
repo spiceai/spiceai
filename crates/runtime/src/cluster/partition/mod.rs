@@ -121,6 +121,26 @@ pub fn get_partition_filter_exprs(
     vec![combined]
 }
 
+/// Fair-share cap for a single table's *initial* allocation to one executor.
+///
+/// Returns at most `ceil(table_partition_count / connected_executors)`, floored to
+/// `remaining_budget` (the executor's remaining per-executor soft cap). This spreads a
+/// table's partitions across all currently-connected executors instead of letting the
+/// first caller greedily claim up to the full soft cap. `connected_executors` is clamped
+/// to at least `1` (the calling executor is always connected). An empty table yields `0`
+/// and is skipped by the caller; a non-empty table always yields at least `1`.
+#[must_use]
+pub(crate) fn fair_share_limit(
+    table_partition_count: usize,
+    connected_executors: usize,
+    remaining_budget: usize,
+) -> usize {
+    let divisor = connected_executors.max(1);
+    table_partition_count
+        .div_ceil(divisor)
+        .min(remaining_budget)
+}
+
 /// Computes the per-executor [`Statistics`] for the slice of `table` this
 /// executor has accelerated locally, returning the encoded statistics bytes and
 /// the column names they're aligned to (so the coordinator can project column
@@ -276,5 +296,49 @@ fn effective_max_for_ndv(
         // Only tighten — never widen past the real max.
         (Some(syn), Some(tmax)) if &syn < tmax => Precision::Inexact(syn),
         _ => true_max,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::fair_share_limit;
+
+    const BUDGET: usize = 1000;
+
+    #[test]
+    fn fair_share_even_split() {
+        assert_eq!(fair_share_limit(30, 3, BUDGET), 10);
+    }
+
+    #[test]
+    fn fair_share_rounds_up() {
+        // 10 partitions across 3 executors: ceil(10/3) = 4 so the first executors can
+        // cover the remainder rather than leaving it stranded for the next cycle.
+        assert_eq!(fair_share_limit(10, 3, BUDGET), 4);
+    }
+
+    #[test]
+    fn fair_share_more_executors_than_partitions() {
+        assert_eq!(fair_share_limit(5, 10, BUDGET), 1);
+    }
+
+    #[test]
+    fn fair_share_single_executor_gets_all() {
+        assert_eq!(fair_share_limit(30, 1, BUDGET), 30);
+    }
+
+    #[test]
+    fn fair_share_clamped_to_remaining_budget() {
+        assert_eq!(fair_share_limit(30, 3, 6), 6);
+    }
+
+    #[test]
+    fn fair_share_empty_table_is_zero() {
+        assert_eq!(fair_share_limit(0, 3, BUDGET), 0);
+    }
+
+    #[test]
+    fn fair_share_zero_executors_clamped_to_one() {
+        assert_eq!(fair_share_limit(30, 0, BUDGET), 30);
     }
 }

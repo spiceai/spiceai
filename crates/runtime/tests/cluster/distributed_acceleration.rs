@@ -440,6 +440,26 @@ async fn test_distributed_acceleration_multi_executor() -> Result<(), anyhow::Er
             harness.wait_for_executors(Duration::from_secs(15)).await?;
             wait_for_row_count(&harness, "test_data", 10, Duration::from_mins(1)).await?;
 
+            // Fair-share allocation: the 5 bucket(4, id) partitions must be spread
+            // across both executors rather than one executor greedily claiming all of
+            // them. All 10 rows being queryable means every partition is assigned and
+            // loaded, so ownership counts are stable to read here.
+            let owner_counts = harness.partition_owner_counts("test_data");
+            let total_assigned: usize = owner_counts.values().sum();
+            assert_eq!(
+                total_assigned, 5,
+                "all 5 partitions should be assigned exactly once: {owner_counts:?}"
+            );
+            assert_eq!(
+                owner_counts.len(),
+                2,
+                "partitions should be spread across both executors, not hoarded by one: {owner_counts:?}"
+            );
+            assert!(
+                owner_counts.values().all(|&count| (1..=3).contains(&count)),
+                "each executor should own its fair share (1..=3 of 5 partitions): {owner_counts:?}"
+            );
+
             // --- SELECT all rows ---
             let select_all_sql = "SELECT id, name, age, city, score FROM test_data ORDER BY id";
 
