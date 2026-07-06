@@ -26,8 +26,9 @@ use super::pk_index::{CachedPkIndex, PkExistenceRef, ShardedPkIndex};
 use crate::metadata::InlinedData;
 
 use arrow::record_batch::RecordBatch;
-use arrow_row::{OwnedRow, RowConverter};
 use arrow_schema::SchemaRef;
+
+use crate::row_converter::{OwnedRow, RowConverter};
 use async_trait::async_trait;
 use data_components::delete::DeletionSink;
 use datafusion_catalog::Session;
