@@ -134,6 +134,11 @@ pub(crate) fn build_replication_config(
         status_interval: params.status_interval,
         idle_wakeup_interval: Duration::from_secs(1),
         buffer_events: 1024,
+        // Decouple server-liveness feedback from downstream consumption: a slow
+        // apply loop (or a slow shared-slot member) must never stall standby
+        // status updates long enough for Postgres to hit `wal_sender_timeout`
+        // and reset the walsender. See `pgwire_replication` worker `send_event`.
+        feedback_while_backpressured: true,
     }
 }
 
