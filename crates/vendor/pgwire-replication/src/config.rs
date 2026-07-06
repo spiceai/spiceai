@@ -291,7 +291,14 @@ pub struct ReplicationConfig {
     /// allowing the server to release WAL segments. Too infrequent updates
     /// may cause WAL accumulation; too frequent updates add overhead.
     ///
-    /// Default: 1 second (matches pg_recvlogical)
+    /// This interval also bounds the server-side liveness window: while a
+    /// consumer is backpressured (see [`Self::feedback_while_backpressured`])
+    /// the worker proactively re-sends a standby status update on every
+    /// `status_interval`, so this value should be comfortably below the
+    /// server's `wal_sender_timeout` (default 60 s). A ratio of ~1/6 leaves
+    /// margin under CPU pressure.
+    ///
+    /// Default: 5 seconds
     pub status_interval: Duration,
 
     /// Maximum time to wait for server messages before waking up.
@@ -313,6 +320,19 @@ pub struct ReplicationConfig {
     ///
     /// Default: 8192 events
     pub buffer_events: usize,
+
+    /// Keep sending standby status feedback while the consumer is backpressured.
+    ///
+    /// When `true` (default), a full event channel no longer parks the worker:
+    /// it keeps emitting standby status updates on [`Self::status_interval`]
+    /// while it waits for the consumer to drain, so PostgreSQL never sees a
+    /// feedback gap longer than `status_interval` and will not terminate the
+    /// walsender on `wal_sender_timeout`.
+    ///
+    /// When `false`, the worker reverts to hard backpressure: a full channel
+    /// blocks the worker (including feedback) until the consumer drains. Use
+    /// only if a consumer specifically relies on that coupling.
+    pub feedback_while_backpressured: bool,
 
     /// Maximum accepted size (bytes) of a single backend message payload during
     /// streaming. A frame whose declared length exceeds this is rejected as a
@@ -342,9 +362,10 @@ impl Default for ReplicationConfig {
             publication: "pub".into(),
             start_lsn: Lsn(0),
             stop_at_lsn: None,
-            status_interval: Duration::from_secs(10),
+            status_interval: Duration::from_secs(5),
             idle_wakeup_interval: Duration::from_secs(10),
             buffer_events: 8192,
+            feedback_while_backpressured: true,
             max_message_size: crate::protocol::framing::MAX_MESSAGE_SIZE,
         }
     }
@@ -494,6 +515,13 @@ impl ReplicationConfig {
     /// Set the event buffer size.
     pub fn with_buffer_size(mut self, size: usize) -> Self {
         self.buffer_events = size;
+        self
+    }
+
+    /// Set whether standby status feedback keeps flowing while the consumer is
+    /// backpressured. See [`Self::feedback_while_backpressured`].
+    pub fn with_feedback_while_backpressured(mut self, enabled: bool) -> Self {
+        self.feedback_while_backpressured = enabled;
         self
     }
 

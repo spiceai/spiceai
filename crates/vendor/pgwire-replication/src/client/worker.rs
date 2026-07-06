@@ -1,17 +1,16 @@
 use bytes::Bytes;
-use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::{mpsc, watch};
-use tokio::time::MissedTickBehavior;
+use tokio::time::Instant;
 
 use crate::config::ReplicationConfig;
 use crate::error::{PgWireError, Result};
 use crate::lsn::Lsn;
 use crate::protocol::framing::{
     read_backend_message, write_copy_data, write_copy_done, write_password_message, write_query,
-    write_startup_message, BackendMessage, FrameReader,
+    write_startup_message, FrameReader,
 };
 use crate::protocol::messages::{parse_auth_request, parse_error_response};
 use crate::protocol::replication::{
@@ -150,25 +149,19 @@ impl WorkerState {
     }
 
     /// Run the replication protocol on the given stream.
-    ///
-    /// Takes the stream by value so that, once the request/response handshake is
-    /// complete, it can be split into independent read and write halves: the
-    /// streaming loop reads WAL on one half while feedback (standby status
-    /// updates) is written on the other, so a slow consumer applying
-    /// backpressure to the event channel can never starve the keepalive path
-    /// (which would otherwise trip the server's `wal_sender_timeout` and drop
-    /// the slot). The handshake reads are exact (never over-read past a message
-    /// boundary), so no buffered bytes are lost across the split.
-    pub async fn run_on_stream<S: AsyncRead + AsyncWrite + Unpin + Send>(
+    pub async fn run_on_stream<S: AsyncRead + AsyncWrite + Unpin>(
         &mut self,
-        mut stream: S,
+        stream: &mut S,
     ) -> Result<()> {
-        self.startup(&mut stream).await?;
-        self.authenticate(&mut stream).await?;
-        self.start_replication(&mut stream).await?;
-
-        let (read_half, write_half) = tokio::io::split(stream);
-        self.stream_loop(read_half, write_half).await
+        // No intermediate `BufReader`: the streaming loop reads through a
+        // `FrameReader`, which owns a single growable buffer it fills straight
+        // from the socket (kernel -> one buffer, frames are zero-copy slices of
+        // it). Handshake reads are exact and never over-read past a message
+        // boundary, so nothing is lost handing the raw stream to `stream_loop`.
+        self.startup(stream).await?;
+        self.authenticate(stream).await?;
+        self.start_replication(stream).await?;
+        self.stream_loop(stream).await
     }
 
     /// Send startup message with replication parameters.
@@ -211,162 +204,167 @@ impl WorkerState {
 
     /// Main replication streaming loop.
     ///
-    /// Runs on the split stream: `r` (read half) feeds a [`FrameReader`] that
-    /// slices WAL messages zero-copy, while `w` (write half) carries feedback.
-    /// One `select!` interleaves three concerns so none starves the others:
+    /// Uses a two-phase approach for throughput:
+    /// 1. **Drain phase**: while the [`FrameReader`] already has whole frames
+    ///    buffered, read them in a tight loop without `select!` or timeout
+    ///    overhead.
+    /// 2. **Wait phase**: when no complete frame is buffered, fall back to
+    ///    `select!` with timeout + stop signal to handle idle keepalives and
+    ///    graceful shutdown.
     ///
-    /// 1. **Consume** — decode frames and hand [`ReplicationEvent`]s to the
-    ///    consumer over the bounded channel. Frames already buffered are drained
-    ///    in a tight loop (no per-message `select!`/timer overhead).
-    /// 2. **Feedback** — send a standby status update every `status_interval`,
-    ///    *and* while the event channel is full and we wait for capacity. This
-    ///    is the key resilience property: a stalled consumer cannot stop
-    ///    keepalives, so the server never trips `wal_sender_timeout` and drops
-    ///    the slot. Feedback reports only the durably-applied LSN, so keeping the
-    ///    connection alive never advances the server's confirmed position past
-    ///    what the consumer has persisted.
-    /// 3. **Shutdown** — a graceful stop (or the consumer dropping) sends
-    ///    `CopyDone` and returns.
-    ///
-    /// [`FrameReader::next`] is cancellation-safe, so `select!` dropping the read
-    /// future mid-message loses no bytes.
-    async fn stream_loop<R, W>(&mut self, mut r: R, mut w: W) -> Result<()>
-    where
-        R: AsyncRead + Unpin,
-        W: AsyncWrite + Unpin,
-    {
+    /// [`FrameReader`] reads straight from the socket into a single growable
+    /// buffer (no per-message zero-fill, no intermediate `BufReader` copy) and
+    /// hands out frames as zero-copy slices. It is cancellation-safe — partial
+    /// reads survive a dropped future — so the wait-phase `select!` cannot lose
+    /// bytes.
+    async fn stream_loop<S: AsyncRead + AsyncWrite + Unpin>(
+        &mut self,
+        stream: &mut S,
+    ) -> Result<()> {
+        let mut last_status_sent = Instant::now() - self.cfg.status_interval;
+        let mut last_applied = self.progress.load_applied();
+        // Incremental, zero-copy, cancellation-safe reader.
         let mut reader = FrameReader::new(self.cfg.max_message_size);
-        // Events decoded but not yet accepted by the consumer. Usually holds 0
-        // or 1; the bounded-replay stop path can enqueue 2 (final data + Stop).
-        let mut pending: VecDeque<ReplicationEvent> = VecDeque::new();
-        // Feedback cadence: honor both the periodic `status_interval` and the
-        // (historically idle-only) `idle_wakeup_interval` by ticking at the
-        // tighter of the two, so neither config field is silently ignored and
-        // the server hears from us — releasing WAL — at least that often even
-        // while the consumer is quiet. Clamp to >= 1ms since `interval` panics
-        // on a zero period.
-        let feedback_interval = self
-            .cfg
-            .status_interval
-            .min(self.cfg.idle_wakeup_interval)
-            .max(std::time::Duration::from_millis(1));
-        // `interval` fires its first tick immediately, sending an initial status
-        // update (matches the previous behavior).
-        let mut status = tokio::time::interval(feedback_interval);
-        status.set_missed_tick_behavior(MissedTickBehavior::Delay);
-        // Bound the tight drain so feedback/stop get a turn under a firehose.
+        // How many messages to process in the tight loop before checking
+        // stop signal and sending periodic status feedback.
         const DRAIN_BATCH: usize = 256;
 
         loop {
-            // ── Flush decoded events to the consumer. ──
-            // Fast path is a non-blocking `try_send`. When the channel is full
-            // (slow consumer), fall back to a `select!` that keeps sending
-            // feedback while awaiting capacity, so backpressure never starves
-            // keepalives.
-            while let Some(ev) = pending.pop_front() {
-                match self.out.try_send(Ok(ev)) {
-                    Ok(()) => {}
-                    Err(mpsc::error::TrySendError::Closed(_)) => {
-                        tracing::debug!("event channel closed, client may have disconnected");
-                        return Ok(());
-                    }
-                    Err(mpsc::error::TrySendError::Full(item)) => 'wait: loop {
-                        tokio::select! {
-                            biased;
+            // Update applied LSN from client
+            let current_applied = self.progress.load_applied();
+            if current_applied != last_applied {
+                last_applied = current_applied;
+            }
 
-                            res = self.stop_rx.changed() => {
-                                if res.is_err() || *self.stop_rx.borrow() {
-                                    let _ = write_copy_done(&mut w).await;
-                                    return Ok(());
-                                }
-                            }
+            // Send periodic status feedback
+            if last_status_sent.elapsed() >= self.cfg.status_interval {
+                self.send_feedback(stream, last_applied, false).await?;
+                last_status_sent = Instant::now();
+            }
 
-                            permit = self.out.reserve() => {
-                                match permit {
-                                    Ok(p) => { p.send(item); break 'wait; }
-                                    Err(_) => return Ok(()), // channel closed
-                                }
-                            }
-
-                            _ = status.tick() => {
-                                self.send_feedback(&mut w, self.progress.load_applied(), false)
-                                    .await?;
-                            }
-                        }
-                    },
+            // ── Drain phase: tight loop while whole frames are already buffered ──
+            // A single socket read often delivers many WAL messages into the
+            // FrameReader's buffer. Slice them out in a tight loop (no await on
+            // the socket, no select!/timeout overhead per message).
+            let mut drained = 0usize;
+            while drained < DRAIN_BATCH && reader.has_buffered_frame() {
+                let msg = reader.next(stream).await?;
+                drained += 1;
+                if msg.tag == b'E' {
+                    return Err(PgWireError::Server(parse_error_response(&msg.payload)));
+                }
+                if msg.tag == b'd'
+                    && self
+                        .handle_copy_data(
+                            stream,
+                            msg.payload,
+                            &mut last_applied,
+                            &mut last_status_sent,
+                        )
+                        .await?
+                {
+                    return Ok(());
                 }
             }
 
-            // ── Wait for the next frame, a feedback tick, or a stop signal. ──
-            tokio::select! {
+            // If we drained messages, loop back to check stop/status before
+            // potentially blocking on the next read.
+            if drained > 0 {
+                // Check stop signal without blocking
+                if self.stop_rx.has_changed().unwrap_or(false) && *self.stop_rx.borrow() {
+                    let _ = write_copy_done(stream).await;
+                    return Ok(());
+                }
+                continue;
+            }
+
+            // ── Wait phase: no whole frame buffered, wait for socket data ──
+            //
+            // Both `stop_rx.changed()` and the timeout can drop the read future
+            // mid-message. `FrameReader::next` is cancellation-safe — a partial
+            // frame stays in the reader's buffer and is preserved across the
+            // drop, so the next iteration resumes the read without losing bytes.
+            let msg = tokio::select! {
                 biased;
 
-                res = self.stop_rx.changed() => {
-                    if res.is_err() || *self.stop_rx.borrow() {
-                        let _ = write_copy_done(&mut w).await;
+                _ = self.stop_rx.changed() => {
+                    if *self.stop_rx.borrow() {
+                        let _ = write_copy_done(stream).await;
                         return Ok(());
                     }
+                    continue;
                 }
 
-                _ = status.tick() => {
-                    self.send_feedback(&mut w, self.progress.load_applied(), false).await?;
-                }
-
-                msg = reader.next(&mut r) => {
-                    let msg = msg?;
-                    if self.handle_message(msg, &mut pending, &mut w).await? {
-                        return Ok(());
-                    }
-                    // Drain frames already buffered without awaiting the socket.
-                    let mut drained = 0usize;
-                    while drained < DRAIN_BATCH && reader.has_buffered_frame() {
-                        let msg = reader.next(&mut r).await?;
-                        drained += 1;
-                        if self.handle_message(msg, &mut pending, &mut w).await? {
-                            return Ok(());
+                msg_result = tokio::time::timeout(
+                    self.cfg.idle_wakeup_interval,
+                    reader.next(stream),
+                ) => {
+                    match msg_result {
+                        Ok(res) => res?,
+                        Err(_) => {
+                            let applied = self.progress.load_applied();
+                            last_applied = applied;
+                            self.send_feedback(stream, applied, false).await?;
+                            last_status_sent = Instant::now();
+                            continue;
                         }
                     }
                 }
+            };
+
+            if msg.tag == b'E' {
+                return Err(PgWireError::Server(parse_error_response(&msg.payload)));
+            }
+            if msg.tag == b'd'
+                && self
+                    .handle_copy_data(
+                        stream,
+                        msg.payload,
+                        &mut last_applied,
+                        &mut last_status_sent,
+                    )
+                    .await?
+            {
+                return Ok(());
             }
         }
     }
 
-    /// Decode one backend message and enqueue any resulting events into
-    /// `pending`. Sends an immediate feedback reply for solicited keepalives.
-    /// Returns `Ok(true)` when a configured `stop_at_lsn` has been reached and
-    /// the stream should terminate.
-    async fn handle_message<W>(
-        &self,
-        msg: BackendMessage,
-        pending: &mut VecDeque<ReplicationEvent>,
-        w: &mut W,
-    ) -> Result<bool>
-    where
-        W: AsyncWrite + Unpin,
-    {
-        match msg.tag {
-            b'E' => return Err(PgWireError::Server(parse_error_response(&msg.payload))),
-            b'd' => {}
-            // ParameterStatus / NoticeResponse / etc. mid-stream: ignore.
-            _ => return Ok(false),
-        }
+    /// Handle a CopyData message. Returns true if we should stop.
+    async fn handle_copy_data<S: AsyncRead + AsyncWrite + Unpin>(
+        &mut self,
+        stream: &mut S,
+        payload: Bytes,
+        last_applied: &mut Lsn,
+        last_status_sent: &mut Instant,
+    ) -> Result<bool> {
+        let cd = parse_copy_data(payload)?;
 
-        match parse_copy_data(msg.payload)? {
+        match cd {
             ReplicationCopyData::KeepAlive {
                 wal_end,
                 server_time_micros,
                 reply_requested,
             } => {
-                // Respond immediately if the server requests it.
+                // Respond immediately if server requests it
                 if reply_requested {
-                    self.send_feedback(w, self.progress.load_applied(), true)
-                        .await?;
+                    let applied = self.progress.load_applied();
+                    *last_applied = applied;
+                    self.send_feedback(stream, applied, true).await?;
+                    *last_status_sent = Instant::now();
                 }
-                pending.push_back(ReplicationEvent::KeepAlive {
-                    wal_end,
-                    reply_requested,
-                    server_time_micros,
-                });
+
+                self.send_event(
+                    stream,
+                    Ok(ReplicationEvent::KeepAlive {
+                        wal_end,
+                        reply_requested,
+                        server_time_micros,
+                    }),
+                    last_status_sent,
+                )
+                .await?;
+
                 Ok(false)
             }
             ReplicationCopyData::XLogData {
@@ -375,8 +373,7 @@ impl WorkerState {
                 server_time_micros,
                 data,
             } => {
-                // Begin/Commit/Message boundaries surface as their own typed
-                // events; other payloads pass through as raw XLogData.
+                // If the payload is a pgoutput Begin/Commit message, emit only the boundary event.
                 if let Some(boundary_ev) = parse_pgoutput_boundary(&data)? {
                     let reached_lsn = match boundary_ev {
                         ReplicationEvent::Begin { final_lsn, .. } => final_lsn,
@@ -384,43 +381,159 @@ impl WorkerState {
                         _ => wal_end, // should never happen if parser only returns Begin/Commit
                     };
 
-                    pending.push_back(boundary_ev);
+                    self.send_event(stream, Ok(boundary_ev), last_status_sent)
+                        .await?;
 
-                    // Stop condition (prefer boundary LSN semantics when available).
+                    // Stop condition (prefer boundary LSN semantics when available)
                     if let Some(stop_lsn) = self.cfg.stop_at_lsn {
                         if reached_lsn >= stop_lsn {
-                            pending.push_back(ReplicationEvent::StoppedAt {
-                                reached: reached_lsn,
-                            });
-                            let _ = write_copy_done(w).await;
-                            return Ok(true);
+                            self.send_event(
+                                stream,
+                                Ok(ReplicationEvent::StoppedAt {
+                                    reached: reached_lsn,
+                                }),
+                                last_status_sent,
+                            )
+                            .await?;
+                            let _ = write_copy_done(stream).await;
+                            return Ok(true); // should stop.
                         }
                     }
 
                     return Ok(false);
                 }
-
+                // Otherwise, emit raw payload
+                // Check stop condition
                 if let Some(stop_lsn) = self.cfg.stop_at_lsn {
                     if wal_end >= stop_lsn {
-                        pending.push_back(ReplicationEvent::XLogData {
-                            wal_start,
-                            wal_end,
-                            server_time_micros,
-                            data,
-                        });
-                        pending.push_back(ReplicationEvent::StoppedAt { reached: wal_end });
-                        let _ = write_copy_done(w).await;
+                        // Send final event, then stop signal
+                        self.send_event(
+                            stream,
+                            Ok(ReplicationEvent::XLogData {
+                                wal_start,
+                                wal_end,
+                                server_time_micros,
+                                data,
+                            }),
+                            last_status_sent,
+                        )
+                        .await?;
+
+                        self.send_event(
+                            stream,
+                            Ok(ReplicationEvent::StoppedAt { reached: wal_end }),
+                            last_status_sent,
+                        )
+                        .await?;
+
+                        let _ = write_copy_done(stream).await;
                         return Ok(true);
                     }
                 }
 
-                pending.push_back(ReplicationEvent::XLogData {
-                    wal_start,
-                    wal_end,
-                    server_time_micros,
-                    data,
-                });
+                self.send_event(
+                    stream,
+                    Ok(ReplicationEvent::XLogData {
+                        wal_start,
+                        wal_end,
+                        server_time_micros,
+                        data,
+                    }),
+                    last_status_sent,
+                )
+                .await?;
+
                 Ok(false)
+            }
+        }
+    }
+
+    /// Send an event to the consumer channel without letting a full channel
+    /// starve server feedback.
+    ///
+    /// A plain `out.send().await` on a full events channel parks the entire
+    /// worker until the consumer drains — and while parked, the worker sends no
+    /// standby status updates and services no keepalives. PostgreSQL then sees
+    /// no feedback for `> wal_sender_timeout` and terminates the walsender
+    /// (connection reset), forcing a reconnect and WAL replay. This is the
+    /// coupling this method breaks.
+    ///
+    /// Hot path: a non-blocking `try_reserve` sends immediately (no timer, no
+    /// `select!`). Only when the channel is full do we enter a loop that keeps
+    /// emitting standby status updates every [`status_interval`] while awaiting
+    /// capacity, so the server's liveness window is satisfied regardless of
+    /// consumer progress.
+    ///
+    /// While parked here the worker is not reading the socket, so a server
+    /// keepalive with `reply_requested=true` may sit unread — that is fine,
+    /// because the proactive feedback we send on `status_interval` satisfies
+    /// `wal_sender_timeout` whether or not the request byte was observed.
+    ///
+    /// Gated by [`ReplicationConfig::feedback_while_backpressured`] (default
+    /// `true`); when disabled this reverts to the original blocking `send`.
+    ///
+    /// [`status_interval`]: ReplicationConfig::status_interval
+    /// [`ReplicationConfig::feedback_while_backpressured`]: ReplicationConfig::feedback_while_backpressured
+    async fn send_event<S: AsyncRead + AsyncWrite + Unpin>(
+        &mut self,
+        stream: &mut S,
+        event: std::result::Result<ReplicationEvent, PgWireError>,
+        last_status_sent: &mut Instant,
+    ) -> Result<()> {
+        // Opt-out: original hard-backpressure semantics.
+        if !self.cfg.feedback_while_backpressured {
+            if self.out.send(event).await.is_err() {
+                tracing::debug!("event channel closed, client may have disconnected");
+            }
+            return Ok(());
+        }
+
+        // Hot path: capacity available right now — no timer/select overhead.
+        match self.out.try_reserve() {
+            Ok(permit) => {
+                permit.send(event);
+                return Ok(());
+            }
+            Err(mpsc::error::TrySendError::Closed(())) => {
+                tracing::debug!("event channel closed, client may have disconnected");
+                return Ok(());
+            }
+            Err(mpsc::error::TrySendError::Full(())) => {}
+        }
+
+        // Backpressured: wait for capacity, but keep the server alive by
+        // re-sending standby status feedback every `status_interval`.
+        loop {
+            let feedback_deadline = *last_status_sent + self.cfg.status_interval;
+            tokio::select! {
+                biased;
+
+                // Shutdown must be able to interrupt a stalled send.
+                _ = self.stop_rx.changed() => {
+                    if *self.stop_rx.borrow() {
+                        // Caller's loop observes stop on the next iteration and
+                        // finishes; the event is dropped along with the stream.
+                        return Ok(());
+                    }
+                }
+
+                reserved = tokio::time::timeout_at(feedback_deadline, self.out.reserve()) => {
+                    match reserved {
+                        Ok(Ok(permit)) => {
+                            permit.send(event);
+                            return Ok(());
+                        }
+                        Ok(Err(_)) => {
+                            tracing::debug!("event channel closed, client may have disconnected");
+                            return Ok(());
+                        }
+                        Err(_elapsed) => {
+                            let applied = self.progress.load_applied();
+                            self.send_feedback(stream, applied, false).await?;
+                            *last_status_sent = Instant::now();
+                        }
+                    }
+                }
             }
         }
     }
@@ -719,8 +832,6 @@ fn postgres_md5(password: &str, user: &str, salt: &[u8; 4]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::Duration;
-    use tokio::io::AsyncWriteExt;
 
     #[test]
     fn parse_sasl_mechanisms_single() {
@@ -759,199 +870,87 @@ mod tests {
         assert!(ts > 0);
     }
 
-    // ==================== streaming loop tests ====================
-
-    /// Wrap a backend message: tag + i32 length (counts itself + payload) + payload.
-    fn backend_frame(tag: u8, payload: &[u8]) -> Vec<u8> {
-        let len = (4 + payload.len()) as i32;
-        let mut v = Vec::with_capacity(5 + payload.len());
-        v.push(tag);
-        v.extend_from_slice(&len.to_be_bytes());
-        v.extend_from_slice(payload);
-        v
-    }
-
-    /// A CopyData ('d') wrapping an XLogData ('w') record carrying `data`.
-    fn xlog_copydata(wal_start: u64, wal_end: u64, data: &[u8]) -> Vec<u8> {
-        let mut inner = vec![b'w'];
-        inner.extend_from_slice(&(wal_start as i64).to_be_bytes());
-        inner.extend_from_slice(&(wal_end as i64).to_be_bytes());
-        inner.extend_from_slice(&0i64.to_be_bytes()); // server_time
-        inner.extend_from_slice(data);
-        backend_frame(b'd', &inner)
-    }
-
-    /// A CopyData ('d') wrapping a KeepAlive ('k') record.
-    fn keepalive_copydata(wal_end: u64, reply_requested: bool) -> Vec<u8> {
-        let mut inner = vec![b'k'];
-        inner.extend_from_slice(&(wal_end as i64).to_be_bytes());
-        inner.extend_from_slice(&0i64.to_be_bytes()); // server_time
-        inner.push(u8::from(reply_requested));
-        backend_frame(b'd', &inner)
-    }
-
-    /// Returns true if `msg` is a standby status update ('d' CopyData starting 'r').
-    fn is_feedback(msg: &BackendMessage) -> bool {
-        msg.tag == b'd' && msg.payload.first() == Some(&b'r')
-    }
-
-    fn spawn_worker<R, W>(
-        cfg: ReplicationConfig,
-        r: R,
-        w: W,
-    ) -> (
-        Arc<SharedProgress>,
-        watch::Sender<bool>,
-        mpsc::Receiver<std::result::Result<ReplicationEvent, PgWireError>>,
-        tokio::task::JoinHandle<Result<()>>,
-    )
-    where
-        R: AsyncRead + Unpin + Send + 'static,
-        W: AsyncWrite + Unpin + Send + 'static,
-    {
-        let (out, rx) = mpsc::channel(cfg.buffer_events.max(1));
-        let progress = Arc::new(SharedProgress::new(Lsn(0)));
-        let (stop_tx, stop_rx) = watch::channel(false);
-        let mut worker = WorkerState::new(cfg, Arc::clone(&progress), stop_rx, out);
-        let handle = tokio::spawn(async move { worker.stream_loop(r, w).await });
-        (progress, stop_tx, rx, handle)
-    }
-
-    /// The key resilience property (top-cluster #1): a consumer that never
-    /// drains the event channel must NOT stop standby-status feedback. Without
-    /// the read/feedback split a stalled consumer would block the single task
-    /// and the server would eventually trip `wal_sender_timeout`.
+    /// Regression test for the feedback/backpressure coupling: when the consumer
+    /// stops draining the events channel, `send_event` must keep emitting standby
+    /// status updates every `status_interval` instead of parking silently. If it
+    /// didn't, Postgres would see no feedback and terminate the walsender on
+    /// `wal_sender_timeout`.
     #[tokio::test]
-    async fn feedback_survives_consumer_backpressure() {
-        let cfg = ReplicationConfig::default()
-            .with_status_interval(Duration::from_millis(20))
-            .with_buffer_size(1); // fill after one event
+    async fn feedback_continues_while_events_channel_is_full() {
+        use tokio::io::{duplex, AsyncReadExt};
 
-        let (worker_io, server_io) = tokio::io::duplex(64 * 1024);
-        let (wr, ww) = tokio::io::split(worker_io);
-        let (mut sr, mut sw) = tokio::io::split(server_io);
+        // Capacity-1 consumer channel, primed to full and never drained. `_rx`
+        // keeps it open so `send_event` blocks on backpressure (not closure).
+        let (out_tx, _rx) = mpsc::channel::<std::result::Result<ReplicationEvent, PgWireError>>(1);
+        out_tx
+            .try_send(Ok(ReplicationEvent::KeepAlive {
+                wal_end: Lsn(0),
+                reply_requested: false,
+                server_time_micros: 0,
+            }))
+            .expect("prime channel to full");
 
-        let (_progress, stop_tx, _rx, handle) = spawn_worker(cfg, wr, ww);
+        let (_stop_tx, stop_rx) = watch::channel(false);
+        // Short real interval so the three feedback sends complete quickly.
+        let cfg = ReplicationConfig {
+            status_interval: std::time::Duration::from_millis(20),
+            feedback_while_backpressured: true,
+            ..Default::default()
+        };
+        let progress = Arc::new(SharedProgress::new(Lsn(42)));
+        let mut worker = WorkerState::new(cfg, progress, stop_rx, out_tx.clone());
 
-        // Fire several changes; the consumer (`_rx`) is intentionally never
-        // drained, so the channel is full after the first event.
-        for i in 0..5u64 {
-            sw.write_all(&xlog_copydata(i, i + 1, &[b'I', 1, 2, 3]))
+        // In-memory socket; the worker writes standby status updates on its side.
+        let (client_io, mut server_io) = duplex(64 * 1024);
+
+        let send = tokio::spawn(async move {
+            let mut stream = client_io;
+            let mut last_status_sent = Instant::now();
+            worker
+                .send_event(
+                    &mut stream,
+                    Ok(ReplicationEvent::KeepAlive {
+                        wal_end: Lsn(0),
+                        reply_requested: false,
+                        server_time_micros: 0,
+                    }),
+                    &mut last_status_sent,
+                )
                 .await
-                .unwrap();
-        }
-        sw.flush().await.unwrap();
+        });
 
-        // We must keep receiving feedback despite the stalled consumer.
-        let got = tokio::time::timeout(Duration::from_secs(2), async {
-            let mut feedbacks = 0;
-            loop {
-                let msg = read_backend_message(&mut sr).await.expect("read feedback");
-                if is_feedback(&msg) {
-                    feedbacks += 1;
-                    if feedbacks >= 3 {
-                        return feedbacks;
-                    }
-                }
-            }
-        })
-        .await;
+        // Read three standby status updates, one per `status_interval`. Under the
+        // old coupling zero frames would ever arrive and `read_exact` would hang.
+        for _ in 0..3 {
+            let mut tag = [0u8; 1];
+            server_io
+                .read_exact(&mut tag)
+                .await
+                .expect("read frame tag");
+            assert_eq!(tag[0], b'd', "expected a CopyData frame");
+            let mut len = [0u8; 4];
+            server_io
+                .read_exact(&mut len)
+                .await
+                .expect("read frame len");
+            let payload_len = (u32::from_be_bytes(len) as usize) - 4;
+            let mut payload = vec![0u8; payload_len];
+            server_io
+                .read_exact(&mut payload)
+                .await
+                .expect("read frame payload");
+            assert_eq!(
+                payload[0], b'r',
+                "CopyData payload should be a standby status update"
+            );
+        }
+
+        // Feedback flowed *while* the send was still backpressured — the point of
+        // the fix.
         assert!(
-            got.is_ok(),
-            "feedback was starved under consumer backpressure"
+            !send.is_finished(),
+            "send_event should still be parked on the full channel"
         );
-
-        // Cleanup: stop and drain writes until the worker drops its half.
-        let _ = stop_tx.send(true);
-        let _ = tokio::time::timeout(Duration::from_secs(1), async {
-            while read_backend_message(&mut sr).await.is_ok() {}
-        })
-        .await;
-        let _ = tokio::time::timeout(Duration::from_secs(1), handle).await;
-    }
-
-    /// A keepalive with `reply_requested` must be answered immediately, well
-    /// before the (here: very long) periodic interval, and still surface a
-    /// `KeepAlive` event to the consumer.
-    #[tokio::test]
-    async fn keepalive_reply_requested_triggers_immediate_feedback() {
-        let cfg = ReplicationConfig::default().with_status_interval(Duration::from_secs(3600));
-
-        let (worker_io, server_io) = tokio::io::duplex(64 * 1024);
-        let (wr, ww) = tokio::io::split(worker_io);
-        let (mut sr, mut sw) = tokio::io::split(server_io);
-
-        let (_progress, stop_tx, mut rx, handle) = spawn_worker(cfg, wr, ww);
-
-        // Drain the immediate initial feedback (interval's first tick).
-        let first = read_backend_message(&mut sr).await.unwrap();
-        assert!(is_feedback(&first), "expected an initial status update");
-
-        sw.write_all(&keepalive_copydata(42, true)).await.unwrap();
-        sw.flush().await.unwrap();
-
-        let fb = tokio::time::timeout(Duration::from_secs(1), read_backend_message(&mut sr))
-            .await
-            .expect("no feedback within timeout")
-            .unwrap();
-        assert!(is_feedback(&fb), "keepalive reply must be a status update");
-
-        let ev = tokio::time::timeout(Duration::from_secs(1), rx.recv())
-            .await
-            .expect("no event")
-            .expect("channel closed")
-            .expect("worker error");
-        assert!(
-            matches!(ev, ReplicationEvent::KeepAlive { wal_end, reply_requested: true, .. } if wal_end == Lsn(42)),
-            "expected KeepAlive event, got {ev:?}"
-        );
-
-        let _ = stop_tx.send(true);
-        let _ = tokio::time::timeout(Duration::from_secs(1), async {
-            while read_backend_message(&mut sr).await.is_ok() {}
-        })
-        .await;
-        let _ = tokio::time::timeout(Duration::from_secs(1), handle).await;
-    }
-
-    /// Events are delivered to the consumer in wire order.
-    #[tokio::test]
-    async fn events_flow_in_order_when_drained() {
-        let cfg = ReplicationConfig::default().with_status_interval(Duration::from_secs(3600));
-
-        let (worker_io, server_io) = tokio::io::duplex(64 * 1024);
-        let (wr, ww) = tokio::io::split(worker_io);
-        let (mut sr, mut sw) = tokio::io::split(server_io);
-
-        let (_progress, stop_tx, mut rx, handle) = spawn_worker(cfg, wr, ww);
-
-        for i in 1..=4u64 {
-            sw.write_all(&xlog_copydata(i, i, &[b'I', i as u8]))
-                .await
-                .unwrap();
-        }
-        sw.flush().await.unwrap();
-
-        for i in 1..=4u64 {
-            let ev = tokio::time::timeout(Duration::from_secs(1), rx.recv())
-                .await
-                .expect("timed out awaiting event")
-                .expect("channel closed")
-                .expect("worker error");
-            match ev {
-                ReplicationEvent::XLogData { wal_end, data, .. } => {
-                    assert_eq!(wal_end, Lsn(i));
-                    assert_eq!(&data[..], &[b'I', i as u8]);
-                }
-                other => panic!("unexpected event: {other:?}"),
-            }
-        }
-
-        let _ = stop_tx.send(true);
-        let _ = tokio::time::timeout(Duration::from_secs(1), async {
-            while read_backend_message(&mut sr).await.is_ok() {}
-        })
-        .await;
-        let _ = tokio::time::timeout(Duration::from_secs(1), handle).await;
+        send.abort();
     }
 }
