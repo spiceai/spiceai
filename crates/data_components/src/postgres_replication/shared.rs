@@ -1264,7 +1264,11 @@ async fn deliver_commit(
         // slot. Server-side liveness is handled one layer down by the worker.
         let mut pending = Ok(envelope);
         loop {
-            match member.sender.send_timeout(pending, MEMBER_SEND_STALL_WARN).await {
+            match member
+                .sender
+                .send_timeout(pending, MEMBER_SEND_STALL_WARN)
+                .await
+            {
                 Ok(()) => break,
                 Err(mpsc::error::SendTimeoutError::Closed(_)) => {
                     source.detach_member(member_key, "changes stream receiver dropped");

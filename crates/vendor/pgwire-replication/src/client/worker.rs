@@ -875,8 +875,7 @@ mod tests {
 
         // Capacity-1 consumer channel, primed to full and never drained. `_rx`
         // keeps it open so `send_event` blocks on backpressure (not closure).
-        let (out_tx, _rx) =
-            mpsc::channel::<std::result::Result<ReplicationEvent, PgWireError>>(1);
+        let (out_tx, _rx) = mpsc::channel::<std::result::Result<ReplicationEvent, PgWireError>>(1);
         out_tx
             .try_send(Ok(ReplicationEvent::KeepAlive {
                 wal_end: Lsn(0),
@@ -918,10 +917,16 @@ mod tests {
         // old coupling zero frames would ever arrive and `read_exact` would hang.
         for _ in 0..3 {
             let mut tag = [0u8; 1];
-            server_io.read_exact(&mut tag).await.expect("read frame tag");
+            server_io
+                .read_exact(&mut tag)
+                .await
+                .expect("read frame tag");
             assert_eq!(tag[0], b'd', "expected a CopyData frame");
             let mut len = [0u8; 4];
-            server_io.read_exact(&mut len).await.expect("read frame len");
+            server_io
+                .read_exact(&mut len)
+                .await
+                .expect("read frame len");
             let payload_len = (u32::from_be_bytes(len) as usize) - 4;
             let mut payload = vec![0u8; payload_len];
             server_io
@@ -929,8 +934,7 @@ mod tests {
                 .await
                 .expect("read frame payload");
             assert_eq!(
-                payload[0],
-                b'r',
+                payload[0], b'r',
                 "CopyData payload should be a standby status update"
             );
         }
