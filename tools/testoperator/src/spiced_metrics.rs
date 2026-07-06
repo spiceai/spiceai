@@ -39,7 +39,7 @@ pub struct MetricSample {
 }
 
 /// Unix epoch milliseconds now. Canonical scrape-timestamp helper, shared by the
-/// pg_stats sampler. The `0` fallback is intentional and effectively unreachable:
+/// `pg_stats` sampler. The `0` fallback is intentional and effectively unreachable:
 /// `duration_since(UNIX_EPOCH)` only errors if the system clock is set before 1970,
 /// which cannot happen on a benchmark runner — so threading a `Result` through every
 /// scrape-timestamp call site would be needless plumbing for a can't-happen case.
