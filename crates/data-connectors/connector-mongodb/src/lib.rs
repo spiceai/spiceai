@@ -750,7 +750,7 @@ impl DataConnector for MongoDB {
     ) -> DataConnectorResult<Arc<dyn TableProvider>> {
         let provider = self
             .mongodb_factory
-            .table_provider(dataset.path().into(), dataset.schema.clone())
+            .table_provider(dataset.path().into(), dataset.schema.clone(), None)
             .await
             .context(UnableToGetReadProviderSnafu {
                 dataconnector: "mongodb",
