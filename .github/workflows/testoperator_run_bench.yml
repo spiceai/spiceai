@@ -489,7 +489,7 @@ jobs:
           CHBENCH_PG_HOST: 127.0.0.1
 
       - name: Install GH CLI
-        if: steps.determine_update_snapshots.outputs.update_snapshots == 'always'
+        if: false # snapshot upload disabled on scratch bench branch
         run: |
           (type -p wget >/dev/null || (sudo apt update && sudo apt-get install wget -y)) \
           && sudo mkdir -p -m 755 /etc/apt/keyrings \
@@ -501,7 +501,7 @@ jobs:
           && sudo apt install gh -y
 
       - name: Upload benchmark snapshots to branch
-        if: steps.determine_update_snapshots.outputs.update_snapshots == 'always'
+        if: false # snapshot upload disabled on scratch bench branch
         run: |
           git fetch --unshallow || true
 
