@@ -657,7 +657,7 @@ mod tests {
     /// output from the same seed, so an AES build would silently re-bucket
     /// persisted partitioned datasets relative to the shipped fallback-hashed
     /// builds (#11277). `vendored_hash.rs` has a `compile_error!` that fails any
-    /// x86/x86_64 build with `target_feature = "aes"` active, so on such a build
+    /// `x86/x86_64` build with `target_feature = "aes"` active, so on such a build
     /// this crate does not compile and this test never runs. Where it *does* run,
     /// assert the invariant explicitly and re-lock one fallback golden to prove
     /// the active hasher is in fact the portable fallback.
