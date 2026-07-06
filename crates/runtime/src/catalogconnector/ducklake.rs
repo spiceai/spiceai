@@ -26,8 +26,8 @@ use crate::{
 };
 use async_trait::async_trait;
 use data_components::RefreshableCatalogProvider;
-use data_components::ducklake::DuckLakeS3Params;
 use data_components::ducklake::provider::DuckLakeCatalogProvider;
+use data_components::ducklake::{DuckLakeS3Params, build_ducklake_attach_sql};
 use datafusion_table_providers::sql::db_connection_pool::dbconnection::duckdbconn::DuckDbConnection;
 use datafusion_table_providers::sql::db_connection_pool::duckdbpool::DuckDbConnectionPool;
 use duckdb::AccessMode;
@@ -69,6 +69,9 @@ pub const PARAMETERS: &[ParameterSpec] = &[
         .secret(),
     ParameterSpec::component("aws_allow_http")
         .description("Allow HTTP (non-TLS) connections to S3."),
+    ParameterSpec::component("automatic_migration").description(
+        "Automatically migrate an older DuckLake catalog schema to the version required by the ducklake extension on attach. Defaults to false; migration rewrites catalog metadata and cannot be undone.",
+    ),
 ];
 
 fn configure_duckdb_httpfs(
@@ -195,6 +198,14 @@ impl CatalogConnector for DuckLakeCatalog {
             .ok()
             .map(ToString::to_string);
 
+        let automatic_migration = self
+            .params
+            .parameters
+            .get("automatic_migration")
+            .expose()
+            .ok()
+            .is_some_and(|v| v.eq_ignore_ascii_case("true"));
+
         // Get the catalog's access mode to determine writable/ddl_enabled flags
         let writable = catalog.access.allows_write();
         let ddl_enabled = catalog.access.allows_ddl();
@@ -316,10 +327,10 @@ impl CatalogConnector for DuckLakeCatalog {
                         source: Box::new(e),
                     })?;
 
-                let escaped_connection_string = connection_string_for_pool.replace('\'', "''");
-                let escaped_catalog_name = catalog_name_for_pool.replace('"', "\"\"");
-                let attach_sql = format!(
-                    "ATTACH 'ducklake:{escaped_connection_string}' AS \"{escaped_catalog_name}\""
+                let attach_sql = build_ducklake_attach_sql(
+                    &connection_string_for_pool,
+                    &catalog_name_for_pool,
+                    automatic_migration,
                 );
                 duckdb_wrapper
                     .conn
