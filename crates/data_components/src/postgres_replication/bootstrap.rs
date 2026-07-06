@@ -413,7 +413,12 @@ impl BootstrapBuilder {
                 *scale,
             ),
             DataType::List(_) | DataType::Dictionary(_, _) => {
-                Self::TextCast(super::changes::FieldBuilder::new(data_type)?)
+                // Bootstrap builders accumulate up to `bootstrap_batch_size`
+                // rows before finishing; start at Arrow's default capacity (1024)
+                // and let amortized growth cover the rest.
+                Self::TextCast(super::changes::FieldBuilder::with_capacity(
+                    data_type, 1024,
+                )?)
             }
             DataType::LargeList(_) | DataType::FixedSizeList(_, _) => {
                 return PgOutputDecodeSnafu {
