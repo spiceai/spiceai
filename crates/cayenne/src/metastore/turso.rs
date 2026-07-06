@@ -570,6 +570,24 @@ impl MetastoreBackend for TursoMetastore {
     async fn init_schema(&self) -> CatalogResult<()> {
         let conn = self.pool().await?.acquire().await;
 
+        // Refuse to open a catalog written by a newer, incompatible Spice build
+        // BEFORE running any migration against it (a fresh/legacy DB reads 0).
+        let mut version_rows =
+            conn.query("PRAGMA user_version", ())
+                .await
+                .map_err(|e| CatalogError::Database {
+                    message: format!("Failed to read metastore schema version: {e}"),
+                })?;
+        let stored_version = match version_rows.next().await {
+            Ok(Some(row)) => match row.get_value(0) {
+                Ok(TursoValue::Integer(v)) => v,
+                _ => 0,
+            },
+            _ => 0,
+        };
+        drop(version_rows);
+        super::ensure_supported_schema_version(stored_version)?;
+
         // Create tables
         let schema_sql = format!(
             "{}; {}; {}; {}; {}; {}; {}; {}; {}; {}; {}; {}; {};",
@@ -637,6 +655,8 @@ impl MetastoreBackend for TursoMetastore {
         // Metadata-only publish: per-commit reinsert sequence on delete-file rows;
         // NULL on legacy rows falls back to cayenne_insert_record. Forward-upgrade
         // safe; downgrade requires a catalog rebuild (see the sqlite backfill note).
+        // The `user_version` gate at the top / stamp at the bottom of this fn turns
+        // an unsafe downgrade into a loud failure instead of silent row loss.
         let _ = conn
             .execute(
                 "ALTER TABLE cayenne_delete_file ADD COLUMN reinsert_sequence BIGINT",
@@ -804,6 +824,21 @@ impl MetastoreBackend for TursoMetastore {
             .map_err(|e| CatalogError::Database {
                 message: format!("Failed to create inlined_delete unpublished index: {e}"),
             })?;
+
+        // Stamp the current schema version now that all migrations have succeeded,
+        // so a later downgrade to a build with a lower max version fails loudly at
+        // the gate above instead of returning silently wrong results.
+        conn.execute(
+            &format!(
+                "PRAGMA user_version = {}",
+                super::CAYENNE_METASTORE_SCHEMA_VERSION
+            ),
+            (),
+        )
+        .await
+        .map_err(|e| CatalogError::Database {
+            message: format!("Failed to stamp metastore schema version: {e}"),
+        })?;
 
         // Validate that existing tables match the expected schema.
         // This catches incompatible metadata databases from previous versions.
