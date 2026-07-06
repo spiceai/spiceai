@@ -26,8 +26,9 @@ use super::pk_index::{CachedPkIndex, PkExistenceRef, ShardedPkIndex};
 use crate::metadata::InlinedData;
 
 use arrow::record_batch::RecordBatch;
-use arrow_row::{OwnedRow, RowConverter};
 use arrow_schema::SchemaRef;
+
+use crate::row_converter::{OwnedRow, RowConverter};
 use async_trait::async_trait;
 use data_components::delete::DeletionSink;
 use datafusion_catalog::Session;
@@ -418,8 +419,10 @@ pub(crate) struct PreparedShardedInsertStream {
     pub(crate) stream: SendableRecordBatchStream,
     /// PK column indices (in the stream's schema) for the shard split + validate.
     pub(crate) pk_indices: Vec<usize>,
-    /// The PK existence converter, reused across the apply's batches.
-    pub(crate) converter: RowConverter,
+    /// The PK existence converter, reused across the apply's batches. An `Arc`
+    /// so it can be the table's cached `pk_row_converter` (zero per-apply rebuild)
+    /// for composite PKs, or a freshly built one for `Int64` PKs (no cache).
+    pub(crate) converter: Arc<RowConverter>,
     /// Pre-apply per-shard existence snapshot. `None` when conflict detection is
     /// off (`pk_conflict_detection: none`) or the source trusts uniqueness — the
     /// drain then appends every row with no validation, mirroring the immediate

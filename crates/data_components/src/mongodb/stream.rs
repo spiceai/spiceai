@@ -15,6 +15,7 @@ limitations under the License.
 */
 
 use crate::cdc::{ChangeBatch, ChangeBatchError, changes_schema};
+use crate::schema_projection::SchemaProjection;
 use arrow::{
     array::{ArrayRef, ListArray, RecordBatch, StringArray, StructArray, new_null_array},
     datatypes::{Field, Schema, SchemaRef},
@@ -22,6 +23,7 @@ use arrow::{
 use arrow_buffer::OffsetBuffer;
 use datafusion_table_providers::mongodb::{
     Error as MongoDBError,
+    projection::project_bson_document,
     utils::{
         arrow::mongo_docs_to_arrow,
         unnest::{UnnestBehavior, UnnestParameters, unnest_bson_documents},
@@ -74,6 +76,7 @@ pub fn change_events_to_change_batch(
     table_schema: &SchemaRef,
     primary_keys: &[String],
     unnest_parameters: &UnnestParameters,
+    projection: Option<&SchemaProjection>,
 ) -> Result<Option<ChangeBatch>> {
     let mut rows = Vec::with_capacity(events.len());
     let primary_keys = Arc::<[String]>::from(primary_keys.to_vec());
@@ -87,18 +90,52 @@ pub fn change_events_to_change_batch(
                 })?;
                 rows.push(ChangeRow::new("c", Arc::clone(&primary_keys), document));
             }
-            OperationType::Update => {
-                let document = event.full_document.context(MissingFullDocumentSnafu {
-                    operation: "update",
-                })?;
-                rows.push(ChangeRow::new("u", Arc::clone(&primary_keys), document));
-            }
-            OperationType::Replace => {
-                let document = event.full_document.context(MissingFullDocumentSnafu {
-                    operation: "replace",
-                })?;
-                rows.push(ChangeRow::new("u", Arc::clone(&primary_keys), document));
-            }
+            OperationType::Update => match event.full_document {
+                Some(document) => {
+                    rows.push(ChangeRow::new("u", Arc::clone(&primary_keys), document));
+                }
+                None => match event.document_key {
+                    Some(key) => {
+                        tracing::warn!(
+                            operation = "update",
+                            "MongoDB change stream post-image was unavailable (document \
+                             deleted before UpdateLookup); substituting a synthetic delete"
+                        );
+                        rows.push(ChangeRow::new("d", Arc::clone(&primary_keys), key));
+                    }
+                    None => {
+                        tracing::warn!(
+                            operation = "update",
+                            "MongoDB change stream post-image was unavailable (document \
+                             deleted before UpdateLookup) and documentKey was missing; \
+                             skipping event"
+                        );
+                    }
+                },
+            },
+            OperationType::Replace => match event.full_document {
+                Some(document) => {
+                    rows.push(ChangeRow::new("u", Arc::clone(&primary_keys), document));
+                }
+                None => match event.document_key {
+                    Some(key) => {
+                        tracing::warn!(
+                            operation = "replace",
+                            "MongoDB change stream post-image was unavailable (document \
+                             deleted before UpdateLookup); substituting a synthetic delete"
+                        );
+                        rows.push(ChangeRow::new("d", Arc::clone(&primary_keys), key));
+                    }
+                    None => {
+                        tracing::warn!(
+                            operation = "replace",
+                            "MongoDB change stream post-image was unavailable (document \
+                             deleted before UpdateLookup) and documentKey was missing; \
+                             skipping event"
+                        );
+                    }
+                },
+            },
             OperationType::Delete => {
                 let document = event.document_key.context(MissingDocumentKeySnafu)?;
                 rows.push(ChangeRow::new("d", Arc::clone(&primary_keys), document));
@@ -130,7 +167,7 @@ pub fn change_events_to_change_batch(
         return truncate_change_batch(table_schema).map(Some);
     }
 
-    build_change_batch(rows, table_schema, unnest_parameters).map(Some)
+    build_change_batch(rows, table_schema, unnest_parameters, projection).map(Some)
 }
 
 pub fn truncate_change_batch(table_schema: &SchemaRef) -> Result<ChangeBatch> {
@@ -174,6 +211,7 @@ fn build_change_batch(
     rows: Vec<ChangeRow>,
     table_schema: &SchemaRef,
     unnest_parameters: &UnnestParameters,
+    projection: Option<&SchemaProjection>,
 ) -> Result<ChangeBatch> {
     let change_data_schema = nullable_clone(table_schema);
     let row_count = rows.len();
@@ -183,6 +221,17 @@ fn build_change_batch(
     let documents = match unnest_parameters.behavior {
         UnnestBehavior::Depth(0) => documents,
         _ => unnest_bson_documents(documents, unnest_parameters).context(ConversionSnafu)?,
+    };
+
+    // Fold non-declared fields into the catch-all column when JSON nesting is
+    // configured, matching the scan path. The change-data schema is already the
+    // projected (declared + catch-all) schema.
+    let documents = match projection.filter(|p| p.has_catch_all()) {
+        Some(p) => documents
+            .into_iter()
+            .map(|d| project_bson_document(d, p))
+            .collect(),
+        None => documents,
     };
 
     let data_batch = mongo_docs_to_arrow(&documents, Arc::clone(&change_data_schema))
@@ -289,6 +338,7 @@ mod tests {
             &schema(),
             &["_id".to_string()],
             &default_unnest_parameters(0),
+            None,
         )
         .expect("change batch should build")
         .expect("batch should not be empty");
@@ -326,6 +376,7 @@ mod tests {
             &schema(),
             &["_id".to_string()],
             &default_unnest_parameters(0),
+            None,
         )
         .expect("change batch should build")
         .expect("batch should not be empty");
@@ -341,6 +392,7 @@ mod tests {
             &schema(),
             &["_id".to_string()],
             &default_unnest_parameters(0),
+            None,
         )
         .expect("empty change batch should not fail");
 
@@ -360,6 +412,7 @@ mod tests {
             &schema(),
             &["_id".to_string()],
             &default_unnest_parameters(0),
+            None,
         )
         .expect("change batch should build")
         .expect("batch should not be empty");
@@ -389,6 +442,7 @@ mod tests {
             &schema(),
             &["_id".to_string()],
             &default_unnest_parameters(0),
+            None,
         )
         .expect("change batch should build")
         .expect("batch should not be empty");
@@ -399,23 +453,46 @@ mod tests {
     }
 
     #[test]
-    fn update_requires_full_document() {
+    fn update_without_full_document_becomes_delete() {
         let events = vec![event(doc! {
             "_id": { "_data": "update-token" },
             "operationType": "update",
             "ns": { "db": "db", "coll": "users" },
-            "documentKey": { "_id": "1" }
+            "documentKey": { "_id": "x" }
         })];
 
-        let error = change_events_to_change_batch(
+        let batch = change_events_to_change_batch(
             events,
             &schema(),
             &["_id".to_string()],
             &default_unnest_parameters(0),
+            None,
         )
-        .expect_err("missing fullDocument should fail");
+        .expect("change batch should build")
+        .expect("batch should not be empty");
 
-        assert!(matches!(error, StreamError::MissingFullDocument { .. }));
+        assert_eq!(batch.record.num_rows(), 1);
+        assert!(matches!(batch.op(0), ChangeOperation::Delete));
+    }
+
+    #[test]
+    fn update_without_full_document_or_key_is_skipped() {
+        let events = vec![event(doc! {
+            "_id": { "_data": "update-token" },
+            "operationType": "update",
+            "ns": { "db": "db", "coll": "users" }
+        })];
+
+        let batch = change_events_to_change_batch(
+            events,
+            &schema(),
+            &["_id".to_string()],
+            &default_unnest_parameters(0),
+            None,
+        )
+        .expect("change batch should build");
+
+        assert!(batch.is_none());
     }
 
     #[test]
@@ -431,6 +508,7 @@ mod tests {
             &schema(),
             &["_id".to_string()],
             &default_unnest_parameters(0),
+            None,
         )
         .expect_err("missing documentKey should fail");
 
@@ -451,6 +529,7 @@ mod tests {
             &schema(),
             &["_id".to_string()],
             &default_unnest_parameters(0),
+            None,
         )
         .expect_err("unsupported operation should fail");
 

@@ -20,7 +20,7 @@ limitations under the License.
 //! provider maintains and probes these; the per-row location is recorded as a
 //! [`RowLocation`].
 
-use arrow_row::OwnedRow;
+use crate::row_converter::OwnedRow;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
@@ -97,6 +97,20 @@ impl CachedPkKeyset {
                 self.approx_bytes = self.approx_bytes.saturating_add(entry_bytes);
                 entry.insert(location);
             }
+        }
+    }
+
+    /// Insert `key` -> `location` only when the key is ABSENT, preserving an
+    /// existing entry's `RowLocation` (unlike [`Self::insert`], which overwrites).
+    /// One hash lookup via `entry`, updating `approx_bytes` only for the new key.
+    /// Used by the mem-tier fold, which must not clobber a durable-scan location
+    /// with `FileUnlocated`.
+    pub(crate) fn insert_if_absent(&mut self, key: OwnedRow, location: RowLocation) {
+        if let std::collections::hash_map::Entry::Vacant(entry) = self.keys.entry(key) {
+            self.approx_bytes = self
+                .approx_bytes
+                .saturating_add(approx_pk_keyset_entry_bytes(entry.key()));
+            entry.insert(location);
         }
     }
 }

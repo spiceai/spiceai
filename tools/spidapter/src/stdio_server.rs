@@ -323,8 +323,9 @@ impl Drop for MongoDbGuard {
         // exit — must leave the database intact so a caller who asked to keep it
         // (or a crashed run) never loses data they may want to inspect.
         //
-        // The cost is that an abnormal exit leaks a throwaway `spidapter_<id>`
-        // database on the shared instance; those are safe to GC by name later.
+        // The cost is that an abnormal exit leaks a throwaway
+        // `spidapter_<YYYY_MM_DD>_<id>` database on the shared instance; those are
+        // safe to GC by name later (the date prefix makes stale ones identifiable).
         if let Some((_, database)) = self.target.take() {
             eprintln!(
                 "[stdio] MongoDbGuard: dropped without explicit teardown; \
@@ -1024,7 +1025,13 @@ impl Handler for SpidapterHandler {
                 // isolated and cleanup is a single drop. The database is created
                 // lazily on first write (by the spicebench sink) and dropped at
                 // teardown via the MongoDbGuard below.
-                let database = format!("spidapter_{short_id}");
+                //
+                // The `YYYY_MM_DD` prefix embeds the creation date in the name so
+                // leaked databases (abnormal exit — see MongoDbGuard) are visible at a
+                // glance and can be aged out by name without a per-database creation
+                // timestamp (MongoDB does not expose one).
+                let date = chrono::Utc::now().format("%Y_%m_%d");
+                let database = format!("spidapter_{date}_{short_id}");
                 let uri = with_mongodb_database(&mongo_conf.uri, &database);
                 eprintln!(
                     "[stdio] MongoDB connect: using per-run database '{database}' \
@@ -1036,6 +1043,33 @@ impl Handler for SpidapterHandler {
         };
 
         let mut setup_config = SetupConfig::from_metadata(&metadata).set_storage(storage);
+        // A scenario-level `spicepod:` path (e.g. the hand-tuned / adaptive Mongo CDC
+        // pods) deploys a full spicepod verbatim instead of generating one. An explicit
+        // `spicepod_path` in the setup metadata still wins; an empty scenario value
+        // (unset `${MONGO_SPICEPOD_PATH:-}`) falls through to generation.
+        if setup_config.spicepod_path.is_none()
+            && let Some(pod) = self
+                .scenario
+                .spicepod
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+        {
+            // Resolve a relative scenario `spicepod:` against the scenario base path
+            // (where the scenario YAML and its `pods/` live) so resolution doesn't
+            // depend on the process CWD. Absolute paths — the common case:
+            // `MONGO_SPICEPOD_PATH` locally or the in-image `/app/scenarios/...` path —
+            // are used as-is. `load_spicepod_from_path` then reads the resolved path.
+            let pod_path = match self.args.scenario_base_path.as_deref() {
+                Some(base) if std::path::Path::new(pod).is_relative() => std::path::Path::new(base)
+                    .join(pod)
+                    .to_string_lossy()
+                    .into_owned(),
+                _ => pod.to_string(),
+            };
+            eprintln!("[stdio] Using scenario spicepod (skipping generation): {pod_path}");
+            setup_config.spicepod_path = Some(pod_path);
+        }
         // For non-direct sources, still honour the env AWS_REGION override.
         setup_config.aws_region_override = std::env::var("AWS_REGION").ok();
 
@@ -1533,10 +1567,31 @@ impl Handler for SpidapterHandler {
                     scp.app_id,
                     scp.cloud.base_url()
                 );
+                // The token minted at provision can expire during a long run. When
+                // service-account client credentials are set, re-mint a fresh client
+                // for the delete; otherwise reuse the provision client (a static key
+                // has nothing to refresh). Fall back to the provision client if the
+                // refresh itself fails.
+                let refreshed = if std::env::var_os("SPICE_CLOUD_CLIENT_ID").is_some()
+                    && std::env::var_os("SPICE_CLOUD_CLIENT_SECRET").is_some()
+                {
+                    match commands::build_cloud_client(Some(scp.cloud.base_url()), None).await {
+                        Ok(client) => Some(client),
+                        Err(e) => {
+                            eprintln!(
+                                "[stdio] teardown: failed to refresh cloud token, using provision token: {e}"
+                            );
+                            None
+                        }
+                    }
+                } else {
+                    None
+                };
+                let cloud = refreshed.as_ref().unwrap_or(&scp.cloud);
                 // On `?` failure here, `scp` (and its still-armed `app_guard`) is
                 // dropped, so the guard retries the delete on drop. On success we
                 // disarm it below so it does not delete the app a second time.
-                commands::delete_app(&scp.cloud, scp.app_id)
+                commands::delete_app(cloud, scp.app_id)
                     .await
                     .map_err(|e| format!("Failed to delete app {}: {e}", scp.app_id))?;
                 if let Some(mut guard) = scp.app_guard.take() {
@@ -1701,6 +1756,7 @@ pub async fn run_stdio_server(args: &StdioArgs) -> anyhow::Result<()> {
             compute: None,
             acceleration: None,
             source: SourceConfig::Direct(DirectConfig::default()),
+            spicepod: None,
         }
     };
 
@@ -2429,5 +2485,57 @@ mod tests {
                 .contains("only a single partition column is supported"),
             "unexpected error: {err}"
         );
+    }
+
+    /// The bundled tuned/adaptive Mongo CDC pods must parse through
+    /// `parse_and_rename_spicepod` — the parser `load_spicepod_from_path` applies
+    /// after reading the file — have all 8 TPC-H datasets, and carry Cayenne CDC
+    /// acceleration. The pod bytes are embedded with `include_str!` so the test
+    /// covers exactly the committed files. Guards against a param key / column type /
+    /// structure that the `SpicepodDefinition` deserializer rejects.
+    #[test]
+    fn bundled_mongo_spicepods_parse() {
+        let pods: [(&str, &str); 4] = [
+            (
+                "mongo-sf10-tuned",
+                include_str!("../scenarios/pods/mongo/mongo-sf10-tuned.yaml"),
+            ),
+            (
+                "mongo-sf100-tuned",
+                include_str!("../scenarios/pods/mongo/mongo-sf100-tuned.yaml"),
+            ),
+            (
+                "mongo-sf1000-tuned",
+                include_str!("../scenarios/pods/mongo/mongo-sf1000-tuned.yaml"),
+            ),
+            (
+                "mongo-adaptive",
+                include_str!("../scenarios/pods/mongo/mongo-adaptive.yaml"),
+            ),
+        ];
+        let run_id = Uuid::nil();
+        for (name, yaml) in pods {
+            let pod = parse_and_rename_spicepod(yaml, &run_id)
+                .unwrap_or_else(|e| panic!("pod `{name}` failed to parse: {e}"));
+            assert_eq!(
+                pod.datasets.len(),
+                8,
+                "pod `{name}` should declare all 8 TPC-H datasets"
+            );
+            for ds in &pod.datasets {
+                let spicepod::component::ComponentOrReference::Component(ds) = ds else {
+                    panic!("pod `{name}` dataset must be an inline component");
+                };
+                let accel = ds.acceleration.as_ref().unwrap_or_else(|| {
+                    panic!("pod `{name}` dataset `{}` missing acceleration", ds.name)
+                });
+                assert_eq!(
+                    accel.engine.as_deref(),
+                    Some("cayenne"),
+                    "pod `{name}` dataset `{}` must use the cayenne engine",
+                    ds.name
+                );
+            }
+        }
     }
 }

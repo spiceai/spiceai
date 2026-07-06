@@ -1,0 +1,14 @@
+[package]
+name = "connector-gcs"
+edition.workspace = true
+version.workspace = true
+rust-version.workspace = true
+license-file.workspace = true
+description = "Google Cloud Storage (GCS) data connector for Spice.ai runtime"
+
+[dependencies]
+object_store = { workspace = true }
+runtime = { path = "../../runtime" }
+snafu.workspace = true
+tokio.workspace = true
+url.workspace = true

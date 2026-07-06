@@ -1231,7 +1231,27 @@ impl RefreshTask {
                 pending_commit: &mut pending_commit,
                 deferred_commits: deferred_commits.as_ref(),
             };
-            if !self.apply_burst(&mut apply_context, burst).await {
+            // Which cap closed this burst — the tuning signal for `cdc_max_coalesced_envelopes` /
+            // `cdc_max_coalesced_bytes` / `cdc_max_coalesce_age_ms`
+            let close_reason = if burst.len() >= max_burst {
+                "envelope_cap"
+            } else if carried_item.is_some() || burst_bytes >= max_burst_bytes {
+                "byte_cap"
+            } else if channel_closed {
+                "stream_end"
+            } else if self.runtime_status.is_shutdown() {
+                // The linger loop exits early on shutdown; without this arm those
+                // bursts would misreport as `age_deadline` and skew tuning signals.
+                "shutdown"
+            } else if cdc_cfg.max_coalesce_age_ms > 0 {
+                "age_deadline"
+            } else {
+                "drained"
+            };
+            if !self
+                .apply_burst(&mut apply_context, burst, close_reason)
+                .await
+            {
                 rx.close();
                 reader_handle.abort();
                 break;
@@ -1346,6 +1366,7 @@ impl RefreshTask {
         &self,
         context: &mut ApplyContext<'_>,
         burst: Vec<Result<cdc::ChangeEnvelope, cdc::StreamError>>,
+        close_reason: &'static str,
     ) -> bool {
         let burst_start = Instant::now();
         let burst_envelopes = u64::try_from(burst.len()).unwrap_or(u64::MAX);
@@ -1366,20 +1387,6 @@ impl RefreshTask {
         metrics::CDC_APPLY_BURST_BYTES
             .record(u64::try_from(burst_bytes).unwrap_or(u64::MAX), &labels);
         metrics::CDC_APPLY_BURST_ROWS_TOTAL.add(burst_rows, &labels);
-
-        // Freshest upstream commit timestamp in this burst, for the CDC
-        // replication-lag gauge. Computed here (before the burst is consumed by the
-        // apply loop below) but RECORDED only after the burst's Ok runs apply
-        // successfully — the gauge reflects APPLIED data, so a failed apply must not
-        // report artificially fresh lag. `source_commit_ts_ms` is stamped by the
-        // source connector (Postgres commit time, MongoDB change-stream cluster
-        // time, Debezium source ts); the max over the burst is the most recent.
-        // Sources that don't stamp a timestamp leave it `None`.
-        let max_commit_ts_ms = burst
-            .iter()
-            .filter_map(|item| item.as_ref().ok())
-            .filter_map(|env| env.change_batch.source_commit_ts_ms())
-            .max();
 
         // Walk the burst preserving arrival order, processing contiguous
         // runs of Ok envelopes together and Err items individually so error
@@ -1421,21 +1428,16 @@ impl RefreshTask {
                 }
             }
         }
+        tracing::debug!(
+            dataset = %context.dataset_name,
+            envelopes = burst_envelopes,
+            bytes = burst_bytes,
+            rows = burst_rows,
+            close_reason,
+            apply_ms = elapsed_ms(burst_start),
+            "Applied coalesced CDC change burst"
+        );
         metrics::CDC_APPLY_BURST_DURATION_MS.record(elapsed_ms(burst_start), &labels);
-
-        // Record CDC progress only now that the burst's Ok runs have applied (the
-        // early `return false` above skips it, so a failed apply never reports fresh
-        // progress). The raw applied-commit watermark is emitted whenever the burst
-        // carried a source timestamp; the derived lag additionally needs a readable
-        // wall clock (skipped on pre-epoch / overflow rather than reporting a
-        // misleading 0ms).
-        if let Some(max_commit_ts_ms) = max_commit_ts_ms {
-            metrics::CDC_APPLIED_COMMIT_UNIX_TIME_MS.record(max_commit_ts_ms, &labels);
-            if let Some(now_ms) = util::time::system_time_to_unix_ms(std::time::SystemTime::now()) {
-                metrics::CDC_REPLICATION_LAG_MS
-                    .record(now_ms.saturating_sub(max_commit_ts_ms).max(0), &labels);
-            }
-        }
         true
     }
 
@@ -2415,16 +2417,42 @@ impl RefreshTask {
         )?;
 
         if let Some(combined) = combined {
-            let delete_plan = self
-                .accelerator
-                .delete_from(session_state, vec![combined])
-                .await
-                .map_err(find_datafusion_root)
-                .context(crate::accelerated_table::FailedToWriteDataSnafu)?;
-            collect(delete_plan, ctx.task_ctx())
-                .await
-                .map_err(find_datafusion_root)
-                .context(crate::accelerated_table::FailedToWriteDataSnafu)?;
+            // The CDC apply loop discards the "rows affected" count. Cayenne can
+            // handle key-delete CDC batches through a count-skipping path; non-
+            // Cayenne accelerators and shapes Cayenne declines fall back to the
+            // generic `delete_from` below.
+            let handled_by_cayenne_cdc_path = {
+                #[cfg(not(windows))]
+                {
+                    if let Some(cayenne) = self.cayenne_accelerator() {
+                        cayenne
+                            .delete_from_cdc_fast(std::slice::from_ref(&combined))
+                            .await
+                            .map_err(find_datafusion_root)
+                            .context(crate::accelerated_table::FailedToWriteDataSnafu)?
+                            .is_some()
+                    } else {
+                        false
+                    }
+                }
+                #[cfg(windows)]
+                {
+                    false
+                }
+            };
+
+            if !handled_by_cayenne_cdc_path {
+                let delete_plan = self
+                    .accelerator
+                    .delete_from(session_state, vec![combined])
+                    .await
+                    .map_err(find_datafusion_root)
+                    .context(crate::accelerated_table::FailedToWriteDataSnafu)?;
+                collect(delete_plan, ctx.task_ctx())
+                    .await
+                    .map_err(find_datafusion_root)
+                    .context(crate::accelerated_table::FailedToWriteDataSnafu)?;
+            }
             wrote = true;
         }
 

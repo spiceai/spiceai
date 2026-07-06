@@ -32,7 +32,6 @@ use std::time::Duration;
 
 use arrow::array::AsArray;
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
-use data_components::cdc::{ChangeEnvelope, ChangesStream};
 use data_components::postgres_replication::{
     ReplicationMetricsCollector, ReplicationParams, ReplicationStreamInput, config,
     start_replication_stream,
@@ -49,28 +48,6 @@ fn dataset_schema() -> SchemaRef {
         Field::new("id", DataType::Int32, false),
         Field::new("name", DataType::Utf8, true),
     ]))
-}
-
-/// Read the next real change envelope, skipping idle heartbeat envelopes
-/// (zero-row, not a readiness signal) that interleave with real changes on any
-/// Postgres keepalive. The total wait is bounded by `timeout_secs` so a genuinely
-/// missing change still times out instead of looping on heartbeats forever.
-async fn next_change(
-    stream: &mut ChangesStream,
-    timeout_secs: u64,
-    what: &str,
-) -> Result<ChangeEnvelope, anyhow::Error> {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(timeout_secs);
-    loop {
-        let envelope = tokio::time::timeout_at(deadline, stream.next())
-            .await
-            .map_err(|_| anyhow::anyhow!("timed out waiting for {what}"))?
-            .ok_or_else(|| anyhow::anyhow!("stream ended waiting for {what}"))??;
-        if envelope.change_batch.record.num_rows() == 0 && !envelope.is_dataset_ready() {
-            continue;
-        }
-        return Ok(envelope);
-    }
 }
 
 fn params_for(port: u16, slot_name: &str, publication_name: &str) -> ReplicationParams {
@@ -142,7 +119,9 @@ async fn bootstrap_then_stream_changes() -> Result<(), anyhow::Error> {
     let mut stream = start_replication_stream(input);
 
     // --- 1. Bootstrap envelope: two rows, op="c" ---
-    let envelope = next_change(&mut stream, 30, "bootstrap envelope").await?;
+    let envelope = tokio::time::timeout(Duration::from_secs(30), stream.next())
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("bootstrap envelope missing"))??;
     let (committer, change_batch, is_ready) = envelope.into_parts();
     let ops = change_batch
         .record
@@ -163,7 +142,9 @@ async fn bootstrap_then_stream_changes() -> Result<(), anyhow::Error> {
         .simple_query("INSERT INTO public.repl_users VALUES (3, 'Charlie')")
         .await?;
 
-    let envelope = next_change(&mut stream, 15, "insert envelope").await?;
+    let envelope = tokio::time::timeout(Duration::from_secs(15), stream.next())
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("insert envelope missing"))??;
     let (committer, change_batch, _) = envelope.into_parts();
     let ops = change_batch
         .record
@@ -185,7 +166,9 @@ async fn bootstrap_then_stream_changes() -> Result<(), anyhow::Error> {
     source
         .simple_query("UPDATE public.repl_users SET name = 'Alicia' WHERE id = 1")
         .await?;
-    let envelope = next_change(&mut stream, 15, "update envelope").await?;
+    let envelope = tokio::time::timeout(Duration::from_secs(15), stream.next())
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("update envelope missing"))??;
     let (committer, change_batch, _) = envelope.into_parts();
     let ops = change_batch
         .record
@@ -199,7 +182,9 @@ async fn bootstrap_then_stream_changes() -> Result<(), anyhow::Error> {
     source
         .simple_query("DELETE FROM public.repl_users WHERE id = 2")
         .await?;
-    let envelope = next_change(&mut stream, 15, "delete envelope").await?;
+    let envelope = tokio::time::timeout(Duration::from_secs(15), stream.next())
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("delete envelope missing"))??;
     let (committer, change_batch, _) = envelope.into_parts();
     let ops = change_batch
         .record
@@ -231,7 +216,9 @@ async fn bootstrap_then_stream_changes() -> Result<(), anyhow::Error> {
         metrics: ReplicationMetricsCollector::new(),
     };
     let mut stream = start_replication_stream(input);
-    let envelope = next_change(&mut stream, 30, "forced resume snapshot").await?;
+    let envelope = tokio::time::timeout(Duration::from_secs(30), stream.next())
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("forced resume snapshot missing"))??;
     let (committer, change_batch, is_ready) = envelope.into_parts();
     assert_eq!(
         change_batch.record.num_rows(),
@@ -282,8 +269,12 @@ async fn two_replicas_have_independent_slots() -> Result<(), anyhow::Error> {
     // mirrors real runtime usage — otherwise confirmed_flush_lsn never
     // advances and the slot state can become inconsistent (source of flaky
     // WAL-retention / cleanup timing behavior).
-    let env_a = next_change(&mut stream_a, 30, "bootstrap a").await?;
-    let env_b = next_change(&mut stream_b, 30, "bootstrap b").await?;
+    let env_a = tokio::time::timeout(Duration::from_secs(30), stream_a.next())
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("bootstrap a missing"))??;
+    let env_b = tokio::time::timeout(Duration::from_secs(30), stream_b.next())
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("bootstrap b missing"))??;
     assert_eq!(env_a.change_batch.record.num_rows(), 2);
     assert_eq!(env_b.change_batch.record.num_rows(), 2);
     env_a.commit().await?;
@@ -294,8 +285,12 @@ async fn two_replicas_have_independent_slots() -> Result<(), anyhow::Error> {
         .simple_query("INSERT INTO public.repl_users VALUES (4, 'Derek')")
         .await?;
 
-    let live_a = next_change(&mut stream_a, 15, "live a").await?;
-    let live_b = next_change(&mut stream_b, 15, "live b").await?;
+    let live_a = tokio::time::timeout(Duration::from_secs(15), stream_a.next())
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("live a missing"))??;
+    let live_b = tokio::time::timeout(Duration::from_secs(15), stream_b.next())
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("live b missing"))??;
     assert_eq!(live_a.change_batch.record.num_rows(), 1);
     assert_eq!(live_b.change_batch.record.num_rows(), 1);
     live_a.commit().await?;

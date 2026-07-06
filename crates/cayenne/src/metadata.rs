@@ -16,8 +16,6 @@ limitations under the License.
 
 //! Data structures for Cayenne metadata.
 
-use std::num::NonZeroUsize;
-
 use arrow_schema::SchemaRef;
 use datafusion_table_providers::util::on_conflict::OnConflict;
 use serde::{Deserialize, Serialize};
@@ -34,6 +32,10 @@ pub const DEFAULT_INLINE_FLUSH_MAX_ROWS: i64 = 10_000;
 pub const DEFAULT_INLINE_FLUSH_MAX_SEGMENTS: i64 = 64;
 /// Default maximum serialized IPC bytes to keep inline before flushing to Vortex.
 pub const DEFAULT_INLINE_FLUSH_MAX_BYTES: i64 = 8 * 1_048_576;
+/// Default maximum age of buffered streaming-append data before the sink cuts
+/// the segment and publishes it (bounds ingest-to-queryable latency for
+/// long-lived insert streams).
+pub const DEFAULT_STREAM_PUBLISH_INTERVAL_MS: u64 = 10_000;
 
 /// Metadata about a table in the catalog.
 #[derive(Debug, Clone)]
@@ -652,6 +654,11 @@ impl StorageClass {
 /// Configuration for Vortex encodings to optimize compression and performance.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "VortexConfig is a flat aggregate of many independent, unrelated runtime toggles \
+              mapped 1:1 from spicepod params; grouping them into sub-structs would obscure that mapping"
+)]
 pub struct VortexConfig {
     /// Runtime-global footer metadata cache size in MB, when explicitly configured.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -715,34 +722,6 @@ pub struct VortexConfig {
     /// [`crate::provider::table::BAKE_DELETION_INDEX_TRIGGER`]).
     #[serde(default = "default_bake_deletion_index_trigger")]
     pub bake_deletion_index_trigger: usize,
-    /// Per-table threshold: number of orphan-eligible key-based deletion vectors
-    /// (count of `cayenne_delete_file` rows, NOT masked rows) that must accumulate
-    /// on a single table before its cleanup sweep runs. A key DV becomes
-    /// orphan-eligible only once **time-based retention** empties the protected
-    /// snapshot(s) it shadowed, raising the surviving-sequence floor above its
-    /// delete sequence so it shadows nothing (issue #9388). Without a retention
-    /// policy no DVs are ever orphaned and the sweep is a no-op.
-    ///
-    /// This governs ONLY the orphaned tail. The live (not-yet-orphaned) DV set —
-    /// DVs still shadowing rows in un-emptied snapshots — is bounded separately by
-    /// compaction's seq-prefix bake (see [`crate::provider::memory_account`]: "the
-    /// real bound on deletions is compaction"), not by this knob.
-    ///
-    /// `Some(20)` is the default. `None` disables cleanup entirely — no
-    /// background sweep is spawned, so the file-based DELETE path acquires no
-    /// extra locks and runs no catalog scan (the pre-feature behavior). The
-    /// `NonZeroUsize` type makes a misconfigured `0` unrepresentable; the spicepod
-    /// param (`cayenne_orphaned_dv_cleanup_min_files`) maps `0` to `None`
-    /// (disabled) and, when left unset, falls back to this default (`20`). A
-    /// larger value sweeps less often
-    /// (cheaper, but orphaned `.arrow` files linger on disk longer); a smaller
-    /// value reclaims disk sooner. Each orphaned `.arrow` file's size scales with
-    /// the number of deletions it records, so lingering disk ≈
-    /// `n_tables × threshold × avg_dv_size` (`avg_dv_size` was ~63 KiB, up to
-    /// ~870 KiB, in an SF-100 CH-benCHmark sample). The sweep is lock-free and
-    /// runs off the write path on the dedicated compaction runtime, so this only
-    /// trades sweep frequency against lingering disk — never ingest latency.
-    pub orphaned_dv_cleanup_min_files: Option<NonZeroUsize>,
     /// Number of protected snapshots that can accumulate before snapshot-maintenance
     /// compaction is eligible to run. Kept separate from `compaction_trigger_files`
     /// so small-file compaction tuning does not silently change scan amplification
@@ -813,6 +792,13 @@ pub struct VortexConfig {
         alias = "inline_memtable_max_bytes"
     )]
     pub inline_flush_max_bytes: i64,
+    /// Maximum age (ms) of buffered data in a streaming append before the sink
+    /// cuts the segment and publishes it, bounding ingest-to-queryable latency
+    /// for long-lived insert streams (e.g. ADBC bulk ingest). Each segment is a
+    /// complete prepare→stage→publish write. Set to 0 to disable and publish
+    /// only when the stream ends (pre-feature behavior).
+    #[serde(default = "default_stream_publish_interval_ms")]
+    pub stream_publish_interval_ms: u64,
     /// Whether inserts should scan existing data for primary-key conflicts. Set to `none` only
     /// when the source enforces PK uniqueness and ingestion cannot replay existing rows.
     #[serde(default)]
@@ -893,6 +879,24 @@ pub struct VortexConfig {
     /// to 1 s.
     #[serde(default = "default_cdc_mem_tier_checkpoint_interval_ms")]
     pub cdc_mem_tier_checkpoint_interval_ms: u64,
+    /// Max wall-clock milliseconds the ACTIVE ingestion piece may age before a
+    /// **seal** durably shadows it and advances the source replication slot, in
+    /// `cdc_durability: memory` mode only. This is the fresh-durability cadence
+    /// that DECOUPLES the slot ack (and thus replication/freshness lag) from the
+    /// heavy protected-snapshot checkpoint: a seal writes the un-sealed RAM delta
+    /// to the durable-but-unpublished inline corpus (one metastore commit, no
+    /// Vortex encode, no listing-fence publish, no read-amp) and fires the slot
+    /// advancer, so the slot advances every ~`seal_age_ms` instead of every
+    /// `max_age_ms`/`min_flush_bytes` checkpoint. Reads are unaffected — they
+    /// already union the RAM tier; the shadow is invisible in-process and is only
+    /// replayed on crash recovery. Bounds replication lag WITHOUT the read-amp of a
+    /// faster full checkpoint. `0` disables sealing (slot ack reverts to the
+    /// checkpoint cadence — the pre-seal behavior). Defaults to 2 s so replication
+    /// freshness stays under ~3 s. Should be `<= cdc_mem_tier_max_age_ms` to have
+    /// any effect (a seal older than the checkpoint window is superseded by the
+    /// checkpoint's own slot advance).
+    #[serde(default = "default_cdc_mem_tier_seal_age_ms")]
+    pub cdc_mem_tier_seal_age_ms: u64,
     /// Enable the closed-loop dynamic auto-tuner (see `provider::tuning`). Set by
     /// the `cayenne_tuning` mode: `auto` (default) → `false` (static derivation
     /// only); `adaptive` → `true` (static warm-start + the closed loop). When on,
@@ -994,6 +998,26 @@ pub struct VortexConfig {
     /// with `cayenne_force_view_types: true`).
     #[serde(skip)]
     pub force_view_read_schema: bool,
+
+    /// End-to-end integrity checksums for durability surfaces (staging-WAL
+    /// records and Vortex data files). When enabled:
+    ///
+    /// * Each staging-WAL record is written with a checksum envelope, and a
+    ///   record that fails its checksum on recovery is *detected and discarded*
+    ///   (converging to the last committed snapshot) rather than parsed as
+    ///   garbage or replayed with corrupted move instructions.
+    /// * A digest is computed for each published Vortex data file and stored in
+    ///   the manifest, then verified before the file is first scanned; a
+    ///   mismatch fails the read as a *detected fault* instead of returning
+    ///   silently-wrong rows.
+    ///
+    /// Runtime-configurable: the accelerator factory sets it (default off; opt
+    /// in with `cayenne_integrity_checksums: true`). Off is byte-identical to
+    /// the pre-feature on-disk format and adds no read/write overhead. Reads
+    /// always accept both framed and legacy pre-feature WAL records regardless
+    /// of this flag, so toggling it (or downgrading) never orphans a WAL.
+    #[serde(skip)]
+    pub integrity_checksums: bool,
 
     // ---- Cold object-store tier (storage-cascade bottom tier; cascade model) ----
     /// Absolute object-store URL prefix for the cold tier (e.g.
@@ -1134,6 +1158,10 @@ fn default_inline_flush_max_bytes() -> i64 {
     DEFAULT_INLINE_FLUSH_MAX_BYTES
 }
 
+fn default_stream_publish_interval_ms() -> u64 {
+    DEFAULT_STREAM_PUBLISH_INTERVAL_MS
+}
+
 /// Default per-table RAM-tier byte cap for `cdc_durability: memory` (256 MiB —
 /// the serde/engine floor; the accelerator's auto-tune derives a memory-scaled
 /// value of ~1/64 of host RAM clamped to 256 MiB–1 GiB when the param is unset,
@@ -1205,6 +1233,18 @@ fn default_cdc_mem_tier_max_age_ms() -> u64 {
 /// bound hot tables).
 fn default_cdc_mem_tier_checkpoint_interval_ms() -> u64 {
     1_000
+}
+
+/// Default seal cadence for `cdc_durability: memory` (2 s). A seal durably
+/// shadows the un-sealed RAM delta into the unpublished inline corpus and
+/// advances the source slot WITHOUT a full protected-snapshot checkpoint, so
+/// replication/freshness lag is bounded by this (not by `max_age_ms` /
+/// `min_flush_bytes`). 2 s keeps freshness under ~3 s while amortizing the
+/// per-seal metastore commit. Set to 0 to disable sealing (slot ack reverts to
+/// the checkpoint cadence). Like the age cap, this is a time-domain durability
+/// policy bound and is deliberately NOT hardware-derived.
+fn default_cdc_mem_tier_seal_age_ms() -> u64 {
+    2_000
 }
 
 impl VortexConfig {
@@ -1296,12 +1336,6 @@ impl Default for VortexConfig {
             write_concurrency: None,
             compaction_trigger_files: default_compaction_trigger_files(),
             bake_deletion_index_trigger: default_bake_deletion_index_trigger(),
-            // Orphaned-DV cleanup enabled by default at a per-table threshold of 20
-            // (retention-only: a no-op until time-based retention orphans DVs; the
-            // sweep is lock-free/off-path, so enabling it does not affect ingest —
-            // validated no-regression on CH-benCHmark SF-1000). Set the spicepod
-            // param `cayenne_orphaned_dv_cleanup_min_files` to `0` to disable.
-            orphaned_dv_cleanup_min_files: NonZeroUsize::new(20),
             compaction_trigger_protected_snapshots: default_compaction_trigger_protected_snapshots(
             ),
             compaction_trigger_snapshot_age_ms: default_compaction_trigger_snapshot_age_ms(),
@@ -1314,6 +1348,7 @@ impl Default for VortexConfig {
             inline_flush_max_rows: default_inline_flush_max_rows(),
             inline_flush_max_segments: default_inline_flush_max_segments(),
             inline_flush_max_bytes: default_inline_flush_max_bytes(),
+            stream_publish_interval_ms: default_stream_publish_interval_ms(),
             pk_conflict_detection: PkConflictDetection::default(),
             pk_keyset_cache_mb: None,
             deletion_mode: DeletionMode::default(),
@@ -1323,6 +1358,7 @@ impl Default for VortexConfig {
             cdc_mem_tier_max_age_ms: default_cdc_mem_tier_max_age_ms(),
             cdc_mem_tier_min_flush_bytes: default_cdc_mem_tier_min_flush_bytes(),
             cdc_mem_tier_checkpoint_interval_ms: default_cdc_mem_tier_checkpoint_interval_ms(),
+            cdc_mem_tier_seal_age_ms: default_cdc_mem_tier_seal_age_ms(),
             dynamic_tuning: false,
             pinned_tuning_actuators: PinnedTuningActuators::default(),
             // Directory listing stays the scan's file source by default; the
@@ -1339,6 +1375,7 @@ impl Default for VortexConfig {
             data_storage_write_mbps: None,
             metastore_storage_write_mbps: None,
             force_view_read_schema: false,
+            integrity_checksums: false,
             cold_tier_location: None,
             cold_clustering_columns: Vec::new(),
             cold_target_file_size_mb: 512,
@@ -1414,6 +1451,16 @@ mod tests {
         assert!(
             config.cdc_mem_tier_checkpoint_interval_ms > 0,
             "cdc_mem_tier_checkpoint_interval_ms must default non-zero so the periodic task runs"
+        );
+        assert!(
+            config.cdc_mem_tier_seal_age_ms > 0,
+            "cdc_mem_tier_seal_age_ms must default non-zero so sealing (fast durable slot \
+             advance) is ON by default — the feature must not be gated behind an opt-in flag"
+        );
+        assert!(
+            config.cdc_mem_tier_seal_age_ms <= config.cdc_mem_tier_max_age_ms,
+            "the seal cadence must default at or below the checkpoint age cap, or seals never \
+             fire before the checkpoint supersedes them"
         );
 
         let from_empty: VortexConfig = serde_json::from_str("{}").expect("valid empty config");
@@ -1601,6 +1648,13 @@ pub struct SnapshotFile {
     pub min_sequence: i64,
     /// Inclusive maximum commit sequence of the rows in this file.
     pub max_sequence: i64,
+    /// Optional end-to-end integrity digest of the file's bytes, self-describing
+    /// as `"<algorithm>:<lowercase-hex>"` (e.g. `"xxh3-128:1a2b…"`). `None` when
+    /// integrity checksums were disabled at flush (or for rows written before
+    /// the feature). Computed once at publish and verified before first read
+    /// when `integrity_checksums` is enabled. See
+    /// [`crate::provider::file_digest`].
+    pub digest: Option<String>,
 }
 
 /// One row of the cold-tier object-store manifest (`cayenne_cold_tier_file`).
@@ -1666,6 +1720,17 @@ pub struct TableStatistics {
     /// the sum of every insert ever made. Compaction and overwrite reset it to
     /// the authoritative rewritten count.
     pub num_rows: i64,
+    /// Whether [`Self::num_rows`] is a provably-exact live count (`true`) or a
+    /// best-effort estimate that may over-count (`false`).
+    ///
+    /// The mem-tier checkpoint applies a `Delta` whose durable-supersede netting
+    /// is best-effort, so it taints this to `false`; a full-rewrite compaction /
+    /// overwrite `Set`s an authoritative count and restores `true`. Consumers that
+    /// answer `COUNT(*)` from statistics (the `stats_aggregate` fold and the
+    /// distributed executor-statistics reporter) must treat a `false` count as
+    /// `Precision::Inexact`, so the fold declines and a real scan answers instead
+    /// — preventing a drifted count from producing a wrong `COUNT(*)`.
+    pub num_rows_exact: bool,
     /// Serialized per-column NDV (distinct-count) `HyperLogLog` sketches
     /// ([`crate::hll::NdvSketches`]), `None` when no NDV-tracked column has a
     /// sketch. Merged across writes register-wise; used to size distributed

@@ -55,17 +55,40 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use arrow::array::{Int64Array, RecordBatch};
 use arrow::datatypes::{DataType, Field, Schema};
-use cayenne::metadata::{CreateTableOptions, DeletionMode, VortexConfig};
-use cayenne::{CayenneTableProvider, CayenneTableProviderBuilder, MetadataCatalog};
+use cayenne::metadata::{CdcDurability, CreateTableOptions, DeletionMode, VortexConfig};
+use cayenne::{CayenneTableProvider, CayenneTableProviderBuilder, MetadataCatalog, SlotAdvancer};
 use common::{BackendType, TestFixture};
 use datafusion::datasource::TableProvider;
 use datafusion::datasource::memory::MemorySourceConfig;
+use datafusion::execution::SendableRecordBatchStream;
 use datafusion::execution::context::SessionContext;
+use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::prelude::{Expr, col, lit};
 use datafusion_expr::dml::InsertOp;
 use datafusion_table_providers::util::{
     column_reference::ColumnReference, on_conflict::OnConflict,
 };
+
+/// Slot advancer that arms `cdc_durability: memory` deferral in tests (the
+/// runtime installs the real one on the first replayable committer). Without it
+/// `is_cdc_memory_mode() && has_slot_advancer()` is false and mem-mode CDC writes
+/// fall back to the durable path — so the mem-tier + checkpoint path under test
+/// never runs.
+struct NoopSlotAdvancer;
+#[async_trait::async_trait]
+impl SlotAdvancer for NoopSlotAdvancer {
+    async fn on_checkpoint_durable(&self, _durable_epoch: u64) {}
+}
+
+/// Whether a workload drives writes through the durable path (`insert_batch` /
+/// `delete_from`) or the in-memory CDC tier (`write_cdc_append_stream` /
+/// `write_cdc_delete_keys_in_memory` + periodic `checkpoint_mem_tier`). Memory
+/// requires key-based deletion (`is_cdc_memory_mode` excludes position deletes).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Durability {
+    File,
+    Memory,
+}
 
 type TestResult<T> = Result<T, Box<dyn std::error::Error>>;
 type Model = BTreeMap<i64, i64>;
@@ -143,6 +166,9 @@ struct OpWeights {
 #[derive(Clone, Copy)]
 struct Workload {
     mode: Mode,
+    /// Durable insert path vs in-memory CDC tier + checkpoint. `Memory` is only
+    /// valid with [`Mode::Key`] (mem mode excludes position deletes).
+    durability: Durability,
     concurrency: Concurrency,
     weights: OpWeights,
     /// Initial seeded rows (and the key-space upper bound for random keys).
@@ -169,12 +195,16 @@ fn schema() -> Arc<Schema> {
     ]))
 }
 
-fn config(mode: Mode, pk_keyset_cache_mb: Option<usize>) -> VortexConfig {
+fn config(mode: Mode, durability: Durability, pk_keyset_cache_mb: Option<usize>) -> VortexConfig {
     let base = VortexConfig {
         target_vortex_file_size_mb: 1,
         compaction_trigger_files: 4,
         compaction_background_interval_ms: 0,
         inline_max_rows: 0,
+        cdc_durability: match durability {
+            Durability::File => CdcDurability::File,
+            Durability::Memory => CdcDurability::Memory,
+        },
         // `Some(0)` forces the over-budget bloom existence-filter path for upsert
         // conflict detection (instead of the exact PK keyset); `None` keeps the
         // default exact index. Lets one harness fuzz both existence paths.
@@ -194,6 +224,7 @@ async fn create_table(
     fixture: &TestFixture,
     name: &str,
     mode: Mode,
+    durability: Durability,
     pk_keyset_cache_mb: Option<usize>,
 ) -> TestResult<(Arc<CayenneTableProvider>, SessionContext)> {
     let opts = CreateTableOptions {
@@ -205,13 +236,23 @@ async fn create_table(
         ]))),
         base_path: fixture.data_path.to_string_lossy().to_string(),
         partition_column: None,
-        vortex_config: config(mode, pk_keyset_cache_mb),
+        vortex_config: config(mode, durability, pk_keyset_cache_mb),
     };
     let catalog: Arc<dyn MetadataCatalog> =
         Arc::clone(&fixture.catalog) as Arc<dyn MetadataCatalog>;
     let ctx = SessionContext::new();
     let table =
         Arc::new(CayenneTableProvider::create_table(catalog, opts, ctx.runtime_env()).await?);
+    if durability == Durability::Memory {
+        // Arm mem-mode deferral (the runtime does this on the first replayable
+        // committer); without it mem-mode CDC writes take the durable path.
+        assert!(
+            table.is_cdc_memory_mode(),
+            "Memory durability requires an is_cdc_memory_mode-eligible table (Key mode, \
+             non-partitioned); got mode={mode:?}"
+        );
+        table.install_slot_advancer(Arc::new(NoopSlotAdvancer));
+    }
     ctx.register_table(name, Arc::clone(&table) as Arc<dyn TableProvider>)?;
     Ok((table, ctx))
 }
@@ -245,15 +286,87 @@ fn rows_to_batch(rows: &[(i64, i64)]) -> RecordBatch {
     .expect("valid batch")
 }
 
-async fn upsert(table: &Arc<CayenneTableProvider>, rows: &[(i64, i64)]) -> TestResult<()> {
-    common::insert_batch(table.as_ref(), rows_to_batch(rows)).await?;
+/// Single-column `id` batch for the in-memory CDC delete path.
+fn id_batch(keys: &[i64]) -> RecordBatch {
+    let id_schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+    RecordBatch::try_new(id_schema, vec![Arc::new(Int64Array::from(keys.to_vec()))])
+        .expect("valid id batch")
+}
+
+fn batch_to_stream(batch: RecordBatch) -> SendableRecordBatchStream {
+    let schema = batch.schema();
+    Box::pin(RecordBatchStreamAdapter::new(
+        schema,
+        futures::stream::iter([Ok(batch)]),
+    ))
+}
+
+async fn upsert(
+    table: &Arc<CayenneTableProvider>,
+    rows: &[(i64, i64)],
+    durability: Durability,
+) -> TestResult<()> {
+    match durability {
+        Durability::File => {
+            common::insert_batch(table.as_ref(), rows_to_batch(rows)).await?;
+        }
+        Durability::Memory => {
+            let ctx = SessionContext::new();
+            let write = table
+                .write_cdc_append_stream(batch_to_stream(rows_to_batch(rows)), &ctx.task_ctx())
+                .await?;
+            // Memory-mode appends publish through the RAM tier synchronously; a
+            // spill fallback (byte-cap breach) instead stages and needs finalize.
+            if write.has_pending_finalize() {
+                write.finish().await?;
+            }
+        }
+    }
     Ok(())
 }
 
-async fn delete(table: &Arc<CayenneTableProvider>, filter: Expr) -> TestResult<()> {
+/// Delete a single key. File uses the durable `DELETE`; memory uses the in-RAM
+/// CDC delete path (`write_cdc_delete_keys_in_memory`).
+async fn delete_key(
+    table: &Arc<CayenneTableProvider>,
+    key: i64,
+    durability: Durability,
+) -> TestResult<()> {
+    match durability {
+        Durability::File => delete_filter(table, col("id").eq(lit(key))).await?,
+        Durability::Memory => {
+            table
+                .write_cdc_delete_keys_in_memory(&id_batch(&[key]))
+                .await?;
+        }
+    }
+    Ok(())
+}
+
+async fn delete_filter(table: &Arc<CayenneTableProvider>, filter: Expr) -> TestResult<()> {
     let ctx = SessionContext::new();
     let plan = table.delete_from(&ctx.state(), vec![filter]).await?;
     datafusion_physical_plan::collect(plan, ctx.task_ctx()).await?;
+    Ok(())
+}
+
+/// Delete every live key. File uses `DELETE WHERE true`; memory deletes the
+/// supplied live keyset through the in-RAM CDC delete path.
+async fn delete_all(
+    table: &Arc<CayenneTableProvider>,
+    live_keys: &[i64],
+    durability: Durability,
+) -> TestResult<()> {
+    match durability {
+        Durability::File => delete_filter(table, lit(true)).await?,
+        Durability::Memory => {
+            if !live_keys.is_empty() {
+                table
+                    .write_cdc_delete_keys_in_memory(&id_batch(live_keys))
+                    .await?;
+            }
+        }
+    }
     Ok(())
 }
 
@@ -264,6 +377,21 @@ async fn overwrite(table: &Arc<CayenneTableProvider>, rows: &[(i64, i64)]) -> Te
         .insert_into(&ctx.state(), exec, InsertOp::Overwrite)
         .await?;
     datafusion_physical_plan::collect(plan, ctx.task_ctx()).await?;
+    Ok(())
+}
+
+/// One "settle" pass. File compacts small files; memory additionally checkpoints
+/// the RAM tier to durable Vortex files and bakes the seq-prefix (the exact
+/// intersection — mem-tier checkpoint + bake — that surfaced the COUNT(*) drift).
+async fn settle(table: &Arc<CayenneTableProvider>, durability: Durability) -> TestResult<()> {
+    // Drain debounced post-write maintenance so the persisted stats (the maintained
+    // `num_rows` delta) reflect every committed write before we read/compact.
+    table.flush_pending_maintenance().await?;
+    if durability == Durability::Memory {
+        table.checkpoint_mem_tier().await?;
+        let _ = table.bake_seq_prefix_protected_snapshots().await?;
+    }
+    table.maybe_compact_small_files().await?;
     Ok(())
 }
 
@@ -349,6 +477,7 @@ async fn scalar_i64(ctx: &SessionContext, sql: &str) -> TestResult<i64> {
 /// `SUM(value)` while the deduplicated id→value map still looks right.
 async fn verify_aggregate_queries(
     ctx: &SessionContext,
+    provider: &CayenneTableProvider,
     name: &str,
     model: &Model,
     key_space: i64,
@@ -363,6 +492,25 @@ async fn verify_aggregate_queries(
         i64::try_from(model.len()).expect("model len fits i64"),
         "{ctx_msg}: COUNT(*) mismatch"
     );
+
+    // Maintained-count exactness invariant (the distributed-gate contract): the
+    // count `local_executor_table_statistics` reports to the coordinator — and
+    // that the coordinator folds `COUNT(*)` on ONLY when Exact — must never be
+    // `Exact`-and-wrong. If it is `Exact(n)`, n must equal the live row count; a
+    // drifted count must instead be served `Inexact` (so the fold declines). This
+    // is what catches "drift served Exact" defects the plain `COUNT(*)` query
+    // (which single-node answers from footer sums) can miss.
+    if let Some(stats) = provider.optimizer_table_statistics()
+        && let datafusion::common::stats::Precision::Exact(n) = stats.num_rows
+    {
+        assert_eq!(
+            n,
+            model.len(),
+            "{ctx_msg}: maintained num_rows served Exact({n}) but {} rows are live — a drifted \
+             count must be served Inexact so the distributed COUNT(*) fold declines",
+            model.len(),
+        );
+    }
 
     // SUM over all values — sensitive to duplicates and wrong values that a
     // per-key compare might not surface if the dup carries the same key.
@@ -495,8 +643,9 @@ fn apply_model(model: &mut Model, op: &Op) {
 // ============================================================================
 
 async fn run_sequential(fixture: &TestFixture, w: &Workload, seed: u64) -> TestResult<()> {
-    let name = format!("seq_{:?}_{seed}", w.mode);
-    let (mut table, mut ctx) = create_table(fixture, &name, w.mode, w.pk_keyset_cache_mb).await?;
+    let name = format!("seq_{:?}_{:?}_{seed}", w.mode, w.durability);
+    let (mut table, mut ctx) =
+        create_table(fixture, &name, w.mode, w.durability, w.pk_keyset_cache_mb).await?;
     let mut rng = Rng::new(seed);
     let mut model = Model::new();
     let mut history: Vec<Op> = Vec::with_capacity(w.ops);
@@ -505,17 +654,37 @@ async fn run_sequential(fixture: &TestFixture, w: &Workload, seed: u64) -> TestR
         let op = gen_op(&mut rng, &w.weights, w.population, w.batch_size);
         history.push(op.clone());
         match &op {
-            Op::Upsert { rows } => upsert(&table, rows).await?,
-            Op::Delete { key } => delete(&table, col("id").eq(lit(*key))).await?,
-            Op::DeleteAll => delete(&table, lit(true)).await?,
+            Op::Upsert { rows } => upsert(&table, rows, w.durability).await?,
+            Op::Delete { key } => delete_key(&table, *key, w.durability).await?,
+            Op::DeleteAll => {
+                // Pre-op live keys (memory deletes them by key; file uses WHERE true).
+                let live_keys: Vec<i64> = model.keys().copied().collect();
+                delete_all(&table, &live_keys, w.durability).await?;
+            }
             Op::Overwrite { rows } => overwrite(&table, rows).await?,
             Op::Compact => {
-                table.maybe_compact_small_files().await?;
+                settle(&table, w.durability).await?;
             }
             Op::Restart => {
+                // A clean restart, not a crash. For memory durability checkpoint the
+                // RAM tier first so no un-acked mem rows are lost (the model expects
+                // every applied op). Then DRAIN this instance's detached maintenance:
+                // a real crash would kill it, and an in-process reopen must drain it
+                // or the old instance's compaction can commit against the shared
+                // catalog concurrently with the reopened provider (distinct
+                // `compaction_lock`s), corrupting the protected-snapshot set. See
+                // `drain_in_flight_maintenance`.
+                if w.durability == Durability::Memory {
+                    table.checkpoint_mem_tier().await?;
+                }
+                table.drain_in_flight_maintenance().await?;
                 let (t, c) = reopen_table(fixture, &name).await?;
                 table = t;
                 ctx = c;
+                // Re-arm mem-mode deferral on the fresh provider instance.
+                if w.durability == Durability::Memory {
+                    table.install_slot_advancer(Arc::new(NoopSlotAdvancer));
+                }
             }
         }
         apply_model(&mut model, &op);
@@ -524,34 +693,39 @@ async fn run_sequential(fixture: &TestFixture, w: &Workload, seed: u64) -> TestR
             &live,
             &model,
             &format!(
-                "seq diverged after step {step} ({op:?}) mode={:?} seed={seed}\nhistory={history:?}",
-                w.mode
+                "seq diverged after step {step} ({op:?}) mode={:?} durability={:?} seed={seed}\nhistory={history:?}",
+                w.mode, w.durability,
             ),
         );
     }
 
-    table.maybe_compact_small_files().await?;
-    let (_t, c) = reopen_table(fixture, &name).await?;
+    // Final settle (memory: checkpoint RAM + bake; both: compact) so the reopened
+    // state is durable, then drain this instance's in-flight detached maintenance
+    // before reopening from the catalog (see the loop's Op::Restart).
+    settle(&table, w.durability).await?;
+    table.drain_in_flight_maintenance().await?;
+    let (t, c) = reopen_table(fixture, &name).await?;
     let final_state = read_rows(&c, &name).await?;
     let msg = format!(
-        "seq final compact+restart diverged mode={:?} seed={seed}\nhistory={history:?}",
-        w.mode
+        "seq final compact+restart diverged mode={:?} durability={:?} seed={seed}\nhistory={history:?}",
+        w.mode, w.durability,
     );
     assert_converged(&final_state, &model, &msg);
-    verify_aggregate_queries(&c, &name, &model, w.population, &msg).await?;
+    verify_aggregate_queries(&c, t.as_ref(), &name, &model, w.population, &msg).await?;
     Ok(())
 }
 
 async fn run_concurrent(fixture: &TestFixture, w: &Workload, seed: u64) -> TestResult<()> {
-    let name = format!("conc_{:?}_{seed}", w.mode);
-    let (table0, ctx0) = create_table(fixture, &name, w.mode, w.pk_keyset_cache_mb).await?;
+    let name = format!("conc_{:?}_{:?}_{seed}", w.mode, w.durability);
+    let (table0, ctx0) =
+        create_table(fixture, &name, w.mode, w.durability, w.pk_keyset_cache_mb).await?;
     let mut rng = Rng::new(seed);
 
     for start in (0..w.population).step_by(20) {
         let rows: Vec<(i64, i64)> = (start..(start + 20).min(w.population))
             .map(|k| (k, k * 10))
             .collect();
-        upsert(&table0, &rows).await?;
+        upsert(&table0, &rows, w.durability).await?;
     }
     let mut model: Model = (0..w.population).map(|k| (k, k * 10)).collect();
 
@@ -572,13 +746,16 @@ async fn run_concurrent(fixture: &TestFixture, w: &Workload, seed: u64) -> TestR
     let stop = Arc::new(AtomicBool::new(false));
     let bg_handle = Arc::clone(&handle);
     let bg_stop = Arc::clone(&stop);
+    let bg_durability = w.durability;
     let compactor = tokio::spawn(async move {
         while !bg_stop.load(Ordering::Relaxed) {
             {
                 // Hold the read lock across the pass so a concurrent restart
                 // (write lock) waits for it instead of swapping mid-compaction.
+                // For memory this also checkpoints the RAM tier + bakes — the
+                // background CDC checkpointer racing foreground mem-tier appends.
                 let t = bg_handle.read().await;
-                let _ = t.maybe_compact_small_files().await;
+                let _ = settle(&t, bg_durability).await;
             }
             tokio::task::yield_now().await;
         }
@@ -591,15 +768,16 @@ async fn run_concurrent(fixture: &TestFixture, w: &Workload, seed: u64) -> TestR
         match &op {
             Op::Upsert { rows } => {
                 let t = handle.read().await;
-                upsert(&t, rows).await?;
+                upsert(&t, rows, w.durability).await?;
             }
             Op::Delete { key } => {
                 let t = handle.read().await;
-                delete(&t, col("id").eq(lit(*key))).await?;
+                delete_key(&t, *key, w.durability).await?;
             }
             Op::DeleteAll => {
+                let live_keys: Vec<i64> = model.keys().copied().collect();
                 let t = handle.read().await;
-                delete(&t, lit(true)).await?;
+                delete_all(&t, &live_keys, w.durability).await?;
             }
             Op::Overwrite { rows } => {
                 let t = handle.read().await;
@@ -608,8 +786,23 @@ async fn run_concurrent(fixture: &TestFixture, w: &Workload, seed: u64) -> TestR
             Op::Restart => {
                 // Exclusive: waits for any in-flight compaction, then reopens
                 // from the catalog and swaps in the fresh provider + context.
+                // Drain the OLD instance's detached maintenance first so it cannot
+                // commit against the shared catalog after the reopen (its
+                // `compaction_lock` is distinct from the reopened provider's — the
+                // background compactor's read lock does NOT gate it).
                 let mut guard = handle.write().await;
+                // Clean restart: for memory durability checkpoint the RAM tier
+                // (persist un-acked mem rows), then drain this instance's detached
+                // maintenance so it cannot commit against the shared catalog after
+                // the reopen.
+                if w.durability == Durability::Memory {
+                    guard.checkpoint_mem_tier().await?;
+                }
+                guard.drain_in_flight_maintenance().await?;
                 let (nt, nc) = reopen_table(fixture, &name).await?;
+                if w.durability == Durability::Memory {
+                    nt.install_slot_advancer(Arc::new(NoopSlotAdvancer));
+                }
                 *guard = nt;
                 ctx = nc;
             }
@@ -622,15 +815,18 @@ async fn run_concurrent(fixture: &TestFixture, w: &Workload, seed: u64) -> TestR
     stop.store(true, Ordering::Relaxed);
     compactor.await.expect("compaction task joins");
     let table = Arc::clone(&*handle.read().await);
-    table.maybe_compact_small_files().await?;
+    settle(&table, w.durability).await?;
+    // Quiesce before the final assertion so no detached compaction from this (or
+    // an earlier, since-replaced) instance commits mid-read.
+    table.drain_in_flight_maintenance().await?;
 
     let live = read_rows(&ctx, &name).await?;
     let msg = format!(
-        "concurrent convergence failed mode={:?} seed={seed}",
-        w.mode
+        "concurrent convergence failed mode={:?} durability={:?} seed={seed}",
+        w.mode, w.durability,
     );
     assert_converged(&live, &model, &msg);
-    verify_aggregate_queries(&ctx, &name, &model, w.population, &msg).await?;
+    verify_aggregate_queries(&ctx, table.as_ref(), &name, &model, w.population, &msg).await?;
     Ok(())
 }
 
@@ -705,9 +901,23 @@ const CONCURRENT_UPSERT_ONLY: OpWeights = OpWeights {
     restart: 0,
 };
 
+// Memory-CDC op mix. Excludes `delete_all`/`overwrite` (durable-rewrite ops with
+// no mem-tier equivalent); `compact` (a "settle" here — checkpoint + bake +
+// compact) is weighted UP because the mem-tier drift only surfaces once rows are
+// checkpointed to durable files and the seq-prefix is baked.
+const MEMORY_MIXED: OpWeights = OpWeights {
+    upsert: 45,
+    delete: 25,
+    delete_all: 0,
+    overwrite: 0,
+    compact: 25,
+    restart: 5,
+};
+
 fn sequential(mode: Mode) -> Workload {
     Workload {
         mode,
+        durability: Durability::File,
         concurrency: Concurrency::Sequential,
         weights: SEQUENTIAL_MIXED,
         population: 6,
@@ -717,15 +927,48 @@ fn sequential(mode: Mode) -> Workload {
         pk_keyset_cache_mb: None,
     }
 }
+// Sequential memory-CDC: drives the mem-tier append + checkpoint + seq-prefix bake
+// path (Key mode only — mem mode excludes position deletes). This is the exact
+// intersection the durable-path configs never exercised, where the COUNT(*)
+// over-count lived.
+fn sequential_memory() -> Workload {
+    Workload {
+        mode: Mode::Key,
+        durability: Durability::Memory,
+        concurrency: Concurrency::Sequential,
+        weights: MEMORY_MIXED,
+        population: 8,
+        batch_size: 1,
+        ops: scaled_ops(60),
+        seeds: scaled_seeds(16),
+        pk_keyset_cache_mb: None,
+    }
+}
 fn concurrent_mixed(mode: Mode) -> Workload {
     Workload {
         mode,
+        durability: Durability::File,
         concurrency: Concurrency::ConcurrentWithCompaction,
         weights: CONCURRENT_MIXED,
         population: 300,
         batch_size: 1,
         ops: scaled_ops(250),
         seeds: scaled_seeds(16),
+        pk_keyset_cache_mb: None,
+    }
+}
+// Concurrent memory-CDC: foreground mem-tier upserts/deletes racing a background
+// checkpoint + bake loop — the concurrency profile behind the SF-1000 gate.
+fn concurrent_memory() -> Workload {
+    Workload {
+        mode: Mode::Key,
+        durability: Durability::Memory,
+        concurrency: Concurrency::ConcurrentWithCompaction,
+        weights: MEMORY_MIXED,
+        population: 32,
+        batch_size: 1,
+        ops: scaled_ops(200),
+        seeds: scaled_seeds(8),
         pk_keyset_cache_mb: None,
     }
 }
@@ -740,6 +983,7 @@ fn concurrent_mixed(mode: Mode) -> Workload {
 fn concurrent_mixed_dense(mode: Mode, pk_keyset_cache_mb: Option<usize>) -> Workload {
     Workload {
         mode,
+        durability: Durability::File,
         concurrency: Concurrency::ConcurrentWithCompaction,
         weights: CONCURRENT_MIXED,
         population: 16,
@@ -755,6 +999,7 @@ fn concurrent_mixed_dense(mode: Mode, pk_keyset_cache_mb: Option<usize>) -> Work
 fn concurrent_upsert_only(mode: Mode) -> Workload {
     Workload {
         mode,
+        durability: Durability::File,
         concurrency: Concurrency::ConcurrentWithCompaction,
         weights: CONCURRENT_UPSERT_ONLY,
         population: 300,
@@ -775,6 +1020,28 @@ async fn prop_sequential_position_impl(f: TestFixture) -> TestResult<()> {
 test_with_backends!(prop_sequential_key_impl);
 test_with_backends!(prop_sequential_position_impl);
 
+// --- Memory-CDC convergence + count-exactness (mem-tier checkpoint + bake) ---
+//
+// Drives writes through the in-RAM CDC tier (`write_cdc_append_stream` /
+// `write_cdc_delete_keys_in_memory`) with periodic checkpoint + seq-prefix bake —
+// the path the durable-path configs above never exercise. Besides row-set
+// convergence, `verify_aggregate_queries` asserts the maintained count is never
+// served `Exact`-and-wrong, guarding the distributed COUNT(*) gate against the
+// mem-tier drift.
+async fn prop_sequential_memory_impl(f: TestFixture) -> TestResult<()> {
+    run_workload(f, sequential_memory()).await
+}
+test_with_backends!(prop_sequential_memory_impl);
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn prop_concurrent_memory_sqlite() -> TestResult<()> {
+    common::run_with_backend(BackendType::Sqlite, |f| {
+        run_workload(f, concurrent_memory())
+    })
+    .await
+    .map_err(|e| -> Box<dyn std::error::Error> { e })
+}
+
 // --- Focused regression: re-upsert after overwrite+delete stays visible ---
 //
 // The minimal deterministic shape behind the sequential walks: INSERT OVERWRITE
@@ -787,11 +1054,11 @@ test_with_backends!(prop_sequential_position_impl);
 async fn reupsert_after_overwrite_delete_is_visible_impl(f: TestFixture) -> TestResult<()> {
     for mode in [Mode::Key, Mode::Position] {
         let name = format!("reupsert_min_{mode:?}");
-        let (table, ctx) = create_table(&f, &name, mode, None).await?;
+        let (table, ctx) = create_table(&f, &name, mode, Durability::File, None).await?;
 
         overwrite(&table, &[(1, 100)]).await?;
-        delete(&table, col("id").eq(lit(1))).await?;
-        upsert(&table, &[(1, 200)]).await?;
+        delete_key(&table, 1, Durability::File).await?;
+        upsert(&table, &[(1, 200)], Durability::File).await?;
 
         let live = read_rows(&ctx, &name).await?;
         assert_eq!(
@@ -895,7 +1162,7 @@ async fn prop_concurrent_mixed_dense_bloom_position_sqlite() -> TestResult<()> {
 
 async fn run_concurrent_reads_seed(fixture: &TestFixture, mode: Mode, seed: u64) -> TestResult<()> {
     let name = format!("iso_{mode:?}_{seed}");
-    let (table, ctx) = create_table(fixture, &name, mode, None).await?;
+    let (table, ctx) = create_table(fixture, &name, mode, Durability::File, None).await?;
     let mut rng = Rng::new(seed);
 
     let n: i64 = 200;

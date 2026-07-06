@@ -2637,8 +2637,8 @@ impl MetadataCatalog for CayenneCatalog {
         self.metastore
             .execute_helper(ExecuteParams {
                 sql: "INSERT OR REPLACE INTO cayenne_table_statistics \
-                      (table_id, statistics_blob, num_rows, ndv_sketches) \
-                      VALUES (?1, ?2, ?3, ?4)",
+                      (table_id, statistics_blob, num_rows, ndv_sketches, num_rows_exact) \
+                      VALUES (?1, ?2, ?3, ?4, ?5)",
                 params: vec![
                     MetastoreValue::Text(stats.table_id.clone()),
                     MetastoreValue::Blob(stats.statistics_blob.clone()),
@@ -2647,6 +2647,7 @@ impl MetadataCatalog for CayenneCatalog {
                         .ndv_sketches
                         .clone()
                         .map_or(MetastoreValue::Null, MetastoreValue::Blob),
+                    MetastoreValue::Integer(i64::from(stats.num_rows_exact)),
                 ],
             })
             .await
@@ -2658,7 +2659,7 @@ impl MetadataCatalog for CayenneCatalog {
             .query_helper(
                 QueryParams {
                     sql: r"
-                    SELECT table_id, statistics_blob, num_rows, ndv_sketches
+                    SELECT table_id, statistics_blob, num_rows, ndv_sketches, num_rows_exact
                     FROM cayenne_table_statistics
                     WHERE table_id = ?1
                     ",
@@ -2670,6 +2671,10 @@ impl MetadataCatalog for CayenneCatalog {
                         statistics_blob: row.get_blob(1)?,
                         num_rows: row.get_i64(2)?,
                         ndv_sketches: row.get_optional_blob(3)?,
+                        // Legacy rows (pre-migration backfill DEFAULT 1) read back
+                        // as exact — trusted once; the next mem-tier checkpoint
+                        // delta taints them if they have since drifted.
+                        num_rows_exact: row.get_i64(4)? != 0,
                     })
                 },
             )
@@ -2773,8 +2778,8 @@ impl MetadataCatalog for CayenneCatalog {
         self.metastore
             .execute_helper(ExecuteParams {
                 sql: "INSERT OR REPLACE INTO cayenne_snapshot_file \
-                      (table_id, snapshot_id, file_path, row_count, file_size_bytes, min_sequence, max_sequence) \
-                      VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                      (table_id, snapshot_id, file_path, row_count, file_size_bytes, min_sequence, max_sequence, digest) \
+                      VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
                 params: vec![
                     MetastoreValue::Text(file.table_id.clone()),
                     MetastoreValue::Text(file.snapshot_id.clone()),
@@ -2783,6 +2788,9 @@ impl MetadataCatalog for CayenneCatalog {
                     MetastoreValue::Integer(file.file_size_bytes),
                     MetastoreValue::Integer(file.min_sequence),
                     MetastoreValue::Integer(file.max_sequence),
+                    file.digest
+                        .clone()
+                        .map_or(MetastoreValue::Null, MetastoreValue::Text),
                 ],
             })
             .await
@@ -2797,7 +2805,7 @@ impl MetadataCatalog for CayenneCatalog {
             .query_helper(
                 QueryParams {
                     sql: r"
-                    SELECT table_id, snapshot_id, file_path, row_count, file_size_bytes, min_sequence, max_sequence
+                    SELECT table_id, snapshot_id, file_path, row_count, file_size_bytes, min_sequence, max_sequence, digest
                     FROM cayenne_snapshot_file
                     WHERE table_id = ?1 AND snapshot_id = ?2
                     ",
@@ -2815,6 +2823,7 @@ impl MetadataCatalog for CayenneCatalog {
                         file_size_bytes: row.get_i64(4)?,
                         min_sequence: row.get_i64(5)?,
                         max_sequence: row.get_i64(6)?,
+                        digest: row.get_optional_string(7)?,
                     })
                 },
             )
@@ -2826,7 +2835,7 @@ impl MetadataCatalog for CayenneCatalog {
             .query_helper(
                 QueryParams {
                     sql: r"
-                    SELECT table_id, snapshot_id, file_path, row_count, file_size_bytes, min_sequence, max_sequence
+                    SELECT table_id, snapshot_id, file_path, row_count, file_size_bytes, min_sequence, max_sequence, digest
                     FROM cayenne_snapshot_file
                     WHERE table_id = ?1
                     ",
@@ -2841,6 +2850,7 @@ impl MetadataCatalog for CayenneCatalog {
                         file_size_bytes: row.get_i64(4)?,
                         min_sequence: row.get_i64(5)?,
                         max_sequence: row.get_i64(6)?,
+                        digest: row.get_optional_string(7)?,
                     })
                 },
             )

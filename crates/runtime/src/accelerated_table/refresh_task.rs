@@ -629,40 +629,54 @@ impl RefreshTask {
 
         // For table providers with refresh skip support, check if the refresh can be skipped to
         // avoid unnecessary data fetching when the underlying data is unchanged.
+        //
+        // A one-off refresh override (a manual refresh carrying a different `refresh_sql`)
+        // deliberately materializes a subset of the source, so the "source unchanged → skip"
+        // optimization does not apply: skipping would silently drop the override and retain the
+        // previously-materialized rows (issue #11353). When an override is present, bypass the
+        // skip check and reset the provider's cached version so the *next* plain refresh
+        // re-materializes the full source instead of skipping against the narrowed data.
         if refresh.mode == RefreshMode::Full || refresh.mode == RefreshMode::Append {
             let table_provider = self.federated.table_provider().await;
 
-            match data_components::refresh_skip::should_skip_refresh_for_table_provider(
-                table_provider.as_ref(),
-            )
-            .await
-            {
-                Ok(Some(true)) => {
-                    tracing::debug!(
-                        "Skipping refresh for {} - data unchanged",
-                        self.dataset_name
-                    );
+            if refresh.override_sql_raw.is_some() {
+                data_components::refresh_skip::reset_refresh_skip_state_for_table_provider(
+                    table_provider.as_ref(),
+                )
+                .await;
+            } else {
+                match data_components::refresh_skip::should_skip_refresh_for_table_provider(
+                    table_provider.as_ref(),
+                )
+                .await
+                {
+                    Ok(Some(true)) => {
+                        tracing::debug!(
+                            "Skipping refresh for {} - data unchanged",
+                            self.dataset_name
+                        );
 
-                    for label_set in &dataset_metrics_label_sets {
-                        metrics::REFRESH_DATA_FETCHES_SKIPPED.add(1, label_set);
+                        for label_set in &dataset_metrics_label_sets {
+                            metrics::REFRESH_DATA_FETCHES_SKIPPED.add(1, label_set);
+                        }
+
+                        self.set_refresh_status(
+                            refresh.display_sql().as_deref(),
+                            status::ComponentStatus::Ready,
+                        )
+                        .await;
+                        return Ok(());
                     }
-
-                    self.set_refresh_status(
-                        refresh.display_sql().as_deref(),
-                        status::ComponentStatus::Ready,
-                    )
-                    .await;
-                    return Ok(());
-                }
-                Ok(_) => {
-                    // Data may have changed or provider does not support skipping; continue with refresh.
-                }
-                Err(e) => {
-                    tracing::debug!(
-                        "Failed to check if refresh should be skipped for {}, proceeding with refresh: {}",
-                        self.dataset_name,
-                        e
-                    );
+                    Ok(_) => {
+                        // Data may have changed or provider does not support skipping; continue with refresh.
+                    }
+                    Err(e) => {
+                        tracing::debug!(
+                            "Failed to check if refresh should be skipped for {}, proceeding with refresh: {}",
+                            self.dataset_name,
+                            e
+                        );
+                    }
                 }
             }
         }
