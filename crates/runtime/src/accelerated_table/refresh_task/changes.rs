@@ -1174,8 +1174,8 @@ impl RefreshTask {
                 if let Some(now_ms) =
                     util::time::system_time_to_unix_ms(std::time::SystemTime::now())
                 {
-                    // `saturating_sub` already floors at 0 (u64); the `max(0)` is a
-                    // belt-and-suspenders clamp for the `as f64` cast, not dead code.
+                    // `saturating_sub` guards against overflow; `.max(0)` clamps future timestamps
+                    // (clock skew / bad source clock) to 0 so we never record negative arrival lag.
                     #[expect(
                         clippy::cast_precision_loss,
                         reason = "arrival lag in ms as f64 for the histogram; sub-ms precision is irrelevant at second/minute-scale backlogs"
