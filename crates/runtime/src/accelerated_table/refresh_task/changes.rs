@@ -1028,6 +1028,11 @@ impl RefreshTask {
         // (`cdc_apply_cycle_ms`): the period between successive burst applies.
         let mut prev_recv_start: Option<Instant> = None;
         let mut carried_item: Option<Result<cdc::ChangeEnvelope, cdc::StreamError>> = None;
+        // Receipt wall-clock (unix ms) of `carried_item`, captured when it is carried so
+        // the next iteration records its arrival lag at true receipt time rather than
+        // after it waited out this burst's apply. Only read when the next burst starts
+        // from the carry; always set alongside `carried_item`.
+        let mut carried_received_ms: Option<i64> = None;
         let mut last_cycle_start = Instant::now();
         let write_ctx = SessionContext::new();
         let write_session_state = write_ctx.state();
@@ -1159,20 +1164,30 @@ impl RefreshTask {
             // Staleness of this envelope AT ARRIVAL (now − its source commit ts):
             // lag already present before the accelerator acts, separating source-side
             // lag from lag the apply path adds (`cdc_source_arrival_lag_ms`).
-            if !from_carried
-                && let Ok(env) = &first
+            if let Ok(env) = &first
                 // Exclude heartbeats: their server-clock timestamp would advance the
                 // received frontier past data not actually received mid-backlog,
                 // corrupting the rate ladder (see ChangeBatch::is_heartbeat).
                 && !env.change_batch.is_heartbeat()
                 && let Some(commit_ts_ms) = env.change_batch.source_commit_ts_ms()
             {
-                // Ingress frontier (received commit ts) is recorded once per burst in `apply_burst`
-                // using the freshest commit timestamp across the coalesced burst, so it can be
-                // compared to the applied frontier (egress) without ever appearing to lag it.
-                if let Some(now_ms) =
+                // Ingress frontier (received commit ts) is recorded once per burst in
+                // `apply_burst` using the freshest commit timestamp across the coalesced
+                // burst, so it can be compared to the applied frontier (egress) without
+                // ever appearing to lag it.
+                //
+                // Arrival lag is per-burst-first: a carried first was received on the
+                // PREVIOUS iteration, so use its captured receipt time; a fresh first is
+                // arriving now. Measuring a carried item at process time would fold this
+                // burst's apply wait into its arrival lag and — because byte-cap pressure
+                // carries an item on nearly every burst — systematically under-sample the
+                // histogram in exactly the backlogged regime the metric is meant to diagnose.
+                let received_ms = if from_carried {
+                    carried_received_ms
+                } else {
                     util::time::system_time_to_unix_ms(std::time::SystemTime::now())
-                {
+                };
+                if let Some(now_ms) = received_ms {
                     // `saturating_sub` guards against overflow; `.max(0)` clamps future timestamps
                     // (clock skew / bad source clock) to 0 so we never record negative arrival lag.
                     #[expect(
@@ -1222,6 +1237,8 @@ impl RefreshTask {
                             && burst_bytes.saturating_add(item_bytes) > max_burst_bytes
                         {
                             carried_item = Some(item);
+                            carried_received_ms =
+                                util::time::system_time_to_unix_ms(std::time::SystemTime::now());
                             break;
                         }
                         burst_bytes = burst_bytes.saturating_add(item_bytes);
@@ -1266,6 +1283,9 @@ impl RefreshTask {
                                 && burst_bytes.saturating_add(item_bytes) > max_burst_bytes
                             {
                                 carried_item = Some(item);
+                                carried_received_ms = util::time::system_time_to_unix_ms(
+                                    std::time::SystemTime::now(),
+                                );
                                 break;
                             }
                             burst_bytes = burst_bytes.saturating_add(item_bytes);
