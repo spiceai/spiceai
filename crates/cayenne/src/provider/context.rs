@@ -596,6 +596,19 @@ impl CayenneContext {
         }
     }
 
+    /// Maximum age of buffered streaming-append data before the sink cuts the
+    /// segment and publishes it. Returns `None` when disabled (interval = 0):
+    /// the sink then publishes only when the input stream ends.
+    #[must_use]
+    pub(crate) fn stream_publish_interval(&self) -> Option<std::time::Duration> {
+        let ms = self.config.stream_publish_interval_ms;
+        if ms == 0 {
+            None
+        } else {
+            Some(std::time::Duration::from_millis(ms))
+        }
+    }
+
     /// Get the shared semaphore for limiting concurrent file writes / uploads.
     #[must_use]
     pub fn upload_semaphore(&self) -> &Arc<Semaphore> {

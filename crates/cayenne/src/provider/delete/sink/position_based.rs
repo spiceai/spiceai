@@ -30,7 +30,7 @@ use super::CayenneDeletionSink;
 use crate::provider::Error;
 use crate::provider::deletion_strategy::PositionDeletionVector;
 use crate::provider::utils::convert_to_u64_box;
-use arrow::row::{OwnedRow, RowConverter};
+use crate::row_converter::{OwnedRow, RowConverter};
 use datafusion::datasource::listing::ListingTable;
 use datafusion::execution::context::SessionContext;
 use datafusion::optimizer::analyzer::type_coercion::TypeCoercionRewriter;
