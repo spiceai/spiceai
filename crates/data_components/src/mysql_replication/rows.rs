@@ -440,7 +440,15 @@ impl FieldBuilder {
             Self::UInt16(b) => b.append_value(value_to_unsigned(value, "UInt16")?),
             Self::UInt32(b) => b.append_value(value_to_unsigned(value, "UInt32")?),
             Self::UInt64(b) => b.append_value(value_to_unsigned(value, "UInt64")?),
-            Self::Float32(b) => b.append_value(value_to_f64(value)? as f32),
+            Self::Float32(b) => {
+                #[expect(
+                    clippy::cast_possible_truncation,
+                    reason = "FLOAT source columns arrive at f32 precision already; wider values \
+                              reaching a user-declared Float32 column accept the truncation"
+                )]
+                let v = value_to_f64(value)? as f32;
+                b.append_value(v);
+            }
             Self::Float64(b) => b.append_value(value_to_f64(value)?),
             Self::Date32(b) => match value_to_date32(value)? {
                 Some(days) => b.append_value(days),
@@ -566,15 +574,17 @@ fn value_to_string(value: &Value) -> Result<std::borrow::Cow<'_, str>> {
         Value::UInt(v) => Ok(Cow::Owned(v.to_string())),
         Value::Float(v) => Ok(Cow::Owned(v.to_string())),
         Value::Double(v) => Ok(Cow::Owned(v.to_string())),
-        Value::Date(y, m, d, 0, 0, 0, 0) => Ok(Cow::Owned(format!("{y:04}-{m:02}-{d:02}"))),
-        Value::Date(y, m, d, h, min, s, micro) => Ok(Cow::Owned(format!(
-            "{y:04}-{m:02}-{d:02} {h:02}:{min:02}:{s:02}.{micro:06}"
+        Value::Date(year, month, day, 0, 0, 0, 0) => {
+            Ok(Cow::Owned(format!("{year:04}-{month:02}-{day:02}")))
+        }
+        Value::Date(year, month, day, hour, minute, second, micros) => Ok(Cow::Owned(format!(
+            "{year:04}-{month:02}-{day:02} {hour:02}:{minute:02}:{second:02}.{micros:06}"
         ))),
-        Value::Time(neg, days, h, m, s, micro) => {
-            let sign = if *neg { "-" } else { "" };
-            let hours = u32::from(*h) + days * 24;
+        Value::Time(negative, days, hour, minute, second, micros) => {
+            let sign = if *negative { "-" } else { "" };
+            let hours = u32::from(*hour) + days * 24;
             Ok(Cow::Owned(format!(
-                "{sign}{hours:02}:{m:02}:{s:02}.{micro:06}"
+                "{sign}{hours:02}:{minute:02}:{second:02}.{micros:06}"
             )))
         }
         Value::NULL => unreachable!("NULL handled by append()"),
@@ -596,8 +606,8 @@ fn value_to_bool(value: &Value) -> Result<bool> {
         Value::Int(v) => Ok(*v != 0),
         Value::UInt(v) => Ok(*v != 0),
         Value::Bytes(b) => match std::str::from_utf8(b).map(str::trim) {
-            Ok("0") | Ok("false") | Ok("FALSE") => Ok(false),
-            Ok("1") | Ok("true") | Ok("TRUE") => Ok(true),
+            Ok("0" | "false" | "FALSE") => Ok(false),
+            Ok("1" | "true" | "TRUE") => Ok(true),
             _ => DecodeSnafu {
                 message: format!("cannot interpret {value:?} as boolean"),
             }
@@ -782,20 +792,22 @@ fn value_to_time_nanos(value: &Value) -> Result<i64> {
 ///   - `Value::Bytes` of a formatted datetime — defensive fallback.
 fn value_to_timestamp_micros(value: &Value) -> Result<Option<i64>> {
     match value {
-        Value::Date(y, m, d, h, min, s, micro) => {
-            let Some(date) =
-                chrono::NaiveDate::from_ymd_opt(i32::from(*y), u32::from(*m), u32::from(*d))
-            else {
+        Value::Date(year, month, day, hour, minute, second, micros) => {
+            let Some(date) = chrono::NaiveDate::from_ymd_opt(
+                i32::from(*year),
+                u32::from(*month),
+                u32::from(*day),
+            ) else {
                 return Ok(None); // zero-datetime sentinel
             };
             let time = chrono::NaiveTime::from_hms_micro_opt(
-                u32::from(*h),
-                u32::from(*min),
-                u32::from(*s),
-                *micro,
+                u32::from(*hour),
+                u32::from(*minute),
+                u32::from(*second),
+                *micros,
             )
             .ok_or_else(|| Error::Decode {
-                message: format!("invalid time component {h}:{min}:{s}.{micro}"),
+                message: format!("invalid time component {hour}:{minute}:{second}.{micros}"),
             })?;
             Ok(Some(date.and_time(time).and_utc().timestamp_micros()))
         }

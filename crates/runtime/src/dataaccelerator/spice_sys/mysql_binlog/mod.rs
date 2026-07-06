@@ -182,7 +182,7 @@ impl MySqlBinlogSys {
     }
 
     /// Convert the replication layer's u64 offset into the `BIGINT` the
-    /// sidecar stores. Positions beyond i64::MAX cannot occur (binlog files
+    /// sidecar stores. Positions beyond `i64::MAX` cannot occur (binlog files
     /// cap at 1 GiB), but clamp defensively rather than wrap.
     #[cfg_attr(
         not(any(

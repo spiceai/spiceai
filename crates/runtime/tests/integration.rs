@@ -146,9 +146,10 @@ mod utils;
 mod view;
 
 mod management;
-// MySQL is required for the rehydration tests
+// MySQL is required for the rehydration tests; the local-db verification
+// queries both duckdb- and sqlite-persisted accelerators.
 mod podswatcher;
-#[cfg(all(feature = "mysql", feature = "duckdb"))]
+#[cfg(all(feature = "mysql", feature = "duckdb", feature = "sqlite"))]
 mod rehydration;
 mod shutdown;
 

@@ -84,7 +84,10 @@ struct AckState {
 
 impl AckState {
     fn advance(&self, to: &BinlogPosition) {
-        let mut committed = self.committed.lock().unwrap_or_else(|e| e.into_inner());
+        let mut committed = self
+            .committed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         match committed.as_ref() {
             Some(current) if current >= to => {}
             _ => *committed = Some(to.clone()),
@@ -94,7 +97,7 @@ impl AckState {
     fn committed(&self) -> Option<BinlogPosition> {
         self.committed
             .lock()
-            .unwrap_or_else(|e| e.into_inner())
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone()
     }
 }
@@ -698,6 +701,10 @@ fn buffer_rows_event(
     Ok(())
 }
 
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "used as a function pointer in map_err; taking by reference would require a closure at every call site"
+)]
 fn row_io_error(e: std::io::Error) -> Error {
     Error::Decode {
         message: format!("row image parse: {e}"),
@@ -1093,7 +1100,7 @@ fn classify_statement(
                         }
                     }
                 }
-                Some("database") | Some("schema") => {
+                Some("database" | "schema") => {
                     idx += 1;
                     if word(idx).as_deref() == Some("if")
                         && word(idx + 1).as_deref() == Some("exists")

@@ -232,7 +232,7 @@ pub async fn binlog_file_exists(conn: &mut Conn, file: &str) -> Result<bool> {
 }
 
 /// `true` when the error is the server rejecting the statement syntax —
-/// i.e. `SHOW BINARY LOG STATUS` on a pre-8.2 server (ER_PARSE_ERROR).
+/// i.e. `SHOW BINARY LOG STATUS` on a pre-8.2 server (`ER_PARSE_ERROR`).
 fn is_unknown_statement(e: &mysql_async::Error) -> bool {
     matches!(e, mysql_async::Error::Server(s) if s.code == 1064)
 }

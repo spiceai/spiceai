@@ -188,8 +188,7 @@ pub fn process_nonce() -> u32 {
         let pid = std::process::id();
         let now_nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.subsec_nanos())
-            .unwrap_or(0);
+            .map_or(0, |d| d.subsec_nanos());
         fnv1a_32(&pid.to_le_bytes()) ^ now_nanos
     })
 }
