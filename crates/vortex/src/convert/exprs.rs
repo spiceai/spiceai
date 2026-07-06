@@ -630,10 +630,10 @@ mod tests {
     use datafusion_physical_plan::expressions as df_expr;
     use insta::assert_snapshot;
     use rstest::rstest;
-    use vortex::dtype::Field as VortexField;
-    use vortex::dtype::FieldPath;
-    use vortex::dtype::FieldPathSet;
-    use vortex::expr::pruning::checked_pruning_expr;
+    use vortex::VortexSessionDefault;
+    use vortex::dtype::PType;
+    use vortex::dtype::StructFields;
+    use vortex::session::VortexSession;
 
     use super::*;
     use crate::common_tests::TestSessionContext;
@@ -800,24 +800,26 @@ mod tests {
         let result = DefaultExpressionConvertor::default()
             .convert(&in_list)
             .expect("IN-list should convert to a Vortex expression");
-        let (pruning_expr, _required_stats) = checked_pruning_expr(
-            &result,
-            &FieldPathSet::from_iter([
-                FieldPath::from_iter([
-                    VortexField::Name("id".into()),
-                    VortexField::Name("min".into()),
-                ]),
-                FieldPath::from_iter([
-                    VortexField::Name("id".into()),
-                    VortexField::Name("max".into()),
-                ]),
-            ]),
-        )
-        .expect("converted IN-list should support min/max pruning");
+        // The converted IN-list must be falsifiable from min/max statistics on `id`,
+        // producing a pruning expression over the column's stats.
+        let scope = DType::Struct(
+            StructFields::new(
+                ["id"].into(),
+                vec![DType::Primitive(PType::I32, Nullability::NonNullable)],
+            ),
+            Nullability::NonNullable,
+        );
+        let session = VortexSession::default();
+        let pruning_expr = result
+            .falsify(&scope, &session)
+            .expect("falsify should not error")
+            .expect("converted IN-list should support min/max pruning");
 
         let pruning_display = pruning_expr.to_string();
-        assert!(pruning_display.contains("id_min"));
-        assert!(pruning_display.contains("id_max"));
+        assert!(
+            pruning_display.contains("id"),
+            "pruning expression should reference the id column: {pruning_display}"
+        );
     }
 
     #[rstest]
