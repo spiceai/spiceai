@@ -45,3 +45,6 @@ rstest = "0.26.1"
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["test-util", "rt-multi-thread", "fs"] }
 url = { workspace = true }
+
+[lints]
+workspace = true

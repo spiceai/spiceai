@@ -16,3 +16,6 @@ runtime = { path = "../../runtime" }
 snafu.workspace = true
 tokio.workspace = true
 tracing.workspace = true
+
+[lints]
+workspace = true

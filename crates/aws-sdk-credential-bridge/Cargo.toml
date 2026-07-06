@@ -34,3 +34,6 @@ url.workspace = true
 aws-sdk-cognitoidentity.workspace = true
 aws-sdk-cognitoidentityprovider.workspace = true
 tempfile.workspace = true
+
+[lints]
+workspace = true

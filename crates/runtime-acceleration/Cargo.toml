@@ -65,3 +65,6 @@ tempfile.workspace = true
 [[bench]]
 harness = false
 name = "snapshot_operations"
+
+[lints]
+workspace = true

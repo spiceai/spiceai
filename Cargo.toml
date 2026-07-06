@@ -102,6 +102,37 @@ repository = "https://github.com/spiceai/spiceai"
 rust-version = "1.95.0"
 version = "2.1.0-unstable"
 
+# Clippy lint levels for the workspace. Each member crate opts in with
+# `[lints]\nworkspace = true` so scoped `cargo clippy -p <crate>` and rust-analyzer
+# surface the same violations as the `make lint-rust` CI gate, at edit time.
+# `make lint-rust` re-applies these flags over `--workspace` as a backstop for any
+# crate that forgets to opt in. NOTE: `-Dwarnings` intentionally stays in the
+# Makefile only — denying it here would also fail ordinary `cargo build`/`check`.
+# Test-context exemptions (allow-expect-in-tests, thresholds) live in `clippy.toml`.
+[workspace.lints.rust]
+# `tokio_unstable` is enabled via `RUSTFLAGS="--cfg tokio_unstable"` to expose the
+# per-worker tokio RuntimeMetrics (busy/park/steal). Declare it so the otherwise-unknown
+# cfg name doesn't trip the `unexpected_cfgs` lint on builds without the flag. Declared
+# workspace-wide (via each crate's `lints.workspace = true`) rather than per-crate.
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(tokio_unstable)'] }
+
+[workspace.lints.clippy]
+# Deny the pedantic group with a lower priority so the specific opt-outs below win.
+pedantic = { level = "deny", priority = -1 }
+unwrap_used = "deny"
+expect_used = "deny"
+clone_on_ref_ptr = "deny"
+equatable_if_let = "deny"
+needless_collect = "deny"
+redundant_clone = "deny"
+todo = "deny"
+assertions_on_result_states = "deny"
+allow_attributes = "deny"
+# Pedantic members we opt out of (priority 0 overrides the group deny above).
+module_name_repetitions = "allow"
+large_futures = "allow"
+too_many_lines = "allow"
+
 [workspace.dependencies]
 adbc_core = "0.23"
 adbc_driver_manager = "0.23"

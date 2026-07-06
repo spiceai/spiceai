@@ -15,3 +15,6 @@ rmcp = { workspace = true, optional = true }
 serde_json.workspace = true
 [features]
 mcp = ["dep:rmcp"]
+
+[lints]
+workspace = true

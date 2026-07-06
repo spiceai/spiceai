@@ -17,3 +17,6 @@ quick-xml = "0.38"
 snafu.workspace = true
 tokio = { workspace = true, features = ["sync"] }
 zip = "7.2"
+
+[lints]
+workspace = true

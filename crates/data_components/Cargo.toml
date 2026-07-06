@@ -238,3 +238,6 @@ required-features = ["mongodb"]
 harness = false
 name = "kafka_decode"
 required-features = ["bench", "kafka"]
+
+[lints]
+workspace = true

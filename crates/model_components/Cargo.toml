@@ -31,3 +31,6 @@ util = { path = "../util", features = ["datafusion"] }
 [features]
 dev = []
 full = []
+
+[lints]
+workspace = true
