@@ -335,6 +335,8 @@ jobs:
         if: ${{ github.event.inputs.query_overrides == '' }}
         run: |
           [ -z "$AWS_ENDPOINT_URL" ] && unset AWS_ENDPOINT_URL
+          # Reach real AWS S3 for the s3-public federated spicepod (drop injected MinIO endpoint).
+          unset S3_ENDPOINT S3_KEY S3_SECRET
 
           rm -rf .spice/data
           INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" testoperator run bench \
@@ -413,6 +415,8 @@ jobs:
         if: ${{ github.event.inputs.query_overrides != '' }}
         run: |
           [ -z "$AWS_ENDPOINT_URL" ] && unset AWS_ENDPOINT_URL
+          # Reach real AWS S3 for the s3-public federated spicepod (drop injected MinIO endpoint).
+          unset S3_ENDPOINT S3_KEY S3_SECRET
 
           rm -rf .spice/data
           INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" testoperator run bench \
