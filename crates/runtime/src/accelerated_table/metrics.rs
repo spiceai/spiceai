@@ -188,6 +188,49 @@ pub(crate) static CDC_APPLY_FIXED_COST_MS: LazyLock<Histogram<f64>> = LazyLock::
         .build()
 });
 
+/// Bucket boundaries for the per-delete-burst key-count histogram. Resolves the
+/// sub-cap band (`< 2048`, where a burst runs as a single durable plan) from the
+/// multi-cap tail (`> 2048`, where chunking splits the burst) so the fleet can
+/// see how often bursts exceed `cdc_delete_subbatch_max`.
+const DELETE_BURST_KEYS_HISTOGRAM_BUCKETS: [f64; 11] = [
+    1.0, 8.0, 64.0, 256.0, 512.0, 1024.0, 2048.0, 4096.0, 8192.0, 16384.0, 32768.0,
+];
+
+/// Number of primary keys in one CDC Delete sub-batch ("delete burst"), recorded
+/// once per [`process_delete_batch`](super::refresh_task::changes) call regardless
+/// of whether the burst was absorbed in memory or applied durably. The
+/// distribution tells us how large delete bursts actually get — i.e. whether the
+/// `cdc_delete_subbatch_max` cap ever binds in practice.
+pub(crate) static CDC_KEYS_PER_DELETE_BURST: LazyLock<Histogram<u64>> = LazyLock::new(|| {
+    METER
+        .u64_histogram("dataset_acceleration_cdc_keys_per_delete_burst")
+        .with_description(
+            "Number of primary keys in one CDC delete sub-batch (delete burst), before any per-plan chunking.",
+        )
+        .with_unit("keys")
+        .with_boundaries(DELETE_BURST_KEYS_HISTOGRAM_BUCKETS.to_vec())
+        .build()
+});
+
+/// Count of CDC Delete sub-batches that could NOT be absorbed as in-memory
+/// tombstones (`cdc_durability: memory`, key-mode Cayenne) and fell through to a
+/// durable `delete_from`, broken down by the `reason` attribute:
+/// `no_capability` (no Cayenne mem-tier delete support — the common non-Cayenne
+/// / non-key-mode case), `no_advancer` (capable but the slot advancer is not
+/// armed), `inextractable_keys` (a delete row carried no primary key), or
+/// `budget` (the mem-tier byte budget refused the write after spill). This is
+/// the discriminator for whether the eventual composite-key absorb fix targets
+/// the right reason.
+pub(crate) static CDC_DELETE_ABSORB_FALLTHROUGH: LazyLock<Counter<u64>> = LazyLock::new(|| {
+    METER
+        .u64_counter("dataset_acceleration_cdc_delete_absorb_fallthrough_total")
+        .with_description(
+            "Count of CDC delete sub-batches that fell through the in-memory absorb path to a durable delete, by reason (no_capability|no_advancer|inextractable_keys|budget).",
+        )
+        .with_unit("bursts")
+        .build()
+});
+
 /// Time the CDC apply loop spent blocked waiting to receive the next batch from
 /// the source-reader channel (i.e. waiting on the replication-slot read + WAL
 /// decode that the reader task performs). This is the discriminator for the

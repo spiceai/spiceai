@@ -418,3 +418,7 @@ name = "flatten_json_properties"
 [[bench]]
 harness = false
 name = "cdc_cayenne_inline"
+
+[[bench]]
+harness = false
+name = "cdc_delete_burst"

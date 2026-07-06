@@ -410,6 +410,14 @@ pub struct CdcConfig {
     /// Maximum time to wait for the previous source-side commit before
     /// surfacing ingestion as stalled.
     pub commit_timeout: Duration,
+    /// Upper bound on the number of primary keys packed into a single durable
+    /// `delete_from` execution. A Delete sub-batch of `N` keyed rows is applied
+    /// as `⌈N/cap⌉` independent delete plans instead of one monolithic
+    /// predicate (a `~50k`-comparison OR-tree over 16,384 keys pegged prefetch
+    /// and triggered walsender timeouts). Chunking makes the cost linear and
+    /// interruptible; keys across chunks are distinct, so semantics are
+    /// preserved (each key deleted exactly once).
+    pub delete_subbatch_max: usize,
 }
 
 const CDC_PREFETCH_BUFFER_DEFAULT: usize = 128;
@@ -429,6 +437,13 @@ const CDC_MAX_COALESCED_BYTES_MAX: usize = 1024 * 1024 * 1024;
 const CDC_MAX_COALESCE_AGE_MS_DEFAULT: u64 = 0;
 const CDC_COMMIT_TIMEOUT_MS_DEFAULT: usize = 30_000;
 const CDC_COMMIT_TIMEOUT_MS_MAX: usize = 3_600_000;
+// A delete burst can be as large as a coalesced burst's row count, so bound the
+// per-plan key count well below that. 2,048 keeps each durable `delete_from`
+// cheap and interruptible while still amortizing plan construction; the MAX is
+// a sanity guard on operator overrides (a larger value re-approaches the
+// monolithic predicate this cap exists to avoid).
+const CDC_DELETE_SUBBATCH_MAX_DEFAULT: usize = 2_048;
+const CDC_DELETE_SUBBATCH_MAX_MAX: usize = 65_536;
 const CAYENNE_CDC_SYNCHRONOUS_FALLBACK_WARNING_KEY_LIMIT: usize = 1024;
 
 #[derive(Debug, Default)]
@@ -462,6 +477,7 @@ impl Default for CdcConfig {
             max_coalesced_bytes: CDC_MAX_COALESCED_BYTES_DEFAULT,
             max_coalesce_age_ms: CDC_MAX_COALESCE_AGE_MS_DEFAULT,
             commit_timeout: Duration::from_millis(CDC_COMMIT_TIMEOUT_MS_DEFAULT as u64),
+            delete_subbatch_max: CDC_DELETE_SUBBATCH_MAX_DEFAULT,
         }
     }
 }
@@ -663,6 +679,11 @@ fn cdc_config() -> CdcConfig {
             CDC_COMMIT_TIMEOUT_MS_DEFAULT,
             CDC_COMMIT_TIMEOUT_MS_MAX,
         ) as u64),
+        delete_subbatch_max: parse_env_usize(
+            "SPICE_CDC_DELETE_SUBBATCH_MAX",
+            CDC_DELETE_SUBBATCH_MAX_DEFAULT,
+            CDC_DELETE_SUBBATCH_MAX_MAX,
+        ),
     }
 }
 
@@ -727,6 +748,7 @@ pub(crate) const CDC_RUNTIME_PARAMS: &[&str] = &[
     "cdc_max_coalesced_bytes",
     "cdc_max_coalesce_age_ms",
     "cdc_commit_timeout_ms",
+    "cdc_delete_subbatch_max",
 ];
 
 /// Build a [`CdcConfig`] from the spicepod `runtime.params` map, reading
@@ -772,6 +794,13 @@ pub fn cdc_config_from_params(params: &std::collections::HashMap<String, String>
             CDC_COMMIT_TIMEOUT_MS_DEFAULT,
             CDC_COMMIT_TIMEOUT_MS_MAX,
         ) as u64),
+        delete_subbatch_max: resolve_cdc_param(
+            params,
+            "cdc_delete_subbatch_max",
+            "SPICE_CDC_DELETE_SUBBATCH_MAX",
+            CDC_DELETE_SUBBATCH_MAX_DEFAULT,
+            CDC_DELETE_SUBBATCH_MAX_MAX,
+        ),
     }
 }
 
@@ -827,6 +856,12 @@ pub(crate) fn cdc_config_overlay(
             usize::try_from(base.commit_timeout.as_millis()).unwrap_or(CDC_COMMIT_TIMEOUT_MS_MAX),
             CDC_COMMIT_TIMEOUT_MS_MAX,
         ) as u64),
+        delete_subbatch_max: overlay_usize(
+            dataset_params,
+            "cdc_delete_subbatch_max",
+            base.delete_subbatch_max,
+            CDC_DELETE_SUBBATCH_MAX_MAX,
+        ),
     }
 }
 
@@ -2274,6 +2309,20 @@ impl RefreshTask {
         }
     }
 
+    /// Effective per-plan delete-key cap for this dataset: the process-global
+    /// [`CdcConfig`] with any per-dataset `cdc_*` overrides layered on. Read
+    /// once per Delete sub-batch (not per row), so runtime overrides apply
+    /// without threading config through the write path. Floored at 1 so
+    /// `chunks()` never sees a zero.
+    fn cdc_delete_subbatch_max(&self) -> usize {
+        let base = cdc_config();
+        let effective = match self.cdc_param_overrides.as_ref() {
+            Some(overrides) => cdc_config_overlay(base, overrides),
+            None => base,
+        };
+        effective.delete_subbatch_max.max(1)
+    }
+
     /// Warn once per table when the CDC apply takes the synchronous fallback for
     /// a Cayenne-engine dataset — i.e. [`Self::cayenne_accelerator`] could not
     /// unwrap the inner provider through its wrappers, so pipelined finalization
@@ -2353,22 +2402,43 @@ impl RefreshTask {
     ) -> crate::accelerated_table::Result<Option<u64>> {
         let dataset_name = &self.dataset_name;
 
+        if row_indices.is_empty() {
+            return Ok(None);
+        }
+
+        // Distribution of delete-burst sizes, recorded once per sub-batch on
+        // both the absorb and durable paths so the fleet can see how large
+        // delete bursts get — i.e. whether `cdc_delete_subbatch_max` ever binds.
+        metrics::CDC_KEYS_PER_DELETE_BURST.record(
+            u64::try_from(row_indices.len()).unwrap_or(u64::MAX),
+            &[KeyValue::new("dataset", dataset_name.to_string())],
+        );
+
         // In-memory absorption: when the burst-level gate kept this burst on
         // the mem path, the slot advancer is armed and a capable Cayenne sink
         // turns the delete rows into mem-tier tombstones, deferring their
-        // durability to the covering checkpoint. `Ok(None)` from the absorb
-        // call (capability lost, inextractable keys, budget refusal after
-        // spill) falls through to the durable path below — safe in either ack
-        // mode, since durable deletes never sit ahead of the source slot.
+        // durability to the covering checkpoint. Any fall-through (capability
+        // lost, inextractable keys, budget refusal after spill) lands on the
+        // durable path below — safe in either ack mode, since durable deletes
+        // never sit ahead of the source slot — and records the reason so the
+        // eventual composite-key absorb fix can be aimed at the right cause.
         #[cfg(not(windows))]
-        if let Some(cayenne) = self.cayenne_accelerator()
-            && cayenne.supports_in_memory_cdc_deletes()
-            && cayenne.has_slot_advancer()
-            && !row_indices.is_empty()
-            && row_indices
+        let fallthrough_reason: &'static str = 'absorb: {
+            let Some(cayenne) = self.cayenne_accelerator() else {
+                break 'absorb "no_capability";
+            };
+            if !cayenne.supports_in_memory_cdc_deletes() {
+                break 'absorb "no_capability";
+            }
+            if !cayenne.has_slot_advancer() {
+                break 'absorb "no_advancer";
+            }
+            if !row_indices
                 .iter()
                 .all(|&row| !change_batch.primary_keys(row).is_empty())
-        {
+            {
+                break 'absorb "inextractable_keys";
+            }
             let selected_batch = select_rows(&change_batch.data_batch(), row_indices)?;
             let absorbed = cayenne
                 .write_cdc_delete_keys_in_memory(&selected_batch)
@@ -2386,7 +2456,25 @@ impl RefreshTask {
                 self.update_last_updated_at();
                 return Ok(Some(epoch));
             }
-        }
+            // Gate passed but the sink declined the RAM write. In practice this
+            // is the mem-tier byte budget refusing after a spill attempt; a
+            // deeper key-extraction miss (all rows carried PKs at this layer) is
+            // far rarer, so attribute the fall-through to `budget`.
+            "budget"
+        };
+
+        // On Windows the in-memory absorb path is compiled out entirely, so
+        // every delete is durable — attribute it to the missing capability.
+        #[cfg(windows)]
+        let fallthrough_reason: &'static str = "no_capability";
+
+        metrics::CDC_DELETE_ABSORB_FALLTHROUGH.add(
+            1,
+            &[
+                KeyValue::new("dataset", dataset_name.to_string()),
+                KeyValue::new("reason", fallthrough_reason),
+            ],
+        );
 
         let (keyless_rows, keyed_rows): (Vec<_>, Vec<_>) = row_indices
             .iter()
@@ -2410,24 +2498,34 @@ impl RefreshTask {
             }
         }
 
-        let combined = build_batch_delete_expr_from_change_batch(
-            change_batch,
-            &keyed_rows,
-            dataset_name.to_string().as_str(),
-        )?;
+        // Cap the number of keys per durable `delete_from`: a burst of N keyed
+        // rows becomes ⌈N/cap⌉ independent, interruptible plans instead of one
+        // monolithic OR-tree predicate (the ~89s / ~50k-comparison execution
+        // that pegged prefetch and tripped walsender timeouts). The keys across
+        // chunks are distinct PKs, so each is deleted exactly once and
+        // cross-chunk ordering is not load-bearing; all chunks run under the
+        // single `_lock_guard` held for this call, so the burst stays isolated.
+        let cap = self.cdc_delete_subbatch_max();
+        for chunk in keyed_rows.chunks(cap) {
+            let combined = build_batch_delete_expr_from_change_batch(
+                change_batch,
+                chunk,
+                dataset_name.to_string().as_str(),
+            )?;
 
-        if let Some(combined) = combined {
-            let delete_plan = self
-                .accelerator
-                .delete_from(session_state, vec![combined])
-                .await
-                .map_err(find_datafusion_root)
-                .context(crate::accelerated_table::FailedToWriteDataSnafu)?;
-            collect(delete_plan, ctx.task_ctx())
-                .await
-                .map_err(find_datafusion_root)
-                .context(crate::accelerated_table::FailedToWriteDataSnafu)?;
-            wrote = true;
+            if let Some(combined) = combined {
+                let delete_plan = self
+                    .accelerator
+                    .delete_from(session_state, vec![combined])
+                    .await
+                    .map_err(find_datafusion_root)
+                    .context(crate::accelerated_table::FailedToWriteDataSnafu)?;
+                collect(delete_plan, ctx.task_ctx())
+                    .await
+                    .map_err(find_datafusion_root)
+                    .context(crate::accelerated_table::FailedToWriteDataSnafu)?;
+                wrote = true;
+            }
         }
 
         if wrote {
@@ -3372,6 +3470,7 @@ mod tests {
             max_coalesced_bytes: 64 * 1024 * 1024,
             max_coalesce_age_ms: 250,
             commit_timeout: Duration::from_secs(30),
+            delete_subbatch_max: CDC_DELETE_SUBBATCH_MAX_DEFAULT,
         };
         let overlaid = cdc_config_overlay(
             base,
@@ -3996,6 +4095,32 @@ mod tests {
         .build()
     }
 
+    /// `make_refresh_task` with per-dataset `cdc_*` param overrides applied, so
+    /// a test can pin `cdc_delete_subbatch_max` regardless of the process-global
+    /// [`CdcConfig`].
+    fn make_refresh_task_with_cdc_params(
+        accelerator: Arc<dyn TableProvider>,
+        cdc_params: std::collections::HashMap<String, String>,
+    ) -> RefreshTask {
+        use crate::accelerated_table::refresh_task::RefreshTaskBuilder;
+        use crate::federated_table::FederatedTable;
+        use tokio::runtime::Handle;
+        use tokio::sync::Mutex;
+
+        let federated = Arc::new(FederatedTable::new_unchecked(Arc::clone(&accelerator)));
+        RefreshTaskBuilder::new(
+            crate::status::RuntimeStatus::new(),
+            datafusion::sql::TableReference::bare("test".to_string()),
+            federated,
+            None,
+            accelerator,
+            Handle::current(),
+            Arc::new(Mutex::new(())),
+        )
+        .with_cdc_param_overrides(Some(Arc::new(cdc_params)))
+        .build()
+    }
+
     #[tokio::test]
     async fn test_write_change_upsert_returns_data_written() {
         let task = make_refresh_task(make_mem_table() as Arc<dyn TableProvider>);
@@ -4121,6 +4246,73 @@ mod tests {
             .expect("collect should succeed");
         let remaining_rows: usize = remaining.iter().map(RecordBatch::num_rows).sum();
         assert_eq!(remaining_rows, 0);
+    }
+
+    #[tokio::test]
+    async fn test_delete_burst_chunks_at_subbatch_cap() {
+        // A single Delete sub-batch of N keyed rows must be applied as
+        // ⌈N/cap⌉ independent durable `delete_from` plans, and every cap must
+        // reach the identical end state (each key deleted exactly once).
+        const N: usize = 10;
+        let schema = Arc::new(create_test_data_schema());
+
+        for cap in [1usize, 3, 4, 10, 100] {
+            let ids: Vec<i32> = (0..i32::try_from(N).expect("N fits in i32")).collect();
+            let names: Vec<Option<&str>> = vec![Some("row"); N];
+            let initial = RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![
+                    Arc::new(Int32Array::from(ids.clone())) as ArrayRef,
+                    Arc::new(StringArray::from(names.clone())) as ArrayRef,
+                ],
+            )
+            .expect("initial batch should be created");
+            let mem = Arc::new(
+                MemTable::try_new(Arc::clone(&schema), vec![vec![initial]])
+                    .expect("mem table should be created"),
+            );
+            let delete_plan_calls = Arc::new(AtomicUsize::new(0));
+            let provider = Arc::new(CountingDeleteProvider {
+                inner: Arc::clone(&mem) as Arc<dyn TableProvider>,
+                delete_plan_calls: Arc::clone(&delete_plan_calls),
+            }) as Arc<dyn TableProvider>;
+            let task = make_refresh_task_with_cdc_params(
+                provider,
+                std::collections::HashMap::from([(
+                    "cdc_delete_subbatch_max".to_string(),
+                    cap.to_string(),
+                )]),
+            );
+
+            let ops = vec!["d"; N];
+            let pks: Vec<Vec<&str>> = vec![vec!["id"]; N];
+            let change_batch = create_test_change_batch(ops, &pks, ids, names);
+
+            assert_eq!(
+                task.write_change(change_batch)
+                    .await
+                    .expect("delete burst should succeed"),
+                WriteChangeResult::DataWritten
+            );
+
+            let expected_plans = N.div_ceil(cap);
+            assert_eq!(
+                delete_plan_calls.load(AtomicOrdering::SeqCst),
+                expected_plans,
+                "N={N} keys with cap={cap} should execute ceil(N/cap)={expected_plans} delete plans"
+            );
+
+            let ctx = SessionContext::new();
+            let scan = mem
+                .scan(&ctx.state(), None, &[], None)
+                .await
+                .expect("scan should succeed");
+            let remaining = collect(scan, ctx.task_ctx())
+                .await
+                .expect("collect should succeed");
+            let remaining_rows: usize = remaining.iter().map(RecordBatch::num_rows).sum();
+            assert_eq!(remaining_rows, 0, "cap={cap}: every key should be deleted");
+        }
     }
 
     #[tokio::test]
@@ -4746,6 +4938,7 @@ mod tests {
             max_coalesced_bytes: 128 * 1024 * 1024,
             max_coalesce_age_ms,
             commit_timeout: Duration::from_secs(30),
+            delete_subbatch_max: CDC_DELETE_SUBBATCH_MAX_DEFAULT,
         }
     }
 
@@ -4897,6 +5090,7 @@ mod tests {
             max_coalesced_bytes: 1,
             max_coalesce_age_ms: 60_000,
             commit_timeout: Duration::from_secs(30),
+            delete_subbatch_max: CDC_DELETE_SUBBATCH_MAX_DEFAULT,
         };
 
         let stream: ChangesStream = YieldOnceThenParkStream {
@@ -5063,6 +5257,54 @@ mod tests {
             self.insert_execution_calls
                 .fetch_add(1, AtomicOrdering::SeqCst);
             self.inner.execute(partition, context)
+        }
+    }
+
+    /// Wraps a `TableProvider` and counts each `delete_from` call, delegating
+    /// the delete to the inner provider. Lets a test assert that an N-key
+    /// delete burst is applied as `⌈N/cap⌉` independent durable plans.
+    #[derive(Debug)]
+    struct CountingDeleteProvider {
+        inner: Arc<dyn TableProvider>,
+        delete_plan_calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl TableProvider for CountingDeleteProvider {
+        fn schema(&self) -> arrow::datatypes::SchemaRef {
+            self.inner.schema()
+        }
+
+        fn table_type(&self) -> datafusion::datasource::TableType {
+            self.inner.table_type()
+        }
+
+        async fn scan(
+            &self,
+            state: &dyn Session,
+            projection: Option<&Vec<usize>>,
+            filters: &[Expr],
+            limit: Option<usize>,
+        ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+            self.inner.scan(state, projection, filters, limit).await
+        }
+
+        async fn insert_into(
+            &self,
+            state: &dyn Session,
+            input: Arc<dyn ExecutionPlan>,
+            insert_op: InsertOp,
+        ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+            self.inner.insert_into(state, input, insert_op).await
+        }
+
+        async fn delete_from(
+            &self,
+            state: &dyn Session,
+            filters: Vec<Expr>,
+        ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+            self.delete_plan_calls.fetch_add(1, AtomicOrdering::SeqCst);
+            self.inner.delete_from(state, filters).await
         }
     }
 
