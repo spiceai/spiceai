@@ -23,18 +23,22 @@ license-file.workspace = true
 description = "MySQL data connector for Spice.ai runtime"
 
 [dependencies]
+async-stream.workspace = true
 async-trait.workspace = true
 chrono.workspace = true
 data_components = { path = "../../data_components", features = ["mysql"] }
 datafusion.workspace = true
 datafusion-table-providers = { workspace = true, features = ["mysql", "mysql-federation"] }
+fundu.workspace = true
+futures.workspace = true
 linkme.workspace = true
 mysql_async.workspace = true
 opentelemetry.workspace = true
 paste.workspace = true
-runtime = { path = "../../runtime" }
+runtime = { path = "../../runtime", features = ["mysql"] }
 secrecy.workspace = true
 snafu.workspace = true
+tokio.workspace = true
 tracing.workspace = true
 
 [features]

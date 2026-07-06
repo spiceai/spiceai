@@ -4469,11 +4469,14 @@ dependencies = [
 name = "connector-mysql"
 version = "2.1.0-unstable"
 dependencies = [
+ "async-stream",
  "async-trait",
  "chrono",
  "data_components",
  "datafusion",
  "datafusion-table-providers",
+ "fundu",
+ "futures",
  "linkme",
  "mysql_async",
  "opentelemetry",
@@ -4481,6 +4484,7 @@ dependencies = [
  "runtime",
  "secrecy",
  "snafu",
+ "tokio",
  "tracing",
 ]
 
@@ -12241,6 +12245,7 @@ dependencies = [
  "base64 0.22.1",
  "bigdecimal",
  "bitflags 2.13.0",
+ "bitvec",
  "btoi",
  "byteorder",
  "bytes",
@@ -12260,6 +12265,7 @@ dependencies = [
  "thiserror 2.0.18",
  "time",
  "uuid 1.23.2",
+ "zstd",
 ]
 
 [[package]]
