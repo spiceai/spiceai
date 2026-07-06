@@ -29,9 +29,7 @@ use datafusion::catalog::TableProvider;
 use futures::StreamExt;
 use runtime::{
     component::{
-        ComponentType,
         dataset::{Dataset, acceleration::RefreshMode},
-        metrics::{MetricSpec, MetricType, MetricsProvider, ObserveMetricCallback},
     },
     dataaccelerator::spice_sys::{self, OpenOption, kafka::KafkaSys},
     dataconnector::{
@@ -43,6 +41,8 @@ use runtime::{
     federated_table::FederatedTable,
     parameters::{ExposedParamLookup, ParameterSpec, Parameters},
 };
+use runtime_api_types::v1::ComponentType;
+use runtime_metrics::component::{MetricSpec, MetricType, MetricsProvider, ObserveMetricCallback};
 use snafu::prelude::*;
 use tonic::async_trait;
 
