@@ -14,9 +14,9 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use serde::Serialize;
 use std::collections::HashMap;
 use std::time::Duration;
-use serde::Serialize;
 use test_framework::{
     anyhow::{self, Context},
     constants::METRICS_URL,

@@ -68,6 +68,20 @@ limitations under the License.
 //! restarting spiced (or the member rejoining) heals it by replaying from the
 //! held LSN, which every member applies idempotently.
 //!
+//! # Backpressure vs. server liveness
+//!
+//! A slow member sink backpressures the pump: `deliver_commit` blocks on the
+//! member channel, which stops the pump calling `client.recv()`, which lets
+//! events pile up in the `pgwire_replication` worker's channel. What keeps this
+//! from killing the connection is the **worker** (`pgwire_replication`'s
+//! `send_event`): it keeps emitting standby status feedback on `status_interval`
+//! while its own channel is full, so Postgres never hits `wal_sender_timeout`.
+//! The pump-side handling here ([`MEMBER_SEND_STALL_WARN`], the `send_timeout`
+//! loop in `deliver_commit`) is therefore *not* what prevents server-side
+//! timeout — it exists only for observability (the
+//! `dataset_postgres_replication_member_send_stalled_seconds_total` counter) and
+//! to keep the pump's shutdown check responsive while a member stalls.
+//!
 //! # Lifecycle
 //!
 //! - A member whose receiver is dropped (dataset removed, sink task died) is
@@ -110,6 +124,14 @@ const MEMBER_CHANNEL_CAPACITY: usize = 64;
 /// membership (joins, dropped receivers). Idle Postgres servers can go tens
 /// of seconds between messages; this keeps membership changes responsive.
 const RECV_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// How long a single member's committed-change delivery may block the pump
+/// before we emit a WARN, bump the stall metric, and re-check for shutdown.
+/// Server-side liveness is *not* at risk here — the `pgwire_replication` worker
+/// keeps sending standby status feedback while its own channel backs up (see
+/// its `send_event`); this bound is purely for observability and to keep the
+/// pump's shutdown check responsive while one member's sink is slow.
+const MEMBER_SEND_STALL_WARN: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Identity of a shared replication source. Datasets whose connection params
 /// and slot name produce the same key share one pump.
@@ -908,6 +930,12 @@ async fn run_pump(source: Arc<SharedSource>) {
                 c
             }
             Err(e) if resilience::is_transient_pgwire(&e) => {
+                // Mark the outage start on the first failed attempt so a boot-time /
+                // never-yet-connected outage (no prior success set `disconnect_at`) still
+                // contributes to `replication_disconnected_ms_total`. `get_or_insert_with`
+                // preserves an earlier drop timestamp (an established connection that fell
+                // over then failed to reconnect), so the full outage span is attributed.
+                disconnect_at.get_or_insert_with(std::time::Instant::now);
                 source.for_each_member_metrics(ReplicationMetricsCollector::inc_reconnect);
                 reconnect_attempts = reconnect_attempts.saturating_add(1);
                 client::log_transient_reconnect(
@@ -981,8 +1009,9 @@ async fn run_pump(source: Arc<SharedSource>) {
             // shared across members, so attribute the (shared) wait to each member.
             let recv_start = std::time::Instant::now();
             let polled = tokio::time::timeout(RECV_POLL_INTERVAL, client.recv()).await;
-            input_us_acc = input_us_acc
-                .saturating_add(u64::try_from(recv_start.elapsed().as_micros()).unwrap_or(u64::MAX));
+            input_us_acc = input_us_acc.saturating_add(
+                u64::try_from(recv_start.elapsed().as_micros()).unwrap_or(u64::MAX),
+            );
             // Flushed per commit/keepalive (or the idle-timeout branch below), not per event.
             let mut should_flush = false;
             let event = match polled {
@@ -1051,6 +1080,7 @@ async fn run_pump(source: Arc<SharedSource>) {
                         std::mem::take(&mut txn),
                         end_lsn.0,
                         commit_time_micros,
+                        shutdown_epoch,
                     )
                     .await;
                     let flush = source.ack.flush_lsn();
@@ -1099,8 +1129,9 @@ async fn run_pump(source: Arc<SharedSource>) {
             // `member_send_wait_micros` accumulator around the send `await`s (below and in
             // `deliver_commit`) would make input-share honest; until then the waterfall
             // annotates the shared-path processing bucket accordingly. TODO(cdc-metrics).
-            proc_us_acc = proc_us_acc
-                .saturating_add(u64::try_from(processing_start.elapsed().as_micros()).unwrap_or(u64::MAX));
+            proc_us_acc = proc_us_acc.saturating_add(
+                u64::try_from(processing_start.elapsed().as_micros()).unwrap_or(u64::MAX),
+            );
             if should_flush {
                 flush_reader_metrics(&source, input_us_acc, proc_us_acc, max_wal_end);
                 input_us_acc = 0;
@@ -1270,6 +1301,7 @@ async fn deliver_commit(
     txn: HashMap<RelationId, Vec<DecodedChange>>,
     end_lsn: u64,
     commit_time_micros: i64,
+    shutdown_epoch: u64,
 ) {
     let commit_time = client::pg_epoch_to_system_time(commit_time_micros);
     // Unix-epoch ms for the per-batch replication-lag signal carried into the
@@ -1333,8 +1365,43 @@ async fn deliver_commit(
             false,
         );
         source.ack.deliver(member_key, end_lsn);
-        if member.sender.send(Ok(envelope)).await.is_err() {
-            source.detach_member(member_key, "changes stream receiver dropped");
+        // Must-deliver: this envelope carries committed changes and a
+        // `SharedLsnCommitter` that advances the ack floor, so we cannot drop
+        // it under backpressure. But we also must not let one slow member block
+        // the pump (and thus every other member) indefinitely, or wedge runtime
+        // shutdown. Bound the wait: on each stall tick emit a WARN + bump the
+        // stall metric, and abandon delivery if the runtime is shutting down
+        // (epoch advanced) — the pump then observes shutdown and releases the
+        // slot. Server-side liveness is handled one layer down by the worker.
+        let mut pending = Ok(envelope);
+        loop {
+            match member
+                .sender
+                .send_timeout(pending, MEMBER_SEND_STALL_WARN)
+                .await
+            {
+                Ok(()) => break,
+                Err(mpsc::error::SendTimeoutError::Closed(_)) => {
+                    source.detach_member(member_key, "changes stream receiver dropped");
+                    break;
+                }
+                Err(mpsc::error::SendTimeoutError::Timeout(returned)) => {
+                    if crate::cdc::shutdown_epoch() != shutdown_epoch {
+                        return;
+                    }
+                    member
+                        .metrics
+                        .add_send_stalled(MEMBER_SEND_STALL_WARN.as_secs());
+                    tracing::warn!(
+                        dataset = %member.dataset_name,
+                        stalled_for = ?MEMBER_SEND_STALL_WARN,
+                        "shared Postgres CDC member sink is not draining; the pump is \
+                         waiting to deliver committed changes (watch \
+                         dataset_postgres_replication_member_send_stalled_seconds_total)"
+                    );
+                    pending = returned;
+                }
+            }
         }
     }
 

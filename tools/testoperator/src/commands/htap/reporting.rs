@@ -227,9 +227,13 @@ pub(super) fn emit_replication_metrics(
     }
     // dataset -> slot from the scraped member_attached gauge labels (shared-slot join).
     let mut ds_slot: BTreeMap<String, String> = BTreeMap::new();
-    if let Some(samples) = metrics.samples.get("dataset_postgres_replication_member_attached") {
+    if let Some(samples) = metrics
+        .samples
+        .get("dataset_postgres_replication_member_attached")
+    {
         for sample in samples {
-            if let (Some(name), Some(slot)) = (sample.labels.get("name"), sample.labels.get("slot")) {
+            if let (Some(name), Some(slot)) = (sample.labels.get("name"), sample.labels.get("slot"))
+            {
                 ds_slot.insert(name.clone(), slot.clone());
             }
         }
@@ -548,9 +552,7 @@ fn to_u64(value: f64) -> u64 {
 /// prior run showed one table at 0.8% coverage hiding a real stall). A HIGH ratio
 /// (>100%) is normal and not a problem: write phases are non-additive (parallel
 /// shards, commit/finalize overlapping the next burst). Returns (table, coverage).
-pub(super) fn phase_coverage(
-    metrics: &crate::spiced_metrics::SpicedMetrics,
-) -> Vec<(String, f64)> {
+pub(super) fn phase_coverage(metrics: &crate::spiced_metrics::SpicedMetrics) -> Vec<(String, f64)> {
     use std::collections::BTreeMap;
     // Sum the latest cumulative value of each distinct series into a `group`-label bucket.
     let sum_latest_by = |name: &str, group: &str| -> BTreeMap<String, f64> {
@@ -579,7 +581,10 @@ pub(super) fn phase_coverage(
         out
     };
     let phase_sum = sum_latest_by("cayenne_write_phase_duration_ms_sum", "table");
-    let burst_sum = sum_latest_by("dataset_acceleration_cdc_apply_burst_duration_ms_sum", "dataset");
+    let burst_sum = sum_latest_by(
+        "dataset_acceleration_cdc_apply_burst_duration_ms_sum",
+        "dataset",
+    );
     let mut out: Vec<(String, f64)> = burst_sum
         .into_iter()
         .filter(|(_, bsum)| *bsum > 0.0) // skip static/full-refresh tables (no CDC bursts)
@@ -603,7 +608,9 @@ pub(super) fn emit_phase_coverage(
     if coverage.is_empty() {
         return Vec::new();
     }
-    println!("\nApply-phase coverage (Σ write-phase ÷ apply-burst; <85% ⇒ instrumentation blind spot)");
+    println!(
+        "\nApply-phase coverage (Σ write-phase ÷ apply-burst; <85% ⇒ instrumentation blind spot)"
+    );
     let mut violations = Vec::new();
     for (table, cov) in &coverage {
         let flag = if *cov < 0.85 { "  <<< BLIND SPOT" } else { "" };
@@ -694,14 +701,18 @@ pub(super) fn emit_backpressure_summary(metrics: &crate::spiced_metrics::SpicedM
         ))
     };
 
-    let prefetch =
-        gauge_series_by_label("dataset_acceleration_cdc_prefetch_buffer_occupancy", "dataset");
+    let prefetch = gauge_series_by_label(
+        "dataset_acceleration_cdc_prefetch_buffer_occupancy",
+        "dataset",
+    );
     let recv_wait_present = metrics
         .samples
         .contains_key("dataset_acceleration_cdc_source_recv_wait_ms_bucket");
     if prefetch.is_empty()
         && !recv_wait_present
-        && !metrics.samples.contains_key("cayenne_encode_permits_available")
+        && !metrics
+            .samples
+            .contains_key("cayenne_encode_permits_available")
     {
         return; // No CDC/Cayenne backpressure series scraped (non-Cayenne / no CDC).
     }
@@ -715,7 +726,10 @@ pub(super) fn emit_backpressure_summary(metrics: &crate::spiced_metrics::SpicedM
             "dataset",
         );
         println!("  Prefetch channel (occupancy of capacity; high => apply-bound)");
-        println!("    {:<16} {:>8} {:>8} {:>8} {:>10}", "dataset", "p50", "p99", "max", "capacity");
+        println!(
+            "    {:<16} {:>8} {:>8} {:>8} {:>10}",
+            "dataset", "p50", "p99", "max", "capacity"
+        );
         for (dataset, values) in &prefetch {
             let p50 = percentile(values, 0.50);
             let p99 = percentile(values, 0.99);
@@ -838,8 +852,11 @@ fn reduce_samples_for_dump(
             let mut first_idx: BTreeMap<Vec<(&str, &str)>, usize> = BTreeMap::new();
             let mut last_idx: BTreeMap<Vec<(&str, &str)>, usize> = BTreeMap::new();
             for (i, s) in series.iter().enumerate() {
-                let mut key: Vec<(&str, &str)> =
-                    s.labels.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+                let mut key: Vec<(&str, &str)> = s
+                    .labels
+                    .iter()
+                    .map(|(k, v)| (k.as_str(), v.as_str()))
+                    .collect();
                 key.sort_unstable();
                 first_idx.entry(key.clone()).or_insert(i);
                 last_idx.insert(key, i);
@@ -850,7 +867,10 @@ fn reduce_samples_for_dump(
                 .collect();
             idxs.sort_unstable();
             idxs.dedup();
-            out.insert(name.as_str(), idxs.into_iter().map(|i| &series[i]).collect());
+            out.insert(
+                name.as_str(),
+                idxs.into_iter().map(|i| &series[i]).collect(),
+            );
         }
     }
     out

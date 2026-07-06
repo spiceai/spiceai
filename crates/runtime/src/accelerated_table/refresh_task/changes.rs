@@ -1169,7 +1169,9 @@ impl RefreshTask {
                 // advanced (rate vs wall = received ×realtime). Compare to the
                 // applied frontier (egress) to split delivery vs apply slowdown.
                 metrics::CDC_RECEIVED_COMMIT_UNIX_TIME_MS.record(commit_ts_ms, &recv_wait_labels);
-                if let Some(now_ms) = util::time::system_time_to_unix_ms(std::time::SystemTime::now()) {
+                if let Some(now_ms) =
+                    util::time::system_time_to_unix_ms(std::time::SystemTime::now())
+                {
                     // `saturating_sub` already floors at 0 (u64); the `max(0)` is a
                     // belt-and-suspenders clamp for the `as f64` cast, not dead code.
                     metrics::CDC_SOURCE_ARRIVAL_LAG_MS.record(
@@ -1328,7 +1330,27 @@ impl RefreshTask {
                 pending_commit: &mut pending_commit,
                 deferred_commits: deferred_commits.as_ref(),
             };
-            if !self.apply_burst(&mut apply_context, burst).await {
+            // Which cap closed this burst — the tuning signal for `cdc_max_coalesced_envelopes` /
+            // `cdc_max_coalesced_bytes` / `cdc_max_coalesce_age_ms`
+            let close_reason = if burst.len() >= max_burst {
+                "envelope_cap"
+            } else if carried_item.is_some() || burst_bytes >= max_burst_bytes {
+                "byte_cap"
+            } else if channel_closed {
+                "stream_end"
+            } else if self.runtime_status.is_shutdown() {
+                // The linger loop exits early on shutdown; without this arm those
+                // bursts would misreport as `age_deadline` and skew tuning signals.
+                "shutdown"
+            } else if cdc_cfg.max_coalesce_age_ms > 0 {
+                "age_deadline"
+            } else {
+                "drained"
+            };
+            if !self
+                .apply_burst(&mut apply_context, burst, close_reason)
+                .await
+            {
                 rx.close();
                 reader_handle.abort();
                 break;
@@ -1443,6 +1465,7 @@ impl RefreshTask {
         &self,
         context: &mut ApplyContext<'_>,
         burst: Vec<Result<cdc::ChangeEnvelope, cdc::StreamError>>,
+        close_reason: &'static str,
     ) -> bool {
         let burst_start = Instant::now();
         let burst_envelopes = u64::try_from(burst.len()).unwrap_or(u64::MAX);
@@ -1522,6 +1545,15 @@ impl RefreshTask {
                 }
             }
         }
+        tracing::debug!(
+            dataset = %context.dataset_name,
+            envelopes = burst_envelopes,
+            bytes = burst_bytes,
+            rows = burst_rows,
+            close_reason,
+            apply_ms = elapsed_ms(burst_start),
+            "Applied coalesced CDC change burst"
+        );
         metrics::CDC_APPLY_BURST_DURATION_MS.record(elapsed_ms(burst_start), &labels);
 
         // Record CDC progress only now that the burst's Ok runs have applied (the

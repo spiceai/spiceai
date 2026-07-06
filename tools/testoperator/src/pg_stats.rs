@@ -80,15 +80,14 @@ impl PgStatsScraper {
     /// never fails the benchmark.
     pub async fn spawn(conn_str: String, db: String) -> anyhow::Result<Option<Self>> {
         // Connect once up front so a bad config surfaces immediately (as a warning).
-        let (client, connection) = match tokio_postgres::connect(&conn_str, tokio_postgres::NoTls)
-            .await
-        {
-            Ok(pair) => pair,
-            Err(e) => {
-                eprintln!("pg_stats: could not connect to source for stats sampling: {e}");
-                return Ok(None);
-            }
-        };
+        let (client, connection) =
+            match tokio_postgres::connect(&conn_str, tokio_postgres::NoTls).await {
+                Ok(pair) => pair,
+                Err(e) => {
+                    eprintln!("pg_stats: could not connect to source for stats sampling: {e}");
+                    return Ok(None);
+                }
+            };
         // Drive the connection in the background (tokio-postgres requirement).
         tokio::spawn(async move {
             if let Err(e) = connection.await {
@@ -168,7 +167,10 @@ impl PgStatsScraper {
 
         // WAL production (cumulative).
         if let Ok(rows) = client
-            .query("SELECT wal_records::int8 AS recs, wal_bytes::int8 AS bytes FROM pg_stat_wal", &[])
+            .query(
+                "SELECT wal_records::int8 AS recs, wal_bytes::int8 AS bytes FROM pg_stat_wal",
+                &[],
+            )
             .await
             && let Some(r) = rows.first()
         {

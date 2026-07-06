@@ -1123,7 +1123,7 @@ impl<'a> AppendMutationWriter<'a> {
     ) -> Result<(
         u64,
         Arc<ColumnStatsAccumulator>,
-        std::collections::HashSet<arrow_row::OwnedRow>,
+        std::collections::HashSet<crate::row_converter::OwnedRow>,
         usize,
     )> {
         let new_snapshot_id = uuid::Uuid::now_v7().to_string();

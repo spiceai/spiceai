@@ -1283,7 +1283,7 @@ mod tests {
             0,
         ));
         let before_hash =
-            ShardedMemTier::version_hash_of(&[Arc::new(tier.clone()), Arc::clone(&other_shard)]);
+            ShardedMemTier::version_hash_of(&[Arc::new(tier), Arc::clone(&other_shard)]);
         let after_hash =
             ShardedMemTier::version_hash_of(&[Arc::new(sealed.clone()), Arc::clone(&other_shard)]);
         assert_eq!(

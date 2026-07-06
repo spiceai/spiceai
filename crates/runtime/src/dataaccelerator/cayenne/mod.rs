@@ -303,15 +303,21 @@ static COMPACTION_SEMAPHORE_FOR_METRICS: RwLock<Option<(Weak<tokio::sync::Semaph
 /// from the real table-registration path; idempotent across a fleet of tables
 /// (they share one semaphore).
 fn publish_compaction_semaphore_for_metrics(sem: &Arc<tokio::sync::Semaphore>, total: usize) {
-    if let Ok(mut guard) = COMPACTION_SEMAPHORE_FOR_METRICS.write() {
-        *guard = Some((Arc::downgrade(sem), total));
-    }
+    // Recover through poisoning: an unrelated panic must not permanently disable the
+    // compaction-permit gauges (the guarded Weak<Semaphore> isn't corrupted by another
+    // thread's panic).
+    let mut guard = COMPACTION_SEMAPHORE_FOR_METRICS
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    *guard = Some((Arc::downgrade(sem), total));
 }
 
 /// `(available, total)` permits of the fleet-wide compaction semaphore, or `None`
 /// before a real table has registered (or after teardown).
 fn compaction_semaphore_snapshot() -> Option<(u64, u64)> {
-    let guard = COMPACTION_SEMAPHORE_FOR_METRICS.read().ok()?;
+    let guard = COMPACTION_SEMAPHORE_FOR_METRICS
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let (weak, total) = guard.as_ref()?;
     let sem = weak.upgrade()?;
     Some((sem.available_permits() as u64, *total as u64))

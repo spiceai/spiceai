@@ -111,7 +111,9 @@ pub(crate) async fn run(args: &HtapArgs) -> anyhow::Result<()> {
     // unreachable. Probed once up front (a few ms round trips).
     let clock_skew_ms_estimate = crate::pg_stats::probe_clock_skew_ms().await;
     if let Some(skew) = clock_skew_ms_estimate {
-        println!("source clock-skew estimate: {skew}ms (local − server; subtracted from lag in analysis)");
+        println!(
+            "source clock-skew estimate: {skew}ms (local − server; subtracted from lag in analysis)"
+        );
     }
 
     // Run metadata for the `--metrics-dump` artifact — captured before the values
@@ -370,9 +372,19 @@ pub(crate) async fn run(args: &HtapArgs) -> anyhow::Result<()> {
     // Persist the full scraped time-series + run metadata for offline waterfall
     // analysis (scripts/chbench-waterfall.py) and CI artifact upload.
     if let Some(dump_path) = &args.metrics_dump {
-        match reporting::write_metrics_dump(dump_path, &run_metadata, spiced_metrics.as_ref(), &pg_stats).await {
+        match reporting::write_metrics_dump(
+            dump_path,
+            &run_metadata,
+            spiced_metrics.as_ref(),
+            &pg_stats,
+        )
+        .await
+        {
             Ok(()) => println!("\nWrote metrics dump to {}", dump_path.display()),
-            Err(e) => eprintln!("Failed to write metrics dump to {}: {e}", dump_path.display()),
+            Err(e) => eprintln!(
+                "Failed to write metrics dump to {}: {e}",
+                dump_path.display()
+            ),
         }
     }
 
@@ -507,7 +519,13 @@ pub(crate) async fn run(args: &HtapArgs) -> anyhow::Result<()> {
     if !coverage_violations.is_empty() {
         let detail = coverage_violations
             .iter()
-            .map(|(t, c)| format!("{t}: {:.1}% < {:.0}%", c * 100.0, args.min_phase_coverage * 100.0))
+            .map(|(t, c)| {
+                format!(
+                    "{t}: {:.1}% < {:.0}%",
+                    c * 100.0,
+                    args.min_phase_coverage * 100.0
+                )
+            })
             .collect::<Vec<_>>()
             .join(", ");
         error_messages.push(format!(

@@ -111,9 +111,9 @@ pub fn spawn_staleness_probe(
     cancel: CancellationToken,
     max_reasonable_gap: Duration,
 ) -> tokio::task::JoinHandle<anyhow::Result<StalenessReport>> {
-    tokio::spawn(
-        async move { run_staleness_probe(driver, spice_client, cancel, max_reasonable_gap).await },
-    )
+    tokio::spawn(async move {
+        run_staleness_probe(driver, spice_client, cancel, max_reasonable_gap).await
+    })
 }
 
 /// Core probe loop. Runs until cancelled, collecting gap samples for each table.

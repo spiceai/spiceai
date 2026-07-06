@@ -89,6 +89,12 @@ pub struct MetricsCollector {
     /// datasets share one). Lets the analysis join the per-dataset view to the
     /// authoritative per-slot backlog and show grouping. Set at (shared) attach.
     slot_name: RwLock<Option<String>>,
+    /// Cumulative seconds the shared-slot pump spent blocked trying to deliver
+    /// committed changes into this member's channel because its sink was not
+    /// draining. Non-zero means downstream backpressure stalled the pump (and
+    /// therefore every other member on the slot); the server connection itself
+    /// stays alive throughout. Only ever set for shared-slot datasets.
+    member_send_stalled_seconds_total: AtomicU64,
 
     // Watermark: commit time of the most-recent transaction we've ingested.
     // Used to compute `replication_lag_ms = now - watermark`.
@@ -112,9 +118,13 @@ impl MetricsCollector {
 
     /// Record which replication slot this member belongs to (shared-slot grouping).
     pub fn set_slot_name(&self, slot: String) {
-        if let Ok(mut guard) = self.slot_name.write() {
-            *guard = Some(slot);
-        }
+        // Recover through poisoning so an unrelated panic can't leave the `slot` label
+        // permanently unset (which would break shared-slot grouping in the analysis).
+        let mut guard = self
+            .slot_name
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *guard = Some(slot);
     }
 
     pub fn inc_insert(&self) {
@@ -246,6 +256,11 @@ impl MetricsCollector {
     pub fn inc_recv_error(&self) {
         self.replication_recv_errors_total
             .fetch_add(1, Ordering::Relaxed);
+    }
+    /// Add to the cumulative member-send-stalled seconds counter (shared slot).
+    pub fn add_send_stalled(&self, secs: u64) {
+        self.member_send_stalled_seconds_total
+            .fetch_add(secs, Ordering::Relaxed);
     }
     pub fn inc_reconnect(&self) {
         self.replication_reconnects_total
@@ -411,7 +426,20 @@ impl Metrics {
     }
     #[must_use]
     pub fn slot_name(&self) -> Option<String> {
-        self.collector.slot_name.read().ok().and_then(|g| g.clone())
+        // Recover through poisoning: an unrelated panic must not permanently drop the
+        // `slot` label (which would break shared-slot grouping in the analysis). The
+        // guarded String is not corrupted by another thread's panic.
+        self.collector
+            .slot_name
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+    #[must_use]
+    pub fn member_send_stalled_seconds_total(&self) -> u64 {
+        self.collector
+            .member_send_stalled_seconds_total
+            .load(Ordering::Relaxed)
     }
 }
 
