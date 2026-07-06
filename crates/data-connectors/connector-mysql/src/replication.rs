@@ -187,7 +187,13 @@ pub fn build_changes_stream(
         }
 
         if engine_supports_upsert && !has_upsert_on_pk {
-            let pk_hint = primary_keys.first().cloned().unwrap_or_else(|| "<pk>".to_string());
+            // Composite keys hint the full parenthesized column list — a
+            // single-column suggestion would mis-route UPDATE/DELETE events.
+            let pk_hint = match primary_keys.as_slice() {
+                [] => "<pk>".to_string(),
+                [single] => single.clone(),
+                composite => format!("({})", composite.join(", ")),
+            };
             let msg = if declared_pks.is_empty() {
                 format!(
                     "mysql replication for dataset `{dataset_name}`: the source table's \

@@ -159,6 +159,9 @@ pub(super) fn snapshot_stream(input: SnapshotInput) -> ChangesStream {
                 .into_iter()
                 .map(|row| DecodedChange {
                     op: ChangeOp::Create,
+                    // `mysql_async::Row::unwrap` (not `Option::unwrap`) moves
+                    // the row's values out; it only panics after a prior
+                    // `take()`, which this path never calls.
                     row: row.unwrap(),
                 })
                 .collect();
