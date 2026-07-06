@@ -58,8 +58,9 @@ use crate::catalog::MetadataCatalog;
 use crate::metadata::TableMetadata;
 use arc_swap::ArcSwap;
 use arrow::array::ArrayRef;
-use arrow_row::RowConverter;
 use arrow_schema::SchemaRef;
+
+use crate::row_converter::RowConverter;
 use async_trait::async_trait;
 use data_components::delete::DeletionSink;
 use datafusion::datasource::listing::ListingTable;
