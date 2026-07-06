@@ -31,6 +31,16 @@
 //!
 //! `bucket()` only ever hashes a single column, so the multi-column
 //! `combine_hashes` path is intentionally omitted.
+//!
+//! Caveat: this module freezes the *seed and the hashing loop*, but still
+//! delegates the actual byte hashing to the external `ahash` crate (pinned only
+//! as `^0.8`). ahash gives **no** cross-version output guarantee, so a routine
+//! `cargo update` — or a build that enables ahash's AES path — could still
+//! silently change these hashes (#11277). `bucket::tests::
+//! test_bucket_hash_stability_golden_values` pins the current output for every
+//! supported type so any such drift fails CI loudly instead of silently
+//! re-bucketing persisted data. Keep that guard passing; only regenerate its
+//! goldens as part of a deliberate, format-versioned migration.
 
 #![allow(clippy::pedantic)]
 

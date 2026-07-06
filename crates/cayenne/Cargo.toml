@@ -145,6 +145,10 @@ name = "sharded_validation_inline"
 
 [[bench]]
 harness = false
+name = "maintained_minmax_anchor"
+
+[[bench]]
+harness = false
 name = "staged_ivm_feed"
 
 [[bench]]
@@ -421,6 +425,10 @@ required-features = ["chdb-bench", "duckdb-bench"]
 [[bench]]
 harness = false
 name = "mem_tier_join_shapes"
+
+[[bench]]
+harness = false
+name = "mem_tier_seal_cadence"
 
 [[bench]]
 harness = false
