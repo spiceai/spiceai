@@ -1167,10 +1167,9 @@ impl RefreshTask {
                 && !env.change_batch.is_heartbeat()
                 && let Some(commit_ts_ms) = env.change_batch.source_commit_ts_ms()
             {
-                // Ingress frontier: how far the source-time we've RECEIVED has
-                // advanced (rate vs wall = received ×realtime). Compare to the
-                // applied frontier (egress) to split delivery vs apply slowdown.
-                metrics::CDC_RECEIVED_COMMIT_UNIX_TIME_MS.record(commit_ts_ms, &recv_wait_labels);
+                // Ingress frontier (received commit ts) is recorded once per burst in `apply_burst`
+                // using the freshest commit timestamp across the coalesced burst, so it can be
+                // compared to the applied frontier (egress) without ever appearing to lag it.
                 if let Some(now_ms) =
                     util::time::system_time_to_unix_ms(std::time::SystemTime::now())
                 {
