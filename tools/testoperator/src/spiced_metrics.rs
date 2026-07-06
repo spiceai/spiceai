@@ -33,7 +33,7 @@ pub struct MetricSample {
     pub value: f64,
     pub metric_type: MetricType,
     /// Unix-ms wall clock when this scrape was taken. Lets the offline analysis
-    /// compute windowed deltas (Δ_sum/Δ_count over Δt) instead of lifetime totals.
+    /// compute windowed deltas (`Δ_sum`/`Δ_count` over `Δt`) instead of lifetime totals.
     #[serde(default)]
     pub ts_ms: i64,
 }
@@ -42,8 +42,7 @@ pub struct MetricSample {
 fn now_unix_ms() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
-        .unwrap_or(0)
+        .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]

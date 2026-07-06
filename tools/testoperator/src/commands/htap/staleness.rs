@@ -187,7 +187,7 @@ async fn run_staleness_probe(
         }
     }
 
-    Ok(build_report(samples, discarded, probe_table_names))
+    Ok(build_report(samples, &discarded, probe_table_names))
 }
 
 /// Query `MAX(_bench_ts)` from Spice via Flight SQL, returning microseconds since epoch.
@@ -239,7 +239,7 @@ pub(super) async fn query_max_bench_ts_spice(
 /// Build the final report from raw gap samples (in microseconds).
 fn build_report(
     samples: HashMap<String, Vec<i64>>,
-    discarded: HashMap<String, u64>,
+    discarded: &HashMap<String, u64>,
     probe_tables: Vec<String>,
 ) -> StalenessReport {
     let mut tables = HashMap::new();

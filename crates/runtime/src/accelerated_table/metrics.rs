@@ -142,8 +142,8 @@ pub(crate) static CDC_APPLIED_COMMIT_UNIX_TIME_MS: LazyLock<Gauge<i64>> = LazyLo
 /// (at ingress, before coalesce/apply). Paired with
 /// `cdc_applied_commit_unix_time_ms` (egress), the advance RATE of each vs wall
 /// clock gives a "progress ×realtime" ladder:
-///   received-rate = d(received_commit_ts)/d(wall)  — how fast we pull source-time IN
-///   applied-rate  = d(applied_commit_ts)/d(wall)   — how fast we make it queryable
+///   received-rate = `d(received_commit_ts)/d(wall)`  — how fast we pull source-time IN
+///   applied-rate  = `d(applied_commit_ts)/d(wall)`   — how fast we make it queryable
 /// received-rate < 1 ⇒ ingress can't keep up with the source (delivery/source-bound;
 /// split further by reader input-wait vs decode). received-rate ≈ 1 but
 /// applied-rate < 1 ⇒ the slowdown is INSIDE our apply/write path. An independent
@@ -370,7 +370,7 @@ pub(crate) static CDC_COALESCE_BATCH_AGE_MS: LazyLock<Histogram<f64>> = LazyLock
 /// *source-side* lag from the lag the apply path ADDS (queue + write). Pair with
 /// `cdc_coalesce_batch_age_ms` (queue) and `cdc_apply_burst_duration_ms` (write)
 /// for an additive decomposition of `cdc_replication_lag_ms`. High arrival lag +
-/// low recv_wait ⇒ source can't keep up (not idle); near-zero arrival lag ⇒ any
+/// low `recv_wait` ⇒ source can't keep up (not idle); near-zero arrival lag ⇒ any
 /// lag is added downstream. Uses the coarse duration buckets since a backlog can
 /// reach many seconds/minutes (the histogram tail is the point). Labeled by
 /// `dataset`.

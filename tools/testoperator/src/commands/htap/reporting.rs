@@ -23,6 +23,11 @@ limitations under the License.
 use test_framework::anyhow::{self, Context};
 use test_framework::opentelemetry::KeyValue;
 
+/// Slack (bytes) below which authoritative per-slot retained WAL counts as "drained"
+/// — ~1 WAL segment of padding, since `confirmed_flush_lsn` trails the WAL head by up
+/// to a segment even when fully caught up.
+const CAUGHT_UP_WAL_EPSILON: f64 = 16.0 * 1024.0 * 1024.0;
+
 /// Emits replication metrics scraped from spiced's `/metrics` endpoint.
 ///
 /// `phase` labels the scrape context (e.g. "under load", "post-drain re-scrape").
@@ -217,7 +222,6 @@ pub(super) fn emit_replication_metrics(
     // AND the AUTHORITATIVE per-slot retained WAL (pg_replication_slots, source view) is
     // ~0. The inverse (client 0 but authoritative large) is the write-blocked failure
     // mode — surfaced as a WARNING, not silently called caught-up.
-    const CAUGHT_UP_WAL_EPSILON: f64 = 16.0 * 1024.0 * 1024.0; // ~1 WAL segment of padding
     let mut slot_retained: BTreeMap<String, i64> = BTreeMap::new();
     for s in pg_stats {
         for (slot, b) in &s.slot_retained_bytes {
@@ -248,7 +252,14 @@ pub(super) fn emit_replication_metrics(
         ds_slot
             .get(d)
             .and_then(|slot| slot_retained.get(slot).copied())
-            .map(|r| r as f64)
+            .map(|r| {
+                #[expect(
+                    clippy::cast_precision_loss,
+                    reason = "WAL byte counts compared against a ~16 MiB epsilon; f64 mantissa is ample"
+                )]
+                let bytes = r as f64;
+                bytes
+            })
     };
     // Require the lag_bytes series to be PRESENT and 0 — a MISSING series (not
     // scraped/parsed for this dataset) must NOT read as caught-up via unwrap_or(0.0).
@@ -830,8 +841,8 @@ pub(super) async fn write_metrics_dump(
 /// Reduce the raw per-second series for the dump — see [`write_metrics_dump`].
 /// Gauges keep their full time series (percentiles/min/max/windowing). Cumulative
 /// (counter/histogram/summary) series keep the FIRST and LAST sample per distinct
-/// label-set, so the analysis can compute *windowed* deltas (Δ_sum/Δ_count,
-/// Δ_bucket, Δ_count/Δt across `ts_ms`) rather than lifetime totals — a stall is
+/// label-set, so the analysis can compute *windowed* deltas (`Δ_sum`/`Δ_count`,
+/// `Δ_bucket`, `Δ_count`/`Δt` across `ts_ms`) rather than lifetime totals — a stall is
 /// diluted by lifetime aggregation, and the first snapshot lets the whole-run
 /// window exclude the bootstrap/initial-snapshot writes baked into it.
 fn reduce_samples_for_dump(

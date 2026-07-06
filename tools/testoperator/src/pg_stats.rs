@@ -52,9 +52,9 @@ pub struct PgStatSample {
     pub xact_commit: i64,
     /// AUTHORITATIVE per-slot retained WAL in bytes, from the source's own
     /// `pg_replication_slots` (`pg_current_wal_lsn() − confirmed_flush_lsn`). Unlike
-    /// the client-view `dataset_postgres_replication_lag_bytes` (server_wal_end −
-    /// confirmed_flush), this does NOT stall when the walsender is WriteData-blocked
-    /// — the client stops receiving keepalives so its wal_end freezes, but the
+    /// the client-view `dataset_postgres_replication_lag_bytes` (`server_wal_end` −
+    /// `confirmed_flush`), this does NOT stall when the walsender is WriteData-blocked
+    /// — the client stops receiving keepalives so its `wal_end` freezes, but the
     /// source's WAL head keeps advancing. The two diverging is itself a strong
     /// "sender is blocked on us" signal; this is the truth for drain/caught-up.
     pub slot_retained_bytes: BTreeMap<String, i64>,
@@ -63,8 +63,7 @@ pub struct PgStatSample {
 fn now_unix_ms() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
-        .unwrap_or(0)
+        .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
 }
 
 /// Background sampler of source Postgres stats. Mirrors `MetricsScraper`: spawn a
@@ -221,7 +220,7 @@ impl PgStatsScraper {
 pub fn source_conn_from_env() -> anyhow::Result<(String, String)> {
     let source = crate::commands::bench::chbench_source_from_env()
         .context("building CH-benCH source config for pg_stats")?;
-    Ok((source.connection_string(), source.db.clone()))
+    Ok((source.connection_string(), source.db))
 }
 
 /// Estimate the source↔local clock skew in ms (local − server), NTP-style: probe

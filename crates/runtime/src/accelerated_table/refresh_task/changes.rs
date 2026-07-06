@@ -1174,10 +1174,12 @@ impl RefreshTask {
                 {
                     // `saturating_sub` already floors at 0 (u64); the `max(0)` is a
                     // belt-and-suspenders clamp for the `as f64` cast, not dead code.
-                    metrics::CDC_SOURCE_ARRIVAL_LAG_MS.record(
-                        now_ms.saturating_sub(commit_ts_ms).max(0) as f64,
-                        &recv_wait_labels,
-                    );
+                    #[expect(
+                        clippy::cast_precision_loss,
+                        reason = "arrival lag in ms as f64 for the histogram; sub-ms precision is irrelevant at second/minute-scale backlogs"
+                    )]
+                    let arrival_lag_ms = now_ms.saturating_sub(commit_ts_ms).max(0) as f64;
+                    metrics::CDC_SOURCE_ARRIVAL_LAG_MS.record(arrival_lag_ms, &recv_wait_labels);
                 }
             }
             // First envelope of this burst is now in hand; time from here until the
