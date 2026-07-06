@@ -25,9 +25,7 @@ expression: "normalize_search_response(resp, round_scores)"
           "New"
         ]
       },
-      }
       "primary_key": {
-    }
         "i_item_sk": 7
       }
     }
