@@ -68,6 +68,20 @@ limitations under the License.
 //! restarting spiced (or the member rejoining) heals it by replaying from the
 //! held LSN, which every member applies idempotently.
 //!
+//! # Backpressure vs. server liveness
+//!
+//! A slow member sink backpressures the pump: `deliver_commit` blocks on the
+//! member channel, which stops the pump calling `client.recv()`, which lets
+//! events pile up in the `pgwire_replication` worker's channel. What keeps this
+//! from killing the connection is the **worker** (`pgwire_replication`'s
+//! `send_event`): it keeps emitting standby status feedback on `status_interval`
+//! while its own channel is full, so Postgres never hits `wal_sender_timeout`.
+//! The pump-side handling here ([`MEMBER_SEND_STALL_WARN`], the `send_timeout`
+//! loop in `deliver_commit`) is therefore *not* what prevents server-side
+//! timeout — it exists only for observability (the
+//! `dataset_postgres_replication_member_send_stalled_seconds_total` counter) and
+//! to keep the pump's shutdown check responsive while a member stalls.
+//!
 //! # Lifecycle
 //!
 //! - A member whose receiver is dropped (dataset removed, sink task died) is
@@ -92,7 +106,7 @@ use tokio_stream::wrappers::ReceiverStream;
 
 use super::{
     Error, ReplicationMetricsCollector, ReplicationStreamInput, Result, bootstrap,
-    changes::{ChangeOp, DecodedChange},
+    changes::{ChangeOp, DecodedChange, push_update_change},
     client,
     config::ReplicationParams,
     pgoutput, resilience, slot,
@@ -110,6 +124,14 @@ const MEMBER_CHANNEL_CAPACITY: usize = 64;
 /// membership (joins, dropped receivers). Idle Postgres servers can go tens
 /// of seconds between messages; this keeps membership changes responsive.
 const RECV_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// How long a single member's committed-change delivery may block the pump
+/// before we emit a WARN, bump the stall metric, and re-check for shutdown.
+/// Server-side liveness is *not* at risk here — the `pgwire_replication` worker
+/// keeps sending standby status feedback while its own channel backs up (see
+/// its `send_event`); this bound is purely for observability and to keep the
+/// pump's shutdown check responsive while one member's sink is slow.
+const MEMBER_SEND_STALL_WARN: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Identity of a shared replication source. Datasets whose connection params
 /// and slot name produce the same key share one pump.
@@ -982,6 +1004,7 @@ async fn run_pump(source: Arc<SharedSource>) {
                         std::mem::take(&mut txn),
                         end_lsn.0,
                         commit_time_micros,
+                        shutdown_epoch,
                     )
                     .await;
                     let flush = source.ack.flush_lsn();
@@ -1108,13 +1131,19 @@ async fn handle_decoded(
                 && let Some(member) = source.member(member_key)
             {
                 member.metrics.inc_update();
-                // Fill unchanged-TOAST markers from the old tuple (REPLICA
-                // IDENTITY FULL) before buffering.
-                let new = super::changes::merge_unchanged_toast(new, old.as_ref());
-                txn.entry(relation_id).or_default().push(DecodedChange {
-                    op: ChangeOp::Update,
-                    row: new,
-                });
+                let Some(rel) = decoder.relation(relation_id) else {
+                    member_fatal(
+                        source,
+                        member_key,
+                        format!(
+                            "change event before Relation for id {relation_id} in {}",
+                            member.dataset_name
+                        ),
+                    )
+                    .await;
+                    return;
+                };
+                push_update_change(txn.entry(relation_id).or_default(), rel, old, new);
             }
         }
         DecodedMessage::Delete { relation_id, old } => {
@@ -1161,6 +1190,7 @@ async fn deliver_commit(
     txn: HashMap<RelationId, Vec<DecodedChange>>,
     end_lsn: u64,
     commit_time_micros: i64,
+    shutdown_epoch: u64,
 ) {
     let commit_time = client::pg_epoch_to_system_time(commit_time_micros);
     // Unix-epoch ms for the per-batch replication-lag signal carried into the
@@ -1224,8 +1254,43 @@ async fn deliver_commit(
             false,
         );
         source.ack.deliver(member_key, end_lsn);
-        if member.sender.send(Ok(envelope)).await.is_err() {
-            source.detach_member(member_key, "changes stream receiver dropped");
+        // Must-deliver: this envelope carries committed changes and a
+        // `SharedLsnCommitter` that advances the ack floor, so we cannot drop
+        // it under backpressure. But we also must not let one slow member block
+        // the pump (and thus every other member) indefinitely, or wedge runtime
+        // shutdown. Bound the wait: on each stall tick emit a WARN + bump the
+        // stall metric, and abandon delivery if the runtime is shutting down
+        // (epoch advanced) — the pump then observes shutdown and releases the
+        // slot. Server-side liveness is handled one layer down by the worker.
+        let mut pending = Ok(envelope);
+        loop {
+            match member
+                .sender
+                .send_timeout(pending, MEMBER_SEND_STALL_WARN)
+                .await
+            {
+                Ok(()) => break,
+                Err(mpsc::error::SendTimeoutError::Closed(_)) => {
+                    source.detach_member(member_key, "changes stream receiver dropped");
+                    break;
+                }
+                Err(mpsc::error::SendTimeoutError::Timeout(returned)) => {
+                    if crate::cdc::shutdown_epoch() != shutdown_epoch {
+                        return;
+                    }
+                    member
+                        .metrics
+                        .add_send_stalled(MEMBER_SEND_STALL_WARN.as_secs());
+                    tracing::warn!(
+                        dataset = %member.dataset_name,
+                        stalled_for = ?MEMBER_SEND_STALL_WARN,
+                        "shared Postgres CDC member sink is not draining; the pump is \
+                         waiting to deliver committed changes (watch \
+                         dataset_postgres_replication_member_send_stalled_seconds_total)"
+                    );
+                    pending = returned;
+                }
+            }
         }
     }
 

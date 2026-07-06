@@ -56,6 +56,11 @@ on:
         options:
           - 'spiceai-dev-large-runners'
           - 'spiceai-dev-xlarge-runners'
+      collect_diagnostics:
+        description: 'Capture additional diagnostics'
+        required: false
+        default: false
+        type: boolean
 
 # Serialize ALL SF100 + SF1000 CH-benCHmark runs across every variant (sqlite/turso cdc-tuned,
 # adaptive, duckdb): they share ONE concurrency group keyed only by scale factor, so
@@ -64,12 +69,15 @@ on:
 # an in-flight benchmark is never killed mid-run. Other scale factors (e.g. manual SF1/SF10 runs)
 # get a unique group (github.run_id) and stay parallel.
 #
-# NOTE: GitHub keeps at most one in-progress + one pending run per group (a newer pending run
-# cancels the older pending one), so when a cron dispatches a batch faster than runs complete,
-# the intermediate dispatches are superseded rather than queued FIFO.
+# queue: max keeps up to 100 runs pending in the group, processed first-in-first-out by the time
+# each started waiting. So a batch dispatched faster than runs complete queues FIFO instead of the
+# newer pending run superseding (cancelling) the older one, which is the default (queue: single).
+# This is what lets the dispatcher fire a whole batch at once and let GitHub serialize it, rather
+# than blocking to feed runs one at a time; see testoperator_dispatch_htap.yml.
 concurrency:
   group: ${{ (github.event.inputs.scale_factor == '100' || github.event.inputs.scale_factor == '1000') && 'chbench-htap-sf100-sf1000' || github.run_id }}
   cancel-in-progress: false
+  queue: max
 
 jobs:
   run-htap:
@@ -159,6 +167,20 @@ jobs:
             TESTOP_PREFIX="taskset -c 32-39,96-103"
             echo "CPU pinning: spiced -> 64 logical CPUs, testoperator -> 16 logical CPUs"
           fi
+
+          # Optionally capture under-load troubleshooting artifacts
+          DIAG_DIR="${GITHUB_WORKSPACE}/htap-diagnostics"
+          DIAG_PIDS=""
+          if [ "${{ github.event.inputs.collect_diagnostics }}" = "true" ]; then
+            mkdir -p "$DIAG_DIR"
+            OUTDIR="$DIAG_DIR" HTTP_HOST=localhost HTTP_PORT=8090 \
+              EXPLAIN_QUERIES=all EXPLAIN_INTERVAL=30 READY_TIMEOUT=3600 \
+              bash scripts/htap-explain-probe.sh > "$DIAG_DIR/explain-probe.log" 2>&1 &
+            DIAG_PIDS="$DIAG_PIDS $!"
+            echo "diagnostics probes backgrounded (pids$DIAG_PIDS) -> $DIAG_DIR"
+          fi
+
+          set +e
           $TESTOP_PREFIX testoperator run htap \
             -s "${SPICED_BIN}" \
             -p '${{ steps.set_spicepod_path.outputs.SPICEPOD_PATH }}' \
@@ -173,11 +195,35 @@ jobs:
             ${{ github.event.inputs.runner_type == 'spiceai-dev-xlarge-runners' && '--skip-prepare' || '' }} \
             --disable-progress-bars \
             --metrics
+          testop_exit=$?
+          set -e
+
+          # Stop the diagnostics probes (spiced exits after this step, so they
+          # self-terminate anyway); propagate testoperator's real exit code.
+          [ -n "$DIAG_PIDS" ] && kill $DIAG_PIDS 2>/dev/null || true
+          exit $testop_exit
         env:
+          SPICED_LOG: "runtime::accelerated_table::refresh_task::changes=debug,cayenne::mem_tier=debug,info"
           SPICEAI_BENCHMARK_METRICS_KEY: ${{ secrets.SPICEAI_BENCHMARK_METRICS_KEY }}
           SPICED_COMMIT: ${{ steps.setup-spiced.outputs.SPICED_COMMIT }}
           # Dedicated in-cluster PG pod on xlarge; per-run docker container (loopback) elsewhere.
           CHBENCH_PG_HOST: ${{ github.event.inputs.runner_type == 'spiceai-dev-xlarge-runners' && 'chbench-postgres.dataplatform.svc.cluster.local' || '127.0.0.1' }}
+          # MinIO credentials for spiced, mirroring testoperator_run_bench.yml. Consumed only by
+          # configs that reference the local S3 (`${secrets:S3_ENDPOINT}` etc.) — e.g. the Cayenne
+          # cold-object-store-tier chbench config; harmless/unused for every other HTAP config.
+          S3_ENDPOINT: ${{ secrets.TEST_MINIO_ENDPOINT }}
+          S3_KEY: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
+          S3_SECRET: ${{ secrets.TEST_MINIO_SECRET_KEY }}
+
+      # Upload the under-load diagnostics dir
+      - name: Upload HTAP diagnostics
+        if: always() && github.event.inputs.collect_diagnostics == 'true'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: htap-diagnostics-sf${{ github.event.inputs.scale_factor }}-${{ github.run_id }}
+          path: htap-diagnostics/
+          if-no-files-found: ignore
+          retention-days: 14
 
       # The dedicated PG pod is long-lived and shared across runs, so a crashed
       # or cancelled run can leave inactive replication slots (which retain WAL
@@ -223,4 +269,24 @@ jobs:
               -v ON_ERROR_STOP=0 -f /tmp/chbench-slot-cleanup.sql || true
           else
             echo "No psql client available; skipping replication slot cleanup."
+          fi
+
+      # The MinIO `benchmarks` bucket is shared across runs, so the Cayenne cold-object-store tier
+      # (cayenne_cold_tier_location: s3://benchmarks/cayenne-cold-sf1000/) would otherwise accumulate
+      # cold files every run: each promotion writes a new UUID-named prefix and nothing GCs them
+      # (the query path reads the metastore manifest, never an S3 listing, so a fresh run never
+      # references a prior run's objects — they are dead weight, not a collision). Drop the whole
+      # cold prefix after the run. Gated to the cold config; `mc` + the `spice-minio` alias come from
+      # the Install MinIO step above. Runs on failure/cancel too so a crashed run leaves no orphans.
+      - name: Clean up Cayenne cold-tier S3 objects
+        if: always() && endsWith(github.event.inputs.spicepod_path, 'cold-sf1000.yaml')
+        run: |
+          if command -v mc >/dev/null 2>&1; then
+            echo "Removing cold-tier objects under spice-minio/benchmarks/cayenne-cold-sf1000/ (best-effort; an empty prefix is expected when no promotion ran) ..."
+            # Non-fatal: mc prints its own diagnostics (empty prefix, or an auth/endpoint failure) to
+            # the log, but a cleanup miss must never fail the benchmark run. No success/"already clean"
+            # message here, so a real mc failure is not misreported.
+            mc rm --recursive --force spice-minio/benchmarks/cayenne-cold-sf1000/ || true
+          else
+            echo "mc client not found; skipping cold-tier S3 cleanup."
           fi

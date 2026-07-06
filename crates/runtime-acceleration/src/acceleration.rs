@@ -73,6 +73,11 @@ pub enum ParseError {
         valid_columns: String,
     },
 
+    #[snafu(display(
+        "Cannot configure {constraint} because the dataset schema has no columns. This usually means the source table does not exist or could not be read. Verify the dataset's `from` target exists and is accessible, then try again."
+    ))]
+    AcceleratedSchemaEmpty { constraint: String },
+
     #[snafu(display("Failed to retrieve table constraints: {source}"))]
     UnableToGetTableConstraints {
         source: datafusion::error::DataFusionError,
@@ -511,7 +516,16 @@ impl Acceleration {
             .join(", ")
     }
 
+    /// Validates that all configured index columns exist in the source schema.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if an index is configured against an empty schema or if any configured
+    /// index column is missing from the source schema.
     pub fn validate_indexes(&self, schema: &SchemaRef) -> Result<(), ParseError> {
+        if !self.indexes.is_empty() {
+            Self::ensure_schema_populated(schema, "indexes")?;
+        }
         for column in self.indexes.keys() {
             for index_column in column.iter() {
                 if schema.field_with_name(index_column).is_err() {
@@ -527,8 +541,15 @@ impl Acceleration {
         Ok(())
     }
 
+    /// Validates that all configured primary key columns exist in the source schema.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a primary key is configured against an empty schema or if any
+    /// configured primary key column is missing from the source schema.
     pub fn validate_primary_key(&self, schema: &SchemaRef) -> Result<(), ParseError> {
         if let Some(columns) = &self.primary_key {
+            Self::ensure_schema_populated(schema, "a primary key")?;
             for column in columns.iter() {
                 if schema.field_with_name(column).is_err() {
                     return PrimaryKeyColumnNotFoundSnafu {
@@ -543,7 +564,27 @@ impl Acceleration {
         Ok(())
     }
 
+    /// A configured constraint (primary key or index) can only be validated against a schema
+    /// that actually has columns. An empty schema means the source table could not be resolved
+    /// (e.g. it does not exist), so report that root cause instead of a misleading
+    /// "column was not found. Valid columns: " message listing no valid columns.
+    fn ensure_schema_populated(schema: &SchemaRef, constraint: &str) -> Result<(), ParseError> {
+        if schema.fields().is_empty() {
+            return AcceleratedSchemaEmptySnafu {
+                constraint: constraint.to_string(),
+            }
+            .fail();
+        }
+        Ok(())
+    }
+
     #[expect(clippy::needless_pass_by_value)]
+    /// Builds DataFusion table constraints from configured indexes and primary keys.
+    ///
+    /// # Errors
+    ///
+    /// This method preserves a `Result`-based API for callers but does not currently return an
+    /// error.
     pub fn table_constraints(&self, schema: SchemaRef) -> Result<Option<Constraints>, ParseError> {
         if self.indexes.is_empty() && self.primary_key.is_none() {
             tracing::trace!(
@@ -603,6 +644,12 @@ impl Acceleration {
         on_conflict_targets
     }
 
+    /// Returns the conflict behavior implied by the configured unique constraints and primary key.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the configured `on_conflict` targets do not match the available
+    /// primary key and unique-index targets.
     pub fn on_conflict(&self) -> Result<Option<OnConflict>, ParseError> {
         let on_conflict_all_targets = self.on_conflict_targets();
 
@@ -663,7 +710,6 @@ impl Acceleration {
 impl TryFrom<spicepod_acceleration::Acceleration> for Acceleration {
     type Error = ParseError;
 
-    #[expect(clippy::result_large_err)]
     fn try_from(
         acceleration: spicepod_acceleration::Acceleration,
     ) -> std::result::Result<Self, Self::Error> {
@@ -965,6 +1011,8 @@ fn parse_duration_param(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use arrow::datatypes::{DataType, Field, Schema};
+    use std::sync::Arc;
 
     #[test]
     fn test_parse_federation_disabled_param() {
@@ -1074,5 +1122,105 @@ mod tests {
         let parsed = Acceleration::try_from(acceleration).expect("acceleration should parse");
         assert_eq!(parsed.maintained_aggregates.as_slice(), &[maintained]);
         assert!(!parsed.maintained_aggregates.is_enabled());
+    }
+
+    fn empty_schema() -> SchemaRef {
+        Arc::new(Schema::empty())
+    }
+
+    fn schema_with(columns: &[&str]) -> SchemaRef {
+        Arc::new(Schema::new(
+            columns
+                .iter()
+                .map(|c| Field::new(*c, DataType::Int32, false))
+                .collect::<Vec<_>>(),
+        ))
+    }
+
+    fn acceleration_with_primary_key(pk: &str) -> Acceleration {
+        Acceleration {
+            primary_key: Some(ColumnReference::try_from(pk).expect("valid column reference")),
+            ..Acceleration::default()
+        }
+    }
+
+    fn acceleration_with_index(index: &str) -> Acceleration {
+        let mut indexes = HashMap::new();
+        indexes.insert(
+            ColumnReference::try_from(index).expect("valid column reference"),
+            IndexType::Enabled,
+        );
+        Acceleration {
+            indexes,
+            ..Acceleration::default()
+        }
+    }
+
+    #[test]
+    fn empty_schema_with_primary_key_reports_empty_schema_not_missing_column() {
+        let acceleration = acceleration_with_primary_key("marker_id");
+        let err = acceleration
+            .validate_primary_key(&empty_schema())
+            .expect_err("empty schema with a primary key must fail");
+
+        assert!(
+            matches!(err, ParseError::AcceleratedSchemaEmpty { .. }),
+            "expected AcceleratedSchemaEmpty, got: {err}"
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.contains("no columns") && msg.contains("does not exist"),
+            "message should point at the empty schema / missing table: {msg}"
+        );
+        assert!(
+            !msg.contains("was not found in the schema"),
+            "message should not be the misleading column-not-found error: {msg}"
+        );
+    }
+
+    #[test]
+    fn empty_schema_with_index_reports_empty_schema_not_missing_column() {
+        let acceleration = acceleration_with_index("marker_id");
+        let err = acceleration
+            .validate_indexes(&empty_schema())
+            .expect_err("empty schema with an index must fail");
+
+        assert!(
+            matches!(err, ParseError::AcceleratedSchemaEmpty { .. }),
+            "expected AcceleratedSchemaEmpty, got: {err}"
+        );
+    }
+
+    #[test]
+    fn empty_schema_without_constraints_is_ok() {
+        let acceleration = Acceleration::default();
+        acceleration
+            .validate_primary_key(&empty_schema())
+            .expect("no primary key configured, so an empty schema is fine");
+        acceleration
+            .validate_indexes(&empty_schema())
+            .expect("no indexes configured, so an empty schema is fine");
+    }
+
+    #[test]
+    fn populated_schema_missing_primary_key_column_keeps_column_not_found_error() {
+        let acceleration = acceleration_with_primary_key("marker_id");
+        let err = acceleration
+            .validate_primary_key(&schema_with(&["id", "value"]))
+            .expect_err("missing primary key column must fail");
+
+        assert!(
+            matches!(err, ParseError::PrimaryKeyColumnNotFound { .. }),
+            "expected PrimaryKeyColumnNotFound, got: {err}"
+        );
+        assert!(err.to_string().contains("was not found in the schema"));
+    }
+
+    #[test]
+    fn populated_schema_with_primary_key_column_is_ok() {
+        let acceleration = acceleration_with_primary_key("marker_id");
+        acceleration
+            .validate_primary_key(&schema_with(&["marker_id", "value"]))
+            .expect("primary key column present, so validation passes");
     }
 }

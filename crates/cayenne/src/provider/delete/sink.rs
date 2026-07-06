@@ -58,8 +58,9 @@ use crate::catalog::MetadataCatalog;
 use crate::metadata::TableMetadata;
 use arc_swap::ArcSwap;
 use arrow::array::ArrayRef;
-use arrow_row::RowConverter;
 use arrow_schema::SchemaRef;
+
+use crate::row_converter::RowConverter;
 use async_trait::async_trait;
 use data_components::delete::DeletionSink;
 use datafusion::datasource::listing::ListingTable;
@@ -111,8 +112,10 @@ pub struct CayenneDeletionSink {
     pk_row_converter: Option<Arc<RowConverter>>,
     /// Indices of primary key columns in the table schema.
     pk_column_indices: Vec<usize>,
-    /// Additional listing tables from protected snapshots that should also be scanned for deletions.
-    protected_snapshot_tables: Vec<Arc<ListingTable>>,
+    /// Extra listing tables to also scan for deletion keys, beyond the main
+    /// listing table — the protected snapshots and (for cold-tier tables) the
+    /// cold-tier files. The sink treats every entry uniformly.
+    additional_scan_tables: Vec<Arc<ListingTable>>,
     /// Shared `RuntimeEnv` for S3 object store access.
     runtime_env: Arc<RuntimeEnv>,
     /// Shared write lock to prevent concurrent writes/refreshes from racing with deletions.
@@ -150,7 +153,7 @@ impl CayenneDeletionSink {
         table_memory: Arc<CayenneMemoryAccount>,
         pk_row_converter: Option<Arc<RowConverter>>,
         pk_column_indices: Vec<usize>,
-        protected_snapshot_tables: Vec<Arc<ListingTable>>,
+        additional_scan_tables: Vec<Arc<ListingTable>>,
         runtime_env: Arc<RuntimeEnv>,
         write_lock: Option<Arc<TokioMutex<()>>>,
         seq_allocator: Arc<TokioMutex<super::super::table::SeqAllocator>>,
@@ -165,7 +168,7 @@ impl CayenneDeletionSink {
             table_memory,
             pk_row_converter,
             pk_column_indices,
-            protected_snapshot_tables,
+            additional_scan_tables,
             runtime_env,
             write_lock,
             seq_allocator,
@@ -173,14 +176,15 @@ impl CayenneDeletionSink {
         }
     }
 
-    /// Mark this sink as needing an exact, verified deleted-row count (a
-    /// user-visible `DELETE`, where "rows affected" is shown to the client).
-    /// Bypasses the count-skipping `pk IN (...)` fast path so the scan-based
-    /// path counts only the live rows actually removed. The default (unset)
-    /// keeps the fast path for CDC/internal callers that do not surface the
-    /// count. See [`Self::count_exact`].
-    pub(crate) fn with_exact_count(mut self) -> Self {
-        self.count_exact = true;
+    /// Set whether this sink must return an exact, verified deleted-row count.
+    ///
+    /// `true` (a user-visible `DELETE`, where "rows affected" is shown to the
+    /// client) bypasses the count-skipping `pk IN (...)` fast path so the
+    /// scan-based path counts only the live rows actually removed. `false` (the
+    /// default) keeps the fast path for CDC/internal callers that do not surface
+    /// the count. See [`Self::count_exact`].
+    pub(crate) fn with_exact_count(mut self, exact: bool) -> Self {
+        self.count_exact = exact;
         self
     }
 
@@ -954,10 +958,11 @@ impl DeletionSink for CayenneDeletionSink {
         // operation), so we never observe a torn swap here.
         let listing_table = self.listing_table.load_full();
 
-        // Collect all tables to scan: main listing table + protected snapshots
+        // Collect all tables to scan: main listing table + the extra tables
+        // (protected snapshots and, for cold-tier tables, the cold-tier files).
         let mut all_tables = vec![Arc::clone(&listing_table)];
-        for protected_table in &self.protected_snapshot_tables {
-            all_tables.push(Arc::clone(protected_table));
+        for extra_table in &self.additional_scan_tables {
+            all_tables.push(Arc::clone(extra_table));
         }
 
         if self.filters.is_empty() {

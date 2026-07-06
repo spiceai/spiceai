@@ -17,8 +17,11 @@ limitations under the License.
 use crate::acceleration::Acceleration;
 use datafusion::common::TableReference;
 use runtime_secrets::Secrets;
-use std::sync::Arc;
+use std::{future::Future, pin::Pin, sync::Arc};
 use tokio::sync::RwLock;
+
+pub type InitializedSourcesFuture<'a> =
+    Pin<Box<dyn Future<Output = Vec<Arc<dyn AccelerationSource>>> + Send + 'a>>;
 
 /// Represents an acceleration source component, such as a dataset or a view.
 /// Provides additional information about the source, such as its name and associated metadata.
@@ -49,12 +52,8 @@ pub trait AccelerationSource: Send + Sync {
     fn as_any(&self) -> &dyn std::any::Any;
 
     /// Returns all initialized acceleration sources (datasets and views) known to this source's
-    /// runtime. Used by DuckDB to attach peer file-mode databases. Default returns empty.
-    fn initialized_sources<'a>(
-        &'a self,
-    ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = Vec<Arc<dyn AccelerationSource>>> + Send + 'a>,
-    > {
+    /// runtime. Used by `DuckDB` to attach peer file-mode databases. Default returns empty.
+    fn initialized_sources<'a>(&'a self) -> InitializedSourcesFuture<'a> {
         Box::pin(async { vec![] })
     }
 }

@@ -64,9 +64,12 @@ datasets:
         # cost from the write path. On crash the un-checkpointed tail replays from the slot and the
         # PK-idempotent apply converges exactly-once. This is the counterpart to `…-cdc-tuned-sf1000`.
         cayenne_cdc_durability: memory
-        cayenne_cdc_mem_tier_max_bytes: '1073741824' # 1 GiB resident cap (synchronous backstop)
-        cayenne_cdc_mem_tier_min_flush_bytes: '134217728' # 128 MiB min-flush gate (fewer, larger checkpoints)
+        cayenne_cdc_mem_tier_max_bytes: '1073741824' # 1 GiB
+        cayenne_cdc_mem_tier_min_flush_bytes: '268435456'
         cayenne_cdc_mem_tier_max_age_ms: '30000'
+        # In-memory CDC intra-apply sharding: 4 PK-hash shards validate+append in
+        # parallel within one apply on the memory-tier (changes) tables.
+        cayenne_cdc_mem_tier_shards: '4'
         # KEY deletes even in file mode: deletion_mode auto resolves to
         # position, which serializes compaction with writers (try_lock
         # starvation under continuous CDC — measured unbounded file/read-amp
@@ -220,6 +223,7 @@ datasets:
         cayenne_cdc_mem_tier_max_bytes: '268435456' # 256 MiB
         cayenne_cdc_mem_tier_min_flush_bytes: '33554432' # 32 MiB
         cayenne_cdc_mem_tier_max_age_ms: '30000'
+        cayenne_cdc_mem_tier_shards: '4'
         cayenne_deletion_mode: key
         cayenne_write_concurrency: '8'
         cayenne_segment_cache_mb: '64'
@@ -269,6 +273,7 @@ datasets:
         cayenne_cdc_mem_tier_max_bytes: '268435456' # 256 MiB
         cayenne_cdc_mem_tier_min_flush_bytes: '33554432' # 32 MiB
         cayenne_cdc_mem_tier_max_age_ms: '30000'
+        cayenne_cdc_mem_tier_shards: '4'
         cayenne_deletion_mode: key
         cayenne_write_concurrency: '2'
         cayenne_segment_cache_mb: '16'

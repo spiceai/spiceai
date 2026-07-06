@@ -47,8 +47,9 @@ limitations under the License.
 //! columns and the original HTTP metadata (e.g. for direct fetches via
 //! filter pushdown on `request_path`).
 
+use crate::schema_projection::SchemaProjection;
 use snafu::{ResultExt, Snafu};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -67,21 +68,22 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 #[derive(Debug, Clone)]
 pub struct HttpJsonNesting {
     /// Column order exactly as declared in the spicepod, used to build
-    /// the table schema. Includes `json_field_name` in its declared
+    /// the table schema. Includes the catch-all column in its declared
     /// position.
     pub column_order: Vec<String>,
-    /// Set of declared static field names (i.e. `column_order` minus
-    /// `json_field_name` and `metadata_fields`). These are extracted as
-    /// top-level keys from each JSON response row.
-    pub static_fields: HashSet<String>,
     /// Set of declared columns sourced from HTTP request/response
     /// metadata rather than from the JSON body. Names must match
     /// fields in [`HttpTableProvider::base_table_schema`].
     ///
     /// [`HttpTableProvider::base_table_schema`]: super::provider::HttpTableProvider::base_table_schema
     pub metadata_fields: HashSet<String>,
-    /// Name of the catch-all JSON column.
-    pub json_field_name: String,
+    /// Connector-agnostic projection (kept fields + catch-all) that performs the
+    /// actual object decomposition via [`SchemaProjection::project_row`]. This
+    /// is the shared core used by every nesting-capable connector; HTTP only
+    /// adds the string-parsing, raw-text-fallback, and metadata-field handling
+    /// around it. The static-field set and catch-all name are read back from it
+    /// via [`Self::static_fields`] / [`Self::json_field_name`].
+    projection: SchemaProjection,
 }
 
 impl HttpJsonNesting {
@@ -95,19 +97,32 @@ impl HttpJsonNesting {
         json_field_name: String,
         metadata_fields: HashSet<String>,
     ) -> Self {
-        let static_fields: HashSet<String> = column_order
+        let static_fields: Vec<String> = column_order
             .iter()
             .filter(|c| {
                 c.as_str() != json_field_name.as_str() && !metadata_fields.contains(c.as_str())
             })
             .cloned()
             .collect();
+        let projection = SchemaProjection::nesting(static_fields, json_field_name);
         Self {
             column_order,
-            static_fields,
             metadata_fields,
-            json_field_name,
+            projection,
         }
+    }
+
+    /// Declared static (kept-as-is) field names. Read from the shared
+    /// projection so there is a single source of truth.
+    #[must_use]
+    pub fn static_fields(&self) -> &HashSet<String> {
+        self.projection.static_fields()
+    }
+
+    /// Name of the catch-all JSON column. Read from the shared projection.
+    #[must_use]
+    pub fn json_field_name(&self) -> &str {
+        self.projection.catch_all_name().unwrap_or_default()
     }
 }
 
@@ -139,13 +154,12 @@ pub type DecomposedRow = HashMap<String, Option<String>>;
 /// [`HttpExec::parse_content`]: super::provider::HttpExec
 pub fn decompose_json_row(json_row: &str, nesting: &HttpJsonNesting) -> Result<DecomposedRow> {
     let mut out: DecomposedRow = HashMap::new();
-
-    let Ok(value) = serde_json::from_str::<serde_json::Value>(json_row) else {
+    let Ok(mut value) = serde_json::from_str::<serde_json::Value>(json_row) else {
         // Not valid JSON: preserve the raw row instead of failing the
         // whole query. All declared static fields are NULL; the
         // catch-all keeps the raw text as a JSON string (NULL when the
         // body is empty/whitespace).
-        for name in &nesting.static_fields {
+        for name in nesting.static_fields() {
             out.insert(name.clone(), None);
         }
         let catchall = if json_row.trim().is_empty() {
@@ -156,58 +170,38 @@ pub fn decompose_json_row(json_row: &str, nesting: &HttpJsonNesting) -> Result<D
                     .context(JsonSerializeSnafu)?,
             )
         };
-        out.insert(nesting.json_field_name.clone(), catchall);
+        out.insert(nesting.json_field_name().to_string(), catchall);
         return Ok(out);
     };
 
-    match value {
-        serde_json::Value::Object(map) => {
-            // Use BTreeMap so the serialized catch-all has deterministic,
-            // sorted keys (matches DynamoDB's `json_nest` behavior).
-            let mut catchall: BTreeMap<String, serde_json::Value> = BTreeMap::new();
-
-            for (k, v) in map {
-                if nesting.metadata_fields.contains(&k) {
-                    // Body keys colliding with HTTP metadata names are
-                    // ignored here; the metadata column is populated
-                    // from the actual HTTP request/response, not from
-                    // the body. Drop the body key from both the static
-                    // and catch-all outputs.
-                    continue;
-                }
-                if nesting.static_fields.contains(&k) {
-                    out.insert(k, json_value_to_string(v));
-                } else {
-                    catchall.insert(k, v);
-                }
-            }
-
-            // Any declared static field that was absent from the row
-            // becomes explicit NULL rather than being missing from the
-            // batch.
-            for name in &nesting.static_fields {
-                out.entry(name.clone()).or_insert(None);
-            }
-
-            let catchall_str = if catchall.is_empty() {
-                None
-            } else {
-                Some(serde_json::to_string(&catchall).context(JsonSerializeSnafu)?)
-            };
-            out.insert(nesting.json_field_name.clone(), catchall_str);
-        }
-        other => {
-            // Non-object row: preserve it in the catch-all column so no
-            // data is lost. Static fields are NULL.
-            for name in &nesting.static_fields {
-                out.insert(name.clone(), None);
-            }
-            out.insert(
-                nesting.json_field_name.clone(),
-                Some(serde_json::to_string(&other).context(JsonSerializeSnafu)?),
-            );
-        }
+    // Body keys colliding with HTTP metadata names are dropped here: the
+    // metadata column is populated from the actual HTTP request/response, not
+    // from the body, and must not leak into the catch-all.
+    if let serde_json::Value::Object(map) = &mut value {
+        map.retain(|k, _| !nesting.metadata_fields.contains(k));
     }
+
+    // Delegate the static/catch-all partition + sorted-JSON serialization to the
+    // shared connector-agnostic core (`RowShape for serde_json::Value`).
+    let projected = nesting.projection.project_row(value);
+
+    let mut obj = match projected {
+        serde_json::Value::Object(map) => map,
+        // `project_row` always returns an object; this arm is unreachable.
+        _ => serde_json::Map::new(),
+    };
+
+    // Materialize one `Option<String>` per declared column. Absent declared
+    // fields (and an empty catch-all) become SQL NULL.
+    let mut out: DecomposedRow = HashMap::with_capacity(nesting.static_fields().len() + 1);
+    for name in nesting.static_fields() {
+        let value = obj.remove(name).and_then(json_value_to_string);
+        out.insert(name.clone(), value);
+    }
+    let catchall = obj
+        .remove(nesting.json_field_name())
+        .and_then(json_value_to_string);
+    out.insert(nesting.json_field_name().to_string(), catchall);
 
     Ok(out)
 }

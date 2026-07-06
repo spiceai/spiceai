@@ -67,6 +67,12 @@ pub struct MetricsCollector {
     /// A non-zero value with no user-visible error just means the network
     /// wobbled and we recovered.
     replication_reconnects_total: AtomicU64,
+    /// Cumulative seconds the shared-slot pump spent blocked trying to deliver
+    /// committed changes into this member's channel because its sink was not
+    /// draining. Non-zero means downstream backpressure stalled the pump (and
+    /// therefore every other member on the slot); the server connection itself
+    /// stays alive throughout. Only ever set for shared-slot datasets.
+    member_send_stalled_seconds_total: AtomicU64,
 
     // Watermark: commit time of the most-recent transaction we've ingested.
     // Used to compute `replication_lag_ms = now - watermark`.
@@ -194,6 +200,11 @@ impl MetricsCollector {
     pub fn inc_recv_error(&self) {
         self.replication_recv_errors_total
             .fetch_add(1, Ordering::Relaxed);
+    }
+    /// Add to the cumulative member-send-stalled seconds counter (shared slot).
+    pub fn add_send_stalled(&self, secs: u64) {
+        self.member_send_stalled_seconds_total
+            .fetch_add(secs, Ordering::Relaxed);
     }
     pub fn inc_reconnect(&self) {
         self.replication_reconnects_total
@@ -327,6 +338,12 @@ impl Metrics {
     pub fn replication_reconnects_total(&self) -> u64 {
         self.collector
             .replication_reconnects_total
+            .load(Ordering::Relaxed)
+    }
+    #[must_use]
+    pub fn member_send_stalled_seconds_total(&self) -> u64 {
+        self.collector
+            .member_send_stalled_seconds_total
             .load(Ordering::Relaxed)
     }
 }

@@ -372,6 +372,9 @@ pub struct DataFusionBuilder {
     memory_limit: Option<u64>,
     target_partitions: Option<usize>,
     prefer_hash_join: Option<bool>,
+    eager_aggregation: Option<bool>,
+    eager_aggregation_min_reduction_factor: Option<usize>,
+    eager_aggregation_max_pushed_groups: Option<usize>,
     temp_directory: Option<String>,
     accelerated_refresh_semaphore: Option<Arc<Semaphore>>,
     query_admission_semaphore: Option<Arc<Semaphore>>,
@@ -391,6 +394,11 @@ pub struct DataFusionBuilder {
     /// dedicated thread pools are enabled (set by the Runtime builder); `None`
     /// leaves the full budget to queries and gives compaction no separate pool.
     compaction_memory_fraction: Option<f64>,
+    /// Estimated aggregate bytes the enabled changes-mode Cayenne tables reserve
+    /// OUTSIDE the query pool (per-table keyset/segment/coalesce/inline caches),
+    /// set by the Runtime builder. When it exceeds the base host/10 headroom, the
+    /// query-memory default is reduced by the excess. 0 = none / not Cayenne CDC.
+    cayenne_cdc_reservation_bytes: u64,
     cayenne_optimizer_rules: CayenneOptimizerRules,
     /// Arbitrary additional analyzer rules.
     additional_analyzer_rules: Vec<Arc<dyn AnalyzerRule + Send + Sync>>,
@@ -432,6 +440,9 @@ impl DataFusionBuilder {
             memory_limit: None,
             target_partitions: None,
             prefer_hash_join: None,
+            eager_aggregation: None,
+            eager_aggregation_min_reduction_factor: None,
+            eager_aggregation_max_pushed_groups: None,
             temp_directory: None,
             accelerated_refresh_semaphore: None,
             query_admission_semaphore: None,
@@ -447,6 +458,7 @@ impl DataFusionBuilder {
             cayenne_sort_merge_memory_pool_fraction: None,
             cayenne_footer_cache_mb: None,
             compaction_memory_fraction: None,
+            cayenne_cdc_reservation_bytes: 0,
             cayenne_optimizer_rules: CayenneOptimizerRules::default(),
             additional_analyzer_rules: vec![],
             executor_registry: None,
@@ -488,6 +500,24 @@ impl DataFusionBuilder {
     #[must_use]
     pub fn prefer_hash_join(mut self, prefer_hash_join: Option<bool>) -> Self {
         self.prefer_hash_join = prefer_hash_join;
+        self
+    }
+
+    #[must_use]
+    pub fn eager_aggregation(mut self, eager_aggregation: Option<bool>) -> Self {
+        self.eager_aggregation = eager_aggregation;
+        self
+    }
+
+    #[must_use]
+    pub fn eager_aggregation_min_reduction_factor(mut self, factor: Option<usize>) -> Self {
+        self.eager_aggregation_min_reduction_factor = factor;
+        self
+    }
+
+    #[must_use]
+    pub fn eager_aggregation_max_pushed_groups(mut self, cap: Option<usize>) -> Self {
+        self.eager_aggregation_max_pushed_groups = cap;
         self
     }
 
@@ -580,6 +610,16 @@ impl DataFusionBuilder {
         self
     }
 
+    /// Estimated off-pool per-table Cayenne CDC cache reservation (bytes), summed
+    /// over enabled changes-mode Cayenne tables (keyset/segment/coalesce/inline).
+    /// Used to reduce the query-memory default when it exceeds the base host/10
+    /// headroom. Set by the Runtime builder; `0` disables the reduction.
+    #[must_use]
+    pub fn cayenne_cdc_reservation_bytes(mut self, bytes: u64) -> Self {
+        self.cayenne_cdc_reservation_bytes = bytes;
+        self
+    }
+
     /// Carve a dedicated compaction memory pool of `fraction` of the query
     /// memory limit. Set by the Runtime builder only when Cayenne acceleration
     /// is configured and dedicated thread pools are enabled.
@@ -661,8 +701,11 @@ impl DataFusionBuilder {
             .compaction_memory_fraction
             .and_then(validate_compaction_memory_fraction);
         let cayenne_active = compaction_memory_fraction.is_some();
-        let effective_memory_limit =
-            effective_query_memory_limit(self.memory_limit, cayenne_active);
+        let effective_memory_limit = effective_query_memory_limit(
+            self.memory_limit,
+            cayenne_active,
+            self.cayenne_cdc_reservation_bytes,
+        );
         let compaction_memory_bytes = compaction_memory_fraction.map(|fraction| {
             #[expect(
                 clippy::cast_precision_loss,
@@ -762,6 +805,44 @@ impl DataFusionBuilder {
         if let Some(prefer_hash_join) = self.prefer_hash_join {
             config.options_mut().optimizer.prefer_hash_join = prefer_hash_join;
             tracing::info!(prefer_hash_join, "Applied runtime.query.prefer_hash_join");
+        }
+
+        // Cost-based eager-aggregation physical optimizer
+        // (`datafusion.optimizer.enable_eager_aggregation`): pushes a partial
+        // aggregation below a join when a statistics-based cost model predicts a
+        // large row reduction, then re-aggregates above the join. Enabled by
+        // default in spiced (DataFusion's own default is off); disable via
+        // `runtime.query.eager_aggregation: false`. The cost gate can be tuned
+        // with `runtime.query.eager_aggregation_min_reduction_factor`
+        // (DataFusion default 4) and `..._max_pushed_groups` (default 0 =
+        // uncapped); unset leaves the DataFusion default in place.
+        let eager_aggregation = self.eager_aggregation.unwrap_or(true);
+        config.options_mut().optimizer.enable_eager_aggregation = eager_aggregation;
+        if let Some(factor) = self.eager_aggregation_min_reduction_factor {
+            if factor > 0 {
+                config
+                    .options_mut()
+                    .optimizer
+                    .eager_aggregation_min_reduction_factor = factor;
+            } else {
+                tracing::warn!(
+                    "Ignoring runtime.query.eager_aggregation_min_reduction_factor=0; value must be greater than 0"
+                );
+            }
+        }
+        if let Some(cap) = self.eager_aggregation_max_pushed_groups {
+            config
+                .options_mut()
+                .optimizer
+                .eager_aggregation_max_pushed_groups = cap;
+        }
+        if self.eager_aggregation.is_some() {
+            tracing::info!(eager_aggregation, "Applied runtime.query.eager_aggregation");
+        } else {
+            tracing::info!(
+                eager_aggregation,
+                "runtime.query.eager_aggregation not set; defaulting to spiced default"
+            );
         }
 
         // Sizes DataFusion's *native* hash-join InList dynamic-filter budget
@@ -1108,6 +1189,7 @@ impl DataFusionBuilder {
             pending_initializations: TokioRwLock::new(HashMap::new()),
             pending_initializations_count: std::sync::atomic::AtomicUsize::new(0),
             query_cancel_registry: Arc::new(super::query::registry::QueryCancelRegistry::new()),
+            write_stats_notify: tokio::sync::Notify::new(),
             accelerated_tables: TokioRwLock::new(HashSet::new()),
             accelerator_engine_registry: self.accelerator_engine_registry,
             acceleration_refresh_semaphore: self.accelerated_refresh_semaphore,
@@ -1402,29 +1484,67 @@ impl Default for AnalyzerRulesBuilder {
 /// compaction carve) when the operator sets no explicit `runtime.query.memory_limit`.
 const DEFAULT_QUERY_MEMORY_PERCENT: u64 = 90;
 
-/// Reduced default used when Cayenne in-memory acceleration is active. The query
-/// pool, the carved compaction pool, AND the off-pool Cayenne in-memory CDC tier
-/// (`cdc_durability: memory`) are each derived from total RAM; sized in isolation
-/// they sum to >100% of host — the SF1000 process-OOM (RSS 242 GiB on a 256 GiB
-/// box, the query pool never reporting exhaustion because the tier is off-pool).
-/// Capping the query+compaction block at 75% reserves the remaining 25% for the
-/// tier (~12.5%) plus caches / inline memtables / encode buffers / OS headroom
-/// (~12.5%). See [`coordinated_mem_tier_budget`].
-const CAYENNE_QUERY_MEMORY_PERCENT: u64 = 75;
+/// Reduced BASE default used when Cayenne in-memory acceleration is active. The
+/// query pool, the carved compaction pool, AND the off-pool Cayenne in-memory CDC
+/// tier (`cdc_durability: memory`) are each derived from total RAM; sized in
+/// isolation they sum to >100% of host — the SF1000 process-OOM (RSS 242 GiB on a
+/// 256 GiB box, the query pool never reporting exhaustion because the tier is
+/// off-pool). Capping the query+compaction block at 70% reserves the remaining 30%
+/// for the in-memory tier (up to 20%, host/5, [`coordinated_mem_tier_budget`]) plus
+/// a 10% (host/10) headroom covering the off-pool per-table CDC caches / inline
+/// memtables / encode buffers / OS overhead — a 70% / 20% / 10% = 100% partition.
+/// This is only the BASE: when the estimated per-table CDC cache reservation
+/// (keyset/segment/coalesce/inline, summed over changes-mode tables) EXCEEDS the
+/// host/10 headroom, the query default is reduced further by the excess in
+/// [`effective_query_memory_limit`], down to [`CAYENNE_QUERY_MEMORY_FLOOR_PERCENT`].
+const CAYENNE_QUERY_MEMORY_PERCENT: u64 = 70;
 
-fn effective_query_memory_limit(memory_limit: Option<u64>, cayenne_active: bool) -> u64 {
+/// Floor (% of host) the reservation-aware reduction never pushes the query pool
+/// below, so a cache-heavy CDC config (many tables and/or large per-table caches)
+/// cannot starve queries. Beyond it, the mem-tier install-time check warns and
+/// memory mode leans on the per-table caps + spill/durable backstops.
+const CAYENNE_QUERY_MEMORY_FLOOR_PERCENT: u64 = 50;
+
+fn effective_query_memory_limit(
+    memory_limit: Option<u64>,
+    cayenne_active: bool,
+    cdc_reservation_bytes: u64,
+) -> u64 {
     memory_limit.unwrap_or_else(|| {
         let total_memory = crate::resource_monitor::get_total_memory();
-        let percent = if cayenne_active {
-            CAYENNE_QUERY_MEMORY_PERCENT
-        } else {
-            DEFAULT_QUERY_MEMORY_PERCENT
-        };
-        let default_limit = total_memory.saturating_mul(percent) / 100;
+        if !cayenne_active {
+            let default_limit = total_memory.saturating_mul(DEFAULT_QUERY_MEMORY_PERCENT) / 100;
+            tracing::debug!(
+                cayenne_active,
+                "No query memory limit specified, defaulting to {DEFAULT_QUERY_MEMORY_PERCENT}% of total memory: {}",
+                util::human_readable_bytes(default_limit as usize)
+            );
+            return default_limit;
+        }
+
+        // Cayenne CDC active. Base is CAYENNE_QUERY_MEMORY_PERCENT of host, leaving
+        // room for the off-pool in-memory tier (clamped to <= host/5 by
+        // `coordinated_mem_tier_budget`) plus a host/10 headroom for the off-pool
+        // per-table CDC caches + OS overhead — a 70 / 20 / 10 = 100% partition. The
+        // per-table caches (keyset/segment/coalesce/inline) live OUTSIDE the query
+        // pool and scale with table count; they are assumed to fit the host/10
+        // headroom. When the estimated reservation EXCEEDS that headroom, carve the
+        // excess out of the query pool so the freed query bytes cover the excess
+        // caches and `query_pool + compaction + tier + caches + headroom` stays
+        // within host. Floored at CAYENNE_QUERY_MEMORY_FLOOR_PERCENT so a very
+        // cache-heavy config never starves queries (past the floor the tier
+        // install-time check warns).
+        let base = total_memory.saturating_mul(CAYENNE_QUERY_MEMORY_PERCENT) / 100;
+        let base_headroom = total_memory / MEM_TIER_HEADROOM_FRACTION;
+        let reservation_excess = cdc_reservation_bytes.saturating_sub(base_headroom);
+        let floor = total_memory.saturating_mul(CAYENNE_QUERY_MEMORY_FLOOR_PERCENT) / 100;
+        let default_limit = base.saturating_sub(reservation_excess).max(floor);
 
         tracing::debug!(
             cayenne_active,
-            "No query memory limit specified, defaulting to {percent}% of total memory: {}",
+            cdc_reservation_bytes,
+            reservation_excess,
+            "No query memory limit specified; Cayenne CDC base {CAYENNE_QUERY_MEMORY_PERCENT}% of total, reduced by the per-table CDC reservation above the host/10 headroom to: {}",
             util::human_readable_bytes(default_limit as usize)
         );
 
@@ -1433,19 +1553,21 @@ fn effective_query_memory_limit(memory_limit: Option<u64>, cayenne_active: bool)
 }
 
 /// 1/N of host RAM bounding the aggregate off-pool Cayenne in-memory CDC tier (the
-/// ceiling), and the headroom reserve held beyond the pools+tier for caches,
-/// inline memtables, encode buffers, and OS/allocator overhead. Both 1/8 ⇒ with
-/// the 75% query+compaction block the host partitions as 75% / 12.5% / 12.5%.
-const MEM_TIER_CEILING_FRACTION: u64 = 8;
-const MEM_TIER_HEADROOM_FRACTION: u64 = 8;
+/// ceiling, 1/5 = 20%), and the headroom reserve held beyond the pools+tier for the
+/// off-pool per-table CDC caches, inline memtables, encode buffers, and OS/allocator
+/// overhead (1/10 = 10%). With the 70% query+compaction block the host partitions as
+/// 70% / 20% / 10% = 100%.
+const MEM_TIER_CEILING_FRACTION: u64 = 5;
+const MEM_TIER_HEADROOM_FRACTION: u64 = 10;
 /// Raised tier ceiling (1/N of host, > the base `MEM_TIER_CEILING_FRACTION`) the
 /// tier may FLOAT up to on a query-light deployment — one where the operator set a
 /// low `runtime.query.memory_limit`, leaving RAM the default partition would not
 /// otherwise use. The float only consumes room left beyond a DOUBLED headroom
 /// reserve and never exceeds the coordinated remainder, so `query_pool +
 /// compaction + tier + headroom <= host` (the #11449 invariant) is preserved
-/// exactly. 1/6 ≈ 16.7%, a modest bump from the 12.5% base.
-const MEM_TIER_FLOAT_CEILING_FRACTION: u64 = 6;
+/// exactly. 1/4 = 25%, a modest bump above the 20% base ceiling — the fraction must
+/// stay SMALLER than `MEM_TIER_CEILING_FRACTION` so the float sits ABOVE the base.
+const MEM_TIER_FLOAT_CEILING_FRACTION: u64 = 4;
 /// Floor (1/N of host) so a global aggregate cap is ALWAYS installed — a tier
 /// budget of 0 disables the global cap entirely (per-table caps then sum unbounded
 /// across a fleet: the original no-global-cap OOM). Binds only when an operator
@@ -1464,7 +1586,7 @@ pub(crate) const MEM_TIER_FLOOR_FRACTION: u64 = 32;
 /// default inputs — a query pool sized to leave room (see
 /// [`effective_query_memory_limit`]) — it yields
 /// `query_pool + compaction + tier + headroom ≤ host`. The result is clamped to
-/// `[host/32, host/8]`: the `host/8` ceiling keeps the tier ≤ 1/8 of host when the
+/// `[host/32, host/5]`: the `host/5` ceiling keeps the tier ≤ 1/5 of host when the
 /// pools are small, and the `host/32` floor guarantees a nonzero global aggregate
 /// cap is ALWAYS installed (a 0 budget would disable the cap — the original
 /// no-global-cap OOM).
@@ -1489,7 +1611,7 @@ pub(crate) fn coordinated_mem_tier_budget(
     // Floating ceiling for query-light deployments: when the query + compaction
     // pools are sized well below the default partition (an operator who set a low
     // `runtime.query.memory_limit`), let the tier reclaim part of the freed RAM
-    // above the base host/8 cap — up to `host / MEM_TIER_FLOAT_CEILING_FRACTION` —
+    // above the base host/5 cap — up to `host / MEM_TIER_FLOAT_CEILING_FRACTION` —
     // but only the room left beyond a DOUBLED headroom reserve, so the off-pool
     // caches/memtables the single headroom covers keep their slack. Raising only the
     // ceiling never lifts the result above `remainder` (the ceiling caps from above,
@@ -1727,11 +1849,11 @@ mod tests {
     use datafusion_expr::{Expr, LogicalPlan};
 
     use super::{
-        CAYENNE_QUERY_MEMORY_PERCENT, CayenneOptimizerRules, DEFAULT_QUERY_MEMORY_PERCENT,
-        DataFusionBuilder, MEM_TIER_CEILING_FRACTION, MEM_TIER_FLOAT_CEILING_FRACTION,
-        MEM_TIER_FLOOR_FRACTION, MEM_TIER_HEADROOM_FRACTION, build_compaction_runtime_env,
-        configure_hash_join_memory_limits, coordinated_mem_tier_budget,
-        effective_query_memory_limit,
+        CAYENNE_QUERY_MEMORY_FLOOR_PERCENT, CAYENNE_QUERY_MEMORY_PERCENT, CayenneOptimizerRules,
+        DEFAULT_QUERY_MEMORY_PERCENT, DataFusionBuilder, MEM_TIER_CEILING_FRACTION,
+        MEM_TIER_FLOAT_CEILING_FRACTION, MEM_TIER_FLOOR_FRACTION, MEM_TIER_HEADROOM_FRACTION,
+        build_compaction_runtime_env, configure_hash_join_memory_limits,
+        coordinated_mem_tier_budget, effective_query_memory_limit,
         runtime_env_with_effective_memory_limit_and_object_store_registry,
         validate_compaction_memory_fraction,
     };
@@ -1749,25 +1871,75 @@ mod tests {
     #[test]
     fn effective_query_memory_limit_honors_explicit_value() {
         assert_eq!(
-            effective_query_memory_limit(Some(123 << 30), true),
+            effective_query_memory_limit(Some(123 << 30), true, 0),
             123 << 30
         );
         assert_eq!(
-            effective_query_memory_limit(Some(123 << 30), false),
+            effective_query_memory_limit(Some(123 << 30), false, 0),
             123 << 30
         );
-        assert_eq!(effective_query_memory_limit(Some(7), true), 7);
+        // A nonzero CDC reservation never overrides an explicit limit.
+        assert_eq!(effective_query_memory_limit(Some(7), true, 1 << 30), 7);
+    }
+
+    /// Cayenne active, no explicit limit: a per-table CDC reservation at/under the
+    /// base host/10 headroom leaves the default at the base 70%; a reservation ABOVE
+    /// the headroom reduces the default by exactly the excess; and a very large
+    /// reservation floors at `CAYENNE_QUERY_MEMORY_FLOOR_PERCENT` (never 0). Reads
+    /// live host RAM, so it asserts the RELATIONSHIPS rather than absolute bytes.
+    #[test]
+    fn effective_query_memory_limit_reduces_by_cdc_reservation() {
+        let total = crate::resource_monitor::get_total_memory();
+        let base = total.saturating_mul(CAYENNE_QUERY_MEMORY_PERCENT) / 100;
+        let headroom = total / MEM_TIER_HEADROOM_FRACTION;
+        let floor = total.saturating_mul(CAYENNE_QUERY_MEMORY_FLOOR_PERCENT) / 100;
+
+        // Reservation within the base headroom -> no reduction, stays at base 70%.
+        assert_eq!(effective_query_memory_limit(None, true, 0), base);
+        assert_eq!(effective_query_memory_limit(None, true, headroom), base);
+
+        // Reservation above the headroom -> reduced by exactly the excess.
+        let excess = headroom / 2;
+        assert_eq!(
+            effective_query_memory_limit(None, true, headroom + excess),
+            base - excess
+        );
+
+        // A reservation larger than the whole host floors the pool, never 0.
+        let floored = effective_query_memory_limit(None, true, total.saturating_mul(2));
+        assert_eq!(floored, floor);
+        assert!(floored > 0);
+
+        // The reservation never affects the non-Cayenne default.
+        assert_eq!(
+            effective_query_memory_limit(None, false, total),
+            total.saturating_mul(DEFAULT_QUERY_MEMORY_PERCENT) / 100
+        );
     }
 
     // Compile-time invariants on the host-partition constants: the Cayenne
-    // query-pool default must be below the non-Cayenne default, and the partition
-    // (75% query+compaction, one-eighth tier ceiling, one-eighth headroom) sums to
-    // 100% of host. `const` assertions (compile-time) rather than a runtime test
-    // asserting constant values (which clippy flags as assertions_on_constants).
+    // query-pool default must be below the non-Cayenne default, and the default
+    // partition (70% query+compaction, one-fifth tier ceiling, one-tenth headroom)
+    // sums to exactly 100% of host — a 90% allocated block plus a 10% headroom
+    // reserve for the off-pool per-table CDC caches and OS overhead. `const`
+    // assertions (compile-time) rather than a runtime test asserting constant values
+    // (which clippy flags as assertions_on_constants).
     const _: () = assert!(CAYENNE_QUERY_MEMORY_PERCENT < DEFAULT_QUERY_MEMORY_PERCENT);
-    const _: () = assert!(CAYENNE_QUERY_MEMORY_PERCENT == 75);
-    const _: () = assert!(MEM_TIER_CEILING_FRACTION == 8); // one-eighth = 12.5%
-    const _: () = assert!(MEM_TIER_HEADROOM_FRACTION == 8); // one-eighth = 12.5%
+    const _: () = assert!(CAYENNE_QUERY_MEMORY_PERCENT == 70);
+    const _: () = assert!(MEM_TIER_CEILING_FRACTION == 5); // one-fifth = 20%
+    const _: () = assert!(MEM_TIER_HEADROOM_FRACTION == 10); // one-tenth = 10%
+    // The default partition must not overcommit host RAM: query+compaction (%) +
+    // tier ceiling (100/CEIL %) + headroom (100/HEAD %) <= 100. Cross-multiplied to
+    // exact integer form (no truncation of fractional percentages). 70/20/10 = 100.
+    const _: () = assert!(
+        CAYENNE_QUERY_MEMORY_PERCENT * MEM_TIER_CEILING_FRACTION * MEM_TIER_HEADROOM_FRACTION
+            + 100 * MEM_TIER_HEADROOM_FRACTION
+            + 100 * MEM_TIER_CEILING_FRACTION
+            <= 100 * MEM_TIER_CEILING_FRACTION * MEM_TIER_HEADROOM_FRACTION
+    );
+    // The float ceiling must sit ABOVE the base ceiling (smaller fraction = larger
+    // share of host) or the query-light float is inert.
+    const _: () = assert!(MEM_TIER_FLOAT_CEILING_FRACTION < MEM_TIER_CEILING_FRACTION);
 
     /// THE invariant: for the coordinated default partition (Cayenne active, no
     /// explicit limit), `query_pool + compaction + mem_tier + headroom` never
@@ -1800,7 +1972,7 @@ mod tests {
     /// The tier budget is always clamped to `[host/32, host/MEM_TIER_FLOAT_CEILING]`:
     /// never 0 (a 0 budget disables the global aggregate cap, the original
     /// no-global-cap OOM) and never above the float ceiling even when the pools are
-    /// tiny. The float (host/6) only engages on a query-light deployment and never
+    /// tiny. The float (host/4) only engages on a query-light deployment and never
     /// breaks the no-overcommit invariant.
     #[test]
     fn coordinated_tier_budget_stays_within_clamp() {
@@ -1824,7 +1996,7 @@ mod tests {
                 "the float must not overcommit host RAM"
             );
 
-            // A moderate query pool at the default 75% partition stays at/under the
+            // A moderate query pool at the default 70% partition stays at/under the
             // BASE ceiling (the float only helps when the pool is sized down).
             let pre_carve = total.saturating_mul(CAYENNE_QUERY_MEMORY_PERCENT) / 100;
             let moderate = coordinated_mem_tier_budget(total, pre_carve, 0);
@@ -2041,6 +2213,84 @@ mod tests {
                 .target_partitions,
             4,
             "Without an override target_partitions should fall back to DataFusion's default"
+        );
+    }
+
+    #[test]
+    fn test_eager_aggregation_wires_through_to_session_config() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime");
+        let handle = rt.handle().clone();
+
+        // Default: spiced enables eager aggregation even though DataFusion's own
+        // default is off.
+        let df_default = DataFusionBuilder::new(
+            status::RuntimeStatus::new(),
+            Arc::new(AcceleratorEngineRegistry::default()),
+            handle.clone(),
+        )
+        .build();
+        assert!(
+            df_default
+                .ctx
+                .state()
+                .config()
+                .options()
+                .optimizer
+                .enable_eager_aggregation,
+            "eager aggregation should default to enabled in spiced"
+        );
+
+        // An explicit `false` disables the rule.
+        let df_off = DataFusionBuilder::new(
+            status::RuntimeStatus::new(),
+            Arc::new(AcceleratorEngineRegistry::default()),
+            handle.clone(),
+        )
+        .eager_aggregation(Some(false))
+        .build();
+        assert!(
+            !df_off
+                .ctx
+                .state()
+                .config()
+                .options()
+                .optimizer
+                .enable_eager_aggregation,
+            "eager_aggregation: false should disable the rule"
+        );
+
+        // The two tuning knobs wire through to the optimizer options.
+        let df_tuned = DataFusionBuilder::new(
+            status::RuntimeStatus::new(),
+            Arc::new(AcceleratorEngineRegistry::default()),
+            handle,
+        )
+        .eager_aggregation(Some(true))
+        .eager_aggregation_min_reduction_factor(Some(8))
+        .eager_aggregation_max_pushed_groups(Some(1024))
+        .build();
+        assert_eq!(
+            df_tuned
+                .ctx
+                .state()
+                .config()
+                .options()
+                .optimizer
+                .eager_aggregation_min_reduction_factor,
+            8
+        );
+        assert_eq!(
+            df_tuned
+                .ctx
+                .state()
+                .config()
+                .options()
+                .optimizer
+                .eager_aggregation_max_pushed_groups,
+            1024
         );
     }
 

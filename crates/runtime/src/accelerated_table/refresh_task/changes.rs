@@ -1231,7 +1231,27 @@ impl RefreshTask {
                 pending_commit: &mut pending_commit,
                 deferred_commits: deferred_commits.as_ref(),
             };
-            if !self.apply_burst(&mut apply_context, burst).await {
+            // Which cap closed this burst — the tuning signal for `cdc_max_coalesced_envelopes` /
+            // `cdc_max_coalesced_bytes` / `cdc_max_coalesce_age_ms`
+            let close_reason = if burst.len() >= max_burst {
+                "envelope_cap"
+            } else if carried_item.is_some() || burst_bytes >= max_burst_bytes {
+                "byte_cap"
+            } else if channel_closed {
+                "stream_end"
+            } else if self.runtime_status.is_shutdown() {
+                // The linger loop exits early on shutdown; without this arm those
+                // bursts would misreport as `age_deadline` and skew tuning signals.
+                "shutdown"
+            } else if cdc_cfg.max_coalesce_age_ms > 0 {
+                "age_deadline"
+            } else {
+                "drained"
+            };
+            if !self
+                .apply_burst(&mut apply_context, burst, close_reason)
+                .await
+            {
                 rx.close();
                 reader_handle.abort();
                 break;
@@ -1346,6 +1366,7 @@ impl RefreshTask {
         &self,
         context: &mut ApplyContext<'_>,
         burst: Vec<Result<cdc::ChangeEnvelope, cdc::StreamError>>,
+        close_reason: &'static str,
     ) -> bool {
         let burst_start = Instant::now();
         let burst_envelopes = u64::try_from(burst.len()).unwrap_or(u64::MAX);
@@ -1407,6 +1428,15 @@ impl RefreshTask {
                 }
             }
         }
+        tracing::debug!(
+            dataset = %context.dataset_name,
+            envelopes = burst_envelopes,
+            bytes = burst_bytes,
+            rows = burst_rows,
+            close_reason,
+            apply_ms = elapsed_ms(burst_start),
+            "Applied coalesced CDC change burst"
+        );
         metrics::CDC_APPLY_BURST_DURATION_MS.record(elapsed_ms(burst_start), &labels);
         true
     }
@@ -2387,16 +2417,42 @@ impl RefreshTask {
         )?;
 
         if let Some(combined) = combined {
-            let delete_plan = self
-                .accelerator
-                .delete_from(session_state, vec![combined])
-                .await
-                .map_err(find_datafusion_root)
-                .context(crate::accelerated_table::FailedToWriteDataSnafu)?;
-            collect(delete_plan, ctx.task_ctx())
-                .await
-                .map_err(find_datafusion_root)
-                .context(crate::accelerated_table::FailedToWriteDataSnafu)?;
+            // The CDC apply loop discards the "rows affected" count. Cayenne can
+            // handle key-delete CDC batches through a count-skipping path; non-
+            // Cayenne accelerators and shapes Cayenne declines fall back to the
+            // generic `delete_from` below.
+            let handled_by_cayenne_cdc_path = {
+                #[cfg(not(windows))]
+                {
+                    if let Some(cayenne) = self.cayenne_accelerator() {
+                        cayenne
+                            .delete_from_cdc_fast(std::slice::from_ref(&combined))
+                            .await
+                            .map_err(find_datafusion_root)
+                            .context(crate::accelerated_table::FailedToWriteDataSnafu)?
+                            .is_some()
+                    } else {
+                        false
+                    }
+                }
+                #[cfg(windows)]
+                {
+                    false
+                }
+            };
+
+            if !handled_by_cayenne_cdc_path {
+                let delete_plan = self
+                    .accelerator
+                    .delete_from(session_state, vec![combined])
+                    .await
+                    .map_err(find_datafusion_root)
+                    .context(crate::accelerated_table::FailedToWriteDataSnafu)?;
+                collect(delete_plan, ctx.task_ctx())
+                    .await
+                    .map_err(find_datafusion_root)
+                    .context(crate::accelerated_table::FailedToWriteDataSnafu)?;
+            }
             wrote = true;
         }
 

@@ -169,6 +169,9 @@ impl CayenneContext {
             write_concurrency: wc_init,
             mem_tier_max_bytes: config.cdc_mem_tier_max_bytes,
             target_vortex_file_size_bytes: target_file_size_bytes_init,
+            // Starts at 0 (no queries shed). Only a violated lag/freshness goal
+            // under CPU contention drives it up — inert otherwise.
+            query_admission_reserve: 0,
         }));
         // Bounds keep the controller within sane, memory-/cpu-safe ranges. The
         // memtable and mem-tier ceilings are derived from the runtime-installed
@@ -233,6 +236,11 @@ impl CayenneContext {
             } else {
                 tuning::adaptive_target_file_size_bounds(target_file_size_bytes_init)
             },
+            // Reserve up to `cores` query-admission slots for CDC apply under
+            // contention; the process-global governor re-clamps the reported demand
+            // to the real admission pool's `max - 1`, so this cores-scale ceiling is
+            // a safe upper bound regardless of `runtime.query.max_concurrent_queries`.
+            query_admission_reserve: (0, cores),
         };
         // Register (idempotently) this table's query-observations handle in the
         // process-global registry so the runtime's query tracker can push p99
@@ -573,6 +581,34 @@ impl CayenneContext {
         }
     }
 
+    /// Max age of the ACTIVE ingestion piece before a **seal** durably shadows it
+    /// and advances the source slot (`cdc_durability: memory`). Returns `None` when
+    /// sealing is disabled (`cdc_mem_tier_seal_age_ms == 0`), in which case the
+    /// slot ack reverts to the checkpoint cadence. Like the checkpoint interval
+    /// this is a fixed time-domain durability-policy bound, not a tuned actuator.
+    #[must_use]
+    pub(crate) fn mem_tier_seal_age(&self) -> Option<std::time::Duration> {
+        let ms = self.config.cdc_mem_tier_seal_age_ms;
+        if ms == 0 {
+            None
+        } else {
+            Some(std::time::Duration::from_millis(ms))
+        }
+    }
+
+    /// Maximum age of buffered streaming-append data before the sink cuts the
+    /// segment and publishes it. Returns `None` when disabled (interval = 0):
+    /// the sink then publishes only when the input stream ends.
+    #[must_use]
+    pub(crate) fn stream_publish_interval(&self) -> Option<std::time::Duration> {
+        let ms = self.config.stream_publish_interval_ms;
+        if ms == 0 {
+            None
+        } else {
+            Some(std::time::Duration::from_millis(ms))
+        }
+    }
+
     /// Get the shared semaphore for limiting concurrent file writes / uploads.
     #[must_use]
     pub fn upload_semaphore(&self) -> &Arc<Semaphore> {
@@ -612,6 +648,14 @@ impl CayenneContext {
         if let Some(ts_ms) = source_commit_ts_ms {
             self.ingest_stats.observe_source_commit_ts_ms(ts_ms);
         }
+        // Fold this batch's end-to-end row freshness (apply wall-clock − the batch's
+        // source-commit ts) into the rolling windowed PEAK — the worst-case
+        // PG-commit→queryable lag the freshness SLO is stated against, and what the
+        // freshness-goal shrink lever controls on. No-op when the source carries no
+        // commit ts. Idle-immune (a post-idle batch measures its own small lag), so
+        // it must be folded here on the apply path, before the visibility stamp.
+        self.ingest_stats
+            .fold_row_freshness(now_ms, source_commit_ts_ms);
         // Stamp freshness at apply time. Exact for the synchronous publish path;
         // for the backgrounded staged-CDC publish this trails true visibility by
         // the finalize latency, so it is a lower bound on staleness.
@@ -640,6 +684,13 @@ impl CayenneContext {
         self.ingest_stats.mem_pressure()
     }
 
+    /// Test hook: inject a memory-pressure sample directly (production writes it
+    /// via the controller's `observe_environment`).
+    #[cfg(test)]
+    pub(crate) fn set_mem_pressure_for_test(&self, fraction: f64) {
+        self.ingest_stats.set_mem_pressure(fraction);
+    }
+
     /// A snapshot of the current ingest accounting (rate + response), enriched with
     /// the now-relative CDC goal signals (replication lag, freshness) and the
     /// query-side goal signals (p99 latency, QPH) — the wall clock and the
@@ -650,7 +701,19 @@ impl CayenneContext {
         let mut snap = self.ingest_stats.snapshot();
         let now_ms = chrono::Utc::now().timestamp_millis();
         snap.replication_lag_secs = self.ingest_stats.replication_lag_secs(now_ms);
-        snap.freshness_secs = self.ingest_stats.freshness_secs(now_ms);
+        // `freshness_secs` carries the windowed-PEAK per-apply row freshness (worst
+        // PG-commit→queryable lag over the last ~60s) rather than the instantaneous
+        // `now − last_visible` age. The peak is the SLO signal — the instantaneous
+        // value is sampled at a random phase (so it misses transient stalls the
+        // freshness-goal shrink lever must react to) and ramps unbounded on an idle
+        // table (so it reads as a false violation post-load). Both the freshness goal
+        // and the `cayenne_ingest_freshness_seconds` gauge read this field, so they
+        // share the robust signal. Falls back to the instantaneous age until the
+        // first apply carrying a source-commit ts seeds the peak.
+        snap.freshness_secs = self
+            .ingest_stats
+            .peak_row_freshness_secs(now_ms)
+            .or_else(|| self.ingest_stats.freshness_secs(now_ms));
         snap.query_latency_p99_ms = self.query_observations.p99_latency_ms();
         // QPH is system-wide (a query spanning datasets counts once), so every
         // table's controller reads the process-global aggregate — NOT this table's
@@ -670,6 +733,14 @@ impl CayenneContext {
     #[must_use]
     pub(crate) fn live_actuator_values(&self) -> tuning::ActuatorValues {
         self.live_actuators.values()
+    }
+
+    /// Whether closed-loop dynamic tuning is active for this table (an SLO goal is
+    /// set / `cayenne_tuning: adaptive`). Gates the per-tick query-admission reserve
+    /// report so it is a strict no-op for non-adaptive tables.
+    #[must_use]
+    pub(crate) fn dynamic_tuning_enabled(&self) -> bool {
+        self.dynamic_tuning
     }
 
     /// The operator-configured tuning goals (for telemetry/observability — the

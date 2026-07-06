@@ -52,7 +52,7 @@ expression: tools_list
   },
   {
     "description": "Return the current UTC date and time as an ISO 8601 timestamp. Call this whenever the model needs the actual current time to compute relative durations, evaluate freshness, or stamp generated content; do not guess or rely on training-data dates. Takes no arguments. Returns a string like '2026-05-06T13:45:00Z'.",
-    "name": "mcp_from_spiced/get_current_datetime",
+    "name": "mcp_from_spiced__get_current_datetime",
     "parameters": {
       "$schema": "http://json-schema.org/draft-07/schema#",
       "properties": {},
@@ -63,7 +63,7 @@ expression: tools_list
   },
   {
     "description": "Report the readiness state of every Spice runtime component (datasets, accelerators, models, embeddings, catalogs). Call this when diagnosing why a query, model, or search call is failing or returning empty results, or to verify the runtime is healthy before issuing other tool calls. Takes no arguments. Returns a JSON object mapping component name to status (e.g. 'Ready', 'Initializing', 'Error').",
-    "name": "mcp_from_spiced/get_readiness",
+    "name": "mcp_from_spiced__get_readiness",
     "parameters": {
       "$schema": "http://json-schema.org/draft-07/schema#",
       "properties": {},
@@ -74,7 +74,7 @@ expression: tools_list
   },
   {
     "description": "List every dataset, view, and catalog visible to this runtime, with each entry's fully-qualified table name, description, columns, and capability flags (e.g. `can_search_documents`). Call this first whenever you need to discover what data is available before issuing `sql`, `search`, `table_schema`, or sample tools. Takes no arguments. Returns a JSON array; use the `table` field as the identifier for follow-up tool calls.",
-    "name": "mcp_from_spiced/list_datasets",
+    "name": "mcp_from_spiced__list_datasets",
     "parameters": {
       "$schema": "http://json-schema.org/draft-07/schema#",
       "properties": {},
@@ -85,7 +85,7 @@ expression: tools_list
   },
   {
     "description": "Load memories previously saved by the language model.",
-    "name": "mcp_from_spiced/load_memory",
+    "name": "mcp_from_spiced__load_memory",
     "parameters": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "properties": {
@@ -117,7 +117,7 @@ expression: tools_list
   },
   {
     "description": "Get a random sample of rows from a Spice.ai dataset",
-    "name": "mcp_from_spiced/random_sample",
+    "name": "mcp_from_spiced__random_sample",
     "parameters": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "properties": {
@@ -142,7 +142,7 @@ expression: tools_list
   },
   {
     "description": "Sample distinct column values from a Spice.ai dataset",
-    "name": "mcp_from_spiced/sample_distinct_columns",
+    "name": "mcp_from_spiced__sample_distinct_columns",
     "parameters": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "properties": {
@@ -177,7 +177,7 @@ expression: tools_list
   },
   {
     "description": "Run a hybrid (vector + keyword) similarity search over datasets configured with embeddings. Use this for natural-language or semantic lookups (e.g. 'find documents about X') instead of exact SQL filtering. Provide `text` for the query; optionally restrict with `datasets` (only datasets whose `can_search_documents=true` in `list_datasets` are valid), `where_cond` (a SQL predicate without the `WHERE` keyword), `additional_columns`, and `limit`. Returns matched rows grouped per dataset with similarity scores.",
-    "name": "mcp_from_spiced/search",
+    "name": "mcp_from_spiced__search",
     "parameters": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "properties": {
@@ -232,7 +232,7 @@ expression: tools_list
   },
   {
     "description": "Execute an SQL query in the Spice.ai SQL Dialect (DataFusion SQL using PostgreSQL-dialect with Spice.ai functions) against the Spice runtime and return the result rows as JSON. Use this for any deterministic lookup, aggregation, or filter where exact column names are known; prefer `search` for semantic or natural-language lookups. Quote identifiers containing capitals or reserved keywords, and quote each part of `catalog.schema.table` separately (e.g. \"spice\".\"public\".\"my_table\"). Avoid `SELECT *` and columns ending in `_offset` or `_embedding`. Write statements (INSERT/UPDATE/DELETE/DDL) require the request to be authenticated with a ReadWrite API key AND the target dataset to be configured `access: read_write`; otherwise they are rejected. Use `list_datasets` and `table_schema` first to discover tables and columns.",
-    "name": "mcp_from_spiced/sql",
+    "name": "mcp_from_spiced__sql",
     "parameters": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "properties": {
@@ -250,7 +250,7 @@ expression: tools_list
   },
   {
     "description": "Record any details from 'user' messages that are worth remembering for future conversations.",
-    "name": "mcp_from_spiced/store_memory",
+    "name": "mcp_from_spiced__store_memory",
     "parameters": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "properties": {
@@ -271,7 +271,7 @@ expression: tools_list
   },
   {
     "description": "Return the column schema of one or more datasets. Call this before writing a `sql` query so you know exact column names, types, nullability, and (with `output=full`) descriptions and semantic metadata. Pass `tables` as fully-qualified names from `list_datasets`. `output` is `full` (default, includes metadata) or `minimal` (names + types only).",
-    "name": "mcp_from_spiced/table_schema",
+    "name": "mcp_from_spiced__table_schema",
     "parameters": {
       "$defs": {
         "OutputType": {
@@ -307,7 +307,7 @@ expression: tools_list
   },
   {
     "description": "Get top N samples from a Spice.ai dataset based on a specified ordering",
-    "name": "mcp_from_spiced/top_n_sample",
+    "name": "mcp_from_spiced__top_n_sample",
     "parameters": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "properties": {

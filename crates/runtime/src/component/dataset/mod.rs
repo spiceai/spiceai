@@ -63,6 +63,11 @@ pub enum Error {
         valid_columns: String,
     },
 
+    #[snafu(display(
+        "Cannot configure {constraint} because the dataset schema has no columns. This usually means the source table does not exist or could not be read. Verify the dataset's `from` target exists and is accessible, then try again."
+    ))]
+    AcceleratedSchemaEmpty { constraint: String },
+
     #[snafu(display("Failed to retrieve table constraints for the dataset: {source}"))]
     UnableToGetTableConstraints {
         source: datafusion::error::DataFusionError,
@@ -158,6 +163,9 @@ impl From<runtime_acceleration::AccelerationParseError> for Error {
                 invalid_column,
                 valid_columns,
             },
+            AccelerationParseError::AcceleratedSchemaEmpty { constraint } => {
+                Error::AcceleratedSchemaEmpty { constraint }
+            }
             AccelerationParseError::UnableToGetTableConstraints { source } => {
                 Error::UnableToGetTableConstraints { source }
             }

@@ -806,7 +806,7 @@ datasets:
       mongodb_direct_connection: 'false'
       mongodb_time_zone: UTC
       mongodb_unnest_depth: '3'
-      mongodb_num_docs_to_infer_schema: '100'
+      mongodb_schema_infer_max_records: '100'
       mongodb_pool_min: '1'
       mongodb_pool_max: '10'
 

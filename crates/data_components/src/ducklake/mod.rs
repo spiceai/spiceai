@@ -96,3 +96,57 @@ pub fn configure_duckdb_httpfs(
 
     Ok(())
 }
+
+/// Builds the `ATTACH` statement used to attach a `DuckLake` catalog in `DuckDB`.
+///
+/// The connection string is escaped for a single-quoted literal and the catalog
+/// name for a double-quoted identifier. When `automatic_migration` is `true`, the
+/// `AUTOMATIC_MIGRATION` attach option is appended so that `DuckDB` migrates an
+/// older `DuckLake` catalog schema in place instead of failing with a
+/// `catalog version mismatch ... the extension requires version` error. Migration
+/// is disabled by default because it rewrites the catalog's metadata and cannot be
+/// undone, so it is gated behind an explicit opt-in.
+#[must_use]
+pub fn build_ducklake_attach_sql(
+    connection_string: &str,
+    catalog_name: &str,
+    automatic_migration: bool,
+) -> String {
+    let escaped_connection_string = connection_string.replace('\'', "''");
+    let escaped_catalog_name = catalog_name.replace('"', "\"\"");
+    let mut attach_sql =
+        format!("ATTACH 'ducklake:{escaped_connection_string}' AS \"{escaped_catalog_name}\"");
+    if automatic_migration {
+        attach_sql.push_str(" (AUTOMATIC_MIGRATION TRUE)");
+    }
+    attach_sql
+}
+
+#[cfg(test)]
+mod tests {
+    use super::build_ducklake_attach_sql;
+
+    #[test]
+    fn attach_sql_without_migration_is_unchanged() {
+        assert_eq!(
+            build_ducklake_attach_sql("metadata.ducklake", "ducklake", false),
+            "ATTACH 'ducklake:metadata.ducklake' AS \"ducklake\""
+        );
+    }
+
+    #[test]
+    fn attach_sql_with_migration_appends_option() {
+        assert_eq!(
+            build_ducklake_attach_sql("metadata.ducklake", "ducklake", true),
+            "ATTACH 'ducklake:metadata.ducklake' AS \"ducklake\" (AUTOMATIC_MIGRATION TRUE)"
+        );
+    }
+
+    #[test]
+    fn attach_sql_escapes_connection_string_and_catalog_name() {
+        assert_eq!(
+            build_ducklake_attach_sql("s3://b/o'brien.ducklake", "my\"lake", true),
+            "ATTACH 'ducklake:s3://b/o''brien.ducklake' AS \"my\"\"lake\" (AUTOMATIC_MIGRATION TRUE)"
+        );
+    }
+}

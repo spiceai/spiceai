@@ -34,6 +34,7 @@ use datafusion_table_providers::mongodb::{
 use mongodb::bson::{Bson, Document, doc};
 use runtime::component::dataset::Dataset;
 use runtime::component::dataset::acceleration::RefreshMode;
+use runtime::dataconnector::schema_projection::{ProjectionPolicy, parse_schema_projection};
 use runtime::dataconnector::{
     ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory,
     DataConnectorResult,
@@ -121,8 +122,11 @@ const PARAMETERS: &[ParameterSpec] = &[
         .description("Time zone to use for interpreting and returning timestamp values (e.g., 'UTC', 'America/Los_Angeles')."),
     ParameterSpec::component("unnest_depth")
         .description("Maximum nesting depth for unnesting embedded documents into a flattened structure. Higher values expand deeper nested fields."),
-    ParameterSpec::component("num_docs_to_infer_schema")
+    ParameterSpec::component("schema_infer_max_records")
         .description("Number of documents to use to infer the schema. Defaults to 400."),
+    ParameterSpec::component("num_docs_to_infer_schema")
+        .description("Number of documents to use to infer the schema. Defaults to 400.")
+        .deprecated("Use 'schema_infer_max_records' instead."),
     ParameterSpec::component("pool_min")
         .description("The minimum number of connections to keep open in the pool, lazily created when requested.")
         .default(DEFAULT_CONNECTION_POOL_MIN_STR),
@@ -261,6 +265,26 @@ impl DataConnectorFactory for MongoDBFactory {
                 params
                     .parameters
                     .insert("pool_max".to_string(), pool_max.to_string().into());
+            }
+
+            // `schema_infer_max_records` is the preferred, cross-connector name and is
+            // the key the connection pool reads. `num_docs_to_infer_schema` is deprecated:
+            // when it's set (and the new name isn't), map it onto the new key so existing
+            // configs keep working. `schema_infer_max_records` always takes precedence.
+            let has_schema_infer_max_records = params
+                .parameters
+                .get("schema_infer_max_records")
+                .ok()
+                .is_some();
+            let legacy_num_docs = params
+                .parameters
+                .get("num_docs_to_infer_schema")
+                .ok()
+                .map(|s| s.expose_secret().to_string());
+            if !has_schema_infer_max_records && let Some(value) = legacy_num_docs {
+                params
+                    .parameters
+                    .insert("schema_infer_max_records".to_string(), value.into());
             }
 
             let pool = match MongoDBConnectionPool::new(params.parameters.to_secret_map()).await {
@@ -748,9 +772,15 @@ impl DataConnector for MongoDB {
         &self,
         dataset: &Dataset,
     ) -> DataConnectorResult<Arc<dyn TableProvider>> {
+        // JSON-nesting / declared-schema projection. `_id` is MongoDB's only
+        // primary key and must stay a declared column when a catch-all is used.
+        let projection = parse_schema_projection(
+            dataset,
+            &ProjectionPolicy::new("mongodb").with_required_columns(vec!["_id".to_string()]),
+        )?;
         let provider = self
             .mongodb_factory
-            .table_provider(dataset.path().into(), dataset.schema.clone())
+            .table_provider(dataset.path().into(), dataset.schema.clone(), projection)
             .await
             .context(UnableToGetReadProviderSnafu {
                 dataconnector: "mongodb",
