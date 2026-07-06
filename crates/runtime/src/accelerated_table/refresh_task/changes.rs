@@ -1507,6 +1507,9 @@ impl RefreshTask {
             .filter(|env| !env.change_batch.is_heartbeat())
             .filter_map(|env| env.change_batch.source_commit_ts_ms())
             .max();
+        if let Some(ts) = max_commit_ts_ms {
+            metrics::CDC_RECEIVED_COMMIT_UNIX_TIME_MS.record(ts, &labels);
+        }
 
         // Walk the burst preserving arrival order, processing contiguous
         // runs of Ok envelopes together and Err items individually so error
