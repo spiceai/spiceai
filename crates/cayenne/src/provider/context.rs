@@ -684,6 +684,13 @@ impl CayenneContext {
         self.ingest_stats.mem_pressure()
     }
 
+    /// Test hook: inject a memory-pressure sample directly (production writes it
+    /// via the controller's `observe_environment`).
+    #[cfg(test)]
+    pub(crate) fn set_mem_pressure_for_test(&self, fraction: f64) {
+        self.ingest_stats.set_mem_pressure(fraction);
+    }
+
     /// A snapshot of the current ingest accounting (rate + response), enriched with
     /// the now-relative CDC goal signals (replication lag, freshness) and the
     /// query-side goal signals (p99 latency, QPH) — the wall clock and the
