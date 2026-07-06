@@ -695,6 +695,16 @@ impl ClusterService for ClusterServiceImpl {
                 |scheduler| scheduler.max_partitions_per_executor,
             );
 
+            // Fair-share divisor: peers register their control stream before calling
+            // this RPC, so the connected count already reflects executors that will
+            // pull shortly. Each table is capped at its fair slice so the first caller
+            // can't greedily claim every partition; the balancer mops up any remainder.
+            let connected_executors = self
+                .executor_registry()
+                .connected_executor_count()
+                .await
+                .max(1);
+
             // Find accelerated datasets with partitioning
             for table_ref in super::partition::accelerated_tables(app).keys() {
                 if total_assigned >= max_partitions_per_executor {
@@ -705,17 +715,19 @@ impl ClusterService for ClusterServiceImpl {
                 }
                 let remaining = max_partitions_per_executor.saturating_sub(total_assigned);
 
-                if partition_store
-                    .get_cached_table_metadata(table_ref)
-                    .is_none()
-                {
+                let Some(metadata) = partition_store.get_cached_table_metadata(table_ref) else {
                     tracing::info!(
                         "No cached partition metadata for table {table_ref}. Scheduler likely has not finished discovering partitions for the table. Will not assign in initial allocation, but will get assigned on future assignments"
                     );
                     continue;
-                }
+                };
+                let limit = super::partition::fair_share_limit(
+                    metadata.partitions.len(),
+                    connected_executors,
+                    remaining,
+                );
                 match partition_store
-                    .allocate_partitions(table_ref, executor_id, remaining)
+                    .allocate_partitions(table_ref, executor_id, limit)
                     .await
                 {
                     Ok(result) => {
