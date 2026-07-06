@@ -368,6 +368,19 @@ const METRICS: &[MetricSpec] = &[
          pump. Only reported for datasets on a shared (explicitly-named) slot.",
     )
     .auto_register(),
+    MetricSpec::new(
+        "replication_member_attached",
+        MetricType::ObservableGaugeU64,
+    )
+    .description(
+        "1 while this dataset is an attached member of its shared replication slot, \
+         0 once it has detached. A detached member freezes its ack floor and pins WAL \
+         retention for the WHOLE shared slot until it rejoins or spiced restarts, so a \
+         value of 0 is the unambiguous signal for which dataset stalled the slot (the \
+         lag metric grows on the surviving slot-mates instead). Only reported for \
+         datasets on a shared (explicitly-named) slot; a dedicated slot reports no series.",
+    )
+    .auto_register(),
 ];
 
 #[derive(Debug, Clone)]
@@ -489,6 +502,16 @@ impl MetricsProvider for PostgresMetricsProvider {
             "replication_member_send_stalled_seconds_total" => {
                 Some(ObserveMetricCallback::U64(Box::new(move |instrument| {
                     instrument.observe(m.member_send_stalled_seconds_total(), &attributes);
+                })))
+            }
+            "replication_member_attached" => {
+                Some(ObserveMetricCallback::U64(Box::new(move |instrument| {
+                    // Observe only for shared-slot members (`Some`); a dedicated slot
+                    // has no member-detach concept, so its series stays absent rather
+                    // than a misleading constant `0`.
+                    if let Some(v) = m.member_attached() {
+                        instrument.observe(v, &attributes);
+                    }
                 })))
             }
             _ => None,
