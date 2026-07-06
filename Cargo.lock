@@ -18874,6 +18874,7 @@ dependencies = [
  "aws-sdk-dynamodb",
  "aws-sdk-ec2",
  "base64 0.22.1",
+ "chrono",
  "clap",
  "dirs",
  "mongodb",
