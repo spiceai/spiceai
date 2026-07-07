@@ -68,6 +68,22 @@ pub struct HtapArgs {
     /// write-phase time ÷ apply-burst wall time) falls below this fraction (0.0–1.0).
     /// A low ratio means a CDC apply bottleneck hides in un-instrumented code. Default
     /// 0.0 = report only (no gate); set e.g. 0.85 on the HTAP smoke to catch regressions.
-    #[arg(long, default_value_t = 0.0, value_parser = clap::value_parser!(f64).range(0.0..=1.0))]
+    #[arg(long, default_value_t = 0.0, value_parser = parse_phase_coverage)]
     pub(crate) min_phase_coverage: f64,
+}
+
+/// Parse and validate `--min-phase-coverage`: a fraction in the inclusive range
+/// `0.0..=1.0`. clap only provides ranged value parsers for integer types, so
+/// float bounds are enforced here.
+fn parse_phase_coverage(value: &str) -> Result<f64, String> {
+    let parsed: f64 = value
+        .parse()
+        .map_err(|_| format!("`{value}` is not a valid number"))?;
+    if (0.0..=1.0).contains(&parsed) {
+        Ok(parsed)
+    } else {
+        Err(format!(
+            "phase coverage must be between 0.0 and 1.0 (inclusive), got {parsed}"
+        ))
+    }
 }
