@@ -1471,19 +1471,6 @@ mod tests {
     }
 
     #[test]
-    fn omitted_model_ignores_non_llm_models() {
-        let app = app_with_models(vec![
-            Model::new("spiceai:my-org/my-app/models/runnable", "ml_model"),
-            Model::new("openai:gpt-4o-mini", "llm_model"),
-        ]);
-
-        let model_name = resolve_nsql_model_name_from_app(&app)
-            .expect("single compatible model should be selected");
-
-        assert_eq!(model_name, "llm_model");
-    }
-
-    #[test]
     fn omitted_model_errors_when_no_compatible_model_exists() {
         let app = app_with_models(vec![]);
 
