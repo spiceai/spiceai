@@ -7364,6 +7364,7 @@ checksum = "70e796c081cee67dc755e1a36a0a172b897fab85fc3f6bc48307991f64e4eca9"
 dependencies = [
  "curve25519-dalek",
  "ed25519",
+ "rand_core 0.6.4",
  "serde",
  "sha2 0.10.9",
  "subtle",
@@ -16680,6 +16681,31 @@ dependencies = [
 ]
 
 [[package]]
+name = "runtime-cloud-connect"
+version = "2.1.0-unstable"
+dependencies = [
+ "arrow",
+ "async-trait",
+ "dirs",
+ "ed25519-dalek",
+ "gethostname",
+ "prost 0.14.3",
+ "rand 0.10.1",
+ "rand_core 0.6.4",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "snafu",
+ "tempfile",
+ "tokio",
+ "tokio-stream",
+ "tonic",
+ "tonic-prost",
+ "tonic-prost-build",
+ "tracing",
+]
+
+[[package]]
 name = "runtime-cluster"
 version = "2.1.0-unstable"
 dependencies = [
@@ -18660,6 +18686,7 @@ dependencies = [
  "reqwest 0.13.4",
  "rstest 0.26.1",
  "runtime-api-types",
+ "runtime-cloud-connect",
  "rustyline",
  "semver",
  "serde",
@@ -18743,6 +18770,8 @@ name = "spiced"
 version = "2.1.0-unstable"
 dependencies = [
  "app",
+ "arrow",
+ "async-trait",
  "clap",
  "connector-abfs",
  "connector-adbc",
@@ -18792,9 +18821,11 @@ dependencies = [
  "runtime",
  "runtime-async",
  "runtime-auth",
+ "runtime-cloud-connect",
  "runtime-datafusion",
  "runtime-query-engine",
  "rustls",
+ "serde_json",
  "snafu",
  "snmalloc-rs",
  "spice-cloud",
