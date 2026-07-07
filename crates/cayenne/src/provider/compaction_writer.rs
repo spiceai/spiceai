@@ -650,9 +650,13 @@ impl Writer {
             truncate(&self.file, self.logical_len)?;
         }
         if self.cfg.final_fsync {
-            // Contents durable BEFORE the rename publishes the name — the
-            // local-FS content fsync object_store's writer omits.
-            self.file.sync_all()?;
+            // Contents durable BEFORE the rename publishes the name — the local-FS
+            // content fsync object_store's writer omits. `robust_fsync` tolerates
+            // filesystems that reject the strongest sync (SMB/some NFS refuse
+            // `F_FULLFSYNC`): it falls back to a plain fsync, then to the
+            // directory-fsync + snapshot durability floor, so the networked tier
+            // this writer targets never fails a compaction on the content sync.
+            robust_fsync(&self.file)?;
         }
         std::fs::rename(&self.staging, &self.dest)?;
         // Persist the rename (dirent) so the published name survives a crash. Gate
@@ -664,12 +668,11 @@ impl Writer {
         if self.cfg.final_fsync {
             let _ = fsync_dir(&self.parent);
         }
-        // Drop this output's page-cache footprint NOW, while we still hold the
-        // just-written fd and know whether O_DIRECT kept it out of cache entirely.
-        // The structural completion of the external `fadvise_tier` DONTNEED hint —
-        // which skips its redundant re-open + re-hint when this writer is enabled
-        // (see `evict_compaction_output_pages`). Best-effort: a cache hint must
-        // never fail a compaction.
+        // Drop this output's page-cache footprint NOW (the timely fast path), while
+        // we still hold the just-written fd and know whether O_DIRECT kept it out of
+        // cache entirely. `evict_compaction_output_pages` also runs later as a
+        // backstop (and covers any fallback-to-buffered output). Best-effort: a
+        // cache hint must never fail a compaction.
         evict_own(&self.file, self.direct);
         let metadata = std::fs::metadata(&self.dest)?;
         Ok(PutResult {
@@ -992,7 +995,53 @@ fn truncate(file: &std::fs::File, len: u64) -> std::io::Result<()> {
 /// fsync a directory so a rename (dirent change) is persisted.
 fn fsync_dir(dir: &FsPath) -> std::io::Result<()> {
     let handle = std::fs::File::open(dir)?;
-    handle.sync_all()
+    robust_fsync(&handle)
+}
+
+/// fsync `file`, tolerating filesystems that do not support the strongest sync.
+/// `File::sync_all` maps to `fcntl(F_FULLFSYNC)` on macOS, which returns `ENOTSUP`
+/// on SMB (and some NFS servers); fall back to a plain `fsync(2)`, and if that is
+/// also unsupported, degrade to a no-op — the compaction's directory fsync plus
+/// snapshot-manifest recovery are the durability floor `object_store`'s default
+/// `LocalFileSystem` writer already relies on. Genuine I/O errors (e.g. `EIO`)
+/// still propagate: we must never publish output we could not write.
+fn robust_fsync(file: &std::fs::File) -> std::io::Result<()> {
+    match file.sync_all() {
+        Ok(()) => Ok(()),
+        Err(e) if is_fsync_unsupported(&e) => match plain_fsync(file) {
+            Ok(()) => Ok(()),
+            Err(e2) if is_fsync_unsupported(&e2) => {
+                tracing::debug!(
+                    target: "cayenne::compaction",
+                    "content fsync unsupported on this filesystem; relying on directory-fsync + snapshot durability"
+                );
+                Ok(())
+            }
+            Err(e2) => Err(e2),
+        },
+        Err(e) => Err(e),
+    }
+}
+
+/// Whether an fsync error means the filesystem does not support the operation (vs
+/// a genuine I/O failure). `==` comparisons (not an or-pattern) because on Linux
+/// `ENOTSUP` and `EOPNOTSUPP` are the same value — an or-pattern would be an
+/// unreachable-pattern warning there.
+fn is_fsync_unsupported(e: &std::io::Error) -> bool {
+    let code = e.raw_os_error();
+    code == Some(libc::ENOTSUP) || code == Some(libc::EOPNOTSUPP) || code == Some(libc::ENOSYS)
+}
+
+/// A plain `fsync(2)` — weaker than macOS `F_FULLFSYNC`, which some network
+/// filesystems reject.
+fn plain_fsync(file: &std::fs::File) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd;
+    // SAFETY: valid fd for the borrow.
+    let rc = unsafe { libc::fsync(file.as_raw_fd()) };
+    if rc != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
 }
 
 /// Best-effort etag mirroring `LocalFileSystem`'s shape (changes when the file
