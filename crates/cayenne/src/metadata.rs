@@ -654,6 +654,11 @@ impl StorageClass {
 /// Configuration for Vortex encodings to optimize compression and performance.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "VortexConfig is a flat aggregate of many independent, unrelated runtime toggles \
+              mapped 1:1 from spicepod params; grouping them into sub-structs would obscure that mapping"
+)]
 pub struct VortexConfig {
     /// Runtime-global footer metadata cache size in MB, when explicitly configured.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -993,6 +998,26 @@ pub struct VortexConfig {
     /// with `cayenne_force_view_types: true`).
     #[serde(skip)]
     pub force_view_read_schema: bool,
+
+    /// End-to-end integrity checksums for durability surfaces (staging-WAL
+    /// records and Vortex data files). When enabled:
+    ///
+    /// * Each staging-WAL record is written with a checksum envelope, and a
+    ///   record that fails its checksum on recovery is *detected and discarded*
+    ///   (converging to the last committed snapshot) rather than parsed as
+    ///   garbage or replayed with corrupted move instructions.
+    /// * A digest is computed for each published Vortex data file and stored in
+    ///   the manifest, then verified before the file is first scanned; a
+    ///   mismatch fails the read as a *detected fault* instead of returning
+    ///   silently-wrong rows.
+    ///
+    /// Runtime-configurable: the accelerator factory sets it (default off; opt
+    /// in with `cayenne_integrity_checksums: true`). Off is byte-identical to
+    /// the pre-feature on-disk format and adds no read/write overhead. Reads
+    /// always accept both framed and legacy pre-feature WAL records regardless
+    /// of this flag, so toggling it (or downgrading) never orphans a WAL.
+    #[serde(skip)]
+    pub integrity_checksums: bool,
 
     // ---- Cold object-store tier (storage-cascade bottom tier; cascade model) ----
     /// Absolute object-store URL prefix for the cold tier (e.g.
@@ -1350,6 +1375,7 @@ impl Default for VortexConfig {
             data_storage_write_mbps: None,
             metastore_storage_write_mbps: None,
             force_view_read_schema: false,
+            integrity_checksums: false,
             cold_tier_location: None,
             cold_clustering_columns: Vec::new(),
             cold_target_file_size_mb: 512,
@@ -1622,6 +1648,13 @@ pub struct SnapshotFile {
     pub min_sequence: i64,
     /// Inclusive maximum commit sequence of the rows in this file.
     pub max_sequence: i64,
+    /// Optional end-to-end integrity digest of the file's bytes, self-describing
+    /// as `"<algorithm>:<lowercase-hex>"` (e.g. `"xxh3-128:1a2b…"`). `None` when
+    /// integrity checksums were disabled at flush (or for rows written before
+    /// the feature). Computed once at publish and verified before first read
+    /// when `integrity_checksums` is enabled. See
+    /// [`crate::provider::file_digest`].
+    pub digest: Option<String>,
 }
 
 /// One row of the cold-tier object-store manifest (`cayenne_cold_tier_file`).
