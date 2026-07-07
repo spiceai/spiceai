@@ -3,7 +3,7 @@
 //! All errors in this crate are represented by [`PgWireError`], which covers:
 //! - I/O errors (network, file system)
 //! - Protocol errors (malformed messages, unexpected responses)
-//! - Server errors (PostgreSQL error responses)
+//! - Server errors (`PostgreSQL` error responses)
 //! - Authentication errors (wrong password, unsupported method)
 //! - TLS errors (handshake failure, certificate issues)
 //! - Task errors (worker panics, unexpected termination)
@@ -25,7 +25,7 @@ pub enum PgWireError {
     #[error("protocol error: {0}")]
     Protocol(String),
 
-    /// Server error - PostgreSQL returned an error response.
+    /// Server error - `PostgreSQL` returned an error response.
     ///
     /// The message typically includes SQLSTATE code.
     #[error("server error: {0}")]
@@ -51,24 +51,28 @@ pub enum PgWireError {
 impl PgWireError {
     /// Returns `true` if this is an I/O error.
     #[inline]
+    #[must_use]
     pub fn is_io(&self) -> bool {
         matches!(self, PgWireError::Io(_))
     }
 
     /// Returns `true` if this is a server error.
     #[inline]
+    #[must_use]
     pub fn is_server(&self) -> bool {
         matches!(self, PgWireError::Server(_))
     }
 
     /// Returns `true` if this is an authentication error.
     #[inline]
+    #[must_use]
     pub fn is_auth(&self) -> bool {
         matches!(self, PgWireError::Auth(_))
     }
 
     /// Returns `true` if this is a TLS error.
     #[inline]
+    #[must_use]
     pub fn is_tls(&self) -> bool {
         matches!(self, PgWireError::Tls(_))
     }
@@ -77,6 +81,7 @@ impl PgWireError {
     ///
     /// Transient errors include I/O errors and task errors. Non-transient
     /// errors (auth, server, protocol) typically require configuration changes.
+    #[must_use]
     pub fn is_transient(&self) -> bool {
         matches!(self, PgWireError::Io(_) | PgWireError::Task(_))
     }

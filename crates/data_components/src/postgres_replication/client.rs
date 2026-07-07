@@ -139,6 +139,10 @@ pub(crate) fn build_replication_config(
         // status updates long enough for Postgres to hit `wal_sender_timeout`
         // and reset the walsender. See `pgwire_replication` worker `send_event`.
         feedback_while_backpressured: true,
+        // Keep the crate default (~1 GiB) max_message_size so large TOAST-row
+        // changes are never rejected; the reader allocates incrementally
+        // regardless of this cap.
+        ..Default::default()
     }
 }
 
