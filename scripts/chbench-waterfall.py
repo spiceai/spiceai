@@ -1046,7 +1046,7 @@ def load_source(path):
 
 def print_required_metrics():
     """Print the exact series the analysis needs — the 'what to export' list for
-    running this against a Prometheus/Grafana/OTLP source (see docs/cdc-backpressure-waterfall.md)."""
+    running this against a Prometheus/Grafana/OTLP source."""
     print("Metrics required by the CDC backpressure waterfall")
     print("(gauge => needs a time series/range; histogram/counter => final cumulative is enough)\n")
     width = max(len(m[0]) for m in REQUIRED_METRICS)

@@ -1754,7 +1754,7 @@ pub(crate) fn record_cayenne_write_phase(table_name: &str, phase: &'static str, 
         duration_ms = elapsed.as_millis(),
         "Cayenne write phase completed"
     );
-    telemetry::track_cayenne_write_phase_duration(
+    telemetry::cayenne::track_write_phase_duration(
         elapsed,
         &[
             telemetry::KeyValue::new("table", table_name.to_string()),
@@ -8092,7 +8092,7 @@ impl CayenneTableProvider {
         // inline rows, so the tombstone-vs-rewrite ratio (paired with
         // `track_cayenne_inline_tombstone_write`) reflects real rewrite work.
         if rewrite.removed_rows > 0 {
-            telemetry::track_cayenne_inline_rewrite_fallback(&[telemetry::KeyValue::new(
+            telemetry::cayenne::track_inline_rewrite_fallback(&[telemetry::KeyValue::new(
                 "table",
                 self.table_metadata.table_name.clone(),
             )]);
@@ -9708,7 +9708,7 @@ impl CayenneTableProvider {
         // keys hidden, dimensioned by table; pair with the rewrite-fallback
         // counter in `build_inlined_data_rewrite_for_pk_keys` to observe the
         // tombstone-vs-rewrite ratio.
-        telemetry::track_cayenne_inline_tombstone_write(
+        telemetry::cayenne::track_inline_tombstone_write(
             u64::try_from(delete_count).unwrap_or(u64::MAX),
             &[telemetry::KeyValue::new(
                 "table",
@@ -12135,7 +12135,7 @@ impl CayenneTableProvider {
         } else {
             "failed"
         };
-        telemetry::track_cayenne_compaction_duration(
+        telemetry::cayenne::track_compaction_duration(
             pass_start.elapsed(),
             &[
                 telemetry::KeyValue::new("table", table.clone()),
@@ -12149,7 +12149,7 @@ impl CayenneTableProvider {
                 source: DataFusionError::ResourcesExhausted(_)
             })
         ) {
-            telemetry::track_cayenne_compaction_memory_exhausted(&[
+            telemetry::cayenne::track_compaction_memory_exhausted(&[
                 telemetry::KeyValue::new("table", table),
                 telemetry::KeyValue::new("kind", "full"),
             ]);
@@ -13015,7 +13015,7 @@ impl CayenneTableProvider {
             } else {
                 "failed"
             };
-            telemetry::track_cayenne_compaction_duration(
+            telemetry::cayenne::track_compaction_duration(
                 pass_start.elapsed(),
                 &[
                     telemetry::KeyValue::new("table", table.clone()),
@@ -13029,7 +13029,7 @@ impl CayenneTableProvider {
                     source: DataFusionError::ResourcesExhausted(_)
                 })
             ) {
-                telemetry::track_cayenne_compaction_memory_exhausted(&[
+                telemetry::cayenne::track_compaction_memory_exhausted(&[
                     telemetry::KeyValue::new("table", table),
                     telemetry::KeyValue::new("kind", "subset"),
                 ]);
@@ -13519,7 +13519,7 @@ impl CayenneTableProvider {
                 total_input_bytes
             }
         };
-        telemetry::track_cayenne_compaction_merged_bytes(
+        telemetry::cayenne::track_compaction_merged_bytes(
             merged_output_bytes,
             &[
                 telemetry::KeyValue::new("table", self.table_metadata.table_name.clone()),
@@ -15305,7 +15305,7 @@ impl CayenneTableProvider {
             Self::invalidate_list_files_cache(self.context.runtime_env(), &snapshot_dir_url);
         }
 
-        telemetry::track_cayenne_list_files_cache_publish(
+        telemetry::cayenne::track_list_files_cache_publish(
             applied_delta,
             &[telemetry::KeyValue::new(
                 "table",
@@ -15987,7 +15987,7 @@ impl CayenneTableProvider {
         generation: u64,
         structural_epoch: u64,
     ) -> Result<InlinedCache> {
-        telemetry::track_cayenne_inline_cache_populate(
+        telemetry::cayenne::track_inline_cache_populate(
             false,
             &[telemetry::KeyValue::new(
                 "table",
@@ -16109,7 +16109,7 @@ impl CayenneTableProvider {
         structural_epoch: u64,
         base: &InlinedCache,
     ) -> Result<InlinedCache> {
-        telemetry::track_cayenne_inline_cache_populate(
+        telemetry::cayenne::track_inline_cache_populate(
             true,
             &[telemetry::KeyValue::new(
                 "table",
@@ -16927,7 +16927,7 @@ impl CayenneTableProvider {
         )
         .await;
         // Attribute the mem-tier budget wait (the global MemTierBudget valve).
-        telemetry::track_cayenne_mem_tier_acquire_wait(
+        telemetry::cayenne::track_mem_tier_acquire_wait(
             budget_wait_start.elapsed(),
             &[telemetry::KeyValue::new(
                 "table",
@@ -17310,7 +17310,7 @@ impl CayenneTableProvider {
         };
         drop(write_guard);
         record_cayenne_write_phase(self.table_name(), "cdc_path_inmemory", write_start);
-        telemetry::track_cayenne_cdc_absorbed_delete_keys(
+        telemetry::cayenne::track_cdc_absorbed_delete_keys(
             key_count,
             &[telemetry::KeyValue::new(
                 "table",
@@ -18815,7 +18815,7 @@ impl CayenneTableProvider {
         // counter so `cayenne_mem_tier_{durable,apply}_epoch` expose the slot-ack
         // gap. A gap that GROWS while checkpoints keep firing is a stuck watermark
         // (the N>1 WAL-drain stall) — vs the trigger never firing (the tick counter).
-        telemetry::track_cayenne_mem_tier_epoch(
+        telemetry::cayenne::track_mem_tier_epoch(
             self.mem_tier_apply_epoch
                 .load(std::sync::atomic::Ordering::Relaxed),
             durable_epoch,
@@ -20960,14 +20960,14 @@ impl CayenneTableProvider {
                         file = %part_file.object_meta.location,
                         "Pruned Vortex file at listing time via footer statistics"
                     );
-                    telemetry::track_cayenne_scan_files(
+                    telemetry::cayenne::track_scan_files(
                         1,
                         1,
                         &[telemetry::KeyValue::new("table", table_name.clone())],
                     );
                     return Ok(None);
                 }
-                telemetry::track_cayenne_scan_files(
+                telemetry::cayenne::track_scan_files(
                     1,
                     0,
                     &[telemetry::KeyValue::new("table", table_name.clone())],
@@ -21167,7 +21167,7 @@ impl CayenneTableProvider {
     }
 
     fn record_listing_fence_wait_duration(&self, duration: Duration) {
-        telemetry::track_cayenne_listing_fence_wait_duration(
+        telemetry::cayenne::track_listing_fence_wait_duration(
             duration,
             &[telemetry::KeyValue::new(
                 "dataset",
@@ -21177,7 +21177,7 @@ impl CayenneTableProvider {
     }
 
     fn record_listing_scan_duration(&self, duration: Duration) {
-        telemetry::track_cayenne_listing_scan_duration(
+        telemetry::cayenne::track_listing_scan_duration(
             duration,
             &[telemetry::KeyValue::new(
                 "dataset",
@@ -23196,7 +23196,7 @@ impl super::compaction::CompactionRunner for CayenneTableProvider {
         let snap = self.context.ingest_snapshot();
         let actuators = self.context.live_actuator_values();
         let goals = self.context.goals();
-        telemetry::track_cayenne_autotune_state(
+        telemetry::cayenne::track_autotune_state(
             &telemetry::CayenneAutotuneState {
                 rows_per_sec: snap.rows_per_sec,
                 bytes_per_sec: snap.bytes_per_sec,
@@ -23244,7 +23244,7 @@ impl super::compaction::CompactionRunner for CayenneTableProvider {
         // The closed-loop control step. A no-op when dynamic tuning is disabled
         // (returns `None`); otherwise applies at most one bounded actuator change.
         if let Some(adj) = self.context.retune(super::tuning::MIN_DWELL) {
-            telemetry::track_cayenne_autotune_adjustment(&[
+            telemetry::cayenne::track_autotune_adjustment(&[
                 telemetry::KeyValue::new("table", table.clone()),
                 telemetry::KeyValue::new("actuator", adj.actuator.as_str()),
             ]);
@@ -23416,7 +23416,7 @@ impl super::compaction::MemTierCheckpointRunner for CayenneTableProvider {
         // N>1 sharded tier diagnosis lacked (no checkpoint-fire metric existed).
         let tick_table = self.table_metadata.table_name.clone();
         let emit_tick = |outcome: &'static str| {
-            telemetry::track_cayenne_mem_tier_checkpoint_tick(&[
+            telemetry::cayenne::track_mem_tier_checkpoint_tick(&[
                 telemetry::KeyValue::new("table", tick_table.clone()),
                 telemetry::KeyValue::new("outcome", outcome),
             ]);

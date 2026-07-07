@@ -812,7 +812,7 @@ pub async fn run(args: Args) -> Result<()> {
         // instruments must be (re)bound to the real meter here rather than at carve
         // time — otherwise they'd bind to the early noop meter and never export.
         if let Some(bytes) = rt.datafusion().compaction_memory_pool_bytes() {
-            telemetry::register_cayenne_compaction_metrics(bytes);
+            telemetry::cayenne::register_compaction_metrics(bytes);
         }
 
         // Per-runtime tokio thread/task gauges (alive tasks, workers, global-queue depth;
@@ -842,7 +842,7 @@ pub async fn run(args: Args) -> Result<()> {
         // same reason as the compaction metrics above (bind to the real Prometheus
         // meter, not the early noop one). Localizes *which* valve is stalling the CDC
         // apply path when ingest falls behind.
-        runtime::dataaccelerator::cayenne::register_cayenne_backpressure_gauges();
+        runtime::dataaccelerator::cayenne::register_cayenne_telemetry();
     }
 
     let (tls_config, client_auth_mode) = tls::load_tls_config(

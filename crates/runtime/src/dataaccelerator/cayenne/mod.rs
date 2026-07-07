@@ -289,7 +289,7 @@ pub struct CayenneAccelerator {
 /// A `(weak handle, total permits)` view of the fleet-wide compaction semaphore,
 /// published when a real table's background compaction is spawned (see
 /// [`Self::create_cayenne_table_provider`]) so the metrics registration
-/// ([`register_cayenne_backpressure_gauges`]) can read live occupancy at scrape
+/// ([`register_cayenne_telemetry`]) can read live occupancy at scrape
 /// time without holding the accelerator alive. Published from the spawn path
 /// rather than the constructor because `CayenneAccelerator::new()` is also called
 /// for throwaway helpers (e.g. `cayenne_data_dir`), whose semaphore is dropped
@@ -330,10 +330,10 @@ fn compaction_semaphore_snapshot() -> Option<(u64, u64)> {
 /// a cheap live snapshot at Prometheus scrape time — no sampler task, near-zero
 /// cost between scrapes.
 ///
-/// Like [`telemetry::register_cayenne_compaction_metrics`], the binary MUST call
+/// Like [`telemetry::cayenne::register_compaction_metrics`], the binary MUST call
 /// this once AFTER `init_metrics` has installed the Prometheus meter provider;
 /// otherwise the instruments bind to the early noop meter and never export.
-pub fn register_cayenne_backpressure_gauges() {
+pub fn register_cayenne_telemetry() {
     use opentelemetry::global;
     let meter = global::meter("cayenne");
 

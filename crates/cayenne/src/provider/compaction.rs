@@ -456,7 +456,7 @@ impl BackgroundCompactor {
                     // Attribute the wait for a compaction slot: a high value means
                     // peer tables saturate the fleet-wide semaphore, starving this
                     // table's compaction (protected set / read-amp run away).
-                    telemetry::track_cayenne_compaction_acquire_wait(
+                    telemetry::cayenne::track_compaction_acquire_wait(
                         acquire_start.elapsed(),
                         &[telemetry::KeyValue::new(
                             "table",

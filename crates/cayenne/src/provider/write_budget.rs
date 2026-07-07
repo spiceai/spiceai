@@ -370,7 +370,7 @@ async fn acquire_from(
         WriteClass::Delta => "delta",
         WriteClass::Maintenance => "maintenance",
     };
-    telemetry::track_cayenne_encode_acquire_wait(
+    telemetry::cayenne::track_encode_acquire_wait(
         wait_start.elapsed(),
         &[telemetry::KeyValue::new("class", class_label)],
     );

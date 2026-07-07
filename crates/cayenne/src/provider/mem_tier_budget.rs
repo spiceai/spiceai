@@ -295,7 +295,7 @@ pub(crate) fn try_reserve_bytes(bytes: u64) -> bool {
             if !reserved {
                 // Budget full: the caller must now wait / spill / fall back to the
                 // durable path — memory-mode ingest backpressure.
-                telemetry::track_cayenne_mem_tier_reserve_refused();
+                telemetry::cayenne::track_mem_tier_reserve_refused();
             }
             reserved
         }
