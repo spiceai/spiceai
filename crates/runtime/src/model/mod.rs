@@ -25,7 +25,7 @@ use tokio::sync::RwLock;
 
 mod chat;
 mod embed;
-mod metrics;
+pub(crate) mod metrics;
 mod model_context;
 pub(crate) mod nsql;
 pub mod params;

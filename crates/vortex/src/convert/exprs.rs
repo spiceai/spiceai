@@ -630,10 +630,10 @@ mod tests {
     use datafusion_physical_plan::expressions as df_expr;
     use insta::assert_snapshot;
     use rstest::rstest;
-    use vortex::dtype::Field as VortexField;
-    use vortex::dtype::FieldPath;
-    use vortex::dtype::FieldPathSet;
-    use vortex::expr::pruning::checked_pruning_expr;
+    use vortex::VortexSessionDefault;
+    use vortex::dtype::PType;
+    use vortex::dtype::StructFields;
+    use vortex::session::VortexSession;
 
     use super::*;
     use crate::common_tests::TestSessionContext;
@@ -800,24 +800,34 @@ mod tests {
         let result = DefaultExpressionConvertor::default()
             .convert(&in_list)
             .expect("IN-list should convert to a Vortex expression");
-        let (pruning_expr, _required_stats) = checked_pruning_expr(
-            &result,
-            &FieldPathSet::from_iter([
-                FieldPath::from_iter([
-                    VortexField::Name("id".into()),
-                    VortexField::Name("min".into()),
-                ]),
-                FieldPath::from_iter([
-                    VortexField::Name("id".into()),
-                    VortexField::Name("max".into()),
-                ]),
-            ]),
-        )
-        .expect("converted IN-list should support min/max pruning");
+        // The converted IN-list must be falsifiable from min/max statistics on `id`,
+        // producing a pruning expression over the column's stats.
+        let scope = DType::Struct(
+            StructFields::new(
+                ["id"].into(),
+                vec![DType::Primitive(PType::I32, Nullability::NonNullable)],
+            ),
+            Nullability::NonNullable,
+        );
+        let session = VortexSession::default();
+        let pruning_expr = result
+            .falsify(&scope, &session)
+            .expect("falsify should not error")
+            .expect("converted IN-list should support min/max pruning");
 
+        // The pruning expression must be derived from the min and max statistics of `id` —
+        // that is what makes an IN-list prunable. Assert both stat references are present; a
+        // weaker check (e.g. that the string merely contains "id") would pass even if the
+        // expression were not actually using min/max stats.
         let pruning_display = pruning_expr.to_string();
-        assert!(pruning_display.contains("id_min"));
-        assert!(pruning_display.contains("id_max"));
+        assert!(
+            pruning_display.contains("stat($.id, vortex.min())"),
+            "pruning expression should reference id's min statistic: {pruning_display}"
+        );
+        assert!(
+            pruning_display.contains("stat($.id, vortex.max())"),
+            "pruning expression should reference id's max statistic: {pruning_display}"
+        );
     }
 
     #[rstest]

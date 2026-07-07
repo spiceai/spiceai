@@ -54,6 +54,7 @@ use runtime_datafusion::execution_plan::{
     schema_cast::SchemaCastScanExec, wrap_with_filter,
 };
 
+use runtime_metrics::acceleration as metrics;
 use snafu::prelude::*;
 use spicepod::metric::Metrics;
 use synchronized_table::SynchronizedTable;
@@ -63,7 +64,6 @@ use tokio::task::JoinHandle;
 
 pub mod caching;
 pub mod federation;
-mod metrics;
 pub mod refresh;
 pub mod refresh_task;
 mod refresh_task_runner;

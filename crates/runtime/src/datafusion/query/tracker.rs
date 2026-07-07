@@ -23,7 +23,8 @@ use tokio::time::Instant;
 
 use runtime_request_context::RequestContext;
 
-use super::{error_code::ErrorCode, metrics};
+use super::error_code::ErrorCode;
+use runtime_metrics::query as metrics;
 
 #[derive(Clone)]
 pub(crate) struct QueryTracker {
@@ -100,9 +101,9 @@ impl QueryTracker {
         // below. `finish` is the single terminal step for every tracked query
         // (normal completion, cache hit, and error paths all route through it),
         // so this counts each execution exactly once.
-        crate::metrics::telemetry::track_query_count(&labels);
-        crate::metrics::telemetry::track_query_duration(query_duration, &labels);
-        crate::metrics::telemetry::track_query_execution_duration(
+        runtime_metrics::telemetry::track_query_count(&labels);
+        runtime_metrics::telemetry::track_query_duration(query_duration, &labels);
+        runtime_metrics::telemetry::track_query_execution_duration(
             query_execution_duration,
             &labels,
         );
