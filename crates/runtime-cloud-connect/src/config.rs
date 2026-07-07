@@ -46,8 +46,10 @@ pub struct CloudConnectConfig {
     /// control planes during development.
     pub ca_cert_pem: Option<String>,
 
-    /// When `true`, server certificate verification is **disabled** —
-    /// for development only. Defaults to `false`.
+    /// When `true`, TLS is **disabled entirely** and the runtime connects
+    /// to the control plane over a plaintext (h2c) channel — not merely
+    /// with certificate verification turned off. For local development
+    /// only; never enable against a real control plane. Defaults to `false`.
     pub insecure: bool,
 
     /// Path to the on-disk identity file (typically
