@@ -31,6 +31,7 @@ limitations under the License.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use app::App;
@@ -192,6 +193,12 @@ pub struct PartitionService {
     pub partition_store: Arc<PartitionStore>,
     pub executor_registry: Arc<ExecutorRegistry>,
     pub app: Arc<RwLock<Option<Arc<App>>>>,
+    /// Set once the scheduler has completed its first assignment cycle. Until
+    /// then `allocate_initial_partitions` returns `Unavailable` so a connecting
+    /// executor waits for its fair share rather than loading an empty snapshot —
+    /// CDC/Changes-mode accelerations (e.g. Cayenne) only load partition data at
+    /// their initial snapshot and have no re-load path once assigned later.
+    first_assignment_complete: Arc<AtomicBool>,
 }
 
 impl PartitionService {
@@ -205,7 +212,23 @@ impl PartitionService {
             partition_store,
             executor_registry,
             app,
+            first_assignment_complete: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    /// Whether the scheduler has completed its first assignment cycle.
+    ///
+    /// Gates `allocate_initial_partitions`: an executor waits until this is
+    /// `true` so its initial snapshot loads its assigned partitions.
+    #[must_use]
+    pub fn is_first_assignment_complete(&self) -> bool {
+        self.first_assignment_complete.load(Ordering::Acquire)
+    }
+
+    /// Mark the first assignment cycle as complete. Idempotent; called by the
+    /// periodic assignment task after its first `reconcile_all` succeeds.
+    pub fn mark_first_assignment_complete(&self) {
+        self.first_assignment_complete.store(true, Ordering::Release);
     }
 
     fn config_from_app(app: &App) -> AssignmentConfig {
