@@ -115,7 +115,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing::info!("Flight SQL server listening on {addr}  (press Ctrl-C to stop)");
 
     Server::builder()
-        .add_service(FlightSqlService::new(ctx).into_server())
+        .add_service(FlightSqlService::from_session_context(ctx).into_server())
         .serve_with_shutdown(addr, shutdown_signal())
         .await?;
 

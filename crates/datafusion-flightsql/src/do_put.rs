@@ -30,15 +30,15 @@ use datafusion::datasource::memory::MemorySourceConfig;
 use datafusion::error::{DataFusionError, Result as DFResult};
 use datafusion::logical_expr::dml::InsertOp;
 use datafusion::physical_plan::collect;
-use datafusion::prelude::SessionContext;
 use prost::Message;
+use runtime_query_engine::query_engine::QueryEngine;
 use tokio_stream::adapters::Peekable;
 use tonic::{Request, Response, Status, Streaming};
 
 use crate::{FlightSqlService, flightsql, handle_datafusion_error, to_tonic_err};
 
 pub(crate) async fn handle(
-    ctx: Arc<SessionContext>,
+    engine: Arc<dyn QueryEngine>,
     request: Request<Streaming<FlightData>>,
 ) -> Result<Response<<FlightSqlService as FlightService>::DoPutStream>, Status> {
     let mut streaming_flight: Peekable<Streaming<FlightData>> =
@@ -54,7 +54,7 @@ pub(crate) async fn handle(
     let descriptor_path = fd.path.clone();
 
     let Ok(message) = Any::decode(&*cmd) else {
-        return do_put_raw(ctx, streaming_flight, None).await;
+        return do_put_raw(engine, streaming_flight, None).await;
     };
 
     match Command::try_from(message).map_err(|e| Status::internal(format!("{e:?}")))? {
@@ -64,12 +64,14 @@ pub(crate) async fn handle(
         Command::CommandPreparedStatementUpdate(cmd) => {
             flightsql::prepared_statement_update::do_put_update(cmd, streaming_flight).await
         }
-        Command::CommandStatementUpdate(cmd) => flightsql::statement_update::do_put(ctx, cmd).await,
+        Command::CommandStatementUpdate(cmd) => {
+            flightsql::statement_update::do_put(engine, cmd).await
+        }
         Command::CommandStatementIngest(cmd) => {
             let path_override = ingest_command_path_override(&cmd, &descriptor_path);
-            do_put_raw(ctx, streaming_flight, path_override).await
+            do_put_raw(engine, streaming_flight, path_override).await
         }
-        _ => do_put_raw(ctx, streaming_flight, None).await,
+        _ => do_put_raw(engine, streaming_flight, None).await,
     }
 }
 
@@ -215,7 +217,7 @@ fn coerce_batches_to_schema(
 }
 
 async fn do_put_raw(
-    ctx: Arc<SessionContext>,
+    engine: Arc<dyn QueryEngine>,
     mut streaming: Peekable<Streaming<FlightData>>,
     path_override: Option<Vec<String>>,
 ) -> Result<Response<<FlightSqlService as FlightService>::DoPutStream>, Status> {
@@ -231,10 +233,12 @@ async fn do_put_raw(
         return Err(Status::invalid_argument("no path provided"));
     }
 
-    let table_provider = ctx
-        .table_provider(resolve_table_path(path))
-        .await
-        .map_err(handle_datafusion_error)?;
+    let table_ref = resolve_table_path(path);
+    let table_provider = engine.get_table(&table_ref).await.ok_or_else(|| {
+        handle_datafusion_error(datafusion::error::DataFusionError::Plan(format!(
+            "table '{table_ref}' not found"
+        )))
+    })?;
 
     let (schema, batches) = decode_flight_batches(streaming).await?;
 
@@ -246,14 +250,14 @@ async fn do_put_raw(
 
     let insert_plan = table_provider
         .insert_into(
-            &ctx.state(),
+            &engine.session_context().state(),
             MemorySourceConfig::try_new_exec(&[batches], schema, None)
                 .map_err(handle_datafusion_error)?,
             InsertOp::Append,
         )
         .await
         .map_err(handle_datafusion_error)?;
-    collect(insert_plan, ctx.task_ctx())
+    collect(insert_plan, engine.session_context().task_ctx())
         .await
         .map_err(handle_datafusion_error)?;
 

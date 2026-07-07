@@ -20,14 +20,14 @@ use arrow_flight::{
     FlightDescriptor, IpcMessage, SchemaAsIpc, SchemaResult, flight_descriptor::DescriptorType,
 };
 use arrow_ipc::writer::IpcWriteOptions;
-use datafusion::prelude::SessionContext;
 use datafusion::sql::TableReference;
+use runtime_query_engine::query_engine::QueryEngine;
 use tonic::{Request, Response, Status};
 
 use crate::{FlightSqlService, handle_datafusion_error, to_tonic_err};
 
 pub(crate) async fn handle(
-    ctx: Arc<SessionContext>,
+    engine: Arc<dyn QueryEngine>,
     request: Request<FlightDescriptor>,
 ) -> Result<Response<SchemaResult>, Status> {
     let fd = request.into_inner();
@@ -36,7 +36,7 @@ pub(crate) async fn handle(
         x if x == DescriptorType::Cmd as i32 => {
             let sql = std::str::from_utf8(&fd.cmd)
                 .map_err(|e| Status::invalid_argument(e.to_string()))?;
-            let schema = FlightSqlService::get_arrow_schema(&ctx, sql).await?;
+            let schema = FlightSqlService::get_arrow_schema(&engine, sql).await?;
 
             let options = IpcWriteOptions::default();
             let IpcMessage(schema_bytes) = SchemaAsIpc::new(&schema, &options)
@@ -48,10 +48,11 @@ pub(crate) async fn handle(
         }
         x if x == DescriptorType::Path as i32 => {
             let table_ref = TableReference::from(fd.path.join("."));
-            let table = ctx
-                .table_provider(table_ref)
-                .await
-                .map_err(handle_datafusion_error)?;
+            let table = engine.get_table(&table_ref).await.ok_or_else(|| {
+                handle_datafusion_error(datafusion::error::DataFusionError::Plan(format!(
+                    "table '{table_ref}' not found"
+                )))
+            })?;
             let schema = table.schema();
             let options = IpcWriteOptions::default();
             let IpcMessage(schema_bytes) = SchemaAsIpc::new(schema.as_ref(), &options)

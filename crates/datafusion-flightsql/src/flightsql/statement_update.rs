@@ -25,20 +25,27 @@ use arrow_flight::{
     flight_service_server::FlightService,
     sql::{CommandStatementUpdate, DoPutUpdateResult},
 };
-use datafusion::prelude::SessionContext;
+use futures::TryStreamExt;
 use prost::Message;
+use runtime_query_engine::query_engine::{QueryEngine, QueryRequest};
 use tonic::{Response, Status};
 
-use crate::{FlightSqlService, handle_datafusion_error};
+use crate::{FlightSqlService, query_engine_err_to_status};
 
 pub(crate) async fn do_put(
-    ctx: Arc<SessionContext>,
+    engine: Arc<dyn QueryEngine>,
     cmd: CommandStatementUpdate,
 ) -> Result<Response<<FlightSqlService as FlightService>::DoPutStream>, Status> {
     tracing::trace!("do_put statement_update: {}", cmd.query);
 
-    let df = ctx.sql(&cmd.query).await.map_err(handle_datafusion_error)?;
-    let results: Vec<RecordBatch> = df.collect().await.map_err(handle_datafusion_error)?;
+    let stream = engine
+        .execute_query(QueryRequest::new(&cmd.query))
+        .await
+        .map_err(query_engine_err_to_status)?;
+    let results: Vec<RecordBatch> = stream
+        .try_collect()
+        .await
+        .map_err(|e| Status::internal(e.to_string()))?;
 
     let affected_rows = extract_affected_rows(&results);
 

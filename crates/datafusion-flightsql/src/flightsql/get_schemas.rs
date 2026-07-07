@@ -21,7 +21,7 @@ use arrow_flight::{
     flight_service_server::FlightService,
     sql::{self},
 };
-use datafusion::prelude::SessionContext;
+use runtime_query_engine::query_engine::QueryEngine;
 use tonic::{Request, Response, Status};
 
 use crate::{FlightSqlService, record_batches_to_flight_stream, to_tonic_err};
@@ -42,11 +42,12 @@ pub(crate) fn get_flight_info(
 }
 
 pub(crate) fn do_get(
-    ctx: &Arc<SessionContext>,
+    engine: &Arc<dyn QueryEngine>,
     query: sql::CommandGetDbSchemas,
 ) -> Result<Response<<FlightSqlService as FlightService>::DoGetStream>, Status> {
     tracing::trace!("do_get get_schemas: {query:?}");
 
+    let ctx = engine.session_context();
     let catalogs = match &query.catalog {
         Some(c) => vec![c.clone()],
         None => ctx.catalog_names(),
