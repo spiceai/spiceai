@@ -1062,7 +1062,7 @@ mod tests {
 
     #[test]
     fn backoff_caps_at_max() {
-        let d = next_backoff(Duration::from_secs(120));
+        let d = next_backoff(Duration::from_mins(2));
         assert_eq!(d, MAX_BACKOFF);
     }
 }
