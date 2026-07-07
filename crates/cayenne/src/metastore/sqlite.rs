@@ -1112,7 +1112,7 @@ impl MetastoreBackend for SqliteMetastore {
         // cheaply know the originating catalog stage.
         let wait_start = std::time::Instant::now();
         let guard = self.pool().await?.acquire().await;
-        telemetry::track_cayenne_metastore_writer_wait(
+        telemetry::cayenne::track_metastore_writer_wait(
             wait_start.elapsed(),
             &[telemetry::KeyValue::new("txn", "other")],
         );
@@ -1132,7 +1132,7 @@ impl MetastoreBackend for SqliteMetastore {
             })
             .await
             .map_err(|e| convert_tokio_rusqlite_error(e, "Failed to execute statement"))?;
-        telemetry::track_cayenne_metastore_writer_held(
+        telemetry::cayenne::track_metastore_writer_held(
             held_start.elapsed(),
             &[telemetry::KeyValue::new("txn", "other")],
         );
@@ -1314,7 +1314,7 @@ impl MetastoreBackend for SqliteMetastore {
                     message: format!("Failed to begin transaction: {e}"),
                 },
             )?;
-        telemetry::track_cayenne_metastore_writer_wait(
+        telemetry::cayenne::track_metastore_writer_wait(
             wait_start.elapsed(),
             &[telemetry::KeyValue::new("txn", "other")],
         );
@@ -1442,7 +1442,7 @@ impl MetastoreBackend for SqliteMetastore {
                     message: format!("Failed to checkpoint catalog WAL: {e}"),
                 },
             )?;
-        telemetry::track_cayenne_metastore_checkpoint(
+        telemetry::cayenne::track_metastore_checkpoint(
             checkpoint_start.elapsed(),
             &[telemetry::KeyValue::new("mode", mode_label)],
         );
@@ -1471,7 +1471,7 @@ impl SqliteMetastore {
     /// `cayenne_metastore_wal_bytes` gauge.
     async fn sample_wal_bytes(&self) {
         let bytes = self.read_wal_bytes().await;
-        telemetry::track_cayenne_metastore_wal_bytes(bytes, &[]);
+        telemetry::cayenne::track_metastore_wal_bytes(bytes, &[]);
     }
 }
 
@@ -1504,7 +1504,7 @@ impl Drop for SqliteTransaction {
             // bg connection thread): this Drop returns immediately and the
             // synchronous writer-held window genuinely ends now, not when the
             // detached rollback later completes.
-            telemetry::track_cayenne_metastore_writer_held(
+            telemetry::cayenne::track_metastore_writer_held(
                 self.held_start.elapsed(),
                 &[telemetry::KeyValue::new("txn", "other")],
             );
@@ -1629,7 +1629,7 @@ impl MetastoreTransaction for SqliteTransaction {
         // window the next writer queues behind (PR #11206 review).
         match commit_result {
             Ok(()) => {
-                telemetry::track_cayenne_metastore_writer_held(
+                telemetry::cayenne::track_metastore_writer_held(
                     self.held_start.elapsed(),
                     &[telemetry::KeyValue::new("txn", "other")],
                 );
@@ -1644,7 +1644,7 @@ impl MetastoreTransaction for SqliteTransaction {
                     })
                     .await;
 
-                telemetry::track_cayenne_metastore_writer_held(
+                telemetry::cayenne::track_metastore_writer_held(
                     self.held_start.elapsed(),
                     &[telemetry::KeyValue::new("txn", "other")],
                 );
@@ -1670,7 +1670,7 @@ impl MetastoreTransaction for SqliteTransaction {
 
         // METRIC 1 (writer held): record AFTER ROLLBACK — the write lock is held
         // through the rollback statement, so include its duration (PR #11206).
-        telemetry::track_cayenne_metastore_writer_held(
+        telemetry::cayenne::track_metastore_writer_held(
             self.held_start.elapsed(),
             &[telemetry::KeyValue::new("txn", "other")],
         );
