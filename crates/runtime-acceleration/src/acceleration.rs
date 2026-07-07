@@ -579,7 +579,7 @@ impl Acceleration {
     }
 
     #[expect(clippy::needless_pass_by_value)]
-    /// Builds DataFusion table constraints from configured indexes and primary keys.
+    /// Builds `DataFusion` table constraints from configured indexes and primary keys.
     ///
     /// # Errors
     ///

@@ -53,7 +53,7 @@ pub trait AccelerationSource: Send + Sync {
 
     /// Returns all initialized acceleration sources (datasets and views) known to this source's
     /// runtime. Used by `DuckDB` to attach peer file-mode databases. Default returns empty.
-    fn initialized_sources<'a>(&'a self) -> InitializedSourcesFuture<'a> {
+    fn initialized_sources(&self) -> InitializedSourcesFuture<'_> {
         Box::pin(async { vec![] })
     }
 }
