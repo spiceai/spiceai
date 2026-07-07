@@ -439,6 +439,27 @@ impl ChangeBatch {
         primary_keys
     }
 
+    /// Whether `row` carries any primary key, without allocating the key list.
+    ///
+    /// [`Self::primary_keys`] materializes a `Vec<String>` (cloning every key)
+    /// just to return the names; callers that only need to know whether a row is
+    /// keyed (e.g. the CDC delete path partitioning keyed vs keyless rows) should
+    /// use this — it reads the list length straight off the `ListArray` offsets.
+    #[must_use]
+    pub fn has_primary_keys(&self, row: usize) -> bool {
+        let Some(primary_keys_col) = self
+            .record
+            .column(self.primary_keys_idx)
+            .as_any()
+            .downcast_ref::<ListArray>()
+        else {
+            unreachable!(
+                "The schema is validated to have a 'primary_keys' field which is a ListArray"
+            );
+        };
+        primary_keys_col.value_length(row) > 0
+    }
+
     #[must_use]
     pub fn data(&self, row: usize) -> RecordBatch {
         let Some(data_col) = self

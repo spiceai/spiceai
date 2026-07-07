@@ -246,7 +246,9 @@ async fn get_locally_persisted_records(
 ) -> Result<Vec<RecordBatch>, anyhow::Error> {
     let db_file_path = db_file_path.to_string_lossy();
     let query_result = match engine {
+        #[cfg(feature = "duckdb")]
         "duckdb" => duckdb::query_local_db(db_file_path.as_ref(), query).await?,
+        #[cfg(feature = "sqlite")]
         "sqlite" => sqlite::query_local_db(db_file_path.as_ref(), query).await?,
         _ => Err(anyhow::anyhow!("Unsupported engine: {engine}"))?,
     };
