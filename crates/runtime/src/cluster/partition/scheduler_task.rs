@@ -200,7 +200,14 @@ impl PartitionAssignmentTask {
         service
             .reconcile_all(self.df.as_ref())
             .await
-            .map_err(|e| Error::AssignmentCycle { source: e })
+            .map_err(|e| Error::AssignmentCycle { source: e })?;
+
+        // The first completed cycle has fairly distributed partitions across the
+        // executors connected during the startup window. Opening this gate lets
+        // `allocate_initial_partitions` return each executor its assigned share,
+        // so their initial snapshot loads the right partitions.
+        service.mark_first_assignment_complete();
+        Ok(())
     }
 
     /// Seed partition metadata for all accelerated tables that don't have metadata yet.

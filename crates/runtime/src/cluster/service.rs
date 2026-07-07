@@ -64,7 +64,6 @@ use runtime_proto::{
 };
 use runtime_secrets::Secrets;
 use secrecy::ExposeSecret;
-use spicepod::component::runtime;
 use std::collections::{HashMap, HashSet};
 use std::task::{Context, Poll};
 use tokio::sync::RwLock as TokioRwLock;
@@ -668,6 +667,24 @@ impl ClusterService for ClusterServiceImpl {
             return Err(Status::unavailable(format!(
                 "partition metadata not ready: accelerated table {not_ready} still loading"
             )));
+        }
+
+        // Gate on the scheduler's first assignment cycle. Returning already-assigned
+        // partitions before the scheduler has fairly distributed them would hand this
+        // executor an empty set, and its initial snapshot would load zero rows with no
+        // way to backfill (CDC/Changes-mode accelerations only load partition data at
+        // the initial snapshot). Wait for the first cycle — the executor retries this
+        // RPC on `Unavailable` with backoff — so the returned share is the fair one.
+        if let Some(partition_service) = self.datafusion.partition_service.as_ref()
+            && !partition_service.is_first_assignment_complete()
+        {
+            tracing::debug!(
+                executor = %executor_id,
+                "Deferring allocate_initial_partitions: first assignment cycle not yet complete"
+            );
+            return Err(Status::unavailable(
+                "partition assignment pending: scheduler has not completed its first assignment cycle",
+            ));
         }
 
         let tls_config_opt = self.datafusion.cluster_config.client_tls_config();
