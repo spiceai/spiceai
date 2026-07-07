@@ -87,9 +87,11 @@ GRANT REPLICATION SLAVE, REPLICATION CLIENT ON *.* TO 'replicator'@'%';
    committed position checkpoints to the sidecar every
    `mysql_replication_checkpoint_interval`.
 6. **Restart.** On restart with a persisted position, Spice resumes from it
-   directly — no snapshot — and marks the dataset ready immediately.
-   Non-persistent accelerators (`arrow`, `mode: memory`) boot empty, so they
-   re-snapshot on every start instead.
+   directly — no snapshot — and marks the dataset ready immediately. Because
+   the position lives inside the accelerator itself, data and cursor share
+   one lifecycle: a non-persistent accelerator (`arrow`, `mode: memory`)
+   boots with no position and naturally re-snapshots — no special
+   configuration needed.
 
 Delivery is **at-least-once**: a crash between applying a change and
 checkpointing its position replays up to one checkpoint interval of history,
@@ -101,7 +103,7 @@ as the Postgres connector's snapshot/WAL boundary.
 | Parameter | Default | Description |
 | --- | --- | --- |
 | `mysql_replication_server_id` | derived | The `server_id` this replica registers with. Must be unique among all replicas attached to the source; the default is derived from the dataset name and process, so two spiced instances don't collide. |
-| `mysql_replication_initial_snapshot` | `true` | Load existing rows before streaming. `false` streams only changes made after subscription. |
+| `mysql_replication_snapshot_mode` | `auto` | When existing rows load: `auto` snapshots when no resumable position exists; `never` streams changes only; `always` re-snapshots on every start. |
 | `mysql_replication_checkpoint_interval` | `10s` | How often the committed position persists to the sidecar. Bounds crash-replay volume. |
 | `mysql_replication_bootstrap_batch_size` | `8192` | Rows per emitted snapshot batch (max `1048576`). |
 | `mysql_replication_invalid_position_behavior` | `error` | What to do when the persisted position was purged from the source: `error` or `rebootstrap` (drop the position and re-snapshot). |

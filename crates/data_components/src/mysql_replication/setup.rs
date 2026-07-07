@@ -220,6 +220,28 @@ pub async fn fetch_head_position(conn: &mut Conn) -> Result<BinlogPosition> {
     }
 }
 
+/// The source's approximate row count for the table, from
+/// `information_schema.TABLES` (an `InnoDB` statistics estimate — cheap and
+/// possibly stale, which is fine for snapshot-progress reporting). `None`
+/// when the server has no estimate.
+pub async fn fetch_approx_row_count(
+    conn: &mut Conn,
+    database: &str,
+    table: &str,
+) -> Result<Option<u64>> {
+    let rows: Option<Option<u64>> = conn
+        .exec_first(
+            "SELECT TABLE_ROWS FROM information_schema.TABLES \
+             WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ?",
+            (database, table),
+        )
+        .await
+        .context(SetupQuerySnafu {
+            context: "information_schema.TABLES row-count estimate",
+        })?;
+    Ok(rows.flatten())
+}
+
 /// Whether `file` is still present in the server's binary log index.
 /// A resumable persisted position requires its file to still exist.
 pub async fn binlog_file_exists(conn: &mut Conn, file: &str) -> Result<bool> {

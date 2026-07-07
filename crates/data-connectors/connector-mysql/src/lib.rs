@@ -154,12 +154,14 @@ const PARAMETERS: &[ParameterSpec] = &[
              the dataset name and process.",
         )
         .help_link(MYSQL_DOCS),
-    ParameterSpec::component("replication_initial_snapshot")
+    ParameterSpec::component("replication_snapshot_mode")
         .description(
-            "Whether `refresh_mode: changes` loads the table's existing rows before streaming \
-             binlog changes. Default: true.",
+            "When `refresh_mode: changes` loads the table's existing rows: 'auto' (default) \
+             snapshots when no resumable binlog position exists; 'never' streams changes only; \
+             'always' re-snapshots on every start.",
         )
-        .default("true")
+        .default("auto")
+        .one_of_ignore_ascii_case(&["auto", "never", "always"])
         .help_link(MYSQL_DOCS),
     ParameterSpec::component("replication_checkpoint_interval")
         .description(

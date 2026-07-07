@@ -39,7 +39,7 @@ use async_trait::async_trait;
 use data_components::cdc::{ChangeEnvelope, ChangesStream, StreamError};
 use data_components::mysql_replication::{
     InvalidPositionBehavior, PersistedPosition, PositionStore, ReplicationMetricsCollector,
-    ReplicationParams, ReplicationStreamInput, StoreError, start_replication_stream,
+    ReplicationParams, ReplicationStreamInput, SnapshotMode, StoreError, start_replication_stream,
 };
 use futures::StreamExt;
 use mysql_async::prelude::Queryable;
@@ -87,8 +87,7 @@ fn params_for(port: u16, server_id: u32) -> ReplicationParams {
     ReplicationParams {
         opts: mysql_async::Opts::from(opts),
         server_id,
-        initial_snapshot: true,
-        snapshot_on_resume: false,
+        snapshot_mode: SnapshotMode::Auto,
         bootstrap_batch_size: 8192,
         // Short interval so idle heartbeats persist the position quickly and
         // the resume phase of the test doesn't have to wait.

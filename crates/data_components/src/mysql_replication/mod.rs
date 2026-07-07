@@ -50,7 +50,8 @@ use crate::cdc::{
 };
 
 pub use config::{
-    BinlogPosition, InvalidPositionBehavior, ReplicationParams, derive_server_id, process_nonce,
+    BinlogPosition, InvalidPositionBehavior, ReplicationParams, SnapshotMode, derive_server_id,
+    process_nonce,
 };
 pub use metrics::{Metrics as ReplicationMetrics, MetricsCollector as ReplicationMetricsCollector};
 
@@ -283,12 +284,12 @@ async fn start_inner(input: ReplicationStreamInput) -> Result<ChangesStream> {
     }
 
     let resume_position = match persisted {
-        Some(persisted) if params.snapshot_on_resume && params.initial_snapshot => {
+        Some(persisted) if params.snapshot_mode == SnapshotMode::Always => {
             tracing::info!(
                 dataset = %dataset_name,
                 position = %persisted.position,
-                "non-persistent accelerator with `refresh_mode: changes`: running the initial \
-                 snapshot despite a persisted binlog position"
+                "`snapshot_mode: always`: running the initial snapshot despite a persisted \
+                 binlog position"
             );
             None
         }
@@ -359,11 +360,48 @@ async fn start_inner(input: ReplicationStreamInput) -> Result<ChangesStream> {
         // Cold start: capture the binlog head BEFORE any snapshot so the
         // overlap replays idempotently.
         let head = setup::fetch_head_position(&mut conn).await?;
+        // Seed snapshot progress from the source's approximate row count
+        // (`information_schema.TABLES`) so operators get a progress signal;
+        // best-effort — absence just leaves the metric unset.
+        if params.snapshot_mode != SnapshotMode::Never {
+            match setup::fetch_approx_row_count(&mut conn, &database, &table).await {
+                Ok(Some(expected)) => metrics.set_bootstrap_rows_expected(expected),
+                Ok(None) => {}
+                Err(e) => {
+                    tracing::debug!(dataset = %dataset_name, error = %e, "row-count estimate");
+                }
+            }
+        }
         if let Err(e) = conn.disconnect().await {
             tracing::debug!(dataset = %dataset_name, error = %e, "setup connection disconnect");
         }
 
-        if params.initial_snapshot {
+        if params.snapshot_mode == SnapshotMode::Never {
+            tracing::info!(
+                dataset = %dataset_name,
+                position = %head,
+                "mysql replication: `snapshot_mode: never` — streaming changes from the \
+                 current binlog head without snapshotting existing rows"
+            );
+            metrics.mark_bootstrap_complete();
+            // Persist the start position up front: with no snapshot there is
+            // no bootstrap barrier to piggy-back on, and resuming from `head`
+            // after a restart is exactly the no-snapshot contract.
+            let initial = PersistedPosition {
+                position: head.clone(),
+                schema_json: schema_json.clone(),
+            };
+            if let Err(e) = position_store.save(&initial).await {
+                tracing::warn!(
+                    dataset = %dataset_name,
+                    error = %e,
+                    "failed to persist the initial binlog position; a restart before the first \
+                     checkpoint will re-attach at the then-current head"
+                );
+            }
+            let ready = ready_envelope(&schema)?;
+            (head, Box::pin(stream::once(async move { Ok(ready) })))
+        } else {
             // Lead with a TRUNCATE envelope so a re-bootstrap over a
             // persistent accelerator clears rows deleted on the source while
             // no position was held (no-op on an empty accelerator).
@@ -406,31 +444,6 @@ async fn start_inner(input: ReplicationStreamInput) -> Result<ChangesStream> {
                         .chain(stream::once(async move { Ok(ready) })),
                 ),
             )
-        } else {
-            tracing::info!(
-                dataset = %dataset_name,
-                position = %head,
-                "mysql replication: `initial_snapshot: false` — streaming changes from the \
-                 current binlog head without snapshotting existing rows"
-            );
-            metrics.mark_bootstrap_complete();
-            // Persist the start position up front: with no snapshot there is
-            // no bootstrap barrier to piggy-back on, and resuming from `head`
-            // after a restart is exactly the no-snapshot contract.
-            let initial = PersistedPosition {
-                position: head.clone(),
-                schema_json: schema_json.clone(),
-            };
-            if let Err(e) = position_store.save(&initial).await {
-                tracing::warn!(
-                    dataset = %dataset_name,
-                    error = %e,
-                    "failed to persist the initial binlog position; a restart before the first \
-                     checkpoint will re-attach at the then-current head"
-                );
-            }
-            let ready = ready_envelope(&schema)?;
-            (head, Box::pin(stream::once(async move { Ok(ready) })))
         }
     };
 

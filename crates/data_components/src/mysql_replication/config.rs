@@ -35,19 +35,8 @@ pub struct ReplicationParams {
     /// connections sharing an id. Unlike a Postgres replication slot, no
     /// server-side state is keyed on it, so it may change across restarts.
     pub server_id: u32,
-    /// Run the initial table snapshot when no resumable position exists.
-    pub initial_snapshot: bool,
-    /// Take the initial snapshot even when a persisted binlog position
-    /// exists.
-    ///
-    /// Set by the connector when the dataset's accelerator does not persist
-    /// across restarts (in-memory engines, `mode: memory`, `mode: file_create`):
-    /// the accelerator starts empty every boot, so a plain position resume
-    /// would leave it serving only rows touched after startup. Snapshot-then
-    /// -resume is correct for an empty accelerator: the binlog overlap from
-    /// the pre-snapshot position replays idempotently via the PK upsert.
-    /// `initial_snapshot: false` still disables all snapshots.
-    pub snapshot_on_resume: bool,
+    /// Whether/when the initial table snapshot runs.
+    pub snapshot_mode: SnapshotMode,
     /// Rows per emitted snapshot batch during initial bootstrap.
     pub bootstrap_batch_size: usize,
     /// How often the stream persists its committed binlog position to the
@@ -68,13 +57,34 @@ impl std::fmt::Debug for ReplicationParams {
             .field("user", &self.opts.user())
             .field("database", &self.opts.db_name())
             .field("server_id", &self.server_id)
-            .field("initial_snapshot", &self.initial_snapshot)
-            .field("snapshot_on_resume", &self.snapshot_on_resume)
+            .field("snapshot_mode", &self.snapshot_mode)
             .field("bootstrap_batch_size", &self.bootstrap_batch_size)
             .field("checkpoint_interval", &self.checkpoint_interval)
             .field("invalid_position_behavior", &self.invalid_position_behavior)
             .finish_non_exhaustive()
     }
+}
+
+/// Whether/when the initial table snapshot runs.
+///
+/// There is no separate "snapshot on resume" knob (the Postgres connector
+/// needs one because its cursor lives server-side in the replication slot
+/// and can outlive an empty accelerator): the `MySQL` position is persisted
+/// *inside* the accelerator's sidecar, so a non-persistent accelerator can
+/// never present a stale resumable position — data and cursor share one
+/// lifecycle.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum SnapshotMode {
+    /// Snapshot the table's existing rows when no resumable binlog position
+    /// exists; resume without a snapshot when one does. The default.
+    #[default]
+    Auto,
+    /// Never snapshot: stream changes only, from the persisted position when
+    /// one exists or from the current binlog head otherwise.
+    Never,
+    /// Snapshot on every start, discarding any persisted position — a
+    /// truncate barrier clears stale accelerator state first.
+    Always,
 }
 
 /// Behavior when the persisted binlog position cannot be honored by the

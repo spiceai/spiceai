@@ -33,7 +33,7 @@ use data_components::cdc::{ChangesStream, StreamError};
 use data_components::mysql_replication::{
     BinlogPosition, InvalidPositionBehavior, NoopPositionStore, PersistedPosition, PositionStore,
     ReplicationMetrics, ReplicationMetricsCollector, ReplicationParams, ReplicationStreamInput,
-    StoreError, derive_server_id, process_nonce, start_replication_stream,
+    SnapshotMode, StoreError, derive_server_id, process_nonce, start_replication_stream,
 };
 use datafusion::sql::TableReference;
 use futures::StreamExt;
@@ -70,16 +70,15 @@ pub fn build_changes_stream(
         }
     };
 
-    let mut params_for_stream =
-        match replication_params_from_connector_params(params, &dataset_name) {
-            Ok(p) => p,
-            Err(e) => {
-                let msg = format!("mysql replication: {e}");
-                return Box::pin(futures::stream::once(async move {
-                    Err(StreamError::External(msg))
-                }));
-            }
-        };
+    let params_for_stream = match replication_params_from_connector_params(params, &dataset_name) {
+        Ok(p) => p,
+        Err(e) => {
+            let msg = format!("mysql replication: {e}");
+            return Box::pin(futures::stream::once(async move {
+                Err(StreamError::External(msg))
+            }));
+        }
+    };
 
     // TIMESTAMP columns scan through the read pool in the session time zone
     // (`mysql_time_zone`, default UTC) while binlog values are always UTC.
@@ -97,23 +96,11 @@ pub fn build_changes_stream(
         );
     }
 
-    // A non-persistent accelerator starts empty on every boot, so resuming
-    // from a persisted binlog position without a snapshot would silently
-    // serve only the rows touched after startup. Force the snapshot on every
-    // start for such accelerators (snapshot + binlog overlap converges via
-    // the PK upsert).
-    if dataset
-        .acceleration
-        .as_ref()
-        .is_some_and(accelerator_is_ephemeral)
-    {
-        params_for_stream.snapshot_on_resume = true;
-        tracing::info!(
-            dataset = %dataset_name,
-            "non-persistent accelerator with `refresh_mode: changes`: the initial snapshot \
-             will run on every start"
-        );
-    }
+    // Note: unlike Postgres (whose cursor lives server-side in the slot and
+    // can outlive an empty accelerator), no ephemeral-accelerator special
+    // case is needed here — the binlog position persists inside the
+    // accelerator's own sidecar, so a non-persistent accelerator can never
+    // present a stale resumable position.
 
     // Prefer the dataset's explicitly-declared acceleration `primary_key` —
     // that's what the accelerator write path uses for upsert/delete. Fall
@@ -157,16 +144,6 @@ pub fn build_changes_stream(
     Box::pin(try_stream! {
         let table_provider = federated_table.table_provider().await;
         let schema = table_provider.schema();
-
-        // Seed bootstrap progress from the inferred rough row count (extended
-        // schema inference), if available, so the initial snapshot can report
-        // progress.
-        if let Some(expected) =
-            data_components::inferred_schema::InferredSchema::from_metadata(schema.metadata())
-                .row_count
-        {
-            metrics.set_bootstrap_rows_expected(expected);
-        }
 
         let primary_keys = if declared_pks.is_empty() {
             extract_primary_keys(&table_provider)
@@ -566,26 +543,6 @@ pub(crate) fn observe_replication_metric(
     Some(callback)
 }
 
-/// Whether the accelerator's state survives a process restart. Non-persistent
-/// accelerators must re-snapshot on every start — binlog replay from a
-/// persisted position can never reconstruct an accelerator that booted empty.
-fn accelerator_is_ephemeral(
-    acceleration: &runtime::component::dataset::acceleration::Acceleration,
-) -> bool {
-    use runtime::component::dataset::acceleration::{Engine, Mode};
-    match acceleration.engine.to_unpartitioned() {
-        // Always in-memory.
-        Engine::Arrow => true,
-        // In-memory unless file-backed; `file_create` truncates on startup,
-        // which is just as empty as memory from replication's point of view.
-        Engine::DuckDB | Engine::Sqlite | Engine::Turso => {
-            matches!(acceleration.mode, Mode::Memory | Mode::FileCreate)
-        }
-        // External storage persists independently of this process.
-        _ => false,
-    }
-}
-
 fn replication_params_from_connector_params(
     params: &Parameters,
     dataset_name: &str,
@@ -598,7 +555,23 @@ fn replication_params_from_connector_params(
         })?,
         None => derive_server_id(dataset_name, process_nonce()),
     };
-    let initial_snapshot = optional_bool(params, "replication_initial_snapshot", true)?;
+    let snapshot_mode = match optional_string(params, "replication_snapshot_mode")
+        .as_deref()
+        .map(str::trim)
+    {
+        None | Some("") => SnapshotMode::Auto,
+        Some(value) => match value.to_ascii_lowercase().as_str() {
+            "auto" => SnapshotMode::Auto,
+            "never" => SnapshotMode::Never,
+            "always" => SnapshotMode::Always,
+            other => {
+                let user_param = params.user_param("replication_snapshot_mode");
+                return Err(format!(
+                    "parameter `{user_param}` must be 'auto', 'never', or 'always', got {other:?}"
+                ));
+            }
+        },
+    };
     let checkpoint_interval = optional_duration(
         params,
         "replication_checkpoint_interval",
@@ -631,9 +604,7 @@ fn replication_params_from_connector_params(
     Ok(ReplicationParams {
         opts,
         server_id,
-        initial_snapshot,
-        // Set by the caller from the dataset's acceleration config.
-        snapshot_on_resume: false,
+        snapshot_mode,
         bootstrap_batch_size,
         checkpoint_interval,
         invalid_position_behavior,
@@ -676,8 +647,7 @@ fn build_mysql_opts(params: &Parameters) -> Result<Opts, String> {
     };
 
     let sslmode = optional_string(params, "sslmode")
-        .map(|s| s.to_lowercase())
-        .unwrap_or_else(|| "required".to_string());
+        .map_or_else(|| "required".to_string(), |s| s.to_lowercase());
     match sslmode.as_str() {
         "disabled" | "required" | "preferred" => {}
         other => {
@@ -747,30 +717,6 @@ fn split_database_table(from: &str, params: &Parameters) -> Result<(String, Stri
 
 fn optional_string(params: &Parameters, key: &str) -> Option<String> {
     params.get(key).expose().ok().map(ToString::to_string)
-}
-
-/// Parses an optional boolean parameter strictly. An absent or empty value
-/// uses `default`; anything unrecognized is rejected rather than silently
-/// falling back (a typo'd `replication_initial_snapshot` must not silently
-/// skip the bootstrap snapshot).
-fn optional_bool(params: &Parameters, key: &str, default: bool) -> Result<bool, String> {
-    let Some(raw) = optional_string(params, key) else {
-        return Ok(default);
-    };
-    let trimmed = raw.trim();
-    if trimmed.is_empty() {
-        return Ok(default);
-    }
-    match trimmed.to_ascii_lowercase().as_str() {
-        "true" | "1" | "yes" | "y" => Ok(true),
-        "false" | "0" | "no" | "n" => Ok(false),
-        _ => {
-            let user_param = params.user_param(key);
-            Err(format!(
-                "parameter `{user_param}` must be a boolean (true/false), got {raw:?}"
-            ))
-        }
-    }
 }
 
 fn optional_duration(
@@ -897,8 +843,7 @@ mod tests {
         ]);
         let repl = replication_params_from_connector_params(&params, "orders")
             .expect("valid params parse");
-        assert!(repl.initial_snapshot);
-        assert!(!repl.snapshot_on_resume);
+        assert_eq!(repl.snapshot_mode, SnapshotMode::Auto);
         assert_eq!(repl.bootstrap_batch_size, DEFAULT_BOOTSTRAP_BATCH_SIZE);
         assert_eq!(repl.checkpoint_interval, DEFAULT_CHECKPOINT_INTERVAL);
         assert_eq!(
@@ -951,12 +896,26 @@ mod tests {
     }
 
     #[test]
-    fn bad_bool_is_rejected_not_defaulted() {
-        let params = params_with(&[("replication_initial_snapshot", "ture")]);
+    fn snapshot_mode_parses_strictly() {
+        for (raw, expected) in [
+            ("auto", SnapshotMode::Auto),
+            ("never", SnapshotMode::Never),
+            ("ALWAYS", SnapshotMode::Always),
+        ] {
+            let params = params_with(&[("replication_snapshot_mode", raw)]);
+            let repl = replication_params_from_connector_params(&params, "orders")
+                .expect("valid params parse");
+            assert_eq!(repl.snapshot_mode, expected, "raw: {raw}");
+        }
+
+        // A typo must error loudly, not silently fall back to `auto` —
+        // a misread `never` would otherwise snapshot a table the operator
+        // explicitly opted out of copying.
+        let params = params_with(&[("replication_snapshot_mode", "nevr")]);
         let err = replication_params_from_connector_params(&params, "orders")
-            .expect_err("typo'd boolean must error");
+            .expect_err("typo'd mode must error");
         assert!(
-            err.contains("mysql_replication_initial_snapshot"),
+            err.contains("mysql_replication_snapshot_mode"),
             "got: {err}"
         );
     }
