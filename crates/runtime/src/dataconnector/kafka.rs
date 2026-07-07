@@ -28,13 +28,10 @@ use snafu::prelude::*;
 use std::sync::Arc;
 use tonic::async_trait;
 
-use crate::{
-    component::{
-        ComponentType,
-        metrics::{MetricSpec, MetricType, MetricsProvider, ObserveMetricCallback},
-    },
-    dataaccelerator::spice_sys::{self, kafka::KafkaSys},
-};
+use runtime_api_types::v1::ComponentType;
+use runtime_metrics::component::{MetricSpec, MetricType, MetricsProvider, ObserveMetricCallback};
+
+use crate::dataaccelerator::spice_sys::{self, kafka::KafkaSys};
 
 #[async_trait]
 pub(crate) trait SidecarOffsetStore: Send + Sync {

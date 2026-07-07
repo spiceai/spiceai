@@ -14,7 +14,6 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use super::metrics;
 use super::refresh::Refresh;
 use super::refresh::get_timestamp;
 use super::sink::AccelerationSink;
@@ -32,7 +31,6 @@ use crate::datafusion::is_spice_internal_dataset;
 use crate::datafusion::managed_runtime::{self, ManagedRuntimeError};
 use crate::datafusion::refresh_sql;
 use crate::federated_table::FederatedTable;
-use crate::metrics::telemetry::track_bytes_processed;
 use crate::{
     component::dataset::acceleration::RefreshMode,
     dataconnector::get_data,
@@ -83,6 +81,8 @@ use runtime_datafusion_index::{
     IndexedTableProvider,
     analyzer::{IndexTableScanExtensionPlanner, IndexTableScanOptimizerRule},
 };
+use runtime_metrics::acceleration as metrics;
+use runtime_metrics::telemetry::track_bytes_processed;
 use runtime_object_store::registry::default_runtime_env;
 use runtime_request_context::{AsyncMarker, RequestContext};
 use snafu::{OptionExt, ResultExt};
@@ -1547,7 +1547,7 @@ impl RefreshTask {
         }) {
             Some(Ok((mut parsed, _schema))) => {
                 if let Some(base) = &refresh.sql {
-                    parsed.set_partition_filters(base.partition_filters().to_vec());
+                    parsed.set_partition_filters(base.partition_filters().map(<[_]>::to_vec));
                 }
                 Some(parsed)
             }
@@ -1567,7 +1567,7 @@ impl RefreshTask {
             .as_ref()
             .map(super::refresh::RefreshSQL::to_sql);
         if let Some(ref s) = effective_sql {
-            filters.extend(s.partition_filters().iter().cloned());
+            s.extend_effective_partition_filters(&mut filters);
         }
 
         if let Some(cpu_runtime_handle) = self.cpu_runtime.clone() {

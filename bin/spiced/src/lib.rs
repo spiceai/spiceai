@@ -57,6 +57,7 @@ use yaml::Value;
 #[cfg(feature = "anonymous_telemetry")]
 const TELEMETRY_DISABLED_SETTING_IGNORED_MESSAGE: &str = "Usage telemetry is anonymous and aggregated. In Spice.ai Open Source, setting runtime.telemetry.enabled: false in a Spicepod or passing --telemetry-enabled=false does not disable anonymous usage telemetry. To remove anonymous telemetry from an Open Source build, build from source without the anonymous_telemetry feature, or consider using Spice.ai Enterprise. Learn more at https://docs.spice.ai/docs/enterprise";
 
+mod cloud_connect;
 #[path = "tracing.rs"]
 mod spiced_tracing;
 mod tls;
@@ -930,12 +931,25 @@ pub async fn run(args: Args) -> Result<()> {
         Box::pin(cloned_rt.start_servers(args.runtime, tls_config, endpoint_auth)).await
     });
 
+    let mut components_loaded = false;
     tokio::select! {
-        () = Arc::clone(&rt).load_components() => {},
+        () = Arc::clone(&rt).load_components() => { components_loaded = true; },
         () = runtime::shutdown_signal() => {
             tracing::debug!("Cancelling runtime initializing!");
         },
     }
+
+    // Spice Cloud Connect. Default off — only activates when an identity is
+    // on disk or an adoption code is available. Failures here are non-fatal:
+    // spiced keeps running. Started only after `load_components()` completes
+    // so an adopted control plane can't issue RunQuery / GetRuntimeInfo
+    // against a half-loaded runtime (datasets/models still registering).
+    let cloud_connect_handle = if components_loaded {
+        cloud_connect::maybe_start(env!("CARGO_PKG_VERSION"), Arc::clone(&rt)).await
+    } else {
+        // Shutting down before components finished loading — don't start.
+        None
+    };
 
     let result = match server_thread.await {
         // Don't treat force terminated as an error
@@ -948,6 +962,9 @@ pub async fn run(args: Args) -> Result<()> {
         }),
     };
 
+    if let Some(cc) = cloud_connect_handle {
+        cc.shutdown().await;
+    }
     rt.shutdown().await;
 
     result

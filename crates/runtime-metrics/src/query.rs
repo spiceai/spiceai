@@ -1,5 +1,5 @@
 /*
-Copyright 2024-2025 The Spice.ai OSS Authors
+Copyright 2024-2026 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -23,7 +23,7 @@ use opentelemetry::{
 
 static METER: LazyLock<Meter> = LazyLock::new(|| global::meter("query"));
 
-pub(crate) static FAILURES: LazyLock<Counter<u64>> = LazyLock::new(|| {
+pub static FAILURES: LazyLock<Counter<u64>> = LazyLock::new(|| {
     METER
         .u64_counter("query_failures")
         .with_description("Number of query failures.")

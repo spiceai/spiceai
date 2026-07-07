@@ -28,7 +28,7 @@ use ballista_executor::metrics::ExecutorMetricsCollector;
 use ballista_scheduler::metrics::SchedulerMetricsCollector;
 use opentelemetry::KeyValue;
 
-use crate::metrics::cluster;
+use runtime_metrics::cluster;
 
 /// OpenTelemetry-based metrics collector for Ballista executors.
 ///

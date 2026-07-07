@@ -38,13 +38,13 @@ use datafusion_table_providers::sql::db_connection_pool::{
 };
 use datafusion_table_providers::sql::sql_provider_datafusion::{SqlTable, expr::Engine};
 use runtime::component::dataset::Dataset;
-use runtime::component::metrics::MetricsProvider;
 use runtime::dataconnector::{
     ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory,
     DataConnectorResult, NewDataConnectorResult,
 };
 use runtime::datafusion::udf::deny_spice_functions_for_postgres_table_providers;
 use runtime::parameters::ParameterSpec;
+use runtime_metrics::component::MetricsProvider;
 use secrecy::SecretBox;
 use snafu::prelude::*;
 use std::any::Any;

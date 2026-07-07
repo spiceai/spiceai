@@ -1,5 +1,5 @@
 /*
-Copyright 2024-2025 The Spice.ai OSS Authors
+Copyright 2024-2026 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -14,9 +14,11 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+#![allow(clippy::missing_errors_doc)]
+
 use std::sync::Arc;
 
-use crate::component::metrics::{MetricSpec, MetricType, MetricsProvider, ObserveMetricCallback};
+use crate::component::{MetricSpec, MetricType, MetricsProvider, ObserveMetricCallback};
 use opentelemetry::{KeyValue, metrics::UpDownCounter};
 use snafu::prelude::*;
 
@@ -37,16 +39,16 @@ pub enum Error {
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
-pub(crate) static COMPONENTS_METER: LazyLock<Meter> = LazyLock::new(|| global::meter("component"));
+pub static COMPONENTS_METER: LazyLock<Meter> = LazyLock::new(|| global::meter("component"));
 
-pub(crate) static REGISTERED_COUNT: LazyLock<UpDownCounter<i64>> = LazyLock::new(|| {
+pub static REGISTERED_COUNT: LazyLock<UpDownCounter<i64>> = LazyLock::new(|| {
     COMPONENTS_METER
         .i64_up_down_counter("component_metric_registered_count")
         .with_description("Number of currently registered component metrics.")
         .build()
 });
 
-pub(crate) fn register_component_metric(
+pub fn register_component_metric(
     metric_provider: &Arc<dyn MetricsProvider>,
     metric: MetricSpec,
     instance_name: &str,
