@@ -1,5 +1,5 @@
 /*
-Copyright 2024-2025 The Spice.ai OSS Authors
+Copyright 2024-2026 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -28,8 +28,6 @@ use tokio_util::sync::CancellationToken;
 
 use datafusion::sql::TableReference;
 use opentelemetry::KeyValue;
-
-use runtime_metrics;
 
 // Re-export ComponentStatus from the shared API types crate
 pub use runtime_api_types::v1::ComponentStatus;
@@ -106,7 +104,7 @@ impl RuntimeStatus {
 
     /// Updates the status of a component and tracks if it has ever been ready.
     #[expect(clippy::needless_pass_by_value)]
-    pub(crate) fn update_component_status(&self, component_name: &str, status: ComponentStatus) {
+    pub fn update_component_status(&self, component_name: &str, status: ComponentStatus) {
         let mut statuses = self
             .statuses
             .write()
@@ -210,7 +208,7 @@ impl RuntimeStatus {
         let worker_name = name.to_string();
         let metric_value = status.discriminant();
         self.update_component_status(&format!("worker:{worker_name}"), status);
-        runtime_metrics::models::STATUS
+        runtime_metrics::workers::STATUS
             .record(metric_value, &[KeyValue::new("worker", worker_name)]);
     }
 
