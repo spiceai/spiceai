@@ -94,6 +94,7 @@ rcgen = { version = "0.14", features = ["x509-parser"] }
 time = "0.3"
 
 # Internal crates
+runtime-cloud-connect = { workspace = true }
 spice-cloud-client.workspace = true
 repl = { path = "../../crates/repl" }
 runtime-api-types = { path = "../../crates/runtime-api-types" }

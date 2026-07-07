@@ -37,6 +37,7 @@ members = [
     "crates/runtime-auth",
     "crates/runtime-metrics",
     "crates/runtime-async",
+    "crates/runtime-cloud-connect",
     "crates/runtime-cluster",
     "crates/datafusion-flightsql",
     "crates/runtime-datafusion",
@@ -238,7 +239,7 @@ logos = "0.16.1"
 mailparse = "0.16.1"
 moka = { version = "0.12", features = ["future"] }
 mongodb = { version = "3.5.2", features = ["openssl-tls"] }
-mysql_async = { version = "0.36.2", features = ["native-tls-tls", "chrono"] }
+mysql_async = { version = "0.36.2", features = ["native-tls-tls", "chrono", "binlog"] }
 nix = "0.30"
 num_cpus = "1.16"
 object_store = { version = "0.13.1", features = [
@@ -306,6 +307,7 @@ serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10.8"
 snafu = "0.8.6"
+runtime-cloud-connect = { path = "crates/runtime-cloud-connect" }
 spice-cloud-client = { path = "crates/spice-cloud-client" }
 snowflake-api = { git = "https://github.com/spiceai/snowflake-rs.git", rev = "744ffd77fe82171a805562ce001a341a94d52541" } # branch: spiceai-58
 sqlparser = "0.59.0"
