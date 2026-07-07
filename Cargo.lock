@@ -5764,6 +5764,7 @@ dependencies = [
  "percent-encoding",
  "pgwire-replication",
  "postgres-native-tls",
+ "postgres-protocol",
  "rand 0.10.1",
  "rdkafka",
  "regex",

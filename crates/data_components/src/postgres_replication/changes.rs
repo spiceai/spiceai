@@ -32,10 +32,20 @@ use arrow::{
     datatypes::{DataType, Field, Int8Type, Int16Type, Int32Type, Schema, SchemaRef, TimeUnit},
 };
 use async_trait::async_trait;
+use snafu::ensure;
 
 use super::pgoutput::{Relation, TupleData, Value};
 use super::{PgOutputDecodeSnafu, Result};
 use crate::cdc::{ChangeBatch, ChangeEnvelope, CommitChange, CommitError, changes_schema};
+
+/// Microseconds between the Unix epoch (1970-01-01) and the Postgres epoch
+/// (2000-01-01). Binary `timestamp`/`timestamptz` are relative to the Postgres
+/// epoch; Arrow timestamps are relative to the Unix epoch.
+const PG_EPOCH_MICROS: i64 = 946_684_800_000_000;
+
+/// Days between the Unix epoch and the Postgres epoch. Binary `date` is days
+/// since the Postgres epoch; Arrow `Date32` is days since the Unix epoch.
+const PG_EPOCH_DAYS: i32 = 10_957;
 
 /// One logical change derived from a pgoutput message.
 #[derive(Debug, Clone)]
@@ -258,7 +268,10 @@ pub fn build_change_batch(
             match source_idx {
                 Some(source_idx) => {
                     let value = change.row.columns.get(*source_idx).and_then(Option::as_ref);
-                    data_builders[col_idx].append(value, change.op)?;
+                    // The source column's Postgres type OID drives binary-format
+                    // decoding; the text path ignores it.
+                    let type_oid = relation.columns[*source_idx].type_oid;
+                    data_builders[col_idx].append(value, change.op, type_oid)?;
                 }
                 None => data_builders[col_idx].append_null(),
             }
@@ -536,13 +549,33 @@ impl FieldBuilder {
         })
     }
 
-    pub(super) fn append(&mut self, value: Option<&Value>, op: ChangeOp) -> Result<()> {
+    /// Append one pgoutput column value into the typed Arrow builder.
+    ///
+    /// `type_oid` is the source column's Postgres type OID (from the pgoutput
+    /// `Relation` message). It is consulted only for binary-format values
+    /// ([`Value::Binary`]); the text path is self-describing and ignores it.
+    ///
+    /// Under the binary output protocol Postgres tags each column `t` or `b`
+    /// per-value, so *both* paths must remain live regardless of the requested
+    /// format — a type without a binary send function still arrives as text.
+    pub(super) fn append(
+        &mut self,
+        value: Option<&Value>,
+        op: ChangeOp,
+        type_oid: u32,
+    ) -> Result<()> {
         let Some(v) = value else {
             self.append_null();
             return Ok(());
         };
         let s = match v {
-            Value::Text(s) => s,
+            Value::Text(bytes) => {
+                // UTF-8 validation is deferred to here (the decoder keeps raw
+                // bytes) so it happens exactly once, on the way into the builder.
+                std::str::from_utf8(bytes).map_err(|e| super::Error::PgOutputDecode {
+                    message: format!("invalid utf8 in text value: {e}"),
+                })?
+            }
             Value::Unchanged => {
                 // For UPDATE with a TOASTed column that wasn't changed, pgoutput
                 // omits the value. Silently coercing to NULL would overwrite the
@@ -560,21 +593,9 @@ impl FieldBuilder {
                 .fail();
             }
             Value::Binary(bytes) => {
-                // pgoutput delivers bytea in binary format when the publication
-                // uses the binary encoding. We only accept this for BinaryBuilder;
-                // for other builders it's an error (silent coerce to NULL would
-                // be wrong).
-                if let Self::Binary(b) = self {
-                    b.append_value(bytes);
-                    return Ok(());
-                }
-                return PgOutputDecodeSnafu {
-                    message: "postgres_replication: binary-format pgoutput value received \
-                              for non-binary column. Configure the publication to use the \
-                              text output format."
-                        .to_string(),
-                }
-                .fail();
+                // Binary output protocol: decode the type's `send` wire form
+                // straight into the typed builder (no text round-trip).
+                return self.append_binary(bytes, type_oid);
             }
         };
         match self {
@@ -598,7 +619,7 @@ impl FieldBuilder {
                 })?;
                 b.append_value(bytes);
             }
-            Self::Bool(b) => b.append_value(matches!(s.as_str(), "t" | "true" | "TRUE")),
+            Self::Bool(b) => b.append_value(matches!(s, "t" | "true" | "TRUE")),
             Self::Int8(b) => {
                 b.append_value(s.parse::<i8>().map_err(|e| super::Error::PgOutputDecode {
                     message: format!("int8 parse '{s}': {e}"),
@@ -687,10 +708,13 @@ impl FieldBuilder {
                 for element in &elements {
                     match element {
                         Some(text) => {
-                            let value = Value::Text(text.clone());
-                            inner.append(Some(&value), op)?;
+                            // Text array literal: each element is itself text,
+                            // so the inner builder's text path handles it and
+                            // the element `type_oid` is irrelevant (`0`).
+                            let value = Value::Text(bytes::Bytes::from(text.clone()));
+                            inner.append(Some(&value), op, 0)?;
                         }
-                        None if item_field.is_nullable() => inner.append(None, op)?,
+                        None if item_field.is_nullable() => inner.append(None, op, 0)?,
                         None => {
                             return PgOutputDecodeSnafu {
                                 message: format!(
@@ -705,6 +729,153 @@ impl FieldBuilder {
                 }
                 let end = offsets.last().copied().unwrap_or(0)
                     + i32::try_from(elements.len()).map_err(|e| super::Error::PgOutputDecode {
+                        message: format!("array too large: {e}"),
+                    })?;
+                offsets.push(end);
+                validity.push(true);
+            }
+        }
+        Ok(())
+    }
+
+    /// Decode a binary (`send`-format) pgoutput value directly into the typed
+    /// builder. Reached when Postgres tags the column `b` under the binary
+    /// output protocol. `type_oid` names the source type for diagnostics.
+    fn append_binary(&mut self, raw: &[u8], type_oid: u32) -> Result<()> {
+        use postgres_protocol::types as pg;
+
+        // Map a postgres-protocol binary-decode error into our decode error,
+        // naming the failing logical type and OID for actionable diagnostics.
+        // `kind` is always a string literal, so `'static` lets the returned
+        // closure capture it without a borrow that would outlive the call.
+        let decode_err = |kind: &'static str| {
+            move |e: Box<dyn std::error::Error + Sync + Send>| super::Error::PgOutputDecode {
+                message: format!(
+                    "postgres_replication: binary {kind} decode failed (type oid {type_oid}): {e}"
+                ),
+            }
+        };
+        let range_err = |kind: &str, detail: String| super::Error::PgOutputDecode {
+            message: format!(
+                "postgres_replication: binary {kind} value out of range (type oid {type_oid}): \
+                 {detail}"
+            ),
+        };
+
+        match self {
+            Self::Bool(b) => b.append_value(pg::bool_from_sql(raw).map_err(decode_err("bool"))?),
+            Self::Int8(b) => {
+                b.append_value(pg::char_from_sql(raw).map_err(decode_err("\"char\""))?);
+            }
+            Self::Int16(b) => b.append_value(pg::int2_from_sql(raw).map_err(decode_err("int2"))?),
+            Self::Int32(b) => b.append_value(pg::int4_from_sql(raw).map_err(decode_err("int4"))?),
+            Self::Int64(b) => b.append_value(pg::int8_from_sql(raw).map_err(decode_err("int8"))?),
+            Self::UInt32(b) => b.append_value(pg::oid_from_sql(raw).map_err(decode_err("oid"))?),
+            Self::Float32(b) => {
+                b.append_value(pg::float4_from_sql(raw).map_err(decode_err("float4"))?);
+            }
+            Self::Float64(b) => {
+                b.append_value(pg::float8_from_sql(raw).map_err(decode_err("float8"))?);
+            }
+            Self::Utf8(b) => b.append_value(pg::text_from_sql(raw).map_err(decode_err("text"))?),
+            Self::LargeUtf8(b) => {
+                b.append_value(pg::text_from_sql(raw).map_err(decode_err("text"))?);
+            }
+            // bytea `send` form is the raw bytes — identity.
+            Self::Binary(b) => b.append_value(pg::bytea_from_sql(raw)),
+            Self::Date32(b) => {
+                let pg_days = pg::date_from_sql(raw).map_err(decode_err("date"))?;
+                let days = pg_days
+                    .checked_add(PG_EPOCH_DAYS)
+                    .ok_or_else(|| range_err("date", format!("pg days {pg_days}")))?;
+                b.append_value(days);
+            }
+            Self::Time64Nanos(b) => {
+                let micros = pg::time_from_sql(raw).map_err(decode_err("time"))?;
+                let nanos = micros
+                    .checked_mul(1_000)
+                    .ok_or_else(|| range_err("time", format!("micros {micros}")))?;
+                b.append_value(nanos);
+            }
+            Self::TimestampMicros(b, _tz) => {
+                let pg_micros = pg::timestamp_from_sql(raw).map_err(decode_err("timestamp"))?;
+                let micros = pg_micros
+                    .checked_add(PG_EPOCH_MICROS)
+                    .ok_or_else(|| range_err("timestamp", format!("pg micros {pg_micros}")))?;
+                b.append_value(micros);
+            }
+            Self::TimestampNanos(b, _tz) => {
+                let pg_micros = pg::timestamp_from_sql(raw).map_err(decode_err("timestamp"))?;
+                let micros = pg_micros
+                    .checked_add(PG_EPOCH_MICROS)
+                    .ok_or_else(|| range_err("timestamp", format!("pg micros {pg_micros}")))?;
+                let nanos = micros
+                    .checked_mul(1_000)
+                    .ok_or_else(|| range_err("timestamp", format!("micros {micros}")))?;
+                b.append_value(nanos);
+            }
+            Self::Decimal128(b, precision, scale) => {
+                let v = numeric_from_binary(raw, *precision, *scale)?;
+                b.append_value(v);
+            }
+            Self::DictUtf8Int8(b) => {
+                b.append(pg::text_from_sql(raw).map_err(decode_err("enum"))?)
+                    .map_err(|e| super::Error::PgOutputDecode {
+                        message: format!("dictionary append: {e}"),
+                    })?;
+            }
+            Self::DictUtf8Int16(b) => {
+                b.append(pg::text_from_sql(raw).map_err(decode_err("enum"))?)
+                    .map_err(|e| super::Error::PgOutputDecode {
+                        message: format!("dictionary append: {e}"),
+                    })?;
+            }
+            Self::DictUtf8Int32(b) => {
+                b.append(pg::text_from_sql(raw).map_err(decode_err("enum"))?)
+                    .map_err(|e| super::Error::PgOutputDecode {
+                        message: format!("dictionary append: {e}"),
+                    })?;
+            }
+            Self::List {
+                item_field,
+                inner,
+                offsets,
+                validity,
+            } => {
+                if matches!(
+                    item_field.data_type(),
+                    DataType::List(_) | DataType::LargeList(_) | DataType::FixedSizeList(_, _)
+                ) {
+                    return PgOutputDecodeSnafu {
+                        message:
+                            "postgres_replication: multidimensional arrays are not supported. \
+                                  Cast the column to a scalar type on the source, or exclude the \
+                                  column from the dataset schema."
+                                .to_string(),
+                    }
+                    .fail();
+                }
+                let (elem_oid, elements) = decode_binary_array(raw)?;
+                let count = elements.len();
+                for element in elements {
+                    match element {
+                        // Recurse into the inner builder's binary path with the
+                        // element slice directly — no per-element allocation.
+                        Some(elem) => inner.append_binary(elem, elem_oid)?,
+                        None if item_field.is_nullable() => inner.append_null(),
+                        None => {
+                            return PgOutputDecodeSnafu {
+                                message: format!(
+                                    "NULL array element for non-nullable list item field `{}`",
+                                    item_field.name()
+                                ),
+                            }
+                            .fail();
+                        }
+                    }
+                }
+                let end = offsets.last().copied().unwrap_or(0)
+                    + i32::try_from(count).map_err(|e| super::Error::PgOutputDecode {
                         message: format!("array too large: {e}"),
                     })?;
                 offsets.push(end);
@@ -930,6 +1101,187 @@ fn parse_pg_timestamp_nanos(s: &str) -> Result<i64> {
 /// implementation.
 pub(super) fn parse_pg_numeric_public(s: &str, scale: i8) -> Result<i128> {
     parse_pg_numeric_to_i128(s, 38, scale)
+}
+
+/// Decode a Postgres binary `numeric` (`send` wire form) into an `i128` scaled
+/// to the dataset's declared Arrow scale.
+///
+/// Wire format: `i16 ndigits, i16 weight, u16 sign, u16 dscale`, then `ndigits`
+/// base-10000 groups (`i16` each, most-significant first). The value is
+/// `sign · Σ digit[i]·10000^(weight−i)`. We fold the groups into a base-10000
+/// integer `m` and rescale by `10^(4·(weight−(ndigits−1)) + scale)`; a negative
+/// exponent that does not divide `m` evenly means the value carries more
+/// fractional precision than the declared scale — an error, never a silent
+/// round (mirrors the text path's scale check). `NaN`/`±Infinity` sign words
+/// are rejected: `Decimal128` cannot represent them.
+fn numeric_from_binary(raw: &[u8], _precision: u8, scale: i8) -> Result<i128> {
+    use bytes::Buf;
+
+    const NUMERIC_POS: u16 = 0x0000;
+    const NUMERIC_NEG: u16 = 0x4000;
+
+    let mut b = raw;
+    ensure!(
+        b.remaining() >= 8,
+        PgOutputDecodeSnafu {
+            message: "short binary numeric header".to_string()
+        }
+    );
+    let ndigits = b.get_u16();
+    let weight = b.get_i16();
+    let sign = b.get_u16();
+    let _dscale = b.get_u16();
+
+    let negative = match sign {
+        NUMERIC_POS => false,
+        NUMERIC_NEG => true,
+        other => {
+            return PgOutputDecodeSnafu {
+                message: format!(
+                    "postgres_replication: numeric special value (sign 0x{other:04x}, \
+                     NaN/Infinity) is not representable as Decimal128"
+                ),
+            }
+            .fail();
+        }
+    };
+
+    ensure!(
+        b.remaining() >= usize::from(ndigits) * 2,
+        PgOutputDecodeSnafu {
+            message: "short binary numeric digits".to_string()
+        }
+    );
+
+    let overflow = || super::Error::PgOutputDecode {
+        message: "postgres_replication: numeric magnitude exceeds Decimal128 range".to_string(),
+    };
+
+    let mut m: i128 = 0;
+    for _ in 0..ndigits {
+        let d = b.get_u16();
+        ensure!(
+            d < 10_000,
+            PgOutputDecodeSnafu {
+                message: format!("postgres_replication: invalid base-10000 numeric digit {d}")
+            }
+        );
+        m = m
+            .checked_mul(10_000)
+            .and_then(|m| m.checked_add(i128::from(d)))
+            .ok_or_else(overflow)?;
+    }
+
+    // result = m · 10^p, where p rescales the least-significant base-10000 group
+    // (exponent weight−(ndigits−1), i.e. ×10^(4·that)) to the declared scale.
+    let e_min = i64::from(weight) - (i64::from(ndigits) - 1);
+    let p = 4 * e_min + i64::from(scale);
+
+    let result = if p >= 0 {
+        let exp = u32::try_from(p).map_err(|_| overflow())?;
+        m.checked_mul(pow10_i128(exp)?).ok_or_else(overflow)?
+    } else {
+        let exp = u32::try_from(-p).map_err(|_| overflow())?;
+        let pow = pow10_i128(exp)?;
+        ensure!(
+            m % pow == 0,
+            PgOutputDecodeSnafu {
+                message: format!(
+                    "postgres_replication: numeric value carries more fractional precision \
+                     than the dataset's declared scale {scale}"
+                )
+            }
+        );
+        m / pow
+    };
+
+    Ok(if negative { -result } else { result })
+}
+
+/// `10^exp` as `i128`, erroring if it overflows `Decimal128`'s range.
+fn pow10_i128(exp: u32) -> Result<i128> {
+    let mut v: i128 = 1;
+    for _ in 0..exp {
+        v = v
+            .checked_mul(10)
+            .ok_or_else(|| super::Error::PgOutputDecode {
+                message: format!(
+                    "postgres_replication: numeric magnitude 10^{exp} exceeds Decimal128 range"
+                ),
+            })?;
+    }
+    Ok(v)
+}
+
+/// Parse a Postgres binary array (`send` wire form) into its element OID and a
+/// row-major list of element payloads (`None` = SQL NULL). Only 0- and
+/// 1-dimensional arrays are supported — matching the text path, which rejects
+/// multidimensional arrays. Element slices borrow from `raw`.
+fn decode_binary_array(raw: &[u8]) -> Result<(u32, Vec<Option<&[u8]>>)> {
+    use bytes::Buf;
+
+    let mut b = raw;
+    ensure!(
+        b.remaining() >= 12,
+        PgOutputDecodeSnafu {
+            message: "short binary array header".to_string()
+        }
+    );
+    let ndim = b.get_i32();
+    let _flags = b.get_i32();
+    let elem_oid = b.get_u32();
+    ensure!(
+        (0..=1).contains(&ndim),
+        PgOutputDecodeSnafu {
+            message: format!(
+                "postgres_replication: unsupported array dimensionality {ndim} \
+                 (only scalar 1-D arrays are supported). Cast the column to a scalar type."
+            )
+        }
+    );
+
+    let mut count: usize = 0;
+    if ndim == 1 {
+        ensure!(
+            b.remaining() >= 8,
+            PgOutputDecodeSnafu {
+                message: "short binary array dimension".to_string()
+            }
+        );
+        let len = b.get_i32();
+        let _lower_bound = b.get_i32();
+        count = usize::try_from(len).map_err(|_| super::Error::PgOutputDecode {
+            message: format!("postgres_replication: negative array dimension {len}"),
+        })?;
+    }
+
+    let mut out = Vec::with_capacity(count);
+    for _ in 0..count {
+        ensure!(
+            b.remaining() >= 4,
+            PgOutputDecodeSnafu {
+                message: "short binary array element length".to_string()
+            }
+        );
+        let raw_len = b.get_i32();
+        if raw_len < 0 {
+            out.push(None);
+        } else {
+            let elem_len = usize::try_from(raw_len).map_err(|e| super::Error::PgOutputDecode {
+                message: format!("invalid array element length: {e}"),
+            })?;
+            ensure!(
+                b.remaining() >= elem_len,
+                PgOutputDecodeSnafu {
+                    message: "short binary array element body".to_string()
+                }
+            );
+            let (elem, rest) = b.split_at(elem_len);
+            b = rest;
+            out.push(Some(elem));
+        }
+    }
+    Ok((elem_oid, out))
 }
 
 fn parse_pg_numeric_to_i128(s: &str, precision: u8, scale: i8) -> Result<i128> {
@@ -1172,8 +1524,8 @@ mod tests {
     fn tuple_for(id: &str, name: Option<&str>) -> TupleData {
         TupleData {
             columns: vec![
-                Some(PgValue::Text(id.to_string())),
-                name.map(|n| PgValue::Text(n.to_string())),
+                Some(PgValue::Text(bytes::Bytes::from(id.to_string()))),
+                name.map(|n| PgValue::Text(bytes::Bytes::from(n.to_string()))),
             ],
         }
     }
@@ -1269,7 +1621,7 @@ mod tests {
         };
         let row = TupleData {
             columns: (0..13)
-                .map(|i| Some(PgValue::Text(i.to_string())))
+                .map(|i| Some(PgValue::Text(bytes::Bytes::from(i.to_string()))))
                 .collect(),
         };
         let changes = vec![DecodedChange {
@@ -1635,7 +1987,7 @@ mod tests {
         DecodedChange {
             op,
             row: TupleData {
-                columns: vec![Some(PgValue::Text(text.to_string()))],
+                columns: vec![Some(PgValue::Text(bytes::Bytes::from(text.to_string())))],
             },
         }
     }
@@ -2065,5 +2417,287 @@ mod tests {
         decode_hex("abc").expect_err("odd length should fail");
         // Invalid digit → error.
         decode_hex("zz").expect_err("invalid digit should fail");
+    }
+
+    // ---- binary-format (pgoutput `b` tag) decode tests ----------------------
+
+    use arrow::datatypes::{
+        Date32Type, Decimal128Type, Float32Type, Float64Type, Int64Type, Time64NanosecondType,
+        TimestampNanosecondType, UInt32Type,
+    };
+    use bytes::Bytes;
+
+    /// Append one binary (`send`-format) value into a fresh builder for `dt`
+    /// and finish it into a single-element array.
+    fn bin_one(dt: &DataType, type_oid: u32, raw: &[u8]) -> ArrayRef {
+        let mut fb = FieldBuilder::with_capacity(dt, 1).expect("builder");
+        fb.append(
+            Some(&PgValue::Binary(Bytes::copy_from_slice(raw))),
+            ChangeOp::Create,
+            type_oid,
+        )
+        .expect("append binary value");
+        fb.finish()
+    }
+
+    /// Encode a Postgres binary `numeric` from its base-10000 digit groups.
+    fn enc_numeric(digits: &[u16], weight: i16, negative: bool, dscale: u16) -> Vec<u8> {
+        let mut o = Vec::new();
+        o.extend_from_slice(&(u16::try_from(digits.len()).expect("ndigits")).to_be_bytes());
+        o.extend_from_slice(&weight.to_be_bytes());
+        o.extend_from_slice(&(if negative { 0x4000u16 } else { 0 }).to_be_bytes());
+        o.extend_from_slice(&dscale.to_be_bytes());
+        for d in digits {
+            o.extend_from_slice(&d.to_be_bytes());
+        }
+        o
+    }
+
+    #[test]
+    fn binary_scalar_types_decode() {
+        assert!(bin_one(&DataType::Boolean, 16, &[1]).as_boolean().value(0));
+        assert!(!bin_one(&DataType::Boolean, 16, &[0]).as_boolean().value(0));
+        assert_eq!(
+            bin_one(&DataType::Int16, 21, &1234i16.to_be_bytes())
+                .as_primitive::<Int16Type>()
+                .value(0),
+            1234
+        );
+        assert_eq!(
+            bin_one(&DataType::Int32, 23, &(-42i32).to_be_bytes())
+                .as_primitive::<Int32Type>()
+                .value(0),
+            -42
+        );
+        assert_eq!(
+            bin_one(&DataType::Int64, 20, &9_000_000_000i64.to_be_bytes())
+                .as_primitive::<Int64Type>()
+                .value(0),
+            9_000_000_000
+        );
+        // "char" (oid 18) -> Int8; 0xFF is -1.
+        assert_eq!(
+            bin_one(&DataType::Int8, 18, &[0xFF])
+                .as_primitive::<Int8Type>()
+                .value(0),
+            -1
+        );
+        assert_eq!(
+            bin_one(&DataType::UInt32, 26, &4_000_000_000u32.to_be_bytes())
+                .as_primitive::<UInt32Type>()
+                .value(0),
+            4_000_000_000
+        );
+        assert!(
+            (bin_one(&DataType::Float32, 700, &1.5f32.to_be_bytes())
+                .as_primitive::<Float32Type>()
+                .value(0)
+                - 1.5)
+                .abs()
+                < f32::EPSILON
+        );
+        assert!(
+            (bin_one(&DataType::Float64, 701, &2.25f64.to_be_bytes())
+                .as_primitive::<Float64Type>()
+                .value(0)
+                - 2.25)
+                .abs()
+                < f64::EPSILON
+        );
+        assert_eq!(
+            bin_one(&DataType::Utf8, 25, b"hello")
+                .as_string::<i32>()
+                .value(0),
+            "hello"
+        );
+        // bytea `send` form is identity.
+        assert_eq!(
+            bin_one(&DataType::Binary, 17, &[0xde, 0xad])
+                .as_binary::<i32>()
+                .value(0),
+            &[0xde, 0xad]
+        );
+    }
+
+    #[test]
+    fn binary_temporal_decode() {
+        // date: pg day 0 (2000-01-01) -> Arrow Date32 10957.
+        assert_eq!(
+            bin_one(&DataType::Date32, 1082, &0i32.to_be_bytes())
+                .as_primitive::<Date32Type>()
+                .value(0),
+            10_957
+        );
+        // timestamp: pg micros 0 (2000-01-01) -> Arrow nanos since Unix epoch.
+        let ts = DataType::Timestamp(TimeUnit::Nanosecond, None);
+        assert_eq!(
+            bin_one(&ts, 1114, &0i64.to_be_bytes())
+                .as_primitive::<TimestampNanosecondType>()
+                .value(0),
+            946_684_800_000_000_000
+        );
+        // time: 1_000_000 micros since midnight (00:00:01) -> 1e9 nanos.
+        let t = DataType::Time64(TimeUnit::Nanosecond);
+        assert_eq!(
+            bin_one(&t, 1083, &1_000_000i64.to_be_bytes())
+                .as_primitive::<Time64NanosecondType>()
+                .value(0),
+            1_000_000_000
+        );
+    }
+
+    #[test]
+    fn binary_numeric_decode_matches_expected() {
+        // 172799.49 @ scale 2 -> 17279949 (digits [17,2799,4900], weight 1).
+        assert_eq!(
+            numeric_from_binary(&enc_numeric(&[17, 2799, 4900], 1, false, 2), 15, 2)
+                .expect("172799.49"),
+            17_279_949
+        );
+        // 0.01 @ scale 2 -> 1.
+        assert_eq!(
+            numeric_from_binary(&enc_numeric(&[100], -1, false, 2), 15, 2).expect("0.01"),
+            1
+        );
+        // 100 @ scale 2 -> 10000.
+        assert_eq!(
+            numeric_from_binary(&enc_numeric(&[100], 0, false, 2), 15, 2).expect("100.00"),
+            10_000
+        );
+        // -5 @ scale 0 -> -5.
+        assert_eq!(
+            numeric_from_binary(&enc_numeric(&[5], 0, true, 0), 15, 0).expect("-5"),
+            -5
+        );
+        // Zero (ndigits 0) -> 0.
+        assert_eq!(
+            numeric_from_binary(&enc_numeric(&[], 0, false, 0), 15, 2).expect("0"),
+            0
+        );
+        // Same value through the Decimal128 builder arm of `append_binary`.
+        assert_eq!(
+            bin_one(
+                &DataType::Decimal128(15, 2),
+                1700,
+                &enc_numeric(&[17, 2799, 4900], 1, false, 2)
+            )
+            .as_primitive::<Decimal128Type>()
+            .value(0),
+            17_279_949
+        );
+    }
+
+    #[test]
+    fn binary_numeric_rejects_overscale_and_special() {
+        // 1.234 @ scale 2: more fractional precision than declared -> error, not
+        // a silent round.
+        numeric_from_binary(&enc_numeric(&[1, 2340], 0, false, 3), 15, 2)
+            .expect_err("overscale must error");
+        // NaN sign word 0xC000 is not representable as Decimal128.
+        let mut nan = Vec::new();
+        nan.extend_from_slice(&0u16.to_be_bytes()); // ndigits
+        nan.extend_from_slice(&0i16.to_be_bytes()); // weight
+        nan.extend_from_slice(&0xC000u16.to_be_bytes()); // sign = NaN
+        nan.extend_from_slice(&0u16.to_be_bytes()); // dscale
+        numeric_from_binary(&nan, 15, 2).expect_err("NaN must error");
+    }
+
+    /// Encode a 1-D binary `int4[]` array (`send` wire form).
+    fn enc_binary_int4_array(elems: &[Option<i32>]) -> Vec<u8> {
+        let mut o = Vec::new();
+        o.extend_from_slice(&1i32.to_be_bytes()); // ndim
+        o.extend_from_slice(&1i32.to_be_bytes()); // flags (has nulls)
+        o.extend_from_slice(&23u32.to_be_bytes()); // element oid = int4
+        o.extend_from_slice(&(i32::try_from(elems.len()).expect("len")).to_be_bytes()); // dim len
+        o.extend_from_slice(&1i32.to_be_bytes()); // lower bound
+        for e in elems {
+            match e {
+                Some(v) => {
+                    o.extend_from_slice(&4i32.to_be_bytes());
+                    o.extend_from_slice(&v.to_be_bytes());
+                }
+                None => o.extend_from_slice(&(-1i32).to_be_bytes()),
+            }
+        }
+        o
+    }
+
+    #[test]
+    fn binary_array_int4_decode() {
+        let dt = DataType::List(Arc::new(Field::new("item", DataType::Int32, true)));
+        let arr = bin_one(&dt, 1007, &enc_binary_int4_array(&[Some(1), None, Some(3)]));
+        let list = arr.as_list::<i32>();
+        assert_eq!(list.len(), 1);
+        let values = list.value(0);
+        let ints = values.as_primitive::<Int32Type>();
+        assert_eq!(ints.len(), 3);
+        assert_eq!(ints.value(0), 1);
+        assert!(ints.is_null(1));
+        assert_eq!(ints.value(2), 3);
+    }
+
+    #[test]
+    fn build_change_batch_decodes_binary_tuple() {
+        // A row with binary-encoded columns flows through the same batch builder
+        // as text, driven by the relation's per-column type OIDs.
+        let relation = Relation {
+            relation_id: 1,
+            namespace: "public".to_string(),
+            name: "orders".to_string(),
+            replica_identity: b'd',
+            columns: vec![
+                PgColumn {
+                    is_key: true,
+                    name: "id".to_string(),
+                    type_oid: 20,
+                    type_modifier: -1,
+                },
+                PgColumn {
+                    is_key: false,
+                    name: "amount".to_string(),
+                    type_oid: 1700,
+                    type_modifier: -1,
+                },
+            ],
+        };
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("amount", DataType::Decimal128(15, 2), false),
+        ]));
+        let change = DecodedChange {
+            op: ChangeOp::Create,
+            row: TupleData {
+                columns: vec![
+                    Some(PgValue::Binary(Bytes::from(7i64.to_be_bytes().to_vec()))),
+                    Some(PgValue::Binary(Bytes::from(enc_numeric(
+                        &[17, 2799, 4900],
+                        1,
+                        false,
+                        2,
+                    )))),
+                ],
+            },
+        };
+        let batch = build_change_batch(&schema, &relation, &[change]).expect("build batch");
+        assert_eq!(batch.record.num_rows(), 1);
+        let data = batch
+            .record
+            .column_by_name("data")
+            .expect("data column")
+            .as_struct();
+        assert_eq!(
+            data.column_by_name("id")
+                .expect("id")
+                .as_primitive::<Int64Type>()
+                .value(0),
+            7
+        );
+        assert_eq!(
+            data.column_by_name("amount")
+                .expect("amount")
+                .as_primitive::<Decimal128Type>()
+                .value(0),
+            17_279_949
+        );
     }
 }

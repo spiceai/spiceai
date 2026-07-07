@@ -280,6 +280,9 @@ pem = "3.0.4"
 percent-encoding = "2.3.1"
 pgwire-replication = { path = "crates/vendor/pgwire-replication", default-features = false, features = ["tls-rustls", "scram"] }
 postgres-native-tls = "0.5"
+# Low-level Postgres binary wire-format `*_from_sql` primitives for pgoutput
+# binary CDC decoding. Matches tokio-postgres 0.7.x's transitive pin.
+postgres-protocol = "0.6"
 native-tls = "0.2"
 pin-project = "1.1"
 pingora-lru = "0.7"

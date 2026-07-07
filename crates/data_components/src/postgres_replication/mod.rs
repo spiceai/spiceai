@@ -43,6 +43,7 @@ use snafu::Snafu;
 use crate::cdc::{ChangesStream, StreamError};
 
 pub use config::{ReplicationParams, SchemaEvolutionPolicy};
+pub use pgwire_replication::PgOutputFormat;
 pub use metrics::{Metrics as ReplicationMetrics, MetricsCollector as ReplicationMetricsCollector};
 pub use slot::{SlotInfo, SlotSetupOutcome};
 

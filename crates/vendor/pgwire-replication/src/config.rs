@@ -40,6 +40,26 @@ pub enum SslMode {
     VerifyFull,
 }
 
+/// Column output format requested from pgoutput via `START_REPLICATION`.
+///
+/// pgoutput encodes each column with a per-column tag, so `Binary` is a
+/// *request*: the server still emits text for any type lacking a binary send
+/// function (and always uses the binary form for the fixed Begin/Commit
+/// framing). A consumer must therefore be prepared to decode either form per
+/// column regardless of this setting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PgOutputFormat {
+    /// Request text output (`START_REPLICATION` without the `binary` option).
+    /// pgoutput's historical default and the widest-compatibility choice.
+    #[default]
+    Text,
+
+    /// Request binary output (`binary 'true'`). Values for types with a binary
+    /// send function arrive in their `send`/`recv` wire form; the rest still
+    /// arrive as text.
+    Binary,
+}
+
 impl SslMode {
     /// Returns `true` if this mode requires TLS (won't fall back to plain).
     #[inline]
@@ -357,6 +377,23 @@ pub struct ReplicationConfig {
     ///
     /// Default: 1 GiB
     pub max_message_size: usize,
+
+    /// pgoutput logical decoding protocol version requested in
+    /// `START_REPLICATION` (`proto_version '<n>'`).
+    ///
+    /// `1` is the baseline every supported server speaks. Higher versions add
+    /// features (2: in-progress transaction streaming; 3: two-phase commit;
+    /// 4: parallel-apply streaming) whose extra message types the consumer
+    /// must be prepared to handle — leave at `1` unless the consumer decodes
+    /// them.
+    ///
+    /// Default: 1
+    pub proto_version: u8,
+
+    /// Column output format requested from pgoutput. See [`PgOutputFormat`].
+    ///
+    /// Default: [`PgOutputFormat::Text`]
+    pub format: PgOutputFormat,
 }
 
 impl Default for ReplicationConfig {
@@ -377,6 +414,8 @@ impl Default for ReplicationConfig {
             buffer_events: 8192,
             feedback_while_backpressured: true,
             max_message_size: crate::protocol::framing::MAX_MESSAGE_SIZE,
+            proto_version: 1,
+            format: PgOutputFormat::Text,
         }
     }
 }
@@ -551,6 +590,20 @@ impl ReplicationConfig {
     #[must_use]
     pub fn with_max_message_size(mut self, size: usize) -> Self {
         self.max_message_size = size;
+        self
+    }
+
+    /// Set the pgoutput protocol version. See [`proto_version`](Self::proto_version).
+    #[must_use]
+    pub fn with_proto_version(mut self, version: u8) -> Self {
+        self.proto_version = version;
+        self
+    }
+
+    /// Set the requested pgoutput column output format. See [`PgOutputFormat`].
+    #[must_use]
+    pub fn with_format(mut self, format: PgOutputFormat) -> Self {
+        self.format = format;
         self
     }
 

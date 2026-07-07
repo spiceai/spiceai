@@ -1011,7 +1011,7 @@ async fn run_pump(source: Arc<SharedSource>) {
                 }
                 ReplicationEvent::XLogData { data, wal_end, .. } => {
                     source.for_each_member_metrics(|m| m.set_server_wal_end(wal_end.0));
-                    let msg = match decoder.decode(&data) {
+                    let msg = match decoder.decode(data) {
                         Ok(m) => m,
                         Err(e) => {
                             source.for_each_member_metrics(

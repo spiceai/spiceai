@@ -183,10 +183,19 @@ impl WorkerState {
     ) -> Result<()> {
         // Escape single quotes in publication name
         let publication = self.cfg.publication.replace('\'', "''");
+        // pgoutput options. `binary 'true'` is only appended when requested;
+        // omitting it preserves the historical text-format wire and keeps the
+        // query identical to prior versions for text consumers.
+        let mut options = format!(
+            "proto_version '{}', publication_names '{}', messages 'true'",
+            self.cfg.proto_version, publication,
+        );
+        if matches!(self.cfg.format, crate::config::PgOutputFormat::Binary) {
+            options.push_str(", binary 'true'");
+        }
         let sql = format!(
-            "START_REPLICATION SLOT {} LOGICAL {} \
-            (proto_version '1', publication_names '{}', messages 'true')",
-            self.cfg.slot, self.cfg.start_lsn, publication,
+            "START_REPLICATION SLOT {} LOGICAL {} ({options})",
+            self.cfg.slot, self.cfg.start_lsn,
         );
         write_query(stream, &sql).await?;
 
