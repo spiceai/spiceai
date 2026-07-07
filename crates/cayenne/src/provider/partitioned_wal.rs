@@ -135,23 +135,37 @@ impl PartitionedWal {
         table_root: &Path,
         wal_dir: &Path,
     ) -> Result<()> {
-        match tokio::fs::create_dir(wal_dir).await {
-            Ok(()) => {
-                let parent = table_root.to_path_buf(); // the table root
-                let table = table_root.display().to_string();
-
-                // Sync the table root so the _partitioned_wal/ subdir entry is
-                // written through (directory ordering tier: plain fsync on
-                // macOS, full fsync elsewhere — see `provider/fsync_tier.rs`).
-                tokio::task::spawn_blocking(move || {
-                    let dir = std::fs::File::open(&parent)?;
-                    crate::provider::fsync_tier::ordering_sync_dir_std(&dir)
-                })
-                .await
-                .map_err(|source| Error::TaskPanicked { table, source })??;
+        // `create_dir` (not `create_dir_all`) so the fresh-vs-existing
+        // distinction below drives whether we fsync the parent. If the table
+        // root itself is missing (e.g. the very first write, before any
+        // partition directory has been materialized), fall back to a recursive
+        // create rather than failing with a bare ENOENT — then fsync the parent
+        // exactly as the fresh-create path does.
+        let created = match tokio::fs::create_dir(wal_dir).await {
+            Ok(()) => true,
+            Err(source) if source.kind() == std::io::ErrorKind::AlreadyExists => false,
+            Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
+                tokio::fs::create_dir_all(wal_dir)
+                    .await
+                    .map_err(|source| Error::IoError { source })?;
+                true
             }
-            Err(source) if source.kind() == std::io::ErrorKind::AlreadyExists => {}
             Err(source) => return Err(Error::IoError { source }),
+        };
+
+        if created {
+            let parent = table_root.to_path_buf(); // the table root
+            let table = table_root.display().to_string();
+
+            // Sync the table root so the _partitioned_wal/ subdir entry is
+            // written through (directory ordering tier: plain fsync on
+            // macOS, full fsync elsewhere — see `provider/fsync_tier.rs`).
+            tokio::task::spawn_blocking(move || {
+                let dir = std::fs::File::open(&parent)?;
+                crate::provider::fsync_tier::ordering_sync_dir_std(&dir)
+            })
+            .await
+            .map_err(|source| Error::TaskPanicked { table, source })??;
         }
 
         Ok(())

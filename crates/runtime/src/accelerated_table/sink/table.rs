@@ -29,6 +29,8 @@ use runtime_datafusion_index::{Index, IndexedTableProvider};
 use runtime_table_partition::provider::PartitionTableProvider;
 use util::RetryError;
 
+use datafusion_table_providers::util::retriable_error::check_and_mark_retriable_error;
+
 use crate::{
     accelerated_table::refresh_task::retry_from_df_error, datafusion::error::find_datafusion_root,
     dataupdate::StreamingDataUpdateExecutionPlan, schema_evolution::SCHEMA_EVOLUTION_DETECTED,
@@ -217,7 +219,15 @@ impl TableSink {
                 collect_start.elapsed().as_secs_f64()
             );
             run_on_write_failed(&providers_before_write, &self.sink_indexes).await;
-            return Err(retry_from_df_error(e));
+            // Mirror the read path (`RefreshTask::get_data_update`): the source
+            // is read while this insertion plan is collected, so a mid-stream
+            // read failure (e.g. a data file that is transiently missing during
+            // source-side maintenance) surfaces here. Route it through
+            // `check_and_mark_retriable_error` so such failures are classified
+            // transient and retried, instead of falling straight through to a
+            // permanent refresh failure. Invalid-query errors (SQL/plan/schema)
+            // are left permanent by that helper.
+            return Err(retry_from_df_error(check_and_mark_retriable_error(e)));
         }
 
         // Perform post-write index maintenance (e.g., rebuild hash indexes) if the table supports it.

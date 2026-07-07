@@ -2738,6 +2738,57 @@ mod tests {
     }
 
     #[test]
+    fn missing_data_file_during_collect_is_classified_transient() {
+        // A source read that fails mid-stream (e.g. a data file that is
+        // transiently missing) surfaces from `collect()` in the write sink as a
+        // bare `External(io error)`. Routing it through
+        // `check_and_mark_retriable_error` before `retry_from_df_error` (as
+        // `TableSink::insert_into` now does) must classify it transient so the
+        // refresh retries, rather than failing permanently.
+        let io_err = std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "No such file or directory (os error 2)",
+        );
+        let df_err = DataFusionError::External(Box::new(io_err));
+
+        let classified = retry_from_df_error(check_and_mark_retriable_error(df_err));
+
+        match classified {
+            RetryError::Transient { err, .. } => {
+                assert!(
+                    matches!(err, super::super::Error::UnableToGetDataFromConnector { .. }),
+                    "transient refresh error should be UnableToGetDataFromConnector, got: {err}"
+                );
+            }
+            RetryError::Permanent(err) => {
+                panic!("missing-file read error should be transient, got permanent: {err}");
+            }
+        }
+    }
+
+    #[test]
+    fn invalid_query_error_during_collect_stays_permanent() {
+        // Invalid-query errors (plan/schema/SQL) must remain permanent even
+        // after the new `check_and_mark_retriable_error` pass — retrying them
+        // would loop pointlessly.
+        let df_err = DataFusionError::Plan("invalid projection".to_string());
+
+        let classified = retry_from_df_error(check_and_mark_retriable_error(df_err));
+
+        match classified {
+            RetryError::Permanent(err) => {
+                assert!(
+                    matches!(err, super::super::Error::FailedToRefreshDataset { .. }),
+                    "permanent refresh error should be FailedToRefreshDataset, got: {err}"
+                );
+            }
+            RetryError::Transient { err, .. } => {
+                panic!("invalid-query error should be permanent, got transient: {err}");
+            }
+        }
+    }
+
+    #[test]
     fn table_provider_with_existing_metadata_preserves_indexed_provider() {
         let schema = Arc::new(Schema::new_with_metadata(
             vec![

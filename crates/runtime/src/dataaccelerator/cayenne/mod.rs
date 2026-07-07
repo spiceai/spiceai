@@ -109,6 +109,17 @@ pub enum Error {
 
     #[snafu(display("RuntimeEnv is required for Cayenne accelerator but was not provided"))]
     RuntimeEnvRequired,
+
+    #[snafu(display(
+        "Failed to prepare the Cayenne acceleration directory {path}: {source}. \
+        Ensure 'cayenne_file_path' resolves to a location Spice can create and write to \
+        (its parent directory must exist and be writable). \
+        See: https://spiceai.org/docs/components/data-accelerators/cayenne#params"
+    ))]
+    AccelerationDirectoryUnavailable {
+        path: Arc<str>,
+        source: std::io::Error,
+    },
 }
 
 type Result<T, E = Error> = std::result::Result<T, E>;
@@ -1631,6 +1642,54 @@ impl CayenneAccelerator {
         Ok(path_buf)
     }
 
+    /// Validate and prepare a *local* Cayenne acceleration directory before any
+    /// table data is written.
+    ///
+    /// This fails fast, at load time, with an actionable error naming the
+    /// directory — rather than letting a misconfigured `cayenne_file_path`
+    /// surface later as a bare `No such file or directory (os error 2)` from
+    /// deep in the write path during the first refresh (the write path's
+    /// `IoError` is `#[snafu(transparent)]`, so it carries no path or context).
+    ///
+    /// Two checks, in order:
+    /// 1. `create_dir_all` (mkdir -p): recursively materialize every missing
+    ///    component, so a nested path such as `/data/a/b` where only `/data`
+    ///    exists is created rather than failing on the missing intermediate.
+    /// 2. A write+delete probe: prove the directory is actually writable. This
+    ///    catches read-only mounts and permission problems that step 1 cannot
+    ///    reveal (the directory can already exist yet be unwritable).
+    ///
+    /// No-op for object-store (`s3://`) locations; their existence and
+    /// permissions are validated by the S3 bootstrap path.
+    async fn prepare_local_acceleration_dir(dir_path: &str) -> Result<()> {
+        // Object-store URLs (e.g. S3 Express One Zone) are validated elsewhere.
+        if dir_path.contains("://") && !dir_path.starts_with("file://") {
+            return Ok(());
+        }
+
+        // Strip any `file://` scheme so the on-disk operations receive a real
+        // filesystem path.
+        let fs_path = fs_probe_path(dir_path);
+
+        // 1. mkdir -p: create the full directory tree.
+        tokio::fs::create_dir_all(fs_path)
+            .await
+            .context(AccelerationDirectoryUnavailableSnafu { path: fs_path })?;
+
+        // 2. Writability probe: write then remove a marker file. The probe file
+        //    name is unique per directory prep so concurrent dataset loads
+        //    sharing a parent do not race on the same marker.
+        let probe_path = std::path::Path::new(fs_path)
+            .join(format!(".spice-cayenne-write-probe-{}", uuid::Uuid::now_v7()));
+        tokio::fs::write(&probe_path, b"spice")
+            .await
+            .context(AccelerationDirectoryUnavailableSnafu { path: fs_path })?;
+        // Best-effort cleanup; a leftover probe file is harmless.
+        let _ = tokio::fs::remove_file(&probe_path).await;
+
+        Ok(())
+    }
+
     async fn get_or_create_catalog(
         &self,
         metadata_dir: &str,
@@ -2180,6 +2239,17 @@ impl DataAccelerator for CayenneAccelerator {
 
         let dir_path = self.file_path(source)?;
         let is_s3_express = s3::is_s3_express_data_path(source);
+
+        // For local storage, validate and prepare both the data and metadata
+        // directories up front. A misconfigured `cayenne_file_path` (missing
+        // parent, or an existing-but-unwritable directory) fails here with an
+        // actionable, path-naming error instead of surfacing later as a bare
+        // `No such file or directory (os error 2)` from the write path.
+        if !is_s3_express {
+            Self::prepare_local_acceleration_dir(&dir_path).await?;
+            let metadata_dir = Self::resolve_metadata_dir(source.acceleration());
+            Self::prepare_local_acceleration_dir(&metadata_dir).await?;
+        }
 
         // Handle S3 Express One Zone configuration
         if is_s3_express {
@@ -3289,6 +3359,108 @@ mod tests {
     use datafusion_table_providers::UnsupportedTypeAction;
     use search::index::{SearchIndex, VectorIndex};
     use std::sync::Arc;
+
+    #[tokio::test]
+    async fn prepare_local_acceleration_dir_creates_nested_missing_path() {
+        // A nested `cayenne_file_path` where only a shallow prefix exists must
+        // be created recursively (mkdir -p), not fail on the missing
+        // intermediate component (the reported `os error 2` scenario).
+        let temp = tempfile::TempDir::new().expect("create temp dir");
+        let nested = temp
+            .path()
+            .join("a")
+            .join("b")
+            .join("dataset")
+            .to_string_lossy()
+            .to_string();
+        assert!(
+            !std::path::Path::new(&nested).exists(),
+            "precondition: nested path should not exist yet"
+        );
+
+        CayenneAccelerator::prepare_local_acceleration_dir(&nested)
+            .await
+            .expect("nested directory should be created recursively");
+
+        assert!(
+            std::path::Path::new(&nested).is_dir(),
+            "nested directory should exist after preparation"
+        );
+        // The write probe must not leave any marker files behind.
+        let mut entries = tokio::fs::read_dir(&nested).await.expect("read_dir");
+        assert!(
+            entries.next_entry().await.expect("next_entry").is_none(),
+            "prepared directory should be empty (write probe cleaned up)"
+        );
+    }
+
+    #[tokio::test]
+    async fn prepare_local_acceleration_dir_reports_path_when_uncreatable() {
+        // When a path component is a *file* (not a directory), `create_dir_all`
+        // cannot proceed. The error must name the offending directory and be an
+        // AccelerationDirectoryUnavailable, not a bare io error.
+        let temp = tempfile::TempDir::new().expect("create temp dir");
+        let file_path = temp.path().join("not-a-dir");
+        tokio::fs::write(&file_path, b"i am a file")
+            .await
+            .expect("write blocker file");
+
+        // Attempt to use a directory *underneath* the file.
+        let bad = file_path.join("dataset").to_string_lossy().to_string();
+
+        let err = CayenneAccelerator::prepare_local_acceleration_dir(&bad)
+            .await
+            .expect_err("preparation under a file should fail");
+
+        match err {
+            Error::AccelerationDirectoryUnavailable { path, .. } => {
+                assert!(
+                    bad.contains(path.as_ref()),
+                    "error should name the acceleration directory, got: {path}"
+                );
+            }
+            other => panic!("expected AccelerationDirectoryUnavailable, got: {other}"),
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn prepare_local_acceleration_dir_probes_writability() {
+        use std::os::unix::fs::PermissionsExt;
+
+        // A directory that exists but is read-only passes `create_dir_all` yet
+        // is unusable; the write+delete probe must catch it up front.
+        let temp = tempfile::TempDir::new().expect("create temp dir");
+        let readonly = temp.path().join("readonly");
+        tokio::fs::create_dir_all(&readonly)
+            .await
+            .expect("create readonly dir");
+        let mut perms = tokio::fs::metadata(&readonly)
+            .await
+            .expect("metadata")
+            .permissions();
+        perms.set_mode(0o555); // r-xr-xr-x: no write
+        tokio::fs::set_permissions(&readonly, perms.clone())
+            .await
+            .expect("set readonly perms");
+
+        let dir = readonly.to_string_lossy().to_string();
+        let result = CayenneAccelerator::prepare_local_acceleration_dir(&dir).await;
+
+        // Restore write permission so the TempDir can clean itself up.
+        let mut restore = perms;
+        restore.set_mode(0o755);
+        let _ = tokio::fs::set_permissions(&readonly, restore).await;
+
+        // Running as root bypasses permission bits, so only assert the failure
+        // (and the actionable error) when the probe could actually be blocked.
+        if let Err(err) = result {
+            assert!(
+                matches!(err, Error::AccelerationDirectoryUnavailable { .. }),
+                "expected AccelerationDirectoryUnavailable, got: {err}"
+            );
+        }
+    }
 
     #[test]
     fn resolve_goal_raw_global_default_then_per_dataset_override() {
