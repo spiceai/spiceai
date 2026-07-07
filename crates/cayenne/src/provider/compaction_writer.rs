@@ -526,7 +526,11 @@ impl Writer {
     /// the size is unknown, or the filesystem rejects the hint (in which case
     /// `fs_hints` stays enabled so on-demand `reserve` still tries as the file
     /// grows). Best-effort: preallocation never affects correctness, only layout.
-    fn preallocate_upfront(file: &std::fs::File, cfg: CompactionWriterConfig, expected: u64) -> u64 {
+    fn preallocate_upfront(
+        file: &std::fs::File,
+        cfg: CompactionWriterConfig,
+        expected: u64,
+    ) -> u64 {
         if !cfg.fallocate || expected == 0 {
             return 0;
         }
@@ -1156,7 +1160,10 @@ mod tests {
             .put_multipart_opts(&location, PutMultipartOptions::default())
             .await
             .expect("begin multipart");
-        upload.put_part(data.clone().into()).await.expect("put_part");
+        upload
+            .put_part(data.clone().into())
+            .await
+            .expect("put_part");
         upload.complete().await.expect("complete multipart");
         let got = std::fs::read(dir.path().join("snap/part-0.vortex")).expect("read back");
         assert_eq!(got, data, "zero-expected write must round-trip exactly");
