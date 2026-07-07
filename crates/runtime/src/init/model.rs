@@ -17,11 +17,12 @@ limitations under the License.
 use std::{collections::HashMap, sync::Arc};
 
 use crate::{
-    Runtime, metrics, model::ENABLE_MODEL_SUPPORT_MESSAGE,
+    Runtime, model::ENABLE_MODEL_SUPPORT_MESSAGE,
     model::provider_models::get_available_models_hint, status,
 };
 use app::App;
 use opentelemetry::KeyValue;
+use runtime_metrics as metrics;
 use runtime_secrets::get_params_with_secrets;
 use snafu::prelude::*;
 use spicepod::component::model::{Model as SpicepodModel, ModelSource};

@@ -57,7 +57,8 @@ use utoipa::{
 #[cfg(feature = "dev")]
 use utoipa_swagger_ui::SwaggerUi;
 
-use super::{metrics, v1};
+use super::v1;
+use runtime_metrics::http as metrics;
 
 use axum::{
     Extension,
