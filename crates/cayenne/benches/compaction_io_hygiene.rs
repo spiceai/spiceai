@@ -73,6 +73,24 @@ limitations under the License.
 //!   barrier (open the staging dir + `sync_all` after a dirent change). This is
 //!   the per-staged-commit saving.
 //!
+//! # 3. The Tier 2/3 compaction writer (`provider/compaction_writer`)
+//!
+//! The custom writer owns the output fd to add `fallocate` (preallocate the whole
+//! output up front) and `O_DIRECT` (bypass the page cache entirely, so the
+//! `O(table)` rewrite never populates — hence never evicts — the hot query
+//! working set). This group finalizes a full output file each way — preallocate,
+//! write, `fsync`, rename, parent-dir `fsync` — and reports throughput:
+//!
+//! - `compaction_writer_throughput/buffered/<size>` — the baseline `pwrite` path
+//!   (what `object_store`'s `LocalFileSystem` does, plus the content fsync).
+//! - `compaction_writer_throughput/o_direct/<size>` — the aligned `O_DIRECT` path
+//!   (4 MiB bounce buffer, padded-tail `ftruncate`). Falls back to buffered if the
+//!   filesystem rejects `O_DIRECT` (`EINVAL`).
+//!
+//! A one-shot `mincore(2)` readout (stderr) proves the payoff: after a buffered
+//! write the whole file is resident; after an `O_DIRECT` write ~0 pages are — the
+//! direct path leaves nothing behind to displace the query working set.
+//!
 //! # Faithfulness
 //!
 //! `flush_and_evict` here mirrors `provider/fadvise_tier::flush_and_evict`
@@ -426,11 +444,205 @@ mod linux_impl {
         group.finish();
     }
 
+    // -----------------------------------------------------------------------
+    // Group 4: the Tier 2/3 compaction WRITER path (fallocate + O_DIRECT).
+    // -----------------------------------------------------------------------
+
+    /// One up-front `fallocate(KEEP_SIZE)` of `size` bytes (best-effort), mirroring
+    /// the writer's up-front reservation.
+    fn prealloc(file: &File, size: u64) {
+        if size == 0 {
+            return;
+        }
+        // SAFETY: valid fd for the borrow; offset/len are in-range i64.
+        let _ = unsafe {
+            libc::fallocate(
+                file.as_raw_fd(),
+                libc::FALLOC_FL_KEEP_SIZE,
+                0,
+                i64::try_from(size).unwrap_or(i64::MAX),
+            )
+        };
+    }
+
+    /// Mirror of `compaction_writer`'s buffered finalize: preallocate, write `size`
+    /// bytes with plain `pwrite`, then `fsync` the contents. Leaves the staging
+    /// file for `publish`.
+    fn write_buffered_staging(staging: &Path, size: usize) -> std::io::Result<()> {
+        use std::os::unix::fs::FileExt;
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(staging)?;
+        prealloc(&file, size as u64);
+        let chunk: Vec<u8> = (0..(1usize << 20)).map(|i| (i % 251) as u8).collect();
+        let mut offset = 0u64;
+        let mut written = 0usize;
+        while written < size {
+            let n = chunk.len().min(size - written);
+            let mut b = &chunk[..n];
+            while !b.is_empty() {
+                let w = file.write_at(b, offset)?;
+                b = &b[w..];
+                offset += w as u64;
+            }
+            written += n;
+        }
+        file.sync_all()
+    }
+
+    /// Mirror of `compaction_writer`'s O_DIRECT finalize: aligned writes through a
+    /// 4 MiB bounce buffer, pad the tail to a block, `ftruncate` to the exact
+    /// length, then `fsync`. Returns `Ok(false)` if the filesystem rejects
+    /// `O_DIRECT` (`EINVAL`) — the module then falls back to buffered.
+    fn write_odirect_staging(staging: &Path, size: usize) -> std::io::Result<bool> {
+        use std::os::unix::fs::{FileExt, OpenOptionsExt};
+        const BLOCK: usize = 4096;
+        const CAP: usize = 4 << 20;
+        let file = match OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .custom_flags(libc::O_DIRECT)
+            .open(staging)
+        {
+            Ok(f) => f,
+            Err(e) if e.raw_os_error() == Some(libc::EINVAL) => return Ok(false),
+            Err(e) => return Err(e),
+        };
+        prealloc(&file, size as u64);
+        let layout = std::alloc::Layout::from_size_align(CAP, BLOCK).expect("aligned layout");
+        // SAFETY: non-zero CAP; deallocated with the same layout below.
+        let ptr = unsafe { std::alloc::alloc_zeroed(layout) };
+        assert!(!ptr.is_null(), "aligned alloc failed");
+        // SAFETY: `ptr` owns CAP zeroed, writable bytes for the scope below.
+        let buf = unsafe { std::slice::from_raw_parts_mut(ptr, CAP) };
+        let chunk: Vec<u8> = (0..CAP).map(|i| (i % 251) as u8).collect();
+        let mut offset = 0u64;
+        let mut written = 0usize;
+        while written < size {
+            let n = CAP.min(size - written);
+            buf[..n].copy_from_slice(&chunk[..n]);
+            let padded = n.div_ceil(BLOCK) * BLOCK;
+            if padded > n {
+                buf[n..padded].fill(0);
+            }
+            let mut b = &buf[..padded];
+            while !b.is_empty() {
+                let w = file.write_at(b, offset)?;
+                b = &b[w..];
+                offset += w as u64;
+            }
+            written += n;
+        }
+        let result = file.set_len(size as u64).and_then(|()| file.sync_all());
+        // SAFETY: same ptr/layout as the allocation; `buf` is not used past here.
+        unsafe { std::alloc::dealloc(ptr, layout) };
+        result.map(|()| true)
+    }
+
+    /// The publish half of the writer's `finish`: atomic rename + parent-dir fsync
+    /// (the content fsync already happened inside the write helper).
+    fn publish(staging: &Path, dest: &Path) -> std::io::Result<()> {
+        std::fs::rename(staging, dest)?;
+        if let Some(parent) = dest.parent() {
+            File::open(parent)?.sync_all()?;
+        }
+        Ok(())
+    }
+
+    /// One-shot proof (stderr) that the O_DIRECT writer leaves ~0 resident pages
+    /// while the buffered writer populates the whole file — the core value of the
+    /// direct path (it never displaces the hot query working set).
+    fn verify_odirect_footprint_once(dir: &Path) {
+        static ONCE: Once = Once::new();
+        ONCE.call_once(|| {
+            let size = 32 << 20;
+            let bpath = dir.join("footprint_buffered.bin");
+            write_buffered_staging(&bpath, size).expect("buffered footprint write");
+            let (buffered_resident, total) = resident_pages(&bpath);
+
+            let dpath = dir.join("footprint_odirect.bin");
+            match write_odirect_staging(&dpath, size) {
+                Ok(true) => {
+                    let (odirect_resident, _) = resident_pages(&dpath);
+                    eprintln!(
+                        "[compaction_io_hygiene] writer footprint in {}: buffered \
+                         {buffered_resident}/{total} pages resident, O_DIRECT \
+                         {odirect_resident}/{total} resident — O_DIRECT should be ~0 (never \
+                         populates the cache).",
+                        dir.display()
+                    );
+                }
+                Ok(false) => eprintln!(
+                    "[compaction_io_hygiene] O_DIRECT rejected by this filesystem (EINVAL); the \
+                     o_direct lane falls back to buffered and is NOT meaningful here."
+                ),
+                Err(e) => {
+                    eprintln!("[compaction_io_hygiene] O_DIRECT footprint probe failed: {e}");
+                }
+            }
+        });
+    }
+
+    /// Group 4: write-path throughput of the buffered vs O_DIRECT compaction
+    /// writer, each fully finalized (preallocate, write, fsync, rename, dir-fsync).
+    fn bench_writer_throughput(c: &mut Criterion) {
+        let dir = tempdir();
+        verify_odirect_footprint_once(dir.path());
+
+        let mut group = c.benchmark_group("compaction_writer_throughput");
+        group.sample_size(10);
+        group.warm_up_time(Duration::from_millis(500));
+        group.measurement_time(Duration::from_secs(3));
+
+        for &(label, size) in SIZES {
+            group.throughput(Throughput::Bytes(size as u64));
+
+            let staging = dir.path().join(format!("wb_{label}.staging"));
+            let dest = dir.path().join(format!("wb_{label}.vortex"));
+            group.bench_with_input(BenchmarkId::new("buffered", label), &size, |b, &size| {
+                b.iter_custom(|iters| {
+                    let mut elapsed = Duration::ZERO;
+                    for _ in 0..iters {
+                        let _ = std::fs::remove_file(&dest);
+                        let start = Instant::now();
+                        write_buffered_staging(&staging, size).expect("buffered write");
+                        publish(&staging, &dest).expect("publish");
+                        elapsed += start.elapsed();
+                    }
+                    elapsed
+                });
+            });
+
+            let staging_d = dir.path().join(format!("wd_{label}.staging"));
+            let dest_d = dir.path().join(format!("wd_{label}.vortex"));
+            group.bench_with_input(BenchmarkId::new("o_direct", label), &size, |b, &size| {
+                b.iter_custom(|iters| {
+                    let mut elapsed = Duration::ZERO;
+                    for _ in 0..iters {
+                        let _ = std::fs::remove_file(&dest_d);
+                        let start = Instant::now();
+                        black_box(write_odirect_staging(&staging_d, size).expect("odirect write"));
+                        publish(&staging_d, &dest_d).expect("publish");
+                        elapsed += start.elapsed();
+                    }
+                    elapsed
+                });
+            });
+        }
+        group.finish();
+    }
+
     criterion_group!(
         benches,
         bench_evict_cost,
         bench_read_back,
-        bench_staged_commit_dir_fsync
+        bench_staged_commit_dir_fsync,
+        bench_writer_throughput
     );
 }
 

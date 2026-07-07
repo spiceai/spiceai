@@ -65,13 +65,28 @@ limitations under the License.
 //!
 //! # Safety posture
 //!
-//! Default OFF (env-gated). Linux + local-FS + compaction-output only; S3 and
-//! non-Linux are untouched (non-Linux compiles to a buffered fallback). Atomic
-//! semantics mirror `LocalFileSystem`: write to a same-dir staging file, fsync
-//! contents (new — closes the long-standing local-FS content-durability gap),
-//! rename into place, then fsync the parent dir. An `O_DIRECT` open that the
-//! filesystem rejects (`EINVAL` on tmpfs/overlay) transparently falls back to
-//! buffered. **Gated off pending an HTAP validation run before it is enabled.**
+//! Default OFF (env-gated). Linux + local-FS + compaction-output only; S3 is
+//! untouched. Atomic semantics mirror `LocalFileSystem`: write to a same-dir
+//! staging file, fsync contents (new — closes the long-standing local-FS
+//! content-durability gap), rename into place, then fsync the parent dir. An
+//! `O_DIRECT` open that the filesystem rejects (`EINVAL` on tmpfs/overlay)
+//! transparently falls back to buffered. On macOS (the dev tier) the direct knob
+//! maps to `F_NOCACHE` + `F_PREALLOCATE` — uncached, preallocated I/O without
+//! `O_DIRECT`'s alignment demands — so the module is exercised locally instead of
+//! being a buffered no-op; the p99 target remains Linux/EBS. Other
+//! non-Linux/non-macOS targets compile to a buffered fallback. **Gated off
+//! pending an HTAP validation run before it is enabled.**
+//!
+//! # Completing the write levers
+//!
+//! - The output is preallocated with ONE up-front `fallocate` seeded from the
+//!   caller's target file size (`min(target, 1 GiB)`) instead of growing 64 MiB
+//!   at a time; on-demand growth still covers files that exceed the estimate, and
+//!   a final truncate releases any unused tail so the file occupies exactly its
+//!   logical bytes.
+//! - The writer drops its OWN output pages in `finish` using the fd it already
+//!   holds — the structural completion of the external `fadvise_tier` `DONTNEED`
+//!   hint, which then skips its now-redundant re-open + re-hint for this path.
 
 use std::fmt;
 use std::path::{Path as FsPath, PathBuf};
@@ -95,10 +110,20 @@ type UploadPart = futures::future::BoxFuture<'static, object_store::Result<()>>;
 /// every common device/filesystem logical block size (512/4096).
 const BLOCK: usize = 4096;
 /// Aligned bounce-buffer capacity for the `O_DIRECT` path (a `BLOCK` multiple).
-const ODIRECT_BUF_CAP: usize = 1 << 20; // 1 MiB
-/// `fallocate` reservation granularity — preallocate this much past the write
-/// frontier at a time (`FALLOC_FL_KEEP_SIZE`, so the file size is unchanged).
+/// 4 MiB amortizes the per-`pwrite` syscall over more bytes than any common
+/// device I/O size while staying small enough that N concurrent shard writers
+/// (one dedicated buffer each) don't balloon RSS.
+const ODIRECT_BUF_CAP: usize = 4 << 20; // 4 MiB
+/// On-demand `fallocate` growth granularity — preallocate this much past the
+/// write frontier at a time once the up-front reservation is exhausted
+/// (`FALLOC_FL_KEEP_SIZE`, so the file size is unchanged).
 const FALLOC_CHUNK: u64 = 64 << 20; // 64 MiB
+/// Upper bound on the single up-front `fallocate` seeded from the caller's target
+/// file size. Caps worst-case transient over-reservation (the target can be an
+/// over-estimate, and many shard writers preallocate at once) while still
+/// collapsing the common ≤cap output to ONE reservation syscall; larger files
+/// grow on demand in `FALLOC_CHUNK` steps.
+const MAX_UPFRONT_PREALLOC: u64 = 1 << 30; // 1 GiB
 
 /// Runtime configuration, parsed once from the environment. All knobs default
 /// OFF; `enabled()` gates whether the wrapper is installed at all.
@@ -160,6 +185,11 @@ pub(crate) struct CompactionLocalStore {
     /// upload can open the real file. Mirrors `LocalFileSystem`'s prefix.
     root: PathBuf,
     cfg: CompactionWriterConfig,
+    /// Target per-output-file size (bytes) from the caller — the on-disk Vortex
+    /// file size the compaction is rolling to. Seeds a single up-front
+    /// `fallocate` per output. `0` = unknown (size-rolling disabled, one file per
+    /// shard) → the writer grows the reservation on demand instead.
+    expected_file_bytes: u64,
 }
 
 impl CompactionLocalStore {
@@ -167,8 +197,14 @@ impl CompactionLocalStore {
         inner: Arc<dyn ObjectStore>,
         root: PathBuf,
         cfg: CompactionWriterConfig,
+        expected_file_bytes: u64,
     ) -> Self {
-        Self { inner, root, cfg }
+        Self {
+            inner,
+            root,
+            cfg,
+            expected_file_bytes,
+        }
     }
 
     /// Resolve an object-store `Path` to a filesystem path under `root`.
@@ -208,7 +244,7 @@ impl ObjectStore for CompactionLocalStore {
         opts: PutMultipartOptions,
     ) -> object_store::Result<Box<dyn MultipartUpload>> {
         let dest = self.to_fs_path(location);
-        match CompactionUpload::create(dest, self.cfg) {
+        match CompactionUpload::create(dest, self.cfg, self.expected_file_bytes) {
             Ok(upload) => Ok(Box::new(upload)),
             // Best-effort: if the custom writer can't be set up for this output
             // (staging create/open failure, permission issue, …), fall back to the
@@ -292,8 +328,13 @@ pub(crate) struct CompactionUpload {
 
 impl CompactionUpload {
     /// Open the staging file (with an `O_DIRECT`→buffered fallback) and spawn the
-    /// writer thread. Errors here surface as a failed `put_multipart`.
-    fn create(dest: PathBuf, cfg: CompactionWriterConfig) -> std::io::Result<Self> {
+    /// writer thread. `expected_file_bytes` seeds the up-front `fallocate`. Errors
+    /// here surface as a failed `put_multipart`.
+    fn create(
+        dest: PathBuf,
+        cfg: CompactionWriterConfig,
+        expected_file_bytes: u64,
+    ) -> std::io::Result<Self> {
         let parent = dest
             .parent()
             .ok_or_else(|| {
@@ -310,7 +351,15 @@ impl CompactionUpload {
         let (file, direct) = open_staging(&staging, cfg.direct_io)?;
 
         let (tx, rx) = mpsc::channel::<Msg>();
-        let writer = Writer::new(file, dest, parent, staging.clone(), cfg, direct);
+        let writer = Writer::new(
+            file,
+            dest,
+            parent,
+            staging.clone(),
+            cfg,
+            direct,
+            expected_file_bytes,
+        );
         let handle = std::thread::Builder::new()
             .name("cayenne-compaction-writer".to_string())
             .spawn(move || writer.run(&rx))?;
@@ -444,7 +493,13 @@ impl Writer {
         staging: PathBuf,
         cfg: CompactionWriterConfig,
         direct: bool,
+        expected_file_bytes: u64,
     ) -> Self {
+        // Seed ONE up-front reservation from the caller's target file size so the
+        // O(table) sequential write lands in few extents instead of churning
+        // ext4/xfs delayed-allocation metadata; `reserve` grows past it for files
+        // that exceed the estimate, and `finish` truncates any unused tail away.
+        let allocated = Self::preallocate_upfront(&file, cfg, expected_file_bytes);
         Self {
             file,
             dest,
@@ -454,7 +509,7 @@ impl Writer {
             direct,
             offset: 0,
             logical_len: 0,
-            allocated: 0,
+            allocated,
             last_sync: 0,
             buf: if direct {
                 Some(AlignedBuf::new(ODIRECT_BUF_CAP))
@@ -463,6 +518,22 @@ impl Writer {
             },
             buf_len: 0,
             fs_hints: true,
+        }
+    }
+
+    /// One up-front `fallocate(KEEP_SIZE)` of `min(expected, MAX_UPFRONT_PREALLOC)`.
+    /// Returns the bytes actually reserved — `0` when preallocation is disabled,
+    /// the size is unknown, or the filesystem rejects the hint (in which case
+    /// `fs_hints` stays enabled so on-demand `reserve` still tries as the file
+    /// grows). Best-effort: preallocation never affects correctness, only layout.
+    fn preallocate_upfront(file: &std::fs::File, cfg: CompactionWriterConfig, expected: u64) -> u64 {
+        if !cfg.fallocate || expected == 0 {
+            return 0;
+        }
+        let want = expected.min(MAX_UPFRONT_PREALLOC);
+        match fallocate_keep_size(file, 0, want) {
+            Ok(()) => want,
+            Err(_) => 0,
         }
     }
 
@@ -547,7 +618,13 @@ impl Writer {
 
     fn finish(&mut self) -> std::io::Result<PutResult> {
         if self.direct {
-            self.flush_direct_tail()?;
+            self.flush_direct_tail()?; // pads, writes, then truncates to logical_len
+        } else if self.allocated > self.logical_len {
+            // Buffered path: release any up-front / on-demand `fallocate`
+            // reservation past the true end so the file occupies exactly its
+            // logical bytes on disk. (The O_DIRECT path already truncates in
+            // `flush_direct_tail`.)
+            truncate(&self.file, self.logical_len)?;
         }
         if self.cfg.final_fsync {
             // Contents durable BEFORE the rename publishes the name — the
@@ -564,6 +641,13 @@ impl Writer {
         if self.cfg.final_fsync {
             let _ = fsync_dir(&self.parent);
         }
+        // Drop this output's page-cache footprint NOW, while we still hold the
+        // just-written fd and know whether O_DIRECT kept it out of cache entirely.
+        // The structural completion of the external `fadvise_tier` DONTNEED hint —
+        // which skips its redundant re-open + re-hint when this writer is enabled
+        // (see `evict_compaction_output_pages`). Best-effort: a cache hint must
+        // never fail a compaction.
+        evict_own(&self.file, self.direct);
         let metadata = std::fs::metadata(&self.dest)?;
         Ok(PutResult {
             e_tag: Some(etag(&metadata)),
@@ -696,15 +780,36 @@ fn open_staging(path: &FsPath, direct_io: bool) -> std::io::Result<(std::fs::Fil
     }
 }
 
+/// Non-Linux hosts. macOS honours the direct knob via `F_NOCACHE` (uncached I/O
+/// with no alignment requirement — so the buffered write path is reused and
+/// `direct` stays false); other targets open plain buffered. The hint never
+/// fails the open.
 #[cfg(not(target_os = "linux"))]
-fn open_staging(path: &FsPath, _direct_io: bool) -> std::io::Result<(std::fs::File, bool)> {
-    std::fs::OpenOptions::new()
+fn open_staging(path: &FsPath, direct_io: bool) -> std::io::Result<(std::fs::File, bool)> {
+    let file = std::fs::OpenOptions::new()
         .read(true)
         .write(true)
         .create_new(true)
-        .open(path)
-        .map(|f| (f, false))
+        .open(path)?;
+    maybe_set_nocache(&file, direct_io);
+    Ok((file, false))
 }
+
+/// macOS: disable page caching for this fd (`F_NOCACHE`) when the direct knob is
+/// on — the Darwin analog of `O_DIRECT` for a write-then-evict workload, without
+/// the alignment demands. Best-effort; a failure just leaves caching enabled.
+#[cfg(target_os = "macos")]
+fn maybe_set_nocache(file: &std::fs::File, direct_io: bool) {
+    if direct_io {
+        use std::os::fd::AsRawFd;
+        // SAFETY: valid fd for the borrow; F_NOCACHE takes an int flag argument.
+        let _ = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_NOCACHE, 1) };
+    }
+}
+
+/// Non-macOS, non-Linux: no portable uncached-write hint. No-op.
+#[cfg(all(not(target_os = "linux"), not(target_os = "macos")))]
+fn maybe_set_nocache(_file: &std::fs::File, _direct_io: bool) {}
 
 /// `pwrite` the whole buffer at `offset`, looping over partial writes / `EINTR`.
 fn write_all_at(file: &std::fs::File, mut buf: &[u8], mut offset: u64) -> std::io::Result<()> {
@@ -749,11 +854,49 @@ fn fallocate_keep_size(file: &std::fs::File, offset: u64, len: u64) -> std::io::
     Ok(())
 }
 
-#[cfg(not(target_os = "linux"))]
+/// macOS preallocation via `F_PREALLOCATE`. Reserves blocks WITHOUT changing the
+/// file size (like Linux `FALLOC_FL_KEEP_SIZE`); `F_PEOFPOSMODE` anchors the
+/// reservation at the current logical EOF, so a call reserves `len` more bytes
+/// past the write frontier (`offset` is the Linux-precise bookkeeping and is
+/// ignored here — any over-reservation is released by the final `set_len` in
+/// `finish`). Tries a contiguous extent first, then any layout on a fragmented
+/// volume.
+#[cfg(target_os = "macos")]
+fn fallocate_keep_size(file: &std::fs::File, _offset: u64, len: u64) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd;
+    if len == 0 {
+        return Ok(());
+    }
+    let length = i64::try_from(len).unwrap_or(i64::MAX);
+    let mut store = libc::fstore_t {
+        // `F_ALLOCATECONTIG`/`F_ALLOCATEALL` are already `c_uint` — no cast needed.
+        fst_flags: libc::F_ALLOCATECONTIG | libc::F_ALLOCATEALL,
+        fst_posmode: libc::F_PEOFPOSMODE,
+        fst_offset: 0,
+        fst_length: length,
+        fst_bytesalloc: 0,
+    };
+    // SAFETY: valid fd for the borrow; `store` outlives the fcntl call.
+    let mut rc = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_PREALLOCATE, &mut store) };
+    if rc == -1 {
+        // Contiguous request failed (fragmented volume) — retry allowing any layout.
+        store.fst_flags = libc::F_ALLOCATEALL;
+        // SAFETY: as above.
+        rc = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_PREALLOCATE, &mut store) };
+    }
+    if rc == -1 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// Non-macOS, non-Linux: no portable preallocation primitive. Unsupported, so
+/// `reserve` disables the hint.
+#[cfg(all(not(target_os = "linux"), not(target_os = "macos")))]
 fn fallocate_keep_size(_file: &std::fs::File, _offset: u64, _len: u64) -> std::io::Result<()> {
     Err(std::io::Error::new(
         std::io::ErrorKind::Unsupported,
-        "fallocate is Linux-only",
+        "fallocate is not supported on this platform",
     ))
 }
 
@@ -784,6 +927,41 @@ fn sync_file_range_write(_file: &std::fs::File, _offset: u64, _len: u64) -> std:
     ))
 }
 
+/// Drop the finished output's page-cache footprint using the fd we already hold
+/// (no re-open). Linux: flush any dirty buffered pages so `DONTNEED` can drop
+/// them (a no-op after `sync_all`, or under O_DIRECT where ~none were resident),
+/// then `POSIX_FADV_DONTNEED`. Best-effort — every failure is ignored, since a
+/// cache hint must never fail a compaction.
+#[cfg(target_os = "linux")]
+fn evict_own(file: &std::fs::File, direct: bool) {
+    use std::os::fd::AsRawFd;
+    let fd = file.as_raw_fd();
+    if !direct {
+        // A buffered output may still hold dirty pages if `final_fsync` was off;
+        // write them back so DONTNEED can invalidate them. offset=0, nbytes=0 =>
+        // whole file. SAFETY: valid fd for the borrow.
+        let _ = unsafe {
+            libc::sync_file_range(
+                fd,
+                0,
+                0,
+                libc::SYNC_FILE_RANGE_WAIT_BEFORE
+                    | libc::SYNC_FILE_RANGE_WRITE
+                    | libc::SYNC_FILE_RANGE_WAIT_AFTER,
+            )
+        };
+    }
+    // Drop the now-clean pages (under O_DIRECT ~none were ever resident).
+    // NOTE: `posix_fadvise` returns the errno directly; we discard it (best-effort).
+    // SAFETY: valid fd for the borrow.
+    let _ = unsafe { libc::posix_fadvise(fd, 0, 0, libc::POSIX_FADV_DONTNEED) };
+}
+
+/// Non-Linux: macOS already kept the write uncached via `F_NOCACHE` (when the
+/// direct knob is on); no portable post-hoc page-drop exists otherwise. No-op.
+#[cfg(not(target_os = "linux"))]
+fn evict_own(_file: &std::fs::File, _direct: bool) {}
+
 fn truncate(file: &std::fs::File, len: u64) -> std::io::Result<()> {
     file.set_len(len)
 }
@@ -811,8 +989,20 @@ mod tests {
     use object_store::local::LocalFileSystem;
 
     fn store_over(dir: &FsPath, cfg: CompactionWriterConfig) -> CompactionLocalStore {
+        store_over_expected(dir, cfg, 8 << 20)
+    }
+
+    /// Build a store with an explicit target-file-size hint. `store_over` seeds a
+    /// deliberately GENEROUS 8 MiB so every round-trip exercises the up-front
+    /// `fallocate` + final truncate-release path — the on-disk length must still
+    /// equal the exact byte count regardless of over-reservation.
+    fn store_over_expected(
+        dir: &FsPath,
+        cfg: CompactionWriterConfig,
+        expected_file_bytes: u64,
+    ) -> CompactionLocalStore {
         let inner = Arc::new(LocalFileSystem::new_with_prefix(dir).expect("local store"));
-        CompactionLocalStore::new(inner, dir.to_path_buf(), cfg)
+        CompactionLocalStore::new(inner, dir.to_path_buf(), cfg, expected_file_bytes)
     }
 
     fn cfg(direct: bool) -> CompactionWriterConfig {
@@ -920,5 +1110,55 @@ mod tests {
             staging.is_empty(),
             "abort must remove the staging file, found {staging:?}"
         );
+    }
+
+    /// A generous target-size hint preallocates up front, but the finished file
+    /// must occupy EXACTLY its logical bytes — the final truncate releases the
+    /// unused reservation tail. Asserted for the buffered and `O_DIRECT` paths (the
+    /// latter falls back to buffered where the fs rejects `O_DIRECT`; the invariant
+    /// holds either way).
+    #[tokio::test]
+    async fn prealloc_tail_released_to_exact_size() {
+        for direct in [false, true] {
+            let dir = tempfile::tempdir().expect("tempdir");
+            // 4 MiB reserved up front; only 5000 bytes actually written.
+            let store = store_over_expected(dir.path(), cfg(direct), 4 << 20);
+            let location = Path::from("snap/part-0.vortex");
+            let mut upload = store
+                .put_multipart_opts(&location, PutMultipartOptions::default())
+                .await
+                .expect("begin multipart");
+            upload
+                .put_part(vec![0x5A_u8; 5000].into())
+                .await
+                .expect("put_part");
+            upload.complete().await.expect("complete multipart");
+
+            let meta =
+                std::fs::metadata(dir.path().join("snap/part-0.vortex")).expect("stat output");
+            assert_eq!(
+                meta.len(),
+                5000,
+                "finished file must be exactly its logical size (direct={direct})"
+            );
+        }
+    }
+
+    /// A `0` target-size hint (size-rolling disabled) skips up-front preallocation;
+    /// the writer must still round-trip exactly via on-demand growth.
+    #[tokio::test]
+    async fn zero_expected_size_round_trips() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = store_over_expected(dir.path(), cfg(false), 0);
+        let location = Path::from("snap/part-0.vortex");
+        let data = vec![0xC3_u8; 200_000];
+        let mut upload = store
+            .put_multipart_opts(&location, PutMultipartOptions::default())
+            .await
+            .expect("begin multipart");
+        upload.put_part(data.clone().into()).await.expect("put_part");
+        upload.complete().await.expect("complete multipart");
+        let got = std::fs::read(dir.path().join("snap/part-0.vortex")).expect("read back");
+        assert_eq!(got, data, "zero-expected write must round-trip exactly");
     }
 }

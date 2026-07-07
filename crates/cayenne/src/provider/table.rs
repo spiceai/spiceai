@@ -4792,7 +4792,7 @@ impl CayenneTableProvider {
             && matches!(write_class, super::delta_encoding::WriteClass::Maintenance)
             && !self.table_metadata.path.starts_with("s3://");
         let session_state = if use_compaction_writer {
-            match self.compaction_session_context(writer_cfg) {
+            match self.compaction_session_context(writer_cfg, target_size_bytes as u64) {
                 Ok(ctx) => Arc::new(ctx.state()),
                 Err(error) => {
                     tracing::warn!(
@@ -11307,6 +11307,16 @@ impl CayenneTableProvider {
     /// publish (the output is not yet query-visible, so the dropped pages race
     /// no reader). Never fails — a cache hint must not abort a compaction.
     async fn evict_compaction_output_pages(&self, snapshot_id: &str) {
+        // When the custom compaction writer is enabled it drops each output's
+        // pages itself in `finish` — holding the just-written fd, at the moment of
+        // completion, knowing whether O_DIRECT kept them out of cache entirely.
+        // Re-opening and re-hinting every file here would be redundant, so defer to
+        // the writer's own eviction. (A rare per-output writer-setup fallback to
+        // the inner store forgoes this hint; eviction is best-effort, so that miss
+        // is acceptable.)
+        if super::compaction_writer::config().enabled() {
+            return;
+        }
         let files = match self.list_snapshot_files_with_sizes_local(snapshot_id).await {
             Ok(files) => files,
             Err(error) => {
@@ -14077,11 +14087,14 @@ impl CayenneTableProvider {
     /// override never touches the SHARED runtime's `file://` store that queries
     /// and CDC appends use — only this `Maintenance`-class write is routed
     /// through the custom writer. The query memory pool is shared so the encode
-    /// still respects `runtime.query.memory_limit`. Gated off by default; only
-    /// called when [`super::compaction_writer::config`] is enabled.
+    /// still respects `runtime.query.memory_limit`. `expected_file_bytes` is the
+    /// per-output target file size, forwarded so the writer seeds each output's
+    /// preallocation with one `fallocate`. Gated off by default; only called when
+    /// [`super::compaction_writer::config`] is enabled.
     fn compaction_session_context(
         &self,
         cfg: super::compaction_writer::CompactionWriterConfig,
+        expected_file_bytes: u64,
     ) -> Result<SessionContext> {
         use datafusion::execution::object_store::{
             DefaultObjectStoreRegistry, ObjectStoreRegistry,
@@ -14099,6 +14112,7 @@ impl CayenneTableProvider {
             inner,
             std::path::PathBuf::from("/"),
             cfg,
+            expected_file_bytes,
         ));
         let file_url = url::Url::parse("file:///").map_err(|source| Error::UrlParse {
             url: "file:///".to_string(),
