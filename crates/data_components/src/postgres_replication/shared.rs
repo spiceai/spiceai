@@ -1158,7 +1158,8 @@ async fn run_pump(source: Arc<SharedSource>) {
             proc_us_acc = proc_us_acc.saturating_add(
                 u64::try_from(processing_start.elapsed().as_micros()).unwrap_or(u64::MAX),
             );
-            if should_flush {
+            let us_since_flush = input_us_acc.saturating_add(proc_us_acc);
+            if should_flush || us_since_flush >= 1_000_000 {
                 flush_reader_metrics(&source, input_us_acc, proc_us_acc, max_wal_end);
                 input_us_acc = 0;
                 proc_us_acc = 0;
