@@ -710,10 +710,10 @@ mod test {
     use super::*;
     use arrow::{
         array::{
-            Decimal128Builder, Float32Array, Int8Array, Int16Array, UInt8Array, UInt16Array,
-            UInt32Array, UInt64Array,
+            Decimal128Builder, Decimal256Builder, Float32Array, Int8Array, Int16Array, UInt8Array,
+            UInt16Array, UInt32Array, UInt64Array,
         },
-        datatypes::{Field, Schema, SchemaRef},
+        datatypes::{Field, Schema, SchemaRef, i256},
     };
     use rstest::rstest;
     use std::sync::Arc;
@@ -1019,6 +1019,28 @@ mod test {
             .with_precision_and_scale(38, scale)
             .expect("Should create builder");
         builder.append_value(value);
+        let array = builder.finish();
+
+        let result = array_value_to_string(&array, 0).expect("Should convert value to string");
+        assert_eq!(result, Some(expected.to_string()));
+    }
+
+    // A `MySQL` `SUM(DECIMAL)` widens to Decimal256(76, scale); ensure the i256
+    // arm renders identically to the Decimal128 arm across sign, scale 0/>0, and
+    // the scale-exceeds-digits case (fractional zero-padding).
+    #[rstest]
+    #[case(0, 12_345_i128, "12345")]
+    #[case(2, 12_345_i128, "123.45")]
+    #[case(3, 12_345_i128, "12.345")]
+    #[case(0, -12_345_i128, "-12345")]
+    #[case(2, -12_345_i128, "-123.45")]
+    #[case(6, 1_i128, "0.000001")]
+    #[case(4, -7_i128, "-0.0007")]
+    fn test_decimal256_values(#[case] scale: i8, #[case] value: i128, #[case] expected: &str) {
+        let mut builder = Decimal256Builder::new()
+            .with_precision_and_scale(76, scale)
+            .expect("Should create Decimal256 builder");
+        builder.append_value(i256::from_i128(value));
         let array = builder.finish();
 
         let result = array_value_to_string(&array, 0).expect("Should convert value to string");

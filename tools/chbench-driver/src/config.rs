@@ -125,12 +125,20 @@ impl Default for MysqlSourceConfig {
 }
 
 impl MysqlSourceConfig {
-    /// Build a `mysql_async` connection URL from this config.
+    /// Build `mysql_async` connection options from this config.
+    ///
+    /// Uses `OptsBuilder` rather than a formatted `mysql://` URL so credentials
+    /// or a database name containing URL-reserved characters (`@`, `:`, `/`,
+    /// `#`, `%`, ...) are passed through verbatim instead of being misparsed or
+    /// silently requiring percent-encoding.
     #[must_use]
-    pub fn connection_url(&self) -> String {
-        format!(
-            "mysql://{}:{}@{}:{}/{}",
-            self.user, self.pass, self.host, self.port, self.db,
-        )
+    pub fn opts(&self) -> mysql_async::Opts {
+        mysql_async::OptsBuilder::default()
+            .ip_or_hostname(self.host.clone())
+            .tcp_port(self.port)
+            .user(Some(self.user.clone()))
+            .pass(Some(self.pass.clone()))
+            .db_name(Some(self.db.clone()))
+            .into()
     }
 }

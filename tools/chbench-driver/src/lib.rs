@@ -489,14 +489,9 @@ impl MysqlChBenchDriver {
     ///
     /// # Errors
     ///
-    /// Returns an error if the connection URL is invalid or a connection cannot
-    /// be established.
+    /// Returns an error if a connection to `MySQL` cannot be established.
     pub async fn connect(config: ChBenchConfig, source: MysqlSourceConfig) -> Result<Self> {
-        let opts =
-            mysql_async::Opts::from_url(&source.connection_url()).map_err(|e| Error::MySql {
-                action: "parse MySQL connection URL".into(),
-                source: mysql_async::Error::Url(e),
-            })?;
+        let opts = source.opts();
 
         // Validate connectivity up front (mirrors PostgresChBenchDriver::connect).
         let mut conn = mysql_async::Conn::new(opts.clone())

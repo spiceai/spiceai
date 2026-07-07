@@ -220,9 +220,15 @@ async fn run_new_order(
     for (ol_number_0, &(ol_i_id, ol_supply_w_id, ol_quantity, remote)) in items.iter().enumerate() {
         let ol_number = i32::try_from(ol_number_0).unwrap_or(0) + 1;
 
-        // Check for rollback item — drop the transaction (auto-rollback) and return.
+        // Check for rollback item — explicitly roll back and return. Mirrors the
+        // Postgres new_order path; mysql_async does not issue a ROLLBACK when a
+        // transaction handle is merely dropped, so relying on drop could leave
+        // the transaction open on the connection.
         if ol_i_id < 0 {
-            drop(tx);
+            tx.rollback().await.map_err(|source| crate::Error::MySql {
+                action: "new_order: rollback".into(),
+                source,
+            })?;
             return Ok(());
         }
 
