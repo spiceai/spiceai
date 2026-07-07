@@ -4164,6 +4164,8 @@ dependencies = [
  "datafusion-table-providers",
  "opentelemetry",
  "runtime",
+ "runtime-api-types",
+ "runtime-metrics",
  "snafu",
  "tokio",
  "tracing",
@@ -4183,6 +4185,8 @@ dependencies = [
  "opentelemetry",
  "paste",
  "runtime",
+ "runtime-api-types",
+ "runtime-metrics",
  "runtime-rate-control",
  "runtime-secrets",
  "secrecy",
@@ -4326,6 +4330,8 @@ dependencies = [
  "opentelemetry",
  "reqwest 0.13.4",
  "runtime",
+ "runtime-api-types",
+ "runtime-metrics",
  "secrecy",
  "snafu",
  "tokio",
@@ -4383,6 +4389,7 @@ dependencies = [
  "paste",
  "reqwest 0.13.4",
  "runtime",
+ "runtime-metrics",
  "snafu",
  "token_provider",
  "tokio",
@@ -4419,6 +4426,8 @@ dependencies = [
  "futures",
  "opentelemetry",
  "runtime",
+ "runtime-api-types",
+ "runtime-metrics",
  "secrecy",
  "serde",
  "serde_json",
@@ -4479,6 +4488,8 @@ dependencies = [
  "opentelemetry",
  "paste",
  "runtime",
+ "runtime-api-types",
+ "runtime-metrics",
  "secrecy",
  "snafu",
  "tracing",
@@ -4540,6 +4551,8 @@ dependencies = [
  "futures",
  "opentelemetry",
  "runtime",
+ "runtime-api-types",
+ "runtime-metrics",
  "secrecy",
  "snafu",
  "tokio",
@@ -16519,6 +16532,7 @@ dependencies = [
  "runtime-datafusion",
  "runtime-datafusion-index",
  "runtime-datafusion-udfs",
+ "runtime-metrics",
  "runtime-object-store",
  "runtime-parameters",
  "runtime-proto",
@@ -16805,6 +16819,16 @@ dependencies = [
  "util",
  "wasmtime",
  "wat",
+]
+
+[[package]]
+name = "runtime-metrics"
+version = "2.1.0-unstable"
+dependencies = [
+ "opentelemetry",
+ "runtime-api-types",
+ "snafu",
+ "telemetry",
 ]
 
 [[package]]

@@ -1,0 +1,16 @@
+[package]
+description = "OpenTelemetry metrics definitions and component metrics traits for the Spice runtime"
+edition.workspace = true
+exclude.workspace = true
+homepage.workspace = true
+license-file.workspace = true
+name = "runtime-metrics"
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+opentelemetry = { workspace = true }
+runtime-api-types = { path = "../runtime-api-types" }
+snafu = { workspace = true }
+telemetry = { path = "../telemetry" }

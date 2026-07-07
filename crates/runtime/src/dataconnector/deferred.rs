@@ -140,7 +140,7 @@ impl DataConnector for DeferredConnector {
             .await
     }
 
-    fn metrics_provider(&self) -> Option<Arc<dyn crate::component::metrics::MetricsProvider>> {
+    fn metrics_provider(&self) -> Option<Arc<dyn runtime_metrics::component::MetricsProvider>> {
         self.inner.metrics_provider()
     }
 
