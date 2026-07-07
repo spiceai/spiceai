@@ -68,6 +68,6 @@ pub struct HtapArgs {
     /// write-phase time ÷ apply-burst wall time) falls below this fraction (0.0–1.0).
     /// A low ratio means a CDC apply bottleneck hides in un-instrumented code. Default
     /// 0.0 = report only (no gate); set e.g. 0.85 on the HTAP smoke to catch regressions.
-    #[arg(long, default_value_t = 0.0)]
+    #[arg(long, default_value_t = 0.0, value_parser = clap::value_parser!(f64).range(0.0..=1.0))]
     pub(crate) min_phase_coverage: f64,
 }
