@@ -361,6 +361,20 @@ impl ExecutorRegistry {
             .unwrap_or_default()
     }
 
+    /// Returns `true` once at least one executor has reported statistics for
+    /// `table`. Used to gate a distributed table's query-readiness on having
+    /// the row-count statistics needed to size the coordinator's joins — the
+    /// report may itself carry unknown stats (the executor always reports per
+    /// served table), so this signals "we have heard from an executor", not
+    /// "the stats are usable".
+    #[must_use]
+    pub fn has_statistics_for(&self, table: &TableReference) -> bool {
+        self.executor_statistics
+            .read()
+            .get(table)
+            .is_some_and(|per_executor| !per_executor.is_empty())
+    }
+
     /// Returns the scheduler's `node_id` if one was provided at construction.
     #[must_use]
     pub fn node_id(&self) -> Option<&str> {
@@ -755,6 +769,34 @@ pub(crate) fn flight_sql_table_provider(
 /// Uses the given [`PartitionStore`] to look up partition metadata, checks readiness (both an
 /// active connection and a `FlightSQL` client) via the `executors` map, selects a minimal
 /// executor set, and returns `(FlightSQL provider, partition values)` pairs.
+/// Projects the `executor_id`'s reported statistics for `table` onto `schema`,
+/// warning when no usable plan statistics (a known `num_rows`) are available for
+/// this leaf. Absent row counts prevent DataFusion's cost-based join-side swap
+/// (`should_swap_join_order`), so a distributed plan can end up buffering the
+/// large side of a hash join — worth surfacing rather than silently degrading.
+fn stamp_executor_statistics(
+    executor_statistics: &HashMap<String, ExecutorTableStatistics>,
+    executor_id: &str,
+    table: &TableReference,
+    schema: &SchemaRef,
+) -> Option<Statistics> {
+    let statistics = executor_statistics
+        .get(executor_id)
+        .map(|ets| ets.projected_onto(schema));
+    if statistics
+        .as_ref()
+        .and_then(|s| s.num_rows.get_value())
+        .is_none()
+    {
+        tracing::warn!(
+            table = %table,
+            executor = %executor_id,
+            "No plan statistics retrieved from executor for table {table:?}; distributed join sizing may be degraded"
+        );
+    }
+    statistics
+}
+
 pub(crate) fn get_partitions_from_store(
     partition_store: &PartitionStore,
     executors: &HashMap<String, (&ExecutorConnection, &FlightSqlClient)>,
@@ -782,13 +824,17 @@ pub(crate) fn get_partitions_from_store(
         if let Some(node_id) = node_id {
             metrics::record_query_executor_count(node_id, 1);
         }
+        // Stamp the chosen executor's reported stats onto this single leaf scan
+        // so the coordinator can size joins even on this no-partition-metadata
+        // fallback path (previously this passed `None`, silently degrading plans).
+        let statistics = stamp_executor_statistics(executor_statistics, executor_id, table, schema);
         return vec![(
             flight_sql_table_provider(
                 executor_id,
                 (*client).clone(),
                 table,
                 Arc::clone(schema),
-                None,
+                statistics,
             ),
             Vec::new(),
         )];
@@ -871,9 +917,8 @@ pub(crate) fn get_partitions_from_store(
             // coordinator's planner can size joins. Project the reported per-column
             // stats onto the leaf's (possibly projected) schema by name, carrying
             // num_rows and per-column min/max.
-            let statistics = executor_statistics
-                .get(&executor_id)
-                .map(|ets| ets.projected_onto(schema));
+            let statistics =
+                stamp_executor_statistics(executor_statistics, &executor_id, table, schema);
             let provider = flight_sql_table_provider(
                 &executor_id,
                 (*client).clone(),
