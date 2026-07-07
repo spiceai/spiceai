@@ -81,6 +81,7 @@ pub mod deletion_index;
 pub(crate) mod deletion_strategy;
 pub(crate) mod delta_encoding;
 pub(crate) mod fadvise_tier;
+pub(crate) mod file_digest;
 pub(crate) mod file_pruning;
 pub(crate) mod fsync_tier;
 pub(crate) mod inlined_cache;
@@ -104,6 +105,7 @@ pub(crate) mod table;
 pub(crate) mod tuning;
 pub(crate) mod utils;
 pub(crate) mod vortex_format;
+pub(crate) mod wal_checksum;
 pub(crate) mod write_budget;
 pub(crate) mod zorder;
 

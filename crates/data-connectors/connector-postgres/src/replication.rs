@@ -394,17 +394,6 @@ const METRICS: &[MetricSpec] = &[
     )
     .auto_register(),
     MetricSpec::new(
-        "replication_member_attached",
-        MetricType::ObservableGaugeU64,
-    )
-    .description(
-        "1 while this dataset's replication stream is attached and routing, 0 once it \
-         detaches (receiver dropped, sink died, mid-snapshot failure). A detached member \
-         pins the shared slot's WAL retention and its rate ladder is stale — a first-class \
-         liveness signal. Carries a `slot` label for shared-slot grouping.",
-    )
-    .auto_register(),
-    MetricSpec::new(
         "replication_member_send_stalled_seconds_total",
         MetricType::ObservableCounterU64,
     )
@@ -414,6 +403,20 @@ const METRICS: &[MetricSpec] = &[
          (downstream backpressure). The server replication connection stays alive \
          throughout; a rising value indicates a slow apply loop stalling the shared \
          pump. Only reported for datasets on a shared (explicitly-named) slot.",
+    )
+    .auto_register(),
+    MetricSpec::new(
+        "replication_member_attached",
+        MetricType::ObservableGaugeU64,
+    )
+    .description(
+        "1 while this dataset is an attached member of its shared replication slot, \
+         0 once it has detached. A detached member freezes its ack floor and pins WAL \
+         retention for the WHOLE shared slot until it rejoins or spiced restarts, so a \
+         value of 0 is the unambiguous signal for which dataset stalled the slot (the \
+         lag metric grows on the surviving slot-mates instead). Only reported for \
+         datasets on a shared (explicitly-named) slot; a dedicated slot reports no series. \
+         Carries a `slot` label for shared-slot grouping.",
     )
     .auto_register(),
 ];
@@ -551,13 +554,17 @@ impl MetricsProvider for PostgresMetricsProvider {
             }
             "replication_member_attached" => {
                 Some(ObserveMetricCallback::U64(Box::new(move |instrument| {
-                    // Append the shared-slot label (known once the member attaches) so
-                    // the analysis can group datasets by slot + join authoritative backlog.
-                    let mut attrs = attributes.clone();
-                    if let Some(slot) = m.slot_name() {
-                        attrs.push(KeyValue::new("slot", slot));
+                    // Observe only for shared-slot members (`Some`); a dedicated slot has
+                    // no member-detach concept, so its series stays absent rather than a
+                    // misleading constant `0`. Append the shared-slot label so the
+                    // analysis can group datasets by slot + join authoritative backlog.
+                    if let Some(v) = m.member_attached() {
+                        let mut attrs = attributes.clone();
+                        if let Some(slot) = m.slot_name() {
+                            attrs.push(KeyValue::new("slot", slot));
+                        }
+                        instrument.observe(v, &attrs);
                     }
-                    instrument.observe(m.member_attached(), &attrs);
                 })))
             }
             "replication_member_send_stalled_seconds_total" => {

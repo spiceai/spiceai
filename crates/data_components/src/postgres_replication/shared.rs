@@ -63,9 +63,13 @@ limitations under the License.
 //! with no traffic are credited forward on keepalives/commits whenever they
 //! have no in-flight envelopes. A stalled or failed member therefore pins WAL
 //! retention for the whole slot **by design** — acking past it would lose its
-//! changes permanently. The pinning is observable via the existing
-//! `dataset_postgres_replication_lag_bytes` metric and a WARN log on detach;
-//! restarting spiced (or the member rejoining) heals it by replaying from the
+//! changes permanently. The detached state is observable directly via the
+//! `dataset_postgres_replication_member_attached` gauge (1 attached / 0 detached)
+//! and an ERROR log on a stalling detach; the resulting WAL growth also shows on
+//! `dataset_postgres_replication_lag_bytes` (which, on a shared slot, grows for
+//! the *surviving* members whose ack floor is pinned by the detached one — the
+//! member gauge is the unambiguous signal for *which* dataset stalled).
+//! Restarting spiced (or the member rejoining) heals it by replaying from the
 //! held LSN, which every member applies idempotently.
 //!
 //! # Backpressure vs. server liveness
@@ -456,26 +460,44 @@ impl SharedSource {
     /// its table is (best-effort) removed from the publication — any rejoin,
     /// in-process or after a restart, then re-adds the table and takes a fresh
     /// snapshot.
-    fn detach_member(&self, key: &MemberKey, reason: &str) {
+    /// Detach a member from the shared slot. `stalls_slot` distinguishes a
+    /// genuine, unhealed stall (the member's changes stream died and its ack
+    /// floor now pins WAL for every slot-mate until it rejoins or spiced
+    /// restarts — a page-worthy, ERROR-level condition) from a self-healing
+    /// supersede (an already-closed member being replaced by an incoming
+    /// re-subscription, which re-attaches immediately — only WARN).
+    fn detach_member(&self, key: &MemberKey, reason: &str, stalls_slot: bool) {
         let removed = lock(&self.members).remove(key);
         let was_snapshotting = self.ack.detach(key);
         lock(&self.detached).insert(key.clone());
         if let Some(member) = removed {
-            // First-class liveness signal: flip the member-attached gauge to 0 so the
-            // analysis classifies this dataset STREAM-DEAD (its rate ladder is stale)
-            // rather than trusting a frozen frontier. The collector Arc outlives the
-            // MemberHandle (the connector's metrics provider still observes it).
-            member.metrics.set_member_attached(false);
-            tracing::warn!(
-                dataset = %member.dataset_name,
-                table = %format_member(key),
-                slot = %self.key.slot_name,
-                reason,
-                was_snapshotting,
-                "shared replication member detached; its last applied LSN now pins WAL \
-                 retention for the shared slot until the dataset rejoins or spiced restarts \
-                 (watch dataset_postgres_replication_lag_bytes)"
-            );
+            // Flip the membership-liveness gauge to detached (0) so the state is
+            // observable, not only logged (#11644). A superseding re-subscription
+            // re-attaches (back to 1) via `mark_member_attached` on rejoin.
+            member.metrics.mark_member_detached();
+            if stalls_slot {
+                tracing::error!(
+                    dataset = %member.dataset_name,
+                    table = %format_member(key),
+                    slot = %self.key.slot_name,
+                    reason,
+                    was_snapshotting,
+                    "shared replication member detached; its last applied LSN now pins WAL \
+                     retention for the shared slot until the dataset rejoins or spiced restarts \
+                     (watch dataset_postgres_replication_member_attached and \
+                     dataset_postgres_replication_lag_bytes)"
+                );
+            } else {
+                tracing::warn!(
+                    dataset = %member.dataset_name,
+                    table = %format_member(key),
+                    slot = %self.key.slot_name,
+                    reason,
+                    was_snapshotting,
+                    "shared replication member detached and is being replaced by a new \
+                     subscription (rejoin in progress)"
+                );
+            }
         }
         if was_snapshotting {
             let params = self.params.clone();
@@ -505,7 +527,7 @@ impl SharedSource {
             .map(|(k, _)| k.clone())
             .collect();
         for key in closed {
-            self.detach_member(&key, "changes stream receiver dropped");
+            self.detach_member(&key, "changes stream receiver dropped", true);
         }
     }
 }
@@ -607,7 +629,7 @@ async fn attach_member(
             // The previous subscription's receiver is gone (dataset reload,
             // failed sink) but the pump hasn't reaped it yet — detach it now
             // so this is a rejoin, not a duplicate.
-            source.detach_member(&member_key, "superseded by a new subscription");
+            source.detach_member(&member_key, "superseded by a new subscription", false);
         } else {
             return Err(Error::SharedTableAlreadySubscribed {
                 schema: schema_name,
@@ -644,10 +666,9 @@ async fn attach_member(
 
     let snapshotting = need_snapshot && params.initial_snapshot;
     let (sender, receiver) = mpsc::channel(MEMBER_CHANNEL_CAPACITY);
-    // Liveness + grouping signals for the analysis: mark attached and record which
-    // shared slot this dataset joined (a detach flips attached→0; see detach_member).
+    // Grouping signal for the analysis: record which shared slot this dataset joined.
+    // (Membership liveness is marked by `mark_member_attached` just below.)
     metrics.set_slot_name(source.key.slot_name.clone());
-    metrics.set_member_attached(true);
     source.ack.register(&member_key, snapshotting);
     lock(&source.members).insert(
         member_key.clone(),
@@ -660,6 +681,11 @@ async fn attach_member(
             metrics: Arc::clone(&metrics),
         }),
     );
+    // Membership liveness is now observable (`dataset_postgres_replication_member_attached`):
+    // this dataset is an attached member of the shared slot. Covers both a fresh
+    // join and an in-process rejoin (both reach here); the paired `mark_member_detached`
+    // in `detach_member` flips it to 0 when the member leaves (#11644).
+    metrics.mark_member_attached();
 
     tracing::info!(
         dataset = %dataset_name,
@@ -802,7 +828,7 @@ async fn member_fatal(source: &Arc<SharedSource>, key: &MemberKey, message: Stri
             .send(Err(StreamError::External(message)))
             .await;
     }
-    source.detach_member(key, "fatal member error");
+    source.detach_member(key, "fatal member error", true);
 }
 
 /// Mark the source dead and drop it from the registry (only if the registry
@@ -1382,7 +1408,7 @@ async fn deliver_commit(
             {
                 Ok(()) => break,
                 Err(mpsc::error::SendTimeoutError::Closed(_)) => {
-                    source.detach_member(member_key, "changes stream receiver dropped");
+                    source.detach_member(member_key, "changes stream receiver dropped", true);
                     break;
                 }
                 Err(mpsc::error::SendTimeoutError::Timeout(returned)) => {

@@ -119,6 +119,11 @@ pub enum CatalogError {
     SchemaMismatch { table: String },
 
     #[snafu(display(
+        "Cayenne acceleration metadata was written by a newer version of Spice (metadata schema version {found}, this build supports up to {supported}). Opening it with this build could silently drop rows from query results. Upgrade Spice to a build that supports metadata schema version {found} or newer, or clear the Cayenne acceleration data (delete the Cayenne metadata directory) so it can be recreated from the source. See: https://spiceai.org/docs/components/data-accelerators"
+    ))]
+    IncompatibleSchemaVersion { found: i64, supported: i64 },
+
+    #[snafu(display(
         "Deletion vectors require non-negative row IDs, found negative values: {row_ids}"
     ))]
     NegativeRowId { row_ids: String },

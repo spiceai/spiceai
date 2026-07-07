@@ -1,7 +1,7 @@
-//! Configuration types for PostgreSQL replication connections.
+//! Configuration types for `PostgreSQL` replication connections.
 //!
 //! This module provides configuration structures for establishing replication
-//! connections to PostgreSQL, including TLS settings and replication parameters.
+//! connections to `PostgreSQL`, including TLS settings and replication parameters.
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -10,7 +10,7 @@ use crate::lsn::Lsn;
 
 /// SSL/TLS connection mode.
 ///
-/// These modes match PostgreSQL's `sslmode` connection parameter.
+/// These modes match `PostgreSQL`'s `sslmode` connection parameter.
 /// See [PostgreSQL SSL Support](https://www.postgresql.org/docs/current/libpq-ssl.html)
 /// for detailed documentation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -43,24 +43,27 @@ pub enum SslMode {
 impl SslMode {
     /// Returns `true` if this mode requires TLS (won't fall back to plain).
     #[inline]
+    #[must_use]
     pub fn requires_tls(&self) -> bool {
         !matches!(self, SslMode::Disable | SslMode::Prefer)
     }
 
     /// Returns `true` if this mode verifies the certificate chain.
     #[inline]
+    #[must_use]
     pub fn verifies_certificate(&self) -> bool {
         matches!(self, SslMode::VerifyCa | SslMode::VerifyFull)
     }
 
     /// Returns `true` if this mode verifies the server hostname.
     #[inline]
+    #[must_use]
     pub fn verifies_hostname(&self) -> bool {
         matches!(self, SslMode::VerifyFull)
     }
 }
 
-/// TLS/SSL configuration for PostgreSQL connections.
+/// TLS/SSL configuration for `PostgreSQL` connections.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct TlsConfig {
     /// SSL mode controlling connection security level.
@@ -105,6 +108,7 @@ impl TlsConfig {
     /// let tls = TlsConfig::disabled();
     /// assert!(!tls.mode.requires_tls());
     /// ```
+    #[must_use]
     pub fn disabled() -> Self {
         Self::default()
     }
@@ -122,6 +126,7 @@ impl TlsConfig {
     /// assert!(tls.mode.requires_tls());
     /// assert!(!tls.mode.verifies_certificate());
     /// ```
+    #[must_use]
     pub fn require() -> Self {
         Self {
             mode: SslMode::Require,
@@ -144,6 +149,7 @@ impl TlsConfig {
     /// // Using custom CA
     /// let tls = TlsConfig::verify_ca(Some("/path/to/ca.pem".into()));
     /// ```
+    #[must_use]
     pub fn verify_ca(ca_path: Option<PathBuf>) -> Self {
         Self {
             mode: SslMode::VerifyCa,
@@ -166,6 +172,7 @@ impl TlsConfig {
     /// let tls = TlsConfig::verify_full(Some("/etc/ssl/certs/ca.pem".into()));
     /// assert!(tls.mode.verifies_hostname());
     /// ```
+    #[must_use]
     pub fn verify_full(ca_path: Option<PathBuf>) -> Self {
         Self {
             mode: SslMode::VerifyFull,
@@ -183,6 +190,7 @@ impl TlsConfig {
     /// let tls = TlsConfig::verify_full(None)
     ///     .with_sni_hostname("db.example.com");
     /// ```
+    #[must_use]
     pub fn with_sni_hostname(mut self, hostname: impl Into<String>) -> Self {
         self.sni_hostname = Some(hostname.into());
         self
@@ -197,6 +205,7 @@ impl TlsConfig {
     /// let tls = TlsConfig::verify_full(Some("/ca.pem".into()))
     ///     .with_client_cert("/client.pem", "/client.key");
     /// ```
+    #[must_use]
     pub fn with_client_cert(
         mut self,
         cert_path: impl Into<PathBuf>,
@@ -209,12 +218,13 @@ impl TlsConfig {
 
     /// Returns `true` if mutual TLS (client certificate) is configured.
     #[inline]
+    #[must_use]
     pub fn is_mtls(&self) -> bool {
         self.client_cert_pem_path.is_some() && self.client_key_pem_path.is_some()
     }
 }
 
-/// Configuration for PostgreSQL logical replication connections.
+/// Configuration for `PostgreSQL` logical replication connections.
 ///
 /// # Example
 ///
@@ -238,13 +248,13 @@ impl TlsConfig {
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReplicationConfig {
-    /// PostgreSQL server hostname or IP address.
+    /// `PostgreSQL` server hostname or IP address.
     pub host: String,
 
-    /// PostgreSQL server port (default: 5432).
+    /// `PostgreSQL` server port (default: 5432).
     pub port: u16,
 
-    /// PostgreSQL username with replication privileges.
+    /// `PostgreSQL` username with replication privileges.
     ///
     /// The user must have the `REPLICATION` attribute or be a superuser.
     pub user: String,
@@ -272,7 +282,7 @@ pub struct ReplicationConfig {
     /// LSN position to start replication from.
     ///
     /// - `Lsn(0)`: Start from slot's `confirmed_flush_lsn`
-    /// - Specific LSN: Resume from that position (must be >= slot's restart_lsn)
+    /// - Specific LSN: Resume from that position (must be >= slot's `restart_lsn`)
     pub start_lsn: Lsn,
 
     /// Optional LSN to stop replication at.
@@ -287,7 +297,7 @@ pub struct ReplicationConfig {
 
     /// Interval for sending standby status updates to the server.
     ///
-    /// Status updates inform PostgreSQL of the client's replay position,
+    /// Status updates inform `PostgreSQL` of the client's replay position,
     /// allowing the server to release WAL segments. Too infrequent updates
     /// may cause WAL accumulation; too frequent updates add overhead.
     ///
@@ -325,7 +335,7 @@ pub struct ReplicationConfig {
     ///
     /// When `true` (default), a full event channel no longer parks the worker:
     /// it keeps emitting standby status updates on [`Self::status_interval`]
-    /// while it waits for the consumer to drain, so PostgreSQL never sees a
+    /// while it waits for the consumer to drain, so `PostgreSQL` never sees a
     /// feedback gap longer than `status_interval` and will not terminate the
     /// walsender on `wal_sender_timeout`.
     ///
@@ -333,6 +343,20 @@ pub struct ReplicationConfig {
     /// blocks the worker (including feedback) until the consumer drains. Use
     /// only if a consumer specifically relies on that coupling.
     pub feedback_while_backpressured: bool,
+
+    /// Maximum accepted size (bytes) of a single backend message payload during
+    /// streaming. A frame whose declared length exceeds this is rejected as a
+    /// protocol error before any buffer is allocated for it, bounding the memory
+    /// a malformed or malicious length field can request.
+    ///
+    /// The default is `PostgreSQL`'s ~1 GiB field-size ceiling, so legitimate
+    /// large-row (TOAST) changes are never rejected. Lower it only if you know
+    /// the replicated relations have no large values — the reader already grows
+    /// its buffer incrementally from bytes actually received, so a high cap does
+    /// not by itself cause a large allocation.
+    ///
+    /// Default: 1 GiB
+    pub max_message_size: usize,
 }
 
 impl Default for ReplicationConfig {
@@ -352,6 +376,7 @@ impl Default for ReplicationConfig {
             idle_wakeup_interval: Duration::from_secs(10),
             buffer_events: 8192,
             feedback_while_backpressured: true,
+            max_message_size: crate::protocol::framing::MAX_MESSAGE_SIZE,
         }
     }
 }
@@ -396,8 +421,9 @@ impl ReplicationConfig {
     /// Returns `true` if `host` refers to a Unix domain socket directory.
     ///
     /// Following libpq convention, a host starting with `/` is treated as
-    /// the directory containing the PostgreSQL Unix socket file.
+    /// the directory containing the `PostgreSQL` Unix socket file.
     #[inline]
+    #[must_use]
     pub fn is_unix_socket(&self) -> bool {
         self.host.starts_with('/')
     }
@@ -407,6 +433,7 @@ impl ReplicationConfig {
     /// # Panics
     ///
     /// Panics if `host` does not start with `/` (i.e. `is_unix_socket()` is false).
+    #[must_use]
     pub fn unix_socket_path(&self) -> std::path::PathBuf {
         assert!(
             self.is_unix_socket(),
@@ -418,7 +445,7 @@ impl ReplicationConfig {
 
     /// Create a configuration for connecting via Unix domain socket.
     ///
-    /// `socket_dir` is the directory containing the PostgreSQL socket file
+    /// `socket_dir` is the directory containing the `PostgreSQL` socket file
     /// (e.g. `/var/run/postgresql`). The actual socket path will be
     /// `{socket_dir}/.s.PGSQL.{port}`.
     ///
@@ -462,42 +489,49 @@ impl ReplicationConfig {
     }
 
     /// Set the server port.
+    #[must_use]
     pub fn with_port(mut self, port: u16) -> Self {
         self.port = port;
         self
     }
 
     /// Set TLS configuration.
+    #[must_use]
     pub fn with_tls(mut self, tls: TlsConfig) -> Self {
         self.tls = tls;
         self
     }
 
     /// Set the starting LSN.
+    #[must_use]
     pub fn with_start_lsn(mut self, lsn: Lsn) -> Self {
         self.start_lsn = lsn;
         self
     }
 
     /// Set an optional stop LSN for bounded replay.
+    #[must_use]
     pub fn with_stop_lsn(mut self, lsn: Lsn) -> Self {
         self.stop_at_lsn = Some(lsn);
         self
     }
 
     /// Set the status update interval.
+    #[must_use]
     pub fn with_status_interval(mut self, interval: Duration) -> Self {
         self.status_interval = interval;
         self
     }
 
     /// Set the idle wakeup interval.
+    #[must_use]
     pub fn with_wakeup_interval(mut self, timeout: Duration) -> Self {
         self.idle_wakeup_interval = timeout;
         self
     }
 
     /// Set the event buffer size.
+    #[must_use]
     pub fn with_buffer_size(mut self, size: usize) -> Self {
         self.buffer_events = size;
         self
@@ -505,14 +539,25 @@ impl ReplicationConfig {
 
     /// Set whether standby status feedback keeps flowing while the consumer is
     /// backpressured. See [`Self::feedback_while_backpressured`].
+    #[must_use]
     pub fn with_feedback_while_backpressured(mut self, enabled: bool) -> Self {
         self.feedback_while_backpressured = enabled;
+        self
+    }
+
+    /// Set the maximum accepted backend-message payload size (bytes).
+    ///
+    /// See [`max_message_size`](Self::max_message_size). Defaults to ~1 GiB.
+    #[must_use]
+    pub fn with_max_message_size(mut self, size: usize) -> Self {
+        self.max_message_size = size;
         self
     }
 
     /// Returns the connection string for display (password masked).
     ///
     /// Useful for logging without exposing credentials.
+    #[must_use]
     pub fn display_connection(&self) -> String {
         if self.is_unix_socket() {
             format!(

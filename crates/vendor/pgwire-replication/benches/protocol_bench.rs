@@ -7,7 +7,9 @@ use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criteri
 use std::io::Cursor;
 
 use pgwire_replication::lsn::Lsn;
-use pgwire_replication::protocol::framing::{read_backend_message_into, MessageReader};
+use pgwire_replication::protocol::framing::{
+    read_backend_message_into, FrameReader, MessageReader,
+};
 use pgwire_replication::protocol::messages::{parse_error_response, ErrorFields};
 use pgwire_replication::protocol::replication::{encode_standby_status_update, parse_copy_data};
 
@@ -144,7 +146,7 @@ fn bench_read_backend_message(c: &mut Criterion) {
             },
         );
 
-        // New cancellation-safe path used by the streaming loop.
+        // Prior cancellation-safe path (per-message zero-filled buffer).
         group.bench_with_input(
             BenchmarkId::new("MessageReader", size),
             &stream,
@@ -158,6 +160,26 @@ fn bench_read_backend_message(c: &mut Criterion) {
                         let mut reader = MessageReader::new();
                         for _ in 0..COUNT {
                             let _msg = reader.read(&mut cur).await.unwrap();
+                        }
+                    });
+                });
+            },
+        );
+
+        // Current streaming path: incremental, zero-copy, no per-message memset.
+        group.bench_with_input(
+            BenchmarkId::new("FrameReader", size),
+            &stream,
+            |b, stream| {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .build()
+                    .unwrap();
+                b.iter(|| {
+                    rt.block_on(async {
+                        let mut cur = Cursor::new(black_box(stream.as_slice()));
+                        let mut reader = FrameReader::new(1024 * 1024 * 1024);
+                        for _ in 0..COUNT {
+                            let _msg = reader.next(&mut cur).await.unwrap();
                         }
                     });
                 });

@@ -79,14 +79,6 @@ pub struct MetricsCollector {
     /// reconnect storm — during that time no changes are delivered and lag grows,
     /// and Postgres replays from the held floor on resume.
     replication_disconnected_ms_total: AtomicU64,
-    /// Liveness: `1` while this dataset's stream is attached and routing, `0` once it
-    /// detaches (receiver dropped / sink died / mid-snapshot failure). A detached
-    /// member pins the shared slot's WAL retention and its rate ladder is meaningless
-    /// — this is a FIRST-CLASS signal the analysis checks before any classification.
-    /// Initialized to `1` (attached) by `MetricsCollector::new()` — the sole
-    /// constructor — so the per-dataset (non-shared) path reads live; the derived
-    /// `Default` leaves it `0`, so always build collectors via `new()`.
-    member_attached: AtomicU64,
     /// The replication slot this dataset is a member of (for shared slots, several
     /// datasets share one). Lets the analysis join the per-dataset view to the
     /// authoritative per-slot backlog and show grouping. Set at (shared) attach.
@@ -98,6 +90,17 @@ pub struct MetricsCollector {
     /// stays alive throughout. Only ever set for shared-slot datasets.
     member_send_stalled_seconds_total: AtomicU64,
 
+    // Shared-slot membership liveness. `member_attached` is `1` while this
+    // dataset is an attached member of its shared replication slot and `0` once
+    // it has detached — a detached member freezes its ack floor and pins WAL
+    // retention for the WHOLE shared slot until it rejoins or spiced restarts
+    // (#11644). `member_attached_known` gates observation to shared-slot datasets
+    // only: it stays `false` for a dedicated (non-shared) slot, whose single
+    // consumer has no member-detach concept, so the metric reports no series
+    // there rather than a misleading constant `0`/`1`.
+    member_attached: AtomicU64,
+    member_attached_known: AtomicBool,
+
     // Watermark: commit time of the most-recent transaction we've ingested.
     // Used to compute `replication_lag_ms = now - watermark`.
     last_commit_seen_at: RwLock<Option<SystemTime>>,
@@ -106,16 +109,10 @@ pub struct MetricsCollector {
 impl MetricsCollector {
     #[must_use]
     pub fn new() -> Arc<Self> {
-        let collector = Self::default();
-        // Attached by default; the shared path flips this to 0 on detach.
-        collector.member_attached.store(1, Ordering::Relaxed);
-        Arc::new(collector)
-    }
-
-    /// Mark the member attached (`true`) or detached (`false`).
-    pub fn set_member_attached(&self, attached: bool) {
-        self.member_attached
-            .store(u64::from(attached), Ordering::Relaxed);
+        // `member_attached` stays "unknown" (series absent) until the shared-slot path
+        // calls `mark_member_attached`; a dedicated (non-shared) slot never does, so it
+        // reports no membership series rather than a misleading constant.
+        Arc::new(Self::default())
     }
 
     /// Record which replication slot this member belongs to (shared-slot grouping).
@@ -273,6 +270,25 @@ impl MetricsCollector {
         self.replication_disconnected_ms_total
             .fetch_add(ms, Ordering::Relaxed);
     }
+
+    /// Mark this dataset as an attached member of its shared replication slot
+    /// (fresh join or in-process rejoin). Also flips the "known" flag so the
+    /// metric begins reporting — a dataset on a dedicated (non-shared) slot never
+    /// calls this, so its series stays absent rather than a misleading `0`.
+    pub fn mark_member_attached(&self) {
+        self.member_attached.store(1, Ordering::Relaxed);
+        // Release pairs with the Acquire load in `member_attached()` so a reader
+        // that observes `known == true` also sees the value store above.
+        self.member_attached_known.store(true, Ordering::Release);
+    }
+
+    /// Mark this dataset as DETACHED from its shared replication slot: its ack
+    /// floor is now frozen and pins WAL retention for the whole slot until it
+    /// rejoins or spiced restarts (#11644).
+    pub fn mark_member_detached(&self) {
+        self.member_attached.store(0, Ordering::Relaxed);
+        self.member_attached_known.store(true, Ordering::Release);
+    }
 }
 
 /// Read-only snapshot interface used by the `MetricsProvider` callbacks.
@@ -423,10 +439,6 @@ impl Metrics {
             .load(Ordering::Relaxed)
     }
     #[must_use]
-    pub fn member_attached(&self) -> u64 {
-        self.collector.member_attached.load(Ordering::Relaxed)
-    }
-    #[must_use]
     pub fn slot_name(&self) -> Option<String> {
         // Recover through poisoning: an unrelated panic must not permanently drop the
         // `slot` label (which would break shared-slot grouping in the analysis). The
@@ -442,6 +454,22 @@ impl Metrics {
         self.collector
             .member_send_stalled_seconds_total
             .load(Ordering::Relaxed)
+    }
+
+    /// Shared-slot membership liveness: `Some(1)` while attached, `Some(0)` once
+    /// detached (ack floor frozen, WAL pinned for the whole slot — #11644), or
+    /// `None` for a dedicated (non-shared) slot, which has no member-detach
+    /// concept and reports no series. Callers observe only on `Some` so an absent
+    /// series means "not applicable", never a misleading `0`.
+    #[must_use]
+    pub fn member_attached(&self) -> Option<u64> {
+        // Acquire pairs with the Release store in `mark_member_{attached,detached}`
+        // so the value load never observes a stale default once `known` is true.
+        if self.collector.member_attached_known.load(Ordering::Acquire) {
+            Some(self.collector.member_attached.load(Ordering::Relaxed))
+        } else {
+            None
+        }
     }
 }
 
@@ -494,6 +522,24 @@ mod tests {
         c.set_bootstrap_rows_expected(0);
         assert_eq!(m.bootstrap_rows_expected(), Some(0));
         assert_eq!(m.bootstrap_progress_percent(), Some(100));
+    }
+
+    #[test]
+    fn member_attached_reports_only_for_shared_slot_members() {
+        let c = MetricsCollector::new();
+        let m = Metrics::new(Arc::clone(&c));
+        // A dedicated (non-shared) slot never marks membership: no series, so an
+        // absent value means "not applicable" — never a misleading `0`.
+        assert_eq!(m.member_attached(), None);
+
+        // A shared-slot member: attached on join, 0 on detach (ack floor frozen /
+        // WAL pinned), back to 1 on rejoin.
+        c.mark_member_attached();
+        assert_eq!(m.member_attached(), Some(1));
+        c.mark_member_detached();
+        assert_eq!(m.member_attached(), Some(0));
+        c.mark_member_attached();
+        assert_eq!(m.member_attached(), Some(1));
     }
 
     #[test]
