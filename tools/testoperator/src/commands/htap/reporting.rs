@@ -30,10 +30,21 @@ use test_framework::opentelemetry::KeyValue;
 /// don't overwrite the headline lag metric.
 pub(super) fn emit_replication_metrics(
     metrics: &crate::spiced_metrics::SpicedMetrics,
+    engine: &str,
     phase: &str,
     record_telemetry: bool,
 ) {
     use std::collections::{BTreeMap, BTreeSet};
+
+    // spiced names replication metrics per source connector, e.g.
+    // `dataset_postgres_replication_*` or `dataset_mysql_replication_*`.
+    let lag_ms_metric = format!("dataset_{engine}_replication_lag_ms");
+    let lag_bytes_metric = format!("dataset_{engine}_replication_lag_bytes");
+    let inserts_metric = format!("dataset_{engine}_replication_inserts_total");
+    let updates_metric = format!("dataset_{engine}_replication_updates_total");
+    let deletes_metric = format!("dataset_{engine}_replication_deletes_total");
+    let recv_errors_metric = format!("dataset_{engine}_replication_recv_errors_total");
+    let reconnects_metric = format!("dataset_{engine}_replication_reconnects_total");
 
     // Collect replication metrics per dataset from scraped samples.
     // Gauges (lag_ms, lag_bytes): use the last observed value — represents the
@@ -49,26 +60,20 @@ pub(super) fn emit_replication_metrics(
 
     let gauge_metrics = [
         (
-            "dataset_postgres_replication_lag_ms",
+            lag_ms_metric.as_str(),
             &mut lag_ms as &mut BTreeMap<String, f64>,
         ),
-        ("dataset_postgres_replication_lag_bytes", &mut lag_bytes),
+        (lag_bytes_metric.as_str(), &mut lag_bytes),
     ];
     let counter_metrics = [
         (
-            "dataset_postgres_replication_inserts_total",
+            inserts_metric.as_str(),
             &mut inserts as &mut BTreeMap<String, f64>,
         ),
-        ("dataset_postgres_replication_updates_total", &mut updates),
-        ("dataset_postgres_replication_deletes_total", &mut deletes),
-        (
-            "dataset_postgres_replication_recv_errors_total",
-            &mut recv_errors,
-        ),
-        (
-            "dataset_postgres_replication_reconnects_total",
-            &mut reconnects,
-        ),
+        (updates_metric.as_str(), &mut updates),
+        (deletes_metric.as_str(), &mut deletes),
+        (recv_errors_metric.as_str(), &mut recv_errors),
+        (reconnects_metric.as_str(), &mut reconnects),
     ];
 
     for (metric_name, map) in gauge_metrics {
@@ -108,7 +113,7 @@ pub(super) fn emit_replication_metrics(
     // captures the pipeline state when the scraper stopped, which understates the
     // worst lag seen during the run.
     let mut lag_ms_series: BTreeMap<String, Vec<f64>> = BTreeMap::new();
-    if let Some(samples) = metrics.samples.get("dataset_postgres_replication_lag_ms") {
+    if let Some(samples) = metrics.samples.get(lag_ms_metric.as_str()) {
         for sample in samples {
             if sample.value.is_nan() {
                 continue;

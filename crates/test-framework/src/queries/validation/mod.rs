@@ -24,11 +24,11 @@ use anyhow::{Result, anyhow};
 
 use arrow::{
     array::{
-        Array, BooleanArray, Date32Array, Date64Array, Decimal128Array, Float32Array, Float64Array,
-        Int8Array, Int16Array, Int32Array, Int64Array, LargeStringArray, RecordBatch, StringArray,
-        StringViewArray, TimestampMicrosecondArray, TimestampMillisecondArray,
-        TimestampNanosecondArray, TimestampSecondArray, UInt8Array, UInt16Array, UInt32Array,
-        UInt64Array,
+        Array, BooleanArray, Date32Array, Date64Array, Decimal128Array, Decimal256Array,
+        Float32Array, Float64Array, Int8Array, Int16Array, Int32Array, Int64Array,
+        LargeStringArray, RecordBatch, StringArray, StringViewArray, TimestampMicrosecondArray,
+        TimestampMillisecondArray, TimestampNanosecondArray, TimestampSecondArray, UInt8Array,
+        UInt16Array, UInt32Array, UInt64Array,
     },
     csv::reader::Format,
     datatypes::TimeUnit,
@@ -339,6 +339,40 @@ pub fn array_value_to_string(array: &dyn Array, index: usize) -> Result<Option<S
                 (a.to_string(), b.to_string())
             } else {
                 ("0".to_string(), format!("{str_val:0>scale$}"))
+            };
+
+            if frac_part.is_empty() {
+                Ok(Some(format!("{sign}{int_part}")))
+            } else {
+                Ok(Some(format!("{sign}{int_part}.{frac_part}")))
+            }
+        }
+
+        DataType::Decimal256(_, scale) => {
+            let val = array
+                .as_any()
+                .downcast_ref::<Decimal256Array>()
+                .ok_or_else(|| anyhow!("Failed to downcast Decimal256 array"))?
+                .value(index);
+
+            // `i256::to_string()` renders the full signed integer; split it into
+            // integer/fractional parts by the declared scale, mirroring the
+            // Decimal128 arm. Working from the string sidesteps i256 abs/compare
+            // APIs and preserves the exact digits. A `MySQL` `SUM(..)` widens to
+            // DECIMAL(65, s) -> Arrow Decimal256(76, s); this renders the same
+            // string the Int64/Decimal128 side produces, so the values compare
+            // equal (scale 0 -> integer string; scale s -> s fractional digits).
+            let str_signed = val.to_string();
+            let sign = if str_signed.starts_with('-') { "-" } else { "" };
+            let abs_str = str_signed.strip_prefix('-').unwrap_or(&str_signed);
+            let scale = usize::try_from(*scale)?;
+
+            let len = abs_str.len();
+            let (int_part, frac_part) = if len > scale {
+                let (a, b) = abs_str.split_at(len - scale);
+                (a.to_string(), b.to_string())
+            } else {
+                ("0".to_string(), format!("{abs_str:0>scale$}"))
             };
 
             if frac_part.is_empty() {

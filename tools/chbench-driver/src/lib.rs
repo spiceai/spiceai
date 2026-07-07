@@ -20,12 +20,14 @@ limitations under the License.
 /// and runs a TPC-C OLTP workload with configurable terminals.
 pub mod config;
 pub mod loader;
+pub mod loader_mysql;
 pub mod metrics;
 pub mod rand;
 pub mod schema;
+pub mod schema_mysql;
 pub mod txn;
 
-pub use config::{ChBenchConfig, PostgresSourceConfig};
+pub use config::{ChBenchConfig, MysqlSourceConfig, PostgresSourceConfig};
 pub use metrics::OltpReport;
 pub use txn::TxnType;
 
@@ -38,6 +40,7 @@ use ::rand::rngs::StdRng;
 use arrow::array::RecordBatch;
 use async_trait::async_trait;
 use datafusion_table_providers::sql::db_connection_pool::dbconnection::AsyncDbConnection;
+use datafusion_table_providers::sql::db_connection_pool::mysqlpool::MySQLConnectionPool;
 use datafusion_table_providers::sql::db_connection_pool::postgrespool::PostgresConnectionPool;
 use futures::TryStreamExt;
 use governor::{
@@ -46,6 +49,7 @@ use governor::{
     middleware::NoOpMiddleware,
     state::{InMemoryState, NotKeyed},
 };
+use mysql_async::prelude::Queryable;
 use secrecy::SecretBox;
 use snafu::{Snafu, ensure};
 use tokio::sync::OnceCell;
@@ -60,6 +64,12 @@ pub enum Error {
     Sql {
         action: String,
         source: tokio_postgres::Error,
+    },
+
+    #[snafu(display("Failed to {action}: {source}"))]
+    MySql {
+        action: String,
+        source: mysql_async::Error,
     },
 
     #[snafu(display(
@@ -438,6 +448,328 @@ async fn run_terminal(
                 if !stop.is_cancelled() {
                     // Log only if not shutting down — connection-closed errors
                     // during shutdown are expected and noisy.
+                    eprintln!("Terminal {terminal_id} {txn_type} error: {e}");
+                }
+            }
+        }
+    }
+
+    Ok(metrics)
+}
+
+/// Pin a `MySQL` session's time zone to UTC so `NOW(3)`/`_bench_ts` writes and
+/// reads line up with how the Spice CDC path interprets timestamps (which pins
+/// the replication session to UTC).
+async fn set_mysql_utc(conn: &mut mysql_async::Conn) -> Result<()> {
+    conn.query_drop("SET time_zone = '+00:00'")
+        .await
+        .map_err(|source| Error::MySql {
+            action: "set MySQL session time zone to UTC".into(),
+            source,
+        })
+}
+
+/// `MySQL`-backed CH-benCH driver.
+///
+/// Mirrors [`PostgresChBenchDriver`]: same schema/seed/OLTP/staleness contract,
+/// implemented against a binlog-enabled `MySQL` source over `mysql_async`.
+pub struct MysqlChBenchDriver {
+    config: ChBenchConfig,
+    source: MysqlSourceConfig,
+    /// Parsed connection options, cloned to open per-terminal connections.
+    opts: mysql_async::Opts,
+    /// `MySQL` pool that returns query results as Arrow `RecordBatch`es, kept
+    /// separate from the OLTP connections because the analytical-query gate
+    /// needs Arrow output to compare against Spice results.
+    arrow_client: OnceCell<Arc<MySQLConnectionPool>>,
+}
+
+impl MysqlChBenchDriver {
+    /// Connect to `MySQL` using the provided configuration.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the connection URL is invalid or a connection cannot
+    /// be established.
+    pub async fn connect(config: ChBenchConfig, source: MysqlSourceConfig) -> Result<Self> {
+        let opts =
+            mysql_async::Opts::from_url(&source.connection_url()).map_err(|e| Error::MySql {
+                action: "parse MySQL connection URL".into(),
+                source: mysql_async::Error::Url(e),
+            })?;
+
+        // Validate connectivity up front (mirrors PostgresChBenchDriver::connect).
+        let mut conn = mysql_async::Conn::new(opts.clone())
+            .await
+            .map_err(|source| Error::MySql {
+                action: "connect to MySQL".into(),
+                source,
+            })?;
+        set_mysql_utc(&mut conn).await?;
+        drop(conn);
+
+        Ok(Self {
+            config,
+            source,
+            opts,
+            arrow_client: OnceCell::new(),
+        })
+    }
+
+    /// Open a fresh UTC-pinned connection to the source.
+    async fn new_conn(&self) -> Result<mysql_async::Conn> {
+        let mut conn = mysql_async::Conn::new(self.opts.clone())
+            .await
+            .map_err(|source| Error::MySql {
+                action: "open MySQL connection".into(),
+                source,
+            })?;
+        set_mysql_utc(&mut conn).await?;
+        Ok(conn)
+    }
+
+    /// Build the Arrow-returning connection pool from the source config.
+    async fn build_arrow_client(&self) -> Result<Arc<MySQLConnectionPool>> {
+        let mut params: HashMap<String, SecretBox<str>> = HashMap::new();
+        params.insert("host".into(), SecretBox::from(self.source.host.clone()));
+        params.insert(
+            "tcp_port".into(),
+            SecretBox::from(self.source.port.to_string()),
+        );
+        params.insert("db".into(), SecretBox::from(self.source.db.clone()));
+        params.insert("user".into(), SecretBox::from(self.source.user.clone()));
+        params.insert("pass".into(), SecretBox::from(self.source.pass.clone()));
+        params.insert("sslmode".into(), SecretBox::from("disabled".to_string()));
+
+        let pool = MySQLConnectionPool::new(params)
+            .await
+            .map_err(|e| Error::Arrow {
+                action: "build MySQLConnectionPool".into(),
+                message: e.to_string(),
+            })?;
+        Ok(Arc::new(pool))
+    }
+
+    /// Verify the source already holds a prepared CH-benCH dataset matching the
+    /// configured warehouse count. Used on the `--skip-prepare` path.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::MySql`] if the `warehouse` table is absent and
+    /// [`Error::SourceScaleMismatch`] if its row count does not match the
+    /// configured scale factor.
+    pub async fn verify_prepared(&self) -> Result<()> {
+        let mut conn = self.new_conn().await?;
+        let found: Option<i64> = conn
+            .query_first("SELECT COUNT(*) FROM warehouse")
+            .await
+            .map_err(|source| Error::MySql {
+                action: "verify --skip-prepare source (is the warehouse table seeded?)".into(),
+                source,
+            })?;
+        let found = u64::try_from(found.unwrap_or(0)).unwrap_or(0);
+        let expected = self.config.warehouses as u64;
+        ensure!(
+            found == expected,
+            SourceScaleMismatchSnafu { found, expected }
+        );
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl ChBenchDriver for MysqlChBenchDriver {
+    /// Drop and recreate all CH-benCH tables, then load seed data.
+    async fn prepare(&self) -> Result<()> {
+        println!(
+            "Preparing CH-benCHmark schema with {} warehouse(s)",
+            self.config.warehouses,
+        );
+
+        let mut conn = self.new_conn().await?;
+        schema_mysql::drop_tables(&mut conn).await?;
+        schema_mysql::create_tables(&mut conn).await?;
+        loader_mysql::load_all(&mut conn, self.config.warehouses, self.config.seed).await?;
+
+        Ok(())
+    }
+
+    /// Run the TPC-C OLTP workload until `stop` is triggered.
+    ///
+    /// Each terminal opens its own `MySQL` connection and runs transactions in a
+    /// tight loop with the configured mix weights.
+    async fn run(&self, stop: CancellationToken) -> Result<OltpReport> {
+        let terminals = self.config.terminals;
+        let mix = self.config.mix;
+        let warehouses = i32::try_from(self.config.warehouses).unwrap_or(1);
+        let base_seed = self.config.seed.unwrap_or(42);
+
+        let assignments = txn::TerminalAssignment::compute(terminals, warehouses);
+
+        let rate_limiter = match self.config.rate {
+            Some(rate) => {
+                let cells = NonZeroU32::new(rate).ok_or(Error::InvalidRate { rate })?;
+                Some(Arc::new(RateLimiter::direct(Quota::per_second(cells))))
+            }
+            None => None,
+        };
+
+        match self.config.rate {
+            Some(rate) => println!(
+                "Starting OLTP workload: {warehouses} warehouse(s), {terminals} terminals, mix={mix:?}, target rate={rate} txn/s",
+            ),
+            None => println!(
+                "Starting OLTP workload: {warehouses} warehouse(s), {terminals} terminals, mix={mix:?}, target rate=unlimited",
+            ),
+        }
+
+        let mut handles = Vec::with_capacity(terminals);
+        for (terminal_id, &assignment) in assignments.iter().enumerate() {
+            let opts = self.opts.clone();
+            let stop = stop.clone();
+            let rate_limiter = rate_limiter.clone();
+
+            handles.push(tokio::spawn(async move {
+                run_terminal_mysql(
+                    terminal_id,
+                    opts,
+                    stop,
+                    assignment,
+                    mix,
+                    base_seed,
+                    rate_limiter,
+                )
+                .await
+            }));
+        }
+
+        let mut combined = metrics::OltpMetrics::new();
+        let mut failed_terminals: usize = 0;
+        for handle in handles {
+            match handle.await {
+                Ok(Ok(terminal_metrics)) => combined.merge(&terminal_metrics),
+                Ok(Err(e)) => {
+                    eprintln!("Terminal error: {e}");
+                    failed_terminals += 1;
+                }
+                Err(e) => {
+                    eprintln!("Terminal join error: {e}");
+                    failed_terminals += 1;
+                }
+            }
+        }
+
+        ensure!(
+            failed_terminals == 0,
+            OltpTerminalFailuresSnafu {
+                failed: failed_terminals,
+                total: terminals,
+            }
+        );
+
+        Ok(combined.finish())
+    }
+
+    fn probe_tables(&self) -> &[&str] {
+        schema::STALENESS_PROBE_TABLES
+    }
+
+    async fn max_bench_ts(&self, table: &str) -> Result<Option<i64>> {
+        let mut conn = self.new_conn().await?;
+        let sql = format!("SELECT MAX(_bench_ts) FROM {table}");
+        let value: Option<Option<chrono::NaiveDateTime>> =
+            conn.query_first(&sql)
+                .await
+                .map_err(|source| Error::MySql {
+                    action: format!("query MAX(_bench_ts) from {table}"),
+                    source,
+                })?;
+        // Session pinned to UTC, so the naive datetime is UTC wall-clock time.
+        Ok(value.flatten().map(|dt| dt.and_utc().timestamp_micros()))
+    }
+
+    async fn row_count(&self, table: &str) -> Result<i64> {
+        let mut conn = self.new_conn().await?;
+        let sql = format!("SELECT COUNT(*) FROM {table}");
+        let value: Option<i64> = conn
+            .query_first(&sql)
+            .await
+            .map_err(|source| Error::MySql {
+                action: format!("query COUNT(*) from {table}"),
+                source,
+            })?;
+        Ok(value.unwrap_or(0))
+    }
+
+    async fn query_arrow(&self, sql: &str) -> Result<Vec<RecordBatch>> {
+        let client = self
+            .arrow_client
+            .get_or_try_init(|| self.build_arrow_client())
+            .await?;
+
+        let conn = client.connect_direct().await.map_err(|e| Error::Arrow {
+            action: "acquire MySQL connection".into(),
+            message: e.to_string(),
+        })?;
+
+        let stream = conn
+            .query_arrow(sql, &[], None)
+            .await
+            .map_err(|e| Error::Arrow {
+                action: format!("execute arrow query: {sql}"),
+                message: e.to_string(),
+            })?;
+
+        stream
+            .try_collect::<Vec<_>>()
+            .await
+            .map_err(|e| Error::Arrow {
+                action: format!("collect arrow query results: {sql}"),
+                message: e.to_string(),
+            })
+    }
+}
+
+/// Run a single `MySQL` OLTP terminal loop until cancelled.
+async fn run_terminal_mysql(
+    terminal_id: usize,
+    opts: mysql_async::Opts,
+    stop: CancellationToken,
+    assignment: txn::TerminalAssignment,
+    mix: [u32; 5],
+    base_seed: u64,
+    rate_limiter: Option<Arc<OltpRateLimiter>>,
+) -> Result<metrics::OltpMetrics> {
+    let mut conn = mysql_async::Conn::new(opts)
+        .await
+        .map_err(|source| Error::MySql {
+            action: format!("connect terminal {terminal_id}"),
+            source,
+        })?;
+    set_mysql_utc(&mut conn).await?;
+
+    let mut rng = StdRng::seed_from_u64(base_seed.wrapping_add(terminal_id as u64));
+    let mut metrics = metrics::OltpMetrics::new();
+
+    loop {
+        if stop.is_cancelled() {
+            break;
+        }
+
+        if let Some(limiter) = &rate_limiter {
+            tokio::select! {
+                () = limiter.until_ready() => {}
+                () = stop.cancelled() => break,
+            }
+        }
+
+        let txn_type = txn::pick_txn_type(&mut rng, &mix);
+
+        match txn::mysql::execute(&mut conn, &mut rng, txn_type, &assignment).await {
+            Ok(()) => metrics.record_success(txn_type),
+            Err(e) => {
+                metrics.record_abort();
+                if !stop.is_cancelled() {
                     eprintln!("Terminal {terminal_id} {txn_type} error: {e}");
                 }
             }

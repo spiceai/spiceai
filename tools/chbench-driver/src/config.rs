@@ -89,3 +89,48 @@ impl PostgresSourceConfig {
         )
     }
 }
+
+/// `MySQL`-specific connection configuration.
+///
+/// The source server must have binary logging enabled for Spice CDC
+/// (`log_bin = ON`, `binlog_format = ROW`, `binlog_row_image = FULL`), and the
+/// user needs `REPLICATION SLAVE` + `REPLICATION CLIENT` alongside DDL rights.
+pub struct MysqlSourceConfig {
+    /// `MySQL` host.
+    pub host: String,
+
+    /// `MySQL` port.
+    pub port: u16,
+
+    /// `MySQL` database name.
+    pub db: String,
+
+    /// `MySQL` user.
+    pub user: String,
+
+    /// `MySQL` password.
+    pub pass: String,
+}
+
+impl Default for MysqlSourceConfig {
+    fn default() -> Self {
+        Self {
+            host: "127.0.0.1".into(),
+            port: 3306,
+            db: "chbench".into(),
+            user: "bench".into(),
+            pass: "bench".into(),
+        }
+    }
+}
+
+impl MysqlSourceConfig {
+    /// Build a `mysql_async` connection URL from this config.
+    #[must_use]
+    pub fn connection_url(&self) -> String {
+        format!(
+            "mysql://{}:{}@{}:{}/{}",
+            self.user, self.pass, self.host, self.port, self.db,
+        )
+    }
+}
