@@ -134,11 +134,11 @@ jobs:
         if: github.event.inputs.source_type != 'mysql' && github.event.inputs.runner_type != 'spiceai-dev-xlarge-runners'
         uses: ./.github/actions/setup-chbench-postgres
 
-      # MySQL source: always an ephemeral per-run docker container on the runner
-      # (loopback). There's no shared in-cluster MySQL pod / template cache yet,
-      # so this runs on every runner type and the run below seeds normally.
+      # MySQL source: on spiceai-dev-xlarge-runners a dedicated in-cluster MySQL
+      # pod is used (chbench-mysql.dataplatform.svc.cluster.local, like Postgres),
+      # so skip the local docker MySQL there.
       - name: Setup CH-benCH MySQL
-        if: github.event.inputs.source_type == 'mysql'
+        if: github.event.inputs.source_type == 'mysql' && github.event.inputs.runner_type != 'spiceai-dev-xlarge-runners'
         uses: ./.github/actions/setup-chbench-mysql
 
       # The xlarge PG pod is long-lived, so cache a pristine seed as a Postgres
@@ -221,8 +221,8 @@ jobs:
           SPICED_COMMIT: ${{ steps.setup-spiced.outputs.SPICED_COMMIT }}
           # Dedicated in-cluster PG pod on xlarge; per-run docker container (loopback) elsewhere.
           CHBENCH_PG_HOST: ${{ github.event.inputs.runner_type == 'spiceai-dev-xlarge-runners' && 'chbench-postgres.dataplatform.svc.cluster.local' || '127.0.0.1' }}
-          # MySQL source is always the per-run docker container on loopback (used only when source_type=mysql).
-          CHBENCH_MYSQL_HOST: '127.0.0.1'
+          # Dedicated in-cluster MySQL pod on xlarge; per-run docker container (loopback) elsewhere. Used only when source_type=mysql.
+          CHBENCH_MYSQL_HOST: ${{ github.event.inputs.runner_type == 'spiceai-dev-xlarge-runners' && 'chbench-mysql.dataplatform.svc.cluster.local' || '127.0.0.1' }}
           # MinIO credentials for spiced, mirroring testoperator_run_bench.yml. Consumed only by
           # configs that reference the local S3 (`${secrets:S3_ENDPOINT}` etc.) — e.g. the Cayenne
           # cold-object-store-tier chbench config; harmless/unused for every other HTAP config.
@@ -246,7 +246,7 @@ jobs:
       # behind. testoperator already drops its tables/publication at the start of
       # the next run, but inactive slots are not covered by that.
       - name: Clean up PG replication slots
-        if: always() && github.event.inputs.runner_type == 'spiceai-dev-xlarge-runners'
+        if: always() && github.event.inputs.source_type != 'mysql' && github.event.inputs.runner_type == 'spiceai-dev-xlarge-runners'
         env:
           CHBENCH_PG_HOST: chbench-postgres.dataplatform.svc.cluster.local
           CHBENCH_PG_PORT: '5432'
