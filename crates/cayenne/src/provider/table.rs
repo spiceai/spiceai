@@ -11315,21 +11315,16 @@ impl CayenneTableProvider {
     /// publish (the output is not yet query-visible, so the dropped pages race
     /// no reader). Never fails — a cache hint must not abort a compaction.
     async fn evict_compaction_output_pages(&self, snapshot_id: &str) {
-        // On the network-attached (EBS) tier the custom writer is installed and
-        // drops each output's pages itself in `finish` (holding the just-written
-        // fd, knowing whether O_DIRECT kept them out of cache), so re-opening and
-        // re-hinting here would be redundant — defer to it. On every other tier
-        // the writer is NOT installed, so this external eviction is the one that
-        // runs. Mirrors the install predicate (`use_direct_writer_for`); this is
-        // the local compaction-publish path. (A rare per-output writer-setup
-        // fallback to the inner store forgoes the self-evict; best-effort.)
-        if super::compaction_writer::use_direct_writer_for(
-            self.context.data_storage_class(),
-            super::delta_encoding::WriteClass::Maintenance,
-            &self.table_metadata.path,
-        ) {
-            return;
-        }
+        // Runs on EVERY tier as the safety net. On the network-attached (EBS) tier
+        // the custom writer already self-evicts each output in `finish` (holding
+        // the just-written fd), so this external pass is a cheap backstop there —
+        // an O_DIRECT output has ~0 resident pages, so the DONTNEED hint walks
+        // almost nothing. It is deliberately NOT skipped on that tier: a per-output
+        // writer-setup (or session-context) fallback to the inner LocalFileSystem
+        // writer leaves that output buffered and un-self-evicted, and skipping here
+        // would reintroduce the scan-under-compaction cache pressure this guards
+        // against. Cheap redundancy on the fast path buys correctness on the
+        // fallback path.
         let files = match self.list_snapshot_files_with_sizes_local(snapshot_id).await {
             Ok(files) => files,
             Err(error) => {

@@ -493,6 +493,37 @@ mod linux_impl {
         file.sync_all()
     }
 
+    /// A `BLOCK`-aligned heap buffer for the O_DIRECT probe, freed on `Drop` so an
+    /// early `?` on a write error can never leak it. The bench-crate analog of the
+    /// production `AlignedBuf` (which is `pub(crate)` and unreachable from here).
+    struct AlignedProbeBuf {
+        ptr: *mut u8,
+        layout: std::alloc::Layout,
+        cap: usize,
+    }
+
+    impl AlignedProbeBuf {
+        fn new(cap: usize, align: usize) -> Self {
+            let layout = std::alloc::Layout::from_size_align(cap, align).expect("aligned layout");
+            // SAFETY: non-zero cap; null-checked below.
+            let ptr = unsafe { std::alloc::alloc_zeroed(layout) };
+            assert!(!ptr.is_null(), "aligned alloc failed");
+            Self { ptr, layout, cap }
+        }
+
+        fn as_mut_slice(&mut self) -> &mut [u8] {
+            // SAFETY: `ptr` owns `cap` zeroed, writable bytes for our lifetime.
+            unsafe { std::slice::from_raw_parts_mut(self.ptr, self.cap) }
+        }
+    }
+
+    impl Drop for AlignedProbeBuf {
+        fn drop(&mut self) {
+            // SAFETY: `ptr`/`layout` are exactly what `alloc_zeroed` returned in `new`.
+            unsafe { std::alloc::dealloc(self.ptr, self.layout) };
+        }
+    }
+
     /// Mirror of `compaction_writer`'s O_DIRECT finalize: aligned writes through a
     /// 4 MiB bounce buffer, pad the tail to a block, `ftruncate` to the exact
     /// length, then `fsync`. Returns `Ok(false)` if the filesystem rejects
@@ -514,12 +545,10 @@ mod linux_impl {
             Err(e) => return Err(e),
         };
         prealloc(&file, size as u64);
-        let layout = std::alloc::Layout::from_size_align(CAP, BLOCK).expect("aligned layout");
-        // SAFETY: non-zero CAP; deallocated with the same layout below.
-        let ptr = unsafe { std::alloc::alloc_zeroed(layout) };
-        assert!(!ptr.is_null(), "aligned alloc failed");
-        // SAFETY: `ptr` owns CAP zeroed, writable bytes for the scope below.
-        let buf = unsafe { std::slice::from_raw_parts_mut(ptr, CAP) };
+        // RAII: the aligned buffer frees on Drop, so the `?`s below can early-return
+        // on a write/fsync error without leaking it.
+        let mut aligned = AlignedProbeBuf::new(CAP, BLOCK);
+        let buf = aligned.as_mut_slice();
         let chunk: Vec<u8> = (0..CAP).map(|i| (i % 251) as u8).collect();
         let mut offset = 0u64;
         let mut written = 0usize;
@@ -538,10 +567,9 @@ mod linux_impl {
             }
             written += n;
         }
-        let result = file.set_len(size as u64).and_then(|()| file.sync_all());
-        // SAFETY: same ptr/layout as the allocation; `buf` is not used past here.
-        unsafe { std::alloc::dealloc(ptr, layout) };
-        result.map(|()| true)
+        file.set_len(size as u64)?;
+        file.sync_all()?;
+        Ok(true)
     }
 
     /// The publish half of the writer's `finish`: atomic rename + parent-dir fsync
@@ -626,7 +654,13 @@ mod linux_impl {
                     for _ in 0..iters {
                         let _ = std::fs::remove_file(&dest_d);
                         let start = Instant::now();
-                        black_box(write_odirect_staging(&staging_d, size).expect("odirect write"));
+                        // If the filesystem rejects O_DIRECT (EINVAL → Ok(false)), no
+                        // staging file was written; fall back to the buffered writer
+                        // (mirrors the production writer) so `publish` has a file to
+                        // rename instead of panicking on a missing staging path.
+                        if !write_odirect_staging(&staging_d, size).expect("odirect write") {
+                            write_buffered_staging(&staging_d, size).expect("buffered fallback");
+                        }
                         publish(&staging_d, &dest_d).expect("publish");
                         elapsed += start.elapsed();
                     }
