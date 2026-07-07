@@ -39,7 +39,6 @@ limitations under the License.
 //! invariant violation and is reported loudly rather than papered over
 //! with a silent late init.
 
-use std::any::Any;
 use std::sync::Arc;
 
 use arrow::datatypes::SchemaRef;
@@ -173,10 +172,6 @@ impl std::fmt::Debug for DatasetTableProvider {
 
 #[async_trait]
 impl TableProvider for DatasetTableProvider {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema(&self) -> SchemaRef {
         Arc::clone(&self.schema)
     }

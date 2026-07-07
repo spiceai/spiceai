@@ -79,6 +79,7 @@ on:
         options:
           - 'spiceai-dev-runners'
           - 'spiceai-dev-large-runners'
+          - 'spiceai-dev-xlarge-runners'
       scale_factor:
         description: 'Scale factor for the benchmark'
         required: false
@@ -113,7 +114,7 @@ jobs:
           MSSQL_SA_PASSWORD: S3cretP@ssw0rd
           DB_NAME: tpch_sf1
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
       - name: Set up Rust toolchain
         uses: ./.github/actions/setup-rust
@@ -139,7 +140,13 @@ jobs:
         run: |
           query_set="${{ github.event.inputs.query_set }}"
           query_set="${query_set%%\[*\]*}"
-          SPICEPOD_PATH="./test/spicepods/${query_set}/sf${{ github.event.inputs.scale_factor }}/${{ github.event.inputs.spicepod_path }}"
+
+          if [ "${query_set}" = "chbench" ]; then
+            SPICEPOD_PATH="./test/spicepods/${query_set}/${{ github.event.inputs.spicepod_path }}"
+          else
+            SPICEPOD_PATH="./test/spicepods/${query_set}/sf${{ github.event.inputs.scale_factor }}/${{ github.event.inputs.spicepod_path }}"
+          fi
+
           echo "SPICEPOD_PATH=${SPICEPOD_PATH}" >> $GITHUB_OUTPUT
 
       - name: Validate spicepod file exists
@@ -213,7 +220,7 @@ jobs:
 
       - name: Set up Python
         if: ${{ contains(github.event.inputs.spicepod_path, 'scylladb') || contains(github.event.inputs.spicepod_path, 'ducklake') }}
-        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
         with:
           python-version: '3.12'
 
@@ -400,6 +407,7 @@ jobs:
           SCYLLADB_HOST: ${{ contains(github.event.inputs.spicepod_path, 'scylladb') && '127.0.0.1' || '' }}
           SCYLLADB_PORT: ${{ contains(github.event.inputs.spicepod_path, 'scylladb') && '9042' || '' }}
           SCYLLADB_KEYSPACE: ${{ contains(github.event.inputs.spicepod_path, 'scylladb') && 'tpch_sf1' || '' }}
+          CHBENCH_PG_HOST: 127.0.0.1
 
       - name: Run the benchmark test (with overrides) - ${{ github.event.inputs.spicepod_path }}
         if: ${{ github.event.inputs.query_overrides != '' }}
@@ -478,6 +486,7 @@ jobs:
           SCYLLADB_HOST: ${{ contains(github.event.inputs.spicepod_path, 'scylladb') && '127.0.0.1' || '' }}
           SCYLLADB_PORT: ${{ contains(github.event.inputs.spicepod_path, 'scylladb') && '9042' || '' }}
           SCYLLADB_KEYSPACE: ${{ contains(github.event.inputs.spicepod_path, 'scylladb') && 'tpch_sf1' || '' }}
+          CHBENCH_PG_HOST: 127.0.0.1
 
       - name: Install GH CLI
         if: steps.determine_update_snapshots.outputs.update_snapshots == 'always'

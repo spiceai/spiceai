@@ -22,7 +22,6 @@ use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, ExecutionPlanProperties, Partitioning,
     PlanProperties,
 };
-use std::any::Any;
 use std::fmt;
 use std::sync::Arc;
 
@@ -32,7 +31,7 @@ pub struct SliceExec {
     input: Arc<dyn ExecutionPlan>,
     /// The partition of the execution plan to return.
     partition: usize,
-    properties: PlanProperties,
+    properties: Arc<PlanProperties>,
 }
 
 impl SliceExec {
@@ -44,12 +43,12 @@ impl SliceExec {
         Self {
             input,
             partition,
-            properties: PlanProperties::new(
+            properties: Arc::new(PlanProperties::new(
                 eq_properties,
                 Partitioning::UnknownPartitioning(1),
                 emission_type,
                 boundedness,
-            ),
+            )),
         }
     }
 }
@@ -72,15 +71,11 @@ impl ExecutionPlan for SliceExec {
         "SliceExec"
     }
 
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema(&self) -> SchemaRef {
         self.input.schema()
     }
 
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
     }
 

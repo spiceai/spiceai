@@ -31,7 +31,7 @@ use tempfile::TempDir;
 
 use crate::{
     configure_test_datafusion, init_tracing, run_query_and_check_results,
-    utils::test_request_context,
+    utils::{register_test_connectors, test_request_context},
 };
 
 /// Returns `true` when the `git` CLI is available on `PATH`.
@@ -39,8 +39,7 @@ fn git_available() -> bool {
     Command::new("git")
         .arg("--version")
         .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
+        .is_ok_and(|o| o.status.success())
 }
 
 /// Initialize a local git repository with a small, deterministic file set so
@@ -125,11 +124,12 @@ async fn git_connector_local_repo_lists_files() -> Result<(), anyhow::Error> {
                 .build();
 
             configure_test_datafusion();
+            register_test_connectors().await;
             let mut rt = Runtime::builder().with_app(app).build().await;
             let cloned_rt = Arc::new(rt.clone());
 
             tokio::select! {
-                () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+                () = tokio::time::sleep(std::time::Duration::from_mins(1)) => {
                     return Err(anyhow::anyhow!("Timed out waiting for datasets to load"));
                 }
                 () = cloned_rt.load_components() => {}
@@ -185,11 +185,12 @@ async fn git_connector_local_repo_include_glob() -> Result<(), anyhow::Error> {
                 .build();
 
             configure_test_datafusion();
+            register_test_connectors().await;
             let mut rt = Runtime::builder().with_app(app).build().await;
             let cloned_rt = Arc::new(rt.clone());
 
             tokio::select! {
-                () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+                () = tokio::time::sleep(std::time::Duration::from_mins(1)) => {
                     return Err(anyhow::anyhow!("Timed out waiting for datasets to load"));
                 }
                 () = cloned_rt.load_components() => {}

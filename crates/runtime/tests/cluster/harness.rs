@@ -370,7 +370,7 @@ impl ClusterHarnessBuilder {
         }));
 
         tokio::select! {
-            () = tokio::time::sleep(Duration::from_secs(60)) => {
+            () = tokio::time::sleep(Duration::from_mins(1)) => {
                 return Err(anyhow::Error::msg("Timed out waiting for scheduler to start"));
             }
             () = Arc::clone(&scheduler_rt).load_components() => {}
@@ -490,7 +490,7 @@ async fn start_executor(
     });
 
     tokio::select! {
-        () = tokio::time::sleep(Duration::from_secs(60)) => {
+        () = tokio::time::sleep(Duration::from_mins(1)) => {
             return Err(anyhow::Error::msg(format!(
                 "Timed out waiting for {label} to start"
             )));

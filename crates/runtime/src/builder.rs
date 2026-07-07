@@ -57,6 +57,40 @@ use util::{in_tracing_context, in_tracing_context_async};
 type DatafusionConfigurationCallback = fn(&mut DataFusion);
 
 const CAYENNE_FOOTER_CACHE_MB_PARAM: &str = "cayenne_footer_cache_mb";
+const CAYENNE_SORT_MERGE_MIN_ROWS_PARAM: &str = "cayenne_sort_merge_min_rows";
+const CAYENNE_SORT_MERGE_MEMORY_POOL_FRACTION_PARAM: &str =
+    "cayenne_sort_merge_memory_pool_fraction";
+const CAYENNE_FILTER_PROPAGATION_PARAM: &str = "cayenne_filter_propagation";
+const CAYENNE_OPTIMIZER_RULES_PARAM: &str = "cayenne_optimizer_rules";
+
+/// Goal-driven adaptive-tuning SLO setpoints, settable GLOBALLY here at
+/// `runtime.params` and overridden per-dataset via the matching
+/// `acceleration.params` key (see `dataaccelerator::cayenne`). `cayenne_goal_qph`
+/// is the exception: QPH is a system-wide metric (a join spans datasets), so it
+/// is global-only and a per-dataset value is ignored. Declared here so the keys
+/// are part of the recognized `runtime.params` vocabulary and don't false-warn as
+/// unknown; the values are resolved (and validated) where the per-dataset Cayenne
+/// config is built. NOTE: `cayenne_goal_convergence_window` is deliberately NOT
+/// here — it paces HOW the loop chases these SLOs (a control-cadence/benchmarking
+/// knob), not a target outcome, so it stays a per-dataset advanced override.
+const CAYENNE_GOAL_REPLICATION_LAG_PARAM: &str = "cayenne_goal_replication_lag";
+const CAYENNE_GOAL_FRESHNESS_PARAM: &str = "cayenne_goal_freshness";
+const CAYENNE_GOAL_QUERY_LATENCY_PARAM: &str = "cayenne_goal_query_latency";
+const CAYENNE_GOAL_QPH_PARAM: &str = "cayenne_goal_qph";
+
+/// Process-global `SQLite` metastore pragma tuning keys (cache, mmap, busy
+/// timeout, WAL autocheckpoint, `auto_vacuum`). Consumed once at startup in
+/// `build_internal`; declared here so they're part of the recognized
+/// `runtime.params` vocabulary and don't false-warn as unknown.
+const CAYENNE_METASTORE_CACHE_MB_PARAM: &str = "cayenne_metastore_cache_mb";
+const CAYENNE_METASTORE_MMAP_MB_PARAM: &str = "cayenne_metastore_mmap_mb";
+const CAYENNE_METASTORE_BUSY_TIMEOUT_MS_PARAM: &str = "cayenne_metastore_busy_timeout_ms";
+const CAYENNE_METASTORE_WAL_AUTOCHECKPOINT_PAGES_PARAM: &str =
+    "cayenne_metastore_wal_autocheckpoint_pages";
+const CAYENNE_METASTORE_WAL_TRUNCATE_THRESHOLD_MB_PARAM: &str =
+    "cayenne_metastore_wal_truncate_threshold_mb";
+const CAYENNE_METASTORE_AUTO_VACUUM_PARAM: &str = "cayenne_metastore_auto_vacuum";
+
 /// Runtime param: fraction of `runtime.query.memory_limit` carved into a
 /// dedicated Cayenne compaction memory pool when Cayenne acceleration is
 /// configured on a dataset and dedicated thread pools are enabled.
@@ -66,6 +100,65 @@ const CAYENNE_COMPACTION_MEMORY_FRACTION_PARAM: &str = "cayenne_compaction_memor
 const DEFAULT_COMPACTION_MEMORY_FRACTION: f64 = 0.2;
 const MIN_COMPACTION_MEMORY_FRACTION: f64 = 0.05;
 const MAX_COMPACTION_MEMORY_FRACTION: f64 = 0.9;
+
+/// `runtime.params` keys with a `cayenne_` prefix that the runtime recognizes.
+const KNOWN_CAYENNE_RUNTIME_PARAMS: &[&str] = &[
+    CAYENNE_FOOTER_CACHE_MB_PARAM,
+    CAYENNE_SORT_MERGE_MIN_ROWS_PARAM,
+    CAYENNE_SORT_MERGE_MEMORY_POOL_FRACTION_PARAM,
+    CAYENNE_FILTER_PROPAGATION_PARAM,
+    CAYENNE_OPTIMIZER_RULES_PARAM,
+    CAYENNE_COMPACTION_MEMORY_FRACTION_PARAM,
+    CAYENNE_METASTORE_CACHE_MB_PARAM,
+    CAYENNE_METASTORE_MMAP_MB_PARAM,
+    CAYENNE_METASTORE_BUSY_TIMEOUT_MS_PARAM,
+    CAYENNE_METASTORE_WAL_AUTOCHECKPOINT_PAGES_PARAM,
+    CAYENNE_METASTORE_WAL_TRUNCATE_THRESHOLD_MB_PARAM,
+    CAYENNE_METASTORE_AUTO_VACUUM_PARAM,
+    CAYENNE_GOAL_REPLICATION_LAG_PARAM,
+    CAYENNE_GOAL_FRESHNESS_PARAM,
+    CAYENNE_GOAL_QUERY_LATENCY_PARAM,
+    CAYENNE_GOAL_QPH_PARAM,
+];
+
+/// Recognized `runtime.params` keys that don't belong to a larger prefix
+/// family (the family lists live next to the code that consumes them:
+/// `KNOWN_CAYENNE_RUNTIME_PARAMS`, `changes::CDC_RUNTIME_PARAMS`,
+/// `http_rate_control::HTTP_RATE_CONTROL_RUNTIME_PARAMS`,
+/// `cluster::CLUSTER_GRPC_RUNTIME_PARAMS`).
+const MISC_RUNTIME_PARAMS: &[&str] = &[
+    "url_tables",
+    "geo",
+    "parquet_page_index",
+    "dedicated_thread_pool",
+    "shuffle_location",
+    "shuffle_format",
+    "github_max_concurrent_connections",
+];
+
+/// The complete set of `runtime.params` keys the runtime recognizes, gathered
+/// from every consuming subsystem's authoritative list. Used to validate the
+/// `runtime.params` section at startup: any key not in this set is a typo or
+/// unsupported option and gets a "did you mean" warning scoped to this
+/// section's vocabulary. See spiceai/spiceai#10970.
+///
+/// When adding a new `runtime.params` key, extend the owning family's list
+/// (or `MISC_RUNTIME_PARAMS`) so it is recognized here.
+fn known_runtime_params() -> Vec<&'static str> {
+    let mut known = Vec::with_capacity(
+        KNOWN_CAYENNE_RUNTIME_PARAMS.len()
+            + crate::accelerated_table::refresh_task::changes::CDC_RUNTIME_PARAMS.len()
+            + dataconnector::http_rate_control::HTTP_RATE_CONTROL_RUNTIME_PARAMS.len()
+            + crate::cluster::CLUSTER_GRPC_RUNTIME_PARAMS.len()
+            + MISC_RUNTIME_PARAMS.len(),
+    );
+    known.extend_from_slice(KNOWN_CAYENNE_RUNTIME_PARAMS);
+    known.extend_from_slice(crate::accelerated_table::refresh_task::changes::CDC_RUNTIME_PARAMS);
+    known.extend_from_slice(dataconnector::http_rate_control::HTTP_RATE_CONTROL_RUNTIME_PARAMS);
+    known.extend_from_slice(crate::cluster::CLUSTER_GRPC_RUNTIME_PARAMS);
+    known.extend_from_slice(MISC_RUNTIME_PARAMS);
+    known
+}
 
 pub struct RuntimeBuilder {
     app: Option<Arc<app::App>>,
@@ -88,6 +181,7 @@ pub struct RuntimeBuilder {
 }
 
 impl RuntimeBuilder {
+    #[must_use]
     pub fn new() -> Self {
         RuntimeBuilder {
             app: None,
@@ -110,27 +204,32 @@ impl RuntimeBuilder {
         }
     }
 
+    #[must_use]
     pub fn with_app(mut self, app: app::App) -> Self {
         self.app = Some(Arc::new(app));
         self
     }
 
+    #[must_use]
     pub fn with_app_opt(mut self, app: Option<Arc<app::App>>) -> Self {
         self.app = app;
         self
     }
 
+    #[must_use]
     pub fn with_runtime_config(mut self, config: Config) -> Self {
         self.runtime_config = Arc::new(config);
         self
     }
 
+    #[must_use]
     pub fn with_extensions(mut self, extensions: Vec<Box<dyn ExtensionFactory>>) -> Self {
         self.extensions = extensions;
         self
     }
 
     /// Extensions that will be automatically loaded if a component requests them and the user hasn't explicitly loaded it.
+    #[must_use]
     pub fn with_autoload_extensions(
         mut self,
         extensions: HashMap<String, Box<dyn ExtensionFactory>>,
@@ -139,16 +238,19 @@ impl RuntimeBuilder {
         self
     }
 
+    #[must_use]
     pub fn with_pods_watcher(mut self, pods_watcher: podswatcher::PodsWatcher) -> Self {
         self.pods_watcher = Some(pods_watcher);
         self
     }
 
+    #[must_use]
     pub fn with_datasets_health_monitor(mut self) -> Self {
         self.datasets_health_monitor_enabled = true;
         self
     }
 
+    #[must_use]
     pub fn with_metrics_server(
         mut self,
         metrics_endpoint: SocketAddr,
@@ -159,6 +261,7 @@ impl RuntimeBuilder {
         self
     }
 
+    #[must_use]
     pub fn with_metrics_server_opt(
         mut self,
         metrics_endpoint: Option<SocketAddr>,
@@ -169,16 +272,19 @@ impl RuntimeBuilder {
         self
     }
 
+    #[must_use]
     pub fn with_rate_limits(mut self, rate_limits: RateLimits) -> Self {
         self.rate_limits = Some(Arc::new(rate_limits));
         self
     }
 
+    #[must_use]
     pub fn with_io_runtime(mut self, io_runtime: Handle) -> Self {
         self.io_runtime = Some(io_runtime);
         self
     }
 
+    #[must_use]
     pub fn with_resolved_cluster_config(
         mut self,
         resolved_cluster_config: ResolvedClusterConfig,
@@ -190,6 +296,7 @@ impl RuntimeBuilder {
     /// Sets a `SetOnce` handle that will be resolved with the spicepod
     /// `TelemetryConfig` once it is available.  For executors, this is set
     /// after the app definition is fetched from the scheduler.
+    #[must_use]
     pub fn with_telemetry_config(
         mut self,
         telemetry_config: Arc<tokio::sync::SetOnce<TelemetryConfig>>,
@@ -203,6 +310,7 @@ impl RuntimeBuilder {
     /// This reader is used by:
     /// - `GetMetrics` RPC to return local metrics to peer schedulers
     /// - Executors responding to metrics requests from schedulers via control stream
+    #[must_use]
     pub fn with_metrics_reader(mut self, metrics_reader: MetricsReader) -> Self {
         self.metrics_reader = Some(metrics_reader);
         self
@@ -232,6 +340,7 @@ impl RuntimeBuilder {
 
         let memory_limit = parse_memory_limit(query.memory_limit.clone());
         let target_partitions = query.target_partitions;
+        let max_concurrent_queries = query.max_concurrent_queries;
 
         let metrics = spicepod_rt.metrics.clone();
 
@@ -252,14 +361,25 @@ impl RuntimeBuilder {
         // URL tables are opt-in via `runtime.params.url_tables=enabled`
         let url_tables_enabled =
             spicepod_rt.params.get("url_tables").map(String::as_str) == Some("enabled");
+        warn_on_unknown_runtime_params(&spicepod_rt.params);
         let cayenne_sort_merge_min_rows =
-            parse_usize_runtime_param(&spicepod_rt.params, "cayenne_sort_merge_min_rows");
+            parse_usize_runtime_param(&spicepod_rt.params, CAYENNE_SORT_MERGE_MIN_ROWS_PARAM);
+        log_applied_cayenne_param(
+            CAYENNE_SORT_MERGE_MIN_ROWS_PARAM,
+            cayenne_sort_merge_min_rows,
+        );
         let cayenne_sort_merge_memory_pool_fraction = parse_f64_runtime_param(
             &spicepod_rt.params,
-            "cayenne_sort_merge_memory_pool_fraction",
+            CAYENNE_SORT_MERGE_MEMORY_POOL_FRACTION_PARAM,
+        );
+        log_applied_cayenne_param(
+            CAYENNE_SORT_MERGE_MEMORY_POOL_FRACTION_PARAM,
+            cayenne_sort_merge_memory_pool_fraction,
         );
         let cayenne_footer_cache_mb =
             parse_usize_runtime_param(&spicepod_rt.params, CAYENNE_FOOTER_CACHE_MB_PARAM);
+        log_applied_cayenne_param(CAYENNE_FOOTER_CACHE_MB_PARAM, cayenne_footer_cache_mb);
+        let cayenne_filter_propagation = parse_cayenne_filter_propagation(&spicepod_rt.params);
 
         // Process-global SQLite metastore pragma tuning (cache, mmap, busy
         // timeout, WAL autocheckpoint, auto_vacuum). Applied once at startup;
@@ -268,30 +388,39 @@ impl RuntimeBuilder {
         {
             let mut metastore_cfg = cayenne::SqliteMetastoreConfig::default();
             if let Some(v) =
-                parse_usize_runtime_param(&spicepod_rt.params, "cayenne_metastore_cache_mb")
+                parse_usize_runtime_param(&spicepod_rt.params, CAYENNE_METASTORE_CACHE_MB_PARAM)
             {
                 metastore_cfg.cache_size_mb = v;
             }
             if let Some(v) =
-                parse_usize_runtime_param(&spicepod_rt.params, "cayenne_metastore_mmap_mb")
+                parse_usize_runtime_param(&spicepod_rt.params, CAYENNE_METASTORE_MMAP_MB_PARAM)
             {
                 metastore_cfg.mmap_size_bytes = i64::try_from(v.saturating_mul(1024 * 1024))
                     .unwrap_or(metastore_cfg.mmap_size_bytes);
             }
-            if let Some(v) =
-                parse_usize_runtime_param(&spicepod_rt.params, "cayenne_metastore_busy_timeout_ms")
-            {
+            if let Some(v) = parse_usize_runtime_param(
+                &spicepod_rt.params,
+                CAYENNE_METASTORE_BUSY_TIMEOUT_MS_PARAM,
+            ) {
                 metastore_cfg.busy_timeout_ms =
                     u64::try_from(v).unwrap_or(metastore_cfg.busy_timeout_ms);
             }
             if let Some(v) = parse_usize_runtime_param(
                 &spicepod_rt.params,
-                "cayenne_metastore_wal_autocheckpoint_pages",
+                CAYENNE_METASTORE_WAL_AUTOCHECKPOINT_PAGES_PARAM,
             ) {
                 metastore_cfg.wal_autocheckpoint_pages =
                     u32::try_from(v).unwrap_or(metastore_cfg.wal_autocheckpoint_pages);
             }
-            if let Some(av) = spicepod_rt.params.get("cayenne_metastore_auto_vacuum") {
+            if let Some(v) = parse_usize_runtime_param(
+                &spicepod_rt.params,
+                CAYENNE_METASTORE_WAL_TRUNCATE_THRESHOLD_MB_PARAM,
+            ) {
+                metastore_cfg.wal_truncate_threshold_bytes =
+                    u64::try_from(v.saturating_mul(1024 * 1024))
+                        .unwrap_or(metastore_cfg.wal_truncate_threshold_bytes);
+            }
+            if let Some(av) = spicepod_rt.params.get(CAYENNE_METASTORE_AUTO_VACUUM_PARAM) {
                 metastore_cfg.auto_vacuum = match av.to_lowercase().as_str() {
                     "none" => cayenne::SqliteAutoVacuum::None,
                     "incremental" => cayenne::SqliteAutoVacuum::Incremental,
@@ -308,7 +437,19 @@ impl RuntimeBuilder {
         }
 
         let cayenne_filter_propagation_enabled =
-            parse_cayenne_filter_propagation(&spicepod_rt.params).is_enabled();
+            cayenne_filter_propagation.is_some_and(CayenneFilterPropagation::is_enabled);
+        // Only log "applied" for a value the user validly set; an unset or
+        // invalid value yields `None` (and an invalid value already warned).
+        log_applied_cayenne_param(
+            CAYENNE_FILTER_PROPAGATION_PARAM,
+            cayenne_filter_propagation.map(|propagation| {
+                if propagation.is_enabled() {
+                    "enabled"
+                } else {
+                    "disabled"
+                }
+            }),
+        );
         let cayenne_optimizer_rules =
             parse_cayenne_optimizer_rules(&spicepod_rt.params, cayenne_filter_propagation_enabled);
 
@@ -346,6 +487,15 @@ impl RuntimeBuilder {
                 clamp_cayenne_compaction_memory_fraction(requested)
             });
 
+        // Estimate the off-pool per-table Cayenne CDC cache reservation (keyset /
+        // segment / coalesce / inline, summed over enabled changes-mode Cayenne
+        // tables). The DataFusion builder reduces the query-memory default by the
+        // amount this exceeds the base host/8 headroom, so the query pool + the
+        // in-memory tier + the per-table caches stay within host RAM as the table
+        // count grows.
+        let cayenne_cdc_reservation_bytes =
+            estimate_cayenne_cdc_reservation_bytes(self.app.as_ref(), &spicepod_rt.params);
+
         #[cfg(not(windows))]
         if cayenne_footer_cache_mb.is_some() {
             self.accelerator_engine_registry
@@ -374,7 +524,32 @@ impl RuntimeBuilder {
 
         // Create resource monitor early so it can be passed to DataFusion
         let resource_monitor = crate::resource_monitor::ResourceMonitor::new();
-        let secrets = Arc::new(RwLock::new(Self::load_secrets(self.app.as_ref()).await));
+        let loaded_secrets = Self::load_secrets(self.app.as_ref()).await;
+
+        // Diagnostics-only: resolve every `${ store:key }` reference in the
+        // app up front so secret problems surface as one consolidated report
+        // instead of scattered per-component errors. Skipped on cluster
+        // executors, where secrets resolve via scheduler RPC and the
+        // scheduler has already validated them. Never changes component
+        // loading; never logs secret values.
+        //
+        // Runs on the owned `Secrets` before it is wrapped in the shared
+        // `RwLock` below, so no lock guard is held across the lookups' awaits.
+        // Wrapped in `in_tracing_context_async` for the same reason as
+        // `load_secrets`: this runs before `spiced::init_tracing` installs the
+        // global subscriber, so without a temporary subscriber the summary
+        // would be dropped on the floor.
+        let is_cluster_executor = matches!(
+            self.resolved_cluster_config
+                .as_ref()
+                .and_then(ResolvedClusterConfig::effective_role),
+            Some(ClusterRole::Executor)
+        );
+        if !is_cluster_executor && let Some(app) = self.app.as_ref() {
+            in_tracing_context_async(crate::secrets_preflight::run(app, &loaded_secrets)).await;
+        }
+
+        let secrets = Arc::new(RwLock::new(loaded_secrets));
 
         // Create the shared app reference early so DataFusion, Runtime, and PartitionService share it.
         let shared_app: Arc<RwLock<Option<Arc<App>>>> = Arc::new(RwLock::new(self.app));
@@ -510,6 +685,11 @@ impl RuntimeBuilder {
         )
         .memory_limit(memory_limit)
         .target_partitions(target_partitions)
+        .max_concurrent_queries(max_concurrent_queries)
+        .prefer_hash_join(query.prefer_hash_join)
+        .eager_aggregation(query.eager_aggregation)
+        .eager_aggregation_min_reduction_factor(query.eager_aggregation_min_reduction_factor)
+        .eager_aggregation_max_pushed_groups(query.eager_aggregation_max_pushed_groups)
         .temp_directory(query.temp_directory)
         .spill_compression(query.spill_compression)
         .with_task_history(task_history)
@@ -521,6 +701,7 @@ impl RuntimeBuilder {
         .cayenne_sort_merge_memory_pool_fraction(cayenne_sort_merge_memory_pool_fraction)
         .cayenne_footer_cache_mb(cayenne_footer_cache_mb)
         .compaction_memory_fraction(compaction_memory_fraction)
+        .cayenne_cdc_reservation_bytes(cayenne_cdc_reservation_bytes)
         .cayenne_optimizer_rules(cayenne_optimizer_rules);
 
         if let Some(DistributedNode::Scheduler {
@@ -568,10 +749,8 @@ impl RuntimeBuilder {
             apply_app_lock: Arc::new(tokio::sync::Mutex::new(())),
             df,
             models: Arc::new(RwLock::new(HashMap::new())),
-            completion_llms: Arc::new(RwLock::new(HashMap::new())),
-            model_rate_controllers: Arc::new(RwLock::new(HashMap::new())),
+            llm_runtime_stores: Arc::new(crate::model::LlmRuntimeStores::default()),
             http_rate_control_registry,
-            responses_llms: Arc::new(RwLock::new(HashMap::new())),
             workers: Arc::new(RwLock::new(HashMap::new())),
             embeds: Arc::new(RwLock::new(HashMap::new())),
             rerankers: Arc::new(RwLock::new(HashMap::new())),
@@ -772,6 +951,39 @@ fn parse_memory_limit(memory_limit: Option<String>) -> Option<u64> {
     }
 }
 
+/// Emit an INFO log when a `cayenne_*` runtime tunable parsed successfully so
+/// operators see at startup which override actually took effect. Only logs
+/// when `value` is `Some` (the parser already emits a warning for malformed
+/// values). See spiceai/spiceai#10970.
+fn log_applied_cayenne_param<V: std::fmt::Display>(key: &str, value: Option<V>) {
+    if let Some(value) = value {
+        tracing::info!("Cayenne runtime tunable applied: runtime.params.{key}={value}");
+    }
+}
+
+/// Warn (with a "did you mean" suggestion when close) on any key in the
+/// `runtime.params` section the runtime doesn't recognize, so typos like
+/// `cayenne_footer_cach_mb` or `shuffle_locatin` don't silently leave the
+/// runtime on defaults. Candidates are scoped to the `runtime.params`
+/// section's full vocabulary ([`known_runtime_params`]) so suggestions only
+/// ever point at another valid `runtime.params` key. See
+/// spiceai/spiceai#10970.
+fn warn_on_unknown_runtime_params(params: &HashMap<String, String>) {
+    let known = known_runtime_params();
+    for key in params.keys() {
+        if known.contains(&key.as_str()) {
+            continue;
+        }
+        if let Some(suggestion) = util::levenshtein::closest_match(key, &known) {
+            tracing::warn!(
+                "runtime.params.{key} is not a recognized runtime parameter; did you mean '{suggestion}'? Ignoring."
+            );
+        } else {
+            tracing::warn!("runtime.params.{key} is not a recognized runtime parameter; ignoring.");
+        }
+    }
+}
+
 fn parse_usize_runtime_param(params: &HashMap<String, String>, key: &str) -> Option<usize> {
     let raw = params.get(key)?;
     if raw.eq_ignore_ascii_case("usize::MAX") || raw.eq_ignore_ascii_case("max") {
@@ -787,6 +999,102 @@ fn parse_usize_runtime_param(params: &HashMap<String, String>, key: &str) -> Opt
             None
         }
     }
+}
+
+/// Estimate the aggregate bytes that enabled `refresh_mode: changes` Cayenne tables
+/// reserve OUTSIDE the `DataFusion` query pool: per table, the PK keyset cache +
+/// segment cache + CDC coalesce buffer + inline memtable. Each uses the explicit
+/// per-table param (matching the accelerator's key lists, incl. `cayenne_`-prefixed
+/// aliases) when set, else the accelerator's auto-derived cap (mirroring
+/// `dataaccelerator::cayenne::autotune::HardwareProfile` — keep the fractions in
+/// sync). The globally coordinated in-memory tier and the virtual (non-resident)
+/// metastore mmap are intentionally excluded: the tier is already capped at host/5
+/// and the mmap is page-cache-backed. Returns 0 when no changes-mode Cayenne table
+/// is configured, which disables the query-pool reduction.
+fn estimate_cayenne_cdc_reservation_bytes(
+    app: Option<&Arc<app::App>>,
+    runtime_params: &HashMap<String, String>,
+) -> u64 {
+    const MIB: u64 = 1024 * 1024;
+    const GIB: u64 = 1024 * MIB;
+    // Auto-derived per-table cap fractions (mirror of the accelerator's autotune).
+    const KEYSET_CACHE_HOST_FRACTION: u64 = 32; // ~1/32 host, clamped [256 MiB, 8 GiB]
+    const SEGMENT_CACHE_HOST_FRACTION: u64 = 128; // ~1/128 host, clamped [256 MiB, 1 GiB]
+    const DEFAULT_COALESCE_BYTES: u64 = 128 * MIB;
+    const DEFAULT_INLINE_BYTES: u64 = 8 * MIB;
+
+    // Parse the first matching key as a trimmed u64 (params may carry whitespace,
+    // matching the rest of the runtime/dataset param parsing).
+    fn parse_u64(map: &HashMap<String, String>, keys: &[&str]) -> Option<u64> {
+        keys.iter()
+            .find_map(|k| map.get(*k))
+            .and_then(|v| v.trim().parse::<u64>().ok())
+    }
+
+    let Some(app) = app else {
+        return 0;
+    };
+    let total_memory = crate::resource_monitor::get_total_memory();
+    // Global CDC coalesce-buffer size (default 128 MiB); a per-dataset
+    // `cdc_max_coalesced_bytes` overlays it per table (see `cdc_config_overlay`).
+    let global_coalesce_bytes =
+        parse_u64(runtime_params, &["cdc_max_coalesced_bytes"]).unwrap_or(DEFAULT_COALESCE_BYTES);
+
+    let mut total: u64 = 0;
+    for dataset in &app.datasets {
+        let Some(accel) = dataset.acceleration.as_ref() else {
+            continue;
+        };
+        if !accel.enabled
+            || !accel
+                .engine
+                .as_deref()
+                .is_some_and(|engine| engine.eq_ignore_ascii_case("cayenne"))
+            || accel.refresh_mode != Some(spicepod::acceleration::RefreshMode::Changes)
+        {
+            continue;
+        }
+        let params = accel
+            .params
+            .as_ref()
+            .map(spicepod::param::Params::as_string_map)
+            .unwrap_or_default();
+        // MB-valued cache params -> bytes; else the accelerator's auto host-fraction cap.
+        let keyset = parse_u64(
+            &params,
+            &["cayenne_pk_keyset_cache_mb", "pk_keyset_cache_mb"],
+        )
+        .map_or_else(
+            || (total_memory / KEYSET_CACHE_HOST_FRACTION).clamp(256 * MIB, 8 * GIB),
+            |mb| mb.saturating_mul(MIB),
+        );
+        let segment = parse_u64(&params, &["cayenne_segment_cache_mb", "segment_cache_mb"])
+            .map_or_else(
+                || (total_memory / SEGMENT_CACHE_HOST_FRACTION).clamp(256 * MIB, GIB),
+                |mb| mb.saturating_mul(MIB),
+            );
+        // Inline memtable is byte-valued; match the accelerator's key list including
+        // the `cayenne_`-prefixed aliases (see dataaccelerator::cayenne mod.rs).
+        let inline = parse_u64(
+            &params,
+            &[
+                "cayenne_inline_flush_max_bytes",
+                "inline_flush_max_bytes",
+                "cayenne_inline_memtable_max_bytes",
+                "inline_memtable_max_bytes",
+            ],
+        )
+        .unwrap_or(DEFAULT_INLINE_BYTES);
+        // Per-dataset coalesce override wins over the global (mirrors cdc_config_overlay).
+        let coalesce =
+            parse_u64(&params, &["cdc_max_coalesced_bytes"]).unwrap_or(global_coalesce_bytes);
+        total = total
+            .saturating_add(keyset)
+            .saturating_add(segment)
+            .saturating_add(coalesce)
+            .saturating_add(inline);
+    }
+    total
 }
 
 fn parse_f64_runtime_param(params: &HashMap<String, String>, key: &str) -> Option<f64> {
@@ -821,9 +1129,6 @@ fn clamp_cayenne_compaction_memory_fraction(value: f64) -> f64 {
     clamped
 }
 
-const CAYENNE_FILTER_PROPAGATION_PARAM: &str = "cayenne_filter_propagation";
-const CAYENNE_OPTIMIZER_RULES_PARAM: &str = "cayenne_optimizer_rules";
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CayenneFilterPropagation {
     Disabled,
@@ -836,19 +1141,24 @@ impl CayenneFilterPropagation {
     }
 }
 
-fn parse_cayenne_filter_propagation(params: &HashMap<String, String>) -> CayenneFilterPropagation {
-    let Some(raw) = params.get(CAYENNE_FILTER_PROPAGATION_PARAM) else {
-        return CayenneFilterPropagation::Disabled;
-    };
+/// Parse the Cayenne filter-propagation tunable. Returns `None` when the key is
+/// unset or holds an invalid value (in which case the effective behavior is
+/// `Disabled` and an invalid value warns) — mirroring [`parse_usize_runtime_param`]
+/// /[`parse_f64_runtime_param`], so callers only log "applied" for a value the
+/// user validly set.
+fn parse_cayenne_filter_propagation(
+    params: &HashMap<String, String>,
+) -> Option<CayenneFilterPropagation> {
+    let raw = params.get(CAYENNE_FILTER_PROPAGATION_PARAM)?;
 
     match raw.trim().to_ascii_lowercase().as_str() {
-        "enabled" => CayenneFilterPropagation::Enabled,
-        "disabled" => CayenneFilterPropagation::Disabled,
+        "enabled" => Some(CayenneFilterPropagation::Enabled),
+        "disabled" => Some(CayenneFilterPropagation::Disabled),
         _ => {
             tracing::warn!(
                 "runtime.params.{CAYENNE_FILTER_PROPAGATION_PARAM}={raw:?} must be 'enabled' or 'disabled'; using disabled"
             );
-            CayenneFilterPropagation::Disabled
+            None
         }
     }
 }
@@ -898,14 +1208,31 @@ fn parse_cayenne_optimizer_rules(
             "semi_join_pushdown" | "push_down_semi_join" | "semi_join" => {
                 rules.set_semi_join_pushdown(true);
             }
+            "join_reorder" | "reorder_join" | "join_ordering" => {
+                rules.set_join_reorder(true);
+            }
             "dynamic_filter_sharing" | "dynamic_filters" => {
                 rules.set_dynamic_filter_sharing(true);
+            }
+            "maintained_aggregate"
+            | "maintained_aggregates"
+            | "cdc_aggregate"
+            | "cdc_aggregates" => {
+                rules.set_maintained_aggregate(true);
             }
             "anti_join_sort_merge" | "anti_sort_merge" => {
                 rules.set_anti_join_sort_merge(true);
             }
+            // Opt-in: restores the Cayenne `ExactLeftAccumulator` join rewrite
+            // (`CayenneJoinRewriter`). Off by default — the default path uses
+            // DataFusion 53's native inner-join hash-join dynamic-filter pushdown
+            // (min/max bounds + InList/hash-table membership). Naming this rule
+            // re-enables the forked exact in-list accumulator alongside it.
             "exact_join_filter" | "join_rewriter" | "exact_accumulator" => {
                 rules.set_exact_join_filter(true);
+            }
+            "stats_aggregate" | "metadata_aggregate" | "aggregate_pushdown" => {
+                rules.set_stats_aggregate(true);
             }
             _ => {
                 // Don't discard the rest of an explicit list because of one bad
@@ -1023,6 +1350,55 @@ mod test {
     }
 
     #[test]
+    fn known_runtime_params_covers_every_family() {
+        // The section vocabulary must include *every* key from *every* family
+        // that feeds it — not just a representative key — so a future addition
+        // to any family list (e.g. a new `cayenne_*` tunable) can't silently
+        // fall out of the merged vocabulary and false-warn on a valid key.
+        let known = known_runtime_params();
+        let family_keys = KNOWN_CAYENNE_RUNTIME_PARAMS
+            .iter()
+            .chain(crate::accelerated_table::refresh_task::changes::CDC_RUNTIME_PARAMS)
+            .chain(dataconnector::http_rate_control::HTTP_RATE_CONTROL_RUNTIME_PARAMS)
+            .chain(MISC_RUNTIME_PARAMS);
+        for key in family_keys {
+            assert!(
+                known.contains(key),
+                "known_runtime_params() missing `{key}`; a valid runtime param would false-warn"
+            );
+        }
+        // No accidental duplicates across the merged family lists.
+        let mut deduped = known.clone();
+        deduped.sort_unstable();
+        deduped.dedup();
+        assert_eq!(
+            deduped.len(),
+            known.len(),
+            "duplicate keys in known_runtime_params()"
+        );
+    }
+
+    #[test]
+    fn runtime_param_typos_suggest_within_section() {
+        // A typo resolves to the intended key, and the suggestion is drawn from
+        // the whole `runtime.params` section vocabulary — across families.
+        let known = known_runtime_params();
+        assert_eq!(
+            util::levenshtein::closest_match("cayenne_footer_cach_mb", &known).as_deref(),
+            Some("cayenne_footer_cache_mb"),
+        );
+        assert_eq!(
+            util::levenshtein::closest_match("shuffle_locatin", &known).as_deref(),
+            Some("shuffle_location"),
+        );
+        // A wholly unrelated key gets no misleading suggestion.
+        assert_eq!(
+            util::levenshtein::closest_match("totally_unrelated_key", &known),
+            None,
+        );
+    }
+
+    #[test]
     fn test_clamp_cayenne_compaction_memory_fraction() {
         for (input, expected) in [(0.0, 0.05), (0.2, 0.2), (1.0, 0.9)] {
             let actual = clamp_cayenne_compaction_memory_fraction(input);
@@ -1042,26 +1418,26 @@ mod test {
 
         assert_eq!(
             parse_cayenne_filter_propagation(&params),
-            CayenneFilterPropagation::Enabled
+            Some(CayenneFilterPropagation::Enabled)
         );
         assert_eq!(
             parse_cayenne_filter_propagation(&HashMap::from([(
                 CAYENNE_FILTER_PROPAGATION_PARAM.to_string(),
                 "disabled".to_string(),
             )])),
-            CayenneFilterPropagation::Disabled
+            Some(CayenneFilterPropagation::Disabled)
         );
+        // An invalid value warns and yields `None` (effective behavior is
+        // disabled, but nothing was validly applied so callers won't log it).
         assert_eq!(
             parse_cayenne_filter_propagation(&HashMap::from([(
                 CAYENNE_FILTER_PROPAGATION_PARAM.to_string(),
                 "true".to_string(),
             )])),
-            CayenneFilterPropagation::Disabled
+            None
         );
-        assert_eq!(
-            parse_cayenne_filter_propagation(&HashMap::new()),
-            CayenneFilterPropagation::Disabled
-        );
+        // An unset key also yields `None`.
+        assert_eq!(parse_cayenne_filter_propagation(&HashMap::new()), None);
     }
 
     #[test]
@@ -1098,15 +1474,20 @@ mod test {
             CayenneOptimizerRules::all_enabled()
         );
 
+        // `join_rewriter` is an opt-in alias that enables the Cayenne
+        // `ExactLeftAccumulator` rewrite (`exact_join_filter`) alongside any
+        // other named rules, and does not trigger the unknown-rule path.
         let mut selected_rules = CayenneOptimizerRules::none();
         selected_rules.set_filter_propagation(true);
         selected_rules.set_cross_join_reassociation(true);
+        selected_rules.set_maintained_aggregate(true);
         selected_rules.set_exact_join_filter(true);
         assert_eq!(
             parse_cayenne_optimizer_rules(
                 &HashMap::from([(
                     CAYENNE_OPTIMIZER_RULES_PARAM.to_string(),
-                    "filter-propagation,cross_join_reassociation,join_rewriter".to_string(),
+                    "filter-propagation,cross_join_reassociation,cdc_aggregates,join_rewriter"
+                        .to_string(),
                 )]),
                 true,
             ),
@@ -1128,6 +1509,23 @@ mod test {
                 false,
             ),
             semi_join_only
+        );
+
+        // `stats_aggregate` is on under both `auto` and `all`, and is also
+        // selectable by token (including its aliases) without enabling anything else.
+        assert!(CayenneOptimizerRules::auto_enabled().stats_aggregate());
+        assert!(CayenneOptimizerRules::all_enabled().stats_aggregate());
+        let mut stats_aggregate_only = CayenneOptimizerRules::none();
+        stats_aggregate_only.set_stats_aggregate(true);
+        assert_eq!(
+            parse_cayenne_optimizer_rules(
+                &HashMap::from([(
+                    CAYENNE_OPTIMIZER_RULES_PARAM.to_string(),
+                    "metadata_aggregate".to_string(),
+                )]),
+                false,
+            ),
+            stats_aggregate_only
         );
 
         assert_eq!(

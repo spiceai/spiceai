@@ -45,7 +45,7 @@ use datafusion::execution::runtime_env::RuntimeEnv;
 use datafusion_catalog::TableProvider;
 use datafusion_common::ScalarValue;
 use datafusion_expr::Expr;
-use object_store::{ObjectMeta, ObjectStore};
+use object_store::{ObjectMeta, ObjectStore, ObjectStoreExt};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::Mutex as TokioMutex;
@@ -103,6 +103,12 @@ pub struct FileBasedDeletionSink {
     protected_snapshots: Arc<ArcSwap<HashMap<String, i64>>>,
     /// Table ID for catalog operations.
     table_id: String,
+    /// A write-clone of the owning provider (shares all of its `Arc`-backed
+    /// state). Used during orphaned-DV cleanup to read the live current-snapshot
+    /// ID (folded into the surviving-sequence floor) and to prune the in-memory
+    /// PK deletion index of the tombstones whose delete files were removed, so
+    /// the memory is reclaimed immediately rather than only on the next reload.
+    provider: CayenneTableProvider,
     /// Table base path for constructing snapshot directory paths.
     table_path: String,
     /// Shared runtime environment for cache invalidation after file deletion.
@@ -131,6 +137,8 @@ impl FileBasedDeletionSink {
     /// * `catalog` - Metadata catalog for clearing snapshot sequence records.
     /// * `protected_snapshots` - In-memory protected snapshots map.
     /// * `table_id` - Table ID for catalog operations.
+    /// * `provider` - A write-clone of the owning provider (shared `Arc` state),
+    ///   used for orphaned-DV cleanup (current-snapshot lookup + deletion-index prune).
     /// * `table_path` - Table base path for snapshot directory construction.
     /// * `runtime_env` - Shared runtime environment for cache invalidation.
     #[expect(clippy::too_many_arguments)]
@@ -142,6 +150,7 @@ impl FileBasedDeletionSink {
         catalog: Arc<dyn MetadataCatalog>,
         protected_snapshots: Arc<ArcSwap<HashMap<String, i64>>>,
         table_id: String,
+        provider: CayenneTableProvider,
         table_path: String,
         runtime_env: Arc<RuntimeEnv>,
         write_lock: Arc<TokioMutex<()>>,
@@ -155,6 +164,7 @@ impl FileBasedDeletionSink {
             catalog,
             protected_snapshots,
             table_id,
+            provider,
             table_path,
             runtime_env,
             write_lock,
@@ -429,9 +439,18 @@ impl DeletionSink for FileBasedDeletionSink {
         }
 
         // Clean up emptied protected snapshots: catalog, in-memory map, and directory.
+        // Removing snapshots raises the surviving-sequence floor, which can orphan
+        // key-based deletion vectors that only shadowed the now-deleted rows (issue
+        // #9388). The actual orphaned-DV sweep runs OFF this critical section — it is
+        // a lock-free, throttled background pass on the dedicated compaction runtime
+        // (`schedule_orphan_dv_sweep`), so it never extends the `write_lock` /
+        // `listing_fence` window that CDC ingest and scans contend on here. We only
+        // signal it; the sweep is throttled and will only reclaim orphaned DVs once enough
+        // orphans accumulate (see `ORPHANED_DV_CLEANUP_MIN_FILES`).
         if !result.emptied_snapshot_ids.is_empty() {
             self.cleanup_emptied_snapshots(&result.emptied_snapshot_ids)
                 .await;
+            self.provider.schedule_orphan_dv_sweep();
         }
 
         Ok(result.total_deleted_rows)

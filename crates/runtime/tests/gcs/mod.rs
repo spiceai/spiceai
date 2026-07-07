@@ -35,7 +35,10 @@ use futures::TryStreamExt;
 use runtime::Runtime;
 use spicepod::{component::dataset::Dataset, param::Params as DatasetParams};
 
-use crate::{configure_test_datafusion, init_tracing, utils::test_request_context};
+use crate::{
+    configure_test_datafusion, init_tracing,
+    utils::{register_test_connectors, test_request_context},
+};
 
 /// Creates a GCS dataset configuration for public bucket access (no auth required).
 pub fn get_public_gcs_dataset(gcs_uri: &str, name: &str) -> Dataset {
@@ -89,13 +92,14 @@ async fn gcs_public_dataset_federation() -> Result<(), anyhow::Error> {
                 .build();
 
             configure_test_datafusion();
+            register_test_connectors().await;
             let rt = Runtime::builder().with_app(app).build().await;
 
             let cloned_rt = Arc::new(rt.clone());
 
             // Set a timeout for the test
             tokio::select! {
-                () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+                () = tokio::time::sleep(std::time::Duration::from_mins(1)) => {
                     return Err(anyhow::anyhow!("Timed out waiting for datasets to load"));
                 }
                 () = cloned_rt.load_components() => {}
@@ -145,12 +149,13 @@ async fn gs_url_scheme() -> Result<(), anyhow::Error> {
                 .build();
 
             configure_test_datafusion();
+            register_test_connectors().await;
             let rt = Runtime::builder().with_app(app).build().await;
 
             let cloned_rt = Arc::new(rt.clone());
 
             tokio::select! {
-                () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+                () = tokio::time::sleep(std::time::Duration::from_mins(1)) => {
                     return Err(anyhow::anyhow!("Timed out waiting for datasets to load"));
                 }
                 () = cloned_rt.load_components() => {}
@@ -194,12 +199,13 @@ async fn gcs_url_scheme() -> Result<(), anyhow::Error> {
                 .build();
 
             configure_test_datafusion();
+            register_test_connectors().await;
             let rt = Runtime::builder().with_app(app).build().await;
 
             let cloned_rt = Arc::new(rt.clone());
 
             tokio::select! {
-                () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+                () = tokio::time::sleep(std::time::Duration::from_mins(1)) => {
                     return Err(anyhow::anyhow!("Timed out waiting for datasets to load"));
                 }
                 () = cloned_rt.load_components() => {}
@@ -250,12 +256,13 @@ async fn gcs_adc_authentication() -> Result<(), anyhow::Error> {
                 .build();
 
             configure_test_datafusion();
+            register_test_connectors().await;
             let rt = Runtime::builder().with_app(app).build().await;
 
             let cloned_rt = Arc::new(rt.clone());
 
             tokio::select! {
-                () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+                () = tokio::time::sleep(std::time::Duration::from_mins(1)) => {
                     return Err(anyhow::anyhow!("Timed out waiting for datasets to load"));
                 }
                 () = cloned_rt.load_components() => {}
@@ -323,12 +330,13 @@ async fn gcs_tpch_sf1() -> Result<(), anyhow::Error> {
                 .build();
 
             configure_test_datafusion();
+            register_test_connectors().await;
             let rt = Runtime::builder().with_app(app).build().await;
 
             let cloned_rt = Arc::new(rt.clone());
 
             tokio::select! {
-                () = tokio::time::sleep(std::time::Duration::from_secs(120)) => {
+                () = tokio::time::sleep(std::time::Duration::from_mins(2)) => {
                     return Err(anyhow::anyhow!("Timed out waiting for datasets to load"));
                 }
                 () = cloned_rt.load_components() => {}
@@ -472,12 +480,13 @@ async fn gcs_csv_format() -> Result<(), anyhow::Error> {
                 .build();
 
             configure_test_datafusion();
+            register_test_connectors().await;
             let rt = Runtime::builder().with_app(app).build().await;
 
             let cloned_rt = Arc::new(rt.clone());
 
             tokio::select! {
-                () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+                () = tokio::time::sleep(std::time::Duration::from_mins(1)) => {
                     return Err(anyhow::anyhow!("Timed out waiting for datasets to load"));
                 }
                 () = cloned_rt.load_components() => {}

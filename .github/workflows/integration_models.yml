@@ -82,7 +82,7 @@ jobs:
       HAS_SPICEIO_SECRET: ${{ secrets.UNAS_SMB_PASS != '' }}
 
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           persist-credentials: false
           fetch-depth: 1 # Shallow clone for faster checkout
@@ -93,7 +93,7 @@ jobs:
       - name: Set up spiceio
         if: runner.os == 'macOS' && env.HAS_SPICEIO_SECRET == 'true'
         id: setup-spiceio
-        uses: spiceai/spiceio/.github/actions/setup@1a8c1bc2d46e0b68df4a786b5f929d758f75b06e # v0.5.6
+        uses: spiceai/spiceio/.github/actions/setup@973bc49a7be396ec9430255ad0f7ed684d7a1317 # v0.5.8
         with:
           smb-url: smb://runner@192.168.3.148/ai_platform_dev
           smb-pass: ${{ secrets.UNAS_SMB_PASS }}
@@ -117,7 +117,7 @@ jobs:
           # Metal runners do not have `xcrun metal`
           # See `https://github.com/EricLBuehler/mistral.rs/pull/1311`
           MISTRALRS_METAL_PRECOMPILE: 0
-          RUSTC_WRAPPER: sccache
+          RUSTC_WRAPPER: ${{ env.RUSTC_WRAPPER }}
           AWS_ACCESS_KEY_ID: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.TEST_MINIO_SECRET_KEY }}
         run: |
@@ -146,7 +146,7 @@ jobs:
       - name: Set up spiceio for build archive
         if: env.HAS_SPICEIO_SECRET == 'true'
         id: setup-spiceio-build
-        uses: spiceai/spiceio/.github/actions/setup@1a8c1bc2d46e0b68df4a786b5f929d758f75b06e # v0.5.6
+        uses: spiceai/spiceio/.github/actions/setup@973bc49a7be396ec9430255ad0f7ed684d7a1317 # v0.5.8
         with:
           smb-url: smb://runner@192.168.3.148/ai_platform_dev
           smb-pass: ${{ secrets.UNAS_SMB_PASS }}
@@ -192,7 +192,7 @@ jobs:
     env:
       HAS_SPICEIO_SECRET: ${{ secrets.UNAS_SMB_PASS != '' }}
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           persist-credentials: false
 
@@ -205,7 +205,7 @@ jobs:
       - name: Set up spiceio
         if: runner.os == 'macOS' && env.HAS_SPICEIO_SECRET == 'true'
         id: setup-spiceio
-        uses: spiceai/spiceio/.github/actions/setup@1a8c1bc2d46e0b68df4a786b5f929d758f75b06e # v0.5.6
+        uses: spiceai/spiceio/.github/actions/setup@973bc49a7be396ec9430255ad0f7ed684d7a1317 # v0.5.8
         with:
           smb-url: smb://runner@192.168.3.148/ai_platform_dev
           smb-pass: ${{ secrets.UNAS_SMB_PASS }}
@@ -378,7 +378,7 @@ jobs:
     env:
       HAS_SPICEIO_SECRET: ${{ secrets.UNAS_SMB_PASS != '' }}
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           persist-credentials: false
 
@@ -391,7 +391,7 @@ jobs:
       - name: Set up spiceio
         if: runner.os == 'macOS' && env.HAS_SPICEIO_SECRET == 'true'
         id: setup-spiceio
-        uses: spiceai/spiceio/.github/actions/setup@1a8c1bc2d46e0b68df4a786b5f929d758f75b06e # v0.5.6
+        uses: spiceai/spiceio/.github/actions/setup@973bc49a7be396ec9430255ad0f7ed684d7a1317 # v0.5.8
         with:
           smb-url: smb://runner@192.168.3.148/ai_platform_dev
           smb-pass: ${{ secrets.UNAS_SMB_PASS }}
@@ -459,7 +459,7 @@ jobs:
     env:
       HAS_SPICEIO_SECRET: ${{ secrets.UNAS_SMB_PASS != '' }}
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           persist-credentials: false
 
@@ -472,7 +472,7 @@ jobs:
       - name: Set up spiceio
         if: runner.os == 'macOS' && env.HAS_SPICEIO_SECRET == 'true'
         id: setup-spiceio
-        uses: spiceai/spiceio/.github/actions/setup@1a8c1bc2d46e0b68df4a786b5f929d758f75b06e # v0.5.6
+        uses: spiceai/spiceio/.github/actions/setup@973bc49a7be396ec9430255ad0f7ed684d7a1317 # v0.5.8
         with:
           smb-url: smb://runner@192.168.3.148/ai_platform_dev
           smb-pass: ${{ secrets.UNAS_SMB_PASS }}
@@ -523,7 +523,7 @@ jobs:
       HAS_SPICEIO_SECRET: ${{ secrets.UNAS_SMB_PASS != '' }}
 
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           persist-credentials: false
           fetch-depth: 1 # Shallow clone for faster checkout
@@ -534,7 +534,7 @@ jobs:
       - name: Set up spiceio
         if: runner.os == 'macOS' && env.HAS_SPICEIO_SECRET == 'true'
         id: setup-spiceio
-        uses: spiceai/spiceio/.github/actions/setup@1a8c1bc2d46e0b68df4a786b5f929d758f75b06e # v0.5.6
+        uses: spiceai/spiceio/.github/actions/setup@973bc49a7be396ec9430255ad0f7ed684d7a1317 # v0.5.8
         with:
           smb-url: smb://runner@192.168.3.148/ai_platform_dev
           smb-pass: ${{ secrets.UNAS_SMB_PASS }}
@@ -555,7 +555,7 @@ jobs:
       # Build the test binary without running tests
       - name: Build AI integration test binary
         env:
-          RUSTC_WRAPPER: sccache
+          RUSTC_WRAPPER: ${{ env.RUSTC_WRAPPER }}
           AWS_ACCESS_KEY_ID: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.TEST_MINIO_SECRET_KEY }}
         run: |
@@ -584,7 +584,7 @@ jobs:
       - name: Set up spiceio for build archive
         if: env.HAS_SPICEIO_SECRET == 'true'
         id: setup-spiceio-build
-        uses: spiceai/spiceio/.github/actions/setup@1a8c1bc2d46e0b68df4a786b5f929d758f75b06e # v0.5.6
+        uses: spiceai/spiceio/.github/actions/setup@973bc49a7be396ec9430255ad0f7ed684d7a1317 # v0.5.8
         with:
           smb-url: smb://runner@192.168.3.148/ai_platform_dev
           smb-pass: ${{ secrets.UNAS_SMB_PASS }}

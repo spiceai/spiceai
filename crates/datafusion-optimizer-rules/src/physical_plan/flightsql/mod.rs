@@ -15,4 +15,5 @@ limitations under the License.
 */
 
 pub mod aggregate_pushdown;
+pub mod broadcast_join;
 mod exec;

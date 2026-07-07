@@ -28,7 +28,6 @@ use datafusion::physical_plan::{
 use datafusion::sql::TableReference;
 use futures::{StreamExt, stream};
 use opentelemetry::KeyValue;
-use std::any::Any;
 use std::fmt;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -54,7 +53,7 @@ pub struct FallbackOnZeroResultsScanExec {
     input: Arc<dyn ExecutionPlan>,
     fallback_table_provider: FallbackAsyncTableProvider,
     fallback_scan_params: TableScanParams,
-    properties: PlanProperties,
+    properties: Arc<PlanProperties>,
 }
 
 impl FallbackOnZeroResultsScanExec {
@@ -78,12 +77,12 @@ impl FallbackOnZeroResultsScanExec {
             input,
             fallback_table_provider,
             fallback_scan_params,
-            properties: PlanProperties::new(
+            properties: Arc::new(PlanProperties::new(
                 eq_properties,
                 Partitioning::UnknownPartitioning(1),
                 emission_type,
                 boundedness,
-            ),
+            )),
         }
     }
 }
@@ -106,15 +105,11 @@ impl ExecutionPlan for FallbackOnZeroResultsScanExec {
         "FallbackOnZeroResultsScanExec"
     }
 
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema(&self) -> SchemaRef {
         self.input.schema()
     }
 
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
     }
 

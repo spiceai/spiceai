@@ -16,13 +16,13 @@ limitations under the License.
 
 use std::sync::Arc;
 
-use crate::embeddings::table::EmbeddingTable;
 use arrow_schema::SchemaRef;
 use datafusion::{
     datasource::TableProvider, error::Result, execution::context::SessionContext,
     sql::TableReference,
 };
 use runtime_datafusion::schema_provider::SpiceSchemaProvider;
+use runtime_search::embeddings::table::EmbeddingTable;
 use snafu::prelude::*;
 
 pub(crate) fn ensure_schema_exists(
@@ -56,7 +56,7 @@ pub struct BaseSchema {}
 
 impl BaseSchema {
     pub fn get_schema(provider: &Arc<dyn TableProvider>) -> SchemaRef {
-        if let Some(embedding_table) = provider.as_any().downcast_ref::<EmbeddingTable>() {
+        if let Some(embedding_table) = provider.downcast_ref::<EmbeddingTable>() {
             return embedding_table.get_base_table_schema();
         }
         provider.schema()

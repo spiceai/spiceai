@@ -20,7 +20,7 @@ use snafu::{ResultExt, Snafu};
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
-use std::{any::Any, path::Path, sync::Arc};
+use std::{path::Path, sync::Arc};
 use url::Url;
 
 use crate::{arrow::write::MemTable, rate_limit::RateLimiter};
@@ -412,10 +412,6 @@ impl GitTableProvider {
 
 #[async_trait]
 impl TableProvider for GitTableProvider {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema(&self) -> SchemaRef {
         Arc::clone(&self.schema)
     }

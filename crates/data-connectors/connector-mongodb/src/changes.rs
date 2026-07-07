@@ -22,7 +22,8 @@ use data_components::{
         build_ready_signal_envelope, wrap_data_as_change_batch,
     },
     mongodb::stream::{
-        change_events_to_change_batch, default_unnest_parameters, truncate_change_batch,
+        change_events_to_change_batch, default_unnest_parameters, nullable_clone,
+        truncate_change_batch,
     },
 };
 use datafusion::{
@@ -46,6 +47,7 @@ use runtime::{
         OpenOption,
         mongodb::{MongoCheckpointMetadata, MongoSys},
     },
+    dataconnector::schema_projection::{ProjectionPolicy, parse_schema_projection},
     federated_table::FederatedTable,
     parameters::{ExposedParamLookup, Parameters},
 };
@@ -70,6 +72,14 @@ pub fn build_changes_stream(
         let table_provider = federated_table.table_provider().await;
         let schema = table_provider.schema();
         let primary_keys = resolve_primary_keys(&dataset.name, dataset.acceleration.as_ref(), &schema)?;
+        // JSON-nesting projection, matching the scan path. `_id` is MongoDB's
+        // only primary key and must stay a declared column (never folded into
+        // the catch-all). `schema` is already the projected (exposed) schema.
+        let projection = parse_schema_projection(
+            &dataset,
+            &ProjectionPolicy::new("mongodb").with_required_columns(vec!["_id".to_string()]),
+        )
+        .map_err(|e| StreamError::External(e.to_string()))?;
         let config = ChangeStreamConfig::from_params(&params)?;
         let invalid_token_behavior = ResumeTokenInvalidBehavior::from_params(&params)?;
         let collection_name = dataset.path().to_string();
@@ -177,6 +187,10 @@ pub fn build_changes_stream(
                 .map_err(StreamError::MongoDB)?;
             yield ChangeEnvelope::new(Box::new(NoOpCommitter), truncate, false);
 
+            // Use the same nullable schema that CDC event batches use (via nullable_clone
+            // in change_events_to_change_batch), so snapshot and live-stream batches can
+            // be coalesced without an Arrow schema mismatch on non-null fields like _id.
+            let snapshot_schema = nullable_clone(&schema);
             let mut snapshot_stream = snapshot_stream(table_provider).await?;
             while let Some(batch) = FuturesStreamExt::next(&mut snapshot_stream).await {
                 let batch = batch.map_err(|error| StreamError::Arrow(error.to_string()))?;
@@ -184,7 +198,10 @@ pub fn build_changes_stream(
                     continue;
                 }
 
-                let change_batch = wrap_data_as_change_batch(&schema, &batch)
+                let batch = batch
+                    .with_schema(Arc::clone(&snapshot_schema))
+                    .map_err(|error| StreamError::Arrow(error.to_string()))?;
+                let change_batch = wrap_data_as_change_batch(&snapshot_schema, &batch)
                     .map_err(|error| StreamError::Arrow(error.to_string()))?;
                 yield ChangeEnvelope::new(Box::new(NoOpCommitter), change_batch, false);
             }
@@ -254,8 +271,14 @@ pub fn build_changes_stream(
                 &schema,
                 &primary_keys,
                 &unnest_parameters,
+                projection.as_ref(),
             )
             .map_err(StreamError::MongoDB)? {
+                // MongoDB change-stream cluster time is whole seconds (BSON
+                // Timestamp), so the replication-lag signal here has ~1s
+                // granularity — fine for a multi-second tuner.
+                let change_batch = change_batch
+                    .with_source_commit_ts_ms(tail_cluster_time.map(|s| s.saturating_mul(1000)));
                 let committer = build_batch_committer(
                     mongo_sys.as_ref(),
                     tail_token,

@@ -142,7 +142,7 @@ pub fn parse_refresh_sql(
                         );
 
                         ensure_no_expr!(select.cluster_by.is_empty(), "CLUSTER BY", expected_table);
-                        ensure_no_expr!(select.connect_by.is_none(), "CONNECT BY", expected_table);
+                        ensure_no_expr!(select.connect_by.is_empty(), "CONNECT BY", expected_table);
                         ensure_no_expr!(select.distinct.is_none(), "DISTINCT", expected_table);
                         ensure_no_expr!(
                             select.distribute_by.is_empty(),
@@ -323,6 +323,7 @@ fn validate_and_extract_columns(
                 }
             },
             SelectItem::ExprWithAlias { .. }
+            | SelectItem::ExprWithAliases { .. }
             | SelectItem::QualifiedWildcard(..)
             | SelectItem::Wildcard(..) => {
                 return OnlyColumnReferencesSnafu {

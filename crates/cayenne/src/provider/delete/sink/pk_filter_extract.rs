@@ -32,8 +32,9 @@ limitations under the License.
 //!
 
 use arrow::array::ArrayRef;
-use arrow_row::RowConverter;
 use arrow_schema::DataType;
+
+use crate::row_converter::RowConverter;
 use datafusion_common::ScalarValue;
 use datafusion_expr::Expr;
 use datafusion_expr::Operator;
@@ -117,7 +118,7 @@ pub(crate) fn try_extract_in_list_row_keys(
         scalars.push(scalar.clone());
     }
 
-    let array = ScalarValue::iter_to_array(scalars.into_iter()).ok()?;
+    let array = ScalarValue::iter_to_array(scalars).ok()?;
     let array = if array.data_type() == target_type {
         array
     } else {
@@ -264,7 +265,7 @@ fn scalars_to_row_keys(
 ) -> Option<Vec<Box<[u8]>>> {
     let mut arrays: Vec<ArrayRef> = Vec::with_capacity(pk_target_types.len());
     for (pk_idx, values) in pk_column_values.into_iter().enumerate() {
-        let array = ScalarValue::iter_to_array(values.into_iter()).ok()?;
+        let array = ScalarValue::iter_to_array(values).ok()?;
         let target_type = pk_target_types[pk_idx];
         let array = if array.data_type() == target_type {
             array
@@ -376,9 +377,9 @@ fn find_scalar_for_column<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::row_converter::SortField;
     use arrow::array::{Int64Array, RecordBatch, StringArray};
     use arrow::datatypes::{Field, Schema};
-    use arrow_row::SortField;
     use data_components::pk_filter_expr::{
         balanced_binary, build_pk_in_list_from_batch, get_delete_where_expr_from_batch,
     };

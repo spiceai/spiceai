@@ -14,10 +14,10 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::{borrow::Cow, fmt::Debug, sync::Arc};
+use std::{borrow::Cow, fmt::Debug, sync::Arc, time::Duration};
 
 use axum::Router;
-use hyper_util::rt::{TokioExecutor, TokioIo};
+use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
 use hyper_util::server::conn::auto::{Builder, Connection};
 use hyper_util::service::TowerToHyperService;
 use runtime_auth::{HttpAuth, IdentitySource, layer::http::AuthLayer};
@@ -29,11 +29,9 @@ use tokio::sync::watch::{self, Receiver};
 use tokio_rustls::TlsAcceptor;
 use tokio_util::sync::CancellationToken;
 
-use crate::search::search_engine::SearchEngine;
-use crate::{
-    Runtime, config, metrics as runtime_metrics, search::util::parse_explicit_primary_keys,
-    tls::TlsConfig,
-};
+use crate::{Runtime, config, metrics as runtime_metrics, tls::TlsConfig};
+use runtime_search::search_engine::SearchEngine;
+use runtime_search::search_engine::parse_explicit_primary_keys;
 
 #[cfg(feature = "openapi")]
 pub use routes::get_api_doc;
@@ -125,10 +123,14 @@ pub(crate) async fn start<A>(
 where
     A: ToSocketAddrs + Debug,
 {
-    let vsearch = Arc::new(SearchEngine::new(
-        Arc::clone(&rt.df),
-        parse_explicit_primary_keys(Arc::clone(&rt.app)).await,
-    ));
+    let vsearch = Arc::new(
+        SearchEngine::new(
+            Arc::clone(&rt.df) as Arc<dyn runtime_query_engine::query_engine::QueryEngine>,
+            parse_explicit_primary_keys(Arc::clone(&rt.app)).await,
+            crate::search::util::RuntimeTableProviderExplorer,
+        )
+        .with_search_cache(rt.df.search_cache_provider()),
+    );
     let app = rt.app.as_ref().read().await;
     let cors_config: Cow<'_, CorsConfig> = match app.as_ref() {
         Some(app) => Cow::Borrowed(&app.runtime.cors),
@@ -152,6 +154,7 @@ where
         vsearch,
         auth_layer,
         &cors_config,
+        tls_config.is_some(),
         #[cfg(feature = "mcp")]
         mcp_config.as_ref(),
     );
@@ -258,6 +261,11 @@ fn process_tcp_stream(stream: TcpStream, routes: Router, on_shutdown: Receiver<(
     });
 }
 
+/// Maximum time a client may take to send the full request-header block on an
+/// HTTP/1 connection. Bounds Slowloris-style header-dribble attacks that would
+/// otherwise hold connections (and their spawned tasks/FDs) open indefinitely.
+const HTTP_HEADER_READ_TIMEOUT: Duration = Duration::from_secs(30);
+
 fn serve_connection<S>(
     stream: S,
     service: Router,
@@ -266,7 +274,15 @@ where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
     let hyper_service = TowerToHyperService::new(service);
-    Builder::new(TokioExecutor::new())
+    let mut builder = Builder::new(TokioExecutor::new());
+    // Apply an HTTP/1 header-read timeout (auto HTTP/1+2 serving is preserved).
+    // HTTP/2 has its own framing/flow-control limits, so this targets the
+    // plaintext/HTTP-1 Slowloris vector.
+    builder
+        .http1()
+        .timer(TokioTimer::new())
+        .header_read_timeout(HTTP_HEADER_READ_TIMEOUT);
+    builder
         .serve_connection(TokioIo::new(stream), hyper_service)
         .into_owned()
 }

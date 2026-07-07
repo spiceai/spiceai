@@ -33,7 +33,7 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
-    #[snafu(display("Error converting record batch: {source}",))]
+    #[snafu(display("Error converting record batch: {source}"))]
     UnableToConvertRecordBatch { source: arrow::error::ArrowError },
 
     #[snafu(display("Field is not nullable: {field}"))]
@@ -643,7 +643,7 @@ mod test {
                 }
             }
             (result, expected) => {
-                panic!("Mismatched ParamValues variants: got {result:?}, expected {expected:?}",)
+                panic!("Mismatched ParamValues variants: got {result:?}, expected {expected:?}")
             }
         }
     }

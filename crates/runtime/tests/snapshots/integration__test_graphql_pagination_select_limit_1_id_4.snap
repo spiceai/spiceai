@@ -12,8 +12,7 @@ description: "Query: SELECT * FROM test_graphql where id = '4' limit 1"
 | physical_plan | CoalescePartitionsExec: fetch=1                                          |
 |               |   FilterExec: id@0 = 4, fetch=1                                          |
 |               |     RepartitionExec: partitioning=RoundRobinBatch(3), input_partitions=1 |
-|               |       CooperativeExec                                                    |
-|               |         BytesProcessedExec                                               |
-|               |           GraphQLTableProviderExec                                       |
+|               |       BytesProcessedExec                                                 |
+|               |         GraphQLTableProviderExec                                         |
 |               |                                                                          |
 +---------------+--------------------------------------------------------------------------+

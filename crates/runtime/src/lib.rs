@@ -17,9 +17,11 @@ limitations under the License.
 #![recursion_limit = "256"]
 
 use ::tools::SpiceModelTool;
+use ::tools::naming::{decode_tool_name, encode_tool_name};
 use ::tools::rename::with_name;
 use async_stream::stream;
 use datafusion_expr::Expr;
+use datafusion_proto::bytes::Serializeable;
 use init::scheduler::ScheduleRegistry;
 use spicepod::component::runtime::TelemetryConfig;
 use std::collections::HashSet;
@@ -47,7 +49,6 @@ use crate::{auth::EndpointAuth, dataconnector::DataConnector};
 use ::datafusion::error::DataFusionError;
 use ::datafusion::sql::{ResolvedTableReference, TableReference, sqlparser};
 use app::App;
-use datafusion_proto::bytes::Serializeable;
 
 use {crate::Error::FailedToStartClusterExecutor, crate::config::ClusterRole};
 
@@ -67,7 +68,7 @@ pub use http::get_api_doc;
 use llms::rerank::RerankerModelStore;
 use model::{EmbeddingModelStore, LLMChatCompletionsModelStore};
 
-use crate::tools::{Tooling, catalog::SpiceToolCatalog, factory::default_available_catalogs};
+use crate::tools::{Tooling, factory::default_available_catalogs};
 use model_components::model::Model;
 pub use notify::Error as NotifyError;
 use snafu::prelude::*;
@@ -86,7 +87,7 @@ use crate::udtfs::ListUDFTableFunc;
 use runtime_async::cancellable_task::{CancellableTaskHandle, spawn_cancellable_task};
 pub mod accelerated_table;
 pub mod auth;
-mod builder;
+pub mod builder;
 pub mod catalogconnector;
 mod changes;
 pub mod component;
@@ -96,8 +97,10 @@ pub mod dataconnector;
 pub mod datafusion;
 pub mod datasets_health_monitor;
 pub mod dataupdate;
+pub(crate) mod egress;
 pub mod embeddings;
 pub mod execution_plan;
+pub mod executor_table;
 pub mod extension;
 pub mod federated_table;
 pub mod flight;
@@ -125,11 +128,13 @@ pub use runtime_parameters as parameters;
 pub mod podswatcher;
 pub mod request;
 mod scheduling;
+pub(crate) mod schema_evolution;
 pub mod search;
 pub mod secrets {
     pub use runtime_secrets::*;
 }
 pub mod cluster;
+mod secrets_preflight;
 pub mod spice_metrics;
 pub mod status;
 pub mod task_history;
@@ -508,7 +513,7 @@ const COMPONENTS_INITIAL_LOAD: &str = "components_initial_load";
 const CACHE_MAINTENANCE: &str = "cache_maintenance";
 
 /// How often [`Runtime::run_cache_maintenance`] drives moka housekeeping.
-const CACHE_MAINTENANCE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+const CACHE_MAINTENANCE_INTERVAL: std::time::Duration = std::time::Duration::from_mins(1);
 
 // Allow 30 seconds for tasks for graceful shutdown
 const RUNTIME_DEFAULT_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(30);
@@ -535,13 +540,11 @@ pub struct Runtime {
     /// diff phase can still read the app `RwLock` without deadlocking.
     apply_app_lock: Arc<tokio::sync::Mutex<()>>,
     df: Arc<DataFusion>,
-    models: Arc<RwLock<HashMap<String, Model>>>,
-    completion_llms: Arc<RwLock<LLMChatCompletionsModelStore>>,
-    /// Per-model rate controllers for AI UDF concurrency control.
-    model_rate_controllers: Arc<RwLock<HashMap<String, Arc<runtime_rate_control::RateController>>>>,
+    // `Arc<Model>` (not `Model`) so a handle can be cloned out of the lock and
+    // moved into `spawn_blocking` to run synchronous inference off the runtime.
+    models: Arc<RwLock<HashMap<String, Arc<Model>>>>,
+    llm_runtime_stores: Arc<model::LlmRuntimeStores>,
     http_rate_control_registry: Arc<dataconnector::http_rate_control::HttpRateControlRegistry>,
-    // LLMs that support the OpenAI Responses API
-    responses_llms: Arc<RwLock<LLMResponsesModelStore>>,
     embeds: Arc<RwLock<EmbeddingModelStore>>,
     /// Registered reranker models (native cross-encoders, reranker-API
     /// providers). Consumed by the `rerank()` UDTF; may be empty when only
@@ -646,7 +649,7 @@ impl Runtime {
 
     #[must_use]
     pub fn completion_llms(&self) -> Arc<RwLock<LLMChatCompletionsModelStore>> {
-        Arc::clone(&self.completion_llms)
+        self.llm_runtime_stores.completion_llms()
     }
 
     #[must_use]
@@ -654,11 +657,38 @@ impl Runtime {
         Arc::clone(&self.rerankers)
     }
 
+    pub async fn responses_api_support_for_model(
+        &self,
+        model_name: &str,
+    ) -> Option<crate::model::ResponsesApiSupport> {
+        self.llm_runtime_stores
+            .responses_api_support()
+            .read()
+            .await
+            .get(model_name)
+            .cloned()
+    }
+
+    pub async fn responses_supported_model_names(&self) -> HashSet<String> {
+        self.llm_runtime_stores
+            .responses_api_support()
+            .read()
+            .await
+            .iter()
+            .filter_map(|(name, support)| support.supports_responses_api().then_some(name.clone()))
+            .collect()
+    }
+
     #[must_use]
     pub fn model_rate_controllers(
         &self,
     ) -> Arc<RwLock<HashMap<String, Arc<runtime_rate_control::RateController>>>> {
-        Arc::clone(&self.model_rate_controllers)
+        self.llm_runtime_stores.rate_controllers()
+    }
+
+    #[must_use]
+    pub fn responses_llms(&self) -> Arc<RwLock<LLMResponsesModelStore>> {
+        self.llm_runtime_stores.responses_llms()
     }
 
     #[must_use]
@@ -817,7 +847,7 @@ impl Runtime {
             if let Some(current_partitions) = prospective.get_mut(&table_ref) {
                 for partition_bytes in partitions {
                     let partition_expr =
-                        Expr::from_bytes_with_registry(partition_bytes, self.df.ctx.as_ref())
+                        Expr::from_bytes_with_ctx(partition_bytes, &self.df.ctx.task_ctx())
                             .map_err(|source| {
                                 Error::UnableToDeserializeClusterPartitionExpression {
                                     table: table_name.clone(),
@@ -834,9 +864,9 @@ impl Runtime {
                 .resolve(SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA);
             let current_partitions = prospective.entry(table_ref.clone()).or_default();
             for partition_bytes in partitions {
-                let partition_expr = ::datafusion_expr::Expr::from_bytes_with_registry(
+                let partition_expr = ::datafusion_expr::Expr::from_bytes_with_ctx(
                     partition_bytes,
-                    self.df.ctx.as_ref(),
+                    &self.df.ctx.task_ctx(),
                 )
                 .map_err(|source| {
                     Error::UnableToDeserializeClusterPartitionExpression {
@@ -988,7 +1018,26 @@ impl Runtime {
         // result mid-ingest. So there is no non-degrading cache here — each tick
         // simply broadcasts the current aggregate.
         loop {
-            interval.tick().await;
+            // Rebroadcast on write completion (debounced so a burst of segment
+            // publishes coalesces into one pass) with the interval tick as the
+            // idle heartbeat.
+            let df_for_notify = self.datafusion();
+            tokio::select! {
+                _ = interval.tick() => {}
+                () = df_for_notify.write_completed_notified() => {
+                    // Debounce, then drain the (at most one) permit stored by
+                    // writes that completed during the sleep so a burst yields
+                    // a single rebroadcast; writes after this point store a
+                    // fresh permit and trigger the next pass.
+                    tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+                    let _ = tokio::time::timeout(
+                        std::time::Duration::ZERO,
+                        df_for_notify.write_completed_notified(),
+                    )
+                    .await;
+                    interval.reset();
+                }
+            }
             let Some(broadcaster) = self.executor_outbound_broadcaster() else {
                 continue;
             };
@@ -1699,6 +1748,14 @@ impl Runtime {
 
         self.status.mark_shutdown();
 
+        // Tell CDC sources to release their upstream resources NOW, before
+        // the connection-drain phase below: a Postgres replication connection
+        // holds a single-consumer slot, and releasing it at shutdown start
+        // (instead of at process exit) lets a replacement instance attach
+        // during a rolling deploy instead of retrying against "slot is
+        // active".
+        data_components::cdc::begin_shutdown();
+
         let shutdown_timeout: Duration = self.read_app().await.and_then(|app| {
             app.runtime.shutdown_timeout().unwrap_or_else(|err| {
                 tracing::warn!("Invalid shutdown timeout: {err}. Using default: {RUNTIME_DEFAULT_SHUTDOWN_TIMEOUT:?}");
@@ -1799,7 +1856,7 @@ impl Runtime {
     ///
     /// For tools from catalog, the name is prefixed with the catalog name. e.g. `catalog_name/tool_name`.
     fn list_all_tools(self: &Arc<Self>) -> impl Stream<Item = Arc<dyn SpiceModelTool>> {
-        let default_catalogs = default_available_catalogs(Arc::clone(self));
+        let default_catalogs = default_available_catalogs(self);
         let stream_self = Arc::clone(self);
         stream! {
             let tool_lock = stream_self.tools.read().await;
@@ -1812,14 +1869,14 @@ impl Runtime {
                     Tooling::Tool(tool) | Tooling::FunctionTool(tool) => {
                         yield Arc::clone(tool);
                     }
-                    Tooling::Catalog(catalog) => {
+                    Tooling::Catalog { tools: catalog, .. } => {
                         // Do not list tools from default catalogs. They are already listed individually as tools.
                         if default_catalog_names.contains(&name.as_str()) {
                             continue;
                         }
                         let all = catalog.all().await;
                         for tool in all {
-                            yield with_name(&tool, format!("{}/{}", catalog.name(), tool.name()).as_str());
+                            yield with_name(&tool, encode_tool_name(catalog.name(), &tool.name()).as_str());
                         }
                     }
                 }
@@ -1829,20 +1886,18 @@ impl Runtime {
 
     pub async fn get_tool(self: &Arc<Self>, tool_name: &str) -> Option<Arc<dyn SpiceModelTool>> {
         let tools = self.tools.read().await;
-        let tool: Arc<dyn SpiceModelTool> =
-            if let Some((catalog_name, name)) = tool_name.split_once('/') {
-                let Some(Tooling::Catalog(catalog)) = tools.get(catalog_name) else {
-                    return None;
-                };
-                return catalog.get(name).await;
-            } else {
-                let Some(Tooling::Tool(tool) | Tooling::FunctionTool(tool)) = tools.get(tool_name)
-                else {
-                    return None;
-                };
-                Arc::clone(tool)
-            };
-        Some(tool)
+        if let Some((catalog_name, name)) = decode_tool_name(tool_name)
+            && let Some(Tooling::Catalog { tools: catalog, .. }) = tools.get(&catalog_name)
+            && let Some(tool) = catalog.get(&name).await
+        {
+            return Some(tool);
+        }
+        // Fall back to a direct (non-catalog) lookup — covers top-level tools
+        // whose names legitimately contain the `__` catalog separator.
+        let Some(Tooling::Tool(tool) | Tooling::FunctionTool(tool)) = tools.get(tool_name) else {
+            return None;
+        };
+        Some(Arc::clone(tool))
     }
 }
 

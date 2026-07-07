@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
-use std::any::Any;
 use std::fmt::Debug;
 use std::fmt::Display;
 use std::fmt::Formatter;
@@ -35,6 +34,7 @@ use datafusion_datasource::file_scan_config::FileScanConfigBuilder;
 use datafusion_datasource::file_sink_config::FileSinkConfig;
 use datafusion_datasource::sink::DataSinkExec;
 use datafusion_datasource::source::DataSourceExec;
+use datafusion_execution::cache::cache_manager::CachedFileMetadataEntry;
 use datafusion_expr::dml::InsertOp;
 use datafusion_physical_expr::LexRequirement;
 use datafusion_physical_expr::PhysicalExprRef;
@@ -63,6 +63,7 @@ use vortex::file::VORTEX_FILE_EXTENSION;
 use vortex::io::object_store::ObjectStoreReadAt;
 use vortex::io::session::RuntimeSessionExt;
 use vortex::scalar::Scalar;
+use vortex::scalar::ScalarValue as VortexScalarValue;
 use vortex::session::VortexSession;
 
 use super::access_plan::VortexAccessPlanProvider;
@@ -382,10 +383,6 @@ impl FileFormatFactory for VortexFormatFactory {
     fn default(&self) -> Arc<dyn FileFormat> {
         Arc::new(VortexFormat::new(self.session.clone()))
     }
-
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
 }
 
 impl VortexFormat {
@@ -543,7 +540,7 @@ fn attach_access_plan_to_file(
     provider: &dyn VortexAccessPlanProvider,
 ) -> PartitionedFile {
     if let Some(access_plan) = provider.access_plan_for_file(&file) {
-        file.with_extensions(access_plan)
+        file.with_extension(Arc::unwrap_or_clone(access_plan))
     } else {
         file
     }
@@ -551,10 +548,6 @@ fn attach_access_plan_to_file(
 
 #[async_trait]
 impl FileFormat for VortexFormat {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn compression_type(&self) -> Option<FileCompressionType> {
         None
     }
@@ -592,9 +585,12 @@ impl FileFormat for VortexFormat {
 
                 SpawnedTask::spawn(async move {
                     // Check if we have cached metadata for this file
-                    if let Some(cached) = cache.get(&object)
-                        && let Some(cached_vortex) =
-                            cached.as_any().downcast_ref::<CachedVortexMetadata>()
+                    if let Some(entry) = cache.get(&object.location)
+                        && entry.is_valid_for(&object)
+                        && let Some(cached_vortex) = entry
+                            .file_metadata
+                            .as_any()
+                            .downcast_ref::<CachedVortexMetadata>()
                     {
                         let inferred_schema = cached_vortex.footer().dtype().to_arrow_schema()?;
                         return VortexResult::Ok((object.location, inferred_schema));
@@ -625,7 +621,8 @@ impl FileFormat for VortexFormat {
                         src = "infer_schema",
                         "footer cached",
                     );
-                    cache.put(&object, cached_metadata);
+                    let entry = CachedFileMetadataEntry::new(object.clone(), cached_metadata);
+                    cache.put(&object.location, entry);
 
                     let inferred_schema = vxf.dtype().to_arrow_schema()?;
                     VortexResult::Ok((object.location, inferred_schema))
@@ -670,18 +667,22 @@ impl FileFormat for VortexFormat {
 
         let statistics = SpawnedTask::spawn(async move {
             // Try to get cached metadata first
-            let cached_metadata = file_metadata_cache.get(&object).and_then(|cached| {
-                cached
-                    .as_any()
-                    .downcast_ref::<CachedVortexMetadata>()
-                    .map(|m| {
-                        (
-                            m.footer().dtype().clone(),
-                            m.footer().statistics().cloned(),
-                            m.footer().row_count(),
-                        )
-                    })
-            });
+            let cached_metadata = file_metadata_cache
+                .get(&object.location)
+                .filter(|entry| entry.is_valid_for(&object))
+                .and_then(|entry| {
+                    entry
+                        .file_metadata
+                        .as_any()
+                        .downcast_ref::<CachedVortexMetadata>()
+                        .map(|m| {
+                            (
+                                m.footer().dtype().clone(),
+                                m.footer().statistics().cloned(),
+                                m.footer().row_count(),
+                            )
+                        })
+                });
 
             let (dtype, file_stats, row_count) = if let Some(metadata) = cached_metadata {
                 metadata
@@ -716,7 +717,8 @@ impl FileFormat for VortexFormat {
                     src = "infer_stats",
                     "footer cached",
                 );
-                file_metadata_cache.put(&object, cached);
+                let entry = CachedFileMetadataEntry::new(object.clone(), cached);
+                file_metadata_cache.put(&object.location, entry);
 
                 (
                     vxf.dtype().clone(),
@@ -766,55 +768,50 @@ impl FileFormat for VortexFormat {
                 let (stats_set, stats_dtype) = file_stats.get(col_idx);
 
                 // Update the total size in bytes.
-                let column_size = stats_set
-                    .get_as::<usize>(Stat::UncompressedSizeInBytes, &PType::U64.into())
-                    .unwrap_or_else(|| stats::Precision::inexact(0_usize));
+                let column_size =
+                    stats_set.get_as::<usize>(Stat::UncompressedSizeInBytes, &PType::U64.into());
                 sum_of_column_byte_sizes = sum_of_column_byte_sizes
                     .zip(column_size)
                     .map(|(acc, size)| acc + size);
 
-                // TODO(connor): There's a lot that can go wrong here, should probably handle this
-                // more gracefully...
-                // Find the min statistic.
-                let min = stats_set.get(Stat::Min).and_then(|pstat_val| {
-                    pstat_val
-                        .map(|stat_val| {
-                            // Because of DataFusion's Schema evolution, it is possible that the
-                            // type of the min/max stat has changed. Thus we construct the stat as
-                            // the file datatype first and only then do we cast accordingly.
-                            let stat_dtype = Stat::Min.dtype(stats_dtype)?;
-                            Scalar::try_new(stat_dtype, Some(stat_val))
-                                .ok()?
-                                .cast(&DType::from_arrow(field.as_ref()))
-                                .ok()?
-                                .try_to_df()
-                                .ok()
-                        })
-                        .transpose()
-                });
+                let target_dtype = DType::from_arrow(field.as_ref());
+                let min = scalar_stat_to_df(
+                    Stat::Min,
+                    stats_set.get(Stat::Min),
+                    stats_dtype,
+                    &target_dtype,
+                );
 
-                // Find the max statistic.
-                let max = stats_set.get(Stat::Max).and_then(|pstat_val| {
-                    pstat_val
-                        .map(|stat_val| {
-                            let stat_dtype = Stat::Max.dtype(stats_dtype)?;
-                            Scalar::try_new(stat_dtype, Some(stat_val))
-                                .ok()?
-                                .cast(&DType::from_arrow(field.as_ref()))
-                                .ok()?
-                                .try_to_df()
-                                .ok()
-                        })
-                        .transpose()
-                });
+                let max = scalar_stat_to_df(
+                    Stat::Max,
+                    stats_set.get(Stat::Max),
+                    stats_dtype,
+                    &target_dtype,
+                );
 
                 let null_count = stats_set.get_as::<usize>(Stat::NullCount, &PType::U64.into());
+
+                // Surface the column sum from the Vortex footer (`Stat::Sum`) so
+                // whole-table `SUM`/`AVG` can be answered from metadata without a
+                // scan. We deliberately keep the sum in its *own* widened dtype
+                // (`Stat::Sum.dtype`) rather than casting down to the column's
+                // arrow type: the sum of e.g. an `Int32` column is an `Int64` in
+                // DataFusion, and narrowing here would lose width or overflow.
+                let sum = match Stat::Sum.dtype(stats_dtype) {
+                    Some(sum_dtype) => scalar_stat_to_df(
+                        Stat::Sum,
+                        stats_set.get(Stat::Sum),
+                        stats_dtype,
+                        &sum_dtype,
+                    ),
+                    None => stats::Precision::Absent,
+                };
 
                 column_statistics.push(ColumnStatistics {
                     null_count: null_count.to_df(),
                     min_value: min.to_df(),
                     max_value: max.to_df(),
-                    sum_value: Precision::Absent,
+                    sum_value: sum.to_df(),
                     distinct_count: distinct_count_from_is_constant(stats_set.get_as::<bool>(
                         Stat::IsConstant,
                         &DType::Bool(Nullability::NonNullable),
@@ -855,7 +852,6 @@ impl FileFormat for VortexFormat {
 
         let mut source = file_scan_config
             .file_source()
-            .as_any()
             .downcast_ref::<VortexSource>()
             .cloned()
             .ok_or_else(|| internal_datafusion_err!("Expected VortexSource"))?;
@@ -937,10 +933,28 @@ impl FileFormat for VortexFormat {
     }
 }
 
-fn distinct_count_from_is_constant(
-    is_constant: Option<stats::Precision<bool>>,
-) -> Precision<usize> {
-    match is_constant.and_then(stats::Precision::as_exact) {
+fn scalar_stat_to_df(
+    stat: Stat,
+    value: stats::Precision<VortexScalarValue>,
+    stats_dtype: &DType,
+    target_dtype: &DType,
+) -> stats::Precision<datafusion_common::ScalarValue> {
+    let Some(scalar_dtype) = stat.dtype(stats_dtype) else {
+        return stats::Precision::Absent;
+    };
+
+    value
+        .map(|stat_value| {
+            Scalar::try_new(scalar_dtype, Some(stat_value))?
+                .cast(target_dtype)?
+                .try_to_df()
+        })
+        .transpose()
+        .unwrap_or(stats::Precision::Absent)
+}
+
+fn distinct_count_from_is_constant(is_constant: stats::Precision<bool>) -> Precision<usize> {
+    match is_constant.as_exact() {
         Some(true) => Precision::Exact(1),
         Some(false) | None => Precision::Absent,
     }
@@ -985,6 +999,119 @@ mod tests {
             .await?
             .collect()
             .await?;
+
+        Ok(())
+    }
+
+    /// Verifies the Vortex -> DataFusion statistics boundary: a written
+    /// Vortex file surfaces per-column byte sizes (from the footer's
+    /// `UncompressedSizeInBytes`) into `ColumnStatistics.byte_size` — including for
+    /// variable-width (`Utf8`) columns — and a projected scan reports only the
+    /// projected columns' bytes rather than the full unprojected row width.
+    #[tokio::test]
+    async fn propagates_per_column_byte_size() -> anyhow::Result<()> {
+        let ctx = TestSessionContext::new(true);
+
+        // Wide schema: fixed-width Int, a narrow Utf8, and a FAT Utf8 (`data`)
+        // standing in for a `VARCHAR(500)`-style column.
+        ctx.session
+            .sql(
+                "CREATE EXTERNAL TABLE t \
+                 (id INT NOT NULL, s VARCHAR NOT NULL, data VARCHAR NOT NULL) \
+                 STORED AS vortex LOCATION 'table/'",
+            )
+            .await?
+            .collect()
+            .await?;
+
+        // Write a known number of rows; `data` holds a long value so dropping it
+        // via projection produces a large, unmistakable drop in total_byte_size.
+        let n = 8usize;
+        let wide = "x".repeat(200);
+        let values = (1..=n)
+            .map(|i| format!("({i}, 's{i}', '{wide}')"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        ctx.session
+            .sql(&format!("INSERT INTO t VALUES {values}"))
+            .await?
+            .collect()
+            .await?;
+
+        let provider = ctx.session.table_provider("t").await?;
+        let state = ctx.session.state();
+
+        // --- All columns: per-column byte_size present, total == sum ---------
+        let all = provider
+            .scan(&state, None, &[], None)
+            .await?
+            .partition_statistics(None)?;
+        assert_eq!(all.num_rows.get_value(), Some(&n), "row count");
+
+        let id_bytes = *all.column_statistics[0]
+            .byte_size
+            .get_value()
+            .expect("Int column byte_size must be populated");
+        let s_bytes = *all.column_statistics[1]
+            .byte_size
+            .get_value()
+            .expect("narrow Utf8 byte_size must be populated");
+        let data_bytes = *all.column_statistics[2]
+            .byte_size
+            .get_value()
+            .expect("wide Utf8 byte_size must be populated");
+
+        assert!(
+            id_bytes >= 4 * n,
+            "Int32 byte_size should be >= 4*rows, got {id_bytes}"
+        );
+        assert!(
+            data_bytes > s_bytes,
+            "wide column must report more bytes than the narrow one ({data_bytes} vs {s_bytes})"
+        );
+
+        let all_total = *all
+            .total_byte_size
+            .get_value()
+            .expect("all-columns total present");
+        assert_eq!(
+            all_total,
+            id_bytes + s_bytes + data_bytes,
+            "all-columns total_byte_size must equal the sum of per-column byte_size"
+        );
+
+        // --- Projected scans: total reflects ONLY the projected columns ------
+        // Project [id] (fixed-width): total is just the int column.
+        let proj_id_cols = vec![0usize];
+        let proj_id = provider
+            .scan(&state, Some(&proj_id_cols), &[], None)
+            .await?
+            .partition_statistics(None)?;
+        assert_eq!(
+            proj_id.total_byte_size.get_value(),
+            Some(&id_bytes),
+            "projecting [id] must report only the id column's bytes"
+        );
+
+        // Project [s] (variable-width survives, fat `data` dropped).
+        let proj_s_cols = vec![1usize];
+        let proj_s = provider
+            .scan(&state, Some(&proj_s_cols), &[], None)
+            .await?
+            .partition_statistics(None)?;
+        assert_eq!(
+            proj_s.total_byte_size.get_value(),
+            Some(&s_bytes),
+            "projecting [s] must report only the s column's bytes, not the full row"
+        );
+        assert!(
+            *proj_s
+                .total_byte_size
+                .get_value()
+                .expect("projected total present")
+                < all_total,
+            "projected total must drop the unprojected wide `data` column"
+        );
 
         Ok(())
     }
@@ -1159,17 +1286,20 @@ mod tests {
     #[test]
     fn distinct_count_is_exact_only_for_exact_constant_true() {
         assert_eq!(
-            distinct_count_from_is_constant(Some(stats::Precision::exact(true))),
+            distinct_count_from_is_constant(stats::Precision::exact(true)),
             Precision::Exact(1)
         );
         assert_eq!(
-            distinct_count_from_is_constant(Some(stats::Precision::exact(false))),
+            distinct_count_from_is_constant(stats::Precision::exact(false)),
             Precision::Absent
         );
         assert_eq!(
-            distinct_count_from_is_constant(Some(stats::Precision::inexact(true))),
+            distinct_count_from_is_constant(stats::Precision::inexact(true)),
             Precision::Absent
         );
-        assert_eq!(distinct_count_from_is_constant(None), Precision::Absent);
+        assert_eq!(
+            distinct_count_from_is_constant(stats::Precision::Absent),
+            Precision::Absent
+        );
     }
 }

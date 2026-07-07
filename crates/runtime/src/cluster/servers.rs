@@ -19,7 +19,10 @@ use crate::auth::EndpointAuth;
 use crate::cluster::ExecutorRegistry;
 use crate::cluster::{ClusterServiceImpl, SchedulerPeers};
 use crate::flight::middleware::{RequestContextLayer, WriteRateLimitLayer};
-use crate::flight::{Error, Service as SpiceFlightService, is_address_in_use_error, session_auth};
+use crate::flight::{
+    Error, Service as SpiceFlightService, configure_flight_server_transport,
+    is_address_in_use_error, session_auth,
+};
 use crate::tls::flight_incoming::tls_incoming;
 use crate::{Runtime, metrics as runtime_metrics};
 use ballista_core::serde::protobuf::scheduler_grpc_server::SchedulerGrpcServer;
@@ -176,6 +179,11 @@ pub async fn start_internal_cluster_server(
     Ok(())
 }
 
+/// Upper bound on h2 pending-accept resets the executor Flight server tolerates
+/// before tripping Rapid-Reset flood protection. Set well above any realistic
+/// shuffle cancellation burst; see `start_executor_flight_server` for rationale.
+const EXECUTOR_MAX_PENDING_ACCEPT_RESET_STREAMS: usize = 100_000;
+
 /// Starts the executor Flight server for both Ballista shuffle data and Spice SQL queries.
 ///
 /// This server uses a composite Flight service that routes:
@@ -200,7 +208,18 @@ pub async fn start_executor_flight_server(
         });
     }
 
-    let server = Server::builder();
+    // The executor Flight server is the cluster shuffle endpoint: reducer partitions
+    // fetch concurrently over a pooled, multiplexed HTTP/2 connection per peer, and a
+    // stage cancellation resets the in-flight fetch streams in bursts. Those legitimate
+    // RST_STREAMs would otherwise trip h2's Rapid-Reset flood protection
+    // (`GOAWAY ENHANCE_YOUR_CALM` after 20 pending-accept resets, hyperium/hyper#2877),
+    // so the threshold is set well above any realistic shuffle cancellation burst. This
+    // is an internal cluster endpoint reached only by the scheduler and peer executors;
+    // in production that path is secured by cluster mTLS. Running without mTLS requires
+    // the dev-only `--allow-insecure-connections` flag, which is not used in deployments
+    // exposed to untrusted clients, so relaxing the Rapid-Reset threshold is safe.
+    let server = configure_flight_server_transport(Server::builder())
+        .http2_max_pending_accept_reset_streams(Some(EXECUTOR_MAX_PENDING_ACCEPT_RESET_STREAMS));
 
     if cluster_server_config.is_some() {
         tracing::info!("Cluster mTLS enabled for executor flight server");

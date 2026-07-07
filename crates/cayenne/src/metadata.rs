@@ -32,6 +32,10 @@ pub const DEFAULT_INLINE_FLUSH_MAX_ROWS: i64 = 10_000;
 pub const DEFAULT_INLINE_FLUSH_MAX_SEGMENTS: i64 = 64;
 /// Default maximum serialized IPC bytes to keep inline before flushing to Vortex.
 pub const DEFAULT_INLINE_FLUSH_MAX_BYTES: i64 = 8 * 1_048_576;
+/// Default maximum age of buffered streaming-append data before the sink cuts
+/// the segment and publishes it (bounds ingest-to-queryable latency for
+/// long-lived insert streams).
+pub const DEFAULT_STREAM_PUBLISH_INTERVAL_MS: u64 = 10_000;
 
 /// Metadata about a table in the catalog.
 #[derive(Debug, Clone)]
@@ -149,6 +153,16 @@ pub struct DeleteFile {
     /// - New inserts get higher sequence numbers
     /// - Old deletes don't apply to new data with the same PK
     pub sequence_number: i64,
+    /// Metadata-only publish: the per-commit-constant sequence at which the keys
+    /// deleted by THIS file were RE-INSERTED in the same upsert publish (`None`
+    /// for a pure delete that re-inserts nothing, and for position-based files
+    /// which carry no keys). On load the merge-on-read path assigns this sequence
+    /// to every key in this file's deletion vector, reconstructing the per-key
+    /// `cayenne_insert_record` map WITHOUT a durable row per key — the keys
+    /// deleted by an upsert are exactly the keys it re-inserts, at one shared
+    /// sequence. Legacy rows (pre-feature) and pure deletes leave this `None` and
+    /// fall back to the `cayenne_insert_record` table.
+    pub reinsert_sequence: Option<i64>,
 }
 
 /// Metadata about a partition in a table.
@@ -280,16 +294,15 @@ pub enum CompressionStrategy {
 ///
 /// The exact level → scheme-set mapping lives in
 /// `provider::delta_encoding::strategy_builder_for_level`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(try_from = "String", into = "String")]
 pub enum DeltaEncoding {
     /// Size-gated: light for small deltas, full for large writes.
-    Auto,
-    /// Fixed encoding level `0..=10` applied to every delta write.
-    Level(u8),
-}
-
-impl Default for DeltaEncoding {
+    /// Local micro A/B (2026-06-06) was neutral on the
+    /// upsert/bulk lanes; the aggregate CPU-per-delta benefit targets
+    /// production-scale CDC and is to be validated there. Set the
+    /// param to `7` to opt out (pre-feature behavior).
+    ///
     /// `Auto` — size-gated light encoding for small deltas. This is also what
     /// pre-feature stored table configs deserialize to via
     /// `#[serde(default)]`, so existing tables pick up the policy on upgrade
@@ -297,9 +310,10 @@ impl Default for DeltaEncoding {
     /// change never forces a table re-create). Set the
     /// `cayenne_delta_encoding` param to `7` to opt out (the full default
     /// cascade, byte-for-byte the pre-feature behavior).
-    fn default() -> Self {
-        Self::Auto
-    }
+    #[default]
+    Auto,
+    /// Fixed encoding level `0..=10` applied to every delta write.
+    Level(u8),
 }
 
 /// Maximum supported [`DeltaEncoding`] level.
@@ -455,6 +469,14 @@ impl DeletionMode {
     /// strategy. So the *mechanism* is chosen by the presence of a PK, but the
     /// resolved *mode* is position either way.
     ///
+    /// NOTE: the Spice accelerator's auto-tune layer pre-resolves `Auto` to
+    /// [`Self::Key`] for `refresh_mode: changes` (CDC) tables that have a
+    /// primary key BEFORE the config reaches this engine-level resolution —
+    /// position-delete compaction must serialize with writers and starves
+    /// under continuous CDC, while key-delete compaction runs concurrently.
+    /// This function therefore only sees `Auto` for non-CDC tables (and PK-less
+    /// CDC tables), where position remains the right resolution.
+    ///
     /// `Key` is the explicit opt-out (apply deletes above the scan). It only has
     /// meaning with a PK; a PK-less table can only do position-based deletion, so
     /// `Key` there resolves to `Position`.
@@ -477,6 +499,158 @@ impl DeletionMode {
     }
 }
 
+/// Durability mode for the inline CDC write path (`refresh_mode: changes`).
+///
+/// In [`Self::File`] (the explicit conservative opt-out — byte-identical to
+/// the pre-mem-tier behavior) every CDC batch persists a durable metastore
+/// entry / staged Vortex write before the source slot ack advances. In
+/// [`Self::Memory`] (the default) the inline path
+/// appends each batch to an in-RAM tier and DEFERS the source slot ack until a
+/// periodic/cap-triggered checkpoint flushes the tier to a durable Vortex file —
+/// collapsing per-batch durability cost at the price of replaying the
+/// un-checkpointed tail from the source slot on crash (the apply is
+/// PK-idempotent, so this is exactly-once). Memory mode is bounded by a
+/// per-table byte cap AND a process-global byte budget so it can never OOM; on
+/// cap breach it spills (checkpoints) and, under sustained overload, falls back
+/// to the durable path for the breaching batch.
+///
+/// Memory mode only applies to the small-write CDC profile; it is forced to
+/// [`Self::File`] for full/snapshot/append-without-fast-refresh profiles (no
+/// inline write path to invert) and for partitioned tables (their visibility
+/// flip cannot be deferred).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CdcDurability {
+    /// Per-batch durable metastore/Vortex persist before the slot ack. The
+    /// conservative explicit opt-out: byte-identical to the pre-mem-tier
+    /// behavior. Also what every NON-eligible table silently uses regardless
+    /// of configuration (see [`Self::Memory`]'s eligibility gates).
+    File,
+    /// In-RAM tier; slot ack deferred to a periodic/cap-triggered checkpoint.
+    /// The DEFAULT: A/B-validated faster than `file` end-to-end on the CDC
+    /// profile (higher analytical QPH, lower replication lag, and a fraction
+    /// of the disk footprint) with identical convergence. Safe as a default
+    /// because it is eligibility-gated, not forced: it engages only for the
+    /// changes/small-write refresh profile AND a replayable source committer
+    /// (the runtime arms it lazily on the first batch whose committer reports
+    /// `supports_deferral()`) on a non-partitioned table; every other
+    /// profile/source/table silently keeps the durable `File` path. The RAM
+    /// tier is bounded on three axes so the deferred slot ack keeps advancing
+    /// and the tier never grows unbounded: a per-table byte cap
+    /// (`cdc_mem_tier_max_bytes`, memory-scaled 256 MiB–1 GiB when unset)
+    /// checked by the write path per burst (the synchronous OOM backstop), an age cap
+    /// (`cdc_mem_tier_max_age_ms`, default 10 s) enforced by the periodic
+    /// background checkpoint task WITHOUT blocking the writer
+    /// (`cdc_mem_tier_checkpoint_interval_ms`, default 1 s), which also
+    /// flushes idle / pure-upsert tables that never trip the byte cap.
+    /// Correctness is unaffected (a crash discards the un-checkpointed tail;
+    /// the source re-streams on restart and the PK-idempotent apply converges
+    /// exactly-once).
+    #[default]
+    Memory,
+}
+
+impl CdcDurability {
+    /// Parse a spicepod parameter value (`file` | `memory`).
+    #[must_use]
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "file" => Some(Self::File),
+            "memory" => Some(Self::Memory),
+            _ => None,
+        }
+    }
+
+    /// Return the spicepod/config string for this mode.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::File => "file",
+            Self::Memory => "memory",
+        }
+    }
+
+    /// Whether this is the in-memory deferred-ack mode.
+    #[must_use]
+    pub const fn is_memory(self) -> bool {
+        matches!(self, Self::Memory)
+    }
+}
+
+/// Which adaptive-tunable knobs the operator pinned with an explicit value. In
+/// `adaptive` mode the closed-loop controller must not move a pinned knob — its
+/// tuning bounds collapse to a single point so `decide()` naturally skips it and
+/// falls through to another lever. (In `auto` mode there is no loop, so an
+/// explicit value is already frozen.) This is how the "override per config
+/// value" mode composes with `auto`/`adaptive`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "one independent pin flag per adaptive-tunable actuator"
+)]
+pub struct PinnedTuningActuators {
+    /// The inline-memtable flush caps were operator-set (don't adapt them).
+    pub inline_flush: bool,
+    /// `cayenne_compaction_background_interval_ms` was operator-set.
+    pub compaction_interval: bool,
+    /// `cayenne_compaction_trigger_files` was operator-set.
+    pub compaction_trigger: bool,
+    /// `cayenne_bake_deletion_index_trigger` was operator-set (don't adapt the
+    /// seq-prefix bake's deletion-index trigger).
+    pub bake_deletion_index_trigger: bool,
+    /// `cayenne_write_concurrency` was operator-set.
+    pub write_concurrency: bool,
+    /// `cayenne_cdc_mem_tier_max_bytes` was operator-set (don't adapt the
+    /// in-memory CDC durability tier byte cap).
+    pub mem_tier: bool,
+    /// `cayenne_target_file_size_mb` was operator-set (don't adapt the target
+    /// Vortex file size).
+    pub target_file_size: bool,
+}
+
+/// Storage medium backing a table's data files or metastore, mapped from the
+/// runtime's detected acceleration storage class at registration. Cayenne-local:
+/// the runtime's `ResolvedAccelerationStorage` lives in the `runtime` crate (which
+/// depends on this one), so it cannot be imported here — the accelerator maps onto
+/// this enum. A *detected* fact, not an operator knob: it never (de)serializes with
+/// the spicepod config (`#[serde(skip)]` on the carrying fields).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum StorageClass {
+    /// Local NVMe/SSD — fast random I/O; the tuner applies no write-amortization bias.
+    LocalSsd,
+    /// Network block store (e.g. EBS) — higher, variable latency: the slow tier.
+    Ebs,
+    /// tmpfs / RAM-backed — fastest; no bias.
+    Tmpfs,
+    /// Object store (S3) or an undetectable mount. The safe default — treated as the
+    /// slow tier so the tuner biases toward fewer, larger files / amortized commits.
+    #[default]
+    Unknown,
+}
+
+impl StorageClass {
+    /// Slow/networked tier (EBS, object store, or undetected) — biases the tuner
+    /// toward larger inline-flush (fewer, bigger files; fewer metastore commits).
+    /// `LocalSsd`/`Tmpfs` are fast and get no bias.
+    #[must_use]
+    pub fn is_slow_tier(self) -> bool {
+        matches!(self, Self::Ebs | Self::Unknown)
+    }
+
+    /// Stable numeric code for the telemetry info gauge: `0` `LocalSsd`, `1` `Ebs`,
+    /// `2` `Tmpfs`, `3` `Unknown`. Lets dashboards see the storage tier the tuner
+    /// detected without emitting a high-cardinality string label.
+    #[must_use]
+    pub fn metric_code(self) -> u64 {
+        match self {
+            Self::LocalSsd => 0,
+            Self::Ebs => 1,
+            Self::Tmpfs => 2,
+            Self::Unknown => 3,
+        }
+    }
+}
+
 /// Configuration for Vortex encodings to optimize compression and performance.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -495,6 +669,12 @@ pub struct VortexConfig {
     pub target_vortex_file_size_mb: usize,
     /// Columns to sort data by on refresh operations (empty = no sorting)
     pub sort_columns: Vec<String>,
+    /// Columns to hash-cluster rows by during intra-write sharding (the parallel
+    /// encode fan-out). Empty = derive from the primary key (PK-hash clustering,
+    /// the historical behavior); PK-less tables shard round-robin. Ignored for
+    /// sorted tables (`sort_columns` forces a single serial writer).
+    #[serde(default)]
+    pub shard_key_columns: Vec<String>,
     /// Compression strategy to use for Vortex files
     /// Defaults to Btrblocks
     pub compression_strategy: CompressionStrategy,
@@ -525,6 +705,18 @@ pub struct VortexConfig {
     /// Defaults to 8.
     #[serde(default = "default_compaction_trigger_files")]
     pub compaction_trigger_files: usize,
+    /// Deletion-index size (count of live PK tombstones) at or above which the
+    /// seq-prefix bake (Stage 2 compaction) is triggered. The bake consolidates
+    /// the settled older prefix of protected snapshots so their tombstones drop
+    /// out of the live merge-on-read deletion index, lowering the per-query probe
+    /// cost — at the cost of write amplification. A larger value bakes less often
+    /// (bounding write-amp); a smaller value bakes more often (smaller index,
+    /// cheaper probe). Key-delete tables only (position-delete tables never bake).
+    ///
+    /// Defaults to `50_000` (see
+    /// [`crate::provider::table::BAKE_DELETION_INDEX_TRIGGER`]).
+    #[serde(default = "default_bake_deletion_index_trigger")]
+    pub bake_deletion_index_trigger: usize,
     /// Number of protected snapshots that can accumulate before snapshot-maintenance
     /// compaction is eligible to run. Kept separate from `compaction_trigger_files`
     /// so small-file compaction tuning does not silently change scan amplification
@@ -595,6 +787,13 @@ pub struct VortexConfig {
         alias = "inline_memtable_max_bytes"
     )]
     pub inline_flush_max_bytes: i64,
+    /// Maximum age (ms) of buffered data in a streaming append before the sink
+    /// cuts the segment and publishes it, bounding ingest-to-queryable latency
+    /// for long-lived insert streams (e.g. ADBC bulk ingest). Each segment is a
+    /// complete prepare→stage→publish write. Set to 0 to disable and publish
+    /// only when the stream ends (pre-feature behavior).
+    #[serde(default = "default_stream_publish_interval_ms")]
+    pub stream_publish_interval_ms: u64,
     /// Whether inserts should scan existing data for primary-key conflicts. Set to `none` only
     /// when the source enforces PK uniqueness and ingestion cannot replay existing rows.
     #[serde(default)]
@@ -618,6 +817,260 @@ pub struct VortexConfig {
     /// above-scan key-based filter.
     #[serde(default)]
     pub deletion_mode: DeletionMode,
+    /// Durability mode for the inline CDC write path. [`CdcDurability::Memory`]
+    /// (default) appends to an in-RAM tier and defers the slot ack to a
+    /// periodic/cap-triggered checkpoint — A/B-validated faster than `file`
+    /// end-to-end and eligibility-gated (non-CDC profiles, non-replayable
+    /// sources, and partitioned tables silently keep the durable path).
+    /// [`CdcDurability::File`] persists each batch durably before advancing
+    /// the source slot: the explicit conservative opt-out, byte-identical to
+    /// the pre-mem-tier behavior.
+    #[serde(default)]
+    pub cdc_durability: CdcDurability,
+    /// Per-table RAM-tier byte cap before a forced spill (checkpoint) + slot
+    /// advance, in `cdc_durability: memory` mode only. `0` disables the
+    /// per-table cap; the process-global byte budget still bounds aggregate
+    /// resident memory. When both are set, whichever is breached first triggers
+    /// the spill. The serde default is the 256 MiB floor; when the param is
+    /// unset the accelerator auto-derives a memory-scaled value (~1/64 of host
+    /// RAM, clamped 256 MiB–1 GiB) so the periodic background checkpoint is
+    /// the primary flush path and the write-path spill remains a rare backstop.
+    #[serde(default = "default_cdc_mem_tier_max_bytes")]
+    pub cdc_mem_tier_max_bytes: i64,
+    /// Number of PK-hash shards for the in-mem CDC tier (`cdc_durability: memory`).
+    /// Each shard is an independent sub-tier (its own segments + tombstones + publish
+    /// lock), so ONE apply fans its rows across shards by `shard_of_pk` and runs the
+    /// validate→append per shard in parallel (intra-apply parallelism — the win is
+    /// inside a single apply, since `write_lock` already serializes applies). `1` is
+    /// the unsharded path, byte-identical to pre-sharding. `>1` is gated behind the
+    /// SF-1000 N-sweep; the checkpoint is ALWAYS whole-tier-atomic regardless of N
+    /// (a single-shard checkpoint would pin the source watermark → unbounded WAL).
+    #[serde(default = "default_cdc_mem_tier_shards")]
+    pub cdc_mem_tier_shards: usize,
+    /// Max wall-clock milliseconds a RAM-tier epoch may age before a forced
+    /// checkpoint, in `cdc_durability: memory` mode only. Bounds the crash-replay
+    /// window for cold/low-traffic tables (whose byte cap would otherwise never
+    /// trip). `0` disables the age trigger. Defaults to 10 s.
+    #[serde(default = "default_cdc_mem_tier_max_age_ms")]
+    pub cdc_mem_tier_max_age_ms: u64,
+    /// Minimum resident tier bytes before the PERIODIC background tick durably
+    /// checkpoints, in `cdc_durability: memory` mode only. Bounds snapshot /
+    /// delete-file churn: below this size a tick is a no-op unless the tier's
+    /// age has reached `cdc_mem_tier_max_age_ms` (which still bounds the
+    /// deferred slot ack and crash-replay window). The write-path cap spill and
+    /// explicit checkpoints are NOT gated. `0` disables the gate. The serde
+    /// default is the 32 MiB floor; when the param is unset the accelerator
+    /// auto-derives 1/8 of the derived byte cap (clamped 32–128 MiB), keeping
+    /// the cap:gate ratio constant so a larger tier flushes proportionally
+    /// larger files.
+    #[serde(default = "default_cdc_mem_tier_min_flush_bytes")]
+    pub cdc_mem_tier_min_flush_bytes: i64,
+    /// Periodic background mem-tier checkpoint interval in milliseconds, in
+    /// `cdc_durability: memory` mode only. The accelerator spawns a per-table
+    /// background task that checkpoints the RAM tier every interval (mirroring
+    /// the background compactor); this is what advances the deferred source slot
+    /// ack on an idle or pure-upsert stream that never trips a delete/truncate
+    /// event trigger or a write-path cap. `0` disables the periodic task. Defaults
+    /// to 1 s.
+    #[serde(default = "default_cdc_mem_tier_checkpoint_interval_ms")]
+    pub cdc_mem_tier_checkpoint_interval_ms: u64,
+    /// Max wall-clock milliseconds the ACTIVE ingestion piece may age before a
+    /// **seal** durably shadows it and advances the source replication slot, in
+    /// `cdc_durability: memory` mode only. This is the fresh-durability cadence
+    /// that DECOUPLES the slot ack (and thus replication/freshness lag) from the
+    /// heavy protected-snapshot checkpoint: a seal writes the un-sealed RAM delta
+    /// to the durable-but-unpublished inline corpus (one metastore commit, no
+    /// Vortex encode, no listing-fence publish, no read-amp) and fires the slot
+    /// advancer, so the slot advances every ~`seal_age_ms` instead of every
+    /// `max_age_ms`/`min_flush_bytes` checkpoint. Reads are unaffected — they
+    /// already union the RAM tier; the shadow is invisible in-process and is only
+    /// replayed on crash recovery. Bounds replication lag WITHOUT the read-amp of a
+    /// faster full checkpoint. `0` disables sealing (slot ack reverts to the
+    /// checkpoint cadence — the pre-seal behavior). Defaults to 2 s so replication
+    /// freshness stays under ~3 s. Should be `<= cdc_mem_tier_max_age_ms` to have
+    /// any effect (a seal older than the checkpoint window is superseded by the
+    /// checkpoint's own slot advance).
+    #[serde(default = "default_cdc_mem_tier_seal_age_ms")]
+    pub cdc_mem_tier_seal_age_ms: u64,
+    /// Enable the closed-loop dynamic auto-tuner (see `provider::tuning`). Set by
+    /// the `cayenne_tuning` mode: `auto` (default) → `false` (static derivation
+    /// only); `adaptive` → `true` (static warm-start + the closed loop). When on,
+    /// a per-table controller measures the CDC ingest rate *and the runtime's
+    /// whole-system response* (apply latency vs offered load, read amplification
+    /// that slows queries, cgroup-aware memory pressure) and nudges the safe
+    /// per-operation knobs within the environment-derived `[floor, ceiling]`.
+    #[serde(default)]
+    pub dynamic_tuning: bool,
+    /// Adaptive-tunable knobs the operator pinned with an explicit value; the
+    /// closed loop leaves these alone (see [`PinnedTuningActuators`]).
+    #[serde(default)]
+    pub pinned_tuning_actuators: PinnedTuningActuators,
+    /// Build the scan's file set from the per-snapshot manifest
+    /// (`cayenne_snapshot_file`) instead of by listing the snapshot directory.
+    ///
+    /// EXPERIMENTAL and **off by default**. This path is not yet
+    /// production-hardened: the manifest is maintained as a dual-source supplement
+    /// to directory listing and has not been proven complete on every write/commit
+    /// path, so opting in trades the authoritative listing for a faster-to-resolve
+    /// but less-exercised source. It is **not** required by — and is independent
+    /// of — the seq-prefix deletion-index bake: the bake reads the above-`T`
+    /// protected snapshots via the existing protected-snapshot scan union
+    /// (`protected_snapshots`), never via this manifest.
+    ///
+    /// Defaults to `false` (directory listing) so the manifest stays a
+    /// dual-source supplement until it is proven complete on every path. When
+    /// `true`, a scan resolves its data files from the manifest rows for the
+    /// snapshot it pinned; if the manifest is empty for that snapshot (e.g. a
+    /// snapshot written before population, or a transient post-write rebuild
+    /// failure) the scan transparently falls back to directory listing, so this
+    /// flag never makes a scan miss a live file. The manifest is populated to be
+    /// equal to the directory listing by construction (see
+    /// `upsert_snapshot_manifest_from_listing`).
+    #[serde(default)]
+    pub scan_from_manifest: bool,
+    /// Which widening schema differences detected at table open (the requested
+    /// schema vs the stored metastore schema) may be committed in place via
+    /// `update_table_schema` instead of pinning the stored schema. Set by the
+    /// runtime accelerator from the dataset's `on_schema_change` policy
+    /// (`append_new_columns` / `sync_all_columns`); the default
+    /// [`SchemaEvolutionMode::Disabled`] keeps the legacy pin-stored-schema
+    /// behavior verbatim (`on_schema_change: block`/`fail`, or omitted).
+    /// Runtime-only — never compared by `configuration_matches`.
+    #[serde(default, skip_serializing_if = "SchemaEvolutionMode::is_disabled")]
+    pub schema_evolution: SchemaEvolutionMode,
+    /// Goal-driven adaptive-tuning setpoints (each `None` = unset → the legacy
+    /// signal-driven controller for that metric). When any is set, the closed loop
+    /// drives that high-level SLO toward target with small incremental steps,
+    /// converging within `goal_convergence_window_secs`. Set from the
+    /// `cayenne_goal_*` params; setting any goal implies `dynamic_tuning` (a goal
+    /// with the loop off is inert). Runtime-only — never compared by
+    /// `configuration_matches` (does not affect data layout).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub goal_replication_lag_secs: Option<f64>,
+    /// Freshness goal target in seconds (age of the newest queryable data).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub goal_freshness_secs: Option<f64>,
+    /// Query-latency (p99) goal target in milliseconds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub goal_query_latency_ms: Option<f64>,
+    /// Query-throughput goal target in queries per hour (higher is better).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub goal_qph: Option<f64>,
+    /// Convergence window (seconds) for goal-driven tuning. `None` → the default
+    /// (`provider::tuning::DEFAULT_GOAL_CONVERGENCE_WINDOW`, 60s).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub goal_convergence_window_secs: Option<f64>,
+    /// Storage medium of the table's DATA files (Vortex), detected at registration
+    /// and mapped from the runtime's acceleration storage class. A slow tier
+    /// (EBS / object store / undetected) biases the tuner toward fewer, larger
+    /// files. Detected runtime fact — `#[serde(skip)]` (never a spicepod knob,
+    /// never compared by `configuration_matches`).
+    #[serde(skip)]
+    pub data_storage_class: StorageClass,
+    /// Storage medium of the METASTORE (where publish commits + inline re-reads
+    /// land). A slow tier biases toward larger inline-flush to amortize commits.
+    #[serde(skip)]
+    pub metastore_storage_class: StorageClass,
+    /// Measured sequential write throughput of the DATA volume in MiB/s, from the
+    /// runtime's startup calibration probe; `None` when unprobed (remote/object
+    /// store) or the probe failed. Refines [`Self::data_storage_class`] into the
+    /// tuner's *continuous* slow-tier bias (a fast io2 volume gets less
+    /// amortization pressure than a slow gp3). Detected runtime fact — `#[serde(skip)]`.
+    #[serde(skip)]
+    pub data_storage_write_mbps: Option<f64>,
+    /// Measured sequential write throughput of the METASTORE volume in MiB/s
+    /// (calibration probe); refines the publish-bias bar. `None` when unprobed.
+    #[serde(skip)]
+    pub metastore_storage_write_mbps: Option<f64>,
+    /// Force the **read/query** scan to emit Arrow *view* types (`Utf8View`/
+    /// `BinaryView`) for `Utf8`/`Binary` columns, decoupled from the stored
+    /// schema (which keeps the original types for writes/CDC/stats/keyset). Lets
+    /// `DataFusion` plan joins/aggregates on view arrays, avoiding the i32 2 GiB
+    /// offset overflow in hash-join build-side `concat_batches` (e.g. `CH-benCH`
+    /// q21 at SF1000, where `su_name` fans out across a ~100M-row join).
+    ///
+    /// Runtime-configurable: the accelerator factory sets it (default off; opt in
+    /// with `cayenne_force_view_types: true`).
+    #[serde(skip)]
+    pub force_view_read_schema: bool,
+
+    // ---- Cold object-store tier (storage-cascade bottom tier; cascade model) ----
+    /// Absolute object-store URL prefix for the cold tier (e.g.
+    /// `s3://bucket/prefix`). `None`/empty (the default) disables the cold tier.
+    /// Set from the `cayenne_cold_tier_location` spicepod param. Persisted so a
+    /// reopened table knows where its cold files live; NOT compared by
+    /// `configuration_matches`, so toggling it never recreates the table (the
+    /// cold tier is a strict superset of behavior over an unchanged warm tier).
+    pub cold_tier_location: Option<String>,
+    /// Liquid-clustering key columns for cold files (multi-column Z-order).
+    /// Empty = fall back to `sort_columns`, then the primary key. Set from
+    /// `cayenne_cold_clustering_columns`.
+    pub cold_clustering_columns: Vec<String>,
+    /// Target size for cold Vortex files in MB. Larger than the warm
+    /// `target_vortex_file_size_mb` because object stores favor fewer, larger
+    /// objects and cold scans are range reads. Set from
+    /// `cayenne_cold_target_file_size_mb`. Defaults to 512.
+    pub cold_target_file_size_mb: usize,
+    /// Promotion fires only once the warm tier exceeds this many bytes
+    /// (`<= 0` disables the byte trigger). Set from
+    /// `cayenne_cold_tier_warm_max_bytes`.
+    pub cold_tier_warm_max_bytes: i64,
+    /// Promotion fires only once the warm tier exceeds this many files
+    /// (`0` disables the file-count trigger). Set from
+    /// `cayenne_cold_tier_warm_max_files`.
+    pub cold_tier_warm_max_files: usize,
+    /// How often (ms) the background loop evaluates the cold-promotion trigger.
+    /// Cold tiering is not latency-critical, so this is much coarser than the
+    /// compaction interval. Set from `cayenne_cold_tier_background_interval_ms`.
+    /// Defaults to 60s.
+    pub cold_tier_background_interval_ms: u64,
+}
+
+impl VortexConfig {
+    /// Whether the cold object-store tier is enabled (a non-empty location set).
+    #[must_use]
+    pub fn cold_tier_enabled(&self) -> bool {
+        self.cold_tier_location
+            .as_ref()
+            .is_some_and(|s| !s.trim().is_empty())
+    }
+}
+
+/// Evolution set permitted when a widening schema difference is detected at
+/// table open. Mirrors the runtime's `on_schema_change` policy semantics:
+/// `append_new_columns` evolves added nullable columns only, `sync_all_columns`
+/// evolves the full widening set (added columns + lossless type widening +
+/// nullability relax).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SchemaEvolutionMode {
+    /// Never evolve the stored schema (legacy behavior: pin the stored schema
+    /// and warn on any difference).
+    #[default]
+    Disabled,
+    /// Evolve added nullable columns only (`on_schema_change: append_new_columns`).
+    AddColumnsOnly,
+    /// Evolve the full widening set (`on_schema_change: sync_all_columns`).
+    Widen,
+}
+
+impl SchemaEvolutionMode {
+    /// `true` when this is [`SchemaEvolutionMode::Disabled`] (the serde
+    /// skip-serializing predicate, so stored `vortex_config_json` stays
+    /// byte-identical for non-evolving tables).
+    #[must_use]
+    pub fn is_disabled(&self) -> bool {
+        matches!(self, SchemaEvolutionMode::Disabled)
+    }
+
+    /// Whether `plan` falls within this mode's evolution set.
+    #[must_use]
+    pub fn allows(&self, plan: &arrow_tools::schema_evolution::WideningPlan) -> bool {
+        match self {
+            SchemaEvolutionMode::Disabled => false,
+            SchemaEvolutionMode::AddColumnsOnly => plan.is_additive_only(),
+            SchemaEvolutionMode::Widen => true,
+        }
+    }
 }
 
 fn default_concurrency() -> usize {
@@ -630,6 +1083,10 @@ fn default_upload_concurrency() -> usize {
 
 fn default_compaction_trigger_files() -> usize {
     8
+}
+
+fn default_bake_deletion_index_trigger() -> usize {
+    crate::provider::table::BAKE_DELETION_INDEX_TRIGGER
 }
 
 fn default_compaction_trigger_protected_snapshots() -> usize {
@@ -674,6 +1131,95 @@ fn default_inline_flush_max_segments() -> i64 {
 
 fn default_inline_flush_max_bytes() -> i64 {
     DEFAULT_INLINE_FLUSH_MAX_BYTES
+}
+
+fn default_stream_publish_interval_ms() -> u64 {
+    DEFAULT_STREAM_PUBLISH_INTERVAL_MS
+}
+
+/// Default per-table RAM-tier byte cap for `cdc_durability: memory` (256 MiB —
+/// the serde/engine floor; the accelerator's auto-tune derives a memory-scaled
+/// value of ~1/64 of host RAM clamped to 256 MiB–1 GiB when the param is unset,
+/// so memory-rich hosts get a larger cap and hosts at/under 16 GiB keep this
+/// floor).
+///
+/// This is the SYNCHRONOUS write-path spill threshold (`mem_tier_per_table_cap_breached`),
+/// which blocks the refresh-task's next batch while it flushes — so it should be
+/// a rare backstop, not the primary flush. The primary flush is the periodic
+/// background checkpointer, which (since the two-phase `checkpoint_mem_tier`
+/// moved the encode + `BEGIN IMMEDIATE` commit OUTSIDE the listing fence) no
+/// longer stalls appends — so a larger tier is cheap. 256 MiB gives the 1 s
+/// background tick time to drain the tier before this cap is reached at typical
+/// CDC rates, while staying small enough that ~N memory-mode tables sum well
+/// under the process-global budget, which remains the RAM-scaling aggregate
+/// backstop.
+fn default_cdc_mem_tier_max_bytes() -> i64 {
+    256 * 1024 * 1024
+}
+
+/// One shard by default — the unsharded path, byte-identical to pre-sharding.
+/// `>1` (intra-apply parallelism) is opted into per-table via the accelerator and
+/// sized from the SF-1000 N-sweep; never auto-scaled (finer N = finer bloom slices
+/// + more metastore refills, so the knee is empirical).
+fn default_cdc_mem_tier_shards() -> usize {
+    1
+}
+
+/// Default minimum tier size before the PERIODIC tick durably checkpoints
+/// (32 MiB — the serde/engine floor; the accelerator's auto-tune derives 1/8 of
+/// the derived byte cap, clamped 32–128 MiB, when the param is unset, keeping
+/// the cap:gate ratio constant). Every durable checkpoint costs a new snapshot +
+/// delete-vector files + a listing refresh under the fence; at a 1 s tick a
+/// high-rate table would otherwise produce ~600 tiny snapshots per 10 minutes
+/// (measured at SF-100: 408–676 accumulated snapshot dirs per heavy table), and
+/// the accumulated churn degrades scans and the apply path. Gating the tick on
+/// min-flush-bytes OR the age cap caps churn at ~`max_bytes/min_flush` files per
+/// flush window while leaving freshness untouched (RAM rows are visible to
+/// queries immediately; only the deferred source-slot ack waits, bounded by
+/// `cdc_mem_tier_max_age_ms`). The write-path cap spill and explicit
+/// checkpoints bypass the gate. `0` disables the gate (every tick flushes).
+fn default_cdc_mem_tier_min_flush_bytes() -> i64 {
+    32 * 1024 * 1024
+}
+
+/// Default RAM-tier age cap for `cdc_durability: memory` (10 s).
+///
+/// Bounds the crash-replay window for a slow-trickle table that never reaches
+/// the byte cap. Enforced ONLY by the periodic background tick
+/// (`run_mem_tier_checkpoint_tick`) — the write path never blocks on age (the
+/// writer-side spill predicate is byte-only; see
+/// `mem_tier_per_table_cap_breached`), so the slot-ack/replay bound is
+/// `max_age` + one tick interval + the checkpoint duration, with zero apply
+/// stall. Raised from 2 s now that the background checkpointer (1 s tick) is
+/// the primary, non-fence-blocking flush path: an actively-written table is
+/// drained by the background tick long before 10 s, so this age cap only
+/// catches genuinely slow tables. Deliberately NOT hardware-derived by the
+/// accelerator's auto-tune: it is a time-domain durability-policy bound, and
+/// scaling it with host capacity would silently change crash-replay semantics.
+fn default_cdc_mem_tier_max_age_ms() -> u64 {
+    10_000
+}
+
+/// Default periodic mem-tier checkpoint interval for `cdc_durability: memory`
+/// (1 s). The accelerator spawns a per-memory-mode-table background task that
+/// checkpoints the RAM tier every interval (mirroring the background compactor),
+/// which is what advances the deferred source slot ack on an idle/pure-upsert
+/// stream. Set to 0 to disable the periodic task (the write-path caps still
+/// bound hot tables).
+fn default_cdc_mem_tier_checkpoint_interval_ms() -> u64 {
+    1_000
+}
+
+/// Default seal cadence for `cdc_durability: memory` (2 s). A seal durably
+/// shadows the un-sealed RAM delta into the unpublished inline corpus and
+/// advances the source slot WITHOUT a full protected-snapshot checkpoint, so
+/// replication/freshness lag is bounded by this (not by `max_age_ms` /
+/// `min_flush_bytes`). 2 s keeps freshness under ~3 s while amortizing the
+/// per-seal metastore commit. Set to 0 to disable sealing (slot ack reverts to
+/// the checkpoint cadence). Like the age cap, this is a time-domain durability
+/// policy bound and is deliberately NOT hardware-derived.
+fn default_cdc_mem_tier_seal_age_ms() -> u64 {
+    2_000
 }
 
 impl VortexConfig {
@@ -752,6 +1298,8 @@ impl Default for VortexConfig {
             target_vortex_file_size_mb: 256,
             // No sort columns by default
             sort_columns: Vec::new(),
+            // Shard key derives from the primary key unless overridden
+            shard_key_columns: Vec::new(),
             compression_strategy: CompressionStrategy::default(),
             // `auto`: size-gated light encoding for small deltas (re-encoded
             // by compaction). Local micro A/B (2026-06-06) was neutral on the
@@ -762,6 +1310,7 @@ impl Default for VortexConfig {
             upload_concurrency: default_upload_concurrency(),
             write_concurrency: None,
             compaction_trigger_files: default_compaction_trigger_files(),
+            bake_deletion_index_trigger: default_bake_deletion_index_trigger(),
             compaction_trigger_protected_snapshots: default_compaction_trigger_protected_snapshots(
             ),
             compaction_trigger_snapshot_age_ms: default_compaction_trigger_snapshot_age_ms(),
@@ -774,9 +1323,39 @@ impl Default for VortexConfig {
             inline_flush_max_rows: default_inline_flush_max_rows(),
             inline_flush_max_segments: default_inline_flush_max_segments(),
             inline_flush_max_bytes: default_inline_flush_max_bytes(),
+            stream_publish_interval_ms: default_stream_publish_interval_ms(),
             pk_conflict_detection: PkConflictDetection::default(),
             pk_keyset_cache_mb: None,
             deletion_mode: DeletionMode::default(),
+            cdc_durability: CdcDurability::default(),
+            cdc_mem_tier_max_bytes: default_cdc_mem_tier_max_bytes(),
+            cdc_mem_tier_shards: default_cdc_mem_tier_shards(),
+            cdc_mem_tier_max_age_ms: default_cdc_mem_tier_max_age_ms(),
+            cdc_mem_tier_min_flush_bytes: default_cdc_mem_tier_min_flush_bytes(),
+            cdc_mem_tier_checkpoint_interval_ms: default_cdc_mem_tier_checkpoint_interval_ms(),
+            cdc_mem_tier_seal_age_ms: default_cdc_mem_tier_seal_age_ms(),
+            dynamic_tuning: false,
+            pinned_tuning_actuators: PinnedTuningActuators::default(),
+            // Directory listing stays the scan's file source by default; the
+            // manifest is a dual-source supplement until proven complete.
+            scan_from_manifest: false,
+            schema_evolution: SchemaEvolutionMode::default(),
+            goal_replication_lag_secs: None,
+            goal_freshness_secs: None,
+            goal_query_latency_ms: None,
+            goal_qph: None,
+            goal_convergence_window_secs: None,
+            data_storage_class: StorageClass::default(),
+            metastore_storage_class: StorageClass::default(),
+            data_storage_write_mbps: None,
+            metastore_storage_write_mbps: None,
+            force_view_read_schema: false,
+            cold_tier_location: None,
+            cold_clustering_columns: Vec::new(),
+            cold_target_file_size_mb: 512,
+            cold_tier_warm_max_bytes: 0,
+            cold_tier_warm_max_files: 0,
+            cold_tier_background_interval_ms: 60_000,
         }
     }
 }
@@ -796,11 +1375,82 @@ mod tests {
         assert_eq!(config.pk_conflict_detection, PkConflictDetection::Auto);
     }
 
+    /// `scan_from_manifest` must default OFF (directory listing) so the
+    /// per-snapshot manifest stays a dual-source supplement until it is proven
+    /// complete on every path. A regression flipping this default to `true`
+    /// would silently make the manifest the authoritative scan source — guard
+    /// both the struct default and the serde (empty-config) default.
+    #[test]
+    fn test_scan_from_manifest_defaults_off() {
+        assert!(
+            !VortexConfig::default().scan_from_manifest,
+            "scan_from_manifest must default to false (directory listing)"
+        );
+        let from_empty: VortexConfig = serde_json::from_str("{}").expect("valid empty config");
+        assert!(
+            !from_empty.scan_from_manifest,
+            "an empty config must inherit scan_from_manifest = false via serde default"
+        );
+        let opted_in: VortexConfig = serde_json::from_str(r#"{"scan_from_manifest": true}"#)
+            .expect("valid config with scan_from_manifest opt-in");
+        assert!(
+            opted_in.scan_from_manifest,
+            "an explicit scan_from_manifest = true must deserialize as opt-in"
+        );
+    }
+
     #[test]
     fn test_vortex_config_deserializes_pk_conflict_detection_default() {
         let config: VortexConfig = serde_json::from_str("{}").expect("valid empty config");
 
         assert_eq!(config.pk_conflict_detection, PkConflictDetection::Auto);
+    }
+
+    /// The mem-tier caps + periodic interval must default to NON-ZERO so the
+    /// write-path spill and the periodic checkpoint self-fire (bounding the tier
+    /// and advancing the deferred slot ack). A regression to `0`/`u64::MAX`
+    /// disables both and reopens the unbounded-tier lag gap. Guards both the
+    /// struct default and the serde default (an empty config must inherit them).
+    #[test]
+    fn test_cdc_mem_tier_caps_default_non_zero() {
+        let config = VortexConfig::default();
+        assert!(
+            config.cdc_mem_tier_max_bytes > 0,
+            "cdc_mem_tier_max_bytes must default non-zero so the write-path spill self-fires"
+        );
+        assert!(
+            config.cdc_mem_tier_max_age_ms > 0,
+            "cdc_mem_tier_max_age_ms must default non-zero so cold tables checkpoint"
+        );
+        assert!(
+            config.cdc_mem_tier_checkpoint_interval_ms > 0,
+            "cdc_mem_tier_checkpoint_interval_ms must default non-zero so the periodic task runs"
+        );
+        assert!(
+            config.cdc_mem_tier_seal_age_ms > 0,
+            "cdc_mem_tier_seal_age_ms must default non-zero so sealing (fast durable slot \
+             advance) is ON by default — the feature must not be gated behind an opt-in flag"
+        );
+        assert!(
+            config.cdc_mem_tier_seal_age_ms <= config.cdc_mem_tier_max_age_ms,
+            "the seal cadence must default at or below the checkpoint age cap, or seals never \
+             fire before the checkpoint supersedes them"
+        );
+
+        let from_empty: VortexConfig = serde_json::from_str("{}").expect("valid empty config");
+        assert_eq!(
+            from_empty.cdc_mem_tier_max_bytes, config.cdc_mem_tier_max_bytes,
+            "an empty config must inherit the non-zero byte cap via serde default"
+        );
+        assert_eq!(
+            from_empty.cdc_mem_tier_max_age_ms, config.cdc_mem_tier_max_age_ms,
+            "an empty config must inherit the non-zero age cap via serde default"
+        );
+        assert_eq!(
+            from_empty.cdc_mem_tier_checkpoint_interval_ms,
+            config.cdc_mem_tier_checkpoint_interval_ms,
+            "an empty config must inherit the non-zero checkpoint interval via serde default"
+        );
     }
 
     #[test]
@@ -923,6 +1573,94 @@ pub struct CreateTableOptions {
     pub vortex_config: VortexConfig,
 }
 
+/// Per-file statistics for one Vortex object in a snapshot directory.
+///
+/// Persisted in `cayenne_snapshot_file_statistics` so listing-time pruning can
+/// reuse footer min/max without re-reading every object on each scan. Rows are
+/// keyed by `(table_id, snapshot_id, file_path)` and invalidated when
+/// `file_size_bytes` no longer matches the object store metadata.
+///
+/// Consumers must treat these values as optimization hints only.
+#[derive(Debug, Clone)]
+pub struct SnapshotFileStatistics {
+    /// Table this stats entry belongs to (`UUIDv7`)
+    pub table_id: String,
+    /// Snapshot directory the file was listed from (`UUIDv7`)
+    pub snapshot_id: String,
+    /// Object-store path of the `.vortex` file (as returned by listing)
+    pub file_path: String,
+    /// Cached `ObjectMeta::size` at the time stats were captured
+    pub file_size_bytes: i64,
+    /// Row count from the file footer when stats were captured
+    pub num_rows: i64,
+    /// Serialized Vortex `FileStatistics` flatbuffer bytes (per-column min, max,
+    /// and null count)
+    pub statistics_blob: Vec<u8>,
+}
+
+/// One row of the authoritative per-snapshot data-file manifest
+/// (`cayenne_snapshot_file`). Unlike [`SnapshotFileStatistics`] (a best-effort
+/// pruning cache), the manifest is the COMPLETE file set for a snapshot — every
+/// data file the scan must read. A new snapshot references an existing file by
+/// inserting a row pointing at the same `file_path` (no copy), which is what
+/// lets compaction bake only the dead-heavy files and reference the rest in
+/// place. `min_sequence`/`max_sequence` carry the file's commit-seq range so a
+/// seq-prefix bake (`max_sequence <= T`) is well-defined.
+#[derive(Debug, Clone)]
+pub struct SnapshotFile {
+    /// Table this manifest entry belongs to (`UUIDv7`).
+    pub table_id: String,
+    /// Snapshot this file is a member of (`UUIDv7`).
+    pub snapshot_id: String,
+    /// Object-store path of the `.vortex` data file (as returned by listing).
+    pub file_path: String,
+    /// Live row count in the file.
+    pub row_count: i64,
+    /// `ObjectMeta::size` of the file in bytes.
+    pub file_size_bytes: i64,
+    /// Inclusive minimum commit sequence of the rows in this file.
+    pub min_sequence: i64,
+    /// Inclusive maximum commit sequence of the rows in this file.
+    pub max_sequence: i64,
+}
+
+/// One row of the cold-tier object-store manifest (`cayenne_cold_tier_file`).
+///
+/// The cold tier is the bottom of the storage cascade (RAM mem-tier →
+/// local-disk warm Vortex snapshot → object-store cold). A background promotion
+/// stage rewrites settled/aged warm files as read-optimized (Z-order clustered)
+/// Vortex files on the cold object store and records one row here per file.
+///
+/// Unlike [`SnapshotFile`], cold files are **table-scoped** (not a member of any
+/// snapshot directory) and append-only: a promoted file is referenced only from
+/// this table, never from `cayenne_snapshot_file`. `file_url` is the *absolute*
+/// object-store URL (e.g. `s3://bucket/prefix/{table_id}/cold/<id>.vortex`),
+/// because the cold location may differ from the table's warm path. The embedded
+/// `statistics_blob` (serialized Vortex [`FileStatistics`]: per-column min/max/
+/// null/sum) lets the scan prune cold files at listing time with no object-store
+/// round-trip. `min_sequence`/`max_sequence` carry the file's commit-seq range
+/// (cold files hold the oldest, fully-superseded data — below all protected
+/// snapshots and retention at promotion time).
+#[derive(Debug, Clone)]
+pub struct ColdTierFile {
+    /// Table this cold file belongs to (`UUIDv7`).
+    pub table_id: String,
+    /// Absolute object-store URL of the `.vortex` data file on the cold store.
+    pub file_url: String,
+    /// Live row count in the file (post-merge, single-version-per-key).
+    pub row_count: i64,
+    /// `ObjectMeta::size` of the file in bytes.
+    pub file_size_bytes: i64,
+    /// Inclusive minimum commit sequence of the rows in this file.
+    pub min_sequence: i64,
+    /// Inclusive maximum commit sequence of the rows in this file.
+    pub max_sequence: i64,
+    /// Serialized Vortex `FileStatistics` flatbuffer (per-column min/max/null/
+    /// sum). Always populated at promotion (copied from the written footer) so
+    /// listing-time pruning never falls back to a full scan.
+    pub statistics_blob: Vec<u8>,
+}
+
 /// Table-level statistics stored as a serialized Vortex [`FileStatistics`] blob.
 ///
 /// Stores per-column statistics (min, max, null count) maintained incrementally
@@ -949,10 +1687,22 @@ pub struct TableStatistics {
     /// the sum of every insert ever made. Compaction and overwrite reset it to
     /// the authoritative rewritten count.
     pub num_rows: i64,
+    /// Whether [`Self::num_rows`] is a provably-exact live count (`true`) or a
+    /// best-effort estimate that may over-count (`false`).
+    ///
+    /// The mem-tier checkpoint applies a `Delta` whose durable-supersede netting
+    /// is best-effort, so it taints this to `false`; a full-rewrite compaction /
+    /// overwrite `Set`s an authoritative count and restores `true`. Consumers that
+    /// answer `COUNT(*)` from statistics (the `stats_aggregate` fold and the
+    /// distributed executor-statistics reporter) must treat a `false` count as
+    /// `Precision::Inexact`, so the fold declines and a real scan answers instead
+    /// — preventing a drifted count from producing a wrong `COUNT(*)`.
+    pub num_rows_exact: bool,
     /// Serialized per-column NDV (distinct-count) `HyperLogLog` sketches
-    /// ([`crate::hll::NdvSketches`]), `None` when no integer column has a sketch.
-    /// Merged across writes register-wise; used to size distributed joins on
-    /// sparse integer keys. See [`crate::hll`].
+    /// ([`crate::hll::NdvSketches`]), `None` when no NDV-tracked column has a
+    /// sketch. Merged across writes register-wise; used to size distributed
+    /// joins and group-bys on integer, string, and temporal (date/time/timestamp)
+    /// keys. See [`crate::hll`].
     pub ndv_sketches: Option<Vec<u8>>,
 }
 

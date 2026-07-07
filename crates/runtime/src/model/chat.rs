@@ -43,11 +43,11 @@ use crate::{
     Runtime,
     parameters::Parameters,
     tools::{
-        options::SpiceToolsOptions,
         registry::{TOOL_EMBEDDING_MODEL_PARAM, prepare_model_tools},
         utils::{create_table_allowlist, get_tools_with_allowlist},
     },
 };
+use runtime_tools::options::SpiceToolsOptions;
 
 pub type LLMChatCompletionsModelStore = HashMap<String, Arc<dyn Chat>>;
 
@@ -324,8 +324,99 @@ async fn huggingface(
     }
 
     let chat_template_literal = params.get("chat_template").expose().ok();
+    let distributed = parse_distributed_config(params)?;
 
-    llms::chat::create_hf_model(&id, model_type, gguf_path, hf_token, chat_template_literal).await
+    llms::chat::create_hf_model(
+        &id,
+        model_type,
+        gguf_path,
+        hf_token,
+        chat_template_literal,
+        distributed,
+    )
+    .await
+}
+
+/// Parse the optional multi-node distributed-inference params (`distributed_backend`,
+/// `node_rank`, `nodes`) for a Huggingface model into a [`llms::chat::DistributedConfig`].
+/// Returns `Ok(None)` when distributed mode is not requested.
+#[cfg(feature = "models")]
+fn parse_distributed_config(
+    params: &Parameters,
+) -> Result<Option<llms::chat::DistributedConfig>, LlmError> {
+    let backend = match params
+        .get("distributed_backend")
+        .expose()
+        .ok()
+        .map(|s| s.trim().to_ascii_lowercase())
+        .as_deref()
+    {
+        None | Some("" | "none") => {
+            // Distributed is off: reject orphan topology params so forgetting (or
+            // mistyping) `distributed_backend` doesn't silently run single-node
+            // while `nodes`/`node_rank` look configured.
+            if params.get("nodes").expose().ok().is_some()
+                || params.get("node_rank").expose().ok().is_some()
+            {
+                return Err(LlmError::InvalidParamValueError {
+                    param: "distributed_backend".to_string(),
+                    message: "`nodes`/`node_rank` are set but `distributed_backend` is not `ring`; set `distributed_backend: ring` to enable multi-node inference, or remove `nodes`/`node_rank`.".to_string(),
+                });
+            }
+            return Ok(None);
+        }
+        Some("ring") => llms::chat::DistributedBackend::Ring,
+        Some(other) => {
+            return Err(LlmError::InvalidParamValueError {
+                param: "distributed_backend".to_string(),
+                message: format!("Must be 'ring' or 'none', got '{other}'"),
+            });
+        }
+    };
+
+    let node_rank = match params.get("node_rank").expose().ok().map(str::trim) {
+        None | Some("") => 0,
+        Some(raw) => raw
+            .parse::<usize>()
+            .map_err(|_| LlmError::InvalidParamValueError {
+                param: "node_rank".to_string(),
+                message: format!("Must be a non-negative integer, got '{raw}'"),
+            })?,
+    };
+
+    let nodes: Vec<String> = params
+        .get("nodes")
+        .expose()
+        .ok()
+        .map(|raw| {
+            raw.split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(ToString::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+    if nodes.is_empty() {
+        return Err(LlmError::InvalidParamValueError {
+            param: "nodes".to_string(),
+            message:
+                "`distributed_backend: ring` requires `nodes`: a comma-separated, rank-ordered list of node addresses (e.g. `10.0.0.1,10.0.0.2`)."
+                    .to_string(),
+        });
+    }
+
+    let config = llms::chat::DistributedConfig {
+        backend,
+        node_rank,
+        nodes,
+    };
+    config
+        .validate()
+        .map_err(|(param, message)| LlmError::InvalidParamValueError {
+            param: param.to_string(),
+            message,
+        })?;
+    Ok(Some(config))
 }
 
 async fn databricks(
@@ -379,7 +470,7 @@ async fn databricks(
         )) as Arc<dyn Chat>),
         (None, Some(client_id), Some(client_secret)) => {
             let token_provider = token_provider_registry
-                .get_or_create_provider(format!("databricks_m2m_{client_id}"), || async {
+                .get_or_create_provider(format!("databricks_m2m_{endpoint}_{client_id}"), || async {
                     DatabricksM2MTokenProvider::try_new(
                         endpoint.to_string(),
                         client_id.to_string(),
@@ -405,7 +496,7 @@ async fn databricks(
         }
         (None, Some(client_id), None) => {
             let token_provider = token_provider_registry
-                .get_or_create_provider::<DatabricksU2MTokenProvider, std::convert::Infallible, _, _>(format!("databricks_u2m_{client_id}"), || async {
+                .get_or_create_provider::<DatabricksU2MTokenProvider, std::convert::Infallible, _, _>(format!("databricks_u2m_{endpoint}_{client_id}"), || async {
                     Ok(DatabricksU2MTokenProvider::new(
                         endpoint.to_string(),
                         client_id.to_string(),
@@ -576,6 +667,7 @@ async fn file(
     let tokenizer_config_path = component.find_any_file_path(ModelFileType::TokenizerConfig);
     let config_path = component.find_any_file_path(ModelFileType::Config);
     let generation_config = component.find_any_file_path(ModelFileType::GenerationConfig);
+    let distributed = parse_distributed_config(params)?;
 
     let chat_template_literal = params.get("chat_template").expose().ok();
 
@@ -586,6 +678,7 @@ async fn file(
         tokenizer_config_path.as_deref(),
         generation_config.as_deref(),
         chat_template_literal,
+        distributed,
     )
     .await
 }
@@ -770,5 +863,120 @@ mod test {
                 .iter()
                 .any(|(k, v)| k == "max_completion_tokens" && v == &Value::Number(1.into()))
         );
+    }
+
+    #[cfg(feature = "models")]
+    fn distributed_params(pairs: &[(&str, &str)]) -> Parameters {
+        Parameters::new(
+            pairs
+                .iter()
+                .map(|&(k, v)| (k.to_string(), SecretString::from(v.to_string())))
+                .collect(),
+            "huggingface",
+            crate::model::params::huggingface::PARAMETERS,
+        )
+    }
+
+    #[cfg(feature = "models")]
+    #[test]
+    fn distributed_absent_is_single_node() {
+        let params = distributed_params(&[]);
+        assert!(
+            parse_distributed_config(&params)
+                .expect("no distributed params is valid")
+                .is_none()
+        );
+    }
+
+    #[cfg(feature = "models")]
+    #[test]
+    fn distributed_none_is_single_node() {
+        let params = distributed_params(&[("distributed_backend", "none")]);
+        assert!(
+            parse_distributed_config(&params)
+                .expect("`none` backend is valid")
+                .is_none()
+        );
+    }
+
+    #[cfg(feature = "models")]
+    #[test]
+    fn distributed_ring_parses_topology() {
+        let params = distributed_params(&[
+            ("distributed_backend", "ring"),
+            ("nodes", "10.0.0.1, 10.0.0.2"),
+            ("node_rank", "1"),
+        ]);
+        let cfg = parse_distributed_config(&params)
+            .expect("valid ring config")
+            .expect("ring config is Some");
+        assert_eq!(cfg.backend, llms::chat::DistributedBackend::Ring);
+        assert_eq!(cfg.node_rank, 1);
+        assert_eq!(
+            cfg.nodes,
+            vec!["10.0.0.1".to_string(), "10.0.0.2".to_string()]
+        );
+    }
+
+    #[cfg(feature = "models")]
+    #[test]
+    fn distributed_backend_is_case_insensitive() {
+        let params = distributed_params(&[
+            ("distributed_backend", "Ring"),
+            ("nodes", "10.0.0.1,10.0.0.2"),
+        ]);
+        let cfg = parse_distributed_config(&params)
+            .expect("mixed-case backend is valid")
+            .expect("ring config is Some");
+        assert_eq!(cfg.backend, llms::chat::DistributedBackend::Ring);
+    }
+
+    #[cfg(feature = "models")]
+    #[test]
+    fn distributed_rejects_unknown_backend() {
+        let params = distributed_params(&[("distributed_backend", "nccl")]);
+        let err = parse_distributed_config(&params).expect_err("unknown backend is invalid");
+        assert!(matches!(
+            err,
+            LlmError::InvalidParamValueError { ref param, .. } if param == "distributed_backend"
+        ));
+    }
+
+    #[cfg(feature = "models")]
+    #[test]
+    fn distributed_ring_requires_nodes() {
+        let params = distributed_params(&[("distributed_backend", "ring")]);
+        let err = parse_distributed_config(&params).expect_err("ring without nodes is invalid");
+        assert!(matches!(
+            err,
+            LlmError::InvalidParamValueError { ref param, .. } if param == "nodes"
+        ));
+    }
+
+    #[cfg(feature = "models")]
+    #[test]
+    fn distributed_rejects_rank_out_of_range() {
+        let params = distributed_params(&[
+            ("distributed_backend", "ring"),
+            ("nodes", "10.0.0.1,10.0.0.2"),
+            ("node_rank", "2"),
+        ]);
+        let err = parse_distributed_config(&params).expect_err("rank >= world size is invalid");
+        assert!(matches!(
+            err,
+            LlmError::InvalidParamValueError { ref param, .. } if param == "node_rank"
+        ));
+    }
+
+    #[cfg(feature = "models")]
+    #[test]
+    fn distributed_rejects_orphan_nodes_without_backend() {
+        let params = distributed_params(&[("nodes", "10.0.0.1,10.0.0.2")]);
+        let err =
+            parse_distributed_config(&params).expect_err("nodes without ring backend is invalid");
+        assert!(matches!(
+            err,
+            LlmError::InvalidParamValueError { ref param, .. } if param == "distributed_backend"
+        ));
     }
 }

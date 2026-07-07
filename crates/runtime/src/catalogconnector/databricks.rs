@@ -828,7 +828,7 @@ mod tests {
         assert_eq!(config.statement_max_retries, 21);
         assert!(!config.disable_on_permanent_error);
         assert_eq!(config.connect_timeout, std::time::Duration::from_secs(5));
-        assert_eq!(config.request_timeout, std::time::Duration::from_secs(120));
+        assert_eq!(config.request_timeout, std::time::Duration::from_mins(2));
     }
 
     #[test]

@@ -25,6 +25,12 @@ use secrecy::{ExposeSecret, SecretString};
 ///
 /// Built by the connector from spicepod params; see
 /// `connector-postgres::lib::replication_params_from_connector_params`.
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "each bool mirrors an independent user-facing parameter (or a derived \
+              accelerator property); folding them into enums would obscure the 1:1 \
+              mapping to spicepod params"
+)]
 #[derive(Clone)]
 pub struct ReplicationParams {
     pub host: String,
@@ -40,10 +46,28 @@ pub struct ReplicationParams {
     pub slot_name: String,
     pub publication_name: String,
     pub initial_snapshot: bool,
+    /// Take the initial snapshot even when resuming from an existing slot.
+    ///
+    /// Set by the connector when the dataset's accelerator does not persist
+    /// across restarts (in-memory engines, `mode: memory`, `mode: file_create`):
+    /// the accelerator starts empty every boot, so a plain slot resume would
+    /// leave it serving only rows touched after startup — silently missing
+    /// all history. Snapshot-then-resume is correct for an empty accelerator:
+    /// the WAL overlap from `confirmed_flush_lsn` replays idempotently via
+    /// the PK upsert. `initial_snapshot: false` still disables all snapshots.
+    pub snapshot_on_resume: bool,
     pub temporary_slot: bool,
     pub status_interval: Duration,
     /// Rows per emitted snapshot batch during initial bootstrap.
     pub bootstrap_batch_size: usize,
+    /// `true` when the slot name was explicitly configured
+    /// (`pg_replication_slot`). Explicitly-named slots are served by the
+    /// shared multiplexer ([`super::shared`]): every dataset on the same
+    /// connection naming the same slot shares one replication
+    /// connection/decoder, with changes routed per table. Default
+    /// (per-dataset generated) slot names keep the dedicated per-dataset
+    /// stream.
+    pub shared: bool,
 }
 
 impl std::fmt::Debug for ReplicationParams {
@@ -58,10 +82,54 @@ impl std::fmt::Debug for ReplicationParams {
             .field("slot_name", &self.slot_name)
             .field("publication_name", &self.publication_name)
             .field("initial_snapshot", &self.initial_snapshot)
+            .field("snapshot_on_resume", &self.snapshot_on_resume)
             .field("temporary_slot", &self.temporary_slot)
             .field("status_interval", &self.status_interval)
             .field("bootstrap_batch_size", &self.bootstrap_batch_size)
+            .field("shared", &self.shared)
             .finish_non_exhaustive()
+    }
+}
+
+/// Dataset-level `on_schema_change` policy, plumbed into the replication stream
+/// so the source layer can reconcile pgoutput `Relation` messages against the
+/// working schema. Mirrors the runtime's `OnSchemaChange` enum — this crate
+/// cannot depend on the runtime, so the connector maps between the two.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum SchemaEvolutionPolicy {
+    /// `on_schema_change: block` (or omitted): run the legacy validation
+    /// verbatim — extra source columns are silently ignored and a dataset
+    /// column missing from the relation is a hard schema-mismatch error.
+    #[default]
+    Block,
+    /// `on_schema_change: fail`: detect-and-error — any source relation schema
+    /// change stops the stream with a terminal actionable error.
+    Fail,
+    /// `on_schema_change: append_new_columns`.
+    AppendNewColumns,
+    /// `on_schema_change: sync_all_columns`.
+    SyncAllColumns,
+}
+
+impl SchemaEvolutionPolicy {
+    /// `true` for the policies that adopt widening changes at the source layer
+    /// (`append_new_columns` / `sync_all_columns`). The source adopts the full
+    /// widening set for both so wider batches reach the runtime apply loop,
+    /// which enforces the per-policy evolution set (added-only vs full).
+    #[must_use]
+    pub fn adopts_changes(self) -> bool {
+        matches!(self, Self::AppendNewColumns | Self::SyncAllColumns)
+    }
+}
+
+impl std::fmt::Display for SchemaEvolutionPolicy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Block => write!(f, "block"),
+            Self::Fail => write!(f, "fail"),
+            Self::AppendNewColumns => write!(f, "append_new_columns"),
+            Self::SyncAllColumns => write!(f, "sync_all_columns"),
+        }
     }
 }
 
@@ -95,6 +163,27 @@ impl SslMode {
             Some("verify-ca") => Self::VerifyCa,
             Some("verify-full") => Self::VerifyFull,
             _ => Self::Prefer,
+        }
+    }
+
+    /// Strict variant of [`Self::from_str_or_default`]: an absent value uses
+    /// the `prefer` default, but an unrecognized value is rejected rather than
+    /// silently downgraded to `prefer`. A typo'd `verify-full` quietly turning
+    /// into `prefer` would disable certificate/hostname verification (a silent
+    /// TLS/MITM downgrade), so the CDC parameter path validates loudly.
+    pub fn from_str_strict(s: Option<&str>) -> std::result::Result<Self, String> {
+        match s.map(str::trim) {
+            None | Some("") => Ok(Self::Prefer),
+            Some(raw) => match raw.to_ascii_lowercase().as_str() {
+                "disable" => Ok(Self::Disable),
+                "prefer" => Ok(Self::Prefer),
+                "require" => Ok(Self::Require),
+                "verify-ca" => Ok(Self::VerifyCa),
+                "verify-full" => Ok(Self::VerifyFull),
+                _ => Err(format!(
+                    "must be one of disable, prefer, require, verify-ca, verify-full, got {raw:?}"
+                )),
+            },
         }
     }
 
@@ -155,14 +244,35 @@ const PUB_DATASET_PORTION_MAX: usize =
 /// within Postgres' 63-byte limit.
 #[must_use]
 pub fn default_slot_name(dataset_name: &str) -> String {
+    let instance_hash = instance_hash();
+    let dataset_hash = xxh3_short_hash_prefix(dataset_name, DATASET_HASH_LEN);
+    let dataset = truncate_to_bytes(&sanitize(dataset_name), SLOT_DATASET_PORTION_MAX);
+    format!("{SLOT_PREFIX}{dataset}_{dataset_hash}_{instance_hash}")
+}
+
+/// Default publication name for a dataset with an explicitly-named
+/// (shareable) replication slot: `{sanitized_slot}_pub`.
+///
+/// Derived from the slot rather than the dataset so that every dataset
+/// sharing the slot lands on the *same* publication by default — the shared
+/// stream opens one replication connection with one publication covering all
+/// member tables.
+#[must_use]
+pub fn publication_name_for_slot(slot_name: &str) -> String {
+    let base = sanitize(slot_name);
+    let base = truncate_to_bytes(&base, PG_IDENTIFIER_MAX_BYTES - 4);
+    format!("{base}_pub")
+}
+
+/// 8-hex-char hash identifying this spiced instance, derived from
+/// `SPICE_INSTANCE_ID` (falling back to the machine hostname). Deterministic
+/// across restarts of the same instance.
+fn instance_hash() -> String {
     let instance = std::env::var("SPICE_INSTANCE_ID")
         .ok()
         .or_else(|| hostname::get().ok().and_then(|h| h.into_string().ok()))
         .unwrap_or_else(|| "unknown".to_string());
-    let instance_hash = xxh3_short_hash(&instance);
-    let dataset_hash = xxh3_short_hash_prefix(dataset_name, DATASET_HASH_LEN);
-    let dataset = truncate_to_bytes(&sanitize(dataset_name), SLOT_DATASET_PORTION_MAX);
-    format!("{SLOT_PREFIX}{dataset}_{dataset_hash}_{instance_hash}")
+    xxh3_short_hash(&instance)
 }
 
 /// Default publication is shared across replicas:
@@ -494,6 +604,19 @@ mod tests {
         );
         assert!(pubname.starts_with(SLOT_PREFIX));
         assert!(pubname.ends_with("_pub"));
+    }
+
+    #[test]
+    fn publication_name_for_slot_is_slot_derived() {
+        assert_eq!(
+            publication_name_for_slot("spice_spicehq_dev"),
+            "spice_spicehq_dev_pub"
+        );
+        // Sanitized so odd slot names still produce a valid identifier.
+        assert_eq!(publication_name_for_slot("my-slot"), "my_slot_pub");
+        // 63-byte cap survives long slot names.
+        let long = "p".repeat(120);
+        assert!(publication_name_for_slot(&long).len() <= PG_IDENTIFIER_MAX_BYTES);
     }
 
     #[test]

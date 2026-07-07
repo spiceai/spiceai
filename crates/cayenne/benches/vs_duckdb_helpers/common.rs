@@ -240,6 +240,37 @@ async fn setup_cayenne_with(
     on_conflict: Option<OnConflict>,
     table_schema: Arc<Schema>,
 ) -> CayenneFixture {
+    setup_cayenne_custom(
+        table_name,
+        metastore,
+        primary_key,
+        on_conflict,
+        table_schema,
+        cayenne::metadata::VortexConfig::default(),
+        Arc::new(RuntimeEnv::default()),
+    )
+    .await
+}
+
+/// Fully-parameterized Cayenne fixture: callers control the `VortexConfig`
+/// (e.g. compaction triggers, inline-memtable size) and the `RuntimeEnv`
+/// (e.g. a budgeted memory pool). The simpler `setup_cayenne*` wrappers all
+/// route through this with defaults.
+///
+/// Pass the SAME `RuntimeEnv` to [`warm_session_with_runtime`] when queries
+/// must run under the same memory budget as the table's write path — that
+/// mirrors spiced, which shares one `RuntimeEnv` across the accelerator and
+/// the query sessions.
+#[allow(clippy::too_many_arguments)]
+pub async fn setup_cayenne_custom(
+    table_name: &str,
+    metastore: Metastore,
+    primary_key: Vec<String>,
+    on_conflict: Option<OnConflict>,
+    table_schema: Arc<Schema>,
+    vortex_config: cayenne::metadata::VortexConfig,
+    runtime_env: Arc<RuntimeEnv>,
+) -> CayenneFixture {
     let temp_dir = tempfile::tempdir().expect("temp dir");
     let data_path = temp_dir.path().join("data");
     tokio::fs::create_dir_all(&data_path)
@@ -260,9 +291,9 @@ async fn setup_cayenne_with(
                 on_conflict,
                 base_path: data_path.to_string_lossy().to_string(),
                 partition_column: None,
-                vortex_config: cayenne::metadata::VortexConfig::default(),
+                vortex_config,
             },
-            Arc::new(RuntimeEnv::default()),
+            runtime_env,
         )
         .await
         .expect("cayenne create_table"),
@@ -273,6 +304,81 @@ async fn setup_cayenne_with(
         table,
         catalog: Arc::clone(&catalog) as Arc<dyn MetadataCatalog>,
     }
+}
+
+/// Build a [`SessionContext`](datafusion::prelude::SessionContext) carrying the
+/// same Cayenne physical optimizer rules a running Spice daemon installs via its
+/// `DataFusionBuilder`, on top of DataFusion's default rules.
+///
+/// The benches otherwise build a bare `SessionContext::new()`, which omits every
+/// Cayenne physical rule, so a benchmark would measure plans the daemon never
+/// actually runs. We register the daemon's full default-on Cayenne physical set
+/// here so all benches — scan, group-by, delete, concurrent — measure
+/// production-faithful plans:
+///
+/// * `CayenneDynamicFilterSharing` — cross-scan join dynamic-filter sharing.
+/// * `CayenneMaintainedAggregateRewriter` — serves declared maintained views
+///   (a no-op when none are declared, as in these benches).
+/// * `CayenneStatsAggregateRewriter` — folds whole-table `SUM`/`AVG` (and mixed
+///   aggregates) from Vortex file statistics; `COUNT`/`MIN`/`MAX` already fold
+///   via DataFusion's built-in `AggregateStatistics` rule.
+/// * `CayenneAntiJoinSortMergeRewriter` — rewrites oversized semi/anti joins
+///   (its memory gate defaults when no `CayenneOptimizerConfig` extension is
+///   present, so it is safe to register on a bare session).
+///
+/// We deliberately register the rules directly rather than constructing the
+/// runtime's `DataFusionBuilder`: that builder disables the default catalog
+/// (breaking `register_table` from a bench) and would pull the entire `runtime`
+/// crate into the bench build.
+///
+/// KNOWN GAP for the join benches (`vs_duckdb_join`, `vs_chdb_join`): the
+/// daemon's *logical* join rules — `reorder_join`, `cayenne_push_down_semi_join`,
+/// `cayenne_reassociate_cross_join` — live in the `runtime` crate and are NOT
+/// registered here, so those benches are not yet fully production-faithful. The
+/// physical join rules above (`CayenneDynamicFilterSharing`,
+/// `CayenneAntiJoinSortMergeRewriter`) *are* applied. Making the join benches
+/// faithful requires routing their sessions through the real `DataFusionBuilder`;
+/// tracked as follow-up work.
+fn cayenne_session_state_builder() -> datafusion::execution::session_state::SessionStateBuilder {
+    use cayenne::optimizer_rules::{
+        CayenneAntiJoinSortMergeRewriter, CayenneDynamicFilterSharing,
+        CayenneMaintainedAggregateRewriter, CayenneStatsAggregateRewriter,
+    };
+    use datafusion::execution::session_state::SessionStateBuilder;
+
+    SessionStateBuilder::new()
+        .with_default_features()
+        .with_physical_optimizer_rule(Arc::new(CayenneDynamicFilterSharing::new()))
+        .with_physical_optimizer_rule(Arc::new(CayenneMaintainedAggregateRewriter::new()))
+        .with_physical_optimizer_rule(Arc::new(CayenneStatsAggregateRewriter::new()))
+        .with_physical_optimizer_rule(Arc::new(CayenneAntiJoinSortMergeRewriter::new()))
+}
+
+/// A fresh Cayenne-configured session (default runtime/config).
+fn cayenne_session() -> datafusion::prelude::SessionContext {
+    datafusion::prelude::SessionContext::new_with_state(cayenne_session_state_builder().build())
+}
+
+/// Like [`warm_session_for`] but builds the session on a caller-provided
+/// [`RuntimeEnv`] — required when the query must execute under a budgeted
+/// memory pool. A plain `SessionContext::new()` would silently run queries
+/// against an UNLIMITED default pool, making any memory-budget comparison
+/// measure nothing (the fixture's budget would gate only the write path).
+pub fn warm_session_with_runtime(
+    table: &Arc<CayenneTableProvider>,
+    runtime_env: Arc<RuntimeEnv>,
+) -> datafusion::prelude::SessionContext {
+    use datafusion::datasource::TableProvider;
+    use datafusion::prelude::{SessionConfig, SessionContext};
+
+    let state = cayenne_session_state_builder()
+        .with_config(SessionConfig::new())
+        .with_runtime_env(runtime_env)
+        .build();
+    let ctx = SessionContext::new_with_state(state);
+    ctx.register_table("t", Arc::clone(table) as Arc<dyn TableProvider>)
+        .expect("register table");
+    ctx
 }
 
 /// A clean DuckDB file-mode database with the same schema.
@@ -536,9 +642,8 @@ pub async fn cayenne_insert_from_parquet(
 /// Run a SQL query through Cayenne and return the collected batches.
 pub async fn cayenne_query(table: &Arc<CayenneTableProvider>, sql: &str) -> Vec<RecordBatch> {
     use datafusion::datasource::TableProvider;
-    use datafusion::prelude::SessionContext;
 
-    let ctx = SessionContext::new();
+    let ctx = cayenne_session();
     ctx.register_table("t", Arc::clone(table) as Arc<dyn TableProvider>)
         .expect("register table");
     let df = ctx.sql(sql).await.expect("cayenne sql");
@@ -558,9 +663,8 @@ pub async fn cayenne_query(table: &Arc<CayenneTableProvider>, sql: &str) -> Vec<
 /// hand-wavey.
 pub fn warm_session_for(table: &Arc<CayenneTableProvider>) -> datafusion::prelude::SessionContext {
     use datafusion::datasource::TableProvider;
-    use datafusion::prelude::SessionContext;
 
-    let ctx = SessionContext::new();
+    let ctx = cayenne_session();
     ctx.register_table("t", Arc::clone(table) as Arc<dyn TableProvider>)
         .expect("register table");
     ctx
@@ -586,9 +690,15 @@ pub async fn cayenne_query_join(
     sql: &str,
 ) -> Vec<RecordBatch> {
     use datafusion::datasource::TableProvider;
-    use datafusion::prelude::SessionContext;
 
-    let ctx = SessionContext::new();
+    // Use the Cayenne-configured session so the join measures production-faithful
+    // physical optimization: `CayenneDynamicFilterSharing` (probe-side
+    // dynamic-filter pushdown into the Vortex scan) and the semi/anti-join
+    // sort-merge rewrite. NOTE: the *logical* join rules (`reorder_join`,
+    // `cayenne_push_down_semi_join`) live in the `runtime` crate and are still
+    // absent here — faithful join benchmarking ultimately needs the runtime
+    // `DataFusionBuilder`; see the module docs on `cayenne_session_state_builder`.
+    let ctx = cayenne_session();
     ctx.register_table("t", Arc::clone(fact) as Arc<dyn TableProvider>)
         .expect("register fact");
     ctx.register_table("d", Arc::clone(dim) as Arc<dyn TableProvider>)
@@ -688,9 +798,8 @@ async fn cayenne_plan_text(
     sql: &str,
 ) -> String {
     use datafusion::datasource::TableProvider;
-    use datafusion::prelude::SessionContext;
 
-    let ctx = SessionContext::new();
+    let ctx = cayenne_session();
     ctx.register_table("t", Arc::clone(table) as Arc<dyn TableProvider>)
         .expect("register cayenne table for plan capture");
     let df = ctx
@@ -792,4 +901,14 @@ pub fn duckdb_query_scalar(conn: &Connection, sql: &str) -> i64 {
     let mut stmt = conn.prepare(sql).expect("duckdb prepare");
     stmt.query_row([], |row| row.get::<_, i64>(0))
         .expect("duckdb query_row")
+}
+
+/// Execute a query purely for timing and drain its rows, forcing full
+/// execution. Type-agnostic, so it fits any result shape — a `Float64` `AVG`
+/// scalar or a multi-column aggregate rollup — where [`duckdb_query_scalar`]'s
+/// `i64`-typed column-0 read would not.
+pub fn duckdb_exec(conn: &Connection, sql: &str) {
+    let mut stmt = conn.prepare(sql).expect("duckdb prepare");
+    let mut rows = stmt.query([]).expect("duckdb query");
+    while rows.next().expect("duckdb row").is_some() {}
 }

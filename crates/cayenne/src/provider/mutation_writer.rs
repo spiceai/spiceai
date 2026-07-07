@@ -78,12 +78,24 @@ use parking_lot::Mutex as ParkingMutex;
 use tokio::sync::OwnedMutexGuard;
 
 use super::Result;
+use super::column_stats::ColumnStatsAccumulator;
 use super::context::CayenneContext;
+use super::mem_tier_budget;
+use super::on_conflict::{PostValidationState, PreparedShardedInsertStream};
 use super::staging_wal::{CayenneStagedAppend, PreparedStagedAppend, StagingWalTargetKind};
-use super::table::{
-    CayenneCdcWrite, CayenneTableProvider, ColumnStatsAccumulator, PostValidationState,
-    record_cayenne_write_phase,
-};
+use super::table::{CayenneCdcWrite, CayenneTableProvider, record_cayenne_write_phase};
+
+/// Record METRIC 4 (`cayenne_cdc_burst_rows` / `cayenne_cdc_burst_bytes`) for one
+/// prepared CDC batch at the staged/inlined write entry, labeled by table. The
+/// values come from the inline buffer at the call sites; on the inline-overflow
+/// FALLBACK path they are therefore the buffered LOWER BOUND (the unbuffered
+/// stream remainder is not counted — see `InlineBatchBuffer::total_bytes`).
+/// Forwarding both together keeps the two histograms paired per batch.
+fn record_cayenne_cdc_burst(table_name: &str, rows: u64, bytes: u64) {
+    let dims = [telemetry::KeyValue::new("table", table_name.to_string())];
+    telemetry::track_cayenne_cdc_burst_rows(rows, &dims);
+    telemetry::track_cayenne_cdc_burst_bytes(bytes, &dims);
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum InlineMutationPolicy {
@@ -146,17 +158,32 @@ impl InlineBatchBuffer {
         !self.exceeded
     }
 
+    /// The cap that tripped the inline-admission fallback, as the METRIC 3
+    /// `reason` label. Checks rows first (the order `push` evaluates them), so a
+    /// burst that blew both caps reports `rows_cap`. Returns `None` when neither
+    /// cap is exceeded (the buffer still fits — the caller inlines or the stream
+    /// simply ended).
     #[must_use]
+    pub(crate) fn overflow_reason(&self) -> Option<&'static str> {
+        if self.total_rows > self.max_rows {
+            Some("rows_cap")
+        } else if self.total_bytes > self.max_buffer_bytes {
+            Some("bytes_cap")
+        } else {
+            None
+        }
+    }
+
     pub(crate) fn total_rows(&self) -> usize {
         self.total_rows
     }
 
     /// In-memory Arrow bytes buffered so far. When the buffer overflows and the
     /// write falls back to a Vortex write, this is a *lower bound* on the
-    /// delta's total size (the un-buffered remainder of the stream is added on
-    /// top). It is used only to size the write shard count, where under-counting
-    /// is the safe direction: it can only keep the write on fewer (never more)
-    /// shards than the true size warrants.
+    /// delta's total size because the un-buffered remainder has not been
+    /// measured. The fallback path still passes this lower bound as
+    /// `estimated_bytes`, deliberately keeping hot CDC bursts on fewer write
+    /// shards than their true size might warrant.
     #[must_use]
     pub(crate) fn total_bytes(&self) -> usize {
         self.total_bytes
@@ -190,10 +217,47 @@ enum InlineMutationOutcome {
     },
     Fallback {
         stream: SendableRecordBatchStream,
-        /// Lower bound on the delta's byte size: the bytes buffered before the
-        /// inline buffer overflowed. Threaded into the snapshot write as its
-        /// size estimate so small (but non-inlinable) deltas stay a single file.
-        buffered_bytes: u64,
+        /// Size estimate for the staged write: the bytes buffered before
+        /// falling back (exact when the stream ended inside the caps; a lower
+        /// bound when it overflowed). The lower bound is used AS the size on
+        /// purpose: it floors overflowing CDC bursts to a single encode shard.
+        /// Fanning such bursts out to full write-concurrency was measured as a
+        /// strict regression (file flood → slower encode, fatter publish,
+        /// 2-4x OLAP read-amp; 2026-06-06 run) — see the comment at the
+        /// construction site.
+        estimated_bytes: Option<u64>,
+    },
+}
+
+/// Outcome of the in-memory CDC write attempt (`cdc_durability: memory`).
+enum MemWriteOutcome {
+    /// The batch was appended to the RAM tier (or absorbed by a spill); the
+    /// returned `CayenneCdcWrite` carries the mem-tier epoch for slot deferral.
+    /// Boxed because `CayenneCdcWrite` is large and the other variant is small.
+    Done(Box<CayenneCdcWrite>),
+    /// Sustained overload — the global byte budget could not admit the batch
+    /// even after a bounded wait for other tables' releases AND spilling the
+    /// tier durable. The caller must take the durable path for this batch (its
+    /// committer advances the slot per-batch, which is safe because the spill
+    /// drained every prior mem batch to durable first). The re-streamed batches
+    /// + the held write guard are handed back.
+    FallBackToDurable {
+        stream: SendableRecordBatchStream,
+        write_guard: OwnedMutexGuard<()>,
+    },
+}
+
+/// Outcome of the N>1 sharded in-memory CDC write attempt (§5 Phase 3).
+enum MemShardedOutcome {
+    /// Appended to the per-shard RAM tiers; carries the slot-deferral receipt.
+    Done(Box<CayenneCdcWrite>),
+    /// Sustained overload — take the durable path. The buffered RAW batches +
+    /// schema are handed back; the caller re-streams them through the standard
+    /// serial prepare so the durable path re-validates them.
+    FallBackToDurable {
+        batches: Vec<RecordBatch>,
+        schema: SchemaRef,
+        write_guard: OwnedMutexGuard<()>,
     },
 }
 
@@ -248,10 +312,96 @@ impl<'a> AppendMutationWriter<'a> {
         let pending_pk_deletions = !self.table.pk_deletion_strategy().is_position_based()
             && self.table.has_pending_deletions();
 
+        // N>1 in-memory CDC: validate + append per PK-hash shard within one apply
+        // (§5 Phase 3). Engaged for EVERY in-memory upsert apply on a non-partitioned,
+        // deferral-armed, >1-shard table.
+        //
+        // CRITICAL — this path must NOT be gated on `!pending_pk_deletions`. A real CDC
+        // table almost always carries a tombstone in its durable deletion index (every
+        // upsert supersedes, every delete tombstones), so gating on it diverted ~98% of
+        // applies to the SERIAL shard-0 path — which stamps `source_position = None`, so
+        // the checkpoint's `durable_epoch = MAX(source_position)` never covered them and
+        // the source slot froze (the SF-100 N=4 WAL→38 GB stall; ~2239 serial vs ~82
+        // sharded applies on order_line). Sharding a pending-deletion upsert is SOUND: the
+        // per-shard validation handles on-conflict supersession (it builds per-shard
+        // `OnConflictDeletions`), and a new row is immune to any pre-existing tombstone
+        // because its `data_sequence` is reserved strictly above every prior
+        // `delete_sequence` — the same seq-ordering the serial staged path relies on — so a
+        // stale-PRESENT existence-index hit costs at most a harmless redundant tombstone
+        // under upsert semantics. CDC DELETE bursts take the separately-sharded
+        // `append_delete_intents_sharded`, so EVERY apply at N>1 stays on the one
+        // `apply_epoch` slot-ack axis the checkpoint reconciles. Every other case — and
+        // ALWAYS at N=1 — falls through to the byte-identical serial path below.
+        let mem_tier_shards = self.table.mem_tier_shard_count();
+        if mem_tier_shards > 1
+            && self.table.is_cdc_memory_mode()
+            && self.table.has_slot_advancer()
+            && self.table.metadata().partition_column.is_none()
+        {
+            if let Some(prepared) = self
+                .table
+                .prepare_stream_for_insert_sharded(data, mem_tier_shards)
+                .await?
+            {
+                match self
+                    .write_cdc_in_memory_sharded(prepared, write_guard, write_start)
+                    .await?
+                {
+                    MemShardedOutcome::Done(cdc_write) => return Ok(*cdc_write),
+                    MemShardedOutcome::FallBackToDurable {
+                        batches,
+                        schema,
+                        write_guard,
+                    } => {
+                        // Sustained overload: the sharded path bailed BEFORE any
+                        // validation/append (no tier mutation occurred, the spill
+                        // already drained + acked prior mem batches). Re-stream the
+                        // buffered RAW batches through the standard serial
+                        // `prepare_stream_for_insert` so the durable path re-runs
+                        // on-conflict validation against the single index — keeping
+                        // conflict semantics intact without a second sharded apply.
+                        let _write_guard = write_guard;
+                        let raw = MemorySourceConfig::try_new_exec(&[batches], schema, None)
+                            .and_then(|exec| execute_stream(exec, Arc::clone(self.task_context)))?;
+                        let prepared = self.table.prepare_stream_for_insert(raw).await?;
+                        let post_validation = prepared.post_validation();
+                        let may_have_on_conflict_deletions =
+                            prepared.may_have_on_conflict_deletions();
+                        let rows = self
+                            .write_prepared_stream(
+                                prepared.stream,
+                                post_validation,
+                                pending_pk_deletions,
+                                may_have_on_conflict_deletions,
+                            )
+                            .await?;
+                        record_cayenne_write_phase(
+                            self.table.table_name(),
+                            "cdc_path_inmemory_sharded_fallback",
+                            write_start,
+                        );
+                        return Ok(CayenneCdcWrite::completed(
+                            self.table.clone_for_write_operations(),
+                            rows,
+                        ));
+                    }
+                }
+            }
+            // `prepare_stream_for_insert_sharded` returned None (no PK): fall through
+            // is impossible — `data` was consumed. PK-less tables never reach
+            // `is_cdc_memory_mode` (it requires a key-based merge-on-read shape), so
+            // this branch is unreachable in practice. Guard defensively.
+            return Err(super::Error::Internal {
+                table: self.table.table_name().to_string(),
+                message: "sharded in-memory CDC path engaged on a table without a primary key"
+                    .to_string(),
+            });
+        }
+
         let prepared = self.table.prepare_stream_for_insert(data).await?;
         let post_validation = prepared.post_validation();
         let may_have_on_conflict_deletions = prepared.may_have_on_conflict_deletions();
-        let mut prepared_stream = prepared.stream;
+        let prepared_stream = prepared.stream;
 
         // Retention used to block the pipelined path because it ran inline
         // under `write_lock`. Now that retention is scheduled via
@@ -323,6 +473,35 @@ impl<'a> AppendMutationWriter<'a> {
             ));
         }
 
+        // In-memory CDC durability mode: append the validated batch to the RAM
+        // tier and defer the source slot ack to a checkpoint, instead of
+        // persisting a per-batch durable BLOB. Gated to the key-based
+        // merge-on-read shape on a non-partitioned table (`is_cdc_memory_mode`) AND
+        // the runtime has armed deferral for a replayable source (`has_slot_advancer`);
+        // every other table/source keeps the durable path below, byte-identical.
+        let (mut prepared_stream, write_guard) = if self.table.is_cdc_memory_mode()
+            && self.table.has_slot_advancer()
+        {
+            match self
+                .write_cdc_in_memory(prepared_stream, &post_validation, write_guard, write_start)
+                .await?
+            {
+                MemWriteOutcome::Done(cdc_write) => return Ok(*cdc_write),
+                // Sustained overload: the global budget is full even after a
+                // bounded wait for other tables to release AND a spill drained
+                // the tier (firing the slot advancer, so the prior mem batches
+                // are durable). This batch takes the durable path below with a
+                // NORMAL committer — safe because the slot is not ahead of
+                // durable (spill-then-fallback ordering guard).
+                MemWriteOutcome::FallBackToDurable {
+                    stream,
+                    write_guard,
+                } => (stream, write_guard),
+            }
+        } else {
+            (prepared_stream, write_guard)
+        };
+
         match self
             .try_inline_or_restream(prepared_stream, &post_validation)
             .await?
@@ -351,10 +530,9 @@ impl<'a> AppendMutationWriter<'a> {
             }
             InlineMutationOutcome::Fallback {
                 stream,
-                buffered_bytes,
+                estimated_bytes,
             } => {
                 prepared_stream = stream;
-                let estimated_bytes = Some(buffered_bytes);
                 // Stage into a ProtectedSnapshot whenever the batch may carry
                 // on-conflict deletions OR the table already holds pending PK
                 // deletions. The latter case may produce no new delete payload
@@ -492,6 +670,278 @@ impl<'a> AppendMutationWriter<'a> {
         }
     }
 
+    /// In-memory CDC write path (`cdc_durability: memory`). Drains the validated
+    /// stream into RAM, computes the on-conflict tombstones in memory, and
+    /// appends to the mem tier — deferring the source slot ack to a checkpoint —
+    /// with byte caps (per-table, plus a process-wide one when the runtime has
+    /// installed the global budget) that spill (and, under sustained overload,
+    /// fall back to the durable path) so the resident tier cannot grow without
+    /// bound. The caps bound the resident tier, not a single apply: each prepared
+    /// burst is still buffered fully in RAM before the cap is checked.
+    ///
+    /// PK conflict validation still runs (it populated `post_validation` as the
+    /// stream was prepared); only the per-batch DURABILITY is deferred.
+    async fn write_cdc_in_memory(
+        &self,
+        mut prepared_stream: SendableRecordBatchStream,
+        post_validation: &Arc<ParkingMutex<Option<PostValidationState>>>,
+        write_guard: OwnedMutexGuard<()>,
+        write_start: Instant,
+    ) -> Result<MemWriteOutcome> {
+        // Drain the prepared stream into RAM (CDC batches are small per apply).
+        // Draining also RUNS the deferred PK-conflict validation, populating
+        // `post_validation` with the on-conflict deletions.
+        let schema = prepared_stream.schema();
+        let mut batches: Vec<RecordBatch> = Vec::new();
+        let mut incoming_bytes: u64 = 0;
+        let mut incoming_rows: u64 = 0;
+        let drain_start = Instant::now();
+        while let Some(batch) = StreamExt::next(&mut prepared_stream).await {
+            let batch = batch?;
+            incoming_bytes = incoming_bytes.saturating_add(batch.get_array_memory_size() as u64);
+            incoming_rows = incoming_rows.saturating_add(batch.num_rows() as u64);
+            batches.push(batch);
+        }
+        drop(prepared_stream);
+        // Decompose `cdc_path_inmemory`: draining the prepared stream RUNS the
+        // deferred PK-conflict validation and decodes the upstream CDC batches,
+        // so this is the "produce + validate the batch" slice — separating
+        // upstream-bound cost from the fence + append cost that follows.
+        record_cayenne_write_phase(
+            self.table.table_name(),
+            "inmemory_stream_drain",
+            drain_start,
+        );
+
+        let PostValidationState {
+            on_conflict_deletions,
+            validated_keys,
+        } = take_post_validation(post_validation);
+        let superseded =
+            u64::try_from(on_conflict_deletions.total_superseded()).unwrap_or(u64::MAX);
+
+        // CAP CHECK + spill/fallback decision (OOM-safety, correctness item #2).
+        //
+        // 1. Per-table BYTE cap breached → spill (checkpoint) FIRST — double-
+        //    checked under the checkpoint lock, see
+        //    `spill_mem_tier_if_cap_breached` — then append into the bounded
+        //    tier. Byte cap only: the tier's AGE cap is enforced by the 1s
+        //    background tick without blocking this writer (the age-sharing
+        //    variant made the applier ride out checkpoint outages — the
+        //    measured 33-41s apply stalls behind compaction-starved encodes).
+        // 2. Global budget can't admit the bytes → wait (bounded) for ANOTHER
+        //    table's checkpoint to release budget; on timeout spill self (which
+        //    releases the flushed epoch's budget) and retry once; still refused
+        //    → fall back to the durable path for this batch. The spill fires
+        //    the slot advancer, draining every prior mem batch to durable, so a
+        //    durable fallback batch is never ahead of durable.
+        //
+        // Both admission stalls are timed (`inmemory_spill` /
+        // `inmemory_budget_wait`): they were the invisible bulk of the apply
+        // path under overload — a synchronous whole-tier checkpoint inside the
+        // write path that no phase metric covered.
+        if self.table.mem_tier_per_table_cap_breached(incoming_bytes) {
+            let spill_start = Instant::now();
+            let spill_result = self
+                .table
+                .spill_mem_tier_if_cap_breached(incoming_bytes)
+                .await;
+            record_cayenne_write_phase(self.table.table_name(), "inmemory_spill", spill_start);
+            spill_result?;
+        }
+
+        if !mem_tier_budget::try_reserve_bytes(incoming_bytes) {
+            let wait_start = Instant::now();
+            let admitted = self.table.wait_for_budget_or_spill(incoming_bytes).await;
+            record_cayenne_write_phase(self.table.table_name(), "inmemory_budget_wait", wait_start);
+            if !admitted? {
+                // Still over budget after waiting AND spilling (other tables
+                // hold it): fall back to the durable path. The spill already
+                // drained and acked this table's prior mem batches
+                // (spill-then-fallback ordering).
+                record_cayenne_write_phase(
+                    self.table.table_name(),
+                    "cdc_path_inmemory_fallback",
+                    write_start,
+                );
+                let stream = MemorySourceConfig::try_new_exec(&[batches], schema, None)
+                    .and_then(|exec| execute_stream(exec, Arc::clone(self.task_context)))?;
+                // Restore the post-validation state consumed by `take_post_validation`
+                // above. The durable fallback path (`try_inline_or_restream`) re-reads
+                // `post_validation`, so without this the on-conflict deletions and
+                // validated-key bookkeeping would be lost — silently skipping conflict
+                // semantics under sustained memory-mode overload (a correctness risk).
+                restore_post_validation(
+                    post_validation,
+                    PostValidationState {
+                        on_conflict_deletions,
+                        validated_keys,
+                    },
+                );
+                return Ok(MemWriteOutcome::FallBackToDurable {
+                    stream,
+                    write_guard,
+                });
+            }
+        }
+
+        // Append to the RAM tier under the listing fence. The reserved bytes stay
+        // held (released by the checkpoint that flushes this epoch). On append
+        // error, release the reservation so the budget doesn't leak.
+        let epoch = match self
+            .table
+            .append_to_mem_tier(batches, &on_conflict_deletions, incoming_bytes, superseded)
+            .await
+        {
+            Ok(epoch) => epoch,
+            Err(e) => {
+                mem_tier_budget::release_bytes(incoming_bytes);
+                return Err(e);
+            }
+        };
+        // Record the inlined PK keys so a subsequent same-table upsert sees this
+        // batch's rows as present (same bookkeeping as the durable inline path).
+        self.table.record_inlined_pk_keys(&validated_keys);
+
+        drop(write_guard);
+        record_cayenne_write_phase(self.table.table_name(), "cdc_path_inmemory", write_start);
+        Ok(MemWriteOutcome::Done(Box::new(
+            CayenneCdcWrite::in_memory_staged(
+                self.table.clone_for_write_operations(),
+                incoming_rows,
+                epoch,
+            ),
+        )))
+    }
+
+    /// Sharded (N>1) in-memory CDC write path (§5 Phase 3, step b). Drains the
+    /// RAW decoded stream, applies the whole-apply OOM-safety caps/budget exactly
+    /// as [`Self::write_cdc_in_memory`], then DECOUPLES decode from validation:
+    /// each batch is split by PK shard and the per-batch on-conflict validation
+    /// runs PER SHARD ([`CayenneTableProvider::validate_and_append_sharded`]),
+    /// with the N shard appends joined concurrently. The combined post-validation
+    /// state is published for the durable fallback.
+    ///
+    /// Engaged only at N>1; the N=1 write path never reaches here, so today's
+    /// behavior is byte-identical.
+    async fn write_cdc_in_memory_sharded(
+        &self,
+        prepared: PreparedShardedInsertStream,
+        write_guard: OwnedMutexGuard<()>,
+        write_start: Instant,
+    ) -> Result<MemShardedOutcome> {
+        let PreparedShardedInsertStream {
+            mut stream,
+            pk_indices,
+            converter,
+            sharded_index,
+            on_conflict,
+        } = prepared;
+
+        // Drain the RAW stream into RAM (no validation wrapper — validation is
+        // deferred to the per-shard step below).
+        let schema = stream.schema();
+        let mut batches: Vec<RecordBatch> = Vec::new();
+        let mut incoming_bytes: u64 = 0;
+        let mut incoming_rows: u64 = 0;
+        let drain_start = Instant::now();
+        while let Some(batch) = StreamExt::next(&mut stream).await {
+            let batch = batch?;
+            incoming_bytes = incoming_bytes.saturating_add(batch.get_array_memory_size() as u64);
+            incoming_rows = incoming_rows.saturating_add(batch.num_rows() as u64);
+            batches.push(batch);
+        }
+        drop(stream);
+        record_cayenne_write_phase(
+            self.table.table_name(),
+            "inmemory_stream_drain",
+            drain_start,
+        );
+
+        // Whole-apply (whole-tier) OOM-safety: per-table byte cap spill + global
+        // budget reservation, identical to the serial path. The byte trigger is
+        // whole-tier (sum across shards), never budget/N-per-shard (§3.4 Fix 2).
+        if self.table.mem_tier_per_table_cap_breached(incoming_bytes) {
+            let spill_start = Instant::now();
+            let spill_result = self
+                .table
+                .spill_mem_tier_if_cap_breached(incoming_bytes)
+                .await;
+            record_cayenne_write_phase(self.table.table_name(), "inmemory_spill", spill_start);
+            spill_result?;
+        }
+
+        if !mem_tier_budget::try_reserve_bytes(incoming_bytes) {
+            let wait_start = Instant::now();
+            let admitted = self.table.wait_for_budget_or_spill(incoming_bytes).await;
+            record_cayenne_write_phase(self.table.table_name(), "inmemory_budget_wait", wait_start);
+            if !admitted? {
+                // Sustained overload: hand the buffered raw batches to the durable
+                // path. Populate the combined post-validation state by running the
+                // sharded validate+append? No — on fallback we must NOT append to
+                // the tier. Instead run validation only to produce the combined
+                // on-conflict deletions for the durable path. The simplest correct
+                // route: re-run validation through the standard serial prepare on
+                // the durable side (it rebuilds the single index). We therefore
+                // hand back the raw batches with an EMPTY post-validation; the
+                // durable `write_prepared_stream` re-validates via its own
+                // `prepare_stream_for_insert`. To keep that contract, the fallback
+                // re-streams the raw batches into a FRESH `prepare_stream_for_insert`
+                // at the caller.
+                return Ok(MemShardedOutcome::FallBackToDurable {
+                    batches,
+                    schema,
+                    write_guard,
+                });
+            }
+        }
+
+        // Validate + append per shard. On error, release the byte reservation so
+        // the global budget doesn't leak (matching the serial path).
+        let apply = match self
+            .table
+            .validate_and_append_sharded(
+                batches,
+                sharded_index,
+                &pk_indices,
+                &converter,
+                &on_conflict,
+                incoming_bytes,
+            )
+            .await
+        {
+            Ok(apply) => apply,
+            Err(e) => {
+                mem_tier_budget::release_bytes(incoming_bytes);
+                return Err(e);
+            }
+        };
+
+        drop(write_guard);
+        tracing::debug!(
+            table = self.table.table_name(),
+            shards = self.table.mem_tier_shard_count(),
+            incoming_rows,
+            superseded = apply.superseded,
+            validated_keys = apply.validated_keys.len(),
+            file_key_deletes = apply.on_conflict_deletions.deleted_pk_i64.len()
+                + apply.on_conflict_deletions.deleted_row_keys.len(),
+            "Sharded in-memory CDC apply completed"
+        );
+        record_cayenne_write_phase(
+            self.table.table_name(),
+            "cdc_path_inmemory_sharded",
+            write_start,
+        );
+        Ok(MemShardedOutcome::Done(Box::new(
+            CayenneCdcWrite::in_memory_staged(
+                self.table.clone_for_write_operations(),
+                incoming_rows,
+                apply.epoch,
+            ),
+        )))
+    }
+
     pub(super) async fn write(&self, data: SendableRecordBatchStream) -> Result<u64> {
         self.table.ensure_no_incomplete_write().await?;
 
@@ -541,10 +991,15 @@ impl<'a> AppendMutationWriter<'a> {
             self.table.has_retention_delete_filters(),
         ]);
 
-        // Lower-bound size estimate for the staged write. Populated from the
-        // inline buffer when we attempt to inline; left `None` when inlining is
-        // skipped (partition/retention tables) so the write keeps the prior
-        // full-fan-out behavior.
+        // Size estimate for the staged write. Populated from the inline buffer
+        // whenever we attempt to inline first: an exact size when the buffer
+        // captured the whole delta, and a buffered LOWER BOUND when it overflowed
+        // — the lower bound is kept ON PURPOSE (it floors a hot CDC burst to a
+        // single encode shard; fanning overflowing bursts out to full
+        // write-concurrency was measured as a strict regression — file flood,
+        // slower encode, fatter publish, 2-4x OLAP read-amp). `None` only when
+        // inlining is skipped entirely (partition/retention tables), which keep
+        // the prior full-fan-out sizing. See `try_inline_or_restream`.
         let mut estimated_bytes: Option<u64> = None;
 
         if inline_policy.can_inline() {
@@ -562,12 +1017,22 @@ impl<'a> AppendMutationWriter<'a> {
                 }
                 InlineMutationOutcome::Fallback {
                     stream,
-                    buffered_bytes,
+                    estimated_bytes: fallback_estimate,
                 } => {
                     prepared_stream = stream;
-                    estimated_bytes = Some(buffered_bytes);
+                    estimated_bytes = fallback_estimate;
                 }
             }
+        } else {
+            // METRIC 3 (inline admission flip): the table's shape bars the inline
+            // memtable outright (partition column or retention delete filters), so
+            // this write goes straight to a staged Vortex write without ever
+            // buffering. `try_inline_or_restream` (which records rows_cap/bytes_cap
+            // and the burst shape) is skipped, so attribute the flip here.
+            telemetry::track_cayenne_inline_fallback(&[
+                telemetry::KeyValue::new("table", self.table.table_name().to_string()),
+                telemetry::KeyValue::new("reason", "blocking_config"),
+            ]);
         }
 
         let needs_new_snapshot = pending_pk_deletions || may_have_on_conflict_deletions;
@@ -658,7 +1123,7 @@ impl<'a> AppendMutationWriter<'a> {
     ) -> Result<(
         u64,
         Arc<ColumnStatsAccumulator>,
-        std::collections::HashSet<arrow_row::OwnedRow>,
+        std::collections::HashSet<crate::row_converter::OwnedRow>,
         usize,
     )> {
         let new_snapshot_id = uuid::Uuid::now_v7().to_string();
@@ -671,17 +1136,23 @@ impl<'a> AppendMutationWriter<'a> {
                 target_size_bytes,
                 &new_snapshot_id,
                 self.task_context.session_config().target_partitions(),
-                // Lower-bound size estimate populated from the inline-gate
-                // buffer when the write attempted to inline first (the common
-                // on-conflict upsert shape: small deltas fully buffered by the
-                // gate, so the bound is exact). `None` when inlining was
-                // skipped (partition/retention tables) — those keep the prior
-                // full-fan-out behavior and the full default delta encoding.
+                // Size estimate from the inline-gate buffer when the write
+                // attempted to inline first (the common on-conflict upsert shape:
+                // small deltas fully buffered by the gate, so the bound is
+                // exact). On overflow it is a buffered LOWER BOUND, kept ON
+                // PURPOSE so a hot CDC burst stays a single encode shard
+                // (fanning overflowing bursts out regressed encode/publish/OLAP
+                // read-amp 2-4x). `None` only when inlining was skipped
+                // (partition/retention tables) — those keep the prior full
+                // fan-out sizing and the full default delta encoding.
                 estimated_bytes,
                 crate::provider::delta_encoding::WriteClass::Delta,
             )
             .await?;
         record_cayenne_write_phase(self.table.table_name(), "vortex_write", write_start);
+        // Fold the encode + object-store/disk upload latency into the adaptive
+        // tuner's I/O-bound signal (CDC-apply path only; compaction is excluded).
+        self.context.record_io_latency(write_start.elapsed());
         tracing::trace!(
             table = self.table.table_name(),
             new_snapshot_id,
@@ -723,11 +1194,10 @@ impl<'a> AppendMutationWriter<'a> {
         // `publish_cas` is the atomic deletion-cache + protected-snapshot publish.
         let publish_start = Instant::now();
         let seq_start = Instant::now();
-        let new_sequence = self
-            .table
-            .catalog()
-            .increment_sequence_number(self.table.table_id())
-            .await?;
+        // Lever B2: in-memory allocator (shared with the staged path on this
+        // same provider), so the sync-publish snapshot sequence stays on the one
+        // monotone source instead of acquiring the metastore writer here.
+        let new_sequence = self.table.reserve_sequences_local(1).await?;
 
         // Durably record the new snapshot's sequence before making it visible.
         self.table
@@ -742,6 +1212,9 @@ impl<'a> AppendMutationWriter<'a> {
             .await;
         record_cayenne_write_phase(self.table.table_name(), "publish_cas", cas_start);
         record_cayenne_write_phase(self.table.table_name(), "publish", publish_start);
+        // Fold the metastore publish-wall latency into the adaptive tuner's
+        // publish-bound signal (the single-writer finalization on the CDC-apply path).
+        self.context.record_publish_latency(publish_start.elapsed());
 
         Ok((rows, stats_acc, validated_keys, superseded))
     }
@@ -807,6 +1280,14 @@ impl<'a> AppendMutationWriter<'a> {
                 self.table
                     .schedule_inline_checkpoint_if_memtable_pressure_exceeded();
 
+                // METRIC 4 (burst shape): rows + Arrow bytes of this inlined CDC
+                // batch. Both are exact here — the whole delta fit in the buffer.
+                record_cayenne_cdc_burst(
+                    self.table.table_name(),
+                    buffer.total_rows() as u64,
+                    buffer.total_bytes() as u64,
+                );
+
                 return Ok(InlineMutationOutcome::Inlined {
                     rows: u64::try_from(buffer.total_rows()).unwrap_or(u64::MAX),
                     post_validation: state,
@@ -816,15 +1297,45 @@ impl<'a> AppendMutationWriter<'a> {
             restore_post_validation(post_validation, state);
         }
 
-        // Bytes seen while buffering — a lower bound on the delta size (the
-        // chained remainder of `prepared_stream` may add more). Used to size the
-        // write shard count: small deltas stay a single file. Captured before
-        // `into_chained_stream` consumes the buffer.
-        let buffered_bytes = buffer.total_bytes() as u64;
+        // Size the staged write with the buffered byte count — DELIBERATELY,
+        // even though on overflow it is only a lower bound on the delta size.
+        // Treating an overflowed (unsized) burst as unknown and fanning out to
+        // full write-concurrency was tried and MEASURED AS A REGRESSION
+        // (2026-06-06, SF-100 @10K txn/s): 8 shards x every hot burst produced
+        // ~10K vortex files/table in one run, per-file fixed costs made encode
+        // 2.5x SLOWER per batch, publish grew with the per-file metastore rows,
+        // and scan read-amp regressed every OLAP query 2-4x. Hot CDC bursts
+        // must stay a single file (the SOTA shape: parallelize ACROSS flushes,
+        // never within small ones); large EXACT-sized writes (inline
+        // checkpoints) still fan out via the encode-shard unit in
+        // `snapshot_shard_count`. Captured before `into_chained_stream`
+        // consumes the buffer.
+        let estimated_bytes = Some(buffer.total_bytes() as u64);
+        // METRIC 3 (inline admission flip): record the flip when a cap tripped,
+        // attributed to which one (`rows_cap` / `bytes_cap`). The other way to
+        // reach here is the buffer fitting but `try_inline_batches_with_inlined_deletions`
+        // returning false (a rare deletions-couldn't-apply-inline case) — that is
+        // not an admission-cap event, so it is deliberately left uncounted rather
+        // than mislabeled as a cap.
+        if let Some(reason) = buffer.overflow_reason() {
+            telemetry::track_cayenne_inline_fallback(&[
+                telemetry::KeyValue::new("table", self.table.table_name().to_string()),
+                telemetry::KeyValue::new("reason", reason),
+            ]);
+        }
+        // METRIC 4 (burst shape): rows + Arrow bytes of this CDC batch, captured
+        // before `into_chained_stream` consumes the buffer. On the fallback path
+        // the byte count is a lower bound (the un-buffered stream remainder is not
+        // yet counted), but the row count is exact for what was buffered.
+        record_cayenne_cdc_burst(
+            self.table.table_name(),
+            buffer.total_rows() as u64,
+            buffer.total_bytes() as u64,
+        );
         let re_stream = buffer.into_chained_stream(prepared_stream, self.task_context)?;
         Ok(InlineMutationOutcome::Fallback {
             stream: re_stream,
-            buffered_bytes,
+            estimated_bytes,
         })
     }
 
@@ -876,6 +1387,9 @@ impl<'a> AppendMutationWriter<'a> {
             }
         };
         record_cayenne_write_phase(self.table.table_name(), "vortex_write", write_start);
+        // Fold the encode + object-store/disk upload latency into the adaptive
+        // tuner's I/O-bound signal (CDC-apply path only; compaction is excluded).
+        self.context.record_io_latency(write_start.elapsed());
 
         let staged_append = CayenneStagedAppend::from_staged_append_in(
             self.table.clone_for_write_operations(),
@@ -886,6 +1400,9 @@ impl<'a> AppendMutationWriter<'a> {
         let publish_start = Instant::now();
         staged_append.finalize_staged_write().await?;
         record_cayenne_write_phase(self.table.table_name(), "publish", publish_start);
+        // Fold the metastore publish-wall latency into the adaptive tuner's
+        // publish-bound signal (the single-writer finalization on the CDC-apply path).
+        self.context.record_publish_latency(publish_start.elapsed());
 
         Ok(result)
     }
@@ -905,6 +1422,42 @@ impl<'a> AppendMutationWriter<'a> {
         self.table
             .staging_may_have_files()
             .store(true, Ordering::Release);
+
+        // IVM staged capture (Edit B): when the table has a retraction-capable
+        // maintained aggregate, buffer the insert batches and re-stream them into
+        // the encoder unchanged; the buffer feeds the registry incrementally at
+        // publish (attached to the receipt below). Non-IVM / non-retraction tables
+        // (the common case) stream straight through at zero cost. The Stage-A
+        // buffer is accepted for the prototype (the only staged IVM table is a
+        // small rollup); a large staged IVM table needs deferred two-phase capture.
+        let (stream, ivm_captured): (SendableRecordBatchStream, Option<Arc<Vec<RecordBatch>>>) =
+            if self.table.should_capture_staged_ivm_feed() {
+                let schema = stream.schema();
+                let mut buffered: Vec<RecordBatch> = Vec::new();
+                let mut src = stream;
+                while let Some(batch) = src.next().await {
+                    buffered.push(batch.map_err(|e| super::Error::Internal {
+                        table: self.table.table_name().to_string(),
+                        message: format!("IVM staged capture failed to read a batch: {e}"),
+                    })?);
+                }
+                // Share ONE backing buffer between the re-stream and the publish
+                // receipt: `RecordBatch` is cheaply clonable (it shares the
+                // underlying Arrow buffers), so the encoder re-stream clones each
+                // batch lazily off the shared `Arc<Vec<_>>` rather than duplicating
+                // the whole `Vec`.
+                let captured = Arc::new(buffered);
+                let stream_batches = Arc::clone(&captured);
+                let restream: SendableRecordBatchStream = Box::pin(RecordBatchStreamAdapter::new(
+                    schema,
+                    futures::stream::iter((0..stream_batches.len()).map(move |i| {
+                        Ok::<_, datafusion::error::DataFusionError>(stream_batches[i].clone())
+                    })),
+                ));
+                (restream, Some(captured))
+            } else {
+                (stream, None)
+            };
 
         let write_start = Instant::now();
         let (rows, writer_ops, stats_acc) = match self
@@ -935,6 +1488,9 @@ impl<'a> AppendMutationWriter<'a> {
             }
         };
         record_cayenne_write_phase(self.table.table_name(), "vortex_write", write_start);
+        // Fold the encode + object-store/disk upload latency into the adaptive
+        // tuner's I/O-bound signal (CDC-apply path only; compaction is excluded).
+        self.context.record_io_latency(write_start.elapsed());
 
         let staged_append = CayenneStagedAppend::from_staged_append_to_snapshot(
             self.table.clone_for_write_operations(),
@@ -945,7 +1501,7 @@ impl<'a> AppendMutationWriter<'a> {
             rows,
         );
         let prepare_start = Instant::now();
-        let prepared_append = match staged_append.prepare().await {
+        let mut prepared_append = match staged_append.prepare().await {
             Ok(prepared_append) => prepared_append,
             Err(e) => {
                 if let Err(cleanup_err) = self
@@ -962,6 +1518,11 @@ impl<'a> AppendMutationWriter<'a> {
             }
         };
         record_cayenne_write_phase(self.table.table_name(), "stage_wal_prepare", prepare_start);
+
+        // Hand the captured insert batches to the receipt so the staged publish
+        // (apply_under_barrier / apply_under_held_barrier) feeds the maintained-
+        // aggregate registry under the held listing fence.
+        prepared_append.set_ivm_feed_batches(ivm_captured);
 
         Ok((rows, writer_ops, stats_acc, prepared_append))
     }
@@ -1021,6 +1582,8 @@ mod tests {
 
         assert_eq!(buffer.total_rows(), INLINE_MAX_ROWS + 1);
         assert!(!buffer.should_continue_buffering());
+        // METRIC 3: a row-cap overflow attributes to `rows_cap`.
+        assert_eq!(buffer.overflow_reason(), Some("rows_cap"));
     }
 
     #[test]
@@ -1041,5 +1604,26 @@ mod tests {
         buffer.push(batch);
 
         assert!(!buffer.should_continue_buffering());
+        // METRIC 3: a byte-cap overflow (within the row cap) attributes to
+        // `bytes_cap`.
+        assert_eq!(buffer.overflow_reason(), Some("bytes_cap"));
+    }
+
+    #[test]
+    fn inline_buffer_overflow_reason_none_when_within_caps() {
+        // METRIC 3: a buffer that fits both caps reports no fallback reason, so the
+        // inline-admission counter is not incremented for a write that inlines.
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Int64Array::from_iter_values(0..8))],
+        )
+        .expect("batch should be valid");
+
+        let mut buffer = InlineBatchBuffer::new(schema, INLINE_MAX_ROWS, INLINE_MAX_BUFFER_BYTES);
+        buffer.push(batch);
+
+        assert!(buffer.should_continue_buffering());
+        assert_eq!(buffer.overflow_reason(), None);
     }
 }

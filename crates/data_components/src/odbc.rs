@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use crate::function_support::FunctionSupport;
 use async_trait::async_trait;
 use datafusion::{
     datasource::TableProvider,
@@ -21,12 +22,8 @@ use datafusion::{
 };
 use datafusion_table_providers::sql::{
     db_connection_pool as db_connection_pool_datafusion,
-    sql_provider_datafusion::{
-        SqlTable,
-        expr::{self, Engine},
-    },
+    sql_provider_datafusion::{SqlTable, expr::Engine},
 };
-use datafusion_table_providers::util::supported_functions::FunctionSupport;
 use db_connection_pool::dbconnection::odbcconn::ODBCDbConnectionPool;
 use snafu::prelude::*;
 use std::sync::Arc;
@@ -52,9 +49,6 @@ pub enum Error {
     UnableToGetSchema {
         source: db_connection_pool_datafusion::dbconnection::Error,
     },
-
-    #[snafu(display("Failed to generate SQL for the ODBC query: {source}"))]
-    UnableToGenerateSQL { source: expr::Error },
 }
 
 type Result<T, E = Error> = std::result::Result<T, E>;

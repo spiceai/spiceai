@@ -34,7 +34,7 @@ use datafusion::{
     physical_plan::{ExecutionPlan, stream::RecordBatchStreamAdapter},
     scalar::ScalarValue,
 };
-use std::{any::Any, collections::HashMap, path::Path, sync::Arc, time::Duration};
+use std::{collections::HashMap, path::Path, sync::Arc, time::Duration};
 use token_provider::TokenProvider;
 use util::ExponentialBackoff;
 use util::fibonacci_backoff::{Backoff, FibonacciBackoffBuilder};
@@ -277,10 +277,6 @@ fn requested_ref_from_filters(filters: &[Expr]) -> datafusion::error::Result<Opt
 
 #[async_trait]
 impl TableProvider for GithubFilesTableProvider {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema(&self) -> SchemaRef {
         Arc::clone(&self.schema)
     }
@@ -415,7 +411,7 @@ where
         .build();
 
     let mut exponential_backoff = ExponentialBackoff {
-        max_elapsed_time: Some(std::time::Duration::from_secs(300)), // 5 minutes max total retry time
+        max_elapsed_time: Some(std::time::Duration::from_mins(5)), // 5 minutes max total retry time
         ..ExponentialBackoff::default()
     };
 
@@ -677,7 +673,7 @@ impl GithubRestClient {
     ) -> reqwest::Result<Self> {
         let client = reqwest::Client::builder()
             .connect_timeout(Duration::from_secs(10))
-            .timeout(Duration::from_secs(120))
+            .timeout(Duration::from_mins(2))
             .build()?;
 
         Ok(GithubRestClient {

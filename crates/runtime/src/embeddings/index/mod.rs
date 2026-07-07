@@ -52,7 +52,7 @@ pub mod tests {
     use search::{SEARCH_SCORE_COLUMN_NAME, generation::util::append_fields, index::SearchIndex};
     use snafu::ResultExt;
 
-    use crate::embedding_col;
+    use runtime_search::embedding_col;
 
     /// This is just a [`MemTable`] that pretends it can support all filter pushdowns.
     /// This is useful for testing explain plans.
@@ -80,11 +80,7 @@ pub mod tests {
             self.4
         }
 
-        fn as_any(&self) -> &dyn Any {
-            self
-        }
-
-        fn properties(&self) -> &datafusion::physical_plan::PlanProperties {
+        fn properties(&self) -> &Arc<datafusion::physical_plan::PlanProperties> {
             self.0.properties()
         }
 
@@ -139,10 +135,6 @@ pub mod tests {
 
     #[async_trait]
     impl TableProvider for ExplainMemTable {
-        fn as_any(&self) -> &dyn Any {
-            self
-        }
-
         fn schema(&self) -> SchemaRef {
             self.0.schema()
         }

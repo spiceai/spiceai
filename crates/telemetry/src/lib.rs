@@ -43,6 +43,40 @@ pub const DURATION_MS_HISTOGRAM_BUCKETS: [f64; 15] = [
     100_000.0, 250_000.0, 500_000.0,
 ];
 
+// Buckets for byte-sized payload histograms (Cayenne CDC burst / WAL telemetry).
+// Spans a single small inline write (~1 KiB) through a coalesced burst at the
+// default 128 MiB coalesce budget up to a multi-hundred-MiB WAL backlog, so both
+// the hot-path burst shape and a stalled-checkpoint WAL stay on-scale.
+pub const BYTES_HISTOGRAM_BUCKETS: [f64; 16] = [
+    1024.0,
+    4096.0,
+    16384.0,
+    65536.0,
+    262_144.0,
+    1_048_576.0,
+    4_194_304.0,
+    16_777_216.0,
+    67_108_864.0,
+    134_217_728.0,
+    268_435_456.0,
+    536_870_912.0,
+    1_073_741_824.0,
+    2_147_483_648.0,
+    4_294_967_296.0,
+    8_589_934_592.0,
+];
+
+// Finer-grained millisecond buckets for sub-second contention timings (metastore
+// writer wait/hold, WAL checkpoint, CDC linger). The shared
+// `DURATION_MS_HISTOGRAM_BUCKETS` jumps straight from 0 to 100ms, which is too
+// coarse for lock/checkpoint latencies that live in the 0.1–50ms band; this set
+// resolves that band while still reaching into the multi-second tail that signals
+// a stall.
+pub const CONTENTION_MS_HISTOGRAM_BUCKETS: [f64; 17] = [
+    0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 25.0, 50.0, 100.0, 250.0, 500.0, 1000.0, 2500.0, 5000.0,
+    10000.0, 30000.0,
+];
+
 static QUERY_COUNT: OnceLock<Counter<u64>> = OnceLock::new();
 
 pub fn track_query_count(dimensions: &[KeyValue]) {
@@ -446,6 +480,87 @@ pub fn track_cayenne_write_phase_duration(duration: Duration, dimensions: &[KeyV
         .record(duration.as_secs_f64() * 1000.0, dimensions);
 }
 
+static CAYENNE_CDC_ABSORBED_DELETE_KEYS: OnceLock<Counter<u64>> = OnceLock::new();
+
+/// Counts CDC Delete-event keys absorbed by the in-memory CDC tier
+/// (`cdc_durability: memory`) as RAM tombstones instead of being routed onto
+/// the durable staged path. Each absorbed key defers its durability to the
+/// covering mem-tier checkpoint, exactly like in-memory upserts. `dimensions`
+/// should carry `table`.
+pub fn track_cayenne_cdc_absorbed_delete_keys(keys: u64, dimensions: &[KeyValue]) {
+    CAYENNE_CDC_ABSORBED_DELETE_KEYS
+        .get_or_init(|| {
+            cayenne_operational_meter()
+                .u64_counter("cayenne_cdc_absorbed_delete_keys_total")
+                .with_description(
+                    "CDC Delete-event keys absorbed as in-memory CDC tier tombstones (durability deferred to the covering mem-tier checkpoint) instead of taking the durable staged path.",
+                )
+                .with_unit("keys")
+                .build()
+        })
+        .add(keys, dimensions);
+}
+
+static CAYENNE_MEM_TIER_CHECKPOINT_TICK: OnceLock<Counter<u64>> = OnceLock::new();
+
+/// Counts background mem-tier checkpoint TICK outcomes (`cdc_durability: memory`),
+/// so a stalled deferred source-slot ack is attributable to the trigger vs the
+/// checkpoint body. Outcomes (carried as the `outcome` dimension): `fired` (the
+/// tick ran a checkpoint), `skipped_empty` (whole tier empty), `skipped_gate`
+/// (size/age churn gate held it off), `no_advancer` / `not_memory_mode` (early
+/// return before the gate), `failed` (the checkpoint errored). A flat-zero `fired`
+/// under a growing WAL backlog localizes a slot-ack stall to the trigger path —
+/// the exact signal missing when the sharded (N>1) tier stopped draining.
+/// `dimensions` carries `table` + `outcome`.
+pub fn track_cayenne_mem_tier_checkpoint_tick(dimensions: &[KeyValue]) {
+    CAYENNE_MEM_TIER_CHECKPOINT_TICK
+        .get_or_init(|| {
+            cayenne_operational_meter()
+                .u64_counter("cayenne_mem_tier_checkpoint_tick_total")
+                .with_description(
+                    "Background mem-tier checkpoint tick outcomes (fired / skipped_empty / skipped_gate / no_advancer / not_memory_mode / failed), labeled by table and outcome.",
+                )
+                .with_unit("ticks")
+                .build()
+        })
+        .add(1, dimensions);
+}
+
+static CAYENNE_MEM_TIER_APPLY_EPOCH: OnceLock<Gauge<u64>> = OnceLock::new();
+static CAYENNE_MEM_TIER_DURABLE_EPOCH: OnceLock<Gauge<u64>> = OnceLock::new();
+
+/// The per-apply slot-ack epoch axis (`cdc_durability: memory`): `apply_epoch` is the
+/// latest allocated per-apply epoch counter; `durable_epoch` is the highest epoch the
+/// most recent mem-tier checkpoint reported durable (what `fire_slot_advancer` handed
+/// the runtime to advance the source slot). The GAP (`apply_epoch − durable_epoch`) is
+/// the un-acked source-slot backlog measured in apply epochs: a small/steady gap means
+/// the slot keeps pace; a gap that GROWS while checkpoints keep firing means the
+/// watermark is stuck — the exact signature of the N>1 WAL-drain stall, and the signal
+/// that pins it to the watermark computation vs the trigger. `dimensions` carries
+/// `table`. Emitted on each `fire_slot_advancer` (i.e. each completed checkpoint).
+pub fn track_cayenne_mem_tier_epoch(apply_epoch: u64, durable_epoch: u64, dimensions: &[KeyValue]) {
+    CAYENNE_MEM_TIER_APPLY_EPOCH
+        .get_or_init(|| {
+            cayenne_operational_meter()
+                .u64_gauge("cayenne_mem_tier_apply_epoch")
+                .with_description(
+                    "Latest allocated per-apply slot-ack epoch counter (cdc_durability: memory).",
+                )
+                .build()
+        })
+        .record(apply_epoch, dimensions);
+    CAYENNE_MEM_TIER_DURABLE_EPOCH
+        .get_or_init(|| {
+            cayenne_operational_meter()
+                .u64_gauge("cayenne_mem_tier_durable_epoch")
+                .with_description(
+                    "Highest per-apply epoch the last mem-tier checkpoint reported durable (handed to fire_slot_advancer to advance the source slot).",
+                )
+                .build()
+        })
+        .record(durable_epoch, dimensions);
+}
+
 static CAYENNE_COMPACTION_DURATION_MS: OnceLock<Histogram<f64>> = OnceLock::new();
 
 /// Build-once accessor for the compaction-duration histogram. The first call
@@ -457,16 +572,19 @@ fn cayenne_compaction_duration_ms() -> &'static Histogram<f64> {
     CAYENNE_COMPACTION_DURATION_MS.get_or_init(|| {
         cayenne_operational_meter()
             .f64_histogram("cayenne_compaction_duration_ms")
-            .with_description("Wall-clock time of Cayenne background compaction passes.")
+            .with_description(
+                "Wall-clock time of Cayenne compaction passes (kind=full current-snapshot rewrite | subset protected-snapshot merge).",
+            )
             .with_unit("ms")
             .with_boundaries(DURATION_MS_HISTOGRAM_BUCKETS.to_vec())
             .build()
     })
 }
 
-/// Records the wall-clock duration of a Cayenne background compaction pass.
-/// `dimensions` should carry `table` and `result` (`"completed"` | `"failed"`).
-/// The histogram's count doubles as the compaction-pass counter.
+/// Records the wall-clock duration of a Cayenne compaction pass. `dimensions`
+/// should carry `table`, `kind` (`"full"` current-snapshot rewrite | `"subset"`
+/// protected-snapshot merge), and `result` (`"completed"` | `"failed"`). The
+/// histogram's count doubles as the per-kind compaction-pass counter.
 pub fn track_cayenne_compaction_duration(duration: Duration, dimensions: &[KeyValue]) {
     cayenne_compaction_duration_ms().record(duration.as_secs_f64() * 1000.0, dimensions);
 }
@@ -509,6 +627,7 @@ fn cayenne_compaction_memory_exhausted() -> &'static Counter<u64> {
 /// Counts compaction passes that failed because the dedicated compaction memory
 /// pool could not satisfy a reservation (`ResourcesExhausted`). A non-zero rate
 /// means the carve fraction is too small for the rewrite working set.
+/// `dimensions` should carry `table` and `kind` (`"full"` | `"subset"`).
 pub fn track_cayenne_compaction_memory_exhausted(dimensions: &[KeyValue]) {
     cayenne_compaction_memory_exhausted().add(1, dimensions);
 }
@@ -528,6 +647,132 @@ pub fn register_cayenne_compaction_metrics(compaction_pool_bytes: u64) {
     let _ = cayenne_compaction_memory_exhausted();
     // Publish the carved pool size against the real meter.
     cayenne_compaction_memory_pool_bytes().record(compaction_pool_bytes, &[]);
+}
+
+/// Registers per-tokio-runtime observable gauges so `/metrics` shows, per runtime,
+/// whether its worker threads are idle or competing for cores. Pull-based: each
+/// callback reads `tokio::runtime::Handle::metrics()` at Prometheus scrape time, so
+/// there is no periodic sampler task and near-zero cost between scrapes.
+///
+/// `handles` is a list of `(label, handle)` — e.g. `("cpu", …)`, `("refresh", …)`,
+/// `("cdc_apply", …)`, `("compaction", …)`, `("main", …)`; each becomes a
+/// `runtime="<label>"` attribute on every gauge. Like [`register_cayenne_compaction_metrics`],
+/// the binary MUST call this once AFTER `init_metrics` has installed the Prometheus meter.
+///
+/// The task/worker/queue gauges use stable `RuntimeMetrics` APIs and are always emitted.
+/// The per-worker busy/park/steal gauges — the direct "are these threads doing work or
+/// just parked" signal — require the `tokio_unstable` cfg at build time
+/// (`RUSTFLAGS="--cfg tokio_unstable"`); without it only the stable gauges register, so
+/// default and CI builds are unaffected.
+pub fn register_tokio_runtime_metrics(handles: Vec<(&'static str, tokio::runtime::Handle)>) {
+    if handles.is_empty() {
+        return;
+    }
+    let handles: std::sync::Arc<[(&'static str, tokio::runtime::Handle)]> = handles.into();
+    let meter = global::meter("tokio_runtime");
+
+    let h = std::sync::Arc::clone(&handles);
+    let _ = meter
+        .u64_observable_gauge("tokio_runtime_alive_tasks")
+        .with_description("Alive (spawned, not-yet-completed) tasks per tokio runtime.")
+        .with_unit("{task}")
+        .with_callback(move |obs| {
+            for (name, handle) in h.iter() {
+                obs.observe(
+                    handle.metrics().num_alive_tasks() as u64,
+                    &[KeyValue::new("runtime", *name)],
+                );
+            }
+        })
+        .build();
+
+    let h = std::sync::Arc::clone(&handles);
+    let _ = meter
+        .u64_observable_gauge("tokio_runtime_workers")
+        .with_description("Worker threads per tokio runtime.")
+        .with_unit("{thread}")
+        .with_callback(move |obs| {
+            for (name, handle) in h.iter() {
+                obs.observe(
+                    handle.metrics().num_workers() as u64,
+                    &[KeyValue::new("runtime", *name)],
+                );
+            }
+        })
+        .build();
+
+    let h = std::sync::Arc::clone(&handles);
+    let _ = meter
+        .u64_observable_gauge("tokio_runtime_global_queue_depth")
+        .with_description(
+            "Tasks waiting in the runtime's global (injection) queue per tokio runtime.",
+        )
+        .with_unit("{task}")
+        .with_callback(move |obs| {
+            for (name, handle) in h.iter() {
+                obs.observe(
+                    handle.metrics().global_queue_depth() as u64,
+                    &[KeyValue::new("runtime", *name)],
+                );
+            }
+        })
+        .build();
+
+    // Per-worker busy/park/steal — the direct "idle vs stealing cores" signal — are only
+    // exposed under `--cfg tokio_unstable`. Gated so default/CI builds compile and emit
+    // just the stable gauges above; build with the cfg to surface these in `/metrics`.
+    #[cfg(tokio_unstable)]
+    {
+        let h = std::sync::Arc::clone(&handles);
+        let _ = meter
+            .f64_observable_gauge("tokio_runtime_worker_busy_seconds")
+            .with_description(
+                "Cumulative worker-busy time (summed across workers) per tokio runtime; rate()/workers = busy ratio.",
+            )
+            .with_unit("s")
+            .with_callback(move |obs| {
+                for (name, handle) in h.iter() {
+                    let m = handle.metrics();
+                    let busy: f64 = (0..m.num_workers())
+                        .map(|w| m.worker_total_busy_duration(w).as_secs_f64())
+                        .sum();
+                    obs.observe(busy, &[KeyValue::new("runtime", *name)]);
+                }
+            })
+            .build();
+
+        let h = std::sync::Arc::clone(&handles);
+        let _ = meter
+            .u64_observable_gauge("tokio_runtime_worker_park_count")
+            .with_description(
+                "Cumulative worker park count (summed across workers) per tokio runtime.",
+            )
+            .with_unit("{park}")
+            .with_callback(move |obs| {
+                for (name, handle) in h.iter() {
+                    let m = handle.metrics();
+                    let parks: u64 = (0..m.num_workers()).map(|w| m.worker_park_count(w)).sum();
+                    obs.observe(parks, &[KeyValue::new("runtime", *name)]);
+                }
+            })
+            .build();
+
+        let h = std::sync::Arc::clone(&handles);
+        let _ = meter
+            .u64_observable_gauge("tokio_runtime_worker_steal_count")
+            .with_description(
+                "Cumulative task-steal count (summed across workers) per tokio runtime.",
+            )
+            .with_unit("{steal}")
+            .with_callback(move |obs| {
+                for (name, handle) in h.iter() {
+                    let m = handle.metrics();
+                    let steals: u64 = (0..m.num_workers()).map(|w| m.worker_steal_count(w)).sum();
+                    obs.observe(steals, &[KeyValue::new("runtime", *name)]);
+                }
+            })
+            .build();
+    }
 }
 
 static CAYENNE_INLINE_TOMBSTONE_WRITES: OnceLock<Counter<u64>> = OnceLock::new();
@@ -584,6 +829,627 @@ pub fn track_cayenne_inline_rewrite_fallback(dimensions: &[KeyValue]) {
                 .build()
         })
         .add(1, dimensions);
+}
+
+static CAYENNE_SCAN_FILES_LISTED: OnceLock<Counter<u64>> = OnceLock::new();
+static CAYENNE_SCAN_FILES_PRUNED: OnceLock<Counter<u64>> = OnceLock::new();
+
+/// Counts Vortex data files considered ("listed") and skipped ("pruned") at
+/// scan listing time via the #11234 footer min/max statistics. The pruned/listed
+/// ratio is the read-amplification signal: sorted compaction tightens per-file
+/// ranges so listing-time pruning skips more files for an aligned filter.
+/// `dimensions` should carry `table`.
+pub fn track_cayenne_scan_files(listed: u64, pruned: u64, dimensions: &[KeyValue]) {
+    if listed > 0 {
+        CAYENNE_SCAN_FILES_LISTED
+            .get_or_init(|| {
+                cayenne_operational_meter()
+                    .u64_counter("cayenne_scan_files_listed_total")
+                    .with_description(
+                        "Vortex data files considered at scan listing time (before footer-statistics pruning).",
+                    )
+                    .build()
+            })
+            .add(listed, dimensions);
+    }
+    if pruned > 0 {
+        CAYENNE_SCAN_FILES_PRUNED
+            .get_or_init(|| {
+                cayenne_operational_meter()
+                    .u64_counter("cayenne_scan_files_pruned_total")
+                    .with_description(
+                        "Vortex data files skipped at scan listing time by footer min/max statistics.",
+                    )
+                    .build()
+            })
+            .add(pruned, dimensions);
+    }
+}
+
+static CAYENNE_INLINE_CACHE_DELTA_POPULATES: OnceLock<Counter<u64>> = OnceLock::new();
+static CAYENNE_INLINE_CACHE_FULL_REBUILDS: OnceLock<Counter<u64>> = OnceLock::new();
+
+/// Counts how the inline-memtable read cache was materialized on a miss: one
+/// increment to the delta counter when the incremental fast path was taken
+/// (the rows committed since the last view were fetched + decoded AND/OR a
+/// published tombstone's removal was applied to the reused base entries —
+/// cycle-5 TASK 1), or to the full-rebuild counter when the whole
+/// `cayenne_inlined_data` corpus had to be re-read and re-decoded (sentinel/first
+/// touch, or a structural change — inline rewrite, checkpoint, overwrite,
+/// recovery, or the over-cap tombstone-delta release). Under sustained CDC the
+/// delta counter should dominate even on heavy-upsert tables: a published
+/// tombstone is now a delta (removal-only), so it no longer forces a full
+/// rebuild on every upsert batch. A high full-rebuild rate now means inline
+/// rewrites (inline-vs-inline conflicts), frequent checkpoints, or the
+/// tombstone-delta queue repeatedly hitting its cap. `dimensions` should carry
+/// `table`.
+pub fn track_cayenne_inline_cache_populate(delta: bool, dimensions: &[KeyValue]) {
+    if delta {
+        CAYENNE_INLINE_CACHE_DELTA_POPULATES
+            .get_or_init(|| {
+                cayenne_operational_meter()
+                    .u64_counter("cayenne_inline_cache_delta_populates_total")
+                    .with_description(
+                        "Inline-memtable cache misses satisfied by the append-only delta path (only newly committed rows fetched + decoded), avoiding the O(corpus) re-read.",
+                    )
+                    .build()
+            })
+            .add(1, dimensions);
+    } else {
+        CAYENNE_INLINE_CACHE_FULL_REBUILDS
+            .get_or_init(|| {
+                cayenne_operational_meter()
+                    .u64_counter("cayenne_inline_cache_full_rebuilds_total")
+                    .with_description(
+                        "Inline-memtable cache misses that required a full corpus re-read + re-decode (sentinel/first touch or a structural change: rewrite, tombstone, checkpoint, overwrite, recovery).",
+                    )
+                    .build()
+            })
+            .add(1, dimensions);
+    }
+}
+
+static CAYENNE_LIST_FILES_CACHE_DELTA_APPLIES: OnceLock<Counter<u64>> = OnceLock::new();
+static CAYENNE_LIST_FILES_CACHE_EVICTIONS: OnceLock<Counter<u64>> = OnceLock::new();
+
+/// Counts how a current-snapshot publish updated `DataFusion`'s list-files cache:
+/// a delta-apply (the moved files were merged onto the cached directory listing,
+/// avoiding a full re-LIST) or an eviction (the whole directory entry was
+/// dropped, forcing the next scan to re-LIST — the fallback for compaction,
+/// retention, a cold cache, or a standalone publish). Under sustained append CDC
+/// the delta-apply counter should dominate; a high eviction rate means most
+/// publishes lack recorded additions or the listing keeps getting evicted out
+/// from under the writer. `dimensions` should carry `table`.
+pub fn track_cayenne_list_files_cache_publish(delta: bool, dimensions: &[KeyValue]) {
+    if delta {
+        CAYENNE_LIST_FILES_CACHE_DELTA_APPLIES
+            .get_or_init(|| {
+                cayenne_operational_meter()
+                    .u64_counter("cayenne_list_files_cache_delta_applies_total")
+                    .with_description(
+                        "Current-snapshot publishes that merged the moved files onto the cached directory listing (avoiding a full re-LIST).",
+                    )
+                    .build()
+            })
+            .add(1, dimensions);
+    } else {
+        CAYENNE_LIST_FILES_CACHE_EVICTIONS
+            .get_or_init(|| {
+                cayenne_operational_meter()
+                    .u64_counter("cayenne_list_files_cache_evictions_total")
+                    .with_description(
+                        "Current-snapshot publishes that evicted the whole directory listing (forcing the next scan to re-LIST): compaction, retention, cold cache, or standalone publish.",
+                    )
+                    .build()
+            })
+            .add(1, dimensions);
+    }
+}
+
+// ---- Auto-tuning (cayenne::provider::tuning) ------------------------------
+
+/// A table's auto-tuner state: the measured ingest/response signals plus the
+/// live (possibly dynamically-tuned) knob values. Emitted as gauges on every
+/// background tick — useful whether or not dynamic tuning is enabled, since the
+/// accounting is always recorded (it makes "what did auto pick, and how is the
+/// table behaving" observable in Prometheus).
+#[derive(Debug, Clone, Copy)]
+pub struct CayenneAutotuneState {
+    /// Measured CDC ingest rate, rows/sec (EWMA).
+    pub rows_per_sec: f64,
+    /// Measured CDC ingest rate, bytes/sec (EWMA); `< 0` ⇒ unavailable (the
+    /// gauge is then suppressed rather than emitting a misleading 0).
+    pub bytes_per_sec: f64,
+    /// Apply latency / offered-load interval; `> 1` ⇒ ingest falling behind.
+    pub apply_vs_arrival: f64,
+    /// Read amplification (runs a scan must merge); high ⇒ ingest slowing queries.
+    pub read_amp: u64,
+    /// cgroup-aware memory usage fraction of the budget; `< 0` ⇒ unknown.
+    pub mem_pressure: f64,
+    /// Per-batch apply wall time (EWMA, ms) — the latency the controller weighs
+    /// against the offered-load interval.
+    pub apply_ms: f64,
+    /// Live inline-memtable flush byte budget.
+    pub inline_flush_max_bytes: u64,
+    /// Live background compaction interval (ms).
+    pub compaction_interval_ms: u64,
+    /// Live small-file compaction trigger (file count).
+    pub compaction_trigger_files: u64,
+    /// Configured target Vortex file size (MB) — the reference compacted files
+    /// should trend toward (compare against `cayenne_compaction_merged_bytes`).
+    pub target_file_size_mb: u64,
+    /// Live write/encode concurrency (0 = session default).
+    pub write_concurrency: u64,
+    /// Live in-memory CDC durability tier byte cap (`cdc_durability: memory`);
+    /// `0` ⇒ no per-table cap (the process-global mem-tier budget still bounds RAM).
+    pub mem_tier_max_bytes: u64,
+    /// Measured fraction of ingested rows that are deletes (EWMA, `[0, 1]`).
+    pub delete_fraction: f64,
+    /// Arrival-interval coefficient of variation (burstiness); ~0 steady, `> 1` spiky.
+    pub arrival_cv: f64,
+    /// Measured end-to-end replication lag (seconds); `< 0` ⇒ unavailable (no
+    /// upstream source timestamp seen).
+    pub replication_lag_secs: f64,
+    /// Replication-lag goal target (seconds); `< 0` ⇒ no goal configured.
+    pub goal_replication_lag_secs: f64,
+    /// Measured freshness — age of the newest applied data (seconds); `< 0` ⇒ unavailable.
+    pub freshness_secs: f64,
+    /// Freshness goal target (seconds); `< 0` ⇒ no goal configured.
+    pub goal_freshness_secs: f64,
+    /// Measured p99 query latency on this table (ms); `< 0` ⇒ no queries observed.
+    pub query_latency_p99_ms: f64,
+    /// Query-latency goal target (ms); `< 0` ⇒ no goal configured.
+    pub goal_query_latency_ms: f64,
+    /// Measured SYSTEM-WIDE query throughput (queries/hour); `< 0` ⇒ unavailable.
+    /// Global, not per-table — a query spanning datasets is counted once, and the
+    /// gauge is emitted without a per-table dimension.
+    pub qph: f64,
+    /// System-wide QPH goal target (queries/hour); `< 0` ⇒ no goal configured.
+    pub goal_qph: f64,
+    /// cgroup-aware CPU busy-fraction of available cores; `< 0` ⇒ unavailable
+    /// (non-Linux or not yet sampled).
+    pub cpu_pressure: f64,
+    /// Per-batch object-store/disk write latency (EWMA, ms); `< 0` ⇒ no Vortex spill
+    /// observed (pure-inline table).
+    pub io_latency_ms: f64,
+    /// Per-batch metastore publish-wall latency (EWMA, ms); `< 0` ⇒ no metastore
+    /// publish observed (e.g. the writer-free pipelined path).
+    pub publish_latency_ms: f64,
+    /// Detected data-acceleration storage tier (`StorageClass::metric_code`: 0 local
+    /// SSD, 1 EBS, 2 tmpfs, 3 unknown/object-store).
+    pub data_storage_class: u64,
+    /// Detected metastore storage tier (same code mapping as `data_storage_class`).
+    pub metastore_storage_class: u64,
+    /// Calibration-probe measured data-volume write throughput (MiB/s); `< 0` ⇒
+    /// unprobed (remote / object-store / probe failed). Drives the continuous
+    /// slow-tier bias.
+    pub data_storage_write_mbps: f64,
+    /// Calibration-probe measured metastore-volume write throughput (MiB/s); `< 0`
+    /// ⇒ unprobed.
+    pub metastore_storage_write_mbps: f64,
+    /// `1` when the goal-driven controller has declared the SLO infeasible on this
+    /// hardware (no further adjustment possible — actuator bounds or resource gating —
+    /// and the goal still violated); `0` otherwise. Reflects current state — self-clears
+    /// if the SLO becomes reachable again — so an operator can alert on a sustained `1`.
+    pub goal_slo_infeasible: u64,
+}
+
+static CAYENNE_AT_ROWS_PER_SEC: OnceLock<Gauge<f64>> = OnceLock::new();
+static CAYENNE_AT_BYTES_PER_SEC: OnceLock<Gauge<f64>> = OnceLock::new();
+static CAYENNE_AT_APPLY_VS_ARRIVAL: OnceLock<Gauge<f64>> = OnceLock::new();
+static CAYENNE_AT_READ_AMP: OnceLock<Gauge<u64>> = OnceLock::new();
+static CAYENNE_AT_MEM_PRESSURE: OnceLock<Gauge<f64>> = OnceLock::new();
+static CAYENNE_AT_APPLY_MS: OnceLock<Gauge<f64>> = OnceLock::new();
+static CAYENNE_AT_INLINE_FLUSH_BYTES: OnceLock<Gauge<u64>> = OnceLock::new();
+static CAYENNE_AT_COMPACTION_INTERVAL_MS: OnceLock<Gauge<u64>> = OnceLock::new();
+static CAYENNE_AT_COMPACTION_TRIGGER_FILES: OnceLock<Gauge<u64>> = OnceLock::new();
+static CAYENNE_AT_TARGET_FILE_SIZE_MB: OnceLock<Gauge<u64>> = OnceLock::new();
+static CAYENNE_AT_WRITE_CONCURRENCY: OnceLock<Gauge<u64>> = OnceLock::new();
+static CAYENNE_AT_MEM_TIER_MAX_BYTES: OnceLock<Gauge<u64>> = OnceLock::new();
+static CAYENNE_AT_DELETE_FRACTION: OnceLock<Gauge<f64>> = OnceLock::new();
+static CAYENNE_AT_ARRIVAL_CV: OnceLock<Gauge<f64>> = OnceLock::new();
+static CAYENNE_AT_REPLICATION_LAG_SECS: OnceLock<Gauge<f64>> = OnceLock::new();
+static CAYENNE_AT_GOAL_REPLICATION_LAG_SECS: OnceLock<Gauge<f64>> = OnceLock::new();
+static CAYENNE_AT_FRESHNESS_SECS: OnceLock<Gauge<f64>> = OnceLock::new();
+static CAYENNE_AT_GOAL_FRESHNESS_SECS: OnceLock<Gauge<f64>> = OnceLock::new();
+static CAYENNE_AT_QUERY_LATENCY_P99_MS: OnceLock<Gauge<f64>> = OnceLock::new();
+static CAYENNE_AT_GOAL_QUERY_LATENCY_MS: OnceLock<Gauge<f64>> = OnceLock::new();
+static CAYENNE_AT_QPH: OnceLock<Gauge<f64>> = OnceLock::new();
+static CAYENNE_AT_GOAL_QPH: OnceLock<Gauge<f64>> = OnceLock::new();
+static CAYENNE_AT_CPU_PRESSURE: OnceLock<Gauge<f64>> = OnceLock::new();
+static CAYENNE_AT_IO_LATENCY_MS: OnceLock<Gauge<f64>> = OnceLock::new();
+static CAYENNE_AT_PUBLISH_LATENCY_MS: OnceLock<Gauge<f64>> = OnceLock::new();
+static CAYENNE_AT_DATA_STORAGE_WRITE_MIBPS: OnceLock<Gauge<f64>> = OnceLock::new();
+static CAYENNE_AT_METASTORE_STORAGE_WRITE_MIBPS: OnceLock<Gauge<f64>> = OnceLock::new();
+static CAYENNE_AT_GOAL_SLO_INFEASIBLE: OnceLock<Gauge<u64>> = OnceLock::new();
+static CAYENNE_AT_DATA_STORAGE_CLASS: OnceLock<Gauge<u64>> = OnceLock::new();
+static CAYENNE_AT_METASTORE_STORAGE_CLASS: OnceLock<Gauge<u64>> = OnceLock::new();
+
+/// Emit the auto-tuner state gauges for one table. `dimensions` should carry
+/// `table`. Called on each background tick.
+pub fn track_cayenne_autotune_state(state: &CayenneAutotuneState, dimensions: &[KeyValue]) {
+    CAYENNE_AT_ROWS_PER_SEC
+        .get_or_init(|| {
+            cayenne_operational_meter()
+                .f64_gauge("cayenne_ingest_rows_per_sec")
+                .with_description("Measured CDC ingest rate (rows/sec, EWMA).")
+                .build()
+        })
+        .record(state.rows_per_sec, dimensions);
+    // Suppress the bytes/sec gauge when byte accounting is unavailable
+    // (`bytes_per_sec < 0`) rather than reporting a misleading 0 under load.
+    if state.bytes_per_sec >= 0.0 {
+        CAYENNE_AT_BYTES_PER_SEC
+            .get_or_init(|| {
+                cayenne_operational_meter()
+                    .f64_gauge("cayenne_ingest_bytes_per_sec")
+                    .with_description("Measured CDC ingest rate (bytes/sec, EWMA).")
+                    .with_unit("By/s")
+                    .build()
+            })
+            .record(state.bytes_per_sec, dimensions);
+    }
+    CAYENNE_AT_APPLY_VS_ARRIVAL
+        .get_or_init(|| {
+            cayenne_operational_meter()
+                .f64_gauge("cayenne_ingest_apply_vs_arrival")
+                .with_description(
+                    "Apply latency / offered-load interval; > 1 means ingest is falling behind.",
+                )
+                .build()
+        })
+        .record(state.apply_vs_arrival, dimensions);
+    CAYENNE_AT_READ_AMP
+        .get_or_init(|| {
+            cayenne_operational_meter()
+                .u64_gauge("cayenne_ingest_read_amp")
+                .with_description(
+                    "Read amplification (protected-snapshot runs a scan must merge); high means ingest is slowing queries.",
+                )
+                .build()
+        })
+        .record(state.read_amp, dimensions);
+    CAYENNE_AT_MEM_PRESSURE
+        .get_or_init(|| {
+            cayenne_operational_meter()
+                .f64_gauge("cayenne_ingest_mem_pressure")
+                .with_description(
+                    "cgroup-aware memory usage as a fraction of the budget; negative means unknown.",
+                )
+                .build()
+        })
+        .record(state.mem_pressure, dimensions);
+    CAYENNE_AT_INLINE_FLUSH_BYTES
+        .get_or_init(|| {
+            cayenne_operational_meter()
+                .u64_gauge("cayenne_autotune_inline_flush_max_bytes")
+                .with_description("Current (live) inline-memtable flush byte budget.")
+                .with_unit("By")
+                .build()
+        })
+        .record(state.inline_flush_max_bytes, dimensions);
+    CAYENNE_AT_COMPACTION_INTERVAL_MS
+        .get_or_init(|| {
+            cayenne_operational_meter()
+                .u64_gauge("cayenne_autotune_compaction_interval_ms")
+                .with_description("Current (live) background compaction interval.")
+                .with_unit("ms")
+                .build()
+        })
+        .record(state.compaction_interval_ms, dimensions);
+    CAYENNE_AT_APPLY_MS
+        .get_or_init(|| {
+            cayenne_operational_meter()
+                .f64_gauge("cayenne_ingest_apply_ms")
+                .with_description("Per-batch CDC apply wall time (EWMA).")
+                .with_unit("ms")
+                .build()
+        })
+        .record(state.apply_ms, dimensions);
+    CAYENNE_AT_COMPACTION_TRIGGER_FILES
+        .get_or_init(|| {
+            cayenne_operational_meter()
+                .u64_gauge("cayenne_autotune_compaction_trigger_files")
+                .with_description("Current (live) small-file compaction trigger (file count).")
+                .build()
+        })
+        .record(state.compaction_trigger_files, dimensions);
+    CAYENNE_AT_TARGET_FILE_SIZE_MB
+        .get_or_init(|| {
+            cayenne_operational_meter()
+                .u64_gauge("cayenne_autotune_target_file_size_mb")
+                .with_description(
+                    "Configured target Vortex file size — the reference compacted files should trend toward (compare cayenne_compaction_merged_bytes).",
+                )
+                .with_unit("MiB")
+                .build()
+        })
+        .record(state.target_file_size_mb, dimensions);
+    CAYENNE_AT_WRITE_CONCURRENCY
+        .get_or_init(|| {
+            cayenne_operational_meter()
+                .u64_gauge("cayenne_autotune_write_concurrency")
+                .with_description("Current (live) write/encode concurrency (0 = session default).")
+                .build()
+        })
+        .record(state.write_concurrency, dimensions);
+    CAYENNE_AT_MEM_TIER_MAX_BYTES
+        .get_or_init(|| {
+            cayenne_operational_meter()
+                .u64_gauge("cayenne_autotune_mem_tier_max_bytes")
+                .with_description(
+                    "Current (live) in-memory CDC durability tier byte cap (0 = no per-table cap).",
+                )
+                .with_unit("By")
+                .build()
+        })
+        .record(state.mem_tier_max_bytes, dimensions);
+    CAYENNE_AT_DELETE_FRACTION
+        .get_or_init(|| {
+            cayenne_operational_meter()
+                .f64_gauge("cayenne_ingest_delete_fraction")
+                .with_description("Measured fraction of ingested rows that are deletes (EWMA).")
+                .build()
+        })
+        .record(state.delete_fraction, dimensions);
+    CAYENNE_AT_ARRIVAL_CV
+        .get_or_init(|| {
+            cayenne_operational_meter()
+                .f64_gauge("cayenne_ingest_arrival_cv")
+                .with_description(
+                    "Arrival-interval coefficient of variation (burstiness); ~0 steady, > 1 spiky.",
+                )
+                .build()
+        })
+        .record(state.arrival_cv, dimensions);
+
+    // Goal signals: the measured high-level metric (always emitted when available)
+    // and, when configured, its goal target. Each is suppressed (sentinel `< 0`)
+    // when the metric is unavailable or the goal is unset, rather than emitting a
+    // misleading 0. Comparing measured vs target shows convergence toward the SLO.
+    if state.replication_lag_secs >= 0.0 {
+        CAYENNE_AT_REPLICATION_LAG_SECS
+            .get_or_init(|| {
+                cayenne_operational_meter()
+                    .f64_gauge("cayenne_ingest_replication_lag_seconds")
+                    .with_description(
+                        "Measured end-to-end CDC replication lag (now − newest applied upstream commit timestamp).",
+                    )
+                    .with_unit("s")
+                    .build()
+            })
+            .record(state.replication_lag_secs, dimensions);
+    }
+    if state.goal_replication_lag_secs >= 0.0 {
+        CAYENNE_AT_GOAL_REPLICATION_LAG_SECS
+            .get_or_init(|| {
+                cayenne_operational_meter()
+                    .f64_gauge("cayenne_goal_replication_lag_seconds")
+                    .with_description("Configured replication-lag goal target.")
+                    .with_unit("s")
+                    .build()
+            })
+            .record(state.goal_replication_lag_secs, dimensions);
+    }
+    if state.freshness_secs >= 0.0 {
+        CAYENNE_AT_FRESHNESS_SECS
+            .get_or_init(|| {
+                cayenne_operational_meter()
+                    .f64_gauge("cayenne_ingest_freshness_seconds")
+                    .with_description("Measured freshness — windowed-peak per-apply row freshness (worst PG-commit→queryable lag) over a ~60s window (the default goal-convergence window; fixed — it does not track per-dataset convergence-window overrides). Peak, not instantaneous: captures transient stalls and does not ramp on an idle table. Falls back to the instantaneous now−last_apply age on sources without a commit timestamp, or before the first timestamped apply.")
+                    .with_unit("s")
+                    .build()
+            })
+            .record(state.freshness_secs, dimensions);
+    }
+    if state.goal_freshness_secs >= 0.0 {
+        CAYENNE_AT_GOAL_FRESHNESS_SECS
+            .get_or_init(|| {
+                cayenne_operational_meter()
+                    .f64_gauge("cayenne_goal_freshness_seconds")
+                    .with_description("Configured freshness goal target.")
+                    .with_unit("s")
+                    .build()
+            })
+            .record(state.goal_freshness_secs, dimensions);
+    }
+    if state.query_latency_p99_ms >= 0.0 {
+        CAYENNE_AT_QUERY_LATENCY_P99_MS
+            .get_or_init(|| {
+                cayenne_operational_meter()
+                    .f64_gauge("cayenne_query_latency_p99_ms")
+                    .with_description("Measured p99 query latency on this table (pushed down from the query path).")
+                    .with_unit("ms")
+                    .build()
+            })
+            .record(state.query_latency_p99_ms, dimensions);
+    }
+    if state.goal_query_latency_ms >= 0.0 {
+        CAYENNE_AT_GOAL_QUERY_LATENCY_MS
+            .get_or_init(|| {
+                cayenne_operational_meter()
+                    .f64_gauge("cayenne_goal_query_latency_ms")
+                    .with_description("Configured query-latency (p99) goal target.")
+                    .with_unit("ms")
+                    .build()
+            })
+            .record(state.goal_query_latency_ms, dimensions);
+    }
+    // QPH is a system-wide metric (a query, e.g. a join, spans datasets and is
+    // counted once), so these two gauges are GLOBAL — recorded with no per-table
+    // dimension, they collapse to a single series even though every table's
+    // controller tick reports the same value.
+    if state.qph >= 0.0 {
+        CAYENNE_AT_QPH
+            .get_or_init(|| {
+                cayenne_operational_meter()
+                    .f64_gauge("cayenne_query_throughput_qph")
+                    .with_description("Measured system-wide query throughput (queries/hour).")
+                    .build()
+            })
+            .record(state.qph, &[]);
+    }
+    if state.goal_qph >= 0.0 {
+        CAYENNE_AT_GOAL_QPH
+            .get_or_init(|| {
+                cayenne_operational_meter()
+                    .f64_gauge("cayenne_goal_query_throughput_qph")
+                    .with_description("Configured system-wide query-throughput (QPH) goal target.")
+                    .build()
+            })
+            .record(state.goal_qph, &[]);
+    }
+
+    // Environment/data signals the closed loop reasons over (Part A). The three
+    // pressure/latency gauges are suppressed (sentinel `< 0`) until sampled — CPU
+    // is non-Linux/unsampled; I/O and publish latency stay unset until the table
+    // spills to Vortex / takes the writer-bearing publish path. The storage-tier
+    // codes are detected facts, always emitted (see `StorageClass::metric_code`).
+    if state.cpu_pressure >= 0.0 {
+        CAYENNE_AT_CPU_PRESSURE
+            .get_or_init(|| {
+                cayenne_operational_meter()
+                    .f64_gauge("cayenne_ingest_cpu_pressure")
+                    .with_description(
+                        "cgroup-aware CPU busy-fraction of available cores; gates CPU-stealing tuning moves.",
+                    )
+                    .build()
+            })
+            .record(state.cpu_pressure, dimensions);
+    }
+    if state.io_latency_ms >= 0.0 {
+        CAYENNE_AT_IO_LATENCY_MS
+            .get_or_init(|| {
+                cayenne_operational_meter()
+                    .f64_gauge("cayenne_ingest_io_latency_ms")
+                    .with_description(
+                        "Per-batch object-store/disk write latency (EWMA); drives the I/O-bound tuning gate.",
+                    )
+                    .with_unit("ms")
+                    .build()
+            })
+            .record(state.io_latency_ms, dimensions);
+    }
+    if state.publish_latency_ms >= 0.0 {
+        CAYENNE_AT_PUBLISH_LATENCY_MS
+            .get_or_init(|| {
+                cayenne_operational_meter()
+                    .f64_gauge("cayenne_ingest_publish_latency_ms")
+                    .with_description(
+                        "Per-batch metastore publish-wall latency (EWMA); drives the publish-bound tuning gate.",
+                    )
+                    .with_unit("ms")
+                    .build()
+            })
+            .record(state.publish_latency_ms, dimensions);
+    }
+    CAYENNE_AT_DATA_STORAGE_CLASS
+        .get_or_init(|| {
+            cayenne_operational_meter()
+                .u64_gauge("cayenne_data_storage_class")
+                .with_description(
+                    "Detected data-acceleration storage tier (0 local SSD, 1 EBS, 2 tmpfs, 3 unknown/object-store).",
+                )
+                .build()
+        })
+        .record(state.data_storage_class, dimensions);
+    CAYENNE_AT_METASTORE_STORAGE_CLASS
+        .get_or_init(|| {
+            cayenne_operational_meter()
+                .u64_gauge("cayenne_metastore_storage_class")
+                .with_description(
+                    "Detected metastore storage tier (same code mapping as cayenne_data_storage_class).",
+                )
+                .build()
+        })
+        .record(state.metastore_storage_class, dimensions);
+    if state.data_storage_write_mbps >= 0.0 {
+        CAYENNE_AT_DATA_STORAGE_WRITE_MIBPS
+            .get_or_init(|| {
+                cayenne_operational_meter()
+                    .f64_gauge("cayenne_data_storage_write_mibps")
+                    .with_description(
+                        "Calibration-probe measured data-volume write throughput; drives the continuous slow-tier bias.",
+                    )
+                    .with_unit("MiB/s")
+                    .build()
+            })
+            .record(state.data_storage_write_mbps, dimensions);
+    }
+    if state.metastore_storage_write_mbps >= 0.0 {
+        CAYENNE_AT_METASTORE_STORAGE_WRITE_MIBPS
+            .get_or_init(|| {
+                cayenne_operational_meter()
+                    .f64_gauge("cayenne_metastore_storage_write_mibps")
+                    .with_description(
+                        "Calibration-probe measured metastore-volume write throughput; drives the continuous publish bias.",
+                    )
+                    .with_unit("MiB/s")
+                    .build()
+            })
+            .record(state.metastore_storage_write_mbps, dimensions);
+    }
+    CAYENNE_AT_GOAL_SLO_INFEASIBLE
+        .get_or_init(|| {
+            cayenne_operational_meter()
+                .u64_gauge("cayenne_goal_slo_infeasible")
+                .with_description(
+                    "1 when the goal-driven tuner has declared the SLO infeasible on this hardware (no further adjustment possible due to bounds or gating, goal still violated); 0 otherwise.",
+                )
+                .build()
+        })
+        .record(state.goal_slo_infeasible, dimensions);
+}
+
+static CAYENNE_AT_ADJUSTMENTS: OnceLock<Counter<u64>> = OnceLock::new();
+
+/// Counts dynamic auto-tune adjustments applied. `dimensions` should carry
+/// `table` and `actuator`. A non-zero rate means the closed loop is actively
+/// adapting the table to its observed workload.
+pub fn track_cayenne_autotune_adjustment(dimensions: &[KeyValue]) {
+    CAYENNE_AT_ADJUSTMENTS
+        .get_or_init(|| {
+            cayenne_operational_meter()
+                .u64_counter("cayenne_autotune_adjustments_total")
+                .with_description("Dynamic auto-tune adjustments applied, by actuator.")
+                .build()
+        })
+        .add(1, dimensions);
+}
+
+static CAYENNE_COMPACTION_MERGED_BYTES: OnceLock<Histogram<u64>> = OnceLock::new();
+
+/// Records the bytes a protected-snapshot subset compaction merged into one
+/// output (≈ the resulting compacted file size). Compare its distribution
+/// against `cayenne_autotune_target_file_size_mb` to see whether compaction is
+/// trending to the target file size or stalling below it (a read-amplification
+/// signal the adaptive tuner cares about). `dimensions` should carry `table`
+/// and `kind` (currently always `"subset"` — the full current-snapshot rewrite
+/// path does not yet emit this metric).
+pub fn track_cayenne_compaction_merged_bytes(bytes: u64, dimensions: &[KeyValue]) {
+    const MIB: f64 = 1024.0 * 1024.0;
+    CAYENNE_COMPACTION_MERGED_BYTES
+        .get_or_init(|| {
+            cayenne_operational_meter()
+                .u64_histogram("cayenne_compaction_merged_bytes")
+                .with_description(
+                    "Bytes merged into one output by a protected-snapshot subset compaction (≈ compacted file size); compare to the target file size.",
+                )
+                .with_unit("By")
+                .with_boundaries(vec![
+                    MIB,
+                    4.0 * MIB,
+                    16.0 * MIB,
+                    32.0 * MIB,
+                    64.0 * MIB,
+                    128.0 * MIB,
+                    256.0 * MIB,
+                    512.0 * MIB,
+                    1024.0 * MIB,
+                ])
+                .build()
+        })
+        .record(bytes, dimensions);
 }
 
 static SNAPSHOT_BOOTSTRAP_DURATION_MS: OnceLock<Counter<f64>> = OnceLock::new();
@@ -660,4 +1526,176 @@ pub fn record_snapshot_skipped(dimensions: &[KeyValue]) {
                 .build()
         })
         .add(1, dimensions);
+}
+
+// ───────────────────────── Cayenne CDC observability (cycle-6) ─────────────────
+//
+// METRIC 1 — metastore writer wait/hold. The per-dataset metastore is a single
+// SQLite DB with WAL-serialized writers, so a hot CDC table can queue behind its
+// own Stage-A fold / sequence-reserve / publish-flip writes. These two histograms
+// split that into (a) time spent waiting to acquire the write transaction and (b)
+// time the write transaction (or a bare write statement) is held. A `txn` label
+// names the stage where the call site can pass it cheaply; otherwise it is
+// `"other"`. No `table` label: the metastore connection is shared across all
+// tables in a dataset's catalog (the DB filename is always `cayenne.db`), so a
+// table label is not cheaply available at this layer.
+
+static CAYENNE_METASTORE_WRITER_WAIT_MS: OnceLock<Histogram<f64>> = OnceLock::new();
+
+/// Records the time a metastore writer spent waiting to acquire the write
+/// transaction (pool-slot acquire + `BEGIN IMMEDIATE`) or a bare write statement.
+/// `dimensions` should carry a `txn` stage label (`stage_a_fold` / `seq_reserve`
+/// / `flip` / `checkpoint` / `other`).
+pub fn track_cayenne_metastore_writer_wait(duration: Duration, dimensions: &[KeyValue]) {
+    CAYENNE_METASTORE_WRITER_WAIT_MS
+        .get_or_init(|| {
+            cayenne_operational_meter()
+                .f64_histogram("cayenne_metastore_writer_wait_ms")
+                .with_description(
+                    "Time a Cayenne metastore writer spent waiting to acquire the write transaction (pool-slot acquire + BEGIN IMMEDIATE) or a bare write statement.",
+                )
+                .with_unit("ms")
+                .with_boundaries(CONTENTION_MS_HISTOGRAM_BUCKETS.to_vec())
+                .build()
+        })
+        .record(duration.as_secs_f64() * 1000.0, dimensions);
+}
+
+static CAYENNE_METASTORE_WRITER_HELD_MS: OnceLock<Histogram<f64>> = OnceLock::new();
+
+/// Records how long a metastore write transaction (or a bare write statement) was
+/// held, from acquisition through commit/rollback (or statement completion).
+/// `dimensions` should carry a `txn` stage label (see
+/// [`track_cayenne_metastore_writer_wait`]).
+pub fn track_cayenne_metastore_writer_held(duration: Duration, dimensions: &[KeyValue]) {
+    CAYENNE_METASTORE_WRITER_HELD_MS
+        .get_or_init(|| {
+            cayenne_operational_meter()
+                .f64_histogram("cayenne_metastore_writer_held_ms")
+                .with_description(
+                    "Time a Cayenne metastore write transaction (or bare write statement) was held, from acquisition through commit/rollback.",
+                )
+                .with_unit("ms")
+                .with_boundaries(CONTENTION_MS_HISTOGRAM_BUCKETS.to_vec())
+                .build()
+        })
+        .record(duration.as_secs_f64() * 1000.0, dimensions);
+}
+
+// METRIC 2 — metastore WAL telemetry. The WAL gauge is sampled (cheap `stat()`)
+// on each background maintenance checkpoint tick; the checkpoint histogram times
+// the checkpoint itself with a `mode` label: `passive_background` (the default
+// off-hot-path PASSIVE drain) or `truncate_background` (the size-triggered
+// TRUNCATE escalation when the WAL exceeds its cap). With the inline
+// auto-checkpoint disabled (cycle-8 TASK A2) these background modes are the sole
+// WAL drain; an `inline_backstop` mode would only appear if a deployment
+// re-enabled the inline auto-checkpoint via `wal_autocheckpoint_pages > 0`.
+
+static CAYENNE_METASTORE_WAL_BYTES: OnceLock<Gauge<u64>> = OnceLock::new();
+
+/// Records the current size in bytes of the metastore `-wal` file, sampled on the
+/// background maintenance checkpoint tick (and after the inline backstop). A WAL
+/// that keeps growing means the passive checkpoint cannot keep pace with the CDC
+/// commit rate. `dimensions` may carry `table` (the maintenance tick that sampled
+/// it) — the WAL file itself is shared across the catalog's tables.
+pub fn track_cayenne_metastore_wal_bytes(bytes: u64, dimensions: &[KeyValue]) {
+    CAYENNE_METASTORE_WAL_BYTES
+        .get_or_init(|| {
+            cayenne_operational_meter()
+                .u64_gauge("cayenne_metastore_wal_bytes")
+                .with_description(
+                    "Current size in bytes of the Cayenne metastore SQLite -wal file, sampled at checkpoint time.",
+                )
+                .with_unit("By")
+                .build()
+        })
+        .record(bytes, dimensions);
+}
+
+static CAYENNE_METASTORE_CHECKPOINT_MS: OnceLock<Histogram<f64>> = OnceLock::new();
+
+/// Records the wall-clock duration of a metastore WAL checkpoint. `dimensions`
+/// should carry a `mode` label: `passive_background` (the off-hot-path
+/// maintenance-tick PASSIVE checkpoint, the common case), `truncate_background`
+/// (the same tick escalated to TRUNCATE once the WAL exceeds its size cap), or
+/// `inline_backstop` (only if a deployment re-enabled the inline auto-checkpoint
+/// via `wal_autocheckpoint_pages > 0`).
+pub fn track_cayenne_metastore_checkpoint(duration: Duration, dimensions: &[KeyValue]) {
+    CAYENNE_METASTORE_CHECKPOINT_MS
+        .get_or_init(|| {
+            cayenne_operational_meter()
+                .f64_histogram("cayenne_metastore_checkpoint_ms")
+                .with_description("Wall-clock time of a Cayenne metastore WAL checkpoint.")
+                .with_unit("ms")
+                .with_boundaries(CONTENTION_MS_HISTOGRAM_BUCKETS.to_vec())
+                .build()
+        })
+        .record(duration.as_secs_f64() * 1000.0, dimensions);
+}
+
+// METRIC 3 — inline admission flips. One increment each time a CDC batch that
+// could have updated the inline memtable instead fell back to a Vortex staged
+// write, labeled by `table` and the `reason` it could not inline:
+// `rows_cap` / `bytes_cap` (the inline buffer overflowed its row or byte cap) or
+// `blocking_config` (the table's shape — partition column or retention delete
+// filters — bars inlining outright).
+
+static CAYENNE_INLINE_FALLBACKS: OnceLock<Counter<u64>> = OnceLock::new();
+
+/// Counts inline-admission fallbacks: a CDC batch that could not update the inline
+/// memtable and fell back to a staged Vortex write. `dimensions` should carry
+/// `table` and `reason` (`rows_cap` | `bytes_cap` | `blocking_config`).
+pub fn track_cayenne_inline_fallback(dimensions: &[KeyValue]) {
+    CAYENNE_INLINE_FALLBACKS
+        .get_or_init(|| {
+            cayenne_operational_meter()
+                .u64_counter("cayenne_inline_fallback_total")
+                .with_description(
+                    "CDC batches that fell back from the inline memtable to a staged Vortex write, by reason (rows_cap | bytes_cap | blocking_config).",
+                )
+                .build()
+        })
+        .add(1, dimensions);
+}
+
+// METRIC 4 — CDC burst shape. Rows and Arrow in-memory bytes of each prepared CDC
+// batch at the Cayenne staged/inlined write entry, per `table`. Pairs with the
+// runtime-side coalesced-burst histograms to attribute size to a specific table.
+
+static CAYENNE_CDC_BURST_ROWS: OnceLock<Histogram<u64>> = OnceLock::new();
+
+/// Records the row count of a prepared CDC batch at the Cayenne write entry.
+/// `dimensions` should carry `table`.
+pub fn track_cayenne_cdc_burst_rows(rows: u64, dimensions: &[KeyValue]) {
+    CAYENNE_CDC_BURST_ROWS
+        .get_or_init(|| {
+            cayenne_operational_meter()
+                .u64_histogram("cayenne_cdc_burst_rows")
+                .with_description(
+                    "Row count of a prepared CDC batch at the Cayenne staged/inlined write entry. On the inline-overflow fallback path this is the BUFFERED row count — a lower bound, since the unbuffered stream remainder is not counted.",
+                )
+                .with_boundaries(ROWS_RETURNED_HISTOGRAM_BUCKETS.to_vec())
+                .with_unit("rows")
+                .build()
+        })
+        .record(rows, dimensions);
+}
+
+static CAYENNE_CDC_BURST_BYTES: OnceLock<Histogram<u64>> = OnceLock::new();
+
+/// Records the Arrow in-memory byte size of a prepared CDC batch at the Cayenne
+/// write entry. On the inline-overflow fallback path the value is the buffered
+/// lower bound (the unbuffered stream remainder is not counted). `dimensions`
+/// should carry `table`.
+pub fn track_cayenne_cdc_burst_bytes(bytes: u64, dimensions: &[KeyValue]) {
+    CAYENNE_CDC_BURST_BYTES
+        .get_or_init(|| {
+            cayenne_operational_meter()
+                .u64_histogram("cayenne_cdc_burst_bytes")
+                .with_description("Arrow in-memory byte size of a prepared CDC batch at the Cayenne staged/inlined write entry. On the inline-overflow fallback path this is the BUFFERED byte size — a lower bound, since the unbuffered stream remainder is not counted.")
+                .with_boundaries(BYTES_HISTOGRAM_BUCKETS.to_vec())
+                .with_unit("By")
+                .build()
+        })
+        .record(bytes, dimensions);
 }

@@ -16,9 +16,14 @@ limitations under the License.
 
 //! Logical optimizer rules for Cayenne.
 //!
-//! The flagship rules here are [`CayennePropagateFilterAcrossEquiJoinKeys`]
-//! and [`CayenneReassociateCrossJoin`], the plan-time rewrites that expose
-//! selective key domains and avoid preserving expensive join-order shapes.
+//! This module registers four logical rules: [`CayennePropagateFilterAcrossEquiJoinKeys`]
+//! (predicate transitive closure across equi-join keys), [`CayenneReassociateCrossJoin`]
+//! (avoid preserving an expensive early cross join), [`CayenneInListToRangeRewrite`]
+//! (long consecutive integer `IN` lists → `BETWEEN`), and [`CayennePushDownSemiJoin`]
+//! (push a `LeftSemi`/`RightSemi` join down to prune the base scan before the multi-way
+//! joins build their non-spillable hash tables). The flagship is
+//! [`CayennePropagateFilterAcrossEquiJoinKeys`], which exposes selective key domains and
+//! avoids preserving expensive join-order shapes.
 //!
 //! `DataFusion`'s stock `infer_join_predicates` (in `push_down_filter`) already
 //! propagates predicates that *directly* reference a join-key column:
@@ -154,9 +159,7 @@ impl CayennePropagateFilterAcrossEquiJoinKeys {
     /// Create a new instance of the rule.
     #[must_use]
     pub fn new() -> Self {
-        Self::new_with_table_provider_predicate(|provider| {
-            provider.as_any().is::<CayenneTableProvider>()
-        })
+        Self::new_with_table_provider_predicate(<dyn TableProvider>::is::<CayenneTableProvider>)
     }
 
     /// Create a new instance with a caller-provided table-provider predicate.
@@ -171,7 +174,6 @@ impl CayennePropagateFilterAcrossEquiJoinKeys {
         let is_cayenne_table_provider: TableProviderPredicate = Arc::new(is_cayenne_table_provider);
         Self::new_with_table_source_predicate(move |source| {
             source
-                .as_any()
                 .downcast_ref::<DefaultTableSource>()
                 .is_some_and(|source| is_cayenne_table_provider(source.table_provider.as_ref()))
         })
@@ -308,6 +310,7 @@ impl OptimizerRule for CayennePropagateFilterAcrossEquiJoinKeys {
             join.join_type,
             join.join_constraint,
             join.null_equality,
+            join.null_aware,
         )?;
 
         Ok(Transformed::yes(LogicalPlan::Join(new_join)))
@@ -363,9 +366,7 @@ impl CayenneReassociateCrossJoin {
     /// Create a new instance of the rule.
     #[must_use]
     pub fn new() -> Self {
-        Self::new_with_table_provider_predicate(|provider| {
-            provider.as_any().is::<CayenneTableProvider>()
-        })
+        Self::new_with_table_provider_predicate(<dyn TableProvider>::is::<CayenneTableProvider>)
     }
 
     /// Create a new instance with a caller-provided table-provider predicate.
@@ -380,7 +381,6 @@ impl CayenneReassociateCrossJoin {
         let is_cayenne_table_provider: TableProviderPredicate = Arc::new(is_cayenne_table_provider);
         Self::new_with_table_source_predicate(move |source| {
             source
-                .as_any()
                 .downcast_ref::<DefaultTableSource>()
                 .is_some_and(|source| is_cayenne_table_provider(source.table_provider.as_ref()))
         })
@@ -449,9 +449,7 @@ impl CayenneInListToRangeRewrite {
     /// Create a new instance of the rule.
     #[must_use]
     pub fn new() -> Self {
-        Self::new_with_table_provider_predicate(|provider| {
-            provider.as_any().is::<CayenneTableProvider>()
-        })
+        Self::new_with_table_provider_predicate(<dyn TableProvider>::is::<CayenneTableProvider>)
     }
 
     /// Create a new instance with a caller-provided table-provider predicate.
@@ -462,7 +460,6 @@ impl CayenneInListToRangeRewrite {
         let is_cayenne_table_provider: TableProviderPredicate = Arc::new(is_cayenne_table_provider);
         Self::new_with_table_source_predicate(move |source| {
             source
-                .as_any()
                 .downcast_ref::<DefaultTableSource>()
                 .is_some_and(|source| is_cayenne_table_provider(source.table_provider.as_ref()))
         })
@@ -581,9 +578,7 @@ impl CayennePushDownSemiJoin {
     /// Create a new instance of the rule.
     #[must_use]
     pub fn new() -> Self {
-        Self::new_with_table_provider_predicate(|provider| {
-            provider.as_any().is::<CayenneTableProvider>()
-        })
+        Self::new_with_table_provider_predicate(<dyn TableProvider>::is::<CayenneTableProvider>)
     }
 
     /// Create a new instance with a caller-provided table-provider predicate.
@@ -594,7 +589,6 @@ impl CayennePushDownSemiJoin {
         let is_cayenne_table_provider: TableProviderPredicate = Arc::new(is_cayenne_table_provider);
         Self::new_with_table_source_predicate(move |source| {
             source
-                .as_any()
                 .downcast_ref::<DefaultTableSource>()
                 .is_some_and(|source| is_cayenne_table_provider(source.table_provider.as_ref()))
         })
@@ -828,6 +822,7 @@ fn build_landed_semi_join(
         JoinType::LeftSemi,
         JoinConstraint::On,
         NullEquality::NullEqualsNothing,
+        false,
     )?))
 }
 
@@ -844,6 +839,7 @@ fn rebuild_inner_join(
         inner.join_type,
         inner.join_constraint,
         inner.null_equality,
+        inner.null_aware,
     )?))
 }
 
@@ -953,6 +949,7 @@ fn reassociate_cross_join(
         JoinType::Inner,
         JoinConstraint::On,
         NullEquality::NullEqualsNothing,
+        false,
     )?);
 
     let outer_join = Join::try_new(
@@ -963,6 +960,7 @@ fn reassociate_cross_join(
         JoinType::Inner,
         JoinConstraint::On,
         NullEquality::NullEqualsNothing,
+        false,
     )?;
 
     Ok(Transformed::yes(LogicalPlan::Join(outer_join)))
@@ -1295,7 +1293,6 @@ fn table_scan_upper_bound_rows(scan: &datafusion::logical_expr::TableScan) -> Op
     use datafusion::common::stats::Precision;
 
     scan.source
-        .as_any()
         .downcast_ref::<DefaultTableSource>()
         .and_then(|default| default.table_provider.statistics())
         .and_then(|stats| match stats.num_rows {
@@ -1508,15 +1505,19 @@ fn collect_selective_filter_columns(expr: &Expr, columns: &mut Vec<Column>) {
             collect_literal_comparison_columns(&binary.left, &binary.right, columns);
             collect_literal_comparison_columns(&binary.right, &binary.left, columns);
         }
-        Expr::Between(between) if !between.negated => {
-            if expr_is_literal_like(&between.low) && expr_is_literal_like(&between.high) {
-                collect_columns_from_expr(&between.expr, columns);
-            }
+        Expr::Between(between)
+            if !between.negated
+                && expr_is_literal_like(&between.low)
+                && expr_is_literal_like(&between.high) =>
+        {
+            collect_columns_from_expr(&between.expr, columns);
         }
-        Expr::InList(in_list) if !in_list.negated && !in_list.list.is_empty() => {
-            if in_list.list.iter().all(expr_is_literal_like) {
-                collect_columns_from_expr(&in_list.expr, columns);
-            }
+        Expr::InList(in_list)
+            if !in_list.negated
+                && !in_list.list.is_empty()
+                && in_list.list.iter().all(expr_is_literal_like) =>
+        {
+            collect_columns_from_expr(&in_list.expr, columns);
         }
         Expr::Like(like) if !like.negated && expr_is_literal_like(&like.pattern) => {
             collect_columns_from_expr(&like.expr, columns);
@@ -1729,10 +1730,6 @@ mod tests {
 
     #[async_trait::async_trait]
     impl TableProvider for StatMemTable {
-        fn as_any(&self) -> &dyn std::any::Any {
-            self
-        }
-
         fn schema(&self) -> Arc<Schema> {
             self.inner.schema()
         }
@@ -1762,10 +1759,6 @@ mod tests {
 
     #[async_trait::async_trait]
     impl TableProvider for NoStatsTable {
-        fn as_any(&self) -> &dyn std::any::Any {
-            self
-        }
-
         fn schema(&self) -> Arc<Schema> {
             self.inner.schema()
         }
@@ -2054,6 +2047,7 @@ mod tests {
             cust_orders_join_type,
             JoinConstraint::On,
             NullEquality::NullEqualsNothing,
+            false,
         )?);
         let three_way = LogicalPlan::Join(Join::try_new(
             Arc::new(cust_orders),
@@ -2063,6 +2057,7 @@ mod tests {
             JoinType::Inner,
             JoinConstraint::On,
             NullEquality::NullEqualsNothing,
+            false,
         )?);
         Ok(LogicalPlan::Join(Join::try_new(
             Arc::new(three_way),
@@ -2072,6 +2067,7 @@ mod tests {
             JoinType::LeftSemi,
             JoinConstraint::On,
             NullEquality::NullEqualsNothing,
+            false,
         )?))
     }
 
@@ -2138,6 +2134,7 @@ mod tests {
             JoinType::LeftSemi,
             JoinConstraint::On,
             NullEquality::NullEqualsNothing,
+            false,
         )?);
 
         let transformed = push_down_semi_join_rule().rewrite(
@@ -2217,6 +2214,7 @@ mod tests {
             JoinType::Inner,
             JoinConstraint::On,
             NullEquality::NullEqualsNothing,
+            false,
         )?);
         let three_way = LogicalPlan::Join(Join::try_new(
             Arc::new(cust_orders),
@@ -2226,6 +2224,7 @@ mod tests {
             JoinType::Inner,
             JoinConstraint::On,
             NullEquality::NullEqualsNothing,
+            false,
         )?);
         let plan = LogicalPlan::Join(Join::try_new(
             Arc::new(three_way),
@@ -2239,6 +2238,7 @@ mod tests {
             JoinType::LeftSemi,
             JoinConstraint::On,
             NullEquality::NullEqualsNothing,
+            false,
         )?);
         let transformed = push_down_semi_join_rule().rewrite(
             plan.clone(),
@@ -2283,6 +2283,7 @@ mod tests {
             JoinType::Inner,
             JoinConstraint::On,
             NullEquality::NullEqualsNothing,
+            false,
         )?);
         let plan = LogicalPlan::Join(Join::try_new(
             Arc::new(cross),
@@ -2308,6 +2309,7 @@ mod tests {
             JoinType::Inner,
             JoinConstraint::On,
             NullEquality::NullEqualsNothing,
+            false,
         )?);
         let original_schema = Arc::clone(plan.schema());
 
@@ -2378,6 +2380,7 @@ mod tests {
             JoinType::Inner,
             JoinConstraint::On,
             NullEquality::NullEqualsNothing,
+            false,
         )?);
         let plan = LogicalPlan::Join(Join::try_new(
             Arc::new(cross),
@@ -2396,6 +2399,7 @@ mod tests {
             JoinType::Inner,
             JoinConstraint::On,
             NullEquality::NullEqualsNothing,
+            false,
         )?);
 
         let transformed = cross_join_rule().rewrite(
@@ -2452,6 +2456,7 @@ mod tests {
             JoinType::Inner,
             JoinConstraint::On,
             NullEquality::NullEqualsNothing,
+            false,
         )?);
         let plan = LogicalPlan::Join(Join::try_new(
             Arc::new(cross),
@@ -2464,6 +2469,7 @@ mod tests {
             JoinType::Inner,
             JoinConstraint::On,
             NullEquality::NullEqualsNothing,
+            false,
         )?);
 
         let transformed = cross_join_rule().rewrite(
@@ -2495,6 +2501,7 @@ mod tests {
             JoinType::Inner,
             JoinConstraint::On,
             NullEquality::NullEqualsNothing,
+            false,
         )?);
         let plan = LogicalPlan::Join(Join::try_new(
             Arc::new(cross),
@@ -2507,6 +2514,7 @@ mod tests {
             JoinType::Inner,
             JoinConstraint::On,
             NullEquality::NullEqualsNothing,
+            false,
         )?);
 
         let rule = CayenneReassociateCrossJoin::new_with_table_source_predicate(|_| false);
@@ -2539,6 +2547,7 @@ mod tests {
             JoinType::Inner,
             JoinConstraint::On,
             NullEquality::NullEqualsNothing,
+            false,
         )?);
         let plan = LogicalPlan::Join(Join::try_new(
             Arc::new(cross),
@@ -2551,6 +2560,7 @@ mod tests {
             JoinType::Inner,
             JoinConstraint::On,
             NullEquality::NullEqualsNothing,
+            false,
         )?);
 
         let rule = CayenneReassociateCrossJoin::new_with_table_provider_predicate(|provider| {
@@ -2872,6 +2882,7 @@ mod tests {
             JoinType::Inner,
             JoinConstraint::On,
             NullEquality::NullEqualsNothing,
+            false,
         )?);
 
         let r = rule();
@@ -2951,6 +2962,7 @@ mod tests {
             JoinType::Inner,
             JoinConstraint::On,
             NullEquality::NullEqualsNothing,
+            false,
         )?);
 
         let r = rule();
@@ -3036,6 +3048,7 @@ mod tests {
             JoinType::Inner,
             JoinConstraint::On,
             NullEquality::NullEqualsNothing,
+            false,
         )?);
 
         let r = rule();
@@ -3434,6 +3447,7 @@ mod tests {
             JoinType::Inner,
             JoinConstraint::On,
             NullEquality::NullEqualsNull,
+            false,
         )?);
 
         let r = rule();
@@ -3487,6 +3501,7 @@ mod tests {
             JoinType::Inner,
             JoinConstraint::On,
             NullEquality::NullEqualsNothing,
+            false,
         )?);
 
         let r = rule();

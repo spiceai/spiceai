@@ -318,6 +318,7 @@ fn add_labels_to_resource_metrics(
                 value: Some(AnyValue {
                     value: Some(Value::StringValue(node_id.to_string())),
                 }),
+                ..Default::default()
             });
         }
 
@@ -327,6 +328,7 @@ fn add_labels_to_resource_metrics(
                 value: Some(AnyValue {
                     value: Some(Value::StringValue(role.to_string())),
                 }),
+                ..Default::default()
             });
         }
     }
@@ -358,6 +360,7 @@ fn add_labels_to_metric_data_points(
                 value: Some(AnyValue {
                     value: Some(Value::StringValue(node_id.to_string())),
                 }),
+                ..Default::default()
             });
         }
         if !has_role {
@@ -366,6 +369,7 @@ fn add_labels_to_metric_data_points(
                 value: Some(AnyValue {
                     value: Some(Value::StringValue(role.to_string())),
                 }),
+                ..Default::default()
             });
         }
     }
@@ -586,12 +590,14 @@ mod tests {
                             value: Some(AnyValue {
                                 value: Some(Value::StringValue("existing-node".to_string())),
                             }),
+                            ..Default::default()
                         },
                         KeyValue {
                             key: NODE_ROLE_LABEL.to_string(),
                             value: Some(AnyValue {
                                 value: Some(Value::StringValue(ROLE_SCHEDULER.to_string())),
                             }),
+                            ..Default::default()
                         },
                     ],
                     dropped_attributes_count: 0,
@@ -661,6 +667,7 @@ mod tests {
                                                 "scheduler1.mac.local:50052".to_string(),
                                             )),
                                         }),
+                                        ..Default::default()
                                     }],
                                     start_time_unix_nano: 0,
                                     time_unix_nano: 0,

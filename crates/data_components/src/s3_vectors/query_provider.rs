@@ -13,7 +13,7 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
-use std::{any::Any, sync::Arc};
+use std::sync::Arc;
 
 use crate::s3_vectors::{
     S3_VECTOR_EMBEDDING_NAME, S3_VECTOR_PRIMARY_KEY_NAME,
@@ -50,8 +50,11 @@ use tracing::{Instrument, info_span};
 /// The JSON key within a `QueryVector` response that contains the distance to the query vector.
 pub static S3_VECTOR_DISTANCE_NAME: &str = "distance";
 
-/// Maximum topK results retrievable by a `QueryVector` operation. <https://docs.aws.amazon.com/AmazonS3/latest/userguide/s3-vectors-limitations.html>
-pub static S3_VECTOR_MAX_TOPK: i32 = 100;
+/// Maximum topK results retrievable by a `QueryVector` operation.
+pub use s3_vectors::QUERY_VECTORS_MAX_TOPK as S3_VECTOR_MAX_TOPK;
+
+/// Maximum number of results returned per page in a `QueryVectors` API call.
+pub use s3_vectors::QUERY_VECTORS_PAGE_SIZE as S3_VECTOR_PAGE_SIZE;
 
 /// Maximum number of keys per `GetVectors` API call. <https://docs.aws.amazon.com/AmazonS3/latest/userguide/s3-vectors-limitations.html>
 pub static GET_VECTORS_MAX_KEYS: usize = 100;
@@ -81,10 +84,6 @@ impl S3VectorsQueryTable {
 
 #[async_trait]
 impl TableProvider for S3VectorsQueryTable {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema(&self) -> SchemaRef {
         self.table.query_provider_schema()
     }
@@ -125,8 +124,10 @@ impl TableProvider for S3VectorsQueryTable {
                 S3_VECTOR_MAX_TOPK
             }
             Some(Ok(l)) => l,
-            // No limit, or failed conversion
-            None | Some(Err(_)) => S3_VECTOR_MAX_TOPK,
+            // Conversion failed (limit > i32::MAX) — clamp to max
+            Some(Err(_)) => S3_VECTOR_MAX_TOPK,
+            // No limit specified — default to one page of results
+            None => S3_VECTOR_PAGE_SIZE,
         };
         return Ok(Arc::new(S3VectorsQueryExec::new(
             &self.table,
@@ -147,7 +148,7 @@ impl std::fmt::Debug for S3VectorsQueryExec {
 pub(super) struct S3VectorsQueryExec {
     idx: S3VectorIdentifier,
     client: Arc<dyn S3Vectors + Send + Sync>,
-    plan_properties: PlanProperties,
+    plan_properties: Arc<PlanProperties>,
     query: Vec<f32>,
     limit: i32,
     filters: Vec<Expr>,
@@ -178,12 +179,12 @@ impl S3VectorsQueryExec {
         Self {
             idx: Arc::unwrap_or_clone(Arc::clone(&table.idx)),
             client: Arc::clone(&table.client),
-            plan_properties: PlanProperties::new(
+            plan_properties: Arc::new(PlanProperties::new(
                 EquivalenceProperties::new(projected_schema),
                 Partitioning::UnknownPartitioning(1),
                 EmissionType::Incremental,
                 Boundedness::Bounded,
-            ),
+            )),
             query,
             limit: i32::try_from(limit).unwrap_or(i32::MAX),
             filters,
@@ -196,11 +197,7 @@ impl ExecutionPlan for S3VectorsQueryExec {
         "S3VectorsQueryExec"
     }
 
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.plan_properties
     }
 
@@ -635,13 +632,9 @@ mod tests {
             .expect("scan");
 
         // The plan should be a GlobalLimitExec -> UnionExec
-        let limit_plan = plan
-            .as_any()
-            .downcast_ref::<GlobalLimitExec>()
-            .expect("downcast");
+        let limit_plan = plan.downcast_ref::<GlobalLimitExec>().expect("downcast");
         let union_plan = limit_plan
             .input()
-            .as_any()
             .downcast_ref::<UnionExec>()
             .expect("downcast");
 
@@ -737,13 +730,9 @@ mod tests {
             .expect("scan");
 
         // The plan should be a GlobalLimitExec -> UnionExec
-        let limit_plan = plan
-            .as_any()
-            .downcast_ref::<GlobalLimitExec>()
-            .expect("downcast");
+        let limit_plan = plan.downcast_ref::<GlobalLimitExec>().expect("downcast");
         let union_plan = limit_plan
             .input()
-            .as_any()
             .downcast_ref::<UnionExec>()
             .expect("downcast");
 
@@ -816,15 +805,19 @@ mod tests {
             .expect("scan");
 
         // The plan should be S3VectorsQueryExec directly
-        assert!(plan.as_any().downcast_ref::<S3VectorsQueryExec>().is_some());
+        assert!(plan.downcast_ref::<S3VectorsQueryExec>().is_some());
 
         Ok(())
     }
 
     #[test]
     fn test_s3_vector_max_topk_value() {
-        // Verify the constant is set to 100 as per updated S3 Vectors API limits
-        assert_eq!(S3_VECTOR_MAX_TOPK, 100);
+        assert_eq!(S3_VECTOR_MAX_TOPK, 10_000);
+    }
+
+    #[test]
+    fn test_s3_vector_page_size_value() {
+        assert_eq!(S3_VECTOR_PAGE_SIZE, 100);
     }
 
     #[test]
@@ -888,20 +881,19 @@ mod tests {
 
         let session_state = SessionContext::new().state();
 
-        // Test with limit exceeding S3_VECTOR_MAX_TOPK (100)
+        // Test with limit exceeding S3_VECTOR_MAX_TOPK (10_000)
         // The scan should clamp the limit to S3_VECTOR_MAX_TOPK
         let plan = query_table
-            .scan(&session_state, None, &[], Some(200))
+            .scan(&session_state, None, &[], Some(20_000))
             .await
             .expect("scan should succeed");
 
         // The plan should be S3VectorsQueryExec with clamped limit
         let exec = plan
-            .as_any()
             .downcast_ref::<S3VectorsQueryExec>()
             .expect("should be S3VectorsQueryExec");
 
-        // The limit should be clamped to S3_VECTOR_MAX_TOPK (100)
+        // The limit should be clamped to S3_VECTOR_MAX_TOPK (10_000)
         assert_eq!(exec.limit, S3_VECTOR_MAX_TOPK);
     }
 
@@ -968,7 +960,6 @@ mod tests {
 
         // The plan should be S3VectorsQueryExec with the original limit
         let exec = plan
-            .as_any()
             .downcast_ref::<S3VectorsQueryExec>()
             .expect("should be S3VectorsQueryExec");
 
@@ -1031,7 +1022,7 @@ mod tests {
 
         let session_state = SessionContext::new().state();
 
-        // Test with no limit - should use S3_VECTOR_MAX_TOPK as default
+        // Test with no limit - should default to one page (S3_VECTOR_PAGE_SIZE)
         let plan = query_table
             .scan(&session_state, None, &[], None)
             .await
@@ -1039,12 +1030,11 @@ mod tests {
 
         // The plan should be S3VectorsQueryExec with the default limit
         let exec = plan
-            .as_any()
             .downcast_ref::<S3VectorsQueryExec>()
             .expect("should be S3VectorsQueryExec");
 
-        // The limit should be S3_VECTOR_MAX_TOPK (100)
-        assert_eq!(exec.limit, S3_VECTOR_MAX_TOPK);
+        // The limit should be S3_VECTOR_PAGE_SIZE (100)
+        assert_eq!(exec.limit, S3_VECTOR_PAGE_SIZE);
     }
 
     #[test]
@@ -1152,5 +1142,387 @@ mod tests {
             obj.get("field2").and_then(serde_json::Value::as_f64),
             Some(42.0)
         );
+    }
+
+    /// Helper to create a standard test `S3VectorsQueryTable` for limit tests.
+    fn make_query_table(mock_client: Arc<MockClient>) -> S3VectorsQueryTable {
+        let bucket_name = "test-bucket";
+        let index_name = "test-index";
+
+        mock_client.data.lock().expect("lock").indexes.insert(
+            bucket_name.to_string(),
+            vec![
+                IndexSummary::builder()
+                    .vector_bucket_name(bucket_name)
+                    .set_index_arn(Some("arn".to_string()))
+                    .creation_time(DateTime::from_secs(1))
+                    .index_name(index_name.to_string())
+                    .build()
+                    .expect("build"),
+            ],
+        );
+
+        mock_client
+            .data
+            .lock()
+            .expect("lock")
+            .vectors
+            .insert(index_name.to_string(), vec![]);
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new(S3_VECTOR_PRIMARY_KEY_NAME, DataType::Utf8, false),
+            Field::new(
+                S3_VECTOR_EMBEDDING_NAME,
+                DataType::new_list(DataType::Float32, true),
+                false,
+            ),
+            Field::new(S3_VECTOR_DISTANCE_NAME, DataType::Float64, false),
+        ]));
+
+        let s3_table = S3VectorsTable {
+            client: mock_client,
+            schema,
+            constraints: Constraints::default(),
+            idx: Arc::new(S3VectorIdentifier::Index {
+                bucket_name: bucket_name.to_string(),
+                index_name: index_name.to_string(),
+            }),
+            dimension: 3,
+            columns: MetadataColumns::none(),
+            distance_metric: DistanceMetric::Cosine,
+        };
+
+        let compute_vector = Arc::new(MockComputeVector::new(vec![1.0, 2.0, 3.0]));
+        S3VectorsQueryTable::new(s3_table, compute_vector, "test query".to_string())
+    }
+
+    /// Scans the table and returns the resulting `S3VectorsQueryExec` limit.
+    async fn scan_limit(query_table: &S3VectorsQueryTable, limit: Option<usize>) -> i32 {
+        let session_state = SessionContext::new().state();
+        let plan = query_table
+            .scan(&session_state, None, &[], limit)
+            .await
+            .expect("scan should succeed");
+        plan.downcast_ref::<S3VectorsQueryExec>()
+            .expect("should be S3VectorsQueryExec")
+            .limit
+    }
+
+    #[test]
+    fn test_page_size_less_than_max_topk() {
+        assert!(
+            S3_VECTOR_PAGE_SIZE < S3_VECTOR_MAX_TOPK,
+            "S3_VECTOR_PAGE_SIZE ({S3_VECTOR_PAGE_SIZE}) must be less than S3_VECTOR_MAX_TOPK ({S3_VECTOR_MAX_TOPK})",
+        );
+    }
+
+    #[tokio::test]
+    async fn test_limit_exactly_at_page_size() {
+        let query_table = make_query_table(Arc::new(MockClient::new()));
+        assert_eq!(scan_limit(&query_table, Some(100)).await, 100);
+    }
+
+    #[tokio::test]
+    async fn test_limit_one_above_page_size() {
+        let query_table = make_query_table(Arc::new(MockClient::new()));
+        assert_eq!(scan_limit(&query_table, Some(101)).await, 101);
+    }
+
+    #[tokio::test]
+    async fn test_limit_exactly_at_max_topk() {
+        let query_table = make_query_table(Arc::new(MockClient::new()));
+        assert_eq!(scan_limit(&query_table, Some(10_000)).await, 10_000);
+    }
+
+    #[tokio::test]
+    async fn test_limit_one_above_max_topk() {
+        let query_table = make_query_table(Arc::new(MockClient::new()));
+        assert_eq!(
+            scan_limit(&query_table, Some(10_001)).await,
+            S3_VECTOR_MAX_TOPK
+        );
+    }
+
+    #[tokio::test]
+    async fn test_limit_of_one() {
+        let query_table = make_query_table(Arc::new(MockClient::new()));
+        assert_eq!(scan_limit(&query_table, Some(1)).await, 1);
+    }
+
+    #[tokio::test]
+    async fn test_limit_usize_max_clamps_to_max_topk() {
+        let query_table = make_query_table(Arc::new(MockClient::new()));
+        // usize::MAX fails i32::try_from, so clamps to S3_VECTOR_MAX_TOPK
+        assert_eq!(
+            scan_limit(&query_table, Some(usize::MAX)).await,
+            S3_VECTOR_MAX_TOPK
+        );
+    }
+
+    #[tokio::test]
+    async fn test_limit_i32_max_as_usize_clamps_to_max_topk() {
+        let query_table = make_query_table(Arc::new(MockClient::new()));
+        // i32::MAX as usize is larger than S3_VECTOR_MAX_TOPK, should clamp
+        assert_eq!(
+            scan_limit(&query_table, Some(i32::MAX as usize)).await,
+            S3_VECTOR_MAX_TOPK
+        );
+    }
+
+    #[tokio::test]
+    async fn test_limit_just_below_page_size() {
+        let query_table = make_query_table(Arc::new(MockClient::new()));
+        assert_eq!(scan_limit(&query_table, Some(99)).await, 99);
+    }
+
+    #[tokio::test]
+    async fn test_limit_multi_page_boundary() {
+        let query_table = make_query_table(Arc::new(MockClient::new()));
+        // Exact multiple of page size (e.g. 500 = 5 pages)
+        assert_eq!(scan_limit(&query_table, Some(500)).await, 500);
+    }
+
+    #[test]
+    fn test_to_flat_value_no_distance() {
+        let query_output = QueryOutputVector::builder()
+            .key("key-no-dist".to_string())
+            .build()
+            .expect("build");
+
+        let result = super::to_flat_value(query_output, None);
+        let obj = result.as_object().expect("should be object");
+
+        assert_eq!(
+            obj.get(S3_VECTOR_PRIMARY_KEY_NAME),
+            Some(&serde_json::Value::String("key-no-dist".to_string()))
+        );
+        assert!(
+            obj.get(S3_VECTOR_DISTANCE_NAME).is_none(),
+            "distance should not be present when not set"
+        );
+    }
+
+    #[test]
+    fn test_to_flat_value_empty_metadata() {
+        use aws_smithy_types::Document;
+
+        let metadata = Document::Object(std::collections::HashMap::new());
+        let query_output = QueryOutputVector::builder()
+            .key("key-empty-meta".to_string())
+            .metadata(metadata)
+            .build()
+            .expect("build");
+
+        let result = super::to_flat_value(query_output, None);
+        let obj = result.as_object().expect("should be object");
+
+        // Only the primary key should be present
+        assert_eq!(obj.len(), 1);
+        assert!(obj.contains_key(S3_VECTOR_PRIMARY_KEY_NAME));
+    }
+
+    #[test]
+    fn test_to_flat_value_metadata_key_does_not_override_primary_key() {
+        use aws_smithy_types::Document;
+
+        // If metadata contains a field matching the primary key column name,
+        // the actual key should still win (it is inserted after metadata).
+        let metadata = Document::Object(
+            vec![(
+                S3_VECTOR_PRIMARY_KEY_NAME.to_string(),
+                Document::String("metadata-value".to_string()),
+            )]
+            .into_iter()
+            .collect(),
+        );
+
+        let query_output = QueryOutputVector::builder()
+            .key("actual-key".to_string())
+            .metadata(metadata)
+            .build()
+            .expect("build");
+
+        let result = super::to_flat_value(query_output, None);
+        let obj = result.as_object().expect("should be object");
+
+        assert_eq!(
+            obj.get(S3_VECTOR_PRIMARY_KEY_NAME),
+            Some(&serde_json::Value::String("actual-key".to_string()))
+        );
+    }
+
+    #[test]
+    fn test_to_flat_value_distance_zero() {
+        let query_output = QueryOutputVector::builder()
+            .key("exact-match".to_string())
+            .distance(0.0_f32)
+            .build()
+            .expect("build");
+
+        let result = super::to_flat_value(query_output, None);
+        let obj = result.as_object().expect("should be object");
+
+        let distance = obj
+            .get(S3_VECTOR_DISTANCE_NAME)
+            .expect("distance should be present");
+        assert_eq!(distance.as_f64(), Some(0.0));
+    }
+
+    #[test]
+    fn test_to_flat_value_empty_vector_data() {
+        let query_output = QueryOutputVector::builder()
+            .key("empty-vec".to_string())
+            .build()
+            .expect("build");
+
+        let vector_data = VectorData::Float32(vec![]);
+        let result = super::to_flat_value(query_output, Some(vector_data));
+        let obj = result.as_object().expect("should be object");
+
+        let embedding = obj
+            .get(S3_VECTOR_EMBEDDING_NAME)
+            .expect("embedding should be present");
+        let arr = embedding.as_array().expect("should be array");
+        assert!(
+            arr.is_empty(),
+            "embedding array should be empty for 0-dim vector"
+        );
+    }
+
+    #[test]
+    fn test_to_flat_value_metadata_with_nested_objects() {
+        use aws_smithy_types::Document;
+
+        let nested = Document::Object(
+            vec![("inner".to_string(), Document::String("value".to_string()))]
+                .into_iter()
+                .collect(),
+        );
+        let metadata = Document::Object(
+            vec![("nested_field".to_string(), nested)]
+                .into_iter()
+                .collect(),
+        );
+
+        let query_output = QueryOutputVector::builder()
+            .key("nested-key".to_string())
+            .metadata(metadata)
+            .build()
+            .expect("build");
+
+        let result = super::to_flat_value(query_output, None);
+        let obj = result.as_object().expect("should be object");
+
+        let nested_field = obj.get("nested_field").expect("nested_field should exist");
+        assert!(nested_field.is_object(), "nested field should be an object");
+        assert_eq!(
+            nested_field.get("inner"),
+            Some(&serde_json::Value::String("value".to_string()))
+        );
+    }
+
+    #[test]
+    fn test_to_flat_value_metadata_with_boolean_and_null() {
+        use aws_smithy_types::Document;
+
+        let metadata = Document::Object(
+            vec![
+                ("bool_field".to_string(), Document::Bool(true)),
+                ("null_field".to_string(), Document::Null),
+            ]
+            .into_iter()
+            .collect(),
+        );
+
+        let query_output = QueryOutputVector::builder()
+            .key("bool-null-key".to_string())
+            .metadata(metadata)
+            .build()
+            .expect("build");
+
+        let result = super::to_flat_value(query_output, None);
+        let obj = result.as_object().expect("should be object");
+
+        assert_eq!(obj.get("bool_field"), Some(&serde_json::Value::Bool(true)));
+        assert_eq!(obj.get("null_field"), Some(&serde_json::Value::Null));
+    }
+
+    #[test]
+    fn test_to_flat_value_metadata_with_array() {
+        use aws_smithy_types::Document;
+
+        let metadata = Document::Object(
+            vec![(
+                "tags".to_string(),
+                Document::Array(vec![
+                    Document::String("a".to_string()),
+                    Document::String("b".to_string()),
+                ]),
+            )]
+            .into_iter()
+            .collect(),
+        );
+
+        let query_output = QueryOutputVector::builder()
+            .key("array-key".to_string())
+            .metadata(metadata)
+            .build()
+            .expect("build");
+
+        let result = super::to_flat_value(query_output, None);
+        let obj = result.as_object().expect("should be object");
+
+        let tags = obj.get("tags").expect("tags should exist");
+        let arr = tags.as_array().expect("should be array");
+        assert_eq!(arr.len(), 2);
+        assert_eq!(arr[0], serde_json::Value::String("a".to_string()));
+        assert_eq!(arr[1], serde_json::Value::String("b".to_string()));
+    }
+
+    #[test]
+    fn test_to_flat_value_all_fields_populated() {
+        use aws_smithy_types::{Document, Number};
+
+        let metadata = Document::Object(
+            vec![
+                ("genre".to_string(), Document::String("sci-fi".to_string())),
+                ("year".to_string(), Document::Number(Number::PosInt(2024))),
+            ]
+            .into_iter()
+            .collect(),
+        );
+
+        let query_output = QueryOutputVector::builder()
+            .key("full-key".to_string())
+            .distance(0.25_f32)
+            .metadata(metadata)
+            .build()
+            .expect("build");
+
+        let vector_data = VectorData::Float32(vec![0.1, 0.2]);
+        let result = super::to_flat_value(query_output, Some(vector_data));
+        let obj = result.as_object().expect("should be object");
+
+        assert_eq!(
+            obj.get(S3_VECTOR_PRIMARY_KEY_NAME),
+            Some(&serde_json::Value::String("full-key".to_string()))
+        );
+        assert_eq!(
+            obj.get(S3_VECTOR_DISTANCE_NAME)
+                .and_then(serde_json::Value::as_f64),
+            Some(0.25)
+        );
+        assert_eq!(
+            obj.get("genre"),
+            Some(&serde_json::Value::String("sci-fi".to_string()))
+        );
+        assert_eq!(
+            obj.get("year").and_then(serde_json::Value::as_u64),
+            Some(2024)
+        );
+
+        let embedding = obj.get(S3_VECTOR_EMBEDDING_NAME).expect("embedding");
+        let arr = embedding.as_array().expect("array");
+        assert_eq!(arr.len(), 2);
     }
 }

@@ -105,6 +105,24 @@ async fn test_position_mode_composite_pk_upsert_impl(
         .collect()
         .await?;
 
+    let plan = ctx
+        .sql("SELECT w_id, o_id, amount FROM pos_upsert WHERE w_id = 1")
+        .await?
+        .create_physical_plan()
+        .await?;
+    let plan = datafusion::physical_plan::displayable(plan.as_ref())
+        .indent(true)
+        .to_string();
+    let has_direct_current_snapshot_scan =
+        plan.lines().collect::<Vec<_>>().windows(2).any(|lines| {
+            lines[0].contains("CayenneAccelerationExec: snapshots_scanned=1")
+                && lines[1].contains("DataSourceExec")
+        });
+    assert!(
+        has_direct_current_snapshot_scan,
+        "position-mode upsert must keep the current-snapshot Vortex scan on the direct position-delete path:\n{plan}"
+    );
+
     let batches = ctx
         .sql("SELECT w_id, o_id, amount FROM pos_upsert ORDER BY w_id, o_id")
         .await?

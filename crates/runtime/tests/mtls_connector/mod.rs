@@ -175,7 +175,7 @@ async fn start_upstream(pki: &ConnectorTestPki, csv_path: &std::path::Path) -> u
 
     let load_handle = Arc::clone(&rt);
     tokio::select! {
-        () = tokio::time::sleep(Duration::from_secs(60)) => {
+        () = tokio::time::sleep(Duration::from_mins(1)) => {
             panic!("upstream timed out loading components");
         }
         () = load_handle.load_components() => {}
@@ -203,8 +203,7 @@ async fn start_upstream(pki: &ConnectorTestPki, csv_path: &std::path::Path) -> u
     let probe_identity = reqwest::Identity::from_pem(&probe_id_buf).expect("probe identity");
     let probe = reqwest::Client::builder()
         .use_rustls_tls()
-        .tls_built_in_root_certs(false)
-        .add_root_certificate(probe_ca)
+        .tls_certs_only([probe_ca])
         .identity(probe_identity)
         .build()
         .expect("probe client");
@@ -294,7 +293,7 @@ async fn test_flightsql_connector_mtls_end_to_end() -> Result<(), anyhow::Error>
             let downstream_handle = Arc::new(downstream.clone());
 
             tokio::select! {
-                () = tokio::time::sleep(Duration::from_secs(60)) => {
+                () = tokio::time::sleep(Duration::from_mins(1)) => {
                     return Err(anyhow::anyhow!("Timed out waiting for downstream to load"));
                 }
                 () = downstream_handle.load_components() => {}

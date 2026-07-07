@@ -4,7 +4,7 @@
 name = "connector-nfs"
 edition = "2024"
 version = "1.11.0-unstable"
-rust-version = "1.94.1"
+rust-version = "1.95.0"
 license = "Apache-2.0"
 description = "NFS data connector for Spice.ai runtime"
 

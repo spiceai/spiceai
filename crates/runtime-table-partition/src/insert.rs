@@ -72,7 +72,7 @@ pub struct PartitionerExec {
     insert_op: InsertOp,
     /// The table's data schema, used internally for evaluating partition expressions.
     data_schema: SchemaRef,
-    properties: PlanProperties,
+    properties: Arc<PlanProperties>,
     output_schema: SchemaRef,
 }
 
@@ -86,12 +86,12 @@ impl PartitionerExec {
         data_schema: SchemaRef,
     ) -> Self {
         let output_schema = count_schema();
-        let properties = PlanProperties::new(
+        let properties = Arc::new(PlanProperties::new(
             EquivalenceProperties::new(Arc::clone(&output_schema)),
             Partitioning::UnknownPartitioning(1),
             EmissionType::Incremental,
             Boundedness::Bounded,
-        );
+        ));
         Self {
             input,
             creator,
@@ -127,10 +127,6 @@ impl DisplayAs for PartitionerExec {
 }
 
 impl ExecutionPlan for PartitionerExec {
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
-
     fn schema(&self) -> SchemaRef {
         Arc::clone(&self.output_schema)
     }
@@ -306,7 +302,7 @@ impl ExecutionPlan for PartitionerExec {
         "PartitionerExec"
     }
 
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
     }
 }
@@ -337,17 +333,17 @@ fn filter_batch_by_indices(
 struct PartitionInputExec {
     rx: Mutex<Option<Receiver<RecordBatch>>>,
     schema: SchemaRef,
-    properties: PlanProperties,
+    properties: Arc<PlanProperties>,
 }
 
 impl PartitionInputExec {
     fn new(rx: Receiver<RecordBatch>, schema: SchemaRef) -> Self {
-        let properties = PlanProperties::new(
+        let properties = Arc::new(PlanProperties::new(
             EquivalenceProperties::new(Arc::clone(&schema)),
             Partitioning::UnknownPartitioning(1),
             EmissionType::Incremental,
             Boundedness::Bounded,
-        );
+        ));
 
         Self {
             rx: Mutex::new(Some(rx)),
@@ -370,15 +366,11 @@ impl ExecutionPlan for PartitionInputExec {
         "PartitionInsertExec"
     }
 
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
-
     fn schema(&self) -> SchemaRef {
         Arc::clone(&self.schema)
     }
 
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
     }
 

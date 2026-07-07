@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use arrow_flight::error::FlightError;
 use arrow_flight::flight_service_client::FlightServiceClient;
 use arrow_flight::sql::client::FlightSqlServiceClient;
 use async_trait::async_trait;
@@ -48,7 +49,7 @@ pub enum Error {
     UnableToConstructTlsChannel { source: flight_client::tls::Error },
 
     #[snafu(display("Failed to connect to the Flight server. {source}"))]
-    UnableToPerformHandshake { source: arrow::error::ArrowError },
+    UnableToPerformHandshake { source: FlightError },
 
     #[snafu(display(
         "Failed to apply parameter '{parameter}': {source}. Ensure the value is valid and retry. For details, visit: https://spiceai.org/docs/components/data-connectors/flightsql#params"
@@ -262,9 +263,17 @@ impl DataConnectorFactory for FlightSQLFactory {
                     .await
                     .context(UnableToPerformHandshakeSnafu)?;
             }
+            // Extract bearer token for per-endpoint client auth propagation.
+            let token = client.token().cloned();
             let flightsql_factory =
-                DataComponentFlightSQLFactory::new(client, endpoint, cookie_store)
-                    .with_function_support(deny_spice_specific_functions().as_ref().clone());
+                DataComponentFlightSQLFactory::new(client, endpoint, cookie_store);
+            let flightsql_factory = if let Some(t) = token {
+                flightsql_factory.with_token(t)
+            } else {
+                flightsql_factory
+            };
+            let flightsql_factory = flightsql_factory
+                .with_function_support(deny_spice_specific_functions().as_ref().clone());
             Ok(Arc::new(FlightSQL { flightsql_factory }) as Arc<dyn DataConnector>)
         })
     }

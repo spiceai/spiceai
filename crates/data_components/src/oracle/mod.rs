@@ -29,7 +29,7 @@ use datafusion::{
     sql::TableReference,
 };
 
-use std::{any::Any, sync::Arc};
+use std::sync::Arc;
 
 use crate::oracle::{
     connection::OracleConnectionPool, convert::map_oracle_type_to_arrow_type,
@@ -101,6 +101,9 @@ pub enum Error {
         value: String,
         source: bigdecimal::ParseBigDecimalError,
     },
+
+    #[snafu(display("Oracle blocking task failed to complete: {source}"))]
+    TaskJoin { source: tokio::task::JoinError },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -135,13 +138,13 @@ impl OracleTableProvider {
 
         let table_name = table.table();
 
-        let (columns_meta_query, params) = match table.schema() {
+        let (columns_meta_query, params): (String, Vec<String>) = match table.schema() {
             Some(schema_name) => (
                 "SELECT COLUMN_NAME, DATA_TYPE, DATA_PRECISION, DATA_SCALE \
                     FROM ALL_TAB_COLUMNS \
                     WHERE TABLE_NAME = :1 AND OWNER = :2"
                     .to_string(),
-                vec![table_name, schema_name],
+                vec![table_name.to_string(), schema_name.to_string()],
             ),
             // In Oracle, the default schema is the user's schema that is used to connect when no specific schema is provided in a SQL statement.
             // We use SYS_CONTEXT to get the current schema name.
@@ -150,44 +153,55 @@ impl OracleTableProvider {
                     FROM ALL_TAB_COLUMNS \
                     WHERE TABLE_NAME = :1 AND OWNER = SYS_CONTEXT('USERENV', 'CURRENT_SCHEMA')"
                     .to_string(),
-                vec![table_name],
+                vec![table_name.to_string()],
             ),
         };
 
         tracing::debug!("Executing schema query for dataset {table}: {columns_meta_query}");
 
-        let conn = conn.get().await?;
+        // `rust-oracle` is a synchronous OCI driver; the broker round-trip and
+        // lazy row fetches block the calling thread. Run them on the blocking
+        // pool (with an owned `'static` connection) so dataset registration
+        // doesn't stall the async runtime thread.
+        let pooled = conn.get_owned().await?;
+        let table_display = table.to_string();
 
-        let params: Vec<&dyn oracle::sql_type::ToSql> = params
-            .iter()
-            .map(|s| s as &dyn oracle::sql_type::ToSql)
-            .collect();
+        let fields = tokio::task::spawn_blocking(move || -> Result<Vec<Field>> {
+            let params: Vec<&dyn oracle::sql_type::ToSql> = params
+                .iter()
+                .map(|s| s as &dyn oracle::sql_type::ToSql)
+                .collect();
 
-        let query_res = conn
-            .query(&columns_meta_query, &params)
-            .context(QuerySnafu)?;
+            let query_res = pooled
+                .query(&columns_meta_query, &params)
+                .context(QuerySnafu)?;
 
-        let mut fields = Vec::new();
+            let mut fields = Vec::new();
 
-        for row_result in query_res {
-            let row = row_result.context(QuerySnafu)?;
+            for row_result in query_res {
+                let row = row_result.context(QuerySnafu)?;
 
-            let column_name: String = row.get(0).context(SchemaRetrievalSnafu)?;
-            let data_type: String = row.get(1).context(SchemaRetrievalSnafu)?;
-            let numeric_precision: Option<u8> = row.get(2).context(SchemaRetrievalSnafu)?;
-            let numeric_scale: Option<i8> = row.get(3).context(SchemaRetrievalSnafu)?;
+                let column_name: String = row.get(0).context(SchemaRetrievalSnafu)?;
+                let data_type: String = row.get(1).context(SchemaRetrievalSnafu)?;
+                let numeric_precision: Option<u8> = row.get(2).context(SchemaRetrievalSnafu)?;
+                let numeric_scale: Option<i8> = row.get(3).context(SchemaRetrievalSnafu)?;
 
-            let Some(arrow_data_type) =
-                map_oracle_type_to_arrow_type(&data_type, numeric_precision, numeric_scale)
-            else {
-                tracing::warn!(
-                    "Column '{column_name}' of dataset {table} has unsupported data type '{data_type}' and will be ignored"
-                );
-                continue;
-            };
+                let Some(arrow_data_type) =
+                    map_oracle_type_to_arrow_type(&data_type, numeric_precision, numeric_scale)
+                else {
+                    tracing::warn!(
+                        "Column '{column_name}' of dataset {table_display} has unsupported data type '{data_type}' and will be ignored"
+                    );
+                    continue;
+                };
 
-            fields.push(Field::new(column_name, arrow_data_type, true));
-        }
+                fields.push(Field::new(column_name, arrow_data_type, true));
+            }
+
+            Ok(fields)
+        })
+        .await
+        .context(TaskJoinSnafu)??;
 
         if fields.is_empty() {
             return Err(Error::SchemaRetrievalTableNotFound {
@@ -203,10 +217,6 @@ impl OracleTableProvider {
 
 #[async_trait]
 impl TableProvider for OracleTableProvider {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema(&self) -> SchemaRef {
         Arc::clone(&self.schema)
     }
@@ -271,7 +281,7 @@ fn is_datetime_related_expr(expr: &Expr) -> bool {
     match expr {
         Expr::Cast(cast) => {
             matches!(
-                cast.data_type,
+                cast.field.data_type(),
                 DataType::Time32(_)
                     | DataType::Time64(_)
                     | DataType::Date32

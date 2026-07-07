@@ -20,7 +20,6 @@ limitations under the License.
 //! `ALL_USERS` and `ALL_TABLES`/`ALL_VIEWS` queries, and provides them
 //! as `DataFusion` catalog/schema providers.
 
-use std::any::Any;
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
@@ -48,6 +47,9 @@ pub enum Error {
 
     #[snafu(display("Failed to create Oracle table provider: {source}"))]
     TableProviderFailed { source: super::Error },
+
+    #[snafu(display("Oracle blocking task failed to complete: {source}"))]
+    TaskJoin { source: tokio::task::JoinError },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -140,35 +142,41 @@ impl OracleCatalogProvider {
     }
 
     async fn list_schemas(&self) -> Result<Vec<String>> {
-        let conn = self
+        // `rust-oracle` is a synchronous OCI driver; the broker round-trip and
+        // lazy row fetches block the calling thread. Run them on the blocking
+        // pool (with an owned `'static` connection) so catalog refresh doesn't
+        // stall the async runtime thread.
+        let pooled = self
             .pool
-            .get()
+            .get_owned()
             .await
             .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)
             .context(ConnectionFailedSnafu)?;
 
-        let rows = conn
-            .query("SELECT USERNAME FROM ALL_USERS ORDER BY USERNAME", &[])
-            .context(QueryFailedSnafu)?;
+        let names = tokio::task::spawn_blocking(move || -> Result<Vec<String>> {
+            let rows = pooled
+                .query("SELECT USERNAME FROM ALL_USERS ORDER BY USERNAME", &[])
+                .context(QueryFailedSnafu)?;
 
-        let mut names = Vec::new();
-        for row_result in rows {
-            let row = row_result.context(QueryFailedSnafu)?;
-            let name: String = row.get(0).context(QueryFailedSnafu)?;
-            if !SYSTEM_SCHEMAS.contains(&name.as_str()) {
-                names.push(name);
+            let mut names = Vec::new();
+            for row_result in rows {
+                let row = row_result.context(QueryFailedSnafu)?;
+                let name: String = row.get(0).context(QueryFailedSnafu)?;
+                if !SYSTEM_SCHEMAS.contains(&name.as_str()) {
+                    names.push(name);
+                }
             }
-        }
+
+            Ok(names)
+        })
+        .await
+        .context(TaskJoinSnafu)??;
 
         Ok(names)
     }
 }
 
 impl CatalogProvider for OracleCatalogProvider {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema_names(&self) -> Vec<String> {
         let guard = match self.schemas.read() {
             Ok(guard) => guard,
@@ -269,29 +277,42 @@ impl OracleSchemaProvider {
     }
 
     async fn list_tables_from_db(&self) -> Result<Vec<String>> {
-        let conn = self
+        // `rust-oracle` is a synchronous OCI driver; the broker round-trip and
+        // lazy row fetches block the calling thread. Run them on the blocking
+        // pool (with an owned `'static` connection) so catalog refresh doesn't
+        // stall the async runtime thread.
+        let pooled = self
             .pool
-            .get()
+            .get_owned()
             .await
             .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)
             .context(ConnectionFailedSnafu)?;
 
-        // Query both tables and views from the schema
-        let query = "SELECT TABLE_NAME FROM ALL_TABLES WHERE OWNER = :1 \
-                     UNION \
-                     SELECT VIEW_NAME AS TABLE_NAME FROM ALL_VIEWS WHERE OWNER = :1 \
-                     ORDER BY TABLE_NAME";
+        // Own the bind param before moving into the blocking closure.
+        let schema_name = self.schema_name.clone();
 
-        let rows = conn
-            .query(query, &[&self.schema_name])
-            .context(QueryFailedSnafu)?;
+        let names = tokio::task::spawn_blocking(move || -> Result<Vec<String>> {
+            // Query both tables and views from the schema
+            let query = "SELECT TABLE_NAME FROM ALL_TABLES WHERE OWNER = :1 \
+                         UNION \
+                         SELECT VIEW_NAME AS TABLE_NAME FROM ALL_VIEWS WHERE OWNER = :1 \
+                         ORDER BY TABLE_NAME";
 
-        let mut names = Vec::new();
-        for row_result in rows {
-            let row = row_result.context(QueryFailedSnafu)?;
-            let name: String = row.get(0).context(QueryFailedSnafu)?;
-            names.push(name);
-        }
+            let params: Vec<&dyn oracle::sql_type::ToSql> = vec![&schema_name];
+
+            let rows = pooled.query(query, &params).context(QueryFailedSnafu)?;
+
+            let mut names = Vec::new();
+            for row_result in rows {
+                let row = row_result.context(QueryFailedSnafu)?;
+                let name: String = row.get(0).context(QueryFailedSnafu)?;
+                names.push(name);
+            }
+
+            Ok(names)
+        })
+        .await
+        .context(TaskJoinSnafu)??;
 
         Ok(names)
     }
@@ -299,10 +320,6 @@ impl OracleSchemaProvider {
 
 #[async_trait]
 impl SchemaProvider for OracleSchemaProvider {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn table_names(&self) -> Vec<String> {
         let guard = match self.tables.read() {
             Ok(guard) => guard,

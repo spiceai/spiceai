@@ -14,11 +14,11 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use crate::function_support::contains_unsupported_functions;
 use async_trait::async_trait;
 use datafusion::common::tree_node::TreeNodeRecursion;
 use datafusion_federation::sql::{SQLExecutor, SQLFederationProvider, SQLTableSource};
 use datafusion_federation::{FederatedTableProviderAdaptor, FederatedTableSource};
-use datafusion_table_providers::util::supported_functions::contains_unsupported_functions;
 use std::sync::Arc;
 
 use datafusion::{
@@ -101,13 +101,13 @@ impl SQLExecutor for FlightSQLTable {
         schema: SchemaRef,
         _filters: &[Arc<dyn datafusion::physical_plan::PhysicalExpr>],
     ) -> DataFusionResult<SendableRecordBatchStream> {
+        let mut client = self.client.clone();
+        if let Some(token) = &self.token {
+            client.set_token(token.clone());
+        }
         Ok(Box::pin(RecordBatchStreamAdapter::new(
             schema,
-            query_to_stream(
-                self.client.clone(),
-                query.to_string(),
-                Arc::clone(&self.cookie_store),
-            ),
+            query_to_stream(client, query.to_string(), Arc::clone(&self.cookie_store)),
         )))
     }
 

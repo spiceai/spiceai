@@ -553,8 +553,8 @@ fn extract_primary_key_columns(
     let mut pk_cols = Vec::new();
 
     for constraint in constraints {
-        if let TableConstraint::PrimaryKey { columns, .. } = constraint {
-            for idx_col in columns {
+        if let TableConstraint::PrimaryKey(primary_key) = constraint {
+            for idx_col in &primary_key.columns {
                 if let datafusion::sql::sqlparser::ast::Expr::Identifier(ident) =
                     &idx_col.column.expr
                 {
@@ -566,13 +566,7 @@ fn extract_primary_key_columns(
 
     for col_def in columns {
         for opt_def in &col_def.options {
-            if matches!(
-                &opt_def.option,
-                ColumnOption::Unique {
-                    is_primary: true,
-                    ..
-                }
-            ) {
+            if matches!(&opt_def.option, ColumnOption::PrimaryKey(_)) {
                 pk_cols.push(col_def.name.value.clone());
             }
         }

@@ -87,7 +87,7 @@ pub(crate) async fn run(args: &DatasetTestArgs) -> anyhow::Result<RowCounts> {
             let scale_factor = args.scale_factor.unwrap_or(1.0);
             #[expect(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
             let terminals = (scale_factor * 10.0) as usize;
-            prepare_chbench_source(scale_factor, terminals, None).await?;
+            prepare_chbench_source(scale_factor, terminals, None, false).await?;
         }
 
         let instance = SpicedInstance::start(start_request).await?;
@@ -120,7 +120,6 @@ async fn run_inner(
     let memory_token = CancellationToken::new();
     let memory_readings = spiced_instance
         .process()
-        .ok()
         .map(|process| process.watch_memory(&memory_token));
 
     spiced_instance
@@ -185,15 +184,11 @@ async fn run_inner(
     )
     .await?;
 
-    let mut benchmark_test = SpiceTest::new(app.name.clone(), test_builder)
+    let benchmark_test = SpiceTest::new(app.name.clone(), test_builder)
         .with_spiced_instance(spiced_instance)
         .with_results_snapshot(snapshot_predicate)
-        .with_progress_bars(!args.common.disable_progress_bars);
-
-    if query_set != test_framework::queries::QuerySet::ChBench {
-        // Skip explain plan snapshot for CH-benCH
-        benchmark_test = benchmark_test.with_explain_plan_snapshot();
-    }
+        .with_progress_bars(!args.common.disable_progress_bars)
+        .with_explain_plan_snapshot();
 
     let benchmark_test = benchmark_test.start()?;
 
@@ -346,16 +341,20 @@ fn chbench_source_from_env() -> anyhow::Result<chbench_driver::PostgresSourceCon
     Ok(source)
 }
 
-/// Validate scale factor, build the CH-benCH config, connect to the source
-/// Postgres, create the schema and load seed data.
+/// Validate scale factor, build the CH-benCH config, and connect to the source
+/// Postgres. Unless `skip_prepare` is set, also create the schema and load seed data.
 ///
 /// `scale_factor` maps to TPC-C warehouses (must be a positive integer >= 1).
 /// `terminals` specifies the target number of terminals.
 /// `rate` optionally caps the workload-wide transaction rate (txn/s); `None` runs the OLTP workload closed-loop at maximum throughput.
+/// `skip_prepare` connects to an already-prepared source (e.g. one restored from a
+/// template) WITHOUT creating the schema or loading seed data — the caller is
+/// responsible for ensuring the source already matches `scale_factor`.
 pub(crate) async fn prepare_chbench_source(
     scale_factor: f64,
     terminals: usize,
     rate: Option<u32>,
+    skip_prepare: bool,
 ) -> anyhow::Result<chbench_driver::PostgresChBenchDriver> {
     if scale_factor < 1.0 || scale_factor.fract() != 0.0 {
         anyhow::bail!(
@@ -380,7 +379,16 @@ pub(crate) async fn prepare_chbench_source(
 
     let source = chbench_source_from_env()?;
     let driver = chbench_driver::PostgresChBenchDriver::connect(config, source).await?;
-    driver.prepare().await?;
+    if skip_prepare {
+        // Source is assumed already populated (e.g. restored from a template).
+        // Verify it actually is — and matches the requested scale factor —
+        // before running against it; a missing/mismatched source would otherwise
+        // yield silently-wrong results instead of a clear error.
+        driver.verify_prepared().await?;
+        println!("Skipping CH-benCHmark seed (--skip-prepare): verified existing source");
+    } else {
+        driver.prepare().await?;
+    }
 
     println!("CH-benCHmark source is ready");
     Ok(driver)

@@ -219,18 +219,7 @@ impl Dialect for SpiceCloudPlatformDialect {
     fn identifier_quote_style(&self, identifier: &str) -> Option<char> {
         PostgreSqlDialect {}.identifier_quote_style(identifier)
     }
-
-    /// Spice Cloud re-plans the SQL we push down with `DataFusion`'s analyzer,
-    /// which rejects a correlated scalar subquery whose parent plan node is a
-    /// `Join` (only `Projection`/`Filter`/`Aggregate` are permitted). The
-    /// unparser only emits subqueries inside `JOIN ... ON` predicates when this
-    /// returns `true`, so returning `false` keeps them in the `WHERE` clause
-    /// where the remote can decorrelate them. See spiceai/spiceai#11141.
-    fn supports_subquery_in_join_predicate(&self) -> bool {
-        false
-    }
 }
-
 #[derive(Default, Copy, Clone)]
 pub struct SpiceAIFactory {}
 
@@ -592,7 +581,6 @@ impl DataConnector for SpiceAI {
         Some(Box::pin(stream! {
             let table_provider = federated_table.table_provider().await;
             let Some(federated_table_provider_adaptor) = table_provider
-            .as_any()
             .downcast_ref::<FederatedTableProviderAdaptor>() else {
                 return;
             };
@@ -600,7 +588,6 @@ impl DataConnector for SpiceAI {
                 return;
             };
             let Some(flight_table) = federated_adaptor
-            .as_any()
             .downcast_ref::<FlightTable>() else {
                 return;
             };
@@ -616,14 +603,6 @@ impl DataConnector for SpiceAI {
         }))
     }
 }
-
-register_data_connector!("spice.ai", SpiceAIFactory);
-register_data_connector!(
-    register_legacy_spiceai_connector,
-    LEGACY_SPICEAI_CONNECTOR_REGISTRATION,
-    "spiceai",
-    SpiceAIFactory
-);
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum SpiceAIDatasetPath {
@@ -891,7 +870,13 @@ mod tests {
 
     #[tokio::test]
     async fn test_spiceai_from_variants_resolve_connector_params() {
-        crate::dataconnector::register_all().await;
+        // `register_all()` uses the linkme distributed slice, which no longer includes
+        // the spiceai connector since its registration was moved to the `connector-spiceai`
+        // crate (which depends on `runtime`, not the reverse). Register the factory directly.
+        crate::dataconnector::register_connector_factory("spice.ai", SpiceAIFactory::new_arc())
+            .await;
+        crate::dataconnector::register_connector_factory("spiceai", SpiceAIFactory::new_arc())
+            .await;
 
         for input in [
             "spiceai:http://localhost:50051",

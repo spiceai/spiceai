@@ -19,6 +19,7 @@ aws-sdk-ec2.workspace = true
 base64.workspace = true
 clap.workspace = true
 dirs = "6"
+mongodb.workspace = true
 regex.workspace = true
 reqwest.workspace = true
 runtime-secrets = { path = "../../crates/runtime-secrets", default-features = false }

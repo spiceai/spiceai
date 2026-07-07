@@ -1,0 +1,155 @@
+/*
+Copyright 2024-2025 The Spice.ai OSS Authors
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+     https://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+use async_trait::async_trait;
+use datafusion::sql::TableReference;
+use serde_json::Value;
+use snafu::ResultExt;
+use std::{borrow::Cow, sync::Arc};
+use tracing_futures::Instrument;
+
+use runtime_query_engine::allowlist::ResolvedTableAwareAllowlist;
+
+use crate::builtin::list_datasets::get_dataset_elements;
+use crate::utils::parameters;
+use app::App;
+use cache::TabledCacheProvider;
+use cache::result::search::CachedSearchResult;
+use runtime_query_engine::query_engine::QueryEngine;
+use runtime_request_context::{AsyncMarker, RequestContext};
+use runtime_search::request::{SearchRequest, SearchRequestBaseJson};
+use runtime_search::search_engine::{SearchEngine, parse_explicit_primary_keys};
+use runtime_search::table_provider_explorer::TableProviderExplorer;
+use runtime_search::types::to_pretty;
+use tokio::sync::RwLock;
+use tools::SpiceModelTool;
+
+pub struct SearchTool<E: TableProviderExplorer + Clone> {
+    name: String,
+    description: String,
+    df: Arc<dyn QueryEngine>,
+    app: Arc<RwLock<Option<Arc<App>>>>,
+    search_cache: Option<Arc<dyn TabledCacheProvider<CachedSearchResult> + Send + Sync>>,
+    table_allowlist: Option<ResolvedTableAwareAllowlist>,
+    explorer: E,
+}
+impl<E: TableProviderExplorer + Clone> SearchTool<E> {
+    #[must_use]
+    pub fn new(
+        df: Arc<dyn QueryEngine>,
+        app: Arc<RwLock<Option<Arc<App>>>>,
+        search_cache: Option<Arc<dyn TabledCacheProvider<CachedSearchResult> + Send + Sync>>,
+        explorer: E,
+        name: Option<&str>,
+        description: Option<&str>,
+    ) -> Self {
+        Self {
+            name: name.unwrap_or("search").to_string(),
+            description: description
+                .unwrap_or("Run a hybrid (vector + keyword) similarity search over datasets configured with embeddings. Use this for natural-language or semantic lookups (e.g. 'find documents about X') instead of exact SQL filtering. Provide `text` for the query; optionally restrict with `datasets` (only datasets whose `can_search_documents=true` in `list_datasets` are valid), `where_cond` (a SQL predicate without the `WHERE` keyword), `additional_columns`, and `limit`. Returns matched rows grouped per dataset with similarity scores.")
+                .to_string(),
+            df,
+            app,
+            search_cache,
+            table_allowlist: None,
+            explorer,
+        }
+    }
+    #[must_use]
+    pub fn with_table_allowlist(mut self, allowlist: Option<ResolvedTableAwareAllowlist>) -> Self {
+        self.table_allowlist = allowlist;
+        self
+    }
+}
+
+#[async_trait]
+impl<E: TableProviderExplorer + Clone + 'static> SpiceModelTool for SearchTool<E> {
+    fn name(&self) -> Cow<'_, str> {
+        self.name.clone().into()
+    }
+
+    fn description(&self) -> Option<Cow<'_, str>> {
+        Some(Cow::Borrowed(self.description.as_str()))
+    }
+
+    fn parameters(&self) -> Option<Value> {
+        parameters::<SearchRequestBaseJson>()
+    }
+
+    async fn call(&self, arg: &str) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
+        let span = tracing::span!(target: "task_history", tracing::Level::INFO, "tool_use::search", tool = self.name().to_string(), input = arg);
+
+        let tool_use_result = async {
+            let req: SearchRequestBaseJson = serde_json::from_str(arg)?;
+            tracing::trace!("search tool use function call request: {req:?}");
+
+            let vs = SearchEngine::new(
+                Arc::clone(&self.df),
+                parse_explicit_primary_keys(Arc::clone(&self.app)).await,
+                self.explorer.clone(),
+            );
+
+            let mut search_request = SearchRequest::try_from(req)?;
+            let allowed_tables = match (search_request.datasets, self.table_allowlist.as_ref()) {
+                (tables, None) => tables,
+                (Some(ds), Some(allowlist)) => Some(
+                    ds.into_iter()
+                        .filter(|d| allowlist.table_is_allowed(&TableReference::parse_str(d)))
+                        .collect::<Vec<String>>(),
+                ),
+                (None, Some(allowlist)) => {
+                    let tables = get_dataset_elements(
+                        Arc::clone(&self.df),
+                        Arc::clone(&self.app),
+                        Some(allowlist),
+                    )
+                    .await
+                    .into_iter()
+                    .map(|d| d.table)
+                    .collect::<Vec<String>>();
+                    Some(tables)
+                }
+            };
+            search_request.datasets = allowed_tables;
+            let request_context = RequestContext::current(AsyncMarker::new().await);
+
+            let (result, _) = vs
+                .search_with_cache(&search_request, self.search_cache.clone(), request_context)
+                .await
+                .boxed()?;
+
+            let mut formatted = serde_json::Map::with_capacity(result.len());
+            for (tbl, result) in result {
+                let displayed = to_pretty(result).await?;
+                formatted.insert(tbl.to_string(), Value::String(displayed.to_string()));
+            }
+            Ok(Value::Object(formatted))
+        }
+        .instrument(span.clone())
+        .await;
+
+        match tool_use_result {
+            Ok(value) => {
+                let captured_output_json = serde_json::to_string(&value).boxed()?;
+                tracing::info!(target: "task_history", parent: &span, captured_output = %captured_output_json);
+                Ok(value)
+            }
+            Err(e) => {
+                tracing::error!(target: "task_history", parent: &span, "{e}");
+                Err(e)
+            }
+        }
+    }
+}

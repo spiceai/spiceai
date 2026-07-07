@@ -30,7 +30,6 @@ use datafusion::{
     common::{DataFusionError, Result as DataFusionResult, exec_err},
     logical_expr::{ColumnarValue, ScalarUDFImpl, Signature, Volatility},
 };
-use std::any::Any;
 use std::sync::Arc;
 
 use crate::vector_simd::make_scalar_function;
@@ -67,10 +66,6 @@ impl CosineDistance {
 }
 
 impl ScalarUDFImpl for CosineDistance {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn name(&self) -> &'static str {
         COSINE_DISTANCE_UDF_NAME
     }
@@ -201,10 +196,16 @@ fn compute_cosine_distance(
         return exec_err!("Both arrays must have the same length");
     }
 
-    Ok(Some(cosine_distance(&float_vals1, &float_vals2)))
+    Ok(cosine_distance(&float_vals1, &float_vals2))
 }
 
-fn cosine_distance(x: &Float64Array, y: &Float64Array) -> f64 {
+/// Computes the cosine distance between two equal-length vectors.
+///
+/// Returns `None` when either vector has zero magnitude (e.g. an all-zero or
+/// failed embedding): cosine similarity is undefined there (`0.0 / 0.0` is
+/// `NaN`), and a `NaN` score sorts ahead of every real score in
+/// `ORDER BY _score DESC`, surfacing failed embeddings as top matches.
+fn cosine_distance(x: &Float64Array, y: &Float64Array) -> Option<f64> {
     let mut x_length: f64 = 0.0;
     let mut y_length: f64 = 0.0;
 
@@ -224,8 +225,15 @@ fn cosine_distance(x: &Float64Array, y: &Float64Array) -> f64 {
 
     let similarity = sum_squares / (x_length.sqrt() * y_length.sqrt());
 
+    // A zero-magnitude vector makes `similarity` NaN (and a non-finite value can
+    // otherwise only arise from overflow). Guard it so callers get a NULL score
+    // rather than a NaN that would sort to the top of `ORDER BY _score DESC`.
+    if !similarity.is_finite() {
+        return None;
+    }
+
     // Convert cosine similarity [-1.0, 1.0] to cosine distance [0.0, 1.0]
-    (1.0 - similarity) / 2.0
+    Some((1.0 - similarity) / 2.0)
 }
 
 /// Converts an array of any numeric type to a `Float64Array`.
@@ -254,32 +262,84 @@ fn convert_to_f64_array(array: &ArrayRef) -> DataFusionResult<Float64Array> {
 
 #[cfg(test)]
 mod tests {
-    use arrow::array::Float64Array;
+    use std::sync::Arc;
 
-    use super::cosine_distance;
+    use arrow::array::{ArrayRef, Float64Array};
 
-    #[expect(clippy::float_cmp)]
+    use super::{compute_cosine_distance, cosine_distance};
+
     #[test]
     fn test_cosine_distance() {
-        assert_eq!(
-            0.0,
+        // Identical vectors -> similarity 1 -> distance 0.
+        assert!(matches!(
             cosine_distance(
                 &Float64Array::from(vec![1.0, 2.0, 3.0]),
-                &Float64Array::from(vec![1.0, 2.0, 3.0])
-            )
-        );
+                &Float64Array::from(vec![1.0, 2.0, 3.0]),
+            ),
+            Some(d) if d.abs() < f64::EPSILON
+        ));
 
-        assert_eq!(
-            1.0,
+        // Opposite vectors -> similarity -1 -> distance 1.
+        assert!(matches!(
             cosine_distance(
                 &Float64Array::from(vec![1.0, 2.0, 3.0]),
-                &Float64Array::from(vec![-1.0, -2.0, -3.0])
+                &Float64Array::from(vec![-1.0, -2.0, -3.0]),
+            ),
+            Some(d) if (d - 1.0).abs() < f64::EPSILON
+        ));
+
+        // Arbitrary vectors stay within the normalized [0, 1] range.
+        assert!(matches!(
+            cosine_distance(
+                &Float64Array::from(vec![1000.0, 2000.0, 30.0]),
+                &Float64Array::from(vec![-42.0, 123.0, -3.0]),
+            ),
+            Some(d) if (0.0..=1.0).contains(&d)
+        ));
+    }
+
+    #[test]
+    fn test_cosine_distance_zero_vector_is_null() {
+        // A zero-magnitude vector has no defined direction; the distance must be
+        // NULL (None) rather than NaN so failed/empty embeddings do not sort to
+        // the top of `ORDER BY _score DESC`.
+        assert_eq!(
+            None,
+            cosine_distance(
+                &Float64Array::from(vec![0.0, 0.0, 0.0]),
+                &Float64Array::from(vec![1.0, 2.0, 3.0]),
             )
         );
-        let dist = cosine_distance(
-            &Float64Array::from(vec![1000.0, 2000.0, 30.0]),
-            &Float64Array::from(vec![-42.0, 123.0, -3.0]),
+        assert_eq!(
+            None,
+            cosine_distance(
+                &Float64Array::from(vec![1.0, 2.0, 3.0]),
+                &Float64Array::from(vec![0.0, 0.0, 0.0]),
+            )
         );
-        assert!((0.0..=1.0).contains(&dist));
+        assert_eq!(
+            None,
+            cosine_distance(
+                &Float64Array::from(vec![0.0, 0.0]),
+                &Float64Array::from(vec![0.0, 0.0]),
+            )
+        );
+    }
+
+    #[test]
+    fn test_compute_cosine_distance_zero_vector_propagates_null() {
+        // Exercise the production wrapper: a zero-magnitude vector must surface
+        // as `Ok(None)` (SQL NULL), not `Ok(Some(NaN))`.
+        let zero: ArrayRef = Arc::new(Float64Array::from(vec![0.0, 0.0, 0.0]));
+        let nonzero: ArrayRef = Arc::new(Float64Array::from(vec![1.0, 2.0, 3.0]));
+
+        let result = compute_cosine_distance(Some(zero), Some(nonzero));
+        assert!(matches!(result, Ok(None)));
+
+        // A normal pair still yields a finite distance.
+        let a: ArrayRef = Arc::new(Float64Array::from(vec![1.0, 2.0, 3.0]));
+        let b: ArrayRef = Arc::new(Float64Array::from(vec![1.0, 2.0, 3.0]));
+        let result = compute_cosine_distance(Some(a), Some(b));
+        assert!(matches!(result, Ok(Some(d)) if d.is_finite()));
     }
 }

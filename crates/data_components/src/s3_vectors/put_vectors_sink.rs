@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::{any::Any, collections::HashMap, sync::Arc};
+use std::{collections::HashMap, sync::Arc};
 
 use arrow::datatypes::{DataType, SchemaRef};
 use arrow_array::{Array, RecordBatch};
@@ -91,10 +91,6 @@ impl DisplayAs for PutVectorsSink {
 
 #[async_trait]
 impl DataSink for PutVectorsSink {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema(&self) -> &SchemaRef {
         &self.table.schema
     }

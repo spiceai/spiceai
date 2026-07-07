@@ -341,7 +341,7 @@ mod tests {
             .expect("failed to create table");
 
         // The table should be created with an indexed structure
-        assert!(table.as_any().is::<IndexedMemTable>());
+        assert!(table.is::<IndexedMemTable>());
     }
 
     #[tokio::test]
@@ -375,7 +375,7 @@ mod tests {
             .expect("failed to create table");
 
         // Without primary key, should still be a valid table
-        assert!(table.as_any().is::<MemTable>());
+        assert!(table.is::<MemTable>());
     }
 
     #[tokio::test]
@@ -453,7 +453,7 @@ mod tests {
             .expect("failed to create table");
 
         // With hash_index not specified, should still create successfully (uses non-indexed table)
-        assert!(table.as_any().is::<MemTable>());
+        assert!(table.is::<MemTable>());
     }
 
     // =============================================================================

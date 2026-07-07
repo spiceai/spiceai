@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::{any::Any, fmt, sync::Arc};
+use std::{fmt, sync::Arc};
 
 use crate::mssql::{ConnectionPoolSnafu, QuerySnafu, convert::rows_to_arrow};
 use arrow::datatypes::SchemaRef;
@@ -49,7 +49,7 @@ pub struct SqlServerExecPlan {
     filters: Vec<Expr>,
     limit: Option<usize>,
     sort_exprs: Vec<PhysicalSortExpr>,
-    properties: PlanProperties,
+    properties: Arc<PlanProperties>,
 }
 
 pub fn project_schema_safe(
@@ -87,12 +87,12 @@ impl SqlServerExecPlan {
             filters: filters.to_vec(),
             limit,
             sort_exprs: Vec::new(),
-            properties: PlanProperties::new(
+            properties: Arc::new(PlanProperties::new(
                 EquivalenceProperties::new(projected_schema),
                 Partitioning::UnknownPartitioning(1),
                 EmissionType::Incremental,
                 Boundedness::Bounded,
-            ),
+            )),
         })
     }
 
@@ -135,7 +135,7 @@ impl SqlServerExecPlan {
                 .sort_exprs
                 .iter()
                 .map(|sort| {
-                    let col = sort.expr.as_any().downcast_ref::<Column>().ok_or_else(|| {
+                    let col = sort.expr.downcast_ref::<Column>().ok_or_else(|| {
                         DataFusionError::Internal(
                             "Sort pushdown contains non-column expressions".to_string(),
                         )
@@ -187,15 +187,11 @@ impl ExecutionPlan for SqlServerExecPlan {
         "SqlServerExec"
     }
 
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema(&self) -> SchemaRef {
         Arc::clone(&self.projected_schema)
     }
 
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
     }
 
@@ -226,7 +222,7 @@ impl ExecutionPlan for SqlServerExecPlan {
             filters: self.filters.clone(),
             limit,
             sort_exprs: self.sort_exprs.clone(),
-            properties: self.properties.clone(),
+            properties: Arc::clone(&self.properties),
         }))
     }
 
@@ -241,7 +237,7 @@ impl ExecutionPlan for SqlServerExecPlan {
         let mut nulls_match_native = true;
         for sort_expr in order {
             // Only support simple column references
-            let Some(col) = sort_expr.expr.as_any().downcast_ref::<Column>() else {
+            let Some(col) = sort_expr.expr.downcast_ref::<Column>() else {
                 return Ok(SortOrderPushdownResult::Unsupported);
             };
 
@@ -249,8 +245,7 @@ impl ExecutionPlan for SqlServerExecPlan {
             let is_nullable = self
                 .projected_schema
                 .field_with_name(col.name())
-                .map(arrow::datatypes::Field::is_nullable)
-                .unwrap_or(true);
+                .map_or(true, arrow::datatypes::Field::is_nullable);
             if !is_nullable {
                 continue;
             }
@@ -289,12 +284,12 @@ impl ExecutionPlan for SqlServerExecPlan {
             filters: self.filters.clone(),
             limit: self.limit,
             sort_exprs,
-            properties: PlanProperties::new(
+            properties: Arc::new(PlanProperties::new(
                 eq_properties,
                 Partitioning::UnknownPartitioning(1),
                 EmissionType::Incremental,
                 Boundedness::Bounded,
-            ),
+            )),
         };
 
         let inner = Arc::new(new_plan) as Arc<dyn ExecutionPlan>;

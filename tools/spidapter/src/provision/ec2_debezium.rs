@@ -225,7 +225,7 @@ async fn wait_for_debezium_connect(host: &str, port: u16) -> anyhow::Result<()> 
         .timeout(Duration::from_secs(15))
         .build()?;
 
-    let timeout = Duration::from_secs(600);
+    let timeout = Duration::from_mins(10);
     let started = tokio::time::Instant::now();
 
     loop {
@@ -254,7 +254,7 @@ async fn wait_for_debezium_connect(host: &str, port: u16) -> anyhow::Result<()> 
 }
 
 async fn wait_for_instance_running(ec2: &Ec2Client, instance_id: &str) -> anyhow::Result<()> {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(300);
+    let deadline = tokio::time::Instant::now() + Duration::from_mins(5);
 
     loop {
         if tokio::time::Instant::now() > deadline {

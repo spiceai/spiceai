@@ -166,10 +166,6 @@ mod tests {
 
     #[async_trait]
     impl TableProvider for MockTableProvider {
-        fn as_any(&self) -> &dyn Any {
-            self
-        }
-
         fn schema(&self) -> arrow::datatypes::SchemaRef {
             Arc::new(Schema::new(vec![
                 Field::new("id", DataType::Int32, false),

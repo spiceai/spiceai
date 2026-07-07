@@ -24,7 +24,9 @@ use bytes::Bytes;
 use futures::AsyncReadExt;
 use futures::StreamExt;
 use futures::stream::BoxStream;
-use object_store::{Attributes, ListResult, MultipartUpload, PutMultipartOptions, PutPayload};
+use object_store::{
+    Attributes, CopyOptions, ListResult, MultipartUpload, PutMultipartOptions, PutPayload,
+};
 use object_store::{
     GetOptions, GetResult, GetResultPayload, ObjectMeta, ObjectStore, PutOptions, PutResult,
     path::Path,
@@ -401,31 +403,6 @@ impl FTPObjectStore {
         let entries = Self::list_directory(&mut conn, &prefix_str).await?;
         Ok(process_directory_entries_shallow(&prefix_str, entries))
     }
-
-    /// Get file metadata without reading content.
-    async fn get_file_metadata(&self, location: &Path) -> object_store::Result<ObjectMeta> {
-        let mut conn = self.inner.get_connection().await?;
-        let location_string = location.to_string();
-
-        let size: u64 = u64::try_from(conn.size(&location_string).await.map_err(|e| {
-            object_store::Error::NotFound {
-                path: location_string.clone(),
-                source: e.into(),
-            }
-        })?)
-        .unwrap_or(0);
-
-        let last_modified = conn
-            .mdtm(&location_string)
-            .await
-            .map_err(|e| object_store::Error::NotFound {
-                path: location_string.clone(),
-                source: e.into(),
-            })?
-            .and_utc();
-
-        Ok(build_object_meta(location.clone(), size, last_modified))
-    }
 }
 
 /// Read data from an FTP stream asynchronously
@@ -531,6 +508,16 @@ impl ObjectStore for FTPObjectStore {
 
         let object_meta = build_object_meta(location.clone(), size, last_modified);
 
+        if options.head {
+            let stream = futures::stream::empty();
+            return Ok(GetResult {
+                meta: object_meta,
+                payload: GetResultPayload::Stream(Box::pin(stream)),
+                range: 0..0,
+                attributes: Attributes::default(),
+            });
+        }
+
         let (start, end, data_to_read) = resolve_range(options.range.as_ref(), size);
 
         #[expect(clippy::cast_possible_truncation)]
@@ -552,20 +539,10 @@ impl ObjectStore for FTPObjectStore {
         })
     }
 
-    async fn head(&self, location: &Path) -> object_store::Result<ObjectMeta> {
-        self.get_file_metadata(location).await
-    }
-
-    async fn delete(&self, _location: &Path) -> object_store::Result<()> {
-        Err(object_store::Error::NotSupported {
-            source: "FTP delete not implemented".into(),
-        })
-    }
-
-    fn delete_stream<'a>(
-        &'a self,
-        _locations: BoxStream<'a, object_store::Result<Path>>,
-    ) -> BoxStream<'a, object_store::Result<Path>> {
+    fn delete_stream(
+        &self,
+        _locations: BoxStream<'static, object_store::Result<Path>>,
+    ) -> BoxStream<'static, object_store::Result<Path>> {
         futures::stream::once(async {
             Err(object_store::Error::NotSupported {
                 source: "FTP delete_stream not implemented".into(),
@@ -608,15 +585,14 @@ impl ObjectStore for FTPObjectStore {
         self.list_directory_shallow(prefix).await
     }
 
-    async fn copy(&self, _from: &Path, _to: &Path) -> object_store::Result<()> {
+    async fn copy_opts(
+        &self,
+        _from: &Path,
+        _to: &Path,
+        _options: CopyOptions,
+    ) -> object_store::Result<()> {
         Err(object_store::Error::NotSupported {
-            source: "FTP copy not implemented".into(),
-        })
-    }
-
-    async fn copy_if_not_exists(&self, _from: &Path, _to: &Path) -> object_store::Result<()> {
-        Err(object_store::Error::NotSupported {
-            source: "FTP copy_if_not_exists not implemented".into(),
+            source: "FTP copy_opts not implemented".into(),
         })
     }
 }

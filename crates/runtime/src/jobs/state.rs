@@ -22,7 +22,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 pub const JOB_SCHEMA_VERSION: u32 = 1;
 
 /// Default time-to-live for job results (12 hours, matching Databricks)
-pub const DEFAULT_RESULT_TTL: Duration = Duration::from_secs(12 * 60 * 60);
+pub const DEFAULT_RESULT_TTL: Duration = Duration::from_hours(12);
 
 /// Default chunk size for results (10,000 rows)
 pub const DEFAULT_CHUNK_SIZE: usize = 10_000;
@@ -136,6 +136,17 @@ pub struct JobResult {
     pub manifest: JobResultManifest,
     /// List of chunk indices available
     pub chunk_indices: Vec<usize>,
+    /// Cumulative starting row offset of each chunk, aligned with `chunk_indices`.
+    ///
+    /// Chunks are flushed once a row threshold is reached but are built by appending
+    /// whole record batches, so a chunk routinely holds more than `chunk_size` rows.
+    /// The starting offset therefore cannot be derived as `chunk_index * chunk_size`;
+    /// it is recorded here as the cumulative row count of all preceding chunks.
+    ///
+    /// Defaults to empty for results persisted before this field existed; readers must
+    /// fall back gracefully when an offset is absent.
+    #[serde(default)]
+    pub chunk_row_offsets: Vec<usize>,
 }
 
 /// Complete state of a job.

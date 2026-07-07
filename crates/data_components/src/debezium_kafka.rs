@@ -14,6 +14,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use std::sync::Arc;
+
 use crate::kafka::{
     KafkaOffsetCommitHook, MessageBatchCommitter, inject_ready_signal_on_caught_up,
 };
@@ -24,6 +26,7 @@ use crate::{
         change_event::{ChangeEvent, ChangeEventKey},
     },
     kafka::{Error, KafkaConsumer},
+    schema_projection::SchemaProjection,
 };
 use arrow::datatypes::SchemaRef;
 use async_trait::async_trait;
@@ -35,7 +38,6 @@ use datafusion::{
     logical_expr::Expr,
     physical_plan::{ExecutionPlan, empty::EmptyExec},
 };
-use std::{any::Any, sync::Arc};
 use tokio::time::Duration;
 use tokio_stream::StreamExt;
 
@@ -46,6 +48,9 @@ pub struct DebeziumKafka {
     consumer: &'static KafkaConsumer,
     batching: (usize, Duration),
     offset_commit_hook: Option<Arc<dyn KafkaOffsetCommitHook>>,
+    /// JSON-nesting / declared-schema projection applied to each change row's
+    /// `before`/`after` payload before Arrow conversion. `None` ⇒ passthrough.
+    projection: Option<SchemaProjection>,
 }
 
 impl std::fmt::Debug for DebeziumKafka {
@@ -65,6 +70,7 @@ impl DebeziumKafka {
         primary_keys: Vec<String>,
         consumer: KafkaConsumer,
         batching: (usize, Duration),
+        projection: Option<SchemaProjection>,
     ) -> Self {
         let Ok(df_schema) = DFSchema::try_from(Arc::clone(&schema)) else {
             unreachable!("DFSchema::try_from is infallible as of DataFusion 38")
@@ -92,6 +98,7 @@ impl DebeziumKafka {
             consumer: Box::leak(Box::new(consumer)),
             batching,
             offset_commit_hook: None,
+            projection,
         }
     }
 
@@ -116,6 +123,7 @@ impl DebeziumKafka {
         let consumer = self.consumer;
         let metrics = Arc::clone(self.consumer.metrics());
         let offset_commit_hook = self.offset_commit_hook.clone();
+        let projection = self.projection.clone();
         let inner = self
             .consumer
             .stream_json::<ChangeEventKey, ChangeEvent>()
@@ -138,8 +146,26 @@ impl DebeziumKafka {
                     .map(super::kafka::KafkaMessage::value)
                     .collect();
 
-                let rb = changes::vector_to_change_batch(&schema, &pk, &changes)
-                    .map_err(|e| cdc::StreamError::SerdeJsonError(e.to_string()))?;
+                // Newest upstream commit timestamp in the batch, for the
+                // replication-lag signal: prefer the source DB commit time
+                // (`source.ts_ms`), falling back to the connector envelope time
+                // (`payload.ts_ms`) when the source time is absent (0).
+                let source_commit_ts_ms = changes
+                    .iter()
+                    .map(|change| {
+                        let source_ts = change.payload.source.ts_ms;
+                        if source_ts != 0 {
+                            source_ts
+                        } else {
+                            change.payload.ts_ms
+                        }
+                    })
+                    .max();
+
+                let rb =
+                    changes::vector_to_change_batch(&schema, &pk, &changes, projection.as_ref())
+                        .map_err(|e| cdc::StreamError::SerdeJsonError(e.to_string()))?
+                        .with_source_commit_ts_ms(source_commit_ts_ms);
 
                 let committer = MessageBatchCommitter::from_messages(consumer, &messages)
                     .with_offset_commit_hook(offset_commit_hook.clone());
@@ -157,10 +183,6 @@ impl DebeziumKafka {
 
 #[async_trait]
 impl TableProvider for DebeziumKafka {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema(&self) -> SchemaRef {
         Arc::clone(&self.schema)
     }

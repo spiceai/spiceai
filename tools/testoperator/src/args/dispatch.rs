@@ -47,6 +47,13 @@ pub struct DispatchArgs {
     #[arg(long)]
     pub(crate) max_concurrent: Option<usize>,
 
+    /// When `--max-concurrent` is set, how many minutes to wait for a free slot
+    /// before dispatching anyway. Raise this above a single run's wall-clock for
+    /// long workloads (e.g. SF-1000 HTAP) so the slot wait actually serializes them
+    /// instead of giving up early. Ignored unless `--max-concurrent` is set.
+    #[arg(long, default_value = "30")]
+    pub(crate) max_concurrent_wait_timeout_mins: u64,
+
     /// Dry run mode - print the workflow dispatch request without sending it
     #[arg(long, default_value = "false")]
     pub(crate) dry_run: bool,

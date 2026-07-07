@@ -15,15 +15,14 @@ limitations under the License.
 */
 
 use std::num::TryFromIntError;
-use std::sync::{Arc, LazyLock};
+use std::sync::LazyLock;
 
-use ahash::RandomState;
+use crate::vendored_hash::{RandomState, create_hashes};
 use arrow::array::{ArrayRef, UInt64Array};
 use arrow::compute::binary;
 use datafusion::arrow::array::{Array, Int32Array};
 use datafusion::arrow::datatypes::DataType;
 use datafusion::common::DataFusionError;
-use datafusion::common::hash_utils::create_hashes;
 use datafusion::logical_expr::{
     ColumnarValue, ScalarFunctionArgs, ScalarUDFImpl, Signature, Volatility,
 };
@@ -99,10 +98,6 @@ impl Bucket {
 }
 
 impl ScalarUDFImpl for Bucket {
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
-
     fn name(&self) -> &'static str {
         BUCKET_SCALAR_UDF_NAME
     }
@@ -242,7 +237,7 @@ fn compute_bucket(
     }
     let array = scalar.to_array()?;
     let mut hashes = vec![0; 1];
-    create_hashes(&[array], &RANDOM_STATE, &mut hashes)?;
+    create_hashes(array.as_ref(), &RANDOM_STATE, &mut hashes)?;
     let bucket = u64::try_from(num_buckets)
         .map(|n| hashes[0] % n)
         .context(BucketLargerThanTypeSnafu)?;
@@ -257,7 +252,7 @@ fn compute_bucket_array(
     let num_buckets = i32::try_from(num_buckets).context(BucketLargerThanTypeSnafu)?;
 
     let mut hashes = vec![0u64; array.len()];
-    create_hashes(&[Arc::clone(array)], &RANDOM_STATE, &mut hashes)?;
+    create_hashes(array.as_ref(), &RANDOM_STATE, &mut hashes)?;
 
     let hash_array = UInt64Array::from(hashes);
 
@@ -286,6 +281,7 @@ mod tests {
     use arrow_schema::Field;
     use datafusion::config::ConfigOptions;
     use insta::assert_snapshot;
+    use std::sync::Arc;
 
     #[test]
     fn test_bucket_scalar() {
@@ -556,6 +552,141 @@ mod tests {
         assert!(
             !error_msg.contains("+---"),
             "Error message should not contain table formatting: {error_msg}"
+        );
+    }
+
+    /// Golden-value guard that pins `bucket()`'s output for a representative
+    /// value of every non-string Arrow type the partition transform hashes.
+    ///
+    /// `bucket(n, value) = hash(value) % n` is the partition transform behind
+    /// `runtime-table-partition`: a value MUST map to the same bucket for the
+    /// lifetime of a persisted dataset, or an equality-filter prune silently
+    /// skips the partition that holds the matching rows — missing-row data loss
+    /// (#11277). The hash is therefore part of the on-disk format, and
+    /// `vendored_hash.rs` freezes it to `DataFusion` 53's `ahash`. But that module
+    /// still delegates the actual hashing to the external `ahash` crate, pinned
+    /// only as `^0.8` — and ahash gives **no** cross-version output guarantee, so
+    /// a routine `cargo update` (or a build that enables ahash's AES path) can
+    /// silently re-bucket every existing partitioned dataset.
+    ///
+    /// These goldens make that drift LOUD: any change here fails CI instead of
+    /// silently corrupting pruning. The pre-existing snapshot tests only locked
+    /// the string (`bucket_scalar`/`bucket_array`) and decimal paths; the integer,
+    /// unsigned, boolean, float, and binary paths — the common partition keys,
+    /// e.g. `bucket(50, org_id)` or `bucket(3, user_id)` — had no guard at all.
+    ///
+    /// A large modulus (`MAX_NUM_BUCKETS`) is used so the assertion captures the
+    /// low 6 decimal digits of the hash, not just a handful of low bits. Edge
+    /// values fill each integer width so every width's hashing path is distinct.
+    ///
+    /// If a value here ever needs to change, that is a breaking change to the
+    /// on-disk partition format: regenerate the goldens **and** version/migrate
+    /// the format — do not blindly update them to make CI green.
+    #[test]
+    fn test_bucket_hash_stability_golden_values() {
+        // (type label, input value, expected `bucket(MAX_NUM_BUCKETS, value)`).
+        let cases: [(&str, ScalarValue, i64); 14] = [
+            ("Int8", ScalarValue::Int8(Some(-128)), 924_318),
+            ("Int16", ScalarValue::Int16(Some(-12_345)), 180_632),
+            ("Int32", ScalarValue::Int32(Some(-1_234_567)), 143_530),
+            ("Int64", ScalarValue::Int64(Some(-123_456_789_012)), 397_203),
+            ("UInt8", ScalarValue::UInt8(Some(255)), 670_181),
+            ("UInt16", ScalarValue::UInt16(Some(65_535)), 162_628),
+            ("UInt32", ScalarValue::UInt32(Some(4_000_000_000)), 663_368),
+            (
+                "UInt64",
+                ScalarValue::UInt64(Some(18_000_000_000_000_000_000)),
+                279_638,
+            ),
+            ("Boolean_true", ScalarValue::Boolean(Some(true)), 719_061),
+            ("Boolean_false", ScalarValue::Boolean(Some(false)), 627_404),
+            ("Float32", ScalarValue::Float32(Some(1.5)), 157_006),
+            ("Float64", ScalarValue::Float64(Some(-2.5)), 749_390),
+            (
+                "Utf8",
+                ScalarValue::Utf8(Some("user_42".to_string())),
+                594_815,
+            ),
+            (
+                "Binary",
+                ScalarValue::Binary(Some(vec![0x00, 0x01, 0x02, 0xff])),
+                682_122,
+            ),
+        ];
+
+        for (label, value, expected) in cases {
+            let bucket = compute_bucket(&value, MAX_NUM_BUCKETS, &DataType::Int64)
+                .expect("compute_bucket should succeed for a supported type");
+            let ScalarValue::Int64(Some(actual)) = bucket else {
+                panic!("expected an Int64 bucket for {label}, got {bucket:?}");
+            };
+            assert_eq!(
+                actual, expected,
+                "bucket() output for {label} drifted from the frozen on-disk value \
+                 {expected} to {actual}. The partition hash must not change (see \
+                 #11277 and vendored_hash.rs); if this is an intentional, \
+                 format-versioned migration, update the golden AND bump the format."
+            );
+        }
+
+        // The vectorized array path must agree with the scalar path (it shares
+        // `create_hashes`); lock it for a non-string type — the existing
+        // `bucket_array` snapshot only covers strings. Element 0 reuses the
+        // Int64 scalar value above and must match its golden (397_203).
+        let arr: ArrayRef = std::sync::Arc::new(arrow::array::Int64Array::from(vec![
+            -123_456_789_012_i64,
+            0,
+            9_999_999_999,
+        ]));
+        let bucketed = compute_bucket_array(&arr, MAX_NUM_BUCKETS, &DataType::Int64)
+            .expect("compute_bucket_array should succeed for Int64");
+        let bucketed = bucketed
+            .as_any()
+            .downcast_ref::<arrow::array::Int64Array>()
+            .expect("bucket array should be Int64");
+        assert_eq!(
+            bucketed.values(),
+            &[397_203_i64, 627_404, 929_657],
+            "vectorized bucket() output for an Int64 column drifted from its frozen \
+             on-disk values (see #11277)"
+        );
+    }
+
+    /// The `bucket()` partition hash must never come from ahash's AES-accelerated
+    /// hasher: `aes_hash::AHasher` and `fallback_hash::AHasher` produce different
+    /// output from the same seed, so an AES build would silently re-bucket
+    /// persisted partitioned datasets relative to the shipped fallback-hashed
+    /// builds (#11277). `vendored_hash.rs` has a `compile_error!` that fails any
+    /// `x86/x86_64` build with `target_feature = "aes"` active, so on such a build
+    /// this crate does not compile and this test never runs. Where it *does* run,
+    /// assert the invariant explicitly and re-lock one fallback golden to prove
+    /// the active hasher is in fact the portable fallback.
+    #[test]
+    fn test_bucket_uses_portable_fallback_hash_not_aes() {
+        let aes_hasher_active = cfg!(all(
+            any(target_arch = "x86", target_arch = "x86_64"),
+            target_feature = "aes",
+            not(miri)
+        ));
+        assert!(
+            !aes_hasher_active,
+            "the compile_error! guard in vendored_hash.rs should have prevented \
+             compiling this crate with ahash's AES hasher active (see #11277)"
+        );
+
+        // Same input/golden as `test_bucket_hash_stability_golden_values` (Utf8
+        // "user_42"): proves the hasher actually driving bucket() in this build
+        // is the portable fallback, not an output-incompatible variant.
+        let bucket = compute_bucket(
+            &ScalarValue::Utf8(Some("user_42".to_string())),
+            MAX_NUM_BUCKETS,
+            &DataType::Int64,
+        )
+        .expect("compute_bucket should succeed for Utf8");
+        assert_eq!(
+            bucket,
+            ScalarValue::Int64(Some(594_815)),
+            "bucket() must use the frozen portable fallback hash (#11277)"
         );
     }
 

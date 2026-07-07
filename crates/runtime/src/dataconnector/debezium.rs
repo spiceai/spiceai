@@ -15,17 +15,25 @@ limitations under the License.
 */
 
 use super::{ConnectorParams, DataConnector, DataConnectorFactory, ParameterSpec, Parameters};
-use crate::component::dataset::Dataset;
+use crate::accelerated_table::refresh_task::changes::{
+    CdcSchemaEvolution, SCHEMA_EVOLUTION_APPLIED, SCHEMA_EVOLUTION_DETECTED,
+    SCHEMA_EVOLUTION_FAILED, install_cdc_schema_evolution, schema_evolution_labels,
+    widening_plan_kind,
+};
 use crate::component::dataset::acceleration::{Engine, RefreshMode};
+use crate::component::dataset::{Dataset, OnSchemaChange};
 use crate::component::metrics::MetricsProvider;
 use crate::dataaccelerator::spice_sys::{self, OpenOption, debezium_kafka::DebeziumKafkaSys};
+use crate::dataconnector::schema_projection::{ProjectionPolicy, parse_schema_projection};
 use crate::dataconnector::{
     ConnectorComponent,
     kafka::{SidecarOffsetCommitHook, SidecarOffsetStore},
 };
 use crate::datafusion::refresh_sql;
 use crate::federated_table::FederatedTable;
+use crate::schema_evolution::evolution_allowed;
 use arrow::datatypes::SchemaRef;
+use arrow_tools::schema_evolution::{self, EvolutionContext, SchemaEvolution};
 use async_stream::stream;
 use async_trait::async_trait;
 use data_components::cdc::ChangesStream;
@@ -33,8 +41,8 @@ use data_components::debezium::change_event::{ChangeEvent, ChangeEventKey};
 use data_components::debezium::{self, change_event};
 use data_components::debezium_kafka::DebeziumKafka;
 use data_components::kafka::{KafkaConfig, KafkaConsumer, KafkaMetrics, KafkaOffset};
+use data_components::schema_discovery::merge_inferred_and_declared_schemas;
 use datafusion::datasource::TableProvider;
-use datafusion_table_providers::util::schema::merge_inferred_and_declared_schemas;
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use snafu::prelude::*;
@@ -128,6 +136,21 @@ impl Debezium {
                 .map(ToString::to_string),
             ssl_ca_location: params
                 .get("kafka_ssl_ca_location")
+                .expose()
+                .ok()
+                .map(ToString::to_string),
+            ssl_certificate_location: params
+                .get("kafka_ssl_certificate_location")
+                .expose()
+                .ok()
+                .map(ToString::to_string),
+            ssl_key_location: params
+                .get("kafka_ssl_key_location")
+                .expose()
+                .ok()
+                .map(ToString::to_string),
+            ssl_key_password: params
+                .get("kafka_ssl_key_password")
                 .expose()
                 .ok()
                 .map(ToString::to_string),
@@ -233,6 +256,15 @@ const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::runtime("kafka_ssl_ca_location")
         .secret()
         .description("Path to the SSL/TLS CA certificate file for server verification."),
+    ParameterSpec::runtime("kafka_ssl_certificate_location")
+        .secret()
+        .description("Path to the client SSL/TLS certificate file for mTLS authentication."),
+    ParameterSpec::runtime("kafka_ssl_key_location")
+        .secret()
+        .description("Path to the client SSL/TLS private key file for mTLS authentication."),
+    ParameterSpec::runtime("kafka_ssl_key_password")
+        .secret()
+        .description("Password for the client SSL/TLS private key, if encrypted."),
     ParameterSpec::runtime("kafka_enable_ssl_certificate_verification")
         .default("true")
         .description("Enable SSL/TLS certificate verification. Default: 'true'."),
@@ -338,6 +370,19 @@ impl DataConnector for Debezium {
 
         let declared_schema = dataset.schema.clone();
 
+        // `on_schema_change` != block implies the reload-time Kafka peek — the
+        // legacy `schema_evolution` param is an alias for it. With the param set
+        // but no policy, adoption stays blind (no widening validation): warn.
+        let on_schema_change = dataset.on_schema_change;
+        let schema_evolution_enabled =
+            self.schema_evolution || !matches!(on_schema_change, OnSchemaChange::Block);
+        if self.schema_evolution && matches!(on_schema_change, OnSchemaChange::Block) {
+            tracing::warn!(
+                dataset = %dataset_name,
+                "`schema_evolution: true` without `on_schema_change` adopts the latest Kafka message schema blindly (no widening validation). Set `on_schema_change: append_new_columns` or `sync_all_columns` on the dataset to validate adoption"
+            );
+        }
+
         let metadata_from_accelerator =
             if let Some(debezium_kafka_sys) = debezium_kafka_sys.as_deref() {
                 get_metadata_from_accelerator(debezium_kafka_sys)
@@ -379,7 +424,7 @@ impl DataConnector for Debezium {
                     }
                 );
 
-                let (metadata, schema) = if self.schema_evolution {
+                let (metadata, schema) = if schema_evolution_enabled {
                     // Check for schema evolution by peeking at the latest Kafka message
                     refresh_schema_if_evolved(
                         metadata,
@@ -388,6 +433,7 @@ impl DataConnector for Debezium {
                         &self.kafka_config,
                         debezium_kafka_sys.as_deref(),
                         declared_schema.as_ref(),
+                        on_schema_change,
                     )
                     .await?
                 } else {
@@ -436,10 +482,22 @@ impl DataConnector for Debezium {
                     &self.kafka_config,
                     debezium_kafka_sys.as_deref(),
                     declared_schema.as_ref(),
-                    self.schema_evolution,
+                    schema_evolution_enabled,
                 )
                 .await?
             }
+        };
+
+        // JSON-nesting / declared-schema projection. Primary-key (Kafka key)
+        // columns must be declared explicitly — never folded into the catch-all
+        // — so CDC UPDATE/DELETE apply keeps working.
+        let projection = parse_schema_projection(
+            dataset,
+            &ProjectionPolicy::new("debezium").with_required_columns(metadata.primary_keys.clone()),
+        )?;
+        let schema = match &projection {
+            Some(p) => p.project_schema(schema),
+            None => schema,
         };
 
         ensure!(
@@ -458,6 +516,17 @@ impl DataConnector for Debezium {
                 "Debezium messages do not include primary keys; Arrow acceleration will apply deletes and updates by matching full row values, which requires Debezium full before images for keyless updates and deletes"
             );
         }
+
+        // Make the dataset's policy + key columns available to the CDC apply
+        // loop for stream-time schema classification. The dataset registration
+        // path may re-install with a richer constraint set; last write wins.
+        install_cdc_schema_evolution(
+            &dataset.name,
+            CdcSchemaEvolution {
+                policy: on_schema_change,
+                constraint_columns: metadata.primary_keys.clone(),
+            },
+        );
 
         let refresh_sql = dataset.refresh_sql();
         let refresh_schema = if let Some(refresh_sql) = &refresh_sql {
@@ -479,6 +548,7 @@ impl DataConnector for Debezium {
             metadata.primary_keys,
             kafka_consumer,
             self.batching,
+            projection,
         );
 
         if let Some(debezium_kafka_sys) = debezium_kafka_sys {
@@ -504,7 +574,7 @@ impl DataConnector for Debezium {
     ) -> Option<ChangesStream> {
         Some(Box::pin(stream! {
             let table_provider = federated_table.table_provider().await;
-            let Some(debezium_kafka) = table_provider.as_any().downcast_ref::<DebeziumKafka>() else {
+            let Some(debezium_kafka) = table_provider.downcast_ref::<DebeziumKafka>() else {
                 return;
             };
 
@@ -788,6 +858,11 @@ async fn fetch_first_event(
 /// changed from the cached metadata, update the stored metadata and return the fresh
 /// schema. Falls back to the cached schema if the peek fails or no messages are available.
 /// If `declared_schema` is provided, it is merged into whichever schema is chosen.
+///
+/// With `on_schema_change` != `block`, adoption is classifier-validated: only a
+/// widening permitted by the policy adopts + persists the sidecar; anything
+/// else keeps the cached schema with an actionable warning (`fail` errors).
+/// `block` (legacy `schema_evolution: true`) keeps today's blind adoption.
 async fn refresh_schema_if_evolved(
     metadata: DebeziumKafkaMetadata,
     dataset: &Dataset,
@@ -795,6 +870,7 @@ async fn refresh_schema_if_evolved(
     kafka_config: &KafkaConfig,
     debezium_kafka_sys: Option<&DebeziumKafkaSys>,
     declared_schema: Option<&SchemaRef>,
+    on_schema_change: OnSchemaChange,
 ) -> super::DataConnectorResult<(DebeziumKafkaMetadata, SchemaRef)> {
     let dataset_name = dataset.name.to_string();
 
@@ -861,6 +937,108 @@ async fn refresh_schema_if_evolved(
             metadata,
             merge_inferred_and_declared_schemas(Arc::new(cached_schema), declared_schema),
         ));
+    }
+
+    if !matches!(on_schema_change, OnSchemaChange::Block) {
+        let mut constraint_columns: Vec<String> = metadata.primary_keys.clone();
+        for pk in primary_keys_from_acceleration(dataset) {
+            if !constraint_columns.contains(&pk) {
+                constraint_columns.push(pk);
+            }
+        }
+        let ctx = EvolutionContext {
+            constraint_columns: &constraint_columns,
+        };
+        match schema_evolution::classify(&cached_schema, &fresh_schema, &ctx) {
+            SchemaEvolution::Identical => {
+                // Immaterial difference (e.g. reordered fields): the cached
+                // schema stays canonical.
+                return Ok((
+                    metadata,
+                    merge_inferred_and_declared_schemas(Arc::new(cached_schema), declared_schema),
+                ));
+            }
+            SchemaEvolution::Widening(plan) => {
+                let kind = widening_plan_kind(&plan);
+                let change = plan.describe();
+                SCHEMA_EVOLUTION_DETECTED.add(
+                    1,
+                    &schema_evolution_labels(&dataset_name, kind, "debezium_reload"),
+                );
+                if matches!(on_schema_change, OnSchemaChange::Fail) {
+                    SCHEMA_EVOLUTION_FAILED.add(
+                        1,
+                        &schema_evolution_labels(&dataset_name, kind, "fail_policy"),
+                    );
+                    return Err(super::DataConnectorError::UnableToGetReadProvider {
+                        dataconnector: "debezium".to_string(),
+                        source: format!(
+                            "schema change detected on Kafka topic '{topic}' ({change}) and `on_schema_change: fail` is set. \
+                             Revert the source schema change, or set `on_schema_change: append_new_columns`/`sync_all_columns` to evolve"
+                        )
+                        .into(),
+                        connector_component: ConnectorComponent::from(dataset),
+                    });
+                }
+                if !evolution_allowed(on_schema_change, &plan) {
+                    SCHEMA_EVOLUTION_FAILED.add(
+                        1,
+                        &schema_evolution_labels(&dataset_name, kind, "blocked_by_policy"),
+                    );
+                    tracing::warn!(
+                        dataset = %dataset_name,
+                        "widening schema change detected on Kafka topic '{topic}' ({change}) but `on_schema_change: {on_schema_change}` only evolves added columns; keeping the cached schema. Set `on_schema_change: sync_all_columns` to evolve types"
+                    );
+                    return Ok((
+                        metadata,
+                        merge_inferred_and_declared_schemas(
+                            Arc::new(cached_schema),
+                            declared_schema,
+                        ),
+                    ));
+                }
+                SCHEMA_EVOLUTION_APPLIED.add(
+                    1,
+                    &schema_evolution_labels(&dataset_name, kind, "debezium_reload"),
+                );
+                tracing::info!(
+                    dataset = %dataset_name,
+                    "adopting widened Debezium schema: {change}"
+                );
+            }
+            SchemaEvolution::Incompatible { reason } => {
+                SCHEMA_EVOLUTION_DETECTED.add(
+                    1,
+                    &schema_evolution_labels(&dataset_name, "incompatible", "debezium_reload"),
+                );
+                if matches!(on_schema_change, OnSchemaChange::Fail) {
+                    SCHEMA_EVOLUTION_FAILED.add(
+                        1,
+                        &schema_evolution_labels(&dataset_name, "incompatible", "fail_policy"),
+                    );
+                    return Err(super::DataConnectorError::UnableToGetReadProvider {
+                        dataconnector: "debezium".to_string(),
+                        source: format!(
+                            "incompatible schema change detected on Kafka topic '{topic}': {reason}. `on_schema_change: fail` is set"
+                        )
+                        .into(),
+                        connector_component: ConnectorComponent::from(dataset),
+                    });
+                }
+                SCHEMA_EVOLUTION_FAILED.add(
+                    1,
+                    &schema_evolution_labels(&dataset_name, "incompatible", "incompatible"),
+                );
+                tracing::warn!(
+                    dataset = %dataset_name,
+                    "schema change detected on Kafka topic '{topic}' cannot be applied losslessly: {reason}. Keeping the cached schema — messages with the new shape may fail to parse. To adopt a breaking change, remove the dataset's acceleration data and restart so the dataset re-registers with the new schema"
+                );
+                return Ok((
+                    metadata,
+                    merge_inferred_and_declared_schemas(Arc::new(cached_schema), declared_schema),
+                ));
+            }
+        }
     }
 
     tracing::info!("Detected schema evolution for dataset {dataset_name}. Updating cached schema.");

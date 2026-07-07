@@ -56,6 +56,7 @@ pub mod sqlite;
 #[cfg(feature = "turso")]
 pub mod turso;
 
+pub(crate) mod imds;
 pub(crate) mod snapshots;
 pub mod spice_sys;
 pub(crate) mod storage;
@@ -465,6 +466,26 @@ pub trait DataAccelerator: Send + Sync {
         Ok(())
     }
 
+    /// Applies a widening schema-evolution plan to an existing table in the acceleration
+    /// engine, in place (without dropping the table or its data).
+    ///
+    /// Implementations must be idempotent: re-applying a plan that was already partially
+    /// or fully applied (e.g. after a crash between the engine DDL and the checkpoint
+    /// update) must succeed without error, so restart-time re-classification self-heals.
+    ///
+    /// The default implementation rejects the call; engines that support in-place schema
+    /// evolution must override this.
+    async fn evolve_table_schema(
+        &self,
+        _table_name: &str,
+        _source: &dyn AccelerationSource,
+        _plan: &arrow_tools::schema_evolution::WideningPlan,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        Err(Box::new(SchemaEvolutionUnsupported {
+            engine: self.name(),
+        }))
+    }
+
     /// Check if the accelerator is initialized for a component
     fn is_initialized(&self, _source: &dyn AccelerationSource) -> bool {
         true
@@ -594,6 +615,17 @@ pub type ReloadProviderFactory = Arc<
      (DuckDB, SQLite, Cayenne, or Turso)."
 ))]
 pub struct SnapshotReloadUnsupported {
+    pub engine: &'static str,
+}
+
+/// Error returned by the default [`DataAccelerator::evolve_table_schema`]
+/// implementation when an engine does not support in-place schema evolution.
+#[derive(Debug, Snafu)]
+#[snafu(display(
+    "Acceleration engine '{engine}' does not support in-place schema evolution. \
+     The acceleration must be recreated to apply the new schema."
+))]
+pub struct SchemaEvolutionUnsupported {
     pub engine: &'static str,
 }
 
@@ -1091,7 +1123,6 @@ mod test {
             .expect("accelerator table should be created");
 
         let indexed = table
-            .as_any()
             .downcast_ref::<IndexedMemTable>()
             .expect("primary key should create an IndexedMemTable");
         assert!(indexed.has_index());
@@ -1209,7 +1240,6 @@ mod test {
             .expect("accelerator table should be created");
 
         let indexed = table
-            .as_any()
             .downcast_ref::<IndexedMemTable>()
             .expect("indexes should create an IndexedMemTable");
         assert!(!indexed.has_index());
@@ -2337,41 +2367,29 @@ mod accelerator_compat_tests {
 
                 // For Vortex, check if unsupported types are converted to Utf8
                 if matches!(engine, Engine::Cayenne) {
-                    if vortex_unsupported_types.contains(original_type) {
-                        assert_eq!(
-                            table_type,
-                            &DataType::Utf8,
-                            "{:?}: Field {} ({}) with unsupported type {:?} should be converted to Utf8, got {:?}",
-                            engine,
-                            i,
-                            original_field.name(),
-                            original_type,
-                            table_type
-                        );
-                    } else if matches!(original_type, DataType::Map(_, _)) {
-                        // Map types are also converted to Utf8
-                        assert_eq!(
-                            table_type,
-                            &DataType::Utf8,
-                            "{:?}: Field {} ({}) with Map type should be converted to Utf8, got {:?}",
-                            engine,
-                            i,
-                            original_field.name(),
-                            table_type
-                        );
+                    // Cayenne converts these unsupported types and Map to a string
+                    // (Utf8) column. The accelerator factory now defaults
+                    // force_view_read_schema to OFF, so the read schema keeps native
+                    // Utf8 (no Utf8View viewification unless the table opts in with
+                    // `cayenne_force_view_types: true`). So the expected type is Utf8
+                    // for unsupported/Map and the original type otherwise.
+                    let expected_table = if vortex_unsupported_types.contains(original_type)
+                        || matches!(original_type, DataType::Map(_, _))
+                    {
+                        DataType::Utf8
                     } else {
-                        // Other types should match exactly (or be compatible conversions like timestamps)
-                        assert_eq!(
-                            original_type,
-                            table_type,
-                            "{:?}: Field {} ({}) data type mismatch. Expected {:?}, got {:?}",
-                            engine,
-                            i,
-                            original_field.name(),
-                            original_type,
-                            table_type
-                        );
-                    }
+                        original_type.clone()
+                    };
+                    assert_eq!(
+                        table_type, &expected_table,
+                        "{:?}: Field {} ({}) data type mismatch. original {:?}, expected table {:?}, got {:?}",
+                        engine,
+                        i,
+                        original_field.name(),
+                        original_type,
+                        expected_table,
+                        table_type
+                    );
                 } else if matches!(engine, Engine::DuckDB) {
                     // DuckDB normalises YearMonth/DayTime intervals to MonthDayNano
                     // because its native INTERVAL type maps to the MonthDayNano layout.

@@ -294,7 +294,7 @@ fn classify_block_devices(devices: &[BlockDevice]) -> ResolvedAccelerationStorag
         // vendor "Msft" and model "Virtual Disk". Treat them like EBS for
         // pool sizing because they share the same network-attached latency
         // characteristics.
-        if description.contains("msft virtual disk")
+        if (description.contains("msft") && description.contains("virtual disk"))
             || description.contains("microsoft virtual disk")
             || description.contains("azure managed disk")
         {
@@ -315,6 +315,175 @@ fn classify_block_devices(devices: &[BlockDevice]) -> ResolvedAccelerationStorag
     } else {
         ResolvedAccelerationStorage::Unknown
     }
+}
+
+// ---------------------------------------------------------------------------
+// Active calibration probe
+// ---------------------------------------------------------------------------
+//
+// Device-identity classification ([`classify_block_devices`]) answers "is this
+// EBS?" but not "how fast is this EBS?" — every EBS volume type (gp2/gp3/io2/st1)
+// reports the same `Amazon Elastic Block Store` model string yet differs by ~1000×
+// in random-I/O behavior. A one-shot micro-benchmark at registration measures the
+// medium directly, so the tuner's slow-tier bias scales continuously with real
+// throughput instead of a 4-value enum. Cloud-agnostic: it works on GCP PD, Azure
+// disks, and on-prem SAN, and it is the only storage signal available to a
+// `cdc_durability: memory` table that never spills (and so never produces the
+// per-batch `io_latency` EWMA the closed loop otherwise keys off).
+
+/// Measured write performance of a storage medium, from the one-shot calibration
+/// probe. `write_mbps` is `None` when the probe was skipped (remote/object-store or
+/// a non-existent path) or failed — the caller then falls back to class-based
+/// behavior, so the probe is strictly additive and fail-open.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub(crate) struct StoragePerf {
+    /// Sequential write throughput in MiB/s (bulk write + final fsync), or `None`.
+    pub write_mbps: Option<f64>,
+}
+
+/// Bytes written by the throughput probe. Small enough to keep startup cheap (one
+/// probe per distinct volume, memoized), large enough to amortize per-write syscall
+/// overhead into a stable MiB/s estimate.
+const PROBE_FILE_BYTES: usize = 8 * 1024 * 1024;
+/// `PROBE_FILE_BYTES` expressed in MiB as an exact `f64` (avoids a lossy
+/// usize→f64 cast of the byte count in the throughput division).
+const PROBE_FILE_MIB: f64 = 8.0;
+const PROBE_CHUNK_BYTES: usize = 256 * 1024;
+
+/// Process-global memo so N tables sharing a volume probe it once. Keyed by the
+/// canonicalized directory; a poisoned lock recovers in-place (the probe is
+/// best-effort, never load-bearing).
+static PROBE_CACHE: std::sync::LazyLock<
+    std::sync::Mutex<
+        std::collections::HashMap<
+            std::path::PathBuf,
+            std::sync::Arc<tokio::sync::OnceCell<StoragePerf>>,
+        >,
+    >,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+/// The directory the calibration probe writes to for `path`: `path` itself when it
+/// is a directory, else its parent directory; `None` when neither is a directory.
+/// Shared by [`probe_storage_perf_async`] (which canonicalizes it for the
+/// per-volume cache key) and [`probe_storage_perf_blocking`], so the memo key
+/// matches the directory actually probed — two files on one volume dedupe to a
+/// single probe.
+fn probe_dir(path: &Path) -> Option<std::path::PathBuf> {
+    if path.is_dir() {
+        Some(path.to_path_buf())
+    } else {
+        path.parent().filter(|p| p.is_dir()).map(Path::to_path_buf)
+    }
+}
+
+/// Blocking calibration: write `PROBE_FILE_BYTES` to a temp file under `dir`,
+/// fsync, and measure sequential write throughput. Best-effort: any I/O error
+/// short-circuits to `StoragePerf::default()` and the temp file is always removed.
+/// Probes the parent directory when handed a file path.
+fn probe_storage_perf_blocking(path: &std::path::Path) -> StoragePerf {
+    use std::io::Write;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    // Process-unique sequence for the temp-file name (declared before statements).
+    static PROBE_SEQ: AtomicU64 = AtomicU64::new(0);
+
+    let Some(dir) = probe_dir(path) else {
+        return StoragePerf::default();
+    };
+    let seq = PROBE_SEQ.fetch_add(1, Ordering::Relaxed);
+    let probe_path = dir.join(format!(
+        ".spice_storage_probe_{}_{seq}.tmp",
+        std::process::id()
+    ));
+
+    let perf = (|| -> Option<StoragePerf> {
+        // `create_new` (O_EXCL): never truncate/clobber a pre-existing or
+        // attacker-planted file at the (pid+seq) probe path — if it somehow exists,
+        // the probe just fails open.
+        let mut file = std::fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&probe_path)
+            .ok()?;
+        // A non-zero pattern so a filesystem can't satisfy the write as a sparse
+        // hole (which would measure nothing).
+        let chunk = vec![0xA5u8; PROBE_CHUNK_BYTES];
+        let start = std::time::Instant::now();
+        let mut written = 0usize;
+        while written < PROBE_FILE_BYTES {
+            file.write_all(&chunk).ok()?;
+            written = written.saturating_add(chunk.len());
+        }
+        file.sync_all().ok()?;
+        let elapsed = start.elapsed().as_secs_f64();
+        let write_mbps = (elapsed > 0.0).then(|| PROBE_FILE_MIB / elapsed);
+        Some(StoragePerf { write_mbps })
+    })();
+
+    let _ = std::fs::remove_file(&probe_path);
+    perf.unwrap_or_default()
+}
+
+/// Available and total bytes on the filesystem backing `path` (the mount whose
+/// mount point is the longest prefix of the canonicalized path), or `None` when
+/// undetectable / remote / empty. Best-effort, for a low-disk startup warning: a
+/// full data or spill volume turns a memory-pressure spill into a crash.
+pub(crate) fn disk_space_bytes(path: &str) -> Option<(u64, u64)> {
+    if path.is_empty() {
+        return None;
+    }
+    let target = std::path::Path::new(path);
+    let target = target
+        .canonicalize()
+        .unwrap_or_else(|_| target.to_path_buf());
+    let disks = sysinfo::Disks::new_with_refreshed_list();
+    disks
+        .list()
+        .iter()
+        .filter(|disk| target.starts_with(disk.mount_point()))
+        .max_by_key(|disk| disk.mount_point().components().count())
+        .map(|disk| (disk.available_space(), disk.total_space()))
+}
+
+/// Resolve measured storage performance for `path`, off the async runtime (the
+/// probe does blocking file I/O). Memoized per volume so repeated table
+/// registrations on the same mount probe once. Empty/remote paths and probe
+/// failures return `StoragePerf::default()` (all `None`).
+pub(crate) async fn probe_storage_perf_async(path: &str) -> StoragePerf {
+    if path.is_empty() {
+        return StoragePerf::default();
+    }
+    // Resolve + canonicalize the probed directory (the parent when handed a file
+    // path) OFF the runtime — `is_dir`/`canonicalize` are blocking syscalls. The
+    // result is the per-volume memo key, so different files on one volume dedupe to
+    // a single probe.
+    let path_owned = path.to_string();
+    let Some(key) = tokio::task::spawn_blocking(move || {
+        probe_dir(Path::new(&path_owned)).map(|dir| dir.canonicalize().unwrap_or(dir))
+    })
+    .await
+    .ok()
+    .flatten() else {
+        return StoragePerf::default();
+    };
+    // Per-key shared cell: concurrent registrations on the same volume COALESCE on a
+    // single probe via `get_or_init` instead of each firing an 8 MiB write + fsync.
+    let cell = {
+        let mut cache = PROBE_CACHE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        std::sync::Arc::clone(cache.entry(key.clone()).or_default())
+    };
+    *cell
+        .get_or_init(|| {
+            let probe_target = key.clone();
+            async move {
+                tokio::task::spawn_blocking(move || probe_storage_perf_blocking(&probe_target))
+                    .await
+                    .unwrap_or_default()
+            }
+        })
+        .await
 }
 
 #[cfg(test)]
@@ -413,5 +582,24 @@ mod tests {
             resolve_acceleration_storage(StorageProfile::Tmpfs, Path::new("/does/not/matter")),
             ResolvedAccelerationStorage::Tmpfs
         );
+    }
+
+    #[test]
+    fn calibration_probe_measures_a_real_dir() {
+        let dir = std::env::temp_dir();
+        let perf = probe_storage_perf_blocking(&dir);
+        // A writable temp dir yields a positive throughput; the probe never leaves
+        // its temp file behind.
+        assert!(
+            perf.write_mbps.is_some_and(|m| m > 0.0),
+            "expected a positive throughput, got {perf:?}"
+        );
+    }
+
+    #[test]
+    fn calibration_probe_fails_open_on_missing_path() {
+        let perf = probe_storage_perf_blocking(Path::new("/nonexistent/spice/probe/dir"));
+        assert_eq!(perf, StoragePerf::default());
+        assert!(perf.write_mbps.is_none());
     }
 }

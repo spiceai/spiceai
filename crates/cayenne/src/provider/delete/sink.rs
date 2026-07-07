@@ -30,11 +30,13 @@ limitations under the License.
 //!
 //! - **Int64 PK-based**: For tables with a single-column Int64 primary key.
 //!   Optimized path that extracts PK values directly without `RowConverter` overhead.
-//!   Uses `HashMap<i64, i64>` for PK -> `delete_sequence` mapping.
+//!   The deleted PKs (at the write's `delete_sequence`) are folded into the published
+//!   [`super::super::deletion_index::DeletionIndex`] via `extend_max_deletes`.
 //!
 //! - **Key-based**: For tables with composite or non-integer primary keys.
-//!   Uses Arrow's `RowConverter` to create deterministic byte keys for lookup.
-//!   Uses `HashMap<Box<[u8]>, i64>` for key -> `delete_sequence` mapping.
+//!   Uses Arrow's `RowConverter` to create deterministic byte keys, which are folded
+//!   into the published [`super::super::deletion_index::KeyDeletionIndex`] via
+//!   `extend_max_deletes`.
 //!
 //! # Workflow
 //!
@@ -56,8 +58,9 @@ use crate::catalog::MetadataCatalog;
 use crate::metadata::TableMetadata;
 use arc_swap::ArcSwap;
 use arrow::array::ArrayRef;
-use arrow_row::RowConverter;
 use arrow_schema::SchemaRef;
+
+use crate::row_converter::RowConverter;
 use async_trait::async_trait;
 use data_components::delete::DeletionSink;
 use datafusion::datasource::listing::ListingTable;
@@ -109,14 +112,32 @@ pub struct CayenneDeletionSink {
     pk_row_converter: Option<Arc<RowConverter>>,
     /// Indices of primary key columns in the table schema.
     pk_column_indices: Vec<usize>,
-    /// Additional listing tables from protected snapshots that should also be scanned for deletions.
-    protected_snapshot_tables: Vec<Arc<ListingTable>>,
+    /// Extra listing tables to also scan for deletion keys, beyond the main
+    /// listing table — the protected snapshots and (for cold-tier tables) the
+    /// cold-tier files. The sink treats every entry uniformly.
+    additional_scan_tables: Vec<Arc<ListingTable>>,
     /// Shared `RuntimeEnv` for S3 object store access.
     runtime_env: Arc<RuntimeEnv>,
     /// Shared write lock to prevent concurrent writes/refreshes from racing with deletions.
     /// `None` when the caller already holds the write lock (e.g. retention filters applied
     /// during `write_all_append`).
     write_lock: Option<Arc<TokioMutex<()>>>,
+    /// Shared in-memory sequence allocator (lever B2) of the owning
+    /// `CayenneTableProvider`. The DML `DELETE` sink routes its sequence
+    /// allocations through the SAME allocator as every other writer of this
+    /// table, so memory and the DB `current_sequence_number` never diverge.
+    seq_allocator: Arc<TokioMutex<super::super::table::SeqAllocator>>,
+    /// Whether this sink must return a VERIFIED deleted-row count — i.e. it backs
+    /// a user-visible `DELETE`, where the count is surfaced to the SQL client as
+    /// "rows affected". When false (the CDC/internal default), the `pk IN (...)`
+    /// fast path may persist deletions WITHOUT a scan and return 0. That 0 is a
+    /// deliberate non-authoritative placeholder, not an upper bound — the filter's
+    /// extracted PK key set is the upper bound on deletions, and computing the
+    /// exact figure would need the scan this path skips (see
+    /// [`Self::delete_filtered_rows_from_tables`]). When true, the fast path is
+    /// bypassed so the scan-based path returns an exact count of the live rows
+    /// actually removed.
+    count_exact: bool,
 }
 
 impl CayenneDeletionSink {
@@ -132,9 +153,10 @@ impl CayenneDeletionSink {
         table_memory: Arc<CayenneMemoryAccount>,
         pk_row_converter: Option<Arc<RowConverter>>,
         pk_column_indices: Vec<usize>,
-        protected_snapshot_tables: Vec<Arc<ListingTable>>,
+        additional_scan_tables: Vec<Arc<ListingTable>>,
         runtime_env: Arc<RuntimeEnv>,
         write_lock: Option<Arc<TokioMutex<()>>>,
+        seq_allocator: Arc<TokioMutex<super::super::table::SeqAllocator>>,
     ) -> Self {
         Self {
             table_metadata,
@@ -146,10 +168,24 @@ impl CayenneDeletionSink {
             table_memory,
             pk_row_converter,
             pk_column_indices,
-            protected_snapshot_tables,
+            additional_scan_tables,
             runtime_env,
             write_lock,
+            seq_allocator,
+            count_exact: false,
         }
+    }
+
+    /// Set whether this sink must return an exact, verified deleted-row count.
+    ///
+    /// `true` (a user-visible `DELETE`, where "rows affected" is shown to the
+    /// client) bypasses the count-skipping `pk IN (...)` fast path so the
+    /// scan-based path counts only the live rows actually removed. `false` (the
+    /// default) keeps the fast path for CDC/internal callers that do not surface
+    /// the count. See [`Self::count_exact`].
+    pub(crate) fn with_exact_count(mut self, exact: bool) -> Self {
+        self.count_exact = exact;
+        self
     }
 
     fn refresh_deletion_memory_accounting(&self) {
@@ -294,35 +330,42 @@ impl CayenneDeletionSink {
 
         let coerced_filters = self.coerce_filters_for_schema()?;
 
-        // If filters encode PK deletion values directly, extract them and write
-        // deletion vectors without performing full scan.
+        // PK-IN-list fast path: when the filter encodes the PK deletion values
+        // directly (`pk IN (...)`), extract them and write deletion vectors
+        // WITHOUT a full table scan.
         //
-        // The fast path always returns 0: the extracted key set is the filter's
-        // upper bound on deletions, not a verified per-row count, so we can't
-        // produce a meaningful "rows deleted" number without a scan. Callers
-        // (CDC, `InlineAwareDeletionSink`) must not depend on this count — the
-        // authoritative count for user-visible DELETEs comes from the inline
-        // path in `InlineAwareDeletionSink`.
-        match self.try_extract_pks_from_filters(&coerced_filters) {
-            Some(ExtractedPkDeletes::Int64(pk_values)) => {
-                tracing::debug!(
-                    table = %table_name,
-                    count = pk_values.len(),
-                    "Fast-path delete: extracted Int64 PK values directly from filters, skipping table scan"
-                );
-                self.persist_int64_pk_deletions(pk_values).await?;
-                return Ok(0);
+        // This path cannot produce a verified count: the extracted key set is
+        // the filter's UPPER BOUND on deletions (some keys may not exist), so a
+        // meaningful "rows deleted" number would require the scan it is avoiding.
+        // It therefore returns 0. CDC/internal callers don't surface the count
+        // and take this fast path.
+        //
+        // A user-visible `DELETE` (`count_exact`) surfaces "rows affected" to the
+        // client, so it must NOT take the fast path: it falls through to the
+        // scan-based path below, which extracts PKs from the LIVE rows the scan
+        // matched and thus counts only rows actually removed.
+        if !self.count_exact {
+            match self.try_extract_pks_from_filters(&coerced_filters) {
+                Some(ExtractedPkDeletes::Int64(pk_values)) => {
+                    tracing::debug!(
+                        table = %table_name,
+                        count = pk_values.len(),
+                        "Fast-path delete: extracted Int64 PK values directly from filters, skipping table scan"
+                    );
+                    self.persist_int64_pk_deletions(pk_values).await?;
+                    return Ok(0);
+                }
+                Some(ExtractedPkDeletes::RowKeys(row_keys)) => {
+                    tracing::debug!(
+                        table = %table_name,
+                        count = row_keys.len(),
+                        "Fast-path delete: extracted row keys directly from filters, skipping table scan"
+                    );
+                    self.persist_key_based_deletions(row_keys).await?;
+                    return Ok(0);
+                }
+                None => {}
             }
-            Some(ExtractedPkDeletes::RowKeys(row_keys)) => {
-                tracing::debug!(
-                    table = %table_name,
-                    count = row_keys.len(),
-                    "Fast-path delete: extracted row keys directly from filters, skipping table scan"
-                );
-                self.persist_key_based_deletions(row_keys).await?;
-                return Ok(0);
-            }
-            None => {}
         }
 
         let physical_filters = self.build_physical_filters(&coerced_filters)?;
@@ -593,10 +636,14 @@ impl CayenneDeletionSink {
         let sequence = if let Some(sequence) = delete_sequence {
             *sequence
         } else {
-            let sequence = self
-                .catalog
-                .increment_sequence_number(&self.table_metadata.table_id)
-                .await?;
+            let sequence = super::super::table::reserve_sequences_in(
+                &self.seq_allocator,
+                &self.catalog,
+                &self.table_metadata.table_id,
+                &self.table_metadata.table_name,
+                1,
+            )
+            .await?;
             *delete_sequence = Some(sequence);
             sequence
         };
@@ -617,10 +664,14 @@ impl CayenneDeletionSink {
         let sequence = if let Some(sequence) = delete_sequence {
             *sequence
         } else {
-            let sequence = self
-                .catalog
-                .increment_sequence_number(&self.table_metadata.table_id)
-                .await?;
+            let sequence = super::super::table::reserve_sequences_in(
+                &self.seq_allocator,
+                &self.catalog,
+                &self.table_metadata.table_id,
+                &self.table_metadata.table_name,
+                1,
+            )
+            .await?;
             *delete_sequence = Some(sequence);
             sequence
         };
@@ -724,12 +775,12 @@ impl CayenneDeletionSink {
         };
 
         // Build a fresh snapshot with the new deletions and publish via ArcSwap.
-        // Writes are serialised by the per-table write lock so the load+rebuild+store
-        // sequence is race-free.
-        let updated = current
-            .tombstones
-            .extend_max_deletes(written_row_keys.iter().map(|key| (key, delete_sequence)));
-        deletion_snapshot.store(Arc::new(RowConverterDeletionSnapshot::from_index(updated)));
+        deletion_snapshot.rcu(|current| {
+            let updated = current
+                .tombstones
+                .extend_max_deletes(written_row_keys.iter().map(|key| (key, delete_sequence)));
+            Arc::new(RowConverterDeletionSnapshot::from_index(updated))
+        });
         self.refresh_deletion_memory_accounting();
 
         let deleted_count =
@@ -838,12 +889,12 @@ impl CayenneDeletionSink {
         self.catalog.add_delete_file(result.delete_file).await?;
 
         // Build a fresh snapshot with the new deletions and publish via ArcSwap.
-        // Writes are serialised by the per-table write lock so the load+rebuild+store
-        // sequence is race-free.
-        let updated = current
-            .tombstones
-            .extend_max_deletes(pk_values.iter().map(|&pk| (pk, delete_sequence)));
-        deletion_snapshot.store(Arc::new(Int64PkDeletionSnapshot::from_index(updated)));
+        deletion_snapshot.rcu(|current| {
+            let updated = current
+                .tombstones
+                .extend_max_deletes(pk_values.iter().map(|&pk| (pk, delete_sequence)));
+            Arc::new(Int64PkDeletionSnapshot::from_index(updated))
+        });
         self.refresh_deletion_memory_accounting();
 
         let deleted_count =
@@ -907,10 +958,11 @@ impl DeletionSink for CayenneDeletionSink {
         // operation), so we never observe a torn swap here.
         let listing_table = self.listing_table.load_full();
 
-        // Collect all tables to scan: main listing table + protected snapshots
+        // Collect all tables to scan: main listing table + the extra tables
+        // (protected snapshots and, for cold-tier tables, the cold-tier files).
         let mut all_tables = vec![Arc::clone(&listing_table)];
-        for protected_table in &self.protected_snapshot_tables {
-            all_tables.push(Arc::clone(protected_table));
+        for extra_table in &self.additional_scan_tables {
+            all_tables.push(Arc::clone(extra_table));
         }
 
         if self.filters.is_empty() {

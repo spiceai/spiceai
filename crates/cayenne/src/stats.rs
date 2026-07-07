@@ -25,6 +25,7 @@ use std::sync::Arc;
 use arrow_schema::Schema;
 use datafusion_common::stats::Precision;
 use datafusion_common::{ColumnStatistics, ScalarValue, Statistics};
+use vortex::VortexSessionDefault;
 use vortex::array::stats::StatsSet;
 use vortex::dtype::arrow::FromArrowType;
 use vortex::dtype::{DType, Nullability};
@@ -115,7 +116,7 @@ fn scalar_to_df(scalar: &Scalar) -> Option<ScalarValue> {
             // extension types. Round-trip through Arrow so DataFusion
             // `ScalarValue` gets the correct logical type (preserving time
             // unit / time zone).
-            let datum: Arc<dyn arrow::array::Datum> = scalar.try_into().ok()?;
+            let datum = Arc::<dyn arrow::array::Datum>::try_from(scalar).ok()?;
             let (array, _is_scalar) = datum.get();
             ScalarValue::try_from_array(array, 0).ok()
         }
@@ -130,6 +131,7 @@ fn vortex_precision_to_df<T: Debug + Clone + PartialEq + Eq + PartialOrd>(
     match p {
         VortexPrecision::Exact(v) => Precision::Exact(v),
         VortexPrecision::Inexact(v) => Precision::Inexact(v),
+        VortexPrecision::Absent => Precision::Absent,
     }
 }
 
@@ -161,6 +163,24 @@ pub(crate) fn column_stats_to_stats_set(cs: &ColumnStatistics) -> StatsSet {
         stats.set(Stat::Max, precision);
     }
 
+    // Persist the column sum so whole-table `SUM`/`AVG` can be answered from
+    // metadata. The value is already widened to the sum dtype upstream by
+    // `infer_stats` in the Vortex persistent format (via `Stat::Sum.dtype`:
+    // signed -> Int64, unsigned -> UInt64, float -> Float64), matching
+    // `Sum::return_dtype` so it round-trips through `stats_set_to_column_stats`.
+    // Cross-batch/cross-file combination is handled additively by Vortex's
+    // `StatsSet::merge_unordered` (`merge_sum`).
+    if let Some(sv) = cs.sum_value.get_value()
+        && let Some(vortex_sv) = df_scalar_to_vortex(sv)
+    {
+        let precision = if cs.sum_value.is_exact().is_some() {
+            VortexPrecision::Exact(vortex_sv)
+        } else {
+            VortexPrecision::Inexact(vortex_sv)
+        };
+        stats.set(Stat::Sum, precision);
+    }
+
     if let Some(count) = cs.null_count.get_value() {
         // `usize -> u64` is lossless on all currently supported targets
         // (cayenne requires \u2265 64-bit pointers per project policy), but use
@@ -187,39 +207,40 @@ pub(crate) fn column_stats_to_stats_set(cs: &ColumnStatistics) -> StatsSet {
 
 /// Convert a Vortex [`StatsSet`] and column [`DType`] to `DataFusion` [`ColumnStatistics`].
 pub(crate) fn stats_set_to_column_stats(stats: &StatsSet, dtype: &DType) -> ColumnStatistics {
-    let min_value = stats
-        .get(Stat::Min)
-        .and_then(|p| {
-            let sv = p.map(|v| vortex_stat_to_df(&v, Stat::Min, dtype));
-            match sv {
-                VortexPrecision::Exact(Some(v)) => Some(Precision::Exact(v)),
-                VortexPrecision::Inexact(Some(v)) => Some(Precision::Inexact(v)),
-                _ => None,
-            }
-        })
-        .unwrap_or(Precision::Absent);
+    let min_value = vortex_precision_to_df(
+        stats
+            .get(Stat::Min)
+            .and_then(|v| vortex_stat_to_df(&v, Stat::Min, dtype)),
+    );
 
-    let max_value = stats
-        .get(Stat::Max)
-        .and_then(|p| {
-            let sv = p.map(|v| vortex_stat_to_df(&v, Stat::Max, dtype));
-            match sv {
-                VortexPrecision::Exact(Some(v)) => Some(Precision::Exact(v)),
-                VortexPrecision::Inexact(Some(v)) => Some(Precision::Inexact(v)),
-                _ => None,
-            }
-        })
-        .unwrap_or(Precision::Absent);
+    let max_value = vortex_precision_to_df(
+        stats
+            .get(Stat::Max)
+            .and_then(|v| vortex_stat_to_df(&v, Stat::Max, dtype)),
+    );
 
-    let null_count = stats
-        .get_as::<usize>(Stat::NullCount, &vortex::dtype::PType::U64.into())
-        .map_or(Precision::Absent, vortex_precision_to_df);
+    let null_count = vortex_precision_to_df(
+        stats
+            .get_as::<u64>(Stat::NullCount, &vortex::dtype::PType::U64.into())
+            .and_then(|count| usize::try_from(count).ok()),
+    );
+
+    // `Stat::Sum` is stored in the sum's widened dtype (signed -> I64,
+    // unsigned -> U64, float -> F64; see `Sum::return_dtype`), and
+    // `vortex_stat_to_df` reconstructs that via `Stat::Sum.dtype(dtype)`. This
+    // lets the metadata-only `SUM`/`AVG` fold (`crate::stats_aggregate`) answer
+    // whole-table sums without a scan.
+    let sum_value = vortex_precision_to_df(
+        stats
+            .get(Stat::Sum)
+            .and_then(|v| vortex_stat_to_df(&v, Stat::Sum, dtype)),
+    );
 
     ColumnStatistics {
         null_count,
         max_value,
         min_value,
-        sum_value: Precision::Absent,
+        sum_value,
         distinct_count: Precision::Absent,
         byte_size: Precision::Absent,
     }
@@ -241,15 +262,39 @@ pub fn file_statistics_to_df(file_stats: &FileStatistics, num_rows: i64) -> Stat
         .map(|(stats, dtype)| stats_set_to_column_stats(stats, dtype))
         .collect();
 
-    let num_rows = usize::try_from(num_rows)
-        .map(Precision::Exact)
-        .unwrap_or(Precision::Absent);
+    let num_rows = usize::try_from(num_rows).map_or(Precision::Absent, Precision::Exact);
 
     Statistics {
         num_rows,
         total_byte_size: Precision::Absent,
         column_statistics,
     }
+}
+
+/// Serialize `DataFusion` scan statistics to a persisted Vortex blob.
+///
+/// Returns `None` when any column cannot be converted or serialization fails.
+pub(crate) fn statistics_to_persisted_blob(stats: &Statistics, schema: &Schema) -> Option<Vec<u8>> {
+    if stats.column_statistics.len() != schema.fields().len() {
+        return None;
+    }
+    let column_stats: Vec<StatsSet> = stats
+        .column_statistics
+        .iter()
+        .map(column_stats_to_stats_set)
+        .collect();
+    let file_stats = build_file_statistics(column_stats, schema);
+    serialize_file_statistics(&file_stats).ok()
+}
+
+/// Restore `DataFusion` scan statistics from a persisted Vortex blob.
+pub(crate) fn statistics_from_persisted_blob(
+    blob: &[u8],
+    schema: &Schema,
+    num_rows: i64,
+) -> Option<Arc<Statistics>> {
+    let file_stats = deserialize_file_statistics(blob, schema).ok()?;
+    Some(Arc::new(file_statistics_to_df(&file_stats, num_rows)))
 }
 
 /// Serialize a Vortex [`FileStatistics`] to bytes.
@@ -269,7 +314,11 @@ pub(crate) fn serialize_file_statistics(stats: &FileStatistics) -> VortexResult<
 pub fn deserialize_file_statistics(bytes: &[u8], schema: &Schema) -> VortexResult<FileStatistics> {
     let struct_dtype = vortex_struct_dtype_from_schema(schema);
     let fb_stats = flatbuffers::root::<vortex::flatbuffers::footer::FileStatistics>(bytes)?;
-    FileStatistics::from_flatbuffer(&fb_stats, &struct_dtype)
+    FileStatistics::from_flatbuffer(
+        &fb_stats,
+        &struct_dtype,
+        &vortex_session::VortexSession::default(),
+    )
 }
 
 /// Convert an Arrow [`Schema`] to a Vortex struct [`DType`].
@@ -372,8 +421,20 @@ mod tests {
         };
         let set = column_stats_to_stats_set(&cs);
         // Pre-serialize sanity: StatsSet has Utf8 min/max.
-        assert!(set.get(Stat::Min).is_some(), "min present in StatsSet");
-        assert!(set.get(Stat::Max).is_some(), "max present in StatsSet");
+        assert!(
+            matches!(
+                set.get(Stat::Min),
+                VortexPrecision::Exact(_) | VortexPrecision::Inexact(_)
+            ),
+            "min present in StatsSet"
+        );
+        assert!(
+            matches!(
+                set.get(Stat::Max),
+                VortexPrecision::Exact(_) | VortexPrecision::Inexact(_)
+            ),
+            "max present in StatsSet"
+        );
 
         let file_stats = build_file_statistics(vec![set], &schema);
         let bytes = serialize_file_statistics(&file_stats).expect("serialize ok");
@@ -436,6 +497,68 @@ mod tests {
         assert_eq!(
             col.max_value,
             DfPrecision::Exact(ScalarValue::Int64(Some(30)))
+        );
+    }
+
+    #[test]
+    fn sum_roundtrips_through_file_statistics() {
+        let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, true)]));
+        let cs = ColumnStatistics {
+            null_count: DfPrecision::Exact(0),
+            min_value: DfPrecision::Exact(ScalarValue::Int64(Some(1))),
+            max_value: DfPrecision::Exact(ScalarValue::Int64(Some(3))),
+            sum_value: DfPrecision::Exact(ScalarValue::Int64(Some(6))),
+            distinct_count: DfPrecision::Absent,
+            byte_size: DfPrecision::Absent,
+        };
+        let set = column_stats_to_stats_set(&cs);
+        assert!(
+            matches!(set.get(Stat::Sum), VortexPrecision::Exact(_)),
+            "sum present in StatsSet"
+        );
+
+        let file_stats = build_file_statistics(vec![set], &schema);
+        let bytes = serialize_file_statistics(&file_stats).expect("serialize ok");
+        let rt = deserialize_file_statistics(&bytes, &schema).expect("deserialize ok");
+
+        let df = file_statistics_to_df(&rt, 3);
+        assert_eq!(
+            df.column_statistics[0].sum_value,
+            DfPrecision::Exact(ScalarValue::Int64(Some(6))),
+            "exact sum must survive the metastore blob roundtrip"
+        );
+    }
+
+    #[test]
+    fn serialized_statistics_merge_adds_sum_across_writes() {
+        let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, true)]));
+        let mk_sum = |sum: i64| ColumnStatistics {
+            null_count: DfPrecision::Exact(0),
+            min_value: DfPrecision::Absent,
+            max_value: DfPrecision::Absent,
+            sum_value: DfPrecision::Exact(ScalarValue::Int64(Some(sum))),
+            distinct_count: DfPrecision::Absent,
+            byte_size: DfPrecision::Absent,
+        };
+        let first_set = column_stats_to_stats_set(&mk_sum(60));
+        let second_set = column_stats_to_stats_set(&mk_sum(30));
+        let first_blob =
+            serialize_file_statistics(&build_file_statistics(vec![first_set], &schema))
+                .expect("serialize ok");
+        let dtypes = vec![DType::from_arrow((
+            schema.field(0).data_type(),
+            Nullability::Nullable,
+        ))];
+
+        let merged_blob = merge_serialized_stats(&first_blob, &[second_set], &dtypes, &schema)
+            .expect("statistics should merge");
+        let merged = deserialize_file_statistics(&merged_blob, &schema).expect("deserialize ok");
+
+        let df = file_statistics_to_df(&merged, 9);
+        assert_eq!(
+            df.column_statistics[0].sum_value,
+            DfPrecision::Exact(ScalarValue::Int64(Some(90))),
+            "sums must add additively across writes/files (Vortex merge_sum)"
         );
     }
 }

@@ -23,7 +23,10 @@ use futures::StreamExt;
 use runtime::Runtime;
 use spicepod::{component::dataset::Dataset, param::Params};
 
-use crate::{configure_test_datafusion, init_tracing, utils::test_request_context};
+use crate::{
+    configure_test_datafusion, init_tracing,
+    utils::{register_test_connectors, test_request_context},
+};
 
 pub fn get_glue_dataset(s3_uri: &str, name: &str) -> Dataset {
     let mut dataset = Dataset::new(s3_uri, name);
@@ -54,13 +57,14 @@ async fn glue_federation() -> Result<(), anyhow::Error> {
                 .build();
 
             configure_test_datafusion();
+            register_test_connectors().await;
             let rt = Runtime::builder().with_app(app).build().await;
 
             let cloned_rt = Arc::new(rt.clone());
 
             // Set a timeout for the test
             tokio::select! {
-                () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+                () = tokio::time::sleep(std::time::Duration::from_mins(1)) => {
                     return Err(anyhow::anyhow!("Timed out waiting for datasets to load"));
                 }
                 () = cloned_rt.load_components() => {}

@@ -64,15 +64,26 @@ pub mod ddl;
 pub mod hll;
 #[cfg(feature = "partition-table-provider")]
 pub use ddl::CayenneDdlHandler;
+pub(crate) mod bounded_fifo;
 pub mod logical_optimizer;
+pub mod maintained_aggregate;
 pub mod metadata;
 pub mod metastore;
+
+/// Z-order clustering kernel, re-exported for benchmarks only. Not a stable API.
+#[doc(hidden)]
+pub mod __bench_zorder {
+    pub use crate::provider::zorder::zorder_keys;
+}
 pub mod optimizer_rules;
 #[cfg(feature = "partition-table-provider")]
 pub(crate) mod partition_creator;
 pub mod provider;
+pub(crate) mod resource_starvation;
+pub mod row_converter;
 pub(crate) mod schema;
 pub mod stats;
+pub mod stats_aggregate;
 
 pub use catalog::MetadataCatalog;
 pub use catalog::{CatalogError, CatalogResult};
@@ -81,15 +92,19 @@ pub use catalog_provider::{
 };
 pub use cayenne_catalog::{CayenneCatalog, is_retryable_write_conflict};
 pub use metadata::{
-    DataFile, DeleteFile, InlinedData, InlinedDataStats, InlinedDelete, ObjectStoreConfig,
-    PartitionMetadata, TableMetadata, TableStatistics,
+    CdcDurability, DataFile, DeleteFile, InlinedData, InlinedDataStats, InlinedDelete,
+    ObjectStoreConfig, PartitionMetadata, StorageClass, TableMetadata, TableStatistics,
 };
 pub use metastore::sqlite::{SqliteAutoVacuum, SqliteMetastoreConfig, set_sqlite_metastore_config};
 pub use provider::constants::{STAGING_DIR_NAME, STAGING_WAL_FILENAME, STAGING_WAL_TMP_FILENAME};
 pub use provider::{
     CayenneCdcWrite, CayenneContext, CayenneStagedAppend, CayenneTableProvider,
     CayenneTableProviderBuilder, PARTITIONED_WAL_DIR, PartitionedWal, PartitionedWalEntry,
-    PreparedOverwrite, PreparedStagedAppend, TimeRetentionFilterBuilder,
-    set_compaction_runtime_env, set_compaction_runtime_handle, set_global_encode_concurrency,
+    PreparedOverwrite, PreparedStagedAppend, QueryObservations, SlotAdvancer,
+    TimeRetentionFilterBuilder, cap_global_encode_concurrency, deregister_query_observations,
+    global_mem_tier_total, global_qph, record_global_query, record_query_latency,
+    register_query_observations, set_compaction_runtime_env, set_compaction_runtime_handle,
+    set_cpu_burstable, set_global_encode_concurrency, set_global_mem_tier_bytes,
+    set_global_memory_budget, set_query_admission_governor, update_global_mem_tier_total,
 };
 pub use schema::transform_schema_for_vortex;

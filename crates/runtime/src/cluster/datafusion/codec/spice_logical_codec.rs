@@ -18,11 +18,7 @@ use crate::Runtime;
 use crate::cluster::datafusion::codec::udtf_args::{
     RrfArgs, TextSearchArgs, UdtfArgs, UdtfArgsExt, VectorSearchArgs,
 };
-use crate::embeddings::udtf::{
-    DistanceMetric, VectorSearchTableFunc, VectorSearchTableFuncArgs, VectorSearchUDTFProvider,
-};
-use crate::search::full_text::udtf::{TextSearchTableFunc, TextSearchTableFuncArgs};
-use crate::search::rrf::ReciprocalRankFusion;
+use crate::embeddings::udtf::{VectorSearchTableFunc, VectorSearchUDTFProvider};
 use crate::udtfs::{ListUDFTable, ListUDFTableFunc};
 use arrow_schema::SchemaRef;
 use ballista_core::serde::BallistaLogicalExtensionCodec;
@@ -36,6 +32,9 @@ use datafusion_proto::logical_plan::LogicalExtensionCodec;
 use prost::Message;
 use runtime_proto::rrf_nested_query::Query;
 use runtime_proto::udtf_args::Args;
+use runtime_search::full_text_udtf::TextSearchTableFunc;
+use runtime_search::rrf::ReciprocalRankFusion;
+use runtime_search::udtf::{DistanceMetric, TextSearchTableFuncArgs, VectorSearchTableFuncArgs};
 use search::provider::{SearchQueryProvider, UdtfSource};
 use std::collections::HashMap;
 use std::fmt::Debug;
@@ -84,6 +83,7 @@ impl SpiceLogicalCodec {
 
     /// Reconstructs a UDTF-produced `TableProvider` by re-invoking the UDTF with
     /// the serialized arguments.
+    #[expect(deprecated)] // DF54: TableFunctionImpl::call deferred (needs Session); see follow-up
     pub(crate) fn invoke_udtf(
         udtf_args: UdtfArgs,
         runtime: &Arc<Runtime>,
@@ -100,14 +100,18 @@ impl SpiceLogicalCodec {
                 udtf.call(&[])
             }
             Args::TextSearch(text_args) => {
-                let udtf = TextSearchTableFunc::new(Arc::downgrade(&runtime.df));
-                let exprs = TextSearchTableFunc::to_expr(&TextSearchTableFuncArgs {
+                let udtf = TextSearchTableFunc::new(
+                    Arc::downgrade(&runtime.df) as _,
+                    crate::search::util::RuntimeTableProviderExplorer,
+                );
+                let exprs = TextSearchTableFuncArgs {
                     tbl: SqlTableReference::parse_str(&text_args.table),
                     query: text_args.query,
                     column: text_args.column,
                     limit: text_args.limit.map(Self::limit_from_u64).transpose()?,
                     include_score: text_args.include_score,
-                });
+                }
+                .to_expr();
                 udtf.call(&exprs)
             }
             Args::VectorSearch(vector_args) => {
@@ -115,7 +119,7 @@ impl SpiceLogicalCodec {
                     Arc::downgrade(&runtime.df),
                     HashMap::new(), // explicit_pks - will be inferred from table
                 );
-                let exprs = VectorSearchTableFunc::to_expr(&VectorSearchTableFuncArgs {
+                let exprs = VectorSearchTableFuncArgs {
                     tbl: SqlTableReference::parse_str(&vector_args.table),
                     queries: vec![vector_args.query.clone()],
                     query: vector_args.query,
@@ -127,7 +131,8 @@ impl SpiceLogicalCodec {
                         .as_deref()
                         .map(DistanceMetric::parse)
                         .transpose()?,
-                })?;
+                }
+                .to_expr()?;
                 udtf.call(&exprs)
             }
             Args::Rrf(rrf_args) => Self::invoke_rrf(&rrf_args, runtime),
@@ -136,6 +141,7 @@ impl SpiceLogicalCodec {
 
     /// Reconstructs an RRF (Reciprocal Rank Fusion) `TableProvider` by re-invoking
     /// the nested search UDTFs and then the RRF UDTF.
+    #[expect(deprecated)] // DF54: TableFunctionImpl::call deferred (needs Session); see follow-up
     fn invoke_rrf(rrf_args: &RrfArgs, runtime: &Arc<Runtime>) -> Result<Arc<dyn TableProvider>> {
         use datafusion::catalog::TableFunctionImpl;
         use datafusion::logical_expr::expr::FieldMetadata;
@@ -155,33 +161,34 @@ impl SpiceLogicalCodec {
                     let Some(args) = &ts.args else {
                         return exec_err!("TextSearch nested query missing args");
                     };
-                    let text_exprs = TextSearchTableFunc::to_expr(&TextSearchTableFuncArgs {
+                    let text_exprs = TextSearchTableFuncArgs {
                         tbl: SqlTableReference::parse_str(&args.table),
                         query: args.query.clone(),
                         column: args.column.clone(),
                         limit: args.limit.map(Self::limit_from_u64).transpose()?,
                         include_score: args.include_score,
-                    });
+                    }
+                    .to_expr();
                     (text_exprs, ts.rank_weight)
                 }
                 Query::VectorSearch(vs) => {
                     let Some(args) = &vs.args else {
                         return exec_err!("VectorSearch nested query missing args");
                     };
-                    let vector_exprs =
-                        VectorSearchTableFunc::to_expr(&VectorSearchTableFuncArgs {
-                            tbl: SqlTableReference::parse_str(&args.table),
-                            queries: vec![args.query.clone()],
-                            query: args.query.clone(),
-                            column: args.column.clone(),
-                            limit: args.limit.map(Self::limit_from_u64).transpose()?,
-                            include_score: args.include_score,
-                            distance_metric: args
-                                .distance_metric
-                                .as_deref()
-                                .map(DistanceMetric::parse)
-                                .transpose()?,
-                        })?;
+                    let vector_exprs = VectorSearchTableFuncArgs {
+                        tbl: SqlTableReference::parse_str(&args.table),
+                        queries: vec![args.query.clone()],
+                        query: args.query.clone(),
+                        column: args.column.clone(),
+                        limit: args.limit.map(Self::limit_from_u64).transpose()?,
+                        include_score: args.include_score,
+                        distance_metric: args
+                            .distance_metric
+                            .as_deref()
+                            .map(DistanceMetric::parse)
+                            .transpose()?,
+                    }
+                    .to_expr()?;
                     (vector_exprs, vs.rank_weight)
                 }
             };
@@ -330,17 +337,15 @@ impl LogicalExtensionCodec for SpiceLogicalCodec {
         node: Arc<dyn TableProvider>,
         buf: &mut Vec<u8>,
     ) -> Result<()> {
-        let any = node.as_any();
-
         // Check for ListUDFTable
-        if any.downcast_ref::<ListUDFTable>().is_some() {
+        if node.downcast_ref::<ListUDFTable>().is_some() {
             let args = UdtfArgs::list_udfs();
             buf.extend_from_slice(&args.encode_to_vec());
             return Ok(());
         }
 
         // Check for SearchQueryProvider (text_search/vector_search via index)
-        if let Some(search_provider) = any.downcast_ref::<SearchQueryProvider>()
+        if let Some(search_provider) = node.downcast_ref::<SearchQueryProvider>()
             && let Some(source) = &search_provider.udtf_source
         {
             let args = match source {
@@ -378,7 +383,7 @@ impl LogicalExtensionCodec for SpiceLogicalCodec {
         }
 
         // Check for VectorSearchUDTFProvider (vector_search without index)
-        if let Some(vector_provider) = any.downcast_ref::<VectorSearchUDTFProvider>() {
+        if let Some(vector_provider) = node.downcast_ref::<VectorSearchUDTFProvider>() {
             let provider_args = vector_provider.args();
             let args = UdtfArgs::vector_search(VectorSearchArgs {
                 table: provider_args.tbl.to_string(),
@@ -395,7 +400,7 @@ impl LogicalExtensionCodec for SpiceLogicalCodec {
         }
 
         // Check for ReciprocalRankFusion (rrf)
-        if let Some(rrf_provider) = any.downcast_ref::<ReciprocalRankFusion>()
+        if let Some(rrf_provider) = node.downcast_ref::<ReciprocalRankFusion>()
             && let Some(source) = &rrf_provider.rrf_source
         {
             let args = UdtfArgs::rrf(source.clone());

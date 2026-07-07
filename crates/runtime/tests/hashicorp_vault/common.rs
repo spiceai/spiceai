@@ -34,7 +34,7 @@ const VAULT_DOCKER_CONTAINER: &str = "runtime-integration-test-vault";
 /// Pinned to a recent Vault Enterprise/OSS image; using a tagged version
 /// keeps the test reproducible if upstream bumps the `latest` tag.
 const VAULT_IMAGE: &str = "hashicorp/vault:1.18";
-const VAULT_CONTAINER_START_TIMEOUT: Duration = Duration::from_secs(180);
+const VAULT_CONTAINER_START_TIMEOUT: Duration = Duration::from_mins(3);
 const VAULT_SECRET_MOUNT_READY_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[instrument]

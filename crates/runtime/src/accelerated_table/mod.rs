@@ -15,9 +15,11 @@ limitations under the License.
 */
 
 use crate::config::ClusterRole;
+use std::collections::HashMap;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, Ordering};
+use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
-use std::{any::Any, sync::Arc, time::Duration};
 
 use crate::component::dataset::acceleration::{RefreshMode, RefreshOnStartup, ZeroResultsAction};
 use crate::component::dataset::{ReadyState, TimeFormat};
@@ -145,6 +147,15 @@ pub enum Error {
         format_datafusion_error(source)
     ))]
     FailedToWriteData { source: DataFusionError },
+
+    #[snafu(display(
+        "Failed to apply retention_sql to accelerated dataset {dataset_name} after refresh data was written: {}. The accelerated dataset may contain rows that should have been retained away.",
+        format_datafusion_error(source)
+    ))]
+    FailedToApplyRetentionSql {
+        dataset_name: String,
+        source: DataFusionError,
+    },
 
     #[snafu(display(
         "The accelerated table does not support delete operations. Use a different acceleration engine which supports delete operations. For details, visit: https://spiceai.org/docs/components/data-accelerators"
@@ -359,6 +370,7 @@ pub struct Builder {
     snapshot_refresh_state: Option<snapshots::SnapshotRefreshState>,
     metrics: Option<Metrics>,
     cpu_runtime: Option<Handle>,
+    cdc_apply_runtime: Option<Handle>,
     io_runtime: Handle,
     caching_ttl: Option<Duration>,
     caching_stale_while_revalidate_ttl: Option<Duration>,
@@ -371,6 +383,9 @@ pub struct Builder {
     cluster_role: Option<ClusterRole>,
     user_facing_schema: Option<SchemaRef>,
     accelerator_write_mutex: Arc<Mutex<()>>,
+    /// Per-dataset `cdc_*` overrides drawn from `dataset.acceleration.params`.
+    /// Layered over the process-global CDC config.
+    cdc_param_overrides: Option<Arc<HashMap<String, String>>>,
 }
 
 impl Builder {
@@ -409,6 +424,7 @@ impl Builder {
             snapshot_refresh_state: None,
             metrics: None,
             cpu_runtime: None,
+            cdc_apply_runtime: None,
             io_runtime,
             caching_ttl: None,
             caching_stale_while_revalidate_ttl: None,
@@ -420,6 +436,7 @@ impl Builder {
             cluster_role: None,
             accelerator_write_mutex: Arc::new(Mutex::new(())), // can be overridden
             user_facing_schema: None,
+            cdc_param_overrides: None,
         }
     }
 
@@ -523,6 +540,11 @@ impl Builder {
 
     pub fn cpu_runtime(&mut self, runtime: Option<Handle>) -> &mut Self {
         self.cpu_runtime = runtime;
+        self
+    }
+
+    pub fn cdc_apply_runtime(&mut self, runtime: Option<Handle>) -> &mut Self {
+        self.cdc_apply_runtime = runtime;
         self
     }
 
@@ -664,6 +686,17 @@ impl Builder {
         accelerator_write_mutex: Arc<Mutex<()>>,
     ) -> &mut Self {
         self.accelerator_write_mutex = accelerator_write_mutex;
+        self
+    }
+
+    /// Provide per-dataset `cdc_*` parameter overrides drawn from
+    /// `dataset.acceleration.params`. These layer on top of the runtime-global
+    /// CDC config only for this dataset's changes stream;
+    pub fn cdc_param_overrides(
+        &mut self,
+        overrides: Option<Arc<HashMap<String, String>>>,
+    ) -> &mut Self {
+        self.cdc_param_overrides = overrides;
         self
     }
 
@@ -828,6 +861,7 @@ impl Builder {
             Arc::clone(&refresh_params),
             Arc::clone(&self.accelerator),
             self.cpu_runtime.clone(),
+            self.cdc_apply_runtime.clone(),
             self.io_runtime.clone(),
             Arc::clone(&self.accelerator_write_mutex),
         );
@@ -855,6 +889,7 @@ impl Builder {
         }
 
         refresher.with_s3_express_acceleration(self.is_s3_express_acceleration);
+        refresher.with_cdc_param_overrides(self.cdc_param_overrides);
 
         let (refresh_handle, refresh_trigger) =
             if matches!(self.cluster_role, Some(ClusterRole::Scheduler)) {
@@ -1130,7 +1165,7 @@ impl AcceleratedTable {
         dataset_name: TableReference,
         layout: runtime_acceleration::snapshot::AccelerationLayout,
     ) {
-        let mut interval = tokio::time::interval(Duration::from_secs(60));
+        let mut interval = tokio::time::interval(Duration::from_mins(1));
 
         loop {
             interval.tick().await;
@@ -1315,10 +1350,6 @@ impl Drop for AcceleratedTable {
 
 #[async_trait]
 impl TableProvider for AcceleratedTable {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn constraints(&self) -> Option<&Constraints> {
         self.accelerator.constraints()
     }
@@ -1613,19 +1644,32 @@ impl TableProvider for AcceleratedTable {
         // Compute the target schema based on user's original projection.
         // SchemaCastScanExec strips extra columns (like _fetched_at added for caching)
         // and casts types. The schema should match what the user requested.
+        //
+        // Drop the extended-inference hints (`spice.inferred_*`) from this physical
+        // scan-output schema. They stay on the logical `TableProvider::schema()`
+        // chain — so `MetadataEnrichedTableProvider` still surfaces the inferred
+        // row-count/byte-size as table statistics and an accelerator keeps its
+        // tuning warm-start — but their values vary per table, and DataFusion
+        // builds a join's output schema by merging its inputs' schema-level
+        // metadata in input order. Leaving them here lets `join_selection`'s
+        // build/probe swap flip the surviving values, so the rule's output schema
+        // no longer equals its input and the physical-optimizer schema invariant
+        // fails. See `data_components::inferred_schema`.
+        let full_schema = self.schema();
+        let mut metadata = full_schema.metadata().clone();
+        data_components::inferred_schema::strip_inferred_metadata(&mut metadata);
         let target_schema = match projection {
             Some(indices) => {
-                let full_schema = self.schema();
                 let projected_fields: Vec<_> = indices
                     .iter()
                     .filter_map(|&i| full_schema.fields().get(i).cloned())
                     .collect();
-                Arc::new(Schema::new_with_metadata(
-                    projected_fields,
-                    full_schema.metadata().clone(),
-                ))
+                Arc::new(Schema::new_with_metadata(projected_fields, metadata))
             }
-            None => self.schema(),
+            None => Arc::new(Schema::new_with_metadata(
+                full_schema.fields().clone(),
+                metadata,
+            )),
         };
 
         Ok(Arc::new(SchemaCastScanExec::new(plan, target_schema)))

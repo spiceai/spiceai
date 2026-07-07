@@ -11,7 +11,7 @@ description: "Query: clickbench_q20"
 |               |   RepartitionExec: partitioning=RoundRobinBatch(16), input_partitions=1                          |
 |               |     SchemaCastScanExec                                                                           |
 |               |       FallbackOnZeroResultsScanExec                                                              |
-|               |         CayenneAccelerationExec                                                                  |
+|               |         CayenneAccelerationExec: snapshots_scanned=0, files_scanned=0                            |
 |               |           BytesProcessedExec                                                                     |
 |               |             EmptyExec                                                                            |
 |               |                                                                                                  |

@@ -85,7 +85,7 @@ limitations under the License.
 
 use std::hint::black_box;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use tokio::runtime::Runtime;
@@ -158,5 +158,220 @@ fn bench_checkpoint_fence_stall(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_checkpoint_fence_stall);
+// ---------------------------------------------------------------------------
+// Off-fence checkpoint: mem-tier checkpoint encode + BEGIN IMMEDIATE commit moved
+// OUTSIDE the listing fence.
+//
+// `checkpoint_mem_tier` (cdc_durability: memory) previously held
+// `listing_fence.write()` across the Vortex ENCODE and the metastore COMMIT, so
+// every concurrent CDC append (which also takes `listing_fence.write()`) stalled
+// for that full duration. The two-phase rewrite runs encode + commit off the
+// fence and takes the fence only for the in-memory swap.
+//
+// This bench measures the FENCE-HELD duration — the exact stall a concurrent
+// append sees — under each model. Work is modeled by `sleep`: an encode (~8 ms
+// for a small delta) plus a metastore commit round-trip at three deployment
+// RTTs. Single-task and deterministic (no inter-task race): the timed span is
+// purely the fence-held section.
+//
+//   - `encode_commit_under_fence/<rtt>` (OLD): fence held across encode + commit
+//     + swap  ⇒ stall ≈ encode + commit.
+//   - `swap_only_under_fence/<rtt>`     (NEW): encode + commit happen first, off
+//     the fence; fence held for the swap only  ⇒ stall ≈ µs.
+//
+// The ratio of the two lanes is the per-checkpoint append-stall reduction, which
+// recurs at the background checkpoint cadence (default 1 s) for every memory-mode
+// table — so a 10–30 ms stall removed per checkpoint is 10–30 ms of ingest
+// throughput reclaimed per table per second.
+const ENCODE: Duration = Duration::from_millis(8);
+
+// The under-fence work the new path keeps (ArcSwap publish + tier clear +
+// listing refresh) is all in-process and sub-millisecond — model it with the
+// same no-op symbol the inline-checkpoint lanes use.
+use refresh_listing_table_no_op as swap_no_op;
+
+async fn encode_commit_under_fence(fence: &RwLock<()>, commit_rtt: Duration) -> Duration {
+    let started = Instant::now();
+    let _guard = fence.write().await;
+    tokio::time::sleep(ENCODE).await; // Vortex encode — UNDER the fence (old)
+    tokio::time::sleep(commit_rtt).await; // BEGIN IMMEDIATE commit — UNDER the fence (old)
+    swap_no_op();
+    started.elapsed()
+}
+
+async fn swap_only_under_fence(fence: &RwLock<()>, commit_rtt: Duration) -> Duration {
+    tokio::time::sleep(ENCODE).await; // encode — OUTSIDE the fence (new)
+    tokio::time::sleep(commit_rtt).await; // commit — OUTSIDE the fence (new)
+    let started = Instant::now();
+    let _guard = fence.write().await; // fence taken ONLY for the swap
+    swap_no_op();
+    started.elapsed()
+}
+
+fn bench_mem_tier_checkpoint_fence_stall(c: &mut Criterion) {
+    let rt = Runtime::new().expect("tokio runtime");
+    let fence = Arc::new(RwLock::new(()));
+
+    let mut group = c.benchmark_group("mem_tier_checkpoint_fence_stall");
+    for &(label, rtt) in RTTS {
+        let fence_a = Arc::clone(&fence);
+        group.bench_with_input(
+            BenchmarkId::new("encode_commit_under_fence", label),
+            &rtt,
+            |b, &rtt| {
+                let fence = Arc::clone(&fence_a);
+                b.to_async(&rt).iter_custom(|iters| {
+                    let fence = Arc::clone(&fence);
+                    async move {
+                        let mut held = Duration::ZERO;
+                        for _ in 0..iters {
+                            held += encode_commit_under_fence(&fence, rtt).await;
+                        }
+                        // The fence-held span must cover at least the encode +
+                        // commit it serializes — guards against the model silently
+                        // measuring nothing.
+                        assert!(
+                            held >= ENCODE.saturating_mul(u32::try_from(iters).unwrap_or(u32::MAX)),
+                            "under-fence lane must hold the fence across the encode"
+                        );
+                        held
+                    }
+                });
+            },
+        );
+
+        let fence_b = Arc::clone(&fence);
+        group.bench_with_input(
+            BenchmarkId::new("swap_only_under_fence", label),
+            &rtt,
+            |b, &rtt| {
+                let fence = Arc::clone(&fence_b);
+                b.to_async(&rt).iter_custom(|iters| {
+                    let fence = Arc::clone(&fence);
+                    async move {
+                        let mut held = Duration::ZERO;
+                        for _ in 0..iters {
+                            held += swap_only_under_fence(&fence, rtt).await;
+                        }
+                        held
+                    }
+                });
+            },
+        );
+    }
+    group.finish();
+}
+
+// ---------------------------------------------------------------------------
+// Off-`write_lock` N>1 checkpoint: at N>1 (mem-tier sharding) the checkpoint used
+// to hold the table `write_lock` across the WHOLE checkpoint — the all-shards
+// capture + the off-fence Vortex ENCODE + the metastore COMMIT — for
+// deadlock-safety (a concurrent apply racing the per-shard clear). But CDC applies
+// also take `write_lock`, so at N>1 every sharded apply stalled for the full
+// encode+commit of every checkpoint — re-serializing exactly the cost the in-memory
+// tier exists to defer, and the reason order_line/stock never drained at SF1000.
+//
+// The fix holds `write_lock` ONLY for the all-shards capture and releases it before
+// the encode; the deadlock that forced the long hold is removed by PIPELINING the
+// per-shard sequence reservation (the apply reserves its (delete, data) pair once up
+// front, so `append_to_shard` never holds a publish lock across an await — the
+// clear's index-order lock walk can no longer form a cycle with an apply).
+//
+// This bench measures the WRITE_LOCK-held duration — the exact stall a concurrent
+// sharded apply sees per checkpoint — BEFORE vs AFTER. Same `sleep` model and
+// held-span methodology as the listing-fence lanes above; single-task and
+// deterministic, so the timed span is purely the write_lock-held section. The
+// all-shards capture (snapshot N `ArcSwap`s + reserve one sequence) is in-process
+// and sub-millisecond, modeled by the same no-op symbol.
+//
+//   - encode_commit_under_write_lock/<rtt> (BEFORE): write_lock held across capture
+//     + encode + commit  ⇒ sharded-apply stall ≈ encode + commit.
+//   - capture_only_under_write_lock/<rtt>  (AFTER):  write_lock held for the capture
+//     only; encode + commit run off the lock  ⇒ sharded-apply stall ≈ µs.
+//
+// The ratio of the two lanes is the per-checkpoint sharded-apply-stall reduction,
+// which recurs at the background checkpoint cadence for every N>1 memory-mode table
+// — the lever that lets the heavy CDC tables keep draining at N>1.
+use refresh_listing_table_no_op as capture_no_op;
+
+async fn encode_commit_under_write_lock(write_lock: &RwLock<()>, commit_rtt: Duration) -> Duration {
+    let started = Instant::now();
+    let _guard = write_lock.write().await;
+    capture_no_op(); // all-shards capture (snapshot + seq reserve) — UNDER write_lock
+    tokio::time::sleep(ENCODE).await; // Vortex encode — UNDER write_lock (before)
+    tokio::time::sleep(commit_rtt).await; // BEGIN IMMEDIATE commit — UNDER write_lock (before)
+    started.elapsed()
+}
+
+async fn capture_only_under_write_lock(write_lock: &RwLock<()>, _commit_rtt: Duration) -> Duration {
+    // Real after-flow: acquire write_lock → capture → RELEASE → encode → commit. The
+    // sharded-apply stall is the write_lock-held capture window only; the encode +
+    // commit that follow run with write_lock free (concurrent applies proceed), so
+    // they do not count toward the stall — mirror `swap_only_under_fence` and time
+    // just the held span.
+    let started = Instant::now();
+    let _guard = write_lock.write().await; // write_lock taken ONLY for the capture
+    capture_no_op();
+    started.elapsed() // guard drops here; encode + commit are off-lock
+}
+
+fn bench_mem_tier_checkpoint_write_lock_stall(c: &mut Criterion) {
+    let rt = Runtime::new().expect("tokio runtime");
+    let write_lock = Arc::new(RwLock::new(()));
+
+    let mut group = c.benchmark_group("mem_tier_checkpoint_write_lock_stall");
+    for &(label, rtt) in RTTS {
+        let wl_a = Arc::clone(&write_lock);
+        group.bench_with_input(
+            BenchmarkId::new("encode_commit_under_write_lock", label),
+            &rtt,
+            |b, &rtt| {
+                let write_lock = Arc::clone(&wl_a);
+                b.to_async(&rt).iter_custom(|iters| {
+                    let write_lock = Arc::clone(&write_lock);
+                    async move {
+                        let mut held = Duration::ZERO;
+                        for _ in 0..iters {
+                            held += encode_commit_under_write_lock(&write_lock, rtt).await;
+                        }
+                        // The before lane must hold write_lock across at least the
+                        // encode it serializes — guards the model from measuring nothing.
+                        assert!(
+                            held >= ENCODE.saturating_mul(u32::try_from(iters).unwrap_or(u32::MAX)),
+                            "before lane must hold write_lock across the encode"
+                        );
+                        held
+                    }
+                });
+            },
+        );
+
+        let wl_b = Arc::clone(&write_lock);
+        group.bench_with_input(
+            BenchmarkId::new("capture_only_under_write_lock", label),
+            &rtt,
+            |b, &rtt| {
+                let write_lock = Arc::clone(&wl_b);
+                b.to_async(&rt).iter_custom(|iters| {
+                    let write_lock = Arc::clone(&write_lock);
+                    async move {
+                        let mut held = Duration::ZERO;
+                        for _ in 0..iters {
+                            held += capture_only_under_write_lock(&write_lock, rtt).await;
+                        }
+                        held
+                    }
+                });
+            },
+        );
+    }
+    group.finish();
+}
+
+criterion_group!(
+    benches,
+    bench_checkpoint_fence_stall,
+    bench_mem_tier_checkpoint_fence_stall,
+    bench_mem_tier_checkpoint_write_lock_stall
+);
 criterion_main!(benches);

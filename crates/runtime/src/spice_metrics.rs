@@ -101,8 +101,8 @@ pub async fn register_metrics_table(
     let retention = Retention::builder()
         .time_column(Some("time_unix_nano"))
         .time_format(Some(TimeFormat::Timestamptz))
-        .time_period(Some(Duration::from_secs(1800))) // delete metrics older than 30 minutes
-        .check_interval(Some(Duration::from_secs(300))) // run retention every 5 minutes
+        .time_period(Some(Duration::from_mins(30))) // delete metrics older than 30 minutes
+        .check_interval(Some(Duration::from_mins(5))) // run retention every 5 minutes
         .enabled(true)
         .build();
 

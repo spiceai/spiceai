@@ -26,7 +26,7 @@ use std::path::PathBuf;
 use std::time::{Duration, SystemTime};
 
 /// Cache validity duration for version checks.
-const VERSION_CACHE_DURATION: Duration = Duration::from_secs(24 * 60 * 60); // 24 hours
+const VERSION_CACHE_DURATION: Duration = Duration::from_hours(24); // 24 hours
 
 /// Arguments for the version command.
 #[derive(Args, Debug)]

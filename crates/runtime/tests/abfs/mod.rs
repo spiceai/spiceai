@@ -19,7 +19,10 @@ limitations under the License.
 //! These tests verify the Azure Blob Storage integration, including patches from
 //! the `spiceai/arrow-rs` fork that optimize Parquet reading on Azure.
 
-use crate::{RecordBatch, init_tracing, utils::test_request_context};
+use crate::{
+    RecordBatch, init_tracing,
+    utils::{register_test_connectors, test_request_context},
+};
 
 use anyhow::anyhow;
 use app::AppBuilder;
@@ -37,8 +40,8 @@ use crate::{
     docker::{ContainerRunnerBuilder, RunningContainer, wait_for_tcp_port},
 };
 
-const AZURITE_CONTAINER_START_TIMEOUT: Duration = Duration::from_secs(180);
-const AZURITE_HOST_PORT_READY_TIMEOUT: Duration = Duration::from_secs(60);
+const AZURITE_CONTAINER_START_TIMEOUT: Duration = Duration::from_mins(3);
+const AZURITE_HOST_PORT_READY_TIMEOUT: Duration = Duration::from_mins(1);
 
 #[instrument]
 pub async fn start_azurite_docker_container() -> Result<RunningContainer<'static>, anyhow::Error> {
@@ -145,13 +148,14 @@ async fn run_queries() -> Result<(), anyhow::Error> {
         .build();
 
     configure_test_datafusion();
+    register_test_connectors().await;
     let rt = Runtime::builder().with_app(app).build().await;
 
     let cloned_rt = Arc::new(rt.clone());
 
     // Set a timeout for the test
     tokio::select! {
-        () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+        () = tokio::time::sleep(std::time::Duration::from_mins(1)) => {
             return Err(anyhow!("Timed out waiting for datasets to load".to_string()));
         }
         () = cloned_rt.load_components() => {}
@@ -276,11 +280,12 @@ async fn run_parquet_query_with_meta() -> Result<(), anyhow::Error> {
         .build();
 
     configure_test_datafusion();
+    register_test_connectors().await;
     let rt = Runtime::builder().with_app(app).build().await;
     let cloned_rt = Arc::new(rt.clone());
 
     tokio::select! {
-        () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+        () = tokio::time::sleep(std::time::Duration::from_mins(1)) => {
             return Err(anyhow!("Timed out waiting for datasets to load"));
         }
         () = cloned_rt.load_components() => {}

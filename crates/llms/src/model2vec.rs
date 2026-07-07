@@ -35,7 +35,9 @@ use util::home_dir::home_dir;
 /// transformer models into static word embeddings.
 pub struct Model2Vec {
     pub name: String,
-    model: StaticModel,
+    // `Arc` so the model can be shared into `spawn_blocking` to run the
+    // (CPU-bound, synchronous) forward pass off the async runtime thread.
+    model: Arc<StaticModel>,
 
     // Bound on model instantiation
     normalize: Option<bool>,
@@ -101,7 +103,7 @@ impl Model2Vec {
 
         let model2vec = Self {
             name,
-            model,
+            model: Arc::new(model),
             normalize,
             parallelism,
             embed_max_token_length,
@@ -180,6 +182,34 @@ impl Debug for Model2Vec {
     }
 }
 
+/// Run the `Model2Vec` forward pass. Synchronous and CPU-bound — callers on the
+/// async runtime must invoke this via `spawn_blocking`.
+fn encode_with_static_model(
+    model: &StaticModel,
+    input: EmbeddingInput,
+    model_name: &str,
+    max_token_length: Option<usize>,
+    batch_size: usize,
+) -> Result<Vec<Vec<f32>>, super::embeddings::Error> {
+    let embedding_input = match input {
+        EmbeddingInput::String(s) => vec![s],
+        EmbeddingInput::StringArray(sentences) => sentences,
+        _ => {
+            return Err(UnsupportedEmbeddingInput {
+                model: model_name.to_string(),
+                message: "Model2Vec models only support strings or vectors of strings".to_string(),
+            });
+        }
+    };
+
+    if embedding_input.is_empty() {
+        tracing::debug!("Embedding input is empty, returning empty vector");
+        return Ok(vec![]);
+    }
+
+    Ok(model.encode_with_args(&embedding_input, max_token_length, batch_size))
+}
+
 #[async_trait]
 impl Embed for Model2Vec {
     fn cache(&self) -> Option<Arc<dyn CacheProvider<CachedEmbeddingResult> + Send + Sync>> {
@@ -206,7 +236,28 @@ impl Embed for Model2Vec {
             return Ok(cached);
         }
 
-        let vectors = self.embed_sync(input.clone())?;
+        // The forward pass is CPU-bound and synchronous; run it on the blocking
+        // pool so it doesn't stall the async runtime thread (which also serves
+        // `/health`, `/v1/embeddings`, etc.).
+        let model = Arc::clone(&self.model);
+        let model_name = self.name.clone();
+        let max_token_length = self.embed_max_token_length;
+        let batch_size = self.embed_custom_batch_size.unwrap_or(1024);
+        // `cache_key` borrows `input`, so hand the blocking task an owned clone.
+        let owned_input = input.clone();
+        let vectors = tokio::task::spawn_blocking(move || {
+            encode_with_static_model(
+                &model,
+                owned_input,
+                &model_name,
+                max_token_length,
+                batch_size,
+            )
+        })
+        .await
+        .map_err(|e| super::embeddings::Error::FailedToCreateEmbedding {
+            source: Box::new(e),
+        })??;
 
         if let Some(key) = cache_key {
             self.put_cached_embed(key, CachedEmbeddingResult::Vector(vectors.clone()))
@@ -217,28 +268,13 @@ impl Embed for Model2Vec {
     }
 
     fn embed_sync(&self, input: EmbeddingInput) -> Result<Vec<Vec<f32>>, super::embeddings::Error> {
-        let embedding_input = match input {
-            EmbeddingInput::String(s) => vec![s],
-            EmbeddingInput::StringArray(sentences) => sentences,
-            _ => {
-                return Err(UnsupportedEmbeddingInput {
-                    model: self.name.clone(),
-                    message: "Model2Vec models only support strings or vectors of strings"
-                        .to_string(),
-                });
-            }
-        };
-
-        if embedding_input.is_empty() {
-            tracing::debug!("Embedding input is empty, returning empty vector");
-            return Ok(vec![]);
-        }
-
-        Ok(self.model.encode_with_args(
-            &embedding_input,
+        encode_with_static_model(
+            &self.model,
+            input,
+            &self.name,
             self.embed_max_token_length,
             self.embed_custom_batch_size.unwrap_or(1024),
-        ))
+        )
     }
 
     fn supports_sync_embeddings(&self) -> bool {

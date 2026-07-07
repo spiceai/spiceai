@@ -100,7 +100,7 @@ mod embeddings {
             .scope(async {
                 run_beta_functionality_criteria_test(
                     create_local_embedding_from_hf("intfloat/e5-small-v2", "hf_e5").await?,
-                    Duration::from_secs(3 * 60),
+                    Duration::from_mins(3),
                 )
                 .await
             })

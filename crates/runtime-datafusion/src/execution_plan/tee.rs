@@ -23,7 +23,6 @@ use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, ExecutionPlanProperties, Partitioning,
     PlanProperties,
 };
-use std::any::Any;
 use std::fmt;
 use std::sync::Arc;
 
@@ -33,7 +32,7 @@ pub struct TeeExec {
     input: Arc<dyn ExecutionPlan>,
     /// The number of times to duplicate the output.
     n: usize,
-    properties: PlanProperties,
+    properties: Arc<PlanProperties>,
 }
 
 impl TeeExec {
@@ -45,12 +44,12 @@ impl TeeExec {
         Self {
             input,
             n,
-            properties: PlanProperties::new(
+            properties: Arc::new(PlanProperties::new(
                 eq_properties,
                 Partitioning::UnknownPartitioning(n),
                 emission_type,
                 boundedness,
-            ),
+            )),
         }
     }
 }
@@ -73,15 +72,11 @@ impl ExecutionPlan for TeeExec {
         "TeeExec"
     }
 
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema(&self) -> SchemaRef {
         self.input.schema()
     }
 
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
     }
 

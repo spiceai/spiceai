@@ -26,7 +26,6 @@ limitations under the License.
 //! `DistributedCayenneInsertExec`, `DistributedCayenneMergeExec` forward DML SQL
 //! verbatim to all connected executor nodes via `FlightSQL`.
 
-use std::any::Any;
 use std::fmt;
 use std::fmt::Write as _;
 use std::sync::Arc;
@@ -65,13 +64,13 @@ fn dml_count_schema() -> SchemaRef {
     )]))
 }
 
-fn ddl_plan_properties(schema: SchemaRef) -> PlanProperties {
-    PlanProperties::new(
+fn ddl_plan_properties(schema: SchemaRef) -> Arc<PlanProperties> {
+    Arc::new(PlanProperties::new(
         EquivalenceProperties::new(schema),
         Partitioning::UnknownPartitioning(1),
         EmissionType::Final,
         Boundedness::Bounded,
-    )
+    ))
 }
 
 // ── Executor forwarding helpers ───────────────────────────────────────────────
@@ -182,7 +181,7 @@ pub struct DistributedCayenneCreateTableExec {
     arrow_schema_for_fwd: Arc<arrow::datatypes::Schema>,
     primary_key_for_fwd: Vec<String>,
     runtime_env: Arc<datafusion::execution::runtime_env::RuntimeEnv>,
-    properties: PlanProperties,
+    properties: Arc<PlanProperties>,
 }
 
 impl fmt::Debug for DistributedCayenneCreateTableExec {
@@ -235,10 +234,7 @@ impl ExecutionPlan for DistributedCayenneCreateTableExec {
     fn name(&self) -> &'static str {
         "DistributedCayenneCreateTableExec"
     }
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
     }
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
@@ -443,7 +439,7 @@ pub struct DistributedCayenneDropTableExec {
     df_schema_name: String,
     catalog_list: Arc<dyn CatalogProviderList>,
     executor_registry: Arc<ExecutorRegistry>,
-    properties: PlanProperties,
+    properties: Arc<PlanProperties>,
 }
 
 impl fmt::Debug for DistributedCayenneDropTableExec {
@@ -492,10 +488,7 @@ impl ExecutionPlan for DistributedCayenneDropTableExec {
     fn name(&self) -> &'static str {
         "DistributedCayenneDropTableExec"
     }
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
     }
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
@@ -586,7 +579,7 @@ pub struct DistributedCayenneCreateSchemaExec {
     catalog_name: String,
     catalog_list: Arc<dyn CatalogProviderList>,
     executor_registry: Arc<ExecutorRegistry>,
-    properties: PlanProperties,
+    properties: Arc<PlanProperties>,
 }
 
 impl fmt::Debug for DistributedCayenneCreateSchemaExec {
@@ -633,10 +626,7 @@ impl ExecutionPlan for DistributedCayenneCreateSchemaExec {
     fn name(&self) -> &'static str {
         "DistributedCayenneCreateSchemaExec"
     }
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
     }
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
@@ -710,7 +700,7 @@ pub struct DistributedCayenneDeleteExec {
     executor_registry: Arc<ExecutorRegistry>,
     filter_sql: Option<String>,
     input: Arc<dyn ExecutionPlan>,
-    properties: PlanProperties,
+    properties: Arc<PlanProperties>,
 }
 
 impl fmt::Debug for DistributedCayenneDeleteExec {
@@ -752,10 +742,7 @@ impl ExecutionPlan for DistributedCayenneDeleteExec {
     fn name(&self) -> &'static str {
         "DistributedCayenneDeleteExec"
     }
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
     }
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
@@ -810,7 +797,7 @@ pub struct DistributedCayenneUpdateExec {
     filter_sql: Option<String>,
     assignments_sql: Vec<(String, String)>,
     input: Arc<dyn ExecutionPlan>,
-    properties: PlanProperties,
+    properties: Arc<PlanProperties>,
 }
 
 impl fmt::Debug for DistributedCayenneUpdateExec {
@@ -853,10 +840,7 @@ impl ExecutionPlan for DistributedCayenneUpdateExec {
     fn name(&self) -> &'static str {
         "DistributedCayenneUpdateExec"
     }
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
     }
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
@@ -923,7 +907,7 @@ pub struct DistributedCayenneInsertExec {
     ctx: Arc<datafusion::prelude::SessionContext>,
     io_runtime: tokio::runtime::Handle,
     input: Arc<dyn ExecutionPlan>,
-    properties: PlanProperties,
+    properties: Arc<PlanProperties>,
 }
 
 impl fmt::Debug for DistributedCayenneInsertExec {
@@ -966,10 +950,7 @@ impl ExecutionPlan for DistributedCayenneInsertExec {
     fn name(&self) -> &'static str {
         "DistributedCayenneInsertExec"
     }
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
     }
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
@@ -1093,7 +1074,7 @@ pub struct DistributedCayenneMergeExec {
     original_sql: String,
     executor_registry: Arc<ExecutorRegistry>,
     ctx: Arc<datafusion::prelude::SessionContext>,
-    properties: PlanProperties,
+    properties: Arc<PlanProperties>,
 }
 
 impl fmt::Debug for DistributedCayenneMergeExec {
@@ -1143,10 +1124,8 @@ impl ExecutionPlan for DistributedCayenneMergeExec {
     fn name(&self) -> &'static str {
         "DistributedCayenneMergeExec"
     }
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-    fn properties(&self) -> &PlanProperties {
+
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
     }
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {

@@ -117,6 +117,11 @@ impl Catalog for RestCatalog {
         self.inner.drop_table(table).await
     }
 
+    /// Drop a table from the catalog and delete the underlying table data.
+    async fn purge_table(&self, table: &TableIdent) -> IcebergResult<()> {
+        self.inner.purge_table(table).await
+    }
+
     /// Check if a table exists in the catalog.
     async fn table_exists(&self, table: &TableIdent) -> IcebergResult<bool> {
         self.inner.table_exists(table).await
@@ -156,7 +161,6 @@ mod tests {
         let catalog = RestCatalog::new(
             RestCatalogBuilder::default()
                 .with_storage_factory(Arc::new(OpenDalStorageFactory::S3 {
-                    configured_scheme: "s3".to_string(),
                     customized_credential_load: None,
                 }))
                 .load(
@@ -189,8 +193,9 @@ mod tests {
             .await;
         println!("{tables:?}");
 
+        let catalog = Arc::new(catalog) as Arc<dyn Catalog>;
         let df_table_provider = IcebergTableProvider::try_new(
-            Arc::new(catalog),
+            catalog,
             NamespaceIdent::new("nyc".to_string()),
             "taxis".to_string(),
         )

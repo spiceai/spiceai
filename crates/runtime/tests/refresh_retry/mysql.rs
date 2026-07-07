@@ -108,7 +108,6 @@ async fn create_refresh_task(
         .map_err(|e| e.to_string())?;
 
     let accelerated_table = table
-        .as_any()
         .downcast_ref::<AcceleratedTable>()
         .ok_or("table is not an AcceleratedTable")?;
 
@@ -136,7 +135,6 @@ async fn get_accelerator(rt: &Runtime, table_name: &str) -> Result<Arc<dyn Table
         .map_err(|e| e.to_string())?;
 
     let accelerated_table = table
-        .as_any()
         .downcast_ref::<AcceleratedTable>()
         .ok_or("table is not an AcceleratedTable")?;
 
@@ -179,7 +177,7 @@ async fn mysql_refresh_retries() -> Result<(), String> {
             let cloned_rt = Arc::new(rt.clone());
 
             tokio::select! {
-                () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+                () = tokio::time::sleep(std::time::Duration::from_mins(1)) => {
                     return Err("Timed out waiting for datasets to load".to_string());
                 }
                 () = cloned_rt.load_components() => {}

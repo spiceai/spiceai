@@ -270,6 +270,8 @@ async fn test_delete_file_roundtrip_impl(fixture: TestFixture) -> TestResult<()>
             source_data_file_path: Some(format!("data_{i}.parquet")),
             deletion_type: DeletionType::default(),
             sequence_number: i,
+            // Position-format file: carries no keys, so no re-insert sequence.
+            reinsert_sequence: None,
         };
 
         let id = fixture.catalog.add_delete_file(delete_file).await?;

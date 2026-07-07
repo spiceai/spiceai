@@ -487,7 +487,7 @@ async fn embed_column(
     let mut nulls = Vec::new();
     let mut column = Vec::new();
     for (i, o) in data.enumerate() {
-        if o.is_none() || o.is_some_and(str::is_empty) {
+        if o.is_none_or(str::is_empty) {
             nulls.push(i);
         } else if let Some(s) = o {
             column.push(s.to_string());

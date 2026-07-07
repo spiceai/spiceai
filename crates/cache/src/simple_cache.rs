@@ -169,7 +169,9 @@ impl<
         };
         let table_name = Arc::clone(table_name);
         self.cache
-            .invalidate_entries_if(move |_key, value| value.as_table_refs().contains(&table_ref))
+            .invalidate_entries_if(move |_key, value| {
+                crate::resolved_table_match(value.as_table_refs().as_ref(), &table_ref)
+            })
             .context(FailedToInvalidateCacheSnafu { table_name })?;
 
         Ok(())
@@ -229,7 +231,7 @@ mod tests {
         #[case] hasher: T,
     ) {
         let cache: SimpleCache<CachedQueryResult, _, _> =
-            SimpleCache::new(10, Duration::from_secs(60), hasher);
+            SimpleCache::new(10, Duration::from_mins(1), hasher);
         let key = CacheKey::Query("test_query", None).as_raw_key(cache.hasher());
         let result = create_test_cached_result().await;
 
@@ -259,7 +261,7 @@ mod tests {
         #[case] hasher: T,
     ) {
         let cache: SimpleCache<CachedQueryResult, _, _> =
-            SimpleCache::new(10, Duration::from_secs(60), hasher);
+            SimpleCache::new(10, Duration::from_mins(1), hasher);
         let key = CacheKey::Query("nonexistent_query", None).as_raw_key(cache.hasher());
 
         // Try to get a non-existent key
@@ -281,7 +283,7 @@ mod tests {
         #[case] hasher: T,
     ) {
         let cache: SimpleCache<CachedQueryResult, _, _> =
-            SimpleCache::new(10, Duration::from_secs(60), hasher);
+            SimpleCache::new(10, Duration::from_mins(1), hasher);
         let result = create_test_cached_result().await;
 
         // Put a value in the cache

@@ -52,7 +52,7 @@ async fn spiceai_integration_test_catalog() -> Result<(), anyhow::Error> {
             let cloned_rt = Arc::clone(&rt);
 
             tokio::select! {
-                () = tokio::time::sleep(std::time::Duration::from_secs(120)) => {
+                () = tokio::time::sleep(std::time::Duration::from_mins(2)) => {
                     panic!("Timeout waiting for components to load");
                 }
                 () = cloned_rt.load_components() => {}
@@ -109,7 +109,7 @@ async fn spiceai_integration_test_catalog_include() -> Result<(), anyhow::Error>
             let cloned_rt = Arc::clone(&rt);
 
             tokio::select! {
-                () = tokio::time::sleep(std::time::Duration::from_secs(120)) => {
+                () = tokio::time::sleep(std::time::Duration::from_mins(2)) => {
                     panic!("Timeout waiting for components to load");
                 }
                 () = cloned_rt.load_components() => {}

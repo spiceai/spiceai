@@ -68,6 +68,7 @@ fn spice_array_fn_to_sql(
                         Some(num_elements),
                     )),
                     kind: ast::CastKind::DoubleColon,
+                    array: false,
                     format: None,
                 })
             }
@@ -85,6 +86,7 @@ fn spice_array_fn_to_sql(
                         Some(num_elements),
                     )),
                     kind: ast::CastKind::DoubleColon,
+                    array: false,
                     format: None,
                 })
             }
@@ -162,6 +164,7 @@ pub(crate) fn array_distance_to_sql(
                 Some(n),
             )),
             kind: ast::CastKind::DoubleColon,
+            array: false,
             format: None,
         }
     };
@@ -227,82 +230,74 @@ pub(super) enum DuckDBRegexpFunction {
 impl DuckDBRegexpFunction {
     fn process_args(&self, ast_args: &mut Vec<FunctionArg>) -> Result<(), DataFusionError> {
         match self {
-            DuckDBRegexpFunction::Match => {
-                if ast_args.len() == 3 {
-                    // regexp_extract has 4 positional args, position 3 = group not flags
-                    // bump flags to 4, insert default 0 group
-                    ast_args.insert(
-                        2,
-                        FunctionArg::Unnamed(FunctionArgExpr::Expr(ast::Expr::Value(
-                            ValueWithSpan {
-                                value: sqlparser::ast::Value::Number("0".to_string(), false),
-                                span: sqlparser::tokenizer::Span::empty(),
-                            },
-                        ))),
-                    );
-                }
+            DuckDBRegexpFunction::Match if ast_args.len() == 3 => {
+                // regexp_extract has 4 positional args, position 3 = group not flags
+                // bump flags to 4, insert default 0 group
+                ast_args.insert(
+                    2,
+                    FunctionArg::Unnamed(FunctionArgExpr::Expr(ast::Expr::Value(ValueWithSpan {
+                        value: sqlparser::ast::Value::Number("0".to_string(), false),
+                        span: sqlparser::tokenizer::Span::empty(),
+                    }))),
+                );
             }
-            DuckDBRegexpFunction::Count => {
-                if ast_args.len() == 3 {
-                    // arg #3 is start position
-                    // DuckDB has no equivalent for column or function name, but we can use list slicing if an integer start is specified
-                    let Some(start_arg) = ast_args.get(2) else {
-                        unreachable!("start_arg should be present")
-                    };
+            DuckDBRegexpFunction::Count if ast_args.len() == 3 => {
+                // arg #3 is start position
+                // DuckDB has no equivalent for column or function name, but we can use list slicing if an integer start is specified
+                let Some(start_arg) = ast_args.get(2) else {
+                    unreachable!("start_arg should be present")
+                };
 
-                    match start_arg {
-                        FunctionArg::Unnamed(FunctionArgExpr::Expr(ast::Expr::Value(
-                            ValueWithSpan {
-                                value: sqlparser::ast::Value::Number(num_str, _),
-                                ..
-                            },
-                        ))) => {
-                            let start: u64 = num_str.parse().map_err(|e| {
+                match start_arg {
+                    FunctionArg::Unnamed(FunctionArgExpr::Expr(ast::Expr::Value(
+                        ValueWithSpan {
+                            value: sqlparser::ast::Value::Number(num_str, _),
+                            ..
+                        },
+                    ))) => {
+                        let start: u64 = num_str.parse().map_err(|e| {
                             DataFusionError::Plan(format!(
                                 "Could not parse start position {num_str} as integer for function {}: {e}", self.federated_function_name()
                             ))
                         })?;
-                            // DuckDB uses 0-based indexing, DataFusion uses 1-based indexing
-                            if start < 1 {
-                                return Err(DataFusionError::Plan(format!(
-                                    "Start position must be a positive integer for regular expression function {}, received {start}",
-                                    self.federated_function_name()
-                                )));
-                            }
-                            let duckdb_start = start - 1;
-                            ast_args.remove(2);
-
-                            // wrap the input column/value with a substring. ``substring(string, start[, length])``
-                            // length can be omitted as only the start value is specified
-                            let Some(FunctionArg::Unnamed(FunctionArgExpr::Expr(expr))) =
-                                ast_args.first()
-                            else {
-                                unreachable!("input_arg should be present")
-                            };
-
-                            ast_args[0] =
-                                FunctionArg::Unnamed(FunctionArgExpr::Expr(ast::Expr::Substring {
-                                    expr: Box::new(expr.clone()),
-                                    substring_from: Some(Box::new(ast::Expr::Value(
-                                        ValueWithSpan {
-                                            value: sqlparser::ast::Value::Number(
-                                                duckdb_start.to_string(),
-                                                false,
-                                            ),
-                                            span: sqlparser::tokenizer::Span::empty(),
-                                        },
-                                    ))),
-                                    substring_for: None,
-                                    special: true,
-                                    shorthand: false,
-                                }));
-                        }
-                        _ => {
+                        // DuckDB uses 0-based indexing, DataFusion uses 1-based indexing
+                        if start < 1 {
                             return Err(DataFusionError::Plan(format!(
-                                "Only integer start positions are supported for regular expression function {} with DuckDB",
+                                "Start position must be a positive integer for regular expression function {}, received {start}",
                                 self.federated_function_name()
                             )));
                         }
+                        let duckdb_start = start - 1;
+                        ast_args.remove(2);
+
+                        // wrap the input column/value with a substring. ``substring(string, start[, length])``
+                        // length can be omitted as only the start value is specified
+                        let Some(FunctionArg::Unnamed(FunctionArgExpr::Expr(expr))) =
+                            ast_args.first()
+                        else {
+                            unreachable!("input_arg should be present")
+                        };
+
+                        ast_args[0] =
+                            FunctionArg::Unnamed(FunctionArgExpr::Expr(ast::Expr::Substring {
+                                expr: Box::new(expr.clone()),
+                                substring_from: Some(Box::new(ast::Expr::Value(ValueWithSpan {
+                                    value: sqlparser::ast::Value::Number(
+                                        duckdb_start.to_string(),
+                                        false,
+                                    ),
+                                    span: sqlparser::tokenizer::Span::empty(),
+                                }))),
+                                substring_for: None,
+                                special: true,
+                                shorthand: false,
+                            }));
+                    }
+                    _ => {
+                        return Err(DataFusionError::Plan(format!(
+                            "Only integer start positions are supported for regular expression function {} with DuckDB",
+                            self.federated_function_name()
+                        )));
                     }
                 }
             }

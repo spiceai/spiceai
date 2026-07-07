@@ -19,15 +19,17 @@ use std::{collections::HashMap, sync::Arc};
 use app::App;
 
 use datafusion::{
-    execution::FunctionRegistry,
+    execution::TaskContext,
     logical_expr::Expr,
     sql::{ResolvedTableReference, TableReference},
 };
 use datafusion_proto::bytes::Serializeable;
 use runtime_datafusion::{SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA};
+
 use runtime_proto::{
     AllocateInitialPartitionsRequest, cluster_service_client::ClusterServiceClient,
 };
+use runtime_query_engine::query_engine::QueryEngine;
 use snafu::prelude::*;
 use spicepod::partitioning::PartitionedBy;
 use tonic::transport::Channel;
@@ -125,7 +127,7 @@ pub fn validate_partition_keys(app: &App) -> Result<()> {
 /// startup window the answer is `Some(table)`; the caller should defer.
 pub async fn first_unready_accelerated_table(
     app: &Arc<App>,
-    df: &crate::datafusion::DataFusion,
+    df: &dyn QueryEngine,
 ) -> Option<TableReference> {
     // Collect without holding any external lock — the caller is expected to
     // pass an already-snapshotted `Arc<App>` so we don't hold an async
@@ -177,7 +179,7 @@ pub fn accelerated_tables(app: &Arc<App>) -> HashMap<TableReference, Vec<Partiti
 pub async fn executor_request_initial_partitions(
     mut client: ClusterServiceClient<Channel>,
     executor_url: String,
-    registry: &(dyn FunctionRegistry + Send + Sync),
+    task_ctx: &TaskContext,
 ) -> Result<HashMap<ResolvedTableReference, Vec<Expr>>> {
     let response = client
         .allocate_initial_partitions(AllocateInitialPartitionsRequest { executor_url })
@@ -193,7 +195,7 @@ pub async fn executor_request_initial_partitions(
         let mut exprs = Vec::new();
 
         for item in partitions.items {
-            let expr = Expr::from_bytes_with_registry(&item, registry)
+            let expr = Expr::from_bytes_with_ctx(&item, task_ctx)
                 .context(PartitionExpressionDeserializationSnafu)?;
             exprs.push(expr);
         }

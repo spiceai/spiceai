@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::{any::Any, sync::Arc};
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use dashmap::DashMap;
@@ -53,10 +53,6 @@ impl Default for SpiceSchemaProvider {
 
 #[async_trait]
 impl SchemaProvider for SpiceSchemaProvider {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn table_names(&self) -> Vec<String> {
         self.tables
             .iter()

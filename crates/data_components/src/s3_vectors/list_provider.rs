@@ -13,7 +13,7 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
-use std::{any::Any, sync::Arc};
+use std::sync::Arc;
 
 use crate::s3_vectors::{
     S3_VECTOR_EMBEDDING_NAME, S3_VECTOR_PRIMARY_KEY_NAME,
@@ -63,10 +63,6 @@ impl S3VectorsListTable {
 
 #[async_trait]
 impl TableProvider for S3VectorsListTable {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema(&self) -> SchemaRef {
         Arc::clone(&self.0.schema)
     }
@@ -110,7 +106,7 @@ impl std::fmt::Debug for S3VectorsListExec {
 pub(super) struct S3VectorsListExec {
     idx: Arc<S3VectorIdentifier>,
     client: Arc<dyn S3Vectors + Send + Sync>,
-    plan_properties: PlanProperties,
+    plan_properties: Arc<PlanProperties>,
     limit: Option<usize>,
 }
 
@@ -128,12 +124,12 @@ impl S3VectorsListExec {
     ) -> Self {
         let projected_schema =
             project_schema(&table.schema, projection).unwrap_or_else(|_| Arc::clone(&table.schema));
-        let properties = PlanProperties::new(
+        let properties = Arc::new(PlanProperties::new(
             EquivalenceProperties::new(projected_schema),
             Partitioning::UnknownPartitioning(1),
             EmissionType::Incremental,
             Boundedness::Bounded,
-        );
+        ));
 
         Self {
             idx: Arc::clone(&table.idx),
@@ -149,11 +145,7 @@ impl ExecutionPlan for S3VectorsListExec {
         "S3VectorsListExec"
     }
 
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.plan_properties
     }
 

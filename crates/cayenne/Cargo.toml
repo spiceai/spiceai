@@ -16,7 +16,6 @@ datafusion-dml = { path = "../datafusion-dml" }
 regex = "1.12.3"
 arrow-flight = { workspace = true }
 arrow-ipc = { workspace = true }
-arrow-row = { workspace = true }
 arrow-schema = { workspace = true }
 async-stream = { workspace = true }
 async-trait = { workspace = true }
@@ -32,6 +31,7 @@ datafusion-execution = { workspace = true }
 datafusion-expr = { workspace = true }
 datafusion-physical-expr = { workspace = true }
 datafusion-physical-plan = { workspace = true }
+datafusion-pruning = { workspace = true }
 datafusion-table-providers = { workspace = true }
 futures = { workspace = true }
 hash-index = { path = "../hash-index" }
@@ -60,10 +60,19 @@ flatbuffers = { workspace = true }
 # enabled transitively by vortex-datafusion; naming it here keeps cayenne
 # building if that ever changes.
 vortex = { workspace = true, features = ["files"] }
+# `vortex-btrblocks` exposes the BtrBlocks compressor builder and the concrete
+# compression-scheme types (provider/delta_encoding.rs maps encoding levels to
+# scheme subsets). It is pulled transitively by vortex but with no features, so
+# name it directly to make the scheme types addressable. The `zstd` feature is
+# required for `schemes::string::ZstdScheme`, which the `compression_strategy=
+# zstd` full-tier strategy registers (the vortex umbrella's own `zstd` feature
+# does NOT turn on `vortex-btrblocks/zstd`).
+vortex-btrblocks = { workspace = true, features = ["zstd"] }
 vortex-datafusion = { workspace = true }
 vortex-scan = { workspace = true }
 vortex-session = { workspace = true }
 duckdb = { workspace = true, features = ["bundled"], optional = true }
+chdb-rust = { version = "1", optional = true }
 # Force aegis to use pure-rust implementation for ARM64 builds to avoid C compilation issues
 [target.'cfg(all(target_arch = "aarch64", target_os = "linux"))'.dependencies]
 aegis = { version = "0.9.3", default-features = false, features = [
@@ -71,15 +80,34 @@ aegis = { version = "0.9.3", default-features = false, features = [
     "pure-rust",
 ] }
 
+# Ordering-tier fsync on the staged-commit hot path (provider/fsync_tier.rs):
+# on macOS both std `sync_all` AND `sync_data` are fcntl(F_FULLFSYNC) (~4-5 ms
+# per call, measured), so the plain-fsync ordering tier needs a direct
+# libc::fsync. See the module docs for the durability rationale.
+[target.'cfg(target_os = "macos")'.dependencies]
+libc = "0.2"
+
+# Linux compaction page-cache hygiene (`provider/fadvise_tier.rs`):
+# `sync_file_range` + `posix_fadvise(POSIX_FADV_DONTNEED)` are Linux-only and
+# not exposed by std. Keeps a background compaction from evicting the hot query
+# working set. See the module docs.
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
+
 [features]
 default = []
 turso = ["dep:turso"]
 partition-table-provider = ["dep:runtime-table-partition"]
 duckdb-bench = ["dep:duckdb"]
+chdb-bench = ["dep:chdb-rust"]
 
 [dev-dependencies]
+# Kept only for the `row_converter` byte-identity equivalence test; Cayenne's runtime no
+# longer depends on arrow-row's (unstable) row format.
+arrow-row = { workspace = true }
 criterion = { version = "0.7", features = ["html_reports", "async_tokio"] }
 datafusion-federation.workspace = true
+datafusion-functions-aggregate = { workspace = true }
 datafusion-functions = { workspace = true }
 insta = { workspace = true, features = ["json"] }
 paste.workspace = true
@@ -90,9 +118,48 @@ test-log = { version = "0.2", features = ["trace"] }
 tokio = { workspace = true, features = ["test-util", "rt-multi-thread", "fs"] }
 tokio-stream = { workspace = true }
 
+# The `compaction_io_hygiene` bench reproduces the Linux-only fadvise/fsync
+# primitives (`sync_file_range`, `posix_fadvise`, `mincore`) directly. cayenne
+# already depends on libc for `target_os = "linux"`, but a bench is a separate
+# crate and must name the dep itself.
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+libc = "0.2"
+
+[[bench]]
+harness = false
+name = "zorder_clustering"
+
 [[bench]]
 harness = false
 name = "metastore_operations"
+
+[[bench]]
+harness = false
+name = "ivm_retraction_anchor"
+
+[[bench]]
+harness = false
+name = "mem_tier_shard_split_converter"
+
+[[bench]]
+harness = false
+name = "sharded_validation_inline"
+
+[[bench]]
+harness = false
+name = "maintained_minmax_anchor"
+
+[[bench]]
+harness = false
+name = "staged_ivm_feed"
+
+[[bench]]
+harness = false
+name = "folded_txn_decomposition"
+
+[[bench]]
+harness = false
+name = "insert_record_schema_variants"
 
 [[bench]]
 harness = false
@@ -241,6 +308,11 @@ required-features = ["duckdb-bench"]
 
 [[bench]]
 harness = false
+name = "vs_duckdb_maintained_filtered_groupby"
+required-features = ["duckdb-bench"]
+
+[[bench]]
+harness = false
 name = "vs_duckdb_join"
 required-features = ["duckdb-bench"]
 
@@ -252,6 +324,21 @@ required-features = ["duckdb-bench"]
 [[bench]]
 harness = false
 name = "vs_duckdb_scaling"
+required-features = ["duckdb-bench"]
+
+[[bench]]
+harness = false
+name = "vs_duckdb_memory_budget"
+required-features = ["duckdb-bench"]
+
+[[bench]]
+harness = false
+name = "vs_duckdb_scan_under_compaction"
+required-features = ["duckdb-bench"]
+
+[[bench]]
+harness = false
+name = "vs_duckdb_cdc_multitable"
 required-features = ["duckdb-bench"]
 
 [[bench]]
@@ -303,4 +390,56 @@ name = "delta_encoding_sweep"
 
 [[bench]]
 harness = false
+name = "compaction_write_amplification"
+
+[[bench]]
+harness = false
 name = "scan_under_write_attribution"
+
+[[bench]]
+harness = false
+name = "vs_chdb_scan"
+required-features = ["chdb-bench", "duckdb-bench"]
+
+[[bench]]
+harness = false
+name = "vs_chdb_groupby"
+required-features = ["chdb-bench", "duckdb-bench"]
+
+# chDB-only (does NOT link DuckDB): the maintained filtered-aggregate comparison
+# must run chDB in a process without DuckDB, since both bundled engines abort if
+# linked + run together. Sibling of vs_duckdb_maintained_filtered_groupby.
+[[bench]]
+harness = false
+name = "vs_chdb_maintained_filtered_groupby"
+required-features = ["chdb-bench"]
+
+[[bench]]
+harness = false
+name = "vs_chdb_join"
+required-features = ["chdb-bench", "duckdb-bench"]
+
+[[bench]]
+harness = false
+name = "vs_chdb_scan_under_compaction"
+required-features = ["chdb-bench", "duckdb-bench"]
+
+[[bench]]
+harness = false
+name = "mem_tier_join_shapes"
+
+[[bench]]
+harness = false
+name = "mem_tier_seal_cadence"
+
+[[bench]]
+harness = false
+name = "publish_metadata_wall"
+
+[[bench]]
+harness = false
+name = "cdc_apply_simd"
+
+[[bench]]
+harness = false
+name = "compaction_io_hygiene"

@@ -16,7 +16,9 @@ limitations under the License.
 
 //! Arrow schema transformations for Vortex compatibility.
 
-use arrow::datatypes::{DataType, Schema, TimeUnit};
+use std::sync::Arc;
+
+use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use datafusion::error::{DataFusionError, Result as DFResult};
 use datafusion_table_providers::UnsupportedTypeAction;
 
@@ -27,6 +29,213 @@ fn is_vortex_supported_type(data_type: &DataType) -> bool {
     )
 }
 
+fn unsupported_field_detail(path: &str, data_type: &DataType) -> String {
+    format!("'{path}' (type: {data_type:?})")
+}
+
+fn transform_field_for_vortex(
+    field: &Field,
+    path: &str,
+    unsupported_type_action: UnsupportedTypeAction,
+    top_level: bool,
+    unsupported_fields: &mut Vec<String>,
+) -> Option<Arc<Field>> {
+    let data_type = transform_data_type_for_vortex(
+        field.data_type(),
+        path,
+        unsupported_type_action,
+        top_level,
+        unsupported_fields,
+    )?;
+    Some(Arc::new(field.clone().with_data_type(data_type)))
+}
+
+fn transform_data_type_for_vortex(
+    data_type: &DataType,
+    path: &str,
+    unsupported_type_action: UnsupportedTypeAction,
+    top_level: bool,
+    unsupported_fields: &mut Vec<String>,
+) -> Option<DataType> {
+    if matches!(data_type, DataType::Float16) {
+        tracing::debug!("Converting Float16 field '{path}' to Float32 for Vortex compatibility");
+        return Some(DataType::Float32);
+    }
+
+    if let DataType::Timestamp(unit, tz) = data_type
+        && !matches!(unit, TimeUnit::Microsecond)
+    {
+        tracing::debug!(
+            "Converting timestamp field '{path}' from {:?} to Microsecond for Vortex compatibility",
+            unit
+        );
+        return Some(DataType::Timestamp(TimeUnit::Microsecond, tz.clone()));
+    }
+
+    if !is_vortex_supported_type(data_type) {
+        return handle_unsupported_type(
+            data_type,
+            path,
+            unsupported_type_action,
+            top_level,
+            unsupported_fields,
+        );
+    }
+
+    match data_type {
+        DataType::Dictionary(key_type, value_type) => {
+            let value_type = transform_data_type_for_vortex(
+                value_type,
+                path,
+                unsupported_type_action,
+                false,
+                unsupported_fields,
+            )?;
+            Some(DataType::Dictionary(key_type.clone(), Box::new(value_type)))
+        }
+        DataType::List(field) => Some(DataType::List(transform_nested_field(
+            field,
+            &format!("{path}[]"),
+            unsupported_type_action,
+            unsupported_fields,
+        ))),
+        DataType::LargeList(field) => Some(DataType::LargeList(transform_nested_field(
+            field,
+            &format!("{path}[]"),
+            unsupported_type_action,
+            unsupported_fields,
+        ))),
+        DataType::FixedSizeList(field, size) => Some(DataType::FixedSizeList(
+            transform_nested_field(
+                field,
+                &format!("{path}[]"),
+                unsupported_type_action,
+                unsupported_fields,
+            ),
+            *size,
+        )),
+        DataType::ListView(field) => Some(DataType::ListView(transform_nested_field(
+            field,
+            &format!("{path}[]"),
+            unsupported_type_action,
+            unsupported_fields,
+        ))),
+        DataType::LargeListView(field) => Some(DataType::LargeListView(transform_nested_field(
+            field,
+            &format!("{path}[]"),
+            unsupported_type_action,
+            unsupported_fields,
+        ))),
+        DataType::Map(field, sorted) => Some(DataType::Map(
+            transform_nested_field(
+                field,
+                &format!("{path}.{}", field.name()),
+                unsupported_type_action,
+                unsupported_fields,
+            ),
+            *sorted,
+        )),
+        DataType::Struct(fields) => {
+            let fields: Vec<Field> = fields
+                .iter()
+                .map(|field| {
+                    transform_nested_field(
+                        field,
+                        &format!("{path}.{}", field.name()),
+                        unsupported_type_action,
+                        unsupported_fields,
+                    )
+                    .as_ref()
+                    .clone()
+                })
+                .collect();
+            Some(DataType::Struct(fields.into()))
+        }
+        DataType::Union(fields, mode) => Some(DataType::Union(
+            fields
+                .iter()
+                .map(|(type_id, field)| {
+                    (
+                        type_id,
+                        transform_nested_field(
+                            field,
+                            &format!("{path}.{}", field.name()),
+                            unsupported_type_action,
+                            unsupported_fields,
+                        ),
+                    )
+                })
+                .collect(),
+            *mode,
+        )),
+        DataType::RunEndEncoded(run_ends, values) => Some(DataType::RunEndEncoded(
+            Arc::clone(run_ends),
+            transform_nested_field(
+                values,
+                &format!("{path}.{}", values.name()),
+                unsupported_type_action,
+                unsupported_fields,
+            ),
+        )),
+        _ => Some(data_type.clone()),
+    }
+}
+
+fn transform_nested_field(
+    field: &Arc<Field>,
+    path: &str,
+    unsupported_type_action: UnsupportedTypeAction,
+    unsupported_fields: &mut Vec<String>,
+) -> Arc<Field> {
+    transform_field_for_vortex(
+        field,
+        path,
+        unsupported_type_action,
+        false,
+        unsupported_fields,
+    )
+    .unwrap_or_else(|| Arc::clone(field))
+}
+
+fn handle_unsupported_type(
+    data_type: &DataType,
+    path: &str,
+    unsupported_type_action: UnsupportedTypeAction,
+    top_level: bool,
+    unsupported_fields: &mut Vec<String>,
+) -> Option<DataType> {
+    match (top_level, unsupported_type_action) {
+        (true, UnsupportedTypeAction::String) => {
+            tracing::warn!(
+                "Converting unsupported type {:?} for field '{}' to Utf8.",
+                data_type,
+                path
+            );
+            Some(DataType::Utf8)
+        }
+        (true, UnsupportedTypeAction::Ignore) => {
+            tracing::warn!(
+                "Ignoring unsupported type {:?} for field '{}'",
+                data_type,
+                path
+            );
+            None
+        }
+        (_, UnsupportedTypeAction::Warn) => {
+            tracing::warn!(
+                "Including unsupported type {:?} for field '{}' - insertion may fail",
+                data_type,
+                path
+            );
+            Some(data_type.clone())
+        }
+        (true, UnsupportedTypeAction::Error) | (false, _) => {
+            unsupported_fields.push(unsupported_field_detail(path, data_type));
+            Some(data_type.clone())
+        }
+    }
+}
+
 /// Transform an Arrow schema for Vortex compatibility.
 ///
 /// Always applies:
@@ -34,7 +243,9 @@ fn is_vortex_supported_type(data_type: &DataType) -> bool {
 /// - Non-microsecond `Timestamp` → `Timestamp(Microsecond, tz)`
 ///
 /// Truly unsupported types (`Interval`, `Duration`, `FixedSizeBinary`) are
-/// handled according to `unsupported_type_action`.
+/// handled according to `unsupported_type_action` at the top level. Nested
+/// unsupported types error unless the action is `warn`, because schema-only
+/// string conversion or field removal would not preserve nested data correctly.
 ///
 /// # Errors
 ///
@@ -48,77 +259,22 @@ pub fn transform_schema_for_vortex(
     let mut transformed_fields = Vec::new();
 
     for field in schema.fields() {
-        let data_type = field.data_type();
-
-        if matches!(data_type, DataType::Float16) {
-            tracing::debug!(
-                "Converting Float16 field '{}' to Float32 for Vortex compatibility",
-                field.name()
-            );
-            transformed_fields.push(std::sync::Arc::new(
-                field.as_ref().clone().with_data_type(DataType::Float32),
-            ));
-            continue;
-        }
-
-        if let DataType::Timestamp(unit, tz) = data_type
-            && !matches!(unit, TimeUnit::Microsecond)
-        {
-            tracing::debug!(
-                "Converting timestamp field '{}' from {:?} to Microsecond for Vortex compatibility",
-                field.name(),
-                unit
-            );
-            transformed_fields.push(std::sync::Arc::new(
-                field
-                    .as_ref()
-                    .clone()
-                    .with_data_type(DataType::Timestamp(TimeUnit::Microsecond, tz.clone())),
-            ));
-            continue;
-        }
-
-        if is_vortex_supported_type(data_type) {
-            transformed_fields.push(std::sync::Arc::clone(field));
-        } else {
-            match unsupported_type_action {
-                UnsupportedTypeAction::String => {
-                    tracing::warn!(
-                        "Converting unsupported type {:?} for field '{}' to Utf8.",
-                        data_type,
-                        field.name()
-                    );
-                    transformed_fields.push(std::sync::Arc::new(
-                        field.as_ref().clone().with_data_type(DataType::Utf8),
-                    ));
-                }
-                UnsupportedTypeAction::Error => {
-                    unsupported_fields.push(format!("'{}' (type: {:?})", field.name(), data_type));
-                }
-                UnsupportedTypeAction::Ignore => {
-                    tracing::warn!(
-                        "Ignoring unsupported type {:?} for field '{}'",
-                        data_type,
-                        field.name()
-                    );
-                }
-                UnsupportedTypeAction::Warn => {
-                    tracing::warn!(
-                        "Including unsupported type {:?} for field '{}' — insertion may fail",
-                        data_type,
-                        field.name()
-                    );
-                    transformed_fields.push(std::sync::Arc::clone(field));
-                }
-            }
+        if let Some(field) = transform_field_for_vortex(
+            field,
+            field.name(),
+            unsupported_type_action,
+            true,
+            &mut unsupported_fields,
+        ) {
+            transformed_fields.push(field);
         }
     }
 
     if !unsupported_fields.is_empty() {
         return Err(DataFusionError::Execution(format!(
             "Unsupported data type(s) in schema: {}. By default, unsupported types cause an \
-             error. To convert unsupported types to strings, set 'unsupported_type_action: string'; \
-             otherwise, remove the unsupported columns.",
+             error. To convert top-level unsupported columns to strings, set 'unsupported_type_action: string'; \
+             nested unsupported types must be removed or rewritten to preserve data correctness.",
             unsupported_fields.join(", ")
         )));
     }
@@ -132,6 +288,7 @@ pub fn transform_schema_for_vortex(
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
+    use std::sync::Arc;
 
     use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
     use datafusion_table_providers::UnsupportedTypeAction;
@@ -222,5 +379,158 @@ mod tests {
 
         assert_eq!(out.field(0).data_type(), &DataType::Utf8);
         assert_eq!(out.field(0).metadata(), &field_metadata);
+    }
+
+    #[test]
+    fn nested_safe_types_are_transformed_recursively() {
+        let mut nested_metadata = HashMap::new();
+        nested_metadata.insert("logicalType".to_string(), "TIMESTAMP_NTZ".to_string());
+
+        let schema = Schema::new(vec![Field::new(
+            "payload",
+            DataType::Struct(
+                vec![
+                    Field::new("score", DataType::Float16, true),
+                    Field::new(
+                        "events",
+                        DataType::List(Arc::new(
+                            Field::new(
+                                "item",
+                                DataType::Timestamp(TimeUnit::Nanosecond, None),
+                                true,
+                            )
+                            .with_metadata(nested_metadata.clone()),
+                        )),
+                        true,
+                    ),
+                ]
+                .into(),
+            ),
+            true,
+        )]);
+
+        let out = transform_schema_for_vortex(&schema, UnsupportedTypeAction::Error)
+            .expect("nested supported conversions should succeed");
+        let DataType::Struct(fields) = out.field(0).data_type() else {
+            panic!("expected struct output");
+        };
+        assert_eq!(fields[0].data_type(), &DataType::Float32);
+        let DataType::List(item) = fields[1].data_type() else {
+            panic!("expected list output");
+        };
+        assert_eq!(
+            item.data_type(),
+            &DataType::Timestamp(TimeUnit::Microsecond, None)
+        );
+        assert_eq!(item.metadata(), &nested_metadata);
+    }
+
+    #[test]
+    fn nested_unsupported_type_errors_with_path() {
+        let schema = Schema::new(vec![Field::new(
+            "payload",
+            DataType::Struct(
+                vec![Field::new(
+                    "duration",
+                    DataType::Duration(TimeUnit::Second),
+                    true,
+                )]
+                .into(),
+            ),
+            true,
+        )]);
+
+        let err = transform_schema_for_vortex(&schema, UnsupportedTypeAction::String)
+            .expect_err("nested schema-only string conversion would be unsafe");
+        let message = err.to_string();
+        assert!(
+            message.contains("payload.duration"),
+            "error should include nested field path, got: {message}"
+        );
+    }
+
+    #[test]
+    fn map_with_supported_children_is_preserved() {
+        let schema = Schema::new(vec![Field::new(
+            "headers",
+            DataType::Map(
+                Arc::new(Field::new_struct(
+                    "entries",
+                    vec![
+                        Arc::new(Field::new("keys", DataType::Utf8, false)),
+                        Arc::new(Field::new("values", DataType::Utf8, true)),
+                    ],
+                    false,
+                )),
+                false,
+            ),
+            true,
+        )]);
+
+        let out = transform_schema_for_vortex(&schema, UnsupportedTypeAction::Error)
+            .expect("map with supported children should be preserved");
+        assert_eq!(out, schema);
+    }
+
+    #[test]
+    fn map_nested_unsupported_type_errors_with_entries_path() {
+        let schema = Schema::new(vec![Field::new(
+            "headers",
+            DataType::Map(
+                Arc::new(Field::new_struct(
+                    "entries",
+                    vec![
+                        Arc::new(Field::new("keys", DataType::Utf8, false)),
+                        Arc::new(Field::new(
+                            "values",
+                            DataType::Duration(TimeUnit::Second),
+                            true,
+                        )),
+                    ],
+                    false,
+                )),
+                false,
+            ),
+            true,
+        )]);
+
+        let err = transform_schema_for_vortex(&schema, UnsupportedTypeAction::Error)
+            .expect_err("nested map values duration should be unsupported");
+        let message = err.to_string();
+        assert!(
+            message.contains("headers.entries.values"),
+            "error should include map entries field path, got: {message}"
+        );
+    }
+
+    #[test]
+    fn run_end_encoded_nested_unsupported_type_errors_with_values_path() {
+        let schema = Schema::new(vec![Field::new(
+            "encoded",
+            DataType::RunEndEncoded(
+                Arc::new(Field::new("run_ends", DataType::Int32, false)),
+                Arc::new(Field::new(
+                    "values",
+                    DataType::Struct(
+                        vec![Field::new(
+                            "duration",
+                            DataType::Duration(TimeUnit::Second),
+                            true,
+                        )]
+                        .into(),
+                    ),
+                    true,
+                )),
+            ),
+            true,
+        )]);
+
+        let err = transform_schema_for_vortex(&schema, UnsupportedTypeAction::Error)
+            .expect_err("nested run-end encoded values duration should be unsupported");
+        let message = err.to_string();
+        assert!(
+            message.contains("encoded.values.duration"),
+            "error should include run-end encoded values field path, got: {message}"
+        );
     }
 }

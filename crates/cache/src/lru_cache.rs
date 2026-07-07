@@ -495,7 +495,7 @@ impl<
         if let Some(ref moka_cache) = self.moka_cache {
             moka_cache
                 .invalidate_entries_if(move |_key, value| {
-                    value.as_table_refs().contains(&table_ref)
+                    crate::resolved_table_match(value.as_table_refs().as_ref(), &table_ref)
                 })
                 .context(FailedToInvalidateCacheSnafu {
                     table_name: table_name_arc,
@@ -515,7 +515,7 @@ impl<
                 let mut keys_to_remove = Vec::new();
                 for key in backend.iter_keys().await {
                     if let Some(value) = backend.get(&key).await
-                        && value.as_table_refs().contains(&table_ref)
+                        && crate::resolved_table_match(value.as_table_refs().as_ref(), &table_ref)
                     {
                         keys_to_remove.push(key);
                     }
@@ -555,11 +555,12 @@ mod tests {
     }
 
     async fn create_test_cached_result() -> CachedQueryResult {
+        create_test_cached_result_with_table(TableReference::bare("test_table")).await
+    }
+
+    async fn create_test_cached_result_with_table(table: TableReference) -> CachedQueryResult {
         let record_batch = create_test_record_batch();
-        let mut input_tables = HashSet::new();
-        input_tables.insert(TableReference::Bare {
-            table: Arc::from("test_table"),
-        });
+        let input_tables = HashSet::from([table]);
 
         let encoder = crate::encoding::get_encoder(spicepod::component::caching::Encoding::None);
 
@@ -614,7 +615,7 @@ mod tests {
     ) {
         let cache: LruCache<CachedQueryResult, _, _> = LruCache::new(
             10,
-            Duration::from_secs(60),
+            Duration::from_mins(1),
             hasher,
             CachingPolicy::Lru,
             CacheEngine::Moka,
@@ -650,7 +651,7 @@ mod tests {
     ) {
         let cache: LruCache<CachedQueryResult, _, _> = LruCache::new(
             10,
-            Duration::from_secs(60),
+            Duration::from_mins(1),
             hasher,
             CachingPolicy::Lru,
             CacheEngine::Moka,
@@ -678,7 +679,7 @@ mod tests {
     ) {
         let cache: LruCache<CachedQueryResult, _, _> = LruCache::new(
             10,
-            Duration::from_secs(60),
+            Duration::from_mins(1),
             hasher,
             CachingPolicy::Lru,
             CacheEngine::Moka,
@@ -713,6 +714,77 @@ mod tests {
             .expect("cache should not contain key after invalidation");
     }
 
+    /// Regression test for #11266: cache invalidation must resolve both the
+    /// stored and the invalidating table reference to fully-qualified form, so a
+    /// differently-qualified entry (e.g. `spice.public.foo`) is still
+    /// invalidated by a bare/partial reference (e.g. `foo`) for the same table,
+    /// and vice versa. Exact `TableReference` equality misses these, leaving
+    /// stale rows served as fresh cache hits until TTL.
+    #[rstest]
+    // Stored fully-qualified, invalidated bare.
+    #[case::full_invalidated_by_bare(
+        TableReference::full("spice", "public", "foo"),
+        TableReference::bare("foo"),
+        true
+    )]
+    // Stored bare, invalidated fully-qualified.
+    #[case::bare_invalidated_by_full(
+        TableReference::bare("foo"),
+        TableReference::full("spice", "public", "foo"),
+        true
+    )]
+    // Stored partial, invalidated bare (same default catalog).
+    #[case::partial_invalidated_by_bare(
+        TableReference::partial("public", "foo"),
+        TableReference::bare("foo"),
+        true
+    )]
+    // Different physical table — must NOT be invalidated.
+    #[case::different_table_preserved(
+        TableReference::full("spice", "public", "foo"),
+        TableReference::bare("bar"),
+        false
+    )]
+    // Different (non-default) schema — must NOT be invalidated.
+    #[case::different_schema_preserved(
+        TableReference::full("spice", "other", "foo"),
+        TableReference::bare("foo"),
+        false
+    )]
+    #[tokio::test]
+    async fn test_cache_invalidate_resolves_qualification(
+        #[case] stored: TableReference,
+        #[case] invalidate_with: TableReference,
+        #[case] expect_invalidated: bool,
+    ) {
+        let cache: LruCache<CachedQueryResult, _, _> = LruCache::new(
+            10,
+            Duration::from_mins(1),
+            RandomState::default(),
+            CachingPolicy::Lru,
+            CacheEngine::Moka,
+        );
+        let result = create_test_cached_result_with_table(stored).await;
+
+        let key = CacheKey::Query("test_query", None).as_raw_key(cache.hasher());
+        cache.put_raw_key(&key.as_u64(), result).await;
+
+        assert!(
+            cache.get_raw_key(&key.as_u64()).await.is_some(),
+            "cache should contain the key before invalidation"
+        );
+
+        cache
+            .invalidate_for_table(invalidate_with)
+            .expect("should invalidate cache");
+
+        assert_eq!(
+            cache.get_raw_key(&key.as_u64()).await.is_none(),
+            expect_invalidated,
+            "invalidation outcome mismatch"
+        );
+    }
+
     #[rstest]
     #[case::siphash(RandomState::default())]
     #[case::ahash(ahash::RandomState::default())]
@@ -726,7 +798,7 @@ mod tests {
     ) {
         let cache: LruCache<CachedSearchResult, _, _> = LruCache::new(
             10,
-            Duration::from_secs(60),
+            Duration::from_mins(1),
             hasher,
             CachingPolicy::Lru,
             CacheEngine::Moka,
@@ -848,7 +920,7 @@ mod tests {
         let hasher = RandomState::default();
         let cache: LruCache<CachedQueryResult, _, _> = LruCache::new(
             10,
-            Duration::from_secs(60),
+            Duration::from_mins(1),
             hasher,
             caching_policy,
             CacheEngine::Moka,
@@ -877,7 +949,7 @@ mod tests {
         let hasher = RandomState::default();
         let cache: LruCache<CachedQueryResult, _, _> = LruCache::new(
             1024 * 1024, // 1 MB
-            Duration::from_secs(60),
+            Duration::from_mins(1),
             hasher,
             CachingPolicy::Lru,
             CacheEngine::Pingora,
@@ -909,7 +981,7 @@ mod tests {
         let hasher = RandomState::default();
         let cache: LruCache<CachedQueryResult, _, _> = LruCache::new(
             1024 * 1024, // 1 MB
-            Duration::from_secs(60),
+            Duration::from_mins(1),
             hasher,
             CachingPolicy::Lru,
             CacheEngine::Pingora,
@@ -932,7 +1004,7 @@ mod tests {
         let hasher = RandomState::default();
         let cache: LruCache<CachedQueryResult, _, _> = LruCache::new(
             1024 * 1024, // 1 MB
-            Duration::from_secs(60),
+            Duration::from_mins(1),
             hasher,
             CachingPolicy::Lru,
             CacheEngine::Pingora,
@@ -970,7 +1042,7 @@ mod tests {
         let hasher = RandomState::default();
         let cache: LruCache<CachedQueryResult, _, _> = LruCache::new(
             1024 * 1024, // 1 MB
-            Duration::from_secs(60),
+            Duration::from_mins(1),
             hasher,
             CachingPolicy::Lru,
             CacheEngine::Pingora,
@@ -1016,7 +1088,7 @@ mod tests {
         let hasher = RandomState::default();
         let cache: LruCache<CachedQueryResult, _, _> = LruCache::new(
             1024 * 1024, // 1 MB
-            Duration::from_secs(60),
+            Duration::from_mins(1),
             hasher,
             CachingPolicy::Lru,
             CacheEngine::Pingora,
@@ -1125,7 +1197,7 @@ mod tests {
         let hasher = RandomState::default();
         let cache: LruCache<CachedQueryResult, _, _> = LruCache::new(
             1024 * 1024, // 1 MB
-            Duration::from_secs(60),
+            Duration::from_mins(1),
             hasher,
             CachingPolicy::Lru,
             CacheEngine::Pingora,
@@ -1170,7 +1242,7 @@ mod tests {
         let hasher = RandomState::default();
         let cache: LruCache<CachedSearchResult, _, _> = LruCache::new(
             1024 * 1024, // 1 MB
-            Duration::from_secs(60),
+            Duration::from_mins(1),
             hasher,
             CachingPolicy::Lru,
             CacheEngine::Pingora,

@@ -34,6 +34,7 @@ use ::datafusion::sql::ResolvedTableReference;
 use app::App;
 use ballista_core::config::ShuffleFormat as BallistaShuffleFormat;
 use ballista_core::extension::SessionConfigExt;
+use ballista_core::extension::SessionConfigHelperExt;
 use ballista_core::registry::BallistaFunctionRegistry;
 use ballista_core::serde::BallistaCodec;
 use ballista_core::serde::protobuf::executor_resource::Resource;
@@ -46,7 +47,7 @@ use ballista_core::{ConfigProducer, RuntimeProducer};
 use ballista_executor::execution_loop;
 use ballista_executor::executor::Executor;
 use ballista_scheduler::cluster::memory::{InMemoryClusterState, InMemoryJobState};
-use ballista_scheduler::cluster::{BallistaCluster, ClusterState};
+use ballista_scheduler::cluster::{BallistaCluster, ClusterState, JobState};
 use ballista_scheduler::config::{OnCancelTasksFn, SchedulerConfig};
 use ballista_scheduler::scheduler_process;
 use ballista_scheduler::scheduler_server::SchedulerServer;
@@ -73,7 +74,7 @@ use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::net::TcpListener;
 use tokio::sync::{Notify, RwLock, oneshot};
 use tokio_util::sync::CancellationToken;
@@ -89,6 +90,114 @@ const SCHEDULER_BACKOFF_MAX: Duration = Duration::from_secs(5);
 /// registering all accelerated tables yet). At ~5s per attempt this gives a
 /// few minutes of patience before the executor startup hard-fails.
 const ALLOCATE_INITIAL_PARTITIONS_MAX_RETRIES: usize = 60;
+
+const CLUSTER_GRPC_HTTP2_KEEP_ALIVE_INTERVAL_SECONDS_PARAM: &str =
+    "cluster_grpc_http2_keep_alive_interval_seconds";
+const CLUSTER_GRPC_KEEP_ALIVE_TIMEOUT_SECONDS_PARAM: &str =
+    "cluster_grpc_keep_alive_timeout_seconds";
+const CLUSTER_GRPC_TIMEOUT_SECONDS_PARAM: &str = "cluster_grpc_timeout_seconds";
+const CLUSTER_GRPC_TCP_KEEP_ALIVE_SECONDS_PARAM: &str = "cluster_grpc_tcp_keep_alive_seconds";
+const CLUSTER_GRPC_CONNECT_TIMEOUT_SECONDS_PARAM: &str = "cluster_grpc_connect_timeout_seconds";
+
+/// `runtime.params` keys with a `cluster_grpc_` prefix that the runtime
+/// recognizes, so they don't false-warn as unknown at startup.
+pub(crate) const CLUSTER_GRPC_RUNTIME_PARAMS: &[&str] = &[
+    CLUSTER_GRPC_HTTP2_KEEP_ALIVE_INTERVAL_SECONDS_PARAM,
+    CLUSTER_GRPC_KEEP_ALIVE_TIMEOUT_SECONDS_PARAM,
+    CLUSTER_GRPC_TIMEOUT_SECONDS_PARAM,
+    CLUSTER_GRPC_TCP_KEEP_ALIVE_SECONDS_PARAM,
+    CLUSTER_GRPC_CONNECT_TIMEOUT_SECONDS_PARAM,
+];
+
+/// gRPC client tuning for internal cluster communication (the executor's
+/// `poll_work` calls to the scheduler), read from the `cluster_grpc_*` keys in
+/// `runtime.params`. The defaults detect a silently-dropped connection within
+/// (ping interval + ping timeout) so it is torn down and reconnected well under
+/// `executor_timeout`. Without this, a stale connection hangs each `poll_work`
+/// for the request timeout, which gaps the `poll_work`-carried heartbeat and
+/// flaps the executor.
+#[derive(Debug, Clone, PartialEq, Eq)]
+// Every field is a duration in seconds; the shared `_seconds` postfix names the unit.
+#[expect(clippy::struct_field_names)]
+struct ClusterGrpcClientConfig {
+    /// HTTP/2 keep-alive ping interval, in seconds.
+    http2_keep_alive_interval_seconds: u64,
+    /// HTTP/2 keep-alive ping timeout, in seconds: how long to wait for a ping
+    /// ack before declaring the connection dead.
+    keep_alive_timeout_seconds: u64,
+    /// Per-request timeout, in seconds, for cluster gRPC calls.
+    timeout_seconds: u64,
+    /// TCP keep-alive interval, in seconds.
+    tcp_keep_alive_seconds: u64,
+    /// Connection-establishment timeout, in seconds.
+    connect_timeout_seconds: u64,
+}
+
+impl Default for ClusterGrpcClientConfig {
+    fn default() -> Self {
+        Self {
+            http2_keep_alive_interval_seconds: 5,
+            keep_alive_timeout_seconds: 5,
+            timeout_seconds: 10,
+            tcp_keep_alive_seconds: 60,
+            connect_timeout_seconds: 20,
+        }
+    }
+}
+
+impl ClusterGrpcClientConfig {
+    fn from_params(params: &HashMap<String, String>) -> Self {
+        let defaults = Self::default();
+        Self {
+            http2_keep_alive_interval_seconds: parse_cluster_grpc_param(
+                params,
+                CLUSTER_GRPC_HTTP2_KEEP_ALIVE_INTERVAL_SECONDS_PARAM,
+                defaults.http2_keep_alive_interval_seconds,
+            ),
+            keep_alive_timeout_seconds: parse_cluster_grpc_param(
+                params,
+                CLUSTER_GRPC_KEEP_ALIVE_TIMEOUT_SECONDS_PARAM,
+                defaults.keep_alive_timeout_seconds,
+            ),
+            timeout_seconds: parse_cluster_grpc_param(
+                params,
+                CLUSTER_GRPC_TIMEOUT_SECONDS_PARAM,
+                defaults.timeout_seconds,
+            ),
+            tcp_keep_alive_seconds: parse_cluster_grpc_param(
+                params,
+                CLUSTER_GRPC_TCP_KEEP_ALIVE_SECONDS_PARAM,
+                defaults.tcp_keep_alive_seconds,
+            ),
+            connect_timeout_seconds: parse_cluster_grpc_param(
+                params,
+                CLUSTER_GRPC_CONNECT_TIMEOUT_SECONDS_PARAM,
+                defaults.connect_timeout_seconds,
+            ),
+        }
+    }
+}
+
+fn parse_cluster_grpc_param(params: &HashMap<String, String>, key: &str, default: u64) -> u64 {
+    match params.get(key) {
+        None => default,
+        Some(raw) => match raw.trim().parse::<u64>() {
+            Ok(0) => {
+                tracing::warn!(
+                    "runtime.params.{key}={raw:?} must be a positive number of seconds; using default {default}"
+                );
+                default
+            }
+            Ok(value) => value,
+            Err(e) => {
+                tracing::warn!(
+                    "runtime.params.{key}={raw:?} is not a valid number of seconds ({e}); using default {default}"
+                );
+                default
+            }
+        },
+    }
+}
 
 #[derive(Clone)]
 pub enum DistributedNode {
@@ -187,6 +296,7 @@ enum SchedulerConnectionState {
     },
 }
 
+#[expect(clippy::too_many_arguments)]
 fn spawn_scheduler_poll_loop(
     scheduler_address: String,
     client_tls_config: Option<ClientTlsConfig>,
@@ -195,10 +305,12 @@ fn spawn_scheduler_poll_loop(
     readiness_sender: Arc<Mutex<Option<oneshot::Sender<String>>>>,
     poll_now_notify: Option<Arc<Notify>>,
     available_task_slots: Arc<tokio::sync::Semaphore>,
+    grpc_client: &ClusterGrpcClientConfig,
 ) -> SchedulerPollHandle {
     let cancel = CancellationToken::new();
     let token = cancel.clone();
     let tls_enabled = client_tls_config.is_some();
+    let grpc_client = grpc_client.clone();
 
     let task = tokio::spawn(async move {
         let mut backoff = FibonacciBackoffBuilder::new()
@@ -218,24 +330,35 @@ fn spawn_scheduler_poll_loop(
                 SchedulerConnectionState::NeedsEndpoint => {
                     let endpoint_url =
                         normalize_scheduler_endpoint(&scheduler_address, tls_enabled);
-                    let scheduler_endpoint = match create_grpc_client_endpoint(
-                        endpoint_url.clone(),
-                        Some(&GrpcClientConfig::default()),
-                    ) {
-                        Ok(endpoint) => endpoint,
-                        Err(err) => {
-                            tracing::warn!(
-                                "Failed to create scheduler endpoint {endpoint_url}: {err}"
-                            );
-                            if let Some(delay) = backoff.next_duration() {
-                                tokio::select! {
-                                    () = token.cancelled() => break,
-                                    () = tokio::time::sleep(delay) => {}
-                                }
-                            }
-                            continue;
-                        }
+                    let grpc_config = GrpcClientConfig {
+                        connect_timeout_seconds: grpc_client.connect_timeout_seconds,
+                        timeout_seconds: grpc_client.timeout_seconds,
+                        tcp_keepalive_seconds: grpc_client.tcp_keep_alive_seconds,
+                        http2_keepalive_interval_seconds: grpc_client
+                            .http2_keep_alive_interval_seconds,
                     };
+                    let scheduler_endpoint =
+                        match create_grpc_client_endpoint(endpoint_url.clone(), Some(&grpc_config))
+                        {
+                            // Override ballista's hardcoded 20s keep-alive ping timeout so a
+                            // dropped connection is detected within (ping interval + this) and
+                            // reconnected before the scheduler's executor-timeout reap window.
+                            Ok(endpoint) => endpoint.keep_alive_timeout(Duration::from_secs(
+                                grpc_client.keep_alive_timeout_seconds,
+                            )),
+                            Err(err) => {
+                                tracing::warn!(
+                                    "Failed to create scheduler endpoint {endpoint_url}: {err}"
+                                );
+                                if let Some(delay) = backoff.next_duration() {
+                                    tokio::select! {
+                                        () = token.cancelled() => break,
+                                        () = tokio::time::sleep(delay) => {}
+                                    }
+                                }
+                                continue;
+                            }
+                        };
 
                     let scheduler_endpoint = if let Some(tls_config) = client_tls_config.clone() {
                         match scheduler_endpoint.tls_config(tls_config) {
@@ -374,10 +497,22 @@ async fn fetch_scheduler_membership(
     }
 }
 
+/// How long a scheduler must be continuously absent from the registry before
+/// its poller is cancelled. Registry entries can flap when a scheduler's
+/// heartbeat write stalls briefly (e.g. an object-store blip): the entry goes
+/// stale and reappears seconds later. Cancelling the poller on the first
+/// missed observation destroys its undelivered task-status buffer and kills
+/// its in-flight tasks, which leaves completed stages unreported and wedges
+/// the running job. Polling a genuinely-dead scheduler for the grace period is
+/// harmless (the poll fails and backs off), so err on the side of keeping the
+/// poller alive.
+const SCHEDULER_POLLER_REMOVAL_GRACE: Duration = Duration::from_mins(1);
+
 #[expect(clippy::too_many_arguments)]
 fn update_scheduler_pollers(
     pollers: &mut HashMap<String, SchedulerPollHandle>,
     known_schedulers: &mut HashSet<String>,
+    scheduler_missing_since: &mut HashMap<String, Instant>,
     addresses: Vec<String>,
     client_tls_config: Option<&ClientTlsConfig>,
     executor: &Arc<Executor>,
@@ -385,17 +520,33 @@ fn update_scheduler_pollers(
     readiness_sender: &Arc<Mutex<Option<oneshot::Sender<String>>>>,
     poll_now_notify: Option<&Arc<Notify>>,
     available_task_slots: &Arc<tokio::sync::Semaphore>,
+    grpc_client: &ClusterGrpcClientConfig,
 ) {
     let next_schedulers: HashSet<String> = addresses.into_iter().collect();
+
+    // A scheduler observed in the registry again is no longer missing.
+    scheduler_missing_since.retain(|address, _| !next_schedulers.contains(address));
 
     let added: Vec<String> = next_schedulers
         .difference(known_schedulers)
         .cloned()
         .collect();
-    let removed: Vec<String> = known_schedulers
-        .difference(&next_schedulers)
-        .cloned()
-        .collect();
+
+    let mut removed: Vec<String> = Vec::new();
+    let mut still_in_grace: Vec<String> = Vec::new();
+    for address in known_schedulers.difference(&next_schedulers) {
+        let missing_since = scheduler_missing_since
+            .entry(address.clone())
+            .or_insert_with(Instant::now);
+        if missing_since.elapsed() >= SCHEDULER_POLLER_REMOVAL_GRACE {
+            removed.push(address.clone());
+        } else {
+            still_in_grace.push(address.clone());
+        }
+    }
+    for address in &removed {
+        scheduler_missing_since.remove(address);
+    }
 
     if !added.is_empty() || !removed.is_empty() {
         let added_list = added.join(",");
@@ -414,6 +565,7 @@ fn update_scheduler_pollers(
             Arc::clone(readiness_sender),
             poll_now_notify.cloned(),
             Arc::clone(available_task_slots),
+            grpc_client,
         );
         pollers.insert(address, handle);
     }
@@ -428,6 +580,9 @@ fn update_scheduler_pollers(
     }
 
     *known_schedulers = next_schedulers;
+    // Schedulers still within the removal grace keep their pollers and remain
+    // "known" so a registry re-appearance is not treated as a new scheduler.
+    known_schedulers.extend(still_in_grace);
 }
 
 pub(crate) mod accelerated_partition_provider;
@@ -443,6 +598,7 @@ mod reaper;
 pub(crate) mod scheduler_registry;
 mod servers;
 mod service;
+pub(crate) mod shared_job_state;
 
 use crate::cluster::partition::service::PartitionService;
 pub use accelerated_partition_provider::AcceleratedPartitionProvider;
@@ -1191,6 +1347,9 @@ pub async fn initialize_cluster_executor(
         .boxed()
         .context(FailedToStartClusterExecutorSnafu)?;
 
+    let scheduler_grpc_client_for_manager =
+        ClusterGrpcClientConfig::from_params(&app_def.runtime.params);
+
     // Resolve executor settings from the scheduler's app definition before the
     // executor Flight server starts.
     if let Some(ref telemetry_config) = rt.telemetry_config {
@@ -1237,14 +1396,21 @@ pub async fn initialize_cluster_executor(
                 .unwrap_or_else(|| env::temp_dir().to_string_lossy().to_string())
         }
         Some(loc) => {
-            // Local disk mode with explicit path
-            // Validate the path exists or can be created
+            // Local disk mode with explicit path. Ensure it exists: the executor
+            // mounts its data volume (e.g. `/data`) but a configured shuffle
+            // subdirectory (e.g. `/data/ballista-shuffle/<run>`) will not exist
+            // yet, and Ballista uses the work_dir as-is without creating it — so
+            // shuffle writes would fail. Create it (idempotent) rather than only
+            // warning.
             let path = std::path::Path::new(loc);
             if !path.exists() {
-                tracing::warn!(
-                    "shuffle_location '{}' does not exist. Ensure the directory exists and is writable by the executor process.",
-                    loc
-                );
+                match std::fs::create_dir_all(path) {
+                    Ok(()) => tracing::info!("Created shuffle_location directory '{}'", loc),
+                    Err(e) => tracing::warn!(
+                        "shuffle_location '{}' does not exist and could not be created: {e}. Ensure it is writable by the executor process.",
+                        loc
+                    ),
+                }
             }
             loc.to_string()
         }
@@ -1454,6 +1620,7 @@ pub async fn initialize_cluster_executor(
     let poll_manager = tokio::spawn(async move {
         let mut pollers: HashMap<String, SchedulerPollHandle> = HashMap::new();
         let mut known_schedulers: HashSet<String> = HashSet::new();
+        let mut scheduler_missing_since: HashMap<String, Instant> = HashMap::new();
 
         // Initialize control stream manager for metrics collection
         let mut control_stream_manager = ControlStreamManager::new(
@@ -1486,6 +1653,7 @@ pub async fn initialize_cluster_executor(
         update_scheduler_pollers(
             &mut pollers,
             &mut known_schedulers,
+            &mut scheduler_missing_since,
             current_addresses,
             client_tls_config_for_manager.as_ref(),
             &executor_for_manager,
@@ -1493,6 +1661,7 @@ pub async fn initialize_cluster_executor(
             &readiness_sender,
             Some(&poll_now_notify),
             &available_task_slots_for_manager,
+            &scheduler_grpc_client_for_manager,
         );
 
         let mut refresh = tokio::time::interval(SCHEDULER_REFRESH_INTERVAL);
@@ -1528,6 +1697,7 @@ pub async fn initialize_cluster_executor(
                         update_scheduler_pollers(
                             &mut pollers,
                             &mut known_schedulers,
+                            &mut scheduler_missing_since,
                             addresses,
                             client_tls_config_for_manager.as_ref(),
                             &executor_for_manager,
@@ -1535,6 +1705,7 @@ pub async fn initialize_cluster_executor(
                             &readiness_sender,
                             Some(&poll_now_notify),
                             &available_task_slots_for_manager,
+                            &scheduler_grpc_client_for_manager,
                         );
                     }
                 }
@@ -1562,11 +1733,12 @@ pub async fn initialize_cluster_executor(
                 .max_duration(Some(SCHEDULER_BACKOFF_MAX))
                 .max_retries(Some(ALLOCATE_INITIAL_PARTITIONS_MAX_RETRIES))
                 .build();
+            let task_ctx = rt.datafusion().ctx.task_ctx();
             loop {
                 match executor_request_initial_partitions(
                     cluster_client.clone(),
                     rt.datafusion().cluster_config.node_advertise_url(),
-                    rt.datafusion().ctx.as_ref(),
+                    task_ctx.as_ref(),
                 )
                 .await
                 {
@@ -1861,13 +2033,20 @@ async fn create_scheduler_server(
                 .cloned()
                 .unwrap_or_default();
 
-            let mut cfg = current_context
+            let cfg = current_context
                 .copied_config()
                 .with_target_partitions(target_partitions)
                 .with_option_extension(SpiceClusterConfig::default())
                 .with_option_extension(incoming_request_context)
                 .with_ballista_shuffle_format(ballista_shuffle_format)
                 .with_ballista_shuffle_memory_mode(shuffle_memory_mode);
+
+            // Apply the DataFusion configuration that distributed (Ballista) execution
+            // requires for correctness. The session builder rebuilds from
+            // `current_context.copied_config()` (the local single-node config), and
+            // this config is serialized into the task props sent to executors, so it
+            // governs both the distributed plan and its execution.
+            let mut cfg = apply_distributed_execution_config(cfg);
 
             // Apply object store shuffle configuration if specified
             if let Some(ref storage_type) = shuffle_storage_type {
@@ -1921,12 +2100,86 @@ async fn create_scheduler_server(
             .with_ballista_shuffle_memory_mode(shuffle_memory_mode)
     });
 
-    // Manually create the BallistaCluster with our custom config_producer
-    let job_state = Arc::new(InMemoryJobState::new(
-        metrics_node_id,
-        session_builder,
-        config_producer,
-    ));
+    // Back job state with shared object storage when a scheduler state location is
+    // configured, so in-flight jobs survive scheduler loss and any scheduler can
+    // resume them; otherwise keep job state in memory.
+    //
+    // The spicepod loads asynchronously after the runtime is built. Wait for it with
+    // a fibonacci backoff and keep retrying until it loads (warning periodically)
+    // rather than giving up — when a state location is configured we must honor it,
+    // not silently degrade to in-memory.
+    let scheduler_cfg = {
+        let mut backoff = util::fibonacci_backoff::FibonacciBackoffBuilder::new()
+            .max_retries(None)
+            .build();
+        let started = std::time::Instant::now();
+        let mut last_warn = std::time::Instant::now();
+        // Keep retrying until the spicepod loads (a configured state location must
+        // be honored, never silently degraded), but stay responsive to shutdown so
+        // a process told to stop while the app is still loading can't deadlock here.
+        let shutdown = crate::shutdown_signal();
+        tokio::pin!(shutdown);
+        loop {
+            if let Some(app) = rt.read_app().await {
+                break app.runtime.scheduler.clone();
+            }
+            if last_warn.elapsed() >= std::time::Duration::from_secs(30) {
+                tracing::warn!(
+                    "still waiting for the spicepod to load before configuring the \
+                     scheduler's job state ({}s elapsed)",
+                    started.elapsed().as_secs()
+                );
+                last_warn = std::time::Instant::now();
+            }
+            let delay = backoff
+                .next_duration()
+                .unwrap_or_else(|| std::time::Duration::from_secs(30))
+                .min(std::time::Duration::from_secs(30));
+            tokio::select! {
+                () = tokio::time::sleep(delay) => {}
+                () = &mut shutdown => {
+                    return Err(crate::Error::FailedToStartClusterScheduler {
+                        source: "shutdown requested while waiting for the spicepod to load".into(),
+                    });
+                }
+            }
+        }
+    };
+    let job_state: Arc<dyn JobState> = if let Some(scheduler_cfg) = scheduler_cfg {
+        tracing::info!(
+            state_location = %scheduler_cfg.state_location,
+            "Scheduler using shared object-store job state"
+        );
+        let (store, base_prefix) = scheduler_registry::build_object_store(
+            rt.as_ref(),
+            &scheduler_cfg.state_location,
+            &scheduler_cfg,
+        )
+        .await
+        .map_err(|e| crate::Error::FailedToStartClusterScheduler {
+            source: Box::new(e),
+        })?;
+        let codec: BallistaCodec<LogicalPlanNode, PhysicalPlanNode> = BallistaCodec::new(
+            SpiceLogicalCodec::new_codec(),
+            SpicePhysicalCodec::new(Arc::clone(rt))
+                .boxed()
+                .context(FailedToStartClusterSchedulerSnafu)?,
+        );
+        Arc::new(shared_job_state::SharedJobState::new(
+            metrics_node_id,
+            store,
+            base_prefix,
+            codec,
+            session_builder,
+            config_producer,
+        ))
+    } else {
+        Arc::new(InMemoryJobState::new(
+            metrics_node_id,
+            session_builder,
+            config_producer,
+        ))
+    };
     let cluster = BallistaCluster::new(cluster_state, job_state);
 
     let scheduler_config = SchedulerConfig {
@@ -1948,7 +2201,7 @@ async fn create_scheduler_server(
         on_work_available: Some(on_work_available),
         on_cancel_tasks: Some(on_cancel_tasks),
 
-        // Faster failure detection: 30s timeout with 10s heartbeat interval
+        // Mark an executor dead after 30s without a heartbeat (heartbeats every 10s).
         executor_timeout_seconds: 30,
 
         // The Spice executor uses pull-based polling (execution_loop::poll_loop),
@@ -2170,6 +2423,45 @@ async fn executor_bind_object_stores(rt: Arc<Runtime>) -> crate::Result<()> {
     Ok(())
 }
 
+/// Apply the `DataFusion` configuration that distributed (Ballista) execution requires
+/// for correctness, returning the adjusted [`SessionConfig`].
+///
+/// This is the same set the executor applies via `new_with_ballista`, applied here so
+/// the scheduler-side plan and the config serialized into executor task props agree.
+fn apply_distributed_execution_config(cfg: SessionConfig) -> SessionConfig {
+    // `ballista_restricted_configuration` enforces the settings that distributed
+    // execution requires — among other things it disables CollectLeft broadcast joins
+    // (whose left child must be a single partition, invalid once the input is a
+    // multi-partition shuffle) and round-robin repartition.
+    let mut cfg = cfg.ballista_restricted_configuration();
+
+    // These optimizations rely on shared mutable state within a single process and are
+    // incorrect (or fatal) once a plan is split into stages that run in separate
+    // executor processes; `ballista_restricted_configuration` does not cover them.
+    {
+        let opts = cfg.options_mut();
+
+        // The hash-join dynamic filter builds a min/max filter from the build side at
+        // runtime and pushes it into the probe-side scan via shared plan state; across
+        // a stage boundary it can never be populated, and its serialized form carries
+        // probe-side column indices that don't resolve against the receiving stage's
+        // schema. (TopK/aggregate dynamic filters stay enabled — they merely remain
+        // empty across stages rather than erroring.)
+        opts.optimizer.enable_join_dynamic_filter_pushdown = false;
+
+        // An uncorrelated scalar subquery is otherwise executed by a
+        // `ScalarSubqueryExec` that evaluates it eagerly on one node into a shared
+        // results container; a shuffle boundary between the exec and its dependent
+        // `ScalarSubqueryExpr`s leaves a child stage unable to decode the expr.
+        // Disabling this rewrites them to left joins via `ScalarSubqueryToJoin`
+        // (DataFusion's documented escape hatch for distributed execution frameworks),
+        // which distribute correctly.
+        opts.optimizer.enable_physical_uncorrelated_scalar_subquery = false;
+    }
+
+    cfg
+}
+
 #[cfg(test)]
 mod tests {
     use super::ClusterTlsConfig;
@@ -2184,6 +2476,56 @@ mod tests {
         CapturedX509Certificate, EcdsaCurve, InMemorySigningKeyPair, KeyAlgorithm, Sign, Signer,
         X509Certificate,
     };
+
+    #[test]
+    fn cluster_grpc_client_config_from_params() {
+        use super::ClusterGrpcClientConfig;
+        use std::collections::HashMap;
+
+        // No params → defaults.
+        let config = ClusterGrpcClientConfig::from_params(&HashMap::new());
+        assert_eq!(config, ClusterGrpcClientConfig::default());
+
+        // Valid overrides apply (tolerating incidental whitespace); invalid and zero
+        // values fall back to the default.
+        let params: HashMap<String, String> = [
+            (
+                super::CLUSTER_GRPC_HTTP2_KEEP_ALIVE_INTERVAL_SECONDS_PARAM,
+                " 30 ",
+            ),
+            (super::CLUSTER_GRPC_KEEP_ALIVE_TIMEOUT_SECONDS_PARAM, "0"),
+            (super::CLUSTER_GRPC_TIMEOUT_SECONDS_PARAM, "not-a-number"),
+            (super::CLUSTER_GRPC_TCP_KEEP_ALIVE_SECONDS_PARAM, "120"),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+        let config = ClusterGrpcClientConfig::from_params(&params);
+        let defaults = ClusterGrpcClientConfig::default();
+        assert_eq!(config.http2_keep_alive_interval_seconds, 30);
+        assert_eq!(
+            config.keep_alive_timeout_seconds,
+            defaults.keep_alive_timeout_seconds
+        );
+        assert_eq!(config.timeout_seconds, defaults.timeout_seconds);
+        assert_eq!(config.tcp_keep_alive_seconds, 120);
+        assert_eq!(
+            config.connect_timeout_seconds,
+            defaults.connect_timeout_seconds
+        );
+    }
+
+    #[test]
+    fn distributed_execution_config_disables_single_process_optimizations() {
+        let cfg =
+            super::apply_distributed_execution_config(::datafusion::prelude::SessionConfig::new());
+        let opts = cfg.options();
+        // Single-process-only optimizations must be disabled for distributed execution.
+        assert!(!opts.optimizer.enable_join_dynamic_filter_pushdown);
+        assert!(!opts.optimizer.enable_physical_uncorrelated_scalar_subquery);
+        // Ballista restricted configuration disables round-robin repartition.
+        assert!(!opts.optimizer.enable_round_robin_repartition);
+    }
 
     fn create_signed_certificate(
         subject_cn: &str,

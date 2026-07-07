@@ -41,7 +41,7 @@ async fn test_aws_sdk_environment_resolution() -> Result<(), anyhow::Error> {
             let mut rt = Runtime::builder().with_app(app).build().await;
 
             tokio::select! {
-                () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+                () = tokio::time::sleep(std::time::Duration::from_mins(1)) => {
                     return Err(anyhow::Error::msg("Timed out waiting for datasets to load"));
                 }
                 () = Arc::new(rt.clone()).load_components() => {}

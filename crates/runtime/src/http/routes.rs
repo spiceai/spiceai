@@ -20,7 +20,7 @@ use crate::datafusion::DataFusion;
 use crate::datafusion::request_context_extension::DataFusionContextExtension;
 use crate::model::ModelContextLayer;
 use crate::request::DatabricksAuthExtension;
-use crate::{search::search_engine, status::RuntimeStatus};
+use crate::status::RuntimeStatus;
 
 use crate::Runtime;
 use crate::cluster::ExecutorRegistry;
@@ -32,8 +32,6 @@ use crate::http::v1::{
 };
 use runtime_request_context::{Protocol, RequestContext};
 
-#[cfg(feature = "mcp")]
-use crate::tools::mcp::server::RuntimeServer;
 use app::App;
 use axum::{extract::State, routing::patch};
 use http::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE};
@@ -42,6 +40,8 @@ use opentelemetry::KeyValue;
 use rmcp::transport::streamable_http_server::{
     StreamableHttpService, session::local::LocalSessionManager, tower::StreamableHttpServerConfig,
 };
+#[cfg(feature = "mcp")]
+use runtime_tools::mcp::server::RuntimeServer;
 use spicepod::component::runtime::CorsConfig;
 #[cfg(feature = "mcp")]
 use spicepod::component::runtime::McpConfig;
@@ -315,9 +315,14 @@ const HEALTH_REQUEST_BODY_LIMIT: usize = 128 * 1024; // 128 KiB
 pub(crate) fn routes(
     rt: &Arc<Runtime>,
     config: Arc<config::Config>,
-    search: Arc<search_engine::SearchEngine>,
+    search: Arc<
+        runtime_search::search_engine::SearchEngine<
+            crate::search::util::RuntimeTableProviderExplorer,
+        >,
+    >,
     auth_layer: Option<AuthLayer>,
     cors_config: &CorsConfig,
+    metrics_tls: bool,
     #[cfg(feature = "mcp")] mcp_config: Option<&McpConfig>,
 ) -> Router {
     let mut authenticated_router = Router::new()
@@ -417,12 +422,12 @@ pub(crate) fn routes(
             .route("/v1/search", post(v1::search::post))
             .merge(tools_router)
             .route("/v1/workers", get(v1::workers::get))
-            .layer(Extension(Arc::clone(&rt.completion_llms)))
+            .layer(Extension(rt.completion_llms()))
             .layer(Extension(Arc::clone(&rt.models)))
             .layer(Extension(search))
             .layer(Extension(Arc::clone(&rt.embeds)))
             .layer(Extension(Arc::clone(&rt.workers)))
-            .layer(Extension(Arc::clone(&rt.responses_llms)));
+            .layer(Extension(rt.responses_llms()));
     }
 
     // Add async queries API routes - registered unconditionally for discoverability and consistency.
@@ -458,7 +463,7 @@ pub(crate) fn routes(
         let runtime_arc = Arc::clone(rt);
         let mcp_config = mcp_server_config(mcp_config);
         let mcp_service = StreamableHttpService::new(
-            move || Ok(RuntimeServer::from(&runtime_arc)),
+            move || Ok(RuntimeServer::new(Arc::clone(&runtime_arc.tools))),
             Arc::new(LocalSessionManager::default()),
             mcp_config,
         );
@@ -481,6 +486,7 @@ pub(crate) fn routes(
     authenticated_router = authenticated_router
         .layer(Extension(Arc::clone(rt)))
         .layer(Extension(rt.metrics_endpoint))
+        .layer(Extension(v1::status::MetricsTlsEnabled(metrics_tls)))
         .layer(Extension(config));
 
     // Apply request body size limit to prevent DoS attacks via unbounded request payloads
@@ -595,7 +601,7 @@ async fn track_metrics(
         KeyValue::new("status", status),
     ];
 
-    labels.extend(request_dimensions.into_iter());
+    labels.extend(request_dimensions);
 
     metrics::REQUESTS_TOTAL.add(1, &labels);
     metrics::REQUESTS.add(1, &labels);

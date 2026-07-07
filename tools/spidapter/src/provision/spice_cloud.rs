@@ -40,7 +40,7 @@ pub(crate) async fn provision_scp_app(
     cayenne: Option<&CayenneConfig>,
 ) -> anyhow::Result<RunState> {
     let api_url = args.spice_cloud_api_url.trim_end_matches('/');
-    let cloud = commands::build_cloud_client(Some(api_url), args.api_key.as_deref())?;
+    let cloud = commands::build_cloud_client(Some(api_url), args.api_key.as_deref()).await?;
 
     let cname = commands::resolve_default_cname(&cloud).await?;
     let flight_url = scp
@@ -99,6 +99,8 @@ pub(crate) async fn provision_scp_app(
         commands::ensure_spice_cloud_app(&cloud, &app_name, &app_create_config, deployment_mode)
             .await?;
 
+    let app_guard = commands::ScpAppGuard::new(cloud.clone(), app_id);
+
     // Fetch API key from the dedicated api-keys endpoint
     let api_keys = cloud
         .get_api_keys(app_id)
@@ -129,6 +131,24 @@ pub(crate) async fn provision_scp_app(
     eprintln!("[stdio] Setting secrets from spicepod...");
     commands::secrets::set_spicepod_secrets(&cloud, app_id, &spicepod_yaml).await?;
     eprintln!("[stdio] Spicepod secrets set");
+
+    // The MongoDB connection string carries credentials, so the spicepod
+    // references it as `${secrets:MONGO_CONNECTION_STRING}` (see
+    // `generate_mongodb_spicepod`). Set that secret to the real URI here: it is
+    // dynamic (per-run database / EC2-provisioned), so the env-only
+    // `set_spicepod_secrets` above cannot resolve it. Runs after that call so
+    // this value wins.
+    if let FederatedStorageConfig::MongoDB { uri, .. } = &setup_config.storage {
+        eprintln!("[stdio] Setting MONGO_CONNECTION_STRING secret...");
+        commands::secrets::set_secret(
+            &cloud,
+            app_id,
+            super::super::sources::mongodb::MONGO_CONNECTION_STRING_SECRET,
+            uri,
+        )
+        .await?;
+        eprintln!("[stdio] MONGO_CONNECTION_STRING secret set");
+    }
 
     eprintln!("[stdio] Setting RUNNER secret...");
     match commands::secrets::set_secret(&cloud, app_id, "RUNNER", "spidapter").await {
@@ -165,7 +185,7 @@ pub(crate) async fn provision_scp_app(
 
     // Always wait for spiced to accept SQL queries before returning.
     let poll_client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(600))
+        .timeout(Duration::from_mins(10))
         .build()?;
     commands::wait_for_deployment_ready(
         &poll_client,
@@ -200,6 +220,8 @@ pub(crate) async fn provision_scp_app(
         storage: FederatedStorageConfig::Direct, // will be replaced by setup() caller
         ec2_guards: vec![],
         dynamodb_guard: None,
+        mongodb_guard: None,
+        app_guard: Some(app_guard),
     })))
 }
 

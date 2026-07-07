@@ -34,9 +34,11 @@ pub async fn make_arrow_flight_client(
     api_key: Option<String>,
     tls_config: Option<ClientTlsConfig>,
 ) -> crate::Result<arrow_flight::FlightClient> {
-    let mut ep = Endpoint::from_str(endpoint)
-        .map_err(|e| Error::UnableToConnectToEndpoint { source: e })
-        .context(UnableToConnectToServerSnafu)?;
+    let mut ep = crate::configure_endpoint_for_high_throughput(
+        Endpoint::from_str(endpoint)
+            .map_err(|e| Error::UnableToConnectToEndpoint { source: e })
+            .context(UnableToConnectToServerSnafu)?,
+    );
 
     if let Some(tls_config) = tls_config {
         ep = ep

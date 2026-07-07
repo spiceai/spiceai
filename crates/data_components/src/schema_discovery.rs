@@ -20,9 +20,11 @@ limitations under the License.
 //! (e.g. `information_schema` and `DESCRIBE TABLE`) use [`discover_schema`]
 //! to probe both in parallel and apply a deterministic decision matrix.
 
-use arrow::datatypes::SchemaRef;
+use arrow::datatypes::{Field, Schema, SchemaRef};
 use async_trait::async_trait;
+use std::collections::{HashMap, HashSet};
 use std::future::Future;
+use std::sync::Arc;
 
 // ── Permissions trait ──────────────────────────────────────────────
 
@@ -198,6 +200,55 @@ pub async fn discover_schema(
         // AccessDenied and Permanent already handled above; Ok already handled above
         _ => Err(format!("Failed to discover schema for table '{table_name}'").into()),
     }
+}
+
+/// Merge an inferred schema with a declared schema.
+///
+/// Declared fields override inferred fields with the same name; fields that
+/// only appear in the inferred schema are kept; fields that only appear in
+/// the declared schema are appended after the inferred ones.
+///
+/// This was previously provided by `datafusion_table_providers::util::schema`
+/// but was removed in table-providers v0.11.0, so it is reimplemented here.
+#[must_use]
+pub fn merge_inferred_and_declared_schemas(
+    inferred: SchemaRef,
+    declared: Option<&SchemaRef>,
+) -> SchemaRef {
+    let Some(declared) = declared else {
+        return inferred;
+    };
+
+    let declared_by_name: HashMap<&str, &Field> = declared
+        .fields()
+        .iter()
+        .map(|f| (f.name().as_str(), f.as_ref()))
+        .collect();
+    let inferred_names: HashSet<&str> = inferred
+        .fields()
+        .iter()
+        .map(|f| f.name().as_str())
+        .collect();
+
+    let mut merged: Vec<Field> = inferred
+        .fields()
+        .iter()
+        .map(|f| {
+            declared_by_name
+                .get(f.name().as_str())
+                .copied()
+                .cloned()
+                .unwrap_or_else(|| f.as_ref().clone())
+        })
+        .collect();
+
+    for f in declared.fields() {
+        if !inferred_names.contains(f.name().as_str()) {
+            merged.push(f.as_ref().clone());
+        }
+    }
+
+    Arc::new(Schema::new(merged))
 }
 
 #[cfg(test)]

@@ -35,8 +35,12 @@ pub mod common;
 pub mod dml;
 #[cfg(feature = "postgres")]
 pub mod replication;
+#[cfg(feature = "postgres")]
+pub mod replication_shared;
 #[cfg(all(feature = "postgres", feature = "duckdb"))]
 pub mod replication_tpch;
+#[cfg(all(feature = "postgres", feature = "duckdb"))]
+pub mod schema_inference;
 
 #[tokio::test]
 async fn test_postgres_types() -> Result<(), anyhow::Error> {

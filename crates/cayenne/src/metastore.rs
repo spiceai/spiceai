@@ -28,8 +28,53 @@ pub mod turso;
 
 use std::fmt::Display;
 
-use super::catalog::CatalogResult;
+use super::catalog::{CatalogError, CatalogResult};
 use async_trait::async_trait;
+
+/// The Cayenne metastore schema version stamped into the backing database's
+/// `user_version` header by [`Metastore::init_schema`] on every open.
+///
+/// Bump this whenever a schema change makes a catalog written by the new code
+/// **unsafe to open with an older binary** — i.e. the older binary would return
+/// silently wrong results rather than fail cleanly.
+///
+/// Version history:
+/// - `1` — metadata-only upsert publish (#11260): upsert commits stop writing
+///   per-key `cayenne_insert_record` rows and instead stamp `reinsert_sequence`
+///   on key-based delete files. A pre-#11260 binary reads an empty insert-record
+///   table for post-upgrade upserts and silently filters out the current version
+///   of every upserted row. The gate below turns that latent silent-row-loss into
+///   a loud [`CatalogError::IncompatibleSchemaVersion`] on any future downgrade to
+///   a build whose max supported version is lower than the stamped one (#11291).
+pub const CAYENNE_METASTORE_SCHEMA_VERSION: i64 = 1;
+
+/// Guard against opening a metastore that was written by a **newer** Spice build
+/// than this one supports.
+///
+/// `stored_version` is the `user_version` header read from the catalog before any
+/// migration runs. A stored version greater than [`CAYENNE_METASTORE_SCHEMA_VERSION`]
+/// means the catalog carries a schema this build does not understand; continuing
+/// would risk silently wrong results (see the version history above), so we refuse
+/// to open it with a loud error instead. A stored version less than or equal to the
+/// current one is a legacy or same-version catalog and is safe to migrate forward
+/// (each backend re-stamps `user_version` to the current value after migrating).
+///
+/// A stamp of `0` — a fresh database, or any catalog written before this gate
+/// existed — is always accepted.
+///
+/// # Errors
+///
+/// Returns [`CatalogError::IncompatibleSchemaVersion`] if `stored_version` is
+/// greater than [`CAYENNE_METASTORE_SCHEMA_VERSION`].
+pub fn ensure_supported_schema_version(stored_version: i64) -> CatalogResult<()> {
+    if stored_version > CAYENNE_METASTORE_SCHEMA_VERSION {
+        return Err(CatalogError::IncompatibleSchemaVersion {
+            found: stored_version,
+            supported: CAYENNE_METASTORE_SCHEMA_VERSION,
+        });
+    }
+    Ok(())
+}
 
 /// Expected column definitions for a metadata table.
 ///
@@ -78,6 +123,9 @@ pub const EXPECTED_TABLES: &[ExpectedTable] = &[
             "file_size_bytes",
             "source_data_file_path",
             "sequence_number",
+            // Metadata-only publish: per-commit reinsert sequence (added last,
+            // matching the DDL column order + the ALTER backfill).
+            "reinsert_sequence",
         ],
     },
     ExpectedTable {
@@ -96,12 +144,17 @@ pub const EXPECTED_TABLES: &[ExpectedTable] = &[
     },
     ExpectedTable {
         name: "cayenne_insert_record",
-        columns: &[
-            "insert_record_id",
-            "table_id",
-            "pk_bytes",
-            "sequence_number",
-        ],
+        // Composite-PK table keyed on (table_id, pk_bytes); the former
+        // `insert_record_id` UUID column was never read and is dropped. SQLite
+        // declares it `WITHOUT ROWID`; Turso uses a plain rowid table because it
+        // does not support `WITHOUT ROWID` under its `mvcc` journal mode.
+        //
+        // `table_id` stores the 16 raw bytes of the UUID (`BLOB`) rather than
+        // the 36-char text — a pure re-encoding to cut WAL write volume on hot
+        // upsert bursts (see [`table_id_to_key_bytes`] and the DDL doc in
+        // `sqlite.rs`). Only column *names* are validated here, so the
+        // text→blob value change does not affect schema validation.
+        columns: &["table_id", "pk_bytes", "sequence_number"],
     },
     ExpectedTable {
         name: "cayenne_snapshot_sequence",
@@ -109,7 +162,57 @@ pub const EXPECTED_TABLES: &[ExpectedTable] = &[
     },
     ExpectedTable {
         name: "cayenne_table_statistics",
-        columns: &["table_id", "statistics_blob", "num_rows", "ndv_sketches"],
+        columns: &[
+            "table_id",
+            "statistics_blob",
+            "num_rows",
+            "ndv_sketches",
+            "num_rows_exact",
+        ],
+    },
+    ExpectedTable {
+        name: "cayenne_snapshot_file_statistics",
+        columns: &[
+            "table_id",
+            "snapshot_id",
+            "file_path",
+            "file_size_bytes",
+            "num_rows",
+            "statistics_blob",
+        ],
+    },
+    ExpectedTable {
+        // Authoritative per-snapshot data-file manifest (manifest snapshot
+        // model). Captured in metastore snapshots so a snapshot-bootstrapped
+        // node inherits the complete file set. Column order MUST match the DDL
+        // in `sqlite.rs`/`turso.rs` and the export/import column order.
+        name: "cayenne_snapshot_file",
+        columns: &[
+            "table_id",
+            "snapshot_id",
+            "file_path",
+            "row_count",
+            "file_size_bytes",
+            "min_sequence",
+            "max_sequence",
+        ],
+    },
+    ExpectedTable {
+        // Cold-tier object-store manifest. Table-scoped (no snapshot_id),
+        // append-only. Carries each cold file's stats blob inline (one row, no
+        // join) so listing-time pruning needs no object-store round-trip.
+        // Column order MUST match the DDL in `sqlite.rs`/`turso.rs` and the
+        // export/import column order.
+        name: "cayenne_cold_tier_file",
+        columns: &[
+            "table_id",
+            "file_url",
+            "row_count",
+            "file_size_bytes",
+            "min_sequence",
+            "max_sequence",
+            "statistics_blob",
+        ],
     },
     ExpectedTable {
         name: "cayenne_pk_index",
@@ -148,6 +251,43 @@ pub const EXPECTED_TABLES: &[ExpectedTable] = &[
         ],
     },
 ];
+
+/// Encode a `table_id` UUID string into the compact key bytes stored in the
+/// `cayenne_insert_record.table_id` column.
+///
+/// `cayenne_insert_record` is a hot, high-volume table: one row per
+/// deleted-then-reinserted PK of a CDC burst (20K–55K rows on hot upsert
+/// tables), and `table_id` is the leading field of its clustered
+/// `WITHOUT ROWID` primary key — physically rewritten on every row even though
+/// it is identical across the whole burst. Storing the 16 raw bytes of the
+/// UUID instead of its 36-char hyphenated text both narrows each B-tree cell
+/// and packs more rows per leaf page, cutting the WAL frames a burst writes by
+/// roughly a third.
+///
+/// This is a **pure re-encoding of an existing constant**: the same value is
+/// produced at every write, read, delete, and migration access path, so the
+/// `(table_id, pk_bytes)` upsert conflict target and the `WHERE table_id = ?`
+/// prefix scan are preserved exactly. The only consumer of the table
+/// (`get_insert_records`) reads back `pk_bytes` + `sequence_number` and never
+/// the encoded key beyond the `WHERE` filter, so the on-disk encoding is
+/// invisible to deletion-visibility ordering.
+///
+/// The function is **total**: a well-formed UUID (every production `table_id`
+/// is minted via `uuid::Uuid::now_v7().to_string()`) yields its 16 raw bytes;
+/// any other string falls back to its raw UTF-8 bytes. Because writer and
+/// reader call this same function, they always agree on the stored key
+/// regardless of which branch is taken — the fallback can never desync the
+/// upsert/lookup, it only forgoes the size win for a (non-production) non-UUID
+/// id. The hyphenated-text form is never written, so no other code path needs
+/// to recognise the legacy encoding except the one-shot `init_schema`
+/// migration, which converts existing TEXT rows via this same function.
+#[must_use]
+pub fn table_id_to_key_bytes(table_id: &str) -> Vec<u8> {
+    match uuid::Uuid::parse_str(table_id) {
+        Ok(uuid) => uuid.as_bytes().to_vec(),
+        Err(_) => table_id.as_bytes().to_vec(),
+    }
+}
 
 /// Validate the existing metadata table schemas against the expected definitions.
 ///
@@ -553,12 +693,77 @@ pub trait MetastoreBackend: Send + Sync {
     ///
     /// Returns an error if cleanup fails.
     async fn shutdown(&self) -> CatalogResult<()>;
+
+    /// Run a background WAL checkpoint off the hot path (cycle-5 TASK 2b).
+    ///
+    /// The default pass is PASSIVE — it drains the WAL into the main DB
+    /// without blocking writers or waiting for readers. Implementations MAY
+    /// escalate to a TRUNCATE checkpoint past a size threshold; TRUNCATE
+    /// briefly blocks writers, which is acceptable here precisely because this
+    /// runs on the background maintenance tick, never inside a hot CDC commit
+    /// (the inline `wal_autocheckpoint` is disabled). Default implementation
+    /// does nothing (backends without a WAL).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the checkpoint statement fails. A busy WAL is NOT an
+    /// error (the checkpoint simply does partial work).
+    async fn checkpoint_wal(&self) -> CatalogResult<()> {
+        Ok(())
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::catalog::CatalogError;
+
+    /// A well-formed UUID `table_id` encodes to its 16 raw bytes (the compact
+    /// WAL-volume form), and those bytes equal `Uuid::as_bytes`.
+    #[test]
+    fn test_table_id_to_key_bytes_uuid_is_16_raw_bytes() {
+        let id = uuid::Uuid::now_v7();
+        let bytes = table_id_to_key_bytes(&id.to_string());
+        assert_eq!(bytes.len(), 16, "a UUID must encode to exactly 16 bytes");
+        assert_eq!(
+            bytes,
+            id.as_bytes().to_vec(),
+            "the encoded bytes must be the UUID's raw bytes"
+        );
+        // Strictly smaller than the 36-char hyphenated text (the whole point).
+        assert!(bytes.len() < id.to_string().len());
+    }
+
+    /// The encoder is total and deterministic: a non-UUID string falls back to
+    /// its raw UTF-8 bytes (never panics), and repeated calls agree — so the
+    /// writer and reader always produce the same key regardless of input.
+    #[test]
+    fn test_table_id_to_key_bytes_non_uuid_falls_back_to_utf8() {
+        for s in ["bench-table-id", "", "not-a-uuid", "1234"] {
+            let a = table_id_to_key_bytes(s);
+            let b = table_id_to_key_bytes(s);
+            assert_eq!(a, b, "encoding must be deterministic for {s:?}");
+            assert_eq!(
+                a,
+                s.as_bytes().to_vec(),
+                "a non-UUID id must fall back to its raw UTF-8 bytes"
+            );
+        }
+    }
+
+    /// UUIDs that differ only in case / hyphenation still encode to the same
+    /// 16 bytes (UUID parsing is canonicalizing), so the key is stable.
+    #[test]
+    fn test_table_id_to_key_bytes_uuid_canonicalizes() {
+        let id = uuid::Uuid::now_v7();
+        let lower = id.to_string();
+        let upper = lower.to_uppercase();
+        assert_eq!(
+            table_id_to_key_bytes(&lower),
+            table_id_to_key_bytes(&upper),
+            "case differences in a UUID must not change the encoded key"
+        );
+    }
 
     #[tokio::test]
     async fn test_validate_existing_schema_matching_columns() {
@@ -675,6 +880,44 @@ mod tests {
         assert!(
             msg.contains("cayenne_table"),
             "Error message should name the mismatched table: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_ensure_supported_schema_version_accepts_legacy_and_current() {
+        // A fresh/legacy database reads user_version 0; a same-version catalog
+        // reads the current version. Both are safe to migrate forward and open.
+        ensure_supported_schema_version(0).expect("legacy (v0) catalog must open");
+        ensure_supported_schema_version(CAYENNE_METASTORE_SCHEMA_VERSION)
+            .expect("same-version catalog must open");
+    }
+
+    #[test]
+    fn test_ensure_supported_schema_version_rejects_newer() {
+        // A catalog stamped by a newer build must be refused loudly rather than
+        // opened and read with silently-wrong (dropped-row) results (#11291).
+        let newer = CAYENNE_METASTORE_SCHEMA_VERSION + 1;
+        let err =
+            ensure_supported_schema_version(newer).expect_err("a newer catalog must be rejected");
+        match err {
+            CatalogError::IncompatibleSchemaVersion { found, supported } => {
+                assert_eq!(found, newer, "reported version must be the stored one");
+                assert_eq!(
+                    supported, CAYENNE_METASTORE_SCHEMA_VERSION,
+                    "reported supported version must be this build's max"
+                );
+            }
+            other => panic!("expected IncompatibleSchemaVersion, got: {other}"),
+        }
+        // The message must be actionable and free of internal jargon.
+        let msg = CatalogError::IncompatibleSchemaVersion {
+            found: newer,
+            supported: CAYENNE_METASTORE_SCHEMA_VERSION,
+        }
+        .to_string();
+        assert!(
+            msg.contains("newer version of Spice") && msg.contains("Upgrade Spice"),
+            "message should tell the user to upgrade: {msg}"
         );
     }
 }

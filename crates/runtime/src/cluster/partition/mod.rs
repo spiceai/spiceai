@@ -170,9 +170,7 @@ pub(crate) async fn local_executor_table_statistics(
     // `TableProvider::statistics` — available even while position-based deletions
     // are pending (the CDC case). Encode NDV into the reported max so it survives
     // `UnionExec` over the per-executor scans.
-    if let Some(cayenne) = provider
-        .as_any()
-        .downcast_ref::<cayenne::CayenneTableProvider>()
+    if let Some(cayenne) = provider.downcast_ref::<cayenne::CayenneTableProvider>()
         && let Some(mut stats) = cayenne.optimizer_table_statistics()
         && stats.num_rows.get_value().is_some()
     {
@@ -193,7 +191,7 @@ pub(crate) async fn local_executor_table_statistics(
         && stats.num_rows.get_value().is_some()
         && has_any_column_bounds(&stats)
     {
-        return Some((stats, column_names));
+        return Some(((*stats).clone(), column_names));
     }
 
     tracing::debug!(table = %table, "No local statistics available for executor table");

@@ -124,7 +124,7 @@ impl Default for AssignmentConfig {
         Self {
             max_assignments_per_cycle: 100,
             max_partitions_per_executor: 1000,
-            discovery_timeout: Duration::from_secs(60),
+            discovery_timeout: Duration::from_mins(1),
         }
     }
 }

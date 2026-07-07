@@ -250,11 +250,102 @@ fn http_base_url_from_endpoints(
 
 /// Mirror of `SpicedInstance::external`'s URL inference, exposed here so we can
 /// fall back to a derived HTTP base URL when the adapter doesn't return one.
+#[expect(
+    clippy::unnecessary_wraps,
+    reason = "returns Option to compose with http_base_url_from_endpoints().or_else(...) at the call site"
+)]
 fn derive_http_base_url(flight_url: &str) -> Option<String> {
     if flight_url.contains("flight.spiceai.io") {
-        return Some("https://data.spiceai.io".to_string());
+        // Spice Cloud serves Flight (gRPC) on a `*-flight.spiceai.io` host and HTTP
+        // on the matching `*-data.spiceai.io` host. Region-specific cnames (e.g.
+        // `us-west-2-prod-aws-flight.spiceai.io`) must map to the SAME region's data
+        // host, so substitute the `flight` label rather than returning a hardcoded
+        // generic `data.spiceai.io` (which does not route to a region-cname app).
+        return Some(
+            flight_url
+                .trim_end_matches('/')
+                .replace("flight.spiceai.io", "data.spiceai.io"),
+        );
     }
-    flight_url
-        .rfind(':')
-        .map(|last_colon| format!("{base}:8090", base = &flight_url[..last_colon]))
+
+    let http_flight_url = flight_url
+        .strip_prefix("grpc://")
+        .map(|rest| format!("http://{rest}"))
+        .or_else(|| {
+            flight_url
+                .strip_prefix("grpc+tls://")
+                .map(|rest| format!("https://{rest}"))
+        });
+    let parse_target = http_flight_url.as_deref().unwrap_or(flight_url);
+    let Ok(mut url) = url::Url::parse(parse_target) else {
+        return Some(format!("{flight_url}:8090"));
+    };
+    url.set_path("");
+    url.set_query(None);
+    url.set_fragment(None);
+    if url.set_port(Some(8090)).is_err() {
+        return Some(format!("{flight_url}:8090"));
+    }
+    Some(url.as_str().trim_end_matches('/').to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::derive_http_base_url;
+
+    #[test]
+    fn derive_http_base_url_handles_missing_flight_port() {
+        assert_eq!(
+            derive_http_base_url("https://example.com"),
+            Some("https://example.com:8090".to_string())
+        );
+    }
+
+    #[test]
+    fn derive_http_base_url_replaces_flight_port() {
+        assert_eq!(
+            derive_http_base_url("http://localhost:50051"),
+            Some("http://localhost:8090".to_string())
+        );
+    }
+
+    #[test]
+    fn derive_http_base_url_maps_grpc_flight_scheme_to_http() {
+        assert_eq!(
+            derive_http_base_url("grpc://localhost:50051"),
+            Some("http://localhost:8090".to_string())
+        );
+    }
+
+    #[test]
+    fn derive_http_base_url_maps_grpc_tls_flight_scheme_to_https() {
+        assert_eq!(
+            derive_http_base_url("grpc+tls://localhost:50051"),
+            Some("https://localhost:8090".to_string())
+        );
+    }
+
+    #[test]
+    fn derive_http_base_url_falls_back_for_non_url_flight_address() {
+        assert_eq!(
+            derive_http_base_url("localhost:50051"),
+            Some("localhost:50051:8090".to_string())
+        );
+    }
+
+    #[test]
+    fn derive_http_base_url_maps_generic_spiceai_flight_to_data() {
+        assert_eq!(
+            derive_http_base_url("https://flight.spiceai.io"),
+            Some("https://data.spiceai.io".to_string())
+        );
+    }
+
+    #[test]
+    fn derive_http_base_url_maps_regional_spiceai_flight_to_data() {
+        assert_eq!(
+            derive_http_base_url("https://us-west-2-prod-aws-flight.spiceai.io"),
+            Some("https://us-west-2-prod-aws-data.spiceai.io".to_string())
+        );
+    }
 }

@@ -14,25 +14,34 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+#[cfg(feature = "bedrock")]
 use std::{collections::HashMap, num::NonZeroU32};
 
+#[cfg(feature = "bedrock")]
 use governor::Quota;
+#[cfg(feature = "bedrock")]
 use llms::bedrock::BedrockClient;
+#[cfg(feature = "bedrock")]
 use runtime_rate_control::RateControllerBuilder;
+#[cfg(feature = "bedrock")]
 use secrecy::{ExposeSecret, SecretString};
+#[cfg(feature = "bedrock")]
 use snafu::ResultExt;
 
 // Maximum number of concurrently running requests.
 // The overall request rate is controlled by the rate_limiter.
+#[cfg(feature = "bedrock")]
 const DEFAULT_MAX_CONCURRENT_INVOCATIONS: usize = 40;
 
 /// Extract a secret from a hashmap of secrets, if it exists.
+#[cfg(feature = "bedrock")]
 macro_rules! extract_secret {
     ($params:expr, $key:expr) => {
         $params.get($key).map(secrecy::ExposeSecret::expose_secret)
     };
 }
 
+#[cfg(feature = "bedrock")]
 pub(super) async fn create_bedrock_client(
     params: &HashMap<String, SecretString>,
     credential_provider_name: &'static str,

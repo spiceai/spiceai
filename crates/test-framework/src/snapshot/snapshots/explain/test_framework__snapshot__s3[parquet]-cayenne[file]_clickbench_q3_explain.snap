@@ -9,12 +9,8 @@ description: "Query: clickbench_q3"
 |               |   Aggregate: groupBy=[[]], aggr=[[sum(CAST(hits.AdvEngineID AS Int64)), count(Int64(1)), avg(CAST(hits.ResolutionWidth AS Float64))]]                            |
 |               |     TableScan: hits projection=[ResolutionWidth, AdvEngineID]                                                                                                    |
 | physical_plan | ProjectionExec: expr=[sum(hits.AdvEngineID)@0 as sum(hits.AdvEngineID), count(Int64(1))@1 as count(*), avg(hits.ResolutionWidth)@2 as avg(hits.ResolutionWidth)] |
-|               |   AggregateExec: mode=Final, gby=[], aggr=[sum(hits.AdvEngineID), count(Int64(1)), avg(hits.ResolutionWidth)]                                                    |
-|               |     CoalescePartitionsExec                                                                                                                                       |
-|               |       AggregateExec: mode=Partial, gby=[], aggr=[sum(hits.AdvEngineID), count(Int64(1)), avg(hits.ResolutionWidth)]                                              |
-|               |         SchemaCastScanExec                                                                                                                                       |
-|               |           CayenneAccelerationExec                                                                                                                                |
-|               |             BytesProcessedExec                                                                                                                                   |
-|               |               DataSourceExec: file_groups={16 groups: [<redacted>]}, projection=[ResolutionWidth, AdvEngineID], file_type=vortex                                 |
+|               |   MaintainedAggregateExec                                                                                                                                        |
+|               |     BytesProcessedExec                                                                                                                                           |
+|               |       DataSourceExec: partitions=1, partition_sizes=[<redacted>]                                                                                                 |
 |               |                                                                                                                                                                  |
 +---------------+------------------------------------------------------------------------------------------------------------------------------------------------------------------+

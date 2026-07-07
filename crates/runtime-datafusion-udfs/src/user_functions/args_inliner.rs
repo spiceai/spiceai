@@ -38,7 +38,7 @@ use std::collections::HashMap;
 use arrow::datatypes::Schema;
 use datafusion::{
     common::{
-        Column, Result as DataFusionResult,
+        Column, DFSchema, Result as DataFusionResult,
         tree_node::{Transformed, TreeNode},
     },
     logical_expr::{LogicalPlan, Projection, TableScan, expr::Alias},
@@ -53,6 +53,31 @@ fn is_args_table_ref(table_name: &datafusion::sql::TableReference) -> bool {
     table_name
         .table()
         .eq_ignore_ascii_case(SQL_TABLE_ARGS_TABLE_NAME)
+}
+
+/// Returns `true` if an *unqualified* column named `name` resolves uniquely to
+/// a field qualified by the `args` table within `input_schema`.
+///
+/// Derived output columns — aggregate aliases, projection aliases, subquery
+/// outputs, `ORDER BY`/`HAVING` references — are unqualified `Column`s too.
+/// Matching them by name alone (the previous behavior) stomped any such column
+/// whose name happened to collide with a scalar arg, replacing e.g. an
+/// aggregate result with the constant argument value. Resolving the name
+/// against the node's input schema ensures we only inline columns that actually
+/// originate from the `args` table. When the name is absent or ambiguous we are
+/// conservative and do not inline (this only forgoes a pushdown optimization,
+/// never changes results).
+fn unqualified_resolves_to_args(input_schema: &DFSchema, name: &str) -> bool {
+    let mut matches = input_schema
+        .iter()
+        .filter(|(_, field)| field.name().eq_ignore_ascii_case(name))
+        .map(|(qualifier, _)| qualifier);
+    match (matches.next(), matches.next()) {
+        // Unique match: inline only when it is qualified by `args`.
+        (Some(qualifier), None) => qualifier.is_some_and(is_args_table_ref),
+        // No match, or ambiguous across qualifiers: do not inline.
+        _ => false,
+    }
 }
 
 /// If `plan` is `Projection([single_expr], TableScan("args"))` and
@@ -175,6 +200,21 @@ pub(super) fn inline_args_into_plan(
     // all plans (including subquery plans).
     let plan = plan
         .transform_up_with_subqueries(|plan| {
+            // The schema a node's expressions resolve against is the merged
+            // schema of its inputs. Leaf nodes (e.g. `TableScan`) have no
+            // inputs, so fall back to the node's own schema. We use this to
+            // decide whether an *unqualified* column actually refers to the
+            // `args` table rather than to a derived column of the same name.
+            let mut input_schema = DFSchema::empty();
+            let inputs = plan.inputs();
+            if inputs.is_empty() {
+                input_schema.merge(plan.schema());
+            } else {
+                for input in inputs {
+                    input_schema.merge(input.schema());
+                }
+            }
+
             plan.map_expressions(|expr| {
                 expr.transform_up(|e| {
                     if let Expr::Column(Column {
@@ -185,8 +225,8 @@ pub(super) fn inline_args_into_plan(
                     {
                         let key = name.to_ascii_lowercase();
                         let should_replace = match relation {
-                            Some(r) => is_args_table_ref(r) && arg_map.contains_key(&key),
-                            None => arg_map.contains_key(&key),
+                            Some(r) => is_args_table_ref(r),
+                            None => unqualified_resolves_to_args(&input_schema, name),
                         };
                         if should_replace && let Some(value) = arg_map.get(&key) {
                             return Ok(Transformed::yes(Expr::Literal(value.clone(), None)));
@@ -374,6 +414,71 @@ mod tests {
         let original = plan_str(&plan);
         let rewritten = inline_args_into_plan(plan, &schema, &values).expect("rewrite");
         assert_eq!(original, plan_str(&rewritten));
+    }
+
+    /// Regression for the bug where a scalar arg whose name collides with a
+    /// derived (aggregate/projection-alias) output column stomped that column
+    /// with the arg literal. The body below never references `args`, so the
+    /// arg literal must NOT appear in the rewritten plan — the outer `total`
+    /// is the aggregate alias, not the argument.
+    #[tokio::test]
+    async fn inline_does_not_stomp_derived_column_with_arg_name() {
+        let schema = Schema::new(vec![ArrowField::new(
+            "total",
+            arrow::datatypes::DataType::Int64,
+            true,
+        )]);
+        let values = vec![ScalarValue::Int64(Some(999))];
+        let body = "SELECT total FROM (SELECT sum(id) AS total FROM t) sub";
+        let plan = plan_body(body, &schema, &values).await;
+        let rewritten = inline_args_into_plan(plan, &schema, &values).expect("rewrite");
+        let s = plan_str(&rewritten);
+        assert!(
+            !s.contains("Int64(999)"),
+            "Derived column `total` must not be replaced by the arg literal: {s}"
+        );
+        assert!(
+            s.contains("sum(t.id)") || s.contains("sum("),
+            "Aggregate over t.id should be preserved: {s}"
+        );
+    }
+
+    /// A scalar arg referenced as a bare (unqualified) column via
+    /// `CROSS JOIN args` must still be inlined — the fix resolves the name
+    /// against the input schema and finds it uniquely owned by `args`.
+    #[tokio::test]
+    async fn inline_replaces_unqualified_arg_via_cross_join() {
+        let schema = Schema::new(vec![ArrowField::new(
+            "offset",
+            arrow::datatypes::DataType::Int64,
+            true,
+        )]);
+        let values = vec![ScalarValue::Int64(Some(5))];
+        let body = "SELECT id + offset AS r FROM t CROSS JOIN args";
+        let plan = plan_body(body, &schema, &values).await;
+        let rewritten = inline_args_into_plan(plan, &schema, &values).expect("rewrite");
+        let s = plan_str(&rewritten);
+        assert!(
+            s.contains("Int64(5)"),
+            "Unqualified arg `offset` should be inlined: {s}"
+        );
+    }
+
+    /// A non-`args` table column that collides with an arg name must not be
+    /// inlined even when referenced unqualified (here `t.name` vs arg `name`).
+    #[tokio::test]
+    async fn inline_does_not_stomp_unqualified_base_table_column() {
+        let schema = utf8_schema(&["name"]);
+        let values = vec![ScalarValue::Utf8(Some("inlined".into()))];
+        // `name` here is `t.name`; `args` is not in scope for this query.
+        let body = "SELECT name FROM t WHERE id > 0";
+        let plan = plan_body(body, &schema, &values).await;
+        let rewritten = inline_args_into_plan(plan, &schema, &values).expect("rewrite");
+        let s = plan_str(&rewritten);
+        assert!(
+            !s.contains("Utf8(\"inlined\")"),
+            "Base-table column `name` must not be replaced by the arg literal: {s}"
+        );
     }
 
     #[tokio::test]

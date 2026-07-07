@@ -22,12 +22,10 @@ description: "Query: tpch_simple_q5"
 |               |           AggregateExec: mode=Partial, gby=[L_LINESTATUS@1 as L_LINESTATUS], aggr=[sum(O.O_TOTALPRICE)]                                                                        |
 |               |             HashJoinExec: mode=Partitioned, join_type=Inner, accumulator=MinMaxLeftAccumulator, on=[(O_ORDERKEY@0, L_ORDERKEY@0)], projection=[O_TOTALPRICE@1, L_LINESTATUS@3] |
 |               |               RepartitionExec: partitioning=Hash([O_ORDERKEY@0], 32), input_partitions=1                                                                                       |
-|               |                 CooperativeExec                                                                                                                                                |
-|               |                   BytesProcessedExec                                                                                                                                           |
-|               |                     OracleExec sql=SELECT "O_ORDERKEY", "O_TOTALPRICE" FROM "TPCH_SF1"."ORDERS"                                                                                |
+|               |                 BytesProcessedExec                                                                                                                                             |
+|               |                   OracleExec sql=SELECT "O_ORDERKEY", "O_TOTALPRICE" FROM "TPCH_SF1"."ORDERS"                                                                                  |
 |               |               RepartitionExec: partitioning=Hash([L_ORDERKEY@0], 32), input_partitions=1                                                                                       |
-|               |                 CooperativeExec                                                                                                                                                |
-|               |                   BytesProcessedExec                                                                                                                                           |
-|               |                     OracleExec sql=SELECT "L_ORDERKEY", "L_LINESTATUS" FROM "TPCH_SF1"."LINEITEM"                                                                              |
+|               |                 BytesProcessedExec                                                                                                                                             |
+|               |                   OracleExec sql=SELECT "L_ORDERKEY", "L_LINESTATUS" FROM "TPCH_SF1"."LINEITEM"                                                                                |
 |               |                                                                                                                                                                                |
 +---------------+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+

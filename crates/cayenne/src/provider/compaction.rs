@@ -340,6 +340,20 @@ pub(crate) trait CompactionRunner: Send + Sync {
 
     /// Identifier used in log messages.
     fn compaction_target_name(&self) -> &str;
+
+    /// Called once per background wake, before draining the compaction backlog.
+    /// A hook for per-tick maintenance — in particular the dynamic auto-tuning
+    /// control step (sample the environment + ingest/query response, apply at
+    /// most one bounded knob change) and its metric emission. Default no-op so
+    /// other [`CompactionRunner`] impls (e.g. test stubs) need not implement it.
+    fn on_background_tick(&self) {}
+
+    /// The (possibly dynamically-tuned) background interval to use for the NEXT
+    /// wake. `None` keeps the spawn-time interval. Lets the auto-tuner widen or
+    /// tighten the compaction cadence at runtime. Default `None`.
+    fn background_interval_hint(&self) -> Option<Duration> {
+        None
+    }
 }
 
 /// Maximum protected-snapshot merge passes a single table runs per wake-up
@@ -386,9 +400,13 @@ impl BackgroundCompactor {
         // from the query and refresh runtimes) when one has been injected;
         // otherwise fall back to the ambient runtime.
         let handle = spawn_compaction(async move {
+            // The interval is re-read from the runner each wake so the dynamic
+            // auto-tuner can widen/tighten the compaction cadence at runtime
+            // (defaults to the spawn-time interval when no hint is given).
+            let mut current = interval;
             'wake: loop {
                 tokio::select! {
-                    () = tokio::time::sleep(interval) => {}
+                    () = tokio::time::sleep(current) => {}
                     () = shutdown_task.notified() => break,
                 }
 
@@ -396,6 +414,14 @@ impl BackgroundCompactor {
                     // Provider dropped — task exits naturally.
                     break;
                 };
+
+                // Per-wake hook: the dynamic auto-tuning control step (+metrics).
+                // Runs before draining and before re-reading the interval so a
+                // just-applied cadence change takes effect on the next sleep.
+                runner.on_background_tick();
+                if let Some(next) = runner.background_interval_hint() {
+                    current = next;
+                }
 
                 // Drain the protected-snapshot backlog instead of doing a single
                 // tier-merge per tick. Each `run_compaction_trigger` merges only
@@ -530,6 +556,247 @@ impl Drop for BackgroundCompactor {
             return;
         };
         spawn_compactor_drain_thread(handle);
+    }
+}
+
+/// Trait the background mem-tier checkpointer uses to flush a memory-mode
+/// table's RAM tier on a periodic tick.
+///
+/// Implemented by `CayenneTableProvider`. Decouples the scheduler from the
+/// provider (parallel to [`CompactionRunner`]) so the scheduler is unit-testable
+/// with a stub, and keeps the runtime's slot-advancer concern out of this module
+/// — the provider's tick takes the per-table checkpoint lock and calls the
+/// existing `checkpoint_mem_tier`, which fires the slot advancer post-fence.
+#[async_trait::async_trait]
+pub(crate) trait MemTierCheckpointRunner: Send + Sync {
+    /// Run one periodic mem-tier checkpoint. A no-op when the table is not in
+    /// memory mode, is unarmed, or its tier is empty. Errors are logged by the
+    /// implementation (a failed checkpoint must NOT advance the slot — the
+    /// deferred committers stay queued and the next tick retries).
+    async fn run_mem_tier_checkpoint_tick(&self);
+
+    /// Identifier used in log messages.
+    fn mem_tier_checkpoint_target_name(&self) -> &str;
+
+    /// The (possibly re-read) interval to use for the NEXT wake. `None` keeps the
+    /// spawn-time interval. Mirrors [`CompactionRunner::background_interval_hint`]
+    /// so a future auto-tuner can widen/tighten the cadence at runtime.
+    fn checkpoint_interval_hint(&self) -> Option<Duration> {
+        None
+    }
+}
+
+/// Per-table background mem-tier checkpointer (`cdc_durability: memory`).
+///
+/// Owns a tokio task that wakes every `interval` and runs ONE checkpoint tick
+/// (`run_mem_tier_checkpoint_tick`), which flushes the RAM tier to a durable
+/// Vortex file and advances the deferred source slot ack. Modeled on
+/// [`BackgroundCompactor`]: a `Weak` runner so the task never pins the provider,
+/// a `select!` over `sleep(interval)` vs a shutdown `Notify`, the interval
+/// re-read each wake, and `Drop`-fires-shutdown + a bounded detached-thread drain
+/// so dropping the provider never blocks a Tokio worker.
+///
+/// Unlike the compactor there is NO shared semaphore and NO multi-pass drain
+/// loop: a single `checkpoint_mem_tier` flushes the entire tier in one call, and
+/// the per-table `mem_checkpoint_lock` (taken inside the tick) is the only
+/// serialization needed — it already excludes the write-path spill and the
+/// event-driven checkpoints, so two checkpoints for one table can never overlap.
+pub(crate) struct BackgroundMemTierCheckpointer {
+    handle: Option<tokio::task::JoinHandle<()>>,
+    shutdown: Arc<Notify>,
+}
+
+impl BackgroundMemTierCheckpointer {
+    /// Spawn the periodic checkpoint task. Returns `None` if `interval` is zero
+    /// (the task is disabled — the write-path caps still bound hot tables).
+    pub(crate) fn spawn(
+        runner: Weak<dyn MemTierCheckpointRunner>,
+        interval: Duration,
+    ) -> Option<Self> {
+        if interval.is_zero() {
+            return None;
+        }
+
+        let shutdown = Arc::new(Notify::new());
+        let shutdown_task = Arc::clone(&shutdown);
+
+        // Spawn onto the dedicated compaction runtime (shared low-priority
+        // background runtime) when one is injected, otherwise the ambient
+        // runtime — same routing as the compactor so background work stays off
+        // the query/refresh runtimes.
+        let handle = spawn_compaction(async move {
+            // Re-read the interval each wake so a future auto-tuner can adjust the
+            // cadence (defaults to the spawn-time interval when no hint is given).
+            let mut current = interval;
+            loop {
+                tokio::select! {
+                    () = tokio::time::sleep(current) => {}
+                    () = shutdown_task.notified() => break,
+                }
+
+                let Some(runner) = runner.upgrade() else {
+                    // Provider dropped — task exits naturally.
+                    break;
+                };
+
+                if let Some(next) = runner.checkpoint_interval_hint() {
+                    current = next;
+                }
+
+                tracing::trace!(
+                    target: "cayenne::mem_tier",
+                    table = runner.mem_tier_checkpoint_target_name(),
+                    "Periodic mem-tier checkpoint wake",
+                );
+
+                // One checkpoint per tick. The tick itself is a no-op on an empty
+                // or unarmed tier and takes the per-table lock only when there is
+                // something to flush, so an idle table costs one cheap wake.
+                runner.run_mem_tier_checkpoint_tick().await;
+            }
+        });
+
+        Some(Self {
+            handle: Some(handle),
+            shutdown,
+        })
+    }
+}
+
+fn drain_and_abort_checkpointer(handle: &JoinHandle<()>) {
+    // Let an in-flight checkpoint finish its current Vortex write before the
+    // surrounding runtime tears down, for the same vortex-io reason as the
+    // compactor drain (a task whose runtime is dropped mid-write panics).
+    let deadline = Instant::now() + COMPACTOR_SHUTDOWN_DRAIN;
+    while !handle.is_finished() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    handle.abort();
+}
+
+fn spawn_checkpointer_drain_thread(handle: JoinHandle<()>) {
+    let handle = Arc::new(Mutex::new(Some(handle)));
+    let handle_for_thread = Arc::clone(&handle);
+
+    match std::thread::Builder::new()
+        .name("cayenne-memtier-checkpoint-drain".to_string())
+        .spawn(move || {
+            let Some(handle) = handle_for_thread.lock().take() else {
+                return;
+            };
+            drain_and_abort_checkpointer(&handle);
+        }) {
+        Ok(join_handle) => drop(join_handle),
+        Err(error) => {
+            if let Some(handle) = handle.lock().take() {
+                handle.abort();
+            }
+            tracing::warn!(target: "cayenne::mem_tier", "Failed to spawn background mem-tier checkpointer drain thread; aborted task immediately: {error}");
+        }
+    }
+}
+
+impl Drop for BackgroundMemTierCheckpointer {
+    fn drop(&mut self) {
+        self.shutdown.notify_one();
+        let Some(handle) = self.handle.take() else {
+            return;
+        };
+        spawn_checkpointer_drain_thread(handle);
+    }
+}
+
+/// Periodic driver for the cold-tier promotion worker (storage-cascade bottom
+/// tier). Implemented by `CayenneTableProvider`; mirrors [`MemTierCheckpointRunner`]
+/// so the scheduler is decoupled from the provider and unit-testable with a stub.
+#[async_trait::async_trait]
+pub(crate) trait ColdTierPromotionRunner: Send + Sync {
+    /// Run one promotion tick. A no-op when the cold tier is disabled or the warm
+    /// tier has not crossed its promotion threshold. Errors are logged by the
+    /// implementation (a failed promotion leaves the warm tier intact and the
+    /// next tick retries).
+    async fn run_cold_tier_promotion_tick(&self);
+
+    /// Identifier used in log messages.
+    fn cold_tier_promotion_target_name(&self) -> &str;
+
+    /// The (possibly re-read) interval for the NEXT wake. `None` keeps the
+    /// spawn-time interval.
+    fn cold_tier_promotion_interval_hint(&self) -> Option<Duration> {
+        None
+    }
+}
+
+/// Per-table background cold-tier promoter (storage-cascade bottom tier).
+///
+/// Owns a tokio task that wakes every `interval` and runs ONE promotion tick
+/// (`run_cold_tier_promotion_tick`), which graduates the warm tier to the cold
+/// object store when its size/file thresholds are crossed. Modeled exactly on
+/// [`BackgroundMemTierCheckpointer`]: a `Weak` runner so the task never pins the
+/// provider, a `select!` over `sleep(interval)` vs a shutdown `Notify`, the
+/// interval re-read each wake, and `Drop`-fires-shutdown + a bounded detached
+/// drain. Runs on the shared low-priority compaction runtime via
+/// [`spawn_compaction`], on its OWN cadence — so the heavy whole-table
+/// graduation never blocks the compaction tick or the query/refresh runtimes.
+pub(crate) struct BackgroundColdTierPromoter {
+    handle: Option<tokio::task::JoinHandle<()>>,
+    shutdown: Arc<Notify>,
+}
+
+impl BackgroundColdTierPromoter {
+    /// Spawn the periodic promotion task. Returns `None` if `interval` is zero
+    /// (the task is disabled).
+    pub(crate) fn spawn(
+        runner: Weak<dyn ColdTierPromotionRunner>,
+        interval: Duration,
+    ) -> Option<Self> {
+        if interval.is_zero() {
+            return None;
+        }
+
+        let shutdown = Arc::new(Notify::new());
+        let shutdown_task = Arc::clone(&shutdown);
+
+        let handle = spawn_compaction(async move {
+            let mut current = interval;
+            loop {
+                tokio::select! {
+                    () = tokio::time::sleep(current) => {}
+                    () = shutdown_task.notified() => break,
+                }
+
+                let Some(runner) = runner.upgrade() else {
+                    break;
+                };
+
+                if let Some(next) = runner.cold_tier_promotion_interval_hint() {
+                    current = next;
+                }
+
+                tracing::trace!(
+                    target: "cayenne::compaction",
+                    table = runner.cold_tier_promotion_target_name(),
+                    "Periodic cold-tier promotion wake",
+                );
+
+                runner.run_cold_tier_promotion_tick().await;
+            }
+        });
+
+        Some(Self {
+            handle: Some(handle),
+            shutdown,
+        })
+    }
+}
+
+impl Drop for BackgroundColdTierPromoter {
+    fn drop(&mut self) {
+        self.shutdown.notify_one();
+        let Some(handle) = self.handle.take() else {
+            return;
+        };
+        spawn_checkpointer_drain_thread(handle);
     }
 }
 

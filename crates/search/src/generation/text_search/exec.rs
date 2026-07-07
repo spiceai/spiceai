@@ -10,7 +10,7 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
-use std::{any::Any, fmt::Formatter, sync::Arc};
+use std::{fmt::Formatter, sync::Arc};
 
 use arrow::{datatypes::SchemaRef, error::ArrowError};
 use async_stream::stream;
@@ -36,7 +36,7 @@ pub struct FullTextSearchExec {
     pub(super) query: String,
     filters: Vec<LogicalExpr>,
     limit: usize,
-    plan_properties: PlanProperties,
+    plan_properties: Arc<PlanProperties>,
 }
 
 impl FullTextSearchExec {
@@ -58,12 +58,12 @@ impl FullTextSearchExec {
             query,
             filters,
             limit,
-            plan_properties: PlanProperties::new(
+            plan_properties: Arc::new(PlanProperties::new(
                 EquivalenceProperties::new(schema),
                 Partitioning::UnknownPartitioning(1),
                 EmissionType::Incremental,
                 Boundedness::Bounded,
-            ),
+            )),
         })
     }
 }
@@ -89,11 +89,7 @@ impl ExecutionPlan for FullTextSearchExec {
         "FullTextSearchTableExec"
     }
 
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.plan_properties
     }
 

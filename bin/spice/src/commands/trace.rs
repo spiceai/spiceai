@@ -179,7 +179,16 @@ pub async fn execute(ctx: &RuntimeContext, args: &TraceArgs) -> Result<()> {
 }
 
 fn is_valid_trace_task(task: &str) -> bool {
+    // Built-in task types are matched exactly. Custom and MCP-proxied tools are recorded
+    // dynamically in task_history as `tool_use::<tool>` or `tool_use::<server>/<tool>`
+    // (via the `task_override` label emitted in runtime-tools), so the static allowlist
+    // can never enumerate them. Accept any `tool_use::`-prefixed task with a non-empty
+    // suffix; the SQL filter already quotes the value via `quote_sql_string`, so this does
+    // not introduce injection. See https://github.com/spiceai/spiceai/issues/10995.
     SUPPORTED_TRACE_TASKS.contains(&task)
+        || task
+            .strip_prefix("tool_use::")
+            .is_some_and(|suffix| !suffix.is_empty())
 }
 
 /// Quote a SQL string value (escape single quotes).
@@ -292,7 +301,7 @@ fn build_tree_node(
             .collect();
 
         // Sort children by start time
-        children.sort_by(|a, b| a.task_history.start_time.cmp(&b.task_history.start_time));
+        children.sort_by_key(|a| a.task_history.start_time);
 
         node.children = children;
     }
@@ -471,5 +480,46 @@ fn truncate_string(s: &str, max_len: Option<usize>) -> String {
             format!("{}... ({omitted} characters omitted)", &s[..max])
         }
         _ => s.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn built_in_trace_tasks_are_valid() {
+        for task in SUPPORTED_TRACE_TASKS {
+            assert!(is_valid_trace_task(task), "expected '{task}' to be valid");
+        }
+    }
+
+    #[test]
+    fn dynamic_mcp_tool_use_tasks_are_valid() {
+        // Regression for https://github.com/spiceai/spiceai/issues/10995: MCP and other
+        // custom tools are recorded with dynamic `tool_use::<server>/<tool>` task names.
+        assert!(is_valid_trace_task("tool_use::github/search_code"));
+        assert!(is_valid_trace_task("tool_use::my_catalog/my_tool"));
+        // A custom tool without a server segment is also valid.
+        assert!(is_valid_trace_task("tool_use::custom_tool"));
+    }
+
+    #[test]
+    fn invalid_trace_tasks_are_rejected() {
+        assert!(!is_valid_trace_task("bogus"));
+        assert!(!is_valid_trace_task(""));
+        // The bare prefix with no tool suffix is not a real task name.
+        assert!(!is_valid_trace_task("tool_use::"));
+    }
+
+    #[test]
+    fn dynamic_tool_task_produces_quoted_sql_filter() {
+        // The dynamic name must flow through unchanged and be single-quoted so it is a
+        // literal (not injected) in the generated SQL.
+        let filter = get_trace_filter("tool_use::github/search_code", None, None);
+        assert!(
+            filter.contains("task='tool_use::github/search_code'"),
+            "got: {filter}"
+        );
     }
 }

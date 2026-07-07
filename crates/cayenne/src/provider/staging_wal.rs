@@ -61,9 +61,12 @@ use super::constants::{STAGING_DIR_NAME, STAGING_WAL_FILENAME, STAGING_WAL_TMP_F
 use super::table::CayenneTableProvider;
 use crate::metastore::MetastoreTransaction;
 use crate::provider::Error;
+use arrow::record_batch::RecordBatch;
 use datafusion::execution::SendableRecordBatchStream;
 use futures::TryStreamExt;
+use object_store::ObjectStoreExt;
 use object_store::path::Path as ObjectStorePath;
+use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 use tokio::io::AsyncWriteExt;
@@ -101,6 +104,51 @@ impl std::fmt::Debug for CayenneStagedAppend {
             .field("target_kind", &self.target_kind)
             .field("row_count", &self.row_count)
             .finish()
+    }
+}
+
+/// RAII guard for the in-flight staging-append registration taken out at the
+/// start of [`CayenneStagedAppend::prepare`].
+///
+/// `prepare` must register the append as in-flight BEFORE awaiting the WAL write
+/// so a concurrent recovery pass cannot treat the not-yet-durable WAL as a crash
+/// leftover. If that `await` is cancelled (the `prepare` future is dropped),
+/// neither the method's error path nor [`PreparedStagedAppend`]'s `Drop` runs —
+/// so without this guard the registration would leak forever, permanently
+/// blocking compaction (`has_inflight_staging_appends`) and skewing recovery
+/// cleanup. The guard unregisters on drop and is [disarmed](Self::disarm) once a
+/// `PreparedStagedAppend` has taken over the registration (its own `Drop` then
+/// owns the unregister).
+struct InflightStagingAppendGuard<'a> {
+    table: &'a CayenneTableProvider,
+    staging_snapshot_id: &'a str,
+    armed: bool,
+}
+
+impl<'a> InflightStagingAppendGuard<'a> {
+    /// Register `staging_snapshot_id` as in-flight and return an armed guard.
+    fn register(table: &'a CayenneTableProvider, staging_snapshot_id: &'a str) -> Self {
+        table.register_inflight_staging_append(staging_snapshot_id);
+        Self {
+            table,
+            staging_snapshot_id,
+            armed: true,
+        }
+    }
+
+    /// Hand the registration off to a constructed `PreparedStagedAppend` so the
+    /// guard no longer unregisters on drop.
+    fn disarm(mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for InflightStagingAppendGuard<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            self.table
+                .unregister_inflight_staging_append(self.staging_snapshot_id);
+        }
     }
 }
 
@@ -240,6 +288,7 @@ impl CayenneStagedAppend {
         self.remove_wal().await?;
         self.table
             .publish_current_snapshot_files_changed_under_held_fence();
+        self.table.mark_maintained_aggregates_stale();
         record_cayenne_write_phase(self.table.table_name(), "publish_commit", commit_start);
         Ok(())
     }
@@ -276,10 +325,24 @@ impl CayenneStagedAppend {
     ///
     /// Returns an error if writing the staging WAL fails.
     pub async fn prepare(self) -> Result<PreparedStagedAppend> {
-        if self.target_kind == StagingWalTargetKind::CurrentSnapshot {
+        // Register the in-flight append BEFORE its WAL becomes discoverable on
+        // disk. Recovery treats any committed WAL whose id is not in the
+        // in-flight set as a crash leftover; writing the WAL first opened a
+        // window where a concurrent recovery pass could "recover" — move and
+        // delete — an append that was still being prepared.
+        //
+        // The guard reverts the registration on every early exit that does NOT
+        // hand it to a `PreparedStagedAppend`: a WAL-write error AND cancellation
+        // of this future mid-`await` (when neither the error path below nor
+        // `PreparedStagedAppend::drop` would run, which would otherwise leak the
+        // entry forever and permanently block compaction/recovery cleanup). It is
+        // disarmed once the receipt is built, handing the unregister to its `Drop`.
+        let inflight_guard =
+            InflightStagingAppendGuard::register(&self.table, &self.staging_snapshot_id);
+        let wal_write = if self.target_kind == StagingWalTargetKind::CurrentSnapshot {
             self.table
                 .write_staging_wal_for(&self.staging_snapshot_id)
-                .await?;
+                .await
         } else {
             self.table
                 .write_staging_wal_for_target(
@@ -287,16 +350,23 @@ impl CayenneStagedAppend {
                     &self.target_snapshot_id,
                     self.target_kind,
                 )
-                .await?;
-        }
-        self.table
-            .register_inflight_staging_append(&self.staging_snapshot_id);
+                .await
+        };
+        // On a WAL-write error the `?` returns early here and `inflight_guard`
+        // drops, reverting the registration.
+        wal_write?;
+        // WAL is durable; hand the in-flight registration to the receipt, whose
+        // `Drop` now owns the unregister.
+        inflight_guard.disarm();
         Ok(PreparedStagedAppend {
             table: self.table,
             staging_snapshot_id: self.staging_snapshot_id,
             target_snapshot_id: self.target_snapshot_id,
             target_kind: self.target_kind,
             row_count: self.row_count,
+            // Default: no incremental IVM feed. The write path attaches captured
+            // batches via `set_ivm_feed_batches` only for IVM tables.
+            ivm_feed_batches: None,
         })
     }
 
@@ -336,6 +406,14 @@ pub struct PreparedStagedAppend {
     target_snapshot_id: String,
     target_kind: StagingWalTargetKind,
     row_count: u64,
+    /// IVM feed: the insert `RecordBatches` captured at Stage A, present ONLY when
+    /// this table has a registered maintained aggregate AND the write is
+    /// incrementally feedable (set by the write path; `None` for non-IVM tables —
+    /// the common case, zero cost — or when the write must fall back to a full
+    /// rebuild). Consumed under the publish fence by
+    /// [`CayenneTableProvider::feed_staged_ivm_under_fence`]: `Some` feeds the
+    /// registry incrementally, `None` marks it stale (if IVM is registered).
+    ivm_feed_batches: Option<Arc<Vec<RecordBatch>>>,
 }
 
 impl std::fmt::Debug for PreparedStagedAppend {
@@ -346,6 +424,7 @@ impl std::fmt::Debug for PreparedStagedAppend {
             .field("target_snapshot_id", &self.target_snapshot_id)
             .field("target_kind", &self.target_kind)
             .field("row_count", &self.row_count)
+            .field("has_ivm_feed", &self.ivm_feed_batches.is_some())
             .finish()
     }
 }
@@ -362,6 +441,15 @@ impl PreparedStagedAppend {
     #[must_use]
     pub fn row_count(&self) -> u64 {
         self.row_count
+    }
+
+    /// Attach the IVM insert batches captured at Stage A (write path → receipt),
+    /// to be fed to the maintained-aggregate registry under the publish fence in
+    /// `apply_under_barrier` / `apply_under_held_barrier`. `None` (the default)
+    /// means no incremental feed — the registry is marked stale if IVM is
+    /// registered, falling queries back to a base scan.
+    pub(crate) fn set_ivm_feed_batches(&mut self, batches: Option<Arc<Vec<RecordBatch>>>) {
+        self.ivm_feed_batches = batches;
     }
 
     async fn lock_current_snapshot_for_apply(&self) -> Option<OwnedMutexGuard<()>> {
@@ -457,6 +545,12 @@ impl PreparedStagedAppend {
             self.table
                 .publish_current_snapshot_files_changed_under_held_fence();
         }
+        // IVM: feed the maintained-aggregate registry from this staged publish,
+        // atomically with the held listing fence (the serializer for concurrent
+        // finish() tasks) so applier-enqueue order == epoch order. `None` feed
+        // (non-IVM table, or a non-incremental write) marks stale instead.
+        self.table
+            .feed_staged_ivm_under_fence(self.ivm_feed_batches.as_ref());
         Ok(())
     }
 
@@ -491,6 +585,12 @@ impl PreparedStagedAppend {
             self.table
                 .publish_current_snapshot_files_changed_under_held_fence();
         }
+        // IVM: feed the maintained-aggregate registry from this staged publish,
+        // atomically with the held listing fence (the serializer for concurrent
+        // finish() tasks) so applier-enqueue order == epoch order. `None` feed
+        // (non-IVM table, or a non-incremental write) marks stale instead.
+        self.table
+            .feed_staged_ivm_under_fence(self.ivm_feed_batches.as_ref());
         Ok(())
     }
 
@@ -791,12 +891,26 @@ impl CayenneTableProvider {
             message: format!("Failed to serialize staging WAL: {e}"),
         })?;
 
-        // Single open + write + fsync, keeping the fd through to `sync_all`.
+        // Single open + write + fsync, keeping the fd through to the sync.
         // The previous revision called `tokio::fs::write` (which opens,
         // writes, drops the fd) and then re-opened the file to call
         // `sync_all` — paying an extra `open(2)` per WAL write on every
         // staged append. Replacing the two opens with one is a small but
         // real per-ingestion saving on the local-FS hot path.
+        //
+        // Ordering tier (`fsync_tier::ordering_sync_tokio_file`), not
+        // `sync_all`: on macOS BOTH std `sync_all` and `sync_data` are
+        // `fcntl(F_FULLFSYNC)` (~4-5 ms full drive-cache flush, measured),
+        // while plain `fsync(2)` is ~66 µs — and plain fsync is the macOS
+        // tier SQLite/DuckDB/Postgres default to. On Linux the helper is
+        // `fdatasync`, which flushes the WAL bytes + the size metadata needed
+        // to read them. Full-platter durability is not load-bearing here:
+        // losing this WAL record in a power-loss window only orphans staging
+        // files that recovery (`ensure_no_incomplete_write`) audits and
+        // discards — and the metastore's own visibility commits are SQLite
+        // `synchronous=NORMAL` (no fullfsync), so a stronger barrier on this
+        // marker file could not raise end-to-end durability anyway. See
+        // `provider/fsync_tier.rs` for the measurements and rationale.
         let mut file = tokio::fs::OpenOptions::new()
             .write(true)
             .create(true)
@@ -804,7 +918,7 @@ impl CayenneTableProvider {
             .open(&tmp_path)
             .await?;
         file.write_all(content.as_bytes()).await?;
-        file.sync_all().await?;
+        super::fsync_tier::ordering_sync_tokio_file(&file).await?;
         drop(file);
 
         if let Err(e) = tokio::fs::rename(&tmp_path, &wal_path).await {
@@ -961,20 +1075,22 @@ impl CayenneTableProvider {
                     self.staging_may_have_files()
                         .store(false, Ordering::Release);
                 }
-                // Durability: after removing the WAL marker (the "commit success" signal),
-                // fsync the staging directory so the unlink is persisted. A crash without
-                // this sync could make the removal non-durable, causing a false-positive
-                // "incomplete write" detection on the next open even though the data move
-                // succeeded and was synced. This completes the "WAL absent = durably
-                // committed" contract for local FS staged appends (symmetric to the
-                // sync after data file moves).
-                if let Err(e) = Self::sync_snapshot_dir(&staging_dir).await {
-                    tracing::warn!(
-                        "Failed to sync staging dir after WAL removal for table {}: {e} (data is safe; may see stale WAL on restart)",
-                        self.table_name(),
-                    );
-                    // Non-fatal: data files are already durable. A lingering WAL is conservative.
-                }
+                // No staging-dir fsync after the WAL unlink. The data move's
+                // target-snapshot dir fsync (`move_staging_files_local`) already
+                // made this commit durable BEFORE this point, so persisting the
+                // WAL *unlink* is a recovery-hygiene ordering hint, not a
+                // durability barrier — and it bought nothing end-to-end (the
+                // next line `remove_dir`s this same directory without a sync
+                // anyway). A crash in this window self-heals: recovery's
+                // `ensure_no_incomplete_write` audit finds every WAL-listed file
+                // already in the target snapshot and re-drives the idempotent
+                // (now no-op) move, then removes the stale WAL. Dropping this
+                // barrier cuts one ordering-tier `fsync(2)` from EVERY staged
+                // commit — a real saving on EBS / provisioned-IOPS, where each
+                // barrier is a billed, capped operation. The durable commit
+                // boundary (the target-dir fsync) and the recovery substrate
+                // (the WAL-content fsync + the post-rename staging-dir fsync)
+                // are untouched.
                 match tokio::fs::remove_dir(&staging_dir).await {
                     Ok(()) => {}
                     Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
@@ -1016,6 +1132,21 @@ impl CayenneTableProvider {
                 return Ok(());
             }
         }
+
+        // Exclude the pipelined staged-commit finalize while recovering. The
+        // Stage-B finalize (`apply_under_held_barrier`) moves staged files out
+        // of `_staging/` under `visibility_lock` WITHOUT `write_lock`, while
+        // this recovery runs under `write_lock` only — with no shared lock,
+        // recovery can read a WAL written milliseconds ago by a still-running
+        // finalize and "recover" (move + delete) the staging entries out from
+        // under it (observed live: ENOENT mid-finalize → the changes stream
+        // died permanently with "manual intervention required"). Taking the
+        // visibility lock makes recovery and finalize mutually exclusive.
+        // Lock order is safe: every caller of this function holds `write_lock`
+        // (or runs single-threaded at provider open), matching the staged
+        // publish order `write_lock → visibility_lock`; the finalize task
+        // never takes `write_lock`, so no inversion exists.
+        let _visibility = self.visibility_lock_arc().lock_owned().await;
 
         let mut located_wals = self.read_staging_wals().await?;
         // Sort by the staging snapshot id rather than `wal.created_at`. The
@@ -1300,9 +1431,14 @@ impl CayenneTableProvider {
         // in-flight append is known, clear any orphan pre-WAL staging files
         // and correct the flags so future writes take the fast path. Unparseable
         // committed WALs are errors above; only uncommitted tmp WALs are ignored.
+        //
+        // Cleanup is per-entry (`clear_orphan_staging_dirs`), never a whole-root
+        // delete: an append registering concurrently with this pass must not
+        // lose its staged files (the whole-root variant destroyed a pipelined
+        // finalize's staging dir mid-move — observed live as a permanent
+        // changes-stream failure).
         if !self.has_inflight_staging_appends() {
-            self.staging_may_have_files().store(true, Ordering::Release);
-            self.clear_staging_dir().await?;
+            self.clear_orphan_staging_dirs().await?;
             self.staging_wal_present().store(false, Ordering::Release);
         }
         Ok(())

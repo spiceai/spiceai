@@ -16,6 +16,8 @@ limitations under the License.
 
 pub mod provider;
 
+use std::sync::Arc;
+
 use async_trait::async_trait;
 use connection_manager::SqlServerConnectionPool;
 use convert::{map_column_type_to_arrow_type, map_type_name_to_column_type};
@@ -35,7 +37,6 @@ use datafusion::{
 };
 use util::format_datafusion_error;
 
-use std::{any::Any, sync::Arc};
 pub mod connection_manager;
 mod convert;
 pub mod dialect;
@@ -170,10 +171,6 @@ impl SqlServerTableProvider {
 
 #[async_trait]
 impl TableProvider for SqlServerTableProvider {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema(&self) -> SchemaRef {
         Arc::clone(&self.schema)
     }
@@ -300,7 +297,7 @@ fn is_time_related_expr(expr: &Expr) -> bool {
     match expr {
         Expr::Cast(cast) => {
             matches!(
-                cast.data_type,
+                cast.field.data_type(),
                 DataType::Time32(_) | DataType::Time64(_) | DataType::Timestamp(_, _)
             )
         }

@@ -37,8 +37,8 @@ use datafusion::{
 use globset::GlobSet;
 use snafu::prelude::*;
 use std::collections::HashMap;
+use std::fmt;
 use std::sync::{Arc, RwLock};
-use std::{any::Any, fmt};
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -223,10 +223,6 @@ impl GlueCatalogProvider {
 }
 
 impl CatalogProvider for GlueCatalogProvider {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema_names(&self) -> Vec<String> {
         // Schema, here, refers to Glue databases
         let databases = match self.databases.read() {
@@ -286,10 +282,6 @@ impl RefreshableCatalogProvider for GlueCatalogProvider {
 
 #[async_trait]
 impl SchemaProvider for GlueSchemaProvider {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn table_names(&self) -> Vec<String> {
         let tables = match self.tables.read() {
             Ok(t) => t,

@@ -31,7 +31,7 @@ use std::collections::HashMap;
 use std::fmt;
 use std::sync::Arc;
 use vortex_datafusion::VortexAccessPlan;
-use vortex_scan::Selection;
+use vortex_scan::selection::Selection;
 
 /// Position-based deletion state for a single data file.
 ///
@@ -451,5 +451,68 @@ impl PkDeletionStrategyWithCache {
                 ),
             }),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::BTreeSet;
+
+    /// Regression test for the `deletion_snapshot` lost-update race that the
+    /// `rcu`-based publishing fixes. The old pattern (`load_full()` + `store()`)
+    /// could clobber a concurrent prune/add that landed between the load and the
+    /// store, resurrecting tombstoned rows.
+    ///
+    /// We make the race DETERMINISTIC via `ArcSwap::rcu`'s contract: the closure
+    /// re-runs whenever the cell changed under it. On the first closure call we
+    /// inject a concurrent prune (simulating a compaction that lands between the
+    /// rcu load and its compare-and-swap), forcing `rcu` to retry against the
+    /// PRUNED index. The published result must reflect BOTH the prune and the
+    /// add — never the stale pre-prune view.
+    ///
+    /// With the old non-atomic `load_full()` + `store()`, the add (built off the
+    /// pre-prune load) would overwrite the prune and resurrect the deleted key —
+    /// `delete_len()` would be 3 and the deleted set would include pk 1.
+    #[test]
+    fn rcu_publish_does_not_lose_a_concurrent_prune() {
+        // Live index: pk 1 deleted at seq 10, pk 2 deleted at seq 20.
+        let initial = DeletionIndex::empty().extend_max_deletes([(1_i64, 10_i64), (2, 20)]);
+        assert_eq!(initial.delete_len(), 2);
+        let cell = ArcSwap::from_pointee(Int64PkDeletionSnapshot::from_index(initial));
+
+        // A writer adds a pure delete for pk 3 at seq 30 via `rcu`. On the first
+        // closure call we inject a concurrent prune at cutoff=10 (drops pk 1),
+        // forcing `rcu` to retry against the pruned index.
+        let mut injected = false;
+        cell.rcu(|current| {
+            if !injected {
+                injected = true;
+                let pruned = current.tombstones.prune_deletes_at_or_below(10);
+                cell.store(Arc::new(Int64PkDeletionSnapshot::from_index(pruned)));
+            }
+            let updated = current
+                .tombstones
+                .extend_max(std::iter::once((3_i64, 30_i64)), std::iter::empty());
+            Arc::new(Int64PkDeletionSnapshot::from_index(updated))
+        });
+
+        assert!(injected, "the injected concurrent prune should have run");
+
+        let guard = cell.load();
+        let final_index = &guard.tombstones;
+        let deleted: BTreeSet<i64> = final_index
+            .iter_entries()
+            .filter(|(_, entry)| entry.delete_sequence().is_some())
+            .map(|(pk, _)| pk)
+            .collect();
+
+        // pk 1 stayed pruned (no resurrection), pk 2 untouched, pk 3 added.
+        assert_eq!(
+            deleted,
+            [2_i64, 3].into_iter().collect::<BTreeSet<_>>(),
+            "rcu lost the concurrent prune (pk 1 resurrected) or dropped the add"
+        );
+        assert_eq!(final_index.delete_len(), 2);
     }
 }

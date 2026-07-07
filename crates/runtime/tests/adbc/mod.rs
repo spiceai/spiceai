@@ -16,7 +16,7 @@ limitations under the License.
 
 use crate::{
     configure_test_datafusion, init_tracing,
-    utils::{runtime_ready_check, test_request_context},
+    utils::{register_test_connectors, runtime_ready_check, test_request_context},
 };
 use app::AppBuilder;
 use datafusion::assert_batches_eq;
@@ -91,10 +91,11 @@ async fn test_adbc_sqlite_file_backed() -> Result<(), String> {
                 .build();
 
             configure_test_datafusion();
+            register_test_connectors().await;
             let rt = Runtime::builder().with_app(app).build().await;
 
             tokio::select! {
-                () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+                () = tokio::time::sleep(std::time::Duration::from_mins(1)) => {
                     return Err("Timed out waiting for datasets to load".to_string());
                 }
                 () = Arc::new(rt.clone()).load_components() => {}
@@ -222,10 +223,11 @@ async fn test_adbc_duckdb_file_backed() -> Result<(), String> {
                 .build();
 
             configure_test_datafusion();
+            register_test_connectors().await;
             let rt = Runtime::builder().with_app(app).build().await;
 
             tokio::select! {
-                () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+                () = tokio::time::sleep(std::time::Duration::from_mins(1)) => {
                     return Err("Timed out waiting for datasets to load".to_string());
                 }
                 () = Arc::new(rt.clone()).load_components() => {}
@@ -299,10 +301,11 @@ async fn test_adbc_sqlite_prepopulated_data() -> Result<(), String> {
                 .build();
 
             configure_test_datafusion();
+            register_test_connectors().await;
             let rt = Runtime::builder().with_app(app).build().await;
 
             tokio::select! {
-                () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+                () = tokio::time::sleep(std::time::Duration::from_mins(1)) => {
                     return Err("Timed out waiting for datasets to load".to_string());
                 }
                 () = Arc::new(rt.clone()).load_components() => {}
@@ -388,10 +391,11 @@ async fn test_adbc_connection_options() -> Result<(), String> {
                 .build();
 
             configure_test_datafusion();
+            register_test_connectors().await;
             let rt = Runtime::builder().with_app(app).build().await;
 
             tokio::select! {
-                () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+                () = tokio::time::sleep(std::time::Duration::from_mins(1)) => {
                     return Err("Timed out waiting for datasets to load".to_string());
                 }
                 () = Arc::new(rt.clone()).load_components() => {}
@@ -449,10 +453,11 @@ async fn test_adbc_sqlite_schema_inference() -> Result<(), String> {
                 .build();
 
             configure_test_datafusion();
+            register_test_connectors().await;
             let rt = Runtime::builder().with_app(app).build().await;
 
             tokio::select! {
-                () = tokio::time::sleep(Duration::from_secs(60)) => {
+                () = tokio::time::sleep(Duration::from_mins(1)) => {
                     return Err("Timed out waiting for datasets to load".to_string());
                 }
                 () = Arc::new(rt.clone()).load_components() => {}
@@ -515,10 +520,11 @@ async fn test_adbc_sqlite_empty_table_schema() -> Result<(), String> {
                 .build();
 
             configure_test_datafusion();
+            register_test_connectors().await;
             let rt = Runtime::builder().with_app(app).build().await;
 
             tokio::select! {
-                () = tokio::time::sleep(Duration::from_secs(60)) => {
+                () = tokio::time::sleep(Duration::from_mins(1)) => {
                     return Err("Timed out waiting for datasets to load".to_string());
                 }
                 () = Arc::new(rt.clone()).load_components() => {}
@@ -614,10 +620,11 @@ async fn test_adbc_sqlite_dataset_registration_in_information_schema() -> Result
                 .build();
 
             configure_test_datafusion();
+            register_test_connectors().await;
             let rt = Runtime::builder().with_app(app).build().await;
 
             tokio::select! {
-                () = tokio::time::sleep(Duration::from_secs(60)) => {
+                () = tokio::time::sleep(Duration::from_mins(1)) => {
                     return Err("Timed out waiting for datasets to load".to_string());
                 }
                 () = Arc::new(rt.clone()).load_components() => {}
@@ -679,6 +686,7 @@ async fn test_adbc_sqlite_missing_table_error() -> Result<(), String> {
                 .build();
 
             configure_test_datafusion();
+            register_test_connectors().await;
             let rt = Runtime::builder().with_app(app).build().await;
 
             tokio::select! {
@@ -712,6 +720,7 @@ async fn test_adbc_sqlite_in_memory_rejected() -> Result<(), String> {
                 .build();
 
             configure_test_datafusion();
+            register_test_connectors().await;
             let rt = Runtime::builder().with_app(app).build().await;
 
             tokio::select! {
@@ -748,6 +757,7 @@ async fn test_adbc_sqlite_missing_driver_param() -> Result<(), String> {
                 .build();
 
             configure_test_datafusion();
+            register_test_connectors().await;
             let rt = Runtime::builder().with_app(app).build().await;
 
             tokio::select! {
@@ -786,6 +796,7 @@ async fn test_adbc_invalid_driver_name() -> Result<(), String> {
                 .build();
 
             configure_test_datafusion();
+            register_test_connectors().await;
             let rt = Runtime::builder().with_app(app).build().await;
 
             tokio::select! {
@@ -818,6 +829,7 @@ async fn test_adbc_invalid_uri() -> Result<(), String> {
                 .build();
 
             configure_test_datafusion();
+            register_test_connectors().await;
             let rt = Runtime::builder().with_app(app).build().await;
 
             tokio::select! {

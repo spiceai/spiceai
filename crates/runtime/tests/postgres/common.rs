@@ -29,8 +29,8 @@ use crate::docker::{ContainerRunnerBuilder, RunningContainer, wait_for_tcp_port}
 pub const PG_PASSWORD: &str = "runtime-integration-test-pw";
 const PG_IMAGE: &str = "docker.io/library/postgres:latest";
 const PG_DOCKER_CONTAINER: &str = "runtime-integration-test-postgres";
-const PG_CONTAINER_START_TIMEOUT: Duration = Duration::from_secs(180);
-const PG_HOST_PORT_READY_TIMEOUT: Duration = Duration::from_secs(60);
+const PG_CONTAINER_START_TIMEOUT: Duration = Duration::from_mins(3);
+const PG_HOST_PORT_READY_TIMEOUT: Duration = Duration::from_mins(1);
 
 pub fn get_pg_params(port: usize) -> HashMap<String, SecretString> {
     let mut params = HashMap::new();

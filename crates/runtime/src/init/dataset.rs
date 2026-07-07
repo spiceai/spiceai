@@ -17,7 +17,6 @@ limitations under the License.
 use std::{collections::HashMap, future::Future, pin::Pin, sync::Arc, time::Instant};
 
 use crate::cluster::partition::get_partition_filter_exprs;
-use crate::component::dataset::acceleration::Mode;
 use crate::dataaccelerator::BootstrapStatus;
 use crate::dataaccelerator::spice_sys::OpenOption;
 use crate::dataaccelerator::spice_sys::caching_engine::CachingEngineSys;
@@ -571,15 +570,100 @@ impl Runtime {
         }
     }
 
+    /// Apply extended schema inference to a freshly-resolved dataset.
+    ///
+    /// When the dataset opts into `schema_inference: extended` and the source
+    /// connector emitted inferred-schema metadata, this fills any acceleration
+    /// settings the user left unset (primary key, indexes, sort columns) and
+    /// returns a rebuilt `Dataset`. Applying it here — before the `FederatedTable`
+    /// and registration are created — ensures every refresh mode, including CDC
+    /// (`refresh_mode: changes`), observes the inferred values. Returns `ds`
+    /// unchanged when inference is disabled, the dataset is not accelerated, or no
+    /// usable metadata was emitted.
+    fn apply_inferred_acceleration(
+        ds: Arc<Dataset>,
+        provider: &Arc<dyn datafusion::datasource::TableProvider>,
+    ) -> Arc<Dataset> {
+        use crate::component::dataset::schema_inference::apply_inferred_schema;
+        use data_components::inferred_schema::InferredSchema;
+
+        // Skip when extended inference is off, or the dataset is not accelerated —
+        // including an `acceleration` block that is present but `enabled: false`,
+        // which the rest of the runtime treats as non-accelerated.
+        if !ds.schema_inference.is_extended()
+            || !ds.acceleration.as_ref().is_some_and(|a| a.enabled)
+        {
+            return ds;
+        }
+
+        let source_schema = provider.schema();
+        let inferred = InferredSchema::from_metadata(source_schema.metadata());
+        // Only acceleration settings (primary key / indexes / sort / shard key) are
+        // applied here; inferred sizing and column statistics ride on the provider
+        // schema metadata and are surfaced as table statistics / tuning inputs
+        // elsewhere. Skip the refresh_sql parse and dataset rebuild when nothing
+        // acceleration-relevant was inferred (e.g. sizing only).
+        // `shard_key` is consumed only by Cayenne (see `apply_inferred_shard_key`);
+        // for other engines it is not acceleration-relevant and must not, on its
+        // own, force a refresh_sql parse + dataset rebuild below.
+        let shard_key_relevant = !inferred.shard_key.is_empty()
+            && ds.acceleration.as_ref().is_some_and(|a| {
+                a.engine.to_unpartitioned()
+                    == crate::component::dataset::acceleration::Engine::Cayenne
+            });
+        if inferred.primary_key.is_empty()
+            && inferred.indexes.is_empty()
+            && inferred.sort_columns.is_empty()
+            && !shard_key_relevant
+        {
+            return ds;
+        }
+
+        // Resolve the schema the accelerator will actually store. When a refresh_sql
+        // reshapes the schema, validate inferred columns against the projected
+        // schema; if it can't be parsed, skip inference rather than risk injecting a
+        // column the accelerator would later reject.
+        let effective_schema = match ds
+            .acceleration
+            .as_ref()
+            .and_then(|a| a.refresh_sql.as_ref())
+        {
+            Some(sql) => match crate::datafusion::refresh_sql::parse_refresh_sql(
+                ds.name.clone(),
+                sql.as_str(),
+                Arc::clone(&source_schema),
+            ) {
+                Ok((_, projected)) => projected,
+                Err(error) => {
+                    tracing::debug!(
+                        dataset = %ds.name,
+                        %error,
+                        "Skipping extended schema inference; could not parse refresh_sql to validate inferred columns"
+                    );
+                    return ds;
+                }
+            },
+            None => source_schema,
+        };
+
+        let mut new_ds = (*ds).clone();
+        if let Some(acceleration) = new_ds.acceleration.as_mut() {
+            apply_inferred_schema(acceleration, &inferred, &effective_schema, ds.name.table());
+        }
+        Arc::new(new_ds)
+    }
+
     pub(crate) async fn register_loaded_dataset(
         self: Arc<Self>,
-        ds: Arc<Dataset>,
+        mut ds: Arc<Dataset>,
         data_connector: Arc<dyn DataConnector>,
         accelerated_table: Option<Arc<AcceleratedTable>>,
         bootstrap_status: BootstrapStatus,
         load_semaphore: Option<Arc<Semaphore>>,
     ) -> Result<()> {
-        let source = ds.source();
+        // Owned (not borrowed from `ds`) so the dataset can be rebuilt below by
+        // extended schema inference without holding a borrow across the reassignment.
+        let source = ds.source().to_string();
         let spaced_tracer = Arc::clone(&self.spaced_tracer);
         if let Some(acceleration) = &ds.acceleration
             && data_connector.resolve_refresh_mode(acceleration.refresh_mode)
@@ -594,12 +678,19 @@ impl Runtime {
             return Err(err);
         }
 
-        // In file_update mode, schema mismatches are handled by create_accelerated_table
-        // which detects changes and recreates the acceleration with the new schema.
-        let allow_schema_mismatch = ds
-            .acceleration
-            .as_ref()
-            .is_some_and(|a| a.mode == Mode::FileUpdate);
+        // Bypass the deferred-mismatch gate when the dataset recreates on a schema change, so
+        // create_accelerated_table drops + recreates the table with the new schema instead of
+        // deferring. `recreates_on_schema_mismatch` is the single source of truth for the exact
+        // conditions (`file_update` with refreshes enabled, or `on_schema_change:
+        // drop_and_recreate` + `refresh_mode: full` on a recreate-capable engine); sharing it
+        // keeps this gate and the recreate decision in create_accelerated_table aligned.
+        let allow_schema_mismatch = ds.acceleration.as_ref().is_some_and(|a| {
+            crate::schema_evolution::recreates_on_schema_mismatch(
+                a,
+                ds.on_schema_change,
+                data_connector.resolve_refresh_mode(a.refresh_mode),
+            )
+        });
 
         // Test dataset connectivity by attempting to get a read provider.
         // Acquire the load semaphore (if provided) to limit concurrent source queries.
@@ -614,6 +705,10 @@ impl Runtime {
         let schema_start = Instant::now();
         let federated_table = match data_connector.read_provider(&ds).await {
             Ok(provider) => {
+                // Gap-fill acceleration settings from extended schema inference (no-op
+                // unless `schema_inference: extended` and the connector emitted metadata)
+                // before the dataset flows into registration and any changes stream.
+                ds = Self::apply_inferred_acceleration(ds, &provider);
                 FederatedTable::new(
                     Arc::clone(&ds),
                     provider,
@@ -668,6 +763,14 @@ impl Runtime {
         // begin their source-facing work while this one registers.
         drop(load_guard);
 
+        // `on_schema_change: fail` records an actionable message when a schema change
+        // deferred the provider. Capture it now (the table is moved into registration)
+        // and surface it as the dataset status AFTER registration completes —
+        // registration marks checkpointed datasets Ready, which the fail policy
+        // must override. The deferred retry keeps serving the existing acceleration
+        // and self-heals (a later refresh restores Ready) if the source reverts.
+        let schema_change_failure = federated_table.schema_change_failure().map(str::to_string);
+
         let register_start = Instant::now();
         match Arc::clone(&self)
             .register_dataset(
@@ -675,7 +778,7 @@ impl Runtime {
                 RegisterDatasetContext {
                     data_connector: Arc::clone(&data_connector),
                     federated_read_table: federated_table,
-                    source: source.to_string(),
+                    source,
                     accelerated_table,
                     bootstrap_status,
                 },
@@ -725,6 +828,13 @@ impl Runtime {
                 );
                 metrics::datasets::COUNT.add(1, &[KeyValue::new("engine", engine)]);
 
+                if let Some(message) = schema_change_failure {
+                    self.status.update_dataset(
+                        &ds.name,
+                        status::ComponentStatus::error_with_message(message),
+                    );
+                }
+
                 Ok(())
             }
             Err(err) => {
@@ -766,6 +876,10 @@ impl Runtime {
                 return;
             }
         }
+
+        // Drop the dataset's CDC schema-evolution settings; a reload re-installs
+        // them at registration before the changes stream starts.
+        crate::accelerated_table::refresh_task::changes::remove_cdc_schema_evolution(&ds_name);
 
         tracing::info!("Unloaded dataset {}", &ds_name);
         let engine = ds_acceleration.map_or_else(
@@ -894,10 +1008,16 @@ impl Runtime {
             }
             .build()
         })?;
-        let allow_schema_mismatch = ds
-            .acceleration
-            .as_ref()
-            .is_some_and(|a| a.mode == Mode::FileUpdate);
+        // Same recreate-bypass as the initial-load gate. Previously this honored only
+        // `file_update`, so a reloaded `on_schema_change: drop_and_recreate` dataset would not
+        // recreate on an incompatible source change; the shared helper fixes that.
+        let allow_schema_mismatch = ds.acceleration.as_ref().is_some_and(|a| {
+            crate::schema_evolution::recreates_on_schema_mismatch(
+                a,
+                ds.on_schema_change,
+                connector.resolve_refresh_mode(a.refresh_mode),
+            )
+        });
         let federated_table = FederatedTable::new(
             Arc::clone(&ds),
             read_table,
@@ -1086,6 +1206,16 @@ impl Runtime {
         let replicate = ds.replication.as_ref().is_some_and(|r| r.enabled);
         // FEDERATED TABLE
         if !ds.is_accelerated() {
+            // `on_schema_change` only governs accelerated datasets in v1: federated
+            // queries always reflect the live source schema, so the policy is inert.
+            if ds.on_schema_change != crate::component::dataset::OnSchemaChange::Block {
+                tracing::warn!(
+                    dataset = %ds.name,
+                    "`on_schema_change: {policy}` has no effect on non-accelerated datasets; it applies to accelerated datasets only",
+                    policy = ds.on_schema_change,
+                );
+            }
+
             let ds_name: TableReference = ds.name.clone();
             self.df
                 .register_table(

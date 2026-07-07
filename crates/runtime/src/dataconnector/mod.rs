@@ -23,8 +23,8 @@ use crate::component::metrics::MetricsProvider;
 use crate::component::metrics::MetricsProviderComponent;
 use crate::datafusion::error::find_datafusion_root;
 use crate::federated_table::FederatedTable;
-use crate::parameters::ParameterSpec;
-use crate::parameters::Parameters;
+pub use crate::parameters::ParameterSpec;
+pub use crate::parameters::Parameters;
 use arrow_schema::SchemaRef;
 use arrow_tools::schema::schema_meta_get_computed_columns;
 use async_trait::async_trait;
@@ -57,7 +57,7 @@ use tracing::Level;
 use std::future::Future;
 use std::time::Duration;
 
-pub(crate) mod client_identity;
+pub mod client_identity;
 pub mod http_rate_control;
 pub mod listing;
 
@@ -149,20 +149,22 @@ macro_rules! register_data_connector {
     };
 }
 
-pub mod abfs;
-#[cfg(feature = "adbc")]
-pub mod adbc;
-#[cfg(feature = "cosmosdb")]
-pub mod cosmosdb;
+// abfs: moved to crates/data-connectors/connector-abfs
+// #[deprecated] pub mod abfs;
+// adbc: moved to crates/data-connectors/connector-adbc
+// #[cfg(feature = "adbc")] pub mod adbc;
+// cosmosdb: moved to crates/data-connectors/connector-cosmosdb
+// #[cfg(feature = "cosmosdb")] pub mod cosmosdb;
 #[cfg(feature = "debezium")]
 pub mod debezium;
 #[cfg(feature = "dynamodb")]
 pub mod dynamodb;
 pub mod file;
 
-pub mod git;
-pub mod github;
+// git: moved to crates/data-connectors/connector-git
+// github: moved to crates/data-connectors/connector-github
 pub mod https;
+// kafka connector moved to crates/data-connectors/connector-kafka; module kept for debezium sidecar types
 #[cfg(feature = "kafka")]
 pub mod kafka;
 pub mod localpod;
@@ -170,17 +172,21 @@ pub mod memory;
 
 pub const ODBC_DATACONNECTOR: &str = "odbc"; // const needs to be accessible when ODBC isn't built
 pub mod deferred;
-#[cfg(feature = "duckdb")]
-pub mod ducklake;
-pub mod gcs;
+// ducklake: moved to crates/data-connectors/connector-ducklake
+// gcs: moved to crates/data-connectors/connector-gcs
+// glue: registration moved to crates/data-connectors/connector-glue; module kept for catalog connector
 pub mod glue;
 pub mod iceberg;
+pub mod iceberg_cluster;
 pub mod parameters;
 pub mod s3;
+pub mod schema_projection;
 pub mod sink;
+// spiceai: registration moved to crates/data-connectors/connector-spiceai; module kept for catalog connector
 pub mod spiceai;
 
 #[derive(Debug, Snafu)]
+#[snafu(visibility(pub))]
 pub enum DataConnectorError {
     #[snafu(display("Cannot connect to the {connector_component} ({dataconnector}). {source}"))]
     UnableToConnectInternal {
@@ -268,6 +274,20 @@ pub enum DataConnectorError {
         "Cannot setup the {connector_component} ({dataconnector}) with an invalid configuration. {message}"
     ))]
     InvalidConfigurationNoSource {
+        dataconnector: String,
+        connector_component: ConnectorComponent,
+        message: String,
+    },
+
+    // Unlike the InvalidConfiguration* variants, this is a transient (retriable)
+    // condition: an object-store source has no data files at the path yet. Object
+    // stores are eventually consistent and data is frequently written after the
+    // runtime starts, so the dataset load must keep retrying until the files
+    // appear rather than failing permanently. See `is_retriable`.
+    #[snafu(display(
+        "No data files are yet available for the {connector_component} ({dataconnector}). {message} The runtime will keep retrying until the source data becomes available."
+    ))]
+    ObjectStoreNoFilesAvailable {
         dataconnector: String,
         connector_component: ConnectorComponent,
         message: String,
@@ -496,33 +516,11 @@ pub async fn registered_connector_names() -> Vec<String> {
 }
 
 /// Returns the registered connector name whose Levenshtein distance to `name`
-/// is lowest (bounded so short typos only match very close names).
+/// is lowest (bounded so short typos only match very close names). Routes
+/// through [`util::levenshtein::closest_match`] so the "did you mean" UX is
+/// consistent with runtime tunables and component-level parameters.
 pub async fn suggest_connector(name: &str) -> Option<String> {
-    closest_name(name, &registered_connector_names().await)
-}
-
-/// Pure helper used by [`suggest_connector`]. Kept separate from the registry
-/// lookup so its scoring + threshold can be unit-tested without spinning up
-/// the async registry.
-pub(crate) fn closest_name(typo: &str, candidates: &[String]) -> Option<String> {
-    let input = typo.to_ascii_lowercase();
-    let mut best: Option<(String, usize)> = None;
-    for candidate in candidates {
-        let d = util::levenshtein::distance(&input, &candidate.to_ascii_lowercase());
-        if best.as_ref().is_none_or(|(_, b)| d < *b) {
-            best = Some((candidate.clone(), d));
-        }
-    }
-    let (candidate, distance) = best?;
-    // Bound: allow at most one edit per 3 chars of the longer string. Prevents a
-    // wildly different name ("kafka" vs. "postgres") from being suggested while
-    // still catching connector-name typos like "postgress" → "postgres" (d=1).
-    let max_allowed = (candidate.len().max(typo.len()) / 3).max(1);
-    if distance <= max_allowed {
-        Some(candidate)
-    } else {
-        None
-    }
+    util::levenshtein::closest_match(name, &registered_connector_names().await)
 }
 
 pub async fn unregister_all() {
@@ -871,51 +869,11 @@ mod tests {
 
     use super::*;
 
-    fn names(list: &[&str]) -> Vec<String> {
-        list.iter().map(|s| (*s).to_string()).collect()
-    }
+    // The closest-match algorithm is exercised in
+    // crates/util/src/levenshtein.rs (`test_closest_match_*`). `suggest_connector`
+    // / `suggest_catalog_connector` just plumb the registry's name list through
+    // it, so no per-call wrapper test is needed here.
 
-    #[test]
-    fn closest_name_matches_one_char_typo() {
-        let candidates = names(&["postgres", "mysql", "snowflake", "kafka"]);
-        assert_eq!(
-            closest_name("postgress", &candidates),
-            Some("postgres".to_string())
-        );
-    }
-
-    #[test]
-    fn closest_name_matches_case_insensitive() {
-        let candidates = names(&["postgres", "mysql"]);
-        assert_eq!(
-            closest_name("MYSQL", &candidates),
-            Some("mysql".to_string())
-        );
-    }
-
-    #[test]
-    fn closest_name_distant_returns_none() {
-        let candidates = names(&["postgres", "mysql", "kafka"]);
-        // "xyz" has no close match.
-        assert_eq!(closest_name("xyz", &candidates), None);
-    }
-
-    #[test]
-    fn closest_name_empty_candidates_returns_none() {
-        let candidates: Vec<String> = Vec::new();
-        assert_eq!(closest_name("postgres", &candidates), None);
-    }
-
-    #[test]
-    fn closest_name_short_typo_short_threshold() {
-        // Short names get a max_allowed floor of 1 — a single-char off name matches,
-        // but two chars off does not (protects against wildly different suggestions).
-        let candidates = names(&["pg", "my"]);
-        // "po" vs "pg": distance 1, allowed. vs "my": distance 2, not allowed.
-        assert_eq!(closest_name("po", &candidates), Some("pg".to_string()));
-        // "zz" vs both is distance 2 — no match.
-        assert_eq!(closest_name("zz", &candidates), None);
-    }
     use crate::component::dataset::UnsupportedTypeAction as DatasetUnsupportedTypeAction;
     use crate::component::dataset::builder::DatasetBuilder;
     use crate::dataconnector::parameters::ConnectorParamsBuilder;

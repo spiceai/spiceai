@@ -18,6 +18,7 @@ pub mod federation;
 pub mod provider;
 mod write;
 
+use crate::function_support::FunctionSupport;
 use arrow::array::Array;
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
 use async_trait::async_trait;
@@ -35,7 +36,6 @@ use datafusion::{
 use datafusion_table_providers::sql::{
     db_connection_pool::DbConnectionPool, sql_provider_datafusion::SqlTable,
 };
-use datafusion_table_providers::util::supported_functions::FunctionSupport;
 use snowflake_api::SnowflakeApi;
 use std::{collections::HashMap, sync::Arc};
 use tokio::sync::Mutex;
@@ -781,17 +781,14 @@ mod tests {
         let unparser = Unparser::new(&dialect);
 
         // MQL_AT AT TIME ZONE 'UTC' AT TIME ZONE 'America/Los_Angeles'
-        let inner = Expr::Cast(Cast {
-            expr: Box::new(col("MQL_AT")),
-            data_type: DataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into())),
-        });
-        let outer = Expr::Cast(Cast {
-            expr: Box::new(inner),
-            data_type: DataType::Timestamp(
-                TimeUnit::Nanosecond,
-                Some("America/Los_Angeles".into()),
-            ),
-        });
+        let inner = Expr::Cast(Cast::new(
+            Box::new(col("MQL_AT")),
+            DataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into())),
+        ));
+        let outer = Expr::Cast(Cast::new(
+            Box::new(inner),
+            DataType::Timestamp(TimeUnit::Nanosecond, Some("America/Los_Angeles".into())),
+        ));
 
         let sql = unparser
             .expr_to_sql(&outer)

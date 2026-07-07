@@ -85,7 +85,7 @@ limitations under the License.
 //! The read path automatically detects the storage format (TEXT vs INTEGER) and converts
 //! to the Arrow schema's expected timestamp type and unit.
 
-use std::{any::Any, fmt, sync::Arc};
+use std::{fmt, sync::Arc};
 
 use arrow::{
     array::{
@@ -113,7 +113,7 @@ use datafusion::{
     },
     error::{DataFusionError, Result as DataFusionResult},
     execution::{SendableRecordBatchStream, TaskContext},
-    logical_expr::{Expr, LogicalPlan, TableProviderFilterPushDown, TableType, dml::InsertOp},
+    logical_expr::{Expr, TableProviderFilterPushDown, TableType, dml::InsertOp},
     physical_expr::EquivalenceProperties,
     physical_plan::{
         DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PlanProperties,
@@ -135,16 +135,16 @@ use datafusion::{
 use datafusion_federation::{
     FederatedTableProviderAdaptor, FederatedTableSource,
     sql::{
-        RemoteTableRef, SQLExecutor, SQLFederationProvider, SQLTableSource,
-        ast_analyzer::{AstAnalyzer, AstAnalyzerRule},
+        AstAnalyzer, AstAnalyzerRule, LogicalOptimizer, RemoteTableRef, SQLExecutor,
+        SQLFederationProvider, SQLTableSource,
     },
 };
 use datafusion_table_providers::sqlite::sqlite_interval::SQLiteIntervalVisitor;
-use datafusion_table_providers::util::supported_functions::{
-    FunctionSupport, contains_unsupported_functions,
-};
+
+use crate::function_support::{FunctionSupport, unfederate_plan_with_unsupported_functions};
 use futures::stream::{self, StreamExt, TryStreamExt};
 use snafu::prelude::*;
+use tokio::sync::{OwnedRwLockReadGuard, OwnedRwLockWriteGuard, RwLock};
 use turso::{Builder, Connection, Database, Value as TursoValue};
 use turso_shared::{BEGIN_CONCURRENT_SQL, COMMIT_SQL, JOURNAL_MODE_SQL_LITERAL};
 
@@ -354,6 +354,7 @@ pub struct TursoConnectionPool {
     database: Arc<Database>,
     db_path: String,
     timestamp_format: TimestampFormat,
+    schema_lock: Arc<RwLock<()>>,
 }
 
 impl TursoConnectionPool {
@@ -391,6 +392,7 @@ impl TursoConnectionPool {
             database: Arc::new(database),
             db_path: path.to_string(),
             timestamp_format,
+            schema_lock: Arc::new(RwLock::new(())),
         })
     }
 
@@ -399,9 +401,31 @@ impl TursoConnectionPool {
     /// This method is lightweight and can be called frequently. Each connection
     /// shares the underlying database instance, making it efficient for high-frequency
     /// operations.
-    #[expect(clippy::unused_async)]
+    ///
+    /// Per-connection performance PRAGMAs are applied on every connection here.
+    /// Unlike `journal_mode = mvcc` (which persists on the database file and is set
+    /// once at pool creation), `synchronous` and `cache_size` are per-connection and
+    /// do not carry over — without this, every accelerator connection would default
+    /// to `synchronous = FULL` (an extra fsync per commit). These are cheap in-memory
+    /// settings, so they are net-positive even on hot paths.
     pub async fn connect(&self) -> Result<Connection> {
-        self.database.connect().context(TursoDatabaseSnafu)
+        let conn = self.database.connect().context(TursoDatabaseSnafu)?;
+
+        // Wait for locks instead of immediately returning SQLITE_BUSY.
+        conn.busy_timeout(std::time::Duration::from_secs(5))
+            .context(TursoDatabaseSnafu)?;
+
+        // NORMAL synchronous: safe under WAL/MVCC, avoids FULL's extra per-commit fsync.
+        conn.execute("PRAGMA synchronous = NORMAL", ())
+            .await
+            .context(TursoDatabaseSnafu)?;
+
+        // 32MB page cache (negative value = kilobytes), matching the metastore connection.
+        conn.execute("PRAGMA cache_size = -32768", ())
+            .await
+            .context(TursoDatabaseSnafu)?;
+
+        Ok(conn)
     }
 
     /// Returns true if this is an in-memory database
@@ -420,6 +444,22 @@ impl TursoConnectionPool {
     #[must_use]
     pub fn timestamp_format(&self) -> TimestampFormat {
         self.timestamp_format
+    }
+
+    /// Holds schema changes out while a Turso write transaction is open.
+    ///
+    /// Turso returns "Database schema conflict" if a `BEGIN CONCURRENT` write
+    /// transaction commits after another connection changes the schema. DML uses
+    /// a shared guard so concurrent writers can still proceed; DDL uses the
+    /// exclusive guard below.
+    pub async fn acquire_schema_read_lock(&self) -> OwnedRwLockReadGuard<()> {
+        Arc::clone(&self.schema_lock).read_owned().await
+    }
+
+    /// Acquires exclusive access for schema-changing statements such as
+    /// `CREATE TABLE`, `CREATE INDEX`, `ALTER TABLE`, and `DROP TABLE`.
+    pub async fn acquire_schema_write_lock(&self) -> OwnedRwLockWriteGuard<()> {
+        Arc::clone(&self.schema_lock).write_owned().await
     }
 }
 
@@ -469,7 +509,10 @@ impl TursoTableProvider {
     /// to the target type (e.g., INTEGER too large for Int8, invalid JSON) are converted to NULL.
     /// This design choice prioritizes query availability over failing entire result sets due to
     /// individual value conversion issues. This is standard behavior for database queries where
-    /// some data may be malformed or out of range.
+    /// some data may be malformed or out of range. Because a soft-failed value is otherwise
+    /// indistinguishable from genuinely-NULL data, [`Self::count_conversion_failures`] detects
+    /// these cases after the batch is built and emits a per-scan WARN so schema/type drift is
+    /// observable rather than silent.
     ///
     /// **Write-time validation is critical**: To prevent bad data from entering the database,
     /// see `scalar_value_to_turso()` which enforces strict validation during INSERT operations.
@@ -1100,7 +1143,60 @@ impl TursoTableProvider {
             columns.push(column);
         }
 
-        Ok(RecordBatch::try_new(Arc::clone(schema), columns)?)
+        let batch = RecordBatch::try_new(Arc::clone(schema), columns)?;
+        Self::warn_on_conversion_failures(rows, &batch);
+        Ok(batch)
+    }
+
+    /// Counts, per column, stored values that were non-NULL in Turso but produced a NULL
+    /// Arrow cell — i.e. a type conversion in [`Self::values_to_record_batch`] soft-failed
+    /// and silently dropped a real value. A genuine `TursoValue::Null` (or a short row with
+    /// no value for the column) is never counted. The returned vector is indexed by column.
+    ///
+    /// Read-side conversions intentionally fall back to NULL to keep queries available in the
+    /// face of schema/type drift, so this is detection-only: it never alters the batch.
+    #[must_use]
+    pub(crate) fn count_conversion_failures(
+        rows: &[Vec<TursoValue>],
+        batch: &RecordBatch,
+    ) -> Vec<usize> {
+        (0..batch.num_columns())
+            .map(|col_idx| {
+                let array = batch.column(col_idx);
+                rows.iter()
+                    .enumerate()
+                    .filter(|(row_idx, row)| {
+                        array.is_null(*row_idx)
+                            && !matches!(row.get(col_idx), Some(TursoValue::Null) | None)
+                    })
+                    .count()
+            })
+            .collect()
+    }
+
+    /// Emits a single per-scan WARN summarizing any silent read-side conversion failures
+    /// (see [`Self::count_conversion_failures`]), so schema/type drift is observable instead
+    /// of masquerading as genuinely-NULL data.
+    fn warn_on_conversion_failures(rows: &[Vec<TursoValue>], batch: &RecordBatch) {
+        let failures = Self::count_conversion_failures(rows, batch);
+        let total: usize = failures.iter().sum();
+        if total == 0 {
+            return;
+        }
+        let schema = batch.schema();
+        let per_column: Vec<String> = failures
+            .iter()
+            .enumerate()
+            .filter(|(_, count)| **count > 0)
+            .map(|(col_idx, count)| format!("{}={count}", schema.field(col_idx).name()))
+            .collect();
+        tracing::warn!(
+            "Turso read: {total} non-NULL stored value(s) failed type conversion and were \
+             returned as NULL (per column: {}). This usually indicates schema/type drift \
+             between the write and read paths (e.g. an out-of-range integer, an unparseable \
+             timestamp, or external mutation of the acceleration database).",
+            per_column.join(", ")
+        );
     }
 
     /// Returns AST analyzer rules for Turso-specific SQL transformations.
@@ -1141,10 +1237,6 @@ impl TursoTableProvider {
 
 #[async_trait]
 impl TableProvider for TursoTableProvider {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema(&self) -> SchemaRef {
         Arc::clone(&self.schema)
     }
@@ -1286,11 +1378,11 @@ impl SQLExecutor for TursoTableProvider {
         Some(AstAnalyzer::new(vec![Self::turso_ast_analyzer()]))
     }
 
-    fn can_execute_plan(&self, plan: &LogicalPlan) -> bool {
-        // Default to not federate if [`Self::function_support`] provided, otherwise true.
-        self.function_support.as_ref().is_none_or(|func_supp| {
-            !contains_unsupported_functions(plan, func_supp).unwrap_or(false)
-        })
+    fn logical_optimizer(&self) -> Option<LogicalOptimizer> {
+        let function_support = self.function_support.clone()?;
+        Some(Box::new(move |plan| {
+            unfederate_plan_with_unsupported_functions(plan, &function_support)
+        }))
     }
 
     fn execute(
@@ -1383,12 +1475,7 @@ impl SQLExecutor for TursoTableProvider {
                 TursoValue::Integer(not_null),
             ) = (&col_name, &col_type, &not_null)
             {
-                let data_type = match col_type.to_uppercase().as_str() {
-                    "INTEGER" | "BLOB" => DataType::Int64,
-                    "REAL" | "FLOAT" | "DOUBLE" => DataType::Float64,
-                    "DATE_TEXT" => DataType::Date32,
-                    _ => DataType::Utf8,
-                };
+                let data_type = sqlite_declared_type_to_arrow(col_type);
                 let nullable = *not_null == 0;
                 fields.push(Field::new(col_name.as_str(), data_type, nullable));
             }
@@ -1414,7 +1501,7 @@ pub struct TursoExec {
     pool: Arc<TursoConnectionPool>,
     filters: Vec<Expr>,
     limit: Option<usize>,
-    properties: PlanProperties,
+    properties: Arc<PlanProperties>,
 }
 
 impl TursoExec {
@@ -1434,12 +1521,12 @@ impl TursoExec {
         filters: &[Expr],
         limit: Option<usize>,
     ) -> Self {
-        let properties = PlanProperties::new(
+        let properties = Arc::new(PlanProperties::new(
             EquivalenceProperties::new(Arc::clone(&schema)),
             Partitioning::UnknownPartitioning(1),
             EmissionType::Incremental,
             Boundedness::Bounded,
-        );
+        ));
 
         Self {
             schema,
@@ -1508,15 +1595,11 @@ impl ExecutionPlan for TursoExec {
         "TursoExec"
     }
 
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema(&self) -> SchemaRef {
         Arc::clone(&self.schema)
     }
 
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
     }
 
@@ -1633,6 +1716,7 @@ impl DeletionSink for TursoDeletionSink {
             where_clause
         );
 
+        let _schema_guard = self.pool.acquire_schema_read_lock().await;
         let conn = self.pool.connect().await?;
         let rows_affected = conn
             .execute(&delete_sql, ())
@@ -1715,6 +1799,7 @@ impl TursoDataSink {
             .connect()
             .await
             .map_err(|e| DataFusionError::External(Box::new(e)))?;
+        let _schema_guard = self.pool.acquire_schema_read_lock().await;
 
         let delete_sql = format!("DELETE FROM {}", quote_identifier(&self.table_name));
         let insert_sql = self.insert_sql();
@@ -1771,6 +1856,7 @@ impl TursoDataSink {
             .connect()
             .await
             .map_err(|e| DataFusionError::External(Box::new(e)))?;
+        let _schema_guard = self.pool.acquire_schema_read_lock().await;
         let insert_sql = self.insert_sql();
 
         let write_result = async {
@@ -1841,10 +1927,6 @@ impl TursoDataSink {
 
 #[async_trait]
 impl DataSink for TursoDataSink {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn metrics(&self) -> Option<datafusion::physical_plan::metrics::MetricsSet> {
         None
     }
@@ -1863,6 +1945,19 @@ impl DataSink for TursoDataSink {
         }
 
         self.append_all(data).await
+    }
+}
+
+/// Maps a `SQLite`/Turso declared column type (as reported by `PRAGMA` `table_info`) to the Arrow [`DataType`] used when inferring a table schema.
+///
+/// `SQLite` type affinity is loose, so this matches the declared type names Turso emits and falls back to [`DataType::Utf8`] (`TEXT` affinity) for anything unrecognized. `BLOB` maps to [`DataType::Binary`] so blob columns round-trip through [`TursoValue::Blob`] instead of being coerced to [`DataType::Int64`].
+fn sqlite_declared_type_to_arrow(declared_type: &str) -> DataType {
+    match declared_type.to_uppercase().as_str() {
+        "INTEGER" => DataType::Int64,
+        "BLOB" => DataType::Binary,
+        "REAL" | "FLOAT" | "DOUBLE" => DataType::Float64,
+        "DATE_TEXT" => DataType::Date32,
+        _ => DataType::Utf8,
     }
 }
 
@@ -1951,7 +2046,13 @@ fn convert_timestamp_to_turso(
             }
 
             match unit {
-                TimeUnit::Second => Ok(TursoValue::Integer(value * timestamp_conversion::MILLIS_PER_SECOND)),
+                TimeUnit::Second => value
+                    .checked_mul(timestamp_conversion::MILLIS_PER_SECOND)
+                    .map(TursoValue::Integer)
+                    .ok_or_else(|| {
+                        format!("Timestamp value {value}s overflows millisecond conversion")
+                    })
+                    .map_err(Into::into),
                 TimeUnit::Millisecond => Ok(TursoValue::Integer(value)),
                 TimeUnit::Microsecond => Err(
                     "TimestampMicrosecond not supported with integer_millis format - use rfc3339 format to preserve sub-millisecond precision"
@@ -2464,6 +2565,101 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_turso_schema_changes_wait_for_open_sink_write_transaction() {
+        let table_name = "schema_gate_data";
+        let (pool, sink) = create_turso_sink(table_name).await;
+        let schema = Arc::clone(sink.schema());
+        let first_batch = batch(Arc::clone(&schema), vec![1], vec!["one"]);
+
+        let (stream_waiting_tx, stream_waiting_rx) = tokio::sync::oneshot::channel();
+        let (finish_stream_tx, finish_stream_rx) = tokio::sync::oneshot::channel();
+        let delayed_stream = futures::stream::unfold(
+            (
+                0_u8,
+                Some(first_batch),
+                Some(stream_waiting_tx),
+                Some(finish_stream_rx),
+            ),
+            |(state, batch, stream_waiting_tx, finish_stream_rx)| async move {
+                match state {
+                    0 => Some((
+                        Ok::<_, DataFusionError>(batch.expect("first batch should be available")),
+                        (1, None, stream_waiting_tx, finish_stream_rx),
+                    )),
+                    1 => {
+                        if let Some(stream_waiting_tx) = stream_waiting_tx {
+                            let _ = stream_waiting_tx.send(());
+                        }
+                        if let Some(finish_stream_rx) = finish_stream_rx {
+                            let _ = finish_stream_rx.await;
+                        }
+                        None
+                    }
+                    _ => None,
+                }
+            },
+        );
+        let data: SendableRecordBatchStream = Box::pin(RecordBatchStreamAdapter::new(
+            Arc::clone(&schema),
+            delayed_stream,
+        ));
+
+        let sink_task = tokio::spawn(async move {
+            sink.write_all(data, &Arc::new(TaskContext::default()))
+                .await
+        });
+        stream_waiting_rx
+            .await
+            .expect("sink stream should wait before commit");
+
+        let ddl_pool = Arc::clone(&pool);
+        let (ddl_started_tx, ddl_started_rx) = tokio::sync::oneshot::channel();
+        let mut ddl_task = tokio::spawn(async move {
+            ddl_started_tx
+                .send(())
+                .expect("DDL start notification should be delivered");
+            let _schema_guard = ddl_pool.acquire_schema_write_lock().await;
+            let conn = ddl_pool
+                .connect()
+                .await
+                .expect("schema change connection should be created");
+            conn.execute(
+                "CREATE TABLE schema_gate_other (id INTEGER PRIMARY KEY)",
+                (),
+            )
+            .await
+        });
+
+        ddl_started_rx
+            .await
+            .expect("DDL task should start before waiting for the schema lock");
+        let ddl_wait =
+            tokio::time::timeout(std::time::Duration::from_millis(50), &mut ddl_task).await;
+        assert!(
+            ddl_wait.is_err(),
+            "schema changes should wait until the sink write transaction commits"
+        );
+
+        finish_stream_tx
+            .send(())
+            .expect("stream finish signal should be delivered");
+        let written = sink_task
+            .await
+            .expect("sink task should not panic")
+            .expect("sink write should succeed");
+        assert_eq!(written, 1);
+
+        ddl_task
+            .await
+            .expect("DDL task should not panic")
+            .expect("schema change should succeed after the sink commits");
+        assert_eq!(
+            query_rows(&pool, table_name).await,
+            vec![(1, "one".to_string())]
+        );
+    }
+
+    #[tokio::test]
     async fn test_turso_nulls_first_last_ordering() {
         let pool = TursoConnectionPool::new(":memory:")
             .await
@@ -2749,5 +2945,164 @@ mod tests {
             .expect("should be TimestampMillisecondArray");
         assert!(!arr.is_null(0), "Millisecond identity should not be NULL");
         assert_eq!(arr.value(0), millis_2300);
+    }
+
+    #[test]
+    fn test_count_conversion_failures_distinguishes_drift_from_genuine_null() {
+        use arrow::datatypes::{DataType, Field};
+
+        // Int8 column. Row 0: in-range integer (ok), row 1: genuine NULL,
+        // row 2: 999 which overflows i8 and soft-fails to NULL on read.
+        let schema = Arc::new(arrow::datatypes::Schema::new(vec![Field::new(
+            "small",
+            DataType::Int8,
+            true,
+        )]));
+        let rows = vec![
+            vec![TursoValue::Integer(42)],
+            vec![TursoValue::Null],
+            vec![TursoValue::Integer(999)],
+        ];
+
+        let batch = TursoTableProvider::values_to_record_batch(&rows, &schema)
+            .expect("batch should build even with an out-of-range value");
+        let arr = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow::array::Int8Array>()
+            .expect("should be Int8Array");
+
+        // The soft-fail behavior itself is preserved: both the genuine NULL and the
+        // overflowed value read back as NULL cells.
+        assert_eq!(arr.value(0), 42);
+        assert!(arr.is_null(1), "genuine NULL stays NULL");
+        assert!(arr.is_null(2), "out-of-range value soft-fails to NULL");
+
+        // The regression: only the out-of-range non-NULL value counts as a conversion
+        // failure — the genuine NULL must not be counted.
+        let failures = TursoTableProvider::count_conversion_failures(&rows, &batch);
+        assert_eq!(
+            failures,
+            vec![1],
+            "exactly one conversion failure (the 999), genuine NULL excluded"
+        );
+    }
+
+    #[test]
+    fn test_count_conversion_failures_zero_when_all_values_valid() {
+        use arrow::datatypes::{DataType, Field};
+
+        let schema = Arc::new(arrow::datatypes::Schema::new(vec![Field::new(
+            "n",
+            DataType::Int64,
+            true,
+        )]));
+        let rows = vec![
+            vec![TursoValue::Integer(1)],
+            vec![TursoValue::Null],
+            vec![TursoValue::Integer(2)],
+        ];
+
+        let batch =
+            TursoTableProvider::values_to_record_batch(&rows, &schema).expect("batch should build");
+        let failures = TursoTableProvider::count_conversion_failures(&rows, &batch);
+        assert_eq!(
+            failures,
+            vec![0],
+            "no conversion failures when every non-NULL value converts cleanly"
+        );
+    }
+
+    #[test]
+    fn test_sqlite_declared_type_to_arrow_mapping() {
+        // Guardrail over the full set of declared types this mapper recognizes.
+        // BLOB must map to Binary (regression: it was previously coerced to Int64,
+        // which lost the bytes and mis-typed the inferred schema).
+        let cases: &[(&str, DataType)] = &[
+            ("INTEGER", DataType::Int64),
+            ("BLOB", DataType::Binary),
+            ("REAL", DataType::Float64),
+            ("FLOAT", DataType::Float64),
+            ("DOUBLE", DataType::Float64),
+            ("DATE_TEXT", DataType::Date32),
+            ("TEXT", DataType::Utf8),
+            // Unknown / SQLite affinity fallthrough -> TEXT (Utf8).
+            ("VARCHAR(255)", DataType::Utf8),
+        ];
+        for (declared, expected) in cases {
+            assert_eq!(
+                &sqlite_declared_type_to_arrow(declared),
+                expected,
+                "declared type {declared} should map to {expected:?}"
+            );
+            // PRAGMA table_info can report the type in any case; mapping is
+            // case-insensitive, so the lowercased form must map identically.
+            assert_eq!(
+                &sqlite_declared_type_to_arrow(&declared.to_lowercase()),
+                expected,
+                "declared type {} (lowercased) should map to {expected:?}",
+                declared.to_lowercase()
+            );
+        }
+    }
+
+    #[test]
+    fn test_blob_column_roundtrips_as_binary() {
+        use arrow::array::BinaryArray;
+
+        // A column inferred as Binary (from a BLOB declared type) must decode
+        // TursoValue::Blob rows into a BinaryArray preserving the exact bytes,
+        // with NULLs surfaced as null entries.
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "payload",
+            DataType::Binary,
+            true,
+        )]));
+        let rows = vec![
+            vec![TursoValue::Blob(vec![0x00, 0xDE, 0xAD, 0xBE, 0xEF])],
+            vec![TursoValue::Null],
+            vec![TursoValue::Blob(Vec::new())],
+        ];
+
+        let batch = TursoTableProvider::values_to_record_batch(&rows, &schema)
+            .expect("BLOB rows should build a Binary batch");
+        let arr = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<BinaryArray>()
+            .expect("column should be a BinaryArray");
+
+        assert_eq!(arr.len(), 3);
+        assert_eq!(arr.value(0), &[0x00, 0xDE, 0xAD, 0xBE, 0xEF]);
+        assert!(arr.is_null(1), "TursoValue::Null should decode to null");
+        assert_eq!(arr.value(2), &[] as &[u8], "empty blob should round-trip");
+    }
+
+    #[test]
+    fn test_convert_timestamp_to_turso_integer_millis_second_overflow_returns_error() {
+        // integer_millis multiplies a seconds value by 1_000; i64::MAX seconds
+        // overflows that multiplication and must return an error rather than
+        // silently wrapping to a bogus millisecond value.
+        let result = convert_timestamp_to_turso(
+            i64::MAX,
+            TimeUnit::Second,
+            None,
+            TimestampFormat::IntegerMillis,
+        );
+        let Err(e) = result else {
+            panic!("i64::MAX seconds should overflow the millisecond conversion");
+        };
+        assert!(
+            e.to_string().contains("overflows millisecond conversion"),
+            "unexpected error message: {e}"
+        );
+
+        // A value that fits must still succeed and be scaled by 1_000.
+        let ok =
+            convert_timestamp_to_turso(5, TimeUnit::Second, None, TimestampFormat::IntegerMillis);
+        let Ok(TursoValue::Integer(millis)) = ok else {
+            panic!("in-range seconds value should convert to an integer millis value");
+        };
+        assert_eq!(millis, 5_000, "5s should convert to 5000ms");
     }
 }

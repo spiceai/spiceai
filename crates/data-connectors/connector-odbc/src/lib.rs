@@ -191,10 +191,8 @@ fn driver_is_file(driver: &str) -> bool {
     driver
         .split('=')
         .next_back()
-        // if the file doesn't yet exist, the connector will fail registration
-        // when the connector re-tries, if the file exists it will fail again
-        .filter(|s| std::fs::metadata(s).is_ok())
-        .is_some()
+        .as_ref()
+        .is_some_and(|s| std::fs::metadata(s).is_ok())
 }
 
 fn parameter_is_integer(parameters: &Parameters, param: &str) -> Result<()> {

@@ -17,7 +17,6 @@ limitations under the License.
 //! [`TableProvider`] implementations for Elasticsearch kNN vector search
 //! and full-text search, used by the search index layer.
 
-use std::any::Any;
 use std::sync::Arc;
 
 use arrow::array::{ArrayRef, Float64Array, RecordBatch, StringArray};
@@ -83,10 +82,6 @@ pub struct ElasticsearchKnnTable {
 
 #[async_trait]
 impl TableProvider for ElasticsearchKnnTable {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema(&self) -> SchemaRef {
         Arc::clone(&self.schema)
     }
@@ -122,12 +117,12 @@ impl TableProvider for ElasticsearchKnnTable {
             projection: projection.cloned(),
             query_text: self.query_text.clone(),
             embedder: self.embedder.clone(),
-            properties: PlanProperties::new(
+            properties: Arc::new(PlanProperties::new(
                 EquivalenceProperties::new(project_schema(&self.schema, projection)?),
                 Partitioning::UnknownPartitioning(1),
                 EmissionType::Final,
                 Boundedness::Bounded,
-            ),
+            )),
         }))
     }
 }
@@ -145,7 +140,7 @@ struct ElasticsearchKnnExec {
     projection: Option<Vec<usize>>,
     query_text: Option<String>,
     embedder: Option<Arc<dyn QueryEmbedder>>,
-    properties: PlanProperties,
+    properties: Arc<PlanProperties>,
 }
 
 impl DisplayAs for ElasticsearchKnnExec {
@@ -163,11 +158,7 @@ impl ExecutionPlan for ElasticsearchKnnExec {
         "ElasticsearchKnnExec"
     }
 
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
     }
 
@@ -328,10 +319,6 @@ pub struct ElasticsearchTextSearchTable {
 
 #[async_trait]
 impl TableProvider for ElasticsearchTextSearchTable {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema(&self) -> SchemaRef {
         Arc::clone(&self.schema)
     }
@@ -365,12 +352,12 @@ impl TableProvider for ElasticsearchTextSearchTable {
             source_schema: Arc::clone(&self.source_schema),
             projected_schema,
             projection: projection.cloned(),
-            properties: PlanProperties::new(
+            properties: Arc::new(PlanProperties::new(
                 EquivalenceProperties::new(project_schema(&self.schema, projection)?),
                 Partitioning::UnknownPartitioning(1),
                 EmissionType::Final,
                 Boundedness::Bounded,
-            ),
+            )),
         }))
     }
 }
@@ -386,7 +373,7 @@ struct ElasticsearchTextSearchExec {
     source_schema: SchemaRef,
     projected_schema: SchemaRef,
     projection: Option<Vec<usize>>,
-    properties: PlanProperties,
+    properties: Arc<PlanProperties>,
 }
 
 impl DisplayAs for ElasticsearchTextSearchExec {
@@ -404,11 +391,7 @@ impl ExecutionPlan for ElasticsearchTextSearchExec {
         "ElasticsearchTextSearchExec"
     }
 
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
     }
 

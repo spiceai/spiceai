@@ -119,14 +119,15 @@ if [ -n "$PG_CONTAINER" ]; then
 fi
 
 echo "Running CH-benCH HTAP: SF=$SF duration=${DURATION}s ready-wait=${READY}s -> $OUTDIR"
+# Pipe output to terminal and to file
 SPICED_LOG="$SPICED_LOG" "$TESTOP" run htap \
   -p "$SPICEPOD" -s "$REPO_ROOT/$SPICED" \
   --query-set chbench --scale-factor "$SF" --validate \
   --ready-wait "$READY" --duration "$DURATION" \
   ${TERMINALS:+--terminals "$TERMINALS"} \
   ${CONCURRENCY:+--concurrency "$CONCURRENCY"} \
-  --disable-progress-bars --scrape-spiced-metrics > "$LOG" 2>&1
-testop_exit=$?
+  --disable-progress-bars --scrape-spiced-metrics 2>&1 | tee "$LOG"
+testop_exit=${PIPESTATUS[0]}
 echo "TESTOP_EXIT=$testop_exit"
 kill "$CPU_PID" "$QLAT_PID" ${OLTP_PID:+$OLTP_PID} 2>/dev/null
 
