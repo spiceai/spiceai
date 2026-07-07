@@ -201,42 +201,66 @@ async fn checkpoint_pending_memory_cdc_commits(
     dataset_name: &TableReference,
     runtime_status: &status::RuntimeStatus,
 ) -> Option<String> {
+    // Bounded checkpoint retries before a still-non-empty queue is declared
+    // fatal (declared before the first statement to satisfy pedantic
+    // `items_after_statements`).
+    const MAX_CHECKPOINT_ATTEMPTS: usize = 3;
+
     if deferred_commit_queue_is_empty(queue).await {
         return None;
     }
 
-    match cayenne.checkpoint_mem_tier().await {
-        Ok(_) => {
-            if deferred_commit_queue_is_empty(queue).await {
-                None
-            } else if runtime_status.is_shutdown() {
-                tracing::debug!(
-                    "Deferred CDC commits remain for {dataset_name} during shutdown after mem-tier checkpoint"
-                );
-                None
-            } else {
-                let error_message = format!(
-                    "Failed to checkpoint in-memory CDC tier for {dataset_name}: deferred source commits remain after durable checkpoint"
-                );
-                tracing::error!("{error_message}");
-                Some(error_message)
+    // A queue still non-empty AFTER a successful checkpoint is, in practice,
+    // transient rather than a real invariant violation: the apply loop enqueues a
+    // batch's committer only AFTER `write_change` returns its epoch, so the
+    // covering checkpoint can fire (and drain nothing) before the committer is
+    // queued — the late-enqueue race. `checkpoint_mem_tier` re-fires the slot
+    // advancer for the last durable epoch even on an empty tier (Cayenne #11644
+    // fix), which releases such a committer; but a concurrent background
+    // checkpoint or a straggler epoch can still need one more checkpoint to seal.
+    // Retry a bounded number of times before declaring failure — the only
+    // correctness requirement is that the source slot must NOT advance past a
+    // still-un-durable RAM batch, and waiting (re-checkpointing) preserves that
+    // trivially. Only a queue that survives every attempt is fatal (#11644).
+    for attempt in 1..=MAX_CHECKPOINT_ATTEMPTS {
+        match cayenne.checkpoint_mem_tier().await {
+            Ok(_) => {
+                if deferred_commit_queue_is_empty(queue).await {
+                    return None;
+                }
+                if runtime_status.is_shutdown() {
+                    tracing::debug!(
+                        "Deferred CDC commits remain for {dataset_name} during shutdown after mem-tier checkpoint"
+                    );
+                    return None;
+                }
+                if attempt < MAX_CHECKPOINT_ATTEMPTS {
+                    tracing::debug!(
+                        "Deferred CDC commits still queued for {dataset_name} after checkpoint attempt {attempt}/{MAX_CHECKPOINT_ATTEMPTS}; re-checkpointing to seal the straggler epoch"
+                    );
+                }
             }
-        }
-        Err(e) => {
-            if runtime_status.is_shutdown() {
-                tracing::debug!(
-                    "Failed to checkpoint in-memory CDC tier for {dataset_name} during shutdown: {e}"
-                );
-                None
-            } else {
+            Err(e) => {
+                if runtime_status.is_shutdown() {
+                    tracing::debug!(
+                        "Failed to checkpoint in-memory CDC tier for {dataset_name} during shutdown: {e}"
+                    );
+                    return None;
+                }
                 let error_message = format!(
                     "Failed to checkpoint in-memory CDC tier for {dataset_name} before advancing source commit: {e}"
                 );
                 tracing::error!("{error_message}");
-                Some(error_message)
+                return Some(error_message);
             }
         }
     }
+
+    let error_message = format!(
+        "Failed to checkpoint in-memory CDC tier for {dataset_name}: deferred source commits remain after {MAX_CHECKPOINT_ATTEMPTS} durable checkpoints"
+    );
+    tracing::error!("{error_message}");
+    Some(error_message)
 }
 
 pub(super) struct CdcInsertPlanCache {
