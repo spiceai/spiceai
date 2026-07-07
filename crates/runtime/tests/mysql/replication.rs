@@ -254,9 +254,16 @@ async fn bootstrap_then_stream_changes_then_resume() -> Result<(), anyhow::Error
     assert_eq!(ops_of(&envelope), vec!["t"]);
     envelope.commit().await?;
 
-    // --- 7. Idle checkpoint persists the acked position via heartbeats ---
+    // --- 7. Idle checkpoint persists the acked position ---
+    // The checkpointer runs inside the stream, so it only makes progress
+    // while the stream is polled — which the runtime's apply loop does
+    // continuously. Mirror that here: keep polling the (quiet) stream while
+    // waiting for the persisted position to advance. No envelope arrives on
+    // a quiet table, so each poll simply times out after driving the
+    // stream's idle tick.
     let deadline = std::time::Instant::now() + Duration::from_secs(15);
     loop {
+        let _ = tokio::time::timeout(Duration::from_millis(250), stream.next()).await;
         let persisted = store
             .load()
             .await
@@ -270,7 +277,6 @@ async fn bootstrap_then_stream_changes_then_resume() -> Result<(), anyhow::Error
             std::time::Instant::now() < deadline,
             "idle checkpoint never advanced past the bootstrap position ({bootstrap_position})"
         );
-        tokio::time::sleep(Duration::from_millis(250)).await;
     }
 
     // --- 8. Resume from the persisted position (no snapshot) ---
