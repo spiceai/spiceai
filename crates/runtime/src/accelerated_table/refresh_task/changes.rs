@@ -1052,11 +1052,13 @@ impl RefreshTask {
         // (`cdc_apply_cycle_ms`): the period between successive burst applies.
         let mut prev_recv_start: Option<Instant> = None;
         let mut carried_item: Option<Result<cdc::ChangeEnvelope, cdc::StreamError>> = None;
-        // Receipt wall-clock (unix ms) of `carried_item`, captured when it is carried so
-        // the next iteration records its arrival lag at true receipt time rather than
-        // after it waited out this burst's apply. Only read when the next burst starts
-        // from the carry; always set alongside `carried_item`.
+        // Receipt time of `carried_item`, captured when it is carried so the next
+        // iteration attributes its wait from true receipt rather than after it sat
+        // through this burst's apply. `_ms` (wall clock) feeds the arrival-lag gauge;
+        // `_at` (monotonic) feeds the coalesce batch-age. Only read when the next burst
+        // starts from the carry; always set together alongside `carried_item`.
         let mut carried_received_ms: Option<i64> = None;
+        let mut carried_received_at: Option<Instant> = None;
         let mut last_cycle_start = Instant::now();
         let write_ctx = SessionContext::new();
         let write_session_state = write_ctx.state();
@@ -1225,8 +1227,15 @@ impl RefreshTask {
             // First envelope of this burst is now in hand; time from here until the
             // apply below is the per-batch queued/coalescing latency
             // (`cdc_coalesce_batch_age_ms`). `flush_reason` records what ended the
-            // coalesce (`cdc_coalesce_flush_total`).
-            let batch_first_received = Instant::now();
+            // coalesce (`cdc_coalesce_flush_total`). A carried first was received on the
+            // previous iteration and waited through the prior burst's apply, so anchor
+            // its batch age at that captured receipt rather than "now" (which would
+            // undercount the queued term exactly under byte-cap backlog).
+            let batch_first_received = if from_carried {
+                carried_received_at.unwrap_or_else(Instant::now)
+            } else {
+                Instant::now()
+            };
             let mut linger_hit_deadline = false;
             let mut shutdown_flush = false;
             // Coalesce a contiguous run of buffered envelopes into one
@@ -1263,6 +1272,7 @@ impl RefreshTask {
                             carried_item = Some(item);
                             carried_received_ms =
                                 util::time::system_time_to_unix_ms(std::time::SystemTime::now());
+                            carried_received_at = Some(Instant::now());
                             break;
                         }
                         burst_bytes = burst_bytes.saturating_add(item_bytes);
@@ -1310,6 +1320,7 @@ impl RefreshTask {
                                 carried_received_ms = util::time::system_time_to_unix_ms(
                                     std::time::SystemTime::now(),
                                 );
+                                carried_received_at = Some(Instant::now());
                                 break;
                             }
                             burst_bytes = burst_bytes.saturating_add(item_bytes);
