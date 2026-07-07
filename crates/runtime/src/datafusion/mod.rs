@@ -1567,7 +1567,7 @@ impl DataFusion {
         if let Some(bytes) = self.compaction_memory_bytes {
             // The compaction metrics (incl. the pool-size gauge) are registered by
             // the binary AFTER metrics init via
-            // `telemetry::register_cayenne_compaction_metrics`. This runs before the
+            // `telemetry::cayenne::register_compaction_metrics`. This runs before the
             // Prometheus meter exists, so emitting the gauge here would bind it to
             // the noop meter and it would never reach `/metrics`.
             tracing::info!(

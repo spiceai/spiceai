@@ -99,12 +99,13 @@ pub use metastore::sqlite::{SqliteAutoVacuum, SqliteMetastoreConfig, set_sqlite_
 pub use provider::constants::{STAGING_DIR_NAME, STAGING_WAL_FILENAME, STAGING_WAL_TMP_FILENAME};
 pub use provider::{
     CayenneCdcWrite, CayenneContext, CayenneStagedAppend, CayenneTableProvider,
-    CayenneTableProviderBuilder, PARTITIONED_WAL_DIR, PartitionedWal, PartitionedWalEntry,
-    PreparedOverwrite, PreparedStagedAppend, QueryObservations, SlotAdvancer,
+    CayenneTableProviderBuilder, EncodeBudgetSnapshot, PARTITIONED_WAL_DIR, PartitionedWal,
+    PartitionedWalEntry, PreparedOverwrite, PreparedStagedAppend, QueryObservations, SlotAdvancer,
     TimeRetentionFilterBuilder, cap_global_encode_concurrency, deregister_query_observations,
-    global_mem_tier_total, global_qph, record_global_query, record_query_latency,
-    register_query_observations, set_compaction_runtime_env, set_compaction_runtime_handle,
-    set_cpu_burstable, set_global_encode_concurrency, set_global_mem_tier_bytes,
-    set_global_memory_budget, set_query_admission_governor, update_global_mem_tier_total,
+    encode_budget_snapshot, global_mem_tier_total, global_mem_tier_used, global_qph,
+    record_global_query, record_query_latency, register_query_observations,
+    set_compaction_runtime_env, set_compaction_runtime_handle, set_cpu_burstable,
+    set_global_encode_concurrency, set_global_mem_tier_bytes, set_global_memory_budget,
+    set_query_admission_governor, update_global_mem_tier_total,
 };
 pub use schema::transform_schema_for_vortex;

@@ -138,6 +138,26 @@ pub static CDC_APPLIED_COMMIT_UNIX_TIME_MS: LazyLock<Gauge<i64>> = LazyLock::new
         .build()
 });
 
+/// Upstream commit timestamp (Unix epoch ms) of the latest RECEIVED CDC envelope
+/// (at ingress, before coalesce/apply). Paired with
+/// `cdc_applied_commit_unix_time_ms` (egress), the advance RATE of each vs wall
+/// clock gives a "progress ×realtime" ladder:
+///   received-rate = `d(received_commit_ts)/d(wall)`  — how fast we pull source-time IN
+///   applied-rate  = `d(applied_commit_ts)/d(wall)`   — how fast we make it queryable
+/// received-rate < 1 ⇒ ingress can't keep up with the source (delivery/source-bound;
+/// split further by reader input-wait vs decode). received-rate ≈ 1 but
+/// applied-rate < 1 ⇒ the slowdown is INSIDE our apply/write path. An independent
+/// corroborator for the lag-slope / arrival-lag / classifier signals.
+pub static CDC_RECEIVED_COMMIT_UNIX_TIME_MS: LazyLock<Gauge<i64>> = LazyLock::new(|| {
+    METER
+        .i64_gauge("dataset_acceleration_cdc_received_commit_unix_time_ms")
+        .with_description(
+            "Upstream commit timestamp (Unix epoch ms) of the latest received CDC envelope (ingress). Its advance rate vs wall clock = how fast the reader pulls source-time in; compare to cdc_applied_commit_unix_time_ms (egress) to localize slowdowns to delivery vs apply.",
+        )
+        .with_unit("ms")
+        .build()
+});
+
 pub static SIZE_BYTES: LazyLock<Gauge<u64>> = LazyLock::new(|| {
     METER
         .u64_gauge("dataset_acceleration_size_bytes")
@@ -208,6 +228,28 @@ pub static CDC_APPLY_FIXED_COST_MS: LazyLock<Histogram<f64>> = LazyLock::new(|| 
         .build()
 });
 
+// TODO(cdc-metrics): a `cdc_apply_unaccounted_ms = burst_ms − Σ(in-burst write phases)`
+// histogram is a few lines given the burst brackets + fixed-cost phases are both here,
+// and would surface an instrumentation blind spot (a delete-heavy table measured ~0.8%
+// phase coverage of burst wall clock) at record time. The waterfall computes the same
+// ratio from the exported sums today (two-level coverage), so this is a convenience /
+// CI-gate follow-up.
+
+/// Which apply path each CDC sub-batch took, labeled by `path`
+/// (`inmem_append` | `inmem_delete` | `durable_append` | `durable_delete`). The
+/// `durable_*` paths take the synchronous whole-burst commit + maintenance and are
+/// far more expensive; a table pinned to them (e.g. delete-bearing bursts that clear
+/// the slot-advancer) explains a large apply time that the write-phase breakdown
+/// alone leaves unattributed.
+pub static CDC_APPLY_PATH_TOTAL: LazyLock<Counter<u64>> = LazyLock::new(|| {
+    METER
+        .u64_counter("dataset_acceleration_cdc_apply_path_total")
+        .with_description(
+            "Count of CDC apply sub-batches by path (inmem_append/inmem_delete/durable_append/durable_delete).",
+        )
+        .build()
+});
+
 /// Bucket boundaries for the per-delete-burst key-count histogram. Resolves the
 /// sub-cap band (`< 2048`, where a burst runs as a single durable plan) from the
 /// multi-cap tail (`> 2048`, where chunking splits the burst) so the fleet can
@@ -252,6 +294,15 @@ pub static CDC_DELETE_ABSORB_FALLTHROUGH: LazyLock<Counter<u64>> = LazyLock::new
         .build()
 });
 
+/// Time the CDC apply loop spent blocked waiting to receive the next batch from
+/// the source-reader channel (i.e. waiting on the replication-slot read + WAL
+/// decode that the reader task performs). This is the discriminator for the
+/// "unaccounted per-batch overhead" gap: a high recv-wait means the apply loop
+/// is *source-bound* (the reader cannot decode/deliver batches fast enough),
+/// while a near-zero recv-wait means the loop is *apply-bound* (the bottleneck
+/// is the accelerator write, e.g. Cayenne's synchronous on-conflict path). Pair
+/// it with `cdc_apply_burst_duration_ms` for full per-batch attribution
+/// (wall-clock ≈ recv-wait + apply-burst).
 pub static CDC_SOURCE_RECV_WAIT_MS: LazyLock<Histogram<f64>> = LazyLock::new(|| {
     METER
         .f64_histogram("dataset_acceleration_cdc_source_recv_wait_ms")
@@ -271,5 +322,130 @@ pub static CDC_LINGER_WAIT_MS: LazyLock<Histogram<f64>> = LazyLock::new(|| {
         )
         .with_unit("ms")
         .with_boundaries(CONTENTION_MS_HISTOGRAM_BUCKETS.to_vec())
+        .build()
+});
+
+/// Occupancy of the bounded prefetch channel between the CDC source-reader task
+/// and the apply loop, sampled each time the apply loop wakes with a new batch.
+/// Pinned at (or near) `dataset_acceleration_cdc_prefetch_buffer_capacity` means
+/// the reader is producing faster than the apply loop drains — the definitive
+/// **apply-bound** signal (the accelerator write, e.g. Cayenne, is the
+/// bottleneck). Near-zero means the loop keeps up / is **source-bound** (pair
+/// with `cdc_source_recv_wait_ms`). Labeled by `dataset`.
+pub static CDC_PREFETCH_BUFFER_OCCUPANCY: LazyLock<Gauge<u64>> = LazyLock::new(|| {
+    METER
+        .u64_gauge("dataset_acceleration_cdc_prefetch_buffer_occupancy")
+        .with_description(
+            "Buffered items in the CDC source-reader→apply prefetch channel when the apply loop last woke. Near capacity = apply-bound (accelerator write is the bottleneck); near zero = source-bound.",
+        )
+        .with_unit("{envelope}")
+        .build()
+});
+
+/// Capacity (buffer size) of the CDC prefetch channel — the `cdc_prefetch_buffer`
+/// config. Emitted alongside the occupancy so a dashboard can compute the
+/// fill ratio without hard-coding the default. Labeled by `dataset`.
+pub static CDC_PREFETCH_BUFFER_CAPACITY: LazyLock<Gauge<u64>> = LazyLock::new(|| {
+    METER
+        .u64_gauge("dataset_acceleration_cdc_prefetch_buffer_capacity")
+        .with_description(
+            "Capacity of the CDC source-reader→apply prefetch channel (the cdc_prefetch_buffer config).",
+        )
+        .with_unit("{envelope}")
+        .build()
+});
+
+/// Counts applied CDC bursts by what ended coalescing (the flush `reason`):
+/// `deadline` (the `cdc_max_coalesce_age_ms` linger timer fired — the batch was
+/// held for freshness-cost time waiting for more rows), `envelope_cap`
+/// (`cdc_max_coalesced_envelopes` reached), `byte_cap` (`cdc_max_coalesced_bytes`
+/// reached), `buffer_drained` (linger disabled or nothing left to coalesce),
+/// `channel_closed`, or `shutdown`. A high `deadline` share means coalescing is
+/// timer-bound (low source volume) and the linger is adding latency without
+/// filling batches; a high `envelope_cap`/`byte_cap` share means batches fill
+/// before the deadline (the write path, not the timer, paces the apply loop).
+/// Labeled by `dataset` + `reason`.
+pub static CDC_COALESCE_FLUSH_TOTAL: LazyLock<Counter<u64>> = LazyLock::new(|| {
+    METER
+        .u64_counter("dataset_acceleration_cdc_coalesce_flush_total")
+        .with_description(
+            "CDC coalesced bursts applied, labeled by dataset and flush reason (deadline / envelope_cap / byte_cap / buffer_drained / channel_closed / shutdown).",
+        )
+        .with_unit("{burst}")
+        .build()
+});
+
+/// Time from receiving the FIRST envelope of a coalesced burst until that burst
+/// is flushed (the accelerator write begins) — i.e. how long the head-of-batch
+/// change sat being coalesced (Phase-1 drain + Phase-2 linger). This is the
+/// per-batch queued/coalescing latency the linger policy trades for larger
+/// writes; pair with `cdc_replication_lag_ms` to attribute lag to coalescing vs
+/// the write path. Uses the fine contention buckets since a batch can flush in
+/// sub-ms (cap hit) or wait out the multi-second `cdc_max_coalesce_age_ms`.
+/// Labeled by `dataset`.
+pub static CDC_COALESCE_BATCH_AGE_MS: LazyLock<Histogram<f64>> = LazyLock::new(|| {
+    METER
+        .f64_histogram("dataset_acceleration_cdc_coalesce_batch_age_ms")
+        .with_description(
+            "Time from receiving the first envelope of a coalesced CDC burst until it is flushed to the accelerator (Phase-1 drain + Phase-2 linger) — the per-batch queued/coalescing latency.",
+        )
+        .with_unit("ms")
+        .with_boundaries(CONTENTION_MS_HISTOGRAM_BUCKETS.to_vec())
+        .build()
+});
+
+/// Staleness of the first envelope of a burst AT THE MOMENT IT IS RECEIVED by the
+/// apply loop: wall-clock now − its upstream source-commit timestamp. This is lag
+/// that is ALREADY present before the accelerator does anything — PG WAL flush +
+/// network + logical-decode + reader delivery — so it cleanly separates
+/// *source-side* lag from the lag the apply path ADDS (queue + write). Pair with
+/// `cdc_coalesce_batch_age_ms` (queue) and `cdc_apply_burst_duration_ms` (write)
+/// for an additive decomposition of `cdc_replication_lag_ms`. High arrival lag +
+/// low `recv_wait` ⇒ source can't keep up (not idle); near-zero arrival lag ⇒ any
+/// lag is added downstream. Uses the coarse duration buckets since a backlog can
+/// reach many seconds/minutes (the histogram tail is the point). Labeled by
+/// `dataset`.
+pub static CDC_SOURCE_ARRIVAL_LAG_MS: LazyLock<Histogram<f64>> = LazyLock::new(|| {
+    METER
+        .f64_histogram("dataset_acceleration_cdc_source_arrival_lag_ms")
+        .with_description(
+            "Staleness of a burst's first envelope when received (now − source commit ts) — source-side lag present before the accelerator acts, separating it from lag the apply path adds.",
+        )
+        .with_unit("ms")
+        .with_boundaries(DURATION_MS_HISTOGRAM_BUCKETS.to_vec())
+        .build()
+});
+
+/// Time the CDC source-reader task blocked on `send` into the prefetch channel.
+/// Non-zero means the channel was full — the apply loop (accelerator write) is not
+/// draining fast enough, i.e. **apply-bound / downstream backpressure** on the
+/// reader. Near-zero with a rising lag means the reader itself (source socket or
+/// decode) is the limiter, not the apply path. Labeled by `dataset`.
+pub static CDC_READER_SEND_WAIT_MS: LazyLock<Histogram<f64>> = LazyLock::new(|| {
+    METER
+        .f64_histogram("dataset_acceleration_cdc_reader_send_wait_ms")
+        .with_description(
+            "Time the CDC source-reader blocked sending into the prefetch channel (channel full => apply-bound / downstream backpressure).",
+        )
+        .with_unit("ms")
+        .with_boundaries(CONTENTION_MS_HISTOGRAM_BUCKETS.to_vec())
+        .build()
+});
+
+/// Wall-clock period between successive CDC burst applies (one iteration's
+/// recv-start to the next). This is the ground-truth apply CADENCE that anchors
+/// the per-stage attribution: the sum of the per-stage means overstates the real
+/// cycle where phases overlap (pipelined commit/finalize), so comparing that sum
+/// to this cadence exposes the overlap. A cadence pinned near
+/// `cdc_max_coalesce_age_ms` means the linger timer paces the loop. Labeled by
+/// `dataset`.
+pub static CDC_APPLY_CYCLE_MS: LazyLock<Histogram<f64>> = LazyLock::new(|| {
+    METER
+        .f64_histogram("dataset_acceleration_cdc_apply_cycle_ms")
+        .with_description(
+            "Wall-clock period between successive CDC burst applies (recv-start to recv-start) — the apply cadence that ground-truths the per-stage attribution.",
+        )
+        .with_unit("ms")
+        .with_boundaries(DURATION_MS_HISTOGRAM_BUCKETS.to_vec())
         .build()
 });
