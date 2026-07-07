@@ -12,6 +12,14 @@ on:
         description: 'The spicepod file to test with (relative to test/spicepods/chbench/)'
         required: true
         type: string
+      source_type:
+        description: 'Source database (postgres or mysql)'
+        required: false
+        default: 'postgres'
+        type: choice
+        options:
+          - 'postgres'
+          - 'mysql'
       scale_factor:
         description: 'Scale factor (warehouses). Terminals = scale_factor * 10.'
         required: false
@@ -123,8 +131,15 @@ jobs:
       # On spiceai-dev-xlarge-runners a dedicated in-cluster PostgreSQL pod is used,
       # so skip the local docker Postgres there.
       - name: Setup CH-benCH PostgreSQL
-        if: github.event.inputs.runner_type != 'spiceai-dev-xlarge-runners'
+        if: github.event.inputs.source_type != 'mysql' && github.event.inputs.runner_type != 'spiceai-dev-xlarge-runners'
         uses: ./.github/actions/setup-chbench-postgres
+
+      # MySQL source: always an ephemeral per-run docker container on the runner
+      # (loopback). There's no shared in-cluster MySQL pod / template cache yet,
+      # so this runs on every runner type and the run below seeds normally.
+      - name: Setup CH-benCH MySQL
+        if: github.event.inputs.source_type == 'mysql'
+        uses: ./.github/actions/setup-chbench-mysql
 
       # The xlarge PG pod is long-lived, so cache a pristine seed as a Postgres
       # template database and restore chbench from it (FILE_COPY, seconds) instead
@@ -133,7 +148,7 @@ jobs:
       # this the run below uses `--skip-prepare`. Ephemeral docker-PG runners have
       # nothing to cache, so they skip this and seed normally.
       - name: Restore or seed CH-benCH from template
-        if: github.event.inputs.runner_type == 'spiceai-dev-xlarge-runners'
+        if: github.event.inputs.source_type != 'mysql' && github.event.inputs.runner_type == 'spiceai-dev-xlarge-runners'
         run: bash .github/scripts/chbench_template.sh
         env:
           SCALE_FACTOR: ${{ github.event.inputs.scale_factor }}
@@ -181,6 +196,7 @@ jobs:
           $TESTOP_PREFIX testoperator run htap \
             -s "${SPICED_BIN}" \
             -p '${{ steps.set_spicepod_path.outputs.SPICEPOD_PATH }}' \
+            ${{ github.event.inputs.source_type == 'mysql' && '--source-type mysql' || '' }} \
             --query-set chbench \
             --scale-factor ${{ github.event.inputs.scale_factor }} \
             ${{ github.event.inputs.terminals && format('--terminals {0}', github.event.inputs.terminals) || '' }} \
