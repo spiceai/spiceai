@@ -69,6 +69,8 @@ jobs:
       run_arm64: ${{ steps.set_targets.outputs.run_arm64 }}
       image: ${{ steps.set_image_metadata.outputs.image }}
       tag: ${{ steps.set_image_metadata.outputs.tag }}
+      revision: ${{ steps.provenance.outputs.revision }}
+      on_trunk: ${{ steps.provenance.outputs.on_trunk }}
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
@@ -97,6 +99,24 @@ jobs:
           echo "rel_version=${version}" >> $GITHUB_OUTPUT
           echo "dev_label=${dev_label}" >> $GITHUB_OUTPUT
           echo "Building dev image with version: \"${version}\""
+
+      - name: Determine build provenance
+        id: provenance
+        run: |
+          # Raw commit actually built (HEAD = `inputs.ref || github.sha`).
+          revision="$(git rev-parse HEAD)"
+          # "Is this trunk code": is the built commit reachable from trunk's tip?
+          # Only trunk's recent history is needed, so fetch a shallow slice rather
+          # than the whole repo.
+          git fetch --depth=100 --no-tags origin trunk
+          if git merge-base --is-ancestor HEAD FETCH_HEAD 2>/dev/null; then
+            on_trunk=true
+          else
+            on_trunk=false
+          fi
+          echo "revision=${revision}" >> "$GITHUB_OUTPUT"
+          echo "on_trunk=${on_trunk}" >> "$GITHUB_OUTPUT"
+          echo "Provenance: revision=${revision} on_trunk=${on_trunk} ref_type=${GITHUB_REF_TYPE} ref_name=${GITHUB_REF_NAME}"
 
       - name: Set target architectures
         id: set_targets
@@ -167,13 +187,13 @@ jobs:
           sudo chown $USER /var/run/docker.sock
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5 # v4.1.0
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
 
       - name: Login to Docker Hub
         # Authenticate to Docker Hub before building so base image pulls (rust, debian, etc.)
         # use authenticated rate limits instead of anonymous (per-IP) limits.
         if: github.repository == 'spiceai/spiceai'
-        uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee # v4.2.0
+        uses: docker/login-action@af1e73f918a031802d376d3c8bbc3fe56130a9b0 # v4.4.0
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
@@ -188,7 +208,7 @@ jobs:
           fi
 
       - name: Build ARM64 image
-        uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf # v7.2.0
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
         with:
           context: .
           file: Dockerfile
@@ -199,6 +219,13 @@ jobs:
           build-args: |
             CARGO_FEATURES=${{ env.CARGO_FEATURES }}
             RUST_PROFILE=${{ env.RUST_PROFILE }}
+          # Provenance labels baked into the image config (survive the multi-arch
+          # `imagetools create` in publish, readable via `docker inspect`).
+          labels: |
+            org.opencontainers.image.revision=${{ needs.setup.outputs.revision }}
+            build.on_trunk=${{ needs.setup.outputs.on_trunk }}
+            build.ref_type=${{ github.ref_type }}
+            build.ref_name=${{ github.ref_name }}
 
       - name: Validate ARM64 image
         run: |
@@ -237,13 +264,13 @@ jobs:
           grep '^version =' Cargo.toml
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5 # v4.1.0
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
 
       - name: Login to Docker Hub
         # Authenticate to Docker Hub before building so base image pulls (rust, debian, etc.)
         # use authenticated rate limits instead of anonymous (per-IP) limits.
         if: github.repository == 'spiceai/spiceai'
-        uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee # v4.2.0
+        uses: docker/login-action@af1e73f918a031802d376d3c8bbc3fe56130a9b0 # v4.4.0
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
@@ -258,7 +285,7 @@ jobs:
           fi
 
       - name: Build AMD64 image
-        uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf # v7.2.0
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
         with:
           context: .
           file: Dockerfile
@@ -269,6 +296,13 @@ jobs:
           build-args: |
             CARGO_FEATURES=${{ env.CARGO_FEATURES }}
             RUST_PROFILE=${{ env.RUST_PROFILE }}
+          # Provenance labels baked into the image config (survive the multi-arch
+          # `imagetools create` in publish, readable via `docker inspect`).
+          labels: |
+            org.opencontainers.image.revision=${{ needs.setup.outputs.revision }}
+            build.on_trunk=${{ needs.setup.outputs.on_trunk }}
+            build.ref_type=${{ github.ref_type }}
+            build.ref_name=${{ github.ref_name }}
 
       - name: Validate AMD64 image
         run: |
@@ -298,14 +332,14 @@ jobs:
           ls -l /tmp
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5 # v4.1.0
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
 
       - name: Login to Docker Hub
         # Authenticate to Docker Hub before pulling so we use the authenticated
         # rate limits instead of anonymous (per-IP) limits when pulling
         # registry:2 below.
         if: github.repository == 'spiceai/spiceai'
-        uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee # v4.2.0
+        uses: docker/login-action@af1e73f918a031802d376d3c8bbc3fe56130a9b0 # v4.4.0
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
@@ -315,7 +349,7 @@ jobs:
           docker run -d -p 5000:5000 --restart=always --name registry registry:2
 
       - name: Login to GitHub Package Registry
-        uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee # v4.2.0
+        uses: docker/login-action@af1e73f918a031802d376d3c8bbc3fe56130a9b0 # v4.4.0
         with:
           registry: ghcr.io
           username: ${{ github.repository_owner }}

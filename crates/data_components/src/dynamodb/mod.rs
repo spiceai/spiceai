@@ -32,7 +32,7 @@ mod table_schema;
 mod unnest;
 mod utils;
 
-pub use json_nest::JsonNesting;
+pub use json_nest::project_dynamodb_row;
 
 type DynamoDBRow = HashMap<String, AttributeValue>;
 

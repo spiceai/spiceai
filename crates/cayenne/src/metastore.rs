@@ -28,8 +28,53 @@ pub mod turso;
 
 use std::fmt::Display;
 
-use super::catalog::CatalogResult;
+use super::catalog::{CatalogError, CatalogResult};
 use async_trait::async_trait;
+
+/// The Cayenne metastore schema version stamped into the backing database's
+/// `user_version` header by [`Metastore::init_schema`] on every open.
+///
+/// Bump this whenever a schema change makes a catalog written by the new code
+/// **unsafe to open with an older binary** — i.e. the older binary would return
+/// silently wrong results rather than fail cleanly.
+///
+/// Version history:
+/// - `1` — metadata-only upsert publish (#11260): upsert commits stop writing
+///   per-key `cayenne_insert_record` rows and instead stamp `reinsert_sequence`
+///   on key-based delete files. A pre-#11260 binary reads an empty insert-record
+///   table for post-upgrade upserts and silently filters out the current version
+///   of every upserted row. The gate below turns that latent silent-row-loss into
+///   a loud [`CatalogError::IncompatibleSchemaVersion`] on any future downgrade to
+///   a build whose max supported version is lower than the stamped one (#11291).
+pub const CAYENNE_METASTORE_SCHEMA_VERSION: i64 = 1;
+
+/// Guard against opening a metastore that was written by a **newer** Spice build
+/// than this one supports.
+///
+/// `stored_version` is the `user_version` header read from the catalog before any
+/// migration runs. A stored version greater than [`CAYENNE_METASTORE_SCHEMA_VERSION`]
+/// means the catalog carries a schema this build does not understand; continuing
+/// would risk silently wrong results (see the version history above), so we refuse
+/// to open it with a loud error instead. A stored version less than or equal to the
+/// current one is a legacy or same-version catalog and is safe to migrate forward
+/// (each backend re-stamps `user_version` to the current value after migrating).
+///
+/// A stamp of `0` — a fresh database, or any catalog written before this gate
+/// existed — is always accepted.
+///
+/// # Errors
+///
+/// Returns [`CatalogError::IncompatibleSchemaVersion`] if `stored_version` is
+/// greater than [`CAYENNE_METASTORE_SCHEMA_VERSION`].
+pub fn ensure_supported_schema_version(stored_version: i64) -> CatalogResult<()> {
+    if stored_version > CAYENNE_METASTORE_SCHEMA_VERSION {
+        return Err(CatalogError::IncompatibleSchemaVersion {
+            found: stored_version,
+            supported: CAYENNE_METASTORE_SCHEMA_VERSION,
+        });
+    }
+    Ok(())
+}
 
 /// Expected column definitions for a metadata table.
 ///
@@ -117,7 +162,13 @@ pub const EXPECTED_TABLES: &[ExpectedTable] = &[
     },
     ExpectedTable {
         name: "cayenne_table_statistics",
-        columns: &["table_id", "statistics_blob", "num_rows", "ndv_sketches"],
+        columns: &[
+            "table_id",
+            "statistics_blob",
+            "num_rows",
+            "ndv_sketches",
+            "num_rows_exact",
+        ],
     },
     ExpectedTable {
         name: "cayenne_snapshot_file_statistics",
@@ -144,6 +195,24 @@ pub const EXPECTED_TABLES: &[ExpectedTable] = &[
             "file_size_bytes",
             "min_sequence",
             "max_sequence",
+            "digest",
+        ],
+    },
+    ExpectedTable {
+        // Cold-tier object-store manifest. Table-scoped (no snapshot_id),
+        // append-only. Carries each cold file's stats blob inline (one row, no
+        // join) so listing-time pruning needs no object-store round-trip.
+        // Column order MUST match the DDL in `sqlite.rs`/`turso.rs` and the
+        // export/import column order.
+        name: "cayenne_cold_tier_file",
+        columns: &[
+            "table_id",
+            "file_url",
+            "row_count",
+            "file_size_bytes",
+            "min_sequence",
+            "max_sequence",
+            "statistics_blob",
         ],
     },
     ExpectedTable {
@@ -812,6 +881,44 @@ mod tests {
         assert!(
             msg.contains("cayenne_table"),
             "Error message should name the mismatched table: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_ensure_supported_schema_version_accepts_legacy_and_current() {
+        // A fresh/legacy database reads user_version 0; a same-version catalog
+        // reads the current version. Both are safe to migrate forward and open.
+        ensure_supported_schema_version(0).expect("legacy (v0) catalog must open");
+        ensure_supported_schema_version(CAYENNE_METASTORE_SCHEMA_VERSION)
+            .expect("same-version catalog must open");
+    }
+
+    #[test]
+    fn test_ensure_supported_schema_version_rejects_newer() {
+        // A catalog stamped by a newer build must be refused loudly rather than
+        // opened and read with silently-wrong (dropped-row) results (#11291).
+        let newer = CAYENNE_METASTORE_SCHEMA_VERSION + 1;
+        let err =
+            ensure_supported_schema_version(newer).expect_err("a newer catalog must be rejected");
+        match err {
+            CatalogError::IncompatibleSchemaVersion { found, supported } => {
+                assert_eq!(found, newer, "reported version must be the stored one");
+                assert_eq!(
+                    supported, CAYENNE_METASTORE_SCHEMA_VERSION,
+                    "reported supported version must be this build's max"
+                );
+            }
+            other => panic!("expected IncompatibleSchemaVersion, got: {other}"),
+        }
+        // The message must be actionable and free of internal jargon.
+        let msg = CatalogError::IncompatibleSchemaVersion {
+            found: newer,
+            supported: CAYENNE_METASTORE_SCHEMA_VERSION,
+        }
+        .to_string();
+        assert!(
+            msg.contains("newer version of Spice") && msg.contains("Upgrade Spice"),
+            "message should tell the user to upgrade: {msg}"
         );
     }
 }

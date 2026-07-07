@@ -26,6 +26,7 @@ use crate::{
         change_event::{ChangeEvent, ChangeEventKey},
     },
     kafka::{Error, KafkaConsumer},
+    schema_projection::SchemaProjection,
 };
 use arrow::datatypes::SchemaRef;
 use async_trait::async_trait;
@@ -47,6 +48,9 @@ pub struct DebeziumKafka {
     consumer: &'static KafkaConsumer,
     batching: (usize, Duration),
     offset_commit_hook: Option<Arc<dyn KafkaOffsetCommitHook>>,
+    /// JSON-nesting / declared-schema projection applied to each change row's
+    /// `before`/`after` payload before Arrow conversion. `None` ⇒ passthrough.
+    projection: Option<SchemaProjection>,
 }
 
 impl std::fmt::Debug for DebeziumKafka {
@@ -66,6 +70,7 @@ impl DebeziumKafka {
         primary_keys: Vec<String>,
         consumer: KafkaConsumer,
         batching: (usize, Duration),
+        projection: Option<SchemaProjection>,
     ) -> Self {
         let Ok(df_schema) = DFSchema::try_from(Arc::clone(&schema)) else {
             unreachable!("DFSchema::try_from is infallible as of DataFusion 38")
@@ -93,6 +98,7 @@ impl DebeziumKafka {
             consumer: Box::leak(Box::new(consumer)),
             batching,
             offset_commit_hook: None,
+            projection,
         }
     }
 
@@ -117,6 +123,7 @@ impl DebeziumKafka {
         let consumer = self.consumer;
         let metrics = Arc::clone(self.consumer.metrics());
         let offset_commit_hook = self.offset_commit_hook.clone();
+        let projection = self.projection.clone();
         let inner = self
             .consumer
             .stream_json::<ChangeEventKey, ChangeEvent>()
@@ -155,9 +162,10 @@ impl DebeziumKafka {
                     })
                     .max();
 
-                let rb = changes::vector_to_change_batch(&schema, &pk, &changes)
-                    .map_err(|e| cdc::StreamError::SerdeJsonError(e.to_string()))?
-                    .with_source_commit_ts_ms(source_commit_ts_ms);
+                let rb =
+                    changes::vector_to_change_batch(&schema, &pk, &changes, projection.as_ref())
+                        .map_err(|e| cdc::StreamError::SerdeJsonError(e.to_string()))?
+                        .with_source_commit_ts_ms(source_commit_ts_ms);
 
                 let committer = MessageBatchCommitter::from_messages(consumer, &messages)
                     .with_offset_commit_hook(offset_commit_hook.clone());

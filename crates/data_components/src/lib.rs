@@ -109,6 +109,8 @@ pub const INFERRED_COLUMN_STATS_METADATA_KEY: &str = "spice.inferred_column_stat
 /// Metadata to merge into fields, keyed by field name.
 pub type FieldMetadata = HashMap<String, HashMap<String, String>>;
 
+#[cfg(feature = "adbc")]
+pub mod adbc_helpers;
 pub mod arrow;
 #[cfg(feature = "clickhouse")]
 pub mod clickhouse;
@@ -160,6 +162,10 @@ pub mod s3_single_file_cached;
 #[cfg(feature = "s3_vectors")]
 pub mod s3_vectors;
 pub mod schema_discovery;
+/// Connector-agnostic schema projection (JSON nesting). The core lives in the
+/// `datafusion-table-providers` fork so providers defined there (`MongoDB`) can
+/// reuse it; re-exported here for the in-repo connectors (`DynamoDB`, Debezium).
+pub use datafusion_table_providers::schema_projection;
 #[cfg(feature = "scylladb")]
 pub mod scylladb;
 pub mod sql_expr;

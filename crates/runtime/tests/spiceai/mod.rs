@@ -23,7 +23,7 @@ use spicepod::{component::dataset::Dataset, param::Params};
 
 use crate::{
     ValidateFn, configure_test_datafusion, init_tracing, run_query_and_check_results,
-    utils::test_request_context,
+    utils::{register_test_connectors, test_request_context},
 };
 
 fn make_spiceai_dataset(path: &str, name: &str) -> Dataset {
@@ -64,6 +64,7 @@ async fn spiceai_federation() -> Result<(), anyhow::Error> {
                 .build();
 
             configure_test_datafusion();
+            register_test_connectors().await;
             let mut rt =
                 Runtime::builder()
                     .with_app(app)

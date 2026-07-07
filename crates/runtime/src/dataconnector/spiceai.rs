@@ -604,14 +604,6 @@ impl DataConnector for SpiceAI {
     }
 }
 
-register_data_connector!("spice.ai", SpiceAIFactory);
-register_data_connector!(
-    register_legacy_spiceai_connector,
-    LEGACY_SPICEAI_CONNECTOR_REGISTRATION,
-    "spiceai",
-    SpiceAIFactory
-);
-
 #[derive(Debug, PartialEq, Eq)]
 pub enum SpiceAIDatasetPath {
     OrgAppPath {
@@ -878,7 +870,13 @@ mod tests {
 
     #[tokio::test]
     async fn test_spiceai_from_variants_resolve_connector_params() {
-        crate::dataconnector::register_all().await;
+        // `register_all()` uses the linkme distributed slice, which no longer includes
+        // the spiceai connector since its registration was moved to the `connector-spiceai`
+        // crate (which depends on `runtime`, not the reverse). Register the factory directly.
+        crate::dataconnector::register_connector_factory("spice.ai", SpiceAIFactory::new_arc())
+            .await;
+        crate::dataconnector::register_connector_factory("spiceai", SpiceAIFactory::new_arc())
+            .await;
 
         for input in [
             "spiceai:http://localhost:50051",

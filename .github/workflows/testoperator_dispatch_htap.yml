@@ -2,10 +2,18 @@ name: testoperator dispatch htap
 
 on:
   schedule:
-    # htap-sf1000, twice daily (0000, 1200) — HTAP CH-benCHmark SF1000 (spiceai-dev-xlarge-runners)
-    - cron: '0 0,12 * * *'
+    # htap-sf1000-adaptive, every 3 hours (0000, 0300, …, 2100) — the high-value SF1000 adaptive
+    # config for frequent adaptive trend data (spiceai-dev-xlarge-runners).
+    - cron: '0 */3 * * *'
+    # htap-sf1000 (other configs), once daily (0100) — the remaining SF1000 configs
+    # (adaptive-turso, duckdb baseline) on the xlarge pool.
+    - cron: '0 1 * * *'
     # htap-sf1, twice daily (0600, 1800) — HTAP CH-benCHmark SF1 (spiceai-dev-large-runners)
     - cron: '0 6,18 * * *'
+    # htap-sf1000-cold, once daily (0800) — HTAP CH-benCHmark SF1000 adaptive cold-object-store tier
+    # (spiceai-dev-xlarge-runners). Lighter once-a-day cadence; it shares the SF1000 serialized run
+    # concurrency group, so it queues, never contends.
+    - cron: '0 8 * * *'
 
   workflow_dispatch:
     inputs:
@@ -22,14 +30,18 @@ on:
           - 'sf10'
           - 'sf100'
           - 'sf1000'
+          - 'sf1000-adaptive'
+          - 'sf1000-cold'
 
 jobs:
   dispatch-htap:
     name: Dispatch HTAP - ${{ github.event.inputs.scale_factor || github.event.schedule }}
     runs-on: spiceai-dev-runners
-    # On schedule the dispatcher serializes the batch (--max-concurrent 1) and blocks for the sum of
-    # its run durations; an SF1000 batch can run several hours, so raise the cap above GitHub's 6h.
-    timeout-minutes: 720
+    # The dispatcher only fires the workflow_dispatch events (spaced ~80s apart) and exits; the runs
+    # themselves serialize via the htap workflow's queue: max concurrency group, not here. So this
+    # only needs to cover the build + dispatch loop (≤~10 min for the largest batch), not the sum of
+    # run durations.
+    timeout-minutes: 120
     # Per-cron group on schedule (so the SF1/SF100/SF1000 dispatchers don't block each other),
     # per-ref on manual dispatch.
     concurrency:
@@ -85,32 +97,30 @@ jobs:
           done
 
       # On manual dispatch the scale factor comes from the input. On schedule, derive it from the
-      # cron that fired. Scheduled batches also serialize (--max-concurrent 1) so each run finishes
-      # before the next is dispatched; --max-concurrent-wait-timeout-mins covers a full run's
-      # wall-clock so the slot wait doesn't give up early. Manual dispatch keeps the original
-      # fire-and-forget behaviour (no serialization flags).
+      # cron that fired. Both manual and scheduled dispatch are fire-and-forget: the runs serialize
+      # via the htap workflow's queue: max concurrency group (FIFO), so the dispatcher no longer
+      # feeds them one at a time with --max-concurrent.
       - name: Resolve scale factor
         id: resolve
         run: |
           SF="${{ github.event.inputs.scale_factor }}"
-          FLAGS=""
           if [ -z "$SF" ]; then
             case "${{ github.event.schedule }}" in
-              '0 0,12 * * *')                 SF=sf1000 ;;
+              '0 */3 * * *')                  SF=sf1000-adaptive ;;
+              '0 1 * * *')                    SF=sf1000 ;;
               '0 6,18 * * *')                 SF=sf1 ;;
+              '0 8 * * *')                    SF=sf1000-cold ;;
               *)                              SF= ;;   # unrecognized cron — dispatch nothing
             esac
-            FLAGS="--max-concurrent 1 --max-concurrent-wait-timeout-mins 180"
           fi
-          echo "Resolved scale factor: '$SF' (flags: '$FLAGS')"
+          echo "Resolved scale factor: '$SF'"
           echo "scale_factor=$SF" >> "$GITHUB_OUTPUT"
-          echo "flags=$FLAGS" >> "$GITHUB_OUTPUT"
 
       - name: Dispatch Testoperator - HTAP - CH-BenCHmark - ${{ steps.resolve.outputs.scale_factor }}
         if: ${{ steps.resolve.outputs.scale_factor != '' }}
         run: |
           testoperator dispatch ./tools/testoperator/dispatch/chbench/${{ steps.resolve.outputs.scale_factor }} \
-            --workflow htap ${{ steps.resolve.outputs.flags }}
+            --workflow htap
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           SPICED_COMMIT: ${{ steps.setup-spiced.outputs.SPICED_COMMIT }}

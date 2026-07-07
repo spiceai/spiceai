@@ -17,15 +17,95 @@ limitations under the License.
 use std::sync::Arc;
 
 use datafusion_common::{
-    Column, DataFusionError, NullEquality, Result, plan_datafusion_err, plan_err,
+    Column, DFSchemaRef, DataFusionError, NullEquality, Result, plan_datafusion_err, plan_err,
+    tree_node::{Transformed, TreeNode},
 };
 use datafusion_expr::{
-    Expr, Filter, JoinType, LogicalPlan, Operator,
+    Expr, Filter, JoinType, LogicalPlan, Operator, Projection,
     utils::{
         check_all_columns_from_schema, conjunction, disjunction, split_binary, split_conjunction,
         split_conjunction_owned,
     },
 };
+
+use super::{
+    cost::JoinCostEstimator,
+    left_deep_join_plan::{ReorderOutcome, optimal_left_deep_join_plan},
+};
+
+/// Reorder the inner-join island(s) inside the inputs of a node that is about to
+/// be sealed as an opaque graph leaf (a semi/anti/outer join, or a wrapper the
+/// flattener does not descend through). The flattener only extracts the
+/// contiguous inner-join region from the root and stops at these boundaries.
+/// Each input is reordered independently via the same enumerator;
+/// [`LogicalPlan::map_children`] recomputes `plan`'s schema from the
+/// reordered inputs. Best-effort: an un-costable input is left unchanged.
+///
+/// This is safe precisely because it runs ONLY at opaque boundaries. A
+/// contiguous inner-join region is never sealed here — the flattener dissolves
+/// it into the current graph as individual relations, so it is reordered once,
+/// as a whole, by the enumeration that owns it. `reorder_opaque_inputs` only
+/// ever sees a child the parent genuinely cannot merge across (a semi/anti/outer
+/// join), so reordering that child independently cannot fragment a larger
+/// reorderable region.
+///
+/// Example — `FROM a, b, c WHERE … AND NOT EXISTS (SELECT … FROM x, y, z …)`:
+///
+/// ```text
+/// LeftAnti
+///   ├─ (a ⋈ b ⋈ c)   one inner island: a, b, c dissolve into ONE graph and are
+///   │                 reordered together (all 3-way orders are considered)
+///   └─ (x ⋈ y ⋈ z)   a separate island behind the anti-join boundary,
+///                     reordered independently
+/// ```
+///
+/// The recursion reorders each island as a unit; it never splits `a ⋈ b ⋈ c`
+/// into "reorder `a ⋈ b`, then `c`" — which would forfeit orders like
+/// `a ⋈ c ⋈ b`. Reordering across the boundary is semantically safe too: an
+/// anti/semi join's result depends only on each side's row SET, not its internal
+/// join order, and `restore_schema_order` keeps each side's output columns
+/// stable.
+fn reorder_opaque_inputs(
+    plan: LogicalPlan,
+    cost_estimator: &dyn JoinCostEstimator,
+) -> Result<Transformed<LogicalPlan>> {
+    plan.map_children(|child| {
+        // Capture the child's original output schema before reordering.
+        let original_schema = Arc::clone(child.schema());
+        Ok(match optimal_left_deep_join_plan(child, cost_estimator) {
+            ReorderOutcome::Completed(t) if t.transformed => {
+                // A join reorder preserves the *set* of output columns but can
+                // change their ORDER. Parent operators — and DataFusion's
+                // `optimize_projections`, which tracks required columns
+                // positionally — assume the original order;
+                // Re-project back to the ORIGINAL schema so the reordered island is a drop-in replacement.
+                Transformed::yes(restore_schema_order(t.data, &original_schema)?)
+            }
+            ReorderOutcome::Completed(t) => t,
+            ReorderOutcome::Failed { plan, .. } => Transformed::no(plan),
+        })
+    })
+}
+
+/// Wrap `plan` in a `Projection` reproducing `schema`'s columns in `schema`'s
+/// order, so a reordered island presents the exact output signature its parent
+/// expects. No-op when the order already matches. Errors if a column is missing
+/// (reorder dropped it) — the caller falls back to the original plan.
+fn restore_schema_order(plan: LogicalPlan, schema: &DFSchemaRef) -> Result<LogicalPlan> {
+    if plan.schema().columns() == schema.columns() {
+        return Ok(plan);
+    }
+    let exprs: Vec<Expr> = schema
+        .iter()
+        .map(|(qualifier, field)| {
+            Expr::Column(Column::new(qualifier.cloned(), field.name().to_owned()))
+        })
+        .collect();
+    Ok(LogicalPlan::Projection(Projection::try_new(
+        exprs,
+        Arc::new(plan),
+    )?))
+}
 
 pub type NodeId = usize;
 
@@ -90,6 +170,11 @@ pub struct JoinGraph {
     /// and out of `LogicalPlan::Filter` nodes that sit between joins.
     /// The enumerator must reapply these on top of the reordered plan.
     filters: Vec<Expr>,
+    /// Set when an opaque join node's nested inner-join island was reordered in place
+    /// (see [`reorder_opaque_inputs`]). Such a reorder changes the plan even when the
+    /// top-level graph has too few nodes to reorder; `build_reordered_plan` must then
+    /// still emit the reconstructed plan rather than discarding the work via its `< 3` no-op.
+    opaque_islands_reordered: bool,
 }
 
 impl JoinGraph {
@@ -102,13 +187,18 @@ impl JoinGraph {
     /// cannot be mapped onto exactly two relations during flattening.
     pub fn try_from_logical_plan(
         value: LogicalPlan,
+        cost_estimator: &dyn JoinCostEstimator,
     ) -> Result<(JoinGraph, Vec<LogicalPlan>), DataFusionError> {
         // First, extract the join subtree from any wrapper operators
         let (join_subtree, wrappers) = extract_join_subtree(value)?;
 
         // Now convert only the join subtree to a query graph
         let mut join_graph = JoinGraph::new();
-        flatten_joins_recursive(join_subtree, &mut join_graph)?;
+        flatten_joins_recursive(join_subtree, &mut join_graph, cost_estimator)?;
+        // Turn any equi-join predicates the flattener parked in the side-channel
+        // into edges (a subtree still in cross-join form — e.g. a nested island
+        // reordered before `eliminate_cross_join` reaches it — arrives edgeless).
+        join_graph.promote_equi_filters_to_edges();
         join_graph.derive_implied_single_table_filters();
         // Re-anchor degree-1 inner-join pendants onto the smallest relation in
         // their equi-join equivalence class (e.g. a small dimension joined only
@@ -217,11 +307,20 @@ impl JoinGraph {
             nodes: VecMap::new(),
             edges: VecMap::new(),
             filters: Vec::new(),
+            opaque_islands_reordered: false,
         }
     }
     #[must_use]
     pub fn filters(&self) -> &[Expr] {
         &self.filters
+    }
+
+    /// True if an opaque node's nested inner-join island was reordered in place
+    /// (see [`reorder_opaque_inputs`]). Lets `build_reordered_plan` emit the
+    /// reconstructed plan even when the top-level graph is below the reorder
+    /// threshold.
+    pub(crate) fn opaque_islands_reordered(&self) -> bool {
+        self.opaque_islands_reordered
     }
 
     /// Number of live relations (graph nodes). A value below 3 means there is no
@@ -265,11 +364,120 @@ impl JoinGraph {
         self.filters.push(expr);
     }
 
+    /// Promote equi-join predicates sitting in the side-channel `filters` into
+    /// graph edges. The flattener hoists a `Filter`'s conjuncts to the
+    /// side-channel; for a subtree still in cross-join form (`Inner` joins with
+    /// empty `on` plus a `Filter` carrying the join predicates — the shape a
+    /// nested island has *before* `eliminate_cross_join` reaches it, e.g. the
+    /// preserved side of chbench q21's `NOT EXISTS`), every equi-join predicate
+    /// lands here and the graph would otherwise be edgeless (all cross products,
+    /// so the reconstruction emits nothing but cross joins). Convert each
+    /// `expr = expr` conjunct that maps to exactly two distinct nodes into an edge
+    /// (same merge + cycle-demotion rules as `Join.on`), leaving genuine non-equi
+    /// and single-table predicates behind. A no-op at the top level, where
+    /// equi-joins already arrive as edges.
+    fn promote_equi_filters_to_edges(&mut self) {
+        let mut pairs_by_node_pair: std::collections::HashMap<(NodeId, NodeId), Vec<(Expr, Expr)>> =
+            std::collections::HashMap::new();
+        let mut insertion_order: Vec<(NodeId, NodeId)> = Vec::new();
+        let mut kept: Vec<Expr> = Vec::new();
+
+        for pred in std::mem::take(&mut self.filters) {
+            if let Expr::BinaryExpr(be) = &pred
+                && be.op == Operator::Eq
+                && let Some((a, b)) = self.equi_endpoints(&be.left, &be.right)
+            {
+                let key = if a <= b { (a, b) } else { (b, a) };
+                if !pairs_by_node_pair.contains_key(&key) {
+                    insertion_order.push(key);
+                }
+                pairs_by_node_pair
+                    .entry(key)
+                    .or_default()
+                    .push(((*be.left).clone(), (*be.right).clone()));
+                continue;
+            }
+            kept.push(pred);
+        }
+        self.filters = kept;
+
+        for (node_a, node_b) in insertion_order {
+            let Some(pairs) = pairs_by_node_pair.remove(&(node_a, node_b)) else {
+                continue;
+            };
+            if let Some(existing_edge_id) = self.find_edge_between(node_a, node_b) {
+                self.extend_edge_on(existing_edge_id, pairs);
+                continue;
+            }
+            // Cycle check: keep IK84's graph a tree — demote back to filters.
+            if self.path_exists(node_a, node_b) {
+                for (l, r) in pairs {
+                    self.add_filter(l.eq(r));
+                }
+                continue;
+            }
+            self.add_edge(
+                node_a,
+                node_b,
+                pairs,
+                JoinType::Inner,
+                NullEquality::NullEqualsNothing,
+            );
+        }
+    }
+
+    /// The two distinct graph nodes owning the columns of an equi-join predicate
+    /// `left = right` (one side per node), or `None` if it does not cleanly split
+    /// across exactly two nodes (single-table, unmapped, or spanning >2 nodes —
+    /// left as a side-channel filter).
+    fn equi_endpoints(&self, left: &Expr, right: &Expr) -> Option<(NodeId, NodeId)> {
+        let left_cols = left.column_refs();
+        let right_cols = right.column_refs();
+        if left_cols.is_empty() || right_cols.is_empty() {
+            return None;
+        }
+        let matching: Vec<NodeId> = self
+            .nodes()
+            .filter_map(|(node_id, node)| {
+                let schema = node.plan.schema();
+                let has_left =
+                    check_all_columns_from_schema(&left_cols, schema.as_ref()).unwrap_or(false);
+                let has_right =
+                    check_all_columns_from_schema(&right_cols, schema.as_ref()).unwrap_or(false);
+                if (has_left && !has_right) || (!has_left && has_right) {
+                    Some(node_id)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        match matching.as_slice() {
+            [a, b] => Some((*a, *b)),
+            _ => None,
+        }
+    }
+
     pub(crate) fn add_node(&mut self, node_data: Arc<LogicalPlan>) -> NodeId {
         self.nodes.insert(Node {
             plan: node_data,
             connections: Vec::new(),
         })
+    }
+
+    /// Add `plan` as an opaque node after reordering the inner-join island(s)
+    /// inside its inputs (see [`reorder_opaque_inputs`]). Records whether that
+    /// in-place reorder changed anything, so `build_reordered_plan` knows to emit
+    /// the reconstructed plan even when the top-level graph is below the reorder
+    /// threshold.
+    fn add_opaque_reordered_node(
+        &mut self,
+        plan: LogicalPlan,
+        cost_estimator: &dyn JoinCostEstimator,
+    ) -> Result<()> {
+        let sealed = reorder_opaque_inputs(plan, cost_estimator)?;
+        self.opaque_islands_reordered |= sealed.transformed;
+        self.add_node(Arc::new(sealed.data));
+        Ok(())
     }
 
     pub fn add_node_with_edge(
@@ -762,7 +970,11 @@ pub fn reconstruct_plan(join_plan: LogicalPlan, wrappers: Vec<LogicalPlan>) -> R
     Ok(current)
 }
 
-fn flatten_joins_recursive(plan: LogicalPlan, join_graph: &mut JoinGraph) -> Result<()> {
+fn flatten_joins_recursive(
+    plan: LogicalPlan,
+    join_graph: &mut JoinGraph,
+    cost_estimator: &dyn JoinCostEstimator,
+) -> Result<()> {
     match plan {
         // Inner joins decompose into the graph. (Cross joins are encoded as
         // Inner with an empty `on` list, which is also handled here: the
@@ -777,8 +989,16 @@ fn flatten_joins_recursive(plan: LogicalPlan, join_graph: &mut JoinGraph) -> Res
                 }
             }
 
-            flatten_joins_recursive(Arc::unwrap_or_clone(Arc::clone(&join.left)), join_graph)?;
-            flatten_joins_recursive(Arc::unwrap_or_clone(Arc::clone(&join.right)), join_graph)?;
+            flatten_joins_recursive(
+                Arc::unwrap_or_clone(Arc::clone(&join.left)),
+                join_graph,
+                cost_estimator,
+            )?;
+            flatten_joins_recursive(
+                Arc::unwrap_or_clone(Arc::clone(&join.right)),
+                join_graph,
+                cost_estimator,
+            )?;
 
             // Group each equi-pair by which two nodes it connects. A
             // single `Join.on` can mix pairs that span different node-
@@ -891,8 +1111,16 @@ fn flatten_joins_recursive(plan: LogicalPlan, join_graph: &mut JoinGraph) -> Res
             // as opaque (one un-reordered node). Such joins cost their build
             // side, not inner-join ordering, so little is lost.
             if join.filter.is_some() {
-                join_graph.add_node(Arc::new(LogicalPlan::Join(join)));
-                return Ok(());
+                // Seal as opaque, but first reorder any inner-join island inside
+                // its inputs — both the preserved (LHS) side and the RHS blob
+                // (`reorder_opaque_inputs` maps over every child). E.g. the 5-way
+                // chain under chbench q21's `NOT EXISTS` inequality on the LHS.
+                // Reordering either side is safe: each island preserves its
+                // input's row set and schema, so the semi/anti result is
+                // unchanged. Without this the whole join collapses to one
+                // un-reordered node.
+                return join_graph
+                    .add_opaque_reordered_node(LogicalPlan::Join(join), cost_estimator);
             }
 
             // Pre-flight multi-LHS guard. We inspect the qualifiers on
@@ -929,12 +1157,12 @@ fn flatten_joins_recursive(plan: LogicalPlan, join_graph: &mut JoinGraph) -> Res
                 .map(|c| c.relation.clone())
                 .collect();
             if lhs_qualifiers.len() != 1 || lhs_qualifiers.contains(&None) {
-                join_graph.add_node(Arc::new(LogicalPlan::Join(join)));
-                return Ok(());
+                return join_graph
+                    .add_opaque_reordered_node(LogicalPlan::Join(join), cost_estimator);
             }
 
             // Recurse into the LHS subtree, then attach the blob.
-            flatten_joins_recursive(Arc::unwrap_or_clone(lhs_child), join_graph)?;
+            flatten_joins_recursive(Arc::unwrap_or_clone(lhs_child), join_graph, cost_estimator)?;
             let blob_id = join_graph.add_node(rhs_child);
 
             // Find the single LHS-side node that owns the join key(s).
@@ -982,10 +1210,10 @@ fn flatten_joins_recursive(plan: LogicalPlan, join_graph: &mut JoinGraph) -> Res
             Ok(())
         }
         // Other non-inner joins (Left/Right/Full/Mark) are not freely
-        // reorderable, so the entire join subtree becomes one opaque leaf.
+        // reorderable, so the entire join subtree becomes one opaque leaf — but
+        // still reorder any inner-join island nested inside its inputs.
         LogicalPlan::Join(join) => {
-            join_graph.add_node(Arc::new(LogicalPlan::Join(join)));
-            Ok(())
+            join_graph.add_opaque_reordered_node(LogicalPlan::Join(join), cost_estimator)
         }
         // A `Filter` directly above a decomposable join is part of the join
         // region: hoist its conjuncts to the side-channel and recurse into
@@ -1000,12 +1228,15 @@ fn flatten_joins_recursive(plan: LogicalPlan, join_graph: &mut JoinGraph) -> Res
                 join_graph.add_filter(conj);
             }
             let inner = Arc::unwrap_or_clone(filter.input);
-            flatten_joins_recursive(inner, join_graph)
+            flatten_joins_recursive(inner, join_graph, cost_estimator)
         }
         // Anything else (Aggregate, Projection, Sort, Limit, Window, Filter
         // not over a decomposable join, base scans, ...) is absorbed as an
-        // opaque leaf. Joins nested inside such a wrapper are intentionally
-        // hidden from the enumerator (matches Databend's dphyp behavior).
+        // opaque leaf, WITHOUT recursing to reorder nested islands. A wrapper at
+        // this position is typically a scalar/correlated subquery body (e.g.
+        // chbench q2's `min` aggregate) whose independent reorder perturbs the
+        // outer query's costing. The in-place island reorder is reserved for the
+        // semi/anti/outer join branches above (for e.g. `NOT EXISTS` case).
         other => {
             join_graph.add_node(Arc::new(other));
             Ok(())

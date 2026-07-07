@@ -226,7 +226,7 @@ pub fn humantime_elapsed(time: SystemTime) -> Result<String, SystemTimeError> {
         .map(|elapsed| {
             humantime::format_duration(Duration::from_millis(elapsed.as_millis() as u64))
         })
-        .map(|s| format!("{s}"))
+        .map(|s| s.to_string())
 }
 
 /// Create a new array which is `None` at each `null_idxs`. Each element in `data` is in the new

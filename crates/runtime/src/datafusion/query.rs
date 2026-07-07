@@ -1479,8 +1479,27 @@ impl Query {
             self.handle_schema_error(&request_context, &e);
             return Err(e);
         }
-        let dataset_schema = plan.schema().as_arrow().clone();
-        let parameter_schema = parameter_schema_for_plan(&plan)?;
+
+        // Advertise the schema after the analyzer has applied type coercion,
+        // but before logical optimizer rules run. Execution also analyzes the
+        // plan before planning, so using the raw logical schema here can make
+        // FlightSQL GetFlightInfo disagree with DoGet for expressions such as
+        // `CASE WHEN ... THEN decimal_col ELSE 0 END`.
+        let analyzed_plan =
+            match session
+                .analyzer()
+                .execute_and_check(*plan, session.config_options(), |_, _| {})
+            {
+                Ok(plan) => plan,
+                Err(e) => {
+                    let e = find_datafusion_root(e);
+                    self.handle_schema_error(&request_context, &e);
+                    return Err(e);
+                }
+            };
+
+        let dataset_schema = analyzed_plan.schema().as_arrow().clone();
+        let parameter_schema = parameter_schema_for_plan(&analyzed_plan)?;
 
         Ok((dataset_schema, parameter_schema))
     }
@@ -1940,20 +1959,32 @@ fn write_to_json_value_with_arrow(
 fn write_to_json_bytes_with_arrow(
     data: &[RecordBatch],
 ) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
-    let buf = Vec::new();
-    let mut writer = arrow_json::WriterBuilder::new()
-        .with_explicit_nulls(true)
-        .build::<_, JsonArray>(buf);
-
+    let mut writer = json_array_writer();
     writer.write_batches(data.iter().collect::<Vec<&RecordBatch>>().as_slice())?;
     writer.finish()?;
 
     Ok(writer.into_inner())
 }
 
+/// Creates a JSON-array writer over an owned buffer, using the same encoding as
+/// buffered responses. The buffer can be drained incrementally via
+/// `writer.get_mut()` to stream the array batch-by-batch (see the HTTP `/v1/sql`
+/// streaming path).
+pub(crate) fn json_array_writer() -> arrow_json::Writer<Vec<u8>, JsonArray> {
+    arrow_json::WriterBuilder::new()
+        .with_explicit_nulls(true)
+        .build::<Vec<u8>, JsonArray>(Vec::new())
+}
+
 fn record_batch_has_union_columns(batch: &RecordBatch) -> bool {
-    batch
-        .schema()
+    schema_has_union_columns(&batch.schema())
+}
+
+/// Returns `true` when any (possibly nested) field in `schema` is a union type.
+/// Union columns aren't rendered by the arrow-json array writer, so responses
+/// containing them fall back to the buffered JSON path.
+pub(crate) fn schema_has_union_columns(schema: &arrow::datatypes::Schema) -> bool {
+    schema
         .fields()
         .iter()
         .any(|field| data_type_contains_union(field.data_type()))
@@ -2612,6 +2643,60 @@ mod tests {
         }
 
         assert_eq!(query.cache_status, CacheStatus::CacheMiss);
+    }
+
+    #[tokio::test]
+    async fn get_schema_preserves_parameter_schema_for_unbound_parameters() {
+        let df = Arc::new(
+            DataFusionBuilder::new(
+                RuntimeStatus::new(),
+                Arc::new(AcceleratorEngineRegistry::new()),
+                Handle::current(),
+            )
+            .build(),
+        );
+
+        let (schema, parameter_schema) = QueryBuilder::new("SELECT $1 + 1 AS x", df)
+            .build()
+            .get_schema()
+            .await
+            .expect("schema should be available");
+
+        let output_type = schema.field_with_name("x").expect("x field").data_type();
+        assert!(
+            output_type == &DataType::Int64 || output_type == &DataType::UInt64,
+            "expected Int64 or UInt64 output type, got {output_type:?}"
+        );
+        let parameter_schema = parameter_schema.expect("parameter schema");
+        assert_eq!(parameter_schema.fields().len(), 1);
+        assert_eq!(parameter_schema.field(0).name(), "$1");
+    }
+
+    #[tokio::test]
+    async fn get_schema_uses_analyzed_plan_for_decimal_case_coercion() {
+        let df = Arc::new(
+            DataFusionBuilder::new(
+                RuntimeStatus::new(),
+                Arc::new(AcceleratorEngineRegistry::new()),
+                Handle::current(),
+            )
+            .build(),
+        );
+
+        // Mirrors the CH-benCH Q8 pattern: a decimal branch plus an untyped
+        // integer literal branch. DataFusion's analyzer coerces Int64(0) to
+        // Decimal128(20,0), making the CASE output Decimal128(22,2).
+        let sql = "SELECT CASE WHEN TRUE THEN CAST(1.23 AS DECIMAL(6,2)) ELSE 0 END AS x";
+
+        let (schema, parameter_schema) = QueryBuilder::new(sql, df)
+            .build()
+            .get_schema()
+            .await
+            .expect("schema should be available");
+
+        assert!(parameter_schema.is_none());
+        let field = schema.field_with_name("x").expect("x field");
+        assert_eq!(field.data_type(), &DataType::Decimal128(22, 2));
     }
 
     #[tokio::test]

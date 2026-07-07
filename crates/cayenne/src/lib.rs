@@ -69,11 +69,18 @@ pub mod logical_optimizer;
 pub mod maintained_aggregate;
 pub mod metadata;
 pub mod metastore;
+
+/// Z-order clustering kernel, re-exported for benchmarks only. Not a stable API.
+#[doc(hidden)]
+pub mod __bench_zorder {
+    pub use crate::provider::zorder::zorder_keys;
+}
 pub mod optimizer_rules;
 #[cfg(feature = "partition-table-provider")]
 pub(crate) mod partition_creator;
 pub mod provider;
 pub(crate) mod resource_starvation;
+pub mod row_converter;
 pub(crate) mod schema;
 pub mod stats;
 pub mod stats_aggregate;
@@ -98,6 +105,6 @@ pub use provider::{
     global_mem_tier_total, global_qph, record_global_query, record_query_latency,
     register_query_observations, set_compaction_runtime_env, set_compaction_runtime_handle,
     set_cpu_burstable, set_global_encode_concurrency, set_global_mem_tier_bytes,
-    set_global_memory_budget, update_global_mem_tier_total,
+    set_global_memory_budget, set_query_admission_governor, update_global_mem_tier_total,
 };
 pub use schema::transform_schema_for_vortex;
