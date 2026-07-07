@@ -20,7 +20,6 @@ use crate::{
     AcceleratorEngineNotAvailableSnafu, AcceleratorInitializationFailedSnafu, LogErrors, Result,
     Runtime, UnableToAttachViewSnafu,
     component::view::{View, ViewBuilder},
-    metrics,
     secrets::Secrets,
     status, view, warn_spaced,
 };
@@ -29,6 +28,7 @@ use datafusion::sql::{TableReference, parser::DFParser, sqlparser::dialect::Post
 #[cfg(feature = "duckdb")]
 use futures::stream::StreamExt;
 use itertools::Itertools;
+use runtime_metrics as metrics;
 use snafu::prelude::*;
 use tokio::sync::RwLock;
 use util::topological_ordering::{
