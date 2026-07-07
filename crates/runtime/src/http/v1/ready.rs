@@ -14,11 +14,10 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::fmt::Write;
 use std::sync::Arc;
 
 use crate::cluster::ExecutorRegistry;
-use crate::status::RuntimeStatus;
+use crate::status::{ExecutorReadiness, ReadinessError, ReadinessPolicy, RuntimeStatus};
 use axum::{
     Extension,
     extract::Query,
@@ -56,16 +55,11 @@ pub struct ReadyQuery {
 }
 
 impl ReadyQuery {
-    fn count_gate_active(&self) -> bool {
-        matches!(self.min_ready_executors, Some(n) if n > 0)
-    }
-
-    fn percent_gate_active(&self) -> bool {
-        matches!(self.min_ready_executors_percent, Some(p) if p > 0)
-    }
-
-    fn any_executor_gate_active(&self) -> bool {
-        self.count_gate_active() || self.percent_gate_active()
+    fn policy(&self) -> ReadinessPolicy {
+        ReadinessPolicy {
+            min_ready_executors: self.min_ready_executors,
+            min_ready_executors_percent: self.min_ready_executors_percent,
+        }
     }
 }
 
@@ -115,175 +109,44 @@ pub(crate) async fn get(
     Extension(executor_registry): Extension<Option<Arc<ExecutorRegistry>>>,
     Query(query): Query<ReadyQuery>,
 ) -> Response {
-    if let Some(percent) = query.min_ready_executors_percent
-        && percent > 100
-    {
-        return (
-            status::StatusCode::BAD_REQUEST,
-            "min_ready_executors_percent must be between 0 and 100",
-        )
-            .into_response();
-    }
-
-    // Executor gates are scheduler-only. Supplying them on a non-scheduler runtime is a
-    // misconfiguration — return 400 rather than silently passing or failing.
-    if query.any_executor_gate_active() && executor_registry.is_none() {
-        return (
-            status::StatusCode::BAD_REQUEST,
-            "executor gates (min_ready_executors, min_ready_executors_percent) require scheduler role; this runtime has no executor registry",
-        )
-            .into_response();
-    }
-
-    let components_ok = status.is_ready();
-
-    // We may not need executor counts; only fetch them when a gate is active. The 400 above
-    // ensures we only reach this branch with a registry in hand when a gate is active.
-    let executor_state = match (query.any_executor_gate_active(), executor_registry.as_ref()) {
-        (true, Some(registry)) => Some(ExecutorState {
+    let policy = query.policy();
+    let executor_state = match (
+        policy.any_executor_gate_active(),
+        executor_registry.as_ref(),
+    ) {
+        (true, Some(registry)) => Some(ExecutorReadiness {
             ready: registry.flight_sql_clients_count().await,
             registered: registry.connected_executor_count().await,
         }),
         _ => None,
     };
 
-    // `Some(0)` must match before `(Some(_), None)` so a zero-valued gate is treated as
-    // "Skipped" (disabled) consistently whether or not a registry is present.
-    let count_pass = match (query.min_ready_executors, executor_state.as_ref()) {
-        (Some(0), _) => GateOutcome::Skipped,
-        (None, _) | (Some(_), None) => GateOutcome::NotSet,
-        (Some(n), Some(state)) => {
-            if u64::try_from(state.ready).unwrap_or(u64::MAX) >= u64::from(n) {
-                GateOutcome::Pass
-            } else {
-                GateOutcome::Fail
-            }
+    let report = match status.readiness_report(policy, executor_state) {
+        Ok(report) => report,
+        Err(ReadinessError::InvalidReadyExecutorsPercent) => {
+            return (
+                status::StatusCode::BAD_REQUEST,
+                "min_ready_executors_percent must be between 0 and 100",
+            )
+                .into_response();
+        }
+        Err(ReadinessError::MissingExecutorState) => {
+            return (
+                status::StatusCode::BAD_REQUEST,
+                "executor gates (min_ready_executors, min_ready_executors_percent) require scheduler role; this runtime has no executor registry",
+            )
+                .into_response();
         }
     };
 
-    let percent_pass = match (query.min_ready_executors_percent, executor_state.as_ref()) {
-        (Some(0), _) => GateOutcome::Skipped,
-        (None, _) | (Some(_), None) => GateOutcome::NotSet,
-        (Some(_), Some(state)) if state.registered == 0 => GateOutcome::Fail,
-        (Some(p), Some(state)) => {
-            // Saturate on overflow rather than panic / wrap. With realistic executor counts
-            // (<< 2^64) the saturation branches are unreachable, but we avoid any chance of an
-            // incorrect "ready" result if counts ever grow pathologically large.
-            let lhs = u128::try_from(state.ready)
-                .unwrap_or(u128::MAX)
-                .saturating_mul(100);
-            let rhs =
-                u128::from(p).saturating_mul(u128::try_from(state.registered).unwrap_or(u128::MAX));
-            if lhs >= rhs {
-                GateOutcome::Pass
-            } else {
-                GateOutcome::Fail
-            }
-        }
-    };
-
-    let overall_ok = components_ok
-        && !matches!(count_pass, GateOutcome::Fail)
-        && !matches!(percent_pass, GateOutcome::Fail);
-
-    let code = if overall_ok {
+    let code = if report.overall_ok {
         status::StatusCode::OK
     } else {
         status::StatusCode::SERVICE_UNAVAILABLE
     };
-
-    let body = if query.verbose {
-        render_verbose(
-            components_ok,
-            count_pass,
-            percent_pass,
-            executor_state.as_ref(),
-            &query,
-            overall_ok,
-        )
-    } else if overall_ok {
-        "ready".to_string()
-    } else {
-        "not ready".to_string()
-    };
+    let body = report.render(query.verbose);
 
     (code, body).into_response()
-}
-
-#[derive(Debug, Clone, Copy)]
-struct ExecutorState {
-    ready: usize,
-    registered: usize,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum GateOutcome {
-    /// Param not supplied at all.
-    NotSet,
-    /// Param supplied with a zero / "disabled" value.
-    Skipped,
-    Pass,
-    Fail,
-}
-
-fn render_verbose(
-    components_ok: bool,
-    count_pass: GateOutcome,
-    percent_pass: GateOutcome,
-    executor_state: Option<&ExecutorState>,
-    query: &ReadyQuery,
-    overall_ok: bool,
-) -> String {
-    let mut out = String::new();
-    let _ = writeln!(
-        out,
-        "{} components {}",
-        marker(if components_ok {
-            GateOutcome::Pass
-        } else {
-            GateOutcome::Fail
-        }),
-        if components_ok { "ok" } else { "not ready" }
-    );
-
-    if count_pass != GateOutcome::NotSet || percent_pass != GateOutcome::NotSet {
-        let (ready, registered) = executor_state.map_or((0, 0), |s| (s.ready, s.registered));
-        let pct: u128 = if registered == 0 {
-            0
-        } else {
-            u128::try_from(ready)
-                .unwrap_or(u128::MAX)
-                .saturating_mul(100)
-                / u128::try_from(registered).unwrap_or(u128::MAX)
-        };
-        let mut detail =
-            format!("executors: {ready}/{registered} ready ({pct}%, registered={registered}");
-        if let Some(n) = query.min_ready_executors {
-            let _ = write!(detail, ", min={n}");
-        }
-        if let Some(p) = query.min_ready_executors_percent {
-            let _ = write!(detail, ", min_percent={p}%");
-        }
-        detail.push(')');
-
-        let worst = match (count_pass, percent_pass) {
-            (GateOutcome::Fail, _) | (_, GateOutcome::Fail) => GateOutcome::Fail,
-            (GateOutcome::Pass, _) | (_, GateOutcome::Pass) => GateOutcome::Pass,
-            _ => GateOutcome::Skipped,
-        };
-        let _ = writeln!(out, "{} {detail}", marker(worst));
-    }
-
-    out.push_str(if overall_ok { "ready" } else { "not ready" });
-    out
-}
-
-fn marker(outcome: GateOutcome) -> &'static str {
-    match outcome {
-        GateOutcome::Pass => "[+]",
-        GateOutcome::Fail => "[-]",
-        GateOutcome::Skipped | GateOutcome::NotSet => "[ ]",
-    }
 }
 
 #[cfg(test)]
@@ -337,10 +200,10 @@ mod tests {
     }
 
     fn status_ready() -> Arc<RuntimeStatus> {
-        use crate::status::{ComponentStatus, RuntimeReadyState};
+        use crate::status::{ComponentKey, RuntimeReadyState};
         let status = RuntimeStatus::new();
         status.set_ready_state(RuntimeReadyState::OnRegistration);
-        status.update_component_status("test:probe", ComponentStatus::Ready);
+        status.mark_ready(ComponentKey::internal("test:probe"));
         status
     }
 

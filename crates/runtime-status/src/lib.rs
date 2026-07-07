@@ -16,6 +16,7 @@ limitations under the License.
 
 use std::{
     collections::{HashMap, HashSet, hash_map::Entry},
+    fmt::Write as _,
     sync::{
         Arc, RwLock,
         atomic::{AtomicBool, Ordering},
@@ -26,8 +27,10 @@ use std::{
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 
-use datafusion::sql::TableReference;
+use datafusion::sql::{ResolvedTableReference, TableReference};
 use opentelemetry::KeyValue;
+use runtime_datafusion::{SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA};
+use util::{RetryError, fibonacci_backoff::FibonacciBackoffBuilder, retry};
 
 // Re-export ComponentStatus from the shared API types crate
 pub use runtime_api_types::v1::ComponentStatus;
@@ -37,6 +40,296 @@ pub enum RuntimeReadyState {
     #[default]
     OnLoad,
     OnRegistration,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub enum ComponentKey {
+    Catalog(String),
+    Dataset(TableReference),
+    Model(String),
+    Tool(String),
+    ToolCatalog(String),
+    Llm(String),
+    Embedding(String),
+    Reranker(String),
+    View(TableReference),
+    Worker(String),
+    Cluster(String),
+    Internal(String),
+}
+
+impl ComponentKey {
+    #[must_use]
+    pub fn catalog(name: impl Into<String>) -> Self {
+        Self::Catalog(name.into())
+    }
+
+    #[must_use]
+    pub fn dataset(name: &TableReference) -> Self {
+        Self::Dataset(name.clone())
+    }
+
+    #[must_use]
+    pub fn model(name: impl Into<String>) -> Self {
+        Self::Model(name.into())
+    }
+
+    #[must_use]
+    pub fn tool(name: impl Into<String>) -> Self {
+        Self::Tool(name.into())
+    }
+
+    #[must_use]
+    pub fn tool_catalog(name: impl Into<String>) -> Self {
+        Self::ToolCatalog(name.into())
+    }
+
+    #[must_use]
+    pub fn llm(name: impl Into<String>) -> Self {
+        Self::Llm(name.into())
+    }
+
+    #[must_use]
+    pub fn embedding(name: impl Into<String>) -> Self {
+        Self::Embedding(name.into())
+    }
+
+    #[must_use]
+    pub fn reranker(name: impl Into<String>) -> Self {
+        Self::Reranker(name.into())
+    }
+
+    #[must_use]
+    pub fn view(name: &TableReference) -> Self {
+        Self::View(name.clone())
+    }
+
+    #[must_use]
+    pub fn worker(name: impl Into<String>) -> Self {
+        Self::Worker(name.into())
+    }
+
+    #[must_use]
+    pub fn cluster(name: impl Into<String>) -> Self {
+        Self::Cluster(name.into())
+    }
+
+    #[must_use]
+    pub fn internal(name: impl Into<String>) -> Self {
+        Self::Internal(name.into())
+    }
+
+    #[must_use]
+    pub fn full_name(&self) -> String {
+        match self {
+            Self::Catalog(name) => format!("catalog:{name}"),
+            Self::Dataset(name) => format!("dataset:{name}"),
+            Self::Model(name) => format!("model:{name}"),
+            Self::Tool(name) => format!("tool:{name}"),
+            Self::ToolCatalog(name) => format!("tool_catalog:{name}"),
+            Self::Llm(name) => format!("llm:{name}"),
+            Self::Embedding(name) => format!("embedding:{name}"),
+            Self::Reranker(name) => format!("reranker:{name}"),
+            Self::View(name) => format!("view:{name}"),
+            Self::Worker(name) => format!("worker:{name}"),
+            Self::Cluster(name) => format!("cluster:{name}"),
+            Self::Internal(name) => name.clone(),
+        }
+    }
+
+    #[must_use]
+    pub fn parse(component_name: &str) -> Self {
+        const DATASET_PREFIX: &str = "dataset:";
+        const VIEW_PREFIX: &str = "view:";
+        const TOOL_CATALOG_PREFIX: &str = "tool_catalog:";
+        const CATALOG_PREFIX: &str = "catalog:";
+        const MODEL_PREFIX: &str = "model:";
+        const TOOL_PREFIX: &str = "tool:";
+        const LLM_PREFIX: &str = "llm:";
+        const EMBEDDING_PREFIX: &str = "embedding:";
+        const RERANKER_PREFIX: &str = "reranker:";
+        const WORKER_PREFIX: &str = "worker:";
+        const CLUSTER_PREFIX: &str = "cluster:";
+
+        if let Some(name) = component_name.strip_prefix(DATASET_PREFIX) {
+            return TableReference::parse_str(name).map_or_else(
+                |_| Self::internal(component_name),
+                |table| Self::Dataset(table),
+            );
+        }
+        if let Some(name) = component_name.strip_prefix(VIEW_PREFIX) {
+            return TableReference::parse_str(name).map_or_else(
+                |_| Self::internal(component_name),
+                |table| Self::View(table),
+            );
+        }
+        if let Some(name) = component_name.strip_prefix(TOOL_CATALOG_PREFIX) {
+            return Self::ToolCatalog(name.to_string());
+        }
+        if let Some(name) = component_name.strip_prefix(CATALOG_PREFIX) {
+            return Self::Catalog(name.to_string());
+        }
+        if let Some(name) = component_name.strip_prefix(MODEL_PREFIX) {
+            return Self::Model(name.to_string());
+        }
+        if let Some(name) = component_name.strip_prefix(TOOL_PREFIX) {
+            return Self::Tool(name.to_string());
+        }
+        if let Some(name) = component_name.strip_prefix(LLM_PREFIX) {
+            return Self::Llm(name.to_string());
+        }
+        if let Some(name) = component_name.strip_prefix(EMBEDDING_PREFIX) {
+            return Self::Embedding(name.to_string());
+        }
+        if let Some(name) = component_name.strip_prefix(RERANKER_PREFIX) {
+            return Self::Reranker(name.to_string());
+        }
+        if let Some(name) = component_name.strip_prefix(WORKER_PREFIX) {
+            return Self::Worker(name.to_string());
+        }
+        if let Some(name) = component_name.strip_prefix(CLUSTER_PREFIX) {
+            return Self::Cluster(name.to_string());
+        }
+
+        Self::Internal(component_name.to_string())
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ExecutorReadiness {
+    pub ready: usize,
+    pub registered: usize,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ReadinessPolicy {
+    pub min_ready_executors: Option<u32>,
+    pub min_ready_executors_percent: Option<u8>,
+}
+
+impl ReadinessPolicy {
+    #[must_use]
+    pub fn count_gate_active(&self) -> bool {
+        matches!(self.min_ready_executors, Some(n) if n > 0)
+    }
+
+    #[must_use]
+    pub fn percent_gate_active(&self) -> bool {
+        matches!(self.min_ready_executors_percent, Some(p) if p > 0)
+    }
+
+    #[must_use]
+    pub fn any_executor_gate_active(&self) -> bool {
+        self.count_gate_active() || self.percent_gate_active()
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReadinessError {
+    InvalidReadyExecutorsPercent,
+    MissingExecutorState,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReadinessGateOutcome {
+    NotSet,
+    Skipped,
+    Pass,
+    Fail,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ReadinessReport {
+    pub components_ok: bool,
+    pub count_gate: ReadinessGateOutcome,
+    pub percent_gate: ReadinessGateOutcome,
+    pub executor_state: Option<ExecutorReadiness>,
+    pub overall_ok: bool,
+    pub policy: ReadinessPolicy,
+}
+
+impl ReadinessReport {
+    #[must_use]
+    pub fn render(&self, verbose: bool) -> String {
+        if !verbose {
+            return if self.overall_ok {
+                "ready".to_string()
+            } else {
+                "not ready".to_string()
+            };
+        }
+
+        let mut out = String::new();
+        let _ = writeln!(
+            out,
+            "{} components {}",
+            marker(if self.components_ok {
+                ReadinessGateOutcome::Pass
+            } else {
+                ReadinessGateOutcome::Fail
+            }),
+            if self.components_ok {
+                "ok"
+            } else {
+                "not ready"
+            }
+        );
+
+        if self.count_gate != ReadinessGateOutcome::NotSet
+            || self.percent_gate != ReadinessGateOutcome::NotSet
+        {
+            let (ready, registered) = self
+                .executor_state
+                .map_or((0, 0), |s| (s.ready, s.registered));
+            let pct: u128 = if registered == 0 {
+                0
+            } else {
+                u128::try_from(ready)
+                    .unwrap_or(u128::MAX)
+                    .saturating_mul(100)
+                    / u128::try_from(registered).unwrap_or(u128::MAX)
+            };
+            let mut detail =
+                format!("executors: {ready}/{registered} ready ({pct}%, registered={registered}");
+            if let Some(n) = self.policy.min_ready_executors {
+                let _ = write!(detail, ", min={n}");
+            }
+            if let Some(p) = self.policy.min_ready_executors_percent {
+                let _ = write!(detail, ", min_percent={p}%");
+            }
+            detail.push(')');
+
+            let worst = match (self.count_gate, self.percent_gate) {
+                (ReadinessGateOutcome::Fail, _) | (_, ReadinessGateOutcome::Fail) => {
+                    ReadinessGateOutcome::Fail
+                }
+                (ReadinessGateOutcome::Pass, _) | (_, ReadinessGateOutcome::Pass) => {
+                    ReadinessGateOutcome::Pass
+                }
+                _ => ReadinessGateOutcome::Skipped,
+            };
+            let _ = writeln!(out, "{} {detail}", marker(worst));
+        }
+
+        out.push_str(if self.overall_ok {
+            "ready"
+        } else {
+            "not ready"
+        });
+        out
+    }
+}
+
+fn marker(outcome: ReadinessGateOutcome) -> &'static str {
+    match outcome {
+        ReadinessGateOutcome::Pass => "[+]",
+        ReadinessGateOutcome::Fail => "[-]",
+        ReadinessGateOutcome::Skipped | ReadinessGateOutcome::NotSet => "[ ]",
+    }
+}
+
+fn resolve_table_reference(table: TableReference) -> ResolvedTableReference {
+    table.resolve(SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA)
 }
 
 /// Per-component state stored in the `statuses` map.
@@ -102,6 +395,43 @@ impl RuntimeStatus {
         self.is_shutdown.load(Ordering::SeqCst)
     }
 
+    pub fn mark_initializing(&self, key: ComponentKey) {
+        self.update(key, ComponentStatus::Initializing);
+    }
+
+    pub fn mark_ready(&self, key: ComponentKey) {
+        self.update(key, ComponentStatus::Ready);
+    }
+
+    pub fn mark_disabled(&self, key: ComponentKey) {
+        self.update(key, ComponentStatus::Disabled);
+    }
+
+    pub fn mark_refreshing(&self, key: ComponentKey) {
+        self.update(key, ComponentStatus::Refreshing);
+    }
+
+    pub fn mark_shutting_down(&self, key: ComponentKey) {
+        self.update(key, ComponentStatus::ShuttingDown);
+    }
+
+    pub fn mark_not_loaded(&self, key: ComponentKey) {
+        self.update(key, ComponentStatus::NotLoaded);
+    }
+
+    pub fn mark_error(&self, key: ComponentKey) {
+        self.update(key, ComponentStatus::error());
+    }
+
+    pub fn mark_error_with_message(&self, key: ComponentKey, message: impl Into<String>) {
+        self.update(key, ComponentStatus::error_with_message(message));
+    }
+
+    pub fn update(&self, key: ComponentKey, status: ComponentStatus) {
+        self.update_component_status(&key.full_name(), status.clone());
+        self.record_metrics(&key, &status);
+    }
+
     /// Updates the status of a component and tracks if it has ever been ready.
     #[expect(clippy::needless_pass_by_value)]
     pub fn update_component_status(&self, component_name: &str, status: ComponentStatus) {
@@ -137,96 +467,106 @@ impl RuntimeStatus {
         }
     }
 
-    pub fn update_catalog(&self, catalog_name: impl Into<String>, status: ComponentStatus) {
-        let catalog_name = catalog_name.into();
+    fn record_metrics(&self, key: &ComponentKey, status: &ComponentStatus) {
         let metric_value = status.discriminant();
-        self.update_component_status(&format!("catalog:{catalog_name}"), status);
-        runtime_metrics::catalogs::STATUS
-            .record(metric_value, &[KeyValue::new("catalog", catalog_name)]);
+
+        match key {
+            ComponentKey::Catalog(name) => {
+                runtime_metrics::catalogs::STATUS
+                    .record(metric_value, &[KeyValue::new("catalog", name.clone())]);
+            }
+            ComponentKey::Dataset(name) => {
+                runtime_metrics::datasets::STATUS
+                    .record(metric_value, &[KeyValue::new("dataset", name.to_string())]);
+            }
+            ComponentKey::Model(name) => {
+                runtime_metrics::models::STATUS
+                    .record(metric_value, &[KeyValue::new("model", name.clone())]);
+            }
+            ComponentKey::Tool(name) => {
+                runtime_metrics::tools::STATUS
+                    .record(metric_value, &[KeyValue::new("tool", name.clone())]);
+            }
+            ComponentKey::ToolCatalog(name) => {
+                runtime_metrics::tools::STATUS
+                    .record(metric_value, &[KeyValue::new("tool_catalog", name.clone())]);
+            }
+            ComponentKey::Llm(name) => {
+                runtime_metrics::llms::STATUS
+                    .record(metric_value, &[KeyValue::new("model", name.clone())]);
+            }
+            ComponentKey::Embedding(name) => {
+                runtime_metrics::embeddings::STATUS
+                    .record(metric_value, &[KeyValue::new("model", name.clone())]);
+            }
+            ComponentKey::Reranker(name) => {
+                runtime_metrics::rerankers::STATUS
+                    .record(metric_value, &[KeyValue::new("model", name.clone())]);
+            }
+            ComponentKey::View(name) => {
+                runtime_metrics::views::STATUS
+                    .record(metric_value, &[KeyValue::new("view", name.to_string())]);
+            }
+            ComponentKey::Worker(name) => {
+                runtime_metrics::workers::STATUS
+                    .record(metric_value, &[KeyValue::new("worker", name.clone())]);
+            }
+            ComponentKey::Cluster(name) => {
+                let status_value = match status {
+                    ComponentStatus::Initializing | ComponentStatus::NotLoaded => 0,
+                    ComponentStatus::Ready | ComponentStatus::Refreshing => 1,
+                    ComponentStatus::Disabled | ComponentStatus::Error(_) => 2,
+                    ComponentStatus::ShuttingDown => 3,
+                };
+                runtime_metrics::cluster::set_node_status(name, name, status_value);
+            }
+            ComponentKey::Internal(_) => {}
+        }
+    }
+
+    pub fn update_catalog(&self, catalog_name: impl Into<String>, status: ComponentStatus) {
+        self.update(ComponentKey::catalog(catalog_name), status);
     }
 
     pub fn update_dataset(&self, dataset: &TableReference, status: ComponentStatus) {
-        let ds_name = dataset.to_string();
-        let metric_value = status.discriminant();
-        self.update_component_status(&format!("dataset:{ds_name}"), status);
-        runtime_metrics::datasets::STATUS
-            .record(metric_value, &[KeyValue::new("dataset", ds_name)]);
+        self.update(ComponentKey::dataset(dataset), status);
     }
 
     pub fn update_model(&self, model_name: &str, status: ComponentStatus) {
-        let model_name = model_name.to_string();
-        let metric_value = status.discriminant();
-        self.update_component_status(&format!("model:{model_name}"), status);
-        runtime_metrics::models::STATUS.record(metric_value, &[KeyValue::new("model", model_name)]);
+        self.update(ComponentKey::model(model_name), status);
     }
 
     pub fn update_tool(&self, tool_name: &str, status: ComponentStatus) {
-        let tool_name = tool_name.to_string();
-        let metric_value = status.discriminant();
-        self.update_component_status(&format!("tool:{tool_name}"), status);
-        runtime_metrics::tools::STATUS.record(metric_value, &[KeyValue::new("tool", tool_name)]);
+        self.update(ComponentKey::tool(tool_name), status);
     }
 
     pub fn update_tool_catalog(&self, catalog_name: &str, status: ComponentStatus) {
-        let name = catalog_name.to_string();
-        let metric_value = status.discriminant();
-        self.update_component_status(&format!("tool_catalog:{name}"), status);
-        runtime_metrics::tools::STATUS.record(metric_value, &[KeyValue::new("tool_catalog", name)]);
+        self.update(ComponentKey::tool_catalog(catalog_name), status);
     }
 
     pub fn update_llm(&self, model_name: &str, status: ComponentStatus) {
-        let model_name = model_name.to_string();
-        let metric_value = status.discriminant();
-        self.update_component_status(&format!("llm:{model_name}"), status);
-        runtime_metrics::llms::STATUS.record(metric_value, &[KeyValue::new("model", model_name)]);
+        self.update(ComponentKey::llm(model_name), status);
     }
 
     pub fn update_embedding(&self, model_name: &str, status: ComponentStatus) {
-        let model_name = model_name.to_string();
-        let metric_value = status.discriminant();
-        self.update_component_status(&format!("embedding:{model_name}"), status);
-        runtime_metrics::embeddings::STATUS
-            .record(metric_value, &[KeyValue::new("model", model_name)]);
+        self.update(ComponentKey::embedding(model_name), status);
     }
 
     pub fn update_reranker(&self, model_name: &str, status: ComponentStatus) {
-        let model_name = model_name.to_string();
-        let metric_value = status.discriminant();
-        self.update_component_status(&format!("reranker:{model_name}"), status);
-        runtime_metrics::rerankers::STATUS
-            .record(metric_value, &[KeyValue::new("model", model_name)]);
+        self.update(ComponentKey::reranker(model_name), status);
     }
     pub fn update_view(&self, view_name: &TableReference, status: ComponentStatus) {
-        let view_name = view_name.to_string();
-        let metric_value = status.discriminant();
-        self.update_component_status(&format!("view:{view_name}"), status);
-        runtime_metrics::views::STATUS.record(metric_value, &[KeyValue::new("view", view_name)]);
+        self.update(ComponentKey::view(view_name), status);
     }
 
     /// Update the status of a worker
     pub fn update_worker(&self, name: &str, status: ComponentStatus) {
-        let worker_name = name.to_string();
-        let metric_value = status.discriminant();
-        self.update_component_status(&format!("worker:{worker_name}"), status);
-        runtime_metrics::workers::STATUS
-            .record(metric_value, &[KeyValue::new("worker", worker_name)]);
+        self.update(ComponentKey::worker(name), status);
     }
 
     /// Update the status of a cluster node
     pub fn update_cluster(&self, node_name: &str, status: ComponentStatus) {
-        let cluster_node_name = node_name.to_string();
-
-        // Record cluster node status metric
-        // Map ComponentStatus to cluster status values: 0=Unknown, 1=Healthy, 2=Unhealthy, 3=Draining
-        let status_value = match &status {
-            ComponentStatus::Initializing | ComponentStatus::NotLoaded => 0,
-            ComponentStatus::Ready | ComponentStatus::Refreshing => 1, // Refreshing is still healthy
-            ComponentStatus::Disabled | ComponentStatus::Error(_) => 2,
-            ComponentStatus::ShuttingDown => 3, // Draining
-        };
-
-        self.update_component_status(&format!("cluster:{cluster_node_name}"), status);
-        runtime_metrics::cluster::set_node_status(&cluster_node_name, node_name, status_value);
+        self.update(ComponentKey::cluster(node_name), status);
     }
 
     /// Get the status of a worker
@@ -292,6 +632,68 @@ impl RuntimeStatus {
         }
     }
 
+    pub fn readiness_report(
+        &self,
+        policy: ReadinessPolicy,
+        executor_state: Option<ExecutorReadiness>,
+    ) -> Result<ReadinessReport, ReadinessError> {
+        if policy
+            .min_ready_executors_percent
+            .is_some_and(|percent| percent > 100)
+        {
+            return Err(ReadinessError::InvalidReadyExecutorsPercent);
+        }
+
+        if policy.any_executor_gate_active() && executor_state.is_none() {
+            return Err(ReadinessError::MissingExecutorState);
+        }
+
+        let components_ok = self.is_ready();
+
+        let count_gate = match (policy.min_ready_executors, executor_state) {
+            (Some(0), _) => ReadinessGateOutcome::Skipped,
+            (None, _) | (Some(_), None) => ReadinessGateOutcome::NotSet,
+            (Some(n), Some(state)) => {
+                if u64::try_from(state.ready).unwrap_or(u64::MAX) >= u64::from(n) {
+                    ReadinessGateOutcome::Pass
+                } else {
+                    ReadinessGateOutcome::Fail
+                }
+            }
+        };
+
+        let percent_gate = match (policy.min_ready_executors_percent, executor_state) {
+            (Some(0), _) => ReadinessGateOutcome::Skipped,
+            (None, _) | (Some(_), None) => ReadinessGateOutcome::NotSet,
+            (Some(_), Some(state)) if state.registered == 0 => ReadinessGateOutcome::Fail,
+            (Some(p), Some(state)) => {
+                let lhs = u128::try_from(state.ready)
+                    .unwrap_or(u128::MAX)
+                    .saturating_mul(100);
+                let rhs = u128::from(p)
+                    .saturating_mul(u128::try_from(state.registered).unwrap_or(u128::MAX));
+                if lhs >= rhs {
+                    ReadinessGateOutcome::Pass
+                } else {
+                    ReadinessGateOutcome::Fail
+                }
+            }
+        };
+
+        let overall_ok = components_ok
+            && !matches!(count_gate, ReadinessGateOutcome::Fail)
+            && !matches!(percent_gate, ReadinessGateOutcome::Fail);
+
+        Ok(ReadinessReport {
+            components_ok,
+            count_gate,
+            percent_gate,
+            executor_state,
+            overall_ok,
+            policy,
+        })
+    }
+
     /// Returns the status of all registered components.
     #[must_use]
     pub fn get_all_statuses(&self) -> HashMap<String, ComponentStatus> {
@@ -302,6 +704,14 @@ impl RuntimeStatus {
         statuses
             .iter()
             .map(|(k, state)| (k.clone(), state.status.clone()))
+            .collect()
+    }
+
+    #[must_use]
+    pub fn get_all_component_statuses(&self) -> HashMap<ComponentKey, ComponentStatus> {
+        self.get_all_statuses()
+            .into_iter()
+            .map(|(name, status)| (ComponentKey::parse(&name), status))
             .collect()
     }
 
@@ -335,6 +745,69 @@ impl RuntimeStatus {
     #[must_use]
     pub fn get_worker_statuses(&self) -> HashMap<String, ComponentStatus> {
         self.get_statuses_of_prefix("worker:")
+    }
+
+    #[must_use]
+    pub fn get_table_statuses(&self) -> HashMap<TableReference, ComponentStatus> {
+        let mut statuses = self.get_dataset_statuses();
+        statuses.extend(self.get_view_statuses());
+        statuses
+    }
+
+    #[must_use]
+    pub fn get_component_status_by_key(&self, key: &ComponentKey) -> Option<ComponentStatus> {
+        self.get_component_status(&key.full_name())
+    }
+
+    #[must_use]
+    pub fn find_dataset_statuses_matching_resolved(
+        &self,
+        resolved: &ResolvedTableReference,
+    ) -> Vec<(TableReference, ComponentStatus)> {
+        self.get_dataset_statuses()
+            .into_iter()
+            .filter(|(key, _)| resolve_table_reference(key.clone()) == *resolved)
+            .collect()
+    }
+
+    #[must_use]
+    pub fn dataset_ready_update_targets(
+        &self,
+        resolved: &ResolvedTableReference,
+    ) -> Option<Vec<TableReference>> {
+        let matching = self.find_dataset_statuses_matching_resolved(resolved);
+        let pending: Vec<TableReference> = matching
+            .iter()
+            .filter(|(_, status)| !matches!(status, ComponentStatus::Ready))
+            .map(|(key, _)| key.clone())
+            .collect();
+
+        if pending.is_empty() && !matching.is_empty() {
+            None
+        } else {
+            Some(pending)
+        }
+    }
+
+    pub fn mark_resolved_dataset_ready(&self, resolved: &ResolvedTableReference) -> bool {
+        let Some(pending) = self.dataset_ready_update_targets(resolved) else {
+            return false;
+        };
+
+        if pending.is_empty() {
+            let canonical = TableReference::full(
+                resolved.catalog.to_string(),
+                resolved.schema.to_string(),
+                resolved.table.to_string(),
+            );
+            self.mark_ready(ComponentKey::dataset(&canonical));
+        } else {
+            for key in pending {
+                self.mark_ready(ComponentKey::dataset(&key));
+            }
+        }
+
+        true
     }
 
     #[must_use]
@@ -417,9 +890,32 @@ impl RuntimeStatus {
         }
     }
 
+    fn first_unready_dependency(
+        &self,
+        dependent_tables: &[ResolvedTableReference],
+    ) -> Option<ResolvedTableReference> {
+        let statuses = self
+            .get_table_statuses()
+            .into_iter()
+            .map(|(key, value)| (resolve_table_reference(key), value))
+            .collect::<HashMap<_, _>>();
+        let catalog_statuses = self.get_catalog_statuses();
+
+        dependent_tables.iter().find_map(|dependent_table| {
+            let is_ready = if let Some(status) = statuses.get(dependent_table) {
+                status == &ComponentStatus::Ready
+            } else {
+                let catalog = dependent_table.catalog.as_ref();
+                catalog_statuses.get(catalog) == Some(&ComponentStatus::Ready)
+            };
+
+            (!is_ready).then(|| dependent_table.clone())
+        })
+    }
+
     /// Internal helper to wait for a component to become ready.
-    async fn wait_for_component_ready(&self, component_name: &str) {
-        let mut receiver = self.get_or_create_notifier(component_name);
+    async fn wait_for_component_ready(&self, key: &ComponentKey) {
+        let mut receiver = self.get_or_create_notifier(&key.full_name());
 
         loop {
             // Check current value (handles already-ready case)
@@ -436,8 +932,8 @@ impl RuntimeStatus {
 
     /// Waits for a component to leave the `Initializing` state — used by
     /// callers that only need the component registered, not fully ready.
-    async fn wait_for_component_registered(&self, component_name: &str) {
-        let mut receiver = self.get_or_create_notifier(component_name);
+    async fn wait_for_component_registered(&self, key: &ComponentKey) {
+        let mut receiver = self.get_or_create_notifier(&key.full_name());
 
         loop {
             if !matches!(*receiver.borrow(), ComponentStatus::Initializing) {
@@ -451,8 +947,8 @@ impl RuntimeStatus {
 
     /// Waits for a dataset to become ready.
     pub async fn wait_for_dataset_ready(&self, dataset: &TableReference) {
-        let component_name = format!("dataset:{dataset}");
-        self.wait_for_component_ready(&component_name).await;
+        self.wait_for_component_ready(&ComponentKey::dataset(dataset))
+            .await;
     }
 
     /// Waits for a dataset to be registered (any status other than
@@ -461,62 +957,83 @@ impl RuntimeStatus {
     /// scheduler-side partition discovery, where waiting for `Ready`
     /// would deadlock because `Ready` is gated on executor data loads.
     pub async fn wait_for_dataset_registered(&self, dataset: &TableReference) {
-        let component_name = format!("dataset:{dataset}");
-        self.wait_for_component_registered(&component_name).await;
+        self.wait_for_component_registered(&ComponentKey::dataset(dataset))
+            .await;
     }
 
     /// Waits for a model to become ready.
     pub async fn wait_for_model_ready(&self, model_name: &str) {
-        let component_name = format!("model:{model_name}");
-        self.wait_for_component_ready(&component_name).await;
+        self.wait_for_component_ready(&ComponentKey::model(model_name))
+            .await;
     }
 
     /// Waits for a catalog to become ready.
     pub async fn wait_for_catalog_ready(&self, catalog_name: &str) {
-        let component_name = format!("catalog:{catalog_name}");
-        self.wait_for_component_ready(&component_name).await;
+        self.wait_for_component_ready(&ComponentKey::catalog(catalog_name))
+            .await;
     }
 
     /// Waits for a tool to become ready.
     pub async fn wait_for_tool_ready(&self, tool_name: &str) {
-        let component_name = format!("tool:{tool_name}");
-        self.wait_for_component_ready(&component_name).await;
+        self.wait_for_component_ready(&ComponentKey::tool(tool_name))
+            .await;
     }
 
     /// Waits for a tool catalog to become ready.
     pub async fn wait_for_tool_catalog_ready(&self, catalog_name: &str) {
-        let component_name = format!("tool_catalog:{catalog_name}");
-        self.wait_for_component_ready(&component_name).await;
+        self.wait_for_component_ready(&ComponentKey::tool_catalog(catalog_name))
+            .await;
     }
 
     /// Waits for an LLM to become ready.
     pub async fn wait_for_llm_ready(&self, model_name: &str) {
-        let component_name = format!("llm:{model_name}");
-        self.wait_for_component_ready(&component_name).await;
+        self.wait_for_component_ready(&ComponentKey::llm(model_name))
+            .await;
     }
 
     /// Waits for an embedding model to become ready.
     pub async fn wait_for_embedding_ready(&self, model_name: &str) {
-        let component_name = format!("embedding:{model_name}");
-        self.wait_for_component_ready(&component_name).await;
+        self.wait_for_component_ready(&ComponentKey::embedding(model_name))
+            .await;
     }
 
     /// Waits for a view to become ready.
     pub async fn wait_for_view_ready(&self, view_name: &TableReference) {
-        let component_name = format!("view:{view_name}");
-        self.wait_for_component_ready(&component_name).await;
+        self.wait_for_component_ready(&ComponentKey::view(view_name))
+            .await;
     }
 
     /// Waits for a worker to become ready.
     pub async fn wait_for_worker_ready(&self, worker_name: &str) {
-        let component_name = format!("worker:{worker_name}");
-        self.wait_for_component_ready(&component_name).await;
+        self.wait_for_component_ready(&ComponentKey::worker(worker_name))
+            .await;
     }
 
     /// Waits for a cluster node to become ready.
     pub async fn wait_for_cluster_ready(&self, node_name: &str) {
-        let component_name = format!("cluster:{node_name}");
-        self.wait_for_component_ready(&component_name).await;
+        self.wait_for_component_ready(&ComponentKey::cluster(node_name))
+            .await;
+    }
+
+    pub async fn wait_until_dependent_tables_ready(&self, dependent_tables: &[TableReference]) {
+        let retry_strategy = FibonacciBackoffBuilder::new()
+            .max_retries(None)
+            .max_duration(Some(Duration::from_secs(10)))
+            .build();
+        let dependent_tables = dependent_tables
+            .iter()
+            .cloned()
+            .map(resolve_table_reference)
+            .collect::<Vec<_>>();
+
+        let _ = retry(retry_strategy, || async {
+            if self.first_unready_dependency(&dependent_tables).is_some() {
+                return Err(RetryError::transient(()));
+            }
+
+            Ok(())
+        })
+        .await;
     }
 
     /// Waits for the entire runtime to be ready (all registered components have been ready at least once).

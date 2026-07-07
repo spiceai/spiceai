@@ -30,7 +30,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::CLUSTER_PARTITION_ASSIGNMENT_TASK;
 use crate::datafusion::DataFusion;
-use crate::status::{ComponentStatus, RuntimeStatus};
+use crate::status::{ComponentKey, RuntimeStatus};
 
 pub use runtime_cluster::scheduler_task_config::{ConfigError, PartitionAssignmentConfig};
 
@@ -87,13 +87,17 @@ impl PartitionAssignmentTask {
         tokio::select! {
             () = self.cancel.cancelled() => {
                 tracing::info!("Partition metadata initialization cancelled during shutdown");
-                self.status.update_component_status("partition_metadata", ComponentStatus::error_with_message("Cancelled during shutdown"));
+                self.status.mark_error_with_message(
+                    ComponentKey::internal("partition_metadata"),
+                    "Cancelled during shutdown",
+                );
                 return Ok(());
             }
             result = self.initialize_metadata() => {
                 match result {
                     Ok(()) => {
-                        self.status.update_component_status("partition_metadata", ComponentStatus::Ready);
+                        self.status
+                            .mark_ready(ComponentKey::internal("partition_metadata"));
                         // Pick up executor acks that arrived before metadata
                         // seeding completed (e.g. replayed on control-stream
                         // connect during scheduler startup) — they couldn't
@@ -102,7 +106,10 @@ impl PartitionAssignmentTask {
                     }
                     Err(err) => {
                         tracing::warn!("Failed to initialize partition metadata: {err}");
-                        self.status.update_component_status("partition_metadata", ComponentStatus::error_with_message(format!("Failed to initialize: {err}")));
+                        self.status.mark_error_with_message(
+                            ComponentKey::internal("partition_metadata"),
+                            format!("Failed to initialize: {err}"),
+                        );
                     }
                 }
             }
@@ -123,18 +130,17 @@ impl PartitionAssignmentTask {
 
                     match self.run_assignment_cycle().await {
                         Ok(()) => {
-                            self.status.update_component_status("partition_metadata", ComponentStatus::Ready);
+                            self.status
+                                .mark_ready(ComponentKey::internal("partition_metadata"));
                         }
                         Err(e) => {
                             tracing::warn!(
                                 error = %e,
                                 "Partition assignment cycle failed"
                             );
-                            self.status.update_component_status(
-                                "partition_metadata",
-                                ComponentStatus::error_with_message(format!(
-                                    "Assignment cycle failed: {e}"
-                                )),
+                            self.status.mark_error_with_message(
+                                ComponentKey::internal("partition_metadata"),
+                                format!("Assignment cycle failed: {e}"),
                             );
                         }
                     }

@@ -1055,37 +1055,11 @@ pub(crate) async fn evaluate_table_readiness(datafusion: &DataFusion, table: &Ta
         .clone()
         .resolve(SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA);
 
-    // Find the dataset keys registered at init time. The original key may be
-    // bare/partial (`foo`) while the canonical form is full
-    // (`spice.public.foo`); calling `update_dataset(&canonical)` would create
-    // a *new* status entry and leave the original stuck in `Refreshing`,
-    // keeping `/v1/ready` at 503. Match by resolve-equality to update the
-    // existing entries. Collect *all* matches: an ack that arrived before
-    // dataset registration can have created a canonical-key entry alongside
-    // the registered bare key, and every resolve-equal entry must reach
-    // `Ready` for `/v1/ready` to flip.
-    let matching: Vec<(TableReference, crate::status::ComponentStatus)> = datafusion
+    if datafusion
         .runtime_status
-        .get_dataset_statuses()
-        .into_iter()
-        .filter(|(key, _)| {
-            key.clone()
-                .resolve(SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA)
-                == resolved
-        })
-        .collect();
-    let pending: Vec<TableReference> = matching
-        .iter()
-        .filter(|(_, status)| !matches!(status, crate::status::ComponentStatus::Ready))
-        .map(|(key, _)| key.clone())
-        .collect();
-
-    // Every matching entry is already `Ready` — skip so re-acks and periodic
-    // readiness sweeps don't re-emit the status-change log/metric every time.
-    // (No matching entry at all still proceeds: the ack may have arrived
-    // before the dataset registered its status, in which case the canonical
-    // entry is created below.)
-    if pending.is_empty() && !matching.is_empty() {
+        .dataset_ready_update_targets(&resolved)
+        .is_none()
+    {
         return;
     }
 
@@ -1100,17 +1074,9 @@ pub(crate) async fn evaluate_table_readiness(datafusion: &DataFusion, table: &Ta
             table = %table,
             "All assigned partitions loaded; marking dataset Ready"
         );
-        if pending.is_empty() {
-            datafusion
-                .runtime_status
-                .update_dataset(table, crate::status::ComponentStatus::Ready);
-        } else {
-            for key in pending {
-                datafusion
-                    .runtime_status
-                    .update_dataset(&key, crate::status::ComponentStatus::Ready);
-            }
-        }
+        let _ = datafusion
+            .runtime_status
+            .mark_resolved_dataset_ready(&resolved);
     }
 }
 

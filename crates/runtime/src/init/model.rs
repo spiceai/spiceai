@@ -71,7 +71,7 @@ impl Runtime {
         if let Some(app) = app_lock.as_ref() {
             for model in &app.models {
                 self.status
-                    .update_model(&model.name, status::ComponentStatus::Initializing);
+                    .mark_initializing(status::ComponentKey::model(&model.name));
                 self.load_model(model).await;
             }
         }
@@ -183,7 +183,7 @@ impl Runtime {
                     ],
                 );
                 self.status
-                    .update_model(&model.name, status::ComponentStatus::Ready);
+                    .mark_ready(status::ComponentKey::model(&model.name));
             }
             Err(e) => {
                 metrics::models::LOAD_ERROR.add(1, &[]);
@@ -253,7 +253,7 @@ impl Runtime {
 
     async fn update_model(&self, m: &SpicepodModel) {
         self.status
-            .update_model(&m.name, status::ComponentStatus::Refreshing);
+            .mark_refreshing(status::ComponentKey::model(&m.name));
         self.remove_model(m).await;
         self.load_model(m).await;
     }
@@ -266,7 +266,7 @@ impl Runtime {
                 }
             } else {
                 self.status
-                    .update_model(&model.name, status::ComponentStatus::Initializing);
+                    .mark_initializing(status::ComponentKey::model(&model.name));
                 self.load_model(model).await;
             }
         }
@@ -275,7 +275,7 @@ impl Runtime {
         for model in &current_app.models {
             if !new_app.models.iter().any(|m| m.name == model.name) {
                 self.status
-                    .update_model(&model.name, status::ComponentStatus::Disabled);
+                    .mark_disabled(status::ComponentKey::model(&model.name));
                 self.remove_model(model).await;
             }
         }

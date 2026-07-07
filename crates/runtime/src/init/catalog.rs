@@ -40,7 +40,7 @@ impl Runtime {
         let mut futures = vec![];
         for catalog in &valid_catalogs {
             self.status
-                .update_catalog(&catalog.name, status::ComponentStatus::Initializing);
+                .mark_initializing(status::ComponentKey::catalog(&catalog.name));
             futures.push(Arc::clone(&self).load_catalog(catalog));
         }
 
@@ -87,7 +87,7 @@ impl Runtime {
             }
 
             self.status
-                .update_catalog(&catalog.name, status::ComponentStatus::Ready);
+                .mark_ready(status::ComponentKey::catalog(&catalog.name));
 
             Ok(())
         })
@@ -237,7 +237,7 @@ impl Runtime {
                 }
             } else {
                 self.status
-                    .update_catalog(&catalog.name, status::ComponentStatus::Initializing);
+                    .mark_initializing(status::ComponentKey::catalog(&catalog.name));
                 Arc::clone(&self).load_catalog(catalog).await;
             }
         }

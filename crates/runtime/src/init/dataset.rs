@@ -129,7 +129,7 @@ impl Runtime {
             }
 
             self.status
-                .update_dataset(&ds.name, status::ComponentStatus::Initializing);
+                .mark_initializing(status::ComponentKey::dataset(&ds.name));
             let ds_clone = Arc::clone(ds);
             let cloned_self = Arc::clone(&self);
             let load_semaphore = Arc::clone(&semaphore);
@@ -145,7 +145,7 @@ impl Runtime {
         // For each localpod dataset, chain it after its parent's future
         for (ds, bootstrap_status) in localpod_datasets {
             self.status
-                .update_dataset(&ds.name, status::ComponentStatus::Initializing);
+                .mark_initializing(status::ComponentKey::dataset(&ds.name));
 
             // Get the parent dataset path from the localpod dataset
             let path = ds.path();
@@ -906,7 +906,7 @@ impl Runtime {
 
     async fn update_dataset(self: Arc<Self>, ds: Arc<Dataset>) {
         self.status
-            .update_dataset(&ds.name, status::ComponentStatus::Refreshing);
+            .mark_refreshing(status::ComponentKey::dataset(&ds.name));
 
         // Updating a dataset may cause the cached LogicalPlans to be
         // obsolete, so we remove them
@@ -927,7 +927,7 @@ impl Runtime {
                         Ok(())
                     ) {
                         self.status
-                            .update_dataset(&ds.name, status::ComponentStatus::Ready);
+                            .mark_ready(status::ComponentKey::dataset(&ds.name));
                         return;
                     }
                     tracing::debug!(
@@ -1282,7 +1282,7 @@ impl Runtime {
                 })?;
 
             self.status
-                .update_dataset(&ds_name, status::ComponentStatus::Ready);
+                .mark_ready(status::ComponentKey::dataset(&ds_name));
 
             return Ok(());
         }
@@ -1352,7 +1352,7 @@ impl Runtime {
 
         // The accelerated refresh task will set the dataset status to `Ready` once it finishes loading.
         self.status
-            .update_dataset(&ds.name, status::ComponentStatus::Refreshing);
+            .mark_refreshing(status::ComponentKey::dataset(&ds.name));
         let notifier = self
             .df
             .register_table(
@@ -1486,7 +1486,7 @@ impl Runtime {
                 }
             } else {
                 self.status
-                    .update_dataset(&ds.name, status::ComponentStatus::Initializing);
+                    .mark_initializing(status::ComponentKey::dataset(&ds.name));
                 Arc::clone(&self)
                     .load_dataset(
                         Arc::clone(ds),
@@ -1526,7 +1526,7 @@ impl Runtime {
                 };
 
                 self.status
-                    .update_dataset(&ds_name, status::ComponentStatus::Disabled);
+                    .mark_disabled(status::ComponentKey::dataset(&ds_name));
                 Arc::clone(&self)
                     .remove_dataset(ds_name, ds_acceleration.as_ref())
                     .await;

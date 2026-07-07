@@ -128,8 +128,6 @@ use tokio::sync::{Mutex, Notify};
 use tokio::sync::{RwLock as TokioRwLock, Semaphore};
 use tokio::task::JoinHandle;
 use tokio::time::{Instant, sleep};
-use util::fibonacci_backoff::FibonacciBackoffBuilder;
-use util::{RetryError, retry};
 
 pub mod query;
 
@@ -3863,7 +3861,9 @@ impl DataFusion {
             }
 
             // If view depends on other tables, wait until they are ready
-            wait_until_dependent_tables_are_ready(&table, &dependent_table_names, &status).await;
+            status
+                .wait_until_dependent_tables_ready(&dependent_table_names)
+                .await;
 
             let tbl_provider = match prepare_view(&ctx, &statements[0], &view).await {
                 Ok(tbl) => tbl,
@@ -4618,12 +4618,6 @@ pub fn is_spice_internal_dataset(dataset: &TableReference) -> bool {
     }
 }
 
-// Normalizes a table reference to a full table reference with catalog, schema, and table name
-// so it can be used for comparison.
-fn resolve_table_reference(table: TableReference) -> ResolvedTableReference {
-    table.resolve(SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA)
-}
-
 #[must_use]
 pub fn is_spice_internal_schema(catalog: &str, schema: &str) -> bool {
     catalog == SPICE_DEFAULT_CATALOG
@@ -4637,57 +4631,6 @@ impl Drop for DataFusion {
     fn drop(&mut self) {
         tracing::debug!("DataFusion resources cleanup");
     }
-}
-
-async fn wait_until_dependent_tables_are_ready(
-    table: &TableReference,
-    dependent_tables: &[TableReference],
-    runtime_status: &Arc<status::RuntimeStatus>,
-) {
-    tracing::debug!(
-        "Waiting for dependent tables {dependent_tables:?} to be ready for {table}",
-        table = table
-    );
-
-    // Exponential retry with max duration of 10 seconds between retries
-    let retry_strategy = FibonacciBackoffBuilder::new()
-        .max_retries(None)
-        .max_duration(Some(Duration::from_secs(10)))
-        .build();
-    let dependent_tables = dependent_tables
-        .iter()
-        .cloned()
-        .map(resolve_table_reference)
-        .collect::<Vec<_>>();
-
-    let _ = retry(retry_strategy, || async {
-        let mut table_statuses = runtime_status.get_dataset_statuses();
-        table_statuses.extend(runtime_status.get_view_statuses());
-        let statuses = table_statuses
-            .into_iter()
-            .map(|(key, value)| (resolve_table_reference(key), value))
-            .collect::<std::collections::HashMap<_, _>>();
-        let catalog_statuses = runtime_status.get_catalog_statuses();
-
-        if let Some(not_ready_table) = dependent_tables.iter().find(|dependent_table| {
-            if let Some(s) = statuses.get(dependent_table) {
-                s != &status::ComponentStatus::Ready
-            } else {
-                // Table not tracked as a dataset or view (e.g. a catalog table).
-                // Consider it ready if its catalog is registered and ready.
-                let catalog = dependent_table.catalog.as_ref();
-                catalog_statuses.get(catalog) != Some(&status::ComponentStatus::Ready)
-            }
-        }) {
-            tracing::debug!(
-                "Dependent table {not_ready_table} is not ready for {table}. Retrying..."
-            );
-
-            return Err(RetryError::transient(()));
-        }
-        Ok(())
-    })
-    .await;
 }
 
 async fn build_snapshot_creation_config(

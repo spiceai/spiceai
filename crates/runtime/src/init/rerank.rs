@@ -50,7 +50,7 @@ impl Runtime {
 
         for reranker in &app.rerankers {
             self.status
-                .update_reranker(&reranker.name, status::ComponentStatus::Initializing);
+                .mark_initializing(status::ComponentKey::reranker(&reranker.name));
             let load_result = async {
                 let rr = try_to_rerank_model(reranker, Arc::clone(&self.secrets)).await?;
                 rr.health().await.context(HealthFailedSnafu {
@@ -68,7 +68,7 @@ impl Runtime {
                     metrics::rerankers::COUNT
                         .add(1, &[KeyValue::new("reranker", reranker.name.clone())]);
                     self.status
-                        .update_reranker(&reranker.name, status::ComponentStatus::Ready);
+                        .mark_ready(status::ComponentKey::reranker(&reranker.name));
                 }
                 Err(e) => {
                     metrics::rerankers::LOAD_ERROR.add(1, &[]);

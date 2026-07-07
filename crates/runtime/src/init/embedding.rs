@@ -42,7 +42,7 @@ impl Runtime {
         if let Some(app) = app_opt.as_ref() {
             for in_embed in &app.embeddings {
                 self.status
-                    .update_embedding(&in_embed.name, status::ComponentStatus::Initializing);
+                    .mark_initializing(status::ComponentKey::embedding(&in_embed.name));
                 match self.load_embedding(in_embed).await {
                     Ok(e) => {
                         let mut embeds_map = self.embeds.write().await;
@@ -64,7 +64,7 @@ impl Runtime {
                             ],
                         );
                         self.status
-                            .update_embedding(&in_embed.name, status::ComponentStatus::Ready);
+                            .mark_ready(status::ComponentKey::embedding(&in_embed.name));
                     }
                     Err(e) => {
                         metrics::embeddings::LOAD_ERROR.add(1, &[]);

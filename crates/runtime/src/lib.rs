@@ -1559,51 +1559,51 @@ impl Runtime {
         let valid_datasets = Arc::clone(&self).get_valid_datasets(&app, LogErrors(false));
         for ds in &valid_datasets {
             self.status
-                .update_dataset(&ds.name, ComponentStatus::Initializing);
+                .mark_initializing(status::ComponentKey::dataset(&ds.name));
         }
 
         if cfg!(feature = "models") {
             for embedding in &app.embeddings {
                 self.status
-                    .update_embedding(&embedding.name, ComponentStatus::Initializing);
+                    .mark_initializing(status::ComponentKey::embedding(&embedding.name));
             }
 
             for reranker in &app.rerankers {
                 self.status
-                    .update_reranker(&reranker.name, ComponentStatus::Initializing);
+                    .mark_initializing(status::ComponentKey::reranker(&reranker.name));
             }
 
             for model in &app.models {
                 self.status
-                    .update_model(&model.name, ComponentStatus::Initializing);
+                    .mark_initializing(status::ComponentKey::model(&model.name));
             }
 
             for tool in &app.tools {
                 self.status
-                    .update_tool(&tool.name, ComponentStatus::Initializing);
+                    .mark_initializing(status::ComponentKey::tool(&tool.name));
             }
 
             for catalog_name in default_catalog_names() {
                 self.status
-                    .update_tool_catalog(catalog_name, ComponentStatus::Initializing);
+                    .mark_initializing(status::ComponentKey::tool_catalog(catalog_name));
             }
 
             for model in &app.models {
                 self.status
-                    .update_model(&model.name, ComponentStatus::Initializing);
+                    .mark_initializing(status::ComponentKey::model(&model.name));
             }
         }
 
         let valid_catalogs = Arc::clone(&self).get_valid_catalogs(&app, LogErrors(false));
         for catalog in valid_catalogs {
             self.status
-                .update_catalog(&catalog.name, ComponentStatus::Initializing);
+                .mark_initializing(status::ComponentKey::catalog(&catalog.name));
         }
 
         let valid_views = Arc::clone(&self).get_valid_views(&app, LogErrors(false));
         for validated_view in valid_views {
             self.status
-                .update_view(&validated_view.view.name, ComponentStatus::Initializing);
+                .mark_initializing(status::ComponentKey::view(&validated_view.view.name));
         }
     }
 

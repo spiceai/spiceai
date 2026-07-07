@@ -388,7 +388,7 @@ impl Runtime {
 
     async fn update_view(self: Arc<Self>, view: &Arc<View>) {
         self.status
-            .update_view(&view.name, status::ComponentStatus::Refreshing);
+            .mark_refreshing(status::ComponentKey::view(&view.name));
         Arc::clone(&self).remove_view(&view.name).await;
         let secrets = self.secrets();
         let _ = self.load_view(view, secrets);
@@ -436,7 +436,7 @@ impl Runtime {
                     }
                 };
                 self.status
-                    .update_view(&view_builder.name, status::ComponentStatus::Disabled);
+                    .mark_disabled(status::ComponentKey::view(&view_builder.name));
                 Arc::clone(&self).remove_view(&view_builder.name).await;
             }
         }
