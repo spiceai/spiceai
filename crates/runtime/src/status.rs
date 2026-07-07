@@ -29,8 +29,6 @@ use tokio_util::sync::CancellationToken;
 use datafusion::sql::TableReference;
 use opentelemetry::KeyValue;
 
-use crate::metrics;
-
 // Re-export ComponentStatus from the shared API types crate
 pub use runtime_api_types::v1::ComponentStatus;
 
@@ -143,62 +141,66 @@ impl RuntimeStatus {
         let catalog_name = catalog_name.into();
         let metric_value = status.discriminant();
         self.update_component_status(&format!("catalog:{catalog_name}"), status);
-        metrics::catalogs::STATUS.record(metric_value, &[KeyValue::new("catalog", catalog_name)]);
+        runtime_metrics::catalogs::STATUS
+            .record(metric_value, &[KeyValue::new("catalog", catalog_name)]);
     }
 
     pub fn update_dataset(&self, dataset: &TableReference, status: ComponentStatus) {
         let ds_name = dataset.to_string();
         let metric_value = status.discriminant();
         self.update_component_status(&format!("dataset:{ds_name}"), status);
-        metrics::datasets::STATUS.record(metric_value, &[KeyValue::new("dataset", ds_name)]);
+        runtime_metrics::datasets::STATUS
+            .record(metric_value, &[KeyValue::new("dataset", ds_name)]);
     }
 
     pub fn update_model(&self, model_name: &str, status: ComponentStatus) {
         let model_name = model_name.to_string();
         let metric_value = status.discriminant();
         self.update_component_status(&format!("model:{model_name}"), status);
-        metrics::models::STATUS.record(metric_value, &[KeyValue::new("model", model_name)]);
+        runtime_metrics::models::STATUS.record(metric_value, &[KeyValue::new("model", model_name)]);
     }
 
     pub fn update_tool(&self, tool_name: &str, status: ComponentStatus) {
         let tool_name = tool_name.to_string();
         let metric_value = status.discriminant();
         self.update_component_status(&format!("tool:{tool_name}"), status);
-        metrics::tools::STATUS.record(metric_value, &[KeyValue::new("tool", tool_name)]);
+        runtime_metrics::tools::STATUS.record(metric_value, &[KeyValue::new("tool", tool_name)]);
     }
 
     pub fn update_tool_catalog(&self, catalog_name: &str, status: ComponentStatus) {
         let name = catalog_name.to_string();
         let metric_value = status.discriminant();
         self.update_component_status(&format!("tool_catalog:{name}"), status);
-        metrics::tools::STATUS.record(metric_value, &[KeyValue::new("tool_catalog", name)]);
+        runtime_metrics::tools::STATUS.record(metric_value, &[KeyValue::new("tool_catalog", name)]);
     }
 
     pub fn update_llm(&self, model_name: &str, status: ComponentStatus) {
         let model_name = model_name.to_string();
         let metric_value = status.discriminant();
         self.update_component_status(&format!("llm:{model_name}"), status);
-        metrics::llms::STATUS.record(metric_value, &[KeyValue::new("model", model_name)]);
+        runtime_metrics::llms::STATUS.record(metric_value, &[KeyValue::new("model", model_name)]);
     }
 
     pub fn update_embedding(&self, model_name: &str, status: ComponentStatus) {
         let model_name = model_name.to_string();
         let metric_value = status.discriminant();
         self.update_component_status(&format!("embedding:{model_name}"), status);
-        metrics::embeddings::STATUS.record(metric_value, &[KeyValue::new("model", model_name)]);
+        runtime_metrics::embeddings::STATUS
+            .record(metric_value, &[KeyValue::new("model", model_name)]);
     }
 
     pub fn update_reranker(&self, model_name: &str, status: ComponentStatus) {
         let model_name = model_name.to_string();
         let metric_value = status.discriminant();
         self.update_component_status(&format!("reranker:{model_name}"), status);
-        metrics::rerankers::STATUS.record(metric_value, &[KeyValue::new("model", model_name)]);
+        runtime_metrics::rerankers::STATUS
+            .record(metric_value, &[KeyValue::new("model", model_name)]);
     }
     pub fn update_view(&self, view_name: &TableReference, status: ComponentStatus) {
         let view_name = view_name.to_string();
         let metric_value = status.discriminant();
         self.update_component_status(&format!("view:{view_name}"), status);
-        metrics::views::STATUS.record(metric_value, &[KeyValue::new("view", view_name)]);
+        runtime_metrics::views::STATUS.record(metric_value, &[KeyValue::new("view", view_name)]);
     }
 
     /// Update the status of a worker
@@ -206,7 +208,8 @@ impl RuntimeStatus {
         let worker_name = name.to_string();
         let metric_value = status.discriminant();
         self.update_component_status(&format!("worker:{worker_name}"), status);
-        metrics::models::STATUS.record(metric_value, &[KeyValue::new("worker", worker_name)]);
+        runtime_metrics::workers::STATUS
+            .record(metric_value, &[KeyValue::new("worker", worker_name)]);
     }
 
     /// Update the status of a cluster node
@@ -223,7 +226,7 @@ impl RuntimeStatus {
         };
 
         self.update_component_status(&format!("cluster:{cluster_node_name}"), status);
-        metrics::cluster::set_node_status(&cluster_node_name, node_name, status_value);
+        runtime_metrics::cluster::set_node_status(&cluster_node_name, node_name, status_value);
     }
 
     /// Get the status of a worker

@@ -639,7 +639,11 @@ pub enum Table {
         /// Initial partition filter expressions to apply before the refresher starts.
         /// These are set on the `Refresh` during table registration to avoid a race
         /// where the first refresh runs before partition filters are applied.
-        initial_partition_filters: Vec<datafusion_expr::Expr>,
+        ///
+        /// Uses the `RefreshSQL` three-state partition-filter semantics: `None`
+        /// (not partition-scoped), `Some(filters)` (assigned partitions), or
+        /// `Some(empty)` (executor owns no partition — load no rows).
+        initial_partition_filters: Option<Vec<datafusion_expr::Expr>>,
     },
     Federated {
         data_connector: Arc<dyn DataConnector>,
@@ -1980,7 +1984,7 @@ impl DataFusion {
             federated_table,
             Arc::clone(&pending_registration.secrets),
             BootstrapStatus::none(), // Sink datasets don't bootstrap from snapshots
-            vec![],
+            None,                    // Sink datasets are not partition-scoped
         )
         .await?;
 
@@ -2321,7 +2325,7 @@ impl DataFusion {
         federated_read_table: FederatedTable,
         secrets: Arc<TokioRwLock<Secrets>>,
         bootstrap_status: BootstrapStatus,
-        initial_partition_filters: Vec<datafusion_expr::Expr>,
+        initial_partition_filters: Option<Vec<datafusion_expr::Expr>>,
     ) -> Result<AcceleratedTable> {
         tracing::trace!("Creating accelerated table {dataset:?}");
 
@@ -2599,15 +2603,17 @@ impl DataFusion {
             .context(InvalidTimeColumnTimeFormatSnafu)?;
 
         // Apply initial partition filters before the refresher starts to avoid a race
-        // where the first refresh runs without partition filters.
-        if !initial_partition_filters.is_empty() {
+        // where the first refresh runs without partition filters. `Some(empty)`
+        // (executor owns no partition of this table) is preserved so the refresh
+        // loads no rows rather than the entire source table.
+        if let Some(filters) = initial_partition_filters {
             use crate::accelerated_table::refresh::{RefreshSQL, RefreshSQLColumns};
             if let Some(ref mut sql) = refresh.sql {
-                sql.set_partition_filters(initial_partition_filters);
+                sql.set_partition_filters(Some(filters));
             } else {
                 let mut sql =
                     RefreshSQL::new(dataset.name.clone(), RefreshSQLColumns::All, vec![], None);
-                sql.set_partition_filters(initial_partition_filters);
+                sql.set_partition_filters(Some(filters));
                 refresh = refresh.refresh_sql(sql);
             }
         }
@@ -3434,7 +3440,7 @@ impl DataFusion {
         federated_read_table: FederatedTable,
         secrets: Arc<TokioRwLock<Secrets>>,
         bootstrap_status: BootstrapStatus,
-        initial_partition_filters: Vec<datafusion_expr::Expr>,
+        initial_partition_filters: Option<Vec<datafusion_expr::Expr>>,
     ) -> Result<Option<Arc<Notify>>> {
         let mut accelerated_table = self
             .create_accelerated_table(
@@ -3641,10 +3647,14 @@ impl DataFusion {
     }
 
     /// Update only the partition filters on an accelerated table's refresh.
+    ///
+    /// `filters` carries the `RefreshSQL` three-state partition-filter semantics:
+    /// `None` (not partition-scoped), `Some(filters)` (assigned partitions), or
+    /// `Some(empty)` (no partitions assigned — load no rows).
     pub async fn update_partition_filters(
         &self,
         dataset_name: TableReference,
-        filters: Vec<datafusion_expr::Expr>,
+        filters: Option<Vec<datafusion_expr::Expr>>,
     ) -> Result<()> {
         let table = self
             .get_accelerated_table_provider(&dataset_name.to_string())

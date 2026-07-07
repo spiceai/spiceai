@@ -734,10 +734,104 @@ mod connect {
             .arg("--help")
             .assert()
             .success()
-            .stdout(predicate::str::contains(
-                "Spicepod hosted on Spice.ai Cloud",
-            ))
-            .stdout(predicate::str::contains("Spice.ai Cloud"));
+            // Spice Cloud Connect adoption flow (new) — still mentions
+            // the legacy pod-add behavior in the long help.
+            .stdout(predicate::str::contains("SPICE-ADOPT"))
+            .stdout(predicate::str::contains("Spice Cloud"))
+            .stdout(predicate::str::contains("status"))
+            .stdout(predicate::str::contains("forget"));
+    }
+
+    /// `spice connect <CODE>` should stage the code at
+    /// `$SPICE_CONFIG_DIR/pending-adopt-code` and the subsequent
+    /// `spice connect status` should report pending adoption.
+    #[test]
+    fn test_connect_stage_code_and_status() {
+        let dir = TempDir::new().expect("create temp config dir");
+        let config_dir = dir.path();
+
+        // Stage the code.
+        let mut cmd = spice_cmd();
+        cmd.env("SPICE_CONFIG_DIR", config_dir)
+            .arg("connect")
+            .arg("SPICE-ADOPT-AAAA-BBBB")
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("Adoption code stored"));
+
+        let pending = config_dir.join("pending-adopt-code");
+        assert!(pending.exists(), "pending-adopt-code should be created");
+        let content = fs::read_to_string(&pending).expect("read pending-adopt-code");
+        assert_eq!(content, "SPICE-ADOPT-AAAA-BBBB");
+
+        // Status should report pending adoption.
+        let mut cmd = spice_cmd();
+        cmd.env("SPICE_CONFIG_DIR", config_dir)
+            .arg("connect")
+            .arg("status")
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("pending adoption"))
+            .stdout(predicate::str::contains("SPICE-ADOPT"));
+    }
+
+    /// A malformed adoption code (right prefix, wrong shape) should be
+    /// rejected as an invalid argument rather than falling through to the
+    /// legacy pod-add path and emitting a misleading cloud-Spicepod error.
+    #[test]
+    fn test_connect_malformed_adoption_code_is_rejected() {
+        let dir = TempDir::new().expect("create temp config dir");
+        let config_dir = dir.path();
+        spice_cmd()
+            .env("SPICE_CONFIG_DIR", config_dir)
+            .arg("connect")
+            .arg("SPICE-ADOPT-AAA-BBBB")
+            .assert()
+            .failure();
+
+        // It must not have been staged as a pending code or treated as a pod:
+        // rejecting early means the pending file is never written.
+        assert!(
+            !config_dir.join("pending-adopt-code").exists(),
+            "malformed code must not be staged"
+        );
+    }
+
+    /// `spice connect forget` with no prior state should be a no-op.
+    #[test]
+    fn test_connect_forget_when_nothing_to_clear() {
+        let dir = TempDir::new().expect("create temp config dir");
+        let mut cmd = spice_cmd();
+        cmd.env("SPICE_CONFIG_DIR", dir.path())
+            .arg("connect")
+            .arg("forget")
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("nothing to forget"));
+    }
+
+    /// `spice connect forget` after `spice connect <CODE>` should clear
+    /// the pending file.
+    #[test]
+    fn test_connect_forget_clears_pending_code() {
+        let dir = TempDir::new().expect("create temp config dir");
+        let config_dir = dir.path();
+        spice_cmd()
+            .env("SPICE_CONFIG_DIR", config_dir)
+            .arg("connect")
+            .arg("SPICE-ADOPT-AAAA-BBBB")
+            .assert()
+            .success();
+        assert!(config_dir.join("pending-adopt-code").exists());
+
+        spice_cmd()
+            .env("SPICE_CONFIG_DIR", config_dir)
+            .arg("connect")
+            .arg("forget")
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("identity cleared"));
+        assert!(!config_dir.join("pending-adopt-code").exists());
     }
 }
 

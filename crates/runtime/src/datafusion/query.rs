@@ -58,7 +58,6 @@ pub use builder::QueryBuilder;
 mod cache;
 pub mod error_code;
 mod handle;
-mod metrics;
 pub mod registry;
 pub mod stage_history;
 mod tracker;
@@ -1617,8 +1616,8 @@ fn attach_query_tracker_to_stream(
             }
         }
 
-        crate::metrics::telemetry::track_bytes_returned(num_output_bytes, &request_context.to_dimensions());
-        crate::metrics::telemetry::track_rows_returned(num_records, &request_context.to_dimensions());
+        runtime_metrics::telemetry::track_bytes_returned(num_output_bytes, &request_context.to_dimensions());
+        runtime_metrics::telemetry::track_rows_returned(num_records, &request_context.to_dimensions());
 
         tracker
             .schema(schema_copy)
@@ -1648,7 +1647,7 @@ impl QueryActiveGuard {
 
         let active = request_context.entered_top_level_query();
         if active {
-            crate::metrics::telemetry::inc_query_active_count(dimensions);
+            runtime_metrics::telemetry::inc_query_active_count(dimensions);
         }
 
         Self {
@@ -1663,7 +1662,7 @@ impl Drop for QueryActiveGuard {
     fn drop(&mut self) {
         let exited = self.request_context.exited_top_level_query();
         if self.active && exited {
-            crate::metrics::telemetry::dec_query_active_count(self.dimensions);
+            runtime_metrics::telemetry::dec_query_active_count(self.dimensions);
         }
     }
 }
@@ -1817,9 +1816,9 @@ fn attach_physical_plan_metrics_to_stream(
         let mut totals = PhysicalPlanMetricsTotals::default();
         collect_physical_plan_metrics(physical_plan.as_ref(), &mut totals);
 
-        crate::metrics::telemetry::track_produced_spills(totals.produced_spills, &request_context.to_dimensions());
-        crate::metrics::telemetry::track_spilled_bytes(totals.spilled_bytes, &request_context.to_dimensions());
-        crate::metrics::telemetry::track_spilled_rows(totals.spilled_rows, &request_context.to_dimensions());
+        runtime_metrics::telemetry::track_produced_spills(totals.produced_spills, &request_context.to_dimensions());
+        runtime_metrics::telemetry::track_spilled_bytes(totals.spilled_bytes, &request_context.to_dimensions());
+        runtime_metrics::telemetry::track_spilled_rows(totals.spilled_rows, &request_context.to_dimensions());
     };
 
     Box::pin(RecordBatchStreamAdapter::new(
