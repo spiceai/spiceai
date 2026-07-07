@@ -125,8 +125,7 @@ impl Runtime {
                     responses_llm_map.insert(m.name.clone(), responses_model);
                 }
 
-                let responses_api_support_store =
-                    self.llm_runtime_stores.responses_api_support();
+                let responses_api_support_store = self.llm_runtime_stores.responses_api_support();
                 let mut responses_support_map = responses_api_support_store.write().await;
                 responses_support_map.insert(m.name.clone(), responses_api_support);
                 drop(responses_support_map);

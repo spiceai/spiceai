@@ -330,7 +330,6 @@ impl Model {
     pub fn get_model_id(&self) -> Option<String> {
         self.get_source()?.parse_from(self.from.as_str())
     }
-
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

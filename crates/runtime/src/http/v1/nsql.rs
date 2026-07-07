@@ -786,7 +786,6 @@ fn resolve_nsql_model_name_from_app(app: &app::App) -> Result<String, String> {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
