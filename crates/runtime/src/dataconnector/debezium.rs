@@ -22,7 +22,6 @@ use crate::accelerated_table::refresh_task::changes::{
 };
 use crate::component::dataset::acceleration::{Engine, RefreshMode};
 use crate::component::dataset::{Dataset, OnSchemaChange};
-use crate::component::metrics::MetricsProvider;
 use crate::dataaccelerator::spice_sys::{self, OpenOption, debezium_kafka::DebeziumKafkaSys};
 use crate::dataconnector::schema_projection::{ProjectionPolicy, parse_schema_projection};
 use crate::dataconnector::{
@@ -44,6 +43,7 @@ use data_components::kafka::{KafkaConfig, KafkaConsumer, KafkaMetrics, KafkaOffs
 use data_components::schema_discovery::merge_inferred_and_declared_schemas;
 use datafusion::datasource::TableProvider;
 use futures::StreamExt;
+use runtime_metrics::component::MetricsProvider;
 use serde::{Deserialize, Serialize};
 use snafu::prelude::*;
 use std::any::Any;

@@ -19,8 +19,6 @@ use crate::component::ComponentInitialization;
 use crate::component::catalog::Catalog;
 use crate::component::dataset::Dataset;
 use crate::component::dataset::acceleration::RefreshMode;
-use crate::component::metrics::MetricsProvider;
-use crate::component::metrics::MetricsProviderComponent;
 use crate::datafusion::error::find_datafusion_root;
 use crate::federated_table::FederatedTable;
 pub use crate::parameters::ParameterSpec;
@@ -45,6 +43,7 @@ use datafusion::sql::TableReference;
 use datafusion::sql::unparser::Unparser;
 use linkme::distributed_slice;
 pub use parameters::ConnectorParams;
+use runtime_metrics::component::MetricsProvider;
 use snafu::prelude::*;
 use std::any::Any;
 use std::collections::HashMap;
@@ -718,6 +717,10 @@ pub trait DataConnector: Debug + Send + Sync + 'static {
     fn initialization_for_dataset(&self, _dataset: &Dataset) -> ComponentInitialization {
         self.initialization()
     }
+}
+
+pub trait MetricsProviderComponent: Debug + Send + Sync + 'static {
+    fn metrics_provider(&self) -> Option<Arc<dyn MetricsProvider>>;
 }
 
 impl<T: DataConnector + Debug + 'static> MetricsProviderComponent for T {
