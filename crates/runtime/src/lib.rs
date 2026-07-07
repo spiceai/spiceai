@@ -910,8 +910,14 @@ impl Runtime {
         table: ResolvedTableReference,
         assignments: &PartitionAssignments,
     ) -> Result<()> {
-        let partition_filters =
-            crate::cluster::partition::get_partition_filter_exprs(&table, assignments);
+        // This path runs only in executor partitioned mode, so the table is
+        // always partition-scoped: wrap in `Some`. An empty result here means no
+        // partition is assigned to this executor, which resolves to a `false`
+        // predicate (load no rows) rather than an unfiltered full-table load.
+        let partition_filters = Some(crate::cluster::partition::get_partition_filter_exprs(
+            &table,
+            assignments,
+        ));
 
         let table_ref = TableReference::full(
             Arc::<str>::clone(&table.catalog),

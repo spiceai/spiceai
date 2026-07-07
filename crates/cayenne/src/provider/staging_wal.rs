@@ -715,8 +715,23 @@ pub(crate) enum StagingWalTargetKind {
 #[derive(Debug)]
 struct LocatedStagingWal {
     staging_snapshot_id: String,
-    wal: StagingWal,
+    outcome: StagingWalOutcome,
     location: String,
+}
+
+/// The result of reading one staging-WAL record on recovery.
+#[derive(Debug)]
+enum StagingWalOutcome {
+    /// A record that read back and (when framed) passed its checksum.
+    Parsed(StagingWal),
+    /// A checksum-framed record that failed its integrity check (bit-rot or a
+    /// torn write). Carries a human-readable reason for logs. Recovery discards
+    /// it — its staged files were never durably committed into a snapshot (the
+    /// metastore visibility commit, not this marker, is the durable commit
+    /// point; see `write_staging_wal_local`), so dropping them converges to the
+    /// last committed snapshot rather than replaying corrupted move
+    /// instructions.
+    Corrupt(String),
 }
 
 impl CayenneTableProvider {
@@ -890,6 +905,14 @@ impl CayenneTableProvider {
             table: self.table_name().to_string(),
             message: format!("Failed to serialize staging WAL: {e}"),
         })?;
+        // With integrity checksums enabled, wrap the JSON payload in a checksum
+        // envelope so a corrupt/torn record is detected on recovery instead of
+        // parsed as garbage. Off → byte-identical legacy pure-JSON.
+        let record_bytes: Vec<u8> = if self.integrity_checksums() {
+            super::wal_checksum::frame(content.as_bytes())
+        } else {
+            content.into_bytes()
+        };
 
         // Single open + write + fsync, keeping the fd through to the sync.
         // The previous revision called `tokio::fs::write` (which opens,
@@ -917,7 +940,7 @@ impl CayenneTableProvider {
             .truncate(true)
             .open(&tmp_path)
             .await?;
-        file.write_all(content.as_bytes()).await?;
+        file.write_all(&record_bytes).await?;
         super::fsync_tier::ordering_sync_tokio_file(&file).await?;
         drop(file);
 
@@ -1000,12 +1023,19 @@ impl CayenneTableProvider {
             table: self.table_name().to_string(),
             message: format!("Failed to serialize staging WAL: {e}"),
         })?;
+        // See `write_staging_wal_local`: frame with a checksum envelope when
+        // integrity checksums are enabled, else write byte-identical legacy JSON.
+        let record_bytes: Vec<u8> = if self.integrity_checksums() {
+            super::wal_checksum::frame(content.as_bytes())
+        } else {
+            content.into_bytes()
+        };
 
         let wal_key =
             ObjectStorePath::from(format!("{}{STAGING_WAL_FILENAME}", staging_prefix.as_ref()));
         config
             .store
-            .put(&wal_key, content.into())
+            .put(&wal_key, record_bytes.into())
             .await
             .map_err(|e| Error::ObjectStore {
                 operation: "write staging WAL",
@@ -1168,10 +1198,35 @@ impl CayenneTableProvider {
                 continue;
             }
 
-            let wal = located_wal.wal;
-            let wal_location = located_wal.location;
             let staging_snapshot_id = located_wal.staging_snapshot_id;
+            let wal_location = located_wal.location;
             let table_name = self.table_name().to_string();
+
+            // A checksum-framed record that failed its integrity check is
+            // *discarded* rather than parsed as garbage. It cannot be an
+            // in-flight append this process staged (that WAL was just written
+            // with a valid checksum and is excluded above), so a mismatch means
+            // a prior process's torn write or on-disk bit-rot. The staged files
+            // were never moved into a snapshot, so removing the staging dir
+            // converges to the last committed snapshot. This keeps the table
+            // usable (unlike the conservative "refuse all writes" path for
+            // genuinely ambiguous cases below), which is only safe *because* the
+            // checksum proves the record is untrustworthy.
+            let wal = match located_wal.outcome {
+                StagingWalOutcome::Parsed(wal) => wal,
+                StagingWalOutcome::Corrupt(reason) => {
+                    tracing::error!(
+                        table = %table_name,
+                        location = %wal_location,
+                        staging_snapshot_id = %staging_snapshot_id,
+                        "Discarding corrupt staging WAL detected by integrity checksum ({reason}); \
+                         its staged files were never committed, converging to the last snapshot",
+                    );
+                    self.clear_staging_snapshot_dir(&staging_snapshot_id)
+                        .await?;
+                    continue;
+                }
+            };
 
             // If this per-partition incomplete write belongs to a cross-partition
             // commit, carry the commit id through every operator-facing recovery
@@ -1499,19 +1554,36 @@ impl CayenneTableProvider {
             Self::snapshot_dir_path(self.table_path(), self.table_id(), staging_snapshot_id);
         let wal_path = staging_dir.join(STAGING_WAL_FILENAME);
         let location = wal_path.to_string_lossy().to_string();
-        match tokio::fs::read_to_string(&wal_path).await {
-            Ok(content) => match serde_json::from_str::<StagingWal>(&content) {
-                Ok(wal) => Ok(Some(LocatedStagingWal {
+        // Read raw bytes (not a String): a checksum-framed record is binary. The
+        // envelope is auto-detected, so both framed and legacy pure-JSON records
+        // are handled regardless of the current `integrity_checksums` setting.
+        match tokio::fs::read(&wal_path).await {
+            Ok(bytes) => match super::wal_checksum::verify(&bytes) {
+                Ok(payload) => match serde_json::from_slice::<StagingWal>(payload.bytes()) {
+                    Ok(wal) => Ok(Some(LocatedStagingWal {
+                        staging_snapshot_id: staging_snapshot_id.to_string(),
+                        outcome: StagingWalOutcome::Parsed(wal),
+                        location,
+                    })),
+                    // The bytes are intact (checksum passed, or legacy
+                    // unchecksummed) but do not parse as a `StagingWal`. Keep the
+                    // conservative refuse-and-flag behavior: the record is not
+                    // corrupt, so we must not silently drop a possibly committed
+                    // append.
+                    Err(e) => Err(Error::IncompleteWrite {
+                        table: self.table_name().to_string(),
+                        message: format!(
+                            "Found unreadable staging WAL at '{location}': {e}. Refusing writes to avoid ignoring a possibly committed staged append. Manual resolution is required."
+                        ),
+                    }),
+                },
+                // The checksum envelope failed to verify → corrupt/torn record.
+                // Signal it up so recovery discards the staging dir.
+                Err(checksum_err) => Ok(Some(LocatedStagingWal {
                     staging_snapshot_id: staging_snapshot_id.to_string(),
-                    wal,
+                    outcome: StagingWalOutcome::Corrupt(checksum_err.to_string()),
                     location,
                 })),
-                Err(e) => Err(Error::IncompleteWrite {
-                    table: self.table_name().to_string(),
-                    message: format!(
-                        "Found unreadable staging WAL at '{location}': {e}. Refusing writes to avoid ignoring a possibly committed staged append. Manual resolution is required."
-                    ),
-                }),
             },
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
             Err(e) => Err(Error::IoError { source: e }),
@@ -1570,17 +1642,27 @@ impl CayenneTableProvider {
                 table: self.table_name().to_string(),
                 source: e,
             })?;
-            let wal = serde_json::from_slice::<StagingWal>(&bytes).map_err(|e| {
-                Error::IncompleteWrite {
-                    table: self.table_name().to_string(),
-                    message: format!(
-                        "Found unreadable staging WAL at '{location}': {e}. Refusing writes to avoid ignoring a possibly committed staged append. Manual resolution is required."
-                    ),
-                }
-            })?;
+            // Auto-detect the checksum envelope (both framed and legacy
+            // pure-JSON records are handled regardless of `integrity_checksums`).
+            let outcome = match super::wal_checksum::verify(&bytes) {
+                Ok(payload) => match serde_json::from_slice::<StagingWal>(payload.bytes()) {
+                    Ok(wal) => StagingWalOutcome::Parsed(wal),
+                    Err(e) => {
+                        // Intact bytes that do not parse as a `StagingWal`:
+                        // conservatively refuse (not corruption).
+                        return Err(Error::IncompleteWrite {
+                            table: self.table_name().to_string(),
+                            message: format!(
+                                "Found unreadable staging WAL at '{location}': {e}. Refusing writes to avoid ignoring a possibly committed staged append. Manual resolution is required."
+                            ),
+                        });
+                    }
+                },
+                Err(checksum_err) => StagingWalOutcome::Corrupt(checksum_err.to_string()),
+            };
             wals.push(LocatedStagingWal {
                 staging_snapshot_id,
-                wal,
+                outcome,
                 location,
             });
         }

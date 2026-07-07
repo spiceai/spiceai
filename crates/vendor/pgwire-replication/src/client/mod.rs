@@ -1,11 +1,11 @@
-//! PostgreSQL logical replication client.
+//! `PostgreSQL` logical replication client.
 //!
 //! This module provides the main interface for consuming logical replication
-//! events from PostgreSQL.
+//! events from `PostgreSQL`.
 //!
 //! # Overview
 //!
-//! The client establishes a replication connection to PostgreSQL and streams
+//! The client establishes a replication connection to `PostgreSQL` and streams
 //! change events (inserts, updates, deletes) from the configured publication.
 //!
 //! # Architecture
