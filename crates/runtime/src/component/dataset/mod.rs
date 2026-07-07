@@ -894,7 +894,7 @@ impl AccelerationSource for Dataset {
                         .into_iter()
                         .map(|v| v as Arc<dyn runtime_acceleration::AccelerationSource>)
                         .collect();
-                return datasets.into_iter().chain(views).collect();
+                datasets.into_iter().chain(views).collect()
             }
             #[cfg(not(feature = "duckdb"))]
             datasets

@@ -509,10 +509,10 @@ impl DataAccelerator for SqliteAccelerator {
                         return None;
                     }
                     let other_path = self.spicepod_dataset_sqlite_file_path(spicepod_ds)?;
-                    if other_path != self_path {
-                        Some(other_path)
-                    } else {
+                    if other_path == self_path {
                         None
+                    } else {
+                        Some(other_path)
                     }
                 })
                 .collect();

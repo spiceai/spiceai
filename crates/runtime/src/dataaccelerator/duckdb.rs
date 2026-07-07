@@ -619,10 +619,10 @@ impl DataAccelerator for DuckDBAccelerator {
                             return None;
                         }
                         let other_path = self.file_path(other.as_ref()).ok()?;
-                        if other_path != self_path {
-                            Some(other_path)
-                        } else {
+                        if other_path == self_path {
                             None
+                        } else {
+                            Some(other_path)
                         }
                     })
                     .collect();
