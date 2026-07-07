@@ -16,7 +16,7 @@ use crate::config::SslMode;
 
 use super::worker::{ReplicationEvent, ReplicationEventReceiver, SharedProgress, WorkerState};
 
-/// PostgreSQL logical replication client.
+/// `PostgreSQL` logical replication client.
 ///
 /// This client spawns a background worker task that maintains the replication
 /// connection and streams events to the consumer via a bounded channel.
@@ -70,7 +70,7 @@ pub struct ReplicationClient {
 }
 
 impl ReplicationClient {
-    /// Connect to PostgreSQL and start streaming replication events.
+    /// Connect to `PostgreSQL` and start streaming replication events.
     ///
     /// This establishes a TCP connection (optionally upgrading to TLS),
     /// authenticates, and starts the replication stream. Events are buffered
@@ -86,6 +86,10 @@ impl ReplicationClient {
     /// - Publication doesn't exist
     /// - Unix socket does not exist (when host starts with `/`)
     /// - TLS requested with Unix socket connection
+    #[expect(
+        clippy::unused_async,
+        reason = "public async constructor: callers await it, and it spawns the worker task"
+    )]
     pub async fn connect(cfg: ReplicationConfig) -> Result<Self> {
         let (tx, rx) = mpsc::channel(cfg.buffer_events);
 
@@ -117,8 +121,12 @@ impl ReplicationClient {
     /// Receive the next replication event.
     ///
     /// - `Ok(Some(event))` => received an event
-    /// - `Ok(None)`        => replication ended normally (stop requested or stop_at_lsn reached)
+    /// - `Ok(None)`        => replication ended normally (stop requested or `stop_at_lsn` reached)
     /// - `Err(e)`          => replication ended abnormally
+    ///
+    /// # Errors
+    /// Returns the worker's terminating error if the replication stream failed
+    /// (I/O, protocol, auth, or a worker panic surfaced as [`PgWireError::Task`]).
     pub async fn recv(&mut self) -> Result<Option<ReplicationEvent>> {
         match self.rx.recv().await {
             Some(Ok(ev)) => Ok(Some(ev)),
@@ -157,24 +165,26 @@ impl ReplicationClient {
     /// After calling this, [`recv()`](Self::recv) will return remaining buffered
     /// events, then `Ok(None)` once the worker exits cleanly.
     ///
-    /// This sends a CopyDone message to the server to cleanly terminate
+    /// This sends a `CopyDone` message to the server to cleanly terminate
     /// the replication stream.
     #[inline]
     pub fn stop(&self) {
         let _ = self.stop_tx.send(true);
     }
 
+    #[must_use]
     pub fn is_running(&self) -> bool {
-        self.join
-            .as_ref()
-            .map(|j| !j.is_finished())
-            .unwrap_or(false)
+        self.join.as_ref().is_some_and(|j| !j.is_finished())
     }
 
     /// Wait for the worker task to complete and return its result.
     ///
     /// This consumes the client. Use this for diagnostics or to ensure
     /// clean shutdown after calling [`stop()`](Self::stop).
+    ///
+    /// # Errors
+    /// Returns the worker's terminating error, or [`PgWireError::Task`] if the
+    /// worker was already joined or panicked.
     pub async fn join(mut self) -> Result<()> {
         let join = self
             .join
@@ -189,7 +199,7 @@ impl ReplicationClient {
 
     /// Abort the worker task immediately.
     ///
-    /// This is a hard cancel and does not send CopyDone.
+    /// This is a hard cancel and does not send `CopyDone`.
     /// Prefer `stop()`/`shutdown()` for graceful termination.
     pub fn abort(&mut self) {
         if let Some(join) = self.join.take() {
@@ -198,6 +208,10 @@ impl ReplicationClient {
     }
 
     /// Request a graceful stop and wait for the worker to exit.
+    ///
+    /// # Errors
+    /// Returns the worker's terminating error if it ended abnormally, or
+    /// [`PgWireError::Task`] if the worker was already joined or panicked.
     pub async fn shutdown(&mut self) -> Result<()> {
         self.stop();
 
@@ -233,20 +247,17 @@ impl Drop for ReplicationClient {
         // We cannot .await here. Prefer to detach a join in the background
         // so the worker can exit cleanly without being aborted.
         if let Some(join) = self.join.take() {
-            match tokio::runtime::Handle::try_current() {
-                Ok(handle) => {
-                    handle.spawn(async move {
-                        let _ = join.await;
-                    });
-                }
-                Err(_) => {
-                    // No Tokio runtime available (dropping outside async context).
-                    // Fall back to abort to avoid a potentially unbounded leaked task.
-                    tracing::debug!(
-                        "dropping ReplicationClient outside a Tokio runtime; aborting worker task"
-                    );
-                    join.abort();
-                }
+            if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                handle.spawn(async move {
+                    let _ = join.await;
+                });
+            } else {
+                // No Tokio runtime available (dropping outside async context).
+                // Fall back to abort to avoid a potentially unbounded leaked task.
+                tracing::debug!(
+                    "dropping ReplicationClient outside a Tokio runtime; aborting worker task"
+                );
+                join.abort();
             }
         }
     }
