@@ -1,5 +1,5 @@
 /*
-Copyright 2026 The Spice.ai OSS Authors
+Copyright 2024-2026 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -47,7 +47,10 @@ use mysql_async::prelude::Queryable;
 use crate::init_tracing;
 use crate::mysql::common;
 
-const MYSQL_REPLICATION_PORT: u16 = 13320;
+// 13324/13325 (the purged-position test uses `+ 1`): distinct from the other
+// MySQL suites (comments 13320, e2e 13322/13323, refresh_retry 13327,
+// rehydration 13337) so parallel test binaries never fight over a container.
+const MYSQL_REPLICATION_PORT: u16 = 13324;
 
 /// In-memory [`PositionStore`] standing in for the accelerator sidecar.
 #[derive(Default)]
