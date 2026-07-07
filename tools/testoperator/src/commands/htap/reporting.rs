@@ -571,7 +571,7 @@ pub(super) fn phase_coverage(metrics: &crate::spiced_metrics::SpicedMetrics) -> 
     use std::collections::BTreeMap;
     // Sum the latest cumulative value of each distinct series into a `group`-label bucket.
     let sum_latest_by = |name: &str, group: &str| -> BTreeMap<String, f64> {
-        let mut series_max: BTreeMap<String, (String, f64)> = BTreeMap::new();
+        let mut series_latest: BTreeMap<String, (String, i64, f64)> = BTreeMap::new();
         if let Some(samples) = metrics.samples.get(name) {
             for s in samples {
                 if s.value.is_nan() {
@@ -581,14 +581,20 @@ pub(super) fn phase_coverage(metrics: &crate::spiced_metrics::SpicedMetrics) -> 
                 let mut fp: Vec<String> =
                     s.labels.iter().map(|(k, v)| format!("{k}={v}")).collect();
                 fp.sort();
-                let e = series_max.entry(fp.join(",")).or_insert((g, f64::MIN));
-                if s.value > e.1 {
-                    e.1 = s.value;
+                let ts = s.ts_ms;
+                let e = series_latest
+                    .entry(fp.join(","))
+                    .or_insert((g.clone(), ts, s.value));
+                // Prefer the most recent scrape timestamp; fall back to max when timestamps are absent.
+                if (ts != 0 && ts >= e.1) || (ts == 0 && s.value > e.2) {
+                    e.0 = g;
+                    e.1 = ts;
+                    e.2 = s.value;
                 }
             }
         }
         let mut out: BTreeMap<String, f64> = BTreeMap::new();
-        for (_, (g, v)) in series_max {
+        for (_, (g, _ts, v)) in series_latest {
             if v.is_finite() {
                 *out.entry(g).or_insert(0.0) += v;
             }

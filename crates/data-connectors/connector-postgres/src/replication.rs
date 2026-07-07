@@ -392,6 +392,7 @@ const METRICS: &[MetricSpec] = &[
          replication_reconnects_total it quantifies the DURATION cost of a reconnect \
          storm — no changes are delivered and lag grows while disconnected.",
     )
+    .unit("ms")
     .auto_register(),
     MetricSpec::new(
         "replication_member_send_stalled_seconds_total",
