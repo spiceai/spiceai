@@ -18,7 +18,7 @@ limitations under the License.
 //!
 //! Outbound control-plane client that lets a standalone `spiced` runtime be
 //! discovered and managed by Spice Cloud (or any compatible control plane)
-//! using a adoption flow:
+//! using an adoption flow:
 //!
 //! 1. Admin in Spice Cloud generates a single-use adoption code.
 //! 2. User runs `spice connect <code>` (or sets `SPICE_ADOPT_CODE`).

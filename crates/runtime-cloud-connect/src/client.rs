@@ -122,21 +122,26 @@ impl ClientDriver {
             let (identifier, credential) = self.next_credential();
 
             if credential.is_empty() {
-                tracing::warn!(
-                    "Cloud Connect: no credentials available; sleeping {} before retry",
-                    humanize(backoff)
+                // No stored identity (or it expired) and no adoption code.
+                // next_credential() reads only in-memory state, so it can never
+                // yield a credential without a restart — retrying is futile.
+                // Exit the driver (spiced keeps serving local traffic) and tell
+                // the user how to re-adopt, mirroring the Forget path.
+                tracing::error!(
+                    "Cloud Connect: no credentials available (identity absent or expired, and no adoption code); exiting cloud-connect. Run `spice connect <code>` and restart spiced to re-adopt."
                 );
-            } else {
-                tracing::debug!(
-                    "Cloud Connect: attempting connect to {} (identifier={})",
-                    self.config.endpoint,
-                    if identifier.is_empty() {
-                        "<pending>"
-                    } else {
-                        identifier.as_str()
-                    },
-                );
+                return Ok(());
             }
+
+            tracing::debug!(
+                "Cloud Connect: attempting connect to {} (identifier={})",
+                self.config.endpoint,
+                if identifier.is_empty() {
+                    "<pending>"
+                } else {
+                    identifier.as_str()
+                },
+            );
 
             match self.connect_and_run(identifier, credential).await {
                 Ok(ExitReason::Shutdown) => return Ok(()),

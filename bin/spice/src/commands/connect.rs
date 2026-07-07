@@ -285,7 +285,10 @@ fn forget_identity() -> Result<()> {
             }
         })?;
     }
-    if had_pending && let Err(e) = std::fs::remove_file(&pending_path) {
+    if had_pending
+        && let Err(e) = std::fs::remove_file(&pending_path)
+        && e.kind() != std::io::ErrorKind::NotFound
+    {
         return Err(crate::error::Error::CloudConnectIo {
             message: format!("remove pending code: {e}"),
         });
