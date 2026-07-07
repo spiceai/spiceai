@@ -50,6 +50,13 @@ fn dataset_schema() -> SchemaRef {
     ]))
 }
 
+fn big_schema() -> SchemaRef {
+    Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int32, false),
+        Field::new("blob", DataType::Utf8, true),
+    ]))
+}
+
 fn params_for(port: u16, slot_name: &str, publication_name: &str) -> ReplicationParams {
     ReplicationParams {
         host: "localhost".into(),
@@ -89,6 +96,28 @@ async fn setup_source_table(port: u16) -> Result<tokio_postgres::Client, anyhow:
     client.simple_query("TRUNCATE public.repl_users").await?;
     client
         .simple_query("INSERT INTO public.repl_users VALUES (1, 'Alice'), (2, 'Bob')")
+        .await?;
+    Ok(client)
+}
+
+async fn setup_big_table(port: u16) -> Result<tokio_postgres::Client, anyhow::Error> {
+    let mut cfg = tokio_postgres::Config::new();
+    cfg.host("localhost")
+        .port(port)
+        .user("postgres")
+        .password(common::PG_PASSWORD)
+        .dbname("postgres");
+    let (client, connection) = cfg.connect(NoTls).await?;
+    tokio::spawn(async move {
+        let _: Result<(), tokio_postgres::Error> = connection.await;
+    });
+    client
+        .simple_query("CREATE TABLE IF NOT EXISTS public.repl_big (id int PRIMARY KEY, blob text)")
+        .await?;
+    client.simple_query("TRUNCATE public.repl_big").await?;
+    // Seed one small row so the bootstrap has content and marks the dataset ready.
+    client
+        .simple_query("INSERT INTO public.repl_big VALUES (0, 'seed')")
         .await?;
     Ok(client)
 }
@@ -227,6 +256,138 @@ async fn bootstrap_then_stream_changes() -> Result<(), anyhow::Error> {
     );
     assert!(is_ready, "forced resume snapshot must mark dataset ready");
     committer.commit().await?;
+
+    Ok(())
+}
+
+/// End-to-end regression for the incremental zero-copy `FrameReader` read path
+/// (the streaming reader in the vendored `pgwire-replication` fork), driven
+/// against a real Postgres:
+///
+/// 1. **Large value** — a single ~4 MiB row produces one WAL `XLogData` message
+///    far larger than a socket read / TCP segment, so `FrameReader` must
+///    assemble the frame across many `read_buf` calls (its incremental,
+///    geometrically-growing buffer path). We assert the value round-trips with
+///    exact length and content — a framing off-by-one would corrupt it.
+/// 2. **Burst** — 1000 rows in a single transaction arrive as many frames
+///    buffered together, exercising the tight drain loop
+///    (`has_buffered_frame` + `next`). We assert every row id arrives exactly
+///    once.
+#[tokio::test(flavor = "multi_thread")]
+async fn large_value_and_burst_replicate_intact() -> Result<(), anyhow::Error> {
+    // Declared before any statements to satisfy clippy::items_after_statements.
+    const BIG_LEN: usize = 4 * 1024 * 1024;
+    const FIRST_ID: i32 = 1000;
+    const LAST_ID: i32 = 1999;
+    const BURST_ROWS: usize = 1000; // LAST_ID - FIRST_ID + 1
+
+    let _tracing = init_tracing(Some("data_components::postgres_replication=debug,info"));
+
+    let port = common::get_random_port()?;
+    let _container = common::start_postgres_docker_container_with_logical_wal(port).await?;
+    let port_u16 = u16::try_from(port).expect("port fits in u16");
+    let source = setup_big_table(port_u16).await?;
+
+    let params = params_for(port_u16, "spice_itest_slot_big", "spice_itest_pub_big");
+    let input = ReplicationStreamInput {
+        dataset_name: "repl_big".into(),
+        params,
+        schema: big_schema(),
+        primary_keys: vec!["id".into()],
+        schema_name: "public".into(),
+        table_name: "repl_big".into(),
+        metrics: ReplicationMetricsCollector::new(),
+    };
+    let mut stream = start_replication_stream(input);
+
+    // Bootstrap: the seed row marks the dataset ready.
+    let envelope = tokio::time::timeout(Duration::from_secs(30), stream.next())
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("bootstrap envelope missing"))??;
+    let (committer, change_batch, is_ready) = envelope.into_parts();
+    assert_eq!(change_batch.record.num_rows(), 1);
+    assert!(is_ready, "bootstrap must mark dataset ready");
+    committer.commit().await?;
+
+    // --- 1. Large value (~4 MiB): spans many socket reads, so the FrameReader
+    // assembles one frame incrementally instead of in a single read. ---
+    source
+        .simple_query(&format!(
+            "INSERT INTO public.repl_big VALUES (1, repeat('A', {BIG_LEN}))"
+        ))
+        .await?;
+
+    let envelope = tokio::time::timeout(Duration::from_secs(30), stream.next())
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("large-value envelope missing"))??;
+    let (committer, change_batch, _) = envelope.into_parts();
+    assert_eq!(change_batch.record.num_rows(), 1);
+    let data_struct = change_batch
+        .record
+        .column_by_name("data")
+        .expect("data")
+        .as_struct();
+    let blob_col = data_struct
+        .column_by_name("blob")
+        .expect("blob")
+        .as_string::<i32>();
+    let received = blob_col.value(0);
+    assert_eq!(
+        received.len(),
+        BIG_LEN,
+        "large value must round-trip with exact length"
+    );
+    assert!(
+        received.bytes().all(|b| b == b'A'),
+        "large value content must be intact"
+    );
+    committer.commit().await?;
+
+    // --- 2. Burst: 1000 rows in one transaction => many frames buffered
+    // together, exercising the tight drain loop. ---
+    source
+        .simple_query(&format!(
+            "INSERT INTO public.repl_big SELECT g, 'x' FROM generate_series({FIRST_ID}, {LAST_ID}) g"
+        ))
+        .await?;
+
+    let mut seen = std::collections::BTreeSet::new();
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    while seen.len() < BURST_ROWS {
+        let remaining = deadline
+            .checked_duration_since(std::time::Instant::now())
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "timed out collecting burst; got {} of {BURST_ROWS}",
+                    seen.len()
+                )
+            })?;
+        let envelope = tokio::time::timeout(remaining, stream.next())
+            .await?
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "burst stream ended early; got {} of {BURST_ROWS}",
+                    seen.len()
+                )
+            })??;
+        let (committer, change_batch, _) = envelope.into_parts();
+        let data_struct = change_batch
+            .record
+            .column_by_name("data")
+            .expect("data")
+            .as_struct();
+        let ids = data_struct
+            .column_by_name("id")
+            .expect("id")
+            .as_primitive::<arrow::datatypes::Int32Type>();
+        for i in 0..change_batch.record.num_rows() {
+            seen.insert(ids.value(i));
+        }
+        committer.commit().await?;
+    }
+    assert_eq!(seen.len(), BURST_ROWS, "all burst rows must arrive");
+    assert_eq!(*seen.iter().next().expect("min id"), FIRST_ID);
+    assert_eq!(*seen.iter().next_back().expect("max id"), LAST_ID);
 
     Ok(())
 }
