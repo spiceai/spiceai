@@ -284,7 +284,9 @@ impl SqliteAccelerator {
             .unwrap_or_default();
         params.insert("data_directory".to_string(), spice_data_base_path());
 
-        self.sqlite_factory.sqlite_file_path("accelerated", &params).ok()
+        self.sqlite_factory
+            .sqlite_file_path("accelerated", &params)
+            .ok()
     }
 }
 
