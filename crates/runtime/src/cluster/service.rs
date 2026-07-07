@@ -688,87 +688,49 @@ impl ClusterService for ClusterServiceImpl {
 
         let partition_store = self.executor_registry().accelerations_partition_store();
         let app_guard = self.app.read().await;
-        let mut total_assigned: usize = 0;
         if let Some(app) = app_guard.as_ref() {
-            let max_partitions_per_executor = app.runtime.scheduler.as_ref().map_or(
-                runtime::default_max_partitions_per_executor(),
-                |scheduler| scheduler.max_partitions_per_executor,
-            );
-
-            // Fair-share divisor: peers register their control stream before calling
-            // this RPC, so the connected count already reflects executors that will
-            // pull shortly. Each table is capped at its fair slice so the first caller
-            // can't greedily claim every partition; the balancer mops up any remainder.
-            let connected_executors = self
-                .executor_registry()
-                .connected_executor_count()
-                .await
-                .max(1);
-
-            // Find accelerated datasets with partitioning
+            // Partition assignment is driven solely by the scheduler's periodic
+            // partition-assignment cycle, which fairly distributes partitions
+            // across all connected executors and pushes them over the control
+            // stream (`notify_executor_of_assignments`). This RPC no longer
+            // allocates — it only returns partitions *already assigned* to this
+            // executor so a reconnecting or failed-over executor recovers its
+            // existing assignments. On a cold start this is empty; the first
+            // assignment cycle assigns and pushes shortly after.
             for table_ref in super::partition::accelerated_tables(app).keys() {
-                if total_assigned >= max_partitions_per_executor {
-                    tracing::debug!(
-                        "Executor {executor_id} reached max_partitions_per_executor ({max_partitions_per_executor}) during initial allocation, skipping remaining tables"
-                    );
-                    break;
-                }
-                let remaining = max_partitions_per_executor.saturating_sub(total_assigned);
-
                 let Some(metadata) = partition_store.get_cached_table_metadata(table_ref) else {
-                    tracing::info!(
-                        "No cached partition metadata for table {table_ref}. Scheduler likely has not finished discovering partitions for the table. Will not assign in initial allocation, but will get assigned on future assignments"
-                    );
                     continue;
                 };
-                let limit = super::partition::fair_share_limit(
-                    metadata.partitions.len(),
-                    connected_executors,
-                    remaining,
-                );
-                match partition_store
-                    .allocate_partitions(table_ref, executor_id, limit)
+                let mut items = Vec::new();
+                for partition in &metadata.partitions {
+                    if !partition.is_assigned_to(executor_id) {
+                        continue;
+                    }
+                    match partition_value_to_bytes(
+                        partition.partition_value.clone(),
+                        table_ref,
+                        self.datafusion.as_ref(),
+                    )
                     .await
-                {
-                    Ok(result) => {
-                        let newly_assigned = result.newly_assigned.len();
-                        let partitions = result.all_assigned();
-                        if partitions.is_empty() {
-                            continue;
+                    {
+                        Ok(bytes) => items.push(bytes.to_vec()),
+                        Err(e) => {
+                            // The readiness gate above should make this path
+                            // unreachable for the dataset-not-ready case.
+                            // Anything that lands here is a real bug (corrupt
+                            // expression, etc.) — fail loud rather than silently
+                            // dropping the partition.
+                            tracing::error!(
+                                "Failed to serialize partition expression for table {table_ref}: {e}"
+                            );
+                            return Err(Status::internal(format!(
+                                "Failed to serialize partition expression for table {table_ref}: {e}"
+                            )));
                         }
-                        let mut items = Vec::with_capacity(partitions.len());
-                        for partition in &partitions {
-                            match partition_value_to_bytes(
-                                partition.clone(),
-                                table_ref,
-                                self.datafusion.as_ref(),
-                            )
-                            .await
-                            {
-                                Ok(bytes) => items.push(bytes.to_vec()),
-                                Err(e) => {
-                                    // The readiness gate above should make this
-                                    // path unreachable for the dataset-not-ready
-                                    // case. Anything that lands here is a real
-                                    // bug (corrupt expression, etc.) — fail loud
-                                    // rather than silently dropping the partition.
-                                    tracing::error!(
-                                        "Failed to serialize partition expression for table {table_ref}: {e}"
-                                    );
-                                    return Err(Status::internal(format!(
-                                        "Failed to serialize partition expression for table {table_ref}: {e}"
-                                    )));
-                                }
-                            }
-                        }
-                        total_assigned += newly_assigned;
-                        table_partitions.insert(table_ref.to_string(), BytesArray { items });
                     }
-                    Err(e) => {
-                        tracing::error!(
-                            "Failed to allocate partitions for table {table_ref} to executor {executor_id}: {e}",
-                        );
-                    }
+                }
+                if !items.is_empty() {
+                    table_partitions.insert(table_ref.to_string(), BytesArray { items });
                 }
             }
         }

@@ -108,7 +108,19 @@ impl PartitionAssignmentTask {
             }
         }
 
-        let mut interval = tokio::time::interval(self.interval);
+        // Defer the *first* assignment cycle by one full interval so executors
+        // have a window to connect before the scheduler distributes partitions.
+        // Assignment is scheduler-controlled (executors no longer allocate on
+        // connect via `allocate_initial_partitions`), so an executor that joins
+        // late — but within this window — is included in the initial fair
+        // distribution rather than being starved by peers that connected first.
+        // `tokio::time::interval` otherwise fires its first tick immediately.
+        tracing::info!(
+            delay_ms = self.interval.as_millis(),
+            "Deferring first partition assignment cycle to let executors connect"
+        );
+        let start = tokio::time::Instant::now() + self.interval;
+        let mut interval = tokio::time::interval_at(start, self.interval);
         interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
         loop {
