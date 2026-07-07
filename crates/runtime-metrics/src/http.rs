@@ -1,5 +1,5 @@
 /*
-Copyright 2024-2025 The Spice.ai OSS Authors
+Copyright 2024-2026 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -26,21 +26,21 @@ use telemetry::DURATION_MS_HISTOGRAM_BUCKETS;
 static METER: LazyLock<Meter> = LazyLock::new(|| global::meter("http"));
 
 /// Deprecated, to be removed in the future
-pub(crate) static REQUESTS_TOTAL: LazyLock<Counter<u64>> = LazyLock::new(|| {
+pub static REQUESTS_TOTAL: LazyLock<Counter<u64>> = LazyLock::new(|| {
     METER
         .u64_counter("http_requests_total")
         .with_description("Number of HTTP requests. Deprecated, use http_requests instead.")
         .build()
 });
 
-pub(crate) static REQUESTS: LazyLock<Counter<u64>> = LazyLock::new(|| {
+pub static REQUESTS: LazyLock<Counter<u64>> = LazyLock::new(|| {
     METER
         .u64_counter("http_requests")
         .with_description("Number of HTTP requests.")
         .build()
 });
 
-pub(crate) static REQUESTS_DURATION_MS: LazyLock<Histogram<f64>> = LazyLock::new(|| {
+pub static REQUESTS_DURATION_MS: LazyLock<Histogram<f64>> = LazyLock::new(|| {
     METER
         .f64_histogram("http_requests_duration_ms")
         .with_unit("ms")

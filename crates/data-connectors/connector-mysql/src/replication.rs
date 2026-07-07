@@ -40,7 +40,7 @@ use futures::StreamExt;
 use mysql_async::{Opts, OptsBuilder, SslOpts};
 use opentelemetry::KeyValue;
 use runtime::component::dataset::Dataset;
-use runtime::component::metrics::{MetricSpec, MetricType, ObserveMetricCallback};
+use runtime_metrics::component::{MetricSpec, MetricType, ObserveMetricCallback};
 use runtime::dataaccelerator::spice_sys::{
     OpenOption,
     mysql_binlog::{MySqlBinlogCheckpoint, MySqlBinlogSys},

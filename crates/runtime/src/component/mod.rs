@@ -14,8 +14,6 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::fmt::Display;
-
 use datafusion::sql::sqlparser::{
     dialect::{Dialect, GenericDialect},
     tokenizer::{Token, Tokenizer},
@@ -39,33 +37,7 @@ pub mod access;
 pub mod catalog;
 pub mod column;
 pub mod dataset;
-pub mod metrics;
 pub mod view;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum ComponentType {
-    Dataset,
-    DatasetAccelerator,
-    Catalog,
-    Model,
-    Embedding,
-    Tool,
-    View,
-}
-
-impl Display for ComponentType {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            ComponentType::Dataset => write!(f, "dataset"),
-            ComponentType::DatasetAccelerator => write!(f, "dataset_accelerator"),
-            ComponentType::Catalog => write!(f, "catalog"),
-            ComponentType::Model => write!(f, "model"),
-            ComponentType::Embedding => write!(f, "embedding"),
-            ComponentType::Tool => write!(f, "tool"),
-            ComponentType::View => write!(f, "view"),
-        }
-    }
-}
 
 /// Validates an identifier to ensure it represents a valid component name.
 ///

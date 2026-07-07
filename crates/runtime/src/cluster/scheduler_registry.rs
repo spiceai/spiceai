@@ -40,7 +40,7 @@ use crate::cluster::cluster_state::{
 };
 use crate::cluster::heartbeat::{self, CLOCK_SKEW_TOLERANCE_MS, SchedulerHeartbeatStore};
 use crate::cluster::reaper::Reaper;
-use crate::metrics::cluster as cluster_metrics;
+use runtime_metrics::cluster as cluster_metrics;
 
 const DEFAULT_TTL_MS: u64 = 30_000;
 const DISCOVERY_INTERVAL: Duration = Duration::from_secs(5);
