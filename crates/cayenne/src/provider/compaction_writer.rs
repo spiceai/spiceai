@@ -63,19 +63,28 @@ limitations under the License.
 //! `ftruncate` the final partial block — so true `O_DIRECT` works for any part
 //! size with no Vortex-emission change.
 //!
+//! # When it is installed (storage-tier gated)
+//!
+//! Installed automatically for compaction output on the **network-attached
+//! block-storage tier** (`StorageClass::Ebs` — AWS EBS, Azure managed disks; see
+//! [`use_direct_writer_for`]), where bypassing the page cache pays off. NOT
+//! installed on local SSD/NVMe (**including AWS EC2 `NVMe` instance storage**,
+//! which the detector classifies `LocalSsd`, not `Ebs`), tmpfs, undetected
+//! storage, or S3 — a memory-capped HTAP A/B showed `O_DIRECT` is a net loss on
+//! local, where the buffered `LocalFileSystem` writer plus the Tier-1 `fadvise`
+//! eviction already win. The tier is detected at registration and overridable
+//! via the `storage` acceleration param, so there is no separate env/bool knob.
+//!
 //! # Safety posture
 //!
-//! Default OFF (env-gated). Linux + local-FS + compaction-output only; S3 is
-//! untouched. Atomic semantics mirror `LocalFileSystem`: write to a same-dir
-//! staging file, fsync contents (new — closes the long-standing local-FS
-//! content-durability gap), rename into place, then fsync the parent dir. An
-//! `O_DIRECT` open that the filesystem rejects (`EINVAL` on tmpfs/overlay)
-//! transparently falls back to buffered. On macOS (the dev tier) the direct knob
-//! maps to `F_NOCACHE` + `F_PREALLOCATE` — uncached, preallocated I/O without
-//! `O_DIRECT`'s alignment demands — so the module is exercised locally instead of
-//! being a buffered no-op; the p99 target remains Linux/EBS. Other
-//! non-Linux/non-macOS targets compile to a buffered fallback. **Gated off
-//! pending an HTAP validation run before it is enabled.**
+//! Linux + local-FS + compaction-output only; S3 is untouched. Atomic semantics
+//! mirror `LocalFileSystem`: write to a same-dir staging file, fsync contents
+//! (new — closes the long-standing local-FS content-durability gap), rename into
+//! place, then fsync the parent dir. An `O_DIRECT` open that the filesystem
+//! rejects (`EINVAL` on tmpfs/overlay) transparently falls back to buffered. On
+//! macOS the direct knob maps to `F_NOCACHE` + `F_PREALLOCATE` — uncached,
+//! preallocated I/O without `O_DIRECT`'s alignment demands. Other
+//! non-Linux/non-macOS targets compile to a buffered fallback.
 //!
 //! # Completing the write levers
 //!
@@ -102,6 +111,9 @@ use object_store::{
     PutMultipartOptions, PutOptions, PutPayload, PutResult,
 };
 
+use crate::metadata::StorageClass;
+use crate::provider::delta_encoding::WriteClass;
+
 /// The `MultipartUpload::put_part` return type (`object_store`'s `UploadPart`
 /// alias), written explicitly to avoid depending on its crate-root re-export.
 type UploadPart = futures::future::BoxFuture<'static, object_store::Result<()>>;
@@ -125,15 +137,13 @@ const FALLOC_CHUNK: u64 = 64 << 20; // 64 MiB
 /// grow on demand in `FALLOC_CHUNK` steps.
 const MAX_UPFRONT_PREALLOC: u64 = 1 << 30; // 1 GiB
 
-/// Runtime configuration, parsed once from the environment. All knobs default
-/// OFF; `enabled()` gates whether the wrapper is installed at all.
+/// Fixed configuration for the custom compaction-output writer. The writer is
+/// installed automatically by storage tier (see [`use_direct_writer_for`]) rather
+/// than a knob; when installed it always uses `O_DIRECT` + `fallocate` +
+/// `bytes_per_sync` rate-smoothing + a final content fsync — the combination the
+/// module is designed around for the network-attached (EBS) tier.
 #[derive(Debug, Clone, Copy)]
-#[expect(
-    clippy::struct_excessive_bools,
-    reason = "independent on/off compaction-writer knobs parsed from the environment; plain bools read more clearly here than two-variant enums"
-)]
 pub(crate) struct CompactionWriterConfig {
-    enabled: bool,
     direct_io: bool,
     fallocate: bool,
     bytes_per_sync: u64,
@@ -141,37 +151,46 @@ pub(crate) struct CompactionWriterConfig {
 }
 
 impl CompactionWriterConfig {
-    /// Parse the gate from the environment (cached by the caller). Master switch
-    /// is `CAYENNE_COMPACTION_DIRECT_WRITER`; everything else only applies when
-    /// that is on.
-    pub(crate) fn from_env() -> Self {
-        let truthy = |key: &str, default: bool| {
-            std::env::var(key).map_or(default, |v| matches!(v.as_str(), "1" | "true" | "TRUE"))
-        };
-        let enabled = truthy("CAYENNE_COMPACTION_DIRECT_WRITER", false);
+    /// The configuration installed on the network-attached block-storage
+    /// (EBS/Azure managed disks) tier: bypass the page cache (`O_DIRECT`),
+    /// preallocate the output (`fallocate`), rate-smooth writeback
+    /// (`bytes_per_sync`), and fsync contents before the publishing rename.
+    pub(crate) fn for_ebs_tier() -> Self {
         Self {
-            enabled,
-            direct_io: truthy("CAYENNE_COMPACTION_O_DIRECT", false),
-            fallocate: truthy("CAYENNE_COMPACTION_FALLOCATE", true),
-            bytes_per_sync: std::env::var("CAYENNE_COMPACTION_BYTES_PER_SYNC")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(8 << 20), // 8 MiB
-            final_fsync: truthy("CAYENNE_COMPACTION_FINAL_FSYNC", true),
+            direct_io: true,
+            fallocate: true,
+            bytes_per_sync: 8 << 20, // 8 MiB
+            final_fsync: true,
         }
-    }
-
-    /// Whether the custom writer should be installed for compaction-output writes
-    /// at all. When false, callers leave the default `LocalFileSystem` in place.
-    pub(crate) fn enabled(self) -> bool {
-        self.enabled
     }
 }
 
-/// The process-wide compaction-writer gate, parsed from the environment once.
-pub(crate) fn config() -> CompactionWriterConfig {
-    static CFG: std::sync::OnceLock<CompactionWriterConfig> = std::sync::OnceLock::new();
-    *CFG.get_or_init(CompactionWriterConfig::from_env)
+/// Whether compaction OUTPUT for a table should be routed through the custom
+/// `O_DIRECT` writer, decided by the detected storage tier. Installed ONLY on the
+/// network-attached block-storage tier ([`StorageClass::Ebs`] — AWS EBS, Azure
+/// managed disks), where bypassing the page cache pays off. Deliberately NOT
+/// installed on:
+/// - [`StorageClass::LocalSsd`] — local SSD/NVMe, **including AWS EC2 `NVMe`
+///   instance storage** (the detector maps that to `LocalSsd`, not `Ebs`): a
+///   memory-capped HTAP A/B showed `O_DIRECT` is a net loss there, where the
+///   buffered `LocalFileSystem` writer + the Tier-1 `fadvise` eviction already
+///   win;
+/// - [`StorageClass::Tmpfs`] — RAM-backed; no device to bypass;
+/// - [`StorageClass::Unknown`] — no positive evidence of the networked tier, so
+///   keep the safe buffered default (never enable on a guess);
+/// - S3 paths — object store, no page cache, its own writer.
+///
+/// The tier is auto-detected at registration (overridable via the `storage`
+/// acceleration param), so this is non-optional — there is no separate env/bool
+/// knob. `Maintenance`-class (compaction) writes on a local filesystem only.
+pub(crate) fn use_direct_writer_for(
+    storage_class: StorageClass,
+    write_class: WriteClass,
+    table_path: &str,
+) -> bool {
+    matches!(storage_class, StorageClass::Ebs)
+        && matches!(write_class, WriteClass::Maintenance)
+        && !table_path.starts_with("s3://")
 }
 
 /// A [`object_store::ObjectStore`] that delegates everything to `inner` (the real
@@ -933,7 +952,7 @@ fn sync_file_range_write(_file: &std::fs::File, _offset: u64, _len: u64) -> std:
 
 /// Drop the finished output's page-cache footprint using the fd we already hold
 /// (no re-open). Linux: flush any dirty buffered pages so `DONTNEED` can drop
-/// them (a no-op after `sync_all`, or under O_DIRECT where ~none were resident),
+/// them (a no-op after `sync_all`, or under `O_DIRECT` where ~none were resident),
 /// then `POSIX_FADV_DONTNEED`. Best-effort — every failure is ignored, since a
 /// cache hint must never fail a compaction.
 #[cfg(target_os = "linux")]
@@ -1011,12 +1030,57 @@ mod tests {
 
     fn cfg(direct: bool) -> CompactionWriterConfig {
         CompactionWriterConfig {
-            enabled: true,
             direct_io: direct,
             fallocate: true,
             bytes_per_sync: 1 << 16, // exercise the rate-smoothing branch
             final_fsync: true,
         }
+    }
+
+    /// The storage-tier gate installs the `O_DIRECT` writer ONLY on the
+    /// network-attached block-storage tier (`Ebs`) for local-FS compaction —
+    /// never on local SSD/NVMe (incl. AWS EC2 `NVMe` instance storage → `LocalSsd`),
+    /// tmpfs, undetected storage, non-`Maintenance` writes, or S3.
+    #[test]
+    fn direct_writer_gated_to_ebs_tier_only() {
+        let local = "/data/cayenne/table";
+        // Network block storage + compaction + local FS → installed.
+        assert!(use_direct_writer_for(
+            StorageClass::Ebs,
+            WriteClass::Maintenance,
+            local
+        ));
+        // Local SSD/NVMe — INCLUDING AWS EC2 `NVMe` instance storage (classified
+        // LocalSsd) — must NOT engage O_DIRECT.
+        assert!(!use_direct_writer_for(
+            StorageClass::LocalSsd,
+            WriteClass::Maintenance,
+            local
+        ));
+        // tmpfs (RAM) and undetected storage: never enable without positive
+        // evidence of the networked tier.
+        assert!(!use_direct_writer_for(
+            StorageClass::Tmpfs,
+            WriteClass::Maintenance,
+            local
+        ));
+        assert!(!use_direct_writer_for(
+            StorageClass::Unknown,
+            WriteClass::Maintenance,
+            local
+        ));
+        // EBS but an S3 object-store path → not installed (no page cache).
+        assert!(!use_direct_writer_for(
+            StorageClass::Ebs,
+            WriteClass::Maintenance,
+            "s3://bucket/table"
+        ));
+        // EBS + a non-Maintenance (delta/append) write → not installed.
+        assert!(!use_direct_writer_for(
+            StorageClass::Ebs,
+            WriteClass::Delta,
+            local
+        ));
     }
 
     #[expect(

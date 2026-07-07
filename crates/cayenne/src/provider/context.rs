@@ -26,7 +26,9 @@ use vortex_datafusion::{ProjectionPushdown, VortexFormat, VortexTableOptions, Wr
 use vortex_session::VortexSession;
 
 use super::tuning::{self, ActuatorValues, IngestStats, LiveActuators, TuningBounds};
-use crate::metadata::{DeletionMode, DeltaEncoding, PkConflictDetection, VortexConfig};
+use crate::metadata::{
+    DeletionMode, DeltaEncoding, PkConflictDetection, StorageClass, VortexConfig,
+};
 
 /// Shared context for Cayenne table operations.
 ///
@@ -724,6 +726,15 @@ impl CayenneContext {
     /// query-side goal signals (p99 latency, QPH) — the wall clock and the
     /// query-observations handle live here, keeping `IngestStats::snapshot` and
     /// `decide` clock-free/pure. For observability/logging and the control step.
+    /// The detected storage medium backing this table's data files (from the
+    /// runtime's acceleration-storage detection at registration, or the operator's
+    /// `storage` param). A cheap field read — the compaction writer's tier gate
+    /// uses it without building a full [`Self::ingest_snapshot`].
+    #[must_use]
+    pub(crate) fn data_storage_class(&self) -> StorageClass {
+        self.config.data_storage_class
+    }
+
     #[must_use]
     pub(crate) fn ingest_snapshot(&self) -> tuning::IngestSnapshot {
         let mut snap = self.ingest_stats.snapshot();
