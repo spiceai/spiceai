@@ -10,7 +10,3 @@ expression: replace_s3_vector_index_names(&formatted)
 |    | - \( F(3) = 4(3) = \boxed{12} \)                                   |        |
 |    | - \( F(-4) = 4(-4) = \boxed{-16} \)                                |        |
 |    | - \( F(0) = 4(0) = \boxed{0} \)                                    |        |
-| 3  | (Problem 12):**                                                    | 0.311  |
-|    | If \(p = \sqrt{d}\), then squaring both sides gives \(d = p^2\).   |        |
-|    | Thus, \(d = \boxed{p^2}\).                                         |        |
-+----+--------------------------------------------------------------------+--------+
