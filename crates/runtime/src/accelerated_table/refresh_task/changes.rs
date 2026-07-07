@@ -187,7 +187,7 @@ fn change_batch_requires_durable_cdc_path(
         match ChangeOperationType::from_operation(&change_batch.op(row)) {
             ChangeOperationType::Truncate | ChangeOperationType::Unknown => true,
             ChangeOperationType::Delete => {
-                !sink_absorbs_in_memory_deletes || change_batch.primary_keys(row).is_empty()
+                !sink_absorbs_in_memory_deletes || !change_batch.has_primary_keys(row)
             }
             ChangeOperationType::Upsert => false,
         }
@@ -2439,7 +2439,7 @@ impl RefreshTask {
         // a mixed keyed+keyless burst is not over-counted as keys.
         let keyed_count = row_indices
             .iter()
-            .filter(|&&row| !change_batch.primary_keys(row).is_empty())
+            .filter(|&&row| change_batch.has_primary_keys(row))
             .count();
         metrics::CDC_KEYS_PER_DELETE_BURST.record(
             u64::try_from(keyed_count).unwrap_or(u64::MAX),
@@ -2467,7 +2467,7 @@ impl RefreshTask {
             }
             if !row_indices
                 .iter()
-                .all(|&row| !change_batch.primary_keys(row).is_empty())
+                .all(|&row| change_batch.has_primary_keys(row))
             {
                 break 'absorb "inextractable_keys";
             }
@@ -2511,7 +2511,7 @@ impl RefreshTask {
         let (keyless_rows, keyed_rows): (Vec<_>, Vec<_>) = row_indices
             .iter()
             .copied()
-            .partition(|row| change_batch.primary_keys(*row).is_empty());
+            .partition(|row| !change_batch.has_primary_keys(*row));
 
         let mut wrote = false;
         let _lock_guard = self.accelerator_write_mutex.lock().await;
@@ -5366,6 +5366,25 @@ mod tests {
         ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
             self.delete_plan_calls.fetch_add(1, AtomicOrdering::SeqCst);
             self.inner.delete_from(state, filters).await
+        }
+
+        // Forward the behaviorally-meaningful optional methods to `inner` so the
+        // wrapper mirrors the wrapped provider rather than silently reverting to
+        // trait defaults (the wrapper-delegation footgun — statistics in
+        // particular changes planning).
+        fn constraints(&self) -> Option<&datafusion::common::Constraints> {
+            self.inner.constraints()
+        }
+
+        fn supports_filters_pushdown(
+            &self,
+            filters: &[&Expr],
+        ) -> DataFusionResult<Vec<datafusion::logical_expr::TableProviderFilterPushDown>> {
+            self.inner.supports_filters_pushdown(filters)
+        }
+
+        fn statistics(&self) -> Option<datafusion::common::Statistics> {
+            self.inner.statistics()
         }
     }
 

@@ -231,8 +231,7 @@ fn bench_delete_burst(c: &mut Criterion) {
                         // Untimed: fresh table populated with N inline rows +
                         // the delete task/stream to time.
                         rt.block_on(async {
-                            let name =
-                                format!("bench_{mode}_{n}_{}", uuid::Uuid::now_v7());
+                            let name = format!("bench_{mode}_{n}_{}", uuid::Uuid::now_v7());
                             let fixture = make_cayenne_fixture(&name).await;
                             let populate = make_task(&fixture.table, None);
                             apply_stream(
