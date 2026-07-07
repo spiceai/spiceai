@@ -819,12 +819,14 @@ pub(super) async fn write_metrics_dump(
     // so it happens here; the heavy JSON encode + filesystem write are moved to a
     // blocking thread so the ~34 MB serialize/write can't stall the async runtime
     // (diagnostics/shutdown tasks) — repo guidance forbids blocking in async paths.
-    let reduced = metrics.map(|m| reduce_samples_for_dump(&m.samples));
-    let dump = serde_json::json!({
-        "run": run,
-        "samples": reduced,
-        "pg_stats": pg_stats,
-    });
+let reduced = metrics
+    .map(|m| reduce_samples_for_dump(&m.samples))
+    .unwrap_or_default();
+let dump = serde_json::json!({
+    "run": run,
+    "samples": reduced,
+    "pg_stats": pg_stats,
+});
     let path = path.to_path_buf();
     tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
         if let Some(parent) = path.parent()
