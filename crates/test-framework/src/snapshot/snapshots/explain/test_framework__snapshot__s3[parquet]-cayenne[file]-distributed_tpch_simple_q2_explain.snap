@@ -1,0 +1,58 @@
+---
+source: crates/test-framework/src/snapshot/mod.rs
+description: "Query: tpch_simple_q2"
+---
++---------------+---------------------------------------------------------------------------------------------------+
+| plan_type     | plan                                                                                              |
++---------------+---------------------------------------------------------------------------------------------------+
+| logical_plan  | SubqueryAlias: lineitem                                                                           |
+|               |   Union                                                                                           |
+|               |     Filter: lineitem.l_linenumber = (<subquery>)                                                  |
+|               |       Subquery:                                                                                   |
+|               |         Aggregate: groupBy=[[]], aggr=[[max(lineitem.l_linenumber)]]                              |
+|               |           SubqueryAlias: lineitem                                                                 |
+|               |             Union                                                                                 |
+|               |               TableScan: lineitem projection=[l_linenumber]                                       |
+|               |               TableScan: lineitem projection=[l_linenumber]                                       |
+|               |               TableScan: lineitem projection=[l_linenumber]                                       |
+|               |       TableScan: lineitem projection=[l_linenumber]                                               |
+|               |     Filter: lineitem.l_linenumber = (<subquery>)                                                  |
+|               |       Subquery:                                                                                   |
+|               |         Aggregate: groupBy=[[]], aggr=[[max(lineitem.l_linenumber)]]                              |
+|               |           SubqueryAlias: lineitem                                                                 |
+|               |             Union                                                                                 |
+|               |               TableScan: lineitem projection=[l_linenumber]                                       |
+|               |               TableScan: lineitem projection=[l_linenumber]                                       |
+|               |               TableScan: lineitem projection=[l_linenumber]                                       |
+|               |       TableScan: lineitem projection=[l_linenumber]                                               |
+|               |     Filter: lineitem.l_linenumber = (<subquery>)                                                  |
+|               |       Subquery:                                                                                   |
+|               |         Aggregate: groupBy=[[]], aggr=[[max(lineitem.l_linenumber)]]                              |
+|               |           SubqueryAlias: lineitem                                                                 |
+|               |             Union                                                                                 |
+|               |               TableScan: lineitem projection=[l_linenumber]                                       |
+|               |               TableScan: lineitem projection=[l_linenumber]                                       |
+|               |               TableScan: lineitem projection=[l_linenumber]                                       |
+|               |       TableScan: lineitem projection=[l_linenumber]                                               |
+| physical_plan | ScalarSubqueryExec: subqueries=1                                                                  |
+|               |   UnionExec                                                                                       |
+|               |     FilterExec: l_linenumber@0 = scalar_subquery(<pending>)                                       |
+|               |       RepartitionExec: partitioning=RoundRobinBatch(16), input_partitions=1                       |
+|               |         BytesProcessedExec                                                                        |
+|               |           FlightSqlExec sql=SELECT l_linenumber FROM lineitem                                     |
+|               |     FilterExec: l_linenumber@0 = scalar_subquery(<pending>)                                       |
+|               |       RepartitionExec: partitioning=RoundRobinBatch(16), input_partitions=1                       |
+|               |         BytesProcessedExec                                                                        |
+|               |           FlightSqlExec sql=SELECT l_linenumber FROM lineitem                                     |
+|               |     FilterExec: l_linenumber@0 = scalar_subquery(<pending>)                                       |
+|               |       RepartitionExec: partitioning=RoundRobinBatch(16), input_partitions=1                       |
+|               |         BytesProcessedExec                                                                        |
+|               |           FlightSqlExec sql=SELECT l_linenumber FROM lineitem                                     |
+|               |   AggregateExec: mode=Final, gby=[], aggr=[max(lineitem.l_linenumber)]                            |
+|               |     CoalescePartitionsExec                                                                        |
+|               |       UnionExec                                                                                   |
+|               |         PartialAggregationFlightSqlExec sql=SELECT MAX("l_linenumber") AS "__agg_0" FROM lineitem |
+|               |         PartialAggregationFlightSqlExec sql=SELECT MAX("l_linenumber") AS "__agg_0" FROM lineitem |
+|               |         PartialAggregationFlightSqlExec sql=SELECT MAX("l_linenumber") AS "__agg_0" FROM lineitem |
+|               |                                                                                                   |
++---------------+---------------------------------------------------------------------------------------------------+

@@ -1,0 +1,21 @@
+---
+source: crates/test-framework/src/snapshot/mod.rs
+description: "Query: tpch_simple_q1"
+---
++---------------+-----------------------------------------------------------------------------------------------+
+| plan_type     | plan                                                                                          |
++---------------+-----------------------------------------------------------------------------------------------+
+| logical_plan  | Aggregate: groupBy=[[]], aggr=[[max(lineitem.l_orderkey)]]                                    |
+|               |   SubqueryAlias: lineitem                                                                     |
+|               |     Union                                                                                     |
+|               |       TableScan: lineitem projection=[l_orderkey]                                             |
+|               |       TableScan: lineitem projection=[l_orderkey]                                             |
+|               |       TableScan: lineitem projection=[l_orderkey]                                             |
+| physical_plan | AggregateExec: mode=Final, gby=[], aggr=[max(lineitem.l_orderkey)]                            |
+|               |   CoalescePartitionsExec                                                                      |
+|               |     UnionExec                                                                                 |
+|               |       PartialAggregationFlightSqlExec sql=SELECT MAX("l_orderkey") AS "__agg_0" FROM lineitem |
+|               |       PartialAggregationFlightSqlExec sql=SELECT MAX("l_orderkey") AS "__agg_0" FROM lineitem |
+|               |       PartialAggregationFlightSqlExec sql=SELECT MAX("l_orderkey") AS "__agg_0" FROM lineitem |
+|               |                                                                                               |
++---------------+-----------------------------------------------------------------------------------------------+
