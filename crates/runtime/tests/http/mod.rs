@@ -130,6 +130,19 @@ WHERE request_path = '/edge'
 ORDER BY id
 ";
 
+/// Same source/path as [`HTTP_JSON_EDGE_QUERY`] (so the connector still fetches
+/// `/edge` exactly once), but an extra predicate filters out every row, leaving
+/// an empty (zero-row) result set. Used to verify empty results are cached.
+const HTTP_JSON_EDGE_EMPTY_QUERY: &str = r"
+SELECT
+    CAST(json_get(content, 'id') AS BIGINT) AS id,
+    CAST(json_get(content, 'name') AS VARCHAR) AS name
+FROM http_json_edges
+WHERE request_path = '/edge'
+  AND CAST(json_get(content, 'id') AS BIGINT) = 999
+ORDER BY id
+";
+
 fn expected_http_json_edge_rows() -> Value {
     json!([
         {
@@ -374,6 +387,30 @@ async fn run_http_json_edge_query(rt: &Runtime) -> Result<(CacheStatus, Vec<Reco
         .try_collect::<Vec<RecordBatch>>()
         .await
         .map_err(|e| format!("Failed to collect HTTP JSON edge query results: {e}"))?;
+
+    Ok((cache_status, batches))
+}
+
+/// Run an arbitrary SQL query against the HTTP JSON edge runtime, returning the
+/// cache status and collected batches.
+async fn run_http_json_query(
+    rt: &Runtime,
+    sql: &str,
+) -> Result<(CacheStatus, Vec<RecordBatch>), String> {
+    let query_result = rt
+        .datafusion()
+        .query_builder(sql)
+        .build()
+        .run()
+        .await
+        .map_err(|e| format!("Failed to run HTTP JSON query: {e}"))?;
+
+    let cache_status = query_result.cache_status;
+    let batches = query_result
+        .data
+        .try_collect::<Vec<RecordBatch>>()
+        .await
+        .map_err(|e| format!("Failed to collect HTTP JSON query results: {e}"))?;
 
     Ok((cache_status, batches))
 }
@@ -1114,6 +1151,74 @@ async fn test_http_json_edge_cases_results_cache() -> Result<(), String> {
             assert_eq!(
                 second_http_cache_header.as_deref(),
                 Some("Hit from spiceai")
+            );
+
+            rt.shutdown().await;
+
+            tx.send(())
+                .map_err(|()| "Failed to send shutdown signal".to_string())?;
+            Ok(())
+        })
+        .await
+}
+
+/// Regression test: an empty (zero-row) result set from a live source must be
+/// cached, and the second identical request must be served from cache WITHOUT
+/// re-fetching the upstream source.
+///
+/// This is the strongest form of the empty-result caching regression test:
+/// `edge_request_count` proves the source was hit exactly once across both
+/// requests. Before the fix, the empty result was never cached, so the second
+/// request re-executed (cache miss) and re-fetched the source (count == 2).
+#[tokio::test]
+async fn test_http_json_edge_cases_empty_result_cache() -> Result<(), String> {
+    let _tracing = init_tracing(Some("integration=debug,info"));
+    register_test_connectors().await;
+
+    test_request_context()
+        .scope(async {
+            let (tx, addr, edge_request_count) = start_http_server().await?;
+            let rt = setup_http_json_edge_runtime(
+                "http_json_edge_cases_empty_result_cache",
+                &format!("http://{addr}/api"),
+                false,
+                Some(SQLResultsCacheConfig {
+                    item_ttl: Some("60s".to_string()),
+                    ..Default::default()
+                }),
+            )
+            .await?;
+
+            // First request: cache miss, empty result, source fetched once.
+            let (first_cache_status, first_batches) =
+                run_http_json_query(rt.as_ref(), HTTP_JSON_EDGE_EMPTY_QUERY).await?;
+            assert_eq!(first_cache_status, CacheStatus::CacheMiss);
+            assert_eq!(
+                first_batches
+                    .iter()
+                    .map(RecordBatch::num_rows)
+                    .sum::<usize>(),
+                0,
+                "query should return zero rows"
+            );
+            assert_eq!(edge_request_count.load(Ordering::SeqCst), 1);
+
+            // Second request: cache hit, still empty, and NO second fetch.
+            let (second_cache_status, second_batches) =
+                run_http_json_query(rt.as_ref(), HTTP_JSON_EDGE_EMPTY_QUERY).await?;
+            assert_eq!(second_cache_status, CacheStatus::CacheHit);
+            assert_eq!(
+                second_batches
+                    .iter()
+                    .map(RecordBatch::num_rows)
+                    .sum::<usize>(),
+                0,
+                "cached query should still return zero rows"
+            );
+            assert_eq!(
+                edge_request_count.load(Ordering::SeqCst),
+                1,
+                "results-cache hit on an empty result should avoid a second HTTP fetch"
             );
 
             rt.shutdown().await;
