@@ -675,9 +675,7 @@ fn build_mysql_opts(params: &Parameters) -> Result<Opts, String> {
         builder
     };
 
-    let sslmode = optional_string(params, "sslmode")
-        .map(|s| s.to_lowercase())
-        .unwrap_or_else(|| "required".to_string());
+    let sslmode = optional_string(params, "sslmode").map_or_else(|| "required".to_string(), |s| s.to_lowercase());
     match sslmode.as_str() {
         "disabled" | "required" | "preferred" => {}
         other => {
