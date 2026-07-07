@@ -15,6 +15,7 @@ limitations under the License.
 */
 
 use async_trait::async_trait;
+use data_components::mysql_replication::{ReplicationMetrics, ReplicationMetricsCollector};
 use datafusion::datasource::TableProvider;
 use datafusion::sql::sqlparser::dialect::MySqlDialect;
 use datafusion_table_providers::mysql::MySQLTableFactory;
@@ -31,16 +32,18 @@ use runtime::dataconnector::{
     DataConnectorResult, NewDataConnectorResult,
 };
 use runtime::datafusion::udf::deny_spice_functions_for_table_providers;
-use runtime::parameters::ParameterSpec;
+use runtime::parameters::{ParameterSpec, Parameters};
 use runtime_api_types::v1::ComponentType;
 use runtime_metrics::component::{MetricSpec, MetricType, MetricsProvider, ObserveMetricCallback};
-use secrecy::ExposeSecret;
+use secrecy::{ExposeSecret, SecretBox};
 use snafu::prelude::*;
 use std::any::Any;
 use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
+
+pub mod replication;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -61,6 +64,10 @@ const DEFAULT_CONNECTION_POOL_MAX: usize = 5;
 pub struct MySQL {
     mysql_factory: MySQLTableFactory,
     pool: Arc<MySQLConnectionPool>,
+    /// Connector params retained for the replication path, which opens its
+    /// own dedicated connections outside the pool.
+    params: Parameters,
+    replication_metrics: Arc<ReplicationMetricsCollector>,
 }
 
 impl std::fmt::Debug for MySQL {
@@ -139,6 +146,46 @@ const PARAMETERS: &[ParameterSpec] = &[
         )
         .default("null")
         .one_of_ignore_ascii_case(&["null", "error"])
+        .help_link(MYSQL_DOCS),
+    ParameterSpec::component("replication_server_id")
+        .description(
+            "The server_id this replica registers on the source with for `refresh_mode: changes`. \
+             Must be unique among all replicas attached to the same source. Default: derived from \
+             the dataset name and process.",
+        )
+        .help_link(MYSQL_DOCS),
+    ParameterSpec::component("replication_snapshot_mode")
+        .description(
+            "When `refresh_mode: changes` loads the table's existing rows: 'auto' (default) \
+             snapshots when no resumable binlog position exists; 'never' streams changes only; \
+             'always' re-snapshots on every start.",
+        )
+        .default("auto")
+        .one_of_ignore_ascii_case(&["auto", "never", "always"])
+        .help_link(MYSQL_DOCS),
+    ParameterSpec::component("replication_checkpoint_interval")
+        .description(
+            "How often the committed binlog position is persisted to the accelerator sidecar \
+             (e.g. '10s'). A crash replays at most this much already-applied change history. \
+             Default: 10s.",
+        )
+        .default("10s")
+        .help_link(MYSQL_DOCS),
+    ParameterSpec::component("replication_bootstrap_batch_size")
+        .description(
+            "Rows per emitted batch during the initial replication snapshot. \
+             Default: 8192. Maximum: 1048576.",
+        )
+        .default("8192")
+        .help_link(MYSQL_DOCS),
+    ParameterSpec::component("replication_invalid_position_behavior")
+        .description(
+            "What to do when the persisted binlog position was purged from the source: 'error' \
+             (default) surfaces an actionable error; 'rebootstrap' drops the saved position and \
+             re-snapshots the table.",
+        )
+        .default("error")
+        .one_of_ignore_ascii_case(&["error", "rebootstrap"])
         .help_link(MYSQL_DOCS),
 ];
 
@@ -224,7 +271,40 @@ impl DataConnectorFactory for MySQLFactory {
                 }
             }
 
-            let pool = match MySQLConnectionPool::new(params.parameters.to_secret_map()).await {
+            let params_for_replication = params.parameters.clone();
+
+            let mut param_map = params.parameters.to_secret_map();
+
+            // `refresh_mode: changes` datasets use this pool only for schema
+            // probes at initialization — replication runs over its own
+            // dedicated connections. Unless the user sized the pool
+            // explicitly, keep it minimal: no idle connections held for the
+            // lifetime of the dataset, and a small max. This matters at N
+            // CDC datasets per source database. (Same policy as the Postgres
+            // connector.)
+            if let ConnectorComponent::Dataset(dataset) = &params.component {
+                let is_changes_mode = dataset.acceleration.as_ref().is_some_and(|acceleration| {
+                    acceleration.refresh_mode
+                        == Some(runtime::component::dataset::acceleration::RefreshMode::Changes)
+                });
+                if is_changes_mode {
+                    // The injected spec defaults are indistinguishable from
+                    // user-set values here, so consult the raw spicepod
+                    // params for whether the user chose a size.
+                    let user_set = |key: &str| {
+                        dataset.params.contains_key(&format!("mysql_{key}"))
+                            || dataset.params.contains_key(key)
+                    };
+                    if !user_set("pool_min") {
+                        param_map.insert("pool_min".to_string(), SecretBox::from("0"));
+                    }
+                    if !user_set("pool_max") {
+                        param_map.insert("pool_max".to_string(), SecretBox::from("2"));
+                    }
+                }
+            }
+
+            let pool = match MySQLConnectionPool::new(param_map).await {
                 Ok(pool) => Arc::new(pool.with_zero_date_behavior(zero_date_behavior)),
                 Err(error) => match error {
                     mysqlpool::Error::InvalidUsernameOrPassword => {
@@ -272,6 +352,8 @@ impl DataConnectorFactory for MySQLFactory {
             Ok(Arc::new(MySQL {
                 mysql_factory,
                 pool,
+                params: params_for_replication,
+                replication_metrics: ReplicationMetricsCollector::new(),
             }) as Arc<dyn DataConnector>)
         })
     }
@@ -410,9 +492,30 @@ impl DataConnector for MySQL {
         }
     }
 
+    fn supports_changes_stream(&self) -> bool {
+        true
+    }
+
+    fn changes_stream(
+        &self,
+        federated_table: Arc<runtime::federated_table::FederatedTable>,
+        dataset: &Dataset,
+        _accelerated_table_provider: Arc<dyn TableProvider>,
+        _accelerator_write_mutex: Arc<tokio::sync::Mutex<()>>,
+        _cpu_runtime: Option<tokio::runtime::Handle>,
+    ) -> Option<data_components::cdc::ChangesStream> {
+        Some(replication::build_changes_stream(
+            &self.params,
+            dataset,
+            federated_table,
+            Arc::clone(&self.replication_metrics),
+        ))
+    }
+
     fn metrics_provider(&self) -> Option<Arc<dyn MetricsProvider>> {
         Some(Arc::new(MySQLMetricsProvider::new(
             self.mysql_factory.conn_pool_metrics(),
+            ReplicationMetrics::new(Arc::clone(&self.replication_metrics)),
         )))
     }
 }
@@ -420,13 +523,27 @@ impl DataConnector for MySQL {
 #[derive(Debug, Clone)]
 struct MySQLMetricsProvider {
     metrics: Arc<Metrics>,
+    replication: ReplicationMetrics,
 }
 
 impl MySQLMetricsProvider {
-    fn new(metrics: Arc<Metrics>) -> Self {
-        Self { metrics }
+    fn new(metrics: Arc<Metrics>, replication: ReplicationMetrics) -> Self {
+        Self {
+            metrics,
+            replication,
+        }
     }
 }
+
+/// Connection-pool metrics plus the `replication_*` set — `available_metrics`
+/// needs one `'static` slice covering both.
+static ALL_METRICS: LazyLock<Vec<MetricSpec>> = LazyLock::new(|| {
+    METRICS
+        .iter()
+        .chain(replication::REPLICATION_METRICS.iter())
+        .copied()
+        .collect()
+});
 
 const METRICS: &[MetricSpec] = &[
     MetricSpec::new("connection_count", MetricType::ObservableGaugeU64)
@@ -481,7 +598,7 @@ impl MetricsProvider for MySQLMetricsProvider {
     }
 
     fn available_metrics(&self) -> &'static [MetricSpec] {
-        METRICS
+        &ALL_METRICS
     }
 
     fn callback_to_observe_metric(
@@ -489,6 +606,19 @@ impl MetricsProvider for MySQLMetricsProvider {
         metric: &MetricSpec,
         attributes: Vec<KeyValue>,
     ) -> Option<ObserveMetricCallback> {
+        // Dispatch by membership rather than a name prefix so a future spec
+        // that breaks the `replication_` naming convention still routes to
+        // its callback (and the coverage test still holds).
+        if replication::REPLICATION_METRICS
+            .iter()
+            .any(|spec| spec.name == metric.name)
+        {
+            return replication::observe_replication_metric(
+                &self.replication,
+                metric.name,
+                attributes,
+            );
+        }
         let metrics = Arc::clone(&self.metrics);
         match metric.name {
             "connection_count" => Some(ObserveMetricCallback::U64(Box::new(move |instrument| {

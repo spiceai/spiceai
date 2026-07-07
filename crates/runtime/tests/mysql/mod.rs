@@ -30,6 +30,9 @@ use crate::utils::{register_test_connectors, runtime_ready_check, test_request_c
 mod comments;
 pub mod common;
 mod federation;
+pub mod replication;
+#[cfg(feature = "duckdb")]
+pub mod replication_e2e;
 
 use super::*;
 use app::AppBuilder;
