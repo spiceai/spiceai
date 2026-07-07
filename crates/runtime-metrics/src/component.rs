@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::{fmt::Debug, sync::Arc};
+use std::fmt::Debug;
 
 use opentelemetry::{KeyValue, metrics::Callback};
 use runtime_api_types::v1::ComponentType;
