@@ -26,7 +26,7 @@ use crate::proto;
 pub(crate) const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
 
 /// Default telemetry cadence.
-pub(crate) const TELEMETRY_INTERVAL: Duration = Duration::from_secs(60);
+pub(crate) const TELEMETRY_INTERVAL: Duration = Duration::from_mins(1);
 
 /// Build a heartbeat for the current runtime state.
 pub(crate) async fn build_heartbeat(
@@ -81,8 +81,7 @@ pub(crate) async fn build_telemetry(
 pub(crate) fn now_unix() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
+        .map_or(0, |d| d.as_secs())
 }
 
 #[cfg(test)]

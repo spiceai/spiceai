@@ -62,7 +62,7 @@ use crate::{Error, Result, fingerprint};
 /// Minimum reconnect backoff.
 const MIN_BACKOFF: Duration = Duration::from_secs(1);
 /// Maximum reconnect backoff.
-const MAX_BACKOFF: Duration = Duration::from_secs(60);
+const MAX_BACKOFF: Duration = Duration::from_mins(1);
 
 /// Outbound channel size: bounded to keep memory predictable.
 const CLIENT_CHANNEL_SIZE: usize = 64;
@@ -682,11 +682,11 @@ fn build_channel(config: &CloudConnectConfig, identity: Option<&Identity>) -> Re
             endpoint: config.endpoint.clone(),
             source,
         })?
-        .timeout(Duration::from_secs(60))
+        .timeout(Duration::from_mins(1))
         .connect_timeout(Duration::from_secs(10))
         .tcp_keepalive(Some(Duration::from_secs(30)))
         .http2_keep_alive_interval(Duration::from_secs(15))
-        .keep_alive_timeout(Duration::from_secs(60))
+        .keep_alive_timeout(Duration::from_mins(1))
         .keep_alive_while_idle(true);
 
     if !config.insecure {

@@ -92,8 +92,7 @@ impl Identity {
         }
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
+            .map_or(0, |d| d.as_secs());
         // Treat the cert as expired *at* `not_after_unix`, not only strictly
         // after it: the field is defined as the timestamp after which the
         // server no longer accepts the credential, so the boundary second
