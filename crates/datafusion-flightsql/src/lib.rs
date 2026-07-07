@@ -36,7 +36,7 @@ limitations under the License.
 //! #[tokio::main]
 //! async fn main() -> Result<(), Box<dyn std::error::Error>> {
 //!     let ctx = Arc::new(SessionContext::new());
-//!     let svc = FlightSqlService::new(ctx);
+//!     let svc = FlightSqlService::from_session_context(ctx);
 //!     Server::builder()
 //!         .add_service(FlightServiceServer::new(svc))
 //!         .serve("0.0.0.0:50051".parse()?)
@@ -62,9 +62,13 @@ use datafusion::common::ParamValues;
 use datafusion::prelude::SessionContext;
 use futures::StreamExt;
 use futures::stream::BoxStream;
+use runtime_query_engine::query_engine::{QueryEngine, QueryRequest};
+use runtime_query_engine::session::QuerySession;
 use tonic::{Request, Response, Status, Streaming};
 
 mod actions;
+mod change_source;
+mod do_exchange;
 mod do_get;
 mod do_put;
 pub(crate) mod flightsql;
@@ -75,29 +79,56 @@ mod session;
 pub mod session_auth;
 pub(crate) mod util;
 
+pub use change_source::ChangeSource;
 pub use session::SessionStore;
 pub(crate) use util::{handle_datafusion_error, record_batches_to_flight_stream, to_tonic_err};
+
+/// Convert a [`runtime_query_engine::query_engine::Error`] into a `tonic` [`Status`].
+pub(crate) fn query_engine_err_to_status(
+    err: runtime_query_engine::query_engine::Error,
+) -> Status {
+    Status::internal(err.to_string())
+}
 
 /// A `FlightSQL` service backed by an arbitrary `DataFusion` [`SessionContext`].
 ///
 /// Create with [`FlightSqlService::new`] and wrap in
 /// [`FlightServiceServer`] to serve over gRPC.
 pub struct FlightSqlService {
-    /// Base context used when no per-session context exists for a request.
-    ctx: Arc<SessionContext>,
+    /// Base query engine used when no per-session context exists for a request.
+    engine: Arc<dyn QueryEngine>,
     session_store: SessionStore,
+    /// Optional live-change feed used to serve `do_exchange` subscriptions.
+    change_source: Option<Arc<dyn ChangeSource>>,
 }
 
 impl FlightSqlService {
-    /// Create a new service using `ctx` as the default query context.
+    /// Create a new service using `engine` as the default query engine.
     ///
     /// Call [`FlightSqlService::into_server`] to wrap in a `FlightServiceServer`.
     #[must_use]
-    pub fn new(ctx: Arc<SessionContext>) -> Self {
+    pub fn new(engine: Arc<dyn QueryEngine>) -> Self {
         Self {
-            ctx,
+            engine,
             session_store: SessionStore::new(),
+            change_source: None,
         }
+    }
+
+    /// Create a new service backed by a bare [`SessionContext`].
+    ///
+    /// This wraps `ctx` in a [`QuerySession`] and preserves the ergonomics of
+    /// the pre-`QueryEngine` API.
+    #[must_use]
+    pub fn from_session_context(ctx: Arc<SessionContext>) -> Self {
+        Self::new(Arc::new(QuerySession::new(ctx)))
+    }
+
+    /// Attach a [`ChangeSource`] used to serve `do_exchange` subscriptions.
+    #[must_use]
+    pub fn with_change_source(mut self, src: Arc<dyn ChangeSource>) -> Self {
+        self.change_source = Some(src);
+        self
     }
 
     /// Returns a clone of the session store (useful for auth wrappers).
@@ -112,18 +143,19 @@ impl FlightSqlService {
         FlightServiceServer::new(self)
     }
 
-    /// Resolve the [`SessionContext`] for a request.
+    /// Resolve the [`QueryEngine`] for a request.
     ///
-    /// Returns the per-session context if the request carries a known session
-    /// ID (via `x-session-id` or `Authorization: Bearer <id>`), otherwise
-    /// falls back to the base context.
-    pub(crate) fn session_ctx(
+    /// Returns a per-session engine (wrapping the request's `SessionContext`)
+    /// if the request carries a known session ID (via `x-session-id` or
+    /// `Authorization: Bearer <id>`), otherwise falls back to the base engine.
+    pub(crate) fn session_engine(
         &self,
         metadata: &tonic::metadata::MetadataMap,
-    ) -> Arc<SessionContext> {
+    ) -> Arc<dyn QueryEngine> {
         self.session_store
             .get_session_from_metadata(metadata)
-            .unwrap_or_else(|| Arc::clone(&self.ctx))
+            .map(|ctx| Arc::new(QuerySession::new(ctx)) as Arc<dyn QueryEngine>)
+            .unwrap_or_else(|| Arc::clone(&self.engine))
     }
 }
 
@@ -143,7 +175,11 @@ impl FlightService for FlightSqlService {
         &self,
         request: Request<Streaming<HandshakeRequest>>,
     ) -> Result<Response<Self::HandshakeStream>, Status> {
-        handshake::handle(request.metadata(), &self.ctx, &self.session_store)
+        handshake::handle(
+            request.metadata(),
+            self.engine.session_context(),
+            &self.session_store,
+        )
     }
 
     async fn list_flights(
@@ -157,8 +193,8 @@ impl FlightService for FlightSqlService {
         &self,
         request: Request<FlightDescriptor>,
     ) -> Result<Response<FlightInfo>, Status> {
-        let ctx = self.session_ctx(request.metadata());
-        Box::pin(get_flight_info::handle(ctx, request)).await
+        let engine = self.session_engine(request.metadata());
+        Box::pin(get_flight_info::handle(engine, request)).await
     }
 
     async fn poll_flight_info(
@@ -172,41 +208,40 @@ impl FlightService for FlightSqlService {
         &self,
         request: Request<FlightDescriptor>,
     ) -> Result<Response<SchemaResult>, Status> {
-        let ctx = self.session_ctx(request.metadata());
-        get_schema::handle(ctx, request).await
+        let engine = self.session_engine(request.metadata());
+        get_schema::handle(engine, request).await
     }
 
     async fn do_get(
         &self,
         request: Request<Ticket>,
     ) -> Result<Response<Self::DoGetStream>, Status> {
-        let ctx = self.session_ctx(request.metadata());
-        Box::pin(do_get::handle(ctx, request)).await
+        let engine = self.session_engine(request.metadata());
+        Box::pin(do_get::handle(engine, request)).await
     }
 
     async fn do_put(
         &self,
         request: Request<Streaming<FlightData>>,
     ) -> Result<Response<Self::DoPutStream>, Status> {
-        let ctx = self.session_ctx(request.metadata());
-        do_put::handle(ctx, request).await
+        let engine = self.session_engine(request.metadata());
+        do_put::handle(engine, request).await
     }
 
     async fn do_exchange(
         &self,
-        _request: Request<Streaming<FlightData>>,
+        request: Request<Streaming<FlightData>>,
     ) -> Result<Response<Self::DoExchangeStream>, Status> {
-        Err(Status::unimplemented(
-            "do_exchange is not supported by this service",
-        ))
+        let engine = self.session_engine(request.metadata());
+        do_exchange::handle(engine, self.change_source.clone(), request).await
     }
 
     async fn do_action(
         &self,
         request: Request<Action>,
     ) -> Result<Response<Self::DoActionStream>, Status> {
-        let ctx = self.session_ctx(request.metadata());
-        Box::pin(actions::do_action(ctx, request)).await
+        let engine = self.session_engine(request.metadata());
+        Box::pin(actions::do_action(engine, request)).await
     }
 
     async fn list_actions(
@@ -220,15 +255,25 @@ impl FlightService for FlightSqlService {
 // ── Query execution utilities ─────────────────────────────────────────────────
 
 impl FlightSqlService {
-    /// Plan `sql` against `ctx` and return the output Arrow schema.
+    /// Plan `sql` against `engine` and return the output Arrow schema.
     ///
     /// Applies `expand_views_schema` so that the advertised schema matches
     /// what `sql_to_flight_stream` will actually produce.
+    ///
+    /// There is no `QueryEngine` trait method for planning arbitrary SQL for
+    /// schema resolution, so this plans directly via the engine's
+    /// [`SessionContext`] (bypassing any richer `execute_query` semantics such
+    /// as caching, telemetry, or access-control). That is acceptable for
+    /// schema-only resolution.
     pub(crate) async fn get_arrow_schema(
-        ctx: &Arc<SessionContext>,
+        engine: &Arc<dyn QueryEngine>,
         sql: &str,
     ) -> Result<Schema, Status> {
-        let df = ctx.sql(sql).await.map_err(handle_datafusion_error)?;
+        let df = engine
+            .session_context()
+            .sql(sql)
+            .await
+            .map_err(handle_datafusion_error)?;
         let schema = df.schema().as_arrow().clone();
         Ok(arrow_tools::schema::expand_views_schema(&schema))
     }
@@ -241,26 +286,26 @@ impl FlightSqlService {
         Ok(message.0)
     }
 
-    /// Execute `sql` against `ctx` and encode the result as a Flight data stream.
+    /// Execute `sql` against `engine` and encode the result as a Flight data stream.
     pub(crate) async fn sql_to_flight_stream(
-        ctx: Arc<SessionContext>,
+        engine: Arc<dyn QueryEngine>,
         sql: &str,
         parameters: Option<ParamValues>,
     ) -> Result<BoxStream<'static, Result<FlightData, Status>>, Status> {
-        let df = ctx.sql(sql).await.map_err(handle_datafusion_error)?;
+        let mut request = QueryRequest::new(sql);
+        if let Some(params) = parameters {
+            request = request.parameters(params);
+        }
 
-        let df = if let Some(params) = parameters {
-            df.with_param_values(params)
-                .map_err(handle_datafusion_error)?
-        } else {
-            df
-        };
+        let data_stream = engine
+            .execute_query(request)
+            .await
+            .map_err(query_engine_err_to_status)?;
 
-        let raw_schema = std::sync::Arc::clone(df.schema().inner());
+        let raw_schema = data_stream.schema();
         // Expand view types (Utf8View → LargeUtf8, BinaryView → LargeBinary) so
         // that the advertised schema matches the cast batches we send below.
         let schema = Arc::new(arrow_tools::schema::expand_views_schema(&raw_schema));
-        let data_stream = df.execute_stream().await.map_err(handle_datafusion_error)?;
 
         // Pre-compute schema flight data once, matching the runtime's approach.
         let options = IpcWriteOptions::default();

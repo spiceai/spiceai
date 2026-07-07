@@ -27,15 +27,15 @@ use arrow_flight::{
     flight_service_server::FlightService,
     sql::{self, Any, ProstMessageExt},
 };
-use datafusion::prelude::SessionContext;
 use futures::stream::BoxStream;
 use prost::Message;
+use runtime_query_engine::query_engine::QueryEngine;
 use tonic::{Request, Response, Status};
 
 use crate::{FlightSqlService, flightsql::prepared_statement_query, to_tonic_err};
 
 pub(crate) async fn do_action(
-    ctx: Arc<SessionContext>,
+    engine: Arc<dyn QueryEngine>,
     request: Request<Action>,
 ) -> Result<Response<<FlightSqlService as FlightService>::DoActionStream>, Status> {
     let action = request.into_inner();
@@ -46,7 +46,7 @@ pub(crate) async fn do_action(
     match sql::Command::try_from(msg).map_err(to_tonic_err)? {
         sql::Command::ActionCreatePreparedStatementRequest(stmt) => {
             let result =
-                prepared_statement_query::do_action_create_prepared_statement(ctx, stmt).await?;
+                prepared_statement_query::do_action_create_prepared_statement(engine, stmt).await?;
             let output = futures::stream::iter(vec![Ok(arrow_flight::Result {
                 body: result.as_any().encode_to_vec().into(),
             })]);

@@ -13,8 +13,10 @@ arrow-ipc = { workspace = true }
 arrow-schema = { workspace = true }
 arrow_tools = { path = "../arrow_tools" }
 async-stream = { workspace = true }
+async-trait = { workspace = true }
 bytes = { workspace = true }
 datafusion = { workspace = true }
+runtime-query-engine = { path = "../runtime-query-engine" }
 futures = { workspace = true }
 http = { workspace = true }
 moka = { workspace = true, features = ["sync"] }
@@ -22,6 +24,7 @@ postcard = { workspace = true }
 prost = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 snafu = { workspace = true }
+tokio = { workspace = true, features = ["macros"] }
 tokio-stream = { workspace = true }
 tonic = { workspace = true }
 tracing = { workspace = true }

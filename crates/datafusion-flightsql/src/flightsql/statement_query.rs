@@ -21,20 +21,20 @@ use arrow_flight::{
     flight_service_server::FlightService,
     sql::{self, ProstMessageExt},
 };
-use datafusion::prelude::SessionContext;
 use prost::Message;
+use runtime_query_engine::query_engine::QueryEngine;
 use tonic::{Request, Response, Status};
 
 use crate::{FlightSqlService, to_tonic_err};
 
 pub(crate) async fn get_flight_info(
-    ctx: Arc<SessionContext>,
+    engine: Arc<dyn QueryEngine>,
     query: sql::CommandStatementQuery,
     request: Request<FlightDescriptor>,
 ) -> Result<Response<FlightInfo>, Status> {
     tracing::trace!("get_flight_info statement_query: {:?}", query.query);
 
-    let arrow_schema = FlightSqlService::get_arrow_schema(&ctx, &query.query).await?;
+    let arrow_schema = FlightSqlService::get_arrow_schema(&engine, &query.query).await?;
     let fd = request.into_inner();
 
     let endpoint = FlightEndpoint::new().with_ticket(Ticket {
@@ -51,12 +51,12 @@ pub(crate) async fn get_flight_info(
 }
 
 pub(crate) async fn do_get(
-    ctx: Arc<SessionContext>,
+    engine: Arc<dyn QueryEngine>,
     cmd: sql::CommandStatementQuery,
 ) -> Result<Response<<FlightSqlService as FlightService>::DoGetStream>, Status> {
     tracing::trace!("do_get statement_query: {:?}", cmd.query);
 
-    let output = FlightSqlService::sql_to_flight_stream(ctx, &cmd.query, None).await?;
+    let output = FlightSqlService::sql_to_flight_stream(engine, &cmd.query, None).await?;
     Ok(Response::new(
         Box::pin(output) as <FlightSqlService as FlightService>::DoGetStream
     ))

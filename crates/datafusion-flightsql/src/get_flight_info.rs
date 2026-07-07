@@ -20,26 +20,26 @@ use arrow_flight::{
     FlightDescriptor, FlightEndpoint, FlightInfo, Ticket,
     sql::{Any, Command},
 };
-use datafusion::prelude::SessionContext;
 use prost::Message;
+use runtime_query_engine::query_engine::QueryEngine;
 use tonic::{Request, Response, Status};
 
 use crate::{FlightSqlService, flightsql, to_tonic_err};
 
 pub(crate) async fn handle(
-    ctx: Arc<SessionContext>,
+    engine: Arc<dyn QueryEngine>,
     request: Request<FlightDescriptor>,
 ) -> Result<Response<FlightInfo>, Status> {
     let Ok(message) = Any::decode(&*request.get_ref().cmd) else {
-        return get_flight_info_simple(ctx, request).await;
+        return get_flight_info_simple(engine, request).await;
     };
 
     match Command::try_from(message).map_err(to_tonic_err)? {
         Command::CommandStatementQuery(cmd) => {
-            flightsql::statement_query::get_flight_info(ctx, cmd, request).await
+            flightsql::statement_query::get_flight_info(engine, cmd, request).await
         }
         Command::CommandPreparedStatementQuery(handle) => {
-            flightsql::prepared_statement_query::get_flight_info(ctx, handle, request).await
+            flightsql::prepared_statement_query::get_flight_info(engine, handle, request).await
         }
         Command::CommandPreparedStatementUpdate(handle) => {
             flightsql::prepared_statement_update::get_flight_info(&handle, request)
@@ -73,13 +73,13 @@ pub(crate) async fn handle(
 }
 
 async fn get_flight_info_simple(
-    ctx: Arc<SessionContext>,
+    engine: Arc<dyn QueryEngine>,
     request: Request<FlightDescriptor>,
 ) -> Result<Response<FlightInfo>, Status> {
     let fd = request.into_inner();
     let sql = std::str::from_utf8(&fd.cmd).map_err(|e| Status::invalid_argument(e.to_string()))?;
 
-    let arrow_schema = FlightSqlService::get_arrow_schema(&ctx, sql).await?;
+    let arrow_schema = FlightSqlService::get_arrow_schema(&engine, sql).await?;
 
     let info = FlightInfo {
         flight_descriptor: Some(fd.clone()),

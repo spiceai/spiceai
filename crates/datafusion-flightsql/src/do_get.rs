@@ -21,32 +21,32 @@ use arrow_flight::{
     flight_service_server::FlightService,
     sql::{Any, Command},
 };
-use datafusion::prelude::SessionContext;
 use prost::Message;
+use runtime_query_engine::query_engine::QueryEngine;
 use tonic::{Request, Response, Status};
 
 use crate::{FlightSqlService, flightsql, to_tonic_err};
 
 pub(crate) async fn handle(
-    ctx: Arc<SessionContext>,
+    engine: Arc<dyn QueryEngine>,
     request: Request<Ticket>,
 ) -> Result<Response<<FlightSqlService as FlightService>::DoGetStream>, Status> {
     let msg: Any = match Message::decode(&*request.get_ref().ticket) {
         Ok(msg) => msg,
-        Err(_) => return do_get_simple(ctx, request).await,
+        Err(_) => return do_get_simple(engine, request).await,
     };
 
     match Command::try_from(msg).map_err(to_tonic_err)? {
-        Command::CommandStatementQuery(cmd) => flightsql::statement_query::do_get(ctx, cmd).await,
+        Command::CommandStatementQuery(cmd) => flightsql::statement_query::do_get(engine, cmd).await,
         Command::CommandPreparedStatementQuery(cmd) => {
-            Box::pin(flightsql::prepared_statement_query::do_get(ctx, cmd)).await
+            Box::pin(flightsql::prepared_statement_query::do_get(engine, cmd)).await
         }
         Command::CommandPreparedStatementUpdate(cmd) => {
-            Box::pin(flightsql::prepared_statement_update::do_get(ctx, cmd)).await
+            Box::pin(flightsql::prepared_statement_update::do_get(engine, cmd)).await
         }
-        Command::CommandGetCatalogs(cmd) => flightsql::get_catalogs::do_get(&ctx, cmd),
-        Command::CommandGetDbSchemas(cmd) => flightsql::get_schemas::do_get(&ctx, cmd),
-        Command::CommandGetTables(cmd) => flightsql::get_tables::do_get(ctx, cmd).await,
+        Command::CommandGetCatalogs(cmd) => flightsql::get_catalogs::do_get(&engine, cmd),
+        Command::CommandGetDbSchemas(cmd) => flightsql::get_schemas::do_get(&engine, cmd),
+        Command::CommandGetTables(cmd) => flightsql::get_tables::do_get(engine, cmd).await,
         Command::CommandGetPrimaryKeys(cmd) => Ok(flightsql::get_primary_keys::do_get(&cmd)),
         Command::CommandGetTableTypes(cmd) => flightsql::get_table_types::do_get(cmd),
         Command::CommandGetSqlInfo(cmd) => flightsql::get_sql_info::do_get(cmd),
@@ -61,7 +61,7 @@ pub(crate) async fn handle(
 }
 
 async fn do_get_simple(
-    ctx: Arc<SessionContext>,
+    engine: Arc<dyn QueryEngine>,
     request: Request<Ticket>,
 ) -> Result<Response<<FlightSqlService as FlightService>::DoGetStream>, Status> {
     let ticket = request.into_inner();
@@ -70,7 +70,7 @@ async fn do_get_simple(
 
     tracing::trace!("do_get (plain SQL): {sql}");
 
-    let output = FlightSqlService::sql_to_flight_stream(ctx, sql, None).await?;
+    let output = FlightSqlService::sql_to_flight_stream(engine, sql, None).await?;
     Ok(Response::new(
         Box::pin(output) as <FlightSqlService as FlightService>::DoGetStream
     ))

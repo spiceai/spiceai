@@ -35,7 +35,6 @@ use arrow_flight::{
 use arrow_schema::SchemaRef;
 use arrow_tools::record_batch::record_to_param_values;
 use datafusion::common::ParamValues;
-use datafusion::prelude::SessionContext;
 use datafusion::sql::sqlparser::{
     ast::{Expr, Statement, Value, VisitMut, VisitorMut},
     dialect::GenericDialect,
@@ -47,6 +46,7 @@ use prost::Message;
 use serde::{Deserialize, Serialize};
 use snafu::prelude::*;
 use tokio_stream::adapters::Peekable;
+use runtime_query_engine::query_engine::QueryEngine;
 use tonic::{Request, Response, Status, Streaming};
 
 use crate::{FlightSqlService, to_tonic_err};
@@ -209,7 +209,7 @@ pub(crate) struct PreparedStatement {
 // ── DoAction: CreatePreparedStatement ────────────────────────────────────────
 
 pub(crate) async fn do_action_create_prepared_statement(
-    ctx: Arc<SessionContext>,
+    engine: Arc<dyn QueryEngine>,
     statement: sql::ActionCreatePreparedStatementRequest,
 ) -> Result<sql::ActionCreatePreparedStatementResult, Status> {
     tracing::trace!("do_action_create_prepared_statement: {:?}", statement.query);
@@ -220,7 +220,7 @@ pub(crate) async fn do_action_create_prepared_statement(
     // Attempt schema inference; fall back to empty schema if type inference
     // fails (e.g. for parameterised queries before parameters are bound).
     let (dataset_schema, parameter_schema) =
-        match FlightSqlService::get_arrow_schema(&ctx, &query).await {
+        match FlightSqlService::get_arrow_schema(&engine, &query).await {
             Ok(schema) => (schema, None),
             Err(e) => {
                 let msg = e.message();
@@ -261,14 +261,14 @@ pub(crate) async fn do_action_create_prepared_statement(
 // ── GetFlightInfo for prepared statement query ────────────────────────────────
 
 pub(crate) async fn get_flight_info(
-    ctx: Arc<SessionContext>,
+    engine: Arc<dyn QueryEngine>,
     handle: sql::CommandPreparedStatementQuery,
     request: Request<FlightDescriptor>,
 ) -> Result<Response<FlightInfo>, Status> {
     let PreparedStatement { query: sql, .. } =
         from_bytes(&handle.prepared_statement_handle).map_err(error_to_status)?;
 
-    let maybe_schema = match FlightSqlService::get_arrow_schema(&ctx, &sql).await {
+    let maybe_schema = match FlightSqlService::get_arrow_schema(&engine, &sql).await {
         Ok(schema) => Some(schema),
         Err(e) => {
             let msg = e.message();
@@ -303,7 +303,7 @@ pub(crate) async fn get_flight_info(
 // ── DoGet: execute prepared statement query ───────────────────────────────────
 
 pub(crate) async fn do_get(
-    ctx: Arc<SessionContext>,
+    engine: Arc<dyn QueryEngine>,
     query: sql::CommandPreparedStatementQuery,
 ) -> Result<Response<<FlightSqlService as FlightService>::DoGetStream>, Status> {
     tracing::trace!("do_get prepared_statement_query");
@@ -327,7 +327,8 @@ pub(crate) async fn do_get(
         Cow::Borrowed(sql.as_str())
     };
 
-    let output = FlightSqlService::sql_to_flight_stream(ctx, &sql_to_execute, param_values).await?;
+    let output =
+        FlightSqlService::sql_to_flight_stream(engine, &sql_to_execute, param_values).await?;
     Ok(Response::new(
         Box::pin(output) as <FlightSqlService as FlightService>::DoGetStream
     ))

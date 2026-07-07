@@ -27,16 +27,16 @@ use arrow_flight::{
 };
 use arrow_ipc::writer::StreamWriter;
 use arrow_schema::SchemaRef;
-use datafusion::prelude::SessionContext;
 use futures::TryStreamExt;
 use postcard::{from_bytes, to_stdvec};
 use prost::Message;
+use runtime_query_engine::query_engine::{QueryEngine, QueryRequest};
 use std::sync::LazyLock;
 use tokio_stream::adapters::Peekable;
 use tonic::{Request, Response, Status, Streaming};
 
 use super::prepared_statement_query::{PreparedStatement, decode_param_values, error_to_status};
-use crate::{FlightSqlService, handle_datafusion_error, to_tonic_err};
+use crate::{FlightSqlService, query_engine_err_to_status, to_tonic_err};
 
 static AFFECTED_ROWS_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
     Arc::new(Schema::new(vec![Field::new(
@@ -63,7 +63,7 @@ pub(crate) fn get_flight_info(
 }
 
 pub(crate) async fn do_get(
-    ctx: Arc<SessionContext>,
+    engine: Arc<dyn QueryEngine>,
     query: sql::CommandPreparedStatementUpdate,
 ) -> Result<Response<<FlightSqlService as FlightService>::DoGetStream>, Status> {
     tracing::trace!("do_get prepared_statement_update");
@@ -76,14 +76,18 @@ pub(crate) async fn do_get(
 
     let param_values = decode_param_values(&parameters).map_err(error_to_status)?;
 
-    let df = ctx.sql(&sql).await.map_err(handle_datafusion_error)?;
-    let df = if let Some(params) = param_values {
-        df.with_param_values(params)
-            .map_err(handle_datafusion_error)?
-    } else {
-        df
-    };
-    let results: Vec<RecordBatch> = df.collect().await.map_err(handle_datafusion_error)?;
+    let mut request = QueryRequest::new(&sql);
+    if let Some(params) = param_values {
+        request = request.parameters(params);
+    }
+    let stream = engine
+        .execute_query(request)
+        .await
+        .map_err(query_engine_err_to_status)?;
+    let results: Vec<RecordBatch> = stream
+        .try_collect()
+        .await
+        .map_err(|e| Status::internal(e.to_string()))?;
     let affected_rows = extract_affected_rows(&results);
 
     let batch = RecordBatch::try_new(
