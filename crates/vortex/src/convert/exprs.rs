@@ -815,10 +815,18 @@ mod tests {
             .expect("falsify should not error")
             .expect("converted IN-list should support min/max pruning");
 
+        // The pruning expression must be derived from the min and max statistics of `id` —
+        // that is what makes an IN-list prunable. Assert both stat references are present; a
+        // weaker check (e.g. that the string merely contains "id") would pass even if the
+        // expression were not actually using min/max stats.
         let pruning_display = pruning_expr.to_string();
         assert!(
-            pruning_display.contains("id"),
-            "pruning expression should reference the id column: {pruning_display}"
+            pruning_display.contains("stat($.id, vortex.min())"),
+            "pruning expression should reference id's min statistic: {pruning_display}"
+        );
+        assert!(
+            pruning_display.contains("stat($.id, vortex.max())"),
+            "pruning expression should reference id's max statistic: {pruning_display}"
         );
     }
 
