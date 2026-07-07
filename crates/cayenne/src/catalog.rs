@@ -21,7 +21,7 @@ limitations under the License.
 //! (`SQLite`, Turso, etc.).
 
 use super::metadata::{
-    CreateTableOptions, DeleteFile, InlinedData, InlinedDataStats, InlinedDelete,
+    ColdTierFile, CreateTableOptions, DeleteFile, InlinedData, InlinedDataStats, InlinedDelete,
     PartitionMetadata, SnapshotFile, SnapshotFileStatistics, TableMetadata, TableStatistics,
 };
 use arrow_schema::SchemaRef;
@@ -117,6 +117,11 @@ pub enum CatalogError {
         "Cayenne metadata schema mismatch for table '{table}'. The metadata database format has changed and is incompatible with this version. To continue, clear your acceleration data (delete the Cayenne metadata directory) so it can be recreated. Existing accelerated data will be re-synced from the source."
     ))]
     SchemaMismatch { table: String },
+
+    #[snafu(display(
+        "Cayenne acceleration metadata was written by a newer version of Spice (metadata schema version {found}, this build supports up to {supported}). Opening it with this build could silently drop rows from query results. Upgrade Spice to a build that supports metadata schema version {found} or newer, or clear the Cayenne acceleration data (delete the Cayenne metadata directory) so it can be recreated from the source. See: https://spiceai.org/docs/components/data-accelerators"
+    ))]
+    IncompatibleSchemaVersion { found: i64, supported: i64 },
 
     #[snafu(display(
         "Deletion vectors require non-negative row IDs, found negative values: {row_ids}"
@@ -289,6 +294,25 @@ pub trait MetadataCatalog: Send + Sync {
 
     /// Get all active delete files for a table (across all virtual files).
     async fn get_table_delete_files(&self, table_id: &str) -> CatalogResult<Vec<DeleteFile>>;
+
+    /// Get orphan-eligible key-based delete files for a table, bounded by `limit`.
+    ///
+    /// Returns rows that are both key-based (`source_data_file_path IS NULL` — the
+    /// reliable discriminator, since the catalog does not persist `deletion_type`)
+    /// and at or below `max_sequence` (`sequence_number <= max_sequence`). The
+    /// caller passes the surviving-sequence floor as `max_sequence`: a key DV with
+    /// delete sequence `D` only shadows data with sequence `< D`, so once the floor
+    /// is `>= D` it shadows nothing and is safe to remove.
+    ///
+    /// This is the bounded query the orphaned-DV cleanup sweep uses instead of
+    /// fetching every delete-file row and filtering in memory; `limit` caps the
+    /// per-sweep working set (the sweep requeues if more remain).
+    async fn get_orphan_eligible_delete_files(
+        &self,
+        table_id: &str,
+        max_sequence: i64,
+        limit: usize,
+    ) -> CatalogResult<Vec<DeleteFile>>;
 
     /// Remove delete files (deletion vectors) by ID for a table.
     async fn remove_delete_files(
@@ -661,6 +685,28 @@ pub trait MetadataCatalog: Send + Sync {
 
     /// Clear all manifest rows for a table.
     async fn clear_snapshot_files(&self, table_id: &str) -> CatalogResult<()>;
+
+    /// List every cold-tier file for a table (the cold scan's file source).
+    /// Read under the scan's listing fence so the cold file set is captured
+    /// consistently with the warm snapshot and deletion snapshot.
+    async fn list_cold_tier_files(&self, table_id: &str) -> CatalogResult<Vec<ColdTierFile>>;
+
+    /// Atomically graduate the table's durable content to the cold tier. In ONE
+    /// transaction: insert the cold-file rows AND perform the overwrite clear
+    /// (drop the warm `cayenne_snapshot_file` manifest, delete files, insert
+    /// records, inline data, snapshot sequences, per-file/table stats, pk index)
+    /// + repoint `current_snapshot_id` to `new_snapshot_id` (a fresh empty warm
+    /// snapshot). All-or-nothing, so a crash mid-promotion never leaves rows in
+    /// BOTH tiers (double-count) or NEITHER (loss). The deletion state is cleared
+    /// because the cold files were written with all deletes already applied
+    /// (single-version) — exactly the semantics of `commit_overwrite`, whose new
+    /// content here lives on the cold object store instead of a warm snapshot.
+    async fn commit_overwrite_to_cold(
+        &self,
+        table_id: &str,
+        new_snapshot_id: &str,
+        cold_files: &[ColdTierFile],
+    ) -> CatalogResult<()>;
 
     /// Upsert the persisted primary-key existence index (a bloom checkpoint),
     /// tagged with the snapshot id it covers. Stored in the metastore so it is

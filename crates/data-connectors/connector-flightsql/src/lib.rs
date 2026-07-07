@@ -263,9 +263,17 @@ impl DataConnectorFactory for FlightSQLFactory {
                     .await
                     .context(UnableToPerformHandshakeSnafu)?;
             }
+            // Extract bearer token for per-endpoint client auth propagation.
+            let token = client.token().cloned();
             let flightsql_factory =
-                DataComponentFlightSQLFactory::new(client, endpoint, cookie_store)
-                    .with_function_support(deny_spice_specific_functions().as_ref().clone());
+                DataComponentFlightSQLFactory::new(client, endpoint, cookie_store);
+            let flightsql_factory = if let Some(t) = token {
+                flightsql_factory.with_token(t)
+            } else {
+                flightsql_factory
+            };
+            let flightsql_factory = flightsql_factory
+                .with_function_support(deny_spice_specific_functions().as_ref().clone());
             Ok(Arc::new(FlightSQL { flightsql_factory }) as Arc<dyn DataConnector>)
         })
     }

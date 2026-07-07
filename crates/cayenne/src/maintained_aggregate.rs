@@ -23,6 +23,7 @@ limitations under the License.
 //! freshness epoch exactly matches the scan snapshot epoch captured by
 //! [`crate::provider::CayenneAccelerationExec`].
 
+use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
 use std::sync::Arc;
@@ -81,8 +82,22 @@ pub enum MaintainedAggregateFunction {
     /// (`Float32`/`Float64`) families. Narrower widths widen losslessly to the
     /// `BIGINT`/`Float64` sum output, matching `DataFusion`'s `SUM` output type.
     Sum,
-    /// SQL `AVG(column)` for `Float32`/`Float64` inputs.
+    /// SQL `AVG(column)` over the signed-integer (`Int8`..`Int64`),
+    /// unsigned-integer (`UInt8`..`UInt64`), or floating-point
+    /// (`Float32`/`Float64`) families. The output is always `Float64` (matching
+    /// `DataFusion`'s `AVG` output type); integer inputs fold their running sum
+    /// exactly into an `i128` accumulator, floats into an `f64` one.
     Avg,
+    /// SQL `MIN(column)` over the signed/unsigned integer families. Unlike
+    /// `SUM` (which widens to `BIGINT`), the output preserves the input type
+    /// (`MIN(Int32) -> Int32`). Retraction-hard: deleting the current minimum
+    /// needs the next-smallest value, so a per-group ordered multiset
+    /// ([`SortedScalarIndex`]) keeps the live values. Integer families only in
+    /// this slice; float `MIN`/`MAX` (NaN ordering) is a follow-up.
+    Min,
+    /// SQL `MAX(column)` — the mirror of [`Self::Min`], reading the largest
+    /// live value from the same ordered-multiset structure.
+    Max,
 }
 
 /// Shared maintained aggregate state for a single Cayenne table.
@@ -168,6 +183,11 @@ enum AggregateOutputType {
     Int64,
     UInt64,
     Float64,
+    /// The output type equals the aggregate's input column type — `MIN`/`MAX`,
+    /// which preserve type rather than widen. The concrete `DataType` lives on
+    /// the [`ResolvedAggregateExpr`]'s resolved column, so field matching for
+    /// this variant is done by [`ResolvedAggregateExpr::output_matches_field`].
+    SameAsInput,
 }
 
 impl AggregateOutputType {
@@ -176,6 +196,9 @@ impl AggregateOutputType {
             Self::Count | Self::Int64 => field.data_type() == &DataType::Int64,
             Self::UInt64 => field.data_type() == &DataType::UInt64,
             Self::Float64 => field.data_type() == &DataType::Float64,
+            // Matched against the input column type in
+            // `ResolvedAggregateExpr::output_matches_field`, never here.
+            Self::SameAsInput => false,
         }
     }
 }
@@ -215,6 +238,103 @@ enum AggregateAccumulator {
         sum: f64,
         count: i64,
     },
+    /// `AVG` over the signed/unsigned integer family. The running sum is folded
+    /// exactly in `i128` (never materialized as an integer — always divided down
+    /// to the `Float64` AVG output), so it is exactly invertible on the retract
+    /// path and, unlike `SumInt64`'s `i64`, wide enough to average many values
+    /// near `i64::MAX`/`u64::MAX` without overflowing.
+    AvgInt128 {
+        column_index: usize,
+        sum: i128,
+        count: i64,
+    },
+    /// SQL `MIN(column)`: the smallest live value in the group, read as the
+    /// first key of a retraction-capable ordered multiset.
+    Min {
+        column_index: usize,
+        index: SortedScalarIndex,
+    },
+    /// SQL `MAX(column)`: the largest live value, read as the last key of the
+    /// same ordered-multiset structure.
+    Max {
+        column_index: usize,
+        index: SortedScalarIndex,
+    },
+}
+
+/// A per-group ordered multiset of the live (non-null) values feeding a
+/// maintained `MIN`/`MAX` — the structure that makes those *retraction-hard*
+/// aggregates incrementally maintainable. `COUNT`/`SUM`/`AVG` invert a
+/// retraction by subtracting; `MIN`/`MAX` cannot — deleting the current
+/// extremum needs the next value, which only a kept ordered structure has.
+/// Keyed by a lossless `i128` order key over the whole signed/unsigned integer
+/// family, so `BTreeMap` gives O(log distinct) insert/retract and O(1)
+/// `MIN` (first key) / `MAX` (last key). Only non-null values are stored, so an
+/// empty index means the extremum is SQL `NULL`. The exact input-typed
+/// [`ScalarValue`] is stored (not the widened key) because the strict
+/// [`scalar_for_field`] requires the output scalar to match the column type
+/// exactly.
+///
+/// Memory bound (PK-indexed views only): a PK-indexed `MIN`/`MAX` view stores
+/// exactly one multiset value per live PK, so its total multiset size tracks
+/// `pk_index.len()` (distinct values ≤ live rows) — the quantity
+/// [`MaintainedAggregateView::index_len`] returns and `max_index_entries` caps,
+/// fail-safe-to-[`RegistryStatus::Stale`]. So for the CDC norm (every CDC table
+/// carries a primary key), the multiset is co-bounded by that cap. An
+/// **insert-only view without a primary key** (`pk_columns` empty) is NOT
+/// covered: `index_len` counts only `pk_index` (empty here), so the multiset is
+/// bounded solely by the column's distinct-value cardinality, not the entry
+/// cap. Extending `index_len` to include the multiset size would close that gap
+/// (see the maintained-MIN/MAX follow-ups).
+#[derive(Debug, Clone, Default)]
+struct SortedScalarIndex {
+    entries: BTreeMap<i128, (ScalarValue, u64)>,
+}
+
+impl SortedScalarIndex {
+    /// Add one live value. `checked_add` on the per-value count matches the
+    /// crate-wide "never silently clamp a maintained counter" discipline.
+    fn insert(&mut self, scalar: ScalarValue) -> DataFusionResult<()> {
+        let key = scalar_order_key(&scalar)?;
+        if let Some((_, count)) = self.entries.get_mut(&key) {
+            *count = count.checked_add(1).ok_or_else(count_overflow)?;
+        } else {
+            self.entries.insert(key, (scalar, 1));
+        }
+        Ok(())
+    }
+
+    /// Remove one live value (the inverse of [`Self::insert`]). A key that is
+    /// absent, or a count that underflows, is a state inconsistency the caller
+    /// turns into a fail-safe-to-stale, exactly like the additive retraction path.
+    fn retract(&mut self, scalar: &ScalarValue) -> DataFusionResult<()> {
+        let key = scalar_order_key(scalar)?;
+        let Some((_, count)) = self.entries.get_mut(&key) else {
+            return Err(retract_underflow());
+        };
+        *count = count.checked_sub(1).ok_or_else(retract_underflow)?;
+        if *count == 0 {
+            self.entries.remove(&key);
+        }
+        Ok(())
+    }
+
+    /// The smallest live value (SQL `MIN`), or `None` when no non-null value
+    /// remains (the group's `MIN` is `NULL`).
+    fn min_scalar(&self) -> Option<ScalarValue> {
+        self.entries
+            .values()
+            .next()
+            .map(|(scalar, _)| scalar.clone())
+    }
+
+    /// The largest live value (SQL `MAX`), or `None` when the index is empty.
+    fn max_scalar(&self) -> Option<ScalarValue> {
+        self.entries
+            .values()
+            .next_back()
+            .map(|(scalar, _)| scalar.clone())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -869,16 +989,24 @@ impl MaintainedAggregateView {
             return Ok(None);
         }
 
-        let mut rows = Vec::with_capacity(self.groups.len());
-        if self.groups.is_empty() && self.spec.group_by.is_empty() {
-            rows.push((Vec::new(), GroupAccumulator::try_new(&self.spec)?));
-        } else {
-            rows.extend(
+        // Iterate the live groups BY REFERENCE — never clone the accumulator. A
+        // maintained MIN/MAX accumulator owns the whole per-group ordered multiset,
+        // so cloning it (as this did) made materialize O(total distinct) ≈ O(rows)
+        // and defeated the O(groups) serve the whole lever depends on; for the
+        // additive accumulators it was needless allocation. The empty global
+        // aggregate (no groups, no GROUP BY) still emits one SQL row from a
+        // default accumulator, which must outlive `rows`.
+        let default_global;
+        let rows: Vec<(&[ScalarValue], &GroupAccumulator)> =
+            if self.groups.is_empty() && self.spec.group_by.is_empty() {
+                default_global = GroupAccumulator::try_new(&self.spec)?;
+                vec![(&[][..], &default_global)]
+            } else {
                 self.groups
                     .iter()
-                    .map(|(key, acc)| (key.clone(), acc.clone())),
-            );
-        }
+                    .map(|(key, acc)| (key.as_slice(), acc))
+                    .collect()
+            };
 
         let output_columns = schema
             .fields()
@@ -931,7 +1059,7 @@ impl MaintainedAggregateView {
             .aggregates
             .iter()
             .zip(schema.fields().iter().skip(self.spec.group_by.len()))
-            .all(|(aggregate, field)| aggregate.output_type.matches_field(field))
+            .all(|(aggregate, field)| aggregate.output_matches_field(field))
     }
 }
 
@@ -988,17 +1116,50 @@ impl ResolvedAggregateExpr {
             {
                 AggregateOutputType::UInt64
             }
+            // SQL `AVG(int)` outputs `Float64` (DataFusion's AVG output type) for
+            // the whole signed/unsigned integer family; the running sum is folded
+            // exactly in `i128` (see `AvgInt128`), so a narrow CDC column (Postgres
+            // `INTEGER` -> arrow `Int32`) is averaged without overflow.
+            (MaintainedAggregateFunction::Avg, Some(data_type))
+                if data_type.is_signed_integer() || data_type.is_unsigned_integer() =>
+            {
+                AggregateOutputType::Float64
+            }
             // `SUM`/`AVG` over floating-point widen to `Float64` (DataFusion's
             // float sum/avg output type); `Float32` widens losslessly.
             (
                 MaintainedAggregateFunction::Sum | MaintainedAggregateFunction::Avg,
                 Some(data_type),
             ) if is_maintainable_float(data_type) => AggregateOutputType::Float64,
-            (MaintainedAggregateFunction::Sum | MaintainedAggregateFunction::Avg, None) => {
+            (
+                MaintainedAggregateFunction::Sum
+                | MaintainedAggregateFunction::Avg
+                | MaintainedAggregateFunction::Min
+                | MaintainedAggregateFunction::Max,
+                None,
+            ) => {
                 return Err(DataFusionError::Plan(format!(
                     "{:?} maintained aggregate requires a column",
                     expr.function
                 )));
+            }
+            // `MIN`/`MAX` preserve the input type (no widening) and are maintained
+            // via an ordered multiset. Supported: the signed/unsigned integer
+            // families, the integer-backed temporal types (`Date32`/`Date64`/
+            // `Timestamp`), and `Decimal128` (its backing value is an `i128`) — all
+            // totally ordered by an integer, so the `i128` order key sorts them
+            // exactly. Float `MIN`/`MAX` (NaN ordering) and `Decimal256` (i256, too
+            // wide for the key) are follow-ups and fall to the catch-all below (the
+            // view does not build; the query re-scans — correct, not fast).
+            (
+                MaintainedAggregateFunction::Min | MaintainedAggregateFunction::Max,
+                Some(data_type),
+            ) if data_type.is_signed_integer()
+                || data_type.is_unsigned_integer()
+                || is_maintainable_temporal(data_type)
+                || matches!(data_type, DataType::Decimal128(_, _)) =>
+            {
+                AggregateOutputType::SameAsInput
             }
             (function, Some(data_type)) => {
                 return Err(DataFusionError::Plan(format!(
@@ -1012,6 +1173,20 @@ impl ResolvedAggregateExpr {
             column,
             output_type,
         })
+    }
+
+    /// Whether this aggregate's output `field` matches the maintained result
+    /// type. For `MIN`/`MAX` ([`AggregateOutputType::SameAsInput`]) the output
+    /// preserves the input column type, so it is checked against the resolved
+    /// column's `DataType`; every other aggregate has a fixed output type.
+    fn output_matches_field(&self, field: &FieldRef) -> bool {
+        match self.output_type {
+            AggregateOutputType::SameAsInput => self
+                .column
+                .as_ref()
+                .is_some_and(|column| field.data_type() == &column.data_type),
+            fixed => fixed.matches_field(field),
+        }
     }
 }
 
@@ -1094,11 +1269,33 @@ impl AggregateAccumulator {
                     value: None,
                 }
             }
+            (MaintainedAggregateFunction::Avg, AggregateOutputType::Float64, Some(column))
+                if column.data_type.is_signed_integer()
+                    || column.data_type.is_unsigned_integer() =>
+            {
+                Self::AvgInt128 {
+                    column_index: column.index,
+                    sum: 0,
+                    count: 0,
+                }
+            }
             (MaintainedAggregateFunction::Avg, AggregateOutputType::Float64, Some(column)) => {
                 Self::AvgFloat64 {
                     column_index: column.index,
                     sum: 0.0,
                     count: 0,
+                }
+            }
+            (MaintainedAggregateFunction::Min, AggregateOutputType::SameAsInput, Some(column)) => {
+                Self::Min {
+                    column_index: column.index,
+                    index: SortedScalarIndex::default(),
+                }
+            }
+            (MaintainedAggregateFunction::Max, AggregateOutputType::SameAsInput, Some(column)) => {
+                Self::Max {
+                    column_index: column.index,
+                    index: SortedScalarIndex::default(),
                 }
             }
             _ => {
@@ -1171,13 +1368,41 @@ impl AggregateAccumulator {
                     *count = count.checked_add(1).ok_or_else(count_overflow)?;
                 }
             }
+            Self::AvgInt128 {
+                column_index,
+                sum,
+                count,
+            } => {
+                if !batch.column(*column_index).is_null(row) {
+                    let scalar = ScalarValue::try_from_array(batch.column(*column_index), row)?;
+                    let delta = scalar_as_i128(&scalar)?;
+                    *sum = sum.checked_add(delta).ok_or_else(avg_overflow)?;
+                    *count = count.checked_add(1).ok_or_else(count_overflow)?;
+                }
+            }
+            // `MIN`/`MAX` insert identically — add the live value to the ordered
+            // multiset; the query reads the min/max end. A null contributes
+            // nothing to an extremum, so it is left out of the index.
+            Self::Min {
+                column_index,
+                index,
+            }
+            | Self::Max {
+                column_index,
+                index,
+            } => {
+                if !batch.column(*column_index).is_null(row) {
+                    let scalar = ScalarValue::try_from_array(batch.column(*column_index), row)?;
+                    index.insert(scalar)?;
+                }
+            }
         }
         Ok(())
     }
 
     /// Inverse of [`Self::apply_insert_row`], subtracting a previously-captured
-    /// input scalar. `COUNT`/`SUM(Int64|UInt64)` are exactly invertible;
-    /// `SUM/AVG(Float64)` subtract and rely on a periodic
+    /// input scalar. `COUNT`/`SUM(Int64|UInt64)`/`AVG(int)` are exactly
+    /// invertible; `SUM/AVG(Float64)` subtract and rely on a periodic
     /// [`MaintainedAggregateRegistry::rebuild_from_batches`] to bound float
     /// drift. A null input contributed nothing, so it retracts nothing.
     fn retract_row(&mut self, input: Option<&ScalarValue>) -> DataFusionResult<()> {
@@ -1225,6 +1450,26 @@ impl AggregateAccumulator {
                     *count = count.checked_sub(1).ok_or_else(retract_underflow)?;
                 }
             }
+            Self::AvgInt128 { sum, count, .. } => {
+                if let Some(scalar) = input
+                    && !scalar.is_null()
+                {
+                    let delta = scalar_as_i128(scalar)?;
+                    *sum = sum.checked_sub(delta).ok_or_else(retract_underflow)?;
+                    *count = count.checked_sub(1).ok_or_else(retract_underflow)?;
+                }
+            }
+            // `MIN`/`MAX` retract identically — remove the captured live value
+            // from the ordered multiset; the extremum falls back to the next
+            // value automatically. A null contributed nothing, so it retracts
+            // nothing.
+            Self::Min { index, .. } | Self::Max { index, .. } => {
+                if let Some(scalar) = input
+                    && !scalar.is_null()
+                {
+                    index.retract(scalar)?;
+                }
+            }
         }
         Ok(())
     }
@@ -1251,6 +1496,28 @@ impl AggregateAccumulator {
                     scalar_for_field(field, Some(ScalarValue::Float64(Some(*sum / count_f64))))
                 }
             }
+            Self::AvgInt128 { sum, count, .. } => {
+                if *count == 0 {
+                    scalar_for_field(field, Some(ScalarValue::Float64(None)))
+                } else {
+                    let count_f64 = exact_i64_to_f64(*count)?;
+                    // The exact `i128` sum is divided down to the `Float64` AVG
+                    // output; the cast rounds to nearest for sums beyond 2^53,
+                    // which is inherent to producing an `f64` average and matches
+                    // DataFusion's `AVG(int)` -> `Float64` result.
+                    #[expect(
+                        clippy::cast_precision_loss,
+                        reason = "AVG output is Float64; rounding the i128 sum to f64 is intended"
+                    )]
+                    let sum_f64 = *sum as f64;
+                    scalar_for_field(field, Some(ScalarValue::Float64(Some(sum_f64 / count_f64))))
+                }
+            }
+            // The stored extremum is already the exact input-typed scalar, so
+            // `scalar_for_field` passes it through; an empty index yields a typed
+            // `NULL` (SQL `MIN`/`MAX` over no non-null rows).
+            Self::Min { index, .. } => scalar_for_field(field, index.min_scalar()),
+            Self::Max { index, .. } => scalar_for_field(field, index.max_scalar()),
         }
     }
 }
@@ -1308,6 +1575,8 @@ fn query_spec_for_aggregate(aggregate: &AggregateExec) -> Option<QueryAggregateS
             "count" => MaintainedAggregateFunction::Count,
             "sum" => MaintainedAggregateFunction::Sum,
             "avg" => MaintainedAggregateFunction::Avg,
+            "min" => MaintainedAggregateFunction::Min,
+            "max" => MaintainedAggregateFunction::Max,
             _ => return None,
         };
 
@@ -1320,7 +1589,10 @@ fn query_spec_for_aggregate(aggregate: &AggregateExec) -> Option<QueryAggregateS
                     CountQueryColumn::Column(column) => Some(column),
                 }
             }
-            MaintainedAggregateFunction::Sum | MaintainedAggregateFunction::Avg => {
+            MaintainedAggregateFunction::Sum
+            | MaintainedAggregateFunction::Avg
+            | MaintainedAggregateFunction::Min
+            | MaintainedAggregateFunction::Max => {
                 if expressions.len() != 1 {
                     return None;
                 }
@@ -1431,6 +1703,18 @@ fn is_maintainable_float(data_type: &DataType) -> bool {
     matches!(data_type, DataType::Float32 | DataType::Float64)
 }
 
+/// Temporal types a maintained `MIN`/`MAX` can order via the integer order key:
+/// `Date32` (days), `Date64` (millis), and every `Timestamp` unit (instant) are
+/// monotonic in their backing integer, so `scalar_order_key` extracts that integer
+/// and the `i128` key sorts them exactly. `Time`/`Duration`/`Interval` are omitted
+/// (an `Interval` is not a single monotonic integer).
+fn is_maintainable_temporal(data_type: &DataType) -> bool {
+    matches!(
+        data_type,
+        DataType::Date32 | DataType::Date64 | DataType::Timestamp(_, _)
+    )
+}
+
 /// Coerce a non-null signed-integer input scalar to `i64`, widening the
 /// `Int8`/`Int16`/`Int32`/`Int64` family losslessly. SQL `SUM(int)` widens to
 /// `BIGINT` (`DataFusion`'s `Int64` sum output), so a narrower CDC column
@@ -1457,6 +1741,24 @@ fn scalar_as_u64(scalar: &ScalarValue) -> DataFusionResult<u64> {
     }
 }
 
+/// Coerce a non-null integer input scalar to `i128`, widening the whole
+/// signed (`Int8`..`Int64`) and unsigned (`UInt8`..`UInt64`) family losslessly
+/// (`u64` fits in `i128`). Used by maintained `AVG(int)`, whose `i128` running
+/// sum has ample headroom to average many values near `i64::MAX`/`u64::MAX`.
+fn scalar_as_i128(scalar: &ScalarValue) -> DataFusionResult<i128> {
+    match scalar {
+        ScalarValue::Int64(Some(v)) => Ok(i128::from(*v)),
+        ScalarValue::Int32(Some(v)) => Ok(i128::from(*v)),
+        ScalarValue::Int16(Some(v)) => Ok(i128::from(*v)),
+        ScalarValue::Int8(Some(v)) => Ok(i128::from(*v)),
+        ScalarValue::UInt64(Some(v)) => Ok(i128::from(*v)),
+        ScalarValue::UInt32(Some(v)) => Ok(i128::from(*v)),
+        ScalarValue::UInt16(Some(v)) => Ok(i128::from(*v)),
+        ScalarValue::UInt8(Some(v)) => Ok(i128::from(*v)),
+        _ => Err(type_mismatch("an integer", scalar)),
+    }
+}
+
 /// Coerce a non-null floating-point input scalar to `f64`, widening `Float32`
 /// to `Float64` losslessly (`DataFusion`'s float sum/avg output type).
 fn scalar_as_f64(scalar: &ScalarValue) -> DataFusionResult<f64> {
@@ -1464,6 +1766,49 @@ fn scalar_as_f64(scalar: &ScalarValue) -> DataFusionResult<f64> {
         ScalarValue::Float64(Some(v)) => Ok(*v),
         ScalarValue::Float32(Some(v)) => Ok(f64::from(*v)),
         _ => Err(type_mismatch("a floating-point", scalar)),
+    }
+}
+
+/// The order key for a maintained `MIN`/`MAX` value: a lossless `i128` over the
+/// signed (`Int8`..`Int64`) and unsigned (`UInt8`..`UInt64`) integer families and
+/// the integer-backed temporal types (`Date32` days, `Date64` millis, and every
+/// `Timestamp` unit's instant). `i128` holds every `i64` and every `u64`, and its
+/// natural order matches SQL ordering within a single fixed-type column — a column
+/// carries one temporal unit + timezone, so the backing integers are directly
+/// comparable — so it is a correct total order for the `BTreeMap`. The exact
+/// input-typed `ScalarValue` is stored alongside the key, preserving the unit and
+/// timezone on output. Float `MIN`/`MAX` (NaN ordering) is a deliberate follow-up
+/// and errors here — the view then simply does not build, and the query falls back
+/// to a base-table scan (correct, not accelerated).
+#[expect(
+    clippy::match_same_arms,
+    reason = "each integer/temporal arm binds a different-width value (&i64, &i32, &i8, &u64, ...) so the identical-looking i128::from(*v) bodies cannot be merged into one | pattern"
+)]
+fn scalar_order_key(scalar: &ScalarValue) -> DataFusionResult<i128> {
+    match scalar {
+        ScalarValue::Int64(Some(v)) => Ok(i128::from(*v)),
+        ScalarValue::Int32(Some(v)) => Ok(i128::from(*v)),
+        ScalarValue::Int16(Some(v)) => Ok(i128::from(*v)),
+        ScalarValue::Int8(Some(v)) => Ok(i128::from(*v)),
+        ScalarValue::UInt64(Some(v)) => Ok(i128::from(*v)),
+        ScalarValue::UInt32(Some(v)) => Ok(i128::from(*v)),
+        ScalarValue::UInt16(Some(v)) => Ok(i128::from(*v)),
+        ScalarValue::UInt8(Some(v)) => Ok(i128::from(*v)),
+        // Integer-backed temporal types share the ordering — a column carries a
+        // single unit/timezone, so the backing integers are directly comparable.
+        ScalarValue::Date32(Some(v)) => Ok(i128::from(*v)),
+        ScalarValue::Date64(Some(v)) => Ok(i128::from(*v)),
+        ScalarValue::TimestampSecond(Some(v), _) => Ok(i128::from(*v)),
+        ScalarValue::TimestampMillisecond(Some(v), _) => Ok(i128::from(*v)),
+        ScalarValue::TimestampMicrosecond(Some(v), _) => Ok(i128::from(*v)),
+        ScalarValue::TimestampNanosecond(Some(v), _) => Ok(i128::from(*v)),
+        // `Decimal128`'s backing value IS an `i128`; a column carries one fixed
+        // scale, so ordering by that integer orders by the decimal value.
+        ScalarValue::Decimal128(Some(v), _, _) => Ok(*v),
+        _ => Err(type_mismatch(
+            "a signed/unsigned integer, temporal, or decimal128",
+            scalar,
+        )),
     }
 }
 
@@ -1557,6 +1902,18 @@ fn retract_underflow() -> DataFusionError {
     )
 }
 
+/// The `AVG(int)` running sum overflowed its `i128` accumulator on the insert
+/// path. AVG-specific (not [`sum_overflow`], whose "SUM" text would misreport the
+/// failing aggregate); with `i128` headroom this is effectively unreachable, but
+/// it fails safe. The retract path reuses [`retract_underflow`], matching
+/// `COUNT`/`SUM(UInt64)`.
+fn avg_overflow() -> DataFusionError {
+    DataFusionError::Execution(
+        "Maintained aggregate AVG running sum overflowed its i128 accumulator; falling back to base table scan"
+            .to_string(),
+    )
+}
+
 fn type_mismatch(expected: &'static str, scalar: &ScalarValue) -> DataFusionError {
     DataFusionError::Execution(format!(
         "Maintained aggregate expected {expected} input but received {scalar:?}"
@@ -1568,8 +1925,11 @@ mod tests {
     use super::*;
     use std::collections::BTreeMap;
 
-    use arrow::array::{Float64Array, Int32Array, Int64Array, StringArray, UInt64Array};
-    use arrow_schema::{Field, Schema};
+    use arrow::array::{
+        Decimal128Array, Float64Array, Int32Array, Int64Array, StringArray,
+        TimestampMicrosecondArray, UInt64Array,
+    };
+    use arrow_schema::{Field, Schema, TimeUnit};
     use datafusion::physical_expr::aggregate::AggregateExprBuilder;
     use datafusion::physical_expr::expressions::{cast, col, lit};
     use datafusion::physical_plan::aggregates::PhysicalGroupBy;
@@ -1578,6 +1938,7 @@ mod tests {
     };
     use datafusion_functions_aggregate::average::avg_udaf;
     use datafusion_functions_aggregate::count::count_udaf;
+    use datafusion_functions_aggregate::min_max::{max_udaf, min_udaf};
     use datafusion_functions_aggregate::sum::sum_udaf;
 
     fn schema() -> SchemaRef {
@@ -1910,6 +2271,8 @@ mod tests {
                     MaintainedAggregateFunction::Count => count_udaf(),
                     MaintainedAggregateFunction::Sum => sum_udaf(),
                     MaintainedAggregateFunction::Avg => avg_udaf(),
+                    MaintainedAggregateFunction::Min => min_udaf(),
+                    MaintainedAggregateFunction::Max => max_udaf(),
                 };
                 AggregateExprBuilder::new(udaf, aggregate_args)
                     .schema(Arc::clone(&schema))
@@ -2235,6 +2598,337 @@ mod tests {
         Ok(())
     }
 
+    /// Serve `MIN(i)`, `MAX(i)` GROUP BY `name` from the registry, returning the
+    /// per-group extrema (NULL extrema are omitted). `i` is the module schema's
+    /// `Int64` column; the group key is `name`.
+    fn min_max_by_name(
+        registry: &MaintainedAggregateRegistry,
+    ) -> DataFusionResult<(BTreeMap<String, i64>, BTreeMap<String, i64>)> {
+        let aggregate = aggregate_exec_for(&[
+            ("min(i)", MaintainedAggregateFunction::Min, Some("i")),
+            ("max(i)", MaintainedAggregateFunction::Max, Some("i")),
+        ])?;
+        let epoch = registry.state.read().epoch;
+        let result = registry
+            .batch_for_aggregate(&aggregate, epoch)?
+            .expect("registry should be fresh");
+        let names = as_string_array(result.column(0))?;
+        let mins = as_int64_array(result.column(1))?;
+        let maxs = as_int64_array(result.column(2))?;
+        let mut min_out = BTreeMap::new();
+        let mut max_out = BTreeMap::new();
+        for row in 0..result.num_rows() {
+            let name = names.value(row).to_string();
+            if !mins.is_null(row) {
+                min_out.insert(name.clone(), mins.value(row));
+            }
+            if !maxs.is_null(row) {
+                max_out.insert(name, maxs.value(row));
+            }
+        }
+        Ok((min_out, max_out))
+    }
+
+    fn min_max_i_spec() -> MaintainedAggregateSpec {
+        MaintainedAggregateSpec {
+            filter: None,
+            group_by: vec!["name".to_string()],
+            aggregates: vec![
+                MaintainedAggregateExpr {
+                    function: MaintainedAggregateFunction::Min,
+                    column: Some("i".to_string()),
+                },
+                MaintainedAggregateExpr {
+                    function: MaintainedAggregateFunction::Max,
+                    column: Some("i".to_string()),
+                },
+            ],
+        }
+    }
+
+    /// The retraction-hard core: deleting the current group MIN or MAX must
+    /// expose the next value from the maintained ordered multiset — the exact
+    /// case `COUNT`/`SUM` (invert-by-subtract) cannot do and the reason MIN/MAX
+    /// needs the kept ordered structure. PK = `u` (column 2).
+    #[test]
+    fn maintains_min_max_with_retraction() -> DataFusionResult<()> {
+        let registry = MaintainedAggregateRegistry::try_new_with_pk(
+            &[min_max_i_spec()],
+            &schema(),
+            &[2],
+            usize::MAX,
+        )?;
+        // group a: i = {10(pk1), 20(pk2), 5(pk3)} -> min 5, max 20.
+        // group b: i = {7(pk4)}                    -> min 7, max 7.
+        registry.apply_insert_batches(
+            1,
+            &[group_batch(&[
+                ("a", 1, 10),
+                ("a", 2, 20),
+                ("a", 3, 5),
+                ("b", 4, 7),
+            ])],
+        )?;
+        let (min, max) = min_max_by_name(&registry)?;
+        assert_eq!(min.get("a"), Some(&5));
+        assert_eq!(max.get("a"), Some(&20));
+        assert_eq!(min.get("b"), Some(&7));
+        assert_eq!(max.get("b"), Some(&7));
+
+        // Delete pk=3 (the current MIN of a, value 5): MIN falls back to 10, MAX unchanged.
+        registry.apply_pk_deletes(2, &group_batch(&[("", 3, 0)]).project(&[2])?)?;
+        let (min, max) = min_max_by_name(&registry)?;
+        assert_eq!(
+            min.get("a"),
+            Some(&10),
+            "MIN exposes the next value after the extremum is retracted"
+        );
+        assert_eq!(max.get("a"), Some(&20));
+
+        // Delete pk=2 (the current MAX of a, value 20): a = {10}, min == max == 10.
+        registry.apply_pk_deletes(3, &group_batch(&[("", 2, 0)]).project(&[2])?)?;
+        let (min, max) = min_max_by_name(&registry)?;
+        assert_eq!(min.get("a"), Some(&10));
+        assert_eq!(
+            max.get("a"),
+            Some(&10),
+            "MAX exposes the next value after the extremum is retracted"
+        );
+        Ok(())
+    }
+
+    /// NULLs never feed an extremum, but a row still counts toward the group's
+    /// existence: an entirely-NULL group survives with NULL MIN/MAX, and a
+    /// partially-NULL group reports the extremum of its non-null values.
+    #[test]
+    fn min_max_ignores_nulls_and_keeps_all_null_group() -> DataFusionResult<()> {
+        let registry = MaintainedAggregateRegistry::try_new_with_pk(
+            &[min_max_i_spec()],
+            &schema(),
+            &[2],
+            usize::MAX,
+        )?;
+        // group a: i = {NULL(pk1), 3(pk2), NULL(pk3)} -> min == max == 3.
+        // group b: i = {NULL(pk4)}                    -> min == max == NULL (group present).
+        let null_i_batch = RecordBatch::try_new(
+            schema(),
+            vec![
+                Arc::new(StringArray::from(vec![
+                    Some("a"),
+                    Some("a"),
+                    Some("a"),
+                    Some("b"),
+                ])),
+                Arc::new(Int64Array::from(vec![None, Some(3_i64), None, None])),
+                Arc::new(UInt64Array::from(vec![1_u64, 2, 3, 4])),
+                Arc::new(Float64Array::from(
+                    vec![None, None, None, None] as Vec<Option<f64>>
+                )),
+            ],
+        )
+        .expect("null-i batch should be valid");
+        registry.apply_insert_batches(1, &[null_i_batch])?;
+        let (min, max) = min_max_by_name(&registry)?;
+        assert_eq!(min.get("a"), Some(&3));
+        assert_eq!(max.get("a"), Some(&3));
+        assert_eq!(min.get("b"), None, "all-NULL group b has NULL MIN");
+        assert_eq!(max.get("b"), None, "all-NULL group b has NULL MAX");
+
+        // Retract pk=2 (a's only non-null i): a is now entirely NULL -> NULL MIN/MAX, group still live.
+        registry.apply_pk_deletes(2, &group_batch(&[("", 2, 0)]).project(&[2])?)?;
+        let (min, max) = min_max_by_name(&registry)?;
+        assert_eq!(min.get("a"), None, "a is now all-NULL i -> NULL MIN");
+        assert_eq!(max.get("a"), None);
+        Ok(())
+    }
+
+    /// The dominant real-world MIN/MAX pattern is temporal — "earliest / latest
+    /// event per group". `Date`/`Timestamp` are integer-backed and monotonic, so
+    /// they reuse the integer order key (no NaN complexity) and preserve the exact
+    /// unit/timezone on output. Retraction-hard case included: deleting the current
+    /// earliest or latest exposes the next. PK = `pk` (column 2).
+    #[test]
+    fn maintains_min_max_over_timestamps() -> DataFusionResult<()> {
+        let ts_type = DataType::Timestamp(TimeUnit::Microsecond, None);
+        let ts_schema = Arc::new(Schema::new(vec![
+            Field::new("name", DataType::Utf8, true),
+            Field::new("ts", ts_type.clone(), true),
+            Field::new("pk", DataType::Int64, false),
+        ]));
+        let spec = MaintainedAggregateSpec {
+            filter: None,
+            group_by: vec!["name".to_string()],
+            aggregates: vec![
+                MaintainedAggregateExpr {
+                    function: MaintainedAggregateFunction::Min,
+                    column: Some("ts".to_string()),
+                },
+                MaintainedAggregateExpr {
+                    function: MaintainedAggregateFunction::Max,
+                    column: Some("ts".to_string()),
+                },
+            ],
+        };
+        let registry = MaintainedAggregateRegistry::try_new_with_pk(
+            std::slice::from_ref(&spec),
+            &ts_schema,
+            &[2],
+            usize::MAX,
+        )?;
+        // (ts_micros, pk); all rows are group "a".
+        let ts_batch = |rows: &[(i64, i64)]| {
+            RecordBatch::try_new(
+                Arc::clone(&ts_schema),
+                vec![
+                    Arc::new(StringArray::from(vec![Some("a"); rows.len()])),
+                    Arc::new(TimestampMicrosecondArray::from(
+                        rows.iter().map(|(t, _)| *t).collect::<Vec<_>>(),
+                    )),
+                    Arc::new(Int64Array::from(
+                        rows.iter().map(|(_, p)| *p).collect::<Vec<_>>(),
+                    )),
+                ],
+            )
+            .expect("timestamp batch should be valid")
+        };
+        let out_schema = Arc::new(Schema::new(vec![
+            Field::new("name", DataType::Utf8, true),
+            Field::new("min_ts", ts_type.clone(), true),
+            Field::new("max_ts", ts_type, true),
+        ]));
+        let serve = |epoch: u64| -> DataFusionResult<(i64, i64)> {
+            let batch = registry
+                .batch_for_spec(&spec, epoch, Arc::clone(&out_schema))?
+                .expect("registry fresh and view matches");
+            assert_eq!(batch.num_rows(), 1, "single group 'a'");
+            let mins = batch
+                .column(1)
+                .as_any()
+                .downcast_ref::<TimestampMicrosecondArray>()
+                .expect("min_ts is TimestampMicrosecond");
+            let maxs = batch
+                .column(2)
+                .as_any()
+                .downcast_ref::<TimestampMicrosecondArray>()
+                .expect("max_ts is TimestampMicrosecond");
+            Ok((mins.value(0), maxs.value(0)))
+        };
+
+        // ts {100(pk1), 300(pk2), 200(pk3)} -> min 100, max 300.
+        registry.apply_insert_batches(1, &[ts_batch(&[(100, 1), (300, 2), (200, 3)])])?;
+        assert_eq!(serve(1)?, (100, 300));
+
+        // Delete pk2 (ts=300, current MAX) -> MAX exposes the next-latest, 200.
+        registry.apply_pk_deletes(2, &ts_batch(&[(0, 2)]).project(&[2])?)?;
+        assert_eq!(
+            serve(2)?,
+            (100, 200),
+            "MAX exposes the next-latest timestamp"
+        );
+
+        // Delete pk1 (ts=100, current MIN) -> MIN exposes the next-earliest, 200.
+        registry.apply_pk_deletes(3, &ts_batch(&[(0, 1)]).project(&[2])?)?;
+        assert_eq!(
+            serve(3)?,
+            (200, 200),
+            "MIN exposes the next-earliest timestamp"
+        );
+        Ok(())
+    }
+
+    /// Financial MIN/MAX (min/max amount per group) over `Decimal128`, whose
+    /// backing value is an `i128` — the order key IS that integer (a column has
+    /// one fixed scale, so no scaling is needed). Also covers a duplicated value
+    /// (the multiset keeps a count, so one retraction of a value seen twice does
+    /// not drop it). `Decimal256` (i256) stays a follow-up. PK = `pk` (column 2).
+    #[test]
+    fn maintains_min_max_over_decimal128() -> DataFusionResult<()> {
+        let dec_type = DataType::Decimal128(12, 2);
+        let dec_schema = Arc::new(Schema::new(vec![
+            Field::new("name", DataType::Utf8, true),
+            Field::new("amt", dec_type.clone(), true),
+            Field::new("pk", DataType::Int64, false),
+        ]));
+        let spec = MaintainedAggregateSpec {
+            filter: None,
+            group_by: vec!["name".to_string()],
+            aggregates: vec![
+                MaintainedAggregateExpr {
+                    function: MaintainedAggregateFunction::Min,
+                    column: Some("amt".to_string()),
+                },
+                MaintainedAggregateExpr {
+                    function: MaintainedAggregateFunction::Max,
+                    column: Some("amt".to_string()),
+                },
+            ],
+        };
+        let registry = MaintainedAggregateRegistry::try_new_with_pk(
+            std::slice::from_ref(&spec),
+            &dec_schema,
+            &[2],
+            usize::MAX,
+        )?;
+        // (raw i128 at scale 2, pk); all rows are group "a".
+        let dec_batch = |rows: &[(i128, i64)]| {
+            let amounts = Decimal128Array::from(rows.iter().map(|(a, _)| *a).collect::<Vec<_>>())
+                .with_precision_and_scale(12, 2)
+                .expect("valid decimal precision/scale");
+            RecordBatch::try_new(
+                Arc::clone(&dec_schema),
+                vec![
+                    Arc::new(StringArray::from(vec![Some("a"); rows.len()])),
+                    Arc::new(amounts),
+                    Arc::new(Int64Array::from(
+                        rows.iter().map(|(_, p)| *p).collect::<Vec<_>>(),
+                    )),
+                ],
+            )
+            .expect("decimal batch should be valid")
+        };
+        let out_schema = Arc::new(Schema::new(vec![
+            Field::new("name", DataType::Utf8, true),
+            Field::new("min_amt", dec_type.clone(), true),
+            Field::new("max_amt", dec_type, true),
+        ]));
+        let serve = |epoch: u64| -> DataFusionResult<(i128, i128)> {
+            let batch = registry
+                .batch_for_spec(&spec, epoch, Arc::clone(&out_schema))?
+                .expect("registry fresh and view matches");
+            assert_eq!(batch.num_rows(), 1, "single group 'a'");
+            let mins = batch
+                .column(1)
+                .as_any()
+                .downcast_ref::<Decimal128Array>()
+                .expect("min_amt is Decimal128");
+            let maxs = batch
+                .column(2)
+                .as_any()
+                .downcast_ref::<Decimal128Array>()
+                .expect("max_amt is Decimal128");
+            Ok((mins.value(0), maxs.value(0)))
+        };
+
+        // amt {1.50(pk1), 9.99(pk2), 1.50(pk3, dup), -0.50(pk4)} -> min -50, max 999 (raw).
+        registry
+            .apply_insert_batches(1, &[dec_batch(&[(150, 1), (999, 2), (150, 3), (-50, 4)])])?;
+        assert_eq!(serve(1)?, (-50, 999));
+
+        // Delete pk2 (9.99, current MAX) -> MAX falls back to 1.50 (raw 150).
+        registry.apply_pk_deletes(2, &dec_batch(&[(0, 2)]).project(&[2])?)?;
+        assert_eq!(serve(2)?, (-50, 150), "MAX exposes the next-largest amount");
+
+        // Delete pk4 (-0.50, current MIN) -> MIN falls back to 1.50; the dup (pk1,pk3)
+        // keeps the value 150 present with count 2, so the group stays non-empty.
+        registry.apply_pk_deletes(3, &dec_batch(&[(0, 4)]).project(&[2])?)?;
+        assert_eq!(
+            serve(3)?,
+            (150, 150),
+            "MIN exposes the next-smallest amount"
+        );
+        Ok(())
+    }
+
     /// Postgres `INTEGER` → arrow `Int32`, the common CDC case (not `BIGINT` →
     /// `Int64`). `SUM` over a narrow signed-integer column must (a) be accepted
     /// at registry construction and (b) widen to `Int64` on both the insert and
@@ -2333,6 +3027,181 @@ mod tests {
             "group a = 10 + updated 7 (Int32 widened)"
         );
         assert_eq!(by_name.get("b"), None, "group b fully retracted by delete");
+        Ok(())
+    }
+
+    /// `AVG` over a narrow signed-integer column (Postgres `INTEGER` → arrow
+    /// `Int32`, the common CDC case) must (a) be accepted at registry
+    /// construction and (b) maintain an exact `i128` running sum + count across
+    /// insert, in-place update (retract-then-apply-new), and delete, dividing
+    /// down to the `Float64` AVG output. Mirrors
+    /// [`sum_over_int32_widens_on_insert_and_retract`] for `AvgInt128` — before
+    /// integer support this failed planning with "Avg maintained aggregate does
+    /// not support column type Int32".
+    #[test]
+    fn avg_over_int32_maintains_exactly_on_insert_and_retract() -> DataFusionResult<()> {
+        let i32_schema = Arc::new(Schema::new(vec![
+            Field::new("name", DataType::Utf8, true),
+            Field::new("v", DataType::Int32, true),
+            Field::new("pk", DataType::Int64, true),
+        ]));
+        let i32_batch = |rows: &[(&str, i32, i64)]| {
+            RecordBatch::try_new(
+                Arc::clone(&i32_schema),
+                vec![
+                    Arc::new(StringArray::from(
+                        rows.iter().map(|(n, _, _)| Some(*n)).collect::<Vec<_>>(),
+                    )),
+                    Arc::new(Int32Array::from(
+                        rows.iter().map(|(_, v, _)| *v).collect::<Vec<_>>(),
+                    )),
+                    Arc::new(Int64Array::from(
+                        rows.iter().map(|(_, _, pk)| *pk).collect::<Vec<_>>(),
+                    )),
+                ],
+            )
+            .expect("int32 batch should be valid")
+        };
+
+        let spec = MaintainedAggregateSpec {
+            filter: None,
+            group_by: vec!["name".to_string()],
+            aggregates: vec![MaintainedAggregateExpr {
+                function: MaintainedAggregateFunction::Avg,
+                column: Some("v".to_string()),
+            }],
+        };
+        // PK = column index 2 (`pk`). Construction must succeed for Int32 AVG.
+        let registry =
+            MaintainedAggregateRegistry::try_new_with_pk(&[spec], &i32_schema, &[2], usize::MAX)?;
+
+        registry
+            .apply_insert_batches(1, &[i32_batch(&[("a", 10, 1), ("a", 20, 2), ("b", 5, 3)])])?;
+        // UPDATE pk=2 in place (retract-old-then-apply-new): v 20 -> 7, so
+        // group a averages (10 + 7) / 2 = 8.5.
+        registry.apply_insert_batches(2, &[i32_batch(&[("a", 7, 2)])])?;
+        // DELETE pk=3 via a PK-projected batch (PK = column 2): retracts group b.
+        registry.apply_pk_deletes(3, &i32_batch(&[("", 0, 3)]).project(&[2])?)?;
+
+        // Serve via a real AggregateExec. DataFusion's AVG over an integer column
+        // outputs `Float64`, so the maintained output field is `Float64` too.
+        let input = MemorySourceConfig::try_new_exec(
+            &[vec![i32_batch(&[])]],
+            Arc::clone(&i32_schema),
+            None,
+        )?;
+        let avg_arg = cast(
+            col("v", i32_schema.as_ref())?,
+            i32_schema.as_ref(),
+            DataType::Int64,
+        )?;
+        let avg_v = AggregateExprBuilder::new(avg_udaf(), vec![avg_arg])
+            .schema(Arc::clone(&i32_schema))
+            .alias("avg(v)")
+            .build()
+            .map(Arc::new)?;
+        let aggregate = AggregateExec::try_new(
+            AggregateMode::Single,
+            PhysicalGroupBy::new_single(vec![(
+                col("name", i32_schema.as_ref())?,
+                "name".to_string(),
+            )]),
+            vec![avg_v],
+            vec![None],
+            input,
+            Arc::clone(&i32_schema),
+        )?;
+        let result = registry
+            .batch_for_aggregate(&aggregate, 3)?
+            .expect("registry should be fresh");
+        let names = as_string_array(result.column(0))?;
+        let avgs = as_float64_array(result.column(1))?;
+        let mut by_name = BTreeMap::new();
+        for row in 0..result.num_rows() {
+            if !avgs.is_null(row) {
+                by_name.insert(names.value(row).to_string(), avgs.value(row));
+            }
+        }
+        let avg_a = by_name.get("a").copied().expect("group a present");
+        assert!(
+            (avg_a - 8.5).abs() < 1e-9,
+            "group a = avg(10, updated 7) = 8.5, got {avg_a}"
+        );
+        assert_eq!(by_name.get("b"), None, "group b fully retracted by delete");
+        Ok(())
+    }
+
+    /// The `i128` running sum has the headroom `SumInt64`'s `i64` lacks: two
+    /// `Int64` rows at `i64::MAX` sum to ~1.8e19 (past `i64::MAX`), which would
+    /// overflow a `SUM`, but `AVG` accumulates in `i128` and returns their
+    /// average (`i64::MAX`) as `Float64` without erroring.
+    #[test]
+    fn avg_over_int64_near_max_does_not_overflow() -> DataFusionResult<()> {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("name", DataType::Utf8, true),
+            Field::new("v", DataType::Int64, true),
+            Field::new("pk", DataType::Int64, true),
+        ]));
+        let batch = |rows: &[(&str, i64, i64)]| {
+            RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![
+                    Arc::new(StringArray::from(
+                        rows.iter().map(|(n, _, _)| Some(*n)).collect::<Vec<_>>(),
+                    )),
+                    Arc::new(Int64Array::from(
+                        rows.iter().map(|(_, v, _)| *v).collect::<Vec<_>>(),
+                    )),
+                    Arc::new(Int64Array::from(
+                        rows.iter().map(|(_, _, pk)| *pk).collect::<Vec<_>>(),
+                    )),
+                ],
+            )
+            .expect("int64 batch should be valid")
+        };
+
+        let spec = MaintainedAggregateSpec {
+            filter: None,
+            group_by: vec!["name".to_string()],
+            aggregates: vec![MaintainedAggregateExpr {
+                function: MaintainedAggregateFunction::Avg,
+                column: Some("v".to_string()),
+            }],
+        };
+        let registry =
+            MaintainedAggregateRegistry::try_new_with_pk(&[spec], &schema, &[2], usize::MAX)?;
+        // Sum = 2 * i64::MAX overflows i64 but fits comfortably in i128.
+        registry.apply_insert_batches(1, &[batch(&[("a", i64::MAX, 1), ("a", i64::MAX, 2)])])?;
+
+        let input =
+            MemorySourceConfig::try_new_exec(&[vec![batch(&[])]], Arc::clone(&schema), None)?;
+        let avg_v = AggregateExprBuilder::new(avg_udaf(), vec![col("v", schema.as_ref())?])
+            .schema(Arc::clone(&schema))
+            .alias("avg(v)")
+            .build()
+            .map(Arc::new)?;
+        let aggregate = AggregateExec::try_new(
+            AggregateMode::Single,
+            PhysicalGroupBy::new_single(vec![(col("name", schema.as_ref())?, "name".to_string())]),
+            vec![avg_v],
+            vec![None],
+            input,
+            Arc::clone(&schema),
+        )?;
+        let result = registry
+            .batch_for_aggregate(&aggregate, 1)?
+            .expect("registry should be fresh");
+        let avgs = as_float64_array(result.column(1))?;
+        let avg_a = avgs.value(0);
+        #[expect(
+            clippy::cast_precision_loss,
+            reason = "test-only reference value; avg of two i64::MAX is i64::MAX"
+        )]
+        let expected = i64::MAX as f64;
+        assert!(
+            (avg_a - expected).abs() / expected < 1e-15,
+            "avg of two i64::MAX values is i64::MAX, got {avg_a}"
+        );
         Ok(())
     }
 

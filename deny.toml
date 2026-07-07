@@ -43,6 +43,18 @@ ignore = [
   # and the unsoundness (custom-logger `rand::rng()`) is not exercised by this
   # transitive use. Owner: data connectors/runtime.
   "RUSTSEC-2026-0097",
+  # `document_parse` pulls `ttf-parser` through `pdf-extract`/`lopdf`; the author
+  # marked it unmaintained and there is no safe upgrade (the suggested `skrifa`
+  # alternative is not wired through `lopdf`/`pdf-extract`). Owner: document_parse.
+  "RUSTSEC-2026-0192",
+  # `quick-xml` quadratic duplicate-attribute check on start tags (DoS). Pulled
+  # transitively in several versions (via vortex, AWS-XML, and serialization
+  # dependencies); no single safe upgrade across all pins yet. Owner: data components/runtime.
+  "RUSTSEC-2026-0194",
+  # `quick-xml` unbounded namespace-declaration allocation in `NsReader`
+  # (memory-exhaustion DoS), same transitive chain as RUSTSEC-2026-0194; no safe
+  # upgrade yet. Owner: data components/runtime.
+  "RUSTSEC-2026-0195",
 ]
 
 [bans]

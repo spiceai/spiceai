@@ -31,8 +31,48 @@
 //!
 //! `bucket()` only ever hashes a single column, so the multi-column
 //! `combine_hashes` path is intentionally omitted.
+//!
+//! Caveat: this module freezes the *seed and the hashing loop*, but still
+//! delegates the actual byte hashing to the external `ahash` crate (pinned only
+//! as `^0.8`). ahash gives **no** cross-version output guarantee, so a routine
+//! `cargo update` could still silently change these hashes (#11277).
+//! `bucket::tests::test_bucket_hash_stability_golden_values` pins the current
+//! output for every supported type so any such version drift fails CI loudly
+//! instead of silently re-bucketing persisted data. Keep that guard passing;
+//! only regenerate its goldens as part of a deliberate, format-versioned
+//! migration.
+//!
+//! The other half of #11277 — a build that enables ahash's AES path — is closed
+//! by the `compile_error!` guard below. ahash's `aes_hash::AHasher` and
+//! `fallback_hash::AHasher` produce **different** `hash_one` output from the
+//! same `RandomState` seed, so a build compiled for x86/x86_64 with
+//! `target_feature = "aes"` (e.g. `-C target-cpu=native`) would re-bucket every
+//! persisted partitioned dataset relative to the shipped fallback-hashed builds.
+//! CI never sets `+aes`, so the golden test alone cannot catch it — the guard
+//! turns that silent corruption into a loud build failure instead.
 
 #![allow(clippy::pedantic)]
+
+// Mirror the exact cfg ahash uses to switch `RandomState`/`AHasher` to its
+// AES-accelerated (and thus output-incompatible) implementation on x86 — see
+// `ahash::AHasher` selection in ahash's `lib.rs`. The arm AES paths additionally
+// require ahash's `nightly-arm-aes` feature, which this workspace never enables,
+// so only the x86 condition can activate through our dependency graph.
+#[cfg(all(
+    any(target_arch = "x86", target_arch = "x86_64"),
+    target_feature = "aes",
+    not(miri)
+))]
+compile_error!(
+    "runtime-datafusion-udfs is being compiled with ahash's AES hasher active \
+     (x86/x86_64 + target_feature=\"aes\", e.g. `-C target-cpu=native`). ahash's \
+     AES and fallback hashers produce different output, so this would silently \
+     re-bucket the bucket() partition transform relative to shipped builds and \
+     mis-prune persisted partitioned datasets (#11277). Build this crate without \
+     the `aes` target-feature (drop `target-cpu=native` or add `-C \
+     target-feature=-aes`), or make the bucket() hash version-independent as a \
+     deliberate, format-versioned migration."
+);
 
 pub use ahash::RandomState;
 use arrow::array::types::{IntervalDayTime, IntervalMonthDayNano};

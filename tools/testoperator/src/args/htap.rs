@@ -40,4 +40,18 @@ pub struct HtapArgs {
     /// Target OLTP transaction rate for the OLTP workload. Omit for unlimited (maximum-throughput).
     #[arg(long)]
     pub(crate) rate: Option<u32>,
+
+    /// Seed the source (schema + data) and exit, WITHOUT starting spiced or
+    /// running the workload. Used to materialise a pristine source that an
+    /// external harness can snapshot (e.g. into a Postgres template database)
+    /// for fast reuse across runs. Mutually exclusive with `--skip-prepare`.
+    #[arg(long, conflicts_with = "skip_prepare")]
+    pub(crate) prepare_only: bool,
+
+    /// Skip seeding the source: connect to an already-prepared source and run
+    /// the workload directly. Use when the harness has pre-populated the source
+    /// (e.g. restored it from a template) so the ~minutes-to-an-hour seed is not
+    /// repeated. Mutually exclusive with `--prepare-only`.
+    #[arg(long, conflicts_with = "prepare_only")]
+    pub(crate) skip_prepare: bool,
 }

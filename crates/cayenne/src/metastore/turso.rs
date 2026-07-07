@@ -322,6 +322,7 @@ impl TursoMetastore {
             statistics_blob BLOB NOT NULL,
             num_rows BIGINT NOT NULL DEFAULT 0,
             ndv_sketches BLOB,
+            num_rows_exact INTEGER NOT NULL DEFAULT 1,
             FOREIGN KEY (table_id) REFERENCES cayenne_table(table_id) ON DELETE CASCADE
         )
     ";
@@ -352,8 +353,26 @@ impl TursoMetastore {
             file_size_bytes BIGINT NOT NULL DEFAULT 0,
             min_sequence BIGINT NOT NULL DEFAULT 0,
             max_sequence BIGINT NOT NULL DEFAULT 0,
+            digest TEXT,
             FOREIGN KEY (table_id) REFERENCES cayenne_table(table_id) ON DELETE CASCADE,
             PRIMARY KEY (table_id, snapshot_id, file_path)
+        )
+    ";
+
+    /// Cold-tier object-store manifest. Mirrors the `SQLite`
+    /// `COLD_TIER_FILE_TABLE_DDL`: table-scoped, append-only, stats blob inline.
+    /// Plain-rowid and pragma-free for Turso/libSQL portability.
+    const COLD_TIER_FILE_TABLE_DDL: &'static str = r"
+        CREATE TABLE IF NOT EXISTS cayenne_cold_tier_file (
+            table_id TEXT NOT NULL,
+            file_url TEXT NOT NULL,
+            row_count BIGINT NOT NULL DEFAULT 0,
+            file_size_bytes BIGINT NOT NULL DEFAULT 0,
+            min_sequence BIGINT NOT NULL DEFAULT 0,
+            max_sequence BIGINT NOT NULL DEFAULT 0,
+            statistics_blob BLOB NOT NULL,
+            FOREIGN KEY (table_id) REFERENCES cayenne_table(table_id) ON DELETE CASCADE,
+            PRIMARY KEY (table_id, file_url)
         )
     ";
 
@@ -552,9 +571,27 @@ impl MetastoreBackend for TursoMetastore {
     async fn init_schema(&self) -> CatalogResult<()> {
         let conn = self.pool().await?.acquire().await;
 
+        // Refuse to open a catalog written by a newer, incompatible Spice build
+        // BEFORE running any migration against it (a fresh/legacy DB reads 0).
+        let mut version_rows =
+            conn.query("PRAGMA user_version", ())
+                .await
+                .map_err(|e| CatalogError::Database {
+                    message: format!("Failed to read metastore schema version: {e}"),
+                })?;
+        let stored_version = match version_rows.next().await {
+            Ok(Some(row)) => match row.get_value(0) {
+                Ok(TursoValue::Integer(v)) => v,
+                _ => 0,
+            },
+            _ => 0,
+        };
+        drop(version_rows);
+        super::ensure_supported_schema_version(stored_version)?;
+
         // Create tables
         let schema_sql = format!(
-            "{}; {}; {}; {}; {}; {}; {}; {}; {}; {}; {}; {};",
+            "{}; {}; {}; {}; {}; {}; {}; {}; {}; {}; {}; {}; {};",
             Self::TABLE_TABLE_DDL,
             Self::TABLE_NAME_UNIQUE_INDEX_DDL,
             Self::DELETE_FILE_TABLE_DDL,
@@ -564,6 +601,7 @@ impl MetastoreBackend for TursoMetastore {
             Self::TABLE_STATISTICS_DDL,
             Self::SNAPSHOT_FILE_STATISTICS_TABLE_DDL,
             Self::SNAPSHOT_FILE_TABLE_DDL,
+            Self::COLD_TIER_FILE_TABLE_DDL,
             Self::INLINED_DATA_TABLE_DDL,
             Self::INLINED_DELETE_TABLE_DDL,
             Self::PK_INDEX_TABLE_DDL
@@ -605,12 +643,35 @@ impl MetastoreBackend for TursoMetastore {
                 (),
             )
             .await;
+        // Whether the maintained `num_rows` is a provably-exact live count. Legacy
+        // rows predate the mem-tier drift fix; DEFAULT 1 trusts their count once
+        // (the next mem-tier checkpoint delta taints a drifted one to 0; only a
+        // full-rewrite `Set` restores exactness). See the sqlite note.
+        let _ = conn
+            .execute(
+                "ALTER TABLE cayenne_table_statistics ADD COLUMN num_rows_exact INTEGER NOT NULL DEFAULT 1",
+                (),
+            )
+            .await;
         // Metadata-only publish: per-commit reinsert sequence on delete-file rows;
         // NULL on legacy rows falls back to cayenne_insert_record. Forward-upgrade
         // safe; downgrade requires a catalog rebuild (see the sqlite backfill note).
+        // The `user_version` gate at the top / stamp at the bottom of this fn turns
+        // an unsafe downgrade into a loud failure instead of silent row loss.
         let _ = conn
             .execute(
                 "ALTER TABLE cayenne_delete_file ADD COLUMN reinsert_sequence BIGINT",
+                (),
+            )
+            .await;
+
+        // End-to-end data-file integrity digest (opt-in
+        // `cayenne_integrity_checksums`). NULL on legacy rows / feature-off rows
+        // → verification skipped; forward- and downgrade-safe. Appended last to
+        // match the CREATE TABLE and EXPECTED_TABLES column order.
+        let _ = conn
+            .execute(
+                "ALTER TABLE cayenne_snapshot_file ADD COLUMN digest TEXT",
                 (),
             )
             .await;
@@ -775,6 +836,21 @@ impl MetastoreBackend for TursoMetastore {
             .map_err(|e| CatalogError::Database {
                 message: format!("Failed to create inlined_delete unpublished index: {e}"),
             })?;
+
+        // Stamp the current schema version now that all migrations have succeeded,
+        // so a later downgrade to a build with a lower max version fails loudly at
+        // the gate above instead of returning silently wrong results.
+        conn.execute(
+            &format!(
+                "PRAGMA user_version = {}",
+                super::CAYENNE_METASTORE_SCHEMA_VERSION
+            ),
+            (),
+        )
+        .await
+        .map_err(|e| CatalogError::Database {
+            message: format!("Failed to stamp metastore schema version: {e}"),
+        })?;
 
         // Validate that existing tables match the expected schema.
         // This catches incompatible metadata databases from previous versions.

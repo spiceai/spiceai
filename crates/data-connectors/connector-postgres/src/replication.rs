@@ -41,7 +41,12 @@ use runtime::federated_table::FederatedTable;
 use runtime::parameters::{ExposedParamLookup, Parameters};
 use secrecy::SecretString;
 
-const DEFAULT_STATUS_INTERVAL: Duration = Duration::from_secs(10);
+// Standby status feedback cadence. Kept well below Postgres's default
+// `wal_sender_timeout` (60s) so that — combined with the worker's
+// feedback-while-backpressured behavior — a slow apply loop never lets the
+// server's liveness window lapse and reset the walsender. ~1/6 of the default
+// timeout leaves margin under CPU pressure.
+const DEFAULT_STATUS_INTERVAL: Duration = Duration::from_secs(5);
 const DEFAULT_BOOTSTRAP_BATCH_SIZE: usize = 8192;
 const MAX_BOOTSTRAP_BATCH_SIZE: usize = 1_048_576;
 
@@ -351,6 +356,18 @@ const METRICS: &[MetricSpec] = &[
          error just means the connection wobbled and we recovered.",
     )
     .auto_register(),
+    MetricSpec::new(
+        "replication_member_send_stalled_seconds_total",
+        MetricType::ObservableCounterU64,
+    )
+    .description(
+        "Cumulative seconds the shared-slot pump spent blocked delivering committed \
+         changes into this dataset's channel because its sink was not draining \
+         (downstream backpressure). The server replication connection stays alive \
+         throughout; a rising value indicates a slow apply loop stalling the shared \
+         pump. Only reported for datasets on a shared (explicitly-named) slot.",
+    )
+    .auto_register(),
 ];
 
 #[derive(Debug, Clone)]
@@ -467,6 +484,11 @@ impl MetricsProvider for PostgresMetricsProvider {
             "replication_reconnects_total" => {
                 Some(ObserveMetricCallback::U64(Box::new(move |instrument| {
                     instrument.observe(m.replication_reconnects_total(), &attributes);
+                })))
+            }
+            "replication_member_send_stalled_seconds_total" => {
+                Some(ObserveMetricCallback::U64(Box::new(move |instrument| {
+                    instrument.observe(m.member_send_stalled_seconds_total(), &attributes);
                 })))
             }
             _ => None,

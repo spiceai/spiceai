@@ -7,7 +7,7 @@ description: "Query: tpch_simple_q4"
 +---------------+---------------------------------------------------------------------------------------------------------------------------------------------------------+
 | logical_plan  | Sort: mssql.dbo.lineitem.l_quantity DESC NULLS FIRST, fetch=10                                                                                          |
 |               |   Projection: avg(mssql.dbo.lineitem.l_tax), mssql.dbo.lineitem.l_linenumber, mssql.dbo.lineitem.l_quantity                                             |
-|               |     Aggregate: groupBy=[[mssql.dbo.lineitem.l_linenumber, mssql.dbo.lineitem.l_quantity]], aggr=[[avg(CAST(mssql.dbo.lineitem.l_tax AS Float64))]]      |
+|               |     Aggregate: groupBy=[[mssql.dbo.lineitem.l_linenumber, mssql.dbo.lineitem.l_quantity]], aggr=[[avg(mssql.dbo.lineitem.l_tax)]]                       |
 |               |       TableScan: mssql.dbo.lineitem projection=[l_linenumber, l_quantity, l_tax]                                                                        |
 | physical_plan | SortPreservingMergeExec: [l_quantity@2 DESC], fetch=10                                                                                                  |
 |               |   SortExec: TopK(fetch=10), expr=[l_quantity@2 DESC], preserve_partitioning=[true]                                                                      |

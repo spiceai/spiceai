@@ -18,9 +18,9 @@ limitations under the License.
 
 use super::catalog::{CatalogError, CatalogResult, MetadataCatalog, SnapshotSequenceCommit};
 use super::metadata::{
-    CreateTableOptions, DeleteFile, DeletionType, InlinedData, InlinedDataStats, InlinedDelete,
-    PartitionMetadata, PkConflictDetection, SnapshotFile, SnapshotFileStatistics, TableMetadata,
-    TableStatistics,
+    ColdTierFile, CreateTableOptions, DeleteFile, DeletionType, InlinedData, InlinedDataStats,
+    InlinedDelete, PartitionMetadata, PkConflictDetection, SnapshotFile, SnapshotFileStatistics,
+    TableMetadata, TableStatistics,
 };
 use super::metastore::sqlite::SqliteMetastore;
 #[cfg(feature = "turso")]
@@ -634,6 +634,60 @@ impl CayenneCatalog {
     /// the listing table with inlined data) and stale table stats biased
     /// the query planner.
     ///
+    /// # Errors
+    ///
+    /// In-transaction body of [`MetadataCatalog::commit_overwrite_to_cold`]: the
+    /// cold-tier graduation's per-attempt work, factored out so the retry loop
+    /// mirrors [`Self::commit_overwrite`]. In one transaction it (a) clears the
+    /// prior cold generation, (b) inserts the new cold-file rows, then (c) runs
+    /// the standard overwrite clear + snapshot flip via
+    /// [`Self::commit_overwrite_in_txn`].
+    ///
+    /// Replace-all (a): v1 promotion re-materializes the WHOLE visible table
+    /// (warm + any prior cold, via the cross-tier scan) into this new cold
+    /// generation, so the prior cold rows are duplicated in `cold_files`; clearing
+    /// them first makes a repeated promotion non-double-counting. The superseded
+    /// physical cold objects are unreferenced afterward and reclaimed by GC.
+    ///
+    /// # Errors
+    ///
+    /// Returns the first failing statement's error (which rolls back the whole
+    /// transaction at the caller).
+    async fn commit_overwrite_to_cold_in_txn(
+        &self,
+        txn: &mut dyn MetastoreTransaction,
+        table_id: &str,
+        new_snapshot_id: &str,
+        cold_files: &[ColdTierFile],
+    ) -> CatalogResult<()> {
+        txn.execute(ExecuteParams {
+            sql: "DELETE FROM cayenne_cold_tier_file WHERE table_id = ?1",
+            params: vec![MetastoreValue::Text(table_id.to_string())],
+        })
+        .await?;
+        for f in cold_files {
+            txn.execute(ExecuteParams {
+                sql: "INSERT OR REPLACE INTO cayenne_cold_tier_file \
+                      (table_id, file_url, row_count, file_size_bytes, min_sequence, max_sequence, statistics_blob) \
+                      VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params: vec![
+                    MetastoreValue::Text(f.table_id.clone()),
+                    MetastoreValue::Text(f.file_url.clone()),
+                    MetastoreValue::Integer(f.row_count),
+                    MetastoreValue::Integer(f.file_size_bytes),
+                    MetastoreValue::Integer(f.min_sequence),
+                    MetastoreValue::Integer(f.max_sequence),
+                    MetastoreValue::Blob(f.statistics_blob.clone()),
+                ],
+            })
+            .await?;
+        }
+        // The proven overwrite clear, reused so cold graduation is exactly an
+        // overwrite whose new content lives on the cold store.
+        self.commit_overwrite_in_txn(txn, table_id, new_snapshot_id)
+            .await
+    }
+
     /// # Errors
     ///
     /// Returns [`CatalogError::InvalidOperationNoSource`] if either UUID is
@@ -1719,6 +1773,62 @@ impl MetadataCatalog for CayenneCatalog {
             })
     }
 
+    // INVARIANT (orphaned-DV cleanup): this is a low-level pointer flip on the
+    // live catalog. Today it is only used as part of a wholesale, self-contained
+    // Acceleration Snapshot restore, which re-extracts the snapshot's OWN data and
+    // deletion-vector (`.arrow`) files and metastore before/around this flip and
+    // reloads the provider from scratch — so it never reuses the live table's files.
+    // The orphaned-DV cleanup (`CayenneTableProvider::sweep_orphaned_deletion_vectors`)
+    // relies on that: it deletes DV files once they are below the surviving-sequence
+    // floor. If this primitive is ever used to flip `current_snapshot_id` to an
+    // OLDER snapshot on a LIVE table WITHOUT re-extracting its files, that older
+    // state could reference DV files the sweep already deleted. Before doing so,
+    // either keep orphaned DVs alive longer or reject restoring below the cleanup
+    // point. See the matching note on `sweep_orphaned_deletion_vectors`.
+    async fn get_orphan_eligible_delete_files(
+        &self,
+        table_id: &str,
+        max_sequence: i64,
+        limit: usize,
+    ) -> CatalogResult<Vec<DeleteFile>> {
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        self.metastore
+            .query_helper(
+                QueryParams {
+                    sql: "SELECT delete_file_id, table_id, path, path_is_relative,
+                        format, delete_count, file_size_bytes, source_data_file_path, sequence_number,
+                        reinsert_sequence
+                 FROM cayenne_delete_file
+                 WHERE table_id = ?1 AND source_data_file_path IS NULL AND sequence_number <= ?2
+                 LIMIT ?3",
+                    params: vec![
+                        MetastoreValue::Text(table_id.to_string()),
+                        MetastoreValue::Integer(max_sequence),
+                        MetastoreValue::Integer(limit),
+                    ],
+                },
+                |row| {
+                    Ok(DeleteFile {
+                        delete_file_id: row.get_string(0)?,
+                        table_id: row.get_string(1)?,
+                        source_data_file_path: row.get_optional_string(7)?,
+                        path: row.get_string(2)?,
+                        path_is_relative: row.get_bool(3)?,
+                        format: row.get_string(4)?,
+                        delete_count: row.get_i64(5)?,
+                        file_size_bytes: row.get_i64(6)?,
+                        deletion_type: crate::metadata::DeletionType::default(),
+                        sequence_number: row.get_optional_i64(8)?.unwrap_or(0),
+                        reinsert_sequence: row.get_optional_i64(9)?,
+                    })
+                },
+            )
+            .await
+            .map_err(|e| CatalogError::FailedToGetTableDeleteFiles {
+                source: Box::new(e),
+            })
+    }
+
     async fn remove_delete_files(
         &self,
         table_id: &str,
@@ -2527,8 +2637,8 @@ impl MetadataCatalog for CayenneCatalog {
         self.metastore
             .execute_helper(ExecuteParams {
                 sql: "INSERT OR REPLACE INTO cayenne_table_statistics \
-                      (table_id, statistics_blob, num_rows, ndv_sketches) \
-                      VALUES (?1, ?2, ?3, ?4)",
+                      (table_id, statistics_blob, num_rows, ndv_sketches, num_rows_exact) \
+                      VALUES (?1, ?2, ?3, ?4, ?5)",
                 params: vec![
                     MetastoreValue::Text(stats.table_id.clone()),
                     MetastoreValue::Blob(stats.statistics_blob.clone()),
@@ -2537,6 +2647,7 @@ impl MetadataCatalog for CayenneCatalog {
                         .ndv_sketches
                         .clone()
                         .map_or(MetastoreValue::Null, MetastoreValue::Blob),
+                    MetastoreValue::Integer(i64::from(stats.num_rows_exact)),
                 ],
             })
             .await
@@ -2548,7 +2659,7 @@ impl MetadataCatalog for CayenneCatalog {
             .query_helper(
                 QueryParams {
                     sql: r"
-                    SELECT table_id, statistics_blob, num_rows, ndv_sketches
+                    SELECT table_id, statistics_blob, num_rows, ndv_sketches, num_rows_exact
                     FROM cayenne_table_statistics
                     WHERE table_id = ?1
                     ",
@@ -2560,6 +2671,10 @@ impl MetadataCatalog for CayenneCatalog {
                         statistics_blob: row.get_blob(1)?,
                         num_rows: row.get_i64(2)?,
                         ndv_sketches: row.get_optional_blob(3)?,
+                        // Legacy rows (pre-migration backfill DEFAULT 1) read back
+                        // as exact — trusted once; the next mem-tier checkpoint
+                        // delta taints them if they have since drifted.
+                        num_rows_exact: row.get_i64(4)? != 0,
                     })
                 },
             )
@@ -2663,8 +2778,8 @@ impl MetadataCatalog for CayenneCatalog {
         self.metastore
             .execute_helper(ExecuteParams {
                 sql: "INSERT OR REPLACE INTO cayenne_snapshot_file \
-                      (table_id, snapshot_id, file_path, row_count, file_size_bytes, min_sequence, max_sequence) \
-                      VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                      (table_id, snapshot_id, file_path, row_count, file_size_bytes, min_sequence, max_sequence, digest) \
+                      VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
                 params: vec![
                     MetastoreValue::Text(file.table_id.clone()),
                     MetastoreValue::Text(file.snapshot_id.clone()),
@@ -2673,6 +2788,9 @@ impl MetadataCatalog for CayenneCatalog {
                     MetastoreValue::Integer(file.file_size_bytes),
                     MetastoreValue::Integer(file.min_sequence),
                     MetastoreValue::Integer(file.max_sequence),
+                    file.digest
+                        .clone()
+                        .map_or(MetastoreValue::Null, MetastoreValue::Text),
                 ],
             })
             .await
@@ -2687,7 +2805,7 @@ impl MetadataCatalog for CayenneCatalog {
             .query_helper(
                 QueryParams {
                     sql: r"
-                    SELECT table_id, snapshot_id, file_path, row_count, file_size_bytes, min_sequence, max_sequence
+                    SELECT table_id, snapshot_id, file_path, row_count, file_size_bytes, min_sequence, max_sequence, digest
                     FROM cayenne_snapshot_file
                     WHERE table_id = ?1 AND snapshot_id = ?2
                     ",
@@ -2705,6 +2823,7 @@ impl MetadataCatalog for CayenneCatalog {
                         file_size_bytes: row.get_i64(4)?,
                         min_sequence: row.get_i64(5)?,
                         max_sequence: row.get_i64(6)?,
+                        digest: row.get_optional_string(7)?,
                     })
                 },
             )
@@ -2716,7 +2835,7 @@ impl MetadataCatalog for CayenneCatalog {
             .query_helper(
                 QueryParams {
                     sql: r"
-                    SELECT table_id, snapshot_id, file_path, row_count, file_size_bytes, min_sequence, max_sequence
+                    SELECT table_id, snapshot_id, file_path, row_count, file_size_bytes, min_sequence, max_sequence, digest
                     FROM cayenne_snapshot_file
                     WHERE table_id = ?1
                     ",
@@ -2731,6 +2850,7 @@ impl MetadataCatalog for CayenneCatalog {
                         file_size_bytes: row.get_i64(4)?,
                         min_sequence: row.get_i64(5)?,
                         max_sequence: row.get_i64(6)?,
+                        digest: row.get_optional_string(7)?,
                     })
                 },
             )
@@ -2761,6 +2881,94 @@ impl MetadataCatalog for CayenneCatalog {
                 params: vec![MetastoreValue::Text(table_id.to_string())],
             })
             .await
+    }
+
+    async fn list_cold_tier_files(&self, table_id: &str) -> CatalogResult<Vec<ColdTierFile>> {
+        self.metastore
+            .query_helper(
+                QueryParams {
+                    sql: r"
+                    SELECT table_id, file_url, row_count, file_size_bytes, min_sequence, max_sequence, statistics_blob
+                    FROM cayenne_cold_tier_file
+                    WHERE table_id = ?1
+                    ",
+                    params: vec![MetastoreValue::Text(table_id.to_string())],
+                },
+                |row| {
+                    Ok(ColdTierFile {
+                        table_id: row.get_string(0)?,
+                        file_url: row.get_string(1)?,
+                        row_count: row.get_i64(2)?,
+                        file_size_bytes: row.get_i64(3)?,
+                        min_sequence: row.get_i64(4)?,
+                        max_sequence: row.get_i64(5)?,
+                        statistics_blob: row.get_blob(6)?,
+                    })
+                },
+            )
+            .await
+    }
+
+    async fn commit_overwrite_to_cold(
+        &self,
+        table_id: &str,
+        new_snapshot_id: &str,
+        cold_files: &[ColdTierFile],
+    ) -> CatalogResult<()> {
+        // Atomic warm→cold graduation with the same retry-on-conflict shape as
+        // commit_compaction/commit_overwrite; the per-attempt work lives in
+        // commit_overwrite_to_cold_in_txn below. Promotion runs on the
+        // maintenance path so a transient write conflict just retries.
+        let max_attempts = DEFAULT_CONCURRENT_WRITE_MAX_ATTEMPTS;
+        if max_attempts == 0 {
+            return Err(CatalogError::InvalidOperationNoSource {
+                message: "commit_overwrite_to_cold requires at least one attempt".to_string(),
+            });
+        }
+
+        for attempt in 1..=max_attempts {
+            let mut tx =
+                self.begin_transaction()
+                    .await
+                    .map_err(|e| CatalogError::InvalidOperation {
+                        message: "Failed to begin cold-tier promotion transaction.".to_string(),
+                        source: Box::new(e),
+                    })?;
+
+            match self
+                .commit_overwrite_to_cold_in_txn(&mut *tx, table_id, new_snapshot_id, cold_files)
+                .await
+            {
+                Ok(()) => match tx.commit().await {
+                    Ok(()) => return Ok(()),
+                    Err(e) if attempt < max_attempts && is_retryable_write_conflict(&e) => {
+                        let delay = retry_backoff_delay(attempt);
+                        tracing::debug!(
+                            attempt,
+                            max_attempts,
+                            ?delay,
+                            "Retrying cold-tier promotion transaction after commit conflict"
+                        );
+                        tokio::time::sleep(delay).await;
+                    }
+                    Err(e) => {
+                        return Err(CatalogError::InvalidOperation {
+                            message: "Failed to commit cold-tier promotion transaction."
+                                .to_string(),
+                            source: Box::new(e),
+                        });
+                    }
+                },
+                // Drop `tx` → automatic rollback; leaves the catalog unchanged.
+                Err(e) => return Err(e),
+            }
+        }
+
+        Err(CatalogError::InvalidOperationNoSource {
+            message: format!(
+                "commit_overwrite_to_cold exhausted {max_attempts} attempts without success or a terminal error"
+            ),
+        })
     }
 
     async fn upsert_pk_index(
@@ -3792,6 +4000,23 @@ impl MetadataCatalog for CayenneCatalog {
             .await
             .map_err(|e| CatalogError::InvalidOperation {
                 message: "Failed to delete snapshot file manifest.".to_string(),
+                source: Box::new(e),
+            })?;
+
+        // 5d. Delete the cold-tier object-store manifest. Like every sibling
+        // table it is cleared explicitly (rather than relying on the
+        // ON DELETE CASCADE FK) so a crash before the final `cayenne_table`
+        // delete cannot leave orphan cold-file rows. NOTE: this removes the
+        // catalog rows only — the physical cold objects are swept separately by
+        // the table-drop physical cleanup (they live on the cold object store).
+        self.metastore
+            .execute_helper(ExecuteParams {
+                sql: "DELETE FROM cayenne_cold_tier_file WHERE table_id = ?1",
+                params: vec![MetastoreValue::Text(table_id.clone())],
+            })
+            .await
+            .map_err(|e| CatalogError::InvalidOperation {
+                message: "Failed to delete cold-tier file manifest.".to_string(),
                 source: Box::new(e),
             })?;
 
