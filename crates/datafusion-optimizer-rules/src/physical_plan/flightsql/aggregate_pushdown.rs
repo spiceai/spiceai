@@ -251,9 +251,7 @@ fn walk_to_flight_exec(plan: &Arc<dyn ExecutionPlan>) -> Option<&FlightSqlExec> 
             return None;
         }
 
-        if current.is::<RepartitionExec>()
-            || PASS_THROUGH_EXEC_NAMES.contains(&current.name())
-        {
+        if current.is::<RepartitionExec>() || PASS_THROUGH_EXEC_NAMES.contains(&current.name()) {
             current = children[0];
         } else {
             return None;
