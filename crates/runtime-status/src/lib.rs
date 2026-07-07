@@ -143,14 +143,16 @@ impl RuntimeStatus {
         let catalog_name = catalog_name.into();
         let metric_value = status.discriminant();
         self.update_component_status(&format!("catalog:{catalog_name}"), status);
-        runtime_metrics::catalogs::STATUS.record(metric_value, &[KeyValue::new("catalog", catalog_name)]);
+        runtime_metrics::catalogs::STATUS
+            .record(metric_value, &[KeyValue::new("catalog", catalog_name)]);
     }
 
     pub fn update_dataset(&self, dataset: &TableReference, status: ComponentStatus) {
         let ds_name = dataset.to_string();
         let metric_value = status.discriminant();
         self.update_component_status(&format!("dataset:{ds_name}"), status);
-        runtime_metrics::datasets::STATUS.record(metric_value, &[KeyValue::new("dataset", ds_name)]);
+        runtime_metrics::datasets::STATUS
+            .record(metric_value, &[KeyValue::new("dataset", ds_name)]);
     }
 
     pub fn update_model(&self, model_name: &str, status: ComponentStatus) {
@@ -185,14 +187,16 @@ impl RuntimeStatus {
         let model_name = model_name.to_string();
         let metric_value = status.discriminant();
         self.update_component_status(&format!("embedding:{model_name}"), status);
-        runtime_metrics::embeddings::STATUS.record(metric_value, &[KeyValue::new("model", model_name)]);
+        runtime_metrics::embeddings::STATUS
+            .record(metric_value, &[KeyValue::new("model", model_name)]);
     }
 
     pub fn update_reranker(&self, model_name: &str, status: ComponentStatus) {
         let model_name = model_name.to_string();
         let metric_value = status.discriminant();
         self.update_component_status(&format!("reranker:{model_name}"), status);
-        runtime_metrics::rerankers::STATUS.record(metric_value, &[KeyValue::new("model", model_name)]);
+        runtime_metrics::rerankers::STATUS
+            .record(metric_value, &[KeyValue::new("model", model_name)]);
     }
     pub fn update_view(&self, view_name: &TableReference, status: ComponentStatus) {
         let view_name = view_name.to_string();
@@ -206,7 +210,8 @@ impl RuntimeStatus {
         let worker_name = name.to_string();
         let metric_value = status.discriminant();
         self.update_component_status(&format!("worker:{worker_name}"), status);
-        runtime_metrics::models::STATUS.record(metric_value, &[KeyValue::new("worker", worker_name)]);
+        runtime_metrics::models::STATUS
+            .record(metric_value, &[KeyValue::new("worker", worker_name)]);
     }
 
     /// Update the status of a cluster node

@@ -228,15 +228,24 @@ bollard = "0.18.1"
 bytes.workspace = true
 chrono.workspace = true
 # Connector crates for integration tests
+connector-abfs = { path = "../data-connectors/connector-abfs" }
+connector-adbc = { path = "../data-connectors/connector-adbc" }
 connector-clickhouse = { path = "../data-connectors/connector-clickhouse" }
+connector-cosmosdb = { path = "../data-connectors/connector-cosmosdb" }
 connector-databricks = { path = "../data-connectors/connector-databricks" }
 connector-delta-lake = { path = "../data-connectors/connector-delta-lake" }
 connector-dremio = { path = "../data-connectors/connector-dremio" }
 connector-duckdb = { path = "../data-connectors/connector-duckdb" }
+connector-ducklake = { path = "../data-connectors/connector-ducklake" }
 connector-flightsql = { path = "../data-connectors/connector-flightsql" }
 connector-ftp = { path = "../data-connectors/connector-ftp" }
+connector-gcs = { path = "../data-connectors/connector-gcs" }
+connector-git = { path = "../data-connectors/connector-git" }
+connector-github = { path = "../data-connectors/connector-github" }
+connector-glue = { path = "../data-connectors/connector-glue" }
 connector-graphql = { path = "../data-connectors/connector-graphql" }
 connector-imap = { path = "../data-connectors/connector-imap" }
+connector-kafka = { path = "../data-connectors/connector-kafka" }
 connector-mongodb = { path = "../data-connectors/connector-mongodb" }
 connector-mssql = { path = "../data-connectors/connector-mssql" }
 connector-mysql = { path = "../data-connectors/connector-mysql" }
@@ -249,6 +258,7 @@ connector-sharepoint = { path = "../data-connectors/connector-sharepoint" }
 connector-smb = { path = "../data-connectors/connector-smb" }
 connector-snowflake = { path = "../data-connectors/connector-snowflake" }
 connector-spark = { path = "../data-connectors/connector-spark" }
+connector-spiceai = { path = "../data-connectors/connector-spiceai" }
 criterion = { version = "0.7", features = ["async_tokio", "html_reports"] }
 hf-hub = { workspace = true }
 insta = { workspace = true, features = ["json", "redactions"] }
@@ -360,6 +370,7 @@ s3_vectors = [
     "data_components/s3_vectors",
     "dep:s3_vectors",
     "search/s3_vectors",
+    "runtime-search/s3_vectors",
 ]
 scylladb = ["db_connection_pool/scylladb", "data_components/scylladb"]
 sftp = ["runtime-object-store/sftp"]
@@ -409,3 +420,7 @@ name = "flatten_json_properties"
 [[bench]]
 harness = false
 name = "cdc_cayenne_inline"
+
+[[bench]]
+harness = false
+name = "cdc_delete_burst"

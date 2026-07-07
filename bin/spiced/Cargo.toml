@@ -10,15 +10,25 @@ version.workspace = true
 
 [dependencies]
 app = { path = "../../crates/app" }
+arrow = { workspace = true }
 clap = { workspace = true, features = ["derive"] }
+connector-abfs = { path = "../../crates/data-connectors/connector-abfs" }
+connector-adbc = { path = "../../crates/data-connectors/connector-adbc", optional = true }
+connector-kafka = { path = "../../crates/data-connectors/connector-kafka", optional = true }
 connector-clickhouse = { path = "../../crates/data-connectors/connector-clickhouse", optional = true }
+connector-cosmosdb = { path = "../../crates/data-connectors/connector-cosmosdb", optional = true }
 connector-databricks = { path = "../../crates/data-connectors/connector-databricks", optional = true }
 connector-delta-lake = { path = "../../crates/data-connectors/connector-delta-lake", optional = true }
 connector-dremio = { path = "../../crates/data-connectors/connector-dremio", optional = true }
 connector-duckdb = { path = "../../crates/data-connectors/connector-duckdb", optional = true }
+connector-ducklake = { path = "../../crates/data-connectors/connector-ducklake" }
 connector-elasticsearch = { path = "../../crates/data-connectors/connector-elasticsearch", optional = true }
 connector-flightsql = { path = "../../crates/data-connectors/connector-flightsql", optional = true }
 connector-ftp = { path = "../../crates/data-connectors/connector-ftp", optional = true }
+connector-gcs = { path = "../../crates/data-connectors/connector-gcs" }
+connector-git = { path = "../../crates/data-connectors/connector-git" }
+connector-github = { path = "../../crates/data-connectors/connector-github" }
+connector-glue = { path = "../../crates/data-connectors/connector-glue" }
 connector-graphql = { path = "../../crates/data-connectors/connector-graphql" }
 connector-imap = { path = "../../crates/data-connectors/connector-imap", optional = true }
 connector-sftp = { path = "../../crates/data-connectors/connector-sftp", optional = true }
@@ -35,6 +45,7 @@ connector-sharepoint = { path = "../../crates/data-connectors/connector-sharepoi
 connector-smb = { path = "../../crates/data-connectors/connector-smb", optional = true }
 connector-snowflake = { path = "../../crates/data-connectors/connector-snowflake", optional = true }
 connector-spark = { path = "../../crates/data-connectors/connector-spark", optional = true }
+connector-spiceai = { path = "../../crates/data-connectors/connector-spiceai" }
 event_stream = { path = "../../crates/event_stream" }
 repl = { path = "../../crates/repl" }
 futures.workspace = true
@@ -50,8 +61,11 @@ reqwest.workspace = true
 runtime = { path = "../../crates/runtime" }
 runtime-auth = { path = "../../crates/runtime-auth" }
 runtime-async = { path = "../../crates/runtime-async" }
+runtime-cloud-connect = { workspace = true }
 runtime-datafusion = { path = "../../crates/runtime-datafusion" }
 runtime-query-engine = { path = "../../crates/runtime-query-engine" }
+async-trait = { workspace = true }
+serde_json = { workspace = true }
 rustls.workspace = true
 yaml = { path = "../../crates/yaml" }
 snafu.workspace = true
@@ -69,7 +83,7 @@ util = { path = "../../crates/util"}
 
 # Non-default features should be added to `lint-rust` make target.
 [features]
-adbc = ["runtime/adbc"]
+adbc = ["dep:connector-adbc", "runtime/adbc"]
 alloc-jemalloc = ["dep:tikv-jemallocator"]
 alloc-mimalloc = ["dep:mimalloc"]
 alloc-snmalloc = []
@@ -79,7 +93,7 @@ aws-secrets-manager = ["runtime/aws-secrets-manager"]
 azure-keyvault = ["runtime/azure-keyvault"]
 hashicorp_vault = ["runtime/hashicorp_vault"]
 clickhouse = ["connector-clickhouse", "runtime/clickhouse"]
-cosmosdb = ["runtime/cosmosdb"]
+cosmosdb = ["connector-cosmosdb", "runtime/cosmosdb"]
 cuda = ["runtime/cuda"]
 databricks = ["connector-databricks", "runtime/databricks"]
 debezium = ["runtime/debezium"]
@@ -134,7 +148,7 @@ wasm-functions = ["runtime/wasm-functions"]
 wasm-functions-compile = ["runtime/wasm-functions-compile"]
 iceberg-write = ["runtime/iceberg-write"]
 imap = ["connector-imap", "runtime/imap"]
-kafka = ["runtime/kafka"]
+kafka = ["dep:connector-kafka", "runtime/kafka"]
 keyring-secret-store = ["runtime/keyring-secret-store"]
 mcp = ["runtime/mcp"]
 metal = ["runtime/metal"]

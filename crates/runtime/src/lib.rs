@@ -17,6 +17,7 @@ limitations under the License.
 #![recursion_limit = "256"]
 
 use ::tools::SpiceModelTool;
+use ::tools::naming::{decode_tool_name, encode_tool_name};
 use ::tools::rename::with_name;
 use async_stream::stream;
 use datafusion_expr::Expr;
@@ -86,7 +87,7 @@ use crate::udtfs::ListUDFTableFunc;
 use runtime_async::cancellable_task::{CancellableTaskHandle, spawn_cancellable_task};
 pub mod accelerated_table;
 pub mod auth;
-mod builder;
+pub mod builder;
 pub mod catalogconnector;
 mod changes;
 pub mod component;
@@ -96,6 +97,7 @@ pub mod dataconnector;
 pub mod datafusion;
 pub mod datasets_health_monitor;
 pub mod dataupdate;
+pub(crate) mod egress;
 pub mod embeddings;
 pub mod execution_plan;
 pub mod executor_table;
@@ -524,6 +526,18 @@ pub struct LogErrors(pub bool);
 #[expect(clippy::struct_field_names)]
 pub struct Runtime {
     app: Arc<RwLock<Option<Arc<App>>>>,
+    /// Serializes [`Runtime::apply_app`] so that concurrent callers cannot
+    /// interleave their diff-and-swap. `apply_app` computes diffs under a read
+    /// lock and only takes the app write lock for the final swap; that is sound
+    /// when applies are serialized, but `apply_app` now has two independent
+    /// callers — the on-disk pods watcher and Spice Cloud Connect's
+    /// `apply_spicepod` — which can fire concurrently. Without this mutex two
+    /// applies could diff against the same old app, interleave their
+    /// catalog/dataset/view mutations, and last-writer-wins the swap. Holding
+    /// this mutex (not the app write lock) for the whole apply avoids that while
+    /// keeping the read-lock-for-diff / write-lock-for-swap discipline, so the
+    /// diff phase can still read the app `RwLock` without deadlocking.
+    apply_app_lock: Arc<tokio::sync::Mutex<()>>,
     df: Arc<DataFusion>,
     // `Arc<Model>` (not `Model`) so a handle can be cloned out of the lock and
     // moved into `spawn_blocking` to run synchronous inference off the runtime.
@@ -895,8 +909,14 @@ impl Runtime {
         table: ResolvedTableReference,
         assignments: &PartitionAssignments,
     ) -> Result<()> {
-        let partition_filters =
-            crate::cluster::partition::get_partition_filter_exprs(&table, assignments);
+        // This path runs only in executor partitioned mode, so the table is
+        // always partition-scoped: wrap in `Some`. An empty result here means no
+        // partition is assigned to this executor, which resolves to a `false`
+        // predicate (load no rows) rather than an unfiltered full-table load.
+        let partition_filters = Some(crate::cluster::partition::get_partition_filter_exprs(
+            &table,
+            assignments,
+        ));
 
         let table_ref = TableReference::full(
             Arc::<str>::clone(&table.catalog),
@@ -1003,7 +1023,26 @@ impl Runtime {
         // result mid-ingest. So there is no non-degrading cache here — each tick
         // simply broadcasts the current aggregate.
         loop {
-            interval.tick().await;
+            // Rebroadcast on write completion (debounced so a burst of segment
+            // publishes coalesces into one pass) with the interval tick as the
+            // idle heartbeat.
+            let df_for_notify = self.datafusion();
+            tokio::select! {
+                _ = interval.tick() => {}
+                () = df_for_notify.write_completed_notified() => {
+                    // Debounce, then drain the (at most one) permit stored by
+                    // writes that completed during the sleep so a burst yields
+                    // a single rebroadcast; writes after this point store a
+                    // fresh permit and trigger the next pass.
+                    tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+                    let _ = tokio::time::timeout(
+                        std::time::Duration::ZERO,
+                        df_for_notify.write_completed_notified(),
+                    )
+                    .await;
+                    interval.reset();
+                }
+            }
             let Some(broadcaster) = self.executor_outbound_broadcaster() else {
                 continue;
             };
@@ -1842,7 +1881,7 @@ impl Runtime {
                         }
                         let all = catalog.all().await;
                         for tool in all {
-                            yield with_name(&tool, format!("{}/{}", catalog.name(), tool.name()).as_str());
+                            yield with_name(&tool, encode_tool_name(catalog.name(), &tool.name()).as_str());
                         }
                     }
                 }
@@ -1852,20 +1891,18 @@ impl Runtime {
 
     pub async fn get_tool(self: &Arc<Self>, tool_name: &str) -> Option<Arc<dyn SpiceModelTool>> {
         let tools = self.tools.read().await;
-        let tool: Arc<dyn SpiceModelTool> =
-            if let Some((catalog_name, name)) = tool_name.split_once('/') {
-                let Some(Tooling::Catalog { tools: catalog, .. }) = tools.get(catalog_name) else {
-                    return None;
-                };
-                return catalog.get(name).await;
-            } else {
-                let Some(Tooling::Tool(tool) | Tooling::FunctionTool(tool)) = tools.get(tool_name)
-                else {
-                    return None;
-                };
-                Arc::clone(tool)
-            };
-        Some(tool)
+        if let Some((catalog_name, name)) = decode_tool_name(tool_name)
+            && let Some(Tooling::Catalog { tools: catalog, .. }) = tools.get(&catalog_name)
+            && let Some(tool) = catalog.get(&name).await
+        {
+            return Some(tool);
+        }
+        // Fall back to a direct (non-catalog) lookup — covers top-level tools
+        // whose names legitimately contain the `__` catalog separator.
+        let Some(Tooling::Tool(tool) | Tooling::FunctionTool(tool)) = tools.get(tool_name) else {
+            return None;
+        };
+        Some(Arc::clone(tool))
     }
 }
 

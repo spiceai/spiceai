@@ -20,6 +20,7 @@ pub mod mcp;
 #[cfg(feature = "mcp")]
 pub use mcp::McpProxy;
 
+pub mod naming;
 pub mod rename;
 
 use async_trait::async_trait;

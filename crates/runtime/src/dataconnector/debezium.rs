@@ -22,8 +22,8 @@ use crate::accelerated_table::refresh_task::changes::{
 };
 use crate::component::dataset::acceleration::{Engine, RefreshMode};
 use crate::component::dataset::{Dataset, OnSchemaChange};
-use runtime_metrics::component::MetricsProvider;
 use crate::dataaccelerator::spice_sys::{self, OpenOption, debezium_kafka::DebeziumKafkaSys};
+use crate::dataconnector::schema_projection::{ProjectionPolicy, parse_schema_projection};
 use crate::dataconnector::{
     ConnectorComponent,
     kafka::{SidecarOffsetCommitHook, SidecarOffsetStore},
@@ -43,6 +43,7 @@ use data_components::kafka::{KafkaConfig, KafkaConsumer, KafkaMetrics, KafkaOffs
 use data_components::schema_discovery::merge_inferred_and_declared_schemas;
 use datafusion::datasource::TableProvider;
 use futures::StreamExt;
+use runtime_metrics::component::MetricsProvider;
 use serde::{Deserialize, Serialize};
 use snafu::prelude::*;
 use std::any::Any;
@@ -487,6 +488,18 @@ impl DataConnector for Debezium {
             }
         };
 
+        // JSON-nesting / declared-schema projection. Primary-key (Kafka key)
+        // columns must be declared explicitly — never folded into the catch-all
+        // — so CDC UPDATE/DELETE apply keeps working.
+        let projection = parse_schema_projection(
+            dataset,
+            &ProjectionPolicy::new("debezium").with_required_columns(metadata.primary_keys.clone()),
+        )?;
+        let schema = match &projection {
+            Some(p) => p.project_schema(schema),
+            None => schema,
+        };
+
         ensure!(
             !metadata.primary_keys.is_empty()
                 || matches!(acceleration.engine.to_unpartitioned(), Engine::Arrow),
@@ -535,6 +548,7 @@ impl DataConnector for Debezium {
             metadata.primary_keys,
             kafka_consumer,
             self.batching,
+            projection,
         );
 
         if let Some(debezium_kafka_sys) = debezium_kafka_sys {

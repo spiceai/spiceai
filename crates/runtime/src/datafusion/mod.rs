@@ -639,7 +639,11 @@ pub enum Table {
         /// Initial partition filter expressions to apply before the refresher starts.
         /// These are set on the `Refresh` during table registration to avoid a race
         /// where the first refresh runs before partition filters are applied.
-        initial_partition_filters: Vec<datafusion_expr::Expr>,
+        ///
+        /// Uses the `RefreshSQL` three-state partition-filter semantics: `None`
+        /// (not partition-scoped), `Some(filters)` (assigned partitions), or
+        /// `Some(empty)` (executor owns no partition — load no rows).
+        initial_partition_filters: Option<Vec<datafusion_expr::Expr>>,
     },
     Federated {
         data_connector: Arc<dyn DataConnector>,
@@ -728,6 +732,11 @@ pub struct DataFusion {
     /// `Acquire`-ordered atomic load and skip the lookup entirely.
     pending_initializations_count: std::sync::atomic::AtomicUsize,
     query_cancel_registry: Arc<QueryCancelRegistry>,
+
+    /// Signalled after each completed streaming write; the cluster executor
+    /// statistics reporter listens so scheduler-side stats (and the COUNT(*)
+    /// folds derived from them) track publishes instead of a fixed interval.
+    write_stats_notify: tokio::sync::Notify,
 
     pub(crate) accelerator_engine_registry: Arc<AcceleratorEngineRegistry>,
     // Controls the parallelism of accelerated table refreshes
@@ -1462,6 +1471,25 @@ impl DataFusion {
             "Cayenne global encode-concurrency budget active (caps aggregate write-encode shards across all tables)"
         );
 
+        // Install the process-global query-admission governor so the per-table
+        // adaptive CDC controller can SHED concurrent analytical queries when a
+        // memory-mode table is behind its freshness/lag SLO AND CPU is the
+        // contended resource — handing cores back to the CDC apply — then restore
+        // them when it catches up. Reuses the SAME count-based admission semaphore
+        // the query path acquires from (deadlock-safe: it admits whole queries, not
+        // partitions). A no-op when admission is unbounded
+        // (`runtime.query.max_concurrent_queries` unset → no semaphore).
+        if let Some(semaphore) = self.query_admission_semaphore.as_ref() {
+            // No queries run at install time, so `available_permits()` is the pool's
+            // full capacity (`max_concurrent_queries`).
+            let max = semaphore.available_permits();
+            cayenne::set_query_admission_governor(Arc::clone(semaphore), max);
+            tracing::info!(
+                max_concurrent_queries = max,
+                "Cayenne adaptive query-admission throttle active (controller sheds concurrent queries when CDC is behind its freshness/lag SLO under CPU contention)"
+            );
+        }
+
         // Install the process-global in-memory CDC tier byte budget: the hard
         // aggregate RAM ceiling for `cdc_durability: memory` across ALL Cayenne
         // tables. Per-table `cayenne_cdc_mem_tier_max_bytes` is sized in
@@ -1783,23 +1811,66 @@ impl DataFusion {
                 DataFusionError::External(Box::new(std::io::Error::other(e.to_string())))
             })?;
 
-            // Swap the placeholder out of the catalog with the real
-            // provider so federation analysis on the eventual logical
-            // plan downcasts to the underlying
-            // `FederatedTableProviderAdaptor`.
-            if let Some(real_provider) = ready.table_provider.clone() {
-                self.replace_table(&table_ref, real_provider).map_err(|e| {
-                    DataFusionError::External(Box::new(std::io::Error::other(e.to_string())))
-                })?;
+            // Atomically claim this placeholder before swapping: the resolver
+            // that removes it from the pending registry owns the swap, and any
+            // concurrent resolver that finds it already gone skips its own
+            // swap. This is the global serialization point that stops two
+            // callers from both swapping the same table — a redundant swap is
+            // wasted work and, historically, reopened the deregister/register
+            // window this fix closes. The lock is released before touching the
+            // catalog, so we never hold `pending_initializations` across a
+            // `ctx` table operation (avoiding any lock-order coupling with the
+            // registration paths that take the catalog lock first).
+            {
+                let mut pending = self.pending_initializations.write().await;
+                match pending.remove(&table_ref) {
+                    // Our placeholder is still the pending one — claim it.
+                    Some(current) if Arc::ptr_eq(&current, &placeholder) => {
+                        self.pending_initializations_count
+                            .fetch_sub(1, std::sync::atomic::Ordering::Release);
+                    }
+                    // A concurrent re-registration (e.g. a schema-change
+                    // recreate) replaced the placeholder after we snapshotted it
+                    // and ran `ensure_ready`. The entry we removed belongs to
+                    // that newer registration and carries its own fresh pending
+                    // initialization; put it back untouched and skip our
+                    // now-stale swap so we don't drop it or register stale data.
+                    Some(current) => {
+                        pending.insert(table_ref.clone(), current);
+                        continue;
+                    }
+                    // Already drained by a concurrent resolver.
+                    None => continue,
+                }
             }
 
-            // Drop from the pending registry. Decrement only if the
-            // entry was still present (concurrent resolvers may have
-            // already removed it).
-            let mut pending = self.pending_initializations.write().await;
-            if pending.remove(&table_ref).is_some() {
-                self.pending_initializations_count
-                    .fetch_sub(1, std::sync::atomic::Ordering::Release);
+            // Swap the placeholder out of the catalog with the real provider
+            // so federation analysis on the eventual logical plan downcasts to
+            // the underlying `FederatedTableProviderAdaptor`. `replace_table`
+            // is an atomic overwrite (a single map insert), so even though the
+            // pending lock is no longer held there is no window where the table
+            // is absent from the catalog: the placeholder — itself a fully
+            // functional provider — stays registered until the real provider
+            // atomically replaces it.
+            if let Some(real_provider) = ready.table_provider.clone()
+                && let Err(e) = self.replace_table(&table_ref, real_provider)
+            {
+                // The swap failed after we claimed the placeholder. Restore
+                // it so a later query retries the initialization instead of
+                // leaving the table stuck as a placeholder that is no longer
+                // tracked — but only if nothing has been registered under
+                // this reference since we claimed it, so we can't clobber a
+                // newer placeholder from a concurrent re-registration with
+                // our stale one.
+                let mut pending = self.pending_initializations.write().await;
+                if !pending.contains_key(&table_ref) {
+                    pending.insert(table_ref.clone(), placeholder);
+                    self.pending_initializations_count
+                        .fetch_add(1, std::sync::atomic::Ordering::Release);
+                }
+                return Err(DataFusionError::External(Box::new(std::io::Error::other(
+                    e.to_string(),
+                ))));
             }
         }
 
@@ -1813,9 +1884,13 @@ impl DataFusion {
         name: &TableReference,
         provider: Arc<dyn TableProvider>,
     ) -> Result<()> {
-        // DataFusion has no atomic replace; deregister + register is
-        // the documented pattern.
-        let _ = self.ctx.deregister_table(name.clone());
+        // Register the real provider directly, without a preceding
+        // `deregister_table`. The underlying schema provider registers via an
+        // atomic map insert that overwrites (and returns) the previous
+        // provider, so this replaces the placeholder in a single step with no
+        // window where the table is absent from the catalog. The earlier
+        // deregister-then-register opened exactly such a gap, which a
+        // concurrent query planner could observe as "table not found".
         self.ctx
             .register_table(name.clone(), provider)
             .map_err(find_datafusion_root)
@@ -1909,7 +1984,7 @@ impl DataFusion {
             federated_table,
             Arc::clone(&pending_registration.secrets),
             BootstrapStatus::none(), // Sink datasets don't bootstrap from snapshots
-            vec![],
+            None,                    // Sink datasets are not partition-scoped
         )
         .await?;
 
@@ -2040,6 +2115,11 @@ impl DataFusion {
         Ok(())
     }
 
+    /// Resolves when a streaming write has completed since the previous call.
+    pub async fn write_completed_notified(&self) {
+        self.write_stats_notify.notified().await;
+    }
+
     pub async fn write_streaming_data(
         &self,
         table_reference: &TableReference,
@@ -2131,6 +2211,8 @@ impl DataFusion {
 
         self.runtime_status
             .update_dataset(table_reference, status::ComponentStatus::Ready);
+
+        self.write_stats_notify.notify_one();
 
         if let Some(broadcast_batches) = broadcast_batches
             && self
@@ -2243,7 +2325,7 @@ impl DataFusion {
         federated_read_table: FederatedTable,
         secrets: Arc<TokioRwLock<Secrets>>,
         bootstrap_status: BootstrapStatus,
-        initial_partition_filters: Vec<datafusion_expr::Expr>,
+        initial_partition_filters: Option<Vec<datafusion_expr::Expr>>,
     ) -> Result<AcceleratedTable> {
         tracing::trace!("Creating accelerated table {dataset:?}");
 
@@ -2521,15 +2603,17 @@ impl DataFusion {
             .context(InvalidTimeColumnTimeFormatSnafu)?;
 
         // Apply initial partition filters before the refresher starts to avoid a race
-        // where the first refresh runs without partition filters.
-        if !initial_partition_filters.is_empty() {
+        // where the first refresh runs without partition filters. `Some(empty)`
+        // (executor owns no partition of this table) is preserved so the refresh
+        // loads no rows rather than the entire source table.
+        if let Some(filters) = initial_partition_filters {
             use crate::accelerated_table::refresh::{RefreshSQL, RefreshSQLColumns};
             if let Some(ref mut sql) = refresh.sql {
-                sql.set_partition_filters(initial_partition_filters);
+                sql.set_partition_filters(Some(filters));
             } else {
                 let mut sql =
                     RefreshSQL::new(dataset.name.clone(), RefreshSQLColumns::All, vec![], None);
-                sql.set_partition_filters(initial_partition_filters);
+                sql.set_partition_filters(Some(filters));
                 refresh = refresh.refresh_sql(sql);
             }
         }
@@ -3356,7 +3440,7 @@ impl DataFusion {
         federated_read_table: FederatedTable,
         secrets: Arc<TokioRwLock<Secrets>>,
         bootstrap_status: BootstrapStatus,
-        initial_partition_filters: Vec<datafusion_expr::Expr>,
+        initial_partition_filters: Option<Vec<datafusion_expr::Expr>>,
     ) -> Result<Option<Arc<Notify>>> {
         let mut accelerated_table = self
             .create_accelerated_table(
@@ -3563,10 +3647,14 @@ impl DataFusion {
     }
 
     /// Update only the partition filters on an accelerated table's refresh.
+    ///
+    /// `filters` carries the `RefreshSQL` three-state partition-filter semantics:
+    /// `None` (not partition-scoped), `Some(filters)` (assigned partitions), or
+    /// `Some(empty)` (no partitions assigned — load no rows).
     pub async fn update_partition_filters(
         &self,
         dataset_name: TableReference,
-        filters: Vec<datafusion_expr::Expr>,
+        filters: Option<Vec<datafusion_expr::Expr>>,
     ) -> Result<()> {
         let table = self
             .get_accelerated_table_provider(&dataset_name.to_string())

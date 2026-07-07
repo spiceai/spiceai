@@ -22,6 +22,7 @@ use sha2::{Digest, Sha256};
 use snafu::prelude::*;
 use tokio::sync::watch;
 
+pub mod github_app_token;
 pub mod registry;
 
 #[derive(Debug, Snafu)]

@@ -19,12 +19,10 @@ use crate::component::ComponentInitialization;
 use crate::component::catalog::Catalog;
 use crate::component::dataset::Dataset;
 use crate::component::dataset::acceleration::RefreshMode;
-use runtime_metrics::component::MetricsProvider;
-use runtime_metrics::component::MetricsProviderComponent;
 use crate::datafusion::error::find_datafusion_root;
 use crate::federated_table::FederatedTable;
-use crate::parameters::ParameterSpec;
-use crate::parameters::Parameters;
+pub use crate::parameters::ParameterSpec;
+pub use crate::parameters::Parameters;
 use arrow_schema::SchemaRef;
 use arrow_tools::schema::schema_meta_get_computed_columns;
 use async_trait::async_trait;
@@ -45,6 +43,7 @@ use datafusion::sql::TableReference;
 use datafusion::sql::unparser::Unparser;
 use linkme::distributed_slice;
 pub use parameters::ConnectorParams;
+use runtime_metrics::component::MetricsProvider;
 use snafu::prelude::*;
 use std::any::Any;
 use std::collections::HashMap;
@@ -57,7 +56,7 @@ use tracing::Level;
 use std::future::Future;
 use std::time::Duration;
 
-pub(crate) mod client_identity;
+pub mod client_identity;
 pub mod http_rate_control;
 pub mod listing;
 
@@ -149,20 +148,22 @@ macro_rules! register_data_connector {
     };
 }
 
-pub mod abfs;
-#[cfg(feature = "adbc")]
-pub mod adbc;
-#[cfg(feature = "cosmosdb")]
-pub mod cosmosdb;
+// abfs: moved to crates/data-connectors/connector-abfs
+// #[deprecated] pub mod abfs;
+// adbc: moved to crates/data-connectors/connector-adbc
+// #[cfg(feature = "adbc")] pub mod adbc;
+// cosmosdb: moved to crates/data-connectors/connector-cosmosdb
+// #[cfg(feature = "cosmosdb")] pub mod cosmosdb;
 #[cfg(feature = "debezium")]
 pub mod debezium;
 #[cfg(feature = "dynamodb")]
 pub mod dynamodb;
 pub mod file;
 
-pub mod git;
-pub mod github;
+// git: moved to crates/data-connectors/connector-git
+// github: moved to crates/data-connectors/connector-github
 pub mod https;
+// kafka connector moved to crates/data-connectors/connector-kafka; module kept for debezium sidecar types
 #[cfg(feature = "kafka")]
 pub mod kafka;
 pub mod localpod;
@@ -170,18 +171,21 @@ pub mod memory;
 
 pub const ODBC_DATACONNECTOR: &str = "odbc"; // const needs to be accessible when ODBC isn't built
 pub mod deferred;
-#[cfg(feature = "duckdb")]
-pub mod ducklake;
-pub mod gcs;
+// ducklake: moved to crates/data-connectors/connector-ducklake
+// gcs: moved to crates/data-connectors/connector-gcs
+// glue: registration moved to crates/data-connectors/connector-glue; module kept for catalog connector
 pub mod glue;
 pub mod iceberg;
 pub mod iceberg_cluster;
 pub mod parameters;
 pub mod s3;
+pub mod schema_projection;
 pub mod sink;
+// spiceai: registration moved to crates/data-connectors/connector-spiceai; module kept for catalog connector
 pub mod spiceai;
 
 #[derive(Debug, Snafu)]
+#[snafu(visibility(pub))]
 pub enum DataConnectorError {
     #[snafu(display("Cannot connect to the {connector_component} ({dataconnector}). {source}"))]
     UnableToConnectInternal {
@@ -713,6 +717,10 @@ pub trait DataConnector: Debug + Send + Sync + 'static {
     fn initialization_for_dataset(&self, _dataset: &Dataset) -> ComponentInitialization {
         self.initialization()
     }
+}
+
+pub trait MetricsProviderComponent: Debug + Send + Sync + 'static {
+    fn metrics_provider(&self) -> Option<Arc<dyn MetricsProvider>>;
 }
 
 impl<T: DataConnector + Debug + 'static> MetricsProviderComponent for T {

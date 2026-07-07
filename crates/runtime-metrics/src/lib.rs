@@ -23,15 +23,15 @@ pub use std::sync::LazyLock;
 
 pub mod acceleration;
 pub mod catalogs;
-pub mod http;
-pub mod query;
 pub mod cluster;
 pub mod component;
 pub mod components;
 pub mod datasets;
 pub mod embeddings;
+pub mod http;
 pub mod llms;
 pub mod models;
+pub mod query;
 pub mod rerankers;
 pub mod secrets;
 pub mod spiced_runtime;

@@ -16,7 +16,6 @@ datafusion-dml = { path = "../datafusion-dml" }
 regex = "1.12.3"
 arrow-flight = { workspace = true }
 arrow-ipc = { workspace = true }
-arrow-row = { workspace = true }
 arrow-schema = { workspace = true }
 async-stream = { workspace = true }
 async-trait = { workspace = true }
@@ -103,6 +102,9 @@ duckdb-bench = ["dep:duckdb"]
 chdb-bench = ["dep:chdb-rust"]
 
 [dev-dependencies]
+# Kept only for the `row_converter` byte-identity equivalence test; Cayenne's runtime no
+# longer depends on arrow-row's (unstable) row format.
+arrow-row = { workspace = true }
 criterion = { version = "0.7", features = ["html_reports", "async_tokio"] }
 datafusion-federation.workspace = true
 datafusion-functions-aggregate = { workspace = true }
@@ -116,6 +118,17 @@ test-log = { version = "0.2", features = ["trace"] }
 tokio = { workspace = true, features = ["test-util", "rt-multi-thread", "fs"] }
 tokio-stream = { workspace = true }
 
+# The `compaction_io_hygiene` bench reproduces the Linux-only fadvise/fsync
+# primitives (`sync_file_range`, `posix_fadvise`, `mincore`) directly. cayenne
+# already depends on libc for `target_os = "linux"`, but a bench is a separate
+# crate and must name the dep itself.
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+libc = "0.2"
+
+[[bench]]
+harness = false
+name = "zorder_clustering"
+
 [[bench]]
 harness = false
 name = "metastore_operations"
@@ -123,6 +136,18 @@ name = "metastore_operations"
 [[bench]]
 harness = false
 name = "ivm_retraction_anchor"
+
+[[bench]]
+harness = false
+name = "mem_tier_shard_split_converter"
+
+[[bench]]
+harness = false
+name = "sharded_validation_inline"
+
+[[bench]]
+harness = false
+name = "maintained_minmax_anchor"
 
 [[bench]]
 harness = false
@@ -365,6 +390,10 @@ name = "delta_encoding_sweep"
 
 [[bench]]
 harness = false
+name = "compaction_write_amplification"
+
+[[bench]]
+harness = false
 name = "scan_under_write_attribution"
 
 [[bench]]
@@ -401,8 +430,16 @@ name = "mem_tier_join_shapes"
 
 [[bench]]
 harness = false
+name = "mem_tier_seal_cadence"
+
+[[bench]]
+harness = false
 name = "publish_metadata_wall"
 
 [[bench]]
 harness = false
 name = "cdc_apply_simd"
+
+[[bench]]
+harness = false
+name = "compaction_io_hygiene"

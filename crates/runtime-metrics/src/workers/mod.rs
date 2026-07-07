@@ -1,5 +1,5 @@
 /*
-Copyright 2024-2025 The Spice.ai OSS Authors
+Copyright 2024-2026 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use super::{Histogram, LazyLock, Meter, UpDownCounter, global};
+use super::{Gauge, Histogram, LazyLock, Meter, UpDownCounter, global};
 
 pub static WORKERS_METER: LazyLock<Meter> = LazyLock::new(|| global::meter("worker"));
 
@@ -22,6 +22,15 @@ pub static COUNT: LazyLock<UpDownCounter<i64>> = LazyLock::new(|| {
     WORKERS_METER
         .i64_up_down_counter("worker_active_count")
         .with_description("Number of currently loaded workers.")
+        .build()
+});
+
+pub static STATUS: LazyLock<Gauge<u64>> = LazyLock::new(|| {
+    WORKERS_METER
+        .u64_gauge("worker_load_state")
+        .with_description(
+            "Status of the worker. 0=Initializing, 1=Ready, 2=Disabled, 3=Error, 4=Refreshing, 5=ShuttingDown.",
+        )
         .build()
 });
 

@@ -129,15 +129,14 @@ pub static SCHEDULER_TASK_QUEUE_DEPTH: LazyLock<Gauge<u64>> = LazyLock::new(|| {
 
 /// Time spent scheduling a task in milliseconds.
 /// Labels: `node_id`
-pub static SCHEDULER_TASK_SCHEDULING_LATENCY_MS: LazyLock<Histogram<f64>> =
-    LazyLock::new(|| {
-        CLUSTER_METER
-            .f64_histogram("scheduler_task_scheduling_latency_ms")
-            .with_description("Time spent scheduling a task in milliseconds.")
-            .with_unit("ms")
-            .with_boundaries(DURATION_MS_HISTOGRAM_BUCKETS.to_vec())
-            .build()
-    });
+pub static SCHEDULER_TASK_SCHEDULING_LATENCY_MS: LazyLock<Histogram<f64>> = LazyLock::new(|| {
+    CLUSTER_METER
+        .f64_histogram("scheduler_task_scheduling_latency_ms")
+        .with_description("Time spent scheduling a task in milliseconds.")
+        .with_unit("ms")
+        .with_boundaries(DURATION_MS_HISTOGRAM_BUCKETS.to_vec())
+        .build()
+});
 
 // =============================================================================
 // Stage Metrics (scheduler)
@@ -277,15 +276,14 @@ pub static EXECUTOR_SHUFFLE_WRITE_ROWS: LazyLock<Counter<u64>> = LazyLock::new(|
 
 /// Duration of shuffle write operations in milliseconds.
 /// Labels: `node_id`
-pub static EXECUTOR_SHUFFLE_WRITE_DURATION_MS: LazyLock<Histogram<f64>> =
-    LazyLock::new(|| {
-        CLUSTER_METER
-            .f64_histogram("executor_shuffle_write_duration_ms")
-            .with_description("Duration of shuffle write operations in milliseconds.")
-            .with_unit("ms")
-            .with_boundaries(DURATION_MS_HISTOGRAM_BUCKETS.to_vec())
-            .build()
-    });
+pub static EXECUTOR_SHUFFLE_WRITE_DURATION_MS: LazyLock<Histogram<f64>> = LazyLock::new(|| {
+    CLUSTER_METER
+        .f64_histogram("executor_shuffle_write_duration_ms")
+        .with_description("Duration of shuffle write operations in milliseconds.")
+        .with_unit("ms")
+        .with_boundaries(DURATION_MS_HISTOGRAM_BUCKETS.to_vec())
+        .build()
+});
 
 // =============================================================================
 // Shuffle Locality Metrics (executor-side)
@@ -338,14 +336,13 @@ pub static EXECUTOR_SHUFFLE_READ_LOCAL_DURATION_MS: LazyLock<Histogram<f64>> =
 
 /// Total bytes read from remote shuffle files (fetched from another executor).
 /// Labels: `node_id`
-pub static EXECUTOR_SHUFFLE_READ_REMOTE_BYTES: LazyLock<Counter<u64>> =
-    LazyLock::new(|| {
-        CLUSTER_METER
-            .u64_counter("executor_shuffle_read_remote_bytes")
-            .with_description("Total bytes fetched from remote shuffle files (other executors).")
-            .with_unit("By")
-            .build()
-    });
+pub static EXECUTOR_SHUFFLE_READ_REMOTE_BYTES: LazyLock<Counter<u64>> = LazyLock::new(|| {
+    CLUSTER_METER
+        .u64_counter("executor_shuffle_read_remote_bytes")
+        .with_description("Total bytes fetched from remote shuffle files (other executors).")
+        .with_unit("By")
+        .build()
+});
 
 /// Total rows read from remote shuffle files (fetched from another executor).
 /// Labels: `node_id`
@@ -359,14 +356,13 @@ pub static EXECUTOR_SHUFFLE_READ_REMOTE_ROWS: LazyLock<Counter<u64>> = LazyLock:
 
 /// Count of remote shuffle read operations.
 /// Labels: `node_id`
-pub static EXECUTOR_SHUFFLE_READ_REMOTE_COUNT: LazyLock<Counter<u64>> =
-    LazyLock::new(|| {
-        CLUSTER_METER
-            .u64_counter("executor_shuffle_read_remote_count")
-            .with_description("Count of remote shuffle read operations.")
-            .with_unit("operations")
-            .build()
-    });
+pub static EXECUTOR_SHUFFLE_READ_REMOTE_COUNT: LazyLock<Counter<u64>> = LazyLock::new(|| {
+    CLUSTER_METER
+        .u64_counter("executor_shuffle_read_remote_count")
+        .with_description("Count of remote shuffle read operations.")
+        .with_unit("operations")
+        .build()
+});
 
 /// Duration histogram for remote shuffle read operations (network fetch time).
 /// Labels: `node_id`
@@ -417,15 +413,14 @@ pub static SCHEDULER_RESULT_FETCH_COUNT: LazyLock<Counter<u64>> = LazyLock::new(
 
 /// Duration of result fetch operations in milliseconds.
 /// Labels: `node_id`
-pub static SCHEDULER_RESULT_FETCH_DURATION_MS: LazyLock<Histogram<f64>> =
-    LazyLock::new(|| {
-        CLUSTER_METER
-            .f64_histogram("scheduler_result_fetch_duration_ms")
-            .with_description("Duration of result fetch operations in milliseconds.")
-            .with_unit("ms")
-            .with_boundaries(DURATION_MS_HISTOGRAM_BUCKETS.to_vec())
-            .build()
-    });
+pub static SCHEDULER_RESULT_FETCH_DURATION_MS: LazyLock<Histogram<f64>> = LazyLock::new(|| {
+    CLUSTER_METER
+        .f64_histogram("scheduler_result_fetch_duration_ms")
+        .with_description("Duration of result fetch operations in milliseconds.")
+        .with_unit("ms")
+        .with_boundaries(DURATION_MS_HISTOGRAM_BUCKETS.to_vec())
+        .build()
+});
 
 // =============================================================================
 // Scheduler Operations Metrics

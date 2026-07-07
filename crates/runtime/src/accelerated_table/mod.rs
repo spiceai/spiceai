@@ -54,6 +54,7 @@ use runtime_datafusion::execution_plan::{
     schema_cast::SchemaCastScanExec, wrap_with_filter,
 };
 
+use runtime_metrics::acceleration as metrics;
 use snafu::prelude::*;
 use spicepod::metric::Metrics;
 use synchronized_table::SynchronizedTable;
@@ -1255,15 +1256,15 @@ impl AcceleratedTable {
         let dataset_name = &self.dataset_name;
 
         let mut refresh = self.refresh_params.write().await;
-        // Preserve existing partition_filters when updating user SQL
+        // Preserve existing partition filters when updating user SQL, including
+        // an empty ("no partitions assigned — load no rows") assignment.
         let existing_partition_filters = refresh
             .sql
             .as_ref()
-            .map(|s| s.partition_filters().to_vec())
-            .unwrap_or_default();
+            .and_then(|s| s.partition_filters().map(<[_]>::to_vec));
 
-        if !existing_partition_filters.is_empty() {
-            refresh_sql.set_partition_filters(existing_partition_filters);
+        if let Some(filters) = existing_partition_filters {
+            refresh_sql.set_partition_filters(Some(filters));
         }
         if !is_spice_internal_dataset(&self.dataset_name) {
             tracing::info!(
@@ -1277,9 +1278,14 @@ impl AcceleratedTable {
     }
 
     /// Update only the partition filters on the refresh SQL, preserving user SQL parts.
+    ///
+    /// `filters` uses the three-state `RefreshSQL` partition-filter semantics:
+    /// `None` (not partition-scoped, retrieve everything), `Some(filters)` (the
+    /// assigned partitions), or `Some(empty)` (no partitions assigned — load no
+    /// rows).
     pub async fn update_partition_filters(
         &self,
-        filters: Vec<datafusion_expr::Expr>,
+        filters: Option<Vec<datafusion_expr::Expr>>,
     ) -> Result<()> {
         let mut refresh = self.refresh_params.write().await;
         if let Some(ref mut sql) = refresh.sql {

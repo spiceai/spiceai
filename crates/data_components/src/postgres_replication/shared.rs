@@ -63,10 +63,28 @@ limitations under the License.
 //! with no traffic are credited forward on keepalives/commits whenever they
 //! have no in-flight envelopes. A stalled or failed member therefore pins WAL
 //! retention for the whole slot **by design** — acking past it would lose its
-//! changes permanently. The pinning is observable via the existing
-//! `dataset_postgres_replication_lag_bytes` metric and a WARN log on detach;
-//! restarting spiced (or the member rejoining) heals it by replaying from the
+//! changes permanently. The detached state is observable directly via the
+//! `dataset_postgres_replication_member_attached` gauge (1 attached / 0 detached)
+//! and an ERROR log on a stalling detach; the resulting WAL growth also shows on
+//! `dataset_postgres_replication_lag_bytes` (which, on a shared slot, grows for
+//! the *surviving* members whose ack floor is pinned by the detached one — the
+//! member gauge is the unambiguous signal for *which* dataset stalled).
+//! Restarting spiced (or the member rejoining) heals it by replaying from the
 //! held LSN, which every member applies idempotently.
+//!
+//! # Backpressure vs. server liveness
+//!
+//! A slow member sink backpressures the pump: `deliver_commit` blocks on the
+//! member channel, which stops the pump calling `client.recv()`, which lets
+//! events pile up in the `pgwire_replication` worker's channel. What keeps this
+//! from killing the connection is the **worker** (`pgwire_replication`'s
+//! `send_event`): it keeps emitting standby status feedback on `status_interval`
+//! while its own channel is full, so Postgres never hits `wal_sender_timeout`.
+//! The pump-side handling here ([`MEMBER_SEND_STALL_WARN`], the `send_timeout`
+//! loop in `deliver_commit`) is therefore *not* what prevents server-side
+//! timeout — it exists only for observability (the
+//! `dataset_postgres_replication_member_send_stalled_seconds_total` counter) and
+//! to keep the pump's shutdown check responsive while a member stalls.
 //!
 //! # Lifecycle
 //!
@@ -92,7 +110,7 @@ use tokio_stream::wrappers::ReceiverStream;
 
 use super::{
     Error, ReplicationMetricsCollector, ReplicationStreamInput, Result, bootstrap,
-    changes::{ChangeOp, DecodedChange},
+    changes::{ChangeOp, DecodedChange, push_update_change},
     client,
     config::ReplicationParams,
     pgoutput, resilience, slot,
@@ -110,6 +128,14 @@ const MEMBER_CHANNEL_CAPACITY: usize = 64;
 /// membership (joins, dropped receivers). Idle Postgres servers can go tens
 /// of seconds between messages; this keeps membership changes responsive.
 const RECV_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// How long a single member's committed-change delivery may block the pump
+/// before we emit a WARN, bump the stall metric, and re-check for shutdown.
+/// Server-side liveness is *not* at risk here — the `pgwire_replication` worker
+/// keeps sending standby status feedback while its own channel backs up (see
+/// its `send_event`); this bound is purely for observability and to keep the
+/// pump's shutdown check responsive while one member's sink is slow.
+const MEMBER_SEND_STALL_WARN: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Identity of a shared replication source. Datasets whose connection params
 /// and slot name produce the same key share one pump.
@@ -434,21 +460,44 @@ impl SharedSource {
     /// its table is (best-effort) removed from the publication — any rejoin,
     /// in-process or after a restart, then re-adds the table and takes a fresh
     /// snapshot.
-    fn detach_member(&self, key: &MemberKey, reason: &str) {
+    /// Detach a member from the shared slot. `stalls_slot` distinguishes a
+    /// genuine, unhealed stall (the member's changes stream died and its ack
+    /// floor now pins WAL for every slot-mate until it rejoins or spiced
+    /// restarts — a page-worthy, ERROR-level condition) from a self-healing
+    /// supersede (an already-closed member being replaced by an incoming
+    /// re-subscription, which re-attaches immediately — only WARN).
+    fn detach_member(&self, key: &MemberKey, reason: &str, stalls_slot: bool) {
         let removed = lock(&self.members).remove(key);
         let was_snapshotting = self.ack.detach(key);
         lock(&self.detached).insert(key.clone());
         if let Some(member) = removed {
-            tracing::warn!(
-                dataset = %member.dataset_name,
-                table = %format_member(key),
-                slot = %self.key.slot_name,
-                reason,
-                was_snapshotting,
-                "shared replication member detached; its last applied LSN now pins WAL \
-                 retention for the shared slot until the dataset rejoins or spiced restarts \
-                 (watch dataset_postgres_replication_lag_bytes)"
-            );
+            // Flip the membership-liveness gauge to detached (0) so the state is
+            // observable, not only logged (#11644). A superseding re-subscription
+            // re-attaches (back to 1) via `mark_member_attached` on rejoin.
+            member.metrics.mark_member_detached();
+            if stalls_slot {
+                tracing::error!(
+                    dataset = %member.dataset_name,
+                    table = %format_member(key),
+                    slot = %self.key.slot_name,
+                    reason,
+                    was_snapshotting,
+                    "shared replication member detached; its last applied LSN now pins WAL \
+                     retention for the shared slot until the dataset rejoins or spiced restarts \
+                     (watch dataset_postgres_replication_member_attached and \
+                     dataset_postgres_replication_lag_bytes)"
+                );
+            } else {
+                tracing::warn!(
+                    dataset = %member.dataset_name,
+                    table = %format_member(key),
+                    slot = %self.key.slot_name,
+                    reason,
+                    was_snapshotting,
+                    "shared replication member detached and is being replaced by a new \
+                     subscription (rejoin in progress)"
+                );
+            }
         }
         if was_snapshotting {
             let params = self.params.clone();
@@ -478,7 +527,7 @@ impl SharedSource {
             .map(|(k, _)| k.clone())
             .collect();
         for key in closed {
-            self.detach_member(&key, "changes stream receiver dropped");
+            self.detach_member(&key, "changes stream receiver dropped", true);
         }
     }
 }
@@ -580,7 +629,7 @@ async fn attach_member(
             // The previous subscription's receiver is gone (dataset reload,
             // failed sink) but the pump hasn't reaped it yet — detach it now
             // so this is a rejoin, not a duplicate.
-            source.detach_member(&member_key, "superseded by a new subscription");
+            source.detach_member(&member_key, "superseded by a new subscription", false);
         } else {
             return Err(Error::SharedTableAlreadySubscribed {
                 schema: schema_name,
@@ -629,6 +678,11 @@ async fn attach_member(
             metrics: Arc::clone(&metrics),
         }),
     );
+    // Membership liveness is now observable (`dataset_postgres_replication_member_attached`):
+    // this dataset is an attached member of the shared slot. Covers both a fresh
+    // join and an in-process rejoin (both reach here); the paired `mark_member_detached`
+    // in `detach_member` flips it to 0 when the member leaves (#11644).
+    metrics.mark_member_attached();
 
     tracing::info!(
         dataset = %dataset_name,
@@ -771,7 +825,7 @@ async fn member_fatal(source: &Arc<SharedSource>, key: &MemberKey, message: Stri
             .send(Err(StreamError::External(message)))
             .await;
     }
-    source.detach_member(key, "fatal member error");
+    source.detach_member(key, "fatal member error", true);
 }
 
 /// Mark the source dead and drop it from the registry (only if the registry
@@ -982,6 +1036,7 @@ async fn run_pump(source: Arc<SharedSource>) {
                         std::mem::take(&mut txn),
                         end_lsn.0,
                         commit_time_micros,
+                        shutdown_epoch,
                     )
                     .await;
                     let flush = source.ack.flush_lsn();
@@ -1108,13 +1163,19 @@ async fn handle_decoded(
                 && let Some(member) = source.member(member_key)
             {
                 member.metrics.inc_update();
-                // Fill unchanged-TOAST markers from the old tuple (REPLICA
-                // IDENTITY FULL) before buffering.
-                let new = super::changes::merge_unchanged_toast(new, old.as_ref());
-                txn.entry(relation_id).or_default().push(DecodedChange {
-                    op: ChangeOp::Update,
-                    row: new,
-                });
+                let Some(rel) = decoder.relation(relation_id) else {
+                    member_fatal(
+                        source,
+                        member_key,
+                        format!(
+                            "change event before Relation for id {relation_id} in {}",
+                            member.dataset_name
+                        ),
+                    )
+                    .await;
+                    return;
+                };
+                push_update_change(txn.entry(relation_id).or_default(), rel, old, new);
             }
         }
         DecodedMessage::Delete { relation_id, old } => {
@@ -1161,6 +1222,7 @@ async fn deliver_commit(
     txn: HashMap<RelationId, Vec<DecodedChange>>,
     end_lsn: u64,
     commit_time_micros: i64,
+    shutdown_epoch: u64,
 ) {
     let commit_time = client::pg_epoch_to_system_time(commit_time_micros);
     // Unix-epoch ms for the per-batch replication-lag signal carried into the
@@ -1224,8 +1286,43 @@ async fn deliver_commit(
             false,
         );
         source.ack.deliver(member_key, end_lsn);
-        if member.sender.send(Ok(envelope)).await.is_err() {
-            source.detach_member(member_key, "changes stream receiver dropped");
+        // Must-deliver: this envelope carries committed changes and a
+        // `SharedLsnCommitter` that advances the ack floor, so we cannot drop
+        // it under backpressure. But we also must not let one slow member block
+        // the pump (and thus every other member) indefinitely, or wedge runtime
+        // shutdown. Bound the wait: on each stall tick emit a WARN + bump the
+        // stall metric, and abandon delivery if the runtime is shutting down
+        // (epoch advanced) — the pump then observes shutdown and releases the
+        // slot. Server-side liveness is handled one layer down by the worker.
+        let mut pending = Ok(envelope);
+        loop {
+            match member
+                .sender
+                .send_timeout(pending, MEMBER_SEND_STALL_WARN)
+                .await
+            {
+                Ok(()) => break,
+                Err(mpsc::error::SendTimeoutError::Closed(_)) => {
+                    source.detach_member(member_key, "changes stream receiver dropped", true);
+                    break;
+                }
+                Err(mpsc::error::SendTimeoutError::Timeout(returned)) => {
+                    if crate::cdc::shutdown_epoch() != shutdown_epoch {
+                        return;
+                    }
+                    member
+                        .metrics
+                        .add_send_stalled(MEMBER_SEND_STALL_WARN.as_secs());
+                    tracing::warn!(
+                        dataset = %member.dataset_name,
+                        stalled_for = ?MEMBER_SEND_STALL_WARN,
+                        "shared Postgres CDC member sink is not draining; the pump is \
+                         waiting to deliver committed changes (watch \
+                         dataset_postgres_replication_member_send_stalled_seconds_total)"
+                    );
+                    pending = returned;
+                }
+            }
         }
     }
 

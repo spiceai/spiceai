@@ -73,6 +73,7 @@ limitations under the License.
 //!   coordinator (feature-gated).
 pub(crate) mod column_stats;
 pub(crate) mod compaction;
+pub(crate) mod compaction_writer;
 pub(crate) mod constants;
 pub(crate) mod context;
 pub(crate) mod delete;
@@ -80,6 +81,7 @@ pub mod deletion_index;
 pub(crate) mod deletion_strategy;
 pub(crate) mod delta_encoding;
 pub(crate) mod fadvise_tier;
+pub(crate) mod file_digest;
 pub(crate) mod file_pruning;
 pub(crate) mod fsync_tier;
 pub(crate) mod inlined_cache;
@@ -93,6 +95,7 @@ pub(crate) mod on_conflict;
 pub(crate) mod overwrite;
 pub mod partitioned_wal;
 pub(crate) mod pk_index;
+pub(crate) mod query_admission;
 pub(crate) mod retention;
 pub(crate) mod scan;
 pub(crate) mod sink;
@@ -102,7 +105,9 @@ pub(crate) mod table;
 pub(crate) mod tuning;
 pub(crate) mod utils;
 pub(crate) mod vortex_format;
+pub(crate) mod wal_checksum;
 pub(crate) mod write_budget;
+pub(crate) mod zorder;
 
 // Re-export the main type at the module level for convenience
 pub use compaction::{set_compaction_runtime_env, set_compaction_runtime_handle};
@@ -113,6 +118,7 @@ pub use mem_tier_budget::{
 };
 pub use overwrite::PreparedOverwrite;
 pub use partitioned_wal::{PARTITIONED_WAL_DIR, PartitionedWal, PartitionedWalEntry};
+pub use query_admission::set_query_admission_governor;
 pub use retention::TimeRetentionFilterBuilder;
 pub use scan::CayenneAccelerationExec;
 pub use staging_wal::{CayenneStagedAppend, PreparedStagedAppend};

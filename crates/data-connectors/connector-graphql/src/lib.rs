@@ -22,7 +22,6 @@ use data_components::graphql::{
 use data_components::rate_limit::RateLimiter;
 use datafusion::datasource::TableProvider;
 use runtime::component::dataset::Dataset;
-use runtime_metrics::component::MetricsProvider;
 use runtime::dataconnector::http_rate_control::{
     HttpRateControlMetricSource, HttpRateControlMetrics, HttpRateControlMetricsProvider,
 };
@@ -31,6 +30,7 @@ use runtime::dataconnector::{
     DataConnectorResult, NewDataConnectorResult, default_spice_client, http_rate_control,
 };
 use runtime::parameters::{ParameterSpec, Parameters};
+use runtime_metrics::component::MetricsProvider;
 use snafu::prelude::*;
 use std::{
     any::Any,

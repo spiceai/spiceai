@@ -86,11 +86,8 @@ impl TransactionBuffer {
         });
     }
 
-    pub fn push_update(&mut self, _relation: &Relation, new: TupleData) {
-        self.changes.push(DecodedChange {
-            op: ChangeOp::Update,
-            row: new,
-        });
+    pub fn push_update(&mut self, relation: &Relation, old: Option<TupleData>, new: TupleData) {
+        push_update_change(&mut self.changes, relation, old, new);
     }
 
     pub fn push_delete(&mut self, _relation: &Relation, old: TupleData) {
@@ -144,6 +141,49 @@ pub fn merge_unchanged_toast(mut new: TupleData, old: Option<&TupleData>) -> Tup
     new
 }
 
+/// Buffer a pgoutput UPDATE.
+///
+/// A Postgres primary-key update is represented as one UPDATE message with the
+/// old key tuple plus the new row. Accelerators apply `ChangeOp::Update` as an
+/// upsert keyed by the new primary key, so a primary-key change must also emit a
+/// delete for the old key; otherwise the old accelerated row is orphaned.
+pub fn push_update_change(
+    changes: &mut Vec<DecodedChange>,
+    relation: &Relation,
+    old: Option<TupleData>,
+    new: TupleData,
+) {
+    let new = merge_unchanged_toast(new, old.as_ref());
+    let key_changed = old
+        .as_ref()
+        .is_some_and(|old| primary_key_changed(relation, old, &new));
+
+    if key_changed && let Some(old) = old {
+        changes.push(DecodedChange {
+            op: ChangeOp::Delete,
+            row: old,
+        });
+    }
+
+    changes.push(DecodedChange {
+        op: ChangeOp::Update,
+        row: new,
+    });
+}
+
+fn primary_key_changed(relation: &Relation, old: &TupleData, new: &TupleData) -> bool {
+    relation
+        .columns
+        .iter()
+        .enumerate()
+        .filter(|(_, column)| column.is_key)
+        .any(|(idx, _)| {
+            let old_value = old.columns.get(idx).and_then(Option::as_ref);
+            let new_value = new.columns.get(idx).and_then(Option::as_ref);
+            old_value.is_some() && new_value.is_some() && old_value != new_value
+        })
+}
+
 /// Build a `ChangeBatch` from a list of decoded changes, typing the `data`
 /// struct to the accelerator's Arrow schema.
 ///
@@ -177,11 +217,14 @@ pub fn build_change_batch(
     pk_offsets.push(0);
     let mut pk_values: Vec<&str> = Vec::with_capacity(num_rows.saturating_mul(primary_keys.len()));
 
-    // One builder per output field, typed from dataset schema.
+    // One builder per output field, typed from dataset schema. Sized to the
+    // transaction's row count: default-capacity builders reserve 1024 elements
+    // per column, which turns a 1-row change on a wide table into a ~64 KB
+    // allocation and inflates every byte-based CDC accounting downstream.
     let mut data_builders: Vec<FieldBuilder> = dataset_schema
         .fields()
         .iter()
-        .map(|f| FieldBuilder::new(f.data_type()))
+        .map(|f| FieldBuilder::with_capacity(f.data_type(), num_rows))
         .collect::<Result<Vec<_>>>()?;
 
     // Precompute dataset_field_idx → relation_column_idx once per batch so the
@@ -376,31 +419,43 @@ pub(super) enum FieldBuilder {
 }
 
 impl FieldBuilder {
-    pub(super) fn new(data_type: &DataType) -> Result<Self> {
+    /// Create a builder pre-sized for `capacity` values. Arrow's default
+    /// builder constructors reserve 1024 elements per column, so an unsized
+    /// builder makes small CDC batches (often a single row) allocate and
+    /// report orders of magnitude more memory than the payload. String-like
+    /// builders get a modest per-value byte estimate; under-estimates grow
+    /// amortized, so a low guess is cheap.
+    pub(super) fn with_capacity(data_type: &DataType, capacity: usize) -> Result<Self> {
+        // Starting guess for variable-width data buffers (bytes per value).
+        let data_capacity = capacity.saturating_mul(8);
         Ok(match data_type {
-            DataType::Utf8 => Self::Utf8(StringBuilder::new()),
-            DataType::LargeUtf8 => Self::LargeUtf8(LargeStringBuilder::new()),
-            DataType::Binary => Self::Binary(BinaryBuilder::new()),
-            DataType::Boolean => Self::Bool(BooleanBuilder::new()),
-            DataType::Int8 => Self::Int8(Int8Builder::new()),
-            DataType::Int16 => Self::Int16(Int16Builder::new()),
-            DataType::Int32 => Self::Int32(Int32Builder::new()),
-            DataType::Int64 => Self::Int64(Int64Builder::new()),
-            DataType::UInt32 => Self::UInt32(UInt32Builder::new()),
-            DataType::Float32 => Self::Float32(Float32Builder::new()),
-            DataType::Float64 => Self::Float64(Float64Builder::new()),
-            DataType::Date32 => Self::Date32(Date32Builder::new()),
+            DataType::Utf8 => Self::Utf8(StringBuilder::with_capacity(capacity, data_capacity)),
+            DataType::LargeUtf8 => {
+                Self::LargeUtf8(LargeStringBuilder::with_capacity(capacity, data_capacity))
+            }
+            DataType::Binary => Self::Binary(BinaryBuilder::with_capacity(capacity, data_capacity)),
+            DataType::Boolean => Self::Bool(BooleanBuilder::with_capacity(capacity)),
+            DataType::Int8 => Self::Int8(Int8Builder::with_capacity(capacity)),
+            DataType::Int16 => Self::Int16(Int16Builder::with_capacity(capacity)),
+            DataType::Int32 => Self::Int32(Int32Builder::with_capacity(capacity)),
+            DataType::Int64 => Self::Int64(Int64Builder::with_capacity(capacity)),
+            DataType::UInt32 => Self::UInt32(UInt32Builder::with_capacity(capacity)),
+            DataType::Float32 => Self::Float32(Float32Builder::with_capacity(capacity)),
+            DataType::Float64 => Self::Float64(Float64Builder::with_capacity(capacity)),
+            DataType::Date32 => Self::Date32(Date32Builder::with_capacity(capacity)),
             DataType::Time64(TimeUnit::Nanosecond) => {
-                Self::Time64Nanos(Time64NanosecondBuilder::new())
+                Self::Time64Nanos(Time64NanosecondBuilder::with_capacity(capacity))
             }
-            DataType::Timestamp(TimeUnit::Microsecond, tz) => {
-                Self::TimestampMicros(TimestampMicrosecondBuilder::new(), tz.clone())
-            }
-            DataType::Timestamp(TimeUnit::Nanosecond, tz) => {
-                Self::TimestampNanos(TimestampNanosecondBuilder::new(), tz.clone())
-            }
+            DataType::Timestamp(TimeUnit::Microsecond, tz) => Self::TimestampMicros(
+                TimestampMicrosecondBuilder::with_capacity(capacity),
+                tz.clone(),
+            ),
+            DataType::Timestamp(TimeUnit::Nanosecond, tz) => Self::TimestampNanos(
+                TimestampNanosecondBuilder::with_capacity(capacity),
+                tz.clone(),
+            ),
             DataType::Decimal128(precision, scale) => Self::Decimal128(
-                Decimal128Builder::new().with_data_type(data_type.clone()),
+                Decimal128Builder::with_capacity(capacity).with_data_type(data_type.clone()),
                 *precision,
                 *scale,
             ),
@@ -418,11 +473,15 @@ impl FieldBuilder {
                     }
                     .fail();
                 }
+                let mut offsets = Vec::with_capacity(capacity.saturating_add(1));
+                offsets.push(0);
                 Self::List {
                     item_field: Arc::clone(item_field),
-                    inner: Box::new(Self::new(item_field.data_type())?),
-                    offsets: vec![0],
-                    validity: Vec::new(),
+                    // Element count per list is unknown; one element per row
+                    // is a floor the inner builder grows past as needed.
+                    inner: Box::new(Self::with_capacity(item_field.data_type(), capacity)?),
+                    offsets,
+                    validity: Vec::with_capacity(capacity),
                 }
             }
             DataType::LargeList(_) | DataType::FixedSizeList(_, _) => {
@@ -436,10 +495,18 @@ impl FieldBuilder {
                 .fail();
             }
             // The Postgres provider maps ENUM columns to Dictionary(Int8, Utf8).
+            // Keys are sized to the row count; the values side holds only the
+            // distinct ENUM labels, which are few — start small and grow.
             DataType::Dictionary(key, value) if **value == DataType::Utf8 => match **key {
-                DataType::Int8 => Self::DictUtf8Int8(StringDictionaryBuilder::new()),
-                DataType::Int16 => Self::DictUtf8Int16(StringDictionaryBuilder::new()),
-                DataType::Int32 => Self::DictUtf8Int32(StringDictionaryBuilder::new()),
+                DataType::Int8 => {
+                    Self::DictUtf8Int8(StringDictionaryBuilder::with_capacity(capacity, 8, 128))
+                }
+                DataType::Int16 => {
+                    Self::DictUtf8Int16(StringDictionaryBuilder::with_capacity(capacity, 8, 128))
+                }
+                DataType::Int32 => {
+                    Self::DictUtf8Int32(StringDictionaryBuilder::with_capacity(capacity, 8, 128))
+                }
                 ref other => {
                     return PgOutputDecodeSnafu {
                         message: format!(
@@ -1167,6 +1234,60 @@ mod tests {
         assert!(name_col.is_null(1));
     }
 
+    #[test]
+    fn build_change_batch_memory_sized_to_row_count() {
+        // Regression guard: the data-struct builders must be sized to the
+        // transaction's row count. Default-capacity Arrow builders reserve
+        // 1024 elements per column, so a 1-row change on a wide schema both
+        // allocated and reported ~100 KB from `get_array_memory_size()`,
+        // inflating the CDC coalescer's byte budget and the Cayenne mem-tier
+        // accounting by orders of magnitude.
+        let mut fields = vec![Field::new("id", DataType::Int32, false)];
+        let mut columns = vec![PgColumn {
+            is_key: true,
+            name: "id".into(),
+            type_oid: 23,
+            type_modifier: -1,
+        }];
+        for i in 0..12 {
+            let name = format!("v{i}");
+            fields.push(Field::new(&name, DataType::Int64, true));
+            columns.push(PgColumn {
+                is_key: false,
+                name,
+                type_oid: 20,
+                type_modifier: -1,
+            });
+        }
+        let schema: SchemaRef = Arc::new(Schema::new(fields));
+        let relation = Relation {
+            relation_id: 1,
+            namespace: "public".to_string(),
+            name: "wide".to_string(),
+            replica_identity: b'd',
+            columns,
+        };
+        let row = TupleData {
+            columns: (0..13)
+                .map(|i| Some(PgValue::Text(i.to_string())))
+                .collect(),
+        };
+        let changes = vec![DecodedChange {
+            op: ChangeOp::Create,
+            row,
+        }];
+
+        let batch = build_change_batch(&schema, &relation, &changes).expect("build batch");
+        assert_eq!(batch.record.num_rows(), 1);
+        let size = batch.record.get_array_memory_size();
+        assert!(
+            size < 16 * 1024,
+            "1-row change batch reports {size} bytes; data builders are likely \
+             no longer sized to num_rows (default-capacity Arrow builders \
+             reserve 1024 elements per column)"
+        );
+    }
+
     #[tokio::test]
     async fn lsn_committer_advances_monotonically() {
         let lsn = Arc::new(AtomicU64::new(0));
@@ -1315,6 +1436,63 @@ mod tests {
             assert_eq!(id_value(&batch, 0), 1);
             assert!(!name_is_null(&batch, 0));
         }
+    }
+
+    #[test]
+    fn push_update_change_keeps_non_pk_update_as_single_upsert() {
+        let relation = make_relation();
+        let mut changes = Vec::new();
+        push_update_change(
+            &mut changes,
+            &relation,
+            Some(tuple_for("1", Some("Old"))),
+            tuple_for("1", Some("Updated")),
+        );
+
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].op, ChangeOp::Update);
+        assert_eq!(changes[0].row.columns[0], Some(PgValue::Text("1".into())));
+    }
+
+    #[test]
+    fn push_update_change_emits_old_key_delete_for_pk_update() {
+        let relation = make_relation();
+        let mut changes = Vec::new();
+        push_update_change(
+            &mut changes,
+            &relation,
+            Some(tuple_for("1", None)),
+            tuple_for("1001", Some("Updated")),
+        );
+
+        assert_eq!(changes.len(), 2);
+        assert_eq!(changes[0].op, ChangeOp::Delete);
+        assert_eq!(changes[0].row.columns[0], Some(PgValue::Text("1".into())));
+        assert_eq!(changes[1].op, ChangeOp::Update);
+        assert_eq!(
+            changes[1].row.columns[0],
+            Some(PgValue::Text("1001".into()))
+        );
+    }
+
+    #[test]
+    fn primary_key_update_change_batch_is_delete_then_update() {
+        let schema = non_nullable_users_schema();
+        let relation = make_relation();
+        let mut changes = Vec::new();
+        push_update_change(
+            &mut changes,
+            &relation,
+            Some(tuple_for("1", None)),
+            tuple_for("1001", Some("Updated")),
+        );
+
+        let batch = build_change_batch(&schema, &relation, &changes).expect("build");
+        assert_op_column(&batch, &["d", "u"]);
+        assert_eq!(id_value(&batch, 0), 1);
+        assert_eq!(id_value(&batch, 1), 1001);
+        assert!(name_is_null(&batch, 0));
+        assert!(!name_is_null(&batch, 1));
     }
 
     #[test]
@@ -1597,7 +1775,7 @@ mod tests {
             DataType::List(Arc::new(Field::new("item", DataType::Int32, true))),
             true,
         )));
-        let Err(err) = FieldBuilder::new(&nested) else {
+        let Err(err) = FieldBuilder::with_capacity(&nested, 1) else {
             panic!("expected nested-List rejection");
         };
         let msg = err.to_string();
@@ -1766,9 +1944,10 @@ mod tests {
 
     #[test]
     fn fieldbuilder_rejects_interval() {
-        let Err(err) = FieldBuilder::new(&DataType::Interval(
-            arrow::datatypes::IntervalUnit::MonthDayNano,
-        )) else {
+        let Err(err) = FieldBuilder::with_capacity(
+            &DataType::Interval(arrow::datatypes::IntervalUnit::MonthDayNano),
+            1,
+        ) else {
             panic!("expected Interval rejection");
         };
         assert!(err.to_string().contains("INTERVAL"));

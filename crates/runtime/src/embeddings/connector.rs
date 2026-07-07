@@ -20,7 +20,6 @@ use crate::component::ComponentInitialization;
 use crate::component::dataset::Dataset;
 #[cfg(feature = "duckdb")]
 use crate::component::dataset::acceleration::Engine;
-use runtime_metrics::component::MetricsProvider;
 #[cfg(feature = "duckdb")]
 use crate::component::view::View;
 use crate::dataconnector::{DataConnector, DataConnectorError, DataConnectorResult};
@@ -38,6 +37,7 @@ use datafusion::datasource::TableProvider;
 use futures::StreamExt;
 use itertools::Itertools;
 use runtime_datafusion_index::IndexedTableProvider;
+use runtime_metrics::component::MetricsProvider;
 use search::generation::text_search::index::FullTextDatabaseIndex;
 use search::index::VectorScanTableProvider;
 use spicepod::component::embeddings::ColumnEmbeddingConfig;

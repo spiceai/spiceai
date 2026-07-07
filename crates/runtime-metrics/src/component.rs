@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::{fmt::Debug, sync::Arc};
+use std::fmt::Debug;
 
 use opentelemetry::{KeyValue, metrics::Callback};
 use runtime_api_types::v1::ComponentType;
@@ -65,13 +65,6 @@ impl MetricSpec {
         self.auto_register = true;
         self
     }
-}
-
-pub trait MetricsProviderComponent: Debug + Send + Sync + 'static {
-    /// Returns a `MetricsProvider` for the component.
-    ///
-    /// If the component does not support metrics, return `None`.
-    fn metrics_provider(&self) -> Option<Arc<dyn MetricsProvider>>;
 }
 
 pub trait MetricsProvider: Debug + Send + Sync + 'static {

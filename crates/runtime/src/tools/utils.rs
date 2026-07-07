@@ -37,7 +37,7 @@ use runtime_tools::options::SpiceToolsOptions;
 use super::Tooling;
 use super::builtin::catalog::BuiltinToolCatalog;
 use super::factory::default_catalog_names;
-use tools::{SpiceModelTool, rename::with_name};
+use tools::{SpiceModelTool, naming::encode_tool_name, rename::with_name};
 
 #[derive(Debug, Snafu)]
 enum ToolUtilsError {
@@ -328,7 +328,7 @@ async fn get_tool_by_name(
         if let Some(t) = catalog.get(catalog_tool).await {
             return Some(vec![with_name(
                 &t,
-                format!("{catalog_name}/{}", t.name()).as_str(),
+                encode_tool_name(catalog_name, &t.name()).as_str(),
             )]);
         }
 

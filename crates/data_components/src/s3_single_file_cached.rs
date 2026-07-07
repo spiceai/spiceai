@@ -196,6 +196,12 @@ impl RefreshSkipTableProvider for S3SingleFileCached {
     async fn should_skip_refresh(&self) -> DataFusionResult<bool> {
         self.is_file_unchanged().await
     }
+
+    async fn reset_skip_state(&self) {
+        // Drop the cached file metadata so the next `should_skip_refresh` treats the file as
+        // changed and re-materializes the full source (see `reset_skip_state` on the trait).
+        *self.cached_metadata.write().await = None;
+    }
 }
 
 #[deny(clippy::missing_trait_methods)]
@@ -523,6 +529,82 @@ mod tests {
             result,
             Some(true),
             "refresh-skip must be reached through the metadata-enriched wrapper"
+        );
+    }
+
+    /// Regression test for issue #11353: a refresh carrying an override `refresh_sql`
+    /// materializes a subset of the source, so the skip cache must be invalidated afterwards.
+    /// Otherwise the next plain refresh compares the unchanged source against the cached
+    /// version, skips, and leaves the narrowed data in place.
+    ///
+    /// Verifies that after `reset_skip_state`, a metadata that would otherwise be skipped is
+    /// treated as changed (re-materialized) exactly once, then skippable again.
+    #[tokio::test]
+    async fn test_reset_skip_state_forces_next_refresh() {
+        let meta = make_meta("file", 128, 10, Some("etag"), Some("v1"));
+        let store = Arc::new(HeadOnlyObjectStore::new(vec![
+            meta.clone(),
+            meta.clone(),
+            meta.clone(),
+        ])) as Arc<dyn ObjectStore>;
+        let cached_table = build_cached_table(store, Some(meta));
+
+        // Baseline: unchanged file would be skipped.
+        assert!(
+            cached_table
+                .should_skip_refresh()
+                .await
+                .expect("baseline skip result"),
+            "unchanged file should be skippable before reset"
+        );
+
+        // An override refresh resets the skip state.
+        cached_table.reset_skip_state().await;
+
+        // The next refresh must NOT skip even though the source file is unchanged.
+        assert!(
+            !cached_table
+                .should_skip_refresh()
+                .await
+                .expect("post-reset skip result"),
+            "refresh must re-materialize after reset even when the source is unchanged"
+        );
+
+        // And it becomes skippable again once the cache is repopulated.
+        assert!(
+            cached_table
+                .should_skip_refresh()
+                .await
+                .expect("re-cached skip result"),
+            "unchanged file should be skippable again after the cache repopulates"
+        );
+    }
+
+    /// The reset helper must peel the same wrappers as the skip check so the inner
+    /// `S3SingleFileCached` is reached (issue #11353 + the wrapper-peeling fix in #11339).
+    #[tokio::test]
+    async fn test_reset_skip_state_through_metadata_enriched_wrapper() {
+        let meta = make_meta("file", 128, 10, Some("etag"), Some("v1"));
+        let store = Arc::new(HeadOnlyObjectStore::new(vec![meta.clone()])) as Arc<dyn ObjectStore>;
+        let cached_table = build_cached_table(store, Some(meta));
+
+        let mut extra_metadata = std::collections::HashMap::new();
+        extra_metadata.insert("schema.key".to_string(), "value".to_string());
+        let wrapped: Arc<dyn TableProvider> = Arc::new(crate::MetadataEnrichedTableProvider::new(
+            Arc::new(cached_table) as Arc<dyn TableProvider>,
+            extra_metadata,
+        ));
+
+        crate::refresh_skip::reset_refresh_skip_state_for_table_provider(wrapped.as_ref()).await;
+
+        let result = crate::refresh_skip::should_skip_refresh_for_table_provider(wrapped.as_ref())
+            .await
+            .expect("skip check should not error");
+
+        assert_eq!(
+            result,
+            Some(false),
+            "reset must be reached through the metadata-enriched wrapper, forcing a re-materialize"
         );
     }
 }

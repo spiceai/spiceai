@@ -109,11 +109,23 @@ impl TimeRetentionFilterBuilder {
         &self.column_name
     }
 
-    /// Build a **keep** filter: `col >= cutoff` (rows to retain at scan time).
+    /// Build a **keep** filter: `col >= cutoff OR col IS NULL` (rows to retain at
+    /// scan time).
+    ///
+    /// The `OR col IS NULL` disjunct keeps NULL-timestamp rows VISIBLE, matching
+    /// the delete side, which never removes them: the per-row delete predicate
+    /// `col < cutoff` is NULL (not matched) for a NULL timestamp, and the
+    /// whole-file drop predicate `max(col) < threshold` is false when the file's
+    /// max is NULL/absent. Without the disjunct, `NULL >= cutoff` is NULL under
+    /// three-valued logic, so the read path would permanently hide rows retention
+    /// never reclaims — violating the documented contract that NULL-timestamp rows
+    /// are retained (`crates/runtime/src/accelerated_table/retention.rs`).
     #[must_use]
     pub fn keep_filter(&self) -> Expr {
         let cutoff_nanos = self.cutoff_nanos();
-        self.converter.convert(cutoff_nanos, Operator::GtEq)
+        self.converter
+            .convert(cutoff_nanos, Operator::GtEq)
+            .or(datafusion::logical_expr::col(&self.column_name).is_null())
     }
 
     /// Compute the cutoff timestamp in nanoseconds: `now() - retention_seconds`.
@@ -209,6 +221,10 @@ mod tests {
         assert!(
             filter_str.contains("event_time"),
             "filter should reference event_time: {filter_str}"
+        );
+        assert!(
+            filter_str.contains("IS NULL"),
+            "keep filter must retain NULL-timestamp rows via an `IS NULL` disjunct: {filter_str}"
         );
     }
 
@@ -334,8 +350,15 @@ mod tests {
         let builder = TimeRetentionFilterBuilder::try_new("event_time", 3600, &schema)
             .expect("should create builder");
 
-        // 1. Build the filter (col >= cutoff)
-        let filter = builder.keep_filter();
+        // 1. Build the DELETE filter (`col < cutoff`) — this is what
+        //    `extract_retention_column_and_threshold` actually parses on the write
+        //    path. (The READ `keep_filter` is now `col >= cutoff OR col IS NULL`, a
+        //    top-level OR the single-comparison parser intentionally rejects; its
+        //    NULL-retention shape is covered by `test_keep_filter_timestamp_utc`
+        //    and the end-to-end `retention_test`.)
+        let filter = builder
+            .converter
+            .convert(builder.cutoff_nanos(), Operator::Lt);
 
         // 2. Simplify — mirrors what the runtime does before calling delete_from
         let simplified =
@@ -343,13 +366,13 @@ mod tests {
 
         // 3. Parse the simplified expression back
         let (col_name, op, threshold) = extract_retention_column_and_threshold(&simplified)
-            .expect("should parse simplified keep filter");
+            .expect("should parse simplified delete filter");
 
         assert_eq!(
             col_name, "event_time",
             "column name should survive roundtrip"
         );
-        assert_eq!(op, Operator::GtEq, "keep filter uses >=");
+        assert_eq!(op, Operator::Lt, "delete filter uses <");
 
         // The threshold must be a concrete timestamp scalar (now() evaluated away)
         assert!(

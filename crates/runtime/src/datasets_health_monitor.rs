@@ -36,9 +36,9 @@ use crate::{
         DataFusion,
         error::{find_datafusion_root, format_datafusion_error},
     },
-    metrics,
     search::util::find_concrete_table_provider,
 };
+use runtime_metrics as metrics;
 
 const DATASETS_AVAILABILITY_CHECK_INTERVAL_SECONDS: u64 = 60; // every minute
 const DATASET_UNAVAILABLE_THRESHOLD_MINUTES: u64 = 10;
