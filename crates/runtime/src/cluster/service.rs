@@ -546,7 +546,7 @@ impl ClusterService for ClusterServiceImpl {
 
             // Update active executor count metric.
             let count = executor_registry.connected_executors().await.len();
-            crate::metrics::cluster::set_active_executor_count(&metrics_node_id, count as u64);
+            runtime_metrics::cluster::set_active_executor_count(&metrics_node_id, count as u64);
 
             // Register the executor stream for PollNow broadcasts.
             executor_streams.register(&executor_id, registration_tx);
@@ -615,7 +615,7 @@ impl ClusterService for ClusterServiceImpl {
 
             // Update active executor count metric.
             let count = executor_registry.connected_executors().await.len();
-            crate::metrics::cluster::set_active_executor_count(&metrics_node_id, count as u64);
+            runtime_metrics::cluster::set_active_executor_count(&metrics_node_id, count as u64);
 
             // Unregister the executor stream.
             executor_streams.unregister(&executor_id);

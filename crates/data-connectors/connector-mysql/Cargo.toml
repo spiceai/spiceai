@@ -33,6 +33,8 @@ mysql_async.workspace = true
 opentelemetry.workspace = true
 paste.workspace = true
 runtime = { path = "../../runtime" }
+runtime-api-types = { path = "../../runtime-api-types" }
+runtime-metrics = { path = "../../runtime-metrics" }
 secrecy.workspace = true
 snafu.workspace = true
 tracing.workspace = true
