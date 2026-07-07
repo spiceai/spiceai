@@ -3,9 +3,9 @@ use bytes::{Buf, Bytes};
 use crate::error::{PgWireError, Result};
 use crate::lsn::Lsn;
 
-/// Replication protocol CopyData message types.
+/// Replication protocol `CopyData` message types.
 ///
-/// During logical replication streaming, PostgreSQL sends data wrapped in CopyData
+/// During logical replication streaming, `PostgreSQL` sends data wrapped in `CopyData`
 /// messages. This enum represents the two primary message types:
 /// - `XLogData`: Contains actual WAL data (transaction changes)
 /// - `KeepAlive`: Server heartbeat, optionally requesting client response
@@ -28,25 +28,25 @@ pub enum ReplicationCopyData {
         wal_end: Lsn,
         /// Server timestamp in microseconds since 2000-01-01
         server_time_micros: i64,
-        /// If true, server expects StandbyStatusUpdate reply
+        /// If true, server expects `StandbyStatusUpdate` reply
         reply_requested: bool,
     },
 }
 
 impl ReplicationCopyData {
-    /// Returns true if this is an XLogData message
+    /// Returns true if this is an `XLogData` message
     #[inline]
     pub fn is_xlog_data(&self) -> bool {
         matches!(self, ReplicationCopyData::XLogData { .. })
     }
 
-    /// Returns true if this is a KeepAlive message
+    /// Returns true if this is a `KeepAlive` message
     #[inline]
     pub fn is_keepalive(&self) -> bool {
         matches!(self, ReplicationCopyData::KeepAlive { .. })
     }
 
-    /// Returns true if this is a KeepAlive that requests a reply
+    /// Returns true if this is a `KeepAlive` that requests a reply
     #[inline]
     pub fn requires_reply(&self) -> bool {
         matches!(
@@ -59,10 +59,18 @@ impl ReplicationCopyData {
     }
 }
 
-/// Parse a CopyData payload into a replication message.
+/// Parse a `CopyData` payload into a replication message.
 ///
-/// The payload should be the CopyData content (after stripping the 'd' tag and length).
+/// The payload should be the `CopyData` content (after stripping the 'd' tag and length).
 /// Returns either `XLogData` or `KeepAlive` depending on the first byte.
+///
+/// # Errors
+/// Returns [`PgWireError::Protocol`] if the payload is empty, too short for its
+/// kind, or has an unrecognized `CopyData` kind byte.
+#[expect(
+    clippy::cast_sign_loss,
+    reason = "an LSN is a u64 carried as i64 on the wire; the cast is bit-preserving"
+)]
 pub fn parse_copy_data(payload: Bytes) -> Result<ReplicationCopyData> {
     if payload.is_empty() {
         return Err(PgWireError::Protocol("empty CopyData payload".into()));
@@ -117,7 +125,7 @@ pub fn parse_copy_data(payload: Bytes) -> Result<ReplicationCopyData> {
     }
 }
 
-/// Encode a StandbyStatusUpdate message.
+/// Encode a `StandbyStatusUpdate` message.
 ///
 /// This message reports the client's replay position to the server.
 /// All three LSN fields (write, flush, apply) are set to the same value.
@@ -128,7 +136,12 @@ pub fn parse_copy_data(payload: Bytes) -> Result<ReplicationCopyData> {
 /// * `reply_requested` - If true, server should send a reply (usually false)
 ///
 /// # Returns
-/// Raw bytes suitable for sending via CopyData
+/// Raw bytes suitable for sending via `CopyData`
+#[must_use]
+#[expect(
+    clippy::cast_possible_wrap,
+    reason = "an LSN is a u64 sent as i64 on the wire; the cast is bit-preserving"
+)]
 pub fn encode_standby_status_update(
     applied: Lsn,
     client_time_micros: i64,
@@ -147,27 +160,35 @@ pub fn encode_standby_status_update(
     // Client system clock
     out.extend_from_slice(&client_time_micros.to_be_bytes());
     // Reply requested
-    out.push(if reply_requested { 1 } else { 0 });
+    out.push(u8::from(reply_requested));
 
     out
 }
 
-/// PostgreSQL epoch (2000-01-01) in microseconds since Unix epoch.
+/// `PostgreSQL` epoch (2000-01-01) in microseconds since Unix epoch.
 pub const PG_EPOCH_MICROS: i64 = 946_684_800_000_000;
 
-/// Convert Unix timestamp (micros) to PostgreSQL timestamp (micros since 2000-01-01).
+/// Convert Unix timestamp (micros) to `PostgreSQL` timestamp (micros since 2000-01-01).
 #[inline]
+#[must_use]
 pub fn unix_to_pg_timestamp(unix_micros: i64) -> i64 {
     unix_micros - PG_EPOCH_MICROS
 }
 
-/// Convert PostgreSQL timestamp to Unix timestamp (micros).
+/// Convert `PostgreSQL` timestamp to Unix timestamp (micros).
 #[inline]
+#[must_use]
 pub fn pg_to_unix_timestamp(pg_micros: i64) -> i64 {
     pg_micros + PG_EPOCH_MICROS
 }
 
 #[cfg(test)]
+#[expect(
+    clippy::unreadable_literal,
+    clippy::match_wildcard_for_single_variants,
+    reason = "test vectors use hex byte constants; the wildcard arms are panics on the \
+              other CopyData variant, exhaustive by test construction"
+)]
 mod tests {
     use super::*;
 
@@ -182,7 +203,7 @@ mod tests {
         v.extend_from_slice(&3i64.to_be_bytes()); // server_time
                                                   // no data payload
 
-        let msg = parse_copy_data(Bytes::from(v)).unwrap();
+        let msg = parse_copy_data(Bytes::from(v)).expect("should succeed");
         match msg {
             ReplicationCopyData::XLogData {
                 wal_start,
@@ -208,7 +229,7 @@ mod tests {
         v.extend_from_slice(&(-12345i64).to_be_bytes());
         v.extend_from_slice(b"hello world pgoutput data");
 
-        let msg = parse_copy_data(Bytes::from(v)).unwrap();
+        let msg = parse_copy_data(Bytes::from(v)).expect("should succeed");
         match msg {
             ReplicationCopyData::XLogData {
                 wal_start,
@@ -231,7 +252,7 @@ mod tests {
         v.push(b'w');
         v.extend_from_slice(&[0u8; 23]); // only 23 bytes, need 24
 
-        let err = parse_copy_data(Bytes::from(v)).unwrap_err();
+        let err = parse_copy_data(Bytes::from(v)).expect_err("should error");
         assert!(err.to_string().contains("XLogData"));
         assert!(err.to_string().contains("too short"));
     }
@@ -246,7 +267,7 @@ mod tests {
         v.extend_from_slice(&200i64.to_be_bytes()); // server_time
         v.push(1); // reply_requested = true
 
-        let msg = parse_copy_data(Bytes::from(v)).unwrap();
+        let msg = parse_copy_data(Bytes::from(v)).expect("should succeed");
         match msg {
             ReplicationCopyData::KeepAlive {
                 wal_end,
@@ -269,7 +290,7 @@ mod tests {
         v.extend_from_slice(&888i64.to_be_bytes());
         v.push(0); // reply_requested = false
 
-        let msg = parse_copy_data(Bytes::from(v)).unwrap();
+        let msg = parse_copy_data(Bytes::from(v)).expect("should succeed");
         match msg {
             ReplicationCopyData::KeepAlive {
                 reply_requested, ..
@@ -289,7 +310,7 @@ mod tests {
         v.extend_from_slice(&0i64.to_be_bytes());
         v.push(42); // non-zero = true
 
-        let msg = parse_copy_data(Bytes::from(v)).unwrap();
+        let msg = parse_copy_data(Bytes::from(v)).expect("should succeed");
         assert!(matches!(
             msg,
             ReplicationCopyData::KeepAlive {
@@ -305,7 +326,7 @@ mod tests {
         v.push(b'k');
         v.extend_from_slice(&[0u8; 16]); // only 16 bytes, need 17
 
-        let err = parse_copy_data(Bytes::from(v)).unwrap_err();
+        let err = parse_copy_data(Bytes::from(v)).expect_err("should error");
         assert!(err.to_string().contains("KeepAlive"));
         assert!(err.to_string().contains("too short"));
     }
@@ -314,14 +335,14 @@ mod tests {
 
     #[test]
     fn parse_empty_payload() {
-        let err = parse_copy_data(Bytes::new()).unwrap_err();
+        let err = parse_copy_data(Bytes::new()).expect_err("should error");
         assert!(err.to_string().contains("empty"));
     }
 
     #[test]
     fn parse_unknown_kind() {
         let v = vec![b'X', 0, 0, 0]; // unknown kind 'X'
-        let err = parse_copy_data(Bytes::from(v)).unwrap_err();
+        let err = parse_copy_data(Bytes::from(v)).expect_err("should error");
         assert!(err.to_string().contains("unknown CopyData kind"));
         assert!(err.to_string().contains("0x58")); // 'X' in hex
     }
