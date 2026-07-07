@@ -87,6 +87,13 @@ pub enum Error {
     ))]
     UnsupportedBinlogRowImage { image: String },
 
+    #[snafu(display(
+        "MySQL `binlog_row_value_options` is '{options}', but Spice requires it to be \
+         empty: partial JSON row images cannot be applied. \
+         Run: SET GLOBAL binlog_row_value_options = ''; (and update my.cnf so it persists)."
+    ))]
+    UnsupportedBinlogRowValueOptions { options: String },
+
     #[snafu(display("Source table {database}.{table} does not exist"))]
     SourceTableNotFound { database: String, table: String },
 

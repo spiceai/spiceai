@@ -33,6 +33,7 @@ use super::config::{BinlogPosition, ReplicationParams};
 use super::{
     BinaryLoggingDisabledSnafu, ColumnMissingSnafu, ConnectSnafu, Error, Result, SetupQuerySnafu,
     SourceTableNotFoundSnafu, UnsupportedBinlogFormatSnafu, UnsupportedBinlogRowImageSnafu,
+    UnsupportedBinlogRowValueOptionsSnafu,
 };
 use snafu::prelude::*;
 
@@ -121,6 +122,29 @@ pub async fn validate_server(conn: &mut Conn) -> Result<()> {
     }
     if !image.eq_ignore_ascii_case("FULL") {
         return UnsupportedBinlogRowImageSnafu { image }.fail();
+    }
+
+    // `binlog_row_value_options = PARTIAL_JSON` makes JSON row images partial,
+    // which cannot be applied — fail fast here instead of at decode time.
+    // Queried separately because the variable does not exist on every server
+    // (e.g. MariaDB): an unknown-variable error means "never partial".
+    match conn
+        .query_first::<Option<String>, _>("SELECT @@binlog_row_value_options")
+        .await
+    {
+        Ok(row) => {
+            let options = row.flatten().unwrap_or_default();
+            if !options.trim().is_empty() {
+                return UnsupportedBinlogRowValueOptionsSnafu { options }.fail();
+            }
+        }
+        // 1193: ER_UNKNOWN_SYSTEM_VARIABLE
+        Err(mysql_async::Error::Server(ref e)) if e.code == 1193 => {}
+        Err(e) => {
+            return Err(e).context(SetupQuerySnafu {
+                context: "SELECT @@binlog_row_value_options",
+            });
+        }
     }
 
     Ok(())

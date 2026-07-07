@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-//! End-to-end integration test for the MySQL binlog-replication path, driven
+//! End-to-end integration test for the `MySQL` binlog-replication path, driven
 //! through the full Spice Runtime (Spicepod datasets + `DuckDB` accelerator).
 //!
 //! What this test validates that the pure-library test at `replication.rs`
@@ -25,7 +25,7 @@ limitations under the License.
 //!   - Actual SQL queries through `Runtime::datafusion()` (not raw
 //!     `ChangeBatch` assertions) — so we prove end users can query the
 //!     replicated data.
-//!   - A range of MySQL data types (`INT`, `BIGINT`, `TEXT`, `DOUBLE`,
+//!   - A range of `MySQL` data types (`INT`, `BIGINT`, `TEXT`, `DOUBLE`,
 //!     `DECIMAL`, `DATE`, `DATETIME`) surviving INSERT/UPDATE/DELETE across
 //!     the binlog path.
 //!   - The stream surviving a compatible `ALTER TABLE` on the source
@@ -179,11 +179,19 @@ async fn scalar_i64(rt: &Arc<Runtime>, sql: &str) -> Result<i64, anyhow::Error> 
         .filter(|b| b.num_rows() > 0)
         .ok_or_else(|| anyhow!("no rows from `{sql}`"))?;
     let column = batch.column(0);
-    column
-        .as_any()
-        .downcast_ref::<arrow::array::Int64Array>()
-        .map(|a| a.value(0))
-        .ok_or_else(|| anyhow!("non-Int64 result from `{sql}`: got {}", column.data_type()))
+    // The result width depends on the query and engine: a `COUNT(*)` is
+    // Int64 while a raw `INT` column scan stays Int32 — accept both and
+    // compare as i64.
+    if let Some(a) = column.as_any().downcast_ref::<arrow::array::Int64Array>() {
+        return Ok(a.value(0));
+    }
+    if let Some(a) = column.as_any().downcast_ref::<arrow::array::Int32Array>() {
+        return Ok(i64::from(a.value(0)));
+    }
+    Err(anyhow!(
+        "non-integer result from `{sql}`: got {}",
+        column.data_type()
+    ))
 }
 
 /// Poll `sql` (which must return a single Int64 scalar) until it reports

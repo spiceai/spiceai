@@ -731,10 +731,19 @@ fn optional_duration(
     if trimmed.is_empty() {
         return Ok(default);
     }
-    fundu::parse_duration(trimmed).map_err(|parse_error| {
+    let parsed = fundu::parse_duration(trimmed).map_err(|parse_error| {
         let user_param = params.user_param(key);
         format!("parameter `{user_param}` must be a duration, got {raw:?}: {parse_error}")
-    })
+    })?;
+    // A zero interval would fire on every loop iteration (e.g. a sidecar
+    // checkpoint write per binlog event) — misconfiguration, not a feature.
+    if parsed.is_zero() {
+        let user_param = params.user_param(key);
+        return Err(format!(
+            "parameter `{user_param}` must be a positive duration, got {raw:?}"
+        ));
+    }
+    Ok(parsed)
 }
 
 fn optional_usize_in_range(
@@ -926,6 +935,20 @@ mod tests {
         let err = replication_params_from_connector_params(&params, "orders")
             .expect_err("unsupported sslmode must error");
         assert!(err.contains("mysql_sslmode"), "got: {err}");
+    }
+
+    #[test]
+    fn zero_checkpoint_interval_is_rejected() {
+        // `0s` would persist the position on every loop iteration — reject it
+        // rather than silently busy-looping the sidecar.
+        let params = params_with(&[("replication_checkpoint_interval", "0s")]);
+        let err = replication_params_from_connector_params(&params, "orders")
+            .expect_err("zero interval must error");
+        assert!(err.contains("positive duration"), "got: {err}");
+        assert!(
+            err.contains("mysql_replication_checkpoint_interval"),
+            "got: {err}"
+        );
     }
 
     #[test]

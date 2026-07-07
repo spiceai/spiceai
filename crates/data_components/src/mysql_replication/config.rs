@@ -196,10 +196,13 @@ pub fn process_nonce() -> u32 {
     static NONCE: OnceLock<u32> = OnceLock::new();
     *NONCE.get_or_init(|| {
         let pid = std::process::id();
+        // Hash the full epoch-nanos timestamp, not just the sub-second part:
+        // containerized deployments commonly share pid=1, so the timestamp
+        // carries most of the cross-instance entropy.
         let now_nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |d| d.subsec_nanos());
-        fnv1a_32(&pid.to_le_bytes()) ^ now_nanos
+            .map_or(0u128, |d| d.as_nanos());
+        fnv1a_32(&pid.to_le_bytes()) ^ fnv1a_32(&now_nanos.to_le_bytes())
     })
 }
 

@@ -265,8 +265,8 @@ fn binlog_change_stream(
                 if crate::cdc::shutdown_epoch() != shutdown_epoch {
                     // Release the dump thread now rather than at process
                     // exit; the shutdown drain phase can take tens of
-                    // seconds. Checked per event, so the bound is one
-                    // heartbeat interval on a quiet source.
+                    // seconds. Checked per event and per idle tick, so the
+                    // bound is one checkpoint interval on a quiet source.
                     if let Err(e) = stream.close().await {
                         tracing::debug!(dataset = %dataset_name, error = %e, "binlog stream close during shutdown");
                     }
@@ -275,7 +275,22 @@ fn binlog_change_stream(
                     break 'reconnect;
                 }
 
-                let Some(event) = stream.next().await else {
+                // Bound the wait so idle checkpointing (and shutdown checks)
+                // never depend on the server actually honoring the heartbeat
+                // request — a quiet source with no heartbeats must still
+                // persist acked positions every interval.
+                let next_event =
+                    match tokio::time::timeout(params.checkpoint_interval, stream.next()).await {
+                        Ok(item) => item,
+                        Err(_idle) => {
+                            checkpointer.persist(&ack, &mut resume).await;
+                            poll_source_head(&mut side_conn, &params, &resume, &metrics, &dataset_name)
+                                .await;
+                            last_persist_at = Instant::now();
+                            continue 'recv;
+                        }
+                    };
+                let Some(event) = next_event else {
                     // Server closed the dump cleanly — treat as transient.
                     metrics.inc_recv_error();
                     metrics.inc_reconnect();
@@ -619,16 +634,17 @@ async fn open_binlog_stream(
         .max(Duration::from_millis(500))
         .as_nanos()
         .min(u128::from(u64::MAX));
-    if let Err(e) = mysql_async::prelude::Queryable::query_drop(
-        &mut conn,
-        format!(
-            "SET @master_heartbeat_period = {heartbeat_nanos}, \
-             @source_heartbeat_period = {heartbeat_nanos}"
-        ),
-    )
-    .await
-    {
-        tracing::debug!(dataset = %dataset_name, error = %e, "failed to set the heartbeat period");
+    // Two separate statements: if a server rejects one spelling, the other
+    // must still take effect (a combined statement fails atomically).
+    for var in ["master_heartbeat_period", "source_heartbeat_period"] {
+        if let Err(e) = mysql_async::prelude::Queryable::query_drop(
+            &mut conn,
+            format!("SET @{var} = {heartbeat_nanos}"),
+        )
+        .await
+        {
+            tracing::debug!(dataset = %dataset_name, error = %e, "failed to set @{var}");
+        }
     }
 
     let pos_u32 = u32::try_from(resume.pos).unwrap_or(u32::MAX);

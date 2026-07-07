@@ -339,12 +339,11 @@ async fn purged_position_behavior() -> Result<(), anyhow::Error> {
         200_201,
         Arc::clone(&store) as Arc<dyn PositionStore>,
     ));
-    let err = match tokio::time::timeout(Duration::from_secs(30), stream.next())
+    let Err(err) = tokio::time::timeout(Duration::from_secs(30), stream.next())
         .await?
         .expect("stream yields an item")
-    {
-        Ok(_) => anyhow::bail!("stale position with `error` behavior must fail"),
-        Err(e) => e,
+    else {
+        anyhow::bail!("stale position with `error` behavior must fail")
     };
     assert!(
         err.to_string().contains("rebootstrap"),

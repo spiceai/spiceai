@@ -56,7 +56,7 @@ position in its `spice_sys_mysql_binlog` sidecar when file-backed. The
 | `log_bin` | `ON` | Default on MySQL 8.0+. |
 | `binlog_format` | `ROW` | Default on MySQL 8.0+. Validated at startup. |
 | `binlog_row_image` | `FULL` | Default. Validated at startup; `MINIMAL` images are rejected. |
-| `binlog_row_value_options` | `''` (empty) | Partial JSON row images cannot be applied. |
+| `binlog_row_value_options` | `''` (empty) | Validated at startup; partial JSON row images cannot be applied. |
 | `binlog_expire_logs_seconds` | ≥ longest expected spiced downtime | See [position recovery](#when-the-position-is-purged). |
 
 The connecting user needs:
