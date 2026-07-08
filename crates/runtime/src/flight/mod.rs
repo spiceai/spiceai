@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use crate::Runtime;
 use crate::auth::EndpointAuth;
 use crate::datafusion::DataFusion;
 use crate::datafusion::app_context_extension::AppContextExtension;
@@ -24,7 +25,6 @@ use crate::dataupdate::DataUpdateBroadcaster;
 use crate::egress::EgressAccount;
 use crate::opentelemetry::create_metrics_service;
 use crate::tls::TlsConfig;
-use crate::{Runtime, metrics as runtime_metrics};
 use app::{App, spicepod::component::runtime::FlightIpcCompression};
 use arrow::array::RecordBatch;
 use arrow::datatypes::{DataType, Schema};
@@ -78,7 +78,7 @@ mod flightsql;
 mod get_flight_info;
 mod get_schema;
 mod handshake;
-mod metrics;
+pub(crate) mod metrics;
 pub mod middleware;
 mod mtls;
 mod session;

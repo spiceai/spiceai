@@ -77,6 +77,9 @@ pub mod dynamodb;
 #[cfg(feature = "mongodb")]
 pub mod mongodb;
 
+#[cfg(feature = "mysql")]
+pub mod mysql_binlog;
+
 #[cfg(any(feature = "kafka", feature = "debezium"))]
 mod offsets;
 
@@ -201,7 +204,8 @@ impl Error {
         feature = "postgres",
         feature = "turso",
         feature = "kafka",
-        feature = "mongodb"
+        feature = "mongodb",
+        feature = "mysql"
     ))]
     fn external(err: impl Into<Box<dyn std::error::Error + Send + Sync>>) -> Self {
         Self::External { source: err.into() }

@@ -34,11 +34,11 @@ use data_components::postgres_replication::{
 use datafusion::sql::TableReference;
 use futures::StreamExt;
 use opentelemetry::KeyValue;
-use runtime::component::ComponentType;
 use runtime::component::dataset::Dataset;
-use runtime::component::metrics::{MetricSpec, MetricType, MetricsProvider, ObserveMetricCallback};
 use runtime::federated_table::FederatedTable;
 use runtime::parameters::{ExposedParamLookup, Parameters};
+use runtime_api_types::v1::ComponentType;
+use runtime_metrics::component::{MetricSpec, MetricType, MetricsProvider, ObserveMetricCallback};
 use secrecy::SecretString;
 
 // Standby status feedback cadence. Kept well below Postgres's default
@@ -260,15 +260,41 @@ const METRICS: &[MetricSpec] = &[
     )
     .description(
         "Most recent LSN Spice has acknowledged to Postgres. Matches \
-             `pg_replication_slots.confirmed_flush_lsn`.",
-    ),
+             `pg_replication_slots.confirmed_flush_lsn`. Compare its advance rate \
+             against the applied watermark to spot slot-ack racing ahead of apply.",
+    )
+    .auto_register(),
     MetricSpec::new(
         "replication_server_wal_end_lsn",
         MetricType::ObservableGaugeU64,
     )
     .description(
         "Most recent WAL end LSN reported by the Postgres server (via keepalive or WAL data).",
-    ),
+    )
+    .auto_register(),
+    MetricSpec::new(
+        "replication_reader_input_wait_micros_total",
+        MetricType::ObservableCounterU64,
+    )
+    .description(
+        "Cumulative microseconds the replication reader spent BLOCKED awaiting the \
+         next event from the source socket. High relative to \
+         `reader_processing_micros_total` ⇒ source/network can't deliver fast \
+         enough (source-bound); low ⇒ our decode/build is the limiter.",
+    )
+    .unit("us")
+    .auto_register(),
+    MetricSpec::new(
+        "replication_reader_processing_micros_total",
+        MetricType::ObservableCounterU64,
+    )
+    .description(
+        "Cumulative microseconds the replication reader spent decoding + building \
+         change batches (and yielding downstream) after a socket event. The \
+         source-vs-our-decode discriminator, paired with reader_input_wait_micros_total.",
+    )
+    .unit("us")
+    .auto_register(),
     MetricSpec::new(
         "replication_transactions_total",
         MetricType::ObservableCounterU64,
@@ -357,6 +383,18 @@ const METRICS: &[MetricSpec] = &[
     )
     .auto_register(),
     MetricSpec::new(
+        "replication_disconnected_ms_total",
+        MetricType::ObservableCounterU64,
+    )
+    .description(
+        "Cumulative milliseconds the replication stream was disconnected across all \
+         reconnects (drop → successful resume, including backoff). Paired with \
+         replication_reconnects_total it quantifies the DURATION cost of a reconnect \
+         storm — no changes are delivered and lag grows while disconnected.",
+    )
+    .unit("ms")
+    .auto_register(),
+    MetricSpec::new(
         "replication_member_send_stalled_seconds_total",
         MetricType::ObservableCounterU64,
     )
@@ -366,6 +404,20 @@ const METRICS: &[MetricSpec] = &[
          (downstream backpressure). The server replication connection stays alive \
          throughout; a rising value indicates a slow apply loop stalling the shared \
          pump. Only reported for datasets on a shared (explicitly-named) slot.",
+    )
+    .auto_register(),
+    MetricSpec::new(
+        "replication_member_attached",
+        MetricType::ObservableGaugeU64,
+    )
+    .description(
+        "1 while this dataset is an attached member of its shared replication slot, \
+         0 once it has detached. A detached member freezes its ack floor and pins WAL \
+         retention for the WHOLE shared slot until it rejoins or spiced restarts, so a \
+         value of 0 is the unambiguous signal for which dataset stalled the slot (the \
+         lag metric grows on the surviving slot-mates instead). Only reported for \
+         datasets on a shared (explicitly-named) slot; a dedicated slot reports no series. \
+         Carries a `slot` label for shared-slot grouping.",
     )
     .auto_register(),
 ];
@@ -420,6 +472,16 @@ impl MetricsProvider for PostgresMetricsProvider {
             "replication_server_wal_end_lsn" => {
                 Some(ObserveMetricCallback::U64(Box::new(move |instrument| {
                     instrument.observe(m.server_wal_end_lsn(), &attributes);
+                })))
+            }
+            "replication_reader_input_wait_micros_total" => {
+                Some(ObserveMetricCallback::U64(Box::new(move |instrument| {
+                    instrument.observe(m.reader_input_wait_micros_total(), &attributes);
+                })))
+            }
+            "replication_reader_processing_micros_total" => {
+                Some(ObserveMetricCallback::U64(Box::new(move |instrument| {
+                    instrument.observe(m.reader_processing_micros_total(), &attributes);
                 })))
             }
             "replication_transactions_total" => {
@@ -484,6 +546,26 @@ impl MetricsProvider for PostgresMetricsProvider {
             "replication_reconnects_total" => {
                 Some(ObserveMetricCallback::U64(Box::new(move |instrument| {
                     instrument.observe(m.replication_reconnects_total(), &attributes);
+                })))
+            }
+            "replication_disconnected_ms_total" => {
+                Some(ObserveMetricCallback::U64(Box::new(move |instrument| {
+                    instrument.observe(m.replication_disconnected_ms_total(), &attributes);
+                })))
+            }
+            "replication_member_attached" => {
+                Some(ObserveMetricCallback::U64(Box::new(move |instrument| {
+                    // Observe only for shared-slot members (`Some`); a dedicated slot has
+                    // no member-detach concept, so its series stays absent rather than a
+                    // misleading constant `0`. Append the shared-slot label so the
+                    // analysis can group datasets by slot + join authoritative backlog.
+                    if let Some(v) = m.member_attached() {
+                        let mut attrs = attributes.clone();
+                        if let Some(slot) = m.slot_name() {
+                            attrs.push(KeyValue::new("slot", slot));
+                        }
+                        instrument.observe(v, &attrs);
+                    }
                 })))
             }
             "replication_member_send_stalled_seconds_total" => {
