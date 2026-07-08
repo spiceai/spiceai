@@ -1,0 +1,278 @@
+version: v1
+kind: Spicepod
+name: mysql-cayenne[file]-cdc-tuned-sf10
+
+# Target: xlarge-runner — 64 vCPU / 256 GiB RAM, SSD storage. sf10 run: identical to
+# the sf1000 tuning — at this scale every PK keyset fits the exact path under any
+# pin, so the keyset value is not load-bearing; kept aligned for comparability.
+#
+# Key tuning:
+#   - cdc_prefetch_buffer / cdc_max_coalesced_envelopes 16384 (runtime max after Lever D
+#     raised CDC_PREFETCH_BUFFER_MAX / CDC_MAX_COALESCED_ENVELOPES_MAX 4096->16384):
+#     larger CDC bursts cut metastore round-trips and keep WAL drain ahead of bursty OLTP.
+#   - target_partitions 48: read-path parallelism tuned for the current runner sweep.
+#   - per-table cayenne_write_concurrency / segment_cache_mb / compaction_* for the high-volume
+#     upsert tables; reference tables use lighter settings.
+runtime:
+  params:
+    cdc_prefetch_buffer: '16384'
+    cdc_max_coalesced_envelopes: '16384'
+    cdc_max_coalesced_bytes: '536870912' # 512 MB
+    cdc_max_coalesce_age_ms: '4000'
+    cdc_commit_timeout_ms: '60000'
+    cayenne_sort_merge_min_rows: '50000000'
+    cayenne_footer_cache_mb: '1024'
+    cayenne_metastore_cache_mb: '1024'
+    cayenne_metastore_mmap_mb: '4096'
+  query:
+    target_partitions: 48
+  caching:
+    sql_results:
+      enabled: false
+  task_history:
+    enabled: false
+
+mysql_connection_params: &mysql_params
+  mysql_host: ${env:CHBENCH_MYSQL_HOST}
+  mysql_tcp_port: 3306
+  mysql_db: chbench
+  mysql_user: bench
+  mysql_pass: bench
+  mysql_sslmode: disabled
+
+datasets:
+  # ------------------------------------------------------------------
+  # High-volume PK upsert tables.
+  # ------------------------------------------------------------------
+
+  - from: mysql:district
+    name: district
+    params:
+      <<: *mysql_params
+      mysql_replication_snapshot_mode: auto
+      mysql_replication_server_id: '1001'
+      mysql_replication_bootstrap_batch_size: '1048576'
+    acceleration:
+      enabled: true
+      engine: cayenne
+      mode: file
+      refresh_mode: changes
+      primary_key: (d_w_id, d_id)
+      on_conflict:
+        (d_w_id, d_id): upsert
+      params: &accel_high_volume
+        cayenne_metastore: sqlite
+        cayenne_file_path: .spice/cayenne/district
+        cayenne_write_concurrency: '4'
+        cayenne_segment_cache_mb: '1024'
+        cayenne_compaction_trigger_protected_snapshots: '3'
+        # Pinned to 1 GiB (SF-1000 sweep): a small keyset budget keeps the heavy-update
+        # tables (stock, order_line) on the cheap bloom path and hits the <30s lag goal for
+        # all 22 queries. The memory-aware auto-default (total_mem/32 -> ~8 GiB on a 256 GiB
+        # host) is BACKWARDS — it over-sizes the exact keyset and hurts those tables. Pin 1024.
+        cayenne_pk_keyset_cache_mb: '1024'
+        cayenne_compaction_trigger_snapshot_age_ms: '15000'
+        cayenne_compaction_max_files_per_pick: '64'
+        cayenne_compaction_background_interval_ms: '3000'
+
+  - from: mysql:customer
+    name: customer
+    params:
+      <<: *mysql_params
+      mysql_replication_snapshot_mode: auto
+      mysql_replication_server_id: '1002'
+      mysql_replication_bootstrap_batch_size: '1048576'
+    acceleration:
+      enabled: true
+      engine: cayenne
+      mode: file
+      refresh_mode: changes
+      primary_key: (c_w_id, c_d_id, c_id)
+      on_conflict:
+        (c_w_id, c_d_id, c_id): upsert
+      params:
+        <<: *accel_high_volume
+        cayenne_file_path: .spice/cayenne/customer
+        cayenne_target_file_size_mb: '256'
+
+  - from: mysql:new_order
+    name: new_order
+    params:
+      <<: *mysql_params
+      mysql_replication_snapshot_mode: auto
+      mysql_replication_server_id: '1003'
+      mysql_replication_bootstrap_batch_size: '1048576'
+    acceleration:
+      enabled: true
+      engine: cayenne
+      mode: file
+      refresh_mode: changes
+      primary_key: (no_w_id, no_d_id, no_o_id)
+      on_conflict:
+        (no_w_id, no_d_id, no_o_id): upsert
+      params:
+        <<: *accel_high_volume
+        cayenne_file_path: .spice/cayenne/new_order
+
+  - from: mysql:oorder
+    name: oorder
+    params:
+      <<: *mysql_params
+      mysql_replication_snapshot_mode: auto
+      mysql_replication_server_id: '1004'
+      mysql_replication_bootstrap_batch_size: '1048576'
+    acceleration:
+      enabled: true
+      engine: cayenne
+      mode: file
+      refresh_mode: changes
+      primary_key: (o_w_id, o_d_id, o_id)
+      on_conflict:
+        (o_w_id, o_d_id, o_id): upsert
+      params:
+        <<: *accel_high_volume
+        cayenne_file_path: .spice/cayenne/oorder
+
+  - from: mysql:order_line
+    name: order_line
+    params:
+      <<: *mysql_params
+      mysql_replication_snapshot_mode: auto
+      mysql_replication_server_id: '1005'
+      mysql_replication_bootstrap_batch_size: '1048576'
+    acceleration:
+      enabled: true
+      engine: cayenne
+      mode: file
+      refresh_mode: changes
+      primary_key: (ol_w_id, ol_d_id, ol_o_id, ol_number)
+      on_conflict:
+        (ol_w_id, ol_d_id, ol_o_id, ol_number): upsert
+      params:
+        <<: *accel_high_volume
+        cayenne_file_path: .spice/cayenne/order_line
+        cayenne_write_concurrency: '4'
+        cayenne_target_file_size_mb: '256'
+        cayenne_compaction_trigger_files: '8'
+        cayenne_compaction_trigger_snapshot_age_ms: '30000'
+        cayenne_compaction_max_files_per_pick: '128'
+        cayenne_segment_cache_mb: '2048'
+
+  - from: mysql:stock
+    name: stock
+    params:
+      <<: *mysql_params
+      mysql_replication_snapshot_mode: auto
+      mysql_replication_server_id: '1006'
+      mysql_replication_bootstrap_batch_size: '1048576'
+    acceleration:
+      enabled: true
+      engine: cayenne
+      mode: file
+      refresh_mode: changes
+      primary_key: (s_w_id, s_i_id)
+      on_conflict:
+        (s_w_id, s_i_id): upsert
+      params:
+        <<: *accel_high_volume
+        cayenne_file_path: .spice/cayenne/stock
+        cayenne_target_file_size_mb: '256'
+
+  # ------------------------------------------------------------------
+  # Low-volume reference tables.
+  # ------------------------------------------------------------------
+
+  - from: mysql:warehouse
+    name: warehouse
+    params:
+      <<: *mysql_params
+      mysql_replication_snapshot_mode: auto
+      mysql_replication_server_id: '1007'
+      mysql_replication_bootstrap_batch_size: '1048576'
+    acceleration:
+      enabled: true
+      engine: cayenne
+      mode: file
+      refresh_mode: changes
+      primary_key: w_id
+      on_conflict:
+        w_id: upsert
+      params: &accel_medium
+        cayenne_metastore: sqlite
+        cayenne_file_path: .spice/cayenne/warehouse
+        cayenne_write_concurrency: '4'
+        cayenne_segment_cache_mb: '64'
+        # Pin 1 GiB explicitly (don't leave to the backwards memory-aware auto-default).
+        cayenne_pk_keyset_cache_mb: '1024'
+
+  # ------------------------------------------------------------------
+  # Static reference tables (no OLTP mutations, full refresh).
+  # ------------------------------------------------------------------
+
+  - from: mysql:item
+    name: item
+    params:
+      <<: *mysql_params
+    acceleration:
+      enabled: true
+      engine: cayenne
+      mode: file
+      refresh_mode: full
+      primary_key: i_id
+      on_conflict:
+        i_id: upsert
+      params:
+        <<: *accel_medium
+        cayenne_file_path: .spice/cayenne/item
+
+  - from: mysql:region
+    name: region
+    params:
+      <<: *mysql_params
+    acceleration:
+      enabled: true
+      engine: cayenne
+      mode: file
+      refresh_mode: full
+      primary_key: r_regionkey
+      on_conflict:
+        r_regionkey: upsert
+      params: &accel_small
+        cayenne_metastore: sqlite
+        cayenne_file_path: .spice/cayenne/region
+        cayenne_write_concurrency: '2'
+        cayenne_segment_cache_mb: '16'
+        # Pin 1 GiB explicitly (don't leave to the backwards memory-aware auto-default).
+        cayenne_pk_keyset_cache_mb: '1024'
+
+  - from: mysql:nation
+    name: nation
+    params:
+      <<: *mysql_params
+    acceleration:
+      enabled: true
+      engine: cayenne
+      mode: file
+      refresh_mode: full
+      primary_key: n_nationkey
+      on_conflict:
+        n_nationkey: upsert
+      params:
+        <<: *accel_small
+        cayenne_file_path: .spice/cayenne/nation
+
+  - from: mysql:supplier
+    name: supplier
+    params:
+      <<: *mysql_params
+    acceleration:
+      enabled: true
+      engine: cayenne
+      mode: file
+      refresh_mode: full
+      primary_key: su_suppkey
+      on_conflict:
+        su_suppkey: upsert
+      params:
+        <<: *accel_small
+        cayenne_file_path: .spice/cayenne/supplier

@@ -19,6 +19,7 @@ limitations under the License.
 use std::path::PathBuf;
 use std::time::Duration;
 
+use pgwire_replication::PgOutputFormat;
 use secrecy::{ExposeSecret, SecretString};
 
 /// Parameters for a single dataset's replication stream.
@@ -68,6 +69,15 @@ pub struct ReplicationParams {
     /// (per-dataset generated) slot names keep the dedicated per-dataset
     /// stream.
     pub shared: bool,
+
+    /// pgoutput column output format to request on the WAL stream. Internal —
+    /// not a spicepod parameter: the connector always sets [`PgOutputFormat::Binary`]
+    /// (binary decodes faster and avoids source-side text formatting). Exposed
+    /// as a field only so tests can force [`PgOutputFormat::Text`] to exercise
+    /// the text fallback and assert binary/text parity. Per-column the server
+    /// still emits text for types lacking a binary send function, so the text
+    /// decode path stays live regardless of this setting.
+    pub pg_output_format: PgOutputFormat,
 }
 
 impl std::fmt::Debug for ReplicationParams {
@@ -87,6 +97,7 @@ impl std::fmt::Debug for ReplicationParams {
             .field("status_interval", &self.status_interval)
             .field("bootstrap_batch_size", &self.bootstrap_batch_size)
             .field("shared", &self.shared)
+            .field("pg_output_format", &self.pg_output_format)
             .finish_non_exhaustive()
     }
 }
