@@ -1227,53 +1227,42 @@ async fn run_pump(source: Arc<SharedSource>) {
                     // relation id and buffered raw, so the per-dataset consumer
                     // pays the tuple decode + Arrow build off this shared task.
                     match pgoutput::message_type(&data) {
-                        Some(b'R') => {
-                            // Fully decode to (re)cache the relation, then
-                            // validate + route it.
-                            let rel = match decoder.decode(data) {
-                                Ok(pgoutput::DecodedMessage::Relation(rel)) => rel,
-                                // A non-Relation body under an 'R' tag is
-                                // impossible from a well-formed server; ignore.
-                                Ok(_) => continue 'recv,
+                        // Relation and Truncate are fully decoded here (rare, and
+                        // they carry routing state — the relation cache / a
+                        // relation-id list). Clone the frame first so a TRUNCATE
+                        // can still buffer its raw bytes after the decoder consumes
+                        // `data` (O(1) Bytes refcount; R/T are rare).
+                        Some(b'R' | b'T') => {
+                            let raw = data.clone();
+                            let msg = match decoder.decode(data) {
+                                Ok(msg) => msg,
                                 Err(e) => {
                                     source.for_each_member_metrics(
                                         ReplicationMetricsCollector::inc_decode_error,
                                     );
-                                    fatal_broadcast(
-                                        &source,
-                                        format!("pgoutput decode failed: {e}"),
-                                    )
-                                    .await;
+                                    fatal_broadcast(&source, format!("pgoutput decode failed: {e}"))
+                                        .await;
                                     break 'reconnect;
                                 }
                             };
-                            handle_relation(&source, &mut decoder, &mut routes, rel).await;
+                            match msg {
+                                pgoutput::DecodedMessage::Relation(rel) => {
+                                    handle_relation(&source, &mut decoder, &mut routes, rel).await;
+                                }
+                                pgoutput::DecodedMessage::Truncate { relation_ids } => {
+                                    buffer_raw_truncate(&routes, &mut txn, &relation_ids, &raw);
+                                }
+                                // A non-R/T body under an R/T tag is impossible
+                                // from a well-formed server; ignore.
+                                _ => {}
+                            }
                         }
+                        // Insert/Update/Delete: peek the relation id to route +
+                        // meter, then buffer the raw bytes; the per-dataset
+                        // consumer pays the tuple decode + Arrow build off this
+                        // shared task.
                         Some(tag @ (b'I' | b'U' | b'D')) => {
                             buffer_raw_change(&routes, &mut txn, tag, data);
-                        }
-                        Some(b'T') => {
-                            // Decode to read the (multi-relation) id list so each
-                            // relation routes to its own member; buffer the raw
-                            // truncate bytes per relation for the consumer.
-                            let relation_ids = match decoder.decode(data.clone()) {
-                                Ok(pgoutput::DecodedMessage::Truncate { relation_ids }) => {
-                                    relation_ids
-                                }
-                                Ok(_) => continue 'recv,
-                                Err(e) => {
-                                    source.for_each_member_metrics(
-                                        ReplicationMetricsCollector::inc_decode_error,
-                                    );
-                                    fatal_broadcast(
-                                        &source,
-                                        format!("pgoutput decode failed: {e}"),
-                                    )
-                                    .await;
-                                    break 'reconnect;
-                                }
-                            };
-                            buffer_raw_truncate(&routes, &mut txn, &relation_ids, &data);
                         }
                         // Type / Origin / Message / Stream* — safe to ignore.
                         _ => {}

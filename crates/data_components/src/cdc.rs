@@ -272,7 +272,16 @@ impl LazyChangeBatch {
     }
 
     fn ready(batch: ChangeBatch) -> Self {
-        Self::from_rows(Box::new(batch))
+        // Pre-populate `built` so an eagerly-built envelope (every non-deferred
+        // connector — Kafka/MongoDB/DynamoDB/Debezium/MySQL, ready signals) reads
+        // metadata and the batch itself lock-free via `built.get()`, never boxing
+        // the batch or dispatching through `source`.
+        let built = OnceLock::new();
+        let _ = built.set(batch);
+        Self {
+            built,
+            source: Mutex::new(None),
+        }
     }
 
     /// Return the built batch, running the deferred build on first access.
@@ -294,12 +303,6 @@ impl LazyChangeBatch {
         self.built.get().context(DeferredBatchConsumedSnafu)
     }
 
-    /// Borrow the already-built batch without triggering a build; `None` if not
-    /// yet built.
-    fn peek(&self) -> Option<&ChangeBatch> {
-        self.built.get()
-    }
-
     /// Consume into the owned built batch, building if needed.
     fn into_built(self) -> Result<ChangeBatch, ChangeBatchError> {
         if let Some(batch) = self.built.into_inner() {
@@ -309,11 +312,16 @@ impl LazyChangeBatch {
         src.build()
     }
 
+    // No-build metadata accessors: read the built batch directly (lock-free) if
+    // present, else the not-yet-built source; the `default` covers the consumed
+    // state (post-failed-build). Kept as separate methods rather than a shared
+    // higher-order helper — the built and source branches borrow at different
+    // lifetimes, which a single `FnOnce(&dyn ChangeRows)` helper can't satisfy.
+
     fn is_empty(&self) -> bool {
         if let Some(b) = self.built.get() {
             return b.record.num_rows() == 0;
         }
-        // A consumed source (post-failed-build) has no rows to apply.
         self.source.lock().as_deref().is_none_or(ChangeRows::is_empty)
     }
 
@@ -442,24 +450,6 @@ impl ChangeEnvelope {
     /// dataset's changes stream rather than skipping the batch.
     pub fn change_batch(&self) -> Result<&ChangeBatch, ChangeBatchError> {
         self.change_batch.get()
-    }
-
-    /// Build the deferred batch now (if any), discarding the reference. Lets a
-    /// consumer move the potentially-expensive build to a chosen point (e.g.
-    /// right at dequeue) and convert a build failure into a stream error there.
-    pub fn materialize(&self) -> Result<(), ChangeBatchError> {
-        self.change_batch.get().map(|_| ())
-    }
-
-    /// Borrow the change batch only if it is already built (eager envelope, or
-    /// a deferred one already materialized via [`Self::materialize`] /
-    /// [`Self::change_batch`]); never triggers a build. Returns `None` for a
-    /// not-yet-materialized deferred envelope. Callers that materialize at
-    /// dequeue can treat `None` as "not applicable" for best-effort reads
-    /// (metrics, coalescing size) without risking a hidden build or panic.
-    #[must_use]
-    pub fn built_change_batch(&self) -> Option<&ChangeBatch> {
-        self.change_batch.peek()
     }
 
     /// Consume the envelope into its parts, building a deferred batch if needed.
