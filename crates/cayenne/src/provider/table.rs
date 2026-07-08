@@ -12831,7 +12831,45 @@ impl CayenneTableProvider {
     /// Holds `write_lock` for the whole graduation (mirrors `begin_overwrite`), so
     /// no append races the capture→write→commit and the generation fence is
     /// unnecessary. Heavy + infrequent (gated by the warm-size thresholds).
+    ///
+    /// Records promotion telemetry under `kind="datalake"`, mirroring the
+    /// `kind="full"`/`"subset"` compaction passes: duration with a
+    /// `completed`/`failed` result label for passes that promoted or failed
+    /// (`Ok(false)` no-ops are not counted), plus the memory-exhausted counter.
     pub async fn promote_warm_to_cold(&self) -> Result<bool> {
+        let pass_start = Instant::now();
+        let result = self.promote_warm_to_cold_inner().await;
+        if matches!(result, Ok(true) | Err(_)) {
+            let table = self.table_metadata.table_name.clone();
+            let result_label = if result.is_ok() {
+                "completed"
+            } else {
+                "failed"
+            };
+            telemetry::cayenne::track_compaction_duration(
+                pass_start.elapsed(),
+                &[
+                    telemetry::KeyValue::new("table", table.clone()),
+                    telemetry::KeyValue::new("kind", "datalake"),
+                    telemetry::KeyValue::new("result", result_label),
+                ],
+            );
+            if matches!(
+                &result,
+                Result::Err(Error::DataFusion {
+                    source: DataFusionError::ResourcesExhausted(_)
+                })
+            ) {
+                telemetry::cayenne::track_compaction_memory_exhausted(&[
+                    telemetry::KeyValue::new("table", table),
+                    telemetry::KeyValue::new("kind", "datalake"),
+                ]);
+            }
+        }
+        result
+    }
+
+    async fn promote_warm_to_cold_inner(&self) -> Result<bool> {
         let vc = &self.table_metadata.vortex_config;
         if !vc.cold_tier_enabled() {
             return Ok(false);
@@ -12936,6 +12974,22 @@ impl CayenneTableProvider {
             );
         }
         self.trigger_old_snapshot_cleanup(&new_snapshot_id).await;
+
+        // Publish telemetry: bytes written to the cold store this promotion —
+        // the production check that promotion cost tracks the promoted data,
+        // not total table size. The last successful publish time is derivable
+        // from `cayenne_compaction_duration_ms{kind="datalake", result="completed"}`.
+        let cold_bytes: u64 = cold_files
+            .iter()
+            .map(|f| u64::try_from(f.file_size_bytes.max(0)).unwrap_or(0))
+            .sum();
+        telemetry::cayenne::track_compaction_merged_bytes(
+            cold_bytes,
+            &[
+                telemetry::KeyValue::new("table", self.table_metadata.table_name.clone()),
+                telemetry::KeyValue::new("kind", "datalake"),
+            ],
+        );
 
         tracing::info!(
             target: "cayenne::compaction",

@@ -733,14 +733,110 @@ impl CayenneCatalog {
             })
     }
 
+    /// Reconcile the datalake (cold tier) fields of a reopened table's stored
+    /// `VortexConfig` with the currently configured options.
+    ///
+    /// The cold fields are deliberately excluded from [`configuration_matches`]
+    /// (toggling the tier never recreates the table), and the provider runs
+    /// with the STORED config — so a spicepod change must be persisted here to
+    /// take effect on reopen. One change is rejected instead of persisted:
+    /// moving (or unsetting) the location while cold files exist, because the
+    /// cold manifest's absolute file URLs point at the old location and the
+    /// next promotion's replace-all would strand them.
+    async fn reconcile_cold_tier_config(
+        &self,
+        stored: &mut TableMetadata,
+        options: &CreateTableOptions,
+    ) -> CatalogResult<()> {
+        let normalize = |loc: &Option<String>| -> Option<String> {
+            loc.as_deref()
+                .map(|l| l.trim().trim_end_matches('/').to_string())
+                .filter(|l| !l.is_empty())
+        };
+        let stored_loc = normalize(&stored.vortex_config.cold_tier_location);
+        let configured_loc = normalize(&options.vortex_config.cold_tier_location);
+
+        if let Some(ref stored_loc) = stored_loc
+            && configured_loc.as_ref() != Some(stored_loc)
+        {
+            let cold_files = self.list_cold_tier_files(&stored.table_id).await?;
+            if !cold_files.is_empty() {
+                return Err(CatalogError::ColdTierLocationChanged {
+                    table_name: stored.table_name.clone(),
+                    stored: stored_loc.clone(),
+                    configured: configured_loc.unwrap_or_else(|| "<unset>".to_string()),
+                });
+            }
+        }
+
+        let stored_vc = &stored.vortex_config;
+        let new_vc = &options.vortex_config;
+        let cold_fields_differ = stored_vc.cold_tier_location != new_vc.cold_tier_location
+            || stored_vc.cold_clustering_columns != new_vc.cold_clustering_columns
+            || stored_vc.cold_target_file_size_mb != new_vc.cold_target_file_size_mb
+            || stored_vc.cold_tier_warm_max_bytes != new_vc.cold_tier_warm_max_bytes
+            || stored_vc.cold_tier_warm_max_files != new_vc.cold_tier_warm_max_files
+            || stored_vc.cold_tier_background_interval_ms != new_vc.cold_tier_background_interval_ms;
+        if !cold_fields_differ {
+            return Ok(());
+        }
+
+        stored.vortex_config.cold_tier_location = new_vc.cold_tier_location.clone();
+        stored.vortex_config.cold_clustering_columns = new_vc.cold_clustering_columns.clone();
+        stored.vortex_config.cold_target_file_size_mb = new_vc.cold_target_file_size_mb;
+        stored.vortex_config.cold_tier_warm_max_bytes = new_vc.cold_tier_warm_max_bytes;
+        stored.vortex_config.cold_tier_warm_max_files = new_vc.cold_tier_warm_max_files;
+        stored.vortex_config.cold_tier_background_interval_ms =
+            new_vc.cold_tier_background_interval_ms;
+
+        let vortex_config_json =
+            serde_json::to_string(&stored.vortex_config).map_err(|e| {
+                CatalogError::InvalidOperation {
+                    message: format!(
+                        "Failed to serialize updated datalake configuration for table {}.",
+                        stored.table_name
+                    ),
+                    source: Box::new(e),
+                }
+            })?;
+        self.metastore
+            .execute_helper(ExecuteParams {
+                sql: "UPDATE cayenne_table SET vortex_config_json = ?1 WHERE table_id = ?2",
+                params: vec![
+                    MetastoreValue::Text(vortex_config_json),
+                    MetastoreValue::Text(stored.table_id.clone()),
+                ],
+            })
+            .await
+            .map_err(|e| CatalogError::InvalidOperation {
+                message: format!(
+                    "Failed to persist updated datalake configuration for table {}.",
+                    stored.table_name
+                ),
+                source: Box::new(e),
+            })?;
+        tracing::info!(
+            table = stored.table_name.as_str(),
+            "Reconciled datalake configuration from spicepod params on table reopen"
+        );
+        Ok(())
+    }
+
     async fn validate_existing_table_configuration(
         &self,
         table_name: &str,
         options: &CreateTableOptions,
     ) -> CatalogResult<TableMetadata> {
         match self.get_table(table_name).await {
-            Ok(stored_metadata) => {
+            Ok(mut stored_metadata) => {
                 log_runtime_footer_cache_drift(table_name, &stored_metadata, options);
+
+                // Datalake (cold tier) config is runtime-toggleable, not table
+                // identity: reconcile it here instead of comparing it in
+                // `configuration_matches`. Rejects a location change while
+                // cold files exist; persists any other cold-field change.
+                self.reconcile_cold_tier_config(&mut stored_metadata, options)
+                    .await?;
 
                 if configuration_matches(&stored_metadata, options) {
                     return Ok(stored_metadata);

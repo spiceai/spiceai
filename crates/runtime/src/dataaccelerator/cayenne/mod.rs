@@ -1206,7 +1206,7 @@ impl CayenneAccelerator {
             {
                 if config.deletion_mode == cayenne::metadata::DeletionMode::Position {
                     tracing::warn!(
-                        "Dataset '{table_name}': the cold object-store tier (cayenne_cold_tier_location) requires key-based deletes; overriding cayenne_deletion_mode 'position' -> 'key'."
+                        "Dataset '{table_name}': the datalake tier (cayenne_datalake_location) requires key-based deletes; overriding cayenne_deletion_mode 'position' -> 'key'."
                     );
                 }
                 config.deletion_mode = cayenne::metadata::DeletionMode::Key;
@@ -1342,16 +1342,17 @@ impl CayenneAccelerator {
                     .collect();
             }
 
-            // Cold object-store tier (storage-cascade bottom tier). Presence of a
-            // non-empty `cayenne_cold_tier_location` enables it; the rest tune the
-            // clustering key, cold file size, and the warm→cold promotion trigger.
-            if let Some(loc) = acceleration.params.get("cayenne_cold_tier_location") {
+            // Datalake / cold object-store tier (storage-cascade bottom tier).
+            // Presence of a non-empty `cayenne_datalake_location` enables it; the
+            // rest tune the clustering key, cold file size, and the warm→cold
+            // promotion trigger.
+            if let Some(loc) = acceleration.params.get("cayenne_datalake_location") {
                 let loc = loc.trim();
                 if !loc.is_empty() {
                     config.cold_tier_location = Some(loc.to_string());
                 }
             }
-            if let Some(cols) = acceleration.params.get("cayenne_cold_clustering_columns") {
+            if let Some(cols) = acceleration.params.get("cayenne_datalake_clustering_columns") {
                 config.cold_clustering_columns = cols
                     .split(',')
                     .map(|s| s.trim().to_string())
@@ -1382,6 +1383,25 @@ impl CayenneAccelerator {
                 &["cayenne_cold_tier_background_interval_ms"],
                 config.cold_tier_background_interval_ms,
             );
+            // Default promotion trigger when the tier is enabled but neither
+            // expert trigger is set (both `VortexConfig` defaults are 0 = never
+            // promote, which would leave a location-only config silently
+            // inert): promote once warm accumulates 16 target cold files'
+            // worth of data. Data is sorted per clustering run, so a larger
+            // accumulation yields better zone-map pruning in the written files.
+            if config.cold_tier_enabled()
+                && config.cold_tier_warm_max_bytes == 0
+                && config.cold_tier_warm_max_files == 0
+            {
+                config.cold_tier_warm_max_bytes = i64::try_from(
+                    config.cold_target_file_size_mb.saturating_mul(16 * 1024 * 1024),
+                )
+                .unwrap_or(i64::MAX);
+                tracing::info!(
+                    "Dataset '{table_name}': datalake promotion trigger defaulted to {} bytes. Set 'cayenne_cold_tier_warm_max_bytes' to override.",
+                    config.cold_tier_warm_max_bytes
+                );
+            }
 
             // Upload concurrency: `auto`/unset keeps the available-parallelism
             // default; 0 → warn + minimum 1. The aggregate across all tables is
@@ -1943,10 +1963,20 @@ impl CayenneAccelerator {
         if let Some(retention_builder) = time_retention_filter_builder {
             builder = builder.with_time_retention_filter_builder(retention_builder);
         }
-        // Cold tier: when enabled with an s3:// location, reuse the warm S3
-        // object store for the cold tier (v1: an s3:// cold location shares the
-        // warm bucket). A local `file://` cold tier needs no store — the default
-        // local store resolves it. Cloned before the warm store is moved below.
+        // The datalake tier supports `s3://` locations only. Anything else
+        // would be silently treated as a local directory by the engine's write
+        // path — reject it at registration instead.
+        if let Some(location) = table_options.vortex_config.cold_tier_location.as_deref()
+            && !location.starts_with("s3://")
+        {
+            return Err(Error::AccelerationCreationFailed {
+                source: Box::new(std::io::Error::other(format!(
+                    "Failed to register dataset {table_name} (cayenne): unsupported datalake location '{location}'. Expected 's3://bucket/prefix'. Update 'cayenne_datalake_location'."
+                ))),
+            });
+        }
+        // Datalake (cold) tier object store: built from the dedicated
+        // `cayenne_datalake_s3_*` params (default `iam_role` auth falls back to environment/SDK credentials).
         let cold_object_store = if table_options.vortex_config.cold_tier_enabled()
             && table_options
                 .vortex_config
@@ -1954,10 +1984,24 @@ impl CayenneAccelerator {
                 .as_deref()
                 .is_some_and(|l| l.starts_with("s3://"))
         {
-            object_store.clone()
+            let location = table_options
+                .vortex_config
+                .cold_tier_location
+                .clone()
+                .unwrap_or_default();
+            s3::build_datalake_object_store(source, &location)
+                .await
+                .context(S3Snafu)?
         } else {
             None
         };
+        // Fail fast at registration on datalake-store misconfiguration: verify
+        // write access to the location prefix before the table is created.
+        if let Some(ref cold) = cold_object_store {
+            s3::validate_datalake_store_access(cold, table_name)
+                .await
+                .context(S3Snafu)?;
+        }
         if let Some(object_store) = object_store {
             tracing::info!(
                 "Using S3 Express One Zone storage for {} acceleration: {}",
@@ -2003,7 +2047,7 @@ impl CayenneAccelerator {
             );
         }
         // Cold-tier promotion (storage-cascade bottom tier); a no-op unless
-        // cayenne_cold_tier_location is set. Runs on the same internal
+        // cayenne_datalake_location is set. Runs on the same internal
         // background-worker infra as the mem-tier checkpointer, on its own
         // cadence — no spicepod `workers:` section, nothing user-facing.
         if provider.spawn_background_cold_tier_promotion() {

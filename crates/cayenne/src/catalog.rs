@@ -199,6 +199,15 @@ pub enum CatalogError {
     ChangedConfiguration { table_name: String },
 
     #[snafu(display(
+        "Failed to load table {table_name}: the datalake location changed from '{stored}' to '{configured}' while published datalake files exist. Delete the acceleration, and try again."
+    ))]
+    ColdTierLocationChanged {
+        table_name: String,
+        stored: String,
+        configured: String,
+    },
+
+    #[snafu(display(
         "Table '{table_name}' metadata is invalid or corrupted. Delete the acceleration, and try again. {source}"
     ))]
     InvalidMetadata {
