@@ -12,6 +12,11 @@ runs:
         # clarity. mysql_native_password lets the connector authenticate over
         # plaintext, and log_bin_trust_function_creators lets the non-SUPER
         # `bench` user create the `_bench_ts` triggers during seed.
+        # innodb_use_native_aio=0 disables Linux native async I/O: on shared CI
+        # runners the host-wide fs.aio-max-nr budget is often exhausted by other
+        # containers, so io_setup() returns EAGAIN and InnoDB aborts on startup
+        # ("Cannot initialize AIO sub-system"). Simulated I/O is robust and the
+        # throughput cost is irrelevant for a CI benchmark source.
         docker run -d --name chbench-mysql \
           -e MYSQL_ROOT_PASSWORD=rootpw -e MYSQL_DATABASE=chbench \
           -e MYSQL_USER=bench -e MYSQL_PASSWORD=bench \
@@ -24,7 +29,8 @@ runs:
           --max-connections=200 \
           --innodb-buffer-pool-size=8G \
           --sync-binlog=0 \
-          --innodb-flush-log-at-trx-commit=0
+          --innodb-flush-log-at-trx-commit=0 \
+          --innodb-use-native-aio=0
 
     - name: Wait for CH-benCH MySQL
       shell: bash
