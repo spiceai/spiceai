@@ -3548,6 +3548,7 @@ dependencies = [
  "runtime-datafusion",
  "runtime-table-partition",
  "rusqlite",
+ "rustc-hash 2.1.2",
  "serde",
  "serde_json",
  "snafu",

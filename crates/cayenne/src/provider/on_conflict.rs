@@ -22,13 +22,13 @@ limitations under the License.
 //! scan/update plumbing. The provider drives these from its insert/delete path.
 
 use super::delete::CayenneDeletionSink;
-use super::pk_index::{CachedPkIndex, PkExistenceRef, ShardedPkIndex};
+use super::pk_index::{CachedPkIndex, PkDigestSet, PkExistenceRef, ShardedPkIndex};
 use crate::metadata::InlinedData;
 
 use arrow::record_batch::RecordBatch;
 use arrow_schema::SchemaRef;
 
-use crate::row_converter::{OwnedRow, RowConverter};
+use crate::row_converter::RowConverter;
 use async_trait::async_trait;
 use data_components::delete::DeletionSink;
 use datafusion_catalog::Session;
@@ -352,7 +352,7 @@ pub(crate) struct BatchValidationResult {
     /// Per-file position deletes for located conflict rows: file path -> deleted
     /// file-local row positions. Empty unless `deletion_mode: position`.
     pub(crate) delete_specs: Vec<(Arc<str>, Vec<u64>)>,
-    pub(crate) kept_keys: HashSet<OwnedRow>,
+    pub(crate) kept_keys: PkDigestSet,
     /// File-backed Int64 PK values being deleted (for `Int64Pk` strategy).
     pub(crate) deleted_pk_i64: Vec<i64>,
     /// File-backed row key bytes being deleted (for `RowConverterBased` strategy).
@@ -798,7 +798,7 @@ pub(crate) struct PreparedProtectedSnapshotUpdate {
 #[derive(Default)]
 pub(crate) struct PostValidationState {
     pub(crate) on_conflict_deletions: OnConflictDeletions,
-    pub(crate) validated_keys: HashSet<OwnedRow>,
+    pub(crate) validated_keys: PkDigestSet,
 }
 
 /// Aggregate result of one sharded in-memory CDC apply
@@ -815,7 +815,7 @@ pub(crate) struct ShardedApplyResult {
     /// Union of every shard's on-conflict deletions (keys disjoint across shards).
     pub(crate) on_conflict_deletions: OnConflictDeletions,
     /// Union of every shard's validated (kept) keys.
-    pub(crate) validated_keys: HashSet<OwnedRow>,
+    pub(crate) validated_keys: PkDigestSet,
 }
 
 pub(crate) struct OnConflictContext<'a> {
@@ -824,7 +824,7 @@ pub(crate) struct OnConflictContext<'a> {
     pub(crate) on_conflict: &'a OnConflict,
     pub(crate) upsert_options: &'a UpsertOptions,
     pub(crate) existing: PkExistenceRef<'a>,
-    pub(crate) incoming_keys: &'a HashSet<OwnedRow>,
+    pub(crate) incoming_keys: &'a PkDigestSet,
 }
 
 pub(crate) struct OnConflictValidationStream {
@@ -836,8 +836,8 @@ pub(crate) struct OnConflictValidationStream {
     pub(crate) on_conflict: OnConflict,
     pub(crate) upsert_options: UpsertOptions,
     existing_keys: Option<CachedPkIndex>,
-    pub(crate) incoming_keys: HashSet<OwnedRow>,
-    pub(crate) kept_keys: HashSet<OwnedRow>,
+    pub(crate) incoming_keys: PkDigestSet,
+    pub(crate) kept_keys: PkDigestSet,
     pub(crate) delete_specs: HashMap<Arc<str>, Vec<u64>>,
     pub(crate) deleted_pk_i64: Vec<i64>,
     pub(crate) deleted_row_keys: Vec<Box<[u8]>>,
@@ -869,8 +869,8 @@ impl OnConflictValidationStream {
             on_conflict,
             upsert_options,
             existing_keys: Some(existing_keys),
-            incoming_keys: HashSet::with_capacity(1024),
-            kept_keys: HashSet::with_capacity(1024),
+            incoming_keys: PkDigestSet::with_capacity(1024),
+            kept_keys: PkDigestSet::with_capacity(1024),
             delete_specs: HashMap::new(),
             deleted_pk_i64: Vec::new(),
             deleted_row_keys: Vec::new(),
@@ -897,7 +897,7 @@ impl OnConflictValidationStream {
             ))
         })?;
         let existing = match existing_index {
-            CachedPkIndex::Exact(keyset) => PkExistenceRef::Exact(&keyset.keys),
+            CachedPkIndex::Exact(keyset) => PkExistenceRef::Exact(keyset),
             CachedPkIndex::Bloom(bloom) => PkExistenceRef::Bloom(bloom),
         };
 
@@ -940,8 +940,8 @@ impl OnConflictValidationStream {
             .extend(deleted_inlined_row_keys);
         self.reinserted_over_tombstone += reinserted_over_tombstone;
 
-        self.incoming_keys.extend(kept_keys.iter().cloned());
-        self.kept_keys.extend(kept_keys);
+        self.incoming_keys.extend_ref(&kept_keys);
+        self.kept_keys.absorb(kept_keys);
 
         Ok(filtered_batch)
     }

@@ -56,9 +56,10 @@ use super::on_conflict::{
     pk_deletion_snapshot_for_strategy,
 };
 use super::pk_index::{
-    CachedPkIndex, CachedPkKeyset, PK_INDEX_PERSIST_MAX_BYTES, PkBloom, PkExistenceRef,
-    RowLocation, ShardedPkIndex, approx_captured_file_bytes, approx_pk_keyset_entry_bytes,
-    deserialize_pk_bloom_sidecar, serialize_pk_bloom_sidecar, shard_of_pk,
+    CachedPkIndex, CachedPkKeyset, PK_INDEX_PERSIST_MAX_BYTES, PkBloom, PkDigestSet,
+    PkExistenceRef, RowLocation, ShardedPkIndex, approx_captured_file_bytes,
+    approx_pk_keyset_entry_bytes, deserialize_pk_bloom_sidecar, pk_digest,
+    serialize_pk_bloom_sidecar, shard_of_pk,
 };
 use super::streaming::StreamingExec;
 use crate::bounded_fifo::BoundedFifoSet;
@@ -77,6 +78,7 @@ use crate::resource_starvation::ResourceStarvationTracker;
 use arrow::array::{Array, ArrayRef, BinaryArray, BooleanArray, Int64Array};
 use arrow::record_batch::RecordBatch;
 use arrow_schema::{DataType, Field, SchemaBuilder, SchemaRef};
+use hash_index::PrehashedBuildHasher;
 
 use crate::row_converter::{OwnedRow, RowConverter, SortField};
 use arrow_tools::schema_evolution::{EvolutionContext, SchemaEvolution, WideningPlan, classify};
@@ -212,7 +214,7 @@ pub struct CayenneCdcWrite {
     prepared_append: Option<PreparedStagedAppend>,
     prepared_on_conflict: Option<PreparedOnConflictDeletionPublish>,
     stats: Option<Arc<ColumnStatsAccumulator>>,
-    validated_file_keys: HashSet<OwnedRow>,
+    validated_file_keys: PkDigestSet,
     /// Set when this write appended to the in-memory CDC tier
     /// (`cdc_durability: memory`): the mem-tier epoch the batch landed in. The
     /// runtime reads this (via [`Self::in_memory_epoch`]) to DEFER the source
@@ -232,7 +234,7 @@ impl CayenneCdcWrite {
             prepared_append: None,
             prepared_on_conflict: None,
             stats: None,
-            validated_file_keys: HashSet::new(),
+            validated_file_keys: PkDigestSet::default(),
             in_memory_epoch: None,
         }
     }
@@ -250,7 +252,7 @@ impl CayenneCdcWrite {
             prepared_append: None,
             prepared_on_conflict: None,
             stats: None,
-            validated_file_keys: HashSet::new(),
+            validated_file_keys: PkDigestSet::default(),
             in_memory_epoch: Some(epoch),
         }
     }
@@ -260,7 +262,7 @@ impl CayenneCdcWrite {
         rows: u64,
         prepared_append: PreparedStagedAppend,
         stats: Arc<ColumnStatsAccumulator>,
-        validated_file_keys: HashSet<OwnedRow>,
+        validated_file_keys: PkDigestSet,
     ) -> Self {
         Self {
             table,
@@ -279,7 +281,7 @@ impl CayenneCdcWrite {
         prepared_append: PreparedStagedAppend,
         prepared_on_conflict: PreparedOnConflictDeletionPublish,
         stats: Arc<ColumnStatsAccumulator>,
-        validated_file_keys: HashSet<OwnedRow>,
+        validated_file_keys: PkDigestSet,
     ) -> Self {
         Self {
             table,
@@ -5687,7 +5689,7 @@ impl CayenneTableProvider {
     /// Build a bloom existence filter over `keyset`'s keys, sized to `max_bytes`.
     fn bloom_from_keyset(keyset: &CachedPkKeyset, max_bytes: usize) -> PkBloom {
         let mut bloom = PkBloom::with_byte_budget(max_bytes);
-        for key in keyset.keys.keys() {
+        for key in keyset.rows() {
             bloom.insert(key.as_ref());
         }
         bloom
@@ -5750,7 +5752,7 @@ impl CayenneTableProvider {
     fn flip_inlined_keyset_entries_to_file_unlocated(&self) {
         let mut guard = self.pk_keyset_cache.lock();
         if let Some(CachedPkIndex::Exact(keyset)) = guard.as_mut() {
-            for location in keyset.keys.values_mut() {
+            for location in keyset.locations_mut() {
                 if matches!(location, RowLocation::Inlined) {
                     *location = RowLocation::FileUnlocated;
                 }
@@ -5763,7 +5765,7 @@ impl CayenneTableProvider {
         let mut sharded = self.sharded_pk_keyset_cache.lock();
         if let Some(ShardedPkIndex::Exact(keysets)) = sharded.as_mut() {
             for keyset in keysets.iter_mut() {
-                for location in keyset.keys.values_mut() {
+                for location in keyset.locations_mut() {
                     if matches!(location, RowLocation::Inlined) {
                         *location = RowLocation::FileUnlocated;
                     }
@@ -5772,7 +5774,7 @@ impl CayenneTableProvider {
         }
     }
 
-    fn record_pk_keys_with_location(&self, keys: &HashSet<OwnedRow>, location: &RowLocation) {
+    fn record_pk_keys_with_location(&self, keys: &PkDigestSet, location: &RowLocation) {
         if keys.is_empty() {
             return;
         }
@@ -5788,7 +5790,7 @@ impl CayenneTableProvider {
         let mut convert_to_bloom = false;
         match &mut index {
             CachedPkIndex::Bloom(bloom) => {
-                for key in keys {
+                for key in keys.iter() {
                     bloom.insert(key.as_ref());
                 }
             }
@@ -5796,8 +5798,10 @@ impl CayenneTableProvider {
                 // Existence-only insert. Under `deletion_mode: position`, real
                 // `(file, position)` for File rows is captured separately by the
                 // row_idx() read-back, which upgrades these to `FilePositioned`.
-                for key in keys {
-                    if !keyset.keys.contains_key(key)
+                // Reuse each key's stored digest (the keyset is digest-keyed) so
+                // the contains-gate and insert don't each re-hash the key.
+                for (digest, key) in keys.iter_with_digest() {
+                    if !keyset.contains_digest(digest)
                         && keyset
                             .approx_bytes
                             .saturating_add(approx_pk_keyset_entry_bytes(key))
@@ -5806,7 +5810,7 @@ impl CayenneTableProvider {
                         convert_to_bloom = true;
                         break;
                     }
-                    keyset.insert(key.clone(), location.clone());
+                    keyset.insert_with_digest(digest, key.clone(), location.clone());
                 }
             }
         }
@@ -5817,7 +5821,7 @@ impl CayenneTableProvider {
                     CachedPkIndex::Exact(keyset) => Self::bloom_from_keyset(keyset, max_bytes),
                     CachedPkIndex::Bloom(_) => PkBloom::with_byte_budget(max_bytes),
                 };
-                for key in keys {
+                for key in keys.iter() {
                     bloom.insert(key.as_ref());
                 }
                 tracing::debug!(
@@ -5845,7 +5849,7 @@ impl CayenneTableProvider {
         self.table_memory.set_keyset_bytes(bytes);
     }
 
-    pub(crate) fn record_inlined_pk_keys(&self, keys: &HashSet<OwnedRow>) {
+    pub(crate) fn record_inlined_pk_keys(&self, keys: &PkDigestSet) {
         self.record_pk_keys_with_location(keys, &RowLocation::Inlined);
     }
 
@@ -5862,7 +5866,7 @@ impl CayenneTableProvider {
         self.table_memory.set_keyset_bytes(bytes);
     }
 
-    pub(crate) fn record_file_pk_keys(&self, keys: &HashSet<OwnedRow>) {
+    pub(crate) fn record_file_pk_keys(&self, keys: &PkDigestSet) {
         self.record_pk_keys_with_location(keys, &RowLocation::FileUnlocated);
     }
 
@@ -6049,7 +6053,7 @@ impl CayenneTableProvider {
                 let mut guard = self.pk_keyset_cache.lock();
                 if let Some(CachedPkIndex::Exact(keyset)) = guard.as_mut() {
                     for (key, position) in entries {
-                        if let Some(location) = keyset.keys.get_mut(&key) {
+                        if let Some(location) = keyset.location_mut(&key) {
                             *location = RowLocation::FilePositioned {
                                 file_path: Arc::clone(&file_path),
                                 position,
@@ -7058,7 +7062,7 @@ impl CayenneTableProvider {
                 let mut blooms: Vec<PkBloom> = (0..n)
                     .map(|_| PkBloom::with_byte_budget(max_bytes / n.max(1)))
                     .collect();
-                for key in keyset.keys.keys() {
+                for key in keyset.rows() {
                     let s = shard_of_pk(key.as_ref(), n);
                     blooms[s].insert(key.as_ref());
                 }
@@ -7096,7 +7100,7 @@ impl CayenneTableProvider {
 
         let deduplicate_batch = !ctx.upsert_options.is_default();
         let mut keep_mask = Vec::with_capacity(batch.num_rows());
-        let mut kept_keys: HashSet<OwnedRow> = HashSet::with_capacity(batch.num_rows());
+        let mut kept_keys: PkDigestSet = PkDigestSet::with_capacity(batch.num_rows());
         let mut delete_specs: HashMap<Arc<str>, Vec<u64>> = HashMap::new();
         let mut deleted_pk_i64: Vec<i64> = Vec::new();
         let mut deleted_row_keys: Vec<Box<[u8]>> = Vec::new();
@@ -7193,14 +7197,20 @@ impl CayenneTableProvider {
         // computed up front) so the pre-pass can borrow them and the loop consume them.
         let row_pk_keys: Vec<OwnedRow> =
             (0..batch.num_rows()).map(|i| rows.row(i).owned()).collect();
+        // Hash each row's key bytes ONCE into a seeded XXH3-128 digest; this digest
+        // is the key's identity for all three probes below (dedup pre-pass,
+        // cross-batch `incoming_keys`, and the `existing_keys` keyset), so the
+        // per-row hashing cost is paid a single time and the maps reuse it via
+        // `PrehashedBuildHasher`.
+        let row_digests: Vec<u128> = row_pk_keys.iter().map(pk_digest).collect();
         let is_survivor: Vec<bool> = if deduplicate_batch {
-            let mut survivor: HashMap<&[u8], usize> = HashMap::with_capacity(row_pk_keys.len());
-            for (idx, key) in row_pk_keys.iter().enumerate() {
-                let bytes: &[u8] = key.as_ref();
+            let mut survivor: HashMap<u128, usize, PrehashedBuildHasher> =
+                HashMap::with_capacity_and_hasher(row_pk_keys.len(), PrehashedBuildHasher);
+            for (idx, &digest) in row_digests.iter().enumerate() {
                 if ctx.upsert_options.last_write_wins {
-                    survivor.insert(bytes, idx); // a later duplicate supersedes
+                    survivor.insert(digest, idx); // a later duplicate supersedes
                 } else {
-                    survivor.entry(bytes).or_insert(idx); // keep the first
+                    survivor.entry(digest).or_insert(idx); // keep the first
                 }
             }
             let mut mask = vec![false; row_pk_keys.len()];
@@ -7220,6 +7230,9 @@ impl CayenneTableProvider {
                 });
             }
 
+            // This row's precomputed key identity, reused across all three probes.
+            let digest = row_digests[row_idx];
+
             // Drop in-batch duplicate non-survivors before any conflict/delete work,
             // so exactly one row per PK records a delete and is kept.
             if deduplicate_batch && !is_survivor[row_idx] {
@@ -7227,7 +7240,7 @@ impl CayenneTableProvider {
                 continue;
             }
 
-            if ctx.incoming_keys.contains(&key) {
+            if ctx.incoming_keys.contains_digest(digest) {
                 return Err(Error::DataValidation {
                     table: self.table_metadata.table_name.clone(),
                     message: "Incoming data contains duplicate primary key across batches"
@@ -7237,7 +7250,7 @@ impl CayenneTableProvider {
 
             let keep_row = match ctx.existing {
                 PkExistenceRef::Exact(existing_keys) => {
-                    if let Some(existing) = existing_keys.get(&key) {
+                    if let Some(existing) = existing_keys.location_by_digest(digest) {
                         match ctx.on_conflict {
                             OnConflict::DoNothingAll | OnConflict::DoNothing(_) => false,
                             OnConflict::Upsert(_) => {
@@ -7364,7 +7377,7 @@ impl CayenneTableProvider {
             };
 
             if keep_row {
-                kept_keys.insert(key);
+                kept_keys.insert_with_digest(digest, key);
             }
             keep_mask.push(keep_row);
         }
@@ -7413,8 +7426,8 @@ impl CayenneTableProvider {
         bloom: &PkBloom,
         pk_indices: &[usize],
         converter: &RowConverter,
-        incoming_keys: &HashSet<OwnedRow>,
-    ) -> Result<(Option<RecordBatch>, Option<RecordBatch>, HashSet<OwnedRow>)> {
+        incoming_keys: &PkDigestSet,
+    ) -> Result<(Option<RecordBatch>, Option<RecordBatch>, PkDigestSet)> {
         let pk_columns: Vec<_> = pk_indices
             .iter()
             .map(|&idx| Arc::clone(batch.column(idx)))
@@ -7427,16 +7440,18 @@ impl CayenneTableProvider {
         let any_pk_nullable = pk_columns.iter().any(|col| col.null_count() > 0);
 
         let mut miss_mask = Vec::with_capacity(batch.num_rows());
-        let mut miss_keys: HashSet<OwnedRow> = HashSet::new();
+        let mut miss_keys: PkDigestSet = PkDigestSet::default();
         for row_idx in 0..batch.num_rows() {
             let null_pk = any_pk_nullable && pk_columns.iter().any(|col| col.is_null(row_idx));
             let key = rows.row(row_idx).owned();
+            // One hash per row, reused for both existence-set probes below.
+            let digest = pk_digest(&key);
             let is_miss = !null_pk
                 && !bloom.maybe_contains(key.as_ref())
-                && !incoming_keys.contains(&key)
-                && !miss_keys.contains(&key);
+                && !incoming_keys.contains_digest(digest)
+                && !miss_keys.contains_digest(digest);
             if is_miss {
-                miss_keys.insert(key);
+                miss_keys.insert_with_digest(digest, key);
             }
             miss_mask.push(is_miss);
         }
@@ -7445,7 +7460,7 @@ impl CayenneTableProvider {
         if miss_count == 0 {
             // No fast-path rows: the whole sub-batch is a HIT (preserves the
             // pre-Phase-6 behavior of routing everything through validation).
-            return Ok((None, Some(batch.clone()), HashSet::new()));
+            return Ok((None, Some(batch.clone()), PkDigestSet::default()));
         }
         if miss_count == batch.num_rows() {
             // Entirely new keys: no validation needed for this sub-batch at all.
@@ -7496,16 +7511,16 @@ impl CayenneTableProvider {
         pk_indices: &[usize],
         converter: &RowConverter,
         on_conflict: &OnConflict,
-    ) -> Result<(Vec<RecordBatch>, OnConflictDeletions, HashSet<OwnedRow>)> {
+    ) -> Result<(Vec<RecordBatch>, OnConflictDeletions, PkDigestSet)> {
         let upsert_options = on_conflict.get_upsert_options();
-        let mut incoming_keys: HashSet<OwnedRow> = HashSet::new();
+        let mut incoming_keys: PkDigestSet = PkDigestSet::default();
         let mut delete_specs: HashMap<Arc<str>, Vec<u64>> = HashMap::new();
         let mut deleted_pk_i64: Vec<i64> = Vec::new();
         let mut deleted_row_keys: Vec<Box<[u8]>> = Vec::new();
         let mut deleted_inlined_pk_i64: Vec<i64> = Vec::new();
         let mut deleted_inlined_row_keys: Vec<Box<[u8]>> = Vec::new();
         let mut reinserted_over_tombstone: usize = 0;
-        let mut kept_keys: HashSet<OwnedRow> = HashSet::new();
+        let mut kept_keys: PkDigestSet = PkDigestSet::default();
         let mut filtered_batches: Vec<RecordBatch> = Vec::new();
 
         for batch in shard_batches {
@@ -7537,8 +7552,8 @@ impl CayenneTableProvider {
                     if let Some(miss) = miss
                         && miss.num_rows() > 0
                     {
-                        incoming_keys.extend(miss_keys.iter().cloned());
-                        kept_keys.extend(miss_keys);
+                        incoming_keys.extend_ref(&miss_keys);
+                        kept_keys.absorb(miss_keys);
                         filtered_batches.push(miss);
                     }
                     hit
@@ -7570,8 +7585,8 @@ impl CayenneTableProvider {
             deleted_inlined_pk_i64.extend(result.deleted_inlined_pk_i64);
             deleted_inlined_row_keys.extend(result.deleted_inlined_row_keys);
             reinserted_over_tombstone += result.reinserted_over_tombstone;
-            incoming_keys.extend(result.kept_keys.iter().cloned());
-            kept_keys.extend(result.kept_keys);
+            incoming_keys.extend_ref(&result.kept_keys);
+            kept_keys.absorb(result.kept_keys);
             if let Some(fb) = result.filtered_batch
                 && fb.num_rows() > 0
             {
@@ -7659,11 +7674,7 @@ impl CayenneTableProvider {
         //    rows across several shards (small multi-row txns) — take the inline
         //    branch below and skip the thread machinery, since there the spawn (not
         //    the validation) would bound apply throughput and thus lag.
-        let mut per_shard_validated: Vec<(
-            Vec<RecordBatch>,
-            OnConflictDeletions,
-            HashSet<OwnedRow>,
-        )> = {
+        let mut per_shard_validated: Vec<(Vec<RecordBatch>, OnConflictDeletions, PkDigestSet)> = {
             // Below this many total rows a MULTI-shard apply still validates inline
             // instead of spawning a validation thread per shard: one scoped OS
             // thread per non-empty shard costs ~34 µs at 4 shards (measured,
@@ -7696,7 +7707,11 @@ impl CayenneTableProvider {
                     .enumerate()
                     .map(|(s, shard_batches)| {
                         if shard_batches.is_empty() {
-                            Ok((Vec::new(), OnConflictDeletions::default(), HashSet::new()))
+                            Ok((
+                                Vec::new(),
+                                OnConflictDeletions::default(),
+                                PkDigestSet::default(),
+                            ))
                         } else {
                             self.validate_one_shard(
                                 s,
@@ -7739,9 +7754,11 @@ impl CayenneTableProvider {
                         .into_iter()
                         .map(|handle| match handle {
                             // Empty shard: no validation ran; yield the empty result.
-                            None => {
-                                Ok((Vec::new(), OnConflictDeletions::default(), HashSet::new()))
-                            }
+                            None => Ok((
+                                Vec::new(),
+                                OnConflictDeletions::default(),
+                                PkDigestSet::default(),
+                            )),
                             Some(h) => match h.join() {
                                 Ok(result) => result,
                                 // A panic in shard validation is a bug; re-raise it
@@ -7761,10 +7778,14 @@ impl CayenneTableProvider {
         //    branch is never taken; `sharded_index` is `None` for
         //    `pk_conflict_detection: none`, in which case there is nothing to
         //    restore and the appends record no keys.
-        let validated_keys: HashSet<OwnedRow> = per_shard_validated
-            .iter()
-            .flat_map(|(_, _, kept)| kept.iter().cloned())
-            .collect();
+        // Union every shard's kept keys, reusing each key's stored digest so this
+        // merge does not re-hash keys the per-shard sets already keyed.
+        let mut validated_keys = PkDigestSet::default();
+        for (_, _, kept) in &per_shard_validated {
+            for (digest, key) in kept.iter_with_digest() {
+                validated_keys.insert_with_digest(digest, key.clone());
+            }
+        }
         if let Some(index) = sharded_index.take() {
             self.store_sharded_pk_index(index);
         }
@@ -17105,7 +17126,7 @@ impl CayenneTableProvider {
             // passed in so the shard append's lock-held region stays synchronous
             // (see `validate_and_append_sharded` / `append_to_shard`).
             let base_sequence = self.reserve_sequences_local(2).await?;
-            let no_keys: HashSet<OwnedRow> = HashSet::new();
+            let no_keys: PkDigestSet = PkDigestSet::default();
             self.append_to_shard(
                 0,
                 Vec::new(),
@@ -17160,7 +17181,7 @@ impl CayenneTableProvider {
         // checkpoint relies on (see `validate_and_append_sharded`).
         let base_sequence = self.reserve_sequences_local(2).await?;
         let reserved_sequences = (base_sequence, base_sequence + 1);
-        let no_keys: HashSet<OwnedRow> = HashSet::new();
+        let no_keys: PkDigestSet = PkDigestSet::default();
         let append_futures = per_shard
             .iter()
             .enumerate()
@@ -17421,7 +17442,7 @@ impl CayenneTableProvider {
         // N==1 / non-sharded callers record no keys into the sharded existence
         // cache (it is `None` off the sharded path) — byte-identical to the
         // pre-Phase-6 behavior.
-        let no_keys: HashSet<OwnedRow> = HashSet::new();
+        let no_keys: PkDigestSet = PkDigestSet::default();
         self.append_to_shard(
             0,
             batches,
@@ -17466,7 +17487,7 @@ impl CayenneTableProvider {
         // HIT-path validation against this shard observes the prior MISS-path appends.
         // EMPTY for the N==1 / non-sharded callers (the sharded cache is `None` off
         // the sharded path), so those callers stay byte-identical.
-        record_keys: &HashSet<OwnedRow>,
+        record_keys: &PkDigestSet,
         // Maintained-aggregate DELETE retraction rows (trunk #11389), advanced +
         // enqueued under THIS shard's publish lock. `Some` only on the N=1
         // retraction-aware delete entry (`append_to_mem_tier_inner`); `None` on the
@@ -34835,8 +34856,7 @@ mod tests {
                 panic!("seed insert must leave an Exact cached keyset (None/Bloom found)");
             };
             let positioned = keyset
-                .keys
-                .values()
+                .locations()
                 .filter(|loc| matches!(loc, RowLocation::FilePositioned { .. }))
                 .count();
             assert_eq!(
