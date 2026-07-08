@@ -1,0 +1,78 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ .Values.debezium.name }}
+  labels:
+    {{- include "chbench-debezium.labels" . | nindent 4 }}
+    app.kubernetes.io/name: {{ .Values.debezium.name }}
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      {{- include "chbench-debezium.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/name: {{ .Values.debezium.name }}
+  template:
+    metadata:
+      labels:
+        {{- include "chbench-debezium.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/name: {{ .Values.debezium.name }}
+    spec:
+      nodeSelector:
+        {{- toYaml .Values.nodeSelector | nindent 8 }}
+      tolerations:
+        {{- toYaml .Values.tolerations | nindent 8 }}
+      containers:
+        - name: debezium
+          image: {{ .Values.debezium.image | quote }}
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8083
+              protocol: TCP
+          env:
+            - name: BOOTSTRAP_SERVERS
+              value: {{ printf "%s.%s.svc.cluster.local:9092" .Values.redpanda.name .Release.Namespace | quote }}
+            - name: GROUP_ID
+              value: "chbench-debezium"
+            - name: CONFIG_STORAGE_TOPIC
+              value: "chbench_debezium_config"
+            - name: OFFSET_STORAGE_TOPIC
+              value: "chbench_debezium_offsets"
+            - name: STATUS_STORAGE_TOPIC
+              value: "chbench_debezium_status"
+            - name: CONFIG_STORAGE_REPLICATION_FACTOR
+              value: "1"
+            - name: OFFSET_STORAGE_REPLICATION_FACTOR
+              value: "1"
+            - name: STATUS_STORAGE_REPLICATION_FACTOR
+              value: "1"
+            - name: REST_ADVERTISED_HOST_NAME
+              value: {{ printf "%s.%s.svc.cluster.local" .Values.debezium.name .Release.Namespace | quote }}
+            - name: REST_ADVERTISED_PORT
+              value: "8083"
+            - name: KEY_CONVERTER
+              value: "org.apache.kafka.connect.json.JsonConverter"
+            - name: VALUE_CONVERTER
+              value: "org.apache.kafka.connect.json.JsonConverter"
+            - name: OFFSET_FLUSH_INTERVAL_MS
+              value: "10000"
+            - name: KAFKA_HEAP_OPTS
+              value: {{ .Values.debezium.heap | quote }}
+          resources:
+            {{- toYaml .Values.debezium.resources | nindent 12 }}
+          readinessProbe:
+            httpGet:
+              path: /connectors
+              port: http
+            initialDelaySeconds: 20
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 30
+          livenessProbe:
+            httpGet:
+              path: /connectors
+              port: http
+            initialDelaySeconds: 60
+            periodSeconds: 20
+            timeoutSeconds: 5
+            failureThreshold: 12

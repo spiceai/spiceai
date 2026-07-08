@@ -1,0 +1,86 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ .Values.redpanda.name }}
+  labels:
+    {{- include "chbench-debezium.labels" . | nindent 4 }}
+    app.kubernetes.io/name: {{ .Values.redpanda.name }}
+spec:
+  serviceName: {{ .Values.redpanda.name }}
+  replicas: 1
+  selector:
+    matchLabels:
+      {{- include "chbench-debezium.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/name: {{ .Values.redpanda.name }}
+  template:
+    metadata:
+      labels:
+        {{- include "chbench-debezium.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/name: {{ .Values.redpanda.name }}
+    spec:
+      nodeSelector:
+        {{- toYaml .Values.nodeSelector | nindent 8 }}
+      tolerations:
+        {{- toYaml .Values.tolerations | nindent 8 }}
+      containers:
+        - name: redpanda
+          image: {{ .Values.redpanda.image | quote }}
+          imagePullPolicy: IfNotPresent
+          command: ["/entrypoint.sh"]
+          args:
+            - redpanda
+            - start
+            - --mode
+            - dev-container
+            - --overprovisioned
+            - --smp
+            - {{ .Values.redpanda.smp | quote }}
+            - --memory
+            - {{ .Values.redpanda.memory | quote }}
+            - --kafka-addr
+            - PLAINTEXT://0.0.0.0:9092
+            - --advertise-kafka-addr
+            - PLAINTEXT://{{ .Values.redpanda.name }}.{{ .Release.Namespace }}.svc.cluster.local:9092
+            - --rpc-addr
+            - 0.0.0.0:33145
+            - --advertise-rpc-addr
+            - {{ .Values.redpanda.name }}.{{ .Release.Namespace }}.svc.cluster.local:33145
+            - --pandaproxy-addr
+            - 0.0.0.0:8082
+            - --schema-registry-addr
+            - 0.0.0.0:8081
+          ports:
+            - name: kafka
+              containerPort: 9092
+              protocol: TCP
+            - name: admin
+              containerPort: 9644
+              protocol: TCP
+            - name: schema
+              containerPort: 8081
+              protocol: TCP
+          resources:
+            {{- toYaml .Values.redpanda.resources | nindent 12 }}
+          readinessProbe:
+            httpGet:
+              path: /v1/status/ready
+              port: admin
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 12
+          livenessProbe:
+            httpGet:
+              path: /v1/status/ready
+              port: admin
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 12
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/redpanda/data
+      volumes:
+        - name: data
+          emptyDir:
+            sizeLimit: {{ .Values.redpanda.storageSize | quote }}

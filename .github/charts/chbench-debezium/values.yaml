@@ -1,0 +1,32 @@
+nodeSelector:
+  kubernetes.io/hostname: spice-dev-large-1
+
+tolerations:
+  - key: chbench
+    operator: Equal
+    value: "true"
+    effect: NoSchedule
+
+redpanda:
+  name: chbench-redpanda
+  image: redpandadata/redpanda:v24.1.13
+  smp: 8
+  memory: 32G
+  storageSize: 1Ti
+  resources:
+    requests:
+      cpu: "100m"
+      memory: 40Gi
+    limits:
+      memory: 48Gi
+
+debezium:
+  name: chbench-debezium
+  image: quay.io/debezium/connect:2.7
+  heap: "-Xms4g -Xmx24g"
+  resources:
+    requests:
+      cpu: "100m"
+      memory: 32Gi
+    limits:
+      memory: 40Gi

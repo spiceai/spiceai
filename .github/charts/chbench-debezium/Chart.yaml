@@ -1,0 +1,5 @@
+apiVersion: v2
+name: chbench-debezium
+version: 0.1.0
+appVersion: "2.7"
+description: Dedicated Redpanda + Debezium Connect stack for CH-benCH v1.11 compatibility benchmarks

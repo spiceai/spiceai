@@ -1,0 +1,17 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ .Values.debezium.name }}
+  labels:
+    {{- include "chbench-debezium.labels" . | nindent 4 }}
+    app.kubernetes.io/name: {{ .Values.debezium.name }}
+spec:
+  type: ClusterIP
+  ports:
+    - name: http
+      port: 8083
+      targetPort: http
+      protocol: TCP
+  selector:
+    {{- include "chbench-debezium.selectorLabels" . | nindent 4 }}
+    app.kubernetes.io/name: {{ .Values.debezium.name }}

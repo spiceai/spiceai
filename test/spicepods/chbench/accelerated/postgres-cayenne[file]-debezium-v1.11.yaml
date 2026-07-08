@@ -1,0 +1,210 @@
+version: v1
+kind: Spicepod
+name: postgres-cayenne[file]-debezium-v1.11
+
+# v1.11-compatible CH-benCH Cayenne file config for the throwaway
+# `testoperator run htap --cdc-mode debezium[-preloaded]` path. The harness
+# rewrites the changes-mode `postgres:` datasets below to `debezium:<topic>` at
+# runtime and injects Kafka params; static reference tables remain Postgres full refresh.
+#
+# Keep Cayenne params to names known in v1.11.x. Do not copy the v2.x CDC
+# pipeline knobs here (`cayenne_cdc_durability`, `cayenne_deletion_mode`,
+# `cayenne_write_concurrency`, runtime `cdc_*`, etc.).
+runtime:
+  query:
+    target_partitions: 48
+  caching:
+    sql_results:
+      enabled: false
+  task_history:
+    enabled: false
+
+postgres_connection_params: &postgres_params
+  pg_host: ${env:CHBENCH_PG_HOST}
+  pg_port: '5432'
+  pg_db: ${env:CHBENCH_PG_DB}
+  pg_user: bench
+  pg_pass: bench
+  pg_sslmode: disable
+
+params_high: &params_high
+  cayenne_metastore: sqlite
+  cayenne_segment_cache_mb: '1024'
+  cayenne_target_file_size_mb: '256'
+
+params_medium: &params_medium
+  cayenne_metastore: sqlite
+  cayenne_segment_cache_mb: '64'
+  cayenne_target_file_size_mb: '256'
+
+params_small: &params_small
+  cayenne_metastore: sqlite
+  cayenne_segment_cache_mb: '16'
+  cayenne_target_file_size_mb: '256'
+
+datasets:
+  - from: postgres:district
+    name: district
+    params: *postgres_params
+    acceleration:
+      enabled: true
+      engine: cayenne
+      mode: file
+      refresh_mode: changes
+      primary_key: (d_w_id, d_id)
+      on_conflict:
+        (d_w_id, d_id): upsert
+      params:
+        <<: *params_high
+        cayenne_file_path: .spice/cayenne/district
+
+  - from: postgres:customer
+    name: customer
+    params: *postgres_params
+    acceleration:
+      enabled: true
+      engine: cayenne
+      mode: file
+      refresh_mode: changes
+      primary_key: (c_w_id, c_d_id, c_id)
+      on_conflict:
+        (c_w_id, c_d_id, c_id): upsert
+      params:
+        <<: *params_high
+        cayenne_file_path: .spice/cayenne/customer
+
+  - from: postgres:new_order
+    name: new_order
+    params: *postgres_params
+    acceleration:
+      enabled: true
+      engine: cayenne
+      mode: file
+      refresh_mode: changes
+      primary_key: (no_w_id, no_d_id, no_o_id)
+      on_conflict:
+        (no_w_id, no_d_id, no_o_id): upsert
+      params:
+        <<: *params_high
+        cayenne_file_path: .spice/cayenne/new_order
+
+  - from: postgres:oorder
+    name: oorder
+    params: *postgres_params
+    acceleration:
+      enabled: true
+      engine: cayenne
+      mode: file
+      refresh_mode: changes
+      primary_key: (o_w_id, o_d_id, o_id)
+      on_conflict:
+        (o_w_id, o_d_id, o_id): upsert
+      params:
+        <<: *params_high
+        cayenne_file_path: .spice/cayenne/oorder
+
+  - from: postgres:order_line
+    name: order_line
+    params: *postgres_params
+    acceleration:
+      enabled: true
+      engine: cayenne
+      mode: file
+      refresh_mode: changes
+      primary_key: (ol_w_id, ol_d_id, ol_o_id, ol_number)
+      on_conflict:
+        (ol_w_id, ol_d_id, ol_o_id, ol_number): upsert
+      params:
+        <<: *params_high
+        cayenne_file_path: .spice/cayenne/order_line
+
+  - from: postgres:stock
+    name: stock
+    params: *postgres_params
+    acceleration:
+      enabled: true
+      engine: cayenne
+      mode: file
+      refresh_mode: changes
+      primary_key: (s_w_id, s_i_id)
+      on_conflict:
+        (s_w_id, s_i_id): upsert
+      params:
+        <<: *params_high
+        cayenne_file_path: .spice/cayenne/stock
+
+  - from: postgres:warehouse
+    name: warehouse
+    params: *postgres_params
+    acceleration:
+      enabled: true
+      engine: cayenne
+      mode: file
+      refresh_mode: changes
+      primary_key: w_id
+      on_conflict:
+        w_id: upsert
+      params:
+        <<: *params_medium
+        cayenne_file_path: .spice/cayenne/warehouse
+
+  # Static reference tables: no OLTP mutations, so keep Postgres full refresh.
+  - from: postgres:item
+    name: item
+    params: *postgres_params
+    acceleration:
+      enabled: true
+      engine: cayenne
+      mode: file
+      refresh_mode: full
+      primary_key: i_id
+      on_conflict:
+        i_id: upsert
+      params:
+        <<: *params_medium
+        cayenne_file_path: .spice/cayenne/item
+
+  - from: postgres:region
+    name: region
+    params: *postgres_params
+    acceleration:
+      enabled: true
+      engine: cayenne
+      mode: file
+      refresh_mode: full
+      primary_key: r_regionkey
+      on_conflict:
+        r_regionkey: upsert
+      params:
+        <<: *params_small
+        cayenne_file_path: .spice/cayenne/region
+
+  - from: postgres:nation
+    name: nation
+    params: *postgres_params
+    acceleration:
+      enabled: true
+      engine: cayenne
+      mode: file
+      refresh_mode: full
+      primary_key: n_nationkey
+      on_conflict:
+        n_nationkey: upsert
+      params:
+        <<: *params_small
+        cayenne_file_path: .spice/cayenne/nation
+
+  - from: postgres:supplier
+    name: supplier
+    params: *postgres_params
+    acceleration:
+      enabled: true
+      engine: cayenne
+      mode: file
+      refresh_mode: full
+      primary_key: su_suppkey
+      on_conflict:
+        su_suppkey: upsert
+      params:
+        <<: *params_small
+        cayenne_file_path: .spice/cayenne/supplier
