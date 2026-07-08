@@ -2,20 +2,20 @@ version: v1
 kind: Spicepod
 name: mysql-cayenne[file]-adaptive-turso
 
-# Turso-metastore variant of postgres-cayenne[file]-adaptive: same adaptive tuning + goal SLOs;
+# Turso-metastore variant of mysql-cayenne[file]-adaptive: same adaptive tuning + goal SLOs;
 # only the Cayenne metastore backend differs — cayenne_metastore: turso (libsql MVCC /
 # BEGIN CONCURRENT) instead of the sqlite default. Tracks the Turso metastore under adaptive
-# tuning on the scheduled CH-benCHmark, vs the sqlite adaptive twin (postgres-cayenne[file]-adaptive.yaml).
+# tuning on the scheduled CH-benCHmark, vs the sqlite adaptive twin (mysql-cayenne[file]-adaptive.yaml).
 #
-# Adaptive-tuning variant of the non-tuned postgres-cayenne[file] baseline. Instead of either
-# the static `auto` derivation (the baseline) or a hand-pinned -cdc-tuned-* config, every Cayenne
+# Adaptive-tuning variant of the non-tuned mysql-cayenne[file] baseline. Instead of the
+# static `auto` derivation (the baseline), every Cayenne
 # table runs `cayenne_tuning: adaptive`: the runtime still warm-starts each knob from the detected
 # host + inferred schema, then runs the closed-feedback loop that adapts those knobs over time
 # within the environment-derived [floor, ceiling] as the workload shifts.
 #
 # `schema_inference: extended` (per dataset) does double duty here, so nothing else is hand-set:
 #   - It auto-detects the primary key, secondary indexes, and (non-CDC) sort columns from the
-#     PostgreSQL source and seeds an `upsert` on_conflict on the inferred PK — exactly what
+#     MySQL source and seeds an `upsert` on_conflict on the inferred PK — exactly what
 #     `refresh_mode: changes` needs to apply UPDATE/DELETE events. So PK / on_conflict / indexes
 #     are intentionally NOT declared below; inference fills them (it is gap-filling only and never
 #     overrides a user-set value, so declaring them would just suppress the very thing we test).
@@ -28,7 +28,7 @@ name: mysql-cayenne[file]-adaptive-turso
 # are the high-level targets the closed loop converges toward (it still moves the un-pinned
 # actuators freely to hit them).
 #
-# sql_results / task_history stay off to match the baseline and the -cdc-tuned configs, so a
+# sql_results / task_history stay off to match the baseline, so a
 # comparison isolates the effect of adaptive tuning, not caching/history overhead.
 
 mysql_connection_params: &mysql_params
@@ -63,7 +63,7 @@ runtime:
 datasets:
   # ---- TPC-C core tables (mutated by OLTP workload) ----
   # No primary_key / on_conflict / indexes: `schema_inference: extended` detects them from the
-  # PostgreSQL source and seeds the upsert on_conflict the CDC (changes) path requires.
+  # MySQL source and seeds the upsert on_conflict the CDC (changes) path requires.
 
   - from: mysql:warehouse
     name: warehouse
