@@ -39,7 +39,7 @@ mod schema;
 pub use schema::SchemaTestArgs;
 
 mod htap;
-pub use htap::HtapArgs;
+pub use htap::{HtapArgs, HtapCdcMode};
 
 mod streaming;
 pub use streaming::{StreamingDynamodbArgs, StreamingDynamodbCorrectnessArgs};
