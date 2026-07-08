@@ -107,7 +107,7 @@ pub enum Error {
 
     #[snafu(display(
         "Failed to validate datalake access for dataset {dataset} at {location}: {source}. \
-        Verify 'cayenne_datalake_location' and that the 'cayenne_datalake_s3_*' credentials grant PutObject/DeleteObject access. \
+        Verify 'cayenne_datalake_location' and that the 'cayenne_datalake_s3_*' credentials grant write access (PutObject) on the prefix; DeleteObject is recommended for probe cleanup. \
         See: https://spiceai.org/docs/components/data-accelerators/cayenne"
     ))]
     DatalakeAccessDenied {
@@ -1597,10 +1597,12 @@ pub async fn build_datalake_object_store(
     }))
 }
 
-/// Verify write access to the datalake location at dataset load: PUT then
-/// DELETE a zero-byte probe object under the location prefix, so a
-/// credential/endpoint misconfiguration fails registration with an actionable
-/// error instead of surfacing at the first background promotion.
+/// Verify write access to the datalake location at dataset load: PUT a
+/// zero-byte probe object under the location prefix (failure fails
+/// registration with an actionable error, instead of surfacing at the first
+/// background promotion), then best-effort DELETE it (failure only warns —
+/// `DeleteObject` is deliberately optional so minimal-permission deployments
+/// work; a leftover probe marker is harmless).
 pub async fn validate_datalake_store_access(
     config: &cayenne::metadata::ObjectStoreConfig,
     dataset_name: &str,

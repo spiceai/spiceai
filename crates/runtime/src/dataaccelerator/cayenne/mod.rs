@@ -1981,6 +1981,24 @@ impl CayenneAccelerator {
                 ))),
             });
         }
+        // The datalake tier supports only continuously-ingesting refresh modes:
+        // 'changes' (CDC) and 'append'. A 'full' refresh re-materializes the
+        // whole table on every refresh — an overwrite that discards the
+        // promoted datalake generation each time, defeating the tier.
+        if table_options.vortex_config.cold_tier_enabled() {
+            let refresh_mode = source
+                .acceleration()
+                .and_then(|a| a.refresh_mode)
+                .unwrap_or(RefreshMode::Full);
+            if !matches!(refresh_mode, RefreshMode::Changes | RefreshMode::Append) {
+                return Err(Error::AccelerationCreationFailed {
+                    source: Box::new(std::io::Error::other(format!(
+                        "Failed to register dataset {table_name} (cayenne): the datalake tier supports refresh_mode 'changes' or 'append'; found '{refresh_mode:?}'. \
+                        Set 'refresh_mode: changes' or 'refresh_mode: append', or remove 'cayenne_datalake_location'."
+                    ))),
+                });
+            }
+        }
         // Datalake (cold) tier object store: built from the dedicated
         // `cayenne_datalake_s3_*` params (default `iam_role` auth falls back to environment/SDK credentials).
         let cold_object_store = if table_options.vortex_config.cold_tier_enabled()

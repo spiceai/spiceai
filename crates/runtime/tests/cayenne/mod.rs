@@ -1982,6 +1982,7 @@ fn make_datalake_nation_dataset(
     datalake_location: &str,
     s3_creds: (&str, &str),
     warm_max_bytes: &str,
+    refresh_mode: RefreshMode,
 ) -> Dataset {
     let mut dataset = Dataset::new(
         "s3://spiceai-demo-datasets/tpch/nation/".to_string(),
@@ -2031,7 +2032,7 @@ fn make_datalake_nation_dataset(
         enabled: true,
         engine: Some("cayenne".to_string()),
         mode: Mode::File,
-        refresh_mode: Some(RefreshMode::Full),
+        refresh_mode: Some(refresh_mode),
         primary_key: Some("n_nationkey".to_string()),
         on_conflict: HashMap::from([("n_nationkey".to_string(), OnConflictBehavior::Upsert)]),
         params: Some(Params::from_string_map(params)),
@@ -2069,10 +2070,11 @@ async fn query_single_i64(rt: &Runtime, sql: &str) -> Result<i64, String> {
 }
 
 /// Full datalake-tier cycle against real S3:
-/// registration probe → warm load → background promotion to the datalake →
-/// cross-tier query correctness → restart with a tuned param (reconciled,
-/// still reads promoted data) → restart with a CHANGED location while cold
-/// files exist (rejected at load).
+/// registration probe → warm load (append mode; the datalake tier supports
+/// refresh_mode 'changes' and 'append' only) → background promotion to the
+/// datalake → cross-tier query correctness → restart with a tuned param
+/// (reconciled, re-appended rows upsert-dedupe against the promoted data) →
+/// restart with a CHANGED location while cold files exist (rejected at load).
 ///
 /// Runs against real S3 (bucket [`DATALAKE_TEST_BUCKET`]) with a few KB of
 /// transfer per run. Credentials: `AWS_SNAPSHOT_KEY`/`AWS_SNAPSHOT_SECRET`
@@ -2123,6 +2125,18 @@ async fn test_cayenne_datalake_tier_e2e() -> Result<(), String> {
                     .map_err(|e| format!("failed to build S3 client: {e}"))?,
             );
 
+            // Precondition: the run's prefix must be empty, so the later
+            // "found .vortex objects" signal can only come from THIS run's
+            // promotion — never from leftovers of a prior run.
+            let preexisting = list_objects_under_prefix(&store, &format!("{prefix}/")).await?;
+            if !preexisting.is_empty() {
+                return Err(format!(
+                    "datalake test prefix s3://{DATALAKE_TEST_BUCKET}/{prefix}/ is not empty at test start ({} objects, e.g. {:?}); promotion detection would be unsound",
+                    preexisting.len(),
+                    preexisting.keys().next()
+                ));
+            }
+
             let result = datalake_e2e_inner(
                 &data_dir,
                 &metadata_dir,
@@ -2162,6 +2176,7 @@ async fn datalake_e2e_inner(
                 location,
                 s3_creds,
                 "1", // tiny trigger: promote as soon as any warm data exists
+                RefreshMode::Append,
             ))
             .build();
         configure_test_datafusion();
@@ -2230,6 +2245,7 @@ async fn datalake_e2e_inner(
                 location,
                 s3_creds,
                 "999999999999", // changed trigger: reconcile persists it silently
+                RefreshMode::Append,
             ))
             .build();
         let rt = Runtime::builder().with_app(app).build().await;
@@ -2262,6 +2278,7 @@ async fn datalake_e2e_inner(
                 &changed_location,
                 s3_creds,
                 "1",
+                RefreshMode::Append,
             ))
             .build();
         let rt = Runtime::builder().with_app(app).build().await;
