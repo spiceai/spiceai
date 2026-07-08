@@ -364,5 +364,77 @@ fn bench_decode(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_decode);
+/// Per-event *routing* cost on the shared pump: peek the relation id, look it up
+/// in the route map, and buffer the raw bytes into the per-relation txn map.
+/// This is the only place the hasher choice matters (the decode bench's
+/// `route_peek` stage deliberately omits the maps), so it compares std `HashMap`
+/// (SipHash) vs `FxHashMap` for the two `u32`-keyed lookups. `M` relations, `N`
+/// change messages round-robined across them, a fresh txn per iteration (one
+/// transaction's worth).
+fn bench_routing(c: &mut Criterion) {
+    use rustc_hash::FxHashMap;
+    use std::collections::HashMap;
+
+    const M: u32 = 16; // subscribed relations (tables) on the shared slot
+    const BASE_OID: u32 = 16_384;
+
+    fn make_msgs(n: usize) -> Vec<Bytes> {
+        (0..n)
+            .map(|i| {
+                let relid = BASE_OID + (i as u32 % M);
+                let mut o = vec![b'I'];
+                o.extend_from_slice(&relid.to_be_bytes());
+                o.push(b'N');
+                o.extend_from_slice(&1u16.to_be_bytes());
+                o.push(b't');
+                o.extend_from_slice(&1u32.to_be_bytes());
+                o.push(b'x');
+                Bytes::from(o)
+            })
+            .collect()
+    }
+
+    let mut group = c.benchmark_group("pgoutput_routing");
+    for &n in &[1_000usize, 10_000] {
+        let msgs = make_msgs(n);
+        group.throughput(Throughput::Elements(n as u64));
+
+        group.bench_with_input(BenchmarkId::new("siphash", n), &msgs, |b, msgs| {
+            let mut routes: HashMap<u32, usize> = HashMap::new();
+            for k in 0..M {
+                routes.insert(BASE_OID + k, k as usize);
+            }
+            b.iter(|| {
+                let mut txn: HashMap<u32, Vec<Bytes>> = HashMap::new();
+                for msg in msgs {
+                    let relid = u32::from_be_bytes([msg[1], msg[2], msg[3], msg[4]]);
+                    if routes.get(&relid).is_some() {
+                        txn.entry(relid).or_default().push(msg.clone());
+                    }
+                }
+                black_box(&txn);
+            });
+        });
+
+        group.bench_with_input(BenchmarkId::new("fxhash", n), &msgs, |b, msgs| {
+            let mut routes: FxHashMap<u32, usize> = FxHashMap::default();
+            for k in 0..M {
+                routes.insert(BASE_OID + k, k as usize);
+            }
+            b.iter(|| {
+                let mut txn: FxHashMap<u32, Vec<Bytes>> = FxHashMap::default();
+                for msg in msgs {
+                    let relid = u32::from_be_bytes([msg[1], msg[2], msg[3], msg[4]]);
+                    if routes.get(&relid).is_some() {
+                        txn.entry(relid).or_default().push(msg.clone());
+                    }
+                }
+                black_box(&txn);
+            });
+        });
+    }
+    group.finish();
+}
+
+criterion_group!(benches, bench_decode, bench_routing);
 criterion_main!(benches);
