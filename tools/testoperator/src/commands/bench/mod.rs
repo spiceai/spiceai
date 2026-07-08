@@ -177,7 +177,7 @@ async fn run_inner(
         &app,
         NotStarted::new()
             .with_parallel_count(1)
-            .with_end_condition(EndCondition::QuerySetCompleted(5))
+            .with_end_condition(EndCondition::QuerySetCompleted(1))
             .with_validate(args.validate)
             .with_scale_factor(args.scale_factor.unwrap_or(1.0))
             .with_query_executor(executor),
