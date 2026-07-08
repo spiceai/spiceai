@@ -37,7 +37,10 @@ use snafu::ensure;
 
 use super::pgoutput::{Relation, TupleData, Value};
 use super::{PgOutputDecodeSnafu, Result};
-use crate::cdc::{ChangeBatch, ChangeEnvelope, CommitChange, CommitError, changes_schema};
+use crate::cdc::{
+    ChangeBatch, ChangeBatchError, ChangeEnvelope, ChangeRows, CommitChange, CommitError,
+    changes_schema,
+};
 
 /// Microseconds between the Unix epoch (1970-01-01) and the Postgres epoch
 /// (2000-01-01). Binary `timestamp`/`timestamptz` are relative to the Postgres
@@ -305,6 +308,83 @@ pub fn build_change_batch(
     ChangeBatch::try_new(record).map_err(|e| super::Error::SchemaMismatch {
         message: format!("change batch validation failed: {e}"),
     })
+}
+
+/// A committed transaction's changes for one relation, carried through the
+/// shared-slot [`ChangeEnvelope`] as a deferred [`ChangeRows`] source.
+///
+/// The shared Postgres replication pump routes and buffers these without
+/// building the Arrow batch; [`ChangeRows::build`] runs later on the per-dataset
+/// consumer (see [`build_change_batch`]), moving the O(rows × columns)
+/// Arrow-typing + UTF-8 cost off the single shared read path. The metadata
+/// methods are answered from the buffered changes without building.
+pub struct PgChangeRows {
+    schema: SchemaRef,
+    relation: Relation,
+    changes: Vec<DecodedChange>,
+    source_commit_ts_ms: Option<i64>,
+}
+
+impl PgChangeRows {
+    #[must_use]
+    pub fn new(
+        schema: SchemaRef,
+        relation: Relation,
+        changes: Vec<DecodedChange>,
+        source_commit_ts_ms: Option<i64>,
+    ) -> Self {
+        Self {
+            schema,
+            relation,
+            changes,
+            source_commit_ts_ms,
+        }
+    }
+}
+
+impl ChangeRows for PgChangeRows {
+    fn is_empty(&self) -> bool {
+        self.changes.is_empty()
+    }
+
+    fn num_rows_hint(&self) -> usize {
+        // Exact today: primary-key-change splits are already materialized into
+        // `changes` by `push_update_change` on the pump. Remains a valid upper
+        // bound once the split moves into decode-direct.
+        self.changes.len()
+    }
+
+    fn encoded_len(&self) -> usize {
+        // Sum of buffered tuple-value wire bytes — a build-free proxy for the
+        // eventual Arrow size, used only for the consumer's coalescing budget.
+        self.changes
+            .iter()
+            .flat_map(|c| c.row.columns.iter())
+            .filter_map(|v| v.as_ref())
+            .map(|v| match v {
+                Value::Text(b) | Value::Binary(b) => b.len(),
+                Value::Unchanged => 0,
+            })
+            .sum()
+    }
+
+    fn source_commit_ts_ms(&self) -> Option<i64> {
+        self.source_commit_ts_ms
+    }
+
+    fn is_heartbeat(&self) -> bool {
+        // WAL change batches always carry rows; readiness/keepalive heartbeats
+        // are emitted separately as zero-row envelopes.
+        false
+    }
+
+    fn build(self: Box<Self>) -> Result<ChangeBatch, ChangeBatchError> {
+        build_change_batch(&self.schema, &self.relation, &self.changes)
+            .map(|b| b.with_source_commit_ts_ms(self.source_commit_ts_ms))
+            .map_err(|e| ChangeBatchError::DeferredBuild {
+                message: e.to_string(),
+            })
+    }
 }
 
 /// Return a clone of `schema` where every field is marked nullable.

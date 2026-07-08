@@ -5761,6 +5761,7 @@ dependencies = [
  "object_store 0.13.2",
  "opendal 0.55.0",
  "oracle",
+ "parking_lot",
  "parquet",
  "percent-encoding",
  "pgwire-replication",

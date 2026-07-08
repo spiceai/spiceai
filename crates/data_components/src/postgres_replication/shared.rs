@@ -1569,28 +1569,31 @@ async fn deliver_commit(
             .await;
             continue;
         };
-        let batch = match super::changes::build_change_batch(&member.schema, rel, &changes) {
-            Ok(b) => b.with_source_commit_ts_ms(commit_ts_ms),
-            Err(e) => {
-                member_fatal(
-                    source,
-                    member_key,
-                    format!("change batch build failed for {}: {e}", member.dataset_name),
-                )
-                .await;
-                continue;
-            }
-        };
+        // Defer the O(rows x columns) Arrow-typing + UTF-8 build off this shared
+        // pump task onto the per-dataset consumer: the pump routes + buffers
+        // here, and `PgChangeRows::build` runs later on the consumer (see
+        // `ChangeRows`), so build cost no longer serializes every member behind
+        // one thread. The relation is cloned once per commit-per-relation
+        // (schema metadata, not per row) so the rows own their inputs; a build
+        // failure (e.g. an unmergeable unchanged-TOAST column) then surfaces as a
+        // `StreamError` on this dataset's stream at consume time rather than a
+        // pump-side `member_fatal`, isolating it to the one dataset.
+        let rows = super::changes::PgChangeRows::new(
+            Arc::clone(&member.schema),
+            rel.clone(),
+            changes,
+            commit_ts_ms,
+        );
         member.metrics.inc_transaction();
         // Readiness was already signaled by the member's snapshot / ready
         // envelope at subscribe time, so WAL envelopes never need to carry it.
-        let envelope = ChangeEnvelope::new(
+        let envelope = ChangeEnvelope::new_from_rows(
             Box::new(SharedLsnCommitter {
                 ack: Arc::clone(&source.ack),
                 key: member_key.clone(),
                 flush_to: end_lsn,
             }),
-            batch,
+            Box::new(rows),
             false,
         );
         source.ack.deliver(member_key, end_lsn);

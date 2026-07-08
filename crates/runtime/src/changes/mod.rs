@@ -43,7 +43,9 @@ pub async fn index_change_envelope(
         e
     })?;
 
-    let (change_committer, batch, is_dataset_ready) = envelope.into_parts();
+    // Materialize a deferred batch here (this index wrapper transforms the
+    // stream before the accelerator consumes it).
+    let (change_committer, batch, is_dataset_ready) = envelope.into_parts()?;
     let mut batches = vec![batch.data_batch()];
 
     for index in &indexes.0 {
@@ -219,8 +221,8 @@ mod tests {
 
         assert!(result.is_ok());
         let result_envelope = result.expect("Expected successful result");
-        assert_eq!(result_envelope.change_batch.record.num_rows(), 3);
-        assert_eq!(result_envelope.change_batch.record.num_columns(), 3); // op, primary_keys, data
+        assert_eq!(result_envelope.change_batch().expect("built change batch").record.num_rows(), 3);
+        assert_eq!(result_envelope.change_batch().expect("built change batch").record.num_columns(), 3); // op, primary_keys, data
     }
 
     #[tokio::test]
@@ -237,9 +239,9 @@ mod tests {
 
         assert!(result.is_ok());
         let result_envelope = result.expect("Expected successful result");
-        assert_eq!(result_envelope.change_batch.record.num_rows(), 3);
+        assert_eq!(result_envelope.change_batch().expect("built change batch").record.num_rows(), 3);
 
-        let data_batch = result_envelope.change_batch.data_batch();
+        let data_batch = result_envelope.change_batch().expect("built change batch").data_batch();
         assert_eq!(data_batch.num_columns(), 3); // id, name, embedding
         assert!(data_batch.schema().column_with_name("embedding").is_some());
     }
@@ -259,7 +261,7 @@ mod tests {
 
         assert!(result.is_ok());
         let result_envelope = result.expect("Expected successful result");
-        assert_eq!(result_envelope.change_batch.record.num_rows(), 3);
+        assert_eq!(result_envelope.change_batch().expect("built change batch").record.num_rows(), 3);
     }
 
     #[tokio::test]
@@ -320,8 +322,8 @@ mod tests {
         let result_envelope = result.expect("Expected successful result");
 
         // Verify that all rows still have the "c" (create) operation
-        for i in 0..result_envelope.change_batch.record.num_rows() {
-            let op = result_envelope.change_batch.op(i);
+        for i in 0..result_envelope.change_batch().expect("built change batch").record.num_rows() {
+            let op = result_envelope.change_batch().expect("built change batch").op(i);
             assert!(matches!(op, data_components::cdc::ChangeOperation::Create));
         }
     }
@@ -329,7 +331,7 @@ mod tests {
     #[tokio::test]
     async fn test_index_change_envelope_maintains_row_count() {
         let envelope = create_test_change_envelope();
-        let original_row_count = envelope.change_batch.record.num_rows();
+        let original_row_count = envelope.change_batch().expect("built change batch").record.num_rows();
 
         let table_provider = Arc::new(MockTableProvider);
         let index = Arc::new(MockIndex::new("test_index").with_added_column());
@@ -343,7 +345,7 @@ mod tests {
         assert!(result.is_ok());
         let result_envelope = result.expect("Expected successful result");
         assert_eq!(
-            result_envelope.change_batch.record.num_rows(),
+            result_envelope.change_batch().expect("built change batch").record.num_rows(),
             original_row_count
         );
     }

@@ -1239,8 +1239,8 @@ impl RefreshTask {
                 // Exclude heartbeats: their server-clock timestamp would advance the
                 // received frontier past data not actually received mid-backlog,
                 // corrupting the rate ladder (see ChangeBatch::is_heartbeat).
-                && !env.change_batch.is_heartbeat()
-                && let Some(commit_ts_ms) = env.change_batch.source_commit_ts_ms()
+                && !env.is_heartbeat()
+                && let Some(commit_ts_ms) = env.source_commit_ts_ms()
             {
                 // Ingress frontier (received commit ts) is recorded once per burst in
                 // `apply_burst` using the freshest commit timestamp across the coalesced
@@ -1578,7 +1578,7 @@ impl RefreshTask {
         let burst_rows: u64 = burst
             .iter()
             .filter_map(|item| item.as_ref().ok())
-            .map(|env| env.change_batch.record.num_rows() as u64)
+            .map(|env| env.num_rows_hint() as u64)
             .fold(0_u64, u64::saturating_add);
         let labels = context.metric_labels.dataset();
         metrics::CDC_APPLY_BURST_ENVELOPES.record(burst_envelopes, labels);
@@ -1600,8 +1600,8 @@ impl RefreshTask {
             // Exclude heartbeats: a keepalive interleaved in a backlogged burst carries
             // the server clock, which would inflate the applied frontier + lag gauge
             // (applied appearing to outrun received). See ChangeBatch::is_heartbeat.
-            .filter(|env| !env.change_batch.is_heartbeat())
-            .filter_map(|env| env.change_batch.source_commit_ts_ms())
+            .filter(|env| !env.is_heartbeat())
+            .filter_map(|env| env.source_commit_ts_ms())
             .max();
         if let Some(ts) = max_commit_ts_ms {
             metrics::CDC_RECEIVED_COMMIT_UNIX_TIME_MS.record(ts, labels);
@@ -1785,7 +1785,29 @@ impl RefreshTask {
             Vec::with_capacity(envelopes.len());
         let mut batches: Vec<ChangeBatch> = Vec::with_capacity(envelopes.len());
         for env in envelopes {
-            let (committer, batch, _is_ready) = env.into_parts();
+            // Build the (possibly deferred) batch here, on the per-dataset apply
+            // task — off the source's shared read/route path. A deferred build
+            // can fail on per-row value typing that only surfaces at build time
+            // (e.g. an unmergeable unchanged-TOAST column under REPLICA IDENTITY
+            // DEFAULT); treat it as a terminal error for this dataset, mirroring
+            // the eager path's pump-side fatal. Committers collected so far are
+            // dropped without acking, so the source re-streams on reconnect.
+            let (committer, batch, _is_ready) = match env.into_parts() {
+                Ok(parts) => parts,
+                Err(e) => {
+                    let error_message = format!(
+                        "Failed to build CDC change batch for {}: {e}",
+                        context.dataset_name,
+                    );
+                    tracing::error!("{error_message}");
+                    self.set_refresh_status(
+                        context.refresh_sql,
+                        status::ComponentStatus::error_with_message(error_message),
+                    )
+                    .await;
+                    return false;
+                }
+            };
             committers.push(committer);
             batches.push(batch);
         }
@@ -2872,8 +2894,12 @@ fn concat_change_batches(batches: &[ChangeBatch]) -> crate::accelerated_table::R
 }
 
 fn cdc_item_memory_size(item: &Result<cdc::ChangeEnvelope, cdc::StreamError>) -> usize {
+    // `encoded_len` reports the coalescing byte budget WITHOUT forcing a build:
+    // a deferred (e.g. Postgres) envelope answers from its buffered wire size, a
+    // built one from its Arrow size. The actual Arrow build is deferred to apply
+    // time (`into_parts`), off the source's shared read path.
     item.as_ref()
-        .map_or(0, |env| env.change_batch.record.get_array_memory_size())
+        .map_or(0, cdc::ChangeEnvelope::encoded_len)
 }
 
 fn elapsed_ms(start: Instant) -> f64 {
