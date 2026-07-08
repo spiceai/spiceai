@@ -117,8 +117,22 @@ use super::{
     config::ReplicationParams,
     pgoutput, resilience, slot,
 };
+use rustc_hash::FxHashMap;
+
 use crate::cdc::{ChangeEnvelope, ChangesStream, CommitChange, CommitError, StreamError};
 use crate::postgres_replication::pgoutput::RelationId;
+
+/// Per-connection routing table: relation id -> (member key, resolved handle).
+/// `FxHashMap` (not the SipHash default) since the keys are trusted internal
+/// relation ids and this is on the per-event pump hot path — a `u32` `FxHash`
+/// is ~1-2ns vs SipHash's ~10-20ns, and bit-mixing keeps hashbrown's SIMD
+/// filter effective (unlike an identity `nohash`, whose zero high bits defeat
+/// it as the map grows).
+type RouteMap = FxHashMap<RelationId, (MemberKey, Arc<MemberHandle>)>;
+
+/// Per-transaction buffer of raw pgoutput change bytes, keyed by relation id.
+/// `FxHashMap` for the same hot-path reason as [`RouteMap`].
+type TxnBuffer = FxHashMap<RelationId, Vec<Bytes>>;
 
 /// Default bounded per-member delivery queue depth (envelopes), overridable via
 /// `pg_replication_member_channel_capacity`
@@ -1051,11 +1065,11 @@ async fn run_pump(source: Arc<SharedSource>) {
         // Relation id -> (member key, resolved handle). Caching the `Arc<MemberHandle>`
         // here (once, at Relation time) keeps the per-event route lookup a bare
         // `u32` hash — no `members` mutex, no `(String, String)` hash on the hot path.
-        let mut routes: HashMap<RelationId, (MemberKey, Arc<MemberHandle>)> = HashMap::new();
+        let mut routes: RouteMap = RouteMap::default();
         // Raw pgoutput change-message bytes, buffered per relation as the pump
         // routes them (no tuple decode on this shared task). The per-dataset
         // consumer decodes + builds them (see `PgChangeRows`).
-        let mut txn: HashMap<RelationId, Vec<Bytes>> = HashMap::new();
+        let mut txn: TxnBuffer = TxnBuffer::default();
         let mut txn_open = false;
 
         // Reader-timing accumulators (see `BoundaryMetrics` /
@@ -1379,7 +1393,7 @@ async fn run_pump(source: Arc<SharedSource>) {
 async fn handle_relation(
     source: &Arc<SharedSource>,
     decoder: &mut pgoutput::Decoder,
-    routes: &mut HashMap<RelationId, (MemberKey, Arc<MemberHandle>)>,
+    routes: &mut RouteMap,
     rel: pgoutput::Relation,
 ) {
     let member_key: MemberKey = (rel.namespace.clone(), rel.name.clone());
@@ -1437,8 +1451,8 @@ async fn handle_relation(
 /// the eager path. The "change before Relation" invariant is still enforced at
 /// commit (`deliver_commit` fatals if the relation isn't cached).
 fn buffer_raw_change(
-    routes: &HashMap<RelationId, (MemberKey, Arc<MemberHandle>)>,
-    txn: &mut HashMap<RelationId, Vec<Bytes>>,
+    routes: &RouteMap,
+    txn: &mut TxnBuffer,
     tag: u8,
     data: Bytes,
 ) {
@@ -1463,8 +1477,8 @@ fn buffer_raw_change(
 /// raw bytes per relation. Unlike the per-dataset path, multi-relation
 /// TRUNCATEs are fine here: each relation routes to its own member.
 fn buffer_raw_truncate(
-    routes: &HashMap<RelationId, (MemberKey, Arc<MemberHandle>)>,
-    txn: &mut HashMap<RelationId, Vec<Bytes>>,
+    routes: &RouteMap,
+    txn: &mut TxnBuffer,
     relation_ids: &[RelationId],
     data: &Bytes,
 ) {
@@ -1558,8 +1572,8 @@ async fn deliver_to_member(
 async fn deliver_commit(
     source: &Arc<SharedSource>,
     decoder: &pgoutput::Decoder,
-    routes: &HashMap<RelationId, (MemberKey, Arc<MemberHandle>)>,
-    txn: HashMap<RelationId, Vec<Bytes>>,
+    routes: &RouteMap,
+    txn: TxnBuffer,
     end_lsn: u64,
     commit_time_micros: i64,
     shutdown_epoch: u64,

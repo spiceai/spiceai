@@ -5774,6 +5774,7 @@ dependencies = [
  "runtime-rate-control",
  "runtime-request-context",
  "rusqlite",
+ "rustc-hash 2.1.2",
  "s3_vectors",
  "s3_vectors_metadata_filter",
  "scylla",
