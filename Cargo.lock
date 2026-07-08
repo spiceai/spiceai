@@ -16521,7 +16521,7 @@ dependencies = [
  "dirs",
  "ed25519-dalek",
  "gethostname",
- "prost 0.14.3",
+ "prost",
  "rand 0.10.1",
  "rand_core 0.6.4",
  "serde",
@@ -22008,7 +22008,7 @@ source = "git+https://github.com/spiceai/vortex.git?rev=409505dfd09e60d34088c36b
 dependencies = [
  "fsst-rs",
  "num-traits",
- "prost 0.14.3",
+ "prost",
  "vortex-array",
  "vortex-buffer",
  "vortex-error",
