@@ -153,6 +153,30 @@ impl DataSink for CayenneDataSink {
             }),
         ));
 
+        // Memory mode (`mode: memory`): all data lives in the RAM mem-tier, so
+        // collect the stream and route it there — an atomic replace on
+        // overwrite/full refresh, otherwise an append. Nothing is ever encoded to
+        // Vortex. The write lock serializes memory-mode writes so an overwrite never
+        // interleaves with a concurrent append.
+        if self.table.is_memory_resident_mode() {
+            let overwrite = self.overwrite == InsertOp::Overwrite;
+            let mut data = normalized;
+            let mut batches: Vec<arrow::record_batch::RecordBatch> = Vec::new();
+            let mut incoming_bytes: u64 = 0;
+            while let Some(batch) = data.next().await {
+                let batch = batch?;
+                incoming_bytes =
+                    incoming_bytes.saturating_add(batch.get_array_memory_size() as u64);
+                batches.push(batch);
+            }
+            let _write_guard = self.table.write_lock().lock().await;
+            return self
+                .table
+                .write_batches_memory_mode(batches, incoming_bytes, overwrite)
+                .await
+                .map_err(Into::into);
+        }
+
         if self.overwrite == InsertOp::Overwrite {
             // Overwrite path: `CayenneTableProvider::begin_overwrite` acquires the
             // table write lock internally and the lock is held inside the

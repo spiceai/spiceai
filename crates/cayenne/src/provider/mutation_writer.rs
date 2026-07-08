@@ -479,8 +479,8 @@ impl<'a> AppendMutationWriter<'a> {
         // merge-on-read shape on a non-partitioned table (`is_cdc_memory_mode`) AND
         // the runtime has armed deferral for a replayable source (`has_slot_advancer`);
         // every other table/source keeps the durable path below, byte-identical.
-        let (mut prepared_stream, write_guard) = if self.table.is_cdc_memory_mode()
-            && self.table.has_slot_advancer()
+        let (mut prepared_stream, write_guard) = if self.table.is_memory_resident_mode()
+            || (self.table.is_cdc_memory_mode() && self.table.has_slot_advancer())
         {
             match self
                 .write_cdc_in_memory(prepared_stream, &post_validation, write_guard, write_start)
@@ -750,7 +750,13 @@ impl<'a> AppendMutationWriter<'a> {
             spill_result?;
         }
 
-        if !mem_tier_budget::try_reserve_bytes(incoming_bytes) {
+        // Memory mode never spills to the durable path — the per-table RAM bound
+        // above (`spill_mem_tier_if_cap_breached`, which errors in memory mode) is
+        // the sole limit, so skip the process-global budget reserve/wait/fallback
+        // (which could otherwise force the Vortex durable write memory mode forbids).
+        if !self.table.is_memory_resident_mode()
+            && !mem_tier_budget::try_reserve_bytes(incoming_bytes)
+        {
             let wait_start = Instant::now();
             let admitted = self.table.wait_for_budget_or_spill(incoming_bytes).await;
             record_cayenne_write_phase(self.table.table_name(), "inmemory_budget_wait", wait_start);
@@ -795,7 +801,10 @@ impl<'a> AppendMutationWriter<'a> {
         {
             Ok(epoch) => epoch,
             Err(e) => {
-                mem_tier_budget::release_bytes(incoming_bytes);
+                // Memory mode skipped the reservation above, so must not release.
+                if !self.table.is_memory_resident_mode() {
+                    mem_tier_budget::release_bytes(incoming_bytes);
+                }
                 return Err(e);
             }
         };
@@ -871,7 +880,13 @@ impl<'a> AppendMutationWriter<'a> {
             spill_result?;
         }
 
-        if !mem_tier_budget::try_reserve_bytes(incoming_bytes) {
+        // Memory mode never spills to the durable path — the per-table RAM bound
+        // above (`spill_mem_tier_if_cap_breached`, which errors in memory mode) is
+        // the sole limit, so skip the process-global budget reserve/wait/fallback
+        // (which could otherwise force the Vortex durable write memory mode forbids).
+        if !self.table.is_memory_resident_mode()
+            && !mem_tier_budget::try_reserve_bytes(incoming_bytes)
+        {
             let wait_start = Instant::now();
             let admitted = self.table.wait_for_budget_or_spill(incoming_bytes).await;
             record_cayenne_write_phase(self.table.table_name(), "inmemory_budget_wait", wait_start);
@@ -912,7 +927,10 @@ impl<'a> AppendMutationWriter<'a> {
         {
             Ok(apply) => apply,
             Err(e) => {
-                mem_tier_budget::release_bytes(incoming_bytes);
+                // Memory mode skipped the reservation above, so must not release.
+                if !self.table.is_memory_resident_mode() {
+                    mem_tier_budget::release_bytes(incoming_bytes);
+                }
                 return Err(e);
             }
         };
