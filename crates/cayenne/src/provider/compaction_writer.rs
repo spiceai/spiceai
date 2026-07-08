@@ -168,8 +168,9 @@ impl CompactionWriterConfig {
 
 /// Whether compaction OUTPUT for a table should be routed through the custom
 /// `O_DIRECT` writer, decided by the detected storage tier. Installed ONLY on the
-/// network-attached block-storage tier ([`StorageClass::Ebs`] — AWS EBS, Azure
-/// managed disks), where bypassing the page cache pays off. Deliberately NOT
+/// network-attached storage tier ([`StorageClass::Ebs`] — AWS EBS, Azure managed
+/// disks, or an NFS/SMB network filesystem), where bypassing the page cache pays
+/// off. Deliberately NOT
 /// installed on:
 /// - [`StorageClass::LocalSsd`] — local SSD/NVMe, **including AWS EC2 `NVMe`
 ///   instance storage** (the detector maps that to `LocalSsd`, not `Ebs`): a

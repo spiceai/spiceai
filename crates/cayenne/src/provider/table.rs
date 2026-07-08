@@ -4794,9 +4794,10 @@ impl CayenneTableProvider {
         )?;
 
         // Create session context once with object store registered (if S3).
-        // On the network-attached block-storage tier (`StorageClass::Ebs` — AWS
-        // EBS, Azure managed disks) route Maintenance-class (compaction) LOCAL
-        // output through the custom fallocate / bytes_per_sync / O_DIRECT writer,
+        // On the network-attached storage tier (`StorageClass::Ebs` — AWS EBS,
+        // Azure managed disks, or an NFS/SMB network filesystem) route
+        // Maintenance-class (compaction) LOCAL output through the custom
+        // fallocate / bytes_per_sync / O_DIRECT writer,
         // via a private object-store registry scoped to this write (see
         // `compaction_session_context`). On local SSD/NVMe (incl. AWS EC2 NVMe
         // instance storage), tmpfs, undetected storage, or S3 the writer is NOT
