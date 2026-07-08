@@ -9,6 +9,10 @@ inputs:
     description: 'spiced build commit'
     required: false
     type: string
+  spiced_version: # optionally download an official GitHub release binary, e.g. 1.11.6
+    description: 'spiced release version to download from GitHub releases'
+    required: false
+    type: string
   ref: # optionally override the branch to fetch latest 10 commits from
     description: 'target ref'
     required: false
@@ -54,7 +58,7 @@ runs:
         echo "ext=zip" >> $env:GITHUB_OUTPUT
 
     - name: Find the latest built spiced commit (Linux/macOS)
-      if: ${{ !inputs.spiced_commit && runner.os != 'Windows' }}
+      if: ${{ !inputs.spiced_commit && !inputs.spiced_version && runner.os != 'Windows' }}
       shell: bash
       run: |
         git fetch --depth=10 origin ${{ inputs.ref }}
@@ -84,7 +88,7 @@ runs:
         exit 1
 
     - name: Find the latest built spiced commit (Windows)
-      if: ${{ !inputs.spiced_commit && runner.os == 'Windows' }}
+      if: ${{ !inputs.spiced_commit && !inputs.spiced_version && runner.os == 'Windows' }}
       shell: pwsh
       run: |
         $ErrorActionPreference = 'Stop'
@@ -119,16 +123,32 @@ runs:
 
     - name: Set SPICED_COMMIT from workflow input (Linux/macOS)
       shell: bash
-      if: ${{ inputs.spiced_commit && runner.os != 'Windows' }}
+      if: ${{ inputs.spiced_commit && !inputs.spiced_version && runner.os != 'Windows' }}
       run: |
         echo "SPICED_COMMIT=${{ inputs.spiced_commit }}" >> $GITHUB_ENV
 
     - name: Set SPICED_COMMIT from workflow input (Windows)
       shell: pwsh
-      if: ${{ inputs.spiced_commit && runner.os == 'Windows' }}
+      if: ${{ inputs.spiced_commit && !inputs.spiced_version && runner.os == 'Windows' }}
       run: |
         $ErrorActionPreference = 'Stop'
         echo "SPICED_COMMIT=${{ inputs.spiced_commit }}" >> $env:GITHUB_ENV
+
+    - name: Set SPICED_COMMIT from release version (Linux/macOS)
+      shell: bash
+      if: ${{ inputs.spiced_version && runner.os != 'Windows' }}
+      run: |
+        version="${{ inputs.spiced_version }}"
+        version="${version#v}"
+        echo "SPICED_COMMIT=v${version}" >> $GITHUB_ENV
+
+    - name: Set SPICED_COMMIT from release version (Windows)
+      shell: pwsh
+      if: ${{ inputs.spiced_version && runner.os == 'Windows' }}
+      run: |
+        $ErrorActionPreference = 'Stop'
+        $version = "${{ inputs.spiced_version }}" -replace '^v', ''
+        echo "SPICED_COMMIT=v$version" >> $env:GITHUB_ENV
 
     - name: Output SPICED_COMMIT (Linux/macOS)
       id: output_spiced_commit
@@ -145,7 +165,7 @@ runs:
         echo "SPICED_COMMIT=$env:SPICED_COMMIT" >> $env:GITHUB_OUTPUT
 
     - name: Download spiced from MinIO (Linux/macOS)
-      if: runner.os != 'Windows'
+      if: ${{ !inputs.spiced_version && runner.os != 'Windows' }}
       shell: bash
       run: |
         if [[ "${{ inputs.with_odbc }}" == "true" ]]; then
@@ -159,8 +179,40 @@ runs:
         tar -xzf spiced_${features}${PLATFORM}.${EXT}
         sudo cp ./spiced /usr/local/bin/spiced
 
+    - name: Download spiced from GitHub release (Linux/macOS)
+      if: ${{ inputs.spiced_version && runner.os != 'Windows' }}
+      shell: bash
+      run: |
+        version="${{ inputs.spiced_version }}"
+        version="${version#v}"
+        PLATFORM="${{ steps.platform.outputs.os }}_${{ steps.platform.outputs.arch }}"
+        EXT="${{ steps.platform.outputs.ext }}"
+        asset="spiced_${PLATFORM}.${EXT}"
+        url="https://github.com/spiceai/spiceai/releases/download/v${version}/${asset}"
+        echo "Downloading ${url}"
+        curl -fsSL -o "${asset}" "${url}"
+        tar -xzf "${asset}"
+        sudo cp ./spiced /usr/local/bin/spiced
+
+    - name: Download spiced from GitHub release (Windows)
+      if: ${{ inputs.spiced_version && runner.os == 'Windows' }}
+      shell: pwsh
+      run: |
+        $ErrorActionPreference = 'Stop'
+        $version = "${{ inputs.spiced_version }}" -replace '^v', ''
+        $platform = "${{ steps.platform-windows.outputs.os }}_${{ steps.platform-windows.outputs.arch }}"
+        $ext = "${{ steps.platform-windows.outputs.ext }}"
+        $asset = "spiced.exe_$platform.$ext"
+        $url = "https://github.com/spiceai/spiceai/releases/download/v$version/$asset"
+        Invoke-WebRequest -Uri $url -OutFile $asset
+        tar -xzf $asset
+        $spicedDir = "$env:USERPROFILE\spiced"
+        New-Item -ItemType Directory -Force -Path $spicedDir | Out-Null
+        Copy-Item -Path .\spiced.exe -Destination "$spicedDir\spiced.exe"
+        echo "$spicedDir" >> $env:GITHUB_PATH
+
     - name: Download spiced from MinIO (Windows)
-      if: runner.os == 'Windows'
+      if: ${{ !inputs.spiced_version && runner.os == 'Windows' }}
       shell: pwsh
       run: |
         $ErrorActionPreference = 'Stop'

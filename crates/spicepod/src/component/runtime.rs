@@ -569,7 +569,10 @@ pub struct TaskHistory {
     #[serde(default = "default_none")]
     #[cfg_attr(feature = "schemars", schemars(with = "String"))]
     pub captured_output: Arc<str>,
-    #[serde(default = "default_truncated")]
+    #[serde(
+        default = "default_truncated",
+        skip_serializing_if = "is_default_truncated"
+    )]
     #[cfg_attr(feature = "schemars", schemars(with = "TaskHistoryCapturedContext"))]
     pub captured_context: Arc<str>,
     #[serde(default = "default_retention_period")]
@@ -595,6 +598,10 @@ fn default_none() -> Arc<str> {
 
 fn default_truncated() -> Arc<str> {
     "truncated".into()
+}
+
+fn is_default_truncated(value: &Arc<str>) -> bool {
+    value.as_ref() == "truncated"
 }
 
 fn default_retention_period() -> Arc<str> {

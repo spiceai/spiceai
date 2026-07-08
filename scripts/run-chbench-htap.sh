@@ -19,6 +19,7 @@
 #   DURATION=300           steady-state workload seconds
 #   READY=2400             max seconds to wait for spiced to become ready
 #   SPICEPOD=test/spicepods/chbench/accelerated/postgres-cayenne[file]-cdc-tuned-sf100.yaml
+#   CDC_MODE=native        set to debezium to launch Redpanda/Debezium for v1.11.x spiced
 #   SPICED=target/debug/spiced          path to the spiced binary
 #   TESTOP=target/debug/testoperator    path to the testoperator binary
 #   OUTDIR=/tmp/chbench-<sf>             telemetry output directory
@@ -49,6 +50,7 @@ CONCURRENCY="${CONCURRENCY:-}"  # OLAP query threads; empty = testoperator defau
 SKIP_PREPARE="${SKIP_PREPARE:-}"  # non-empty => reuse an already-seeded source
                                   # (testoperator --skip-prepare); SF must match.
 SPICEPOD="${SPICEPOD:-test/spicepods/chbench/accelerated/postgres-cayenne[file]-cdc-tuned-sf100.yaml}"
+CDC_MODE="${CDC_MODE:-native}"
 SPICED="${SPICED:-target/debug/spiced}"
 TESTOP="${TESTOP:-target/debug/testoperator}"
 OUTDIR="${OUTDIR:-/tmp/chbench-sf${SF}}"
@@ -151,12 +153,13 @@ if [ -n "$OLTP_SAMPLE_OK" ]; then
   OLTP_PID=$!
 fi
 
-echo "Running CH-benCH HTAP: SF=$SF duration=${DURATION}s ready-wait=${READY}s -> $OUTDIR"
+echo "Running CH-benCH HTAP: SF=$SF duration=${DURATION}s ready-wait=${READY}s cdc-mode=${CDC_MODE} -> $OUTDIR"
 # Pipe output to terminal and to file
 SPICED_LOG="$SPICED_LOG" "$TESTOP" run htap \
   -p "$SPICEPOD" -s "$REPO_ROOT/$SPICED" \
   --query-set chbench --scale-factor "$SF" --validate \
   --ready-wait "$READY" --duration "$DURATION" \
+  --cdc-mode "$CDC_MODE" \
   ${TERMINALS:+--terminals "$TERMINALS"} \
   ${CONCURRENCY:+--concurrency "$CONCURRENCY"} \
   ${SKIP_PREPARE:+--skip-prepare} \
