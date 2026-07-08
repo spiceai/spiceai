@@ -11,7 +11,7 @@ expression: resp?
   {
     "id": 1015,
     "answer": "Pedunculagin and alchemillin have astringent and wound-healing properties, possibly due to their high tannin content.",
-    "_score": 0.31
+    "_score": 0.3
   },
   {
     "id": 1035,
