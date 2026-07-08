@@ -1168,7 +1168,9 @@ async fn run_pump(source: Arc<SharedSource>) {
                 }
                 ReplicationEvent::XLogData { data, wal_end, .. } => {
                     max_wal_end = max_wal_end.max(wal_end.0);
-                    let msg = match decoder.decode(&data) {
+                    // Zero-copy decode: hand the owned `Bytes` frame to the decoder
+                    // (values become refcounted slices of it), not a borrow.
+                    let msg = match decoder.decode(data) {
                         Ok(m) => m,
                         Err(e) => {
                             source.for_each_member_metrics(
@@ -1627,6 +1629,7 @@ mod tests {
             bootstrap_batch_size: 8192,
             shared: true,
             member_channel_capacity: DEFAULT_MEMBER_CHANNEL_CAPACITY,
+            pg_output_format: crate::postgres_replication::PgOutputFormat::Binary,
         }
     }
 

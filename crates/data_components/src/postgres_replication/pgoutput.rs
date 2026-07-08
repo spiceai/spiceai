@@ -23,7 +23,7 @@ limitations under the License.
 
 use std::collections::HashMap;
 
-use bytes::Buf;
+use bytes::{Buf, Bytes};
 use snafu::ensure;
 
 use super::{PgOutputDecodeSnafu, Result};
@@ -93,13 +93,25 @@ pub struct TupleData {
     pub columns: Vec<Option<Value>>,
 }
 
+/// A single column value, carried as a zero-copy [`Bytes`] slice of the
+/// originating `XLogData` frame.
+///
+/// The decoder does not copy or validate value payloads: text values keep
+/// their raw (unvalidated) bytes and binary values keep their `send`-format
+/// bytes. Interpretation (UTF-8 validation, integer/temporal/numeric parsing,
+/// binary `FromSql` decoding) happens once, downstream, when a value is
+/// appended into its typed Arrow builder. Because `Bytes` is refcounted, a
+/// whole transaction's worth of buffered tuples holds only slices of the
+/// underlying frame buffers alive — no per-column heap allocation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Value {
-    /// Text-format representation (pgoutput emits text for most types).
-    Text(String),
-    /// Binary-format payload for columns with `TYPE_OID` emitting binary.
-    Binary(Vec<u8>),
-    /// TOAST column that was not changed in the UPDATE.
+    /// Text-format payload (pgoutput tuple tag `t`). Raw, not yet UTF-8
+    /// validated.
+    Text(Bytes),
+    /// Binary-format payload (pgoutput tuple tag `b`) — the type's `send`
+    /// wire form. Also used for `bytea` under the text protocol.
+    Binary(Bytes),
+    /// TOAST column that was not changed in the UPDATE (tuple tag `u`).
     Unchanged,
 }
 
@@ -145,7 +157,10 @@ impl Decoder {
     /// Decode a single pgoutput message. If it's a `Relation`, the decoder
     /// caches it internally so later Insert/Update/Delete messages can refer
     /// to it.
-    pub fn decode(&mut self, mut buf: &[u8]) -> Result<DecodedMessage> {
+    ///
+    /// Takes the `XLogData` payload as an owned [`Bytes`]; tuple values are
+    /// peeled out as zero-copy sub-slices of it (see [`Value`]).
+    pub fn decode(&mut self, mut buf: Bytes) -> Result<DecodedMessage> {
         ensure!(
             buf.remaining() >= 1,
             PgOutputDecodeSnafu {
@@ -177,7 +192,7 @@ impl Decoder {
     }
 }
 
-fn decode_begin(buf: &mut &[u8]) -> Result<DecodedMessage> {
+fn decode_begin(buf: &mut Bytes) -> Result<DecodedMessage> {
     ensure!(
         buf.remaining() >= 8 + 8 + 4,
         PgOutputDecodeSnafu {
@@ -194,7 +209,7 @@ fn decode_begin(buf: &mut &[u8]) -> Result<DecodedMessage> {
     })
 }
 
-fn decode_commit(buf: &mut &[u8]) -> Result<DecodedMessage> {
+fn decode_commit(buf: &mut Bytes) -> Result<DecodedMessage> {
     ensure!(
         buf.remaining() >= 1 + 8 + 8 + 8,
         PgOutputDecodeSnafu {
@@ -212,7 +227,7 @@ fn decode_commit(buf: &mut &[u8]) -> Result<DecodedMessage> {
     })
 }
 
-fn decode_relation(buf: &mut &[u8]) -> Result<Relation> {
+fn decode_relation(buf: &mut Bytes) -> Result<Relation> {
     ensure!(
         buf.remaining() >= 4,
         PgOutputDecodeSnafu {
@@ -264,7 +279,7 @@ fn decode_relation(buf: &mut &[u8]) -> Result<Relation> {
     })
 }
 
-fn decode_insert(buf: &mut &[u8]) -> Result<DecodedMessage> {
+fn decode_insert(buf: &mut Bytes) -> Result<DecodedMessage> {
     ensure!(
         buf.remaining() > 4,
         PgOutputDecodeSnafu {
@@ -283,7 +298,7 @@ fn decode_insert(buf: &mut &[u8]) -> Result<DecodedMessage> {
     Ok(DecodedMessage::Insert { relation_id, tuple })
 }
 
-fn decode_update(buf: &mut &[u8]) -> Result<DecodedMessage> {
+fn decode_update(buf: &mut Bytes) -> Result<DecodedMessage> {
     ensure!(
         buf.remaining() > 4,
         PgOutputDecodeSnafu {
@@ -322,7 +337,7 @@ fn decode_update(buf: &mut &[u8]) -> Result<DecodedMessage> {
     }
 }
 
-fn decode_delete(buf: &mut &[u8]) -> Result<DecodedMessage> {
+fn decode_delete(buf: &mut Bytes) -> Result<DecodedMessage> {
     ensure!(
         buf.remaining() > 4,
         PgOutputDecodeSnafu {
@@ -341,7 +356,7 @@ fn decode_delete(buf: &mut &[u8]) -> Result<DecodedMessage> {
     Ok(DecodedMessage::Delete { relation_id, old })
 }
 
-fn decode_truncate(buf: &mut &[u8]) -> Result<DecodedMessage> {
+fn decode_truncate(buf: &mut Bytes) -> Result<DecodedMessage> {
     ensure!(
         buf.remaining() > 4,
         PgOutputDecodeSnafu {
@@ -366,7 +381,7 @@ fn decode_truncate(buf: &mut &[u8]) -> Result<DecodedMessage> {
     Ok(DecodedMessage::Truncate { relation_ids })
 }
 
-fn read_tuple(buf: &mut &[u8]) -> Result<TupleData> {
+fn read_tuple(buf: &mut Bytes) -> Result<TupleData> {
     ensure!(
         buf.remaining() >= 2,
         PgOutputDecodeSnafu {
@@ -386,46 +401,30 @@ fn read_tuple(buf: &mut &[u8]) -> Result<TupleData> {
         match tag {
             b'n' => columns.push(None),
             b'u' => columns.push(Some(Value::Unchanged)),
-            b't' => {
+            // `t` (text) and `b` (binary) differ only in how the downstream
+            // Arrow builder interprets the payload. Both peel a length-prefixed
+            // slice off `buf` with zero copy: `<Bytes as Buf>::copy_to_bytes`
+            // is a refcount bump + range advance, no allocation or UTF-8 check.
+            b't' | b'b' => {
                 ensure!(
                     buf.remaining() >= 4,
                     PgOutputDecodeSnafu {
-                        message: "short Tuple text length".to_string()
+                        message: "short Tuple value length".to_string()
                     }
                 );
                 let len = buf.get_u32() as usize;
                 ensure!(
                     buf.remaining() >= len,
                     PgOutputDecodeSnafu {
-                        message: "short Tuple text body".to_string()
+                        message: "short Tuple value body".to_string()
                     }
                 );
-                let bytes = &buf[..len];
-                let s = std::str::from_utf8(bytes)
-                    .map_err(|e| super::Error::PgOutputDecode {
-                        message: format!("invalid utf8: {e}"),
-                    })?
-                    .to_string();
-                buf.advance(len);
-                columns.push(Some(Value::Text(s)));
-            }
-            b'b' => {
-                ensure!(
-                    buf.remaining() >= 4,
-                    PgOutputDecodeSnafu {
-                        message: "short Tuple binary length".to_string()
-                    }
-                );
-                let len = buf.get_u32() as usize;
-                ensure!(
-                    buf.remaining() >= len,
-                    PgOutputDecodeSnafu {
-                        message: "short Tuple binary body".to_string()
-                    }
-                );
-                let bytes = buf[..len].to_vec();
-                buf.advance(len);
-                columns.push(Some(Value::Binary(bytes)));
+                let bytes = buf.copy_to_bytes(len);
+                columns.push(Some(if tag == b't' {
+                    Value::Text(bytes)
+                } else {
+                    Value::Binary(bytes)
+                }));
             }
             other => {
                 return PgOutputDecodeSnafu {
@@ -438,14 +437,16 @@ fn read_tuple(buf: &mut &[u8]) -> Result<TupleData> {
     Ok(TupleData { columns })
 }
 
-fn read_cstring(buf: &mut &[u8]) -> Result<String> {
-    let nul = buf
-        .iter()
-        .position(|b| *b == 0)
-        .ok_or_else(|| super::Error::PgOutputDecode {
-            message: "unterminated cstring".to_string(),
-        })?;
-    let s = std::str::from_utf8(&buf[..nul])
+fn read_cstring(buf: &mut Bytes) -> Result<String> {
+    // `Bytes` is contiguous, so `chunk()` exposes the whole remaining slice.
+    let nul =
+        buf.chunk()
+            .iter()
+            .position(|b| *b == 0)
+            .ok_or_else(|| super::Error::PgOutputDecode {
+                message: "unterminated cstring".to_string(),
+            })?;
+    let s = std::str::from_utf8(&buf.chunk()[..nul])
         .map_err(|e| super::Error::PgOutputDecode {
             message: format!("invalid utf8 in cstring: {e}"),
         })?
@@ -502,7 +503,7 @@ mod tests {
         begin.extend_from_slice(&0x1234u64.to_be_bytes());
         begin.extend_from_slice(&7i64.to_be_bytes());
         begin.extend_from_slice(&11u32.to_be_bytes());
-        match decoder.decode(&begin).expect("decode begin") {
+        match decoder.decode(Bytes::from(begin)).expect("decode begin") {
             DecodedMessage::Begin {
                 final_lsn,
                 commit_ts,
@@ -520,7 +521,7 @@ mod tests {
     fn decode_relation_inserts_into_cache() {
         let mut decoder = Decoder::new();
         let buf = build_relation_fixture();
-        let rel = match decoder.decode(&buf).expect("decode relation") {
+        let rel = match decoder.decode(Bytes::from(buf)).expect("decode relation") {
             DecodedMessage::Relation(r) => r,
             other => panic!("unexpected: {other:?}"),
         };
@@ -539,7 +540,7 @@ mod tests {
     fn decode_insert_basic() {
         let mut decoder = Decoder::new();
         let buf = build_insert_fixture();
-        let msg = decoder.decode(&buf).expect("decode insert");
+        let msg = decoder.decode(Bytes::from(buf)).expect("decode insert");
         let DecodedMessage::Insert { relation_id, tuple } = msg else {
             panic!("expected Insert")
         };
@@ -562,7 +563,8 @@ mod tests {
         buf.push(b'7');
         // col 1: null
         buf.push(b'n');
-        let DecodedMessage::Delete { relation_id, old } = decoder.decode(&buf).expect("decode")
+        let DecodedMessage::Delete { relation_id, old } =
+            decoder.decode(Bytes::from(buf)).expect("decode")
         else {
             panic!("expected Delete")
         };
@@ -586,7 +588,7 @@ mod tests {
             relation_id,
             old,
             new,
-        } = decoder.decode(&buf).expect("decode")
+        } = decoder.decode(Bytes::from(buf)).expect("decode")
         else {
             panic!("expected Update")
         };
@@ -613,7 +615,9 @@ mod tests {
         buf.push(b't');
         buf.extend_from_slice(&1u32.to_be_bytes());
         buf.push(b'9');
-        let DecodedMessage::Update { old, new, .. } = decoder.decode(&buf).expect("decode") else {
+        let DecodedMessage::Update { old, new, .. } =
+            decoder.decode(Bytes::from(buf)).expect("decode")
+        else {
             panic!("expected Update")
         };
         let old = old.expect("old tuple should be present");
@@ -629,7 +633,8 @@ mod tests {
         buf.push(0x00);
         buf.extend_from_slice(&42u32.to_be_bytes());
         buf.extend_from_slice(&43u32.to_be_bytes());
-        let DecodedMessage::Truncate { relation_ids } = decoder.decode(&buf).expect("decode")
+        let DecodedMessage::Truncate { relation_ids } =
+            decoder.decode(Bytes::from(buf)).expect("decode")
         else {
             panic!("expected Truncate")
         };
@@ -648,7 +653,7 @@ mod tests {
         buf.push(0x00); // flags
         buf.extend_from_slice(&42u32.to_be_bytes()); // only one relation id actually present
         decoder
-            .decode(&buf)
+            .decode(Bytes::from(buf))
             .expect_err("oversized truncate nrel should error, not over-allocate");
     }
 
@@ -656,6 +661,8 @@ mod tests {
     fn decode_unknown_message_type_errors() {
         let mut decoder = Decoder::new();
         let buf = [b'Z', 0, 0, 0];
-        decoder.decode(&buf).expect_err("unknown message type");
+        decoder
+            .decode(Bytes::copy_from_slice(&buf))
+            .expect_err("unknown message type");
     }
 }

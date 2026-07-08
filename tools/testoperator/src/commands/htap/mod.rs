@@ -43,12 +43,20 @@ use test_framework::{
 };
 
 use crate::{
-    args::HtapArgs, commands::bench::prepare_chbench_source, health::HealthMonitor,
+    args::{HtapArgs, SourceType},
+    commands::bench::prepare_chbench_source,
+    health::HealthMonitor,
     spiced_metrics::MetricsScraper,
 };
 
 pub(crate) async fn run(args: &HtapArgs) -> anyhow::Result<()> {
     let test_args = &args.test_args;
+    // spiced names replication metrics per source connector; select the prefix
+    // matching the configured source so scraping picks up the right series.
+    let replication_engine = match test_args.source_type {
+        SourceType::Postgres => "postgres",
+        SourceType::Mysql => "mysql",
+    };
     let (app, mut start_request) = super::get_app_and_start_request(&test_args.common).await?;
 
     let query_set = test_args.load_query_set()?;
@@ -71,9 +79,14 @@ pub(crate) async fn run(args: &HtapArgs) -> anyhow::Result<()> {
     #[expect(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
     let terminals = args.terminals.unwrap_or((scale_factor * 10.0) as usize);
     let duration = Duration::from_secs(test_args.common.duration);
-    let driver: Arc<dyn chbench_driver::ChBenchDriver> = Arc::new(
-        prepare_chbench_source(scale_factor, terminals, args.rate, args.skip_prepare).await?,
-    );
+    let driver: Arc<dyn chbench_driver::ChBenchDriver> = prepare_chbench_source(
+        scale_factor,
+        terminals,
+        args.rate,
+        args.skip_prepare,
+        test_args.source_type,
+    )
+    .await?;
 
     // --prepare-only: the source is now seeded; exit before starting spiced so
     // an external harness can snapshot the pristine source (e.g. to a Postgres
@@ -358,7 +371,13 @@ pub(crate) async fn run(args: &HtapArgs) -> anyhow::Result<()> {
     // Apply-phase coverage violations (populated below), gated at the end of the run.
     let mut coverage_violations: Vec<(String, f64)> = Vec::new();
     if let Some(metrics) = &spiced_metrics {
-        reporting::emit_replication_metrics(metrics, &pg_stats, "under load", true);
+        reporting::emit_replication_metrics(
+            metrics,
+            replication_engine,
+            &pg_stats,
+            "under load",
+            true,
+        );
         // For Cayenne backend report additional metrics
         reporting::emit_cayenne_read_amp_percentiles(metrics);
         // Localize CDC backpressure across the pipeline stages (prefetch channel,
@@ -432,6 +451,7 @@ pub(crate) async fn run(args: &HtapArgs) -> anyhow::Result<()> {
                             crate::pg_stats::PgStatsScraper::sample_once_now().await;
                         reporting::emit_replication_metrics(
                             &metrics,
+                            replication_engine,
                             &fresh_pg_stats,
                             "post-drain re-scrape",
                             false,

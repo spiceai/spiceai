@@ -28,8 +28,8 @@ use std::time::Duration;
 use async_stream::try_stream;
 use data_components::cdc::{ChangesStream, StreamError};
 use data_components::postgres_replication::{
-    ReplicationMetrics, ReplicationMetricsCollector, ReplicationParams, ReplicationStreamInput,
-    SchemaEvolutionPolicy, config, start_replication_stream_with_policy,
+    PgOutputFormat, ReplicationMetrics, ReplicationMetricsCollector, ReplicationParams,
+    ReplicationStreamInput, SchemaEvolutionPolicy, config, start_replication_stream_with_policy,
 };
 use datafusion::sql::TableReference;
 use futures::StreamExt;
@@ -697,6 +697,10 @@ fn replication_params_from_connector_params(
         bootstrap_batch_size,
         shared,
         member_channel_capacity,
+        // Binary pgoutput on every stream — faster decode, no source-side text
+        // formatting. Not a user-facing parameter; the per-column text fallback
+        // still handles types Postgres emits as text.
+        pg_output_format: PgOutputFormat::Binary,
     })
 }
 

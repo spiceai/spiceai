@@ -38,7 +38,7 @@ use arrow::array::{Array, AsArray};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use data_components::cdc::{ChangeEnvelope, ChangesStream};
 use data_components::postgres_replication::{
-    ReplicationMetricsCollector, ReplicationParams, ReplicationStreamInput, config,
+    PgOutputFormat, ReplicationMetricsCollector, ReplicationParams, ReplicationStreamInput, config,
     start_replication_stream,
 };
 use futures::StreamExt;
@@ -82,6 +82,7 @@ fn shared_params(port: u16) -> ReplicationParams {
         shared: true,
         member_channel_capacity:
             data_components::postgres_replication::shared::DEFAULT_MEMBER_CHANNEL_CAPACITY,
+        pg_output_format: PgOutputFormat::Binary,
     }
 }
 
