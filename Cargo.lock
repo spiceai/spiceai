@@ -3705,6 +3705,7 @@ dependencies = [
  "datafusion-table-providers",
  "futures",
  "governor",
+ "mysql_async",
  "rand 0.10.1",
  "secrecy",
  "snafu",
