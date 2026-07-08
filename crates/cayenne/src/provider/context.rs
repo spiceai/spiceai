@@ -26,7 +26,9 @@ use vortex_datafusion::{ProjectionPushdown, VortexFormat, VortexTableOptions, Wr
 use vortex_session::VortexSession;
 
 use super::tuning::{self, ActuatorValues, IngestStats, LiveActuators, TuningBounds};
-use crate::metadata::{DeletionMode, DeltaEncoding, PkConflictDetection, VortexConfig};
+use crate::metadata::{
+    DeletionMode, DeltaEncoding, PkConflictDetection, StorageClass, VortexConfig,
+};
 
 /// Shared context for Cayenne table operations.
 ///
@@ -717,6 +719,15 @@ impl CayenneContext {
     #[cfg(test)]
     pub(crate) fn set_mem_pressure_for_test(&self, fraction: f64) {
         self.ingest_stats.set_mem_pressure(fraction);
+    }
+
+    /// The detected storage medium backing this table's data files (from the
+    /// runtime's acceleration-storage detection at registration, or the operator's
+    /// `storage` param). A cheap field read — the compaction writer's tier gate
+    /// uses it without building a full [`Self::ingest_snapshot`].
+    #[must_use]
+    pub(crate) fn data_storage_class(&self) -> StorageClass {
+        self.config.data_storage_class
     }
 
     /// A snapshot of the current ingest accounting (rate + response), enriched with
