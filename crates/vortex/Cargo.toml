@@ -39,9 +39,15 @@ vortex-utils = { workspace = true, features = ["dashmap"] }
 
 [dev-dependencies]
 anyhow = { workspace = true }
+criterion = { version = "0.7", features = ["html_reports", "async_tokio"] }
 datafusion = { workspace = true }
+datafusion-common = { workspace = true }
 insta = { workspace = true }
 rstest = "0.26.1"
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["test-util", "rt-multi-thread", "fs"] }
 url = { workspace = true }
+
+[[bench]]
+harness = false
+name = "filter_pushdown_not"
