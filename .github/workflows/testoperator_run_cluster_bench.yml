@@ -281,6 +281,10 @@ jobs:
           AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_ICEBERG_SECRET_ACCESS_KEY }}
           AWS_REGION: us-east-1
           AWS_DEFAULT_REGION: us-east-1
+          # Land the spidapter cluster app on the dedicated private spicehq nodegroup
+          # (adds tags.organization=spicehq); without it the app schedules on the
+          # shared default nodegroup.
+          SPIDAPTER_ORGANIZATION_TAG: spicehq
           SCHEDULER_STATE_LOCATION: 's3://spiceai-testing-cluster-state/testoperator-cluster-bench-${{ github.run_id }}/'
           SPICEAI_BENCHMARK_METRICS_KEY: ${{ secrets.SPICEAI_BENCHMARK_METRICS_KEY }}
           EXECUTOR_REPLICAS: ${{ env.CB_EXECUTOR_REPLICAS }}
