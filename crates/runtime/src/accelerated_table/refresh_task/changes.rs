@@ -304,8 +304,8 @@ impl CdcInsertPlanCache {
 struct ApplyContext<'a> {
     refresh_sql: Option<&'a str>,
     dataset_name: &'a TableReference,
-    /// Prebuilt per-dataset metric labels reused by the apply-loop record sites
-    /// (see [`DatasetMetricLabels`]). Always `&self.dataset_metric_labels`.
+    /// Prebuilt per-dataset metric labels reused by hot record sites in the apply loop
+    /// (see [`DatasetMetricLabels`]).
     metric_labels: &'a DatasetMetricLabels,
     caching: Option<&'a Weak<Caching>>,
     ready_sender: Option<&'a Arc<Notify>>,
