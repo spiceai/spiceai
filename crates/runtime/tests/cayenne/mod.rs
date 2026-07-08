@@ -2074,8 +2074,8 @@ async fn query_single_i64(rt: &Runtime, sql: &str) -> Result<i64, String> {
 /// Runs against real S3 (bucket [`DATALAKE_TEST_BUCKET`]) with a few KB of
 /// transfer per run. Credentials: `AWS_SNAPSHOT_KEY`/`AWS_SNAPSHOT_SECRET`
 /// (already provisioned in the integration-test CI environment; the same pair
-/// the snapshot-refresh tests use). Skips with a notice when unset, so the
-/// test is safe to run un-ignored in the regular integration suite.
+/// the snapshot-refresh tests use). FAILS when the credentials are missing —
+/// a silent skip would read as coverage that doesn't exist.
 #[tokio::test]
 async fn test_cayenne_datalake_tier_e2e() -> Result<(), String> {
     let _tracing = init_tracing(Some("integration=debug,info"));
@@ -2085,16 +2085,16 @@ async fn test_cayenne_datalake_tier_e2e() -> Result<(), String> {
         std::env::var("AWS_SNAPSHOT_KEY"),
         std::env::var("AWS_SNAPSHOT_SECRET"),
     ) else {
-        eprintln!(
-            "skipping test_cayenne_datalake_tier_e2e: AWS_SNAPSHOT_KEY/AWS_SNAPSHOT_SECRET not set"
+        return Err(
+            "AWS_SNAPSHOT_KEY/AWS_SNAPSHOT_SECRET must be set (read/write on the integration-test bucket)"
+                .to_string(),
         );
-        return Ok(());
     };
     if key.is_empty() || secret.is_empty() {
-        eprintln!(
-            "skipping test_cayenne_datalake_tier_e2e: AWS_SNAPSHOT_KEY/AWS_SNAPSHOT_SECRET empty"
+        return Err(
+            "AWS_SNAPSHOT_KEY/AWS_SNAPSHOT_SECRET must be non-empty (read/write on the integration-test bucket)"
+                .to_string(),
         );
-        return Ok(());
     }
 
     test_request_context()
