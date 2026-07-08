@@ -913,8 +913,7 @@ impl RunSummary {
             let _ = writeln!(out, "\n### Per-query latency\n");
             let _ = writeln!(
                 out,
-                "| Query | Status | Iterations | Median (ms) | P90 (ms) | P99 (ms) |\n\
-                 | --- | --- | --- | --- | --- | --- |",
+                "| Query | Status | Iterations | Median (ms) | P90 (ms) | P99 (ms) |\n| --- | --- | --- | --- | --- | --- |",
             );
             for q in &self.queries {
                 let status = if q.passed { "✅" } else { "❌" };
