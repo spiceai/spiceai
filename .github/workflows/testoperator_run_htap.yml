@@ -8,6 +8,15 @@ on:
         description: 'spiced build commit'
         required: false
         type: string
+      spiced_ref:
+        description: 'Ref to search for a recent spiced build when spiced_commit is empty'
+        required: false
+        type: string
+        default: 'refs/heads/trunk'
+      spiced_version:
+        description: 'Official spiced release version to download from GitHub Releases (e.g. 1.11.6)'
+        required: false
+        type: string
       spicepod_path:
         description: 'The spicepod file to test with (relative to test/spicepods/chbench/)'
         required: true
@@ -43,6 +52,14 @@ on:
         options:
           - ''
           - 'duckdb'
+      cdc_mode:
+        description: 'CDC path for CH-benCH changes-mode tables'
+        required: false
+        type: choice
+        default: 'native'
+        options:
+          - 'native'
+          - 'debezium'
       ready_wait:
         description: 'How long (in seconds) to wait for spiced to start'
         required: true
@@ -116,6 +133,8 @@ jobs:
         id: setup-spiced
         with:
           spiced_commit: ${{ github.event.inputs.spiced_commit }}
+          spiced_version: ${{ github.event.inputs.spiced_version }}
+          ref: ${{ github.event.inputs.spiced_ref }}
 
       - name: Display spiced commit
         run: echo "SPICED_COMMIT=${{ steps.setup-spiced.outputs.SPICED_COMMIT }}"
@@ -130,7 +149,8 @@ jobs:
             echo ""
             echo "| Parameter | Value |"
             echo "| --- | --- |"
-            echo "| spiced commit | \`${{ steps.setup-spiced.outputs.SPICED_COMMIT }}\` |"
+            echo "| spiced commit/version | \`${{ steps.setup-spiced.outputs.SPICED_COMMIT }}\` |"
+            echo "| spiced ref | \`${{ github.event.inputs.spiced_ref }}\` |"
             echo "| testoperator commit | \`${{ github.sha }}\` |"
             echo "| spicepod | \`${{ github.event.inputs.spicepod_path }}\` |"
             echo "| scale factor (warehouses) | ${{ github.event.inputs.scale_factor }} |"
@@ -139,6 +159,7 @@ jobs:
             echo "| duration (s) | ${{ github.event.inputs.duration }} |"
             echo "| analytical concurrency | ${{ github.event.inputs.concurrency }} |"
             echo "| query overrides | ${{ github.event.inputs.query_overrides || 'none' }} |"
+            echo "| CDC mode | ${{ github.event.inputs.cdc_mode }} |"
             echo "| runner | ${{ github.event.inputs.runner_type }} |"
           } >> "$GITHUB_STEP_SUMMARY"
 
@@ -214,6 +235,7 @@ jobs:
             --duration ${{ github.event.inputs.duration }} \
             --concurrency ${{ github.event.inputs.concurrency }} \
             ${{ github.event.inputs.query_overrides != '' && format('--query-overrides {0}', github.event.inputs.query_overrides) || '' }} \
+            --cdc-mode ${{ github.event.inputs.cdc_mode }} \
             --ready-wait ${{ github.event.inputs.ready_wait }} \
             ${{ github.event.inputs.runner_type == 'spiceai-dev-xlarge-runners' && '--skip-prepare' || '' }} \
             --disable-progress-bars \
@@ -236,6 +258,7 @@ jobs:
           SPICED_COMMIT: ${{ steps.setup-spiced.outputs.SPICED_COMMIT }}
           # Dedicated in-cluster PG pod on xlarge; per-run docker container (loopback) elsewhere.
           CHBENCH_PG_HOST: ${{ github.event.inputs.runner_type == 'spiceai-dev-xlarge-runners' && 'chbench-postgres.dataplatform.svc.cluster.local' || '127.0.0.1' }}
+          CHBENCH_PG_PORT: '5432'
           # MinIO credentials for spiced, mirroring testoperator_run_bench.yml. Consumed only by
           # configs that reference the local S3 (`${secrets:S3_ENDPOINT}` etc.) — e.g. the Cayenne
           # cold-object-store-tier chbench config; harmless/unused for every other HTAP config.
@@ -283,6 +306,12 @@ jobs:
           if-no-files-found: warn
           retention-days: 30
 
+      - name: Clean up CH-benCH Debezium containers
+        if: always() && github.event.inputs.cdc_mode == 'debezium'
+        run: |
+          docker stop -t 30 chbench-debezium 2>/dev/null || true
+          docker rm -f chbench-debezium chbench-redpanda 2>/dev/null || true
+
       # The dedicated PG pod is long-lived and shared across runs, so a crashed
       # or cancelled run can leave inactive replication slots (which retain WAL
       # and eventually fill the disk) and orphaned publications. Drop any left
@@ -303,13 +332,13 @@ jobs:
           BEGIN
             FOR r IN
               SELECT slot_name FROM pg_replication_slots
-              WHERE slot_name LIKE 'spice_%' AND NOT active
+              WHERE (slot_name LIKE 'spice_%' OR slot_name LIKE 'chbench_%') AND NOT active
             LOOP
               RAISE NOTICE 'dropping replication slot %', r.slot_name;
               PERFORM pg_drop_replication_slot(r.slot_name);
             END LOOP;
             FOR r IN
-              SELECT pubname FROM pg_publication WHERE pubname LIKE 'spice_%'
+              SELECT pubname FROM pg_publication WHERE pubname LIKE 'spice_%' OR pubname LIKE 'chbench_%'
             LOOP
               RAISE NOTICE 'dropping publication %', r.pubname;
               EXECUTE format('DROP PUBLICATION IF EXISTS %I', r.pubname);

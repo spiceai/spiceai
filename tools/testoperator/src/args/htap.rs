@@ -16,9 +16,27 @@ limitations under the License.
 
 use std::path::PathBuf;
 
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 
 use super::DatasetTestArgs;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum HtapCdcMode {
+    /// Use the spicepod as-is. For current Postgres HTAP pods this is native Postgres CDC.
+    Native,
+    /// Start/register Debezium + Kafka and rewrite CH-benCH changes-mode datasets to Debezium topics.
+    Debezium,
+}
+
+impl HtapCdcMode {
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Native => "native",
+            Self::Debezium => "debezium",
+        }
+    }
+}
 
 /// Arguments for the HTAP (Hybrid Transactional/Analytical Processing) test.
 ///
@@ -63,6 +81,18 @@ pub struct HtapArgs {
     /// analysis consumes; CI uploads it as a workflow artifact.
     #[arg(long)]
     pub(crate) metrics_dump: Option<PathBuf>,
+
+    /// CDC source used for CH-benCH changes-mode tables. `native` keeps the spicepod
+    /// as-is (current Postgres CDC pods use native logical replication). `debezium`
+    /// launches/registers Debezium + Kafka and rewrites CH-benCH changes-mode datasets
+    /// to `debezium:<topic>` so older binaries (for example v1.11.x) can run the HTAP harness.
+    #[arg(long, value_enum, default_value_t = HtapCdcMode::Native)]
+    pub(crate) cdc_mode: HtapCdcMode,
+
+    /// In Debezium CDC mode, wait this many seconds for the initial Debezium snapshot
+    /// to catch up in Spice before starting the OLTP workload. Defaults to `--ready-wait`.
+    #[arg(long)]
+    pub(crate) debezium_bootstrap_wait: Option<u64>,
 
     /// Fail the run if any changes-mode table's apply-phase coverage (instrumented
     /// write-phase time ÷ apply-burst wall time) falls below this fraction (0.0–1.0).
