@@ -69,6 +69,20 @@ pub struct ReplicationClient {
     join: Option<JoinHandle<std::result::Result<(), PgWireError>>>,
 }
 
+/// Outcome of a non-blocking [`ReplicationClient::try_recv`].
+#[derive(Debug)]
+pub enum TryRecvEvent {
+    /// An event was immediately available in the worker's buffer.
+    Event(ReplicationEvent),
+    /// Nothing is buffered right now. The caller should fall back to the
+    /// awaiting [`ReplicationClient::recv`] to block until the next event.
+    Empty,
+    /// The worker has exited and its channel is drained. The caller should
+    /// call [`ReplicationClient::recv`] to observe the terminal result
+    /// (`Ok(None)` on a clean stop, `Err(_)` on failure).
+    Closed,
+}
+
 impl ReplicationClient {
     /// Connect to `PostgreSQL` and start streaming replication events.
     ///
@@ -132,6 +146,39 @@ impl ReplicationClient {
             Some(Ok(ev)) => Ok(Some(ev)),
             Some(Err(e)) => Err(e),
             None => self.handle_worker_shutdown().await,
+        }
+    }
+
+    /// Receive the next replication event without awaiting.
+    ///
+    /// Unlike [`recv`](Self::recv), this never yields to the runtime — it
+    /// returns immediately with whatever the worker has already buffered.
+    /// Consumers drain with `try_recv` in a tight loop and fall back to the
+    /// awaiting `recv` only when it reports [`TryRecvEvent::Empty`], avoiding a
+    /// per-message timer on the hot path.
+    ///
+    /// - `Ok(TryRecvEvent::Event(ev))` => an event was buffered
+    /// - `Ok(TryRecvEvent::Empty)`     => nothing buffered right now
+    /// - `Ok(TryRecvEvent::Closed)`    => worker exited; call
+    ///   [`recv`](Self::recv) for the terminal result
+    /// - `Err(e)`                      => the worker reported an error event
+    ///
+    /// Like `recv`, this only reads an in-process channel and so is cancel-safe
+    /// (there is nothing to await). It does not itself surface the worker's
+    /// terminal `Result`: on a drained/closed channel it returns `Closed` and
+    /// leaves the join handle intact for [`recv`](Self::recv) to reap.
+    ///
+    /// # Errors
+    ///
+    /// Returns the [`PgWireError`] the worker emitted if an error event is next
+    /// in the buffer (the same errors [`recv`](Self::recv) surfaces).
+    #[inline]
+    pub fn try_recv(&mut self) -> Result<TryRecvEvent> {
+        match self.rx.try_recv() {
+            Ok(Ok(ev)) => Ok(TryRecvEvent::Event(ev)),
+            Ok(Err(e)) => Err(e),
+            Err(mpsc::error::TryRecvError::Empty) => Ok(TryRecvEvent::Empty),
+            Err(mpsc::error::TryRecvError::Disconnected) => Ok(TryRecvEvent::Closed),
         }
     }
 
@@ -303,5 +350,68 @@ async fn run_worker(worker: &mut WorkerState, cfg: &ReplicationConfig) -> Result
         }
         let mut s = tcp;
         worker.run_on_stream(&mut s).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    impl ReplicationClient {
+        /// Build a client around a pre-populated channel and an inert worker
+        /// join handle, for exercising the `rx`-backed methods (`try_recv`,
+        /// `recv`) without a live Postgres connection.
+        fn for_test(
+            rx: ReplicationEventReceiver,
+            join: JoinHandle<std::result::Result<(), PgWireError>>,
+        ) -> Self {
+            let (stop_tx, _stop_rx) = watch::channel(false);
+            Self {
+                rx,
+                progress: Arc::new(SharedProgress::new(Lsn(0))),
+                stop_tx,
+                join: Some(join),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn try_recv_reports_event_empty_and_closed() {
+        let (tx, rx) = mpsc::channel(4);
+        let join = tokio::spawn(async { Ok(()) });
+        let mut client = ReplicationClient::for_test(rx, join);
+
+        // Nothing buffered yet.
+        assert!(matches!(client.try_recv(), Ok(TryRecvEvent::Empty)));
+
+        // A buffered event is drained without awaiting.
+        tx.send(Ok(ReplicationEvent::KeepAlive {
+            wal_end: Lsn(7),
+            reply_requested: false,
+            server_time_micros: 0,
+        }))
+        .await
+        .expect("send event");
+        match client.try_recv() {
+            Ok(TryRecvEvent::Event(ReplicationEvent::KeepAlive { wal_end, .. })) => {
+                assert_eq!(wal_end, Lsn(7));
+            }
+            other => panic!("expected a KeepAlive event, got {other:?}"),
+        }
+
+        // Drained again.
+        assert!(matches!(client.try_recv(), Ok(TryRecvEvent::Empty)));
+
+        // A worker error event surfaces as `Err`.
+        tx.send(Err(PgWireError::Internal("boom".into())))
+            .await
+            .expect("send err");
+        client
+            .try_recv()
+            .expect_err("a worker error event must surface as Err");
+
+        // Dropping the sender closes the channel → `Closed`.
+        drop(tx);
+        assert!(matches!(client.try_recv(), Ok(TryRecvEvent::Closed)));
     }
 }
