@@ -308,7 +308,10 @@ impl LazyChangeBatch {
         if let Some(batch) = self.built.into_inner() {
             return Ok(batch);
         }
-        let src = self.source.into_inner().context(DeferredBatchConsumedSnafu)?;
+        let src = self
+            .source
+            .into_inner()
+            .context(DeferredBatchConsumedSnafu)?;
         src.build()
     }
 
@@ -322,7 +325,10 @@ impl LazyChangeBatch {
         if let Some(b) = self.built.get() {
             return b.record.num_rows() == 0;
         }
-        self.source.lock().as_deref().is_none_or(ChangeRows::is_empty)
+        self.source
+            .lock()
+            .as_deref()
+            .is_none_or(ChangeRows::is_empty)
     }
 
     fn num_rows_hint(&self) -> usize {
@@ -339,7 +345,10 @@ impl LazyChangeBatch {
         if let Some(b) = self.built.get() {
             return b.record.get_array_memory_size();
         }
-        self.source.lock().as_deref().map_or(0, ChangeRows::encoded_len)
+        self.source
+            .lock()
+            .as_deref()
+            .map_or(0, ChangeRows::encoded_len)
     }
 
     fn source_commit_ts_ms(&self) -> Option<i64> {
@@ -1104,6 +1113,9 @@ mod deferred_tests {
         assert!(env.is_empty(), "zero-row batch is empty");
         assert_eq!(env.num_rows_hint(), 0);
         assert!(env.is_dataset_ready());
-        assert_eq!(env.change_batch().expect("already built").record.num_rows(), 0);
+        assert_eq!(
+            env.change_batch().expect("already built").record.num_rows(),
+            0
+        );
     }
 }

@@ -112,10 +112,7 @@ use bytes::Bytes;
 
 use super::{
     Error, ReplicationMetricsCollector, ReplicationStreamInput, Result, bootstrap,
-    changes::PgChangeRows,
-    client,
-    config::ReplicationParams,
-    pgoutput, resilience, slot,
+    changes::PgChangeRows, client, config::ReplicationParams, pgoutput, resilience, slot,
 };
 use rustc_hash::FxHashMap;
 
@@ -1240,8 +1237,11 @@ async fn run_pump(source: Arc<SharedSource>) {
                                     source.for_each_member_metrics(
                                         ReplicationMetricsCollector::inc_decode_error,
                                     );
-                                    fatal_broadcast(&source, format!("pgoutput decode failed: {e}"))
-                                        .await;
+                                    fatal_broadcast(
+                                        &source,
+                                        format!("pgoutput decode failed: {e}"),
+                                    )
+                                    .await;
                                     break 'reconnect;
                                 }
                             };
@@ -1439,12 +1439,7 @@ async fn handle_relation(
 /// read. A change for a relation with no streaming member is dropped, matching
 /// the eager path. The "change before Relation" invariant is still enforced at
 /// commit (`deliver_commit` fatals if the relation isn't cached).
-fn buffer_raw_change(
-    routes: &RouteMap,
-    txn: &mut TxnBuffer,
-    tag: u8,
-    data: Bytes,
-) {
+fn buffer_raw_change(routes: &RouteMap, txn: &mut TxnBuffer, tag: u8, data: Bytes) {
     let Some(relation_id) = pgoutput::relation_id(&data) else {
         return;
     };

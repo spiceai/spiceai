@@ -143,19 +143,25 @@ async fn next_envelope(
 
 fn ops_of(envelope: &ChangeEnvelope) -> Vec<String> {
     let ops = envelope
-        .change_batch().expect("built change batch")
+        .change_batch()
+        .expect("built change batch")
         .record
         .column_by_name("op")
         .expect("op column")
         .as_string::<i32>();
-    (0..envelope.change_batch().expect("built change batch").record.num_rows())
+    (0..envelope
+        .change_batch()
+        .expect("built change batch")
+        .record
+        .num_rows())
         .map(|i| ops.value(i).to_string())
         .collect()
 }
 
 fn ids_of(envelope: &ChangeEnvelope) -> Vec<i32> {
     let data = envelope
-        .change_batch().expect("built change batch")
+        .change_batch()
+        .expect("built change batch")
         .record
         .column_by_name("data")
         .expect("data column")
@@ -194,7 +200,14 @@ async fn bootstrap_then_stream_changes_then_resume() -> Result<(), anyhow::Error
     envelope.commit().await?;
 
     let envelope = next_envelope(&mut stream, "ready signal").await?;
-    assert_eq!(envelope.change_batch().expect("built change batch").record.num_rows(), 0);
+    assert_eq!(
+        envelope
+            .change_batch()
+            .expect("built change batch")
+            .record
+            .num_rows(),
+        0
+    );
     assert!(
         envelope.is_dataset_ready(),
         "post-snapshot envelope marks ready"
@@ -223,7 +236,8 @@ async fn bootstrap_then_stream_changes_then_resume() -> Result<(), anyhow::Error
     assert_eq!(ops_of(&envelope), vec!["u"]);
     assert_eq!(ids_of(&envelope), vec![1]);
     let data = envelope
-        .change_batch().expect("built change batch")
+        .change_batch()
+        .expect("built change batch")
         .record
         .column_by_name("data")
         .expect("data")
@@ -297,7 +311,14 @@ async fn bootstrap_then_stream_changes_then_resume() -> Result<(), anyhow::Error
     // First envelope on resume is the immediate ready signal — no truncate
     // and no snapshot batch.
     let envelope = next_envelope(&mut stream, "resume ready signal").await?;
-    assert_eq!(envelope.change_batch().expect("built change batch").record.num_rows(), 0);
+    assert_eq!(
+        envelope
+            .change_batch()
+            .expect("built change batch")
+            .record
+            .num_rows(),
+        0
+    );
     assert!(envelope.is_dataset_ready());
     envelope.commit().await?;
 

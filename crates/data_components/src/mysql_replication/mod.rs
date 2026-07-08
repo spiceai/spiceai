@@ -430,11 +430,12 @@ async fn start_inner(input: ReplicationStreamInput) -> Result<ChangesStream> {
             // ready-signal envelope, after the runtime has durably applied
             // the whole snapshot. A crash before then leaves the sidecar
             // empty, so the next start re-bootstraps from scratch.
-            let (_, ready_batch, is_ready) = ready_envelope(&schema)?
-                .into_parts()
-                .map_err(|e| Error::SchemaMismatch {
-                    message: e.to_string(),
-                })?;
+            let (_, ready_batch, is_ready) =
+                ready_envelope(&schema)?
+                    .into_parts()
+                    .map_err(|e| Error::SchemaMismatch {
+                        message: e.to_string(),
+                    })?;
             let ready = ChangeEnvelope::from_parts(
                 Box::new(InitialPositionCommitter {
                     store: Arc::clone(&position_store),

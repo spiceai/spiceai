@@ -439,8 +439,22 @@ async fn two_replicas_have_independent_slots() -> Result<(), anyhow::Error> {
     let env_b = tokio::time::timeout(Duration::from_secs(30), stream_b.next())
         .await?
         .ok_or_else(|| anyhow::anyhow!("bootstrap b missing"))??;
-    assert_eq!(env_a.change_batch().expect("built change batch").record.num_rows(), 2);
-    assert_eq!(env_b.change_batch().expect("built change batch").record.num_rows(), 2);
+    assert_eq!(
+        env_a
+            .change_batch()
+            .expect("built change batch")
+            .record
+            .num_rows(),
+        2
+    );
+    assert_eq!(
+        env_b
+            .change_batch()
+            .expect("built change batch")
+            .record
+            .num_rows(),
+        2
+    );
     env_a.commit().await?;
     env_b.commit().await?;
 
@@ -455,8 +469,22 @@ async fn two_replicas_have_independent_slots() -> Result<(), anyhow::Error> {
     let live_b = tokio::time::timeout(Duration::from_secs(15), stream_b.next())
         .await?
         .ok_or_else(|| anyhow::anyhow!("live b missing"))??;
-    assert_eq!(live_a.change_batch().expect("built change batch").record.num_rows(), 1);
-    assert_eq!(live_b.change_batch().expect("built change batch").record.num_rows(), 1);
+    assert_eq!(
+        live_a
+            .change_batch()
+            .expect("built change batch")
+            .record
+            .num_rows(),
+        1
+    );
+    assert_eq!(
+        live_b
+            .change_batch()
+            .expect("built change batch")
+            .record
+            .num_rows(),
+        1
+    );
     live_a.commit().await?;
     live_b.commit().await?;
 

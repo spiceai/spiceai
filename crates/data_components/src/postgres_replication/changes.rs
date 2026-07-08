@@ -324,7 +324,7 @@ pub fn build_change_batch(
 /// change decoders are structural (they don't consult the relation cache); the
 /// `relation` argument, not the decoder, drives typing and key detection.
 fn decode_raw_changes(relation: &Relation, raw: &[bytes::Bytes]) -> Result<Vec<DecodedChange>> {
-    use super::pgoutput::{Decoder, DecodedMessage};
+    use super::pgoutput::{DecodedMessage, Decoder};
     let mut decoder = Decoder::new();
     // Lower bound on capacity (a PK-changing UPDATE grows the vec by one).
     let mut changes = Vec::with_capacity(raw.len());
@@ -422,12 +422,11 @@ impl ChangeRows for PgChangeRows {
     }
 
     fn build(self: Box<Self>) -> Result<ChangeBatch, ChangeBatchError> {
-        let changes =
-            decode_raw_changes(&self.relation, &self.raw).map_err(|e| {
-                ChangeBatchError::DeferredBuild {
-                    message: e.to_string(),
-                }
-            })?;
+        let changes = decode_raw_changes(&self.relation, &self.raw).map_err(|e| {
+            ChangeBatchError::DeferredBuild {
+                message: e.to_string(),
+            }
+        })?;
         build_change_batch(&self.schema, &self.relation, &changes)
             .map(|b| b.with_source_commit_ts_ms(self.source_commit_ts_ms))
             .map_err(|e| ChangeBatchError::DeferredBuild {
@@ -3183,7 +3182,12 @@ mod raw_decode_tests {
             op: ChangeOp::Create,
             row: tuple(&["1", "a"]),
         });
-        push_update_change(&mut eager, &rel, Some(tuple(&["1", "a"])), tuple(&["2", "b"]));
+        push_update_change(
+            &mut eager,
+            &rel,
+            Some(tuple(&["1", "a"])),
+            tuple(&["2", "b"]),
+        );
         eager.push(DecodedChange {
             op: ChangeOp::Delete,
             row: tuple(&["2", "b"]),
@@ -3191,7 +3195,11 @@ mod raw_decode_tests {
 
         let raw_changes = decode_raw_changes(&rel, &raw).expect("raw decode");
         // insert + (delete-old-key + upsert-new) + delete
-        assert_eq!(raw_changes.len(), 4, "PK-changing update must expand to 2 rows");
+        assert_eq!(
+            raw_changes.len(),
+            4,
+            "PK-changing update must expand to 2 rows"
+        );
 
         let eager_batch = build_change_batch(&sch, &rel, &eager).expect("eager build");
         let raw_batch = build_change_batch(&sch, &rel, &raw_changes).expect("raw build");
@@ -3210,7 +3218,12 @@ mod raw_decode_tests {
         let raw = vec![raw_update(&["1", "a"], &["1", "b"]), raw_truncate()];
 
         let mut eager: Vec<DecodedChange> = Vec::new();
-        push_update_change(&mut eager, &rel, Some(tuple(&["1", "a"])), tuple(&["1", "b"]));
+        push_update_change(
+            &mut eager,
+            &rel,
+            Some(tuple(&["1", "a"])),
+            tuple(&["1", "b"]),
+        );
         eager.push(DecodedChange {
             op: ChangeOp::Truncate,
             row: TupleData { columns: vec![] },
@@ -3218,7 +3231,11 @@ mod raw_decode_tests {
 
         let raw_changes = decode_raw_changes(&rel, &raw).expect("raw decode");
         // A non-PK update is a single upsert row (no delete-of-old-key).
-        assert_eq!(raw_changes.len(), 2, "non-key update stays one row (+ truncate)");
+        assert_eq!(
+            raw_changes.len(),
+            2,
+            "non-key update stays one row (+ truncate)"
+        );
 
         let eager_batch = build_change_batch(&sch, &rel, &eager).expect("eager build");
         let raw_batch = build_change_batch(&sch, &rel, &raw_changes).expect("raw build");
@@ -3235,7 +3252,10 @@ mod raw_decode_tests {
         let rows = PgChangeRows::new(
             schema(),
             relation(),
-            vec![raw_insert(&["1", "a"]), raw_update(&["1", "a"], &["2", "b"])],
+            vec![
+                raw_insert(&["1", "a"]),
+                raw_update(&["1", "a"], &["2", "b"]),
+            ],
             Some(7),
         );
         assert!(!rows.is_empty());

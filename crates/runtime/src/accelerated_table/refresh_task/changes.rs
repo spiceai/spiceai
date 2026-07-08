@@ -2898,8 +2898,7 @@ fn cdc_item_memory_size(item: &Result<cdc::ChangeEnvelope, cdc::StreamError>) ->
     // a deferred (e.g. Postgres) envelope answers from its buffered wire size, a
     // built one from its Arrow size. The actual Arrow build is deferred to apply
     // time (`into_parts`), off the source's shared read path.
-    item.as_ref()
-        .map_or(0, cdc::ChangeEnvelope::encoded_len)
+    item.as_ref().map_or(0, cdc::ChangeEnvelope::encoded_len)
 }
 
 fn elapsed_ms(start: Instant) -> f64 {
