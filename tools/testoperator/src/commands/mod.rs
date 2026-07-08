@@ -27,8 +27,7 @@ use test_framework::{
     opentelemetry_sdk::Resource,
     queries::{Query, QuerySet},
     spiced::{SpicedInstance, StartRequest},
-    spicepod::Spicepod,
-    spicepod::component::dataset::CheckAvailability,
+    spicepod::{Spicepod, component::dataset::CheckAvailability, spec::SpicepodVersion},
     spicepod_utils::from_app,
     spicetest::datasets::NotStarted,
     telemetry::{OtlpExporterConfig, Telemetry},
@@ -424,7 +423,11 @@ pub(crate) async fn get_dataset_app_and_start_request(
 }
 
 fn start_request_from_app(args: &CommonArgs, app: App) -> anyhow::Result<StartRequest> {
-    let mut start_request = StartRequest::new(args.spiced_path_buf(), from_app(app))?;
+    let mut spicepod = from_app(app);
+    if should_emit_v1_spicepod() {
+        spicepod.version = SpicepodVersion::V1;
+    }
+    let mut start_request = StartRequest::new(args.spiced_path_buf(), spicepod)?;
 
     if let Some(ref data_dir) = args.data_dir {
         start_request = start_request.with_data_dir(data_dir.clone());
@@ -437,6 +440,17 @@ fn start_request_from_app(args: &CommonArgs, app: App) -> anyhow::Result<StartRe
     }
 
     Ok(start_request)
+}
+
+fn should_emit_v1_spicepod() -> bool {
+    // `from_app(app)` uses the current SpicepodVersion default (v2). That is
+    // correct for current spiced, but v1.x runtimes reject `version: v2`. The
+    // benchmark workflow sets SPICED_COMMIT to the runtime version/commit; use
+    // it to keep rewritten temporary spicepods compatible with official v1.x
+    // binaries such as v1.11.6.
+    std::env::var("SPICED_COMMIT").is_ok_and(|version| {
+        version.starts_with("v1.") || version.starts_with("1.") || version == "v1"
+    })
 }
 
 pub(crate) async fn env_export(args: &CommonArgs) -> anyhow::Result<()> {

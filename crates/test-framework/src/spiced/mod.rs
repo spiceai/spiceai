@@ -73,6 +73,7 @@ pub struct StartRequest {
     tempdir: TempDir,
     data_dir: Option<PathBuf>,
     additional_args: Vec<String>,
+    env: Vec<(String, String)>,
     prepared: bool,
 }
 
@@ -85,6 +86,7 @@ impl StartRequest {
             prepared: false,
             data_dir: None,
             additional_args: Vec::new(),
+            env: Vec::new(),
         })
     }
 
@@ -97,6 +99,12 @@ impl StartRequest {
     #[must_use]
     pub fn with_additional_args(mut self, args: Vec<String>) -> Self {
         self.additional_args = args;
+        self
+    }
+
+    #[must_use]
+    pub fn with_env(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
+        self.env.push((key.into(), value.into()));
         self
     }
 
@@ -246,6 +254,11 @@ impl SpicedInstance {
             && !metrics_addr.is_empty()
         {
             cmd.arg("--metrics").arg(metrics_addr);
+        }
+
+        // Add any additional environment variables
+        for (key, value) in start_request.env {
+            cmd.env(key, value);
         }
 
         // Add any additional arguments
