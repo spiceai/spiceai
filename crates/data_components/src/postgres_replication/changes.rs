@@ -1114,7 +1114,7 @@ pub(super) fn parse_pg_numeric_public(s: &str, scale: i8) -> Result<i128> {
 /// fractional precision than the declared scale — an error, never a silent
 /// round (mirrors the text path's scale check). `NaN`/`±Infinity` sign words
 /// are rejected: `Decimal128` cannot represent them.
-fn numeric_from_binary(raw: &[u8], _precision: u8, scale: i8) -> Result<i128> {
+fn numeric_from_binary(raw: &[u8], precision: u8, scale: i8) -> Result<i128> {
     use bytes::Buf;
 
     const NUMERIC_POS: u16 = 0x0000;
@@ -1195,7 +1195,36 @@ fn numeric_from_binary(raw: &[u8], _precision: u8, scale: i8) -> Result<i128> {
         m / pow
     };
 
-    Ok(if negative { -result } else { result })
+    let signed = if negative { -result } else { result };
+    ensure_decimal_precision(signed, precision)?;
+    Ok(signed)
+}
+
+/// Ensure a decoded unscaled `Decimal128` value fits the column's declared
+/// precision (`abs(value) < 10^precision`).
+///
+/// Postgres enforces precision on the source column, so a violation means the
+/// dataset schema declares a narrower precision than the source — surface it as
+/// a structured error rather than storing a value Arrow would treat as out of
+/// range for the declared type. Shared by the text and binary numeric decoders
+/// so both agree on what's representable.
+fn ensure_decimal_precision(value: i128, precision: u8) -> Result<()> {
+    // Saturates for precision >= 39; that's fine — `i128`'s magnitude never
+    // reaches `u128::MAX`, and Arrow caps `Decimal128` precision at 38 anyway.
+    let mut bound: u128 = 1;
+    for _ in 0..precision {
+        bound = bound.saturating_mul(10);
+    }
+    ensure!(
+        value.unsigned_abs() < bound,
+        PgOutputDecodeSnafu {
+            message: format!(
+                "postgres_replication: numeric value exceeds the dataset's declared \
+                 Decimal128 precision {precision}"
+            )
+        }
+    );
+    Ok(())
 }
 
 /// `10^exp` as `i128`, erroring if it overflows `Decimal128`'s range.
@@ -1235,7 +1264,8 @@ fn decode_binary_array(raw: &[u8]) -> Result<(u32, Vec<Option<&[u8]>>)> {
         PgOutputDecodeSnafu {
             message: format!(
                 "postgres_replication: unsupported array dimensionality {ndim} \
-                 (only scalar 1-D arrays are supported). Cast the column to a scalar type."
+                 (only empty or 1-dimensional arrays of scalars are supported). \
+                 Cast the column to a scalar type."
             )
         }
     );
@@ -1332,9 +1362,9 @@ fn parse_pg_numeric_to_i128(s: &str, precision: u8, scale: i8) -> Result<i128> {
     })?;
     let value = sign * magnitude;
 
-    // Sanity-check against declared precision — Arrow will enforce this on
-    // `append_value` anyway, but a friendlier error helps ops.
-    let _ = precision;
+    // Enforce the declared precision here (with a friendly error) rather than
+    // relying on Arrow, and to stay consistent with the binary decoder.
+    ensure_decimal_precision(value, precision)?;
     Ok(value)
 }
 
@@ -2600,6 +2630,18 @@ mod tests {
         nan.extend_from_slice(&0xC000u16.to_be_bytes()); // sign = NaN
         nan.extend_from_slice(&0u16.to_be_bytes()); // dscale
         numeric_from_binary(&nan, 15, 2).expect_err("NaN must error");
+
+        // 10^15 exceeds precision 15 (max unscaled magnitude 10^15 - 1) —
+        // reject rather than store an out-of-precision Decimal128 value.
+        // 10^15 = 1000 * 10000^3 → digits [1000], weight 3, scale 0.
+        numeric_from_binary(&enc_numeric(&[1000], 3, false, 0), 15, 0)
+            .expect_err("value exceeding declared precision must error");
+        // One less (10^15 - 1) fits precision 15.
+        assert_eq!(
+            numeric_from_binary(&enc_numeric(&[999, 9999, 9999, 9999], 3, false, 0), 15, 0)
+                .expect("10^15 - 1 fits precision 15"),
+            999_999_999_999_999
+        );
     }
 
     /// Encode a 1-D binary `int4[]` array (`send` wire form).

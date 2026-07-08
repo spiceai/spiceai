@@ -43,8 +43,8 @@ use snafu::Snafu;
 use crate::cdc::{ChangesStream, StreamError};
 
 pub use config::{ReplicationParams, SchemaEvolutionPolicy};
-pub use pgwire_replication::PgOutputFormat;
 pub use metrics::{Metrics as ReplicationMetrics, MetricsCollector as ReplicationMetricsCollector};
+pub use pgwire_replication::PgOutputFormat;
 pub use slot::{SlotInfo, SlotSetupOutcome};
 
 /// Extracts a human-readable message from a `tokio_postgres::Error`.

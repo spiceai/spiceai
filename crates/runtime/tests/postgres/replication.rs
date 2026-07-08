@@ -491,7 +491,11 @@ fn wide_schema() -> SchemaRef {
         Field::new("v_f8", DataType::Float64, true),
         Field::new("v_num", DataType::Decimal128(15, 2), true),
         Field::new("v_date", DataType::Date32, true),
-        Field::new("v_ts", DataType::Timestamp(TimeUnit::Nanosecond, None), true),
+        Field::new(
+            "v_ts",
+            DataType::Timestamp(TimeUnit::Nanosecond, None),
+            true,
+        ),
         Field::new("v_text", DataType::Utf8, true),
     ]))
 }
@@ -576,7 +580,10 @@ async fn run_wide_types_scenario(
         .await?
         .ok_or_else(|| anyhow::anyhow!("ready envelope missing ({tag})"))??;
     let (_committer, ready_batch, is_ready) = ready.into_parts();
-    assert!(is_ready, "skip-bootstrap ready envelope must mark ready ({tag})");
+    assert!(
+        is_ready,
+        "skip-bootstrap ready envelope must mark ready ({tag})"
+    );
     assert_eq!(
         ready_batch.record.num_rows(),
         0,

@@ -29,8 +29,7 @@ use async_stream::try_stream;
 use data_components::cdc::{ChangesStream, StreamError};
 use data_components::postgres_replication::{
     PgOutputFormat, ReplicationMetrics, ReplicationMetricsCollector, ReplicationParams,
-    ReplicationStreamInput,
-    SchemaEvolutionPolicy, config, start_replication_stream_with_policy,
+    ReplicationStreamInput, SchemaEvolutionPolicy, config, start_replication_stream_with_policy,
 };
 use datafusion::sql::TableReference;
 use futures::StreamExt;
