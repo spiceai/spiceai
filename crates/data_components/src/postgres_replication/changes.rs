@@ -18,6 +18,7 @@ limitations under the License.
 //! [`crate::cdc::ChangeBatch`]es that the existing refresh loop knows how to
 //! apply.
 
+use std::borrow::Cow;
 use std::sync::{Arc, atomic::AtomicU64};
 
 use arrow::{
@@ -777,11 +778,16 @@ impl FieldBuilder {
             Self::Float64(b) => {
                 b.append_value(pg::float8_from_sql(raw).map_err(decode_err("float8"))?);
             }
-            Self::Utf8(b) => b.append_value(pg::text_from_sql(raw).map_err(decode_err("text"))?),
-            Self::LargeUtf8(b) => {
-                b.append_value(pg::text_from_sql(raw).map_err(decode_err("text"))?);
-            }
-            // bytea `send` form is the raw bytes — identity.
+            // A column mapped to Arrow Utf8 can be a genuine text type (whose
+            // binary send form IS UTF-8 text) or a non-text type Postgres still
+            // maps to a string (uuid/inet/cidr/macaddr). `decode_binary_text`
+            // dispatches on the OID and yields the canonical Postgres text —
+            // identical to what the `::text` bootstrap path produces, so the
+            // snapshot and WAL agree.
+            Self::Utf8(b) => b.append_value(decode_binary_text(raw, type_oid)?.as_ref()),
+            Self::LargeUtf8(b) => b.append_value(decode_binary_text(raw, type_oid)?.as_ref()),
+            // bytea `send` form is the raw payload verbatim; append it directly
+            // (the one copy into the Arrow buffer is unavoidable).
             Self::Binary(b) => b.append_value(raw),
             Self::Date32(b) => {
                 let pg_days = pg::date_from_sql(raw).map_err(decode_err("date"))?;
@@ -1285,10 +1291,13 @@ fn decode_binary_array(raw: &[u8]) -> Result<(u32, Vec<Option<&[u8]>>)> {
         })?;
     }
 
+    // Fallibly reserve so a corrupt/oversized `count` from the WAL surfaces as a
+    // structured error instead of aborting the process on a huge allocation.
     let mut out = Vec::new();
-    out.try_reserve_exact(count).map_err(|e| super::Error::PgOutputDecode {
-        message: format!("postgres_replication: array too large (len {count}): {e}"),
-    })?;
+    out.try_reserve_exact(count)
+        .map_err(|e| super::Error::PgOutputDecode {
+            message: format!("postgres_replication: array too large (len {count}): {e}"),
+        })?;
     for _ in 0..count {
         ensure!(
             b.remaining() >= 4,
@@ -1315,6 +1324,108 @@ fn decode_binary_array(raw: &[u8]) -> Result<(u32, Vec<Option<&[u8]>>)> {
         }
     }
     Ok((elem_oid, out))
+}
+
+/// Decode a binary value destined for an Arrow `Utf8`/`LargeUtf8` column into
+/// its canonical Postgres text, dispatched by the source type OID.
+///
+/// Most Arrow-`Utf8` sources (`text`, `varchar`, `bpchar`, `name`, `json`,
+/// `xml`) have a binary send form that already *is* UTF-8 text. A few
+/// Postgres types map to Arrow strings but send non-text binary — `uuid`,
+/// `inet`, `cidr`, `macaddr` — so we format those to the exact text the
+/// `::text` bootstrap path (and SQL queries) produce, keeping snapshot and WAL
+/// in agreement. Any other OID targeting a text column is an explicit error
+/// rather than a silent mis-decode.
+fn decode_binary_text(raw: &[u8], type_oid: u32) -> Result<Cow<'_, str>> {
+    use postgres_protocol::types as pg;
+
+    let decode_err =
+        move |e: Box<dyn std::error::Error + Sync + Send>| super::Error::PgOutputDecode {
+            message: format!(
+                "postgres_replication: binary text decode failed (type oid {type_oid}): {e}"
+            ),
+        };
+
+    match type_oid {
+        // text, varchar, bpchar, name, json, xml — binary send is UTF-8 text.
+        25 | 1043 | 1042 | 19 | 114 | 142 => {
+            Ok(Cow::Borrowed(pg::text_from_sql(raw).map_err(decode_err)?))
+        }
+        // uuid → canonical lowercase hyphenated form.
+        2950 => Ok(Cow::Owned(format_uuid(
+            &pg::uuid_from_sql(raw).map_err(decode_err)?,
+        ))),
+        // macaddr → lowercase colon-separated form.
+        829 => Ok(Cow::Owned(format_macaddr(
+            pg::macaddr_from_sql(raw).map_err(decode_err)?,
+        ))),
+        // inet / cidr → `addr` or `addr/bits` (matches inet_out / cidr_out).
+        869 | 650 => Ok(Cow::Owned(format_inet(raw)?)),
+        other => PgOutputDecodeSnafu {
+            message: format!(
+                "postgres_replication: binary decoding into a text column is not supported for \
+                 Postgres type OID {other}. Exclude the column from the dataset schema, or \
+                 request text replication output for this dataset."
+            ),
+        }
+        .fail(),
+    }
+}
+
+const HEX_LOWER: &[u8; 16] = b"0123456789abcdef";
+
+fn push_hex_byte(s: &mut String, byte: u8) {
+    s.push(HEX_LOWER[(byte >> 4) as usize] as char);
+    s.push(HEX_LOWER[(byte & 0x0f) as usize] as char);
+}
+
+/// Format 16 UUID bytes as `xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx` (lowercase),
+/// matching Postgres `uuid_out`.
+fn format_uuid(bytes: &[u8; 16]) -> String {
+    let mut s = String::with_capacity(36);
+    for (i, byte) in bytes.iter().enumerate() {
+        if matches!(i, 4 | 6 | 8 | 10) {
+            s.push('-');
+        }
+        push_hex_byte(&mut s, *byte);
+    }
+    s
+}
+
+/// Format 6 MAC bytes as `xx:xx:xx:xx:xx:xx` (lowercase), matching Postgres
+/// `macaddr_out`.
+fn format_macaddr(bytes: [u8; 6]) -> String {
+    let mut s = String::with_capacity(17);
+    for (i, byte) in bytes.iter().enumerate() {
+        if i != 0 {
+            s.push(':');
+        }
+        push_hex_byte(&mut s, *byte);
+    }
+    s
+}
+
+/// Format a binary `inet`/`cidr` as Postgres would: `addr/bits` always for
+/// `cidr`, and for `inet` only when `bits` is not the address width (matching
+/// `inet_out`/`cidr_out`). IP address text uses the standard canonical form
+/// (RFC 5952 for IPv6).
+fn format_inet(raw: &[u8]) -> Result<String> {
+    use postgres_protocol::types as pg;
+
+    let inet = pg::inet_from_sql(raw).map_err(|e| super::Error::PgOutputDecode {
+        message: format!("postgres_replication: binary inet decode failed: {e}"),
+    })?;
+    // Byte 2 of the wire format is the `is_cidr` flag, which `Inet` discards but
+    // which decides whether a full-width prefix is printed.
+    let is_cidr = raw.get(2).is_some_and(|b| *b != 0);
+    let addr = inet.addr();
+    let bits = inet.netmask();
+    let max_bits = if addr.is_ipv4() { 32 } else { 128 };
+    Ok(if is_cidr || bits != max_bits {
+        format!("{addr}/{bits}")
+    } else {
+        format!("{addr}")
+    })
 }
 
 fn parse_pg_numeric_to_i128(s: &str, precision: u8, scale: i8) -> Result<i128> {
@@ -2679,6 +2790,86 @@ mod tests {
         assert_eq!(ints.value(0), 1);
         assert!(ints.is_null(1));
         assert_eq!(ints.value(2), 3);
+    }
+
+    #[test]
+    fn binary_uuid_and_macaddr_decode_to_canonical_text() {
+        // uuid → lowercase hyphenated (matches `uuid_out`).
+        let uuid = [
+            0x55, 0x0e, 0x84, 0x00, 0xe2, 0x9b, 0x41, 0xd4, 0xa7, 0x16, 0x44, 0x66, 0x55, 0x44,
+            0x00, 0x00,
+        ];
+        assert_eq!(
+            bin_one(&DataType::Utf8, 2950, &uuid)
+                .as_string::<i32>()
+                .value(0),
+            "550e8400-e29b-41d4-a716-446655440000"
+        );
+        // macaddr → lowercase colon-separated (matches `macaddr_out`).
+        assert_eq!(
+            bin_one(&DataType::Utf8, 829, &[0x08, 0x00, 0x2b, 0x01, 0x02, 0x03])
+                .as_string::<i32>()
+                .value(0),
+            "08:00:2b:01:02:03"
+        );
+    }
+
+    /// Encode a binary `inet`/`cidr` value.
+    fn enc_inet(family: u8, bits: u8, is_cidr: u8, addr: &[u8]) -> Vec<u8> {
+        let mut o = vec![
+            family,
+            bits,
+            is_cidr,
+            u8::try_from(addr.len()).expect("addr len fits u8"),
+        ];
+        o.extend_from_slice(addr);
+        o
+    }
+
+    #[test]
+    fn binary_inet_cidr_decode_to_canonical_text() {
+        // inet host: full-width prefix omitted (matches `inet_out`).
+        assert_eq!(
+            bin_one(&DataType::Utf8, 869, &enc_inet(2, 32, 0, &[10, 0, 0, 1]))
+                .as_string::<i32>()
+                .value(0),
+            "10.0.0.1"
+        );
+        // inet with a network prefix keeps it.
+        assert_eq!(
+            bin_one(&DataType::Utf8, 869, &enc_inet(2, 24, 0, &[10, 0, 0, 0]))
+                .as_string::<i32>()
+                .value(0),
+            "10.0.0.0/24"
+        );
+        // cidr always prints the prefix, even at full width (matches `cidr_out`).
+        assert_eq!(
+            bin_one(&DataType::Utf8, 650, &enc_inet(2, 32, 1, &[10, 0, 0, 0]))
+                .as_string::<i32>()
+                .value(0),
+            "10.0.0.0/32"
+        );
+        // IPv6 canonical (RFC 5952) compressed form.
+        let mut v6 = [0u8; 16];
+        v6[0] = 0x20;
+        v6[1] = 0x01;
+        v6[2] = 0x0d;
+        v6[3] = 0xb8;
+        v6[15] = 0x01;
+        assert_eq!(
+            bin_one(&DataType::Utf8, 869, &enc_inet(3, 128, 0, &v6))
+                .as_string::<i32>()
+                .value(0),
+            "2001:db8::1"
+        );
+    }
+
+    #[test]
+    fn binary_text_column_rejects_unsupported_oid() {
+        // An OID with no supported text/binary mapping targeting a Utf8 column
+        // must error loudly (here: jsonb, whose binary carries a version byte),
+        // never silently mis-decode into a wrong string.
+        decode_binary_text(&[0x01, b'{', b'}'], 3802).expect_err("unsupported oid must error");
     }
 
     #[test]
