@@ -114,7 +114,8 @@ pub use compaction::{set_compaction_runtime_env, set_compaction_runtime_handle};
 pub use context::CayenneContext;
 pub use mem_tier::SlotAdvancer;
 pub use mem_tier_budget::{
-    global_mem_tier_total, set_global_mem_tier_bytes, update_global_mem_tier_total,
+    global_mem_tier_total, global_mem_tier_used, set_global_mem_tier_bytes,
+    update_global_mem_tier_total,
 };
 pub use overwrite::PreparedOverwrite;
 pub use partitioned_wal::{PARTITIONED_WAL_DIR, PartitionedWal, PartitionedWalEntry};
@@ -127,7 +128,10 @@ pub use tuning::{
     QueryObservations, deregister_query_observations, global_qph, record_global_query,
     record_query_latency, register_query_observations, set_cpu_burstable, set_global_memory_budget,
 };
-pub use write_budget::{cap_global_encode_concurrency, set_global_encode_concurrency};
+pub use write_budget::{
+    EncodeBudgetSnapshot, cap_global_encode_concurrency, encode_budget_snapshot,
+    set_global_encode_concurrency,
+};
 
 // Re-export deletion utilities for advanced use cases
 pub use delete::CayenneDeletionSink;

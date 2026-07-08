@@ -63,9 +63,13 @@ limitations under the License.
 //! with no traffic are credited forward on keepalives/commits whenever they
 //! have no in-flight envelopes. A stalled or failed member therefore pins WAL
 //! retention for the whole slot **by design** — acking past it would lose its
-//! changes permanently. The pinning is observable via the existing
-//! `dataset_postgres_replication_lag_bytes` metric and a WARN log on detach;
-//! restarting spiced (or the member rejoining) heals it by replaying from the
+//! changes permanently. The detached state is observable directly via the
+//! `dataset_postgres_replication_member_attached` gauge (1 attached / 0 detached)
+//! and an ERROR log on a stalling detach; the resulting WAL growth also shows on
+//! `dataset_postgres_replication_lag_bytes` (which, on a shared slot, grows for
+//! the *surviving* members whose ack floor is pinned by the detached one — the
+//! member gauge is the unambiguous signal for *which* dataset stalled).
+//! Restarting spiced (or the member rejoining) heals it by replaying from the
 //! held LSN, which every member applies idempotently.
 //!
 //! # Backpressure vs. server liveness
@@ -456,21 +460,44 @@ impl SharedSource {
     /// its table is (best-effort) removed from the publication — any rejoin,
     /// in-process or after a restart, then re-adds the table and takes a fresh
     /// snapshot.
-    fn detach_member(&self, key: &MemberKey, reason: &str) {
+    /// Detach a member from the shared slot. `stalls_slot` distinguishes a
+    /// genuine, unhealed stall (the member's changes stream died and its ack
+    /// floor now pins WAL for every slot-mate until it rejoins or spiced
+    /// restarts — a page-worthy, ERROR-level condition) from a self-healing
+    /// supersede (an already-closed member being replaced by an incoming
+    /// re-subscription, which re-attaches immediately — only WARN).
+    fn detach_member(&self, key: &MemberKey, reason: &str, stalls_slot: bool) {
         let removed = lock(&self.members).remove(key);
         let was_snapshotting = self.ack.detach(key);
         lock(&self.detached).insert(key.clone());
         if let Some(member) = removed {
-            tracing::warn!(
-                dataset = %member.dataset_name,
-                table = %format_member(key),
-                slot = %self.key.slot_name,
-                reason,
-                was_snapshotting,
-                "shared replication member detached; its last applied LSN now pins WAL \
-                 retention for the shared slot until the dataset rejoins or spiced restarts \
-                 (watch dataset_postgres_replication_lag_bytes)"
-            );
+            // Flip the membership-liveness gauge to detached (0) so the state is
+            // observable, not only logged (#11644). A superseding re-subscription
+            // re-attaches (back to 1) via `mark_member_attached` on rejoin.
+            member.metrics.mark_member_detached();
+            if stalls_slot {
+                tracing::error!(
+                    dataset = %member.dataset_name,
+                    table = %format_member(key),
+                    slot = %self.key.slot_name,
+                    reason,
+                    was_snapshotting,
+                    "shared replication member detached; its last applied LSN now pins WAL \
+                     retention for the shared slot until the dataset rejoins or spiced restarts \
+                     (watch dataset_postgres_replication_member_attached and \
+                     dataset_postgres_replication_lag_bytes)"
+                );
+            } else {
+                tracing::warn!(
+                    dataset = %member.dataset_name,
+                    table = %format_member(key),
+                    slot = %self.key.slot_name,
+                    reason,
+                    was_snapshotting,
+                    "shared replication member detached and is being replaced by a new \
+                     subscription (rejoin in progress)"
+                );
+            }
         }
         if was_snapshotting {
             let params = self.params.clone();
@@ -500,7 +527,7 @@ impl SharedSource {
             .map(|(k, _)| k.clone())
             .collect();
         for key in closed {
-            self.detach_member(&key, "changes stream receiver dropped");
+            self.detach_member(&key, "changes stream receiver dropped", true);
         }
     }
 }
@@ -602,7 +629,7 @@ async fn attach_member(
             // The previous subscription's receiver is gone (dataset reload,
             // failed sink) but the pump hasn't reaped it yet — detach it now
             // so this is a rejoin, not a duplicate.
-            source.detach_member(&member_key, "superseded by a new subscription");
+            source.detach_member(&member_key, "superseded by a new subscription", false);
         } else {
             return Err(Error::SharedTableAlreadySubscribed {
                 schema: schema_name,
@@ -639,6 +666,9 @@ async fn attach_member(
 
     let snapshotting = need_snapshot && params.initial_snapshot;
     let (sender, receiver) = mpsc::channel(MEMBER_CHANNEL_CAPACITY);
+    // Grouping signal for the analysis: record which shared slot this dataset joined.
+    // (Membership liveness is marked by `mark_member_attached` just below.)
+    metrics.set_slot_name(source.key.slot_name.clone());
     source.ack.register(&member_key, snapshotting);
     lock(&source.members).insert(
         member_key.clone(),
@@ -651,6 +681,11 @@ async fn attach_member(
             metrics: Arc::clone(&metrics),
         }),
     );
+    // Membership liveness is now observable (`dataset_postgres_replication_member_attached`):
+    // this dataset is an attached member of the shared slot. Covers both a fresh
+    // join and an in-process rejoin (both reach here); the paired `mark_member_detached`
+    // in `detach_member` flips it to 0 when the member leaves (#11644).
+    metrics.mark_member_attached();
 
     tracing::info!(
         dataset = %dataset_name,
@@ -793,7 +828,7 @@ async fn member_fatal(source: &Arc<SharedSource>, key: &MemberKey, message: Stri
             .send(Err(StreamError::External(message)))
             .await;
     }
-    source.detach_member(key, "fatal member error");
+    source.detach_member(key, "fatal member error", true);
 }
 
 /// Mark the source dead and drop it from the registry (only if the registry
@@ -832,6 +867,31 @@ async fn try_finish_if_empty(source: &Arc<SharedSource>) -> bool {
 /// per relation and route per member at Commit, acknowledgment is the
 /// [`AckTable`] floor instead of a single atomic, and member joins trigger a
 /// reconnect instead of a new connection.
+/// Fan the reader-timing accumulators (summed since the last flush) out to every
+/// live member in one pass, instead of per decoded event. The shared pump decodes
+/// one merged stream, so a per-event fan-out (`for_each_member_metrics` locks +
+/// iterates all members on every row at hundreds of thousands of rows/s) both
+/// perturbs the very hot path we measure and multiplies cost by the member count.
+/// Accumulating per event (cheap local adds) and flushing per commit/keepalive/idle
+/// tick keeps the same per-dataset series with a fraction of the overhead.
+/// `server_wal_end` is monotonic-max, so flushing the running max is exact.
+fn flush_reader_metrics(source: &SharedSource, input_us: u64, proc_us: u64, max_wal_end: u64) {
+    if input_us == 0 && proc_us == 0 && max_wal_end == 0 {
+        return;
+    }
+    source.for_each_member_metrics(|m| {
+        if input_us > 0 {
+            m.add_reader_input_wait_micros(input_us);
+        }
+        if proc_us > 0 {
+            m.add_reader_processing_micros(proc_us);
+        }
+        if max_wal_end > 0 {
+            m.set_server_wal_end(max_wal_end);
+        }
+    });
+}
+
 async fn run_pump(source: Arc<SharedSource>) {
     // Captured at pump start: the pump stops when the epoch advances (this
     // Runtime began shutting down); a pump started by a later Runtime in the
@@ -842,6 +902,9 @@ async fn run_pump(source: Arc<SharedSource>) {
     let publication_name = params.publication_name.clone();
     let mut backoff = resilience::Backoff::default_for_stream();
     let mut reconnect_attempts: u32 = 0;
+    // When the stream dropped (set as the inner loop breaks to reconnect); consumed
+    // on the next successful connect to attribute the disconnected duration.
+    let mut disconnect_at: Option<std::time::Instant> = None;
 
     'reconnect: loop {
         if crate::cdc::shutdown_epoch() != shutdown_epoch {
@@ -872,6 +935,12 @@ async fn run_pump(source: Arc<SharedSource>) {
         let mut client = match ReplicationClient::connect(config).await {
             Ok(c) => {
                 backoff.reset();
+                // Attribute the disconnected duration (drop → resume) to every member.
+                if let Some(dropped_at) = disconnect_at.take() {
+                    let down_ms =
+                        u64::try_from(dropped_at.elapsed().as_millis()).unwrap_or(u64::MAX);
+                    source.for_each_member_metrics(|m| m.add_disconnected_ms(down_ms));
+                }
                 if reconnect_attempts > 0 {
                     tracing::info!(
                         slot = %slot_name,
@@ -887,6 +956,12 @@ async fn run_pump(source: Arc<SharedSource>) {
                 c
             }
             Err(e) if resilience::is_transient_pgwire(&e) => {
+                // Mark the outage start on the first failed attempt so a boot-time /
+                // never-yet-connected outage (no prior success set `disconnect_at`) still
+                // contributes to `replication_disconnected_ms_total`. `get_or_insert_with`
+                // preserves an earlier drop timestamp (an established connection that fell
+                // over then failed to reconnect), so the full outage span is attributed.
+                disconnect_at.get_or_insert_with(std::time::Instant::now);
                 source.for_each_member_metrics(ReplicationMetricsCollector::inc_reconnect);
                 reconnect_attempts = reconnect_attempts.saturating_add(1);
                 client::log_transient_reconnect(
@@ -910,6 +985,14 @@ async fn run_pump(source: Arc<SharedSource>) {
         let mut routes: HashMap<RelationId, MemberKey> = HashMap::new();
         let mut txn: HashMap<RelationId, Vec<DecodedChange>> = HashMap::new();
         let mut txn_open = false;
+
+        // Reader-timing accumulators (see `flush_reader_metrics`): summed per decoded
+        // event, fanned out to members once per commit/keepalive/idle tick rather than
+        // per row. Reset per connection; the partial tail on a mid-txn reconnect is a
+        // negligible loss for a diagnostic metric.
+        let mut input_us_acc: u64 = 0;
+        let mut proc_us_acc: u64 = 0;
+        let mut max_wal_end: u64 = 0;
 
         'recv: loop {
             if crate::cdc::shutdown_epoch() != shutdown_epoch {
@@ -946,9 +1029,27 @@ async fn run_pump(source: Arc<SharedSource>) {
             // returns on real server traffic, which can be tens of seconds
             // apart when the source is idle. `recv()` reads an internal
             // channel and is cancel-safe.
+            // Time blocked awaiting the next event from the source socket
+            // (input-wait) vs. processing below (decode + route/deliver). Their
+            // ratio is the source-bound vs. our-decode discriminator. The pump is
+            // shared across members, so attribute the (shared) wait to each member.
+            let recv_start = std::time::Instant::now();
             let polled = tokio::time::timeout(RECV_POLL_INTERVAL, client.recv()).await;
+            input_us_acc = input_us_acc.saturating_add(
+                u64::try_from(recv_start.elapsed().as_micros()).unwrap_or(u64::MAX),
+            );
+            // Flushed per commit/keepalive (or the idle-timeout branch below), not per event.
+            let mut should_flush = false;
             let event = match polled {
-                Err(_elapsed) => continue 'recv,
+                Err(_elapsed) => {
+                    // Idle tick: flush the accumulated input-wait so idle time is
+                    // attributed even when no server event arrives for a while.
+                    flush_reader_metrics(&source, input_us_acc, proc_us_acc, max_wal_end);
+                    input_us_acc = 0;
+                    proc_us_acc = 0;
+                    max_wal_end = 0;
+                    continue 'recv;
+                }
                 Ok(Ok(Some(e))) => e,
                 // Server closed cleanly (e.g. orderly Postgres shutdown):
                 // treat like a transient drop and reconnect — the shared
@@ -972,14 +1073,17 @@ async fn run_pump(source: Arc<SharedSource>) {
                 }
             };
 
+            let processing_start = std::time::Instant::now();
             match event {
                 ReplicationEvent::Begin { .. } => {
                     txn_open = true;
                     txn.clear();
                 }
                 ReplicationEvent::XLogData { data, wal_end, .. } => {
-                    source.for_each_member_metrics(|m| m.set_server_wal_end(wal_end.0));
-                    let msg = match decoder.decode(&data) {
+                    max_wal_end = max_wal_end.max(wal_end.0);
+                    // Zero-copy decode: hand the owned `Bytes` frame to the decoder
+                    // (values become refcounted slices of it), not a borrow.
+                    let msg = match decoder.decode(data) {
                         Ok(m) => m,
                         Err(e) => {
                             source.for_each_member_metrics(
@@ -1010,9 +1114,17 @@ async fn run_pump(source: Arc<SharedSource>) {
                     let flush = source.ack.flush_lsn();
                     source.for_each_member_metrics(|m| m.set_confirmed_flush_lsn(flush));
                     client.update_applied_lsn(Lsn(flush));
+                    should_flush = true;
                 }
                 ReplicationEvent::KeepAlive { wal_end, .. } => {
-                    source.for_each_member_metrics(|m| m.set_server_wal_end(wal_end.0));
+                    // Accumulate the server WAL end and defer the per-member fan-out to
+                    // `flush_reader_metrics` (called on should_flush below), which sets
+                    // `server_wal_end` once per commit/keepalive rather than per event.
+                    // Trunk's inline `set_server_wal_end` here is redundant with that
+                    // flush and would reintroduce the per-event fan-out this accumulator
+                    // was added to remove.
+                    max_wal_end = max_wal_end.max(wal_end.0);
+                    should_flush = true;
                     if !txn_open {
                         source.ack.credit_idle(wal_end.0);
                     }
@@ -1030,11 +1142,39 @@ async fn run_pump(source: Arc<SharedSource>) {
                     break 'reconnect;
                 }
             }
+            // Processing (decode + route/deliver) for this event; paired with the
+            // input-wait above. Accumulated locally; fanned out to members only on a
+            // commit/keepalive (should_flush) — the frequent per-row XLogData events
+            // just accumulate, keeping the hot decode path free of the per-event
+            // member-iteration fan-out.
+            //
+            // CAVEAT (waterfall reader-split): this bucket is "decode + route + DELIVER",
+            // and delivery includes `await`ing the bounded per-member channel in
+            // `deliver_commit`. When a member's sink is slow the pump BLOCKS on that send
+            // — downstream back-pressure, not our decode cost — yet it lands here and
+            // deflates the reader input-share, which can make the classifier read
+            // READER-decode-bound when the truth is apply-bound. A dedicated
+            // `member_send_wait_micros` accumulator around the send `await`s (below and in
+            // `deliver_commit`) would make input-share honest; until then the waterfall
+            // annotates the shared-path processing bucket accordingly. TODO(cdc-metrics).
+            proc_us_acc = proc_us_acc.saturating_add(
+                u64::try_from(processing_start.elapsed().as_micros()).unwrap_or(u64::MAX),
+            );
+            let us_since_flush = input_us_acc.saturating_add(proc_us_acc);
+            if should_flush || us_since_flush >= 1_000_000 {
+                flush_reader_metrics(&source, input_us_acc, proc_us_acc, max_wal_end);
+                input_us_acc = 0;
+                proc_us_acc = 0;
+                max_wal_end = 0;
+            }
         } // end 'recv
 
         // Inner loop broke for reconnect (transient error or membership
         // change). On membership change the backoff was just reset by the
         // successful connect, so the wait is the minimal initial delay.
+        // Mark the drop so the next successful connect can attribute the
+        // disconnected duration (this wait + reconnect handshake).
+        disconnect_at = Some(std::time::Instant::now());
         backoff.wait().await;
     } // end 'reconnect
 
@@ -1271,7 +1411,7 @@ async fn deliver_commit(
             {
                 Ok(()) => break,
                 Err(mpsc::error::SendTimeoutError::Closed(_)) => {
-                    source.detach_member(member_key, "changes stream receiver dropped");
+                    source.detach_member(member_key, "changes stream receiver dropped", true);
                     break;
                 }
                 Err(mpsc::error::SendTimeoutError::Timeout(returned)) => {

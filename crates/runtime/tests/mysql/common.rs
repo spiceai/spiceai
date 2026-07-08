@@ -42,7 +42,7 @@ pub fn make_mysql_dataset(path: &str, name: &str, port: u16, accelerated: bool) 
     dataset
 }
 
-const MYSQL_ROOT_PASSWORD: &str = "integration-test-pw";
+pub const MYSQL_ROOT_PASSWORD: &str = "integration-test-pw";
 const MYSQL_IMAGE: &str = "docker.io/library/mysql:latest";
 const MYSQL_DOCKER_CONTAINER: &str = "runtime-integration-test-mysql";
 const MYSQL_CONTAINER_START_TIMEOUT: Duration = Duration::from_mins(3);

@@ -70,6 +70,11 @@ pub struct DatasetTestArgs {
     #[arg(long)]
     pub(crate) scale_factor: Option<f64>,
 
+    /// Source database for the CH-benCH workload (only used with `--query-set chbench`).
+    /// Defaults to postgres.
+    #[arg(long, value_enum, default_value = "postgres")]
+    pub(crate) source_type: SourceType,
+
     /// The query set to use for the test
     #[arg(long)]
     pub(crate) query_set: QuerySetArg,
@@ -125,6 +130,15 @@ pub enum QuerySetArg {
     ParameterizedTpch,
     /// Scenario query set loaded from a file (use --scenario-query-file)
     Scenario,
+}
+
+/// Source database backing the CH-benCH workload.
+#[derive(Clone, Copy, ValueEnum, Debug, Deserialize, Serialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum SourceType {
+    #[default]
+    Postgres,
+    Mysql,
 }
 
 #[derive(Clone, ValueEnum, Debug, Deserialize, Serialize)]

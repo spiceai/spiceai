@@ -574,6 +574,16 @@ pub static REPLICATION_LAG_MAX_MS: LazyLock<Gauge<f64>> = LazyLock::new(|| {
         .build()
 });
 
+pub static REPLICATION_LAG_BYTES: LazyLock<Gauge<f64>> = LazyLock::new(|| {
+    meter()
+        .f64_gauge("replication_lag_bytes")
+        .with_description(
+            "Replication WAL backlog in bytes (server WAL end − confirmed flush LSN) per dataset — the direct source-side CDC backpressure signal.",
+        )
+        .with_unit("By")
+        .build()
+});
+
 pub static OLTP_TPMC: LazyLock<Gauge<f64>> = LazyLock::new(|| {
     meter()
         .f64_gauge("tpmc")

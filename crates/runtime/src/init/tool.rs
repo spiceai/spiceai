@@ -17,11 +17,12 @@ limitations under the License.
 use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use crate::{
-    Runtime, UnableToInitializeLlmToolSnafu, metrics, status,
+    Runtime, UnableToInitializeLlmToolSnafu, status,
     tools::{self, Tooling, factory::default_available_catalogs},
 };
 use futures::future::join_all;
 use opentelemetry::KeyValue;
+use runtime_metrics as metrics;
 use runtime_secrets::get_params_with_secrets;
 use runtime_tools::catalog::SpiceToolCatalog;
 use secrecy::SecretString;

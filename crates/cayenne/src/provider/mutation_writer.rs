@@ -93,8 +93,8 @@ use super::table::{CayenneCdcWrite, CayenneTableProvider, record_cayenne_write_p
 /// Forwarding both together keeps the two histograms paired per batch.
 fn record_cayenne_cdc_burst(table_name: &str, rows: u64, bytes: u64) {
     let dims = [telemetry::KeyValue::new("table", table_name.to_string())];
-    telemetry::track_cayenne_cdc_burst_rows(rows, &dims);
-    telemetry::track_cayenne_cdc_burst_bytes(bytes, &dims);
+    telemetry::cayenne::track_cdc_burst_rows(rows, &dims);
+    telemetry::cayenne::track_cdc_burst_bytes(bytes, &dims);
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1047,7 +1047,7 @@ impl<'a> AppendMutationWriter<'a> {
             // this write goes straight to a staged Vortex write without ever
             // buffering. `try_inline_or_restream` (which records rows_cap/bytes_cap
             // and the burst shape) is skipped, so attribute the flip here.
-            telemetry::track_cayenne_inline_fallback(&[
+            telemetry::cayenne::track_inline_fallback(&[
                 telemetry::KeyValue::new("table", self.table.table_name().to_string()),
                 telemetry::KeyValue::new("reason", "blocking_config"),
             ]);
@@ -1336,7 +1336,7 @@ impl<'a> AppendMutationWriter<'a> {
         // not an admission-cap event, so it is deliberately left uncounted rather
         // than mislabeled as a cap.
         if let Some(reason) = buffer.overflow_reason() {
-            telemetry::track_cayenne_inline_fallback(&[
+            telemetry::cayenne::track_inline_fallback(&[
                 telemetry::KeyValue::new("table", self.table.table_name().to_string()),
                 telemetry::KeyValue::new("reason", reason),
             ]);

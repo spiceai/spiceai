@@ -1,6 +1,6 @@
 //! # pgwire-replication
 //!
-//! A Tokio-based PostgreSQL logical replication client implementing the pgoutput protocol.
+//! A Tokio-based `PostgreSQL` logical replication client implementing the pgoutput protocol.
 //!
 //! ## Features
 //!
@@ -60,31 +60,11 @@
 //! - `scram` (default) - SCRAM-SHA-256 authentication
 //! - `md5` - MD5 authentication (legacy)
 
-// spiceai vendoring: this is third-party code excluded from the workspace lint
-// policy (see `--exclude pgwire-replication` in the Makefile). It is still
-// compiled as a path dependency of `data_components`, and path deps are linted
-// (not `--cap-lints`-suppressed), so the workspace's forced `-D` clippy flags
-// would otherwise fire on unmodified upstream code. We suppress them here
-// rather than editing upstream sources — mirroring the other vendored crates
-// (lopdf/ttf-parser/pdf-extract). Upstream's own `#![warn(clippy::cargo, ...)]`
-// is intentionally dropped: under the workspace `-Dwarnings` it escalated
-// `clippy::cargo` to deny and reported `cargo_common_metadata` for every other
-// workspace crate.
-#![allow(
-    clippy::all,
-    clippy::pedantic,
-    clippy::nursery,
-    clippy::cargo,
-    clippy::unwrap_used,
-    clippy::expect_used,
-    clippy::clone_on_ref_ptr,
-    clippy::todo,
-    clippy::assertions_on_result_states,
-    clippy::equatable_if_let,
-    clippy::needless_collect,
-    clippy::redundant_clone,
-    clippy::allow_attributes
-)]
+// spiceai vendoring: originally imported from crates.io 0.3.2 (see Cargo.toml),
+// now maintained as a local fork. Unlike the other vendored crates it carries no
+// blanket `#![allow]` and is NOT excluded from `make lint-rust` — it is held to
+// the same clippy bar (pedantic + the workspace's denied lints) as first-class
+// workspace crates.
 
 pub mod auth;
 pub mod client;
@@ -95,6 +75,6 @@ pub mod protocol;
 pub mod tls;
 
 pub use client::{ReplicationClient, ReplicationEvent, ReplicationEventReceiver};
-pub use config::{ReplicationConfig, SslMode, TlsConfig};
+pub use config::{PgOutputFormat, ReplicationConfig, SslMode, TlsConfig};
 pub use error::{PgWireError, Result};
 pub use lsn::Lsn;

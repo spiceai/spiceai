@@ -42,6 +42,7 @@ pub mod expr;
 pub mod session_state;
 #[cfg(feature = "datafusion")]
 pub mod stream_utils;
+pub mod time;
 pub mod time_format;
 #[cfg(feature = "datafusion")]
 pub mod timestamp_filter;

@@ -1352,6 +1352,22 @@ pub struct CayenneTableProvider {
     /// (the single shard keeps `MemTier::epoch` as the slot-ack currency, so the
     /// N=1 path is byte-identical). Shared across writer clones.
     mem_tier_apply_epoch: Arc<std::sync::atomic::AtomicU64>,
+    /// The highest durable epoch any real checkpoint has reported to the slot
+    /// advancer, encoded as `epoch + 1` so `0` means "no checkpoint has fired
+    /// yet" (epoch `0` is itself a valid N>1 `apply_epoch`). Updated in
+    /// [`Self::fire_slot_advancer`] via `fetch_max`, so it is monotone
+    /// non-decreasing. Read by the `nothing_to_flush` path of
+    /// [`Self::checkpoint_mem_tier`] to RE-fire the advancer on an empty tier:
+    /// the runtime enqueues a batch's source committer AFTER the write returns
+    /// its epoch, so a background checkpoint can flush that batch and fire the
+    /// advancer in the gap BEFORE the committer is queued. The next durable-path
+    /// apply then checkpoints the (now-empty) tier to release the late committer
+    /// — an empty tier means every appended epoch is already durable, so the
+    /// re-fire is always safe and releases exactly the committers at or below
+    /// this watermark. Without it the runtime declares the deferred-commit queue
+    /// permanently stuck and fatally stops the changes stream (#11644). Shared
+    /// across writer clones.
+    last_fired_durable_epoch: Arc<std::sync::atomic::AtomicU64>,
     /// Cross-layer handle the runtime installs in memory mode so
     /// `checkpoint_mem_tier` can advance the source slot AFTER the durable fence
     /// (the slot-deferral correctness seam). `None` in file mode (and for
@@ -1738,7 +1754,7 @@ pub(crate) fn record_cayenne_write_phase(table_name: &str, phase: &'static str, 
         duration_ms = elapsed.as_millis(),
         "Cayenne write phase completed"
     );
-    telemetry::track_cayenne_write_phase_duration(
+    telemetry::cayenne::track_write_phase_duration(
         elapsed,
         &[
             telemetry::KeyValue::new("table", table_name.to_string()),
@@ -4403,6 +4419,7 @@ impl CayenneTableProvider {
                 .collect::<Vec<_>>()
                 .into(),
             mem_tier_apply_epoch: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            last_fired_durable_epoch: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             slot_advancer: Arc::new(ParkingMutex::new(None)),
             mem_tier_max_age_ms,
             mem_tier_shadow_present: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -4733,8 +4750,20 @@ impl CayenneTableProvider {
         // use the whole budget; `Maintenance` (compaction outputs, sorted
         // rewrites, overwrites) is capped below it so a latency-bound delta
         // encode never queues behind a whole multi-shard compaction pass.
+        // Attribute the time blocked on the shared encode budget to a dedicated
+        // write phase so `cayenne_write_phase_duration_ms{phase="encode_permit_wait"}`
+        // splits semaphore-wait out of the aggregate write cost (the outer
+        // `cdc_apply_fixed_cost_ms{phase="write"}` in the runtime apply loop). The
+        // `cayenne_encode_acquire_wait_ms{class}` histogram inside `acquire_from`
+        // carries the same signal without the table label; this one keys by table.
+        let encode_permit_wait_start = Instant::now();
         let _encode_permits =
             super::write_budget::acquire_encode_permits(encode_shards, write_class).await;
+        record_cayenne_write_phase(
+            self.table_name(),
+            "encode_permit_wait",
+            encode_permit_wait_start,
+        );
 
         // Construct snapshot directory URL
         let snapshot_dir_url = Self::snapshot_dir_url(
@@ -5315,6 +5344,7 @@ impl CayenneTableProvider {
             // lock (the seq-ordering invariant requires a single lock per table).
             mem_tier_publish_locks: Arc::clone(&self.mem_tier_publish_locks),
             mem_tier_apply_epoch: Arc::clone(&self.mem_tier_apply_epoch),
+            last_fired_durable_epoch: Arc::clone(&self.last_fired_durable_epoch),
             slot_advancer: Arc::clone(&self.slot_advancer),
             mem_tier_max_age_ms: self.mem_tier_max_age_ms,
             mem_tier_shadow_present: Arc::clone(&self.mem_tier_shadow_present),
@@ -8078,7 +8108,7 @@ impl CayenneTableProvider {
         // inline rows, so the tombstone-vs-rewrite ratio (paired with
         // `track_cayenne_inline_tombstone_write`) reflects real rewrite work.
         if rewrite.removed_rows > 0 {
-            telemetry::track_cayenne_inline_rewrite_fallback(&[telemetry::KeyValue::new(
+            telemetry::cayenne::track_inline_rewrite_fallback(&[telemetry::KeyValue::new(
                 "table",
                 self.table_metadata.table_name.clone(),
             )]);
@@ -9694,7 +9724,7 @@ impl CayenneTableProvider {
         // keys hidden, dimensioned by table; pair with the rewrite-fallback
         // counter in `build_inlined_data_rewrite_for_pk_keys` to observe the
         // tombstone-vs-rewrite ratio.
-        telemetry::track_cayenne_inline_tombstone_write(
+        telemetry::cayenne::track_inline_tombstone_write(
             u64::try_from(delete_count).unwrap_or(u64::MAX),
             &[telemetry::KeyValue::new(
                 "table",
@@ -12121,7 +12151,7 @@ impl CayenneTableProvider {
         } else {
             "failed"
         };
-        telemetry::track_cayenne_compaction_duration(
+        telemetry::cayenne::track_compaction_duration(
             pass_start.elapsed(),
             &[
                 telemetry::KeyValue::new("table", table.clone()),
@@ -12135,7 +12165,7 @@ impl CayenneTableProvider {
                 source: DataFusionError::ResourcesExhausted(_)
             })
         ) {
-            telemetry::track_cayenne_compaction_memory_exhausted(&[
+            telemetry::cayenne::track_compaction_memory_exhausted(&[
                 telemetry::KeyValue::new("table", table),
                 telemetry::KeyValue::new("kind", "full"),
             ]);
@@ -13001,7 +13031,7 @@ impl CayenneTableProvider {
             } else {
                 "failed"
             };
-            telemetry::track_cayenne_compaction_duration(
+            telemetry::cayenne::track_compaction_duration(
                 pass_start.elapsed(),
                 &[
                     telemetry::KeyValue::new("table", table.clone()),
@@ -13015,7 +13045,7 @@ impl CayenneTableProvider {
                     source: DataFusionError::ResourcesExhausted(_)
                 })
             ) {
-                telemetry::track_cayenne_compaction_memory_exhausted(&[
+                telemetry::cayenne::track_compaction_memory_exhausted(&[
                     telemetry::KeyValue::new("table", table),
                     telemetry::KeyValue::new("kind", "subset"),
                 ]);
@@ -13505,7 +13535,7 @@ impl CayenneTableProvider {
                 total_input_bytes
             }
         };
-        telemetry::track_cayenne_compaction_merged_bytes(
+        telemetry::cayenne::track_compaction_merged_bytes(
             merged_output_bytes,
             &[
                 telemetry::KeyValue::new("table", self.table_metadata.table_name.clone()),
@@ -15291,7 +15321,7 @@ impl CayenneTableProvider {
             Self::invalidate_list_files_cache(self.context.runtime_env(), &snapshot_dir_url);
         }
 
-        telemetry::track_cayenne_list_files_cache_publish(
+        telemetry::cayenne::track_list_files_cache_publish(
             applied_delta,
             &[telemetry::KeyValue::new(
                 "table",
@@ -15973,7 +16003,7 @@ impl CayenneTableProvider {
         generation: u64,
         structural_epoch: u64,
     ) -> Result<InlinedCache> {
-        telemetry::track_cayenne_inline_cache_populate(
+        telemetry::cayenne::track_inline_cache_populate(
             false,
             &[telemetry::KeyValue::new(
                 "table",
@@ -16095,7 +16125,7 @@ impl CayenneTableProvider {
         structural_epoch: u64,
         base: &InlinedCache,
     ) -> Result<InlinedCache> {
-        telemetry::track_cayenne_inline_cache_populate(
+        telemetry::cayenne::track_inline_cache_populate(
             true,
             &[telemetry::KeyValue::new(
                 "table",
@@ -17027,12 +17057,21 @@ impl CayenneTableProvider {
     /// including this table's own background tick) can always make progress
     /// while we wait, and the wait is deadline-bounded regardless.
     pub(crate) async fn wait_for_budget_or_spill(&self, incoming_bytes: u64) -> Result<bool> {
-        if crate::provider::mem_tier_budget::reserve_bytes_or_wait(
+        let budget_wait_start = Instant::now();
+        let reserved = crate::provider::mem_tier_budget::reserve_bytes_or_wait(
             incoming_bytes,
             crate::provider::mem_tier_budget::BUDGET_WAIT,
         )
-        .await
-        {
+        .await;
+        // Attribute the mem-tier budget wait (the global MemTierBudget valve).
+        telemetry::cayenne::track_mem_tier_acquire_wait(
+            budget_wait_start.elapsed(),
+            &[telemetry::KeyValue::new(
+                "table",
+                self.table_name().to_string(),
+            )],
+        );
+        if reserved {
             // Another table's flush freed the bytes and the reservation is
             // already recorded — proceed WITHOUT spilling: the freeing table
             // paid the flush.
@@ -17408,7 +17447,7 @@ impl CayenneTableProvider {
         };
         drop(write_guard);
         record_cayenne_write_phase(self.table_name(), "cdc_path_inmemory", write_start);
-        telemetry::track_cayenne_cdc_absorbed_delete_keys(
+        telemetry::cayenne::track_cdc_absorbed_delete_keys(
             key_count,
             &[telemetry::KeyValue::new(
                 "table",
@@ -18106,6 +18145,19 @@ impl CayenneTableProvider {
             shard_snapshots.iter().all(|s| s.is_empty())
         };
         if nothing_to_flush {
+            // The tier is fully empty — every epoch ever appended has already
+            // been flushed durable by a prior checkpoint (a real flush always
+            // fires the advancer for its epoch). But the runtime enqueues a
+            // batch's source committer AFTER `write_change` returns its epoch, so
+            // a committer can be queued LATE, after the flush that drained its
+            // epoch already fired. Re-fire the advancer with the last durable
+            // watermark so that late committer is released; otherwise the runtime
+            // finds a non-empty deferred-commit queue after this "successful"
+            // checkpoint and fatally (permanently) stops the changes stream
+            // (#11644). Safe because an empty tier carries no un-durable RAM
+            // batch, and idempotent because the advancer only drains committers
+            // still queued at or below the watermark.
+            self.refire_last_durable_slot_advancer().await;
             return Ok(0);
         }
         // At N==1 the slot-ack currency stays the single shard's `MemTier::epoch`
@@ -18496,7 +18548,10 @@ impl CayenneTableProvider {
             "mem_tier_checkpoint",
             checkpoint_start,
         );
-        tracing::debug!(
+        // Fires on every mem-tier checkpoint flush — per-snapshot happy-path
+        // diagnostic (spammy under sustained ingest, e.g. a snapshot storm), so
+        // keep it at trace so it is omitted even at debug verbosity.
+        tracing::trace!(
             target: "cayenne::mem_tier",
             table = self.table_metadata.table_name.as_str(),
             flushed_rows = flushed_mem_rows,
@@ -18894,6 +18949,14 @@ impl CayenneTableProvider {
     /// up (memory mode). A no-op in file mode / when the runtime did not install
     /// a handle.
     async fn fire_slot_advancer(&self, durable_epoch: u64) {
+        // Record the durable high-watermark (encoded `epoch + 1`, monotone via
+        // `fetch_max`) so the `nothing_to_flush` path can RE-fire the advancer for
+        // a source committer queued after this flush already drained its epoch —
+        // the late-enqueue race that otherwise fatally stops the stream (#11644).
+        self.last_fired_durable_epoch.fetch_max(
+            durable_epoch.saturating_add(1),
+            std::sync::atomic::Ordering::SeqCst,
+        );
         // Reset the freshness clock: the slot just advanced (via a seal or a bake),
         // so the next seal is due one `seal_age` from now. Read by `seal_due`.
         *self.last_slot_advance_at.lock() = Instant::now();
@@ -18901,7 +18964,7 @@ impl CayenneTableProvider {
         // counter so `cayenne_mem_tier_{durable,apply}_epoch` expose the slot-ack
         // gap. A gap that GROWS while checkpoints keep firing is a stuck watermark
         // (the N>1 WAL-drain stall) — vs the trigger never firing (the tick counter).
-        telemetry::track_cayenne_mem_tier_epoch(
+        telemetry::cayenne::track_mem_tier_epoch(
             self.mem_tier_apply_epoch
                 .load(std::sync::atomic::Ordering::Relaxed),
             durable_epoch,
@@ -18910,6 +18973,32 @@ impl CayenneTableProvider {
                 self.table_metadata.table_name.clone(),
             )],
         );
+        let advancer = self.slot_advancer.lock().clone();
+        if let Some(advancer) = advancer {
+            advancer.on_checkpoint_durable(durable_epoch).await;
+        }
+    }
+
+    /// Re-fire the installed slot advancer with the last durable epoch a real
+    /// checkpoint reported, WITHOUT touching the freshness clock or the epoch
+    /// telemetry (this is not a new durable advance — it releases committers a
+    /// prior flush already made durable). Used by the `nothing_to_flush` path of
+    /// [`Self::checkpoint_mem_tier`]: an empty tier means every appended epoch is
+    /// already durable, so a source committer the runtime queued LATE — after the
+    /// flush that drained its epoch fired — must still be released. The advancer
+    /// drains only committers still queued at or below the watermark, so a no-op
+    /// (empty queue, or nothing new) is harmless and this is idempotent across
+    /// repeated empty checkpoints. See [`Self::last_fired_durable_epoch`] and
+    /// issue #11644.
+    async fn refire_last_durable_slot_advancer(&self) {
+        let encoded = self
+            .last_fired_durable_epoch
+            .load(std::sync::atomic::Ordering::SeqCst);
+        // `0` means no checkpoint has ever fired: nothing is durable yet, so
+        // there is nothing to release.
+        let Some(durable_epoch) = encoded.checked_sub(1) else {
+            return;
+        };
         let advancer = self.slot_advancer.lock().clone();
         if let Some(advancer) = advancer {
             advancer.on_checkpoint_durable(durable_epoch).await;
@@ -21020,14 +21109,14 @@ impl CayenneTableProvider {
                         file = %part_file.object_meta.location,
                         "Pruned Vortex file at listing time via footer statistics"
                     );
-                    telemetry::track_cayenne_scan_files(
+                    telemetry::cayenne::track_scan_files(
                         1,
                         1,
                         &[telemetry::KeyValue::new("table", table_name.clone())],
                     );
                     return Ok(None);
                 }
-                telemetry::track_cayenne_scan_files(
+                telemetry::cayenne::track_scan_files(
                     1,
                     0,
                     &[telemetry::KeyValue::new("table", table_name.clone())],
@@ -21227,7 +21316,7 @@ impl CayenneTableProvider {
     }
 
     fn record_listing_fence_wait_duration(&self, duration: Duration) {
-        telemetry::track_cayenne_listing_fence_wait_duration(
+        telemetry::cayenne::track_listing_fence_wait_duration(
             duration,
             &[telemetry::KeyValue::new(
                 "dataset",
@@ -21237,7 +21326,7 @@ impl CayenneTableProvider {
     }
 
     fn record_listing_scan_duration(&self, duration: Duration) {
-        telemetry::track_cayenne_listing_scan_duration(
+        telemetry::cayenne::track_listing_scan_duration(
             duration,
             &[telemetry::KeyValue::new(
                 "dataset",
@@ -23256,7 +23345,7 @@ impl super::compaction::CompactionRunner for CayenneTableProvider {
         let snap = self.context.ingest_snapshot();
         let actuators = self.context.live_actuator_values();
         let goals = self.context.goals();
-        telemetry::track_cayenne_autotune_state(
+        telemetry::cayenne::track_autotune_state(
             &telemetry::CayenneAutotuneState {
                 rows_per_sec: snap.rows_per_sec,
                 bytes_per_sec: snap.bytes_per_sec,
@@ -23304,7 +23393,7 @@ impl super::compaction::CompactionRunner for CayenneTableProvider {
         // The closed-loop control step. A no-op when dynamic tuning is disabled
         // (returns `None`); otherwise applies at most one bounded actuator change.
         if let Some(adj) = self.context.retune(super::tuning::MIN_DWELL) {
-            telemetry::track_cayenne_autotune_adjustment(&[
+            telemetry::cayenne::track_autotune_adjustment(&[
                 telemetry::KeyValue::new("table", table.clone()),
                 telemetry::KeyValue::new("actuator", adj.actuator.as_str()),
             ]);
@@ -23476,7 +23565,7 @@ impl super::compaction::MemTierCheckpointRunner for CayenneTableProvider {
         // N>1 sharded tier diagnosis lacked (no checkpoint-fire metric existed).
         let tick_table = self.table_metadata.table_name.clone();
         let emit_tick = |outcome: &'static str| {
-            telemetry::track_cayenne_mem_tier_checkpoint_tick(&[
+            telemetry::cayenne::track_mem_tier_checkpoint_tick(&[
                 telemetry::KeyValue::new("table", tick_table.clone()),
                 telemetry::KeyValue::new("outcome", outcome),
             ]);
@@ -26032,6 +26121,71 @@ mod tests {
             tier.sealed_segments,
             tier.segments.len(),
             "every segment is now the immutable (sealed) piece"
+        );
+    }
+
+    /// Repro for #11644 (root cause of the fatal changes-stream stop). In
+    /// `cdc_durability: memory` the runtime enqueues a batch's source committer
+    /// tagged with its mem-tier epoch AFTER `write_change` returns the epoch. A
+    /// background mem-tier checkpoint can flush that batch and fire the slot
+    /// advancer in the gap BEFORE the committer is queued (see
+    /// `test_slot_advancer_delays_committers_pushed_after_checkpoint` in the
+    /// runtime). The next durable-path apply then calls `checkpoint_mem_tier` to
+    /// release the now-late-queued committer — but the tier is ALREADY EMPTY, so
+    /// the `nothing_to_flush` early return must STILL re-fire the slot advancer
+    /// with the last durable epoch. Without it the advancer never runs for the
+    /// late committer, the runtime's deferred-commit queue stays non-empty, and
+    /// the gate declares "deferred source commits remain after durable
+    /// checkpoint" — fatally (and permanently) stopping the stream.
+    #[tokio::test]
+    async fn mem_tier_empty_checkpoint_refires_slot_advancer() {
+        use std::sync::atomic::Ordering::SeqCst;
+        // A checkpoint on an empty tier never legitimately advances to this
+        // sentinel epoch, so any observed value below it proves a real re-fire.
+        const SENTINEL: u64 = u64::MAX;
+
+        let runtime_env = SessionContext::new().runtime_env();
+        let (provider, _catalog, _tmp) =
+            create_memory_mode_upsert_table("empty_ckpt_refire", Arc::clone(&runtime_env)).await;
+        let durable = Arc::new(std::sync::atomic::AtomicU64::new(SENTINEL));
+        provider.install_slot_advancer(Arc::new(EpochRecorder(Arc::clone(&durable))));
+
+        // Append a batch and checkpoint it durable: this is the "background
+        // checkpoint" of the race — it fires the advancer for the batch's epoch
+        // and drains the tier.
+        let no_deletions = OnConflictDeletions::default();
+        let batch = int64_id_batch(&[1, 2, 3]);
+        let bytes = batch.get_array_memory_size() as u64;
+        let epoch = provider
+            .append_to_mem_tier(vec![batch], &no_deletions, bytes, 0)
+            .await
+            .expect("append");
+        provider
+            .checkpoint_mem_tier()
+            .await
+            .expect("flush checkpoint");
+        assert_eq!(
+            durable.load(SeqCst),
+            epoch,
+            "the flushing checkpoint fires the advancer for the batch's epoch"
+        );
+        assert!(provider.mem_tier.tier().load().is_empty(), "tier drained");
+
+        // Now the runtime queues the batch's committer (LATE — after the flush
+        // already fired). The gate runs `checkpoint_mem_tier` on the now-empty
+        // tier to release it. Reset the recorder so only a genuine re-fire is
+        // observable, then run the empty-tier checkpoint.
+        durable.store(SENTINEL, SeqCst);
+        provider
+            .checkpoint_mem_tier()
+            .await
+            .expect("empty-tier gate checkpoint");
+        assert_eq!(
+            durable.load(SeqCst),
+            epoch,
+            "an empty-tier checkpoint must re-fire the slot advancer with the last \
+             durable epoch so a late-queued committer is released (issue #11644); \
+             without this the deferred-commit queue is declared permanently stuck"
         );
     }
 
