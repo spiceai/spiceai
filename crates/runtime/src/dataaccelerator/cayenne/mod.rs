@@ -112,8 +112,8 @@ pub enum Error {
 
     #[snafu(display(
         "Failed to prepare the Cayenne acceleration directory {path}: {source}. \
-        Ensure 'cayenne_file_path' resolves to a location Spice can create and write to \
-        (its parent directory must exist and be writable). \
+        Ensure 'cayenne_file_path' resolves to a local path Spice has permission to \
+        create and write to. \
         See: https://spiceai.org/docs/components/data-accelerators/cayenne#params"
     ))]
     AccelerationDirectoryUnavailable {
@@ -1668,13 +1668,17 @@ impl CayenneAccelerator {
         }
 
         // Strip any `file://` scheme so the on-disk operations receive a real
-        // filesystem path.
+        // filesystem path. Materialize the `Arc<str>` once for reuse in both
+        // error contexts below.
         let fs_path = fs_probe_path(dir_path);
+        let path: Arc<str> = Arc::from(fs_path);
 
         // 1. mkdir -p: create the full directory tree.
         tokio::fs::create_dir_all(fs_path)
             .await
-            .context(AccelerationDirectoryUnavailableSnafu { path: fs_path })?;
+            .context(AccelerationDirectoryUnavailableSnafu {
+                path: Arc::clone(&path),
+            })?;
 
         // 2. Writability probe: write then remove a marker file. The probe file
         //    name is unique per directory prep so concurrent dataset loads
@@ -1683,7 +1687,7 @@ impl CayenneAccelerator {
             .join(format!(".spice-cayenne-write-probe-{}", uuid::Uuid::now_v7()));
         tokio::fs::write(&probe_path, b"spice")
             .await
-            .context(AccelerationDirectoryUnavailableSnafu { path: fs_path })?;
+            .context(AccelerationDirectoryUnavailableSnafu { path })?;
         // Best-effort cleanup; a leftover probe file is harmless.
         let _ = tokio::fs::remove_file(&probe_path).await;
 
@@ -2240,16 +2244,20 @@ impl DataAccelerator for CayenneAccelerator {
         let dir_path = self.file_path(source)?;
         let is_s3_express = s3::is_s3_express_data_path(source);
 
-        // For local storage, validate and prepare both the data and metadata
-        // directories up front. A misconfigured `cayenne_file_path` (missing
-        // parent, or an existing-but-unwritable directory) fails here with an
-        // actionable, path-naming error instead of surfacing later as a bare
+        // Validate and prepare the acceleration directories up front. A
+        // misconfigured local path (missing intermediate directory, or an
+        // existing-but-unwritable directory) fails here with an actionable,
+        // path-naming error instead of surfacing later as a bare
         // `No such file or directory (os error 2)` from the write path.
-        if !is_s3_express {
-            Self::prepare_local_acceleration_dir(&dir_path).await?;
-            let metadata_dir = Self::resolve_metadata_dir(source.acceleration());
-            Self::prepare_local_acceleration_dir(&metadata_dir).await?;
-        }
+        //
+        // `prepare_local_acceleration_dir` no-ops for object-store (`s3://`)
+        // paths, so this correctly covers every layout: fully-local setups
+        // (both dirs local), and S3 Express (the data dir on S3 is skipped, but
+        // the metadata dir is always local and must still be validated — the
+        // `is_s3_express` data-path flag says nothing about the metadata dir).
+        Self::prepare_local_acceleration_dir(&dir_path).await?;
+        let metadata_dir = Self::resolve_metadata_dir(source.acceleration());
+        Self::prepare_local_acceleration_dir(&metadata_dir).await?;
 
         // Handle S3 Express One Zone configuration
         if is_s3_express {
@@ -3444,6 +3452,17 @@ mod tests {
             .await
             .expect("set readonly perms");
 
+        // Confirm the environment actually enforces the write ban before
+        // asserting on it. Running as root (or on a mount that ignores
+        // permission bits) can write to a 0o555 directory anyway, which would
+        // make the probe legitimately succeed; in that case there is nothing to
+        // regress against, so skip rather than assert vacuously.
+        let sentinel = readonly.join("permission-enforced-probe");
+        let write_is_blocked = tokio::fs::write(&sentinel, b"x").await.is_err();
+        if !write_is_blocked {
+            let _ = tokio::fs::remove_file(&sentinel).await;
+        }
+
         let dir = readonly.to_string_lossy().to_string();
         let result = CayenneAccelerator::prepare_local_acceleration_dir(&dir).await;
 
@@ -3452,12 +3471,22 @@ mod tests {
         restore.set_mode(0o755);
         let _ = tokio::fs::set_permissions(&readonly, restore).await;
 
-        // Running as root bypasses permission bits, so only assert the failure
-        // (and the actionable error) when the probe could actually be blocked.
-        if let Err(err) = result {
-            assert!(
-                matches!(err, Error::AccelerationDirectoryUnavailable { .. }),
-                "expected AccelerationDirectoryUnavailable, got: {err}"
+        if write_is_blocked {
+            // The directory is genuinely unwritable, so the probe MUST fail with
+            // the actionable error — this is the behavior under test.
+            match result {
+                Err(Error::AccelerationDirectoryUnavailable { .. }) => {}
+                Err(other) => {
+                    panic!("expected AccelerationDirectoryUnavailable, got: {other}")
+                }
+                Ok(()) => panic!(
+                    "write+delete probe did not catch an unwritable directory (returned Ok)"
+                ),
+            }
+        } else {
+            eprintln!(
+                "skipping writability assertion: environment does not enforce the read-only bit \
+                 (likely running as root)"
             );
         }
     }

@@ -139,11 +139,13 @@ impl PartitionedWal {
         // distinction below drives whether we fsync the parent. If the table
         // root itself is missing (e.g. the very first write, before any
         // partition directory has been materialized), fall back to a recursive
-        // create rather than failing with a bare ENOENT — then fsync the parent
-        // exactly as the fresh-create path does.
-        let created = match tokio::fs::create_dir(wal_dir).await {
-            Ok(()) => true,
-            Err(source) if source.kind() == std::io::ErrorKind::AlreadyExists => false,
+        // create rather than failing with a bare ENOENT.
+        let table_root_created = match tokio::fs::create_dir(wal_dir).await {
+            Ok(()) => false,
+            Err(source) if source.kind() == std::io::ErrorKind::AlreadyExists => {
+                // Already exists: nothing was created, so no fsync is owed.
+                return Ok(());
+            }
             Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
                 tokio::fs::create_dir_all(wal_dir)
                     .await
@@ -153,21 +155,37 @@ impl PartitionedWal {
             Err(source) => return Err(Error::IoError { source }),
         };
 
-        if created {
-            let parent = table_root.to_path_buf(); // the table root
-            let table = table_root.display().to_string();
+        // Sync the table root so the newly created `_partitioned_wal/` entry is
+        // written through (directory ordering tier: plain fsync on macOS, full
+        // fsync elsewhere — see `provider/fsync_tier.rs`).
+        Self::ordering_sync_dir(table_root).await?;
 
-            // Sync the table root so the _partitioned_wal/ subdir entry is
-            // written through (directory ordering tier: plain fsync on
-            // macOS, full fsync elsewhere — see `provider/fsync_tier.rs`).
-            tokio::task::spawn_blocking(move || {
-                let dir = std::fs::File::open(&parent)?;
-                crate::provider::fsync_tier::ordering_sync_dir_std(&dir)
-            })
-            .await
-            .map_err(|source| Error::TaskPanicked { table, source })??;
+        // In the fallback path `table_root` itself was just created by
+        // `create_dir_all`, so its own directory entry is not yet durable.
+        // Sync its parent too — otherwise a crash could make `table_root` (and
+        // the `_partitioned_wal/` dir inside it) "disappear" even though the
+        // catalog was committed to point at it. This mirrors the parent-sync
+        // requirement documented in `Table::ensure_snapshot_dir_exists`.
+        if table_root_created
+            && let Some(grandparent) = table_root.parent()
+        {
+            Self::ordering_sync_dir(grandparent).await?;
         }
 
+        Ok(())
+    }
+
+    /// Open `dir` and fsync it at the directory ordering tier, so a child entry
+    /// created inside it is persisted through to the device.
+    async fn ordering_sync_dir(dir: &Path) -> Result<()> {
+        let path = dir.to_path_buf();
+        let table = dir.display().to_string();
+        tokio::task::spawn_blocking(move || {
+            let dir = std::fs::File::open(&path)?;
+            crate::provider::fsync_tier::ordering_sync_dir_std(&dir)
+        })
+        .await
+        .map_err(|source| Error::TaskPanicked { table, source })??;
         Ok(())
     }
 
@@ -471,6 +489,40 @@ mod tests {
                 },
             ],
         )
+    }
+
+    #[tokio::test]
+    async fn write_to_creates_missing_table_root() {
+        // The coordination dir uses a non-recursive `create_dir`, which assumes
+        // `table_root` already exists. If it does not (e.g. the very first write
+        // before any partition directory has been materialized), the write must
+        // still succeed by recursively creating the tree — not fail with a bare
+        // ENOENT. Uses a nested-missing `table_root` where only the temp dir
+        // exists.
+        let tmp = TempDir::new().expect("tempdir");
+        let table_root = tmp.path().join("schema").join("table");
+        assert!(
+            !table_root.exists(),
+            "precondition: nested table_root should not exist yet"
+        );
+
+        let wal = sample_wal();
+        let path = wal
+            .write_to(&table_root)
+            .await
+            .expect("write should create the missing table root");
+
+        assert!(path.exists(), "WAL file should exist after write");
+        assert!(
+            table_root.join(PARTITIONED_WAL_DIR).is_dir(),
+            "coordination dir should have been created under the new table root"
+        );
+
+        let all = PartitionedWal::read_all_in(&table_root)
+            .await
+            .expect("read");
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].0, wal);
     }
 
     #[tokio::test]
