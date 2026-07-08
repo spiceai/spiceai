@@ -435,7 +435,7 @@ const METRICS: &[MetricSpec] = &[
          (including sub-second waits). The pump subtracts this wait from \
          reader_processing_micros_total at the source, so that counter stays \
          decode-only; this metric exports the subtracted amount for attribution. \
-         Only reported for datasets on a shared slot.",
+         Only meaningful for datasets on a shared slot; dedicated-slot datasets will export 0.",
     )
     .unit("us")
     .auto_register(),
