@@ -355,6 +355,7 @@ mod tests {
     use arrow::array::Int64Array;
     use arrow::record_batch::RecordBatch;
     use arrow_schema::{DataType, Field, Schema};
+    use datafusion::datasource::TableProvider;
     use datafusion::datasource::sink::DataSink;
     use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
     use datafusion::prelude::SessionContext;
@@ -585,7 +586,6 @@ mod tests {
         // Retention-style DELETE of every row (the `retention_sql` shape),
         // leaving pending key-deletion tombstones. Subsequent appends isolate
         // from those tombstones by writing to a new snapshot.
-        use datafusion::datasource::TableProvider;
         let delete_plan = provider
             .delete_from(&ctx.state(), vec![col("id").gt_eq(lit(0_i64))])
             .await
