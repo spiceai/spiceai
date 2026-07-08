@@ -20763,11 +20763,19 @@ impl CayenneTableProvider {
         scan_config: &SessionConfig,
         read_schema_override: Option<SchemaRef>,
     ) -> datafusion_common::Result<Option<Arc<dyn ExecutionPlan>>> {
-        // Cold tier disabled (no location) → no branch. The object store for the
-        // cold URLs is resolved from the session registry: the default local
-        // store for `file://` cold, or the cold S3 store registered at scan top.
+        // Cold tier disabled (no location) → no branch.
         if !self.table_metadata.vortex_config.cold_tier_enabled() {
             return Ok(None);
+        }
+
+        // Register the cold object store on THIS session's registry
+        // (idempotent). `scan()` also registers it at scan top, but other
+        // callers — e.g. the PK keyset rebuild — build fresh session contexts,
+        // and an unregistered s3:// URL falls back to a default-region S3
+        // client (region-redirect failures on non-us-east-1 buckets). A local
+        // `file://` cold location needs no registration.
+        if let Some(ref cold_config) = self.cold_object_store_config {
+            Self::register_object_store_if_needed(state.runtime_env(), cold_config);
         }
 
         let cold_files = self
