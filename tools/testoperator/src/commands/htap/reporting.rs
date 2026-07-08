@@ -49,8 +49,11 @@ pub(super) struct ReplicationLagSummary {
 /// only the primary under-load scrape should be recorded so diagnostic re-scrapes
 /// don't overwrite the headline lag metric.
 ///
-/// Returns the headline worst-lag figures across all datasets, or `None` when no
-/// replication series were scraped (non-Cayenne / no CDC).
+/// Returns the headline worst-lag figures across all datasets, or `None` when the
+/// `*_replication_lag_ms` series was not scraped for any dataset — either because no
+/// replication metrics were scraped at all (non-Cayenne / no CDC) or because other
+/// replication counters were present but the lag gauge was absent. The rest of the
+/// replication table still prints in the latter case; only the lag summary is `None`.
 pub(super) fn emit_replication_metrics(
     metrics: &crate::spiced_metrics::SpicedMetrics,
     engine: &str,
@@ -914,7 +917,10 @@ impl RunSummary {
             let _ = writeln!(out, "| Worst replication lag (p99) | {} |", lag_s(lag.p99));
             let _ = writeln!(out, "| Worst replication lag (max) | {} |", lag_s(lag.max));
         } else {
-            let _ = writeln!(out, "| Worst replication lag | _no replication metrics_ |");
+            let _ = writeln!(
+                out,
+                "| Worst replication lag | _no replication lag metrics_ |"
+            );
         }
 
         if !self.queries.is_empty() {
