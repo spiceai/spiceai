@@ -101,11 +101,12 @@ pub use provider::{
     CayenneCdcWrite, CayenneContext, CayenneStagedAppend, CayenneTableProvider,
     CayenneTableProviderBuilder, EncodeBudgetSnapshot, PARTITIONED_WAL_DIR, PartitionedWal,
     PartitionedWalEntry, PreparedOverwrite, PreparedStagedAppend, QueryObservations, SlotAdvancer,
-    TimeRetentionFilterBuilder, cap_global_encode_concurrency, deregister_query_observations,
-    encode_budget_snapshot, global_mem_tier_total, global_mem_tier_used, global_qph,
+    TimeRetentionFilterBuilder, begin_compaction_shutdown, cap_global_encode_concurrency,
+    deregister_query_observations, drain_compaction_tasks, encode_budget_snapshot,
+    global_mem_tier_total, global_mem_tier_used, global_qph, in_flight_compaction_tasks,
     record_global_query, record_query_latency, register_query_observations,
-    set_compaction_runtime_env, set_compaction_runtime_handle, set_cpu_burstable,
-    set_global_encode_concurrency, set_global_mem_tier_bytes, set_global_memory_budget,
-    set_query_admission_governor, update_global_mem_tier_total,
+    reset_compaction_shutdown, set_compaction_runtime_env, set_compaction_runtime_handle,
+    set_cpu_burstable, set_global_encode_concurrency, set_global_mem_tier_bytes,
+    set_global_memory_budget, set_query_admission_governor, update_global_mem_tier_total,
 };
 pub use schema::transform_schema_for_vortex;

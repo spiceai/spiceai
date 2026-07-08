@@ -4850,6 +4850,7 @@ impl CayenneTableProvider {
 
         let tracked_schema = self.table_schema();
         let tracked_stream = {
+            let target_schema = Arc::clone(&tracked_schema);
             let total_bytes_written = Arc::clone(&total_bytes_written);
             let total_rows_written = Arc::clone(&total_rows_written);
             let last_progress_ms = Arc::clone(&last_progress_ms);
@@ -4858,36 +4859,57 @@ impl CayenneTableProvider {
             let start = start_time;
 
             stream.map(move |batch_result| {
-                if let Ok(batch) = &batch_result {
-                    total_bytes_written.fetch_add(batch.get_array_memory_size(), Ordering::Relaxed);
-                    total_rows_written.fetch_add(batch.num_rows() as u64, Ordering::Relaxed);
-                    stats_acc.update(batch);
+                let batch = batch_result?;
+                // Internal compaction reads can come from the query scan path,
+                // whose output schema may intentionally differ from the stored
+                // write schema (for example Utf8View when
+                // `cayenne_force_view_types` is enabled). Normalize every writer
+                // input batch to the snapshot writer schema before Vortex derives
+                // its dtype; otherwise the Vortex stream adapter can panic on a
+                // read-schema/write-schema dtype mismatch in the background
+                // compactor.
+                let batch = arrow_tools::record_batch::try_cast_to(
+                    batch,
+                    Arc::clone(&target_schema),
+                )
+                .map_err(|e| {
+                    DataFusionError::Context(
+                        format!(
+                            "Failed to cast writer input batch to Cayenne table schema for table {table_name}"
+                        ),
+                        Box::new(DataFusionError::from(e)),
+                    )
+                })?;
 
-                    if is_s3_storage {
-                        let elapsed = start.elapsed();
-                        let elapsed_ms = u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX);
-                        let last_logged = last_progress_ms.load(Ordering::Relaxed);
-                        if elapsed_ms.saturating_sub(last_logged) >= 10_000 {
-                            let bytes_so_far = total_bytes_written.load(Ordering::Relaxed);
-                            let throughput = if elapsed.as_secs_f64() > 0.0 {
-                                #[expect(clippy::cast_precision_loss)]
-                                let bytes_per_sec = bytes_so_far as f64 / elapsed.as_secs_f64();
-                                format_bytes_per_sec(bytes_per_sec)
-                            } else {
-                                "calculating...".to_string()
-                            };
-                            tracing::info!(
-                                "S3 upload for {}: streamed {} in {:.1}s, {}",
-                                table_name,
-                                format_bytes(bytes_so_far),
-                                elapsed.as_secs_f64(),
-                                throughput
-                            );
-                            last_progress_ms.store(elapsed_ms, Ordering::Relaxed);
-                        }
+                total_bytes_written.fetch_add(batch.get_array_memory_size(), Ordering::Relaxed);
+                total_rows_written.fetch_add(batch.num_rows() as u64, Ordering::Relaxed);
+                stats_acc.update(&batch);
+
+                if is_s3_storage {
+                    let elapsed = start.elapsed();
+                    let elapsed_ms = u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX);
+                    let last_logged = last_progress_ms.load(Ordering::Relaxed);
+                    if elapsed_ms.saturating_sub(last_logged) >= 10_000 {
+                        let bytes_so_far = total_bytes_written.load(Ordering::Relaxed);
+                        let throughput = if elapsed.as_secs_f64() > 0.0 {
+                            #[expect(clippy::cast_precision_loss)]
+                            let bytes_per_sec = bytes_so_far as f64 / elapsed.as_secs_f64();
+                            format_bytes_per_sec(bytes_per_sec)
+                        } else {
+                            "calculating...".to_string()
+                        };
+                        tracing::info!(
+                            "S3 upload for {}: streamed {} in {:.1}s, {}",
+                            table_name,
+                            format_bytes(bytes_so_far),
+                            elapsed.as_secs_f64(),
+                            throughput
+                        );
+                        last_progress_ms.store(elapsed_ms, Ordering::Relaxed);
                     }
                 }
-                batch_result
+
+                Ok(batch)
             })
         };
 
@@ -22966,6 +22988,9 @@ fn format_bytes_per_sec(bytes_per_sec: f64) -> String {
 #[async_trait::async_trait]
 impl super::compaction::CompactionRunner for CayenneTableProvider {
     async fn run_compaction_trigger(&self) -> std::result::Result<bool, String> {
+        let Some(_pass) = super::compaction::try_track_compaction_pass() else {
+            return Ok(false);
+        };
         // Routes to the fast protected-snapshot subset compaction, which only
         // rewrites immutable protected snapshots and CAS-swaps them in the
         // catalog. Key-delete tables can run concurrently with appends because
@@ -23650,6 +23675,112 @@ mod tests {
                     .downcast_ref::<StringViewArray>()
                     .is_some(),
                 "scan must emit StringViewArray under force_view_read_schema"
+            );
+        }
+    }
+
+    /// Regression guard for the current-snapshot compactor's read-schema/write-schema
+    /// boundary. The rewrite input is built with `TableProvider::scan()`, which
+    /// emits the query read schema (`Utf8View` here), but Vortex file writes must
+    /// use the stored table schema (`Utf8`). `write_to_snapshot` must normalize
+    /// the scanned batches before Vortex derives/checks its dtype; otherwise the
+    /// background current-snapshot compactor can panic on a dtype mismatch.
+    #[tokio::test]
+    async fn current_snapshot_compaction_casts_force_view_scan_to_write_schema() {
+        use arrow::array::{Int64Array, StringArray, StringViewArray};
+        use arrow::datatypes::{DataType, Field, Schema};
+
+        let ctx = SessionContext::new();
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let metadata_dir = format!("{}/metadata", temp_dir.path().to_str().expect("path"));
+        let data_dir = format!("{}/data", temp_dir.path().to_str().expect("path"));
+        std::fs::create_dir_all(&metadata_dir).expect("metadata dir");
+        let connection_string = format!("sqlite://{metadata_dir}/cayenne.db");
+        let catalog = Arc::new(CayenneCatalog::new(connection_string).expect("catalog"))
+            as Arc<dyn MetadataCatalog>;
+        catalog.init().await.expect("catalog init");
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("name", DataType::Utf8, false),
+        ]));
+        let vortex_config = VortexConfig {
+            force_view_read_schema: true,
+            ..VortexConfig::default()
+        };
+        let table_name = "view_compaction";
+        let context = CayenneContext::new(&vortex_config, ctx.runtime_env(), table_name);
+        let options = CreateTableOptions {
+            table_name: table_name.to_string(),
+            schema: Arc::clone(&schema),
+            primary_key: vec!["id".to_string()],
+            on_conflict: Some(OnConflict::Upsert(
+                datafusion_table_providers::util::column_reference::ColumnReference::new(vec![
+                    "id".to_string(),
+                ]),
+            )),
+            base_path: data_dir,
+            partition_column: None,
+            vortex_config,
+        };
+        let provider = CayenneTableProviderBuilder::new(Arc::clone(&catalog), ctx.runtime_env())
+            .with_context(context)
+            .create(options)
+            .await
+            .expect("table created");
+
+        assert_eq!(
+            provider
+                .schema()
+                .field_with_name("name")
+                .expect("name field")
+                .data_type(),
+            &DataType::Utf8View,
+        );
+        assert_eq!(
+            provider
+                .table_schema()
+                .field_with_name("name")
+                .expect("name field")
+                .data_type(),
+            &DataType::Utf8,
+        );
+
+        insert_batch(
+            &provider,
+            RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![
+                    Arc::new(Int64Array::from(vec![1_i64, 2])),
+                    Arc::new(StringArray::from(vec!["alice", "bob"])),
+                ],
+            )
+            .expect("batch"),
+        )
+        .await;
+        assert!(provider.cached_inlined_row_count() > 0, "rows land inline");
+
+        assert!(
+            provider
+                .rewrite_current_snapshot_for_compaction()
+                .await
+                .expect("current-snapshot rewrite succeeds"),
+            "rewrite should commit a compacted current snapshot"
+        );
+
+        let batches = read_all(&ctx, &provider, table_name).await;
+        let total: usize = batches.iter().map(RecordBatch::num_rows).sum();
+        assert_eq!(total, 2, "rows survive compaction");
+        for batch in &batches {
+            let idx = batch.schema().index_of("name").expect("name col");
+            assert_eq!(batch.schema().field(idx).data_type(), &DataType::Utf8View);
+            assert!(
+                batch
+                    .column(idx)
+                    .as_any()
+                    .downcast_ref::<StringViewArray>()
+                    .is_some(),
+                "query scan remains view-typed after compaction"
             );
         }
     }
