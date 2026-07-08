@@ -41,7 +41,6 @@ vortex-utils = { workspace = true, features = ["dashmap"] }
 anyhow = { workspace = true }
 criterion = { version = "0.7", features = ["html_reports", "async_tokio"] }
 datafusion = { workspace = true }
-datafusion-common = { workspace = true }
 insta = { workspace = true }
 rstest = "0.26.1"
 tempfile = { workspace = true }
