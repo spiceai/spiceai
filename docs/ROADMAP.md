@@ -13,6 +13,19 @@ To propose features or report issues, please [file an issue](https://github.com/
 
 ---
 
+## Released Versions
+
+### [v2.1.0](https://github.com/spiceai/spiceai/releases/tag/v2.1.0) (June 29, 2026) ✅
+
+**Focus:** High-Throughput CDC, Distributed Query, and PostgreSQL Replication at Scale.
+
+- **Cayenne CDC at Scale**: Optimized CDC-fed acceleration for high-throughput streaming data.
+- **PostgreSQL Replication at Scale**: Enhanced PostgreSQL connector with improved replication performance.
+- **Distributed Query (Iceberg & Broadcast Joins)**: Federated queries with efficient broadcast join execution.
+- Full SDK support across all language bindings (Go, Java, Rust, Python, .NET).
+
+---
+
 ## Release Timeline
 
 ### [v2.2](https://github.com/spiceai/spiceai/milestone/99) (July 2026)
