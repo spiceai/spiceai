@@ -248,6 +248,18 @@ impl ExpressionConvertor for DefaultExpressionConvertor {
             return Ok(is_not_null(arg));
         }
 
+        if let Some(not_expr) = df.downcast_ref::<df_expr::NotExpr>() {
+            // Boolean NOT. Vortex's `not` inverts the value bits while preserving
+            // the validity buffer (NOT NULL = NULL), matching SQL three-valued
+            // logic and DataFusion's `FilterExec`. DataFusion normalizes
+            // `col = false`, `col != true`, and `NOT (a AND b)` fragments to a
+            // `NotExpr` over a boolean operand, so this arm is what lets those
+            // common boolean-flag filters push into the Vortex scan instead of
+            // being row-evaluated above it.
+            let arg = self.convert(not_expr.arg().as_ref())?;
+            return Ok(not(arg));
+        }
+
         if let Some(in_list) = df.downcast_ref::<df_expr::InListExpr>() {
             let value = self.convert(in_list.expr().as_ref())?;
             let list_elements: Vec<_> = in_list
@@ -460,6 +472,8 @@ fn can_be_pushed_down_impl(df_expr: &Arc<dyn PhysicalExpr>, schema: &Schema) -> 
         can_be_pushed_down_impl(is_null.arg(), schema)
     } else if let Some(is_not_null) = expr.downcast_ref::<df_expr::IsNotNullExpr>() {
         can_be_pushed_down_impl(is_not_null.arg(), schema)
+    } else if let Some(not_expr) = expr.downcast_ref::<df_expr::NotExpr>() {
+        can_be_pushed_down_impl(not_expr.arg(), schema)
     } else if let Some(in_list) = expr.downcast_ref::<df_expr::InListExpr>() {
         can_be_pushed_down_impl(in_list.expr(), schema)
             && in_list
@@ -500,6 +514,9 @@ fn is_convertible_expr(df_expr: &Arc<dyn PhysicalExpr>) -> bool {
             .is_some_and(|e| is_convertible_expr(e.expr()))
         || expr.downcast_ref::<df_expr::IsNullExpr>().is_some()
         || expr.downcast_ref::<df_expr::IsNotNullExpr>().is_some()
+        || expr
+            .downcast_ref::<df_expr::NotExpr>()
+            .is_some_and(|n| is_convertible_expr(n.arg()))
         || expr.downcast_ref::<df_expr::InListExpr>().is_some()
         || expr
             .downcast_ref::<ScalarFunctionExpr>()
@@ -874,6 +891,46 @@ mod tests {
                 case_insensitive
             }
         );
+    }
+
+    #[test]
+    fn test_expr_from_df_not() {
+        // `NOT (id = 42)` must convert to a Vortex `not` over the pushed comparison.
+        let left = Arc::new(df_expr::Column::new("id", 0)) as Arc<dyn PhysicalExpr>;
+        let right =
+            Arc::new(df_expr::Literal::new(ScalarValue::Int32(Some(42)))) as Arc<dyn PhysicalExpr>;
+        let binary = Arc::new(df_expr::BinaryExpr::new(left, DFOperator::Eq, right));
+        let not_expr = df_expr::NotExpr::new(binary);
+
+        let result = DefaultExpressionConvertor::default()
+            .convert(&not_expr)
+            .expect("NOT expression should convert");
+
+        let display = result.display_tree().to_string();
+        assert!(
+            display.contains("vortex.not"),
+            "converted NOT must emit a vortex.not node: {display}"
+        );
+    }
+
+    #[rstest]
+    fn test_can_be_pushed_down_not_over_boolean_column(test_schema: Schema) {
+        // `NOT active` where `active` is a supported boolean column pushes down.
+        let active = Arc::new(df_expr::Column::new("active", 3)) as Arc<dyn PhysicalExpr>;
+        let not_expr = Arc::new(df_expr::NotExpr::new(active)) as Arc<dyn PhysicalExpr>;
+
+        assert!(can_be_pushed_down_impl(&not_expr, &test_schema));
+    }
+
+    #[rstest]
+    fn test_can_be_pushed_down_not_unsupported_operand(test_schema: Schema) {
+        // `NOT` over an unsupported-typed column must not push (the convertor
+        // must never promise DataFusion a pushdown the scan can't honor).
+        let list_col =
+            Arc::new(df_expr::Column::new("unsupported_list", 5)) as Arc<dyn PhysicalExpr>;
+        let not_expr = Arc::new(df_expr::NotExpr::new(list_col)) as Arc<dyn PhysicalExpr>;
+
+        assert!(!can_be_pushed_down_impl(&not_expr, &test_schema));
     }
 
     #[test]
