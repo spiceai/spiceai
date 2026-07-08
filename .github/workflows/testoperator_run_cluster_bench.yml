@@ -387,7 +387,7 @@ jobs:
             ${TRANSPORT_FLAG} \
             ${SCENARIO_ARG} \
             --system-adapter-stdio-cmd spidapter \
-            --system-adapter-stdio-args "stdio --verbose --scenario federated-direct --scenario-base-path tools/spidapter/scenarios" \
+            --system-adapter-stdio-args "stdio --verbose --ready-wait 3000 --scenario federated-direct --scenario-base-path tools/spidapter/scenarios" \
             --system-adapter-param channel="${CHANNEL}" \
             --system-adapter-param executor_replicas="${EXECUTOR_REPLICAS}" \
             --system-adapter-param custom_image_tag="${CUSTOM_IMAGE_TAG}" \
