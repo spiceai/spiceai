@@ -482,4 +482,142 @@ mod tests {
             "all rows visible after stream end"
         );
     }
+
+    fn int64_batch(schema: &Arc<Schema>, values: Vec<i64>) -> RecordBatch {
+        RecordBatch::try_new(Arc::clone(schema), vec![Arc::new(Int64Array::from(values))])
+            .expect("batch")
+    }
+
+    async fn append_rows(
+        provider: &CayenneTableProvider,
+        context: &Arc<CayenneContext>,
+        schema: &Arc<Schema>,
+        ctx: &SessionContext,
+        batches: Vec<RecordBatch>,
+    ) -> datafusion::error::Result<u64> {
+        let stream = Box::pin(RecordBatchStreamAdapter::new(
+            Arc::clone(schema),
+            futures::stream::iter(batches.into_iter().map(Ok)),
+        ));
+        let sink = CayenneDataSink::new(
+            provider.clone_for_write(),
+            InsertOp::Append,
+            Arc::clone(schema),
+            Arc::clone(context),
+        );
+        sink.write_all(stream, &ctx.task_ctx()).await
+    }
+
+    /// An append that carries no rows must complete as a successful no-op —
+    /// including on the upsert + retention-filter shape, where the inline
+    /// memtable path is barred and the write goes to a new Vortex snapshot.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn zero_row_upsert_append_with_retention_filters_is_a_successful_noop() {
+        use datafusion_expr::{col, lit};
+
+        let ctx = SessionContext::new();
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let metadata_dir = format!("{}/metadata", temp_dir.path().to_str().expect("path"));
+        let data_dir = format!("{}/data", temp_dir.path().to_str().expect("path"));
+        std::fs::create_dir_all(&metadata_dir).expect("metadata dir");
+        let connection_string = format!("sqlite://{metadata_dir}/cayenne.db");
+        let catalog = Arc::new(CayenneCatalog::new(connection_string).expect("catalog"))
+            as Arc<dyn MetadataCatalog>;
+        catalog.init().await.expect("catalog init");
+
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let vortex_config = VortexConfig {
+            // Publish on stream end (the refresh-write shape). The segmented
+            // streaming-publish path never publishes an empty segment, so it
+            // would short-circuit a zero-row stream before it reaches the
+            // append writer this test exercises.
+            stream_publish_interval_ms: 0,
+            ..VortexConfig::default()
+        };
+        let context = CayenneContext::new(&vortex_config, ctx.runtime_env(), "zero_row_append");
+        let options = CreateTableOptions {
+            table_name: "zero_row_append".to_string(),
+            schema: Arc::clone(&schema),
+            primary_key: vec!["id".to_string()],
+            on_conflict: Some(OnConflict::Upsert(ColumnReference::new(vec![
+                "id".to_string(),
+            ]))),
+            base_path: data_dir,
+            partition_column: None,
+            vortex_config,
+        };
+        let provider = CayenneTableProviderBuilder::new(Arc::clone(&catalog), ctx.runtime_env())
+            .with_context(Arc::clone(&context))
+            // A retention delete filter (matching nothing) bars the inline
+            // path, routing appends through the new-snapshot write — the
+            // same shape as a dataset configured with `retention_sql`.
+            .with_retention_filters(vec![col("id").lt(lit(0_i64))])
+            .create(options)
+            .await
+            .expect("table created");
+
+        // Seed the table so the zero-row append below runs against a
+        // populated accelerator, mirroring a post-initial-load refresh.
+        let seeded = append_rows(
+            &provider,
+            &context,
+            &schema,
+            &ctx,
+            vec![int64_batch(&schema, vec![1, 2, 3])],
+        )
+        .await
+        .expect("seed write");
+        assert_eq!(seeded, 3);
+        assert_eq!(visible_rows(&ctx, &provider).await, 3);
+
+        // An empty stream is a no-op append: it must succeed, report zero
+        // rows, and leave the visible data untouched.
+        let appended = append_rows(&provider, &context, &schema, &ctx, vec![])
+            .await
+            .expect("zero-row append must succeed");
+        assert_eq!(appended, 0);
+        assert_eq!(
+            visible_rows(&ctx, &provider).await,
+            3,
+            "zero-row append must not change visible data"
+        );
+
+        // Retention-style DELETE of every row (the `retention_sql` shape),
+        // leaving pending key-deletion tombstones. Subsequent appends isolate
+        // from those tombstones by writing to a new snapshot.
+        use datafusion::datasource::TableProvider;
+        let delete_plan = provider
+            .delete_from(&ctx.state(), vec![col("id").gt_eq(lit(0_i64))])
+            .await
+            .expect("delete plan");
+        datafusion::physical_plan::collect(delete_plan, ctx.task_ctx())
+            .await
+            .expect("retention delete");
+        assert_eq!(visible_rows(&ctx, &provider).await, 0);
+
+        // A zero-row append over pending deletions must also be a successful
+        // no-op: it has no rows to isolate, produces no data files, and must
+        // not publish (or fsync) a snapshot directory that was never
+        // materialized. This is the steady state of a scheduled
+        // `refresh_mode: append` dataset whose retention has evicted
+        // everything and whose source has no new rows.
+        let appended = append_rows(&provider, &context, &schema, &ctx, vec![])
+            .await
+            .expect("zero-row append over pending deletions must succeed");
+        assert_eq!(appended, 0);
+        assert_eq!(visible_rows(&ctx, &provider).await, 0);
+
+        // The table must remain fully writable afterwards.
+        let appended = append_rows(
+            &provider,
+            &context,
+            &schema,
+            &ctx,
+            vec![int64_batch(&schema, vec![4])],
+        )
+        .await
+        .expect("subsequent write");
+        assert_eq!(appended, 1);
+        assert_eq!(visible_rows(&ctx, &provider).await, 1);
+    }
 }
