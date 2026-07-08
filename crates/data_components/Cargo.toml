@@ -85,6 +85,7 @@ native-tls = { workspace = true, optional = true }
 percent-encoding.workspace = true
 pgwire-replication = { workspace = true, optional = true }
 postgres-native-tls = { workspace = true, optional = true }
+postgres-protocol = { workspace = true, optional = true }
 rand.workspace = true
 rdkafka = { workspace = true, features = ["ssl-vendored"], optional = true }
 regex.workspace = true
@@ -175,6 +176,7 @@ postgres = [
     "dep:pgwire-replication",
     "dep:native-tls",
     "dep:postgres-native-tls",
+    "dep:postgres-protocol",
     "federation",
     "datafusion-table-providers/postgres",
     "datafusion-table-providers/postgres-federation",
@@ -231,6 +233,11 @@ name = "object_filter"
 
 [[bench]]
 harness = false
+name = "shared_pump_bench"
+required-features = ["postgres"]
+
+[[bench]]
+harness = false
 name = "mongodb_change_stream"
 required-features = ["mongodb"]
 
@@ -238,3 +245,8 @@ required-features = ["mongodb"]
 harness = false
 name = "kafka_decode"
 required-features = ["bench", "kafka"]
+
+[[bench]]
+harness = false
+name = "pgoutput_decode"
+required-features = ["postgres"]
