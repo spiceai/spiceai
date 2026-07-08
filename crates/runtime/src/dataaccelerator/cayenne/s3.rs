@@ -1509,7 +1509,6 @@ pub async fn build_datalake_object_store(
     let mut s3_builder = AmazonS3Builder::from_env()
         .with_bucket_name(bucket_name)
         .with_http_connector(SpawnedReqwestConnector::new(io_runtime))
-        .with_allow_http(params.allow_http)
         .with_region(effective_region.clone())
         .with_unsigned_payload(params.unsigned_payload);
 
@@ -1520,8 +1519,14 @@ pub async fn build_datalake_object_store(
     };
     s3_builder = s3_builder.with_retry(retry_config);
 
-    let mut client_options =
-        ClientOptions::default().with_timeout(std::time::Duration::from_mins(2));
+    // `with_client_options` below REPLACES the builder's client options
+    // wholesale, so allow_http must be carried on `client_options` itself
+    // (a builder-level `with_allow_http` would be silently clobbered). An
+    // explicit `cayenne_datalake_s3_allow_http` and an `http://` endpoint
+    // both enable it.
+    let mut client_options = ClientOptions::default()
+        .with_timeout(std::time::Duration::from_mins(2))
+        .with_allow_http(params.allow_http);
 
     if let Some(endpoint) = &params.endpoint {
         s3_builder = s3_builder.with_endpoint(endpoint);

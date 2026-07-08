@@ -15,8 +15,9 @@ name: postgres-cayenne[file]-adaptive-cold-sf1000
 #                                              inferred PK auto-forces deletion_mode: key, so
 #                                              cayenne_deletion_mode is intentionally left unset.
 #   - cayenne_cold_tier_warm_max_bytes         4 GiB warm->cold promotion trigger (expert override;
-#                                              the unset default is 0 = never promote, which would
-#                                              leave the tier inert until the auto trigger lands).
+#                                              unset defaults to 16 x cayenne_cold_target_file_size_mb
+#                                              = 16 GiB at this pod's 1024 MB file size — pin 4 GiB
+#                                              so the big tables graduate after bootstrap).
 #   - cayenne_cold_target_file_size_mb         1024 — read-optimized cold files, larger than the warm
 #                                              target so cold scans open fewer footers.
 #   - cayenne_cold_tier_background_interval_ms 30s promoter cadence.

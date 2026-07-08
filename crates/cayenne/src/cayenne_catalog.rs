@@ -845,10 +845,17 @@ impl CayenneCatalog {
 
                 // Datalake (cold tier) config is runtime-toggleable, not table
                 // identity: reconcile it here instead of comparing it in
-                // `configuration_matches`. Rejects a location change while
-                // cold files exist; persists any other cold-field change.
-                self.reconcile_cold_tier_config(&mut stored_metadata, options)
-                    .await?;
+                // `configuration_matches`. Gated on the rest of the
+                // configuration matching (schema excluded — widening evolution
+                // is handled below): when identity config differs, the caller
+                // falls back to the stored config wholesale, and persisting
+                // PART of the new config (the cold fields) would leave a mixed
+                // state. Rejects a location change while cold files exist;
+                // persists any other cold-field change.
+                if configuration_matches_ignoring_schema(&stored_metadata, options) {
+                    self.reconcile_cold_tier_config(&mut stored_metadata, options)
+                        .await?;
+                }
 
                 if configuration_matches(&stored_metadata, options) {
                     return Ok(stored_metadata);

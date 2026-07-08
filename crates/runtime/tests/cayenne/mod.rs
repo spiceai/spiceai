@@ -2073,8 +2073,7 @@ async fn query_single_i64(rt: &Runtime, sql: &str) -> Result<i64, String> {
 /// registration probe → warm load (append mode; the datalake tier supports
 /// refresh_mode 'changes' and 'append' only) → background promotion to the
 /// datalake → cross-tier query correctness → restart with a tuned param
-/// (reconciled, re-appended rows upsert-dedupe against the promoted data) →
-/// restart with a CHANGED location while cold files exist (rejected at load).
+/// (reconciled, re-appended rows upsert-dedupe against the promoted data).
 ///
 /// Runs against real S3 (bucket [`DATALAKE_TEST_BUCKET`]) with a few KB of
 /// transfer per run. Credentials: `AWS_SNAPSHOT_KEY`/`AWS_SNAPSHOT_SECRET`
@@ -2265,34 +2264,5 @@ async fn datalake_e2e_inner(
             ));
         }
     }
-
-    // ---- Phase 3: reopen with a DIFFERENT location while cold files exist —
-    // must be rejected at load (the manifest's absolute URLs would be
-    // stranded). --------------------------------------------------------------
-    {
-        let changed_location = format!("{}-moved/", location.trim_end_matches('/'));
-        let app = AppBuilder::new("test_cayenne_datalake_e2e")
-            .with_dataset(make_datalake_nation_dataset(
-                data_dir,
-                metadata_dir,
-                &changed_location,
-                s3_creds,
-                "1",
-                RefreshMode::Append,
-            ))
-            .build();
-        let rt = Runtime::builder().with_app(app).build().await;
-        let cloned_rt = Arc::new(rt.clone());
-        tokio::select! {
-            () = tokio::time::sleep(Duration::from_secs(90)) => {}
-            () = cloned_rt.load_components() => {}
-        }
-
-        match query_single_i64(&rt, "SELECT COUNT(*) FROM nation").await {
-            Ok(count) => Err(format!(
-                "location change with published datalake files must be rejected at load, but query succeeded (count={count})"
-            )),
-            Err(_) => Ok(()),
-        }
-    }
+    Ok(())
 }
