@@ -1048,7 +1048,10 @@ async fn run_pump(source: Arc<SharedSource>) {
         // Per-connection state: Postgres re-sends Relation messages on a new
         // connection, rebuilding the routes.
         let mut decoder = pgoutput::Decoder::new();
-        let mut routes: HashMap<RelationId, MemberKey> = HashMap::new();
+        // Relation id -> (member key, resolved handle). Caching the `Arc<MemberHandle>`
+        // here (once, at Relation time) keeps the per-event route lookup a bare
+        // `u32` hash — no `members` mutex, no `(String, String)` hash on the hot path.
+        let mut routes: HashMap<RelationId, (MemberKey, Arc<MemberHandle>)> = HashMap::new();
         // Raw pgoutput change-message bytes, buffered per relation as the pump
         // routes them (no tuple decode on this shared task). The per-dataset
         // consumer decodes + builds them (see `PgChangeRows`).
@@ -1233,7 +1236,7 @@ async fn run_pump(source: Arc<SharedSource>) {
                             handle_relation(&source, &mut decoder, &mut routes, rel).await;
                         }
                         Some(tag @ (b'I' | b'U' | b'D')) => {
-                            buffer_raw_change(&source, &routes, &mut txn, tag, data);
+                            buffer_raw_change(&routes, &mut txn, tag, data);
                         }
                         Some(b'T') => {
                             // Decode to read the (multi-relation) id list so each
@@ -1256,7 +1259,7 @@ async fn run_pump(source: Arc<SharedSource>) {
                                     break 'reconnect;
                                 }
                             };
-                            buffer_raw_truncate(&source, &routes, &mut txn, &relation_ids, &data);
+                            buffer_raw_truncate(&routes, &mut txn, &relation_ids, &data);
                         }
                         // Type / Origin / Message / Stream* — safe to ignore.
                         _ => {}
@@ -1376,7 +1379,7 @@ async fn run_pump(source: Arc<SharedSource>) {
 async fn handle_relation(
     source: &Arc<SharedSource>,
     decoder: &mut pgoutput::Decoder,
-    routes: &mut HashMap<RelationId, MemberKey>,
+    routes: &mut HashMap<RelationId, (MemberKey, Arc<MemberHandle>)>,
     rel: pgoutput::Relation,
 ) {
     let member_key: MemberKey = (rel.namespace.clone(), rel.name.clone());
@@ -1422,7 +1425,9 @@ async fn handle_relation(
         return;
     }
     decoder.apply_declared_primary_keys(rel.relation_id, &member.primary_keys);
-    routes.insert(rel.relation_id, member_key);
+    // Cache the resolved handle alongside the key so the per-event path skips
+    // the `members` lock + string hash (see `buffer_raw_change`).
+    routes.insert(rel.relation_id, (member_key, member));
 }
 
 /// Route an Insert/Update/Delete by its peeked relation id and buffer the raw
@@ -1432,8 +1437,7 @@ async fn handle_relation(
 /// the eager path. The "change before Relation" invariant is still enforced at
 /// commit (`deliver_commit` fatals if the relation isn't cached).
 fn buffer_raw_change(
-    source: &Arc<SharedSource>,
-    routes: &HashMap<RelationId, MemberKey>,
+    routes: &HashMap<RelationId, (MemberKey, Arc<MemberHandle>)>,
     txn: &mut HashMap<RelationId, Vec<Bytes>>,
     tag: u8,
     data: Bytes,
@@ -1441,10 +1445,9 @@ fn buffer_raw_change(
     let Some(relation_id) = pgoutput::relation_id(&data) else {
         return;
     };
-    let Some(member_key) = routes.get(&relation_id) else {
-        return;
-    };
-    let Some(member) = source.member(member_key) else {
+    // Cached at Relation time: a `u32` lookup yields the member handle directly,
+    // so the per-event hot path takes no `members` lock and hashes no strings.
+    let Some((_member_key, member)) = routes.get(&relation_id) else {
         return;
     };
     match tag {
@@ -1460,16 +1463,13 @@ fn buffer_raw_change(
 /// raw bytes per relation. Unlike the per-dataset path, multi-relation
 /// TRUNCATEs are fine here: each relation routes to its own member.
 fn buffer_raw_truncate(
-    source: &Arc<SharedSource>,
-    routes: &HashMap<RelationId, MemberKey>,
+    routes: &HashMap<RelationId, (MemberKey, Arc<MemberHandle>)>,
     txn: &mut HashMap<RelationId, Vec<Bytes>>,
     relation_ids: &[RelationId],
     data: &Bytes,
 ) {
     for &relation_id in relation_ids {
-        if let Some(member_key) = routes.get(&relation_id)
-            && let Some(member) = source.member(member_key)
-        {
+        if let Some((_member_key, member)) = routes.get(&relation_id) {
             member.metrics.inc_truncate();
             txn.entry(relation_id).or_default().push(data.clone());
             tracing::info!(
@@ -1558,7 +1558,7 @@ async fn deliver_to_member(
 async fn deliver_commit(
     source: &Arc<SharedSource>,
     decoder: &pgoutput::Decoder,
-    routes: &HashMap<RelationId, MemberKey>,
+    routes: &HashMap<RelationId, (MemberKey, Arc<MemberHandle>)>,
     txn: HashMap<RelationId, Vec<Bytes>>,
     end_lsn: u64,
     commit_time_micros: i64,
@@ -1580,11 +1580,8 @@ async fn deliver_commit(
         if raw.is_empty() {
             continue;
         }
-        let Some(member_key) = routes.get(&relation_id) else {
+        let Some((member_key, member)) = routes.get(&relation_id) else {
             continue;
-        };
-        let Some(member) = source.member(member_key) else {
-            continue; // detached mid-transaction
         };
         if source.ack.already_committed(member_key, end_lsn) {
             // Reconnect replay of a commit this member already durably
