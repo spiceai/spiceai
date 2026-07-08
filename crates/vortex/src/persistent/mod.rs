@@ -182,6 +182,96 @@ mod tests {
         Ok(())
     }
 
+    /// Returns the indented physical plan for `sql`, used to assert whether a
+    /// predicate pushed into the Vortex scan (shown as `predicate:` on the
+    /// `DataSourceExec`) or was left in a `FilterExec` above it.
+    async fn physical_plan_display(
+        session: &datafusion::prelude::SessionContext,
+        sql: &str,
+    ) -> anyhow::Result<String> {
+        let df = session.sql(sql).await?;
+        let plan = session
+            .state()
+            .create_physical_plan(df.logical_plan())
+            .await?;
+        Ok(DisplayableExecutionPlan::new(plan.as_ref())
+            .indent(true)
+            .to_string())
+    }
+
+    /// End-to-end coverage for `CAST(CASE ...)` pushdown and the `ELSE` guard.
+    ///
+    /// A non-elided type-changing cast over a `CASE` (`CAST(CASE ... AS DOUBLE)`)
+    /// must push into the Vortex scan when the `CASE` has an `ELSE` branch, and
+    /// must stay in a `FilterExec` above the scan when it does not (Vortex cannot
+    /// represent a `CASE` without `ELSE`). Both must return identical, correct
+    /// results across `NULL`s. Also guards that `coalesce(col, literal)` — which
+    /// `DataFusion` lowers to a `CASE` — keeps pushing.
+    #[tokio::test]
+    async fn test_cast_case_and_coalesce_pushdown() -> anyhow::Result<()> {
+        let ctx = TestSessionContext::default();
+
+        ctx.session
+            .sql(
+                "CREATE EXTERNAL TABLE nums (id INT NOT NULL, v BIGINT) \
+                STORED AS vortex LOCATION '/nums/'",
+            )
+            .await?;
+        ctx.session
+            .sql("INSERT INTO nums VALUES (1, 10), (2, NULL), (3, 5), (4, NULL), (5, 20)")
+            .await?
+            .collect()
+            .await?;
+
+        // 1. CAST(CASE ... ELSE ... AS DOUBLE) pushes into the scan.
+        //    Per row: v>5 ? v : 0, cast to f64, keep when > 8.0.
+        //    v=10→10 keep(1); NULL→0 drop; 5→0 drop; NULL→0 drop; 20→20 keep(5).
+        let else_query = "SELECT id FROM nums \
+             WHERE CAST(CASE WHEN v > 5 THEN v ELSE 0 END AS DOUBLE) > 8.0 ORDER BY id";
+        let else_plan = physical_plan_display(&ctx.session, else_query).await?;
+        assert!(
+            else_plan.contains("predicate:") && !else_plan.contains("FilterExec"),
+            "CAST(CASE ... ELSE) should push into the scan, got plan:\n{else_plan}"
+        );
+        let else_result = ctx.session.sql(else_query).await?.collect().await?;
+        let else_fmt = pretty_format_batches(&else_result)?.to_string();
+        assert_snapshot!("cast_case_else_result", else_fmt);
+
+        // 2. CAST(CASE ... END AS DOUBLE) *without* ELSE must NOT push (the guard),
+        //    but must return the same rows: v>5 ? v : NULL, cast, keep when > 8.0.
+        //    NULL comparisons drop, so the matching rows are identical to case 1.
+        let no_else_query = "SELECT id FROM nums \
+             WHERE CAST(CASE WHEN v > 5 THEN v END AS DOUBLE) > 8.0 ORDER BY id";
+        let no_else_plan = physical_plan_display(&ctx.session, no_else_query).await?;
+        assert!(
+            no_else_plan.contains("FilterExec"),
+            "CAST(CASE) without ELSE must stay above the scan, got plan:\n{no_else_plan}"
+        );
+        let no_else_result = ctx.session.sql(no_else_query).await?.collect().await?;
+        assert_eq!(
+            else_fmt,
+            pretty_format_batches(&no_else_result)?.to_string(),
+            "ELSE and no-ELSE forms must return identical rows here"
+        );
+
+        // 3. coalesce(v, 0) is lowered by DataFusion to a CASE and still pushes.
+        //    v ?? 0 > 8: 10 keep(1); NULL→0 drop; 5 drop; NULL→0 drop; 20 keep(5).
+        let coalesce_query = "SELECT id FROM nums WHERE coalesce(v, 0) > 8 ORDER BY id";
+        let coalesce_plan = physical_plan_display(&ctx.session, coalesce_query).await?;
+        assert!(
+            coalesce_plan.contains("predicate:") && !coalesce_plan.contains("FilterExec"),
+            "coalesce(col, literal) should push into the scan, got plan:\n{coalesce_plan}"
+        );
+        let coalesce_result = ctx.session.sql(coalesce_query).await?.collect().await?;
+        assert_eq!(
+            else_fmt,
+            pretty_format_batches(&coalesce_result)?.to_string(),
+            "coalesce(v, 0) > 8 must match the CASE-based result"
+        );
+
+        Ok(())
+    }
+
     /// Doc example: demonstrates creating, writing, reading, and filtering a Vortex table.
     #[tokio::test]
     async fn doc_example() -> anyhow::Result<()> {
