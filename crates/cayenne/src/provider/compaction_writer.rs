@@ -152,8 +152,9 @@ pub(crate) struct CompactionWriterConfig {
 }
 
 impl CompactionWriterConfig {
-    /// The configuration installed on the network-attached block-storage
-    /// (EBS/Azure managed disks) tier: bypass the page cache (`O_DIRECT`),
+    /// The configuration installed on the network-attached storage tier
+    /// (EBS/Azure managed disks, or an NFS/SMB network filesystem): bypass the
+    /// page cache (`O_DIRECT`),
     /// preallocate the output (`fallocate`), rate-smooth writeback
     /// (`bytes_per_sync`), and fsync contents before the publishing rename.
     pub(crate) fn for_ebs_tier() -> Self {
@@ -1102,7 +1103,7 @@ mod tests {
     }
 
     /// The storage-tier gate installs the `O_DIRECT` writer ONLY on the
-    /// network-attached block-storage tier (`Ebs`) for local-FS compaction —
+    /// network-attached storage tier (`Ebs`) for local-FS compaction —
     /// never on local SSD/NVMe (incl. AWS EC2 `NVMe` instance storage → `LocalSsd`),
     /// tmpfs, undetected storage, non-`Maintenance` writes, or S3.
     #[test]
