@@ -1791,6 +1791,35 @@ impl CayenneAccelerator {
         Ok(path_buf)
     }
 
+    /// Lazily initialize a Cayenne catalog into `cell` from `connection_string`,
+    /// sharing the init/`OnceCell` machinery between the file-mode and memory-mode
+    /// catalog getters.
+    async fn init_cayenne_catalog(
+        cell: &OnceCell<Arc<dyn cayenne::MetadataCatalog>>,
+        connection_string: String,
+    ) -> Result<Arc<dyn cayenne::MetadataCatalog>> {
+        cell.get_or_try_init(move || {
+            let connection_string = connection_string;
+            async move {
+                let catalog = Arc::new(
+                    cayenne::CayenneCatalog::new(connection_string)
+                        .boxed()
+                        .context(AccelerationInitializationFailedSnafu)?,
+                ) as Arc<dyn cayenne::MetadataCatalog>;
+
+                catalog
+                    .init()
+                    .await
+                    .boxed()
+                    .context(AccelerationInitializationFailedSnafu)?;
+
+                Ok::<Arc<dyn cayenne::MetadataCatalog>, Error>(catalog)
+            }
+        })
+        .await
+        .map(Arc::clone)
+    }
+
     async fn get_or_create_catalog(
         &self,
         metadata_dir: &str,
@@ -1800,28 +1829,7 @@ impl CayenneAccelerator {
             "turso" => format!("libsql://{metadata_dir}/cayenne.db"),
             _ => format!("sqlite://{metadata_dir}/cayenne.db"), // Default to SQLite
         };
-
-        self.catalog
-            .get_or_try_init(move || {
-                let connection_string = connection_string;
-                async move {
-                    let catalog = Arc::new(
-                        cayenne::CayenneCatalog::new(connection_string)
-                            .boxed()
-                            .context(AccelerationInitializationFailedSnafu)?,
-                    ) as Arc<dyn cayenne::MetadataCatalog>;
-
-                    catalog
-                        .init()
-                        .await
-                        .boxed()
-                        .context(AccelerationInitializationFailedSnafu)?;
-
-                    Ok::<Arc<dyn cayenne::MetadataCatalog>, Error>(catalog)
-                }
-            })
-            .await
-            .map(Arc::clone)
+        Self::init_cayenne_catalog(&self.catalog, connection_string).await
     }
 
     /// Get or create the shared in-memory (`memdb`) catalog for `mode: memory`
@@ -1831,27 +1839,7 @@ impl CayenneAccelerator {
     async fn get_or_create_memory_catalog(&self) -> Result<Arc<dyn cayenne::MetadataCatalog>> {
         let connection_string =
             format!("sqlite://file:/cayenne-mem-{}?vfs=memdb", self.instance_id);
-        self.memory_catalog
-            .get_or_try_init(move || {
-                let connection_string = connection_string;
-                async move {
-                    let catalog = Arc::new(
-                        cayenne::CayenneCatalog::new(connection_string)
-                            .boxed()
-                            .context(AccelerationInitializationFailedSnafu)?,
-                    ) as Arc<dyn cayenne::MetadataCatalog>;
-
-                    catalog
-                        .init()
-                        .await
-                        .boxed()
-                        .context(AccelerationInitializationFailedSnafu)?;
-
-                    Ok::<Arc<dyn cayenne::MetadataCatalog>, Error>(catalog)
-                }
-            })
-            .await
-            .map(Arc::clone)
+        Self::init_cayenne_catalog(&self.memory_catalog, connection_string).await
     }
 
     /// Apply the `mode: memory` overrides to a table's [`cayenne::metadata::VortexConfig`]:
@@ -1861,6 +1849,11 @@ impl CayenneAccelerator {
     /// becomes the hard RAM bound (breach => error, never spill); default `0` =
     /// unbounded (Arrow parity) unless the operator sets an explicit
     /// `cayenne_cdc_mem_tier_max_bytes`.
+    ///
+    /// Note: with the drain disabled, an `append`/`changes` memory table accumulates
+    /// mem-tier segments with no in-RAM coalesce valve, so append cost grows with the
+    /// segment count. `full` refresh is unaffected (each overwrite resets the tier to
+    /// a single segment). A periodic in-RAM segment coalesce is a future follow-up.
     fn apply_memory_mode_overrides(
         config: &mut cayenne::metadata::VortexConfig,
         acceleration: Option<&Acceleration>,
@@ -2691,6 +2684,18 @@ impl DataAccelerator for CayenneAccelerator {
         // directory: derive a (never-written) base path and skip directory creation.
         // File mode resolves and creates the data dir as before.
         let memory_mode = !source.is_file_accelerated();
+        // Memory mode is non-partitioned only: `is_memory_resident_mode()` (the
+        // predicate the write/scan paths consult) requires no partition column, so a
+        // partitioned memory table would fall through to the durable Vortex path and
+        // silently write to disk. Reject it up front rather than half-configuring an
+        // on-disk partitioned table.
+        if memory_mode && !partition_by.is_empty() {
+            return Err(Box::new(Error::InvalidConfiguration {
+                detail: Arc::from(
+                    "Cayenne mode: memory is not supported with partitioning. Remove partition_by, or use mode: file for a partitioned accelerator.",
+                ),
+            }));
+        }
         let dir_path = if memory_mode {
             Self::resolve_default_data_path(&source.name().to_string().replace(['.', '/'], "_"))
         } else {

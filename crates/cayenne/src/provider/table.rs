@@ -17001,13 +17001,6 @@ impl CayenneTableProvider {
             // tombstone/visibility memo — drop them so the next scan rebuilds.
             self.mem_tier_visible_memo.store(None);
             self.merged_scan_deletions.store(None);
-            // Defensive: empty any additional shards (memory mode is single-shard).
-            for shard_id in 1..self.mem_tier.shard_count() {
-                let cur_shard = self.mem_tier.shard(shard_id).load();
-                self.mem_tier
-                    .shard(shard_id)
-                    .store(Arc::new(cur_shard.retain_after(usize::MAX)));
-            }
         }
         Ok(incoming_rows)
     }

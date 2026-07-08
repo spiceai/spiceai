@@ -221,13 +221,15 @@ fn is_sqlite_lock_error(error: &tokio_rusqlite::Error<rusqlite::Error>) -> bool 
 }
 
 /// Returns true if the connection string targets an in-memory `SQLite` database
-/// (Cayenne memory mode). Recognizes the memdb VFS (`?vfs=memdb`), the
-/// shared-cache in-memory form (`?mode=memory`), and the bare `:memory:` name.
+/// (Cayenne memory mode). Memory mode always uses the memdb VFS
+/// (`file:<name>?vfs=memdb`) — the only form under which multiple pooled
+/// connections share ONE in-memory database. (`:memory:` / `mode=memory` would
+/// instead give each pooled connection its own private database.)
 ///
 /// In-memory databases have no backing file, so the pool skips parent-directory
 /// creation and uses the `MEMORY` rollback journal (WAL is unsupported).
 fn is_memory_db_path(db_path: &str) -> bool {
-    db_path == ":memory:" || db_path.contains("vfs=memdb") || db_path.contains("mode=memory")
+    db_path.contains("vfs=memdb")
 }
 
 async fn configure_sqlite_connection(
