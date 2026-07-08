@@ -135,6 +135,16 @@ pub const DEFAULT_MEMBER_CHANNEL_CAPACITY: usize = 1024;
 /// of seconds between messages; this keeps membership changes responsive.
 const RECV_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
 
+/// Yield to the Tokio scheduler after draining this many buffered events via the
+/// non-blocking `try_recv` fast path. Most `handle_decoded` branches (Insert /
+/// Update / Delete during a transaction) never reach a real `.await`, so a large
+/// buffered transaction would otherwise be processed in a tight loop that never
+/// yields — starving other tasks on the worker (including `/health`). The
+/// blocking `recv()` path participates in Tokio's cooperative budget and needs
+/// no explicit yield; only the sync `try_recv` drain does. Matches Tokio's own
+/// coop budget (128) so the cadence is unchanged from the pre-`try_recv` loop.
+const DRAIN_YIELD_INTERVAL: usize = 128;
+
 /// How long a single member's committed-change delivery may block the pump
 /// before we emit a WARN, bump the stall metric, and re-check for shutdown.
 /// Server-side liveness is *not* at risk here — the `pgwire_replication` worker
@@ -1051,6 +1061,9 @@ async fn run_pump(source: Arc<SharedSource>) {
         // Set on a Commit boundary so the consolidated flush also refreshes the
         // freshness watermark; cleared on each flush.
         let mut commit_watermark: Option<std::time::SystemTime> = None;
+        // Buffered events processed via the non-blocking `try_recv` fast path
+        // since the last cooperative yield (see `DRAIN_YIELD_INTERVAL`).
+        let mut drained_since_yield: usize = 0;
 
         'recv: loop {
             if crate::cdc::shutdown_epoch() != shutdown_epoch {
@@ -1097,12 +1110,18 @@ async fn run_pump(source: Arc<SharedSource>) {
             // channel and are cancel-safe.
             let mut should_flush = false;
             let acquired = match client.try_recv() {
-                Ok(TryRecvEvent::Event(e)) => Acquired::Event(e),
+                Ok(TryRecvEvent::Event(e)) => {
+                    drained_since_yield += 1;
+                    Acquired::Event(e)
+                }
                 Err(e) => Acquired::RecvError(e),
                 // Buffer drained (or worker gone): block for the next event.
                 // `Closed` falls here too so the blocking `recv()` reaps the
-                // worker's terminal `Ok(None)`/`Err`.
+                // worker's terminal `Ok(None)`/`Err`. The blocking `recv()`
+                // participates in Tokio's cooperative budget, so reaching here
+                // is itself a yield opportunity — reset the drain counter.
                 Ok(TryRecvEvent::Empty | TryRecvEvent::Closed) => {
+                    drained_since_yield = 0;
                     let recv_start = std::time::Instant::now();
                     let polled = tokio::time::timeout(RECV_POLL_INTERVAL, client.recv()).await;
                     input_us_acc = input_us_acc.saturating_add(
@@ -1154,6 +1173,17 @@ async fn run_pump(source: Arc<SharedSource>) {
                     break 'reconnect;
                 }
             };
+
+            // Stay cooperative while draining a long run of buffered events off
+            // the sync `try_recv` fast path: most `handle_decoded` branches never
+            // reach a real `.await`, so a large buffered transaction would
+            // otherwise monopolize this worker thread and starve other tasks
+            // (including `/health`). Yield every `DRAIN_YIELD_INTERVAL` events;
+            // the blocking `recv()` path already resets the counter to 0.
+            if drained_since_yield >= DRAIN_YIELD_INTERVAL {
+                drained_since_yield = 0;
+                tokio::task::yield_now().await;
+            }
 
             let processing_start = std::time::Instant::now();
             // Microseconds spent blocked delivering this event's committed
