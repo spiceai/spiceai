@@ -19,7 +19,7 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::path::PathBuf;
 use test_framework::TestType;
 
-use super::dataset::{QueryOverridesArg, QuerySetArg, SourceType};
+use super::dataset::{QueryOverridesArg, QuerySetArg};
 
 #[derive(Parser, Debug, Clone)]
 pub struct DispatchArgs {
@@ -434,9 +434,6 @@ pub struct StreamingCorrectnessDispatchArgs {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct HtapDispatchArgs {
     pub spicepod_path: PathBuf,
-    /// Source database for the CH-benCH workload (`postgres`|`mysql`). Omitted = postgres.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub source_type: Option<SourceType>,
     pub runner_type: RunnerType,
     #[serde(
         skip_serializing_if = "Option::is_none",

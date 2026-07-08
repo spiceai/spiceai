@@ -1,7 +1,6 @@
 tests:
   htap:
     spicepod_path: accelerated/mysql-cayenne[file].yaml
-    source_type: mysql
     runner_type: spiceai-dev-large-runners
     scale_factor: 1
     duration: 600

@@ -1,7 +1,6 @@
 tests:
   htap:
     spicepod_path: accelerated/mysql-arrow.yaml
-    source_type: mysql
     runner_type: spiceai-dev-xlarge-runners
     scale_factor: 10
     duration: 600
