@@ -66,8 +66,9 @@ limitations under the License.
 //! # When it is installed (storage-tier gated)
 //!
 //! Installed automatically for compaction output on the **network-attached
-//! block-storage tier** (`StorageClass::Ebs` — AWS EBS, Azure managed disks; see
-//! [`use_direct_writer_for`]), where bypassing the page cache pays off. NOT
+//! tier** (`StorageClass::Ebs` — AWS EBS / Azure managed block disks, or an
+//! NFS/SMB network filesystem; see [`use_direct_writer_for`]), where bypassing
+//! the page cache pays off. NOT
 //! installed on local SSD/NVMe (**including AWS EC2 `NVMe` instance storage**,
 //! which the detector classifies `LocalSsd`, not `Ebs`), tmpfs, undetected
 //! storage, or S3 — a memory-capped HTAP A/B showed `O_DIRECT` is a net loss on
@@ -643,11 +644,18 @@ impl Writer {
         if self.direct {
             self.flush_direct_tail()?; // pads, writes, then truncates to logical_len
         } else if self.allocated > self.logical_len {
-            // Buffered path: release any up-front / on-demand `fallocate`
-            // reservation past the true end so the file occupies exactly its
-            // logical bytes on disk. (The O_DIRECT path already truncates in
-            // `flush_direct_tail`.)
-            truncate(&self.file, self.logical_len)?;
+            // Buffered path: best-effort release of the up-front / on-demand
+            // `fallocate` reservation past the true end. `set_len(logical_len)`
+            // drops the KEEP_SIZE-preallocated tail extents beyond `logical_len` on
+            // ext4/xfs (truncation frees blocks past the new end, not merely
+            // i_size). This is a disk-LAYOUT hint, not correctness — the file's
+            // logical length is already `logical_len` from the writes — so it is
+            // `let _` best-effort: a bounded residual over-allocation on a
+            // filesystem that will not shrink it is harmless and must never fail
+            // the compaction. (The O_DIRECT path's `flush_direct_tail` truncate is
+            // load-bearing — it shrinks i_size off the alignment padding — and so
+            // keeps its `?`.)
+            let _ = truncate(&self.file, self.logical_len);
         }
         if self.cfg.final_fsync {
             // Contents durable BEFORE the rename publishes the name — the local-FS
