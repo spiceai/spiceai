@@ -1244,8 +1244,10 @@ async fn run_pump(source: Arc<SharedSource>) {
             proc_us_acc = proc_us_acc.saturating_add(processed_us.saturating_sub(send_wait_us));
             // Flush on a commit/keepalive boundary, or periodically (~1s of
             // accumulated wait+processing) so a long transaction still reports
-            // before its commit. A periodic flush carries no watermark/ack change
-            // (commit_watermark stays None; confirmed_flush is a monotonic no-op).
+            // before its commit. A periodic flush carries no commit watermark
+            // (commit_watermark stays None) and does not call `credit_idle`, but
+            // it may still publish a higher confirmed_flush if members advanced
+            // the shared ack floor asynchronously.
             let us_since_flush = input_us_acc.saturating_add(proc_us_acc);
             if should_flush || us_since_flush >= 1_000_000 {
                 source.flush_member_metrics(&BoundaryMetrics {
