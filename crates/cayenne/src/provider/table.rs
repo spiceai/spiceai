@@ -4794,17 +4794,26 @@ impl CayenneTableProvider {
         )?;
 
         // Create session context once with object store registered (if S3).
-        // For Maintenance-class (compaction) LOCAL writes, optionally route the
-        // output through the custom fallocate / bytes_per_sync / O_DIRECT writer
+        // On the network-attached storage tier (`StorageClass::Ebs` — AWS EBS,
+        // Azure managed disks, or an NFS/SMB network filesystem) route
+        // Maintenance-class (compaction) LOCAL output through the custom
+        // fallocate / bytes_per_sync / O_DIRECT writer,
         // via a private object-store registry scoped to this write (see
-        // `compaction_session_context`). Gated OFF by default; falls back to the
-        // default writer on any setup error so it can never fail a compaction.
-        let writer_cfg = super::compaction_writer::config();
-        let use_compaction_writer = writer_cfg.enabled()
-            && matches!(write_class, super::delta_encoding::WriteClass::Maintenance)
-            && !self.table_metadata.path.starts_with("s3://");
+        // `compaction_session_context`). On local SSD/NVMe (incl. AWS EC2 NVMe
+        // instance storage), tmpfs, undetected storage, or S3 the writer is NOT
+        // installed — an HTAP A/B showed O_DIRECT is a net loss there, where the
+        // buffered writer + Tier-1 fadvise eviction win. Falls back to the default
+        // writer on any setup error so it can never fail a compaction.
+        let use_compaction_writer = super::compaction_writer::use_direct_writer_for(
+            self.context.data_storage_class(),
+            write_class,
+            &self.table_metadata.path,
+        );
         let session_state = if use_compaction_writer {
-            match self.compaction_session_context(writer_cfg) {
+            match self.compaction_session_context(
+                super::compaction_writer::CompactionWriterConfig::for_ebs_tier(),
+                target_size_bytes as u64,
+            ) {
                 Ok(ctx) => Arc::new(ctx.state()),
                 Err(error) => {
                     tracing::warn!(
@@ -11208,6 +11217,16 @@ impl CayenneTableProvider {
     /// publish (the output is not yet query-visible, so the dropped pages race
     /// no reader). Never fails — a cache hint must not abort a compaction.
     async fn evict_compaction_output_pages(&self, snapshot_id: &str) {
+        // Runs on EVERY tier as the safety net. On the network-attached (EBS) tier
+        // the custom writer already self-evicts each output in `finish` (holding
+        // the just-written fd), so this external pass is a cheap backstop there —
+        // an O_DIRECT output has ~0 resident pages, so the DONTNEED hint walks
+        // almost nothing. It is deliberately NOT skipped on that tier: a per-output
+        // writer-setup (or session-context) fallback to the inner LocalFileSystem
+        // writer leaves that output buffered and un-self-evicted, and skipping here
+        // would reintroduce the scan-under-compaction cache pressure this guards
+        // against. Cheap redundancy on the fast path buys correctness on the
+        // fallback path.
         let files = match self.list_snapshot_files_with_sizes_local(snapshot_id).await {
             Ok(files) => files,
             Err(error) => {
@@ -13978,11 +13997,15 @@ impl CayenneTableProvider {
     /// override never touches the SHARED runtime's `file://` store that queries
     /// and CDC appends use — only this `Maintenance`-class write is routed
     /// through the custom writer. The query memory pool is shared so the encode
-    /// still respects `runtime.query.memory_limit`. Gated off by default; only
-    /// called when [`super::compaction_writer::config`] is enabled.
+    /// still respects `runtime.query.memory_limit`. `expected_file_bytes` is the
+    /// per-output target file size, forwarded so the writer seeds each output's
+    /// preallocation with one `fallocate`. Only called on the network-attached
+    /// (EBS) tier — when [`super::compaction_writer::use_direct_writer_for`]
+    /// selects the writer.
     fn compaction_session_context(
         &self,
         cfg: super::compaction_writer::CompactionWriterConfig,
+        expected_file_bytes: u64,
     ) -> Result<SessionContext> {
         use datafusion::execution::object_store::{
             DefaultObjectStoreRegistry, ObjectStoreRegistry,
@@ -14000,6 +14023,7 @@ impl CayenneTableProvider {
             inner,
             std::path::PathBuf::from("/"),
             cfg,
+            expected_file_bytes,
         ));
         let file_url = url::Url::parse("file:///").map_err(|source| Error::UrlParse {
             url: "file:///".to_string(),

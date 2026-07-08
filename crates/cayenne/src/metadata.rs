@@ -620,7 +620,9 @@ pub struct PinnedTuningActuators {
 pub enum StorageClass {
     /// Local NVMe/SSD — fast random I/O; the tuner applies no write-amortization bias.
     LocalSsd,
-    /// Network block store (e.g. EBS) — higher, variable latency: the slow tier.
+    /// Network-attached storage — EBS / Azure managed block disks, or an NFS/SMB
+    /// network filesystem. Higher, variable latency: the slow/networked tier.
+    /// (The variant name is historical — EBS was the first case.)
     Ebs,
     /// tmpfs / RAM-backed — fastest; no bias.
     Tmpfs,
