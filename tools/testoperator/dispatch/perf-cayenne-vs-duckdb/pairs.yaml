@@ -64,6 +64,16 @@ pairs:
     runner_type: spiceai-dev-runners
     notes: Turso metastore variant. Compare against bench-tpch-sf1-file to isolate the metastore.
 
+  - id: bench-tpch-sf1-file-memory
+    workload: bench
+    query_set: tpch
+    scale_factor: 1
+    cayenne: tpch/sf1/accelerated/file[parquet]-cayenne[memory].yaml
+    duckdb: tpch/sf1/accelerated/file[parquet]-duckdb[memory].yaml
+    must_beat: false
+    runner_type: spiceai-dev-runners
+    notes: In-RAM comparison — both pods hold all data in memory. Cayenne memory mode uses an in-RAM memdb metastore, so no Turso variant applies. must_beat is false while the mode is new.
+
   # sf10 file: no DuckDB sf10 file-mode pod exists today (only s3 at sf10);
   # add a `file[parquet]-duckdb[file].yaml` under test/spicepods/tpch/sf10/
   # mirroring the SF1 layout to enable this pair.

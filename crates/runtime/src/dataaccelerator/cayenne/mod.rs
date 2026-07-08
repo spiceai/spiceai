@@ -276,7 +276,7 @@ pub(crate) fn transform_schema_for_vortex(
 pub struct CayenneAccelerator {
     catalog: Arc<OnceCell<Arc<dyn cayenne::MetadataCatalog>>>,
     /// Separate catalog for `mode: memory` (in-RAM) tables, backed by an in-memory
-    /// SQLite `memdb` metastore. File-mode and memory-mode tables cannot share one
+    /// `SQLite` `memdb` metastore. File-mode and memory-mode tables cannot share one
     /// metastore (memory-mode data must never touch disk), so memory tables use this.
     memory_catalog: Arc<OnceCell<Arc<dyn cayenne::MetadataCatalog>>>,
     /// Process-unique id for this accelerator instance, used to name the in-memory
@@ -1682,7 +1682,7 @@ impl CayenneAccelerator {
     }
 
     /// Get or create the shared in-memory (`memdb`) catalog for `mode: memory`
-    /// tables. The DSN uses SQLite's `memdb` VFS keyed by this accelerator's
+    /// tables. The DSN uses `SQLite`'s `memdb` VFS keyed by this accelerator's
     /// instance id, so the metastore lives entirely in RAM (nothing on disk) and
     /// distinct accelerator instances stay isolated.
     async fn get_or_create_memory_catalog(&self) -> Result<Arc<dyn cayenne::MetadataCatalog>> {
@@ -1733,8 +1733,8 @@ impl CayenneAccelerator {
         config.inline_max_bytes = 0;
         config.inline_max_buffer_bytes = 0;
         let explicit_limit = acceleration.is_some_and(|a| {
-            a.params.get("cayenne_cdc_mem_tier_max_bytes").is_some()
-                || a.params.get("cdc_mem_tier_max_bytes").is_some()
+            a.params.contains_key("cayenne_cdc_mem_tier_max_bytes")
+                || a.params.contains_key("cdc_mem_tier_max_bytes")
         });
         if !explicit_limit {
             config.cdc_mem_tier_max_bytes = 0;
@@ -1850,11 +1850,16 @@ impl CayenneAccelerator {
             Self::apply_memory_mode_overrides(&mut vortex_config, acceleration);
         }
 
-        // Build S3 object store if using S3 Express One Zone storage
-        let object_store =
+        // Build S3 object store if using S3 Express One Zone storage. Memory mode
+        // has no data directory or object store (and `cayenne_data_dir` errors for
+        // it), so skip this entirely — memory-mode data lives only in RAM.
+        let object_store = if memory_mode {
+            None
+        } else {
             s3::build_s3_object_store(source, CayenneAccelerator::new().cayenne_data_dir(source)?)
                 .await
-                .context(S3Snafu)?;
+                .context(S3Snafu)?
+        };
 
         // Log S3 Express configuration
         if is_s3_express {
