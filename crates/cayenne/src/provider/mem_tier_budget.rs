@@ -266,6 +266,19 @@ pub fn global_mem_tier_total() -> Option<u64> {
         .map(|b| b.total.load(Ordering::Acquire))
 }
 
+/// Currently-reserved bytes across all in-memory CDC tiers (`used`), or `None`
+/// when no budget is installed. Paired with [`global_mem_tier_total`] this is the
+/// mem-tier occupancy: `used` approaching `total` under `cdc_durability: memory`
+/// means writes are about to be forced to spill/fall back to the durable path
+/// (backpressure). For a metrics scrape callback.
+#[must_use]
+pub fn global_mem_tier_used() -> Option<u64> {
+    GLOBAL_MEM_TIER_BUDGET
+        .read()
+        .as_ref()
+        .map(|b| b.used.load(Ordering::Acquire))
+}
+
 /// Attempt to reserve `bytes` from the global in-memory tier budget.
 ///
 /// Returns `true` when the bytes fit (or when no budget is installed — an
@@ -277,7 +290,15 @@ pub fn global_mem_tier_total() -> Option<u64> {
 pub(crate) fn try_reserve_bytes(bytes: u64) -> bool {
     match GLOBAL_MEM_TIER_BUDGET.read().as_ref() {
         None => true,
-        Some(budget) => budget.try_reserve(bytes),
+        Some(budget) => {
+            let reserved = budget.try_reserve(bytes);
+            if !reserved {
+                // Budget full: the caller must now wait / spill / fall back to the
+                // durable path — memory-mode ingest backpressure.
+                telemetry::cayenne::track_mem_tier_reserve_refused();
+            }
+            reserved
+        }
     }
 }
 

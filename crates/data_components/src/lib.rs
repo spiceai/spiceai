@@ -148,6 +148,8 @@ pub mod mongodb;
 pub mod mssql;
 #[cfg(feature = "mysql")]
 pub mod mysql;
+#[cfg(feature = "mysql")]
+pub mod mysql_replication;
 #[cfg(feature = "odbc")]
 pub mod odbc;
 #[cfg(feature = "oracle")]

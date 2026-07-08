@@ -323,7 +323,7 @@ fn snapshot_predicate(query_name: &str) -> bool {
 /// | `CHBENCH_PG_DB` | `chbench` |
 /// | `CHBENCH_PG_USER` | `bench` |
 /// | `CHBENCH_PG_PASS` | `bench` |
-fn chbench_source_from_env() -> anyhow::Result<chbench_driver::PostgresSourceConfig> {
+pub(crate) fn chbench_source_from_env() -> anyhow::Result<chbench_driver::PostgresSourceConfig> {
     let mut source = chbench_driver::PostgresSourceConfig::default();
     if let Ok(v) = std::env::var("CHBENCH_PG_HOST") {
         source.host = v;

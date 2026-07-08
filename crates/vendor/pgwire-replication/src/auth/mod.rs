@@ -1,9 +1,9 @@
-//! Authentication mechanisms for PostgreSQL connections.
+//! Authentication mechanisms for `PostgreSQL` connections.
 //!
-//! This module provides implementations for PostgreSQL authentication methods:
+//! This module provides implementations for `PostgreSQL` authentication methods:
 //!
 //! - **SCRAM-SHA-256** (feature: `scram`): Modern, secure password authentication
-//!   recommended for PostgreSQL 10+. Provides mutual authentication and doesn't
+//!   recommended for `PostgreSQL` 10+. Provides mutual authentication and doesn't
 //!   transmit the password.
 //!
 //! # Feature Flags
