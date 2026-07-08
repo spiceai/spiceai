@@ -345,6 +345,14 @@ pub(super) fn emit_replication_metrics(
     }
     println!();
 
+    // The lag figures are meaningful only if the `*_replication_lag_ms` series was
+    // actually scraped. When it is absent (e.g. counters present but no lag gauge),
+    // `worst_lag_*` stay at 0 — reporting that as "0.00 s lag" would falsely read as
+    // perfect replication, so record no headline lag telemetry and return no summary.
+    if lag_ms.is_empty() && lag_ms_series.is_empty() {
+        return None;
+    }
+
     // Headline: worst replication lag across all datasets (last value, P99, and max).
     if record_telemetry {
         crate::metrics::REPLICATION_LAG_MS.record(worst_lag_ms, &[]);

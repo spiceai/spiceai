@@ -488,7 +488,9 @@ pub(crate) async fn run(args: &HtapArgs) -> anyhow::Result<()> {
                         // WAL rather than the current (post-drain) state.
                         let fresh_pg_stats =
                             crate::pg_stats::PgStatsScraper::sample_once_now().await;
-                        reporting::emit_replication_metrics(
+                        // Diagnostic re-scrape: the lag summary return is unused here
+                        // (the headline was already captured from the under-load scrape).
+                        let _ = reporting::emit_replication_metrics(
                             &metrics,
                             replication_engine,
                             &fresh_pg_stats,
