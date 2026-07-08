@@ -97,6 +97,15 @@ fn detect_path_storage(path: &Path) -> ResolvedAccelerationStorage {
         return ResolvedAccelerationStorage::Tmpfs;
     }
 
+    // Network filesystems (NFS/SMB/CIFS) have no local block device to inspect and
+    // would otherwise fall through to `Unknown`. Classify them as the
+    // network-attached tier (`Ebs`): they share the higher-latency,
+    // page-cache-precious profile the tuner and the compaction O_DIRECT writer key
+    // off, just as a filesystem rather than a block device.
+    if is_network_fstype(&mount.fstype) {
+        return ResolvedAccelerationStorage::Ebs;
+    }
+
     let dev_block_path = PathBuf::from("/sys/dev/block").join(&mount.major_minor);
     let mut visited = HashSet::new();
     let devices = collect_block_devices(&dev_block_path, &mut visited);
@@ -107,6 +116,14 @@ fn detect_path_storage(path: &Path) -> ResolvedAccelerationStorage {
 #[cfg(target_os = "linux")]
 fn is_in_memory_fstype(fstype: &str) -> bool {
     matches!(fstype, "tmpfs" | "ramfs")
+}
+
+/// A network-attached filesystem (as reported by `/proc/self/mountinfo`): NFS
+/// (`nfs`/`nfs4`) or SMB (`cifs`, or the legacy `smbfs`/`smb3`). These are the
+/// networked tier — higher, variable latency — treated like `Ebs`.
+#[cfg(target_os = "linux")]
+fn is_network_fstype(fstype: &str) -> bool {
+    matches!(fstype, "nfs" | "nfs4" | "cifs" | "smbfs" | "smb3")
 }
 
 #[cfg(target_os = "linux")]
@@ -518,6 +535,26 @@ mod tests {
             .expect("mount should resolve");
         assert_eq!(mount.fstype, "tmpfs");
         assert!(is_in_memory_fstype(&mount.fstype));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn classifies_network_filesystems_as_network_tier() {
+        // An NFS mount parses with an `nfs4` fstype (no block device), and is the
+        // networked tier — not in-memory.
+        let mountinfo = "1 0 8:1 / / rw - ext4 /dev/sda1 rw\n2 1 0:52 / /mnt/nas rw - nfs4 192.168.3.148:/export rw";
+        let mount = find_longest_matching_mount(Path::new("/mnt/nas/table.db"), mountinfo)
+            .expect("mount should resolve");
+        assert_eq!(mount.fstype, "nfs4");
+        assert!(is_network_fstype(&mount.fstype));
+        assert!(!is_in_memory_fstype(&mount.fstype));
+        // NFS and SMB variants are network; local filesystems are not.
+        for fstype in ["nfs", "nfs4", "cifs", "smbfs", "smb3"] {
+            assert!(is_network_fstype(fstype), "{fstype} should be network");
+        }
+        for fstype in ["ext4", "xfs", "btrfs", "apfs", "tmpfs"] {
+            assert!(!is_network_fstype(fstype), "{fstype} should not be network");
+        }
     }
 
     #[cfg(target_os = "linux")]

@@ -233,6 +233,11 @@ name = "object_filter"
 
 [[bench]]
 harness = false
+name = "shared_pump_bench"
+required-features = ["postgres"]
+
+[[bench]]
+harness = false
 name = "mongodb_change_stream"
 required-features = ["mongodb"]
 
