@@ -106,8 +106,25 @@ pub(crate) struct ColumnStatsAccumulator {
 }
 
 impl ColumnStatsAccumulator {
-    /// Create a new accumulator for the given schema.
+    /// Create a new accumulator for the given schema, maintaining NDV sketches
+    /// for every NDV-tracked column. Used by every write that produces a
+    /// persisted file (`write_to_snapshot`: checkpoint spills, staged appends,
+    /// compaction, overwrite), where NDV is computed once at file birth.
     pub(crate) fn new(schema: &arrow_schema::Schema) -> Self {
+        Self::new_with_ndv(schema, true)
+    }
+
+    /// Create a new accumulator, optionally skipping per-column NDV (HyperLogLog)
+    /// maintenance.
+    ///
+    /// With `compute_ndv = false` no sketch is allocated, so [`update`](Self::update)
+    /// does no NDV hashing and the write contributes an empty sketch (a no-op
+    /// register-wise-union merge that preserves the existing table aggregate).
+    /// This is the lazy-NDV path for the **inline tier0 (metastore) write** — the
+    /// synchronous CDC hot loop — whose rows are re-sketched for free when they
+    /// later spill to a Vortex file at checkpoint. Min/max/null-count stats are
+    /// maintained regardless of this flag.
+    pub(crate) fn new_with_ndv(schema: &arrow_schema::Schema, compute_ndv: bool) -> Self {
         let num_cols = schema.fields().len();
         let dtypes: Vec<vortex::dtype::DType> = schema
             .fields()
@@ -124,11 +141,16 @@ impl ColumnStatsAccumulator {
             })
             .collect();
         // NDV sketches only for NDV-tracked columns (integers, strings, temporal);
-        // other columns get `None` so the write path skips them.
+        // other columns get `None` so the write path skips them. When
+        // `compute_ndv` is false every slot is `None`, so `update` folds nothing
+        // and no sketch is persisted (inline hot-loop lazy-NDV path).
         let ndv: Vec<Option<crate::hll::HyperLogLog>> = schema
             .fields()
             .iter()
-            .map(|f| Self::supports_ndv(f.data_type()).then(crate::hll::HyperLogLog::new))
+            .map(|f| {
+                (compute_ndv && Self::supports_ndv(f.data_type()))
+                    .then(crate::hll::HyperLogLog::new)
+            })
             .collect();
         Self {
             state: std::sync::Mutex::new(ColumnStatsState {

@@ -1273,7 +1273,12 @@ impl<'a> AppendMutationWriter<'a> {
                 )
                 .await?
             {
-                let stats_acc = ColumnStatsAccumulator::new(&schema);
+                // Inline tier0 (metastore BLOB) write — the synchronous CDC hot
+                // loop. Skip NDV here: these rows contribute their distinct-count
+                // for free when the inline memtable later spills to a Vortex file
+                // at checkpoint (`write_to_snapshot` folds NDV there). Min/max/
+                // null-count stats are still maintained.
+                let stats_acc = ColumnStatsAccumulator::new_with_ndv(&schema, false);
                 for batch in buffer.batches() {
                     stats_acc.update(batch);
                 }
