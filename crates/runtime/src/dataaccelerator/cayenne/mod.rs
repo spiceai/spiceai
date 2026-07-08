@@ -112,7 +112,8 @@ pub enum Error {
 
     #[snafu(display(
         "Failed to prepare the Cayenne acceleration directory {path}: {source}. \
-        Ensure 'cayenne_file_path' resolves to a local path Spice has permission to \
+        Ensure the configured Cayenne path ('cayenne_file_path', or 'cayenne_metadata_dir' \
+        for the metadata directory) resolves to a local path Spice has permission to \
         create and write to. \
         See: https://spiceai.org/docs/components/data-accelerators/cayenne#params"
     ))]
@@ -1663,7 +1664,8 @@ impl CayenneAccelerator {
     /// permissions are validated by the S3 bootstrap path.
     async fn prepare_local_acceleration_dir(dir_path: &str) -> Result<()> {
         // Object-store URLs (e.g. S3 Express One Zone) are validated elsewhere.
-        if dir_path.contains("://") && !dir_path.starts_with("file://") {
+        // Reuse `is_local_path` so the local/remote predicate stays in one place.
+        if !is_local_path(dir_path) {
             return Ok(());
         }
 
@@ -1681,8 +1683,10 @@ impl CayenneAccelerator {
         // 2. Writability probe: write then remove a marker file. The probe file
         //    name is unique per directory prep so concurrent dataset loads
         //    sharing a parent do not race on the same marker.
-        let probe_path = std::path::Path::new(fs_path)
-            .join(format!(".spice-cayenne-write-probe-{}", uuid::Uuid::now_v7()));
+        let probe_path = std::path::Path::new(fs_path).join(format!(
+            ".spice-cayenne-write-probe-{}",
+            uuid::Uuid::now_v7()
+        ));
         tokio::fs::write(&probe_path, b"spice")
             .await
             .context(AccelerationDirectoryUnavailableSnafu { path: fs_path })?;
@@ -3477,9 +3481,9 @@ mod tests {
                 Err(other) => {
                     panic!("expected AccelerationDirectoryUnavailable, got: {other}")
                 }
-                Ok(()) => panic!(
-                    "write+delete probe did not catch an unwritable directory (returned Ok)"
-                ),
+                Ok(()) => {
+                    panic!("write+delete probe did not catch an unwritable directory (returned Ok)")
+                }
             }
         } else {
             eprintln!(

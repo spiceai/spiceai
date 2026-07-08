@@ -166,9 +166,7 @@ impl PartitionedWal {
         // the `_partitioned_wal/` dir inside it) "disappear" even though the
         // catalog was committed to point at it. This mirrors the parent-sync
         // requirement documented in `Table::ensure_snapshot_dir_exists`.
-        if table_root_created
-            && let Some(grandparent) = table_root.parent()
-        {
+        if table_root_created && let Some(grandparent) = table_root.parent() {
             Self::ordering_sync_dir(grandparent).await?;
         }
 

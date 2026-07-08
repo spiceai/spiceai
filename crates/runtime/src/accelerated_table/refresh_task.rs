@@ -2756,7 +2756,10 @@ mod tests {
         match classified {
             RetryError::Transient { err, .. } => {
                 assert!(
-                    matches!(err, super::super::Error::UnableToGetDataFromConnector { .. }),
+                    matches!(
+                        err,
+                        super::super::Error::UnableToGetDataFromConnector { .. }
+                    ),
                     "transient refresh error should be UnableToGetDataFromConnector, got: {err}"
                 );
             }
