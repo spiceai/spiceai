@@ -1352,7 +1352,10 @@ impl CayenneAccelerator {
                     config.cold_tier_location = Some(loc.to_string());
                 }
             }
-            if let Some(cols) = acceleration.params.get("cayenne_datalake_clustering_columns") {
+            if let Some(cols) = acceleration
+                .params
+                .get("cayenne_datalake_clustering_columns")
+            {
                 config.cold_clustering_columns = cols
                     .split(',')
                     .map(|s| s.trim().to_string())
@@ -1394,7 +1397,9 @@ impl CayenneAccelerator {
                 && config.cold_tier_warm_max_files == 0
             {
                 config.cold_tier_warm_max_bytes = i64::try_from(
-                    config.cold_target_file_size_mb.saturating_mul(16 * 1024 * 1024),
+                    config
+                        .cold_target_file_size_mb
+                        .saturating_mul(16 * 1024 * 1024),
                 )
                 .unwrap_or(i64::MAX);
                 tracing::info!(

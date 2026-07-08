@@ -1579,7 +1579,9 @@ pub async fn build_datalake_object_store(
                 );
             }
             Err(err) => {
-                tracing::warn!("Unable to initialize AWS credentials for the Cayenne datalake store: {err}");
+                tracing::warn!(
+                    "Unable to initialize AWS credentials for the Cayenne datalake store: {err}"
+                );
             }
         }
     }

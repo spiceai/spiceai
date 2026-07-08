@@ -776,7 +776,8 @@ impl CayenneCatalog {
             || stored_vc.cold_target_file_size_mb != new_vc.cold_target_file_size_mb
             || stored_vc.cold_tier_warm_max_bytes != new_vc.cold_tier_warm_max_bytes
             || stored_vc.cold_tier_warm_max_files != new_vc.cold_tier_warm_max_files
-            || stored_vc.cold_tier_background_interval_ms != new_vc.cold_tier_background_interval_ms;
+            || stored_vc.cold_tier_background_interval_ms
+                != new_vc.cold_tier_background_interval_ms;
         if !cold_fields_differ {
             return Ok(());
         }
@@ -789,16 +790,15 @@ impl CayenneCatalog {
         stored.vortex_config.cold_tier_background_interval_ms =
             new_vc.cold_tier_background_interval_ms;
 
-        let vortex_config_json =
-            serde_json::to_string(&stored.vortex_config).map_err(|e| {
-                CatalogError::InvalidOperation {
-                    message: format!(
-                        "Failed to serialize updated datalake configuration for table {}.",
-                        stored.table_name
-                    ),
-                    source: Box::new(e),
-                }
-            })?;
+        let vortex_config_json = serde_json::to_string(&stored.vortex_config).map_err(|e| {
+            CatalogError::InvalidOperation {
+                message: format!(
+                    "Failed to serialize updated datalake configuration for table {}.",
+                    stored.table_name
+                ),
+                source: Box::new(e),
+            }
+        })?;
         self.metastore
             .execute_helper(ExecuteParams {
                 sql: "UPDATE cayenne_table SET vortex_config_json = ?1 WHERE table_id = ?2",

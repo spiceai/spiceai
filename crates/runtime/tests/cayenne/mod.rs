@@ -2174,7 +2174,9 @@ async fn datalake_e2e_inner(
 
         let count = query_single_i64(&rt, "SELECT COUNT(*) FROM nation").await?;
         if count != 25 {
-            return Err(format!("expected 25 nation rows before promotion, got {count}"));
+            return Err(format!(
+                "expected 25 nation rows before promotion, got {count}"
+            ));
         }
 
         // Wait for the background promoter (500ms cadence, trigger = 1 byte)
@@ -2192,22 +2194,26 @@ async fn datalake_e2e_inner(
         })
         .await;
         if !promoted {
-            return Err("timed out waiting for warm→datalake promotion (no .vortex objects on the store)".to_string());
+            return Err(
+                "timed out waiting for warm→datalake promotion (no .vortex objects on the store)"
+                    .to_string(),
+            );
         }
 
         // Cross-tier correctness after promotion: full count and a point
         // lookup both served with the warm tier cleared.
         let count = query_single_i64(&rt, "SELECT COUNT(*) FROM nation").await?;
         if count != 25 {
-            return Err(format!("expected 25 nation rows after promotion, got {count}"));
+            return Err(format!(
+                "expected 25 nation rows after promotion, got {count}"
+            ));
         }
-        let point = query_single_i64(
-            &rt,
-            "SELECT COUNT(*) FROM nation WHERE n_nationkey = 7",
-        )
-        .await?;
+        let point =
+            query_single_i64(&rt, "SELECT COUNT(*) FROM nation WHERE n_nationkey = 7").await?;
         if point != 1 {
-            return Err(format!("expected 1 row for n_nationkey=7 after promotion, got {point}"));
+            return Err(format!(
+                "expected 1 row for n_nationkey=7 after promotion, got {point}"
+            ));
         }
     }
 
@@ -2235,7 +2241,9 @@ async fn datalake_e2e_inner(
 
         let count = query_single_i64(&rt, "SELECT COUNT(*) FROM nation").await?;
         if count != 25 {
-            return Err(format!("expected 25 nation rows after restart, got {count}"));
+            return Err(format!(
+                "expected 25 nation rows after restart, got {count}"
+            ));
         }
     }
 
