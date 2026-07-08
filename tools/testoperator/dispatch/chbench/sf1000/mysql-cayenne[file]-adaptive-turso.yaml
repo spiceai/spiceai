@@ -1,6 +1,6 @@
 tests:
   htap:
-    spicepod_path: accelerated/postgres-cayenne[file]-adaptive.yaml
+    spicepod_path: accelerated/mysql-cayenne[file]-adaptive-turso.yaml
     runner_type: spiceai-dev-xlarge-runners
     scale_factor: 1000
     terminals: 100

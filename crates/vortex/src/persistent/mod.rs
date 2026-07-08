@@ -273,6 +273,83 @@ mod tests {
         Ok(())
     }
 
+    /// Boolean `NOT` filters (including `col = false`, which `DataFusion`
+    /// normalizes to `NOT col`) must push into the Vortex scan and must honor SQL
+    /// three-valued logic — a `NULL` operand yields `NULL`, which `WHERE` treats
+    /// as "not kept".
+    #[tokio::test]
+    async fn test_not_boolean_filter_pushes_down_and_handles_nulls() -> anyhow::Result<()> {
+        let ctx = TestSessionContext::default();
+
+        ctx.session
+            .sql(
+                "CREATE EXTERNAL TABLE flags (id INT NOT NULL, active BOOLEAN) \
+                STORED AS vortex LOCATION '/flags/'",
+            )
+            .await?;
+
+        ctx.session
+            .sql(
+                "INSERT INTO flags VALUES \
+                    (1, true), (2, false), (3, NULL), (4, false), (5, true)",
+            )
+            .await?
+            .collect()
+            .await?;
+
+        // The predicate must be pushed into the Vortex `DataSourceExec` (shown as
+        // `predicate:` on the scan) and there must be no `FilterExec` re-applying it
+        // above the scan — that is the whole point of the pushdown.
+        let df = ctx
+            .session
+            .sql("SELECT id FROM flags WHERE NOT active")
+            .await?;
+        let plan = ctx
+            .session
+            .state()
+            .create_physical_plan(df.logical_plan())
+            .await?;
+        let plan_display = DisplayableExecutionPlan::new(plan.as_ref())
+            .indent(true)
+            .to_string();
+        assert!(
+            plan_display.contains("predicate:") && plan_display.contains("vortex"),
+            "NOT filter should push into the Vortex scan, got plan:\n{plan_display}"
+        );
+        assert!(
+            !plan_display.contains("FilterExec"),
+            "NOT filter should not leave a FilterExec above the scan, got plan:\n{plan_display}"
+        );
+
+        // Correctness across three-valued logic: true → dropped, false → kept,
+        // NULL → dropped. Rows 2 and 4 (active = false) are the only matches.
+        let result = ctx
+            .session
+            .sql("SELECT id FROM flags WHERE NOT active ORDER BY id")
+            .await?
+            .collect()
+            .await?;
+        let result_fmt = pretty_format_batches(&result)?.to_string();
+        assert_snapshot!("not_boolean_filter_result", result_fmt);
+
+        // `active = false` is simplified by DataFusion to `NOT active`; it must
+        // return the identical set, proving the pushdown covers the common
+        // boolean-equals-false shape too.
+        let eq_false = ctx
+            .session
+            .sql("SELECT id FROM flags WHERE active = false ORDER BY id")
+            .await?
+            .collect()
+            .await?;
+        assert_eq!(
+            result_fmt,
+            pretty_format_batches(&eq_false)?.to_string(),
+            "`active = false` must match `NOT active`"
+        );
+
+        Ok(())
+    }
+
     /// Doc example: demonstrates creating, writing, reading, and filtering a Vortex table.
     #[tokio::test]
     async fn doc_example() -> anyhow::Result<()> {
