@@ -512,12 +512,16 @@ fn is_convertible_expr(df_expr: &Arc<dyn PhysicalExpr>) -> bool {
 /// Type-only convertibility check for a `CASE` expression, mirroring
 /// [`DefaultExpressionConvertor::try_convert_case_expr`]: the expression must
 /// have an `ELSE` branch (Vortex cannot represent a `CASE` without one, and
-/// `convert` returns an error for it) and every sub-expression must itself be
-/// convertible. Without this, a `CAST(CASE ... END)` over a non-elided
-/// type-changing cast (e.g. `CAST(CASE ... END AS DOUBLE)`) is left in a
-/// `FilterExec` above the scan even though `convert` could push it.
+/// `convert` returns an error for it) and every sub-expression — the optional
+/// base, each `WHEN`/`THEN`, and the `ELSE` — must itself be convertible.
+/// `try_convert_case_expr` always converts the `ELSE` branch, so accepting a
+/// `CASE` whose `ELSE` holds an unsupported expression would break the
+/// "accepted for pushdown => convertible" invariant and fail at scan time.
+/// Without this, a `CAST(CASE ... END)` over a non-elided type-changing cast
+/// (e.g. `CAST(CASE ... END AS DOUBLE)`) is left in a `FilterExec` above the
+/// scan even though `convert` could push it.
 fn is_convertible_case_expr(case_expr: &df_expr::CaseExpr) -> bool {
-    case_expr.else_expr().is_some()
+    case_expr.else_expr().is_some_and(is_convertible_expr)
         && case_expr.expr().is_none_or(is_convertible_expr)
         && case_expr
             .when_then_expr()
@@ -984,6 +988,40 @@ mod tests {
         assert!(
             !is_convertible_expr(&declined),
             "CAST over a CASE without ELSE must not be convertible"
+        );
+    }
+
+    #[test]
+    fn test_cast_case_convertibility_requires_convertible_else() {
+        // The ELSE branch must itself be convertible: `try_convert_case_expr`
+        // always converts the ELSE, so accepting a CASE whose ELSE holds an
+        // unsupported expression would break the "accepted for pushdown =>
+        // convertible" invariant and fail inside `convert()` at scan time.
+        let when_then = vec![(
+            Arc::new(df_expr::Column::new("active", 0)) as Arc<dyn PhysicalExpr>,
+            Arc::new(df_expr::Literal::new(ScalarValue::Int64(Some(1)))) as Arc<dyn PhysicalExpr>,
+        )];
+
+        // `NOT` is not an expression type `convert()` handles, so an ELSE built
+        // from it is not convertible.
+        let unconvertible_else = Arc::new(df_expr::NotExpr::new(Arc::new(df_expr::Column::new(
+            "active", 0,
+        )))) as Arc<dyn PhysicalExpr>;
+
+        // CAST(CASE ... ELSE NOT(...) END AS DOUBLE): the ELSE cannot be
+        // converted, so the whole cast must be declined for pushdown.
+        let declined = Arc::new(df_expr::CastExpr::new(
+            Arc::new(
+                df_expr::CaseExpr::try_new(None, when_then, Some(unconvertible_else))
+                    .expect("CASE with ELSE should build"),
+            ),
+            DataType::Float64,
+            None,
+        )) as Arc<dyn PhysicalExpr>;
+
+        assert!(
+            !is_convertible_expr(&declined),
+            "CAST over a CASE whose ELSE is not convertible must not be convertible"
         );
     }
 
