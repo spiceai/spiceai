@@ -20018,6 +20018,7 @@ dependencies = [
  "system-adapter-protocol",
  "test-framework",
  "tokio",
+ "tokio-postgres",
  "tokio-util",
  "url",
  "uuid 1.23.2",

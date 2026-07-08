@@ -443,6 +443,7 @@ impl BackgroundCompactor {
                     // `run_compaction_trigger` below is intentionally never
                     // interrupted, so a pass still drains to completion on drop (see
                     // `COMPACTOR_SHUTDOWN_DRAIN` and the drain-in-flight test).
+                    let acquire_start = Instant::now();
                     let _permit = tokio::select! {
                         biased;
                         () = shutdown_task.notified() => break 'wake,
@@ -452,6 +453,16 @@ impl BackgroundCompactor {
                             Err(_) => break 'wake,
                         },
                     };
+                    // Attribute the wait for a compaction slot: a high value means
+                    // peer tables saturate the fleet-wide semaphore, starving this
+                    // table's compaction (protected set / read-amp run away).
+                    telemetry::cayenne::track_compaction_acquire_wait(
+                        acquire_start.elapsed(),
+                        &[telemetry::KeyValue::new(
+                            "table",
+                            runner.compaction_target_name().to_string(),
+                        )],
+                    );
 
                     match runner.run_compaction_trigger().await {
                         Ok(true) => {

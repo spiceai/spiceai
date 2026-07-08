@@ -87,6 +87,72 @@ async fn results_cache_system_queries() -> Result<(), String> {
         .await
 }
 
+/// Empty result sets (queries that return zero rows) must be cached, so a
+/// repeat request is served from cache instead of being re-executed against the
+/// source.
+///
+/// This is a regression test for empty results not being cached. In
+/// `DataFusion`, a filter that matches nothing yields **zero** record batches
+/// (not a single zero-row batch) — the common shape for
+/// `SELECT ... WHERE <key> = <absent>`, `WHERE 1 = 0`, and `LIMIT 0`. The
+/// results cache previously keyed its "should I store this?" decision on the
+/// batch count, so these were never cached and re-executed on every request.
+#[tokio::test]
+async fn results_cache_empty_result_sets() -> Result<(), String> {
+    let _tracing = init_tracing(None);
+    register_test_connectors().await;
+
+    test_request_context()
+        .scope(async {
+            let sql_results_cache = SQLResultsCacheConfig {
+                item_ttl: Some("60s".to_string()),
+                ..Default::default()
+            };
+
+            let app = AppBuilder::new("cache_test")
+                .with_sql_cache(sql_results_cache)
+                .with_dataset(make_s3_tpch_dataset("customer"))
+                .build();
+
+            configure_test_datafusion();
+            let rt = Runtime::builder().with_app(app).build().await;
+
+            let cloned_rt = Arc::new(rt.clone());
+            cloned_rt.load_components().await;
+
+            // Each query returns zero rows. Verify: first request misses, is
+            // empty; second request hits, is still empty (served from cache).
+            // `c_custkey = -1` covers the realistic "key not present" case; the
+            // other two cover the `WHERE 1 = 0` / `LIMIT 0` shapes.
+            for query in [
+                "SELECT * FROM customer WHERE c_custkey = -1",
+                "SELECT * FROM customer WHERE 1 = 0",
+                "SELECT * FROM customer LIMIT 0",
+            ] {
+                let miss = execute_query_and_check_cache_status(&rt, query, CacheStatus::CacheMiss)
+                    .await
+                    .expect("first request should run successfully");
+                assert_eq!(
+                    miss.iter().map(RecordBatch::num_rows).sum::<usize>(),
+                    0,
+                    "query should return zero rows: {query}"
+                );
+
+                let hit = execute_query_and_check_cache_status(&rt, query, CacheStatus::CacheHit)
+                    .await
+                    .expect("repeat request should run successfully");
+                assert_eq!(
+                    hit.iter().map(RecordBatch::num_rows).sum::<usize>(),
+                    0,
+                    "cached query should still return zero rows: {query}"
+                );
+            }
+
+            Ok(())
+        })
+        .await
+}
+
 async fn execute_query_and_check_cache_status(
     rt: &Runtime,
     query: &str,
