@@ -104,7 +104,7 @@ use std::sync::{Arc, LazyLock, Mutex, PoisonError};
 use arrow::datatypes::SchemaRef;
 use async_trait::async_trait;
 use futures::{StreamExt, stream};
-use pgwire_replication::{Lsn, ReplicationClient, ReplicationEvent};
+use pgwire_replication::{Lsn, ReplicationClient, ReplicationEvent, TryRecvEvent};
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 
@@ -118,16 +118,32 @@ use super::{
 use crate::cdc::{ChangeEnvelope, ChangesStream, CommitChange, CommitError, StreamError};
 use crate::postgres_replication::pgoutput::RelationId;
 
-/// Bounded per-member delivery queue. When one member's sink stops draining,
-/// the pump blocks on its channel and the whole shared stream pauses (in
-/// addition to the WAL pinning the ack floor already causes) — bounded memory
-/// is preferred over unbounded buffering behind a stalled sink.
-const MEMBER_CHANNEL_CAPACITY: usize = 64;
+/// Default bounded per-member delivery queue depth (envelopes), overridable via
+/// `pg_replication_member_channel_capacity`
+/// ([`ReplicationParams::member_channel_capacity`]). When one member's sink
+/// stops draining the pump blocks on its channel and the whole shared stream
+/// pauses (in addition to the WAL pinning the ack floor already causes) —
+/// bounded memory is preferred over unbounded buffering behind a stalled sink.
+/// This queue sits in front of the accelerator's much larger prefetch buffer,
+/// so a too-shallow value turns a member's transient stall into slot-wide
+/// head-of-line blocking; the default is deep enough to absorb a burst without
+/// transmitting one member's stall to the whole slot.
+pub const DEFAULT_MEMBER_CHANNEL_CAPACITY: usize = 1024;
 
 /// Upper bound on how long the pump blocks in `recv()` before re-checking
 /// membership (joins, dropped receivers). Idle Postgres servers can go tens
 /// of seconds between messages; this keeps membership changes responsive.
 const RECV_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Yield to the Tokio scheduler after draining this many buffered events via the
+/// non-blocking `try_recv` fast path. Most `handle_decoded` branches (Insert /
+/// Update / Delete during a transaction) never reach a real `.await`, so a large
+/// buffered transaction would otherwise be processed in a tight loop that never
+/// yields — starving other tasks on the worker (including `/health`). The
+/// blocking `recv()` path participates in Tokio's cooperative budget and needs
+/// no explicit yield; only the sync `try_recv` drain does. Matches Tokio's own
+/// coop budget (128) so the cadence is unchanged from the pre-`try_recv` loop.
+const DRAIN_YIELD_INTERVAL: usize = 128;
 
 /// How long a single member's committed-change delivery may block the pump
 /// before we emit a WARN, bump the stall metric, and re-check for shutdown.
@@ -451,6 +467,39 @@ impl SharedSource {
         }
     }
 
+    /// Publish one boundary's accumulated metrics to every live member in a
+    /// single pass. Replaces the several separate `for_each_member_metrics`
+    /// walks a commit/keepalive used to do (reader timing + `confirmed_flush` +
+    /// commit watermark) — one `live_members()` snapshot, one iteration. Skips
+    /// the members lock entirely when there is nothing to report.
+    fn flush_member_metrics(&self, b: &BoundaryMetrics) {
+        if b.input_wait_us == 0
+            && b.processing_us == 0
+            && b.server_wal_end == 0
+            && b.confirmed_flush_lsn == 0
+            && b.commit_watermark.is_none()
+        {
+            return;
+        }
+        self.for_each_member_metrics(|m| {
+            if b.input_wait_us > 0 {
+                m.add_reader_input_wait_micros(b.input_wait_us);
+            }
+            if b.processing_us > 0 {
+                m.add_reader_processing_micros(b.processing_us);
+            }
+            if b.server_wal_end > 0 {
+                m.set_server_wal_end(b.server_wal_end);
+            }
+            if b.confirmed_flush_lsn > 0 {
+                m.set_confirmed_flush_lsn(b.confirmed_flush_lsn);
+            }
+            if let Some(at) = b.commit_watermark {
+                m.record_commit_watermark(at);
+            }
+        });
+    }
+
     /// Detach a member: stop routing to it but hold its ack floor so the slot
     /// never acknowledges past what it durably applied. See the module docs
     /// for why the hold (and the WAL retention it causes) is intentional.
@@ -665,7 +714,7 @@ async fn attach_member(
         || (!rejoining && source.slot_created_fresh.load(Ordering::Acquire));
 
     let snapshotting = need_snapshot && params.initial_snapshot;
-    let (sender, receiver) = mpsc::channel(MEMBER_CHANNEL_CAPACITY);
+    let (sender, receiver) = mpsc::channel(params.member_channel_capacity);
     // Grouping signal for the analysis: record which shared slot this dataset joined.
     // (Membership liveness is marked by `mark_member_attached` just below.)
     metrics.set_slot_name(source.key.slot_name.clone());
@@ -867,29 +916,44 @@ async fn try_finish_if_empty(source: &Arc<SharedSource>) -> bool {
 /// per relation and route per member at Commit, acknowledgment is the
 /// [`AckTable`] floor instead of a single atomic, and member joins trigger a
 /// reconnect instead of a new connection.
-/// Fan the reader-timing accumulators (summed since the last flush) out to every
-/// live member in one pass, instead of per decoded event. The shared pump decodes
-/// one merged stream, so a per-event fan-out (`for_each_member_metrics` locks +
-/// iterates all members on every row at hundreds of thousands of rows/s) both
-/// perturbs the very hot path we measure and multiplies cost by the member count.
-/// Accumulating per event (cheap local adds) and flushing per commit/keepalive/idle
-/// tick keeps the same per-dataset series with a fraction of the overhead.
-/// `server_wal_end` is monotonic-max, so flushing the running max is exact.
-fn flush_reader_metrics(source: &SharedSource, input_us: u64, proc_us: u64, max_wal_end: u64) {
-    if input_us == 0 && proc_us == 0 && max_wal_end == 0 {
-        return;
-    }
-    source.for_each_member_metrics(|m| {
-        if input_us > 0 {
-            m.add_reader_input_wait_micros(input_us);
-        }
-        if proc_us > 0 {
-            m.add_reader_processing_micros(proc_us);
-        }
-        if max_wal_end > 0 {
-            m.set_server_wal_end(max_wal_end);
-        }
-    });
+/// Per-boundary metric snapshot fanned out to every live member in a single
+/// pass (see [`SharedSource::flush_member_metrics`]). #11610 already moved the
+/// reader-timing fan-out off the per-`XLogData` path onto commit/keepalive
+/// boundaries; this collapses the *several* separate `for_each_member_metrics`
+/// walks a boundary still did (reader timing, `confirmed_flush`, commit
+/// watermark) into one members-lock + one iteration. All fields are optional:
+/// an idle tick reports only the reader timing, a keepalive adds
+/// `confirmed_flush`, and a commit adds the watermark too.
+#[derive(Default)]
+struct BoundaryMetrics {
+    /// Microseconds blocked awaiting the source socket since the last flush.
+    input_wait_us: u64,
+    /// Microseconds spent decoding/routing since the last flush, with member
+    /// send-wait already subtracted (see `deliver_commit`).
+    processing_us: u64,
+    /// Running max of the server's reported WAL end (monotonic; exact to flush).
+    server_wal_end: u64,
+    /// Shared ack floor to publish as each member's `confirmed_flush_lsn`, or
+    /// `0` to leave it unchanged (idle ticks do not advance the ack).
+    confirmed_flush_lsn: u64,
+    /// Commit time of the transaction just delivered, for the freshness
+    /// watermark; `None` on keepalive/idle boundaries.
+    commit_watermark: Option<std::time::SystemTime>,
+}
+
+/// Outcome of one acquisition step in the pump's recv loop. Unifies the
+/// non-blocking `try_recv` fast path and the timed blocking `recv` so their
+/// error handling lives in exactly one place.
+enum Acquired {
+    /// An event to process.
+    Event(ReplicationEvent),
+    /// The poll timed out with the buffer empty — flush accumulated timing and
+    /// re-check membership.
+    Idle,
+    /// The server closed the stream cleanly; reconnect.
+    CleanClose,
+    /// A recv error (transient → reconnect, else fatal broadcast).
+    RecvError(pgwire_replication::PgWireError),
 }
 
 async fn run_pump(source: Arc<SharedSource>) {
@@ -986,13 +1050,20 @@ async fn run_pump(source: Arc<SharedSource>) {
         let mut txn: HashMap<RelationId, Vec<DecodedChange>> = HashMap::new();
         let mut txn_open = false;
 
-        // Reader-timing accumulators (see `flush_reader_metrics`): summed per decoded
-        // event, fanned out to members once per commit/keepalive/idle tick rather than
-        // per row. Reset per connection; the partial tail on a mid-txn reconnect is a
-        // negligible loss for a diagnostic metric.
+        // Reader-timing accumulators (see `BoundaryMetrics` /
+        // `flush_member_metrics`): summed per decoded event, fanned out to
+        // members once per commit/keepalive/idle tick rather than per row. Reset
+        // per connection; the partial tail on a mid-txn reconnect is a negligible
+        // loss for a diagnostic metric.
         let mut input_us_acc: u64 = 0;
         let mut proc_us_acc: u64 = 0;
         let mut max_wal_end: u64 = 0;
+        // Set on a Commit boundary so the consolidated flush also refreshes the
+        // freshness watermark; cleared on each flush.
+        let mut commit_watermark: Option<std::time::SystemTime> = None;
+        // Buffered events processed via the non-blocking `try_recv` fast path
+        // since the last cooperative yield (see `DRAIN_YIELD_INTERVAL`).
+        let mut drained_since_yield: usize = 0;
 
         'recv: loop {
             if crate::cdc::shutdown_epoch() != shutdown_epoch {
@@ -1023,39 +1094,69 @@ async fn run_pump(source: Arc<SharedSource>) {
                 return;
             }
 
-            // Bound the wait so membership changes (joins via the restart
-            // flag, receiver drops via the reap above) are noticed within
-            // ~`RECV_POLL_INTERVAL` even on a quiet server — `recv()` only
-            // returns on real server traffic, which can be tens of seconds
-            // apart when the source is idle. `recv()` reads an internal
-            // channel and is cancel-safe.
-            // Time blocked awaiting the next event from the source socket
-            // (input-wait) vs. processing below (decode + route/deliver). Their
-            // ratio is the source-bound vs. our-decode discriminator. The pump is
-            // shared across members, so attribute the (shared) wait to each member.
-            let recv_start = std::time::Instant::now();
-            let polled = tokio::time::timeout(RECV_POLL_INTERVAL, client.recv()).await;
-            input_us_acc = input_us_acc.saturating_add(
-                u64::try_from(recv_start.elapsed().as_micros()).unwrap_or(u64::MAX),
-            );
-            // Flushed per commit/keepalive (or the idle-timeout branch below), not per event.
+            // Acquire the next event. Fast path: drain events the worker has
+            // already buffered via the non-blocking `try_recv`, which arms no
+            // timer — so the per-message `timeout(..)` cost is paid once per
+            // idle gap, not once per event. Only when the buffer is empty (or
+            // the worker closed) do we block on the timed `recv()`; that bounds
+            // the wait so membership changes (joins via the restart flag,
+            // receiver drops via the reap above) are noticed within
+            // ~`RECV_POLL_INTERVAL` even on a quiet server.
+            //
+            // A `try_recv` hit adds no input-wait (there was nothing to wait
+            // for); only the blocking wait feeds `input_us_acc`. That keeps the
+            // input-wait vs. processing split (the source-bound vs. our-decode
+            // discriminator) honest. Both `recv`/`try_recv` read an internal
+            // channel and are cancel-safe.
             let mut should_flush = false;
-            let event = match polled {
-                Err(_elapsed) => {
-                    // Idle tick: flush the accumulated input-wait so idle time is
-                    // attributed even when no server event arrives for a while.
-                    flush_reader_metrics(&source, input_us_acc, proc_us_acc, max_wal_end);
+            let acquired = match client.try_recv() {
+                Ok(TryRecvEvent::Event(e)) => {
+                    drained_since_yield += 1;
+                    Acquired::Event(e)
+                }
+                Err(e) => Acquired::RecvError(e),
+                // Buffer drained (or worker gone): block for the next event.
+                // `Closed` falls here too so the blocking `recv()` reaps the
+                // worker's terminal `Ok(None)`/`Err`. The blocking `recv()`
+                // participates in Tokio's cooperative budget, so reaching here
+                // is itself a yield opportunity — reset the drain counter.
+                Ok(TryRecvEvent::Empty | TryRecvEvent::Closed) => {
+                    drained_since_yield = 0;
+                    let recv_start = std::time::Instant::now();
+                    let polled = tokio::time::timeout(RECV_POLL_INTERVAL, client.recv()).await;
+                    input_us_acc = input_us_acc.saturating_add(
+                        u64::try_from(recv_start.elapsed().as_micros()).unwrap_or(u64::MAX),
+                    );
+                    match polled {
+                        Err(_elapsed) => Acquired::Idle,
+                        Ok(Ok(Some(e))) => Acquired::Event(e),
+                        // Server closed cleanly (e.g. orderly Postgres shutdown):
+                        // treat like a transient drop and reconnect — the shared
+                        // stream is meant to run for the process lifetime.
+                        Ok(Ok(None)) => Acquired::CleanClose,
+                        Ok(Err(e)) => Acquired::RecvError(e),
+                    }
+                }
+            };
+            let event = match acquired {
+                Acquired::Event(e) => e,
+                Acquired::Idle => {
+                    // Idle tick: flush the accumulated reader timing so idle
+                    // time is attributed even when no server event arrives for a
+                    // while. No ack/watermark change on an idle boundary.
+                    source.flush_member_metrics(&BoundaryMetrics {
+                        input_wait_us: input_us_acc,
+                        processing_us: proc_us_acc,
+                        server_wal_end: max_wal_end,
+                        ..BoundaryMetrics::default()
+                    });
                     input_us_acc = 0;
                     proc_us_acc = 0;
                     max_wal_end = 0;
                     continue 'recv;
                 }
-                Ok(Ok(Some(e))) => e,
-                // Server closed cleanly (e.g. orderly Postgres shutdown):
-                // treat like a transient drop and reconnect — the shared
-                // stream is meant to run for the process lifetime.
-                Ok(Ok(None)) => break 'recv,
-                Ok(Err(e)) => {
+                Acquired::CleanClose => break 'recv,
+                Acquired::RecvError(e) => {
                     source.for_each_member_metrics(ReplicationMetricsCollector::inc_recv_error);
                     if resilience::is_transient_pgwire(&e) {
                         source.for_each_member_metrics(ReplicationMetricsCollector::inc_reconnect);
@@ -1073,7 +1174,23 @@ async fn run_pump(source: Arc<SharedSource>) {
                 }
             };
 
+            // Stay cooperative while draining a long run of buffered events off
+            // the sync `try_recv` fast path: most `handle_decoded` branches never
+            // reach a real `.await`, so a large buffered transaction would
+            // otherwise monopolize this worker thread and starve other tasks
+            // (including `/health`). Yield every `DRAIN_YIELD_INTERVAL` events;
+            // the blocking `recv()` path already resets the counter to 0.
+            if drained_since_yield >= DRAIN_YIELD_INTERVAL {
+                drained_since_yield = 0;
+                tokio::task::yield_now().await;
+            }
+
             let processing_start = std::time::Instant::now();
+            // Microseconds spent blocked delivering this event's committed
+            // changes into slow member channels (set only by a Commit). Kept
+            // separate so it can be subtracted from processing below —
+            // downstream back-pressure is not our decode cost.
+            let mut send_wait_us: u64 = 0;
             match event {
                 ReplicationEvent::Begin { .. } => {
                     txn_open = true;
@@ -1081,7 +1198,9 @@ async fn run_pump(source: Arc<SharedSource>) {
                 }
                 ReplicationEvent::XLogData { data, wal_end, .. } => {
                     max_wal_end = max_wal_end.max(wal_end.0);
-                    let msg = match decoder.decode(&data) {
+                    // Zero-copy decode: hand the owned `Bytes` frame to the decoder
+                    // (values become refcounted slices of it), not a borrow.
+                    let msg = match decoder.decode(data) {
                         Ok(m) => m,
                         Err(e) => {
                             source.for_each_member_metrics(
@@ -1099,7 +1218,7 @@ async fn run_pump(source: Arc<SharedSource>) {
                     ..
                 } => {
                     txn_open = false;
-                    deliver_commit(
+                    send_wait_us = deliver_commit(
                         &source,
                         &decoder,
                         &routes,
@@ -1109,26 +1228,23 @@ async fn run_pump(source: Arc<SharedSource>) {
                         shutdown_epoch,
                     )
                     .await;
-                    let flush = source.ack.flush_lsn();
-                    source.for_each_member_metrics(|m| m.set_confirmed_flush_lsn(flush));
-                    client.update_applied_lsn(Lsn(flush));
+                    // The ack floor + freshness watermark are published to every
+                    // member by the single consolidated boundary flush below, not
+                    // a separate per-member pass.
+                    commit_watermark = Some(client::pg_epoch_to_system_time(commit_time_micros));
+                    client.update_applied_lsn(Lsn(source.ack.flush_lsn()));
                     should_flush = true;
                 }
                 ReplicationEvent::KeepAlive { wal_end, .. } => {
-                    // Accumulate the server WAL end and defer the per-member fan-out to
-                    // `flush_reader_metrics` (called on should_flush below), which sets
-                    // `server_wal_end` once per commit/keepalive rather than per event.
-                    // Trunk's inline `set_server_wal_end` here is redundant with that
-                    // flush and would reintroduce the per-event fan-out this accumulator
-                    // was added to remove.
+                    // Accumulate the server WAL end; the per-member fan-out
+                    // (server_wal_end + confirmed_flush) happens once in the
+                    // consolidated boundary flush below, not inline per event.
                     max_wal_end = max_wal_end.max(wal_end.0);
                     should_flush = true;
                     if !txn_open {
                         source.ack.credit_idle(wal_end.0);
                     }
-                    let flush = source.ack.flush_lsn();
-                    source.for_each_member_metrics(|m| m.set_confirmed_flush_lsn(flush));
-                    client.update_applied_lsn(Lsn(flush));
+                    client.update_applied_lsn(Lsn(source.ack.flush_lsn()));
                 }
                 ReplicationEvent::Message { .. } => {}
                 ReplicationEvent::StoppedAt { reached } => {
@@ -1140,30 +1256,41 @@ async fn run_pump(source: Arc<SharedSource>) {
                     break 'reconnect;
                 }
             }
-            // Processing (decode + route/deliver) for this event; paired with the
-            // input-wait above. Accumulated locally; fanned out to members only on a
-            // commit/keepalive (should_flush) — the frequent per-row XLogData events
-            // just accumulate, keeping the hot decode path free of the per-event
-            // member-iteration fan-out.
+            // Processing (decode + route) for this event, paired with the
+            // input-wait above. Accumulated locally; fanned out to members only
+            // on a commit/keepalive boundary (`should_flush`) — the frequent
+            // per-row XLogData events just accumulate, keeping the hot decode
+            // path free of the per-event member-iteration fan-out.
             //
-            // CAVEAT (waterfall reader-split): this bucket is "decode + route + DELIVER",
-            // and delivery includes `await`ing the bounded per-member channel in
-            // `deliver_commit`. When a member's sink is slow the pump BLOCKS on that send
-            // — downstream back-pressure, not our decode cost — yet it lands here and
-            // deflates the reader input-share, which can make the classifier read
-            // READER-decode-bound when the truth is apply-bound. A dedicated
-            // `member_send_wait_micros` accumulator around the send `await`s (below and in
-            // `deliver_commit`) would make input-share honest; until then the waterfall
-            // annotates the shared-path processing bucket accordingly. TODO(cdc-metrics).
-            proc_us_acc = proc_us_acc.saturating_add(
-                u64::try_from(processing_start.elapsed().as_micros()).unwrap_or(u64::MAX),
-            );
+            // `send_wait_us` — time the Commit spent BLOCKED `await`ing a slow
+            // member's bounded channel in `deliver_commit` — is subtracted here:
+            // that is downstream back-pressure, not our decode cost, and is
+            // carried per dataset by `member_send_wait_micros_total` instead. So
+            // the reader-processing bucket stays honest (decode + route only) and
+            // the classifier no longer reads READER-decode-bound when the truth
+            // is apply-bound. (Resolves the earlier reader-split caveat.)
+            let processed_us =
+                u64::try_from(processing_start.elapsed().as_micros()).unwrap_or(u64::MAX);
+            proc_us_acc = proc_us_acc.saturating_add(processed_us.saturating_sub(send_wait_us));
+            // Flush on a commit/keepalive boundary, or periodically (~1s of
+            // accumulated wait+processing) so a long transaction still reports
+            // before its commit. A periodic flush carries no commit watermark
+            // (commit_watermark stays None) and does not call `credit_idle`, but
+            // it may still publish a higher confirmed_flush if members advanced
+            // the shared ack floor asynchronously.
             let us_since_flush = input_us_acc.saturating_add(proc_us_acc);
             if should_flush || us_since_flush >= 1_000_000 {
-                flush_reader_metrics(&source, input_us_acc, proc_us_acc, max_wal_end);
+                source.flush_member_metrics(&BoundaryMetrics {
+                    input_wait_us: input_us_acc,
+                    processing_us: proc_us_acc,
+                    server_wal_end: max_wal_end,
+                    confirmed_flush_lsn: source.ack.flush_lsn(),
+                    commit_watermark,
+                });
                 input_us_acc = 0;
                 proc_us_acc = 0;
                 max_wal_end = 0;
+                commit_watermark = None;
             }
         } // end 'recv
 
@@ -1319,8 +1446,80 @@ async fn handle_decoded(
     }
 }
 
+/// Outcome of delivering one envelope into a member's channel. Every variant
+/// carries the microseconds spent `await`ing the channel (already recorded into
+/// the member's `member_send_wait_micros_total`), which the caller folds into
+/// the commit total it subtracts from reader-processing.
+enum SendOutcome {
+    /// Delivered.
+    Sent(u64),
+    /// The member's receiver was dropped — the caller should detach it.
+    ReceiverGone(u64),
+    /// The runtime began shutting down mid-wait — the caller should abandon the
+    /// rest of the commit and let the pump release the slot.
+    ShutdownAbandon(u64),
+}
+
+/// Must-deliver one envelope into a member's bounded channel, timing the wait.
+///
+/// The envelope carries committed changes and a `SharedLsnCommitter` that
+/// advances the ack floor, so it cannot be dropped under back-pressure. But one
+/// slow member must not block the pump (and thus every other member)
+/// indefinitely or wedge shutdown, so the wait is bounded: on each
+/// `MEMBER_SEND_STALL_WARN` tick we WARN + bump the stall metric, and abandon if
+/// the runtime is shutting down. Server-side liveness is handled a layer down by
+/// the worker. Records the full awaited time into `member_send_wait_micros_total`
+/// (≈0 when the channel had spare capacity) and returns it in the outcome.
+async fn deliver_to_member(
+    metrics: &ReplicationMetricsCollector,
+    dataset_name: &str,
+    sender: &mpsc::Sender<std::result::Result<ChangeEnvelope, StreamError>>,
+    envelope: std::result::Result<ChangeEnvelope, StreamError>,
+    shutdown_epoch: u64,
+) -> SendOutcome {
+    let send_start = std::time::Instant::now();
+    let waited =
+        |start: std::time::Instant| u64::try_from(start.elapsed().as_micros()).unwrap_or(u64::MAX);
+    let mut pending = envelope;
+    loop {
+        match sender.send_timeout(pending, MEMBER_SEND_STALL_WARN).await {
+            Ok(()) => {
+                let w = waited(send_start);
+                metrics.add_member_send_wait_micros(w);
+                return SendOutcome::Sent(w);
+            }
+            Err(mpsc::error::SendTimeoutError::Closed(_)) => {
+                let w = waited(send_start);
+                metrics.add_member_send_wait_micros(w);
+                return SendOutcome::ReceiverGone(w);
+            }
+            Err(mpsc::error::SendTimeoutError::Timeout(returned)) => {
+                if crate::cdc::shutdown_epoch() != shutdown_epoch {
+                    let w = waited(send_start);
+                    metrics.add_member_send_wait_micros(w);
+                    return SendOutcome::ShutdownAbandon(w);
+                }
+                metrics.add_send_stalled(MEMBER_SEND_STALL_WARN.as_secs());
+                tracing::warn!(
+                    dataset = %dataset_name,
+                    stalled_for = ?MEMBER_SEND_STALL_WARN,
+                    "shared Postgres CDC member sink is not draining; the pump is \
+                     waiting to deliver committed changes (watch \
+                     dataset_postgres_replication_member_send_stalled_seconds_total)"
+                );
+                pending = returned;
+            }
+        }
+    }
+}
+
 /// Route a committed transaction's buffered changes to their members, then
-/// credit idle members and recompute the shared ack floor.
+/// credit idle members and recompute the shared ack floor. Returns the total
+/// microseconds spent `await`ing slow member channels during this commit — the
+/// caller subtracts it from the reader-processing accumulator so downstream
+/// back-pressure is not misattributed to decode cost (it is carried per dataset
+/// by `member_send_wait_micros_total`). Returns ~0 whenever every member's
+/// channel had spare capacity.
 async fn deliver_commit(
     source: &Arc<SharedSource>,
     decoder: &pgoutput::Decoder,
@@ -1329,15 +1528,18 @@ async fn deliver_commit(
     end_lsn: u64,
     commit_time_micros: i64,
     shutdown_epoch: u64,
-) {
+) -> u64 {
     let commit_time = client::pg_epoch_to_system_time(commit_time_micros);
     // Unix-epoch ms for the per-batch replication-lag signal carried into the
-    // accelerator (distinct from the `SystemTime` used for the local metrics
-    // watermark below).
+    // accelerator (distinct from the `SystemTime` watermark published by the
+    // caller's boundary flush).
     let commit_ts_ms = commit_time
         .duration_since(std::time::UNIX_EPOCH)
         .ok()
         .and_then(|d| i64::try_from(d.as_millis()).ok());
+    // Total time blocked awaiting member channels this commit, returned to the
+    // caller for the reader-processing subtraction.
+    let mut total_send_wait_us: u64 = 0;
 
     for (relation_id, changes) in txn {
         if changes.is_empty() {
@@ -1392,50 +1594,34 @@ async fn deliver_commit(
             false,
         );
         source.ack.deliver(member_key, end_lsn);
-        // Must-deliver: this envelope carries committed changes and a
-        // `SharedLsnCommitter` that advances the ack floor, so we cannot drop
-        // it under backpressure. But we also must not let one slow member block
-        // the pump (and thus every other member) indefinitely, or wedge runtime
-        // shutdown. Bound the wait: on each stall tick emit a WARN + bump the
-        // stall metric, and abandon delivery if the runtime is shutting down
-        // (epoch advanced) — the pump then observes shutdown and releases the
-        // slot. Server-side liveness is handled one layer down by the worker.
-        let mut pending = Ok(envelope);
-        loop {
-            match member
-                .sender
-                .send_timeout(pending, MEMBER_SEND_STALL_WARN)
-                .await
-            {
-                Ok(()) => break,
-                Err(mpsc::error::SendTimeoutError::Closed(_)) => {
-                    source.detach_member(member_key, "changes stream receiver dropped", true);
-                    break;
-                }
-                Err(mpsc::error::SendTimeoutError::Timeout(returned)) => {
-                    if crate::cdc::shutdown_epoch() != shutdown_epoch {
-                        return;
-                    }
-                    member
-                        .metrics
-                        .add_send_stalled(MEMBER_SEND_STALL_WARN.as_secs());
-                    tracing::warn!(
-                        dataset = %member.dataset_name,
-                        stalled_for = ?MEMBER_SEND_STALL_WARN,
-                        "shared Postgres CDC member sink is not draining; the pump is \
-                         waiting to deliver committed changes (watch \
-                         dataset_postgres_replication_member_send_stalled_seconds_total)"
-                    );
-                    pending = returned;
-                }
+        match deliver_to_member(
+            &member.metrics,
+            &member.dataset_name,
+            &member.sender,
+            Ok(envelope),
+            shutdown_epoch,
+        )
+        .await
+        {
+            SendOutcome::Sent(waited) => {
+                total_send_wait_us = total_send_wait_us.saturating_add(waited);
+            }
+            SendOutcome::ReceiverGone(waited) => {
+                total_send_wait_us = total_send_wait_us.saturating_add(waited);
+                source.detach_member(member_key, "changes stream receiver dropped", true);
+            }
+            SendOutcome::ShutdownAbandon(waited) => {
+                return total_send_wait_us.saturating_add(waited);
             }
         }
     }
 
-    // Slot-level freshness signal: every live member has now seen WAL through
-    // this commit (routed members via their envelope, others by exclusion).
-    source.for_each_member_metrics(|m| m.record_commit_watermark(commit_time));
+    // The slot-level freshness watermark for this commit is published to every
+    // member by the caller's consolidated boundary flush
+    // (`BoundaryMetrics::commit_watermark`), not a separate per-member pass.
     source.ack.credit_idle(end_lsn);
+
+    total_send_wait_us
 }
 
 #[cfg(test)]
@@ -1444,6 +1630,175 @@ mod tests {
 
     fn key(s: &str) -> MemberKey {
         ("public".to_string(), s.to_string())
+    }
+
+    /// A one-column schema — `build_ready_signal_envelope` cannot build a
+    /// zero-field struct array, so tests that emit a ready envelope need at
+    /// least one field.
+    fn tiny_schema() -> SchemaRef {
+        Arc::new(arrow::datatypes::Schema::new(vec![
+            arrow::datatypes::Field::new("id", arrow::datatypes::DataType::Int32, false),
+        ]))
+    }
+
+    /// Minimal shared params for tests that only exercise members/metrics; the
+    /// connection fields are never dialed.
+    fn test_params() -> ReplicationParams {
+        ReplicationParams {
+            host: "localhost".to_string(),
+            port: 5432,
+            user: "u".to_string(),
+            password: secrecy::SecretString::from(String::new()),
+            database: "db".to_string(),
+            sslmode: crate::postgres_replication::config::SslMode::Disable,
+            sslrootcert: None,
+            slot_name: "slot".to_string(),
+            publication_name: "pub".to_string(),
+            initial_snapshot: true,
+            snapshot_on_resume: false,
+            temporary_slot: false,
+            status_interval: std::time::Duration::from_secs(5),
+            bootstrap_batch_size: 8192,
+            shared: true,
+            member_channel_capacity: DEFAULT_MEMBER_CHANNEL_CAPACITY,
+            pg_output_format: crate::postgres_replication::PgOutputFormat::Binary,
+        }
+    }
+
+    type MemberProbe = (
+        MemberKey,
+        Arc<ReplicationMetricsCollector>,
+        mpsc::Receiver<std::result::Result<ChangeEnvelope, StreamError>>,
+    );
+
+    /// Build a `SharedSource` with `n` members wired to fresh metrics collectors
+    /// and (capacity-4) channels, returning a probe per member so tests can read
+    /// its metrics and drive its channel.
+    fn test_source_with_members(n: usize) -> (Arc<SharedSource>, Vec<MemberProbe>) {
+        let source_key = SourceKey::from_params(&test_params());
+        let source = Arc::new(SharedSource::new(source_key, test_params()));
+        let schema: SchemaRef = Arc::new(arrow::datatypes::Schema::empty());
+        let mut probes = Vec::with_capacity(n);
+        for i in 0..n {
+            let member_key = key(&format!("t{i}"));
+            let metrics = ReplicationMetricsCollector::new();
+            let (sender, receiver) = mpsc::channel(4);
+            lock(&source.members).insert(
+                member_key.clone(),
+                Arc::new(MemberHandle {
+                    dataset_name: format!("ds{i}"),
+                    schema: Arc::clone(&schema),
+                    primary_keys: vec![],
+                    generated_columns: vec![],
+                    sender,
+                    metrics: Arc::clone(&metrics),
+                }),
+            );
+            probes.push((member_key, metrics, receiver));
+        }
+        (source, probes)
+    }
+
+    /// Item 1: one boundary flush publishes every field to every member.
+    #[test]
+    fn flush_member_metrics_fans_all_fields_to_every_member() {
+        let (source, probes) = test_source_with_members(3);
+        let watermark =
+            std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+        source.flush_member_metrics(&BoundaryMetrics {
+            input_wait_us: 11,
+            processing_us: 22,
+            server_wal_end: 500,
+            confirmed_flush_lsn: 400,
+            commit_watermark: Some(watermark),
+        });
+        for (_, collector, _rx) in &probes {
+            let m = crate::postgres_replication::ReplicationMetrics::new(Arc::clone(collector));
+            assert_eq!(m.reader_input_wait_micros_total(), 11);
+            assert_eq!(m.reader_processing_micros_total(), 22);
+            assert_eq!(m.server_wal_end_lsn(), 500);
+            assert_eq!(m.confirmed_flush_lsn(), 400);
+            assert!(
+                m.replication_lag_ms().is_some(),
+                "watermark should set lag_ms"
+            );
+        }
+    }
+
+    /// Item 1: an all-zero boundary touches nothing (the members-lock fast path).
+    #[test]
+    fn flush_member_metrics_empty_boundary_is_a_noop() {
+        let (source, probes) = test_source_with_members(2);
+        source.flush_member_metrics(&BoundaryMetrics::default());
+        for (_, collector, _rx) in &probes {
+            let m = crate::postgres_replication::ReplicationMetrics::new(Arc::clone(collector));
+            assert_eq!(m.reader_input_wait_micros_total(), 0);
+            assert_eq!(m.reader_processing_micros_total(), 0);
+            assert_eq!(m.server_wal_end_lsn(), 0);
+            assert_eq!(m.confirmed_flush_lsn(), 0);
+        }
+    }
+
+    /// Item 4: a stalled (full) member channel lands the pump's blocked time in
+    /// `member_send_wait_micros_total` — the value the caller subtracts from the
+    /// reader-processing bucket — while a channel with spare capacity waits ~0.
+    #[tokio::test]
+    async fn deliver_to_member_backpressure_lands_in_send_wait() {
+        let epoch = crate::cdc::shutdown_epoch();
+        let schema = tiny_schema();
+        let collector = ReplicationMetricsCollector::new();
+        let (tx, mut rx) = mpsc::channel::<std::result::Result<ChangeEnvelope, StreamError>>(1);
+
+        // Spare capacity → immediate send, negligible wait.
+        let env0 = Ok(crate::cdc::build_ready_signal_envelope(&schema).expect("ready envelope"));
+        match deliver_to_member(&collector, "ds", &tx, env0, epoch).await {
+            SendOutcome::Sent(w) => assert!(w < 100_000, "fast path should be ~0µs, got {w}"),
+            _ => panic!("expected Sent on the fast path"),
+        }
+        let _ = rx.recv().await.expect("drain fast-path envelope");
+
+        // Fill to capacity; free a slot only after a delay so the next send blocks.
+        tx.send(Ok(
+            crate::cdc::build_ready_signal_envelope(&schema).expect("env")
+        ))
+        .await
+        .expect("prefill to capacity");
+        let drainer = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(60)).await;
+            let _ = rx.recv().await; // free one slot
+            rx // keep the receiver alive until the send completes
+        });
+        let env1 = Ok(crate::cdc::build_ready_signal_envelope(&schema).expect("env"));
+        let SendOutcome::Sent(waited) = deliver_to_member(&collector, "ds", &tx, env1, epoch).await
+        else {
+            panic!("expected Sent once the slot frees")
+        };
+        assert!(
+            waited >= 40_000,
+            "expected ≥40ms blocked wait, got {waited}µs"
+        );
+
+        let m = crate::postgres_replication::ReplicationMetrics::new(Arc::clone(&collector));
+        assert!(
+            m.member_send_wait_micros_total() >= waited,
+            "member_send_wait counter must include the blocked wait"
+        );
+        let _rx = drainer.await.expect("drainer task");
+    }
+
+    /// Item 4: a dropped receiver is reported so the caller detaches the member.
+    #[tokio::test]
+    async fn deliver_to_member_reports_receiver_gone() {
+        let epoch = crate::cdc::shutdown_epoch();
+        let schema = tiny_schema();
+        let collector = ReplicationMetricsCollector::new();
+        let (tx, rx) = mpsc::channel::<std::result::Result<ChangeEnvelope, StreamError>>(1);
+        drop(rx);
+        let env = Ok(crate::cdc::build_ready_signal_envelope(&schema).expect("env"));
+        assert!(matches!(
+            deliver_to_member(&collector, "ds", &tx, env, epoch).await,
+            SendOutcome::ReceiverGone(_)
+        ));
     }
 
     #[test]
