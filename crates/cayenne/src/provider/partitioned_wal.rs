@@ -155,10 +155,16 @@ impl PartitionedWal {
             Err(source) => return Err(Error::IoError { source }),
         };
 
+        // Error context uses `table_root` for every sync below (including the
+        // grandparent one), so a spawn-blocking join failure is attributed to
+        // this table rather than to whatever ancestor directory we happened to
+        // fsync.
+        let table = table_root.display().to_string();
+
         // Sync the table root so the newly created `_partitioned_wal/` entry is
         // written through (directory ordering tier: plain fsync on macOS, full
         // fsync elsewhere — see `provider/fsync_tier.rs`).
-        Self::ordering_sync_dir(table_root).await?;
+        Self::ordering_sync_dir(table_root, &table).await?;
 
         // In the fallback path `table_root` itself was just created by
         // `create_dir_all`, so its own directory entry is not yet durable.
@@ -167,17 +173,19 @@ impl PartitionedWal {
         // catalog was committed to point at it. This mirrors the parent-sync
         // requirement documented in `Table::ensure_snapshot_dir_exists`.
         if table_root_created && let Some(grandparent) = table_root.parent() {
-            Self::ordering_sync_dir(grandparent).await?;
+            Self::ordering_sync_dir(grandparent, &table).await?;
         }
 
         Ok(())
     }
 
     /// Open `dir` and fsync it at the directory ordering tier, so a child entry
-    /// created inside it is persisted through to the device.
-    async fn ordering_sync_dir(dir: &Path) -> Result<()> {
+    /// created inside it is persisted through to the device. `table` labels the
+    /// owning table for error context (it may differ from `dir`, e.g. when
+    /// syncing `dir`'s parent on behalf of the table root).
+    async fn ordering_sync_dir(dir: &Path, table: &str) -> Result<()> {
         let path = dir.to_path_buf();
-        let table = dir.display().to_string();
+        let table = table.to_string();
         tokio::task::spawn_blocking(move || {
             let dir = std::fs::File::open(&path)?;
             crate::provider::fsync_tier::ordering_sync_dir_std(&dir)

@@ -2259,6 +2259,20 @@ impl DataAccelerator for CayenneAccelerator {
         // `is_s3_express` data-path flag says nothing about the metadata dir).
         Self::prepare_local_acceleration_dir(&dir_path).await?;
         let metadata_dir = Self::resolve_metadata_dir(source.acceleration());
+        // The Cayenne metastore (SQLite/Turso catalog) is always stored on local
+        // disk, so the metadata directory must be local. Reject a non-local
+        // `cayenne_metadata_dir` (e.g. an `s3://` URL) up front — otherwise
+        // `prepare_local_acceleration_dir` would no-op on it and later local
+        // filesystem operations would fail obscurely on the URL string.
+        if !is_local_path(&metadata_dir) {
+            return Err(Box::new(Error::InvalidConfiguration {
+                detail: Arc::from(format!(
+                    "Cayenne metadata directory must be a local path, but it resolved to '{metadata_dir}'. \
+                    The Cayenne metastore (SQLite/Turso catalog) is stored on local disk; \
+                    set 'cayenne_metadata_dir' to a local path or a 'file://' URL."
+                )),
+            }) as Box<dyn std::error::Error + Send + Sync>);
+        }
         Self::prepare_local_acceleration_dir(&metadata_dir).await?;
 
         // Handle S3 Express One Zone configuration
@@ -3812,6 +3826,56 @@ mod tests {
             .collect();
         assert!(dims.contains(&256));
         assert!(dims.contains(&1536));
+    }
+
+    #[tokio::test]
+    async fn init_rejects_non_local_metadata_dir() {
+        // The Cayenne metastore is always local, so a non-local
+        // `cayenne_metadata_dir` (e.g. an s3:// URL) must be rejected up front
+        // with an actionable error — not silently skipped by the local-dir
+        // preparation and left to fail obscurely later.
+        let app = AppBuilder::new("test").build();
+        let rt = crate::Runtime::builder().build().await;
+        let temp = tempfile::TempDir::new().expect("create temp dir");
+
+        let mut dataset = DatasetBuilder::try_new(
+            "cayenne_bad_metadata_dir".to_string(),
+            "cayenne_bad_metadata_dir",
+        )
+        .expect("Failed to create builder")
+        .with_app(Arc::new(app))
+        .with_runtime(Arc::new(rt))
+        .build()
+        .expect("Failed to build dataset");
+
+        dataset.acceleration = Some(Acceleration {
+            engine: Engine::Cayenne,
+            mode: Mode::File,
+            params: [
+                (
+                    "cayenne_file_path".to_string(),
+                    temp.path().to_string_lossy().to_string(),
+                ),
+                (
+                    "cayenne_metadata_dir".to_string(),
+                    "s3://example-bucket/cayenne-metadata".to_string(),
+                ),
+            ]
+            .into_iter()
+            .collect(),
+            ..Default::default()
+        });
+
+        let accelerator = CayenneAccelerator::new();
+        let err = accelerator
+            .init(&dataset)
+            .await
+            .expect_err("init should reject a non-local metadata directory");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("metadata directory must be a local path"),
+            "error should explain the metadata dir must be local, got: {msg}"
+        );
     }
 
     #[tokio::test]
