@@ -18430,7 +18430,10 @@ impl CayenneTableProvider {
             "mem_tier_checkpoint",
             checkpoint_start,
         );
-        tracing::debug!(
+        // Fires on every mem-tier checkpoint flush — per-snapshot happy-path
+        // diagnostic (spammy under sustained ingest, e.g. a snapshot storm), so
+        // keep it at trace so it is omitted even at debug verbosity.
+        tracing::trace!(
             target: "cayenne::mem_tier",
             table = self.table_metadata.table_name.as_str(),
             flushed_rows = flushed_mem_rows,
