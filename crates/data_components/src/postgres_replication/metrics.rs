@@ -93,9 +93,11 @@ pub struct MetricsCollector {
     /// member's bounded channel while delivering committed changes. Unlike
     /// `member_send_stalled_seconds_total` (which only ticks after a full
     /// `MEMBER_SEND_STALL_WARN` interval elapses), this accrues the *full*
-    /// per-commit wait — including sub-second waits — so the waterfall can
-    /// subtract it from `reader_processing_micros_total` and stop attributing
-    /// downstream back-pressure to our decode cost. Only set for shared slots.
+    /// per-commit wait, including sub-second waits. The pump already subtracts
+    /// this wait from `reader_processing_micros_total` at the source (so that
+    /// counter stays decode-only, not inflated by downstream back-pressure);
+    /// this counter exports the subtracted amount so the waterfall can attribute
+    /// it to apply back-pressure rather than lose it. Only set for shared slots.
     member_send_wait_micros_total: AtomicU64,
 
     // Shared-slot membership liveness. `member_attached` is `1` while this
@@ -270,8 +272,10 @@ impl MetricsCollector {
             .fetch_add(secs, Ordering::Relaxed);
     }
     /// Add microseconds the shared-slot pump spent `await`ing this member's
-    /// channel during commit delivery (shared slot). Subtracted from
-    /// `reader_processing_micros_total` by the waterfall.
+    /// channel during commit delivery (shared slot). The pump subtracts the
+    /// same amount from `reader_processing_micros_total` at the source, so that
+    /// counter stays decode-only; this exports the subtracted wait for
+    /// attribution.
     pub fn add_member_send_wait_micros(&self, us: u64) {
         self.member_send_wait_micros_total
             .fetch_add(us, Ordering::Relaxed);

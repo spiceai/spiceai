@@ -432,9 +432,10 @@ const METRICS: &[MetricSpec] = &[
         "Cumulative microseconds the shared-slot pump spent awaiting this dataset's \
          delivery channel while applying committed changes. Unlike \
          member_send_stalled_seconds_total, this accrues the full per-commit wait \
-         (including sub-second waits), so it is subtracted from \
-         reader_processing_micros_total to keep downstream back-pressure from being \
-         misattributed to decode cost. Only reported for datasets on a shared slot.",
+         (including sub-second waits). The pump subtracts this wait from \
+         reader_processing_micros_total at the source, so that counter stays \
+         decode-only; this metric exports the subtracted amount for attribution. \
+         Only reported for datasets on a shared slot.",
     )
     .unit("us")
     .auto_register(),
