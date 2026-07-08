@@ -1444,9 +1444,8 @@ async fn deliver_to_member(
     shutdown_epoch: u64,
 ) -> SendOutcome {
     let send_start = std::time::Instant::now();
-    let waited = |start: std::time::Instant| {
-        u64::try_from(start.elapsed().as_micros()).unwrap_or(u64::MAX)
-    };
+    let waited =
+        |start: std::time::Instant| u64::try_from(start.elapsed().as_micros()).unwrap_or(u64::MAX);
     let mut pending = envelope;
     loop {
         match sender.send_timeout(pending, MEMBER_SEND_STALL_WARN).await {
@@ -1603,11 +1602,9 @@ mod tests {
     /// zero-field struct array, so tests that emit a ready envelope need at
     /// least one field.
     fn tiny_schema() -> SchemaRef {
-        Arc::new(arrow::datatypes::Schema::new(vec![arrow::datatypes::Field::new(
-            "id",
-            arrow::datatypes::DataType::Int32,
-            false,
-        )]))
+        Arc::new(arrow::datatypes::Schema::new(vec![
+            arrow::datatypes::Field::new("id", arrow::datatypes::DataType::Int32, false),
+        ]))
     }
 
     /// Minimal shared params for tests that only exercise members/metrics; the
@@ -1686,7 +1683,10 @@ mod tests {
             assert_eq!(m.reader_processing_micros_total(), 22);
             assert_eq!(m.server_wal_end_lsn(), 500);
             assert_eq!(m.confirmed_flush_lsn(), 400);
-            assert!(m.replication_lag_ms().is_some(), "watermark should set lag_ms");
+            assert!(
+                m.replication_lag_ms().is_some(),
+                "watermark should set lag_ms"
+            );
         }
     }
 
@@ -1712,8 +1712,7 @@ mod tests {
         let epoch = crate::cdc::shutdown_epoch();
         let schema = tiny_schema();
         let collector = ReplicationMetricsCollector::new();
-        let (tx, mut rx) =
-            mpsc::channel::<std::result::Result<ChangeEnvelope, StreamError>>(1);
+        let (tx, mut rx) = mpsc::channel::<std::result::Result<ChangeEnvelope, StreamError>>(1);
 
         // Spare capacity → immediate send, negligible wait.
         let env0 = Ok(crate::cdc::build_ready_signal_envelope(&schema).expect("ready envelope"));
@@ -1724,9 +1723,11 @@ mod tests {
         let _ = rx.recv().await.expect("drain fast-path envelope");
 
         // Fill to capacity; free a slot only after a delay so the next send blocks.
-        tx.send(Ok(crate::cdc::build_ready_signal_envelope(&schema).expect("env")))
-            .await
-            .expect("prefill to capacity");
+        tx.send(Ok(
+            crate::cdc::build_ready_signal_envelope(&schema).expect("env")
+        ))
+        .await
+        .expect("prefill to capacity");
         let drainer = tokio::spawn(async move {
             tokio::time::sleep(std::time::Duration::from_millis(60)).await;
             let _ = rx.recv().await; // free one slot
@@ -1737,7 +1738,10 @@ mod tests {
         else {
             panic!("expected Sent once the slot frees")
         };
-        assert!(waited >= 40_000, "expected ≥40ms blocked wait, got {waited}µs");
+        assert!(
+            waited >= 40_000,
+            "expected ≥40ms blocked wait, got {waited}µs"
+        );
 
         let m = crate::postgres_replication::ReplicationMetrics::new(Arc::clone(&collector));
         assert!(
