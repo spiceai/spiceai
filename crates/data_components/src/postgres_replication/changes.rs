@@ -782,7 +782,7 @@ impl FieldBuilder {
                 b.append_value(pg::text_from_sql(raw).map_err(decode_err("text"))?);
             }
             // bytea `send` form is the raw bytes — identity.
-            Self::Binary(b) => b.append_value(pg::bytea_from_sql(raw)),
+            Self::Binary(b) => b.append_value(raw),
             Self::Date32(b) => {
                 let pg_days = pg::date_from_sql(raw).map_err(decode_err("date"))?;
                 let days = pg_days
@@ -1285,7 +1285,10 @@ fn decode_binary_array(raw: &[u8]) -> Result<(u32, Vec<Option<&[u8]>>)> {
         })?;
     }
 
-    let mut out = Vec::with_capacity(count);
+    let mut out = Vec::new();
+    out.try_reserve_exact(count).map_err(|e| super::Error::PgOutputDecode {
+        message: format!("postgres_replication: array too large (len {count}): {e}"),
+    })?;
     for _ in 0..count {
         ensure!(
             b.remaining() >= 4,
