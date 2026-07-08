@@ -244,8 +244,9 @@ mod tests {
              WHERE CAST(CASE WHEN v > 5 THEN v END AS DOUBLE) > 8.0 ORDER BY id";
         let no_else_plan = physical_plan_display(&ctx.session, no_else_query).await?;
         assert!(
-            no_else_plan.contains("FilterExec"),
-            "CAST(CASE) without ELSE must stay above the scan, got plan:\n{no_else_plan}"
+            no_else_plan.contains("FilterExec") && !no_else_plan.contains("predicate:"),
+            "CAST(CASE) without ELSE must stay in a FilterExec above the scan and must \
+             NOT be pushed into the scan, got plan:\n{no_else_plan}"
         );
         let no_else_result = ctx.session.sql(no_else_query).await?.collect().await?;
         assert_eq!(

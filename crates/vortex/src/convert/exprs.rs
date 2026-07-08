@@ -487,6 +487,13 @@ fn can_be_pushed_down_impl(df_expr: &Arc<dyn PhysicalExpr>, schema: &Schema) -> 
 /// Checks if an expression type is one that `convert()` can handle.
 /// This is less restrictive than `can_be_pushed_down` since it only checks
 /// expression types, not data type support.
+///
+/// It is deliberately a conservative subset of `convert()`:
+/// `DynamicFilterPhysicalExpr` is handled by `convert()` (via its
+/// `current()` snapshot) but omitted here, because a `CAST` over a dynamic
+/// filter is not a plan shape `DataFusion` produces. A conservative result
+/// only forgoes a pushdown for such a (non-occurring) expression — it is never
+/// incorrect.
 fn is_convertible_expr(df_expr: &Arc<dyn PhysicalExpr>) -> bool {
     let expr = df_expr;
 
@@ -995,25 +1002,39 @@ mod tests {
     fn test_cast_case_convertibility_requires_convertible_else() {
         // The ELSE branch must itself be convertible: `try_convert_case_expr`
         // always converts the ELSE, so accepting a CASE whose ELSE holds an
-        // unsupported expression would break the "accepted for pushdown =>
+        // unconvertible expression would break the "accepted for pushdown =>
         // convertible" invariant and fail inside `convert()` at scan time.
+        //
+        // Use a nested CASE *without* an ELSE as the outer ELSE branch: Vortex
+        // can never represent an ELSE-less CASE (a permanent limitation, unlike
+        // the evolving set of supported leaf expressions), so the outer CASE is
+        // rejected precisely by the new ELSE-convertibility check. This keeps
+        // the test valid no matter which leaf expressions `convert()` later
+        // grows support for.
+        let inner_case_without_else = Arc::new(
+            df_expr::CaseExpr::try_new(
+                None,
+                vec![(
+                    Arc::new(df_expr::Column::new("active", 0)) as Arc<dyn PhysicalExpr>,
+                    Arc::new(df_expr::Literal::new(ScalarValue::Int64(Some(2))))
+                        as Arc<dyn PhysicalExpr>,
+                )],
+                None,
+            )
+            .expect("inner CASE without ELSE should build"),
+        ) as Arc<dyn PhysicalExpr>;
+
         let when_then = vec![(
             Arc::new(df_expr::Column::new("active", 0)) as Arc<dyn PhysicalExpr>,
             Arc::new(df_expr::Literal::new(ScalarValue::Int64(Some(1)))) as Arc<dyn PhysicalExpr>,
         )];
 
-        // `NOT` is not an expression type `convert()` handles, so an ELSE built
-        // from it is not convertible.
-        let unconvertible_else = Arc::new(df_expr::NotExpr::new(Arc::new(df_expr::Column::new(
-            "active", 0,
-        )))) as Arc<dyn PhysicalExpr>;
-
-        // CAST(CASE ... ELSE NOT(...) END AS DOUBLE): the ELSE cannot be
-        // converted, so the whole cast must be declined for pushdown.
+        // CAST(CASE ... ELSE (CASE ... /* no ELSE */) END AS DOUBLE): the outer
+        // ELSE is not convertible, so the whole cast must be declined.
         let declined = Arc::new(df_expr::CastExpr::new(
             Arc::new(
-                df_expr::CaseExpr::try_new(None, when_then, Some(unconvertible_else))
-                    .expect("CASE with ELSE should build"),
+                df_expr::CaseExpr::try_new(None, when_then, Some(inner_case_without_else))
+                    .expect("outer CASE with ELSE should build"),
             ),
             DataType::Float64,
             None,
