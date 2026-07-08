@@ -152,16 +152,10 @@ impl ComponentKey {
         const CLUSTER_PREFIX: &str = "cluster:";
 
         if let Some(name) = component_name.strip_prefix(DATASET_PREFIX) {
-            return TableReference::parse_str(name).map_or_else(
-                |_| Self::internal(component_name),
-                |table| Self::Dataset(table),
-            );
+            return Self::Dataset(TableReference::parse_str(name));
         }
         if let Some(name) = component_name.strip_prefix(VIEW_PREFIX) {
-            return TableReference::parse_str(name).map_or_else(
-                |_| Self::internal(component_name),
-                |table| Self::View(table),
-            );
+            return Self::View(TableReference::parse_str(name));
         }
         if let Some(name) = component_name.strip_prefix(TOOL_CATALOG_PREFIX) {
             return Self::ToolCatalog(name.to_string());
@@ -434,7 +428,7 @@ impl RuntimeStatus {
 
     /// Updates the status of a component and tracks if it has ever been ready.
     #[expect(clippy::needless_pass_by_value)]
-    pub fn update_component_status(&self, component_name: &str, status: ComponentStatus) {
+    fn update_component_status(&self, component_name: &str, status: ComponentStatus) {
         let mut statuses = self
             .statuses
             .write()
