@@ -1668,17 +1668,15 @@ impl CayenneAccelerator {
         }
 
         // Strip any `file://` scheme so the on-disk operations receive a real
-        // filesystem path. Materialize the `Arc<str>` once for reuse in both
-        // error contexts below.
+        // filesystem path. `fs_path` stays a `&str`: the SNAFU context selectors
+        // below only convert it to the error's `Arc<str>` when `into_error` runs
+        // on the `Err` branch, so the success path allocates nothing.
         let fs_path = fs_probe_path(dir_path);
-        let path: Arc<str> = Arc::from(fs_path);
 
         // 1. mkdir -p: create the full directory tree.
         tokio::fs::create_dir_all(fs_path)
             .await
-            .context(AccelerationDirectoryUnavailableSnafu {
-                path: Arc::clone(&path),
-            })?;
+            .context(AccelerationDirectoryUnavailableSnafu { path: fs_path })?;
 
         // 2. Writability probe: write then remove a marker file. The probe file
         //    name is unique per directory prep so concurrent dataset loads
@@ -1687,7 +1685,7 @@ impl CayenneAccelerator {
             .join(format!(".spice-cayenne-write-probe-{}", uuid::Uuid::now_v7()));
         tokio::fs::write(&probe_path, b"spice")
             .await
-            .context(AccelerationDirectoryUnavailableSnafu { path })?;
+            .context(AccelerationDirectoryUnavailableSnafu { path: fs_path })?;
         // Best-effort cleanup; a leftover probe file is harmless.
         let _ = tokio::fs::remove_file(&probe_path).await;
 
