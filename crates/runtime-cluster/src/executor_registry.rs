@@ -38,6 +38,7 @@ use snafu::prelude::*;
 use tokio::sync::{RwLock, mpsc};
 
 use crate::correlated::{CorrelatedResponses, CorrelationError, send_correlated};
+use crate::metadata::normalized_table_name;
 use crate::{PartitionStore, PartitionValue, executor_selection, metrics};
 
 /// Error type for executor registry operations.
@@ -271,8 +272,14 @@ pub struct ExecutorRegistry {
     /// broadcast, so its in-memory view is complete; it is re-populated by the
     /// executors' next refresh after a scheduler restart. Read at query-planning
     /// time to size the coordinator's per-executor federated scans.
+    ///
+    /// Keyed by [`normalized_table_name`] (the same canonical form the partition
+    /// store uses) so a report recorded from an executor's fully-qualified table
+    /// reference matches the bare `TableScan` reference the query planner looks
+    /// up with — a raw `TableReference` key hashes `Bare{t}` ≠ `Full{c,s,t}` and
+    /// would miss on every lookup.
     executor_statistics:
-        Arc<parking_lot::RwLock<HashMap<TableReference, HashMap<String, ExecutorTableStatistics>>>>,
+        Arc<parking_lot::RwLock<HashMap<String, HashMap<String, ExecutorTableStatistics>>>>,
 
     /// Append-only log of DDL SQL statements applied to the cluster.
     ddl_log: Arc<RwLock<DdlLog>>,
@@ -334,7 +341,7 @@ impl ExecutorRegistry {
     ) {
         self.executor_statistics
             .write()
-            .entry(table)
+            .entry(normalized_table_name(&table))
             .or_default()
             .insert(
                 executor_id,
@@ -356,7 +363,7 @@ impl ExecutorRegistry {
     ) -> HashMap<String, ExecutorTableStatistics> {
         self.executor_statistics
             .read()
-            .get(table)
+            .get(&normalized_table_name(table))
             .cloned()
             .unwrap_or_default()
     }
@@ -371,7 +378,7 @@ impl ExecutorRegistry {
     pub fn has_statistics_for(&self, table: &TableReference) -> bool {
         self.executor_statistics
             .read()
-            .get(table)
+            .get(&normalized_table_name(table))
             .is_some_and(|per_executor| !per_executor.is_empty())
     }
 
@@ -941,7 +948,7 @@ pub struct FederatedPartitionProvider {
     flight_sql_clients: Arc<RwLock<HashMap<String, FlightSqlClient>>>,
     partition_store: Arc<PartitionStore>,
     executor_statistics:
-        Arc<parking_lot::RwLock<HashMap<TableReference, HashMap<String, ExecutorTableStatistics>>>>,
+        Arc<parking_lot::RwLock<HashMap<String, HashMap<String, ExecutorTableStatistics>>>>,
     node_id: Option<Arc<str>>,
 }
 
@@ -984,7 +991,7 @@ impl TablePartitionProvider for FederatedPartitionProvider {
         let executor_statistics = self
             .executor_statistics
             .read()
-            .get(table)
+            .get(&normalized_table_name(table))
             .cloned()
             .unwrap_or_default();
 
