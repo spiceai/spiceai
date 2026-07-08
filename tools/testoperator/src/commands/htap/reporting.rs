@@ -965,7 +965,7 @@ pub(super) async fn write_run_summary(
         Ok(())
     })
     .await
-    .context("run-summary write task panicked")?
+    .context("run-summary write task failed to join (panicked or was cancelled)")?
 }
 
 /// Serializes the full scraped metrics time-series plus run metadata to `path` as
