@@ -1,0 +1,53 @@
+name: Setup CH-benCH MySQL
+description: 'Starts a MySQL container configured for CH-benCH benchmarking (binlog CDC)'
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Start MySQL for CH-benCH
+      shell: bash
+      run: |
+        # MySQL 8.0 defaults already satisfy the CDC connector (log_bin=ON,
+        # binlog_format=ROW, binlog_row_image=FULL); set them explicitly for
+        # clarity. mysql_native_password lets the connector authenticate over
+        # plaintext, and log_bin_trust_function_creators lets the non-SUPER
+        # `bench` user create the `_bench_ts` triggers during seed.
+        # innodb_use_native_aio=0 disables Linux native async I/O: on shared CI
+        # runners the host-wide fs.aio-max-nr budget is often exhausted by other
+        # containers, so io_setup() returns EAGAIN and InnoDB aborts on startup
+        # ("Cannot initialize AIO sub-system"). Simulated I/O is robust and the
+        # throughput cost is irrelevant for a CI benchmark source.
+        docker run -d --name chbench-mysql \
+          -e MYSQL_ROOT_PASSWORD=rootpw -e MYSQL_DATABASE=chbench \
+          -e MYSQL_USER=bench -e MYSQL_PASSWORD=bench \
+          -p 3306:3306 \
+          mysql:8.0 \
+          --default-authentication-plugin=mysql_native_password \
+          --log-bin-trust-function-creators=1 \
+          --binlog-format=ROW \
+          --binlog-row-image=FULL \
+          --max-connections=200 \
+          --innodb-buffer-pool-size=8G \
+          --sync-binlog=0 \
+          --innodb-flush-log-at-trx-commit=0 \
+          --innodb-use-native-aio=0
+
+    - name: Wait for CH-benCH MySQL
+      shell: bash
+      run: |
+        # Authenticate rather than `mysqladmin ping` (which reports "alive" even
+        # mid-init / on auth failure). Once ready, grant the server-wide
+        # replication privileges the CDC connector needs — MYSQL_USER only grants
+        # `chbench.*`, not REPLICATION SLAVE/CLIENT.
+        for _ in {1..60}; do
+          if docker exec chbench-mysql mysql -uroot -prootpw -e 'SELECT 1' > /dev/null 2>&1; then
+            echo "MySQL is ready"
+            docker exec chbench-mysql mysql -uroot -prootpw -e \
+              "GRANT REPLICATION SLAVE, REPLICATION CLIENT ON *.* TO 'bench'@'%'; FLUSH PRIVILEGES;"
+            exit 0
+          fi
+          sleep 2
+        done
+        echo "MySQL did not become ready in time."
+        docker logs chbench-mysql
+        exit 1
