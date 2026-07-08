@@ -813,7 +813,7 @@ pub async fn run(args: Args) -> Result<()> {
         // instruments must be (re)bound to the real meter here rather than at carve
         // time — otherwise they'd bind to the early noop meter and never export.
         if let Some(bytes) = rt.datafusion().compaction_memory_pool_bytes() {
-            telemetry::register_cayenne_compaction_metrics(bytes);
+            telemetry::cayenne::register_compaction_metrics(bytes);
         }
 
         // Per-runtime tokio thread/task gauges (alive tasks, workers, global-queue depth;
@@ -836,6 +836,14 @@ pub async fn run(args: Args) -> Result<()> {
         }
         tokio_handles.push(("main", Handle::current()));
         telemetry::register_tokio_runtime_metrics(tokio_handles);
+
+        // Cayenne write-path backpressure occupancy gauges (encode budget, in-memory
+        // CDC tier byte budget, compaction semaphore). Pull-based observable gauges on
+        // the global `cayenne` meter; registered here — after `init_metrics` — for the
+        // same reason as the compaction metrics above (bind to the real Prometheus
+        // meter, not the early noop one). Localizes *which* valve is stalling the CDC
+        // apply path when ingest falls behind.
+        runtime::dataaccelerator::cayenne::register_cayenne_telemetry();
     }
 
     let (tls_config, client_auth_mode) = tls::load_tls_config(
