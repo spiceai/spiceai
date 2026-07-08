@@ -655,7 +655,13 @@ impl Writer {
             // the compaction. (The O_DIRECT path's `flush_direct_tail` truncate is
             // load-bearing — it shrinks i_size off the alignment padding — and so
             // keeps its `?`.)
-            let _ = truncate(&self.file, self.logical_len);
+            if let Err(error) = truncate(&self.file, self.logical_len) {
+                tracing::debug!(
+                    target: "cayenne::compaction",
+                    %error,
+                    "best-effort compaction tail-release (freeing the fallocate reservation past EOF) failed; the file is the correct length but keeps a bounded, harmless over-allocation"
+                );
+            }
         }
         if self.cfg.final_fsync {
             // Contents durable BEFORE the rename publishes the name — the local-FS

@@ -721,11 +721,6 @@ impl CayenneContext {
         self.ingest_stats.set_mem_pressure(fraction);
     }
 
-    /// A snapshot of the current ingest accounting (rate + response), enriched with
-    /// the now-relative CDC goal signals (replication lag, freshness) and the
-    /// query-side goal signals (p99 latency, QPH) — the wall clock and the
-    /// query-observations handle live here, keeping `IngestStats::snapshot` and
-    /// `decide` clock-free/pure. For observability/logging and the control step.
     /// The detected storage medium backing this table's data files (from the
     /// runtime's acceleration-storage detection at registration, or the operator's
     /// `storage` param). A cheap field read — the compaction writer's tier gate
@@ -735,6 +730,11 @@ impl CayenneContext {
         self.config.data_storage_class
     }
 
+    /// A snapshot of the current ingest accounting (rate + response), enriched with
+    /// the now-relative CDC goal signals (replication lag, freshness) and the
+    /// query-side goal signals (p99 latency, QPH) — the wall clock and the
+    /// query-observations handle live here, keeping `IngestStats::snapshot` and
+    /// `decide` clock-free/pure. For observability/logging and the control step.
     #[must_use]
     pub(crate) fn ingest_snapshot(&self) -> tuning::IngestSnapshot {
         let mut snap = self.ingest_stats.snapshot();
