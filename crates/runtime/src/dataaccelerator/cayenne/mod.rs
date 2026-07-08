@@ -1195,23 +1195,6 @@ impl CayenneAccelerator {
                 );
             }
 
-            // The cold object-store tier requires key-based deletes: position
-            // deletes are file-path scoped and cannot survive the warm→cold
-            // rewrite. Force key when the cold tier is enabled and a primary key
-            // exists (the engine additionally skips promotion for position-mode
-            // tables, so this keeps the cold tier from being silently inert).
-            if config.cold_tier_enabled()
-                && workload.has_primary_key
-                && config.deletion_mode != cayenne::metadata::DeletionMode::Key
-            {
-                if config.deletion_mode == cayenne::metadata::DeletionMode::Position {
-                    tracing::warn!(
-                        "Dataset '{table_name}': the datalake tier (cayenne_datalake_location) requires key-based deletes; overriding cayenne_deletion_mode 'position' -> 'key'."
-                    );
-                }
-                config.deletion_mode = cayenne::metadata::DeletionMode::Key;
-            }
-
             // CDC durability mode (file | memory). Memory mode appends CDC
             // batches to an in-RAM tier and defers the source slot ack to a
             // checkpoint; it is only meaningful for the small-write/CDC
@@ -1406,6 +1389,24 @@ impl CayenneAccelerator {
                     "Dataset '{table_name}': datalake promotion trigger defaulted to {} bytes. Set 'cayenne_cold_tier_warm_max_bytes' to override.",
                     config.cold_tier_warm_max_bytes
                 );
+            }
+            // The datalake (cold) tier requires key-based deletes: position
+            // deletes are file-path scoped and cannot survive the warm→cold
+            // rewrite. Force key when the tier is enabled and a primary key
+            // exists (the engine additionally skips promotion for position-mode
+            // tables, so this keeps the tier from being silently inert — e.g.
+            // deletion_mode 'auto' resolves to 'position' for non-CDC tables).
+            // Must run AFTER cayenne_datalake_location is parsed above.
+            if config.cold_tier_enabled()
+                && workload.has_primary_key
+                && config.deletion_mode != cayenne::metadata::DeletionMode::Key
+            {
+                if config.deletion_mode == cayenne::metadata::DeletionMode::Position {
+                    tracing::warn!(
+                        "Dataset '{table_name}': the datalake tier (cayenne_datalake_location) requires key-based deletes; overriding cayenne_deletion_mode 'position' -> 'key'."
+                    );
+                }
+                config.deletion_mode = cayenne::metadata::DeletionMode::Key;
             }
 
             // Upload concurrency: `auto`/unset keeps the available-parallelism
@@ -2139,8 +2140,8 @@ fn wrap_with_native_vector_indexes(
 const PARAMETERS: &[ParameterSpec] = &concat_arrays::<
     ParameterSpec,
     S3_PARAMS_LEN,
-    52,
-    { S3_PARAMS_LEN + 52 },
+    61,
+    { S3_PARAMS_LEN + 61 },
 >(
     S3_PARAMETERS,
     [
@@ -2169,12 +2170,39 @@ const PARAMETERS: &[ParameterSpec] = &concat_arrays::<
             .description("When 'true' (default), Cayenne advertises and decodes string and binary columns as Arrow view types (Utf8View/BinaryView) on the query/scan path so DataFusion plans joins and aggregates on view arrays, avoiding the i32 2 GiB offset overflow in hash-join build-side batch concatenation at scale. The stored schema keeps Utf8/Binary for writes, CDC, and stats. Set 'false' to opt out.")
             .one_of(&["true", "false"])
             .default("true"),
-        ParameterSpec::component("cold_tier_location")
-            .description("Object-store URL prefix for the cold tier (storage-cascade bottom tier), e.g. 's3://bucket/prefix' or 'file:///mnt/cold'. When set, a background promotion stage graduates the warm local-disk tier to read-optimized, Z-order-clustered Vortex files on this store, and queries span warm + cold with per-tier pushdown. Unset (default) disables the cold tier. Requires key-based deletes and a primary key (auto-resolved). v1: an s3:// cold location must share the warm bucket; partitioned and position-delete tables are not supported."),
-        ParameterSpec::component("cold_clustering_columns")
-            .description("Comma-separated liquid-clustering key columns for cold files (multi-column Z-order), e.g. 'tenant_id,ts'. When unset, falls back to cayenne_sort_columns, then the primary key. Clustering tightens each cold file's per-column zone maps so selective queries on any clustering dimension prune at the storage layer."),
+        ParameterSpec::component("datalake_location")
+            .description("Object-store URL prefix for the datalake tier, e.g. 's3://bucket/prefix' — the storage-cascade bottom tier. When set, a background promotion stage graduates the warm local-disk tier to read-optimized, Z-order-clustered Vortex files on this store, and queries span warm + cold with per-tier pushdown. Unset (default) disables the tier. Requires key-based deletes and a primary key (auto-resolved). Partitioned and position-delete tables are not supported."),
+        ParameterSpec::component("datalake_clustering_columns")
+            .description("Comma-separated liquid-clustering key columns for datalake files (multi-column Z-order), e.g. 'tenant_id,ts'. When unset, falls back to cayenne_sort_columns, then the primary key. Clustering tightens each cold file's per-column zone maps so selective queries on any clustering dimension prune at the storage layer."),
+        ParameterSpec::component("datalake_s3_auth")
+            .description("Authentication method for the datalake S3 store. 'iam_role' (default) uses environment/SDK credentials; 'key' uses cayenne_datalake_s3_key/_secret.")
+            .one_of(&["iam_role", "key"])
+            .default("iam_role"),
+        ParameterSpec::component("datalake_s3_key")
+            .description("Access key ID for the datalake S3 store (with cayenne_datalake_s3_auth: key).")
+            .secret(),
+        ParameterSpec::component("datalake_s3_secret")
+            .description("Secret access key for the datalake S3 store (with cayenne_datalake_s3_auth: key).")
+            .secret(),
+        ParameterSpec::component("datalake_s3_session_token")
+            .description("Optional session token for the datalake S3 store (with cayenne_datalake_s3_auth: key).")
+            .secret(),
+        ParameterSpec::component("datalake_s3_region")
+            .description("AWS region of the datalake S3 bucket. Defaults to the environment region (AWS_REGION/AWS_DEFAULT_REGION), then us-east-1; inert for S3-compatible endpoints."),
+        ParameterSpec::component("datalake_s3_endpoint")
+            .description("Custom S3 endpoint URL for the datalake store (e.g. an S3-compatible store such as MinIO). http:// endpoints implicitly allow HTTP."),
+        ParameterSpec::component("datalake_s3_allow_http")
+            .description("Allow plain-HTTP connections to the datalake S3 endpoint. Default: false.")
+            .one_of(&["true", "false"])
+            .default("false"),
+        ParameterSpec::component("datalake_s3_client_timeout")
+            .description("HTTP client timeout for datalake store requests, as a duration (e.g. '2m'). Default: 2m."),
+        ParameterSpec::component("datalake_s3_unsigned_payload")
+            .description("Use unsigned payloads for datalake S3 uploads. Default: true.")
+            .one_of(&["true", "false"])
+            .default("true"),
         ParameterSpec::component("cold_target_file_size_mb")
-            .description("Target size for cold-tier Vortex files in MB. Larger than the warm cayenne_target_file_size_mb because object stores favor fewer, larger objects and cold scans are range reads. Default: 512."),
+            .description("Target size for datalake (cold) tier Vortex files in MB. Larger than the warm cayenne_target_file_size_mb because object stores favor fewer, larger objects and cold scans are range reads. Default: 512."),
         ParameterSpec::component("cold_tier_warm_max_bytes")
             .description("The warm tier graduates to cold once its total Vortex bytes reach this threshold. 0 (default) disables the byte trigger; set with cold_tier_warm_max_files to bound warm-tier size."),
         ParameterSpec::component("cold_tier_warm_max_files")

@@ -1988,9 +1988,12 @@ fn make_datalake_nation_dataset(
         "nation".to_string(),
     );
     dataset.params = Some(Params::from_string_map(
-        vec![("file_format".to_string(), "parquet".to_string())]
-            .into_iter()
-            .collect(),
+        vec![
+            ("file_format".to_string(), "parquet".to_string()),
+            ("s3_auth".to_string(), "public".to_string()),
+        ]
+        .into_iter()
+        .collect(),
     ));
 
     let mut params = HashMap::from([

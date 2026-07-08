@@ -12908,7 +12908,7 @@ impl CayenneTableProvider {
             table = self.table_metadata.table_name.as_str(),
             warm_bytes,
             warm_files,
-            "Promoting warm tier to cold object store (Z-order clustered graduation)"
+            "Promoting warm tier to datalake object store (Z-order clustered graduation)"
         );
 
         // Exclude writers for the whole graduation (mirrors begin_overwrite).
@@ -12996,7 +12996,7 @@ impl CayenneTableProvider {
             table = self.table_metadata.table_name.as_str(),
             cold_files = cold_files.len(),
             total_rows,
-            "Cold-tier promotion committed"
+            "Datalake-tier promotion committed"
         );
         Ok(true)
     }
