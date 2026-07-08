@@ -18,6 +18,7 @@ limitations under the License.
 //! Postgres database while executing CH-benCH analytical queries through spiced.
 
 mod correctness;
+mod debezium;
 mod reporting;
 mod spice;
 mod staleness;
@@ -43,13 +44,15 @@ use test_framework::{
 };
 
 use crate::{
-    args::HtapArgs, commands::bench::prepare_chbench_source, health::HealthMonitor,
+    args::{HtapArgs, HtapCdcMode},
+    commands::bench::{chbench_source_from_env, prepare_chbench_source},
+    health::HealthMonitor,
     spiced_metrics::MetricsScraper,
 };
 
 pub(crate) async fn run(args: &HtapArgs) -> anyhow::Result<()> {
     let test_args = &args.test_args;
-    let (app, mut start_request) = super::get_app_and_start_request(&test_args.common).await?;
+    let mut app = super::load_app(&test_args.common).await?;
 
     let query_set = test_args.load_query_set()?;
     if !matches!(query_set, QuerySet::ChBench) {
@@ -57,12 +60,6 @@ pub(crate) async fn run(args: &HtapArgs) -> anyhow::Result<()> {
             "HTAP command requires the 'chbench' query set, but got '{query_set}'. \
              Use '--query-set chbench' or run 'testoperator run bench' for other query sets."
         );
-    }
-
-    // Always enable the metrics endpoint in HTAP mode for replication metrics.
-    if !test_args.common.scrape_spiced_metrics {
-        start_request = start_request
-            .with_additional_args(vec!["--metrics".to_string(), "127.0.0.1:9090".to_string()]);
     }
 
     // 1. Prepare the source: seed schema + data — or, with --skip-prepare,
@@ -81,6 +78,29 @@ pub(crate) async fn run(args: &HtapArgs) -> anyhow::Result<()> {
     if args.prepare_only {
         println!("--prepare-only: source prepared, exiting without running the workload");
         return Ok(());
+    }
+
+    let debezium_harness = if args.cdc_mode == HtapCdcMode::Debezium {
+        let source = chbench_source_from_env()?;
+        let harness = debezium::DebeziumHarness::start(&source).await?;
+        harness.rewrite_app(&mut app);
+        Some(harness)
+    } else {
+        None
+    };
+
+    let mut start_request = super::start_request_from_app(&test_args.common, app.clone())?;
+    if let Some(harness) = &debezium_harness {
+        start_request = start_request.with_env(
+            "CHBENCH_KAFKA_BOOTSTRAP_SERVERS",
+            harness.kafka_bootstrap_servers(),
+        );
+    }
+
+    // Always enable the metrics endpoint in HTAP mode for replication metrics.
+    if !test_args.common.scrape_spiced_metrics {
+        start_request = start_request
+            .with_additional_args(vec!["--metrics".to_string(), "127.0.0.1:9090".to_string()]);
     }
 
     // 2. Start spiced.
@@ -133,6 +153,7 @@ pub(crate) async fn run(args: &HtapArgs) -> anyhow::Result<()> {
         "concurrency": test_args.common.concurrency,
         "target_oltp_rate": args.rate
             .map_or_else(|| "unlimited".to_string(), |r| r.to_string()),
+        "cdc_mode": args.cdc_mode.as_str(),
         "spicepod_path": test_args.common.spicepod_path.display().to_string(),
         "clock_skew_ms_estimate": clock_skew_ms_estimate,
     });
@@ -156,10 +177,31 @@ pub(crate) async fn run(args: &HtapArgs) -> anyhow::Result<()> {
                 args.rate
                     .map_or_else(|| "unlimited".to_string(), |r| r.to_string()),
             ),
+            KeyValue::new("cdc_mode", args.cdc_mode.as_str()),
         ])
         .build();
 
     let telemetry = super::create_telemetry_with_resource(&test_args.common, benchmark_resource);
+
+    if let Some(harness) = &debezium_harness {
+        let bootstrap_wait = Duration::from_secs(
+            args.debezium_bootstrap_wait
+                .unwrap_or(test_args.common.ready_wait),
+        );
+        let tables: Vec<String> = driver
+            .probe_tables()
+            .iter()
+            .map(|t| (*t).to_string())
+            .collect();
+        let spice_clients = {
+            let query = spiced_instance.spice_client(None, true).await?;
+            let flight = spiced_instance.flight_client(None).await?;
+            spice::SpiceClients::new(query, flight)
+        };
+        harness
+            .wait_for_initial_catchup(Arc::clone(&driver), &spice_clients, &tables, bootstrap_wait)
+            .await?;
+    }
 
     let health_monitor = HealthMonitor::spawn()?;
 
