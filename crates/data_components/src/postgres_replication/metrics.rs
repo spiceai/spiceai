@@ -52,6 +52,12 @@ pub struct MetricsCollector {
     confirmed_flush_lsn: AtomicU64, // last LSN we acknowledged to the server
     server_wal_end_lsn: AtomicU64,  // latest WAL end reported by the server (keepalive)
 
+    // Reader-task time accounting (microseconds), to split "blocked waiting on the
+    // source socket" (input wait) from "our decode/build" (processing) — the
+    // source-vs-us discriminator for a reader/delivery-bound pipeline.
+    reader_input_wait_micros_total: AtomicU64,
+    reader_processing_micros_total: AtomicU64,
+
     // Schema evolution (stream-time, from pgoutput Relation messages).
     /// Widening schema changes adopted into the working schema.
     schema_evolutions_total: AtomicU64,
@@ -67,6 +73,16 @@ pub struct MetricsCollector {
     /// A non-zero value with no user-visible error just means the network
     /// wobbled and we recovered.
     replication_reconnects_total: AtomicU64,
+    /// Cumulative milliseconds the stream was disconnected across all reconnects
+    /// (drop → successful resume, including backoff). Paired with
+    /// `replication_reconnects_total`, this quantifies the DURATION cost of a
+    /// reconnect storm — during that time no changes are delivered and lag grows,
+    /// and Postgres replays from the held floor on resume.
+    replication_disconnected_ms_total: AtomicU64,
+    /// The replication slot this dataset is a member of (for shared slots, several
+    /// datasets share one). Lets the analysis join the per-dataset view to the
+    /// authoritative per-slot backlog and show grouping. Set at (shared) attach.
+    slot_name: RwLock<Option<String>>,
     /// Cumulative seconds the shared-slot pump spent blocked trying to deliver
     /// committed changes into this member's channel because its sink was not
     /// draining. Non-zero means downstream backpressure stalled the pump (and
@@ -93,7 +109,21 @@ pub struct MetricsCollector {
 impl MetricsCollector {
     #[must_use]
     pub fn new() -> Arc<Self> {
+        // `member_attached` stays "unknown" (series absent) until the shared-slot path
+        // calls `mark_member_attached`; a dedicated (non-shared) slot never does, so it
+        // reports no membership series rather than a misleading constant.
         Arc::new(Self::default())
+    }
+
+    /// Record which replication slot this member belongs to (shared-slot grouping).
+    pub fn set_slot_name(&self, slot: String) {
+        // Recover through poisoning so an unrelated panic can't leave the `slot` label
+        // permanently unset (which would break shared-slot grouping in the analysis).
+        let mut guard = self
+            .slot_name
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *guard = Some(slot);
     }
 
     pub fn inc_insert(&self) {
@@ -187,6 +217,20 @@ impl MetricsCollector {
         }
     }
 
+    /// Add to the reader input-wait accumulator (time blocked awaiting the next
+    /// event from the source socket). High relative to processing ⇒ source/network
+    /// can't deliver fast enough (source-bound).
+    pub fn add_reader_input_wait_micros(&self, us: u64) {
+        self.reader_input_wait_micros_total
+            .fetch_add(us, Ordering::Relaxed);
+    }
+    /// Add to the reader processing accumulator (decode + batch-build after a
+    /// socket event). High relative to input-wait ⇒ our decode/build is the limiter.
+    pub fn add_reader_processing_micros(&self, us: u64) {
+        self.reader_processing_micros_total
+            .fetch_add(us, Ordering::Relaxed);
+    }
+
     pub fn record_commit_watermark(&self, at: SystemTime) {
         if let Ok(mut guard) = self.last_commit_seen_at.write() {
             *guard = Some(at);
@@ -220,6 +264,11 @@ impl MetricsCollector {
     pub fn inc_reconnect(&self) {
         self.replication_reconnects_total
             .fetch_add(1, Ordering::Relaxed);
+    }
+    /// Add elapsed disconnected time (ms) for a completed reconnect (drop → resume).
+    pub fn add_disconnected_ms(&self, ms: u64) {
+        self.replication_disconnected_ms_total
+            .fetch_add(ms, Ordering::Relaxed);
     }
 
     /// Mark this dataset as an attached member of its shared replication slot
@@ -306,6 +355,19 @@ impl Metrics {
         self.collector.server_wal_end_lsn.load(Ordering::Relaxed)
     }
 
+    #[must_use]
+    pub fn reader_input_wait_micros_total(&self) -> u64 {
+        self.collector
+            .reader_input_wait_micros_total
+            .load(Ordering::Relaxed)
+    }
+    #[must_use]
+    pub fn reader_processing_micros_total(&self) -> u64 {
+        self.collector
+            .reader_processing_micros_total
+            .load(Ordering::Relaxed)
+    }
+
     /// Bytes between the server's reported WAL end and our last confirmed
     /// flush LSN. Returns 0 if the server hasn't reported yet or if we're
     /// ahead of the last-seen server position (can happen with stale atomic reads).
@@ -369,6 +431,23 @@ impl Metrics {
         self.collector
             .replication_reconnects_total
             .load(Ordering::Relaxed)
+    }
+    #[must_use]
+    pub fn replication_disconnected_ms_total(&self) -> u64 {
+        self.collector
+            .replication_disconnected_ms_total
+            .load(Ordering::Relaxed)
+    }
+    #[must_use]
+    pub fn slot_name(&self) -> Option<String> {
+        // Recover through poisoning: an unrelated panic must not permanently drop the
+        // `slot` label (which would break shared-slot grouping in the analysis). The
+        // guarded String is not corrupted by another thread's panic.
+        self.collector
+            .slot_name
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
     }
     #[must_use]
     pub fn member_send_stalled_seconds_total(&self) -> u64 {

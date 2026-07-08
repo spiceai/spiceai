@@ -21,6 +21,7 @@ mod args;
 mod commands;
 mod health;
 mod metrics;
+mod pg_stats;
 mod spiced_metrics;
 mod system_adapter;
 
