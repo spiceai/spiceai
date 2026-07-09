@@ -53,4 +53,9 @@ runs:
       id: check_changes
       shell: bash
       run: |
-        echo "relevant_changes=${{ steps.changed-code-files.outputs.code_changes }}" >> $GITHUB_OUTPUT
+        result='${{ steps.changed-code-files.outputs.code_changes }}'
+        if [ "$result" != "true" ] && [ "$result" != "false" ]; then
+          echo "::error::check-code-changes: the 'filters' input must define a 'code_changes' group"
+          exit 1
+        fi
+        echo "relevant_changes=$result" >> "$GITHUB_OUTPUT"

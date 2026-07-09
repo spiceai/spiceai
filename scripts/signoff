@@ -72,11 +72,17 @@ bullet() { local prefix="$1" line; while IFS= read -r line; do [[ -n "$line" ]] 
 
 # --- preconditions -----------------------------------------------------------
 
+# git + gh cover every path; the default `signoff` flow uses only these (it parses
+# JSON via `gh --jq`, not the jq binary).
 require_tools() {
   command -v git >/dev/null 2>&1 || fail "git not found"
   command -v gh  >/dev/null 2>&1 || fail "GitHub CLI (gh) not found — install from https://cli.github.com"
-  command -v jq  >/dev/null 2>&1 || fail "jq not found — install from https://jqlang.github.io/jq"
   gh auth status >/dev/null 2>&1 || fail "not logged in to GitHub — run 'gh auth login'"
+}
+
+# Only the subcommands that parse JSON with the jq binary (status/check/install).
+require_jq() {
+  command -v jq >/dev/null 2>&1 || fail "jq not found — install from https://jqlang.github.io/jq"
 }
 
 # owner/repo of the current checkout, from the gh context.
@@ -161,6 +167,7 @@ cmd_signoff() {
 
 cmd_status() {
   require_tools
+  require_jq
   local sha repo combined state desc
   sha=$(git rev-parse HEAD)
   repo=$(repo_slug)
@@ -190,6 +197,7 @@ ruleset_id() {
 
 cmd_check() {
   require_tools
+  require_jq
   local repo id ruleset checks
   repo=$(repo_slug)
   id=$(ruleset_id "$repo")
@@ -220,6 +228,7 @@ cmd_install() {
   done
 
   require_tools
+  require_jq
   local repo id ruleset
   repo=$(repo_slug)
   id=$(ruleset_id "$repo")
