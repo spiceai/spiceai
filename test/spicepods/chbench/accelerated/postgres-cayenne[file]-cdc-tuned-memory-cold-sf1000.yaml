@@ -8,13 +8,11 @@ name: postgres-cayenne[file]-cdc-tuned-memory-cold-sf1000
 # cascade is: RAM mem-tier -> warm local-disk Vortex -> COLD object store. A background promoter
 # graduates the warm tier to read-optimized, Z-order-clustered Vortex on the cold store once the
 # per-table warm-size trigger is crossed, and queries span all three tiers with per-tier
-# pushdown/pruning. See the `cayenne_cold_tier_*` knobs on &accel_high_volume below.
+# pushdown/pruning. See the datalake/cold knobs on &accel_high_volume below.
 #
 # The cold store is the shared local MinIO (`s3://benchmarks`, the same bucket the analytical
-# bench configs use). Because the warm tier is local `mode: file`, Cayenne does not itself
-# register the s3:// cold store (v1 only auto-registers it when the warm tier is already on S3),
-# so the `cold_tier_store_anchor` anchor dataset below references the bucket to register a path-style
-# MinIO object store that the shared registry then reuses for cold promotion + cross-tier scans.
+# bench configs use), reached via the dedicated `cayenne_datalake_s3_*` credentials on the
+# datasets — the engine registers the store on the promotion, scan, and delete paths itself.
 # The HTAP run workflow provides S3_ENDPOINT/S3_KEY/S3_SECRET (from the TEST_MINIO_* secrets).
 # Sized for a 64 vCPU / 256 GiB host (m7a.16xlarge-class) with EBS gp3.
 runtime:
@@ -47,29 +45,6 @@ postgres_connection_params: &postgres_params
   pg_sslmode: disable
 
 datasets:
-  # ------------------------------------------------------------------
-  # Cold-tier object-store registration anchor.
-  #
-  # The Cayenne cold tier writes to `s3://benchmarks/cayenne-cold-sf1000/` (the shared local
-  # MinIO). With a local `mode: file` warm tier, Cayenne does not itself register the s3:// cold
-  # store (v1 only auto-registers it when the warm tier is on S3-Express — and MinIO is standard
-  # S3, not Express). This federated dataset references the same bucket so the runtime registers a
-  # path-style MinIO object store under `s3://benchmarks`; the object-store registry is shared
-  # across the query and compaction runtimes, so cold promotion + cross-tier scans reuse it. This
-  # dataset is NOT part of the CH-benCH schema and no query set touches it — it exists solely to
-  # register the store. `region.parquet` is a tiny (few-row) object present in the bench bucket; if
-  # it is ever absent, point this at any existing object in `s3://benchmarks`.
-  # ------------------------------------------------------------------
-  - from: s3://benchmarks/tpch_sf1/region.parquet
-    name: cold_tier_store_anchor
-    params:
-      file_format: parquet
-      allow_http: true
-      s3_auth: key
-      s3_endpoint: ${secrets:S3_ENDPOINT}
-      s3_key: ${secrets:S3_KEY}
-      s3_secret: ${secrets:S3_SECRET}
-
   # ------------------------------------------------------------------
   # High-volume PK upsert tables.
   # ------------------------------------------------------------------
@@ -122,12 +97,17 @@ datasets:
         cayenne_compaction_background_interval_ms: '3000'
         cdc_max_coalesce_age_ms: '3000'
         cdc_max_coalesced_bytes: '536870912' # 512 MB
-        # --- Cold object-store tier (RAM mem-tier -> warm local disk -> COLD) ---
-        # Presence of the location enables the cold tier (and forces key deletes, already set
-        # above). Cayenne namespaces cold files by table_id under this prefix, so one shared
-        # location is safe for every high-volume table. Resolves to the MinIO store registered by
-        # the `cold_tier_store_anchor` anchor dataset.
-        cayenne_cold_tier_location: s3://benchmarks/cayenne-cold-sf1000/
+        # --- Datalake (cold) object-store tier (RAM mem-tier -> warm local disk -> COLD) ---
+        # Presence of the location enables the tier (and forces key deletes, already set above).
+        # Cayenne namespaces cold files by table_id under this prefix, so one shared location is
+        # safe for every high-volume table. The dedicated datalake credentials below build the
+        # MinIO store directly; the engine registers it on the promotion, scan, and delete paths.
+        cayenne_datalake_location: s3://benchmarks/cayenne-cold-sf1000/
+        cayenne_datalake_s3_auth: key
+        cayenne_datalake_s3_endpoint: ${secrets:S3_ENDPOINT}
+        cayenne_datalake_s3_key: ${secrets:S3_KEY}
+        cayenne_datalake_s3_secret: ${secrets:S3_SECRET}
+        cayenne_datalake_s3_allow_http: 'true'
         # Read-optimized cold files, larger than the 512 MB warm target so cold scans open fewer
         # footers.
         cayenne_cold_target_file_size_mb: '1024'
@@ -139,7 +119,7 @@ datasets:
         cayenne_cold_tier_warm_max_bytes: '4294967296'
         # Background promoter cadence — re-checks the warm-size trigger every 30s.
         cayenne_cold_tier_background_interval_ms: '30000'
-        # cayenne_cold_clustering_columns omitted -> Z-order falls back to the primary key
+        # cayenne_datalake_clustering_columns omitted -> Z-order falls back to the primary key
         # (sensible default for chbench point/range lookups); tune per-table if a scan dimension
         # dominates.
 
