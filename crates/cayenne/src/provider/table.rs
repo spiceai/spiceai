@@ -12983,124 +12983,90 @@ impl CayenneTableProvider {
     /// big-endian `i64`). The caller runs after the mem-tier/inline
     /// checkpoints, so the durable set is complete.
     ///
-    /// Every failure path degrades CONSERVATIVELY to all-dirty (= the v1
-    /// whole-table rewrite): correctness never depends on classification.
+    /// # Errors
+    ///
+    /// Returns an error when the deletion vectors cannot be listed/read or the
+    /// tombstone keys cannot be decoded — the promotion executor handles it
+    /// (warn + skip the pass); this function never logs or applies policy.
     async fn partition_cold_manifest_for_promotion(
         &self,
         cold_files: Vec<crate::metadata::ColdTierFile>,
-    ) -> super::cold_partition::ColdFilePartition {
+    ) -> Result<super::cold_partition::ColdFilePartition> {
         use super::cold_partition::{
             ColdFilePartition, decode_int64_tombstone_keys, decode_tombstone_keys,
             partition_cold_files,
         };
 
-        let all_dirty = |cold_files: Vec<crate::metadata::ColdTierFile>| ColdFilePartition {
-            dirty: cold_files,
-            clean: Vec::new(),
+        let internal = |message: String| Error::Internal {
+            table: self.table_metadata.table_name.clone(),
+            message,
         };
+
         if cold_files.is_empty() {
-            return ColdFilePartition {
+            return Ok(ColdFilePartition {
                 dirty: Vec::new(),
                 clean: Vec::new(),
-            };
+            });
         }
 
         // Durable tombstone keys (bytes) from the deletion-vector files.
-        let delete_files = match self
+        let delete_files = self
             .catalog
             .get_table_delete_files(&self.table_metadata.table_id)
-            .await
-        {
-            Ok(files) => files,
-            Err(error) => {
-                tracing::warn!(
-                    target: "cayenne::compaction",
-                    table = self.table_metadata.table_name.as_str(),
-                    %error,
-                    "Carry-forward classification failed to list deletion vectors; rewriting all cold files"
-                );
-                return all_dirty(cold_files);
-            }
-        };
+            .await?;
         if delete_files.is_empty() {
             // No tombstones can touch cold data: everything carries forward.
-            return ColdFilePartition {
+            return Ok(ColdFilePartition {
                 dirty: Vec::new(),
                 clean: cold_files,
-            };
+            });
         }
-        let read = tokio::task::spawn_blocking(move || {
+        let (_, deleted_row_keys, _, _) = tokio::task::spawn_blocking(move || {
             super::delete::detect_deletion_type_and_read(delete_files)
         })
-        .await;
-        let deleted_row_keys = match read {
-            Ok(Ok((_, deleted_row_keys, _, _))) => deleted_row_keys,
-            Ok(Err(error)) => {
-                tracing::warn!(
-                    target: "cayenne::compaction",
-                    table = self.table_metadata.table_name.as_str(),
-                    %error,
-                    "Carry-forward classification failed to read deletion vectors; rewriting all cold files"
-                );
-                return all_dirty(cold_files);
-            }
-            Err(join_error) => {
-                tracing::warn!(
-                    target: "cayenne::compaction",
-                    table = self.table_metadata.table_name.as_str(),
-                    %join_error,
-                    "Carry-forward classification reader task failed; rewriting all cold files"
-                );
-                return all_dirty(cold_files);
-            }
-        };
+        .await
+        .map_err(|join_error| {
+            internal(format!(
+                "carry-forward classification reader task failed: {join_error}"
+            ))
+        })??;
         if deleted_row_keys.is_empty() {
-            return ColdFilePartition {
+            return Ok(ColdFilePartition {
                 dirty: Vec::new(),
                 clean: cold_files,
-            };
+            });
         }
 
         // Decode the key bytes into per-column scalars for the rectangle test.
         let key_bytes: Vec<Box<[u8]>> = deleted_row_keys.into_keys().collect();
         let decoded = if let Some(converter) = self.pk_row_converter.as_deref() {
-            match decode_tombstone_keys(converter, &key_bytes) {
-                Ok(rows) => rows,
-                Err(error) => {
-                    tracing::warn!(
-                        target: "cayenne::compaction",
-                        table = self.table_metadata.table_name.as_str(),
-                        %error,
-                        "Carry-forward classification failed to decode tombstone keys; rewriting all cold files"
-                    );
-                    return all_dirty(cold_files);
-                }
-            }
+            decode_tombstone_keys(converter, &key_bytes).map_err(|e| {
+                internal(format!(
+                    "carry-forward classification failed to decode tombstone keys: {e}"
+                ))
+            })?
         } else if matches!(
             self.pk_deletion_strategy,
             PkDeletionStrategyWithCache::Int64Pk { .. }
         ) {
-            match decode_int64_tombstone_keys(&key_bytes) {
-                Some(rows) => rows,
-                None => {
-                    tracing::warn!(
-                        target: "cayenne::compaction",
-                        table = self.table_metadata.table_name.as_str(),
-                        "Carry-forward classification found malformed Int64 tombstone keys; rewriting all cold files"
-                    );
-                    return all_dirty(cold_files);
-                }
-            }
+            decode_int64_tombstone_keys(&key_bytes).map_err(|e| {
+                internal(format!(
+                    "carry-forward classification found malformed Int64 tombstone keys: {e}"
+                ))
+            })?
         } else {
-            return all_dirty(cold_files);
+            return Err(internal(
+                "carry-forward classification has no key decoder for this deletion strategy"
+                    .to_string(),
+            ));
         };
 
-        partition_cold_files(
+        Ok(partition_cold_files(
             cold_files,
             &decoded,
             &self.table_metadata.schema,
             &self.pk_column_indices,
-        )
+        ))
     }
 
     async fn promote_warm_to_cold_inner(&self) -> Result<bool> {
@@ -13170,9 +13136,28 @@ impl CayenneTableProvider {
             .list_cold_tier_files(&self.table_metadata.table_id)
             .await?;
         let prior_cold_len = prior_cold.len();
-        let partition = self.partition_cold_manifest_for_promotion(prior_cold).await;
-        // Guardrail: when most files are dirty, carry-forward saves little and
-        // a full rewrite restores global Z-order clustering — fall back.
+        let partition = match self.partition_cold_manifest_for_promotion(prior_cold).await {
+            Ok(partition) => partition,
+            Err(error) => {
+                tracing::warn!(
+                    target: "cayenne::compaction",
+                    table = self.table_metadata.table_name.as_str(),
+                    %error,
+                    "Carry-forward classification failed; skipping this promotion pass (next tick retries)"
+                );
+                return Ok(false);
+            }
+        };
+        // Guardrail: when MOST files are dirty, fall back to rewriting
+        // everything (clean files included). The extra cost is bounded (< 2x
+        // the dirty-only rewrite) and it buys a global Z-order re-cluster:
+        // carry-forward sorts only what it rewrites, so carried files' PK
+        // ranges increasingly overlap new files' across promotions — degrading
+        // both query pruning AND this very classification (wider, overlapping
+        // rectangles make every tombstone hit more files, a feedback loop that
+        // drives the dirty fraction up). A full rewrite at the moment most of
+        // the table is being rewritten anyway is the cheapest point to break
+        // that loop, and it consolidates the accumulated file count too.
         let partition = if partition.dirty.len() * 2 > prior_cold_len {
             let mut dirty = partition.dirty;
             dirty.extend(partition.clean);

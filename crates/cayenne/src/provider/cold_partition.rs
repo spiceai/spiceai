@@ -85,17 +85,26 @@ pub(crate) fn decode_tombstone_keys(
 }
 
 /// Decode raw big-endian `i64` tombstone keys (the Int64-PK fast path's
-/// durable encoding) into single-column `ScalarValue` tuples. Keys shorter
-/// than 8 bytes are invalid; `None` signals "cannot classify" (all-dirty).
-pub(crate) fn decode_int64_tombstone_keys(keys: &[Box<[u8]>]) -> Option<Vec<Vec<ScalarValue>>> {
+/// durable encoding) into single-column `ScalarValue` tuples.
+///
+/// # Errors
+///
+/// Returns an error when a key is shorter than 8 bytes — callers treat that
+/// as "cannot classify".
+pub(crate) fn decode_int64_tombstone_keys(
+    keys: &[Box<[u8]>],
+) -> Result<Vec<Vec<ScalarValue>>, arrow_schema::ArrowError> {
     keys.iter()
         .map(|bytes| {
             if bytes.len() >= 8 {
                 let mut arr = [0_u8; 8];
                 arr.copy_from_slice(&bytes[..8]);
-                Some(vec![ScalarValue::Int64(Some(i64::from_be_bytes(arr)))])
+                Ok(vec![ScalarValue::Int64(Some(i64::from_be_bytes(arr)))])
             } else {
-                None
+                Err(arrow_schema::ArrowError::InvalidArgumentError(format!(
+                    "Int64 tombstone key has {} bytes, expected at least 8",
+                    bytes.len()
+                )))
             }
         })
         .collect()
@@ -233,6 +242,6 @@ mod tests {
         assert_eq!(decoded[1], vec![ScalarValue::Int64(Some(-3))]);
         // Short key → cannot classify.
         let bad: Vec<Box<[u8]>> = vec![vec![1, 2].into_boxed_slice()];
-        assert!(decode_int64_tombstone_keys(&bad).is_none());
+        assert!(decode_int64_tombstone_keys(&bad).is_err());
     }
 }
