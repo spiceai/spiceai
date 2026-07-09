@@ -66,6 +66,10 @@ pub(crate) enum Kernel {
     Dot,
     /// Squared L2 distance. Sqrt is left to the caller when true L2 is needed.
     L2Squared,
+    /// Cosine distance (`1 - similarity`). Returns values in `[0, 2]`; callers
+    /// that need the `[0, 1]` remap used by Spice's `cosine_distance` UDF should
+    /// supply a `post_process` of `|v| v / 2.0`.
+    Cosine,
 }
 
 impl Kernel {
@@ -73,6 +77,7 @@ impl Kernel {
         match self {
             Self::Dot => f32::dot(a, b),
             Self::L2Squared => f32::l2sq(a, b),
+            Self::Cosine => f32::cosine(a, b),
         }
     }
 }
