@@ -15,6 +15,7 @@ limitations under the License.
 */
 
 use async_trait::async_trait;
+use data_components::inferred_schema::InferredSchema;
 use data_components::mysql_replication::{ReplicationMetrics, ReplicationMetricsCollector};
 use datafusion::datasource::TableProvider;
 use datafusion::sql::sqlparser::dialect::MySqlDialect;
@@ -409,24 +410,88 @@ async fn mysql_comment_metadata(
     ))
 }
 
-async fn enrich_with_mysql_comments(
+/// Query `information_schema` for the target table's primary key and rough
+/// sizing. Returns an [`InferredSchema`]; empty when nothing usable was found
+/// (e.g. a table with no primary key). Secondary indexes / sort columns /
+/// per-column stats are not inferred for MySQL yet — only the primary key
+/// (which `refresh_mode: changes` requires to route UPDATE/DELETE events) and
+/// the row-count/byte estimates the adaptive tuner warm-starts from.
+async fn mysql_inferred_schema_metadata(
+    pool: &Arc<MySQLConnectionPool>,
+    table_reference: &datafusion::sql::TableReference,
+) -> std::result::Result<InferredSchema, Box<dyn std::error::Error + Send + Sync>> {
+    let connection = pool.connect_direct().await?;
+    let mut conn = connection.conn.lock().await;
+    let table_schema = table_reference
+        .schema()
+        .or_else(|| table_reference.catalog())
+        .map(ToString::to_string);
+    let table_name = table_reference.table().to_string();
+
+    // Primary-key columns, in key order. `KEY_COLUMN_USAGE` names the PK
+    // constraint `PRIMARY`; `ORDINAL_POSITION` is the column's position within
+    // the key (1-based), so ordering by it preserves composite-key order.
+    let pk_rows: Vec<(String,)> = conn
+        .exec(
+            "SELECT COLUMN_NAME \
+             FROM information_schema.KEY_COLUMN_USAGE \
+             WHERE CONSTRAINT_NAME = 'PRIMARY' \
+               AND TABLE_SCHEMA = COALESCE(?, DATABASE()) \
+               AND TABLE_NAME = ? \
+             ORDER BY ORDINAL_POSITION",
+            (table_schema.clone(), table_name.clone()),
+        )
+        .await?;
+    let primary_key: Vec<String> = pk_rows.into_iter().map(|(name,)| name).collect();
+
+    // Rough sizing (best-effort; a failure here must not fail inference).
+    // `TABLE_ROWS` is an estimate for InnoDB, which matches `InferredSchema`'s
+    // "estimate, not a precise count" contract.
+    let mut row_count: Option<u64> = None;
+    let mut table_bytes: Option<u64> = None;
+    let size_result: mysql_async::Result<Vec<(Option<u64>, Option<u64>)>> = conn
+        .exec(
+            "SELECT TABLE_ROWS, DATA_LENGTH \
+             FROM information_schema.TABLES \
+             WHERE TABLE_SCHEMA = COALESCE(?, DATABASE()) \
+               AND TABLE_NAME = ?",
+            (table_schema, table_name),
+        )
+        .await;
+    match size_result {
+        Ok(rows) => {
+            if let Some((rows_est, bytes)) = rows.into_iter().next() {
+                row_count = rows_est;
+                table_bytes = bytes;
+            }
+        }
+        Err(error) => {
+            tracing::debug!(%error, "Failed to query MySQL table size; continuing without it");
+        }
+    }
+
+    Ok(InferredSchema {
+        primary_key,
+        row_count,
+        table_bytes,
+        ..Default::default()
+    })
+}
+
+/// Enrich the provider's schema with MySQL metadata: column/table comments and
+/// source types (always), plus the inferred primary key / sizing when the
+/// dataset opts into `schema_inference: extended`. Mirrors the PostgreSQL
+/// connector's `enrich_with_postgres_metadata`.
+async fn enrich_with_mysql_metadata(
     pool: &Arc<MySQLConnectionPool>,
     dataset: &Dataset,
     table_reference: &datafusion::sql::TableReference,
     provider: Arc<dyn TableProvider>,
 ) -> Arc<dyn TableProvider> {
-    match mysql_comment_metadata(pool, table_reference).await {
-        Ok((table_metadata, field_metadata)) => {
-            if table_metadata.is_empty() && field_metadata.is_empty() {
-                provider
-            } else {
-                data_components::metadata_enriched_table_provider(
-                    provider,
-                    table_metadata,
-                    field_metadata,
-                )
-            }
-        }
+    let (mut table_metadata, field_metadata) = match mysql_comment_metadata(pool, table_reference)
+        .await
+    {
+        Ok(metadata) => metadata,
         Err(error) => {
             tracing::warn!(
                 dataset = %dataset.name,
@@ -434,8 +499,40 @@ async fn enrich_with_mysql_comments(
                 error = %error,
                 "Failed to query MySQL comments; registering without comment metadata"
             );
-            provider
+            (HashMap::new(), data_components::FieldMetadata::new())
         }
+    };
+
+    if dataset.schema_inference.is_extended() {
+        match mysql_inferred_schema_metadata(pool, table_reference).await {
+            Ok(inferred) => {
+                if !inferred.is_empty() {
+                    tracing::debug!(
+                        dataset = %dataset.name,
+                        source = %dataset.path(),
+                        primary_key = ?inferred.primary_key,
+                        row_count = ?inferred.row_count,
+                        table_bytes = ?inferred.table_bytes,
+                        "Inferred extended schema metadata from MySQL catalog"
+                    );
+                }
+                table_metadata.extend(inferred.to_metadata());
+            }
+            Err(error) => {
+                tracing::warn!(
+                    dataset = %dataset.name,
+                    source = %dataset.path(),
+                    error = %error,
+                    "Failed to infer extended schema from MySQL catalog; registering without inferred metadata"
+                );
+            }
+        }
+    }
+
+    if table_metadata.is_empty() && field_metadata.is_empty() {
+        provider
+    } else {
+        data_components::metadata_enriched_table_provider(provider, table_metadata, field_metadata)
     }
 }
 
@@ -465,7 +562,7 @@ impl DataConnector for MySQL {
         match self.mysql_factory.table_provider(tbl).await {
             Ok(provider) => {
                 Ok(
-                    enrich_with_mysql_comments(&self.pool, dataset, &table_reference, provider)
+                    enrich_with_mysql_metadata(&self.pool, dataset, &table_reference, provider)
                         .await,
                 )
             }
