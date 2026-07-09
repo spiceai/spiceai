@@ -304,15 +304,12 @@ pub(crate) const COLD_PK_BLOOM_PER_FILE_MAX_BYTES: usize = 16 * 1024 * 1024;
 /// Table-global cold-tier PK existence view: one [`PkBloom`] per live cold file
 /// (from the `cayenne_cold_tier_file` manifest), probed at CDC-upsert
 /// conflict-detection time so a re-ingested cold-resident key records a
-/// supersede tombstone WITHOUT scanning the cold object store
-/// (`load_existing_keyset`).
+/// supersede tombstone WITHOUT scanning the cold object store.
 ///
-/// Correctness mirrors [`PkBloom`]: no false negatives (a live cold key is never
-/// missed), and a false positive only yields a harmless redundant key-based
-/// delete under upsert. Only ever consulted for `OnConflict::Upsert` tables —
-/// `DoNothing` keeps the exact cold scan (a false positive would wrongly drop a
-/// genuinely new row). Per-file blooms are kept as a list (not unioned) because
-/// each is right-sized to its file's key count, so bit-array sizes differ.
+/// No false negatives (a live cold key is never missed); a false positive is a
+/// harmless redundant key-delete under upsert. Never consulted for `DoNothing`
+/// (a false positive would wrongly drop a genuinely new row). Blooms stay a
+/// list, not a union, because each is right-sized to its file's key count.
 pub(crate) struct ColdPkExistence {
     blooms: Vec<PkBloom>,
 }

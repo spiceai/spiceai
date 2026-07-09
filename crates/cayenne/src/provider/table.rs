@@ -1122,18 +1122,12 @@ pub struct CayenneTableProvider {
     /// `shard_of_pk` so a key co-locates with its tier segments + tombstones.
     sharded_pk_keyset_cache: Arc<ParkingMutex<Option<ShardedPkIndex>>>,
     /// Table-global cold-tier (datalake) PK existence view: one bloom per live
-    /// cold file, unioned from the `cayenne_cold_tier_file` manifest's per-file
-    /// `pk_bloom` blobs. Lets the CDC-upsert keyset rebuild fold cold-resident
-    /// keys back in WITHOUT scanning the cold object store (the O(cold-rows) tax
-    /// this replaces — see [`Self::load_existing_keyset`]). Lifecycle mirrors the
-    /// keyset caches: (re)built on a keyset cache miss by
-    /// [`Self::resolve_cold_keyset_source`] and cleared by
-    /// [`Self::clear_cached_pk_keyset`] (which promotion calls on commit). `None`
-    /// means no cold contribution is bloom-backed — either the table is
-    /// non-upsert / cold-disabled, or a cold file lacks a bloom so the rebuild
-    /// fell back to the exact cold scan. Consulted read-only on the CDC apply
-    /// hot path ([`Self::apply_on_conflict_to_batch`]); never used for
-    /// `DoNothing` (a false positive would wrongly drop a genuinely new row).
+    /// cold file, from the manifest's per-file `pk_bloom` blobs. Lets the
+    /// CDC-upsert keyset rebuild fold cold-resident keys WITHOUT the O(cold-rows)
+    /// object-store scan. Rebuilt on keyset cache miss by
+    /// [`Self::resolve_cold_keyset_source`], cleared by
+    /// [`Self::clear_cached_pk_keyset`] (promotion calls it on commit). `None` =
+    /// no bloom-backed cold contribution (see [`ColdKeysetSource`]).
     cold_pk_existence: Arc<ParkingMutex<Option<Arc<ColdPkExistence>>>>,
     /// Accounts the keyset + deletion indexes against the query memory
     /// pool. `Arc`-shared with provider clones so they update one reservation.
@@ -2524,33 +2518,22 @@ impl CayenneTableProvider {
         Ok(())
     }
 
-    /// One physical-GC mark-and-sweep pass over the datalake (cold) tier
-    /// (Option B).
+    /// One physical-GC mark-and-sweep pass over the datalake (cold) tier:
+    /// deletes `.vortex` objects orphaned by overwrites and dirty rewrites.
     ///
-    /// Replace-all overwrites and carry-forward dirty rewrites orphan prior cold
-    /// generations: their `.vortex` objects stay on the store but are no longer
-    /// referenced by the `cayenne_cold_tier_file` manifest. Left alone they
-    /// accumulate forever. The manifest is the GC ROOT, and the orphan set is
-    /// re-derived every pass as `(objects under the cold prefix) − (manifest
-    /// URLs)` — so this is **self-healing across restarts**: a promotion followed
-    /// immediately by a process restart leaves the orphaned objects discoverable
-    /// by the next pass (no in-memory task has to survive the restart).
+    /// The manifest is the GC root; the orphan set is re-derived every pass as
+    /// `(objects under the cold prefix) − (manifest URLs)`, so GC is
+    /// self-healing across restarts — no in-memory task has to survive one.
     ///
-    /// Scan safety via a mark-and-sweep grace ([`Self::plan_cold_gc_deletions`]):
-    /// an orphan is deleted only once it has been observed orphaned for at least
-    /// `cold_tier_gc_interval_ms` (recorded in `cold_gc_first_seen`). Because GC
-    /// observes an orphan only AFTER the orphaning promotion committed (under
-    /// `listing_fence.write()`), and a scan that could reference it was plan-built
-    /// BEFORE that commit (under `listing_fence.read()`), the scan has had a full
-    /// interval to finish before the object is removed. A query running LONGER
-    /// than the interval that overlaps the orphaning could still hit a `NotFound`
-    /// scan ERROR (never silently wrong results) — the documented narrow
-    /// limitation; the robust fix is pinning cold URLs in the scan ref-count
-    /// (deferred).
+    /// Scan safety ([`Self::plan_cold_gc_deletions`]): an orphan is deleted only
+    /// after being observed orphaned for `cold_tier_gc_interval_ms`, giving any
+    /// scan planned before the orphaning promotion a full interval to finish.
+    /// A query running longer than that interval can still hit a `NotFound` scan
+    /// ERROR (never silently wrong results) — known narrow limitation; the
+    /// robust fix is pinning cold URLs in the scan ref-count (deferred).
     ///
-    /// Best-effort: a missing `DeleteObject` grant or a transient error is logged
-    /// and skipped (retried next pass), never failing anything. Runs on the
-    /// background cold-tier tick, off the scan/write hot paths.
+    /// Best-effort: missing `DeleteObject` grant or transient errors are logged
+    /// and retried next pass. Runs on the background tick, off the hot paths.
     async fn run_cold_tier_gc_tick(&self) {
         if !self.table_metadata.vortex_config.cold_tier_enabled() {
             return;
@@ -6506,20 +6489,8 @@ impl CayenneTableProvider {
     /// would run its cold scan), so the two stay coupled: NO object-store I/O —
     /// the per-file blooms come straight from the manifest rows.
     ///
-    /// - [`ColdKeysetSource::Bloom`]: upsert-eligible, cold enabled, and every
-    ///   live cold file carries a per-file bloom (or there are no live cold
-    ///   files). `cold_pk_existence` holds the union view; the rebuild SKIPS the
-    ///   cold scan.
-    /// - [`ColdKeysetSource::Scan`]: upsert-eligible + cold enabled, but a live
-    ///   cold file lacks a bloom (legacy row, or over the per-file cap). The
-    ///   bloom set would be incomplete — which could miss a key and double-count
-    ///   — so fall back to the exact cold scan for the whole table.
-    ///   `cold_pk_existence` is cleared.
-    /// - [`ColdKeysetSource::None`]: no cold contribution is bloom-backed — cold
-    ///   disabled, or a non-upsert (`DoNothing`) table (which needs the exact
-    ///   scan; a bloom false positive would wrongly drop a new row). The rebuild
-    ///   folds via the scan (a no-op when cold is disabled). `cold_pk_existence`
-    ///   is cleared.
+    /// See [`ColdKeysetSource`] for the three outcomes; `cold_pk_existence` is
+    /// populated only for [`ColdKeysetSource::Bloom`] and cleared otherwise.
     async fn resolve_cold_keyset_source(&self) -> Result<ColdKeysetSource> {
         if !self.table_metadata.vortex_config.cold_tier_enabled() || !self.upsert_bloom_eligible() {
             *self.cold_pk_existence.lock() = None;
@@ -6531,10 +6502,9 @@ impl CayenneTableProvider {
             .list_cold_tier_files(&self.table_metadata.table_id)
             .await?;
         // Liveness is size-based, NOT row_count-based: promotion commits files
-        // with `row_count = 0` when footer stats inference fails, and such a
-        // file still holds keys. Those files carry no bloom (sizing needs the
-        // count), so keeping them live routes the rebuild to the exact-scan
-        // fallback below instead of silently dropping their keys.
+        // with `row_count = 0` when footer stats inference fails. Such files
+        // carry no bloom, so keeping them live routes to the exact-scan fallback
+        // instead of silently dropping their keys.
         let live: Vec<_> = cold_files
             .into_iter()
             .filter(|f| f.file_size_bytes > 0)
@@ -6581,14 +6551,11 @@ impl CayenneTableProvider {
 
     /// Rebuild the exact PK keyset from durable state.
     ///
-    /// `fold_cold` controls the datalake (cold) tier pass: `true` scans the cold
-    /// object store to fold cold-resident keys into the keyset (the exact,
-    /// always-correct path, used for `DoNothing` and when a cold file lacks a
-    /// per-file PK bloom); `false` SKIPS that scan because the cold contribution
-    /// is served by the table-global [`ColdPkExistence`] bloom instead
-    /// (`resolve_cold_keyset_source` — the O(cold-rows) scan this avoids). When
-    /// the cold tier is disabled the flag is immaterial (the cold pass is a
-    /// no-op either way).
+    /// `fold_cold`: `true` scans the cold store to fold cold-resident keys into
+    /// the keyset (the exact path — `DoNothing`, or a cold file lacks a bloom);
+    /// `false` skips that O(cold-rows) scan because the cold contribution is
+    /// served by the [`ColdPkExistence`] bloom (`resolve_cold_keyset_source`).
+    /// Immaterial when the cold tier is disabled (the pass is a no-op).
     async fn load_existing_keyset(
         &self,
         pk_indices: &[usize],
@@ -6726,11 +6693,9 @@ impl CayenneTableProvider {
         // cold key is dead here, and its re-inserted copy is picked up by the
         // warm/mem-tier passes above.
         //
-        // Skipped when `fold_cold` is false: an upsert-eligible table whose live
-        // cold files all carry a per-file PK bloom serves the cold contribution
-        // from the table-global `ColdPkExistence` (built by
-        // `resolve_cold_keyset_source`, probed on the CDC apply path), so this
-        // O(cold-rows) object-store scan is avoided entirely.
+        // Skipped when `fold_cold` is false: the cold contribution is then
+        // served by the `ColdPkExistence` bloom, avoiding this O(cold-rows)
+        // object-store scan entirely.
         if fold_cold
             && let Some(cold_plan) = self
                 .build_cold_tier_scan_plan(
@@ -7674,16 +7639,12 @@ impl CayenneTableProvider {
                 }
             };
 
-        // Datalake (cold) tier existence, snapshotted once for this batch. A
-        // warm/mem MISS is checked against it: a cold-resident key (blooms have
-        // no false negatives, so a MISS here is definitely-absent-from-cold) must
-        // record a key-based supersede tombstone, exactly like a warm `Bloom`
-        // HIT. `None` for non-upsert / cold-disabled tables and whenever the
-        // rebuild fell back to the exact cold scan (which folded cold keys into
-        // the exact keyset above, so `ctx.existing` already covers them). Only
-        // ever consulted on upsert (a `DoNothing` cold false positive would
-        // wrongly drop a genuinely new row — enforced by `resolve_cold_keyset_source`
-        // returning `None` for non-upsert tables, so this stays `None` there).
+        // Datalake (cold) PK existence, snapshotted once for this batch: a
+        // warm/mem MISS that HITS here must record a key-based supersede, exactly
+        // like a warm `Bloom` HIT (no false negatives, so a MISS is
+        // definitely-absent-from-cold). `None` when the rebuild fell back to the
+        // exact cold scan (`ctx.existing` already covers cold keys) or for
+        // non-upsert / cold-disabled tables (`resolve_cold_keyset_source`).
         let cold_existence = self.cold_pk_existence.lock().clone();
 
         // Emit a key-based supersede delete (to BOTH the file and inline lists,
@@ -13746,13 +13707,11 @@ impl CayenneTableProvider {
                 return Ok(false);
             }
         };
-        // NOTE: no dirty-fraction guardrail (deliberately, for now): promotion
-        // always carries every clean file, even when most files are dirty.
-        // Carry-forward sorts only what it rewrites, so carried files' PK
-        // ranges can increasingly overlap new files' across promotions —
-        // watch `datalake_rewrite_selectivity` in the commit trace; if it
-        // ratchets upward in practice, a recluster policy (full rewrite past a
-        // dirty-fraction threshold) is the designed counter-measure.
+        // Deliberately no dirty-fraction guardrail: clean files are always
+        // carried, so carried files' PK ranges may increasingly overlap new
+        // files' across promotions. Watch `datalake_rewrite_selectivity`; if it
+        // ratchets up, the counter-measure is a recluster policy (full rewrite
+        // past a dirty-fraction threshold).
         let (dirty_cold, clean_cold) = (partition.dirty, partition.clean);
 
         // Canonical visible read (all tiers, all deletes applied, single-version
@@ -13784,13 +13743,11 @@ impl CayenneTableProvider {
             )
             .await?;
         if cold_files.is_empty() && dirty_cold.is_empty() {
-            // Nothing rewritten and nothing to drop: the writer produced no
-            // new cold files and no dirty file needed reconciling, so there is
-            // nothing to register or clean up. Gate on files-written rather
-            // than `total_rows` — a file that was written but whose footer row
-            // count couldn't be inferred must still be committed, not silently
-            // orphaned in the cold store. (New files empty with dirty files
-            // present is a legitimate commit: every dirty row was deleted.)
+            // Nothing rewritten and nothing to drop. Gate on files-written, not
+            // `total_rows`: a written file whose footer row count couldn't be
+            // inferred must still be committed, not silently orphaned. (No new
+            // files with dirty files present IS a legitimate commit: every
+            // dirty row was deleted.)
             return Ok(false);
         }
 
@@ -13804,9 +13761,8 @@ impl CayenneTableProvider {
         // detection guarantees no tombstoned key hides in a carried file).
         let written_files = cold_files.len();
         let carried_datalake_files = clean_cold.len();
-        // Newly WRITTEN bytes only — the carried files cost zero object-store
-        // IO, and this metric is the production check that promotion cost
-        // tracks the CHANGED data, not total table size.
+        // Newly WRITTEN bytes only (carried files cost zero object-store IO) —
+        // the production check that promotion cost tracks the CHANGED data.
         let written_bytes: u64 = cold_files
             .iter()
             .map(|f| u64::try_from(f.file_size_bytes.max(0)).unwrap_or(0))
@@ -13831,20 +13787,14 @@ impl CayenneTableProvider {
             );
         }
         self.trigger_old_snapshot_cleanup(&new_snapshot_id).await;
-        // Physical GC of cold objects orphaned by this (and prior) promotions is
-        // NOT done inline here — it runs as a periodic mark-and-sweep on the
-        // background cold-tier tick (`run_cold_tier_gc_tick`), which re-derives
-        // the orphan set from the store minus the manifest so it is self-healing
-        // across restarts and gives every orphan a full grace interval.
+        // Physical GC of the cold objects this promotion orphans is NOT inline —
+        // it runs as a periodic mark-and-sweep on the background tick
+        // (`run_cold_tier_gc_tick`), self-healing across restarts.
 
-        // Publish telemetry: bytes WRITTEN this promotion (carried files cost
-        // nothing), reported to the SHARED cross-kind
-        // `cayenne_compaction_merged_bytes` metric — "merged bytes" is that
-        // family's name for a pass's written output (kind="full"/"subset"
-        // report theirs the same way); the datalake-specific vocabulary lives
-        // in the trace fields below. The last successful publish time is
-        // derivable from
-        // `cayenne_compaction_duration_ms{kind="datalake", result="completed"}`.
+        // Bytes WRITTEN this promotion (carried files cost nothing), reported to
+        // the shared cross-kind `cayenne_compaction_merged_bytes` metric —
+        // "merged bytes" is that family's name for a pass's written output. The
+        // datalake-specific vocabulary lives in the trace fields below.
         telemetry::cayenne::track_compaction_merged_bytes(
             written_bytes,
             &[
@@ -13853,19 +13803,11 @@ impl CayenneTableProvider {
             ],
         );
 
-        // Trace fields come in three pairs:
-        //   input          — warm_files/warm_bytes: the newly settled warm
-        //                    data this promotion publishes;
-        //   classification — rewritten_datalake_files/carried_datalake_files:
-        //                    the existing datalake manifest split (they sum to
-        //                    the prior manifest size);
-        //   output         — written_files/written_bytes: the new files
-        //                    uploaded (byte-level write amplification =
-        //                    written_bytes / warm delta).
-        // The headline `datalake_rewrite_selectivity` (DataFusion-metrics
-        // style) is the classification ratio: the fraction of existing
-        // datalake files the tombstones selected for rewrite — lower is
-        // better, carried files cost zero object-store IO.
+        // Trace fields come in three pairs: input (warm_files/warm_bytes),
+        // classification (rewritten/carried datalake files — sums to the prior
+        // manifest size), output (written_files/written_bytes). The headline
+        // `datalake_rewrite_selectivity` is the fraction of existing datalake
+        // files selected for rewrite — lower is better.
         let rewritten_datalake_files = dirty_cold.len();
         let datalake_rewrite_selectivity = if prior_cold_len == 0 {
             "n/a (first promotion, no existing datalake files)".to_string()
@@ -24401,11 +24343,9 @@ impl super::compaction::ColdTierPromotionRunner for CayenneTableProvider {
             }
         }
 
-        // Physical GC of superseded cold objects runs on its own (coarser)
-        // cadence, gated here so it fires about every `cold_tier_gc_interval_ms`
-        // regardless of the promotion tick interval. Runs even when nothing was
-        // promoted, so orphans from a prior promotion (including one just before a
-        // restart) are still swept on an otherwise-idle table.
+        // Physical cold GC fires about every `cold_tier_gc_interval_ms`
+        // regardless of the (finer) promotion tick — even when nothing was
+        // promoted, so orphans from before a restart are swept on an idle table.
         let gc_interval = std::time::Duration::from_millis(
             self.table_metadata.vortex_config.cold_tier_gc_interval_ms,
         );

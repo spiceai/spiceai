@@ -677,11 +677,10 @@ impl MetastoreBackend for TursoMetastore {
             )
             .await;
 
-        // Per-cold-file primary-key existence Bloom filter. NULL on legacy rows
-        // and on files written for non-upsert / over-cap tables → the keyset
-        // rebuild falls back to the exact cold scan; forward- and
-        // downgrade-safe. Appended last to match the CREATE TABLE and
-        // EXPECTED_TABLES column order.
+        // Per-cold-file PK existence bloom. NULL (legacy / non-upsert /
+        // over-cap) makes the keyset rebuild fall back to the exact cold
+        // scan, so the column is forward- and downgrade-safe. Appended
+        // last to match CREATE TABLE and EXPECTED_TABLES column order.
         let _ = conn
             .execute(
                 "ALTER TABLE cayenne_cold_tier_file ADD COLUMN pk_bloom_blob BLOB",
