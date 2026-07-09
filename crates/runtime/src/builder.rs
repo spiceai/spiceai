@@ -325,6 +325,12 @@ impl RuntimeBuilder {
             );
         }
 
+        // Cayenne compaction shutdown state is process-global. Reset it when a
+        // fresh Runtime is built so embedded/test runtimes created after a prior
+        // shutdown can start maintenance passes again, including when dedicated
+        // thread pools are disabled and no compaction runtime handle is injected.
+        cayenne::reset_compaction_shutdown();
+
         self.accelerator_engine_registry.register_all().await;
         dataconnector::register_all().await;
         catalogconnector::register_all().await;

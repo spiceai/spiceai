@@ -117,6 +117,7 @@ REQUIRED_METRICS = [
     ("dataset_acceleration_cdc_apply_path_total", "counter", "dataset,path"),
     ("dataset_postgres_replication_reader_input_wait_micros_total", "counter", "name"),
     ("dataset_postgres_replication_reader_processing_micros_total", "counter", "name"),
+    ("dataset_postgres_replication_member_send_wait_micros_total", "counter", "name"),
     ("dataset_postgres_replication_reconnects_total", "counter", "name"),
     ("dataset_postgres_replication_disconnected_ms_total", "counter", "name"),
     ("dataset_postgres_replication_member_attached", "gauge", "name,slot"),
@@ -672,17 +673,27 @@ def render(data):
         if len(wal_bytes) >= 2 and window_ms > 0:
             wal_slope = (wal_bytes[-1] - wal_bytes[0]) / (window_ms / 1000.0)
         # Reader split: time blocked on the source socket (input-wait) vs decode/build
-        # (processing) — the definitive source-send vs our-decode discriminator.
+        # (processing) — the definitive source-send vs our-decode discriminator. On the
+        # shared pump, member-send-wait (time blocked delivering into a slow member's
+        # channel — downstream apply back-pressure) is already SUBTRACTED from
+        # `reader_processing_micros_total` at the source, so `input_share` is honest:
+        # a slow member no longer deflates the input-share and mislabels the slot
+        # READER-decode-bound. It is exported separately as
+        # `member_send_wait_micros_total` and surfaced below as its own bucket.
         in_us = sum(_delta(f, l) for f, l in
                     _pairs(data, PG + "reader_input_wait_micros_total", {"name": ds}).values())
         proc_us = sum(_delta(f, l) for f, l in
                       _pairs(data, PG + "reader_processing_micros_total", {"name": ds}).values())
+        member_send_wait_us = sum(_delta(f, l) for f, l in
+                      _pairs(data, PG + "member_send_wait_micros_total", {"name": ds}).values())
         reader_total = in_us + proc_us
         input_share = (in_us / reader_total) if reader_total > 0 else None
         send_wait_p99 = hist_quantile(data, DA + "cdc_reader_send_wait_ms", 0.99, want)
         if input_share is not None:
             p(f"    reader split: socket-wait {input_share * 100:.0f}% vs decode/build "
-              f"{(1 - input_share) * 100:.0f}%; send-wait p99={send_wait_p99:.0f}ms "
+              f"{(1 - input_share) * 100:.0f}% (decode/build excludes member-send-wait "
+              f"{member_send_wait_us / 1e6:.1f}s of shared-slot apply back-pressure); "
+              f"reader send-wait p99={send_wait_p99:.0f}ms "
               "(socket-wait high ⇒ source; decode high ⇒ our reader; send-wait high ⇒ apply-bound)")
         # Stream health: reconnects in the window mean the connection dropped and
         # replayed (Δ of the cumulative counter over the window, summed across the
