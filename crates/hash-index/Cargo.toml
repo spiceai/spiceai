@@ -32,3 +32,7 @@ tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
 [[bench]]
 name = "lookup"
 harness = false
+
+[[bench]]
+name = "sbbf"
+harness = false
