@@ -1051,6 +1051,17 @@ pub struct VortexConfig {
     /// compaction interval. Set from `cayenne_cold_tier_background_interval_ms`.
     /// Defaults to 60s.
     pub cold_tier_background_interval_ms: u64,
+    /// Physical-GC cadence AND orphan grace (ms) for superseded cold objects:
+    /// the background sweep runs about this often, and an orphaned object (on the
+    /// store but no longer referenced by the manifest) is deleted only once it
+    /// has been observed orphaned for at least this long — so an in-flight scan
+    /// built before the orphaning promotion has had a full interval to finish
+    /// (mark on one sweep, delete on the next). Set from the user-facing
+    /// `cayenne_datalake_gc_interval_ms` param (the internal field keeps the
+    /// engine `cold_tier` vocabulary, mirroring `cold_tier_location` <-
+    /// `cayenne_datalake_location`). Defaults to 5min. Lowered in tests to
+    /// exercise the mark-and-sweep quickly.
+    pub cold_tier_gc_interval_ms: u64,
 }
 
 impl VortexConfig {
@@ -1384,6 +1395,7 @@ impl Default for VortexConfig {
             cold_tier_warm_max_bytes: 0,
             cold_tier_warm_max_files: 0,
             cold_tier_background_interval_ms: 60_000,
+            cold_tier_gc_interval_ms: 300_000,
         }
     }
 }
@@ -1694,6 +1706,17 @@ pub struct ColdTierFile {
     /// sum). Always populated at promotion (copied from the written footer) so
     /// listing-time pruning never falls back to a full scan.
     pub statistics_blob: Vec<u8>,
+    /// Serialized primary-key existence Bloom filter over this file's live PK
+    /// values (the `PkBloom` sidecar format — see
+    /// [`crate::provider::pk_index`]). Populated at promotion for upsert-eligible
+    /// tables so the PK keyset rebuild can fold cold-resident keys back in by
+    /// unioning the live files' blooms — with NO object-store scan of the cold
+    /// tier (`load_existing_keyset`). `None` when the table isn't upsert-eligible,
+    /// the file's key count exceeds the per-file bloom cap, or the row predates
+    /// this column — the rebuild then falls back to the exact cold scan for the
+    /// whole table. Never used for `DoNothing` conflict detection (a bloom false
+    /// positive would wrongly drop a genuinely new row).
+    pub pk_bloom: Option<Vec<u8>>,
 }
 
 /// Table-level statistics stored as a serialized Vortex [`FileStatistics`] blob.
