@@ -340,6 +340,10 @@ impl CayenneContext {
         }
         let mut options = Self::vortex_table_options(&self.config);
         options.target_file_size_mb = cold_target_file_size_mb;
+        // Write-only format: it never scans, so drop the read-path segment cache
+        // and avoid constructing a `SharedSegmentCache` (moka + metrics) per
+        // promotion.
+        options.segment_cache_size_bytes = None;
         let format = VortexFormat::new_with_options(session, options)
             .with_dataset_label(self.dataset.as_str());
         let format = match shard {
