@@ -60,15 +60,20 @@ jobs:
       - name: Install Python dependencies
         run: python3 -m pip install markdown weasyprint
 
-      # Guard against a stale committed figure: regenerating waterfall.svg must
-      # be a no-op, otherwise gen_waterfall.py was edited without committing the
-      # result and both the GitHub view and the PDF would show a stale figure.
+      # Guard against a stale or uncommitted figure: regenerating waterfall.svg
+      # from gen_waterfall.py must leave the working tree clean. --porcelain
+      # catches a modified, untracked, or missing SVG — any of which means the
+      # generator was edited without committing the regenerated figure, so both
+      # the GitHub view and the PDF would show a stale image.
       - name: Verify waterfall.svg is up to date
         working-directory: docs/cayenne
         run: |
           python3 gen_waterfall.py
-          git diff --exit-code waterfall.svg \
-            || { echo "waterfall.svg is out of date — run 'python3 gen_waterfall.py' and commit it." >&2; exit 1; }
+          if [ -n "$(git status --porcelain -- waterfall.svg)" ]; then
+            echo "waterfall.svg is out of date — run 'python3 gen_waterfall.py' and commit the result." >&2
+            git --no-pager diff -- waterfall.svg
+            exit 1
+          fi
 
       - name: Build Cayenne PDF
         working-directory: docs/cayenne
