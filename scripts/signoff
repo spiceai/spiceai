@@ -34,7 +34,6 @@ readonly VERSION="1.0.0"
 readonly STATUS_CONTEXT="${SIGNOFF_CONTEXT:-signoff}"
 readonly TARGET_BRANCH="${SIGNOFF_BRANCH:-trunk}"
 DEBUG="${SIGNOFF_DEBUG:-}"
-CHECKS_ELAPSED=0  # set by run_checks; returned via a global, not stdout
 
 # The single source of truth for the checks required to merge. `install` writes
 # exactly this list into the trunk ruleset's required status checks. Every name
@@ -105,21 +104,14 @@ ensure_clean_and_pushed() {
 # The heavier suite (release build, integration, e2e, ...) runs in the merge
 # queue, so it deliberately isn't part of the local sign-off.
 #
-# Output streams straight to the terminal and the duration is returned via the
-# CHECKS_ELAPSED global — NOT via stdout. (Calling this as `x=$(run_checks)` would
-# capture all of make's stdout into `x`, corrupting the status description and
-# hiding build output.)
+# Output streams straight to the terminal — call this bare, never `$(run_checks)`,
+# which would capture make's stdout.
 run_checks() {
-  local start
-  start=$(date +%s)
-
   info "Running Rust lint (make lint-rust)…"
   make lint-rust
 
   info "Building the CLI and running unit tests (make build-cli nextest)…"
   make build-cli nextest
-
-  CHECKS_ELAPSED=$(( $(date +%s) - start ))
 }
 
 cmd_signoff() {
@@ -136,14 +128,15 @@ cmd_signoff() {
   require_tools
   $force || ensure_clean_and_pushed
 
-  local sha user repo description
+  local sha user repo description start
   sha=$(git rev-parse HEAD) || fail "could not resolve HEAD"
   user=$(gh api user --jq .login 2>/dev/null || git config user.name || echo "unknown")
   repo=$(repo_slug)
 
   if $verify; then
+    start=$(date +%s)
     run_checks
-    description="Signed off by ${user} — lint+test passed in ${CHECKS_ELAPSED}s"
+    description="Signed off by ${user} — lint+test passed in $(( $(date +%s) - start ))s"
   else
     description="Signed off by ${user} (checks not verified locally)"
   fi
@@ -217,22 +210,19 @@ cmd_install() {
   done
 
   require_tools
-  local repo id
+  local repo id ruleset
   repo=$(repo_slug)
   id=$(ruleset_id "$repo")
   [[ -n "$id" ]] || fail "no ruleset named '${TARGET_BRANCH}' on ${repo} (create it in the repo settings first)"
-
-  # Build the desired required_status_checks array as JSON.
-  local desired
-  desired=$(printf '%s\n' "${REQUIRED_CHECKS[@]}" | jq -R . | jq -s \
-    --argjson iid "$ACTIONS_INTEGRATION_ID" 'map({context: ., integration_id: $iid})')
+  # Fetch the ruleset once; both the preview and the PUT body derive from it.
+  ruleset=$(gh api "repos/${repo}/rulesets/${id}") \
+    || fail "failed to read ruleset ${id} on ${repo}"
 
   info "Ruleset '${TARGET_BRANCH}' (id ${id}) on ${repo}"
   info ""
   info "Current required checks:"
-  gh api "repos/${repo}/rulesets/${id}" \
-    --jq '(.rules[] | select(.type=="required_status_checks") | .parameters.required_status_checks[].context)' \
-    2>/dev/null | bullet "  - " >&2 || info "  (none)"
+  jq -r '.rules[]? | select(.type=="required_status_checks") | .parameters.required_status_checks[]?.context' <<<"$ruleset" \
+    | bullet "  - " >&2 || info "  (none)"
   info ""
   info "New required checks:"
   printf '%s\n' "${REQUIRED_CHECKS[@]}" | bullet "  + " >&2
@@ -243,10 +233,12 @@ cmd_install() {
     return 0
   fi
 
-  # Fetch the current ruleset and swap only the required_status_checks array,
-  # preserving every other rule (pull_request approvals, merge_queue, etc.).
-  local body
-  body=$(gh api "repos/${repo}/rulesets/${id}" | jq --argjson checks "$desired" '
+  # Swap only the required_status_checks array, preserving every other rule
+  # (pull_request approvals, merge_queue, etc.).
+  local desired body
+  desired=$(jq -n --argjson iid "$ACTIONS_INTEGRATION_ID" \
+    '$ARGS.positional | map({context: ., integration_id: $iid})' --args "${REQUIRED_CHECKS[@]}")
+  body=$(jq --argjson checks "$desired" '
     {
       name,
       target,
@@ -270,7 +262,7 @@ cmd_install() {
         }])
         end
       )
-    }')
+    }' <<<"$ruleset")
 
   echo "$body" | gh api --method PUT "repos/${repo}/rulesets/${id}" --input - >/dev/null \
     || fail "failed to update ruleset ${id} (need admin on ${repo})"
@@ -300,7 +292,7 @@ EOF
 
 main() {
   case "${1:-}" in
-    ""|run|signoff|create) shift || true; cmd_signoff "$@" ;;
+    ""|signoff) shift || true; cmd_signoff "$@" ;;
     -f|--force|--no-verify) cmd_signoff "$@" ;;
     status)   shift; cmd_status "$@" ;;
     check)    shift; cmd_check "$@" ;;

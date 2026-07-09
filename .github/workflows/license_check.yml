@@ -37,6 +37,9 @@ env:
   CARGO_NET_GIT_FETCH_WITH_CLI: true
 
 jobs:
+  # Required check, so it runs on every merge-queue entry (merge_group can't
+  # path-filter). Dependency licenses/advisories are the gate here; running
+  # unconditionally is intentional.
   license-check-rust:
     name: Check Rust Licenses
     runs-on: self-hosted

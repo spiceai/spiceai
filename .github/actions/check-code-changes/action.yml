@@ -15,6 +15,26 @@
 name: 'Check Code Changes'
 description: 'Detects if there are relevant code changes that require running tests'
 
+inputs:
+  filters:
+    description: >-
+      dorny/paths-filter `filters` YAML; must define a `code_changes` group.
+      Defaults to the standard repo-wide code paths.
+    required: false
+    default: |
+      code_changes:
+        - '.github/**'
+        - 'crates/**'
+        - 'bin/**'
+        - 'test/**'
+        - 'tools/**'
+        - 'install/**'
+        - 'Cargo.toml'
+        - 'Cargo.lock'
+        - 'go.mod'
+        - 'go.sum'
+        - 'Makefile'
+
 outputs:
   relevant_changes:
     description: 'Whether there are relevant code changes'
@@ -27,19 +47,7 @@ runs:
       id: changed-code-files
       uses: dorny/paths-filter@7b450fff21473bca461d4b92ce414b9d0420d706 # v4.0.2
       with:
-        filters: |
-          code_changes:
-            - '.github/**'
-            - 'crates/**'
-            - 'bin/**'
-            - 'test/**'
-            - 'tools/**'
-            - 'install/**'
-            - 'Cargo.toml'
-            - 'Cargo.lock'
-            - 'go.mod'
-            - 'go.sum'
-            - 'Makefile'
+        filters: ${{ inputs.filters }}
 
     - name: Check for relevant changes
       id: check_changes

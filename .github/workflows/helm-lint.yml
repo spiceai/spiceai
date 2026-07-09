@@ -15,23 +15,23 @@ jobs:
   changes:
     runs-on: ubuntu-latest
     outputs:
-      chart: ${{ steps.filter.outputs.chart }}
+      relevant: ${{ steps.check.outputs.relevant_changes }}
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           persist-credentials: false
           fetch-depth: 0
-      - uses: dorny/paths-filter@7b450fff21473bca461d4b92ce414b9d0420d706 # v4.0.2
-        id: filter
+      - id: check
+        uses: ./.github/actions/check-code-changes
         with:
           filters: |
-            chart:
+            code_changes:
               - 'deploy/chart/**'
 
   lint-helm:
     name: Helm Lint
     needs: changes
-    if: ${{ needs.changes.outputs.chart == 'true' || github.event_name == 'workflow_dispatch' }}
+    if: ${{ needs.changes.outputs.relevant == 'true' || github.event_name == 'workflow_dispatch' }}
     runs-on: spiceai-macos
 
     steps:

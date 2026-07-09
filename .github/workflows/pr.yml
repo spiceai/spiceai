@@ -80,23 +80,19 @@ jobs:
               repo: context.repo.repo,
               ref: sha,
             });
+            // 'signoff' must match STATUS_CONTEXT (SIGNOFF_CONTEXT) in scripts/signoff.
             const signoff = data.statuses.find((s) => s.context === 'signoff');
             if (signoff && signoff.state === 'success') {
               core.notice(`Signed off by ${signoff.creator?.login ?? 'unknown'}: ${signoff.description ?? ''}`);
               return;
             }
             core.setFailed(
-              [
-                `No developer sign-off found for ${sha}.`,
-                ``,
-                `On your machine, with this commit pushed, run:`,
-                ``,
-                `    make signoff`,
-                ``,
-                `It runs lint + unit tests locally and records a sign-off on this exact`,
-                `commit (push a new commit and you must sign off again). The full test`,
-                `suite then runs in the merge queue. See docs/dev/ci_signoff.md.`,
-              ].join('\n')
+              `No developer sign-off found for ${sha}.\n\n` +
+              `On your machine, with this commit pushed, run:\n\n` +
+              `    make signoff\n\n` +
+              `It runs lint + unit tests locally and records a sign-off on this exact\n` +
+              `commit (push a new commit and you must sign off again). The full test\n` +
+              `suite then runs in the merge queue. See docs/dev/ci_signoff.md.`
             );
       - name: Merge queue passthrough
         if: ${{ github.event_name != 'pull_request' }}

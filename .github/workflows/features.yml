@@ -29,6 +29,10 @@ env:
   CARGO_HTTP_TIMEOUT: 60
 
 jobs:
+  # Required check, so it runs on every merge-queue entry (merge_group can't
+  # path-filter). Feature-combination breakage can come from any code change, so
+  # running unconditionally is intentional; step-gate on Cargo changes if queue
+  # latency ever becomes a concern.
   build:
     name: Features Check
     runs-on: spiceai-macos
