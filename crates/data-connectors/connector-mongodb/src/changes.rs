@@ -265,7 +265,9 @@ pub fn build_changes_stream(
                 )))?;
             let barrier = build_heartbeat_envelope(&schema, None, false)
                 .map_err(|error| StreamError::Arrow(error.to_string()))?;
-            let (_, batch, _) = barrier.into_parts();
+            let (_, batch, _) = barrier
+                .into_parts()
+                .map_err(|error| StreamError::Arrow(error.to_string()))?;
             let committer: Box<dyn CommitChange + Send + Sync> = match mongo_sys.as_ref() {
                 Some(sys) => Box::new(MongoResumeTokenCommitter::new(
                     Arc::clone(sys),

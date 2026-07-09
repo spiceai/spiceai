@@ -112,6 +112,9 @@ pub enum Error {
     #[snafu(display("Schema mismatch: {message}"))]
     SchemaMismatch { message: String },
 
+    #[snafu(display("Failed to build the ready-signal change batch: {message}"))]
+    BuildReadySignal { message: String },
+
     #[snafu(display("Bootstrap snapshot error: {message}"))]
     Bootstrap { message: String },
 
@@ -674,7 +677,10 @@ async fn start_inner(input: ReplicationStreamInput) -> Result<ChangesStream> {
                 .map_err(|e| Error::SchemaMismatch {
                     message: e.to_string(),
                 })?
-                .into_parts();
+                .into_parts()
+                .map_err(|e| Error::SchemaMismatch {
+                    message: e.to_string(),
+                })?;
             let boundary = ChangeEnvelope::from_parts(
                 Box::new(InitialPositionCommitter {
                     store: Arc::clone(&position_store),

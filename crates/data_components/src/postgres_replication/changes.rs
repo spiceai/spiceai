@@ -30,14 +30,19 @@ use arrow::{
         UInt32Builder,
     },
     buffer::OffsetBuffer,
-    datatypes::{DataType, Field, Int8Type, Int16Type, Int32Type, Schema, SchemaRef, TimeUnit},
+    datatypes::{
+        DataType, Field, Int8Type, Int16Type, Int32Type, IntervalUnit, Schema, SchemaRef, TimeUnit,
+    },
 };
 use async_trait::async_trait;
 use snafu::ensure;
 
 use super::pgoutput::{Relation, TupleData, Value};
 use super::{PgOutputDecodeSnafu, Result};
-use crate::cdc::{ChangeBatch, ChangeEnvelope, CommitChange, CommitError, changes_schema};
+use crate::cdc::{
+    ChangeBatch, ChangeBatchError, ChangeEnvelope, ChangeRows, CommitChange, CommitError,
+    changes_schema,
+};
 
 /// Microseconds between the Unix epoch (1970-01-01) and the Postgres epoch
 /// (2000-01-01). Binary `timestamp`/`timestamptz` are relative to the Postgres
@@ -305,6 +310,193 @@ pub fn build_change_batch(
     ChangeBatch::try_new(record).map_err(|e| super::Error::SchemaMismatch {
         message: format!("change batch validation failed: {e}"),
     })
+}
+
+/// Decode a per-relation run of buffered raw pgoutput change messages (exactly
+/// as the shared pump routed them, one `Bytes` per `XLogData` change message)
+/// into `DecodedChange`s, applying the same per-op transform the pump used to
+/// perform inline: INSERT → Create; UPDATE → (delete-of-old-key when the
+/// primary key changed) + upsert, with unchanged-TOAST merged from the old
+/// tuple; DELETE → Delete; TRUNCATE → Truncate. `relation` supplies the key
+/// flags for the UPDATE primary-key-change split.
+///
+/// This runs on the per-dataset consumer (inside [`PgChangeRows::build`]), off
+/// the shared pump — the pump only peeked each message's type + relation id to
+/// route it. A throwaway [`super::pgoutput::Decoder`] is used because the
+/// change decoders are structural (they don't consult the relation cache); the
+/// `relation` argument, not the decoder, drives typing and key detection.
+fn decode_raw_changes(relation: &Relation, raw: &[bytes::Bytes]) -> Result<Vec<DecodedChange>> {
+    use super::pgoutput::{DecodedMessage, Decoder};
+    let mut decoder = Decoder::new();
+    // Lower bound on capacity (a PK-changing UPDATE grows the vec by one).
+    let mut changes = Vec::with_capacity(raw.len());
+    for msg in raw {
+        match decoder.decode(msg.clone())? {
+            DecodedMessage::Insert { tuple, .. } => changes.push(DecodedChange {
+                op: ChangeOp::Create,
+                row: tuple,
+            }),
+            DecodedMessage::Update { old, new, .. } => {
+                push_update_change(&mut changes, relation, old, new);
+            }
+            DecodedMessage::Delete { old, .. } => changes.push(DecodedChange {
+                op: ChangeOp::Delete,
+                row: old,
+            }),
+            DecodedMessage::Truncate { .. } => changes.push(DecodedChange {
+                op: ChangeOp::Truncate,
+                row: TupleData { columns: vec![] },
+            }),
+            // Begin/Commit/Relation/Other are never buffered as per-relation
+            // change messages; ignore defensively.
+            DecodedMessage::Begin { .. }
+            | DecodedMessage::Commit { .. }
+            | DecodedMessage::Relation(_)
+            | DecodedMessage::Other => {}
+        }
+    }
+    Ok(changes)
+}
+
+/// A committed transaction's raw change messages for one relation, carried
+/// through the shared-slot [`ChangeEnvelope`] as a deferred [`ChangeRows`]
+/// source.
+///
+/// The shared Postgres replication pump only peeks each message's type +
+/// relation id to route it, then buffers the raw pgoutput bytes here;
+/// [`ChangeRows::build`] decodes + transforms + Arrow-builds them later on the
+/// per-dataset consumer (see [`decode_raw_changes`] and [`build_change_batch`]),
+/// moving the entire decode + O(rows × columns) build off the single shared
+/// read path. Metadata is answered from the buffered bytes without decoding.
+pub struct PgChangeRows {
+    schema: SchemaRef,
+    relation: Relation,
+    raw: Vec<bytes::Bytes>,
+    source_commit_ts_ms: Option<i64>,
+    /// Precomputed `num_rows_hint` (upper bound) and `encoded_len` so the
+    /// consumer's coalescing/metric reads are O(1) rather than rescanning `raw`.
+    row_hint: usize,
+    byte_len: usize,
+}
+
+impl PgChangeRows {
+    #[must_use]
+    pub fn new(
+        schema: SchemaRef,
+        relation: Relation,
+        raw: Vec<bytes::Bytes>,
+        source_commit_ts_ms: Option<i64>,
+    ) -> Self {
+        // Computed once here (per commit-per-relation) so the metadata accessors
+        // are O(1): the consumer calls them on the coalescing/metric hot path,
+        // possibly several times per envelope. Upper bound = one row per message,
+        // plus one more per UPDATE ('U') since a primary-key-changing UPDATE
+        // expands to a delete + upsert.
+        let updates = raw.iter().filter(|m| m.first() == Some(&b'U')).count();
+        let row_hint = raw.len() + updates;
+
+        // Coalescing byte-budget estimate. Raw wire bytes alone under-count the
+        // eventual Arrow memory for NULL / unchanged-TOAST / DELETE-key-only rows
+        // (pgoutput sends those columns as 1-byte markers, but Arrow allocates the
+        // full column width), so floor the estimate at the fixed-width Arrow
+        // footprint derived from the schema. `max` tracks Arrow in both regimes
+        // without a per-value scan: value-heavy rows → wire dominates;
+        // NULL/delete-heavy → the fixed-width floor dominates.
+        let wire_bytes: usize = raw.iter().map(bytes::Bytes::len).sum();
+        let per_row_fixed: usize = schema
+            .fields()
+            .iter()
+            .map(|f| arrow_fixed_width(f.data_type()))
+            .sum();
+        let byte_len = wire_bytes.max(row_hint.saturating_mul(per_row_fixed));
+
+        Self {
+            schema,
+            relation,
+            raw,
+            source_commit_ts_ms,
+            row_hint,
+            byte_len,
+        }
+    }
+}
+
+/// Fixed per-value Arrow byte width for a data type, or 0 for variable-width
+/// types (Utf8/Binary/List/Struct/…), whose bytes are already reflected in the
+/// buffered pgoutput wire size. Used only to floor `PgChangeRows`'s coalescing
+/// byte estimate at the real Arrow footprint (see `PgChangeRows::new`).
+fn arrow_fixed_width(data_type: &DataType) -> usize {
+    match data_type {
+        DataType::Boolean | DataType::Int8 | DataType::UInt8 => 1,
+        DataType::Int16 | DataType::UInt16 | DataType::Float16 => 2,
+        DataType::Int32
+        | DataType::UInt32
+        | DataType::Float32
+        | DataType::Date32
+        | DataType::Time32(_)
+        | DataType::Interval(IntervalUnit::YearMonth) => 4,
+        DataType::Int64
+        | DataType::UInt64
+        | DataType::Float64
+        | DataType::Date64
+        | DataType::Time64(_)
+        | DataType::Duration(_)
+        | DataType::Interval(IntervalUnit::DayTime)
+        | DataType::Timestamp(_, _) => 8,
+        DataType::Decimal128(_, _) | DataType::Interval(IntervalUnit::MonthDayNano) => 16,
+        DataType::Decimal256(_, _) => 32,
+        DataType::FixedSizeBinary(len) => usize::try_from(*len).unwrap_or(0),
+        _ => 0,
+    }
+}
+
+impl ChangeRows for PgChangeRows {
+    fn is_empty(&self) -> bool {
+        // Exact: every buffered change message yields at least one output row,
+        // so no messages ⟺ no rows.
+        self.raw.is_empty()
+    }
+
+    fn num_rows_hint(&self) -> usize {
+        // Upper bound (precomputed in `new`): one row per message + one per
+        // UPDATE (a primary-key-changing UPDATE expands to delete + upsert).
+        // Over-estimating only affects builder pre-allocation.
+        self.row_hint
+    }
+
+    fn encoded_len(&self) -> usize {
+        // Schema-aware coalescing-budget estimate (precomputed in `new`):
+        // `max(wire_bytes, rows × fixed_width_footprint)`, a decode-free proxy
+        // for the eventual Arrow memory that stays representative for both
+        // value-heavy and NULL/delete-heavy bursts (see `new`). Still approximate
+        // — Arrow allocation rounding and variable-column offsets aren't modeled —
+        // so `max_coalesced_bytes` remains a soft bound backed by
+        // `max_coalesced_envelopes`.
+        self.byte_len
+    }
+
+    fn source_commit_ts_ms(&self) -> Option<i64> {
+        self.source_commit_ts_ms
+    }
+
+    fn is_heartbeat(&self) -> bool {
+        // WAL change batches always carry rows; readiness/keepalive heartbeats
+        // are emitted separately as zero-row envelopes.
+        false
+    }
+
+    fn build(self: Box<Self>) -> Result<ChangeBatch, ChangeBatchError> {
+        let changes = decode_raw_changes(&self.relation, &self.raw).map_err(|e| {
+            ChangeBatchError::DeferredBuild {
+                message: e.to_string(),
+            }
+        })?;
+        build_change_batch(&self.schema, &self.relation, &changes)
+            .map(|b| b.with_source_commit_ts_ms(self.source_commit_ts_ms))
+            .map_err(|e| ChangeBatchError::DeferredBuild {
+                message: e.to_string(),
+            })
+    }
 }
 
 /// Return a clone of `schema` where every field is marked nullable.
@@ -2959,5 +3151,209 @@ mod tests {
                 .value(0),
             17_279_949
         );
+    }
+}
+
+/// Differential tests for the deferred raw-buffering path (increment 2): the
+/// shared pump buffers raw pgoutput change bytes and the per-dataset consumer
+/// decodes them via [`decode_raw_changes`]. Each test asserts the raw path
+/// yields a `ChangeBatch` byte-identical to the eager path (constructing the
+/// `DecodedChange`s directly, as the pump used to do inline), so relocating the
+/// tuple decode + TOAST/PK-split transform off the pump changed nothing observable.
+#[cfg(test)]
+mod raw_decode_tests {
+    use super::*;
+    use crate::postgres_replication::pgoutput::Column;
+    use arrow::datatypes::{DataType, Field, Schema};
+    use bytes::Bytes;
+    use std::sync::Arc;
+
+    fn relation() -> Relation {
+        Relation {
+            relation_id: 1,
+            namespace: "public".to_string(),
+            name: "t".to_string(),
+            replica_identity: b'd',
+            columns: vec![
+                Column {
+                    is_key: true,
+                    name: "id".to_string(),
+                    type_oid: 25, // text — keep typing trivial for the differential
+                    type_modifier: -1,
+                },
+                Column {
+                    is_key: false,
+                    name: "v".to_string(),
+                    type_oid: 25,
+                    type_modifier: -1,
+                },
+            ],
+        }
+    }
+
+    fn schema() -> SchemaRef {
+        Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Utf8, false),
+            Field::new("v", DataType::Utf8, true),
+        ]))
+    }
+
+    fn tuple(vals: &[&str]) -> TupleData {
+        TupleData {
+            columns: vals
+                .iter()
+                .map(|s| Some(Value::Text(Bytes::copy_from_slice(s.as_bytes()))))
+                .collect(),
+        }
+    }
+
+    // ---- raw pgoutput message encoders (text-format tuples) ----
+    fn enc_text_tuple(out: &mut Vec<u8>, vals: &[&str]) {
+        out.extend_from_slice(&u16::try_from(vals.len()).expect("cols").to_be_bytes());
+        for v in vals {
+            out.push(b't');
+            out.extend_from_slice(&u32::try_from(v.len()).expect("len").to_be_bytes());
+            out.extend_from_slice(v.as_bytes());
+        }
+    }
+
+    fn raw_insert(vals: &[&str]) -> Bytes {
+        let mut o = vec![b'I'];
+        o.extend_from_slice(&1u32.to_be_bytes());
+        o.push(b'N');
+        enc_text_tuple(&mut o, vals);
+        Bytes::from(o)
+    }
+
+    fn raw_delete(old: &[&str]) -> Bytes {
+        let mut o = vec![b'D'];
+        o.extend_from_slice(&1u32.to_be_bytes());
+        o.push(b'K');
+        enc_text_tuple(&mut o, old);
+        Bytes::from(o)
+    }
+
+    fn raw_update(old_key: &[&str], new: &[&str]) -> Bytes {
+        let mut o = vec![b'U'];
+        o.extend_from_slice(&1u32.to_be_bytes());
+        o.push(b'K');
+        enc_text_tuple(&mut o, old_key);
+        o.push(b'N');
+        enc_text_tuple(&mut o, new);
+        Bytes::from(o)
+    }
+
+    fn raw_truncate() -> Bytes {
+        let mut o = vec![b'T'];
+        o.extend_from_slice(&1u32.to_be_bytes()); // nrel
+        o.push(0); // flags
+        o.extend_from_slice(&1u32.to_be_bytes()); // relation id
+        Bytes::from(o)
+    }
+
+    #[test]
+    fn raw_path_matches_eager_insert_pk_update_delete() {
+        let rel = relation();
+        let sch = schema();
+
+        // insert(id=1) ; primary-key-changing update(1 -> 2) ; delete(id=2)
+        let raw = vec![
+            raw_insert(&["1", "a"]),
+            raw_update(&["1", "a"], &["2", "b"]),
+            raw_delete(&["2", "b"]),
+        ];
+
+        // Eager reference: build the DecodedChanges directly (bypassing the raw
+        // bytes) with the same transform the pump used to run inline.
+        let mut eager: Vec<DecodedChange> = Vec::new();
+        eager.push(DecodedChange {
+            op: ChangeOp::Create,
+            row: tuple(&["1", "a"]),
+        });
+        push_update_change(
+            &mut eager,
+            &rel,
+            Some(tuple(&["1", "a"])),
+            tuple(&["2", "b"]),
+        );
+        eager.push(DecodedChange {
+            op: ChangeOp::Delete,
+            row: tuple(&["2", "b"]),
+        });
+
+        let raw_changes = decode_raw_changes(&rel, &raw).expect("raw decode");
+        // insert + (delete-old-key + upsert-new) + delete
+        assert_eq!(
+            raw_changes.len(),
+            4,
+            "PK-changing update must expand to 2 rows"
+        );
+
+        let eager_batch = build_change_batch(&sch, &rel, &eager).expect("eager build");
+        let raw_batch = build_change_batch(&sch, &rel, &raw_changes).expect("raw build");
+        assert_eq!(
+            eager_batch.record, raw_batch.record,
+            "raw-buffered path must produce an identical ChangeBatch to the eager path"
+        );
+    }
+
+    #[test]
+    fn raw_path_matches_eager_update_no_key_change_and_truncate() {
+        let rel = relation();
+        let sch = schema();
+
+        // non-key update(id=1, v a->b) ; truncate
+        let raw = vec![raw_update(&["1", "a"], &["1", "b"]), raw_truncate()];
+
+        let mut eager: Vec<DecodedChange> = Vec::new();
+        push_update_change(
+            &mut eager,
+            &rel,
+            Some(tuple(&["1", "a"])),
+            tuple(&["1", "b"]),
+        );
+        eager.push(DecodedChange {
+            op: ChangeOp::Truncate,
+            row: TupleData { columns: vec![] },
+        });
+
+        let raw_changes = decode_raw_changes(&rel, &raw).expect("raw decode");
+        // A non-PK update is a single upsert row (no delete-of-old-key).
+        assert_eq!(
+            raw_changes.len(),
+            2,
+            "non-key update stays one row (+ truncate)"
+        );
+
+        let eager_batch = build_change_batch(&sch, &rel, &eager).expect("eager build");
+        let raw_batch = build_change_batch(&sch, &rel, &raw_changes).expect("raw build");
+        assert_eq!(eager_batch.record, raw_batch.record);
+    }
+
+    #[test]
+    fn pgchangerows_metadata_is_answered_without_decoding() {
+        // is_empty is exact; num_rows_hint is an upper bound (+1 per UPDATE).
+        let empty = PgChangeRows::new(schema(), relation(), vec![], Some(7));
+        assert!(empty.is_empty());
+        assert_eq!(empty.num_rows_hint(), 0);
+
+        let rows = PgChangeRows::new(
+            schema(),
+            relation(),
+            vec![
+                raw_insert(&["1", "a"]),
+                raw_update(&["1", "a"], &["2", "b"]),
+            ],
+            Some(7),
+        );
+        assert!(!rows.is_empty());
+        // 2 messages + 1 (the UPDATE may split) = 3 upper bound; actual after
+        // build is 3 (insert + delete-old + upsert-new).
+        assert_eq!(rows.num_rows_hint(), 3);
+        assert_eq!(rows.source_commit_ts_ms(), Some(7));
+        assert!(!rows.is_heartbeat());
+
+        let batch = Box::new(rows).build().expect("build");
+        assert_eq!(batch.record.num_rows(), 3);
     }
 }
