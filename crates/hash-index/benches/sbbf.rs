@@ -30,8 +30,8 @@ limitations under the License.
 //! hierarchy. A split-block probe touches exactly one 32-byte block chosen by a
 //! random hash, so:
 //!   - if throughput stays high as the filter grows past the LLC, the probe is
-//!     **compute-bound** (the 8-word block loop dominates) and SIMD-within-a-
-//!     block can help;
+//!     **compute-bound** (the 8-word block loop dominates) and
+//!     SIMD-within-a-block can help;
 //!   - if throughput collapses once the filter exceeds cache, the probe is
 //!     **memory-latency-bound** (one cache miss per probe dominates the 8-word
 //!     compute), and SIMD-within-a-block cannot help the real (large-filter)
