@@ -80,7 +80,7 @@ jobs:
               repo: context.repo.repo,
               ref: sha,
             });
-            // 'signoff' must match STATUS_CONTEXT (SIGNOFF_CONTEXT) in scripts/signoff.
+            // 'signoff' matches the hardcoded STATUS_CONTEXT in scripts/signoff.
             const signoff = data.statuses.find((s) => s.context === 'signoff');
             if (signoff && signoff.state === 'success') {
               core.notice(`Signed off by ${signoff.creator?.login ?? 'unknown'}: ${signoff.description ?? ''}`);

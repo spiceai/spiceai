@@ -24,14 +24,15 @@
 #   scripts/signoff install --yes   Apply the ruleset change (default is a dry-run)
 #
 # Environment:
-#   SIGNOFF_CONTEXT   Commit-status context to post (default: signoff)
 #   SIGNOFF_BRANCH    Branch/ruleset to target for install/check (default: trunk)
 #   SIGNOFF_DEBUG     Set to any value for verbose debug logging
 
 set -euo pipefail
 
 readonly VERSION="1.0.0"
-readonly STATUS_CONTEXT="${SIGNOFF_CONTEXT:-signoff}"
+# Fixed, not configurable: it must match the hardcoded context the Attestation
+# workflow (pr.yml) looks for, so an env override would silently break the gate.
+readonly STATUS_CONTEXT="signoff"
 readonly TARGET_BRANCH="${SIGNOFF_BRANCH:-trunk}"
 DEBUG="${SIGNOFF_DEBUG:-}"
 
@@ -161,7 +162,9 @@ cmd_status() {
   repo=$(repo_slug)
   # Fetch the combined status once, then pick the first matching entry with jq.
   # (Piping `gh --jq ... | head -n1` would SIGPIPE the writer under pipefail.)
-  combined=$(gh api "repos/${repo}/commits/${sha}/status" 2>/dev/null || echo '{}')
+  # Fail on a real API error rather than falling back to {} → "not signed off".
+  combined=$(gh api "repos/${repo}/commits/${sha}/status") \
+    || fail "failed to read commit status for ${sha} on ${repo} (auth/rate-limit/network?)"
   state=$(jq -r "first(.statuses[]? | select(.context==\"${STATUS_CONTEXT}\") | .state) // \"\"" <<<"$combined")
   if [[ "$state" == "success" ]]; then
     desc=$(jq -r "first(.statuses[]? | select(.context==\"${STATUS_CONTEXT}\") | .description) // \"\"" <<<"$combined")
