@@ -216,8 +216,7 @@ impl CheckpointMeta {
 /// Build the `schema_json` value persisted with each checkpoint.
 ///
 /// When the connector could not serialize the dataset schema, returns `None`
-/// (drift detection disabled for that run — resume will refuse rather than
-/// guess).
+/// (resume will refuse rather than decode against an unverified layout).
 #[must_use]
 pub fn encode_checkpoint_schema_json(
     dataset_schema_json: Option<&str>,
@@ -231,7 +230,8 @@ pub fn encode_checkpoint_schema_json(
         Err(e) => {
             tracing::warn!(
                 error = %e,
-                "failed to serialize mysql binlog checkpoint meta; drift detection disabled"
+                "failed to serialize mysql binlog checkpoint meta; resume will refuse \
+                 rather than decode against an unverified layout"
             );
             None
         }
@@ -247,6 +247,9 @@ pub enum ResumeDrift {
     /// Checkpoint has missing or invalid schema/layout metadata (absent,
     /// corrupt, or an unsupported meta version).
     MissingCheckpointMeta,
+    /// Current run could not serialize the dataset schema, so resume has no
+    /// comparable baseline against the persisted checkpoint.
+    CurrentDatasetSchemaUnavailable,
     /// Dataset Arrow schema changed between runs.
     DatasetSchemaChanged,
     /// Source ordinal layout (names/types/order/PK) changed between runs.
@@ -266,6 +269,10 @@ impl std::fmt::Display for ResumeDrift {
                     "persisted checkpoint has missing or invalid schema/layout metadata"
                 )
             }
+            Self::CurrentDatasetSchemaUnavailable => write!(
+                f,
+                "current dataset schema could not be serialized for resume compatibility"
+            ),
             Self::DatasetSchemaChanged => {
                 write!(f, "dataset schema changed since the checkpoint was written")
             }
@@ -303,7 +310,7 @@ pub fn check_resume_compatibility(
         Some(_) => return Err(ResumeDrift::DatasetSchemaChanged),
         // Current run could not serialize the dataset schema — refuse rather
         // than resume without a comparable baseline.
-        None => return Err(ResumeDrift::MissingCheckpointMeta),
+        None => return Err(ResumeDrift::CurrentDatasetSchemaUnavailable),
     }
     if meta.source_layout_fingerprint != current_layout_fingerprint {
         return Err(ResumeDrift::SourceLayoutChanged);
@@ -870,6 +877,18 @@ mod tests {
         assert_eq!(
             check_resume_compatibility(None, Some("{}"), &layout.fingerprint()),
             Err(ResumeDrift::MissingCheckpointMeta)
+        );
+    }
+
+    #[test]
+    fn resume_refuses_when_current_schema_unavailable() {
+        let layout = layout(&[("id", "int")]);
+        let meta = CheckpointMeta::new(r#"{"fields":[]}"#.to_string(), layout.fingerprint())
+            .to_schema_json()
+            .expect("serialize");
+        assert_eq!(
+            check_resume_compatibility(Some(&meta), None, &layout.fingerprint()),
+            Err(ResumeDrift::CurrentDatasetSchemaUnavailable)
         );
     }
 
