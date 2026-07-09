@@ -16,7 +16,7 @@ revision each version of the doc reflects.
 | File | Role |
 |---|---|
 | `cayenne.md` | Source document. **This is the source of truth — edit this.** |
-| `build_pdf.py` | Converter: extracts ` ```mermaid ` blocks → kroki.io SVG → python-markdown → WeasyPrint → `cayenne.html` + `Cayenne.pdf`. The cover page, running footer, and landscape-figure CSS live here. |
+| `build_pdf.py` | Converter: extracts <code>```mermaid</code> blocks → kroki.io SVG → python-markdown → WeasyPrint → `cayenne.html` + `Cayenne.pdf`. The cover page, running footer, and landscape-figure CSS live here. |
 | `gen_waterfall.py` | Generator for the committed `waterfall.svg` landscape "life of a change" waterfall figure. |
 | `waterfall.svg` | The waterfall figure, **committed** and referenced from `cayenne.md` as `<img src="waterfall.svg">` so it renders in both the GitHub markdown view and the PDF. Regenerate with `gen_waterfall.py`. |
 | `Cayenne.pdf` | Built output. **Not committed** (git-ignored) — CI builds it as a linkable artifact off `trunk`; build it locally to preview. |
@@ -24,7 +24,7 @@ revision each version of the doc reflects.
 Committed figures are referenced as separate `.svg` files (currently `waterfall.svg`)
 rather than pasted inline, because GitHub's markdown renderer strips inline
 `<svg>` markup — a referenced `.svg` renders in both the GitHub view and the
-PDF. Mermaid diagrams stay as ` ```mermaid ` fenced blocks: GitHub renders them
+PDF. Mermaid diagrams stay as <code>```mermaid</code> fenced blocks: GitHub renders them
 natively, and `build_pdf.py` rasterizes them via kroki for the PDF.
 
 ## Continuous integration
