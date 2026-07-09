@@ -30,7 +30,9 @@ use arrow::{
         UInt32Builder,
     },
     buffer::OffsetBuffer,
-    datatypes::{DataType, Field, Int8Type, Int16Type, Int32Type, Schema, SchemaRef, TimeUnit},
+    datatypes::{
+        DataType, Field, Int8Type, Int16Type, Int32Type, IntervalUnit, Schema, SchemaRef, TimeUnit,
+    },
 };
 use async_trait::async_trait;
 use snafu::ensure;
@@ -426,20 +428,24 @@ impl PgChangeRows {
 fn arrow_fixed_width(data_type: &DataType) -> usize {
     match data_type {
         DataType::Boolean | DataType::Int8 | DataType::UInt8 => 1,
-        DataType::Int16 | DataType::UInt16 => 2,
+        DataType::Int16 | DataType::UInt16 | DataType::Float16 => 2,
         DataType::Int32
         | DataType::UInt32
         | DataType::Float32
         | DataType::Date32
-        | DataType::Time32(_) => 4,
+        | DataType::Time32(_)
+        | DataType::Interval(IntervalUnit::YearMonth) => 4,
         DataType::Int64
         | DataType::UInt64
         | DataType::Float64
         | DataType::Date64
         | DataType::Time64(_)
+        | DataType::Duration(_)
+        | DataType::Interval(IntervalUnit::DayTime)
         | DataType::Timestamp(_, _) => 8,
-        DataType::Decimal128(_, _) => 16,
+        DataType::Decimal128(_, _) | DataType::Interval(IntervalUnit::MonthDayNano) => 16,
         DataType::Decimal256(_, _) => 32,
+        DataType::FixedSizeBinary(len) => usize::try_from(*len).unwrap_or(0),
         _ => 0,
     }
 }
