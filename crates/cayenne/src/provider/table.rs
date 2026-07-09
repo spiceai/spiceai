@@ -6530,11 +6530,14 @@ impl CayenneTableProvider {
             .catalog
             .list_cold_tier_files(&self.table_metadata.table_id)
             .await?;
-        // Only files with live rows carry keys worth probing; a zero-row/zero-byte
-        // manifest row (e.g. a placeholder) contributes nothing.
+        // Liveness is size-based, NOT row_count-based: promotion commits files
+        // with `row_count = 0` when footer stats inference fails, and such a
+        // file still holds keys. Those files carry no bloom (sizing needs the
+        // count), so keeping them live routes the rebuild to the exact-scan
+        // fallback below instead of silently dropping their keys.
         let live: Vec<_> = cold_files
             .into_iter()
-            .filter(|f| f.file_size_bytes > 0 && f.row_count > 0)
+            .filter(|f| f.file_size_bytes > 0)
             .collect();
         if live.is_empty() {
             // No cold-resident keys: an empty bloom view is complete and correct
