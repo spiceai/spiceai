@@ -12840,9 +12840,13 @@ impl CayenneTableProvider {
             Self::ensure_snapshot_dir_exists(std::path::Path::new(local)).await?;
         }
 
-        let target_size_bytes =
-            self.table_metadata.vortex_config.cold_target_file_size_mb * 1024 * 1024;
-        let write_format = self.write_shard_format(1, target_size_bytes, None);
+        let cold_target_file_size_mb = self.table_metadata.vortex_config.cold_target_file_size_mb;
+        let target_size_bytes = cold_target_file_size_mb.saturating_mul(1024 * 1024);
+
+        let shard = self.write_shard_config(1, target_size_bytes, None);
+        let write_format = self
+            .context
+            .cold_write_format(cold_target_file_size_mb, shard);
         let cold_listing_table = Self::create_listing_table(
             &cold_dir_url,
             self.table_schema(),
