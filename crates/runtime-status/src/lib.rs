@@ -390,40 +390,40 @@ impl RuntimeStatus {
     }
 
     pub fn mark_initializing(&self, key: ComponentKey) {
-        self.update(key, ComponentStatus::Initializing);
+        self.update(&key, &ComponentStatus::Initializing);
     }
 
     pub fn mark_ready(&self, key: ComponentKey) {
-        self.update(key, ComponentStatus::Ready);
+        self.update(&key, &ComponentStatus::Ready);
     }
 
     pub fn mark_disabled(&self, key: ComponentKey) {
-        self.update(key, ComponentStatus::Disabled);
+        self.update(&key, &ComponentStatus::Disabled);
     }
 
     pub fn mark_refreshing(&self, key: ComponentKey) {
-        self.update(key, ComponentStatus::Refreshing);
+        self.update(&key, &ComponentStatus::Refreshing);
     }
 
     pub fn mark_shutting_down(&self, key: ComponentKey) {
-        self.update(key, ComponentStatus::ShuttingDown);
+        self.update(&key, &ComponentStatus::ShuttingDown);
     }
 
     pub fn mark_not_loaded(&self, key: ComponentKey) {
-        self.update(key, ComponentStatus::NotLoaded);
+        self.update(&key, &ComponentStatus::NotLoaded);
     }
 
     pub fn mark_error(&self, key: ComponentKey) {
-        self.update(key, ComponentStatus::error());
+        self.update(&key, &ComponentStatus::error());
     }
 
     pub fn mark_error_with_message(&self, key: ComponentKey, message: impl Into<String>) {
-        self.update(key, ComponentStatus::error_with_message(message));
+        self.update(&key, &ComponentStatus::error_with_message(message));
     }
 
-    pub fn update(&self, key: ComponentKey, status: ComponentStatus) {
+    pub fn update(&self, key: &ComponentKey, status: &ComponentStatus) {
         self.update_component_status(&key.full_name(), status.clone());
-        self.record_metrics(&key, &status);
+        Self::record_metrics(key, status);
     }
 
     /// Updates the status of a component and tracks if it has ever been ready.
@@ -461,7 +461,7 @@ impl RuntimeStatus {
         }
     }
 
-    fn record_metrics(&self, key: &ComponentKey, status: &ComponentStatus) {
+    fn record_metrics(key: &ComponentKey, status: &ComponentStatus) {
         let metric_value = status.discriminant();
 
         match key {
@@ -519,48 +519,48 @@ impl RuntimeStatus {
     }
 
     pub fn update_catalog(&self, catalog_name: impl Into<String>, status: ComponentStatus) {
-        self.update(ComponentKey::catalog(catalog_name), status);
+        self.update(&ComponentKey::catalog(catalog_name), &status);
     }
 
     pub fn update_dataset(&self, dataset: &TableReference, status: ComponentStatus) {
-        self.update(ComponentKey::dataset(dataset), status);
+        self.update(&ComponentKey::dataset(dataset), &status);
     }
 
     pub fn update_model(&self, model_name: &str, status: ComponentStatus) {
-        self.update(ComponentKey::model(model_name), status);
+        self.update(&ComponentKey::model(model_name), &status);
     }
 
     pub fn update_tool(&self, tool_name: &str, status: ComponentStatus) {
-        self.update(ComponentKey::tool(tool_name), status);
+        self.update(&ComponentKey::tool(tool_name), &status);
     }
 
     pub fn update_tool_catalog(&self, catalog_name: &str, status: ComponentStatus) {
-        self.update(ComponentKey::tool_catalog(catalog_name), status);
+        self.update(&ComponentKey::tool_catalog(catalog_name), &status);
     }
 
     pub fn update_llm(&self, model_name: &str, status: ComponentStatus) {
-        self.update(ComponentKey::llm(model_name), status);
+        self.update(&ComponentKey::llm(model_name), &status);
     }
 
     pub fn update_embedding(&self, model_name: &str, status: ComponentStatus) {
-        self.update(ComponentKey::embedding(model_name), status);
+        self.update(&ComponentKey::embedding(model_name), &status);
     }
 
     pub fn update_reranker(&self, model_name: &str, status: ComponentStatus) {
-        self.update(ComponentKey::reranker(model_name), status);
+        self.update(&ComponentKey::reranker(model_name), &status);
     }
     pub fn update_view(&self, view_name: &TableReference, status: ComponentStatus) {
-        self.update(ComponentKey::view(view_name), status);
+        self.update(&ComponentKey::view(view_name), &status);
     }
 
     /// Update the status of a worker
     pub fn update_worker(&self, name: &str, status: ComponentStatus) {
-        self.update(ComponentKey::worker(name), status);
+        self.update(&ComponentKey::worker(name), &status);
     }
 
     /// Update the status of a cluster node
     pub fn update_cluster(&self, node_name: &str, status: ComponentStatus) {
-        self.update(ComponentKey::cluster(node_name), status);
+        self.update(&ComponentKey::cluster(node_name), &status);
     }
 
     /// Get the status of a worker
@@ -626,6 +626,10 @@ impl RuntimeStatus {
         }
     }
 
+    /// # Errors
+    ///
+    /// Returns [`ReadinessError::InvalidReadyExecutorsPercent`] if the policy's
+    /// `min_ready_executors_percent` exceeds 100.
     pub fn readiness_report(
         &self,
         policy: ReadinessPolicy,
@@ -783,6 +787,7 @@ impl RuntimeStatus {
         }
     }
 
+    #[must_use]
     pub fn mark_resolved_dataset_ready(&self, resolved: &ResolvedTableReference) -> bool {
         let Some(pending) = self.dataset_ready_update_targets(resolved) else {
             return false;

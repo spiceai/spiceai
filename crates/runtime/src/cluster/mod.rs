@@ -22,7 +22,7 @@ use crate::cluster::partition::{
 };
 use crate::config::{ClusterConfig, ClusterRole};
 use crate::jobs::JobExecutor;
-use crate::status::ComponentStatus;
+use crate::status::{ComponentKey, ComponentStatus};
 use crate::{
     CLUSTER_INTERNAL_SERVER, CLUSTER_PARTITION_ASSIGNMENT_TASK, CLUSTER_SCHEDULER_REGISTRY,
     FailedToRegisterSchedulerSnafu, FailedToStartClusterExecutorSnafu,
@@ -1083,8 +1083,7 @@ pub async fn initialize_cluster_scheduler(rt: &Arc<Runtime>) -> crate::Result<()
         .boxed()
         .context(FailedToStartClusterSchedulerSnafu)?;
 
-    rt.status
-        .mark_ready(status::ComponentKey::cluster("scheduler"));
+    rt.status.mark_ready(ComponentKey::cluster("scheduler"));
 
     Ok(())
 }
@@ -1172,7 +1171,7 @@ pub(crate) async fn initialize_cluster_scheduler_future(
             // Register partition_metadata as Initializing so `/v1/ready`
             // waits for metadata seeding to complete before reporting ready.
             rt.status
-                .mark_initializing(status::ComponentKey::internal("partition_metadata"));
+                .mark_initializing(ComponentKey::internal("partition_metadata"));
 
             let pa_task = PartitionAssignmentTask::new(
                 rt.datafusion(),
@@ -1821,8 +1820,7 @@ pub async fn initialize_cluster_executor(
 
         executor_bind_object_stores(Arc::clone(&rt)).await?;
 
-        rt.status
-            .mark_ready(status::ComponentKey::cluster("executor"));
+        rt.status.mark_ready(ComponentKey::cluster("executor"));
 
         poll_manager
             .await
@@ -2214,8 +2212,7 @@ async fn create_scheduler_server(
         ..Default::default()
     };
 
-    rt.status
-        .mark_ready(status::ComponentKey::cluster("scheduler"));
+    rt.status.mark_ready(ComponentKey::cluster("scheduler"));
 
     let shuffle_location_display = shuffle_location
         .as_deref()
