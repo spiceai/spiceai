@@ -131,18 +131,12 @@ impl cayenne::SlotAdvancer for CayenneSlotAdvancer {
         // whole prefix to a single max-LSN commit and acking once is equivalent
         // to acking each epoch in turn — O(epochs) work becomes one `fetch_max`.
         // A dataset's deferred queue holds a single committer type, so this is
-        // all-or-nothing: only when the committers are coalescable (an infallible,
-        // order-insensitive shared slot — the `as_any` probe) do we collapse to a
-        // single entry tagged with the highest folded epoch. Order-sensitive or
-        // fallible sources are left with their per-epoch structure completely
-        // untouched, preserving the in-order, requeue-on-failure drain byte for
-        // byte (folding an infallible committer can never hit that requeue path).
-        let coalescable = ready
-            .iter()
-            .flat_map(|(_, committers)| committers.iter())
-            .next()
-            .is_some_and(|committer| committer.as_any().is_some());
-        let mut ready = if coalescable {
+        // all-or-nothing: only when *every* committer is coalescable do we
+        // collapse to a single entry tagged with the highest folded epoch.
+        // Order-sensitive or fallible sources are left with their per-epoch
+        // structure completely untouched, preserving the in-order,
+        // requeue-on-failure drain byte for byte.
+        let mut ready = if prefix_is_coalescable(&ready) {
             // `coalescable` proved the prefix holds at least one committer, so
             // `max` is `Some` and the fold (which only ever reduces a non-empty
             // input) stays non-empty — no empty-case guard needed.
@@ -191,6 +185,23 @@ impl cayenne::SlotAdvancer for CayenneSlotAdvancer {
 /// to as few as one commit — which turns the ordered background commit chain
 /// into a single `fetch_max` for that source. Anything that refuses to fold
 /// (the default for order-sensitive sources) is retained in order, so those
+/// Whether the whole deferred-drain prefix opts into coalescing — i.e. every
+/// committer is coalesce-identifiable (`as_any` is `Some`, which only the
+/// infallible, order-insensitive committers override). Empty prefix -> `false`.
+/// A dataset's queue holds a single committer type, so in practice this is
+/// all-or-nothing; requiring *all* of them (not just the first) is a cheap guard
+/// that keeps a hypothetical mixed queue on the safe per-epoch, in-order,
+/// requeue-on-failure drain rather than wrongly collapsing epochs.
+fn prefix_is_coalescable(
+    ready: &VecDeque<(u64, Vec<Box<dyn cdc::CommitChange + Send + Sync>>)>,
+) -> bool {
+    ready.iter().any(|(_, committers)| !committers.is_empty())
+        && ready
+            .iter()
+            .flat_map(|(_, committers)| committers.iter())
+            .all(|committer| committer.as_any().is_some())
+}
+
 /// connectors are byte-identical.
 fn fold_committers(
     committers: Vec<Box<dyn cdc::CommitChange + Send + Sync>>,
@@ -5107,6 +5118,52 @@ mod tests {
             folded.len(),
             3,
             "order-sensitive committers keep their per-item structure"
+        );
+    }
+
+    /// The drain-collapse gate: only an all-coalescable prefix collapses. A mixed
+    /// prefix (coalescable followed by non-coalescable) must NOT collapse, so it
+    /// keeps the safe per-epoch, requeue-on-failure drain.
+    #[test]
+    fn prefix_is_coalescable_requires_every_committer_to_opt_in() {
+        let u64_log = Arc::new(TokioMutex::new(Vec::new()));
+        let cc_log = CommitLog::new();
+        let foldable = || {
+            Box::new(FoldableCommitter {
+                value: 1,
+                log: Arc::clone(&u64_log),
+            }) as Box<dyn cdc::CommitChange + Send + Sync>
+        };
+        let plain = || {
+            Box::new(TrackingCommitter {
+                id: 1,
+                log: Arc::clone(&cc_log),
+                outcome: Ok(()),
+            }) as Box<dyn cdc::CommitChange + Send + Sync>
+        };
+
+        assert!(!prefix_is_coalescable(&VecDeque::new()), "empty prefix");
+        assert!(
+            !prefix_is_coalescable(&VecDeque::from([(1u64, vec![])])),
+            "prefix of only empty committer vecs"
+        );
+        assert!(
+            prefix_is_coalescable(&VecDeque::from([
+                (1u64, vec![foldable()]),
+                (2u64, vec![foldable()]),
+            ])),
+            "every committer coalescable"
+        );
+        assert!(
+            !prefix_is_coalescable(&VecDeque::from([
+                (1u64, vec![foldable()]),
+                (2u64, vec![plain()]),
+            ])),
+            "mixed prefix must not collapse (the first-only-check hazard)"
+        );
+        assert!(
+            !prefix_is_coalescable(&VecDeque::from([(1u64, vec![plain()])])),
+            "no committer coalescable"
         );
     }
 
