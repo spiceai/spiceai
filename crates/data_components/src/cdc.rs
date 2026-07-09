@@ -251,7 +251,7 @@ pub fn log_committer_progress(
         (Some(now), Some(ts)) => Some(now.saturating_sub(ts)),
         _ => None,
     };
-    tracing::error!(
+    tracing::debug!(
         target: "spice_cdc::commit",
         connector,
         dataset,
