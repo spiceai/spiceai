@@ -34,6 +34,7 @@ readonly VERSION="1.0.0"
 readonly STATUS_CONTEXT="${SIGNOFF_CONTEXT:-signoff}"
 readonly TARGET_BRANCH="${SIGNOFF_BRANCH:-trunk}"
 DEBUG="${SIGNOFF_DEBUG:-}"
+CHECKS_ELAPSED=0  # set by run_checks; returned via a global, not stdout
 
 # The single source of truth for the checks required to merge. `install` writes
 # exactly this list into the trunk ruleset's required status checks. Every name
@@ -103,8 +104,13 @@ ensure_clean_and_pushed() {
 # Run the same fast checks the old PR build ran: lint + build + unit tests.
 # The heavier suite (release build, integration, e2e, ...) runs in the merge
 # queue, so it deliberately isn't part of the local sign-off.
+#
+# Output streams straight to the terminal and the duration is returned via the
+# CHECKS_ELAPSED global — NOT via stdout. (Calling this as `x=$(run_checks)` would
+# capture all of make's stdout into `x`, corrupting the status description and
+# hiding build output.)
 run_checks() {
-  local start elapsed
+  local start
   start=$(date +%s)
 
   info "Running Rust lint (make lint-rust)…"
@@ -113,8 +119,7 @@ run_checks() {
   info "Building the CLI and running unit tests (make build-cli nextest)…"
   make build-cli nextest
 
-  elapsed=$(( $(date +%s) - start ))
-  echo "$elapsed"
+  CHECKS_ELAPSED=$(( $(date +%s) - start ))
 }
 
 cmd_signoff() {
@@ -131,14 +136,14 @@ cmd_signoff() {
   require_tools
   $force || ensure_clean_and_pushed
 
-  local sha user repo elapsed description
+  local sha user repo description
   sha=$(git rev-parse HEAD) || fail "could not resolve HEAD"
   user=$(gh api user --jq .login 2>/dev/null || git config user.name || echo "unknown")
   repo=$(repo_slug)
 
   if $verify; then
-    elapsed=$(run_checks)
-    description="Signed off by ${user} — lint+test passed in ${elapsed}s"
+    run_checks
+    description="Signed off by ${user} — lint+test passed in ${CHECKS_ELAPSED}s"
   else
     description="Signed off by ${user} (checks not verified locally)"
   fi
@@ -158,15 +163,15 @@ cmd_signoff() {
 
 cmd_status() {
   require_tools
-  local sha repo state
+  local sha repo combined state desc
   sha=$(git rev-parse HEAD)
   repo=$(repo_slug)
-  state=$(gh api "repos/${repo}/commits/${sha}/status" \
-            --jq ".statuses[] | select(.context==\"${STATUS_CONTEXT}\") | .state" 2>/dev/null | head -n1)
+  # Fetch the combined status once, then pick the first matching entry with jq.
+  # (Piping `gh --jq ... | head -n1` would SIGPIPE the writer under pipefail.)
+  combined=$(gh api "repos/${repo}/commits/${sha}/status" 2>/dev/null || echo '{}')
+  state=$(jq -r "first(.statuses[]? | select(.context==\"${STATUS_CONTEXT}\") | .state) // \"\"" <<<"$combined")
   if [[ "$state" == "success" ]]; then
-    local desc
-    desc=$(gh api "repos/${repo}/commits/${sha}/status" \
-             --jq ".statuses[] | select(.context==\"${STATUS_CONTEXT}\") | .description" 2>/dev/null | head -n1)
+    desc=$(jq -r "first(.statuses[]? | select(.context==\"${STATUS_CONTEXT}\") | .description) // \"\"" <<<"$combined")
     echo "${OK} ${sha:0:12} is signed off — ${desc}"
   else
     echo "${NO} ${sha:0:12} is not signed off — run: make signoff"
@@ -174,10 +179,12 @@ cmd_status() {
   fi
 }
 
-# Resolve the ruleset id for TARGET_BRANCH by name.
+# Resolve the ruleset id for TARGET_BRANCH by name. `first(...)` returns a single
+# id inside jq — avoids `head`, which SIGPIPEs the writer under pipefail.
 ruleset_id() {
   local repo="$1"
-  gh api "repos/${repo}/rulesets" --jq ".[] | select(.name==\"${TARGET_BRANCH}\") | .id" 2>/dev/null | head -n1
+  gh api "repos/${repo}/rulesets" \
+    --jq "first(.[] | select(.name==\"${TARGET_BRANCH}\") | .id) // empty" 2>/dev/null
 }
 
 cmd_check() {

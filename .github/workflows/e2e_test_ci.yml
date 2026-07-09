@@ -48,6 +48,22 @@ env:
   CARGO_NET_GIT_FETCH_WITH_CLI: true
 
 jobs:
+  # Skip the expensive E2E matrix on merge groups that don't touch code (docs,
+  # etc.). `build` — which every test job depends on — is gated on this, so the
+  # whole matrix cascades to "skipped" while the E2E Test CI gate still reports.
+  check_changes:
+    runs-on: spiceai-dev-runners
+    outputs:
+      relevant_changes: ${{ steps.check.outputs.relevant_changes == 'true' || github.event_name == 'workflow_dispatch' }}
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - name: Check for code changes
+        id: check
+        uses: ./.github/actions/check-code-changes
+
   setup-matrix:
     name: Setup strategy matrix
     runs-on: spiceai-dev-runners
@@ -82,7 +98,8 @@ jobs:
   build:
     name: Build ${{ matrix.target.name }} binaries
     runs-on: ${{ matrix.target.builder }}
-    needs: setup-matrix
+    needs: [setup-matrix, check_changes]
+    if: ${{ needs.check_changes.outputs.relevant_changes == 'true' }}
 
     strategy:
       matrix:
@@ -2201,9 +2218,10 @@ jobs:
   # than dozens of shifting matrix names.
   e2e-gate:
     name: E2E Test CI
-    runs-on: spiceai-dev-runners
+    runs-on: ubuntu-latest
     if: ${{ !cancelled() }}
     needs:
+      - check_changes
       - setup-matrix
       - build
       - setup-model-matrix

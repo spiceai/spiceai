@@ -60,8 +60,11 @@ jobs:
   # merge queue, where the heavy jobs below and the other workflows run the full
   # suite. This is what replaces running all checks on every PR push.
   attestation:
+    # GitHub-hosted: this job only calls the API, and self-hosted runners don't
+    # run for fork PRs — which would leave external contributors' required
+    # Attestation check unreported and stuck.
     name: Attestation
-    runs-on: spiceai-dev-runners
+    runs-on: ubuntu-latest
     permissions:
       contents: read
       statuses: read
