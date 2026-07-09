@@ -14,8 +14,11 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use octocrab::{Octocrab, actions::ActionsHandler};
+use http_body_util::BodyExt;
+use octocrab::{Octocrab, actions::ActionsHandler, map_github_error};
+use serde::Deserialize;
 use serde_json::Value;
+use tonic::transport::Uri;
 
 /// Represents a GitHub workflow to be dispatched
 pub struct GitHubWorkflow {
@@ -58,6 +61,33 @@ impl GitHubWorkflow {
         .await?;
 
         Ok(())
+    }
+
+
+    /// A reimplementation of [`octocrab::actions::WorkflowDispatchBuilder::send`] that returns the workflow run URL.
+    pub async fn run_workflow(&self, crab: &Octocrab, input: Option<Value>) -> anyhow::Result<String> {
+        // [`WorkflowDispatch`] is `non_exhaustive`.
+        let body = serde_json::json!({
+            "ref": &self.r#ref,
+            "inputs": input.unwrap_or(Value::Null)
+        });
+        let uri: Uri = format!(
+            "/repos/{owner}/{repo}/actions/workflows/{workflow_id}/dispatches",
+            owner = self.org,
+            repo = self.repo,
+            workflow_id = self.workflow_file
+        )
+        .parse()?;
+
+        #[derive(Deserialize)]
+        struct WorkflowDispatchResponse {
+            run_url: String,
+            #[allow(dead_code)]
+            html_url: String,
+        }
+        let z = map_github_error(crab._post(uri, Some(&body)).await?).await?.into_body().collect().await?.to_bytes();
+        let resp = serde_json::from_slice::<WorkflowDispatchResponse>(&z)?;
+        Ok(resp.run_url)
     }
 
     /// Returns the number of active workflow runs for this workflow.
