@@ -917,7 +917,10 @@ pub(crate) async fn reserve_sequences_in(
 /// Keyed the SAME way as [`MergedScanDeletions`] — (file-index `Arc` ptr, the
 /// per-shard content `version` hash, structural epoch) — so any concurrent
 /// append/clear/publish forces a rebuild and a stale pairing can never be
-/// served. Where `merged_scan_deletions` memoizes the merged tombstone
+/// served. Like `MergedScanDeletions`, the file-index `Arc` is RETAINED here
+/// (`file_index`) so its address cannot be freed and reused by a later index
+/// generation, keeping the ptr comparison ABA-safe (#11303). Where
+/// `merged_scan_deletions` memoizes the merged tombstone
 /// *snapshot*, this memoizes the merge-on-read *output*: the visible batches
 /// after `filter_inlined_batch_for_deletions` has already run.
 ///
@@ -930,10 +933,13 @@ pub(crate) async fn reserve_sequences_in(
 /// reference, and lets repeated same-version queries skip merge-on-read
 /// entirely.
 struct MemTierVisibleMemo {
-    /// `PkDeletionSnapshot::index_ptr()` of the file-side index the visibility
-    /// was filtered against (`None` for position-based, which does not filter
-    /// here).
-    file_index_ptr: Option<usize>,
+    /// The file-side deletion snapshot the visibility was filtered against,
+    /// RETAINED for the lifetime of the memo (`None` for position-based, which
+    /// does not filter here). Retaining the `Arc` — not merely its address —
+    /// pins the index generation so its address cannot be freed and reused by a
+    /// later generation, making the [`Self::file_index_ptr`] identity ABA-safe;
+    /// see [`MergedScanDeletions::file_index`] and #11303.
+    file_index: Option<PkDeletionSnapshot>,
     /// [`crate::provider::mem_tier::ShardedMemTier::version_hash_of`] of the
     /// shards the batches were built from.
     tier_version: u64,
@@ -942,6 +948,18 @@ struct MemTierVisibleMemo {
     /// Per-segment deletion-filtered visible batches, unpruned. `Arc<[_]>` so a
     /// memo hit is an `Arc`-pointer clone, never an O(segments) copy.
     segments: Arc<[VisibleMemTierSegment]>,
+}
+
+impl MemTierVisibleMemo {
+    /// `Arc::as_ptr` identity of the retained file-side index — the memo key's
+    /// file-side component (`None` for position-based). Read from
+    /// [`Self::file_index`] so the compared pointer and the pinned allocation
+    /// can never diverge.
+    fn file_index_ptr(&self) -> Option<usize> {
+        self.file_index
+            .as_ref()
+            .and_then(PkDeletionSnapshot::index_ptr)
+    }
 }
 
 /// One retained mem-tier segment's deletion-filtered visible batches plus the
@@ -1161,7 +1179,10 @@ pub struct CayenneTableProvider {
     /// Memo for the per-scan merged (file ∪ mem-tier) deletion snapshot. Keyed
     /// by (file-index `Arc` ptr, tier content `version`, structural epoch) — a
     /// hit requires all three, so any concurrent append/clear/publish forces a
-    /// rebuild and a stale pairing can never be served. Kills the per-scan
+    /// rebuild and a stale pairing can never be served. The file-index `Arc` is
+    /// RETAINED in the memo (`MergedScanDeletions::file_index`) so its address
+    /// cannot be freed and reused by a later index generation, keeping the ptr
+    /// comparison ABA-safe (#11303). Kills the per-scan
     /// O(tier-tombstones) `with_mem_tier_tombstones` extend that correlated
     /// plans (q20: 322ms -> 74s) paid per outer-group rescan.
     merged_scan_deletions: Arc<arc_swap::ArcSwapOption<MergedScanDeletions>>,
@@ -16549,7 +16570,7 @@ impl CayenneTableProvider {
         let tier_version = crate::provider::mem_tier::ShardedMemTier::version_hash_of(shards);
         let structural_epoch = self.inlined_structural_epoch.load(Ordering::Relaxed);
         if let Some(memo) = self.merged_scan_deletions.load_full()
-            && memo.file_index_ptr == file_index_ptr
+            && memo.file_index_ptr() == Some(file_index_ptr)
             && memo.tier_version == tier_version
             && memo.structural_epoch == structural_epoch
         {
@@ -16558,7 +16579,10 @@ impl CayenneTableProvider {
         let merged = deletion_snapshot.with_mem_tier_tombstones_map(&union);
         self.merged_scan_deletions
             .store(Some(Arc::new(MergedScanDeletions {
-                file_index_ptr,
+                // Retain the file-side source snapshot (pins its index `Arc` so
+                // the `file_index_ptr` identity above stays ABA-safe — #11303);
+                // `deletion_snapshot` is unused past this point.
+                file_index: deletion_snapshot,
                 tier_version,
                 structural_epoch,
                 merged: merged.clone(),
@@ -17619,12 +17643,15 @@ impl CayenneTableProvider {
             if self.mem_tier_shard_count() == 1
                 && let Some(memo) = self.merged_scan_deletions.load_full()
                 && memo.tier_version == cur.version
-                && Some(memo.file_index_ptr) == self.pk_deletion_snapshot().index_ptr()
+                && memo.file_index_ptr() == self.pk_deletion_snapshot().index_ptr()
             {
                 let structural_epoch = self.inlined_structural_epoch.load(Ordering::Relaxed);
                 self.merged_scan_deletions
                     .store(Some(Arc::new(MergedScanDeletions {
-                        file_index_ptr: memo.file_index_ptr,
+                        // The file-side index is unchanged by a tier append —
+                        // carry the retained source snapshot forward (keeps its
+                        // `Arc` pinned so the ptr identity stays ABA-safe, #11303).
+                        file_index: memo.file_index.clone(),
                         tier_version: next_version,
                         structural_epoch,
                         merged: memo.merged.extended_by_delta(&tombstones),
@@ -18831,12 +18858,15 @@ impl CayenneTableProvider {
         // `filter_inlined_batch_for_deletions` reads live (`pk_deletion_strategy`
         // via `pk_deletion_snapshot`), so the key reflects what the memoized
         // batches were filtered against.
-        let file_index_ptr = self.pk_deletion_snapshot().index_ptr();
+        // Retain the file-side source snapshot in the memo (pins its index `Arc`
+        // so the `file_index_ptr` identity stays ABA-safe — #11303).
+        let file_index = self.pk_deletion_snapshot();
+        let file_index_ptr = file_index.index_ptr();
         let tier_version = crate::provider::mem_tier::ShardedMemTier::version_hash_of(shards);
         let structural_epoch = self.inlined_structural_epoch.load(Ordering::Relaxed);
 
         let segments = if let Some(memo) = self.mem_tier_visible_memo.load_full()
-            && memo.file_index_ptr == file_index_ptr
+            && memo.file_index_ptr() == file_index_ptr
             && memo.tier_version == tier_version
             && memo.structural_epoch == structural_epoch
         {
@@ -18853,7 +18883,7 @@ impl CayenneTableProvider {
             );
             self.mem_tier_visible_memo
                 .store(Some(Arc::new(MemTierVisibleMemo {
-                    file_index_ptr,
+                    file_index: Some(file_index),
                     tier_version,
                     structural_epoch,
                     segments: Arc::clone(&built),
@@ -34260,6 +34290,107 @@ mod tests {
         assert!(
             !Arc::ptr_eq(&first, &third),
             "an append must invalidate the visible-batch memo (tier version changed)"
+        );
+    }
+
+    /// Strong count of the file-side deletion index held inside a
+    /// `PkDeletionSnapshot` (the allocation the scan memos key on by
+    /// `Arc::as_ptr`). `0` for position-based (no index).
+    fn file_index_strong_count(snapshot: &PkDeletionSnapshot) -> usize {
+        match snapshot {
+            PkDeletionSnapshot::Int64Pk { tombstones } => Arc::strong_count(tombstones),
+            PkDeletionSnapshot::RowConverterBased { tombstones } => Arc::strong_count(tombstones),
+            PkDeletionSnapshot::PositionBased => 0,
+        }
+    }
+
+    /// #11303 regression: the per-scan deletion memos must RETAIN (pin) the
+    /// file-side deletion index they key on, not merely cache its raw
+    /// `Arc::as_ptr`.
+    ///
+    /// The memo key compares `Arc::as_ptr(file_index)`. If the memo does not
+    /// keep that `Arc` alive, a deletion publish can free the index and a later
+    /// publish can reuse its freed address for a new generation — a false
+    /// pointer match (ABA) that serves a stale merged deletion view and
+    /// resurrects deleted rows. Pinning the source `Arc` makes the address
+    /// non-reusable while the memo is live, so a pointer match can only mean
+    /// "same generation".
+    ///
+    /// The ABA itself is allocator-dependent and non-deterministic to trigger,
+    /// so this asserts the retention INVARIANT that eliminates it: after a scan
+    /// builds the memos, clearing them must drop the file-side index's strong
+    /// count (the memos were holding references to it). On the pre-fix code the
+    /// memos held no reference, so clearing them would not move the count.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn deletion_memos_pin_file_index_against_aba() {
+        let ctx = SessionContext::new();
+        let runtime_env = ctx.runtime_env();
+        let (provider, _catalog, _tmp) = create_cdc_upsert_table_with_vortex_config(
+            "aba_pin",
+            Arc::clone(&runtime_env),
+            VortexConfig {
+                cdc_durability: crate::metadata::CdcDurability::Memory,
+                deletion_mode: crate::metadata::DeletionMode::Key,
+                inline_max_rows: 1024,
+                ..VortexConfig::default()
+            },
+        )
+        .await;
+        let schema = Arc::clone(&provider.table_metadata.schema);
+        provider.install_slot_advancer(Arc::new(NoopSlotAdvancer));
+
+        // Durable rows + checkpoint (a file-side deletion index exists), then a
+        // RAM upsert tombstoning a durable key so a scan builds BOTH the merged
+        // and the visible-batch deletion memos.
+        insert_batch(
+            &provider,
+            id_value_batch(Arc::clone(&schema), &[1, 2], &[10, 20]),
+        )
+        .await;
+        provider
+            .checkpoint_inlined_data()
+            .await
+            .expect("flush inline rows to the file tier");
+        let write = provider
+            .write_cdc_append_stream(
+                single_batch_stream(id_value_batch(Arc::clone(&schema), &[1], &[100])),
+                &ctx.task_ctx(),
+            )
+            .await
+            .expect("RAM upsert");
+        assert!(
+            write.in_memory_epoch().is_some(),
+            "upsert engaged the RAM tier"
+        );
+
+        // Build the memos and re-assert visibility over the memoized path.
+        assert_eq!(
+            collect_id_value_pairs(&ctx, &provider, "aba_pin").await,
+            vec![(1, 100), (2, 20)],
+            "tier tombstone must hide the durable copy of PK 1"
+        );
+        assert!(
+            provider.merged_scan_deletions.load_full().is_some(),
+            "the scan must have stored the merged-deletions memo"
+        );
+
+        // The live file-side deletion index. `pk_deletion_snapshot()` clones its
+        // inner `Arc`, giving the test exactly one reference to count against;
+        // no write happens after this, so the live cell still holds the same
+        // generation the memos keyed on.
+        let live = provider.pk_deletion_snapshot();
+        let count_with_memos = file_index_strong_count(&live);
+        // Clearing the memos must release the reference(s) they were PINNING.
+        provider.merged_scan_deletions.store(None);
+        provider.mem_tier_visible_memo.store(None);
+        let count_without_memos = file_index_strong_count(&live);
+
+        assert!(
+            count_with_memos > count_without_memos,
+            "the scan deletion memos must PIN the file-side index (ABA guard, #11303): \
+             strong count was {count_with_memos} with the memos present and \
+             {count_without_memos} after clearing them — a pre-fix memo that cached only \
+             the raw pointer would leave the count unchanged"
         );
     }
 
