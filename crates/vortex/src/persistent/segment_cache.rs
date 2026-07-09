@@ -75,7 +75,7 @@ static ENTRIES: LazyLock<Gauge<u64>> = LazyLock::new(|| {
 /// `SegmentCache` interface it expects.
 #[derive(Clone, Debug)]
 pub(crate) struct SharedSegmentCache {
-    cache: Cache<(Path, SegmentId), ByteBuffer, SegmentCacheHasher>,
+    cache: Cache<(Arc<Path>, SegmentId), ByteBuffer, SegmentCacheHasher>,
     /// Total `get` calls; drives periodic stats sampling.
     accesses: Arc<AtomicU64>,
     /// `get` calls that returned a cached buffer (a hit).
@@ -107,20 +107,22 @@ impl SharedSegmentCache {
     pub(crate) fn for_path(&self, path: Path) -> Arc<dyn SegmentCache> {
         Arc::new(PathSegmentCache {
             shared: self.clone(),
-            path,
+            path: Arc::new(path),
         })
     }
 }
 
 struct PathSegmentCache {
     shared: SharedSegmentCache,
-    path: Path,
+    // `Arc<Path>` so forming the `(path, segment)` cache key on every `get`/`put`
+    // is a refcount bump, not a `Path` (string) clone — segment reads are hot.
+    path: Arc<Path>,
 }
 
 #[async_trait]
 impl SegmentCache for PathSegmentCache {
     async fn get(&self, id: SegmentId) -> VortexResult<Option<ByteBuffer>> {
-        let result = self.shared.cache.get(&(self.path.clone(), id)).await;
+        let result = self.shared.cache.get(&(Arc::clone(&self.path), id)).await;
 
         // Segment-cache right-sizing telemetry: count accesses/hits and, every
         // SEGMENT_CACHE_STATS_SAMPLE_EVERY calls, publish the cumulative hit rate
@@ -149,8 +151,56 @@ impl SegmentCache for PathSegmentCache {
     async fn put(&self, id: SegmentId, buffer: ByteBuffer) -> VortexResult<()> {
         self.shared
             .cache
-            .insert((self.path.clone(), id), buffer)
+            .insert((Arc::clone(&self.path), id), buffer)
             .await;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn get_put_roundtrip_and_path_isolation() {
+        let shared = SharedSegmentCache::new(1 << 20, None);
+        let cache_a = shared.for_path(Path::from("a.vortex"));
+        let cache_b = shared.for_path(Path::from("b.vortex"));
+        let id = SegmentId::from(1);
+
+        // Miss before insert.
+        assert!(
+            cache_a
+                .get(id)
+                .await
+                .expect("get should not error")
+                .is_none()
+        );
+
+        cache_a
+            .put(id, ByteBuffer::from(vec![1u8, 2, 3, 4]))
+            .await
+            .expect("put should not error");
+
+        // Hit on the same path + segment id.
+        assert_eq!(
+            cache_a
+                .get(id)
+                .await
+                .expect("get should not error")
+                .map(|b| b.len()),
+            Some(4)
+        );
+
+        // The cache key is (path, segment id): a different path with the same
+        // segment id must not collide — path isolation must survive the switch to
+        // an `Arc<Path>` key.
+        assert!(
+            cache_b
+                .get(id)
+                .await
+                .expect("get should not error")
+                .is_none()
+        );
     }
 }

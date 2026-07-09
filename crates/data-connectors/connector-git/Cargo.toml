@@ -20,3 +20,6 @@ secrecy.workspace = true
 snafu.workspace = true
 tokio.workspace = true
 tracing.workspace = true
+
+[lints]
+workspace = true

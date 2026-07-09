@@ -130,11 +130,208 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 pub type StoreError = Box<dyn std::error::Error + Send + Sync>;
 
 /// A persisted replication checkpoint: the binlog position to resume from,
-/// plus an optional serialized Arrow schema snapshot for drift detection.
+/// plus optional schema/layout snapshots for drift detection.
+///
+/// `schema_json` historically held only the dataset Arrow schema. That is
+/// insufficient: binlog row images are positional, so a source-only reorder
+/// or same-count reshape that leaves the dataset schema unchanged would
+/// silently mis-map columns on resume. New checkpoints store a versioned
+/// envelope in `schema_json` that also fingerprints the source ordinal
+/// layout (see [`CheckpointMeta`]).
 #[derive(Clone, Debug)]
 pub struct PersistedPosition {
     pub position: BinlogPosition,
     pub schema_json: Option<String>,
+}
+
+/// Version tag for [`CheckpointMeta`] serialized into `schema_json`.
+pub const CHECKPOINT_META_VERSION: u32 = 2;
+
+/// Versioned checkpoint sidecar payload stored in `schema_json`.
+///
+/// v1 (legacy): the raw Arrow schema JSON object.
+/// v2: this envelope, with both the dataset schema and a source-layout
+/// fingerprint. Resume refuses to continue when either diverges.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct CheckpointMeta {
+    pub version: u32,
+    /// Serialized dataset Arrow schema (same bytes `MySqlBinlogSys::serialize_schema` produces).
+    pub dataset_schema_json: String,
+    /// [`setup::TableLayout::fingerprint`] of the source table at checkpoint time.
+    pub source_layout_fingerprint: String,
+}
+
+impl CheckpointMeta {
+    #[must_use]
+    pub fn new(dataset_schema_json: String, source_layout_fingerprint: String) -> Self {
+        Self {
+            version: CHECKPOINT_META_VERSION,
+            dataset_schema_json,
+            source_layout_fingerprint,
+        }
+    }
+
+    /// Serialize for the `schema_json` sidecar column.
+    pub fn to_schema_json(&self) -> Result<String, serde_json::Error> {
+        serde_json::to_string(self)
+    }
+
+    /// Parse a stored `schema_json` value.
+    ///
+    /// - v2 envelope → `Ok(Some(meta))`
+    /// - legacy raw Arrow schema JSON (object with a top-level `fields` key,
+    ///   no usable `version`) → `Ok(None)` (caller must treat as unknown
+    ///   layout and refuse unsafe resume)
+    /// - corrupt / empty / non-schema JSON → `Err`
+    pub fn parse(schema_json: &str) -> Result<Option<Self>, String> {
+        let value: serde_json::Value =
+            serde_json::from_str(schema_json).map_err(|e| e.to_string())?;
+        if value
+            .get("version")
+            .and_then(serde_json::Value::as_u64)
+            .is_some_and(|v| v >= u64::from(CHECKPOINT_META_VERSION))
+        {
+            let meta: Self = serde_json::from_value(value).map_err(|e| e.to_string())?;
+            if meta.version != CHECKPOINT_META_VERSION {
+                return Err(format!(
+                    "unsupported mysql binlog checkpoint meta version {}",
+                    meta.version
+                ));
+            }
+            return Ok(Some(meta));
+        }
+        // Legacy: a bare Arrow schema JSON object (has `fields`, no usable
+        // `version`). Anything else is corrupt / unsupported meta.
+        if value.is_object() && value.get("fields").is_some() {
+            return Ok(None);
+        }
+        Err(
+            "persisted checkpoint schema_json is neither a v2 CheckpointMeta envelope nor a legacy Arrow schema object"
+                .to_string(),
+        )
+    }
+}
+
+/// Build the `schema_json` value persisted with each checkpoint.
+///
+/// When the connector could not serialize the dataset schema, returns `None`
+/// (resume will refuse rather than decode against an unverified layout).
+#[must_use]
+pub fn encode_checkpoint_schema_json(
+    dataset_schema_json: Option<&str>,
+    source_layout: &setup::TableLayout,
+) -> Option<String> {
+    let dataset_schema_json = dataset_schema_json?;
+    match CheckpointMeta::new(dataset_schema_json.to_string(), source_layout.fingerprint())
+        .to_schema_json()
+    {
+        Ok(json) => Some(json),
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "failed to serialize mysql binlog checkpoint meta; resume will refuse rather than decode against an unverified layout"
+            );
+            None
+        }
+    }
+}
+
+/// Why a persisted checkpoint cannot safely resume against the current
+/// source layout / dataset schema.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ResumeDrift {
+    /// Checkpoint predates layout fingerprinting (legacy raw Arrow schema).
+    LegacyCheckpoint,
+    /// Checkpoint has missing or invalid schema/layout metadata (absent,
+    /// corrupt, or an unsupported meta version).
+    MissingCheckpointMeta,
+    /// Current run could not serialize the dataset schema, so resume has no
+    /// comparable baseline against the persisted checkpoint.
+    CurrentDatasetSchemaUnavailable,
+    /// Dataset Arrow schema changed between runs.
+    DatasetSchemaChanged,
+    /// Source ordinal layout (names/types/order/PK) changed between runs.
+    SourceLayoutChanged,
+}
+
+impl std::fmt::Display for ResumeDrift {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::LegacyCheckpoint => write!(
+                f,
+                "persisted checkpoint predates source-layout fingerprinting"
+            ),
+            Self::MissingCheckpointMeta => {
+                write!(
+                    f,
+                    "persisted checkpoint has missing or invalid schema/layout metadata"
+                )
+            }
+            Self::CurrentDatasetSchemaUnavailable => write!(
+                f,
+                "current dataset schema could not be serialized for resume compatibility"
+            ),
+            Self::DatasetSchemaChanged => {
+                write!(f, "dataset schema changed since the checkpoint was written")
+            }
+            Self::SourceLayoutChanged => write!(
+                f,
+                "source table ordinal layout changed since the checkpoint was written"
+            ),
+        }
+    }
+}
+
+/// Compare a persisted checkpoint against the current dataset schema JSON and
+/// source layout fingerprint.
+///
+/// Returns `Ok(())` only when resume is safe: the checkpoint carries a v2
+/// meta envelope whose dataset schema and source-layout fingerprint both
+/// match. Any other outcome is [`ResumeDrift`] — the caller must error or
+/// rebootstrap rather than decode historical row images with the current
+/// layout (which would silently scramble columns on a reorder/retype).
+pub fn check_resume_compatibility(
+    persisted_schema_json: Option<&str>,
+    current_dataset_schema_json: Option<&str>,
+    current_layout_fingerprint: &str,
+) -> Result<(), ResumeDrift> {
+    let Some(stored) = persisted_schema_json else {
+        return Err(ResumeDrift::MissingCheckpointMeta);
+    };
+    let meta = match CheckpointMeta::parse(stored) {
+        Ok(Some(meta)) => meta,
+        Ok(None) => return Err(ResumeDrift::LegacyCheckpoint),
+        Err(_) => return Err(ResumeDrift::MissingCheckpointMeta),
+    };
+    match current_dataset_schema_json {
+        Some(current) if dataset_schemas_equivalent(current, &meta.dataset_schema_json) => {}
+        Some(_) => return Err(ResumeDrift::DatasetSchemaChanged),
+        // Current run could not serialize the dataset schema — refuse rather
+        // than resume without a comparable baseline.
+        None => return Err(ResumeDrift::CurrentDatasetSchemaUnavailable),
+    }
+    if meta.source_layout_fingerprint != current_layout_fingerprint {
+        return Err(ResumeDrift::SourceLayoutChanged);
+    }
+    Ok(())
+}
+
+/// Compare two Arrow schema JSON strings for equivalence.
+///
+/// Exact string match is preferred (fast path). Otherwise both sides are
+/// parsed as [`serde_json::Value`] so map key order differences in field
+/// metadata do not false-positive into [`ResumeDrift::DatasetSchemaChanged`].
+fn dataset_schemas_equivalent(a: &str, b: &str) -> bool {
+    if a == b {
+        return true;
+    }
+    match (
+        serde_json::from_str::<serde_json::Value>(a),
+        serde_json::from_str::<serde_json::Value>(b),
+    ) {
+        (Ok(left), Ok(right)) => left == right,
+        _ => false,
+    }
 }
 
 /// Durable storage for the dataset's binlog position — the client-side
@@ -270,6 +467,12 @@ async fn start_inner(input: ReplicationStreamInput) -> Result<ChangesStream> {
     }
 
     // 2. Load the persisted position and pick the start path.
+    //
+    // Binlog row images are positional. Resuming against a different source
+    // ordinal layout (or dataset schema) would decode historical events with
+    // the *current* name→index map and silently scramble columns whenever
+    // types still convert. Refuse that case — error or rebootstrap per
+    // `invalid_position_behavior`.
     let persisted = position_store
         .load()
         .await
@@ -277,18 +480,8 @@ async fn start_inner(input: ReplicationStreamInput) -> Result<ChangesStream> {
             message: e.to_string(),
         })?;
 
-    if let Some(persisted) = &persisted
-        && let (Some(stored), Some(current)) =
-            (persisted.schema_json.as_deref(), schema_json.as_deref())
-        && stored != current
-    {
-        tracing::warn!(
-            dataset = %dataset_name,
-            "mysql replication resume detected dataset schema drift between runs; continuing \
-             with the current schema. If columns fail to populate, re-bootstrap by restarting \
-             with `mysql_replication_invalid_position_behavior: rebootstrap`."
-        );
-    }
+    let layout_fingerprint = layout.fingerprint();
+    let checkpoint_schema_json = encode_checkpoint_schema_json(schema_json.as_deref(), &layout);
 
     let resume_position = match persisted {
         Some(persisted) if params.snapshot_mode == SnapshotMode::Always => {
@@ -301,7 +494,39 @@ async fn start_inner(input: ReplicationStreamInput) -> Result<ChangesStream> {
             None
         }
         Some(persisted) => {
-            if setup::binlog_file_exists(&mut conn, &persisted.position.file).await? {
+            if let Err(drift) = check_resume_compatibility(
+                persisted.schema_json.as_deref(),
+                schema_json.as_deref(),
+                &layout_fingerprint,
+            ) {
+                match params.invalid_position_behavior {
+                    InvalidPositionBehavior::Error => {
+                        return StalePositionSnafu {
+                            message: format!(
+                                "cannot resume mysql binlog for {dataset_name} from {}: {drift}. Replaying historical row images against the current source layout would mis-map columns. Set `mysql_replication_invalid_position_behavior: rebootstrap` to drop the saved position and re-snapshot the table.",
+                                persisted.position
+                            ),
+                        }
+                        .fail();
+                    }
+                    InvalidPositionBehavior::Rebootstrap => {
+                        tracing::warn!(
+                            dataset = %dataset_name,
+                            position = %persisted.position,
+                            drift = %drift,
+                            "persisted binlog checkpoint is incompatible with the current source layout / dataset schema; rebootstrap behavior enabled, falling back to a fresh snapshot"
+                        );
+                        if let Err(e) = position_store.clear().await {
+                            tracing::warn!(
+                                dataset = %dataset_name,
+                                error = %e,
+                                "failed to clear the incompatible binlog position; the subsequent bootstrap will overwrite it"
+                            );
+                        }
+                        None
+                    }
+                }
+            } else if setup::binlog_file_exists(&mut conn, &persisted.position.file).await? {
                 Some(persisted.position)
             } else {
                 match params.invalid_position_behavior {
@@ -396,7 +621,7 @@ async fn start_inner(input: ReplicationStreamInput) -> Result<ChangesStream> {
             // after a restart is exactly the no-snapshot contract.
             let initial = PersistedPosition {
                 position: head.clone(),
-                schema_json: schema_json.clone(),
+                schema_json: checkpoint_schema_json.clone(),
             };
             if let Err(e) = position_store.save(&initial).await {
                 tracing::warn!(
@@ -436,7 +661,7 @@ async fn start_inner(input: ReplicationStreamInput) -> Result<ChangesStream> {
                     store: Arc::clone(&position_store),
                     position: PersistedPosition {
                         position: head.clone(),
-                        schema_json: schema_json.clone(),
+                        schema_json: checkpoint_schema_json.clone(),
                     },
                 }),
                 ready_batch,
@@ -465,7 +690,9 @@ async fn start_inner(input: ReplicationStreamInput) -> Result<ChangesStream> {
         table,
         dataset_name,
         position_store,
-        schema_json,
+        // Persist the versioned checkpoint meta (dataset schema + source
+        // layout fingerprint), not the bare Arrow schema — resume needs both.
+        schema_json: checkpoint_schema_json,
         metrics,
     });
 
@@ -522,4 +749,150 @@ fn stream_error(err: &Error) -> StreamError {
 )]
 pub(crate) fn err_to_stream(err: Error) -> StreamError {
     stream_error(&err)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::mysql_replication::setup::{SourceColumn, TableLayout};
+
+    fn layout(names_and_types: &[(&str, &str)]) -> TableLayout {
+        TableLayout {
+            columns: names_and_types
+                .iter()
+                .map(|(name, ty)| SourceColumn {
+                    name: (*name).to_string(),
+                    column_type: (*ty).to_string(),
+                    enum_variants: None,
+                    set_variants: None,
+                    is_primary_key: false,
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn checkpoint_meta_round_trips() {
+        let meta = CheckpointMeta::new(
+            r#"{"fields":[{"name":"id","data_type":"Int32","nullable":false,"dict_id":0,"dict_is_ordered":false,"metadata":{}}],"metadata":{}}"#.to_string(),
+            layout(&[("id", "int")]).fingerprint(),
+        );
+        let json = meta.to_schema_json().expect("serialize");
+        let parsed = CheckpointMeta::parse(&json)
+            .expect("parse")
+            .expect("v2 envelope");
+        assert_eq!(parsed, meta);
+    }
+
+    #[test]
+    fn checkpoint_meta_parse_legacy_arrow_schema_as_none() {
+        // Pre-v2 checkpoints stored the raw Arrow schema JSON object.
+        let legacy = r#"{"fields":[{"name":"id","data_type":"Int32","nullable":false,"dict_id":0,"dict_is_ordered":false,"metadata":{}}],"metadata":{}}"#;
+        assert_eq!(
+            CheckpointMeta::parse(legacy).expect("legacy parses"),
+            None,
+            "legacy Arrow schema JSON must be treated as unknown layout"
+        );
+    }
+
+    #[test]
+    fn checkpoint_meta_parse_non_schema_json_as_err() {
+        assert!(
+            CheckpointMeta::parse(r#""just a string""#).is_err(),
+            "non-object JSON must not look like a legacy Arrow schema"
+        );
+        assert!(
+            CheckpointMeta::parse(r#"{"not_fields":[]}"#).is_err(),
+            "object without `fields` must not look like a legacy Arrow schema"
+        );
+        assert!(
+            CheckpointMeta::parse("42").is_err(),
+            "numeric JSON must not look like a legacy Arrow schema"
+        );
+    }
+
+    #[test]
+    fn resume_compatible_when_schema_and_layout_match() {
+        let layout = layout(&[("id", "int"), ("name", "varchar(255)")]);
+        let dataset = r#"{"fields":[]}"#;
+        let meta = CheckpointMeta::new(dataset.to_string(), layout.fingerprint())
+            .to_schema_json()
+            .expect("serialize");
+        check_resume_compatibility(Some(&meta), Some(dataset), &layout.fingerprint())
+            .expect("matching checkpoint must resume");
+    }
+
+    #[test]
+    fn resume_refuses_source_layout_reorder() {
+        let old = layout(&[("id", "int"), ("name", "varchar(255)")]);
+        let new = layout(&[("name", "varchar(255)"), ("id", "int")]);
+        let dataset = r#"{"fields":[]}"#;
+        let meta = CheckpointMeta::new(dataset.to_string(), old.fingerprint())
+            .to_schema_json()
+            .expect("serialize");
+        assert_eq!(
+            check_resume_compatibility(Some(&meta), Some(dataset), &new.fingerprint()),
+            Err(ResumeDrift::SourceLayoutChanged)
+        );
+    }
+
+    #[test]
+    fn resume_refuses_dataset_schema_change() {
+        let layout = layout(&[("id", "int")]);
+        let meta = CheckpointMeta::new(r#"{"fields":["old"]}"#.to_string(), layout.fingerprint())
+            .to_schema_json()
+            .expect("serialize");
+        assert_eq!(
+            check_resume_compatibility(
+                Some(&meta),
+                Some(r#"{"fields":["new"]}"#),
+                &layout.fingerprint()
+            ),
+            Err(ResumeDrift::DatasetSchemaChanged)
+        );
+    }
+
+    #[test]
+    fn resume_refuses_legacy_checkpoint() {
+        let layout = layout(&[("id", "int")]);
+        let legacy = r#"{"fields":[{"name":"id","data_type":"Int32","nullable":false,"dict_id":0,"dict_is_ordered":false,"metadata":{}}],"metadata":{}}"#;
+        assert_eq!(
+            check_resume_compatibility(Some(legacy), Some(legacy), &layout.fingerprint()),
+            Err(ResumeDrift::LegacyCheckpoint)
+        );
+    }
+
+    #[test]
+    fn resume_refuses_missing_meta() {
+        let layout = layout(&[("id", "int")]);
+        assert_eq!(
+            check_resume_compatibility(None, Some("{}"), &layout.fingerprint()),
+            Err(ResumeDrift::MissingCheckpointMeta)
+        );
+    }
+
+    #[test]
+    fn resume_refuses_when_current_schema_unavailable() {
+        let layout = layout(&[("id", "int")]);
+        let meta = CheckpointMeta::new(r#"{"fields":[]}"#.to_string(), layout.fingerprint())
+            .to_schema_json()
+            .expect("serialize");
+        assert_eq!(
+            check_resume_compatibility(Some(&meta), None, &layout.fingerprint()),
+            Err(ResumeDrift::CurrentDatasetSchemaUnavailable)
+        );
+    }
+
+    #[test]
+    fn resume_accepts_equivalent_schema_json_with_reordered_metadata_keys() {
+        let layout = layout(&[("id", "int")]);
+        // Same Arrow schema; metadata object key order differs.
+        let stored = r#"{"fields":[{"name":"id","data_type":"Int32","nullable":false,"dict_id":0,"dict_is_ordered":false,"metadata":{"b":"2","a":"1"}}],"metadata":{}}"#;
+        let current = r#"{"fields":[{"name":"id","data_type":"Int32","nullable":false,"dict_id":0,"dict_is_ordered":false,"metadata":{"a":"1","b":"2"}}],"metadata":{}}"#;
+        let meta = CheckpointMeta::new(stored.to_string(), layout.fingerprint())
+            .to_schema_json()
+            .expect("serialize");
+        check_resume_compatibility(Some(&meta), Some(current), &layout.fingerprint())
+            .expect("equivalent schema JSON must resume despite metadata key order");
+    }
 }

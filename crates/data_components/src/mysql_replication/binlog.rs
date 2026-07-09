@@ -51,7 +51,7 @@ use super::config::{BinlogPosition, ReplicationParams};
 use super::metrics::MetricsCollector;
 use super::rows::{TransactionBuffer, build_change_batch, normalize_binlog_value, truncate_change};
 use super::setup::TableLayout;
-use super::{Error, PersistedPosition, PositionStore, Result};
+use super::{CheckpointMeta, Error, PersistedPosition, PositionStore, Result};
 use crate::cdc::{ChangeEnvelope, ChangesStream, CommitChange, CommitError, StreamError};
 
 pub(super) struct BinlogStreamInput {
@@ -68,8 +68,9 @@ pub(super) struct BinlogStreamInput {
     pub table: String,
     pub dataset_name: String,
     pub position_store: Arc<dyn PositionStore>,
-    /// Serialized dataset schema persisted alongside each checkpoint for
-    /// drift detection on resume.
+    /// Versioned checkpoint meta ([`super::CheckpointMeta`] JSON) persisted
+    /// alongside each position — dataset schema + source-layout fingerprint
+    /// for drift detection on resume.
     pub schema_json: Option<String>,
     pub metrics: Arc<MetricsCollector>,
 }
@@ -195,6 +196,7 @@ fn binlog_change_stream(
         let mut checkpointer = Checkpointer {
             store: position_store,
             schema_json,
+            pending_adopt: None,
             dataset_name: dataset_name.clone(),
             metrics: Arc::clone(&metrics),
             last_persisted: start,
@@ -257,7 +259,20 @@ fn binlog_change_stream(
             };
 
             // Per-connection state. A fresh connection re-sends the rotate +
-            // table-map events, so nothing carries over.
+            // table-map events, so nothing carries over — except the decode
+            // layout, which lives across reconnects. If we adopted mid-stream
+            // but resume is still before that boundary, restore the pre-adopt
+            // layout so replayed pre-DDL row images keep the matching map.
+            if let Some(pre) = checkpointer.restore_pre_adopt_if_needed(&resume) {
+                tracing::info!(
+                    dataset = %dataset_name,
+                    position = %resume,
+                    "restoring pre-adopt source layout for reconnect before schema-change boundary"
+                );
+                layout = pre.layout.clone();
+                column_map = pre.column_map.clone();
+                pk_source_indexes = pre.pk_source_indexes.clone();
+            }
             let mut current_file = resume.file.clone();
             let mut txn: Option<TransactionBuffer> = None;
 
@@ -376,6 +391,16 @@ fn binlog_change_stream(
                             // didn't witness (or couldn't parse). Try to adopt
                             // the current source layout — see the ALTER TABLE
                             // handling below for the tolerance contract.
+                            let boundary =
+                                BinlogPosition::new(current_file.clone(), event_end_pos);
+                            // Reconnect replay: if we already recorded this
+                            // boundary, apply that epoch — do NOT re-fetch
+                            // today's information_schema (may be a later epoch).
+                            if let Some(known) = checkpointer.layout_for_replay_boundary(&boundary) {
+                                layout = known.layout.clone();
+                                column_map = known.column_map.clone();
+                                pk_source_indexes = known.pk_source_indexes.clone();
+                            } else {
                             match adopt_current_layout(
                                 &params, &database, &table, &schema, &layout, &primary_keys,
                                 &dataset_name,
@@ -384,13 +409,35 @@ fn binlog_change_stream(
                                     if adopted.layout.columns.len() as u64
                                         == tme.columns_count() =>
                                 {
+                                    // Defer durable fingerprint update until
+                                    // resume crosses this event — see
+                                    // `Checkpointer::note_adopted_layout`. Keep
+                                    // the pre-adopt layout so a reconnect that
+                                    // reopens before the boundary can restore it.
+                                    let pre_adopt = AdoptedLayout {
+                                        layout: layout.clone(),
+                                        column_map: column_map.clone(),
+                                        pk_source_indexes: pk_source_indexes.clone(),
+                                    };
+                                    checkpointer.note_adopted_layout(
+                                        &adopted,
+                                        pre_adopt,
+                                        &boundary,
+                                    );
                                     layout = adopted.layout;
                                     column_map = adopted.column_map;
                                     pk_source_indexes = adopted.pk_source_indexes;
                                 }
                                 outcome => {
+                                    // Do NOT persist the resume position past a
+                                    // fatal schema boundary: advancing the
+                                    // durable cursor would leave a restart
+                                    // decoding remaining historical row images
+                                    // with the current layout (silent column
+                                    // scramble). Leave the last good checkpoint
+                                    // in place so rebootstrap / operator fix
+                                    // can recover from a known-safe position.
                                     metrics.inc_schema_mismatch_error();
-                                    checkpointer.persist(&ack, &mut resume).await;
                                     let reason = match outcome {
                                         Ok(adopted) => format!(
                                             "the current source layout has {} columns but this \
@@ -412,6 +459,7 @@ fn binlog_change_stream(
                                     )))?;
                                     unreachable!();
                                 }
+                            }
                             }
                         }
                     }
@@ -504,18 +552,43 @@ fn binlog_change_stream(
                                     // `adopt_current_layout`); a dropped or retyped
                                     // dataset column is fatal below.
                                     Some(StatementKind::SchemaChange("ALTER TABLE")) => {
+                                        let boundary = BinlogPosition::new(
+                                            current_file.clone(),
+                                            event_end_pos,
+                                        );
+                                        // Reconnect replay of a known boundary:
+                                        // apply the pending epoch, do not
+                                        // re-fetch today's information_schema.
+                                        if let Some(known) =
+                                            checkpointer.layout_for_replay_boundary(&boundary)
+                                        {
+                                            layout = known.layout.clone();
+                                            column_map = known.column_map.clone();
+                                            pk_source_indexes = known.pk_source_indexes.clone();
+                                        } else {
                                         match adopt_current_layout(
                                             &params, &database, &table, &schema, &layout,
                                             &primary_keys, &dataset_name,
                                         ).await {
                                             Ok(adopted) => {
+                                                let pre_adopt = AdoptedLayout {
+                                                    layout: layout.clone(),
+                                                    column_map: column_map.clone(),
+                                                    pk_source_indexes: pk_source_indexes.clone(),
+                                                };
+                                                checkpointer.note_adopted_layout(
+                                                    &adopted,
+                                                    pre_adopt,
+                                                    &boundary,
+                                                );
                                                 layout = adopted.layout;
                                                 column_map = adopted.column_map;
                                                 pk_source_indexes = adopted.pk_source_indexes;
                                             }
                                             Err(e) => {
+                                                // Do NOT persist past a fatal ALTER —
+                                                // see the TableMap mismatch path.
                                                 metrics.inc_schema_mismatch_error();
-                                                checkpointer.persist(&ack, &mut resume).await;
                                                 Err(StreamError::External(format!(
                                                     "mysql binlog for {dataset_name}: ALTER TABLE on source table \
                                                      {database}.{table} (statement: {statement}) cannot be adopted \
@@ -526,10 +599,12 @@ fn binlog_change_stream(
                                                 unreachable!();
                                             }
                                         }
+                                        }
                                     }
                                     Some(StatementKind::SchemaChange(verb)) => {
+                                        // Do NOT persist past DROP/RENAME — see
+                                        // the TableMap mismatch path.
                                         metrics.inc_schema_mismatch_error();
-                                        checkpointer.persist(&ack, &mut resume).await;
                                         Err(StreamError::External(format!(
                                             "mysql binlog for {dataset_name}: {verb} detected on source table \
                                              {database}.{table} (statement: {statement}). The subscribed table \
@@ -599,9 +674,19 @@ fn binlog_change_stream(
                     advance_max(&mut resume, committed);
                 }
 
-                if last_persist_at.elapsed() >= params.checkpoint_interval {
+                // Flush when the checkpoint interval elapses, or as soon as a
+                // pending layout-adopt fingerprint becomes eligible (resume
+                // crossed the DDL/TableMap boundary). The latter must not wait
+                // for the interval — a crash with the old fingerprint still
+                // durable is fine (forces rebootstrap); a crash with the *new*
+                // fingerprint at a pre-boundary position is not.
+                let flush_adopt = checkpointer.pending_adopt_ready(&resume);
+                if flush_adopt || last_persist_at.elapsed() >= params.checkpoint_interval {
                     checkpointer.persist(&ack, &mut resume).await;
-                    poll_source_head(&mut side_conn, &params, &resume, &metrics, &dataset_name).await;
+                    if !flush_adopt {
+                        poll_source_head(&mut side_conn, &params, &resume, &metrics, &dataset_name)
+                            .await;
+                    }
                     last_persist_at = Instant::now();
                 }
             } // 'recv
@@ -816,26 +901,293 @@ fn commit_ts_ms(event_timestamp: u32) -> Option<i64> {
     (event_timestamp > 0).then(|| i64::from(event_timestamp) * 1000)
 }
 
+/// One schema-change boundary and the layout that applies to events at/after it.
+#[derive(Clone)]
+struct LayoutEpoch {
+    /// End position of the ALTER / `TableMap` that introduced this layout.
+    boundary: BinlogPosition,
+    layout: AdoptedLayout,
+    fingerprint: String,
+}
+
+/// A mid-stream layout adopt (or chain of adopts) whose fingerprint must not
+/// become durable until resume has crossed the relevant schema-change event.
+///
+/// Pairing a post-adopt fingerprint with a pre-boundary position would let a
+/// crash/restart decode historical row images with the new ordinal map.
+///
+/// The in-memory decode layout is swapped immediately (same-connection events
+/// after the DDL already use the new `TableMap`). On an in-process reconnect
+/// that reopens from a still-pre-boundary `resume`, the layout that was in
+/// force at that position is restored from [`Self::epochs`] /
+/// [`Self::pre_adopt`].
+struct PendingLayoutAdopt {
+    /// Layout in force before the first pending epoch — restored when
+    /// `resume` is still before `epochs[0].boundary`.
+    pre_adopt: AdoptedLayout,
+    /// Ordered schema-change epochs (ascending boundary). The layout for a
+    /// resume position `R` is the last epoch with `boundary <= R`, or
+    /// `pre_adopt` if `R` is before the first boundary.
+    epochs: Vec<LayoutEpoch>,
+}
+
+impl PendingLayoutAdopt {
+    fn earliest_boundary(&self) -> Option<&BinlogPosition> {
+        self.epochs.first().map(|epoch| &epoch.boundary)
+    }
+
+    fn latest_boundary(&self) -> Option<&BinlogPosition> {
+        self.epochs.last().map(|epoch| &epoch.boundary)
+    }
+
+    /// Layout that was in force at `resume` (for reconnect restore).
+    fn layout_at(&self, resume: &BinlogPosition) -> &AdoptedLayout {
+        let mut current = &self.pre_adopt;
+        for epoch in &self.epochs {
+            if resume < &epoch.boundary {
+                break;
+            }
+            current = &epoch.layout;
+        }
+        current
+    }
+
+    /// Fingerprint that matches `resume` (for durable checkpoint meta).
+    fn fingerprint_at(&self, resume: &BinlogPosition) -> Option<&str> {
+        let mut fingerprint: Option<&str> = None;
+        for epoch in &self.epochs {
+            if resume < &epoch.boundary {
+                break;
+            }
+            fingerprint = Some(epoch.fingerprint.as_str());
+        }
+        fingerprint
+    }
+}
+
 /// Owns the durable half of the ack pipeline: folds committer acks into the
 /// resume position and writes it to the position store when it advanced.
 struct Checkpointer {
     store: Arc<dyn PositionStore>,
+    /// Versioned [`CheckpointMeta`] JSON (dataset schema + source-layout
+    /// fingerprint). The fingerprint is updated from [`Self::pending_adopt`]
+    /// only once resume has crossed the schema-change boundary.
     schema_json: Option<String>,
+    /// Compatible mid-stream adopt(s) waiting for resume to pass their
+    /// boundaries before the matching fingerprint is written to the sidecar.
+    pending_adopt: Option<PendingLayoutAdopt>,
     dataset_name: String,
     metrics: Arc<MetricsCollector>,
     last_persisted: BinlogPosition,
 }
 
 impl Checkpointer {
+    /// Record a compatible mid-stream layout adopt.
+    ///
+    /// The durable sidecar keeps fingerprints that match the resume position
+    /// until [`Self::persist`] sees resume past each epoch boundary. The
+    /// caller swaps the in-memory decode layout immediately; reconnect
+    /// restore uses [`Self::restore_pre_adopt_if_needed`].
+    ///
+    /// Multiple adopts before resume crosses the first boundary append epochs
+    /// while preserving the original `pre_adopt`. Epochs are kept in boundary
+    /// order; a boundary already present is left unchanged (reconnect replay
+    /// must not overwrite with a later `information_schema` fetch), and a
+    /// boundary behind the latest known epoch is ignored (use
+    /// [`Self::layout_for_replay_boundary`] instead).
+    fn note_adopted_layout(
+        &mut self,
+        adopted: &AdoptedLayout,
+        pre_adopt: AdoptedLayout,
+        boundary: &BinlogPosition,
+    ) {
+        let epoch = LayoutEpoch {
+            boundary: boundary.clone(),
+            layout: adopted.clone(),
+            fingerprint: adopted.layout.fingerprint(),
+        };
+        match self.pending_adopt.as_mut() {
+            Some(pending) => {
+                if pending
+                    .epochs
+                    .iter()
+                    .any(|existing| &existing.boundary == boundary)
+                {
+                    // Already known (reconnect replay). Leave the recorded
+                    // epoch alone — a re-fetched information_schema layout
+                    // may be a later epoch and must not overwrite.
+                } else if pending
+                    .latest_boundary()
+                    .is_some_and(|latest| boundary < latest)
+                {
+                    tracing::debug!(
+                        dataset = %self.dataset_name,
+                        boundary = %boundary,
+                        "ignoring layout adopt behind an already-pending later schema-change boundary"
+                    );
+                } else {
+                    pending.epochs.push(epoch);
+                }
+            }
+            None => {
+                self.pending_adopt = Some(PendingLayoutAdopt {
+                    pre_adopt,
+                    epochs: vec![epoch],
+                });
+            }
+        }
+    }
+
+    /// Layout to use when replaying a schema-change at `boundary` while a
+    /// pending chain already exists.
+    ///
+    /// Exact boundary hits return that epoch. Boundaries behind the latest
+    /// pending epoch (e.g. reconnect replaying ALTER@A1 when only `TableMap`@T1
+    /// and ALTER@A2 were recorded) must NOT trigger a fresh
+    /// `information_schema` fetch — that returns today's later layout. Use
+    /// [`PendingLayoutAdopt::layout_at`] instead.
+    fn layout_for_replay_boundary(&self, boundary: &BinlogPosition) -> Option<&AdoptedLayout> {
+        let pending = self.pending_adopt.as_ref()?;
+        if let Some(exact) = pending
+            .epochs
+            .iter()
+            .find(|epoch| &epoch.boundary == boundary)
+        {
+            return Some(&exact.layout);
+        }
+        let latest = pending.latest_boundary()?;
+        (boundary < latest).then(|| pending.layout_at(boundary))
+    }
+
+    /// On reconnect, restore the decode layout that was in force at `resume`
+    /// whenever a pending adopt chain still has epochs ahead of (or at) that
+    /// position's required map. Returns `Some` when the live layout should be
+    /// replaced.
+    ///
+    /// Always restores when there is a pending chain and resume is before the
+    /// latest boundary — including the case where resume sits between two
+    /// epochs (needs the intermediate layout, not the latest live one).
+    fn restore_pre_adopt_if_needed(&self, resume: &BinlogPosition) -> Option<&AdoptedLayout> {
+        let pending = self.pending_adopt.as_ref()?;
+        let latest = pending.latest_boundary()?;
+        // If resume is already past every pending boundary, the live layout
+        // (latest adopt) is correct and durable flush will clear the chain.
+        if resume >= latest {
+            return None;
+        }
+        Some(pending.layout_at(resume))
+    }
+
+    /// Whether any pending epoch's fingerprint is eligible to become durable
+    /// (`resume` has crossed at least the earliest boundary).
+    fn pending_adopt_ready(&self, resume: &BinlogPosition) -> bool {
+        self.pending_adopt
+            .as_ref()
+            .and_then(PendingLayoutAdopt::earliest_boundary)
+            .is_some_and(|boundary| resume >= boundary)
+    }
+
+    /// Fold fingerprints for every epoch whose boundary is at or behind
+    /// `resume` into `schema_json`, dropping those epochs. Clears the pending
+    /// chain entirely once resume has crossed the latest boundary.
+    ///
+    /// Crossed epochs promote `pre_adopt` to the latest crossed layout so a
+    /// reconnect between remaining boundaries restores the intermediate map
+    /// (not the original pre-first-adopt layout). The pending chain is only
+    /// mutated after the durable meta update succeeds — a failed refresh must
+    /// not lose the crossed fingerprint.
+    ///
+    /// Returns `true` when the durable meta was updated.
+    fn apply_pending_adopt_if_ready(&mut self, resume: &BinlogPosition) -> bool {
+        let Some(pending) = self.pending_adopt.as_ref() else {
+            return false;
+        };
+        let Some(fingerprint) = pending.fingerprint_at(resume).map(str::to_string) else {
+            return false;
+        };
+
+        // Latest crossed epoch becomes the new `pre_adopt` baseline for any
+        // epochs that remain after this apply.
+        let mut promoted_pre_adopt = pending.pre_adopt.clone();
+        for epoch in &pending.epochs {
+            if resume < &epoch.boundary {
+                break;
+            }
+            promoted_pre_adopt = epoch.layout.clone();
+        }
+        let remaining_epochs: Vec<LayoutEpoch> = pending
+            .epochs
+            .iter()
+            .filter(|epoch| resume < &epoch.boundary)
+            .cloned()
+            .collect();
+
+        let Some(json) = self.schema_json.as_deref() else {
+            // No durable meta to refresh. Still advance/clear the in-memory
+            // chain once resume has crossed so `pending_adopt_ready` cannot
+            // stay true forever and skip source-head polls. Restart will
+            // refuse `MissingCheckpointMeta` anyway.
+            self.advance_or_clear_pending(promoted_pre_adopt, remaining_epochs);
+            return false;
+        };
+        let Ok(Some(mut meta)) = CheckpointMeta::parse(json) else {
+            // Corrupt / unsupported meta — same as missing: clear the chain
+            // once crossed rather than wedging the event loop.
+            self.advance_or_clear_pending(promoted_pre_adopt, remaining_epochs);
+            return false;
+        };
+        if meta.source_layout_fingerprint == fingerprint {
+            // Fingerprint already durable — still advance the in-memory chain
+            // so reconnect restore stays consistent with resume.
+            self.advance_or_clear_pending(promoted_pre_adopt, remaining_epochs);
+            return false;
+        }
+        meta.source_layout_fingerprint = fingerprint;
+        match meta.to_schema_json() {
+            Ok(updated) => {
+                self.schema_json = Some(updated);
+                self.advance_or_clear_pending(promoted_pre_adopt, remaining_epochs);
+                true
+            }
+            Err(e) => {
+                tracing::warn!(
+                    dataset = %self.dataset_name,
+                    error = %e,
+                    "failed to refresh checkpoint layout fingerprint after mid-stream adopt"
+                );
+                false
+            }
+        }
+    }
+
+    fn advance_or_clear_pending(
+        &mut self,
+        promoted_pre_adopt: AdoptedLayout,
+        remaining_epochs: Vec<LayoutEpoch>,
+    ) {
+        if remaining_epochs.is_empty() {
+            self.pending_adopt = None;
+        } else if let Some(pending) = self.pending_adopt.as_mut() {
+            pending.pre_adopt = promoted_pre_adopt;
+            pending.epochs = remaining_epochs;
+        }
+    }
+
     /// Persist the resume position (after folding in the latest ack) when it
-    /// advanced. Sidecar failures are logged and counted, not fatal — the
-    /// position re-persists on the next interval, and a crash in between only
-    /// widens the idempotent replay window.
+    /// advanced, or when a pending layout-adopt fingerprint became eligible.
+    /// Sidecar failures are logged and counted, not fatal — the position
+    /// re-persists on the next interval, and a crash in between only widens
+    /// the idempotent replay window.
+    ///
+    /// Callers must not invoke this on a fatal schema-mismatch path: advancing
+    /// the durable cursor past an un-adoptable DDL / `TableMap` boundary would
+    /// leave a restart decoding historical row images with the current layout.
     async fn persist(&mut self, ack: &AckState, resume: &mut BinlogPosition) {
         if let Some(committed) = ack.committed() {
             advance_max(resume, committed);
         }
-        if *resume <= self.last_persisted {
+        let fingerprint_updated = self.apply_pending_adopt_if_ready(resume);
+        if *resume <= self.last_persisted && !fingerprint_updated {
             return;
         }
         let persisted = PersistedPosition {
@@ -847,7 +1199,9 @@ impl Checkpointer {
                 self.metrics.inc_checkpoint_persist();
                 self.metrics
                     .set_committed_position(resume.file_ordinal().unwrap_or(0), resume.pos);
-                self.last_persisted = resume.clone();
+                if *resume >= self.last_persisted {
+                    self.last_persisted = resume.clone();
+                }
             }
             Err(e) => {
                 self.metrics.inc_checkpoint_persist_error();
@@ -883,6 +1237,7 @@ fn compute_pk_source_indexes(
 }
 
 /// The re-validated positional mappings adopted after a source DDL.
+#[derive(Clone)]
 struct AdoptedLayout {
     layout: TableLayout,
     column_map: Vec<usize>,
@@ -1298,6 +1653,460 @@ mod tests {
             ack.committed(),
             Some(BinlogPosition::new("binlog.000002", 100))
         );
+    }
+
+    #[test]
+    fn pending_adopt_fingerprint_waits_for_boundary() {
+        use super::super::setup::SourceColumn;
+        use super::super::{CHECKPOINT_META_VERSION, CheckpointMeta};
+
+        let col = |name: &str, ty: &str, pk: bool| SourceColumn {
+            name: name.to_string(),
+            column_type: ty.to_string(),
+            enum_variants: None,
+            set_variants: None,
+            is_primary_key: pk,
+        };
+        let old_layout = TableLayout {
+            columns: vec![col("id", "int", true), col("name", "varchar(255)", false)],
+        };
+        let new_layout = TableLayout {
+            columns: vec![col("name", "varchar(255)", false), col("id", "int", true)],
+        };
+        assert_ne!(old_layout.fingerprint(), new_layout.fingerprint());
+
+        let meta = CheckpointMeta {
+            version: CHECKPOINT_META_VERSION,
+            dataset_schema_json: r#"{"fields":[]}"#.to_string(),
+            source_layout_fingerprint: old_layout.fingerprint(),
+        };
+        let schema_json = meta.to_schema_json().expect("serialize");
+        let boundary = BinlogPosition::new("binlog.000001", 500);
+        let mut checkpointer = Checkpointer {
+            store: Arc::new(super::super::NoopPositionStore),
+            schema_json: Some(schema_json),
+            pending_adopt: None,
+            dataset_name: "orders".to_string(),
+            metrics: MetricsCollector::new(),
+            last_persisted: BinlogPosition::new("binlog.000001", 100),
+        };
+
+        let pre_adopt = AdoptedLayout {
+            layout: old_layout.clone(),
+            column_map: vec![0, 1],
+            pk_source_indexes: vec![0],
+        };
+        let adopted = AdoptedLayout {
+            layout: new_layout.clone(),
+            column_map: vec![1, 0],
+            pk_source_indexes: vec![1],
+        };
+        checkpointer.note_adopted_layout(&adopted, pre_adopt, &boundary);
+
+        // Pre-boundary resume must not flip the durable fingerprint, and must
+        // expose the pre-adopt layout for reconnect restore.
+        let before = BinlogPosition::new("binlog.000001", 400);
+        assert!(!checkpointer.pending_adopt_ready(&before));
+        assert!(!checkpointer.apply_pending_adopt_if_ready(&before));
+        let restored = checkpointer
+            .restore_pre_adopt_if_needed(&before)
+            .expect("pre-boundary reconnect must restore pre-adopt layout");
+        assert_eq!(restored.layout.fingerprint(), old_layout.fingerprint());
+        let still_old = CheckpointMeta::parse(checkpointer.schema_json.as_deref().expect("meta"))
+            .expect("parse")
+            .expect("v2");
+        assert_eq!(
+            still_old.source_layout_fingerprint,
+            old_layout.fingerprint()
+        );
+        assert!(checkpointer.pending_adopt.is_some());
+
+        // At/after the boundary the new fingerprint becomes eligible and
+        // reconnect must NOT restore the pre-adopt layout.
+        assert!(checkpointer.pending_adopt_ready(&boundary));
+        assert!(
+            checkpointer
+                .restore_pre_adopt_if_needed(&boundary)
+                .is_none()
+        );
+        assert!(checkpointer.apply_pending_adopt_if_ready(&boundary));
+        let updated = CheckpointMeta::parse(checkpointer.schema_json.as_deref().expect("meta"))
+            .expect("parse")
+            .expect("v2");
+        assert_eq!(updated.source_layout_fingerprint, new_layout.fingerprint());
+        assert!(checkpointer.pending_adopt.is_none());
+        assert!(
+            checkpointer
+                .restore_pre_adopt_if_needed(&boundary)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn pending_adopt_clears_when_schema_json_missing() {
+        use super::super::setup::SourceColumn;
+
+        let col = |name: &str, ty: &str, pk: bool| SourceColumn {
+            name: name.to_string(),
+            column_type: ty.to_string(),
+            enum_variants: None,
+            set_variants: None,
+            is_primary_key: pk,
+        };
+        let old_layout = TableLayout {
+            columns: vec![col("id", "int", true), col("name", "varchar(255)", false)],
+        };
+        let new_layout = TableLayout {
+            columns: vec![col("name", "varchar(255)", false), col("id", "int", true)],
+        };
+        let boundary = BinlogPosition::new("binlog.000001", 500);
+        let mut checkpointer = Checkpointer {
+            store: Arc::new(super::super::NoopPositionStore),
+            schema_json: None,
+            pending_adopt: None,
+            dataset_name: "orders".to_string(),
+            metrics: MetricsCollector::new(),
+            last_persisted: BinlogPosition::new("binlog.000001", 100),
+        };
+        checkpointer.note_adopted_layout(
+            &AdoptedLayout {
+                layout: new_layout,
+                column_map: vec![1, 0],
+                pk_source_indexes: vec![1],
+            },
+            AdoptedLayout {
+                layout: old_layout,
+                column_map: vec![0, 1],
+                pk_source_indexes: vec![0],
+            },
+            &boundary,
+        );
+        assert!(checkpointer.pending_adopt_ready(&boundary));
+        // Without durable meta, apply must still clear the chain so the event
+        // loop does not skip source-head polls forever.
+        assert!(!checkpointer.apply_pending_adopt_if_ready(&boundary));
+        assert!(checkpointer.pending_adopt.is_none());
+        assert!(!checkpointer.pending_adopt_ready(&boundary));
+    }
+
+    #[test]
+    fn second_adopt_preserves_original_pre_adopt_for_reconnect() {
+        use super::super::setup::SourceColumn;
+        use super::super::{CHECKPOINT_META_VERSION, CheckpointMeta};
+
+        let col = |name: &str, ty: &str, pk: bool| SourceColumn {
+            name: name.to_string(),
+            column_type: ty.to_string(),
+            enum_variants: None,
+            set_variants: None,
+            is_primary_key: pk,
+        };
+        let l0 = TableLayout {
+            columns: vec![col("id", "int", true), col("a", "int", false)],
+        };
+        let l1 = TableLayout {
+            columns: vec![col("a", "int", false), col("id", "int", true)],
+        };
+        let l2 = TableLayout {
+            columns: vec![
+                col("a", "int", false),
+                col("id", "int", true),
+                col("b", "int", false),
+            ],
+        };
+
+        let meta = CheckpointMeta {
+            version: CHECKPOINT_META_VERSION,
+            dataset_schema_json: r#"{"fields":[]}"#.to_string(),
+            source_layout_fingerprint: l0.fingerprint(),
+        };
+        let mut checkpointer = Checkpointer {
+            store: Arc::new(super::super::NoopPositionStore),
+            schema_json: Some(meta.to_schema_json().expect("serialize")),
+            pending_adopt: None,
+            dataset_name: "orders".to_string(),
+            metrics: MetricsCollector::new(),
+            last_persisted: BinlogPosition::new("binlog.000001", 100),
+        };
+
+        let ba = BinlogPosition::new("binlog.000001", 500);
+        let bb = BinlogPosition::new("binlog.000001", 800);
+        let adopted_a = AdoptedLayout {
+            layout: l1.clone(),
+            column_map: vec![1, 0],
+            pk_source_indexes: vec![1],
+        };
+        let pre_a = AdoptedLayout {
+            layout: l0.clone(),
+            column_map: vec![0, 1],
+            pk_source_indexes: vec![0],
+        };
+        checkpointer.note_adopted_layout(&adopted_a, pre_a, &ba);
+
+        // Second adopt while resume is still before BA — caller's "pre_adopt"
+        // is the intermediate L1 live layout; must NOT become the restore
+        // baseline for positions before BA.
+        let adopted_b = AdoptedLayout {
+            layout: l2.clone(),
+            column_map: vec![1, 0, 2],
+            pk_source_indexes: vec![1],
+        };
+        let pre_b_wrong = AdoptedLayout {
+            layout: l1.clone(),
+            column_map: vec![1, 0],
+            pk_source_indexes: vec![1],
+        };
+        checkpointer.note_adopted_layout(&adopted_b, pre_b_wrong, &bb);
+
+        let before_a = BinlogPosition::new("binlog.000001", 400);
+        let between = BinlogPosition::new("binlog.000001", 600);
+
+        let restored_before = checkpointer
+            .restore_pre_adopt_if_needed(&before_a)
+            .expect("before BA must restore L0");
+        assert_eq!(restored_before.layout.fingerprint(), l0.fingerprint());
+
+        let restored_between = checkpointer
+            .restore_pre_adopt_if_needed(&between)
+            .expect("between BA and BB must restore L1");
+        assert_eq!(restored_between.layout.fingerprint(), l1.fingerprint());
+
+        // Durable fingerprint must not advance past BA until resume crosses BA.
+        assert!(!checkpointer.apply_pending_adopt_if_ready(&before_a));
+        assert!(checkpointer.apply_pending_adopt_if_ready(&between));
+        let mid = CheckpointMeta::parse(checkpointer.schema_json.as_deref().expect("meta"))
+            .expect("parse")
+            .expect("v2");
+        assert_eq!(mid.source_layout_fingerprint, l1.fingerprint());
+        // L2 epoch still pending until resume crosses BB. After the partial
+        // apply, reconnect at `between` must restore L1 (promoted pre_adopt),
+        // not the original L0.
+        assert!(checkpointer.pending_adopt.is_some());
+        let restored_after_partial = checkpointer
+            .restore_pre_adopt_if_needed(&between)
+            .expect("after partial apply, between BA and BB must still restore L1");
+        assert_eq!(
+            restored_after_partial.layout.fingerprint(),
+            l1.fingerprint(),
+            "partial apply must promote pre_adopt to the latest crossed layout"
+        );
+        // Positions before BA are no longer in the pending chain's restore
+        // window once BA has been crossed — restore uses promoted L1 as the
+        // baseline, which is correct for any remaining pre-BB reconnect that
+        // somehow reopened earlier (safe: L1 matches post-A events; pre-A
+        // events are behind the durable resume floor).
+        assert!(checkpointer.apply_pending_adopt_if_ready(&bb));
+        let done = CheckpointMeta::parse(checkpointer.schema_json.as_deref().expect("meta"))
+            .expect("parse")
+            .expect("v2");
+        assert_eq!(done.source_layout_fingerprint, l2.fingerprint());
+        assert!(checkpointer.pending_adopt.is_none());
+    }
+
+    #[test]
+    fn reconnect_replay_uses_known_boundary_not_later_epoch() {
+        use super::super::setup::SourceColumn;
+        use super::super::{CHECKPOINT_META_VERSION, CheckpointMeta};
+
+        let col = |name: &str, ty: &str, pk: bool| SourceColumn {
+            name: name.to_string(),
+            column_type: ty.to_string(),
+            enum_variants: None,
+            set_variants: None,
+            is_primary_key: pk,
+        };
+        let l0 = TableLayout {
+            columns: vec![col("id", "int", true), col("a", "int", false)],
+        };
+        let l1 = TableLayout {
+            columns: vec![col("a", "int", false), col("id", "int", true)],
+        };
+        let l2 = TableLayout {
+            columns: vec![
+                col("a", "int", false),
+                col("id", "int", true),
+                col("b", "int", false),
+            ],
+        };
+
+        let meta = CheckpointMeta {
+            version: CHECKPOINT_META_VERSION,
+            dataset_schema_json: r#"{"fields":[]}"#.to_string(),
+            source_layout_fingerprint: l0.fingerprint(),
+        };
+        let mut checkpointer = Checkpointer {
+            store: Arc::new(super::super::NoopPositionStore),
+            schema_json: Some(meta.to_schema_json().expect("serialize")),
+            pending_adopt: None,
+            dataset_name: "orders".to_string(),
+            metrics: MetricsCollector::new(),
+            last_persisted: BinlogPosition::new("binlog.000001", 100),
+        };
+
+        let ba = BinlogPosition::new("binlog.000001", 500);
+        let bb = BinlogPosition::new("binlog.000001", 800);
+        checkpointer.note_adopted_layout(
+            &AdoptedLayout {
+                layout: l1.clone(),
+                column_map: vec![1, 0],
+                pk_source_indexes: vec![1],
+            },
+            AdoptedLayout {
+                layout: l0.clone(),
+                column_map: vec![0, 1],
+                pk_source_indexes: vec![0],
+            },
+            &ba,
+        );
+        checkpointer.note_adopted_layout(
+            &AdoptedLayout {
+                layout: l2.clone(),
+                column_map: vec![1, 0, 2],
+                pk_source_indexes: vec![1],
+            },
+            AdoptedLayout {
+                layout: l1.clone(),
+                column_map: vec![1, 0],
+                pk_source_indexes: vec![1],
+            },
+            &bb,
+        );
+
+        // Reconnect before BA restores L0; replaying ALTER@BA must apply the
+        // known L1 epoch — not today's L2 from information_schema.
+        let before_a = BinlogPosition::new("binlog.000001", 400);
+        let restored = checkpointer
+            .restore_pre_adopt_if_needed(&before_a)
+            .expect("restore L0");
+        assert_eq!(restored.layout.fingerprint(), l0.fingerprint());
+
+        let known = checkpointer
+            .layout_for_replay_boundary(&ba)
+            .expect("BA must be a known pending epoch");
+        assert_eq!(
+            known.layout.fingerprint(),
+            l1.fingerprint(),
+            "reconnect replay of BA must use L1, not a later information_schema fetch"
+        );
+
+        // A spurious re-note of BA with today's L2 must not corrupt the chain.
+        checkpointer.note_adopted_layout(
+            &AdoptedLayout {
+                layout: l2,
+                column_map: vec![1, 0, 2],
+                pk_source_indexes: vec![1],
+            },
+            AdoptedLayout {
+                layout: l0,
+                column_map: vec![0, 1],
+                pk_source_indexes: vec![0],
+            },
+            &ba,
+        );
+        let still = checkpointer
+            .layout_for_replay_boundary(&ba)
+            .expect("BA still known");
+        assert_eq!(
+            still.layout.fingerprint(),
+            l1.fingerprint(),
+            "re-noting a known boundary must not overwrite with a later information_schema layout"
+        );
+    }
+
+    #[test]
+    fn behind_latest_unknown_boundary_uses_layout_at_not_fresh_fetch() {
+        use super::super::setup::SourceColumn;
+        use super::super::{CHECKPOINT_META_VERSION, CheckpointMeta};
+
+        let col = |name: &str, ty: &str, pk: bool| SourceColumn {
+            name: name.to_string(),
+            column_type: ty.to_string(),
+            enum_variants: None,
+            set_variants: None,
+            is_primary_key: pk,
+        };
+        let l0 = TableLayout {
+            columns: vec![col("id", "int", true), col("a", "int", false)],
+        };
+        let l1 = TableLayout {
+            columns: vec![col("a", "int", false), col("id", "int", true)],
+        };
+        let l2 = TableLayout {
+            columns: vec![
+                col("a", "int", false),
+                col("id", "int", true),
+                col("b", "int", false),
+            ],
+        };
+
+        let meta = CheckpointMeta {
+            version: CHECKPOINT_META_VERSION,
+            dataset_schema_json: r#"{"fields":[]}"#.to_string(),
+            source_layout_fingerprint: l0.fingerprint(),
+        };
+        let mut checkpointer = Checkpointer {
+            store: Arc::new(super::super::NoopPositionStore),
+            schema_json: Some(meta.to_schema_json().expect("serialize")),
+            pending_adopt: None,
+            dataset_name: "orders".to_string(),
+            metrics: MetricsCollector::new(),
+            last_persisted: BinlogPosition::new("binlog.000001", 100),
+        };
+
+        // First change recorded only via TableMap@T1; second via ALTER@A2.
+        let t1 = BinlogPosition::new("binlog.000001", 500);
+        let a2 = BinlogPosition::new("binlog.000001", 800);
+        let a1 = BinlogPosition::new("binlog.000001", 450); // ALTER that caused T1; ≠ T1
+        checkpointer.note_adopted_layout(
+            &AdoptedLayout {
+                layout: l1.clone(),
+                column_map: vec![1, 0],
+                pk_source_indexes: vec![1],
+            },
+            AdoptedLayout {
+                layout: l0.clone(),
+                column_map: vec![0, 1],
+                pk_source_indexes: vec![0],
+            },
+            &t1,
+        );
+        checkpointer.note_adopted_layout(
+            &AdoptedLayout {
+                layout: l2,
+                column_map: vec![1, 0, 2],
+                pk_source_indexes: vec![1],
+            },
+            AdoptedLayout {
+                layout: l1.clone(),
+                column_map: vec![1, 0],
+                pk_source_indexes: vec![1],
+            },
+            &a2,
+        );
+
+        // A1 is behind latest but not an exact known boundary. Replay must use
+        // layout_at(A1)=L0 (A1 < T1), never a fresh L2 fetch.
+        let replay = checkpointer
+            .layout_for_replay_boundary(&a1)
+            .expect("behind-latest must resolve via layout_at");
+        assert_eq!(
+            replay.layout.fingerprint(),
+            l0.fingerprint(),
+            "ALTER@A1 before TableMap@T1 must keep L0 until T1, not jump to L2"
+        );
+
+        // Between T1 and A2, an unknown boundary must resolve to L1.
+        let between = BinlogPosition::new("binlog.000001", 600);
+        let mid = checkpointer
+            .layout_for_replay_boundary(&between)
+            .expect("between T1 and A2");
+        assert_eq!(mid.layout.fingerprint(), l1.fingerprint());
+
+        // Exact T1 still works.
+        let at_t1 = checkpointer
+            .layout_for_replay_boundary(&t1)
+            .expect("exact T1");
+        assert_eq!(at_t1.layout.fingerprint(), l1.fingerprint());
     }
 
     #[test]

@@ -250,3 +250,6 @@ required-features = ["bench", "kafka"]
 harness = false
 name = "pgoutput_decode"
 required-features = ["postgres"]
+
+[lints]
+workspace = true
