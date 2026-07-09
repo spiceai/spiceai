@@ -101,7 +101,7 @@ fn inventory_dataset(port: u16, schema_inference: SchemaInference) -> Dataset {
     dataset.schema_inference = schema_inference;
     dataset.acceleration = Some(Acceleration {
         enabled: true,
-        engine: Some("duckdb".to_string()),
+        engine: Some("arrow".to_string()),
         mode: Mode::Memory,
         refresh_mode: Some(RefreshMode::Changes),
         ..Acceleration::default()
