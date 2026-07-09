@@ -13232,12 +13232,12 @@ impl CayenneTableProvider {
         // physically applied by this rewrite (warm-resident keys by the warm
         // stream, cold-resident keys by the dirty-file stream; conservative
         // detection guarantees no tombstoned key hides in a carried file).
-        let rewritten_files = cold_files.len();
-        let carried_files = clean_cold.len();
-        // Rewritten bytes only — the carried files cost zero object-store IO,
-        // and this metric is the production check that promotion cost tracks
-        // the CHANGED data, not total table size.
-        let rewritten_bytes: u64 = cold_files
+        let written_files = cold_files.len();
+        let carried_datalake_files = clean_cold.len();
+        // Newly WRITTEN bytes only — the carried files cost zero object-store
+        // IO, and this metric is the production check that promotion cost
+        // tracks the CHANGED data, not total table size.
+        let written_bytes: u64 = cold_files
             .iter()
             .map(|f| u64::try_from(f.file_size_bytes.max(0)).unwrap_or(0))
             .sum();
@@ -13262,23 +13262,51 @@ impl CayenneTableProvider {
         }
         self.trigger_old_snapshot_cleanup(&new_snapshot_id).await;
 
-        // Publish telemetry: bytes REWRITTEN this promotion (carried files
-        // cost nothing). The last successful publish time is derivable from
+        // Publish telemetry: bytes WRITTEN this promotion (carried files cost
+        // nothing). The last successful publish time is derivable from
         // `cayenne_compaction_duration_ms{kind="datalake", result="completed"}`.
         telemetry::cayenne::track_compaction_merged_bytes(
-            rewritten_bytes,
+            written_bytes,
             &[
                 telemetry::KeyValue::new("table", self.table_metadata.table_name.clone()),
                 telemetry::KeyValue::new("kind", "datalake"),
             ],
         );
 
+        // Trace fields come in three pairs:
+        //   input          — warm_files/warm_bytes: the newly settled warm
+        //                    data this promotion publishes;
+        //   classification — rewritten_datalake_files/carried_datalake_files:
+        //                    the existing datalake manifest split (they sum to
+        //                    the prior manifest size);
+        //   output         — written_files/written_bytes: the new files
+        //                    uploaded (byte-level write amplification =
+        //                    written_bytes / warm delta).
+        // The headline `datalake_rewrite_selectivity` (DataFusion-metrics
+        // style) is the classification ratio: the fraction of existing
+        // datalake files the tombstones selected for rewrite — lower is
+        // better, carried files cost zero object-store IO.
+        let rewritten_datalake_files = dirty_cold.len();
+        let datalake_rewrite_selectivity = if prior_cold_len == 0 {
+            "n/a (first promotion, no existing datalake files)".to_string()
+        } else {
+            #[expect(
+                clippy::cast_precision_loss,
+                reason = "file counts are far below f64's exact-integer range; display only"
+            )]
+            let pct = (rewritten_datalake_files as f64 / prior_cold_len as f64) * 100.0;
+            format!("{pct:.1}% ({rewritten_datalake_files}/{prior_cold_len} existing datalake files)")
+        };
         tracing::info!(
             target: "cayenne::compaction",
             table = self.table_metadata.table_name.as_str(),
-            rewritten_files,
-            carried_files,
-            dirty_inputs = dirty_cold.len(),
+            datalake_rewrite_selectivity = %datalake_rewrite_selectivity,
+            warm_files,
+            warm_bytes,
+            rewritten_datalake_files,
+            carried_datalake_files,
+            written_files,
+            written_bytes,
             total_rows,
             "Datalake-tier promotion committed (carry-forward)"
         );
