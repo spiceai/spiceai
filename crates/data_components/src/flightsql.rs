@@ -41,13 +41,17 @@ use arrow_flight::{
 use datafusion::{
     arrow::datatypes::SchemaRef,
     catalog::Session,
-    common::Statistics,
+    common::tree_node::{Transformed, TreeNode},
     common::utils::quote_identifier,
+    common::{DFSchema, Statistics},
     datasource::TableProvider,
     error::{DataFusionError, Result as DataFusionResult},
     execution::TaskContext,
-    logical_expr::{Expr, TableProviderFilterPushDown, TableType},
-    physical_expr::{EquivalenceProperties, LexOrdering, PhysicalSortExpr, expressions::Column},
+    logical_expr::{Expr, TableProviderFilterPushDown, TableType, execution_props::ExecutionProps},
+    physical_expr::{
+        AnalysisContext, EquivalenceProperties, LexOrdering, PhysicalSortExpr, analyze,
+        create_physical_expr, expressions::Column, intervals::utils::check_support,
+    },
     physical_plan::{
         DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PlanProperties,
         SendableRecordBatchStream, SortOrderPushdownResult,
@@ -488,28 +492,112 @@ impl FlightSQLTable {
         //
         // When filters are pushed down to the remote scan, the stamped statistics
         // still describe the *unfiltered* slice the executor reported (they are the
-        // whole-table row count / column bounds, not the filtered subset). Every
-        // pushdown-eligible filter is reported `Exact` (see
-        // `supports_filters_pushdown`), so DataFusion drops the coordinator-side
-        // `FilterExec` — and if the stamped `num_rows`/bounds stay `Exact`, the
-        // `aggregate_statistics` optimizer rule folds `COUNT(*)`/`MIN`/`MAX` to
-        // those unfiltered values, silently ignoring the predicate (e.g. a filtered
-        // `COUNT(*)` returns the full table count — issue #11599). Marking the
-        // statistics inexact when any filter is applied disables that fold while
-        // keeping the bounds usable for join sizing.
+        // whole-table row count / column bounds, not the filtered subset). Two
+        // adjustments keep the planner honest about that:
+        //
+        // - Scale `num_rows`/`total_byte_size` by the filters' estimated
+        //   selectivity (see `estimate_filter_selectivity`). Reporting the
+        //   unfiltered count makes the planner treat a heavily filtered scan as
+        //   table-sized, mis-sizing every join above it: hash-join side
+        //   selection and the broadcast-join cost test both compare these row
+        //   counts.
+        // - Mark the statistics inexact. Every pushdown-eligible filter is
+        //   reported `Exact` (see `supports_filters_pushdown`), so DataFusion
+        //   drops the coordinator-side `FilterExec` — and if the stamped
+        //   `num_rows`/bounds stayed `Exact`, the `aggregate_statistics`
+        //   optimizer rule would fold `COUNT(*)`/`MIN`/`MAX` to the unfiltered
+        //   values, silently ignoring the predicate (e.g. a filtered `COUNT(*)`
+        //   returning the full table count — issue #11599).
         let exec = match &self.statistics {
             Some(stats) => {
-                let stats = stats.clone().project(projections);
+                let projected = stats.clone().project(projections);
                 let stats = if filters.is_empty() {
-                    stats
+                    projected
                 } else {
-                    stats.to_inexact()
+                    // Selectivity is estimated against the full (unprojected)
+                    // table schema/statistics: filters may reference columns
+                    // outside the projection.
+                    let selectivity = estimate_filter_selectivity(schema, stats, filters);
+                    let mut scaled = projected.to_inexact();
+                    scaled.num_rows = scaled.num_rows.with_estimated_selectivity(selectivity);
+                    scaled.total_byte_size = scaled
+                        .total_byte_size
+                        .with_estimated_selectivity(selectivity);
+                    scaled
                 };
                 exec.with_statistics(stats)
             }
             None => exec,
         };
         Ok(Arc::new(exec))
+    }
+}
+
+/// Selectivity assumed for a pushed-down filter conjunct that interval analysis
+/// cannot evaluate (an expression shape it doesn't support, or one that fails
+/// to plan). Mirrors `FilterExec`'s default selectivity of 20%.
+const DEFAULT_FILTER_SELECTIVITY: f64 = 0.2;
+
+/// Estimate the combined selectivity (`0.0..=1.0`) of the pushed-down `filters`
+/// against the table's full (unprojected) `schema` and `statistics`.
+///
+/// Each conjunct is analyzed independently with DataFusion's interval analysis
+/// (the same machinery `FilterExec` uses for its own statistics) and the
+/// per-conjunct selectivities are multiplied under an independence assumption.
+/// A conjunct that cannot be analyzed contributes [`DEFAULT_FILTER_SELECTIVITY`]
+/// rather than being ignored; a conjunct the analysis *supports* but learns
+/// nothing from (e.g. no column bounds) contributes 1.0, matching `FilterExec`.
+/// The result only ever scales statistics that are already marked inexact, so a
+/// misestimate cannot corrupt results — only plan quality.
+fn estimate_filter_selectivity(
+    schema: &SchemaRef,
+    statistics: &Statistics,
+    filters: &[Expr],
+) -> f64 {
+    let Ok(df_schema) = DFSchema::try_from(Arc::clone(schema)) else {
+        return DEFAULT_FILTER_SELECTIVITY;
+    };
+    let props = ExecutionProps::new();
+    filters
+        .iter()
+        .map(|filter| conjunct_selectivity(filter, schema, &df_schema, statistics, &props))
+        .product::<f64>()
+        .clamp(0.0, 1.0)
+}
+
+fn conjunct_selectivity(
+    filter: &Expr,
+    schema: &SchemaRef,
+    df_schema: &DFSchema,
+    statistics: &Statistics,
+    props: &ExecutionProps,
+) -> f64 {
+    // Filters arrive with plan-qualified columns (`lineitem.l_shipdate`);
+    // strip the qualifiers so they resolve against the provider's bare schema.
+    let Ok(unqualified) = filter.clone().transform(|expr| {
+        Ok(match expr {
+            Expr::Column(col) if col.relation.is_some() => Transformed::yes(Expr::Column(
+                datafusion::common::Column::new_unqualified(col.name),
+            )),
+            other => Transformed::no(other),
+        })
+    }) else {
+        return DEFAULT_FILTER_SELECTIVITY;
+    };
+    let Ok(predicate) = create_physical_expr(&unqualified.data, df_schema, props) else {
+        return DEFAULT_FILTER_SELECTIVITY;
+    };
+    if !check_support(&predicate, schema) {
+        return DEFAULT_FILTER_SELECTIVITY;
+    }
+    let Ok(analysis_ctx) =
+        AnalysisContext::try_from_statistics(schema, &statistics.column_statistics)
+    else {
+        return DEFAULT_FILTER_SELECTIVITY;
+    };
+    match analyze(&predicate, analysis_ctx, schema) {
+        Ok(ctx) => ctx.selectivity.unwrap_or(1.0).clamp(0.0, 1.0),
+        Err(_) => DEFAULT_FILTER_SELECTIVITY,
     }
 }
 
