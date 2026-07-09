@@ -4,6 +4,7 @@ compute:
     image_tag: ${SPIDAPTER_IMAGE_TAG:-}
     scheduler_state_location: ${SCHEDULER_STATE_LOCATION:-}
     organization_tag: ${SPIDAPTER_ORGANIZATION_TAG:-}
+    cluster_name: ${SPIDAPTER_CLUSTER_NAME:-}
     resources:
       app_memory: ${SPIDAPTER_APP_MEMORY_LIMIT:-64Gi}
       ephemeral_storage_gb: ${SPIDAPTER_EPHEMERAL_STORAGE_LIMIT_GB:-}
