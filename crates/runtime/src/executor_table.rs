@@ -18,7 +18,8 @@ limitations under the License.
 //! a single peer executor's partition of a table over Flight SQL.
 //!
 //! This is the primitive behind distributed broadcast joins on the
-//! distributed-acceleration (Cayenne catalog) path. Each executor physically
+//! distributed-acceleration paths (both Cayenne catalog tables and accelerated
+//! datasets in the default `spice.public` schema). Each executor physically
 //! holds only its assigned partition of a table, so a plain `SELECT * FROM t`
 //! issued to one executor returns just that executor's slice. A small dimension
 //! table can therefore be reconstructed in full on ANY node by UNION-ing
@@ -56,7 +57,6 @@ use flight_client::{
 };
 use tonic::transport::{ClientTlsConfig, Endpoint};
 
-use cayenne::catalog_provider::CayenneSchemaProvider;
 use data_components::flightsql::{FlightSQLTable, FlightSqlClient};
 
 use crate::datafusion::DataFusion;
@@ -135,41 +135,18 @@ impl TableFunctionImpl for ExecutorTableFunc {
             )
         })?;
 
-        // Resolve the schema SYNCHRONOUSLY from the LOCAL catalog. `get_table_sync`
-        // only sees `SpiceSchemaProvider` tables (not external catalogs like
-        // Cayenne), and the generic `SchemaProvider::table()` is async — so
-        // resolve the catalog/schema (both sync) and read the Cayenne schema
-        // provider's in-memory table cache directly via `table_sync`.
-        let cat_name = table_ref.catalog().ok_or_else(|| {
+        // Resolve the schema SYNCHRONOUSLY from the LOCAL catalog (every node
+        // shares the table definition; only the data is partitioned).
+        // `get_table_sync` resolves bare/partial references against the default
+        // `spice.public` catalog — matching how the coordinator's planner
+        // resolved the same reference when it rendered this SQL — and covers
+        // every cached schema provider (`SpiceSchemaProvider` for accelerated
+        // datasets, Cayenne catalog schemas, Iceberg) via `sync_table`.
+        let provider = df.get_table_sync(&table_ref).ok_or_else(|| {
             DataFusionError::Plan(format!(
-                "executor_table: table '{table_str}' must be catalog-qualified"
+                "executor_table: table '{table_str}' not found locally"
             ))
         })?;
-        let sch_name = table_ref.schema().ok_or_else(|| {
-            DataFusionError::Plan(format!(
-                "executor_table: table '{table_str}' must be schema-qualified"
-            ))
-        })?;
-        let catalog = df.ctx.catalog(cat_name).ok_or_else(|| {
-            DataFusionError::Plan(format!("executor_table: catalog '{cat_name}' not found"))
-        })?;
-        let schema_provider = catalog.schema(sch_name).ok_or_else(|| {
-            DataFusionError::Plan(format!("executor_table: schema '{sch_name}' not found"))
-        })?;
-        let cayenne_schema = schema_provider
-            .downcast_ref::<CayenneSchemaProvider>()
-            .ok_or_else(|| {
-                DataFusionError::Plan(format!(
-                    "executor_table: schema '{cat_name}.{sch_name}' is not a Cayenne catalog schema"
-                ))
-            })?;
-        let provider = cayenne_schema
-            .table_sync(table_ref.table())
-            .ok_or_else(|| {
-                DataFusionError::Plan(format!(
-                    "executor_table: table '{table_str}' not found locally"
-                ))
-            })?;
         let schema: SchemaRef = provider.schema();
 
         let client = build_peer_client(&endpoint, df.cluster_config.client_tls_config())?;

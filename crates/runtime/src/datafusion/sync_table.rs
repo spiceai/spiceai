@@ -36,6 +36,7 @@ limitations under the License.
 
 use std::sync::Arc;
 
+use cayenne::catalog_provider::CayenneSchemaProvider;
 use data_components::iceberg::provider::IcebergSchemaProvider;
 use datafusion::catalog::{SchemaProvider, TableProvider};
 use runtime_datafusion::schema_provider::SpiceSchemaProvider;
@@ -59,6 +60,12 @@ impl SyncTableProvider for IcebergSchemaProvider {
     }
 }
 
+impl SyncTableProvider for CayenneSchemaProvider {
+    fn sync_table(&self, name: &str) -> Option<Arc<dyn TableProvider>> {
+        self.table_sync(name)
+    }
+}
+
 /// Views a `dyn SchemaProvider` as a [`SyncTableProvider`] when its concrete
 /// type supports synchronous resolution. One entry per supporting type — this
 /// list is the single extension point for adding a catalog's synchronous tables.
@@ -73,6 +80,10 @@ const SYNC_CASTS: &[SyncCast] = &[
     },
     |s| {
         s.downcast_ref::<IcebergSchemaProvider>()
+            .map(|p| p as &dyn SyncTableProvider)
+    },
+    |s| {
+        s.downcast_ref::<CayenneSchemaProvider>()
             .map(|p| p as &dyn SyncTableProvider)
     },
 ];
