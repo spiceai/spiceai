@@ -413,7 +413,7 @@ async fn mysql_comment_metadata(
 /// Query `information_schema` for the target table's primary key and rough
 /// sizing. Returns an [`InferredSchema`]; empty when nothing usable was found
 /// (e.g. a table with no primary key). Secondary indexes / sort columns /
-/// per-column stats are not inferred for MySQL yet — only the primary key
+/// per-column stats are not inferred for `MySQL` yet — only the primary key
 /// (which `refresh_mode: changes` requires to route UPDATE/DELETE events) and
 /// the row-count/byte estimates the adaptive tuner warm-starts from.
 async fn mysql_inferred_schema_metadata(
@@ -478,9 +478,9 @@ async fn mysql_inferred_schema_metadata(
     })
 }
 
-/// Enrich the provider's schema with MySQL metadata: column/table comments and
+/// Enrich the provider's schema with `MySQL` metadata: column/table comments and
 /// source types (always), plus the inferred primary key / sizing when the
-/// dataset opts into `schema_inference: extended`. Mirrors the PostgreSQL
+/// dataset opts into `schema_inference: extended`. Mirrors the `PostgreSQL`
 /// connector's `enrich_with_postgres_metadata`.
 async fn enrich_with_mysql_metadata(
     pool: &Arc<MySQLConnectionPool>,

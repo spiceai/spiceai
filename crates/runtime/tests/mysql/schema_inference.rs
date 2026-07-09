@@ -160,7 +160,7 @@ async fn wait_for_scalar_i64(
 /// With `schema_inference: extended`, a changes-mode dataset that declares no
 /// primary key still loads (the PK is inferred from `information_schema`) and
 /// correctly routes a live UPDATE and DELETE — the exact path that failed with
-/// "no primary key available" before MySQL extended inference existed.
+/// "no primary key available" before `MySQL` extended inference existed.
 #[tokio::test]
 async fn test_extended_inference_enables_cdc_without_declared_pk() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some(
