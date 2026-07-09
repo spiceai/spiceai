@@ -63,9 +63,12 @@ impl GitHubWorkflow {
         Ok(())
     }
 
-
     /// A reimplementation of [`octocrab::actions::WorkflowDispatchBuilder::send`] that returns the workflow run URL.
-    pub async fn run_workflow(&self, crab: &Octocrab, input: Option<Value>) -> anyhow::Result<String> {
+    pub async fn run_workflow(
+        &self,
+        crab: &Octocrab,
+        input: Option<Value>,
+    ) -> anyhow::Result<String> {
         // [`WorkflowDispatch`] is `non_exhaustive`.
         let body = serde_json::json!({
             "ref": &self.r#ref,
@@ -85,9 +88,11 @@ impl GitHubWorkflow {
             #[allow(dead_code)]
             html_url: String,
         }
-        let z = map_github_error(crab._post(uri, Some(&body)).await?).await?.into_body().collect().await?.to_bytes();
-        let resp = serde_json::from_slice::<WorkflowDispatchResponse>(&z)?;
-        Ok(resp.run_url)
+        let response = map_github_error(crab._post(uri, Some(&body)).await?).await?;
+        let body = response.into_body().collect().await?.to_bytes();
+        let WorkflowDispatchResponse { run_url, .. } =
+            serde_json::from_slice::<WorkflowDispatchResponse>(&body)?;
+        Ok(run_url)
     }
 
     /// Returns the number of active workflow runs for this workflow.

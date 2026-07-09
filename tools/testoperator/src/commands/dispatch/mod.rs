@@ -236,7 +236,7 @@ pub async fn dispatch(args: DispatchArgs) -> Result<()> {
             }
         };
         match result {
-            Err(e) =>  {
+            Err(e) => {
                 eprintln!("Failed to dispatch {}. Error: {e:?}", path.display());
                 failed_dispatches.push((path.display().to_string(), e));
                 continue;
