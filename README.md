@@ -30,7 +30,7 @@
 
 🎯 **Goal**: Build data-grounded AI apps and agents in minutes, not months. No pipelines. No glue. Just SQL, search, and inference — federated across your data, accelerated locally, served on localhost.
 
-> 🆕 **New in Spice 2.0 — add a real-time analytics node to your operational database.** Point Spice at **PostgreSQL, MySQL, or MongoDB** and it maintains a sandboxed, analytics-ready replica with high-throughput **CDC replication** — **sub-second queries, ~2-second freshness, and zero analytical load on production**. No ETL. No Debezium. No Kafka. [Read the Spice 2.0 launch →](https://spice.ai/blog/spice-2-0-is-now-available)
+> 🆕 **New in Spice 2.0 — add a real-time analytics node to your operational database.** Point Spice at **PostgreSQL, MySQL, or MongoDB** and it maintains a sandboxed, analytics-ready replica with high-throughput **CDC replication** — **sub-second queries, ~2-second freshness, and zero analytical load on production**. No ETL, no Debezium, no Kafka required. [Read the Spice 2.0 launch →](https://spice.ai/blog/spice-2-0-is-now-available)
 
 ## Why Spice?
 
@@ -81,7 +81,7 @@ Spice provides five APIs and interfaces in a lightweight, portable runtime (sing
 
 Add a sandboxed, analytics-ready replica alongside **PostgreSQL, MySQL, and MongoDB** in minutes — **~2-second end-to-end freshness, zero analytical load on production, and no ETL**. Spice replicates committed inserts, updates, and deletes directly from the native change log at up to **~170x the ingest throughput of Spice 1.x**, so production never runs a single analytical query. It's incrementally adoptable: start with **1 table** and be querying operational data in minutes, then join across replicated sources in a single SQL query. In the CH-BenCHmark HTAP benchmark, **1 Spice node served 1,046 analytical queries/hour at SF1000 (1,000 warehouses, 300M+ rows) while the source sustained a 266,000+ tpmC live transactional load**. [Read the Spice 2.0 launch →](https://spice.ai/blog/spice-2-0-is-now-available)
 
-- **PostgreSQL (WAL), MySQL (binlog), and MongoDB (change streams)** — native logical replication with auto-managed slots/positions and bootstrapped snapshots. **No Debezium or Kafka required.**
+- **PostgreSQL (WAL), MySQL (binlog), and MongoDB (change streams)** — native replication with auto-managed replication state (slots, binlog positions, resume tokens) and bootstrapped initial snapshots. **No Debezium or Kafka required.**
 - **DynamoDB Streams** — two-tier acceleration that fans out from a central Spice layer to thousands of edge sidecars with sub-second propagation. Used in production for global control-plane sync. [Read the pattern →](https://spice.ai/blog/real-time-acceleration-with-dynamodb-streams)
 - **Debezium + Kafka** — available when you want it.
 
@@ -159,7 +159,7 @@ If you build with **DataFusion**, **DuckDB**, **Vortex**, **Iceberg**, or **Ball
 
 ### Real-time Analytics on Operational Data (no ETL)
 
-- **Analytics node for PostgreSQL, MySQL, and MongoDB**: Point Spice at a live operational database and it maintains a continuously updated, sandboxed analytics replica via native CDC — **sub-second queries, ~2-second freshness, and 0 analytical queries on production**. Start with 1 table, then join across replicated sources in one SQL query. [CDC Docs](https://spiceai.org/docs/features/cdc)
+- **Analytics node for PostgreSQL, MySQL, and MongoDB**: Point Spice at a live operational database and it maintains a continuously updated, sandboxed analytics replica via native CDC — **sub-second queries, ~2-second freshness, and zero analytical queries against production**. Start with one table, then join across replicated sources in one SQL query. [CDC Docs](https://spiceai.org/docs/features/cdc)
 - **HTAP at scale**: Sustain analytics and transactions on the same data — **1,046 analytical QPH at SF1000 under a 266,000+ tpmC transactional load** in CH-BenCHmark, all served from the replica. [Spice 2.0 launch →](https://spice.ai/blog/spice-2-0-is-now-available)
 - **Bring your own BI tools**: Query the replica from Power BI, Tableau, Looker, and Apache Superset over Arrow Flight SQL, ODBC, and JDBC — or from Python and the Go, Rust, Java, and JavaScript SDKs.
 
@@ -590,7 +590,7 @@ Spice.ai is designed to be extensible. See [EXTENSIBILITY.md](./docs/EXTENSIBILI
 
 🚀 See the full [Roadmap](https://github.com/spiceai/spiceai/blob/trunk/docs/ROADMAP.md). Recent releases and what's next:
 
-- **[v2.0](https://spiceai.org/releases/v2.0-stable)** (shipped, June 2026) — Spice Cayenne GA, multi-active HA distributed query GA, native CDC (PostgreSQL WAL, MongoDB change streams, Kafka), DML/DDL write-back, mTLS + OIDC, HashiCorp Vault & Azure Key Vault, and SQL/HTTP UDFs. [Read the launch →](https://spice.ai/blog/spice-2-0-is-now-available)
+- **[v2.0](https://spiceai.org/releases/v2.0-stable)** (shipped, June 2026) — Spice Cayenne GA, multi-active HA distributed query GA, native CDC (PostgreSQL WAL, MongoDB change streams, Debezium), DML/DDL write-back, mTLS + OIDC, HashiCorp Vault & Azure Key Vault, and SQL/HTTP UDFs. [Read the launch →](https://spice.ai/blog/spice-2-0-is-now-available)
 - **[v2.1](https://spiceai.org/releases/v2.1.0)** (shipped, July 2026) — High-throughput Cayenne CDC (in-memory tier + dedicated compaction runtime), PostgreSQL replication at scale (shared replication slot), distributed Iceberg scans and broadcast joins, DataFusion v54, tensor-parallel GLM inference, and adaptive self-tuning (experimental).
 - **[v2.2](https://github.com/spiceai/spiceai/milestone/99)** (upcoming, targeting September 2026) — MySQL binlog CDC (already on `trunk`), webhooks, and reactive event-driven actions (Drasi-based).
 
