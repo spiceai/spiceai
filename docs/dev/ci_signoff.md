@@ -2,7 +2,8 @@
 
 Spice runs the fast quality checks on the **developer's machine**, not on every
 pull-request push. You run one command locally to attest your change, and a
-single lightweight check validates that attestation on the PR. The heavy, full
+single lightweight check — **Attestation** — validates it on the PR (only the
+`enforce-pull-with-spice` PR-hygiene check runs alongside it). The heavy, full
 test suite then runs **once in the merge queue**, on the actual merged result,
 as the required gate.
 
@@ -109,7 +110,8 @@ Advisory checks that also run on `merge_group` but don't block (they can be
 promoted to required with a gate job later): `integration tests (llms)`,
 `Elasticsearch Integration Tests`, `Helm Lint`.
 
-`Attestation` is the only status produced on `pull_request`, so it (plus reviews)
+`Attestation` is the only *quality* check produced on `pull_request` (the
+`enforce-pull-with-spice` hygiene check runs there too), so it plus reviews
 gates entry to the queue. Every required check is produced on `merge_group`, so
 the queue enforces the full suite on the merged commit. `check_changes` still
 lets docs-only merges skip the build and report success.

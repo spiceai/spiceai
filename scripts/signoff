@@ -41,7 +41,7 @@ CHECKS_ELAPSED=0  # set by run_checks; returned via a global, not stdout
 # here must be produced by a workflow that triggers on `merge_group` (see the
 # .github/workflows/*.yml gate jobs) or the merge queue will stall.
 readonly REQUIRED_CHECKS=(
-  "Attestation"              # this sign-off gate (pr.yml) — the only check on the PR
+  "Attestation"              # sign-off gate (pr.yml) — the PR's only quality check
   "enforce-pull-with-spice"  # PR hygiene (enforce-pulls-with-spice.yml)
   "Rust Lint"                # pr.yml
   "Build and Test"           # pr.yml
@@ -189,12 +189,15 @@ ruleset_id() {
 
 cmd_check() {
   require_tools
-  local repo id checks
+  local repo id ruleset checks
   repo=$(repo_slug)
   id=$(ruleset_id "$repo")
   [[ -n "$id" ]] || fail "no ruleset named '${TARGET_BRANCH}' on ${repo}"
-  checks=$(gh api "repos/${repo}/rulesets/${id}" \
-    --jq '(.rules[] | select(.type=="required_status_checks") | .parameters.required_status_checks[].context)' 2>/dev/null || true)
+  # Fail loudly on an API error instead of reporting "not required" — a swallowed
+  # auth/rate-limit/network error would otherwise look like a missing sign-off gate.
+  ruleset=$(gh api "repos/${repo}/rulesets/${id}") \
+    || fail "failed to read ruleset ${id} on ${repo} (auth/rate-limit/network?)"
+  checks=$(jq -r '.rules[]? | select(.type=="required_status_checks") | .parameters.required_status_checks[]?.context' <<<"$ruleset")
   if grep -qx "Attestation" <<<"$checks"; then
     echo "${OK} '${TARGET_BRANCH}' requires developer sign-off (Attestation). Required checks:"
   else
@@ -250,11 +253,23 @@ cmd_install() {
       enforcement,
       conditions,
       bypass_actors: (.bypass_actors // []),
-      rules: (.rules | map(
-        if .type == "required_status_checks"
-        then (.parameters.required_status_checks = $checks)
-        else . end
-      ))
+      rules: (
+        if any((.rules // [])[]; .type == "required_status_checks")
+        then (.rules | map(
+          if .type == "required_status_checks"
+          then (.parameters.required_status_checks = $checks)
+          else . end
+        ))
+        else ((.rules // []) + [{
+          type: "required_status_checks",
+          parameters: {
+            strict_required_status_checks_policy: false,
+            do_not_enforce_on_create: false,
+            required_status_checks: $checks
+          }
+        }])
+        end
+      )
     }')
 
   echo "$body" | gh api --method PUT "repos/${repo}/rulesets/${id}" --input - >/dev/null \

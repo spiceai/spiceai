@@ -32,8 +32,32 @@ env:
   CARGO_HTTP_TIMEOUT: 60
 
 jobs:
+  # merge_group can't path-filter, so gate the (container-spinning) test job on a
+  # changed-files check instead of running Elasticsearch for every merge entry.
+  changes:
+    runs-on: ubuntu-latest
+    outputs:
+      elasticsearch: ${{ steps.filter.outputs.elasticsearch }}
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - uses: dorny/paths-filter@7b450fff21473bca461d4b92ce414b9d0420d706 # v4.0.2
+        id: filter
+        with:
+          filters: |
+            elasticsearch:
+              - 'crates/elasticsearch/**'
+              - 'crates/data_components/src/elasticsearch/**'
+              - 'crates/data-connectors/connector-elasticsearch/**'
+              - 'crates/search/src/index/elasticsearch/**'
+              - 'crates/runtime/src/embeddings/index/elasticsearch/**'
+
   test-elasticsearch:
     name: Elasticsearch Integration Tests
+    needs: changes
+    if: ${{ needs.changes.outputs.elasticsearch == 'true' || github.event_name == 'workflow_dispatch' }}
     runs-on: spiceai-dev-runners
 
     services:
