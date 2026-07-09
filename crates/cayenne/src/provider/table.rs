@@ -12841,9 +12841,6 @@ impl CayenneTableProvider {
         }
 
         let cold_target_file_size_mb = self.table_metadata.vortex_config.cold_target_file_size_mb;
-        // `saturating_mul` mirrors `CayenneContext::new`'s MB→bytes conversion:
-        // a pathologically large configured value clamps instead of wrapping
-        // (release) or panicking (debug).
         let target_size_bytes = cold_target_file_size_mb.saturating_mul(1024 * 1024);
 
         let shard = self.write_shard_config(1, target_size_bytes, None);
