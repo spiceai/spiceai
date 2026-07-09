@@ -443,3 +443,6 @@ name = "cdc_apply_simd"
 [[bench]]
 harness = false
 name = "compaction_io_hygiene"
+
+[lints]
+workspace = true

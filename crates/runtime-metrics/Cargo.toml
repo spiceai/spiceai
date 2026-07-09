@@ -14,3 +14,6 @@ opentelemetry = { workspace = true }
 runtime-api-types = { path = "../runtime-api-types" }
 snafu = { workspace = true }
 telemetry = { path = "../telemetry" }
+
+[lints]
+workspace = true

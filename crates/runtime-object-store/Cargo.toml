@@ -42,3 +42,6 @@ ftp = ["dep:suppaftp", "dep:bb8"]
 nfs = ["dep:libnfs", "dep:nix"]
 sftp = ["dep:ssh2"]
 smb = ["dep:smb", "dep:bb8"]
+
+[lints]
+workspace = true

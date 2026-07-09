@@ -179,3 +179,6 @@ sqlite = ["runtime/sqlite"]
 tpc-extension = ["dep:tpc-extension"]
 turso = ["runtime/turso"]
 vortex = ["runtime/vortex"]
+
+[lints]
+workspace = true
