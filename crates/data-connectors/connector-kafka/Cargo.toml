@@ -26,3 +26,6 @@ snafu.workspace = true
 tokio.workspace = true
 tonic.workspace = true
 tracing.workspace = true
+
+[lints]
+workspace = true

@@ -56,3 +56,6 @@ s3_vectors = ["search/s3_vectors"]
 
 [dev-dependencies]
 insta = {workspace = true, features = ["json"] }
+
+[lints]
+workspace = true
