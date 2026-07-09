@@ -755,7 +755,6 @@ impl RuntimeBuilder {
             app: shared_app,
             apply_app_lock: Arc::new(tokio::sync::Mutex::new(())),
             df,
-            models: Arc::new(RwLock::new(HashMap::new())),
             llm_runtime_stores: Arc::new(crate::model::LlmRuntimeStores::default()),
             http_rate_control_registry,
             workers: Arc::new(RwLock::new(HashMap::new())),
