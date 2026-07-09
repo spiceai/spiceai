@@ -1,5 +1,5 @@
 /*
-Copyright 2024-2026 The Spice.ai OSS Authors
+Copyright 2024-2025 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -16,23 +16,17 @@ limitations under the License.
 
 //! [`ScalarUDFImpl`] for cosine distance of two vectors.
 //!
-//! `cosine_distance(a, b)` returns `(1 - cosine_similarity(a, b)) / 2`, mapping
-//! the result into `[0, 1]` (0 = identical, 1 = opposite).
+//! Two dispatch paths based on input type:
 //!
-//! Two dispatch paths are supported:
+//! - **SIMD path**: both inputs are `FixedSizeList<Float32, N>` (or one is
+//!   `List<Float32>`/`LargeList<Float32>` promoted to FSL via `coerce_types`) →
+//!   dispatches to [`simsimd`] for AVX-512 / AVX2 / NEON / scalar acceleration.
 //!
-//! - **SIMD path** (fast): both inputs are `FixedSizeList<Float32, N>` with the
-//!   same `N`. The kernel dispatches to [`simsimd`] which selects the best
-//!   available CPU feature set at load time (AVX-512 / AVX2 / NEON / scalar).
+//! - **Scalar fallback**: `List` or `LargeList` inputs of any numeric element
+//!   type → plain Rust loop, backwards-compatible with the original implementation.
 //!
-//! - **Scalar fallback**: either input is `List(_)` or `LargeList(_)`. Both
-//!   arguments are coerced to `List` and the distance is computed element-by-element
-//!   in `f64`. This path supports arbitrary numeric element types (Float32, Float64,
-//!   Int32, Int64) and is useful for embeddings stored in variable-length list
-//!   columns (e.g. from Parquet or JSON sources that do not produce FSL).
-//!
-//! Anything else (e.g. plain `Float32` scalars) is rejected at the coercion stage
-//! with a descriptive error.
+//! Both paths return `(1 - cosine_similarity) / 2` ∈ `[0, 1]` (0 = identical,
+//! 1 = opposite). Zero-magnitude vectors produce SQL NULL on both paths.
 
 use arrow::array::{Array, ArrayRef, Float64Array, LargeListArray, ListArray, OffsetSizeTrait};
 use arrow_schema::DataType;
@@ -50,8 +44,7 @@ use datafusion::{
 use std::sync::Arc;
 
 use crate::vector_simd::{
-    Kernel, coerce_fsl_f32_binary_args, compute_fsl_f32, make_scalar_function,
-    matching_fixed_size_list_f32,
+    Kernel, compute_fsl_f32, make_scalar_function, matching_fixed_size_list_f32,
 };
 
 pub static COSINE_DISTANCE_UDF_NAME: &str = "cosine_distance";
@@ -85,6 +78,14 @@ impl CosineDistance {
     }
 }
 
+/// Returns `true` if `dt` is `List<Float32>` or `LargeList<Float32>`.
+fn is_list_f32(dt: &DataType) -> bool {
+    match dt {
+        List(field) | LargeList(field) => field.data_type() == &DataType::Float32,
+        _ => false,
+    }
+}
+
 impl ScalarUDFImpl for CosineDistance {
     fn name(&self) -> &'static str {
         COSINE_DISTANCE_UDF_NAME
@@ -107,28 +108,52 @@ impl ScalarUDFImpl for CosineDistance {
         if arg_types.len() != 2 {
             return exec_err!("{COSINE_DISTANCE_UDF_NAME} expects exactly two arguments");
         }
+        let lhs = &arg_types[0];
+        let rhs = &arg_types[1];
 
-        // SIMD path: both args are FixedSizeList<Float32, N> with the same N.
-        if matching_fixed_size_list_f32(&arg_types[0], &arg_types[1]).is_some() {
-            return coerce_fsl_f32_binary_args(COSINE_DISTANCE_UDF_NAME, arg_types);
+        // Case 1: both are FixedSizeList<Float32, N> with matching N → SIMD path.
+        if matching_fixed_size_list_f32(lhs, rhs).is_some() {
+            return Ok(vec![lhs.clone(), rhs.clone()]);
         }
 
-        // Scalar fallback: accept List/LargeList/FixedSizeList (coerced to List).
-        let mut result = Vec::new();
-        for arg_type in arg_types {
-            match arg_type {
+        // Case 2: one is List<Float32>/LargeList<Float32>, the other is
+        // FixedSizeList<Float32, N> → promote the List/LargeList to FSL so the
+        // SIMD path handles it.
+        let fsl_field = Arc::new(arrow_schema::Field::new("item", DataType::Float32, true));
+        if let (true, FixedSizeList(_, n)) = (is_list_f32(lhs), rhs) {
+            let fsl = DataType::FixedSizeList(Arc::clone(&fsl_field), *n);
+            return Ok(vec![fsl.clone(), fsl]);
+        }
+        if let (FixedSizeList(_, n), true) = (lhs, is_list_f32(rhs)) {
+            let fsl = DataType::FixedSizeList(Arc::clone(&fsl_field), *n);
+            return Ok(vec![fsl.clone(), fsl]);
+        }
+
+        // Case 3: both are List/LargeList/FixedSizeList (any element type) →
+        // scalar fallback; coerce to a consistent List type.
+        // If either arg is LargeList, coerce both to LargeList to avoid
+        // mismatched List/LargeList at execution.
+        let use_large = matches!(lhs, LargeList(_)) || matches!(rhs, LargeList(_));
+        let coerce_one = |dt: &DataType| -> DataFusionResult<DataType> {
+            match dt {
                 List(_) | LargeList(_) | FixedSizeList(_, _) => {
-                    result.push(coerced_fixed_size_list_to_list(arg_type));
+                    let list_type = coerced_fixed_size_list_to_list(dt);
+                    if use_large {
+                        // Wrap element type in LargeList if it isn't already.
+                        match list_type {
+                            List(field) => Ok(LargeList(field)),
+                            other => Ok(other),
+                        }
+                    } else {
+                        Ok(list_type)
+                    }
                 }
-                _ => {
-                    return exec_err!(
-                        "The {COSINE_DISTANCE_UDF_NAME} function can only accept List/LargeList/FixedSizeList."
-                    );
-                }
+                _ => exec_err!(
+                    "The {COSINE_DISTANCE_UDF_NAME} function can only accept List/LargeList/FixedSizeList."
+                ),
             }
-        }
-
-        Ok(result)
+        };
+        Ok(vec![coerce_one(lhs)?, coerce_one(rhs)?])
     }
 
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DataFusionResult<ColumnarValue> {
@@ -136,19 +161,16 @@ impl ScalarUDFImpl for CosineDistance {
     }
 }
 
-/// Dispatch to the correct kernel based on the runtime array types.
-///
-/// - `(FixedSizeList, FixedSizeList)` → SIMD kernel via [`simsimd`].
-/// - `(List, List)` → scalar loop with `i32` offsets.
-/// - `(LargeList, LargeList)` → scalar loop with `i64` offsets.
-pub fn cosine_distance_inner(args: &[ArrayRef]) -> DataFusionResult<ArrayRef> {
+pub(crate) fn cosine_distance_inner(args: &[ArrayRef]) -> DataFusionResult<ArrayRef> {
     if args.len() != 2 {
         return exec_err!("{COSINE_DISTANCE_UDF_NAME} expects exactly two arguments");
     }
 
     match (&args[0].data_type(), &args[1].data_type()) {
+        // SIMD path: both inputs are FixedSizeList<Float32, N>.
+        // `simsimd`'s `cos` kernel returns `1 - cosine_similarity` ∈ [0, 2];
+        // divide by 2 to map into the standard [0, 1] distance range.
         (FixedSizeList(_, _), FixedSizeList(_, _)) => {
-            // `simsimd` returns `1 - similarity` in `[0, 2]`; divide by 2 to get `[0, 1]`.
             compute_fsl_f32(args, Kernel::Cosine, |v| v / 2.0)
         }
         (List(_), List(_)) => general_cosine_distance::<i32>(args),
@@ -300,9 +322,15 @@ fn convert_to_f64_array(array: &ArrayRef) -> DataFusionResult<Float64Array> {
 mod tests {
     use std::sync::Arc;
 
-    use arrow::array::{ArrayRef, Float64Array};
+    use arrow::array::{Array, ArrayRef, Float64Array};
+    use arrow_schema::Field;
 
-    use super::{compute_cosine_distance, cosine_distance};
+    use super::{CosineDistance, compute_cosine_distance, cosine_distance, cosine_distance_inner};
+    use crate::vector_simd::testing::fsl_f32;
+    use arrow::array::AsArray;
+    use arrow::datatypes::Float64Type;
+    use arrow_schema::DataType;
+    use datafusion::logical_expr::ScalarUDFImpl;
 
     #[test]
     fn test_cosine_distance() {
@@ -377,5 +405,121 @@ mod tests {
         let b: ArrayRef = Arc::new(Float64Array::from(vec![1.0, 2.0, 3.0]));
         let result = compute_cosine_distance(Some(a), Some(b));
         assert!(matches!(result, Ok(Some(d)) if d.is_finite()));
+    }
+
+    // --- SIMD (FixedSizeList<Float32>) path tests ---
+
+    #[test]
+    fn simd_identical_vectors_zero_distance() {
+        let a = fsl_f32(&[&[1.0_f32, 2.0, 3.0]]) as ArrayRef;
+        let b = fsl_f32(&[&[1.0_f32, 2.0, 3.0]]) as ArrayRef;
+        let out = cosine_distance_inner(&[a, b]).expect("ok");
+        let out = out.as_primitive::<Float64Type>();
+        assert!(!out.is_null(0), "expected a value, got null");
+        assert!(out.value(0).abs() < 1e-5, "expected ~0.0, got {}", out.value(0));
+    }
+
+    #[test]
+    fn simd_orthogonal_vectors_half_distance() {
+        let a = fsl_f32(&[&[1.0_f32, 0.0]]) as ArrayRef;
+        let b = fsl_f32(&[&[0.0_f32, 1.0]]) as ArrayRef;
+        let out = cosine_distance_inner(&[a, b]).expect("ok");
+        let out = out.as_primitive::<Float64Type>();
+        assert!(!out.is_null(0), "expected a value, got null");
+        assert!((out.value(0) - 0.5).abs() < 1e-5, "expected ~0.5, got {}", out.value(0));
+    }
+
+    #[test]
+    fn simd_opposite_vectors_max_distance() {
+        let a = fsl_f32(&[&[1.0_f32, 2.0, 3.0]]) as ArrayRef;
+        let b = fsl_f32(&[&[-1.0_f32, -2.0, -3.0]]) as ArrayRef;
+        let out = cosine_distance_inner(&[a, b]).expect("ok");
+        let out = out.as_primitive::<Float64Type>();
+        assert!(!out.is_null(0), "expected a value, got null");
+        assert!((out.value(0) - 1.0).abs() < 1e-5, "expected ~1.0, got {}", out.value(0));
+    }
+
+    #[test]
+    fn simd_zero_magnitude_vector_yields_null() {
+        // A zero-magnitude vector has no defined direction; the SIMD path must
+        // emit a NULL row (not an error) so failed embeddings don't bubble up.
+        let a = fsl_f32(&[&[0.0_f32, 0.0, 0.0]]) as ArrayRef;
+        let b = fsl_f32(&[&[1.0_f32, 2.0, 3.0]]) as ArrayRef;
+        let out = cosine_distance_inner(&[a, b]).expect("ok");
+        let out = out.as_primitive::<Float64Type>();
+        assert!(out.is_null(0), "expected NULL for zero-magnitude vector, got {}", out.value(0));
+    }
+
+    // --- coerce_types tests ---
+
+    fn fsl_f32_type(n: i32) -> DataType {
+        DataType::FixedSizeList(
+            Arc::new(Field::new("item", DataType::Float32, true)),
+            n,
+        )
+    }
+
+    fn list_f32_type() -> DataType {
+        DataType::List(Arc::new(Field::new("item", DataType::Float32, true)))
+    }
+
+    fn large_list_f32_type() -> DataType {
+        DataType::LargeList(Arc::new(Field::new("item", DataType::Float32, true)))
+    }
+
+    #[test]
+    fn coerce_both_fsl_returns_fsl() {
+        let udf = CosineDistance::new();
+        let result = udf
+            .coerce_types(&[fsl_f32_type(3), fsl_f32_type(3)])
+            .expect("ok");
+        assert!(matches!(result[0], DataType::FixedSizeList(_, 3)));
+        assert!(matches!(result[1], DataType::FixedSizeList(_, 3)));
+    }
+
+    #[test]
+    fn coerce_list_and_fsl_promotes_to_fsl() {
+        let udf = CosineDistance::new();
+        // List<Float32> + FSL<Float32, 4> → both FSL<Float32, 4>
+        let result = udf
+            .coerce_types(&[list_f32_type(), fsl_f32_type(4)])
+            .expect("ok");
+        assert!(matches!(result[0], DataType::FixedSizeList(_, 4)), "got {:?}", result[0]);
+        assert!(matches!(result[1], DataType::FixedSizeList(_, 4)), "got {:?}", result[1]);
+    }
+
+    #[test]
+    fn coerce_fsl_and_list_promotes_to_fsl() {
+        let udf = CosineDistance::new();
+        // FSL<Float32, 5> + List<Float32> → both FSL<Float32, 5>
+        let result = udf
+            .coerce_types(&[fsl_f32_type(5), list_f32_type()])
+            .expect("ok");
+        assert!(matches!(result[0], DataType::FixedSizeList(_, 5)), "got {:?}", result[0]);
+        assert!(matches!(result[1], DataType::FixedSizeList(_, 5)), "got {:?}", result[1]);
+    }
+
+    #[test]
+    fn coerce_large_list_and_fsl_promotes_to_fsl() {
+        let udf = CosineDistance::new();
+        let result = udf
+            .coerce_types(&[large_list_f32_type(), fsl_f32_type(6)])
+            .expect("ok");
+        assert!(matches!(result[0], DataType::FixedSizeList(_, 6)), "got {:?}", result[0]);
+        assert!(matches!(result[1], DataType::FixedSizeList(_, 6)), "got {:?}", result[1]);
+    }
+
+    #[test]
+    fn coerce_mixed_list_types_uses_large_list() {
+        // One LargeList arg → both coerced to LargeList to stay consistent.
+        let udf = CosineDistance::new();
+        let list_f64 = DataType::List(Arc::new(Field::new("item", DataType::Float64, true)));
+        let large_list_f64 =
+            DataType::LargeList(Arc::new(Field::new("item", DataType::Float64, true)));
+        let result = udf
+            .coerce_types(&[list_f64, large_list_f64])
+            .expect("ok");
+        assert!(matches!(result[0], DataType::LargeList(_)), "got {:?}", result[0]);
+        assert!(matches!(result[1], DataType::LargeList(_)), "got {:?}", result[1]);
     }
 }

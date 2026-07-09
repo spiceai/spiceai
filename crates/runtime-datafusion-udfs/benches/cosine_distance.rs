@@ -18,11 +18,11 @@ limitations under the License.
 //!
 //! Three groups are measured:
 //!
-//! - `fsl_f32/simd`: `FixedSizeList<Float32, N>` inputs via `cosine_distance_inner`
+//! - `fsl_f32/simd`: `FixedSizeList<Float32, N>` inputs via `CosineDistance`
 //!   (dispatches to simsimd).
 //! - `fsl_f32/scalar`: `FixedSizeList<Float32, N>` inputs with a plain Rust loop
 //!   that bypasses SIMD entirely (dot product + norms).
-//! - `list_f32/spice_scalar`: `List<Float32>` inputs via `cosine_distance_inner`
+//! - `list_f32/spice_scalar`: `List<Float32>` inputs via `CosineDistance`
 //!   (hits the scalar fallback path).
 //! - `list_f32/datafusion`: `List<Float32>` inputs via `datafusion_functions_nested`
 //!   `ArrayDistance`.
@@ -35,7 +35,7 @@ use criterion::{BatchSize, BenchmarkId, Criterion, criterion_group, criterion_ma
 use datafusion::config::ConfigOptions;
 use datafusion::logical_expr::{ColumnarValue, ScalarFunctionArgs, ScalarUDFImpl};
 use datafusion_functions_nested::distance::ArrayDistance;
-use runtime_datafusion_udfs::cosine_distance::cosine_distance_inner;
+use runtime_datafusion_udfs::cosine_distance::CosineDistance;
 use std::sync::Arc;
 
 // ---------------------------------------------------------------------------
@@ -143,7 +143,23 @@ fn scalar_fsl_cosine_distance(a: &ArrayRef, b: &ArrayRef) -> Vec<Option<f64>> {
 // Benchmark groups
 // ---------------------------------------------------------------------------
 
-/// Group 1: `FixedSizeList<Float32>` — SIMD (via `cosine_distance_inner`) vs scalar loop.
+fn invoke(a: ArrayRef, b: ArrayRef, rows: usize) -> ColumnarValue {
+    let return_field = Arc::new(Field::new("f", DataType::Float64, true));
+    CosineDistance::new()
+        .invoke_with_args(ScalarFunctionArgs {
+            args: vec![
+                ColumnarValue::Array(std::hint::black_box(a)),
+                ColumnarValue::Array(std::hint::black_box(b)),
+            ],
+            arg_fields: vec![],
+            number_rows: rows,
+            return_field,
+            config_options: Arc::new(ConfigOptions::default()),
+        })
+        .expect("ok")
+}
+
+/// Group 1: `FixedSizeList<Float32>` — SIMD (via `CosineDistance`) vs scalar loop.
 fn bench_fsl_f32(c: &mut Criterion) {
     let mut group = c.benchmark_group("cosine_distance/fsl_f32");
 
@@ -153,10 +169,7 @@ fn bench_fsl_f32(c: &mut Criterion) {
             group.bench_with_input(id, &(rows, dim), |b, &(rows, dim)| {
                 b.iter_batched(
                     || (build_fsl_f32(rows, dim), build_fsl_f32(rows, dim)),
-                    |(a, b)| {
-                        cosine_distance_inner(&[std::hint::black_box(a), std::hint::black_box(b)])
-                            .expect("ok")
-                    },
+                    |(a, b)| invoke(a, b, rows),
                     BatchSize::LargeInput,
                 );
             });
@@ -193,10 +206,7 @@ fn bench_list_f32(c: &mut Criterion) {
             group.bench_with_input(id, &(rows, dim), |b, &(rows, dim)| {
                 b.iter_batched(
                     || (build_list_f32(rows, dim), build_list_f32(rows, dim)),
-                    |(a, b)| {
-                        cosine_distance_inner(&[std::hint::black_box(a), std::hint::black_box(b)])
-                            .expect("ok")
-                    },
+                    |(a, b)| invoke(a, b, rows),
                     BatchSize::LargeInput,
                 );
             });
