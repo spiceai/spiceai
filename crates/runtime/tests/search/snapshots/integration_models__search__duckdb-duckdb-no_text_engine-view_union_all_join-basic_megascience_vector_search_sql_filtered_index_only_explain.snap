@@ -18,7 +18,6 @@ description: "SELECT id, trunc(_score, 3) as _score FROM vector_search(qs, 'seco
 |               |               SortExec: TopK(fetch=4), expr=[_score@1 DESC NULLS LAST, id@0 ASC], preserve_partitioning=[true]                                                                               |
 |               |                 BytesProcessedExec                                                                                                                                                           |
 |               |                   RepartitionExec: partitioning=RoundRobinBatch(3), input_partitions=1                                                                                                       |
-|               |                     CooperativeExec                                                                                                                                                          |
-|               |                       DuckDBVectorQueryExec embedded_column=answer_embedding, metric=cosine, dims=64, filters=[subject != Utf8("math")], limit=4, scan=brute_force, projection=[id, _score]  |
+|               |                     DuckDBVectorQueryExec embedded_column=answer_embedding, metric=cosine, dims=64, filters=[subject != Utf8("math")], limit=4, scan=brute_force, projection=[id, _score]    |
 |               |                                                                                                                                                                                              |
 +---------------+----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+

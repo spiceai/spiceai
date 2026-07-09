@@ -14,11 +14,9 @@ description: "SELECT id, answer, trunc(_score, 3) as _score FROM text_search(qs,
 |               |       FilterExec: subject@3 != math, projection=[id@0, _score@1, answer@2]                                                                                           |
 |               |         HashJoinExec: mode=CollectLeft, join_type=Left, accumulator=MinMaxLeftAccumulator, on=[(id@0, id@1)], projection=[id@0, _score@1, answer@2, subject@4]       |
 |               |           CoalescePartitionsExec                                                                                                                                     |
-|               |             CooperativeExec                                                                                                                                          |
-|               |               BytesProcessedExec                                                                                                                                     |
-|               |                 RepartitionExec: partitioning=RoundRobinBatch(3), input_partitions=1                                                                                 |
-|               |                   CooperativeExec                                                                                                                                    |
-|               |                     FullTextSearchTableExec q=secondary                                                                                                              |
+|               |             BytesProcessedExec                                                                                                                                       |
+|               |               RepartitionExec: partitioning=RoundRobinBatch(3), input_partitions=1                                                                                   |
+|               |                 FullTextSearchTableExec q=secondary                                                                                                                  |
 |               |           RepartitionExec: partitioning=RoundRobinBatch(3), input_partitions=1                                                                                       |
 |               |             FilterExec: subject@2 != math                                                                                                                            |
 |               |               SchemaCastScanExec                                                                                                                                     |
