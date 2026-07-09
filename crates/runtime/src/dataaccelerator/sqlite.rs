@@ -19,7 +19,7 @@ use std::sync::Arc;
 use crate::{
     component::dataset::acceleration::{Engine, Mode},
     dataaccelerator::{
-        FilePathError,
+        AcceleratorEngineRegistry, FilePathError,
         snapshots::{download_snapshot_if_needed, snapshot_before_recreate},
         storage::{ResolvedAccelerationStorage, resolve_acceleration_storage_async},
     },
@@ -271,6 +271,23 @@ impl SqliteAccelerator {
 
         Ok(pool)
     }
+
+    fn spicepod_dataset_sqlite_file_path(
+        &self,
+        dataset: &spicepod::component::dataset::Dataset,
+    ) -> Option<String> {
+        let acceleration = dataset.acceleration.as_ref()?;
+        let mut params = acceleration
+            .params
+            .as_ref()
+            .map(spicepod::param::Params::as_string_map)
+            .unwrap_or_default();
+        params.insert("data_directory".to_string(), spice_data_base_path());
+
+        self.sqlite_factory
+            .sqlite_file_path("accelerated", &params)
+            .ok()
+    }
 }
 
 /// Execute a sequence of PRAGMA statements against the shared `SQLite`
@@ -364,6 +381,7 @@ impl DataAccelerator for SqliteAccelerator {
     async fn init(
         &self,
         source: &dyn AccelerationSource,
+        registry: Arc<AcceleratorEngineRegistry>,
     ) -> Result<BootstrapStatus, Box<dyn std::error::Error + Send + Sync>> {
         if !source.is_file_accelerated() {
             return Ok(BootstrapStatus::none());
@@ -421,6 +439,7 @@ impl DataAccelerator for SqliteAccelerator {
             let bootstrap_status = download_snapshot_if_needed(
                 acceleration,
                 source,
+                registry,
                 runtime_acceleration::snapshot::AccelerationLayout::file(PathBuf::from(path)),
                 AccelerationEngine::Sqlite,
                 None,
@@ -460,29 +479,43 @@ impl DataAccelerator for SqliteAccelerator {
                 cmd.options.insert("file".to_string(), sqlite_file);
             }
 
-            let datasets = source
-                .runtime()
-                .get_initialized_datasets(&source.app(), crate::LogErrors(false))
-                .await;
             let self_path = self.file_path(source)?;
-            let attach_databases = datasets
+            let app = source.app();
+            // Compute file paths for all other SQLite file-mode datasets from
+            // spicepod-level configuration in the app.
+            let attach_databases: Vec<String> = app
+                .datasets
                 .iter()
-                .filter_map(|other_dataset| {
-                    if other_dataset.acceleration.as_ref().is_some_and(|a| {
-                        a.engine == Engine::Sqlite
-                            && matches!(a.mode, Mode::File | Mode::FileCreate | Mode::FileUpdate)
-                    }) {
-                        if other_dataset.name() == source.name() {
-                            None
-                        } else {
-                            let other_path = self.file_path(other_dataset.as_ref());
-                            other_path.ok().filter(|p| p != &self_path)
-                        }
-                    } else {
+                .filter_map(|spicepod_ds| {
+                    let acceleration = spicepod_ds.acceleration.as_ref()?;
+                    let engine_str = acceleration
+                        .engine
+                        .as_deref()
+                        .unwrap_or("arrow")
+                        .to_lowercase();
+                    if engine_str != "sqlite" {
+                        return None;
+                    }
+                    if !matches!(
+                        acceleration.mode,
+                        spicepod::acceleration::Mode::File
+                            | spicepod::acceleration::Mode::FileCreate
+                            | spicepod::acceleration::Mode::FileUpdate
+                    ) {
+                        return None;
+                    }
+                    let ds_name = datafusion::common::TableReference::parse_str(&spicepod_ds.name);
+                    if ds_name.to_string() == source.name().to_string() {
+                        return None;
+                    }
+                    let other_path = self.spicepod_dataset_sqlite_file_path(spicepod_ds)?;
+                    if other_path == self_path {
                         None
+                    } else {
+                        Some(other_path)
                     }
                 })
-                .collect::<Vec<_>>();
+                .collect();
 
             if !attach_databases.is_empty() {
                 cmd.options
@@ -996,7 +1029,7 @@ mod tests {
         assert!(!accelerator.is_initialized(&dataset));
 
         accelerator
-            .init(&dataset)
+            .init(&dataset, dataset.runtime.accelerator_engine_registry())
             .await
             .expect("initialization should be successful");
 

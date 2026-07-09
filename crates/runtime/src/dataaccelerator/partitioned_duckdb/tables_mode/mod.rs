@@ -55,7 +55,7 @@ use crate::dataaccelerator::{BootstrapStatus, upsert_dedup::UpsertDedupTableProv
 use crate::{
     component::dataset::acceleration::{Engine, Mode},
     dataaccelerator::{
-        AccelerationSource, DataAccelerator, FilePathError,
+        AccelerationSource, AcceleratorEngineRegistry, DataAccelerator, FilePathError,
         duckdb::{DuckDBAccelerator, create_factory, create_table_provider, duckdb_file_path},
         partitioned_duckdb::{
             ExpectedAccelerationSourceSnafu, FailedToCreateConnectionPoolSnafu, FileModeOnlySnafu,
@@ -148,6 +148,7 @@ impl DataAccelerator for TablesModePartitionedDuckDBAccelerator {
     async fn init(
         &self,
         source: &dyn AccelerationSource,
+        _registry: Arc<AcceleratorEngineRegistry>,
     ) -> Result<BootstrapStatus, Box<dyn std::error::Error + Send + Sync>> {
         if let Some(acceleration_settings) = source.acceleration() {
             ensure!(
