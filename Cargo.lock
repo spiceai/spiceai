@@ -22208,6 +22208,7 @@ dependencies = [
  "anyhow",
  "arrow-schema",
  "async-trait",
+ "criterion 0.7.0",
  "datafusion",
  "datafusion-catalog",
  "datafusion-common",
