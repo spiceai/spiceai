@@ -260,7 +260,8 @@ async fn test_standard_inference_full_refresh_loads() -> Result<(), anyhow::Erro
             })
             .await?;
 
-            let mut dataset = inventory_dataset(MYSQL_STANDARD_INFERENCE_PORT, SchemaInference::Standard);
+            let mut dataset =
+                inventory_dataset(MYSQL_STANDARD_INFERENCE_PORT, SchemaInference::Standard);
             // Full refresh needs no primary key, so this is a clean opt-in control.
             if let Some(accel) = dataset.acceleration.as_mut() {
                 accel.refresh_mode = Some(RefreshMode::Full);
