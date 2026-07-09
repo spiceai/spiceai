@@ -97,8 +97,9 @@ pub enum ChangeBatchError {
     #[snafu(display("Failed to process change data capture update: {source}"))]
     Arrow { source: ArrowError },
     #[snafu(display(
-        "Deferred change batch was already consumed or failed to build; \
-         this is an internal error in the CDC pipeline"
+        "Deferred change batch is no longer available: it was already consumed, \
+         or an earlier build attempt failed. If a build failed, the preceding \
+         'Failed to build deferred change batch' error carries the underlying cause"
     ))]
     DeferredBatchConsumed,
     #[snafu(display("Failed to build deferred change batch: {message}"))]
