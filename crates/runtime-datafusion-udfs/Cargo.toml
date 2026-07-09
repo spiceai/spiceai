@@ -41,12 +41,17 @@ wasmtime = { workspace = true, optional = true }
 [dev-dependencies]
 async-stream.workspace = true
 axum.workspace = true
+criterion = { version = "0.7", features = ["html_reports"] }
 governor.workspace = true
 insta.workspace = true
 tracing-subscriber.workspace = true
 tracing-test = "0.2"
 tempfile.workspace = true
 wat.workspace = true
+
+[[bench]]
+name = "cosine_distance"
+harness = false
 
 [features]
 default = []
