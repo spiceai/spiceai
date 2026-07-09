@@ -120,9 +120,9 @@ use crate::cdc::{ChangeEnvelope, ChangesStream, CommitChange, CommitError, Strea
 use crate::postgres_replication::pgoutput::RelationId;
 
 /// Per-connection routing table: relation id -> (member key, resolved handle).
-/// `FxHashMap` (not the SipHash default) since the keys are trusted internal
+/// `FxHashMap` (not the `SipHash` default) since the keys are trusted internal
 /// relation ids and this is on the per-event pump hot path — a `u32` `FxHash`
-/// is ~1-2ns vs SipHash's ~10-20ns, and bit-mixing keeps hashbrown's SIMD
+/// is ~1-2ns vs `SipHash`'s ~10-20ns, and bit-mixing keeps `hashbrown`'s SIMD
 /// filter effective (unlike an identity `nohash`, whose zero high bits defeat
 /// it as the map grows).
 type RouteMap = FxHashMap<RelationId, (MemberKey, Arc<MemberHandle>)>;

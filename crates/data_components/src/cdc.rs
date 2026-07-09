@@ -179,7 +179,7 @@ pub trait CommitChange {
 /// A CDC source that can render its wire format straight into Arrow (e.g.
 /// Postgres pgoutput) implements this so a multiplexed reader can *route* an
 /// event to the right dataset without paying the O(rows × columns) Arrow-typing
-/// + UTF-8 cost on its shared hot path: [`ChangeRows::build`] runs later, on the
+/// and UTF-8 cost on its shared hot path: [`ChangeRows::build`] runs later, on the
 /// per-dataset consumer, and decodes directly into the Arrow builders — no
 /// intermediate per-row materialization. An already-built [`ChangeBatch`]
 /// implements it trivially (blanket impl below) so existing connectors are
