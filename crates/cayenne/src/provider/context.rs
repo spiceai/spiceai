@@ -323,6 +323,45 @@ impl CayenneContext {
         Arc::new(format)
     }
 
+    /// Build a write-only `VortexFormat` for the cold (datalake) tier whose
+    /// file-rolling target is `cold_target_file_size_mb` rather than the warm
+    /// `target_vortex_file_size_mb`.
+    ///
+    /// The base/warm [`Self::file_format`] bakes the warm file size into its
+    /// [`VortexTableOptions`], and `CayenneTableProvider::write_shard_format`
+    /// returns that base format unchanged whenever a write earns a single shard
+    /// — which every sorted / PK-upsert table does (see
+    /// `CayenneTableProvider::snapshot_shard_count`). The cold promotion write
+    /// is exactly that single-ordered-run case, so without a dedicated format
+    /// the cold tier would silently roll files at the warm size and
+    /// `cayenne_cold_target_file_size_mb` would be inert.
+    ///
+    /// Mirrors the base format's full encoding strategy and dataset label;
+    /// `shard` optionally layers intra-write sharding on top (the non-sorted
+    /// case), exactly like the warm path.
+    #[must_use]
+    pub(crate) fn cold_write_format(
+        &self,
+        cold_target_file_size_mb: usize,
+        shard: Option<WriteShardConfig>,
+    ) -> Arc<VortexFormat> {
+        let mut session = VortexSession::default();
+        if let Some(full_strategy) =
+            super::delta_encoding::full_strategy_builder_for(&self.config.compression_strategy)
+        {
+            session = session.set(full_strategy);
+        }
+        let mut options = Self::vortex_table_options(&self.config);
+        options.target_file_size_mb = cold_target_file_size_mb;
+        let format = VortexFormat::new_with_options(session, options)
+            .with_dataset_label(self.dataset.as_str());
+        let format = match shard {
+            Some(config) => format.with_write_shard(config),
+            None => format,
+        };
+        Arc::new(format)
+    }
+
     /// Get the Vortex file format for creating listing tables.
     ///
     /// The format uses the shared runtime cache for file metadata.
@@ -979,6 +1018,42 @@ mod tests {
         assert_eq!(
             context.file_format().options().projection_pushdown,
             ProjectionPushdown::On
+        );
+    }
+
+    /// Regression: the cold (datalake) promotion write must roll files at
+    /// `cayenne_cold_target_file_size_mb`, not the warm `target_vortex_file_size_mb`.
+    ///
+    /// Every sorted / PK-upsert table earns a single write shard, so the warm
+    /// `write_shard_format` path returns the base format unchanged — whose
+    /// `target_file_size_mb` is the warm size. Cold promotion therefore silently
+    /// rolled files at the warm size, leaving `cayenne_cold_target_file_size_mb`
+    /// inert. `cold_write_format` must build a format carrying the cold size.
+    #[test]
+    fn cold_write_format_rolls_files_at_cold_target_size() {
+        let runtime_env = Arc::new(RuntimeEnv::default());
+        let config = VortexConfig {
+            target_vortex_file_size_mb: 256,
+            cold_target_file_size_mb: 1024,
+            ..VortexConfig::default()
+        };
+        let context = CayenneContext::new(&config, runtime_env, "test");
+
+        // Baseline: the warm/base format rolls at the warm target size.
+        assert_eq!(
+            context.file_format().options().target_file_size_mb,
+            256,
+            "base (warm) format must use target_vortex_file_size_mb"
+        );
+
+        // Fix: the cold format rolls at the cold target size, independent of the
+        // warm size. Before the fix the promotion write reused the base format,
+        // so this file size was silently 256 (the warm size).
+        let cold = context.cold_write_format(config.cold_target_file_size_mb, None);
+        assert_eq!(
+            cold.options().target_file_size_mb,
+            1024,
+            "cold format must use cayenne_cold_target_file_size_mb, not the warm size"
         );
     }
 
