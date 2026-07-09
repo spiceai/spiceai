@@ -49,4 +49,11 @@ url = { workspace = true }
 
 [[bench]]
 harness = false
+name = "schema_field_lookup"
+
+[[bench]]
+harness = false
 name = "filter_pushdown_not"
+
+[lints]
+workspace = true

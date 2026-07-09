@@ -281,11 +281,12 @@ pub(crate) async fn run(args: &HtapArgs) -> anyhow::Result<()> {
 
     // 7. Report analytical query metrics.
     let mut failures: Vec<String> = Vec::new();
+    let mut query_summary_rows: Vec<reporting::QuerySummaryRow> = Vec::new();
     for query in &metrics.metrics {
         let query_name = &query.query_name;
         let attributes = vec![KeyValue::new("query_name", query_name.to_string())];
 
-        let status: u64 = u64::from(match &query.query_status {
+        let passed = match &query.query_status {
             QueryStatus::Passed => true,
             QueryStatus::Failed(reason) => {
                 if let Some(reason) = reason {
@@ -295,6 +296,16 @@ pub(crate) async fn run(args: &HtapArgs) -> anyhow::Result<()> {
                 }
                 false
             }
+        };
+        let status: u64 = u64::from(passed);
+
+        query_summary_rows.push(reporting::QuerySummaryRow {
+            query_name: query_name.to_string(),
+            passed,
+            iterations: query.iterations,
+            median_ms: query.median_duration_ms,
+            p90_ms: query.percentile_90_duration_ms,
+            p99_ms: query.percentile_99_duration_ms,
         });
 
         crate::metrics::QUERY_STATUS.record(status, &attributes);
@@ -342,10 +353,17 @@ pub(crate) async fn run(args: &HtapArgs) -> anyhow::Result<()> {
 
     // 8. Report OLTP results.
     println!("\n=== TPC-C OLTP ===");
+    let mut oltp_summary: Option<reporting::OltpSummary> = None;
     match oltp_result {
         Ok(Ok(report)) => {
             report.print_summary();
             crate::metrics::OLTP_TPMC.record(report.tpmc, &[]);
+            oltp_summary = Some(reporting::OltpSummary {
+                tpmc: report.tpmc,
+                total_committed: report.total_committed,
+                total_aborted: report.total_aborted,
+                abort_rate: report.abort_rate,
+            });
         }
         Ok(Err(e)) => {
             eprintln!("OLTP workload error: {e}");
@@ -370,8 +388,9 @@ pub(crate) async fn run(args: &HtapArgs) -> anyhow::Result<()> {
 
     // Apply-phase coverage violations (populated below), gated at the end of the run.
     let mut coverage_violations: Vec<(String, f64)> = Vec::new();
+    let mut lag_summary: Option<reporting::ReplicationLagSummary> = None;
     if let Some(metrics) = &spiced_metrics {
-        reporting::emit_replication_metrics(
+        lag_summary = reporting::emit_replication_metrics(
             metrics,
             replication_engine,
             &pg_stats,
@@ -403,6 +422,26 @@ pub(crate) async fn run(args: &HtapArgs) -> anyhow::Result<()> {
             Err(e) => eprintln!(
                 "Failed to write metrics dump to {}: {e}",
                 dump_path.display()
+            ),
+        }
+    }
+
+    // Emit the headline results (tpmC, QPH, worst lag, per-query latencies) as a
+    // Markdown summary CI appends to the job summary.
+    if let Some(summary_path) = &args.summary_out {
+        let summary = reporting::RunSummary {
+            qph,
+            completed_queries,
+            elapsed_secs,
+            oltp: oltp_summary,
+            lag: lag_summary,
+            queries: query_summary_rows,
+        };
+        match reporting::write_run_summary(summary_path, &summary).await {
+            Ok(()) => println!("\nWrote run summary to {}", summary_path.display()),
+            Err(e) => eprintln!(
+                "Failed to write run summary to {}: {e}",
+                summary_path.display()
             ),
         }
     }
@@ -449,7 +488,9 @@ pub(crate) async fn run(args: &HtapArgs) -> anyhow::Result<()> {
                         // WAL rather than the current (post-drain) state.
                         let fresh_pg_stats =
                             crate::pg_stats::PgStatsScraper::sample_once_now().await;
-                        reporting::emit_replication_metrics(
+                        // Diagnostic re-scrape: the lag summary return is unused here
+                        // (the headline was already captured from the under-load scrape).
+                        let _ = reporting::emit_replication_metrics(
                             &metrics,
                             replication_engine,
                             &fresh_pg_stats,

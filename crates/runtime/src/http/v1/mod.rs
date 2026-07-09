@@ -20,7 +20,6 @@ pub mod datasets;
 pub mod embeddings;
 pub mod functions;
 pub mod iceberg;
-pub mod inference;
 pub mod responses;
 pub mod snapshots;
 

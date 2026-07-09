@@ -6,7 +6,7 @@ expression: resp?
   {
     "question": "What is the possible action of pedunculagin and alchemillin, chemical components of lady's mantle?",
     "answer": "Pedunculagin and alchemillin have astringent and wound-healing properties, possibly due to their high tannin content.",
-    "_score": 0.286
+    "_score": 0.285
   },
   {
     "question": "What is the definition of a partial relation?",
@@ -16,11 +16,11 @@ expression: resp?
   {
     "question": "What causes dermatomycosis, and what are some examples of this condition?",
     "answer": "Dermatomycosis is caused by fungal infections, specifically various forms of *tinea*, such as athlete's foot (*tinea pedis*).",
-    "_score": 0.247
+    "_score": 0.246
   },
   {
     "question": "How long of a follow-up is required after spinal cord (SC) ependymoma resection?",
     "answer": "More than 10 years of follow-up is required, as late recurrences (beyond 12 years) have been reported in 5%–10% of patients.",
-    "_score": 0.235
+    "_score": 0.234
   }
 ]

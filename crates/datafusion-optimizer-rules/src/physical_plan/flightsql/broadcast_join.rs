@@ -426,9 +426,7 @@ fn resolve_federated_side(plan: &Arc<dyn ExecutionPlan>) -> Option<FederatedSide
     // otherwise `collect_flight_execs` hits the multi-input `UnionExec`
     // mid-walk and bails.
     let mut scan_root = plan;
-    while scan_root.downcast_ref::<UnionExec>().is_none()
-        && scan_root.downcast_ref::<FlightSqlExec>().is_none()
-    {
+    while !scan_root.is::<UnionExec>() && !scan_root.is::<FlightSqlExec>() {
         if !is_single_input_wrapper(scan_root.as_ref()) {
             return None;
         }
@@ -500,8 +498,8 @@ fn walk_to_flight_exec(plan: &Arc<dyn ExecutionPlan>) -> Option<&FlightSqlExec> 
     reason = "DF53 deprecates CoalesceBatchesExec (arrow BatchCoalescer); kept for plan-shape recognition"
 )]
 fn is_single_input_wrapper(plan: &dyn ExecutionPlan) -> bool {
-    plan.downcast_ref::<RepartitionExec>().is_some()
-        || plan.downcast_ref::<CoalesceBatchesExec>().is_some()
+    plan.is::<RepartitionExec>()
+        || plan.is::<CoalesceBatchesExec>()
         || PASS_THROUGH_EXEC_NAMES.contains(&plan.name())
 }
 
