@@ -6520,9 +6520,10 @@ impl CayenneTableProvider {
             .filter(|f| f.file_size_bytes > 0)
             .collect();
         if live.is_empty() {
-            // No cold-resident keys: an empty bloom view is complete and correct
-            // (nothing to fold), so skip the scan.
-            self.store_cold_pk_existence(None);
+            // No cold-resident keys: an EMPTY existence view (never probes true)
+            // is complete and correct, so skip the scan. Stored (not cleared) to
+            // keep the invariant "`Bloom` ⇒ view present".
+            self.store_cold_pk_existence(Some(Arc::new(ColdPkExistence::new(Vec::new()))));
             return Ok(ColdKeysetSource::Bloom);
         }
 
