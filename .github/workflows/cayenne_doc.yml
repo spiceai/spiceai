@@ -6,8 +6,9 @@ name: Build Cayenne doc PDF
 # - On pull requests touching docs/cayenne/**, this verifies the document still
 #   builds (mermaid blocks resolve via kroki.io, WeasyPrint succeeds) and
 #   uploads the rendered PDF as a run artifact for review.
-# - On push to trunk (and manual dispatch), it builds and uploads Cayenne.pdf as
-#   a downloadable, linkable artifact of the current trunk.
+# - On push to trunk that touches docs/cayenne/** (or this workflow file), and on
+#   manual dispatch, it builds and uploads Cayenne.pdf as a downloadable, linkable
+#   artifact of the current trunk.
 
 on:
   push:

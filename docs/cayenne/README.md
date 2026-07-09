@@ -35,8 +35,9 @@ builds the PDF:
 - **On pull requests** that touch `docs/cayenne/**`, it renders the PDF to
   verify the document still builds (mermaid blocks resolve, WeasyPrint
   succeeds) and uploads the result as a run artifact for review.
-- **On push to `trunk`** (and on manual dispatch), it builds and uploads
-  `Cayenne.pdf` as a downloadable, linkable artifact of the current `trunk`.
+- **On push to `trunk` that touches `docs/cayenne/**`** (or the workflow file
+  itself), and on manual dispatch, it builds and uploads `Cayenne.pdf` as a
+  downloadable, linkable artifact of the current `trunk`.
 
 ## Prerequisites
 
