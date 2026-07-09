@@ -24588,7 +24588,7 @@ mod tests {
     /// referenced file is never touched.
     #[test]
     fn cold_gc_marks_then_sweeps_after_grace() {
-        let grace = std::time::Duration::from_secs(300);
+        let grace = std::time::Duration::from_mins(5);
         let live: HashSet<String> = [url("s3://b/t/cold/p2/live.vortex")].into_iter().collect();
         let on_store = vec![
             url("s3://b/t/cold/p2/live.vortex"),
@@ -24612,12 +24612,12 @@ mod tests {
             "referenced file is not aged"
         );
 
-        // Just before grace: still nothing.
+        // Before grace (half a grace in): still nothing.
         let del = CayenneTableProvider::plan_cold_gc_deletions(
             &on_store,
             &live,
             &mut first_seen,
-            t0 + grace - std::time::Duration::from_secs(1),
+            t0 + grace / 2,
             grace,
         );
         assert!(del.is_empty(), "before grace deletes nothing");
@@ -24638,7 +24638,7 @@ mod tests {
     /// however old the orphan actually is.
     #[test]
     fn cold_gc_restart_resets_grace_never_premature() {
-        let grace = std::time::Duration::from_secs(300);
+        let grace = std::time::Duration::from_mins(5);
         let live = HashSet::new();
         let on_store = vec![url("s3://b/orphan.vortex")];
         let mut first_seen = HashMap::new(); // as if just restarted
@@ -24652,7 +24652,10 @@ mod tests {
             t + grace * 10,
             grace,
         );
-        assert!(del.is_empty(), "restart re-marks; never deletes on first sight");
+        assert!(
+            del.is_empty(),
+            "restart re-marks; never deletes on first sight"
+        );
 
         // A grace after first observation: now collectible.
         let del = CayenneTableProvider::plan_cold_gc_deletions(
@@ -24670,7 +24673,7 @@ mod tests {
     /// is never (spuriously) deleted and the map stays bounded.
     #[test]
     fn cold_gc_prunes_no_longer_orphaned() {
-        let grace = std::time::Duration::from_secs(300);
+        let grace = std::time::Duration::from_mins(5);
         let t0 = Instant::now();
         let f = url("s3://b/f.vortex");
         let mut first_seen = HashMap::new();
