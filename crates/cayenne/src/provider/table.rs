@@ -10014,7 +10014,7 @@ impl CayenneTableProvider {
     /// Uses `DataFusion`'s `SortExec` which provides:
     /// - **Automatic disk spilling**: Handles datasets larger than available memory
     /// - **Streaming external merge sort**: Processes data incrementally without loading all into RAM
-    /// - **SIMD-optimized kernels**: Hardware-accelerated sorting (NEON on arm64, AVX2/AVX-512 on amd64)
+    /// - **SIMD-optimized kernels**: Hardware-accelerated sorting (NEON on arm64, AVX2 on amd64)
     /// - **Configurable spill compression**: Supports zstd, `lz4_frame`, or uncompressed spill files
     /// - **Memory management**: Integrates with `DataFusion`'s memory pool and reservation system
     ///
