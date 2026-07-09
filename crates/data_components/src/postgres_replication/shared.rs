@@ -108,15 +108,28 @@ use pgwire_replication::{Lsn, ReplicationClient, ReplicationEvent, TryRecvEvent}
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 
+use bytes::Bytes;
+
 use super::{
     Error, ReplicationMetricsCollector, ReplicationStreamInput, Result, bootstrap,
-    changes::{ChangeOp, DecodedChange, push_update_change},
-    client,
-    config::ReplicationParams,
-    pgoutput, resilience, slot,
+    changes::PgChangeRows, client, config::ReplicationParams, pgoutput, resilience, slot,
 };
+use rustc_hash::FxHashMap;
+
 use crate::cdc::{ChangeEnvelope, ChangesStream, CommitChange, CommitError, StreamError};
 use crate::postgres_replication::pgoutput::RelationId;
+
+/// Per-connection routing table: relation id -> (member key, resolved handle).
+/// `FxHashMap` (not the `SipHash` default) since the keys are trusted internal
+/// relation ids and this is on the per-event pump hot path — a `u32` `FxHash`
+/// is ~1-2ns vs `SipHash`'s ~10-20ns, and bit-mixing keeps `hashbrown`'s SIMD
+/// filter effective (unlike an identity `nohash`, whose zero high bits defeat
+/// it as the map grows).
+type RouteMap = FxHashMap<RelationId, (MemberKey, Arc<MemberHandle>)>;
+
+/// Per-transaction buffer of raw pgoutput change bytes, keyed by relation id.
+/// `FxHashMap` for the same hot-path reason as [`RouteMap`].
+type TxnBuffer = FxHashMap<RelationId, Vec<Bytes>>;
 
 /// Default bounded per-member delivery queue depth (envelopes), overridable via
 /// `pg_replication_member_channel_capacity`
@@ -1046,8 +1059,14 @@ async fn run_pump(source: Arc<SharedSource>) {
         // Per-connection state: Postgres re-sends Relation messages on a new
         // connection, rebuilding the routes.
         let mut decoder = pgoutput::Decoder::new();
-        let mut routes: HashMap<RelationId, MemberKey> = HashMap::new();
-        let mut txn: HashMap<RelationId, Vec<DecodedChange>> = HashMap::new();
+        // Relation id -> (member key, resolved handle). Caching the `Arc<MemberHandle>`
+        // here (once, at Relation time) keeps the per-event route lookup a bare
+        // `u32` hash — no `members` mutex, no `(String, String)` hash on the hot path.
+        let mut routes: RouteMap = RouteMap::default();
+        // Raw pgoutput change-message bytes, buffered per relation as the pump
+        // routes them (no tuple decode on this shared task). The per-dataset
+        // consumer decodes + builds them (see `PgChangeRows`).
+        let mut txn: TxnBuffer = TxnBuffer::default();
         let mut txn_open = false;
 
         // Reader-timing accumulators (see `BoundaryMetrics` /
@@ -1198,19 +1217,56 @@ async fn run_pump(source: Arc<SharedSource>) {
                 }
                 ReplicationEvent::XLogData { data, wal_end, .. } => {
                     max_wal_end = max_wal_end.max(wal_end.0);
-                    // Zero-copy decode: hand the owned `Bytes` frame to the decoder
-                    // (values become refcounted slices of it), not a borrow.
-                    let msg = match decoder.decode(data) {
-                        Ok(m) => m,
-                        Err(e) => {
-                            source.for_each_member_metrics(
-                                ReplicationMetricsCollector::inc_decode_error,
-                            );
-                            fatal_broadcast(&source, format!("pgoutput decode failed: {e}")).await;
-                            break 'reconnect;
+                    // Peek the message type to route WITHOUT decoding the tuple:
+                    // Relation/Truncate are fully decoded here (rare, and they
+                    // carry routing state — the relation cache / a relation-id
+                    // list); Insert/Update/Delete are only peeked for their
+                    // relation id and buffered raw, so the per-dataset consumer
+                    // pays the tuple decode + Arrow build off this shared task.
+                    match pgoutput::message_type(&data) {
+                        // Relation and Truncate are fully decoded here (rare, and
+                        // they carry routing state — the relation cache / a
+                        // relation-id list). Clone the frame first so a TRUNCATE
+                        // can still buffer its raw bytes after the decoder consumes
+                        // `data` (O(1) Bytes refcount; R/T are rare).
+                        Some(b'R' | b'T') => {
+                            let raw = data.clone();
+                            let msg = match decoder.decode(data) {
+                                Ok(msg) => msg,
+                                Err(e) => {
+                                    source.for_each_member_metrics(
+                                        ReplicationMetricsCollector::inc_decode_error,
+                                    );
+                                    fatal_broadcast(
+                                        &source,
+                                        format!("pgoutput decode failed: {e}"),
+                                    )
+                                    .await;
+                                    break 'reconnect;
+                                }
+                            };
+                            match msg {
+                                pgoutput::DecodedMessage::Relation(rel) => {
+                                    handle_relation(&source, &mut decoder, &mut routes, rel).await;
+                                }
+                                pgoutput::DecodedMessage::Truncate { relation_ids } => {
+                                    buffer_raw_truncate(&routes, &mut txn, &relation_ids, &raw);
+                                }
+                                // A non-R/T body under an R/T tag is impossible
+                                // from a well-formed server; ignore.
+                                _ => {}
+                            }
                         }
-                    };
-                    handle_decoded(&source, &mut decoder, &mut routes, &mut txn, msg).await;
+                        // Insert/Update/Delete: peek the relation id to route +
+                        // meter, then buffer the raw bytes; the per-dataset
+                        // consumer pays the tuple decode + Arrow build off this
+                        // shared task.
+                        Some(tag @ (b'I' | b'U' | b'D')) => {
+                            buffer_raw_change(&routes, &mut txn, tag, data);
+                        }
+                        // Type / Origin / Message / Stream* — safe to ignore.
+                        _ => {}
+                    }
                 }
                 ReplicationEvent::Commit {
                     end_lsn,
@@ -1318,131 +1374,108 @@ async fn run_pump(source: Arc<SharedSource>) {
     finish_pump(&source);
 }
 
-/// Apply one decoded pgoutput message to the per-connection routing/buffer
-/// state.
-async fn handle_decoded(
+/// Validate a (re)decoded Relation against its subscribed dataset and (re)build
+/// its route. Members that are held (snapshotting, or joined after this
+/// connection started) are left unrouted until the next reconnect promotes
+/// them. Runs on the pump — Relations are rare (once per (slot, relation) and
+/// on schema change).
+async fn handle_relation(
     source: &Arc<SharedSource>,
     decoder: &mut pgoutput::Decoder,
-    routes: &mut HashMap<RelationId, MemberKey>,
-    txn: &mut HashMap<RelationId, Vec<DecodedChange>>,
-    msg: pgoutput::DecodedMessage,
+    routes: &mut RouteMap,
+    rel: pgoutput::Relation,
 ) {
-    use pgoutput::DecodedMessage;
-    match msg {
-        DecodedMessage::Relation(rel) => {
-            let member_key: MemberKey = (rel.namespace.clone(), rel.name.clone());
-            let Some(member) = source.member(&member_key) else {
-                // No member for this table (e.g. publication membership left
-                // over from a removed dataset). Decoded changes are dropped.
-                routes.remove(&rel.relation_id);
-                tracing::debug!(
-                    table = %format_member(&member_key),
-                    slot = %source.key.slot_name,
-                    "relation in shared publication has no subscribed dataset; ignoring its changes"
-                );
-                return;
-            };
-            if !source.ack.is_streaming(&member_key) {
-                // The member is still held — snapshotting, or joined after
-                // this connection started. Don't route WAL at it (a
-                // snapshotting member's channel isn't drained until the
-                // snapshot ends). Its held ack floor keeps this WAL
-                // replayable; the next (re)connect promotes it and re-sends
-                // this Relation.
-                routes.remove(&rel.relation_id);
-                tracing::debug!(
-                    dataset = %member.dataset_name,
-                    table = %format_member(&member_key),
-                    "member is not yet streaming; deferring WAL routing until the next reconnect"
-                );
-                return;
-            }
-            if let Err(e) = client::validate_relation_against_schema(
-                &member.schema,
-                &rel,
-                &member.primary_keys,
-                &member.generated_columns,
-            ) {
-                member.metrics.inc_schema_mismatch_error();
-                routes.remove(&rel.relation_id);
-                member_fatal(
-                    source,
-                    &member_key,
-                    format!("schema mismatch for {}: {e}", member.dataset_name),
-                )
-                .await;
-                return;
-            }
-            decoder.apply_declared_primary_keys(rel.relation_id, &member.primary_keys);
-            routes.insert(rel.relation_id, member_key);
+    let member_key: MemberKey = (rel.namespace.clone(), rel.name.clone());
+    let Some(member) = source.member(&member_key) else {
+        // No member for this table (e.g. publication membership left over from
+        // a removed dataset). Its changes are dropped (never routed).
+        routes.remove(&rel.relation_id);
+        tracing::debug!(
+            table = %format_member(&member_key),
+            slot = %source.key.slot_name,
+            "relation in shared publication has no subscribed dataset; ignoring its changes"
+        );
+        return;
+    };
+    if !source.ack.is_streaming(&member_key) {
+        // The member is still held — snapshotting, or joined after this
+        // connection started. Don't route WAL at it (a snapshotting member's
+        // channel isn't drained until the snapshot ends). Its held ack floor
+        // keeps this WAL replayable; the next (re)connect promotes it and
+        // re-sends this Relation.
+        routes.remove(&rel.relation_id);
+        tracing::debug!(
+            dataset = %member.dataset_name,
+            table = %format_member(&member_key),
+            "member is not yet streaming; deferring WAL routing until the next reconnect"
+        );
+        return;
+    }
+    if let Err(e) = client::validate_relation_against_schema(
+        &member.schema,
+        &rel,
+        &member.primary_keys,
+        &member.generated_columns,
+    ) {
+        member.metrics.inc_schema_mismatch_error();
+        routes.remove(&rel.relation_id);
+        member_fatal(
+            source,
+            &member_key,
+            format!("schema mismatch for {}: {e}", member.dataset_name),
+        )
+        .await;
+        return;
+    }
+    decoder.apply_declared_primary_keys(rel.relation_id, &member.primary_keys);
+    // Cache the resolved handle alongside the key so the per-event path skips
+    // the `members` lock + string hash (see `buffer_raw_change`).
+    routes.insert(rel.relation_id, (member_key, member));
+}
+
+/// Route an Insert/Update/Delete by its peeked relation id and buffer the raw
+/// pgoutput bytes for the per-dataset consumer to decode. The tuple is NOT
+/// decoded here — only the relation id (routing) and `tag` (per-op metric) are
+/// read. A change for a relation with no streaming member is dropped, matching
+/// the eager path. The "change before Relation" invariant is still enforced at
+/// commit (`deliver_commit` fatals if the relation isn't cached).
+fn buffer_raw_change(routes: &RouteMap, txn: &mut TxnBuffer, tag: u8, data: Bytes) {
+    let Some(relation_id) = pgoutput::relation_id(&data) else {
+        return;
+    };
+    // Cached at Relation time: a `u32` lookup yields the member handle directly,
+    // so the per-event hot path takes no `members` lock and hashes no strings.
+    let Some((_member_key, member)) = routes.get(&relation_id) else {
+        return;
+    };
+    match tag {
+        b'I' => member.metrics.inc_insert(),
+        b'U' => member.metrics.inc_update(),
+        b'D' => member.metrics.inc_delete(),
+        _ => {}
+    }
+    txn.entry(relation_id).or_default().push(data);
+}
+
+/// Route a Truncate to every subscribed relation in its id list and buffer the
+/// raw bytes per relation. Unlike the per-dataset path, multi-relation
+/// TRUNCATEs are fine here: each relation routes to its own member.
+fn buffer_raw_truncate(
+    routes: &RouteMap,
+    txn: &mut TxnBuffer,
+    relation_ids: &[RelationId],
+    data: &Bytes,
+) {
+    for &relation_id in relation_ids {
+        if let Some((_member_key, member)) = routes.get(&relation_id) {
+            member.metrics.inc_truncate();
+            txn.entry(relation_id).or_default().push(data.clone());
+            tracing::info!(
+                dataset = %member.dataset_name,
+                relation_id,
+                "TRUNCATE from shared postgres replication queued for accelerator"
+            );
         }
-        DecodedMessage::Insert { relation_id, tuple } => {
-            if let Some(member_key) = routes.get(&relation_id)
-                && let Some(member) = source.member(member_key)
-            {
-                member.metrics.inc_insert();
-                txn.entry(relation_id).or_default().push(DecodedChange {
-                    op: ChangeOp::Create,
-                    row: tuple,
-                });
-            }
-        }
-        DecodedMessage::Update {
-            relation_id,
-            old,
-            new,
-        } => {
-            if let Some(member_key) = routes.get(&relation_id)
-                && let Some(member) = source.member(member_key)
-            {
-                member.metrics.inc_update();
-                let Some(rel) = decoder.relation(relation_id) else {
-                    member_fatal(
-                        source,
-                        member_key,
-                        format!(
-                            "change event before Relation for id {relation_id} in {}",
-                            member.dataset_name
-                        ),
-                    )
-                    .await;
-                    return;
-                };
-                push_update_change(txn.entry(relation_id).or_default(), rel, old, new);
-            }
-        }
-        DecodedMessage::Delete { relation_id, old } => {
-            if let Some(member_key) = routes.get(&relation_id)
-                && let Some(member) = source.member(member_key)
-            {
-                member.metrics.inc_delete();
-                txn.entry(relation_id).or_default().push(DecodedChange {
-                    op: ChangeOp::Delete,
-                    row: old,
-                });
-            }
-        }
-        DecodedMessage::Truncate { relation_ids } => {
-            // Unlike the per-dataset path, multi-relation TRUNCATEs are fine
-            // here: each relation routes to its own member.
-            for relation_id in relation_ids {
-                if let Some(member_key) = routes.get(&relation_id)
-                    && let Some(member) = source.member(member_key)
-                {
-                    member.metrics.inc_truncate();
-                    txn.entry(relation_id).or_default().push(DecodedChange {
-                        op: ChangeOp::Truncate,
-                        row: pgoutput::TupleData { columns: vec![] },
-                    });
-                    tracing::info!(
-                        dataset = %member.dataset_name,
-                        relation_id,
-                        "TRUNCATE from shared postgres replication queued for accelerator"
-                    );
-                }
-            }
-        }
-        DecodedMessage::Begin { .. } | DecodedMessage::Commit { .. } | DecodedMessage::Other => {}
     }
 }
 
@@ -1523,8 +1556,8 @@ async fn deliver_to_member(
 async fn deliver_commit(
     source: &Arc<SharedSource>,
     decoder: &pgoutput::Decoder,
-    routes: &HashMap<RelationId, MemberKey>,
-    txn: HashMap<RelationId, Vec<DecodedChange>>,
+    routes: &RouteMap,
+    txn: TxnBuffer,
     end_lsn: u64,
     commit_time_micros: i64,
     shutdown_epoch: u64,
@@ -1541,16 +1574,25 @@ async fn deliver_commit(
     // caller for the reader-processing subtraction.
     let mut total_send_wait_us: u64 = 0;
 
-    for (relation_id, changes) in txn {
-        if changes.is_empty() {
+    for (relation_id, raw) in txn {
+        if raw.is_empty() {
             continue;
         }
-        let Some(member_key) = routes.get(&relation_id) else {
+        // The handle is the one cached at Relation time. A member can detach
+        // mid-connection (via `member_fatal` or a re-subscribe) while its route
+        // entry lingers until the next reconnect rebuilds `routes`, so re-check
+        // it's still streaming before delivering. Skipping this would keep
+        // routing committed changes to a detached member and — because
+        // `AckTable::commit` doesn't check `live` — advance its ack floor past
+        // its last applied LSN, breaking the "stop routing but hold the floor"
+        // detach contract (and delivering changes after a fatal error). This is
+        // a per-commit gate, not the per-event hot path, so the lookup is fine.
+        let Some((member_key, member)) = routes.get(&relation_id) else {
             continue;
         };
-        let Some(member) = source.member(member_key) else {
-            continue; // detached mid-transaction
-        };
+        if !source.ack.is_streaming(member_key) {
+            continue;
+        }
         if source.ack.already_committed(member_key, end_lsn) {
             // Reconnect replay of a commit this member already durably
             // applied (replays start at the minimum floor across members).
@@ -1569,28 +1611,27 @@ async fn deliver_commit(
             .await;
             continue;
         };
-        let batch = match super::changes::build_change_batch(&member.schema, rel, &changes) {
-            Ok(b) => b.with_source_commit_ts_ms(commit_ts_ms),
-            Err(e) => {
-                member_fatal(
-                    source,
-                    member_key,
-                    format!("change batch build failed for {}: {e}", member.dataset_name),
-                )
-                .await;
-                continue;
-            }
-        };
+        // Defer the entire tuple decode + O(rows x columns) Arrow-typing/UTF-8
+        // build off this shared pump task onto the per-dataset consumer: the
+        // pump only peeked + buffered the raw bytes, and `PgChangeRows::build`
+        // decodes + builds later on the consumer (see `ChangeRows`), so neither
+        // decode nor build serializes every member behind one thread. The
+        // relation is cloned once per commit-per-relation (schema metadata, not
+        // per row) so the rows own their inputs; a decode/build failure (e.g. an
+        // unmergeable unchanged-TOAST column) then surfaces as a `StreamError` on
+        // this dataset's stream at consume time rather than a pump-side
+        // `member_fatal`, isolating it to the one dataset.
+        let rows = PgChangeRows::new(Arc::clone(&member.schema), rel.clone(), raw, commit_ts_ms);
         member.metrics.inc_transaction();
         // Readiness was already signaled by the member's snapshot / ready
         // envelope at subscribe time, so WAL envelopes never need to carry it.
-        let envelope = ChangeEnvelope::new(
+        let envelope = ChangeEnvelope::new_from_rows(
             Box::new(SharedLsnCommitter {
                 ack: Arc::clone(&source.ack),
                 key: member_key.clone(),
                 flush_to: end_lsn,
             }),
-            batch,
+            Box::new(rows),
             false,
         );
         source.ack.deliver(member_key, end_lsn);

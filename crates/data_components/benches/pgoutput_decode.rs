@@ -16,13 +16,30 @@ limitations under the License.
 
 //! Decode microbench for the Postgres pgoutput CDC path, over a change stream
 //! shaped like a TPC-H `orders` table (mixed int / numeric / date / string
-//! columns). Measures the full hot path: `Decoder::decode` over a synthesized
-//! Relation + N Insert messages, then `build_change_batch` into Arrow.
+//! columns).
+//!
+//! Three stages are measured per format so the deferred-parsing tradeoff is
+//! directly quantifiable — all three run the *same* synthesized Relation + N
+//! Insert messages:
+//!   * `{fmt}`         — combined `Decoder::decode` + `build_change_batch`
+//!                       (what the pump does eagerly today; kept under the bare
+//!                       `text`/`binary` id so `--baseline text-before` still
+//!                       compares against the pre-refactor number).
+//!   * `{fmt}-decode`  — `Decoder::decode` only, i.e. the pump-side work that
+//!                       STAYS on the shared pump after deferral (peel zero-copy
+//!                       `Bytes` slices into buffered `DecodedChange`s).
+//!   * `{fmt}-build`   — `build_change_batch` only, over pre-decoded changes,
+//!                       i.e. the Arrow-typing + UTF-8 work that MOVES to the
+//!                       per-dataset consumer under deferred parsing.
+//! `build / (decode + build)` is the fraction of pump CPU deferral sheds — the
+//! go/no-go signal for the deferred-parse change.
 //!
 //! The `text` and `binary` variants encode the *same logical rows* two ways, so
 //! the numbers are directly comparable. Payload `Bytes` are built once, outside
 //! the timed loop; the per-message `Bytes::clone` inside the loop is an O(1)
-//! refcount bump — the same handoff the replication frame reader performs.
+//! refcount bump — the same handoff the replication frame reader performs. The
+//! `-build` stage decodes once outside the timed loop (the `Bytes` slices stay
+//! valid because the source payload vectors outlive the loop).
 //!
 //! Run:
 //!   cargo bench -p data_components --features postgres --bench pgoutput_decode
@@ -239,7 +256,9 @@ fn encode_insert_binary(values: &[Vec<u8>]) -> Bytes {
 
 // ---- measured work -------------------------------------------------------
 
-fn decode_and_build(schema: &SchemaRef, relation: &Bytes, inserts: &[Bytes]) {
+/// Pump-side work retained after deferral: decode the Relation and peel each
+/// Insert's tuple into a buffered `DecodedChange` (zero-copy `Bytes` slices).
+fn decode_only(relation: &Bytes, inserts: &[Bytes]) -> (Relation, Vec<DecodedChange>) {
     let mut decoder = Decoder::new();
     let rel: Relation = match decoder.decode(relation.clone()).expect("decode relation") {
         DecodedMessage::Relation(r) => r,
@@ -255,8 +274,36 @@ fn decode_and_build(schema: &SchemaRef, relation: &Bytes, inserts: &[Bytes]) {
             other => panic!("expected Insert, got {other:?}"),
         }
     }
-    let batch = build_change_batch(schema, &rel, &changes).expect("build batch");
+    (rel, changes)
+}
+
+/// Pump-side work after increment 2 (raw-buffering): fully decode the (rare)
+/// Relation to cache schema, then only PEEK each change message's kind + relation
+/// id to route it — the tuple is left as raw bytes for the consumer to decode.
+/// This is what the shared pump would do before buffering, so `route_peek` vs
+/// `decode` is the pump per-event cost after vs before deferring the decode.
+fn route_peek(relation: &Bytes, inserts: &[Bytes]) -> u32 {
+    let mut decoder = Decoder::new();
+    let _ = decoder.decode(relation.clone()).expect("decode relation");
+    let mut acc = 0u32;
+    for msg in inserts {
+        // pgoutput I/U/D layout: tag = msg[0], relation_id = msg[1..5] (big-endian).
+        let relid = u32::from_be_bytes([msg[1], msg[2], msg[3], msg[4]]);
+        acc = acc.wrapping_add(relid);
+    }
+    acc
+}
+
+/// Deferred work: Arrow-type + UTF-8 the pre-decoded changes into a batch. This
+/// is what moves off the pump to the per-dataset consumer under deferred parse.
+fn build_only(schema: &SchemaRef, rel: &Relation, changes: &[DecodedChange]) {
+    let batch = build_change_batch(schema, rel, changes).expect("build batch");
     black_box(batch);
+}
+
+fn decode_and_build(schema: &SchemaRef, relation: &Bytes, inserts: &[Bytes]) {
+    let (rel, changes) = decode_only(relation, inserts);
+    build_only(schema, &rel, &changes);
 }
 
 fn bench_decode(c: &mut Criterion) {
@@ -275,23 +322,119 @@ fn bench_decode(c: &mut Criterion) {
             .collect();
 
         group.throughput(Throughput::Elements(n as u64));
-        group.bench_with_input(
-            BenchmarkId::new("text", n),
-            &(&relation, &text),
-            |b, (r, ins)| {
-                b.iter(|| decode_and_build(black_box(&schema), black_box(r), black_box(ins)));
-            },
-        );
-        group.bench_with_input(
-            BenchmarkId::new("binary", n),
-            &(&relation, &binary),
-            |b, (r, ins)| {
-                b.iter(|| decode_and_build(black_box(&schema), black_box(r), black_box(ins)));
-            },
-        );
+        for (fmt, inserts) in [("text", &text), ("binary", &binary)] {
+            // Combined (eager pump path today). Bare `text`/`binary` id preserves
+            // `--baseline text-before` comparability.
+            group.bench_with_input(
+                BenchmarkId::new(fmt, n),
+                &(&relation, inserts),
+                |b, (r, ins)| {
+                    b.iter(|| decode_and_build(black_box(&schema), black_box(r), black_box(ins)));
+                },
+            );
+            // Decode-only: pump work after increment 1 (decode -> DecodedChange,
+            // build deferred to the consumer).
+            group.bench_with_input(
+                BenchmarkId::new(format!("{fmt}-decode"), n),
+                &(&relation, inserts),
+                |b, (r, ins)| {
+                    b.iter(|| black_box(decode_only(black_box(r), black_box(ins))));
+                },
+            );
+            // Route-peek: pump work after increment 2 (peek kind+relid only,
+            // decode deferred to the consumer with the raw bytes).
+            group.bench_with_input(
+                BenchmarkId::new(format!("{fmt}-route_peek"), n),
+                &(&relation, inserts),
+                |b, (r, ins)| {
+                    b.iter(|| black_box(route_peek(black_box(r), black_box(ins))));
+                },
+            );
+            // Build-only: moves to the consumer. Decode once outside the timed loop.
+            let (rel, changes) = decode_only(&relation, inserts);
+            group.bench_with_input(
+                BenchmarkId::new(format!("{fmt}-build"), n),
+                &(rel, changes),
+                |b, (rel, changes)| {
+                    b.iter(|| build_only(black_box(&schema), black_box(rel), black_box(changes)));
+                },
+            );
+        }
     }
     group.finish();
 }
 
-criterion_group!(benches, bench_decode);
+/// Per-event *routing* cost on the shared pump: peek the relation id, look it up
+/// in the route map, and buffer the raw bytes into the per-relation txn map.
+/// This is the only place the hasher choice matters (the decode bench's
+/// `route_peek` stage deliberately omits the maps), so it compares std `HashMap`
+/// (SipHash) vs `FxHashMap` for the two `u32`-keyed lookups. `M` relations, `N`
+/// change messages round-robined across them, a fresh txn per iteration (one
+/// transaction's worth).
+fn bench_routing(c: &mut Criterion) {
+    use rustc_hash::FxHashMap;
+    use std::collections::HashMap;
+
+    const M: u32 = 16; // subscribed relations (tables) on the shared slot
+    const BASE_OID: u32 = 16_384;
+
+    fn make_msgs(n: usize) -> Vec<Bytes> {
+        (0..n)
+            .map(|i| {
+                let relid = BASE_OID + (i as u32 % M);
+                let mut o = vec![b'I'];
+                o.extend_from_slice(&relid.to_be_bytes());
+                o.push(b'N');
+                o.extend_from_slice(&1u16.to_be_bytes());
+                o.push(b't');
+                o.extend_from_slice(&1u32.to_be_bytes());
+                o.push(b'x');
+                Bytes::from(o)
+            })
+            .collect()
+    }
+
+    let mut group = c.benchmark_group("pgoutput_routing");
+    for &n in &[1_000usize, 10_000] {
+        let msgs = make_msgs(n);
+        group.throughput(Throughput::Elements(n as u64));
+
+        group.bench_with_input(BenchmarkId::new("siphash", n), &msgs, |b, msgs| {
+            let mut routes: HashMap<u32, usize> = HashMap::new();
+            for k in 0..M {
+                routes.insert(BASE_OID + k, k as usize);
+            }
+            b.iter(|| {
+                let mut txn: HashMap<u32, Vec<Bytes>> = HashMap::new();
+                for msg in msgs {
+                    let relid = u32::from_be_bytes([msg[1], msg[2], msg[3], msg[4]]);
+                    if routes.get(&relid).is_some() {
+                        txn.entry(relid).or_default().push(msg.clone());
+                    }
+                }
+                black_box(&txn);
+            });
+        });
+
+        group.bench_with_input(BenchmarkId::new("fxhash", n), &msgs, |b, msgs| {
+            let mut routes: FxHashMap<u32, usize> = FxHashMap::default();
+            for k in 0..M {
+                routes.insert(BASE_OID + k, k as usize);
+            }
+            b.iter(|| {
+                let mut txn: FxHashMap<u32, Vec<Bytes>> = FxHashMap::default();
+                for msg in msgs {
+                    let relid = u32::from_be_bytes([msg[1], msg[2], msg[3], msg[4]]);
+                    if routes.get(&relid).is_some() {
+                        txn.entry(relid).or_default().push(msg.clone());
+                    }
+                }
+                black_box(&txn);
+            });
+        });
+    }
+    group.finish();
+}
+
+criterion_group!(benches, bench_decode, bench_routing);
 criterion_main!(benches);

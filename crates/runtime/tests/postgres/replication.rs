@@ -154,7 +154,7 @@ async fn bootstrap_then_stream_changes() -> Result<(), anyhow::Error> {
     let envelope = tokio::time::timeout(Duration::from_secs(30), stream.next())
         .await?
         .ok_or_else(|| anyhow::anyhow!("bootstrap envelope missing"))??;
-    let (committer, change_batch, is_ready) = envelope.into_parts();
+    let (committer, change_batch, is_ready) = envelope.into_parts().expect("build change batch");
     let ops = change_batch
         .record
         .column_by_name("op")
@@ -177,7 +177,7 @@ async fn bootstrap_then_stream_changes() -> Result<(), anyhow::Error> {
     let envelope = tokio::time::timeout(Duration::from_secs(15), stream.next())
         .await?
         .ok_or_else(|| anyhow::anyhow!("insert envelope missing"))??;
-    let (committer, change_batch, _) = envelope.into_parts();
+    let (committer, change_batch, _) = envelope.into_parts().expect("build change batch");
     let ops = change_batch
         .record
         .column_by_name("op")
@@ -201,7 +201,7 @@ async fn bootstrap_then_stream_changes() -> Result<(), anyhow::Error> {
     let envelope = tokio::time::timeout(Duration::from_secs(15), stream.next())
         .await?
         .ok_or_else(|| anyhow::anyhow!("update envelope missing"))??;
-    let (committer, change_batch, _) = envelope.into_parts();
+    let (committer, change_batch, _) = envelope.into_parts().expect("build change batch");
     let ops = change_batch
         .record
         .column_by_name("op")
@@ -217,7 +217,7 @@ async fn bootstrap_then_stream_changes() -> Result<(), anyhow::Error> {
     let envelope = tokio::time::timeout(Duration::from_secs(15), stream.next())
         .await?
         .ok_or_else(|| anyhow::anyhow!("delete envelope missing"))??;
-    let (committer, change_batch, _) = envelope.into_parts();
+    let (committer, change_batch, _) = envelope.into_parts().expect("build change batch");
     let ops = change_batch
         .record
         .column_by_name("op")
@@ -251,7 +251,7 @@ async fn bootstrap_then_stream_changes() -> Result<(), anyhow::Error> {
     let envelope = tokio::time::timeout(Duration::from_secs(30), stream.next())
         .await?
         .ok_or_else(|| anyhow::anyhow!("forced resume snapshot missing"))??;
-    let (committer, change_batch, is_ready) = envelope.into_parts();
+    let (committer, change_batch, is_ready) = envelope.into_parts().expect("build change batch");
     assert_eq!(
         change_batch.record.num_rows(),
         2,
@@ -307,7 +307,7 @@ async fn large_value_and_burst_replicate_intact() -> Result<(), anyhow::Error> {
     let envelope = tokio::time::timeout(Duration::from_secs(30), stream.next())
         .await?
         .ok_or_else(|| anyhow::anyhow!("bootstrap envelope missing"))??;
-    let (committer, change_batch, is_ready) = envelope.into_parts();
+    let (committer, change_batch, is_ready) = envelope.into_parts().expect("build change batch");
     assert_eq!(change_batch.record.num_rows(), 1);
     assert!(is_ready, "bootstrap must mark dataset ready");
     committer.commit().await?;
@@ -323,7 +323,7 @@ async fn large_value_and_burst_replicate_intact() -> Result<(), anyhow::Error> {
     let envelope = tokio::time::timeout(Duration::from_secs(30), stream.next())
         .await?
         .ok_or_else(|| anyhow::anyhow!("large-value envelope missing"))??;
-    let (committer, change_batch, _) = envelope.into_parts();
+    let (committer, change_batch, _) = envelope.into_parts().expect("build change batch");
     assert_eq!(change_batch.record.num_rows(), 1);
     let data_struct = change_batch
         .record
@@ -373,7 +373,7 @@ async fn large_value_and_burst_replicate_intact() -> Result<(), anyhow::Error> {
                     seen.len()
                 )
             })??;
-        let (committer, change_batch, _) = envelope.into_parts();
+        let (committer, change_batch, _) = envelope.into_parts().expect("build change batch");
         let data_struct = change_batch
             .record
             .column_by_name("data")
@@ -439,8 +439,22 @@ async fn two_replicas_have_independent_slots() -> Result<(), anyhow::Error> {
     let env_b = tokio::time::timeout(Duration::from_secs(30), stream_b.next())
         .await?
         .ok_or_else(|| anyhow::anyhow!("bootstrap b missing"))??;
-    assert_eq!(env_a.change_batch.record.num_rows(), 2);
-    assert_eq!(env_b.change_batch.record.num_rows(), 2);
+    assert_eq!(
+        env_a
+            .change_batch()
+            .expect("built change batch")
+            .record
+            .num_rows(),
+        2
+    );
+    assert_eq!(
+        env_b
+            .change_batch()
+            .expect("built change batch")
+            .record
+            .num_rows(),
+        2
+    );
     env_a.commit().await?;
     env_b.commit().await?;
 
@@ -455,8 +469,22 @@ async fn two_replicas_have_independent_slots() -> Result<(), anyhow::Error> {
     let live_b = tokio::time::timeout(Duration::from_secs(15), stream_b.next())
         .await?
         .ok_or_else(|| anyhow::anyhow!("live b missing"))??;
-    assert_eq!(live_a.change_batch.record.num_rows(), 1);
-    assert_eq!(live_b.change_batch.record.num_rows(), 1);
+    assert_eq!(
+        live_a
+            .change_batch()
+            .expect("built change batch")
+            .record
+            .num_rows(),
+        1
+    );
+    assert_eq!(
+        live_b
+            .change_batch()
+            .expect("built change batch")
+            .record
+            .num_rows(),
+        1
+    );
     live_a.commit().await?;
     live_b.commit().await?;
 
@@ -581,7 +609,7 @@ async fn run_wide_types_scenario(
     let ready = tokio::time::timeout(Duration::from_secs(30), stream.next())
         .await?
         .ok_or_else(|| anyhow::anyhow!("ready envelope missing ({tag})"))??;
-    let (_committer, ready_batch, is_ready) = ready.into_parts();
+    let (_committer, ready_batch, is_ready) = ready.into_parts().expect("build change batch");
     assert!(
         is_ready,
         "skip-bootstrap ready envelope must mark ready ({tag})"
@@ -603,7 +631,7 @@ async fn run_wide_types_scenario(
     let env = tokio::time::timeout(Duration::from_secs(15), stream.next())
         .await?
         .ok_or_else(|| anyhow::anyhow!("insert envelope missing ({tag})"))??;
-    let (committer, batch, _) = env.into_parts();
+    let (committer, batch, _) = env.into_parts().expect("build change batch");
     assert_eq!(
         batch
             .record
@@ -716,7 +744,7 @@ async fn run_wide_types_scenario(
     let env = tokio::time::timeout(Duration::from_secs(15), stream.next())
         .await?
         .ok_or_else(|| anyhow::anyhow!("update envelope missing ({tag})"))??;
-    let (committer, batch, _) = env.into_parts();
+    let (committer, batch, _) = env.into_parts().expect("build change batch");
     assert_eq!(
         batch
             .record
@@ -770,7 +798,7 @@ async fn run_wide_types_scenario(
     let env = tokio::time::timeout(Duration::from_secs(15), stream.next())
         .await?
         .ok_or_else(|| anyhow::anyhow!("delete envelope missing ({tag})"))??;
-    let (committer, batch, _) = env.into_parts();
+    let (committer, batch, _) = env.into_parts().expect("build change batch");
     assert_eq!(
         batch
             .record
