@@ -94,7 +94,6 @@ jsonwebtoken = { version = "10.3.0", features = ["aws_lc_rs"] }
 linkme.workspace = true
 llms = { path = "../llms", default-features = false }
 mediatype = "0.21.0"
-model_components = { path = "../model_components" }
 moka.workspace = true
 mysql_async = { workspace = true, optional = true }
 notify = "8.2.0"
@@ -336,7 +335,6 @@ metal = ["llms/metal"]
 distributed = ["llms/distributed", "models"]
 models = [
     "bedrock",
-    "model_components/full",
     "mcp",
     "runtime-datafusion-udfs/models",
     "search/llms",
@@ -352,6 +350,7 @@ openapi = [
     "dep:utoipa-swagger-ui",
     "dep:utoipa",
     "mcp",
+    "runtime-acceleration/openapi",
     "runtime-api-types/openapi",
     "runtime-search/openapi",
     "runtime-tools/openapi",

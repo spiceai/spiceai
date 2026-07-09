@@ -9,7 +9,9 @@ rust-version.workspace = true
 version.workspace = true
 
 [dependencies]
+app = { path = "../app" }
 arrow.workspace = true
+datafusion-table-providers.workspace = true
 arrow-schema = { workspace = true, features = ["serde"] }
 arrow_tools = { path = "../arrow_tools" }
 async-trait.workspace = true
@@ -43,11 +45,13 @@ tracing.workspace = true
 turso = { workspace = true, optional = true }
 url.workspace = true
 util = { path = "../util", features = ["datafusion"] }
+utoipa = { workspace = true, optional = true }
 uuid = { version = "1", features = ["v7"] }
 
 [features]
 default = []
 duckdb = ["dep:duckdb"]
+openapi = ["dep:utoipa"]
 snapshots = []
 sqlite = ["dep:rusqlite"]
 turso = ["dep:turso"]
