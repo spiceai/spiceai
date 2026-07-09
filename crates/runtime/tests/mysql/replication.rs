@@ -40,7 +40,7 @@ use data_components::cdc::{ChangeEnvelope, ChangesStream, StreamError};
 use data_components::cdc::{InitialSnapshotMode, InvalidCheckpointBehavior};
 use data_components::mysql_replication::{
     PersistedPosition, PositionStore, ReplicationMetricsCollector, ReplicationParams,
-    ReplicationStreamInput, StoreError, start_replication_stream,
+    ReplicationStreamInput, StoreError, encode_checkpoint_schema_json, start_replication_stream,
 };
 use futures::StreamExt;
 use mysql_async::prelude::Queryable;
@@ -106,15 +106,18 @@ fn stream_input(
     server_id: u32,
     store: Arc<dyn PositionStore>,
 ) -> ReplicationStreamInput {
+    let schema = dataset_schema();
+    let schema_json = serde_json::to_string(schema.as_ref())
+        .expect("dataset schema must serialize for checkpoint meta");
     ReplicationStreamInput {
         dataset_name: "repl_users".into(),
         params: params_for(port, server_id),
-        schema: dataset_schema(),
+        schema,
         primary_keys: vec!["id".into()],
         database: "mysqldb".into(),
         table: "repl_users".into(),
         position_store: store,
-        schema_json: None,
+        schema_json: Some(schema_json),
         metrics: ReplicationMetricsCollector::new(),
     }
 }
@@ -336,10 +339,24 @@ async fn purged_position_behavior() -> Result<(), anyhow::Error> {
     let pool = setup_source_table(port).await?;
 
     // A persisted position pointing at a binlog file the server never had —
-    // the same shape as a real purge.
+    // the same shape as a real purge. Use a valid v2 checkpoint meta so the
+    // resume path reaches the purged-file check (rather than failing early on
+    // MissingCheckpointMeta).
+    let mut layout_conn = pool.get_conn().await?;
+    let layout = data_components::mysql_replication::setup::fetch_table_layout(
+        &mut layout_conn,
+        "mysqldb",
+        "repl_users",
+    )
+    .await?;
+    drop(layout_conn);
+    let dataset_schema_json = serde_json::to_string(dataset_schema().as_ref())
+        .expect("dataset schema must serialize for checkpoint meta");
+    let stale_meta = encode_checkpoint_schema_json(Some(&dataset_schema_json), &layout)
+        .expect("checkpoint meta must encode");
     let stale = PersistedPosition {
         position: data_components::mysql_replication::BinlogPosition::new("binlog.999999", 4),
-        schema_json: None,
+        schema_json: Some(stale_meta),
     };
 
     // Default behavior (`error`): the stream surfaces an actionable error.

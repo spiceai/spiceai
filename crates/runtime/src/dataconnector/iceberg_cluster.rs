@@ -135,9 +135,7 @@ impl TableProvider for IcebergClusterTableProvider {
         // plan (it never should), in which case we also leave it untouched.
         // The scan arguments are captured so the executor can replay this exact
         // `scan()` call to re-derive an equivalent (identically bucketed) scan.
-        if session_is_distributed(state.config())
-            && plan.downcast_ref::<IcebergTableScan>().is_some()
-        {
+        if session_is_distributed(state.config()) && plan.is::<IcebergTableScan>() {
             return Ok(Arc::new(IcebergScanExec::new(
                 self.table_ref.clone(),
                 plan,

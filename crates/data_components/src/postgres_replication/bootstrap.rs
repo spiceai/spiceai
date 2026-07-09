@@ -665,9 +665,13 @@ impl BootstrapBuilder {
                         message: format!("bootstrap read column (as text): {e}"),
                     })?;
                 match v {
+                    // Bootstrap fetches these columns as `::text`, so the value
+                    // is always text — the `type_oid` is irrelevant here (only
+                    // the binary branch consults it), hence `0` (unknown).
                     Some(s) => fb.append(
-                        Some(&super::pgoutput::Value::Text(s)),
+                        Some(&super::pgoutput::Value::Text(bytes::Bytes::from(s))),
                         super::changes::ChangeOp::Create,
+                        0,
                     )?,
                     None => fb.append_null(),
                 }

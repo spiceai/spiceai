@@ -18,3 +18,6 @@ runtime-metrics = { path = "../../runtime-metrics" }
 snafu.workspace = true
 tokio.workspace = true
 tracing.workspace = true
+
+[lints]
+workspace = true

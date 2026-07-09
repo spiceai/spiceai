@@ -142,6 +142,14 @@ pub(crate) fn build_replication_config(
         // status updates long enough for Postgres to hit `wal_sender_timeout`
         // and reset the walsender. See `pgwire_replication` worker `send_event`.
         feedback_while_backpressured: true,
+        // pgoutput column output format. The connector always sets Binary (see
+        // `ReplicationParams::pg_output_format`); tests may force Text to exercise
+        // the fallback. Postgres still tags each column text/binary per-value, so
+        // types without a binary send function (and the fixed Begin/Commit
+        // framing) arrive as text and are decoded by the text fallback — but the
+        // common int/float/date/timestamp/numeric columns arrive binary, skipping
+        // text formatting + reparsing on both ends. The decoder handles either tag.
+        format: params.pg_output_format,
         // Keep the crate default (~1 GiB) max_message_size so large TOAST-row
         // changes are never rejected; the reader allocates incrementally
         // regardless of this cap.
@@ -207,6 +215,9 @@ fn wal_stream(
         //     positive signal — they currently have to infer recovery from
         //     the absence of further WARNs.
         let mut reconnect_attempts: u32 = u32::from(initial_failed);
+        // Set at a drop, consumed on the next successful connect, to attribute the
+        // disconnected duration (mirrors the shared-pump path).
+        let mut disconnect_at: Option<std::time::Instant> = None;
 
         // Outer reconnect loop: runs until we hit a fatal error or the stream
         // reaches a natural end (rare — Postgres replication slots are
@@ -228,6 +239,12 @@ fn wal_stream(
                         match ReplicationClient::connect(config.clone()).await {
                             Ok(c) => {
                                 backoff.reset();
+                                if let Some(dropped_at) = disconnect_at.take() {
+                                    metrics.add_disconnected_ms(
+                                        u64::try_from(dropped_at.elapsed().as_millis())
+                                            .unwrap_or(u64::MAX),
+                                    );
+                                }
                                 if reconnect_attempts > 0 {
                                     tracing::info!(
                                         dataset = %dataset_name,
@@ -240,6 +257,8 @@ fn wal_stream(
                             }
                             Err(e) if super::resilience::is_transient_pgwire(&e) => {
                                 metrics.inc_reconnect();
+                                // First failed attempt of this outage starts the clock.
+                                disconnect_at.get_or_insert_with(std::time::Instant::now);
                                 reconnect_attempts = reconnect_attempts.saturating_add(1);
                                 log_transient_reconnect(
                                     reconnect_attempts,
@@ -278,13 +297,25 @@ fn wal_stream(
                 );
                 break 'reconnect;
             }
-            let event = match client.recv().await {
+            // Time blocked awaiting the next event from the source socket
+            // (input-wait) vs. our processing below (decode + build). Their ratio
+            // is the source-bound vs. our-decode discriminator.
+            let recv_start = std::time::Instant::now();
+            let recv_result = client.recv().await;
+            metrics.add_reader_input_wait_micros(
+                u64::try_from(recv_start.elapsed().as_micros()).unwrap_or(u64::MAX),
+            );
+            let processing_start = std::time::Instant::now();
+            let event = match recv_result {
                 Ok(Some(e)) => e,
                 Ok(None) => break 'reconnect, // server closed cleanly
                 Err(e) => {
                     metrics.inc_recv_error();
                     if super::resilience::is_transient_pgwire(&e) {
                         metrics.inc_reconnect();
+                        // Drop detected: start the disconnected-duration clock (consumed
+                        // by the next successful connect above).
+                        disconnect_at.get_or_insert_with(std::time::Instant::now);
                         reconnect_attempts = reconnect_attempts.saturating_add(1);
                         log_transient_reconnect(
                             reconnect_attempts,
@@ -308,7 +339,7 @@ fn wal_stream(
                 }
                 ReplicationEvent::XLogData { data, wal_end, .. } => {
                     metrics.set_server_wal_end(wal_end.0);
-                    let msg = match decoder.decode(&data) {
+                    let msg = match decoder.decode(data) {
                         Ok(m) => m,
                         Err(e) => {
                             metrics.inc_decode_error();
@@ -614,6 +645,12 @@ fn wal_stream(
                     break 'reconnect;
                 }
             }
+            // Processing (decode + build + yield) for this event; paired with the
+            // input-wait recorded above. Error/close arms `break`/`?` out before
+            // here, which is fine — they carry no steady-state processing cost.
+            metrics.add_reader_processing_micros(
+                u64::try_from(processing_start.elapsed().as_micros()).unwrap_or(u64::MAX),
+            );
         } // end 'recv
 
         // Inner 'recv loop broke on a transient error. Sleep with backoff

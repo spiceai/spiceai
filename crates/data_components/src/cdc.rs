@@ -476,6 +476,20 @@ impl ChangeBatch {
         self.source_commit_ts_ms
     }
 
+    /// Whether this is a zero-row envelope — a keepalive/heartbeat carrying only a
+    /// `source_commit_ts_ms` to keep the idle lag gauge fresh, not an actual change.
+    /// No source currently emits these (the Postgres heartbeat fan-out was reverted),
+    /// so this is a defensive guard: consumers that derive *received/applied progress
+    /// frontiers* must exclude such envelopes, because they are stamped with the server
+    /// clock on a "keepalive ⇒ caught up" premise that is FALSE mid-backlog (keepalives
+    /// interleave between transactions) — counting them advances the frontier past data
+    /// not yet received/applied and corrupts the progress-rate ladder. It also correctly
+    /// excludes empty-transaction envelopes from the data frontier.
+    #[must_use]
+    pub fn is_heartbeat(&self) -> bool {
+        self.record.num_rows() == 0
+    }
+
     #[must_use]
     pub fn op(&self, row: usize) -> ChangeOperation {
         let Some(op_col) = self

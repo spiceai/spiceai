@@ -16,3 +16,6 @@ tokio-stream.workspace = true
 snafu.workspace = true
 futures.workspace = true
 bytes.workspace = true
+
+[lints]
+workspace = true

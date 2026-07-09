@@ -156,15 +156,34 @@ connector's block mode has:
 - **Columns added on the source** are not replicated (a warning names them);
   add them to the dataset schema and restart to capture them.
 - **Dropping or renaming a dataset column** (or `RENAME TABLE`/`DROP TABLE`)
-  stops the stream with an actionable error.
+  stops the stream with an actionable error. The durable binlog checkpoint is
+  **not** advanced past that failure, so a restart still sees the last
+  known-good position.
 - **Retyping a dataset column** keeps streaming while values remain
   convertible to the dataset's Arrow type; an unconvertible value stops the
   stream with a decode error.
 
-If the stream stopped across a DDL boundary with an un-checkpointed tail, the
-restart may be unable to decode pre-DDL events — re-bootstrap with
-`mysql_replication_invalid_checkpoint_behavior: restart`. Quiescing writes
-to the table around DDL avoids that case entirely.
+Binlog row images are positional. Each checkpoint therefore stores a
+fingerprint of the source ordinal layout (column names, types, order, and
+primary-key membership) alongside the dataset schema. On restart, Spice
+refuses to resume when either has drifted — including source-only reorders
+that leave the dataset schema unchanged — and either errors or re-bootstraps
+per `mysql_replication_invalid_checkpoint_behavior`. Checkpoints written before
+layout fingerprinting (legacy) are treated the same way: set
+`mysql_replication_invalid_checkpoint_behavior: restart` once to rebuild
+(see [#11763](https://github.com/spiceai/spiceai/issues/11763) for the
+upgrade/release-note tracking).
+
+If the stream stopped across a DDL boundary with an un-checkpointed tail,
+re-bootstrap with `mysql_replication_invalid_checkpoint_behavior: restart`.
+Quiescing writes to the table around DDL avoids that case entirely.
+
+**Lag + multiple same-count DDLs:** mid-stream adopt re-reads today's
+`information_schema`. If the stream is behind and the source applies several
+compatible same-count reorders/retypes before Spice processes the first
+`ALTER`, Spice can adopt the final layout while still decoding intermediate
+row images. Prefer quiescing DDL until replication lag is near zero; see
+[#11764](https://github.com/spiceai/spiceai/issues/11764).
 
 ## Metrics
 
@@ -194,7 +213,9 @@ Exposed under `dataset_mysql_*` alongside the connection-pool metrics:
 - **Schema evolution is block-mode only** — compatible `ALTER TABLE` is
   tolerated (see above), but `on_schema_change` policies that *adopt* new
   columns (`append_new_columns` / `sync_all_columns`) are not yet wired to
-  this connector.
+  this connector. Same-count mid-stream reshapes under replication lag can
+  still mis-map until [#11764](https://github.com/spiceai/spiceai/issues/11764)
+  lands; quiesce DDL while lag is non-zero.
 - **XA (two-phase) transactions are not supported.** An XA transaction that
   touches the replicated table stops the stream with an error; XA activity on
   other tables logs a warning and is ignored.

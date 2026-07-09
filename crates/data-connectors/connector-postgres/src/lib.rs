@@ -204,6 +204,14 @@ const PARAMETERS: &[ParameterSpec] = &[
              Default: 8192. Maximum: 1048576.",
         )
         .default("8192"),
+    ParameterSpec::component("replication_member_channel_capacity")
+        .description(
+            "Shared-slot only: envelopes buffered per member table before the shared \
+             replication pump back-pressures. Too small a value lets one member's \
+             transient stall block the whole slot (head-of-line blocking). \
+             Default: 1024. Maximum: 1048576.",
+        )
+        .default("1024"),
 ];
 
 impl DataConnectorFactory for PostgresFactory {

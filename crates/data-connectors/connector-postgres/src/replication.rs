@@ -28,8 +28,8 @@ use std::time::Duration;
 use async_stream::try_stream;
 use data_components::cdc::{ChangesStream, InitialSnapshotMode, StreamError};
 use data_components::postgres_replication::{
-    ReplicationMetrics, ReplicationMetricsCollector, ReplicationParams, ReplicationStreamInput,
-    SchemaEvolutionPolicy, config, start_replication_stream_with_policy,
+    PgOutputFormat, ReplicationMetrics, ReplicationMetricsCollector, ReplicationParams,
+    ReplicationStreamInput, SchemaEvolutionPolicy, config, start_replication_stream_with_policy,
 };
 use datafusion::sql::TableReference;
 use futures::StreamExt;
@@ -49,6 +49,10 @@ use secrecy::SecretString;
 const DEFAULT_STATUS_INTERVAL: Duration = Duration::from_secs(5);
 const DEFAULT_BOOTSTRAP_BATCH_SIZE: usize = 8192;
 const MAX_BOOTSTRAP_BATCH_SIZE: usize = 1_048_576;
+// Upper bound on the configurable shared-slot member channel capacity. Matches
+// the bootstrap-batch ceiling — a bounded, backpressure-preserving queue in
+// front of the accelerator prefetch, not an unbounded buffer.
+const MAX_MEMBER_CHANNEL_CAPACITY: usize = 1_048_576;
 
 pub fn build_changes_stream(
     params: &Parameters,
@@ -262,15 +266,41 @@ const METRICS: &[MetricSpec] = &[
     )
     .description(
         "Most recent LSN Spice has acknowledged to Postgres. Matches \
-             `pg_replication_slots.confirmed_flush_lsn`.",
-    ),
+             `pg_replication_slots.confirmed_flush_lsn`. Compare its advance rate \
+             against the applied watermark to spot slot-ack racing ahead of apply.",
+    )
+    .auto_register(),
     MetricSpec::new(
         "replication_server_wal_end_lsn",
         MetricType::ObservableGaugeU64,
     )
     .description(
         "Most recent WAL end LSN reported by the Postgres server (via keepalive or WAL data).",
-    ),
+    )
+    .auto_register(),
+    MetricSpec::new(
+        "replication_reader_input_wait_micros_total",
+        MetricType::ObservableCounterU64,
+    )
+    .description(
+        "Cumulative microseconds the replication reader spent BLOCKED awaiting the \
+         next event from the source socket. High relative to \
+         `reader_processing_micros_total` ⇒ source/network can't deliver fast \
+         enough (source-bound); low ⇒ our decode/build is the limiter.",
+    )
+    .unit("us")
+    .auto_register(),
+    MetricSpec::new(
+        "replication_reader_processing_micros_total",
+        MetricType::ObservableCounterU64,
+    )
+    .description(
+        "Cumulative microseconds the replication reader spent decoding + building \
+         change batches (and yielding downstream) after a socket event. The \
+         source-vs-our-decode discriminator, paired with reader_input_wait_micros_total.",
+    )
+    .unit("us")
+    .auto_register(),
     MetricSpec::new(
         "replication_transactions_total",
         MetricType::ObservableCounterU64,
@@ -359,6 +389,18 @@ const METRICS: &[MetricSpec] = &[
     )
     .auto_register(),
     MetricSpec::new(
+        "replication_disconnected_ms_total",
+        MetricType::ObservableCounterU64,
+    )
+    .description(
+        "Cumulative milliseconds the replication stream was disconnected across all \
+         reconnects (drop → successful resume, including backoff). Paired with \
+         replication_reconnects_total it quantifies the DURATION cost of a reconnect \
+         storm — no changes are delivered and lag grows while disconnected.",
+    )
+    .unit("ms")
+    .auto_register(),
+    MetricSpec::new(
         "replication_member_send_stalled_seconds_total",
         MetricType::ObservableCounterU64,
     )
@@ -380,8 +422,24 @@ const METRICS: &[MetricSpec] = &[
          retention for the WHOLE shared slot until it rejoins or spiced restarts, so a \
          value of 0 is the unambiguous signal for which dataset stalled the slot (the \
          lag metric grows on the surviving slot-mates instead). Only reported for \
-         datasets on a shared (explicitly-named) slot; a dedicated slot reports no series.",
+         datasets on a shared (explicitly-named) slot; a dedicated slot reports no series. \
+         Carries a `slot` label for shared-slot grouping.",
     )
+    .auto_register(),
+    MetricSpec::new(
+        "replication_member_send_wait_micros_total",
+        MetricType::ObservableCounterU64,
+    )
+    .description(
+        "Cumulative microseconds the shared-slot pump spent awaiting this dataset's \
+         delivery channel while applying committed changes. Unlike \
+         member_send_stalled_seconds_total, this accrues the full per-commit wait \
+         (including sub-second waits). The pump subtracts this wait from \
+         reader_processing_micros_total at the source, so that counter stays \
+         decode-only; this metric exports the subtracted amount for attribution. \
+         Only meaningful for datasets on a shared slot; dedicated-slot datasets will export 0.",
+    )
+    .unit("us")
     .auto_register(),
 ];
 
@@ -435,6 +493,16 @@ impl MetricsProvider for PostgresMetricsProvider {
             "replication_server_wal_end_lsn" => {
                 Some(ObserveMetricCallback::U64(Box::new(move |instrument| {
                     instrument.observe(m.server_wal_end_lsn(), &attributes);
+                })))
+            }
+            "replication_reader_input_wait_micros_total" => {
+                Some(ObserveMetricCallback::U64(Box::new(move |instrument| {
+                    instrument.observe(m.reader_input_wait_micros_total(), &attributes);
+                })))
+            }
+            "replication_reader_processing_micros_total" => {
+                Some(ObserveMetricCallback::U64(Box::new(move |instrument| {
+                    instrument.observe(m.reader_processing_micros_total(), &attributes);
                 })))
             }
             "replication_transactions_total" => {
@@ -501,19 +569,34 @@ impl MetricsProvider for PostgresMetricsProvider {
                     instrument.observe(m.replication_reconnects_total(), &attributes);
                 })))
             }
+            "replication_disconnected_ms_total" => {
+                Some(ObserveMetricCallback::U64(Box::new(move |instrument| {
+                    instrument.observe(m.replication_disconnected_ms_total(), &attributes);
+                })))
+            }
+            "replication_member_attached" => {
+                Some(ObserveMetricCallback::U64(Box::new(move |instrument| {
+                    // Observe only for shared-slot members (`Some`); a dedicated slot has
+                    // no member-detach concept, so its series stays absent rather than a
+                    // misleading constant `0`. Append the shared-slot label so the
+                    // analysis can group datasets by slot + join authoritative backlog.
+                    if let Some(v) = m.member_attached() {
+                        let mut attrs = attributes.clone();
+                        if let Some(slot) = m.slot_name() {
+                            attrs.push(KeyValue::new("slot", slot));
+                        }
+                        instrument.observe(v, &attrs);
+                    }
+                })))
+            }
             "replication_member_send_stalled_seconds_total" => {
                 Some(ObserveMetricCallback::U64(Box::new(move |instrument| {
                     instrument.observe(m.member_send_stalled_seconds_total(), &attributes);
                 })))
             }
-            "replication_member_attached" => {
+            "replication_member_send_wait_micros_total" => {
                 Some(ObserveMetricCallback::U64(Box::new(move |instrument| {
-                    // Observe only for shared-slot members (`Some`); a dedicated slot
-                    // has no member-detach concept, so its series stays absent rather
-                    // than a misleading constant `0`.
-                    if let Some(v) = m.member_attached() {
-                        instrument.observe(v, &attributes);
-                    }
+                    instrument.observe(m.member_send_wait_micros_total(), &attributes);
                 })))
             }
             _ => None,
@@ -594,6 +677,14 @@ fn replication_params_from_connector_params(
         "replication_ready_lag",
         data_components::cdc::DEFAULT_READY_LAG,
     )?;
+    // Only meaningful on the shared path, but parsed unconditionally so a
+    // misconfigured value is rejected up front regardless of slot mode.
+    let member_channel_capacity = optional_usize_in_range(
+        params,
+        "replication_member_channel_capacity",
+        data_components::postgres_replication::shared::DEFAULT_MEMBER_CHANNEL_CAPACITY,
+        MAX_MEMBER_CHANNEL_CAPACITY,
+    )?;
 
     Ok(ReplicationParams {
         host,
@@ -612,6 +703,11 @@ fn replication_params_from_connector_params(
         ready_lag,
         bootstrap_batch_size,
         shared,
+        member_channel_capacity,
+        // Binary pgoutput on every stream — faster decode, no source-side text
+        // formatting. Not a user-facing parameter; the per-column text fallback
+        // still handles types Postgres emits as text.
+        pg_output_format: PgOutputFormat::Binary,
     })
 }
 

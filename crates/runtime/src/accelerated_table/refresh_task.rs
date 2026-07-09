@@ -427,9 +427,12 @@ impl RefreshTaskBuilder {
                 .with_sink_indexes(federated_indexes),
         ));
 
+        let dataset_metric_labels = DatasetMetricLabels::new(&self.dataset_name);
+
         RefreshTask {
             runtime_status: self.runtime_status,
             dataset_name: self.dataset_name,
+            dataset_metric_labels,
             federated: self.federated,
             federated_source: self.federated_source,
             accelerator: self.accelerator,
@@ -460,9 +463,49 @@ impl RefreshTaskBuilder {
     }
 }
 
+/// Prebuilt metric labels for one dataset. The `dataset` label value is held as
+/// an `Arc<str>` inside a `KeyValue`, so cloning it is a refcount bump rather
+/// than a fresh `dataset_name.to_string()` heap copy. This lets the CDC apply
+/// loop (and the refresh ingestion loop) record their per-event / per-batch
+/// metrics without re-allocating the label on every call. Built once per
+/// dataset task; the emitted metric output is byte-identical to constructing the
+/// label inline.
+#[derive(Debug, Clone)]
+pub(crate) struct DatasetMetricLabels {
+    /// A single-element array holding `KeyValue { "dataset": Arc<str> }` so
+    /// dataset-only record sites can pass `&self.dataset_only` — no allocation,
+    /// no clone.
+    dataset_only: [KeyValue; 1],
+}
+
+impl DatasetMetricLabels {
+    pub(crate) fn new(dataset_name: &TableReference) -> Self {
+        let name: Arc<str> = Arc::from(dataset_name.to_string());
+        Self {
+            dataset_only: [KeyValue::new("dataset", name)],
+        }
+    }
+
+    /// The dataset-only label set — a zero-allocation slice reuse.
+    pub(crate) fn dataset(&self) -> &[KeyValue] {
+        &self.dataset_only
+    }
+
+    /// The dataset label plus one additional static-valued label. Cloning the
+    /// cached dataset `KeyValue` is an `Arc` refcount bump and the static second
+    /// label allocates nothing, so only the two-element stack array is produced —
+    /// no string copy.
+    pub(crate) fn tagged(&self, key: &'static str, value: &'static str) -> [KeyValue; 2] {
+        [self.dataset_only[0].clone(), KeyValue::new(key, value)]
+    }
+}
+
 pub struct RefreshTask {
     runtime_status: Arc<status::RuntimeStatus>,
     dataset_name: TableReference,
+    /// Prebuilt per-dataset metric labels (see [`DatasetMetricLabels`]), reused
+    /// by the hot metric-record sites instead of re-allocating the label.
+    dataset_metric_labels: DatasetMetricLabels,
     federated: Arc<FederatedTable>,
     federated_source: Option<String>,
     accelerator: Arc<dyn TableProvider>,
@@ -902,6 +945,7 @@ impl RefreshTask {
                     data_update.data,
                     RefreshStat::default(),
                     dataset_name.to_string(),
+                    self.dataset_metric_labels.clone(),
                     notify_written_data_stat_available,
                     DataLoadTracing::new(&self.dataset_name),
                     resource_monitor,
@@ -910,6 +954,7 @@ impl RefreshTask {
                     mut stream,
                     mut stat,
                     ds_name,
+                    metric_labels,
                     notify_refresh_stat_available,
                     mut tracing,
                     resource_monitor,
@@ -922,10 +967,12 @@ impl RefreshTask {
                                 stat.memory_size += batch.get_array_memory_size();
 
                                 // Record incremental ingestion counters per batch.
-                                let labels = [KeyValue::new("dataset", ds_name.clone())];
-                                metrics::REFRESH_ROWS_WRITTEN.add(batch.num_rows() as u64, &labels);
+                                // Reuse the prebuilt dataset label (no per-batch
+                                // `dataset` string copy) — see `DatasetMetricLabels`.
+                                let labels = metric_labels.dataset();
+                                metrics::REFRESH_ROWS_WRITTEN.add(batch.num_rows() as u64, labels);
                                 metrics::REFRESH_BYTES_WRITTEN
-                                    .add(batch.get_array_memory_size() as u64, &labels);
+                                    .add(batch.get_array_memory_size() as u64, labels);
 
                                 // Check memory usage after processing each batch
                                 if let Some(ref monitor) = resource_monitor {
@@ -938,6 +985,7 @@ impl RefreshTask {
                                         stream,
                                         stat,
                                         ds_name,
+                                        metric_labels,
                                         notify_refresh_stat_available,
                                         tracing,
                                         resource_monitor,
@@ -950,6 +998,7 @@ impl RefreshTask {
                                     stream,
                                     stat,
                                     ds_name,
+                                    metric_labels,
                                     notify_refresh_stat_available,
                                     tracing,
                                     resource_monitor,
@@ -2769,8 +2818,7 @@ mod tests {
         assert!(
             indexed
                 .get_underlying()
-                .downcast_ref::<MetadataEnrichedTableProvider>()
-                .is_some()
+                .is::<MetadataEnrichedTableProvider>()
         );
 
         let wrapped_schema = wrapped.schema();
