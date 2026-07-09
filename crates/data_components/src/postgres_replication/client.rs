@@ -192,6 +192,13 @@ fn wal_stream(
         let mut client_slot: Option<ReplicationClient> = initial_client;
         let mut backoff = super::resilience::Backoff::default_for_stream();
         let mut last_emitted_commit_lsn = confirmed_flush.load(Ordering::Relaxed);
+        // Throttle idle-heartbeat emission: Postgres delivers keepalives in
+        // bursts (one per chunk of filtered/unrelated WAL it decodes to advance
+        // our confirmed position), so cap readiness heartbeats at one per
+        // `heartbeat_every` to avoid flooding the apply loop and logs. The
+        // per-keepalive position ACK below is unaffected.
+        let heartbeat_every = crate::cdc::heartbeat_interval(ready_lag);
+        let mut last_heartbeat_at: Option<std::time::Instant> = None;
         // Counts consecutive failed connect/recv attempts in the current
         // outage cycle. Reset to 0 on each successful connect. Used to:
         //   - Demote repeat WARN noise to DEBUG once an outage is established
@@ -552,7 +559,10 @@ fn wal_stream(
                     // is never flagged Ready prematurely. `server_time_micros` is
                     // Postgres-epoch (2000-01-01) microseconds; the crate uses 0
                     // only for synthetic keepalives, which we skip.
-                    if txn.is_none() && server_time_micros > 0 {
+                    if txn.is_none()
+                        && server_time_micros > 0
+                        && last_heartbeat_at.is_none_or(|at| at.elapsed() >= heartbeat_every)
+                    {
                         let heartbeat_ts_ms = pg_epoch_to_system_time(server_time_micros)
                             .duration_since(std::time::UNIX_EPOCH)
                             .ok()
@@ -590,6 +600,7 @@ fn wal_stream(
                             lag_ms = ?heartbeat_lag_ms,
                             "CDC idle heartbeat emitted"
                         );
+                        last_heartbeat_at = Some(std::time::Instant::now());
                         yield heartbeat;
                     }
                 }

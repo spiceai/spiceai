@@ -890,6 +890,13 @@ async fn run_pump(source: Arc<SharedSource>) {
     let publication_name = params.publication_name.clone();
     let mut backoff = resilience::Backoff::default_for_stream();
     let mut reconnect_attempts: u32 = 0;
+    // Throttle idle-heartbeat fan-out: keepalives arrive in bursts (one per
+    // chunk of filtered/unrelated WAL the slot decodes), so emit at most one
+    // heartbeat round per `heartbeat_every`. The per-keepalive `credit_idle`
+    // ACK is unaffected. Members share the slot's connection params, so the
+    // interval is derived from the source's ready_lag.
+    let heartbeat_every = crate::cdc::heartbeat_interval(params.ready_lag);
+    let mut last_heartbeat_at: Option<std::time::Instant> = None;
 
     'reconnect: loop {
         if crate::cdc::shutdown_epoch() != shutdown_epoch {
@@ -1082,7 +1089,10 @@ async fn run_pump(source: Arc<SharedSource>) {
                         // member has not caught up. `server_time_micros` is
                         // Postgres-epoch microseconds; 0 marks a synthetic
                         // keepalive, which we skip.
-                        if server_time_micros > 0 {
+                        if server_time_micros > 0
+                            && last_heartbeat_at.is_none_or(|at| at.elapsed() >= heartbeat_every)
+                        {
+                            last_heartbeat_at = Some(std::time::Instant::now());
                             let heartbeat_ts_ms =
                                 client::pg_epoch_to_system_time(server_time_micros)
                                     .duration_since(std::time::UNIX_EPOCH)
