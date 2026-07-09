@@ -209,12 +209,22 @@ pub fn to_cached_record_batch_stream(
         // so that compressed results that fit in the cache are not prematurely rejected.
         if records_size < cache_max_size || has_encoder {
             match batches_to_cache(&records) {
-                None if !records.is_empty() => {
+                // `batches_to_cache` only returns `None` when transient HTTP
+                // error responses (5xx/429) are present, which requires a
+                // non-empty result set — skip the write to avoid caching a
+                // partial result.
+                None => {
                     tracing::debug!(
                         "Transient HTTP error responses were present, skipping cache storage"
                     );
                 }
-                Some(records_to_cache) if !records_to_cache.is_empty() => {
+                // Cache the result, including genuinely empty (0-row / 0-batch)
+                // result sets. The schema is stored separately in
+                // `CachedQueryResult`, so an empty result round-trips with the
+                // correct schema, and caching it lets repeat queries that
+                // legitimately return no rows be served from cache instead of
+                // re-executing on every request.
+                Some(records_to_cache) => {
                     let cached_at = std::time::Instant::now();
                     let encoder = cache_provider.encoder();
 
@@ -245,7 +255,6 @@ pub fn to_cached_record_batch_stream(
                         }
                     }
                 }
-                _ => {}
             }
         }
     };
@@ -963,6 +972,123 @@ pub(crate) mod tests {
             .expect("cached result should decode");
         assert_eq!(cached_batches.len(), 1);
         assert_eq!(cached_batches[0].num_rows(), n);
+    }
+
+    /// Regression test: a query that returns an empty result set by yielding
+    /// **zero batches** (e.g. `DataFusion`'s `EmptyExec` for `WHERE 1=0`) must
+    /// still be cached, so repeat queries that legitimately return no rows are
+    /// served from cache instead of re-executing on every request.
+    #[tokio::test]
+    async fn test_empty_result_zero_batches_is_cached() {
+        use datafusion::error::DataFusionError;
+        use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+        use futures::TryStreamExt;
+        use spicepod::component::caching::SQLResultsCacheConfig;
+
+        let cache_provider = Arc::new(
+            crate::QueryResultsCacheProvider::try_new(
+                &SQLResultsCacheConfig {
+                    item_ttl: Some("10m".to_string()),
+                    ..Default::default()
+                },
+                Box::new([]),
+            )
+            .expect("valid cache provider"),
+        );
+
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+
+        // A stream that yields no batches at all (0 batches, 0 rows).
+        let raw_cache_key = crate::key::CacheKey::Query("empty-zero-batches", None)
+            .as_raw_key(cache_provider.hasher());
+        let stream = Box::pin(RecordBatchStreamAdapter::new(
+            Arc::clone(&schema),
+            futures::stream::iter(Vec::<Result<RecordBatch, DataFusionError>>::new()),
+        ));
+
+        let cached_stream = to_cached_record_batch_stream(
+            Arc::clone(&cache_provider),
+            stream,
+            raw_cache_key,
+            Arc::new(HashSet::from(["local_table".into()])),
+        );
+
+        let output_batches = cached_stream
+            .try_collect::<Vec<_>>()
+            .await
+            .expect("stream should be collected successfully");
+        assert!(output_batches.is_empty());
+
+        let cached = cache_provider
+            .get_raw_key(&raw_cache_key)
+            .await
+            .expect("cache lookup should succeed")
+            .expect("empty result sets (zero batches) should be cached");
+
+        let cached_batches = cached.records().await.expect("cached result should decode");
+        assert!(
+            cached_batches.iter().all(|b| b.num_rows() == 0),
+            "cached empty result should contain no rows"
+        );
+        assert_eq!(
+            cached.schema.fields().len(),
+            1,
+            "cached empty result should preserve the query schema"
+        );
+    }
+
+    /// A query that returns an empty result set by yielding a single schema-only
+    /// batch (0 rows) must also be cached. This is the sibling case to
+    /// [`test_empty_result_zero_batches_is_cached`] — both represent zero rows
+    /// and must be cached consistently.
+    #[tokio::test]
+    async fn test_empty_result_zero_row_batch_is_cached() {
+        use datafusion::error::DataFusionError;
+        use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+        use futures::TryStreamExt;
+        use spicepod::component::caching::SQLResultsCacheConfig;
+
+        let cache_provider = Arc::new(
+            crate::QueryResultsCacheProvider::try_new(
+                &SQLResultsCacheConfig {
+                    item_ttl: Some("10m".to_string()),
+                    ..Default::default()
+                },
+                Box::new([]),
+            )
+            .expect("valid cache provider"),
+        );
+
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+        let empty_batch = RecordBatch::new_empty(Arc::clone(&schema));
+
+        let raw_cache_key = crate::key::CacheKey::Query("empty-zero-row-batch", None)
+            .as_raw_key(cache_provider.hasher());
+        let stream = Box::pin(RecordBatchStreamAdapter::new(
+            Arc::clone(&schema),
+            futures::stream::iter(vec![Ok::<RecordBatch, DataFusionError>(empty_batch)]),
+        ));
+
+        let cached_stream = to_cached_record_batch_stream(
+            Arc::clone(&cache_provider),
+            stream,
+            raw_cache_key,
+            Arc::new(HashSet::from(["local_table".into()])),
+        );
+
+        let _output = cached_stream
+            .try_collect::<Vec<_>>()
+            .await
+            .expect("stream should be collected successfully");
+
+        let cached = cache_provider
+            .get_raw_key(&raw_cache_key)
+            .await
+            .expect("cache lookup should succeed")
+            .expect("empty result sets (zero-row batch) should be cached");
+
+        let cached_batches = cached.records().await.expect("cached result should decode");
+        assert!(cached_batches.iter().all(|b| b.num_rows() == 0));
     }
 
     /// Verify that when there is no encoder and the result exceeds the cache

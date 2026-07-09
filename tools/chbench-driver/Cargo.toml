@@ -10,9 +10,10 @@ publish = false
 arrow = { workspace = true }
 async-trait = { workspace = true }
 chrono = { workspace = true }
-datafusion-table-providers = { workspace = true, features = ["postgres"] }
+datafusion-table-providers = { workspace = true, features = ["postgres", "mysql"] }
 futures = { workspace = true }
 governor = { workspace = true, features = ["std"] }
+mysql_async = { workspace = true }
 rand = { workspace = true }
 secrecy = { workspace = true }
 snafu = { workspace = true }

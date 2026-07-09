@@ -93,8 +93,8 @@ use super::table::{CayenneCdcWrite, CayenneTableProvider, record_cayenne_write_p
 /// Forwarding both together keeps the two histograms paired per batch.
 fn record_cayenne_cdc_burst(table_name: &str, rows: u64, bytes: u64) {
     let dims = [telemetry::KeyValue::new("table", table_name.to_string())];
-    telemetry::track_cayenne_cdc_burst_rows(rows, &dims);
-    telemetry::track_cayenne_cdc_burst_bytes(bytes, &dims);
+    telemetry::cayenne::track_cdc_burst_rows(rows, &dims);
+    telemetry::cayenne::track_cdc_burst_bytes(bytes, &dims);
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1029,7 +1029,7 @@ impl<'a> AppendMutationWriter<'a> {
             // this write goes straight to a staged Vortex write without ever
             // buffering. `try_inline_or_restream` (which records rows_cap/bytes_cap
             // and the burst shape) is skipped, so attribute the flip here.
-            telemetry::track_cayenne_inline_fallback(&[
+            telemetry::cayenne::track_inline_fallback(&[
                 telemetry::KeyValue::new("table", self.table.table_name().to_string()),
                 telemetry::KeyValue::new("reason", "blocking_config"),
             ]);
@@ -1189,6 +1189,20 @@ impl<'a> AppendMutationWriter<'a> {
             deletion_start,
         );
 
+        // A write that carried no rows produced no data files, so the snapshot
+        // directory was never materialized on disk (the Vortex sink only
+        // creates it when writing a file) and there is nothing to fsync,
+        // sequence, or protect. Publish any on-conflict update without a
+        // protected-snapshot entry and skip the sequence record — recording a
+        // snapshot that has no directory would fail the directory sync with
+        // NotFound and leave the catalog referencing a phantom snapshot. This
+        // is the steady state of a scheduled append refresh whose source has
+        // no new rows.
+        if rows == 0 {
+            self.table.commit_on_conflict_publish(update, None).await;
+            return Ok((rows, stats_acc, validated_keys, superseded));
+        }
+
         // `publish` is the metastore finalization total; the sub-phases attribute
         // it — `publish_seq` is sequence allocation + the durable sequence record,
         // `publish_cas` is the atomic deletion-cache + protected-snapshot publish.
@@ -1318,7 +1332,7 @@ impl<'a> AppendMutationWriter<'a> {
         // not an admission-cap event, so it is deliberately left uncounted rather
         // than mislabeled as a cap.
         if let Some(reason) = buffer.overflow_reason() {
-            telemetry::track_cayenne_inline_fallback(&[
+            telemetry::cayenne::track_inline_fallback(&[
                 telemetry::KeyValue::new("table", self.table.table_name().to_string()),
                 telemetry::KeyValue::new("reason", reason),
             ]);

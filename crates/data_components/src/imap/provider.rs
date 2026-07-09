@@ -25,7 +25,7 @@ use datafusion::{
     logical_expr::Expr,
     physical_plan::ExecutionPlan,
 };
-use mailparse::dateparse;
+use mailparse::{ParsedMail, dateparse, parse_mail};
 use snafu::prelude::*;
 
 use crate::arrow::write::MemTable;
@@ -40,6 +40,57 @@ fn decode(value: &[u8]) -> String {
         Ok(s) => s,
         Err(_) => charset::decode_latin1(value).to_string(),
     }
+}
+
+/// Recursively find the first MIME part matching `mimetype` and return its
+/// decoded body.
+///
+/// `ParsedMail::get_body` applies the part's `Content-Transfer-Encoding`
+/// (base64 / quoted-printable) and charset, so the returned text is
+/// human-readable rather than the raw wire bytes. Attachment parts (any other
+/// MIME type) are never descended into for their content — only their nested
+/// text parts, if any, are considered.
+fn find_part_body(part: &ParsedMail, mimetype: &str) -> Option<String> {
+    if part.subparts.is_empty() {
+        if part.ctype.mimetype.eq_ignore_ascii_case(mimetype) {
+            return part.get_body().ok();
+        }
+        return None;
+    }
+
+    part.subparts
+        .iter()
+        .find_map(|sub| find_part_body(sub, mimetype))
+}
+
+/// Extract the human-readable text body from a raw RFC822 message.
+///
+/// The IMAP `BODY.PEEK[]` fetch returns the entire raw message — MIME headers,
+/// multipart boundaries, and body parts still in their
+/// `Content-Transfer-Encoding` (base64 / quoted-printable). Storing that
+/// verbatim made `content` both bloated (attachment bytes and headers inline)
+/// and, for the common base64 `text/plain` case, unreadable gibberish rather
+/// than the message body (see #11549).
+///
+/// This walks the MIME tree preferring the decoded `text/plain` part, falls
+/// back to the `text/html` part, then to the top-level decoded body for
+/// non-multipart messages, and finally to the raw decoded bytes if `mailparse`
+/// cannot parse the message at all — so content is never silently dropped.
+/// Attachment part bytes are never returned.
+fn extract_text_body(raw: &[u8]) -> String {
+    if let Ok(parsed) = parse_mail(raw) {
+        if let Some(text) =
+            find_part_body(&parsed, "text/plain").or_else(|| find_part_body(&parsed, "text/html"))
+        {
+            return text;
+        }
+        if let Ok(body) = parsed.get_body() {
+            return body;
+        }
+    }
+
+    // Parsing failed entirely — preserve the raw content rather than dropping it.
+    decode(raw)
 }
 
 /// Parse an RFC822 `Date:` header into milliseconds since the Unix epoch.
@@ -178,7 +229,7 @@ impl TableProvider for ImapTableProvider {
             let message_blind_ccs = parse_addreses_from_envelope!(envelope, bcc);
             let message_reply_tos = parse_addreses_from_envelope!(envelope, reply_to);
             let body = if self.fetch_content {
-                message.body().as_ref().map(|v| decode(v))
+                message.body().as_ref().map(|v| extract_text_body(v))
             } else {
                 None
             };
@@ -285,5 +336,75 @@ mod tests {
         assert_eq!(dates.value(0), day_one);
         assert_eq!(dates.value(1), day_two);
         assert_ne!(dates.value(0), dates.value(1));
+    }
+
+    #[test]
+    fn extract_text_body_decodes_base64_text_plain() {
+        // Regression for #11549: a `text/plain` part sent as base64 must be
+        // decoded to readable text, not stored as the raw base64 payload.
+        let raw = b"Content-Type: text/plain; charset=utf-8\r\n\
+                    Content-Transfer-Encoding: base64\r\n\r\n\
+                    SGVsbG8sIHdvcmxkIQ==\r\n";
+        assert_eq!(extract_text_body(raw), "Hello, world!");
+    }
+
+    #[test]
+    fn extract_text_body_decodes_quoted_printable() {
+        // Quoted-printable is the other common `text/plain` encoding; it must be
+        // decoded (=C3=A9 -> é), preserving the message's actual characters.
+        let raw = b"Content-Type: text/plain; charset=utf-8\r\n\
+                    Content-Transfer-Encoding: quoted-printable\r\n\r\n\
+                    Caf=C3=A9\r\n";
+        assert_eq!(extract_text_body(raw).trim(), "Café");
+    }
+
+    #[test]
+    fn extract_text_body_prefers_plain_over_html() {
+        // multipart/alternative: the readable `text/plain` alternative is
+        // preferred over the markup-laden `text/html` one.
+        let raw = b"Content-Type: multipart/alternative; boundary=\"b\"\r\n\r\n\
+                    --b\r\nContent-Type: text/plain\r\n\r\nplain body\r\n\
+                    --b\r\nContent-Type: text/html\r\n\r\n<p>html body</p>\r\n\
+                    --b--\r\n";
+        let body = extract_text_body(raw);
+        assert_eq!(body.trim(), "plain body");
+        assert!(!body.contains("html body"), "html part leaked: {body:?}");
+    }
+
+    #[test]
+    fn extract_text_body_falls_back_to_html_when_no_plain() {
+        // When only a `text/html` part exists it is returned (decoded), rather
+        // than falling through to the raw MIME.
+        let raw = b"Content-Type: multipart/alternative; boundary=\"b\"\r\n\r\n\
+                    --b\r\nContent-Type: text/html\r\n\r\n<p>only html</p>\r\n\
+                    --b--\r\n";
+        assert_eq!(extract_text_body(raw).trim(), "<p>only html</p>");
+    }
+
+    #[test]
+    fn extract_text_body_excludes_attachment_bytes() {
+        // multipart/mixed with a text part and a base64 attachment: only the
+        // decoded text body is returned — the attachment payload (the source of
+        // the ~320KB/message bloat in #11549) is never included.
+        let raw = b"Content-Type: multipart/mixed; boundary=\"b\"\r\n\r\n\
+                    --b\r\nContent-Type: text/plain\r\n\r\nreal message\r\n\
+                    --b\r\nContent-Type: application/octet-stream\r\n\
+                    Content-Transfer-Encoding: base64\r\n\
+                    Content-Disposition: attachment; filename=\"a.bin\"\r\n\r\n\
+                    AAAAAAAAAAAAAAAAAAA=\r\n\
+                    --b--\r\n";
+        let body = extract_text_body(raw);
+        assert_eq!(body.trim(), "real message");
+        assert!(
+            !body.contains("AAAAAAAAAAAAAAAAAAA"),
+            "attachment bytes leaked into content: {body:?}"
+        );
+    }
+
+    #[test]
+    fn extract_text_body_handles_single_part_plain() {
+        // A simple non-multipart message decodes to its body.
+        let raw = b"Content-Type: text/plain\r\n\r\njust some text\r\n";
+        assert_eq!(extract_text_body(raw).trim(), "just some text");
     }
 }

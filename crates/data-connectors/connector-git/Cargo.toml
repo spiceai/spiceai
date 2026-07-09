@@ -14,6 +14,8 @@ globset.workspace = true
 opentelemetry.workspace = true
 reqwest.workspace = true
 runtime = { path = "../../runtime" }
+runtime-api-types = { path = "../../runtime-api-types" }
+runtime-metrics = { path = "../../runtime-metrics" }
 secrecy.workspace = true
 snafu.workspace = true
 tokio.workspace = true

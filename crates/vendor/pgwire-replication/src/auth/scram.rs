@@ -1,7 +1,7 @@
 //! SCRAM-SHA-256 authentication implementation.
 //!
 //! This module implements the SCRAM-SHA-256 authentication mechanism as specified
-//! in RFC 5802 and RFC 7677, used by PostgreSQL for secure password authentication.
+//! in RFC 5802 and RFC 7677, used by `PostgreSQL` for secure password authentication.
 //!
 //! # Protocol Overview
 //!
@@ -65,7 +65,8 @@ impl ScramClient {
     /// Create a new SCRAM client with a random nonce.
     ///
     /// # Arguments
-    /// * `username` - PostgreSQL username (will be SASL-escaped)
+    /// * `username` - `PostgreSQL` username (will be SASL-escaped)
+    #[must_use]
     pub fn new(username: &str) -> ScramClient {
         let mut nonce = [0u8; 18];
         rand::rng().fill_bytes(&mut nonce);
@@ -243,7 +244,7 @@ fn sasl_escape_username(u: &str) -> String {
     u.replace('=', "=3D").replace(',', "=2C")
 }
 
-/// Hi() function from RFC 5802 - essentially PBKDF2-HMAC-SHA256.
+/// `Hi()` function from RFC 5802 - essentially PBKDF2-HMAC-SHA256.
 ///
 /// Derives a key from password and salt using the specified iteration count.
 #[cfg(feature = "scram")]
@@ -269,6 +270,10 @@ fn hi_sha256(password: &[u8], salt: &[u8], iters: u32) -> Vec<u8> {
 
 /// Compute HMAC-SHA-256.
 #[cfg(feature = "scram")]
+#[expect(
+    clippy::expect_used,
+    reason = "HMAC accepts a key of any length, so new_from_slice never returns Err here"
+)]
 fn hmac_sha256(key: &[u8], msg: &[u8]) -> Vec<u8> {
     let mut mac = HmacSha256::new_from_slice(key).expect("HMAC key length is always valid");
     mac.update(msg);
@@ -334,7 +339,8 @@ mod tests {
 
     #[test]
     fn parse_server_first_valid() {
-        let (r, s, i) = ScramClient::parse_server_first("r=abc123,s=c2FsdA==,i=4096").unwrap();
+        let (r, s, i) =
+            ScramClient::parse_server_first("r=abc123,s=c2FsdA==,i=4096").expect("should succeed");
         assert_eq!(r, "abc123");
         assert_eq!(s, "c2FsdA==");
         assert_eq!(i, 4096);
@@ -343,7 +349,8 @@ mod tests {
     #[test]
     fn parse_server_first_different_order() {
         // Fields can appear in any order
-        let (r, s, i) = ScramClient::parse_server_first("i=1000,s=Zm9v,r=xyz").unwrap();
+        let (r, s, i) =
+            ScramClient::parse_server_first("i=1000,s=Zm9v,r=xyz").expect("should succeed");
         assert_eq!(r, "xyz");
         assert_eq!(s, "Zm9v");
         assert_eq!(i, 1000);
@@ -352,8 +359,8 @@ mod tests {
     #[test]
     fn parse_server_first_with_extensions() {
         // Should ignore unknown extensions
-        let (r, s, i) =
-            ScramClient::parse_server_first("r=nonce,s=c2FsdA==,i=4096,x=unknown").unwrap();
+        let (r, s, i) = ScramClient::parse_server_first("r=nonce,s=c2FsdA==,i=4096,x=unknown")
+            .expect("should succeed");
         assert_eq!(r, "nonce");
         assert_eq!(i, 4096);
         let _ = s; // unused but parsed
@@ -361,25 +368,26 @@ mod tests {
 
     #[test]
     fn parse_server_first_missing_nonce() {
-        let err = ScramClient::parse_server_first("s=c2FsdA==,i=4096").unwrap_err();
+        let err = ScramClient::parse_server_first("s=c2FsdA==,i=4096").expect_err("should error");
         assert!(err.to_string().contains("nonce"));
     }
 
     #[test]
     fn parse_server_first_missing_salt() {
-        let err = ScramClient::parse_server_first("r=abc,i=4096").unwrap_err();
+        let err = ScramClient::parse_server_first("r=abc,i=4096").expect_err("should error");
         assert!(err.to_string().contains("salt"));
     }
 
     #[test]
     fn parse_server_first_missing_iterations() {
-        let err = ScramClient::parse_server_first("r=abc,s=c2FsdA==").unwrap_err();
+        let err = ScramClient::parse_server_first("r=abc,s=c2FsdA==").expect_err("should error");
         assert!(err.to_string().contains("iteration"));
     }
 
     #[test]
     fn parse_server_first_invalid_iterations() {
-        let err = ScramClient::parse_server_first("r=abc,s=c2FsdA==,i=notanumber").unwrap_err();
+        let err = ScramClient::parse_server_first("r=abc,s=c2FsdA==,i=notanumber")
+            .expect_err("should error");
         assert!(err.to_string().contains("iteration"));
     }
 
@@ -392,8 +400,9 @@ mod tests {
 
         let server_first = "r=rOprNGfwEbeRWgbNEkqO%hvYDpWUa2RaTCAfuxFIlj)hNlF$k0,s=W22ZaJ0SNY7soEsUEjb6gQ==,i=4096";
 
-        let (client_final, auth_message, salted_password) =
-            client.client_final("pencil", server_first).unwrap();
+        let (client_final, auth_message, salted_password) = client
+            .client_final("pencil", server_first)
+            .expect("should succeed");
 
         // Verify structure
         assert!(client_final.starts_with("c=biws,r="));
@@ -414,7 +423,9 @@ mod tests {
         // Server returns nonce that doesn't start with client nonce
         let server_first = "r=differentnonce,s=c2FsdA==,i=4096";
 
-        let err = client.client_final("password", server_first).unwrap_err();
+        let err = client
+            .client_final("password", server_first)
+            .expect_err("should error");
         assert!(err.to_string().contains("nonce mismatch"));
     }
 
@@ -424,7 +435,9 @@ mod tests {
 
         let server_first = "r=abcdef,s=!!!invalid!!!,i=4096";
 
-        let err = client.client_final("password", server_first).unwrap_err();
+        let err = client
+            .client_final("password", server_first)
+            .expect_err("should error");
         assert!(err.to_string().contains("base64"));
     }
 
@@ -437,8 +450,9 @@ mod tests {
 
         let server_first = "r=fyko+d2lbbFgONRv9qkxdawL3rfcNHYJY1ZVvWVs7j,s=QSXCR+Q6sek8bf92,i=4096";
 
-        let (_, auth_message, salted_password) =
-            client.client_final("pencil", server_first).unwrap();
+        let (_, auth_message, salted_password) = client
+            .client_final("pencil", server_first)
+            .expect("should succeed");
 
         // Compute expected server signature manually
         let server_key = hmac_sha256(&salted_password, b"Server Key");
@@ -446,7 +460,8 @@ mod tests {
         let server_final = format!("v={}", B64.encode(&server_sig));
 
         // Should succeed
-        ScramClient::verify_server_final(&server_final, &salted_password, &auth_message).unwrap();
+        ScramClient::verify_server_final(&server_final, &salted_password, &auth_message)
+            .expect("should succeed");
     }
 
     #[test]
@@ -456,26 +471,28 @@ mod tests {
         let server_final = "v=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="; // wrong
 
         let err = ScramClient::verify_server_final(server_final, &salted_password, auth_message)
-            .unwrap_err();
+            .expect_err("should error");
         assert!(err.to_string().contains("signature mismatch"));
     }
 
     #[test]
     fn verify_server_final_rejects_missing_signature() {
-        let err = ScramClient::verify_server_final("", &[], "").unwrap_err();
+        let err = ScramClient::verify_server_final("", &[], "").expect_err("should error");
         assert!(err.to_string().contains("missing signature"));
     }
 
     #[test]
     fn verify_server_final_handles_server_error() {
-        let err = ScramClient::verify_server_final("e=invalid-proof", &[], "").unwrap_err();
+        let err =
+            ScramClient::verify_server_final("e=invalid-proof", &[], "").expect_err("should error");
         assert!(err.to_string().contains("server error"));
         assert!(err.to_string().contains("invalid-proof"));
     }
 
     #[test]
     fn verify_server_final_rejects_invalid_base64() {
-        let err = ScramClient::verify_server_final("v=!!!invalid!!!", &[], "").unwrap_err();
+        let err =
+            ScramClient::verify_server_final("v=!!!invalid!!!", &[], "").expect_err("should error");
         assert!(err.to_string().contains("base64"));
     }
 

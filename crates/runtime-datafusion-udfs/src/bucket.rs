@@ -652,6 +652,44 @@ mod tests {
         );
     }
 
+    /// The `bucket()` partition hash must never come from ahash's AES-accelerated
+    /// hasher: `aes_hash::AHasher` and `fallback_hash::AHasher` produce different
+    /// output from the same seed, so an AES build would silently re-bucket
+    /// persisted partitioned datasets relative to the shipped fallback-hashed
+    /// builds (#11277). `vendored_hash.rs` has a `compile_error!` that fails any
+    /// `x86/x86_64` build with `target_feature = "aes"` active, so on such a build
+    /// this crate does not compile and this test never runs. Where it *does* run,
+    /// assert the invariant explicitly and re-lock one fallback golden to prove
+    /// the active hasher is in fact the portable fallback.
+    #[test]
+    fn test_bucket_uses_portable_fallback_hash_not_aes() {
+        let aes_hasher_active = cfg!(all(
+            any(target_arch = "x86", target_arch = "x86_64"),
+            target_feature = "aes",
+            not(miri)
+        ));
+        assert!(
+            !aes_hasher_active,
+            "the compile_error! guard in vendored_hash.rs should have prevented \
+             compiling this crate with ahash's AES hasher active (see #11277)"
+        );
+
+        // Same input/golden as `test_bucket_hash_stability_golden_values` (Utf8
+        // "user_42"): proves the hasher actually driving bucket() in this build
+        // is the portable fallback, not an output-incompatible variant.
+        let bucket = compute_bucket(
+            &ScalarValue::Utf8(Some("user_42".to_string())),
+            MAX_NUM_BUCKETS,
+            &DataType::Int64,
+        )
+        .expect("compute_bucket should succeed for Utf8");
+        assert_eq!(
+            bucket,
+            ScalarValue::Int64(Some(594_815)),
+            "bucket() must use the frozen portable fallback hash (#11277)"
+        );
+    }
+
     #[test]
     fn test_first_arg_wrong_scalar_type_error_message() {
         // Test error message when first argument is a scalar but wrong type

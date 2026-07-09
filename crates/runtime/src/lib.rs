@@ -114,7 +114,6 @@ mod init;
 pub mod internal_table;
 pub mod jobs;
 mod management;
-mod metrics;
 pub mod metrics_reader;
 mod metrics_server;
 pub mod model;
@@ -517,6 +516,7 @@ const CACHE_MAINTENANCE_INTERVAL: std::time::Duration = std::time::Duration::fro
 
 // Allow 30 seconds for tasks for graceful shutdown
 const RUNTIME_DEFAULT_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(30);
+const CAYENNE_COMPACTION_SHUTDOWN_TIMEOUT: Duration = Duration::from_mins(2);
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
@@ -527,6 +527,18 @@ pub struct LogErrors(pub bool);
 #[expect(clippy::struct_field_names)]
 pub struct Runtime {
     app: Arc<RwLock<Option<Arc<App>>>>,
+    /// Serializes [`Runtime::apply_app`] so that concurrent callers cannot
+    /// interleave their diff-and-swap. `apply_app` computes diffs under a read
+    /// lock and only takes the app write lock for the final swap; that is sound
+    /// when applies are serialized, but `apply_app` now has two independent
+    /// callers — the on-disk pods watcher and Spice Cloud Connect's
+    /// `apply_spicepod` — which can fire concurrently. Without this mutex two
+    /// applies could diff against the same old app, interleave their
+    /// catalog/dataset/view mutations, and last-writer-wins the swap. Holding
+    /// this mutex (not the app write lock) for the whole apply avoids that while
+    /// keeping the read-lock-for-diff / write-lock-for-swap discipline, so the
+    /// diff phase can still read the app `RwLock` without deadlocking.
+    apply_app_lock: Arc<tokio::sync::Mutex<()>>,
     df: Arc<DataFusion>,
     // `Arc<Model>` (not `Model`) so a handle can be cloned out of the lock and
     // moved into `spawn_blocking` to run synchronous inference off the runtime.
@@ -898,8 +910,14 @@ impl Runtime {
         table: ResolvedTableReference,
         assignments: &PartitionAssignments,
     ) -> Result<()> {
-        let partition_filters =
-            crate::cluster::partition::get_partition_filter_exprs(&table, assignments);
+        // This path runs only in executor partitioned mode, so the table is
+        // always partition-scoped: wrap in `Some`. An empty result here means no
+        // partition is assigned to this executor, which resolves to a `false`
+        // predicate (load no rows) rather than an unfiltered full-table load.
+        let partition_filters = Some(crate::cluster::partition::get_partition_filter_exprs(
+            &table,
+            assignments,
+        ));
 
         let table_ref = TableReference::full(
             Arc::<str>::clone(&table.catalog),
@@ -1754,6 +1772,11 @@ impl Runtime {
             "Shutdown initiated; waiting up to {shutdown_timeout:?} for connections to drain"
         );
 
+        // Stop new Cayenne compaction-runtime passes as soon as shutdown begins.
+        // In-flight passes remain counted and are drained below before the
+        // dedicated compaction runtime itself can be dropped.
+        cayenne::begin_compaction_shutdown();
+
         let start_time = Instant::now();
 
         // Shutdown running components in phases so request-serving tasks drain
@@ -1790,6 +1813,24 @@ impl Runtime {
 
         // Clean up DataFusion first as there could be datasets loading and accessing registries below.
         self.df.shutdown().await;
+
+        let in_flight = cayenne::in_flight_compaction_tasks();
+        if in_flight > 0 {
+            let compaction_timeout = CAYENNE_COMPACTION_SHUTDOWN_TIMEOUT;
+            tracing::debug!(
+                in_flight,
+                ?compaction_timeout,
+                "Waiting for in-flight Cayenne compaction passes before dropping compaction runtime"
+            );
+            if !cayenne::drain_compaction_tasks(compaction_timeout).await {
+                tracing::warn!(
+                    remaining = cayenne::in_flight_compaction_tasks(),
+                    ?compaction_timeout,
+                    "Timed out waiting for Cayenne compaction passes during shutdown"
+                );
+            }
+        }
+
         dataconnector::unregister_all().await;
         catalogconnector::unregister_all().await;
         self.accelerator_engine_registry.unregister_all().await;

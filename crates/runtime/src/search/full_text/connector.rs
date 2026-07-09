@@ -25,13 +25,13 @@ use crate::changes::{Indexes, index_change_envelope};
 use crate::component::{
     ComponentInitialization,
     dataset::{Dataset, acceleration::RefreshMode},
-    metrics::MetricsProvider,
 };
 use crate::dataconnector::{DataConnector, DataConnectorError, DataConnectorResult};
 use crate::federated_table::FederatedTable;
 use crate::search::full_text::table::add_full_text_search_to_table;
 use crate::search::util::find_concrete_table_provider;
 use futures::StreamExt;
+use runtime_metrics::component::MetricsProvider;
 use tokio::sync::Mutex;
 
 /// A [`DataConnector`] middleware that, for [`Dataset`]s needing full text search capabilies, creates a [`IndexedTableProvider`] using the underlying [`TableProvider`]s and a [`FullTextDatabaseIndex`]. If no full text search capabilities are needed it is not unnecessarily nested.

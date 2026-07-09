@@ -1352,6 +1352,22 @@ pub struct CayenneTableProvider {
     /// (the single shard keeps `MemTier::epoch` as the slot-ack currency, so the
     /// N=1 path is byte-identical). Shared across writer clones.
     mem_tier_apply_epoch: Arc<std::sync::atomic::AtomicU64>,
+    /// The highest durable epoch any real checkpoint has reported to the slot
+    /// advancer, encoded as `epoch + 1` so `0` means "no checkpoint has fired
+    /// yet" (epoch `0` is itself a valid N>1 `apply_epoch`). Updated in
+    /// [`Self::fire_slot_advancer`] via `fetch_max`, so it is monotone
+    /// non-decreasing. Read by the `nothing_to_flush` path of
+    /// [`Self::checkpoint_mem_tier`] to RE-fire the advancer on an empty tier:
+    /// the runtime enqueues a batch's source committer AFTER the write returns
+    /// its epoch, so a background checkpoint can flush that batch and fire the
+    /// advancer in the gap BEFORE the committer is queued. The next durable-path
+    /// apply then checkpoints the (now-empty) tier to release the late committer
+    /// — an empty tier means every appended epoch is already durable, so the
+    /// re-fire is always safe and releases exactly the committers at or below
+    /// this watermark. Without it the runtime declares the deferred-commit queue
+    /// permanently stuck and fatally stops the changes stream (#11644). Shared
+    /// across writer clones.
+    last_fired_durable_epoch: Arc<std::sync::atomic::AtomicU64>,
     /// Cross-layer handle the runtime installs in memory mode so
     /// `checkpoint_mem_tier` can advance the source slot AFTER the durable fence
     /// (the slot-deferral correctness seam). `None` in file mode (and for
@@ -1738,7 +1754,7 @@ pub(crate) fn record_cayenne_write_phase(table_name: &str, phase: &'static str, 
         duration_ms = elapsed.as_millis(),
         "Cayenne write phase completed"
     );
-    telemetry::track_cayenne_write_phase_duration(
+    telemetry::cayenne::track_write_phase_duration(
         elapsed,
         &[
             telemetry::KeyValue::new("table", table_name.to_string()),
@@ -4403,6 +4419,7 @@ impl CayenneTableProvider {
                 .collect::<Vec<_>>()
                 .into(),
             mem_tier_apply_epoch: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            last_fired_durable_epoch: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             slot_advancer: Arc::new(ParkingMutex::new(None)),
             mem_tier_max_age_ms,
             mem_tier_shadow_present: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -4717,8 +4734,20 @@ impl CayenneTableProvider {
         // use the whole budget; `Maintenance` (compaction outputs, sorted
         // rewrites, overwrites) is capped below it so a latency-bound delta
         // encode never queues behind a whole multi-shard compaction pass.
+        // Attribute the time blocked on the shared encode budget to a dedicated
+        // write phase so `cayenne_write_phase_duration_ms{phase="encode_permit_wait"}`
+        // splits semaphore-wait out of the aggregate write cost (the outer
+        // `cdc_apply_fixed_cost_ms{phase="write"}` in the runtime apply loop). The
+        // `cayenne_encode_acquire_wait_ms{class}` histogram inside `acquire_from`
+        // carries the same signal without the table label; this one keys by table.
+        let encode_permit_wait_start = Instant::now();
         let _encode_permits =
             super::write_budget::acquire_encode_permits(encode_shards, write_class).await;
+        record_cayenne_write_phase(
+            self.table_name(),
+            "encode_permit_wait",
+            encode_permit_wait_start,
+        );
 
         // Construct snapshot directory URL
         let snapshot_dir_url = Self::snapshot_dir_url(
@@ -4765,17 +4794,26 @@ impl CayenneTableProvider {
         )?;
 
         // Create session context once with object store registered (if S3).
-        // For Maintenance-class (compaction) LOCAL writes, optionally route the
-        // output through the custom fallocate / bytes_per_sync / O_DIRECT writer
+        // On the network-attached storage tier (`StorageClass::Ebs` — AWS EBS,
+        // Azure managed disks, or an NFS/SMB network filesystem) route
+        // Maintenance-class (compaction) LOCAL output through the custom
+        // fallocate / bytes_per_sync / O_DIRECT writer,
         // via a private object-store registry scoped to this write (see
-        // `compaction_session_context`). Gated OFF by default; falls back to the
-        // default writer on any setup error so it can never fail a compaction.
-        let writer_cfg = super::compaction_writer::config();
-        let use_compaction_writer = writer_cfg.enabled()
-            && matches!(write_class, super::delta_encoding::WriteClass::Maintenance)
-            && !self.table_metadata.path.starts_with("s3://");
+        // `compaction_session_context`). On local SSD/NVMe (incl. AWS EC2 NVMe
+        // instance storage), tmpfs, undetected storage, or S3 the writer is NOT
+        // installed — an HTAP A/B showed O_DIRECT is a net loss there, where the
+        // buffered writer + Tier-1 fadvise eviction win. Falls back to the default
+        // writer on any setup error so it can never fail a compaction.
+        let use_compaction_writer = super::compaction_writer::use_direct_writer_for(
+            self.context.data_storage_class(),
+            write_class,
+            &self.table_metadata.path,
+        );
         let session_state = if use_compaction_writer {
-            match self.compaction_session_context(writer_cfg) {
+            match self.compaction_session_context(
+                super::compaction_writer::CompactionWriterConfig::for_ebs_tier(),
+                target_size_bytes as u64,
+            ) {
                 Ok(ctx) => Arc::new(ctx.state()),
                 Err(error) => {
                     tracing::warn!(
@@ -4812,6 +4850,7 @@ impl CayenneTableProvider {
 
         let tracked_schema = self.table_schema();
         let tracked_stream = {
+            let target_schema = Arc::clone(&tracked_schema);
             let total_bytes_written = Arc::clone(&total_bytes_written);
             let total_rows_written = Arc::clone(&total_rows_written);
             let last_progress_ms = Arc::clone(&last_progress_ms);
@@ -4820,36 +4859,57 @@ impl CayenneTableProvider {
             let start = start_time;
 
             stream.map(move |batch_result| {
-                if let Ok(batch) = &batch_result {
-                    total_bytes_written.fetch_add(batch.get_array_memory_size(), Ordering::Relaxed);
-                    total_rows_written.fetch_add(batch.num_rows() as u64, Ordering::Relaxed);
-                    stats_acc.update(batch);
+                let batch = batch_result?;
+                // Internal compaction reads can come from the query scan path,
+                // whose output schema may intentionally differ from the stored
+                // write schema (for example Utf8View when
+                // `cayenne_force_view_types` is enabled). Normalize every writer
+                // input batch to the snapshot writer schema before Vortex derives
+                // its dtype; otherwise the Vortex stream adapter can panic on a
+                // read-schema/write-schema dtype mismatch in the background
+                // compactor.
+                let batch = arrow_tools::record_batch::try_cast_to(
+                    batch,
+                    Arc::clone(&target_schema),
+                )
+                .map_err(|e| {
+                    DataFusionError::Context(
+                        format!(
+                            "Failed to cast writer input batch to Cayenne table schema for table {table_name}"
+                        ),
+                        Box::new(DataFusionError::from(e)),
+                    )
+                })?;
 
-                    if is_s3_storage {
-                        let elapsed = start.elapsed();
-                        let elapsed_ms = u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX);
-                        let last_logged = last_progress_ms.load(Ordering::Relaxed);
-                        if elapsed_ms.saturating_sub(last_logged) >= 10_000 {
-                            let bytes_so_far = total_bytes_written.load(Ordering::Relaxed);
-                            let throughput = if elapsed.as_secs_f64() > 0.0 {
-                                #[expect(clippy::cast_precision_loss)]
-                                let bytes_per_sec = bytes_so_far as f64 / elapsed.as_secs_f64();
-                                format_bytes_per_sec(bytes_per_sec)
-                            } else {
-                                "calculating...".to_string()
-                            };
-                            tracing::info!(
-                                "S3 upload for {}: streamed {} in {:.1}s, {}",
-                                table_name,
-                                format_bytes(bytes_so_far),
-                                elapsed.as_secs_f64(),
-                                throughput
-                            );
-                            last_progress_ms.store(elapsed_ms, Ordering::Relaxed);
-                        }
+                total_bytes_written.fetch_add(batch.get_array_memory_size(), Ordering::Relaxed);
+                total_rows_written.fetch_add(batch.num_rows() as u64, Ordering::Relaxed);
+                stats_acc.update(&batch);
+
+                if is_s3_storage {
+                    let elapsed = start.elapsed();
+                    let elapsed_ms = u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX);
+                    let last_logged = last_progress_ms.load(Ordering::Relaxed);
+                    if elapsed_ms.saturating_sub(last_logged) >= 10_000 {
+                        let bytes_so_far = total_bytes_written.load(Ordering::Relaxed);
+                        let throughput = if elapsed.as_secs_f64() > 0.0 {
+                            #[expect(clippy::cast_precision_loss)]
+                            let bytes_per_sec = bytes_so_far as f64 / elapsed.as_secs_f64();
+                            format_bytes_per_sec(bytes_per_sec)
+                        } else {
+                            "calculating...".to_string()
+                        };
+                        tracing::info!(
+                            "S3 upload for {}: streamed {} in {:.1}s, {}",
+                            table_name,
+                            format_bytes(bytes_so_far),
+                            elapsed.as_secs_f64(),
+                            throughput
+                        );
+                        last_progress_ms.store(elapsed_ms, Ordering::Relaxed);
                     }
                 }
-                batch_result
+
+                Ok(batch)
             })
         };
 
@@ -5299,6 +5359,7 @@ impl CayenneTableProvider {
             // lock (the seq-ordering invariant requires a single lock per table).
             mem_tier_publish_locks: Arc::clone(&self.mem_tier_publish_locks),
             mem_tier_apply_epoch: Arc::clone(&self.mem_tier_apply_epoch),
+            last_fired_durable_epoch: Arc::clone(&self.last_fired_durable_epoch),
             slot_advancer: Arc::clone(&self.slot_advancer),
             mem_tier_max_age_ms: self.mem_tier_max_age_ms,
             mem_tier_shadow_present: Arc::clone(&self.mem_tier_shadow_present),
@@ -8062,7 +8123,7 @@ impl CayenneTableProvider {
         // inline rows, so the tombstone-vs-rewrite ratio (paired with
         // `track_cayenne_inline_tombstone_write`) reflects real rewrite work.
         if rewrite.removed_rows > 0 {
-            telemetry::track_cayenne_inline_rewrite_fallback(&[telemetry::KeyValue::new(
+            telemetry::cayenne::track_inline_rewrite_fallback(&[telemetry::KeyValue::new(
                 "table",
                 self.table_metadata.table_name.clone(),
             )]);
@@ -9678,7 +9739,7 @@ impl CayenneTableProvider {
         // keys hidden, dimensioned by table; pair with the rewrite-fallback
         // counter in `build_inlined_data_rewrite_for_pk_keys` to observe the
         // tombstone-vs-rewrite ratio.
-        telemetry::track_cayenne_inline_tombstone_write(
+        telemetry::cayenne::track_inline_tombstone_write(
             u64::try_from(delete_count).unwrap_or(u64::MAX),
             &[telemetry::KeyValue::new(
                 "table",
@@ -10865,15 +10926,25 @@ impl CayenneTableProvider {
             // accumulated alongside the coalesced stats. Retention deletes below
             // are not yet netted here (TPC-H has none); compaction's `Set` reset
             // bounds any resulting drift.
-            // `live_rows_delta` is the exactly-netted `inserted - superseded` for
-            // the staged/inline path. Retention deletes below are NOT yet netted
-            // into it, so when retention runs this commit the delta under-counts —
-            // taint exactness in that case (bounded by compaction's `Set` re-baseline).
+            //
+            // `live_rows_delta` is `inserted - superseded`. It is a provably-exact
+            // net ONLY for a pure-append table (no `on_conflict`, no retention):
+            // there `superseded == 0` always and no durable delete can drift the
+            // count. For an upsert/delete-capable table the incremental count is
+            // best-effort — `superseded` can mis-net (e.g. a stale keyset after an
+            // overwrite) and standalone durable deletes are not netted here — so it
+            // is tainted `exact: false` and served `Inexact` until a compaction /
+            // overwrite `Set` re-baselines an authoritative count. This is the
+            // durable-path twin of the mem-tier checkpoint taint: it stops a
+            // possibly-drifted count from being folded into a distributed
+            // `COUNT(*)` as `Exact`.
+            let delta_is_exact =
+                self.table_metadata.on_conflict.is_none() && !state.retention_requested;
             self.persist_table_stats(
                 &stats,
                 RowCountUpdate::Delta {
                     delta: state.live_rows_delta,
-                    exact: !state.retention_requested,
+                    exact: delta_is_exact,
                 },
             )
             .await;
@@ -11279,6 +11350,16 @@ impl CayenneTableProvider {
     /// publish (the output is not yet query-visible, so the dropped pages race
     /// no reader). Never fails — a cache hint must not abort a compaction.
     async fn evict_compaction_output_pages(&self, snapshot_id: &str) {
+        // Runs on EVERY tier as the safety net. On the network-attached (EBS) tier
+        // the custom writer already self-evicts each output in `finish` (holding
+        // the just-written fd), so this external pass is a cheap backstop there —
+        // an O_DIRECT output has ~0 resident pages, so the DONTNEED hint walks
+        // almost nothing. It is deliberately NOT skipped on that tier: a per-output
+        // writer-setup (or session-context) fallback to the inner LocalFileSystem
+        // writer leaves that output buffered and un-self-evicted, and skipping here
+        // would reintroduce the scan-under-compaction cache pressure this guards
+        // against. Cheap redundancy on the fast path buys correctness on the
+        // fallback path.
         let files = match self.list_snapshot_files_with_sizes_local(snapshot_id).await {
             Ok(files) => files,
             Err(error) => {
@@ -11379,6 +11460,145 @@ impl CayenneTableProvider {
         Ok(files)
     }
 
+    /// Whether end-to-end integrity checksums are enabled for this table (WAL
+    /// records and Vortex data files). Provider-level accessor so sibling
+    /// modules (e.g. `staging_wal`) can read the flag without touching the
+    /// private `context` field.
+    pub(crate) fn integrity_checksums(&self) -> bool {
+        self.context.integrity_checksums()
+    }
+
+    /// Read the full bytes of a published data file, for integrity-digest
+    /// compute (at flush) or verification (before first read). `file_name` is
+    /// the snapshot-relative name as returned by
+    /// [`Self::list_snapshot_files_with_sizes`]. This is a whole-file read, so
+    /// it runs only when `integrity_checksums` is enabled.
+    async fn read_data_file_bytes(&self, snapshot_id: &str, file_name: &str) -> Result<Vec<u8>> {
+        if self.table_metadata.path.starts_with("s3://") {
+            let Some(prefix) = self.snapshot_object_store_prefix(snapshot_id)? else {
+                return Err(Error::Internal {
+                    table: self.table_metadata.table_name.clone(),
+                    message: format!(
+                        "cannot resolve object-store prefix for snapshot '{snapshot_id}' to read '{file_name}'"
+                    ),
+                });
+            };
+            let config = self.require_object_store()?;
+            let path = ObjectStorePath::from(format!("{}{file_name}", prefix.as_ref()));
+            let result = config
+                .store
+                .get(&path)
+                .await
+                .map_err(|e| Error::ObjectStore {
+                    operation: "read data file for integrity check",
+                    table: self.table_metadata.table_name.clone(),
+                    source: e,
+                })?;
+            let bytes = result.bytes().await.map_err(|e| Error::ObjectStore {
+                operation: "read data file for integrity check",
+                table: self.table_metadata.table_name.clone(),
+                source: e,
+            })?;
+            Ok(bytes.to_vec())
+        } else {
+            let path = self.snapshot_dir_path_for(snapshot_id).join(file_name);
+            Ok(tokio::fs::read(path).await?)
+        }
+    }
+
+    /// Verify the integrity digest of every manifest data file that has one and
+    /// has not yet been verified this process (see
+    /// [`crate::provider::file_digest`]).
+    ///
+    /// The expensive part — the whole-file READ — is bounded to once per file
+    /// per process ("verify on first read"): a verified file is cached in
+    /// [`CayenneContext`] and never re-read. Each scan still runs one manifest
+    /// query (`get_all_snapshot_files`) to discover digest-bearing files and
+    /// iterates its rows; that is a single indexed metastore SELECT, not
+    /// per-file I/O, but it is not zero — for very wide tables a manifest
+    /// generation/epoch cache to skip the query once all files are verified is a
+    /// reasonable follow-up. Unreadable/missing files are not cached, so they are
+    /// re-checked on later scans (harmless: an unreadable file is not corrupt).
+    ///
+    /// A digest mismatch fails the scan as a **detected fault** rather than
+    /// letting corrupted bytes decode into silently-wrong rows. Files without a
+    /// stored digest (integrity was off at flush, or a pre-feature row) are
+    /// skipped — they are unverifiable, not corrupt. A no-op unless
+    /// `integrity_checksums` is enabled.
+    async fn verify_data_file_integrity(&self) -> datafusion_common::Result<()> {
+        if !self.context.integrity_checksums() {
+            return Ok(());
+        }
+
+        let table_id = self.table_metadata.table_id.clone();
+        let files = self
+            .catalog
+            .get_all_snapshot_files(&table_id)
+            .await
+            .map_err(|e| {
+                datafusion_common::DataFusionError::Execution(format!(
+                    "Failed to load manifest for integrity verification of table {}: {e}",
+                    self.table_metadata.table_name
+                ))
+            })?;
+
+        for file in files {
+            let Some(stored) = file.digest.as_deref() else {
+                continue;
+            };
+            let key = format!("{}/{}", file.snapshot_id, file.file_path);
+            if self.context.is_data_file_verified(&key) {
+                continue;
+            }
+
+            let bytes = match self
+                .read_data_file_bytes(&file.snapshot_id, &file.file_path)
+                .await
+            {
+                Ok(bytes) => bytes,
+                // The manifest can transiently list a file the scan will not
+                // actually read (e.g. a retired snapshot's row not yet pruned).
+                // A file we cannot read is not proof of corruption — skip it. If
+                // the scan genuinely needs the file, it fails on its own read
+                // path. Only a digest MISMATCH is treated as a detected fault.
+                Err(error) => {
+                    tracing::debug!(
+                        table = self.table_metadata.table_name.as_str(),
+                        snapshot_id = file.snapshot_id.as_str(),
+                        file = file.file_path.as_str(),
+                        %error,
+                        "skipping integrity verification: data file not readable",
+                    );
+                    continue;
+                }
+            };
+
+            match super::file_digest::check(stored, &bytes) {
+                super::file_digest::DigestCheck::Match => {
+                    self.context.mark_data_file_verified(key);
+                }
+                super::file_digest::DigestCheck::Mismatch => {
+                    return Err(datafusion_common::DataFusionError::Execution(format!(
+                        "Data-file integrity check FAILED for '{}' in snapshot '{}' of table {}: \
+                         stored digest {stored} does not match the file contents (corruption \
+                         detected). Refusing to return possibly-wrong rows.",
+                        file.file_path, file.snapshot_id, self.table_metadata.table_name,
+                    )));
+                }
+                super::file_digest::DigestCheck::Unsupported => {
+                    tracing::debug!(
+                        table = self.table_metadata.table_name.as_str(),
+                        file = file.file_path.as_str(),
+                        stored,
+                        "skipping integrity verification: unsupported/unparseable digest algorithm",
+                    );
+                }
+            }
+        }
+
+        Ok(())
+    }
+
     /// Returns true if the file name looks like a compactable Vortex data file
     /// (and not a hidden file or staging-WAL artifact).
     fn is_compactable_data_file(name: &str) -> bool {
@@ -11450,16 +11670,22 @@ impl CayenneTableProvider {
         // existing ranges could clobber a compaction-authored merged `[min, max]`
         // with the per-file fallback and overstate `min_sequence` (an unsafe
         // reference-in-place input for the seq-prefix bake).
-        let existing: std::collections::HashMap<String, (i64, i64)> = match tag {
+        let existing: std::collections::HashMap<String, (i64, i64, Option<String>)> = match tag {
             ManifestSequenceTag::PreserveOrUniform { .. } => self
                 .catalog
                 .get_snapshot_files(&table_id, snapshot_id)
                 .await?
                 .into_iter()
-                .map(|f| (f.file_path, (f.min_sequence, f.max_sequence)))
+                .map(|f| (f.file_path, (f.min_sequence, f.max_sequence, f.digest)))
                 .collect(),
             ManifestSequenceTag::Uniform { .. } => std::collections::HashMap::new(),
         };
+
+        // Compute a per-file integrity digest only when the feature is enabled.
+        // Vortex data files are immutable once published, so a digest already
+        // recorded for this (snapshot, file) is reused rather than recomputed —
+        // bounding the whole-file read-back to a file's first appearance.
+        let compute_digests = self.context.integrity_checksums();
 
         for (file_name, size) in &files {
             // Reuse the per-file footer row count when the scan path already
@@ -11474,6 +11700,7 @@ impl CayenneTableProvider {
                 .flatten()
                 .map_or(0, |stats| stats.num_rows);
 
+            let existing_entry = existing.get(file_name);
             let (min_sequence, max_sequence) = match tag {
                 ManifestSequenceTag::Uniform { min, max } => (min, max),
                 // Preserve a compaction-authored merged range; for a brand-new
@@ -11482,9 +11709,39 @@ impl CayenneTableProvider {
                 // snapshot (conservative: `min = 0` keeps it always
                 // bake-eligible, never wrongly referenced, never resurrecting a
                 // deleted row).
-                ManifestSequenceTag::PreserveOrUniform { min, max } => {
-                    existing.get(file_name).copied().unwrap_or((min, max))
+                ManifestSequenceTag::PreserveOrUniform { min, max } => existing_entry
+                    .map_or((min, max), |(existing_min, existing_max, _)| {
+                        (*existing_min, *existing_max)
+                    }),
+            };
+
+            // Reuse a digest a prior flush already recorded for this immutable
+            // file (preserved even when the feature is now off, so toggling off
+            // never wipes it); otherwise compute one from the file bytes when
+            // the feature is on.
+            let digest = if let Some(existing_digest) =
+                existing_entry.and_then(|(_, _, digest)| digest.clone())
+            {
+                Some(existing_digest)
+            } else if compute_digests {
+                match self.read_data_file_bytes(snapshot_id, file_name).await {
+                    Ok(bytes) => Some(super::file_digest::compute(&bytes)),
+                    // A digest is a best-effort integrity aid; a transient
+                    // read-back failure must not abort the commit. Leave it
+                    // unset (the file stays unverifiable) and surface the miss.
+                    Err(error) => {
+                        tracing::warn!(
+                            table = self.table_metadata.table_name.as_str(),
+                            snapshot_id,
+                            file = file_name.as_str(),
+                            %error,
+                            "could not read data file to compute integrity digest; leaving it unset",
+                        );
+                        None
+                    }
                 }
+            } else {
+                None
             };
 
             self.catalog
@@ -11496,6 +11753,7 @@ impl CayenneTableProvider {
                     file_size_bytes: i64::try_from(*size).unwrap_or(i64::MAX),
                     min_sequence,
                     max_sequence,
+                    digest,
                 })
                 .await?;
         }
@@ -11918,7 +12176,7 @@ impl CayenneTableProvider {
         } else {
             "failed"
         };
-        telemetry::track_cayenne_compaction_duration(
+        telemetry::cayenne::track_compaction_duration(
             pass_start.elapsed(),
             &[
                 telemetry::KeyValue::new("table", table.clone()),
@@ -11932,7 +12190,7 @@ impl CayenneTableProvider {
                 source: DataFusionError::ResourcesExhausted(_)
             })
         ) {
-            telemetry::track_cayenne_compaction_memory_exhausted(&[
+            telemetry::cayenne::track_compaction_memory_exhausted(&[
                 telemetry::KeyValue::new("table", table),
                 telemetry::KeyValue::new("kind", "full"),
             ]);
@@ -12798,7 +13056,7 @@ impl CayenneTableProvider {
             } else {
                 "failed"
             };
-            telemetry::track_cayenne_compaction_duration(
+            telemetry::cayenne::track_compaction_duration(
                 pass_start.elapsed(),
                 &[
                     telemetry::KeyValue::new("table", table.clone()),
@@ -12812,7 +13070,7 @@ impl CayenneTableProvider {
                     source: DataFusionError::ResourcesExhausted(_)
                 })
             ) {
-                telemetry::track_cayenne_compaction_memory_exhausted(&[
+                telemetry::cayenne::track_compaction_memory_exhausted(&[
                     telemetry::KeyValue::new("table", table),
                     telemetry::KeyValue::new("kind", "subset"),
                 ]);
@@ -13302,7 +13560,7 @@ impl CayenneTableProvider {
                 total_input_bytes
             }
         };
-        telemetry::track_cayenne_compaction_merged_bytes(
+        telemetry::cayenne::track_compaction_merged_bytes(
             merged_output_bytes,
             &[
                 telemetry::KeyValue::new("table", self.table_metadata.table_name.clone()),
@@ -13432,7 +13690,11 @@ impl CayenneTableProvider {
         (true, None)
     }
 
-    async fn bake_seq_prefix_protected_snapshots(&self) -> Result<bool> {
+    /// Exposed (hidden) for property tests that drive the seq-prefix bake directly
+    /// (`mutation_property_test`); production only reaches it via
+    /// `run_compaction_trigger`.
+    #[doc(hidden)]
+    pub async fn bake_seq_prefix_protected_snapshots(&self) -> Result<bool> {
         // GATE: key-delete tables only. Position deletes are file-scoped (the
         // prune is a no-op for them) and their subset compaction must serialize
         // against writers — neither is the seq-prefix bake's domain.
@@ -13868,11 +14130,15 @@ impl CayenneTableProvider {
     /// override never touches the SHARED runtime's `file://` store that queries
     /// and CDC appends use — only this `Maintenance`-class write is routed
     /// through the custom writer. The query memory pool is shared so the encode
-    /// still respects `runtime.query.memory_limit`. Gated off by default; only
-    /// called when [`super::compaction_writer::config`] is enabled.
+    /// still respects `runtime.query.memory_limit`. `expected_file_bytes` is the
+    /// per-output target file size, forwarded so the writer seeds each output's
+    /// preallocation with one `fallocate`. Only called on the network-attached
+    /// (EBS) tier — when [`super::compaction_writer::use_direct_writer_for`]
+    /// selects the writer.
     fn compaction_session_context(
         &self,
         cfg: super::compaction_writer::CompactionWriterConfig,
+        expected_file_bytes: u64,
     ) -> Result<SessionContext> {
         use datafusion::execution::object_store::{
             DefaultObjectStoreRegistry, ObjectStoreRegistry,
@@ -13890,6 +14156,7 @@ impl CayenneTableProvider {
             inner,
             std::path::PathBuf::from("/"),
             cfg,
+            expected_file_bytes,
         ));
         let file_url = url::Url::parse("file:///").map_err(|source| Error::UrlParse {
             url: "file:///".to_string(),
@@ -15084,7 +15351,7 @@ impl CayenneTableProvider {
             Self::invalidate_list_files_cache(self.context.runtime_env(), &snapshot_dir_url);
         }
 
-        telemetry::track_cayenne_list_files_cache_publish(
+        telemetry::cayenne::track_list_files_cache_publish(
             applied_delta,
             &[telemetry::KeyValue::new(
                 "table",
@@ -15766,7 +16033,7 @@ impl CayenneTableProvider {
         generation: u64,
         structural_epoch: u64,
     ) -> Result<InlinedCache> {
-        telemetry::track_cayenne_inline_cache_populate(
+        telemetry::cayenne::track_inline_cache_populate(
             false,
             &[telemetry::KeyValue::new(
                 "table",
@@ -15888,7 +16155,7 @@ impl CayenneTableProvider {
         structural_epoch: u64,
         base: &InlinedCache,
     ) -> Result<InlinedCache> {
-        telemetry::track_cayenne_inline_cache_populate(
+        telemetry::cayenne::track_inline_cache_populate(
             true,
             &[telemetry::KeyValue::new(
                 "table",
@@ -16699,12 +16966,21 @@ impl CayenneTableProvider {
     /// including this table's own background tick) can always make progress
     /// while we wait, and the wait is deadline-bounded regardless.
     pub(crate) async fn wait_for_budget_or_spill(&self, incoming_bytes: u64) -> Result<bool> {
-        if crate::provider::mem_tier_budget::reserve_bytes_or_wait(
+        let budget_wait_start = Instant::now();
+        let reserved = crate::provider::mem_tier_budget::reserve_bytes_or_wait(
             incoming_bytes,
             crate::provider::mem_tier_budget::BUDGET_WAIT,
         )
-        .await
-        {
+        .await;
+        // Attribute the mem-tier budget wait (the global MemTierBudget valve).
+        telemetry::cayenne::track_mem_tier_acquire_wait(
+            budget_wait_start.elapsed(),
+            &[telemetry::KeyValue::new(
+                "table",
+                self.table_name().to_string(),
+            )],
+        );
+        if reserved {
             // Another table's flush freed the bytes and the reservation is
             // already recorded — proceed WITHOUT spilling: the freeing table
             // paid the flush.
@@ -17080,7 +17356,7 @@ impl CayenneTableProvider {
         };
         drop(write_guard);
         record_cayenne_write_phase(self.table_name(), "cdc_path_inmemory", write_start);
-        telemetry::track_cayenne_cdc_absorbed_delete_keys(
+        telemetry::cayenne::track_cdc_absorbed_delete_keys(
             key_count,
             &[telemetry::KeyValue::new(
                 "table",
@@ -17773,6 +18049,19 @@ impl CayenneTableProvider {
             shard_snapshots.iter().all(|s| s.is_empty())
         };
         if nothing_to_flush {
+            // The tier is fully empty — every epoch ever appended has already
+            // been flushed durable by a prior checkpoint (a real flush always
+            // fires the advancer for its epoch). But the runtime enqueues a
+            // batch's source committer AFTER `write_change` returns its epoch, so
+            // a committer can be queued LATE, after the flush that drained its
+            // epoch already fired. Re-fire the advancer with the last durable
+            // watermark so that late committer is released; otherwise the runtime
+            // finds a non-empty deferred-commit queue after this "successful"
+            // checkpoint and fatally (permanently) stops the changes stream
+            // (#11644). Safe because an empty tier carries no un-durable RAM
+            // batch, and idempotent because the advancer only drains committers
+            // still queued at or below the watermark.
+            self.refire_last_durable_slot_advancer().await;
             return Ok(0);
         }
         // At N==1 the slot-ack currency stays the single shard's `MemTier::epoch`
@@ -18163,7 +18452,10 @@ impl CayenneTableProvider {
             "mem_tier_checkpoint",
             checkpoint_start,
         );
-        tracing::debug!(
+        // Fires on every mem-tier checkpoint flush — per-snapshot happy-path
+        // diagnostic (spammy under sustained ingest, e.g. a snapshot storm), so
+        // keep it at trace so it is omitted even at debug verbosity.
+        tracing::trace!(
             target: "cayenne::mem_tier",
             table = self.table_metadata.table_name.as_str(),
             flushed_rows = flushed_mem_rows,
@@ -18557,6 +18849,14 @@ impl CayenneTableProvider {
     /// up (memory mode). A no-op in file mode / when the runtime did not install
     /// a handle.
     async fn fire_slot_advancer(&self, durable_epoch: u64) {
+        // Record the durable high-watermark (encoded `epoch + 1`, monotone via
+        // `fetch_max`) so the `nothing_to_flush` path can RE-fire the advancer for
+        // a source committer queued after this flush already drained its epoch —
+        // the late-enqueue race that otherwise fatally stops the stream (#11644).
+        self.last_fired_durable_epoch.fetch_max(
+            durable_epoch.saturating_add(1),
+            std::sync::atomic::Ordering::SeqCst,
+        );
         // Reset the freshness clock: the slot just advanced (via a seal or a bake),
         // so the next seal is due one `seal_age` from now. Read by `seal_due`.
         *self.last_slot_advance_at.lock() = Instant::now();
@@ -18564,7 +18864,7 @@ impl CayenneTableProvider {
         // counter so `cayenne_mem_tier_{durable,apply}_epoch` expose the slot-ack
         // gap. A gap that GROWS while checkpoints keep firing is a stuck watermark
         // (the N>1 WAL-drain stall) — vs the trigger never firing (the tick counter).
-        telemetry::track_cayenne_mem_tier_epoch(
+        telemetry::cayenne::track_mem_tier_epoch(
             self.mem_tier_apply_epoch
                 .load(std::sync::atomic::Ordering::Relaxed),
             durable_epoch,
@@ -18573,6 +18873,32 @@ impl CayenneTableProvider {
                 self.table_metadata.table_name.clone(),
             )],
         );
+        let advancer = self.slot_advancer.lock().clone();
+        if let Some(advancer) = advancer {
+            advancer.on_checkpoint_durable(durable_epoch).await;
+        }
+    }
+
+    /// Re-fire the installed slot advancer with the last durable epoch a real
+    /// checkpoint reported, WITHOUT touching the freshness clock or the epoch
+    /// telemetry (this is not a new durable advance — it releases committers a
+    /// prior flush already made durable). Used by the `nothing_to_flush` path of
+    /// [`Self::checkpoint_mem_tier`]: an empty tier means every appended epoch is
+    /// already durable, so a source committer the runtime queued LATE — after the
+    /// flush that drained its epoch fired — must still be released. The advancer
+    /// drains only committers still queued at or below the watermark, so a no-op
+    /// (empty queue, or nothing new) is harmless and this is idempotent across
+    /// repeated empty checkpoints. See [`Self::last_fired_durable_epoch`] and
+    /// issue #11644.
+    async fn refire_last_durable_slot_advancer(&self) {
+        let encoded = self
+            .last_fired_durable_epoch
+            .load(std::sync::atomic::Ordering::SeqCst);
+        // `0` means no checkpoint has ever fired: nothing is durable yet, so
+        // there is nothing to release.
+        let Some(durable_epoch) = encoded.checked_sub(1) else {
+            return;
+        };
         let advancer = self.slot_advancer.lock().clone();
         if let Some(advancer) = advancer {
             advancer.on_checkpoint_durable(durable_epoch).await;
@@ -20683,14 +21009,14 @@ impl CayenneTableProvider {
                         file = %part_file.object_meta.location,
                         "Pruned Vortex file at listing time via footer statistics"
                     );
-                    telemetry::track_cayenne_scan_files(
+                    telemetry::cayenne::track_scan_files(
                         1,
                         1,
                         &[telemetry::KeyValue::new("table", table_name.clone())],
                     );
                     return Ok(None);
                 }
-                telemetry::track_cayenne_scan_files(
+                telemetry::cayenne::track_scan_files(
                     1,
                     0,
                     &[telemetry::KeyValue::new("table", table_name.clone())],
@@ -20890,7 +21216,7 @@ impl CayenneTableProvider {
     }
 
     fn record_listing_fence_wait_duration(&self, duration: Duration) {
-        telemetry::track_cayenne_listing_fence_wait_duration(
+        telemetry::cayenne::track_listing_fence_wait_duration(
             duration,
             &[telemetry::KeyValue::new(
                 "dataset",
@@ -20900,7 +21226,7 @@ impl CayenneTableProvider {
     }
 
     fn record_listing_scan_duration(&self, duration: Duration) {
-        telemetry::track_cayenne_listing_scan_duration(
+        telemetry::cayenne::track_listing_scan_duration(
             duration,
             &[telemetry::KeyValue::new(
                 "dataset",
@@ -21547,6 +21873,13 @@ impl TableProvider for CayenneTableProvider {
         if let Some(ref cold_config) = self.cold_object_store_config {
             Self::register_object_store_if_needed(state.runtime_env(), cold_config);
         }
+
+        // End-to-end data-file integrity: when enabled, verify each manifest
+        // file's stored digest once before serving reads from it. A mismatch
+        // fails the scan as a detected fault instead of decoding corrupted bytes
+        // into silently-wrong rows. No-op (and zero I/O) when the feature is off
+        // or once every file has been verified this process.
+        self.verify_data_file_integrity().await?;
 
         // Warm the inlined cache before taking the consistency guards so the
         // read under `scan_state_lock` is a cheap cache hit in the common case.
@@ -22297,7 +22630,9 @@ impl TableProvider for CayenneTableProvider {
             return self.delete_using_deletion_vectors(&filters).await;
         }
 
-        let file_sink = self.build_deletion_vector_sink(&filters, None).await?;
+        let file_sink = self
+            .build_deletion_vector_sink(&filters, None, DeletionRequestSource::User)
+            .await?;
         Ok(Arc::new(DeletionExec::new(Arc::new(
             InlineAwareDeletionSink {
                 table: self.clone_for_write(),
@@ -22364,6 +22699,18 @@ impl TableProvider for CayenneTableProvider {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DeletionRequestSource {
+    User,
+    Cdc,
+}
+
+impl DeletionRequestSource {
+    fn requires_exact_count(self) -> bool {
+        matches!(self, Self::User)
+    }
+}
+
 impl CayenneTableProvider {
     /// File-level delete path.
     ///
@@ -22418,8 +22765,12 @@ impl CayenneTableProvider {
         filters: &[Expr],
     ) -> datafusion_common::Result<Arc<dyn ExecutionPlan>> {
         let sink: Arc<dyn DeletionSink> = Arc::new(
-            self.build_deletion_vector_sink(filters, Some(Arc::clone(&self.write_lock)))
-                .await?,
+            self.build_deletion_vector_sink(
+                filters,
+                Some(Arc::clone(&self.write_lock)),
+                DeletionRequestSource::User,
+            )
+            .await?,
         );
         Ok(Arc::new(DeletionExec::new(Arc::new(
             PkKeysetInvalidatingDeletionSink {
@@ -22487,10 +22838,16 @@ impl CayenneTableProvider {
         Ok(tables)
     }
 
+    /// Build the [`CayenneDeletionSink`] behind the deletion-vector delete paths.
+    ///
+    /// User-visible deletes require a verified deleted-row count because the SQL
+    /// client receives "rows affected". CDC deletes discard that count, so they
+    /// can use count-skipping key-delete paths when the filter shape supports it.
     async fn build_deletion_vector_sink(
         &self,
         filters: &[Expr],
         write_lock: Option<Arc<tokio::sync::Mutex<()>>>,
+        source: DeletionRequestSource,
     ) -> datafusion_common::Result<CayenneDeletionSink> {
         let mut snapshot_tables: Vec<Arc<ListingTable>> = self
             .build_protected_snapshot_listing_tables()?
@@ -22518,12 +22875,55 @@ impl CayenneTableProvider {
             write_lock,
             Arc::clone(&self.seq_allocator),
         )
-        // `build_deletion_vector_sink` backs only user-visible DELETE paths
-        // (`delete_from`, `delete_using_deletion_vectors`), which surface "rows
-        // affected" — so require a verified count (bypass the count-skipping
-        // PK-IN-list fast path). CDC/internal sinks are built elsewhere and keep
-        // the fast path.
-        .with_exact_count())
+        .with_exact_count(source.requires_exact_count()))
+    }
+
+    /// Durable CDC key-delete path that avoids exact row-count work when possible.
+    ///
+    /// User `DELETE` and the durable CDC apply loop both funnel through
+    /// [`TableProvider::delete_from`], which requires a verified "rows affected"
+    /// count. CDC discards that count, so the apply loop calls this path to build
+    /// the same key-based [`InlineAwareDeletionSink`] as `delete_from` but with a
+    /// count-skipping inner sink. A `pk IN (...)` filter, or an equivalent
+    /// composite OR-of-AND filter, can then persist deletion vectors without
+    /// scanning. Other key-delete filter shapes may still scan through the shared
+    /// sink.
+    ///
+    /// Returns `Ok(Some(_))` when Cayenne handled the delete. The returned count
+    /// is not guaranteed to be exact: count-skipping paths return a sentinel 0,
+    /// while scan-based paths may return an exact count. CDC callers must discard
+    /// it. Returns `Ok(None)` for shapes this path does not handle, such as
+    /// file-based retention or position-based deletes; callers should route those
+    /// through `delete_from` unchanged.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if building the deletion-vector sink fails (e.g. listing
+    /// the protected-snapshot or cold-tier tables) or if persisting the deletion
+    /// vectors fails.
+    pub async fn delete_from_cdc_fast(
+        &self,
+        filters: &[Expr],
+    ) -> datafusion_common::Result<Option<u64>> {
+        if self.file_based_deletes_preferred(filters)
+            || self.pk_deletion_strategy.is_position_based()
+        {
+            return Ok(None);
+        }
+
+        let file_sink = self
+            .build_deletion_vector_sink(filters, None, DeletionRequestSource::Cdc)
+            .await?;
+        let sink = InlineAwareDeletionSink {
+            table: self.clone_for_write(),
+            file_sink,
+            filters: filters.to_vec(),
+        };
+        let deleted = sink
+            .delete_from()
+            .await
+            .map_err(datafusion_common::DataFusionError::External)?;
+        Ok(Some(deleted))
     }
 
     /// Delete rows by hash-probing key columns against a set of matched keys.
@@ -22700,6 +23100,9 @@ fn format_bytes_per_sec(bytes_per_sec: f64) -> String {
 #[async_trait::async_trait]
 impl super::compaction::CompactionRunner for CayenneTableProvider {
     async fn run_compaction_trigger(&self) -> std::result::Result<bool, String> {
+        let Some(_pass) = super::compaction::try_track_compaction_pass() else {
+            return Ok(false);
+        };
         // Routes to the fast protected-snapshot subset compaction, which only
         // rewrites immutable protected snapshots and CAS-swaps them in the
         // catalog. Key-delete tables can run concurrently with appends because
@@ -22845,7 +23248,7 @@ impl super::compaction::CompactionRunner for CayenneTableProvider {
         let snap = self.context.ingest_snapshot();
         let actuators = self.context.live_actuator_values();
         let goals = self.context.goals();
-        telemetry::track_cayenne_autotune_state(
+        telemetry::cayenne::track_autotune_state(
             &telemetry::CayenneAutotuneState {
                 rows_per_sec: snap.rows_per_sec,
                 bytes_per_sec: snap.bytes_per_sec,
@@ -22893,7 +23296,7 @@ impl super::compaction::CompactionRunner for CayenneTableProvider {
         // The closed-loop control step. A no-op when dynamic tuning is disabled
         // (returns `None`); otherwise applies at most one bounded actuator change.
         if let Some(adj) = self.context.retune(super::tuning::MIN_DWELL) {
-            telemetry::track_cayenne_autotune_adjustment(&[
+            telemetry::cayenne::track_autotune_adjustment(&[
                 telemetry::KeyValue::new("table", table.clone()),
                 telemetry::KeyValue::new("actuator", adj.actuator.as_str()),
             ]);
@@ -23065,7 +23468,7 @@ impl super::compaction::MemTierCheckpointRunner for CayenneTableProvider {
         // N>1 sharded tier diagnosis lacked (no checkpoint-fire metric existed).
         let tick_table = self.table_metadata.table_name.clone();
         let emit_tick = |outcome: &'static str| {
-            telemetry::track_cayenne_mem_tier_checkpoint_tick(&[
+            telemetry::cayenne::track_mem_tier_checkpoint_tick(&[
                 telemetry::KeyValue::new("table", tick_table.clone()),
                 telemetry::KeyValue::new("outcome", outcome),
             ]);
@@ -23384,6 +23787,112 @@ mod tests {
                     .downcast_ref::<StringViewArray>()
                     .is_some(),
                 "scan must emit StringViewArray under force_view_read_schema"
+            );
+        }
+    }
+
+    /// Regression guard for the current-snapshot compactor's read-schema/write-schema
+    /// boundary. The rewrite input is built with `TableProvider::scan()`, which
+    /// emits the query read schema (`Utf8View` here), but Vortex file writes must
+    /// use the stored table schema (`Utf8`). `write_to_snapshot` must normalize
+    /// the scanned batches before Vortex derives/checks its dtype; otherwise the
+    /// background current-snapshot compactor can panic on a dtype mismatch.
+    #[tokio::test]
+    async fn current_snapshot_compaction_casts_force_view_scan_to_write_schema() {
+        use arrow::array::{Int64Array, StringArray, StringViewArray};
+        use arrow::datatypes::{DataType, Field, Schema};
+
+        let ctx = SessionContext::new();
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let metadata_dir = format!("{}/metadata", temp_dir.path().to_str().expect("path"));
+        let data_dir = format!("{}/data", temp_dir.path().to_str().expect("path"));
+        std::fs::create_dir_all(&metadata_dir).expect("metadata dir");
+        let connection_string = format!("sqlite://{metadata_dir}/cayenne.db");
+        let catalog = Arc::new(CayenneCatalog::new(connection_string).expect("catalog"))
+            as Arc<dyn MetadataCatalog>;
+        catalog.init().await.expect("catalog init");
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("name", DataType::Utf8, false),
+        ]));
+        let vortex_config = VortexConfig {
+            force_view_read_schema: true,
+            ..VortexConfig::default()
+        };
+        let table_name = "view_compaction";
+        let context = CayenneContext::new(&vortex_config, ctx.runtime_env(), table_name);
+        let options = CreateTableOptions {
+            table_name: table_name.to_string(),
+            schema: Arc::clone(&schema),
+            primary_key: vec!["id".to_string()],
+            on_conflict: Some(OnConflict::Upsert(
+                datafusion_table_providers::util::column_reference::ColumnReference::new(vec![
+                    "id".to_string(),
+                ]),
+            )),
+            base_path: data_dir,
+            partition_column: None,
+            vortex_config,
+        };
+        let provider = CayenneTableProviderBuilder::new(Arc::clone(&catalog), ctx.runtime_env())
+            .with_context(context)
+            .create(options)
+            .await
+            .expect("table created");
+
+        assert_eq!(
+            provider
+                .schema()
+                .field_with_name("name")
+                .expect("name field")
+                .data_type(),
+            &DataType::Utf8View,
+        );
+        assert_eq!(
+            provider
+                .table_schema()
+                .field_with_name("name")
+                .expect("name field")
+                .data_type(),
+            &DataType::Utf8,
+        );
+
+        insert_batch(
+            &provider,
+            RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![
+                    Arc::new(Int64Array::from(vec![1_i64, 2])),
+                    Arc::new(StringArray::from(vec!["alice", "bob"])),
+                ],
+            )
+            .expect("batch"),
+        )
+        .await;
+        assert!(provider.cached_inlined_row_count() > 0, "rows land inline");
+
+        assert!(
+            provider
+                .rewrite_current_snapshot_for_compaction()
+                .await
+                .expect("current-snapshot rewrite succeeds"),
+            "rewrite should commit a compacted current snapshot"
+        );
+
+        let batches = read_all(&ctx, &provider, table_name).await;
+        let total: usize = batches.iter().map(RecordBatch::num_rows).sum();
+        assert_eq!(total, 2, "rows survive compaction");
+        for batch in &batches {
+            let idx = batch.schema().index_of("name").expect("name col");
+            assert_eq!(batch.schema().field(idx).data_type(), &DataType::Utf8View);
+            assert!(
+                batch
+                    .column(idx)
+                    .as_any()
+                    .downcast_ref::<StringViewArray>()
+                    .is_some(),
+                "query scan remains view-typed after compaction"
             );
         }
     }
@@ -25481,6 +25990,71 @@ mod tests {
             tier.sealed_segments,
             tier.segments.len(),
             "every segment is now the immutable (sealed) piece"
+        );
+    }
+
+    /// Repro for #11644 (root cause of the fatal changes-stream stop). In
+    /// `cdc_durability: memory` the runtime enqueues a batch's source committer
+    /// tagged with its mem-tier epoch AFTER `write_change` returns the epoch. A
+    /// background mem-tier checkpoint can flush that batch and fire the slot
+    /// advancer in the gap BEFORE the committer is queued (see
+    /// `test_slot_advancer_delays_committers_pushed_after_checkpoint` in the
+    /// runtime). The next durable-path apply then calls `checkpoint_mem_tier` to
+    /// release the now-late-queued committer — but the tier is ALREADY EMPTY, so
+    /// the `nothing_to_flush` early return must STILL re-fire the slot advancer
+    /// with the last durable epoch. Without it the advancer never runs for the
+    /// late committer, the runtime's deferred-commit queue stays non-empty, and
+    /// the gate declares "deferred source commits remain after durable
+    /// checkpoint" — fatally (and permanently) stopping the stream.
+    #[tokio::test]
+    async fn mem_tier_empty_checkpoint_refires_slot_advancer() {
+        use std::sync::atomic::Ordering::SeqCst;
+        // A checkpoint on an empty tier never legitimately advances to this
+        // sentinel epoch, so any observed value below it proves a real re-fire.
+        const SENTINEL: u64 = u64::MAX;
+
+        let runtime_env = SessionContext::new().runtime_env();
+        let (provider, _catalog, _tmp) =
+            create_memory_mode_upsert_table("empty_ckpt_refire", Arc::clone(&runtime_env)).await;
+        let durable = Arc::new(std::sync::atomic::AtomicU64::new(SENTINEL));
+        provider.install_slot_advancer(Arc::new(EpochRecorder(Arc::clone(&durable))));
+
+        // Append a batch and checkpoint it durable: this is the "background
+        // checkpoint" of the race — it fires the advancer for the batch's epoch
+        // and drains the tier.
+        let no_deletions = OnConflictDeletions::default();
+        let batch = int64_id_batch(&[1, 2, 3]);
+        let bytes = batch.get_array_memory_size() as u64;
+        let epoch = provider
+            .append_to_mem_tier(vec![batch], &no_deletions, bytes, 0)
+            .await
+            .expect("append");
+        provider
+            .checkpoint_mem_tier()
+            .await
+            .expect("flush checkpoint");
+        assert_eq!(
+            durable.load(SeqCst),
+            epoch,
+            "the flushing checkpoint fires the advancer for the batch's epoch"
+        );
+        assert!(provider.mem_tier.tier().load().is_empty(), "tier drained");
+
+        // Now the runtime queues the batch's committer (LATE — after the flush
+        // already fired). The gate runs `checkpoint_mem_tier` on the now-empty
+        // tier to release it. Reset the recorder so only a genuine re-fire is
+        // observable, then run the empty-tier checkpoint.
+        durable.store(SENTINEL, SeqCst);
+        provider
+            .checkpoint_mem_tier()
+            .await
+            .expect("empty-tier gate checkpoint");
+        assert_eq!(
+            durable.load(SeqCst),
+            epoch,
+            "an empty-tier checkpoint must re-fire the slot advancer with the last \
+             durable epoch so a late-queued committer is released (issue #11644); \
+             without this the deferred-commit queue is declared permanently stuck"
         );
     }
 
@@ -29504,6 +30078,7 @@ mod tests {
                 file_size_bytes: 1,
                 min_sequence: 0,
                 max_sequence: 0,
+                digest: None,
             })
             .await
             .expect("seed a sentinel manifest row");
@@ -29681,6 +30256,7 @@ mod tests {
                     file_size_bytes: 100,
                     min_sequence: seq,
                     max_sequence: seq,
+                    digest: None,
                 })
                 .await
                 .expect("upsert manifest row");
@@ -29746,6 +30322,7 @@ mod tests {
                     file_size_bytes: 100,
                     min_sequence: min_seq,
                     max_sequence: max_seq,
+                    digest: None,
                 })
                 .await
                 .expect("upsert manifest row");
@@ -29923,6 +30500,7 @@ mod tests {
                         file_size_bytes: i64::try_from(size).unwrap_or(0),
                         min_sequence: seq,
                         max_sequence: seq,
+                        digest: None,
                     })
                     .await
                     .expect("pin manifest sequence");
@@ -30100,6 +30678,7 @@ mod tests {
                         file_size_bytes: i64::try_from(size).unwrap_or(0),
                         min_sequence: seq,
                         max_sequence: seq,
+                        digest: None,
                     })
                     .await
                     .expect("pin manifest sequence");
@@ -30497,6 +31076,7 @@ mod tests {
                         file_size_bytes: i64::try_from(size).unwrap_or(0),
                         min_sequence: seq,
                         max_sequence: seq,
+                        digest: None,
                     })
                     .await
                     .expect("re-pin manifest sequence");
@@ -30602,6 +31182,7 @@ mod tests {
                     file_size_bytes: i64::try_from(size).unwrap_or(0),
                     min_sequence: 5, // <= T=20: the write-range trap
                     max_sequence: 5,
+                    digest: None,
                 })
                 .await
                 .expect("pin low write-range");
@@ -30983,6 +31564,7 @@ mod tests {
             file_size_bytes: 100,
             min_sequence: 1,
             max_sequence: 1,
+            digest: None,
         };
         let all_rows = vec![
             // current snapshot owns one file...
@@ -31031,6 +31613,7 @@ mod tests {
             file_size_bytes: 100,
             min_sequence: 1,
             max_sequence: 1,
+            digest: None,
         };
         for row in [
             mk("snapA", "a0.vortex"),

@@ -34,12 +34,12 @@ use crate::changes::{Indexes, index_change_envelope};
 use crate::component::{
     ComponentInitialization,
     dataset::{Dataset, acceleration::RefreshMode},
-    metrics::MetricsProvider,
 };
 use crate::dataconnector::{DataConnector, DataConnectorError, DataConnectorResult};
 use crate::federated_table::FederatedTable;
 use crate::search::full_text::table::add_elasticsearch_fts_to_table;
 use crate::search::util::find_concrete_table_provider;
+use runtime_metrics::component::MetricsProvider;
 use runtime_secrets::Secrets;
 
 /// Resolved Elasticsearch FTS connection parameters.
