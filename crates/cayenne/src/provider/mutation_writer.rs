@@ -473,12 +473,14 @@ impl<'a> AppendMutationWriter<'a> {
             ));
         }
 
-        // In-memory CDC durability mode: append the validated batch to the RAM
-        // tier and defer the source slot ack to a checkpoint, instead of
-        // persisting a per-batch durable BLOB. Gated to the key-based
-        // merge-on-read shape on a non-partitioned table (`is_cdc_memory_mode`) AND
-        // the runtime has armed deferral for a replayable source (`has_slot_advancer`);
-        // every other table/source keeps the durable path below, byte-identical.
+        // In-memory write path: append the validated batch to the RAM tier and
+        // defer the source slot ack to a checkpoint, instead of persisting a
+        // per-batch durable BLOB. Taken when EITHER the table is a `mode: memory`
+        // accelerator (`is_memory_resident_mode` — the mem-tier is its permanent
+        // store) OR a key-based, non-partitioned CDC table (`is_cdc_memory_mode`)
+        // whose runtime has armed deferral for a replayable source
+        // (`has_slot_advancer`); every other table/source keeps the durable path
+        // below, byte-identical.
         let (mut prepared_stream, write_guard) = if self.table.is_memory_resident_mode()
             || (self.table.is_cdc_memory_mode() && self.table.has_slot_advancer())
         {

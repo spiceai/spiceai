@@ -1992,7 +1992,7 @@ impl CayenneAccelerator {
         let object_store = if memory_mode {
             None
         } else {
-            s3::build_s3_object_store(source, CayenneAccelerator::new().cayenne_data_dir(source)?)
+            s3::build_s3_object_store(source, self.cayenne_data_dir(source)?)
                 .await
                 .context(S3Snafu)?
         };

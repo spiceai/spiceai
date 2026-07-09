@@ -189,7 +189,7 @@ pub enum Error {
     /// mode never spills to disk, so the write is rejected rather than silently
     /// dropped or grown unbounded.
     #[snafu(display(
-        "Failed to append to dataset {table} (cayenne): the in-memory accelerator reached its \
+        "Failed to write to dataset {table} (cayenne): the in-memory accelerator reached its \
          memory limit ({limit_bytes} bytes; resident {resident_bytes} + incoming {incoming_bytes}). \
          Use 'mode: file' for durable on-disk acceleration, or raise the limit with the \
          'cayenne_cdc_mem_tier_max_bytes' parameter. \

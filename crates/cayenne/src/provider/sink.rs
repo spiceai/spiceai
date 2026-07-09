@@ -167,6 +167,13 @@ impl DataSink for CayenneDataSink {
                 let batch = batch?;
                 incoming_bytes =
                     incoming_bytes.saturating_add(batch.get_array_memory_size() as u64);
+                // Enforce the hard RAM bound while buffering so an oversized refresh
+                // fails fast with a structured error instead of OOMing during
+                // collection (memory mode never spills). The authoritative re-check
+                // runs under the write lock in `write_batches_memory_mode`.
+                self.table
+                    .enforce_memory_limit(incoming_bytes, overwrite)
+                    .map_err(datafusion_common::DataFusionError::from)?;
                 batches.push(batch);
             }
             let _write_guard = self.table.write_lock().lock().await;

@@ -4587,8 +4587,9 @@ impl CayenneTableProvider {
     }
 
     /// Whether this table is a pure in-memory (`mode: memory`) accelerator: data
-    /// lives permanently in the RAM mem-tier + inline corpus, no Vortex data files
-    /// are ever written, the durable drain (checkpoint/seal) is disabled, and the
+    /// lives permanently in the RAM mem-tier (inline publishing is disabled), no
+    /// Vortex data files are ever written, the durable drain (checkpoint/seal) is
+    /// disabled, and the
     /// source slot is never advanced (ephemeral — reload from source on restart).
     ///
     /// This is the master switch for memory mode and is DISTINCT from
@@ -16955,7 +16956,7 @@ impl CayenneTableProvider {
     /// structured error. `overwrite` (full refresh) atomically replaces the tier,
     /// so it compares only the incoming bytes; append compares resident + incoming.
     /// A limit of `u64::MAX` (unset) disables enforcement.
-    fn enforce_memory_limit(&self, incoming_bytes: u64, overwrite: bool) -> Result<()> {
+    pub(crate) fn enforce_memory_limit(&self, incoming_bytes: u64, overwrite: bool) -> Result<()> {
         let limit = self.context.mem_tier_max_bytes_capped();
         if limit == u64::MAX {
             return Ok(());
@@ -17004,7 +17005,8 @@ impl CayenneTableProvider {
     /// Atomically REPLACE the entire RAM mem-tier with `batches` (memory-mode full
     /// refresh). A single `ArcSwap` store per shard, so a concurrent scan captures
     /// either the complete pre- or post-overwrite tier — never a partial or empty
-    /// view. Memory mode uses a single shard; any extra shards are emptied too.
+    /// view. Memory mode is single-shard (enforced by the accelerator's memory-mode
+    /// overrides), so this replaces shard 0 only.
     async fn overwrite_mem_tier(
         &self,
         batches: Vec<RecordBatch>,

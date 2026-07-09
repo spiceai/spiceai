@@ -825,7 +825,7 @@ pub struct VortexConfig {
     #[serde(default)]
     pub deletion_mode: DeletionMode,
     /// Whether this table is a pure in-memory (`mode: memory`) accelerator: all
-    /// data lives in the RAM mem-tier (held in an in-memory metastore), no Vortex
+    /// data lives in the RAM mem-tier (the in-memory metastore holds only metadata), no Vortex
     /// data files are ever written (checkpoint + compaction disabled), the source
     /// slot is never advanced (ephemeral — reload from the source on restart), and
     /// a hard RAM bound returns an error on breach instead of spilling.
