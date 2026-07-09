@@ -37,9 +37,10 @@ use arrow::array::AsArray;
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use async_trait::async_trait;
 use data_components::cdc::{ChangeEnvelope, ChangesStream, StreamError};
+use data_components::cdc::{InitialSnapshotMode, InvalidCheckpointBehavior};
 use data_components::mysql_replication::{
-    InvalidPositionBehavior, PersistedPosition, PositionStore, ReplicationMetricsCollector,
-    ReplicationParams, ReplicationStreamInput, SnapshotMode, StoreError, start_replication_stream,
+    PersistedPosition, PositionStore, ReplicationMetricsCollector, ReplicationParams,
+    ReplicationStreamInput, StoreError, start_replication_stream,
 };
 use futures::StreamExt;
 use mysql_async::prelude::Queryable;
@@ -90,12 +91,13 @@ fn params_for(port: u16, server_id: u32) -> ReplicationParams {
     ReplicationParams {
         opts: mysql_async::Opts::from(opts),
         server_id,
-        snapshot_mode: SnapshotMode::Auto,
+        snapshot_mode: InitialSnapshotMode::Auto,
         bootstrap_batch_size: 8192,
         // Short interval so idle heartbeats persist the position quickly and
         // the resume phase of the test doesn't have to wait.
         checkpoint_interval: Duration::from_secs(1),
-        invalid_position_behavior: InvalidPositionBehavior::Error,
+        invalid_position_behavior: InvalidCheckpointBehavior::Error,
+        ready_lag: Duration::from_secs(2),
     }
 }
 
@@ -364,7 +366,7 @@ async fn purged_position_behavior() -> Result<(), anyhow::Error> {
     let store: Arc<MemoryPositionStore> = Arc::new(MemoryPositionStore::default());
     store.save(&stale).await.expect("save stale position");
     let mut input = stream_input(port, 200_202, Arc::clone(&store) as Arc<dyn PositionStore>);
-    input.params.invalid_position_behavior = InvalidPositionBehavior::Rebootstrap;
+    input.params.invalid_position_behavior = InvalidCheckpointBehavior::Restart;
     let mut stream = start_replication_stream(input);
 
     let envelope = next_envelope(&mut stream, "rebootstrap truncate barrier").await?;

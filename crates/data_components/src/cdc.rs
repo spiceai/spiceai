@@ -14,7 +14,16 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::{fmt::Display, sync::Arc};
+use std::{
+    fmt::Display,
+    sync::Arc,
+    time::{Duration, SystemTime},
+};
+
+pub mod config;
+pub use config::{
+    DEFAULT_READY_LAG, InitialSnapshotMode, InvalidCheckpointBehavior, heartbeat_interval,
+};
 
 use arrow::error::ArrowError;
 use arrow::{
@@ -220,21 +229,65 @@ impl CommitChange for NoOpCommitter {
     }
 }
 
-/// Construct an empty [`ChangeEnvelope`] whose only job is to flip
-/// `is_dataset_ready=true`. The batch contains zero rows and uses a no-op
-/// committer.
+/// Emit one uniform log line when a CDC committer durably acks source progress,
+/// showing the source-commit timestamp of the data it commits and the
+/// end-to-end lag (`now − source_commit_ts_ms`). Every connector's committer
+/// calls this so `refresh_mode: changes` freshness and lag-based readiness can
+/// be verified from the logs with a single filter (`spice_cdc::commit`).
 ///
-/// Connectors should emit one of these envelopes once they consider
-/// themselves caught up to the source if no real change events are available
-/// to carry the ready signal. See the [`ChangesStream`] documentation for the
-/// readiness contract.
-pub fn build_ready_signal_envelope(schema: &SchemaRef) -> Result<ChangeEnvelope, ChangeBatchError> {
+/// `source_commit_ts_ms` is `None` for snapshot-boundary / no-timestamp commits
+/// (lag is then reported as `None`).
+pub fn log_committer_progress(
+    connector: &str,
+    dataset: &str,
+    position: &str,
+    source_commit_ts_ms: Option<i64>,
+) {
+    let now_ms = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .ok()
+        .and_then(|d| i64::try_from(d.as_millis()).ok());
+    let lag_ms = match (now_ms, source_commit_ts_ms) {
+        (Some(now), Some(ts)) => Some(now.saturating_sub(ts)),
+        _ => None,
+    };
+    tracing::error!(
+        target: "spice_cdc::commit",
+        connector,
+        dataset,
+        position,
+        source_commit_ts_ms = ?source_commit_ts_ms,
+        lag_ms = ?lag_ms,
+        "CDC committer acked source position"
+    );
+}
+
+/// Construct a zero-row "heartbeat" [`ChangeEnvelope`] stamped with a
+/// source-attested `source_commit_ts_ms` and carrying `is_dataset_ready`.
+///
+/// CDC connectors emit these to keep **lag-based readiness** live on an idle
+/// source: a caught-up but quiet source has no rows to carry a freshness
+/// timestamp, so without a heartbeat its measured lag would climb forever and
+/// the dataset would never flip Ready. Periodically emitting a zero-row
+/// envelope stamped with the source's own clock (a Postgres keepalive time, a
+/// MongoDB cluster time, a MySQL server clock) lets the runtime observe
+/// `now - source_commit_ts_ms` and mark the dataset Ready once that lag is
+/// within the connector's `ready_lag`.
+///
+/// The batch has zero rows and a no-op committer — idle progress is
+/// acknowledged through the connector's own keepalive/position handling, not
+/// through this envelope's committer.
+pub fn build_heartbeat_envelope(
+    schema: &SchemaRef,
+    source_commit_ts_ms: Option<i64>,
+    is_dataset_ready: bool,
+) -> Result<ChangeEnvelope, ChangeBatchError> {
     // Normalize fields to all-nullable so this empty barrier batch's struct type
     // matches the truncate/snapshot/live change batches it coalesces with. The
     // dataset schema may declare non-null columns (e.g. a `nullable: false`
     // primary key in the spicepod), but every other change batch uses the
     // nullable schema; without this, concat fails ("arrays of different data
-    // types") when the ready signal is coalesced with real data.
+    // types") when the heartbeat is coalesced with real data.
     let nullable_schema = Schema::new(
         schema
             .fields()
@@ -266,13 +319,52 @@ pub fn build_ready_signal_envelope(schema: &SchemaRef) -> Result<ChangeEnvelope,
         vec![op_array, Arc::new(pk_list), Arc::new(data_struct)],
     )
     .context(ArrowSnafu)?;
-    let batch = ChangeBatch::try_new(record)?;
+    let batch = ChangeBatch::try_new(record)?.with_source_commit_ts_ms(source_commit_ts_ms);
 
     Ok(ChangeEnvelope::new(
         Box::new(NoOpCommitter),
         batch,
-        true, // is_dataset_ready
+        is_dataset_ready,
     ))
+}
+
+/// Construct an empty [`ChangeEnvelope`] whose only job is to flip
+/// `is_dataset_ready=true`. The batch contains zero rows and uses a no-op
+/// committer.
+///
+/// For sources with a binary caught-up-or-not readiness signal (e.g. Kafka
+/// consumer lag reaching zero). Sources with a continuous freshness clock use
+/// [`build_heartbeat_envelope`] with [`source_commit_within_ready_lag`] for
+/// lag-based readiness instead. See the [`ChangesStream`] documentation for
+/// the readiness contract.
+pub fn build_ready_signal_envelope(schema: &SchemaRef) -> Result<ChangeEnvelope, ChangeBatchError> {
+    build_heartbeat_envelope(schema, None, true)
+}
+
+/// Lag-based readiness predicate shared by CDC connectors: returns `true` when
+/// `source_commit_ts_ms` is within `ready_lag` of now (wall clock). `None` (the
+/// connector has no upstream timestamp yet) is **not** ready — there is no
+/// freshness signal proving the stream has caught up. A source clock slightly
+/// ahead of ours (small skew) clamps to zero lag and reads as ready.
+///
+/// This is the single definition of "caught up" behind every connector's
+/// `{connector}_replication_ready_lag`: connectors stamp each envelope's
+/// `is_dataset_ready` with it (mirroring DynamoDB's poll-cycle lag gate), and a
+/// [`build_heartbeat_envelope`] on an idle source carries the same verdict.
+#[must_use]
+pub fn source_commit_within_ready_lag(
+    source_commit_ts_ms: Option<i64>,
+    ready_lag: Duration,
+) -> bool {
+    let Some(ts_ms) = source_commit_ts_ms else {
+        return false;
+    };
+    let now_ms = match SystemTime::now().duration_since(SystemTime::UNIX_EPOCH) {
+        Ok(elapsed) => i64::try_from(elapsed.as_millis()).unwrap_or(i64::MAX),
+        Err(_) => return false,
+    };
+    let lag_ms = now_ms.saturating_sub(ts_ms).max(0);
+    u128::from(lag_ms.unsigned_abs()) < ready_lag.as_millis()
 }
 
 /// The Arrow schema that represents a `ChangeEvent`

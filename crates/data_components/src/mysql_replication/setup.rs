@@ -244,6 +244,26 @@ pub async fn fetch_head_position(conn: &mut Conn) -> Result<BinlogPosition> {
     }
 }
 
+/// The source's current wall clock as Unix-epoch milliseconds, via `NOW(3)`
+/// (millisecond precision). Used to stamp idle readiness heartbeats with a
+/// source-attested time: a binlog HEARTBEAT event carries no usable clock, so
+/// lag-based readiness on a quiet source reads the source's own clock here
+/// rather than a local `now()`.
+pub async fn fetch_source_now_ms(conn: &mut Conn) -> Result<i64> {
+    let ms: Option<i64> = conn
+        .query_first("SELECT CAST(ROUND(UNIX_TIMESTAMP(NOW(3)) * 1000) AS SIGNED)")
+        .await
+        .context(SetupQuerySnafu {
+            context: "UNIX_TIMESTAMP(NOW(3))",
+        })?;
+    match ms {
+        Some(ms) => Ok(ms),
+        None => Err(Error::Decode {
+            message: "source clock query (UNIX_TIMESTAMP(NOW(3))) returned no row".to_string(),
+        }),
+    }
+}
+
 /// The source's approximate row count for the table, from
 /// `information_schema.TABLES` (an `InnoDB` statistics estimate — cheap and
 /// possibly stale, which is fine for snapshot-progress reporting). `None`

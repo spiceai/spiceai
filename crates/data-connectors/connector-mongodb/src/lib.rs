@@ -26,6 +26,7 @@ limitations under the License.
 mod changes;
 
 use async_trait::async_trait;
+use data_components::cdc::{InitialSnapshotMode, InvalidCheckpointBehavior};
 use data_components::inferred_schema::{InferredIndex, InferredSchema, InferredSortColumn};
 use datafusion::datasource::TableProvider;
 use datafusion_table_providers::mongodb::{
@@ -145,10 +146,22 @@ const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::runtime("change_stream_batch_size")
         .description("Number of Change Stream events MongoDB should request from the server per batch.")
         .default("1000"),
+    ParameterSpec::runtime("mongodb_replication_initial_snapshot")
+        .description("When `refresh_mode: changes` first loads the collection's existing documents: 'auto' (default) snapshots when no resumable resume token exists and resumes without a snapshot when one does; 'disabled' streams change events only, from the current point; 'enabled' snapshots on every start, discarding any persisted resume token. Default: auto.")
+        .default("auto")
+        .one_of_ignore_ascii_case(InitialSnapshotMode::VALUES),
+    ParameterSpec::runtime("mongodb_replication_invalid_checkpoint_behavior")
+        .description("Behavior when a persisted Change Stream resume token cannot be honored by the server (e.g. past the oplog retention window). 'error' (default) surfaces a clear error so the operator can decide (re-snapshotting a large collection should be opt-in). 'restart' drops the persisted token and re-snapshots the collection. Default: error.")
+        .one_of_ignore_ascii_case(InvalidCheckpointBehavior::VALUES),
+    ParameterSpec::runtime("mongodb_replication_ready_lag")
+        .description("For `refresh_mode: changes`, the dataset is marked Ready once its replication lag (now minus the newest applied change's cluster time) falls below this. It stays not-ready while snapshotting or draining a backlog, so it never serves stale data. Default: 2s.")
+        .default("2s"),
+    // Deprecated alias of `mongodb_replication_invalid_checkpoint_behavior`
+    // (rebootstrap -> restart). Kept so existing spicepods keep loading.
     ParameterSpec::runtime("mongodb_resume_token_invalid_behavior")
-        .description("Behavior when a persisted Change Stream resume token cannot be honored by the server (e.g. past the oplog retention window). 'error' surfaces a clear error so the operator can decide (recommended default; re-snapshotting a large collection should be opt-in). 'rebootstrap' drops the persisted token and re-snapshots the collection.")
-        .default("error")
-        .one_of(&["error", "rebootstrap"]),
+        .description("[deprecated] Use `mongodb_replication_invalid_checkpoint_behavior` (error|restart) instead. 'rebootstrap' maps to 'restart'.")
+        .one_of(&["error", "rebootstrap"])
+        .deprecated("Renamed to 'mongodb_replication_invalid_checkpoint_behavior'; 'rebootstrap' -> 'restart'."),
 ];
 
 const IGNORED_IF_URI: &[&str] = &[

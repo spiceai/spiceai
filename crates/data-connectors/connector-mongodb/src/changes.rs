@@ -18,8 +18,9 @@ use async_stream::try_stream;
 use async_trait::async_trait;
 use data_components::{
     cdc::{
-        ChangeEnvelope, ChangesStream, CommitChange, CommitError, NoOpCommitter, StreamError,
-        build_ready_signal_envelope, wrap_data_as_change_batch,
+        ChangeEnvelope, ChangesStream, CommitChange, CommitError, DEFAULT_READY_LAG,
+        InitialSnapshotMode, InvalidCheckpointBehavior, NoOpCommitter, StreamError,
+        build_heartbeat_envelope, source_commit_within_ready_lag, wrap_data_as_change_batch,
     },
     mongodb::stream::{
         change_events_to_change_batch, default_unnest_parameters, nullable_clone,
@@ -33,9 +34,11 @@ use datafusion::{
 use datafusion_table_providers::mongodb::connection_pool::MongoDBConnectionPool;
 use futures::StreamExt as FuturesStreamExt;
 use mongodb::{
-    Collection,
+    ClientSession, Collection,
     bson::Document,
-    change_stream::{ChangeStream, event::ChangeStreamEvent, event::ResumeToken},
+    change_stream::{
+        ChangeStream, event::ChangeStreamEvent, event::ResumeToken, session::SessionChangeStream,
+    },
     options::FullDocumentType,
 };
 use runtime::{
@@ -52,7 +55,6 @@ use runtime::{
     parameters::{ExposedParamLookup, Parameters},
 };
 use std::{sync::Arc, time::Duration};
-use tokio_stream::StreamExt as TokioStreamExt;
 
 const DEFAULT_CHANGE_STREAM_BATCH_MAX_SIZE: usize = 1_000;
 const DEFAULT_CHANGE_STREAM_BATCH_SIZE: u32 = 1_000;
@@ -81,7 +83,9 @@ pub fn build_changes_stream(
         )
         .map_err(|e| StreamError::External(e.to_string()))?;
         let config = ChangeStreamConfig::from_params(&params)?;
-        let invalid_token_behavior = ResumeTokenInvalidBehavior::from_params(&params)?;
+        let invalid_token_behavior = invalid_checkpoint_behavior_from_params(&params)?;
+        let ready_lag = ready_lag_from_params(&params)?;
+        let snapshot_mode = snapshot_mode_from_params(&params)?;
         let collection_name = dataset.path().to_string();
 
         let connection = pool
@@ -112,54 +116,84 @@ pub fn build_changes_stream(
             persisted_checkpoint(mongo_sys.as_deref(), &dataset, current_schema_json.as_deref())
                 .await;
 
-        let live_change_stream = if let Some(metadata) = persisted {
-            let resume_token = deserialize_resume_token(&metadata.resume_token_json)
-                .map_err(|error| StreamError::External(format!(
-                    "Failed to deserialize persisted MongoDB resume token for dataset `{}` collection `{collection_name}`: {error}. To recover, delete the dataset's row from `spice_sys_mongodb` or restart with `mongodb_resume_token_invalid_behavior: rebootstrap`.",
-                    dataset.name
-                )))?;
-
-            match try_open_change_stream(&collection, &config, Some(resume_token)).await {
-                Ok(stream) => {
-                    tracing::info!(
-                        dataset = %dataset.name,
-                        collection = %collection_name,
-                        "MongoDB Change Stream resumed from persisted resume token; skipping collection snapshot"
-                    );
-
-                    let ready = build_ready_signal_envelope(&schema)
-                        .map_err(|error| StreamError::Arrow(error.to_string()))?;
-                    yield ready;
-                    Some(stream)
-                }
-                Err(error) if is_stale_resume_token_error(&error) => match invalid_token_behavior {
-                    ResumeTokenInvalidBehavior::Error => Err(StreamError::External(format!(
-                        "MongoDB Change Stream resume token for dataset `{}` collection `{collection_name}` is past the oplog retention window or otherwise invalid (driver code {}). Set `mongodb_resume_token_invalid_behavior: rebootstrap` to drop the persisted token and re-snapshot the collection. Source: {error}",
-                        dataset.name,
-                        resume_token_error_code(&error).map_or_else(|| "unknown".to_string(), |c| c.to_string()),
-                    )))?,
-                    ResumeTokenInvalidBehavior::Rebootstrap => {
-                        tracing::warn!(
-                            dataset = %dataset.name,
-                            collection = %collection_name,
-                            error = %error,
-                            "MongoDB Change Stream resume token is stale; rebootstrap behavior enabled, falling back to cold bootstrap"
-                        );
-                        clear_persisted_token(mongo_sys.as_deref(), &dataset).await;
-                        None
-                    }
-                },
-                Err(error) => Err(StreamError::External(format!(
-                    "Failed to start MongoDB Change Stream for dataset `{}` collection `{collection_name}` while resuming from persisted token: {error}",
-                    dataset.name
-                )))?,
+        // `initial_snapshot: enabled` re-snapshots on every start: drop any
+        // persisted resume token so the cold-bootstrap (snapshot) path below
+        // runs unconditionally.
+        let persisted = if snapshot_mode == InitialSnapshotMode::Enabled {
+            if persisted.is_some() {
+                clear_persisted_token(mongo_sys.as_deref(), &dataset).await;
             }
-        } else {
             None
+        } else {
+            persisted
         };
 
-        let live_change_stream = if let Some(stream) = live_change_stream {
-            stream
+        // CDC readiness is purely lag-based (see the live loop): neither the
+        // resume nor the bootstrap path emits a one-shot "ready" signal anymore.
+        // Each live batch and each idle heartbeat instead carries a readiness
+        // verdict computed from how far the newest applied change's cluster time
+        // trails now, so the dataset is marked ready only once the stream has
+        // caught up to the source head — never merely because bootstrap finished.
+        //
+        // The resume path returns the live session stream directly; `None` falls
+        // through to cold bootstrap below.
+        let resumed: Option<(SessionChangeStream<ChangeStreamEvent<Document>>, ClientSession)> =
+            if let Some(metadata) = persisted {
+                let resume_token = deserialize_resume_token(&metadata.resume_token_json)
+                    .map_err(|error| StreamError::External(format!(
+                        "Failed to deserialize persisted MongoDB resume token for dataset `{}` collection `{collection_name}`: {error}. To recover, delete the dataset's row from `spice_sys_mongodb` or restart with `mongodb_replication_invalid_checkpoint_behavior: restart`.",
+                        dataset.name
+                    )))?;
+
+                // An explicit MongoDB session lets the live loop read the
+                // source-attested `operationTime` gossiped on each getMore reply —
+                // the cluster time the stream has provably scanned the oplog up to.
+                // That timestamp (never a local now()) drives lag-based readiness
+                // and the idle heartbeat.
+                let mut session = start_change_stream_session(
+                    connection.client.as_ref(),
+                    &dataset.name,
+                    &collection_name,
+                )
+                .await?;
+
+                match try_open_session_change_stream(&collection, &config, &mut session, Some(resume_token)).await {
+                    Ok(stream) => {
+                        tracing::info!(
+                            dataset = %dataset.name,
+                            collection = %collection_name,
+                            "MongoDB Change Stream resumed from persisted resume token; skipping collection snapshot"
+                        );
+                        Some((stream, session))
+                    }
+                    Err(error) if is_stale_resume_token_error(&error) => match invalid_token_behavior {
+                        InvalidCheckpointBehavior::Error => Err(StreamError::External(format!(
+                            "MongoDB Change Stream resume token for dataset `{}` collection `{collection_name}` is past the oplog retention window or otherwise invalid (driver code {}). Set `mongodb_replication_invalid_checkpoint_behavior: restart` to drop the persisted token and re-snapshot the collection. Source: {error}",
+                            dataset.name,
+                            resume_token_error_code(&error).map_or_else(|| "unknown".to_string(), |c| c.to_string()),
+                        )))?,
+                        InvalidCheckpointBehavior::Restart => {
+                            tracing::warn!(
+                                dataset = %dataset.name,
+                                collection = %collection_name,
+                                error = %error,
+                                "MongoDB Change Stream resume token is stale; `restart` behavior enabled, falling back to cold bootstrap"
+                            );
+                            clear_persisted_token(mongo_sys.as_deref(), &dataset).await;
+                            None
+                        }
+                    },
+                    Err(error) => Err(StreamError::External(format!(
+                        "Failed to start MongoDB Change Stream for dataset `{}` collection `{collection_name}` while resuming from persisted token: {error}",
+                        dataset.name
+                    )))?,
+                }
+            } else {
+                None
+            };
+
+        let (mut live_change_stream, mut session) = if let Some(live) = resumed {
+            live
         } else {
             let initial_change_stream = open_change_stream(
                 &collection,
@@ -177,90 +211,188 @@ pub fn build_changes_stream(
             })?;
             drop(initial_change_stream);
 
-            tracing::info!(
-                dataset = %dataset.name,
-                collection = %collection_name,
-                "MongoDB Change Stream started; bootstrapping accelerator from collection snapshot"
-            );
+            if snapshot_mode == InitialSnapshotMode::Disabled {
+                // `initial_snapshot: disabled`: begin streaming change events
+                // from the captured point without copying existing documents
+                // (no truncate, no snapshot scan).
+                tracing::info!(
+                    dataset = %dataset.name,
+                    collection = %collection_name,
+                    "MongoDB Change Stream started; `initial_snapshot: disabled` — streaming changes from the current point without a collection snapshot"
+                );
+            } else {
+                tracing::info!(
+                    dataset = %dataset.name,
+                    collection = %collection_name,
+                    "MongoDB Change Stream started; bootstrapping accelerator from collection snapshot"
+                );
 
-            let truncate = truncate_change_batch(&schema)
-                .map_err(StreamError::MongoDB)?;
-            yield ChangeEnvelope::new(Box::new(NoOpCommitter), truncate, false);
+                let truncate = truncate_change_batch(&schema)
+                    .map_err(StreamError::MongoDB)?;
+                yield ChangeEnvelope::new(Box::new(NoOpCommitter), truncate, false);
 
-            // Use the same nullable schema that CDC event batches use (via nullable_clone
-            // in change_events_to_change_batch), so snapshot and live-stream batches can
-            // be coalesced without an Arrow schema mismatch on non-null fields like _id.
-            let snapshot_schema = nullable_clone(&schema);
-            let mut snapshot_stream = snapshot_stream(table_provider).await?;
-            while let Some(batch) = FuturesStreamExt::next(&mut snapshot_stream).await {
-                let batch = batch.map_err(|error| StreamError::Arrow(error.to_string()))?;
-                if batch.num_rows() == 0 {
-                    continue;
+                // Use the same nullable schema that CDC event batches use (via nullable_clone
+                // in change_events_to_change_batch), so snapshot and live-stream batches can
+                // be coalesced without an Arrow schema mismatch on non-null fields like _id.
+                let snapshot_schema = nullable_clone(&schema);
+                let mut snapshot_stream = snapshot_stream(table_provider).await?;
+                while let Some(batch) = FuturesStreamExt::next(&mut snapshot_stream).await {
+                    let batch = batch.map_err(|error| StreamError::Arrow(error.to_string()))?;
+                    if batch.num_rows() == 0 {
+                        continue;
+                    }
+
+                    let batch = batch
+                        .with_schema(Arc::clone(&snapshot_schema))
+                        .map_err(|error| StreamError::Arrow(error.to_string()))?;
+                    let change_batch = wrap_data_as_change_batch(&snapshot_schema, &batch)
+                        .map_err(|error| StreamError::Arrow(error.to_string()))?;
+                    yield ChangeEnvelope::new(Box::new(NoOpCommitter), change_batch, false);
                 }
-
-                let batch = batch
-                    .with_schema(Arc::clone(&snapshot_schema))
-                    .map_err(|error| StreamError::Arrow(error.to_string()))?;
-                let change_batch = wrap_data_as_change_batch(&snapshot_schema, &batch)
-                    .map_err(|error| StreamError::Arrow(error.to_string()))?;
-                yield ChangeEnvelope::new(Box::new(NoOpCommitter), change_batch, false);
             }
 
-            // Commit the captured resume token piggy-backed on the ready signal envelope.
-            // The committer fires after the downstream has fully persisted the empty
-            // ready batch, which is the natural barrier between "bootstrap" and "live"
-            // phases. A crash any time before this commit leaves the sidecar empty, so
-            // the next start will re-bootstrap.
+            // Persist the captured resume token at the bootstrap→live barrier so a
+            // restart resumes here instead of re-snapshotting. This is a zero-row,
+            // NOT-ready envelope: readiness is lag-based and comes from the live
+            // loop below, never from finishing bootstrap. The committer fires only
+            // after the downstream has persisted this empty batch — the natural
+            // barrier between the "bootstrap" and "live" phases. A crash before this
+            // commit leaves the sidecar empty, so the next start re-bootstraps.
             let initial_token_json = serialize_resume_token(&resume_token)
                 .map_err(|error| StreamError::External(format!(
                     "Failed to serialize MongoDB resume token for dataset `{}` collection `{collection_name}`: {error}",
                     dataset.name
                 )))?;
-            let ready = build_ready_signal_envelope(&schema)
+            let barrier = build_heartbeat_envelope(&schema, None, false)
                 .map_err(|error| StreamError::Arrow(error.to_string()))?;
-            let (_, batch, is_ready) = ready.into_parts();
+            let (_, batch, _) = barrier.into_parts();
             let committer: Box<dyn CommitChange + Send + Sync> = match mongo_sys.as_ref() {
                 Some(sys) => Box::new(MongoResumeTokenCommitter::new(
                     Arc::clone(sys),
                     initial_token_json,
                     None,
                     current_schema_json.clone(),
+                    dataset.name.to_string(),
                 )),
                 None => Box::new(NoOpCommitter),
             };
-            yield ChangeEnvelope::from_parts(committer, batch, is_ready);
+            yield ChangeEnvelope::from_parts(committer, batch, false);
 
             tracing::info!(
                 dataset = %dataset.name,
                 collection = %collection_name,
-                "MongoDB collection snapshot complete; resuming Change Stream events from captured token"
+                "MongoDB Change Stream bootstrap complete; resuming events from the captured resume token"
             );
 
-            open_change_stream(
+            // Session created after the (possibly long) snapshot so an idle
+            // MongoDB logical session cannot time out mid-bootstrap.
+            let mut session = start_change_stream_session(
+                connection.client.as_ref(),
+                &dataset.name,
+                &collection_name,
+            )
+            .await?;
+            let stream = open_session_change_stream(
                 &collection,
                 &config,
+                &mut session,
                 &dataset.name,
                 &collection_name,
                 Some(resume_token),
             )
-            .await?
+            .await?;
+            (stream, session)
         };
 
         let unnest_parameters = default_unnest_parameters(config.unnest_depth);
-        let event_batches = live_change_stream.chunks_timeout(
-            config.batch_max_size,
-            config.batch_max_duration,
-        );
-        tokio::pin!(event_batches);
 
-        while let Some(batch) = TokioStreamExt::next(&mut event_batches).await {
-            if batch.is_empty() {
+        // Manual batching over the session change stream. `next_if_any` issues at
+        // most one getMore per call and returns `Ok(None)` on an empty (idle)
+        // getMore; the session then carries the source-attested `operationTime`
+        // that getMore gossiped — the cluster time the stream has provably scanned
+        // the oplog up to. A caught-up live batch or that idle timestamp (never a
+        // local now()) drives lag-based readiness, so a quiet-but-caught-up source
+        // still becomes ready while a draining backlog stays not-ready. Idle polls
+        // are paced by `change_stream_max_await_time`, so this never busy-loops.
+        let mut pending: Vec<ChangeStreamEvent<Document>> =
+            Vec::with_capacity(config.batch_max_size);
+        let mut batch_started_at: Option<std::time::Instant> = None;
+
+        'live: loop {
+            let next = live_change_stream
+                .next_if_any(&mut session)
+                .await
+                .map_err(|error| StreamError::External(format!(
+                    "Failed to read MongoDB Change Stream event for dataset `{}` collection `{collection_name}`: {error}",
+                    dataset.name
+                )))?;
+
+            let flush = match next {
+                Some(event) => {
+                    pending.push(event);
+                    let started = *batch_started_at.get_or_insert_with(std::time::Instant::now);
+                    pending.len() >= config.batch_max_size
+                        || started.elapsed() >= config.batch_max_duration
+                }
+                None => {
+                    if !pending.is_empty() {
+                        // An idle getMore closes the in-flight batch.
+                        true
+                    } else if !live_change_stream.is_alive() {
+                        tracing::info!(
+                            dataset = %dataset.name,
+                            collection = %collection_name,
+                            "MongoDB Change Stream ended (collection dropped or invalidated); completing"
+                        );
+                        break 'live;
+                    } else {
+                        // Idle and caught up: emit a zero-row heartbeat stamped with
+                        // the getMore's gossiped cluster time so lag-based readiness
+                        // stays live on a quiet source. With no gossiped time yet,
+                        // emit nothing rather than fabricate a local now().
+                        if let Some(op_time) = session.operation_time() {
+                            // MongoDB cluster time is whole seconds (BSON Timestamp)
+                            // → Unix-epoch milliseconds, matching the live path.
+                            let cluster_time_ms = i64::from(op_time.time).saturating_mul(1000);
+                            let is_ready =
+                                source_commit_within_ready_lag(Some(cluster_time_ms), ready_lag);
+                            let heartbeat =
+                                build_heartbeat_envelope(&schema, Some(cluster_time_ms), is_ready)
+                                    .map_err(|error| StreamError::Arrow(error.to_string()))?;
+                            // Log the idle heartbeat so lag-based readiness can be
+                            // verified from the logs (target spice_cdc::heartbeat).
+                            let heartbeat_lag_ms = std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .ok()
+                                .and_then(|d| i64::try_from(d.as_millis()).ok())
+                                .map(|now| now.saturating_sub(cluster_time_ms));
+                            tracing::info!(
+                                target: "spice_cdc::heartbeat",
+                                connector = "mongodb",
+                                dataset = %dataset.name,
+                                source_commit_ts_ms = cluster_time_ms,
+                                is_dataset_ready = is_ready,
+                                lag_ms = ?heartbeat_lag_ms,
+                                "CDC idle heartbeat emitted"
+                            );
+                            yield heartbeat;
+                        }
+                        false
+                    }
+                }
+            };
+
+            if !flush {
                 continue;
             }
 
-            let events = collect_change_events(batch, &dataset)?;
+            let events = std::mem::take(&mut pending);
+            batch_started_at = None;
 
             let tail_token = events.last().map(|event| event.id.clone());
+            // MongoDB change-stream cluster time is whole seconds (BSON Timestamp),
+            // so the replication-lag signal here has ~1s granularity — fine for a
+            // multi-second ready lag.
             let tail_cluster_time = events
                 .last()
                 .and_then(|event| event.cluster_time)
@@ -273,12 +405,11 @@ pub fn build_changes_stream(
                 &unnest_parameters,
                 projection.as_ref(),
             )
-            .map_err(StreamError::MongoDB)? {
-                // MongoDB change-stream cluster time is whole seconds (BSON
-                // Timestamp), so the replication-lag signal here has ~1s
-                // granularity — fine for a multi-second tuner.
-                let change_batch = change_batch
-                    .with_source_commit_ts_ms(tail_cluster_time.map(|s| s.saturating_mul(1000)));
+            .map_err(StreamError::MongoDB)?
+            {
+                let source_commit_ts_ms = tail_cluster_time.map(|s| s.saturating_mul(1000));
+                let change_batch = change_batch.with_source_commit_ts_ms(source_commit_ts_ms);
+                let is_ready = source_commit_within_ready_lag(source_commit_ts_ms, ready_lag);
                 let committer = build_batch_committer(
                     mongo_sys.as_ref(),
                     tail_token,
@@ -286,7 +417,7 @@ pub fn build_changes_stream(
                     current_schema_json.as_deref(),
                     &dataset.name,
                 );
-                yield ChangeEnvelope::new(committer, change_batch, false);
+                yield ChangeEnvelope::new(committer, change_batch, is_ready);
             }
         }
     })
@@ -324,7 +455,7 @@ async fn persisted_checkpoint(
     {
         tracing::warn!(
             dataset = %dataset.name,
-            "MongoDB Change Stream resume detected schema drift between runs; continuing with the current schema. If new fields fail to populate, restart with `mongodb_resume_token_invalid_behavior: rebootstrap` to re-snapshot."
+            "MongoDB Change Stream resume detected schema drift between runs; continuing with the current schema. If new fields fail to populate, restart with `mongodb_replication_invalid_checkpoint_behavior: restart` to re-snapshot."
         );
     }
 
@@ -400,6 +531,7 @@ fn build_batch_committer(
             token_json,
             tail_cluster_time,
             schema_json.map(str::to_string),
+            dataset_name.to_string(),
         )),
         Err(error) => {
             tracing::warn!(
@@ -412,33 +544,64 @@ fn build_batch_committer(
     }
 }
 
-/// Behavior when the persisted resume token cannot be honored by the source
-/// (e.g. the oplog window has rolled past the token's position).
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-enum ResumeTokenInvalidBehavior {
-    /// Surface a clear error so the operator can decide. Recommended default
-    /// because a re-snapshot of a large collection should be opt-in.
-    #[default]
-    Error,
-    /// Drop the persisted token and fall through to the cold-bootstrap path,
-    /// re-snapshotting the collection.
-    Rebootstrap,
+/// Resolve the initial-snapshot mode from `mongodb_replication_initial_snapshot`
+/// (`auto|enabled|disabled`); defaults to [`InitialSnapshotMode::Auto`].
+fn snapshot_mode_from_params(params: &Parameters) -> Result<InitialSnapshotMode, StreamError> {
+    match optional_string(params, "mongodb_replication_initial_snapshot") {
+        None => Ok(InitialSnapshotMode::default()),
+        Some(value) if value.trim().is_empty() => Ok(InitialSnapshotMode::default()),
+        Some(value) => InitialSnapshotMode::from_canonical(&value).ok_or_else(|| {
+            invalid_parameter_error(
+                params,
+                "mongodb_replication_initial_snapshot",
+                format!(
+                    "must be 'auto', 'enabled', or 'disabled', got {:?}",
+                    value.trim()
+                ),
+            )
+        }),
+    }
 }
 
-impl ResumeTokenInvalidBehavior {
-    fn from_params(params: &Parameters) -> Result<Self, StreamError> {
-        match optional_string(params, "mongodb_resume_token_invalid_behavior").as_deref() {
-            None => Ok(Self::default()),
-            Some(value) => match value.trim().to_ascii_lowercase().as_str() {
-                "error" => Ok(Self::Error),
-                "rebootstrap" => Ok(Self::Rebootstrap),
-                other => Err(invalid_parameter_error(
+/// Resolve the lag-based readiness threshold from `mongodb_replication_ready_lag`
+/// (a duration); defaults to [`DEFAULT_READY_LAG`]. A `refresh_mode: changes`
+/// dataset is marked ready once its replication lag falls below this.
+fn ready_lag_from_params(params: &Parameters) -> Result<Duration, StreamError> {
+    optional_positive_duration(params, "mongodb_replication_ready_lag", DEFAULT_READY_LAG)
+}
+
+/// Resolve the invalid-checkpoint behavior, preferring the canonical
+/// `mongodb_replication_invalid_checkpoint_behavior` (`error|restart`) and
+/// falling back to the deprecated `mongodb_resume_token_invalid_behavior`
+/// (`error|rebootstrap`); defaults to [`InvalidCheckpointBehavior::Error`].
+fn invalid_checkpoint_behavior_from_params(
+    params: &Parameters,
+) -> Result<InvalidCheckpointBehavior, StreamError> {
+    if let Some(value) = optional_string(params, "mongodb_replication_invalid_checkpoint_behavior")
+    {
+        let trimmed = value.trim();
+        if !trimmed.is_empty() {
+            return InvalidCheckpointBehavior::from_canonical(trimmed).ok_or_else(|| {
+                invalid_parameter_error(
                     params,
-                    "mongodb_resume_token_invalid_behavior",
-                    format!("must be 'error' or 'rebootstrap', got {other:?}"),
-                )),
-            },
+                    "mongodb_replication_invalid_checkpoint_behavior",
+                    format!("must be 'error' or 'restart', got {trimmed:?}"),
+                )
+            });
         }
+    }
+    match optional_string(params, "mongodb_resume_token_invalid_behavior").as_deref() {
+        None => Ok(InvalidCheckpointBehavior::default()),
+        Some(value) if value.trim().is_empty() => Ok(InvalidCheckpointBehavior::default()),
+        Some(value) => match value.trim().to_ascii_lowercase().as_str() {
+            "error" => Ok(InvalidCheckpointBehavior::Error),
+            "rebootstrap" => Ok(InvalidCheckpointBehavior::Restart),
+            other => Err(invalid_parameter_error(
+                params,
+                "mongodb_resume_token_invalid_behavior",
+                format!("must be 'error' or 'rebootstrap', got {other:?}"),
+            )),
+        },
     }
 }
 
@@ -447,6 +610,8 @@ pub(crate) struct MongoResumeTokenCommitter {
     resume_token_json: String,
     cluster_time_ts: Option<i64>,
     schema_json: Option<String>,
+    /// Dataset name, for the committer-progress log line.
+    dataset: String,
 }
 
 impl MongoResumeTokenCommitter {
@@ -455,12 +620,14 @@ impl MongoResumeTokenCommitter {
         resume_token_json: String,
         cluster_time_ts: Option<i64>,
         schema_json: Option<String>,
+        dataset: String,
     ) -> Self {
         Self {
             mongo_sys,
             resume_token_json,
             cluster_time_ts,
             schema_json,
+            dataset,
         }
     }
 }
@@ -478,7 +645,15 @@ impl CommitChange for MongoResumeTokenCommitter {
             .await
             .map_err(|error| CommitError::UnableToCommitChange {
                 source: Box::new(error),
-            })
+            })?;
+        // MongoDB cluster time is whole seconds; convert to ms for lag reporting.
+        data_components::cdc::log_committer_progress(
+            "mongodb",
+            &self.dataset,
+            &self.resume_token_json,
+            self.cluster_time_ts.map(|s| s.saturating_mul(1000)),
+        );
+        Ok(())
     }
 }
 
@@ -516,6 +691,61 @@ async fn open_change_stream(
         })
 }
 
+/// Open a session-bound live change stream. Mirrors [`try_open_change_stream`]
+/// but binds an explicit [`ClientSession`] so the live loop can read the
+/// source-attested `operationTime` gossiped on each getMore (the cluster time
+/// the stream has provably scanned the oplog up to), which drives lag-based
+/// readiness and the idle heartbeat.
+async fn try_open_session_change_stream(
+    collection: &Collection<Document>,
+    config: &ChangeStreamConfig,
+    session: &mut ClientSession,
+    resume_token: Option<ResumeToken>,
+) -> mongodb::error::Result<SessionChangeStream<ChangeStreamEvent<Document>>> {
+    let mut watch = collection
+        .watch()
+        .full_document(FullDocumentType::UpdateLookup)
+        .max_await_time(config.max_await_time)
+        .batch_size(config.server_batch_size);
+
+    if let Some(resume_token) = resume_token {
+        watch = watch.resume_after(resume_token);
+    }
+
+    watch.session(session).await
+}
+
+async fn open_session_change_stream(
+    collection: &Collection<Document>,
+    config: &ChangeStreamConfig,
+    session: &mut ClientSession,
+    dataset_name: &datafusion::sql::TableReference,
+    collection_name: &str,
+    resume_token: Option<ResumeToken>,
+) -> Result<SessionChangeStream<ChangeStreamEvent<Document>>, StreamError> {
+    try_open_session_change_stream(collection, config, session, resume_token)
+        .await
+        .map_err(|error| {
+            StreamError::External(format!(
+                "Failed to start MongoDB Change Stream for dataset `{dataset_name}` collection `{collection_name}`: {error}"
+            ))
+        })
+}
+
+/// Start an explicit `MongoDB` client session for the live change stream. The
+/// session carries the gossiped `operationTime` used for lag-based readiness.
+async fn start_change_stream_session(
+    client: &mongodb::Client,
+    dataset_name: &datafusion::sql::TableReference,
+    collection_name: &str,
+) -> Result<ClientSession, StreamError> {
+    client.start_session().await.map_err(|error| {
+        StreamError::External(format!(
+            "Failed to start a MongoDB session for Change Stream readiness on dataset `{dataset_name}` collection `{collection_name}`: {error}"
+        ))
+    })
+}
+
 /// Returns `true` if the driver error indicates the resume token is past the
 /// oplog retention window (`ChangeStreamHistoryLost`, code 286) or the cursor
 /// is otherwise unresumable (`ChangeStreamFatalError`, code 280).
@@ -536,21 +766,6 @@ async fn snapshot_stream(
     df.execute_stream()
         .await
         .map_err(|error| data_components::cdc::StreamError::Arrow(error.to_string()))
-}
-
-fn collect_change_events(
-    batch: Vec<mongodb::error::Result<ChangeStreamEvent<Document>>>,
-    dataset: &Dataset,
-) -> Result<Vec<ChangeStreamEvent<Document>>, data_components::cdc::StreamError> {
-    batch
-        .into_iter()
-        .collect::<mongodb::error::Result<Vec<_>>>()
-        .map_err(|error| {
-            data_components::cdc::StreamError::External(format!(
-                "Failed to read MongoDB Change Stream event for dataset `{}`: {error}",
-                dataset.name
-            ))
-        })
 }
 
 fn resolve_primary_keys(
@@ -784,6 +999,103 @@ mod tests {
             "mongodb",
             crate::PARAMETERS,
         )
+    }
+
+    #[test]
+    fn snapshot_mode_parses_canonical_values() {
+        assert_eq!(
+            snapshot_mode_from_params(&params(&[])).expect("default parses"),
+            InitialSnapshotMode::Auto
+        );
+        for (raw, expected) in [
+            ("auto", InitialSnapshotMode::Auto),
+            ("ENABLED", InitialSnapshotMode::Enabled),
+            ("disabled", InitialSnapshotMode::Disabled),
+        ] {
+            assert_eq!(
+                snapshot_mode_from_params(&params(&[(
+                    "mongodb_replication_initial_snapshot",
+                    raw
+                )]))
+                .expect("valid value parses"),
+                expected,
+                "raw: {raw}"
+            );
+        }
+        let err = snapshot_mode_from_params(&params(&[(
+            "mongodb_replication_initial_snapshot",
+            "sometimes",
+        )]))
+        .expect_err("typo must error");
+        assert!(
+            format!("{err}").contains("mongodb_replication_initial_snapshot"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn invalid_checkpoint_behavior_prefers_canonical_over_deprecated_alias() {
+        // Default when neither key is set.
+        assert_eq!(
+            invalid_checkpoint_behavior_from_params(&params(&[])).expect("default parses"),
+            InvalidCheckpointBehavior::Error
+        );
+        // Canonical key + value.
+        assert_eq!(
+            invalid_checkpoint_behavior_from_params(&params(&[(
+                "mongodb_replication_invalid_checkpoint_behavior",
+                "restart"
+            )]))
+            .expect("canonical parses"),
+            InvalidCheckpointBehavior::Restart
+        );
+        // Deprecated alias still honored.
+        assert_eq!(
+            invalid_checkpoint_behavior_from_params(&params(&[(
+                "mongodb_resume_token_invalid_behavior",
+                "rebootstrap"
+            )]))
+            .expect("deprecated alias parses"),
+            InvalidCheckpointBehavior::Restart
+        );
+        // Canonical wins when both are set.
+        assert_eq!(
+            invalid_checkpoint_behavior_from_params(&params(&[
+                ("mongodb_replication_invalid_checkpoint_behavior", "error"),
+                ("mongodb_resume_token_invalid_behavior", "rebootstrap"),
+            ]))
+            .expect("both set parses"),
+            InvalidCheckpointBehavior::Error
+        );
+        // Canonical key rejects the deprecated value vocabulary.
+        let err = invalid_checkpoint_behavior_from_params(&params(&[(
+            "mongodb_replication_invalid_checkpoint_behavior",
+            "rebootstrap",
+        )]))
+        .expect_err("deprecated value on canonical key must error");
+        assert!(
+            format!("{err}").contains("'error' or 'restart'"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn ready_lag_defaults_and_parses() {
+        assert_eq!(
+            ready_lag_from_params(&params(&[])).expect("default parses"),
+            DEFAULT_READY_LAG
+        );
+        assert_eq!(
+            ready_lag_from_params(&params(&[("mongodb_replication_ready_lag", "5s")]))
+                .expect("valid duration parses"),
+            Duration::from_secs(5)
+        );
+        let err = ready_lag_from_params(&params(&[("mongodb_replication_ready_lag", "nope")]))
+            .expect_err("invalid duration must error");
+        assert!(
+            format!("{err}").contains("mongodb_replication_ready_lag"),
+            "got: {err}"
+        );
     }
 
     #[test]

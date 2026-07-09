@@ -50,7 +50,9 @@ These optional runtime parameters live under dataset `params:`; most are not pre
 - `change_stream_batch_max_duration` (default `1s`): Maximum time to wait for a Change Stream batch to fill before applying it. Accepts [fundu](https://docs.rs/fundu) duration strings and must be greater than 0.
 - `change_stream_max_await_time` (default `1s`): Maximum time MongoDB waits for new Change Stream events before returning an empty server batch. Accepts [fundu](https://docs.rs/fundu) duration strings and must be greater than 0.
 - `change_stream_batch_size` (default `1000`): Number of Change Stream events MongoDB should request from the server per batch. Must fit in a `u32` and be greater than 0.
-- `mongodb_resume_token_invalid_behavior` (default `error`): Behavior when a persisted Change Stream resume token cannot be honored by the server (e.g. it is past the oplog retention window). `error` surfaces a clear error so the operator can decide; `rebootstrap` drops the persisted token and re-snapshots the collection.
+- `mongodb_replication_initial_snapshot` (default `auto`): When the collection's existing documents load: `auto` snapshots when no resumable resume token exists and resumes without a snapshot when one does; `disabled` streams changes only from the current point; `enabled` snapshots on every start, discarding any persisted token.
+- `mongodb_replication_invalid_checkpoint_behavior` (default `error`): Behavior when a persisted Change Stream resume token cannot be honored by the server (e.g. it is past the oplog retention window). `error` surfaces a clear error so the operator can decide; `restart` drops the persisted token and re-snapshots the collection. (Deprecated alias: `mongodb_resume_token_invalid_behavior` with `error`/`rebootstrap`.)
+- `mongodb_replication_invalid_checkpoint_restart_readiness` (default `after_snapshot`): During a `restart`, when the dataset is marked Ready: `after_snapshot` (default) waits until the re-snapshot completes so no stale data is served; `before_snapshot` marks Ready immediately and re-snapshots in the background.
 
 The existing `mongodb_unnest_depth` parameter also applies to Change Stream documents, so nested BSON documents are flattened the same way as normal MongoDB reads.
 
@@ -69,7 +71,7 @@ For file-accelerated datasets (acceleration `mode: file` / `file_create` / `file
 
 The token is written once after the initial collection snapshot completes (piggy-backed onto the dataset-ready signal so a crash mid-snapshot still triggers a clean re-bootstrap), then re-written after each live Change Stream batch is persisted to the accelerator. The committer fires only once the downstream accelerator write has succeeded, so the persisted token always reflects data already in the accelerator (at-least-once semantics).
 
-On restart with a persisted token, Spice resumes the Change Stream from that token and skips the collection snapshot. If MongoDB rejects the token (typical codes `ChangeStreamHistoryLost` 286 or `ChangeStreamFatalError` 280, e.g. when the oplog window has rolled past the token's position), the behavior is governed by `mongodb_resume_token_invalid_behavior` above. Re-snapshotting a large collection is opt-in by default.
+On restart with a persisted token, Spice resumes the Change Stream from that token and skips the collection snapshot. If MongoDB rejects the token (typical codes `ChangeStreamHistoryLost` 286 or `ChangeStreamFatalError` 280, e.g. when the oplog window has rolled past the token's position), the behavior is governed by `mongodb_replication_invalid_checkpoint_behavior` above. Re-snapshotting a large collection is opt-in by default.
 
 Datasets that are not file-accelerated (in-memory Arrow, etc.) do not get a sidecar row; restarts re-bootstrap from a fresh snapshot.
 

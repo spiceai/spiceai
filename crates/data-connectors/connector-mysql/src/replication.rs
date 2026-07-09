@@ -30,10 +30,11 @@ use std::time::Duration;
 use async_stream::try_stream;
 use async_trait::async_trait;
 use data_components::cdc::{ChangesStream, StreamError};
+use data_components::cdc::{InitialSnapshotMode, InvalidCheckpointBehavior};
 use data_components::mysql_replication::{
-    BinlogPosition, InvalidPositionBehavior, NoopPositionStore, PersistedPosition, PositionStore,
-    ReplicationMetrics, ReplicationMetricsCollector, ReplicationParams, ReplicationStreamInput,
-    SnapshotMode, StoreError, derive_server_id, process_nonce, start_replication_stream,
+    BinlogPosition, NoopPositionStore, PersistedPosition, PositionStore, ReplicationMetrics,
+    ReplicationMetricsCollector, ReplicationParams, ReplicationStreamInput, StoreError,
+    derive_server_id, process_nonce, start_replication_stream,
 };
 use datafusion::sql::TableReference;
 use futures::StreamExt;
@@ -555,23 +556,7 @@ fn replication_params_from_connector_params(
         })?,
         None => derive_server_id(dataset_name, process_nonce()),
     };
-    let snapshot_mode = match optional_string(params, "replication_snapshot_mode")
-        .as_deref()
-        .map(str::trim)
-    {
-        None | Some("") => SnapshotMode::Auto,
-        Some(value) => match value.to_ascii_lowercase().as_str() {
-            "auto" => SnapshotMode::Auto,
-            "never" => SnapshotMode::Never,
-            "always" => SnapshotMode::Always,
-            other => {
-                let user_param = params.user_param("replication_snapshot_mode");
-                return Err(format!(
-                    "parameter `{user_param}` must be 'auto', 'never', or 'always', got {other:?}"
-                ));
-            }
-        },
-    };
+    let snapshot_mode = parse_snapshot_mode(params)?;
     let checkpoint_interval = optional_duration(
         params,
         "replication_checkpoint_interval",
@@ -583,23 +568,12 @@ fn replication_params_from_connector_params(
         DEFAULT_BOOTSTRAP_BATCH_SIZE,
         MAX_BOOTSTRAP_BATCH_SIZE,
     )?;
-    let invalid_position_behavior =
-        match optional_string(params, "replication_invalid_position_behavior")
-            .as_deref()
-            .map(str::trim)
-        {
-            None | Some("") => InvalidPositionBehavior::Error,
-            Some(value) => match value.to_ascii_lowercase().as_str() {
-                "error" => InvalidPositionBehavior::Error,
-                "rebootstrap" => InvalidPositionBehavior::Rebootstrap,
-                other => {
-                    let user_param = params.user_param("replication_invalid_position_behavior");
-                    return Err(format!(
-                        "parameter `{user_param}` must be 'error' or 'rebootstrap', got {other:?}"
-                    ));
-                }
-            },
-        };
+    let invalid_position_behavior = parse_invalid_checkpoint_behavior(params)?;
+    let ready_lag = optional_duration(
+        params,
+        "replication_ready_lag",
+        data_components::cdc::DEFAULT_READY_LAG,
+    )?;
 
     Ok(ReplicationParams {
         opts,
@@ -608,6 +582,7 @@ fn replication_params_from_connector_params(
         bootstrap_batch_size,
         checkpoint_interval,
         invalid_position_behavior,
+        ready_lag,
     })
 }
 
@@ -773,6 +748,85 @@ fn optional_usize_in_range(
     }
 }
 
+/// Parse an optional enum-valued parameter. Returns `Ok(None)` when the key is
+/// absent or empty; `Ok(Some(v))` when a recognized (case-insensitive) value
+/// maps via `map`; and an `Err` naming the user-facing parameter otherwise.
+fn optional_enum<T>(
+    params: &Parameters,
+    key: &str,
+    expected: &str,
+    map: impl Fn(&str) -> Option<T>,
+) -> Result<Option<T>, String> {
+    let Some(raw) = optional_string(params, key) else {
+        return Ok(None);
+    };
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    map(&trimmed.to_ascii_lowercase()).map(Some).ok_or_else(|| {
+        let user_param = params.user_param(key);
+        format!("parameter `{user_param}` must be {expected}, got {trimmed:?}")
+    })
+}
+
+/// Resolve the initial-snapshot mode, preferring the canonical
+/// `mysql_replication_initial_snapshot` (`auto|enabled|disabled`) and falling
+/// back to the deprecated `mysql_replication_snapshot_mode`
+/// (`auto|never|always`). Defaults to [`InitialSnapshotMode::Auto`] when neither is set.
+fn parse_snapshot_mode(params: &Parameters) -> Result<InitialSnapshotMode, String> {
+    if let Some(mode) = optional_enum(
+        params,
+        "replication_initial_snapshot",
+        "'auto', 'enabled', or 'disabled'",
+        InitialSnapshotMode::from_canonical,
+    )? {
+        return Ok(mode);
+    }
+    // Deprecated `mysql_replication_snapshot_mode` (auto|never|always).
+    Ok(optional_enum(
+        params,
+        "replication_snapshot_mode",
+        "'auto', 'never', or 'always'",
+        |value| match value {
+            "auto" => Some(InitialSnapshotMode::Auto),
+            "never" => Some(InitialSnapshotMode::Disabled),
+            "always" => Some(InitialSnapshotMode::Enabled),
+            _ => None,
+        },
+    )?
+    .unwrap_or_default())
+}
+
+/// Resolve the invalid-checkpoint behavior, preferring the canonical
+/// `mysql_replication_invalid_checkpoint_behavior` (`error|restart`) and falling
+/// back to the deprecated `mysql_replication_invalid_position_behavior`
+/// (`error|rebootstrap`). Defaults to [`InvalidCheckpointBehavior::Error`].
+fn parse_invalid_checkpoint_behavior(
+    params: &Parameters,
+) -> Result<InvalidCheckpointBehavior, String> {
+    if let Some(behavior) = optional_enum(
+        params,
+        "replication_invalid_checkpoint_behavior",
+        "'error' or 'restart'",
+        InvalidCheckpointBehavior::from_canonical,
+    )? {
+        return Ok(behavior);
+    }
+    // Deprecated `mysql_replication_invalid_position_behavior` (error|rebootstrap).
+    Ok(optional_enum(
+        params,
+        "replication_invalid_position_behavior",
+        "'error' or 'rebootstrap'",
+        |value| match value {
+            "error" => Some(InvalidCheckpointBehavior::Error),
+            "rebootstrap" => Some(InvalidCheckpointBehavior::Restart),
+            _ => None,
+        },
+    )?
+    .unwrap_or_default())
+}
+
 fn extract_primary_keys(provider: &Arc<dyn datafusion::datasource::TableProvider>) -> Vec<String> {
     use datafusion::common::Constraint;
     let Some(constraints) = provider.constraints() else {
@@ -852,13 +906,14 @@ mod tests {
         ]);
         let repl = replication_params_from_connector_params(&params, "orders")
             .expect("valid params parse");
-        assert_eq!(repl.snapshot_mode, SnapshotMode::Auto);
+        assert_eq!(repl.snapshot_mode, InitialSnapshotMode::Auto);
         assert_eq!(repl.bootstrap_batch_size, DEFAULT_BOOTSTRAP_BATCH_SIZE);
         assert_eq!(repl.checkpoint_interval, DEFAULT_CHECKPOINT_INTERVAL);
         assert_eq!(
             repl.invalid_position_behavior,
-            InvalidPositionBehavior::Error
+            InvalidCheckpointBehavior::Error
         );
+        assert_eq!(repl.ready_lag, data_components::cdc::DEFAULT_READY_LAG);
         assert!(
             repl.server_id >= 100_000,
             "derived id clears reserved range"
@@ -895,7 +950,7 @@ mod tests {
             .expect("valid params parse");
         assert_eq!(
             repl.invalid_position_behavior,
-            InvalidPositionBehavior::Rebootstrap
+            InvalidCheckpointBehavior::Restart
         );
 
         let params = params_with(&[("replication_invalid_position_behavior", "reboot")]);
@@ -907,9 +962,9 @@ mod tests {
     #[test]
     fn snapshot_mode_parses_strictly() {
         for (raw, expected) in [
-            ("auto", SnapshotMode::Auto),
-            ("never", SnapshotMode::Never),
-            ("ALWAYS", SnapshotMode::Always),
+            ("auto", InitialSnapshotMode::Auto),
+            ("never", InitialSnapshotMode::Disabled),
+            ("ALWAYS", InitialSnapshotMode::Enabled),
         ] {
             let params = params_with(&[("replication_snapshot_mode", raw)]);
             let repl = replication_params_from_connector_params(&params, "orders")
@@ -927,6 +982,90 @@ mod tests {
             err.contains("mysql_replication_snapshot_mode"),
             "got: {err}"
         );
+    }
+
+    #[test]
+    fn initial_snapshot_parses_strictly() {
+        for (raw, expected) in [
+            ("auto", InitialSnapshotMode::Auto),
+            ("disabled", InitialSnapshotMode::Disabled),
+            ("ENABLED", InitialSnapshotMode::Enabled),
+        ] {
+            let params = params_with(&[("replication_initial_snapshot", raw)]);
+            let repl = replication_params_from_connector_params(&params, "orders")
+                .expect("valid params parse");
+            assert_eq!(repl.snapshot_mode, expected, "raw: {raw}");
+        }
+
+        let params = params_with(&[("replication_initial_snapshot", "yes")]);
+        let err = replication_params_from_connector_params(&params, "orders")
+            .expect_err("typo'd mode must error");
+        assert!(
+            err.contains("mysql_replication_initial_snapshot")
+                && err.contains("'auto', 'enabled', or 'disabled'"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn invalid_checkpoint_behavior_parses_strictly() {
+        for (raw, expected) in [
+            ("error", InvalidCheckpointBehavior::Error),
+            ("RESTART", InvalidCheckpointBehavior::Restart),
+        ] {
+            let params = params_with(&[("replication_invalid_checkpoint_behavior", raw)]);
+            let repl = replication_params_from_connector_params(&params, "orders")
+                .expect("valid params parse");
+            assert_eq!(repl.invalid_position_behavior, expected, "raw: {raw}");
+        }
+
+        let params = params_with(&[("replication_invalid_checkpoint_behavior", "reboot")]);
+        let err = replication_params_from_connector_params(&params, "orders")
+            .expect_err("typo must error");
+        assert!(
+            err.contains("mysql_replication_invalid_checkpoint_behavior")
+                && err.contains("'error' or 'restart'"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn canonical_snapshot_key_wins_over_deprecated_alias() {
+        // Both set: the canonical `initial_snapshot` takes precedence over the
+        // deprecated `snapshot_mode`.
+        let params = params_with(&[
+            ("replication_initial_snapshot", "disabled"),
+            ("replication_snapshot_mode", "always"),
+        ]);
+        let repl = replication_params_from_connector_params(&params, "orders")
+            .expect("valid params parse");
+        assert_eq!(repl.snapshot_mode, InitialSnapshotMode::Disabled);
+
+        let params = params_with(&[
+            ("replication_invalid_checkpoint_behavior", "restart"),
+            ("replication_invalid_position_behavior", "error"),
+        ]);
+        let repl = replication_params_from_connector_params(&params, "orders")
+            .expect("valid params parse");
+        assert_eq!(
+            repl.invalid_position_behavior,
+            InvalidCheckpointBehavior::Restart
+        );
+    }
+
+    #[test]
+    fn ready_lag_parses_and_defaults() {
+        // Explicit duration is parsed.
+        let params = params_with(&[("replication_ready_lag", "500ms")]);
+        let repl = replication_params_from_connector_params(&params, "orders")
+            .expect("valid params parse");
+        assert_eq!(repl.ready_lag, std::time::Duration::from_millis(500));
+
+        // An unparseable duration errors, naming the user-facing parameter.
+        let params = params_with(&[("replication_ready_lag", "soon")]);
+        let err = replication_params_from_connector_params(&params, "orders")
+            .expect_err("unparseable duration must error");
+        assert!(err.contains("ready_lag"), "got: {err}");
     }
 
     #[test]

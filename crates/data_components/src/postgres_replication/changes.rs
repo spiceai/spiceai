@@ -320,11 +320,17 @@ pub fn envelope_with_lsn(
     confirmed_flush: Arc<AtomicU64>,
     flush_to: u64,
     is_dataset_ready: bool,
+    dataset: String,
 ) -> ChangeEnvelope {
+    // Capture the batch's source-commit timestamp before it's moved into the
+    // envelope, so the committer can log end-to-end lag when it acks progress.
+    let source_commit_ts_ms = batch.source_commit_ts_ms();
     ChangeEnvelope::new(
         Box::new(LsnCommitter {
             confirmed_flush,
             flush_to,
+            dataset,
+            source_commit_ts_ms,
         }),
         batch,
         is_dataset_ready,
@@ -337,6 +343,11 @@ pub fn envelope_with_lsn(
 struct LsnCommitter {
     confirmed_flush: Arc<AtomicU64>,
     flush_to: u64,
+    /// Dataset name, for the committer-progress log line.
+    dataset: String,
+    /// Source-commit timestamp (ms since the Unix epoch) of the batch this
+    /// commit acks; `None` for snapshot-boundary batches.
+    source_commit_ts_ms: Option<i64>,
 }
 
 #[async_trait]
@@ -347,7 +358,7 @@ impl CommitChange for LsnCommitter {
         let mut current = self.confirmed_flush.load(Ordering::Relaxed);
         loop {
             if self.flush_to <= current {
-                return Ok(());
+                break;
             }
             match self.confirmed_flush.compare_exchange(
                 current,
@@ -355,10 +366,17 @@ impl CommitChange for LsnCommitter {
                 Ordering::Release,
                 Ordering::Relaxed,
             ) {
-                Ok(_) => return Ok(()),
+                Ok(_) => break,
                 Err(actual) => current = actual,
             }
         }
+        crate::cdc::log_committer_progress(
+            "postgres",
+            &self.dataset,
+            &format!("lsn={}", self.flush_to),
+            self.source_commit_ts_ms,
+        );
+        Ok(())
     }
 
     /// The Postgres logical replication slot retains WAL until `confirmed_flush`
@@ -1142,6 +1160,8 @@ mod tests {
         let committer = LsnCommitter {
             confirmed_flush: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             flush_to: 42,
+            dataset: "test".to_string(),
+            source_commit_ts_ms: None,
         };
         assert!(committer.supports_deferral());
     }
@@ -1294,6 +1314,8 @@ mod tests {
         let c1 = LsnCommitter {
             confirmed_flush: Arc::clone(&lsn),
             flush_to: 100,
+            dataset: "test".to_string(),
+            source_commit_ts_ms: None,
         };
         c1.commit().await.expect("commit");
         assert_eq!(lsn.load(std::sync::atomic::Ordering::Relaxed), 100);
@@ -1302,6 +1324,8 @@ mod tests {
         let c2 = LsnCommitter {
             confirmed_flush: Arc::clone(&lsn),
             flush_to: 50,
+            dataset: "test".to_string(),
+            source_commit_ts_ms: None,
         };
         c2.commit().await.expect("commit");
         assert_eq!(lsn.load(std::sync::atomic::Ordering::Relaxed), 100);
