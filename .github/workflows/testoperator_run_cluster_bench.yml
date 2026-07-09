@@ -292,6 +292,13 @@ jobs:
           AWS_DEFAULT_REGION: us-east-1
           SCHEDULER_STATE_LOCATION: 's3://spiceai-testing-cluster-state/testoperator-cluster-bench-${{ github.run_id }}/'
           SPICEAI_BENCHMARK_METRICS_KEY: ${{ secrets.SPICEAI_BENCHMARK_METRICS_KEY }}
+          # Wait for all executors via GET /v1/apps/{id}/metrics
+          # (cluster.active_executors_count), not a fixed sleep. 9-exec private
+          # nodegroup bringup routinely exceeds the old 120s default.
+          SPIDAPTER_DEPLOYMENT_READY_WAIT: '600'
+          # Extra grace after metrics report all executors, so
+          # executor_bind_object_stores can finish before queries start.
+          SPIDAPTER_EXECUTOR_BIND_GRACE_SECS: '90'
           EXECUTOR_REPLICAS: ${{ env.CB_EXECUTOR_REPLICAS }}
           CHANNEL: ${{ env.CB_CHANNEL }}
           CUSTOM_IMAGE_TAG: ${{ env.CB_CUSTOM_IMAGE_TAG }}
@@ -394,7 +401,7 @@ jobs:
             ${TRANSPORT_FLAG} \
             ${SCENARIO_ARG} \
             --system-adapter-stdio-cmd spidapter \
-            --system-adapter-stdio-args "stdio --verbose --scenario federated-direct --scenario-base-path tools/spidapter/scenarios" \
+            --system-adapter-stdio-args "stdio --verbose --ready-wait 3000 --scenario federated-direct --scenario-base-path tools/spidapter/scenarios" \
             --system-adapter-param channel="${CHANNEL}" \
             --system-adapter-param executor_replicas="${EXECUTOR_REPLICAS}" \
             --system-adapter-param custom_image_tag="${CUSTOM_IMAGE_TAG}" \

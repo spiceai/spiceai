@@ -197,15 +197,42 @@ pub(crate) async fn provision_scp_app(
     .await?;
 
     if wait_for_ready && deployment_mode == &DeploymentMode::Cluster {
+        // Prefer waiting until the scheduler reports all executors registered
+        // (GET /v1/apps/{id}/metrics → cluster.active_executors_count) rather
+        // than a fixed sleep. Large private-nodegroup bringups (e.g. 9× i3.4xlarge)
+        // routinely take longer than the old 120s default.
         let executor_wait_timeout = std::env::var("SPIDAPTER_DEPLOYMENT_READY_WAIT")
             .ok()
             .and_then(|s| s.parse::<u64>().ok())
-            .unwrap_or(120);
+            .unwrap_or(300);
+        let expected_executors = u64::try_from(app_create_config.executor_replicas.max(0))
+            .unwrap_or(0)
+            .max(1);
 
-        eprintln!(
-            "[stdio] Deployment is ready, waiting an additional {executor_wait_timeout}s for executors to connect..."
-        );
-        tokio::time::sleep(Duration::from_secs(executor_wait_timeout)).await;
+        wait_for_scp_executor_count(
+            &cloud,
+            app_id,
+            expected_executors,
+            Duration::from_secs(executor_wait_timeout),
+        )
+        .await;
+
+        // `active_executors_count` increments when an executor registers with
+        // the scheduler, which happens before `executor_bind_object_stores`
+        // finishes. Queries that land in that window look up `s3://bucket`
+        // with no URL fragment, so AmazonS3Builder falls back to us-east-1 and
+        // caches a poisoned store for the rest of the run. Give bind a moment
+        // to complete before handing the app to the benchmark.
+        let bind_grace_secs = std::env::var("SPIDAPTER_EXECUTOR_BIND_GRACE_SECS")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(90);
+        if bind_grace_secs > 0 {
+            eprintln!(
+                "[stdio] Waiting an additional {bind_grace_secs}s for executor object-store binding..."
+            );
+            tokio::time::sleep(Duration::from_secs(bind_grace_secs)).await;
+        }
     }
 
     eprintln!("[stdio] Spice Cloud deployment ready for app '{app_name}' at {flight_url}");
@@ -226,7 +253,6 @@ pub(crate) async fn provision_scp_app(
     })))
 }
 
-#[expect(dead_code)]
 pub(crate) async fn wait_for_scp_executor_count(
     cloud: &CloudClient,
     app_id: i64,
@@ -234,11 +260,12 @@ pub(crate) async fn wait_for_scp_executor_count(
     timeout: Duration,
 ) {
     eprintln!(
-        "[stdio] Deployment is ready, waiting up to {}s for {expected_count} executor(s) to connect...",
+        "[stdio] Deployment is ready, waiting up to {}s for {expected_count} executor(s) to register (via /v1/apps/{app_id}/metrics)...",
         timeout.as_secs(),
     );
 
     let started = tokio::time::Instant::now();
+    let mut last_logged_count: Option<u64> = None;
 
     loop {
         if started.elapsed() > timeout {
@@ -251,11 +278,22 @@ pub(crate) async fn wait_for_scp_executor_count(
 
         match cloud.get_app_metrics(app_id, None).await {
             Ok(metrics) => {
-                if let Some(cluster) = &metrics.cluster
-                    && let Some(count) = cluster.active_executors_count
-                    && count >= expected_count
-                {
-                    eprintln!("[stdio] {count}/{expected_count} executor(s) connected");
+                let count = metrics
+                    .cluster
+                    .as_ref()
+                    .and_then(|c| c.active_executors_count)
+                    .unwrap_or(0);
+
+                if last_logged_count != Some(count) {
+                    eprintln!(
+                        "[stdio] {count}/{expected_count} executor(s) registered ({}s elapsed)",
+                        started.elapsed().as_secs(),
+                    );
+                    last_logged_count = Some(count);
+                }
+
+                if count >= expected_count {
+                    eprintln!("[stdio] All {expected_count} executor(s) registered");
                     return;
                 }
             }
