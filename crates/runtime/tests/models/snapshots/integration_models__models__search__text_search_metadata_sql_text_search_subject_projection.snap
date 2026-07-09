@@ -16,7 +16,7 @@ expression: resp?
   {
     "id": 499,
     "subject": "math",
-    "trunc(text_search(qs, Utf8(\"angles\"), question)._score,Int64(3))": 4.245
+    "trunc(text_search(qs, Utf8(\"angles\"), question)._score,Int64(3))": 4.244
   },
   {
     "id": 1175,

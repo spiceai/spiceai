@@ -365,7 +365,7 @@ mod tests {
 
         let peeled = peel_table_provider_wrappers(&wrapped);
         assert!(
-            peeled.downcast_ref::<MemTable>().is_some(),
+            peeled.is::<MemTable>(),
             "peel must reach the inner provider through the metadata wrapper"
         );
     }
@@ -379,7 +379,7 @@ mod tests {
 
         let peeled = peel_table_provider_wrappers(&wrapped);
         assert!(
-            peeled.downcast_ref::<MemTable>().is_some(),
+            peeled.is::<MemTable>(),
             "peel must unwrap every nested metadata wrapper"
         );
     }
@@ -389,7 +389,7 @@ mod tests {
         let inner = mem_table();
         let peeled = peel_table_provider_wrappers(&inner);
         assert!(
-            peeled.downcast_ref::<MemTable>().is_some(),
+            peeled.is::<MemTable>(),
             "an unwrapped provider must be returned unchanged"
         );
     }

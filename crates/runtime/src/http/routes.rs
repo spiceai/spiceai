@@ -101,8 +101,6 @@ use tower_http::limit::RequestBodyLimitLayer;
         v1::workers::get,
         v1::nsql::get_context,
         v1::nsql::post,
-        v1::inference::get,
-        v1::inference::post,
         v1::tools::list,
         v1::tools::search,
         v1::tools::post,
@@ -407,8 +405,6 @@ pub(crate) fn routes(
 
         authenticated_router = authenticated_router
             .route("/v1/models", get(v1::models::get))
-            .route("/v1/models/{name}/predict", get(v1::inference::get))
-            .route("/v1/predict", post(v1::inference::post))
             .route("/v1/nsql/context", get(v1::nsql::get_context))
             .route("/v1/nsql", post(v1::nsql::post).layer(ModelContextLayer))
             .route(
@@ -424,7 +420,6 @@ pub(crate) fn routes(
             .merge(tools_router)
             .route("/v1/workers", get(v1::workers::get))
             .layer(Extension(rt.completion_llms()))
-            .layer(Extension(Arc::clone(&rt.models)))
             .layer(Extension(search))
             .layer(Extension(Arc::clone(&rt.embeds)))
             .layer(Extension(Arc::clone(&rt.workers)))
