@@ -1572,9 +1572,10 @@ impl RefreshTask {
             .iter()
             .map(cdc_item_memory_size)
             .fold(0_usize, usize::saturating_add);
-        // Row-level change count: each Ok envelope's ChangeBatch carries one row
-        // per source change event, so summing num_rows across the burst yields
-        // the true number of records applied.
+        // Row-level change count for the throughput metric. This sums
+        // `num_rows_hint()` (an upper bound: a primary-key-changing UPDATE may
+        // expand to two rows and is only counted exactly after the build), so it
+        // over-estimates slightly rather than forcing a build here just to count.
         let burst_rows: u64 = burst
             .iter()
             .filter_map(|item| item.as_ref().ok())

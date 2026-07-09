@@ -1578,6 +1578,11 @@ async fn deliver_commit(
         if raw.is_empty() {
             continue;
         }
+        // The handle is the one cached at Relation time. If the member detached
+        // mid-connection its `Arc` lives on here (pinned by the route) but its
+        // receiver is gone, so the `deliver_to_member` send below returns
+        // `ReceiverGone` and we detach it there — no separate liveness re-check
+        // is needed, and its ack floor never advances past this commit.
         let Some((member_key, member)) = routes.get(&relation_id) else {
             continue;
         };
