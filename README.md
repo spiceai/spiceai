@@ -586,13 +586,13 @@ Comprehensive documentation at [spiceai.org/docs](https://spiceai.org/docs/).
 
 Spice.ai is designed to be extensible. See [EXTENSIBILITY.md](./docs/EXTENSIBILITY.md) to build custom [Data Connectors](https://spiceai.org/docs/components/data-connectors), [Data Accelerators](https://spiceai.org/docs/components/data-accelerators), [Catalog Connectors](https://spiceai.org/docs/components/catalogs), [Secret Stores](https://spiceai.org/docs/components/secret-stores), [Models](https://spiceai.org/docs/components/models), or [Embeddings](https://spiceai.org/docs/components/embeddings).
 
-### 🔨 Roadmap
+### 🔨 Releases & Roadmap
 
-🚀 See the [Roadmap](https://github.com/spiceai/spiceai/blob/trunk/docs/ROADMAP.md). Highlights:
+🚀 See the full [Roadmap](https://github.com/spiceai/spiceai/blob/trunk/docs/ROADMAP.md). Recent releases and what's next:
 
-- **[v2.0](https://github.com/spiceai/spiceai/milestone/58) (now available)** — CDC replication for operational databases (Postgres/MySQL/MongoDB), Cayenne GA, multi-active HA GA, distributed query GA, mTLS, Cedar policy engine (Beta). [Read the launch →](https://spice.ai/blog/spice-2-0-is-now-available)
-- **[v2.1](https://github.com/spiceai/spiceai/milestone/95) (July 2026)** — Distributed search, schema registry, schema evolution
-- **[v2.2](https://github.com/spiceai/spiceai/milestone/99) (September 2026)** — Webhooks, reactive event-driven actions (Drasi-based)
+- **[v2.0](https://spiceai.org/releases/v2.0-stable)** (shipped, June 2026) — Spice Cayenne GA, multi-active HA distributed query GA, native CDC (PostgreSQL WAL, MongoDB change streams, Kafka), DML/DDL write-back, mTLS + OIDC, HashiCorp Vault & Azure Key Vault, and SQL/HTTP UDFs. [Read the launch →](https://spice.ai/blog/spice-2-0-is-now-available)
+- **[v2.1](https://spiceai.org/releases/v2.1.0)** (shipped, July 2026) — High-throughput Cayenne CDC (in-memory tier + dedicated compaction runtime), PostgreSQL replication at scale (shared replication slot), distributed Iceberg scans and broadcast joins, DataFusion v54, tensor-parallel GLM inference, and adaptive self-tuning (experimental).
+- **[v2.2](https://github.com/spiceai/spiceai/milestone/99)** (upcoming, targeting September 2026) — Webhooks and reactive event-driven actions (Drasi-based).
 
 ### 🤝 Connect with us
 
