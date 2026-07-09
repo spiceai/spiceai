@@ -16,13 +16,25 @@ limitations under the License.
 
 //! Criterion benchmarks for `cosine_distance` UDF.
 //!
-//! Two groups are measured:
-//! - `fsl_f32`: `FixedSizeList<Float32, N>` inputs → SIMD path via `simsimd`.
-//! - `list_f32`: `List<Float32>` inputs → scalar fallback path.
+//! Three groups are measured:
+//!
+//! - `fsl_f32/simd`: `FixedSizeList<Float32, N>` inputs via `cosine_distance_inner`
+//!   (dispatches to simsimd).
+//! - `fsl_f32/scalar`: `FixedSizeList<Float32, N>` inputs with a plain Rust loop
+//!   that bypasses SIMD entirely (dot product + norms).
+//! - `list_f32/spice_scalar`: `List<Float32>` inputs via `cosine_distance_inner`
+//!   (hits the scalar fallback path).
+//! - `list_f32/datafusion`: `List<Float32>` inputs via `datafusion_functions_nested`
+//!   `ArrayDistance`.
 
-use arrow::array::{ArrayRef, FixedSizeListArray, Float32Builder, ListBuilder};
+use arrow::array::{
+    Array, ArrayRef, FixedSizeListArray, Float32Array, Float32Builder, ListBuilder,
+};
 use arrow_schema::{DataType, Field};
 use criterion::{BatchSize, BenchmarkId, Criterion, criterion_group, criterion_main};
+use datafusion::config::ConfigOptions;
+use datafusion::logical_expr::{ColumnarValue, ScalarFunctionArgs, ScalarUDFImpl};
+use datafusion_functions_nested::distance::ArrayDistance;
 use runtime_datafusion_udfs::cosine_distance::cosine_distance_inner;
 use std::sync::Arc;
 
@@ -62,54 +74,160 @@ fn build_list_f32(rows: usize, dim: usize) -> ArrayRef {
 }
 
 // ---------------------------------------------------------------------------
+// Scalar FSL cosine distance — plain Rust loop, no SIMD
+//
+// Extracts the flat f32 buffer from both `FixedSizeList<Float32>` arrays and
+// computes cosine distance with a simple dot-product + norm loop so that
+// benchmarks can measure the raw SIMD speed-up without calling
+// `cosine_distance_inner`.
+// ---------------------------------------------------------------------------
+
+fn scalar_fsl_cosine_distance(a: &ArrayRef, b: &ArrayRef) -> Vec<Option<f64>> {
+    let fsl_a = a
+        .as_any()
+        .downcast_ref::<FixedSizeListArray>()
+        .expect("FixedSizeListArray");
+    let fsl_b = b
+        .as_any()
+        .downcast_ref::<FixedSizeListArray>()
+        .expect("FixedSizeListArray");
+    let dim = fsl_a.value_length() as usize;
+
+    // The values child of a FixedSizeListArray is a flat Float32Array.
+    let flat_a = fsl_a
+        .values()
+        .as_any()
+        .downcast_ref::<Float32Array>()
+        .expect("Float32Array values");
+    let flat_b = fsl_b
+        .values()
+        .as_any()
+        .downcast_ref::<Float32Array>()
+        .expect("Float32Array values");
+
+    let rows = fsl_a.len();
+    let mut results = Vec::with_capacity(rows);
+
+    for row in 0..rows {
+        let start = row * dim;
+        let end = start + dim;
+
+        let slice_a = flat_a.values().get(start..end).unwrap_or(&[]);
+        let slice_b = flat_b.values().get(start..end).unwrap_or(&[]);
+
+        let mut dot: f64 = 0.0;
+        let mut norm_a: f64 = 0.0;
+        let mut norm_b: f64 = 0.0;
+
+        for (&x, &y) in slice_a.iter().zip(slice_b.iter()) {
+            let xf = f64::from(x);
+            let yf = f64::from(y);
+            dot += xf * yf;
+            norm_a += xf * xf;
+            norm_b += yf * yf;
+        }
+
+        let denom = norm_a.sqrt() * norm_b.sqrt();
+        let dist = if denom == 0.0 || !denom.is_finite() {
+            None
+        } else {
+            Some((1.0 - dot / denom) / 2.0)
+        };
+        results.push(dist);
+    }
+
+    results
+}
+
+// ---------------------------------------------------------------------------
 // Benchmark groups
 // ---------------------------------------------------------------------------
 
-fn bench_fsl_simd(c: &mut Criterion) {
-    let mut group = c.benchmark_group("cosine_distance/fsl_f32 (SIMD)");
+/// Group 1: `FixedSizeList<Float32>` — SIMD (via `cosine_distance_inner`) vs scalar loop.
+fn bench_fsl_f32(c: &mut Criterion) {
+    let mut group = c.benchmark_group("cosine_distance/fsl_f32");
 
     for &rows in &[1_000_usize, 10_000_usize] {
         for &dim in &[128_usize, 512_usize, 1536_usize] {
-            group.bench_with_input(
-                BenchmarkId::new(format!("rows={rows}"), format!("dim={dim}")),
-                &(rows, dim),
-                |b, &(rows, dim)| {
-                    b.iter_batched(
-                        || (build_fsl_f32(rows, dim), build_fsl_f32(rows, dim)),
-                        |(a, b)| cosine_distance_inner(&[std::hint::black_box(a), std::hint::black_box(b)])
-                            .expect("ok"),
-                        BatchSize::LargeInput,
-                    );
-                },
-            );
+            let id = BenchmarkId::new(format!("simd/rows={rows}"), format!("dim={dim}"));
+            group.bench_with_input(id, &(rows, dim), |b, &(rows, dim)| {
+                b.iter_batched(
+                    || (build_fsl_f32(rows, dim), build_fsl_f32(rows, dim)),
+                    |(a, b)| {
+                        cosine_distance_inner(&[std::hint::black_box(a), std::hint::black_box(b)])
+                            .expect("ok")
+                    },
+                    BatchSize::LargeInput,
+                );
+            });
+
+            let id = BenchmarkId::new(format!("scalar/rows={rows}"), format!("dim={dim}"));
+            group.bench_with_input(id, &(rows, dim), |b, &(rows, dim)| {
+                b.iter_batched(
+                    || (build_fsl_f32(rows, dim), build_fsl_f32(rows, dim)),
+                    |(a, b)| {
+                        std::hint::black_box(scalar_fsl_cosine_distance(
+                            &std::hint::black_box(a),
+                            &std::hint::black_box(b),
+                        ))
+                    },
+                    BatchSize::LargeInput,
+                );
+            });
         }
     }
 
     group.finish();
 }
 
-fn bench_list_scalar(c: &mut Criterion) {
-    let mut group = c.benchmark_group("cosine_distance/list_f32 (scalar)");
+/// Group 2: `List<Float32>` — Spice scalar fallback vs DataFusion `ArrayDistance`.
+fn bench_list_f32(c: &mut Criterion) {
+    let mut group = c.benchmark_group("cosine_distance/list_f32");
+
+    let return_field = Arc::new(arrow_schema::Field::new("result", DataType::Float64, true));
 
     for &rows in &[1_000_usize, 10_000_usize] {
         for &dim in &[128_usize, 512_usize, 1536_usize] {
-            group.bench_with_input(
-                BenchmarkId::new(format!("rows={rows}"), format!("dim={dim}")),
-                &(rows, dim),
-                |b, &(rows, dim)| {
-                    b.iter_batched(
-                        || (build_list_f32(rows, dim), build_list_f32(rows, dim)),
-                        |(a, b)| cosine_distance_inner(&[std::hint::black_box(a), std::hint::black_box(b)])
-                            .expect("ok"),
-                        BatchSize::LargeInput,
-                    );
-                },
-            );
+            let id =
+                BenchmarkId::new(format!("spice_scalar/rows={rows}"), format!("dim={dim}"));
+            group.bench_with_input(id, &(rows, dim), |b, &(rows, dim)| {
+                b.iter_batched(
+                    || (build_list_f32(rows, dim), build_list_f32(rows, dim)),
+                    |(a, b)| {
+                        cosine_distance_inner(&[std::hint::black_box(a), std::hint::black_box(b)])
+                            .expect("ok")
+                    },
+                    BatchSize::LargeInput,
+                );
+            });
+
+            let id =
+                BenchmarkId::new(format!("datafusion/rows={rows}"), format!("dim={dim}"));
+            let return_field = Arc::clone(&return_field);
+            group.bench_with_input(id, &(rows, dim), |b, &(rows, dim)| {
+                b.iter_batched(
+                    || (build_list_f32(rows, dim), build_list_f32(rows, dim)),
+                    |(a, b)| {
+                        let args = ScalarFunctionArgs {
+                            args: vec![
+                                ColumnarValue::Array(std::hint::black_box(a)),
+                                ColumnarValue::Array(std::hint::black_box(b)),
+                            ],
+                            arg_fields: vec![],
+                            number_rows: rows,
+                            return_field: Arc::clone(&return_field),
+                            config_options: Arc::new(ConfigOptions::default()),
+                        };
+                        ArrayDistance::new().invoke_with_args(args).expect("ok")
+                    },
+                    BatchSize::LargeInput,
+                );
+            });
         }
     }
 
     group.finish();
 }
 
-criterion_group!(benches, bench_fsl_simd, bench_list_scalar);
+criterion_group!(benches, bench_fsl_f32, bench_list_f32);
 criterion_main!(benches);
