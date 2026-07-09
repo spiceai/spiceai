@@ -64,6 +64,13 @@ pub struct HtapArgs {
     #[arg(long)]
     pub(crate) metrics_dump: Option<PathBuf>,
 
+    /// Write a human-readable Markdown results summary (headline tpmC, QPH, worst
+    /// replication lag, and the per-query latency table) to this path when the run
+    /// completes. CI appends it to the GitHub Actions job summary so the headline
+    /// results are visible without opening the run log.
+    #[arg(long)]
+    pub(crate) summary_out: Option<PathBuf>,
+
     /// Fail the run if any changes-mode table's apply-phase coverage (instrumented
     /// write-phase time ÷ apply-burst wall time) falls below this fraction (0.0–1.0).
     /// A low ratio means a CDC apply bottleneck hides in un-instrumented code. Default

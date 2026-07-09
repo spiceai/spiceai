@@ -12,12 +12,18 @@ limitations under the License.
 */
 use snafu::Snafu;
 
+pub mod acceleration;
+pub mod acceleration_source;
 pub mod dataset_checkpoint;
 mod engine;
 pub mod layout;
 pub mod snapshot;
 
+pub use acceleration::Acceleration;
+pub use acceleration::ParseError as AccelerationParseError;
+pub use acceleration_source::AccelerationSource;
 pub use engine::Engine;
+pub use snapshot::SnapshotDownloadInfo;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -25,4 +31,47 @@ pub enum Error {
         "Unknown acceleration engine '{name}'. Valid engines are: arrow, duckdb, sqlite, turso, postgres/postgresql, cayenne/vortex. Docs: https://spiceai.org/docs/components/data-accelerators"
     ))]
     AcceleratorEngineNotAvailable { name: String },
+}
+
+/// Indicates whether a data accelerator was bootstrapped (initialized from existing data)
+/// during initialization, and carries any metadata from the snapshot.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BootstrapStatus {
+    Bootstrapped(SnapshotDownloadInfo),
+    None,
+}
+
+impl BootstrapStatus {
+    #[must_use]
+    pub const fn bootstrapped(info: SnapshotDownloadInfo) -> Self {
+        Self::Bootstrapped(info)
+    }
+
+    #[must_use]
+    pub const fn none() -> Self {
+        Self::None
+    }
+
+    #[must_use]
+    pub fn is_bootstrapped(&self) -> bool {
+        matches!(self, Self::Bootstrapped { .. })
+    }
+
+    #[must_use]
+    pub const fn last_updated_at(&self) -> Option<i64> {
+        match self {
+            Self::None => None,
+            Self::Bootstrapped(info) => info.last_updated_at,
+        }
+    }
+
+    /// The `snapshot_id` of the snapshot that was loaded at bootstrap, if any.
+    /// `None` when no bootstrap occurred (no snapshot, or snapshots disabled).
+    #[must_use]
+    pub const fn loaded_snapshot_id(&self) -> Option<u64> {
+        match self {
+            Self::None => None,
+            Self::Bootstrapped(info) => Some(info.snapshot_id),
+        }
+    }
 }

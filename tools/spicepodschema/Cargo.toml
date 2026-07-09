@@ -72,3 +72,6 @@ connector-snowflake = { path = "../../crates/data-connectors/connector-snowflake
 connector-spark = { path = "../../crates/data-connectors/connector-spark" }
 
 runtime-parameters = { path = "../../crates/runtime-parameters" }
+
+[lints]
+workspace = true

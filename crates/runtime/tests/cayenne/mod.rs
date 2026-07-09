@@ -584,10 +584,7 @@ async fn test_cayenne_s3_express_multi_zone_live() -> Result<(), String> {
                 .get_accelerated_table_provider(&table_name)
                 .await
                 .map_err(|e| format!("failed to resolve accelerated provider: {e}"))?;
-            if accelerated_provider
-                .downcast_ref::<AcceleratedTable>()
-                .is_none()
-            {
+            if !accelerated_provider.is::<AcceleratedTable>() {
                 return Err(format!(
                     "Expected provider for {table_name} to be AcceleratedTable in {zone_count}-zone scenario"
                 ));
@@ -2071,7 +2068,7 @@ async fn query_single_i64(rt: &Runtime, sql: &str) -> Result<i64, String> {
 
 /// Full datalake-tier cycle against real S3:
 /// registration probe → warm load (append mode; the datalake tier supports
-/// refresh_mode 'changes' and 'append' only) → background promotion to the
+/// `refresh_mode` 'changes' and 'append' only) → background promotion to the
 /// datalake → cross-tier query correctness → restart with a tuned param
 /// (reconciled, re-appended rows upsert-dedupe against the promoted data).
 ///
