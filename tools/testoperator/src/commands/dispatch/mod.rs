@@ -237,13 +237,13 @@ pub async fn dispatch(args: DispatchArgs) -> Result<()> {
         };
         match result {
             Err(e) => {
-                eprintln!("Failed to dispatch {}. Error: {e:?}", path.display());
+                eprintln!("❌ Failed to dispatch {}. Error: {e:?}", path.display());
                 failed_dispatches.push((path.display().to_string(), e));
                 continue;
             }
             Ok(run_url) => {
                 // sleep to space out runs
-                println!("Run: {run_url}. Waiting for next run...");
+                println!("✅ {run_url} is running");
                 tokio::time::sleep(std::time::Duration::from_secs(80)).await;
             }
         }

@@ -15,7 +15,7 @@ limitations under the License.
 */
 
 use http_body_util::BodyExt;
-use octocrab::{Octocrab, actions::ActionsHandler, map_github_error};
+use octocrab::{OctoBody, Octocrab, actions::ActionsHandler, map_github_error};
 use serde::Deserialize;
 use serde_json::Value;
 use tonic::transport::Uri;
@@ -63,13 +63,15 @@ impl GitHubWorkflow {
         Ok(())
     }
 
-    /// A reimplementation of [`octocrab::actions::WorkflowDispatchBuilder::send`] that returns the workflow run URL.
+    /// Dispatches the GitHub workflow and returns the workflow run URL.
+    ///
+    /// Requires `X-GitHub-Api-Version: 2026-03-10` which causes the dispatch
+    /// endpoint to return a 201 response with `run_url` instead of 204 No Content.
     pub async fn run_workflow(
         &self,
         crab: &Octocrab,
         input: Option<Value>,
     ) -> anyhow::Result<String> {
-        // [`WorkflowDispatch`] is `non_exhaustive`.
         let body = serde_json::json!({
             "ref": &self.r#ref,
             "inputs": input.unwrap_or(Value::Null)
@@ -84,15 +86,25 @@ impl GitHubWorkflow {
 
         #[derive(Deserialize)]
         struct WorkflowDispatchResponse {
-            run_url: String,
-            #[allow(dead_code)]
             html_url: String,
         }
-        let response = map_github_error(crab._post(uri, Some(&body)).await?).await?;
-        let body = response.into_body().collect().await?.to_bytes();
-        let WorkflowDispatchResponse { run_url, .. } =
-            serde_json::from_slice::<WorkflowDispatchResponse>(&body)?;
-        Ok(run_url)
+
+        // Build the request manually to set X-GitHub-Api-Version: 2026-03-10.
+        // octocrab's `build_request` bakes in 2022-11-28 via _SET_HEADERS_MAP, which
+        // would produce a comma-joined invalid header. Auth/User-Agent are still injected
+        // by the middleware in `execute`.
+        let serialized = serde_json::to_string(&body)?;
+        let request = http::Request::builder()
+            .method(http::Method::POST)
+            .uri(uri)
+            .header(http::header::CONTENT_TYPE, "application/json")
+            .header("X-GitHub-Api-Version", "2026-03-10")
+            .body(OctoBody::from(serialized))?;
+        let response = map_github_error(crab.execute(request).await?).await?;
+        let bytes = response.into_body().collect().await?.to_bytes();
+        let WorkflowDispatchResponse { html_url } =
+            serde_json::from_slice::<WorkflowDispatchResponse>(&bytes)?;
+        Ok(html_url)
     }
 
     /// Returns the number of active workflow runs for this workflow.
