@@ -789,7 +789,9 @@ async fn attach_member(
         // WAL envelopes and the pump's keepalive heartbeats (see `deliver_commit`
         // and `run_pump`'s KeepAlive handling), not an immediate resume-time
         // ready signal that could mark a still-behind member Ready.
-        Box::pin(stream::empty::<std::result::Result<ChangeEnvelope, StreamError>>())
+        Box::pin(stream::empty::<
+            std::result::Result<ChangeEnvelope, StreamError>,
+        >())
     };
 
     Ok(Box::pin(head.chain(ReceiverStream::new(receiver))))
@@ -1376,8 +1378,7 @@ async fn deliver_commit(
         // its source commit time is within the member's `ready_lag` of now, i.e.
         // the member has caught up to the source head. A backlog (post-snapshot
         // gap replay, resume catch-up) keeps the dataset not-ready until closed.
-        let is_ready =
-            crate::cdc::source_commit_within_ready_lag(commit_ts_ms, member.ready_lag);
+        let is_ready = crate::cdc::source_commit_within_ready_lag(commit_ts_ms, member.ready_lag);
         let envelope = ChangeEnvelope::new(
             Box::new(SharedLsnCommitter {
                 ack: Arc::clone(&source.ack),

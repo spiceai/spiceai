@@ -364,7 +364,9 @@ async fn start_inner(input: ReplicationStreamInput) -> Result<ChangesStream> {
         metrics.mark_bootstrap_complete();
         (
             position,
-            Box::pin(stream::empty::<std::result::Result<ChangeEnvelope, StreamError>>()),
+            Box::pin(stream::empty::<
+                std::result::Result<ChangeEnvelope, StreamError>,
+            >()),
         )
     } else {
         // Cold start: capture the binlog head BEFORE any snapshot so the
@@ -413,7 +415,9 @@ async fn start_inner(input: ReplicationStreamInput) -> Result<ChangesStream> {
             // once it has caught up to the head captured above.
             (
                 head,
-                Box::pin(stream::empty::<std::result::Result<ChangeEnvelope, StreamError>>()),
+                Box::pin(stream::empty::<
+                    std::result::Result<ChangeEnvelope, StreamError>,
+                >()),
             )
         } else {
             // Lead with a TRUNCATE envelope so a re-bootstrap over a

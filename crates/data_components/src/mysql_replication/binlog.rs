@@ -879,7 +879,9 @@ fn readiness_heartbeat(
         "CDC idle heartbeat emitted"
     );
     build_heartbeat_envelope(schema, Some(source_now_ms), is_ready).map_err(|e| {
-        StreamError::External(format!("heartbeat envelope build failed for {dataset_name}: {e}"))
+        StreamError::External(format!(
+            "heartbeat envelope build failed for {dataset_name}: {e}"
+        ))
     })
 }
 
