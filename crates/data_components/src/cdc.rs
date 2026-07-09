@@ -303,6 +303,15 @@ impl LazyChangeBatch {
         self.built.get().context(DeferredBatchConsumedSnafu)
     }
 
+    /// Whether the batch is already built — an eager envelope, or a deferred
+    /// one whose build has already run — so [`Self::into_built`] and the
+    /// metadata accessors resolve without running a (possibly expensive)
+    /// deferred build. Lets callers skip a `spawn_blocking` offload they'd
+    /// only pay overhead for.
+    fn is_materialized(&self) -> bool {
+        self.built.get().is_some()
+    }
+
     /// Consume into the owned built batch, building if needed.
     fn into_built(self) -> Result<ChangeBatch, ChangeBatchError> {
         if let Some(batch) = self.built.into_inner() {
@@ -467,11 +476,37 @@ impl ChangeEnvelope {
     }
 
     /// Consume the envelope into its parts, building a deferred batch if needed.
+    ///
+    /// The build is synchronous CPU work — for a deferred envelope under a
+    /// large burst it can run well past the async runtime's ~100µs-per-await
+    /// budget. Prefer [`Self::into_parts_offloaded`] from an async task; reserve
+    /// this for synchronous contexts or already-materialized envelopes.
     pub fn into_parts(
         self,
     ) -> Result<(Box<dyn CommitChange + Send + Sync>, ChangeBatch, bool), ChangeBatchError> {
         let batch = self.change_batch.into_built()?;
         Ok((self.change_committer, batch, self.is_dataset_ready))
+    }
+
+    /// [`Self::into_parts`] for async callers: a *deferred* envelope's
+    /// synchronous Arrow build is offloaded to a blocking thread so it cannot
+    /// stall the async worker (and, with it, `/health`) under a large burst.
+    ///
+    /// An already-materialized (eager) envelope resolves inline — its build is
+    /// a no-op, and `spawn_blocking` dispatch would only add overhead to that
+    /// hot path.
+    pub async fn into_parts_offloaded(
+        self,
+    ) -> Result<(Box<dyn CommitChange + Send + Sync>, ChangeBatch, bool), ChangeBatchError> {
+        if self.change_batch.is_materialized() {
+            return self.into_parts();
+        }
+        match tokio::task::spawn_blocking(move || self.into_parts()).await {
+            Ok(parts) => parts,
+            Err(join_err) => Err(ChangeBatchError::DeferredBuild {
+                message: format!("deferred CDC batch build task failed: {join_err}"),
+            }),
+        }
     }
 
     #[must_use]

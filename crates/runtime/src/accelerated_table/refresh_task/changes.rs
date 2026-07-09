@@ -1297,7 +1297,7 @@ impl RefreshTask {
             // (`last_cycle_start`) is reached.
             let mut burst: Vec<Result<cdc::ChangeEnvelope, cdc::StreamError>> =
                 Vec::with_capacity(8);
-            let mut burst_bytes = cdc_item_memory_size(&first);
+            let mut burst_bytes = cdc_item_budget_bytes(&first);
             burst.push(first);
             let max_burst = cdc_cfg.max_coalesced_envelopes;
             let max_burst_bytes = cdc_cfg.max_coalesced_bytes;
@@ -1309,7 +1309,7 @@ impl RefreshTask {
             while burst.len() < max_burst {
                 match rx.try_recv() {
                     Ok(item) => {
-                        let item_bytes = cdc_item_memory_size(&item);
+                        let item_bytes = cdc_item_budget_bytes(&item);
                         if burst_bytes > 0
                             && item_bytes > 0
                             && burst_bytes.saturating_add(item_bytes) > max_burst_bytes
@@ -1356,7 +1356,7 @@ impl RefreshTask {
                     // `rx.recv()` is cancel-safe, so a timeout drops no envelope.
                     match tokio::time::timeout(remaining, rx.recv()).await {
                         Ok(Some(item)) => {
-                            let item_bytes = cdc_item_memory_size(&item);
+                            let item_bytes = cdc_item_budget_bytes(&item);
                             if burst_bytes > 0
                                 && item_bytes > 0
                                 && burst_bytes.saturating_add(item_bytes) > max_burst_bytes
@@ -1570,7 +1570,7 @@ impl RefreshTask {
         let burst_envelopes = u64::try_from(burst.len()).unwrap_or(u64::MAX);
         let burst_bytes = burst
             .iter()
-            .map(cdc_item_memory_size)
+            .map(cdc_item_budget_bytes)
             .fold(0_usize, usize::saturating_add);
         let labels = context.metric_labels.dataset();
         metrics::CDC_APPLY_BURST_ENVELOPES.record(burst_envelopes, labels);
@@ -1788,7 +1788,7 @@ impl RefreshTask {
             // DEFAULT); treat it as a terminal error for this dataset, mirroring
             // the eager path's pump-side fatal. Committers collected so far are
             // dropped without acking, so the source re-streams on reconnect.
-            let (committer, batch, _is_ready) = match env.into_parts() {
+            let (committer, batch, _is_ready) = match env.into_parts_offloaded().await {
                 Ok(parts) => parts,
                 Err(e) => {
                     let error_message = format!(
@@ -2901,11 +2901,13 @@ fn concat_change_batches(batches: &[ChangeBatch]) -> crate::accelerated_table::R
     })
 }
 
-fn cdc_item_memory_size(item: &Result<cdc::ChangeEnvelope, cdc::StreamError>) -> usize {
-    // `encoded_len` reports the coalescing byte budget WITHOUT forcing a build:
-    // a deferred (e.g. Postgres) envelope answers from its buffered wire size, a
-    // built one from its Arrow size. The actual Arrow build is deferred to apply
-    // time (`into_parts`), off the source's shared read path.
+fn cdc_item_budget_bytes(item: &Result<cdc::ChangeEnvelope, cdc::StreamError>) -> usize {
+    // A coalescing byte-budget proxy, NOT a true in-memory Arrow size:
+    // `encoded_len` answers WITHOUT forcing a build — a deferred (e.g. Postgres)
+    // envelope from a schema-aware estimate of its buffered wire size, a built
+    // one from its actual Arrow size. Used only to bound how much a single burst
+    // accumulates before applying; the real Arrow build is deferred to apply
+    // time (`into_parts_offloaded`), off the source's shared read path.
     item.as_ref().map_or(0, cdc::ChangeEnvelope::encoded_len)
 }
 

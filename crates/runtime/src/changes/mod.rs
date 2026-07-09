@@ -44,8 +44,9 @@ pub async fn index_change_envelope(
     })?;
 
     // Materialize a deferred batch here (this index wrapper transforms the
-    // stream before the accelerator consumes it).
-    let (change_committer, batch, is_dataset_ready) = envelope.into_parts()?;
+    // stream before the accelerator consumes it). Offload the synchronous build
+    // so a large deferred burst can't stall this async worker.
+    let (change_committer, batch, is_dataset_ready) = envelope.into_parts_offloaded().await?;
     let mut batches = vec![batch.data_batch()];
 
     for index in &indexes.0 {
