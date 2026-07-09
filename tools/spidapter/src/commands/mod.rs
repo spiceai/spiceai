@@ -259,12 +259,11 @@ pub(crate) async fn ensure_spice_cloud_app(
                 .cluster_name
                 .as_ref()
                 .is_none_or(|name| name.trim().is_empty())
+                && let Some(org) = &config.organization_tag
             {
-                if let Some(org) = &config.organization_tag {
-                    let org = org.trim();
-                    if !org.is_empty() {
-                        tags.insert("organization".to_string(), org.to_string());
-                    }
+                let org = org.trim();
+                if !org.is_empty() {
+                    tags.insert("organization".to_string(), org.to_string());
                 }
             }
             Some(tags)
