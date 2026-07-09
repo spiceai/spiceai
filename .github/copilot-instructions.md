@@ -40,6 +40,7 @@ make lint-rust-fix      # Auto-fix lint issues
 - **Layout**: source in `crates/` — most-touched: `runtime/` (orchestration), `data_components/` (`TableProvider` impls), `app/` (Spicepod parsing), `datafusion/` (extensions), `llms/`, `search/`; acceleration engines in `runtime-acceleration/` and `cayenne/` (native CDC-fed accelerator); per-concern `runtime-*` crates. Authoritative map: workspace `members` in root `Cargo.toml`.
 - **Extension points** (`docs/EXTENSIBILITY.md`): Data Connector, Data Accelerator, Catalog Connector, Secret Store, Model, Embedding.
 - **Acceleration wraps**: `AcceleratedTable` → `FederatedTable` → connector `TableProvider`.
+- **Cayenne doc**: `docs/cayenne/` holds a breadth-first technical reference for the `cayenne` crate (`cayenne.md`, source-grounded against `crates/cayenne`), built to a PDF artifact by `.github/workflows/cayenne_doc.yml`. **A PR that changes `crates/cayenne` behavior, config params, the metastore schema, or the CDC/compaction flows must be reviewed for whether it merits a `docs/cayenne/cayenne.md` update — make that update in the same PR where practical, and add a *Document changelog* row referencing the reviewed commit.** The doc must stay source-accurate; never let it state something the code no longer does.
 
 ## Rust standards
 
