@@ -203,7 +203,9 @@ cmd_check() {
   else
     echo "${NO} '${TARGET_BRANCH}' does not yet require sign-off. Run: scripts/signoff install --yes"
   fi
-  echo "$checks" | bullet "  - "
+  # `|| true`: bullet returns non-zero on an empty list, which under pipefail
+  # would otherwise make this (last) statement exit the command non-zero.
+  echo "$checks" | bullet "  - " || true
 }
 
 cmd_install() {
