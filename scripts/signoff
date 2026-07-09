@@ -97,6 +97,10 @@ ensure_clean_and_pushed() {
   if [[ -n "$(git log '@{push}..' --oneline)" ]]; then
     fail "branch has commits that aren't pushed — push them first, or pass -f"
   fi
+  # ...and not behind either, so HEAD is exactly the pushed tip under review.
+  if [[ -n "$(git log 'HEAD..@{push}' --oneline)" ]]; then
+    fail "branch is behind its remote — pull the latest, then sign off (or pass -f)"
+  fi
 }
 
 # --- commands ----------------------------------------------------------------
