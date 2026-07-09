@@ -12907,17 +12907,23 @@ impl CayenneTableProvider {
         Ok((cold_files, total_rows))
     }
 
-    /// Cold-tier graduation (storage-cascade bottom tier; v1 = whole-table).
+    /// Cold-tier graduation (storage-cascade bottom tier; incremental
+    /// carry-forward — promotion cost is proportional to the CHANGED data,
+    /// not total table size).
     ///
     /// When the warm tier has grown past `cayenne_cold_tier_warm_max_bytes` /
-    /// `_files`, graduate the table's whole durable content to the cold object
-    /// store: flush the in-RAM/inline tiers, read the canonical visible stream
-    /// (all deletes applied, single-version per key — the proven rewrite read),
+    /// `_files`: flush the in-RAM/inline tiers, classify the existing cold
+    /// manifest into dirty/clean against the durable tombstones
+    /// ([`Self::partition_cold_manifest_for_promotion`]), read the canonical
+    /// visible stream restricted to warm + dirty cold files (all deletes
+    /// applied, single-version per key — the proven rewrite read with a
+    /// [`super::cold_partition::ColdScanFileSubset`] session extension),
     /// Z-order cluster it, write read-optimized Vortex to the cold store, then
-    /// atomically register the cold files + overwrite-clear the warm tier + flip
-    /// to a fresh empty warm snapshot. Subsequent CDC writes accumulate in warm
-    /// again until the next graduation. Reuses `commit_overwrite` semantics, so a
-    /// crash is all-or-nothing.
+    /// atomically register the new files PLUS the carried-forward clean
+    /// manifest rows + overwrite-clear the warm tier + flip to a fresh empty
+    /// warm snapshot. Subsequent CDC writes accumulate in warm again until the
+    /// next graduation. Reuses `commit_overwrite` semantics, so a crash is
+    /// all-or-nothing.
     ///
     /// Returns `Ok(true)` if a graduation committed, `Ok(false)` if the cold tier
     /// is disabled, unsupported (position-delete), or not yet triggered.
@@ -12966,6 +12972,135 @@ impl CayenneTableProvider {
             }
         }
         result
+    }
+
+    /// Classify the cold manifest into dirty/clean for the carry-forward
+    /// promotion (see [`super::cold_partition`]).
+    ///
+    /// Tombstoned keys come from the DURABLE deletion vectors — the in-memory
+    /// key index stores only key hashes, but the DV rows persist the
+    /// `RowConverter`-encoded key bytes (Int64-PK tables persist raw
+    /// big-endian `i64`). The caller runs after the mem-tier/inline
+    /// checkpoints, so the durable set is complete.
+    ///
+    /// Every failure path degrades CONSERVATIVELY to all-dirty (= the v1
+    /// whole-table rewrite): correctness never depends on classification.
+    async fn partition_cold_manifest_for_promotion(
+        &self,
+        cold_files: Vec<crate::metadata::ColdTierFile>,
+    ) -> super::cold_partition::ColdFilePartition {
+        use super::cold_partition::{
+            ColdFilePartition, decode_int64_tombstone_keys, decode_tombstone_keys,
+            partition_cold_files,
+        };
+
+        let all_dirty = |cold_files: Vec<crate::metadata::ColdTierFile>| ColdFilePartition {
+            dirty: cold_files,
+            clean: Vec::new(),
+        };
+        if cold_files.is_empty() {
+            return ColdFilePartition {
+                dirty: Vec::new(),
+                clean: Vec::new(),
+            };
+        }
+
+        // Durable tombstone keys (bytes) from the deletion-vector files.
+        let delete_files = match self
+            .catalog
+            .get_table_delete_files(&self.table_metadata.table_id)
+            .await
+        {
+            Ok(files) => files,
+            Err(error) => {
+                tracing::warn!(
+                    target: "cayenne::compaction",
+                    table = self.table_metadata.table_name.as_str(),
+                    %error,
+                    "Carry-forward classification failed to list deletion vectors; rewriting all cold files"
+                );
+                return all_dirty(cold_files);
+            }
+        };
+        if delete_files.is_empty() {
+            // No tombstones can touch cold data: everything carries forward.
+            return ColdFilePartition {
+                dirty: Vec::new(),
+                clean: cold_files,
+            };
+        }
+        let read = tokio::task::spawn_blocking(move || {
+            super::delete::detect_deletion_type_and_read(delete_files)
+        })
+        .await;
+        let deleted_row_keys = match read {
+            Ok(Ok((_, deleted_row_keys, _, _))) => deleted_row_keys,
+            Ok(Err(error)) => {
+                tracing::warn!(
+                    target: "cayenne::compaction",
+                    table = self.table_metadata.table_name.as_str(),
+                    %error,
+                    "Carry-forward classification failed to read deletion vectors; rewriting all cold files"
+                );
+                return all_dirty(cold_files);
+            }
+            Err(join_error) => {
+                tracing::warn!(
+                    target: "cayenne::compaction",
+                    table = self.table_metadata.table_name.as_str(),
+                    %join_error,
+                    "Carry-forward classification reader task failed; rewriting all cold files"
+                );
+                return all_dirty(cold_files);
+            }
+        };
+        if deleted_row_keys.is_empty() {
+            return ColdFilePartition {
+                dirty: Vec::new(),
+                clean: cold_files,
+            };
+        }
+
+        // Decode the key bytes into per-column scalars for the rectangle test.
+        let key_bytes: Vec<Box<[u8]>> = deleted_row_keys.into_keys().collect();
+        let decoded = if let Some(converter) = self.pk_row_converter.as_deref() {
+            match decode_tombstone_keys(converter, &key_bytes) {
+                Ok(rows) => rows,
+                Err(error) => {
+                    tracing::warn!(
+                        target: "cayenne::compaction",
+                        table = self.table_metadata.table_name.as_str(),
+                        %error,
+                        "Carry-forward classification failed to decode tombstone keys; rewriting all cold files"
+                    );
+                    return all_dirty(cold_files);
+                }
+            }
+        } else if matches!(
+            self.pk_deletion_strategy,
+            PkDeletionStrategyWithCache::Int64Pk { .. }
+        ) {
+            match decode_int64_tombstone_keys(&key_bytes) {
+                Some(rows) => rows,
+                None => {
+                    tracing::warn!(
+                        target: "cayenne::compaction",
+                        table = self.table_metadata.table_name.as_str(),
+                        "Carry-forward classification found malformed Int64 tombstone keys; rewriting all cold files"
+                    );
+                    return all_dirty(cold_files);
+                }
+            }
+        } else {
+            return all_dirty(cold_files);
+        };
+
+        partition_cold_files(
+            cold_files,
+            &decoded,
+            &self.table_metadata.schema,
+            &self.pk_column_indices,
+        )
     }
 
     async fn promote_warm_to_cold_inner(&self) -> Result<bool> {
@@ -13024,10 +13159,44 @@ impl CayenneTableProvider {
 
         let max_sequence = self.sequence_high_water().await;
 
+        // ---- Carry-forward partition (incremental promotion). Classify the
+        // existing cold manifest into DIRTY files (may contain a tombstoned
+        // key — must be re-read and rewritten) and CLEAN files (provably
+        // untouched — carried forward by manifest reference, never re-read).
+        // Promotion cost is thereby proportional to the changed data, not
+        // total table size.
+        let prior_cold = self
+            .catalog
+            .list_cold_tier_files(&self.table_metadata.table_id)
+            .await?;
+        let prior_cold_len = prior_cold.len();
+        let partition = self.partition_cold_manifest_for_promotion(prior_cold).await;
+        // Guardrail: when most files are dirty, carry-forward saves little and
+        // a full rewrite restores global Z-order clustering — fall back.
+        let partition = if partition.dirty.len() * 2 > prior_cold_len {
+            let mut dirty = partition.dirty;
+            dirty.extend(partition.clean);
+            super::cold_partition::ColdFilePartition {
+                dirty,
+                clean: Vec::new(),
+            }
+        } else {
+            partition
+        };
+        let (dirty_cold, clean_cold) = (partition.dirty, partition.clean);
+
         // Canonical visible read (all tiers, all deletes applied, single-version
         // per key) — reuses the proven rewrite read so cold is correct by
-        // construction.
-        let ctx = self.create_compaction_session_context();
+        // construction. The session's `ColdScanFileSubset` extension restricts
+        // its cold branch to the dirty files: clean files stay out of the
+        // stream entirely.
+        let dirty_urls: std::collections::HashSet<String> =
+            dirty_cold.iter().map(|f| f.file_url.clone()).collect();
+        let ctx = self.create_compaction_session_context_with_config(
+            SessionConfig::default().with_extension(Arc::new(
+                super::cold_partition::ColdScanFileSubset(dirty_urls),
+            )),
+        );
         let (stream, _generation_before) = self.visible_file_stream_for_rewrite(&ctx).await?;
 
         // Z-order cluster for a read-optimized cold layout.
@@ -13044,17 +13213,36 @@ impl CayenneTableProvider {
                 max_sequence,
             )
             .await?;
-        if cold_files.is_empty() {
-            // Nothing live to promote (e.g. every row deleted): the writer
-            // produced no cold files, so there is nothing to register or clean
-            // up. Gate on files-written rather than `total_rows` — a file that
-            // was written but whose footer row count couldn't be inferred must
-            // still be committed, not silently orphaned in the cold store.
+        if cold_files.is_empty() && dirty_cold.is_empty() {
+            // Nothing rewritten and nothing to drop: the writer produced no
+            // new cold files and no dirty file needed reconciling, so there is
+            // nothing to register or clean up. Gate on files-written rather
+            // than `total_rows` — a file that was written but whose footer row
+            // count couldn't be inferred must still be committed, not silently
+            // orphaned in the cold store. (New files empty with dirty files
+            // present is a legitimate commit: every dirty row was deleted.)
             return Ok(false);
         }
 
-        // Commit: atomically register cold files + overwrite-clear warm + flip to
-        // a fresh empty warm snapshot, then sync the in-memory state.
+        // Commit: atomically register the NEW cold files plus the
+        // carried-forward CLEAN manifest rows (verbatim — their objects were
+        // never touched), overwrite-clear warm + the prior cold manifest, and
+        // flip to a fresh empty warm snapshot, then sync in-memory state. The
+        // deletion index is cleared by the same commit: every tombstone was
+        // physically applied by this rewrite (warm-resident keys by the warm
+        // stream, cold-resident keys by the dirty-file stream; conservative
+        // detection guarantees no tombstoned key hides in a carried file).
+        let rewritten_files = cold_files.len();
+        let carried_files = clean_cold.len();
+        // Rewritten bytes only — the carried files cost zero object-store IO,
+        // and this metric is the production check that promotion cost tracks
+        // the CHANGED data, not total table size.
+        let rewritten_bytes: u64 = cold_files
+            .iter()
+            .map(|f| u64::try_from(f.file_size_bytes.max(0)).unwrap_or(0))
+            .sum();
+        let mut cold_files = cold_files;
+        cold_files.extend(clean_cold);
         let new_snapshot_id = uuid::Uuid::now_v7().to_string();
         if !self.table_metadata.path.starts_with("s3://") {
             let dir = self.snapshot_dir_path_for(&new_snapshot_id);
@@ -13074,16 +13262,11 @@ impl CayenneTableProvider {
         }
         self.trigger_old_snapshot_cleanup(&new_snapshot_id).await;
 
-        // Publish telemetry: bytes written to the cold store this promotion —
-        // the production check that promotion cost tracks the promoted data,
-        // not total table size. The last successful publish time is derivable
-        // from `cayenne_compaction_duration_ms{kind="datalake", result="completed"}`.
-        let cold_bytes: u64 = cold_files
-            .iter()
-            .map(|f| u64::try_from(f.file_size_bytes.max(0)).unwrap_or(0))
-            .sum();
+        // Publish telemetry: bytes REWRITTEN this promotion (carried files
+        // cost nothing). The last successful publish time is derivable from
+        // `cayenne_compaction_duration_ms{kind="datalake", result="completed"}`.
         telemetry::cayenne::track_compaction_merged_bytes(
-            cold_bytes,
+            rewritten_bytes,
             &[
                 telemetry::KeyValue::new("table", self.table_metadata.table_name.clone()),
                 telemetry::KeyValue::new("kind", "datalake"),
@@ -13093,9 +13276,11 @@ impl CayenneTableProvider {
         tracing::info!(
             target: "cayenne::compaction",
             table = self.table_metadata.table_name.as_str(),
-            cold_files = cold_files.len(),
+            rewritten_files,
+            carried_files,
+            dirty_inputs = dirty_cold.len(),
             total_rows,
-            "Datalake-tier promotion committed"
+            "Datalake-tier promotion committed (carry-forward)"
         );
         Ok(true)
     }
@@ -14635,9 +14820,20 @@ impl CayenneTableProvider {
     /// snapshot rewrite cannot starve concurrent queries. Falls back to the
     /// shared query environment when no dedicated compaction env is set.
     fn create_compaction_session_context(&self) -> SessionContext {
+        self.create_compaction_session_context_with_config(SessionConfig::default())
+    }
+
+    /// [`Self::create_compaction_session_context`] with an explicit config —
+    /// the carry-forward promotion attaches its [`ColdScanFileSubset`]
+    /// extension here so its private session's cold branch reads only the
+    /// dirty files being rewritten.
+    fn create_compaction_session_context_with_config(
+        &self,
+        config: SessionConfig,
+    ) -> SessionContext {
         let runtime_env = super::compaction::compaction_runtime_env()
             .unwrap_or_else(|| Arc::clone(self.context.runtime_env()));
-        SessionContext::new_with_config_rt(SessionConfig::default(), runtime_env)
+        SessionContext::new_with_config_rt(config, runtime_env)
     }
 
     /// Wrap a plan with a `FilterExec` that enforces the retention filter.
@@ -20837,6 +21033,19 @@ impl CayenneTableProvider {
                     self.table_metadata.table_name
                 ))
             })?;
+        // Carry-forward promotion: the promotion's PRIVATE session carries a
+        // `ColdScanFileSubset` config extension restricting this branch to the
+        // dirty files being rewritten (clean files are carried forward by
+        // manifest reference, never re-read). User-query sessions never carry
+        // the extension, so queries always see the full manifest.
+        let cold_files =
+            match scan_config.get_extension::<super::cold_partition::ColdScanFileSubset>() {
+                Some(subset) => cold_files
+                    .into_iter()
+                    .filter(|f| subset.0.contains(&f.file_url))
+                    .collect(),
+                None => cold_files,
+            };
         // No early all-empty guard needed: the per-file loop skips zero-size
         // files and the `object_store_url is None` / `kept.is_empty()` checks
         // below both return `Ok(None)` when nothing survives.
