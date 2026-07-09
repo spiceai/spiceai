@@ -1808,6 +1808,7 @@ mod tests {
             shared: true,
             member_channel_capacity: DEFAULT_MEMBER_CHANNEL_CAPACITY,
             pg_output_format: crate::postgres_replication::PgOutputFormat::Binary,
+            ready_lag: crate::cdc::DEFAULT_READY_LAG,
         }
     }
 
@@ -1838,6 +1839,7 @@ mod tests {
                     generated_columns: vec![],
                     sender,
                     metrics: Arc::clone(&metrics),
+                    ready_lag: crate::cdc::DEFAULT_READY_LAG,
                 }),
             );
             probes.push((member_key, metrics, receiver));
