@@ -1808,18 +1808,6 @@ impl RefreshTask {
             batches.push(batch);
         }
 
-        // Exact applied-row total for the throughput metric, summed from the
-        // just-built batches (no extra build — `into_parts` above already built
-        // them). `num_rows_hint()` over-counts a PK-changing UPDATE as two rows,
-        // so record the real count here instead of pre-apply.
-        metrics::CDC_APPLY_BURST_ROWS_TOTAL.add(
-            batches
-                .iter()
-                .map(|b| b.record.num_rows() as u64)
-                .fold(0_u64, u64::saturating_add),
-            context.metric_labels.dataset(),
-        );
-
         // Mixed-schema runs (mid-stream schema evolution): `concat_change_batches`
         // requires equal schemas. When the dataset's policy allows evolution,
         // split the run into contiguous same-schema groups applied in order —
@@ -1831,6 +1819,17 @@ impl RefreshTask {
         let groups = group_run_by_schema(batches, committers, split_on_schema_change);
         let last_group = groups.len().saturating_sub(1);
         for (group_idx, (group_batches, group_committers)) in groups.into_iter().enumerate() {
+            // Exact applied-row count for this group, summed from the just-built
+            // batches (no extra build — `into_parts` already built them);
+            // `num_rows_hint()` would over-count a PK-changing UPDATE as two
+            // rows. Computed before `apply_coalesced_run` consumes the batches,
+            // but recorded only AFTER the group applies, so a SkipRun/Stop
+            // failure can't inflate the throughput metric with rows that were
+            // never written.
+            let group_rows = group_batches
+                .iter()
+                .map(|b| b.record.num_rows() as u64)
+                .fold(0_u64, u64::saturating_add);
             match self
                 .apply_coalesced_run(
                     context,
@@ -1840,7 +1839,10 @@ impl RefreshTask {
                 )
                 .await
             {
-                CoalescedRunOutcome::Applied => {}
+                CoalescedRunOutcome::Applied => {
+                    metrics::CDC_APPLY_BURST_ROWS_TOTAL
+                        .add(group_rows, context.metric_labels.dataset());
+                }
                 // A skipped group's committers were dropped without acking —
                 // later groups must not apply (their commits would advance the
                 // source offset past the skipped, unapplied envelopes).
