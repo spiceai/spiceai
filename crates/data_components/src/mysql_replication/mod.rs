@@ -498,16 +498,16 @@ async fn start_inner(input: ReplicationStreamInput) -> Result<ChangesStream> {
                 &layout_fingerprint,
             ) {
                 match params.invalid_position_behavior {
-                    InvalidPositionBehavior::Error => {
+                    InvalidCheckpointBehavior::Error => {
                         return StalePositionSnafu {
                             message: format!(
-                                "cannot resume mysql binlog for {dataset_name} from {}: {drift}. Replaying historical row images against the current source layout would mis-map columns. Set `mysql_replication_invalid_position_behavior: rebootstrap` to drop the saved position and re-snapshot the table.",
+                                "cannot resume mysql binlog for {dataset_name} from {}: {drift}. Replaying historical row images against the current source layout would mis-map columns. Set `mysql_replication_invalid_checkpoint_behavior: restart` to drop the saved position and re-snapshot the table.",
                                 persisted.position
                             ),
                         }
                         .fail();
                     }
-                    InvalidPositionBehavior::Rebootstrap => {
+                    InvalidCheckpointBehavior::Restart => {
                         tracing::warn!(
                             dataset = %dataset_name,
                             position = %persisted.position,
@@ -533,7 +533,7 @@ async fn start_inner(input: ReplicationStreamInput) -> Result<ChangesStream> {
                             message: format!(
                                 "persisted binlog position {} is no longer on the server \
                                  (binary logs were purged). Set \
-                                 `mysql_replication_invalid_position_behavior: rebootstrap` to \
+                                 `mysql_replication_invalid_checkpoint_behavior: restart` to \
                                  drop the saved position and re-snapshot the table, or increase \
                                  `binlog_expire_logs_seconds` on the source.",
                                 persisted.position

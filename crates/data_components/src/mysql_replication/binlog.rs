@@ -483,7 +483,7 @@ fn binlog_change_stream(
                                          {database}.{table} changed shape ({} columns on the \
                                          event, {} validated) and the new layout cannot be \
                                          adopted: {reason}. Re-bootstrap by setting \
-                                         `mysql_replication_invalid_position_behavior: rebootstrap`.",
+                                         `mysql_replication_invalid_checkpoint_behavior: restart`.",
                                         tme.columns_count(),
                                         layout.columns.len()
                                     )))?;
@@ -632,7 +632,7 @@ fn binlog_change_stream(
                                                      {database}.{table} (statement: {statement}) cannot be adopted \
                                                      mid-stream: {e}. Update the dataset schema to match the new \
                                                      table definition, or re-bootstrap by setting \
-                                                     `mysql_replication_invalid_position_behavior: rebootstrap`."
+                                                     `mysql_replication_invalid_checkpoint_behavior: restart`."
                                                 )))?;
                                                 unreachable!();
                                             }
@@ -648,7 +648,7 @@ fn binlog_change_stream(
                                              {database}.{table} (statement: {statement}). The subscribed table \
                                              no longer exists under this name — fix the source (or the dataset) \
                                              and re-bootstrap by setting \
-                                             `mysql_replication_invalid_position_behavior: rebootstrap`."
+                                             `mysql_replication_invalid_checkpoint_behavior: restart`."
                                         )))?;
                                         unreachable!();
                                     }
@@ -1450,7 +1450,7 @@ fn purged_position_error(resume: &BinlogPosition, dataset_name: &str) -> StreamE
     StreamError::External(format!(
         "mysql binlog for {dataset_name}: the source no longer has binlog position {resume} \
          (binary logs were purged). Restart the dataset with \
-         `mysql_replication_invalid_position_behavior: rebootstrap` to drop the saved position \
+         `mysql_replication_invalid_checkpoint_behavior: restart` to drop the saved position \
          and re-snapshot the table, or increase `binlog_expire_logs_seconds` on the source."
     ))
 }
