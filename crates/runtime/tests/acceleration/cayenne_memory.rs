@@ -79,6 +79,14 @@ async fn test_cayenne_memory_mode_full_refresh_and_query() -> Result<(), anyhow:
 
             crate::configure_test_datafusion();
 
+            // Memory mode must never touch disk. Compute its (derived, never-created)
+            // data directory up front and clear any stale directory a PRIOR local run
+            // may have left, so the end-of-test "does not exist" assertion reflects
+            // only what THIS run wrote rather than tripping over leftover state.
+            let data_path =
+                std::path::PathBuf::from(runtime::spice_data_base_path()).join("cayenne_mem_it");
+            let _ = std::fs::remove_dir_all(&data_path);
+
             let mut dataset = Dataset::new(format!("file://{}", csv.display()), "cayenne_mem_it");
             dataset.acceleration = Some(Acceleration {
                 enabled: true,
@@ -139,9 +147,8 @@ async fn test_cayenne_memory_mode_full_refresh_and_query() -> Result<(), anyhow:
 
             // Memory mode is fully in-RAM: its (derived, never-created) data
             // directory must not exist on disk at all — no data files and no
-            // snapshot directories (the metastore is an in-RAM memdb).
-            let data_path =
-                std::path::PathBuf::from(runtime::spice_data_base_path()).join("cayenne_mem_it");
+            // snapshot directories (the metastore is an in-RAM memdb). It was
+            // cleared before the run, so its presence now would mean a disk write.
             assert!(
                 !data_path.exists(),
                 "memory mode must not write anything to disk, but {data_path:?} exists"
