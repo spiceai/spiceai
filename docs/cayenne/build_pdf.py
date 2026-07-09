@@ -169,7 +169,7 @@ for i, svg in enumerate(svgs):
 CSS = """
 @page {
   size: A4; margin: 18mm 16mm 20mm 16mm;
-  @bottom-center { content: "Cayenne — Spice AI's CDC acceleration engine"; font-size: 8pt; color: #94a3b8; }
+  @bottom-center { content: "Cayenne — Spice.ai's CDC acceleration engine"; font-size: 8pt; color: #94a3b8; }
   @bottom-right  { content: counter(page) " / " counter(pages); font-size: 8pt; color: #94a3b8; }
 }
 @page :first { @bottom-center { content: ""; } @bottom-right { content: ""; } }
@@ -207,7 +207,7 @@ figure.diagram { margin: 16px auto; text-align: center; page-break-inside: avoid
 figure.diagram svg { max-width: 100%; height: auto; }
 @page landscapefig {
   size: A4 landscape; margin: 12mm 14mm 14mm 14mm;
-  @bottom-center { content: "Cayenne — Spice AI's CDC acceleration engine"; font-size: 8pt; color: #94a3b8; }
+  @bottom-center { content: "Cayenne — Spice.ai's CDC acceleration engine"; font-size: 8pt; color: #94a3b8; }
   @bottom-right  { content: counter(page) " / " counter(pages); font-size: 8pt; color: #94a3b8; }
 }
 .landscape-fig { page: landscapefig; page-break-before: always; page-break-after: always;
@@ -226,7 +226,7 @@ COVER = """
 <div class="cover">
   <div class="cover-kicker">SPICE.AI · crates/cayenne</div>
   <div class="cover-title">Cayenne</div>
-  <div class="cover-sub">Spice AI's acceleration engine for high-rate CDC — a lakehouse table format built on Vortex</div>
+  <div class="cover-sub">Spice.ai's acceleration engine for high-rate CDC — a lakehouse table format built on Vortex</div>
   <div class="cover-desc">A breadth-first technical walkthrough — from the three-tier overview down to
   the locks, the fused deletion index, and the CDC write pipeline — with comparisons to
   Apache Iceberg, Delta Lake, and Apache Hudi.</div>
