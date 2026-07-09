@@ -13148,26 +13148,13 @@ impl CayenneTableProvider {
                 return Ok(false);
             }
         };
-        // Guardrail: when MOST files are dirty, fall back to rewriting
-        // everything (clean files included). The extra cost is bounded (< 2x
-        // the dirty-only rewrite) and it buys a global Z-order re-cluster:
-        // carry-forward sorts only what it rewrites, so carried files' PK
-        // ranges increasingly overlap new files' across promotions — degrading
-        // both query pruning AND this very classification (wider, overlapping
-        // rectangles make every tombstone hit more files, a feedback loop that
-        // drives the dirty fraction up). A full rewrite at the moment most of
-        // the table is being rewritten anyway is the cheapest point to break
-        // that loop, and it consolidates the accumulated file count too.
-        let partition = if partition.dirty.len() * 2 > prior_cold_len {
-            let mut dirty = partition.dirty;
-            dirty.extend(partition.clean);
-            super::cold_partition::ColdFilePartition {
-                dirty,
-                clean: Vec::new(),
-            }
-        } else {
-            partition
-        };
+        // NOTE: no dirty-fraction guardrail (deliberately, for now): promotion
+        // always carries every clean file, even when most files are dirty.
+        // Carry-forward sorts only what it rewrites, so carried files' PK
+        // ranges can increasingly overlap new files' across promotions —
+        // watch `datalake_rewrite_selectivity` in the commit trace; if it
+        // ratchets upward in practice, a recluster policy (full rewrite past a
+        // dirty-fraction threshold) is the designed counter-measure.
         let (dirty_cold, clean_cold) = (partition.dirty, partition.clean);
 
         // Canonical visible read (all tiers, all deletes applied, single-version
@@ -13248,7 +13235,12 @@ impl CayenneTableProvider {
         self.trigger_old_snapshot_cleanup(&new_snapshot_id).await;
 
         // Publish telemetry: bytes WRITTEN this promotion (carried files cost
-        // nothing). The last successful publish time is derivable from
+        // nothing), reported to the SHARED cross-kind
+        // `cayenne_compaction_merged_bytes` metric — "merged bytes" is that
+        // family's name for a pass's written output (kind="full"/"subset"
+        // report theirs the same way); the datalake-specific vocabulary lives
+        // in the trace fields below. The last successful publish time is
+        // derivable from
         // `cayenne_compaction_duration_ms{kind="datalake", result="completed"}`.
         telemetry::cayenne::track_compaction_merged_bytes(
             written_bytes,
