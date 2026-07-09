@@ -91,7 +91,10 @@ fn mysql_params() -> HashMap<String, String> {
 /// A `refresh_mode: changes` dataset with the given inference level and, crucially,
 /// **no** `primary_key` / `on_conflict` — those must come from inference.
 fn inventory_dataset(schema_inference: SchemaInference) -> Dataset {
-    let mut dataset = Dataset::new("mysql:mysqldb.inventory".to_string(), "inventory".to_string());
+    let mut dataset = Dataset::new(
+        "mysql:mysqldb.inventory".to_string(),
+        "inventory".to_string(),
+    );
     dataset.params = Some(Params::from_string_map(mysql_params()));
     dataset.schema_inference = schema_inference;
     dataset.acceleration = Some(Acceleration {
@@ -165,10 +168,9 @@ async fn test_extended_inference_enables_cdc_without_declared_pk() -> Result<(),
 
     test_request_context()
         .scope(async {
-            let _container =
-                common::start_mysql_docker_container(MYSQL_SCHEMA_INFERENCE_PORT)
-                    .await
-                    .map_err(|e| anyhow!("start container: {e}"))?;
+            let _container = common::start_mysql_docker_container(MYSQL_SCHEMA_INFERENCE_PORT)
+                .await
+                .map_err(|e| anyhow!("start container: {e}"))?;
 
             // Create + seed on the source (retry to absorb InnoDB DDL-readiness races).
             let pool = common::get_mysql_conn(MYSQL_SCHEMA_INFERENCE_PORT)?;
@@ -218,8 +220,7 @@ async fn test_extended_inference_enables_cdc_without_declared_pk() -> Result<(),
             .await?;
 
             // Live DELETE keyed on the composite PK routes correctly too.
-            exec(&pool, "DELETE FROM inventory WHERE w_id = 2 AND sku = 'A'")
-                .await?;
+            exec(&pool, "DELETE FROM inventory WHERE w_id = 2 AND sku = 'A'").await?;
             wait_for_scalar_i64(&rt, "SELECT count(*) FROM inventory", 2).await?;
 
             Ok(())
@@ -237,10 +238,9 @@ async fn test_standard_inference_full_refresh_loads() -> Result<(), anyhow::Erro
 
     test_request_context()
         .scope(async {
-            let _container =
-                common::start_mysql_docker_container(MYSQL_SCHEMA_INFERENCE_PORT)
-                    .await
-                    .map_err(|e| anyhow!("start container: {e}"))?;
+            let _container = common::start_mysql_docker_container(MYSQL_SCHEMA_INFERENCE_PORT)
+                .await
+                .map_err(|e| anyhow!("start container: {e}"))?;
 
             let pool = common::get_mysql_conn(MYSQL_SCHEMA_INFERENCE_PORT)?;
             let retry_strategy = FibonacciBackoffBuilder::new().max_retries(Some(10)).build();

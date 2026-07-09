@@ -488,20 +488,19 @@ async fn enrich_with_mysql_metadata(
     table_reference: &datafusion::sql::TableReference,
     provider: Arc<dyn TableProvider>,
 ) -> Arc<dyn TableProvider> {
-    let (mut table_metadata, field_metadata) = match mysql_comment_metadata(pool, table_reference)
-        .await
-    {
-        Ok(metadata) => metadata,
-        Err(error) => {
-            tracing::warn!(
-                dataset = %dataset.name,
-                source = %dataset.path(),
-                error = %error,
-                "Failed to query MySQL comments; registering without comment metadata"
-            );
-            (HashMap::new(), data_components::FieldMetadata::new())
-        }
-    };
+    let (mut table_metadata, field_metadata) =
+        match mysql_comment_metadata(pool, table_reference).await {
+            Ok(metadata) => metadata,
+            Err(error) => {
+                tracing::warn!(
+                    dataset = %dataset.name,
+                    source = %dataset.path(),
+                    error = %error,
+                    "Failed to query MySQL comments; registering without comment metadata"
+                );
+                (HashMap::new(), data_components::FieldMetadata::new())
+            }
+        };
 
     if dataset.schema_inference.is_extended() {
         match mysql_inferred_schema_metadata(pool, table_reference).await {
