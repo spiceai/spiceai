@@ -96,7 +96,11 @@ fn bench_probe(c: &mut Criterion) {
                     survivors += usize::from(filter.might_contain(h));
                 }
                 let next = start + PROBE_BATCH;
-                miss_cursor.set(if next + PROBE_BATCH > pool_len { 0 } else { next });
+                miss_cursor.set(if next + PROBE_BATCH > pool_len {
+                    0
+                } else {
+                    next
+                });
                 black_box(survivors);
             });
         });
@@ -113,7 +117,11 @@ fn bench_probe(c: &mut Criterion) {
                     survivors += usize::from(filter.might_contain(h));
                 }
                 let next = start + PROBE_BATCH;
-                hit_cursor.set(if next + PROBE_BATCH > pool_len { 0 } else { next });
+                hit_cursor.set(if next + PROBE_BATCH > pool_len {
+                    0
+                } else {
+                    next
+                });
                 black_box(survivors);
             });
         });
