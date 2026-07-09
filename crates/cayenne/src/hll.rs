@@ -329,23 +329,40 @@ impl NdvSketches {
     /// deserialize-then-[`merge`](Self::merge) over many files — and this is the
     /// write-time aggregate-merge path, so the win applies on every commit.
     ///
-    /// A malformed blob is a no-op (matching `deserialize` → `None`); a column
-    /// whose register width doesn't match the accumulator's is skipped (mirrors
-    /// [`HyperLogLog::merge`](HyperLogLog::merge)'s precision guard).
+    /// A malformed blob is a no-op (matching `deserialize` → `None`). Per column,
+    /// this matches deserialize-then-[`merge`](Self::merge) exactly: a column
+    /// already present at a matching register width is folded in place; one at a
+    /// *different* width (an incompatible precision) is skipped, leaving the
+    /// existing registers untouched (mirrors [`HyperLogLog::merge`]'s precision
+    /// guard); a column not yet in the accumulator is adopted as-is (a union with
+    /// the empty sketch is the sketch itself). Nothing is inserted for a
+    /// would-be-skipped column.
     pub fn merge_serialized(&mut self, existing_blob: &[u8]) {
-        let Some((_precision, columns)) = Self::parse_columns(existing_blob) else {
+        let Some((precision, columns)) = Self::parse_columns(existing_blob) else {
             return;
         };
         for (idx, src) in columns {
-            let hll = self.entry(idx);
-            if hll.registers.len() != src.len() {
-                continue;
-            }
-            // Register-wise max in a single pass; `(*dst).max(*s)` autovectorizes
-            // to packed unsigned-max (`pmaxub`/`vpmaxub` on x86, `umax` on NEON) —
-            // see the `ndv_cumulative_rebuild` bench.
-            for (dst, s) in hll.registers.iter_mut().zip(src) {
-                *dst = (*dst).max(*s);
+            match self.columns.get_mut(&idx) {
+                Some(hll) if hll.registers.len() == src.len() => {
+                    // Register-wise max in a single pass; `(*dst).max(*s)`
+                    // autovectorizes to packed unsigned-max (`pmaxub`/`vpmaxub` on
+                    // x86, `umax` on NEON) — see the `ndv_cumulative_rebuild` bench.
+                    for (dst, s) in hll.registers.iter_mut().zip(src) {
+                        *dst = (*dst).max(*s);
+                    }
+                }
+                // Present but incompatible width — leave it untouched, don't insert.
+                Some(_) => {}
+                // Absent — adopt the incoming column directly (no empty-then-skip).
+                None => {
+                    self.columns.insert(
+                        idx,
+                        HyperLogLog {
+                            precision,
+                            registers: src.to_vec(),
+                        },
+                    );
+                }
             }
         }
     }
@@ -541,6 +558,42 @@ mod tests {
             base, before,
             "a malformed blob must leave the accumulator unchanged"
         );
+    }
+
+    #[test]
+    fn merge_serialized_incompatible_width_preserves_existing_and_adopts_absent() {
+        // Existing aggregate: column 0 sketched at PRECISION with real data.
+        let mut base = NdvSketches::new();
+        for v in 0..500i128 {
+            base.entry(0).add_i128(v);
+        }
+        let before = base.clone();
+
+        // A well-formed blob for column 0 at a DIFFERENT precision (10 → 1024
+        // registers). merge_serialized must skip the incompatible width and leave
+        // the existing sketch untouched — never insert-then-skip or wipe to NULL.
+        let m = 1usize << 10;
+        let mut blob = vec![SKETCH_FORMAT_VERSION, 10u8];
+        blob.extend_from_slice(&1u32.to_le_bytes()); // num_columns
+        blob.extend_from_slice(&0u32.to_le_bytes()); // column index 0
+        blob.resize(blob.len() + m, 7u8); // 1024 registers, rank 7
+        base.merge_serialized(&blob);
+        assert_eq!(
+            base, before,
+            "an incompatible-width column must leave the existing sketch untouched"
+        );
+
+        // A column absent from the accumulator is adopted (union with empty).
+        let mut incoming = NdvSketches::new();
+        for v in 0..300i128 {
+            incoming.entry(3).add_i128(v);
+        }
+        base.merge_serialized(&incoming.serialize().expect("non-empty"));
+        assert!(
+            base.estimate(3).is_some(),
+            "an absent column should be adopted from the blob"
+        );
+        assert!(base.estimate(0).is_some(), "column 0 must still be present");
     }
 
     #[test]
