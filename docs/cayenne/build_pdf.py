@@ -124,7 +124,8 @@ def kroki_svg(source: str) -> str:
     raise RuntimeError(f"kroki render failed: {last}")
 
 
-text = open(SRC, encoding="utf-8").read()
+with open(SRC, encoding="utf-8") as f:
+    text = f.read()
 
 # Extract mermaid fenced blocks
 blocks = []
@@ -238,7 +239,8 @@ html = f"""<!DOCTYPE html><html><head><meta charset="utf-8">
 <style>{CSS}{COVER_CSS}</style></head>
 <body>{COVER}{body}</body></html>"""
 
-open(HTML_OUT, "w", encoding="utf-8").write(html)
+with open(HTML_OUT, "w", encoding="utf-8") as f:
+    f.write(html)
 print(f"Wrote {HTML_OUT} ({len(html)} bytes)", flush=True)
 
 from weasyprint import HTML

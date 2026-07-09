@@ -40,8 +40,8 @@ builds the PDF:
 
 ## Prerequisites
 
-- Python 3 with `markdown`, `weasyprint`, and `requests`
-  (`pip install markdown weasyprint requests` — add `--break-system-packages`
+- Python 3 with `markdown` and `weasyprint`
+  (`pip install markdown weasyprint` — add `--break-system-packages`
   on Debian/Ubuntu system Pythons).
 - WeasyPrint's native deps (Pango/Cairo/…):
   - **macOS**: `brew install pango` (pulls in cairo, gdk-pixbuf, libffi). If the

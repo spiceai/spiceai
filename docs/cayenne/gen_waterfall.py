@@ -100,7 +100,9 @@ svg.append(f'<text x="410" y="709" font-size="12" fill="{FAINT}">older</text>')
 svg.append(f'<text x="1142" y="709" text-anchor="end" font-size="12" fill="{FAINT}">newer  ·  time / recency →</text>')
 
 svg.append('</svg>')
-SVG="\n".join(svg); open("waterfall.svg","w").write(SVG)
+SVG = "\n".join(svg)
+with open("waterfall.svg", "w", encoding="utf-8") as f:
+    f.write(SVG)
 print(f"wrote waterfall.svg ({len(SVG)} bytes)")
 # Optional landscape preview PDF — only if WeasyPrint's native deps are present.
 # waterfall.svg is the committed artifact referenced by cayenne.md; the preview
