@@ -41,15 +41,25 @@ limitations under the License.
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use hash_index::{SplitBlockBloomFilter, hash_key};
+use std::cell::Cell;
 use std::hint::black_box;
 
 /// One `RecordBatch` worth of probe keys — the deletion filter probes a PK
-/// column a batch at a time.
+/// column a batch at a time. Each `b.iter` probes this many hashes.
 const PROBE_BATCH: usize = 8_192;
 
+/// Distinct probe hashes per filter, capped. The probe rotates a `PROBE_BATCH`
+/// window across a pool of `min(capacity, POOL_CAP)` distinct keys, so for large
+/// filters successive iterations touch fresh blocks spread across the whole
+/// filter — the swept working set (~pool * 32 B) exceeds any LLC, giving the
+/// intended RAM-bound random access rather than a cache-hot `PROBE_BATCH`
+/// subset. Small filters stay naturally cache-resident (few distinct blocks).
+const POOL_CAP: usize = 4_000_000;
+
 /// Filter capacities spanning the cache hierarchy. Filter bytes ≈ capacity * 2
-/// (16 bits/item, packed into 32-byte blocks), so: ~16 KB (fits L1), ~1.6 MB
-/// (L2/LLC), ~80 MB (far exceeds any LLC → RAM-bound random block access).
+/// (16 bits/item, packed into 32-byte blocks): ~16 KB (fits L1), ~1.6 MB
+/// (L2/LLC), ~80 MB. With the rotating pool above, the 80 MB size sweeps a
+/// working set far larger than any LLC (RAM-bound random block access).
 const SIZES: [usize; 3] = [8_192, 800_000, 40_000_000];
 
 fn build_filter(n: usize) -> SplitBlockBloomFilter {
@@ -60,40 +70,50 @@ fn build_filter(n: usize) -> SplitBlockBloomFilter {
     filter
 }
 
-/// Probe throughput (miss and hit) across filter sizes. This is the exact shape
-/// a sound frozen-snapshot SIMD batch-probe would target: sweep a batch of
-/// precomputed hashes, counting survivors.
+/// Probe throughput (miss and hit) across filter sizes, rotating a `PROBE_BATCH`
+/// window across a per-filter hash pool so large filters exercise RAM-bound
+/// random access rather than a cache-hot subset. This is the exact shape a sound
+/// frozen-snapshot SIMD batch-probe would target.
 fn bench_probe(c: &mut Criterion) {
     let mut group = c.benchmark_group("sbbf_probe");
     group.throughput(Throughput::Elements(PROBE_BATCH as u64));
 
     for n in SIZES {
         let filter = build_filter(n);
+        let pool_len = n.clamp(PROBE_BATCH, POOL_CAP);
 
-        // All-miss: keys just past the inserted range (bar the ~0.04% FPR).
-        let miss: Vec<u64> = (n as i64..(n as i64 + PROBE_BATCH as i64))
+        // All-miss: distinct keys just past the inserted range (bar the ~0.04%
+        // FPR). Rotate a PROBE_BATCH window so the swept blocks span the pool.
+        let miss: Vec<u64> = (n as i64..(n as i64 + pool_len as i64))
             .map(|k| hash_key(&k))
             .collect();
+        let miss_cursor = Cell::new(0_usize);
         group.bench_with_input(BenchmarkId::new("miss", n), &n, |b, _| {
             b.iter(|| {
+                let start = miss_cursor.get();
                 let mut survivors = 0_usize;
-                for &h in &miss {
+                for &h in &miss[start..start + PROBE_BATCH] {
                     survivors += usize::from(filter.might_contain(h));
                 }
+                let next = start + PROBE_BATCH;
+                miss_cursor.set(if next + PROBE_BATCH > pool_len { 0 } else { next });
                 black_box(survivors);
             });
         });
 
-        // All-hit: keys known to be present (forces all 8 word checks).
-        let hit: Vec<u64> = (0..PROBE_BATCH as i64)
-            .map(|i| hash_key(&(i % n as i64)))
-            .collect();
+        // All-hit: distinct present keys (forces all 8 word checks), same
+        // rotating window across the pool.
+        let hit: Vec<u64> = (0..pool_len as i64).map(|k| hash_key(&k)).collect();
+        let hit_cursor = Cell::new(0_usize);
         group.bench_with_input(BenchmarkId::new("hit", n), &n, |b, _| {
             b.iter(|| {
+                let start = hit_cursor.get();
                 let mut survivors = 0_usize;
-                for &h in &hit {
+                for &h in &hit[start..start + PROBE_BATCH] {
                     survivors += usize::from(filter.might_contain(h));
                 }
+                let next = start + PROBE_BATCH;
+                hit_cursor.set(if next + PROBE_BATCH > pool_len { 0 } else { next });
                 black_box(survivors);
             });
         });
