@@ -7,13 +7,13 @@ description: "SELECT id, answer, array_length(answer_embedding), trunc(_score, 3
     "id": 189,
     "answer": "\\[\n2 - 2(-3)^2 = 2 - 2(9) = 2 - 18 = \\boxed{-16}\n\\]",
     "array_length(vector_search(qs, Utf8(\"second\"), answer).answer_embedding)": 256,
-    "_score": 0.411
+    "_score": 0.41
   },
   {
     "id": 212,
     "answer": "\\[\n(2y)^2 = (2 \\times 2)^2 = 4^2 = \\boxed{16}\n\\]",
     "array_length(vector_search(qs, Utf8(\"second\"), answer).answer_embedding)": 256,
-    "_score": 0.38
+    "_score": 0.379
   },
   {
     "id": 1277,
@@ -25,6 +25,6 @@ description: "SELECT id, answer, array_length(answer_embedding), trunc(_score, 3
     "id": 195,
     "answer": "\\[\n2x^2 = 2(-3)^2 = 2(9) = \\boxed{18}\n\\]",
     "array_length(vector_search(qs, Utf8(\"second\"), answer).answer_embedding)": 256,
-    "_score": 0.348
+    "_score": 0.347
   }
 ]

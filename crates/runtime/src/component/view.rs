@@ -133,7 +133,7 @@ impl View {
     pub async fn is_accelerator_initialized(&self) -> bool {
         if let Some(acceleration_settings) = &self.acceleration {
             let Some(accelerator) = self
-                .runtime()
+                .runtime
                 .accelerator_engine_registry()
                 .get_accelerator_engine(acceleration_settings.engine)
                 .await
@@ -255,8 +255,8 @@ impl AccelerationSource for View {
         Arc::clone(&self.app)
     }
 
-    fn runtime(&self) -> Arc<Runtime> {
-        Arc::clone(&self.runtime)
+    fn secrets(&self) -> Arc<tokio::sync::RwLock<crate::secrets::Secrets>> {
+        self.runtime.secrets()
     }
 
     fn acceleration(&self) -> Option<&Acceleration> {
@@ -273,6 +273,41 @@ impl AccelerationSource for View {
 
     fn as_any(&self) -> &dyn std::any::Any {
         self
+    }
+
+    fn initialized_sources<'a>(
+        &'a self,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = Vec<Arc<dyn runtime_acceleration::AccelerationSource>>>
+                + Send
+                + 'a,
+        >,
+    > {
+        let app = self.app();
+        let runtime = Arc::clone(&self.runtime);
+        Box::pin(async move {
+            let datasets: Vec<Arc<dyn runtime_acceleration::AccelerationSource>> =
+                Arc::clone(&runtime)
+                    .get_initialized_datasets(&app, crate::LogErrors(false))
+                    .await
+                    .into_iter()
+                    .map(|ds| ds as Arc<dyn runtime_acceleration::AccelerationSource>)
+                    .collect();
+            #[cfg(feature = "duckdb")]
+            {
+                let views: Vec<Arc<dyn runtime_acceleration::AccelerationSource>> =
+                    Arc::clone(&runtime)
+                        .get_initialized_views(&app, crate::LogErrors(false))
+                        .await
+                        .into_iter()
+                        .map(|v| v as Arc<dyn runtime_acceleration::AccelerationSource>)
+                        .collect();
+                datasets.into_iter().chain(views).collect()
+            }
+            #[cfg(not(feature = "duckdb"))]
+            datasets
+        })
     }
 }
 

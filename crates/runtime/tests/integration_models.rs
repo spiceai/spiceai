@@ -32,7 +32,7 @@ mod utils;
 mod workers;
 
 pub(crate) const DEFAULT_TRACING_MODELS: Option<&str> = Some(
-    "integration_models=debug,runtime=TRACE,search=TRACE,llms=TRACE,model_components=TRACE,task_history=WARN,runtime::embeddings=INFO,INFO",
+    "integration_models=debug,runtime=TRACE,search=TRACE,llms=TRACE,task_history=WARN,runtime::embeddings=INFO,INFO",
 );
 
 /// Modifies the `DataFusion` configuration to make test results reproducible across all machines.

@@ -1438,7 +1438,7 @@ async fn resolve_s3_params_with_prefix(
         .acceleration()
         .map(|a| a.params.clone())
         .unwrap_or_default();
-    let secrets = source.runtime().secrets();
+    let secrets = source.secrets();
     let params = get_params_with_secrets(secrets, &raw_params).await;
 
     let get_param = |suffix: &str| -> Option<String> {

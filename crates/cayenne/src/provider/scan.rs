@@ -583,7 +583,7 @@ fn collect_file_scan_configs<'a>(
         return;
     }
 
-    if plan.downcast_ref::<UnionExec>().is_some() {
+    if plan.is::<UnionExec>() {
         for child in plan.children() {
             collect_file_scan_configs(child, configs);
         }
@@ -612,15 +612,11 @@ fn collect_file_scan_configs<'a>(
 /// it stops a future operator from silently being treated as transparent.
 #[expect(deprecated)]
 fn is_identity_preserving_wrapper(plan: &Arc<dyn ExecutionPlan>) -> bool {
-    if plan.downcast_ref::<ProjectionExec>().is_some()
-        || plan.downcast_ref::<RepartitionExec>().is_some()
-        || plan
-            .downcast_ref::<datafusion_physical_plan::coalesce_batches::CoalesceBatchesExec>()
-            .is_some()
-        || plan
-            .downcast_ref::<datafusion_physical_plan::coalesce_partitions::CoalescePartitionsExec>()
-            .is_some()
-        || plan.downcast_ref::<CayenneAccelerationExec>().is_some()
+    if plan.is::<ProjectionExec>()
+        || plan.is::<RepartitionExec>()
+        || plan.is::<datafusion_physical_plan::coalesce_batches::CoalesceBatchesExec>()
+        || plan.is::<datafusion_physical_plan::coalesce_partitions::CoalescePartitionsExec>()
+        || plan.is::<CayenneAccelerationExec>()
     {
         return true;
     }
@@ -705,7 +701,7 @@ fn push_dynamic_filters_to_data_source(
         return Ok(None);
     }
 
-    let is_union = plan.downcast_ref::<UnionExec>().is_some();
+    let is_union = plan.is::<UnionExec>();
     if !is_union && !is_identity_preserving_wrapper(&plan) {
         return Ok(None);
     }
@@ -1017,11 +1013,7 @@ mod tests {
                 .partition_count(),
             4
         );
-        assert!(
-            repartitioned_plan
-                .downcast_ref::<RepartitionExec>()
-                .is_some()
-        );
+        assert!(repartitioned_plan.is::<RepartitionExec>());
     }
 
     #[test]
@@ -1051,7 +1043,7 @@ mod tests {
             .expect("inner plan should support projection swapping");
 
         assert!(
-            swapped.downcast_ref::<CayenneAccelerationExec>().is_some(),
+            swapped.is::<CayenneAccelerationExec>(),
             "projection-swapped Cayenne plan should stay wrapped for optimizer identification"
         );
     }

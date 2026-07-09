@@ -180,7 +180,20 @@ jobs:
 
           if [ "$tag_latest_input" = "auto" ]; then
             # Query GitHub for whether this tag is currently the 'latest' release.
-            is_latest=$(gh release view "${release_tag}" --repo "${GITHUB_REPOSITORY}" --json isLatest -q .isLatest 2>/dev/null || echo "false")
+            # Use GraphQL because `gh release view --json isLatest` can return stale
+            # data when a newer release was published after the REST API cached it.
+            gh_owner="${GITHUB_REPOSITORY%%/*}"
+            gh_repo="${GITHUB_REPOSITORY##*/}"
+            is_latest=$(gh api graphql \
+              -f owner="${gh_owner}" \
+              -f repo="${gh_repo}" \
+              -f tag="${release_tag}" \
+              -f query='query($owner: String!, $repo: String!, $tag: String!) {
+                repository(owner: $owner, name: $repo) {
+                  release(tagName: $tag) { isLatest }
+                }
+              }' \
+              --jq '.data.repository.release.isLatest // false' 2>/dev/null || echo "false")
             if [ "$is_latest" = "true" ]; then
               should_tag_latest="true"
               echo "Release ${release_tag} is marked as 'latest' on GitHub, will tag as 'latest'"
