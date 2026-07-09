@@ -22,7 +22,7 @@ expression: resp?
     "answer": "\\[\n2 - 2(-3)^2 = 2 - 2(9) = 2 - 18 = \\boxed{-16}\n\\]",
     "array_length(vector_search(qs_view, Utf8(\"second\"), question).question_embedding)": 64,
     "array_length(vector_search(qs_view, Utf8(\"second\"), question).answer_embedding)": 64,
-    "trunc(vector_search(qs_view, Utf8(\"second\"), question)._score,Int64(3))": 0.536
+    "trunc(vector_search(qs_view, Utf8(\"second\"), question)._score,Int64(3))": 0.537
   },
   {
     "id": 948,
