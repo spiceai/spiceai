@@ -676,7 +676,11 @@ mod tests {
         };
 
         let result = ReciprocalRankFusion
-            .aggregate(vec![stream_0, stream_1, stream_2], vec![Column::from_name("id")], 10)
+            .aggregate(
+                vec![stream_0, stream_1, stream_2],
+                vec![Column::from_name("id")],
+                10,
+            )
             .await
             .expect("rrf aggregation should succeed");
 

@@ -1017,7 +1017,6 @@ impl ReciprocalRankFusion {
             .iter()
             .filter_map(|(maybe_table_reference, field)| {
                 maybe_table_reference
-                    .as_ref()
                     .map(|table_reference| col_qualified!(table_reference.clone(), field.name()))
             })
             .collect::<Vec<_>>();
