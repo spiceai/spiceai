@@ -18,9 +18,14 @@ limitations under the License.
 //!
 //! Mirrors `MongoSys` and `DynamoDBSys`: one row per dataset in
 //! `spice_sys_mysql_binlog`, holding the binlog file + offset that the
-//! dataset's change stream resumes from, and an optional Arrow schema
+//! dataset's change stream resumes from, and an optional schema/layout
 //! snapshot for drift detection. This is the client-side replacement for a
 //! Postgres replication slot's server-tracked `confirmed_flush_lsn`.
+//!
+//! `schema_json` stores a versioned checkpoint meta envelope (dataset Arrow
+//! schema + source ordinal-layout fingerprint). Legacy rows may still hold a
+//! bare Arrow schema JSON object; the replication layer treats those as
+//! unknown layout and refuses unsafe resume.
 //!
 //! ```sql
 //! CREATE TABLE spice_sys_mysql_binlog (

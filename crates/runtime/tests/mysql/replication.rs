@@ -104,15 +104,18 @@ fn stream_input(
     server_id: u32,
     store: Arc<dyn PositionStore>,
 ) -> ReplicationStreamInput {
+    let schema = dataset_schema();
+    let schema_json = serde_json::to_string(schema.as_ref())
+        .expect("dataset schema must serialize for checkpoint meta");
     ReplicationStreamInput {
         dataset_name: "repl_users".into(),
         params: params_for(port, server_id),
-        schema: dataset_schema(),
+        schema,
         primary_keys: vec!["id".into()],
         database: "mysqldb".into(),
         table: "repl_users".into(),
         position_store: store,
-        schema_json: None,
+        schema_json: Some(schema_json),
         metrics: ReplicationMetricsCollector::new(),
     }
 }
