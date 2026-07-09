@@ -206,8 +206,7 @@ impl CheckpointMeta {
             return Ok(None);
         }
         Err(
-            "persisted checkpoint schema_json is neither a v2 CheckpointMeta \
-             envelope nor a legacy Arrow schema object"
+            "persisted checkpoint schema_json is neither a v2 CheckpointMeta envelope nor a legacy Arrow schema object"
                 .to_string(),
         )
     }
@@ -230,8 +229,7 @@ pub fn encode_checkpoint_schema_json(
         Err(e) => {
             tracing::warn!(
                 error = %e,
-                "failed to serialize mysql binlog checkpoint meta; resume will refuse \
-                 rather than decode against an unverified layout"
+                "failed to serialize mysql binlog checkpoint meta; resume will refuse rather than decode against an unverified layout"
             );
             None
         }
@@ -505,11 +503,7 @@ async fn start_inner(input: ReplicationStreamInput) -> Result<ChangesStream> {
                     InvalidPositionBehavior::Error => {
                         return StalePositionSnafu {
                             message: format!(
-                                "cannot resume mysql binlog for {dataset_name} from {}: {drift}. \
-                                 Replaying historical row images against the current source \
-                                 layout would mis-map columns. Set \
-                                 `mysql_replication_invalid_position_behavior: rebootstrap` to \
-                                 drop the saved position and re-snapshot the table.",
+                                "cannot resume mysql binlog for {dataset_name} from {}: {drift}. Replaying historical row images against the current source layout would mis-map columns. Set `mysql_replication_invalid_position_behavior: rebootstrap` to drop the saved position and re-snapshot the table.",
                                 persisted.position
                             ),
                         }
@@ -520,16 +514,13 @@ async fn start_inner(input: ReplicationStreamInput) -> Result<ChangesStream> {
                             dataset = %dataset_name,
                             position = %persisted.position,
                             drift = %drift,
-                            "persisted binlog checkpoint is incompatible with the current \
-                             source layout / dataset schema; rebootstrap behavior enabled, \
-                             falling back to a fresh snapshot"
+                            "persisted binlog checkpoint is incompatible with the current source layout / dataset schema; rebootstrap behavior enabled, falling back to a fresh snapshot"
                         );
                         if let Err(e) = position_store.clear().await {
                             tracing::warn!(
                                 dataset = %dataset_name,
                                 error = %e,
-                                "failed to clear the incompatible binlog position; the \
-                                 subsequent bootstrap will overwrite it"
+                                "failed to clear the incompatible binlog position; the subsequent bootstrap will overwrite it"
                             );
                         }
                         None

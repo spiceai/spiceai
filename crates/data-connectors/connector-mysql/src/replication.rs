@@ -225,9 +225,7 @@ pub fn build_changes_stream(
                 tracing::warn!(
                     dataset = %dataset_name,
                     error = %e,
-                    "failed to serialize the dataset schema for the binlog-position sidecar; \
-                     resume will refuse rather than risk decoding historical row images \
-                     against an unverified layout"
+                    "failed to serialize the dataset schema for the binlog-position sidecar; resume will refuse rather than risk decoding historical row images against an unverified layout"
                 );
                 None
             }

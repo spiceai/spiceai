@@ -211,8 +211,7 @@ pub async fn fetch_table_layout(
         .map(|(idx, row)| {
             let name: String = row.get("COLUMN_NAME").ok_or_else(|| Error::Decode {
                 message: format!(
-                    "information_schema.COLUMNS row {idx} for {database}.{table} \
-                     is missing COLUMN_NAME"
+                    "information_schema.COLUMNS row {idx} for {database}.{table} is missing COLUMN_NAME"
                 ),
             })?;
             // COLUMN_TYPE is part of the resume-safety fingerprint — fail
@@ -220,15 +219,13 @@ pub async fn fetch_table_layout(
             // drift detection.
             let column_type: String = row.get("COLUMN_TYPE").ok_or_else(|| Error::Decode {
                 message: format!(
-                    "information_schema.COLUMNS row for {database}.{table}.{name} \
-                     is missing COLUMN_TYPE"
+                    "information_schema.COLUMNS row for {database}.{table}.{name} is missing COLUMN_TYPE"
                 ),
             })?;
             if name.is_empty() || column_type.is_empty() {
                 return Err(Error::Decode {
                     message: format!(
-                        "information_schema.COLUMNS row {idx} for {database}.{table} \
-                         has empty COLUMN_NAME or COLUMN_TYPE"
+                        "information_schema.COLUMNS row {idx} for {database}.{table} has empty COLUMN_NAME or COLUMN_TYPE"
                     ),
                 });
             }
