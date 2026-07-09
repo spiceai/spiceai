@@ -1,5 +1,10 @@
 # "Life of a change" landscape waterfall — 6 generations, in-memory/warm/cold bracket.
 import html
+import os
+
+# Run from this script's directory so waterfall.svg / waterfall_ls.pdf are always
+# written next to it, regardless of the caller's working directory.
+os.chdir(os.path.dirname(os.path.abspath(__file__)))
 DARK="#1e293b"; BORDER="#312e81"; ACCENT="#6366f1"; SUB="#475569"; SEQ="#6366f1"; FAINT="#94a3b8"
 def esc(s): return html.escape(s, quote=True)
 

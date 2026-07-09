@@ -3,6 +3,12 @@
 import base64, zlib, re, urllib.request, sys
 from concurrent.futures import ThreadPoolExecutor
 import markdown as md
+import os
+
+# Run from this script's directory so every relative path (cayenne.md, the
+# referenced SVG assets, the outputs, and WeasyPrint's base_url=".") resolves
+# regardless of the caller's working directory.
+os.chdir(os.path.dirname(os.path.abspath(__file__)))
 
 SRC = "cayenne.md"
 HTML_OUT = "cayenne.html"
@@ -245,5 +251,4 @@ print(f"Wrote {HTML_OUT} ({len(html)} bytes)", flush=True)
 
 from weasyprint import HTML
 HTML(string=html, base_url=".").write_pdf(PDF_OUT)
-import os
 print(f"Wrote {PDF_OUT} ({os.path.getsize(PDF_OUT)//1024} KB)", flush=True)
