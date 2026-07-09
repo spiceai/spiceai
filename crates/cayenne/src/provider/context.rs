@@ -1033,8 +1033,8 @@ mod tests {
             "base (warm) format must use target_vortex_file_size_mb"
         );
 
-        // Datalake: the cold format rolls at the cold target size, independent of the warm size.
-        // so this file size was silently 256 (the warm size).
+        // Datalake: the cold format rolls at the cold target size, independent of the warm size;
+        // previously this file size was silently 256 (the warm size).
         let cold = context.cold_write_format(config.cold_target_file_size_mb, None);
         assert_eq!(
             cold.options().target_file_size_mb,
