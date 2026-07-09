@@ -8,3 +8,6 @@ description = "AWS Glue data connector for Spice.ai runtime"
 
 [dependencies]
 runtime = { path = "../../runtime" }
+
+[lints]
+workspace = true

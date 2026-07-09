@@ -592,13 +592,35 @@ pub(crate) enum PkDeletionSnapshot {
 /// One memoized merged (file ∪ mem-tier) deletion snapshot for the scan path.
 /// See the `merged_scan_deletions` field docs for the key's torn-state proof.
 pub(crate) struct MergedScanDeletions {
-    /// `Arc::as_ptr` identity of the FILE-side index the merge was built from.
-    pub(crate) file_index_ptr: usize,
+    /// The FILE-side deletion snapshot the merge was built from, RETAINED for
+    /// the lifetime of the memo.
+    ///
+    /// The memo key's file-side identity is the `Arc::as_ptr` of this snapshot's
+    /// index ([`Self::file_index_ptr`]). Holding the `Arc` here — not merely its
+    /// raw address — is load-bearing for correctness: a live `Arc` allocation
+    /// can never be freed and its address handed to a *different* index
+    /// generation, so a pointer match proves the live file-side index IS this
+    /// same generation, never a coincidental ABA alias. Without the retention a
+    /// deletion publish could free this index and a later publish reuse its
+    /// freed address, yielding a false memo hit that serves a stale merged view
+    /// and resurrects deleted rows (#11303).
+    pub(crate) file_index: PkDeletionSnapshot,
     /// [`crate::provider::mem_tier::MemTier::version`] of the tier merged in.
     pub(crate) tier_version: u64,
     /// Structural epoch observed when the memo was built.
     pub(crate) structural_epoch: u64,
     pub(crate) merged: PkDeletionSnapshot,
+}
+
+impl MergedScanDeletions {
+    /// `Arc::as_ptr` identity of the retained file-side index — the memo key's
+    /// file-side component. Read from [`Self::file_index`] so the compared
+    /// pointer and the pinned allocation can never diverge. Always `Some` in
+    /// practice: the memo is only stored once the source index has an identity
+    /// (`PositionBased` returns before the store).
+    pub(crate) fn file_index_ptr(&self) -> Option<usize> {
+        self.file_index.index_ptr()
+    }
 }
 
 /// PK membership of a mem-tier checkpoint's flushed corpus (the visible inline +

@@ -43,3 +43,6 @@ winver = "1.0.0"
 insta.workspace = true
 regex.workspace = true
 tempfile.workspace = true
+
+[lints]
+workspace = true

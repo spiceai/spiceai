@@ -2818,8 +2818,7 @@ mod tests {
         assert!(
             indexed
                 .get_underlying()
-                .downcast_ref::<MetadataEnrichedTableProvider>()
-                .is_some()
+                .is::<MetadataEnrichedTableProvider>()
         );
 
         let wrapped_schema = wrapped.schema();

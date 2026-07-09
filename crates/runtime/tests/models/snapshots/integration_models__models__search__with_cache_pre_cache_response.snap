@@ -1,7 +1,11 @@
 ---
 source: crates/runtime/tests/models/search.rs
-expression: normalize_search_response(resp, round_scores)
+expression: "normalize_search_response(resp, round_scores)"
 ---
+{
+  "duration_ms": "duration_ms_val",
+  "results": [
+    {
       "_score": "0.94",
       "dataset": "spice.public.cached_search",
       "matches": {
@@ -11,6 +15,9 @@ expression: normalize_search_response(resp, round_scores)
       },
       "primary_key": {
         "cp_catalog_page_sk": 1
+      }
+    },
+    {
       "_score": "0.93",
       "dataset": "spice.public.cached_search",
       "matches": {
@@ -20,6 +27,9 @@ expression: normalize_search_response(resp, round_scores)
       },
       "primary_key": {
         "cp_catalog_page_sk": 15
+      }
+    },
+    {
       "_score": "0.93",
       "dataset": "spice.public.cached_search",
       "matches": {
@@ -29,6 +39,9 @@ expression: normalize_search_response(resp, round_scores)
       },
       "primary_key": {
         "cp_catalog_page_sk": 3
+      }
+    },
+    {
       "_score": "0.92",
       "dataset": "spice.public.cached_search",
       "matches": {
@@ -38,6 +51,9 @@ expression: normalize_search_response(resp, round_scores)
       },
       "primary_key": {
         "cp_catalog_page_sk": 7
+      }
+    },
+    {
       "_score": "0.91",
       "dataset": "spice.public.cached_search",
       "matches": {
@@ -47,6 +63,9 @@ expression: normalize_search_response(resp, round_scores)
       },
       "primary_key": {
         "cp_catalog_page_sk": 10
+      }
+    },
+    {
       "_score": "0.91",
       "dataset": "spice.public.cached_search",
       "matches": {
@@ -56,6 +75,9 @@ expression: normalize_search_response(resp, round_scores)
       },
       "primary_key": {
         "cp_catalog_page_sk": 2
+      }
+    },
+    {
       "_score": "0.91",
       "dataset": "spice.public.cached_search",
       "matches": {
@@ -65,6 +87,9 @@ expression: normalize_search_response(resp, round_scores)
       },
       "primary_key": {
         "cp_catalog_page_sk": 17
+      }
+    },
+    {
       "_score": "0.90",
       "dataset": "spice.public.cached_search",
       "matches": {
@@ -74,6 +99,9 @@ expression: normalize_search_response(resp, round_scores)
       },
       "primary_key": {
         "cp_catalog_page_sk": 8
+      }
+    },
+    {
       "_score": "0.90",
       "dataset": "spice.public.cached_search",
       "matches": {
@@ -83,6 +111,9 @@ expression: normalize_search_response(resp, round_scores)
       },
       "primary_key": {
         "cp_catalog_page_sk": 19
+      }
+    },
+    {
       "_score": "0.90",
       "dataset": "spice.public.cached_search",
       "matches": {
@@ -92,6 +123,9 @@ expression: normalize_search_response(resp, round_scores)
       },
       "primary_key": {
         "cp_catalog_page_sk": 14
+      }
+    },
+    {
       "_score": "0.89",
       "dataset": "spice.public.cached_search",
       "matches": {
@@ -101,6 +135,9 @@ expression: normalize_search_response(resp, round_scores)
       },
       "primary_key": {
         "cp_catalog_page_sk": 18
+      }
+    },
+    {
       "_score": "0.89",
       "dataset": "spice.public.cached_search",
       "matches": {
@@ -110,6 +147,9 @@ expression: normalize_search_response(resp, round_scores)
       },
       "primary_key": {
         "cp_catalog_page_sk": 11
+      }
+    },
+    {
       "_score": "0.89",
       "dataset": "spice.public.cached_search",
       "matches": {
@@ -119,6 +159,9 @@ expression: normalize_search_response(resp, round_scores)
       },
       "primary_key": {
         "cp_catalog_page_sk": 13
+      }
+    },
+    {
       "_score": "0.88",
       "dataset": "spice.public.cached_search",
       "matches": {
@@ -128,6 +171,9 @@ expression: normalize_search_response(resp, round_scores)
       },
       "primary_key": {
         "cp_catalog_page_sk": 12
+      }
+    },
+    {
       "_score": "0.87",
       "dataset": "spice.public.cached_search",
       "matches": {
@@ -137,6 +183,9 @@ expression: normalize_search_response(resp, round_scores)
       },
       "primary_key": {
         "cp_catalog_page_sk": 20
+      }
+    },
+    {
       "_score": "0.87",
       "dataset": "spice.public.cached_search",
       "matches": {
@@ -146,6 +195,9 @@ expression: normalize_search_response(resp, round_scores)
       },
       "primary_key": {
         "cp_catalog_page_sk": 5
+      }
+    },
+    {
       "_score": "0.86",
       "dataset": "spice.public.cached_search",
       "matches": {
@@ -155,6 +207,9 @@ expression: normalize_search_response(resp, round_scores)
       },
       "primary_key": {
         "cp_catalog_page_sk": 9
+      }
+    },
+    {
       "_score": "0.84",
       "dataset": "spice.public.cached_search",
       "matches": {
@@ -164,6 +219,9 @@ expression: normalize_search_response(resp, round_scores)
       },
       "primary_key": {
         "cp_catalog_page_sk": 16
+      }
+    },
+    {
       "_score": "0.82",
       "dataset": "spice.public.cached_search",
       "matches": {
@@ -173,3 +231,7 @@ expression: normalize_search_response(resp, round_scores)
       },
       "primary_key": {
         "cp_catalog_page_sk": 6
+      }
+    }
+  ]
+}

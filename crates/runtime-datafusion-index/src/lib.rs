@@ -23,7 +23,9 @@ use snafu::prelude::*;
 
 pub mod analyzer;
 mod provider;
+pub mod util;
 pub use provider::*;
+pub use util::{INDEXED_INNER, InnerProviderFn, find_concrete_table_provider_with};
 
 #[derive(Debug, Snafu)]
 pub enum Error {

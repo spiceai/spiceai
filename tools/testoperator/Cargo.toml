@@ -67,3 +67,6 @@ sqlite = []
 turso = []
 
 append = ["test-framework/file_append"]
+
+[lints]
+workspace = true
