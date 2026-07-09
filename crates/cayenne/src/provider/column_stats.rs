@@ -114,7 +114,7 @@ impl ColumnStatsAccumulator {
         Self::new_with_ndv(schema, true)
     }
 
-    /// Create a new accumulator, optionally skipping per-column NDV (HyperLogLog)
+    /// Create a new accumulator, optionally skipping per-column NDV (`HyperLogLog`)
     /// maintenance.
     ///
     /// With `compute_ndv = false` no sketch is allocated, so [`update`](Self::update)

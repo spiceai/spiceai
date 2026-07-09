@@ -291,9 +291,9 @@ impl NdvSketches {
             return None;
         }
         let columns = body.chunks_exact(record).take(num_columns).map(|rec| {
-            // rec.len() == record == 4 + m by construction, so the index is
-            // exactly 4 bytes and the register slice is `m` bytes.
-            let idx = u32::from_le_bytes(rec[..4].try_into().expect("4-byte column index"));
+            // rec.len() == record == 4 + m by construction, so the leading 4
+            // bytes are the column index and the rest is the register slice.
+            let idx = u32::from_le_bytes([rec[0], rec[1], rec[2], rec[3]]);
             (idx, &rec[4..])
         });
         Some((precision, columns))
@@ -537,7 +537,10 @@ mod tests {
         let mut truncated = good.serialize().expect("serialize");
         truncated.truncate(truncated.len() - 10);
         base.merge_serialized(&truncated);
-        assert_eq!(base, before, "a malformed blob must leave the accumulator unchanged");
+        assert_eq!(
+            base, before,
+            "a malformed blob must leave the accumulator unchanged"
+        );
     }
 
     #[test]
