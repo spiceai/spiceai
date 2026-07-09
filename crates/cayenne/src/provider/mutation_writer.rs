@@ -1207,6 +1207,20 @@ impl<'a> AppendMutationWriter<'a> {
             deletion_start,
         );
 
+        // A write that carried no rows produced no data files, so the snapshot
+        // directory was never materialized on disk (the Vortex sink only
+        // creates it when writing a file) and there is nothing to fsync,
+        // sequence, or protect. Publish any on-conflict update without a
+        // protected-snapshot entry and skip the sequence record — recording a
+        // snapshot that has no directory would fail the directory sync with
+        // NotFound and leave the catalog referencing a phantom snapshot. This
+        // is the steady state of a scheduled append refresh whose source has
+        // no new rows.
+        if rows == 0 {
+            self.table.commit_on_conflict_publish(update, None).await;
+            return Ok((rows, stats_acc, validated_keys, superseded));
+        }
+
         // `publish` is the metastore finalization total; the sub-phases attribute
         // it — `publish_seq` is sequence allocation + the durable sequence record,
         // `publish_cas` is the atomic deletion-cache + protected-snapshot publish.

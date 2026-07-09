@@ -516,6 +516,7 @@ const CACHE_MAINTENANCE_INTERVAL: std::time::Duration = std::time::Duration::fro
 
 // Allow 30 seconds for tasks for graceful shutdown
 const RUNTIME_DEFAULT_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(30);
+const CAYENNE_COMPACTION_SHUTDOWN_TIMEOUT: Duration = Duration::from_mins(2);
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
@@ -1771,6 +1772,11 @@ impl Runtime {
             "Shutdown initiated; waiting up to {shutdown_timeout:?} for connections to drain"
         );
 
+        // Stop new Cayenne compaction-runtime passes as soon as shutdown begins.
+        // In-flight passes remain counted and are drained below before the
+        // dedicated compaction runtime itself can be dropped.
+        cayenne::begin_compaction_shutdown();
+
         let start_time = Instant::now();
 
         // Shutdown running components in phases so request-serving tasks drain
@@ -1807,6 +1813,24 @@ impl Runtime {
 
         // Clean up DataFusion first as there could be datasets loading and accessing registries below.
         self.df.shutdown().await;
+
+        let in_flight = cayenne::in_flight_compaction_tasks();
+        if in_flight > 0 {
+            let compaction_timeout = CAYENNE_COMPACTION_SHUTDOWN_TIMEOUT;
+            tracing::debug!(
+                in_flight,
+                ?compaction_timeout,
+                "Waiting for in-flight Cayenne compaction passes before dropping compaction runtime"
+            );
+            if !cayenne::drain_compaction_tasks(compaction_timeout).await {
+                tracing::warn!(
+                    remaining = cayenne::in_flight_compaction_tasks(),
+                    ?compaction_timeout,
+                    "Timed out waiting for Cayenne compaction passes during shutdown"
+                );
+            }
+        }
+
         dataconnector::unregister_all().await;
         catalogconnector::unregister_all().await;
         self.accelerator_engine_registry.unregister_all().await;
