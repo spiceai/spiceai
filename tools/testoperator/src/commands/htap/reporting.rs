@@ -28,19 +28,39 @@ use test_framework::opentelemetry::KeyValue;
 /// to a segment even when fully caught up.
 const CAUGHT_UP_WAL_EPSILON: f64 = 16.0 * 1024.0 * 1024.0;
 
+/// Headline replication-lag figures across all datasets — the worst (max over
+/// datasets) of the last-observed lag, its P99, and its max over the under-load
+/// window. Returned by [`emit_replication_metrics`] so the run summary can surface
+/// the single worst-lag number without re-parsing the scraped series.
+#[derive(Debug, Clone, Copy, Default)]
+pub(super) struct ReplicationLagSummary {
+    /// Worst (across datasets) last-observed lag, in milliseconds.
+    pub last: f64,
+    /// Worst (across datasets) P99 lag over the under-load window, in milliseconds.
+    pub p99: f64,
+    /// Worst (across datasets) max lag over the under-load window, in milliseconds.
+    pub max: f64,
+}
+
 /// Emits replication metrics scraped from spiced's `/metrics` endpoint.
 ///
 /// `phase` labels the scrape context (e.g. "under load", "post-drain re-scrape").
 /// `record_telemetry` controls whether the values are recorded to OpenTelemetry —
 /// only the primary under-load scrape should be recorded so diagnostic re-scrapes
 /// don't overwrite the headline lag metric.
+///
+/// Returns the headline worst-lag figures across all datasets, or `None` when the
+/// `*_replication_lag_ms` series was not scraped for any dataset — either because no
+/// replication metrics were scraped at all (non-Cayenne / no CDC) or because other
+/// replication counters were present but the lag gauge was absent. The rest of the
+/// replication table still prints in the latter case; only the lag summary is `None`.
 pub(super) fn emit_replication_metrics(
     metrics: &crate::spiced_metrics::SpicedMetrics,
     engine: &str,
     pg_stats: &[crate::pg_stats::PgStatSample],
     phase: &str,
     record_telemetry: bool,
-) {
+) -> Option<ReplicationLagSummary> {
     use std::collections::{BTreeMap, BTreeSet};
 
     // spiced names replication metrics per source connector, e.g.
@@ -153,7 +173,7 @@ pub(super) fn emit_replication_metrics(
         && recv_errors.is_empty()
         && reconnects.is_empty()
     {
-        return;
+        return None;
     }
 
     println!("\nReplication Metrics ({phase})");
@@ -328,12 +348,26 @@ pub(super) fn emit_replication_metrics(
     }
     println!();
 
+    // The lag figures are meaningful only if the `*_replication_lag_ms` series was
+    // actually scraped. When it is absent (e.g. counters present but no lag gauge),
+    // `worst_lag_*` stay at 0 — reporting that as "0.00 s lag" would falsely read as
+    // perfect replication, so record no headline lag telemetry and return no summary.
+    if lag_ms.is_empty() && lag_ms_series.is_empty() {
+        return None;
+    }
+
     // Headline: worst replication lag across all datasets (last value, P99, and max).
     if record_telemetry {
         crate::metrics::REPLICATION_LAG_MS.record(worst_lag_ms, &[]);
         crate::metrics::REPLICATION_LAG_P99_MS.record(worst_lag_p99, &[]);
         crate::metrics::REPLICATION_LAG_MAX_MS.record(worst_lag_max, &[]);
     }
+
+    Some(ReplicationLagSummary {
+        last: worst_lag_ms,
+        p99: worst_lag_p99,
+        max: worst_lag_max,
+    })
 }
 
 /// Emits the p90 and p99 of Cayenne read amplification (`cayenne_ingest_read_amp`)
@@ -809,6 +843,129 @@ pub(super) fn emit_backpressure_summary(metrics: &crate::spiced_metrics::SpicedM
         println!("  Mem-tier bytes used: max={max:.0} of total={total:.0}");
     }
     println!();
+}
+
+/// A single analytical query's headline figures for the run summary.
+pub(super) struct QuerySummaryRow {
+    pub query_name: String,
+    pub passed: bool,
+    pub iterations: usize,
+    pub median_ms: u64,
+    pub p90_ms: u64,
+    pub p99_ms: u64,
+}
+
+/// OLTP figures for the run summary (absent when the OLTP task errored, so the
+/// summary can still report the analytical + replication results it does have).
+pub(super) struct OltpSummary {
+    pub tpmc: f64,
+    pub total_committed: u64,
+    pub total_aborted: u64,
+    pub abort_rate: f64,
+}
+
+/// Headline results for one HTAP run, assembled by the caller from the reporting
+/// sections it already computes and rendered to Markdown for the CI job summary.
+pub(super) struct RunSummary {
+    pub qph: f64,
+    pub completed_queries: usize,
+    pub elapsed_secs: f64,
+    pub oltp: Option<OltpSummary>,
+    pub lag: Option<ReplicationLagSummary>,
+    pub queries: Vec<QuerySummaryRow>,
+}
+
+impl RunSummary {
+    /// Render the headline results as GitHub-flavored Markdown. Writes go to an
+    /// in-memory `String`, which never fails, so the `fmt::Result`s are discarded.
+    fn to_markdown(&self) -> String {
+        use std::fmt::Write as _;
+
+        // Lag is scraped in ms; report seconds to match the `cayenne_goal_*` SLOs.
+        let lag_s = |ms: f64| format!("{:.2} s", ms / 1000.0);
+
+        let mut out = String::new();
+        let _ = writeln!(out, "## Results\n");
+        let _ = writeln!(out, "| Metric | Value |\n| --- | --- |");
+
+        if let Some(oltp) = &self.oltp {
+            let _ = writeln!(out, "| tpmC (NewOrder/min) | {:.1} |", oltp.tpmc);
+            let _ = writeln!(
+                out,
+                "| OLTP transactions | {} committed, {} aborted ({:.2}% abort) |",
+                oltp.total_committed,
+                oltp.total_aborted,
+                oltp.abort_rate * 100.0,
+            );
+        } else {
+            let _ = writeln!(out, "| tpmC (NewOrder/min) | _OLTP results unavailable_ |");
+        }
+
+        let _ = writeln!(out, "| QPH (analytical queries/hour) | {:.1} |", self.qph);
+        let _ = writeln!(
+            out,
+            "| Analytical queries completed | {} in {:.1}s |",
+            self.completed_queries, self.elapsed_secs,
+        );
+
+        if let Some(lag) = &self.lag {
+            let _ = writeln!(
+                out,
+                "| Worst replication lag (last) | {} |",
+                lag_s(lag.last)
+            );
+            let _ = writeln!(out, "| Worst replication lag (p99) | {} |", lag_s(lag.p99));
+            let _ = writeln!(out, "| Worst replication lag (max) | {} |", lag_s(lag.max));
+        } else {
+            let _ = writeln!(
+                out,
+                "| Worst replication lag | _no replication lag metrics_ |"
+            );
+        }
+
+        if !self.queries.is_empty() {
+            let _ = writeln!(out, "\n### Per-query latency\n");
+            let _ = writeln!(
+                out,
+                "| Query | Status | Iterations | Median (ms) | P90 (ms) | P99 (ms) |\n| --- | --- | --- | --- | --- | --- |",
+            );
+            for q in &self.queries {
+                let status = if q.passed { "✅" } else { "❌" };
+                let _ = writeln!(
+                    out,
+                    "| {} | {} | {} | {} | {} | {} |",
+                    q.query_name, status, q.iterations, q.median_ms, q.p90_ms, q.p99_ms,
+                );
+            }
+        }
+
+        out
+    }
+}
+
+/// Write the headline run summary as Markdown to `path`. CI appends this to the
+/// GitHub Actions job summary so tpmC / QPH / lag / per-query latencies are visible
+/// without opening the run log. The write is moved to a blocking thread so it can't
+/// stall the async runtime (repo guidance forbids blocking in async paths).
+pub(super) async fn write_run_summary(
+    path: &std::path::Path,
+    summary: &RunSummary,
+) -> anyhow::Result<()> {
+    let markdown = summary.to_markdown();
+    let path = path.to_path_buf();
+    tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+        if let Some(parent) = path.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("creating run-summary directory {}", parent.display()))?;
+        }
+        std::fs::write(&path, markdown)
+            .with_context(|| format!("writing run summary to {}", path.display()))?;
+        Ok(())
+    })
+    .await
+    .context("run-summary write task failed to join (panicked or was cancelled)")?
 }
 
 /// Serializes the full scraped metrics time-series plus run metadata to `path` as
