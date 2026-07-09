@@ -1602,7 +1602,7 @@ impl RefreshTask {
             // the server clock, which would inflate the applied frontier + lag gauge
             // (applied appearing to outrun received). See ChangeBatch::is_heartbeat.
             .filter(|env| !env.is_heartbeat())
-            .filter_map(|env| env.source_commit_ts_ms())
+            .filter_map(cdc::ChangeEnvelope::source_commit_ts_ms)
             .max();
         if let Some(ts) = max_commit_ts_ms {
             metrics::CDC_RECEIVED_COMMIT_UNIX_TIME_MS.record(ts, labels);

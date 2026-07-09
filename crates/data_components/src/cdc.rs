@@ -325,10 +325,15 @@ impl LazyChangeBatch {
         if let Some(b) = self.built.get() {
             return b.record.num_rows() == 0;
         }
+        // `is_some_and`, not `is_none_or`: a `None` source is only reachable
+        // after a failed deferred build (a successful build populates `built`
+        // and short-circuits above). That's an error state, not an empty batch —
+        // report not-empty so a caller can't treat a failed envelope as a
+        // skippable empty one and swallow the error.
         self.source
             .lock()
             .as_deref()
-            .is_none_or(ChangeRows::is_empty)
+            .is_some_and(ChangeRows::is_empty)
     }
 
     fn num_rows_hint(&self) -> usize {
