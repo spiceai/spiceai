@@ -678,15 +678,15 @@ impl<'a> AppendMutationWriter<'a> {
     /// `mode: memory`. Drains the validated stream into RAM, computes the
     /// on-conflict tombstones in memory, and appends to the mem tier (returning the
     /// mem-tier epoch) under byte caps (per-table, plus a process-wide one when the
-    /// runtime has installed the global budget). The caps bound the resident tier,
-    /// not a single apply: each prepared burst is buffered fully in RAM before the
-    /// cap is checked.
+    /// runtime has installed the global budget) that bound the resident tier.
     ///
-    /// The modes diverge on cap breach and slot ack. `cdc_durability: memory` spills
-    /// the tier durable on breach (and, under sustained overload, falls back to the
-    /// durable path), and the runtime DEFERS the source slot ack behind the covering
-    /// durable checkpoint. `mode: memory` never checkpoints or spills: a breach
-    /// returns `MemTierLimitExceeded`, and the runtime commits the slot immediately.
+    /// The modes diverge on cap breach and slot ack. `cdc_durability: memory`
+    /// buffers the whole burst, then on breach spills the tier durable (and, under
+    /// sustained overload, falls back to the durable path), and the runtime DEFERS
+    /// the source slot ack behind the covering durable checkpoint. `mode: memory`
+    /// never checkpoints or spills: it enforces the RAM bound incrementally as the
+    /// burst is buffered — an oversized burst returns `MemTierLimitExceeded` before
+    /// it can allocate toward OOM — and the runtime commits the slot immediately.
     /// PK conflict validation still runs either way (it populated `post_validation`
     /// as the stream was prepared).
     async fn write_cdc_in_memory(
@@ -708,6 +708,20 @@ impl<'a> AppendMutationWriter<'a> {
             let batch = batch?;
             incoming_bytes = incoming_bytes.saturating_add(batch.get_array_memory_size() as u64);
             incoming_rows = incoming_rows.saturating_add(batch.num_rows() as u64);
+            // Memory mode never spills, so enforce the per-table RAM bound AS the
+            // burst is buffered: an oversized burst fails fast with the structured
+            // error instead of allocating the whole burst toward OOM before the
+            // post-drain check. `spill_mem_tier_if_cap_breached` errors (does not
+            // checkpoint) in memory mode; the cheap `mem_tier_per_table_cap_breached`
+            // pre-check keeps it off the hot path until the cap is actually breached.
+            // Non-memory CDC keeps buffering here and spills after the drain (below).
+            if self.table.is_memory_resident_mode()
+                && self.table.mem_tier_per_table_cap_breached(incoming_bytes)
+            {
+                self.table
+                    .spill_mem_tier_if_cap_breached(incoming_bytes)
+                    .await?;
+            }
             batches.push(batch);
         }
         drop(prepared_stream);

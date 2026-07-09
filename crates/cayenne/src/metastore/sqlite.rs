@@ -254,8 +254,9 @@ async fn configure_sqlite_connection(
                 }
                 if in_memory {
                     // In-memory databases don't support WAL — use the MEMORY
-                    // rollback journal. synchronous/mmap/wal_autocheckpoint are
-                    // meaningless without a backing file, so skip them.
+                    // rollback journal and set synchronous OFF (no backing file to
+                    // fsync). mmap_size / wal_autocheckpoint are meaningless without
+                    // a file and are skipped below.
                     conn.pragma_update(None, "journal_mode", "MEMORY")?;
                     conn.pragma_update(None, "synchronous", "OFF")?;
                 } else {
