@@ -27,15 +27,15 @@ use crate::datafusion::{DataFusion, query::QueryMethod};
 
 use super::{Query, tracker::QueryTracker};
 
-enum SqlOrPlan<'a> {
-    Sql(&'a str),
+enum SqlOrPlan {
+    Sql(Arc<str>),
     /// Pre-parsed plan with the original SQL retained for cache key compatibility.
     Plan(Box<LogicalPlan>, Arc<str>),
 }
 
-pub struct QueryBuilder<'a> {
+pub struct QueryBuilder {
     df: Arc<DataFusion>,
-    method: SqlOrPlan<'a>,
+    method: SqlOrPlan,
     parameters: Option<ParamValues>,
     table_allowlist: Option<ResolvedTableAwareAllowlist>,
     query_id: Uuid,
@@ -43,8 +43,25 @@ pub struct QueryBuilder<'a> {
     read_only: bool,
 }
 
-impl<'a> QueryBuilder<'a> {
-    pub fn new(sql: &'a str, df: Arc<DataFusion>) -> Self {
+impl QueryBuilder {
+    pub fn new(sql: &str, df: Arc<DataFusion>) -> Self {
+        Self {
+            df,
+            method: SqlOrPlan::Sql(Arc::from(sql)),
+            parameters: None,
+            query_id: Uuid::new_v4(),
+            table_allowlist: None,
+            cancellation_token: None,
+            read_only: false,
+        }
+    }
+
+    /// Build a query from an already-owned [`Arc<str>`] SQL string.
+    ///
+    /// Prefer this over [`Self::new`] when the caller already holds an
+    /// `Arc<str>` (for example after decoding an HTTP body) so the SQL is not
+    /// copied again.
+    pub fn new_arc(sql: Arc<str>, df: Arc<DataFusion>) -> Self {
         Self {
             df,
             method: SqlOrPlan::Sql(sql),
@@ -144,7 +161,7 @@ impl<'a> QueryBuilder<'a> {
 
         let query_method = match self.method {
             SqlOrPlan::Sql(sql) => QueryMethod::Text {
-                sql: sql.into(),
+                sql,
                 parameters: self.parameters,
                 table_allowlist: self.table_allowlist,
                 pre_parsed_plan: None,
