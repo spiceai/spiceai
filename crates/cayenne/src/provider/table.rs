@@ -13564,7 +13564,7 @@ impl CayenneTableProvider {
     ) -> Result<super::cold_partition::ColdFilePartition> {
         use super::cold_partition::{
             ColdFilePartition, decode_int64_tombstone_keys, decode_tombstone_keys,
-            partition_cold_files,
+            encode_int64_bloom_probes, partition_cold_files,
         };
 
         let internal = |message: String| Error::Internal {
@@ -13631,9 +13631,22 @@ impl CayenneTableProvider {
             ));
         };
 
+        // Bloom probe bytes, index-aligned with `decoded`: composite DV keys
+        // are already the converter row encoding the per-file blooms insert;
+        // Int64 DV keys are raw BE and must be re-encoded. `None` merely
+        // disables the bloom refinement (rectangle-only classification).
+        let bloom_probes: Option<Vec<Box<[u8]>>> = if self.pk_row_converter.is_some() {
+            Some(key_bytes)
+        } else {
+            self.build_pk_converter(&self.pk_column_indices)
+                .ok()
+                .and_then(|converter| encode_int64_bloom_probes(&converter, &decoded))
+        };
+
         Ok(partition_cold_files(
             cold_files,
             &decoded,
+            bloom_probes.as_deref(),
             &self.table_metadata.schema,
             &self.pk_column_indices,
         ))
