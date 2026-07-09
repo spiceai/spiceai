@@ -839,24 +839,39 @@ async fn test_distributed_acceleration_join_two_partitioned_tables() -> Result<(
 
             for table_name in ["test_data", "categories"] {
                 let table_ref = datafusion::sql::TableReference::parse_str(table_name);
-                let assigned = crate::utils::wait_until_true(Duration::from_secs(30), || async {
-                    partition_store.refresh().await.ok();
-                    partition_store
-                        .get_table_metadata(&table_ref)
-                        .await
-                        .ok()
-                        .flatten()
-                        .is_some_and(|m| {
-                            m.partitions.len() == 4
-                                && m.partitions
+                let distributed =
+                    crate::utils::wait_until_true(Duration::from_secs(60), || async {
+                        partition_store.refresh().await.ok();
+                        partition_store
+                            .get_table_metadata(&table_ref)
+                            .await
+                            .ok()
+                            .flatten()
+                            .is_some_and(|m| {
+                                if m.partitions.len() != 4
+                                    || !m
+                                        .partitions
+                                        .iter()
+                                        .all(runtime::cluster::PartitionMetadata::is_assigned)
+                                {
+                                    return false;
+                                }
+                                // EXPLAIN expects a Union of FlightSqlExec across
+                                // both executors; assignment-only is not enough —
+                                // early allocate can park every partition of a
+                                // table on the first executor that finishes bind.
+                                let executors: std::collections::HashSet<&String> = m
+                                    .partitions
                                     .iter()
-                                    .all(runtime::cluster::PartitionMetadata::is_assigned)
-                        })
-                })
-                .await;
+                                    .flat_map(|p| p.assigned_executors.iter())
+                                    .collect();
+                                executors.len() >= 2
+                            })
+                    })
+                    .await;
                 assert!(
-                    assigned,
-                    "All 4 partitions for {table_name} should be assigned"
+                    distributed,
+                    "All 4 partitions for {table_name} should be assigned across 2 executors"
                 );
             }
 

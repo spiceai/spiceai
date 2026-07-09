@@ -21,6 +21,7 @@ use std::{
 };
 
 use aws_sdk_credential_bridge::S3CredentialProvider;
+use dashmap::{DashMap, mapref::entry::Entry};
 use datafusion::{
     error::DataFusionError,
     execution::{
@@ -34,6 +35,33 @@ use object_store::{
 };
 use tokio::runtime::Handle;
 use url::{Url, form_urlencoded::parse};
+
+/// Records how a cached object store entry was built so fragment-aware lookups
+/// can repair a poisoned (env-default) entry without clobbering deliberate
+/// external registrations.
+///
+/// Non-empty fragments are stored as a blake3 digest so credential fields that
+/// travel in the URL fragment (`key`, `secret`, `session_token`, …) are not
+/// retained in the registry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum StoreConfig {
+    /// Built from a bare URL (empty fragment / env-default).
+    Bare,
+    /// Built from a non-empty URL fragment; blake3 of the raw fragment bytes.
+    Fragment([u8; 32]),
+    /// Registered via [`ObjectStoreRegistry::register_store`] by outside code.
+    External,
+}
+
+impl StoreConfig {
+    fn from_fragment(fragment: &str) -> Self {
+        if fragment.is_empty() {
+            Self::Bare
+        } else {
+            Self::Fragment(*blake3::hash(fragment.as_bytes()).as_bytes())
+        }
+    }
+}
 
 #[cfg(feature = "ftp")]
 use crate::store::ftp::FTPObjectStore;
@@ -96,6 +124,9 @@ static S3_STYLE_STATE: LazyLock<Mutex<S3StyleState>> =
 pub struct SpiceObjectStoreRegistry {
     inner: DefaultObjectStoreRegistry,
     io_runtime: Handle,
+    /// Per-key fingerprint of the configuration that built the cached store.
+    /// Key matches `DataFusion`'s private `get_url_key` (`scheme://host:port`).
+    configs: DashMap<String, StoreConfig>,
 }
 
 impl SpiceObjectStoreRegistry {
@@ -104,7 +135,22 @@ impl SpiceObjectStoreRegistry {
         Self {
             inner: DefaultObjectStoreRegistry::new(),
             io_runtime,
+            configs: DashMap::new(),
         }
+    }
+
+    /// Registry key matching `DataFusion`'s private `get_url_key`
+    /// (`BeforeHost..AfterPort`) — fragment and userinfo/credentials are
+    /// stripped so `s3://bucket#region=...` and bare `s3://bucket` share one
+    /// slot. This intentionally matches `DataFusion`'s store map keying (not
+    /// `BeforeUsername`); Azure container-in-userinfo URLs are handled by the
+    /// Azure builder path before registry lookup.
+    fn url_key(url: &Url) -> String {
+        format!(
+            "{}://{}",
+            url.scheme(),
+            &url[url::Position::BeforeHost..url::Position::AfterPort],
+        )
     }
 
     /// Parse `url_style` parameter. Returns `Some(VirtualHosted)` for vhost, `Some(Path)` for path,
@@ -324,6 +370,17 @@ impl SpiceObjectStoreRegistry {
 
         if let Some(region) = params.get("region") {
             s3_builder = s3_builder.with_region(region);
+        } else if std::env::var_os("AWS_REGION").is_none()
+            && std::env::var_os("AWS_DEFAULT_REGION").is_none()
+        {
+            // AmazonS3Builder::from_env() falls back to the object_store crate
+            // default (us-east-1) when neither a fragment region nor AWS_* env
+            // is set. Log so a later redirect/wrong-endpoint failure has a
+            // smoking gun in the executor logs.
+            tracing::debug!(
+                bucket = %bucket_name,
+                "Building S3 object store with no region param and no AWS_REGION/AWS_DEFAULT_REGION; falling back to object_store default (us-east-1)"
+            );
         }
         if let Some(endpoint) = params.get("endpoint") {
             let endpoint = Self::endpoint_for_s3_url_style(endpoint, bucket_name, url_style)?;
@@ -739,19 +796,122 @@ impl ObjectStoreRegistry for SpiceObjectStoreRegistry {
         url: &Url,
         store: Arc<dyn ObjectStore>,
     ) -> Option<Arc<dyn ObjectStore>> {
-        self.inner.register_store(url, store)
+        let key = Self::url_key(url);
+        // Hold the configs entry while updating the inner store so concurrent
+        // rebuilds can't leave the two maps disagreeing.
+        let entry = self.configs.entry(key);
+        let previous = self.inner.register_store(url, store);
+        entry.insert(StoreConfig::External);
+        previous
     }
 
     fn get_store(&self, url: &Url) -> datafusion::error::Result<Arc<dyn ObjectStore>> {
-        self.inner.get_store(url).or_else(|_| {
+        let key = Self::url_key(url);
+        let fragment = url.fragment().unwrap_or("");
+
+        if fragment.is_empty() {
+            // Bare URL: return cached entry if present; never evict a configured store.
+            if let Ok(store) = self.inner.get_store(url) {
+                return Ok(store);
+            }
             let store = self.get_feature_store(url)?;
-            self.inner.register_store(url, Arc::clone(&store));
-            Ok(store)
-        })
+            return Ok(self.register_built_store(url, key, StoreConfig::Bare, store));
+        }
+
+        // Fragment-bearing URL: reuse only when fingerprint matches or the
+        // entry was deliberately registered externally. Re-check the
+        // fingerprint after `inner.get_store` so a concurrent rebuild cannot
+        // hand us a store for a different config.
+        if self.should_reuse_cached(&key, fragment)
+            && let Ok(store) = self.inner.get_store(url)
+            && self.should_reuse_cached(&key, fragment)
+        {
+            return Ok(store);
+        }
+
+        let store = self.get_feature_store(url)?;
+        Ok(self.register_built_store(url, key, StoreConfig::from_fragment(fragment), store))
     }
 
     fn deregister_store(&self, url: &Url) -> datafusion::error::Result<Arc<dyn ObjectStore>> {
-        self.inner.deregister_store(url)
+        let key = Self::url_key(url);
+        // Hold the configs entry while updating the inner store so the lock
+        // order matches `register_store` / `register_built_store`.
+        let entry = self.configs.entry(key);
+        let store = self.inner.deregister_store(url)?;
+        if let Entry::Occupied(occupied) = entry {
+            occupied.remove();
+        }
+        Ok(store)
+    }
+}
+
+impl SpiceObjectStoreRegistry {
+    fn should_reuse_cached(&self, key: &str, fragment: &str) -> bool {
+        let wanted = StoreConfig::from_fragment(fragment);
+        self.configs
+            .get(key)
+            .is_some_and(|config| match (config.value(), &wanted) {
+                (StoreConfig::External, _) | (StoreConfig::Bare, StoreConfig::Bare) => true,
+                (StoreConfig::Fragment(cached), StoreConfig::Fragment(wanted_hash)) => {
+                    cached == wanted_hash
+                }
+                _ => false,
+            })
+    }
+
+    #[cfg(test)]
+    fn store_config_for(&self, url: &Url) -> Option<StoreConfig> {
+        self.configs
+            .get(&Self::url_key(url))
+            .map(|c| c.value().clone())
+    }
+
+    /// Register a freshly built store under `key`, unless another thread already
+    /// installed a reusable entry while we were building.
+    fn register_built_store(
+        &self,
+        url: &Url,
+        key: String,
+        config: StoreConfig,
+        store: Arc<dyn ObjectStore>,
+    ) -> Arc<dyn ObjectStore> {
+        let entry = self.configs.entry(key);
+        if let Entry::Occupied(occupied) = &entry {
+            match (occupied.get(), &config) {
+                // Deliberate external registration always wins.
+                (StoreConfig::External, _) => {
+                    if let Ok(existing) = self.inner.get_store(url) {
+                        return existing;
+                    }
+                    // External marker without a store — do not clobber the marker
+                    // with a fragment-built store.
+                    return store;
+                }
+                // Identical fingerprint: reuse or re-install after a store-map miss.
+                (StoreConfig::Bare, StoreConfig::Bare)
+                | (StoreConfig::Fragment(_), StoreConfig::Fragment(_))
+                    if occupied.get() == &config =>
+                {
+                    if let Ok(existing) = self.inner.get_store(url) {
+                        return existing;
+                    }
+                    // Fall through to re-register the same fingerprint.
+                }
+                // Bare must never evict a configured fingerprint.
+                (StoreConfig::Fragment(_), StoreConfig::Bare) => {
+                    if let Ok(existing) = self.inner.get_store(url) {
+                        return existing;
+                    }
+                    return store;
+                }
+                // Different fragment (or External wanted): overwrite below.
+                _ => {}
+            }
+        }
+        self.inner.register_store(url, Arc::clone(&store));
+        entry.insert(config);
+        store
     }
 }
 
@@ -917,5 +1077,178 @@ mod tests {
         assert!(!SpiceObjectStoreRegistry::endpoint_is_ip(
             "http://minio:9000"
         ));
+    }
+
+    fn s3_url(bucket: &str, fragment: Option<&str>) -> Url {
+        let mut url = Url::parse(&format!("s3://{bucket}")).expect("valid s3 url");
+        if let Some(fragment) = fragment {
+            url.set_fragment(Some(fragment));
+        }
+        url
+    }
+
+    /// Public-auth fragment so builds don't need AWS credentials / SDK config.
+    fn region_fragment(region: &str) -> String {
+        format!("region={region}&auth=public")
+    }
+
+    #[tokio::test]
+    async fn test_poison_then_repair_replaces_env_default_store() {
+        let registry = SpiceObjectStoreRegistry::new(Handle::current());
+        let bare = s3_url("poison-repair-bucket", None);
+        let configured = s3_url("poison-repair-bucket", Some(&region_fragment("us-west-2")));
+
+        let poisoned = registry
+            .get_store(&bare)
+            .expect("bare lookup should build env-default store");
+        let repaired = registry
+            .get_store(&configured)
+            .expect("fragment lookup should rebuild with region");
+
+        assert!(
+            !Arc::ptr_eq(&poisoned, &repaired),
+            "configured lookup must replace the poisoned store"
+        );
+        assert_eq!(
+            registry.store_config_for(&configured),
+            Some(StoreConfig::from_fragment(&region_fragment("us-west-2"))),
+            "repair must record the configured fragment fingerprint"
+        );
+
+        let bare_after = registry
+            .get_store(&bare)
+            .expect("bare lookup after repair should hit cache");
+        assert!(
+            Arc::ptr_eq(&repaired, &bare_after),
+            "bare lookup must return the repaired store"
+        );
+        assert_eq!(
+            registry.store_config_for(&bare),
+            Some(StoreConfig::from_fragment(&region_fragment("us-west-2"))),
+            "bare lookup after repair must keep the configured fingerprint"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_identical_fragment_is_idempotent() {
+        let registry = SpiceObjectStoreRegistry::new(Handle::current());
+        let fragment = region_fragment("us-west-2");
+        let url = s3_url("idempotent-bucket", Some(&fragment));
+
+        let first = registry.get_store(&url).expect("first get_store");
+        let second = registry.get_store(&url).expect("second get_store");
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "identical fragment must reuse the cached Arc"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_config_change_rebuilds_store() {
+        let registry = SpiceObjectStoreRegistry::new(Handle::current());
+        let west = s3_url("config-change-bucket", Some(&region_fragment("us-west-2")));
+        let eu = s3_url(
+            "config-change-bucket",
+            Some(&region_fragment("eu-central-1")),
+        );
+
+        let first = registry.get_store(&west).expect("us-west-2 store");
+        let second = registry.get_store(&eu).expect("eu-central-1 store");
+        assert!(
+            !Arc::ptr_eq(&first, &second),
+            "different fragment must rebuild"
+        );
+        assert_eq!(
+            registry.store_config_for(&eu),
+            Some(StoreConfig::from_fragment(&region_fragment("eu-central-1"))),
+            "config change must update the fragment fingerprint"
+        );
+
+        let bare = registry
+            .get_store(&s3_url("config-change-bucket", None))
+            .expect("bare follows latest");
+        assert!(
+            Arc::ptr_eq(&second, &bare),
+            "bare lookup must follow the latest configured store"
+        );
+        assert_eq!(
+            registry.store_config_for(&s3_url("config-change-bucket", None)),
+            Some(StoreConfig::from_fragment(&region_fragment("eu-central-1"))),
+            "bare lookup must keep the latest configured fingerprint"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_external_registration_is_not_clobbered() {
+        let registry = SpiceObjectStoreRegistry::new(Handle::current());
+        let bare = s3_url("external-bucket", None);
+        let custom: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+
+        registry.register_store(&bare, Arc::clone(&custom));
+
+        let configured = s3_url("external-bucket", Some(&region_fragment("us-west-2")));
+        let got = registry
+            .get_store(&configured)
+            .expect("fragment lookup after external register");
+        assert!(
+            Arc::ptr_eq(&custom, &got),
+            "external registration must win over fragment rebuild"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_deregister_clears_config_fingerprint() {
+        let registry = SpiceObjectStoreRegistry::new(Handle::current());
+        let configured = s3_url("deregister-bucket", Some(&region_fragment("us-west-2")));
+        let configured_store = registry.get_store(&configured).expect("configured store");
+        assert_eq!(
+            registry.store_config_for(&configured),
+            Some(StoreConfig::from_fragment(&region_fragment("us-west-2"))),
+            "precondition: configured fingerprint is recorded"
+        );
+
+        registry
+            .deregister_store(&configured)
+            .expect("deregister should succeed");
+
+        assert!(
+            registry.store_config_for(&configured).is_none(),
+            "deregister must clear the configs fingerprint"
+        );
+
+        let bare = s3_url("deregister-bucket", None);
+        let rebuilt = registry
+            .get_store(&bare)
+            .expect("bare lookup after deregister rebuilds from env");
+        assert!(
+            !Arc::ptr_eq(&configured_store, &rebuilt),
+            "deregister must clear the fingerprint so bare rebuilds"
+        );
+        assert_eq!(
+            registry.store_config_for(&bare),
+            Some(StoreConfig::Bare),
+            "bare rebuild after deregister must record empty fragment fingerprint"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_bare_lookup_does_not_evict_configured_store() {
+        let registry = SpiceObjectStoreRegistry::new(Handle::current());
+        let configured = s3_url("no-evict-bucket", Some(&region_fragment("eu-west-1")));
+        let configured_store = registry.get_store(&configured).expect("configured store");
+
+        // A second bare miss path (inner already populated) must keep the
+        // configured Arc and fingerprint.
+        let bare = s3_url("no-evict-bucket", None);
+        let bare_store = registry.get_store(&bare).expect("bare after configured");
+        assert!(
+            Arc::ptr_eq(&configured_store, &bare_store),
+            "bare lookup must not replace a configured store"
+        );
+        assert_eq!(
+            registry.store_config_for(&bare),
+            Some(StoreConfig::from_fragment(&region_fragment("eu-west-1"))),
+            "configured fingerprint must remain after bare lookup"
+        );
     }
 }
