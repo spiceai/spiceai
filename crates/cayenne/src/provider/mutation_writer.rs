@@ -1274,11 +1274,16 @@ impl<'a> AppendMutationWriter<'a> {
                 .await?
             {
                 // Inline tier0 (metastore BLOB) write — the synchronous CDC hot
-                // loop. Skip NDV here: these rows contribute their distinct-count
-                // for free when the inline memtable later spills to a Vortex file
-                // at checkpoint (`write_to_snapshot` folds NDV there). Min/max/
-                // null-count stats are still maintained.
-                let stats_acc = ColumnStatsAccumulator::new_with_ndv(&schema, false);
+                // loop. By default skip NDV here (lazy): these rows contribute
+                // their distinct-count for free when the inline memtable later
+                // spills to a Vortex file at checkpoint (`write_to_snapshot` folds
+                // NDV there). `SPICE_CAYENNE_EAGER_NDV` flips this back to eager
+                // (fold on ingest) for benchmarking. Min/max/null-count stats are
+                // maintained regardless.
+                let stats_acc = ColumnStatsAccumulator::new_with_ndv(
+                    &schema,
+                    super::column_stats::eager_ndv_on_ingest(),
+                );
                 for batch in buffer.batches() {
                     stats_acc.update(batch);
                 }
