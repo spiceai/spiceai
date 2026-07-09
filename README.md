@@ -155,42 +155,6 @@ Bootstrap accelerated datasets from S3 in **seconds, not minutes**. Cold-start e
 
 If you build with **DataFusion**, **DuckDB**, **Vortex**, **Iceberg**, or **Ballista**, Spice gives you a flexible, production-ready engine you can just use — instead of stitching them together yourself.
 
-## How does Spice compare?
-
-### Data Query and Analytics
-
-| Feature                          | **Spice**                                           | Trino / Presto       | Dremio                | ClickHouse          | Materialize         |
-| -------------------------------- | --------------------------------------------------- | -------------------- | --------------------- | ------------------- | ------------------- |
-| **Primary Use-Case**             | Data & AI apps/agents                               | Big data analytics   | Interactive analytics | Real-time analytics | Real-time analytics |
-| **Primary deployment model**     | Sidecar + Cluster                                   | Cluster              | Cluster               | Cluster             | Cluster             |
-| **Federated Query Support**      | ✅                                                   | ✅                    | ✅                     | ❌                   | ❌                   |
-| **Distributed Query Execution**  | ✅ (Apache Ballista, multi-active HA)                | ✅                    | ✅                     | ✅                   | Limited             |
-| **Acceleration/Materialization** | ✅ (Cayenne/Vortex, Arrow, SQLite, DuckDB, Postgres) | Intermediate storage | Reflections (Iceberg) | Materialized views  | ✅ (Real-time views) |
-| **Catalog Support**              | ✅ (Iceberg, Unity Catalog, AWS Glue, Databricks)    | ✅                    | ✅                     | ❌                   | ❌                   |
-| **Iceberg Write (SQL INSERT)**   | ✅                                                   | ✅                    | Limited               | ❌                   | ❌                   |
-| **Query Result Caching**         | ✅                                                   | ✅                    | ✅                     | ✅                   | Limited             |
-| **Multi-Modal Acceleration**     | ✅ (OLAP + OLTP per dataset)                         | ❌                    | ❌                     | ❌                   | ❌                   |
-| **Native CDC**                   | ✅ (Postgres WAL, MySQL binlog, MongoDB, DynamoDB Streams) | ❌                    | ❌                     | ❌                   | ✅ (Debezium)        |
-| **Built-in AI / LLM inference**  | ✅                                                   | ❌                    | ❌                     | ❌                   | ❌                   |
-
-### AI Apps and Agents
-
-| Feature                       | **Spice**                                                   | LangChain          | LlamaIndex | AgentOps.ai      | Ollama                        |
-| ----------------------------- | ----------------------------------------------------------- | ------------------ | ---------- | ---------------- | ----------------------------- |
-| **Primary Use-Case**          | Data & AI apps                                              | Agentic workflows  | RAG apps   | Agent operations | LLM apps                      |
-| **Programming Language**      | Any (HTTP / Flight / ODBC / JDBC)                           | JavaScript, Python | Python     | Python           | Any language (HTTP interface) |
-| **Unified Data + AI Runtime** | ✅                                                           | ❌                  | ❌          | ❌                | ❌                             |
-| **Federated Data Query**      | ✅                                                           | ❌                  | ❌          | ❌                | ❌                             |
-| **Distributed Query**         | ✅                                                           | ❌                  | ❌          | ❌                | ❌                             |
-| **Accelerated Data Access**   | ✅                                                           | ❌                  | ❌          | ❌                | ❌                             |
-| **Tools/Functions**           | ✅ (MCP server + gateway, Streamable HTTP)                   | ✅                  | ✅          | Limited          | Limited                       |
-| **LLM Memory**                | ✅                                                           | ✅                  | ❌          | ✅                | ❌                             |
-| **Hybrid Search**             | ✅ (BM25 + vector + RRF + rerank UDTFs)                      | ✅                  | ✅          | Limited          | Limited                       |
-| **Caching**                   | ✅ (query, results, and provider-aware LLM prompt caching)   | Limited            | ❌          | ❌                | ❌                             |
-| **Embeddings**                | ✅ (Built-in & pluggable; multi-vector ColBERT-style MaxSim) | ✅                  | ✅          | Limited          | ❌                             |
-
-✅ = Fully supported · ❌ = Not supported · Limited = Partial or restricted support
-
 ## Example Use-Cases
 
 ### Real-time Analytics on Operational Data (no ETL)
