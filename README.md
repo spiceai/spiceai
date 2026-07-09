@@ -592,7 +592,7 @@ Spice.ai is designed to be extensible. See [EXTENSIBILITY.md](./docs/EXTENSIBILI
 
 - **[v2.0](https://spiceai.org/releases/v2.0-stable)** (shipped, June 2026) — Spice Cayenne GA, multi-active HA distributed query GA, native CDC (PostgreSQL WAL, MongoDB change streams, Kafka), DML/DDL write-back, mTLS + OIDC, HashiCorp Vault & Azure Key Vault, and SQL/HTTP UDFs. [Read the launch →](https://spice.ai/blog/spice-2-0-is-now-available)
 - **[v2.1](https://spiceai.org/releases/v2.1.0)** (shipped, July 2026) — High-throughput Cayenne CDC (in-memory tier + dedicated compaction runtime), PostgreSQL replication at scale (shared replication slot), distributed Iceberg scans and broadcast joins, DataFusion v54, tensor-parallel GLM inference, and adaptive self-tuning (experimental).
-- **[v2.2](https://github.com/spiceai/spiceai/milestone/99)** (upcoming, targeting September 2026) — Webhooks and reactive event-driven actions (Drasi-based).
+- **[v2.2](https://github.com/spiceai/spiceai/milestone/99)** (upcoming, targeting September 2026) — MySQL binlog CDC (already on `trunk`), webhooks, and reactive event-driven actions (Drasi-based).
 
 ### 🤝 Connect with us
 
