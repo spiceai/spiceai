@@ -48,7 +48,12 @@ use crate::utils::{
 };
 use crate::{configure_test_datafusion, init_tracing};
 
-const MYSQL_SCHEMA_INFERENCE_PORT: u16 = 13324;
+// Distinct, unused host ports per test so the two tests can start their own
+// container concurrently (Rust runs tests in parallel) without racing each other
+// or the replication suite (which uses 13324). The container name is derived from
+// the port, so a unique port also means a unique container.
+const MYSQL_EXTENDED_INFERENCE_PORT: u16 = 13328;
+const MYSQL_STANDARD_INFERENCE_PORT: u16 = 13329;
 const CHANGE_PROPAGATION_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Composite-PK table so the test also proves multi-column key inference (in key
@@ -66,13 +71,10 @@ const SEED_SQL: &str = "INSERT INTO inventory (w_id, sku, quantity) VALUES
         (1, 'B', 5),
         (2, 'A', 7)";
 
-fn mysql_params() -> HashMap<String, String> {
+fn mysql_params(port: u16) -> HashMap<String, String> {
     HashMap::from([
         ("mysql_host".to_string(), "localhost".to_string()),
-        (
-            "mysql_tcp_port".to_string(),
-            MYSQL_SCHEMA_INFERENCE_PORT.to_string(),
-        ),
+        ("mysql_tcp_port".to_string(), port.to_string()),
         ("mysql_user".to_string(), "root".to_string()),
         (
             "mysql_pass".to_string(),
@@ -90,12 +92,12 @@ fn mysql_params() -> HashMap<String, String> {
 
 /// A `refresh_mode: changes` dataset with the given inference level and, crucially,
 /// **no** `primary_key` / `on_conflict` — those must come from inference.
-fn inventory_dataset(schema_inference: SchemaInference) -> Dataset {
+fn inventory_dataset(port: u16, schema_inference: SchemaInference) -> Dataset {
     let mut dataset = Dataset::new(
         "mysql:mysqldb.inventory".to_string(),
         "inventory".to_string(),
     );
-    dataset.params = Some(Params::from_string_map(mysql_params()));
+    dataset.params = Some(Params::from_string_map(mysql_params(port)));
     dataset.schema_inference = schema_inference;
     dataset.acceleration = Some(Acceleration {
         enabled: true,
@@ -168,12 +170,12 @@ async fn test_extended_inference_enables_cdc_without_declared_pk() -> Result<(),
 
     test_request_context()
         .scope(async {
-            let _container = common::start_mysql_docker_container(MYSQL_SCHEMA_INFERENCE_PORT)
+            let _container = common::start_mysql_docker_container(MYSQL_EXTENDED_INFERENCE_PORT)
                 .await
                 .map_err(|e| anyhow!("start container: {e}"))?;
 
             // Create + seed on the source (retry to absorb InnoDB DDL-readiness races).
-            let pool = common::get_mysql_conn(MYSQL_SCHEMA_INFERENCE_PORT)?;
+            let pool = common::get_mysql_conn(MYSQL_EXTENDED_INFERENCE_PORT)?;
             let retry_strategy = FibonacciBackoffBuilder::new().max_retries(Some(10)).build();
             retry(retry_strategy, || async {
                 exec(&pool, "DROP TABLE IF EXISTS inventory")
@@ -187,7 +189,10 @@ async fn test_extended_inference_enables_cdc_without_declared_pk() -> Result<(),
             .await?;
 
             let app = AppBuilder::new("mysql_schema_inference_test")
-                .with_dataset(inventory_dataset(SchemaInference::Extended))
+                .with_dataset(inventory_dataset(
+                    MYSQL_EXTENDED_INFERENCE_PORT,
+                    SchemaInference::Extended,
+                ))
                 .build();
 
             configure_test_datafusion();
@@ -238,11 +243,11 @@ async fn test_standard_inference_full_refresh_loads() -> Result<(), anyhow::Erro
 
     test_request_context()
         .scope(async {
-            let _container = common::start_mysql_docker_container(MYSQL_SCHEMA_INFERENCE_PORT)
+            let _container = common::start_mysql_docker_container(MYSQL_STANDARD_INFERENCE_PORT)
                 .await
                 .map_err(|e| anyhow!("start container: {e}"))?;
 
-            let pool = common::get_mysql_conn(MYSQL_SCHEMA_INFERENCE_PORT)?;
+            let pool = common::get_mysql_conn(MYSQL_STANDARD_INFERENCE_PORT)?;
             let retry_strategy = FibonacciBackoffBuilder::new().max_retries(Some(10)).build();
             retry(retry_strategy, || async {
                 exec(&pool, "DROP TABLE IF EXISTS inventory")
@@ -255,7 +260,7 @@ async fn test_standard_inference_full_refresh_loads() -> Result<(), anyhow::Erro
             })
             .await?;
 
-            let mut dataset = inventory_dataset(SchemaInference::Standard);
+            let mut dataset = inventory_dataset(MYSQL_STANDARD_INFERENCE_PORT, SchemaInference::Standard);
             // Full refresh needs no primary key, so this is a clean opt-in control.
             if let Some(accel) = dataset.acceleration.as_mut() {
                 accel.refresh_mode = Some(RefreshMode::Full);
