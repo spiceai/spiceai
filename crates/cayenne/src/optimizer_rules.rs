@@ -125,6 +125,7 @@ use datafusion::physical_plan::aggregates::{AggregateExec, AggregateMode};
 use datafusion::physical_plan::joins::{HashJoinExec, SortMergeJoinExec};
 use datafusion::physical_plan::projection::ProjectionExec;
 use datafusion::physical_plan::sorts::sort::SortExec;
+use data_components::flightsql::FlightSqlExec;
 use datafusion_common::stats::Precision;
 use datafusion_physical_expr::PhysicalExpr;
 use datafusion_physical_expr::expressions::Column;
@@ -251,7 +252,17 @@ impl std::fmt::Debug for CayenneDynamicFilterSharing {
 /// no accessor to reconstruct the projection onto a sort-merge join — and fall
 /// back to the deterministic `runtime.query.prefer_hash_join` knob.
 #[derive(Default)]
-pub struct CayenneAntiJoinSortMergeRewriter;
+pub struct CayenneAntiJoinSortMergeRewriter {
+    /// Extends the memory-gated rewrite's scope to hash joins over federated
+    /// Flight SQL scans — the leaves of a distributed-acceleration plan on the
+    /// scheduler, where an oversized central build side exhausts the
+    /// coordinator's memory pool just like a local Cayenne one. Off for the
+    /// default (executor / single-node) registration so plan shapes there are
+    /// unchanged; the scheduler registers a second, federated-scoped instance
+    /// AFTER the broadcast-join pushdown so this rewrite never consumes a hash
+    /// join that rule would instead distribute onto the executors.
+    include_federated_flight_scans: bool,
+}
 
 /// Only rewrite same-source joins whose LEFT (build) input has
 /// `Precision::Exact` row count exceeding this threshold. Below it, the
@@ -289,10 +300,23 @@ impl ConfigExtension for CayenneOptimizerConfig {
 }
 
 impl CayenneAntiJoinSortMergeRewriter {
-    /// Create a new `CayenneAntiJoinSortMergeRewriter` optimizer rule.
+    /// Create a new `CayenneAntiJoinSortMergeRewriter` optimizer rule scoped to
+    /// joins that touch Cayenne scans.
     #[must_use]
     pub fn new() -> Self {
-        Self
+        Self {
+            include_federated_flight_scans: false,
+        }
+    }
+
+    /// Create a `CayenneAntiJoinSortMergeRewriter` that also rewrites oversized
+    /// hash joins over federated Flight SQL scans (the scheduler's
+    /// distributed-plan leaves). See `include_federated_flight_scans`.
+    #[must_use]
+    pub fn with_federated_flight_scans() -> Self {
+        Self {
+            include_federated_flight_scans: true,
+        }
     }
 }
 
@@ -320,13 +344,18 @@ impl PhysicalOptimizerRule for CayenneAntiJoinSortMergeRewriter {
         // the plan, so count them once up front (the original plan's join count
         // is the concurrency pressure we are budgeting against).
         let hash_join_count = count_hash_joins(&plan);
+        let include_federated_flight_scans = self.include_federated_flight_scans;
         plan.transform_down(|node| {
             let Some(hash_join) = node.downcast_ref::<HashJoinExec>() else {
                 return Ok(Transformed::no(node));
             };
 
-            let Some(sort_merge_join) =
-                try_rewrite_oversized_join(hash_join, config, hash_join_count)?
+            let Some(sort_merge_join) = try_rewrite_oversized_join(
+                hash_join,
+                config,
+                hash_join_count,
+                include_federated_flight_scans,
+            )?
             else {
                 return Ok(Transformed::no(node));
             };
@@ -752,6 +781,7 @@ fn try_rewrite_oversized_join(
     hash_join: &HashJoinExec,
     config: &ConfigOptions,
     hash_join_count: usize,
+    include_federated_flight_scans: bool,
 ) -> Result<Option<Arc<dyn ExecutionPlan>>, DataFusionError> {
     // `SortMergeJoinExec` supports these join types with spillable, explicitly
     // sorted inputs. Inner and outer joins are included here (unlike the legacy
@@ -796,7 +826,9 @@ fn try_rewrite_oversized_join(
         // the pool. Build-side row counts may be inexact here: a build side that
         // is itself a join result rarely carries exact statistics, and an
         // inexact estimate is enough to choose spilling over an OOM.
-        if !join_touches_cayenne(hash_join) {
+        if !join_touches_cayenne(hash_join)
+            && !(include_federated_flight_scans && join_touches_federated_flight_scan(hash_join))
+        {
             return Ok(None);
         }
         let Some(build_row_count) = build_input_row_estimate(hash_join) else {
@@ -921,6 +953,37 @@ fn build_input_row_estimate(hash_join: &HashJoinExec) -> Option<usize> {
 fn join_touches_cayenne(hash_join: &HashJoinExec) -> bool {
     !collect_cayenne_scans(hash_join.left()).is_empty()
         || !collect_cayenne_scans(hash_join.right()).is_empty()
+}
+
+/// Execution plans produced by the scheduler's Flight SQL pushdown rules
+/// (partial-aggregate and broadcast-join) that, like a plain [`FlightSqlExec`],
+/// mark a subtree as a federated executor scan. Their concrete types live in
+/// `datafusion-optimizer-rules`, which this crate cannot depend on, so they are
+/// identified by [`ExecutionPlan::name`] — the same convention those rules use
+/// for their own pass-through checks.
+const FEDERATED_FLIGHT_EXEC_NAMES: &[&str] =
+    &["PartialAggregationFlightSqlExec", "BroadcastJoinFlightSqlExec"];
+
+/// Whether either side of the join reads from a federated Flight SQL scan —
+/// the leaf shape of a distributed-acceleration plan on the scheduler, where
+/// every table is fetched from executors over Flight SQL and an oversized
+/// central hash-join build exhausts the coordinator's pool exactly like a
+/// local Cayenne one. Scopes the memory-gated rewrite for instances built with
+/// [`CayenneAntiJoinSortMergeRewriter::with_federated_flight_scans`].
+fn join_touches_federated_flight_scan(hash_join: &HashJoinExec) -> bool {
+    subtree_has_federated_flight_scan(hash_join.left())
+        || subtree_has_federated_flight_scan(hash_join.right())
+}
+
+fn subtree_has_federated_flight_scan(plan: &Arc<dyn ExecutionPlan>) -> bool {
+    if plan.downcast_ref::<FlightSqlExec>().is_some()
+        || FEDERATED_FLIGHT_EXEC_NAMES.contains(&plan.name())
+    {
+        return true;
+    }
+    plan.children()
+        .into_iter()
+        .any(subtree_has_federated_flight_scan)
 }
 
 /// Count the `HashJoinExec` nodes in a plan. Used to size each join's fair

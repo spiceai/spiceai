@@ -991,6 +991,25 @@ impl DataFusionBuilder {
                     addresses, /* max_broadcast_dim_rows */ 25_000_000,
                 ));
             }
+
+            // Spill safety net for whatever still joins centrally: after the
+            // aggregate and broadcast pushdowns have distributed what they can,
+            // a remaining hash join whose estimated build side exceeds its
+            // share of the memory pool is rewritten to a spillable sort-merge
+            // join — `HashJoinExec`'s build side cannot spill, so an oversized
+            // central build (e.g. the TPC-H q21 semi/anti self-joins over the
+            // full fact table) otherwise fails the whole query with a memory
+            // error. Must stay registered AFTER `FlightSQLBroadcastJoinPushdown`
+            // so it never converts a hash join that rule would instead
+            // distribute onto the executors. The default Cayenne-scoped
+            // instance registered above never fires here (scheduler plans have
+            // no local Cayenne scans), so joins are not rewritten twice.
+            #[cfg(not(windows))]
+            if self.cayenne_optimizer_rules.anti_join_sort_merge() {
+                state = state.with_physical_optimizer_rule(Arc::new(
+                    CayenneAntiJoinSortMergeRewriter::with_federated_flight_scans(),
+                ));
+            }
         }
 
         let mut state = state.build();
