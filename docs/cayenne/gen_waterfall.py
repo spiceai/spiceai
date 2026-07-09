@@ -35,7 +35,9 @@ def arrow(x1,y1,x2,y2,label,lx,ly,dash=False,fs=10,wrap=30):
 def _wrap(label,wrap):
     words=label.split(); lines=[]; cur=""
     for wd in words:
-        if len(cur)+len(wd)+1>wrap: lines.append(cur); cur=wd
+        # only flush a non-empty current line, else a first word longer than
+        # `wrap` would emit a blank leading line (and skew the label-box math)
+        if cur and len(cur)+len(wd)+1>wrap: lines.append(cur); cur=wd
         else: cur=(cur+" "+wd).strip()
     if cur: lines.append(cur)
     return lines
