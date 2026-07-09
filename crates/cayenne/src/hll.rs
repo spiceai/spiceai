@@ -241,22 +241,17 @@ impl NdvSketches {
     /// callers can store SQL `NULL`.
     #[must_use]
     pub fn serialize(&self) -> Option<Vec<u8>> {
-        // Drop empty sketches so we don't persist all-zero registers, and only
-        // include columns at the header precision (all do in practice).
-        let present: Vec<(&u32, &HyperLogLog)> = self
-            .columns
-            .iter()
-            .filter(|(_, h)| !h.is_empty())
-            .collect();
-        if present.is_empty() {
+        // Non-empty columns only (don't persist all-zero registers).
+        let mut cols: Vec<(&u32, &HyperLogLog)> =
+            self.columns.iter().filter(|(_, h)| !h.is_empty()).collect();
+        if cols.is_empty() {
             return None;
         }
-        let precision = present[0].1.precision;
+        // The header carries one precision; keep only columns that match it (all
+        // do in practice — every sketch is built at `PRECISION`).
+        let precision = cols[0].1.precision;
         let m = 1usize << precision;
-        let cols: Vec<(&u32, &HyperLogLog)> = present
-            .into_iter()
-            .filter(|(_, h)| h.registers.len() == m)
-            .collect();
+        cols.retain(|(_, h)| h.registers.len() == m);
         if cols.is_empty() {
             return None;
         }
@@ -272,93 +267,83 @@ impl NdvSketches {
         Some(out)
     }
 
-    /// Deserialize a blob produced by [`Self::serialize`]. Returns `None` on a
-    /// version mismatch or malformed input (callers fall back to no NDV).
-    #[must_use]
-    pub fn deserialize(bytes: &[u8]) -> Option<Self> {
-        if bytes.len() < 6 {
-            return None;
-        }
-        if bytes[0] != SKETCH_FORMAT_VERSION {
+    /// Parse a serialized blob's header and yield each column as
+    /// `(col_idx, register_slice)` **borrowing** `bytes` — the single zero-copy
+    /// reader shared by [`deserialize`](Self::deserialize) (which copies each
+    /// slice into an owned sketch) and [`merge_serialized`](Self::merge_serialized)
+    /// (which folds each slice in place, no allocation). Returns `None` on a
+    /// malformed header or a payload too short for `num_columns` records, so both
+    /// consumers treat a bad blob as "no columns" — one all-or-nothing validation
+    /// instead of two hand-rolled parsers.
+    fn parse_columns(bytes: &[u8]) -> Option<(u8, impl Iterator<Item = (u32, &[u8])>)> {
+        if bytes.len() < 6 || bytes[0] != SKETCH_FORMAT_VERSION {
             return None;
         }
         let precision = bytes[1];
         if precision == 0 || precision > 18 {
             return None;
         }
-        let m = 1usize << precision;
+        let record = 4 + (1usize << precision);
         let num_columns = u32::from_le_bytes(bytes[2..6].try_into().ok()?) as usize;
-        let mut offset = 6usize;
-        let mut columns = BTreeMap::new();
-        for _ in 0..num_columns {
-            if offset + 4 + m > bytes.len() {
-                return None;
-            }
-            let idx = u32::from_le_bytes(bytes[offset..offset + 4].try_into().ok()?);
-            offset += 4;
-            let registers = bytes[offset..offset + m].to_vec();
-            offset += m;
-            columns.insert(idx, HyperLogLog { precision, registers });
+        let body = bytes.get(6..)?;
+        // A body too short for all declared columns is malformed.
+        if body.len() < num_columns.checked_mul(record)? {
+            return None;
         }
+        let columns = body.chunks_exact(record).take(num_columns).map(|rec| {
+            // rec.len() == record == 4 + m by construction, so the index is
+            // exactly 4 bytes and the register slice is `m` bytes.
+            let idx = u32::from_le_bytes(rec[..4].try_into().expect("4-byte column index"));
+            (idx, &rec[4..])
+        });
+        Some((precision, columns))
+    }
+
+    /// Deserialize a blob produced by [`Self::serialize`]. Returns `None` on a
+    /// version mismatch or malformed input (callers fall back to no NDV).
+    #[must_use]
+    pub fn deserialize(bytes: &[u8]) -> Option<Self> {
+        let (precision, columns) = Self::parse_columns(bytes)?;
+        let columns = columns
+            .map(|(idx, registers)| {
+                (
+                    idx,
+                    HyperLogLog {
+                        precision,
+                        registers: registers.to_vec(),
+                    },
+                )
+            })
+            .collect();
         Some(Self { columns })
     }
 
-    /// Merge a serialized blob into `self` in place. Convenience for the persist
-    /// path, mirroring `merge_serialized_stats` for min/max.
+    /// Merge a serialized blob into `self` in place (register-wise union),
+    /// mirroring `merge_serialized_stats` for min/max.
     ///
-    /// Allocation-free: folds each column's register bytes **directly from the
-    /// blob slice** into the per-column accumulator (`entry` creates it once and
-    /// it is reused across every subsequent merge), rather than materializing a
+    /// Allocation-free: folds each column's register bytes straight from the blob
+    /// slice into the per-column accumulator, rather than materializing a
     /// transient [`NdvSketches`] via [`deserialize`](Self::deserialize) (a fresh
-    /// 4 KiB `Vec` + `BTreeMap` node per column, then a second pass). The
-    /// register-wise max is a single autovectorized pass. The `ndv_cumulative_rebuild`
-    /// bench measures this ~16-20x faster than deserialize-then-[`merge`](Self::merge)
-    /// over many files — and this is the write-time aggregate-merge path, so the
-    /// win applies on every commit, not only to bulk rebuilds.
+    /// 4 KiB `Vec` + `BTreeMap` node per column plus a second pass). The
+    /// `ndv_cumulative_rebuild` bench measures this ~16-20x faster than
+    /// deserialize-then-[`merge`](Self::merge) over many files — and this is the
+    /// write-time aggregate-merge path, so the win applies on every commit.
     ///
-    /// Validates the same header/bounds as [`deserialize`](Self::deserialize); a
-    /// malformed blob leaves `self` unchanged (matching `deserialize` → `None`).
-    /// A column whose precision does not match the accumulator's is skipped
-    /// (mirrors [`HyperLogLog::merge`](HyperLogLog::merge)'s guard).
+    /// A malformed blob is a no-op (matching `deserialize` → `None`); a column
+    /// whose register width doesn't match the accumulator's is skipped (mirrors
+    /// [`HyperLogLog::merge`](HyperLogLog::merge)'s precision guard).
     pub fn merge_serialized(&mut self, existing_blob: &[u8]) {
-        if existing_blob.len() < 6 {
-            return;
-        }
-        if existing_blob[0] != SKETCH_FORMAT_VERSION {
-            return;
-        }
-        let precision = existing_blob[1];
-        if precision == 0 || precision > 18 {
-            return;
-        }
-        let m = 1usize << precision;
-        let Ok(num_columns_bytes) = existing_blob[2..6].try_into() else {
+        let Some((_precision, columns)) = Self::parse_columns(existing_blob) else {
             return;
         };
-        let num_columns = u32::from_le_bytes(num_columns_bytes) as usize;
-        let mut offset = 6usize;
-        for _ in 0..num_columns {
-            if offset + 4 + m > existing_blob.len() {
-                return;
-            }
-            let Ok(idx_bytes) = existing_blob[offset..offset + 4].try_into() else {
-                return;
-            };
-            let idx = u32::from_le_bytes(idx_bytes);
-            offset += 4;
-            let src = &existing_blob[offset..offset + m];
-            offset += m;
-
+        for (idx, src) in columns {
             let hll = self.entry(idx);
-            // `entry` created (or returned) a sketch at the accumulator's own
-            // precision. A differing width is an incompatible sketch — skip it
-            // rather than corrupt registers, exactly as `HyperLogLog::merge`.
-            if hll.registers.len() != m {
+            if hll.registers.len() != src.len() {
                 continue;
             }
-            // Register-wise max in a single pass. Written as `(*dst).max(*s)` so
-            // LLVM autovectorizes it (packed unsigned-max: `pmaxub`/`vpmaxub` on
-            // x86, `umax` on NEON) — see the `ndv_cumulative_rebuild` bench.
+            // Register-wise max in a single pass; `(*dst).max(*s)` autovectorizes
+            // to packed unsigned-max (`pmaxub`/`vpmaxub` on x86, `umax` on NEON) —
+            // see the `ndv_cumulative_rebuild` bench.
             for (dst, s) in hll.registers.iter_mut().zip(src) {
                 *dst = (*dst).max(*s);
             }
