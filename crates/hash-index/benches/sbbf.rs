@@ -14,12 +14,10 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-// Benchmark code has different lint requirements than production code
-#![allow(
-    clippy::cast_possible_truncation,
-    clippy::cast_sign_loss,
-    clippy::cast_possible_wrap
-)]
+// Benchmark code has different lint requirements than production code. Use
+// `expect` rather than `allow` to satisfy the workspace `clippy::allow_attributes`
+// deny; the usize -> i64 key casts are the only pedantic lint they trigger.
+#![expect(clippy::cast_possible_wrap)]
 
 //! Baseline micro-benchmarks for the split-block bloom filter
 //! ([`SplitBlockBloomFilter`]) hot loops — the scalar 8-word `insert` /
