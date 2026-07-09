@@ -18,7 +18,7 @@ use crate::component::dataset::acceleration::{self, Acceleration, Engine, IndexT
 use crate::parameters::ParameterSpec;
 use crate::parameters::Parameters;
 use crate::secrets::{ExposeSecret, ParamStr, Secrets};
-use crate::{Runtime, spice_data_base_path};
+use crate::spice_data_base_path;
 use ::arrow::datatypes::SchemaRef;
 use async_trait::async_trait;
 use datafusion::common::{Constraint, DFSchema};
@@ -33,7 +33,7 @@ use datafusion_table_providers::util::{
     column_reference::ColumnReference, constraints::UpsertOptions, on_conflict::OnConflict,
 };
 use linkme::distributed_slice;
-use runtime_acceleration::snapshot::{AccelerationLayout, SnapshotDownloadInfo};
+use runtime_acceleration::snapshot::AccelerationLayout;
 use runtime_table_partition::expression::{PartitionedBy, partition_by_expressions};
 use secrecy::SecretString;
 use snafu::prelude::*;
@@ -61,10 +61,13 @@ pub(crate) mod snapshots;
 pub mod spice_sys;
 pub(crate) mod storage;
 pub mod swappable;
+pub mod types;
 pub mod upsert_dedup;
 
+pub use runtime_acceleration::BootstrapStatus;
 pub(crate) use snapshots::validate_snapshot_paths;
 pub use snapshots::{CayenneSnapshotValidationError, validate_cayenne_snapshot_consistency};
+pub use types::{AccelerationSource, AcceleratorEngineRegistry};
 
 #[derive(Clone, Copy)]
 pub struct AcceleratorRegistration {
@@ -171,62 +174,7 @@ pub enum FilePathError {
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
-#[derive(Default, Clone)]
-pub struct AcceleratorEngineRegistry {
-    pub accelerator_engine_registry: Arc<RwLock<HashMap<Engine, Arc<dyn DataAccelerator>>>>,
-}
-
 impl AcceleratorEngineRegistry {
-    #[must_use]
-    pub fn new() -> Self {
-        Self {
-            accelerator_engine_registry: Arc::new(RwLock::new(HashMap::new())),
-        }
-    }
-
-    pub async fn get_accelerator_engine(&self, engine: Engine) -> Option<Arc<dyn DataAccelerator>> {
-        let guard = self.accelerator_engine_registry.read().await;
-        let engine = guard.get(&engine);
-        match engine {
-            Some(engine_ref) => Some(Arc::clone(engine_ref)),
-            None => None,
-        }
-    }
-
-    pub(crate) async fn register_accelerator_engine(
-        &self,
-        engine: Engine,
-        accelerator_engine: Arc<dyn DataAccelerator>,
-    ) {
-        let replaced_engine = {
-            let mut registry = self.accelerator_engine_registry.write().await;
-            registry.insert(engine, accelerator_engine)
-        };
-
-        if let Some(replaced_engine) = replaced_engine
-            && let Err(e) = replaced_engine.shutdown().await
-        {
-            tracing::error!("Failed to shutdown replaced accelerator engine {engine}: {e}");
-        }
-    }
-
-    pub(crate) async fn register_all(&self) {
-        for registration in DATA_ACCELERATOR_REGISTRATIONS {
-            self.register_accelerator_engine(registration.engine, (registration.constructor)())
-                .await;
-        }
-    }
-
-    pub async fn unregister_all(&self) {
-        let mut registry = self.accelerator_engine_registry.write().await;
-        // Shutdown each accelerator before clearing the registry
-        for (engine, accelerator) in registry.drain() {
-            if let Err(e) = accelerator.shutdown().await {
-                tracing::error!("Failed to shutdown accelerator engine {engine}: {e}");
-            }
-        }
-    }
-
     #[expect(clippy::too_many_arguments)]
     pub async fn create_accelerator_table(
         &self,
@@ -447,6 +395,7 @@ pub trait DataAccelerator: Send + Sync {
     async fn init(
         &self,
         _source: &dyn AccelerationSource,
+        _registry: Arc<AcceleratorEngineRegistry>,
     ) -> Result<BootstrapStatus, Box<dyn std::error::Error + Send + Sync>> {
         Ok(BootstrapStatus::none())
     }
@@ -784,41 +733,14 @@ impl AcceleratorExternalTableBuilder {
     }
 }
 
-/// Represents acceleration source component, such as a dataset or a view.
-/// Provides additional information about the source, such as its name and associated runtime information.
-pub trait AccelerationSource: Send + Sync {
-    /// Returns a clone of the source as an `Arc<dyn AccelerationSource>`
-    fn clone_arc(&self) -> Arc<dyn AccelerationSource>;
-
-    /// Returns true if the source uses file-based acceleration
-    fn is_file_accelerated(&self) -> bool;
-
-    /// Returns the application associated with this source
-    fn app(&self) -> Arc<app::App>;
-
-    /// Returns the runtime associated with this source
-    fn runtime(&self) -> Arc<Runtime>;
-
-    /// Returns the acceleration configuration if it exists
-    fn acceleration(&self) -> Option<&Acceleration>;
-
-    /// Returns the name of this source
-    fn name(&self) -> &TableReference;
-
-    /// Returns the time column name if configured, None otherwise
-    /// Views always return None as they don't support time-based append mode
-    fn time_column(&self) -> Option<&str>;
-
-    /// Returns a reference to `Any` for downcasting
-    fn as_any(&self) -> &dyn std::any::Any;
-}
-
 pub async fn acceleration_file_path(
     source: &dyn AccelerationSource,
+    registry: &AcceleratorEngineRegistry,
 ) -> Result<PathBuf, FilePathError> {
     let acceleration_settings = source.acceleration().context(AccelerationNotEnabledSnafu)?;
 
-    let accelerator = get_registered_accelerator(source, acceleration_settings.engine)
+    let accelerator = registry
+        .get_accelerator_engine(acceleration_settings.engine)
         .await
         .context(AcceleratorEngineUnavailableSnafu {
             engine: acceleration_settings.engine,
@@ -840,10 +762,12 @@ pub async fn acceleration_file_path(
 /// This is used for snapshots and size metrics.
 pub async fn get_acceleration_layout(
     source: &dyn AccelerationSource,
+    registry: &AcceleratorEngineRegistry,
 ) -> Result<AccelerationLayout, FilePathError> {
     let acceleration_settings = source.acceleration().context(AccelerationNotEnabledSnafu)?;
 
-    let accelerator = get_registered_accelerator(source, acceleration_settings.engine)
+    let accelerator = registry
+        .get_accelerator_engine(acceleration_settings.engine)
         .await
         .context(AcceleratorEngineUnavailableSnafu {
             engine: acceleration_settings.engine,
@@ -879,60 +803,6 @@ fn cayenne_pk_conflict_detection_none(acceleration_settings: &Acceleration) -> b
             .iter()
             .filter_map(|key| acceleration_settings.params.get(*key))
             .any(|value| value.eq_ignore_ascii_case("none"))
-}
-
-async fn get_registered_accelerator(
-    source: &dyn AccelerationSource,
-    engine: Engine,
-) -> Option<Arc<dyn DataAccelerator>> {
-    source
-        .runtime()
-        .accelerator_engine_registry()
-        .get_accelerator_engine(engine)
-        .await
-}
-
-/// Indicates whether a data accelerator was bootstrapped (initialized from existing data)
-/// during initialization, and carries any metadata from the snapshot.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum BootstrapStatus {
-    Bootstrapped(SnapshotDownloadInfo),
-    None,
-}
-
-impl BootstrapStatus {
-    #[must_use]
-    pub const fn bootstrapped(info: SnapshotDownloadInfo) -> Self {
-        Self::Bootstrapped(info)
-    }
-
-    #[must_use]
-    pub const fn none() -> Self {
-        Self::None
-    }
-
-    #[must_use]
-    pub fn is_bootstrapped(&self) -> bool {
-        matches!(self, Self::Bootstrapped { .. })
-    }
-
-    #[must_use]
-    pub const fn last_updated_at(&self) -> Option<i64> {
-        match self {
-            Self::None => None,
-            Self::Bootstrapped(info) => info.last_updated_at,
-        }
-    }
-
-    /// The `snapshot_id` of the snapshot that was loaded at bootstrap, if any.
-    /// `None` when no bootstrap occurred (no snapshot, or snapshots disabled).
-    #[must_use]
-    pub const fn loaded_snapshot_id(&self) -> Option<u64> {
-        match self {
-            Self::None => None,
-            Self::Bootstrapped(info) => Some(info.snapshot_id),
-        }
-    }
 }
 
 #[cfg(test)]

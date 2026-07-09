@@ -272,7 +272,7 @@ impl PhysicalExtensionCodec for SpicePhysicalCodec {
                     SchemaCastScanExecNode { schema: schema_buf },
                 )),
             }
-        } else if node.downcast_ref::<BytesProcessedExec>().is_some() {
+        } else if node.is::<BytesProcessedExec>() {
             SpicePhysicalPlanNode {
                 node: Some(spice_physical_plan_node::Node::BytesProcessed(
                     BytesProcessedExecNode {},
@@ -349,7 +349,7 @@ impl PhysicalExtensionCodec for SpicePhysicalCodec {
             }
         } else {
             #[cfg(not(windows))]
-            if node.downcast_ref::<CayenneAccelerationExec>().is_some() {
+            if node.is::<CayenneAccelerationExec>() {
                 SpicePhysicalPlanNode {
                     node: Some(spice_physical_plan_node::Node::CayenneAcceleration(
                         CayenneAccelerationExecNode {},
