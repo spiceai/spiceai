@@ -61,6 +61,11 @@ on:
         required: false
         default: false
         type: boolean
+      cayenne_eager_ndv:
+        description: 'Fold NDV eagerly on ingest (sets SPICE_CAYENNE_EAGER_NDV); default (false) = lazy, compute NDV on file spill'
+        required: false
+        default: false
+        type: boolean
 
 # Serialize ALL SF100 + SF1000 CH-benCHmark runs across every variant (sqlite/turso cdc-tuned,
 # adaptive, duckdb): they share ONE concurrency group keyed only by scale factor, so
@@ -264,6 +269,10 @@ jobs:
           S3_ENDPOINT: ${{ secrets.TEST_MINIO_ENDPOINT }}
           S3_KEY: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
           S3_SECRET: ${{ secrets.TEST_MINIO_SECRET_KEY }}
+          # Eager vs lazy Cayenne NDV (default lazy). Inherited by the spiced
+          # process testoperator spawns; spiced logs the resolved mode once. Used
+          # to A/B the lazy-NDV change in the benchmark.
+          SPICE_CAYENNE_EAGER_NDV: ${{ github.event.inputs.cayenne_eager_ndv }}
 
       # Upload the under-load diagnostics dir
       - name: Upload HTAP diagnostics
