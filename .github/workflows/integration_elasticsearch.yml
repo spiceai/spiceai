@@ -11,13 +11,12 @@ on:
       - 'crates/data-connectors/connector-elasticsearch/**'
       - 'crates/search/src/index/elasticsearch/**'
       - 'crates/runtime/src/embeddings/index/elasticsearch/**'
-  pull_request:
-    paths:
-      - 'crates/elasticsearch/**'
-      - 'crates/data_components/src/elasticsearch/**'
-      - 'crates/data-connectors/connector-elasticsearch/**'
-      - 'crates/search/src/index/elasticsearch/**'
-      - 'crates/runtime/src/embeddings/index/elasticsearch/**'
+  merge_group:
+    branches:
+      - trunk
+      - release-*
+      - release/*
+      - feature-*
   workflow_dispatch:
 
 concurrency:

@@ -6,12 +6,6 @@ on:
     branches:
       - trunk
       - release/*
-  pull_request:
-    branches:
-      - trunk
-      - release-*
-      - release/*
-      - feature-*
   merge_group:
     branches:
       - trunk

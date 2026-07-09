@@ -7,11 +7,6 @@ on:
     paths-ignore:
       - 'docs/**'
       - '.github/**'
-  pull_request:
-    branches: [trunk, develop]
-    paths-ignore:
-      - 'docs/**'
-      - '.github/**'
   schedule:
     - cron: '19 18 * * 4'
 

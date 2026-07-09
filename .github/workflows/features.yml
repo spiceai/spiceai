@@ -6,9 +6,12 @@ on:
       - trunk
     paths:
       - '**/Cargo.toml'
-  pull_request:
-    paths:
-      - '**/Cargo.toml'
+  merge_group:
+    branches:
+      - trunk
+      - release-*
+      - release/*
+      - feature-*
   workflow_dispatch:
 
 concurrency:

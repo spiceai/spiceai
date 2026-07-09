@@ -1,14 +1,13 @@
 name: pr - helm-lint
 
 on:
-  pull_request:
+  merge_group:
     branches:
       - trunk
       - release-*
       - release/*
       - feature-*
-    paths:
-      - 'deploy/chart/**'
+  workflow_dispatch:
 
 jobs:
   lint-helm:

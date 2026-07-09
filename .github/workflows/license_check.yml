@@ -21,16 +21,13 @@ name: Check for forbidden licenses
 # (https://github.com/google/licenseclassifier)
 
 on:
-  pull_request:
+  merge_group:
     branches:
       - trunk
       - release-*
       - release/*
-    paths-ignore:
-      - 'docs/**'
-      - 'README.md'
-      - 'version.txt'
-      - 'acknowledgements.md'
+      - feature-*
+  workflow_dispatch:
 
 env:
   FORBIDDEN_LICENSE_CHECK: |
