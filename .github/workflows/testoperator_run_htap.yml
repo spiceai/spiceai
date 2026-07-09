@@ -243,7 +243,8 @@ jobs:
             ${{ steps.set_spicepod_path.outputs.SOURCE_TYPE != 'mysql' && github.event.inputs.runner_type == 'spiceai-dev-xlarge-runners' && '--skip-prepare' || '' }} \
             --disable-progress-bars \
             --metrics \
-            --metrics-dump "${GITHUB_WORKSPACE}/htap-metrics.json" 2>&1 | tee "${GITHUB_WORKSPACE}/htap-run.log"
+            --metrics-dump "${GITHUB_WORKSPACE}/htap-metrics.json" \
+            --summary-out "${GITHUB_WORKSPACE}/htap-summary.md" 2>&1 | tee "${GITHUB_WORKSPACE}/htap-run.log"
           # ${PIPESTATUS[0]} is testoperator's real exit (not tee's), so a failed
           # run fails the step even though it is piped to tee — this also avoids the
           # false-green where a benchmark/ready-wait timeout reported success.
@@ -283,6 +284,19 @@ jobs:
           if-no-files-found: ignore
           retention-days: 14
 
+      # Append the headline results (tpmC, QPH, worst replication lag, per-query
+      # latencies) to the job summary so the outcome is visible without opening the
+      # run log. testoperator writes this Markdown via --summary-out. Runs even on
+      # failure (a partial summary is still useful).
+      - name: Render results to summary
+        if: always()
+        run: |
+          if [ -f "${GITHUB_WORKSPACE}/htap-summary.md" ]; then
+            cat "${GITHUB_WORKSPACE}/htap-summary.md" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "_No results summary produced (run did not reach the reporting stage)._" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
       # Render the CDC-backpressure waterfall from the metrics dump into the job
       # summary so the "where is CDC falling behind" attribution is visible without
       # downloading the artifact. Runs even if the benchmark failed (partial data
@@ -310,6 +324,7 @@ jobs:
           path: |
             ${{ github.workspace }}/htap-metrics.json
             ${{ github.workspace }}/htap-run.log
+            ${{ github.workspace }}/htap-summary.md
           if-no-files-found: warn
           retention-days: 30
 

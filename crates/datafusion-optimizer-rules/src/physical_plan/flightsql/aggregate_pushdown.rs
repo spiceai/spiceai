@@ -251,9 +251,7 @@ fn walk_to_flight_exec(plan: &Arc<dyn ExecutionPlan>) -> Option<&FlightSqlExec> 
             return None;
         }
 
-        if current.downcast_ref::<RepartitionExec>().is_some()
-            || PASS_THROUGH_EXEC_NAMES.contains(&current.name())
-        {
+        if current.is::<RepartitionExec>() || PASS_THROUGH_EXEC_NAMES.contains(&current.name()) {
             current = children[0];
         } else {
             return None;
@@ -473,10 +471,7 @@ mod tests {
         plan: Arc<dyn ExecutionPlan>,
         data: &mut impl Iterator<Item = Vec<RecordBatch>>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        if plan
-            .downcast_ref::<PartialAggregationFlightSqlExec>()
-            .is_some()
-        {
+        if plan.is::<PartialAggregationFlightSqlExec>() {
             let schema = plan.schema();
             let partition_data = data.next().ok_or_else(|| {
                 datafusion::common::DataFusionError::Internal(
