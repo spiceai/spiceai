@@ -45,15 +45,19 @@ jobs:
   test:
     name: ADBC Integration Tests
     needs: check_changes
-    if: needs.check_changes.outputs.relevant_changes == 'true'
+    # Required check: run unconditionally and gate each step, so on docs-only
+    # merges the job still reports success rather than a skipped required check
+    # (which can stall the merge queue). Mirrors the pr.yml / integration.yml pattern.
     runs-on: spiceai-dev-runners
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        if: needs.check_changes.outputs.relevant_changes == 'true'
         with:
           persist-credentials: false
           fetch-depth: 1
 
       - name: Cache Cargo registry
+        if: needs.check_changes.outputs.relevant_changes == 'true'
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
@@ -65,28 +69,35 @@ jobs:
             ${{ runner.os }}-cargo-
 
       - name: Set up Rust
+        if: needs.check_changes.outputs.relevant_changes == 'true'
         uses: ./.github/actions/setup-rust
 
       - name: Set up make
+        if: needs.check_changes.outputs.relevant_changes == 'true'
         uses: ./.github/actions/setup-make
 
       - name: Set up cc
+        if: needs.check_changes.outputs.relevant_changes == 'true'
         uses: ./.github/actions/setup-cc
 
       - name: Install protoc
+        if: needs.check_changes.outputs.relevant_changes == 'true'
         uses: ./.github/actions/install-protoc
 
       - name: Set up sccache
+        if: needs.check_changes.outputs.relevant_changes == 'true'
         uses: ./.github/actions/setup-sccache
         with:
           minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
 
       - name: Set up ADBC drivers
+        if: needs.check_changes.outputs.relevant_changes == 'true'
         uses: columnar-tech/setup-dbc@4d83cce5bf2aa1e46eedbe44f13b57bbef8f2baf # v1.0.2
         with:
           drivers: 'sqlite'
 
       - name: Run ADBC integration tests
+        if: needs.check_changes.outputs.relevant_changes == 'true'
         env:
           CARGO_INCREMENTAL: 0
           RUSTC_WRAPPER: ${{ env.RUSTC_WRAPPER }}

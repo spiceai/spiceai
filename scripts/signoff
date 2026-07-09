@@ -182,9 +182,10 @@ cmd_status() {
 # Resolve the ruleset id for TARGET_BRANCH by name. `first(...)` returns a single
 # id inside jq — avoids `head`, which SIGPIPEs the writer under pipefail.
 ruleset_id() {
-  local repo="$1"
-  gh api "repos/${repo}/rulesets" \
-    --jq "first(.[] | select(.name==\"${TARGET_BRANCH}\") | .id) // empty" 2>/dev/null
+  local repo="$1" rulesets
+  rulesets=$(gh api "repos/${repo}/rulesets") \
+    || fail "failed to list rulesets on ${repo} (auth/rate-limit/network?)"
+  jq -r "first(.[] | select(.name==\"${TARGET_BRANCH}\") | .id) // empty" <<<"$rulesets"
 }
 
 cmd_check() {
