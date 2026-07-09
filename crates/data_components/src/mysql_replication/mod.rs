@@ -179,9 +179,10 @@ impl CheckpointMeta {
     /// Parse a stored `schema_json` value.
     ///
     /// - v2 envelope → `Ok(Some(meta))`
-    /// - legacy raw Arrow schema JSON → `Ok(None)` (caller must treat as
-    ///   unknown layout and refuse unsafe resume)
-    /// - corrupt / empty → `Err`
+    /// - legacy raw Arrow schema JSON (object with a top-level `fields` key,
+    ///   no usable `version`) → `Ok(None)` (caller must treat as unknown
+    ///   layout and refuse unsafe resume)
+    /// - corrupt / empty / non-schema JSON → `Err`
     pub fn parse(schema_json: &str) -> Result<Option<Self>, String> {
         let value: serde_json::Value =
             serde_json::from_str(schema_json).map_err(|e| e.to_string())?;
@@ -199,8 +200,16 @@ impl CheckpointMeta {
             }
             return Ok(Some(meta));
         }
-        // Legacy: a bare Arrow schema JSON object (has `fields`, no `version`).
-        Ok(None)
+        // Legacy: a bare Arrow schema JSON object (has `fields`, no usable
+        // `version`). Anything else is corrupt / unsupported meta.
+        if value.is_object() && value.get("fields").is_some() {
+            return Ok(None);
+        }
+        Err(
+            "persisted checkpoint schema_json is neither a v2 CheckpointMeta \
+             envelope nor a legacy Arrow schema object"
+                .to_string(),
+        )
     }
 }
 
@@ -785,6 +794,22 @@ mod tests {
             CheckpointMeta::parse(legacy).expect("legacy parses"),
             None,
             "legacy Arrow schema JSON must be treated as unknown layout"
+        );
+    }
+
+    #[test]
+    fn checkpoint_meta_parse_non_schema_json_as_err() {
+        assert!(
+            CheckpointMeta::parse(r#""just a string""#).is_err(),
+            "non-object JSON must not look like a legacy Arrow schema"
+        );
+        assert!(
+            CheckpointMeta::parse(r#"{"not_fields":[]}"#).is_err(),
+            "object without `fields` must not look like a legacy Arrow schema"
+        );
+        assert!(
+            CheckpointMeta::parse("42").is_err(),
+            "numeric JSON must not look like a legacy Arrow schema"
         );
     }
 

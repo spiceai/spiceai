@@ -207,12 +207,31 @@ pub async fn fetch_table_layout(
 
     let columns = rows
         .into_iter()
-        .map(|row| {
-            let name: String = row.get("COLUMN_NAME").unwrap_or_default();
-            // Only the type keyword is case-normalized for matching; the
-            // variant labels are extracted from the original string —
-            // lowercasing them would corrupt mixed-case ENUM/SET values.
-            let column_type: String = row.get("COLUMN_TYPE").unwrap_or_default();
+        .enumerate()
+        .map(|(idx, row)| {
+            let name: String = row.get("COLUMN_NAME").ok_or_else(|| Error::Decode {
+                message: format!(
+                    "information_schema.COLUMNS row {idx} for {database}.{table} \
+                     is missing COLUMN_NAME"
+                ),
+            })?;
+            // COLUMN_TYPE is part of the resume-safety fingerprint — fail
+            // closed rather than recording an empty type that would weaken
+            // drift detection.
+            let column_type: String = row.get("COLUMN_TYPE").ok_or_else(|| Error::Decode {
+                message: format!(
+                    "information_schema.COLUMNS row for {database}.{table}.{name} \
+                     is missing COLUMN_TYPE"
+                ),
+            })?;
+            if name.is_empty() || column_type.is_empty() {
+                return Err(Error::Decode {
+                    message: format!(
+                        "information_schema.COLUMNS row {idx} for {database}.{table} \
+                         has empty COLUMN_NAME or COLUMN_TYPE"
+                    ),
+                });
+            }
             let column_key: String = row.get("COLUMN_KEY").unwrap_or_default();
             let has_prefix = |prefix: &str| {
                 column_type
@@ -227,15 +246,15 @@ pub async fn fetch_table_layout(
                 .then(|| parse_quoted_variants(&column_type))
                 .flatten()
                 .map(Arc::from);
-            SourceColumn {
+            Ok(SourceColumn {
                 name,
                 column_type,
                 enum_variants,
                 set_variants,
                 is_primary_key: column_key == "PRI",
-            }
+            })
         })
-        .collect();
+        .collect::<Result<Vec<_>>>()?;
 
     Ok(TableLayout { columns })
 }
