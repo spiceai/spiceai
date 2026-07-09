@@ -13461,6 +13461,7 @@ impl CayenneTableProvider {
         // After projection, the PK columns are at indices 0..pk_indices.len(),
         // in `pk_indices` order — the same order `converter` (built over
         // `pk_indices`) and the CDC probe expect.
+        let mut inserted: usize = 0;
         while let Some(batch) = stream.next().await {
             let batch = batch?;
             if batch.num_rows() == 0 {
@@ -13473,6 +13474,23 @@ impl CayenneTableProvider {
             for i in 0..batch.num_rows() {
                 bloom.insert(rows.row(i).as_ref());
             }
+            inserted += batch.num_rows();
+        }
+        // Defense-in-depth: the file was just written with deletes applied, so
+        // the read-back must see exactly the footer's row count. A silent
+        // under-read would produce a bloom with FALSE NEGATIVES (missed cold
+        // keys → upsert double-counting) — on any mismatch, publish no bloom so
+        // the keyset rebuild takes the exact cold scan instead.
+        if inserted != expected_keys {
+            tracing::warn!(
+                target: "cayenne::compaction",
+                table = self.table_metadata.table_name.as_str(),
+                file = file_url,
+                expected_keys,
+                inserted,
+                "Cold-file PK bloom read-back row count mismatch; keyset rebuild falls back to the exact cold scan"
+            );
+            return Ok(None);
         }
         Ok(Some(bloom.to_bytes()))
     }
