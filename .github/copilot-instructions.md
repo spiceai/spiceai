@@ -36,13 +36,13 @@ make lint-rust-fix      # Auto-fix lint issues
 ## Architecture
 
 - **Separate Tokio runtimes** isolate the HTTP server (health checks, endpoints) from query execution (DataFusion is CPU/IO heavy and shares one thread pool). Never share runtime handles; `/health` must respond quickly regardless of query load.
-- **Layout**: source in `crates/` — most-touched: `runtime/` (orchestration), `data_components/` (`TableProvider` impls), `app/` (Spicepod parsing), `datafusion/` (extensions), `llms/`, `search/`, `model_components/`; acceleration engines in `runtime-acceleration/` and `cayenne/` (native CDC-fed accelerator); per-concern `runtime-*` crates. Authoritative map: workspace `members` in root `Cargo.toml`.
+- **Layout**: source in `crates/` — most-touched: `runtime/` (orchestration), `data_components/` (`TableProvider` impls), `app/` (Spicepod parsing), `datafusion/` (extensions), `llms/`, `search/`; acceleration engines in `runtime-acceleration/` and `cayenne/` (native CDC-fed accelerator); per-concern `runtime-*` crates. Authoritative map: workspace `members` in root `Cargo.toml`.
 - **Extension points** (`docs/EXTENSIBILITY.md`): Data Connector, Data Accelerator, Catalog Connector, Secret Store, Model, Embedding.
 - **Acceleration wraps**: `AcceleratedTable` → `FederatedTable` → connector `TableProvider`.
 
 ## Rust standards
 
-Workspace is edition 2024, rust-version 1.95.0 — use stable features and modern std APIs through 1.95; don't code to older subsets. Runtime is 64-bit minimum: assume `usize` is at least (never exactly) 64 bits. New `.rs` files need the copyright header (`Copyright 2024-2026 The Spice.ai OSS Authors`; vendored code in `crates/vendor/` exempt).
+Workspace is edition 2024, rust-version 1.96.1 — use stable features and modern std APIs through 1.96; don't code to older subsets. Runtime is 64-bit minimum: assume `usize` is at least (never exactly) 64 bits. New `.rs` files need the copyright header (`Copyright 2024-2026 The Spice.ai OSS Authors`; vendored code in `crates/vendor/` exempt).
 
 ### Error handling (critical)
 

@@ -48,6 +48,11 @@ on:
         required: true
         default: '4'
         type: string
+      organization_tag:
+        description: 'Organization tag applied to the spidapter app; selects the target nodegroup (empty = shared default nodegroup)'
+        required: false
+        default: 'spicehq'
+        type: string
       channel:
         description: 'Spice runtime image channel passed to spidapter (ignored when custom_image_tag is set)'
         required: true
@@ -163,6 +168,7 @@ env:
   CB_SCENARIO_QUERY_FILE: ${{ github.event.inputs.scenario_query_file || '' }}
   CB_QUERY_TRANSPORT: ${{ github.event.inputs.query_transport || 'v1-queries' }}
   CB_EXECUTOR_REPLICAS: ${{ github.event.inputs.executor_replicas || '3' }}
+  CB_ORGANIZATION_TAG: ${{ github.event.inputs.organization_tag || 'spicehq' }}
   CB_CHANNEL: ${{ github.event.inputs.channel || 'nightly' }}
   CB_CUSTOM_IMAGE_TAG: ${{ github.event.inputs.custom_image_tag || '' }}
   CB_SHUFFLE_LOCATION: ${{ github.event.inputs.shuffle_location || '' }}
@@ -281,6 +287,10 @@ jobs:
           AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_ICEBERG_SECRET_ACCESS_KEY }}
           AWS_REGION: us-east-1
           AWS_DEFAULT_REGION: us-east-1
+          # Select the nodegroup for the spidapter cluster app via tags.organization.
+          # Defaults to the dedicated spicehq nodegroup; without it the app lands on
+          # the shared default nodegroup.
+          SPIDAPTER_ORGANIZATION_TAG: ${{ env.CB_ORGANIZATION_TAG }}
           SCHEDULER_STATE_LOCATION: 's3://spiceai-testing-cluster-state/testoperator-cluster-bench-${{ github.run_id }}/'
           SPICEAI_BENCHMARK_METRICS_KEY: ${{ secrets.SPICEAI_BENCHMARK_METRICS_KEY }}
           EXECUTOR_REPLICAS: ${{ env.CB_EXECUTOR_REPLICAS }}

@@ -25,7 +25,6 @@ members = [
     "crates/google-genai",
     "crates/hash-index",
     "crates/llms",
-    "crates/model_components",
     "crates/ns_lookup",
     "crates/object_store_occ",
     "crates/otel-arrow",
@@ -101,7 +100,7 @@ homepage = "https://spice.ai"
 license-file = "LICENSE"
 publish = false
 repository = "https://github.com/spiceai/spiceai"
-rust-version = "1.95.0"
+rust-version = "1.96.1"
 version = "2.1.0-unstable"
 
 [workspace.dependencies]

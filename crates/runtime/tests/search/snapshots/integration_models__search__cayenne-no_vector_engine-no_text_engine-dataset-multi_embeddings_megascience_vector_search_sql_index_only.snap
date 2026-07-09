@@ -9,14 +9,14 @@ description: "SELECT id, trunc(_score, 3) as _score  FROM vector_search(qs, 'sec
   },
   {
     "id": 212,
-    "_score": 0.69
+    "_score": 0.689
   },
   {
     "id": 1277,
-    "_score": 0.688
+    "_score": 0.687
   },
   {
     "id": 195,
-    "_score": 0.674
+    "_score": 0.673
   }
 ]
