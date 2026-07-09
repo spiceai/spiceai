@@ -473,14 +473,16 @@ impl<'a> AppendMutationWriter<'a> {
             ));
         }
 
-        // In-memory write path: append the validated batch to the RAM tier and
-        // defer the source slot ack to a checkpoint, instead of persisting a
-        // per-batch durable BLOB. Taken when EITHER the table is a `mode: memory`
-        // accelerator (`is_memory_resident_mode` — the mem-tier is its permanent
-        // store) OR a key-based, non-partitioned CDC table (`is_cdc_memory_mode`)
-        // whose runtime has armed deferral for a replayable source
-        // (`has_slot_advancer`); every other table/source keeps the durable path
-        // below, byte-identical.
+        // In-memory write path: append the validated batch to the RAM tier instead
+        // of persisting a per-batch durable BLOB. Taken when EITHER the table is a
+        // `mode: memory` accelerator (`is_memory_resident_mode` — the mem-tier is
+        // its permanent store) OR a key-based, non-partitioned CDC table
+        // (`is_cdc_memory_mode`) whose runtime has armed deferral for a replayable
+        // source (`has_slot_advancer`). The two differ in how the runtime acks the
+        // source slot: `mode: memory` never checkpoints, so the slot is committed
+        // immediately (nothing to defer behind); `cdc_durability: memory` defers the
+        // ack behind the covering durable checkpoint. Every other table/source keeps
+        // the durable path below, byte-identical.
         let (mut prepared_stream, write_guard) = if self.table.is_memory_resident_mode()
             || (self.table.is_cdc_memory_mode() && self.table.has_slot_advancer())
         {
@@ -672,17 +674,21 @@ impl<'a> AppendMutationWriter<'a> {
         }
     }
 
-    /// In-memory CDC write path (`cdc_durability: memory`). Drains the validated
-    /// stream into RAM, computes the on-conflict tombstones in memory, and
-    /// appends to the mem tier — deferring the source slot ack to a checkpoint —
-    /// with byte caps (per-table, plus a process-wide one when the runtime has
-    /// installed the global budget) that spill (and, under sustained overload,
-    /// fall back to the durable path) so the resident tier cannot grow without
-    /// bound. The caps bound the resident tier, not a single apply: each prepared
-    /// burst is still buffered fully in RAM before the cap is checked.
+    /// In-memory CDC write path, shared by `cdc_durability: memory` and
+    /// `mode: memory`. Drains the validated stream into RAM, computes the
+    /// on-conflict tombstones in memory, and appends to the mem tier (returning the
+    /// mem-tier epoch) under byte caps (per-table, plus a process-wide one when the
+    /// runtime has installed the global budget). The caps bound the resident tier,
+    /// not a single apply: each prepared burst is buffered fully in RAM before the
+    /// cap is checked.
     ///
-    /// PK conflict validation still runs (it populated `post_validation` as the
-    /// stream was prepared); only the per-batch DURABILITY is deferred.
+    /// The modes diverge on cap breach and slot ack. `cdc_durability: memory` spills
+    /// the tier durable on breach (and, under sustained overload, falls back to the
+    /// durable path), and the runtime DEFERS the source slot ack behind the covering
+    /// durable checkpoint. `mode: memory` never checkpoints or spills: a breach
+    /// returns `MemTierLimitExceeded`, and the runtime commits the slot immediately.
+    /// PK conflict validation still runs either way (it populated `post_validation`
+    /// as the stream was prepared).
     async fn write_cdc_in_memory(
         &self,
         mut prepared_stream: SendableRecordBatchStream,
