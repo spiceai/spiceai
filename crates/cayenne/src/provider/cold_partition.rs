@@ -89,20 +89,19 @@ pub(crate) fn decode_tombstone_keys(
 ///
 /// # Errors
 ///
-/// Returns an error when a key is shorter than 8 bytes — callers treat that
-/// as "cannot classify".
+/// Returns an error when a key is not exactly 8 bytes — callers treat that
+/// as "cannot classify". Truncating a longer buffer would decode a wrong
+/// value and could misclassify a truly-dirty file as clean.
 pub(crate) fn decode_int64_tombstone_keys(
     keys: &[Box<[u8]>],
 ) -> Result<Vec<Vec<ScalarValue>>, arrow_schema::ArrowError> {
     keys.iter()
         .map(|bytes| {
-            if bytes.len() >= 8 {
-                let mut arr = [0_u8; 8];
-                arr.copy_from_slice(&bytes[..8]);
+            if let Ok(arr) = <[u8; 8]>::try_from(bytes.as_ref()) {
                 Ok(vec![ScalarValue::Int64(Some(i64::from_be_bytes(arr)))])
             } else {
                 Err(arrow_schema::ArrowError::InvalidArgumentError(format!(
-                    "Int64 tombstone key has {} bytes, expected at least 8",
+                    "Int64 tombstone key has {} bytes, expected exactly 8",
                     bytes.len()
                 )))
             }
@@ -240,9 +239,12 @@ mod tests {
         let decoded = decode_int64_tombstone_keys(&keys).expect("valid 8-byte keys");
         assert_eq!(decoded[0], vec![ScalarValue::Int64(Some(7))]);
         assert_eq!(decoded[1], vec![ScalarValue::Int64(Some(-3))]);
-        // Short key → cannot classify.
-        let bad: Vec<Box<[u8]>> = vec![vec![1, 2].into_boxed_slice()];
-        decode_int64_tombstone_keys(&bad).expect_err("short key must fail to decode");
+        // Short or long key → cannot classify (truncation could decode a
+        // wrong value and misclassify a dirty file as clean).
+        let short: Vec<Box<[u8]>> = vec![vec![1, 2].into_boxed_slice()];
+        decode_int64_tombstone_keys(&short).expect_err("short key must fail to decode");
+        let long: Vec<Box<[u8]>> = vec![vec![0; 9].into_boxed_slice()];
+        decode_int64_tombstone_keys(&long).expect_err("long key must fail to decode");
     }
 }
 

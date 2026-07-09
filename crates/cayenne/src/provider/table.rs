@@ -2638,7 +2638,9 @@ impl CayenneTableProvider {
             };
             let path = ObjectStorePath::from(rel);
             match store.delete(&path).await {
-                Ok(()) => {
+                // `NotFound` is the goal state (already gone — raced with
+                // another sweep or manual cleanup), not a retryable failure.
+                Ok(()) | Err(object_store::Error::NotFound { .. }) => {
                     deleted += 1;
                     self.cold_gc_first_seen.lock().remove(&full_url);
                 }
@@ -6050,8 +6052,16 @@ impl CayenneTableProvider {
         // (a promotion that changes the cold manifest calls this on commit), so
         // drop it too; the next apply's cache miss rebuilds it from the current
         // manifest via `resolve_cold_keyset_source`.
-        *self.cold_pk_existence.lock() = None;
+        self.store_cold_pk_existence(None);
         self.table_memory.set_keyset_bytes(0);
+    }
+
+    /// Single funnel for (re)setting `cold_pk_existence`: keeps the view's
+    /// resident bytes registered with the memory pool alongside the keyset.
+    fn store_cold_pk_existence(&self, view: Option<Arc<ColdPkExistence>>) {
+        let bytes = view.as_ref().map_or(0, |v| v.approx_bytes());
+        *self.cold_pk_existence.lock() = view;
+        self.table_memory.set_cold_existence_bytes(bytes);
     }
 
     /// Rewrite every cached keyset entry from `RowLocation::Inlined` to
@@ -6493,7 +6503,7 @@ impl CayenneTableProvider {
     /// populated only for [`ColdKeysetSource::Bloom`] and cleared otherwise.
     async fn resolve_cold_keyset_source(&self) -> Result<ColdKeysetSource> {
         if !self.table_metadata.vortex_config.cold_tier_enabled() || !self.upsert_bloom_eligible() {
-            *self.cold_pk_existence.lock() = None;
+            self.store_cold_pk_existence(None);
             return Ok(ColdKeysetSource::None);
         }
 
@@ -6512,7 +6522,7 @@ impl CayenneTableProvider {
         if live.is_empty() {
             // No cold-resident keys: an empty bloom view is complete and correct
             // (nothing to fold), so skip the scan.
-            *self.cold_pk_existence.lock() = None;
+            self.store_cold_pk_existence(None);
             return Ok(ColdKeysetSource::Bloom);
         }
 
@@ -6532,7 +6542,7 @@ impl CayenneTableProvider {
                     file = f.file_url.as_str(),
                     "Cold-tier file has no PK bloom; keyset rebuild falls back to the exact cold scan"
                 );
-                *self.cold_pk_existence.lock() = None;
+                self.store_cold_pk_existence(None);
                 return Ok(ColdKeysetSource::Scan);
             }
         }
@@ -6545,7 +6555,7 @@ impl CayenneTableProvider {
             approx_bytes = existence.approx_bytes(),
             "Built cold-tier PK existence view from manifest blooms; keyset rebuild skips the cold scan"
         );
-        *self.cold_pk_existence.lock() = Some(existence);
+        self.store_cold_pk_existence(Some(existence));
         Ok(ColdKeysetSource::Bloom)
     }
 
