@@ -826,9 +826,11 @@ pub struct VortexConfig {
     pub deletion_mode: DeletionMode,
     /// Whether this table is a pure in-memory (`mode: memory`) accelerator: all
     /// data lives in the RAM mem-tier (the in-memory metastore holds only metadata), no Vortex
-    /// data files are ever written (checkpoint + compaction disabled), the source
-    /// slot is never advanced (ephemeral — reload from the source on restart), and
-    /// a hard RAM bound returns an error on breach instead of spilling.
+    /// data files are ever written (checkpoint + compaction disabled), it is
+    /// ephemeral (reload from the source on restart — for CDC `changes` the source
+    /// slot is committed immediately after each in-RAM write, since there is no
+    /// durable checkpoint to defer behind), and a hard RAM bound returns an error
+    /// on breach instead of spilling.
     ///
     /// Not a user param — `VortexConfig` is only serde-deserialized from the metastore
     /// (never from user input; the accelerator builds it field-by-field), so this is

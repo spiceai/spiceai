@@ -4588,9 +4588,11 @@ impl CayenneTableProvider {
 
     /// Whether this table is a pure in-memory (`mode: memory`) accelerator: data
     /// lives permanently in the RAM mem-tier (inline publishing is disabled), no
-    /// Vortex data files are ever written, the durable drain (checkpoint/seal) is
-    /// disabled, and the
-    /// source slot is never advanced (ephemeral — reload from source on restart).
+    /// Vortex data files are ever written, and the durable drain (checkpoint/seal)
+    /// is disabled. Ephemeral — reloaded from source on restart; for CDC
+    /// (`changes`) the source slot is committed immediately after each in-RAM write
+    /// (there is no durable checkpoint to defer behind), which is safe because a
+    /// restart re-snapshots.
     ///
     /// This is the master switch for memory mode and is DISTINCT from
     /// [`Self::is_cdc_memory_mode`] (a CDC-durability deferral that still drains to
