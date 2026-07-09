@@ -19,3 +19,6 @@ snafu.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 util = { path = "../util" }
+
+[lints]
+workspace = true

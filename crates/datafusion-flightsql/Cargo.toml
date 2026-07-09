@@ -35,3 +35,6 @@ tracing-subscriber = { workspace = true }
 [[example]]
 name = "serve_and_query"
 required-features = []
+
+[lints]
+workspace = true

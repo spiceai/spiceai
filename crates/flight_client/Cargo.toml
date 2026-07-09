@@ -33,3 +33,6 @@ url.workspace = true
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "net", "rt", "sync"] }
 tokio-stream = { workspace = true, features = ["net"] }
+
+[lints]
+workspace = true

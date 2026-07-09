@@ -121,3 +121,6 @@ metal = [
 ]
 
 default = ["local_llm", "local_embed"]
+
+[lints]
+workspace = true

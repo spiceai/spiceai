@@ -36,3 +36,6 @@ harness = false
 [[bench]]
 name = "sbbf"
 harness = false
+
+[lints]
+workspace = true

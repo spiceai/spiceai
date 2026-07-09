@@ -42,6 +42,11 @@ use snafu::prelude::*;
 #[derive(Clone, Debug)]
 pub struct SourceColumn {
     pub name: String,
+    /// Raw `information_schema.COLUMNS.COLUMN_TYPE` (e.g. `int`,
+    /// `varchar(255)`, `enum('a','b')`). Captured so a checkpoint can detect
+    /// source-only layout changes (reorder / retype) that leave the dataset
+    /// Arrow schema unchanged.
+    pub column_type: String,
     /// For `ENUM` columns: the 1-based variant labels. Binlog row images
     /// carry only the variant *index*.
     pub enum_variants: Option<Arc<[String]>>,
@@ -95,6 +100,32 @@ impl TableLayout {
             .filter(|c| c.is_primary_key)
             .map(|c| c.name.as_str())
             .collect()
+    }
+
+    /// Stable fingerprint of the source positional layout.
+    ///
+    /// Binlog row images are positional. Resuming from a persisted position
+    /// against a *different* ordinal layout (reorder, same-count reshape,
+    /// retype) silently maps values onto the wrong dataset columns whenever
+    /// types still convert. This fingerprint is persisted with each
+    /// checkpoint so resume can refuse that case.
+    ///
+    /// Format (one line per ordinal, `\n`-joined):
+    /// `{ordinal}\t{name}\t{column_type}\t{PRI|}\n`
+    #[must_use]
+    pub fn fingerprint(&self) -> String {
+        let mut out = String::with_capacity(self.columns.len().saturating_mul(48));
+        for (ordinal, col) in self.columns.iter().enumerate() {
+            use std::fmt::Write as _;
+            let _ = writeln!(
+                out,
+                "{ordinal}\t{}\t{}\t{}",
+                col.name,
+                col.column_type,
+                if col.is_primary_key { "PRI" } else { "" }
+            );
+        }
+        out
     }
 }
 
@@ -176,12 +207,28 @@ pub async fn fetch_table_layout(
 
     let columns = rows
         .into_iter()
-        .map(|row| {
-            let name: String = row.get("COLUMN_NAME").unwrap_or_default();
-            // Only the type keyword is case-normalized for matching; the
-            // variant labels are extracted from the original string —
-            // lowercasing them would corrupt mixed-case ENUM/SET values.
-            let column_type: String = row.get("COLUMN_TYPE").unwrap_or_default();
+        .enumerate()
+        .map(|(idx, row)| {
+            let name: String = row.get("COLUMN_NAME").ok_or_else(|| Error::Decode {
+                message: format!(
+                    "information_schema.COLUMNS row {idx} for {database}.{table} is missing COLUMN_NAME"
+                ),
+            })?;
+            // COLUMN_TYPE is part of the resume-safety fingerprint — fail
+            // closed rather than recording an empty type that would weaken
+            // drift detection.
+            let column_type: String = row.get("COLUMN_TYPE").ok_or_else(|| Error::Decode {
+                message: format!(
+                    "information_schema.COLUMNS row for {database}.{table}.{name} is missing COLUMN_TYPE"
+                ),
+            })?;
+            if name.is_empty() || column_type.is_empty() {
+                return Err(Error::Decode {
+                    message: format!(
+                        "information_schema.COLUMNS row {idx} for {database}.{table} has empty COLUMN_NAME or COLUMN_TYPE"
+                    ),
+                });
+            }
             let column_key: String = row.get("COLUMN_KEY").unwrap_or_default();
             let has_prefix = |prefix: &str| {
                 column_type
@@ -196,14 +243,15 @@ pub async fn fetch_table_layout(
                 .then(|| parse_quoted_variants(&column_type))
                 .flatten()
                 .map(Arc::from);
-            SourceColumn {
+            Ok(SourceColumn {
                 name,
+                column_type,
                 enum_variants,
                 set_variants,
                 is_primary_key: column_key == "PRI",
-            }
+            })
         })
-        .collect();
+        .collect::<Result<Vec<_>>>()?;
 
     Ok(TableLayout { columns })
 }
@@ -331,12 +379,40 @@ mod tests {
                 .iter()
                 .map(|n| SourceColumn {
                     name: (*n).to_string(),
+                    column_type: "int".to_string(),
                     enum_variants: None,
                     set_variants: None,
                     is_primary_key: false,
                 })
                 .collect(),
         }
+    }
+
+    #[test]
+    fn fingerprint_changes_on_column_reorder() {
+        let a = layout(&["id", "name"]);
+        let b = layout(&["name", "id"]);
+        assert_ne!(
+            a.fingerprint(),
+            b.fingerprint(),
+            "reordering columns must change the layout fingerprint"
+        );
+    }
+
+    #[test]
+    fn fingerprint_changes_on_retype() {
+        let mut a = layout(&["id", "name"]);
+        let mut b = layout(&["id", "name"]);
+        b.columns[1].column_type = "varchar(255)".to_string();
+        assert_ne!(a.fingerprint(), b.fingerprint());
+        // Same layout fingerprints identically (stability).
+        assert_eq!(a.fingerprint(), a.fingerprint());
+        a.columns[0].is_primary_key = true;
+        assert_ne!(
+            a.fingerprint(),
+            b.fingerprint(),
+            "primary-key membership is part of the fingerprint"
+        );
     }
 
     #[test]

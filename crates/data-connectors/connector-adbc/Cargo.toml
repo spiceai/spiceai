@@ -43,3 +43,6 @@ app = { path = "../../app" }
 
 [features]
 default = []
+
+[lints]
+workspace = true

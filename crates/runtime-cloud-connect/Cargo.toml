@@ -41,3 +41,6 @@ tokio = { workspace = true, features = ["macros", "test-util"] }
 # The workspace dependency only enables `sync`, so opt-in explicitly here
 # for the integration tests.
 tokio-stream = { workspace = true, features = ["net"] }
+
+[lints]
+workspace = true

@@ -39,3 +39,6 @@ duckdb = { workspace = true, features = [
 
 [features]
 default = []
+
+[lints]
+workspace = true
