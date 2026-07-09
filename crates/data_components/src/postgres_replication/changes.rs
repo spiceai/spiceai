@@ -371,6 +371,10 @@ pub struct PgChangeRows {
     relation: Relation,
     raw: Vec<bytes::Bytes>,
     source_commit_ts_ms: Option<i64>,
+    /// Precomputed `num_rows_hint` (upper bound) and `encoded_len` so the
+    /// consumer's coalescing/metric reads are O(1) rather than rescanning `raw`.
+    row_hint: usize,
+    byte_len: usize,
 }
 
 impl PgChangeRows {
@@ -381,12 +385,62 @@ impl PgChangeRows {
         raw: Vec<bytes::Bytes>,
         source_commit_ts_ms: Option<i64>,
     ) -> Self {
+        // Computed once here (per commit-per-relation) so the metadata accessors
+        // are O(1): the consumer calls them on the coalescing/metric hot path,
+        // possibly several times per envelope. Upper bound = one row per message,
+        // plus one more per UPDATE ('U') since a primary-key-changing UPDATE
+        // expands to a delete + upsert.
+        let updates = raw.iter().filter(|m| m.first() == Some(&b'U')).count();
+        let row_hint = raw.len() + updates;
+
+        // Coalescing byte-budget estimate. Raw wire bytes alone under-count the
+        // eventual Arrow memory for NULL / unchanged-TOAST / DELETE-key-only rows
+        // (pgoutput sends those columns as 1-byte markers, but Arrow allocates the
+        // full column width), so floor the estimate at the fixed-width Arrow
+        // footprint derived from the schema. `max` tracks Arrow in both regimes
+        // without a per-value scan: value-heavy rows → wire dominates;
+        // NULL/delete-heavy → the fixed-width floor dominates.
+        let wire_bytes: usize = raw.iter().map(bytes::Bytes::len).sum();
+        let per_row_fixed: usize = schema
+            .fields()
+            .iter()
+            .map(|f| arrow_fixed_width(f.data_type()))
+            .sum();
+        let byte_len = wire_bytes.max(row_hint.saturating_mul(per_row_fixed));
+
         Self {
             schema,
             relation,
             raw,
             source_commit_ts_ms,
+            row_hint,
+            byte_len,
         }
+    }
+}
+
+/// Fixed per-value Arrow byte width for a data type, or 0 for variable-width
+/// types (Utf8/Binary/List/Struct/…), whose bytes are already reflected in the
+/// buffered pgoutput wire size. Used only to floor `PgChangeRows`'s coalescing
+/// byte estimate at the real Arrow footprint (see `PgChangeRows::new`).
+fn arrow_fixed_width(data_type: &DataType) -> usize {
+    match data_type {
+        DataType::Boolean | DataType::Int8 | DataType::UInt8 => 1,
+        DataType::Int16 | DataType::UInt16 => 2,
+        DataType::Int32
+        | DataType::UInt32
+        | DataType::Float32
+        | DataType::Date32
+        | DataType::Time32(_) => 4,
+        DataType::Int64
+        | DataType::UInt64
+        | DataType::Float64
+        | DataType::Date64
+        | DataType::Time64(_)
+        | DataType::Timestamp(_, _) => 8,
+        DataType::Decimal128(_, _) => 16,
+        DataType::Decimal256(_, _) => 32,
+        _ => 0,
     }
 }
 
@@ -398,17 +452,21 @@ impl ChangeRows for PgChangeRows {
     }
 
     fn num_rows_hint(&self) -> usize {
-        // Upper bound without decoding: each message yields ≥1 row; a
-        // primary-key-changing UPDATE yields 2, so add one per UPDATE message
-        // (pgoutput tag 'U' at byte 0). Over-estimating only affects builder
-        // pre-allocation.
-        self.raw.len() + self.raw.iter().filter(|m| m.first() == Some(&b'U')).count()
+        // Upper bound (precomputed in `new`): one row per message + one per
+        // UPDATE (a primary-key-changing UPDATE expands to delete + upsert).
+        // Over-estimating only affects builder pre-allocation.
+        self.row_hint
     }
 
     fn encoded_len(&self) -> usize {
-        // Total buffered wire bytes — a decode-free proxy for the eventual Arrow
-        // size, used only for the consumer's coalescing byte budget.
-        self.raw.iter().map(bytes::Bytes::len).sum()
+        // Schema-aware coalescing-budget estimate (precomputed in `new`):
+        // `max(wire_bytes, rows × fixed_width_footprint)`, a decode-free proxy
+        // for the eventual Arrow memory that stays representative for both
+        // value-heavy and NULL/delete-heavy bursts (see `new`). Still approximate
+        // — Arrow allocation rounding and variable-column offsets aren't modeled —
+        // so `max_coalesced_bytes` remains a soft bound backed by
+        // `max_coalesced_envelopes`.
+        self.byte_len
     }
 
     fn source_commit_ts_ms(&self) -> Option<i64> {

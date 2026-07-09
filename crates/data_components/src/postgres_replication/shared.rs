@@ -1578,14 +1578,21 @@ async fn deliver_commit(
         if raw.is_empty() {
             continue;
         }
-        // The handle is the one cached at Relation time. If the member detached
-        // mid-connection its `Arc` lives on here (pinned by the route) but its
-        // receiver is gone, so the `deliver_to_member` send below returns
-        // `ReceiverGone` and we detach it there — no separate liveness re-check
-        // is needed, and its ack floor never advances past this commit.
+        // The handle is the one cached at Relation time. A member can detach
+        // mid-connection (via `member_fatal` or a re-subscribe) while its route
+        // entry lingers until the next reconnect rebuilds `routes`, so re-check
+        // it's still streaming before delivering. Skipping this would keep
+        // routing committed changes to a detached member and — because
+        // `AckTable::commit` doesn't check `live` — advance its ack floor past
+        // its last applied LSN, breaking the "stop routing but hold the floor"
+        // detach contract (and delivering changes after a fatal error). This is
+        // a per-commit gate, not the per-event hot path, so the lookup is fine.
         let Some((member_key, member)) = routes.get(&relation_id) else {
             continue;
         };
+        if !source.ack.is_streaming(member_key) {
+            continue;
+        }
         if source.ack.already_committed(member_key, end_lsn) {
             // Reconnect replay of a commit this member already durably
             // applied (replays start at the minimum floor across members).

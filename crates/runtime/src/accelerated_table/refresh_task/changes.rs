@@ -1572,20 +1572,13 @@ impl RefreshTask {
             .iter()
             .map(cdc_item_memory_size)
             .fold(0_usize, usize::saturating_add);
-        // Row-level change count for the throughput metric. This sums
-        // `num_rows_hint()` (an upper bound: a primary-key-changing UPDATE may
-        // expand to two rows and is only counted exactly after the build), so it
-        // over-estimates slightly rather than forcing a build here just to count.
-        let burst_rows: u64 = burst
-            .iter()
-            .filter_map(|item| item.as_ref().ok())
-            .map(|env| env.num_rows_hint() as u64)
-            .fold(0_u64, u64::saturating_add);
         let labels = context.metric_labels.dataset();
         metrics::CDC_APPLY_BURST_ENVELOPES.record(burst_envelopes, labels);
         metrics::CDC_APPLY_BURST_BYTES
             .record(u64::try_from(burst_bytes).unwrap_or(u64::MAX), labels);
-        metrics::CDC_APPLY_BURST_ROWS_TOTAL.add(burst_rows, labels);
+        // CDC_APPLY_BURST_ROWS_TOTAL is recorded from the built batches in
+        // `apply_envelope_run` (exact applied-row count) — `num_rows_hint()`
+        // over-counts a PK-changing UPDATE's delete+upsert as two rows.
 
         // Freshest upstream commit timestamp in this burst, for the CDC
         // replication-lag gauge. Computed here (before the burst is consumed by the
@@ -1648,11 +1641,13 @@ impl RefreshTask {
                 }
             }
         }
+        // Per-burst row count is not logged here: it's the exact
+        // `CDC_APPLY_BURST_ROWS_TOTAL` metric recorded in `apply_envelope_run`
+        // (from the built batches), not the pre-apply `num_rows_hint` upper bound.
         tracing::debug!(
             dataset = %context.dataset_name,
             envelopes = burst_envelopes,
             bytes = burst_bytes,
-            rows = burst_rows,
             close_reason,
             apply_ms = elapsed_ms(burst_start),
             "Applied coalesced CDC change burst"
@@ -1812,6 +1807,18 @@ impl RefreshTask {
             committers.push(committer);
             batches.push(batch);
         }
+
+        // Exact applied-row total for the throughput metric, summed from the
+        // just-built batches (no extra build — `into_parts` above already built
+        // them). `num_rows_hint()` over-counts a PK-changing UPDATE as two rows,
+        // so record the real count here instead of pre-apply.
+        metrics::CDC_APPLY_BURST_ROWS_TOTAL.add(
+            batches
+                .iter()
+                .map(|b| b.record.num_rows() as u64)
+                .fold(0_u64, u64::saturating_add),
+            context.metric_labels.dataset(),
+        );
 
         // Mixed-schema runs (mid-stream schema evolution): `concat_change_batches`
         // requires equal schemas. When the dataset's policy allows evolution,
