@@ -7492,7 +7492,9 @@ impl CayenneTableProvider {
         let any_pk_nullable = pk_columns.iter().any(|col| col.null_count() > 0);
 
         let mut miss_mask = Vec::with_capacity(batch.num_rows());
-        let mut miss_keys: PkDigestSet = PkDigestSet::default();
+        // Sized to the row count: in the common split case most rows are MISSes,
+        // so this keeps the set at one allocation on the CDC apply hot path.
+        let mut miss_keys: PkDigestSet = PkDigestSet::with_capacity(batch.num_rows());
         for row_idx in 0..batch.num_rows() {
             let null_pk = any_pk_nullable && pk_columns.iter().any(|col| col.is_null(row_idx));
             let key = rows.row(row_idx).owned();
@@ -7831,8 +7833,14 @@ impl CayenneTableProvider {
         //    `pk_conflict_detection: none`, in which case there is nothing to
         //    restore and the appends record no keys.
         // Union every shard's kept keys, reusing each key's stored digest so this
-        // merge does not re-hash keys the per-shard sets already keyed.
-        let mut validated_keys = PkDigestSet::default();
+        // merge does not re-hash keys the per-shard sets already keyed. Pre-sized
+        // to the summed shard totals (an upper bound; keys are disjoint across
+        // shards) so the merge does not rehash/reserve.
+        let validated_capacity: usize = per_shard_validated
+            .iter()
+            .map(|(_, _, kept)| kept.len())
+            .sum();
+        let mut validated_keys = PkDigestSet::with_capacity(validated_capacity);
         for (_, _, kept) in &per_shard_validated {
             for (digest, key) in kept.iter_with_digest() {
                 validated_keys.insert_with_digest(digest, key.clone());

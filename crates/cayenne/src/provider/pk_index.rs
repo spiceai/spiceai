@@ -87,6 +87,11 @@ impl PkDigestSet {
     /// `digest` MUST equal `pk_digest(&key)`.
     #[inline]
     pub(crate) fn insert_with_digest(&mut self, digest: u128, key: OwnedRow) {
+        debug_assert_eq!(
+            digest,
+            pk_digest(&key),
+            "insert_with_digest called with a digest that does not match the key"
+        );
         self.inner.insert(digest, key);
     }
 
@@ -213,6 +218,11 @@ impl CachedPkKeyset {
         key: OwnedRow,
         location: RowLocation,
     ) {
+        debug_assert_eq!(
+            digest,
+            pk_digest(&key),
+            "insert_with_digest called with a digest that does not match the key"
+        );
         match self.keys.entry(digest) {
             std::collections::hash_map::Entry::Occupied(mut entry) => {
                 entry.get_mut().location = location;
