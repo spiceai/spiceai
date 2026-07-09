@@ -270,7 +270,7 @@ pub fn log_committer_progress(
 /// timestamp, so without a heartbeat its measured lag would climb forever and
 /// the dataset would never flip Ready. Periodically emitting a zero-row
 /// envelope stamped with the source's own clock (a Postgres keepalive time, a
-/// MongoDB cluster time, a MySQL server clock) lets the runtime observe
+/// `MongoDB` cluster time, a `MySQL` server clock) lets the runtime observe
 /// `now - source_commit_ts_ms` and mark the dataset Ready once that lag is
 /// within the connector's `ready_lag`.
 ///
@@ -349,7 +349,7 @@ pub fn build_ready_signal_envelope(schema: &SchemaRef) -> Result<ChangeEnvelope,
 ///
 /// This is the single definition of "caught up" behind every connector's
 /// `{connector}_replication_ready_lag`: connectors stamp each envelope's
-/// `is_dataset_ready` with it (mirroring DynamoDB's poll-cycle lag gate), and a
+/// `is_dataset_ready` with it (mirroring `DynamoDB`'s poll-cycle lag gate), and a
 /// [`build_heartbeat_envelope`] on an idle source carries the same verdict.
 #[must_use]
 pub fn source_commit_within_ready_lag(

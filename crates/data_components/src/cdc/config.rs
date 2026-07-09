@@ -93,7 +93,7 @@ impl InvalidCheckpointBehavior {
 /// marked Ready once its replication lag (wall-clock now minus the freshest
 /// applied source-commit timestamp) falls below this. `2s` tolerates ordinary
 /// streaming jitter while still gating out a dataset that is snapshotting,
-/// draining a backlog, or rebuilding after a restart. Mirrors DynamoDB's
+/// draining a backlog, or rebuilding after a restart. Mirrors `DynamoDB`'s
 /// original `ready_lag` default.
 pub const DEFAULT_READY_LAG: Duration = Duration::from_secs(2);
 
