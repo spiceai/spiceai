@@ -59,7 +59,10 @@ jobs:
             fonts-dejavu-core
 
       - name: Install Python dependencies
-        run: python3 -m pip install markdown weasyprint
+        # Pin the direct dependencies so an upstream major release can't break
+        # the doc build on an otherwise-unrelated push. Bump deliberately when
+        # updating the doc.
+        run: python3 -m pip install 'markdown==3.9' 'weasyprint==66.0'
 
       # Guard against a stale or uncommitted figure: regenerating waterfall.svg
       # from gen_waterfall.py must leave the working tree clean. --porcelain
