@@ -12842,13 +12842,7 @@ impl CayenneTableProvider {
 
         let cold_target_file_size_mb = self.table_metadata.vortex_config.cold_target_file_size_mb;
         let target_size_bytes = cold_target_file_size_mb * 1024 * 1024;
-        // Roll cold files at the COLD target size, not the warm size baked into
-        // the base format. `write_shard_format` returns the base (warm-sized)
-        // format for the single-shard case that every sorted / PK-upsert table
-        // hits, which is why cold files were silently rolling at
-        // `target_vortex_file_size_mb` and `cayenne_cold_target_file_size_mb`
-        // was inert. Preserve the identical shard decision (non-sorted tables
-        // still earn parallel encoders) and layer the cold file size on top.
+
         let shard = self.write_shard_config(1, target_size_bytes, None);
         let write_format = self
             .context
