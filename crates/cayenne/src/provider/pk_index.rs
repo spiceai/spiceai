@@ -277,6 +277,64 @@ impl PkBloom {
         }
         true
     }
+
+    /// Serialize this bloom standalone (the [`Self::serialize_into`] frame with
+    /// no sidecar magic/version wrapper) for embedding one bloom per cold-tier
+    /// manifest row (`ColdTierFile::pk_bloom`).
+    pub(crate) fn to_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        self.serialize_into(&mut out);
+        out
+    }
+
+    /// Inverse of [`Self::to_bytes`]: parse ONE bloom from `bytes`, ignoring any
+    /// trailing bytes. Returns `None` on a corrupt/short frame so the caller
+    /// falls back to the exact cold scan.
+    pub(crate) fn from_bytes(bytes: &[u8]) -> Option<Self> {
+        Self::deserialize_from_prefix(bytes).map(|(bloom, _)| bloom)
+    }
+}
+
+/// Upper bound on ONE cold file's persisted PK bloom. A file whose right-sized
+/// bloom (~10 bits/key) would exceed this is stored with no bloom (`None`), so
+/// the keyset rebuild falls back to the exact cold scan for the whole table
+/// rather than bloating the manifest/snapshot. ~16 MiB covers ~13M keys/file.
+pub(crate) const COLD_PK_BLOOM_PER_FILE_MAX_BYTES: usize = 16 * 1024 * 1024;
+
+/// Table-global cold-tier PK existence view: one [`PkBloom`] per live cold file
+/// (from the `cayenne_cold_tier_file` manifest), probed at CDC-upsert
+/// conflict-detection time so a re-ingested cold-resident key records a
+/// supersede tombstone WITHOUT scanning the cold object store
+/// (`load_existing_keyset`).
+///
+/// Correctness mirrors [`PkBloom`]: no false negatives (a live cold key is never
+/// missed), and a false positive only yields a harmless redundant key-based
+/// delete under upsert. Only ever consulted for `OnConflict::Upsert` tables —
+/// `DoNothing` keeps the exact cold scan (a false positive would wrongly drop a
+/// genuinely new row). Per-file blooms are kept as a list (not unioned) because
+/// each is right-sized to its file's key count, so bit-array sizes differ.
+pub(crate) struct ColdPkExistence {
+    blooms: Vec<PkBloom>,
+}
+
+impl ColdPkExistence {
+    pub(crate) fn new(blooms: Vec<PkBloom>) -> Self {
+        Self { blooms }
+    }
+
+    /// `true` if `key` MAY live in any cold file (definitely absent when every
+    /// file's bloom misses — blooms have no false negatives).
+    pub(crate) fn maybe_contains(&self, key: &[u8]) -> bool {
+        self.blooms.iter().any(|b| b.maybe_contains(key))
+    }
+
+    /// Approximate resident bytes across all per-file blooms, for logging.
+    pub(crate) fn approx_bytes(&self) -> usize {
+        self.blooms
+            .iter()
+            .map(|b| b.bits.len().saturating_mul(8))
+            .fold(0, usize::saturating_add)
+    }
 }
 
 /// Magic ("CPKB") + version for the persisted PK-index bloom sidecar. Bumping
@@ -513,4 +571,90 @@ impl ShardedPkIndex {
 pub(crate) enum PkExistenceRef<'a> {
     Exact(&'a HashMap<OwnedRow, RowLocation>),
     Bloom(&'a PkBloom),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{COLD_PK_BLOOM_PER_FILE_MAX_BYTES, ColdPkExistence, PkBloom};
+
+    fn key(n: u64) -> [u8; 8] {
+        n.to_be_bytes()
+    }
+
+    #[test]
+    fn pk_bloom_to_from_bytes_round_trips() {
+        let mut bloom = PkBloom::with_expected_keys(1000, COLD_PK_BLOOM_PER_FILE_MAX_BYTES);
+        for n in 0..1000u64 {
+            bloom.insert(&key(n));
+        }
+        let bytes = bloom.to_bytes();
+        let restored = PkBloom::from_bytes(&bytes).expect("round-trips");
+
+        // No false negatives: every inserted key must still be reported present.
+        for n in 0..1000u64 {
+            assert!(
+                restored.maybe_contains(&key(n)),
+                "restored bloom dropped an inserted key {n}"
+            );
+        }
+        assert_eq!(restored.bit_mask, bloom.bit_mask, "bit layout preserved");
+        assert_eq!(restored.inserted_keys, bloom.inserted_keys);
+    }
+
+    #[test]
+    fn pk_bloom_from_bytes_rejects_corrupt_input() {
+        assert!(PkBloom::from_bytes(&[]).is_none(), "empty input");
+        assert!(
+            PkBloom::from_bytes(&[0u8; 4]).is_none(),
+            "shorter than the header"
+        );
+        // A valid frame with its trailing words truncated must be rejected, not
+        // silently half-parsed.
+        let mut bloom = PkBloom::with_expected_keys(64, COLD_PK_BLOOM_PER_FILE_MAX_BYTES);
+        bloom.insert(&key(7));
+        let mut bytes = bloom.to_bytes();
+        bytes.truncate(bytes.len() - 8);
+        assert!(PkBloom::from_bytes(&bytes).is_none(), "truncated frame");
+    }
+
+    #[test]
+    fn cold_pk_existence_unions_per_file_blooms() {
+        // File A holds evens, file B holds odds — different right-sized blooms.
+        let mut a = PkBloom::with_expected_keys(500, COLD_PK_BLOOM_PER_FILE_MAX_BYTES);
+        let mut b = PkBloom::with_expected_keys(500, COLD_PK_BLOOM_PER_FILE_MAX_BYTES);
+        for n in 0..1000u64 {
+            if n % 2 == 0 {
+                a.insert(&key(n));
+            } else {
+                b.insert(&key(n));
+            }
+        }
+        let existence = ColdPkExistence::new(vec![a, b]);
+
+        // No false negatives across the union for keys in either file.
+        for n in 0..1000u64 {
+            assert!(
+                existence.maybe_contains(&key(n)),
+                "union dropped key {n} present in one of the files"
+            );
+        }
+        // A definitely-absent key is (almost surely) reported absent — the union
+        // must not blanket-accept. Probe a sparse range far from the inserted set
+        // to keep the false-positive odds negligible for the test.
+        let absent_reported_present = (10_000_000u64..10_001_000)
+            .filter(|&n| existence.maybe_contains(&key(n)))
+            .count();
+        assert!(
+            absent_reported_present < 50,
+            "union false-positive rate far too high: {absent_reported_present}/1000"
+        );
+        assert!(existence.approx_bytes() > 0);
+    }
+
+    #[test]
+    fn cold_pk_existence_empty_never_contains() {
+        let existence = ColdPkExistence::new(Vec::new());
+        assert!(!existence.maybe_contains(&key(1)));
+        assert_eq!(existence.approx_bytes(), 0);
+    }
 }

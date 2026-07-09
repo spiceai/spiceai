@@ -160,12 +160,12 @@ fn pk_bounds_from_manifest(
     let mut bounds = Vec::with_capacity(pk_indices.len());
     for &idx in pk_indices {
         let col = stats.column_statistics.get(idx)?;
-        let (min, max) = match (&col.min_value, &col.max_value) {
-            (Precision::Exact(min), Precision::Exact(max))
-            | (Precision::Inexact(min), Precision::Inexact(max))
-            | (Precision::Exact(min), Precision::Inexact(max))
-            | (Precision::Inexact(min), Precision::Exact(max)) => (min, max),
-            _ => return None,
+        let (
+            Precision::Exact(min) | Precision::Inexact(min),
+            Precision::Exact(max) | Precision::Inexact(max),
+        ) = (&col.min_value, &col.max_value)
+        else {
+            return None;
         };
         if min.is_null() || max.is_null() {
             return None;
@@ -242,7 +242,7 @@ mod tests {
         assert_eq!(decoded[1], vec![ScalarValue::Int64(Some(-3))]);
         // Short key → cannot classify.
         let bad: Vec<Box<[u8]>> = vec![vec![1, 2].into_boxed_slice()];
-        assert!(decode_int64_tombstone_keys(&bad).is_err());
+        decode_int64_tombstone_keys(&bad).expect_err("short key must fail to decode");
     }
 }
 
@@ -304,6 +304,7 @@ mod composite_key_tests {
             min_sequence: 0,
             max_sequence: 100,
             statistics_blob: blob,
+            pk_bloom: None,
         }
     }
 
