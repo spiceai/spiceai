@@ -32,20 +32,22 @@
 
 🎯 **Goal**: Build data-grounded AI apps and agents in minutes, not months. No pipelines. No glue. Just SQL, search, and inference — federated across your data, accelerated locally, served on localhost.
 
+> 🆕 **New in Spice 2.0 — add a real-time analytics node to your operational database.** Point Spice at **PostgreSQL, MySQL, or MongoDB** and it maintains a sandboxed, analytics-ready replica with high-throughput **CDC replication** — **sub-second queries, ~2-second freshness, and zero analytical load on production**. No ETL. No Debezium. No Kafka. [Read the Spice 2.0 launch →](https://spice.ai/blog/spice-2-0-is-now-available)
+
 ## Why Spice?
 
+- ⚡ **Real-time analytics node for your operational database** — Add a sandboxed analytics replica to **PostgreSQL, MySQL, and MongoDB** via native CDC (WAL, binlog, change streams) plus DynamoDB Streams — **~2-second freshness, zero load on production, no ETL, no Debezium or Kafka required**.
 - 🚀 **Localhost latency at any scale** — Millisecond queries against a sandboxed working set on each pod, transparently delegated to a distributed cluster for the long tail.
 - 🦀 **Built in Rust** on industry-leading open foundations: [Apache DataFusion](https://datafusion.apache.org), [Apache Ballista](https://datafusion.apache.org/ballista/), [Apache Arrow](https://arrow.apache.org), [Apache Iceberg](https://iceberg.apache.org), [Vortex](https://github.com/vortex-data/vortex), [DuckDB](https://duckdb.org), and [SQLite](https://www.sqlite.org).
 - ⚡ **Distributed query without the operational tax** — Apache Ballista with multi-active schedulers coordinated through object storage. **2.9x faster than single-node DataFusion** on TPC-H SF100, **8x less RAM than Spark**.
-- 💎 **Spice Cayenne** data accelerator on Vortex — **1.4x faster than DuckDB with 3x less memory** on TPC-H SF100. **100x faster random access vs. Parquet**.
+- 💎 **Spice Cayenne** data accelerator on Vortex (GA) — **1.5x faster than DuckDB with 3x less memory** on TPC-H SF100, **26x faster than Spice 1.x on TPC-DS SF100**, **100x faster random access vs. Parquet**.
 - 🔍 **Petabyte-scale hybrid search** — Native Amazon S3 Vectors, Tantivy BM25, DuckDB HNSW, and Elasticsearch kNN, with reciprocal rank fusion (RRF) and reranker UDTFs — all in a single SQL query.
 - 🤖 **AI-native runtime** — OpenAI-compatible APIs, MCP server + gateway, LLM memory, NSQL text-to-SQL, multi-vector ColBERT-style embeddings, provider-aware prompt caching.
 - 🔗 **30+ data connectors** with advanced query push-down — federate Postgres, MySQL, Snowflake, Databricks, Iceberg, Delta Lake, S3, Spark, MSSQL, DynamoDB, MongoDB, GitHub, SharePoint, Kafka, and more.
-- ⏱️ **Real-time CDC** — Native PostgreSQL WAL streaming and DynamoDB Streams (no Debezium or Kafka required), plus Debezium when you need it.
 - 📝 **Open table formats, first-class** — Query, **accelerate, and write** to Apache Iceberg with ACID guarantees via standard SQL `INSERT INTO`. No Spark required.
 - 🛡️ **Enterprise-ready** — HashiCorp Vault and Azure Key Vault secret stores, mTLS, read-only API keys, observability via OpenTelemetry, and an extensibility model used in production at companies like Twilio and Barracuda.
 
-📣 **Latest:** Read [Localhost Latency at Scale: The Spice Cluster-Sidecar Architecture](https://spice.ai/blog/cluster-sidecar-architecture) and [Apache Ballista at Spice AI: Distributed Query Execution Without the Operational Tax](https://spice.ai/blog/apache-ballista-at-spice-ai). | [📊 2025 Year in Review](https://spice.ai/blog/2025-spice-ai-year-in-review)
+📣 **Latest:** [**Spice 2.0 is now available**](https://spice.ai/blog/spice-2-0-is-now-available) — real-time analytical query on operational data, without ETL: **~170x faster CDC ingest**, **2-second freshness**, **1,046 QPH of HTAP analytics at SF1000 under a 266,000+ tpmC live transactional load**. | Read the [Cluster-Sidecar Architecture](https://spice.ai/blog/cluster-sidecar-architecture) and [Apache Ballista](https://spice.ai/blog/apache-ballista-at-spice-ai) deep dives.
 
 <div align="center">
   <picture>
@@ -77,17 +79,25 @@ Spice provides five APIs and interfaces in a lightweight, portable runtime (sing
 
 ## What's New
 
+### Analytics node for operational databases — real-time CDC, no ETL
+
+Add a sandboxed, analytics-ready replica alongside **PostgreSQL, MySQL, and MongoDB** in minutes — **~2-second end-to-end freshness, zero analytical load on production, and no ETL**. Spice replicates committed inserts, updates, and deletes directly from the native change log at up to **~170x the ingest throughput of Spice 1.x**, so production never runs a single analytical query. It's incrementally adoptable: start with **1 table** and be querying operational data in minutes, then join across replicated sources in a single SQL query. In the CH-BenCHmark HTAP benchmark, **1 Spice node served 1,046 analytical queries/hour at SF1000 (1,000 warehouses, 300M+ rows) while the source sustained a 266,000+ tpmC live transactional load**. [Read the Spice 2.0 launch →](https://spice.ai/blog/spice-2-0-is-now-available)
+
+- **PostgreSQL (WAL), MySQL (binlog), and MongoDB (change streams)** — native logical replication with auto-managed slots/positions and bootstrapped snapshots. **No Debezium or Kafka required.**
+- **DynamoDB Streams** — two-tier acceleration that fans out from a central Spice layer to thousands of edge sidecars with sub-second propagation. Used in production for global control-plane sync. [Read the pattern →](https://spice.ai/blog/real-time-acceleration-with-dynamodb-streams)
+- **Debezium + Kafka** — available when you want it.
+
 ### Cluster-Sidecar Architecture: localhost latency, cluster scale
 
 Each application gets a complete data plane on `localhost`. A lightweight Spice sidecar runs in the application pod, serves SQL/search/LLM-inference from a scoped working set, and transparently delegates the long tail to a central Spice cluster (Ballista distributed query, Cayenne acceleration, hybrid search indexing) over Arrow Flight. Three latency tiers: results cache (microseconds) → local working set (single-digit milliseconds) → cluster delegation. The application **never holds credentials** to Postgres, S3, Snowflake, or Iceberg — only a token to its sidecar. [Read the architecture deep dive →](https://spice.ai/blog/cluster-sidecar-architecture)
 
 ### Apache Ballista distributed query
 
-Spice extends Apache Ballista with **multi-active scheduler HA coordinated through object storage** (no etcd, ZooKeeper, or Redis required), bidirectional gRPC control streams, mandatory mTLS, multiple shuffle backends (local, in-memory, S3/Azure/GCS), Vortex-encoded shuffle data, and distributed embeddings inside SQL. **TPC-H SF100: 2.9x faster than single-node DataFusion. 8x less RAM than Apache Spark with 2–8x better query performance** in early preview. [Read the engineering deep dive →](https://spice.ai/blog/apache-ballista-at-spice-ai)
+Spice extends Apache Ballista with **multi-active scheduler HA coordinated through object storage** (no etcd, ZooKeeper, or Redis required), bidirectional gRPC control streams, mandatory mTLS, multiple shuffle backends (local, in-memory, S3/Azure/GCS), Vortex-encoded shuffle data, and distributed embeddings inside SQL. **TPC-H SF100: 2.9x faster on 3 executors than 1 node. 8x less RAM than Apache Spark with 2–8x better query performance** — now generally available. [Read the engineering deep dive →](https://spice.ai/blog/apache-ballista-at-spice-ai)
 
 ### Spice Cayenne — next-gen data acceleration on Vortex
 
-Cayenne pairs the [Vortex columnar format](https://github.com/vortex-data/vortex) with SQLite metadata to deliver multi-file acceleration without DuckDB's single-file ceiling or memory overhead. **TPC-H SF-100: 1.4x faster than DuckDB-file with 3x less memory. ClickBench: 14% faster, 3.4x less memory.** Vortex itself is **100x faster on random access**, **10–20x faster on full scans**, and **5x faster writes** than Parquet — compute kernels run directly on encoded data, skipping decompression entirely for many operations. [Read the Vortex deep dive →](https://spice.ai/blog/vortex-at-spice-ai-the-columnar-format-for-data-intensive-workloads)
+Cayenne pairs the [Vortex columnar format](https://github.com/vortex-data/vortex) with SQLite metadata to deliver multi-file acceleration without DuckDB's single-file ceiling or memory overhead. **Now GA** with atomic WAL-staged writes, high-throughput CDC ingestion, `MERGE INTO`, and SQL-defined partitioning. **TPC-H SF100: 1.5x faster than DuckDB with 3x less memory. TPC-DS SF100: 26x faster than Spice 1.x. ClickBench: 14% faster, 3.4x less memory.** Vortex itself is **100x faster on random access**, **10–20x faster on full scans**, and **5x faster writes** than Parquet — compute kernels run directly on encoded data, skipping decompression entirely for many operations. [Read the Vortex deep dive →](https://spice.ai/blog/vortex-at-spice-ai-the-columnar-format-for-data-intensive-workloads)
 
 ### Apache Iceberg: query, accelerate, and write
 
@@ -109,13 +119,7 @@ SELECT * FROM rerank(
 
 ### Multi-tenancy for AI agents — without per-tenant pipelines
 
-Spin up one Spice runtime per tenant or agent — each with its own sandboxed datasets, accelerators, secrets, and policies. Or share a runtime with config-level tenant isolation. Or do both with a hybrid model. The lightweight runtime makes "one Spicepod per tenant" actually viable — even at high tenant counts. [Read the patterns →](https://spice.ai/blog/multi-tenancy-for-ai-agents-without-pipelines)
-
-### Real-time CDC, the simple way
-
-- **PostgreSQL Native CDC via WAL** — Stream INSERT/UPDATE/DELETE events directly from `pgoutput` logical replication into any local accelerator. **No Debezium or Kafka required.** Auto-managed replication slots and LSN acknowledgement.
-- **DynamoDB Streams** — Two-tier acceleration pattern that fans out from a central Spice layer to thousands of edge sidecars with sub-second propagation. Used in production for global control-plane sync. [Read the pattern →](https://spice.ai/blog/real-time-acceleration-with-dynamodb-streams)
-- **Debezium + Kafka** — Available when you want it.
+Spin up one Spice runtime per tenant or agent — each with its own sandboxed datasets, accelerators, secrets, and policies. Or share a runtime with config-level tenant isolation. Or do both with a hybrid model. The lightweight **~140MB** runtime makes "one Spicepod per tenant" actually viable — even at **thousands of tenants**. [Read the patterns →](https://spice.ai/blog/multi-tenancy-for-ai-agents-without-pipelines)
 
 ### Spice Skills for AI coding agents
 
@@ -168,7 +172,7 @@ If you build with **DataFusion**, **DuckDB**, **Vortex**, **Iceberg**, or **Ball
 | **Iceberg Write (SQL INSERT)**   | ✅                                                   | ✅                    | Limited               | ❌                   | ❌                   |
 | **Query Result Caching**         | ✅                                                   | ✅                    | ✅                     | ✅                   | Limited             |
 | **Multi-Modal Acceleration**     | ✅ (OLAP + OLTP per dataset)                         | ❌                    | ❌                     | ❌                   | ❌                   |
-| **Native CDC**                   | ✅ (Postgres WAL, DynamoDB Streams, Debezium)        | ❌                    | ❌                     | ❌                   | ✅ (Debezium)        |
+| **Native CDC**                   | ✅ (Postgres WAL, MySQL binlog, MongoDB, DynamoDB Streams) | ❌                    | ❌                     | ❌                   | ✅ (Debezium)        |
 | **Built-in AI / LLM inference**  | ✅                                                   | ❌                    | ❌                     | ❌                   | ❌                   |
 
 ### AI Apps and Agents
@@ -190,6 +194,12 @@ If you build with **DataFusion**, **DuckDB**, **Vortex**, **Iceberg**, or **Ball
 ✅ = Fully supported · ❌ = Not supported · Limited = Partial or restricted support
 
 ## Example Use-Cases
+
+### Real-time Analytics on Operational Data (no ETL)
+
+- **Analytics node for PostgreSQL, MySQL, and MongoDB**: Point Spice at a live operational database and it maintains a continuously updated, sandboxed analytics replica via native CDC — **sub-second queries, ~2-second freshness, and 0 analytical queries on production**. Start with 1 table, then join across replicated sources in one SQL query. [CDC Docs](https://spiceai.org/docs/features/cdc)
+- **HTAP at scale**: Sustain analytics and transactions on the same data — **1,046 analytical QPH at SF1000 under a 266,000+ tpmC transactional load** in CH-BenCHmark, all served from the replica. [Spice 2.0 launch →](https://spice.ai/blog/spice-2-0-is-now-available)
+- **Bring your own BI tools**: Query the replica from Power BI, Tableau, Looker, and Apache Superset over Arrow Flight SQL, ODBC, and JDBC — or from Python and the Go, Rust, Java, and JavaScript SDKs.
 
 ### Data-grounded Agentic AI Applications
 
@@ -241,7 +251,7 @@ See more demos on [YouTube](https://www.youtube.com/playlist?list=PLesJrUXEx3U9a
 | `github`                           | GitHub                                | Stable            | GitHub API                   |
 | `postgres`                         | PostgreSQL (with native WAL CDC)      | Stable            |                              |
 | `s3`                               | [S3][s3]                              | Stable            | Parquet, CSV                 |
-| `mysql`                            | MySQL                                 | Stable            |                              |
+| `mysql`                            | MySQL (with native binlog CDC)        | Stable            |                              |
 | `spice.ai`                         | [Spice.ai][spiceai]                   | Stable            | Arrow Flight                 |
 | `dynamodb`                         | Amazon DynamoDB (with Streams)        | Stable            |                              |
 | `graphql`                          | GraphQL                               | Release Candidate | JSON                         |
@@ -269,7 +279,7 @@ See more demos on [YouTube](https://www.youtube.com/playlist?list=PLesJrUXEx3U9a
 | `http`, `https`                    | HTTP(s) (dynamic headers, pagination) | Alpha             | Parquet, CSV, JSON           |
 | `imap`                             | IMAP                                  | Alpha             | IMAP Emails                  |
 | `localpod`                         | [Local dataset replication][localpod] | Alpha             |                              |
-| `mongodb`                          | MongoDB                               | Alpha             |                              |
+| `mongodb`                          | MongoDB (with change-stream CDC)      | Alpha             |                              |
 | `scylladb`                         | ScyllaDB                              | Alpha             |                              |
 | `smb`                              | SMB 3.1.1                             | Alpha             | SMB                          |
 | `nfs`                              | NFS                                   | Alpha             | Parquet, CSV, JSON           |
@@ -618,7 +628,7 @@ Spice.ai is designed to be extensible. See [EXTENSIBILITY.md](./docs/EXTENSIBILI
 
 🚀 See the [Roadmap](https://github.com/spiceai/spiceai/blob/trunk/docs/ROADMAP.md). Highlights:
 
-- **[v2.0](https://github.com/spiceai/spiceai/milestone/58) (June 2026)** — Cayenne GA, multi-active HA GA, distributed query GA, mTLS, Cedar policy engine (Beta)
+- **[v2.0](https://github.com/spiceai/spiceai/milestone/58) (now available)** — CDC replication for operational databases (Postgres/MySQL/MongoDB), Cayenne GA, multi-active HA GA, distributed query GA, mTLS, Cedar policy engine (Beta). [Read the launch →](https://spice.ai/blog/spice-2-0-is-now-available)
 - **[v2.1](https://github.com/spiceai/spiceai/milestone/95) (July 2026)** — Distributed search, schema registry, schema evolution
 - **[v2.2](https://github.com/spiceai/spiceai/milestone/99) (September 2026)** — Webhooks, reactive event-driven actions (Drasi-based)
 
