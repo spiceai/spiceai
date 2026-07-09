@@ -69,7 +69,6 @@ use llms::rerank::RerankerModelStore;
 use model::{EmbeddingModelStore, LLMChatCompletionsModelStore};
 
 use crate::tools::{Tooling, factory::default_available_catalogs};
-use model_components::model::Model;
 pub use notify::Error as NotifyError;
 use snafu::prelude::*;
 use status::ComponentStatus;
@@ -540,9 +539,6 @@ pub struct Runtime {
     /// diff phase can still read the app `RwLock` without deadlocking.
     apply_app_lock: Arc<tokio::sync::Mutex<()>>,
     df: Arc<DataFusion>,
-    // `Arc<Model>` (not `Model`) so a handle can be cloned out of the lock and
-    // moved into `spawn_blocking` to run synchronous inference off the runtime.
-    models: Arc<RwLock<HashMap<String, Arc<Model>>>>,
     llm_runtime_stores: Arc<model::LlmRuntimeStores>,
     http_rate_control_registry: Arc<dataconnector::http_rate_control::HttpRateControlRegistry>,
     embeds: Arc<RwLock<EmbeddingModelStore>>,
