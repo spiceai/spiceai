@@ -47,7 +47,7 @@ use arrow_flight::flight_service_client::FlightServiceClient;
 use arrow_flight::sql::client::FlightSqlServiceClient;
 use arrow_schema::SchemaRef;
 use datafusion::catalog::{TableFunctionImpl, TableProvider};
-use datafusion::common::{DataFusionError, Result as DataFusionResult};
+use datafusion::common::{DataFusionError, Result as DataFusionResult, Statistics};
 use datafusion::logical_expr::Expr;
 use datafusion::scalar::ScalarValue;
 use datafusion::sql::TableReference;
@@ -152,13 +152,24 @@ impl TableFunctionImpl for ExecutorTableFunc {
         let client = build_peer_client(&endpoint, df.cluster_config.client_tls_config())?;
         let cookie_store = Arc::new(CookieStore::new());
 
-        Ok(Arc::new(FlightSQLTable::create_with_schema(
-            EXECUTOR_TABLE_UDTF_NAME,
-            &endpoint,
-            client,
-            table_ref,
-            schema,
-            cookie_store,
-        )))
+        // Stamp the LOCAL provider's statistics onto the peer scan, downgraded
+        // to inexact: the peer serves a different partition slice, but slices
+        // are of comparable size, so the local numbers are a usable estimate.
+        // Without any statistics this scan is an unknown-cardinality leaf, and
+        // the executor's `JoinSelection` can never cost-swap a join between a
+        // gathered broadcast dimension and its local (exact-stats) fact slice.
+        let statistics = provider.statistics().map(Statistics::to_inexact);
+
+        Ok(Arc::new(
+            FlightSQLTable::create_with_schema(
+                EXECUTOR_TABLE_UDTF_NAME,
+                &endpoint,
+                client,
+                table_ref,
+                schema,
+                cookie_store,
+            )
+            .with_statistics(statistics),
+        ))
     }
 }
