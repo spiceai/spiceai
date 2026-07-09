@@ -1856,9 +1856,8 @@ mod tests {
             .expect("item is Ok");
 
         assert!(next.is_dataset_ready(), "envelope must flag dataset ready");
-        assert_eq!(
-            next.change_batch.record.num_rows(),
-            0,
+        assert!(
+            next.is_empty(),
             "ready signal envelope must carry zero rows"
         );
     }
