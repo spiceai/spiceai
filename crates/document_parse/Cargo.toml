@@ -9,6 +9,7 @@ rust-version.workspace = true
 version.workspace = true
 
 [dependencies]
+async-trait.workspace = true
 bytes.workspace = true
 calamine = "0.28"
 docx-rs = { git = "https://github.com/spiceai/docx-rs", rev = "2a85dce57d0128e2cd7c369545516c347cb8c529" }
