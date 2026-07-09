@@ -103,7 +103,7 @@ pub(crate) fn eager_ndv_on_ingest() -> bool {
         });
         tracing::info!(
             target: "cayenne",
-            "NDV computation mode: {} (env SPICE_CAYENNE_EAGER_NDV)",
+            "NDV computation mode: {} (default lazy; override with SPICE_CAYENNE_EAGER_NDV)",
             if eager {
                 "eager (folded on inline ingest)"
             } else {

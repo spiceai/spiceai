@@ -17,8 +17,17 @@ to a file.
 
 Concretely, the only behavioral change from eager folding is at the inline path
 (`AppendMutationWriter`): its `ColumnStatsAccumulator` is built with
-`new_with_ndv(schema, false)`. Min/max/null-count stats are still maintained
-there; only the per-batch NDV hashing is removed from the hot loop.
+`new_with_ndv(schema, eager_ndv_on_ingest())`, which is `false` (lazy) by
+default. Min/max/null-count stats are still maintained there; only the per-batch
+NDV hashing is removed from the hot loop.
+
+### Escape hatch: `SPICE_CAYENNE_EAGER_NDV`
+
+`eager_ndv_on_ingest()` reads the `SPICE_CAYENNE_EAGER_NDV` environment variable
+once (truthy = eager); unset/default is lazy. Setting it restores eager inline
+folding — a benchmark/A-B and operational escape hatch, exposed by the HTAP CI
+workflow as the `cayenne_eager_ndv` dispatch input, and expected to be removed
+once lazy is the only path. The resolved mode is logged once.
 
 The table keeps a **single global aggregate sketch**
 (`cayenne_table_statistics.ndv_sketches`), maintained exactly as before — no
