@@ -21,10 +21,12 @@ limitations under the License.
 #[cfg(feature = "duckdb")]
 pub mod duckdb;
 pub mod flightsql;
+pub mod hash_join_build_compaction;
 pub mod hash_join_optimization;
 pub mod http_subquery_pushdown;
 
 pub mod cluster;
 
+pub use hash_join_build_compaction::HashJoinBuildCompaction;
 pub use hash_join_optimization::EmptyHashJoinExecPhysicalOptimization;
 pub use http_subquery_pushdown::HttpParamsPushdown;
