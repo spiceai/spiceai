@@ -2071,7 +2071,7 @@ async fn query_single_i64(rt: &Runtime, sql: &str) -> Result<i64, String> {
 
 /// Full datalake-tier cycle against real S3:
 /// registration probe → warm load (append mode; the datalake tier supports
-/// refresh_mode 'changes' and 'append' only) → background promotion to the
+/// `refresh_mode` 'changes' and 'append' only) → background promotion to the
 /// datalake → cross-tier query correctness → restart with a tuned param
 /// (reconciled, re-appended rows upsert-dedupe against the promoted data).
 ///
