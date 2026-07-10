@@ -2227,9 +2227,9 @@ const PARAMETERS: &[ParameterSpec] = &concat_arrays::<
         ParameterSpec::component("datalake_target_file_size_mb")
             .description("Target size for datalake (cold) tier Vortex files in MB. Larger than the warm cayenne_target_file_size_mb because object stores favor fewer, larger objects and cold scans are range reads. Default: 512."),
         ParameterSpec::component("datalake_warm_max_bytes")
-            .description("The warm tier graduates to cold once its total Vortex bytes reach this threshold. 0 (default) disables the byte trigger; set with cold_tier_warm_max_files to bound warm-tier size."),
+            .description("The warm tier graduates to the datalake once its total Vortex bytes reach this threshold. Pairs with cayenne_datalake_warm_max_files; 0 disables the byte trigger, but when BOTH triggers are 0/unset this one defaults to 16 x cayenne_datalake_target_file_size_mb."),
         ParameterSpec::component("datalake_warm_max_files")
-            .description("The warm tier graduates to cold once its Vortex file count reaches this threshold. 0 (default) disables the file-count trigger."),
+            .description("The warm tier graduates to the datalake once its Vortex file count reaches this threshold. 0 (default) disables the file-count trigger; when cayenne_datalake_warm_max_bytes is also 0/unset, the byte trigger defaults to 16 x cayenne_datalake_target_file_size_mb."),
         ParameterSpec::component("datalake_promotion_interval_ms")
             .description("How often the background loop evaluates the warm→cold promotion trigger. Cold tiering is not latency-critical, so this is coarser than compaction. Default: 60000 (60s)."),
         ParameterSpec::component("datalake_gc_interval_ms")
