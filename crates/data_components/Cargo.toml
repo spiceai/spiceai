@@ -80,6 +80,8 @@ mailparse = { workspace = true, optional = true }
 num_cpus = "1.16"
 object_store = { workspace = true }
 opendal.workspace = true
+parking_lot.workspace = true
+rustc-hash = "2"
 oracle = { version = "0.6", optional = true }
 native-tls = { workspace = true, optional = true }
 percent-encoding.workspace = true
@@ -234,6 +236,11 @@ name = "object_filter"
 [[bench]]
 harness = false
 name = "shared_pump_bench"
+required-features = ["postgres"]
+
+[[bench]]
+harness = false
+name = "ack_table_bench"
 required-features = ["postgres"]
 
 [[bench]]
