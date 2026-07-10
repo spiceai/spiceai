@@ -13770,7 +13770,7 @@ impl CayenneTableProvider {
         let over_files =
             vc.cold_tier_warm_max_files > 0 && warm_files >= vc.cold_tier_warm_max_files;
         if !(over_bytes || over_files) {
-            tracing::info!(
+            tracing::debug!(
                 target: "cayenne::compaction",
                 table = self.table_metadata.table_name.as_str(),
                 warm_bytes,
