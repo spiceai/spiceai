@@ -82,6 +82,7 @@ use super::column_stats::ColumnStatsAccumulator;
 use super::context::CayenneContext;
 use super::mem_tier_budget;
 use super::on_conflict::{PostValidationState, PreparedShardedInsertStream};
+use super::pk_index::PkDigestSet;
 use super::staging_wal::{CayenneStagedAppend, PreparedStagedAppend, StagingWalTargetKind};
 use super::table::{CayenneCdcWrite, CayenneTableProvider, record_cayenne_write_phase};
 
@@ -1120,12 +1121,7 @@ impl<'a> AppendMutationWriter<'a> {
         prepared_stream: SendableRecordBatchStream,
         post_validation: &Arc<ParkingMutex<Option<PostValidationState>>>,
         estimated_bytes: Option<u64>,
-    ) -> Result<(
-        u64,
-        Arc<ColumnStatsAccumulator>,
-        std::collections::HashSet<crate::row_converter::OwnedRow>,
-        usize,
-    )> {
+    ) -> Result<(u64, Arc<ColumnStatsAccumulator>, PkDigestSet, usize)> {
         let new_snapshot_id = uuid::Uuid::now_v7().to_string();
         let target_size_bytes = self.context.target_file_size_bytes();
         let write_start = Instant::now();
@@ -1273,7 +1269,17 @@ impl<'a> AppendMutationWriter<'a> {
                 )
                 .await?
             {
-                let stats_acc = ColumnStatsAccumulator::new(&schema);
+                // Inline tier0 (metastore BLOB) write — the synchronous CDC hot
+                // loop. By default skip NDV here (lazy): these rows contribute
+                // their distinct-count for free when the inline memtable later
+                // spills to a Vortex file at checkpoint (`write_to_snapshot` folds
+                // NDV there). `SPICE_CAYENNE_EAGER_NDV` flips this back to eager
+                // (fold on ingest) for benchmarking. Min/max/null-count stats are
+                // maintained regardless.
+                let stats_acc = ColumnStatsAccumulator::new_with_ndv(
+                    &schema,
+                    super::column_stats::eager_ndv_on_ingest(),
+                );
                 for batch in buffer.batches() {
                     stats_acc.update(batch);
                 }

@@ -43,7 +43,6 @@ use runtime_request_context::{AsyncMarker, RequestContext};
 use arrow::array::RecordBatch;
 use llms::chat::nsql::{FailedAttempt, QueryGenerationContext, default::DefaultSqlGeneration};
 use serde::{Deserialize, Serialize};
-use spicepod::component::model::ModelType;
 use std::{sync::Arc, time::Duration};
 use tokio::sync::RwLock;
 use tracing_futures::Instrument;
@@ -772,7 +771,7 @@ async fn resolve_nsql_model_name(
 }
 
 fn resolve_nsql_model_name_from_app(app: &app::App) -> Result<String, String> {
-    let compatible_models = compatible_nsql_model_names(app);
+    let compatible_models: Vec<String> = app.models.iter().map(|m| m.name.clone()).collect();
 
     match compatible_models.as_slice() {
         [] => Err(
@@ -785,14 +784,6 @@ fn resolve_nsql_model_name_from_app(app: &app::App) -> Result<String, String> {
             models.join(", ")
         )),
     }
-}
-
-fn compatible_nsql_model_names(app: &app::App) -> Vec<String> {
-    app.models
-        .iter()
-        .filter(|model| model.model_type() == Some(ModelType::Llm))
-        .map(|model| model.name.clone())
-        .collect()
 }
 
 #[cfg(test)]
@@ -1472,19 +1463,6 @@ mod tests {
     #[test]
     fn omitted_model_uses_single_compatible_model() {
         let app = app_with_models(vec![Model::new("openai:gpt-4o-mini", "llm_model")]);
-
-        let model_name = resolve_nsql_model_name_from_app(&app)
-            .expect("single compatible model should be selected");
-
-        assert_eq!(model_name, "llm_model");
-    }
-
-    #[test]
-    fn omitted_model_ignores_non_llm_models() {
-        let app = app_with_models(vec![
-            Model::new("spiceai:my-org/my-app/models/runnable", "ml_model"),
-            Model::new("openai:gpt-4o-mini", "llm_model"),
-        ]);
 
         let model_name = resolve_nsql_model_name_from_app(&app)
             .expect("single compatible model should be selected");

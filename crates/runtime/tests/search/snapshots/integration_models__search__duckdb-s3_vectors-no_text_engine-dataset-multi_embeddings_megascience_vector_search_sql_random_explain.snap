@@ -16,16 +16,12 @@ description: "SELECT subject FROM vector_search(qs, 'second', answer) order by _
 |               |         HashJoinExec: mode=CollectLeft, join_type=Left, accumulator=MinMaxLeftAccumulator, on=[(id@0, id@0)], projection=[id@0, _score@1, subject@3] |
 |               |           CoalescePartitionsExec                                                                                                                     |
 |               |             ProjectionExec: expr=[CAST(key@0 AS Int64) as id, 1 - distance@1 as _score]                                                              |
-|               |               CooperativeExec                                                                                                                        |
-|               |                 BytesProcessedExec                                                                                                                   |
-|               |                   RepartitionExec: partitioning=RoundRobinBatch(3), input_partitions=1                                                               |
-|               |                     CooperativeExec                                                                                                                  |
-|               |                       S3VectorsQueryExec (INDEX_NAME_1): limit=100                                                                                   |
-|               |           SchemaCastScanExec                                                                                                                         |
-|               |             CooperativeExec                                                                                                                          |
 |               |               BytesProcessedExec                                                                                                                     |
 |               |                 RepartitionExec: partitioning=RoundRobinBatch(3), input_partitions=1                                                                 |
-|               |                   CooperativeExec                                                                                                                    |
-|               |                     VirtualExecutionPlan name=duckdb compute_context=:memory: base_sql=SELECT "qs"."id", "qs"."subject" FROM "qs"                    |
+|               |                   S3VectorsQueryExec (INDEX_NAME_1): limit=100                                                                                       |
+|               |           SchemaCastScanExec                                                                                                                         |
+|               |             BytesProcessedExec                                                                                                                       |
+|               |               RepartitionExec: partitioning=RoundRobinBatch(3), input_partitions=1                                                                   |
+|               |                 VirtualExecutionPlan name=duckdb compute_context=:memory: base_sql=SELECT "qs"."id", "qs"."subject" FROM "qs"                        |
 |               |                                                                                                                                                      |
 +---------------+------------------------------------------------------------------------------------------------------------------------------------------------------+

@@ -92,3 +92,6 @@ sqlite = []
 turso = []
 
 file_append = ["dep:duckdb"]
+
+[lints]
+workspace = true

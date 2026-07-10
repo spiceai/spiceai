@@ -200,8 +200,14 @@ pub struct CreateAppRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
     pub visibility: String,
+    /// Deprecated region source. Mutually exclusive with [`Self::cluster_name`].
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cname: Option<String>,
+    /// Dedicated-cluster / nodegroup assignment (from `GET /v1/clusters`).
+    /// Mutually exclusive with [`Self::cname`]; when set, cloud injects the
+    /// `organization` / `_cluster` scheduling tags from the nodegroup row.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cluster_name: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tags: Option<BTreeMap<String, String>>,
     #[serde(skip_serializing_if = "Option::is_none")]

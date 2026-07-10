@@ -19,3 +19,6 @@ serde_json.workspace = true
 tar = "0.4.45"
 tempfile.workspace = true
 walkdir = "2.5.0"
+
+[lints]
+workspace = true

@@ -7,8 +7,17 @@ on:
     paths:
       - '**/Cargo.toml'
   pull_request:
-    paths:
-      - '**/Cargo.toml'
+    branches:
+      - trunk
+      - release-*
+      - release/*
+      - feature-*
+  merge_group:
+    branches:
+      - trunk
+      - release-*
+      - release/*
+      - feature-*
   workflow_dispatch:
 
 concurrency:
@@ -26,8 +35,15 @@ env:
   CARGO_HTTP_TIMEOUT: 60
 
 jobs:
+  # Required check, so it runs on every merge-queue entry (merge_group can't
+  # path-filter). Feature-combination breakage can come from any code change, so
+  # running unconditionally is intentional; step-gate on Cargo changes if queue
+  # latency ever becomes a concern.
   build:
     name: Features Check
+    # Emit the required context on pull requests without running the expensive
+    # feature matrix; the real check runs on the merge-group commit.
+    if: ${{ github.event_name != 'pull_request' }}
     runs-on: spiceai-macos
     env:
       HAS_SPICEIO_SECRET: ${{ secrets.UNAS_SMB_PASS != '' }}

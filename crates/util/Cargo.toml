@@ -31,3 +31,6 @@ parking_lot.workspace = true
 default = ["datafusion"]
 datafusion = ["dep:datafusion"]
 http = ["dep:http-body", "dep:pin-project", "dep:tokio-util"]
+
+[lints]
+workspace = true

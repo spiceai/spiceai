@@ -80,6 +80,8 @@ mailparse = { workspace = true, optional = true }
 num_cpus = "1.16"
 object_store = { workspace = true }
 opendal.workspace = true
+parking_lot.workspace = true
+rustc-hash = "2"
 oracle = { version = "0.6", optional = true }
 native-tls = { workspace = true, optional = true }
 percent-encoding.workspace = true
@@ -238,6 +240,11 @@ required-features = ["postgres"]
 
 [[bench]]
 harness = false
+name = "ack_table_bench"
+required-features = ["postgres"]
+
+[[bench]]
+harness = false
 name = "mongodb_change_stream"
 required-features = ["mongodb"]
 
@@ -250,3 +257,6 @@ required-features = ["bench", "kafka"]
 harness = false
 name = "pgoutput_decode"
 required-features = ["postgres"]
+
+[lints]
+workspace = true
