@@ -32,48 +32,59 @@ use std::process::{Command, Stdio};
 
 /// Open `path` (file path or URL) with the OS default application.
 ///
-/// Returns `Ok(())` once a launcher has been successfully spawned. Launchers are
+/// Returns `Ok(())` once a launcher has exited successfully. Launchers are
 /// started with stdin/stdout/stderr redirected to null so a GUI opener does not
-/// attach to the CLI's terminal. On Unix desktop environments several launchers
-/// are tried in order; the first that spawns successfully wins.
+/// attach to the CLI's terminal. We **wait** for the launcher (via
+/// [`Command::status`]) so the child is reaped and cannot become a zombie while
+/// the CLI keeps polling (e.g. OAuth device login). Typical openers
+/// (`/usr/bin/open`, `xdg-open`) return quickly after handing off to the browser.
+/// On Unix desktop environments several launchers are tried in order; the first
+/// that exits successfully wins (spawn failure *or* non-zero exit tries the next).
 ///
 /// # Errors
 ///
-/// Returns the last I/O error if every candidate launcher fails to spawn.
+/// Returns the last I/O error if every candidate launcher fails to run.
 pub fn that(path: impl AsRef<OsStr>) -> io::Result<()> {
     platform::that(path.as_ref())
 }
 
-fn spawn_null(cmd: &mut Command) -> io::Result<()> {
-    cmd.stdin(Stdio::null())
+/// Run `cmd` with stdio discarded and wait for it, so the process is reaped.
+fn run_null(cmd: &mut Command) -> io::Result<()> {
+    let status = cmd
+        .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
-        .spawn()
-        .map(|_| ())
+        .status()?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(io::Error::other(format!("launcher exited with {status}")))
+    }
 }
 
 #[cfg(target_os = "macos")]
 mod platform {
-    use super::spawn_null;
+    use super::run_null;
     use std::ffi::OsStr;
     use std::io;
     use std::process::Command;
 
     pub(super) fn that(path: &OsStr) -> io::Result<()> {
-        spawn_null(Command::new("/usr/bin/open").arg(path))
+        run_null(Command::new("/usr/bin/open").arg(path))
     }
 }
 
 #[cfg(all(unix, not(target_os = "macos")))]
 mod platform {
-    use super::spawn_null;
+    use super::run_null;
     use std::ffi::OsStr;
     use std::io;
     use std::process::Command;
 
     pub(super) fn that(path: &OsStr) -> io::Result<()> {
         // Prefer the FreeDesktop standard opener, then fall back through common
-        // desktop-environment helpers. First spawn success wins.
+        // desktop-environment helpers. First successful run wins (including a
+        // zero exit status — non-zero tries the next helper).
         let mut last_err = None;
 
         for mut cmd in [
@@ -98,7 +109,7 @@ mod platform {
                 c
             },
         ] {
-            match spawn_null(&mut cmd) {
+            match run_null(&mut cmd) {
                 Ok(()) => return Ok(()),
                 Err(err) => last_err = Some(err),
             }
@@ -170,7 +181,13 @@ mod platform {
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
-        cmd.spawn().map(|_| ())
+        // Wait so the cmd process is reaped (no zombies if the CLI stays up).
+        let status = cmd.status()?;
+        if status.success() {
+            Ok(())
+        } else {
+            Err(io::Error::other(format!("launcher exited with {status}")))
+        }
     }
 }
 
