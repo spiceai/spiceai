@@ -33,5 +33,9 @@ tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
 name = "lookup"
 harness = false
 
+[[bench]]
+name = "sbbf"
+harness = false
+
 [lints]
 workspace = true
