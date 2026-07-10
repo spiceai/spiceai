@@ -532,6 +532,7 @@ fn build_create_app_request(
         // The Cloud create-app endpoint currently accepts the target deployment region
         // in the legacy `cname` request field; update-app uses the newer `region` field.
         cname: Some(region.to_string()),
+        cluster_name: None,
         tags,
         replicas,
         resources,

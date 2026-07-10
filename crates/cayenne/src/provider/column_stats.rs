@@ -84,6 +84,37 @@ pub(crate) enum RowCountUpdate {
     Unchanged,
 }
 
+/// Whether NDV (`HyperLogLog`) sketches are folded **eagerly on the synchronous
+/// ingest (inline tier0) path**, instead of the default lazy behavior of folding
+/// them only when rows first spill to a persisted file (checkpoint/compaction).
+///
+/// Sourced once from the `SPICE_CAYENNE_EAGER_NDV` environment variable
+/// (`1`/`true`/`on`/`yes` = eager); default is lazy. This is a benchmark /
+/// escape-hatch toggle — it lets the HTAP CI job A/B eager vs lazy NDV — and is
+/// expected to be removed once lazy is the only path. The resolved mode is logged
+/// once (on first read) so a run's logs record which was active.
+pub(crate) fn eager_ndv_on_ingest() -> bool {
+    static EAGER_NDV: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        let eager = std::env::var("SPICE_CAYENNE_EAGER_NDV").is_ok_and(|v| {
+            matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "on" | "yes"
+            )
+        });
+        tracing::info!(
+            target: "cayenne",
+            "NDV computation mode: {} (default lazy; override with SPICE_CAYENNE_EAGER_NDV)",
+            if eager {
+                "eager (folded on inline ingest)"
+            } else {
+                "lazy (folded on file spill)"
+            },
+        );
+        eager
+    });
+    *EAGER_NDV
+}
+
 /// Accumulates per-column statistics across multiple `RecordBatch`es during a write.
 ///
 /// Builds Vortex [`StatsSet`] objects per column (min, max, null count) and tracks
@@ -106,8 +137,25 @@ pub(crate) struct ColumnStatsAccumulator {
 }
 
 impl ColumnStatsAccumulator {
-    /// Create a new accumulator for the given schema.
+    /// Create a new accumulator for the given schema, maintaining NDV sketches
+    /// for every NDV-tracked column. Used by every write that produces a
+    /// persisted file (`write_to_snapshot`: checkpoint spills, staged appends,
+    /// compaction, overwrite), where NDV is computed once at file birth.
     pub(crate) fn new(schema: &arrow_schema::Schema) -> Self {
+        Self::new_with_ndv(schema, true)
+    }
+
+    /// Create a new accumulator, optionally skipping per-column NDV (`HyperLogLog`)
+    /// maintenance.
+    ///
+    /// With `compute_ndv = false` no sketch is allocated, so [`update`](Self::update)
+    /// does no NDV hashing and the write contributes an empty sketch (a no-op
+    /// register-wise-union merge that preserves the existing table aggregate).
+    /// This is the lazy-NDV path for the **inline tier0 (metastore) write** — the
+    /// synchronous CDC hot loop — whose rows are re-sketched for free when they
+    /// later spill to a Vortex file at checkpoint. Min/max/null-count stats are
+    /// maintained regardless of this flag.
+    pub(crate) fn new_with_ndv(schema: &arrow_schema::Schema, compute_ndv: bool) -> Self {
         let num_cols = schema.fields().len();
         let dtypes: Vec<vortex::dtype::DType> = schema
             .fields()
@@ -124,11 +172,16 @@ impl ColumnStatsAccumulator {
             })
             .collect();
         // NDV sketches only for NDV-tracked columns (integers, strings, temporal);
-        // other columns get `None` so the write path skips them.
+        // other columns get `None` so the write path skips them. When
+        // `compute_ndv` is false every slot is `None`, so `update` folds nothing
+        // and no sketch is persisted (inline hot-loop lazy-NDV path).
         let ndv: Vec<Option<crate::hll::HyperLogLog>> = schema
             .fields()
             .iter()
-            .map(|f| Self::supports_ndv(f.data_type()).then(crate::hll::HyperLogLog::new))
+            .map(|f| {
+                (compute_ndv && Self::supports_ndv(f.data_type()))
+                    .then(crate::hll::HyperLogLog::new)
+            })
             .collect();
         Self {
             state: std::sync::Mutex::new(ColumnStatsState {
