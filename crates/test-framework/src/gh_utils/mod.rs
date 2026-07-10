@@ -15,9 +15,7 @@ limitations under the License.
 */
 
 use http_body_util::BodyExt;
-use octocrab::{
-    actions::ActionsHandler, map_github_error, OctoBody, Octocrab,
-};
+use octocrab::{OctoBody, Octocrab, actions::ActionsHandler, map_github_error};
 use serde::Deserialize;
 use serde_json::Value;
 use tonic::transport::Uri;
