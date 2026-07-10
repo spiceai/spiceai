@@ -26,20 +26,33 @@ limitations under the License.
 //! Z-order clustered on the PK by default, so rectangles are tight and a
 //! tombstone hits few files.
 //!
+//! When a file carries a per-file PK bloom (`ColdTierFile::pk_bloom`), a
+//! tombstone must ALSO bloom-hit to dirty the file. Both tests individually
+//! never miss a hosted key (true bounds contain it; blooms have no false
+//! negatives for inserted keys), so their intersection doesn't either — while
+//! the bloom rejects ~99% of in-band-but-absent keys, exactly the precision
+//! rectangles lose as carried files' PK ranges drift across promotions. The
+//! rectangle stays first: bloom false positives compound with tombstone count
+//! ((1-p)^T per file), so the bloom is only probed for the few tombstones the
+//! rectangle cannot exclude.
+//!
 //! Detection is CONSERVATIVE in the safe direction: a false positive costs an
 //! extra rewrite; a missed tombstone is impossible. Any file whose statistics
 //! are absent/undecodable — or any key that cannot be compared — classifies as
-//! dirty. This conservatism is what preserves the promotion commit's invariant
-//! that the deletion index fully drains: every tombstone's potential host file
-//! is in the rewrite set, so every tombstone is physically applied.
+//! dirty (bloom-only when a bloom is present). This conservatism is what
+//! preserves the promotion commit's invariant that the deletion index fully
+//! drains: every tombstone's potential host file is in the rewrite set, so
+//! every tombstone is physically applied.
 
 use std::collections::HashSet;
 use std::sync::Arc;
 
+use arrow::array::{ArrayRef, Int64Array};
 use arrow_schema::Schema;
 use datafusion_common::ScalarValue;
 use datafusion_common::stats::Precision;
 
+use super::pk_index::PkBloom;
 use crate::metadata::ColdTierFile;
 use crate::row_converter::{Row, RowConverter};
 use crate::stats::statistics_from_persisted_blob;
@@ -109,14 +122,67 @@ pub(crate) fn decode_int64_tombstone_keys(
         .collect()
 }
 
+/// Re-encode decoded Int64 tombstone keys into the converter row encoding the
+/// per-file PK blooms insert (the Int64 fast path's deletion vectors persist
+/// raw big-endian bytes — a different representation). `None` when any key is
+/// not a single non-null `Int64` or conversion fails — the caller then
+/// classifies by rectangle only (the safe default, not an error).
+pub(crate) fn encode_int64_bloom_probes(
+    converter: &RowConverter,
+    keys: &[Vec<ScalarValue>],
+) -> Option<Vec<Box<[u8]>>> {
+    let values = keys
+        .iter()
+        .map(|k| match k.as_slice() {
+            [ScalarValue::Int64(Some(v))] => Some(*v),
+            _ => None,
+        })
+        .collect::<Option<Vec<i64>>>()?;
+    let column: ArrayRef = Arc::new(Int64Array::from(values));
+    let rows = converter.convert_columns(&[column]).ok()?;
+    Some(
+        (0..keys.len())
+            .map(|i| rows.row(i).data().to_vec().into_boxed_slice())
+            .collect(),
+    )
+}
+
+/// A cold file's PK bloom, parsed on first probe only — clean-by-rectangle
+/// files never pay the parse. A missing/corrupt bloom probes as "MAY contain"
+/// (conservative), degrading that file to rectangle-only classification.
+enum LazyBloom<'a> {
+    Unparsed(Option<&'a [u8]>),
+    Parsed(Option<PkBloom>),
+}
+
+impl LazyBloom<'_> {
+    fn maybe_contains(&mut self, probe: &[u8]) -> bool {
+        if let Self::Unparsed(bytes) = self {
+            *self = Self::Parsed(bytes.and_then(PkBloom::from_bytes));
+        }
+        match self {
+            Self::Parsed(Some(bloom)) => bloom.maybe_contains(probe),
+            _ => true,
+        }
+    }
+}
+
 /// Split `cold_files` into dirty/clean against the tombstoned keys.
 ///
 /// `tombstone_keys` is row-major (`decode_tombstone_keys` output); an empty
 /// set classifies everything clean. `pk_indices` are the PK columns' indices
 /// in `schema`, in primary-key order (matching each key tuple's order).
+///
+/// `bloom_probes` optionally refines the rectangle test: the same tombstones
+/// in the byte encoding the per-file PK blooms insert (index-aligned with
+/// `tombstone_keys` — composite DV keys are already that encoding; Int64 keys
+/// go through [`encode_int64_bloom_probes`]). A file with a usable bloom is
+/// dirty only if a rectangle-contained tombstone ALSO bloom-hits. `None`, a
+/// length mismatch, or a bloom-less file falls back to rectangle-only.
 pub(crate) fn partition_cold_files(
     cold_files: Vec<ColdTierFile>,
     tombstone_keys: &[Vec<ScalarValue>],
+    bloom_probes: Option<&[Box<[u8]>]>,
     schema: &Arc<Schema>,
     pk_indices: &[usize],
 ) -> ColdFilePartition {
@@ -126,17 +192,29 @@ pub(crate) fn partition_cold_files(
             clean: cold_files,
         };
     }
+    // A misaligned probe set can't be trusted — degrade to rectangle-only
+    // rather than probing the wrong bytes.
+    let probes = bloom_probes.filter(|p| p.len() == tombstone_keys.len());
 
     let mut dirty = Vec::new();
     let mut clean = Vec::new();
     for file in cold_files {
         let bounds = pk_bounds_from_manifest(&file, schema, pk_indices);
-        let is_dirty = match &bounds {
-            // No usable statistics → cannot prove clean.
-            None => true,
-            Some(bounds) => tombstone_keys
+        let mut bloom = LazyBloom::Unparsed(probes.and(file.pk_bloom.as_deref()));
+        let is_dirty = match (&bounds, probes) {
+            (Some(bounds), Some(probes)) => tombstone_keys
+                .iter()
+                .zip(probes.iter())
+                .any(|(key, probe)| {
+                    key_within_bounds(key, bounds) && bloom.maybe_contains(probe)
+                }),
+            (Some(bounds), None) => tombstone_keys
                 .iter()
                 .any(|key| key_within_bounds(key, bounds)),
+            // No usable statistics → cannot prove clean by bounds; a bloom
+            // (when present) can still clear the file on its own.
+            (None, Some(probes)) => probes.iter().any(|probe| bloom.maybe_contains(probe)),
+            (None, None) => true,
         };
         if is_dirty {
             dirty.push(file);
@@ -384,7 +462,7 @@ mod composite_key_tests {
         let (converter, bytes) = encode_keys(&keys);
         let decoded = decode_tombstone_keys(&converter, &bytes).expect("decode");
 
-        let partition = partition_cold_files(files, &decoded, &orderline_schema(), &PK_INDICES);
+        let partition = partition_cold_files(files, &decoded, None, &orderline_schema(), &PK_INDICES);
         let dirty: Vec<&str> = partition
             .dirty
             .iter()
@@ -410,7 +488,7 @@ mod composite_key_tests {
         let keys = [(7, 3, 99_999, 1)];
         let (converter, bytes) = encode_keys(&keys);
         let decoded = decode_tombstone_keys(&converter, &bytes).expect("decode");
-        let partition = partition_cold_files(files, &decoded, &orderline_schema(), &PK_INDICES);
+        let partition = partition_cold_files(files, &decoded, None, &orderline_schema(), &PK_INDICES);
         assert!(partition.dirty.is_empty());
         assert_eq!(partition.clean.len(), 2);
     }
@@ -423,11 +501,168 @@ mod composite_key_tests {
         let (converter, bytes) = encode_keys(&keys);
         let decoded = decode_tombstone_keys(&converter, &bytes).expect("decode");
         let partition =
-            partition_cold_files(vec![file], &decoded, &orderline_schema(), &PK_INDICES);
+            partition_cold_files(vec![file], &decoded, None, &orderline_schema(), &PK_INDICES);
         assert_eq!(
             partition.dirty.len(),
             1,
             "no stats -> cannot prove clean -> dirty"
+        );
+    }
+
+    /// Serialize a per-file PK bloom over `keys`, exactly as promotion inserts
+    /// them (converter row bytes).
+    fn bloom_over(keys: &[(i64, i64, i64, i64)]) -> Vec<u8> {
+        let (_, bytes) = encode_keys(keys);
+        let mut bloom = PkBloom::with_byte_budget(1024);
+        for b in &bytes {
+            bloom.insert(b);
+        }
+        bloom.to_bytes()
+    }
+
+    #[test]
+    fn bloom_refinement_clears_in_band_but_absent_keys() {
+        // Two files with IDENTICAL o_id bands — the clustering-degraded case
+        // where rectangles alone cannot tell them apart.
+        let host_keys = [(1, 1, 500, 1)];
+        let other_keys = [(2, 2, 600, 1)];
+        let mut f1 = cold_file("f1", (1, 1000));
+        f1.pk_bloom = Some(bloom_over(&host_keys));
+        let mut f2 = cold_file("f2", (1, 1000));
+        f2.pk_bloom = Some(bloom_over(&other_keys));
+
+        let (converter, bytes) = encode_keys(&host_keys);
+        let decoded = decode_tombstone_keys(&converter, &bytes).expect("decode");
+
+        // Rectangle-only: both files dirty (tombstone is in both bands).
+        let rect_only = partition_cold_files(
+            vec![f1.clone(), f2.clone()],
+            &decoded,
+            None,
+            &orderline_schema(),
+            &PK_INDICES,
+        );
+        assert_eq!(rect_only.dirty.len(), 2, "rectangles alone cannot exclude");
+
+        // Bloom refinement: only the actual host file is dirty. Composite DV
+        // bytes ARE the bloom probe encoding — passed through verbatim.
+        let refined = partition_cold_files(
+            vec![f1, f2],
+            &decoded,
+            Some(&bytes),
+            &orderline_schema(),
+            &PK_INDICES,
+        );
+        let dirty: Vec<&str> = refined.dirty.iter().map(|f| f.file_url.as_str()).collect();
+        let clean: Vec<&str> = refined.clean.iter().map(|f| f.file_url.as_str()).collect();
+        assert_eq!(dirty, vec!["f1"], "only the bloom-hit host file is dirty");
+        assert_eq!(clean, vec!["f2"], "in-band but bloom-missed file is clean");
+    }
+
+    #[test]
+    fn bloomless_file_falls_back_to_rectangle_with_probes_present() {
+        let keys = [(1, 1, 500, 1)];
+        let file = cold_file("f1", (1, 1000)); // pk_bloom: None
+        let (converter, bytes) = encode_keys(&keys);
+        let decoded = decode_tombstone_keys(&converter, &bytes).expect("decode");
+        let partition = partition_cold_files(
+            vec![file],
+            &decoded,
+            Some(&bytes),
+            &orderline_schema(),
+            &PK_INDICES,
+        );
+        assert_eq!(
+            partition.dirty.len(),
+            1,
+            "no bloom -> in-band tombstone keeps the file dirty"
+        );
+    }
+
+    #[test]
+    fn missing_stats_with_bloom_classifies_by_bloom_alone() {
+        let host_keys = [(1, 1, 500, 1)];
+        let absent_keys = [(9, 9, 900, 9)];
+        let mut file = cold_file("f1", (1, 1000));
+        file.statistics_blob = Vec::new(); // no rectangle
+        file.pk_bloom = Some(bloom_over(&host_keys));
+
+        let (converter, absent_bytes) = encode_keys(&absent_keys);
+        let decoded = decode_tombstone_keys(&converter, &absent_bytes).expect("decode");
+        let partition = partition_cold_files(
+            vec![file.clone()],
+            &decoded,
+            Some(&absent_bytes),
+            &orderline_schema(),
+            &PK_INDICES,
+        );
+        assert!(
+            partition.dirty.is_empty(),
+            "bloom miss proves clean even without stats"
+        );
+
+        let (converter, host_bytes) = encode_keys(&host_keys);
+        let decoded = decode_tombstone_keys(&converter, &host_bytes).expect("decode");
+        let partition = partition_cold_files(
+            vec![file],
+            &decoded,
+            Some(&host_bytes),
+            &orderline_schema(),
+            &PK_INDICES,
+        );
+        assert_eq!(partition.dirty.len(), 1, "bloom hit keeps the file dirty");
+    }
+
+    #[test]
+    fn misaligned_probes_degrade_to_rectangle_only() {
+        let keys = [(1, 1, 500, 1), (2, 2, 600, 1)];
+        let mut file = cold_file("f1", (1, 1000));
+        // Bloom over NEITHER key: aligned probes would prove the file clean.
+        file.pk_bloom = Some(bloom_over(&[(3, 3, 700, 3)]));
+        let (converter, bytes) = encode_keys(&keys);
+        let decoded = decode_tombstone_keys(&converter, &bytes).expect("decode");
+        let partition = partition_cold_files(
+            vec![file],
+            &decoded,
+            Some(&bytes[..1]), // wrong length: cannot be trusted
+            &orderline_schema(),
+            &PK_INDICES,
+        );
+        assert_eq!(
+            partition.dirty.len(),
+            1,
+            "misaligned probes must not be used; rectangle keeps the file dirty"
+        );
+    }
+
+    #[test]
+    fn int64_probe_encoding_matches_bloom_insertion() {
+        // The Int64 fast path's DV bytes (raw BE) differ from the bloom's
+        // converter-row encoding; `encode_int64_bloom_probes` bridges them.
+        let converter =
+            RowConverter::new(vec![SortField::new(DataType::Int64)]).expect("int64 converter");
+        let column: ArrayRef = Arc::new(Int64Array::from(vec![10_i64, 20]));
+        let rows = converter
+            .convert_columns(&[column])
+            .expect("encode bloom keys");
+        let mut bloom = PkBloom::with_byte_budget(1024);
+        bloom.insert(rows.row(0).data());
+        bloom.insert(rows.row(1).data());
+
+        let dv_bytes: Vec<Box<[u8]>> = vec![
+            10_i64.to_be_bytes().to_vec().into_boxed_slice(),
+            99_i64.to_be_bytes().to_vec().into_boxed_slice(),
+        ];
+        let decoded = decode_int64_tombstone_keys(&dv_bytes).expect("decode");
+        let probes =
+            encode_int64_bloom_probes(&converter, &decoded).expect("re-encode probes");
+        assert!(
+            bloom.maybe_contains(&probes[0]),
+            "inserted key must bloom-hit through the re-encode"
+        );
+        assert!(
+            !bloom.maybe_contains(&probes[1]),
+            "absent key must bloom-miss through the re-encode"
         );
     }
 }
