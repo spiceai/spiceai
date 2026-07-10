@@ -1057,7 +1057,11 @@ impl ReciprocalRankFusion {
         let a = drop_embedding_cols(a)?;
         let b = drop_embedding_cols(b)?;
 
-        a.join_on(b, JoinType::Full, vec![key_a.eq(key_b)])
+        a.join_on(
+            b,
+            JoinType::Full,
+            vec![key_a.eq(key_b)],
+        )
     }
 
     // Window and rank a search subquery by its `_score` field.
