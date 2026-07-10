@@ -166,28 +166,6 @@ async fn exec_with_lock_retry(
     }
 }
 
-/// Await a batch of spawned loader tasks, propagating the first task error and
-/// mapping a panicked task to [`crate::Error::TaskJoin`]. `what` names the phase
-/// for the panic message (e.g. "seed warehouse", "clone warehouse"). The tasks
-/// are already running concurrently; this only collects their results.
-async fn join_loader_tasks(
-    handles: Vec<tokio::task::JoinHandle<Result<()>>>,
-    what: &str,
-) -> Result<()> {
-    for handle in handles {
-        match handle.await {
-            Ok(Ok(())) => {}
-            Ok(Err(e)) => return Err(e),
-            Err(e) => {
-                return Err(crate::Error::TaskJoin {
-                    message: format!("{what} loader task panicked: {e}"),
-                });
-            }
-        }
-    }
-    Ok(())
-}
-
 const MAX_ITEMS: i32 = 100_000;
 const STOCK_PER_WAREHOUSE: i32 = 100_000;
 const DISTRICTS_PER_WAREHOUSE: i32 = 10;
@@ -344,7 +322,8 @@ const WAREHOUSE_TABLES: &[(&str, &str, &str)] = &[
 /// `history` retry transient `InnoDB` lock errors (see [`exec_with_lock_retry`]).
 ///
 /// The bulk-load session flags applied to `conn` (see [`apply_bulk_load_session`])
-/// are restored before returning, so the connection is left in its default state.
+/// are restored before returning on **both** the success and error paths, so the
+/// connection is left in its default state either way.
 ///
 /// When `seed` is `Some`, a deterministic RNG is used so that the same seed
 /// always produces the same dataset — independent of loader parallelism.
@@ -358,11 +337,6 @@ pub async fn load_all(
     warehouses: usize,
     seed: Option<u64>,
 ) -> Result<()> {
-    let mut rng: StdRng = match seed {
-        Some(s) => StdRng::seed_from_u64(s),
-        None => StdRng::from_rng(&mut rand::rng()),
-    };
-
     // Bulk-load session flags on the shared-table connection.
     let sql_log_bin_off = apply_bulk_load_session(conn).await?;
     println!(
@@ -373,6 +347,27 @@ pub async fn load_all(
             "1 (no SESSION_VARIABLES_ADMIN; seed is binlogged)"
         }
     );
+
+    // Run the load, then always restore the flags — on success and on error — so
+    // a failed load never leaves the coordinator connection in a modified state.
+    let result = seed_and_clone(conn, opts, warehouses, seed).await;
+    let restored = restore_bulk_load_session(conn, sql_log_bin_off).await;
+    result.and(restored)
+}
+
+/// Load the shared tables plus the seed (phase 1) and cloned (phase 2)
+/// warehouses. Split out of [`load_all`] so the session-flag restore there wraps
+/// it on every exit path.
+async fn seed_and_clone(
+    conn: &mut mysql_async::Conn,
+    opts: &mysql_async::Opts,
+    warehouses: usize,
+    seed: Option<u64>,
+) -> Result<()> {
+    let mut rng: StdRng = match seed {
+        Some(s) => StdRng::seed_from_u64(s),
+        None => StdRng::from_rng(&mut rand::rng()),
+    };
 
     load_item(conn, &mut rng).await?;
     load_nation(conn).await?;
@@ -426,7 +421,7 @@ pub async fn load_all(
         }));
     }
 
-    join_loader_tasks(handles, "seed warehouse").await?;
+    crate::join_loader_tasks(handles, "seed warehouse").await?;
 
     println!(
         "  seed phase complete ({seed_count} warehouses in {:.1?})",
@@ -497,16 +492,13 @@ pub async fn load_all(
             Ok::<(), crate::Error>(())
         }));
 
-        join_loader_tasks(handles, "clone warehouse").await?;
+        crate::join_loader_tasks(handles, "clone warehouse").await?;
 
         println!(
             "  clone phase complete ({to_clone} warehouses in {:.1?})",
             clone_start.elapsed()
         );
     }
-
-    // Leave the coordinator connection in its default state.
-    restore_bulk_load_session(conn, sql_log_bin_off).await?;
 
     Ok(())
 }

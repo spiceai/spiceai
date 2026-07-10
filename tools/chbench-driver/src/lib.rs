@@ -95,6 +95,42 @@ pub enum Error {
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
+/// Await a batch of spawned loader tasks (from either the Postgres or `MySQL`
+/// seed/clone phases), propagating the first task error — or a panic as
+/// [`Error::TaskJoin`]. On failure, the tasks not yet awaited are aborted so a
+/// failed load does not leave workers mutating the database detached. `what`
+/// names the phase for the panic message (e.g. "seed warehouse").
+///
+/// The tasks are already running concurrently; this only collects their results.
+pub(crate) async fn join_loader_tasks(
+    handles: Vec<tokio::task::JoinHandle<Result<()>>>,
+    what: &str,
+) -> Result<()> {
+    let mut handles = handles.into_iter();
+    let mut outcome = Ok(());
+    for handle in handles.by_ref() {
+        match handle.await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                outcome = Err(e);
+                break;
+            }
+            Err(e) => {
+                outcome = Err(Error::TaskJoin {
+                    message: format!("{what} loader task panicked: {e}"),
+                });
+                break;
+            }
+        }
+    }
+    if outcome.is_err() {
+        for handle in handles {
+            handle.abort();
+        }
+    }
+    outcome
+}
+
 /// Source-agnostic interface for CH-benCH benchmarks.
 ///
 /// Each source (Postgres, `MySQL`, `DynamoDB`, etc.) implements this trait to
