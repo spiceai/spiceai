@@ -205,9 +205,7 @@ pub(crate) fn partition_cold_files(
             (Some(bounds), Some(probes)) => tombstone_keys
                 .iter()
                 .zip(probes.iter())
-                .any(|(key, probe)| {
-                    key_within_bounds(key, bounds) && bloom.maybe_contains(probe)
-                }),
+                .any(|(key, probe)| key_within_bounds(key, bounds) && bloom.maybe_contains(probe)),
             (Some(bounds), None) => tombstone_keys
                 .iter()
                 .any(|key| key_within_bounds(key, bounds)),
@@ -462,7 +460,8 @@ mod composite_key_tests {
         let (converter, bytes) = encode_keys(&keys);
         let decoded = decode_tombstone_keys(&converter, &bytes).expect("decode");
 
-        let partition = partition_cold_files(files, &decoded, None, &orderline_schema(), &PK_INDICES);
+        let partition =
+            partition_cold_files(files, &decoded, None, &orderline_schema(), &PK_INDICES);
         let dirty: Vec<&str> = partition
             .dirty
             .iter()
@@ -488,7 +487,8 @@ mod composite_key_tests {
         let keys = [(7, 3, 99_999, 1)];
         let (converter, bytes) = encode_keys(&keys);
         let decoded = decode_tombstone_keys(&converter, &bytes).expect("decode");
-        let partition = partition_cold_files(files, &decoded, None, &orderline_schema(), &PK_INDICES);
+        let partition =
+            partition_cold_files(files, &decoded, None, &orderline_schema(), &PK_INDICES);
         assert!(partition.dirty.is_empty());
         assert_eq!(partition.clean.len(), 2);
     }
@@ -654,8 +654,7 @@ mod composite_key_tests {
             99_i64.to_be_bytes().to_vec().into_boxed_slice(),
         ];
         let decoded = decode_int64_tombstone_keys(&dv_bytes).expect("decode");
-        let probes =
-            encode_int64_bloom_probes(&converter, &decoded).expect("re-encode probes");
+        let probes = encode_int64_bloom_probes(&converter, &decoded).expect("re-encode probes");
         assert!(
             bloom.maybe_contains(&probes[0]),
             "inserted key must bloom-hit through the re-encode"
