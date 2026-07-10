@@ -60,7 +60,6 @@ use test_framework::pki::init_pki;
 use tokio::task::JoinHandle;
 use tokio::time::{Instant, sleep};
 
-
 // ---------------------------------------------------------------------------
 // Port allocation
 // ---------------------------------------------------------------------------
