@@ -257,9 +257,12 @@ const STREAMING: u8 = 0b100;
 /// consumer commit path (the hot ~5.5M/run write) is a single lock-free atomic
 /// advance on the member's own `committed`, never a shared mutex; the pump
 /// advances `delivered` (and, for idle members, both — see
-/// [`AckTable::credit_idle`]). Each field is monotonic, so a torn pair-read
-/// across a concurrent writer can only under-observe, never invent a value that
-/// was never written.
+/// [`AckTable::credit_idle`]). During streaming both fields advance monotonically,
+/// so a torn pair-read across a concurrent writer can only under-observe, never
+/// invent a value that was never written. The one non-monotonic step is a
+/// deliberate rejoin reset: [`AckTable::register`] lowers `delivered` back to the
+/// held `committed` floor, but only under the table write lock while the member
+/// is detached (not streaming), so no concurrent pump/committer read races it.
 ///
 /// `#[repr(align(64))]` isolates each member's slot on its own cache line: with
 /// up to ~8 members committing on different consumer threads, adjacent
@@ -2282,7 +2285,7 @@ mod tests {
             model.seed(100);
 
             for _ in 0..800 {
-                let m = (rng.below(MEMBERS)) as usize;
+                let m = usize::try_from(rng.below(MEMBERS)).expect("member index fits usize");
                 let k = &members[m];
                 match rng.below(7) {
                     0 => {

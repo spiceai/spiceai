@@ -137,9 +137,10 @@ impl cayenne::SlotAdvancer for CayenneSlotAdvancer {
         // structure completely untouched, preserving the in-order,
         // requeue-on-failure drain byte for byte.
         let mut ready = if prefix_is_coalescable(&ready) {
-            // `coalescable` proved the prefix holds at least one committer, so
-            // `max` is `Some` and the fold (which only ever reduces a non-empty
-            // input) stays non-empty — no empty-case guard needed.
+            // `prefix_is_coalescable` guaranteed a non-empty prefix, so `max` is
+            // always `Some` here; `unwrap_or(0)` is just the lint-clean spelling
+            // of that (this crate denies `unwrap`/`expect` in non-test code). The
+            // fold only ever reduces a non-empty input, so `folded` is non-empty.
             let max_epoch = ready.iter().map(|(epoch, _)| *epoch).max().unwrap_or(0);
             let folded = fold_committers(ready.into_iter().flat_map(|(_, cs)| cs).collect());
             VecDeque::from([(max_epoch, folded)])
@@ -179,12 +180,6 @@ impl cayenne::SlotAdvancer for CayenneSlotAdvancer {
     }
 }
 
-/// Coalesce a run of consecutive committers via [`cdc::CommitChange::try_absorb`]:
-/// each is folded into the previous retained committer where the source permits
-/// (a shared-slot member folds to its max LSN), collapsing an N-envelope burst
-/// to as few as one commit — which turns the ordered background commit chain
-/// into a single `fetch_max` for that source. Anything that refuses to fold
-/// (the default for order-sensitive sources) is retained in order, so those
 /// Whether the whole deferred-drain prefix opts into coalescing — i.e. every
 /// committer is coalesce-identifiable (`as_any` is `Some`, which only the
 /// infallible, order-insensitive committers override). Empty prefix -> `false`.
@@ -202,6 +197,12 @@ fn prefix_is_coalescable(
             .all(|committer| committer.as_any().is_some())
 }
 
+/// Coalesce a run of consecutive committers via [`cdc::CommitChange::try_absorb`]:
+/// each is folded into the previous retained committer where the source permits
+/// (a shared-slot member folds to its max LSN), collapsing an N-envelope burst
+/// to as few as one commit — which turns the ordered background commit chain
+/// into a single `fetch_max` for that source. Anything that refuses to fold
+/// (the default for order-sensitive sources) is retained in order, so those
 /// connectors are byte-identical.
 fn fold_committers(
     committers: Vec<Box<dyn cdc::CommitChange + Send + Sync>>,
