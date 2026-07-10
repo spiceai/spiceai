@@ -77,6 +77,7 @@ fn params_for(port: u16, slot_name: &str, publication_name: &str) -> Replication
         member_channel_capacity:
             data_components::postgres_replication::shared::DEFAULT_MEMBER_CHANNEL_CAPACITY,
         pg_output_format: PgOutputFormat::Binary,
+        ready_lag: Duration::from_secs(2),
     }
 }
 

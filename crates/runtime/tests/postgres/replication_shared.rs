@@ -83,6 +83,7 @@ fn shared_params(port: u16) -> ReplicationParams {
         member_channel_capacity:
             data_components::postgres_replication::shared::DEFAULT_MEMBER_CHANNEL_CAPACITY,
         pg_output_format: PgOutputFormat::Binary,
+        ready_lag: Duration::from_secs(2),
     }
 }
 
