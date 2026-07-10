@@ -1584,7 +1584,7 @@ pub struct CayenneTableProvider {
     /// an in-flight scan has a full interval to finish. In-memory (reset on
     /// restart → one extra grace cycle, never a premature delete). See
     /// [`Self::run_cold_tier_gc_tick`] / [`Self::plan_cold_gc_deletions`].
-    cold_gc_first_seen: Arc<ParkingMutex<HashMap<String, Instant>>>,
+    cold_gc_orphaned_first_seen: Arc<ParkingMutex<HashMap<String, Instant>>>,
     /// Last instant the cold GC sweep ran, so the background tick fires it about
     /// every `cold_tier_gc_interval_ms` regardless of the (finer) promotion tick
     /// cadence. `None` until the first sweep.
@@ -2626,7 +2626,7 @@ impl CayenneTableProvider {
         // Mark newly-seen orphans, and select those that have aged past the
         // grace for deletion (pure, testable — see `plan_cold_gc_deletions`).
         let to_delete = {
-            let mut first_seen = self.cold_gc_first_seen.lock();
+            let mut first_seen = self.cold_gc_orphaned_first_seen.lock();
             Self::plan_cold_gc_deletions(&on_store, &live, &mut first_seen, Instant::now(), grace)
         };
 
@@ -2643,7 +2643,7 @@ impl CayenneTableProvider {
                 // another sweep or manual cleanup), not a retryable failure.
                 Ok(()) | Err(object_store::Error::NotFound { .. }) => {
                     deleted += 1;
-                    self.cold_gc_first_seen.lock().remove(&full_url);
+                    self.cold_gc_orphaned_first_seen.lock().remove(&full_url);
                 }
                 Err(error) => {
                     skipped_errors += 1;
@@ -4726,7 +4726,7 @@ impl CayenneTableProvider {
             background_compactor: Arc::new(std::sync::OnceLock::new()),
             background_mem_tier_checkpointer: Arc::new(std::sync::OnceLock::new()),
             background_cold_tier_promoter: Arc::new(std::sync::OnceLock::new()),
-            cold_gc_first_seen: Arc::new(ParkingMutex::new(HashMap::new())),
+            cold_gc_orphaned_first_seen: Arc::new(ParkingMutex::new(HashMap::new())),
             cold_gc_last_run: Arc::new(ParkingMutex::new(None)),
             pk_constraints,
         };
@@ -5669,7 +5669,7 @@ impl CayenneTableProvider {
             // original `Arc`) survives writer clones and its drop signal is shared.
             background_mem_tier_checkpointer: Arc::clone(&self.background_mem_tier_checkpointer),
             background_cold_tier_promoter: Arc::clone(&self.background_cold_tier_promoter),
-            cold_gc_first_seen: Arc::clone(&self.cold_gc_first_seen),
+            cold_gc_orphaned_first_seen: Arc::clone(&self.cold_gc_orphaned_first_seen),
             cold_gc_last_run: Arc::clone(&self.cold_gc_last_run),
             pk_constraints: self.pk_constraints.clone(),
         }
