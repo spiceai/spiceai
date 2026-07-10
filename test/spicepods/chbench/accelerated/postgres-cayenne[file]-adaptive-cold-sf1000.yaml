@@ -14,13 +14,13 @@ name: postgres-cayenne[file]-adaptive-cold-sf1000
 #   - cayenne_datalake_location                enables the tier (unset => disabled). Datalake + an
 #                                              inferred PK auto-forces deletion_mode: key, so
 #                                              cayenne_deletion_mode is intentionally left unset.
-#   - cayenne_cold_tier_warm_max_bytes         4 GiB warm->cold promotion trigger (expert override;
-#                                              unset defaults to 16 x cayenne_cold_target_file_size_mb
+#   - cayenne_datalake_warm_max_bytes         4 GiB warm->cold promotion trigger (expert override;
+#                                              unset defaults to 16 x cayenne_datalake_target_file_size_mb
 #                                              = 16 GiB at this pod's 1024 MB file size — pin 4 GiB
 #                                              so the big tables graduate after bootstrap).
-#   - cayenne_cold_target_file_size_mb         1024 — read-optimized cold files, larger than the warm
+#   - cayenne_datalake_target_file_size_mb         1024 — read-optimized cold files, larger than the warm
 #                                              target so cold scans open fewer footers.
-#   - cayenne_cold_tier_background_interval_ms 30s promoter cadence.
+#   - cayenne_datalake_background_interval_ms 30s promoter cadence.
 # NOTE: `cayenne_target_file_size_mb` (the WARM/hot file size) is deliberately NOT set — it is an
 # adaptive actuator, and pinning it would collapse its tuning bounds to a point. Only the COLD file
 # size is set here; they are different knobs.
@@ -91,9 +91,9 @@ datasets:
         cayenne_datalake_s3_secret: ${secrets:S3_SECRET}
         cayenne_datalake_s3_allow_http: 'true'
 
-        cayenne_cold_tier_warm_max_bytes: '4294967296' # 4 GiB warm->cold promotion trigger
-        cayenne_cold_target_file_size_mb: '1024'
-        cayenne_cold_tier_background_interval_ms: '30000'
+        cayenne_datalake_warm_max_bytes: '4294967296' # 4 GiB warm->cold promotion trigger
+        cayenne_datalake_target_file_size_mb: '1024'
+        cayenne_datalake_background_interval_ms: '30000'
 
   - from: postgres:customer
     name: customer

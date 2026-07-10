@@ -1733,7 +1733,7 @@ impl CayenneTableProviderBuilder {
 
     /// Set the object store for the cold tier (storage-cascade bottom tier).
     ///
-    /// When set (together with `cayenne_cold_tier_location`), the promotion
+    /// When set (together with `cayenne_datalake_location`), the promotion
     /// stage writes read-optimized Vortex files here and the cross-tier scan
     /// reads them. May target a different bucket/endpoint than the warm store.
     #[must_use]
@@ -13232,7 +13232,7 @@ impl CayenneTableProvider {
     }
 
     /// Resolve the cold-tier clustering columns to schema indices:
-    /// `cayenne_cold_clustering_columns` → else `cayenne_sort_columns` → else the
+    /// `cayenne_datalake_clustering_columns` → else `cayenne_sort_columns` → else the
     /// primary key. Returns the indices that exist in the schema (empty = no
     /// clustering, promotion writes unsorted).
     fn resolve_cold_clustering_indices(&self) -> Vec<usize> {
@@ -13531,7 +13531,7 @@ impl CayenneTableProvider {
     /// carry-forward — promotion cost is proportional to the CHANGED data,
     /// not total table size).
     ///
-    /// When the warm tier has grown past `cayenne_cold_tier_warm_max_bytes` /
+    /// When the warm tier has grown past `cayenne_datalake_warm_max_bytes` /
     /// `_files`: flush the in-RAM/inline tiers, classify the existing cold
     /// manifest into dirty/clean against the durable tombstones
     /// ([`Self::partition_cold_manifest_for_promotion`]), read the canonical

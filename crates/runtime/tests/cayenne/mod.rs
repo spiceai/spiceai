@@ -2008,11 +2008,11 @@ fn make_datalake_nation_dataset(
             datalake_location.to_string(),
         ),
         (
-            "cayenne_cold_tier_warm_max_bytes".to_string(),
+            "cayenne_datalake_warm_max_bytes".to_string(),
             warm_max_bytes.to_string(),
         ),
         (
-            "cayenne_cold_tier_background_interval_ms".to_string(),
+            "cayenne_datalake_background_interval_ms".to_string(),
             "500".to_string(),
         ),
     ]);

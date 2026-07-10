@@ -1013,12 +1013,12 @@ mod tests {
     }
 
     /// Regression: the cold (datalake) promotion write must roll files at
-    /// `cayenne_cold_target_file_size_mb`, not the warm `target_vortex_file_size_mb`.
+    /// `cayenne_datalake_target_file_size_mb`, not the warm `target_vortex_file_size_mb`.
     ///
     /// Every sorted / PK-upsert table earns a single write shard, so the warm
     /// `write_shard_format` path returns the base format unchanged — whose
     /// `target_file_size_mb` is the warm size. Cold promotion therefore silently
-    /// rolled files at the warm size, leaving `cayenne_cold_target_file_size_mb`
+    /// rolled files at the warm size, leaving `cayenne_datalake_target_file_size_mb`
     /// inert. `cold_write_format` must build a format carrying the cold size.
     #[test]
     fn cold_write_format_rolls_files_at_cold_target_size() {
@@ -1043,7 +1043,7 @@ mod tests {
         assert_eq!(
             cold.options().target_file_size_mb,
             1024,
-            "cold format must use cayenne_cold_target_file_size_mb, not the warm size"
+            "cold format must use cayenne_datalake_target_file_size_mb, not the warm size"
         );
     }
 

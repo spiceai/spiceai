@@ -1350,23 +1350,23 @@ impl CayenneAccelerator {
             // and clamp consistently with the rest of the config surface.
             config.cold_target_file_size_mb = autotune::auto_or_usize(
                 acceleration,
-                &["cayenne_cold_target_file_size_mb"],
+                &["cayenne_datalake_target_file_size_mb"],
                 config.cold_target_file_size_mb,
             )
             .max(1);
             config.cold_tier_warm_max_bytes = autotune::auto_or_i64(
                 acceleration,
-                &["cayenne_cold_tier_warm_max_bytes"],
+                &["cayenne_datalake_warm_max_bytes"],
                 config.cold_tier_warm_max_bytes,
             );
             config.cold_tier_warm_max_files = autotune::auto_or_usize(
                 acceleration,
-                &["cayenne_cold_tier_warm_max_files"],
+                &["cayenne_datalake_warm_max_files"],
                 config.cold_tier_warm_max_files,
             );
             config.cold_tier_background_interval_ms = autotune::auto_or_u64(
                 acceleration,
-                &["cayenne_cold_tier_background_interval_ms"],
+                &["cayenne_datalake_background_interval_ms"],
                 config.cold_tier_background_interval_ms,
             );
             config.cold_tier_gc_interval_ms = autotune::auto_or_u64(
@@ -1391,7 +1391,7 @@ impl CayenneAccelerator {
                 )
                 .unwrap_or(i64::MAX);
                 tracing::info!(
-                    "Dataset '{table_name}': datalake promotion trigger defaulted to {} bytes. Set 'cayenne_cold_tier_warm_max_bytes' to override.",
+                    "Dataset '{table_name}': datalake promotion trigger defaulted to {} bytes. Set 'cayenne_datalake_warm_max_bytes' to override.",
                     config.cold_tier_warm_max_bytes
                 );
             }
@@ -2224,13 +2224,13 @@ const PARAMETERS: &[ParameterSpec] = &concat_arrays::<
             .description("Use unsigned payloads for datalake S3 uploads. Default: true.")
             .one_of(&["true", "false"])
             .default("true"),
-        ParameterSpec::component("cold_target_file_size_mb")
+        ParameterSpec::component("datalake_target_file_size_mb")
             .description("Target size for datalake (cold) tier Vortex files in MB. Larger than the warm cayenne_target_file_size_mb because object stores favor fewer, larger objects and cold scans are range reads. Default: 512."),
-        ParameterSpec::component("cold_tier_warm_max_bytes")
+        ParameterSpec::component("datalake_warm_max_bytes")
             .description("The warm tier graduates to cold once its total Vortex bytes reach this threshold. 0 (default) disables the byte trigger; set with cold_tier_warm_max_files to bound warm-tier size."),
-        ParameterSpec::component("cold_tier_warm_max_files")
+        ParameterSpec::component("datalake_warm_max_files")
             .description("The warm tier graduates to cold once its Vortex file count reaches this threshold. 0 (default) disables the file-count trigger."),
-        ParameterSpec::component("cold_tier_background_interval_ms")
+        ParameterSpec::component("datalake_background_interval_ms")
             .description("How often the background loop evaluates the warm→cold promotion trigger. Cold tiering is not latency-critical, so this is coarser than compaction. Default: 60000 (60s)."),
         ParameterSpec::component("datalake_gc_interval_ms")
             .description("Physical-GC cadence and orphan grace for superseded datalake objects: the background sweep runs about this often and deletes an object no longer referenced by the manifest only once it has been observed orphaned for at least this long (so an in-flight scan has a full interval to finish). Default: 300000 (5min)."),

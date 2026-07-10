@@ -1024,31 +1024,31 @@ pub struct VortexConfig {
     // ---- Cold object-store tier (storage-cascade bottom tier; cascade model) ----
     /// Absolute object-store URL prefix for the cold tier (e.g.
     /// `s3://bucket/prefix`). `None`/empty (the default) disables the cold tier.
-    /// Set from the `cayenne_cold_tier_location` spicepod param. Persisted so a
+    /// Set from the `cayenne_datalake_location` spicepod param. Persisted so a
     /// reopened table knows where its cold files live; NOT compared by
     /// `configuration_matches`, so toggling it never recreates the table (the
     /// cold tier is a strict superset of behavior over an unchanged warm tier).
     pub cold_tier_location: Option<String>,
     /// Liquid-clustering key columns for cold files (multi-column Z-order).
     /// Empty = fall back to `sort_columns`, then the primary key. Set from
-    /// `cayenne_cold_clustering_columns`.
+    /// `cayenne_datalake_clustering_columns`.
     pub cold_clustering_columns: Vec<String>,
     /// Target size for cold Vortex files in MB. Larger than the warm
     /// `target_vortex_file_size_mb` because object stores favor fewer, larger
     /// objects and cold scans are range reads. Set from
-    /// `cayenne_cold_target_file_size_mb`. Defaults to 512.
+    /// `cayenne_datalake_target_file_size_mb`. Defaults to 512.
     pub cold_target_file_size_mb: usize,
     /// Promotion fires only once the warm tier exceeds this many bytes
     /// (`<= 0` disables the byte trigger). Set from
-    /// `cayenne_cold_tier_warm_max_bytes`.
+    /// `cayenne_datalake_warm_max_bytes`.
     pub cold_tier_warm_max_bytes: i64,
     /// Promotion fires only once the warm tier exceeds this many files
     /// (`0` disables the file-count trigger). Set from
-    /// `cayenne_cold_tier_warm_max_files`.
+    /// `cayenne_datalake_warm_max_files`.
     pub cold_tier_warm_max_files: usize,
     /// How often (ms) the background loop evaluates the cold-promotion trigger.
     /// Cold tiering is not latency-critical, so this is much coarser than the
-    /// compaction interval. Set from `cayenne_cold_tier_background_interval_ms`.
+    /// compaction interval. Set from `cayenne_datalake_background_interval_ms`.
     /// Defaults to 60s.
     pub cold_tier_background_interval_ms: u64,
     /// Physical-GC cadence AND orphan grace (ms) for superseded cold objects:
