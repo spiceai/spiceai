@@ -1677,7 +1677,7 @@ pub struct SnapshotFile {
 /// Unlike [`SnapshotFile`], cold files are **table-scoped** (not a member of any
 /// snapshot directory) and append-only: a promoted file is referenced only from
 /// this table, never from `cayenne_snapshot_file`. `file_url` is the *absolute*
-/// object-store URL (e.g. `s3://bucket/prefix/{table_id}/cold/<id>.vortex`),
+/// object-store URL (e.g. `s3://bucket/prefix/{table_id}/data/<id>.vortex`),
 /// because the cold location may differ from the table's warm path. The embedded
 /// `statistics_blob` (serialized Vortex [`FileStatistics`]: per-column min/max/
 /// null/sum) lets the scan prune cold files at listing time with no object-store

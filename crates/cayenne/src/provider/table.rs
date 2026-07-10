@@ -2548,7 +2548,7 @@ impl CayenneTableProvider {
         );
 
         let cold_base = cold_location.trim_end_matches('/');
-        let cold_prefix_url = format!("{cold_base}/{}/cold/", self.table_metadata.table_id);
+        let cold_prefix_url = format!("{cold_base}/{}/data/", self.table_metadata.table_id);
         let cold_url = match ListingTableUrl::parse(&cold_prefix_url) {
             Ok(url) => url,
             Err(error) => {
@@ -13305,7 +13305,7 @@ impl CayenneTableProvider {
         let promotion_id = uuid::Uuid::now_v7().to_string();
         let cold_base = cold_location.trim_end_matches('/');
         let cold_dir_url = format!(
-            "{cold_base}/{}/cold/{promotion_id}/",
+            "{cold_base}/{}/data/{promotion_id}/",
             self.table_metadata.table_id
         );
 
@@ -24609,10 +24609,10 @@ mod tests {
     #[test]
     fn cold_gc_marks_then_sweeps_after_grace() {
         let grace = std::time::Duration::from_mins(5);
-        let live: HashSet<String> = [url("s3://b/t/cold/p2/live.vortex")].into_iter().collect();
+        let live: HashSet<String> = [url("s3://b/t/data/p2/live.vortex")].into_iter().collect();
         let on_store = vec![
-            url("s3://b/t/cold/p2/live.vortex"),
-            url("s3://b/t/cold/p1/orphan.vortex"),
+            url("s3://b/t/data/p2/live.vortex"),
+            url("s3://b/t/data/p1/orphan.vortex"),
         ];
         let mut first_seen = HashMap::new();
         let t0 = Instant::now();
@@ -24626,9 +24626,9 @@ mod tests {
             grace,
         );
         assert!(del.is_empty(), "first sight deletes nothing");
-        assert!(first_seen.contains_key(&url("s3://b/t/cold/p1/orphan.vortex")));
+        assert!(first_seen.contains_key(&url("s3://b/t/data/p1/orphan.vortex")));
         assert!(
-            !first_seen.contains_key(&url("s3://b/t/cold/p2/live.vortex")),
+            !first_seen.contains_key(&url("s3://b/t/data/p2/live.vortex")),
             "referenced file is not aged"
         );
 
@@ -24650,7 +24650,7 @@ mod tests {
             t0 + grace,
             grace,
         );
-        assert_eq!(del, vec![url("s3://b/t/cold/p1/orphan.vortex")]);
+        assert_eq!(del, vec![url("s3://b/t/data/p1/orphan.vortex")]);
     }
 
     /// Restart safety: a fresh (empty) `first_seen` — the post-restart state —
