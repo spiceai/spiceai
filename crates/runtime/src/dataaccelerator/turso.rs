@@ -908,27 +908,28 @@ mod tests {
         std::fs::remove_file(db_path).ok();
 
         // Remove every sidecar turso/libsql may leave next to the database: the
-        // WAL/SHM/journal files and the MVCC logical log (`<stem>.db-log`). A
-        // stale MVCC log from a previous run makes the next open fail with a
-        // `Corrupt("MVCC logical log file exists ... but header indicates WAL
-        // mode")` error, so match by file-name stem to catch them all regardless
-        // of exact suffix — otherwise these tests only pass on a pristine tree.
+        // WAL/SHM/journal files (`<name>-wal`, ...) and the MVCC logical log
+        // (`<stem>.db-log`). A stale MVCC log from a previous run makes the next
+        // open fail with `Corrupt("MVCC logical log file exists ... but header
+        // indicates WAL mode")`, so match any sibling that is the stem followed by
+        // a `.` or `-` separator — covering both `<stem>.<ext>[-suffix]` and the
+        // extensionless `<stem>-<suffix>` form. Otherwise these tests only pass on
+        // a pristine tree and fail on re-run.
         let (Some(parent), Some(stem)) = (
             db_path.parent(),
             db_path.file_stem().and_then(std::ffi::OsStr::to_str),
         ) else {
             return;
         };
-        let prefix = format!("{stem}.");
         let Ok(entries) = std::fs::read_dir(parent) else {
             return;
         };
         for entry in entries.flatten() {
-            if entry
-                .file_name()
-                .to_str()
-                .is_some_and(|name| name.starts_with(&prefix))
-            {
+            let name = entry.file_name();
+            let Some(rest) = name.to_str().and_then(|n| n.strip_prefix(stem)) else {
+                continue;
+            };
+            if rest.is_empty() || rest.starts_with('.') || rest.starts_with('-') {
                 std::fs::remove_file(entry.path()).ok();
             }
         }
