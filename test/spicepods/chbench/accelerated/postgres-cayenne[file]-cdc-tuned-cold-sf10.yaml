@@ -80,7 +80,7 @@ datasets:
         # Expert overrides (mechanics; auto-tuned once the size trigger lands):
         cayenne_datalake_warm_max_bytes: '268435456' # 256 MB — low so SF10 promotes
         cayenne_datalake_target_file_size_mb: '512'
-        cayenne_datalake_background_interval_ms: '15000'
+        cayenne_datalake_promotion_interval_ms: '15000'
 
   - from: postgres:customer
     name: customer
