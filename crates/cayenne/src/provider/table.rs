@@ -24428,8 +24428,11 @@ impl super::compaction::ColdTierPromotionRunner for CayenneTableProvider {
             last.is_none_or(|t| t.elapsed() >= gc_interval)
         };
         if due {
-            *self.cold_gc_last_run.lock() = Some(Instant::now());
             self.run_cold_tier_gc_tick().await;
+            // Stamped AFTER the sweep: a sweep that outlives the interval must
+            // not trigger a back-to-back run next tick. Ticks are serial per
+            // table, so there is no re-entrancy to guard during the await.
+            *self.cold_gc_last_run.lock() = Some(Instant::now());
         }
     }
 
