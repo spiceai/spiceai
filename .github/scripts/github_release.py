@@ -104,21 +104,33 @@ def updateRelease(id, owner, repo, release_name, body, prerelease):
         print(resp.json())
 
 
+def extract_title_from_body(body, fallback_name):
+    """Extract the first # heading from body as the release title, returning (title, remaining_body)."""
+    if body:
+        lines = body.splitlines()
+        if lines and lines[0].startswith("# "):
+            title = lines[0][2:].strip()
+            remaining = "\n".join(lines[1:]).lstrip("\n")
+            return title, remaining
+    return fallback_name, body
+
 def actionUpload(args):
     # Step 1: Get the release
     releaseInfo = getReleaseByTag(args.owner, args.repo, args.tag)
 
     is_prerelease = args.prerelease == "true"
-    
+
+    release_name, body = extract_title_from_body(args.body, args.release_name)
+
     # Step 2: Create the release if it doesn't exist
     if releaseInfo == None:
         print("Creating release")
-        releaseInfo = createRelease(args.owner, args.repo, args.tag, args.release_name, args.body, is_prerelease)
+        releaseInfo = createRelease(args.owner, args.repo, args.tag, release_name, body, is_prerelease)
         print("Release created!")
     else:
         # Step 2.5: Update the release with the latest info
         print("Updating release")
-        updateRelease(releaseInfo["id"], args.owner, args.repo, args.release_name, args.body, is_prerelease)
+        updateRelease(releaseInfo["id"], args.owner, args.repo, release_name, body, is_prerelease)
         print("Release updated!")
 
     # Step 3: Upload the release asset for each artifact

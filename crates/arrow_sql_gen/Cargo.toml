@@ -22,3 +22,6 @@ uuid = { workspace = true, optional = true }
 
 [features]
 clickhouse = ["dep:clickhouse-rs", "dep:uuid"]
+
+[lints]
+workspace = true

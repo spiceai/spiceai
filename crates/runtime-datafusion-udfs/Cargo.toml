@@ -60,3 +60,6 @@ http-functions = ["dep:reqwest", "dep:runtime-auth", "dep:url"]
 models = ["dep:llms"]
 wasm-functions = ["dep:arrow-ipc", "dep:wasmtime"]
 wasm-functions-compile = ["wasm-functions", "dep:blake3"]
+
+[lints]
+workspace = true

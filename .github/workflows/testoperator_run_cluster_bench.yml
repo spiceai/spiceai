@@ -48,6 +48,11 @@ on:
         required: true
         default: '4'
         type: string
+      organization_tag:
+        description: 'Organization tag applied to the spidapter app; selects the target nodegroup (empty = shared default nodegroup)'
+        required: false
+        default: 'spicehq'
+        type: string
       channel:
         description: 'Spice runtime image channel passed to spidapter (ignored when custom_image_tag is set)'
         required: true
@@ -107,6 +112,14 @@ on:
         required: false
         default: ''
         type: string
+      cluster_name:
+        description: |
+          Spice Cloud nodegroup name passed to spidapter as SPIDAPTER_CLUSTER_NAME
+          (from GET /v1/clusters). Empty keeps the default regional shared stamp;
+          set e.g. `spicehq-ballista` to pin apps onto that private nodegroup.
+        required: false
+        default: ''
+        type: string
       scale_factor:
         description: 'Scale factor for the benchmark'
         required: false
@@ -163,6 +176,7 @@ env:
   CB_SCENARIO_QUERY_FILE: ${{ github.event.inputs.scenario_query_file || '' }}
   CB_QUERY_TRANSPORT: ${{ github.event.inputs.query_transport || 'v1-queries' }}
   CB_EXECUTOR_REPLICAS: ${{ github.event.inputs.executor_replicas || '3' }}
+  CB_ORGANIZATION_TAG: ${{ github.event.inputs.organization_tag || 'spicehq' }}
   CB_CHANNEL: ${{ github.event.inputs.channel || 'nightly' }}
   CB_CUSTOM_IMAGE_TAG: ${{ github.event.inputs.custom_image_tag || '' }}
   CB_SHUFFLE_LOCATION: ${{ github.event.inputs.shuffle_location || '' }}
@@ -172,6 +186,7 @@ env:
   CB_EPHEMERAL_STORAGE_LIMIT: ${{ github.event.inputs.ephemeral_storage_limit || '' }}
   CB_CAYENNE_FILE_PATH: ${{ github.event.inputs.cayenne_file_path || '' }}
   CB_CAYENNE_METADATA_DIR: ${{ github.event.inputs.cayenne_metadata_dir || '' }}
+  CB_CLUSTER_NAME: ${{ github.event.inputs.cluster_name || '' }}
   CB_SCALE_FACTOR: ${{ github.event.inputs.scale_factor || '1' }}
   CB_VALIDATE_RESULTS: ${{ github.event.inputs.validate_results || 'false' }}
   CB_UPDATE_SNAPSHOTS: ${{ github.event.inputs.update_snapshots || 'default' }}
@@ -281,6 +296,10 @@ jobs:
           AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_ICEBERG_SECRET_ACCESS_KEY }}
           AWS_REGION: us-east-1
           AWS_DEFAULT_REGION: us-east-1
+          # Select the nodegroup for the spidapter cluster app via tags.organization.
+          # Defaults to the dedicated spicehq nodegroup; without it the app lands on
+          # the shared default nodegroup.
+          SPIDAPTER_ORGANIZATION_TAG: ${{ env.CB_ORGANIZATION_TAG }}
           SCHEDULER_STATE_LOCATION: 's3://spiceai-testing-cluster-state/testoperator-cluster-bench-${{ github.run_id }}/'
           SPICEAI_BENCHMARK_METRICS_KEY: ${{ secrets.SPICEAI_BENCHMARK_METRICS_KEY }}
           EXECUTOR_REPLICAS: ${{ env.CB_EXECUTOR_REPLICAS }}
@@ -293,6 +312,7 @@ jobs:
           EPHEMERAL_STORAGE_LIMIT: ${{ env.CB_EPHEMERAL_STORAGE_LIMIT }}
           CAYENNE_FILE_PATH: ${{ env.CB_CAYENNE_FILE_PATH }}
           CAYENNE_METADATA_DIR: ${{ env.CB_CAYENNE_METADATA_DIR }}
+          CLUSTER_NAME: ${{ env.CB_CLUSTER_NAME }}
           QUERY_SET: ${{ env.CB_QUERY_SET }}
           QUERY_TRANSPORT: ${{ env.CB_QUERY_TRANSPORT }}
           SCALE_FACTOR: ${{ env.CB_SCALE_FACTOR }}
@@ -350,6 +370,7 @@ jobs:
           export_spidapter_env_if_set SPIDAPTER_EPHEMERAL_STORAGE_LIMIT_GB "${EPHEMERAL_STORAGE_LIMIT}"
           export_spidapter_env_if_set SPIDAPTER_CAYENNE_FILE_PATH "${CAYENNE_FILE_PATH}"
           export_spidapter_env_if_set SPIDAPTER_CAYENNE_METADATA_DIR "${CAYENNE_METADATA_DIR}"
+          export_spidapter_env_if_set SPIDAPTER_CLUSTER_NAME "${CLUSTER_NAME}"
 
           # When a custom image tag is provided (e.g. a `trunk-<sha>` image
           # freshly published by `spiced_docker_dev`), pin spidapter to that

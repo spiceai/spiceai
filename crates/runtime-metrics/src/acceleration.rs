@@ -198,7 +198,11 @@ pub static CDC_APPLY_BURST_DURATION_MS: LazyLock<Histogram<f64>> = LazyLock::new
 pub static CDC_APPLY_BURST_BYTES: LazyLock<Histogram<u64>> = LazyLock::new(|| {
     METER
         .u64_histogram("dataset_acceleration_cdc_apply_burst_bytes")
-        .with_description("Arrow in-memory bytes in one coalesced CDC apply burst.")
+        .with_description(
+            "Estimated size of one coalesced CDC apply burst (coalescing byte-budget proxy): \
+             a schema-aware wire-size estimate for deferred (e.g. PostgreSQL) envelopes, \
+             actual Arrow in-memory size for eager ones. Not an exact Arrow memory measurement.",
+        )
         .with_unit("By")
         .build()
 });

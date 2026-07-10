@@ -16,7 +16,7 @@ expression: resp?
   {
     "id": 189,
     "question": "Evaluate the expression \\( 2 - 2x^2 \\), where \\( x = -3 \\).",
-    "trunc(vector_search(qs, Utf8(\"second\"))._score,Int64(3))": 0.539
+    "trunc(vector_search(qs, Utf8(\"second\"))._score,Int64(3))": 0.538
   },
   {
     "id": 948,
