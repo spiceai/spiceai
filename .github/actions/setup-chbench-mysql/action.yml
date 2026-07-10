@@ -38,12 +38,17 @@ runs:
         # Authenticate rather than `mysqladmin ping` (which reports "alive" even
         # mid-init / on auth failure). Once ready, grant the server-wide
         # replication privileges the CDC connector needs — MYSQL_USER only grants
-        # `chbench.*`, not REPLICATION SLAVE/CLIENT.
+        # `chbench.*`, not REPLICATION SLAVE/CLIENT. Also grant
+        # SESSION_VARIABLES_ADMIN so the seed loader can `SET sql_log_bin=0` for
+        # its session and skip binlogging the multi-GB seed (the CDC path
+        # snapshots the seeded tables on startup, so seed rows need not be in the
+        # binlog). The loader falls back gracefully if this privilege is absent
+        # (e.g. on the in-cluster pod, which should grant it too for the speedup).
         for _ in {1..60}; do
           if docker exec chbench-mysql mysql -uroot -prootpw -e 'SELECT 1' > /dev/null 2>&1; then
             echo "MySQL is ready"
             docker exec chbench-mysql mysql -uroot -prootpw -e \
-              "GRANT REPLICATION SLAVE, REPLICATION CLIENT ON *.* TO 'bench'@'%'; FLUSH PRIVILEGES;"
+              "GRANT REPLICATION SLAVE, REPLICATION CLIENT, SESSION_VARIABLES_ADMIN ON *.* TO 'bench'@'%'; FLUSH PRIVILEGES;"
             exit 0
           fi
           sleep 2
