@@ -2,7 +2,7 @@ tests:
   htap:
     spicepod_path: accelerated/mysql-duckdb[file].yaml
     runner_type: spiceai-dev-xlarge-runners
-    scale_factor: 1000
+    scale_factor: 100
     terminals: 100
     duration: 600
     ready_wait: 900
