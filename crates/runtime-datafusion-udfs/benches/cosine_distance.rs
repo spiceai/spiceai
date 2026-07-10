@@ -50,7 +50,10 @@ fn build_fsl_f32(rows: usize, dim: usize) -> ArrayRef {
     // Deterministic pseudo-random values — just use row/col indices scaled to [0,1].
     for row in 0..rows {
         for col in 0..dim {
-            #[expect(clippy::cast_precision_loss, reason = "bench data, precision unimportant")]
+            #[expect(
+                clippy::cast_precision_loss,
+                reason = "bench data, precision unimportant"
+            )]
             values.append_value((row * dim + col) as f32 / (rows * dim) as f32);
         }
     }
@@ -65,8 +68,13 @@ fn build_list_f32(rows: usize, dim: usize) -> ArrayRef {
     let mut builder = ListBuilder::new(Float32Builder::with_capacity(rows * dim));
     for row in 0..rows {
         for col in 0..dim {
-            #[expect(clippy::cast_precision_loss, reason = "bench data, precision unimportant")]
-            builder.values().append_value((row * dim + col) as f32 / (rows * dim) as f32);
+            #[expect(
+                clippy::cast_precision_loss,
+                reason = "bench data, precision unimportant"
+            )]
+            builder
+                .values()
+                .append_value((row * dim + col) as f32 / (rows * dim) as f32);
         }
         builder.append(true);
     }
@@ -201,8 +209,7 @@ fn bench_list_f32(c: &mut Criterion) {
 
     for &rows in &[1_000_usize, 10_000_usize] {
         for &dim in &[128_usize, 512_usize, 1536_usize] {
-            let id =
-                BenchmarkId::new(format!("spice_scalar/rows={rows}"), format!("dim={dim}"));
+            let id = BenchmarkId::new(format!("spice_scalar/rows={rows}"), format!("dim={dim}"));
             group.bench_with_input(id, &(rows, dim), |b, &(rows, dim)| {
                 b.iter_batched(
                     || (build_list_f32(rows, dim), build_list_f32(rows, dim)),
@@ -211,8 +218,7 @@ fn bench_list_f32(c: &mut Criterion) {
                 );
             });
 
-            let id =
-                BenchmarkId::new(format!("datafusion/rows={rows}"), format!("dim={dim}"));
+            let id = BenchmarkId::new(format!("datafusion/rows={rows}"), format!("dim={dim}"));
             let return_field = Arc::clone(&return_field);
             group.bench_with_input(id, &(rows, dim), |b, &(rows, dim)| {
                 b.iter_batched(

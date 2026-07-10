@@ -118,15 +118,21 @@ impl ScalarUDFImpl for CosineDistance {
 
         // Case 2: one is List<Float32>/LargeList<Float32>, the other is
         // FixedSizeList<Float32, N> → promote the List/LargeList to FSL so the
-        // SIMD path handles it.
+        // SIMD path handles it. Only promote if the FSL is actually Float32.
+        use crate::vector_simd::is_fixed_size_list_f32;
+
         let fsl_field = Arc::new(arrow_schema::Field::new("item", DataType::Float32, true));
-        if let (true, FixedSizeList(_, n)) = (is_list_f32(lhs), rhs) {
-            let fsl = DataType::FixedSizeList(Arc::clone(&fsl_field), *n);
-            return Ok(vec![fsl.clone(), fsl]);
+        if is_list_f32(lhs) && is_fixed_size_list_f32(rhs) {
+            if let FixedSizeList(_, n) = rhs {
+                let fsl = DataType::FixedSizeList(Arc::clone(&fsl_field), *n);
+                return Ok(vec![fsl.clone(), fsl]);
+            }
         }
-        if let (FixedSizeList(_, n), true) = (lhs, is_list_f32(rhs)) {
-            let fsl = DataType::FixedSizeList(Arc::clone(&fsl_field), *n);
-            return Ok(vec![fsl.clone(), fsl]);
+        if is_fixed_size_list_f32(lhs) && is_list_f32(rhs) {
+            if let FixedSizeList(_, n) = lhs {
+                let fsl = DataType::FixedSizeList(Arc::clone(&fsl_field), *n);
+                return Ok(vec![fsl.clone(), fsl]);
+            }
         }
 
         // Case 3: both are List/LargeList/FixedSizeList (any element type) →
@@ -416,7 +422,11 @@ mod tests {
         let out = cosine_distance_inner(&[a, b]).expect("ok");
         let out = out.as_primitive::<Float64Type>();
         assert!(!out.is_null(0), "expected a value, got null");
-        assert!(out.value(0).abs() < 1e-5, "expected ~0.0, got {}", out.value(0));
+        assert!(
+            out.value(0).abs() < 1e-5,
+            "expected ~0.0, got {}",
+            out.value(0)
+        );
     }
 
     #[test]
@@ -426,7 +436,11 @@ mod tests {
         let out = cosine_distance_inner(&[a, b]).expect("ok");
         let out = out.as_primitive::<Float64Type>();
         assert!(!out.is_null(0), "expected a value, got null");
-        assert!((out.value(0) - 0.5).abs() < 1e-5, "expected ~0.5, got {}", out.value(0));
+        assert!(
+            (out.value(0) - 0.5).abs() < 1e-5,
+            "expected ~0.5, got {}",
+            out.value(0)
+        );
     }
 
     #[test]
@@ -436,7 +450,11 @@ mod tests {
         let out = cosine_distance_inner(&[a, b]).expect("ok");
         let out = out.as_primitive::<Float64Type>();
         assert!(!out.is_null(0), "expected a value, got null");
-        assert!((out.value(0) - 1.0).abs() < 1e-5, "expected ~1.0, got {}", out.value(0));
+        assert!(
+            (out.value(0) - 1.0).abs() < 1e-5,
+            "expected ~1.0, got {}",
+            out.value(0)
+        );
     }
 
     #[test]
@@ -447,16 +465,17 @@ mod tests {
         let b = fsl_f32(&[&[1.0_f32, 2.0, 3.0]]) as ArrayRef;
         let out = cosine_distance_inner(&[a, b]).expect("ok");
         let out = out.as_primitive::<Float64Type>();
-        assert!(out.is_null(0), "expected NULL for zero-magnitude vector, got {}", out.value(0));
+        assert!(
+            out.is_null(0),
+            "expected NULL for zero-magnitude vector, got {}",
+            out.value(0)
+        );
     }
 
     // --- coerce_types tests ---
 
     fn fsl_f32_type(n: i32) -> DataType {
-        DataType::FixedSizeList(
-            Arc::new(Field::new("item", DataType::Float32, true)),
-            n,
-        )
+        DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, true)), n)
     }
 
     fn list_f32_type() -> DataType {
@@ -484,8 +503,16 @@ mod tests {
         let result = udf
             .coerce_types(&[list_f32_type(), fsl_f32_type(4)])
             .expect("ok");
-        assert!(matches!(result[0], DataType::FixedSizeList(_, 4)), "got {:?}", result[0]);
-        assert!(matches!(result[1], DataType::FixedSizeList(_, 4)), "got {:?}", result[1]);
+        assert!(
+            matches!(result[0], DataType::FixedSizeList(_, 4)),
+            "got {:?}",
+            result[0]
+        );
+        assert!(
+            matches!(result[1], DataType::FixedSizeList(_, 4)),
+            "got {:?}",
+            result[1]
+        );
     }
 
     #[test]
@@ -495,8 +522,16 @@ mod tests {
         let result = udf
             .coerce_types(&[fsl_f32_type(5), list_f32_type()])
             .expect("ok");
-        assert!(matches!(result[0], DataType::FixedSizeList(_, 5)), "got {:?}", result[0]);
-        assert!(matches!(result[1], DataType::FixedSizeList(_, 5)), "got {:?}", result[1]);
+        assert!(
+            matches!(result[0], DataType::FixedSizeList(_, 5)),
+            "got {:?}",
+            result[0]
+        );
+        assert!(
+            matches!(result[1], DataType::FixedSizeList(_, 5)),
+            "got {:?}",
+            result[1]
+        );
     }
 
     #[test]
@@ -505,8 +540,16 @@ mod tests {
         let result = udf
             .coerce_types(&[large_list_f32_type(), fsl_f32_type(6)])
             .expect("ok");
-        assert!(matches!(result[0], DataType::FixedSizeList(_, 6)), "got {:?}", result[0]);
-        assert!(matches!(result[1], DataType::FixedSizeList(_, 6)), "got {:?}", result[1]);
+        assert!(
+            matches!(result[0], DataType::FixedSizeList(_, 6)),
+            "got {:?}",
+            result[0]
+        );
+        assert!(
+            matches!(result[1], DataType::FixedSizeList(_, 6)),
+            "got {:?}",
+            result[1]
+        );
     }
 
     #[test]
@@ -516,10 +559,16 @@ mod tests {
         let list_f64 = DataType::List(Arc::new(Field::new("item", DataType::Float64, true)));
         let large_list_f64 =
             DataType::LargeList(Arc::new(Field::new("item", DataType::Float64, true)));
-        let result = udf
-            .coerce_types(&[list_f64, large_list_f64])
-            .expect("ok");
-        assert!(matches!(result[0], DataType::LargeList(_)), "got {:?}", result[0]);
-        assert!(matches!(result[1], DataType::LargeList(_)), "got {:?}", result[1]);
+        let result = udf.coerce_types(&[list_f64, large_list_f64]).expect("ok");
+        assert!(
+            matches!(result[0], DataType::LargeList(_)),
+            "got {:?}",
+            result[0]
+        );
+        assert!(
+            matches!(result[1], DataType::LargeList(_)),
+            "got {:?}",
+            result[1]
+        );
     }
 }

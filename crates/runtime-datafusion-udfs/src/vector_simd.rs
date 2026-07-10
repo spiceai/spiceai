@@ -394,7 +394,11 @@ mod tests {
         // simsimd `cos` returns `1 - cosine_similarity`; divide by 2 to get [0, 1].
         let out = compute_fsl_f32(&[a, b], Kernel::Cosine, |v| v / 2.0).expect("ok");
         let out = out.as_primitive::<arrow::datatypes::Float64Type>();
-        if out.is_null(0) { None } else { Some(out.value(0)) }
+        if out.is_null(0) {
+            None
+        } else {
+            Some(out.value(0))
+        }
     }
 
     #[test]
@@ -422,6 +426,9 @@ mod tests {
     fn cosine_zero_magnitude_vector_yields_null() {
         // zero-magnitude vector → simsimd returns None → row must be NULL, not an error
         let d = cosine_distance_via_simd(&[0.0, 0.0, 0.0], &[1.0, 2.0, 3.0]);
-        assert!(d.is_none(), "expected NULL for zero-magnitude input, got: {d:?}");
+        assert!(
+            d.is_none(),
+            "expected NULL for zero-magnitude input, got: {d:?}"
+        );
     }
 }
