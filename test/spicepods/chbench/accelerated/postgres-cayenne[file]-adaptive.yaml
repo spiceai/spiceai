@@ -7,8 +7,9 @@ name: postgres-cayenne[file]-adaptive
 # buffers are pinned deep (16384). In that sweep the 1-slot topology failed the data-correctness
 # convergence gate at SF1000 (single apply pump, apply-bound), while the 4-slot grouping converged
 # with the LOWEST replication lag of any config (~320s vs ~440s for slot-per-table) — deep prefetch
-# accounted for most of that gain (4-slot default buffers were ~435s). See the -adaptive-1slot /
-# -adaptive-4slots pods to A/B the slot-count effect with tuning held constant.
+# accounted for most of that gain (4-slot default buffers were ~435s). See the -adaptive-1slot
+# pod to A/B the slot-count effect (1 vs 4 slots) with tuning and deep prefetch held constant;
+# 1-slot remains the goal (minimum source decode) but is still apply-bound at SF1000.
 #
 # Adaptive-tuning variant of the non-tuned postgres-cayenne[file] baseline. Instead of either
 # the static `auto` derivation (the baseline) or a hand-pinned -cdc-tuned-* config, every Cayenne
