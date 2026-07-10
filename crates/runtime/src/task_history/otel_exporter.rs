@@ -20,7 +20,7 @@ use std::collections::HashMap;
 use std::fmt;
 use std::fmt::{Debug, Formatter};
 use std::sync::{Arc, LazyLock};
-use tracing::Instrument;
+use std::time::SystemTime;
 
 use opentelemetry::trace::SpanId;
 use opentelemetry_sdk::{
@@ -233,9 +233,11 @@ impl TaskHistoryExporter {
     /// execution). `ExplainAnalyze` is captured at query completion from the
     /// executed plan — see `datafusion::query::plan_capture`.
     ///
-    /// For each span, this runs an EXPLAIN query which will create a new `task_history` entry
-    /// with `task="sql_query"` and the original query's `span_id` as `parent_span_id`.
-    /// The output is always captured in full regardless of the global `captured_output` setting.
+    /// Writes the `plan` row via [`TaskSpan::write`] rather than tracing
+    /// instrumentation. The async `BatchSpanProcessor` + `TokioCurrentThread`
+    /// test harness runs export on a dedicated worker thread that does not
+    /// see the test's thread-local subscriber, so a tracing-emitted `plan`
+    /// span would never reach this exporter.
     async fn capture_plans_async(
         df: Arc<dyn QueryEngine>,
         spans: Vec<TaskSpan>,
@@ -253,63 +255,82 @@ impl TaskHistoryExporter {
                 }
             };
 
-            // Create a tracing span for the plan capture with "plan" task override
-            // This will create a task_history entry as a child of the original query
-            let plan_span = tracing::span!(
-                target: "task_history",
-                tracing::Level::INFO,
-                "plan",
-                input = %explain_query,
-                runtime_query = true,
-                plan_capture = true
-            );
-            plan_span.record("parent_id", span.span_id.as_ref());
-
-            // Run EXPLAIN query within the span context so it appears as a child task
-            async {
-                match df.execute_query(QueryRequest::new(&explain_query)).await {
-                    Ok(mut result) => {
-                        // Collect all record batches from the result stream
-                        let mut batches = Vec::new();
-                        while let Some(batch) = result.next().await {
-                            match batch {
-                                Ok(b) => batches.push(b),
-                                Err(e) => {
-                                    tracing::debug!(
-                                        "Failed to read EXPLAIN result batch for span_id {}: {}",
-                                        span.span_id,
-                                        e
-                                    );
-                                    return;
-                                }
-                            }
-                        }
-
-                        match pretty_format_batches(&batches) {
-                            Ok(formatted) => {
-                                let output = formatted.to_string();
-                                tracing::info!(target: "task_history", captured_output = %output);
-                            }
+            let start_time = SystemTime::now();
+            match df.execute_query(QueryRequest::new(&explain_query)).await {
+                Ok(mut result) => {
+                    let mut batches = Vec::new();
+                    let mut read_failed = false;
+                    while let Some(batch) = result.next().await {
+                        match batch {
+                            Ok(b) => batches.push(b),
                             Err(e) => {
                                 tracing::debug!(
-                                    "Failed to format EXPLAIN output for span_id {}: {}",
+                                    "Failed to read EXPLAIN result batch for span_id {}: {}",
                                     span.span_id,
                                     e
                                 );
+                                read_failed = true;
+                                break;
                             }
                         }
                     }
-                    Err(e) => {
+                    if read_failed {
+                        continue;
+                    }
+
+                    let output = match pretty_format_batches(&batches) {
+                        Ok(formatted) => formatted.to_string(),
+                        Err(e) => {
+                            tracing::debug!(
+                                "Failed to format EXPLAIN output for span_id {}: {}",
+                                span.span_id,
+                                e
+                            );
+                            continue;
+                        }
+                    };
+
+                    let end_time = SystemTime::now();
+                    let execution_duration_ms = end_time
+                        .duration_since(start_time)
+                        .map_or(0.0, |d| d.as_secs_f64() * 1000.0);
+
+                    let mut labels = HashMap::new();
+                    labels.insert(Arc::from(PLAN_CAPTURE_LABEL), Arc::from("true"));
+                    labels.insert(Arc::from("runtime_query"), Arc::from("true"));
+
+                    let plan_task = TaskSpan {
+                        trace_id: Arc::clone(&span.trace_id),
+                        trace_id_override: None,
+                        span_id: Arc::from(format!("{:016x}", rand::random::<u64>())),
+                        parent_span_id: Some(Arc::clone(&span.span_id)),
+                        distributed_parent_id: None,
+                        task: Arc::from("plan"),
+                        input: Arc::from(explain_query),
+                        captured_output: Some(Arc::from(output)),
+                        start_time,
+                        end_time,
+                        execution_duration_ms,
+                        error_message: None,
+                        labels,
+                        node_id: span.node_id.clone(),
+                    };
+
+                    if let Err(e) = TaskSpan::write(Arc::clone(&df), vec![plan_task]).await {
                         tracing::debug!(
-                            "Failed to run EXPLAIN query for span_id {}: {}",
-                            span.span_id,
-                            e
+                            "Failed to write plan span for parent span_id {}: {e}",
+                            span.span_id
                         );
                     }
                 }
+                Err(e) => {
+                    tracing::debug!(
+                        "Failed to run EXPLAIN query for span_id {}: {}",
+                        span.span_id,
+                        e
+                    );
+                }
             }
-            .instrument(plan_span)
-            .await;
         }
     }
 
@@ -507,22 +528,21 @@ impl SpanExporter for TaskHistoryExporter {
                 .await
                 .map_err(|e| OTelSdkError::InternalFailure(e.to_string()))?;
 
-            // Spawn async task to capture plans for filtered spans
-            // The task runs in the background without blocking the export operation
+            // Await Explain re-plan and write the plan row directly (see
+            // `capture_plans_async`). Do not `tokio::spawn`: under
+            // `TokioCurrentThread` the worker may not drive the spawn before
+            // the next assertion, and a tracing-emitted child span would be
+            // invisible on the worker thread anyway.
             if !spans_for_plan.is_empty() {
-                let df_clone = Arc::clone(&df);
                 let num_spans = spans_for_plan.len();
-                tokio::spawn(async move {
-                    Self::capture_plans_async(
-                        df_clone,
-                        spans_for_plan,
-                        captured_plan,
-                        min_plan_duration_ms,
-                    )
-                    .await;
-
-                    tracing::trace!("Plan capture completed successfully for {num_spans} queries");
-                });
+                Self::capture_plans_async(
+                    Arc::clone(&df),
+                    spans_for_plan,
+                    captured_plan,
+                    min_plan_duration_ms,
+                )
+                .await;
+                tracing::trace!("Plan capture completed successfully for {num_spans} queries");
             }
 
             Ok(())

@@ -1,5 +1,5 @@
 /*
-Copyright 2026 The Spice.ai OSS Authors
+Copyright 2024-2026 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -15,6 +15,10 @@ limitations under the License.
 */
 
 //! Integration tests for execution-time plan capture (`captured_plan: explain analyze`).
+//!
+//! Plan-row assertions are scoped by exact `input` so `wait_for_count` polling
+//! queries (which themselves emit plan rows under `ExplainAnalyze`) cannot
+//! inflate unscoped `task = 'plan'` counts.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -98,17 +102,17 @@ fn col_str(batch: &RecordBatch, col: usize, row: usize) -> String {
         .to_string()
 }
 
+fn sql_escape(s: &str) -> String {
+    s.replace('\'', "''")
+}
+
 #[tokio::test]
 async fn plan_capture_explain_analyze_from_executed_plan() -> Result<(), anyhow::Error> {
     test_request_context()
         .scope(async {
             let tempdir = tempfile::tempdir().expect("tempdir");
             let csv_path = tempdir.path().join("names.csv");
-            tokio::fs::write(
-                &csv_path,
-                "id,name\n1,alice\n2,bob\n3,carol\n",
-            )
-            .await?;
+            tokio::fs::write(&csv_path, "id,name\n1,alice\n2,bob\n3,carol\n").await?;
 
             configure_test_datafusion();
             register_test_connectors().await;
@@ -136,19 +140,28 @@ async fn plan_capture_explain_analyze_from_executed_plan() -> Result<(), anyhow:
             runtime_ready_check(&rt).await;
 
             let sql = "SELECT id, name FROM names ORDER BY id";
+            let plan_input = format!("EXPLAIN ANALYZE {sql}");
+            let plan_input_sql = sql_escape(&plan_input);
             let _ = run_sql(&rt, sql).await?;
             let _ = provider.force_flush();
 
             wait_for_count(
                 &rt,
-                "SELECT count(*)::bigint FROM runtime.task_history WHERE task = 'sql_query' AND input = 'SELECT id, name FROM names ORDER BY id'",
+                &format!(
+                    "SELECT count(*)::bigint FROM runtime.task_history \
+                     WHERE task = 'sql_query' AND input = '{sql}'"
+                ),
                 1,
                 Duration::from_secs(10),
             )
             .await?;
             wait_for_count(
                 &rt,
-                "SELECT count(*)::bigint FROM runtime.task_history WHERE task = 'plan' AND labels['plan_capture'] = 'true'",
+                &format!(
+                    "SELECT count(*)::bigint FROM runtime.task_history \
+                     WHERE task = 'plan' AND labels['plan_capture'] = 'true' \
+                     AND input = '{plan_input_sql}'"
+                ),
                 1,
                 Duration::from_secs(10),
             )
@@ -157,7 +170,10 @@ async fn plan_capture_explain_analyze_from_executed_plan() -> Result<(), anyhow:
             // Exactly one sql_query for the original input — no EXPLAIN ANALYZE re-run.
             let sql_query_count = wait_for_count(
                 &rt,
-                "SELECT count(*)::bigint FROM runtime.task_history WHERE task = 'sql_query' AND input = 'SELECT id, name FROM names ORDER BY id'",
+                &format!(
+                    "SELECT count(*)::bigint FROM runtime.task_history \
+                     WHERE task = 'sql_query' AND input = '{sql}'"
+                ),
                 1,
                 Duration::from_secs(2),
             )
@@ -166,7 +182,8 @@ async fn plan_capture_explain_analyze_from_executed_plan() -> Result<(), anyhow:
 
             let explain_rerun = wait_for_count(
                 &rt,
-                "SELECT count(*)::bigint FROM runtime.task_history WHERE task = 'sql_query' AND input LIKE 'EXPLAIN ANALYZE%'",
+                "SELECT count(*)::bigint FROM runtime.task_history \
+                 WHERE task = 'sql_query' AND input LIKE 'EXPLAIN ANALYZE%'",
                 0,
                 Duration::from_secs(1),
             )
@@ -179,8 +196,11 @@ async fn plan_capture_explain_analyze_from_executed_plan() -> Result<(), anyhow:
 
             let plan_rows = run_sql(
                 &rt,
-                "SELECT span_id, parent_span_id, input, captured_output, labels['plan_capture'] \
-                 FROM runtime.task_history WHERE task = 'plan'",
+                &format!(
+                    "SELECT span_id, parent_span_id, input, captured_output, labels['plan_capture'] \
+                     FROM runtime.task_history \
+                     WHERE task = 'plan' AND input = '{plan_input_sql}'"
+                ),
             )
             .await?;
             assert_eq!(plan_rows.len(), 1);
@@ -189,10 +209,7 @@ async fn plan_capture_explain_analyze_from_executed_plan() -> Result<(), anyhow:
             let input = col_str(&plan_rows[0], 2, 0);
             let output = col_str(&plan_rows[0], 3, 0);
             let plan_capture = col_str(&plan_rows[0], 4, 0);
-            assert!(
-                input.starts_with("EXPLAIN ANALYZE "),
-                "unexpected plan input: {input}"
-            );
+            assert_eq!(input, plan_input);
             assert_eq!(plan_capture, "true");
             assert!(
                 output.contains("Plan with Metrics"),
@@ -258,13 +275,18 @@ async fn plan_capture_skips_cache_hits() -> Result<(), anyhow::Error> {
             runtime_ready_check(&rt).await;
 
             let sql = "SELECT id FROM names WHERE id = 1";
+            let plan_input = format!("EXPLAIN ANALYZE {sql}");
+            let plan_input_sql = sql_escape(&plan_input);
             let _ = run_sql(&rt, sql).await?;
             let _ = run_sql(&rt, sql).await?;
             let _ = provider.force_flush();
 
             wait_for_count(
                 &rt,
-                "SELECT count(*)::bigint FROM runtime.task_history WHERE task = 'plan'",
+                &format!(
+                    "SELECT count(*)::bigint FROM runtime.task_history \
+                     WHERE task = 'plan' AND input = '{plan_input_sql}'"
+                ),
                 1,
                 Duration::from_secs(10),
             )
@@ -276,7 +298,10 @@ async fn plan_capture_skips_cache_hits() -> Result<(), anyhow::Error> {
 
             let plan_count = wait_for_count(
                 &rt,
-                "SELECT count(*)::bigint FROM runtime.task_history WHERE task = 'plan'",
+                &format!(
+                    "SELECT count(*)::bigint FROM runtime.task_history \
+                     WHERE task = 'plan' AND input = '{plan_input_sql}'"
+                ),
                 1,
                 Duration::from_secs(2),
             )
@@ -325,12 +350,20 @@ async fn plan_capture_explain_mode_still_replans() -> Result<(), anyhow::Error> 
             runtime_ready_check(&rt).await;
 
             let sql = "SELECT name FROM names WHERE id = 2";
+            // Exporter Explain path prefixes with `EXPLAIN ` (not ANALYZE).
+            let plan_input = format!("EXPLAIN {sql}");
+            let plan_input_sql = sql_escape(&plan_input);
             let _ = run_sql(&rt, sql).await?;
+            // Flush writes the sql_query and awaits the Explain re-plan, which
+            // writes the plan row directly (no nested OTel span).
             let _ = provider.force_flush();
 
             wait_for_count(
                 &rt,
-                "SELECT count(*)::bigint FROM runtime.task_history WHERE task = 'plan'",
+                &format!(
+                    "SELECT count(*)::bigint FROM runtime.task_history \
+                     WHERE task = 'plan' AND input = '{plan_input_sql}'"
+                ),
                 1,
                 Duration::from_secs(15),
             )
@@ -338,13 +371,17 @@ async fn plan_capture_explain_mode_still_replans() -> Result<(), anyhow::Error> 
 
             let plan_rows = run_sql(
                 &rt,
-                "SELECT input FROM runtime.task_history WHERE task = 'plan'",
+                &format!(
+                    "SELECT input FROM runtime.task_history \
+                     WHERE task = 'plan' AND input = '{plan_input_sql}'"
+                ),
             )
             .await?;
             assert_eq!(plan_rows[0].num_rows(), 1);
             let input = col_str(&plan_rows[0], 0, 0);
+            assert_eq!(input, plan_input);
             assert!(
-                input.starts_with("EXPLAIN ") && !input.starts_with("EXPLAIN ANALYZE "),
+                !input.starts_with("EXPLAIN ANALYZE "),
                 "Explain mode should re-plan with EXPLAIN, got: {input}"
             );
 

@@ -563,12 +563,10 @@ async fn test_distributed_query_captures_plan_from_executed_graph() -> Result<()
 
             let provider = init_global_task_history(&harness.scheduler);
 
-            run_distributed(
-                &harness,
-                "SELECT id, name FROM names ORDER BY id LIMIT 5",
-                "th_test_plan_capture",
-            )
-            .await?;
+            let query_sql = "SELECT id, name FROM names ORDER BY id LIMIT 5";
+            let plan_input = format!("EXPLAIN ANALYZE {query_sql}");
+
+            run_distributed(&harness, query_sql, "th_test_plan_capture").await?;
 
             let _ = provider.force_flush();
 
@@ -585,11 +583,14 @@ async fn test_distributed_query_captures_plan_from_executed_graph() -> Result<()
             .await?;
             wait_for_row_count(
                 &harness,
-                "SELECT count(*)::bigint \
-                 FROM runtime.task_history \
-                 WHERE task = 'plan' \
-                 AND labels['plan_capture'] = 'true' \
-                 AND parent_span_id IS NOT NULL",
+                &format!(
+                    "SELECT count(*)::bigint \
+                     FROM runtime.task_history \
+                     WHERE task = 'plan' \
+                     AND labels['plan_capture'] = 'true' \
+                     AND parent_span_id IS NOT NULL \
+                     AND input = '{plan_input}'"
+                ),
                 1,
                 Duration::from_secs(10),
             )
@@ -609,14 +610,20 @@ async fn test_distributed_query_captures_plan_from_executed_graph() -> Result<()
             assert_eq!(rerun, 0, "must not re-run EXPLAIN ANALYZE in-process");
 
             let plan_rows = harness
-                .query(
+                .query(&format!(
                     "SELECT captured_output \
                      FROM runtime.task_history \
                      WHERE task = 'plan' \
-                     AND labels['plan_capture'] = 'true'",
-                )
+                     AND labels['plan_capture'] = 'true' \
+                     AND input = '{plan_input}'"
+                ))
                 .await?;
             assert!(!plan_rows.is_empty());
+            assert_eq!(
+                plan_rows[0].num_rows(),
+                1,
+                "exactly one plan row for the distributed query"
+            );
             let output = plan_rows[0]
                 .column(0)
                 .as_any()
