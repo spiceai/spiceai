@@ -176,9 +176,10 @@ pub(crate) fn cosine_distance_inner(args: &[ArrayRef]) -> DataFusionResult<Array
         // SIMD path: both inputs are FixedSizeList<Float32, N>.
         // `simsimd`'s `cos` kernel returns `1 - cosine_similarity` ∈ [0, 2];
         // divide by 2 to map into the standard [0, 1] distance range.
-        (FixedSizeList(_, _), FixedSizeList(_, _)) => {
-            compute_fsl_f32(args, Kernel::Cosine, |v| v / 2.0)
-        }
+        // Zero-magnitude vectors produce non-finite results (NaN); guard those
+        // so they emit NULL instead, preventing NaNs from sorting to the top
+        // of `ORDER BY _score DESC`.
+        (FixedSizeList(_, _), FixedSizeList(_, _)) => compute_fsl_f32_cosine(args),
         (List(_), List(_)) => general_cosine_distance::<i32>(args),
         (LargeList(_), LargeList(_)) => general_cosine_distance::<i64>(args),
         (array_type1, array_type2) => {
@@ -187,6 +188,35 @@ pub(crate) fn cosine_distance_inner(args: &[ArrayRef]) -> DataFusionResult<Array
             )
         }
     }
+}
+
+/// Compute cosine distance for FixedSizeList<Float32> with NULL-on-non-finite guard.
+fn compute_fsl_f32_cosine(args: &[ArrayRef]) -> DataFusionResult<ArrayRef> {
+    let result = compute_fsl_f32(args, Kernel::Cosine, |v| v / 2.0)?;
+    let float64 = result
+        .as_any()
+        .downcast_ref::<arrow::array::Float64Array>()
+        .ok_or_else(|| {
+            DataFusionError::Internal("compute_fsl_f32 should return Float64Array".to_string())
+        })?;
+
+    // Guard non-finite values (can arise from zero-magnitude vectors where
+    // cosine is undefined). Convert them to NULL for sorting safety.
+    let mut builder = arrow::array::Float64Builder::with_capacity(float64.len());
+    for i in 0..float64.len() {
+        if float64.is_null(i) {
+            builder.append_null();
+        } else {
+            let v = float64.value(i);
+            if v.is_finite() {
+                builder.append_value(v);
+            } else {
+                builder.append_null();
+            }
+        }
+    }
+
+    Ok(Arc::new(builder.finish()) as ArrayRef)
 }
 
 fn general_cosine_distance<O: OffsetSizeTrait>(arrays: &[ArrayRef]) -> DataFusionResult<ArrayRef> {

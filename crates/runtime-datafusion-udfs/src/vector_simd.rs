@@ -235,22 +235,12 @@ where
                 continue;
             }
         }
-        match kernel.apply(slice_a, slice_b) {
-            // `simsimd` returns `None` for zero-magnitude vectors (cosine is
-            // undefined there). Emit a NULL row so failed/empty embeddings do
-            // not sort to the top of `ORDER BY _score DESC`.
-            None => builder.append_null(),
-            Some(raw) => {
-                let v = post_process(raw);
-                // Guard non-finite values (NaN from 0/0, inf from overflow)
-                // for the same reason: a NaN sorts ahead of all real scores.
-                if v.is_finite() {
-                    builder.append_value(v);
-                } else {
-                    builder.append_null();
-                }
-            }
-        }
+        let raw = kernel.apply(slice_a, slice_b).ok_or_else(|| {
+            DataFusionError::Execution(
+                "vector_simd: simsimd returned None (length mismatch)".to_string(),
+            )
+        })?;
+        builder.append_value(post_process(raw));
     }
 
     Ok(Arc::new(builder.finish()) as ArrayRef)
