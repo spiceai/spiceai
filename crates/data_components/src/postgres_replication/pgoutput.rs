@@ -32,6 +32,28 @@ use super::{PgOutputDecodeSnafu, Result};
 /// decoder's relation cache.
 pub type RelationId = u32;
 
+/// The pgoutput message-type tag (`data[0]`), without decoding the body. Lets a
+/// multiplexed reader (the shared replication pump) branch on message kind
+/// before deciding whether to fully decode or defer. See the message-format
+/// reference in the module docs.
+#[must_use]
+pub fn message_type(data: &[u8]) -> Option<u8> {
+    data.first().copied()
+}
+
+/// The relation id carried by an Insert/Update/Delete/Relation message, read
+/// from `data[1..5]` (big-endian) without decoding the tuple — so the pump can
+/// route a change to its dataset and buffer the raw bytes for deferred decode.
+///
+/// Returns `None` if `data` is too short. Only valid for those message types:
+/// Truncate (`[nrel][flags][relids…]`), Begin, and Commit place other fields at
+/// that offset, so callers MUST check [`message_type`] first.
+#[must_use]
+pub fn relation_id(data: &[u8]) -> Option<RelationId> {
+    let bytes: [u8; 4] = data.get(1..5)?.try_into().ok()?;
+    Some(u32::from_be_bytes(bytes))
+}
+
 /// A decoded pgoutput message, still in its "per-transaction" form.
 #[derive(Debug, Clone)]
 pub enum DecodedMessage {

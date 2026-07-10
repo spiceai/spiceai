@@ -80,6 +80,8 @@ fn shared_params(port: u16) -> ReplicationParams {
         status_interval: Duration::from_secs(1),
         bootstrap_batch_size: 8192,
         shared: true,
+        member_channel_capacity:
+            data_components::postgres_replication::shared::DEFAULT_MEMBER_CHANNEL_CAPACITY,
         pg_output_format: PgOutputFormat::Binary,
     }
 }
@@ -145,7 +147,8 @@ fn rich_dataset_schema() -> SchemaRef {
 
 fn string_col_of(envelope: &ChangeEnvelope, column: &str, row: usize) -> String {
     envelope
-        .change_batch
+        .change_batch()
+        .expect("built change batch")
         .record
         .column_by_name("data")
         .expect("data column")
@@ -159,7 +162,8 @@ fn string_col_of(envelope: &ChangeEnvelope, column: &str, row: usize) -> String 
 
 fn score_of(envelope: &ChangeEnvelope, row: usize) -> i128 {
     envelope
-        .change_batch
+        .change_batch()
+        .expect("built change batch")
         .record
         .column_by_name("data")
         .expect("data column")
@@ -172,7 +176,8 @@ fn score_of(envelope: &ChangeEnvelope, row: usize) -> i128 {
 
 fn tags_of(envelope: &ChangeEnvelope, row: usize) -> Vec<Option<String>> {
     let data = envelope
-        .change_batch
+        .change_batch()
+        .expect("built change batch")
         .record
         .column_by_name("data")
         .expect("data column");
@@ -196,7 +201,8 @@ fn tags_of(envelope: &ChangeEnvelope, row: usize) -> Vec<Option<String>> {
 
 fn status_of(envelope: &ChangeEnvelope, row: usize) -> String {
     let data = envelope
-        .change_batch
+        .change_batch()
+        .expect("built change batch")
         .record
         .column_by_name("data")
         .expect("data column");
@@ -260,7 +266,8 @@ async fn next_envelope(
 
 fn ops_of(envelope: &ChangeEnvelope) -> Vec<String> {
     let ops = envelope
-        .change_batch
+        .change_batch()
+        .expect("built change batch")
         .record
         .column_by_name("op")
         .expect("op column")
@@ -270,7 +277,8 @@ fn ops_of(envelope: &ChangeEnvelope) -> Vec<String> {
 
 fn ids_of(envelope: &ChangeEnvelope) -> Vec<i32> {
     let data = envelope
-        .change_batch
+        .change_batch()
+        .expect("built change batch")
         .record
         .column_by_name("data")
         .expect("data column");
@@ -388,13 +396,29 @@ async fn shared_slot_multiplexes_multiple_datasets() -> Result<(), anyhow::Error
     // --- 1. Two datasets join the same slot; each gets its own snapshot. ---
     let mut stream_a = start_replication_stream(input_for(port, "shared_repl_a"));
     let boot_a = next_envelope(&mut stream_a, "bootstrap a").await?;
-    assert_eq!(boot_a.change_batch.record.num_rows(), 2, "bootstrap a rows");
+    assert_eq!(
+        boot_a
+            .change_batch()
+            .expect("built change batch")
+            .record
+            .num_rows(),
+        2,
+        "bootstrap a rows"
+    );
     assert!(boot_a.is_dataset_ready(), "bootstrap a must mark ready");
     boot_a.commit().await?;
 
     let mut stream_b = start_replication_stream(input_for(port, "shared_repl_b"));
     let boot_b = next_envelope(&mut stream_b, "bootstrap b").await?;
-    assert_eq!(boot_b.change_batch.record.num_rows(), 3, "bootstrap b rows");
+    assert_eq!(
+        boot_b
+            .change_batch()
+            .expect("built change batch")
+            .record
+            .num_rows(),
+        3,
+        "bootstrap b rows"
+    );
     assert!(boot_b.is_dataset_ready(), "bootstrap b must mark ready");
     boot_b.commit().await?;
 
@@ -464,7 +488,15 @@ async fn shared_slot_multiplexes_multiple_datasets() -> Result<(), anyhow::Error
         rich_dataset_schema(),
     ));
     let boot_c = next_envelope(&mut stream_c, "bootstrap c").await?;
-    assert_eq!(boot_c.change_batch.record.num_rows(), 1, "bootstrap c rows");
+    assert_eq!(
+        boot_c
+            .change_batch()
+            .expect("built change batch")
+            .record
+            .num_rows(),
+        1,
+        "bootstrap c rows"
+    );
     assert!(boot_c.is_dataset_ready(), "bootstrap c must mark ready");
     assert_eq!(
         tags_of(&boot_c, 0),
@@ -519,7 +551,8 @@ async fn shared_slot_multiplexes_multiple_datasets() -> Result<(), anyhow::Error
         // (instead of fatally detaching the member, which is the bug this
         // covers).
         let data = live_c
-            .change_batch
+            .change_batch()
+            .expect("built change batch")
             .record
             .column_by_name("data")
             .expect("data column");
@@ -560,7 +593,15 @@ async fn shared_slot_multiplexes_multiple_datasets() -> Result<(), anyhow::Error
     let mut stream_d =
         start_replication_stream(input_with_schema(port, "shared_repl_d", toast_schema));
     let boot_d = next_envelope(&mut stream_d, "bootstrap d").await?;
-    assert_eq!(boot_d.change_batch.record.num_rows(), 1, "bootstrap d rows");
+    assert_eq!(
+        boot_d
+            .change_batch()
+            .expect("built change batch")
+            .record
+            .num_rows(),
+        1,
+        "bootstrap d rows"
+    );
     boot_d.commit().await?;
 
     source
@@ -621,7 +662,11 @@ async fn shared_slot_multiplexes_multiple_datasets() -> Result<(), anyhow::Error
     // Resume path: no snapshot, just the immediate ready signal...
     let ready = next_envelope(&mut stream_a2, "rejoin ready signal").await?;
     assert_eq!(
-        ready.change_batch.record.num_rows(),
+        ready
+            .change_batch()
+            .expect("built change batch")
+            .record
+            .num_rows(),
         0,
         "rejoin must resume from the slot, not re-snapshot"
     );
@@ -662,7 +707,11 @@ async fn shared_slot_multiplexes_multiple_datasets() -> Result<(), anyhow::Error
     let boot_a3 = next_envelope(&mut stream_a3, "forced resume snapshot").await?;
     // shared_repl_a currently holds ids {1, 2, 10, 11, 12, 13}.
     assert_eq!(
-        boot_a3.change_batch.record.num_rows(),
+        boot_a3
+            .change_batch()
+            .expect("built change batch")
+            .record
+            .num_rows(),
         6,
         "snapshot_on_resume must deliver the full table on rejoin"
     );
@@ -751,7 +800,10 @@ async fn shared_slot_partitioned_source_table_streams_changes() -> Result<(), an
     let mut stream = start_replication_stream(input_for(port, "shared_repl_part"));
     let boot = next_envelope(&mut stream, "bootstrap partitioned").await?;
     assert_eq!(
-        boot.change_batch.record.num_rows(),
+        boot.change_batch()
+            .expect("built change batch")
+            .record
+            .num_rows(),
         2,
         "bootstrap covers rows from both partitions"
     );
@@ -823,17 +875,38 @@ async fn shared_and_independent_slots_coexist() -> Result<(), anyhow::Error> {
     // slot — all three streaming in this one process against this one Postgres.
     let mut shared_a = start_replication_stream(input_for(port, "mix_shared_a"));
     let boot_a = next_envelope(&mut shared_a, "bootstrap shared_a").await?;
-    assert_eq!(boot_a.change_batch.record.num_rows(), 1);
+    assert_eq!(
+        boot_a
+            .change_batch()
+            .expect("built change batch")
+            .record
+            .num_rows(),
+        1
+    );
     boot_a.commit().await?;
 
     let mut shared_b = start_replication_stream(input_for(port, "mix_shared_b"));
     let boot_b = next_envelope(&mut shared_b, "bootstrap shared_b").await?;
-    assert_eq!(boot_b.change_batch.record.num_rows(), 1);
+    assert_eq!(
+        boot_b
+            .change_batch()
+            .expect("built change batch")
+            .record
+            .num_rows(),
+        1
+    );
     boot_b.commit().await?;
 
     let mut indep = start_replication_stream(independent_input(port, "mix_indep"));
     let boot_i = next_envelope(&mut indep, "bootstrap indep").await?;
-    assert_eq!(boot_i.change_batch.record.num_rows(), 1);
+    assert_eq!(
+        boot_i
+            .change_batch()
+            .expect("built change batch")
+            .record
+            .num_rows(),
+        1
+    );
     boot_i.commit().await?;
 
     // Both slots exist side by side: one shared, one independent.

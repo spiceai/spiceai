@@ -263,19 +263,8 @@ pub async fn load_all(
         }));
     }
 
-    // Await all seed warehouse tasks.
-    for handle in handles {
-        match handle.await {
-            Ok(Ok(())) => {}
-            Ok(Err(e)) => return Err(e),
-            Err(e) => {
-                return Err(crate::Error::Sql {
-                    action: format!("seed warehouse loader task panicked: {e}"),
-                    source: tokio_postgres::Error::__private_api_timeout(),
-                });
-            }
-        }
-    }
+    // Await all seed warehouse tasks (aborting the rest if one fails).
+    crate::join_loader_tasks(handles, "seed warehouse").await?;
 
     println!(
         "  seed phase complete ({seed_count} warehouses in {:.1?})",

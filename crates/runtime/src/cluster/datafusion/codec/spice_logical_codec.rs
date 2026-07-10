@@ -338,7 +338,7 @@ impl LogicalExtensionCodec for SpiceLogicalCodec {
         buf: &mut Vec<u8>,
     ) -> Result<()> {
         // Check for ListUDFTable
-        if node.downcast_ref::<ListUDFTable>().is_some() {
+        if node.is::<ListUDFTable>() {
             let args = UdtfArgs::list_udfs();
             buf.extend_from_slice(&args.encode_to_vec());
             return Ok(());

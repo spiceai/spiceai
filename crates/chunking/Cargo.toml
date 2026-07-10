@@ -26,3 +26,6 @@ criterion = "0.7"
 [[bench]]
 harness = false
 name = "chunking"
+
+[lints]
+workspace = true
