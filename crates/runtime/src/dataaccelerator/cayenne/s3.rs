@@ -104,6 +104,17 @@ pub enum Error {
 
     #[snafu(display("Invalid S3 configuration for Cayenne acceleration: {detail}"))]
     InvalidConfiguration { detail: Arc<str> },
+
+    #[snafu(display(
+        "Failed to validate datalake access for dataset {dataset} at {location}: {source}. \
+        Verify 'cayenne_datalake_location' and that the 'cayenne_datalake_s3_*' credentials grant write access (PutObject) on the prefix; DeleteObject is recommended for probe cleanup. \
+        See: https://spiceai.org/docs/components/data-accelerators/cayenne"
+    ))]
+    DatalakeAccessDenied {
+        dataset: String,
+        location: String,
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
 }
 type Result<T, E = Error> = std::result::Result<T, E>;
 
@@ -1414,6 +1425,15 @@ struct ResolvedS3Params {
 }
 
 async fn resolve_s3_params(source: &dyn AccelerationSource) -> ResolvedS3Params {
+    resolve_s3_params_with_prefix(source, "cayenne_s3_").await
+}
+
+/// Resolve the S3 params under `prefix` (`cayenne_s3_` for the warm tier,
+/// `cayenne_datalake_s3_` for the datalake/cold tier), with secrets expanded.
+async fn resolve_s3_params_with_prefix(
+    source: &dyn AccelerationSource,
+    prefix: &str,
+) -> ResolvedS3Params {
     let raw_params = source
         .acceleration()
         .map(|a| a.params.clone())
@@ -1421,20 +1441,22 @@ async fn resolve_s3_params(source: &dyn AccelerationSource) -> ResolvedS3Params 
     let secrets = source.secrets();
     let params = get_params_with_secrets(secrets, &raw_params).await;
 
-    let get_param =
-        |key: &str| -> Option<String> { params.get(key).map(|v| v.expose_secret().to_string()) };
+    let get_param = |suffix: &str| -> Option<String> {
+        params
+            .get(&format!("{prefix}{suffix}"))
+            .map(|v| v.expose_secret().to_string())
+    };
 
-    let s3_region = get_param("cayenne_s3_region");
-    let s3_endpoint = get_param("cayenne_s3_endpoint");
-    let s3_key = get_param("cayenne_s3_key");
-    let s3_secret = get_param("cayenne_s3_secret");
-    let s3_session_token = get_param("cayenne_s3_session_token");
-    let s3_auth = get_param("cayenne_s3_auth").unwrap_or_else(|| "iam_role".to_string());
-    let s3_client_timeout = get_param("cayenne_s3_client_timeout");
-    let s3_allow_http =
-        get_param("cayenne_s3_allow_http").is_some_and(|v| v.eq_ignore_ascii_case("true"));
+    let s3_region = get_param("region");
+    let s3_endpoint = get_param("endpoint");
+    let s3_key = get_param("key");
+    let s3_secret = get_param("secret");
+    let s3_session_token = get_param("session_token");
+    let s3_auth = get_param("auth").unwrap_or_else(|| "iam_role".to_string());
+    let s3_client_timeout = get_param("client_timeout");
+    let s3_allow_http = get_param("allow_http").is_some_and(|v| v.eq_ignore_ascii_case("true"));
     let s3_unsigned_payload =
-        get_param("cayenne_s3_unsigned_payload").is_none_or(|v| !v.eq_ignore_ascii_case("false"));
+        get_param("unsigned_payload").is_none_or(|v| !v.eq_ignore_ascii_case("false"));
 
     ResolvedS3Params {
         region: s3_region,
@@ -1447,6 +1469,176 @@ async fn resolve_s3_params(source: &dyn AccelerationSource) -> ResolvedS3Params 
         allow_http: s3_allow_http,
         unsigned_payload: s3_unsigned_payload,
     }
+}
+
+/// Build a standard-S3 (or S3-compatible, e.g. `MinIO`) object store for the
+/// Cayenne datalake (cold) tier at `location` (`s3://bucket/prefix/`), from the
+/// `cayenne_datalake_s3_*` acceleration params.
+///
+/// Unlike [`build_s3_object_store`] (warm tier, S3 Express One Zone only), this
+/// targets general S3 endpoints: path-style requests by default, no
+/// zone/Express options. Returns `None` when `location` is not `s3://`.
+pub async fn build_datalake_object_store(
+    source: &dyn AccelerationSource,
+    location: &str,
+) -> Result<Option<cayenne::metadata::ObjectStoreConfig>> {
+    if !location.starts_with("s3://") {
+        return Ok(None);
+    }
+
+    let params = resolve_s3_params_with_prefix(source, "cayenne_datalake_s3_").await;
+
+    let url = Url::parse(location).boxed().context(InvalidS3UrlSnafu {
+        url: location.to_string(),
+    })?;
+    let bucket_name = get_bucket_name(&url).boxed().context(InvalidS3UrlSnafu {
+        url: location.to_string(),
+    })?;
+
+    // Region resolution: explicit param → environment → us-east-1. For
+    // S3-compatible endpoints (MinIO) the value is inert; for cross-region AWS
+    // buckets set `cayenne_datalake_s3_region` explicitly.
+    let effective_region = params
+        .region
+        .clone()
+        .or_else(|| std::env::var("AWS_REGION").ok())
+        .or_else(|| std::env::var("AWS_DEFAULT_REGION").ok())
+        .unwrap_or_else(|| "us-east-1".to_string());
+
+    let io_runtime = tokio::runtime::Handle::current();
+    let mut s3_builder = AmazonS3Builder::from_env()
+        .with_bucket_name(bucket_name)
+        .with_http_connector(SpawnedReqwestConnector::new(io_runtime))
+        .with_region(effective_region.clone())
+        .with_unsigned_payload(params.unsigned_payload);
+
+    let retry_config = RetryConfig {
+        max_retries: 3,
+        retry_timeout: std::time::Duration::from_mins(10),
+        ..Default::default()
+    };
+    s3_builder = s3_builder.with_retry(retry_config);
+
+    // `with_client_options` below REPLACES the builder's client options
+    // wholesale, so allow_http must be carried on `client_options` itself
+    // (a builder-level `with_allow_http` would be silently clobbered). An
+    // explicit `cayenne_datalake_s3_allow_http` and an `http://` endpoint
+    // both enable it.
+    let mut client_options = ClientOptions::default()
+        .with_timeout(std::time::Duration::from_mins(2))
+        .with_allow_http(params.allow_http);
+
+    if let Some(endpoint) = &params.endpoint {
+        s3_builder = s3_builder.with_endpoint(endpoint);
+        if endpoint.starts_with("http://") {
+            client_options = client_options.with_allow_http(true);
+        }
+    }
+
+    if let Some(timeout) = &params.client_timeout {
+        client_options = client_options.with_timeout(
+            fundu::parse_duration(timeout)
+                .boxed()
+                .context(ObjectStoreCreationSnafu)?,
+        );
+    }
+
+    let mut load_credentials_from_environment = true;
+    if params.auth == "key" {
+        if let (Some(key), Some(secret)) = (params.key.clone(), params.secret.clone()) {
+            s3_builder = s3_builder.with_access_key_id(key);
+            s3_builder = s3_builder.with_secret_access_key(secret);
+            if let Some(token) = params.session_token.clone() {
+                s3_builder = s3_builder.with_token(token);
+            }
+            load_credentials_from_environment = false;
+        } else {
+            return Err(Error::InvalidConfiguration {
+                detail: Arc::from(
+                    "Datalake S3 auth method 'key' requires both 'cayenne_datalake_s3_key' and 'cayenne_datalake_s3_secret' parameters",
+                ),
+            });
+        }
+    }
+
+    s3_builder = s3_builder.with_client_options(client_options);
+
+    if load_credentials_from_environment {
+        match aws_sdk_credential_bridge::get_or_init_sdk_config_with_region(Some(
+            effective_region.as_str(),
+        ))
+        .await
+        {
+            Ok(Some(sdk_config)) => {
+                if sdk_config.credentials_provider().is_some() {
+                    s3_builder = s3_builder.with_credentials(Arc::new(
+                        S3CredentialProvider::from_config(sdk_config.as_ref())
+                            .boxed()
+                            .context(ObjectStoreCreationSnafu)?,
+                    ));
+                }
+            }
+            Ok(None) => {
+                tracing::warn!(
+                    "No AWS SDK credentials available for the Cayenne datalake store; assuming public access"
+                );
+            }
+            Err(err) => {
+                tracing::warn!(
+                    "Unable to initialize AWS credentials for the Cayenne datalake store: {err}"
+                );
+            }
+        }
+    }
+
+    let store = s3_builder
+        .build()
+        .boxed()
+        .context(ObjectStoreCreationSnafu)?;
+
+    Ok(Some(cayenne::metadata::ObjectStoreConfig {
+        url,
+        store: Arc::new(store),
+    }))
+}
+
+/// Verify write access to the datalake location at dataset load: PUT a
+/// zero-byte probe object under the location prefix (failure fails
+/// registration with an actionable error, instead of surfacing at the first
+/// background promotion), then best-effort DELETE it (failure only warns —
+/// `DeleteObject` is deliberately optional so minimal-permission deployments
+/// work; a leftover probe marker is harmless).
+pub async fn validate_datalake_store_access(
+    config: &cayenne::metadata::ObjectStoreConfig,
+    dataset_name: &str,
+) -> Result<()> {
+    let prefix = config.url.path().trim_matches('/');
+    let probe_name = format!(".spice-datalake-probe-{}", uuid::Uuid::now_v7());
+    let probe = if prefix.is_empty() {
+        Path::from(probe_name)
+    } else {
+        Path::from(format!("{prefix}/{probe_name}"))
+    };
+
+    config
+        .store
+        .put(&probe, PutPayload::from_static(b""))
+        .await
+        .boxed()
+        .map_err(|source| Error::DatalakeAccessDenied {
+            dataset: dataset_name.to_string(),
+            location: config.url.to_string(),
+            source,
+        })?;
+
+    // Best-effort cleanup: a leftover zero-byte probe object is harmless.
+    if let Err(e) = config.store.delete(&probe).await {
+        tracing::warn!(
+            "Failed to delete datalake access-probe object {probe} for dataset {dataset_name}: {e}"
+        );
+    }
+
+    Ok(())
 }
 
 async fn build_single_s3_store_for_path(

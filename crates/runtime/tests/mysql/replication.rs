@@ -50,7 +50,8 @@ use crate::mysql::common;
 
 // 13324/13325 (the purged-position test uses `+ 1`): distinct from the other
 // MySQL suites (comments 13320, e2e 13322/13323, refresh_retry 13327,
-// rehydration 13337) so parallel test binaries never fight over a container.
+// schema_inference 13328/13329, rehydration 13337) so parallel test binaries
+// never fight over a container.
 const MYSQL_REPLICATION_PORT: u16 = 13324;
 
 /// In-memory [`PositionStore`] standing in for the accelerator sidecar.
@@ -147,19 +148,25 @@ async fn next_envelope(
 
 fn ops_of(envelope: &ChangeEnvelope) -> Vec<String> {
     let ops = envelope
-        .change_batch
+        .change_batch()
+        .expect("built change batch")
         .record
         .column_by_name("op")
         .expect("op column")
         .as_string::<i32>();
-    (0..envelope.change_batch.record.num_rows())
+    (0..envelope
+        .change_batch()
+        .expect("built change batch")
+        .record
+        .num_rows())
         .map(|i| ops.value(i).to_string())
         .collect()
 }
 
 fn ids_of(envelope: &ChangeEnvelope) -> Vec<i32> {
     let data = envelope
-        .change_batch
+        .change_batch()
+        .expect("built change batch")
         .record
         .column_by_name("data")
         .expect("data column")
@@ -198,7 +205,14 @@ async fn bootstrap_then_stream_changes_then_resume() -> Result<(), anyhow::Error
     envelope.commit().await?;
 
     let envelope = next_envelope(&mut stream, "ready signal").await?;
-    assert_eq!(envelope.change_batch.record.num_rows(), 0);
+    assert_eq!(
+        envelope
+            .change_batch()
+            .expect("built change batch")
+            .record
+            .num_rows(),
+        0
+    );
     assert!(
         envelope.is_dataset_ready(),
         "post-snapshot envelope marks ready"
@@ -227,7 +241,8 @@ async fn bootstrap_then_stream_changes_then_resume() -> Result<(), anyhow::Error
     assert_eq!(ops_of(&envelope), vec!["u"]);
     assert_eq!(ids_of(&envelope), vec![1]);
     let data = envelope
-        .change_batch
+        .change_batch()
+        .expect("built change batch")
         .record
         .column_by_name("data")
         .expect("data")
@@ -301,7 +316,14 @@ async fn bootstrap_then_stream_changes_then_resume() -> Result<(), anyhow::Error
     // First envelope on resume is the immediate ready signal — no truncate
     // and no snapshot batch.
     let envelope = next_envelope(&mut stream, "resume ready signal").await?;
-    assert_eq!(envelope.change_batch.record.num_rows(), 0);
+    assert_eq!(
+        envelope
+            .change_batch()
+            .expect("built change batch")
+            .record
+            .num_rows(),
+        0
+    );
     assert!(envelope.is_dataset_ready());
     envelope.commit().await?;
 
