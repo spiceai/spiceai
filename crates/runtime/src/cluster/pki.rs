@@ -438,7 +438,14 @@ fn build_certified_key(cert_pem: &[u8], key_pem: &[u8]) -> Result<CertifiedKey, 
 }
 
 fn load_certs(pem_bytes: &[u8]) -> Result<Vec<CertificateDer<'static>>, pem::Error> {
-    CertificateDer::pem_slice_iter(pem_bytes).collect()
+    // Empty / non-PEM input should surface as an empty vec so callers can emit
+    // the stable "no CA certificates" / "empty certificate chain" errors,
+    // rather than a generic parse failure.
+    match CertificateDer::pem_slice_iter(pem_bytes).collect::<Result<Vec<_>, _>>() {
+        Ok(certs) => Ok(certs),
+        Err(pem::Error::NoItemsFound) => Ok(Vec::new()),
+        Err(err) => Err(err),
+    }
 }
 
 fn load_key(pem_bytes: &[u8]) -> Result<PrivateKeyDer<'static>, String> {

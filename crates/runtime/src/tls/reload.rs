@@ -802,11 +802,17 @@ fn build_client_verifier(
 }
 
 fn load_certs(pem_bytes: &[u8]) -> Result<Vec<CertificateDer<'static>>, ReloadError> {
-    CertificateDer::pem_slice_iter(pem_bytes)
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|err| ReloadError::ParseCert {
+    // `pem_slice_iter` yields no items for empty/non-PEM input (rather than
+    // always erroring). Map `NoItemsFound` to an empty vec so callers can
+    // distinguish empty bundles (`EmptyCertChain` / `EmptyClientCa`) from
+    // real parse failures.
+    match CertificateDer::pem_slice_iter(pem_bytes).collect::<Result<Vec<_>, _>>() {
+        Ok(certs) => Ok(certs),
+        Err(pem::Error::NoItemsFound) => Ok(Vec::new()),
+        Err(err) => Err(ReloadError::ParseCert {
             source: io::Error::new(io::ErrorKind::InvalidData, err),
-        })
+        }),
+    }
 }
 
 fn load_key(pem_bytes: &[u8]) -> Result<PrivateKeyDer<'static>, ReloadError> {
