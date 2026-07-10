@@ -16,20 +16,40 @@ limitations under the License.
 
 use crate::parameters::ParameterSpec;
 
-const BEDROCK_PARAM_LEN: usize = 5;
+const BEDROCK_PARAM_LEN: usize = 11;
 
 pub const PARAMETERS: &[ParameterSpec] = &BEDROCK_PARAMETERS;
 
 pub(crate) const BEDROCK_PARAMETERS: [ParameterSpec; BEDROCK_PARAM_LEN] = [
-    ParameterSpec::component("dimensions")
+    // AWS credential/config params — runtime (no prefix), matching the LLM bedrock convention.
+    ParameterSpec::runtime("aws_access_key_id")
+        .description("The AWS access key ID.")
+        .secret(),
+    ParameterSpec::runtime("aws_secret_access_key")
+        .description("The AWS secret access key.")
+        .secret(),
+    ParameterSpec::runtime("aws_session_token")
+        .description("The AWS session token.")
+        .secret(),
+    ParameterSpec::runtime("aws_region")
+        .description("The AWS region to use for Bedrock embeddings."),
+    ParameterSpec::runtime("aws_iam_role_source")
+        .description("IAM role credential source. 'auto' uses the default AWS credential chain, 'metadata' uses only instance/container metadata (IMDS, ECS, EKS/IRSA), 'env' uses only environment variables.")
+        .one_of(&["auto", "metadata", "env"]),
+    // Model-specific params — runtime (no prefix) to preserve backward compatibility with
+    // pre-#10853 configs where these were bare keys.
+    ParameterSpec::runtime("dimensions")
         .description("The number of dimensions for the embedding output."),
-    ParameterSpec::component("normalize")
+    ParameterSpec::runtime("normalize")
         .description("Whether to normalize the embedding output.")
         .one_of(&["true", "false"]),
-    ParameterSpec::component("truncate_mode")
+    ParameterSpec::runtime("truncate_mode")
         .description("Truncation mode for input text that exceeds the model's token limit."),
-    ParameterSpec::component("input_type")
+    ParameterSpec::runtime("truncate")
+        .description("Alias for `truncate_mode`; prefer `truncate_mode`.")
+        .deprecated("Use `truncate_mode` instead."),
+    ParameterSpec::runtime("input_type")
         .description("The input type for Cohere embedding models."),
-    ParameterSpec::component("embedding_purpose")
+    ParameterSpec::runtime("embedding_purpose")
         .description("The embedding purpose for Nova multimodal embedding models."),
 ];
