@@ -46,13 +46,20 @@ use rand::{Rng, RngExt, SeedableRng};
 use crate::Result;
 use crate::rand as tpcc_rand;
 
-/// Apply session-level settings that speed up bulk loading on `conn`.
+/// `MySQL` 1227 = `ER_SPECIFIC_ACCESS_DENIED_ERROR` — the session lacks a
+/// required privilege (here, `SESSION_VARIABLES_ADMIN` for `SET sql_log_bin`).
+fn is_privilege_denied(e: &mysql_async::Error) -> bool {
+    matches!(e, mysql_async::Error::Server(se) if se.code == 1227)
+}
+
+/// Apply session-level settings that speed up bulk loading on `conn`. Restore
+/// them afterwards with [`restore_bulk_load_session`].
 ///
 /// `unique_checks=0` and `foreign_key_checks=0` need no special privilege.
 /// `sql_log_bin=0` skips writing the multi-GB seed to the binary log — the Spice
 /// CDC path snapshots the seeded tables when spiced starts, so the seed rows do
-/// not need to be in the binlog — but it requires `SESSION_VARIABLES_ADMIN`, so
-/// it is applied best-effort. Returns whether `sql_log_bin` was disabled.
+/// not need to be in the binlog — but it requires `SESSION_VARIABLES_ADMIN`.
+/// Returns whether `sql_log_bin` was disabled.
 async fn apply_bulk_load_session(conn: &mut mysql_async::Conn) -> Result<bool> {
     conn.query_drop("SET unique_checks=0, foreign_key_checks=0")
         .await
@@ -60,10 +67,41 @@ async fn apply_bulk_load_session(conn: &mut mysql_async::Conn) -> Result<bool> {
             action: "set bulk-load session flags".into(),
             source,
         })?;
-    // Best-effort: the bench user may lack SESSION_VARIABLES_ADMIN. Failing to
-    // disable binlogging only makes the seed slower, never wrong, so swallow the
-    // access-denied error and keep loading with the binlog on.
-    Ok(conn.query_drop("SET sql_log_bin=0").await.is_ok())
+    // Only swallow the specific "privilege missing" error (1227): losing the
+    // binlog skip merely makes the seed slower, never wrong. Any other error
+    // (e.g. a broken connection) is propagated so real failures are not masked.
+    match conn.query_drop("SET sql_log_bin=0").await {
+        Ok(()) => Ok(true),
+        Err(e) if is_privilege_denied(&e) => Ok(false),
+        Err(source) => Err(crate::Error::MySql {
+            action: "disable binlogging for the seed session".into(),
+            source,
+        }),
+    }
+}
+
+/// Restore the session flags changed by [`apply_bulk_load_session`], leaving
+/// `conn` in its default state so a later reuse is not surprised by them.
+/// `sql_log_bin` is restored only if it was successfully disabled.
+async fn restore_bulk_load_session(
+    conn: &mut mysql_async::Conn,
+    sql_log_bin_disabled: bool,
+) -> Result<()> {
+    conn.query_drop("SET unique_checks=1, foreign_key_checks=1")
+        .await
+        .map_err(|source| crate::Error::MySql {
+            action: "restore bulk-load session flags".into(),
+            source,
+        })?;
+    if sql_log_bin_disabled {
+        conn.query_drop("SET sql_log_bin=1")
+            .await
+            .map_err(|source| crate::Error::MySql {
+                action: "restore binlogging for the session".into(),
+                source,
+            })?;
+    }
+    Ok(())
 }
 
 /// Open a fresh loader connection: pinned to UTC (via [`crate::set_mysql_utc`],
@@ -293,17 +331,23 @@ const WAREHOUSE_TABLES: &[(&str, &str, &str)] = &[
 ///
 /// Strategy:
 /// - Shared tables (item, nation, region, supplier) are loaded once on `conn`.
-/// - The first `min(warehouses, SEED_WAREHOUSES)` warehouses are loaded
-///   **serially** on the single `conn`. Each warehouse gets a deterministic
-///   per-warehouse RNG derived from `seed`.
-/// - Remaining warehouses are cloned from the seed set using server-side
-///   `INSERT ... SELECT` (rotating source across seed warehouses).
+/// - The first `min(warehouses, SEED_WAREHOUSES)` warehouses are loaded **in
+///   parallel**, each on its own connection opened from `opts`. Each warehouse
+///   gets a deterministic per-warehouse RNG derived from `seed`.
+/// - Remaining warehouses are cloned from the seed set with server-side
+///   `INSERT ... SELECT` (rotating source across seed warehouses), across a
+///   bounded pool of connections; the primary-key-less `history` table is cloned
+///   on its own connection to avoid `InnoDB` deadlocks (see `ClonePhase`).
 ///
-/// Everything runs on the single `conn`: parallelism adds no benefit because
-/// the dominant clone phase is server-side `INSERT ... SELECT`.
+/// `conn` loads the shared tables and coordinates; the parallel phases open
+/// their own worker connections via [`open_worker`]. Concurrent inserts on
+/// `history` retry transient `InnoDB` lock errors (see [`exec_with_lock_retry`]).
+///
+/// The bulk-load session flags applied to `conn` (see [`apply_bulk_load_session`])
+/// are restored before returning, so the connection is left in its default state.
 ///
 /// When `seed` is `Some`, a deterministic RNG is used so that the same seed
-/// always produces the same dataset.
+/// always produces the same dataset — independent of loader parallelism.
 ///
 /// # Errors
 ///
@@ -460,6 +504,9 @@ pub async fn load_all(
             clone_start.elapsed()
         );
     }
+
+    // Leave the coordinator connection in its default state.
+    restore_bulk_load_session(conn, sql_log_bin_off).await?;
 
     Ok(())
 }

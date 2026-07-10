@@ -110,11 +110,13 @@ pub async fn drop_tables(client: &Client) -> Result<()> {
     Ok(())
 }
 
-/// Create all 12 CH-benCH tables (9 TPC-C + 3 supplemental).
+/// Create all 12 CH-benCH tables (9 TPC-C + 3 supplemental) and add the
+/// `_bench_ts` columns. Secondary indexes and triggers are created separately
+/// (see [`create_indexes`] and [`create_triggers`]) *after* the bulk load.
 ///
 /// # Errors
 ///
-/// Returns an error if any table or index cannot be created.
+/// Returns an error if any table or `_bench_ts` column cannot be created.
 pub async fn create_tables(client: &Client) -> Result<()> {
     let ddl_statements: &[(&str, &str)] = &[
         (
