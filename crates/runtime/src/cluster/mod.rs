@@ -2331,6 +2331,7 @@ impl runtime_secrets::ClusterSecretExpander for ClusterSecretExpanderImpl {
 
 /// - Binds the pre-fetched `App` to the runtime
 /// - Initializes and binds `SchedulerRPCSecretStore`
+/// - Ensures `runtime.task_history` exists (normally created by `load_components`)
 /// - Loads catalogs, embeddings, models, and tools
 async fn executor_bind_app(
     rt: &Arc<Runtime>,
@@ -2354,6 +2355,32 @@ async fn executor_bind_app(
 
     let expander = Box::new(ClusterSecretExpanderImpl::new(secrets_cluster_client));
     *rt.secrets.write().await = Secrets::new_for_cluster_executor(expander, executor_id);
+
+    // Task history is created by `load_components` on a normal bring-up, but
+    // Fix B Ready/slots gate on this bind path — and the test harness skips
+    // concurrent `load_components` to avoid racing dataset load. Ensure the
+    // table exists here so federated `runtime.task_history` queries from the
+    // scheduler don't fail with "table not found" on the executor.
+    //
+    // Concurrent with `load_components` is fine: if we lose the race,
+    // `init_task_history` fails with "table already exists" and we re-check.
+    let task_history_ref = ::datafusion::sql::TableReference::partial(
+        crate::datafusion::SPICE_RUNTIME_SCHEMA,
+        crate::task_history::DEFAULT_TASK_HISTORY_TABLE,
+    );
+    if rt.df.get_table(&task_history_ref).await.is_none() {
+        match Arc::clone(rt).init_task_history().await {
+            Ok(()) => {}
+            Err(err) if rt.df.get_table(&task_history_ref).await.is_some() => {
+                tracing::debug!(
+                    "task_history already initialized by concurrent load_components: {err}"
+                );
+            }
+            Err(err) => {
+                tracing::warn!("Creating internal task history table: {err}");
+            }
+        }
+    }
 
     Arc::clone(rt).load_catalogs().await;
     rt.load_embeddings().await;

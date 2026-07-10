@@ -839,39 +839,45 @@ async fn test_distributed_acceleration_join_two_partitioned_tables() -> Result<(
 
             for table_name in ["test_data", "categories"] {
                 let table_ref = datafusion::sql::TableReference::parse_str(table_name);
-                let distributed =
-                    crate::utils::wait_until_true(Duration::from_secs(60), || async {
-                        partition_store.refresh().await.ok();
-                        partition_store
-                            .get_table_metadata(&table_ref)
-                            .await
-                            .ok()
-                            .flatten()
-                            .is_some_and(|m| {
-                                if m.partitions.len() != 4
-                                    || !m
-                                        .partitions
-                                        .iter()
-                                        .all(runtime::cluster::PartitionMetadata::is_assigned)
-                                {
-                                    return false;
-                                }
-                                // EXPLAIN expects a Union of FlightSqlExec across
-                                // both executors; assignment-only is not enough —
-                                // early allocate can park every partition of a
-                                // table on the first executor that finishes bind.
-                                let executors: std::collections::HashSet<&String> = m
+                let distributed = crate::utils::wait_until_true(Duration::from_mins(1), || async {
+                    partition_store.refresh().await.ok();
+                    partition_store
+                        .get_table_metadata(&table_ref)
+                        .await
+                        .ok()
+                        .flatten()
+                        .is_some_and(|m| {
+                            if m.partitions.len() != 4
+                                || !m
                                     .partitions
                                     .iter()
-                                    .flat_map(|p| p.assigned_executors.iter())
-                                    .collect();
-                                executors.len() >= 2
-                            })
-                    })
-                    .await;
+                                    .all(runtime::cluster::PartitionMetadata::is_assigned)
+                            {
+                                return false;
+                            }
+                            // Match the scheduler config above:
+                            // `max_partitions_per_executor = 4` (global) and
+                            // `max_partition_assignments_per_interval = 2` force
+                            // each table's 4 buckets to land 2+2 across the two
+                            // executors (Union of FlightSqlExec in EXPLAIN).
+                            // Assignment-only is not enough — early allocate can
+                            // park every partition of a table on the first
+                            // executor that finishes bind.
+                            let mut per_executor: std::collections::HashMap<&str, usize> =
+                                std::collections::HashMap::new();
+                            for partition in &m.partitions {
+                                for executor in &partition.assigned_executors {
+                                    *per_executor.entry(executor.as_str()).or_default() += 1;
+                                }
+                            }
+                            per_executor.len() == 2 && per_executor.values().all(|&n| n == 2)
+                        })
+                })
+                .await;
                 assert!(
                     distributed,
-                    "All 4 partitions for {table_name} should be assigned across 2 executors"
+                    "All 4 partitions for {table_name} should be split 2+2 across 2 executors \
+                     (max_partitions_per_executor=4, max_partition_assignments_per_interval=2)"
                 );
             }
 
